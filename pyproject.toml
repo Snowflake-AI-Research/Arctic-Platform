@@ -24,7 +24,7 @@ name = "arctic_platform"
 version = "0.1.1.dev0"
 description = "Snowflake LLM training library w/ RL"
 authors = [
-    {author = "Tunji Ruwase", email = "tunji.ruwase@snowflake.com"}
+    {author = "Tunji Ruwase", email = "tunji.ruwase@snowflake.com"},
     {author = "Stas Bekman", email = "stas.bekman@snowflake.com"},
     {author = "Michael Wyatt", email = "michael.wyatt@snowflake.com"},
     {author = "Jeff Rasley", email = "jeff.rasley@snowflake.com"},
@@ -73,13 +73,11 @@ dependencies = [
 [project.optional-dependencies]
 all = [
     "arctic_platform[dev]",
-    "arctic_platform[docs]",
     "arctic_platform[testing]",
     "arctic_platform[vllm]",
 ]
 
 dev = [
-    "arctic_platform[docs]",
     "arctic_platform[formatting]",
     "arctic_platform[testing]",
 ]
@@ -89,12 +87,17 @@ testing = [
     "pytest-instafail",
     "parameterized",
     "pytest-xdist",
-    "arctic_platform[snowflake]",
 ]
 
 formatting = [
     "pre-commit",
     "autoflake",
+]
+
+docs = [
+]
+
+snowflake = [
 ]
 
 vllm = [
