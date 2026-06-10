@@ -312,12 +312,10 @@ class ArcticRLRayClient:
         self,
         prompts: list[str],
         sampling_params: dict[str, Any] | None = None,
-        routing_key: str | list[str | None] | None = None,
     ) -> list[dict[str, Any]]:
         request = dict(
             prompts=prompts,
             sampling_params=sampling_params,
-            routing_key=routing_key,
         )
         resp = await self._arctic_rl_ray_server.generate(self.sampling_job_id, request)
 

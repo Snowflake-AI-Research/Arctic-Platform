@@ -105,7 +105,6 @@ class JobConfig(BaseModel):
 class GenerateRequest(BaseModel):
     prompts: List[str]
     sampling_params: Optional[Dict[str, Any]] = None
-    routing_key: Optional[Union[str, List[Optional[str]]]] = None
 
 
 class LogProbsRequest(BaseModel):
@@ -1047,12 +1046,12 @@ class ArcticRLRayServer:
         request = GenerateRequest(**request)
         self._verify_job(job_id, "sampling")
         pool: ReplicaPool = self.sampling_pool
-        # A non-None routing_key implies strict (hard) pinning to the keyed engine.
+        # Strict routing keys group affinity on the prompt hash and balances
+        # rollout groups across engines via round-robin.
         results = await pool.generate(
             request.prompts,
             request.sampling_params,
-            routing_key=request.routing_key,
-            strict=request.routing_key is not None,
+            strict=True,
         )
 
         return {"job_id": job_id, "results": results}
