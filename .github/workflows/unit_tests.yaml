@@ -53,7 +53,7 @@ jobs:
           echo "$VIRTUAL_ENV/bin" >> $GITHUB_PATH
           echo "VIRTUAL_ENV=$VIRTUAL_ENV" >> $GITHUB_ENV
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-          uv pip install ".[testing]"
+          uv pip install ".[testing,rl]"
       - name: Environment print
         run: |
           uv pip list
