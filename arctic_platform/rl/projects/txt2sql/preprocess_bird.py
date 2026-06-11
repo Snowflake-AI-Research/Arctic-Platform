@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Preprocess SQL RL training data to verl-compatible parquet format.
 
@@ -29,7 +44,6 @@ import re
 import sqlite3
 
 import pandas as pd
-
 
 # ---------------------------------------------------------------------------
 # R1 prompt template (arctic_text_to_sql_r1)
@@ -92,6 +106,7 @@ Output Format:
 # Schema DDL extraction from SQLite databases
 # ---------------------------------------------------------------------------
 
+
 def _flatten_inline(s: str) -> str:
     """Collapse whitespace so the value fits on a single comment line. No length cap."""
     return " ".join(s.split())
@@ -104,8 +119,7 @@ def _short_value(v, max_len: int = 60) -> str:
 
 
 _FK_RE = re.compile(
-    r"FOREIGN\s+KEY\s*\(\s*([^)]+?)\s*\)\s*REFERENCES\s+"
-    r"[\"'`]?([A-Za-z_][\w]*)[\"'`]?\s*(?:\(\s*([^)]+?)\s*\))?",
+    r"FOREIGN\s+KEY\s*\(\s*([^)]+?)\s*\)\s*REFERENCES\s+" r"[\"'`]?([A-Za-z_][\w]*)[\"'`]?\s*(?:\(\s*([^)]+?)\s*\))?",
     re.IGNORECASE,
 )
 
@@ -132,8 +146,8 @@ def _extract_fks(create_sql: str) -> list[str]:
         if first in {"FOREIGN", "PRIMARY", "UNIQUE", "CONSTRAINT", "CHECK", "CREATE", ")", "("}:
             continue
         m = re.search(
-            r'^\s*[\"\'`]?([A-Za-z_][\w]*)[\"\'`]?\s+[^,]*?\bREFERENCES\s+'
-            r'[\"\'`]?([A-Za-z_][\w]*)[\"\'`]?(?:\s*\(\s*([^)]+?)\s*\))?',
+            r"^\s*[\"\'`]?([A-Za-z_][\w]*)[\"\'`]?\s+[^,]*?\bREFERENCES\s+"
+            r"[\"\'`]?([A-Za-z_][\w]*)[\"\'`]?(?:\s*\(\s*([^)]+?)\s*\))?",
             line,
             re.IGNORECASE,
         )
@@ -237,10 +251,7 @@ def get_schema_ddl(
             col_names = [desc[0] for desc in cursor.description]
             if num_examples > 0:
                 for col_idx, col_name in enumerate(col_names):
-                    vals = [
-                        row[col_idx] for row in rows_for_table[:num_examples]
-                        if row[col_idx] is not None
-                    ]
+                    vals = [row[col_idx] for row in rows_for_table[:num_examples] if row[col_idx] is not None]
                     if vals:
                         col_examples[col_name] = vals
         except sqlite3.Error:
@@ -292,6 +303,7 @@ def get_schema_ddl(
 # ---------------------------------------------------------------------------
 # BIRD processing
 # ---------------------------------------------------------------------------
+
 
 def process_bird(
     bird_dir: str,
@@ -349,17 +361,21 @@ def process_bird(
         else:
             full_question = question
 
-        records.append({
-            "data_source": "bird",
-            "prompt": build_r1_messages(schema_cache[db_id], full_question),
-            "ability": "sql",
-            "reward_model": {"style": "rule", "ground_truth": gold_sql},
-            "extra_info": {
-                "split": split, "index": idx,
-                "db_id": db_id, "db_path": db_path,
-                "question": question,
-            },
-        })
+        records.append(
+            {
+                "data_source": "bird",
+                "prompt": build_r1_messages(schema_cache[db_id], full_question),
+                "ability": "sql",
+                "reward_model": {"style": "rule", "ground_truth": gold_sql},
+                "extra_info": {
+                    "split": split,
+                    "index": idx,
+                    "db_id": db_id,
+                    "db_path": db_path,
+                    "question": question,
+                },
+            }
+        )
 
     print(f"    -> {len(records)} samples")
     return records
@@ -368,6 +384,7 @@ def process_bird(
 # ---------------------------------------------------------------------------
 # Spider processing
 # ---------------------------------------------------------------------------
+
 
 def process_spider(spider_dir: str) -> list[dict]:
     """Process Spider dataset from raw JSON + SQLite databases."""
@@ -402,17 +419,21 @@ def process_spider(spider_dir: str) -> list[dict]:
                 except Exception:
                     continue
 
-            records.append({
-                "data_source": "spider",
-                "prompt": build_r1_messages(schema_cache[db_id], question),
-                "ability": "sql",
-                "reward_model": {"style": "rule", "ground_truth": gold_sql},
-                "extra_info": {
-                    "split": "train", "index": idx,
-                    "db_id": db_id, "db_path": db_path,
-                    "question": question,
-                },
-            })
+            records.append(
+                {
+                    "data_source": "spider",
+                    "prompt": build_r1_messages(schema_cache[db_id], question),
+                    "ability": "sql",
+                    "reward_model": {"style": "rule", "ground_truth": gold_sql},
+                    "extra_info": {
+                        "split": "train",
+                        "index": idx,
+                        "db_id": db_id,
+                        "db_path": db_path,
+                        "question": question,
+                    },
+                }
+            )
 
     print(f"    -> {len(records)} samples total")
     return records
@@ -421,6 +442,7 @@ def process_spider(spider_dir: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 # GretelAI processing
 # ---------------------------------------------------------------------------
+
 
 def _create_gretelai_db(sql_context: str, db_path: str) -> bool:
     """Create a SQLite database from GretelAI's sql_context (CREATE+INSERT statements)."""
@@ -477,17 +499,22 @@ def process_gretelai(
         question = row["question"]
         gold_sql = row["ground_truth"]
 
-        records.append({
-            "data_source": "gretelai",
-            "prompt": build_r1_messages(schema_ddl, question),
-            "ability": "sql",
-            "reward_model": {"style": "rule", "ground_truth": gold_sql},
-            "extra_info": {
-                "split": "train", "index": int(row["extra_info"].get("index", 0)),
-                "db_id": str(sample_id), "db_path": db_path,
-                "question": question, "domain": domain,
-            },
-        })
+        records.append(
+            {
+                "data_source": "gretelai",
+                "prompt": build_r1_messages(schema_ddl, question),
+                "ability": "sql",
+                "reward_model": {"style": "rule", "ground_truth": gold_sql},
+                "extra_info": {
+                    "split": "train",
+                    "index": int(row["extra_info"].get("index", 0)),
+                    "db_id": str(sample_id),
+                    "db_path": db_path,
+                    "question": question,
+                    "domain": domain,
+                },
+            }
+        )
 
     print(f"    -> {len(records)} samples, {skipped} skipped")
     return records
@@ -496,6 +523,7 @@ def process_gretelai(
 # ---------------------------------------------------------------------------
 # Token-length filtering
 # ---------------------------------------------------------------------------
+
 
 def filter_by_token_length(
     records: list[dict],
@@ -508,11 +536,10 @@ def filter_by_token_length(
         return records
 
     from transformers import AutoTokenizer
+
     tok = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
 
-    texts = [
-        "".join(m.get("content", "") for m in r["prompt"]) for r in records
-    ]
+    texts = ["".join(m.get("content", "") for m in r["prompt"]) for r in records]
 
     kept, dropped_per_source = [], {}
     lens = []
@@ -525,9 +552,7 @@ def filter_by_token_length(
             if n <= max_tokens:
                 kept.append(rec)
             else:
-                dropped_per_source[rec["data_source"]] = (
-                    dropped_per_source.get(rec["data_source"], 0) + 1
-                )
+                dropped_per_source[rec["data_source"]] = dropped_per_source.get(rec["data_source"], 0) + 1
 
     n_total = len(records)
     n_kept = len(kept)
@@ -540,6 +565,7 @@ def filter_by_token_length(
             print(f"    dropped {cnt} from {src}")
     if lens:
         import numpy as np
+
         arr = np.array(lens)
         print(
             f"  Pre-filter token stats: median={int(np.median(arr))} "
@@ -557,7 +583,9 @@ DEFAULT_PATHS = {
     "bird_dir": "/data/ruofan/bird_wiki_original",
     "spider_dir": "/data/ruofan/spider_data",
     "gretelai_parquet": "/data/ruofan/gretelai/synthetic_text_to_sql_train.snappy.parquet",
-    "r1_parquet": "/code/users/lukasz/process/snowflake_v1/merged_train_model_type-qwen_coder-sft_maxtoken-8192_maxtime-10_len-16459.parquet",
+    "r1_parquet": (
+        "/code/users/lukasz/process/snowflake_v1/merged_train_model_type-qwen_coder-sft_maxtoken-8192_maxtime-10_len-16459.parquet"
+    ),
 }
 
 
@@ -565,45 +593,61 @@ def main():
     parser = argparse.ArgumentParser(description="Preprocess SQL data for verl RL training")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument(
-        "--sources", nargs="+", default=["bird"],
+        "--sources",
+        nargs="+",
+        default=["bird"],
         choices=["bird", "spider", "gretelai"],
         help="Data sources to include (default: bird only)",
     )
     parser.add_argument("--bird_dir", type=str, default=DEFAULT_PATHS["bird_dir"])
-    parser.add_argument("--spider_dir", type=str, default=DEFAULT_PATHS["spider_dir"]) 
+    parser.add_argument("--spider_dir", type=str, default=DEFAULT_PATHS["spider_dir"])
     parser.add_argument("--gretelai_parquet", type=str, default=DEFAULT_PATHS["gretelai_parquet"])
     parser.add_argument("--r1_parquet", type=str, default=DEFAULT_PATHS["r1_parquet"])
     parser.add_argument(
-        "--max_tokens", type=int, default=32768,
-        help="Drop training samples whose prompt exceeds this many tokens. "
-             "Set to 0 to disable filtering. Default: 32768. "
-             "(BIRD's outlier DBs `works_cycles` and `movie_3` sit at >80K "
-             "tokens with full augmentation, so 32K is the natural break.)",
+        "--max_tokens",
+        type=int,
+        default=32768,
+        help=(
+            "Drop training samples whose prompt exceeds this many tokens. "
+            "Set to 0 to disable filtering. Default: 32768. "
+            "(BIRD's outlier DBs `works_cycles` and `movie_3` sit at >80K "
+            "tokens with full augmentation, so 32K is the natural break.)"
+        ),
     )
     parser.add_argument(
-        "--tokenizer", type=str, default="Qwen/Qwen3-1.7B",
+        "--tokenizer",
+        type=str,
+        default="Qwen/Qwen3-1.7B",
         help="HF tokenizer used for the token-length filter. Default: Qwen/Qwen3-1.7B.",
     )
     parser.add_argument(
-        "--num_examples", type=int, default=10,
-        help="Sample rows per column to include inline as `-- example: [...]`. "
-             "Higher values produce longer prompts. Default: 10.",
+        "--num_examples",
+        type=int,
+        default=10,
+        help=(
+            "Sample rows per column to include inline as `-- example: [...]`. "
+            "Higher values produce longer prompts. Default: 10."
+        ),
     )
     parser.add_argument(
-        "--sample_rows", type=int, default=10,
-        help="Full sample rows shown as a markdown table at the top of each "
-             "CREATE TABLE block. Reuses the rows fetched for `--num_examples` "
-             "(no extra DB queries). Set to 0 to disable. Default: 10.",
+        "--sample_rows",
+        type=int,
+        default=10,
+        help=(
+            "Full sample rows shown as a markdown table at the top of each "
+            "CREATE TABLE block. Reuses the rows fetched for `--num_examples` "
+            "(no extra DB queries). Set to 0 to disable. Default: 10."
+        ),
     )
     parser.add_argument(
-        "--no_descriptions", action="store_true",
-        help="Disable BIRD `database_description/*.csv` schema enrichment "
-             "(column descriptions and value semantics).",
+        "--no_descriptions",
+        action="store_true",
+        help="Disable BIRD `database_description/*.csv` schema enrichment (column descriptions and value semantics).",
     )
     parser.add_argument(
-        "--no_fk_summary", action="store_true",
-        help="Disable the `-- Foreign keys: ...` summary line at the top of "
-             "each CREATE TABLE block.",
+        "--no_fk_summary",
+        action="store_true",
+        help="Disable the `-- Foreign keys: ...` summary line at the top of each CREATE TABLE block.",
     )
     args = parser.parse_args()
 
@@ -619,13 +663,16 @@ def main():
 
     if "bird" in args.sources:
         print("Processing BIRD (train)...")
-        train_records.extend(process_bird(
-            args.bird_dir, "train",
-            num_examples=args.num_examples,
-            use_descriptions=not args.no_descriptions,
-            sample_rows=args.sample_rows,
-            include_fk_summary=not args.no_fk_summary,
-        ))
+        train_records.extend(
+            process_bird(
+                args.bird_dir,
+                "train",
+                num_examples=args.num_examples,
+                use_descriptions=not args.no_descriptions,
+                sample_rows=args.sample_rows,
+                include_fk_summary=not args.no_fk_summary,
+            )
+        )
 
     if "spider" in args.sources:
         print("Processing Spider...")
@@ -634,24 +681,32 @@ def main():
     if "gretelai" in args.sources:
         print("Processing GretelAI...")
         gretelai_db_dir = os.path.join(args.output_dir, "gretelai_dbs")
-        train_records.extend(process_gretelai(
-            args.gretelai_parquet, args.r1_parquet, gretelai_db_dir,
-        ))
+        train_records.extend(
+            process_gretelai(
+                args.gretelai_parquet,
+                args.r1_parquet,
+                gretelai_db_dir,
+            )
+        )
 
     if train_records and args.max_tokens and args.max_tokens > 0:
-        print(f"\nFiltering train by token length...")
+        print("\nFiltering train by token length...")
         train_records = filter_by_token_length(
-            train_records, args.tokenizer, args.max_tokens,
+            train_records,
+            args.tokenizer,
+            args.max_tokens,
         )
 
     if train_records:
         train_path = os.path.join(args.output_dir, "train.parquet")
         os.makedirs(args.output_dir, exist_ok=True)
         import datasets as hf_datasets
+
         hf_datasets.Dataset.from_list(train_records).to_parquet(train_path)
         print(f"\nTrain: {len(train_records)} samples -> {train_path}")
 
         from collections import Counter
+
         source_counts = Counter(r["data_source"] for r in train_records)
         for src, cnt in source_counts.most_common():
             print(f"  {src}: {cnt}")
@@ -665,7 +720,8 @@ def main():
     if "bird" in args.sources:
         print("\nProcessing BIRD (dev) for validation (clean / no augmentation)...")
         val_records = process_bird(
-            args.bird_dir, "dev",
+            args.bird_dir,
+            "dev",
             num_examples=3,
             use_descriptions=False,
             sample_rows=0,
@@ -674,6 +730,7 @@ def main():
         if val_records:
             val_path = os.path.join(args.output_dir, "val.parquet")
             import datasets as hf_datasets
+
             hf_datasets.Dataset.from_list(val_records).to_parquet(val_path)
             print(f"Val: {len(val_records)} samples -> {val_path}")
 

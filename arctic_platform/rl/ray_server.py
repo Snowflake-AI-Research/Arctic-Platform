@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-from math import pi
 import os
 import pathlib
 import time
@@ -39,49 +38,47 @@ from typing import Optional
 from typing import Union
 
 import ray
-from ray.util.placement_group import placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 import torch
-import uvicorn
 from arctic_inference.server.config import ModelConfig
 from arctic_inference.server.replica_pool import ReplicaPool
 from arctic_inference.server.weight_sync.schedule import TransferSchedule
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from ray.util.placement_group import placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from transformers import AutoTokenizer
-from arctic_platform.rl.utils import (
-    unpack_batch,
-    ray_split_batch,
-    merge_dict_shards,
-    combine_metric_shards,
-    restore_batch_order,
-    log_dp_shard_tokens,
-    merge_cuda_ipc_payloads,
-)
-from arctic_platform.rl.utils.ray_pg import (
-    ColocatePlacement,
-    create_colocate_placement,
-    pg_scheduling_options,
-)
+
+from arctic_platform.rl.deepspeed_worker import DeepSpeedWorker
 from arctic_platform.rl.ray_cluster import init_ray_cluster
 from arctic_platform.rl.server import ArcticRLServerState
-from arctic_platform.rl.deepspeed_worker import DeepSpeedWorker
-from arctic_platform.rl.utils.debug import see_memory_usage, pr, pr0
+from arctic_platform.rl.utils import combine_metric_shards
+from arctic_platform.rl.utils import log_dp_shard_tokens
+from arctic_platform.rl.utils import merge_cuda_ipc_payloads
+from arctic_platform.rl.utils import merge_dict_shards
+from arctic_platform.rl.utils import ray_split_batch
+from arctic_platform.rl.utils import unpack_batch
+from arctic_platform.rl.utils.batch import restore_batch_order
 from arctic_platform.rl.utils.debug import ProfilerContext
+from arctic_platform.rl.utils.debug import pr0
+from arctic_platform.rl.utils.ray_pg import ColocatePlacement
+from arctic_platform.rl.utils.ray_pg import create_colocate_placement
+from arctic_platform.rl.utils.ray_pg import pg_scheduling_options
 
 logger = logging.getLogger(__name__)
 
-#PROFILER_TYPE = "c"
-#PROFILER_TYPE = "torch"
+# PROFILER_TYPE = "c"
+# PROFILER_TYPE = "torch"
 PROFILER_TYPE = "none"
 
 ENABLE_TIMERS = False
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
+
     timers = SynchronizedWallClockTimerSimple(wall_clock_breakdown=True)
 else:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimpleDummy
+
     timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
 
 
@@ -141,6 +138,7 @@ _WEIGHT_SYNC_BUCKET_SIZE = 256 * 1024 * 1024
 # Endpoints
 # ---------------------------------------------------------------------------
 
+
 def create_arctic_rl_ray_server_state(**kwargs):
     sched_pg = placement_group([{"GPU": 0, "CPU": 1}])
     return ray.remote(
@@ -157,22 +155,23 @@ def create_arctic_rl_ray_server_state(**kwargs):
 
 # TODO: add remote decorator
 class ArcticRLRayServerState(ArcticRLServerState):
-    def __init__(self,
-                training_gpus: int,
-                sampling_gpus: int,
-                log_prob_gpus: int,
-                log_prob_engine: str,
-                colocate: bool,
-                ):
+    def __init__(
+        self,
+        training_gpus: int,
+        sampling_gpus: int,
+        log_prob_gpus: int,
+        log_prob_engine: str,
+        colocate: bool,
+    ):
         total_gpus = training_gpus + sampling_gpus + log_prob_gpus
         if total_gpus == 0:
             raise ValueError("At least one of --training-gpus, --sampling-gpus, --log-prob-gpus must be > 0")
 
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-        pr0(f"[ArcticRLRayServer] initializing ray cluster")
+        pr0("[ArcticRLRayServer] initializing ray cluster")
         init_ray_cluster(auto_attach=False)
-        pr0(f"[ArcticRLRayServer] ray cluster initialized")
+        pr0("[ArcticRLRayServer] ray cluster initialized")
 
         self.training_gpus = training_gpus
         self.sampling_gpus = sampling_gpus
@@ -194,9 +193,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
             self.gpus_per_node = self.placement.gpus_per_node
             self.n_bundles = self.placement.n_bundles
             self.placement_group = (
-                self.placement.placement_groups[0]
-                if len(self.placement.placement_groups) == 1
-                else None
+                self.placement.placement_groups[0] if len(self.placement.placement_groups) == 1 else None
             )
         else:
             self.placement_groups = []
@@ -205,8 +202,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
             self.placement_group = None
 
         if self.colocate:
-            assert self.placement, \
-                "Placement groups must be created when colocate=True"
+            assert self.placement, "Placement groups must be created when colocate=True"
 
         self.training_workers = []
         self.sampling_pool = ReplicaPool()
@@ -221,7 +217,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
         self.weight_sync_ready = False
         self.weight_sync_bucket_size = _WEIGHT_SYNC_BUCKET_SIZE
 
-        pr0(f"[ArcticRLRayServerState] initialized")
+        pr0("[ArcticRLRayServerState] initialized")
 
     async def get_jobs(self) -> dict[str, Any]:
         return self.jobs
@@ -253,7 +249,6 @@ class ArcticRLRayServerState(ArcticRLServerState):
     async def get_colocate(self) -> bool:
         return self.colocate
 
-
     async def sleep_inference(self, job_id: int, level: int) -> dict[str, Any]:
         colocate = self.colocate
         results = {}
@@ -272,13 +267,10 @@ class ArcticRLRayServerState(ArcticRLServerState):
     async def _empty_training_cache(self, workers: list[DeepSpeedWorker]):
         loop = asyncio.get_running_loop()
         refs = [w.empty_cache.remote() for w in workers]
-        results = await asyncio.gather(*[
-            loop.run_in_executor(None, ray.get, ref) for ref in refs
-        ])
+        results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
         return results
 
-    async def wake_inference(self, tags: list[str] | None = None,
-                             restore_weights: bool | None = None):
+    async def wake_inference(self, tags: list[str] | None = None, restore_weights: bool | None = None):
         """Wake all inference engines, restoring GPU memory.
 
         ``restore_weights`` overrides the default of restoring the CPU-offloaded
@@ -301,7 +293,6 @@ class ArcticRLRayServerState(ArcticRLServerState):
         if lp_pool is not None and lp_pool._config is not None and lp_pool.sleeping:
             results["log_prob"] = await lp_pool.wake_up(tags=tags, restore_weights=restore)
         return results
-
 
     async def reset_prefix_cache(self, job_id: int) -> dict[str, Any]:
         """Reset the prefix cache on the sampling inference engines."""
@@ -335,12 +326,14 @@ class ArcticRLRayServerState(ArcticRLServerState):
         def _pg_options(bundle_index: int, fraction_key: str) -> dict:
             """PG-pinned scheduling: fractional GPU claim inside a specific bundle."""
             return pg_scheduling_options(
-                placement, bundle_index, _COLOCATE_GPU_FRACTIONS[fraction_key],
+                placement,
+                bundle_index,
+                _COLOCATE_GPU_FRACTIONS[fraction_key],
             )
 
-        n_bundles = placement.n_bundles
-        n_sample = self.sampling_gpus
-        n_logprob = self.log_prob_gpus
+        # n_bundles = placement.n_bundles
+        # n_sample = self.sampling_gpus
+        # n_logprob = self.log_prob_gpus
 
         # Bundle layout (deterministic), full 3-way colocation:
         #   training pins rank r        → bundle r            [0 .. training_gpus-1]
@@ -455,7 +448,9 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 num_replicas = gpus // lp_tp
                 if colocate and placement:
                     per_replica_pgs, bundle_indices = placement.tp_layout(
-                        num_replicas, lp_tp, bundle_offset=lp_bundle_offset,
+                        num_replicas,
+                        lp_tp,
+                        bundle_offset=lp_bundle_offset,
                     )
                     lp_extra_env = {}
                     if lp_tp > 1:
@@ -506,11 +501,10 @@ class ArcticRLRayServerState(ArcticRLServerState):
             assert job_config.checkpoint_path is not None, "checkpoint_path is required for training jobs"
             job_info["checkpoint_path"] = os.path.join(job_config.checkpoint_path, f"arctic_rl_job_{job_id}")
             os.makedirs(job_info["checkpoint_path"], exist_ok=True)
-            job_info["sync_path"] = os.path.join(job_info["checkpoint_path"], f"weight_sync.pt")
+            job_info["sync_path"] = os.path.join(job_info["checkpoint_path"], "weight_sync.pt")
 
         self.jobs[job_id] = job_info
         return {"job_id": job_id, "job_type": job_type, "running": True}
-
 
     async def destroy(self, job_id: int, job_type: str) -> dict[str, Any]:
         info = self.jobs.pop(job_id, None)
@@ -598,7 +592,6 @@ class ArcticRLRayServer:
 
     #     pr0(f"[ArcticRLRayServer] initialized")
 
-
     def __init__(self, arctic_rl_ray_server_state: ArcticRLRayServerState):
         self.arctic_rl_ray_server_state = arctic_rl_ray_server_state
 
@@ -616,7 +609,6 @@ class ArcticRLRayServer:
         self.log_prob_pool = ray.get(arctic_rl_ray_server_state.get_log_prob_pool.remote())  # type: ignore
         self.colocate = ray.get(arctic_rl_ray_server_state.get_colocate.remote())  # type: ignore
 
-
     def _verify_job(self, job_id: int, expected_types: Union[str, list[str]]) -> None:
         info = self.jobs.get(job_id)
         if isinstance(expected_types, str):
@@ -626,10 +618,8 @@ class ArcticRLRayServer:
         if info["job_type"] not in expected_types:
             raise ValueError(f"Job {job_id} is not a {', '.join(expected_types)} job")
 
-
     async def health(self):
         return {"status": "OK"}
-
 
     # async def initialize(self, job_config: dict[str, Any]) -> dict[str, Any]:
     #     job_config = JobConfig(**job_config)
@@ -787,10 +777,8 @@ class ArcticRLRayServer:
     #     self.jobs[job_id] = job_info
     #     return {"job_id": job_id, "job_type": job_type, "running": True}
 
-
     async def destroy(self, job_id: int, job_type: str) -> dict[str, Any]:
         return await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
-
 
     async def fwd_bwd(self, job_id: int, batch: dict) -> dict[str, Any]:
         tname_e2e = timers.start("xyz fwd_bwd e2e")
@@ -824,7 +812,6 @@ class ArcticRLRayServer:
         #     w.forward_backward.remote(s) for w, s in zip(workers, shards)
         # ])
 
-
         prof = ProfilerContext(type=PROFILER_TYPE, name="GATHER")
         with prof():
             refs = [w.forward_backward.remote(s) for w, s in zip(workers, shards)]
@@ -836,7 +823,7 @@ class ArcticRLRayServer:
 
         tname = timers.start("xyz fwd_bwd: epilogue")
         losses = [r["avg_loss"] for r in results]
-        avg_loss = sum(losses) # / len(losses)
+        avg_loss = sum(losses)  # / len(losses)
         print(f"new loss {avg_loss=}")
         print(f"new loss {len(losses)=}")
         print(f"new loss {sum(losses) / len(losses)=}")
@@ -868,7 +855,6 @@ class ArcticRLRayServer:
     #     [r.get("post_process_outputs", {}) for r in results]
     # )
     # return {"job_id": job_id, "avg_loss": avg_loss, "post_process_outputs": post_process_outputs}
-
 
     async def fwd_no_grad(self, job_id: int, batch: dict) -> dict[str, Any]:
         info = self.jobs[job_id]
@@ -908,7 +894,6 @@ class ArcticRLRayServer:
 
         return merged
 
-
     async def step(self, job_id: int) -> dict[str, Any]:
         self._verify_job(job_id, "training")
         # results = await asyncio.gather(*[w.step.remote() for w in self.training_workers])
@@ -921,7 +906,6 @@ class ArcticRLRayServer:
         )
         return merged
 
-
     async def empty_training_cache(self, job_id: int):
         """Release ZeRO partition cache and PyTorch cached memory on all workers."""
         self._verify_job(job_id, "training")
@@ -929,8 +913,6 @@ class ArcticRLRayServer:
         results = await self.arctic_rl_ray_server_state.empty_training_cache.remote(workers)
         logger.info("Empty training cache: %s", results)
         return {"job_id": job_id, "workers": results}
-
-
 
     async def save_checkpoint(self, job_id: int):
         self._verify_job(job_id, "training")
@@ -945,13 +927,10 @@ class ArcticRLRayServer:
         _ = ray.get(refs)
         return {"job_id": job_id, "path": checkpoint_path}
 
-
-
     async def sleep_inference(self, job_id: int, level: int):
         """Put all inference engines to sleep, freeing GPU memory."""
         self._verify_job(job_id, "sampling")
         return await self.arctic_rl_ray_server_state.sleep_inference.remote(job_id, level)
-
 
     async def wake_inference(self, job_id: int, tags: list[str] | None = None):
         """Wake all inference engines, restoring GPU memory."""
@@ -959,12 +938,10 @@ class ArcticRLRayServer:
         results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags)
         return {"job_id": job_id, **results}
 
-
     async def reset_prefix_cache(self, job_id: int):
         """Reset the prefix cache on the sampling inference engines."""
         self._verify_job(job_id, "sampling")
         return await self.arctic_rl_ray_server_state.reset_prefix_cache.remote(job_id)
-
 
     async def sleep_training(self, job_id: int, mode: str = "all"):
         """Offload training state to CPU (sleep training workers).
@@ -982,13 +959,9 @@ class ArcticRLRayServer:
             refs = [w.offload_lp_params.remote() for w in workers]
         else:
             refs = [w.offload_to_cpu.remote() for w in workers]
-        results = await asyncio.gather(*[
-            loop.run_in_executor(None, ray.get, ref) for ref in refs
-        ])
+        results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
         logger.info("Offload training (mode=%s): %s", mode, results)
         return {"job_id": job_id, "workers": results}
-
-
 
     async def wake_training(self, job_id: int):
         """Reload all training state to GPU (wake training workers)."""
@@ -996,12 +969,9 @@ class ArcticRLRayServer:
         workers = self.training_workers
         loop = asyncio.get_running_loop()
         refs = [w.backload_to_gpu.remote() for w in workers]
-        results = await asyncio.gather(*[
-            loop.run_in_executor(None, ray.get, ref) for ref in refs
-        ])
+        results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
         logger.info("Wake training: %s", results)
         return {"job_id": job_id, "workers": results}
-
 
     async def sleep_log_prob(self, job_id: int):
         """Offload the reference (log-prob) DeepSpeed engine to CPU.
@@ -1015,12 +985,9 @@ class ArcticRLRayServer:
             return {"job_id": job_id, "workers": []}
         loop = asyncio.get_running_loop()
         refs = [w.offload_to_cpu.remote() for w in workers]
-        results = await asyncio.gather(*[
-            loop.run_in_executor(None, ray.get, ref) for ref in refs
-        ])
+        results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
         logger.info("Offload log_prob: %s", results)
         return {"job_id": job_id, "workers": results}
-
 
     async def wake_log_prob(self, job_id: int):
         """Reload the reference (log-prob) DeepSpeed engine to GPU.
@@ -1034,13 +1001,9 @@ class ArcticRLRayServer:
             return {"job_id": job_id, "workers": []}
         loop = asyncio.get_running_loop()
         refs = [w.backload_to_gpu.remote() for w in workers]
-        results = await asyncio.gather(*[
-            loop.run_in_executor(None, ray.get, ref) for ref in refs
-        ])
+        results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
         logger.info("Wake log_prob: %s", results)
         return {"job_id": job_id, "workers": results}
-
-
 
     async def generate(self, job_id: int, request: dict[str, Any]) -> dict[str, Any]:
         request = GenerateRequest(**request)
@@ -1055,8 +1018,6 @@ class ArcticRLRayServer:
         )
 
         return {"job_id": job_id, "results": results}
-
-
 
     async def sync_weights(self, request: dict[str, Any]) -> dict[str, Any]:
         """Sync training model weights to the sampling engine.
@@ -1080,8 +1041,7 @@ class ArcticRLRayServer:
                     # Slower, memory-efficient path: stream one gathered param
                     # at a time so peak extra GPU memory is one full param per
                     # GPU instead of the whole model (avoids OOM on big models).
-                    results = await self._sync_weights_cuda_ipc_low_mem(
-                        workers, pool, lp_pool)
+                    results = await self._sync_weights_cuda_ipc_low_mem(workers, pool, lp_pool)
                 else:
                     results = await self._sync_weights_cuda_ipc(workers, pool, lp_pool)
             else:
@@ -1160,10 +1120,7 @@ class ArcticRLRayServer:
         # logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
         # return {"status": "ok"}
 
-
-
-    async def _sync_weights_cuda_ipc(self, workers, pool: ReplicaPool,
-                                    lp_pool: ReplicaPool | None = None) -> dict:
+    async def _sync_weights_cuda_ipc(self, workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None) -> dict:
         """Colocated weight sync via CUDA IPC (zero-copy, same GPU).
 
         For ZeRO-3: all workers call gather_cuda_ipc_handles collectively
@@ -1201,31 +1158,25 @@ class ArcticRLRayServer:
                 continue
             for rid in range(p.num_replicas):
                 w = p._workers[rid]
-                recv_tasks.append(
-                    loop.run_in_executor(
-                        None, ray.get,
-                        w.load_weights_cuda_ipc.remote(ipc_payload)))
+                recv_tasks.append(loop.run_in_executor(None, ray.get, w.load_weights_cuda_ipc.remote(ipc_payload)))
                 total_replicas += 1
         await asyncio.gather(*recv_tasks)
 
         # Release IPC tensor refs on every rank (each rank holds its own GPU's
         # cloned weights alive for the duration of the sync).
-        await asyncio.gather(*[
-            loop.run_in_executor(None, ray.get, w.release_ipc_handles.remote())
-            for w in workers
-        ])
+        await asyncio.gather(*[loop.run_in_executor(None, ray.get, w.release_ipc_handles.remote()) for w in workers])
 
         await self.arctic_rl_ray_server_state.wake_inference.remote(tags=["kv_cache"])
 
         elapsed = time.monotonic() - t0
         logger.info(
-            "Weight sync (CUDA IPC) complete in %.3fs (%d replica(s), %d params)",
-            elapsed, total_replicas, num_params)
+            "Weight sync (CUDA IPC) complete in %.3fs (%d replica(s), %d params)", elapsed, total_replicas, num_params
+        )
         return {"status": "ok"}
 
-
-    async def _sync_weights_cuda_ipc_low_mem(self, workers, pool: ReplicaPool,
-                                             lp_pool: ReplicaPool | None = None) -> dict:
+    async def _sync_weights_cuda_ipc_low_mem(
+        self, workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None
+    ) -> dict:
         """Memory-efficient (slower) colocated weight sync via CUDA IPC.
 
         Streams one parameter at a time: all training ranks collectively
@@ -1262,8 +1213,7 @@ class ArcticRLRayServer:
         # load lands on [1] stubs and dies with "output with shape [1] doesn't
         # match the broadcast shape". (Skipping the backload is only valid if
         # cumem owns the weights, i.e. offload_weights=False.)
-        await self.arctic_rl_ray_server_state.wake_inference.remote(
-            tags=["weights"], restore_weights=True)
+        await self.arctic_rl_ray_server_state.wake_inference.remote(tags=["weights"], restore_weights=True)
 
         all_names: list = []
         for idx, name in enumerate(param_names):
@@ -1278,31 +1228,31 @@ class ArcticRLRayServer:
             validate = all_names if idx == num_params - 1 else None
 
             recv_tasks = [
-                loop.run_in_executor(
-                    None, ray.get,
-                    w.load_weights_cuda_ipc_chunk.remote(payload, validate))
+                loop.run_in_executor(None, ray.get, w.load_weights_cuda_ipc_chunk.remote(payload, validate))
                 for w in replicas
             ]
             await asyncio.gather(*recv_tasks)
 
             # Release this param's source ref on every training rank before the
             # next gather, bounding peak memory to one full param per GPU.
-            await asyncio.gather(*[
-                loop.run_in_executor(None, ray.get, w.release_ipc_handles.remote())
-                for w in workers
-            ])
+            await asyncio.gather(
+                *[loop.run_in_executor(None, ray.get, w.release_ipc_handles.remote()) for w in workers]
+            )
 
         await self.arctic_rl_ray_server_state.wake_inference.remote(tags=["kv_cache"])
 
         elapsed = time.monotonic() - t0
         logger.info(
             "Weight sync (CUDA IPC, low-mem) complete in %.3fs (%d replica(s), %d params)",
-            elapsed, len(replicas), num_params)
+            elapsed,
+            len(replicas),
+            num_params,
+        )
         return {"status": "ok"}
 
-
-    async def _sync_weights_ipc(self, sync_path: str, workers, pool: ReplicaPool,
-                                lp_pool: ReplicaPool | None = None) -> dict:
+    async def _sync_weights_ipc(
+        self, sync_path: str, workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None
+    ) -> dict:
         """Colocated weight sync via CPU file.
 
         For ZeRO-3: all workers call gather_and_save_state_dict collectively
@@ -1315,9 +1265,7 @@ class ArcticRLRayServer:
 
         # All workers must participate for ZeRO-3 collective gather
         save_refs = [w.gather_and_save_state_dict.remote(sync_path) for w in workers]
-        results = await asyncio.gather(*[
-            loop.run_in_executor(None, ray.get, ref) for ref in save_refs
-        ])
+        results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in save_refs])
         num_params = results[0].get("num_params", 0)
 
         await self.arctic_rl_ray_server_state.wake_inference.remote(tags=["weights"])
@@ -1329,10 +1277,7 @@ class ArcticRLRayServer:
                 continue
             for rid in range(p.num_replicas):
                 w = p._workers[rid]
-                recv_tasks.append(
-                    loop.run_in_executor(
-                        None, ray.get,
-                        w.load_weights_from_shm_path.remote(sync_path)))
+                recv_tasks.append(loop.run_in_executor(None, ray.get, w.load_weights_from_shm_path.remote(sync_path)))
                 total_replicas += 1
         await asyncio.gather(*recv_tasks)
 
@@ -1342,10 +1287,9 @@ class ArcticRLRayServer:
 
         elapsed = time.monotonic() - t0
         logger.info(
-            "Weight sync (CPU→GPU) complete in %.3fs (%d replica(s), %d params)",
-            elapsed, total_replicas, num_params)
+            "Weight sync (CPU→GPU) complete in %.3fs (%d replica(s), %d params)", elapsed, total_replicas, num_params
+        )
         return {"status": "ok"}
-
 
     async def _sync_weights_nccl(self, workers, pool: ReplicaPool) -> dict:
         """Non-colocated weight sync via NCCL (original path)."""
@@ -1357,9 +1301,7 @@ class ArcticRLRayServer:
             inference_tp=pool.tp_size,
         )
         sender_ranks = [g.sender_train_rank for g in schedule.groups]
-        sender_ips = await asyncio.gather(
-            *[workers[r].get_ip.remote() for r in sender_ranks]
-        )
+        sender_ips = await asyncio.gather(*[workers[r].get_ip.remote() for r in sender_ranks])
         group_master_addrs = {g.group_id: ip for g, ip in zip(schedule.groups, sender_ips)}
 
         if not self.weight_sync_ready:
@@ -1417,7 +1359,6 @@ class ArcticRLRayServer:
         logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
         return {"status": "ok"}
 
-
     async def log_probs(self, job_id: int, request: dict[str, Any]) -> dict[str, Any]:
         self._verify_job(job_id, "log_prob")
         request = LogProbsRequest(**request)
@@ -1437,9 +1378,7 @@ class ArcticRLRayServer:
 
             workers = self.log_prob_workers
             shards, _ = ray_split_batch(batch_data, len(workers))
-            raw = await asyncio.gather(*[
-                w.compute_log_probs.remote(s) for w, s in zip(workers, shards)
-            ])
+            raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
             shard_tensors = [torch.load(io.BytesIO(r), map_location="cpu") for r in raw]
             results = torch.cat(shard_tensors, dim=0)
         else:
@@ -1451,8 +1390,6 @@ class ArcticRLRayServer:
 
         return {"job_id": job_id, "results": results}
 
-
-
     async def status(self):
         return {
             "training_gpus": self.training_gpus,
@@ -1460,7 +1397,6 @@ class ArcticRLRayServer:
             "log_prob_gpus": self.log_prob_gpus,
             "jobs": {jid: info for jid, info in self.jobs.items()},
         }
-
 
     async def get_job_status(self, job_id: int):
         info = self.jobs.get(job_id)

@@ -1,10 +1,27 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import io
 import os
-#import itertools
-import torch
 from typing import Any
 
+# import itertools
+import torch
+
 from arctic_platform.rl.zorro_train.seqlen_balancing import reorg_global_batch
+
 
 def shard_token_stats(batch_data: dict, meta_data: dict | None = None) -> dict[str, int]:
     """Summarize valid token counts for DP straggler diagnosis."""
@@ -61,7 +78,7 @@ def _split_value(val, num_chunks: int):
             raise ValueError(
                 f"Batch dimension {val.shape[0]} is smaller than num_workers "
                 f"{num_chunks}. The client must send at least one sample per "
-                f"DP worker."
+                "DP worker."
             )
         return list(torch.chunk(val, num_chunks, dim=0))
     if isinstance(val, list):
@@ -69,7 +86,7 @@ def _split_value(val, num_chunks: int):
             raise ValueError(
                 f"Batch size {len(val)} is smaller than num_workers "
                 f"{num_chunks}. The client must send at least one sample per "
-                f"DP worker."
+                "DP worker."
             )
         chunk_size = (len(val) + num_chunks - 1) // num_chunks
         return [val[i * chunk_size : (i + 1) * chunk_size] for i in range(num_chunks)]
@@ -133,7 +150,9 @@ def _split_batch(batch: dict, num_workers: int) -> list[dict]:
         shards.append(shard)
     return shards, reorder_indices
 
+
 ray_split_batch = _split_batch
+
 
 def http_split_batch(batch_bytes: bytes, num_workers: int) -> list[bytes]:
     """Deserialize a global batch, split across DP workers, re-serialize each shard."""
@@ -157,7 +176,6 @@ def http_split_batch(batch_bytes: bytes, num_workers: int) -> list[bytes]:
     #     torch.save(shard, buf)
     #     shards.append(buf.getvalue())
 
-
     # DO NOT DELETE:
     # at the moment must not recode back to bytes since we use ray to continue within the http_server - but it could be different later with DSS
     # for i in range(len(shards)):
@@ -168,9 +186,7 @@ def http_split_batch(batch_bytes: bytes, num_workers: int) -> list[bytes]:
     return shards, reorder_indices
 
 
-
-
-def dump_dict_payload(payload: dict, tag:str):
+def dump_dict_payload(payload: dict, tag: str):
     return
     for k, v in payload.items():
         if isinstance(v, torch.Tensor):
@@ -178,16 +194,18 @@ def dump_dict_payload(payload: dict, tag:str):
         else:
             print(f"{tag}: {k=} {v=}")
 
+
 def merge_dict_shards(shards_list: list[dict]) -> dict:
     if len(shards_list) <= 1:
         return shards_list[0] if shards_list else {}
     import collections
+
     combined = collections.defaultdict(list)
     for d in shards_list:
         dump_dict_payload(d, "merge_dict_shards in")
     for d in shards_list:
         for k, v in d.items():
-            if type(v) == list:
+            if isinstance(v, list):
                 combined[k].extend(v)
             else:
                 combined[k].append(v)
@@ -384,25 +402,23 @@ def restore_batch_order(batch, indices):
     if indices is None:
         return batch
 
-    #indices = list(itertools.chain.from_iterable(indices))
-    #print(f"{indices=}")
+    # indices = list(itertools.chain.from_iterable(indices))
+    # print(f"{indices=}")
     revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
 
     # verl only restores indices for compute_log_prob (and not update_actor)
     for key in batch.keys():
         if torch.is_tensor(batch[key]):
             # protect against lists of None's
-            #print(key, batch[key])
+            # print(key, batch[key])
             batch[key] = batch[key][revert_indices]
 
     return batch
 
 
-
-
 def tensorize(val: Any):
     """Recursively convert single/lists/dicts/tuples of Python scalars / lists to tensors preserving the same nested structure if any."""
-    #print(f"{val=}")
+    # print(f"{val=}")
     if isinstance(val, dict):
         for k in val.keys():
             val[k] = tensorize(val[k])

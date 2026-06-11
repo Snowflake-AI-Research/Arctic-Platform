@@ -28,19 +28,20 @@ from __future__ import annotations
 import logging
 
 from arctic_platform.rl.config import ArcticRLClientConfig
-#from arctic_platform.rl.ray_server import ArcticRLRayServerState
+from arctic_platform.rl.http_client import ArcticRLHTTPClient
+from arctic_platform.rl.ray_client import ArcticRLRayClient
+
+# from arctic_platform.rl.ray_server import ArcticRLRayServerState
 from arctic_platform.rl.server import ArcticRLServerState
 
 logger = logging.getLogger(__name__)
 
-from arctic_platform.rl.http_client import ArcticRLHTTPClient
-from arctic_platform.rl.ray_client import ArcticRLRayClient
 
 def create_arctic_rl_client(config: ArcticRLClientConfig, arctic_rl_server_state: ArcticRLServerState = None):
     if config.comm_protocol == "http":
         return ArcticRLHTTPClient(config)
     elif config.comm_protocol == "ray":
-        #assert arctic_rl_server_state is not None, "arctic_rl_server_state is required for comm_protocol: ray"
+        # assert arctic_rl_server_state is not None, "arctic_rl_server_state is required for comm_protocol: ray"
         return ArcticRLRayClient(config, arctic_rl_server_state)
     else:
         raise ValueError(f"Invalid communication protocol: {config.comm_protocol}")

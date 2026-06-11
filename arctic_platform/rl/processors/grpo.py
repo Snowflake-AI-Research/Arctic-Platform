@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """GRPO loss function and proximal logp utilities."""
 
 from __future__ import annotations
@@ -7,7 +22,10 @@ from typing import Tuple
 
 import torch
 
-from .functional import ppo_actor_loss_fn, sapo_loss_fn, agg_loss, kl_penalty
+from .functional import agg_loss
+from .functional import kl_penalty
+from .functional import ppo_actor_loss_fn
+from .functional import sapo_loss_fn
 from .pipeline import register_loss_fn
 
 # ---------------------------------------------------------------------------
@@ -74,7 +92,9 @@ def compute_prox_logp_approximations(
     generated_tokens_mask = versions >= 0
     version_diff = v_theta - v_behave
     version_gap = v_proximal - v_behave
-    alpha = torch.where((version_diff > 0) & generated_tokens_mask, version_gap / version_diff, torch.zeros_like(v_behave))
+    alpha = torch.where(
+        (version_diff > 0) & generated_tokens_mask, version_gap / version_diff, torch.zeros_like(v_behave)
+    )
     alpha = torch.clamp(alpha, 0.0, 1.0)
     approximations = {}
     methods_to_compute = [method] if method else PROX_APPROX_METHODS_ALL
@@ -107,11 +127,19 @@ def _resolve_proximal_logp(
         if not ProxLogpMethod(prox_logp_method).skips_forward_pass():
             raise ValueError(f"prox_logp is None but prox_logp_method='{prox_logp_method}'.")
         if versions is None:
-            raise ValueError(f"prox_logp is None with prox_logp_method='{prox_logp_method}' but versions not available.")
+            raise ValueError(
+                f"prox_logp is None with prox_logp_method='{prox_logp_method}' but versions not available."
+            )
     prox_logp = prox_logp_gt
     if prox_logp_method == PROX_LOGP_METHOD_LOGLINEAR:
         if prox_logp_is_none and versions is not None and current_version is not None:
-            approximations = compute_prox_logp_approximations(old_logp=old_logp, logprobs=logprobs, versions=versions, current_version=current_version, method=PROX_APPROX_METHOD_LOGLINEAR)
+            approximations = compute_prox_logp_approximations(
+                old_logp=old_logp,
+                logprobs=logprobs,
+                versions=versions,
+                current_version=current_version,
+                method=PROX_APPROX_METHOD_LOGLINEAR,
+            )
             prox_logp = approximations[PROX_APPROX_METHOD_LOGLINEAR]
     if prox_logp is None:
         raise RuntimeError(f"prox_logp is None after handling prox_logp_method='{prox_logp_method}'.")
@@ -199,15 +227,45 @@ def _internal_grpo_loss_fn(
     if use_sapo_loss:
         if use_decoupled_loss:
             raise ValueError("SAPO is not compatible with use_decoupled_loss=True.")
-        loss, stat = sapo_loss_fn(logprobs=logprobs, old_logprobs=old_logp, advantages=advantages, tau_pos=sapo_tau_pos, tau_neg=sapo_tau_neg, loss_mask=loss_mask, importance_sampling_level=importance_sampling_level, cu_seqlens=input_data.get("cu_seqlens"))
+        loss, stat = sapo_loss_fn(
+            logprobs=logprobs,
+            old_logprobs=old_logp,
+            advantages=advantages,
+            tau_pos=sapo_tau_pos,
+            tau_neg=sapo_tau_neg,
+            loss_mask=loss_mask,
+            importance_sampling_level=importance_sampling_level,
+            cu_seqlens=input_data.get("cu_seqlens"),
+        )
     else:
-        loss, stat = ppo_actor_loss_fn(logprobs=logprobs, old_logprobs=old_logp, advantages=advantages, eps_clip=eps_clip, eps_clip_higher=eps_clip_higher, loss_mask=loss_mask, c_clip=c_clip, proximal_logprobs=prox_logp, behav_imp_weight_cap=behav_imp_weight_cap, importance_sampling_level=importance_sampling_level, cu_seqlens=input_data.get("cu_seqlens"), loss_agg_mode=loss_agg_mode, rollout_is_weights=rollout_is_weights, dp_size=dp_size, batch_num_tokens=batch_num_tokens, global_batch_size=global_batch_size)
+        loss, stat = ppo_actor_loss_fn(
+            logprobs=logprobs,
+            old_logprobs=old_logp,
+            advantages=advantages,
+            eps_clip=eps_clip,
+            eps_clip_higher=eps_clip_higher,
+            loss_mask=loss_mask,
+            c_clip=c_clip,
+            proximal_logprobs=prox_logp,
+            behav_imp_weight_cap=behav_imp_weight_cap,
+            importance_sampling_level=importance_sampling_level,
+            cu_seqlens=input_data.get("cu_seqlens"),
+            loss_agg_mode=loss_agg_mode,
+            rollout_is_weights=rollout_is_weights,
+            dp_size=dp_size,
+            batch_num_tokens=batch_num_tokens,
+            global_batch_size=global_batch_size,
+        )
 
     # Optional entropy bonus: subtract entropy_coeff * mean_entropy from loss
     if entropy_coeff != 0.0:
         entropy_loss = agg_loss(
-            -entropy.float(), loss_mask, loss_agg_mode=loss_agg_mode,
-            dp_size=dp_size, batch_num_tokens=batch_num_tokens, global_batch_size=global_batch_size,
+            -entropy.float(),
+            loss_mask,
+            loss_agg_mode=loss_agg_mode,
+            dp_size=dp_size,
+            batch_num_tokens=batch_num_tokens,
+            global_batch_size=global_batch_size,
         )
         loss = loss + entropy_coeff * entropy_loss
 
@@ -218,17 +276,23 @@ def _internal_grpo_loss_fn(
             raise ValueError("use_kl_loss=True but 'ref_log_probs' not found in context.")
         kl = kl_penalty(logprob=logprobs, ref_logprob=ref_logprobs.to(logprobs.device), method=kl_loss_type)
         kl_loss = agg_loss(
-            kl, loss_mask, loss_agg_mode=loss_agg_mode,
-            dp_size=dp_size, batch_num_tokens=batch_num_tokens, global_batch_size=global_batch_size,
+            kl,
+            loss_mask,
+            loss_agg_mode=loss_agg_mode,
+            dp_size=dp_size,
+            batch_num_tokens=batch_num_tokens,
+            global_batch_size=global_batch_size,
         )
         loss = loss + kl_loss_coef * kl_loss
 
     metrics = {
-        "approx_kl":         float((stat["approx_kl"].detach() * loss_mask).sum() / loss_mask.sum().clamp(min=1)),
-        "importance_weight": float((stat["importance_weight"].detach() * loss_mask).sum() / loss_mask.sum().clamp(min=1)),
-        "clip_ratio":        float((stat["clip_mask"].float() * loss_mask).sum() / loss_mask.sum().clamp(min=1)),
-        "entropy":           float((entropy.float() * loss_mask).sum() / loss_mask.sum().clamp(min=1)),
-        "loss":              float(loss.detach().cpu().item()),
+        "approx_kl": float((stat["approx_kl"].detach() * loss_mask).sum() / loss_mask.sum().clamp(min=1)),
+        "importance_weight": float(
+            (stat["importance_weight"].detach() * loss_mask).sum() / loss_mask.sum().clamp(min=1)
+        ),
+        "clip_ratio": float((stat["clip_mask"].float() * loss_mask).sum() / loss_mask.sum().clamp(min=1)),
+        "entropy": float((entropy.float() * loss_mask).sum() / loss_mask.sum().clamp(min=1)),
+        "loss": float(loss.detach().cpu().item()),
     }
     return loss, metrics
 

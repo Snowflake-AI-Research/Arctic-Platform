@@ -56,10 +56,7 @@ class ArcticRLClientConfig(BaseModel):
     )
     use_arctic_inference: bool = Field(
         default=False,
-        description=(
-            "If True, set ARCTIC_INFERENCE_ENABLED=1 "
-            "and override VLLM_DISABLE_COMPILE_CACHE=0."
-        ),
+        description="If True, set ARCTIC_INFERENCE_ENABLED=1 and override VLLM_DISABLE_COMPILE_CACHE=0.",
     )
     full_determinism: bool = Field(
         default=False,
@@ -75,7 +72,9 @@ class ArcticRLClientConfig(BaseModel):
     )
     colocate: bool = Field(
         default=False,
-        description="Colocate training, sampling, and log-prob workers on the same GPUs using fractional Ray resources.",
+        description=(
+            "Colocate training, sampling, and log-prob workers on the same GPUs using fractional Ray resources."
+        ),
     )
 
     server_logs: bool = Field(default=True, description="Show server subprocess stdout/stderr.")

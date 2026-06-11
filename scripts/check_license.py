@@ -37,9 +37,22 @@ LICENSE_TEXT = """\
 
 
 def file_has_license(file_path: Path) -> bool:
+    # read at most first 25 lines skipping shebang lines and whitespace lines
+    c = 25
+    content = []
     with open(file_path, "r") as f:
-        content = f.read()
-        return content.startswith(LICENSE_TEXT)
+        while line := f.readline():
+            c -= 1
+            if c == 0:
+                break
+
+            if line.startswith("#!/") or line.isspace():
+                # allow the file to start with a shebang line for executable scripts
+                pass
+            else:
+                content += line
+
+        return "".join(content).startswith(LICENSE_TEXT)
 
 
 def add_license_to_file(file_path: Path) -> None:
