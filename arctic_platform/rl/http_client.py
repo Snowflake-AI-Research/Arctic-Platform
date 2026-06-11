@@ -42,7 +42,7 @@ from arctic_platform.rl.config import ArcticRLClientConfig
 from arctic_platform.rl.utils.debug import see_memory_usage, pr, pr0
 from arctic_platform.rl.http_server import ArcticRLHTTPServerState
 
-ENABLE_TIMERS = True
+ENABLE_TIMERS = False
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
     timers = SynchronizedWallClockTimerSimple(wall_clock_breakdown=True)

@@ -76,7 +76,7 @@ logger = logging.getLogger(__name__)
 #PROFILER_TYPE = "torch"
 PROFILER_TYPE = "none"
 
-ENABLE_TIMERS = True
+ENABLE_TIMERS = False
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
     timers = SynchronizedWallClockTimerSimple(wall_clock_breakdown=True)

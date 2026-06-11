@@ -43,7 +43,7 @@ from arctic_platform.rl.utils.batch import tensorize
 from arctic_platform.rl.ray_server import create_arctic_rl_ray_server_state, ArcticRLRayServerState, ArcticRLRayServer
 from arctic_platform.rl.utils.debug import see_memory_usage, pr, pr0
 
-ENABLE_TIMERS = True
+ENABLE_TIMERS = False
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
     timers = SynchronizedWallClockTimerSimple(wall_clock_breakdown=True)

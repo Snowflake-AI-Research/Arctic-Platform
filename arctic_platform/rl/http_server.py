@@ -79,7 +79,7 @@ app = FastAPI(title="Arctic RL Local Server")
 # Request / response models (mirrors dss-platform sftp_server)
 # ---------------------------------------------------------------------------
 
-ENABLE_TIMERS = True
+ENABLE_TIMERS = False
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
     timers = SynchronizedWallClockTimerSimple(wall_clock_breakdown=True)

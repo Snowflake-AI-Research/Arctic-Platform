@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 ENABLE_BALANCE_STATS = False
 
-ENABLE_TIMERS = True
+ENABLE_TIMERS = False
 
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
