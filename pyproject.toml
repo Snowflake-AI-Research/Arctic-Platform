@@ -61,6 +61,7 @@ dependencies = [
     "psutil",
     "pydantic>=2.10",
     "nvidia-ml-py",
+    "ray",
     "tabulate",
     "torch",
     "tqdm",
