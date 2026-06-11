@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Distributed stats tracker for RL training metrics."""
 
 from __future__ import annotations
@@ -7,7 +22,8 @@ import logging as _logging
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from enum import Enum, auto
+from enum import Enum
+from enum import auto
 from threading import Lock
 from typing import Dict
 
@@ -120,11 +136,17 @@ class DistributedStatsTracker:
                 else:
                     if not vals:
                         continue
-                    tensors = [v.float() if isinstance(v, torch.Tensor) else torch.tensor(v, dtype=torch.float32) for v in vals]
+                    tensors = [
+                        v.float() if isinstance(v, torch.Tensor) else torch.tensor(v, dtype=torch.float32)
+                        for v in vals
+                    ]
                     combined = torch.cat([t.reshape(-1) for t in tensors])
                     if denom_key and denom_key in self.stats:
                         denom_vals = self.stats[denom_key]
-                        denom_tensors = [v.float() if isinstance(v, torch.Tensor) else torch.tensor(v, dtype=torch.float32) for v in denom_vals]
+                        denom_tensors = [
+                            v.float() if isinstance(v, torch.Tensor) else torch.tensor(v, dtype=torch.float32)
+                            for v in denom_vals
+                        ]
                         denom = torch.cat([t.reshape(-1) for t in denom_tensors]).bool()
                         valid = combined[denom] if denom.any() else combined
                     else:

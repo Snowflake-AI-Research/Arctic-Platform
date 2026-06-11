@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Qwen3-specific model patcher.
 
@@ -6,27 +21,31 @@ deduplication at the model level.
 """
 
 import os
-import torch
 import sys
-from functools import partial
-from typing import Optional, Union
-from .module_patcher import ModuleReconstructionPatcher
-from .zorro_train import ZoRRoTrain
-from .qwen_attention_patcher import QwenAttentionPatcher, QwenAttentionOncePatcher
 
 # 2nd half of code
 import threading
+from functools import partial
 from typing import List
-from arctic_platform.rl.utils.debug import see_memory_usage, pr, pr0
+from typing import Optional
+from typing import Union
+
+import torch
+from transformers.cache_utils import Cache
+from transformers.modeling_outputs import ModelOutput
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
-from transformers.cache_utils import Cache
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, ModelOutput
+
+from arctic_platform.rl.utils.debug import pr0
+from arctic_platform.rl.utils.debug import see_memory_usage
+from arctic_platform.rl.zorro_train.module_patcher import ModuleReconstructionPatcher
+from arctic_platform.rl.zorro_train.qwen_attention_patcher import QwenAttentionOncePatcher
+from arctic_platform.rl.zorro_train.qwen_attention_patcher import QwenAttentionPatcher
+from arctic_platform.rl.zorro_train.zorro_train import ReconstructionInfo
+from arctic_platform.rl.zorro_train.zorro_train import ZoRRoTrain
 
 # Global debug object for storing baseline/patched tensors
-debug_object = {'baseline': None, 'patched': None}
-
-from arctic_platform.rl.zorro_train.zorro_train import ReconstructionInfo
+debug_object = {"baseline": None, "patched": None}
 
 
 try:
@@ -37,14 +56,16 @@ except ImportError:
     FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
 
 
-
 ENABLE_TIMERS = False
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
+
     timers = SynchronizedWallClockTimerSimple(wall_clock_breakdown=True)
 else:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimpleDummy
+
     timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
+
 
 class DedupActorWrapper:
     """
@@ -53,6 +74,7 @@ class DedupActorWrapper:
     This eliminates the need to manually check for deduplication and create patchers
     at each call site. Instead, the wrapper handles it transparently.
     """
+
     def __init__(self, actor_module, micro_batch, config):
         """
         Args:
@@ -75,20 +97,20 @@ class DedupActorWrapper:
             # During training (update_policy), we always need the patcher
             self.should_patch = True
 
-        #pr0(f"{self.should_patch=}")
-        #pr0(micro_batch)
+        # pr0(f"{self.should_patch=}")
+        # pr0(micro_batch)
 
     def __enter__(self):
         """Enter the context and apply patching if needed."""
 
-        #import ipdb; ipdb.set_trace()
+        # import ipdb; ipdb.set_trace()
         if self.should_patch:
             from arctic_platform.rl.zorro_train.qwen_model_patcher import Qwen3ModelPatcher
 
             self.patcher = Qwen3ModelPatcher(
                 model=self.actor_module,
                 reconstruction_info=self.micro_batch["reconstruction_info"],
-                use_split_attention=True
+                use_split_attention=True,
             )
             self.patcher.__enter__()
 
@@ -97,29 +119,25 @@ class DedupActorWrapper:
             # avoid computing logits on full sequence, just extract the response part
             def lm_head_new_code_path_fn(hidden_states):
                 hidden_states_extracted = ZoRRoTrain.extract_unpadded_responses_from_deduped_packed_ids(
-                                    hidden_states.squeeze(0),
-                                    self.micro_batch["reconstruction_info"],
-                                    offset=-1)
+                    hidden_states.squeeze(0), self.micro_batch["reconstruction_info"], offset=-1
+                )
                 return self.actor_module.lm_head_old_forward(hidden_states_extracted).unsqueeze(0)
 
             self.actor_module.lm_head_old_forward = self.actor_module.lm_head.forward
             self.actor_module.lm_head.forward = lm_head_new_code_path_fn
-
 
         return self.actor_module
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit the context and clean up patcher if it was created."""
         if self.should_patch:
-            if hasattr(self.actor_module, 'lm_head_old_forward'):
+            if hasattr(self.actor_module, "lm_head_old_forward"):
                 self.actor_module.lm_head.forward = self.actor_module.lm_head_old_forward
             self.patcher.__exit__(exc_type, exc_val, exc_tb)
         return False
 
 
-
-
-class Qwen3ModelOncePatcher():
+class Qwen3ModelOncePatcher:
     """
     Qwen3-specific model patcher that is done once in a model lifetime (never unpatched), unlike Qwen3ModelPatcher that can restore the original
 
@@ -133,7 +151,22 @@ class Qwen3ModelOncePatcher():
     5. After decoder layers: reconstruct to [batch_size, seq_len, hidden_dim] for logits
     """
 
-    def __init__(self, model, response_len, max_token_len, rollout_n, temperature, logits_optimization, world_size, logits_optimization_peak_mem_size_in_gib=4, logits_compute_from_fp32_inputs=False, logits_compute_in_fp32=False, use_unpad=True, patch_with_local=False, use_split_attention=True):
+    def __init__(
+        self,
+        model,
+        response_len,
+        max_token_len,
+        rollout_n,
+        temperature,
+        logits_optimization,
+        world_size,
+        logits_optimization_peak_mem_size_in_gib=4,
+        logits_compute_from_fp32_inputs=False,
+        logits_compute_in_fp32=False,
+        use_unpad=True,
+        patch_with_local=False,
+        use_split_attention=True,
+    ):
         """
         Args:
             model: Qwen3Model or Qwen3ForCausalLM instance
@@ -177,7 +210,6 @@ class Qwen3ModelOncePatcher():
         # This should be known at model init and not change half-way through, since _create_patched_forward_split_attention depends on it
         self.reconstruction_info["is_unpadded"] = self.use_unpad
 
-
     def patch_forward(self):
         self.is_model_patched = False
 
@@ -185,19 +217,24 @@ class Qwen3ModelOncePatcher():
         for name, module in self.model.named_modules():
             module_class_name = type(module).__name__
 
-            if module_class_name == 'Qwen3Model':
+            if module_class_name == "Qwen3Model":
                 # 1. patch the main model
                 self.is_model_patched = True
                 module.forward = self._create_patched_main_model_forward(module, name)
-            elif module_class_name == 'Qwen3ForCausalLM':
+            elif module_class_name == "Qwen3ForCausalLM":
                 # 2. patch the causal_lm module
                 module.forward = self._create_patched_causal_lm_forward(module, name)
 
-        assert self.is_model_patched, f"Deduplication is not supported without patching the model for {self.model.__name__}"
+        assert (
+            self.is_model_patched
+        ), f"Deduplication is not supported without patching the model for {self.model.__name__}"
 
         # 3. patch the attention layers
         self.attention_patcher = QwenAttentionOncePatcher(
-            self.model, reconstruction_info=self.reconstruction_info, patch_with_local=self.patch_with_local, use_split_attention=self.use_split_attention
+            self.model,
+            reconstruction_info=self.reconstruction_info,
+            patch_with_local=self.patch_with_local,
+            use_split_attention=self.use_split_attention,
         )
 
     def _create_patched_main_model_forward(self, module, module_name):
@@ -205,30 +242,31 @@ class Qwen3ModelOncePatcher():
         Returns patched main model forward
         """
         reconstruction_info = self.reconstruction_info
+
         def patched_forward(
             input_ids: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
-            past_key_values = None,
+            past_key_values=None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             use_cache: Optional[bool] = None,
             cache_position: Optional[torch.LongTensor] = None,
             **kwargs,
         ):
 
-            #pr0(f"_create_patched_main_model_forward {reconstruction_info=}")
+            # pr0(f"_create_patched_main_model_forward {reconstruction_info=}")
 
             # Access helpers from the original defining module
             src_mod = sys.modules[type(module).__module__]
-            DynamicCache = getattr(src_mod, 'DynamicCache', None)
-            create_causal_mask = getattr(src_mod, 'create_causal_mask', None)
-            create_sliding_window_causal_mask = getattr(src_mod, 'create_sliding_window_causal_mask', None)
-            BaseModelOutputWithPast = getattr(src_mod, 'BaseModelOutputWithPast', None)
+            DynamicCache = getattr(src_mod, "DynamicCache", None)
+            create_causal_mask = getattr(src_mod, "create_causal_mask", None)
+            create_sliding_window_causal_mask = getattr(src_mod, "create_sliding_window_causal_mask", None)
+            BaseModelOutputWithPast = getattr(src_mod, "BaseModelOutputWithPast", None)
 
             # Validate input
             if (input_ids is None) ^ (inputs_embeds is not None):
                 raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-            #import pdb; pdb.set_trace()
+            # import pdb; pdb.set_trace()
             if inputs_embeds is None:
                 inputs_embeds_dedup = module.embed_tokens(input_ids)
                 inputs_embeds = ZoRRoTrain.reconstruct_sequences(inputs_embeds_dedup, reconstruction_info)
@@ -275,7 +313,7 @@ class Qwen3ModelOncePatcher():
             # pr0(f"{hidden_states_dedup.shape=}")
             # pr0(f"{position_embeddings[0].shape=}")
 
-            for decoder_layer in module.layers[:module.config.num_hidden_layers]:
+            for decoder_layer in module.layers[: module.config.num_hidden_layers]:
                 hidden_states_dedup = decoder_layer(
                     hidden_states_dedup,
                     attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -289,7 +327,7 @@ class Qwen3ModelOncePatcher():
 
             hidden_states_dedup = module.norm(hidden_states_dedup)
 
-            #hidden_states = ZoRRoTrain.reconstruct_sequences(hidden_states_dedup, reconstruction_info)
+            # hidden_states = ZoRRoTrain.reconstruct_sequences(hidden_states_dedup, reconstruction_info)
             return BaseModelOutputWithPast(
                 last_hidden_state=hidden_states_dedup,
                 past_key_values=past_key_values if use_cache else None,
@@ -304,8 +342,8 @@ class Qwen3ModelOncePatcher():
         reconstruction_info = self.reconstruction_info
         model = self.model
         response_len = self.response_len
-        max_token_len = self.max_token_len
-        rollout_n = self.rollout_n
+        # max_token_len = self.max_token_len
+        # rollout_n = self.rollout_n
         temperature = self.temperature
         use_unpad = self.use_unpad
         world_size = self.world_size
@@ -319,7 +357,6 @@ class Qwen3ModelOncePatcher():
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
             calculate_entropy: bool = None,
-
             past_key_values: Optional[Cache] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             labels: Optional[torch.LongTensor] = None,
@@ -335,7 +372,7 @@ class Qwen3ModelOncePatcher():
 
             # Access helpers from the original defining module
             src_mod = sys.modules[type(module).__module__]
-            BaseModelOutputWithPast = getattr(src_mod, 'BaseModelOutputWithPast', None)
+            BaseModelOutputWithPast = getattr(src_mod, "BaseModelOutputWithPast", None)
 
             if attention_mask is None:
                 raise ValueError("attention_mask is required for ZoRRO")
@@ -348,30 +385,40 @@ class Qwen3ModelOncePatcher():
             if DEBUG:
                 pr0(f"{input_ids.shape=} {input_ids=}")
                 from .zorro_train import analyze_normal_batch_via_attention_mask
+
                 analyze_normal_batch_via_attention_mask(input_ids, attention_mask, response_len)
 
-            #pr0(f"{input_ids.shape=}")
-            #pr0(f"{position_ids.shape=}")
+            # pr0(f"{input_ids.shape=}")
+            # pr0(f"{position_ids.shape=}")
 
             deduplicator = ZoRRoTrain()
-            prompt_groups, unique_prompts = deduplicator.find_prompt_groups(input_ids=input_ids, response_length=response_len)
-            dedup_input_ids, adapted_position_ids, reconstruction_info_this_batch = deduplicator.create_deduplicated_batch(
-                input_ids=input_ids, position_ids=position_ids, response_length=response_len,
-                prompt_groups=prompt_groups, unique_prompts=unique_prompts,
-                attention_mask=attention_mask,
-                use_unpad=use_unpad,
+            prompt_groups, unique_prompts = deduplicator.find_prompt_groups(
+                input_ids=input_ids, response_length=response_len
+            )
+            dedup_input_ids, adapted_position_ids, reconstruction_info_this_batch = (
+                deduplicator.create_deduplicated_batch(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    response_length=response_len,
+                    prompt_groups=prompt_groups,
+                    unique_prompts=unique_prompts,
+                    attention_mask=attention_mask,
+                    use_unpad=use_unpad,
+                )
             )
 
             # this updates all the closures in the patched forwards
             reconstruction_info.update(**reconstruction_info_this_batch)
-            #input_ids_rmpad = dedup_input_ids
-            #position_ids_rmpad = adapted_position_ids
+            # input_ids_rmpad = dedup_input_ids
+            # position_ids_rmpad = adapted_position_ids
 
             if DEBUG:
                 pr0(f"{reconstruction_info=}")
                 pr0(f"{reconstruction_info['original_attention_mask'].sum()=}")
 
-            attention_mask = None # we want attention to use pos ids, but we need it not None for zorro packing at the moment
+            attention_mask = (
+                None  # we want attention to use pos ids, but we need it not None for zorro packing at the moment
+            )
 
             pr0(f"{dedup_input_ids.shape=}")
             pr0(f"{adapted_position_ids.shape=}")
@@ -391,17 +438,15 @@ class Qwen3ModelOncePatcher():
             hidden_states = outputs.last_hidden_state
 
             hidden_states_extracted = ZoRRoTrain.extract_unpadded_responses_from_deduped_packed_ids(
-                                hidden_states.squeeze(0),
-                                reconstruction_info,
-                                offset=-1)
+                hidden_states.squeeze(0), reconstruction_info, offset=-1
+            )
 
             # labels for computing the log_prob
             input_ids_rmpad_rolled = torch.roll(dedup_input_ids, shifts=-1, dims=1)  # (1, total_nnz)
             input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
             input_ids_rolled_extracted = ZoRRoTrain.extract_unpadded_responses_from_deduped_packed_ids(
-                                        input_ids_rmpad_rolled,
-                                        reconstruction_info,
-                                        offset=-1)
+                input_ids_rmpad_rolled, reconstruction_info, offset=-1
+            )
 
             timers.stop_and_print_elapsed(tname)
             tname = timers.start("zorro head+post-process")
@@ -416,7 +461,7 @@ class Qwen3ModelOncePatcher():
                 # (arctic_rl.logits_optimization_peak_mem_size_in_gib).
                 chunk_rows = _logits_chunk_rows(model.config.vocab_size, peak_mem_gib)
                 num_shards = max(1, ceildiv(hidden_states_extracted.shape[0], chunk_rows))
-                #pr0(f"derived {num_shards=}")
+                # pr0(f"derived {num_shards=}")
 
                 # sync num shards across gpus so that deepspeed won't hang if the values are different
                 if world_size > 1:
@@ -427,13 +472,17 @@ class Qwen3ModelOncePatcher():
                     # torch.distributed.all_gather(all_num_shards, local_num_shards)
                     # num_shards = max(t.item() for t in all_num_shards)
                     num_shards = local_num_shards.item()
-                    #pr0(f"synced {num_shards=}")
+                    # pr0(f"synced {num_shards=}")
 
-                compute_params = [model.lm_head.weight] # tied with self.model.embed_tokens.weight
+                compute_params = [model.lm_head.weight]  # tied with self.model.embed_tokens.weight
                 # bind the fp32 upcast flags so they flow through TiledLogProbEntropy's forward and (replayed)
                 # backward without changing its signature.
                 logprobs, entropy = TiledLogProbEntropy.apply(
-                    partial(tiled_entropy_and_logprobs_with_temperature_from_logits, logits_compute_from_fp32_inputs=logits_compute_from_fp32_inputs, logits_compute_in_fp32=logits_compute_in_fp32),
+                    partial(
+                        tiled_entropy_and_logprobs_with_temperature_from_logits,
+                        logits_compute_from_fp32_inputs=logits_compute_from_fp32_inputs,
+                        logits_compute_in_fp32=logits_compute_in_fp32,
+                    ),
                     model,
                     hidden_states_extracted,
                     input_ids_rolled_extracted,
@@ -508,7 +557,6 @@ class Qwen3ModelOncePatcher():
         return patched_forward
 
 
-
 class Qwen3ModelPatcher(ModuleReconstructionPatcher):
     """
     Qwen3-specific model patcher.
@@ -548,7 +596,7 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
         module_class_name = type(module).__name__
 
         # We want to patch Qwen3Model specifically
-        if module_class_name == 'Qwen3Model':
+        if module_class_name == "Qwen3Model":
             return True
 
         return False
@@ -557,14 +605,16 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
         """Patch all module forward methods."""
         for name, module in self.model.named_modules():
             if self._should_patch_module_forward(name, module):
-                #this is to signal that the model was patched to DP Actor
+                # this is to signal that the model was patched to DP Actor
                 self.is_model_patched = True
 
                 # Store original forward
                 self.original_forwards[name] = module.forward
                 if self.patch_with_local:
-                    #assert False, "This code path is only for debugging purposes"
-                    assert self._create_unpatched_forward_local is not None, "Subclass must implement _create_unpatched_forward_local"
+                    # assert False, "This code path is only for debugging purposes"
+                    assert (
+                        self._create_unpatched_forward_local is not None
+                    ), "Subclass must implement _create_unpatched_forward_local"
                     module.forward = self._create_unpatched_forward_local(module, name)
                 else:
                     # Create patched forward that optimizes QKV
@@ -591,7 +641,7 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
             input_ids: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
-            past_key_values = None,
+            past_key_values=None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             use_cache: Optional[bool] = None,
             cache_position: Optional[torch.LongTensor] = None,
@@ -599,10 +649,10 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
         ):
             # Access helpers from the original defining module
             src_mod = sys.modules[type(module).__module__]
-            DynamicCache = getattr(src_mod, 'DynamicCache', None)
-            create_causal_mask = getattr(src_mod, 'create_causal_mask', None)
-            create_sliding_window_causal_mask = getattr(src_mod, 'create_sliding_window_causal_mask', None)
-            BaseModelOutputWithPast = getattr(src_mod, 'BaseModelOutputWithPast', None)
+            DynamicCache = getattr(src_mod, "DynamicCache", None)
+            create_causal_mask = getattr(src_mod, "create_causal_mask", None)
+            create_sliding_window_causal_mask = getattr(src_mod, "create_sliding_window_causal_mask", None)
+            BaseModelOutputWithPast = getattr(src_mod, "BaseModelOutputWithPast", None)
 
             # Validate input
             if (input_ids is None) ^ (inputs_embeds is not None):
@@ -647,7 +697,7 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
             # create position embeddings to be shared across the decoder layers
             position_embeddings = module.rotary_emb(hidden_states, position_ids)
 
-            for decoder_layer in module.layers[:module.config.num_hidden_layers]:
+            for decoder_layer in module.layers[: module.config.num_hidden_layers]:
                 hidden_states = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -667,19 +717,15 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
 
         return unpatched_forward
 
-
-
     def _create_patched_forward(self, module, module_name):
-        """
-
-
-        """
+        """ """
         reconstruction_info = self.reconstruction_info
+
         def patched_forward(
             input_ids: Optional[torch.LongTensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
-            past_key_values = None,
+            past_key_values=None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             use_cache: Optional[bool] = None,
             cache_position: Optional[torch.LongTensor] = None,
@@ -687,15 +733,15 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
         ):
             # Access helpers from the original defining module
             src_mod = sys.modules[type(module).__module__]
-            DynamicCache = getattr(src_mod, 'DynamicCache', None)
-            create_causal_mask = getattr(src_mod, 'create_causal_mask', None)
-            create_sliding_window_causal_mask = getattr(src_mod, 'create_sliding_window_causal_mask', None)
-            BaseModelOutputWithPast = getattr(src_mod, 'BaseModelOutputWithPast', None)
+            DynamicCache = getattr(src_mod, "DynamicCache", None)
+            create_causal_mask = getattr(src_mod, "create_causal_mask", None)
+            create_sliding_window_causal_mask = getattr(src_mod, "create_sliding_window_causal_mask", None)
+            BaseModelOutputWithPast = getattr(src_mod, "BaseModelOutputWithPast", None)
 
             # Validate input
             if (input_ids is None) ^ (inputs_embeds is not None):
                 raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-            #import pdb; pdb.set_trace()
+            # import pdb; pdb.set_trace()
             if inputs_embeds is None:
                 inputs_embeds_dedup = module.embed_tokens(input_ids)
                 inputs_embeds = ZoRRoTrain.reconstruct_sequences(inputs_embeds_dedup, reconstruction_info)
@@ -738,7 +784,7 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
 
             position_embeddings = module.rotary_emb(hidden_states_dedup, position_ids_dedup)
 
-            for decoder_layer in module.layers[:module.config.num_hidden_layers]:
+            for decoder_layer in module.layers[: module.config.num_hidden_layers]:
                 hidden_states_dedup = decoder_layer(
                     hidden_states_dedup,
                     attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -752,7 +798,7 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
 
             hidden_states_dedup = module.norm(hidden_states_dedup)
 
-            #hidden_states = ZoRRoTrain.reconstruct_sequences(hidden_states_dedup, reconstruction_info)
+            # hidden_states = ZoRRoTrain.reconstruct_sequences(hidden_states_dedup, reconstruction_info)
             return BaseModelOutputWithPast(
                 last_hidden_state=hidden_states_dedup,
                 past_key_values=past_key_values if use_cache else None,
@@ -778,7 +824,9 @@ def _logits_chunk_rows(vocab_size, peak_mem_gib, bytes_per_elem=4):
     return max(1, budget_bytes // row_bytes)
 
 
-def _lm_head_logits_with_temperature(model, hidden_states, temperature, logits_compute_from_fp32_inputs=False, logits_compute_in_fp32=False):
+def _lm_head_logits_with_temperature(
+    model, hidden_states, temperature, logits_compute_from_fp32_inputs=False, logits_compute_in_fp32=False
+):
     """Project hidden states to vocab logits via the LM head, applying optional
     temperature scaling. Returns the (possibly squeezed) logits tensor.
 
@@ -838,19 +886,32 @@ def _logprobs_and_entropy_from_flat_logits(flat_logits, flat_labels, calculate_e
             # Fastest logprobs-only: log_softmax fused kernel (single pass) +
             # gather on the result.
             logprobs = torch.gather(
-                torch.nn.functional.log_softmax(flat_logits, dim=-1),
-                -1, flat_labels.unsqueeze(-1)
+                torch.nn.functional.log_softmax(flat_logits, dim=-1), -1, flat_labels.unsqueeze(-1)
             ).squeeze(-1)
     return logprobs, entropy
 
 
-def tiled_entropy_and_logprobs_with_temperature_from_logits(model, hidden_states, labels, temperature=1.0, calculate_entropy=True, logits_compute_from_fp32_inputs=False, logits_compute_in_fp32=False):
+def tiled_entropy_and_logprobs_with_temperature_from_logits(
+    model,
+    hidden_states,
+    labels,
+    temperature=1.0,
+    calculate_entropy=True,
+    logits_compute_from_fp32_inputs=False,
+    logits_compute_in_fp32=False,
+):
     # `none` mode: manifest the full logits, then compute logprobs/entropy in one shot. (Also reused per-shard
     # by TiledLogProbEntropy in `memory` mode, where it is called on tiled hidden_states so the full logits
     # aren't manifested.)
     tname_e2e = timers.start("logprob: tiled_entropy_and_logprobs_with_temperature_from_logits e2e")
 
-    logits = _lm_head_logits_with_temperature(model, hidden_states, temperature, logits_compute_from_fp32_inputs=logits_compute_from_fp32_inputs, logits_compute_in_fp32=logits_compute_in_fp32)
+    logits = _lm_head_logits_with_temperature(
+        model,
+        hidden_states,
+        temperature,
+        logits_compute_from_fp32_inputs=logits_compute_from_fp32_inputs,
+        logits_compute_in_fp32=logits_compute_in_fp32,
+    )
 
     batch_dim = logits.shape[:-1]
     flat_logits = logits.reshape(-1, logits.shape[-1])
@@ -866,7 +927,16 @@ def tiled_entropy_and_logprobs_with_temperature_from_logits(model, hidden_states
     return logprobs, entropy
 
 
-def chunked_entropy_and_logprobs_with_temperature_from_logits(model, hidden_states, labels, temperature=1.0, calculate_entropy=True, peak_mem_gib=4.0, logits_compute_from_fp32_inputs=False, logits_compute_in_fp32=False):
+def chunked_entropy_and_logprobs_with_temperature_from_logits(
+    model,
+    hidden_states,
+    labels,
+    temperature=1.0,
+    calculate_entropy=True,
+    peak_mem_gib=4.0,
+    logits_compute_from_fp32_inputs=False,
+    logits_compute_in_fp32=False,
+):
     """`compute` logits-optimization mode for ZoRRO.
 
     Manifests the full logits once (a single ``model.lm_head`` over all tokens)
@@ -887,7 +957,13 @@ def chunked_entropy_and_logprobs_with_temperature_from_logits(model, hidden_stat
     """
     tname_e2e = timers.start("logprob: chunked_entropy_and_logprobs_with_temperature_from_logits e2e")
 
-    logits = _lm_head_logits_with_temperature(model, hidden_states, temperature, logits_compute_from_fp32_inputs=logits_compute_from_fp32_inputs, logits_compute_in_fp32=logits_compute_in_fp32)
+    logits = _lm_head_logits_with_temperature(
+        model,
+        hidden_states,
+        temperature,
+        logits_compute_from_fp32_inputs=logits_compute_from_fp32_inputs,
+        logits_compute_in_fp32=logits_compute_in_fp32,
+    )
 
     batch_dim = logits.shape[:-1]
     flat_logits = logits.reshape(-1, logits.shape[-1])
@@ -946,11 +1022,18 @@ class TiledLogProbEntropy(torch.autograd.Function):
         labels_shards = list(torch.chunk(labels, chunks=shards, dim=0))
 
         with torch.no_grad():
-            logprobs_shards, entropy_shards = list(zip(*[fn(model, hidden_states_shards[idx], labels_shards[idx], temperature, calculate_entropy) for idx in range(shards)]))
+            logprobs_shards, entropy_shards = list(
+                zip(
+                    *[
+                        fn(model, hidden_states_shards[idx], labels_shards[idx], temperature, calculate_entropy)
+                        for idx in range(shards)
+                    ]
+                )
+            )
 
         if calculate_entropy:
             entropy = torch.cat(entropy_shards, dim=0)
-            #pr(f"{entropy.shape=}")
+            # pr(f"{entropy.shape=}")
         else:
             entropy = None
 
@@ -979,14 +1062,14 @@ class TiledLogProbEntropy(torch.autograd.Function):
 
         hs_grad = torch.zeros_like(hs)
 
-        #return (None, None, hs_grad, None, None, None, None, None)
+        # return (None, None, hs_grad, None, None, None, None, None)
 
         hs_shards = list(torch.chunk(hs, chunks=shards, dim=0))
         labels_shards = list(torch.chunk(labels, chunks=shards, dim=0))
 
         # not using GradientAccumulator since it's not needed under deepspeed (needed for ddp/fsdp, so leaving the code here, but commented out)
         # Create a gradient accumulator for parameters
-        #grad_accumulator = GradientAccumulator(compute_params, shards, dtype=hs.dtype)
+        # grad_accumulator = GradientAccumulator(compute_params, shards, dtype=hs.dtype)
 
         # Tell deepspeed not to add a new grad to its ipg bucket during this backward
         # oddly because of self.lm_head.weight being tied with self.model.embed_tokens.weight we have to tell DS that the grad isn't ready and it'll be reduced when model.embed_tokens.weight grad is reduced
@@ -1000,15 +1083,11 @@ class TiledLogProbEntropy(torch.autograd.Function):
             hs_shard.requires_grad_(hs_requires_grad)
 
             shard_offset = i * shard_step
-            hs_shard.grad = (
-                hs_grad.view(-1)
-                .narrow(0, shard_offset, hs_shard.numel())
-                .view_as(hs_shard)
-            )
+            hs_shard.grad = hs_grad.view(-1).narrow(0, shard_offset, hs_shard.numel()).view_as(hs_shard)
 
             # Install hooks for this shard
-            #is_last_shard = i + 1 == shards
-            #grad_accumulator.install_hooks(is_last_shard)
+            # is_last_shard = i + 1 == shards
+            # grad_accumulator.install_hooks(is_last_shard)
 
             with torch.enable_grad():
                 logprobs_shard, entropy_shard = fn(model, hs_shard, labels_shards[i], temperature, calculate_entropy)
@@ -1017,26 +1096,39 @@ class TiledLogProbEntropy(torch.autograd.Function):
             tensors = []
             if entropy_shard is not None:
                 tensors += [entropy_shard]
-                incoming_grad_shards += [(
-                    entropy_grads.view(-1)
-                    .narrow(0, i*labels_step, labels_shards[i].shape[0])
-                    .view(labels_shards[i].shape[0])
-                )]
+                incoming_grad_shards += [
+                    (
+                        entropy_grads.view(-1)
+                        .narrow(0, i * labels_step, labels_shards[i].shape[0])
+                        .view(labels_shards[i].shape[0])
+                    )
+                ]
 
             tensors += [logprobs_shard]
-            incoming_grad_shards += [(
-                logprobs_grads.view(-1)
-                .narrow(0, i*labels_step, labels_shards[i].shape[0])
-                .view(labels_shards[i].shape[0])
-            )]
+            incoming_grad_shards += [
+                (
+                    logprobs_grads.view(-1)
+                    .narrow(0, i * labels_step, labels_shards[i].shape[0])
+                    .view(labels_shards[i].shape[0])
+                )
+            ]
 
             torch.autograd.backward(tensors, incoming_grad_shards)
 
         # Clean up hooks
-        #grad_accumulator.cleanup()
-        #del grad_accumulator
+        # grad_accumulator.cleanup()
+        # del grad_accumulator
 
-        return (None, None, hs_grad, None, None, None, None, None,)
+        return (
+            None,
+            None,
+            hs_grad,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class GradientAccumulator:
@@ -1062,14 +1154,10 @@ class GradientAccumulator:
         # Initialize accumulated gradients in the specified dtype
         for param in self.params:
             if param.grad is not None:
-                self.accumulated_grads[param] = param.grad.to(
-                    self.grad_accumulation_dtype
-                )
+                self.accumulated_grads[param] = param.grad.to(self.grad_accumulation_dtype)
                 param.grad = None
             else:
-                self.accumulated_grads[param] = torch.zeros_like(
-                    param, dtype=self.grad_accumulation_dtype
-                )
+                self.accumulated_grads[param] = torch.zeros_like(param, dtype=self.grad_accumulation_dtype)
 
     def install_hooks(self, is_last_shard: bool):
         """Install gradient hooks that accumulate gradients in higher precision"""

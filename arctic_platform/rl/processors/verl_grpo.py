@@ -1,7 +1,25 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Any
+from typing import Optional
+
 import torch
-import torch.nn.functional as F
-from typing import Optional, Any
+
 from .pipeline import register_loss_fn
+
 
 def mask_and_pad_for_log_probs(tensor: torch.Tensor, batch: dict) -> torch.Tensor:
     """Place per-token logprobs at their response positions in the packed [total_nnz]
@@ -36,7 +54,6 @@ def mask_and_pad_for_log_probs(tensor: torch.Tensor, batch: dict) -> torch.Tenso
     shifted[0] = 0
 
     return torch.where(response_mask, shifted, torch.zeros_like(values))
-
 
 
 def shift_log_probs_left(tensor: torch.Tensor, batch: dict) -> torch.Tensor:
@@ -79,6 +96,7 @@ def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis: int | tuple[int, 
     valid_values = torch.where(mask.bool(), values, 0.0)
     return valid_values.sum(axis=axis)
 
+
 def masked_mean(values, mask, axis=None):
     """
     Compute the mean of `values` over elements selected by `mask`.
@@ -94,6 +112,7 @@ def masked_mean(values, mask, axis=None):
     """
     s = masked_sum(values, mask, axis)
     return s / (mask.sum(axis=axis) + 1e-8)
+
 
 def agg_loss(
     loss_mat: torch.Tensor,
@@ -157,6 +176,7 @@ def agg_loss(
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
     return loss
+
 
 def compute_policy_loss_vanilla(
     old_log_probs: torch.Tensor,
@@ -224,7 +244,7 @@ def compute_policy_loss_vanilla(
     # print(f"{negative_approx_kl=}")
     # print(f"{response_mask=}")
 
-    ppo_kl = masked_mean(-negative_approx_kl, response_mask)
+    # ppo_kl = masked_mean(-negative_approx_kl, response_mask)
     # print(f"{ppo_kl=}")
 
     pg_losses1 = -advantages * ratio
@@ -238,13 +258,11 @@ def compute_policy_loss_vanilla(
     clip_pg_losses1 = torch.maximum(
         pg_losses1, pg_losses2
     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    pg_clipfrac = masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    # pg_clipfrac = masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
 
     pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-    pg_clipfrac_lower = masked_mean(
-        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
-    )
+    # pg_clipfrac_lower = masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
@@ -252,9 +270,7 @@ def compute_policy_loss_vanilla(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
-    pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **global_batch_info
-    )
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **global_batch_info)
 
     # Emit raw masked sums + token counts so that the worker / server
     # epilogue can combine them into a global token-mean per metric per
@@ -264,20 +280,18 @@ def compute_policy_loss_vanilla(
     # token-mean × dp_size scaling.
     response_mask_f = response_mask.float()
     pg_clipfrac_mask = torch.gt(pg_losses2, pg_losses1).float() * response_mask_f
-    pg_clipfrac_lower_mask = (
-        torch.gt(clip_pg_losses1, pg_losses3).float()
-        * (advantages < 0).float()
-        * response_mask_f
-    )
+    pg_clipfrac_lower_mask = torch.gt(clip_pg_losses1, pg_losses3).float() * (advantages < 0).float() * response_mask_f
     # Stack all masked sums into a single tensor so the GPU->CPU transfer is one
     # sync (instead of 5 separate .item() stalls) on the critical path before backward.
-    stacked = torch.stack([
-        response_mask_f.sum(),                            # mask_token_count
-        pg_clipfrac_mask.sum(),                           # actor/pg_clipfrac.sum
-        ((-negative_approx_kl) * response_mask_f).sum(),  # actor/ppo_kl.sum
-        pg_clipfrac_lower_mask.sum(),                     # actor/pg_clipfrac_lower.sum
-        (pg_losses * response_mask_f).sum(),              # actor/pg_loss.sum
-    ]).detach()
+    stacked = torch.stack(
+        [
+            response_mask_f.sum(),  # mask_token_count
+            pg_clipfrac_mask.sum(),  # actor/pg_clipfrac.sum
+            ((-negative_approx_kl) * response_mask_f).sum(),  # actor/ppo_kl.sum
+            pg_clipfrac_lower_mask.sum(),  # actor/pg_clipfrac_lower.sum
+            (pg_losses * response_mask_f).sum(),  # actor/pg_loss.sum
+        ]
+    ).detach()
     (
         mask_token_count,
         pg_clipfrac_sum,
@@ -296,7 +310,6 @@ def compute_policy_loss_vanilla(
         "actor/pg_loss.tokens": mask_token_count,
     }
     return pg_loss, pg_metrics
-
 
 
 def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
@@ -323,7 +336,6 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
     backward_score = 0.5 * (logprob - ref_logprob).square()
 
     return backward_score - backward_score.detach() + forward_score.detach()
-
 
 
 def kl_penalty_forward(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
@@ -363,6 +375,7 @@ def kl_penalty_forward(logprob: torch.FloatTensor, ref_logprob: torch.FloatTenso
 
     raise NotImplementedError
 
+
 class VerlPolicyConfig:
     def __init__(self, actor_config_dict: dict, policy_loss_config_dict: dict):
         self.loss_agg_mode = actor_config_dict.get("loss_agg_mode", "token-mean")
@@ -383,18 +396,16 @@ def verl_grpo_loss(model_outputs: dict, batch: dict, meta: dict, config: dict, d
     policy_loss_config = meta.get("policy_loss_config", {})
     verl_policy_config = VerlPolicyConfig(actor_config, policy_loss_config)
 
-    #print(f"_verl_grpo_loss: {verl_policy_config=}")
+    # print(f"_verl_grpo_loss: {verl_policy_config=}")
 
     log_probs = model_outputs["logprobs"].squeeze()
     entropy = model_outputs.get("entropy", None)
     if entropy is not None:
         entropy = entropy.squeeze()
-        #print(f"_verl_grpo_loss: {entropy.shape=}")
-    #print(f"_verl_grpo_loss: {log_probs.shape=}")
+        # print(f"_verl_grpo_loss: {entropy.shape=}")
+    # print(f"_verl_grpo_loss: {log_probs.shape=}")
 
-    global_batch_info = {
-        k: meta[k] for k in ["dp_size", "batch_num_tokens", "global_batch_size"]
-    }
+    global_batch_info = {k: meta[k] for k in ["dp_size", "batch_num_tokens", "global_batch_size"]}
     global_batch_info["loss_scale_factor"] = None
 
     metrics = {}
@@ -458,9 +469,7 @@ def verl_grpo_loss(model_outputs: dict, batch: dict, meta: dict, config: dict, d
         ref_log_prob = batch["ref_log_prob"]
         # compute kl loss
         kld = kl_penalty(logprob=log_probs, ref_logprob=ref_log_prob, kl_penalty=verl_policy_config.kl_loss_type)
-        kl_loss = agg_loss(
-            loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **global_batch_info
-        )
+        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **global_batch_info)
 
         policy_loss += kl_loss * verl_policy_config.kl_loss_coef
         kl_loss_sum = (kld * response_mask_f).sum().detach().item()
@@ -474,6 +483,6 @@ def verl_grpo_loss(model_outputs: dict, batch: dict, meta: dict, config: dict, d
 
     metrics["loss.sum"] = loss_sum
     metrics["loss.tokens"] = mask_token_count
-    #print(f"_verl_grpo_loss: {policy_loss=}")
+    # print(f"_verl_grpo_loss: {policy_loss=}")
 
     return policy_loss, metrics

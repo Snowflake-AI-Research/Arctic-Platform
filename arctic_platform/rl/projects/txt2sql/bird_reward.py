@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 SQL reward function for BIRD RL training, adapted from SnowflakeDialectSQLRewardManagerV6b.
 
@@ -14,9 +29,8 @@ Reward scheme (matching V6b non-semantic-model behavior):
 import json
 import re
 import sqlite3
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 
 SQL_TIMEOUT = 30
 DEFAULT_LIMIT_NUMBER = 5000
@@ -26,6 +40,7 @@ FORMAT_REWARD_BONUS = 0.1
 # ---------------------------------------------------------------------------
 # SQL extraction (mirrors V6b's extract_solution / _extract_sql_omnisql)
 # ---------------------------------------------------------------------------
+
 
 def _extract_sql_omnisql(message: str) -> str:
     """Extract SQL from ```sql ... ``` markdown blocks (last valid block)."""
@@ -104,6 +119,7 @@ def extract_sql(response: str) -> str:
 # Format validation (mirrors V6b's validate_response_structure)
 # ---------------------------------------------------------------------------
 
+
 def validate_response_format(response: str) -> bool:
     """Check that the response has exactly one <think>...</think> pair, properly nested."""
     start_positions = [m.start() for m in re.finditer(r"<think>", response)]
@@ -117,6 +133,7 @@ def validate_response_format(response: str) -> bool:
 # ---------------------------------------------------------------------------
 # LIMIT addition (mirrors V6b's _add_limit_to_query)
 # ---------------------------------------------------------------------------
+
 
 def _add_limit_to_query(query: str, limit: int = DEFAULT_LIMIT_NUMBER) -> str:
     """Add LIMIT clause if the query doesn't already have one."""
@@ -132,15 +149,18 @@ def _add_limit_to_query(query: str, limit: int = DEFAULT_LIMIT_NUMBER) -> str:
 # SQLite execution and comparison
 # ---------------------------------------------------------------------------
 
+
 def _execute_sql(db_path: str, sql: str, timeout: float = SQL_TIMEOUT) -> frozenset | Exception:
     """Execute SQL against a SQLite database and return result as frozenset of row tuples."""
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
         deadline = __import__("time").monotonic() + timeout
+
         def _check_cancel():
             if __import__("time").monotonic() > deadline:
                 return 1
             return 0
+
         conn.set_progress_handler(_check_cancel, 1000)
         cursor = conn.cursor()
         cursor.execute(sql)
@@ -217,6 +237,7 @@ def _compare_results(
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
     """Compute reward score for SQL generation (verl custom_reward_function interface).

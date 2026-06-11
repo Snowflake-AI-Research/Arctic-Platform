@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import io
 import logging
+import numbers
 import os
+import socket
 import time
 from typing import Any
 
@@ -35,22 +37,20 @@ import deepspeed
 import ray
 import torch
 import torch.distributed as dist
-import uvicorn
 from arctic_inference.server.weight_sync.sender import WeightSender
 from deepspeed.accelerator import get_accelerator
 from transformers import AutoModelForCausalLM
-import numbers
+
 from arctic_platform.rl.processors import run_pipeline
-from arctic_platform.rl.utils import (
-    unpack_batch,
-    merge_dict_shards,
-    combine_metric_microbatches,
-    split_dict,
-    log_dp_shard_tokens,
-)
 from arctic_platform.rl.ray_cluster import primary_ip
+from arctic_platform.rl.utils import combine_metric_microbatches
+from arctic_platform.rl.utils import log_dp_shard_tokens
+from arctic_platform.rl.utils import merge_dict_shards
+from arctic_platform.rl.utils import split_dict
+from arctic_platform.rl.utils import unpack_batch
 from arctic_platform.rl.utils.debug import enable_full_determinism
-from arctic_platform.rl.utils.debug import see_memory_usage, pr, pr0
+from arctic_platform.rl.utils.debug import pr0
+from arctic_platform.rl.utils.debug import see_memory_usage
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +58,14 @@ logger = logging.getLogger(__name__)
 # Request / response models (mirrors dss-platform sftp_server)
 # ---------------------------------------------------------------------------
 
-ENABLE_TIMERS = True
+ENABLE_TIMERS = False
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
+
     timers = SynchronizedWallClockTimerSimple(wall_clock_breakdown=True)
 else:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimpleDummy
+
     timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
 
 
@@ -79,11 +81,12 @@ def make_model_gradient_checkpointing_compatible(model):
         model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
     return model
 
+
 # ---------------------------------------------------------------------------
 # DeepSpeed training actor
 # ---------------------------------------------------------------------------
 
-import socket
+
 @ray.remote
 class DeepSpeedWorker:
     """Single-GPU worker for DeepSpeed training."""
@@ -151,7 +154,7 @@ class DeepSpeedWorker:
 
         if ds_worker_config.get("use_liger", False):
             pr0(f"Using liger kernel w/ {attn_implementation=}")
-            from liger_kernel.transformers import AutoLigerKernelForCausalLM
+
             # Apply Liger kernel to the model if use_liger is set to True
             from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
 
@@ -193,18 +196,19 @@ class DeepSpeedWorker:
 
         gpu_id = torch.cuda.current_device()
         gpu_uuid = torch.cuda.get_device_properties(gpu_id).uuid
-        logger.info("Rank %d initialized on GPU %d (uuid=%s, device=%s)",
-                     self.rank, gpu_id, gpu_uuid, self._device)
+        logger.info("Rank %d initialized on GPU %d (uuid=%s, device=%s)", self.rank, gpu_id, gpu_uuid, self._device)
         self.cpu_device = torch.device("cpu")
 
         enable_gradient_checkpointing = ds_worker_config.get("enable_gradient_checkpointing", True)
         if enable_gradient_checkpointing:
             model.gradient_checkpointing_enable()
 
-        pr0(f"ds_worker[after_initialize]: {self.job_type=} {self.engine.global_steps=} {zorro_train_enable=} {model_name=}")
+        pr0(
+            "ds_worker[after_initialize]:"
+            f" {self.job_type=} {self.engine.global_steps=} {zorro_train_enable=} {model_name=}"
+        )
 
         return True
-
 
     def ds_training_config(self, job_config: dict, ds_config: dict, ds_worker_config: dict) -> dict:
         """Build the DeepSpeed config for a trainable engine (with optimizer).
@@ -247,7 +251,6 @@ class DeepSpeedWorker:
                             "warmup_min_ratio": 0.0,
                             "cos_min_ratio": sched_cfg.get("min_lr_ratio") or 0.0,
                             "warmup_type": "linear",
-
                         },
                     }
                 elif warmup_steps > 0:
@@ -280,7 +283,6 @@ class DeepSpeedWorker:
 
         return ds_config
 
-
     def ds_inference_config(self, log_prob_config: dict, ds_worker_config: dict) -> dict:
         """Build a forward-only DeepSpeed config (no optimizer state).
 
@@ -305,11 +307,10 @@ class DeepSpeedWorker:
         cfg["bf16"] = {"enabled": True}
         return cfg
 
-
     def model_patch_in_zorro(self, model, ds_worker_config):
         from arctic_platform.rl.zorro_train.qwen_model_patcher import Qwen3ModelOncePatcher
 
-        #pr0(f"Patching ZoRRO")
+        # pr0(f"Patching ZoRRO")
 
         response_len = ds_worker_config.get("response_len")
         max_token_len = ds_worker_config.get("max_token_len")
@@ -322,7 +323,19 @@ class DeepSpeedWorker:
         use_unpad = ds_worker_config.get("use_unpad")
         world_size = ds_worker_config.get("world_size")
 
-        self.dedup_actor_model_once_patcher = Qwen3ModelOncePatcher(model, response_len=response_len, max_token_len=max_token_len, rollout_n=rollout_n, temperature=temperature, logits_optimization=logits_optimization, logits_optimization_peak_mem_size_in_gib=logits_optimization_peak_mem_size_in_gib, logits_compute_from_fp32_inputs=logits_compute_from_fp32_inputs, logits_compute_in_fp32=logits_compute_in_fp32, use_unpad=use_unpad, world_size=world_size)
+        self.dedup_actor_model_once_patcher = Qwen3ModelOncePatcher(
+            model,
+            response_len=response_len,
+            max_token_len=max_token_len,
+            rollout_n=rollout_n,
+            temperature=temperature,
+            logits_optimization=logits_optimization,
+            logits_optimization_peak_mem_size_in_gib=logits_optimization_peak_mem_size_in_gib,
+            logits_compute_from_fp32_inputs=logits_compute_from_fp32_inputs,
+            logits_compute_in_fp32=logits_compute_in_fp32,
+            use_unpad=use_unpad,
+            world_size=world_size,
+        )
         self.dedup_actor_model_once_patcher.patch_forward()
 
     # move batch to device
@@ -336,7 +349,7 @@ class DeepSpeedWorker:
         return batch
 
     def _forward_maybe_backward(self, batch: dict, backward: bool) -> dict:
-        #torch.autograd.set_detect_anomaly(True)
+        # torch.autograd.set_detect_anomaly(True)
 
         pr0(f"_forward_maybe_backward mode: {backward=}")
         PROFILE = False
@@ -367,28 +380,39 @@ class DeepSpeedWorker:
         pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
 
         for i, micro_batch in enumerate(micro_batch_data):
-            import time
-            #time.sleep(1)
-            #pr0(f"{i=}")
-            #pr0(f"{micro_batch.keys()=}")
+
+            # time.sleep(1)
+            # pr0(f"{i=}")
+            # pr0(f"{micro_batch.keys()=}")
 
             log_dp_shard_tokens(
-                self.rank, f"{tag} micro_batch {i}/{num_micro_batches}", micro_batch, meta_data,
+                self.rank,
+                f"{tag} micro_batch {i}/{num_micro_batches}",
+                micro_batch,
+                meta_data,
             )
 
             DEBUG = False
             if DEBUG:
                 from arctic_platform.rl.zorro_train import analyze_normal_batch_via_attention_mask
-                analyze_normal_batch_via_attention_mask(micro_batch["input_ids"], micro_batch["attention_mask"], response_len=meta_data["max_response_len"])
 
-            #die
+                analyze_normal_batch_via_attention_mask(
+                    micro_batch["input_ids"], micro_batch["attention_mask"], response_len=meta_data["max_response_len"]
+                )
+
+            # die
             see_memory_usage(f"_forward_maybe_backward mb {i=}", force=True)
             if i == 0:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {meta_data.keys()=} {processing.keys()=}")
 
             micro_batch_output = run_pipeline(
-                self.engine, args, micro_batch, meta_data, processing,
-                device=self._device, backward=backward,
+                self.engine,
+                args,
+                micro_batch,
+                meta_data,
+                processing,
+                device=self._device,
+                backward=backward,
                 pack=False,
                 return_tensors=return_tensors,
             )
@@ -411,22 +435,23 @@ class DeepSpeedWorker:
                 # per metric; ``ray_server.fwd_bwd`` / ``http_server.fwd_bwd``
                 # then sums across DP ranks and collapses the paired keys
                 # into a single global token-mean per metric per mini-batch.
-                pipeline_outputs[k] = combine_metric_microbatches(
-                    [r[k] for r in pipeline_micro_batch_outputs]
-                )
+                pipeline_outputs[k] = combine_metric_microbatches([r[k] for r in pipeline_micro_batch_outputs])
             elif isinstance(v, dict):
                 pipeline_outputs[k] = merge_dict_shards([r[k] for r in pipeline_micro_batch_outputs])
             elif isinstance(v, numbers.Number):
                 # TODO: weight average needs to be implemented
-                pipeline_outputs[k] = sum([r[k] for r in pipeline_micro_batch_outputs]) / len(pipeline_micro_batch_outputs)
+                pipeline_outputs[k] = sum([r[k] for r in pipeline_micro_batch_outputs]) / len(
+                    pipeline_micro_batch_outputs
+                )
 
         pipeline_outputs = self._move_batch_to_device(pipeline_outputs, self.cpu_device)
 
         see_memory_usage("_forward_maybe_backward end", force=True)
         if PROFILE:
             dir = "/tmp/mem-prof"
-            rank = 0 # torch.distributed.get_rank()
+            rank = 0  # torch.distributed.get_rank()
             from pathlib import Path
+
             Path(dir).mkdir(exist_ok=True)
             torch.cuda.memory._dump_snapshot(f"{dir}/rank-{rank}.pickle")
             exit()
@@ -437,13 +462,13 @@ class DeepSpeedWorker:
     def forward_backward(self, batch: dict) -> dict:
         tname = timers.start("forward_backward")
         results = self._forward_maybe_backward(batch, backward=True)
-        timers.stop_and_print_elapsed(tname);
+        timers.stop_and_print_elapsed(tname)
         return results
 
     def forward_no_grad(self, batch: dict) -> dict:
         tname = timers.start("forward_no_grad")
         results = self._forward_maybe_backward(batch, backward=False)
-        timers.stop_and_print_elapsed(tname);
+        timers.stop_and_print_elapsed(tname)
         return results
 
     def step(self) -> dict:
@@ -485,7 +510,6 @@ class DeepSpeedWorker:
             max_bytes = max(max_bytes, numel * elem_size)
         return max_bytes
 
-
     def init_weight_sender(self, group, schedule, master_addr, base_port, bucket_size) -> bool:
         self._weight_sender = WeightSender(
             group=group,
@@ -513,10 +537,10 @@ class DeepSpeedWorker:
             return self._weight_sender.send(weights)
         return {"status": "not_initialized"}
 
-
     def send_weights_ipc(self, group_id: int) -> dict:
         """Save weights to shared memory for colocated (same-GPU) transfer."""
         from arctic_inference.server.weight_sync.ipc_engine import save_weights_to_shm
+
         weights = [(n, p.data) for n, p in self.engine.module.named_parameters()]
         return save_weights_to_shm(weights, group_id)
 
@@ -531,10 +555,10 @@ class DeepSpeedWorker:
         """
         import base64
         import pickle
+
         from torch.multiprocessing.reductions import reduce_tensor
 
-        gpu_uuid = str(torch.cuda.get_device_properties(
-            torch.cuda.current_device()).uuid)
+        gpu_uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
 
         names, dtype_names, shapes = [], [], []
         handles = []
@@ -575,8 +599,7 @@ class DeepSpeedWorker:
         import deepspeed
         from torch.multiprocessing.reductions import reduce_tensor
 
-        gpu_uuid = str(torch.cuda.get_device_properties(
-            torch.cuda.current_device()).uuid)
+        gpu_uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
 
         t0 = time.monotonic()
         names, dtype_names, shapes = [], [], []
@@ -610,14 +633,15 @@ class DeepSpeedWorker:
                 dtype_names.append(str(weight.dtype).split(".")[-1])
                 shapes.append(list(weight.shape))
 
-        if hasattr(self.engine, 'empty_partition_cache'):
+        if hasattr(self.engine, "empty_partition_cache"):
             self.engine.empty_partition_cache()
         torch.cuda.synchronize()
 
         elapsed = time.monotonic() - t0
         pickled = base64.b64encode(pickle.dumps(handles)).decode("utf-8")
-        logger.info("Rank %d gathered IPC handles in %.2fs (%d params, gpu=%s)",
-                    self.rank, elapsed, len(names), gpu_uuid)
+        logger.info(
+            "Rank %d gathered IPC handles in %.2fs (%d params, gpu=%s)", self.rank, elapsed, len(names), gpu_uuid
+        )
         return {
             "names": names,
             "dtype_names": dtype_names,
@@ -671,8 +695,7 @@ class DeepSpeedWorker:
 
         p = self._param_by_name(name)
 
-        gpu_uuid = str(torch.cuda.get_device_properties(
-            torch.cuda.current_device()).uuid)
+        gpu_uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
 
         if hasattr(p, "ds_id"):
             with deepspeed.zero.GatheredParameters([p], enabled=True):
@@ -689,8 +712,7 @@ class DeepSpeedWorker:
             "names": [name],
             "dtype_names": [str(weight.dtype).split(".")[-1]],
             "shapes": [list(weight.shape)],
-            "ipc_handles_pickled": base64.b64encode(
-                pickle.dumps([{gpu_uuid: handle}])).decode("utf-8"),
+            "ipc_handles_pickled": base64.b64encode(pickle.dumps([{gpu_uuid: handle}])).decode("utf-8"),
             "num_params": 1,
             "gpu_uuid": gpu_uuid,
         }
@@ -711,10 +733,10 @@ class DeepSpeedWorker:
         num_params = len(weights)
         del weights
         import gc
+
         gc.collect()
         elapsed = time.monotonic() - t0
-        logger.info("Rank %d saved state dict to %s in %.2fs (%d params)",
-                     self.rank, path, elapsed, num_params)
+        logger.info("Rank %d saved state dict to %s in %.2fs (%d params)", self.rank, path, elapsed, num_params)
         return {"num_params": num_params, "elapsed": elapsed}
 
     def gather_and_save_state_dict(self, path: str) -> dict:
@@ -725,6 +747,7 @@ class DeepSpeedWorker:
         rank 0 copies the full tensor and writes to disk.
         """
         import deepspeed
+
         t0 = time.monotonic()
         model = self.engine.module
         weights = []
@@ -742,17 +765,18 @@ class DeepSpeedWorker:
         num_params = len(weights)
         del weights
         import gc
+
         gc.collect()
-        if hasattr(self.engine, 'empty_partition_cache'):
+        if hasattr(self.engine, "empty_partition_cache"):
             self.engine.empty_partition_cache()
         torch.cuda.empty_cache()
         elapsed = time.monotonic() - t0
-        logger.info("Rank %d gathered+saved state dict in %.2fs (%d params)",
-                     self.rank, elapsed, num_params)
+        logger.info("Rank %d gathered+saved state dict in %.2fs (%d params)", self.rank, elapsed, num_params)
         return {"num_params": num_params, "elapsed": elapsed}
 
     def _log_mem(self, label):
         from deepspeed.runtime.utils import see_memory_usage
+
         see_memory_usage(f"[Rank {self.rank}] {label}", force=True)
 
     def _ds_offload(self, include):
@@ -765,6 +789,7 @@ class DeepSpeedWorker:
         bypasses the engine assertion (see DeepSpeed issue #6596).
         """
         from deepspeed.runtime.zero.config import OffloadDeviceEnum
+
         try:
             self.engine.offload_states(include=include)
         except AssertionError as e:
@@ -791,7 +816,7 @@ class DeepSpeedWorker:
         have no optimizer, so the optimizer-specific handling is skipped.
         """
         opt = getattr(self.engine, "optimizer", None)
-        if opt is not None and hasattr(opt, 'single_partition_of_fp32_groups'):
+        if opt is not None and hasattr(opt, "single_partition_of_fp32_groups"):
             for fp32_group in opt.single_partition_of_fp32_groups:
                 if fp32_group.grad is None:
                     fp32_group.grad = torch.zeros_like(fp32_group)
@@ -835,12 +860,15 @@ class DeepSpeedWorker:
 
         if getattr(self, "_has_optimizer", True):
             from deepspeed.runtime.zero.offload_states import OffloadStateTypeEnum
-            self._ds_offload(include=[
-                OffloadStateTypeEnum.hp_params,
-                OffloadStateTypeEnum.lp_params,
-                OffloadStateTypeEnum.lp_grads,
-                OffloadStateTypeEnum.contiguous_grad_buffer,
-            ])
+
+            self._ds_offload(
+                include=[
+                    OffloadStateTypeEnum.hp_params,
+                    OffloadStateTypeEnum.lp_params,
+                    OffloadStateTypeEnum.lp_grads,
+                    OffloadStateTypeEnum.contiguous_grad_buffer,
+                ]
+            )
         else:
             self._move_params(self.cpu_device)
 
@@ -849,8 +877,7 @@ class DeepSpeedWorker:
         self._on_gpu = False
         elapsed = time.monotonic() - t0
         mem_mb = torch.cuda.memory_allocated() / 1e6
-        logger.info("Rank %d offloaded to CPU in %.2fs (%.0f MB GPU remaining)",
-                     self.rank, elapsed, mem_mb)
+        logger.info("Rank %d offloaded to CPU in %.2fs (%.0f MB GPU remaining)", self.rank, elapsed, mem_mb)
         return {"status": "offloaded", "elapsed": elapsed, "gpu_mb": mem_mb}
 
     def backload_to_gpu(self) -> dict:
@@ -882,18 +909,20 @@ class DeepSpeedWorker:
         self._log_mem("before offload_non_lp")
 
         from deepspeed.runtime.zero.offload_states import OffloadStateTypeEnum
-        self._ds_offload(include=[
-            OffloadStateTypeEnum.hp_params,
-            OffloadStateTypeEnum.lp_grads,
-            OffloadStateTypeEnum.contiguous_grad_buffer,
-        ])
+
+        self._ds_offload(
+            include=[
+                OffloadStateTypeEnum.hp_params,
+                OffloadStateTypeEnum.lp_grads,
+                OffloadStateTypeEnum.contiguous_grad_buffer,
+            ]
+        )
 
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         elapsed = time.monotonic() - t0
         mem_mb = torch.cuda.memory_allocated() / 1e6
-        logger.info("Rank %d offloaded non-lp states in %.2fs (%.0f MB GPU)",
-                     self.rank, elapsed, mem_mb)
+        logger.info("Rank %d offloaded non-lp states in %.2fs (%.0f MB GPU)", self.rank, elapsed, mem_mb)
         return {"status": "offloaded_non_lp", "elapsed": elapsed, "gpu_mb": mem_mb}
 
     def offload_lp_params(self) -> dict:
@@ -901,6 +930,7 @@ class DeepSpeedWorker:
         t0 = time.monotonic()
 
         from deepspeed.runtime.zero.offload_states import OffloadStateTypeEnum
+
         self._ds_offload(include=[OffloadStateTypeEnum.lp_params])
 
         torch.cuda.synchronize()
@@ -908,15 +938,15 @@ class DeepSpeedWorker:
         self._on_gpu = False
         elapsed = time.monotonic() - t0
         mem_mb = torch.cuda.memory_allocated() / 1e6
-        logger.info("Rank %d offloaded lp_params in %.2fs (%.0f MB GPU remaining)",
-                     self.rank, elapsed, mem_mb)
+        logger.info("Rank %d offloaded lp_params in %.2fs (%.0f MB GPU remaining)", self.rank, elapsed, mem_mb)
         return {"status": "offloaded_lp", "elapsed": elapsed, "gpu_mb": mem_mb}
 
     def empty_cache(self) -> dict:
         """Release ZeRO-3 partition cache and PyTorch cached memory."""
-        if hasattr(self.engine, 'empty_partition_cache'):
+        if hasattr(self.engine, "empty_partition_cache"):
             self.engine.empty_partition_cache()
         import gc
+
         gc.collect()
         torch.cuda.empty_cache()
         mem_mb = torch.cuda.memory_allocated() / 1e6

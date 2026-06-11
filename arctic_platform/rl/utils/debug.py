@@ -13,29 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import random
-
-import numpy as np
-import torch
-
-
-
-
 import builtins
+import cProfile
 import fcntl
 import gc
 import os
+import pstats
+import random
+from collections import defaultdict
+from contextlib import nullcontext
+from pstats import Stats
 
+import numpy as np
 import psutil
 import torch
 import torch.distributed as dist
 from deepspeed.accelerator import get_accelerator
-
-from collections import defaultdict
-
 from deepspeed.utils.timer import SynchronizedWallClockTimer
-
+from torch.profiler import ProfilerActivity
+from torch.profiler import profile
 
 # Set to True to quickly temporarily turn off all debugging w/o needing to disable each call
 #
@@ -249,7 +245,6 @@ def print_rank(*msg, force=True, ranks=None, **kwargs):
     print(f"[{global_rank}]", *msg, **kwargs)
 
 
-
 def print_rank0(*msg, force=True, **kwargs):
     """print something only on rank 0"""
     if DISABLE_DEBUG or not force:
@@ -258,6 +253,7 @@ def print_rank0(*msg, force=True, **kwargs):
     global_rank = get_rank()
     if global_rank == 0:
         print(f"[{global_rank}]", *msg, **kwargs)
+
 
 pr = print_rank
 pr0 = print_rank0
@@ -289,7 +285,7 @@ def debug_gathered_tensor(tensor, group, name=None, dim=0):
 
 
 class SynchronizedWallClockTimerSimpleDummy(object):
-    """ A dummy version of SynchronizedWallClockTimerSimple which can use the same API but it just won't do anything """
+    """A dummy version of SynchronizedWallClockTimerSimple which can use the same API but it just won't do anything"""
 
     def __init__(self, *args, **kwargs):
         self.times = defaultdict(float)
@@ -368,27 +364,23 @@ class SynchronizedWallClockTimerSimple(SynchronizedWallClockTimer):
         return self.times[name]
 
     def print_elapsed(self, name, prefix="TIMER"):
-        """ prints elapsed timing """
+        """prints elapsed timing"""
         print(f"{prefix}: {name}: {self.times[name]:.2f}msec")
 
     def stop_and_print_elapsed(self, name, prefix="TIMER"):
-        """ stop and prints elapsed timing """
+        """stop and prints elapsed timing"""
         self.stop(name)
         self.print_elapsed(name, prefix=prefix)
 
 
 ##### Profilers Setup Start #####
 
-import cProfile
-from pstats import Stats
-from torch.profiler import profile, record_function, ProfilerActivity
-from contextlib import nullcontext
-import pstats
 
 # customize the precision of cProfile to give 6 decimals
 pstats.f8 = lambda x: f"{x:3.6f}"
 
-class ProfilerContext():
+
+class ProfilerContext:
     """
     A proxy Profiler context manager class that can quickly choose between cProfile, torch.profiler and no-profiler w/o changing the end user code (other than changing the profiler type flag)
 
@@ -431,7 +423,7 @@ class ProfilerContext():
             self.ctx = nullcontext()
 
     def __call__(self):
-        if self.torch and torch.cuda.is_available(): # or self.c
+        if self.torch and torch.cuda.is_available():  # or self.c
             torch.cuda.synchronize()
 
         return self.ctx
@@ -445,16 +437,14 @@ class ProfilerContext():
         elif self.c:
             print(f"*** cProfile {self.name} ***")
             stats = Stats(self.ctx)
-            stats.sort_stats('tottime').print_stats(20)
+            stats.sort_stats("tottime").print_stats(20)
             # cumulative is useful to understand where some of the large internal time overheads come from - because it shows you the stack of calls leading to the slow call. So `tottime` shows candidates to study and `cumulative` for finding context for those calls
-            stats.sort_stats('cumulative').print_stats(50)
+            stats.sort_stats("cumulative").print_stats(50)
         else:
-            pass # report nothing
-
+            pass  # report nothing
 
 
 ##### Profilers Setup END #####
-
 
 
 def _is_npu_available() -> bool:
@@ -491,5 +481,3 @@ def enable_full_determinism(seed: int):
     if is_npu_available:
         torch.npu.manual_seed(seed)
         torch.npu.manual_seed_all(seed)
-
-

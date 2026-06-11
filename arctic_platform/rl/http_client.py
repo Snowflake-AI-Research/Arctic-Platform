@@ -39,15 +39,17 @@ import requests
 import torch
 
 from arctic_platform.rl.config import ArcticRLClientConfig
-from arctic_platform.rl.utils.debug import see_memory_usage, pr, pr0
 from arctic_platform.rl.http_server import ArcticRLHTTPServerState
+from arctic_platform.rl.utils.debug import pr0
 
-ENABLE_TIMERS = True
+ENABLE_TIMERS = False
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
+
     timers = SynchronizedWallClockTimerSimple(wall_clock_breakdown=True)
 else:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimpleDummy
+
     timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
 
 logger = logging.getLogger(__name__)
@@ -247,9 +249,7 @@ class ArcticRLHTTPClient:
                     pass
                 time.sleep(5)
             else:
-                raise TimeoutError(
-                    f"{label} job {job_id} did not become RUNNING within {timeout}s"
-                )
+                raise TimeoutError(f"{label} job {job_id} did not become RUNNING within {timeout}s")
 
     def _post_initialize(self, job_type: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -394,7 +394,7 @@ class ArcticRLHTTPClient:
             data=request_body,
             headers={
                 "Content-Type": "application/octet-stream",
-#                "Content-Encoding": "gzip",
+                #                "Content-Encoding": "gzip",
             },
         )
         timers.stop_and_print_elapsed(tname)
@@ -431,10 +431,10 @@ class ArcticRLHTTPClient:
             f"{self._base_url}/fwd-no-grad",
             params={"job_id": job_id},
             data=request_body,
-            #data=buffer.getvalue(),
+            # data=buffer.getvalue(),
             headers={
                 "Content-Type": "application/octet-stream",
-#                "Content-Encoding": "gzip",
+                #                "Content-Encoding": "gzip",
             },
         )
         resp.raise_for_status()
@@ -529,9 +529,7 @@ class ArcticRLHTTPClient:
         """Put the sampling inference engine to sleep (free GPU memory)."""
         resp = self._session.post(
             f"{self._base_url}/sleep-inference",
-            params={"job_id": self.sampling_job_id,
-                    "level": level
-                    },
+            params={"job_id": self.sampling_job_id, "level": level},
         )
         resp.raise_for_status()
         return resp.json()
@@ -615,8 +613,7 @@ class ArcticRLHTTPClient:
     # Weight sync
     # ------------------------------------------------------------------
 
-    async def sync_weights(self, cuda_ipc: bool = False,
-                           low_memory: bool = False) -> dict[str, Any]:
+    async def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict[str, Any]:
         """Sync training model weights to the sampling engine.
 
         3 modes:

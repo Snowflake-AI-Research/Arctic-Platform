@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Attention layer monkey-patching for prompt reconstruction.
 
@@ -5,10 +20,9 @@ Temporarily reconstructs full sequences during attention computation.
 NO PADDING SUPPORT - assumes all sequences have the same length.
 """
 
-import torch
+from typing import Dict
+
 import torch.nn as nn
-from typing import Dict, List
-from .zorro_train import ZoRRoTrain
 
 
 class ModuleReconstructionPatcher:
@@ -37,7 +51,9 @@ class ModuleReconstructionPatcher:
                 self.original_forwards[name] = module.forward
 
                 if self.patch_with_local:
-                    assert self._create_unpatched_forward_local is not None, "Subclass must implement _create_unpatched_forward_local"
+                    assert (
+                        self._create_unpatched_forward_local is not None
+                    ), "Subclass must implement _create_unpatched_forward_local"
                     module.forward = self._create_unpatched_forward_local(module, name)
                 else:
                     # Create patched forward that optimizes QKV
@@ -51,14 +67,14 @@ class ModuleReconstructionPatcher:
         self.original_forwards.clear()
 
     def _create_unpatched_forward_local(self, module, module_name):
-        ''' implement in subclass. This should contain the original forward logic locally to allow for debugging '''
+        """implement in subclass. This should contain the original forward logic locally to allow for debugging"""
         raise NotImplementedError("Subclass should override this")
 
     def _create_patched_forward(self, module, module_name):
         """
-    This should contain the patched forward logic that reconstructs the full sequences temporarily.
+        This should contain the patched forward logic that reconstructs the full sequences temporarily.
         """
-        ''' Subclass should override this '''
+        """ Subclass should override this """
         raise NotImplementedError("Subclass should override this")
 
     @staticmethod

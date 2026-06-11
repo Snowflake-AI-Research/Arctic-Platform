@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Ray placement-group helpers for colocated RL training/inference.
 
 The colocated mode pins training, sampling, and log-prob actors to the same
@@ -23,10 +38,12 @@ This module centralizes:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from dataclasses import field
 
 import ray
-from ray.util.placement_group import PlacementGroup, placement_group
+from ray.util.placement_group import PlacementGroup
+from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 logger = logging.getLogger(__name__)
@@ -49,14 +66,12 @@ def detect_gpus_per_node() -> int:
         if g > 0:
             counts.append(g)
     if not counts:
-        raise RuntimeError(
-            "Could not detect any alive Ray nodes with GPUs while creating "
-            "colocate placement groups"
-        )
+        raise RuntimeError("Could not detect any alive Ray nodes with GPUs while creating colocate placement groups")
     if len(set(counts)) > 1:
         logger.warning(
             "Heterogeneous GPU counts per node detected: %s; using max=%d",
-            counts, max(counts),
+            counts,
+            max(counts),
         )
     return max(counts)
 
@@ -111,8 +126,7 @@ class ColocatePlacement:
         """
         if self.gpus_per_node % tp != 0:
             raise ValueError(
-                f"TP={tp} must divide gpus_per_node={self.gpus_per_node} "
-                f"so that each TP group fits on a single node"
+                f"TP={tp} must divide gpus_per_node={self.gpus_per_node} so that each TP group fits on a single node"
             )
         per_replica_pgs: list[PlacementGroup] = []
         bundle_indices: list[int] = []
@@ -163,15 +177,14 @@ def create_colocate_placement(
             )
         pg_sizes = [gpus_per_node] * (n_bundles // gpus_per_node)
 
-    pgs = [
-        placement_group([dict(resources)] * sz, strategy="STRICT_PACK")
-        for sz in pg_sizes
-    ]
+    pgs = [placement_group([dict(resources)] * sz, strategy="STRICT_PACK") for sz in pg_sizes]
     ray.get([pg.ready() for pg in pgs])
     logger.info(
-        "Created colocate placement: %d PG(s) STRICT_PACK, sizes=%s, "
-        "gpus_per_node=%d, n_bundles=%d",
-        len(pgs), pg_sizes, gpus_per_node, n_bundles,
+        "Created colocate placement: %d PG(s) STRICT_PACK, sizes=%s, gpus_per_node=%d, n_bundles=%d",
+        len(pgs),
+        pg_sizes,
+        gpus_per_node,
+        n_bundles,
     )
     return ColocatePlacement(
         placement_groups=pgs,
