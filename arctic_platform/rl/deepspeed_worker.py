@@ -216,7 +216,7 @@ class DeepSpeedWorker:
         training_config = job_config.get("training_config")
         if training_config is not None:
             opt_cfg = training_config.get("optimizer", {})
-            ds_config.setdefault("optimizer", {
+            ds_config["optimizer"] = {
                 "type": "AdamW",
                 "params": {
                     "lr": opt_cfg.get("lr", 1e-5),
@@ -224,20 +224,53 @@ class DeepSpeedWorker:
                     "eps": 1e-8,
                     "weight_decay": opt_cfg.get("weight_decay", 0.0),
                 },
-            })
+            }
             if "gradient_accumulation_steps" in training_config:
-                ds_config.setdefault("gradient_accumulation_steps", training_config["gradient_accumulation_steps"])
+                ds_config["gradient_accumulation_steps"] = training_config["gradient_accumulation_steps"]
             if "gradient_clipping" in opt_cfg:
-                ds_config.setdefault("gradient_clipping", opt_cfg["gradient_clipping"])
+                ds_config["gradient_clipping"] = opt_cfg["gradient_clipping"]
 
-        ds_config.setdefault("train_micro_batch_size_per_gpu", 1)
+            sched_cfg = training_config.get("lr_scheduler", None)
+            horizon = training_config.get("training_horizon", 0)
+            if sched_cfg is not None and horizon > 0:
+                lr = opt_cfg.get("lr", 1e-5)
+                warmup_steps = sched_cfg.get("warmup_ratio", 0.0) * horizon
+                if sched_cfg.get("type", "constant") == "cosine":
+                    ds_config["scheduler"] = {
+                        "type": "WarmupCosineLR",
+                        "params": {
+                            "total_num_steps": horizon,
+                            "warmup_num_steps": warmup_steps,
+                            "warmup_min_ratio": 0.0,
+                            "cos_min_ratio": sched_cfg.get("min_lr_ratio") or 0.0,
+                            "warmup_type": "linear",
+
+                        },
+                    }
+                elif warmup_steps > 0:
+                    ds_config["scheduler"] = {
+                        "type": "WarmupLR",
+                        "params": {
+                            "warmup_min_lr": 0.0,
+                            "warmup_max_lr": lr,
+                            "warmup_num_steps": warmup_steps,
+                            "warmup_type": "linear",
+                        },
+                    }
+                else:
+                    # No LR scheduler, use constant LR
+                    pass
 
         if ds_worker_config.get("use_autocast", False):
-            ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
-            ds_config.setdefault("bf16", {"enabled": True, "bf16_master_weights_and_grads": True, "bf16_optimizer_states": True})
-        else:
-            ds_config.setdefault("bf16", {"enabled": True})
+            ds_config["torch_autocast"] = {"enabled": True, "dtype": "bfloat16"}
 
+        if ds_worker_config.get("fp32_gradients", False):
+            ds_config["communication_data_type"] = "fp32"
+            ds_config["data_types"] = {"grad_accum_dtype": "fp32"}
+
+        # Set reasonable defaults as fallbacks
+        ds_config.setdefault("train_micro_batch_size_per_gpu", 1)
+        ds_config.setdefault("bf16", {"enabled": True})
         ds_config.setdefault(
             "optimizer",
             {
