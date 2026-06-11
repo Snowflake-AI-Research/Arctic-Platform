@@ -205,7 +205,7 @@ def merge_dict_shards(shards_list: list[dict]) -> dict:
         dump_dict_payload(d, "merge_dict_shards in")
     for d in shards_list:
         for k, v in d.items():
-            if type(v) == list:
+            if isinstance(v, list):
                 combined[k].extend(v)
             else:
                 combined[k].append(v)

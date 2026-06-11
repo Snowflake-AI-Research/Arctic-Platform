@@ -331,9 +331,9 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 _COLOCATE_GPU_FRACTIONS[fraction_key],
             )
 
-        n_bundles = placement.n_bundles
-        n_sample = self.sampling_gpus
-        n_logprob = self.log_prob_gpus
+        # n_bundles = placement.n_bundles
+        # n_sample = self.sampling_gpus
+        # n_logprob = self.log_prob_gpus
 
         # Bundle layout (deterministic), full 3-way colocation:
         #   training pins rank r        → bundle r            [0 .. training_gpus-1]
