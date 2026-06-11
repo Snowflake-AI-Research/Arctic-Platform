@@ -16,8 +16,8 @@ jobs:
   unit-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         id: setup_python
         with:
           python-version: '3.12'
@@ -29,17 +29,17 @@ jobs:
           versions="torch-$torch_version-deepspeed-$deepspeed_version"
           echo "versions=$versions" >> $GITHUB_OUTPUT
       - name: Restore cached virtualenv
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           key: venv-${{ runner.os }}-${{ steps.setup_python.outputs.python-version }}-${{ steps.get_latest_versions.outputs.versions }}-${{ hashFiles('pyproject.toml') }}
           path: .venv
       - name: Restore cached torch extensions
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: ~/.cache/torch_extensions
           key: torch-extensions-${{ runner.os }}-${{ steps.setup_python.outputs.python-version }}-${{ steps.get_latest_versions.outputs.versions }}
       - name: Restore huggingface cache
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: ~/.cache/huggingface
           key: huggingface-cache-${{ runner.os }}-${{ steps.setup_python.outputs.python-version }}-${{ steps.get_latest_versions.outputs.versions }}
