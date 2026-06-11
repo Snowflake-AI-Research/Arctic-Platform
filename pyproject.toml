@@ -65,6 +65,7 @@ dependencies = [
     "torch",
     "tqdm",
     "transformers>=4.56,<5.0.0", # torch_dtype deprecation, 5.0 is unstable at the moment
+    "uvicorn",
     "wandb",
     "yq",
 ]
