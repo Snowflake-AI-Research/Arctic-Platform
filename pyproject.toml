@@ -61,12 +61,14 @@ dependencies = [
     "psutil",
     "pydantic>=2.10",
     "nvidia-ml-py",
+    "ray",
     "tabulate",
     "torch",
     "tqdm",
     "transformers>=4.56,<5.0.0", # torch_dtype deprecation, 5.0 is unstable at the moment
     "wandb",
     "yq",
+    "uvicorn",
 ]
 
 # Optional development dependencies
@@ -103,4 +105,3 @@ snowflake = [
 vllm = [
     "vllm==0.18.0",
 ]
-

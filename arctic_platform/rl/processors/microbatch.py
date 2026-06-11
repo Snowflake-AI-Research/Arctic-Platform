@@ -1,17 +1,30 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Micro-batch splitting utilities for RL training."""
 
 from __future__ import annotations
 
 import bisect
 import itertools
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass as _dataclass, field as _field
-from typing import NamedTuple
+from dataclasses import dataclass as _dataclass
+from dataclasses import field as _field
 
 import numpy as np
 import torch
 import torch.distributed as dist
-
 
 DEFAULT_MAX_TOKENS_PER_MB = 10240
 
@@ -61,6 +74,7 @@ def _ffd_allocate(values, capacity: int, min_groups: int, n_groups_divisor: int 
 @_dataclass
 class MicroBatchSpec:
     """Specification for splitting micro-batches during training."""
+
     n_mbs: int | None = _field(default=1, metadata={"help": "Number of micro-batches."})
     granularity: int = _field(default=1, metadata={"help": "Granularity per micro-batch."})
     max_tokens_per_mb: int | None = _field(default=None, metadata={"help": "Max tokens per micro-batch."})
@@ -68,7 +82,12 @@ class MicroBatchSpec:
 
     @classmethod
     def new(cls, mb_spec: "MicroBatchSpec", **kwargs):
-        fields = dict(n_mbs=mb_spec.n_mbs, granularity=mb_spec.granularity, max_tokens_per_mb=mb_spec.max_tokens_per_mb, n_mbs_divisor=mb_spec.n_mbs_divisor)
+        fields = dict(
+            n_mbs=mb_spec.n_mbs,
+            granularity=mb_spec.granularity,
+            max_tokens_per_mb=mb_spec.max_tokens_per_mb,
+            n_mbs_divisor=mb_spec.n_mbs_divisor,
+        )
         fields.update(kwargs)
         return cls(**fields)
 
@@ -107,7 +126,9 @@ def _dict_of_list2list_of_dict(dict_of_lists):
 
 
 def _allocate_balanced_mbs(mb_spec, lens):
-    group_indices = _ffd_allocate(lens, mb_spec.max_tokens_per_mb, min_groups=mb_spec.n_mbs or 1, n_groups_divisor=mb_spec.n_mbs_divisor)
+    group_indices = _ffd_allocate(
+        lens, mb_spec.max_tokens_per_mb, min_groups=mb_spec.n_mbs or 1, n_groups_divisor=mb_spec.n_mbs_divisor
+    )
     return sorted([sorted(g) for g in group_indices])
 
 
@@ -148,12 +169,15 @@ def split_padded_tensor_dict_into_mb_list(data: dict, mb_spec: MicroBatchSpec, g
         if max_n_mbs != len(group_indices):
             group_indices = _allocate_balanced_mbs(MicroBatchSpec.new(mb_spec, n_mbs=max_n_mbs), input_lens)
 
-    group_indices = [_flat2d_mb([list(range(i * granularity, (i + 1) * granularity)) for i in gi]) for gi in group_indices]
+    group_indices = [
+        _flat2d_mb([list(range(i * granularity, (i + 1) * granularity)) for i in gi]) for gi in group_indices
+    ]
     splitted_lens = [[seq_lens[i] for i in gi] for gi in group_indices]
     group_n_seqs = [len(x) for x in splitted_lens]
     group_lens = [sum(x) for x in splitted_lens]
     forward_indices = _flat2d_mb(group_indices)
     import numpy as _np
+
     backward_indices = _np.zeros(bs, dtype=_np.int64)
     backward_indices[forward_indices] = _np.arange(bs)
 
@@ -162,7 +186,7 @@ def split_padded_tensor_dict_into_mb_list(data: dict, mb_spec: MicroBatchSpec, g
         reordered = torch.stack(_reorder_list(unpacked, forward_indices))
         result, offset = [], 0
         for n in group_n_seqs:
-            result.append(reordered[offset:offset + n])
+            result.append(reordered[offset : offset + n])
             offset += n
         return result
 
@@ -173,4 +197,11 @@ def split_padded_tensor_dict_into_mb_list(data: dict, mb_spec: MicroBatchSpec, g
     mbs = _dict_of_list2list_of_dict(to_split)
     results = [{**mb, **not_to_split} for mb in mbs]
 
-    return MicroBatchList(data=data, mb_spec=mb_spec, mbs=results, forward_indices=forward_indices, backward_indices=backward_indices.tolist(), group_lens=group_lens)
+    return MicroBatchList(
+        data=data,
+        mb_spec=mb_spec,
+        mbs=results,
+        forward_indices=forward_indices,
+        backward_indices=backward_indices.tolist(),
+        group_lens=group_lens,
+    )

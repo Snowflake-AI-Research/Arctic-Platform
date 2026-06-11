@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Download LoongRL-Train-Data from HuggingFace and save as verl-compatible parquets.
 
 Subsets:
@@ -9,9 +24,11 @@ Each subset pair is merged into a single dataset per task, then split into
 train/test parquets. A merged version across all tasks is also produced.
 """
 
-import os
 import argparse
-from datasets import load_dataset, concatenate_datasets
+import os
+
+from datasets import concatenate_datasets
+from datasets import load_dataset
 
 HF_REPO = "OldKingMeister/LoongRL-Train-Data"
 
@@ -76,7 +93,7 @@ def download_and_save(output_dir: str, test_ratio: float = 0.05, seed: int = 42)
             merged = merged.remove_columns(drop_cols)
 
         merged = merged.map(add_system_prompt)
-        print(f"  Added system prompt to all rows")
+        print("  Added system prompt to all rows")
 
         split = merged.train_test_split(test_size=test_ratio, seed=seed)
         train_ds = split["train"]
@@ -102,7 +119,7 @@ def download_and_save(output_dir: str, test_ratio: float = 0.05, seed: int = 42)
     os.makedirs(merged_dir, exist_ok=True)
     merged_train.to_parquet(os.path.join(merged_dir, "train.parquet"))
     merged_test.to_parquet(os.path.join(merged_dir, "test.parquet"))
-    print(f"\nMerged all tasks:")
+    print("\nMerged all tasks:")
     print(f"  Train: {os.path.join(merged_dir, 'train.parquet')} ({len(merged_train)} rows)")
     print(f"  Test:  {os.path.join(merged_dir, 'test.parquet')} ({len(merged_test)} rows)")
 

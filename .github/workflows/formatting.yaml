@@ -1,0 +1,36 @@
+name: Formatting
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  formatting:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        id: setup_python
+        with:
+          python-version: '3.10'
+      - name: Restore cached pre-commit environment
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ steps.setup_python.outputs.python-version }}-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Setup environment
+        run: |
+          python scripts/install_deps.py formatting
+      - name: Environment print
+        run: pip list
+      - name: Formatting checks
+        run: |
+          pre-commit run --all-files --show-diff-on-failure

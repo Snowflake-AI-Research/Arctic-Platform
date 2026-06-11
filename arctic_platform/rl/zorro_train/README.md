@@ -115,11 +115,11 @@ The implementation uses **monkey patching** to intercept attention modules:
 
 ## Key Features
 
-✅ **Mathematically Correct**: Gradients match baseline implementation (within numerical precision)  
-✅ **Transparent**: Works as a drop-in replacement for standard forward/backward  
-✅ **Flexible**: Supports multiple attention implementations (SDPA, Flash Attention 2/3)  
-✅ **Gradient Checkpointing**: Compatible with activation checkpointing  
-✅ **Mixed Precision**: Optimized for `bfloat16` training  
+✅ **Mathematically Correct**: Gradients match baseline implementation (within numerical precision)
+✅ **Transparent**: Works as a drop-in replacement for standard forward/backward
+✅ **Flexible**: Supports multiple attention implementations (SDPA, Flash Attention 2/3)
+✅ **Gradient Checkpointing**: Compatible with activation checkpointing
+✅ **Mixed Precision**: Optimized for `bfloat16` training
 
 ## Getting Started
 
@@ -305,4 +305,3 @@ This implementation builds on:
 - Hugging Face Transformers for model implementations
 - Flash Attention for efficient attention kernels
 - VERL framework for RL training infrastructure
-

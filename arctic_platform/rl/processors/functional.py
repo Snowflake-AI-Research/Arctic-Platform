@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Functional math utilities for RL loss computation."""
 
 from __future__ import annotations
@@ -25,9 +40,7 @@ def masked_normalization(
     if dim is None:
         dim = tuple(range(len(x.shape)))
     if mask is None:
-        factor = torch.tensor(
-            np.prod([x.shape[d] for d in dim]), dtype=dtype, device=x.device
-        )
+        factor = torch.tensor(np.prod([x.shape[d] for d in dim]), dtype=dtype, device=x.device)
     else:
         mask = mask.to(dtype)
         x = x * mask
@@ -127,8 +140,7 @@ def kl_penalty(
         kl = torch.clamp(kl, min=-20.0, max=20.0)
         return torch.clamp(kl.exp() - kl - 1, min=-10.0, max=10.0)
     raise ValueError(
-        f"Invalid kl_penalty method: '{method}'. "
-        "Expected one of: 'k1'/'kl', 'abs', 'k2'/'mse', 'k3'/'low_var_kl'."
+        f"Invalid kl_penalty method: '{method}'. Expected one of: 'k1'/'kl', 'abs', 'k2'/'mse', 'k3'/'low_var_kl'."
     )
 
 
@@ -145,10 +157,18 @@ def _compute_sequence_level_ratio_and_advantages(
         seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
         sequence_idx = torch.arange(batch_size, device=log_ratio.device).repeat_interleave(seq_lengths)
         masked_log_ratio = torch.where(loss_mask, log_ratio, 0.0)
-        log_ratio_sum_per_seq = torch.zeros(batch_size, device=log_ratio.device, dtype=log_ratio.dtype).scatter_add_(0, sequence_idx, masked_log_ratio)
+        log_ratio_sum_per_seq = torch.zeros(batch_size, device=log_ratio.device, dtype=log_ratio.dtype).scatter_add_(
+            0, sequence_idx, masked_log_ratio
+        )
         masked_advantages = torch.where(loss_mask, advantages, 0.0)
-        advantages_sum_per_seq = torch.zeros(batch_size, device=advantages.device, dtype=advantages.dtype).scatter_add_(0, sequence_idx, masked_advantages)
-        valid_count_per_seq = torch.zeros(batch_size, device=loss_mask.device, dtype=torch.int32).scatter_add_(0, sequence_idx, loss_mask.int()).clamp(min=1)
+        advantages_sum_per_seq = torch.zeros(
+            batch_size, device=advantages.device, dtype=advantages.dtype
+        ).scatter_add_(0, sequence_idx, masked_advantages)
+        valid_count_per_seq = (
+            torch.zeros(batch_size, device=loss_mask.device, dtype=torch.int32)
+            .scatter_add_(0, sequence_idx, loss_mask.int())
+            .clamp(min=1)
+        )
         log_ratio_mean_per_seq = log_ratio_sum_per_seq / valid_count_per_seq.to(log_ratio.dtype)
         adv_mean_per_seq = advantages_sum_per_seq / valid_count_per_seq.to(advantages.dtype)
         ratio = torch.exp(log_ratio_mean_per_seq)[sequence_idx]
@@ -189,7 +209,9 @@ def ppo_actor_loss_fn(
         ratio = torch.where(loss_mask, torch.exp(logprobs - proximal_logprobs), 0)
     else:
         raise ValueError(f"Invalid importance_sampling_level: {importance_sampling_level}.")
-    clipped_ratio = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + (eps_clip if eps_clip_higher is None else eps_clip_higher))
+    clipped_ratio = torch.clamp(
+        ratio, 1.0 - eps_clip, 1.0 + (eps_clip if eps_clip_higher is None else eps_clip_higher)
+    )
     pg_loss1 = -advantages * ratio
     pg_loss2 = -advantages * clipped_ratio
     clip_mask = pg_loss1.detach() < pg_loss2.detach()
@@ -203,7 +225,11 @@ def ppo_actor_loss_fn(
         dual_clip_mask = torch.zeros_like(clip_mask)
     behav_kl = proximal_logprobs - old_logprobs
     behav_imp_weight = behav_kl.exp()
-    behav_mask = (behav_imp_weight <= behav_imp_weight_cap).logical_and(loss_mask) if behav_imp_weight_cap is not None else loss_mask
+    behav_mask = (
+        (behav_imp_weight <= behav_imp_weight_cap).logical_and(loss_mask)
+        if behav_imp_weight_cap is not None
+        else loss_mask
+    )
     behav_kl = torch.where(behav_mask, behav_kl, 0.0)
     behav_imp_weight = torch.where(behav_mask, behav_imp_weight, 0.0)
     pg_loss = pg_loss * behav_imp_weight
@@ -211,12 +237,22 @@ def ppo_actor_loss_fn(
         pg_loss = pg_loss * rollout_is_weights
     logging_loss = pg_loss.detach()
     pg_loss = agg_loss(
-        pg_loss, loss_mask, loss_agg_mode=loss_agg_mode,
-        dp_size=dp_size, batch_num_tokens=batch_num_tokens, global_batch_size=global_batch_size,
+        pg_loss,
+        loss_mask,
+        loss_agg_mode=loss_agg_mode,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
     )
     clip_mask.logical_and_(loss_mask)
     dual_clip_mask.logical_and_(loss_mask)
-    stat = dict(loss=logging_loss, importance_weight=ratio.detach(), approx_kl=(logprobs - proximal_logprobs).detach(), clip_mask=clip_mask, dual_clip_mask=dual_clip_mask)
+    stat = dict(
+        loss=logging_loss,
+        importance_weight=ratio.detach(),
+        approx_kl=(logprobs - proximal_logprobs).detach(),
+        clip_mask=clip_mask,
+        dual_clip_mask=dual_clip_mask,
+    )
     if proximal_logprobs is not None:
         stat["behave_imp_weight"] = behav_imp_weight
         stat["behave_approx_kl"] = behav_kl
@@ -253,5 +289,14 @@ def sapo_loss_fn(
     pg_loss = -soft_gate * advantages
     logging_loss = pg_loss.detach()
     pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
-    stat = dict(loss=logging_loss, importance_weight=ratio.detach(), approx_kl=log_ratio.detach(), clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool), dual_clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool), sapo_soft_gate=soft_gate.detach(), sapo_scaled_gate_pos=scaled_gate_pos.detach(), sapo_scaled_gate_neg=scaled_gate_neg.detach())
+    stat = dict(
+        loss=logging_loss,
+        importance_weight=ratio.detach(),
+        approx_kl=log_ratio.detach(),
+        clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),
+        dual_clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),
+        sapo_soft_gate=soft_gate.detach(),
+        sapo_scaled_gate_pos=scaled_gate_pos.detach(),
+        sapo_scaled_gate_neg=scaled_gate_neg.detach(),
+    )
     return pg_loss, stat

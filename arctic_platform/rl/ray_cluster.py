@@ -1,5 +1,20 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
 
 """Multinode Ray cluster bootstrap.
 
@@ -21,10 +36,11 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from arctic_platform.rl.utils.debug import see_memory_usage, pr, pr0
 
 import ray
 from ray._private.utils import read_ray_address
+
+from arctic_platform.rl.utils.debug import pr0
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +132,7 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
     global _spawned_cluster, _spawned_temp_dir
 
     # 1. Try attaching to a running cluster (only if it has GPUs).
-    if 1: # auto_attach:
+    if 1:  # auto_attach:
         try:
             ray.init(address="auto", ignore_reinit_error=True, log_to_driver=True)
             gpus = ray.cluster_resources().get("GPU", 0)
@@ -127,9 +143,7 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
                     gpus,
                 )
                 return
-            logger.info(
-                "Existing Ray cluster has no GPU resources; ignoring and starting a new cluster."
-            )
+            logger.info("Existing Ray cluster has no GPU resources; ignoring and starting a new cluster.")
             ray.shutdown()
         except ConnectionError:
             pass

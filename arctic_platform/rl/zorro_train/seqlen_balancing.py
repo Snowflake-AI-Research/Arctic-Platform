@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,34 +27,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import copy
 import heapq
 import itertools
 import logging
-from typing import List, Tuple, Optional, Dict
-from tensordict import TensorDict
-import numpy as np
+from typing import List
+from typing import Tuple
 
+import numpy as np
 import torch
+from tensordict import TensorDict
 from torch import distributed as dist
 
-from arctic_platform.rl.utils.debug import see_memory_usage, pr, pr0
+from arctic_platform.rl.utils.debug import pr
+from arctic_platform.rl.utils.debug import pr0
 
 logger = logging.getLogger(__name__)
 
 ENABLE_BALANCE_STATS = False
 
-ENABLE_TIMERS = True
+ENABLE_TIMERS = False
 
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
+
     timers = SynchronizedWallClockTimerSimple(wall_clock_breakdown=True)
 else:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimpleDummy
+
     timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
 
 is_cuda_available = torch.cuda.is_available()
+
+
 def get_device_name() -> str:
     """Function that gets the torch.device based on the current machine.
     This currently only supports CPU, CUDA, NPU.
@@ -51,6 +71,7 @@ def get_device_name() -> str:
     else:
         device = "cpu"
     return device
+
 
 def karmarkar_karp(seqlen_list: List[int], k_partitions: int, equal_size: bool):
     # see: https://en.wikipedia.org/wiki/Largest_differencing_method
@@ -150,9 +171,9 @@ def karmarkar_karp(seqlen_list: List[int], k_partitions: int, equal_size: bool):
     partitions = final_state.get_partitions()
     if equal_size:
         for i, partition in enumerate(partitions):
-            assert len(partition) * k_partitions == len(seqlen_list), (
-                f"{len(partition)} * {k_partitions} != {len(seqlen_list)}"
-            )
+            assert len(partition) * k_partitions == len(
+                seqlen_list
+            ), f"{len(partition)} * {k_partitions} != {len(seqlen_list)}"
     return partitions
 
 
@@ -170,9 +191,9 @@ def greedy_partition(seqlen_list: List[int], k_partitions: int, equal_size: bool
         partition_sums[min_idx] += seqlen
     if equal_size:
         for i, partition in enumerate(partitions):
-            assert len(partition) * k_partitions == len(seqlen_list), (
-                f"{len(partition)} * {k_partitions} != {len(seqlen_list)}"
-            )
+            assert len(partition) * k_partitions == len(
+                seqlen_list
+            ), f"{len(partition)} * {k_partitions} != {len(seqlen_list)}"
     return partitions
 
 
@@ -327,7 +348,6 @@ def roundup_divisible(a, b):
 #         return micro_batches, micro_bsz_idx
 
 
-
 def get_reverse_idx(idx_map):
     """
     Build the inverse of an index mapping.
@@ -345,18 +365,21 @@ def get_reverse_idx(idx_map):
 
     return reverse_idx_map
 
-def compute_variation(l):
+
+def compute_variation(len):
     """
-        this computes a few useful statistics to quickly tell if the spread in the list is small.
-        1. max/min ratio to see how far the outliers are from each other
-        2. in particular since we want to avoid outliers on the high end this computes the distance of the max value from the median, then normalized by media - the closer to 0 the better.
+    this computes a few useful statistics to quickly tell if the spread in the list is small.
+    1. max/min ratio to see how far the outliers are from each other
+    2. in particular since we want to avoid outliers on the high end this computes the distance of the max value from the median, then normalized by media - the closer to 0 the better.
     """
     import statistics
-    l = sorted(l)
-    min_cost, max_cost = l[0], l[-1]
-    min_max_ratio = max_cost/min_cost
-    divergence_cost = (max(l)-statistics.median(l))/statistics.median(l)
+
+    len = sorted(len)
+    min_cost, max_cost = len[0], len[-1]
+    min_max_ratio = max_cost / min_cost
+    divergence_cost = (max(len) - statistics.median(len)) / statistics.median(len)
     return max_cost, min_max_ratio, divergence_cost
+
 
 def compute_group_costs(batch, prompt_groups, prompt_len, quadratic_coeff=0):
 
@@ -396,14 +419,14 @@ def compute_group_costs(batch, prompt_groups, prompt_len, quadratic_coeff=0):
             dedup_cost_linear += response_tokens
             group_response_tokens += response_tokens
 
-        dedup_cost = quadratic_coeff * dedup_cost_quadratic + (1-quadratic_coeff) * dedup_cost_linear
+        dedup_cost = quadratic_coeff * dedup_cost_quadratic + (1 - quadratic_coeff) * dedup_cost_linear
         total_dedup_tokens += group_prompt_tokens + group_response_tokens
         group_costs.append((dedup_cost, group))
 
     if ENABLE_BALANCE_STATS:
         dedup_costs = [cost[0] for cost in group_costs]
         max_cost, min_max_ratio, divergence_cost = compute_variation(dedup_costs)
-        pr0(f"dedup_costs:\n", "\n".join(map(str, sorted(dedup_costs))), sep="")
+        pr0("dedup_costs:\n", "\n".join(map(str, sorted(dedup_costs))), sep="")
         pr(f"dedup_costs max_cost {max_cost} (in {len(dedup_costs)} items)")
         pr(f"dedup_costs outlier max/min diff is of {min_max_ratio:0.2f}x (in {len(dedup_costs)} items)")
         pr(f"dedup_costs variation {divergence_cost:0.4f} (in {len(dedup_costs)} items)")
@@ -434,14 +457,15 @@ def create_prompt_groups(input_ids, response_length, max_token_len, max_group_le
 
         # first check the boundaries are configured correctly
         max_token_len_effective = prompt_len + response_length * max_group_length_threshold
-        #pr0(f"sanity check: {max_token_len_effective=} {max_token_len=}")
+        # pr0(f"sanity check: {max_token_len_effective=} {max_token_len=}")
         if max_token_len < max_token_len_effective:
             raise ValueError(
                 f"""
                 {max_token_len=} is smaller than {max_token_len_effective}.
                 Where max_token_len_effective = {prompt_len=} + {response_length=} * {max_group_length_threshold=}.
                 You can either raise actor_rollout_ref.actor.ppo_max_token_len_per_gpu to a higher value or reduce the number of rollouts (`actor_rollout_ref.rollout.n`) or to split the prompt groups by setting `arctic_rl.zorro_train.max_rollouts` to a smaller value than `actor_rollout_ref.rollout.n`, so that the math above checks out.
-                Reducing prompt and/or response sizes is another way if it doesn't break the training needs.""")
+                Reducing prompt and/or response sizes is another way if it doesn't break the training needs."""
+            )
 
         max_group_length = max(len(group) for group in prompt_groups)
         if max_group_length > max_group_length_threshold:
@@ -474,7 +498,6 @@ def reorg_global_batch_verl(
 
     Rearrange batches and supporting data to load balance towards zorro use, that is group by prompt groups and then re-order for the best balance.
     """
-
 
     batch = super_batch.batch
 
@@ -520,7 +543,7 @@ def reorg_global_batch_verl(
                 return idx
 
         # If we hit this it means packing failed and some smaller item got where the large item could fit and thus at least one item now can't fit. I dealt with all use-cases I run into but perhaps there are some that I haven't encountered.
-        raise ValueError(f"shouldn't reach here")
+        raise ValueError("shouldn't reach here")
 
     # Sort groups
     # 1. by group size (descending)
@@ -539,13 +562,18 @@ def reorg_global_batch_verl(
 
     # sanity check to ensure each bin is of batch_size/world_size size
     for i in range(world_size):
-        assert len(list(itertools.chain.from_iterable(micro_batch_bins[i]))) == batch_size_per_bin, f"{len(list(itertools.chain.from_iterable(micro_batch_bins[i])))} != {batch_size_per_bin=}"
+        assert (
+            len(list(itertools.chain.from_iterable(micro_batch_bins[i]))) == batch_size_per_bin
+        ), f"{len(list(itertools.chain.from_iterable(micro_batch_bins[i])))} != {batch_size_per_bin=}"
 
     if ENABLE_BALANCE_STATS:
         max_cost, min_max_ratio, divergence_cost = compute_variation(micro_batch_costs)
-        pr0(f"everything micro_batch_costs unsorted:\n", "\n".join(map(str, micro_batch_costs)), sep="")
+        pr0("everything micro_batch_costs unsorted:\n", "\n".join(map(str, micro_batch_costs)), sep="")
         pr(f"everything micro_batch_costs max_cost {max_cost} in {len(micro_batch_costs)} items)")
-        pr(f"everything micro_batch_costs outlier max/min diff is of {min_max_ratio:0.2f}x (in {len(micro_batch_costs)} items)")
+        pr(
+            f"everything micro_batch_costs outlier max/min diff is of {min_max_ratio:0.2f}x (in"
+            f" {len(micro_batch_costs)} items)"
+        )
         pr(f"everything micro_batch_costs variation {divergence_cost:0.4f} (in {len(micro_batch_costs)} items)")
 
     # re-org batches to match the micro_batch_bin packing order, while preparing for a future /world_size split on the batch_size dimension
@@ -556,7 +584,7 @@ def reorg_global_batch_verl(
     # rank 0: items 0, 8, 16
     # rank 1: items 1, 9, 17
     for rank in range(world_size):
-        this_rank_micro_batch_bins = [micro_batch_bins[rank+world_size*i] for i in range(slice_len)]
+        this_rank_micro_batch_bins = [micro_batch_bins[rank + world_size * i] for i in range(slice_len)]
         # remap the global batch into this rank's batch to keep only the entries it needs
         # while remapping the bin_groups to those new batch indices
         for bin_groups in this_rank_micro_batch_bins:
@@ -570,6 +598,7 @@ def reorg_global_batch_verl(
             super_batch.non_tensor_batch[key] = super_batch.non_tensor_batch[key][from_to_indices]
 
     return super_batch
+
 
 def reorg_global_batch(
     batch,
@@ -595,7 +624,7 @@ def reorg_global_batch(
 
     # print("Rearranging batches")
 
-    #max_group_length_threshold = 16
+    # max_group_length_threshold = 16
 
     input_ids = batch["input_ids"]
     batch_size, seq_len = input_ids.shape
@@ -642,7 +671,7 @@ def reorg_global_batch(
                 return idx
 
         # If we hit this it means packing failed and some smaller item got where the large item could fit and thus at least one item now can't fit. I dealt with all use-cases I run into but perhaps there are some that I haven't encountered.
-        raise ValueError(f"shouldn't reach here")
+        raise ValueError("shouldn't reach here")
 
     # Sort groups
     # 1. by group size (descending)
@@ -667,13 +696,18 @@ def reorg_global_batch(
 
     # sanity check to ensure each bin is of batch_size/world_size size
     for i in range(world_size):
-        assert len(list(itertools.chain.from_iterable(micro_batch_bins[i]))) == batch_size_per_bin, f"{len(list(itertools.chain.from_iterable(micro_batch_bins[i])))} != {batch_size_per_bin=}"
+        assert (
+            len(list(itertools.chain.from_iterable(micro_batch_bins[i]))) == batch_size_per_bin
+        ), f"{len(list(itertools.chain.from_iterable(micro_batch_bins[i])))} != {batch_size_per_bin=}"
 
     if ENABLE_BALANCE_STATS:
         max_cost, min_max_ratio, divergence_cost = compute_variation(micro_batch_costs)
-        pr0(f"everything micro_batch_costs unsorted:\n", "\n".join(map(str, micro_batch_costs)), sep="")
+        pr0("everything micro_batch_costs unsorted:\n", "\n".join(map(str, micro_batch_costs)), sep="")
         pr0(f"everything micro_batch_costs max_cost {max_cost} in {len(micro_batch_costs)} items)")
-        pr0(f"everything micro_batch_costs outlier max/min diff is of {min_max_ratio:0.2f}x (in {len(micro_batch_costs)} items)")
+        pr0(
+            f"everything micro_batch_costs outlier max/min diff is of {min_max_ratio:0.2f}x (in"
+            f" {len(micro_batch_costs)} items)"
+        )
         pr0(f"everything micro_batch_costs variation {divergence_cost:0.4f} (in {len(micro_batch_costs)} items)")
 
     # re-org batches to match the micro_batch_bin packing order, while preparing for a future /world_size split on the batch_size dimension
@@ -684,7 +718,7 @@ def reorg_global_batch(
     # rank 0: items 0, 8, 16
     # rank 1: items 1, 9, 17
     for rank in range(world_size):
-        this_rank_micro_batch_bins = [micro_batch_bins[rank+world_size*i] for i in range(slice_len)]
+        this_rank_micro_batch_bins = [micro_batch_bins[rank + world_size * i] for i in range(slice_len)]
         # remap the global batch into this rank's batch to keep only the entries it needs
         # while remapping the bin_groups to those new batch indices
         for bin_groups in this_rank_micro_batch_bins:
@@ -692,9 +726,9 @@ def reorg_global_batch(
                 from_to_indices.extend(group)
 
     for key in batch.keys():
-        #print(key, batch[key])
+        # print(key, batch[key])
         batch[key] = batch[key][from_to_indices]
-    #batch = batch[from_to_indices]
+    # batch = batch[from_to_indices]
 
     # # now re-org the non-tensor part of the super-batch in the same way as the normal batch
     # for key in super_batch.non_tensor_batch.keys():
@@ -702,6 +736,7 @@ def reorg_global_batch(
     #         super_batch.non_tensor_batch[key] = super_batch.non_tensor_batch[key][from_to_indices]
 
     return batch, from_to_indices
+
 
 def rearrange_micro_batches_with_dedup(
     batch: TensorDict,
@@ -739,15 +774,15 @@ def rearrange_micro_batches_with_dedup(
         raise ValueError(f"batch needs to be a TensorDict object, but got {type(batch)}")
 
     if "attention_mask" not in batch:
-        raise ValueError(f"attention_mask is required to be in batch")
+        raise ValueError("attention_mask is required to be in batch")
     if batch["attention_mask"] is None or batch["attention_mask"].ndim != 2:
         raise ValueError(f"attention_mask of shape [bs, seqlen] is required but got: {batch['attention_mask']}")
 
-    #pr0(batch)
-    #exit()
+    # pr0(batch)
+    # exit()
 
-    #local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    device = get_device_name() # torch.device(f"cuda:{local_rank}")
+    # local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = get_device_name()  # torch.device(f"cuda:{local_rank}")
 
     if torch.distributed.is_initialized():
         world_size = dist.get_world_size()
@@ -768,9 +803,9 @@ def rearrange_micro_batches_with_dedup(
         torch.distributed.all_gather(all_num_groups, local_num_groups)
         all_num_groups = [t.item() for t in all_num_groups]
 
-        assert len(set(all_num_groups)) == 1, (
-            f"Number of prompt_groups must be the same across all ranks, but got: {all_num_groups}"
-        )
+        assert (
+            len(set(all_num_groups)) == 1
+        ), f"Number of prompt_groups must be the same across all ranks, but got: {all_num_groups}"
 
     group_costs, total_dedup_tokens = compute_group_costs(batch, prompt_groups, prompt_len)
 
@@ -792,7 +827,7 @@ def rearrange_micro_batches_with_dedup(
     group_costs.sort(reverse=True, key=lambda x: x[0])
 
     # Create micro-batch bins
-    #aname = "bin-packing"; timers.start(aname)
+    # aname = "bin-packing"; timers.start(aname)
     micro_batch_bins = [[] for _ in range(num_micro_batches)]
     micro_batch_costs = [0 for _ in range(num_micro_batches)]
 
@@ -803,19 +838,22 @@ def rearrange_micro_batches_with_dedup(
         min_bin_idx = min(range(num_micro_batches), key=lambda i: micro_batch_costs[i])
         micro_batch_bins[min_bin_idx].append(group)
         micro_batch_costs[min_bin_idx] += cost
-    #timers.stop(aname); pr(f"{aname} elapsed {timers.times[aname]:.2f}msec")
+    # timers.stop(aname); pr(f"{aname} elapsed {timers.times[aname]:.2f}msec")
 
     # sort micro_batch_bins by costs to better load balance things across ranks
     micro_batch_costs, micro_batch_bins = zip(*sorted(zip(micro_batch_costs, micro_batch_bins), reverse=True))
 
     if ENABLE_BALANCE_STATS:
         max_cost, min_max_ratio, divergence_cost = compute_variation(micro_batch_costs)
-        pr0(f"everything micro_batch_costs unsorted:\n", "\n".join(map(str, micro_batch_costs)), sep="")
+        pr0("everything micro_batch_costs unsorted:\n", "\n".join(map(str, micro_batch_costs)), sep="")
         pr(f"everything micro_batch_costs max_cost {max_cost} in {len(micro_batch_costs)} items)")
-        pr(f"everything micro_batch_costs outlier max/min diff is of {min_max_ratio:0.2f}x (in {len(micro_batch_costs)} items)")
+        pr(
+            f"everything micro_batch_costs outlier max/min diff is of {min_max_ratio:0.2f}x (in"
+            f" {len(micro_batch_costs)} items)"
+        )
         pr(f"everything micro_batch_costs variation {divergence_cost:0.4f} (in {len(micro_batch_costs)} items)")
 
-    #aname = "create-final-mbs"; timers.start(aname)
+    # aname = "create-final-mbs"; timers.start(aname)
     # Step 5: Create actual micro-batches with deduplication info
     micro_batches = []
     micro_bsz_idx = []
@@ -848,9 +886,7 @@ def rearrange_micro_batches_with_dedup(
         micro_position_ids = curr_micro_batch["position_ids"]
 
         # Find prompt groups within this micro-batch
-        prompt_groups_micro, unique_prompts = ZoRRoTrain.find_prompt_groups(
-            micro_input_ids, response_length
-        )
+        prompt_groups_micro, unique_prompts = ZoRRoTrain.find_prompt_groups(micro_input_ids, response_length)
 
         # Create deduplicated batch
         dedup_input_ids, adapted_position_ids, reconstruction_info = ZoRRoTrain.create_deduplicated_batch(
@@ -887,14 +923,14 @@ def rearrange_micro_batches_with_dedup(
 
         micro_batches.append(curr_micro_batch)
         micro_bsz_idx.append(sample_indices)
-    #timers.stop(aname); pr(f"{aname} elapsed {timers.times[aname]:.2f}msec")
+    # timers.stop(aname); pr(f"{aname} elapsed {timers.times[aname]:.2f}msec")
 
-    dedup_tokens = [mb['dedup_metrics']['dedup_tokens'] for mb in micro_batches]
+    dedup_tokens = [mb["dedup_metrics"]["dedup_tokens"] for mb in micro_batches]
     total_dedup_tokens = sum(dedup_tokens)
 
     if ENABLE_BALANCE_STATS:
         max_cost, min_max_ratio, divergence_cost = compute_variation(micro_batch_costs)
-        pr0(f"micro_batch_costs:\n", "\n".join(map(str, sorted(micro_batch_costs))), sep="")
+        pr0("micro_batch_costs:\n", "\n".join(map(str, sorted(micro_batch_costs))), sep="")
         pr(f"micro_batch_costs max_cost {max_cost} in {len(micro_batch_costs)} items)")
         pr(f"micro_batch_costs outlier max/min diff is of {min_max_ratio:0.2f}x (in {len(micro_batch_costs)} items)")
         pr(f"micro_batch_costs variation {divergence_cost:0.4f} (in {len(micro_batch_costs)} items)")

@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Composable processing pipeline for RL training forward passes.
 
 Processors are registered by name into two phase-specific registries
@@ -37,36 +52,42 @@ first use.
 from __future__ import annotations
 
 import importlib
-from typing import Any, Callable, Dict
+from typing import Any
+from typing import Callable
+from typing import Dict
 
 import torch
-from arctic_platform.rl.utils.debug import see_memory_usage
-from arctic_platform.rl.utils.batch import detensorize, log_dp_shard_tokens
-from arctic_platform.rl.utils.debug import see_memory_usage, pr, pr0
+
+from arctic_platform.rl.utils.batch import detensorize
+from arctic_platform.rl.utils.batch import log_dp_shard_tokens
 from arctic_platform.rl.utils.debug import ProfilerContext
+from arctic_platform.rl.utils.debug import pr0
+from arctic_platform.rl.utils.debug import see_memory_usage
 
 try:
     from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
 
-    FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = True
+    FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = True
 except ImportError:
-    FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
+    FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
+
 
 from .microbatch import DEFAULT_MAX_TOKENS_PER_MB
 
-#PROFILER_TYPE = "c"
-#PROFILER_TYPE = "torch"
+# PROFILER_TYPE = "c"
+# PROFILER_TYPE = "torch"
 PROFILER_TYPE = "none"
 
 
-ENABLE_TIMERS = True
+ENABLE_TIMERS = False
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
+
     timers = SynchronizedWallClockTimerSimple(wall_clock_breakdown=True)
 else:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimpleDummy
-    timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
 
+    timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
 
 
 # ---------------------------------------------------------------------------
@@ -79,17 +100,21 @@ LOSS_FNS: Dict[str, Callable] = {}
 
 def register_post_processor(name: str):
     """Register a post-forward processor under *name*."""
+
     def decorator(fn: Callable) -> Callable:
         POST_PROCESSORS[name] = fn
         return fn
+
     return decorator
 
 
 def register_loss_fn(name: str):
     """Register a loss function under *name*."""
+
     def decorator(fn: Callable) -> Callable:
         LOSS_FNS[name] = fn
         return fn
+
     return decorator
 
 
@@ -104,11 +129,6 @@ def _resolve_fn(registry: dict, name: str) -> Callable:
     return fn
 
 
-import torch
-from tensordict import TensorDict
-from typing import Optional
-
-
 def padded_tensor_2d_to_unpadded_tensor_1d(tensor_2d, attention_mask_2d_bool):
     pr0(f"{tensor_2d.shape=}")
     pr0(f"{attention_mask_2d_bool.shape=}")
@@ -116,7 +136,7 @@ def padded_tensor_2d_to_unpadded_tensor_1d(tensor_2d, attention_mask_2d_bool):
 
 
 def padded_tensor_2d_dict_to_unpadded_tensor_1d_dict(tensor_dict, attention_mask_2d_bool):
-    for key,value in tensor_dict.items():
+    for key, value in tensor_dict.items():
         if torch.is_tensor(value) and value.shape == attention_mask_2d_bool.shape:
             new_value = padded_tensor_2d_to_unpadded_tensor_1d(value, attention_mask_2d_bool)
             pr0(f"2d->1d {key=} {value.shape=} -> {new_value.shape=} {value.sum()=} -> {new_value.sum()=}")
@@ -147,12 +167,11 @@ def unpadded_tensor_1d_to_padded_tensor_2d(tensor_1d, attention_mask_2d_bool, pa
 
 
 def unpadded_tensor_1d_dict_to_padded_tensor_2d_dict(tensor_dict, attention_mask_2d_bool, pad_value):
-    for key,value in tensor_dict.items():
+    for key, value in tensor_dict.items():
         if torch.is_tensor(value):
             pr0(f"1d->2d {key=} {value.shape=}")
             tensor_dict[key] = unpadded_tensor_1d_to_padded_tensor_2d(value, attention_mask_2d_bool, pad_value)
     return tensor_dict
-
 
 
 def padded_tensor_2d_full_to_unpadded_tensor_1d_response(tensor_2d, attention_mask_2d_bool, max_prompt_len):
@@ -197,11 +216,15 @@ def unpadded_tensor_1d_response_to_padded_tensor_2d_full(tensor_1d, attention_ma
     return tensor_2d
 
 
-def unpadded_tensor_1d_response_dict_to_padded_tensor_2d_full_dict(tensor_dict, attention_mask_2d_bool, max_prompt_len):
-    for key,value in tensor_dict.items():
+def unpadded_tensor_1d_response_dict_to_padded_tensor_2d_full_dict(
+    tensor_dict, attention_mask_2d_bool, max_prompt_len
+):
+    for key, value in tensor_dict.items():
         if torch.is_tensor(value):
             # pr0(f"1d->2d {key=} {value.shape=}")
-            tensor_dict[key] = unpadded_tensor_1d_response_to_padded_tensor_2d_full(value, attention_mask_2d_bool, max_prompt_len)
+            tensor_dict[key] = unpadded_tensor_1d_response_to_padded_tensor_2d_full(
+                value, attention_mask_2d_bool, max_prompt_len
+            )
     return tensor_dict
 
 
@@ -215,7 +238,8 @@ def compute_packing_info_for_batch(tensor_dict):
 
     return tensor_dict
 
-def dump_dict_payload(payload: dict, tag:str):
+
+def dump_dict_payload(payload: dict, tag: str):
     return
     for k, v in payload.items():
         if isinstance(v, torch.Tensor):
@@ -229,6 +253,8 @@ def dump_dict_payload(payload: dict, tag:str):
 # ---------------------------------------------------------------------------
 
 c = 0
+
+
 def run_pipeline(
     engine,
     args: tuple,
@@ -304,8 +330,14 @@ def run_pipeline(
         all_input = {**batch, **meta}
         if "cu_seqlens" not in all_input:
             return _run_pipeline_with_packing(
-                engine, args, batch, meta, processing, device,
-                backward=backward, max_tokens_per_mb=max_tokens_per_mb,
+                engine,
+                args,
+                batch,
+                meta,
+                processing,
+                device,
+                backward=backward,
+                max_tokens_per_mb=max_tokens_per_mb,
             )
 
     tname_e2e = timers.start(f"run_pipeline e2e {engine.global_rank}")
@@ -334,7 +366,6 @@ def run_pipeline(
             if not entropy_used:
                 meta = {**meta, "calculate_entropy": False}
 
-
     # --- forward ---
     # this is a future feature to avoid conflicts between `meta_data` and` model's `kwargs`, where the client could specify which meta_data keys to pass to the ending
     # if 'fwd_meta_keys' in meta_data:
@@ -343,11 +374,11 @@ def run_pipeline(
     #     fwd_meta_data = meta_data
     # outputs = engine(*args, **kwargs, **fwd_meta_data)
 
-    pack_with_unpad = True # XXX: make configurable?
+    pack_with_unpad = True  # XXX: make configurable?
 
     # XXX: could the zorro parts be folded back into the model? this will also change when we start packing on the client side
     zorro_train_enable = meta.get("zorro_train_enable", False)
-    #pr0(f"{zorro_train_enable=}")
+    # pr0(f"{zorro_train_enable=}")
 
     if pack_with_unpad or zorro_train_enable:
         batch = compute_packing_info_for_batch(batch)
@@ -360,9 +391,11 @@ def run_pipeline(
         non_model_input_keys = [k for k in batch.keys() if k not in ["input_ids", "position_ids", "attention_mask"]]
         for key in non_model_input_keys:
             if batch[key].shape == attention_mask_2d_bool.shape:
-                batch[key] = padded_tensor_2d_full_to_unpadded_tensor_1d_response(batch[key], attention_mask_2d_bool, max_prompt_len)
+                batch[key] = padded_tensor_2d_full_to_unpadded_tensor_1d_response(
+                    batch[key], attention_mask_2d_bool, max_prompt_len
+                )
 
-    #pr0(f"{pack_with_unpad=}")
+    # pr0(f"{pack_with_unpad=}")
 
     if pack_with_unpad:
         pad_token = meta["pad_token_id"]
@@ -405,17 +438,16 @@ def run_pipeline(
     if hasattr(outputs, "loss") and outputs.loss is not None:
         model_outputs["loss"] = outputs.loss
 
-
     # --- post-forward ---
     prof_post_fwd = ProfilerContext(type=PROFILER_TYPE, name="POST-FWD")
     tname = timers.start(f"pipe post-fwd {engine.global_rank}")
     post_process_outputs = dict()
     with prof_post_fwd():
         for name in post_names:
-            #tname_post = timers.start(f"pipe post-fwd [{name}]")
+            # tname_post = timers.start(f"pipe post-fwd [{name}]")
             fn = _resolve_fn(POST_PROCESSORS, name)
             post_process_outputs.update(**fn(model_outputs, batch, meta, device))
-            #timers.stop_and_print_elapsed(tname_post)
+            # timers.stop_and_print_elapsed(tname_post)
     timers.stop_and_print_elapsed(tname)
     prof_post_fwd.report()
 
@@ -478,14 +510,17 @@ def run_pipeline(
 
     if zorro_train_enable:
         dump_dict_payload(pipeline_outputs["batch"], "zorro: post-fwd[before unpad_2_pad]")
-        pipeline_outputs["batch"] = unpadded_tensor_1d_response_dict_to_padded_tensor_2d_full_dict(pipeline_outputs["batch"], attention_mask_2d_bool, max_prompt_len)
+        pipeline_outputs["batch"] = unpadded_tensor_1d_response_dict_to_padded_tensor_2d_full_dict(
+            pipeline_outputs["batch"], attention_mask_2d_bool, max_prompt_len
+        )
         dump_dict_payload(pipeline_outputs["batch"], "zorro: post-fwd[after unpad_2_pad]")
 
     if pack_with_unpad:
         dump_dict_payload(pipeline_outputs["batch"], "post-fwd[before unpad_2_pad]")
-        pipeline_outputs["batch"] = unpadded_tensor_1d_dict_to_padded_tensor_2d_dict(pipeline_outputs["batch"], attention_mask_2d_bool, pad_token)
+        pipeline_outputs["batch"] = unpadded_tensor_1d_dict_to_padded_tensor_2d_dict(
+            pipeline_outputs["batch"], attention_mask_2d_bool, pad_token
+        )
         dump_dict_payload(pipeline_outputs["batch"], "post-fwd[after unpad_2_pad]")
-
 
     # Consistency of metrics always being non-tensor
     pipeline_outputs["metrics"] = detensorize(pipeline_outputs["metrics"])
@@ -516,8 +551,10 @@ def _run_pipeline_with_packing(
     Splits batch into microbatches, packs each to [1, T] for flash
     attention, runs the pipeline on each, then unpacks and concatenates.
     """
-    from .packing import pack_sequences, unpack_sequences
-    from .microbatch import MicroBatchSpec, split_padded_tensor_dict_into_mb_list
+    from .microbatch import MicroBatchSpec
+    from .microbatch import split_padded_tensor_dict_into_mb_list
+    from .packing import pack_sequences
+    from .packing import unpack_sequences
 
     # Combine for splitting — meta tensors are split the same way as batch
     all_input = {**meta, **batch}  # batch takes priority on key collision
@@ -539,8 +576,7 @@ def _run_pipeline_with_packing(
 
         # 1D meta: packed tensors have shape [1, T] — squeeze for loss fns
         mb_1d = {
-            k: v.squeeze(0) if torch.is_tensor(v) and v.ndim == 2 and v.shape[0] == 1 else v
-            for k, v in packed.items()
+            k: v.squeeze(0) if torch.is_tensor(v) and v.ndim == 2 and v.shape[0] == 1 else v for k, v in packed.items()
         }
 
         # Model always receives packed [1, T] input_ids + position_ids
@@ -554,7 +590,15 @@ def _run_pipeline_with_packing(
             engine.set_gradient_accumulation_boundary(i == n_mbs - 1)
 
         result = run_pipeline(
-            engine, args, mb_kwargs, meta, mb_1d, processing, device, backward=backward, return_tensors=True,
+            engine,
+            args,
+            mb_kwargs,
+            meta,
+            mb_1d,
+            processing,
+            device,
+            backward=backward,
+            return_tensors=True,
         )
 
         if "avg_loss" in result:
@@ -588,7 +632,7 @@ def _run_pipeline_with_packing(
 
     if captured_losses:
         total_weight = sum(captured_weights) or 1
-        avg_loss = sum(l * w for l, w in zip(captured_losses, captured_weights)) / total_weight
+        avg_loss = sum(loss * weight for loss, weight in zip(captured_losses, captured_weights)) / total_weight
         averaged_metrics = {k: v / total_weight for k, v in captured_metrics.items()}
         result = {"avg_loss": avg_loss, "metrics": averaged_metrics}
         if batch_out:
@@ -596,7 +640,6 @@ def _run_pipeline_with_packing(
         return result
 
     return {"batch": detensorize(batch_out), "metrics": {}}
-
 
 
 # ---------------------------------------------------------------------------
@@ -633,9 +676,9 @@ def logprobs_from_logits(logits, labels, inplace_backward=True):
     logits = logits.reshape(-1, all_but_vocab_dim)
     labels = labels.reshape(-1)
     fa_output = cross_entropy_loss(logits, labels, inplace_backward=inplace_backward)
-    assert isinstance(fa_output, tuple), (
-        "please make sure flash-attn>=2.4.3 where cross_entropy_loss returns Tuple[losses, z_losses]."
-    )
+    assert isinstance(
+        fa_output, tuple
+    ), "please make sure flash-attn>=2.4.3 where cross_entropy_loss returns Tuple[losses, z_losses]."
     output = -fa_output[0]
     return output.view(*batch_dim)
 
@@ -643,8 +686,8 @@ def logprobs_from_logits(logits, labels, inplace_backward=True):
 def chunked_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy, peak_mem_gib=4.0):
     # Flatten to 2D for uniform chunked processing: [N, V] where N = B*S or T
     vocab_size = logits.shape[2]
-    logits_2d = logits.reshape(-1, vocab_size)   # [N, V]
-    labels_1d = labels.reshape(-1)               # [N]
+    logits_2d = logits.reshape(-1, vocab_size)  # [N, V]
+    labels_1d = labels.reshape(-1)  # [N]
 
     # Size each chunk so its [chunk_size, vocab] follow-up working set stays within the configured peak-memory
     # budget (arctic_rl.logits_optimization_peak_mem_size_in_gib). 4 bytes = fp32, the conservative accounting
@@ -657,7 +700,9 @@ def chunked_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy, 
         end = min(start + chunk_size, logits_2d.shape[0])
         logits_chunk = logits_2d[start:end]
         labels_chunk = labels_1d[start:end]
-        logprobs_chunk, entropy_chunk = fast_logprobs_and_entropy_from_logits(logits_chunk, labels_chunk, calculate_entropy)
+        logprobs_chunk, entropy_chunk = fast_logprobs_and_entropy_from_logits(
+            logits_chunk, labels_chunk, calculate_entropy
+        )
         logprobs_chunks.append(logprobs_chunk)
 
         if calculate_entropy:
@@ -674,15 +719,8 @@ def chunked_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy, 
     return logprobs, entropy
 
 
-try:
-    from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
-
-    FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = True
-except ImportError:
-    FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
-
 def fast_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy):
-    #tname_e2e = timers.start("logprob: e2e")
+    # tname_e2e = timers.start("logprob: e2e")
 
     if not calculate_entropy:
         entropy = None
@@ -695,42 +733,46 @@ def fast_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy):
     flat_labels = labels.reshape(-1)
 
     if FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
-        #tname = timers.start("logprob: fa: 1. logprob")
+        # tname = timers.start("logprob: fa: 1. logprob")
         inplace_backward = logits.requires_grad
         output = cross_entropy_loss(flat_logits, flat_labels, inplace_backward=inplace_backward)
         logprobs = (-output[0]).view(*all_but_vocab_dim)
-        #timers.stop_and_print_elapsed(tname)
+        # timers.stop_and_print_elapsed(tname)
         if calculate_entropy:
-            #tname = timers.start("logprob: fa: 2. entropy")
+            # tname = timers.start("logprob: fa: 2. entropy")
             gathered_logits = torch.gather(flat_logits, -1, flat_labels.unsqueeze(-1)).squeeze(-1)
             logsumexp = gathered_logits - logprobs.reshape(-1)
             probs = torch.exp(flat_logits - logsumexp.unsqueeze(-1))
             entropy = (logsumexp - torch.sum(probs * flat_logits, dim=-1)).view(*all_but_vocab_dim)
-            #timers.stop_and_print_elapsed(tname)
+            # timers.stop_and_print_elapsed(tname)
     else:
         # using 2 different implementations paths to optimize for whether calculate_entropy is needed or not
         if calculate_entropy:
-            #tname = timers.start("logprob: (calculate_entropy=True) non-fa: 1. logprob")
+            # tname = timers.start("logprob: (calculate_entropy=True) non-fa: 1. logprob")
             logsumexp = torch.logsumexp(flat_logits, dim=-1)
-            logprobs = (torch.gather(flat_logits, -1, flat_labels.unsqueeze(-1)).squeeze(-1) - logsumexp).view(*all_but_vocab_dim)
+            logprobs = (torch.gather(flat_logits, -1, flat_labels.unsqueeze(-1)).squeeze(-1) - logsumexp).view(
+                *all_but_vocab_dim
+            )
             probs = torch.exp(flat_logits - logsumexp.unsqueeze(-1))
-            #timers.stop_and_print_elapsed(tname)
-            #tname = timers.start("logprob: (calculate_entropy=False) non-fa: 2. entropy")
+            # timers.stop_and_print_elapsed(tname)
+            # tname = timers.start("logprob: (calculate_entropy=False) non-fa: 2. entropy")
             entropy = (logsumexp - torch.sum(probs * flat_logits, dim=-1)).view(*all_but_vocab_dim)
-            #timers.stop_and_print_elapsed(tname)
+            # timers.stop_and_print_elapsed(tname)
         else:
             # Fastest logprobs-only: gather + logsumexp, but we can do better
             # with log_softmax fused kernel (single pass) + gather on the result
-            #tname = timers.start("logprob: (calculate_entropy=False) non-fa: 0. logprob")
-            logprobs = torch.gather(
-                torch.nn.functional.log_softmax(flat_logits, dim=-1),
-                -1, flat_labels.unsqueeze(-1)
-            ).squeeze(-1).view(*all_but_vocab_dim)
-            #timers.stop_and_print_elapsed(tname)
+            # tname = timers.start("logprob: (calculate_entropy=False) non-fa: 0. logprob")
+            logprobs = (
+                torch.gather(torch.nn.functional.log_softmax(flat_logits, dim=-1), -1, flat_labels.unsqueeze(-1))
+                .squeeze(-1)
+                .view(*all_but_vocab_dim)
+            )
+            # timers.stop_and_print_elapsed(tname)
 
-    #timers.stop_and_print_elapsed(tname_e2e)
+    # timers.stop_and_print_elapsed(tname_e2e)
 
     return logprobs, entropy
+
 
 @register_post_processor("compute_entropy_and_logprobs")
 def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: dict, device: str) -> dict:
@@ -740,15 +782,15 @@ def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: di
     large vocabularies (e.g. 150k+ tokens).  Returns only logprobs and maybe entropy — raw
     logits are never included in the wire response.
     """
-    #tname_e2e = timers.start("compute_entropy_and_logprobs_post")
+    # tname_e2e = timers.start("compute_entropy_and_logprobs_post")
     see_memory_usage("compute_entropy_and_logprobs_post start", force=True)
 
     calculate_entropy = meta.get("calculate_entropy")
     pr0(f"{calculate_entropy=}")
     processor_outputs = dict()
     if "logits" in model_outputs:
-        #tname = timers.start("a3")
-        #timers.stop_and_print_elapsed(tname)
+        # tname = timers.start("a3")
+        # timers.stop_and_print_elapsed(tname)
 
         logits = model_outputs["logits"]
         input_ids = batch.get("input_ids")
@@ -773,11 +815,13 @@ def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: di
         logits_optimization = meta.get("logits_optimization", "none")
         peak_mem_gib = meta.get("logits_optimization_peak_mem_size_in_gib", 4)
         if logits_optimization == "compute":
-            logprobs, entropy = chunked_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy, peak_mem_gib=peak_mem_gib)
+            logprobs, entropy = chunked_logprobs_and_entropy_from_logits(
+                logits, labels, calculate_entropy, peak_mem_gib=peak_mem_gib
+            )
         elif logits_optimization == "none":
             logprobs, entropy = fast_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy)
         elif logits_optimization == "memory":
-            raise ValueError(f"arctic_rl.logits_optimization=memory requires zorro enabled")
+            raise ValueError("arctic_rl.logits_optimization=memory requires zorro enabled")
         else:
             raise ValueError(
                 f"Unknown arctic_rl.logits_optimization={logits_optimization!r}; "
@@ -791,9 +835,9 @@ def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: di
         if entropy is not None:
             processor_outputs["entropy"] = entropy
 
-        #tname = timers.start("post-fwd: token_logprobs")
-        #see_memory_usage("compute_entropy_and_logprobs_post 3", force=True)
-        #timers.stop_and_print_elapsed(tname)
+        # tname = timers.start("post-fwd: token_logprobs")
+        # see_memory_usage("compute_entropy_and_logprobs_post 3", force=True)
+        # timers.stop_and_print_elapsed(tname)
 
         # free memory asap (not sure if another post-fwd consumer wants it?)
         model_outputs.pop("logits")
@@ -805,9 +849,10 @@ def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: di
         if entropy is not None:
             processor_outputs["entropy"] = entropy
 
-    #timers.stop_and_print_elapsed(tname_e2e)
+    # timers.stop_and_print_elapsed(tname_e2e)
 
     return processor_outputs
+
 
 # switch to compute_entropy_and_logprobs_post
 # @register_post_processor("compute_logprobs")
@@ -867,6 +912,7 @@ def apply_temperature_post(model_outputs: dict, batch: dict, meta: dict, device:
     """Apply temperature to logits."""
     see_memory_usage("apply_temperature_post start", force=True)
     if "logits" in model_outputs:
+        temperature = meta["temperature"]
         logits = model_outputs["logits"]
         temperature = meta["temperature"]
         if temperature != 1.0:
