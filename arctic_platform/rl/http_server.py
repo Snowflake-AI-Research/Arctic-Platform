@@ -39,8 +39,6 @@ from typing import Optional
 from typing import Union
 
 import ray
-from ray.util.placement_group import placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 import torch
 import uvicorn
 from arctic_inference.server.config import ModelConfig
@@ -54,22 +52,19 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from transformers import AutoTokenizer
-from arctic_platform.rl.utils import (
-    http_split_batch,
-    merge_dict_shards,
-    restore_batch_order,
-    merge_cuda_ipc_payloads,
-)
-from arctic_platform.rl.ray_cluster import init_ray_cluster
-from arctic_platform.rl.utils.ray_pg import (
-    ColocatePlacement,
-    create_colocate_placement,
-    pg_scheduling_options,
-)
-from arctic_platform.rl.utils.debug import see_memory_usage, pr, pr0
+
 from arctic_platform.rl.deepspeed_worker import DeepSpeedWorker
+from arctic_platform.rl.ray_cluster import init_ray_cluster
 from arctic_platform.rl.server import ArcticRLServerState
+from arctic_platform.rl.utils import http_split_batch
+from arctic_platform.rl.utils import merge_cuda_ipc_payloads
+from arctic_platform.rl.utils import merge_dict_shards
+from arctic_platform.rl.utils import restore_batch_order
 from arctic_platform.rl.utils.batch import combine_metric_shards
+from arctic_platform.rl.utils.debug import pr0
+from arctic_platform.rl.utils.ray_pg import ColocatePlacement
+from arctic_platform.rl.utils.ray_pg import create_colocate_placement
+from arctic_platform.rl.utils.ray_pg import pg_scheduling_options
 
 logger = logging.getLogger(__name__)
 
@@ -82,9 +77,11 @@ app = FastAPI(title="Arctic RL Local Server")
 ENABLE_TIMERS = False
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
+
     timers = SynchronizedWallClockTimerSimple(wall_clock_breakdown=True)
 else:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimpleDummy
+
     timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
 
 
@@ -119,7 +116,6 @@ class LogProbsRequest(BaseModel):
     prompts: List[str]
     completions: Optional[List[str]] = None
     top_k: int = 1
-
 
 
 def _build_model_config(model_name: str, vllm_config: dict | None) -> ModelConfig:
@@ -179,10 +175,12 @@ async def initialize(job_config: JobConfig = Body(...)):
     def _pg_options(bundle_index: int, fraction_key: str) -> dict:
         """PG-pinned scheduling: fractional GPU claim inside a specific (global) bundle."""
         return pg_scheduling_options(
-            placement, bundle_index, _COLOCATE_GPU_FRACTIONS[fraction_key],
+            placement,
+            bundle_index,
+            _COLOCATE_GPU_FRACTIONS[fraction_key],
         )
 
-    n_bundles = getattr(app.state, "n_bundles", 0)
+    # n_bundles = getattr(app.state, "n_bundles", 0)
 
     # Bundle layout (deterministic), full 3-way colocation:
     #   training pins rank r        → bundle r            [0 .. training_gpus-1]
@@ -300,7 +298,9 @@ async def initialize(job_config: JobConfig = Body(...)):
             num_replicas = gpus // lp_tp
             if colocate and placement:
                 per_replica_pgs, bundle_indices = placement.tp_layout(
-                    num_replicas, lp_tp, bundle_offset=lp_bundle_offset,
+                    num_replicas,
+                    lp_tp,
+                    bundle_offset=lp_bundle_offset,
                 )
                 lp_extra_env = {}
                 if lp_tp > 1:
@@ -406,15 +406,13 @@ async def fwd_bwd(
     timers.stop_and_print_elapsed(tname)
 
     tname = timers.start("xyz fwd_bwd: gather + forward_backward")
-    results = await asyncio.gather(*[
-        w.forward_backward.remote(s) for w, s in zip(workers, shards)
-    ])
+    results = await asyncio.gather(*[w.forward_backward.remote(s) for w, s in zip(workers, shards)])
     timers.stop_and_print_elapsed(tname)
     pr0(f"[DeepSpeedWorker] fwd_bwd: {len(results)=}")
 
     tname = timers.start("xyz fwd_bwd: epilogue")
     losses = [r["avg_loss"] for r in results]
-    avg_loss = sum(losses) #/ len(losses)
+    avg_loss = sum(losses)  # / len(losses)
 
     # See ray_server.fwd_bwd for the rationale: collapse the per-DP-rank
     # paired ``.sum`` / ``.tokens`` metric scalars into one global
@@ -451,9 +449,7 @@ async def fwd_no_grad(
 
     shards, reorder_indices = http_split_batch(body, len(workers))
     shards[0]["meta"]["worker_return_tensors"] = True
-    results = await asyncio.gather(*[
-        w.forward_no_grad.remote(s) for w, s in zip(workers, shards)
-    ])
+    results = await asyncio.gather(*[w.forward_no_grad.remote(s) for w, s in zip(workers, shards)])
     pr0(f"[DeepSpeedWorker] fwd_no_grad: {len(results)=}")
 
     batch = merge_dict_shards([r["batch"] for r in results])
@@ -490,9 +486,7 @@ async def empty_training_cache(job_id: int):
     workers = app.state.training_workers
     loop = asyncio.get_running_loop()
     refs = [w.empty_cache.remote() for w in workers]
-    results = await asyncio.gather(*[
-        loop.run_in_executor(None, ray.get, ref) for ref in refs
-    ])
+    results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
     logger.info("Empty training cache: %s", results)
     return {"job_id": job_id, "workers": results}
 
@@ -573,9 +567,7 @@ async def sleep_training(job_id: int, mode: str = "all"):
         refs = [w.offload_lp_params.remote() for w in workers]
     else:
         refs = [w.offload_to_cpu.remote() for w in workers]
-    results = await asyncio.gather(*[
-        loop.run_in_executor(None, ray.get, ref) for ref in refs
-    ])
+    results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
     logger.info("Offload training (mode=%s): %s", mode, results)
     return {"job_id": job_id, "workers": results}
 
@@ -587,9 +579,7 @@ async def wake_training(job_id: int):
     workers = app.state.training_workers
     loop = asyncio.get_running_loop()
     refs = [w.backload_to_gpu.remote() for w in workers]
-    results = await asyncio.gather(*[
-        loop.run_in_executor(None, ray.get, ref) for ref in refs
-    ])
+    results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
     logger.info("Wake training: %s", results)
     return {"job_id": job_id, "workers": results}
 
@@ -606,9 +596,7 @@ async def sleep_log_prob(job_id: int):
         return {"job_id": job_id, "workers": []}
     loop = asyncio.get_running_loop()
     refs = [w.offload_to_cpu.remote() for w in workers]
-    results = await asyncio.gather(*[
-        loop.run_in_executor(None, ray.get, ref) for ref in refs
-    ])
+    results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
     logger.info("Offload log_prob: %s", results)
     return {"job_id": job_id, "workers": results}
 
@@ -625,9 +613,7 @@ async def wake_log_prob(job_id: int):
         return {"job_id": job_id, "workers": []}
     loop = asyncio.get_running_loop()
     refs = [w.backload_to_gpu.remote() for w in workers]
-    results = await asyncio.gather(*[
-        loop.run_in_executor(None, ray.get, ref) for ref in refs
-    ])
+    results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in refs])
     logger.info("Wake log_prob: %s", results)
     return {"job_id": job_id, "workers": results}
 
@@ -682,10 +668,9 @@ async def sync_weights(request: SyncWeightsRequest = Body(...)):
         print("colo _sync_weights_nccl")
         results = await _sync_weights_nccl(workers, pool)
 
-    #await self.arctic_rl_ray_server_state.reset_prefix_cache.remote(request.sampling_job_id)
+    # await self.arctic_rl_ray_server_state.reset_prefix_cache.remote(request.sampling_job_id)
 
     return {"job_id": request.training_job_id, **results}
-
 
     # if colocate:
     #     lp_pool = app.state.log_prob_pool
@@ -693,7 +678,6 @@ async def sync_weights(request: SyncWeightsRequest = Body(...)):
     #         return await _sync_weights_cuda_ipc(workers, pool, lp_pool)
     #     return await _sync_weights_ipc(workers, pool, lp_pool)
     # return await _sync_weights_nccl(workers, pool)
-
 
     # schedule = TransferSchedule.build(
     #     training_sharding="dp",
@@ -760,9 +744,7 @@ async def sync_weights(request: SyncWeightsRequest = Body(...)):
     # return {"status": "ok"}
 
 
-
-async def _sync_weights_cuda_ipc(workers, pool: ReplicaPool,
-                                 lp_pool: ReplicaPool | None = None) -> dict:
+async def _sync_weights_cuda_ipc(workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None) -> dict:
     """Colocated weight sync via CUDA IPC (zero-copy, same GPU).
 
     For ZeRO-3: all workers call gather_cuda_ipc_handles collectively
@@ -780,9 +762,7 @@ async def _sync_weights_cuda_ipc(workers, pool: ReplicaPool,
     # All workers must participate for ZeRO-3 collective gather.
     # gather_cuda_ipc_handles is safe for ZeRO-2 too (no ds_id → no gather).
     gather_refs = [w.gather_cuda_ipc_handles.remote() for w in workers]
-    results = await asyncio.gather(*[
-        loop.run_in_executor(None, ray.get, ref) for ref in gather_refs
-    ])
+    results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in gather_refs])
     ipc_payload = merge_cuda_ipc_payloads(results)
     num_params = ipc_payload.get("num_params", 0)
 
@@ -796,29 +776,22 @@ async def _sync_weights_cuda_ipc(workers, pool: ReplicaPool,
             continue
         for rid in range(p.num_replicas):
             w = p._workers[rid]
-            recv_tasks.append(
-                loop.run_in_executor(
-                    None, ray.get,
-                    w.load_weights_cuda_ipc.remote(ipc_payload)))
+            recv_tasks.append(loop.run_in_executor(None, ray.get, w.load_weights_cuda_ipc.remote(ipc_payload)))
             total_replicas += 1
     await asyncio.gather(*recv_tasks)
 
     # Release IPC tensor refs on every rank (each rank holds its own GPU's
     # cloned weights alive for the duration of the sync).
-    await asyncio.gather(*[
-        loop.run_in_executor(None, ray.get, w.release_ipc_handles.remote())
-        for w in workers
-    ])
+    await asyncio.gather(*[loop.run_in_executor(None, ray.get, w.release_ipc_handles.remote()) for w in workers])
 
     elapsed = time.monotonic() - t0
     logger.info(
-        "Weight sync (CUDA IPC) complete in %.3fs (%d replica(s), %d params)",
-        elapsed, total_replicas, num_params)
+        "Weight sync (CUDA IPC) complete in %.3fs (%d replica(s), %d params)", elapsed, total_replicas, num_params
+    )
     return {"status": "ok"}
 
 
-async def _sync_weights_cuda_ipc_low_mem(workers, pool: ReplicaPool,
-                                         lp_pool: ReplicaPool | None = None) -> dict:
+async def _sync_weights_cuda_ipc_low_mem(workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None) -> dict:
     """Memory-efficient (slower) colocated weight sync via CUDA IPC.
 
     Streams one parameter at a time: all training ranks collectively gather a
@@ -864,29 +837,26 @@ async def _sync_weights_cuda_ipc_low_mem(workers, pool: ReplicaPool,
         validate = all_names if idx == num_params - 1 else None
 
         recv_tasks = [
-            loop.run_in_executor(
-                None, ray.get,
-                w.load_weights_cuda_ipc_chunk.remote(payload, validate))
+            loop.run_in_executor(None, ray.get, w.load_weights_cuda_ipc_chunk.remote(payload, validate))
             for w in replicas
         ]
         await asyncio.gather(*recv_tasks)
 
         # Release this param's source ref on every training rank before the next
         # gather, bounding peak memory to one full param per GPU.
-        await asyncio.gather(*[
-            loop.run_in_executor(None, ray.get, w.release_ipc_handles.remote())
-            for w in workers
-        ])
+        await asyncio.gather(*[loop.run_in_executor(None, ray.get, w.release_ipc_handles.remote()) for w in workers])
 
     elapsed = time.monotonic() - t0
     logger.info(
         "Weight sync (CUDA IPC, low-mem) complete in %.3fs (%d replica(s), %d params)",
-        elapsed, len(replicas), num_params)
+        elapsed,
+        len(replicas),
+        num_params,
+    )
     return {"status": "ok"}
 
 
-async def _sync_weights_ipc(sync_path: str, workers, pool: ReplicaPool,
-                            lp_pool: ReplicaPool | None = None) -> dict:
+async def _sync_weights_ipc(sync_path: str, workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None) -> dict:
     """Colocated weight sync via CPU file.
 
     For ZeRO-3: all workers call gather_and_save_state_dict collectively
@@ -898,9 +868,7 @@ async def _sync_weights_ipc(sync_path: str, workers, pool: ReplicaPool,
 
     # All workers must participate for ZeRO-3 collective gather
     save_refs = [w.gather_and_save_state_dict.remote(sync_path) for w in workers]
-    results = await asyncio.gather(*[
-        loop.run_in_executor(None, ray.get, ref) for ref in save_refs
-    ])
+    results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in save_refs])
     num_params = results[0].get("num_params", 0)
 
     recv_tasks = []
@@ -910,10 +878,7 @@ async def _sync_weights_ipc(sync_path: str, workers, pool: ReplicaPool,
             continue
         for rid in range(p.num_replicas):
             w = p._workers[rid]
-            recv_tasks.append(
-                loop.run_in_executor(
-                    None, ray.get,
-                    w.load_weights_from_shm_path.remote(sync_path)))
+            recv_tasks.append(loop.run_in_executor(None, ray.get, w.load_weights_from_shm_path.remote(sync_path)))
             total_replicas += 1
     await asyncio.gather(*recv_tasks)
 
@@ -921,8 +886,8 @@ async def _sync_weights_ipc(sync_path: str, workers, pool: ReplicaPool,
 
     elapsed = time.monotonic() - t0
     logger.info(
-        "Weight sync (CPU→GPU) complete in %.3fs (%d replica(s), %d params)",
-        elapsed, total_replicas, num_params)
+        "Weight sync (CPU→GPU) complete in %.3fs (%d replica(s), %d params)", elapsed, total_replicas, num_params
+    )
     return {"status": "ok"}
 
 
@@ -936,9 +901,7 @@ async def _sync_weights_nccl(workers, pool: ReplicaPool) -> dict:
     )
 
     sender_ranks = [g.sender_train_rank for g in schedule.groups]
-    sender_ips = await asyncio.gather(
-        *[workers[r].get_ip.remote() for r in sender_ranks]
-    )
+    sender_ips = await asyncio.gather(*[workers[r].get_ip.remote() for r in sender_ranks])
     group_master_addrs = {g.group_id: ip for g, ip in zip(schedule.groups, sender_ips)}
 
     if not app.state.weight_sync_ready:
@@ -1012,9 +975,7 @@ async def log_probs(job_id: int, request: LogProbsRequest = Body(...)):
 
         workers = app.state.log_prob_workers
         shards = http_split_batch(batch_data, len(workers))
-        raw = await asyncio.gather(*[
-            w.compute_log_probs.remote(s) for w, s in zip(workers, shards)
-        ])
+        raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
         shard_tensors = [torch.load(io.BytesIO(r), map_location="cpu") for r in raw]
         results = torch.cat(shard_tensors, dim=0)
     else:
@@ -1131,14 +1092,11 @@ def main():
         # Back-compat views for callers that still read these attributes.
         app.state.n_bundles = app.state.placement.n_bundles
         app.state.placement_group = (
-            app.state.placement.placement_groups[0]
-            if len(app.state.placement.placement_groups) == 1
-            else None
+            app.state.placement.placement_groups[0] if len(app.state.placement.placement_groups) == 1 else None
         )
 
     if args.colocate:
-        assert app.state.placement, \
-            "Placement groups must be created when colocate=True"
+        assert app.state.placement, "Placement groups must be created when colocate=True"
 
     app.state.training_workers = []
     app.state.sampling_pool = ReplicaPool()

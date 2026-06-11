@@ -1,23 +1,39 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Demo script for prompt deduplication optimization.
 
 Run this script to test the implementation.
 """
 
-import sys
 import os
+import sys
+
+import torch
 
 # Add parent directory to path for imports
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)
 
-import torch
-from arctic_platform.rl.zorro_train.actor import DeduplicatedActor
-from arctic_platform.rl.zorro_train.tests import (
-    create_dummy_batch,
-    test_gradient_correctness,
-    benchmark_performance
-)
+
+if True:  # deal with sys.path adjustment
+    from arctic_platform.rl.zorro_train.actor import DeduplicatedActor
+    from arctic_platform.rl.zorro_train.tests import benchmark_performance
+    from arctic_platform.rl.zorro_train.tests import create_dummy_batch
+    from arctic_platform.rl.zorro_train.tests import test_gradient_correctness
 
 
 def main():
@@ -25,63 +41,60 @@ def main():
     print("=" * 80)
     print("Prompt Deduplication Optimization Demo")
     print("=" * 80)
-    
+
     # Setup
     model_name = "Qwen/Qwen3-4B"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     attn_impl = "sdpa"  # Use SDPA for compatibility (flash_attention_2 or flash_attention_3 also work)
-    
+
     print(f"\nDevice: {device}")
     print(f"Model: {model_name}")
     print(f"Attention: {attn_impl}")
-    
+
     try:
         actor = DeduplicatedActor(
-            model_name, 
+            model_name,
             device=device,
             use_split_attention=True,  # Enable split attention optimization
-            attn_implementation=attn_impl
+            attn_implementation=attn_impl,
         )
     except Exception as e:
         print(f"\nError loading model: {e}")
         print("\nPlease check that the model is available and your environment is set up correctly")
         import traceback
+
         traceback.print_exc()
         return
-    
+
     # Demo 1: Simple forward pass
     print("\n" + "=" * 80)
     print("Demo 1: Forward Pass with Deduplication")
     print("=" * 80)
-    
+
     batch = create_dummy_batch(
         batch_size=8,
         num_unique_prompts=2,
         prompt_len=32,
         response_len=16,
         device=device,
-        include_training_fields=False
+        include_training_fields=False,
     )
-    
+
     print("\nRunning forward pass...")
-    entropy, log_probs = actor._forward_micro_batch(
-        batch,
-        temperature=1.0,
-        calculate_entropy=True
-    )
-    
-    print(f"\nResults:")
+    entropy, log_probs = actor._forward_micro_batch(batch, temperature=1.0, calculate_entropy=True)
+
+    print("\nResults:")
     print(f"  Log probs shape: {log_probs.shape}")
     print(f"  Log probs mean: {log_probs.mean().item():.4f}")
     if entropy is not None:
         print(f"  Entropy shape: {entropy.shape}")
         print(f"  Entropy mean: {entropy.mean().item():.4f}")
-    
+
     # Demo 2: Gradient correctness test
     print("\n" + "=" * 80)
     print("Demo 2: Gradient Correctness Test")
     print("=" * 80)
-    
+
     passed = test_gradient_correctness(
         actor=actor,
         batch_size=8,
@@ -90,11 +103,11 @@ def main():
         response_len=16,
         device=device,
     )
-    
+
     if not passed:
         print("\nWarning: Gradient test did not pass. Implementation may have issues.")
         return
-    
+
     # Demo 3: Performance benchmark (optional)
     print("\n" + "=" * 80)
     print("Demo 3: Performance Benchmark")
@@ -104,9 +117,9 @@ def main():
     print("  - Each has a different 1K-token response")
     print("  - Total: 110K tokens")
     print("\nDeduplication should save ~81% of computation")
-    
+
     user_input = input("\nRun performance benchmark? (y/n): ")
-    if user_input.lower() == 'y':
+    if user_input.lower() == "y":
         benchmark_performance(
             actor=actor,
             batch_size=4,
@@ -119,7 +132,7 @@ def main():
         )
     else:
         print("Skipping benchmark.")
-    
+
     print("\n" + "=" * 80)
     print("All demos completed!")
     print("=" * 80)
@@ -127,4 +140,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

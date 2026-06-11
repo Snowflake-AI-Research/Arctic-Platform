@@ -25,33 +25,29 @@ construction time.
 
 from __future__ import annotations
 
-import atexit
-import io
 import logging
-import signal
-import subprocess
-import sys
-import time
-import ray
-import aiohttp
-import requests
-import torch
 from typing import Any
 
+import ray
+
 from arctic_platform.rl.config import ArcticRLClientConfig
-from arctic_platform.rl.utils.batch import tensorize
-from arctic_platform.rl.ray_server import create_arctic_rl_ray_server_state, ArcticRLRayServerState, ArcticRLRayServer
-from arctic_platform.rl.utils.debug import see_memory_usage, pr, pr0
+from arctic_platform.rl.ray_server import ArcticRLRayServer
+from arctic_platform.rl.ray_server import ArcticRLRayServerState
+from arctic_platform.rl.ray_server import create_arctic_rl_ray_server_state
+from arctic_platform.rl.utils.debug import pr0
 
 ENABLE_TIMERS = False
 if ENABLE_TIMERS:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimple
+
     timers = SynchronizedWallClockTimerSimple(wall_clock_breakdown=True)
 else:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimpleDummy
+
     timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
 
 logger = logging.getLogger(__name__)
+
 
 class ArcticRLRayClient:
     """HTTP client for RL training against dss-platform or a local server.
@@ -94,8 +90,10 @@ class ArcticRLRayClient:
             self._initialize_jobs(config)
 
         self._arctic_rl_ray_server = ArcticRLRayServer(self._arctic_rl_ray_server_state)
-        pr0(f"[ArcticRLRayClient] exit: created arctic_rl_ray_server: {self._arctic_rl_ray_server=} {self._arctic_rl_ray_server_state=}")
-
+        pr0(
+            "[ArcticRLRayClient] exit: created arctic_rl_ray_server:"
+            f" {self._arctic_rl_ray_server=} {self._arctic_rl_ray_server_state=}"
+        )
 
     def reconnect_config(self) -> ArcticRLClientConfig:
         """Return a serializable config that reconnects to the same pre-existing jobs.
@@ -123,10 +121,8 @@ class ArcticRLRayClient:
             comm_protocol="ray",
         )
 
-
     def get_server_state(self) -> ArcticRLRayServerState:
         return self._arctic_rl_ray_server_state
-
 
     # ------------------------------------------------------------------
     # Job initialization
@@ -142,7 +138,6 @@ class ArcticRLRayClient:
         if self.config.log_prob_gpus > 0:
             data = self._post_initialize("log_prob")
             self._log_prob_job_id = data["job_id"]
-
 
     def _post_initialize(self, job_type: str) -> dict[str, Any]:
         job_config: dict[str, Any] = {
@@ -181,8 +176,6 @@ class ArcticRLRayClient:
 
         resp = ray.get(self._arctic_rl_ray_server_state.initialize.remote(job_config))
         return resp
-
-
 
     async def _destroy_job(self, job_id: int, job_type: str) -> None:
         response = await self._arctic_rl_ray_server.destroy(job_id, job_type)
@@ -270,17 +263,14 @@ class ArcticRLRayClient:
         timers.stop_and_print_elapsed(tname_e2e)
         return response
 
-
     async def fwd_no_grad(self, batch: dict, reference_model: bool) -> dict[str, Any]:
-        """Forward-only pass (no gradient) on the training engine.
-        """
+        """Forward-only pass (no gradient) on the training engine."""
         job_id = self.log_prob_job_id if reference_model else self.training_job_id
         pr0(f"[ArcticRLRayClient] fwd_no_grad INPUT: {batch.keys()=} {reference_model=} {job_id=}")
         response = await self._arctic_rl_ray_server.fwd_no_grad(job_id, batch)
         pr0(f"[ArcticRLRayClient] fwd_no_grad OUTPUT: {response.keys()=}")
         # response["batch"] = tensorize(response["batch"])
         return response
-
 
     async def step(self) -> dict[str, Any]:
         """Optimizer step on the training engine."""
@@ -327,7 +317,6 @@ class ArcticRLRayClient:
 
         return resp["results"]
 
-
     # ------------------------------------------------------------------
     # Colocated lifecycle
     # ------------------------------------------------------------------
@@ -348,7 +337,6 @@ class ArcticRLRayClient:
         print(f"ArcticRLRayClient: wake_inference OUTPUT: {response.keys()=}")
         return response
 
-
     async def reset_prefix_cache(self) -> dict[str, Any]:
         """Reset the prefix cache on the sampling inference engine."""
         job_id = self.sampling_job_id
@@ -356,7 +344,6 @@ class ArcticRLRayClient:
         response = await self._arctic_rl_ray_server.reset_prefix_cache(job_id)
         print(f"ArcticRLRayClient: reset_prefix_cache OUTPUT: {response.keys()=}")
         return response
-
 
     async def sleep_training(self, mode: str = "all") -> dict[str, Any]:
         """Offload training state to CPU (sleep training workers).
@@ -371,7 +358,6 @@ class ArcticRLRayClient:
         print(f"ArcticRLRayClient: sleep_training OUTPUT: {response.keys()}")
         return response
 
-
     async def wake_training(self) -> dict[str, Any]:
         """Reload all training state to GPU (wake training workers)."""
         job_id = self.training_job_id
@@ -379,7 +365,6 @@ class ArcticRLRayClient:
         response = await self._arctic_rl_ray_server.wake_training(job_id)
         print(f"ArcticRLRayClient: wake_training OUTPUT: {response.keys()=}")
         return response
-
 
     async def sleep_log_prob(self) -> dict[str, Any]:
         """Offload the reference (log-prob) DeepSpeed engine to CPU."""
@@ -391,7 +376,6 @@ class ArcticRLRayClient:
         print(f"ArcticRLRayClient: sleep_log_prob OUTPUT: {response.keys()=}")
         return response
 
-
     async def wake_log_prob(self) -> dict[str, Any]:
         """Reload the reference (log-prob) DeepSpeed engine to GPU."""
         job_id = self.log_prob_job_id
@@ -401,8 +385,6 @@ class ArcticRLRayClient:
         response = await self._arctic_rl_ray_server.wake_log_prob(job_id)
         print(f"ArcticRLRayClient: wake_log_prob OUTPUT: {response.keys()=}")
         return response
-
-
 
     async def empty_training_cache(self) -> dict[str, Any]:
         """Release PyTorch cached GPU memory on all training workers."""
@@ -416,8 +398,7 @@ class ArcticRLRayClient:
     # Weight sync
     # ------------------------------------------------------------------
 
-    async def sync_weights(self, cuda_ipc: bool = False,
-                           low_memory: bool = False) -> dict[str, Any]:
+    async def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict[str, Any]:
         """Sync training model weights to the sampling engine.
 
         In non-colocated mode, uses NCCL.  In colocated mode:

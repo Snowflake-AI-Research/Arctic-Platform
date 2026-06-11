@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Prompt deduplication utilities.
 
@@ -5,16 +20,22 @@ Identifies and deduplicates shared prompts across batch samples.
 Supports both padded and unpadded sequences.
 """
 
-import torch
-from typing import Tuple, Dict, List, Optional
 import functools
 import operator
-#import numpy as np
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Tuple
 
-from arctic_platform.rl.utils.debug import pr, pr0
-
+import torch
 import triton
 import triton.language as tl
+
+from arctic_platform.rl.utils.debug import pr
+from arctic_platform.rl.utils.debug import pr0
+
+# import numpy as np
+
 
 def analyze_normal_batch_via_attention_mask(input_ids, attention_mask, padded_response_len):
     """
@@ -70,7 +91,7 @@ def analyze_normal_batch_via_attention_mask(input_ids, attention_mask, padded_re
     non_pad_percent = non_pad_len_total / full_attention_mask.numel() * 100
 
     prompt_ids = input_ids[:, :padded_prompt_len]
-    unique_prompts = {tuple(prompt_ids[i].tolist()):prompts_attention_mask[i].sum() for i in range(batch_size)}
+    unique_prompts = {tuple(prompt_ids[i].tolist()): prompts_attention_mask[i].sum() for i in range(batch_size)}
     unique_prompts_lens = list(unique_prompts.values())
     # unique_prompts = {}
     # for prompt_id in prompt_ids.tolist():
@@ -99,11 +120,11 @@ def analyze_normal_batch_via_attention_mask(input_ids, attention_mask, padded_re
     pr0(f"{prompts_non_pad_lens_total.item()=}")
     pr0(f"{responses_non_pad_len_total.item()=}")
 
-    #pr0(f"{sorted(prompts_non_pad_lens)=}")
+    # pr0(f"{sorted(prompts_non_pad_lens)=}")
     pr0(f"{sorted(unique_prompts_lens)=}")
     pr0(f"{len(unique_prompt_ids)=}")
     pr0(f"{sorted(responses_non_pad_lens.tolist())=}")
-    #pr0(f"{min_responses_non_pad_lens)=}")
+    # pr0(f"{min_responses_non_pad_lens)=}")
     pr0(f"{total_deduped_prompt_and_response_non_pad_tokens=}")
 
     pr0(f"{non_pad_len_total=}")
@@ -116,11 +137,15 @@ def analyze_normal_batch_via_attention_mask(input_ids, attention_mask, padded_re
         unique_prompts_lens_in_k = unique_prompts_lens_in_k[0]
 
     # this is the one line summary so that it's easy to grep for - and print it for all ranks
-    pr(f"batch stats: prompt lens: {unique_prompts_lens_in_k} resp count={len(responses_non_pad_lens)}/min={responses_non_pad_lens_min_in_k/1024:0.1f}Ki/mean={responses_non_pad_lens_mean_in_k/1024:0.1f}Ki/max={responses_non_pad_lens_max_in_k/1024:0.1f}Ki non-pad-tokens={total_deduped_prompt_and_response_non_pad_tokens/1000:0.1f}K/{non_pad_percent:0.1f}%")
+    pr(
+        f"batch stats: prompt lens: {unique_prompts_lens_in_k} resp"
+        f" count={len(responses_non_pad_lens)}/min={responses_non_pad_lens_min_in_k/1024:0.1f}Ki/mean={responses_non_pad_lens_mean_in_k/1024:0.1f}Ki/max={responses_non_pad_lens_max_in_k/1024:0.1f}Ki"
+        f" non-pad-tokens={total_deduped_prompt_and_response_non_pad_tokens/1000:0.1f}K/{non_pad_percent:0.1f}%"
+    )
 
 
 class ReconstructionInfo(dict):
-    """ this class is used to ensure the object persists and can be used as a closure and doesn't get replaced with a new dict object. It forces the use of `update` to overwrite the contents of the object
+    """this class is used to ensure the object persists and can be used as a closure and doesn't get replaced with a new dict object. It forces the use of `update` to overwrite the contents of the object
 
     x = ReconstructionInfo(a=1, b=2)
     pr0(id(x))
@@ -128,8 +153,8 @@ class ReconstructionInfo(dict):
     pr0(id(x)) # same object different contents
 
     """
-    pass
 
+    pass
 
 
 @triton.jit
@@ -169,6 +194,7 @@ def _triton_reconstruct_seq(
         total_seq_tensor_ptrs = total_seq_tensor_ptr + (seq_offset + sid) * head_dim * num_heads + hids
         tl.store(total_seq_tensor_ptrs, tl.load(response_ptrs))
 
+
 def reconstruct_sequence(
     total_seq_tensor,
     prompt_tensor,
@@ -177,7 +203,8 @@ def reconstruct_sequence(
     cu_seqlens_response,
     cu_seqlens_packed,
     prompt_ids,
-    head_dim):
+    head_dim,
+):
     """
     Reconstruct full sequence from deduplicated prompt and response tensors using Triton.
 
@@ -204,8 +231,9 @@ def reconstruct_sequence(
         cu_seqlens_packed,
         prompt_ids,
         head_dim=head_dim,
-        num_heads=num_heads
+        num_heads=num_heads,
     )
+
 
 class ZoRRoTrain:
     """Handles prompt deduplication logic."""
@@ -296,13 +324,15 @@ class ZoRRoTrain:
             prompt_end = current_pos + prompt_len
 
             for sample_idx in group:
-                segment_info.append({
-                    'start': prompt_start,
-                    'end': prompt_end,
-                    'original_idx': sample_idx,
-                    'type': 'prompt',
-                    'group_idx': group_idx,
-                })
+                segment_info.append(
+                    {
+                        "start": prompt_start,
+                        "end": prompt_end,
+                        "original_idx": sample_idx,
+                        "type": "prompt",
+                        "group_idx": group_idx,
+                    }
+                )
 
             current_pos += prompt_len
 
@@ -315,13 +345,15 @@ class ZoRRoTrain:
                 response_start = current_pos
                 response_end = current_pos + response_length
 
-                segment_info.append({
-                    'start': response_start,
-                    'end': response_end,
-                    'original_idx': sample_idx,
-                    'type': 'response',
-                    'group_idx': group_idx,
-                })
+                segment_info.append(
+                    {
+                        "start": response_start,
+                        "end": response_end,
+                        "original_idx": sample_idx,
+                        "type": "response",
+                        "group_idx": group_idx,
+                    }
+                )
 
                 current_pos += response_length
 
@@ -345,14 +377,14 @@ class ZoRRoTrain:
             dedup_attention_mask = None
 
         reconstruction_info = {
-            'segment_info': segment_info,
-            'prompt_groups': prompt_groups,
-            'prompt_len': prompt_len,
-            'response_length': response_length,
-            'original_batch_size': batch_size,
-            'original_seq_len': seq_len,
-            'is_unpadded': False,
-            'original_attention_mask': attention_mask,
+            "segment_info": segment_info,
+            "prompt_groups": prompt_groups,
+            "prompt_len": prompt_len,
+            "response_length": response_length,
+            "original_batch_size": batch_size,
+            "original_seq_len": seq_len,
+            "is_unpadded": False,
+            "original_attention_mask": attention_mask,
         }
 
         return dedup_input_ids, dedup_attention_mask, reconstruction_info
@@ -379,10 +411,7 @@ class ZoRRoTrain:
         # We pass a dummy position_ids since we'll handle that separately
         dummy_position_ids = torch.zeros_like(dedup_input_ids)
         dedup_input_ids_unpad, _, reconstruction_info_updated = ZoRRoTrain.unpad_deduplicated_batch(
-            dedup_input_ids,
-            dummy_position_ids,
-            dedup_attention_mask,
-            reconstruction_info
+            dedup_input_ids, dummy_position_ids, dedup_attention_mask, reconstruction_info
         )
         return dedup_input_ids_unpad, reconstruction_info_updated
 
@@ -414,8 +443,7 @@ class ZoRRoTrain:
 
     @staticmethod
     def attention_mask_to_flash_attn_params(
-        attention_mask: torch.Tensor,
-        device: torch.device = None
+        attention_mask: torch.Tensor, device: torch.device = None
     ) -> Dict[str, torch.Tensor]:
         """
         Convert packed attention mask to Flash Attention varlen parameters.
@@ -468,7 +496,7 @@ class ZoRRoTrain:
 
         for i in range(1, total_q_tokens):
             # Check if query i can attend to anything that query i-1 could attend to
-            prev_attended = attention_mask[i-1].nonzero(as_tuple=False).flatten()
+            prev_attended = attention_mask[i - 1].nonzero(as_tuple=False).flatten()
             curr_attended = attention_mask[i].nonzero(as_tuple=False).flatten()
 
             if len(prev_attended) > 0 and len(curr_attended) > 0:
@@ -509,8 +537,9 @@ class ZoRRoTrain:
         cu_seqlens_k = torch.tensor(k_boundaries, dtype=torch.int32, device=device)
 
         # Verify same number of sequences
-        assert len(cu_seqlens_q) == len(cu_seqlens_k), \
-            f"Q and K must have same number of sequences, got {len(cu_seqlens_q)-1} vs {len(cu_seqlens_k)-1}"
+        assert len(cu_seqlens_q) == len(
+            cu_seqlens_k
+        ), f"Q and K must have same number of sequences, got {len(cu_seqlens_q)-1} vs {len(cu_seqlens_k)-1}"
 
         # Calculate sequence lengths
         seq_lengths_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).cpu().tolist()
@@ -521,15 +550,15 @@ class ZoRRoTrain:
         max_seqlen_k = max(seq_lengths_k) if seq_lengths_k else 0
 
         return {
-            'cu_seqlens_q': cu_seqlens_q,
-            'cu_seqlens_k': cu_seqlens_k,
-            'max_seqlen_q': max_seqlen_q,
-            'max_seqlen_k': max_seqlen_k,
-            'total_q_tokens': total_q_tokens,
-            'total_kv_tokens': total_kv_tokens,
-            'num_sequences': num_sequences,
-            'seq_lengths_q': seq_lengths_q,
-            'seq_lengths_k': seq_lengths_k,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_k": max_seqlen_k,
+            "total_q_tokens": total_q_tokens,
+            "total_kv_tokens": total_kv_tokens,
+            "num_sequences": num_sequences,
+            "seq_lengths_q": seq_lengths_q,
+            "seq_lengths_k": seq_lengths_k,
         }
 
     @staticmethod
@@ -573,9 +602,7 @@ class ZoRRoTrain:
             )
 
             # Unpad original (non-deduplicated) position_ids
-            unpadded_position_ids = ZoRRoTrain._unpad_replicated_ids(
-                position_ids, attention_mask
-            )
+            unpadded_position_ids = ZoRRoTrain._unpad_replicated_ids(position_ids, attention_mask)
         else:
             # No unpadding: keep original position_ids unchanged
             unpadded_position_ids = position_ids
@@ -613,8 +640,8 @@ class ZoRRoTrain:
 
         # Build cu_seqlens for deduplicated batch
         # We need to track where each segment (prompt/response) starts in the packed format
-        segment_info = reconstruction_info['segment_info']
-        prompt_groups = reconstruction_info['prompt_groups']
+        segment_info = reconstruction_info["segment_info"]
+        prompt_groups = reconstruction_info["prompt_groups"]
 
         # Update segment_info with unpadded positions
         updated_segment_info = []
@@ -623,31 +650,35 @@ class ZoRRoTrain:
 
         for seg in segment_info:
             # Get valid tokens in this segment
-            seg_start, seg_end = seg['start'], seg['end']
+            seg_start, seg_end = seg["start"], seg["end"]
             seg_mask = valid_mask[seg_start:seg_end]
             num_valid = seg_mask.sum().item()
 
             if num_valid > 0:
-                updated_segment_info.append({
-                    **seg,
-                    'num_valid_tokens': num_valid,
-                })
+                updated_segment_info.append(
+                    {
+                        **seg,
+                        "num_valid_tokens": num_valid,
+                    }
+                )
 
                 current_packed_pos += num_valid
             else:
                 # Segment has no valid tokens (all padding) - keep info but mark as empty
-                updated_segment_info.append({
-                    **seg,
-                    'num_valid_tokens': 0,
-                })
+                updated_segment_info.append(
+                    {
+                        **seg,
+                        "num_valid_tokens": 0,
+                    }
+                )
 
         # Build cu_seqlens for packed format
         # Each original sample becomes one sequence in the packed format
-        batch_size = reconstruction_info['original_batch_size']
+        batch_size = reconstruction_info["original_batch_size"]
         for sample_idx in range(batch_size):
             # Sum valid tokens for this sample (prompt + response)
-            sample_segments = [s for s in updated_segment_info if s['original_idx'] == sample_idx]
-            sample_valid_tokens = sum(s['num_valid_tokens'] for s in sample_segments)
+            sample_segments = [s for s in updated_segment_info if s["original_idx"] == sample_idx]
+            sample_valid_tokens = sum(s["num_valid_tokens"] for s in sample_segments)
             cu_seqlens_list.append(cu_seqlens_list[-1] + sample_valid_tokens)
 
         cu_seqlens_packed = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=dedup_input_ids.device)
@@ -657,15 +688,17 @@ class ZoRRoTrain:
         cu_seqlens_dedup_list = [0]
         for group_idx, group in enumerate(prompt_groups):
             # Prompt segment
-            prompt_seg = [s for s in updated_segment_info if s['group_idx'] == group_idx and s['type'] == 'prompt'][0]
-            prompt_valid = prompt_seg['num_valid_tokens']
+            prompt_seg = [s for s in updated_segment_info if s["group_idx"] == group_idx and s["type"] == "prompt"][0]
+            prompt_valid = prompt_seg["num_valid_tokens"]
 
             # Each response in the group
             for sample_idx in group:
-                response_seg = [s for s in updated_segment_info
-                               if s['group_idx'] == group_idx and s['type'] == 'response'
-                               and s['original_idx'] == sample_idx][0]
-                response_valid = response_seg['num_valid_tokens']
+                response_seg = [
+                    s
+                    for s in updated_segment_info
+                    if s["group_idx"] == group_idx and s["type"] == "response" and s["original_idx"] == sample_idx
+                ][0]
+                response_valid = response_seg["num_valid_tokens"]
 
                 # One sequence = prompt + response
                 seq_len = prompt_valid + response_valid
@@ -675,22 +708,21 @@ class ZoRRoTrain:
         max_seqlen_dedup = cu_seqlens_dedup.diff().max().item() if len(cu_seqlens_dedup) > 1 else 0
 
         # Update reconstruction_info
-        reconstruction_info.update({
-            'is_unpadded': True,
-            'segment_info': updated_segment_info,
-            'cu_seqlens_packed': cu_seqlens_packed,
-            'max_seqlen_packed': max_seqlen_packed,
-            'cu_seqlens_dedup': cu_seqlens_dedup,
-            'max_seqlen_dedup': max_seqlen_dedup,
-        })
+        reconstruction_info.update(
+            {
+                "is_unpadded": True,
+                "segment_info": updated_segment_info,
+                "cu_seqlens_packed": cu_seqlens_packed,
+                "max_seqlen_packed": max_seqlen_packed,
+                "cu_seqlens_dedup": cu_seqlens_dedup,
+                "max_seqlen_dedup": max_seqlen_dedup,
+            }
+        )
 
         return dedup_input_ids_unpad, dedup_position_ids_unpad, reconstruction_info
 
     @staticmethod
-    def reconstruct_sequences(
-        dedup_hidden: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def reconstruct_sequences(dedup_hidden: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Reconstruct full batch from deduplicated sequence.
 
@@ -705,7 +737,7 @@ class ZoRRoTrain:
             Else:
                 full_hidden: [original_batch, seq_len, *extra_dims] - padded format
         """
-        is_unpadded = reconstruction_info.get('is_unpadded', False)
+        is_unpadded = reconstruction_info.get("is_unpadded", False)
 
         if is_unpadded:
             return ZoRRoTrain._reconstruct_sequences_packed(dedup_hidden, reconstruction_info)
@@ -713,17 +745,14 @@ class ZoRRoTrain:
             return ZoRRoTrain._reconstruct_sequences_padded(dedup_hidden, reconstruction_info)
 
     @staticmethod
-    def _reconstruct_sequences_padded(
-        dedup_hidden: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def _reconstruct_sequences_padded(dedup_hidden: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Reconstruct to padded format [original_batch, seq_len, *extra_dims].
         """
-        segment_info = reconstruction_info['segment_info']
-        original_batch_size = reconstruction_info['original_batch_size']
-        original_seq_len = reconstruction_info['original_seq_len']
-        prompt_len = reconstruction_info['prompt_len']
+        segment_info = reconstruction_info["segment_info"]
+        original_batch_size = reconstruction_info["original_batch_size"]
+        original_seq_len = reconstruction_info["original_seq_len"]
+        prompt_len = reconstruction_info["prompt_len"]
 
         # Remove batch dimension
         dedup_hidden = dedup_hidden.squeeze(0)  # [total_tokens, *extra_dims]
@@ -734,14 +763,14 @@ class ZoRRoTrain:
         # Build mapping from original sample idx to segments
         sample_segments = {}
         for seg in segment_info:
-            sample_idx = seg['original_idx']
+            sample_idx = seg["original_idx"]
             if sample_idx not in sample_segments:
-                sample_segments[sample_idx] = {'prompt': None, 'response': None}
+                sample_segments[sample_idx] = {"prompt": None, "response": None}
 
-            if seg['type'] == 'prompt':
-                sample_segments[sample_idx]['prompt'] = seg
+            if seg["type"] == "prompt":
+                sample_segments[sample_idx]["prompt"] = seg
             else:  # response
-                sample_segments[sample_idx]['response'] = seg
+                sample_segments[sample_idx]["response"] = seg
 
         # Reconstruct each sample
         full_sequences = []
@@ -752,16 +781,16 @@ class ZoRRoTrain:
             seq = torch.zeros((original_seq_len,) + extra_dims, dtype=dtype, device=device)
 
             # Place prompt
-            prompt_seg = segs['prompt']
-            prompt_start = prompt_seg['start']
-            prompt_end = prompt_seg['end']
+            prompt_seg = segs["prompt"]
+            prompt_start = prompt_seg["start"]
+            prompt_end = prompt_seg["end"]
             prompt_hidden = dedup_hidden[prompt_start:prompt_end]
             seq[:prompt_len] = prompt_hidden
 
             # Place response
-            response_seg = segs['response']
-            response_start = response_seg['start']
-            response_end = response_seg['end']
+            response_seg = segs["response"]
+            response_start = response_seg["start"]
+            response_end = response_seg["end"]
             response_hidden = dedup_hidden[response_start:response_end]
             seq[prompt_len:] = response_hidden
 
@@ -783,16 +812,16 @@ class ZoRRoTrain:
         We need to compute deduplicated positions since segment_info contains replicated positions.
         """
 
-        prompt_groups = reconstruction_info['prompt_groups']
-        prompt_len = reconstruction_info['prompt_len']
-        cu_seqlens_packed = reconstruction_info['cu_seqlens_unique_prompts']
-        reordered_seq_idx = reconstruction_info['reordered_seq_idx']
+        prompt_groups = reconstruction_info["prompt_groups"]
+        # prompt_len = reconstruction_info["prompt_len"]
+        cu_seqlens_packed = reconstruction_info["cu_seqlens_unique_prompts"]
+        reordered_seq_idx = reconstruction_info["reordered_seq_idx"]
 
         # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
 
         dedup_tensor = dedup_tensor.squeeze(0)  # [total_dedup_valid_tokens, *extra_dims]
-        num_heads = dedup_tensor.shape[0]
-        head_dim = dedup_tensor.shape[2]
+        # num_heads = dedup_tensor.shape[0]
+        # head_dim = dedup_tensor.shape[2]
 
         # Collect all unique prompt tensors (without padding)
         response_tensors = []
@@ -804,7 +833,9 @@ class ZoRRoTrain:
             response_offset = cu_seqlens_packed[gid + 1].item()
             response_len = cu_seqlens_response[first_secondary_idx].item()
 
-            response_qkv = dedup_tensor[:, prev_packed_response_lengths + response_offset:response_offset + response_len, :]
+            response_qkv = dedup_tensor[
+                :, prev_packed_response_lengths + response_offset : response_offset + response_len, :
+            ]
 
             prev_packed_response_lengths = response_len
 
@@ -818,11 +849,10 @@ class ZoRRoTrain:
         qkv_responses_packed = qkv_responses_packed.unsqueeze(0)
 
         # Return packed tensor: [1, num_heads, total_unique_prompt_tokens, head_dim]
-        reconstruction_info['cu_seqlens_response'] = cu_seqlens_response
-        reconstruction_info['max_response_valid_len'] = max(cu_seqlens_response[1:] - cu_seqlens_response[:-1])
+        reconstruction_info["cu_seqlens_response"] = cu_seqlens_response
+        reconstruction_info["max_response_valid_len"] = max(cu_seqlens_response[1:] - cu_seqlens_response[:-1])
 
         return qkv_responses_packed
-
 
     @staticmethod
     def _get_sequences_reconstructed_from_dedup_tensors(
@@ -840,10 +870,10 @@ class ZoRRoTrain:
         We need to compute deduplicated positions since segment_info contains replicated positions.
         """
 
-        prompt_groups = reconstruction_info['prompt_groups']
-        prompt_len = reconstruction_info['prompt_len']
-        cu_seqlens_packed = reconstruction_info['cu_seqlens_unique_prompts']
-        reordered_seq_idx = reconstruction_info['reordered_seq_idx']
+        prompt_groups = reconstruction_info["prompt_groups"]
+        # prompt_len = reconstruction_info["prompt_len"]
+        cu_seqlens_packed = reconstruction_info["cu_seqlens_unique_prompts"]
+        reordered_seq_idx = reconstruction_info["reordered_seq_idx"]
 
         # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
 
@@ -854,7 +884,7 @@ class ZoRRoTrain:
         prev_packed_response_lengths = 0
         all_tensors = []
 
-        prompt_lengths = reconstruction_info['prompt_lengths'][1:]
+        prompt_lengths = reconstruction_info["prompt_lengths"][1:]
         response_lengths = (cu_seqlens_response[1:] - cu_seqlens_response[:-1]).tolist()
         prompt_tensors = torch.split(prompt_packed_tensor.squeeze(0), prompt_lengths, dim=1)
         for gid, group in enumerate(prompt_groups):
@@ -864,18 +894,22 @@ class ZoRRoTrain:
             response_offset = cu_seqlens_packed[gid + 1].item()
             response_len = cu_seqlens_response[first_secondary_idx].item()
 
-            response_qkv = dedup_tensor[:, prev_packed_response_lengths + response_offset:response_offset + response_len, :]
+            response_qkv = dedup_tensor[
+                :, prev_packed_response_lengths + response_offset : response_offset + response_len, :
+            ]
 
             prev_packed_response_lengths = response_len
-            response_tensors = torch.split(response_qkv, response_lengths[group_sizes[gid]:group_sizes[gid+1]], dim=1)
-            all_tensors.extend([torch.cat([prompt_tensors[gid], response_tensor], dim=1) for response_tensor in response_tensors])
-
+            response_tensors = torch.split(
+                response_qkv, response_lengths[group_sizes[gid] : group_sizes[gid + 1]], dim=1
+            )
+            all_tensors.extend(
+                [torch.cat([prompt_tensors[gid], response_tensor], dim=1) for response_tensor in response_tensors]
+            )
 
         # Add batch dimension: [1, num_heads, total_unique_prompt_tokens, head_dim]
         reconstructed_seq = torch.cat(all_tensors, dim=1).unsqueeze(0)
 
         return reconstructed_seq
-
 
     @staticmethod
     def _get_sequences_packed_from_dedup_tensor(
@@ -891,10 +925,12 @@ class ZoRRoTrain:
         We need to compute deduplicated positions since segment_info contains replicated positions.
         """
 
-        prompt_groups = reconstruction_info['prompt_groups']
-        prompt_len = reconstruction_info['prompt_len']
-        cu_seqlens_packed = reconstruction_info['cu_seqlens_packed']
-        reordered_seq_idx = reconstruction_info['reordered_seq_idx']
+        prompt_groups = reconstruction_info["prompt_groups"]
+        prompt_len = reconstruction_info["prompt_len"]
+        # cu_seqlens_packed = reconstruction_info["cu_seqlens_packed"]
+        cu_seqlens_unique_prompts = reconstruction_info["cu_seqlens_unique_prompts"]
+        reordered_seq_idx = reconstruction_info["reordered_seq_idx"]
+        prompt_lengths = reconstruction_info["prompt_lengths"][1:]
 
         # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
 
@@ -902,22 +938,27 @@ class ZoRRoTrain:
         num_heads = dedup_tensor.shape[0]
         head_dim = dedup_tensor.shape[2]
 
-        prompt_tensors = torch.empty((num_heads, cu_seqlens_unique_prompts[-1], head_dim), dtype=dedup_tensor.dtype, device=dedup_tensor.device)
+        packed_prompt_lengths = [0]
+
+        prompt_tensors = torch.empty(
+            (num_heads, cu_seqlens_unique_prompts[-1], head_dim), dtype=dedup_tensor.dtype, device=dedup_tensor.device
+        )
         for id, group in enumerate(prompt_groups):
             # Get first sequence from this group
             first_seq_idx = group[0]
 
             response_offset = cu_seqlens_response[reordered_seq_idx[first_seq_idx]].item()
-            response_len = (cu_seqlens_response[reordered_seq_idx[first_seq_idx] + 1] - response_offset).item()
+            # response_len = (cu_seqlens_response[reordered_seq_idx[first_seq_idx] + 1] - response_offset).item()
 
             prompt_len = prompt_lengths[id + 1]
 
-            seq_offset = packed_prmpt_lengths[-1] + response_offset
-            prompt_qkv = dedup_tensor[:, seq_offset:seq_offset + prompt_len, :]  # [seq_valid_tokens, num_heads, head_dim]
-            prompt_tensors[:, cu_seqlens_unique_prompts[id]:cu_seqlens_unique_prompts[id+1], :] = prompt_qkv
+            seq_offset = packed_prompt_lengths[-1] + response_offset
+            prompt_qkv = dedup_tensor[
+                :, seq_offset : seq_offset + prompt_len, :
+            ]  # [seq_valid_tokens, num_heads, head_dim]
+            prompt_tensors[:, cu_seqlens_unique_prompts[id] : cu_seqlens_unique_prompts[id + 1], :] = prompt_qkv
 
-            packed_prmpt_lengths.append(packed_prmpt_lengths[-1] + prompt_len)
-
+            packed_prompt_lengths.append(packed_prompt_lengths[-1] + prompt_len)
 
         # Concatenate all unique prompts along token dimension (packed format)
         # [num_heads, total_unique_prompt_tokens, head_dim]
@@ -928,7 +969,6 @@ class ZoRRoTrain:
 
         # Return packed tensor: [1, num_heads, total_unique_prompt_tokens, head_dim]
         return unique_qkv_packed
-
 
     @staticmethod
     def _get_sequences_unpacked_from_dedup_tensor(
@@ -944,9 +984,9 @@ class ZoRRoTrain:
         We need to compute deduplicated positions since segment_info contains replicated positions.
         """
 
-        prompt_groups = reconstruction_info['prompt_groups']
-        prompt_len = reconstruction_info['prompt_len']
-        cu_seqlens_packed = reconstruction_info['cu_seqlens_packed']
+        prompt_groups = reconstruction_info["prompt_groups"]
+        prompt_len = reconstruction_info["prompt_len"]
+        cu_seqlens_packed = reconstruction_info["cu_seqlens_packed"]
 
         # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
 
@@ -976,11 +1016,15 @@ class ZoRRoTrain:
             seq_lengths.append(prompt_len * len(group) + response_len_total)
 
         # Build cu_seqlens for unique prompts (cumulative token positions)
-        cu_seqlens_unique_prompts = torch.tensor(seq_lengths, dtype=torch.int32, device=dedup_tensor.device).cumsum_(dim=0)
+        cu_seqlens_unique_prompts = torch.tensor(seq_lengths, dtype=torch.int32, device=dedup_tensor.device).cumsum_(
+            dim=0
+        )
 
-        packed_prmpt_lengths = [0]
+        packed_prompt_lengths = [0]
 
-        complete_tensor = torch.empty((num_heads, cu_seqlens_unique_prompts[-1], head_dim), dtype=dedup_tensor.dtype, device=dedup_tensor.device)
+        complete_tensor = torch.empty(
+            (num_heads, cu_seqlens_unique_prompts[-1], head_dim), dtype=dedup_tensor.dtype, device=dedup_tensor.device
+        )
         for id, group in enumerate(prompt_groups):
             # Get first sequence from this group
 
@@ -993,19 +1037,25 @@ class ZoRRoTrain:
 
             prompt_len = prompt_lengths[id]
 
-            seq_offset = packed_prmpt_lengths[-1] + response_offset
-            prompt_qkv = dedup_tensor[:, seq_offset:seq_offset + prompt_len, :]  # [seq_valid_tokens, num_heads, head_dim]
+            seq_offset = packed_prompt_lengths[-1] + response_offset
+            prompt_qkv = dedup_tensor[
+                :, seq_offset : seq_offset + prompt_len, :
+            ]  # [seq_valid_tokens, num_heads, head_dim]
             responses_list = torch.split(
-                dedup_tensor[:, seq_offset + prompt_len:seq_offset + prompt_len + response_len_total, :],
-                (cu_seqlens_response[first_secondary_idx: group[-1] + 2] - cu_seqlens_response[first_seq_idx: group[-1] + 1]).tolist(),
-                dim=1
+                dedup_tensor[:, seq_offset + prompt_len : seq_offset + prompt_len + response_len_total, :],
+                (
+                    cu_seqlens_response[first_secondary_idx : group[-1] + 2]
+                    - cu_seqlens_response[first_seq_idx : group[-1] + 1]
+                ).tolist(),
+                dim=1,
             )
             all_prompt_response_pairs = [0] * len(group) * 2
 
             all_prompt_response_pairs[0::2] = [prompt_qkv] * len(group)
             all_prompt_response_pairs[1::2] = responses_list
-            complete_tensor[:, cu_seqlens_unique_prompts[id]:cu_seqlens_unique_prompts[id + 1], :] = torch.cat(all_prompt_response_pairs, dim=1)
-
+            complete_tensor[:, cu_seqlens_unique_prompts[id] : cu_seqlens_unique_prompts[id + 1], :] = torch.cat(
+                all_prompt_response_pairs, dim=1
+            )
 
         # Add batch dimension: [1, num_heads, total_unique_prompt_tokens, head_dim]
         unique_qkv_packed = complete_tensor.unsqueeze(0)
@@ -1013,13 +1063,8 @@ class ZoRRoTrain:
         # Return packed tensor: [1, num_heads, total_unique_prompt_tokens, head_dim]
         return unique_qkv_packed
 
-
     @staticmethod
-    def _get_responses_packed_from_dedup_tensor(
-        dedup_tensor: torch.Tensor,
-        reconstruction_info: Dict,
-        cu_seqlens_response: torch.Tensor,
-    ) -> torch.Tensor:
+    def _reconstruct_sequences_packed(dedup_hidden: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Reconstruct to packed format [1, total_valid_tokens, *extra_dims] (no padding).
         Replicates deduplicated prompts for each sample.
@@ -1027,265 +1072,9 @@ class ZoRRoTrain:
         In the deduplicated space, prompts appear once per group followed by all responses.
         We need to compute deduplicated positions since segment_info contains replicated positions.
         """
-
-        prompt_groups = reconstruction_info['prompt_groups']
-        prompt_len = reconstruction_info['prompt_len']
-        cu_seqlens_packed = reconstruction_info['cu_seqlens_unique_prompts']
-        reordered_seq_idx = reconstruction_info['reordered_seq_idx']
-
-        # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
-
-        dedup_tensor = dedup_tensor.squeeze(0)  # [total_dedup_valid_tokens, *extra_dims]
-        num_heads = dedup_tensor.shape[0]
-        head_dim = dedup_tensor.shape[2]
-
-        # Collect all unique prompt tensors (without padding)
-        response_tensors = []
-        prev_packed_response_lengths = 0
-        for gid, group in enumerate(prompt_groups):
-            # Get first sequence from this group
-            first_secondary_idx = reordered_seq_idx[group[-1]] + 1  # Last sample's response
-
-            response_offset = cu_seqlens_packed[gid + 1].item()
-            response_len = cu_seqlens_response[first_secondary_idx].item()
-
-            response_qkv = dedup_tensor[:, prev_packed_response_lengths + response_offset:response_offset + response_len, :]
-
-            prev_packed_response_lengths = response_len
-
-            response_tensors.append(response_qkv)
-        # import pdb; pdb.set_trace()
-        # Concatenate all unique prompts along token dimension (packed format)
-        # [num_heads, total_unique_prompt_tokens, head_dim]
-        qkv_responses_packed = torch.cat(response_tensors, dim=1)
-
-        # Add batch dimension: [1, num_heads, total_unique_prompt_tokens, head_dim]
-        qkv_responses_packed = qkv_responses_packed.unsqueeze(0)
-
-        # Return packed tensor: [1, num_heads, total_unique_prompt_tokens, head_dim]
-        reconstruction_info['cu_seqlens_response'] = cu_seqlens_response
-        reconstruction_info['max_response_valid_len'] = max(cu_seqlens_response[1:] - cu_seqlens_response[:-1])
-
-        return qkv_responses_packed
-
-
-    @staticmethod
-    def _get_sequences_reconstructed_from_dedup_tensors(
-        dedup_tensor: torch.Tensor,
-        prompt_packed_tensor: torch.Tensor,
-        reconstruction_info: Dict,
-        cu_seqlens_response: torch.Tensor,
-        group_sizes: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Reconstruct to packed format [1, total_valid_tokens, *extra_dims] (no padding).
-        Replicates deduplicated prompts for each sample.
-
-        In the deduplicated space, prompts appear once per group followed by all responses.
-        We need to compute deduplicated positions since segment_info contains replicated positions.
-        """
-
-        prompt_groups = reconstruction_info['prompt_groups']
-        prompt_len = reconstruction_info['prompt_len']
-        cu_seqlens_packed = reconstruction_info['cu_seqlens_unique_prompts']
-
-        # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
-
-        dedup_tensor = dedup_tensor.squeeze(0)  # [total_dedup_valid_tokens, *extra_dims]
-        num_heads = dedup_tensor.shape[0]
-        head_dim = dedup_tensor.shape[2]
-
-        # Collect all unique prompt tensors (without padding)
-        response_tensors = []
-        prev_packed_response_lengths = 0
-        all_tensors = []
-
-        prompt_lengths = reconstruction_info['prompt_lengths'][1:]
-        response_lengths = (cu_seqlens_response[1:] - cu_seqlens_response[:-1]).tolist()
-        prompt_tensors = torch.split(prompt_packed_tensor.squeeze(0), prompt_lengths, dim=1)
-        total_index = 0
-        for gid, group in enumerate(prompt_groups):
-            total_index += len(group)
-            # Last sample's response index (the order inside prompt_group could be non-sequential, therefore compute it rather than look it up inside group[-1]+1)
-            first_secondary_idx = total_index
-
-            response_offset = cu_seqlens_packed[gid + 1].item()
-            response_len = cu_seqlens_response[first_secondary_idx].item()
-
-            response_qkv = dedup_tensor[:, prev_packed_response_lengths + response_offset:response_offset + response_len, :]
-
-            prev_packed_response_lengths = response_len
-            response_tensors = torch.split(response_qkv, response_lengths[group_sizes[gid]:group_sizes[gid+1]], dim=1)
-            all_tensors.extend([torch.cat([prompt_tensors[gid], response_tensor], dim=1) for response_tensor in response_tensors])
-
-
-        # Add batch dimension: [1, num_heads, total_unique_prompt_tokens, head_dim]
-        reconstructed_seq = torch.cat(all_tensors, dim=1).unsqueeze(0)
-
-        return reconstructed_seq
-
-
-    @staticmethod
-    def _get_sequences_packed_from_dedup_tensor(
-        dedup_tensor: torch.Tensor,
-        reconstruction_info: Dict,
-        cu_seqlens_response: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Reconstruct to packed format [1, total_valid_tokens, *extra_dims] (no padding).
-        Replicates deduplicated prompts for each sample.
-
-        In the deduplicated space, prompts appear once per group followed by all responses.
-        We need to compute deduplicated positions since segment_info contains replicated positions.
-        """
-
-        prompt_groups = reconstruction_info['prompt_groups']
-        prompt_len = reconstruction_info['prompt_len']
-        cu_seqlens_packed = reconstruction_info['cu_seqlens_packed']
-        original_attention_mask = reconstruction_info['original_attention_mask']
-
-        # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
-
-        dedup_tensor = dedup_tensor.squeeze(0)  # [total_dedup_valid_tokens, *extra_dims]
-        num_heads = dedup_tensor.shape[0]
-        head_dim = dedup_tensor.shape[2]
-
-        # Recover prompt lengths from cu_seqlens
-        cu_seqlens_unique_prompts = reconstruction_info['cu_seqlens_unique_prompts']
-        prompt_lengths = reconstruction_info['prompt_lengths']
-
-        packed_prmpt_lengths = [0]
-
-        prompt_tensors = torch.empty((num_heads, cu_seqlens_unique_prompts[-1], head_dim), dtype=dedup_tensor.dtype, device=dedup_tensor.device)
-        for id, group in enumerate(prompt_groups):
-            # Get first sequence from this group
-            first_seq_idx = group[0]
-            first_secondary_idx = first_seq_idx + 1
-
-            response_offset = cu_seqlens_response[first_seq_idx].item()
-            response_len = (cu_seqlens_response[first_secondary_idx] - response_offset).item()
-
-            prompt_len = prompt_lengths[id + 1]
-
-            seq_offset = packed_prmpt_lengths[-1] + response_offset
-            prompt_qkv = dedup_tensor[:, seq_offset:seq_offset + prompt_len, :]  # [seq_valid_tokens, num_heads, head_dim]
-            prompt_tensors[:, cu_seqlens_unique_prompts[id]:cu_seqlens_unique_prompts[id+1], :] = prompt_qkv
-
-            packed_prmpt_lengths.append(packed_prmpt_lengths[-1] + prompt_len)
-
-
-        # Concatenate all unique prompts along token dimension (packed format)
-        # [num_heads, total_unique_prompt_tokens, head_dim]
-        # unique_qkv_packed = prompt_tensors.transpose(0, 1)
-
-        # Add batch dimension: [1, num_heads, total_unique_prompt_tokens, head_dim]
-        unique_qkv_packed = prompt_tensors.unsqueeze(0)
-
-        # Return packed tensor: [1, num_heads, total_unique_prompt_tokens, head_dim]
-        return unique_qkv_packed
-
-
-
-    @staticmethod
-    def _get_sequences_unpacked_from_dedup_tensor(
-        dedup_tensor: torch.Tensor,
-        reconstruction_info: Dict,
-        cu_seqlens_response: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Reconstruct to packed format [1, total_valid_tokens, *extra_dims] (no padding).
-        Replicates deduplicated prompts for each sample.
-
-        In the deduplicated space, prompts appear once per group followed by all responses.
-        We need to compute deduplicated positions since segment_info contains replicated positions.
-        """
-
-        prompt_groups = reconstruction_info['prompt_groups']
-        prompt_len = reconstruction_info['prompt_len']
-        cu_seqlens_packed = reconstruction_info['cu_seqlens_packed']
-        original_attention_mask = reconstruction_info['original_attention_mask']
-
-        # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
-
-        dedup_tensor = dedup_tensor.squeeze(0)  # [total_dedup_valid_tokens, *extra_dims]
-        num_heads = dedup_tensor.shape[0]
-        head_dim = dedup_tensor.shape[2]
-
-        # Collect all unique prompt tensors (without padding)
-        seq_lengths = [0]
-        prompt_lengths = []
-        for group in prompt_groups:
-            # Extract this sequence using cu_seqlens
-
-            first_seq_idx = group[0]
-            first_secondary_idx = first_seq_idx + 1
-
-            response_offset = cu_seqlens_response[first_seq_idx].item()
-            response_len = (cu_seqlens_response[first_secondary_idx] - response_offset).item()
-
-            response_len_total = (cu_seqlens_response[group[-1] + 1] - response_offset).item()
-
-            seq_start = cu_seqlens_packed[first_seq_idx].item()
-            seq_end = cu_seqlens_packed[first_seq_idx + 1].item()
-            prompt_response_len = seq_end - seq_start
-            prompt_len = prompt_response_len - response_len
-            prompt_lengths.append(prompt_len)
-            seq_lengths.append(prompt_len * len(group) + response_len_total)
-
-        # Build cu_seqlens for unique prompts (cumulative token positions)
-        cu_seqlens_unique_prompts = torch.tensor(seq_lengths, dtype=torch.int32, device=dedup_tensor.device).cumsum_(dim=0)
-
-        packed_prmpt_lengths = [0]
-
-        complete_tensor = torch.empty((num_heads, cu_seqlens_unique_prompts[-1], head_dim), dtype=dedup_tensor.dtype, device=dedup_tensor.device)
-        for id, group in enumerate(prompt_groups):
-            # Get first sequence from this group
-
-            first_seq_idx = group[0]
-            first_secondary_idx = first_seq_idx + 1
-
-            response_offset = cu_seqlens_response[first_seq_idx].item()
-            response_len = (cu_seqlens_response[first_secondary_idx] - response_offset).item()
-            response_len_total = (cu_seqlens_response[group[-1] + 1] - response_offset).item()
-
-            prompt_len = prompt_lengths[id]
-
-            seq_offset = packed_prmpt_lengths[-1] + response_offset
-            prompt_qkv = dedup_tensor[:, seq_offset:seq_offset + prompt_len, :]  # [seq_valid_tokens, num_heads, head_dim]
-            responses_list = torch.split(
-                dedup_tensor[:, seq_offset + prompt_len:seq_offset + prompt_len + response_len_total, :],
-                (cu_seqlens_response[first_secondary_idx: group[-1] + 2] - cu_seqlens_response[first_seq_idx: group[-1] + 1]).tolist(),
-                dim=1
-            )
-            all_prompt_response_pairs = [0] * len(group) * 2
-
-            all_prompt_response_pairs[0::2] = [prompt_qkv] * len(group)
-            all_prompt_response_pairs[1::2] = responses_list
-            complete_tensor[:, cu_seqlens_unique_prompts[id]:cu_seqlens_unique_prompts[id + 1], :] = torch.cat(all_prompt_response_pairs, dim=1)
-
-
-        # Add batch dimension: [1, num_heads, total_unique_prompt_tokens, head_dim]
-        unique_qkv_packed = complete_tensor.unsqueeze(0)
-
-        # Return packed tensor: [1, num_heads, total_unique_prompt_tokens, head_dim]
-        return unique_qkv_packed
-
-
-    @staticmethod
-    def _reconstruct_sequences_packed(
-        dedup_hidden: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
-        """
-        Reconstruct to packed format [1, total_valid_tokens, *extra_dims] (no padding).
-        Replicates deduplicated prompts for each sample.
-
-        In the deduplicated space, prompts appear once per group followed by all responses.
-        We need to compute deduplicated positions since segment_info contains replicated positions.
-        """
-        segment_info = reconstruction_info['segment_info']
-        original_batch_size = reconstruction_info['original_batch_size']
-        prompt_groups = reconstruction_info['prompt_groups']
+        segment_info = reconstruction_info["segment_info"]
+        original_batch_size = reconstruction_info["original_batch_size"]
+        prompt_groups = reconstruction_info["prompt_groups"]
 
         # Remove batch dimension
         dedup_hidden = dedup_hidden.squeeze(0)  # [total_dedup_valid_tokens, *extra_dims]
@@ -1300,17 +1089,17 @@ class ZoRRoTrain:
         # segments_by_group[group_idx] = {'prompt': seg, 'responses': [seg1, seg2, ...]}
         segments_by_group = {}
         for seg in segment_info:
-            group_idx = seg['group_idx']
+            group_idx = seg["group_idx"]
             if group_idx not in segments_by_group:
-                segments_by_group[group_idx] = {'prompt': None, 'responses': {}}
+                segments_by_group[group_idx] = {"prompt": None, "responses": {}}
 
-            if seg['type'] == 'prompt':
+            if seg["type"] == "prompt":
                 # Only store first occurrence (they're all identical in unpadded coords)
-                if segments_by_group[group_idx]['prompt'] is None:
-                    segments_by_group[group_idx]['prompt'] = seg
+                if segments_by_group[group_idx]["prompt"] is None:
+                    segments_by_group[group_idx]["prompt"] = seg
             else:  # response
-                sample_idx = seg['original_idx']
-                segments_by_group[group_idx]['responses'][sample_idx] = seg
+                sample_idx = seg["original_idx"]
+                segments_by_group[group_idx]["responses"][sample_idx] = seg
 
         # Compute deduplicated positions for each group
         # Layout: [group0_prompt, group0_responses..., group1_prompt, group1_responses..., ...]
@@ -1319,27 +1108,27 @@ class ZoRRoTrain:
 
         for group_idx in sorted(segments_by_group.keys()):
             group_data = segments_by_group[group_idx]
-            prompt_seg = group_data['prompt']
+            prompt_seg = group_data["prompt"]
 
             # Prompt position in deduplicated space
-            prompt_len = prompt_seg['num_valid_tokens']
+            prompt_len = prompt_seg["num_valid_tokens"]
             prompt_dedup_start = current_dedup_pos
             prompt_dedup_end = current_dedup_pos + prompt_len
             current_dedup_pos += prompt_len
 
             # Response positions in deduplicated space
             response_dedup_positions = {}
-            for sample_idx in sorted(group_data['responses'].keys()):
-                response_seg = group_data['responses'][sample_idx]
-                response_len = response_seg['num_valid_tokens']
+            for sample_idx in sorted(group_data["responses"].keys()):
+                response_seg = group_data["responses"][sample_idx]
+                response_len = response_seg["num_valid_tokens"]
                 response_dedup_start = current_dedup_pos
                 response_dedup_end = current_dedup_pos + response_len
                 current_dedup_pos += response_len
                 response_dedup_positions[sample_idx] = (response_dedup_start, response_dedup_end)
 
             group_dedup_positions[group_idx] = {
-                'prompt': (prompt_dedup_start, prompt_dedup_end),
-                'responses': response_dedup_positions
+                "prompt": (prompt_dedup_start, prompt_dedup_end),
+                "responses": response_dedup_positions,
             }
 
         # Reconstruct each sample in packed format
@@ -1349,11 +1138,11 @@ class ZoRRoTrain:
             group_pos = group_dedup_positions[group_idx]
 
             # Extract prompt from deduplicated space
-            prompt_start, prompt_end = group_pos['prompt']
+            prompt_start, prompt_end = group_pos["prompt"]
             prompt_hidden = dedup_hidden[prompt_start:prompt_end]
 
             # Extract response from deduplicated space
-            response_start, response_end = group_pos['responses'][sample_idx]
+            response_start, response_end = group_pos["responses"][sample_idx]
             response_hidden = dedup_hidden[response_start:response_end]
 
             # Concatenate prompt + response for this sample
@@ -1366,10 +1155,7 @@ class ZoRRoTrain:
         return packed_hidden.unsqueeze(0)  # [1, total_all_valid_tokens, *extra_dims]
 
     @staticmethod
-    def deduplicate_sequences(
-        full_hidden: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def deduplicate_sequences(full_hidden: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Convert full batch to deduplicated sequence.
 
@@ -1381,7 +1167,7 @@ class ZoRRoTrain:
         Returns:
             dedup_hidden: [1, total_dedup_tokens, *extra_dims]
         """
-        is_unpadded = reconstruction_info.get('is_unpadded', False)
+        is_unpadded = reconstruction_info.get("is_unpadded", False)
 
         if is_unpadded:
             return ZoRRoTrain._deduplicate_sequences_packed(full_hidden, reconstruction_info)
@@ -1389,17 +1175,14 @@ class ZoRRoTrain:
             return ZoRRoTrain._deduplicate_sequences_padded(full_hidden, reconstruction_info)
 
     @staticmethod
-    def _deduplicate_sequences_padded(
-        full_hidden: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def _deduplicate_sequences_padded(full_hidden: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Deduplicate from padded format [original_batch, seq_len, *extra_dims].
         """
-        segment_info = reconstruction_info['segment_info']
-        prompt_groups = reconstruction_info['prompt_groups']
-        prompt_len = reconstruction_info['prompt_len']
-        response_length = reconstruction_info['response_length']
+        segment_info = reconstruction_info["segment_info"]
+        prompt_groups = reconstruction_info["prompt_groups"]
+        prompt_len = reconstruction_info["prompt_len"]
+        response_length = reconstruction_info["response_length"]
 
         # Calculate total tokens
         total_tokens = len(prompt_groups) * prompt_len + full_hidden.size(0) * response_length
@@ -1408,18 +1191,14 @@ class ZoRRoTrain:
         extra_dims = full_hidden.shape[2:]
 
         # Create tensor for concatenated sequence
-        dedup_hidden = torch.zeros(
-            (total_tokens,) + extra_dims,
-            dtype=full_hidden.dtype,
-            device=full_hidden.device
-        )
+        dedup_hidden = torch.zeros((total_tokens,) + extra_dims, dtype=full_hidden.dtype, device=full_hidden.device)
 
         # Fill in the concatenated sequence
         for group_idx, group in enumerate(prompt_groups):
             # Find prompt segment for this group
             prompt_seg = None
             for seg in segment_info:
-                if seg['group_idx'] == group_idx and seg['type'] == 'prompt':
+                if seg["group_idx"] == group_idx and seg["type"] == "prompt":
                     prompt_seg = seg
                     break
 
@@ -1427,8 +1206,8 @@ class ZoRRoTrain:
             first_sample = group[0]
             prompt_hidden = full_hidden[first_sample, :prompt_len]
 
-            start = prompt_seg['start']
-            end = prompt_seg['end']
+            start = prompt_seg["start"]
+            end = prompt_seg["end"]
             dedup_hidden[start:end] = prompt_hidden
 
             # Extract each response
@@ -1436,31 +1215,28 @@ class ZoRRoTrain:
                 # Find response segment for this sample
                 response_seg = None
                 for seg in segment_info:
-                    if seg['original_idx'] == sample_idx and seg['type'] == 'response':
+                    if seg["original_idx"] == sample_idx and seg["type"] == "response":
                         response_seg = seg
                         break
 
                 response_hidden = full_hidden[sample_idx, prompt_len:]
 
-                start = response_seg['start']
-                end = response_seg['end']
+                start = response_seg["start"]
+                end = response_seg["end"]
                 dedup_hidden[start:end] = response_hidden
 
         return dedup_hidden.unsqueeze(0)  # [1, total_tokens, *extra_dims]
 
     @staticmethod
-    def _deduplicate_sequences_packed(
-        full_hidden: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def _deduplicate_sequences_packed(full_hidden: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Deduplicate from packed format [1, total_valid_tokens, *extra_dims].
         """
-        segment_info = reconstruction_info['segment_info']
-        prompt_groups = reconstruction_info['prompt_groups']
-        original_attention_mask = reconstruction_info['original_attention_mask']
-        prompt_len = reconstruction_info['prompt_len']
-        cu_seqlens_packed = reconstruction_info['cu_seqlens_packed']
+        segment_info = reconstruction_info["segment_info"]
+        prompt_groups = reconstruction_info["prompt_groups"]
+        original_attention_mask = reconstruction_info["original_attention_mask"]
+        prompt_len = reconstruction_info["prompt_len"]
+        cu_seqlens_packed = reconstruction_info["cu_seqlens_packed"]
 
         # Remove batch dimension
         full_hidden = full_hidden.squeeze(0)  # [total_valid_tokens, *extra_dims]
@@ -1473,38 +1249,34 @@ class ZoRRoTrain:
         total_dedup_tokens = 0
         counted_prompts = set()
         for seg in segment_info:
-            if seg['type'] == 'prompt':
-                group_idx = seg['group_idx']
+            if seg["type"] == "prompt":
+                group_idx = seg["group_idx"]
                 if group_idx not in counted_prompts:
-                    total_dedup_tokens += seg['num_valid_tokens']
+                    total_dedup_tokens += seg["num_valid_tokens"]
                     counted_prompts.add(group_idx)
             else:  # response
-                total_dedup_tokens += seg['num_valid_tokens']
+                total_dedup_tokens += seg["num_valid_tokens"]
 
         # pr0(f"[_deduplicate_sequences_packed] Input: {full_hidden.shape[0]} tokens")
         # pr0(f"[_deduplicate_sequences_packed] Expected output: {total_dedup_tokens} tokens")
         # pr0(f"[_deduplicate_sequences_packed] Num groups: {len(prompt_groups)}, Batch size: {original_batch_size}")
 
         # Create tensor for deduplicated sequence
-        dedup_hidden = torch.zeros(
-            (total_dedup_tokens,) + extra_dims,
-            dtype=dtype,
-            device=device
-        )
+        dedup_hidden = torch.zeros((total_dedup_tokens,) + extra_dims, dtype=dtype, device=device)
 
         # Organize segments by group and type
         segments_by_group = {}
         for seg in segment_info:
-            group_idx = seg['group_idx']
+            group_idx = seg["group_idx"]
             if group_idx not in segments_by_group:
-                segments_by_group[group_idx] = {'prompt': None, 'responses': {}}
+                segments_by_group[group_idx] = {"prompt": None, "responses": {}}
 
-            if seg['type'] == 'prompt':
-                if segments_by_group[group_idx]['prompt'] is None:
-                    segments_by_group[group_idx]['prompt'] = seg
+            if seg["type"] == "prompt":
+                if segments_by_group[group_idx]["prompt"] is None:
+                    segments_by_group[group_idx]["prompt"] = seg
             else:  # response
-                sample_idx = seg['original_idx']
-                segments_by_group[group_idx]['responses'][sample_idx] = seg
+                sample_idx = seg["original_idx"]
+                segments_by_group[group_idx]["responses"][sample_idx] = seg
 
         # Compute deduplicated positions for each group
         current_dedup_pos = 0
@@ -1512,27 +1284,27 @@ class ZoRRoTrain:
 
         for group_idx in sorted(segments_by_group.keys()):
             group_data = segments_by_group[group_idx]
-            prompt_seg = group_data['prompt']
+            prompt_seg = group_data["prompt"]
 
             # Prompt position in deduplicated space
-            prompt_len_valid = prompt_seg['num_valid_tokens']
+            prompt_len_valid = prompt_seg["num_valid_tokens"]
             prompt_dedup_start = current_dedup_pos
             prompt_dedup_end = current_dedup_pos + prompt_len_valid
             current_dedup_pos += prompt_len_valid
 
             # Response positions in deduplicated space
             response_dedup_positions = {}
-            for sample_idx in sorted(group_data['responses'].keys()):
-                response_seg = group_data['responses'][sample_idx]
-                response_len_valid = response_seg['num_valid_tokens']
+            for sample_idx in sorted(group_data["responses"].keys()):
+                response_seg = group_data["responses"][sample_idx]
+                response_len_valid = response_seg["num_valid_tokens"]
                 response_dedup_start = current_dedup_pos
                 response_dedup_end = current_dedup_pos + response_len_valid
                 current_dedup_pos += response_len_valid
                 response_dedup_positions[sample_idx] = (response_dedup_start, response_dedup_end)
 
             group_dedup_positions[group_idx] = {
-                'prompt': (prompt_dedup_start, prompt_dedup_end),
-                'responses': response_dedup_positions
+                "prompt": (prompt_dedup_start, prompt_dedup_end),
+                "responses": response_dedup_positions,
             }
 
         # Extract tokens from packed format and place into deduplicated tensor
@@ -1552,7 +1324,7 @@ class ZoRRoTrain:
 
             # Extract prompt and place in deduplicated tensor
             prompt_hidden = sample_tokens[:num_valid_prompt]
-            prompt_dedup_start, prompt_dedup_end = group_pos['prompt']
+            prompt_dedup_start, prompt_dedup_end = group_pos["prompt"]
             dedup_hidden[prompt_dedup_start:prompt_dedup_end] = prompt_hidden
 
             # Extract each response
@@ -1569,24 +1341,21 @@ class ZoRRoTrain:
 
                 # Extract response tokens (after prompt)
                 response_hidden = sample_tokens[num_valid_prompt:]
-                response_dedup_start, response_dedup_end = group_pos['responses'][sample_idx]
+                response_dedup_start, response_dedup_end = group_pos["responses"][sample_idx]
                 dedup_hidden[response_dedup_start:response_dedup_end] = response_hidden
 
         return dedup_hidden.unsqueeze(0)  # [1, total_dedup_tokens, *extra_dims]
 
     @staticmethod
-    def reconstruct_position_ids(
-        dedup_pos: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def reconstruct_position_ids(dedup_pos: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """Reconstruct full position_ids. NO PADDING."""
         if dedup_pos is None:
             return None
 
-        segment_info = reconstruction_info['segment_info']
-        original_batch_size = reconstruction_info['original_batch_size']
-        original_seq_len = reconstruction_info['original_seq_len']
-        prompt_len = reconstruction_info['prompt_len']
+        segment_info = reconstruction_info["segment_info"]
+        original_batch_size = reconstruction_info["original_batch_size"]
+        original_seq_len = reconstruction_info["original_seq_len"]
+        prompt_len = reconstruction_info["prompt_len"]
 
         # Remove batch dimension
         dedup_pos = dedup_pos.squeeze(0)  # [total_tokens]
@@ -1596,14 +1365,14 @@ class ZoRRoTrain:
         # Build mapping
         sample_segments = {}
         for seg in segment_info:
-            sample_idx = seg['original_idx']
+            sample_idx = seg["original_idx"]
             if sample_idx not in sample_segments:
-                sample_segments[sample_idx] = {'prompt': None, 'response': None}
+                sample_segments[sample_idx] = {"prompt": None, "response": None}
 
-            if seg['type'] == 'prompt':
-                sample_segments[sample_idx]['prompt'] = seg
+            if seg["type"] == "prompt":
+                sample_segments[sample_idx]["prompt"] = seg
             else:
-                sample_segments[sample_idx]['response'] = seg
+                sample_segments[sample_idx]["response"] = seg
 
         # Reconstruct
         full_positions = []
@@ -1613,13 +1382,13 @@ class ZoRRoTrain:
             pos = torch.zeros(original_seq_len, dtype=dtype, device=device)
 
             # Place prompt positions
-            prompt_seg = segs['prompt']
-            prompt_pos = dedup_pos[prompt_seg['start']:prompt_seg['end']]
+            prompt_seg = segs["prompt"]
+            prompt_pos = dedup_pos[prompt_seg["start"] : prompt_seg["end"]]
             pos[:prompt_len] = prompt_pos
 
             # Place response positions
-            response_seg = segs['response']
-            response_pos = dedup_pos[response_seg['start']:response_seg['end']]
+            response_seg = segs["response"]
+            response_pos = dedup_pos[response_seg["start"] : response_seg["end"]]
             pos[prompt_len:] = response_pos
 
             full_positions.append(pos)
@@ -1627,10 +1396,7 @@ class ZoRRoTrain:
         return torch.stack(full_positions)  # [original_batch, seq_len]
 
     @staticmethod
-    def deduplicate_position_ids(
-        position_ids_full: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def deduplicate_position_ids(position_ids_full: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Create deduplicated position_ids from full position_ids.
 
@@ -1641,10 +1407,10 @@ class ZoRRoTrain:
         Returns:
             position_ids_dedup: [1, total_tokens]
         """
-        segment_info = reconstruction_info['segment_info']
-        prompt_groups = reconstruction_info['prompt_groups']
-        prompt_len = reconstruction_info['prompt_len']
-        response_length = reconstruction_info['response_length']
+        segment_info = reconstruction_info["segment_info"]
+        prompt_groups = reconstruction_info["prompt_groups"]
+        prompt_len = reconstruction_info["prompt_len"]
+        response_length = reconstruction_info["response_length"]
 
         # Calculate total tokens
         total_tokens = len(prompt_groups) * prompt_len + position_ids_full.size(0) * response_length
@@ -1660,7 +1426,7 @@ class ZoRRoTrain:
             # Find prompt segment
             prompt_seg = None
             for seg in segment_info:
-                if seg['group_idx'] == group_idx and seg['type'] == 'prompt':
+                if seg["group_idx"] == group_idx and seg["type"] == "prompt":
                     prompt_seg = seg
                     break
 
@@ -1668,8 +1434,8 @@ class ZoRRoTrain:
             first_sample = group[0]
             prompt_pos = position_ids_full[first_sample, :prompt_len]
 
-            start = prompt_seg['start']
-            end = prompt_seg['end']
+            start = prompt_seg["start"]
+            end = prompt_seg["end"]
             position_ids_dedup[start:end] = prompt_pos
 
             # Fill in response position_ids for each sample
@@ -1677,23 +1443,20 @@ class ZoRRoTrain:
                 # Find response segment
                 response_seg = None
                 for seg in segment_info:
-                    if seg['original_idx'] == sample_idx and seg['type'] == 'response':
+                    if seg["original_idx"] == sample_idx and seg["type"] == "response":
                         response_seg = seg
                         break
 
                 response_pos = position_ids_full[sample_idx, prompt_len:]
 
-                start = response_seg['start']
-                end = response_seg['end']
+                start = response_seg["start"]
+                end = response_seg["end"]
                 position_ids_dedup[start:end] = response_pos
 
         return position_ids_dedup.unsqueeze(0)  # [1, total_tokens]
 
     @staticmethod
-    def reconstruct_position_embeddings(
-        dedup_emb: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def reconstruct_position_embeddings(dedup_emb: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Reconstruct full position_embeddings (cos/sin). NO PADDING.
 
@@ -1706,13 +1469,13 @@ class ZoRRoTrain:
         if dedup_emb is None:
             return None
 
-        segment_info = reconstruction_info['segment_info']
-        original_batch_size = reconstruction_info['original_batch_size']
-        original_seq_len = reconstruction_info['original_seq_len']
-        prompt_len = reconstruction_info['prompt_len']
+        segment_info = reconstruction_info["segment_info"]
+        original_batch_size = reconstruction_info["original_batch_size"]
+        original_seq_len = reconstruction_info["original_seq_len"]
+        prompt_len = reconstruction_info["prompt_len"]
 
         # Handle both 3D and 4D formats
-        has_head_dim_for_broadcast = (dedup_emb.dim() == 4)
+        has_head_dim_for_broadcast = dedup_emb.dim() == 4
 
         if has_head_dim_for_broadcast:
             dedup_emb = dedup_emb.squeeze(1)  # [1, total_tokens, head_dim]
@@ -1726,14 +1489,14 @@ class ZoRRoTrain:
         # Build mapping
         sample_segments = {}
         for seg in segment_info:
-            sample_idx = seg['original_idx']
+            sample_idx = seg["original_idx"]
             if sample_idx not in sample_segments:
-                sample_segments[sample_idx] = {'prompt': None, 'response': None}
+                sample_segments[sample_idx] = {"prompt": None, "response": None}
 
-            if seg['type'] == 'prompt':
-                sample_segments[sample_idx]['prompt'] = seg
+            if seg["type"] == "prompt":
+                sample_segments[sample_idx]["prompt"] = seg
             else:
-                sample_segments[sample_idx]['response'] = seg
+                sample_segments[sample_idx]["response"] = seg
 
         # Reconstruct
         full_embeddings = []
@@ -1743,13 +1506,13 @@ class ZoRRoTrain:
             emb = torch.zeros((original_seq_len, head_dim), dtype=dtype, device=device)
 
             # Place prompt embeddings
-            prompt_seg = segs['prompt']
-            prompt_emb = dedup_emb[prompt_seg['start']:prompt_seg['end']]
+            prompt_seg = segs["prompt"]
+            prompt_emb = dedup_emb[prompt_seg["start"] : prompt_seg["end"]]
             emb[:prompt_len] = prompt_emb
 
             # Place response embeddings
-            response_seg = segs['response']
-            response_emb = dedup_emb[response_seg['start']:response_seg['end']]
+            response_seg = segs["response"]
+            response_emb = dedup_emb[response_seg["start"] : response_seg["end"]]
             emb[prompt_len:] = response_emb
 
             full_embeddings.append(emb)
@@ -1763,10 +1526,7 @@ class ZoRRoTrain:
         return result
 
     @staticmethod
-    def reconstruct_input_ids(
-        dedup_input_ids: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def reconstruct_input_ids(dedup_input_ids: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Reconstruct full batch input_ids from concatenated sequence.
 
@@ -1776,10 +1536,10 @@ class ZoRRoTrain:
         Returns:
             full_input_ids: [original_batch, seq_len]
         """
-        segment_info = reconstruction_info['segment_info']
-        original_batch_size = reconstruction_info['original_batch_size']
-        original_seq_len = reconstruction_info['original_seq_len']
-        prompt_len = reconstruction_info['prompt_len']
+        segment_info = reconstruction_info["segment_info"]
+        original_batch_size = reconstruction_info["original_batch_size"]
+        original_seq_len = reconstruction_info["original_seq_len"]
+        prompt_len = reconstruction_info["prompt_len"]
 
         # Remove batch dimension
         dedup_input_ids = dedup_input_ids.squeeze(0)  # [total_tokens]
@@ -1789,14 +1549,14 @@ class ZoRRoTrain:
         # Build mapping
         sample_segments = {}
         for seg in segment_info:
-            sample_idx = seg['original_idx']
+            sample_idx = seg["original_idx"]
             if sample_idx not in sample_segments:
-                sample_segments[sample_idx] = {'prompt': None, 'response': None}
+                sample_segments[sample_idx] = {"prompt": None, "response": None}
 
-            if seg['type'] == 'prompt':
-                sample_segments[sample_idx]['prompt'] = seg
+            if seg["type"] == "prompt":
+                sample_segments[sample_idx]["prompt"] = seg
             else:
-                sample_segments[sample_idx]['response'] = seg
+                sample_segments[sample_idx]["response"] = seg
 
         # Reconstruct
         full_sequences = []
@@ -1806,13 +1566,13 @@ class ZoRRoTrain:
             seq = torch.zeros(original_seq_len, dtype=dtype, device=device)
 
             # Place prompt
-            prompt_seg = segs['prompt']
-            prompt_ids = dedup_input_ids[prompt_seg['start']:prompt_seg['end']]
+            prompt_seg = segs["prompt"]
+            prompt_ids = dedup_input_ids[prompt_seg["start"] : prompt_seg["end"]]
             seq[:prompt_len] = prompt_ids
 
             # Place response
-            response_seg = segs['response']
-            response_ids = dedup_input_ids[response_seg['start']:response_seg['end']]
+            response_seg = segs["response"]
+            response_ids = dedup_input_ids[response_seg["start"] : response_seg["end"]]
             seq[prompt_len:] = response_ids
 
             full_sequences.append(seq)
@@ -1820,10 +1580,7 @@ class ZoRRoTrain:
         return torch.stack(full_sequences)  # [original_batch, seq_len]
 
     @staticmethod
-    def get_reconstructed_shape(
-        dedup_shape: tuple,
-        reconstruction_info: Dict
-    ) -> tuple:
+    def get_reconstructed_shape(dedup_shape: tuple, reconstruction_info: Dict) -> tuple:
         """
         Get the reconstructed shape from deduplicated shape.
 
@@ -1846,8 +1603,8 @@ class ZoRRoTrain:
         if dedup_shape[0] != 1:
             raise ValueError(f"First dimension of dedup_shape should be 1, got {dedup_shape[0]}")
 
-        batch_size = reconstruction_info['original_batch_size']
-        seq_len = reconstruction_info['original_seq_len']
+        batch_size = reconstruction_info["original_batch_size"]
+        seq_len = reconstruction_info["original_seq_len"]
 
         # Extra dimensions beyond [1, dedup_tokens]
         extra_dims = dedup_shape[2:]
@@ -1855,10 +1612,7 @@ class ZoRRoTrain:
         return (batch_size, seq_len) + extra_dims
 
     @staticmethod
-    def extract_and_deduplicate_prompts(
-        qkv_states: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def extract_and_deduplicate_prompts(qkv_states: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Extract unique prompts from full batch Q/K/V states.
 
@@ -1871,7 +1625,7 @@ class ZoRRoTrain:
         Returns:
             unique_qkv: [num_unique_prompts, num_heads, prompt_len, head_dim]
         """
-        is_unpadded = reconstruction_info.get('is_unpadded', False)
+        is_unpadded = reconstruction_info.get("is_unpadded", False)
 
         if is_unpadded:
             return ZoRRoTrain._extract_and_deduplicate_prompts_packed(qkv_states, reconstruction_info)
@@ -1879,10 +1633,7 @@ class ZoRRoTrain:
             return ZoRRoTrain._extract_and_deduplicate_prompts_padded(qkv_states, reconstruction_info)
 
     @staticmethod
-    def _extract_and_deduplicate_prompts_padded(
-        qkv_states: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def _extract_and_deduplicate_prompts_padded(qkv_states: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Extract unique prompts from padded sequences.
 
@@ -1893,25 +1644,22 @@ class ZoRRoTrain:
         Returns:
             unique_qkv: [num_unique_prompts, num_heads, prompt_len, head_dim]
         """
-        prompt_groups = reconstruction_info['prompt_groups']
-        prompt_len = reconstruction_info['prompt_len']
+        prompt_groups = reconstruction_info["prompt_groups"]
+        prompt_len = reconstruction_info["prompt_len"]
 
         unique_qkv = []
         for group in prompt_groups:
             # Get first sequence from this group (group is a list of indices)
             first_seq_idx = group[0]
             # Extract prompt part: [1, num_heads, prompt_len, head_dim]
-            prompt_qkv = qkv_states[first_seq_idx:first_seq_idx+1, :, :prompt_len, :]
+            prompt_qkv = qkv_states[first_seq_idx : first_seq_idx + 1, :, :prompt_len, :]
             unique_qkv.append(prompt_qkv)
 
         # Stack: [num_unique_prompts, num_heads, prompt_len, head_dim]
         return torch.cat(unique_qkv, dim=0)
 
     @staticmethod
-    def _extract_and_deduplicate_prompts_packed(
-        qkv_states: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def _extract_and_deduplicate_prompts_packed(qkv_states: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Extract unique prompts from packed sequences (unpadded).
 
@@ -1922,10 +1670,10 @@ class ZoRRoTrain:
         Returns:
             unique_qkv: [1, num_heads, total_unique_prompt_tokens, head_dim] - packed format
         """
-        prompt_groups = reconstruction_info['prompt_groups']
-        prompt_len = reconstruction_info['prompt_len']
-        cu_seqlens_packed = reconstruction_info['cu_seqlens_packed']
-        original_attention_mask = reconstruction_info['original_attention_mask']
+        prompt_groups = reconstruction_info["prompt_groups"]
+        prompt_len = reconstruction_info["prompt_len"]
+        cu_seqlens_packed = reconstruction_info["cu_seqlens_packed"]
+        original_attention_mask = reconstruction_info["original_attention_mask"]
 
         # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
         qkv_states = qkv_states.squeeze(0)
@@ -1964,20 +1712,18 @@ class ZoRRoTrain:
         cu_seqlens_unique_prompts = torch.tensor(
             [0] + torch.cumsum(torch.tensor(prompt_lengths, dtype=torch.int32), dim=0).tolist(),
             dtype=torch.int32,
-            device=qkv_states.device
+            device=qkv_states.device,
         )
-        reconstruction_info['cu_seqlens_unique_prompts'] = cu_seqlens_unique_prompts
-        reconstruction_info['max_prompt_valid_len'] = max(prompt_lengths)
-        reconstruction_info['prompt_lengths'] = prompt_lengths  # Store individual lengths for reconstruction
+        reconstruction_info["cu_seqlens_unique_prompts"] = cu_seqlens_unique_prompts
+        reconstruction_info["max_prompt_valid_len"] = max(prompt_lengths)
+        reconstruction_info["prompt_lengths"] = prompt_lengths  # Store individual lengths for reconstruction
 
         # Return packed tensor: [1, num_heads, total_unique_prompt_tokens, head_dim]
         return unique_qkv_packed
 
     @staticmethod
     def extract_padded_responses_from_deduped_packed_ids(
-        packed_ids: torch.Tensor,
-        reconstruction_info: Dict,
-        offset: int = 0
+        packed_ids: torch.Tensor, reconstruction_info: Dict, offset: int = 0
     ) -> torch.Tensor:
         """
         Extract responses from deduplicated packed sequences and pad them.
@@ -1991,10 +1737,10 @@ class ZoRRoTrain:
         Returns:
             responses: [original_batch, response_len]
         """
-        response_length = reconstruction_info['response_length']
-        prompt_groups = reconstruction_info['prompt_groups']
-        segment_info = reconstruction_info['segment_info']
-        original_batch_size = reconstruction_info['original_batch_size']
+        response_length = reconstruction_info["response_length"]
+        prompt_groups = reconstruction_info["prompt_groups"]
+        segment_info = reconstruction_info["segment_info"]
+        original_batch_size = reconstruction_info["original_batch_size"]
 
         # Initialize response list in original batch order
         responses = [None] * original_batch_size
@@ -2005,44 +1751,53 @@ class ZoRRoTrain:
 
         for group_idx, group in enumerate(prompt_groups):
             # Get prompt segment info (all samples in group share the same prompt entry)
-            prompt_segs = [s for s in segment_info if s['group_idx'] == group_idx and s['type'] == 'prompt']
+            prompt_segs = [s for s in segment_info if s["group_idx"] == group_idx and s["type"] == "prompt"]
             prompt_ids = None
             if prompt_segs:
-                prompt_valid = prompt_segs[0]['num_valid_tokens']
+                prompt_valid = prompt_segs[0]["num_valid_tokens"]
 
-                #prompt_ids from prompt before using response tokens
-                prompt_ids = packed_ids[packed_position + prompt_valid + offset: packed_position + prompt_valid]
-
+                # prompt_ids from prompt before using response tokens
+                prompt_ids = packed_ids[packed_position + prompt_valid + offset : packed_position + prompt_valid]
 
                 # Skip past the prompt
                 packed_position += prompt_valid
 
             # Now process response segments for each sample in the group
             for sample_idx in group:
-                response_segs = [s for s in segment_info
-                                if s['group_idx'] == group_idx and s['type'] == 'response'
-                                and s['original_idx'] == sample_idx]
+                response_segs = [
+                    s
+                    for s in segment_info
+                    if s["group_idx"] == group_idx and s["type"] == "response" and s["original_idx"] == sample_idx
+                ]
                 if response_segs:
-                    response_valid = response_segs[0]['num_valid_tokens']
+                    response_valid = response_segs[0]["num_valid_tokens"]
 
                     # Extract response tokens from packed tensor
-                    response_ids = packed_ids[packed_position:packed_position + offset + response_valid]  # [response_valid]
+                    response_ids = packed_ids[
+                        packed_position : packed_position + offset + response_valid
+                    ]  # [response_valid]
 
                     # Pad to response_length
                     if response_valid <= response_length:
                         # Pad with zeros
                         pad_length = response_length - response_valid
-                        response_ids = torch.cat([
-                            prompt_ids,
-                            response_ids,
-                            torch.zeros(pad_length, dtype=response_ids.dtype, device=response_ids.device)
-                        ], dim=0)
+                        response_ids = torch.cat(
+                            [
+                                prompt_ids,
+                                response_ids,
+                                torch.zeros(pad_length, dtype=response_ids.dtype, device=response_ids.device),
+                            ],
+                            dim=0,
+                        )
                     elif response_valid > response_length:
                         # Truncate if somehow longer
-                        response_ids = torch.cat([
-                            prompt_ids,
-                            response_ids[:response_length+offset],
-                        ], dim=0)
+                        response_ids = torch.cat(
+                            [
+                                prompt_ids,
+                                response_ids[: response_length + offset],
+                            ],
+                            dim=0,
+                        )
 
                     # Store in original batch position
                     responses[sample_idx] = response_ids
@@ -2057,9 +1812,7 @@ class ZoRRoTrain:
 
     @staticmethod
     def extract_unpadded_responses_from_deduped_packed_ids(
-        packed_tensor: torch.Tensor,
-        reconstruction_info: Dict,
-        offset: int = 0
+        packed_tensor: torch.Tensor, reconstruction_info: Dict, offset: int = 0
     ) -> torch.Tensor:
         """
         Extract responses from deduplicated packed sequences, keeping them packed (unpadded).
@@ -2078,8 +1831,8 @@ class ZoRRoTrain:
         Returns:
             packed_responses: [total_response_tokens, *extra_dims] - packed responses only
         """
-        prompt_groups = reconstruction_info['prompt_groups']
-        segment_info = reconstruction_info['segment_info']
+        prompt_groups = reconstruction_info["prompt_groups"]
+        segment_info = reconstruction_info["segment_info"]
 
         # Collect all response segments
         response_segments = []
@@ -2089,30 +1842,36 @@ class ZoRRoTrain:
 
         for group_idx, group in enumerate(prompt_groups):
             # Get prompt segment info (all samples in group share the same prompt entry)
-            prompt_segs = [s for s in segment_info if s['group_idx'] == group_idx and s['type'] == 'prompt']
+            prompt_segs = [s for s in segment_info if s["group_idx"] == group_idx and s["type"] == "prompt"]
             prompt_start = packed_position
             prompt_valid = 0
             if prompt_segs:
-                prompt_valid = prompt_segs[0]['num_valid_tokens']
+                prompt_valid = prompt_segs[0]["num_valid_tokens"]
                 # Skip past the prompt
                 packed_position += prompt_valid
 
             # Now process response segments for each sample in the group
             for sample_idx in group:
-                response_segs = [s for s in segment_info
-                                if s['group_idx'] == group_idx and s['type'] == 'response'
-                                and s['original_idx'] == sample_idx]
+                response_segs = [
+                    s
+                    for s in segment_info
+                    if s["group_idx"] == group_idx and s["type"] == "response" and s["original_idx"] == sample_idx
+                ]
                 if response_segs:
-                    response_valid = response_segs[0]['num_valid_tokens']
+                    response_valid = response_segs[0]["num_valid_tokens"]
 
                     # Extract prompt suffix (last |offset| tokens from prompt)
                     if offset < 0 and prompt_valid > 0:
-                        prompt_suffix = packed_tensor[prompt_start + prompt_valid + offset: prompt_start + prompt_valid]
+                        prompt_suffix = packed_tensor[
+                            prompt_start + prompt_valid + offset : prompt_start + prompt_valid
+                        ]
                     else:
                         prompt_suffix = None
 
                     # Extract response prefix (all but last |offset| tokens)
-                    response_end = packed_position + response_valid + offset if offset < 0 else packed_position + response_valid
+                    response_end = (
+                        packed_position + response_valid + offset if offset < 0 else packed_position + response_valid
+                    )
                     response_tokens = packed_tensor[packed_position:response_end]
 
                     # Concatenate prompt suffix and response prefix
@@ -2131,13 +1890,8 @@ class ZoRRoTrain:
 
         return packed_responses
 
-
-
     @staticmethod
-    def pad_responses(
-        packed_responses: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def pad_responses(packed_responses: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Pad packed responses and arrange into batched format.
 
@@ -2152,21 +1906,17 @@ class ZoRRoTrain:
         Returns:
             padded_responses: [original_batch_size, response_length, *extra_dims] - padded batch
         """
-        response_length = reconstruction_info['response_length']
-        prompt_groups = reconstruction_info['prompt_groups']
-        segment_info = reconstruction_info['segment_info']
-        original_batch_size = reconstruction_info['original_batch_size']
+        response_length = reconstruction_info["response_length"]
+        prompt_groups = reconstruction_info["prompt_groups"]
+        segment_info = reconstruction_info["segment_info"]
+        original_batch_size = reconstruction_info["original_batch_size"]
 
         # Get extra dimensions from input tensor
         extra_dims = packed_responses.shape[1:]
 
         # Initialize output tensor with zeros (for padding)
         output_shape = (original_batch_size, response_length) + extra_dims
-        padded_responses = torch.zeros(
-            output_shape,
-            dtype=packed_responses.dtype,
-            device=packed_responses.device
-        )
+        padded_responses = torch.zeros(output_shape, dtype=packed_responses.dtype, device=packed_responses.device)
 
         # Track position in packed tensor
         # Note: packed_responses contains responses in the same order as extract_unpadded_responses_from_deduped_packed_ids
@@ -2175,18 +1925,20 @@ class ZoRRoTrain:
 
         for group_idx, group in enumerate(prompt_groups):
             for sample_idx in group:
-                response_segs = [s for s in segment_info
-                                if s['group_idx'] == group_idx and s['type'] == 'response'
-                                and s['original_idx'] == sample_idx]
+                response_segs = [
+                    s
+                    for s in segment_info
+                    if s["group_idx"] == group_idx and s["type"] == "response" and s["original_idx"] == sample_idx
+                ]
                 if response_segs:
-                    response_valid = response_segs[0]['num_valid_tokens']
+                    response_valid = response_segs[0]["num_valid_tokens"]
 
                     # The actual length in packed_responses after offset adjustment
                     # (extract_unpadded_responses_from_deduped_packed_ids maintains response_valid tokens per sample)
                     actual_len = min(response_valid, response_length)
 
                     # Extract from packed tensor
-                    response_tokens = packed_responses[packed_position:packed_position + actual_len]
+                    response_tokens = packed_responses[packed_position : packed_position + actual_len]
 
                     # Place in output (zeros already handle padding)
                     padded_responses[sample_idx, :actual_len] = response_tokens
@@ -2197,10 +1949,7 @@ class ZoRRoTrain:
         return padded_responses
 
     @staticmethod
-    def responses_in_orig_sample_order(
-        packed_responses: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def responses_in_orig_sample_order(packed_responses: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Return the same 1D responses tensor, but in the original sample order (should it have changed to deal with a situation where incoming samples aren't already ordered by prompt groups)
 
@@ -2214,8 +1963,8 @@ class ZoRRoTrain:
         """
         device = packed_responses.device
 
-        prompt_groups = reconstruction_info['prompt_groups']
-        cu_seqlens_response = reconstruction_info['cu_seqlens_response']
+        prompt_groups = reconstruction_info["prompt_groups"]
+        cu_seqlens_response = reconstruction_info["cu_seqlens_response"]
 
         # flatten prompt groups into a flag permutation indices
         indices_order = functools.reduce(operator.iconcat, prompt_groups, [])
@@ -2245,8 +1994,9 @@ class ZoRRoTrain:
         orig_lengths = lengths[inv_indices_order]
 
         # Cumulative offsets for the *output* tensor (original order)
-        orig_offsets = torch.cat([torch.zeros(1, dtype=cu_seqlens_response.dtype, device=device),
-                                orig_lengths.cumsum(dim=0)])
+        orig_offsets = torch.cat(
+            [torch.zeros(1, dtype=cu_seqlens_response.dtype, device=device), orig_lengths.cumsum(dim=0)]
+        )
 
         # For every element in the output, determine:
         #   1) which original sample it belongs to
@@ -2262,13 +2012,8 @@ class ZoRRoTrain:
 
         return packed_responses[gather_idx]
 
-
-
     @staticmethod
-    def extract_response_queries(
-        query_states: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def extract_response_queries(query_states: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Extract response queries from full query states.
 
@@ -2281,7 +2026,7 @@ class ZoRRoTrain:
         Returns:
             response_q: [batch_size, num_heads, response_len, head_dim]
         """
-        is_unpadded = reconstruction_info.get('is_unpadded', False)
+        is_unpadded = reconstruction_info.get("is_unpadded", False)
 
         if is_unpadded:
             return ZoRRoTrain._extract_response_queries_packed(query_states, reconstruction_info)
@@ -2289,10 +2034,7 @@ class ZoRRoTrain:
             return ZoRRoTrain._extract_response_queries_padded(query_states, reconstruction_info)
 
     @staticmethod
-    def _extract_response_queries_padded(
-        query_states: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def _extract_response_queries_padded(query_states: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Extract response queries from padded sequences.
 
@@ -2303,17 +2045,14 @@ class ZoRRoTrain:
         Returns:
             response_q: [batch_size, num_heads, response_len, head_dim]
         """
-        prompt_len = reconstruction_info['prompt_len']
+        prompt_len = reconstruction_info["prompt_len"]
 
         # Simply extract response part from all sequences
         # query_states[:, :, prompt_len:, :] extracts response queries
         return query_states[:, :, prompt_len:, :]
 
     @staticmethod
-    def _extract_cu_seqlens(
-        reconstruction_info: Dict,
-        device
-    ) -> torch.Tensor:
+    def _extract_cu_seqlens(reconstruction_info: Dict, device) -> torch.Tensor:
         """
         Extract cu_seqlens from reconstruction_info.
 
@@ -2324,12 +2063,12 @@ class ZoRRoTrain:
             cu_seqlens: [num_sequences + 1] tensor
         """
 
-        original_attention_mask = reconstruction_info['original_attention_mask']
+        original_attention_mask = reconstruction_info["original_attention_mask"]
 
-        prompt_len = reconstruction_info['prompt_len']
-        cu_seqlens_packed = reconstruction_info['cu_seqlens_packed']
-        prompt_groups = reconstruction_info['prompt_groups']
-        original_batch_size = reconstruction_info['original_batch_size']
+        prompt_len = reconstruction_info["prompt_len"]
+        cu_seqlens_packed = reconstruction_info["cu_seqlens_packed"]
+        prompt_groups = reconstruction_info["prompt_groups"]
+        original_batch_size = reconstruction_info["original_batch_size"]
 
         # ex: [[0, 1, 4, 7], [2, 3, 5, 6]] -> {0: 0, 1: 1, 4: 2, 7: 3, 2: 4, 3: 5, 5: 6, 6: 7}
         reordered_seq_idx = {}
@@ -2351,7 +2090,7 @@ class ZoRRoTrain:
             num_valid_prompt = prompt_mask.sum().item()
 
             # Update cu_seqlens for responses
-            num_response_tokens = (seq_end - num_valid_prompt - seq_start)
+            num_response_tokens = seq_end - num_valid_prompt - seq_start
             cu_seqlens_response[reordered_seq_idx[sample_idx] + 1] = num_response_tokens
 
         cu_seqlens_response.cumsum_(0)
@@ -2376,10 +2115,10 @@ class ZoRRoTrain:
         # Build cu_seqlens for unique prompts (cumulative token positions)
         cu_seqlens_unique_prompts = torch.tensor(prompt_lengths, dtype=torch.int32, device=device).cumsum_(dim=0)
 
-        reconstruction_info['cu_seqlens_unique_prompts'] = cu_seqlens_unique_prompts
-        reconstruction_info['max_prompt_valid_len'] = max(prompt_lengths)
-        reconstruction_info['prompt_lengths'] = prompt_lengths  # Store individual lengths for reconstruction
-        reconstruction_info['reordered_seq_idx'] = reordered_seq_idx
+        reconstruction_info["cu_seqlens_unique_prompts"] = cu_seqlens_unique_prompts
+        reconstruction_info["max_prompt_valid_len"] = max(prompt_lengths)
+        reconstruction_info["prompt_lengths"] = prompt_lengths  # Store individual lengths for reconstruction
+        reconstruction_info["reordered_seq_idx"] = reordered_seq_idx
 
         return cu_seqlens_response
 
@@ -2419,10 +2158,7 @@ class ZoRRoTrain:
     #     return torch.tensor(cu_seqlens_response, dtype=torch.int32, device=f'cuda:{torch.cuda.current_device()}')
 
     @staticmethod
-    def _extract_response_queries_packed(
-        query_states: torch.Tensor,
-        reconstruction_info: Dict
-    ) -> torch.Tensor:
+    def _extract_response_queries_packed(query_states: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Extract response queries from packed sequences (unpadded).
 
@@ -2433,10 +2169,10 @@ class ZoRRoTrain:
         Returns:
             response_q: [1, num_heads, total_response_tokens, head_dim] - packed format with only response tokens
         """
-        prompt_len = reconstruction_info['prompt_len']
-        cu_seqlens_packed = reconstruction_info['cu_seqlens_packed']
-        original_attention_mask = reconstruction_info['original_attention_mask']
-        original_batch_size = reconstruction_info['original_batch_size']
+        prompt_len = reconstruction_info["prompt_len"]
+        cu_seqlens_packed = reconstruction_info["cu_seqlens_packed"]
+        original_attention_mask = reconstruction_info["original_attention_mask"]
+        original_batch_size = reconstruction_info["original_batch_size"]
 
         # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
         query_states = query_states.squeeze(0)
@@ -2472,17 +2208,16 @@ class ZoRRoTrain:
 
         # Store cu_seqlens_response in reconstruction_info for use in flash attention
         cu_seqlens_response_tensor = torch.tensor(cu_seqlens_response, dtype=torch.int32, device=query_states.device)
-        reconstruction_info['cu_seqlens_response'] = cu_seqlens_response_tensor
-        reconstruction_info['max_response_valid_len'] = max(cu_seqlens_response_tensor[1:] - cu_seqlens_response_tensor[:-1])
-
+        reconstruction_info["cu_seqlens_response"] = cu_seqlens_response_tensor
+        reconstruction_info["max_response_valid_len"] = max(
+            cu_seqlens_response_tensor[1:] - cu_seqlens_response_tensor[:-1]
+        )
 
         return response_q_packed
 
     @staticmethod
     def replicate_and_concat_prompt_response(
-        prompt_outputs: torch.Tensor,
-        response_outputs: torch.Tensor,
-        reconstruction_info: Dict
+        prompt_outputs: torch.Tensor, response_outputs: torch.Tensor, reconstruction_info: Dict
     ) -> torch.Tensor:
         """
         Replicate prompt outputs and concatenate with response outputs.
@@ -2504,7 +2239,7 @@ class ZoRRoTrain:
                 - If is_unpadded=False: [batch_size, seq_len, num_heads, head_dim]
                 - If is_unpadded=True: [1, total_valid_tokens, num_heads, head_dim] (packed)
         """
-        is_unpadded = reconstruction_info.get('is_unpadded', False)
+        is_unpadded = reconstruction_info.get("is_unpadded", False)
 
         if is_unpadded:
             return ZoRRoTrain._replicate_and_concat_prompt_response_packed(
@@ -2517,9 +2252,7 @@ class ZoRRoTrain:
 
     @staticmethod
     def _replicate_and_concat_prompt_response_padded(
-        prompt_outputs: torch.Tensor,
-        response_outputs: torch.Tensor,
-        reconstruction_info: Dict
+        prompt_outputs: torch.Tensor, response_outputs: torch.Tensor, reconstruction_info: Dict
     ) -> torch.Tensor:
         """
         Replicate and concatenate for padded sequences.
@@ -2532,8 +2265,8 @@ class ZoRRoTrain:
         Returns:
             full_outputs: [batch_size, seq_len, num_heads, head_dim]
         """
-        prompt_groups = reconstruction_info['prompt_groups']
-        batch_size = reconstruction_info['original_batch_size']
+        prompt_groups = reconstruction_info["prompt_groups"]
+        batch_size = reconstruction_info["original_batch_size"]
 
         # Build mapping: sequence_idx -> group_idx
         seq_to_group = {}
@@ -2546,10 +2279,10 @@ class ZoRRoTrain:
             group_idx = seq_to_group[seq_idx]
 
             # Get prompt output for this group
-            prompt_out = prompt_outputs[group_idx:group_idx+1]  # [1, prompt_len, num_heads, head_dim]
+            prompt_out = prompt_outputs[group_idx : group_idx + 1]  # [1, prompt_len, num_heads, head_dim]
 
             # Get response output for this sequence
-            response_out = response_outputs[seq_idx:seq_idx+1]  # [1, response_len, num_heads, head_dim]
+            response_out = response_outputs[seq_idx : seq_idx + 1]  # [1, response_len, num_heads, head_dim]
 
             # Concatenate along sequence dimension (dim=1)
             seq_out = torch.cat([prompt_out, response_out], dim=1)
@@ -2560,9 +2293,7 @@ class ZoRRoTrain:
 
     @staticmethod
     def _replicate_and_concat_prompt_response_packed(
-        prompt_outputs: torch.Tensor,
-        response_outputs: torch.Tensor,
-        reconstruction_info: Dict
+        prompt_outputs: torch.Tensor, response_outputs: torch.Tensor, reconstruction_info: Dict
     ) -> torch.Tensor:
         """
         Replicate and concatenate for packed sequences (unpadded).
@@ -2577,10 +2308,10 @@ class ZoRRoTrain:
         Returns:
             full_outputs: [1, total_valid_tokens, num_heads, head_dim] - packed format
         """
-        prompt_groups = reconstruction_info['prompt_groups']
-        batch_size = reconstruction_info['original_batch_size']
-        cu_seqlens_response = reconstruction_info['cu_seqlens_response']
-        cu_seqlens_unique_prompts = reconstruction_info['cu_seqlens_unique_prompts']
+        prompt_groups = reconstruction_info["prompt_groups"]
+        batch_size = reconstruction_info["original_batch_size"]
+        cu_seqlens_response = reconstruction_info["cu_seqlens_response"]
+        cu_seqlens_unique_prompts = reconstruction_info["cu_seqlens_unique_prompts"]
 
         # Build mapping: sequence_idx -> group_idx
         seq_to_group = {}
@@ -2608,7 +2339,9 @@ class ZoRRoTrain:
             # Get response output for this sequence using cu_seqlens_response
             response_start = cu_seqlens_response[seq_idx].item()
             response_end = cu_seqlens_response[seq_idx + 1].item()
-            response_out = response_outputs[response_start:response_end, :, :]  # [response_len_valid, num_heads, head_dim]
+            response_out = response_outputs[
+                response_start:response_end, :, :
+            ]  # [response_len_valid, num_heads, head_dim]
 
             # Concatenate along token dimension (dim=0)
             seq_out = torch.cat([prompt_out, response_out], dim=0)  # [seq_len_valid, num_heads, head_dim]
@@ -2620,13 +2353,12 @@ class ZoRRoTrain:
         # Add batch dimension: [1, total_valid_tokens, num_heads, head_dim]
         return packed_output.unsqueeze(0)
 
-
     @staticmethod
     def _replicate_and_concat_prompt_responses(
         prompt_outputs: torch.Tensor,
         response_outputs: torch.Tensor,
         reconstruction_info: Dict,
-        cu_seqlens_response: torch.Tensor
+        cu_seqlens_response: torch.Tensor,
     ) -> torch.Tensor:
         """
         Replicate and concatenate for packed sequences (unpadded).
@@ -2641,8 +2373,8 @@ class ZoRRoTrain:
             full_outputs: [1, total_valid_tokens, num_heads, head_dim] - packed format
         """
 
-        prompt_groups = reconstruction_info['prompt_groups']
-        reordered_seq_idx = reconstruction_info['reordered_seq_idx']
+        prompt_groups = reconstruction_info["prompt_groups"]
+        reordered_seq_idx = reconstruction_info["reordered_seq_idx"]
 
         # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
 
@@ -2652,7 +2384,7 @@ class ZoRRoTrain:
         prev_packed_response_lengths = 0
         all_tensors = []
 
-        prompt_lengths = reconstruction_info['prompt_lengths'][1:]
+        prompt_lengths = reconstruction_info["prompt_lengths"][1:]
         prompt_tensors = torch.split(prompt_outputs.squeeze(0), prompt_lengths, dim=0)
         for gid, group in enumerate(prompt_groups):
             # Get first sequence from this group
