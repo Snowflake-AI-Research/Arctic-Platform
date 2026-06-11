@@ -16,7 +16,7 @@ jobs:
   formatting:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         id: setup_python
         with:
