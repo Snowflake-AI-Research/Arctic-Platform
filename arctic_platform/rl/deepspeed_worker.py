@@ -216,12 +216,15 @@ class DeepSpeedWorker:
         training_config = job_config.get("training_config")
         if training_config is not None:
             opt_cfg = training_config.get("optimizer", {})
+            betas = opt_cfg.get("betas")
+            if betas is None:
+                betas = [opt_cfg.get("beta1", 0.9), opt_cfg.get("beta2", 0.999)]
             ds_config["optimizer"] = {
                 "type": "AdamW",
                 "params": {
                     "lr": opt_cfg.get("lr", 1e-5),
-                    "betas": [opt_cfg.get("beta1", 0.9), opt_cfg.get("beta2", 0.999)],
-                    "eps": 1e-8,
+                    "betas": list(betas),
+                    "eps": opt_cfg.get("eps", 1e-8),
                     "weight_decay": opt_cfg.get("weight_decay", 0.0),
                 },
             }
@@ -261,13 +264,6 @@ class DeepSpeedWorker:
                     # No LR scheduler, use constant LR
                     pass
 
-        if ds_worker_config.get("use_autocast", False):
-            ds_config["torch_autocast"] = {"enabled": True, "dtype": "bfloat16"}
-
-        if ds_worker_config.get("fp32_gradients", False):
-            ds_config["communication_data_type"] = "fp32"
-            ds_config["data_types"] = {"grad_accum_dtype": "fp32"}
-
         # Set reasonable defaults as fallbacks
         ds_config.setdefault("train_micro_batch_size_per_gpu", 1)
         ds_config.setdefault("bf16", {"enabled": True})
@@ -278,6 +274,10 @@ class DeepSpeedWorker:
                 "params": {"lr": 1e-5, "betas": [0.9, 0.999], "eps": 1e-8},
             },
         )
+        ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
+        ds_config.setdefault("communication_data_type", "fp32")
+        ds_config.setdefault("data_types", {"grad_accum_dtype": "fp32"})
+
         return ds_config
 
 
