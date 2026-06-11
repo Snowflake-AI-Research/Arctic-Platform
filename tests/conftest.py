@@ -81,10 +81,10 @@ def pytest_collection_modifyitems(config, items):
 """
 
 
-# Load helper functions automatically for all tests
-@pytest.fixture(scope="session", autouse=True)
-def helpers_code_path() -> None:
-    from . import helpers  # noqa: F401
+# # Load helper functions automatically for all tests
+# @pytest.fixture(scope="session", autouse=True)
+# def helpers_code_path() -> None:
+#     from . import helpers  # noqa: F401
 
 
 @pytest.fixture(scope="session")

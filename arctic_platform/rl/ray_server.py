@@ -57,7 +57,7 @@ from arctic_platform.rl.utils import log_dp_shard_tokens
 from arctic_platform.rl.utils import merge_cuda_ipc_payloads
 from arctic_platform.rl.utils import merge_dict_shards
 from arctic_platform.rl.utils import ray_split_batch
-from arctic_platform.rl.utils import restore_batch_order
+from arctic_platform.rl.utils.batch import restore_batch_order
 from arctic_platform.rl.utils import unpack_batch
 from arctic_platform.rl.utils.debug import ProfilerContext
 from arctic_platform.rl.utils.debug import pr0
