@@ -868,8 +868,9 @@ def apply_temperature_post(model_outputs: dict, batch: dict, meta: dict, device:
     see_memory_usage("apply_temperature_post start", force=True)
     if "logits" in model_outputs:
         logits = model_outputs["logits"]
+        temperature = meta["temperature"]
         if temperature != 1.0:
-            temperature = torch.tensor(meta["temperature"], device=logits.device)
+            temperature = torch.tensor(temperature, device=logits.device)
             logits.div_(temperature.clamp(min=1e-8).unsqueeze(-1).to(logits.dtype))
         model_outputs["logits"] = logits
     elif "logprobs" in model_outputs:
