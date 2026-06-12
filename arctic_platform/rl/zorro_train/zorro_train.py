@@ -928,9 +928,7 @@ class ZoRRoTrain:
         prompt_groups = reconstruction_info["prompt_groups"]
         prompt_len = reconstruction_info["prompt_len"]
         # cu_seqlens_packed = reconstruction_info["cu_seqlens_packed"]
-        cu_seqlens_unique_prompts = reconstruction_info["cu_seqlens_unique_prompts"]
-        reordered_seq_idx = reconstruction_info["reordered_seq_idx"]
-        prompt_lengths = reconstruction_info["prompt_lengths"][1:]
+        # original_attention_mask = reconstruction_info["original_attention_mask"]
 
         # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
 
@@ -938,7 +936,11 @@ class ZoRRoTrain:
         num_heads = dedup_tensor.shape[0]
         head_dim = dedup_tensor.shape[2]
 
-        packed_prompt_lengths = [0]
+        # Recover prompt lengths from cu_seqlens
+        cu_seqlens_unique_prompts = reconstruction_info["cu_seqlens_unique_prompts"]
+        prompt_lengths = reconstruction_info["prompt_lengths"]
+
+        packed_prmpt_lengths = [0]
 
         prompt_tensors = torch.empty(
             (num_heads, cu_seqlens_unique_prompts[-1], head_dim), dtype=dedup_tensor.dtype, device=dedup_tensor.device
@@ -946,19 +948,20 @@ class ZoRRoTrain:
         for id, group in enumerate(prompt_groups):
             # Get first sequence from this group
             first_seq_idx = group[0]
+            # first_secondary_idx = first_seq_idx + 1
 
-            response_offset = cu_seqlens_response[reordered_seq_idx[first_seq_idx]].item()
-            # response_len = (cu_seqlens_response[reordered_seq_idx[first_seq_idx] + 1] - response_offset).item()
+            response_offset = cu_seqlens_response[first_seq_idx].item()
+            # response_len = (cu_seqlens_response[first_secondary_idx] - response_offset).item()
 
             prompt_len = prompt_lengths[id + 1]
 
-            seq_offset = packed_prompt_lengths[-1] + response_offset
+            seq_offset = packed_prmpt_lengths[-1] + response_offset
             prompt_qkv = dedup_tensor[
                 :, seq_offset : seq_offset + prompt_len, :
             ]  # [seq_valid_tokens, num_heads, head_dim]
             prompt_tensors[:, cu_seqlens_unique_prompts[id] : cu_seqlens_unique_prompts[id + 1], :] = prompt_qkv
 
-            packed_prompt_lengths.append(packed_prompt_lengths[-1] + prompt_len)
+            packed_prmpt_lengths.append(packed_prmpt_lengths[-1] + prompt_len)
 
         # Concatenate all unique prompts along token dimension (packed format)
         # [num_heads, total_unique_prompt_tokens, head_dim]
@@ -987,6 +990,7 @@ class ZoRRoTrain:
         prompt_groups = reconstruction_info["prompt_groups"]
         prompt_len = reconstruction_info["prompt_len"]
         cu_seqlens_packed = reconstruction_info["cu_seqlens_packed"]
+        # original_attention_mask = reconstruction_info["original_attention_mask"]
 
         # Remove batch dimension: [1, num_heads, total_valid_tokens, head_dim] -> [num_heads, total_valid_tokens, head_dim]
 
@@ -1020,7 +1024,7 @@ class ZoRRoTrain:
             dim=0
         )
 
-        packed_prompt_lengths = [0]
+        packed_prmpt_lengths = [0]
 
         complete_tensor = torch.empty(
             (num_heads, cu_seqlens_unique_prompts[-1], head_dim), dtype=dedup_tensor.dtype, device=dedup_tensor.device
@@ -1037,7 +1041,7 @@ class ZoRRoTrain:
 
             prompt_len = prompt_lengths[id]
 
-            seq_offset = packed_prompt_lengths[-1] + response_offset
+            seq_offset = packed_prmpt_lengths[-1] + response_offset
             prompt_qkv = dedup_tensor[
                 :, seq_offset : seq_offset + prompt_len, :
             ]  # [seq_valid_tokens, num_heads, head_dim]
