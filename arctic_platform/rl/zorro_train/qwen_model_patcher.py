@@ -441,11 +441,27 @@ class Qwen3ModelOncePatcher:
                 hidden_states.squeeze(0), reconstruction_info, offset=-1
             )
 
-            # labels for computing the log_prob
-            input_ids_rmpad_rolled = torch.roll(dedup_input_ids, shifts=-1, dims=1)  # (1, total_nnz)
-            input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
-            input_ids_rolled_extracted = ZoRRoTrain.extract_unpadded_responses_from_deduped_packed_ids(
-                input_ids_rmpad_rolled, reconstruction_info, offset=-1
+            # Labels for the log_prob: the next-token target for each extracted
+            # hidden state. ``hidden_states_extracted`` (offset=-1) yields, per
+            # sample, ``[prompt_final, resp_pos_0..resp_pos_{R-2}]`` which predict
+            # tokens ``[resp_0..resp_{R-1}]`` -- i.e. the labels are exactly each
+            # sample's own response tokens.
+            #
+            # We must NOT derive them by rolling the *deduplicated* packed
+            # sequence: ``torch.roll`` pairs the single shared prompt-final
+            # position with the token physically packed after it, which is the
+            # FIRST rollout's first response token. Because every rollout in a
+            # prompt group extracts that same shared slot, all rollouts would get
+            # the first rollout's first-token label (the prompt is deduplicated,
+            # so the per-rollout boundary token is not adjacent in memory). That
+            # makes the first response-token log-prob wrong for every rollout
+            # except the first in each group.
+            #
+            # Extracting the responses directly with offset=0 gives each rollout
+            # its own response tokens as labels, which aligns 1:1 with the
+            # offset=-1 hidden states above.
+            input_ids_extracted = ZoRRoTrain.extract_unpadded_responses_from_deduped_packed_ids(
+                dedup_input_ids.squeeze(0), reconstruction_info, offset=0
             )
 
             timers.stop_and_print_elapsed(tname)
@@ -485,7 +501,7 @@ class Qwen3ModelOncePatcher:
                     ),
                     model,
                     hidden_states_extracted,
-                    input_ids_rolled_extracted,
+                    input_ids_extracted,
                     temperature,
                     calculate_entropy,
                     num_shards,
@@ -497,7 +513,7 @@ class Qwen3ModelOncePatcher:
                 logprobs, entropy = chunked_entropy_and_logprobs_with_temperature_from_logits(
                     model,
                     hidden_states_extracted,
-                    input_ids_rolled_extracted,
+                    input_ids_extracted,
                     temperature,
                     calculate_entropy,
                     peak_mem_gib=peak_mem_gib,
@@ -509,7 +525,7 @@ class Qwen3ModelOncePatcher:
                 logprobs, entropy = tiled_entropy_and_logprobs_with_temperature_from_logits(
                     model,
                     hidden_states_extracted,
-                    input_ids_rolled_extracted,
+                    input_ids_extracted,
                     temperature,
                     calculate_entropy,
                     logits_compute_from_fp32_inputs=logits_compute_from_fp32_inputs,
