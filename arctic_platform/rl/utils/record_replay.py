@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from arctic_platform.rl.utils.debug import print_rank0 as pr0
 import torch
@@ -12,7 +13,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def _replay_generation_enabled() -> bool:
-    # Read at call time: Ray TaskRunner may import this module before env is set.
+    # Read at call time: env may be set after import.
     return _env_flag("REPLAY_GENERATION")
 
 
@@ -33,7 +34,7 @@ def _replay_generation_mode() -> str:
 
 
 def _replay_start_record() -> int:
-    # Number of leading corpus records to skip in load mode.
+    # Leading records to skip in load mode.
     try:
         return max(0, int(os.environ.get("REPLAY_START_RECORD", "0") or 0))
     except ValueError:
@@ -89,3 +90,41 @@ class RecordReplay:
                 )
             pr0(f"[REPLAY_GENERATION] loading {replay_path}")
             return torch.load(replay_path, weights_only=False)
+
+
+class RecordReplayContext:
+    """Per-record ``with`` wrapper around :class:`RecordReplay`.
+
+        with record_replay.generation(c) as gen:
+            if gen.output is None:
+                gen.output = generate_sequences(...)
+            gen_batch_output = gen.output
+
+    Enter preloads ``output`` in replay mode (else ``None``); exit saves it in
+    record mode. Not re-entrant: ``output`` lives on the instance.
+    """
+
+    def __init__(self):
+        self._rr = RecordReplay()
+        self.output = None
+
+    def is_enabled(self) -> bool:
+        return self._rr.is_enabled()
+
+    def is_record_mode(self) -> bool:
+        return self._rr.is_record_mode()
+
+    def is_replay_mode(self) -> bool:
+        return self._rr.is_replay_mode()
+
+    def skip_record(self, record_index: int) -> bool:
+        return self._rr.skip_record(record_index)
+
+    @contextmanager
+    def generation(self, record_index: int):
+        self.output = (
+            self._rr.load_record(record_index) if self._rr.is_replay_mode() else None
+        )
+        yield self
+        # No-op unless record mode; after yield (no finally) so failures don't save.
+        self._rr.save_record(record_index, self.output)
