@@ -96,9 +96,7 @@ class RecordReplayContext:
     """Per-record ``with`` wrapper around :class:`RecordReplay`.
 
         with record_replay.generation(c) as gen:
-            if gen.output is None:
-                gen.output = generate_sequences(...)
-            gen_batch_output = gen.output
+            gen_batch_output = gen.output or generate_sequences(...)
 
     Enter preloads ``output`` in replay mode (else ``None``); exit saves it in
     record mode. Not re-entrant: ``output`` lives on the instance.
