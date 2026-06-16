@@ -22,10 +22,10 @@ deduplication at the model level.
 
 import os
 import sys
-import warnings
 
 # 2nd half of code
 import threading
+import warnings
 from functools import partial
 from typing import List
 from typing import Optional

@@ -107,9 +107,7 @@ class TestQwen3ModelOncePatcher(TestCasePlus):
         # Reference must be computed before patching (the Once patcher mutates the model permanently). Re-patching
         # with a different logits_optimization just swaps the forward closures, so a single model serves every mode.
         cls.model.eval()
-        cls.reference_logprobs = _reference_response_logprobs(
-            cls.model, cls.batch, cls.prompt_lens, cls.response_lens
-        )
+        cls.reference_logprobs = _reference_response_logprobs(cls.model, cls.batch, cls.prompt_lens, cls.response_lens)
 
     def _patch_and_forward(self, logits_optimization: str, calculate_entropy: bool):
         Qwen3ModelOncePatcher(

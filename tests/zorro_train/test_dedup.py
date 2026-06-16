@@ -151,9 +151,7 @@ class TestRoundTrip(TestCasePlus):
         )
 
         dedup_hidden = torch.randn(1, dedup_input_ids.shape[1], hidden_size)
-        round_tripped = ZoRRoTrain.deduplicate_sequences(
-            ZoRRoTrain.reconstruct_sequences(dedup_hidden, info), info
-        )
+        round_tripped = ZoRRoTrain.deduplicate_sequences(ZoRRoTrain.reconstruct_sequences(dedup_hidden, info), info)
         self.assertTrue(torch.equal(round_tripped, dedup_hidden))
 
 
@@ -176,3 +174,74 @@ class TestTokenSavings(TestCasePlus):
         expected_tokens = num_unique_prompts * prompt_len + batch_size * response_len
         self.assertEqual(dedup_input_ids.shape, (1, expected_tokens))
         self.assertLess(dedup_input_ids.numel(), input_ids.numel())
+
+
+class TestResponseLabelExtraction(TestCasePlus):
+    def test_offset0_yields_each_rollouts_own_response(self):
+        # The log-prob labels are extracted from the packed deduplicated ids with ``offset=0`` so each rollout gets
+        # its OWN response tokens. This guards the first-response-token correctness: a naive roll of the packed
+        # sequence would hand every rollout in a group the first rollout's first token (the shared prompt-final slot
+        # is adjacent only to the first rollout's response), which is exactly the bug the offset-aware extraction
+        # avoids. Pure tensor logic, so verified on CPU without a model.
+        batch_size, num_unique_prompts = 6, 2
+        batch = _make_batch(batch_size=batch_size, num_unique_prompts=num_unique_prompts)
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        groups, unique_prompts = ZoRRoTrain.find_prompt_groups(input_ids=input_ids, response_length=response_len)
+        dedup_input_ids, _, info = ZoRRoTrain.create_deduplicated_batch(
+            input_ids=input_ids,
+            position_ids=batch["position_ids"],
+            response_length=response_len,
+            prompt_groups=groups,
+            unique_prompts=unique_prompts,
+            attention_mask=attention_mask,
+            use_unpad=True,
+        )
+
+        labels = ZoRRoTrain.extract_unpadded_responses_from_deduped_packed_ids(
+            dedup_input_ids.squeeze(0), info, offset=0
+        )
+
+        # Each row's real response tokens (mask == 1 beyond the fixed prompt boundary), concatenated in row order.
+        expected_rows = []
+        for row in range(batch_size):
+            real_prompt_len = int(attention_mask[row, :prompt_len].sum())
+            expected_rows.append(input_ids[row, attention_mask[row].bool()][real_prompt_len:])
+        expected = torch.cat(expected_rows)
+
+        self.assertEqual(labels.shape, expected.shape)
+        self.assertTrue(torch.equal(labels, expected))
+
+
+class TestSampleOrderReordering(TestCasePlus):
+    """``responses_in_orig_sample_order`` undoes the prompt-group permutation.
+
+    Deduplication packs responses grouped by prompt, so when the incoming samples are not already ordered by prompt
+    the packed responses come out permuted. This restores the original sample order. The method reads only
+    ``prompt_groups`` and ``cu_seqlens_response`` from the reconstruction info, so it is exercised here directly with
+    a hand-built layout and per-token values tagged by original sample id (variable response lengths to stress the
+    vectorized offset math).
+    """
+
+    def test_reorders_non_contiguous_groups(self):
+        # Samples 0,2 share one prompt and 1,3 another -> packed order is [0, 2, 1, 3].
+        prompt_groups = [[0, 2], [1, 3]]
+        # Response lengths of samples 0, 2, 1, 3 in that packed order.
+        cu_seqlens_response = torch.tensor([0, 2, 3, 6, 10], dtype=torch.int32)
+        packed = torch.tensor([0, 0, 2, 1, 1, 1, 3, 3, 3, 3], dtype=torch.float)
+        info = {"prompt_groups": prompt_groups, "cu_seqlens_response": cu_seqlens_response}
+
+        reordered = ZoRRoTrain.responses_in_orig_sample_order(packed, info)
+
+        expected = torch.tensor([0, 0, 1, 1, 1, 2, 3, 3, 3, 3], dtype=torch.float)
+        self.assertTrue(torch.equal(reordered, expected))
+
+    def test_already_ordered_is_noop(self):
+        # Flattened prompt groups == [0, 1, 2, 3]; the early-return path must hand back the input untouched.
+        cu_seqlens_response = torch.tensor([0, 2, 3, 6, 10], dtype=torch.int32)
+        packed = torch.arange(10, dtype=torch.float)
+        info = {"prompt_groups": [[0, 1], [2, 3]], "cu_seqlens_response": cu_seqlens_response}
+
+        reordered = ZoRRoTrain.responses_in_orig_sample_order(packed, info)
+
+        self.assertTrue(torch.equal(reordered, packed))
