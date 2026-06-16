@@ -21,14 +21,12 @@ Guards the cheap-but-load-bearing config contract the heavyweight GPU tests rely
 
 from __future__ import annotations
 
-import pytest
 from pydantic import ValidationError
 
 from arctic_platform.rl.config import ArcticRLClientConfig
 from arctic_platform.testing_utils import TestCasePlus
 
 
-@pytest.mark.cpu
 class TestArcticRLClientConfig(TestCasePlus):
     def test_local_requires_at_least_one_engine(self):
         """Local backend with every engine at 0 GPUs is rejected (no job could ever be created)."""

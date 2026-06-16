@@ -192,12 +192,11 @@ This will run:
 
 ### Testing
 
-**Gradient Correctness Test:**
-```bash
-python test_forward_and_backward.py
-```
+The maintained correctness tests live in the top-level test suite:
 
-Compares gradients between baseline and deduplicated implementations. The test passes if the global gradient norm differs by less than 5%.
+```bash
+pytest tests/zorro_train/        # CPU dedup-algorithm round-trips + GPU Qwen3ModelOncePatcher forward/backward
+```
 
 **Performance Benchmark:**
 ```bash
@@ -233,11 +232,12 @@ dedup_prompt_optimization/
 ├── qwen_attention_patcher.py      # Attention-level patching
 ├── module_patcher.py              # Base patcher utilities
 ├── demo.py                        # Interactive demonstration
-├── test_forward_and_backward.py   # Gradient correctness test
 ├── test_perf.py                   # Performance benchmark
-├── test_actor_demo.py             # Simple actor test
 └── tests.py                       # Utility functions for testing
 ```
+
+Correctness tests were migrated to `tests/zorro_train/` (CPU dedup-algorithm round-trips and GPU
+`Qwen3ModelOncePatcher` forward/backward).
 
 ## API Reference
 
