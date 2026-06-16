@@ -378,6 +378,12 @@ class ArcticRLRayServerState(ArcticRLServerState):
             vllm_cfg = dict(job_config.vllm_config or {})
             if colocate:
                 vllm_cfg["enable_sleep_mode"] = True
+            if job_config.use_arctic_inference:
+                # Hardcoded Arctic Inference / FCA tunables. Moved server-side
+                # from arctic-verl `arctic_rl_client.py` (Mert, draft) so that
+                # backends without a verl client get the same defaults.
+                vllm_cfg["compilation_config"] = {"cudagraph_mode": "PIECEWISE"}
+                vllm_cfg["forest_cascade_attn_configs"] = "{}"
             model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
             tp = model_cfg.tensor_parallel_size
             num_replicas = gpus // tp
@@ -447,6 +453,12 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 lp_vllm_cfg = dict(job_config.vllm_config or {})
                 if colocate:
                     lp_vllm_cfg["enable_sleep_mode"] = True
+                if job_config.use_arctic_inference:
+                    # Hardcoded Arctic Inference / FCA tunables. Moved server-side
+                    # from arctic-verl `arctic_rl_client.py` (Mert, draft) so that
+                    # backends without a verl client get the same defaults.
+                    lp_vllm_cfg["compilation_config"] = {"cudagraph_mode": "PIECEWISE"}
+                    lp_vllm_cfg["forest_cascade_attn_configs"] = "{}"
                 model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
                 lp_tp = model_cfg.tensor_parallel_size
                 num_replicas = gpus // lp_tp
