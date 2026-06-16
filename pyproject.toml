@@ -52,7 +52,7 @@ requires-python = ">=3.10"
 # Dependencies for the project
 dependencies = [
     "datasets",
-    "deepspeed>=0.18.2",  # UlyssesSPAttentionHF.register_with_transformers api change
+    "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
     "devtools",
     "jsonlines",
     "loguru",
