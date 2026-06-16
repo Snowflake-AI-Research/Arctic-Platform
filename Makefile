@@ -11,10 +11,10 @@ test: ## run cpu and gpu tests
 	pytest --disable-warnings --instafail ./tests/
 
 test-cpu: ## run cpu-only tests
-	pytest --disable-warnings --instafail -m "not gpu" ./tests/
+	CUDA_VISIBLE_DEVICES= pytest --disable-warnings --instafail ./tests/
 
-test-gpu: ## run gpu-only tests
-	pytest --disable-warnings --instafail -m gpu ./tests/
+test-fast: ## run tests in parallel if there are large gpus
+	pytest -n4 --disable-warnings --instafail ./tests/
 
 # pre-commit here runs on all modified files of the current branch, even if already pushed
 format: ## fix formatting

@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import io
 import logging
+import os
 import pathlib
 import sys
 import time
@@ -130,7 +131,10 @@ def _build_model_config(model_name: str, vllm_config: dict | None) -> ModelConfi
     return ModelConfig(**base)
 
 
-_WEIGHT_SYNC_BASE_PORT = 29600
+# Honor ARL_WEIGHT_SYNC_PORT when set so back-to-back / concurrent training jobs on one host (e.g. repeated
+# pytest-flakefinder iterations or parallel xdist workers) get a fresh NCCL rendezvous port instead of all reusing
+# 29600, where a SIGKILL-reaped sender from a prior job can still squat the port and deadlock the next sync.
+_WEIGHT_SYNC_BASE_PORT = int(os.environ.get("ARL_WEIGHT_SYNC_PORT", 29600))
 _WEIGHT_SYNC_BUCKET_SIZE = 256 * 1024 * 1024
 
 
@@ -199,12 +203,15 @@ async def initialize(job_config: JobConfig = Body(...)):
 
         workers = []
         config_dict = job_config.model_dump()
+        # Honor MASTER_PORT when set so concurrent training jobs on one host (e.g.
+        # parallel pytest-xdist workers) don't collide on the rendezvous port.
+        master_port = int(os.environ.get("MASTER_PORT", 29500))
         for rank in range(gpus):
             if colocate and placement:
                 opts = _pg_options(bundle_index=rank, fraction_key="training")
             else:
                 opts = dict(num_gpus=1)
-            w = DeepSpeedWorker.options(**opts).remote(rank, gpus, 29500)
+            w = DeepSpeedWorker.options(**opts).remote(rank, gpus, master_port)
             workers.append(w)
 
         # Use rank 0's host as the distributed rendezvous master. Passing None

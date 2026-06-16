@@ -129,11 +129,13 @@ class ArcticRLRayClient:
     # ------------------------------------------------------------------
 
     def _initialize_jobs(self, config: ArcticRLClientConfig) -> None:
-        data = self._post_initialize("training")
-        self._training_job_id = data["job_id"]
+        if self.config.training_gpus > 0:
+            data = self._post_initialize("training")
+            self._training_job_id = data["job_id"]
 
-        data = self._post_initialize("sampling")
-        self._sampling_job_id = data["job_id"]
+        if self.config.sampling_gpus > 0:
+            data = self._post_initialize("sampling")
+            self._sampling_job_id = data["job_id"]
 
         if self.config.log_prob_gpus > 0:
             data = self._post_initialize("log_prob")

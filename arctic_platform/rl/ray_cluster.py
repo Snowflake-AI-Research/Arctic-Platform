@@ -132,7 +132,7 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
     global _spawned_cluster, _spawned_temp_dir
 
     # 1. Try attaching to a running cluster (only if it has GPUs).
-    if 1:  # auto_attach:
+    if auto_attach:
         try:
             ray.init(address="auto", ignore_reinit_error=True, log_to_driver=True)
             gpus = ray.cluster_resources().get("GPU", 0)
@@ -150,7 +150,8 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
 
     # 2. Start a new head node. Pick non-colliding ports so we don't clash with
     # any pre-existing (e.g. CPU-only) cluster on this host. Use a unique
-    # ``--temp-dir`` so we can stop only our processes via ``ray stop --temp-dir``.
+    # ``--temp-dir`` so ``_shutdown()`` can stop only our processes by matching
+    # that temp-dir basename on their command lines.
     r = _ray_bin()
     ray_port = _resolve_port("RAY_PORT", _DEFAULT_RAY_PORT)
     dashboard_port = _resolve_port("RAY_DASHBOARD_PORT", _DEFAULT_RAY_DASHBOARD_PORT)
@@ -200,6 +201,21 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
     )
 
 
+def _reset_cached_ray_address() -> None:
+    """Drop Ray's cached default cluster address.
+
+    After we kill the cluster we started, a later ``ray.init(address="auto")``
+    must not resolve to (and then hard-abort on) the now-dead cluster.
+    """
+    for mod in ("ray._common.utils", "ray._private.utils"):
+        try:
+            __import__(mod, fromlist=["reset_ray_address"]).reset_ray_address()
+            break
+        except Exception:
+            continue
+    os.environ.pop("RAY_ADDRESS", None)
+
+
 def _shutdown() -> None:
     global _spawned_cluster, _spawned_temp_dir
     try:
@@ -212,16 +228,23 @@ def _shutdown() -> None:
     if _spawned_temp_dir is None:
         return
 
-    # Scope ``ray stop`` to our cluster's temp dir so coexisting Ray clusters
-    # owned by this user are left untouched.
-    r = _ray_bin()
-    stop_cmd = [r, "stop", "-f", f"--temp-dir={_spawned_temp_dir}"]
-    subprocess.run(stop_cmd, check=False, timeout=120, capture_output=True)
+    # ``ray.shutdown()`` only disconnects this driver; the ``ray start --head``
+    # daemon (gcs_server / raylet / dashboard / monitor / log_monitor) keeps
+    # running. ``ray stop`` would kill it, but it is *global* -- it kills every
+    # Ray process on the host by name, including any coexisting cluster owned by
+    # this user -- and it has no ``--temp-dir`` scoping option (that flag belongs
+    # to ``ray start``). So we surgically SIGKILL only the processes belonging to
+    # the cluster we started, matched by the unique temp-dir basename that
+    # appears on each daemon's command line (raylet/gcs_server/dashboard/...).
+    basename = os.path.basename(_spawned_temp_dir)
+    kill_cmd = ["pkill", "-9", "-f", basename]
+    subprocess.run(kill_cmd, check=False, timeout=120)
     peers = _peer_hosts()
     if peers:
-        _pdsh(peers, stop_cmd, check=False, timeout=180, capture_output=True)
+        _pdsh(peers, kill_cmd, check=False, timeout=180, capture_output=True)
     shutil.rmtree(_spawned_temp_dir, ignore_errors=True)
     _spawned_temp_dir = None
+    _reset_cached_ray_address()
 
 
 atexit.register(_shutdown)

@@ -130,7 +130,10 @@ def _build_model_config(model_name: str, vllm_config: dict | None) -> ModelConfi
     return ModelConfig(**base)
 
 
-_WEIGHT_SYNC_BASE_PORT = 29600
+# Honor ARL_WEIGHT_SYNC_PORT when set so back-to-back / concurrent training jobs on one host (e.g. repeated
+# pytest-flakefinder iterations or parallel xdist workers) get a fresh NCCL rendezvous port instead of all reusing
+# 29600, where a SIGKILL-reaped sender from a prior job can still squat the port and deadlock the next sync.
+_WEIGHT_SYNC_BASE_PORT = int(os.environ.get("ARL_WEIGHT_SYNC_PORT", 29600))
 _WEIGHT_SYNC_BUCKET_SIZE = 256 * 1024 * 1024
 
 
@@ -170,7 +173,12 @@ class ArcticRLRayServerState(ArcticRLServerState):
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
         pr0("[ArcticRLRayServer] initializing ray cluster")
-        init_ray_cluster(auto_attach=False)
+        # This server-state object runs as a Ray actor *inside* the cluster the
+        # driver already created, so it must attach to that cluster (auto_attach
+        # resolves to its own cluster), not start a fresh head. (Previously this
+        # passed auto_attach=False but the flag was ignored by a hardcoded branch
+        # in init_ray_cluster, so the effective behavior was always to attach.)
+        init_ray_cluster(auto_attach=True)
         pr0("[ArcticRLRayServer] ray cluster initialized")
 
         self.training_gpus = training_gpus
@@ -349,8 +357,11 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 raise ValueError("No training GPUs configured")
             if self.training_workers:
                 raise ValueError("Training job already running")
-            # TODO: should be configurable
-            master_port = 29500
+            # Honor MASTER_PORT when set so concurrent training jobs on one host
+            # (e.g. parallel pytest-xdist workers, each with its own cluster) don't
+            # collide on the rendezvous port. All ranks of THIS job are handed the
+            # same value below, so multi-node rendezvous is unaffected.
+            master_port = int(os.environ.get("MASTER_PORT", 29500))
             workers = []
             config_dict = job_config.model_dump()
             for rank in range(gpus):
@@ -910,7 +921,7 @@ class ArcticRLRayServer:
         """Release ZeRO partition cache and PyTorch cached memory on all workers."""
         self._verify_job(job_id, "training")
         workers = self.training_workers
-        results = await self.arctic_rl_ray_server_state.empty_training_cache.remote(workers)
+        results = await self.arctic_rl_ray_server_state._empty_training_cache.remote(workers)
         logger.info("Empty training cache: %s", results)
         return {"job_id": job_id, "workers": results}
 

@@ -198,13 +198,15 @@ class ArcticRLHTTPClient:
 
     def _initialize_jobs(self) -> None:
         self._cleanup_stale_jobs()
-        data = self._post_initialize("sampling")
-        self._sampling_job_id = data["job_id"]
+        if self.config.sampling_gpus > 0:
+            data = self._post_initialize("sampling")
+            self._sampling_job_id = data["job_id"]
         if self.config.log_prob_gpus > 0:
             data = self._post_initialize("log_prob")
             self._log_prob_job_id = data["job_id"]
-        data = self._post_initialize("training")
-        self._training_job_id = data["job_id"]
+        if self.config.training_gpus > 0:
+            data = self._post_initialize("training")
+            self._training_job_id = data["job_id"]
         self._wait_for_jobs_running()
 
     def _cleanup_stale_jobs(self) -> None:
