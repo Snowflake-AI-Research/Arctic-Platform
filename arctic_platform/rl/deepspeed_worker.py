@@ -490,17 +490,21 @@ class DeepSpeedWorker:
         self.engine.save_checkpoint(path)
         return True
 
-    def compute_log_probs(self, batch_bytes: bytes) -> bytes:
-        batch = torch.load(io.BytesIO(batch_bytes), map_location=self._device)
-        args, kwargs, _, _ = unpack_batch(batch)
+    def compute_log_probs(self, batch: dict) -> torch.Tensor:
+        """Full-sequence per-token log-probs for a ``{"batch","meta","processing"}`` DP shard.
+
+        Takes a dict shard (like ``forward_no_grad``) -- ``unpack_batch`` pulls the encoded ``{input_ids,
+        attention_mask}`` out of ``batch["batch"]`` -- runs a forward-only pass, and returns the shifted-label
+        per-token log-probs ``[shard_B, S-1]`` on CPU. The DeepSpeed engine ignores ``top_k`` (unlike the vLLM path).
+        """
+        _, kwargs, _, _ = unpack_batch(batch)
+        kwargs = {k: (v.to(self._device) if torch.is_tensor(v) else v) for k, v in kwargs.items()}
         with torch.no_grad():
-            logits = self.engine(*args, **kwargs).logits
+            logits = self.engine(**kwargs).logits
         log_probs = torch.log_softmax(logits, dim=-1)
         shifted_ids = kwargs["input_ids"][:, 1:]
         token_log_probs = log_probs[:, :-1].gather(-1, shifted_ids.unsqueeze(-1)).squeeze(-1)
-        buf = io.BytesIO()
-        torch.save(token_log_probs.cpu(), buf)
-        return buf.getvalue()
+        return token_log_probs.cpu()
 
     def max_param_bytes(self) -> int:
         max_bytes = 0

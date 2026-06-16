@@ -981,15 +981,15 @@ async def log_probs(job_id: int, request: LogProbsRequest = Body(...)):
     if info.get("engine") == "deepspeed":
         tokenizer = app.state.log_prob_tokenizer
         encoded = tokenizer(full_texts, return_tensors="pt", padding=True)
-        batch_buf = io.BytesIO()
-        torch.save(dict(encoded), batch_buf)
-        batch_data = batch_buf.getvalue()
-
         workers = app.state.log_prob_workers
-        shards = http_split_batch(batch_data, len(workers))
+        # Wrap the encoded batch as the {"batch","meta","processing"} payload unpack_batch expects (the same shape
+        # fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no ZoRRO/
+        # position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
+        batch_buf = io.BytesIO()
+        torch.save(dict(batch=dict(encoded), meta={}, processing={}), batch_buf)
+        shards, _ = http_split_batch(batch_buf.getvalue(), len(workers))
         raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
-        shard_tensors = [torch.load(io.BytesIO(r), map_location="cpu") for r in raw]
-        results = torch.cat(shard_tensors, dim=0)
+        results = torch.cat([r.cpu() for r in raw], dim=0)
     else:
         pool: ReplicaPool = app.state.log_prob_pool
         results = await pool.generate(
