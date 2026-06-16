@@ -33,7 +33,9 @@ class TestArcticRLClientConfig(TestCasePlus):
     def test_local_requires_at_least_one_engine(self):
         """Local backend with every engine at 0 GPUs is rejected (no job could ever be created)."""
         with self.assertRaises(ValidationError):
-            ArcticRLClientConfig(backend="local", model_name="dummy", training_gpus=0, sampling_gpus=0, log_prob_gpus=0)
+            ArcticRLClientConfig(
+                backend="local", model_name="dummy", training_gpus=0, sampling_gpus=0, log_prob_gpus=0
+            )
 
     def test_single_engine_is_valid(self):
         """One engine > 0 satisfies the rule; the others may stay 0 (training-only / sampling-only topologies)."""

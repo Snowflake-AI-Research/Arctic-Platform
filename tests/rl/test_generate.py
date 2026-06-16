@@ -31,13 +31,13 @@ import asyncio
 
 import pytest
 from parameterized import parameterized
-
-from arctic_platform.testing_utils import TestCasePlus
-from arctic_platform.testing_utils import require_torch_multi_gpu
 from rl_harness import arctic_rl_client_session
 from rl_harness import assert_generations
 from rl_harness import parameterized_custom_name_func
 from rl_harness import skip_if_unsupported
+
+from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import require_torch_multi_gpu
 
 model_name = "Qwen/Qwen3-0.6B"
 attn_implementation = "flash_attention_2"
@@ -63,8 +63,16 @@ async def _send_generate(client, prompts: list[str], sampling_params: dict) -> l
 
 def _run_generate(comm_protocol: str) -> list[dict]:
     with arctic_rl_client_session(
-        comm_protocol, False, model_name, attn_implementation, prompt_len, response_len, rollout_n,
-        training_gpus, sampling_gpus, log_prob_gpus,
+        comm_protocol,
+        False,
+        model_name,
+        attn_implementation,
+        prompt_len,
+        response_len,
+        rollout_n,
+        training_gpus,
+        sampling_gpus,
+        log_prob_gpus,
     ) as client:
         return asyncio.run(_send_generate(client, prompts, sampling_params))
 

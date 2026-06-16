@@ -42,10 +42,6 @@ import asyncio
 import pytest
 import torch
 from parameterized import parameterized
-
-from arctic_platform.testing_utils import TestCasePlus
-from arctic_platform.testing_utils import require_torch_gpu
-from arctic_platform.testing_utils import torch_assert_close
 from rl_harness import arctic_rl_client_session
 from rl_harness import assert_finite_logprobs
 from rl_harness import build_compute_log_prob_payload
@@ -54,6 +50,10 @@ from rl_harness import cell_tag
 from rl_harness import parameterized_custom_name_func
 from rl_harness import response_region
 from rl_harness import skip_if_unsupported
+
+from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import torch_assert_close
 
 model_name = "Qwen/Qwen3-0.6B"
 attn_implementation = "flash_attention_2"
@@ -107,8 +107,16 @@ class TestLogProbEngine(TestCasePlus):
         cl_payload = build_compute_log_prob_payload(batch, zorro_enable, rollout_n, prompt_len, response_len)
         tag = cell_tag(comm_protocol, zorro_enable)
         with arctic_rl_client_session(
-            comm_protocol, zorro_enable, model_name, attn_implementation, prompt_len, response_len, rollout_n,
-            training_gpus, sampling_gpus, log_prob_gpus,
+            comm_protocol,
+            zorro_enable,
+            model_name,
+            attn_implementation,
+            prompt_len,
+            response_len,
+            rollout_n,
+            training_gpus,
+            sampling_gpus,
+            log_prob_gpus,
         ) as client:
             logprob_response = asyncio.run(self._drive(client, cl_payload))
 
@@ -130,8 +138,16 @@ class TestLogProbEngine(TestCasePlus):
         """client.log_probs(prompts, completions) scores text through the DeepSpeed engine over both transports."""
         skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus)
         with arctic_rl_client_session(
-            comm_protocol, False, model_name, attn_implementation, prompt_len, response_len, rollout_n,
-            training_gpus, sampling_gpus, log_prob_gpus,
+            comm_protocol,
+            False,
+            model_name,
+            attn_implementation,
+            prompt_len,
+            response_len,
+            rollout_n,
+            training_gpus,
+            sampling_gpus,
+            log_prob_gpus,
         ) as client:
             response = asyncio.run(self._drive_text_log_probs(client))
 

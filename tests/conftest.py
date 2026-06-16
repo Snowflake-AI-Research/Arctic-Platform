@@ -20,7 +20,6 @@ import signal
 import sys
 from pathlib import Path
 
-import pytest
 import torch
 import torch.distributed as dist
 from deepspeed.comm import init_distributed

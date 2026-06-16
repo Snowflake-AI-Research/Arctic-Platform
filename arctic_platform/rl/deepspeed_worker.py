@@ -25,7 +25,6 @@ Usage::
 
 from __future__ import annotations
 
-import io
 import logging
 import numbers
 import os
@@ -498,7 +497,7 @@ class DeepSpeedWorker:
         per-token log-probs ``[shard_B, S-1]`` on CPU. The DeepSpeed engine ignores ``top_k`` (unlike the vLLM path).
         """
         _, kwargs, _, _ = unpack_batch(batch)
-        kwargs = {k: (v.to(self._device) if torch.is_tensor(v) else v) for k, v in kwargs.items()}
+        kwargs = {k: v.to(self._device) if torch.is_tensor(v) else v for k, v in kwargs.items()}
         with torch.no_grad():
             logits = self.engine(**kwargs).logits
         log_probs = torch.log_softmax(logits, dim=-1)

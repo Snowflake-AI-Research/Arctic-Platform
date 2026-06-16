@@ -306,7 +306,11 @@ def assert_positive_grad_norm(step_response: dict) -> float:
 
 
 def reference_response_logprobs_padded(
-    batch: dict, prompt_lens: list[int], response_lens: list[int], model_name: str, attn_implementation: str,
+    batch: dict,
+    prompt_lens: list[int],
+    response_lens: list[int],
+    model_name: str,
+    attn_implementation: str,
     response_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row unpadded reference for a padded batch: ``([B, response_len] logprobs, [B, response_len] valid mask)``.
@@ -348,7 +352,11 @@ _REFERENCE_CACHE: dict = {}
 
 
 def cached_padded_batch_and_reference(
-    model_name: str, attn_implementation: str, num_unique_prompts: int, rollout_n: int, prompt_len: int,
+    model_name: str,
+    attn_implementation: str,
+    num_unique_prompts: int,
+    rollout_n: int,
+    prompt_len: int,
     response_len: int,
 ) -> tuple[dict, list[int], list[int], torch.Tensor, torch.Tensor]:
     """``(batch, prompt_lens, response_lens, reference_logprobs, valid_mask)``, memoized on the geometry."""
@@ -372,7 +380,9 @@ def response_region(logprobs: torch.Tensor, zorro_enable: bool, prompt_len: int,
     regressing to the other convention then mismatches the reference at the compared positions.
     """
     if zorro_enable:
-        assert torch.count_nonzero(logprobs[:, :prompt_len]).item() == 0, "expected prompt-region log-probs zero-filled"
+        assert (
+            torch.count_nonzero(logprobs[:, :prompt_len]).item() == 0
+        ), "expected prompt-region log-probs zero-filled"
         return logprobs[:, prompt_len : prompt_len + response_len]
     return logprobs[:, prompt_len - 1 : prompt_len + response_len - 1]
 

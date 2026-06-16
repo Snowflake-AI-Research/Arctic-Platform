@@ -40,10 +40,6 @@ import asyncio
 
 import pytest
 from parameterized import parameterized
-
-from arctic_platform.testing_utils import TestCasePlus
-from arctic_platform.testing_utils import require_torch_multi_gpu
-from arctic_platform.testing_utils import torch_assert_close
 from rl_harness import arctic_rl_client_session
 from rl_harness import assert_finite_logprobs
 from rl_harness import assert_positive_grad_norm
@@ -56,6 +52,10 @@ from rl_harness import make_fake_batch
 from rl_harness import parameterized_custom_name_func
 from rl_harness import response_region
 from rl_harness import skip_if_unsupported
+
+from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import require_torch_multi_gpu
+from arctic_platform.testing_utils import torch_assert_close
 
 # Model + fake-data geometry this test owns and passes into the rl_harness builders. batch_size = num_unique_prompts
 # * rollout_n must exceed the training world size so the ZoRRO load balancer (reorg_global_batch) runs bin-packing.
@@ -110,8 +110,16 @@ class TestTrainEngine(TestCasePlus):
         ua_payload = build_update_actor_payload(batch, zorro_enable, rollout_n, prompt_len, response_len)
         tag = cell_tag(comm_protocol, zorro_enable)
         with arctic_rl_client_session(
-            comm_protocol, zorro_enable, model_name, attn_implementation, prompt_len, response_len, rollout_n,
-            training_gpus, sampling_gpus, log_prob_gpus,
+            comm_protocol,
+            zorro_enable,
+            model_name,
+            attn_implementation,
+            prompt_len,
+            response_len,
+            rollout_n,
+            training_gpus,
+            sampling_gpus,
+            log_prob_gpus,
         ) as client:
             logprob_response, fwd_bwd_response, step_response = asyncio.run(
                 self._drive(client, cl_payload, ua_payload)
@@ -132,9 +140,7 @@ class TestTrainEngine(TestCasePlus):
         avg_loss = finite_metric(fwd_bwd_response["avg_loss"])
         finite_metric(step_response["metrics"]["last_lr"])
         grad_norm = assert_positive_grad_norm(step_response)
-        print(
-            f"[train-engine] {tag} loss={loss:.4f} pg={pg_loss:.4f} avg={avg_loss:.4f} grad_norm={grad_norm:.4f}"
-        )
+        print(f"[train-engine] {tag} loss={loss:.4f} pg={pg_loss:.4f} avg={avg_loss:.4f} grad_norm={grad_norm:.4f}")
 
     def test_microbatch_accumulation(self):
         """Gradient accumulation (>1 forward microbatch per rank) over a batch larger than the world size.
@@ -149,8 +155,17 @@ class TestTrainEngine(TestCasePlus):
         batch, _, _ = make_fake_batch(model_name, 4, rollout_n, prompt_len, response_len)
         ua_payload = build_update_actor_payload(batch, True, rollout_n, prompt_len, response_len)
         with arctic_rl_client_session(
-            "ray", True, model_name, attn_implementation, prompt_len, response_len, rollout_n,
-            training_gpus, sampling_gpus, log_prob_gpus, gradient_accumulation_steps=2,
+            "ray",
+            True,
+            model_name,
+            attn_implementation,
+            prompt_len,
+            response_len,
+            rollout_n,
+            training_gpus,
+            sampling_gpus,
+            log_prob_gpus,
+            gradient_accumulation_steps=2,
         ) as client:
             fwd_bwd_response, step_response = asyncio.run(self._drive_update(client, ua_payload))
 

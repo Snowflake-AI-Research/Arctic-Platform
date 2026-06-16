@@ -51,10 +51,6 @@ import asyncio
 
 import pytest
 from parameterized import parameterized
-
-from arctic_platform.rl import create_arctic_rl_client
-from arctic_platform.testing_utils import TestCasePlus
-from arctic_platform.testing_utils import require_torch_multi_gpu
 from rl_harness import arctic_rl_client_session
 from rl_harness import assert_finite_logprobs
 from rl_harness import assert_generations
@@ -66,6 +62,10 @@ from rl_harness import finite_metric
 from rl_harness import make_fake_batch
 from rl_harness import parameterized_custom_name_func
 from rl_harness import skip_if_unsupported
+
+from arctic_platform.rl import create_arctic_rl_client
+from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import require_torch_multi_gpu
 
 model_name = "Qwen/Qwen3-0.6B"
 attn_implementation = "flash_attention_2"
@@ -171,8 +171,18 @@ class TestE2E(TestCasePlus):
         batch, _, _ = make_fake_batch(model_name, num_unique_prompts, rollout_n, prompt_len, response_len)
         tag = cell_tag(comm_protocol, zorro_enable)
         with arctic_rl_client_session(
-            comm_protocol, zorro_enable, model_name, attn_implementation, prompt_len, response_len, rollout_n,
-            training_gpus, sampling_gpus, log_prob_gpus, colocate=colocate, vllm_overrides=vllm_overrides,
+            comm_protocol,
+            zorro_enable,
+            model_name,
+            attn_implementation,
+            prompt_len,
+            response_len,
+            rollout_n,
+            training_gpus,
+            sampling_gpus,
+            log_prob_gpus,
+            colocate=colocate,
+            vllm_overrides=vllm_overrides,
         ) as client:
             asyncio.run(self._drive_grpo(client, batch, zorro_enable, tag))
             asyncio.run(self._assert_client_guards(client, comm_protocol, tag))
@@ -230,8 +240,18 @@ class TestE2E(TestCasePlus):
         batch, _, _ = make_fake_batch(model_name, num_unique_prompts, rollout_n, prompt_len, response_len)
         payload = build_update_actor_payload(batch, False, rollout_n, prompt_len, response_len)
         with arctic_rl_client_session(
-            "ray", False, model_name, attn_implementation, prompt_len, response_len, rollout_n,
-            training_gpus, sampling_gpus, log_prob_gpus, vllm_overrides=vllm_overrides, lr=sync_test_lr,
+            "ray",
+            False,
+            model_name,
+            attn_implementation,
+            prompt_len,
+            response_len,
+            rollout_n,
+            training_gpus,
+            sampling_gpus,
+            log_prob_gpus,
+            vllm_overrides=vllm_overrides,
+            lr=sync_test_lr,
         ) as client:
             before, after = asyncio.run(self._perturb_and_sync(client, payload))
         print(f"[e2e] sync_weights: before={before} after={after}")

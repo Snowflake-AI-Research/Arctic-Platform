@@ -149,7 +149,12 @@ class TestPpoActorLoss(TestCasePlus):
         mask = torch.ones(1, 2, dtype=torch.bool)
         with self.assertRaises(ValueError):
             ppo_actor_loss_fn(
-                torch.zeros(1, 2), torch.zeros(1, 2), torch.zeros(1, 2), torch.zeros(1, 2), 0.2, mask,
+                torch.zeros(1, 2),
+                torch.zeros(1, 2),
+                torch.zeros(1, 2),
+                torch.zeros(1, 2),
+                0.2,
+                mask,
                 importance_sampling_level="bogus",
             )
 
