@@ -22,6 +22,7 @@ deduplication at the model level.
 
 import os
 import sys
+import warnings
 
 # 2nd half of code
 import threading
@@ -318,7 +319,7 @@ class Qwen3ModelOncePatcher:
                     hidden_states_dedup,
                     attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                     position_ids=position_ids,
-                    past_key_value=past_key_values,
+                    past_key_values=past_key_values,
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
@@ -577,6 +578,20 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
     """
     Qwen3-specific model patcher.
 
+    .. warning::
+        OUTDATED / DO NOT USE WITHOUT SYNCING FIRST. This context-manager patcher has drifted out of sync with
+        current transformers: recent Qwen3 precomputes the rotary ``position_embeddings`` once in the main model
+        forward (on the *deduplicated* sequence length) and passes them down, while this patcher's attention path
+        reconstructs Q/K back to the *original* (full) length before applying rotary -- so ``apply_rotary_pos_emb``
+        raises a sequence-length mismatch and no forward completes. ``DeduplicatedActor`` (which uses this class) is
+        broken for the same reason.
+
+        The maintained, production patcher is ``Qwen3ModelOncePatcher`` (installed by ``deepspeed_worker.py`` and
+        exercised by ``tests/zorro_train/test_once_patcher.py``). Before using ``Qwen3ModelPatcher`` again, bring it
+        back in line with ``Qwen3ModelOncePatcher`` -- specifically the rotary/position-embedding flow in the
+        main-model and attention forwards (apply rotary on the deduplicated Q/K, or reconstruct ``cos``/``sin`` to
+        the full length) -- and re-verify against a non-deduplicated reference.
+
     Handles deduplication/reconstruction for Qwen3Model and Qwen3ForCausalLM.
 
     Flow:
@@ -598,6 +613,14 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
             use_split_attention: If True, use split attention (2 calls: prompt-to-prompt + response-to-full).
                                 If False, use standard approach (1 call: full attention on reconstructed Q/K/V).
         """
+        # OUTDATED: kept for reference only. See the class docstring -- this path is stale against current
+        # transformers and must be synced with Qwen3ModelOncePatcher (the production patcher) before use.
+        warnings.warn(
+            "Qwen3ModelPatcher is outdated and currently broken against the installed transformers (rotary "
+            "position-embedding length mismatch); it must be synced with Qwen3ModelOncePatcher before use. See the "
+            "Qwen3ModelPatcher class docstring.",
+            stacklevel=2,
+        )
         super().__init__(model, reconstruction_info, patch_with_local=patch_with_local)
         self.attention_patcher = QwenAttentionPatcher(
             model, reconstruction_info, patch_with_local=patch_with_local, use_split_attention=use_split_attention
@@ -718,7 +741,7 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
                     hidden_states,
                     attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                     position_ids=position_ids,
-                    past_key_value=past_key_values,
+                    past_key_values=past_key_values,
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
@@ -805,7 +828,7 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
                     hidden_states_dedup,
                     attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                     position_ids=position_ids,
-                    past_key_value=past_key_values,
+                    past_key_values=past_key_values,
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
