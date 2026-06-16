@@ -253,7 +253,11 @@ class ArcticRLRayServerState(ArcticRLServerState):
         colocate = self.colocate
         results = {}
         pool: ReplicaPool = self.sampling_pool
-        offload_weights = colocate
+        # Let vLLM's CuMemAllocator free the weights (offload_weights=False)
+        # instead of the legacy manual offload, which reallocated param.data on
+        # each wake and changed weight addresses -> stale rollout CUDA graphs
+        # (compile on) -> grad-norm explosion. cumem keeps addresses stable.
+        offload_weights = False
         results["sampling"] = await pool.sleep(level=level, offload_weights=offload_weights)
         lp_pool: ReplicaPool | None = self.log_prob_pool
         if lp_pool is not None and lp_pool._config is not None and not lp_pool.sleeping:
