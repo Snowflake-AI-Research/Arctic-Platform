@@ -102,7 +102,7 @@ class JobConfig(BaseModel):
     ds_worker_config: Optional[dict] = None
     vllm_config: Optional[dict] = None
     checkpoint_path: Optional[str] = None
-    use_arctic_inference: bool = False
+    arctic_inference_config: Optional[dict] = None
     full_determinism: bool = False
     seed: int = 42
 
@@ -236,7 +236,7 @@ async def initialize(job_config: JobConfig = Body(...)):
                 extra_env["VLLM_RAY_PER_WORKER_GPUS"] = str(_COLOCATE_GPU_FRACTIONS["sampling"])
                 vllm_cfg["distributed_executor_backend"] = "ray"
                 model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
-            if job_config.use_arctic_inference:
+            if job_config.arctic_inference_config:
                 extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
                 # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
                 # override the global VLLM_DISABLE_COMPILE_CACHE=1 set in the verl runtime_env.
@@ -311,7 +311,7 @@ async def initialize(job_config: JobConfig = Body(...)):
                     lp_extra_env.pop("CUDA_VISIBLE_DEVICES", None)
                     lp_vllm_cfg["distributed_executor_backend"] = "ray"
                     model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
-                if job_config.use_arctic_inference:
+                if job_config.arctic_inference_config:
                     lp_extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
                     # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
                     # override the global VLLM_DISABLE_COMPILE_CACHE=1 set in the verl runtime_env.

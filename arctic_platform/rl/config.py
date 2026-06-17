@@ -54,9 +54,8 @@ class ArcticRLClientConfig(BaseModel):
     ds_worker_config: Optional[dict] = Field(
         default=None, description="Deepspeed worker config dict (optimizer, dtype, etc.)."
     )
-    use_arctic_inference: bool = Field(
-        default=False,
-        description="If True, set ARCTIC_INFERENCE_ENABLED=1 and override VLLM_DISABLE_COMPILE_CACHE=0.",
+    arctic_inference_config: Optional[dict] = Field(
+        default=None, description="Arctic inference config dict (use_fca, spec_model, etc.)."
     )
     full_determinism: bool = Field(
         default=False,
