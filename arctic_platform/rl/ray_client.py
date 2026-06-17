@@ -145,7 +145,6 @@ class ArcticRLRayClient:
         job_config: dict[str, Any] = {
             "model_name": self.config.model_name,
             "job_type": job_type,
-            "use_arctic_inference": self.config.use_arctic_inference,
             "full_determinism": self.config.full_determinism,
             "seed": self.config.seed,
         }
@@ -173,6 +172,8 @@ class ArcticRLRayClient:
             if job_type == "training":
                 job_config["checkpoint_path"] = self.config.checkpoint_path
         else:
+            if self.config.arctic_inference_config:
+                job_config["arctic_inference_config"] = self.config.arctic_inference_config
             if self.config.vllm_config:
                 job_config["vllm_config"] = self.config.vllm_config
 
