@@ -118,6 +118,22 @@ class DeepSpeedWorker:
         if job_config.get("full_determinism", False):
             enable_full_determinism(seed=job_config.get("seed", 42))
 
+        # aws-ofi-nccl generates a per-process topology and hands it to NCCL by setting NCCL_TOPO_FILE to a
+        # /proc/self/fd/<N> path (an in-memory fd). That handle is only valid in the process that created it: once
+        # inherited by a child, fd <N> resolves to an unrelated file, and because the plugin skips regenerating when
+        # NCCL_TOPO_FILE is already set, NCCL loads a bogus topology and the multi-rank rendezvous deadlocks. This
+        # worker has not run OFI yet, so any value present here is necessarily inherited and stale -- drop it.
+        #
+        # Dropping it does NOT cost performance: the plugin sets NCCL_TOPO_FILE only as an in-process mechanism to
+        # pass its generated topology to NCCL, and it regenerates that topology during OFI init whenever the var is
+        # unset. So popping the stale handle simply makes the plugin produce a fresh, correct, platform-optimal
+        # topology for this process -- exactly what happens on a clean first init -- instead of reusing a poisoned
+        # one. The narrow /proc/self/fd/ check also leaves an admin-provided static topology path untouched.
+        topo_file = os.environ.get("NCCL_TOPO_FILE", "")
+        if topo_file.startswith("/proc/self/fd/"):
+            logger.warning(f"dropping inherited stale NCCL_TOPO_FILE={topo_file}; OFI will regenerate per-process")
+            os.environ.pop("NCCL_TOPO_FILE", None)
+
         deepspeed.init_distributed()
 
         model_name = job_config["model_name"]
@@ -533,6 +549,27 @@ class DeepSpeedWorker:
             else:
                 weights.append((n, p.data))
         return weights
+
+    def weight_norm(self) -> dict:
+        """Global L2 norm of the model's parameters (sum of squares + count).
+
+        ZeRO-3 partitions each param across ranks, so ``GatheredParameters``
+        materializes the full param on every rank; the resulting sum of
+        squares is therefore the whole-model value (the server reads rank 0).
+        Summing squares is layout-invariant, so it compares directly against
+        the vLLM engine's norm despite vLLM fusing params differently. Used by
+        tests to confirm a weight sync landed.
+        """
+        sq_sum = 0.0
+        num_params = 0
+        for _, p in self.engine.module.named_parameters():
+            if hasattr(p, "ds_id"):
+                with deepspeed.zero.GatheredParameters([p], enabled=True):
+                    sq_sum += p.data.double().pow(2).sum().item()
+            else:
+                sq_sum += p.data.double().pow(2).sum().item()
+            num_params += 1
+        return {"norm": sq_sum**0.5, "sq_sum": sq_sum, "num_params": num_params}
 
     def send_weights(self) -> dict:
         weights = self.get_weights()

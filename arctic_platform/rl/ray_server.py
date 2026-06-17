@@ -1134,6 +1134,27 @@ class ArcticRLRayServer:
         # logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
         # return {"status": "ok"}
 
+    async def weight_norm(self, training_job_id: int, sampling_job_id: int) -> dict[str, Any]:
+        """Global L2 weight norm of the training (DeepSpeed) and sampling (vLLM) engines.
+
+        Both are computed as sqrt of the sum of squares over all params, which is invariant to how each engine shards
+        / fuses its parameters -- so after a weight sync the two values must match. Used by tests to verify sync
+        correctness.
+        """
+        self._verify_job(training_job_id, "training")
+        self._verify_job(sampling_job_id, "sampling")
+        loop = asyncio.get_running_loop()
+        training = await loop.run_in_executor(None, ray.get, self.training_workers[0].weight_norm.remote())
+        sampling = await loop.run_in_executor(
+            None, ray.get, self.sampling_pool._workers[0].compute_weight_norm.remote()
+        )
+        return {
+            "training_norm": training["norm"],
+            "sampling_norm": sampling["norm"],
+            "training_num_params": training["num_params"],
+            "sampling_num_params": sampling["num_params"],
+        }
+
     async def _sync_weights_cuda_ipc(self, workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None) -> dict:
         """Colocated weight sync via CUDA IPC (zero-copy, same GPU).
 

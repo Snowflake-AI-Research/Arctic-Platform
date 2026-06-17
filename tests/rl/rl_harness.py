@@ -64,6 +64,7 @@ import torch.distributed as dist
 from parameterized import parameterized
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM
+from transformers import AutoTokenizer
 
 from arctic_platform.rl import ArcticRLClientConfig
 from arctic_platform.rl import create_arctic_rl_client
@@ -194,15 +195,25 @@ def build_compute_log_prob_payload(
 
 
 def build_update_actor_payload(
-    batch: dict, zorro_enable: bool, rollout_n: int, prompt_len: int, response_len: int, pad_token_id: int = 0
+    batch: dict,
+    zorro_enable: bool,
+    rollout_n: int,
+    prompt_len: int,
+    response_len: int,
+    pad_token_id: int = 0,
+    old_log_probs: torch.Tensor | None = None,
 ) -> dict:
     """Mirror the payload ``update_actor`` sends for one GRPO mini-batch.
 
     ``meta`` adds ``actor_config`` / ``policy_loss_config`` / per-mini-batch loss normalizers on top of
-    ``base_meta`` (``dp_size`` is injected server-side). PG tensors (``old_log_probs`` / ``advantages`` /
-    ``response_mask``) are fake -- the clipped-ratio loss clamps any finite delta -- and left-padded response-only
-    -> full length, as the wrapper does. ``response_mask`` is taken from ``attention_mask`` so right-padded response
-    tokens are excluded (a no-op all-ones mask for uniform batches).
+    ``base_meta`` (``dp_size`` is injected server-side). ``advantages`` / ``response_mask`` are fake and the default
+    fake ``old_log_probs`` is random -- fine for a forward/backward smoke since the clipped-ratio loss clamps any
+    finite delta, but the resulting ratio is far from 1 so the surrogate sits in its flat clipped region (tiny / zero
+    gradient). Pass ``old_log_probs`` = the policy's actual response log-probs (e.g. from ``fwd_no_grad``) to start at
+    ratio 1.0 so the unclipped surrogate is active and every step produces a real gradient (mirrors verl, where
+    ``old_log_probs`` is the rollout-time policy snapshot). Shape ``[bsz, response_len]``. PG tensors are left-padded
+    response-only -> full length, as the wrapper does; ``response_mask`` comes from ``attention_mask`` so right-padded
+    response tokens are excluded (a no-op all-ones mask for uniform batches).
     """
     input_ids = batch["input_ids"]
     bsz, seq_len = input_ids.shape
@@ -211,7 +222,12 @@ def build_update_actor_payload(
     gen = torch.Generator().manual_seed(4321)
     responses = input_ids[:, prompt_len:].clone()
     response_mask = batch["attention_mask"][:, prompt_len:].to(torch.long)  # real response tokens only
-    old_log_probs = -(torch.rand((bsz, response_len), generator=gen) * 5.0 + 0.1)
+    if old_log_probs is None:
+        old_log_probs = -(torch.rand((bsz, response_len), generator=gen) * 5.0 + 0.1)
+    else:
+        expected_shape = (bsz, response_len)
+        assert old_log_probs.shape == expected_shape, f"old_log_probs {tuple(old_log_probs.shape)} != {expected_shape}"
+        old_log_probs = old_log_probs.detach().float().cpu()
     advantages = torch.randn((bsz, response_len), generator=gen)
 
     # Simplest GRPO knobs: no KL loss (no ref_log_prob), no entropy, token-mean.
@@ -387,6 +403,102 @@ def response_region(logprobs: torch.Tensor, zorro_enable: bool, prompt_len: int,
     return logprobs[:, prompt_len - 1 : prompt_len + response_len - 1]
 
 
+def assert_weight_norms_match(norms: dict, tag: str = "", rtol: float = 1e-3) -> tuple[float, float]:
+    """A weight sync makes the two engines bit-identical, so their global L2 norms must agree.
+
+    The norm is sqrt of the sum of squares over all params -- invariant to how each engine sublays/fuses its weights
+    -- so the only residual gap is float64 summation order (observed: equal to ~4 decimals), hence the tight rtol.
+    The engines legitimately report different ``num_params`` (vLLM fuses QKV / gate_up), so the counts are surfaced
+    in the failure message but intentionally not asserted equal. Returns ``(training_norm, sampling_norm)``.
+    """
+    training = norms["training_norm"]
+    sampling = norms["sampling_norm"]
+    assert math.isfinite(training) and training > 0, f"{tag}: bad training_norm {training}"
+    assert math.isfinite(sampling) and sampling > 0, f"{tag}: bad sampling_norm {sampling}"
+    rel = abs(training - sampling) / max(training, sampling)
+    assert rel <= rtol, (
+        f"{tag}: weight norms diverge after sync -- training={training:.6f} sampling={sampling:.6f} rel={rel:.2e} "
+        f"(num_params train={norms.get('training_num_params')} sample={norms.get('sampling_num_params')})"
+    )
+    return training, sampling
+
+
+def tokenize_prompts(model_name: str, prompts: list[str]) -> list[list[int]]:
+    """Token ids for each prompt (no special tokens), to mirror the ids vLLM fed to ``generate``."""
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    return [tokenizer(prompt, add_special_tokens=False).input_ids for prompt in prompts]
+
+
+def inference_response_logprobs(results: list[dict]) -> tuple[list[list[int]], list[list[float]]]:
+    """From a ``generate(..., {"logprobs": 0})`` response, per row: the generated token ids and the inference
+    engine's logprob of each generated (greedy) token. Robust to JSON-stringified dict keys on the http transport.
+    """
+    gen_token_ids, gen_logprobs = [], []
+    for result in results:
+        ids = list(result["token_ids"])
+        positions = result["logprobs"]
+        assert positions is not None, "generate did not return per-token logprobs (pass {'logprobs': 0})"
+        row = []
+        for tok_id, pos in zip(ids, positions):
+            entry = pos.get(tok_id, pos.get(str(tok_id)))
+            assert entry is not None, f"generated token {tok_id} missing from its logprob dict keys {list(pos)}"
+            row.append(float(entry["logprob"]))
+        gen_token_ids.append(ids)
+        gen_logprobs.append(row)
+    return gen_token_ids, gen_logprobs
+
+
+def build_response_logprob_batch(
+    prompt_token_ids: list[list[int]],
+    gen_token_ids: list[list[int]],
+    prompt_len: int,
+    response_len: int,
+    pad_token_id: int = 0,
+) -> tuple[dict, list[int]]:
+    """Left-pad prompt / right-pad response batch (verl convention) from explicit prompt + generated token ids.
+
+    Feeds ``build_compute_log_prob_payload`` so the training engine recomputes log-probs for the exact tokens the
+    sampler generated. Returns ``(batch, response_lens)``.
+    """
+    seq_len = prompt_len + response_len
+    rows, prompt_rows, masks, response_lens = [], [], [], []
+    for prompt_ids, gen_ids in zip(prompt_token_ids, gen_token_ids):
+        pl, rl = len(prompt_ids), len(gen_ids)
+        assert 0 < pl <= prompt_len, f"prompt of {pl} tokens does not fit prompt_len {prompt_len}"
+        assert 0 < rl <= response_len, f"response of {rl} tokens does not fit response_len {response_len}"
+        left = prompt_len - pl
+        row = torch.full((seq_len,), pad_token_id, dtype=torch.long)
+        row[left:prompt_len] = torch.tensor(prompt_ids, dtype=torch.long)
+        row[prompt_len : prompt_len + rl] = torch.tensor(gen_ids, dtype=torch.long)
+        prompt_row = torch.full((prompt_len,), pad_token_id, dtype=torch.long)
+        prompt_row[left:] = torch.tensor(prompt_ids, dtype=torch.long)
+        mask = torch.zeros(seq_len, dtype=torch.long)
+        mask[left : prompt_len + rl] = 1
+        rows.append(row)
+        prompt_rows.append(prompt_row)
+        masks.append(mask)
+        response_lens.append(rl)
+    batch = dict(input_ids=torch.stack(rows), attention_mask=torch.stack(masks), prompts=torch.stack(prompt_rows))
+    return batch, response_lens
+
+
+def logprob_kl(training_logprobs: torch.Tensor, inference_logprobs: list[list[float]], response_lens: list[int]):
+    """k3 KL estimate (and mean abs diff) between the training and inference engines over the realized response
+    tokens. ``training_logprobs`` is the ``[B, response_len]`` response region; inference is the per-row list of the
+    same greedy tokens' logprobs. The tokens were sampled by the inference engine, so it is the behavior policy; the
+    nonnegative k3 estimator ``E[exp(d) - 1 - d]`` (``d = train - infer``) is ~0 iff the two policies agree, which
+    they must after a weight sync (only vLLM-vs-HF kernel + bf16 differences remain).
+    """
+    deltas = []
+    for row, response_len in enumerate(response_lens):
+        for token in range(response_len):
+            deltas.append(float(training_logprobs[row, token]) - inference_logprobs[row][token])
+    delta = torch.tensor(deltas)
+    kl = torch.mean(torch.exp(delta) - 1.0 - delta).item()
+    mean_abs_diff = delta.abs().mean().item()
+    return kl, mean_abs_diff
+
+
 def build_config(
     comm_protocol: str,
     checkpoint_path: str,
@@ -491,6 +603,10 @@ def build_config(
         vllm_config=vllm_config,
         checkpoint_path=checkpoint_path,
         ray_auto_attach=False,  # force the http server subprocess to start its own cluster
+        # Bound the blocking http /initialize: a healthy init is ~40-150s here, so 240s comfortably clears legit
+        # (even colocate) startup while turning a wedged multi-GPU NCCL rendezvous into a Timeout the session retry
+        # recovers from on fresh ports -- rather than an unbounded hang that only the per-test timeout would catch.
+        job_ready_timeout=240.0,
         **host_port_kwargs,
     )
 

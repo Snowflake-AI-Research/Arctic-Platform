@@ -646,6 +646,33 @@ class SyncWeightsRequest(BaseModel):
     low_memory: bool = False
 
 
+class WeightNormRequest(BaseModel):
+    training_job_id: int
+    sampling_job_id: int
+
+
+@app.post("/weight-norm")
+async def weight_norm(request: WeightNormRequest = Body(...)):
+    """Global L2 weight norm of the training (DeepSpeed) and sampling (vLLM) engines.
+
+    Both are sqrt of the sum of squares over all params -- invariant to each engine's sharding/fusion -- so after a
+    weight sync the two values must match. Used by tests to verify sync correctness.
+    """
+    _verify_job(request.training_job_id, "training")
+    _verify_job(request.sampling_job_id, "sampling")
+    workers = app.state.training_workers
+    pool: ReplicaPool = app.state.sampling_pool
+    loop = asyncio.get_running_loop()
+    training = await loop.run_in_executor(None, ray.get, workers[0].weight_norm.remote())
+    sampling = await pool.compute_weight_norm()
+    return {
+        "training_norm": training["norm"],
+        "sampling_norm": sampling["norm"],
+        "training_num_params": training["num_params"],
+        "sampling_num_params": sampling["num_params"],
+    }
+
+
 @app.post("/sync-weights")
 async def sync_weights(request: SyncWeightsRequest = Body(...)):
     """Sync training model weights to the sampling engine.

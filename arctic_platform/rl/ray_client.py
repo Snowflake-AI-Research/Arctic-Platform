@@ -422,6 +422,16 @@ class ArcticRLRayClient:
         pr0(f"[ArcticRLClient] sync_weights OUTPUT: {response.keys()=}")
         return response
 
+    async def weight_norm(self) -> dict[str, Any]:
+        """Global L2 weight norm of the training and sampling engines.
+
+        Returns ``{"training_norm", "sampling_norm", ...}``. After a weight sync the two norms must match (the metric
+        is invariant to each engine's parameter sharding/fusion). Intended for tests verifying sync correctness.
+        """
+        response = await self._arctic_rl_ray_server.weight_norm(self.training_job_id, self.sampling_job_id)
+        pr0(f"[ArcticRLClient] weight_norm OUTPUT: {response=}")
+        return response
+
     # ------------------------------------------------------------------
     # Log probabilities
     # ------------------------------------------------------------------

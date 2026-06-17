@@ -37,6 +37,7 @@ the deduplicated length). The CPU-only algorithm round-trips live in ``test_dedu
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 from parameterized import parameterized
 from transformers import AutoModelForCausalLM
 
@@ -89,6 +90,13 @@ logits_optimization_modes = [("none",), ("memory",), ("compute",)]
 class TestQwen3ModelOncePatcher(TestCasePlus):
     @classmethod
     def setUpClass(cls):
+        # The "memory" logits-optimization path calls torch.distributed.get_rank(), so it needs a process group --
+        # which the production DeepSpeed worker always has. A full pytest run can reach here after the GPU RL tests
+        # have torn down the session group, so stand up a single-rank one if missing (and restore on teardown).
+        cls._created_process_group = not dist.is_initialized()
+        if cls._created_process_group:
+            dist.init_process_group(backend="gloo", world_size=1, rank=0, store=dist.HashStore())
+
         torch.manual_seed(0)
         cls.batch = create_dummy_batch(
             batch_size=batch_size,
@@ -108,6 +116,11 @@ class TestQwen3ModelOncePatcher(TestCasePlus):
         # with a different logits_optimization just swaps the forward closures, so a single model serves every mode.
         cls.model.eval()
         cls.reference_logprobs = _reference_response_logprobs(cls.model, cls.batch, cls.prompt_lens, cls.response_lens)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._created_process_group and dist.is_initialized():
+            dist.destroy_process_group()
 
     def _patch_and_forward(self, logits_optimization: str, calculate_entropy: bool):
         Qwen3ModelOncePatcher(
