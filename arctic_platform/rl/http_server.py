@@ -102,7 +102,7 @@ class JobConfig(BaseModel):
     ds_worker_config: Optional[dict] = None
     vllm_config: Optional[dict] = None
     checkpoint_path: Optional[str] = None
-    use_arctic_inference: bool = False
+    arctic_inference_config: Optional[dict] = None
     full_determinism: bool = False
     seed: int = 42
 
@@ -118,10 +118,21 @@ class LogProbsRequest(BaseModel):
     top_k: int = 1
 
 
-def _build_model_config(model_name: str, vllm_config: dict | None) -> ModelConfig:
-    """Construct a :class:`ModelConfig` from user-supplied vllm_config dict."""
+def _build_model_config(
+    model_name: str,
+    vllm_config: dict | None,
+    arctic_inference_config: dict | None = None,
+) -> ModelConfig:
+    """Construct a :class:`ModelConfig` from user-supplied vllm_config dict.
+
+    `arctic_inference_config` carries Arctic-platform signals (e.g. use_fca,
+    spec_model) that are not vLLM engine args: they are recorded on the
+    ModelConfig, which expands them into real engine kwargs in
+    `ModelConfig.to_engine_kwargs()`.
+    """
     cfg = dict(vllm_config or {})
     cfg["model"] = model_name
+    cfg.update(arctic_inference_config or {})
     known_fields = set(ModelConfig.model_fields.keys())
     extra = {k: v for k, v in cfg.items() if k not in known_fields}
     base = {k: v for k, v in cfg.items() if k in known_fields}
@@ -226,7 +237,7 @@ async def initialize(job_config: JobConfig = Body(...)):
         vllm_cfg = dict(job_config.vllm_config or {})
         if colocate:
             vllm_cfg["enable_sleep_mode"] = True
-        model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
+        model_cfg = _build_model_config(job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
         tp = model_cfg.tensor_parallel_size
         num_replicas = gpus // tp
         if colocate and placement:
@@ -235,8 +246,8 @@ async def initialize(job_config: JobConfig = Body(...)):
             if tp > 1:
                 extra_env["VLLM_RAY_PER_WORKER_GPUS"] = str(_COLOCATE_GPU_FRACTIONS["sampling"])
                 vllm_cfg["distributed_executor_backend"] = "ray"
-                model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
-            if job_config.use_arctic_inference:
+                model_cfg = _build_model_config(job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
+            if job_config.arctic_inference_config:
                 extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
                 # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
                 # override the global VLLM_DISABLE_COMPILE_CACHE=1 set in the verl runtime_env.
@@ -293,7 +304,7 @@ async def initialize(job_config: JobConfig = Body(...)):
             lp_vllm_cfg = dict(job_config.vllm_config or {})
             if colocate:
                 lp_vllm_cfg["enable_sleep_mode"] = True
-            model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
+            model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
             lp_tp = model_cfg.tensor_parallel_size
             num_replicas = gpus // lp_tp
             if colocate and placement:
@@ -310,8 +321,8 @@ async def initialize(job_config: JobConfig = Body(...)):
                     # need to be set here.
                     lp_extra_env.pop("CUDA_VISIBLE_DEVICES", None)
                     lp_vllm_cfg["distributed_executor_backend"] = "ray"
-                    model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
-                if job_config.use_arctic_inference:
+                    model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
+                if job_config.arctic_inference_config:
                     lp_extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
                     # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
                     # override the global VLLM_DISABLE_COMPILE_CACHE=1 set in the verl runtime_env.
