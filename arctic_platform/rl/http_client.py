@@ -298,9 +298,7 @@ class ArcticRLHTTPClient:
         # /initialize builds the engine synchronously, so a wedged init (e.g. a deadlocked multi-GPU NCCL rendezvous)
         # would otherwise block the client forever. Bound it by job_ready_timeout -- the budget we already allow for a
         # job to become ready -- so the caller gets a Timeout it can retry on instead of an unbounded hang.
-        resp = self._session.post(
-            f"{self._base_url}/initialize", json=payload, timeout=self.config.job_ready_timeout
-        )
+        resp = self._session.post(f"{self._base_url}/initialize", json=payload, timeout=self.config.job_ready_timeout)
         if not resp.ok:
             logger.error(f"Failed to initialize {job_type} job: {resp.status_code} {resp.text}")
             resp.raise_for_status()

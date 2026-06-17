@@ -234,7 +234,7 @@ class TestE2E(TestCasePlus):
                 rel_move,
                 weight_movement_min_rel,
                 f"{tag}: trainer barely moved (rel={rel_move:.2e} <= {weight_movement_min_rel:.0e}); a no-op sync "
-                f"would pass the equal-norms check undetected -- raise the LR / step count",
+                "would pass the equal-norms check undetected -- raise the LR / step count",
             )
 
         gen = await client.generate(gen_prompts, {"temperature": 0.0, "max_tokens": kl_max_tokens, "logprobs": 0})

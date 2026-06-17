@@ -244,7 +244,9 @@ async def initialize(job_config: JobConfig = Body(...)):
         vllm_cfg = dict(job_config.vllm_config or {})
         if colocate:
             vllm_cfg["enable_sleep_mode"] = True
-        model_cfg = _build_model_config(job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
+        model_cfg = _build_model_config(
+            job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+        )
         tp = model_cfg.tensor_parallel_size
         num_replicas = gpus // tp
         if colocate and placement:
@@ -253,7 +255,9 @@ async def initialize(job_config: JobConfig = Body(...)):
             if tp > 1:
                 extra_env["VLLM_RAY_PER_WORKER_GPUS"] = str(_COLOCATE_GPU_FRACTIONS["sampling"])
                 vllm_cfg["distributed_executor_backend"] = "ray"
-                model_cfg = _build_model_config(job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
+                model_cfg = _build_model_config(
+                    job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+                )
             if job_config.arctic_inference_config:
                 extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
                 # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
@@ -311,7 +315,9 @@ async def initialize(job_config: JobConfig = Body(...)):
             lp_vllm_cfg = dict(job_config.vllm_config or {})
             if colocate:
                 lp_vllm_cfg["enable_sleep_mode"] = True
-            model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
+            model_cfg = _build_model_config(
+                job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+            )
             lp_tp = model_cfg.tensor_parallel_size
             num_replicas = gpus // lp_tp
             if colocate and placement:
@@ -328,7 +334,9 @@ async def initialize(job_config: JobConfig = Body(...)):
                     # need to be set here.
                     lp_extra_env.pop("CUDA_VISIBLE_DEVICES", None)
                     lp_vllm_cfg["distributed_executor_backend"] = "ray"
-                    model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
+                    model_cfg = _build_model_config(
+                        job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+                    )
                 if job_config.arctic_inference_config:
                     lp_extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
                     # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
