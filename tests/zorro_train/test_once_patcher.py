@@ -48,6 +48,7 @@ from arctic_platform.rl.zorro_train.tests import create_dummy_batch
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import torch_assert_close
+import itertools
 
 device = "cuda"
 
@@ -94,13 +95,7 @@ model_names = [
 attn_implementations = ["flash_attention_2", "eager"]
 add_padding_modes = [True, False]
 
-model_attn_logits_cases = [
-    (model_name, attn_implementation, add_padding, logits_optimization)
-    for model_name in model_names
-    for attn_implementation in attn_implementations
-    for add_padding in add_padding_modes
-    for (logits_optimization,) in logits_optimization_modes
-]
+model_attn_logits_cases = itertools.product(model_names, attn_implementations, add_padding_modes, logits_optimization_modes)
 
 
 @functools.lru_cache(maxsize=None)
