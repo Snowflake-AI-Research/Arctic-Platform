@@ -236,16 +236,16 @@ python3 -m verl.trainer.main_ppo \
     custom_reward_function.path="${SCRIPT_DIR}/bird_reward.py" \
     custom_reward_function.name=compute_score \
     arctic_rl.colocate=$COLOCATE \
-    arctic_rl.logits_optimization=memory \
+    arctic_rl.train.logits.optimization=memory \
     arctic_rl.sampling_tp_size=$TP_SIZE \
     arctic_rl.training_gpus=$NGPU_PER_JOB \
     arctic_rl.sampling_gpus=$NGPU_FOR_SAMPLING \
     arctic_rl.log_prob_gpus=$NGPU_FOR_LOG_PROBS \
-    arctic_rl.zorro_train.enable=$USE_ARCTIC_ZORRO \
-    arctic_rl.zorro_train.max_rollouts=$ROLL_N \
-    arctic_rl.use_autocast=$ARCTIC_AUTOCAST \
+    arctic_rl.train.zorro_train.enable=$USE_ARCTIC_ZORRO \
+    arctic_rl.train.zorro_train.max_rollouts=$ROLL_N \
+    arctic_rl.train.deepspeed.torch_autocast.enabled=$ARCTIC_AUTOCAST \
     arctic_rl.cuda_ipc_weight_sync=$CUDA_IPC_WEIGHT_SYNC \
-    arctic_rl.zero_optimization.stage=$ARCTIC_ZERO_STAGE \
-    arctic_rl.zero_optimization.offload_optimizer.device=cpu \
-    arctic_rl.zero_optimization.offload_param.device=none \
+    arctic_rl.train.deepspeed.zero_optimization.stage=$ARCTIC_ZERO_STAGE \
+    arctic_rl.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \
+    arctic_rl.train.deepspeed.zero_optimization.offload_param.device=none \
     "$@" 2>&1 | tee "${LOG_FILE}"

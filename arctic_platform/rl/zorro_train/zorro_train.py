@@ -2404,3 +2404,61 @@ class ZoRRoTrain:
         reconstructed_seq = torch.cat(all_tensors, dim=0).unsqueeze(0)
 
         return reconstructed_seq
+
+    @staticmethod
+    def _segment_valid_tokens(segment: Dict) -> int:
+        return int(segment.get("num_valid_tokens", segment["end"] - segment["start"]))
+
+    @staticmethod
+    def get_group_token_layout(reconstruction_info: Dict) -> List[Dict]:
+        """Return token layout in deduplicated order for each prompt group."""
+        prompt_groups = reconstruction_info["prompt_groups"]
+        segment_info = reconstruction_info["segment_info"]
+        segment_map = {(seg["group_idx"], seg["type"], seg["original_idx"]): seg for seg in segment_info}
+
+        layout = []
+        for group_idx, group in enumerate(prompt_groups):
+            first_sample = group[0]
+            prompt_seg = segment_map[(group_idx, "prompt", first_sample)]
+            prompt_tokens = ZoRRoTrain._segment_valid_tokens(prompt_seg)
+            response_tokens = []
+            for sample_idx in group:
+                response_seg = segment_map[(group_idx, "response", sample_idx)]
+                response_tokens.append(ZoRRoTrain._segment_valid_tokens(response_seg))
+            layout.append(
+                {
+                    "group_idx": group_idx,
+                    "sample_indices": list(group),
+                    "prompt_tokens": prompt_tokens,
+                    "response_tokens": response_tokens,
+                }
+            )
+        return layout
+
+    @staticmethod
+    def split_deduplicated_hidden_by_group(dedup_hidden: torch.Tensor, reconstruction_info: Dict) -> List[Dict]:
+        """Split ``[1, dedup_tokens, ...]`` tensors into per-group prompt/response views."""
+        if dedup_hidden.dim() < 2 or dedup_hidden.shape[0] != 1:
+            raise ValueError(f"Expected dedup_hidden shape [1, tokens, ...], got {tuple(dedup_hidden.shape)}")
+        layout = ZoRRoTrain.get_group_token_layout(reconstruction_info)
+        cursor = 0
+        groups = []
+        for group in layout:
+            prompt_len = group["prompt_tokens"]
+            prompt_hidden = dedup_hidden[:, cursor : cursor + prompt_len, ...]
+            cursor += prompt_len
+            response_hiddens = []
+            for response_len in group["response_tokens"]:
+                response_hiddens.append(dedup_hidden[:, cursor : cursor + response_len, ...])
+                cursor += response_len
+            groups.append(
+                {
+                    "group_idx": group["group_idx"],
+                    "sample_indices": group["sample_indices"],
+                    "prompt_hidden": prompt_hidden,
+                    "response_hiddens": response_hiddens,
+                }
+            )
+        if cursor != dedup_hidden.shape[1]:
+            raise AssertionError(f"Group split consumed {cursor} tokens, expected {dedup_hidden.shape[1]}")
+        return groups

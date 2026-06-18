@@ -26,7 +26,6 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import os
 import pathlib
@@ -94,7 +93,7 @@ class JobConfig(BaseModel):
     ds_worker_config: Optional[dict] = None
     vllm_config: Optional[dict] = None
     checkpoint_path: Optional[str] = None
-    use_arctic_inference: bool = False
+    arctic_inference_config: Optional[dict] = None
     full_determinism: bool = False
     seed: int = 42
 
@@ -118,10 +117,23 @@ class SyncWeightsRequest(BaseModel):
     low_memory: bool = False
 
 
-def _build_model_config(model_name: str, vllm_config: dict | None) -> ModelConfig:
-    """Construct a :class:`ModelConfig` from user-supplied vllm_config dict."""
+def _build_model_config(
+    model_name: str,
+    vllm_config: dict | None,
+    arctic_inference_config: dict | None = None,
+) -> ModelConfig:
+    """Construct a :class:`ModelConfig` from user-supplied vllm_config dict.
+
+    `arctic_inference_config` carries Arctic-platform signals (e.g. use_fca,
+    spec_model) that are not vLLM engine args: they are recorded on the
+    ModelConfig, which expands them into real engine kwargs in
+    `ModelConfig.to_engine_kwargs()`.
+    """
+
     cfg = dict(vllm_config or {})
     cfg["model"] = model_name
+    cfg.update(arctic_inference_config or {})
+
     known_fields = set(ModelConfig.model_fields.keys())
     extra = {k: v for k, v in cfg.items() if k not in known_fields}
     base = {k: v for k, v in cfg.items() if k in known_fields}
@@ -130,7 +142,10 @@ def _build_model_config(model_name: str, vllm_config: dict | None) -> ModelConfi
     return ModelConfig(**base)
 
 
-_WEIGHT_SYNC_BASE_PORT = 29600
+# Honor ARL_WEIGHT_SYNC_PORT when set so back-to-back / concurrent training jobs on one host (e.g. repeated
+# pytest-flakefinder iterations or parallel xdist workers) get a fresh NCCL rendezvous port instead of all reusing
+# 29600, where a SIGKILL-reaped sender from a prior job can still squat the port and deadlock the next sync.
+_WEIGHT_SYNC_BASE_PORT = int(os.environ.get("ARL_WEIGHT_SYNC_PORT", 29600))
 _WEIGHT_SYNC_BUCKET_SIZE = 256 * 1024 * 1024
 
 
@@ -170,7 +185,12 @@ class ArcticRLRayServerState(ArcticRLServerState):
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
         pr0("[ArcticRLRayServer] initializing ray cluster")
-        init_ray_cluster(auto_attach=False)
+        # This server-state object runs as a Ray actor *inside* the cluster the
+        # driver already created, so it must attach to that cluster (auto_attach
+        # resolves to its own cluster), not start a fresh head. (Previously this
+        # passed auto_attach=False but the flag was ignored by a hardcoded branch
+        # in init_ray_cluster, so the effective behavior was always to attach.)
+        init_ray_cluster(auto_attach=True)
         pr0("[ArcticRLRayServer] ray cluster initialized")
 
         self.training_gpus = training_gpus
@@ -253,7 +273,11 @@ class ArcticRLRayServerState(ArcticRLServerState):
         colocate = self.colocate
         results = {}
         pool: ReplicaPool = self.sampling_pool
-        offload_weights = colocate
+        # Let vLLM's CuMemAllocator free the weights (offload_weights=False)
+        # instead of the legacy manual offload, which reallocated param.data on
+        # each wake and changed weight addresses -> stale rollout CUDA graphs
+        # (compile on) -> grad-norm explosion. cumem keeps addresses stable.
+        offload_weights = False
         results["sampling"] = await pool.sleep(level=level, offload_weights=offload_weights)
         lp_pool: ReplicaPool | None = self.log_prob_pool
         if lp_pool is not None and lp_pool._config is not None and not lp_pool.sleeping:
@@ -349,8 +373,11 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 raise ValueError("No training GPUs configured")
             if self.training_workers:
                 raise ValueError("Training job already running")
-            # TODO: should be configurable
-            master_port = 29500
+            # Honor MASTER_PORT when set so concurrent training jobs on one host
+            # (e.g. parallel pytest-xdist workers, each with its own cluster) don't
+            # collide on the rendezvous port. All ranks of THIS job are handed the
+            # same value below, so multi-node rendezvous is unaffected.
+            master_port = int(os.environ.get("MASTER_PORT", 29500))
             workers = []
             config_dict = job_config.model_dump()
             for rank in range(gpus):
@@ -374,7 +401,9 @@ class ArcticRLRayServerState(ArcticRLServerState):
             vllm_cfg = dict(job_config.vllm_config or {})
             if colocate:
                 vllm_cfg["enable_sleep_mode"] = True
-            model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
+            model_cfg = _build_model_config(
+                job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+            )
             tp = model_cfg.tensor_parallel_size
             num_replicas = gpus // tp
             if colocate and placement:
@@ -383,8 +412,10 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 if tp > 1:
                     extra_env["VLLM_RAY_PER_WORKER_GPUS"] = str(_COLOCATE_GPU_FRACTIONS["sampling"])
                     vllm_cfg["distributed_executor_backend"] = "ray"
-                    model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
-                if job_config.use_arctic_inference:
+                    model_cfg = _build_model_config(
+                        job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+                    )
+                if job_config.arctic_inference_config:
                     extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
                     # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
                     # override the global VLLM_DISABLE_COMPILE_CACHE=1 set in the verl runtime_env.
@@ -418,6 +449,11 @@ class ArcticRLRayServerState(ArcticRLServerState):
             if job_config.ds_config is not None:
                 if self.log_prob_workers:
                     raise ValueError("Log-prob job already running")
+                # Honor MASTER_PORT when set (mirrors the training branch above) so concurrent log-prob jobs on one
+                # host -- e.g. parallel pytest-xdist workers, each with its own cluster -- don't collide on the
+                # hardcoded rendezvous port. All ranks of THIS job are handed the same value, so multi-rank
+                # rendezvous is unaffected.
+                master_port = int(os.environ.get("MASTER_PORT", 29501))
                 workers = []
                 config_dict = job_config.model_dump()
                 for rank in range(gpus):
@@ -425,7 +461,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
                         opts = _pg_options(bundle_index=lp_bundle_offset + rank, fraction_key="log_prob")
                     else:
                         opts = dict(num_gpus=1)
-                    w = DeepSpeedWorker.options(**opts).remote(rank, gpus, 29501)
+                    w = DeepSpeedWorker.options(**opts).remote(rank, gpus, master_port)
                     workers.append(w)
                 master_addr = await workers[0].get_ip.remote()
                 await asyncio.gather(*[w.initialize.remote(master_addr, config_dict) for w in workers])
@@ -443,7 +479,9 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 lp_vllm_cfg = dict(job_config.vllm_config or {})
                 if colocate:
                     lp_vllm_cfg["enable_sleep_mode"] = True
-                model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
+                model_cfg = _build_model_config(
+                    job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+                )
                 lp_tp = model_cfg.tensor_parallel_size
                 num_replicas = gpus // lp_tp
                 if colocate and placement:
@@ -460,8 +498,12 @@ class ArcticRLRayServerState(ArcticRLServerState):
                         # need to be set here.
                         lp_extra_env.pop("CUDA_VISIBLE_DEVICES", None)
                         lp_vllm_cfg["distributed_executor_backend"] = "ray"
-                        model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
-                    if job_config.use_arctic_inference:
+                        model_cfg = _build_model_config(
+                            job_config.model_name,
+                            lp_vllm_cfg,
+                            arctic_inference_config=job_config.arctic_inference_config,
+                        )
+                    if job_config.arctic_inference_config:
                         lp_extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
                         # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
                         # override the global VLLM_DISABLE_COMPILE_CACHE=1 set in the verl runtime_env.
@@ -686,7 +728,7 @@ class ArcticRLRayServer:
     #         vllm_cfg = dict(job_config.vllm_config or {})
     #         if colocate:
     #             vllm_cfg["enable_sleep_mode"] = True
-    #         model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
+    #         model_cfg = _build_model_config(job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
     #         tp = model_cfg.tensor_parallel_size
     #         num_replicas = gpus // tp
     #         if colocate and pg is not None:
@@ -695,7 +737,7 @@ class ArcticRLRayServer:
     #             if tp > 1:
     #                 extra_env["VLLM_RAY_PER_WORKER_GPUS"] = str(_COLOCATE_GPU_FRACTIONS["sampling"])
     #                 vllm_cfg["distributed_executor_backend"] = "ray"
-    #                 model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
+    #                 model_cfg = _build_model_config(job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
     #             await pool.initialize(
     #                 model_cfg,
     #                 num_replicas=num_replicas,
@@ -738,7 +780,7 @@ class ArcticRLRayServer:
     #             lp_vllm_cfg = dict(job_config.vllm_config or {})
     #             if colocate:
     #                 lp_vllm_cfg["enable_sleep_mode"] = True
-    #             model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
+    #             model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
     #             lp_tp = model_cfg.tensor_parallel_size
     #             num_replicas = gpus // lp_tp
     #             if colocate and pg is not None:
@@ -750,7 +792,7 @@ class ArcticRLRayServer:
     #                     lp_extra_env["VLLM_RAY_BUNDLE_INDICES"] = ",".join(str(b) for b in lp_bundles[:lp_tp])
     #                     lp_extra_env.pop("CUDA_VISIBLE_DEVICES", None)
     #                     lp_vllm_cfg["distributed_executor_backend"] = "ray"
-    #                     model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
+    #                     model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
     #                 await pool.initialize(
     #                     model_cfg,
     #                     num_replicas=num_replicas,
@@ -910,7 +952,7 @@ class ArcticRLRayServer:
         """Release ZeRO partition cache and PyTorch cached memory on all workers."""
         self._verify_job(job_id, "training")
         workers = self.training_workers
-        results = await self.arctic_rl_ray_server_state.empty_training_cache.remote(workers)
+        results = await self.arctic_rl_ray_server_state._empty_training_cache.remote(workers)
         logger.info("Empty training cache: %s", results)
         return {"job_id": job_id, "workers": results}
 
@@ -1119,6 +1161,27 @@ class ArcticRLRayServer:
         # await asyncio.gather(receive_task, *send_tasks)
         # logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
         # return {"status": "ok"}
+
+    async def weight_norm(self, training_job_id: int, sampling_job_id: int) -> dict[str, Any]:
+        """Global L2 weight norm of the training (DeepSpeed) and sampling (vLLM) engines.
+
+        Both are computed as sqrt of the sum of squares over all params, which is invariant to how each engine shards
+        / fuses its parameters -- so after a weight sync the two values must match. Used by tests to verify sync
+        correctness.
+        """
+        self._verify_job(training_job_id, "training")
+        self._verify_job(sampling_job_id, "sampling")
+        loop = asyncio.get_running_loop()
+        training = await loop.run_in_executor(None, ray.get, self.training_workers[0].weight_norm.remote())
+        sampling = await loop.run_in_executor(
+            None, ray.get, self.sampling_pool._workers[0].compute_weight_norm.remote()
+        )
+        return {
+            "training_norm": training["norm"],
+            "sampling_norm": sampling["norm"],
+            "training_num_params": training["num_params"],
+            "sampling_num_params": sampling["num_params"],
+        }
 
     async def _sync_weights_cuda_ipc(self, workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None) -> dict:
         """Colocated weight sync via CUDA IPC (zero-copy, same GPU).
@@ -1372,15 +1435,14 @@ class ArcticRLRayServer:
         if info.get("engine") == "deepspeed":
             tokenizer = self.log_prob_tokenizer
             encoded = tokenizer(full_texts, return_tensors="pt", padding=True)
-            batch_buf = io.BytesIO()
-            torch.save(dict(encoded), batch_buf)
-            batch_data = batch_buf.getvalue()
-
             workers = self.log_prob_workers
-            shards, _ = ray_split_batch(batch_data, len(workers))
+            # Wrap the encoded batch as the {"batch","meta","processing"} payload unpack_batch expects (the same
+            # shape fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no
+            # ZoRRO/position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
+            wrapper = dict(batch=dict(encoded), meta={}, processing={})
+            shards, _ = ray_split_batch(wrapper, len(workers))
             raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
-            shard_tensors = [torch.load(io.BytesIO(r), map_location="cpu") for r in raw]
-            results = torch.cat(shard_tensors, dim=0)
+            results = torch.cat([r.cpu() for r in raw], dim=0)
         else:
             pool: ReplicaPool = self.log_prob_pool
             results = await pool.generate(

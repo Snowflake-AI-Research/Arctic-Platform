@@ -463,7 +463,7 @@ def create_prompt_groups(input_ids, response_length, max_token_len, max_group_le
                 f"""
                 {max_token_len=} is smaller than {max_token_len_effective}.
                 Where max_token_len_effective = {prompt_len=} + {response_length=} * {max_group_length_threshold=}.
-                You can either raise actor_rollout_ref.actor.ppo_max_token_len_per_gpu to a higher value or reduce the number of rollouts (`actor_rollout_ref.rollout.n`) or to split the prompt groups by setting `arctic_rl.zorro_train.max_rollouts` to a smaller value than `actor_rollout_ref.rollout.n`, so that the math above checks out.
+                You can either raise actor_rollout_ref.actor.ppo_max_token_len_per_gpu to a higher value or reduce the number of rollouts (`actor_rollout_ref.rollout.n`) or to split the prompt groups by setting `arctic_rl.train.zorro_train.max_rollouts` to a smaller value than `actor_rollout_ref.rollout.n`, so that the math above checks out.
                 Reducing prompt and/or response sizes is another way if it doesn't break the training needs."""
             )
 

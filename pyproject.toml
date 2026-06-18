@@ -52,7 +52,7 @@ requires-python = ">=3.10"
 # Dependencies for the project
 dependencies = [
     "datasets",
-    "deepspeed>=0.19.0",  # z2 fixes
+    "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
     "devtools",
     "jsonlines",
     "loguru",
@@ -64,7 +64,8 @@ dependencies = [
     "tabulate",
     "torch",
     "tqdm",
-    "transformers>=4.56,<5.0.0", # torch_dtype deprecation, 5.0 is unstable at the moment
+    "transformers>=4.57.0,<5",
+#    "transformers>=5.5", # want to switch to v5 but vllm18 blocks us at v4
     "wandb",
     "yq",
 ]
@@ -83,10 +84,13 @@ dev = [
 ]
 
 testing = [
-    "pytest",
-    "pytest-instafail",
     "parameterized",
+    "pytest-instafail",
+    "pytest-flakefinder",
+    "pytest-sugar",
+    "pytest-timeout",
     "pytest-xdist",
+    "pytest",
 ]
 
 formatting = [
@@ -101,4 +105,22 @@ rl = [
     "tensordict",
     "uvicorn",
     "vllm==0.18.0",
+]
+
+[tool.pytest.ini_options]
+# Only auto-collect the maintained suite.
+testpaths = ["tests"]
+
+# Per-test wall-clock cap
+timeout = 300
+
+# Cooperative whole-suite cap (pytest-timeout): checked between tests, so it bounds total wall-clock for a normal
+# run. Disable it for intentionally long runs that exceed it, e.g. flakefinder: `pytest --session-timeout=0 ...`.
+session_timeout = 3600
+
+timeout_method = "signal"
+
+markers = [
+    "vllm: marks a GPU test that drives the vLLM sampling engine; it cannot run concurrently with other GPU tests, so it is pinned to a single xdist worker via xdist_group. Exclude it from a parallel pool with '-m \"not vllm\"' and run it on its own.",
+    "gpu_serial: marks a heavyweight GPU test whose body must hold the host-wide GPU lock (serialized across xdist workers by the _serialize_gpu_work autouse fixture).",
 ]

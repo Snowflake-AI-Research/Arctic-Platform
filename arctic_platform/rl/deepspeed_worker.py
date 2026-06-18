@@ -25,7 +25,6 @@ Usage::
 
 from __future__ import annotations
 
-import io
 import logging
 import numbers
 import os
@@ -118,6 +117,22 @@ class DeepSpeedWorker:
 
         if job_config.get("full_determinism", False):
             enable_full_determinism(seed=job_config.get("seed", 42))
+
+        # aws-ofi-nccl generates a per-process topology and hands it to NCCL by setting NCCL_TOPO_FILE to a
+        # /proc/self/fd/<N> path (an in-memory fd). That handle is only valid in the process that created it: once
+        # inherited by a child, fd <N> resolves to an unrelated file, and because the plugin skips regenerating when
+        # NCCL_TOPO_FILE is already set, NCCL loads a bogus topology and the multi-rank rendezvous deadlocks. This
+        # worker has not run OFI yet, so any value present here is necessarily inherited and stale -- drop it.
+        #
+        # Dropping it does NOT cost performance: the plugin sets NCCL_TOPO_FILE only as an in-process mechanism to
+        # pass its generated topology to NCCL, and it regenerates that topology during OFI init whenever the var is
+        # unset. So popping the stale handle simply makes the plugin produce a fresh, correct, platform-optimal
+        # topology for this process -- exactly what happens on a clean first init -- instead of reusing a poisoned
+        # one. The narrow /proc/self/fd/ check also leaves an admin-provided static topology path untouched.
+        topo_file = os.environ.get("NCCL_TOPO_FILE", "")
+        if topo_file.startswith("/proc/self/fd/"):
+            logger.warning(f"dropping inherited stale NCCL_TOPO_FILE={topo_file}; OFI will regenerate per-process")
+            os.environ.pop("NCCL_TOPO_FILE", None)
 
         deepspeed.init_distributed()
 
@@ -220,33 +235,56 @@ class DeepSpeedWorker:
         training_config = job_config.get("training_config")
         if training_config is not None:
             opt_cfg = training_config.get("optimizer", {})
-            ds_config.setdefault(
-                "optimizer",
-                {
-                    "type": "AdamW",
-                    "params": {
-                        "lr": opt_cfg.get("lr", 1e-5),
-                        "betas": [opt_cfg.get("beta1", 0.9), opt_cfg.get("beta2", 0.999)],
-                        "eps": 1e-8,
-                        "weight_decay": opt_cfg.get("weight_decay", 0.0),
-                    },
+            betas = opt_cfg.get("betas")
+            if betas is None:
+                betas = [opt_cfg.get("beta1", 0.9), opt_cfg.get("beta2", 0.999)]
+            ds_config["optimizer"] = {
+                "type": "AdamW",
+                "params": {
+                    "lr": opt_cfg.get("lr", 1e-5),
+                    "betas": list(betas),
+                    "eps": opt_cfg.get("eps", 1e-8),
+                    "weight_decay": opt_cfg.get("weight_decay", 0.0),
                 },
-            )
+            }
             if "gradient_accumulation_steps" in training_config:
-                ds_config.setdefault("gradient_accumulation_steps", training_config["gradient_accumulation_steps"])
+                ds_config["gradient_accumulation_steps"] = training_config["gradient_accumulation_steps"]
             if "gradient_clipping" in opt_cfg:
-                ds_config.setdefault("gradient_clipping", opt_cfg["gradient_clipping"])
+                ds_config["gradient_clipping"] = opt_cfg["gradient_clipping"]
 
+            sched_cfg = training_config.get("lr_scheduler", None)
+            horizon = training_config.get("training_horizon", 0)
+            if sched_cfg is not None and horizon > 0:
+                lr = opt_cfg.get("lr", 1e-5)
+                warmup_steps = sched_cfg.get("warmup_ratio", 0.0) * horizon
+                if sched_cfg.get("type", "constant") == "cosine":
+                    ds_config["scheduler"] = {
+                        "type": "WarmupCosineLR",
+                        "params": {
+                            "total_num_steps": horizon,
+                            "warmup_num_steps": warmup_steps,
+                            "warmup_min_ratio": 0.0,
+                            "cos_min_ratio": sched_cfg.get("min_lr_ratio") or 0.0,
+                            "warmup_type": "linear",
+                        },
+                    }
+                elif warmup_steps > 0:
+                    ds_config["scheduler"] = {
+                        "type": "WarmupLR",
+                        "params": {
+                            "warmup_min_lr": 0.0,
+                            "warmup_max_lr": lr,
+                            "warmup_num_steps": warmup_steps,
+                            "warmup_type": "linear",
+                        },
+                    }
+                else:
+                    # No LR scheduler, use constant LR
+                    pass
+
+        # Set reasonable defaults as fallbacks
         ds_config.setdefault("train_micro_batch_size_per_gpu", 1)
-
-        if ds_worker_config.get("use_autocast", False):
-            ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
-            ds_config.setdefault(
-                "bf16", {"enabled": True, "bf16_master_weights_and_grads": True, "bf16_optimizer_states": True}
-            )
-        else:
-            ds_config.setdefault("bf16", {"enabled": True})
-
+        ds_config.setdefault("bf16", {"enabled": True})
         ds_config.setdefault(
             "optimizer",
             {
@@ -254,6 +292,10 @@ class DeepSpeedWorker:
                 "params": {"lr": 1e-5, "betas": [0.9, 0.999], "eps": 1e-8},
             },
         )
+        ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
+        ds_config.setdefault("communication_data_type", "fp32")
+        ds_config.setdefault("data_types", {"grad_accum_dtype": "fp32"})
+
         return ds_config
 
     def ds_inference_config(self, log_prob_config: dict, ds_worker_config: dict) -> dict:
@@ -463,17 +505,21 @@ class DeepSpeedWorker:
         self.engine.save_checkpoint(path)
         return True
 
-    def compute_log_probs(self, batch_bytes: bytes) -> bytes:
-        batch = torch.load(io.BytesIO(batch_bytes), map_location=self._device)
-        args, kwargs, _, _ = unpack_batch(batch)
+    def compute_log_probs(self, batch: dict) -> torch.Tensor:
+        """Full-sequence per-token log-probs for a ``{"batch","meta","processing"}`` DP shard.
+
+        Takes a dict shard (like ``forward_no_grad``) -- ``unpack_batch`` pulls the encoded ``{input_ids,
+        attention_mask}`` out of ``batch["batch"]`` -- runs a forward-only pass, and returns the shifted-label
+        per-token log-probs ``[shard_B, S-1]`` on CPU. The DeepSpeed engine ignores ``top_k`` (unlike the vLLM path).
+        """
+        _, kwargs, _, _ = unpack_batch(batch)
+        kwargs = {k: v.to(self._device) if torch.is_tensor(v) else v for k, v in kwargs.items()}
         with torch.no_grad():
-            logits = self.engine(*args, **kwargs).logits
+            logits = self.engine(**kwargs).logits
         log_probs = torch.log_softmax(logits, dim=-1)
         shifted_ids = kwargs["input_ids"][:, 1:]
         token_log_probs = log_probs[:, :-1].gather(-1, shifted_ids.unsqueeze(-1)).squeeze(-1)
-        buf = io.BytesIO()
-        torch.save(token_log_probs.cpu(), buf)
-        return buf.getvalue()
+        return token_log_probs.cpu()
 
     def max_param_bytes(self) -> int:
         max_bytes = 0
@@ -503,6 +549,27 @@ class DeepSpeedWorker:
             else:
                 weights.append((n, p.data))
         return weights
+
+    def weight_norm(self) -> dict:
+        """Global L2 norm of the model's parameters (sum of squares + count).
+
+        ZeRO-3 partitions each param across ranks, so ``GatheredParameters``
+        materializes the full param on every rank; the resulting sum of
+        squares is therefore the whole-model value (the server reads rank 0).
+        Summing squares is layout-invariant, so it compares directly against
+        the vLLM engine's norm despite vLLM fusing params differently. Used by
+        tests to confirm a weight sync landed.
+        """
+        sq_sum = 0.0
+        num_params = 0
+        for _, p in self.engine.module.named_parameters():
+            if hasattr(p, "ds_id"):
+                with deepspeed.zero.GatheredParameters([p], enabled=True):
+                    sq_sum += p.data.double().pow(2).sum().item()
+            else:
+                sq_sum += p.data.double().pow(2).sum().item()
+            num_params += 1
+        return {"norm": sq_sum**0.5, "sq_sum": sq_sum, "num_params": num_params}
 
     def send_weights(self) -> dict:
         weights = self.get_weights()

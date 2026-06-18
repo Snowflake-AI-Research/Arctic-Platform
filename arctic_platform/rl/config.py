@@ -54,9 +54,13 @@ class ArcticRLClientConfig(BaseModel):
     ds_worker_config: Optional[dict] = Field(
         default=None, description="Deepspeed worker config dict (optimizer, dtype, etc.)."
     )
-    use_arctic_inference: bool = Field(
-        default=False,
-        description="If True, set ARCTIC_INFERENCE_ENABLED=1 and override VLLM_DISABLE_COMPILE_CACHE=0.",
+    arctic_inference_config: Optional[dict] = Field(
+        default=None,
+        description=(
+            "Arctic inference signals (e.g. use_fca, spec_model). A non-empty value enables "
+            "Arctic inference (ARCTIC_INFERENCE_ENABLED=1) and is expanded into vLLM engine kwargs "
+            "server-side by ModelConfig.to_engine_kwargs(); None/empty means Arctic inference is off."
+        ),
     )
     full_determinism: bool = Field(
         default=False,
@@ -126,9 +130,12 @@ class ArcticRLClientConfig(BaseModel):
     def _validate_local_gpu_counts(self) -> "ArcticRLClientConfig":
         if self.backend != "local" or self.training_job_id is not None:
             return self  # skip validation in reconnect mode
-        for field in ("training_gpus", "sampling_gpus"):
-            if getattr(self, field) <= 0:
-                raise ValueError(f"Local backend requires {field} > 0.")
+        # Any individual engine may be 0 (e.g. a sampling-only generate test or a
+        # training-only forward test); require only that at least one job exists.
+        if self.training_gpus + self.sampling_gpus + self.log_prob_gpus <= 0:
+            raise ValueError(
+                "Local backend requires at least one of training_gpus / sampling_gpus / log_prob_gpus > 0."
+            )
         return self
 
 

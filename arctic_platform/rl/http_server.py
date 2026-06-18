@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import io
 import logging
+import os
 import pathlib
 import sys
 import time
@@ -102,7 +103,7 @@ class JobConfig(BaseModel):
     ds_worker_config: Optional[dict] = None
     vllm_config: Optional[dict] = None
     checkpoint_path: Optional[str] = None
-    use_arctic_inference: bool = False
+    arctic_inference_config: Optional[dict] = None
     full_determinism: bool = False
     seed: int = 42
 
@@ -118,10 +119,21 @@ class LogProbsRequest(BaseModel):
     top_k: int = 1
 
 
-def _build_model_config(model_name: str, vllm_config: dict | None) -> ModelConfig:
-    """Construct a :class:`ModelConfig` from user-supplied vllm_config dict."""
+def _build_model_config(
+    model_name: str,
+    vllm_config: dict | None,
+    arctic_inference_config: dict | None = None,
+) -> ModelConfig:
+    """Construct a :class:`ModelConfig` from user-supplied vllm_config dict.
+
+    `arctic_inference_config` carries Arctic-platform signals (e.g. use_fca,
+    spec_model) that are not vLLM engine args: they are recorded on the
+    ModelConfig, which expands them into real engine kwargs in
+    `ModelConfig.to_engine_kwargs()`.
+    """
     cfg = dict(vllm_config or {})
     cfg["model"] = model_name
+    cfg.update(arctic_inference_config or {})
     known_fields = set(ModelConfig.model_fields.keys())
     extra = {k: v for k, v in cfg.items() if k not in known_fields}
     base = {k: v for k, v in cfg.items() if k in known_fields}
@@ -130,7 +142,10 @@ def _build_model_config(model_name: str, vllm_config: dict | None) -> ModelConfi
     return ModelConfig(**base)
 
 
-_WEIGHT_SYNC_BASE_PORT = 29600
+# Honor ARL_WEIGHT_SYNC_PORT when set so back-to-back / concurrent training jobs on one host (e.g. repeated
+# pytest-flakefinder iterations or parallel xdist workers) get a fresh NCCL rendezvous port instead of all reusing
+# 29600, where a SIGKILL-reaped sender from a prior job can still squat the port and deadlock the next sync.
+_WEIGHT_SYNC_BASE_PORT = int(os.environ.get("ARL_WEIGHT_SYNC_PORT", 29600))
 _WEIGHT_SYNC_BUCKET_SIZE = 256 * 1024 * 1024
 
 
@@ -199,12 +214,15 @@ async def initialize(job_config: JobConfig = Body(...)):
 
         workers = []
         config_dict = job_config.model_dump()
+        # Honor MASTER_PORT when set so concurrent training jobs on one host (e.g.
+        # parallel pytest-xdist workers) don't collide on the rendezvous port.
+        master_port = int(os.environ.get("MASTER_PORT", 29500))
         for rank in range(gpus):
             if colocate and placement:
                 opts = _pg_options(bundle_index=rank, fraction_key="training")
             else:
                 opts = dict(num_gpus=1)
-            w = DeepSpeedWorker.options(**opts).remote(rank, gpus, 29500)
+            w = DeepSpeedWorker.options(**opts).remote(rank, gpus, master_port)
             workers.append(w)
 
         # Use rank 0's host as the distributed rendezvous master. Passing None
@@ -226,7 +244,9 @@ async def initialize(job_config: JobConfig = Body(...)):
         vllm_cfg = dict(job_config.vllm_config or {})
         if colocate:
             vllm_cfg["enable_sleep_mode"] = True
-        model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
+        model_cfg = _build_model_config(
+            job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+        )
         tp = model_cfg.tensor_parallel_size
         num_replicas = gpus // tp
         if colocate and placement:
@@ -235,8 +255,10 @@ async def initialize(job_config: JobConfig = Body(...)):
             if tp > 1:
                 extra_env["VLLM_RAY_PER_WORKER_GPUS"] = str(_COLOCATE_GPU_FRACTIONS["sampling"])
                 vllm_cfg["distributed_executor_backend"] = "ray"
-                model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
-            if job_config.use_arctic_inference:
+                model_cfg = _build_model_config(
+                    job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+                )
+            if job_config.arctic_inference_config:
                 extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
                 # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
                 # override the global VLLM_DISABLE_COMPILE_CACHE=1 set in the verl runtime_env.
@@ -293,7 +315,9 @@ async def initialize(job_config: JobConfig = Body(...)):
             lp_vllm_cfg = dict(job_config.vllm_config or {})
             if colocate:
                 lp_vllm_cfg["enable_sleep_mode"] = True
-            model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
+            model_cfg = _build_model_config(
+                job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+            )
             lp_tp = model_cfg.tensor_parallel_size
             num_replicas = gpus // lp_tp
             if colocate and placement:
@@ -310,8 +334,10 @@ async def initialize(job_config: JobConfig = Body(...)):
                     # need to be set here.
                     lp_extra_env.pop("CUDA_VISIBLE_DEVICES", None)
                     lp_vllm_cfg["distributed_executor_backend"] = "ray"
-                    model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
-                if job_config.use_arctic_inference:
+                    model_cfg = _build_model_config(
+                        job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+                    )
+                if job_config.arctic_inference_config:
                     lp_extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
                     # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
                     # override the global VLLM_DISABLE_COMPILE_CACHE=1 set in the verl runtime_env.
@@ -511,10 +537,15 @@ async def sleep_inference(job_id: int, level: int):
     colocate = app.state.colocate
     results = {}
     pool: ReplicaPool = app.state.sampling_pool
-    results["sampling"] = await pool.sleep(level=level, offload_weights=colocate)
+    # Let vLLM's CuMemAllocator free the weights (offload_weights=False) instead
+    # of the legacy manual offload, which reallocated param.data on each wake and
+    # changed weight addresses -> stale rollout CUDA graphs (compile on) ->
+    # grad-norm explosion. cumem keeps addresses stable.
+    offload_weights = False
+    results["sampling"] = await pool.sleep(level=level, offload_weights=offload_weights)
     lp_pool: ReplicaPool | None = app.state.log_prob_pool
     if lp_pool is not None and lp_pool._config is not None and not lp_pool.sleeping:
-        results["log_prob"] = await lp_pool.sleep(level=level, offload_weights=colocate)
+        results["log_prob"] = await lp_pool.sleep(level=level, offload_weights=offload_weights)
     if colocate:
         await pool.close_weight_sync()
         if lp_pool is not None and lp_pool._config is not None:
@@ -632,6 +663,33 @@ class SyncWeightsRequest(BaseModel):
     colocate: bool = False
     cuda_ipc: bool = False
     low_memory: bool = False
+
+
+class WeightNormRequest(BaseModel):
+    training_job_id: int
+    sampling_job_id: int
+
+
+@app.post("/weight-norm")
+async def weight_norm(request: WeightNormRequest = Body(...)):
+    """Global L2 weight norm of the training (DeepSpeed) and sampling (vLLM) engines.
+
+    Both are sqrt of the sum of squares over all params -- invariant to each engine's sharding/fusion -- so after a
+    weight sync the two values must match. Used by tests to verify sync correctness.
+    """
+    _verify_job(request.training_job_id, "training")
+    _verify_job(request.sampling_job_id, "sampling")
+    workers = app.state.training_workers
+    pool: ReplicaPool = app.state.sampling_pool
+    loop = asyncio.get_running_loop()
+    training = await loop.run_in_executor(None, ray.get, workers[0].weight_norm.remote())
+    sampling = await pool.compute_weight_norm()
+    return {
+        "training_norm": training["norm"],
+        "sampling_norm": sampling["norm"],
+        "training_num_params": training["num_params"],
+        "sampling_num_params": sampling["num_params"],
+    }
 
 
 @app.post("/sync-weights")
@@ -969,15 +1027,15 @@ async def log_probs(job_id: int, request: LogProbsRequest = Body(...)):
     if info.get("engine") == "deepspeed":
         tokenizer = app.state.log_prob_tokenizer
         encoded = tokenizer(full_texts, return_tensors="pt", padding=True)
-        batch_buf = io.BytesIO()
-        torch.save(dict(encoded), batch_buf)
-        batch_data = batch_buf.getvalue()
-
         workers = app.state.log_prob_workers
-        shards = http_split_batch(batch_data, len(workers))
+        # Wrap the encoded batch as the {"batch","meta","processing"} payload unpack_batch expects (the same shape
+        # fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no ZoRRO/
+        # position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
+        batch_buf = io.BytesIO()
+        torch.save(dict(batch=dict(encoded), meta={}, processing={}), batch_buf)
+        shards, _ = http_split_batch(batch_buf.getvalue(), len(workers))
         raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
-        shard_tensors = [torch.load(io.BytesIO(r), map_location="cpu") for r in raw]
-        results = torch.cat(shard_tensors, dim=0)
+        results = torch.cat([r.cpu() for r in raw], dim=0)
     else:
         pool: ReplicaPool = app.state.log_prob_pool
         results = await pool.generate(
