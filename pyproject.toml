@@ -52,23 +52,21 @@ requires-python = ">=3.10"
 # Dependencies for the project
 dependencies = [
     "datasets",
-    "deepspeed>=0.18.2",  # UlyssesSPAttentionHF.register_with_transformers api change
+    "deepspeed>=0.19.0",  # z2 fixes
     "devtools",
     "jsonlines",
     "loguru",
+    "nvidia-ml-py",
     "openai>=1.48.0",
     "peft",
     "psutil",
     "pydantic>=2.10",
-    "nvidia-ml-py",
-    "ray",
     "tabulate",
     "torch",
     "tqdm",
     "transformers>=4.56,<5.0.0", # torch_dtype deprecation, 5.0 is unstable at the moment
     "wandb",
     "yq",
-    "uvicorn",
 ]
 
 # Optional development dependencies
@@ -76,7 +74,7 @@ dependencies = [
 all = [
     "arctic_platform[dev]",
     "arctic_platform[testing]",
-    "arctic_platform[vllm]",
+    "arctic_platform[rl]",
 ]
 
 dev = [
@@ -96,12 +94,11 @@ formatting = [
     "autoflake",
 ]
 
-docs = [
-]
 
-snowflake = [
-]
-
-vllm = [
+rl = [
+    "liger-kernel>=0.8.0",
+    "ray",
+    "tensordict",
+    "uvicorn",
     "vllm==0.18.0",
 ]
