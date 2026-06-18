@@ -55,7 +55,12 @@ jobs:
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install ".[testing]"
           # XXX: temporary install of ArcticInference from github - update to PyPI once the new version is available
-          uv pip install --no-build-isolation git+https://github.com/snowflakedb/ArcticInference@arctic_rl/integration
+          # ArcticInference builds a native nanobind extension via CMake. actions/setup-python exports
+          # Python(3)_ROOT_DIR/pythonLocation pointing at the tool-cache interpreter (no nanobind); CMake's
+          # find_package(Python) honors those hints and fails to find nanobind. Unset them so CMake uses uv's
+          # build-env interpreter, which has nanobind from ArcticInference's build-system.requires.
+          env -u Python_ROOT_DIR -u Python2_ROOT_DIR -u Python3_ROOT_DIR -u pythonLocation \
+            uv pip install git+https://github.com/snowflakedb/ArcticInference@arctic_rl/integration
       - name: Environment print
         run: |
           uv pip list
