@@ -5,6 +5,7 @@
   <img src="docs/images/arctic_platform_logo.svg" width=500px><br>
 </h3>
 
+
 # Arctic Platform: Simplifying and Accelerating Post-Training for LLMs
 
 Arctic Platform is a framework for addressing challenges in current frameworks, such as limited support for rapid prototyping and the lack of native data generation tools, by offering modularity across training and inference components, simplified code structures, and integrated pipelines for creating and cleaning synthetic data. These features enable users to enhance LLM capabilities, like code generation and complex reasoning, with greater efficiency and flexibility.
