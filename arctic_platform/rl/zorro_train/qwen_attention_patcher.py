@@ -19,7 +19,6 @@ Qwen-specific attention patcher with QKV optimization.
 This module implements optimized attention patching for Qwen2/Qwen3 models.
 """
 
-import inspect
 import sys
 
 import torch
@@ -125,9 +124,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             and hasattr(module, "layer_idx")
         ):
             return False
-        qwen35_scheme = all(
-            hasattr(module, name) for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
-        )
+        qwen35_scheme = all(hasattr(module, name) for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"))
         qwen3_next_scheme = (
             hasattr(module, "in_proj_qkvz")
             and hasattr(module, "in_proj_ba")
@@ -623,9 +620,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 seq_idx=None,
             )
         else:
-            mixed_qkv_conv = F.silu(
-                module.conv1d(mixed_qkv_with_prefix)[:, :, : mixed_qkv_with_prefix.shape[-1]]
-            )
+            mixed_qkv_conv = F.silu(module.conv1d(mixed_qkv_with_prefix)[:, :, : mixed_qkv_with_prefix.shape[-1]])
 
         mixed_qkv_conv = mixed_qkv_conv[:, :, conv_prefix.shape[-1] : conv_prefix.shape[-1] + seq_len]
         mixed_qkv_conv = mixed_qkv_conv.transpose(1, 2)
@@ -742,7 +737,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 )
 
             if not reconstruction_info.get("is_unpadded", False) or hidden_states.shape[0] != 1:
-                full_hidden = PromptDeduplicator.reconstruct_sequences(hidden_states, reconstruction_info)
+                full_hidden = ZoRRoTrain.reconstruct_sequences(hidden_states, reconstruction_info)
                 full_out = original_forward(
                     full_hidden,
                     cache_params=None,
@@ -752,10 +747,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 )
                 return ZoRRoTrain.deduplicate_sequences(full_out, reconstruction_info)
 
-            return self._run_linear_prompt_reuse_on_dedup(
-                module=module,
-                dedup_hidden=hidden_states
-            )
+            return self._run_linear_prompt_reuse_on_dedup(module=module, dedup_hidden=hidden_states)
 
         return patched_forward_linear
 

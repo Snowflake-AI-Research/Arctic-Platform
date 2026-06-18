@@ -125,23 +125,31 @@ def _update_linear_attn_mask(module, attention_mask, past_key_values, cache_posi
     return update_fn(attention_mask, cache_position)
 
 
-def _build_mask_kwargs(create_mask_fn, config, inputs_embeds, attention_mask, cache_position, past_key_values, position_ids):
-    """Build kwargs for ``create_causal_mask`` / ``create_sliding_window_causal_mask`` using the embeds keyword the
-    ``inputs_embeds`` on recent versions, ``input_embeds`` on transformers <= 4.57."""
+def _build_mask_kwargs(
+    create_mask_fn, config, inputs_embeds, attention_mask, cache_position, past_key_values, position_ids
+):
+    """Build kwargs for ``create_causal_mask`` / ``create_sliding_window_causal_mask``, tolerating signature drift
+    across transformers versions: the embeds keyword is ``inputs_embeds`` on recent versions and ``input_embeds`` on
+    <= 4.57, and ``cache_position`` was dropped in transformers 5.x. Pass only the arguments the installed function
+    actually accepts (unless it takes ``**kwargs``, in which case pass them all)."""
+    try:
+        params = inspect.signature(create_mask_fn).parameters
+        accepts_var_kw = any(p.kind == p.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        params, accepts_var_kw = {}, True  # can't introspect (e.g. C builtin) -> stay permissive
+
+    embeds_key = "input_embeds" if ("input_embeds" in params and "inputs_embeds" not in params) else "inputs_embeds"
     mask_kwargs = {
         "config": config,
         "attention_mask": attention_mask,
         "cache_position": cache_position,
         "past_key_values": past_key_values,
         "position_ids": position_ids,
+        embeds_key: inputs_embeds,
     }
-    try:
-        params = inspect.signature(create_mask_fn).parameters
-        embeds_key = "input_embeds" if ("input_embeds" in params and "inputs_embeds" not in params) else "inputs_embeds"
-    except (TypeError, ValueError):
-        embeds_key = "inputs_embeds"
-    mask_kwargs[embeds_key] = inputs_embeds
-    return mask_kwargs
+    if accepts_var_kw:
+        return mask_kwargs
+    return {key: value for key, value in mask_kwargs.items() if key in params}
 
 
 try:
@@ -324,9 +332,9 @@ class Qwen3ModelOncePatcher:
                 # 2. patch the causal_lm module
                 module.forward = self._create_patched_causal_lm_forward(module, name)
 
-        assert self.is_model_patched, (
-            f"Deduplication is not supported without patching the model for {type(self.model).__name__}"
-        )
+        assert (
+            self.is_model_patched
+        ), f"Deduplication is not supported without patching the model for {type(self.model).__name__}"
 
         # 3. patch the attention layers
         self.attention_patcher = QwenAttentionOncePatcher(
