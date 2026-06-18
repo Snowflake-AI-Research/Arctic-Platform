@@ -19,6 +19,7 @@ Qwen-specific attention patcher with QKV optimization.
 This module implements optimized attention patching for Qwen2/Qwen3 models.
 """
 
+import inspect
 import sys
 
 import torch
@@ -42,12 +43,23 @@ cos_dedup = None
 sin_dedup = None
 group_sizes = None
 
+GATED_DELTA_CHUNK_SIZE = 64
+
 
 def reset_debug_object():
     debug_object["baseline"] = None
     debug_object["patched"] = None
     debug_object["baseline_counter"] = 0
     debug_object["patched_counter"] = 0
+
+
+def _resolve_attention_interface(all_attention_functions, attn_implementation, eager_attention_forward):
+    """Resolve attention backend for dict-style and transformers 5 AttentionInterface APIs."""
+    if hasattr(all_attention_functions, "get_interface"):
+        return all_attention_functions.get_interface(attn_implementation, eager_attention_forward)
+    if attn_implementation != "eager":
+        return all_attention_functions[attn_implementation]
+    return eager_attention_forward
 
 
 class QwenAttentionPatcher(ModuleReconstructionPatcher):
@@ -72,6 +84,56 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
         """
         self.use_split_attention = use_split_attention
         super().__init__(model, reconstruction_info, patch_with_local=patch_with_local)
+
+    @staticmethod
+    def _project_qkv_with_optional_gate(module, hidden_states, input_shape, hidden_shape):
+        """
+        Qwen3.5 full-attention projects Q with an extra gate branch:
+        q_proj -> [query, gate]. Qwen3 uses a plain q_proj.
+        """
+        q_proj_output = module.q_proj(hidden_states)
+        expected_q_dim = getattr(getattr(module, "config", None), "num_attention_heads", None)
+        if expected_q_dim is not None:
+            expected_q_dim = expected_q_dim * module.head_dim
+
+        gate = None
+        if expected_q_dim is not None and q_proj_output.shape[-1] == expected_q_dim * 2:
+            q_proj_output = q_proj_output.view(*input_shape, -1, module.head_dim * 2)
+            q_proj_output, gate = torch.chunk(q_proj_output, 2, dim=-1)
+            gate = gate.reshape(*input_shape, -1)
+            q_proj_output = q_proj_output.view(hidden_shape)
+        else:
+            q_proj_output = q_proj_output.view(hidden_shape)
+
+        query_states = module.q_norm(q_proj_output)
+        key_states = module.k_norm(module.k_proj(hidden_states).view(hidden_shape))
+        value_states = module.v_proj(hidden_states).view(hidden_shape)
+        return query_states, key_states, value_states, gate
+
+    @staticmethod
+    def _apply_optional_gate(attn_output, gate):
+        if gate is None:
+            return attn_output
+        return attn_output * torch.sigmoid(gate)
+
+    @staticmethod
+    def _is_linear_attn_module(module):
+        if not (
+            hasattr(module, "out_proj")
+            and hasattr(module, "conv1d")
+            and hasattr(module, "chunk_gated_delta_rule")
+            and hasattr(module, "layer_idx")
+        ):
+            return False
+        qwen35_scheme = all(
+            hasattr(module, name) for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+        )
+        qwen3_next_scheme = (
+            hasattr(module, "in_proj_qkvz")
+            and hasattr(module, "in_proj_ba")
+            and hasattr(module, "fix_query_key_value_ordering")
+        )
+        return qwen35_scheme or qwen3_next_scheme
 
     @staticmethod
     def _should_patch_module_forward(name, module):
@@ -99,6 +161,9 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 and hasattr(module, "o_proj")
             ):
                 return True
+
+        if name_parts[-1] == "linear_attn":
+            return QwenAttentionPatcher._is_linear_attn_module(module)
 
         return False
 
@@ -328,9 +393,16 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             prompt_to_prompt_mask = reconstruction_info["prompt_to_prompt_mask"]
             response_to_full_mask = reconstruction_info["response_to_full_mask"]
 
-            # Use explicit masks
+            # Use explicit masks. The extracted masks are 2D ``[q, k]`` additive float masks. Newer transformers'
+            # ``eager_attention_forward`` adds the mask directly (``attn_weights + mask``) so a 2D mask broadcasts,
+            # but transformers <= 4.57 indexes it as ``attention_mask[:, :, :, :k]`` and requires 4D. Expand to
+            # ``[1, 1, q, k]`` so the eager path works on both (4D broadcasts over batch/heads either way).
             prompt_mask = prompt_to_prompt_mask
             response_mask = response_to_full_mask
+            if prompt_mask is not None and prompt_mask.dim() == 2:
+                prompt_mask = prompt_mask[None, None, :, :]
+            if response_mask is not None and response_mask.dim() == 2:
+                response_mask = response_mask[None, None, :, :]
             prompt_kwargs = kwargs
             response_kwargs = kwargs
 
@@ -393,6 +465,8 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
         return torch.cat([o[1][:, : o[2], :] for o in outputs], dim=1)
 
     def _create_unpatched_forward_local(self, module, module_name):
+        if self._is_linear_attn_module(module):
+            return self.original_forwards[module_name]
 
         def unpatched_forward(
             hidden_states,
@@ -413,15 +487,12 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, module.head_dim)
 
-            # Compute projections
-            q_proj_output = module.q_proj(hidden_states).view(hidden_shape)
-            k_proj_output = module.k_proj(hidden_states).view(hidden_shape)
-            v_proj_output = module.v_proj(hidden_states).view(hidden_shape)
-
-            # Apply normalization
-            query_states = module.q_norm(q_proj_output).transpose(1, 2)
-            key_states = module.k_norm(k_proj_output).transpose(1, 2)
-            value_states = v_proj_output.transpose(1, 2)
+            query_states, key_states, value_states, gate = self._project_qkv_with_optional_gate(
+                module, hidden_states, input_shape, hidden_shape
+            )
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
 
             cos, sin = position_embeddings
 
@@ -440,9 +511,11 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                     key_states, value_states, module.layer_idx, cache_kwargs
                 )
 
-            attention_interface = eager_attention_forward
-            if module.config._attn_implementation != "eager":
-                attention_interface = all_attention_functions[module.config._attn_implementation]
+            attention_interface = _resolve_attention_interface(
+                all_attention_functions,
+                module.config._attn_implementation,
+                eager_attention_forward,
+            )
 
             attn_output, attn_weights = attention_interface(
                 module,
@@ -452,7 +525,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 attention_mask,
                 dropout=0.0 if not module.training else module.attention_dropout,
                 scaling=module.scaling,
-                sliding_window=module.sliding_window,  # diff with Llama
+                sliding_window=getattr(module, "sliding_window", None),
                 **kwargs,
             )
 
@@ -468,7 +541,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 debug_object["baseline"]["attention_mask"] = attention_mask
 
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-
+            attn_output = self._apply_optional_gate(attn_output, gate)
             attn_output = module.o_proj(attn_output)
             if debug_object["baseline_counter"] == debug_object["capture_at_invocation"]:
                 debug_object["baseline"]["o_proj_output"] = attn_output
@@ -483,11 +556,208 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
         Create optimized forward for Qwen attention.
         Dispatches to either standard or split attention based on use_split_attention flag.
         """
+        if self._is_linear_attn_module(module):
+            return self._create_patched_forward_linear_attention(module, module_name)
+
         if self.use_split_attention:
             layer_id = int(module_name.split("layers.")[-1].split(".")[0])
             return self._create_patched_forward_split_attention(module, module_name, layer_id)
         else:
             return self._create_patched_forward_standard(module, module_name)
+
+    @staticmethod
+    def _linear_project_pre_conv(module, hidden_states):
+        """Project ``hidden_states`` into the pre-convolution ``(mixed_qkv, z, b, a)`` tensors, handling both the
+        Qwen3.5 (separate ``in_proj_qkv/z/b/a``) and Qwen3-Next (fused ``in_proj_qkvz`` + ``in_proj_ba``) layouts. The
+        downstream gated-delta-rule path is identical for both, so only this projection step needs to branch.
+
+        Returns ``mixed_qkv`` shaped ``[batch, conv_dim, seq]`` (transposed for the depthwise conv), ``z`` shaped
+        ``[batch, seq, num_v_heads, head_v_dim]`` and ``b`` / ``a`` shaped ``[batch, seq, num_v_heads]``.
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        if hasattr(module, "in_proj_qkvz"):
+            projected_qkvz = module.in_proj_qkvz(hidden_states)
+            projected_ba = module.in_proj_ba(hidden_states)
+            query, key, value, z, b, a = module.fix_query_key_value_ordering(projected_qkvz, projected_ba)
+            query, key, value = (x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value))
+            mixed_qkv = torch.cat((query, key, value), dim=-1).transpose(1, 2)
+            return mixed_qkv, z, b, a
+
+        mixed_qkv = module.in_proj_qkv(hidden_states).transpose(1, 2)
+        z = module.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, module.head_v_dim)
+        b = module.in_proj_b(hidden_states)
+        a = module.in_proj_a(hidden_states)
+        return mixed_qkv, z, b, a
+
+    def _linear_forward_recurrent(
+        self,
+        module,
+        hidden_states,
+        prompt_conv_state=None,
+        prompt_recurrent_state=None,
+        return_final_state=False,
+    ):
+        batch_size, seq_len, _ = hidden_states.shape
+        if seq_len == 0:
+            empty = hidden_states[:, :0, :]
+            if return_final_state:
+                return empty, prompt_conv_state, prompt_recurrent_state
+            return empty
+
+        mixed_qkv, z, b, a = self._linear_project_pre_conv(module, hidden_states)
+
+        kernel_size = module.conv_kernel_size
+        if prompt_conv_state is not None and kernel_size > 1:
+            conv_prefix = prompt_conv_state[:, :, -(kernel_size - 1) :]
+        else:
+            conv_prefix = mixed_qkv[:, :, :0]
+
+        mixed_qkv_with_prefix = torch.cat([conv_prefix, mixed_qkv], dim=-1)
+
+        if module.causal_conv1d_fn is not None:
+            mixed_qkv_conv = module.causal_conv1d_fn(
+                x=mixed_qkv_with_prefix,
+                weight=module.conv1d.weight.squeeze(1),
+                bias=module.conv1d.bias,
+                activation=module.activation,
+                seq_idx=None,
+            )
+        else:
+            mixed_qkv_conv = F.silu(
+                module.conv1d(mixed_qkv_with_prefix)[:, :, : mixed_qkv_with_prefix.shape[-1]]
+            )
+
+        mixed_qkv_conv = mixed_qkv_conv[:, :, conv_prefix.shape[-1] : conv_prefix.shape[-1] + seq_len]
+        mixed_qkv_conv = mixed_qkv_conv.transpose(1, 2)
+        query, key, value = torch.split(
+            mixed_qkv_conv,
+            [module.key_dim, module.key_dim, module.value_dim],
+            dim=-1,
+        )
+        query = query.reshape(batch_size, seq_len, -1, module.head_k_dim)
+        key = key.reshape(batch_size, seq_len, -1, module.head_k_dim)
+        value = value.reshape(batch_size, seq_len, -1, module.head_v_dim)
+
+        beta = b.sigmoid()
+        g = -module.A_log.float().exp() * F.softplus(a.float() + module.dt_bias)
+        if module.num_v_heads // module.num_k_heads > 1:
+            factor = module.num_v_heads // module.num_k_heads
+            query = query.repeat_interleave(factor, dim=2)
+            key = key.repeat_interleave(factor, dim=2)
+
+        core_attn_out, last_recurrent_state = module.chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=prompt_recurrent_state,
+            output_final_state=return_final_state,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        core_attn_out = core_attn_out.reshape(-1, module.head_v_dim)
+        z = z.reshape(-1, module.head_v_dim)
+        core_attn_out = module.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+        output = module.out_proj(core_attn_out)
+
+        if not return_final_state:
+            return output
+
+        conv_state = F.pad(mixed_qkv, (kernel_size - mixed_qkv.shape[-1], 0))
+        return output, conv_state, last_recurrent_state
+
+    def _run_linear_prompt_reuse_on_dedup(self, module, dedup_hidden):
+        grouped_hidden = ZoRRoTrain.split_deduplicated_hidden_by_group(dedup_hidden, self.reconstruction_info)
+        chunk_size = GATED_DELTA_CHUNK_SIZE
+        group_outputs = []
+
+        for group in grouped_hidden:
+            prompt_hidden = group["prompt_hidden"]
+            response_hiddens = group["response_hiddens"]
+
+            prompt_len = prompt_hidden.shape[1]
+            prompt_prefix_len = (prompt_len // chunk_size) * chunk_size
+            prompt_prefix_hidden = prompt_hidden[:, :prompt_prefix_len, :]
+            prompt_suffix_hidden = prompt_hidden[:, prompt_prefix_len:, :]
+            prompt_suffix_len = prompt_len - prompt_prefix_len
+
+            prompt_prefix_output, carry_conv_state, carry_recurrent_state = self._linear_forward_recurrent(
+                module=module,
+                hidden_states=prompt_prefix_hidden,
+                prompt_conv_state=None,
+                prompt_recurrent_state=None,
+                return_final_state=True,
+            )
+
+            prompt_suffix_output = None
+            response_outputs = []
+            for response_hidden in response_hiddens:
+                # Re-prepend the prompt suffix so the response is chunked exactly as in a one-shot run.
+                combined_hidden = torch.cat([prompt_suffix_hidden, response_hidden], dim=1)
+                combined_output = self._linear_forward_recurrent(
+                    module=module,
+                    hidden_states=combined_hidden,
+                    prompt_conv_state=carry_conv_state,
+                    prompt_recurrent_state=carry_recurrent_state,
+                    return_final_state=False,
+                )
+                if prompt_suffix_output is None:
+                    prompt_suffix_output = combined_output[:, :prompt_suffix_len, :]
+                response_outputs.append(combined_output[:, prompt_suffix_len:, :])
+
+            if prompt_suffix_output is None:
+                # No responses in this group: still need the prompt suffix output to reconstruct the prompt region.
+                prompt_suffix_output = self._linear_forward_recurrent(
+                    module=module,
+                    hidden_states=prompt_suffix_hidden,
+                    prompt_conv_state=carry_conv_state,
+                    prompt_recurrent_state=carry_recurrent_state,
+                    return_final_state=False,
+                )
+
+            group_outputs.append(torch.cat([prompt_prefix_output, prompt_suffix_output] + response_outputs, dim=1))
+
+        return torch.cat(group_outputs, dim=1)
+
+    def _create_patched_forward_linear_attention(self, module, module_name):
+        reconstruction_info = self.reconstruction_info
+        original_forward = self.original_forwards[module_name]
+
+        def patched_forward_linear(
+            hidden_states,
+            cache_params=None,
+            cache_position=None,
+            attention_mask=None,
+            **kwargs,
+        ):
+            if cache_params is not None:
+                return original_forward(
+                    hidden_states,
+                    cache_params=cache_params,
+                    cache_position=cache_position,
+                    attention_mask=attention_mask,
+                    **kwargs,
+                )
+
+            if not reconstruction_info.get("is_unpadded", False) or hidden_states.shape[0] != 1:
+                full_hidden = PromptDeduplicator.reconstruct_sequences(hidden_states, reconstruction_info)
+                full_out = original_forward(
+                    full_hidden,
+                    cache_params=None,
+                    cache_position=None,
+                    attention_mask=attention_mask,
+                    **kwargs,
+                )
+                return ZoRRoTrain.deduplicate_sequences(full_out, reconstruction_info)
+
+            return self._run_linear_prompt_reuse_on_dedup(
+                module=module,
+                dedup_hidden=hidden_states
+            )
+
+        return patched_forward_linear
 
     def _create_patched_forward_standard(self, module, module_name):
         """
@@ -518,21 +788,9 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, module.head_dim)
 
-            # 1. Compute Q, K, V on deduplicated batch
-            # First project
-            q_proj_output_dedup = module.q_proj(hidden_states).view(hidden_shape)
-            k_proj_output_dedup = module.k_proj(hidden_states).view(hidden_shape)
-            v_proj_output_dedup = module.v_proj(hidden_states).view(hidden_shape)
-
-            # Then normalize
-            query_dedup = module.q_norm(q_proj_output_dedup)
-            key_dedup = module.k_norm(k_proj_output_dedup)
-            value_dedup = v_proj_output_dedup
-
-            # 2. Reconstruct Q, K, V individually to full batch
-            query_states = ZoRRoTrain.reconstruct_sequences(query_dedup, reconstruction_info).transpose(1, 2)
-            key_states = ZoRRoTrain.reconstruct_sequences(key_dedup, reconstruction_info).transpose(1, 2)
-            value_states = ZoRRoTrain.reconstruct_sequences(value_dedup, reconstruction_info).transpose(1, 2)
+            query_dedup, key_dedup, value_dedup, gate_dedup = self._project_qkv_with_optional_gate(
+                module, hidden_states, input_shape, hidden_shape
+            )
 
             cos, sin = position_embeddings
 
@@ -544,7 +802,22 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 )
                 debug_object["patched"]["position_embeddings"] = (cos, sin)
 
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            if reconstruction_info.get("is_unpadded", False):
+                query_dedup_t = query_dedup.transpose(1, 2)
+                key_dedup_t = key_dedup.transpose(1, 2)
+                query_dedup_t, key_dedup_t = apply_rotary_pos_emb(query_dedup_t, key_dedup_t, cos, sin)
+                query_states = ZoRRoTrain.reconstruct_sequences(
+                    query_dedup_t.transpose(1, 2), reconstruction_info
+                ).transpose(1, 2)
+                key_states = ZoRRoTrain.reconstruct_sequences(
+                    key_dedup_t.transpose(1, 2), reconstruction_info
+                ).transpose(1, 2)
+                value_states = ZoRRoTrain.reconstruct_sequences(value_dedup, reconstruction_info).transpose(1, 2)
+            else:
+                query_states = ZoRRoTrain.reconstruct_sequences(query_dedup, reconstruction_info).transpose(1, 2)
+                key_states = ZoRRoTrain.reconstruct_sequences(key_dedup, reconstruction_info).transpose(1, 2)
+                value_states = ZoRRoTrain.reconstruct_sequences(value_dedup, reconstruction_info).transpose(1, 2)
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
             if past_key_value is not None:
                 # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -553,9 +826,11 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                     key_states, value_states, module.layer_idx, cache_kwargs
                 )
 
-            attention_interface = eager_attention_forward
-            if module.config._attn_implementation != "eager":
-                attention_interface = all_attention_functions[module.config._attn_implementation]
+            attention_interface = _resolve_attention_interface(
+                all_attention_functions,
+                module.config._attn_implementation,
+                eager_attention_forward,
+            )
 
             attn_output, attn_weights = attention_interface(
                 module,
@@ -565,7 +840,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 attention_mask,
                 dropout=0.0 if not module.training else module.attention_dropout,
                 scaling=module.scaling,
-                sliding_window=module.sliding_window,  # diff with Llama
+                sliding_window=getattr(module, "sliding_window", None),
                 **kwargs,
             )
 
@@ -583,6 +858,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
 
             # 5. Deduplicate output
             attn_output_dedup = ZoRRoTrain.deduplicate_sequences(attn_output, reconstruction_info)
+            attn_output_dedup = self._apply_optional_gate(attn_output_dedup, gate_dedup)
 
             o_proj_dedup = module.o_proj(attn_output_dedup)
             if debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
@@ -635,16 +911,9 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, module.head_dim)
 
-            # Step 1: Compute Q, K, V on deduplicated batch
-            # First project
-            q_proj_output_dedup = module.q_proj(hidden_states).view(hidden_shape)
-            k_proj_output_dedup = module.k_proj(hidden_states).view(hidden_shape)
-            v_proj_output_dedup = module.v_proj(hidden_states).view(hidden_shape)
-
-            # Then normalize
-            query_dedup = module.q_norm(q_proj_output_dedup)
-            key_dedup = module.k_norm(k_proj_output_dedup)
-            value_dedup = v_proj_output_dedup
+            query_dedup, key_dedup, value_dedup, gate_dedup = self._project_qkv_with_optional_gate(
+                module, hidden_states, input_shape, hidden_shape
+            )
 
             # Step 2: Reconstruct Q, K, V to full batch
             query_states = ZoRRoTrain.reconstruct_sequences(query_dedup, reconstruction_info).transpose(1, 2)
@@ -673,10 +942,11 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             # batch_size = query_states.shape[0]
             # num_heads = query_states.shape[1]
 
-            # Get attention interface
-            attention_interface = eager_attention_forward
-            if module.config._attn_implementation != "eager":
-                attention_interface = all_attention_functions[module.config._attn_implementation]
+            attention_interface = _resolve_attention_interface(
+                all_attention_functions,
+                module.config._attn_implementation,
+                eager_attention_forward,
+            )
 
             # Extract unique prompts and compute prompt-to-prompt attention
             prompt_q = ZoRRoTrain.extract_and_deduplicate_prompts(query_states, reconstruction_info)
@@ -689,7 +959,12 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             # Extract attention masks for unique prompts (first sample in each group)
             if attention_mask is not None:
                 unique_prompt_indices = [group[0] for group in prompt_groups]
-                prompt_mask = attention_mask[unique_prompt_indices, :, :prompt_len, :prompt_len]
+                if attention_mask.ndim == 4:
+                    prompt_mask = attention_mask[unique_prompt_indices, :, :prompt_len, :prompt_len]
+                elif attention_mask.ndim == 2:
+                    prompt_mask = attention_mask[unique_prompt_indices, :prompt_len]
+                else:
+                    raise NotImplementedError
             else:
                 prompt_mask = None
 
@@ -702,14 +977,21 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 prompt_mask,  # Use prompt-only block diagonal mask
                 dropout=0.0 if not module.training else module.attention_dropout,
                 scaling=module.scaling,
-                sliding_window=module.sliding_window,
+                sliding_window=getattr(module, "sliding_window", None),
                 **kwargs,
             )
             # prompt_outputs: [num_unique_prompts, prompt_len, num_heads, head_dim]
 
             # Extract response queries for response-to-full attention
             response_q = ZoRRoTrain.extract_response_queries(query_states, reconstruction_info)
-            response_mask = attention_mask[:, :, prompt_len:, :] if attention_mask is not None else None
+            if attention_mask is None:
+                response_mask = None
+            elif attention_mask.ndim == 4:
+                response_mask = attention_mask[:, :, prompt_len:, :]
+            elif attention_mask.ndim == 2:
+                response_mask = attention_mask
+            else:
+                raise NotImplementedError
 
             # Compute response-to-(prompt+response) attention (single batched call)
             response_outputs, _ = attention_interface(
@@ -720,7 +1002,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 response_mask,  # Use response-to-full mask
                 dropout=0.0 if not module.training else module.attention_dropout,
                 scaling=module.scaling,
-                sliding_window=module.sliding_window,
+                sliding_window=getattr(module, "sliding_window", None),
                 **kwargs,
             )
             # response_outputs: [batch_size, response_len, num_heads, head_dim]
@@ -750,6 +1032,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             attn_output = attn_output.reshape(original_batch_size, seq_len, -1).contiguous()
             # Step 6: Deduplicate
             attn_output_dedup = ZoRRoTrain.deduplicate_sequences(attn_output, reconstruction_info)
+            attn_output_dedup = self._apply_optional_gate(attn_output_dedup, gate_dedup)
 
             # Apply output projection
             o_proj_dedup = module.o_proj(attn_output_dedup)
@@ -858,14 +1141,15 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             apply_rotary_pos_emb = getattr(src_mod, "apply_rotary_pos_emb")
             eager_attention_forward = getattr(src_mod, "eager_attention_forward")
             all_attention_functions = getattr(src_mod, "ALL_ATTENTION_FUNCTIONS", {})
+            if module.config._attn_implementation == "flash_attention_2":
+                use_cumsum_mask = True
 
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, module.head_dim)
 
-            # Step 1: Compute Q, K, V on deduplicated batch
-            query_dedup = module.q_norm(module.q_proj(hidden_states).view(hidden_shape))
-            key_dedup = module.k_norm(module.k_proj(hidden_states).view(hidden_shape))
-            value_dedup = module.v_proj(hidden_states).view(hidden_shape)
+            query_dedup, key_dedup, value_dedup, gate_dedup = self._project_qkv_with_optional_gate(
+                module, hidden_states, input_shape, hidden_shape
+            )
 
             cos, sin = position_embeddings
             cu_seqlens_response = ZoRRoTrain._extract_cu_seqlens(reconstruction_info, hidden_states.device)
@@ -886,10 +1170,11 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 query_dedup.transpose(1, 2), key_dedup.transpose(1, 2), cos_dedup, sin_dedup, unsqueeze_dim=1
             )
 
-            # Get attention interface
-            attention_interface = eager_attention_forward
-            if module.config._attn_implementation != "eager":
-                attention_interface = all_attention_functions[module.config._attn_implementation]
+            attention_interface = _resolve_attention_interface(
+                all_attention_functions,
+                module.config._attn_implementation,
+                eager_attention_forward,
+            )
 
             # Extract unique prompts and compute prompt-to-prompt attention
             prompt_q = ZoRRoTrain._get_sequences_packed_from_dedup_tensor(qs, reconstruction_info, cu_seqlens_response)
@@ -926,7 +1211,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 attention_mask=prompt_mask,
                 dropout=0.0 if not module.training else module.attention_dropout,
                 scaling=module.scaling,
-                sliding_window=module.sliding_window,
+                sliding_window=getattr(module, "sliding_window", None),
                 **prompt_kwargs,
             )
 
@@ -946,7 +1231,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 attention_mask=response_mask,
                 dropout=0.0 if not module.training else module.attention_dropout,
                 scaling=module.scaling,
-                sliding_window=module.sliding_window,
+                sliding_window=getattr(module, "sliding_window", None),
                 **response_kwargs,
             )
             attn_output_dedup = ZoRRoTrain._replicate_and_concat_prompt_responses(
@@ -969,6 +1254,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             total_valid_tokens = attn_output_dedup.shape[1]  # Actual number of valid tokens
 
             attn_output_dedup = attn_output_dedup.reshape(batch_size_packed, total_valid_tokens, -1).contiguous()
+            attn_output_dedup = self._apply_optional_gate(attn_output_dedup, gate_dedup)
             # Apply output projection
             o_proj_dedup = module.o_proj(attn_output_dedup)
 
@@ -992,23 +1278,20 @@ class QwenAttentionOncePatcher(QwenAttentionPatcher):
         """
         self.model = model
         self.reconstruction_info = reconstruction_info
+        self.original_forwards = {}
+        self.patch_with_local = patch_with_local
         self.use_split_attention = use_split_attention
 
         """Patch all module forward methods."""
         for name, module in self.model.named_modules():
             if self._should_patch_module_forward(name, module):
-                # Create patched forward that optimizes QKV
-                module.forward = self._create_patched_forward(module, name)
-
-                # # Store original forward
-                # self.original_forwards[name] = module.forward
-
-                # if self.patch_with_local:
-                #     assert self._create_unpatched_forward_local is not None, "Subclass must implement _create_unpatched_forward_local"
-                #     module.forward = self._create_unpatched_forward_local(module, name)
-                # else:
-                #     # Create patched forward that optimizes QKV
-                #     module.forward = self._create_patched_forward(module, name)
+                if not hasattr(module, "_zorro_original_forward"):
+                    module._zorro_original_forward = module.forward
+                self.original_forwards[name] = module._zorro_original_forward
+                if self.patch_with_local:
+                    module.forward = self._create_unpatched_forward_local(module, name)
+                else:
+                    module.forward = self._create_patched_forward(module, name)
 
 
 def compare_debug_tensors(debug_object, atol=1e-5, rtol=1e-5, verbose=True, num_samples=10):
