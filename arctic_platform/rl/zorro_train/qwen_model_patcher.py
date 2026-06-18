@@ -597,7 +597,7 @@ class Qwen3ModelOncePatcher:
                 # replay in backward. Use this for long seqlen x large vocab, at the cost of a small additional
                 # forward call.
 
-                # see_memory_usage(f"{torch.distributed.get_rank()}: before TiledLogProbEntropy", force=False)
+                see_memory_usage(f"{torch.distributed.get_rank()}: before TiledLogProbEntropy", force=False)
                 # Size shards so each shard's logits block stays within the configured peak-memory budget
                 # (arctic_rl.logits_optimization_peak_mem_size_in_gib).
                 chunk_rows = _logits_chunk_rows(model.config.vocab_size, peak_mem_gib)
