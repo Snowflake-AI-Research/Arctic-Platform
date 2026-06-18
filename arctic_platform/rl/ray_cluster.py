@@ -155,17 +155,30 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
     r = _ray_bin()
     ray_port = _resolve_port("RAY_PORT", _DEFAULT_RAY_PORT)
     dashboard_port = _resolve_port("RAY_DASHBOARD_PORT", _DEFAULT_RAY_DASHBOARD_PORT)
-    _spawned_temp_dir = tempfile.mkdtemp(prefix="ray_arctic_")
+    # Honor a pre-created temp dir if supplied (the test harness pre-creates a unique one per client session so it
+    # can reap exactly this cluster by basename without racing parallel workers); otherwise pick our own. Must stay
+    # shallow -- Ray's AF_UNIX socket paths under <temp-dir>/session_*/sockets/ cannot exceed 107 bytes.
+    _spawned_temp_dir = os.environ.get("ARL_RAY_TEMP_DIR") or tempfile.mkdtemp(prefix="ray_arctic_")
+    start_cmd = [
+        r,
+        "start",
+        "--head",
+        f"--port={ray_port}",
+        f"--dashboard-port={dashboard_port}",
+        f"--temp-dir={_spawned_temp_dir}",
+        "--disable-usage-stats",
+    ]
+    # Honor a pre-set worker-port range if supplied. Ray assigns its CoreWorker gRPC ports from a fixed default
+    # range (10002+) shared by every cluster on the host, so two concurrent per-worker clusters (the test harness's
+    # partitioned pytest-xdist path) collide on a worker port -- a fatal, non-retried bind error that aborts the
+    # CoreWorker. The harness strides this range per worker to keep concurrent clusters disjoint. Pure opt-in; unset
+    # in production, where Ray's default range applies.
+    min_worker_port = os.environ.get("ARL_RAY_MIN_WORKER_PORT")
+    max_worker_port = os.environ.get("ARL_RAY_MAX_WORKER_PORT")
+    if min_worker_port and max_worker_port:
+        start_cmd += [f"--min-worker-port={min_worker_port}", f"--max-worker-port={max_worker_port}"]
     subprocess.run(
-        [
-            r,
-            "start",
-            "--head",
-            f"--port={ray_port}",
-            f"--dashboard-port={dashboard_port}",
-            f"--temp-dir={_spawned_temp_dir}",
-            "--disable-usage-stats",
-        ],
+        start_cmd,
         check=True,
         timeout=300,
         env=os.environ,

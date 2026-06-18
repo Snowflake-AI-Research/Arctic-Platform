@@ -17,12 +17,74 @@ import glob
 import os
 import shutil
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
-import torch
-import torch.distributed as dist
-from deepspeed.comm import init_distributed
+# Largest GPU count any single GPU test needs (test_train_engine / test_generate / test_sync_weights_nccl use 2). A
+# worker can only run the GPU suite if its slice is at least this big.
+_MAX_TEST_GPUS = 2
+
+
+def _visible_gpu_ids() -> list[str]:
+    """Physical GPU ids this process may use, honoring a pre-set CUDA_VISIBLE_DEVICES, else all GPUs from nvidia-smi.
+
+    Queried via nvidia-smi (never torch) so reading the count does not create a CUDA context that would freeze a
+    subsequent CUDA_VISIBLE_DEVICES change.
+    """
+    preset = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if preset is not None:
+        return [x.strip() for x in preset.split(",") if x.strip() != ""]
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+
+
+def _maybe_partition_gpus() -> bool:
+    """Give each pytest-xdist worker a disjoint slice of the visible GPUs, so heavyweight GPU tests run in parallel.
+
+    Must run before any CUDA context is created (and before testing_utils imports torch), so it lives at module top
+    and is invoked before ``import torch`` below. When the box has enough GPUs to hand every worker a slice of at
+    least ``_MAX_TEST_GPUS``, restrict this worker to its slice via CUDA_VISIBLE_DEVICES (and flag
+    ``ARL_GPU_PARTITIONED`` so the harness drops the host-wide serial lock and sizes vLLM memory for a dedicated
+    slice). Otherwise (serial run, controller, or too few GPUs -- e.g. a 2-GPU box, or ``-n`` larger than
+    gpus/_MAX_TEST_GPUS) leave CUDA_VISIBLE_DEVICES untouched: all workers share all GPUs and the serial lock keeps
+    them from colliding. Returns whether partitioning was applied.
+    """
+    worker = os.environ.get("PYTEST_XDIST_WORKER")  # "gw0", "gw1", ...; unset in a serial run or the controller
+    if not worker:
+        return False
+    num_workers = int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1"))
+    if num_workers <= 1:
+        return False
+    visible = _visible_gpu_ids()
+    per_worker = len(visible) // num_workers
+    if per_worker < _MAX_TEST_GPUS:
+        return False
+    wid = int(worker[2:])  # strip "gw"
+    my_slice = visible[wid * per_worker : wid * per_worker + per_worker]
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(my_slice)
+    os.environ["ARL_GPU_PARTITIONED"] = "1"
+    return True
+
+
+# Partition GPUs across xdist workers BEFORE importing torch / testing_utils or creating any CUDA context, so a
+# worker that got a slice has torch.cuda.device_count() report only that slice and every GPU consumer (skip guards,
+# Ray, vLLM, DeepSpeed) stays within the worker's own GPUs -- parallel GPU tests then never collide.
+_maybe_partition_gpus()
+
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+from deepspeed.comm import init_distributed  # noqa: E402
 
 # allow having multiple repository checkouts and not needing to remember to rerun
 # 'pip install -e .[dev]' when switching between checkouts and running tests.

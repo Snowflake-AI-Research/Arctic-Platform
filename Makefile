@@ -1,7 +1,10 @@
 # usage: make help
 
-.PHONY: help test test-cpu test-gpu format
+.PHONY: help test test-cpu test-gpu test-fast test-flakefinder format autoflake
 .DEFAULT_GOAL := help
+
+# number of times test-flakefinder repeats every test; the session timeout scales with it (see below)
+FLAKE_RUNS ?= 10
 
 help: ## this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[0-9a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
@@ -15,6 +18,11 @@ test-cpu: ## run cpu-only tests
 
 test-fast: ## run tests in parallel if there are large gpus
 	pytest -n4 --disable-warnings --instafail ./tests/
+
+# repeats each test FLAKE_RUNS times to surface flakes; since the whole suite runs ~FLAKE_RUNS times, scale the
+# whole-suite cap (default session_timeout=3600s, set in pyproject.toml) by FLAKE_RUNS so it doesn't abort the run
+test-flakefinder: ## run the suite with flakefinder (FLAKE_RUNS=10 repeats), scaling the session timeout
+	pytest --flake-finder --flake-runs=$(FLAKE_RUNS) --session-timeout=$$(( 3600 * $(FLAKE_RUNS) )) --disable-warnings --instafail ./tests/
 
 # pre-commit here runs on all modified files of the current branch, even if already pushed
 format: ## fix formatting

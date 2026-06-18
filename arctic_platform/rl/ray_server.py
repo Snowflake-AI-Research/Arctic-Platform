@@ -449,6 +449,11 @@ class ArcticRLRayServerState(ArcticRLServerState):
             if job_config.ds_config is not None:
                 if self.log_prob_workers:
                     raise ValueError("Log-prob job already running")
+                # Honor MASTER_PORT when set (mirrors the training branch above) so concurrent log-prob jobs on one
+                # host -- e.g. parallel pytest-xdist workers, each with its own cluster -- don't collide on the
+                # hardcoded rendezvous port. All ranks of THIS job are handed the same value, so multi-rank
+                # rendezvous is unaffected.
+                master_port = int(os.environ.get("MASTER_PORT", 29501))
                 workers = []
                 config_dict = job_config.model_dump()
                 for rank in range(gpus):
@@ -456,7 +461,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
                         opts = _pg_options(bundle_index=lp_bundle_offset + rank, fraction_key="log_prob")
                     else:
                         opts = dict(num_gpus=1)
-                    w = DeepSpeedWorker.options(**opts).remote(rank, gpus, 29501)
+                    w = DeepSpeedWorker.options(**opts).remote(rank, gpus, master_port)
                     workers.append(w)
                 master_addr = await workers[0].get_ip.remote()
                 await asyncio.gather(*[w.initialize.remote(master_addr, config_dict) for w in workers])

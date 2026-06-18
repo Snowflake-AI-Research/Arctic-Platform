@@ -22,11 +22,12 @@ port allocation, the skip guard, and the host-wide GPU-serialization lock (engag
 ``_serialize_gpu_work`` autouse fixture in ``tests/rl/conftest.py``). Model name, geometry, and GPU counts are
 owned by each test module and passed in. Does not depend on ``arctic-verl``.
 
-Session lifecycle (``arctic_rl_client_session``): release the driver's torch.distributed group, re-probe a fresh
-set of ports, start the cluster (ray: in-process head in the driver; http: a server subprocess that owns its own
-detached head), build the config, create the client, ``yield`` it, then on exit destroy the jobs / stop the server
-and reap exactly the cluster(s) this body spawned (snapshot-diff of ``ray_arctic_*`` temp dirs). http retries the
-spinup a few times (its subprocess can lose a startup race); ray is in-process, so a single attempt.
+Session lifecycle (``arctic_rl_client_session``): release the driver's torch.distributed group, point ``TMPDIR`` at
+a unique per-session root, re-probe a fresh set of ports, start the cluster (ray: in-process head in the driver;
+http: a server subprocess that owns its own detached head and inherits that ``TMPDIR``), build the config, create
+the client, ``yield`` it, then on exit destroy the jobs / stop the server and reap exactly the cluster this session
+spawned (the http head's ``ray_arctic_*`` dir lives under the session ``TMPDIR``; ray uses its module handle). http
+retries the spinup a few times (its subprocess can lose a startup race); ray is in-process, so a single attempt.
 
 Port allocation (the central source of cross-run/-worker flakiness, so all of it is re-probed per session, never
 fixed at import): each xdist worker owns a contiguous 8-port block via ``get_unique_port_number`` -- conftest takes
@@ -35,13 +36,16 @@ GCS/dashboard (``6379``/``8265``), the DeepSpeed rendezvous ``MASTER_PORT`` (``2
 ``ARL_WEIGHT_SYNC_PORT`` (``30500``) are each probed from a per-worker stride (``+ wid * 50``) so concurrent workers
 never overlap and a not-yet-reaped squatter from a prior session is stepped over rather than reused.
 
-pytest-xdist model: every test here grabs all the local GPUs (its own per-worker Ray cluster claims them), so two
-GPU tests can never truly overlap -- the host-wide ``gpu_serial_lock`` below serializes their bodies across
-workers, making ``-n N`` safe but GPU-bound. The vLLM tests (``test_generate``, ``test_e2e``) are additionally
-tagged ``@pytest.mark.vllm`` + ``xdist_group("arctic_rl_vllm")`` so ``--dist loadgroup`` pins them to one worker
-(never scheduled against each other) and ``-m "not vllm"`` lifts them out of a parallel pool to run separately.
-The training-only tests (``test_train_engine`` / ``test_log_prob_engine``) carry no vLLM group, so they distribute
-freely and run in parallel with the rest of the (CPU) suite.
+pytest-xdist model: two modes, chosen automatically by ``tests/conftest._maybe_partition_gpus`` from the GPU count.
+  - Partitioned (enough GPUs to give every worker a disjoint slice of >= the largest single test's need, e.g. 8
+    GPUs under ``-n 4``): each worker is pinned to its own GPUs via ``CUDA_VISIBLE_DEVICES``, with its own ports and
+    a unique session ``TMPDIR``, so GPU tests run truly in parallel. The ``gpu_serial_lock`` becomes a no-op and
+    vLLM claims a larger share of its dedicated slice.
+  - Serialized fallback (too few GPUs -- e.g. a 2-GPU box, or ``-n`` larger than gpus/slice): all workers share all
+    GPUs, so the host-wide ``gpu_serial_lock`` (engaged per test by ``_serialize_gpu_work`` in
+    ``tests/rl/conftest.py``) drives one GPU body at a time, making ``-n N`` safe but GPU-bound.
+Either way the vLLM tests carry ``@pytest.mark.vllm`` so ``-m "not vllm"`` can lift them out of a pool, and per-test
+isolation (ports / TMPDIR / GPU slice) means a sibling worker's live cluster is never touched on teardown.
 """
 
 from __future__ import annotations
@@ -49,7 +53,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
-import glob
 import inspect
 import math
 import os
@@ -567,15 +570,16 @@ def build_config(
         use_unpad=True,
         use_autocast=False,
     )
-    # vLLM sampling-engine config, only when a sampling job exists. The model is tiny (<2 GiB), the serial lock
-    # runs one engine at a time, and vLLM's startup check needs ``gpu_memory_utilization * total`` free -- so a
-    # small fraction (0.3/N, N = xdist workers) is ample and tolerant of leftover allocations / CUDA contexts,
-    # where 0.9 would spuriously fail the moment any memory is in use.
+    # vLLM sampling-engine config, only when a sampling job exists. The model is tiny (<2 GiB), so a small share of
+    # the GPU is ample and stays tolerant of leftover allocations / CUDA contexts (0.9 would spuriously fail the
+    # startup free-memory check the moment any memory is in use). When GPUs are partitioned this worker owns its
+    # slice outright (0.3); otherwise workers share all GPUs under the serial lock, so divide by the worker count.
     vllm_config = None
     if sampling_gpus > 0:
+        gpu_memory_utilization = 0.3 if gpu_partitioning_active() else 0.3 / get_xdist_worker_count()
         vllm_config = {
             "tensor_parallel_size": 1,
-            "gpu_memory_utilization": 0.3 / get_xdist_worker_count(),
+            "gpu_memory_utilization": gpu_memory_utilization,
             "max_model_len": max_length,
             "enforce_eager": True,
             "enable_prefix_caching": False,
@@ -627,29 +631,23 @@ def force_stop_spawned_ray_cluster() -> None:
     ray_cluster._shutdown()
 
 
-def _ray_arctic_temp_dirs() -> set[str]:
-    """Every ``ray_arctic_*`` session dir on disk -- the unique ``--temp-dir`` each spawned Ray head is named after."""
-    roots = {os.environ.get("TMPDIR") or tempfile.gettempdir(), "/tmp", "/data-fast/tmp"}
-    return {d for root in roots for d in glob.glob(os.path.join(root, "ray_arctic_*"))}
-
-
-def _reap_spawned_clusters(comm_protocol: str, pre_ray_dirs: set[str]) -> None:
-    """Tear down the Ray cluster(s) this session spawned so nothing lingers into the next test.
+def _reap_session_clusters(comm_protocol: str, session_ray_dir: str) -> None:
+    """Tear down the Ray cluster this client session spawned so nothing lingers into the next test.
 
     ray: the driver owns the head -> ``force_stop_spawned_ray_cluster`` (also ``ray.shutdown()`` + reset cached
     address for the driver client). http: the server subprocess starts a detached head whose daemons / vLLM
     ``InferenceWorker`` + ``EngineCore`` actors survive the server's SIGTERM (and a -9 crash) and keep squatting
-    GPUs / ports / /dev/shm. We SIGKILL them by the unique ``ray_arctic_*`` basename, but only for dirs that appeared
-    during this body (snapshot diff) -- and bodies are lock-serialized, so a sibling worker's live cluster is never
-    among them.
+    GPUs / ports / /dev/shm. The session pinned the head to ``session_ray_dir`` (via ARL_RAY_TEMP_DIR), so SIGKILL
+    that cluster by its unique ``--temp-dir`` basename and drop the dir. Keying off this session's own unique dir
+    (rather than a global snapshot diff) keeps teardown race-free under parallel workers -- a sibling's live cluster
+    carries a different basename and is never matched.
     """
     if comm_protocol == "ray":
         with contextlib.suppress(Exception):
             force_stop_spawned_ray_cluster()
         return
-    for temp_dir in _ray_arctic_temp_dirs() - pre_ray_dirs:
-        subprocess.run(["pkill", "-9", "-f", os.path.basename(temp_dir)], check=False, timeout=60)
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    subprocess.run(["pkill", "-9", "-f", os.path.basename(session_ray_dir)], check=False, timeout=60)
+    shutil.rmtree(session_ray_dir, ignore_errors=True)
 
 
 @contextlib.contextmanager
@@ -680,64 +678,84 @@ def arctic_rl_client_session(
     attempts = 3 if comm_protocol == "http" else 1
     with tempfile.TemporaryDirectory(prefix="arl_test_ckpt_") as ckpt_dir:
         for attempt in range(1, attempts + 1):
-            # Re-probe ports per attempt (not once at import) so a port left squatted by a prior, not-yet-reaped
-            # cluster in this worker is skipped rather than reused. Ray GCS/dashboard ports must stay below Ray's
-            # worker-port range (>= 10002); 6379/8265 are Ray's defaults, strided per worker so concurrent workers
-            # never overlap. Each worker starts its OWN head in its own temp-dir, so address="auto" never resolves to
-            # a sibling's cluster; do NOT set RAY_ADDRESS. http_port stays in this worker's 8-port block.
             wid = get_xdist_worker_id()
-            http_port = _reserve_free_port(_PORT_BASE + 1, span=7) if comm_protocol == "http" else None
-            os.environ["RAY_PORT"] = str(_reserve_free_port(6379 + wid * 50, span=50))
-            os.environ["RAY_DASHBOARD_PORT"] = str(_reserve_free_port(8265 + wid * 50, span=50))
-            # DeepSpeed rendezvous port (ray_server / http_server read os.environ["MASTER_PORT"] to hand every rank
-            # the same value). Re-probe a fresh free port per session, strided per worker, instead of reusing the
-            # single static MASTER_PORT conftest set for the whole run: a SIGKILL-reaped worker from a prior session
-            # (e.g. the same heavy test fired repeatedly under pytest-flakefinder) can still squat the old port when
-            # the next session's rank-0 worker tries to create its TCPStore, deadlocking the 2-GPU NCCL rendezvous.
-            os.environ["MASTER_PORT"] = str(_reserve_free_port(29500 + wid * 50, span=50))
-            # Same fix for the training->sampling weight-sync NCCL rendezvous (servers read ARL_WEIGHT_SYNC_PORT);
-            # base well clear of MASTER_PORT's window so the two never overlap across workers.
-            os.environ["ARL_WEIGHT_SYNC_PORT"] = str(_reserve_free_port(30500 + wid * 50, span=50))
-
-            # ray: start the head in the driver (the server actor re-attaches). http: the server subprocess owns its
-            # own cluster. auto_attach=False is essential under xdist or workers attach to each other and deadlock.
-            if comm_protocol == "ray":
-                ray_cluster.init_ray_cluster(auto_attach=False)
-
-            # Snapshot ray session dirs so teardown reaps exactly the cluster(s) born during this body (see
-            # _reap_spawned_clusters); safe across workers because GPU bodies are lock-serialized.
-            pre_ray_dirs = _ray_arctic_temp_dirs()
-            config = build_config(
-                comm_protocol,
-                ckpt_dir,
-                zorro_enable=zorro_enable,
-                model_name=model_name,
-                attn_implementation=attn_implementation,
-                prompt_len=prompt_len,
-                response_len=response_len,
-                rollout_n=rollout_n,
-                training_gpus=training_gpus,
-                sampling_gpus=sampling_gpus,
-                log_prob_gpus=log_prob_gpus,
-                colocate=colocate,
-                http_port=http_port,
-                vllm_overrides=vllm_overrides,
-                lr=lr,
-                gradient_accumulation_steps=gradient_accumulation_steps,
-            )
+            # Pre-create this session's Ray temp dir (shallow, under the default tmp -- Ray's AF_UNIX socket paths
+            # must stay under 107 bytes, so we must NOT nest it) and hand it to the cluster via ARL_RAY_TEMP_DIR. The
+            # http server subprocess inherits the env and starts its head there, so teardown reaps exactly this
+            # cluster by its unique basename -- never a parallel sibling's -- making ``-n N`` partitioning race-free.
+            session_ray_dir = tempfile.mkdtemp(prefix="ray_arctic_")
+            prev_ray_dir = os.environ.get("ARL_RAY_TEMP_DIR")
+            os.environ["ARL_RAY_TEMP_DIR"] = session_ray_dir
             try:
-                client = create_arctic_rl_client(config)  # http: launches + waits on the server subprocess
-            except Exception:
-                _reap_spawned_clusters(comm_protocol, pre_ray_dirs)
-                if attempt == attempts:
-                    raise
-                continue
-            try:
-                yield client
+                # Re-probe ports per attempt (not once at import) so a port left squatted by a prior, not-yet-reaped
+                # cluster in this worker is skipped rather than reused. Ray GCS/dashboard ports must stay below Ray's
+                # worker-port range (>= 10002); 6379/8265 are Ray's defaults, strided per worker so concurrent
+                # workers never overlap. Each worker starts its OWN head in its own temp-dir, so address="auto" never
+                # resolves to a sibling's cluster; do NOT set RAY_ADDRESS. http_port stays in this worker's port block.
+                http_port = _reserve_free_port(_PORT_BASE + 1, span=7) if comm_protocol == "http" else None
+                os.environ["RAY_PORT"] = str(_reserve_free_port(6379 + wid * 50, span=50))
+                os.environ["RAY_DASHBOARD_PORT"] = str(_reserve_free_port(8265 + wid * 50, span=50))
+                # Stride Ray's CoreWorker gRPC port range per worker (init_ray_cluster passes these as
+                # --min/--max-worker-port). Ray's default range (10002+) is shared by every cluster on the host, so
+                # two concurrent per-worker clusters (partitioned GPU path) collide on a worker port -- a fatal,
+                # non-retried CoreWorker bind error that crashes the worker. A 1000-port block per worker is ample
+                # for these tiny clusters; the base sits above the http port block (~11000) and below MASTER_PORT
+                # (29500+), so the ranges never overlap the other strided ports for any realistic ``-n``.
+                ray_worker_port_lo = 12100 + wid * 1000
+                os.environ["ARL_RAY_MIN_WORKER_PORT"] = str(ray_worker_port_lo)
+                os.environ["ARL_RAY_MAX_WORKER_PORT"] = str(ray_worker_port_lo + 999)
+                # DeepSpeed rendezvous port (ray_server / http_server read os.environ["MASTER_PORT"] to hand every
+                # rank the same value). Re-probe a fresh free port per session, strided per worker, instead of
+                # reusing the single static MASTER_PORT conftest set for the whole run: a SIGKILL-reaped worker from a
+                # prior session (e.g. the same heavy test fired repeatedly under pytest-flakefinder) can still squat
+                # the old port when the next session's rank-0 worker creates its TCPStore, deadlocking the rendezvous.
+                os.environ["MASTER_PORT"] = str(_reserve_free_port(29500 + wid * 50, span=50))
+                # Same fix for the training->sampling weight-sync NCCL rendezvous (servers read ARL_WEIGHT_SYNC_PORT);
+                # base well clear of MASTER_PORT's window so the two never overlap across workers.
+                os.environ["ARL_WEIGHT_SYNC_PORT"] = str(_reserve_free_port(30500 + wid * 50, span=50))
+
+                # ray: start the head in the driver (the server actor re-attaches). http: the server subprocess owns
+                # its own cluster. auto_attach=False is essential under xdist or workers attach to each other.
+                if comm_protocol == "ray":
+                    ray_cluster.init_ray_cluster(auto_attach=False)
+
+                config = build_config(
+                    comm_protocol,
+                    ckpt_dir,
+                    zorro_enable=zorro_enable,
+                    model_name=model_name,
+                    attn_implementation=attn_implementation,
+                    prompt_len=prompt_len,
+                    response_len=response_len,
+                    rollout_n=rollout_n,
+                    training_gpus=training_gpus,
+                    sampling_gpus=sampling_gpus,
+                    log_prob_gpus=log_prob_gpus,
+                    colocate=colocate,
+                    http_port=http_port,
+                    vllm_overrides=vllm_overrides,
+                    lr=lr,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                )
+                try:
+                    client = create_arctic_rl_client(config)  # http: launches + waits on the server subprocess
+                except Exception:
+                    _reap_session_clusters(comm_protocol, session_ray_dir)
+                    if attempt == attempts:
+                        raise
+                    continue
+                try:
+                    yield client
+                finally:
+                    teardown_client(client)
+                    _reap_session_clusters(comm_protocol, session_ray_dir)
+                return
             finally:
-                teardown_client(client)
-                _reap_spawned_clusters(comm_protocol, pre_ray_dirs)
-            return
+                if prev_ray_dir is None:
+                    os.environ.pop("ARL_RAY_TEMP_DIR", None)
+                else:
+                    os.environ["ARL_RAY_TEMP_DIR"] = prev_ray_dir
+                shutil.rmtree(session_ray_dir, ignore_errors=True)
 
 
 def skip_if_unsupported(training_gpus: int, sampling_gpus: int, log_prob_gpus: int, colocate: bool = False) -> None:
@@ -754,8 +772,17 @@ def skip_if_unsupported(training_gpus: int, sampling_gpus: int, log_prob_gpus: i
 
 
 # Host-wide lock path shared across all the GPU test modules so their GPU-heavy bodies serialize against each
-# other too.
+# other too. Resolved at import (before any per-session TMPDIR override) so it stays a single host-wide path.
 GPU_SERIAL_LOCK_PATH = os.path.join(tempfile.gettempdir(), "arl_test_gpu.lock")
+
+
+def gpu_partitioning_active() -> bool:
+    """True when conftest gave each xdist worker its own disjoint GPU slice (see tests/conftest._maybe_partition_gpus).
+
+    In that mode workers never share GPUs, so the host-wide serial lock is unnecessary and vLLM can claim a larger
+    share of its dedicated slice.
+    """
+    return os.environ.get("ARL_GPU_PARTITIONED") == "1"
 
 
 @contextlib.contextmanager
@@ -764,9 +791,9 @@ def gpu_serial_lock():
 
     Multiple workers spinning up DeepSpeed engines on the shared GPUs at once contend for VRAM and trip init-time
     memory checks / OOM. Hold a host-wide advisory lock so one worker drives the GPUs at a time. No-op in a serial
-    run.
+    run and when GPUs are partitioned (each worker owns a disjoint slice, so there is nothing to serialize).
     """
-    if get_xdist_worker_count() <= 1:
+    if get_xdist_worker_count() <= 1 or gpu_partitioning_active():
         yield
         return
     with open(GPU_SERIAL_LOCK_PATH, "w") as fh:
