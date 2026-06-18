@@ -38,6 +38,8 @@ the deduplicated length). The CPU-only algorithm round-trips live in ``test_dedu
 from __future__ import annotations
 
 import functools
+import itertools
+
 import torch
 import torch.distributed as dist
 import transformers
@@ -49,7 +51,6 @@ from arctic_platform.rl.zorro_train.tests import create_dummy_batch
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import torch_assert_close
-import itertools
 
 device = "cuda"
 
@@ -96,7 +97,9 @@ model_names = [
 attn_implementations = ["flash_attention_2", "eager"]
 add_padding_modes = [True, False]
 
-model_attn_logits_cases = list(itertools.product(model_names, attn_implementations, add_padding_modes, logits_optimization_modes))
+model_attn_logits_cases = list(
+    itertools.product(model_names, attn_implementations, add_padding_modes, logits_optimization_modes)
+)
 
 
 @functools.lru_cache(maxsize=None)
@@ -123,7 +126,6 @@ def _load_model_and_reference(model_name: str, attn_implementation: str, add_pad
     model.eval()
     reference_logprobs = _reference_response_logprobs(model, batch, prompt_lens, response_lens)
     return model, batch, response_lens, reference_logprobs
-
 
 
 @require_torch_gpu
@@ -195,7 +197,9 @@ class TestQwen3ModelOncePatcher(TestCasePlus):
         torch_assert_close(output.logprobs.float(), reference_logprobs, rtol=0, atol=1e-3)
 
     @parameterized.expand(model_attn_logits_cases)
-    def test_backward_produces_finite_gradients(self, model_name, attn_implementation, add_padding, logits_optimization):
+    def test_backward_produces_finite_gradients(
+        self, model_name, attn_implementation, add_padding, logits_optimization
+    ):
         model, batch, _, _ = self._load_or_skip(model_name, attn_implementation, add_padding)
         model.zero_grad(set_to_none=True)
         output = self._patch_and_forward(model, batch, logits_optimization, calculate_entropy=False)
