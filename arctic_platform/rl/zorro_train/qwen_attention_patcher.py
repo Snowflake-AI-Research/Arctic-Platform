@@ -393,9 +393,16 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             prompt_to_prompt_mask = reconstruction_info["prompt_to_prompt_mask"]
             response_to_full_mask = reconstruction_info["response_to_full_mask"]
 
-            # Use explicit masks
+            # Use explicit masks. The extracted masks are 2D ``[q, k]`` additive float masks. Newer transformers'
+            # ``eager_attention_forward`` adds the mask directly (``attn_weights + mask``) so a 2D mask broadcasts,
+            # but transformers <= 4.57 indexes it as ``attention_mask[:, :, :, :k]`` and requires 4D. Expand to
+            # ``[1, 1, q, k]`` so the eager path works on both (4D broadcasts over batch/heads either way).
             prompt_mask = prompt_to_prompt_mask
             response_mask = response_to_full_mask
+            if prompt_mask is not None and prompt_mask.dim() == 2:
+                prompt_mask = prompt_mask[None, None, :, :]
+            if response_mask is not None and response_mask.dim() == 2:
+                response_mask = response_mask[None, None, :, :]
             prompt_kwargs = kwargs
             response_kwargs = kwargs
 
