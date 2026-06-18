@@ -690,7 +690,7 @@ def chunked_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy, 
     labels_1d = labels.reshape(-1)  # [N]
 
     # Size each chunk so its [chunk_size, vocab] follow-up working set stays within the configured peak-memory
-    # budget (arctic_rl.logits_optimization_peak_mem_size_in_gib). 4 bytes = fp32, the conservative accounting
+    # budget (arctic_rl.train.logits.optimization_peak_mem_size_in_gib). 4 bytes = fp32, the conservative accounting
     # for the logprob/entropy intermediates.
     budget_bytes = max(1, int(peak_mem_gib * 2**30))
     chunk_size = max(1, budget_bytes // max(1, vocab_size * 4))
@@ -801,12 +801,12 @@ def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: di
             input_ids = input_ids.view(logits.shape[:-1])
         labels = torch.roll(input_ids, shifts=-1, dims=-1)
 
-        # arctic_rl.logits_compute_in_fp32: upcast the logits to fp32 before the logprob/entropy math runs on
+        # arctic_rl.train.logits.compute_in_fp32: upcast the logits to fp32 before the logprob/entropy math runs on
         # them (improves numerical precision; no-op if the logits are already fp32).
         if meta.get("logits_compute_in_fp32", False):
             logits = logits.float()
 
-        # arctic_rl.logits_optimization picks the logprob/entropy compute strategy ("memory" (tiling ) is not available unless zorro is used because the non-zorro path already has full logits manifested):
+        # arctic_rl.train.logits.optimization picks the logprob/entropy compute strategy ("memory" (tiling ) is not available unless zorro is used because the non-zorro path already has full logits manifested):
         #   none    -> single fused call over the full logits (fastest; manifests
         #              the full-size follow-up intermediates, i.e. logits memory
         #              more than once).
@@ -821,10 +821,10 @@ def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: di
         elif logits_optimization == "none":
             logprobs, entropy = fast_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy)
         elif logits_optimization == "memory":
-            raise ValueError("arctic_rl.logits_optimization=memory requires zorro enabled")
+            raise ValueError("arctic_rl.train.logits.optimization=memory requires zorro enabled")
         else:
             raise ValueError(
-                f"Unknown arctic_rl.logits_optimization={logits_optimization!r}; "
+                f"Unknown arctic_rl.train.logits.optimization={logits_optimization!r}; "
                 "expected one of: none, memory, compute"
             )
 

@@ -475,7 +475,7 @@ class Qwen3ModelOncePatcher:
 
                 see_memory_usage(f"{torch.distributed.get_rank()}: before TiledLogProbEntropy", force=False)
                 # Size shards so each shard's logits block stays within the configured peak-memory budget
-                # (arctic_rl.logits_optimization_peak_mem_size_in_gib).
+                # (arctic_rl.train.logits.optimization_peak_mem_size_in_gib).
                 chunk_rows = _logits_chunk_rows(model.config.vocab_size, peak_mem_gib)
                 num_shards = max(1, ceildiv(hidden_states_extracted.shape[0], chunk_rows))
                 # pr0(f"derived {num_shards=}")
@@ -534,7 +534,7 @@ class Qwen3ModelOncePatcher:
                 )
             else:
                 raise ValueError(
-                    f"Unknown arctic_rl.logits_optimization={logits_optimization!r}; "
+                    f"Unknown arctic_rl.train.logits.optimization={logits_optimization!r}; "
                     "expected one of: none, memory, compute"
                 )
 
@@ -855,7 +855,7 @@ def _logits_chunk_rows(vocab_size, peak_mem_gib, bytes_per_elem=4):
     peak memory overhead.
 
     Used to size the chunks/shards/tiles for the `memory` and `compute` logits-optimization modes from a single
-    memory budget (``arctic_rl.logits_optimization_peak_mem_size_in_gib``). ``bytes_per_elem`` defaults to 4
+    memory budget (``arctic_rl.train.logits.optimization_peak_mem_size_in_gib``). ``bytes_per_elem`` defaults to 4
     (fp32), the conservative accounting used by the logits follow-up math. Always returns at least 1.
     """
     budget_bytes = max(1, int(peak_mem_gib * 2**30))
@@ -874,10 +874,10 @@ def _lm_head_logits_with_temperature(
     function instead).
 
     When ``logits_compute_from_fp32_inputs`` is set, the LM-head input is upcast to fp32 so the projection
-    (and hence the logits / logprob / entropy math) runs in fp32 (arctic_rl.logits_compute_from_fp32_inputs).
+    (and hence the logits / logprob / entropy math) runs in fp32 (arctic_rl.train.logits.compute_from_fp32_inputs).
 
     When ``logits_compute_in_fp32`` is set, the produced logits are upcast to fp32 before they are consumed
-    (temperature scaling + downstream logprob/entropy math) (arctic_rl.logits_compute_in_fp32). No-op if
+    (temperature scaling + downstream logprob/entropy math) (arctic_rl.train.logits.compute_in_fp32). No-op if
     already fp32.
     """
     if logits_compute_from_fp32_inputs:
@@ -983,7 +983,7 @@ def chunked_entropy_and_logprobs_with_temperature_from_logits(
     dimension, so the full-size follow-up intermediates (``probs`` /
     ``log_softmax``, each as large as the logits) are never materialized at once.
     Each chunk's follow-up working set is bounded by ``peak_mem_gib`` GiB
-    (arctic_rl.logits_optimization_peak_mem_size_in_gib).
+    (arctic_rl.train.logits.optimization_peak_mem_size_in_gib).
     Memory cost: the full logits tensor, once. Compute cost: a Python loop over
     token chunks. Mirrors the chunking pattern used by
     ``processors.pipeline.chunked_logprobs_and_entropy_from_logits``.
