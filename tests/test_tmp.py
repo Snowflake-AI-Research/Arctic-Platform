@@ -13,14 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# XXX: can't import yet - depends on AT
-# arctic_platform/rl/http_server.py:44: in <module>
-#    from arctic_inference.server.config import ModelConfig
-# E   ModuleNotFoundError: No module named 'arctic_inference'
-
-# from arctic_platform.rl import ArcticRLClientConfig  # noqa: F401
-# from arctic_platform.rl import create_arctic_rl_client  # noqa: F401
-# from arctic_platform.rl.server import ArcticRLServerState  # noqa: F401
+from arctic_platform.rl import ArcticRLClientConfig  # noqa: F401
+from arctic_platform.rl import create_arctic_rl_client  # noqa: F401
+from arctic_platform.rl.server import ArcticRLServerState  # noqa: F401
 
 
 def test_import():
