@@ -19,8 +19,7 @@ This is the patcher the DeepSpeed worker installs (``deepspeed_worker.py``). It 
 and then computes deduplicated forward/backward internally: called with the full ``[B, S]`` batch it deduplicates
 shared prompts, runs the model on the packed sequence, and returns per-response-token ``logprobs`` / ``entropy`` in
 the original sample order (no padding). Driven here directly (single process, ``world_size=1``, so no collectives)
-on a real small checkpoint, across all three ``logits_optimization`` dispatch modes (``none`` / ``memory`` /
-``compute``)::
+across all three ``logits_optimization`` dispatch modes (``none`` / ``memory`` / ``compute``)::
 
     pytest tests/zorro_train/test_once_patcher.py
 
@@ -46,8 +45,6 @@ from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import torch_assert_close
 
-model_name = "Qwen/Qwen3-0.6B"
-attn_implementation = "flash_attention_2"
 device = "cuda"
 
 batch_size = 6
@@ -56,7 +53,7 @@ prompt_len = 16
 response_len = 8
 
 
-def _valid_lengths(batch) -> tuple[list[int], list[int]]:
+def _valid_lengths(batch, prompt_len) -> tuple[list[int], list[int]]:
     """Per-row real prompt/response token counts from the attention mask (boundary fixed at column ``prompt_len``)."""
     mask = batch["attention_mask"].bool()
     prompt_lens = [int(mask[row, :prompt_len].sum()) for row in range(mask.shape[0])]
@@ -84,32 +81,49 @@ def _reference_response_logprobs(model, batch, prompt_lens, response_lens) -> to
 # follow-up) and "memory" (tiled compute under no_grad with a backward replay). All must produce the same result.
 logits_optimization_modes = [("none",), ("memory",), ("compute",)]
 
+def _build_case(model, prompt_length: int, add_padding: bool) -> dict:
+    """Build a batch (deterministically) plus its per-row reference. Must run on the UNPATCHED model."""
+    torch.manual_seed(0)
+    case_batch = create_dummy_batch(
+        batch_size=batch_size,
+        num_unique_prompts=num_unique_prompts,
+        prompt_len=prompt_length,
+        response_len=response_len,
+        device=device,
+        include_training_fields=False,
+        add_padding=add_padding,
+    )
+    case_prompt_lens, case_response_lens = _valid_lengths(case_batch, prompt_length)
+    reference = _reference_response_logprobs(model, case_batch, case_prompt_lens, case_response_lens)
+    return {
+        "batch": case_batch,
+        "prompt_lens": case_prompt_lens,
+        "response_lens": case_response_lens,
+        "reference": reference,
+    }
 
-@require_torch_gpu
-class TestQwen3ModelOncePatcher(TestCasePlus):
+
+
+class QwenOncePatcherTestMixin:
+    model_name: str
+    attn_implementation = "flash_attention_2"
+    promptlen_padding_cases: list[tuple[int, bool]] = []
+
     @classmethod
     def setUpClass(cls):
-        torch.manual_seed(0)
-        cls.batch = create_dummy_batch(
-            batch_size=batch_size,
-            num_unique_prompts=num_unique_prompts,
-            prompt_len=prompt_len,
-            response_len=response_len,
-            device=device,
-            include_training_fields=False,
-            add_padding=True,
-        )
-        cls.prompt_lens, cls.response_lens = _valid_lengths(cls.batch)
-        cls.num_response_tokens = sum(cls.response_lens)
         cls.model = AutoModelForCausalLM.from_pretrained(
-            model_name, dtype=torch.bfloat16, device_map=device, attn_implementation=attn_implementation
+            cls.model_name,
+            dtype=torch.bfloat16,
+            device_map=device,
+            attn_implementation=cls.attn_implementation,
         )
-        # Reference must be computed before patching (the Once patcher mutates the model permanently). Re-patching
-        # with a different logits_optimization just swaps the forward closures, so a single model serves every mode.
         cls.model.eval()
-        cls.reference_logprobs = _reference_response_logprobs(cls.model, cls.batch, cls.prompt_lens, cls.response_lens)
+        cls.length_cases = {
+            (prompt_length, add_padding): _build_case(cls.model, prompt_length, add_padding)
+            for prompt_length, add_padding in cls.promptlen_padding_cases
+        }
 
-    def _patch_and_forward(self, logits_optimization: str, calculate_entropy: bool):
+    def _patch_and_forward(self, logits_optimization: str, calculate_entropy: bool, batch=None):
         Qwen3ModelOncePatcher(
             self.model,
             response_len=response_len,
@@ -121,34 +135,79 @@ class TestQwen3ModelOncePatcher(TestCasePlus):
             use_unpad=True,
         ).patch_forward()
         return self.model(
-            input_ids=self.batch["input_ids"],
-            position_ids=self.batch["position_ids"],
-            attention_mask=self.batch["attention_mask"],
+            input_ids=batch["input_ids"],
+            position_ids=batch["position_ids"],
+            attention_mask=batch["attention_mask"],
             use_cache=False,
             calculate_entropy=calculate_entropy,
         )
 
     @parameterized.expand(logits_optimization_modes)
-    def test_forward_matches_reference(self, logits_optimization):
-        with torch.no_grad():
-            output = self._patch_and_forward(logits_optimization, calculate_entropy=True)
-
-        self.assertEqual(output.logprobs.shape, (self.num_response_tokens,))
-        self.assertTrue(torch.isfinite(output.logprobs).all())
-        self.assertEqual(output.entropy.shape, (self.num_response_tokens,))
-        self.assertTrue(torch.isfinite(output.entropy).all())
-        self.assertGreaterEqual(output.entropy.min().item(), 0.0)
-        # Against the per-row reference the deduplicated forward is numerically exact up to bf16 rounding, so a
-        # tight atol catches any regression in the dedup alignment or math (e.g. the first-response-token error the
-        # offset-aware extraction fixes).
-        torch_assert_close(output.logprobs.float(), self.reference_logprobs, rtol=0, atol=1e-3)
+    def test_backward_produces_finite_gradients(self, logits_optimization):
+        for prompt_length, add_padding in self.promptlen_padding_cases:
+            with self.subTest(prompt_length=prompt_length, add_padding=add_padding):
+                case = self.length_cases[(prompt_length, add_padding)]
+                self.model.zero_grad(set_to_none=True)
+                output = self._patch_and_forward(logits_optimization, calculate_entropy=False, batch=case["batch"])
+                output.logprobs.mean().backward()
+                grad = self.model.lm_head.weight.grad
+                self.assertIsNotNone(grad)
+                self.assertTrue(torch.isfinite(grad).all())
+                self.assertGreater(grad.abs().sum().item(), 0.0)
 
     @parameterized.expand(logits_optimization_modes)
-    def test_backward_produces_finite_gradients(self, logits_optimization):
-        self.model.zero_grad(set_to_none=True)
-        output = self._patch_and_forward(logits_optimization, calculate_entropy=False)
-        output.logprobs.mean().backward()
-        grad = self.model.lm_head.weight.grad
-        self.assertIsNotNone(grad)
-        self.assertTrue(torch.isfinite(grad).all())
-        self.assertGreater(grad.abs().sum().item(), 0.0)
+    def test_forward_matches_reference_across_prompt_lengths(self, logits_optimization):
+        for prompt_length, add_padding in self.promptlen_padding_cases:
+            with self.subTest(prompt_length=prompt_length, add_padding=add_padding):
+                case = self.length_cases[(prompt_length, add_padding)]
+                with torch.no_grad():
+                    output = self._patch_and_forward(logits_optimization, calculate_entropy=True, batch=case["batch"])
+                expected_response_tokens = sum(case["response_lens"])
+                self.assertEqual(output.logprobs.shape, (expected_response_tokens,))
+                self.assertTrue(torch.isfinite(output.logprobs).all())
+                self.assertEqual(output.entropy.shape, (expected_response_tokens,))
+                self.assertTrue(torch.isfinite(output.entropy).all())
+                self.assertGreaterEqual(output.entropy.min().item(), 0.0)
+                torch_assert_close(output.logprobs.float(), case["reference"], rtol=0, atol=1e-3)
+
+@require_torch_gpu
+class TestQwen3ModelOncePatcher(QwenOncePatcherTestMixin, TestCasePlus):
+    model_name = "tiny-random/qwen3"
+    # Full-attention-only model: the sweep just varies prompt length / padding (no gated-delta chunk boundary). The
+    # tiny ``head_dim`` keeps the deduplicated/varlen forward bit-exact against the per-row reference, the same as for
+    # the hybrid checkpoint below.
+    promptlen_padding_cases = [
+        (16, False),
+    ]
+
+
+@require_torch_gpu
+class TestQwen3MoeModelOncePatcher(QwenOncePatcherTestMixin, TestCasePlus):
+    model_name = "tiny-random/qwen3-moe"
+    promptlen_padding_cases = [
+        (16, False),
+    ]
+
+@require_torch_gpu
+class TestQwen3NextModelOncePatcher(QwenOncePatcherTestMixin, TestCasePlus):
+    model_name = "tiny-random/qwen3-next-moe"
+    promptlen_padding_cases = [
+        (16, False),
+    ]
+
+@require_torch_gpu
+class TestQwen36ModelOncePatcher(QwenOncePatcherTestMixin, TestCasePlus):
+    model_name = "tiny-random/qwen3.6"
+    promptlen_padding_cases = [
+        (16, False),  
+        (64, False),  
+        (160, False), 
+        (160, True), 
+    ]
+
+@require_torch_gpu
+class TestQwen36MoeModelOncePatcher(QwenOncePatcherTestMixin, TestCasePlus):
+    model_name = "tiny-random/qwen3.6-moe"
+    promptlen_padding_cases = [
+        (16, False),
+    ]

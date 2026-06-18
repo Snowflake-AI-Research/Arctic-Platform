@@ -20,6 +20,7 @@ Patches Qwen3Model and Qwen3ForCausalLM forward methods to handle
 deduplication at the model level.
 """
 
+import inspect
 import os
 import sys
 
@@ -33,6 +34,7 @@ from typing import Union
 
 import torch
 from transformers.cache_utils import Cache
+from transformers.modeling_outputs import BaseModelOutputWithPast as _BaseModelOutputWithPast
 from transformers.modeling_outputs import ModelOutput
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
@@ -48,6 +50,72 @@ from arctic_platform.rl.zorro_train.zorro_train import ZoRRoTrain
 # Global debug object for storing baseline/patched tensors
 debug_object = {"baseline": None, "patched": None}
 
+SUPPORTED_MODEL_TYPES = {
+    "qwen3",
+    "qwen3_moe",
+    "qwen3_5",
+    "qwen3_5_moe",
+    "qwen3_next",
+}
+
+MODEL_TYPE_ALIASES = {
+    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_moe_text": "qwen3_5_moe",
+}
+
+MODEL_TYPE_TO_TEXT_BACKBONE_CLASS = {
+    "qwen3": "Qwen3Model",
+    "qwen3_moe": "Qwen3MoeModel",
+    "qwen3_5": "Qwen3_5TextModel",
+    "qwen3_5_moe": "Qwen3_5MoeTextModel",
+    "qwen3_next": "Qwen3NextModel",
+}
+
+
+def _normalize_model_type(model_type: str) -> str:
+    return MODEL_TYPE_ALIASES.get(model_type, model_type)
+
+
+def get_supported_model_type(model) -> str:
+    """Return normalized ``config.model_type`` for ZoRRO-supported Qwen model families."""
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    if model_type is None:
+        raise ValueError(f"Model {type(model).__name__} does not expose config.model_type")
+
+    normalized = _normalize_model_type(model_type)
+    if normalized not in SUPPORTED_MODEL_TYPES:
+        raise ValueError(
+            f"Unsupported model_type={model_type}. Supported model types: {sorted(SUPPORTED_MODEL_TYPES)} "
+            f"(aliases: {sorted(MODEL_TYPE_ALIASES.keys())})"
+        )
+    return normalized
+
+
+def _init_dynamic_cache(dynamic_cache_cls, config):
+    """Initialize DynamicCache across transformers versions with signature differences."""
+    if dynamic_cache_cls is None:
+        return None
+    try:
+        sig = inspect.signature(dynamic_cache_cls)
+        if "config" in sig.parameters:
+            return dynamic_cache_cls(config=config)
+    except (TypeError, ValueError):
+        pass
+    return dynamic_cache_cls()
+
+
+def _get_text_backbone(causal_lm_model):
+    backbone = causal_lm_model.model
+    return getattr(backbone, "language_model", backbone)
+
+
+def _update_linear_attn_mask(module, attention_mask, past_key_values):
+    update_fn = getattr(module, "_update_linear_attn_mask", None)
+    if update_fn is None:
+        return None
+
+    return update_fn(attention_mask, past_key_values)
 
 try:
     from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
@@ -189,6 +257,9 @@ class Qwen3ModelOncePatcher:
                                  If False, use standard approach (1 call: full attention on reconstructed Q/K/V).
         """
         self.model = model
+        self.model_type = get_supported_model_type(model)
+        self.patch_target_class_name = MODEL_TYPE_TO_TEXT_BACKBONE_CLASS[self.model_type]
+        self.causal_lm_class_name = type(model).__name__
 
         self.response_len = response_len
         self.max_token_len = max_token_len
@@ -218,17 +289,17 @@ class Qwen3ModelOncePatcher:
         for name, module in self.model.named_modules():
             module_class_name = type(module).__name__
 
-            if module_class_name == "Qwen3Model":
+            if module_class_name == self.patch_target_class_name:
                 # 1. patch the main model
                 self.is_model_patched = True
                 module.forward = self._create_patched_main_model_forward(module, name)
-            elif module_class_name == "Qwen3ForCausalLM":
+            elif module_class_name == self.causal_lm_class_name:
                 # 2. patch the causal_lm module
                 module.forward = self._create_patched_causal_lm_forward(module, name)
 
-        assert (
-            self.is_model_patched
-        ), f"Deduplication is not supported without patching the model for {self.model.__name__}"
+        assert self.is_model_patched, (
+            f"Deduplication is not supported without patching the model for {type(self.model).__name__}"
+        )
 
         # 3. patch the attention layers
         self.attention_patcher = QwenAttentionOncePatcher(
@@ -262,7 +333,11 @@ class Qwen3ModelOncePatcher:
             DynamicCache = getattr(src_mod, "DynamicCache", None)
             create_causal_mask = getattr(src_mod, "create_causal_mask", None)
             create_sliding_window_causal_mask = getattr(src_mod, "create_sliding_window_causal_mask", None)
-            BaseModelOutputWithPast = getattr(src_mod, "BaseModelOutputWithPast", None)
+            BaseModelOutputWithPast = (
+                getattr(src_mod, "BaseModelOutputWithPast", None)
+                or getattr(src_mod, "MoeModelOutputWithPast", None)
+                or _BaseModelOutputWithPast
+            )
 
             # Validate input
             if (input_ids is None) ^ (inputs_embeds is not None):
@@ -273,7 +348,7 @@ class Qwen3ModelOncePatcher:
                 inputs_embeds = ZoRRoTrain.reconstruct_sequences(inputs_embeds_dedup, reconstruction_info)
 
             if use_cache and past_key_values is None:
-                past_key_values = DynamicCache()
+                past_key_values = _init_dynamic_cache(DynamicCache, module.config)
 
             if cache_position is None:
                 past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -289,7 +364,7 @@ class Qwen3ModelOncePatcher:
                 # Prepare mask arguments
                 mask_kwargs = {
                     "config": module.config,
-                    "input_embeds": inputs_embeds,
+                    "inputs_embeds": inputs_embeds,
                     "attention_mask": attention_mask,
                     "cache_position": cache_position,
                     "past_key_values": past_key_values,
@@ -300,25 +375,39 @@ class Qwen3ModelOncePatcher:
                     "full_attention": create_causal_mask(**mask_kwargs),
                 }
                 # The sliding window alternating layers are not always activated depending on the config
-                if module.has_sliding_layers:
+                if getattr(module, "has_sliding_layers", False):
                     causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+
+            linear_attn_mask = _update_linear_attn_mask(module, attention_mask, past_key_values)
 
             hidden_states = inputs_embeds
             # create position embeddings to be shared across the decoder layers
             position_ids_dedup = ZoRRoTrain.deduplicate_sequences(position_ids, reconstruction_info)
             hidden_states_dedup = ZoRRoTrain.deduplicate_sequences(hidden_states, reconstruction_info)
 
-            position_embeddings = module.rotary_emb(hidden_states_dedup, position_ids_dedup)
+            if reconstruction_info.get("is_unpadded", False):
+                position_embeddings = module.rotary_emb(hidden_states_dedup, position_ids_dedup)
+                layer_position_ids = position_ids_dedup
+            else:
+                position_embeddings = module.rotary_emb(hidden_states, position_ids)
+                layer_position_ids = position_ids
 
             # pr0(f"{position_ids_dedup.shape=}")
             # pr0(f"{hidden_states_dedup.shape=}")
             # pr0(f"{position_embeddings[0].shape=}")
 
             for decoder_layer in module.layers[: module.config.num_hidden_layers]:
+                layer_type = getattr(decoder_layer, "layer_type", None)
+                if layer_type == "linear_attention":
+                    layer_mask = linear_attn_mask
+                else:
+                    attention_type = getattr(decoder_layer, "attention_type", "full_attention")
+                    layer_mask = causal_mask_mapping[attention_type]
+
                 hidden_states_dedup = decoder_layer(
                     hidden_states_dedup,
-                    attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                    position_ids=position_ids,
+                    attention_mask=layer_mask,
+                    position_ids=layer_position_ids,
                     past_key_values=past_key_values,
                     use_cache=use_cache,
                     cache_position=cache_position,
@@ -373,7 +462,14 @@ class Qwen3ModelOncePatcher:
 
             # Access helpers from the original defining module
             src_mod = sys.modules[type(module).__module__]
-            BaseModelOutputWithPast = getattr(src_mod, "BaseModelOutputWithPast", None)
+            # MoE model modules (e.g. ``modeling_qwen3_moe``) export ``MoeModelOutputWithPast`` instead of
+            # ``BaseModelOutputWithPast``; fall back to it (and finally to the canonical class) so the patched forward
+            # works for both dense and MoE architectures. We only carry ``last_hidden_state`` through it.
+            BaseModelOutputWithPast = (
+                getattr(src_mod, "BaseModelOutputWithPast", None)
+                or getattr(src_mod, "MoeModelOutputWithPast", None)
+                or _BaseModelOutputWithPast
+            )
 
             if attention_mask is None:
                 raise ValueError("attention_mask is required for ZoRRO")
@@ -425,7 +521,7 @@ class Qwen3ModelOncePatcher:
             pr0(f"{adapted_position_ids.shape=}")
             pr0(f"{adapted_position_ids=}")
 
-            outputs: BaseModelOutputWithPast = model.model(
+            outputs: BaseModelOutputWithPast = _get_text_backbone(model)(
                 input_ids=dedup_input_ids,
                 position_ids=adapted_position_ids,
                 attention_mask=attention_mask,
@@ -473,7 +569,7 @@ class Qwen3ModelOncePatcher:
                 # replay in backward. Use this for long seqlen x large vocab, at the cost of a small additional
                 # forward call.
 
-                see_memory_usage(f"{torch.distributed.get_rank()}: before TiledLogProbEntropy", force=False)
+                # see_memory_usage(f"{torch.distributed.get_rank()}: before TiledLogProbEntropy", force=False)
                 # Size shards so each shard's logits block stays within the configured peak-memory budget
                 # (arctic_rl.logits_optimization_peak_mem_size_in_gib).
                 chunk_rows = _logits_chunk_rows(model.config.vocab_size, peak_mem_gib)
@@ -691,7 +787,14 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
             DynamicCache = getattr(src_mod, "DynamicCache", None)
             create_causal_mask = getattr(src_mod, "create_causal_mask", None)
             create_sliding_window_causal_mask = getattr(src_mod, "create_sliding_window_causal_mask", None)
-            BaseModelOutputWithPast = getattr(src_mod, "BaseModelOutputWithPast", None)
+            # MoE model modules (e.g. ``modeling_qwen3_moe``) export ``MoeModelOutputWithPast`` instead of
+            # ``BaseModelOutputWithPast``; fall back to it (and finally to the canonical class) so the patched forward
+            # works for both dense and MoE architectures. We only carry ``last_hidden_state`` through it.
+            BaseModelOutputWithPast = (
+                getattr(src_mod, "BaseModelOutputWithPast", None)
+                or getattr(src_mod, "MoeModelOutputWithPast", None)
+                or _BaseModelOutputWithPast
+            )
 
             # Validate input
             if (input_ids is None) ^ (inputs_embeds is not None):
@@ -775,7 +878,14 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
             DynamicCache = getattr(src_mod, "DynamicCache", None)
             create_causal_mask = getattr(src_mod, "create_causal_mask", None)
             create_sliding_window_causal_mask = getattr(src_mod, "create_sliding_window_causal_mask", None)
-            BaseModelOutputWithPast = getattr(src_mod, "BaseModelOutputWithPast", None)
+            # MoE model modules (e.g. ``modeling_qwen3_moe``) export ``MoeModelOutputWithPast`` instead of
+            # ``BaseModelOutputWithPast``; fall back to it (and finally to the canonical class) so the patched forward
+            # works for both dense and MoE architectures. We only carry ``last_hidden_state`` through it.
+            BaseModelOutputWithPast = (
+                getattr(src_mod, "BaseModelOutputWithPast", None)
+                or getattr(src_mod, "MoeModelOutputWithPast", None)
+                or _BaseModelOutputWithPast
+            )
 
             # Validate input
             if (input_ids is None) ^ (inputs_embeds is not None):
