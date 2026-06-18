@@ -19,7 +19,8 @@ This is the patcher the DeepSpeed worker installs (``deepspeed_worker.py``). It 
 and then computes deduplicated forward/backward internally: called with the full ``[B, S]`` batch it deduplicates
 shared prompts, runs the model on the packed sequence, and returns per-response-token ``logprobs`` / ``entropy`` in
 the original sample order (no padding). Driven here directly (single process, ``world_size=1``, so no collectives)
-across all three ``logits_optimization`` dispatch modes (``none`` / ``memory`` / ``compute``)::
+on a real small checkpoint, across all three ``logits_optimization`` dispatch modes (``none`` / ``memory`` /
+``compute``)::
 
     pytest tests/zorro_train/test_once_patcher.py
 
@@ -36,6 +37,7 @@ the deduplicated length). The CPU-only algorithm round-trips live in ``test_dedu
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 from parameterized import parameterized
 from transformers import AutoModelForCausalLM
 
@@ -45,6 +47,8 @@ from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import torch_assert_close
 
+model_name = "Qwen/Qwen3-0.6B"
+attn_implementation = "flash_attention_2"
 device = "cuda"
 
 batch_size = 6
@@ -111,6 +115,13 @@ class QwenOncePatcherTestMixin:
 
     @classmethod
     def setUpClass(cls):
+        # The "memory" logits-optimization path calls torch.distributed.get_rank(), so it needs a process group --
+        # which the production DeepSpeed worker always has. A full pytest run can reach here after the GPU RL tests
+        # have torn down the session group, so stand up a single-rank one if missing (and restore on teardown).
+        cls._created_process_group = not dist.is_initialized()
+        if cls._created_process_group:
+            dist.init_process_group(backend="gloo", world_size=1, rank=0, store=dist.HashStore())
+
         cls.model = AutoModelForCausalLM.from_pretrained(
             cls.model_name,
             dtype=torch.bfloat16,
@@ -122,6 +133,11 @@ class QwenOncePatcherTestMixin:
             (prompt_length, add_padding): _build_case(cls.model, prompt_length, add_padding)
             for prompt_length, add_padding in cls.promptlen_padding_cases
         }
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._created_process_group and dist.is_initialized():
+            dist.destroy_process_group()
 
     def _patch_and_forward(self, logits_optimization: str, calculate_entropy: bool, batch=None):
         Qwen3ModelOncePatcher(
@@ -199,10 +215,10 @@ class TestQwen3NextModelOncePatcher(QwenOncePatcherTestMixin, TestCasePlus):
 class TestQwen36ModelOncePatcher(QwenOncePatcherTestMixin, TestCasePlus):
     model_name = "tiny-random/qwen3.6"
     promptlen_padding_cases = [
-        (16, False),  
-        (64, False),  
-        (160, False), 
-        (160, True), 
+        (16, False),
+        (64, False),
+        (160, False),
+        (160, True),
     ]
 
 @require_torch_gpu

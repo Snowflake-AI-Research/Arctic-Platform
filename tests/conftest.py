@@ -194,14 +194,3 @@ def _setup_dist():
     os.environ["LOCAL_SIZE"] = "1"
 
     init_distributed(auto_mpi_discovery=False)
-
-
-# # Load helper functions automatically for all tests
-# @pytest.fixture(scope="session", autouse=True)
-# def helpers_code_path() -> None:
-#     from . import helpers  # noqa: F401
-
-
-# @pytest.fixture(scope="session")
-# def model_name() -> str:
-#     return "hf-internal-testing/tiny-random-Olmo2ForCausalLM"

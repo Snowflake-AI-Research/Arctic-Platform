@@ -145,7 +145,6 @@ class ArcticRLRayClient:
         job_config: dict[str, Any] = {
             "model_name": self.config.model_name,
             "job_type": job_type,
-            "use_arctic_inference": self.config.use_arctic_inference,
             "full_determinism": self.config.full_determinism,
             "seed": self.config.seed,
         }
@@ -173,6 +172,8 @@ class ArcticRLRayClient:
             if job_type == "training":
                 job_config["checkpoint_path"] = self.config.checkpoint_path
         else:
+            if self.config.arctic_inference_config:
+                job_config["arctic_inference_config"] = self.config.arctic_inference_config
             if self.config.vllm_config:
                 job_config["vllm_config"] = self.config.vllm_config
 
@@ -420,6 +421,16 @@ class ArcticRLRayClient:
         )
         response = await self._arctic_rl_ray_server.sync_weights(request)
         pr0(f"[ArcticRLClient] sync_weights OUTPUT: {response.keys()=}")
+        return response
+
+    async def weight_norm(self) -> dict[str, Any]:
+        """Global L2 weight norm of the training and sampling engines.
+
+        Returns ``{"training_norm", "sampling_norm", ...}``. After a weight sync the two norms must match (the metric
+        is invariant to each engine's parameter sharding/fusion). Intended for tests verifying sync correctness.
+        """
+        response = await self._arctic_rl_ray_server.weight_norm(self.training_job_id, self.sampling_job_id)
+        pr0(f"[ArcticRLClient] weight_norm OUTPUT: {response=}")
         return response
 
     # ------------------------------------------------------------------

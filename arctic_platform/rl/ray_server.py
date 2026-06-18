@@ -93,7 +93,7 @@ class JobConfig(BaseModel):
     ds_worker_config: Optional[dict] = None
     vllm_config: Optional[dict] = None
     checkpoint_path: Optional[str] = None
-    use_arctic_inference: bool = False
+    arctic_inference_config: Optional[dict] = None
     full_determinism: bool = False
     seed: int = 42
 
@@ -117,10 +117,23 @@ class SyncWeightsRequest(BaseModel):
     low_memory: bool = False
 
 
-def _build_model_config(model_name: str, vllm_config: dict | None) -> ModelConfig:
-    """Construct a :class:`ModelConfig` from user-supplied vllm_config dict."""
+def _build_model_config(
+    model_name: str,
+    vllm_config: dict | None,
+    arctic_inference_config: dict | None = None,
+) -> ModelConfig:
+    """Construct a :class:`ModelConfig` from user-supplied vllm_config dict.
+
+    `arctic_inference_config` carries Arctic-platform signals (e.g. use_fca,
+    spec_model) that are not vLLM engine args: they are recorded on the
+    ModelConfig, which expands them into real engine kwargs in
+    `ModelConfig.to_engine_kwargs()`.
+    """
+
     cfg = dict(vllm_config or {})
     cfg["model"] = model_name
+    cfg.update(arctic_inference_config or {})
+
     known_fields = set(ModelConfig.model_fields.keys())
     extra = {k: v for k, v in cfg.items() if k not in known_fields}
     base = {k: v for k, v in cfg.items() if k in known_fields}
@@ -388,7 +401,9 @@ class ArcticRLRayServerState(ArcticRLServerState):
             vllm_cfg = dict(job_config.vllm_config or {})
             if colocate:
                 vllm_cfg["enable_sleep_mode"] = True
-            model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
+            model_cfg = _build_model_config(
+                job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+            )
             tp = model_cfg.tensor_parallel_size
             num_replicas = gpus // tp
             if colocate and placement:
@@ -397,8 +412,10 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 if tp > 1:
                     extra_env["VLLM_RAY_PER_WORKER_GPUS"] = str(_COLOCATE_GPU_FRACTIONS["sampling"])
                     vllm_cfg["distributed_executor_backend"] = "ray"
-                    model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
-                if job_config.use_arctic_inference:
+                    model_cfg = _build_model_config(
+                        job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+                    )
+                if job_config.arctic_inference_config:
                     extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
                     # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
                     # override the global VLLM_DISABLE_COMPILE_CACHE=1 set in the verl runtime_env.
@@ -457,7 +474,9 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 lp_vllm_cfg = dict(job_config.vllm_config or {})
                 if colocate:
                     lp_vllm_cfg["enable_sleep_mode"] = True
-                model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
+                model_cfg = _build_model_config(
+                    job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
+                )
                 lp_tp = model_cfg.tensor_parallel_size
                 num_replicas = gpus // lp_tp
                 if colocate and placement:
@@ -474,8 +493,12 @@ class ArcticRLRayServerState(ArcticRLServerState):
                         # need to be set here.
                         lp_extra_env.pop("CUDA_VISIBLE_DEVICES", None)
                         lp_vllm_cfg["distributed_executor_backend"] = "ray"
-                        model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
-                    if job_config.use_arctic_inference:
+                        model_cfg = _build_model_config(
+                            job_config.model_name,
+                            lp_vllm_cfg,
+                            arctic_inference_config=job_config.arctic_inference_config,
+                        )
+                    if job_config.arctic_inference_config:
                         lp_extra_env["ARCTIC_INFERENCE_ENABLED"] = "1"
                         # vllm-project/vllm#31199 was fixed in 0.18.0 (vllm-project/vllm#35420);
                         # override the global VLLM_DISABLE_COMPILE_CACHE=1 set in the verl runtime_env.
@@ -700,7 +723,7 @@ class ArcticRLRayServer:
     #         vllm_cfg = dict(job_config.vllm_config or {})
     #         if colocate:
     #             vllm_cfg["enable_sleep_mode"] = True
-    #         model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
+    #         model_cfg = _build_model_config(job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
     #         tp = model_cfg.tensor_parallel_size
     #         num_replicas = gpus // tp
     #         if colocate and pg is not None:
@@ -709,7 +732,7 @@ class ArcticRLRayServer:
     #             if tp > 1:
     #                 extra_env["VLLM_RAY_PER_WORKER_GPUS"] = str(_COLOCATE_GPU_FRACTIONS["sampling"])
     #                 vllm_cfg["distributed_executor_backend"] = "ray"
-    #                 model_cfg = _build_model_config(job_config.model_name, vllm_cfg)
+    #                 model_cfg = _build_model_config(job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
     #             await pool.initialize(
     #                 model_cfg,
     #                 num_replicas=num_replicas,
@@ -752,7 +775,7 @@ class ArcticRLRayServer:
     #             lp_vllm_cfg = dict(job_config.vllm_config or {})
     #             if colocate:
     #                 lp_vllm_cfg["enable_sleep_mode"] = True
-    #             model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
+    #             model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
     #             lp_tp = model_cfg.tensor_parallel_size
     #             num_replicas = gpus // lp_tp
     #             if colocate and pg is not None:
@@ -764,7 +787,7 @@ class ArcticRLRayServer:
     #                     lp_extra_env["VLLM_RAY_BUNDLE_INDICES"] = ",".join(str(b) for b in lp_bundles[:lp_tp])
     #                     lp_extra_env.pop("CUDA_VISIBLE_DEVICES", None)
     #                     lp_vllm_cfg["distributed_executor_backend"] = "ray"
-    #                     model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg)
+    #                     model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
     #                 await pool.initialize(
     #                     model_cfg,
     #                     num_replicas=num_replicas,
@@ -1133,6 +1156,27 @@ class ArcticRLRayServer:
         # await asyncio.gather(receive_task, *send_tasks)
         # logger.info("Weight sync complete in %.3fs (%d group(s))", time.monotonic() - t0, len(schedule.groups))
         # return {"status": "ok"}
+
+    async def weight_norm(self, training_job_id: int, sampling_job_id: int) -> dict[str, Any]:
+        """Global L2 weight norm of the training (DeepSpeed) and sampling (vLLM) engines.
+
+        Both are computed as sqrt of the sum of squares over all params, which is invariant to how each engine shards
+        / fuses its parameters -- so after a weight sync the two values must match. Used by tests to verify sync
+        correctness.
+        """
+        self._verify_job(training_job_id, "training")
+        self._verify_job(sampling_job_id, "sampling")
+        loop = asyncio.get_running_loop()
+        training = await loop.run_in_executor(None, ray.get, self.training_workers[0].weight_norm.remote())
+        sampling = await loop.run_in_executor(
+            None, ray.get, self.sampling_pool._workers[0].compute_weight_norm.remote()
+        )
+        return {
+            "training_norm": training["norm"],
+            "sampling_norm": sampling["norm"],
+            "training_num_params": training["num_params"],
+            "sampling_num_params": sampling["num_params"],
+        }
 
     async def _sync_weights_cuda_ipc(self, workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None) -> dict:
         """Colocated weight sync via CUDA IPC (zero-copy, same GPU).
