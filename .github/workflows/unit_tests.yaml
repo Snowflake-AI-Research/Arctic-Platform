@@ -13,15 +13,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unit-tests:
+  # Diff-based test selection (see utils/tests_fetcher.py). Cheap job: just git +
+  # stdlib python, no heavy deps. It traces the import graph from the files this
+  # PR changed to the impacted tests and exposes them to the test job below.
+  # On push to main (or when shared infra changes) it selects the whole suite.
+  select-tests:
     runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.fetch.outputs.mode }}
+      tests: ${{ steps.fetch.outputs.tests }}
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with:
+          # Full history so we can diff against the base branch's merge-base.
+          fetch-depth: 0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.12'
+      - name: Determine base ref
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git config --global --add safe.directory '*'
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # Make sure the base branch is available locally for the diff.
+            git fetch --no-tags origin "$BASE_REF"
+            echo "ref=origin/$BASE_REF" >> "$GITHUB_OUTPUT"
+          else
+            # push to main (or anything else): run everything.
+            echo "ref=" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Select impacted tests
+        id: fetch
+        run: |
+          python utils/tests_fetcher.py --base "${{ steps.base.outputs.ref }}"
+
+  unit-tests:
+    needs: select-tests
+    # NOTE: this is a required check, so the job must always run and report a
+    # status. We don't skip it at the job level; instead, when nothing is
+    # impacted (mode=none) every expensive step below is skipped via its own
+    # `if`, so the job completes (green) almost instantly without installing
+    # anything or running pytest.
+    runs-on: ubuntu-latest
+    env:
+      RUN_TESTS: ${{ needs.select-tests.outputs.mode != 'none' }}
+    steps:
+      - name: No impacted tests
+        if: env.RUN_TESTS != 'true'
+        run: echo "No tests impacted by this diff (mode=${{ needs.select-tests.outputs.mode }}); nothing to run."
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        if: env.RUN_TESTS == 'true'
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        if: env.RUN_TESTS == 'true'
         id: setup_python
         with:
           python-version: '3.12'
       - name: Get latest dependency versions
+        if: env.RUN_TESTS == 'true'
         id: get_latest_versions
         run: |
           torch_version=$(python -m pip index versions torch --index-url https://download.pytorch.org/whl/cpu | perl -ne 'm|Available versions: ([\d\.]+)| && print $1')
@@ -29,21 +80,25 @@ jobs:
           versions="torch-$torch_version-deepspeed-$deepspeed_version"
           echo "versions=$versions" >> $GITHUB_OUTPUT
       - name: Restore cached virtualenv
+        if: env.RUN_TESTS == 'true'
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           key: venv-${{ runner.os }}-${{ steps.setup_python.outputs.python-version }}-${{ steps.get_latest_versions.outputs.versions }}-${{ hashFiles('pyproject.toml') }}
           path: .venv
       - name: Restore cached torch extensions
+        if: env.RUN_TESTS == 'true'
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: ~/.cache/torch_extensions
           key: torch-extensions-${{ runner.os }}-${{ steps.setup_python.outputs.python-version }}-${{ steps.get_latest_versions.outputs.versions }}
       - name: Restore huggingface cache
+        if: env.RUN_TESTS == 'true'
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
           path: ~/.cache/huggingface
           key: huggingface-cache-${{ runner.os }}-${{ steps.setup_python.outputs.python-version }}-${{ steps.get_latest_versions.outputs.versions }}
       - name: Setup environment
+        if: env.RUN_TESTS == 'true'
         run: |
           pip install uv
           if [ ! -d .venv ]; then
@@ -55,9 +110,16 @@ jobs:
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install ".[testing]"
       - name: Environment print
+        if: env.RUN_TESTS == 'true'
         run: |
           uv pip list
       - name: Unit Tests
+        if: env.RUN_TESTS == 'true'
+        # Run from the repo root with the explicit list of impacted tests
+        # (mode=all => every test file; mode=subset => only the impacted ones).
+        env:
+          SELECTED_TESTS: ${{ needs.select-tests.outputs.tests }}
         run: |
-          cd tests
-          python -m pytest . -m "not gpu" -s -v
+          echo "Selection mode: ${{ needs.select-tests.outputs.mode }}"
+          echo "Running tests: $SELECTED_TESTS"
+          python -m pytest $SELECTED_TESTS -m "not gpu" -s -v
