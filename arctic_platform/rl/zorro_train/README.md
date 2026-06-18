@@ -223,7 +223,7 @@ Expected speedups depend on the deduplication ratio:
 ## Project Structure
 
 ```
-dedup_prompt_optimization/
+zorro_train/
 ├── README.md                      # This file
 ├── __init__.py
 ├── actor.py                       # Main actor class with deduplication

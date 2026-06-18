@@ -1,13 +1,9 @@
-[![License Apache 2.0](https://badgen.net/badge/license/apache2.0/blue)](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/main/LICENSE)
-[![PyPI version](https://badge.fury.io/py/arctic-platform.svg)](https://pypi.org/project/arctic-platform/)
-
-<h3 align="center">
-  <img src="docs/images/arctic_platform_logo.svg" width=500px><br>
-</h3>
+[License Apache 2.0](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/main/LICENSE)
+[PyPI version](https://pypi.org/project/arctic-platform/)
 
 # ArcticPlatform: Simplifying and Accelerating Post-Training for LLMs
 
-ArcticPlatform is a framework designed to simplify and accelerate the post-training process for large language models (LLMs). It addresses challenges in current frameworks, such as limited support for rapid prototyping and the lack of native data generation tools, by offering modular trainer designs, simplified code structures, and integrated pipelines for creating and cleaning synthetic data. These features enable users to enhance LLM capabilities, like code generation and complex reasoning, with greater efficiency and flexibility. Read more about ArcticPlatform [in our blog](https://www.snowflake.com/en/engineering-blog/arcticplatform-llm-post-training-framework/).
+ArcticPlatform is a framework for addressing challenges in current frameworks, such as limited support for rapid prototyping and the lack of native data generation tools, by offering modularity across training and inference components, simplified code structures, and integrated pipelines for creating and cleaning synthetic data. These features enable users to enhance LLM capabilities, like code generation and complex reasoning, with greater efficiency and flexibility. Read more about ArcticPlatform [in our blog](https://www.snowflake.com/en/engineering-blog/arcticplatform-llm-post-training-framework/).
 
 This is a work in progress, starting with the RL components, later integrating more training and inference components.
 
@@ -17,6 +13,7 @@ ArcticPlatform aims to cover the full post-training stack for LLMs behind a smal
 
 - **Reinforcement Learning (available today)** — a high-throughput RL training/inference backend that plugs into existing RL frameworks (see below).
 - **ZoRRO Train (available today)** — a prompt-deduplication optimization that removes redundant prompt computation during RL training (see below).
+- ZoRRO Inference (available today) — forest cascade attention for efficient rollout step that eliminates redundant memory accesses via grouping (see below).
 - **Coming next** — additional trainers (SFT/distillation), synthetic data generation and cleaning pipelines, and tighter inference integration.
 
 ## Reinforcement Learning
@@ -45,7 +42,7 @@ config = ArcticRLClientConfig(
 client = create_arctic_rl_client(config)
 ```
 
-The reference integration is [verl](https://github.com/volcengine/verl) (https://github.com/verl-project/verl/pull/6422), which drives Arctic RL from its PPO/GRPO trainer. End-to-end recipes live under [`arctic_platform/rl`](arctic_platform/rl/README.md), including [Txt2SQL](arctic_platform/rl/projects/txt2sql) and [long-context QA](arctic_platform/rl/projects/long_context_qa).
+The reference integration is [verl](https://github.com/volcengine/verl) ([https://github.com/verl-project/verl/pull/6422](https://github.com/verl-project/verl/pull/6422)), which drives Arctic RL from its PPO/GRPO trainer. End-to-end recipes live under `[arctic_platform/rl](arctic_platform/rl/README.md)`, including [Txt2SQL](arctic_platform/rl/projects/txt2sql) and [long-context QA](arctic_platform/rl/projects/long_context_qa).
 
 Many more frameworks integrations are in works and will be added here once available.
 
@@ -67,7 +64,17 @@ Supported model families today:
 
 This spans dense, MoE, and hybrid (linear + full attention) architectures, and **more models will be added in the future**.
 
-See [`arctic_platform/rl/zorro_train/README.md`](arctic_platform/rl/zorro_train/README.md) for the full design, the deduplication/attention internals, and benchmarks.
+See `[arctic_platform/rl/zorro_train/README.md](arctic_platform/rl/zorro_train/README.md)` for the full design, the deduplication/attention internals, and benchmarks.
+
+### ZoRRO Inference
+
+During RL rollouts many sequences are generated from the same prompt. In the decode step, standard attention re-reads the KV cache of those shared prefixes **once per request**, so the sampler spends most of its memory bandwidth fetching identical keys and values over and over.
+
+**ZoRRO Inference** removes that waste with **Forest Cascade Attention (FCA)**, which deduplicates shared KV reads at the attention layer of the sampling engine. For each decode batch it discovers groups of requests that share a KV-cache prefix and splits each attention call into a single grouped pass over the shared prefix blocks plus a per-request pass over the unique suffix blocks, then merges the two partial results with log-sum-exp weighting. This reads each shared prefix block once per *group* instead of once per *request*, cutting redundant memory accesses while remaining mathematically equivalent to standard attention — the longer and more-shared the prefixes, the larger the win.
+
+It is implemented in the vLLM sampling engine and activates transparently for decode-heavy batches with shared prefixes.
+
+See the [Forest Cascade Attention README](https://github.com/Snowflake-AI-Research/ArcticInference) in Arctic Inference for the full design, the grouping/attention internals, and the tuning knobs.
 
 # Installation
 
@@ -91,4 +98,4 @@ pip install -e .
 
 # Quickstart
 
-To get started training a model with ArcticPlatform, first [install the package](#installation), then follow the recipes under [`arctic_platform/rl`](arctic_platform/rl/README.md).
+To get started training a model with ArcticPlatform, first [install the package](#installation), then follow the recipes under `[arctic_platform/rl](arctic_platform/rl/README.md)`.
