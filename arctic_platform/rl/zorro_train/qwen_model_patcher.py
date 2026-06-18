@@ -110,12 +110,39 @@ def _get_text_backbone(causal_lm_model):
     return getattr(backbone, "language_model", backbone)
 
 
-def _update_linear_attn_mask(module, attention_mask, past_key_values):
+def _update_linear_attn_mask(module, attention_mask, past_key_values, cache_position):
     update_fn = getattr(module, "_update_linear_attn_mask", None)
     if update_fn is None:
         return None
 
-    return update_fn(attention_mask, past_key_values)
+    # transformers changed this model method's 2nd positional arg: recent versions take ``past_key_values``,
+    # transformers <= 4.57 takes ``cache_position``.
+    try:
+        if "past_key_values" in inspect.signature(update_fn).parameters:
+            return update_fn(attention_mask, past_key_values)
+    except (TypeError, ValueError):
+        pass
+    return update_fn(attention_mask, cache_position)
+
+
+def _build_mask_kwargs(create_mask_fn, config, inputs_embeds, attention_mask, cache_position, past_key_values, position_ids):
+    """Build kwargs for ``create_causal_mask`` / ``create_sliding_window_causal_mask`` using the embeds keyword the
+    ``inputs_embeds`` on recent versions, ``input_embeds`` on transformers <= 4.57."""
+    mask_kwargs = {
+        "config": config,
+        "attention_mask": attention_mask,
+        "cache_position": cache_position,
+        "past_key_values": past_key_values,
+        "position_ids": position_ids,
+    }
+    try:
+        params = inspect.signature(create_mask_fn).parameters
+        embeds_key = "input_embeds" if ("input_embeds" in params and "inputs_embeds" not in params) else "inputs_embeds"
+    except (TypeError, ValueError):
+        embeds_key = "inputs_embeds"
+    mask_kwargs[embeds_key] = inputs_embeds
+    return mask_kwargs
+
 
 try:
     from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
@@ -362,14 +389,15 @@ class Qwen3ModelOncePatcher:
             # It may already have been prepared by e.g. `generate`
             if not isinstance(causal_mask_mapping := attention_mask, dict):
                 # Prepare mask arguments
-                mask_kwargs = {
-                    "config": module.config,
-                    "inputs_embeds": inputs_embeds,
-                    "attention_mask": attention_mask,
-                    "cache_position": cache_position,
-                    "past_key_values": past_key_values,
-                    "position_ids": position_ids,
-                }
+                mask_kwargs = _build_mask_kwargs(
+                    create_causal_mask,
+                    module.config,
+                    inputs_embeds,
+                    attention_mask,
+                    cache_position,
+                    past_key_values,
+                    position_ids,
+                )
                 # Create the masks
                 causal_mask_mapping = {
                     "full_attention": create_causal_mask(**mask_kwargs),
@@ -378,7 +406,7 @@ class Qwen3ModelOncePatcher:
                 if getattr(module, "has_sliding_layers", False):
                     causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
-            linear_attn_mask = _update_linear_attn_mask(module, attention_mask, past_key_values)
+            linear_attn_mask = _update_linear_attn_mask(module, attention_mask, past_key_values, cache_position)
 
             hidden_states = inputs_embeds
             # create position embeddings to be shared across the decoder layers
@@ -817,15 +845,16 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
 
             # It may already have been prepared by e.g. `generate`
             if not isinstance(causal_mask_mapping := attention_mask, dict):
-                # Prepare mask arguments
-                mask_kwargs = {
-                    "config": module.config,
-                    "input_embeds": inputs_embeds,
-                    "attention_mask": attention_mask,
-                    "cache_position": cache_position,
-                    "past_key_values": past_key_values,
-                    "position_ids": position_ids,
-                }
+                # Prepare mask arguments.
+                mask_kwargs = _build_mask_kwargs(
+                    create_causal_mask,
+                    module.config,
+                    inputs_embeds,
+                    attention_mask,
+                    cache_position,
+                    past_key_values,
+                    position_ids,
+                )
                 # Create the masks
                 causal_mask_mapping = {
                     "full_attention": create_causal_mask(**mask_kwargs),
@@ -909,15 +938,16 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
 
             # It may already have been prepared by e.g. `generate`
             if not isinstance(causal_mask_mapping := attention_mask, dict):
-                # Prepare mask arguments
-                mask_kwargs = {
-                    "config": module.config,
-                    "input_embeds": inputs_embeds,
-                    "attention_mask": attention_mask,
-                    "cache_position": cache_position,
-                    "past_key_values": past_key_values,
-                    "position_ids": position_ids,
-                }
+                # Prepare mask arguments.
+                mask_kwargs = _build_mask_kwargs(
+                    create_causal_mask,
+                    module.config,
+                    inputs_embeds,
+                    attention_mask,
+                    cache_position,
+                    past_key_values,
+                    position_ids,
+                )
                 # Create the masks
                 causal_mask_mapping = {
                     "full_attention": create_causal_mask(**mask_kwargs),
