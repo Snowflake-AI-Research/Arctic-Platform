@@ -5,15 +5,15 @@
   <img src="docs/images/arctic_platform_logo.svg" width=500px><br>
 </h3>
 
-# ArcticPlatform: Simplifying and Accelerating Post-Training for LLMs
+# Arctic Platform: Simplifying and Accelerating Post-Training for LLMs
 
-ArcticPlatform is a framework for addressing challenges in current frameworks, such as limited support for rapid prototyping and the lack of native data generation tools, by offering modularity across training and inference components, simplified code structures, and integrated pipelines for creating and cleaning synthetic data. These features enable users to enhance LLM capabilities, like code generation and complex reasoning, with greater efficiency and flexibility. Read more about ArcticPlatform [in our blog](https://www.snowflake.com/en/engineering-blog/arcticplatform-llm-post-training-framework/).
+Arctic Platform is a framework for addressing challenges in current frameworks, such as limited support for rapid prototyping and the lack of native data generation tools, by offering modularity across training and inference components, simplified code structures, and integrated pipelines for creating and cleaning synthetic data. These features enable users to enhance LLM capabilities, like code generation and complex reasoning, with greater efficiency and flexibility.
 
 This is a work in progress, starting with the RL components, later integrating more training and inference components.
 
 # Project Scope
 
-ArcticPlatform aims to cover the full post-training stack for LLMs behind a small, composable API. The codebase is being built out incrementally:
+Arctic Platform aims to cover the full post-training stack for LLMs behind a small, composable API. The codebase is being built out incrementally:
 
 - **Reinforcement Learning (available today)** — a high-throughput RL training/inference backend that plugs into existing RL frameworks (see below).
 - **ZoRRO Train (available today)** — a prompt-deduplication optimization that removes redundant prompt computation during RL training (see below).
@@ -22,7 +22,7 @@ ArcticPlatform aims to cover the full post-training stack for LLMs behind a smal
 
 ## Reinforcement Learning
 
-Arctic RL is designed to **integrate into existing RL frameworks** rather than replace them. The RL framework keeps ownership of the training loop, rollouts, rewards, and advantage estimation; ArcticPlatform provides the heavy compute engines behind a thin client:
+Arctic RL is designed to **integrate into existing RL frameworks** rather than replace them. The RL framework keeps ownership of the training loop, rollouts, rewards, and advantage estimation; Arctic Platform provides the heavy compute engines behind a thin client:
 
 - **Training engine** — a DeepSpeed engine that runs forward/backward and the optimizer step.
 - **Log-prob / reference engine** — a forward-only DeepSpeed engine for reference / old log-prob computation.
@@ -102,4 +102,4 @@ pip install -e .
 
 # Quickstart
 
-To get started training a model with ArcticPlatform, first [install the package](#installation), then follow the recipes under `[arctic_platform/rl](arctic_platform/rl/README.md)`.
+To get started training a model with Arctic Platform, first [install the package](#installation), then follow the recipes under `[arctic_platform/rl](arctic_platform/rl/README.md)`.
