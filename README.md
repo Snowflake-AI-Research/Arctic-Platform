@@ -1,5 +1,9 @@
-[License Apache 2.0](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/main/LICENSE)
-[PyPI version](https://pypi.org/project/arctic-platform/)
+[![License Apache 2.0](https://badgen.net/badge/license/apache2.0/blue)](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/main/LICENSE)
+[![PyPI version](https://badge.fury.io/py/arctic-platform.svg)](https://pypi.org/project/arctic-platform/)
+
+<h3 align="center">
+  <img src="docs/images/arctic_platform_logo.svg" width=500px><br>
+</h3>
 
 # ArcticPlatform: Simplifying and Accelerating Post-Training for LLMs
 
@@ -74,7 +78,7 @@ During RL rollouts many sequences are generated from the same prompt. In the dec
 
 It is implemented in the vLLM sampling engine and activates transparently for decode-heavy batches with shared prefixes.
 
-See the [Forest Cascade Attention README](https://github.com/Snowflake-AI-Research/ArcticInference) in Arctic Inference for the full design, the grouping/attention internals, and the tuning knobs.
+See the [Forest Cascade Attention README](https://github.com/snowflakedb/ArcticInference/tree/arctic_rl/integration/arctic_inference/vllm/attention) in Arctic Inference for the full design, the grouping/attention internals, and the tuning knobs.
 
 # Installation
 
