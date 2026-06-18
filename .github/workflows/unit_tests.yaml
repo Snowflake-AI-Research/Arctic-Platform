@@ -55,7 +55,7 @@ jobs:
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install ".[testing]"
           # XXX: temporary install of ArcticInference from github - update to PyPI once the new version is available
-          uv pip install git+https://github.com/snowflakedb/ArcticInference@arctic_rl/integration
+          uv pip install --no-build-isolation git+https://github.com/snowflakedb/ArcticInference@arctic_rl/integration
       - name: Environment print
         run: |
           uv pip list
