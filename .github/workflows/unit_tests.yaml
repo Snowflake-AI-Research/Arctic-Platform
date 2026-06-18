@@ -61,7 +61,7 @@ jobs:
           # build-env interpreter, which has nanobind from ArcticInference's build-system.requires.
           env -u Python_ROOT_DIR -u Python2_ROOT_DIR -u Python3_ROOT_DIR -u pythonLocation \
             uv pip install git+https://github.com/snowflakedb/ArcticInference@arctic_rl/integration
-          uv pip install vllm==0.18.0       
+          uv pip install vllm==0.18.0
       - name: Environment print
         run: |
           uv pip list
