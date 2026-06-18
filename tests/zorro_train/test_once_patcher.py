@@ -95,7 +95,7 @@ model_names = [
 attn_implementations = ["flash_attention_2", "eager"]
 add_padding_modes = [True, False]
 
-model_attn_logits_cases = itertools.product(model_names, attn_implementations, add_padding_modes, logits_optimization_modes)
+model_attn_logits_cases = list(itertools.product(model_names, attn_implementations, add_padding_modes, logits_optimization_modes))
 
 
 @functools.lru_cache(maxsize=None)
