@@ -64,7 +64,8 @@ dependencies = [
     "tabulate",
     "torch",
     "tqdm",
-    "transformers>=5.5",
+    "transformers>=4.57.0,<5",
+#    "transformers>=5.5", # want to switch to v5 but vllm18 blocks us at v4
     "wandb",
     "yq",
 ]
