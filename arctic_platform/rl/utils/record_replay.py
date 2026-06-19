@@ -1,8 +1,26 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import functools
+import inspect
 import os
-from contextlib import contextmanager
 from pathlib import Path
-from arctic_platform.rl.utils.debug import print_rank0 as pr0
+
 import torch
+
+from arctic_platform.rl.utils.debug import print_rank0 as pr0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -27,9 +45,7 @@ def _replay_generation_dir() -> Path:
 def _replay_generation_mode() -> str:
     mode = os.environ.get("REPLAY_GENERATION_MODE", "record").lower()
     if mode not in ("record", "load"):
-        raise ValueError(
-            f"Invalid REPLAY_GENERATION_MODE={mode!r}; expected 'record' or 'load'"
-        )
+        raise ValueError(f"Invalid REPLAY_GENERATION_MODE={mode!r}; expected 'record' or 'load'")
     return mode
 
 
@@ -59,9 +75,7 @@ class RecordReplay:
                 self.dir.mkdir(parents=True, exist_ok=True)
             elif self.is_replay_mode():
                 if not self.dir.exists():
-                    raise FileNotFoundError(
-                        f"[REPLAY_GENERATION] load mode requires {self.dir}"
-                    )
+                    raise FileNotFoundError(f"[REPLAY_GENERATION] load mode requires {self.dir}")
 
     def is_enabled(self) -> bool:
         return self.enabled and self.dir is not None
@@ -85,44 +99,92 @@ class RecordReplay:
         if self.is_replay_mode():
             replay_path = self.dir / f"generate-{record_index}.pickle"
             if not replay_path.exists():
-                raise FileNotFoundError(
-                    f"[REPLAY_GENERATION] load mode requires {replay_path}"
-                )
+                raise FileNotFoundError(f"[REPLAY_GENERATION] load mode requires {replay_path}")
             pr0(f"[REPLAY_GENERATION] loading {replay_path}")
             return torch.load(replay_path, weights_only=False)
 
 
-class RecordReplayContext:
-    """Per-record ``with`` wrapper around :class:`RecordReplay`.
+def record_replay_generation(func):
+    """``lru_cache``-style record/replay decorator for a generation function.
 
-        with record_replay.generation(c) as gen:
-            gen_batch_output = gen.output or generate_sequences(...)
+    Wrap ``generate_sequences`` (or any function that produces rollout data) and,
+    depending on the ``REPLAY_GENERATION*`` env vars, transparently record its
+    outputs to disk or replay previously recorded outputs instead of calling it.
 
-    Enter preloads ``output`` in replay mode (else ``None``); exit saves it in
-    record mode. Not re-entrant: ``output`` lives on the instance.
+    Example::
+
+        from arctic_platform.rl.utils import record_replay_generation
+
+        # Decorate the generation function at its definition...
+        @record_replay_generation
+        def generate_sequences(prompts, **kwargs):
+            ...
+            return gen_batch_output
+
+        # ...then call it exactly as before -- no extra arguments, no `with`:
+        gen_batch_output = generate_sequences(prompts)
+
+    Driven by env vars (read lazily on first call):
+
+    * record a run:  ``REPLAY_GENERATION=1 REPLAY_GENERATION_MODE=record \\
+                       REPLAY_GENERATION_DIR=/path/to/dir``
+    * replay it:     ``REPLAY_GENERATION=1 REPLAY_GENERATION_MODE=load \\
+                       REPLAY_GENERATION_DIR=/path/to/dir``
+      (optionally ``REPLAY_START_RECORD=N`` to regenerate the first N calls).
+
+    Behaviour, decided per call:
+
+    * **disabled** (default): pass straight through to the wrapped function.
+    * **load mode**: if a recording exists for this call, return it *without*
+      calling the wrapped function (the cache "hit"); otherwise call it normally.
+      The leading ``REPLAY_START_RECORD`` calls are always (re)generated.
+    * **record mode**: call the wrapped function and save its output, then return it.
+
+    Like ``functools.lru_cache``, the caller passes no key: outputs form a tape
+    keyed by call order within the process (``generate-1.pickle``,
+    ``generate-2.pickle``, ...). Record and replay runs must therefore issue the
+    same sequence of calls for the indices to line up. Works with both sync and
+    ``async def`` generation functions.
     """
+    state = {"rr": None, "index": 0}
 
-    def __init__(self):
-        self._rr = RecordReplay()
-        self.output = None
+    def _engine() -> RecordReplay:
+        # Build lazily so the REPLAY_GENERATION* env vars can be set after import.
+        if state["rr"] is None:
+            state["rr"] = RecordReplay()
+        return state["rr"]
 
-    def is_enabled(self) -> bool:
-        return self._rr.is_enabled()
+    if inspect.iscoroutinefunction(func):
 
-    def is_record_mode(self) -> bool:
-        return self._rr.is_record_mode()
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            rr = _engine()
+            if not rr.is_enabled():
+                return await func(*args, **kwargs)
+            state["index"] += 1
+            index = state["index"]
+            if rr.is_replay_mode() and not rr.skip_record(index):
+                return rr.load_record(index)  # cache hit -> recorded data
+            output = await func(*args, **kwargs)
+            rr.save_record(index, output)  # no-op unless record mode
+            return output
 
-    def is_replay_mode(self) -> bool:
-        return self._rr.is_replay_mode()
+    else:
 
-    def skip_record(self, record_index: int) -> bool:
-        return self._rr.skip_record(record_index)
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            rr = _engine()
+            if not rr.is_enabled():
+                return func(*args, **kwargs)
+            state["index"] += 1
+            index = state["index"]
+            if rr.is_replay_mode() and not rr.skip_record(index):
+                return rr.load_record(index)  # cache hit -> recorded data
+            output = func(*args, **kwargs)
+            rr.save_record(index, output)  # no-op unless record mode
+            return output
 
-    @contextmanager
-    def generation(self, record_index: int):
-        self.output = (
-            self._rr.load_record(record_index) if self._rr.is_replay_mode() else None
-        )
-        yield self
-        # No-op unless record mode; after yield (no finally) so failures don't save.
-        self._rr.save_record(record_index, self.output)
+    # Expose the engine + a counter reset, mirroring lru_cache's introspection.
+    wrapper.record_replay = _engine
+    wrapper.reset_record_index = lambda: state.update(index=0)
+    return wrapper

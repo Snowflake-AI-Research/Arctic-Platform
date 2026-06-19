@@ -24,8 +24,9 @@ from .batch import split_dict
 from .batch import unpack_batch
 from .cuda_ipc import merge_cuda_ipc_payloads
 from .debug import ProfilerContext
-from .record_replay import RecordReplayContext
 from .debug import SynchronizedWallClockTimerSimple
+from .record_replay import record_replay_generation
+
 __all__ = [
     "unpack_batch",
     "merge_dict_shards",
@@ -38,6 +39,6 @@ __all__ = [
     "log_dp_shard_tokens",
     "merge_cuda_ipc_payloads",
     "ProfilerContext",
-    "RecordReplayContext",
+    "record_replay_generation",
     "SynchronizedWallClockTimerSimple",
 ]
