@@ -31,19 +31,12 @@ import os
 import pathlib
 import time
 from typing import Any
-from typing import Dict
-from typing import List
-from typing import Optional
 from typing import Union
 
 import ray
 import torch
-from arctic_inference.server.config import ModelConfig
 from arctic_inference.server.replica_pool import ReplicaPool
 from arctic_inference.server.weight_sync.schedule import TransferSchedule
-from pydantic import BaseModel
-from pydantic import ConfigDict
-from pydantic import Field
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from transformers import AutoTokenizer
@@ -63,6 +56,11 @@ from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.ray_pg import ColocatePlacement
 from arctic_platform.rl.utils.ray_pg import create_colocate_placement
 from arctic_platform.rl.utils.ray_pg import pg_scheduling_options
+from arctic_platform.rl.utils.server_models import GenerateRequest
+from arctic_platform.rl.utils.server_models import JobConfig
+from arctic_platform.rl.utils.server_models import LogProbsRequest
+from arctic_platform.rl.utils.server_models import SyncWeightsRequest
+from arctic_platform.rl.utils.server_models import build_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -79,67 +77,6 @@ else:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimpleDummy
 
     timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
-
-
-class JobConfig(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    model_name: str
-    job_type: str = Field(default="training")
-    num_devices: Optional[int] = None
-    ds_config: Optional[dict] = None
-    training_config: Optional[dict] = None
-    log_prob_config: Optional[dict] = None
-    ds_worker_config: Optional[dict] = None
-    vllm_config: Optional[dict] = None
-    checkpoint_path: Optional[str] = None
-    arctic_inference_config: Optional[dict] = None
-    full_determinism: bool = False
-    seed: int = 42
-
-
-class GenerateRequest(BaseModel):
-    prompts: List[str]
-    sampling_params: Optional[Dict[str, Any]] = None
-
-
-class LogProbsRequest(BaseModel):
-    prompts: List[str]
-    completions: Optional[List[str]] = None
-    top_k: int = 1
-
-
-class SyncWeightsRequest(BaseModel):
-    training_job_id: int
-    sampling_job_id: int
-    colocate: bool = False
-    cuda_ipc: bool = False
-    low_memory: bool = False
-
-
-def _build_model_config(
-    model_name: str,
-    vllm_config: dict | None,
-    arctic_inference_config: dict | None = None,
-) -> ModelConfig:
-    """Construct a :class:`ModelConfig` from user-supplied vllm_config dict.
-
-    `arctic_inference_config` carries Arctic-platform signals (e.g. use_fca,
-    spec_model) that are not vLLM engine args: they are recorded on the
-    ModelConfig, which expands them into real engine kwargs in
-    `ModelConfig.to_engine_kwargs()`.
-    """
-
-    cfg = dict(vllm_config or {})
-    cfg["model"] = model_name
-    cfg.update(arctic_inference_config or {})
-
-    known_fields = set(ModelConfig.model_fields.keys())
-    extra = {k: v for k, v in cfg.items() if k not in known_fields}
-    base = {k: v for k, v in cfg.items() if k in known_fields}
-    if extra:
-        base["extra_engine_kwargs"] = extra
-    return ModelConfig(**base)
 
 
 # Honor ARL_WEIGHT_SYNC_PORT when set so back-to-back / concurrent training jobs on one host (e.g. repeated
@@ -401,7 +338,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
             vllm_cfg = dict(job_config.vllm_config or {})
             if colocate:
                 vllm_cfg["enable_sleep_mode"] = True
-            model_cfg = _build_model_config(
+            model_cfg = build_model_config(
                 job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
             )
             tp = model_cfg.tensor_parallel_size
@@ -412,7 +349,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 if tp > 1:
                     extra_env["VLLM_RAY_PER_WORKER_GPUS"] = str(_COLOCATE_GPU_FRACTIONS["sampling"])
                     vllm_cfg["distributed_executor_backend"] = "ray"
-                    model_cfg = _build_model_config(
+                    model_cfg = build_model_config(
                         job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
                     )
                 if job_config.arctic_inference_config:
@@ -479,7 +416,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 lp_vllm_cfg = dict(job_config.vllm_config or {})
                 if colocate:
                     lp_vllm_cfg["enable_sleep_mode"] = True
-                model_cfg = _build_model_config(
+                model_cfg = build_model_config(
                     job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
                 )
                 lp_tp = model_cfg.tensor_parallel_size
@@ -498,7 +435,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
                         # need to be set here.
                         lp_extra_env.pop("CUDA_VISIBLE_DEVICES", None)
                         lp_vllm_cfg["distributed_executor_backend"] = "ray"
-                        model_cfg = _build_model_config(
+                        model_cfg = build_model_config(
                             job_config.model_name,
                             lp_vllm_cfg,
                             arctic_inference_config=job_config.arctic_inference_config,
@@ -663,161 +600,6 @@ class ArcticRLRayServer:
     async def health(self):
         return {"status": "OK"}
 
-    # async def initialize(self, job_config: dict[str, Any]) -> dict[str, Any]:
-    #     job_config = JobConfig(**job_config)
-    #     pr0(f"[ArcticRLRayServer] initialize: {job_config=}")
-    #     job_type = job_config.job_type
-    #     job_id = self.next_job_id
-    #     self.next_job_id += 1
-
-    #     colocate = self.colocate
-    #     pg = self.placement_group
-
-    #     # Fractional GPU fractions within each PG bundle.  Each bundle owns 1
-    #     # physical GPU; fractions let multiple actors share that bundle while
-    #     # Ray still sets CUDA_VISIBLE_DEVICES so each actor can see the GPU.
-    #     #   training (0.4) + sampling (0.6)  = 1.0  — share a bundle
-    #     #   training (0.4) + log_prob (0.3)  = 0.7  — share a bundle
-    #     _COLOCATE_GPU_FRACTIONS = {"sampling": 0.6, "log_prob": 0.3, "training": 0.4}
-
-    #     def _pg_options(bundle_index: int, fraction_key: str) -> dict:
-    #         """PG-pinned scheduling: fractional GPU claim inside a specific bundle."""
-    #         return dict(
-    #             num_gpus=_COLOCATE_GPU_FRACTIONS[fraction_key],
-    #             scheduling_strategy=PlacementGroupSchedulingStrategy(
-    #                 placement_group=pg,
-    #                 placement_group_bundle_index=bundle_index,
-    #             ),
-    #         )
-
-    #     n_bundles = getattr(self, "n_bundles", 0)
-    #     n_sample = self.sampling_gpus
-    #     n_logprob = self.log_prob_gpus
-
-    #     # Bundle layout (deterministic):
-    #     #   bundles [0 .. n_sample-1]           → training + sampling
-    #     #   bundles [n_sample .. n_sample+n_lp] → training + log_prob
-    #     #   remaining bundles                   → training only
-
-    #     if job_type == "training":
-    #         gpus = self.training_gpus
-    #         if gpus == 0:
-    #             raise ValueError("No training GPUs configured")
-    #         if self.training_workers:
-    #             raise ValueError("Training job already running")
-
-    #         workers = []
-    #         config_dict = job_config.model_dump()
-    #         for rank in range(gpus):
-    #             if colocate and pg is not None:
-    #                 opts = _pg_options(bundle_index=rank, fraction_key="training")
-    #             else:
-    #                 opts = dict(num_gpus=1)
-    #             w = DeepSpeedWorker.options(**opts).remote(rank, gpus, 29500)
-    #             workers.append(w)
-    #         await asyncio.gather(*[w.initialize.remote(config_dict) for w in workers])
-    #         self.training_workers = workers
-
-    #     elif job_type == "sampling":
-    #         gpus = self.sampling_gpus
-    #         if gpus == 0:
-    #             raise ValueError("No sampling GPUs configured")
-    #         pool: ReplicaPool = self.sampling_pool
-    #         if pool._config is not None:
-    #             raise ValueError("Sampling job already running")
-    #         vllm_cfg = dict(job_config.vllm_config or {})
-    #         if colocate:
-    #             vllm_cfg["enable_sleep_mode"] = True
-    #         model_cfg = _build_model_config(job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
-    #         tp = model_cfg.tensor_parallel_size
-    #         num_replicas = gpus // tp
-    #         if colocate and pg is not None:
-    #             bundle_indices = list(range(num_replicas))
-    #             extra_env = {}
-    #             if tp > 1:
-    #                 extra_env["VLLM_RAY_PER_WORKER_GPUS"] = str(_COLOCATE_GPU_FRACTIONS["sampling"])
-    #                 vllm_cfg["distributed_executor_backend"] = "ray"
-    #                 model_cfg = _build_model_config(job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
-    #             await pool.initialize(
-    #                 model_cfg,
-    #                 num_replicas=num_replicas,
-    #                 ray_num_gpus=_COLOCATE_GPU_FRACTIONS["sampling"],
-    #                 placement_group=pg,
-    #                 bundle_indices=bundle_indices,
-    #                 extra_env=extra_env if extra_env else None,
-    #             )
-    #         else:
-    #             await pool.initialize(model_cfg, num_replicas=num_replicas)
-
-    #     elif job_type == "log_prob":
-    #         gpus = self.log_prob_gpus
-    #         if gpus == 0:
-    #             raise ValueError("No log-prob GPUs configured")
-
-    #         # Log-prob bundles start after sampling bundles to avoid oversubscription.
-    #         lp_bundle_offset = n_sample
-
-    #         if job_config.ds_config is not None:
-    #             if self.log_prob_workers:
-    #                 raise ValueError("Log-prob job already running")
-    #             workers = []
-    #             config_dict = job_config.model_dump()
-    #             for rank in range(gpus):
-    #                 if colocate and pg is not None:
-    #                     opts = _pg_options(bundle_index=lp_bundle_offset + rank, fraction_key="log_prob")
-    #                 else:
-    #                     opts = dict(num_gpus=1)
-    #                 w = DeepSpeedWorker.options(**opts).remote(rank, gpus, 29501)
-    #                 workers.append(w)
-    #             await asyncio.gather(*[w.initialize.remote(config_dict) for w in workers])
-    #             self.log_prob_workers = workers
-    #             self.log_prob_tokenizer = AutoTokenizer.from_pretrained(job_config.model_name)
-    #             engine = "deepspeed"
-    #         else:
-    #             pool: ReplicaPool = self.log_prob_pool
-    #             if pool._config is not None:
-    #                 raise ValueError("Log-prob job already running")
-    #             lp_vllm_cfg = dict(job_config.vllm_config or {})
-    #             if colocate:
-    #                 lp_vllm_cfg["enable_sleep_mode"] = True
-    #             model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
-    #             lp_tp = model_cfg.tensor_parallel_size
-    #             num_replicas = gpus // lp_tp
-    #             if colocate and pg is not None:
-    #                 bundle_indices = [lp_bundle_offset + i for i in range(num_replicas)]
-    #                 lp_extra_env = {}
-    #                 if lp_tp > 1:
-    #                     lp_bundles = [lp_bundle_offset + i for i in range(num_replicas * lp_tp)]
-    #                     lp_extra_env["VLLM_RAY_PER_WORKER_GPUS"] = str(_COLOCATE_GPU_FRACTIONS["log_prob"])
-    #                     lp_extra_env["VLLM_RAY_BUNDLE_INDICES"] = ",".join(str(b) for b in lp_bundles[:lp_tp])
-    #                     lp_extra_env.pop("CUDA_VISIBLE_DEVICES", None)
-    #                     lp_vllm_cfg["distributed_executor_backend"] = "ray"
-    #                     model_cfg = _build_model_config(job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config)
-    #                 await pool.initialize(
-    #                     model_cfg,
-    #                     num_replicas=num_replicas,
-    #                     ray_num_gpus=_COLOCATE_GPU_FRACTIONS["log_prob"],
-    #                     placement_group=pg,
-    #                     bundle_indices=bundle_indices,
-    #                     extra_env=lp_extra_env if lp_extra_env else None,
-    #                 )
-    #             else:
-    #                 await pool.initialize(model_cfg, num_replicas=num_replicas)
-    #             engine = "vllm"
-
-    #     else:
-    #         raise ValueError(f"Unknown job type: {job_type}")
-
-    #     job_info: dict[str, Any] = {
-    #         "job_id": job_id,
-    #         "job_type": job_type,
-    #         "model_name": job_config.model_name,
-    #         "status": "RUNNING",
-    #     }
-    #     if job_type == "log_prob":
-    #         job_info["engine"] = engine
-    #     self.jobs[job_id] = job_info
-    #     return {"job_id": job_id, "job_type": job_type, "running": True}
 
     async def destroy(self, job_id: int, job_type: str) -> dict[str, Any]:
         return await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
