@@ -26,6 +26,12 @@ from .cuda_ipc import merge_cuda_ipc_payloads
 from .debug import ProfilerContext
 from .debug import SynchronizedWallClockTimerSimple
 from .record_replay import record_replay_generation
+from .server_models import GenerateRequest
+from .server_models import JobConfig
+from .server_models import LogProbsRequest
+from .server_models import SyncWeightsRequest
+from .server_models import WeightNormRequest
+from .server_models import build_model_config
 
 __all__ = [
     "unpack_batch",
@@ -41,4 +47,10 @@ __all__ = [
     "ProfilerContext",
     "record_replay_generation",
     "SynchronizedWallClockTimerSimple",
+    "JobConfig",
+    "GenerateRequest",
+    "LogProbsRequest",
+    "SyncWeightsRequest",
+    "WeightNormRequest",
+    "build_model_config",
 ]
