@@ -1,0 +1,12 @@
+[run]
+parallel = true
+sigterm = true
+source =
+    arctic_platform.rl
+concurrency =
+    thread
+    multiprocessing
+
+[report]
+show_missing = true
+skip_covered = false

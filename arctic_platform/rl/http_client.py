@@ -85,7 +85,13 @@ class ArcticRLHTTPClient:
             self._log_prob_job_id: int | None = None
             if config.backend == "local":
                 self._launch_local_server()
-            self._initialize_jobs()
+            try:
+                self._initialize_jobs()
+            except Exception:
+                # A wedged /initialize (e.g. a deadlocked multi-GPU NCCL rendezvous) leaves a half-built local server
+                # squatting its port and Ray cluster -- stop it so the caller can retry on a clean slate.
+                self._stop_server()
+                raise
 
     def reconnect_config(self) -> ArcticRLClientConfig:
         """Return a serializable config that reconnects to the same pre-existing jobs.
@@ -198,13 +204,15 @@ class ArcticRLHTTPClient:
 
     def _initialize_jobs(self) -> None:
         self._cleanup_stale_jobs()
-        data = self._post_initialize("sampling")
-        self._sampling_job_id = data["job_id"]
+        if self.config.sampling_gpus > 0:
+            data = self._post_initialize("sampling")
+            self._sampling_job_id = data["job_id"]
         if self.config.log_prob_gpus > 0:
             data = self._post_initialize("log_prob")
             self._log_prob_job_id = data["job_id"]
-        data = self._post_initialize("training")
-        self._training_job_id = data["job_id"]
+        if self.config.training_gpus > 0:
+            data = self._post_initialize("training")
+            self._training_job_id = data["job_id"]
         self._wait_for_jobs_running()
 
     def _cleanup_stale_jobs(self) -> None:
@@ -283,10 +291,15 @@ class ArcticRLHTTPClient:
             if job_type == "training":
                 payload["checkpoint_path"] = self.config.checkpoint_path
         else:
+            if self.config.arctic_inference_config:
+                payload["arctic_inference_config"] = self.config.arctic_inference_config
             if self.config.vllm_config:
                 payload["vllm_config"] = self.config.vllm_config
 
-        resp = self._session.post(f"{self._base_url}/initialize", json=payload)
+        # /initialize builds the engine synchronously, so a wedged init (e.g. a deadlocked multi-GPU NCCL rendezvous)
+        # would otherwise block the client forever. Bound it by job_ready_timeout -- the budget we already allow for a
+        # job to become ready -- so the caller gets a Timeout it can retry on instead of an unbounded hang.
+        resp = self._session.post(f"{self._base_url}/initialize", json=payload, timeout=self.config.job_ready_timeout)
         if not resp.ok:
             logger.error(f"Failed to initialize {job_type} job: {resp.status_code} {resp.text}")
             resp.raise_for_status()
@@ -662,6 +675,19 @@ class ArcticRLHTTPClient:
 
         pr0(f"[ArcticRLClient] sync_weights OUTPUT: {response.keys()=}")
         return response
+
+    async def weight_norm(self) -> dict[str, Any]:
+        """Global L2 weight norm of the training and sampling engines.
+
+        Returns ``{"training_norm", "sampling_norm", ...}``. After a weight sync the two norms must match (the metric
+        is invariant to each engine's parameter sharding/fusion). Intended for tests verifying sync correctness.
+        """
+        resp = self._session.post(
+            f"{self._base_url}/weight-norm",
+            json={"training_job_id": self.training_job_id, "sampling_job_id": self.sampling_job_id},
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     # ------------------------------------------------------------------
     # Log probabilities

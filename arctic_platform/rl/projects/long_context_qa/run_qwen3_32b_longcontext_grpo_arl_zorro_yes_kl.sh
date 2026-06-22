@@ -206,18 +206,16 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=$TOTAL_EPOCHS \
     trainer.val_before_train=False \
     arctic_rl.colocate=$COLOCATE \
-    arctic_rl.logits_optimization=memory \
+    arctic_rl.train.logits.optimization=memory \
     arctic_rl.sampling_tp_size=$TP_SIZE \
     arctic_rl.training_gpus=$NGPU_PER_JOB \
     arctic_rl.sampling_gpus=$NGPU_FOR_SAMPLING \
     arctic_rl.log_prob_gpus=$NGPU_FOR_LOG_PROBS \
-    arctic_rl.zorro_train.enable=$USE_ARCTIC_ZORRO \
-    arctic_rl.zorro_train.max_rollouts=$ROLL_N \
+    arctic_rl.train.zorro_train.enable=$USE_ARCTIC_ZORRO \
+    arctic_rl.train.zorro_train.max_rollouts=$ROLL_N \
+    arctic_rl.train.deepspeed.torch_autocast.enabled=$ARCTIC_AUTOCAST \
     arctic_rl.cuda_ipc_weight_sync=True \
-    arctic_rl.deepspeed.torch_autocast.enabled=$ARCTIC_AUTOCAST \
-    arctic_rl.deepspeed.communication_data_type=fp32 \
-    arctic_rl.deepspeed.data_types.grad_accum_dtype=fp32 \
-    arctic_rl.deepspeed.zero_optimization.stage=$ARCTIC_ZERO_STAGE \
-    arctic_rl.deepspeed.zero_optimization.offload_optimizer.device=cpu \
-    arctic_rl.deepspeed.zero_optimization.offload_param.device=none \
+    arctic_rl.train.deepspeed.zero_optimization.stage=$ARCTIC_ZERO_STAGE \
+    arctic_rl.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \
+    arctic_rl.train.deepspeed.zero_optimization.offload_param.device=none \
     "$@" 2>&1 | tee $experiment_name.log
