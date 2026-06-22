@@ -23,6 +23,12 @@ from .batch import shard_token_stats
 from .batch import split_dict
 from .batch import unpack_batch
 from .cuda_ipc import merge_cuda_ipc_payloads
+from .server_models import GenerateRequest
+from .server_models import JobConfig
+from .server_models import LogProbsRequest
+from .server_models import SyncWeightsRequest
+from .server_models import WeightNormRequest
+from .server_models import build_model_config
 
 __all__ = [
     "unpack_batch",
@@ -35,4 +41,10 @@ __all__ = [
     "shard_token_stats",
     "log_dp_shard_tokens",
     "merge_cuda_ipc_payloads",
+    "JobConfig",
+    "GenerateRequest",
+    "LogProbsRequest",
+    "SyncWeightsRequest",
+    "WeightNormRequest",
+    "build_model_config",
 ]

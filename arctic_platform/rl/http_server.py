@@ -34,24 +34,17 @@ import pathlib
 import sys
 import time
 from typing import Any
-from typing import Dict
-from typing import List
-from typing import Optional
 from typing import Union
 
 import ray
 import torch
 import uvicorn
-from arctic_inference.server.config import ModelConfig
 from arctic_inference.server.replica_pool import ReplicaPool
 from arctic_inference.server.weight_sync.schedule import TransferSchedule
 from fastapi import Body
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi import Response
-from pydantic import BaseModel
-from pydantic import ConfigDict
-from pydantic import Field
 from transformers import AutoTokenizer
 
 from arctic_platform.rl.deepspeed_worker import DeepSpeedWorker
@@ -66,6 +59,12 @@ from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.ray_pg import ColocatePlacement
 from arctic_platform.rl.utils.ray_pg import create_colocate_placement
 from arctic_platform.rl.utils.ray_pg import pg_scheduling_options
+from arctic_platform.rl.utils.server_models import GenerateRequest
+from arctic_platform.rl.utils.server_models import JobConfig
+from arctic_platform.rl.utils.server_models import LogProbsRequest
+from arctic_platform.rl.utils.server_models import SyncWeightsRequest
+from arctic_platform.rl.utils.server_models import WeightNormRequest
+from arctic_platform.rl.utils.server_models import build_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -89,57 +88,6 @@ else:
 class ArcticRLHTTPServerState(ArcticRLServerState):
     def __init__(self, **kwargs):
         pass
-
-
-class JobConfig(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    model_name: str
-    job_type: str = Field(default="training")
-    num_devices: Optional[int] = None
-    ds_config: Optional[dict] = None
-    training_config: Optional[dict] = None
-    log_prob_config: Optional[dict] = None
-    ds_worker_config: Optional[dict] = None
-    vllm_config: Optional[dict] = None
-    checkpoint_path: Optional[str] = None
-    arctic_inference_config: Optional[dict] = None
-    full_determinism: bool = False
-    seed: int = 42
-
-
-class GenerateRequest(BaseModel):
-    prompts: List[str]
-    sampling_params: Optional[Dict[str, Any]] = None
-
-
-class LogProbsRequest(BaseModel):
-    prompts: List[str]
-    completions: Optional[List[str]] = None
-    top_k: int = 1
-
-
-def _build_model_config(
-    model_name: str,
-    vllm_config: dict | None,
-    arctic_inference_config: dict | None = None,
-) -> ModelConfig:
-    """Construct a :class:`ModelConfig` from user-supplied vllm_config dict.
-
-    `arctic_inference_config` carries Arctic-platform signals (e.g. use_fca,
-    spec_model) that are not vLLM engine args: they are recorded on the
-    ModelConfig, which expands them into real engine kwargs in
-    `ModelConfig.to_engine_kwargs()`.
-    """
-    cfg = dict(vllm_config or {})
-    cfg["model"] = model_name
-    cfg.update(arctic_inference_config or {})
-    known_fields = set(ModelConfig.model_fields.keys())
-    extra = {k: v for k, v in cfg.items() if k not in known_fields}
-    base = {k: v for k, v in cfg.items() if k in known_fields}
-    if extra:
-        base["extra_engine_kwargs"] = extra
-    return ModelConfig(**base)
 
 
 # Honor ARL_WEIGHT_SYNC_PORT when set so back-to-back / concurrent training jobs on one host (e.g. repeated
@@ -244,7 +192,7 @@ async def initialize(job_config: JobConfig = Body(...)):
         vllm_cfg = dict(job_config.vllm_config or {})
         if colocate:
             vllm_cfg["enable_sleep_mode"] = True
-        model_cfg = _build_model_config(
+        model_cfg = build_model_config(
             job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
         )
         tp = model_cfg.tensor_parallel_size
@@ -255,7 +203,7 @@ async def initialize(job_config: JobConfig = Body(...)):
             if tp > 1:
                 extra_env["VLLM_RAY_PER_WORKER_GPUS"] = str(_COLOCATE_GPU_FRACTIONS["sampling"])
                 vllm_cfg["distributed_executor_backend"] = "ray"
-                model_cfg = _build_model_config(
+                model_cfg = build_model_config(
                     job_config.model_name, vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
                 )
             if job_config.arctic_inference_config:
@@ -315,7 +263,7 @@ async def initialize(job_config: JobConfig = Body(...)):
             lp_vllm_cfg = dict(job_config.vllm_config or {})
             if colocate:
                 lp_vllm_cfg["enable_sleep_mode"] = True
-            model_cfg = _build_model_config(
+            model_cfg = build_model_config(
                 job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
             )
             lp_tp = model_cfg.tensor_parallel_size
@@ -334,7 +282,7 @@ async def initialize(job_config: JobConfig = Body(...)):
                     # need to be set here.
                     lp_extra_env.pop("CUDA_VISIBLE_DEVICES", None)
                     lp_vllm_cfg["distributed_executor_backend"] = "ray"
-                    model_cfg = _build_model_config(
+                    model_cfg = build_model_config(
                         job_config.model_name, lp_vllm_cfg, arctic_inference_config=job_config.arctic_inference_config
                     )
                 if job_config.arctic_inference_config:
@@ -655,19 +603,6 @@ async def generate(job_id: int, request: GenerateRequest = Body(...)):
     pool: ReplicaPool = app.state.sampling_pool
     results = await pool.generate(request.prompts, request.sampling_params)
     return {"job_id": job_id, "results": results}
-
-
-class SyncWeightsRequest(BaseModel):
-    training_job_id: int
-    sampling_job_id: int
-    colocate: bool = False
-    cuda_ipc: bool = False
-    low_memory: bool = False
-
-
-class WeightNormRequest(BaseModel):
-    training_job_id: int
-    sampling_job_id: int
 
 
 @app.post("/weight-norm")
