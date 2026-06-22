@@ -600,7 +600,6 @@ class ArcticRLRayServer:
     async def health(self):
         return {"status": "OK"}
 
-
     async def destroy(self, job_id: int, job_type: str) -> dict[str, Any]:
         return await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
 
