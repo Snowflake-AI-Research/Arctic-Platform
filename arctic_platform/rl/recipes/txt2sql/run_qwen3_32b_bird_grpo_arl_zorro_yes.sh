@@ -5,8 +5,7 @@
 # (batch size, LR, prompt/response lengths, rollout.n) with ArcticRL colocate + Zorro
 # for rollout and weight sync.
 #
-# Topology: 4 nodes x 8 GPUs = 32 GPUs, COLOCATE=True (3-way colocation:
-# training + sampling + ref log-prob share each GPU bundle when KL is on).
+# Topology: 4 nodes x 8 GPUs = 32 GPUs, COLOCATE=True
 #   Pass Hydra overrides via "$@" to change training settings.
 #
 # Prerequisites:

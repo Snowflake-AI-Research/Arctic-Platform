@@ -263,6 +263,7 @@ class ArcticRLHTTPClient:
         payload: dict[str, Any] = {
             "model_name": self.config.model_name,
             "job_type": job_type,
+            "arctic_inference_config": self.config.arctic_inference_config,
             "full_determinism": self.config.full_determinism,
             "seed": self.config.seed,
         }
