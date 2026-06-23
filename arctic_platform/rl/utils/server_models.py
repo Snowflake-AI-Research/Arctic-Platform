@@ -76,8 +76,6 @@ def parse_arctic_inference_rollout(arctic_inference_config, model_config_fields=
     if isinstance(zorro, dict) and zorro.get("enable"):
         if "use_fca" in fields:
             out["use_fca"] = True
-        elif "forest_cascade_attn_configs" in fields:
-            out["forest_cascade_attn_configs"] = "{}"
 
     spec = arctic_inference_config.get("speculative_decoding")
     if isinstance(spec, dict):
