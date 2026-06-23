@@ -3,17 +3,14 @@
 #
 # KL-enabled variant of run_qwen3_32b_bird_grpo_arl_zorro_yes.sh:
 #   - actor.use_kl_loss=True (ref model enabled for low_var_kl penalty)
-#   - arctic_rl.sampling_gpus / log_prob_gpus split evenly (16 each on 32 GPUs)
+#   - arctic_rl.log_prob_gpus=32 (ref engine colocated on the same 32 GPUs)
+#
+# With 3-way colocation (training + sampling + log_prob on each bundle), no GPU
+# pool split is required — all three roles share the same 32-GPU Ray placement
+# group and time-share VRAM via sleep/wake/offload.
 #
 # Topology: 4 nodes x 8 GPUs = 32 GPUs, COLOCATE=True
 #   Pass Hydra overrides via "$@" to change training settings.
-#
-# Prerequisites:
-#   1. Preprocess data into ${DATA_DIR:-./data/bird_sql}/{train,val}.parquet
-#   2. pip install func_timeout
-#   3. Multi-node Ray cluster across your GPU nodes
-#   4. ArcticInference + arctic-verl installed in the active Python env
-#   5. Qwen/Qwen3-32B accessible via HuggingFace (set HF_HOME if using a local cache)
 
 set -x
 
@@ -30,7 +27,6 @@ export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}"
 
-# Do NOT set expandable_segments:True -- vLLM colocate sleep mode rejects it.
 unset PYTORCH_CUDA_ALLOC_CONF
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
@@ -84,9 +80,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_torch_compile=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=98304 \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.clip_ratio=0.2 \

@@ -7,8 +7,11 @@ hyperparameters of the stock-verl baseline at
 backends can be compared apples-to-apples on wall-clock speed.
 
 * **Model:** Qwen/Qwen3-32B
-* **Topology:** 4 nodes × 8 H200 GPUs (32 GPUs), `colocate=True`,
-  ZeRO-3 with CPU optimizer offload, vLLM rollout (TP=2)
+* **Topology:** 4 nodes × 8 H200 GPUs (32 GPUs), `colocate=True` with
+  **3-way colocation** (training + sampling + ref log-prob share each GPU
+  bundle). Non-KL runs set `log_prob_gpus=0` (Zorro recomputes actor
+  log-probs on the training engine); KL runs set `log_prob_gpus=32` on
+  the same bundles — no 50/50 GPU split needed.
 * **Data:** [BIRD-SQL](https://bird-bench.github.io/) only — train on
   BIRD `train.json`, validate on BIRD `dev.json`. Spider / GretelAI are
   not used in this recipe.
@@ -144,11 +147,13 @@ which trains on BIRD only.
 ## 3. Train
 
 The base recipe `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` runs without
-a KL penalty (matches the verl baseline 1:1). The `_kl` wrapper enables
-the low-variance KL loss against a frozen reference model and splits
-the GPUs 50/50 between sampling and ref log-prob.
+a KL penalty (matches the verl baseline 1:1). The `_kl` variant enables
+the low-variance KL loss against a frozen reference model and sets
+`log_prob_gpus=32` for 3-way colocation on the same 32-GPU placement
+group (no separate ref pool).
 
-The script picks up `NNODES` from `/data-fast/hostfile`.
+The script assumes a **4-node × 8-GPU** Ray cluster (32 GPUs total).
+Override data paths or other settings via Hydra on the command line.
 
 ```bash
 # No-KL run (matches verl baseline 1:1)
@@ -171,6 +176,6 @@ default.
 | File | What it is |
 | --- | --- |
 | `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` | Base GRPO + Arctic/Zorro recipe (no KL) |
-| `run_qwen3_32b_bird_grpo_arl_zorro_yes_kl.sh` | KL-enabled wrapper around the base recipe |
+| `run_qwen3_32b_bird_grpo_arl_zorro_yes_kl.sh` | KL-enabled recipe (`use_kl_loss=True`, 3-way colocate with `log_prob_gpus=32`) |
 | `bird_reward.py` | SQLite-based exec-match reward (referenced via `custom_reward_function.path`) |
 | `preprocess_bird.py` | Raw BIRD JSON + SQLite → augmented verl parquets |
