@@ -3,7 +3,11 @@
 #
 # KL-enabled variant of run_qwen3_32b_bird_grpo_arl_zorro_yes.sh:
 #   - actor.use_kl_loss=True (ref model enabled for low_var_kl penalty)
-#   - arctic_rl.sampling_gpus / log_prob_gpus split evenly (16 each on 32 GPUs)
+#   - arctic_rl.log_prob_gpus=32 (ref engine colocated on the same 32 GPUs)
+#
+# With 3-way colocation (training + sampling + log_prob on each bundle), no GPU
+# pool split is required — all three roles share the same 32-GPU Ray placement
+# group and time-share VRAM via sleep/wake/offload.
 #
 # Topology: 4 nodes x 8 GPUs = 32 GPUs, COLOCATE=True
 #   Pass Hydra overrides via "$@" to change training settings.

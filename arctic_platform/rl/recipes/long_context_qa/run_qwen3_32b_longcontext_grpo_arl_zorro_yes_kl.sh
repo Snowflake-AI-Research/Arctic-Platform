@@ -4,7 +4,7 @@
 #
 # Diff vs run_qwen3_32b_longcontext_grpo_arl_zorro_yes.sh:
 #   - actor.use_kl_loss=True (ref model enabled for low_var_kl penalty)
-#   - sampling_gpus / log_prob_gpus each NGPU_PER_JOB/2 (ref log-prob pool for KL)
+#   - arctic_rl.log_prob_gpus=NGPU_PER_JOB (3-way colocate; no GPU pool split)
 #   - experiment_name suffix _kl
 #
 # Adapted from:
@@ -82,10 +82,8 @@ ARCTIC_AUTOCAST=False    # match bird arctic intent (autocast off; bf16 weights 
 
 # Total GPUs derived from NGPU_PER_NODE * NNODES (matches verl_opensource recipe:
 # nnodes=4, n_gpus_per_node=8 -> 32 GPUs).
-# KL on: split rollout vs ref log-prob pools 50/50 (matches verl uglrinrq topology).
+# KL on: 3-way colocation — training, sampling, and ref log-prob share all GPUs.
 NGPU_PER_JOB=$((NGPU_PER_NODE*NNODES))
-NGPU_FOR_SAMPLING=$((NGPU_PER_JOB/2))
-NGPU_FOR_LOG_PROBS=$((NGPU_PER_JOB/2))
 TP_SIZE=2                # sampling TP (matches verl_opensource rollout.tensor_model_parallel_size=2)
 
 # ----- Training hyperparams (match verl_opensource long-context recipe) -----
@@ -209,8 +207,8 @@ python3 -m verl.trainer.main_ppo \
     arctic_rl.train.logits.optimization=memory \
     arctic_rl.sampling_tp_size=$TP_SIZE \
     arctic_rl.training_gpus=$NGPU_PER_JOB \
-    arctic_rl.sampling_gpus=$NGPU_FOR_SAMPLING \
-    arctic_rl.log_prob_gpus=$NGPU_FOR_LOG_PROBS \
+    arctic_rl.sampling_gpus=$NGPU_PER_JOB \
+    arctic_rl.log_prob_gpus=$NGPU_PER_JOB \
     arctic_rl.train.zorro_train.enable=$USE_ARCTIC_ZORRO \
     arctic_rl.train.zorro_train.max_rollouts=$ROLL_N \
     arctic_rl.train.deepspeed.torch_autocast.enabled=$ARCTIC_AUTOCAST \
