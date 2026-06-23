@@ -55,12 +55,7 @@ class ArcticRLClientConfig(BaseModel):
         default=None, description="Deepspeed worker config dict (optimizer, dtype, etc.)."
     )
     arctic_inference_config: Optional[dict] = Field(
-        default=None,
-        description=(
-            "Arctic inference signals (e.g. use_fca, spec_model). A non-empty value enables "
-            "Arctic inference (ARCTIC_INFERENCE_ENABLED=1) and is expanded into vLLM engine kwargs "
-            "server-side by ModelConfig.to_engine_kwargs(); None/empty means Arctic inference is off."
-        ),
+        default=None, description="Arctic inference config dict (use_fca, spec_model, etc.)."
     )
     full_determinism: bool = Field(
         default=False,

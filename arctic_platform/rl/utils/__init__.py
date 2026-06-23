@@ -23,6 +23,9 @@ from .batch import shard_token_stats
 from .batch import split_dict
 from .batch import unpack_batch
 from .cuda_ipc import merge_cuda_ipc_payloads
+from .debug import ProfilerContext
+from .debug import SynchronizedWallClockTimerSimple
+from .record_replay import record_replay_generation
 from .server_models import GenerateRequest
 from .server_models import JobConfig
 from .server_models import LogProbsRequest
@@ -41,6 +44,9 @@ __all__ = [
     "shard_token_stats",
     "log_dp_shard_tokens",
     "merge_cuda_ipc_payloads",
+    "ProfilerContext",
+    "record_replay_generation",
+    "SynchronizedWallClockTimerSimple",
     "JobConfig",
     "GenerateRequest",
     "LogProbsRequest",
