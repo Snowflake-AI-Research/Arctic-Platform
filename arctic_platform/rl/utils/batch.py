@@ -132,7 +132,7 @@ def _split_batch(batch: dict, num_workers: int) -> list[dict]:
         reconstruct_position_ids_(batch_data)
 
     # ZoRRO Load balancer
-    if meta_data.get("zorro_train_enable", False):
+    if meta_data.get("load_balancer", False):
         max_group_length_threshold = meta_data.get("zorro_train_max_rollouts", meta_data["rollout_n"])
         batch_data, reorder_indices = reorg_global_batch(
             batch_data,
