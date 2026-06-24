@@ -106,3 +106,20 @@ git clone https://github.com/Snowflake-AI-Research/arctic-platform.git
 cd arctic-platform
 pip install -e .[rl]
 ```
+
+# Citation
+
+If you use Arctic Platform in your research, please consider citing:
+
+```bibtex
+@misc{arctic_platform_2026,
+  title={Arctic Platform: Simplifying and Accelerating Post-Training for LLMs},
+  author={Snowflake AI Research},
+  year={2026},
+  howpublished={\url{https://github.com/Snowflake-AI-Research/Arctic-Platform}}
+}
+```
+
+# License
+
+Apache License 2.0. See [LICENSE](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/main/LICENSE).
