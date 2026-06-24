@@ -157,12 +157,13 @@ pip install flash-attn --no-build-isolation
 from arctic_platform.rl.zorro_train import DeduplicatedActor
 from arctic_platform.rl.zorro_train.tests import create_dummy_batch
 
-# Initialize actor with deduplication
+# Initialize the actor; it installs Qwen3ModelOncePatcher onto the model on first forward.
 actor = DeduplicatedActor(
-    model_name_or_path="Qwen/Qwen3-4B",
+    model_name_or_path="Qwen/Qwen3-0.6B",
     device="cuda",
-    use_split_attention=True,  # Use optimized split attention (default)
-    attn_implementation="flash_attention_3"  # or "sdpa", "flash_attention_2"
+    logits_optimization="none",      # "none" | "compute" | "memory" ("memory" needs a process group)
+    use_split_attention=True,        # split attention (prompt-to-prompt + response-to-full)
+    attn_implementation="eager",     # or "flash_attention_2" / "flash_attention_3"
 )
 
 # Create a batch with shared prompts
@@ -172,15 +173,14 @@ batch = create_dummy_batch(
     prompt_len=4096,
     response_len=512,
     device="cuda",
-    include_training_fields=True
+    include_training_fields=True,
+    add_padding=True,
 )
 
-# Forward pass (automatically deduplicates)
-entropy, log_probs = actor._forward_micro_batch(
-    batch,
-    temperature=1.0,
-    calculate_entropy=True
-)
+# Forward pass (automatically deduplicates). logprobs/entropy are packed 1D in original
+# sample order (valid response tokens only), e.g. shape (num_valid_response_tokens,).
+output = actor.forward(batch, temperature=1.0, calculate_entropy=True)
+log_probs, entropy = output.logprobs, output.entropy
 
 # Training step with backward pass
 actor.model.train()
@@ -293,23 +293,28 @@ from arctic_platform.rl.zorro_train.qwen_model_patcher import Qwen3ModelOncePatc
 
 ### `DeduplicatedActor`
 
-Reference harness for running forward and backward passes with deduplication (used by
-the demo and the gradient-correctness reference; production uses `Qwen3ModelOncePatcher`).
+Reference harness around `Qwen3ModelOncePatcher` (the production patcher) for running deduplicated
+forward and backward passes; used by the demo and as a usage example.
 
 **Constructor:**
 ```python
 DeduplicatedActor(
     model_name_or_path: str,
     device: str = "cuda",
-    patcher_class = None,  # Auto-detected (Qwen -> Qwen3ModelPatcher)
+    logits_optimization: str = "none",     # "none" | "compute" | "memory"
     use_split_attention: bool = True,
-    attn_implementation: str = "sdpa"
+    attn_implementation: str = "eager",    # or "flash_attention_2"
+    world_size: int = 1,
+    max_token_len: int = 4096,
+    dtype: torch.dtype = torch.bfloat16,
 )
 ```
 
 **Methods:**
-- `_forward_micro_batch(micro_batch, temperature=1.0, calculate_entropy=False)`: Forward pass with deduplication
-- `compute_policy_loss_and_backward(micro_batch, temperature=1.0, gradient_accumulation=1)`: PPO training step
+- `forward(micro_batch, temperature=1.0, calculate_entropy=False)`: Deduplicated forward; returns `ModelOutput(logprobs, entropy)` as packed 1D tensors (valid response tokens, original sample order)
+- `_forward_micro_batch(micro_batch, temperature=1.0, calculate_entropy=False)`: Convenience wrapper returning `(entropy, log_probs)`
+- `compute_policy_loss_and_backward(micro_batch, temperature=1.0, gradient_accumulation=1)`: PPO training step (forward + backward)
+- `patch(response_len, rollout_n, temperature)`: (Re)install `Qwen3ModelOncePatcher` on the model
 
 ### `ZoRRoTrain`
 

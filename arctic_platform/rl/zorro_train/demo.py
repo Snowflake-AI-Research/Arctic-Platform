@@ -14,9 +14,20 @@
 # limitations under the License.
 
 """
-Demo script for prompt deduplication optimization.
+Demo script for ZoRRO prompt deduplication via :class:`Qwen3ModelOncePatcher`.
 
-Run this script to test the implementation.
+Loads a Qwen3 checkpoint and exercises the deduplicated forward/backward through :class:`DeduplicatedActor` and the
+helpers in ``tests.py``:
+
+1. ``test_gradient_correctness`` -- deduplicated forward/backward vs a non-deduplicated baseline (logprobs + grads).
+2. ``benchmark_performance`` -- optional dedup-vs-baseline timing.
+
+The Once patcher mutates the model permanently, and the baseline must run on the *unpatched* model, so each helper
+needs its own fresh actor (hence the second model load for the benchmark).
+
+Run::
+
+    python arctic_platform/rl/zorro_train/demo.py
 """
 
 import os
@@ -24,110 +35,85 @@ import sys
 
 import torch
 
-# Add parent directory to path for imports
+# Add the repo root to sys.path so this file runs directly (python .../demo.py).
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)
-
 
 if True:  # deal with sys.path adjustment
     from arctic_platform.rl.zorro_train.actor import DeduplicatedActor
     from arctic_platform.rl.zorro_train.tests import benchmark_performance
-    from arctic_platform.rl.zorro_train.tests import create_dummy_batch
     from arctic_platform.rl.zorro_train.tests import test_gradient_correctness
 
 
+def build_actor(model_name, device, attn_impl, dtype):
+    """Load a fresh (unpatched) DeduplicatedActor."""
+    return DeduplicatedActor(
+        model_name,
+        device=device,
+        logits_optimization="none",  # "none"/"compute" need no process group; "memory" would.
+        use_split_attention=True,
+        attn_implementation=attn_impl,
+        dtype=dtype,
+    )
+
+
 def main():
-    """Run all demos."""
+    """Run the ZoRRO deduplication demos."""
     print("=" * 80)
-    print("Prompt Deduplication Optimization Demo")
+    print("ZoRRO Prompt Deduplication Demo (Qwen3ModelOncePatcher)")
     print("=" * 80)
 
-    # Setup
-    model_name = "Qwen/Qwen3-4B"
+    model_name = os.environ.get("ZORRO_DEMO_MODEL", "Qwen/Qwen3-0.6B")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    attn_impl = "sdpa"  # Use SDPA for compatibility (flash_attention_2 or flash_attention_3 also work)
+    # eager runs everywhere (CPU/GPU, no flash-attn dependency). The Once patcher also supports
+    # flash_attention_2 (the production GPU path); sdpa is not supported by its attention patcher.
+    attn_impl = os.environ.get("ZORRO_DEMO_ATTN", "eager")
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     print(f"\nDevice: {device}")
     print(f"Model: {model_name}")
     print(f"Attention: {attn_impl}")
 
+    # Demo 1: gradient/logprob correctness vs a non-deduplicated baseline (needs a fresh actor).
+    print("\n" + "=" * 80)
+    print("Demo 1: Gradient/Logprob Correctness vs Baseline")
+    print("=" * 80)
     try:
-        actor = DeduplicatedActor(
-            model_name,
-            device=device,
-            use_split_attention=True,  # Enable split attention optimization
-            attn_implementation=attn_impl,
-        )
+        actor = build_actor(model_name, device, attn_impl, dtype)
     except Exception as e:
         print(f"\nError loading model: {e}")
-        print("\nPlease check that the model is available and your environment is set up correctly")
+        print("\nPlease check that the model is available and your environment is set up correctly.")
         import traceback
 
         traceback.print_exc()
         return
 
-    # Demo 1: Simple forward pass
-    print("\n" + "=" * 80)
-    print("Demo 1: Forward Pass with Deduplication")
-    print("=" * 80)
-
-    batch = create_dummy_batch(
-        batch_size=8,
-        num_unique_prompts=2,
-        prompt_len=32,
-        response_len=16,
-        device=device,
-        include_training_fields=False,
-    )
-
-    print("\nRunning forward pass...")
-    entropy, log_probs = actor._forward_micro_batch(batch, temperature=1.0, calculate_entropy=True)
-
-    print("\nResults:")
-    print(f"  Log probs shape: {log_probs.shape}")
-    print(f"  Log probs mean: {log_probs.mean().item():.4f}")
-    if entropy is not None:
-        print(f"  Entropy shape: {entropy.shape}")
-        print(f"  Entropy mean: {entropy.mean().item():.4f}")
-
-    # Demo 2: Gradient correctness test
-    print("\n" + "=" * 80)
-    print("Demo 2: Gradient Correctness Test")
-    print("=" * 80)
-
     passed = test_gradient_correctness(
         actor=actor,
-        batch_size=8,
+        batch_size=6,
         num_unique_prompts=2,
         prompt_len=32,
         response_len=16,
         device=device,
     )
-
     if not passed:
-        print("\nWarning: Gradient test did not pass. Implementation may have issues.")
-        return
+        print("\nWarning: correctness check did not pass. Implementation may have issues.")
 
-    # Demo 3: Performance benchmark (optional)
+    # Demo 2: optional performance benchmark (needs a second fresh actor -- the first is now patched).
     print("\n" + "=" * 80)
-    print("Demo 3: Performance Benchmark")
+    print("Demo 2: Performance Benchmark (optional)")
     print("=" * 80)
-    print("\nThis benchmark tests:")
-    print("  - 10 samples with the SAME 10K-token prompt")
-    print("  - Each has a different 1K-token response")
-    print("  - Total: 110K tokens")
-    print("\nDeduplication should save ~81% of computation")
-
-    user_input = input("\nRun performance benchmark? (y/n): ")
-    if user_input.lower() == "y":
+    print("\nBenchmarks deduplicated vs baseline forward+backward on a batch of shared prompts.")
+    if input("\nRun performance benchmark (loads a second copy of the model)? (y/n): ").lower() == "y":
+        actor2 = build_actor(model_name, device, attn_impl, dtype)
         benchmark_performance(
-            actor=actor,
+            actor=actor2,
             batch_size=4,
-            prompt_len=8192,
-            response_len=1000,
+            prompt_len=2048,
+            response_len=256,
             num_unique_prompts=1,
             num_warmup=1,
-            num_runs=1,
+            num_runs=3,
             device=device,
         )
     else:
