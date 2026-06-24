@@ -66,6 +66,26 @@ class WeightNormRequest(BaseModel):
     sampling_job_id: int
 
 
+def parse_arctic_inference_rollout(arctic_inference_config, model_config_fields=None):
+    if not arctic_inference_config:
+        return {}
+    out = {}
+    fields = model_config_fields or set()
+
+    zorro = arctic_inference_config.get("zorro_inference")
+    if isinstance(zorro, dict) and zorro.get("enable"):
+        if "use_fca" in fields:
+            out["use_fca"] = True
+
+    spec = arctic_inference_config.get("speculative_decoding")
+    if isinstance(spec, dict):
+        model = (spec.get("model") or "").strip()
+        if model and "spec_model" in fields:
+            out["spec_model"] = model
+
+    return out
+
+
 def build_model_config(
     model_name: str,
     vllm_config: dict | None,
@@ -80,8 +100,8 @@ def build_model_config(
     """
     cfg = dict(vllm_config or {})
     cfg["model"] = model_name
-    cfg.update(arctic_inference_config or {})
     known_fields = set(ModelConfig.model_fields.keys())
+    cfg.update(parse_arctic_inference_rollout(arctic_inference_config, known_fields))
     extra = {k: v for k, v in cfg.items() if k not in known_fields}
     base = {k: v for k, v in cfg.items() if k in known_fields}
     if extra:
