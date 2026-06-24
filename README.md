@@ -9,6 +9,11 @@
 
 Arctic Platform is a framework for addressing challenges in current post-training frameworks, such as limited support for rapid prototyping and the lack of native data generation tools, by offering modularity across training and inference components, simplified code structures, and integrated pipelines for creating and cleaning synthetic data. These features enable users to enhance LLM capabilities, like code generation and complex reasoning, with greater efficiency and flexibility.
 
+For example in the RL world if one wre to compare various frameworks, one will find that each framework implements its own backends, adds fragmented system optimizations and the overlall performance isn't quite portable from framework to framework. Thus the intention is to provide consistent building blocks that can be easily integrated into multiple frameworks while providing:
+
+- Unified GPU Backends, e.g. RL en-prem or remote backends
+- Unified System Optimizations leading to High Performance Portability
+
 This is a work in progress, starting with the RL components, later integrating more training and inference components.
 
 # Project Scope
@@ -33,7 +38,7 @@ Arctic RL is designed to **integrate into existing RL frameworks** rather than r
 * **Log-prob / reference engine** — a forward-only DeepSpeed engine for reference / old log-prob computation.
 * **Sampling engine** — a vLLM engine with ArcticInference for fast rollouts.
 
-These engines are orchestrated over [Ray](https://www.ray.io/), can be **colocated** on shared GPUs (via fractional Ray resources) or split across separate GPUs, and keep the sampler in sync with the trainer through NCCL or CUDA-IPC weight transfer. The front-end to back-end communication runs over either Ray or HTTP. ArcticInference extends the core optimizations with multi-replica scheduling, load-balancing, weight-sync, and router-replay.
+These engines are orchestrated over [Ray](https://www.ray.io/), can be **colocated** on shared GPUs (via fractional Ray resources) or split across separate GPUs, and keep the sampler in sync with the trainer through NCCL or CUDA-IPC weight transfer. The RL framework interacts with the compute engines over Ray or HTTP. ArcticInference extends the core optimizations with multi-replica scheduling, load-balancing, weight-sync, and router-replay.
 
 An RL framework integrates this module by constructing a client and driving the standard operations (generate, forward/backward, optimizer step, sync_weights, and wake/sleep for memory management). For example, on a single 8-GPU node one could do:
 
