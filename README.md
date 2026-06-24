@@ -13,12 +13,17 @@ This is a work in progress, starting with the RL components, later integrating m
 
 # Project Scope
 
-Arctic Platform aims to cover the full post-training stack for LLMs behind a small, composable API. The codebase is being built out incrementally:
+Arctic Platform aims to cover the full post-training stack for LLMs behind a small, composable API. The codebase is being built out incrementally.
 
-* **Reinforcement Learning (available today)** — a high-throughput RL training/inference backend that plugs into existing RL frameworks (see below).
-* **ZoRRo Train (available today)** — a prompt-deduplication optimization that removes redundant prompt computation during RL training (see below).
-* **ZoRRo Inference (available today)** — forest cascade attention for efficient rollout step that eliminates redundant memory accesses via grouping (see below).
-* **Coming next** — additional trainers (SFT/distillation), synthetic data generation and cleaning pipelines, and tighter inference integration.
+What is available today:
+
+* [**Arctic Reinforcement Learning**](#arctic-reinforcement-learning) — a high-throughput RL training/inference backend that plugs into existing RL frameworks (see below).
+* [**ZoRRo Train**](#zorro-train) — a prompt-deduplication optimization that removes redundant prompt computation during RL training (see below).
+* [**ZoRRo Inference**](#zorro-inference) — forest cascade attention for efficient rollout step that eliminates redundant memory accesses via grouping (see below).
+
+What's coming next:
+
+* additional trainers (SFT/distillation), synthetic data generation and cleaning pipelines, and tighter inference integration.
 
 ## Arctic Reinforcement Learning
 
@@ -30,49 +35,39 @@ Arctic RL is designed to **integrate into existing RL frameworks** rather than r
 
 These engines are orchestrated over [Ray](https://www.ray.io/), can be **colocated** on shared GPUs (via fractional Ray resources) or split across separate GPUs, and keep the sampler in sync with the trainer through NCCL or CUDA-IPC weight transfer. The front-end to back-end communication runs over either Ray or HTTP. ArcticInference extends the core optimizations with multi-replica scheduling, load-balancing, weight-sync, and router-replay.
 
-A framework integrates by constructing a client and driving the standard operations (generate, forward/backward, optimizer step, sync_weights, and wake/sleep for memory management):
+An RL framework integrates this module by constructing a client and driving the standard operations (generate, forward/backward, optimizer step, sync_weights, and wake/sleep for memory management). For example, on a single 8-GPU node one could do:
 
-```py
+```python
 from arctic_platform.rl import ArcticRLClientConfig, create_arctic_rl_client
 
 config = ArcticRLClientConfig(
     model_name="Qwen/Qwen3-4B",
     comm_protocol="ray",        # or "http"
-    training_gpus=1,
-    sampling_gpus=1,
+    training_gpus=8,            #
+    sampling_gpus=8,
     log_prob_gpus=0,
-    colocate=False,
+    colocate=True,
 )
 client = create_arctic_rl_client(config)
 ```
 
-python
-
-Copy
-
 The reference integration is [verl](https://github.com/volcengine/verl) ([https://github.com/verl-project/verl/pull/6422](https://github.com/verl-project/verl/pull/6422)), which drives Arctic RL from its PPO/GRPO trainer. End-to-end recipes live under [arctic_platform/rl](arctic_platform/rl/README.md), including [Txt2SQL](https://raw.githubusercontent.com/Snowflake-AI-Research/Arctic-Platform/912de39206cf5f53d995cef1661e59c1b17c3b8f/arctic_platform/rl/projects/txt2sql) and [long-context QA](https://raw.githubusercontent.com/Snowflake-AI-Research/Arctic-Platform/912de39206cf5f53d995cef1661e59c1b17c3b8f/arctic_platform/rl/projects/long_context_qa).
 
-The other upcoming integration is into [SkyRL](https://github.com/Snowflake-AI-Research/SkyRL/pull/1)
+The other upcoming integration is into [SkyRL](https://github.com/Snowflake-AI-Research/SkyRL/pull/1).
 
-Many more frameworks integrations are in the works and will be added here once available.
+Multiple additional frameworks integrations are in the works and will be added here once available.
 
 ### ZoRRo Train
 
+ZoRRo stands for Zero Redundancy Rollouts.
+
 In RL training (PPO/GRPO) the same prompt is sampled many times to explore different responses, therefore for long sequence tasks **80–95% of the tokens in a batch are redundant prompt tokens** — and with transformer attention’s O(n²) cost, recomputing those shared prompts dominates the bill for long-context RL.
 
-**ZoRRo Train** eliminates that waste with automatic **prompt deduplication** at the attention layer: it detects sequences that share a prompt, packs each unique prompt once, runs the model a single time over the deduplicated sequence, and transparently reconstructs per-response logprobs/entropy in the original sample order. The result is mathematically equivalent to the naive forward/backward (gradients match the baseline within numerical precision) while substantially cutting memory use and increasing throughput — the longer and more-shared the prompts, the larger the win.
+**ZoRRo Train** eliminates that waste with automatic **prompt deduplication** at all levels: it detects sequences that share a prompt, packs each unique prompt once, runs the model a single time over the deduplicated sequence, and transparently reconstructs per-response logprobs/entropy in the original sample order. The result is mathematically equivalent to the naive forward/backward (gradients match the baseline within numerical precision) while substantially cutting memory use and increasing throughput — the longer and more-shared the prompts, the larger the win.
 
-It is installed transparently by the DeepSpeed training/log-prob engines and toggled per run via the RL config (zorro_train.enable).
+It is installed transparently by the DeepSpeed training/log-prob engines and toggled per run via the RL config (`zorro_train.enable`).
 
-Supported model families today:
-
-* qwen3
-* qwen3-moe
-* qwen3-next-moe
-* qwen3.6
-* qwen3.6-moe
-
-This spans dense, MoE, and hybrid (linear + full attention) architectures, and **more models will be added in the future**.
+The supported model families span dense and MoE models - see the list [here](arctic_platform/rl/zorro_train/README.md#supported-models).
 
 See [arctic_platform/rl/zorro_train/README.md](arctic_platform/rl/zorro_train/README.md) for the full design, the deduplication/attention internals, and benchmarks.
 
@@ -86,6 +81,10 @@ It is implemented in the vLLM sampling engine and activates transparently for de
 
 See the [Forest Cascade Attention README](https://github.com/snowflakedb/ArcticInference/tree/arctic_rl/integration/arctic_inference/vllm/attention) in Arctic Inference for the full design, the grouping/attention internals, and the tuning knobs.
 
+# Quickstart
+
+To get started training a model with Arctic Platform, first [install the package](#installation), then follow [the recipes](arctic_platform/rl/recipes/).
+
 # Installation
 
 ## From PyPI
@@ -96,9 +95,7 @@ Install the latest released version and its dependencies from [PyPI](https://pyp
 pip install arctic-platform
 ```
 
-bash
-
-Copy
+While this project is being very actively developed it's probably better to install directly from [git](#from-source-git).
 
 ## From source (git)
 
@@ -107,13 +104,5 @@ To get the latest development version (or to contribute), clone the repository a
 ```shell
 git clone https://github.com/Snowflake-AI-Research/arctic-platform.git
 cd arctic-platform
-pip install -e .
+pip install -e .[rl]
 ```
-
-bash
-
-Copy
-
-# Quickstart
-
-To get started training a model with Arctic Platform, first [install the package](https://raw.githubusercontent.com/Snowflake-AI-Research/Arctic-Platform/912de39206cf5f53d995cef1661e59c1b17c3b8f/README.md#installation), then follow the recipes under [arctic_platform/rl](arctic_platform/rl/README.md).
