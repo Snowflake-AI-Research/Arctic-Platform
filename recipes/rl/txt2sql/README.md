@@ -1,7 +1,7 @@
 # Text2SQL with Arctic RL
 
 GRPO training for **Qwen3-32B** on the BIRD SQL benchmark, served by
-[Arctic RL](../../) with the [Zorro](../../zorro) trainer. Mirrors the
+[Arctic RL](../../../arctic_platform/rl/) with the [ZoRRo](../../../arctic_platform/rl/zorro_train/) trainer. Mirrors the
 hyperparameters of the stock-verl baseline at
 `verl_opensource/examples/bird_sql/run_qwen3_32b_bird_grpo.sh` so the two
 backends can be compared apples-to-apples on wall-clock speed.

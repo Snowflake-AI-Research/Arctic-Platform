@@ -19,13 +19,15 @@
 # Prerequisites:
 #   1. Download data: python examples/long_context/download_data.py  (in verl_opensource)
 #      Resulting parquets must live at $DATA_DIR/merged/{train,test}.parquet
-#   2. Multi-node ray cluster started across the participating nodes (see /job/hostfile)
-#   3. Arctic packages + arctic-verl installed (use the install-*.sh scripts under work_dir)
+#   2. Arctic packages + arctic-verl installed (use the install-*.sh scripts under work_dir)
+#   3. Multi-node ray cluster started across the participating nodes (see restart_multi_ray.sh)
 
 set -x
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+HOSTFILE="${JOB_HOSTFILE:/data-fast/hostfile"}
 
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
 
@@ -44,9 +46,8 @@ export VLLM_LOGGING_LEVEL=INFO
 # Pre-launch /dev/shm cleanup: NCCL / vllm / sem files accumulate across runs and
 # can fill 100GiB tmpfs after a few iterations, killing raylets (SIGBUS / OOM).
 # Cleanup is per-user so it won't disturb other workloads. Best-effort.
-DS_SSH_HOSTFILE="${JOB_HOSTFILE:-/job/hostfile}"
 DS_SSH_FLAGS=()
-if [[ -n "${JOB_HOSTFILE:-}" ]]; then
+if [[ -n "${HOSTFILE:-}" ]]; then
     DS_SSH_FLAGS=(-f "${JOB_HOSTFILE}")
 fi
 if command -v ds_ssh >/dev/null 2>&1 && [[ -f "${DS_SSH_HOSTFILE}" ]]; then
@@ -59,7 +60,6 @@ if command -v ds_ssh >/dev/null 2>&1 && [[ -f "${DS_SSH_HOSTFILE}" ]]; then
         2>&1 | tail -10
 fi
 
-HOSTFILE="/data-fast/hostfile"
 if [[ -f ${HOSTFILE} ]]; then
     NNODES=$(wc -l < ${HOSTFILE})
 else

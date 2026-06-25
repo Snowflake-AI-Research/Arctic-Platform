@@ -37,7 +37,7 @@ pre-commit run --all-files
 It's better to use:
 ```
 make format
-````
+```
 as it'll install all the required venv things automatically for you and will do the right thing.
 
 If a formatting test fails, some pre-commit hooks will attempt to modify the

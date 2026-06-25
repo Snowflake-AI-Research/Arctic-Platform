@@ -53,13 +53,13 @@ The training recipe consumes `merged/train.parquet` and
 If you want to train on a single task, point the training command at
 that task's `{train,test}.parquet` instead of `merged/`.
 
-## 2. Train
+## 2. Ray and multi-node hostfile
 
-Next edit the environment variables in `run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh` to match your setup. In particular:
-- `HF_HOME` - where you HF hub cache is (you can unset it as well)
-- `VLLM_CACHE_ROOT` - some path where vllm could cache its work
+when using a multi-node training environment Ray and DeepSpeed need a special file called `hostfile` (comes from MPI) that they use to find the participating nodes and the number of gpus on each node.
 
-While at it, you need to create a special file called `hostfile`, that the `deepspeed` launcher uses to discover all the participating nodes. For example:
+Most likely your CSP already provides one for you, if that's the case please note its path on the filesystem.
+
+If you don't have one you need to create it. It looks like this:
 
 ```
 10.1.1.1 slots=8
@@ -67,9 +67,24 @@ While at it, you need to create a special file called `hostfile`, that the `deep
 10.1.1.3 slots=8
 10.1.1.4 slots=8
 ```
-the first column is the ips  of the participating nodes, the second column is the number of gpus on each node. Once created edit `HOSTFILE
+the first column is the IPs of the participating nodes, the second column is the number of gpus on each node.
 
-The `_kl` recipe is standalone (no wrapper).
+now run:
+```
+export JOB_HOSTFILE=/path/of/hostfile
+```
+(or you can change the `HOSTFILE` setting on top of both scripts)
+
+now launch the multi-node ray launcher:
+```
+bash ./restart_multi_ray.sh
+```
+
+## 3. Train
+
+Next edit the environment variables in `run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh` to match your setup. In particular:
+- `HF_HOME` - where you HF hub cache is (you can unset it as well)
+- `VLLM_CACHE_ROOT` - some path where vllm could cache its work
 
 ```bash
 bash run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh \
@@ -77,13 +92,12 @@ bash run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh \
     data.val_files=/data/snowflakesql/long-context/merged/test.parquet
 ```
 
-Or just edit `DATA_DIR` in the script (defaults to
+Alternatively you can edit `DATA_DIR` in the script (defaults to
 `/data/snowflakesql/xyu/long-context`) and launch with no overrides:
 
 ```bash
 bash run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh
 ```
-
 
 Key recipe knobs (set inside the script):
 
@@ -97,10 +111,3 @@ Key recipe knobs (set inside the script):
 | `PPO_MINI_BSZ` | 64 | Actor mini-batch |
 | `LR` | 1e-6 | |
 | `USE_KL_LOSS` | True | Low-variance KL vs. frozen ref, coef `0.001` |
-
-## Files
-
-| File | What it is |
-| --- | --- |
-| `run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh` | KL-enabled GRPO + Arctic/Zorro recipe |
-| `download_data.py` | LoongRL-Train-Data → verl parquets |
