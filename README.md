@@ -11,7 +11,7 @@ Arctic Platform is a framework for addressing challenges in current post-trainin
 
 For example in the RL world if one wre to compare various frameworks, one will find that each framework implements its own backends, adds fragmented system optimizations and the overlall performance isn't quite portable from framework to framework. Thus the intention is to provide consistent building blocks that can be easily integrated into multiple frameworks while providing:
 
-- Unified GPU Backends, e.g. RL en-prem or remote backends
+- Unified GPU Backends, e.g. RL on-prem or remote backends
 - Unified System Optimizations leading to High Performance Portability
 
 This is a work in progress, starting with the RL components, later integrating more training and inference components.
