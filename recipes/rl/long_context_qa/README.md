@@ -17,7 +17,46 @@ Topology: 4 nodes × 8 H200 GPUs (32 GPUs total), `colocate=True`,
 Deepspeed ZeRO stage-3 with CPU optimizer offload, vLLM rollout (TP=2). With KL the
 sampling and ref-log-prob pools each get half the GPUs.
 
-## 1. Download and merge the data
+## 1. Install packages
+
+First create a new virtual environment of your preference or use the existing one.
+
+We are going to use `uv` for much faster installations:
+```bash
+pip install uv
+```
+
+Install the Arctic packages:
+```bash
+uv pip install arctic-platform[rl] arctic-inference[server]
+```
+
+Install Verl and its dependencies:
+
+Please note the assumption is cuda-12.9 - if you use a different version change the `torch` and `cuda-bindings` lines to the version you need.
+
+Also the arctic-inference patches vllm-0.18.0, therefore we explicitly install that one.
+
+```bash
+git clone https://github.com/verl-project/verl
+cd verl
+
+grep -v flash-attn requirements.txt > requirements-no-fa.txt
+uv pip install -r requirements-no-fa.txt
+uv pip install -e .
+
+uv pip install -U pip wheel packaging setuptools
+uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu129 -U
+uv pip install vllm==0.18.0
+uv pip install flash-attn --no-build-isolation
+uv pip install numpy==1.26.4
+uv pip install transformers==4.57.6
+uv pip install flashinfer-python==0.5.3
+uv pip install cuda-bindings==12.9.0
+```
+
+
+## 2. Data preparation
 
 `download_data.py` pulls the three subset pairs from HuggingFace,
 prepends a system prompt that asks the model to think inside `<think>`
@@ -53,7 +92,7 @@ The training recipe consumes `merged/train.parquet` and
 If you want to train on a single task, point the training command at
 that task's `{train,test}.parquet` instead of `merged/`.
 
-## 2. Ray and multi-node hostfile
+## 3. Ray and multi-node hostfile
 
 when using a multi-node training environment Ray and DeepSpeed need a special file called `hostfile` (comes from MPI) that they use to find the participating nodes and the number of gpus on each node.
 
@@ -80,7 +119,7 @@ now launch the multi-node ray launcher:
 bash ./restart_multi_ray.sh
 ```
 
-## 3. Train
+## 4. Train
 
 Next edit the environment variables in `run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh` to match your setup. In particular:
 - `HF_HOME` - where you HF hub cache is (you can unset it as well)
