@@ -26,7 +26,7 @@ tags and answer inside `\boxed{}`, drops any non-verl columns, and
 writes per-task and merged train/test parquets.
 
 ```bash
-cd projects/long_context_qa
+cd recipes/rl/long_context_qa
 
 pip install datasets
 

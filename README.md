@@ -56,7 +56,7 @@ config = ArcticRLClientConfig(
 client = create_arctic_rl_client(config)
 ```
 
-The reference integration is [verl](https://github.com/volcengine/verl) ([https://github.com/verl-project/verl/pull/6422](https://github.com/verl-project/verl/pull/6422)), which drives Arctic RL from its PPO/GRPO trainer. End-to-end recipes live under [arctic_platform/rl](arctic_platform/rl/README.md), including [Txt2SQL](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/arctic_platform/rl/recipes/txt2sql) and [long-context QA](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/arctic_platform/rl/recipes/long_context_qa).
+The reference integration is [verl](https://github.com/volcengine/verl) ([https://github.com/verl-project/verl/pull/6422](https://github.com/verl-project/verl/pull/6422)), which drives Arctic RL from its PPO/GRPO trainer. End-to-end recipes live under [recipes/rl](recipes/rl/), including [Txt2SQL](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/txt2sql) and [long-context QA](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/long_context_qa).
 
 The other upcoming integration is into [SkyRL](https://github.com/Snowflake-AI-Research/SkyRL/pull/1).
 
@@ -88,7 +88,7 @@ See the [Forest Cascade Attention README](https://github.com/snowflakedb/ArcticI
 
 # Quickstart
 
-To get started training a model with Arctic Platform, first [install the package](#installation), then follow [the recipes](arctic_platform/rl/recipes/).
+To get started training a model with Arctic Platform, first [install the package](#installation), then follow [the recipes](recipes/rl/).
 
 # Installation
 

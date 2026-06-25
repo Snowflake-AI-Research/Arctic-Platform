@@ -108,7 +108,7 @@ contract.
 ### Run it
 
 ```bash
-cd projects/txt2sql
+cd recipes/rl/txt2sql
 
 pip install pandas datasets transformers numpy
 pip install func_timeout              # required by bird_reward.py at training time
