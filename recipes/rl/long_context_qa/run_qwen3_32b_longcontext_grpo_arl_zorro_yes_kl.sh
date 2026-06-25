@@ -19,7 +19,7 @@
 # Prerequisites:
 #   1. Download data: python examples/long_context/download_data.py  (in verl_opensource)
 #      Resulting parquets must live at $DATA_DIR/merged/{train,test}.parquet
-#   2. Multi-node ray cluster started across the H200 nodes (see /job/hostfile)
+#   2. Multi-node ray cluster started across the participating nodes (see /job/hostfile)
 #   3. Arctic packages + arctic-verl installed (use the install-*.sh scripts under work_dir)
 
 set -x
@@ -104,6 +104,8 @@ SAVE_FREQ=-1 # 10             # match verl baseline (save checkpoint every 10 st
 TEST_FREQ=10             # match verl baseline (run validation every 10 steps)
 
 LOGGER="['console']"
+# if you want to use wandb, uncomment the following line and set the WANDB_API_KEY in your environment
+# additionally edit below trainer.project_name and trainer.experiment_name entries to match your wandb project and experiment name
 # LOGGER="['console','wandb']"
 
 MODEL_SHORT=Qwen3-32B
@@ -111,8 +113,9 @@ MODEL=Qwen/${MODEL_SHORT}
 
 experiment_name="longcontext_grpo_${MODEL_SHORT}_ngpu${NGPU_PER_JOB}_gbs${BSZ}_mbs${UBS}_rolln${ROLL_N}_arl_zorro_yes_z${ARCTIC_ZERO_STAGE}_kl"
 
+# feel free to change below to hardcoded a particular attention implementation - the following logic tries to pick the best impelementation based on the gpu name
 gpu_name=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader -i 0)
-if [[ $gpu_name == *"H200"* ]]; then
+if [[ $gpu_name == *"H100"* ]] || [[ $gpu_name == *"H200"* ]] ; then
     echo "Running on Hopper"
     flash_attention_v=flash_attention_3
 elif [[ $gpu_name == *"B200"* ]] || [[ $gpu_name == *"B300"* ]] ; then
@@ -195,7 +198,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.balance_batch=False \
     trainer.default_local_dir=/checkpoint/xyu/long-context-rl/$experiment_name \
     trainer.logger=$LOGGER \
-    trainer.project_name=arctic_rl_long_context_$REAL_USER \
+    trainer.project_name=arctic_rl_long_context \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \

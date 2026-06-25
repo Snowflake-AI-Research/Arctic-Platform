@@ -1,9 +1,8 @@
 # Long-Context QA with Arctic RL
 
 GRPO training for **Qwen3-32B** on long-context multi-hop QA, served by
-[Arctic RL](../../) with the [Zorro](../../zorro) trainer. KL-anchored
-against a frozen reference model (matches the long-context verl baseline
-[uglrinrq](https://wandb.ai/snowflake/verl) topology).
+[Arctic RL](../../../arctic_platform/rl/) with the [ZoRRo](../../../arctic_platform/rl/zorro_train/) trainer. KL-anchored
+against a frozen reference model.
 
 The training data is [LoongRL-Train-Data](https://huggingface.co/datasets/OldKingMeister/LoongRL-Train-Data),
 a 16 K-context corpus that merges three QA sources:
@@ -15,17 +14,19 @@ a 16 K-context corpus that merges three QA sources:
 | 2WikiMultiHopQA | `2wikipedia_qwen_0_2500` + `2wikipedia_distractor_2500_5000` |
 
 Topology: 4 nodes × 8 H200 GPUs (32 GPUs total), `colocate=True`,
-ZeRO-3 with CPU optimizer offload, vLLM rollout (TP=2). With KL the
+Deepspeed ZeRO stage-3 with CPU optimizer offload, vLLM rollout (TP=2). With KL the
 sampling and ref-log-prob pools each get half the GPUs.
 
 ## 1. Download and merge the data
 
 `download_data.py` pulls the three subset pairs from HuggingFace,
 prepends a system prompt that asks the model to think inside `<think>`
-tags and answer inside `\boxed{}`, drops any non-verl columns, and
+tags and answer inside `\boxed{}`, drops any non-verl columns,
 writes per-task and merged train/test parquets.
 
 ```bash
+git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
+cd Arctic-Platform
 cd recipes/rl/long_context_qa
 
 pip install datasets
@@ -54,8 +55,21 @@ that task's `{train,test}.parquet` instead of `merged/`.
 
 ## 2. Train
 
-The `_kl` recipe is standalone (no wrapper). It picks up `NNODES` from
-`/data-fast/hostfile`.
+Next edit the environment variables in `run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh` to match your setup. In particular:
+- `HF_HOME` - where you HF hub cache is (you can unset it as well)
+- `VLLM_CACHE_ROOT` - some path where vllm could cache its work
+
+While at it, you need to create a special file called `hostfile`, that the `deepspeed` launcher uses to discover all the participating nodes. For example:
+
+```
+10.1.1.1 slots=8
+10.1.1.2 slots=8
+10.1.1.3 slots=8
+10.1.1.4 slots=8
+```
+the first column is the ips  of the participating nodes, the second column is the number of gpus on each node. Once created edit `HOSTFILE
+
+The `_kl` recipe is standalone (no wrapper).
 
 ```bash
 bash run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh \
@@ -63,8 +77,13 @@ bash run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh \
     data.val_files=/data/snowflakesql/long-context/merged/test.parquet
 ```
 
-Or just edit `DATA_DIR` at the top of the script (default
-`/data/snowflakesql/xyu/long-context`) and launch with no overrides.
+Or just edit `DATA_DIR` in the script (defaults to
+`/data/snowflakesql/xyu/long-context`) and launch with no overrides:
+
+```bash
+bash run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh
+```
+
 
 Key recipe knobs (set inside the script):
 
