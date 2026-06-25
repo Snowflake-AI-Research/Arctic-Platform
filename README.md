@@ -56,7 +56,7 @@ config = ArcticRLClientConfig(
 client = create_arctic_rl_client(config)
 ```
 
-The reference integration is [verl](https://github.com/volcengine/verl) ([https://github.com/verl-project/verl/pull/6422](https://github.com/verl-project/verl/pull/6422)), which drives Arctic RL from its PPO/GRPO trainer. End-to-end recipes live under [arctic_platform/rl](arctic_platform/rl/README.md), including [Txt2SQL](https://raw.githubusercontent.com/Snowflake-AI-Research/Arctic-Platform/912de39206cf5f53d995cef1661e59c1b17c3b8f/arctic_platform/rl/projects/txt2sql) and [long-context QA](https://raw.githubusercontent.com/Snowflake-AI-Research/Arctic-Platform/912de39206cf5f53d995cef1661e59c1b17c3b8f/arctic_platform/rl/projects/long_context_qa).
+The reference integration is [verl](https://github.com/volcengine/verl) ([https://github.com/verl-project/verl/pull/6422](https://github.com/verl-project/verl/pull/6422)), which drives Arctic RL from its PPO/GRPO trainer. End-to-end recipes live under [arctic_platform/rl](arctic_platform/rl/README.md), including [Txt2SQL](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/arctic_platform/rl/recipes/txt2sql) and [long-context QA](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/arctic_platform/rl/recipes/long_context_qa).
 
 The other upcoming integration is into [SkyRL](https://github.com/Snowflake-AI-Research/SkyRL/pull/1).
 
