@@ -9,7 +9,7 @@ backends can be compared apples-to-apples on wall-clock speed.
 * **Model:** Qwen/Qwen3-32B
 * **Topology:** 4 nodes × 8 H200 GPUs (32 GPUs), `colocate=True` with
   **3-way colocation** (training + sampling + ref log-prob share each GPU
-  bundle). Non-KL runs set `log_prob_gpus=0` (Zorro recomputes actor
+  bundle). Non-KL runs set `log_prob_gpus=0` (ZoRRo recomputes actor
   log-probs on the training engine); KL runs set `log_prob_gpus=32` on
   the same bundles — no 50/50 GPU split needed.
 * **Data:** [BIRD-SQL](https://bird-bench.github.io/) only — train on
@@ -175,7 +175,7 @@ default.
 
 | File | What it is |
 | --- | --- |
-| `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` | Base GRPO + Arctic/Zorro recipe (no KL) |
+| `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` | Base GRPO + Arctic/ZoRRo recipe (no KL) |
 | `run_qwen3_32b_bird_grpo_arl_zorro_yes_kl.sh` | KL-enabled recipe (`use_kl_loss=True`, 3-way colocate with `log_prob_gpus=32`) |
 | `bird_reward.py` | SQLite-based exec-match reward (referenced via `custom_reward_function.path`) |
 | `preprocess_bird.py` | Raw BIRD JSON + SQLite → augmented verl parquets |

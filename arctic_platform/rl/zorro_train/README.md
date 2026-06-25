@@ -1,6 +1,6 @@
 # ZoRRo Train: Prompt Deduplication Optimization for RL Training
 
-ZoRRO Train: Zero Redundancy Rollouts for Training
+ZoRRo stands for Zero Redundancy Rollouts.
 
 ## Motivation
 
@@ -132,7 +132,7 @@ The main functionality can be viewed as:
 
 ✅ **Mathematically Correct**: Gradients match baseline implementation (within numerical precision)
 ✅ **Transparent**: Works as a drop-in replacement for standard forward/backward
-✅ **Flexible**: Supports multiple attention implementations (SDPA, Flash Attention 2/3)
+✅ **Flexible**: Supports multiple attention implementations (eager, Flash Attention 2/3)
 ✅ **Gradient Checkpointing**: Compatible with activation checkpointing
 ✅ **Mixed Precision**: Optimized for `bfloat16` training
 
@@ -200,13 +200,12 @@ python arctic_platform/rl/zorro_train/demo.py
 ```
 
 This will run:
-1. A simple forward pass demonstration
-2. A gradient correctness test
-3. An optional performance benchmark
+1. A gradient/logprob correctness test (deduplicated vs. baseline)
+2. An optional performance benchmark
 
 ### Supported models
 
-Currently ZoRROTrain supports these model families:
+Currently ZoRRo Train supports these model families:
 
 * qwen3
 * qwen3-moe
@@ -346,7 +345,7 @@ If you use this optimization in your research, please consider citing:
 
 ```bibtex
 @misc{zorro_train_2025,
-  title={ZoRRO Train: Zero Redundancy Rollouts for Efficient RL Training},
+  title={ZoRRo Train: Zero Redundancy Rollouts for Efficient RL Training},
   author={Snowflake AI Research},
   year={2025},
   howpublished={\url{https://github.com/Snowflake-AI-Research/Arctic-Platform}}

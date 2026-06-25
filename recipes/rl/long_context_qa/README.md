@@ -106,7 +106,7 @@ Key recipe knobs (set inside the script):
 | `PROMPT_LEN` | 16384 | LoongRL is a 16 K-context dataset |
 | `RESPONSE_LEN` | 4096 | |
 | `ROLL_N` | 8 | GRPO group size |
-| `MAX_TOKENS_PER_GPU` | 49 152 | ≥ `PROMPT_LEN + ROLL_N * RESPONSE_LEN` so each GRPO group fits a Zorro tile |
+| `MAX_TOKENS_PER_GPU` | 49 152 | ≥ `PROMPT_LEN + ROLL_N * RESPONSE_LEN` so each GRPO group fits a ZoRRo tile |
 | `BSZ` | 256 | Train batch size (data) |
 | `PPO_MINI_BSZ` | 64 | Actor mini-batch |
 | `LR` | 1e-6 | |

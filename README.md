@@ -107,8 +107,8 @@ While this project is being very actively developed it's probably better to inst
 To get the latest development version (or to contribute), clone the repository and install it in editable mode:
 
 ```shell
-git clone https://github.com/Snowflake-AI-Research/arctic-platform.git
-cd arctic-platform
+git clone https://github.com/Snowflake-AI-Research/Arctic-Platform.git
+cd Arctic-Platform
 pip install -e .[rl]
 ```
 
@@ -117,10 +117,10 @@ pip install -e .[rl]
 If you use Arctic Platform in your research, please consider citing:
 
 ```bibtex
-@misc{arctic_platform_2026,
+@misc{arctic_platform_2025,
   title={Arctic Platform: Simplifying and Accelerating Post-Training for LLMs},
   author={Snowflake AI Research},
-  year={2026},
+  year={2025},
   howpublished={\url{https://github.com/Snowflake-AI-Research/Arctic-Platform}}
 }
 ```
