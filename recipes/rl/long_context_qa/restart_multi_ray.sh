@@ -1,4 +1,4 @@
-HOSTFILE="${JOB_HOSTFILE:/data-fast/hostfile}"
+HOSTFILE="${JOB_HOSTFILE:-/data-fast/hostfile}"
 ray_path=$(which ray)
 # PY_ENV="source ~/py_env/gsched/bin/activate"
 

@@ -31,7 +31,7 @@ cd recipes/rl/long_context_qa
 
 pip install datasets
 
-# Defaults: --output_dir /data/snowflakesql/xyu/long-context, test_ratio=0.05, seed=42
+# Defaults: --output_dir /data/snowflakesql/long-context, test_ratio=0.05, seed=42
 python download_data.py --output_dir /data/snowflakesql/long-context
 ```
 
@@ -93,7 +93,7 @@ bash run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh \
 ```
 
 Alternatively you can edit `DATA_DIR` in the script (defaults to
-`/data/snowflakesql/xyu/long-context`) and launch with no overrides:
+`/data/snowflakesql/long-context`) and launch with no overrides:
 
 ```bash
 bash run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh

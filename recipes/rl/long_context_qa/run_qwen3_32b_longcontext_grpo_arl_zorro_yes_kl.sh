@@ -27,7 +27,7 @@ set -x
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-HOSTFILE="${JOB_HOSTFILE:/data-fast/hostfile"}
+HOSTFILE="${JOB_HOSTFILE:-/data-fast/hostfile}"
 
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
 
@@ -126,7 +126,7 @@ else
 fi
 
 # Data: LoongRL-Train-Data merged across HotpotQA + MuSiQue + 2WikiMQA, 16K context
-DATA_DIR="/data/snowflakesql/xyu/long-context"
+DATA_DIR="/data/snowflakesql/long-context"
 TRAIN_FILES="${DATA_DIR}/merged/train.parquet"
 VAL_FILES="${DATA_DIR}/merged/test.parquet"
 
@@ -196,7 +196,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.use_legacy_worker_impl=$USE_LEGACY_WORKER_IMPL \
     trainer.use_arctic_rl=$USE_ARCTIC_RL \
     trainer.balance_batch=False \
-    trainer.default_local_dir=/checkpoint/xyu/long-context-rl/$experiment_name \
+    trainer.default_local_dir=/checkpoint/long-context-rl/$experiment_name \
     trainer.logger=$LOGGER \
     trainer.project_name=arctic_rl_long_context \
     trainer.experiment_name=$experiment_name \
