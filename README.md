@@ -84,7 +84,7 @@ During RL rollouts many sequences are generated from the same prompt. In the dec
 
 It is implemented in the vLLM sampling engine and activates transparently for decode-heavy batches with shared prefixes.
 
-See the [Forest Cascade Attention README](https://github.com/snowflakedb/ArcticInference/tree/arctic_rl/integration/arctic_inference/vllm/attention) in Arctic Inference for the full design, the grouping/attention internals, and the tuning knobs.
+See the [Forest Cascade Attention README](https://github.com/snowflakedb/ArcticInference/tree/main/arctic_inference/vllm/attention) in Arctic Inference for the full design, the grouping/attention internals, and the tuning knobs.
 
 # Quickstart
 
