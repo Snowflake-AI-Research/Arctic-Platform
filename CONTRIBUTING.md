@@ -1,7 +1,7 @@
 # Contributing
 ArcticPlatform welcomes your contributions!
 
-You may want to start with [First Good Issue label](https://github.com/Snowflake-AI-Research/Arctic-Platform/issues?q=state%3Aopen%20label%3A%22good%20first%20issue%22) issues.
+You may want to start with [good first issue label](https://github.com/Snowflake-AI-Research/Arctic-Platform/issues?q=state%3Aopen%20label%3A%22good%20first%20issue%22) issues.
 
 ## Prerequisites
 ArcticPlatform uses [pre-commit](https://pre-commit.com/) to ensure that

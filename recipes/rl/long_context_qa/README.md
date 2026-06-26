@@ -13,9 +13,11 @@ a 16 K-context corpus that merges three QA sources:
 | MuSiQue | `musique_qwen_0_2500` + `musique_distractor_2500_5000` |
 | 2WikiMultiHopQA | `2wikipedia_qwen_0_2500` + `2wikipedia_distractor_2500_5000` |
 
-Topology: 4 nodes × 8 H200 GPUs (32 GPUs total), `colocate=True`,
+Topology: 4 nodes × 8 H200 GPUs (32 GPUs total), `colocate=True` with **3-way
+colocation** (training + sampling + ref log-prob share each GPU bundle),
 Deepspeed ZeRO stage-3 with CPU optimizer offload, vLLM rollout (TP=2). With KL the
-sampling and ref-log-prob pools each get half the GPUs.
+ref-log-prob engine is colocated on the same GPUs (`log_prob_gpus` = full GPU count) —
+no separate ref pool or 50/50 split.
 
 ## 1. Install packages
 
@@ -145,7 +147,7 @@ Key recipe knobs (set inside the script):
 | `PROMPT_LEN` | 16384 | LoongRL is a 16 K-context dataset |
 | `RESPONSE_LEN` | 4096 | |
 | `ROLL_N` | 8 | GRPO group size |
-| `MAX_TOKENS_PER_GPU` | 49 152 | ≥ `PROMPT_LEN + ROLL_N * RESPONSE_LEN` so each GRPO group fits a ZoRRo tile |
+| `MAX_TOKENS_PER_GPU` | 49152 | ≥ `PROMPT_LEN + ROLL_N * RESPONSE_LEN` so each GRPO group fits a ZoRRo tile |
 | `BSZ` | 256 | Train batch size (data) |
 | `PPO_MINI_BSZ` | 64 | Actor mini-batch |
 | `LR` | 1e-6 | |

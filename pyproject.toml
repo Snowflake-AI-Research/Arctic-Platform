@@ -11,12 +11,12 @@ license-files = [
 
 [tool.hatch.build]
 include = [
-  "arctic_platform_cli.py",
   "arctic_platform",
 ]
 
 [project.urls]
 Homepage = "https://github.com/Snowflake-AI-Research/Arctic-Platform"
+Repository = "https://github.com/Snowflake-AI-Research/Arctic-Platform"
 Issues = "https://github.com/Snowflake-AI-Research/Arctic-Platform/issues"
 
 [project]
@@ -32,8 +32,6 @@ authors = [
 ]
 license = "Apache-2.0"
 readme = "README.md"
-homepage = "https://github.com/Snowflake-AI-Research/Arctic-Platform"
-repository = "https://github.com/Snowflake-AI-Research/Arctic-Platform"
 keywords = ["llm", "training", "rl"]
 
 classifiers = [

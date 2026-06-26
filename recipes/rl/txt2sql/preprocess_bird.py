@@ -580,12 +580,10 @@ def filter_by_token_length(
 # ---------------------------------------------------------------------------
 
 DEFAULT_PATHS = {
-    "bird_dir": "/data/ruofan/bird_wiki_original",
-    "spider_dir": "/data/ruofan/spider_data",
-    "gretelai_parquet": "/data/ruofan/gretelai/synthetic_text_to_sql_train.snappy.parquet",
-    "r1_parquet": (
-        "/code/users/lukasz/process/snowflake_v1/merged_train_model_type-qwen_coder-sft_maxtoken-8192_maxtime-10_len-16459.parquet"
-    ),
+    "bird_dir": "/data/bird",
+    "spider_dir": "/data/spider",
+    "gretelai_parquet": "/data/gretelai/synthetic_text_to_sql_train.snappy.parquet",
+    "r1_parquet": "/data/r1/merged_train.parquet",
 }
 
 

@@ -154,7 +154,7 @@ pip install flash-attn --no-build-isolation
 ### Basic Usage
 
 ```python
-from arctic_platform.rl.zorro_train import DeduplicatedActor
+from arctic_platform.rl.zorro_train.actor import DeduplicatedActor
 from arctic_platform.rl.zorro_train.tests import create_dummy_batch
 
 # Initialize the actor; it installs Qwen3ModelOncePatcher onto the model on first forward.
@@ -258,7 +258,7 @@ Expected speedups depend on the deduplication ratio:
 ```
 arctic_platform/rl/zorro_train/
 ├── README.md                  # This file
-├── __init__.py                # Public exports (ZoRRoTrain, DeduplicatedActor, patchers)
+├── __init__.py                # Public exports (ZoRRoTrain, Qwen3ModelOncePatcher, QwenAttentionOncePatcher, ReconstructionInfo)
 ├── zorro_train.py             # Core dedup algorithm: ZoRRoTrain + ReconstructionInfo
 ├── actor.py                   # DeduplicatedActor reference harness (demo / correctness)
 ├── qwen_model_patcher.py      # Qwen3ModelOncePatcher (production), Qwen3ModelPatcher, logprob/entropy kernels
@@ -276,18 +276,20 @@ round-trips), `test_once_patcher.py` (GPU `Qwen3ModelOncePatcher` forward/backwa
 
 ## API Reference
 
-All public symbols are re-exported from the package root:
+The core algorithm and production patchers are re-exported from the package root:
 
 ```python
 from arctic_platform.rl.zorro_train import (
     ZoRRoTrain,
-    DeduplicatedActor,
-    Qwen3ModelPatcher,
-    QwenAttentionPatcher,
-    ModuleReconstructionPatcher,
+    Qwen3ModelOncePatcher,
+    QwenAttentionOncePatcher,
+    ReconstructionInfo,
 )
-# Production patcher (imported from the submodule):
-from arctic_platform.rl.zorro_train.qwen_model_patcher import Qwen3ModelOncePatcher
+# Reference harness / reference patchers (imported from their submodules):
+from arctic_platform.rl.zorro_train.actor import DeduplicatedActor
+from arctic_platform.rl.zorro_train.qwen_model_patcher import Qwen3ModelPatcher
+from arctic_platform.rl.zorro_train.qwen_attention_patcher import QwenAttentionPatcher
+from arctic_platform.rl.zorro_train.module_patcher import ModuleReconstructionPatcher
 ```
 
 ### `DeduplicatedActor`
