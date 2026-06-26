@@ -18,7 +18,52 @@ backends can be compared apples-to-apples on wall-clock speed.
 * **Reward:** SQLite execution-match against the gold SQL
   (`bird_reward.py`)
 
-## 1. Get the raw BIRD data
+## 1. Install packages
+
+First create a new virtual environment of your preference or use the existing one.
+
+We are going to use `uv` for much faster installations:
+```bash
+pip install uv
+```
+
+Install the Arctic packages:
+```bash
+uv pip install arctic-platform[rl] arctic-inference[server]
+```
+
+Install Verl and its dependencies:
+
+Please note the assumption is cuda-12.9 - if you use a different version change the `torch` and `cuda-bindings` lines to the version you need.
+
+Also the arctic-inference patches vllm-0.18.0, therefore we explicitly install that one.
+
+```bash
+git clone https://github.com/verl-project/verl
+cd verl
+
+grep -v flash-attn requirements.txt > requirements-no-fa.txt
+uv pip install -r requirements-no-fa.txt
+uv pip install -e .
+
+uv pip install -U pip wheel packaging setuptools
+uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu129 -U
+uv pip install cuda-bindings==12.9.0
+uv pip install vllm==0.18.0
+uv pip install psutil
+uv pip install flash-attn --no-build-isolation
+uv pip install numpy==1.26.4
+uv pip install transformers==4.57.6
+uv pip install flashinfer-python==0.5.3
+```
+
+The BIRD reward (`bird_reward.py`) executes the generated SQL at training time, so
+it also needs:
+```bash
+uv pip install func_timeout
+```
+
+## 2. Get the raw BIRD data
 
 [BIRD-SQL](https://bird-bench.github.io/) ships `train.json`, `dev.json`,
 and per-database SQLite files plus per-table `database_description/*.csv`
@@ -48,7 +93,7 @@ After unzipping you should have:
     └── dev_databases/<db_id>/<db_id>.sqlite       (+ database_description/*.csv)
 ```
 
-## 2. Preprocess to verl parquets
+## 3. Preprocess to verl parquets
 
 `preprocess_bird.py` turns raw BIRD into verl-compatible parquets with
 **heavily augmented** training prompts and **clean** validation prompts.
@@ -111,7 +156,6 @@ contract.
 cd recipes/rl/txt2sql
 
 pip install pandas datasets transformers numpy
-pip install func_timeout              # required by bird_reward.py at training time
 
 python preprocess_bird.py \
     --bird_dir /data/bird \
@@ -144,16 +188,48 @@ Output:
 (`--sources bird spider gretelai`). Those are not used by this recipe,
 which trains on BIRD only.
 
-## 3. Train
+## 4. Ray and multi-node hostfile
+
+when using a multi-node training environment Ray and DeepSpeed need a special file called `hostfile` (comes from MPI) that they use to find the participating nodes and the number of gpus on each node.
+
+Most likely your CSP already provides one for you, if that's the case please note its path on the filesystem.
+
+If you don't have one you need to create it. It looks like this:
+
+```
+10.1.1.1 slots=8
+10.1.1.2 slots=8
+10.1.1.3 slots=8
+10.1.1.4 slots=8
+```
+the first column is the IPs of the participating nodes, the second column is the number of gpus on each node.
+
+now run:
+```
+export JOB_HOSTFILE=/path/of/hostfile
+```
+(or you can change the `HOSTFILE` setting on top of both scripts)
+
+now launch the multi-node ray launcher:
+```
+bash ./restart_multi_ray.sh
+```
+
+For a single-node run you can skip the hostfile — the launcher falls back to
+`NNODES=1` and uses the 8 GPUs of the local node.
+
+## 5. Train
 
 The base recipe `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` runs without
 a KL penalty (matches the verl baseline 1:1). The `_kl` variant enables
 the low-variance KL loss against a frozen reference model and sets
-`log_prob_gpus=32` for 3-way colocation on the same 32-GPU placement
-group (no separate ref pool).
+`log_prob_gpus` to the full GPU count for 3-way colocation on the same
+placement group (no separate ref pool).
 
-The script assumes a **4-node × 8-GPU** Ray cluster (32 GPUs total).
-Override data paths or other settings via Hydra on the command line.
+Both scripts derive the node count from the `hostfile` set up in the
+previous step (`NGPU_PER_JOB = 8 × NNODES`); the documented topology is a
+**4-node × 8-GPU** Ray cluster (32 GPUs total). Override data paths or
+other settings via Hydra on the command line.
 
 ```bash
 # No-KL run (matches verl baseline 1:1)
@@ -167,15 +243,23 @@ bash run_qwen3_32b_bird_grpo_arl_zorro_yes_kl.sh \
     data.val_files=/data/snowflakesql/txt2sql/val.parquet
 ```
 
-Override the data paths inline (as above) or edit `DATA_DIR` at the top
-of `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` if you want a permanent
-default.
+Both scripts default `DATA_DIR` to `/data/snowflakesql/txt2sql` (the
+preprocessing output from step 3), so if you kept that path you can launch
+with no overrides:
+
+```bash
+bash run_qwen3_32b_bird_grpo_arl_zorro_yes.sh
+```
+
+Otherwise override the data paths inline (as above), set `DATA_DIR=...` in
+the environment, or edit `DATA_DIR` at the top of the script.
 
 ## Files
 
 | File | What it is |
 | --- | --- |
 | `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` | Base GRPO + Arctic/ZoRRo recipe (no KL) |
-| `run_qwen3_32b_bird_grpo_arl_zorro_yes_kl.sh` | KL-enabled recipe (`use_kl_loss=True`, 3-way colocate with `log_prob_gpus=32`) |
+| `run_qwen3_32b_bird_grpo_arl_zorro_yes_kl.sh` | KL-enabled recipe (`use_kl_loss=True`, 3-way colocate with `log_prob_gpus` = full GPU count) |
+| `restart_multi_ray.sh` | Multi-node Ray launcher (reads the `hostfile`) |
 | `bird_reward.py` | SQLite-based exec-match reward (referenced via `custom_reward_function.path`) |
 | `preprocess_bird.py` | Raw BIRD JSON + SQLite → augmented verl parquets |

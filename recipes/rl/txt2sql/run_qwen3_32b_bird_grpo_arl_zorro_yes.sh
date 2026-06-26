@@ -41,9 +41,28 @@ export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${HOME}/.cache/vllm}"
 export VLLM_LOGGING_LEVEL=INFO
 
-NNODES=4
+HOSTFILE="${JOB_HOSTFILE:-/data-fast/hostfile}"
+
+# Pre-launch /dev/shm cleanup: NCCL / vllm / sem files accumulate across runs and can fill the
+# tmpfs after a few iterations, killing raylets (SIGBUS / OOM). Cleanup is per-user. Best-effort.
+if command -v ds_ssh >/dev/null 2>&1 && [[ -f "${HOSTFILE}" ]]; then
+    ds_ssh -f "${HOSTFILE}" "find /dev/shm -maxdepth 1 -user \$USER \
+        \( -name 'nccl-*' -o -name 'cuda.shm.*' -o -name 'arctic_ws_*' \
+           -o -name 'torch_*' -o -name 'sem.obj*' -o -name 'sem.hdr*' \
+           -o -name 'sem.loky-*' -o -name 'psm_*' -o -name 'plasma*' \) \
+        -delete 2>/dev/null; \
+        echo \"\$(hostname): /dev/shm \$(df -h /dev/shm | tail -1 | awk '{print \$3\"/\"\$2}')\"" \
+        2>&1 | tail -10
+fi
+
+# NNODES is derived from the hostfile (one line per node); falls back to 1 for single-node runs.
+if [[ -f ${HOSTFILE} ]]; then
+    NNODES=$(wc -l < ${HOSTFILE})
+else
+    NNODES=1
+fi
 NGPU_PER_NODE=8
-NGPU_PER_JOB=32
+NGPU_PER_JOB=$((NGPU_PER_NODE*NNODES))
 
 gpu_name=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader -i 0 2>/dev/null || true)
 if [[ $gpu_name == *"H200"* ]]; then
@@ -54,7 +73,7 @@ else
     flash_attention_v=flash_attention_2
 fi
 
-DATA_DIR="${DATA_DIR:-${SCRIPT_DIR}/data/bird_sql}"
+DATA_DIR="${DATA_DIR:-/data/snowflakesql/txt2sql}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${SCRIPT_DIR}/outputs/checkpoints/qwen3_32b_bird_grpo_arl_zorro_yes/${RUN_ID}}"
 mkdir -p "${CHECKPOINT_DIR}"
@@ -139,8 +158,8 @@ python3 -m verl.trainer.main_ppo \
     custom_reward_function.name=compute_score \
     arctic_rl.colocate=True \
     arctic_rl.sampling_tp_size=2 \
-    arctic_rl.training_gpus=32 \
-    arctic_rl.sampling_gpus=32 \
+    arctic_rl.training_gpus=$NGPU_PER_JOB \
+    arctic_rl.sampling_gpus=$NGPU_PER_JOB \
     arctic_rl.log_prob_gpus=0 \
     arctic_rl.weight_sync.cuda_ipc=True \
     arctic_rl.weight_sync.low_memory=False \
