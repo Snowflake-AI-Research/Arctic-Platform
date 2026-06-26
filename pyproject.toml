@@ -21,7 +21,7 @@ Issues = "https://github.com/Snowflake-AI-Research/Arctic-Platform/issues"
 
 [project]
 name = "arctic_platform"
-version = "0.1.1.dev0"
+version = "0.1.2"
 description = "Snowflake LLM training library w/ RL"
 authors = [
     {author = "Tunji Ruwase", email = "tunji.ruwase@snowflake.com"},
