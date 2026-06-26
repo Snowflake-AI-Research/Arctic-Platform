@@ -1,8 +1,8 @@
 # Long-Context QA with Arctic RL
 
 GRPO training for **Qwen3-32B** on long-context multi-hop QA, served by
-[Arctic RL](../../../arctic_platform/rl/) with the [ZoRRo](../../../arctic_platform/rl/zorro_train/) trainer. KL-anchored
-against a frozen reference model.
+[Arctic RL](../../../../arctic_platform/rl/) with the [ZoRRo](../../../../arctic_platform/rl/zorro_train/) trainer. Pure GRPO,
+without a frozen reference model (no KL anchoring).
 
 The training data is [LoongRL-Train-Data](https://huggingface.co/datasets/OldKingMeister/LoongRL-Train-Data),
 a 16 K-context corpus that merges three QA sources:
@@ -13,11 +13,11 @@ a 16 K-context corpus that merges three QA sources:
 | MuSiQue | `musique_qwen_0_2500` + `musique_distractor_2500_5000` |
 | 2WikiMultiHopQA | `2wikipedia_qwen_0_2500` + `2wikipedia_distractor_2500_5000` |
 
-Topology: 4 nodes × 8 H200 GPUs (32 GPUs total), `colocate=True` with **3-way
-colocation** (training + sampling + ref log-prob share each GPU bundle),
-Deepspeed ZeRO stage-3 with CPU optimizer offload, vLLM rollout (TP=2). With KL the
-ref-log-prob engine is colocated on the same GPUs (`log_prob_gpus` = full GPU count) —
-no separate ref pool or 50/50 split.
+Topology: 4 nodes × 8 H200 GPUs (32 GPUs total), `colocate=True` (training +
+sampling share each GPU bundle), Deepspeed ZeRO stage-3 with CPU optimizer
+offload, vLLM rollout (TP=2). Without KL there is no frozen reference model, so
+the ref log-prob pool is disabled (`log_prob_gpus=0`); under ZoRRo log-probs are
+recomputed through the training engine itself.
 
 ## 1. Ray and multi-node hostfile
 
@@ -50,10 +50,11 @@ DeepSpeed multi-node helper, which reads `$JOB_HOSTFILE` from [step (1)](#1-ray-
 the environment lives on a shared filesystem, or that you otherwise make it
 available on each node.
 
-On the launching node, bootstrap `ds_ssh` and `uv` (a much faster installer):
+On the launching node, bootstrap `uv` (a much faster installer) and `ds_ssh`:
 ```bash
+pip install uv             # bootstrap uv on the launching node
 uv pip install deepspeed   # provides ds_ssh
-ds_ssh -f $JOB_HOSTFILE pip install uv
+ds_ssh -f $JOB_HOSTFILE pip install uv   # bootstrap uv on every other node
 ```
 
 Clone this repo (it carries `requirements.txt` and the launcher scripts) and the
@@ -61,7 +62,7 @@ verl fork:
 ```bash
 git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
 git clone -b arctic_rl_share_v0.7.1 --single-branch https://github.com/Snowflake-AI-Research/verl
-cd Arctic-Platform/recipes/rl/long_context_qa
+cd Arctic-Platform/recipes/rl/verl/long_context_qa
 ```
 
 Install the pinned dependencies on all nodes. The assumption is cuda-12.9 - if you
@@ -88,7 +89,7 @@ or you can install directly from a wheel, find the automatic instructions [here]
 
 Install verl (Snowflake fork) editable on all nodes:
 ```bash
-cd ../../../../verl
+cd ../../../../../verl
 grep -v flash-attn requirements.txt > requirements-no-fa.txt
 ds_ssh -f $JOB_HOSTFILE "cd $PWD && uv pip install -r requirements-no-fa.txt && uv pip install -e ."
 cd -
@@ -102,7 +103,7 @@ prepends a system prompt that asks the model to think inside `<think>`
 tags and answer inside `\boxed{}`, drops any non-verl columns,
 writes per-task and merged train/test parquets.
 
-From the recipe directory (`Arctic-Platform/recipes/rl/long_context_qa`, cloned in step 2):
+From the recipe directory (`Arctic-Platform/recipes/rl/verl/long_context_qa`, cloned in step 2):
 
 ```bash
 # Defaults: --output_dir /data/snowflakesql/long-context, test_ratio=0.05, seed=42
@@ -133,12 +134,12 @@ First start the Ray cluster across all nodes (now that the environment is instal
 bash ./restart_multi_ray.sh
 ```
 
-Next edit the environment variables in `run_qwen3_32b_longcontext_grpo_arl_kl.sh` to match your setup. In particular:
+Next edit the environment variables in `run_qwen3_32b_longcontext_grpo_arl.sh` to match your setup. In particular:
 - `HF_HOME` - where you HF hub cache is (you can unset it as well)
 - `VLLM_CACHE_ROOT` - some path where vllm could cache its work
 
 ```bash
-bash run_qwen3_32b_longcontext_grpo_arl_kl.sh \
+bash run_qwen3_32b_longcontext_grpo_arl.sh \
     data.train_files=/data/snowflakesql/long-context/merged/train.parquet \
     data.val_files=/data/snowflakesql/long-context/merged/test.parquet
 ```
@@ -147,8 +148,14 @@ Alternatively you can edit `DATA_DIR` in the script (defaults to
 `/data/snowflakesql/long-context`) and launch with no overrides:
 
 ```bash
-bash run_qwen3_32b_longcontext_grpo_arl_kl.sh
+bash run_qwen3_32b_longcontext_grpo_arl.sh
 ```
+
+The answer reward is scored by `reward.py` (shipped with this recipe and
+auto-wired in the launcher via `custom_reward_function`): it extracts the
+model's `\boxed{}` answer and matches it against the ground truth. Upstream
+`verl` has no built-in scorer for this dataset's `data_source`, so the recipe
+supplies its own — no extra setup needed.
 
 Key recipe knobs (set inside the script):
 
@@ -161,4 +168,4 @@ Key recipe knobs (set inside the script):
 | `BSZ` | 256 | Train batch size (data) |
 | `PPO_MINI_BSZ` | 64 | Actor mini-batch |
 | `LR` | 1e-6 | |
-| `USE_KL_LOSS` | True | Low-variance KL vs. frozen ref, coef `0.001` |
+| `USE_KL_LOSS` | False | Pure GRPO; set `True` to add low-variance KL vs. a frozen ref |

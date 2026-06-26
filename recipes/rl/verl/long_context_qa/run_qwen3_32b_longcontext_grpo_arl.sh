@@ -1,11 +1,6 @@
 #!/bin/bash
 # GRPO training for Qwen3-32B on long-context QA (LoongRL-style) with ArcticRL + Zorro
-# KL-enabled variant — matches ref verl uglrinrq (use_kl_loss=True, kl_loss_coef=0.001).
-#
-# Diff vs run_qwen3_32b_longcontext_grpo_arl_zorro_yes.sh:
-#   - actor.use_kl_loss=True (ref model enabled for low_var_kl penalty)
-#   - arctic_rl.log_prob_gpus=NGPU_PER_JOB (3-way colocate; no GPU pool split)
-#   - experiment_name suffix _kl
+# Non-KL variant — pure GRPO, no frozen reference model (use_kl_loss=False).
 #
 # Adapted from:
 #   - verl_opensource/examples/long_context/run_qwen2_7b_longcontext_grpo.sh (training recipe)
@@ -13,19 +8,17 @@
 #
 # 4 nodes, 8 GPUs each (32 H200 GPUs total), colocate=True
 #
-# Run Arctic then verl baseline sequentially via:
-#   bash _examples/arctic_rl/launch_sequential_32b_kl_smokes.sh
-#
-# Prerequisites:
-#   1. Download data: python examples/long_context/download_data.py  (in verl_opensource)
+# Prerequisites (see README.md):
+#   1. Download data: python download_data.py
 #      Resulting parquets must live at $DATA_DIR/merged/{train,test}.parquet
-#   2. Arctic packages + arctic-verl installed (use the install-*.sh scripts under work_dir)
-#   3. Multi-node ray cluster started across the participating nodes (see restart_multi_ray.sh)
+#   2. Packages installed on every node (README "Install packages": requirements.txt +
+#      overrides.txt, plus the Snowflake verl fork installed editable)
+#   3. Multi-node ray cluster started across the participating nodes (bash restart_multi_ray.sh)
 
 set -x
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 HOSTFILE="${JOB_HOSTFILE:-/data-fast/hostfile}"
 
@@ -51,9 +44,9 @@ export VLLM_LOGGING_LEVEL=INFO
 # Cleanup is per-user so it won't disturb other workloads. Best-effort.
 DS_SSH_FLAGS=()
 if [[ -n "${HOSTFILE:-}" ]]; then
-    DS_SSH_FLAGS=(-f "${JOB_HOSTFILE}")
+    DS_SSH_FLAGS=(-f "${HOSTFILE}")
 fi
-if command -v ds_ssh >/dev/null 2>&1 && [[ -f "${DS_SSH_HOSTFILE}" ]]; then
+if command -v ds_ssh >/dev/null 2>&1 && [[ -f "${HOSTFILE}" ]]; then
     ds_ssh "${DS_SSH_FLAGS[@]}" "find /dev/shm -maxdepth 1 -user \$USER \
         \( -name 'nccl-*' -o -name 'cuda.shm.*' -o -name 'arctic_ws_*' \
            -o -name 'torch_*' -o -name 'sem.obj*' -o -name 'sem.hdr*' \
@@ -84,8 +77,11 @@ ARCTIC_ZERO_STAGE=3
 
 # Total GPUs derived from NGPU_PER_NODE * NNODES (matches verl_opensource recipe:
 # nnodes=4, n_gpus_per_node=8 -> 32 GPUs).
-# KL on: 3-way colocation — training, sampling, and ref log-prob share all GPUs.
+# colocate=True bundle layout: training and sampling span all NGPU_PER_JOB bundles.
+# log_prob is disabled (NGPU_FOR_LOG_PROBS=0): without KL there is no frozen ref model,
+# and under Zorro log-probs are recomputed through the training engine itself.
 NGPU_PER_JOB=$((NGPU_PER_NODE*NNODES))
+NGPU_FOR_LOG_PROBS=0
 TP_SIZE=2                # sampling TP (matches verl_opensource rollout.tensor_model_parallel_size=2)
 
 # ----- Training hyperparams (match verl_opensource long-context recipe) -----
@@ -99,8 +95,8 @@ MAX_TOKENS_PER_GPU=49152 # actor.ppo_max_token_len_per_gpu (>= prompt_len + ROLL
 ROLLOUT_MAX_BATCHED=32768
 LR=1e-6
 CLIP_RATIO=0.2
-USE_KL_LOSS=True         # match ref verl uglrinrq; anchors policy vs frozen ref
-KL_LOSS_COEF=0.001
+USE_KL_LOSS=False        # pure GRPO, no frozen-ref KL anchoring
+KL_LOSS_COEF=0.001       # unused when USE_KL_LOSS=False
 TOTAL_EPOCHS=20
 SAVE_FREQ=-1 # 10             # match verl baseline (save checkpoint every 10 steps)
 TEST_FREQ=10             # match verl baseline (run validation every 10 steps)
@@ -113,7 +109,7 @@ LOGGER="['console']"
 MODEL_SHORT=Qwen3-32B
 MODEL=Qwen/${MODEL_SHORT}
 
-experiment_name="longcontext_grpo_${MODEL_SHORT}_ngpu${NGPU_PER_JOB}_gbs${BSZ}_mbs${UBS}_rolln${ROLL_N}_arl_z${ARCTIC_ZERO_STAGE}_kl"
+experiment_name="longcontext_grpo_${MODEL_SHORT}_ngpu${NGPU_PER_JOB}_gbs${BSZ}_mbs${UBS}_rolln${ROLL_N}_arl_z${ARCTIC_ZERO_STAGE}"
 
 # feel free to change below to hardcoded a particular attention implementation - the following logic tries to pick the best impelementation based on the gpu name
 gpu_name=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader -i 0)
@@ -150,6 +146,8 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts_workers=8 \
     data.truncation=left \
     data.seed=42 \
+    custom_reward_function.path=${SCRIPT_DIR}/reward.py \
+    custom_reward_function.name=compute_score \
     actor_rollout_ref.actor.data_loader_seed=42 \
     actor_rollout_ref.model.path=$MODEL \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -210,7 +208,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=$TOTAL_EPOCHS \
     trainer.val_before_train=False \
     remote_backend.colocate=$COLOCATE \
-    remote_backend.log_prob_gpus=$NGPU_PER_JOB \
+    remote_backend.log_prob_gpus=$NGPU_FOR_LOG_PROBS \
     remote_backend.sampling_gpus=$NGPU_PER_JOB \
     remote_backend.sampling_tp_size=$TP_SIZE \
     remote_backend.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \

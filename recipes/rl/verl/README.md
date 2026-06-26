@@ -1,6 +1,6 @@
 # Arctic RL Recipes
 
-End-to-end recipes for training models with [Arctic RL](../../arctic_platform/rl/).
+End-to-end recipes for training models with [Arctic RL](../../../arctic_platform/rl/).
 
 Available recipes:
   * [Txt2SQL](txt2sql)

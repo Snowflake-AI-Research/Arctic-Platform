@@ -6,8 +6,8 @@ ray_path=$(which ray)
 stop_ray_cmd="$ray_path stop --force --grace-period 30 -v"
 ds_ssh -f $HOSTFILE "eval ${stop_ray_cmd}"
 
-echo "head node is $head_node"
 head_node=$(head -n 1 $HOSTFILE | cut -d ' ' -f 1)
+echo "head node is $head_node"
 # launch ray on the head node
 main_ray_cmd="${ray_path} start --head --port=6379 --num-gpus=8 --num-cpus=64"
 eval ${main_ray_cmd}

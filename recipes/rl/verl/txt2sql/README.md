@@ -1,7 +1,7 @@
 # Text2SQL with Arctic RL
 
 GRPO training for **Qwen3-32B** on the BIRD SQL benchmark, served by
-[Arctic RL](../../../arctic_platform/rl/) with the [ZoRRo](../../../arctic_platform/rl/zorro_train/) trainer. Mirrors the
+[Arctic RL](../../../../arctic_platform/rl/) with the [ZoRRo](../../../../arctic_platform/rl/zorro_train/) trainer. Mirrors the
 hyperparameters of the stock-verl baseline at
 `verl_opensource/examples/bird_sql/run_qwen3_32b_bird_grpo.sh` so the two
 backends can be compared apples-to-apples on wall-clock speed.
@@ -153,7 +153,7 @@ contract.
 ### Run it
 
 ```bash
-cd recipes/rl/txt2sql
+cd recipes/rl/verl/txt2sql
 
 pip install pandas datasets transformers numpy
 
@@ -220,30 +220,21 @@ For a single-node run you can skip the hostfile — the launcher falls back to
 
 ## 5. Train
 
-The base recipe `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` runs without
-a KL penalty (matches the verl baseline 1:1). The `_kl` variant enables
-the low-variance KL loss against a frozen reference model and sets
-`log_prob_gpus` to the full GPU count for 3-way colocation on the same
-placement group (no separate ref pool).
+The recipe `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` runs GRPO without
+a KL penalty (matches the verl baseline 1:1).
 
-Both scripts derive the node count from the `hostfile` set up in the
+The script derives the node count from the `hostfile` set up in the
 previous step (`NGPU_PER_JOB = 8 × NNODES`); the documented topology is a
 **4-node × 8-GPU** Ray cluster (32 GPUs total). Override data paths or
 other settings via Hydra on the command line.
 
 ```bash
-# No-KL run (matches verl baseline 1:1)
 bash run_qwen3_32b_bird_grpo_arl_zorro_yes.sh \
-    data.train_files=/data/snowflakesql/txt2sql/train.parquet \
-    data.val_files=/data/snowflakesql/txt2sql/val.parquet
-
-# KL-anchored run
-bash run_qwen3_32b_bird_grpo_arl_zorro_yes_kl.sh \
     data.train_files=/data/snowflakesql/txt2sql/train.parquet \
     data.val_files=/data/snowflakesql/txt2sql/val.parquet
 ```
 
-Both scripts default `DATA_DIR` to `/data/snowflakesql/txt2sql` (the
+The script defaults `DATA_DIR` to `/data/snowflakesql/txt2sql` (the
 preprocessing output from step 3), so if you kept that path you can launch
 with no overrides:
 
@@ -258,8 +249,7 @@ the environment, or edit `DATA_DIR` at the top of the script.
 
 | File | What it is |
 | --- | --- |
-| `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` | Base GRPO + Arctic/ZoRRo recipe (no KL) |
-| `run_qwen3_32b_bird_grpo_arl_zorro_yes_kl.sh` | KL-enabled recipe (`use_kl_loss=True`, 3-way colocate with `log_prob_gpus` = full GPU count) |
+| `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` | GRPO + Arctic/ZoRRo recipe (no KL) |
 | `restart_multi_ray.sh` | Multi-node Ray launcher (reads the `hostfile`) |
 | `bird_reward.py` | SQLite-based exec-match reward (referenced via `custom_reward_function.path`) |
 | `preprocess_bird.py` | Raw BIRD JSON + SQLite → augmented verl parquets |
