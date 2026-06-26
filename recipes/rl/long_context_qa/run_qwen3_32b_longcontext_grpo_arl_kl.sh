@@ -32,13 +32,16 @@ HOSTFILE="${JOB_HOSTFILE:-/data-fast/hostfile}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
 
 # Standard env (mirrors big_bird / mega_bird zorro perf profile)
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Do NOT set expandable_segments:True -- vLLM colocate sleep mode (cumem allocator) rejects it.
+unset PYTORCH_CUDA_ALLOC_CONF
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
 export HF_HUB_OFFLINE=1
 export HF_HOME=/checkpoint/huggingface
 export TORCH_COMPILE_DISABLE=1
+# Select the Arctic training client for verl's remote_backend=arctic path.
+export USE_ARCTIC_TRAINING_CLIENT=1
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_CACHE_ROOT=/modeling-checkpoints/vllm
 export VLLM_LOGGING_LEVEL=INFO
@@ -110,7 +113,7 @@ LOGGER="['console']"
 MODEL_SHORT=Qwen3-32B
 MODEL=Qwen/${MODEL_SHORT}
 
-experiment_name="longcontext_grpo_${MODEL_SHORT}_ngpu${NGPU_PER_JOB}_gbs${BSZ}_mbs${UBS}_rolln${ROLL_N}_arl_zorro_yes_z${ARCTIC_ZERO_STAGE}_kl"
+experiment_name="longcontext_grpo_${MODEL_SHORT}_ngpu${NGPU_PER_JOB}_gbs${BSZ}_mbs${UBS}_rolln${ROLL_N}_arl_z${ARCTIC_ZERO_STAGE}_kl"
 
 # feel free to change below to hardcoded a particular attention implementation - the following logic tries to pick the best impelementation based on the gpu name
 gpu_name=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader -i 0)
@@ -193,7 +196,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.nccl_timeout=1800 \
     trainer.use_legacy_worker_impl=$USE_LEGACY_WORKER_IMPL \
-    trainer.use_arctic_rl=$USE_ARCTIC_RL \
+    trainer.remote_backend=arctic \
+    remote_backend=arctic \
     trainer.balance_batch=False \
     trainer.default_local_dir=/checkpoint/long-context-rl/$experiment_name \
     trainer.logger=$LOGGER \
@@ -205,16 +209,16 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=$TEST_FREQ \
     trainer.total_epochs=$TOTAL_EPOCHS \
     trainer.val_before_train=False \
-    arctic_rl.colocate=$COLOCATE \
-    arctic_rl.train.logits.optimization=memory \
-    arctic_rl.sampling_tp_size=$TP_SIZE \
-    arctic_rl.training_gpus=$NGPU_PER_JOB \
-    arctic_rl.sampling_gpus=$NGPU_PER_JOB \
-    arctic_rl.log_prob_gpus=$NGPU_PER_JOB \
-    arctic_rl.train.zorro_train.enable=$USE_ARCTIC_ZORRO \
-    arctic_rl.train.zorro_train.max_rollouts=$ROLL_N \
-    arctic_rl.weight_sync.cuda_ipc=True \
-    arctic_rl.train.deepspeed.zero_optimization.stage=$ARCTIC_ZERO_STAGE \
-    arctic_rl.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \
-    arctic_rl.train.deepspeed.zero_optimization.offload_param.device=none \
+    remote_backend.colocate=$COLOCATE \
+    remote_backend.log_prob_gpus=$NGPU_PER_JOB \
+    remote_backend.sampling_gpus=$NGPU_PER_JOB \
+    remote_backend.sampling_tp_size=$TP_SIZE \
+    remote_backend.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \
+    remote_backend.train.deepspeed.zero_optimization.offload_param.device=none \
+    remote_backend.train.deepspeed.zero_optimization.stage=$ARCTIC_ZERO_STAGE \
+    remote_backend.train.logits.optimization=memory \
+    remote_backend.train.zorro_train.enable=$USE_ARCTIC_ZORRO \
+    remote_backend.train.zorro_train.max_rollouts=$ROLL_N \
+    remote_backend.training_gpus=$NGPU_PER_JOB \
+    remote_backend.weight_sync.cuda_ipc=False \
     "$@" 2>&1 | tee $experiment_name.log

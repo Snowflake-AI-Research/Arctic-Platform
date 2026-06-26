@@ -19,65 +19,97 @@ Deepspeed ZeRO stage-3 with CPU optimizer offload, vLLM rollout (TP=2). With KL 
 ref-log-prob engine is colocated on the same GPUs (`log_prob_gpus` = full GPU count) —
 no separate ref pool or 50/50 split.
 
-## 1. Install packages
+## 1. Ray and multi-node hostfile
 
-First create a new virtual environment of your preference or use the existing one.
+When using a multi-node training environment Ray and DeepSpeed need a special file called `hostfile` (comes from MPI) that they use to find the participating nodes and the number of gpus on each node.
 
-We are going to use `uv` for much faster installations:
+Most likely your CSP already provides one for you, if that's the case please note its path on the filesystem.
+
+If you don't have one you need to create it. It looks like this:
+
+```
+10.1.1.1 slots=8
+10.1.1.2 slots=8
+10.1.1.3 slots=8
+10.1.1.4 slots=8
+```
+the first column is the IPs of the participating nodes, the second column is the number of gpus on each node.
+
+Export its path - the install step (and the launcher) use it to fan out across all nodes:
+```
+export JOB_HOSTFILE=/path/of/hostfile
+```
+(or you can change the `HOSTFILE` setting on top of both scripts)
+
+The Ray cluster itself is started later, in the Train step, once the environment is installed on every node.
+
+## 2. Install packages
+
+The steps below install the environment on **every** node via `ds_ssh` (the
+DeepSpeed multi-node helper, which reads `$JOB_HOSTFILE` from [step (1)](#1-ray-and-multi-node-hostfile). They assume
+the environment lives on a shared filesystem, or that you otherwise make it
+available on each node.
+
+On the launching node, bootstrap `ds_ssh` and `uv` (a much faster installer):
 ```bash
-pip install uv
+uv pip install deepspeed   # provides ds_ssh
+ds_ssh -f $JOB_HOSTFILE pip install uv
 ```
 
-Install the Arctic packages:
+Clone this repo (it carries `requirements.txt` and the launcher scripts) and the
+verl fork:
 ```bash
-uv pip install arctic-platform[rl] arctic-inference[server]
+git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
+git clone -b arctic_rl_share_v0.7.1 --single-branch https://github.com/Snowflake-AI-Research/verl
+cd Arctic-Platform/recipes/rl/long_context_qa
 ```
 
-Install Verl and its dependencies:
-
-Please note the assumption is cuda-12.9 - if you use a different version change the `torch` and `cuda-bindings` lines to the version you need.
-
-Also the arctic-inference patches vllm-0.18.0, therefore we explicitly install that one.
-
+Install the pinned dependencies on all nodes. The assumption is cuda-12.9 - if you
+use a different version change the `torch` index URL below and the `cuda-bindings`
+pin in `requirements.txt`. `arctic-inference` patches vllm-0.18.0, so that exact
+version is pinned in `requirements.txt`.
 ```bash
-git clone https://github.com/verl-project/verl
-cd verl
+# torch (CUDA 12.9) first, then the rest of the pinned packages.
+# overrides.txt forces the few transitive deps (flashinfer/numpy/transformers)
+# this recipe is validated against, which vLLM 0.18.0's metadata otherwise pins
+# higher (without it the single resolve is unsatisfiable).
+ds_ssh -f $JOB_HOSTFILE uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu129 -U
+ds_ssh -f $JOB_HOSTFILE uv pip install -r $PWD/requirements.txt --override $PWD/overrides.txt
 
+# flash-attn builds against the freshly installed torch
+ds_ssh -f $JOB_HOSTFILE uv pip install -U pip wheel packaging setuptools
+```
+
+To install flash attention, you can build it from source (may take a long time to build):
+```bash
+ds_ssh -f $JOB_HOSTFILE uv pip install flash-attn --no-build-isolation
+```
+or you can install directly from a wheel, find the automatic instructions [here](https://windreamer.github.io/flash-attention3-wheels/) or download directly from https://github.com/Dao-AILab/flash-attention/releases.
+
+Install verl (Snowflake fork) editable on all nodes:
+```bash
+cd ../../../../verl
 grep -v flash-attn requirements.txt > requirements-no-fa.txt
-uv pip install -r requirements-no-fa.txt
-uv pip install -e .
-
-uv pip install -U pip wheel packaging setuptools
-uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu129 -U
-uv pip install vllm==0.18.0
-uv pip install flash-attn --no-build-isolation
-uv pip install numpy==1.26.4
-uv pip install transformers==4.57.6
-uv pip install flashinfer-python==0.5.3
-uv pip install cuda-bindings==12.9.0
+ds_ssh -f $JOB_HOSTFILE "cd $PWD && uv pip install -r requirements-no-fa.txt && uv pip install -e ."
+cd -
 ```
 
 
-## 2. Data preparation
+## 3. Data preparation
 
 `download_data.py` pulls the three subset pairs from HuggingFace,
 prepends a system prompt that asks the model to think inside `<think>`
 tags and answer inside `\boxed{}`, drops any non-verl columns,
 writes per-task and merged train/test parquets.
 
+From the recipe directory (`Arctic-Platform/recipes/rl/long_context_qa`, cloned in step 2):
+
 ```bash
-git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
-cd Arctic-Platform
-cd recipes/rl/long_context_qa
-
-pip install datasets
-
 # Defaults: --output_dir /data/snowflakesql/long-context, test_ratio=0.05, seed=42
 python download_data.py --output_dir /data/snowflakesql/long-context
 ```
 
 Output layout:
-
 ```
 /data/snowflakesql/long-context/
 ├── hotpotqa/{train,test}.parquet
@@ -94,41 +126,19 @@ The training recipe consumes `merged/train.parquet` and
 If you want to train on a single task, point the training command at
 that task's `{train,test}.parquet` instead of `merged/`.
 
-## 3. Ray and multi-node hostfile
+## 4. Train
 
-when using a multi-node training environment Ray and DeepSpeed need a special file called `hostfile` (comes from MPI) that they use to find the participating nodes and the number of gpus on each node.
-
-Most likely your CSP already provides one for you, if that's the case please note its path on the filesystem.
-
-If you don't have one you need to create it. It looks like this:
-
-```
-10.1.1.1 slots=8
-10.1.1.2 slots=8
-10.1.1.3 slots=8
-10.1.1.4 slots=8
-```
-the first column is the IPs of the participating nodes, the second column is the number of gpus on each node.
-
-now run:
-```
-export JOB_HOSTFILE=/path/of/hostfile
-```
-(or you can change the `HOSTFILE` setting on top of both scripts)
-
-now launch the multi-node ray launcher:
-```
+First start the Ray cluster across all nodes (now that the environment is installed everywhere, and `$JOB_HOSTFILE` is exported from step 1):
+```bash
 bash ./restart_multi_ray.sh
 ```
 
-## 4. Train
-
-Next edit the environment variables in `run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh` to match your setup. In particular:
+Next edit the environment variables in `run_qwen3_32b_longcontext_grpo_arl_kl.sh` to match your setup. In particular:
 - `HF_HOME` - where you HF hub cache is (you can unset it as well)
 - `VLLM_CACHE_ROOT` - some path where vllm could cache its work
 
 ```bash
-bash run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh \
+bash run_qwen3_32b_longcontext_grpo_arl_kl.sh \
     data.train_files=/data/snowflakesql/long-context/merged/train.parquet \
     data.val_files=/data/snowflakesql/long-context/merged/test.parquet
 ```
@@ -137,7 +147,7 @@ Alternatively you can edit `DATA_DIR` in the script (defaults to
 `/data/snowflakesql/long-context`) and launch with no overrides:
 
 ```bash
-bash run_qwen3_32b_longcontext_grpo_arl_zorro_yes_kl.sh
+bash run_qwen3_32b_longcontext_grpo_arl_kl.sh
 ```
 
 Key recipe knobs (set inside the script):

@@ -1,0 +1,22 @@
+# Long-context QA recipe — pinned Python dependencies.
+#
+# Assumes CUDA 12.9. `torch` and `flash-attn` are installed separately in the
+# README (torch needs the PyTorch CUDA index; flash-attn needs --no-build-isolation).
+# If you use a different CUDA version, change the torch index URL and the
+# `cuda-bindings` pin accordingly.
+
+arctic-inference[server]
+# Arctic
+arctic-platform[rl]
+cuda-bindings==12.9.4
+datasets
+flashinfer-python==0.5.3
+
+# Pins
+numpy==1.26.4
+transformers==4.57.6
+
+# Serving / kernels (arctic-inference patches vLLM 0.18.0, so pin that exact version).
+# vLLM 0.18.0 hard-pins newer flashinfer/numpy than this recipe wants, so those
+# downgrades are forced via overrides.txt (uv pip install --override). See README.
+vllm==0.18.0
