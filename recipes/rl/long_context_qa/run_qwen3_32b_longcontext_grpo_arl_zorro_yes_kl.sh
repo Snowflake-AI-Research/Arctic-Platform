@@ -78,7 +78,6 @@ USE_ARCTIC_RL=True
 USE_ARCTIC_ZORRO=True
 COLOCATE=True
 ARCTIC_ZERO_STAGE=3
-ARCTIC_AUTOCAST=False    # match bird arctic intent (autocast off; bf16 weights used directly)
 
 # Total GPUs derived from NGPU_PER_NODE * NNODES (matches verl_opensource recipe:
 # nnodes=4, n_gpus_per_node=8 -> 32 GPUs).
@@ -214,7 +213,6 @@ python3 -m verl.trainer.main_ppo \
     arctic_rl.log_prob_gpus=$NGPU_PER_JOB \
     arctic_rl.train.zorro_train.enable=$USE_ARCTIC_ZORRO \
     arctic_rl.train.zorro_train.max_rollouts=$ROLL_N \
-    arctic_rl.train.deepspeed.torch_autocast.enabled=$ARCTIC_AUTOCAST \
     arctic_rl.weight_sync.cuda_ipc=True \
     arctic_rl.train.deepspeed.zero_optimization.stage=$ARCTIC_ZERO_STAGE \
     arctic_rl.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \
