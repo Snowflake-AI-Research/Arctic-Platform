@@ -1,9 +1,8 @@
 #!/bin/bash
 # GRPO training for Qwen3-32B on BIRD SQL using ArcticRL + Zorro.
 #
-# Arctic counterpart of the stock verl/vLLM BIRD baseline: same GRPO hyperparameters
-# (batch size, LR, prompt/response lengths, rollout.n) with ArcticRL colocate + Zorro
-# for rollout and weight sync.
+# Arctic counterpart of the stock verl/vLLM BIRD baseline: same GRPO hyperparameters (batch size, LR, prompt/response
+# lengths, rollout.n) with ArcticRL colocate + Zorro for rollout and weight sync.
 #
 # Topology: 4 nodes x 8 GPUs = 32 GPUs, COLOCATE=True
 #   Pass Hydra overrides via "$@" to change training settings.
@@ -43,8 +42,8 @@ export VLLM_LOGGING_LEVEL=INFO
 
 HOSTFILE="${JOB_HOSTFILE:-/data-fast/hostfile}"
 
-# Pre-launch /dev/shm cleanup: NCCL / vllm / sem files accumulate across runs and can fill the
-# tmpfs after a few iterations, killing raylets (SIGBUS / OOM). Cleanup is per-user. Best-effort.
+# Pre-launch /dev/shm cleanup: NCCL / vllm / sem files accumulate across runs and can fill the tmpfs after a few
+# iterations, killing raylets (SIGBUS / OOM). Cleanup is per-user. Best-effort.
 if command -v ds_ssh >/dev/null 2>&1 && [[ -f "${HOSTFILE}" ]]; then
     ds_ssh -f "${HOSTFILE}" "find /dev/shm -maxdepth 1 -user \$USER \
         \( -name 'nccl-*' -o -name 'cuda.shm.*' -o -name 'arctic_ws_*' \

@@ -21,10 +21,9 @@ Supports three data sources:
   - Spider:  reads from raw Spider JSON + SQLite databases
   - GretelAI: reads from original parquet, builds per-sample SQLite databases
 
-Produces prompts in the arctic_text_to_sql_r1 format and applies a Qwen3
-token-length filter (default 16,384 tokens) to drop the long-tail BIRD DBs
-(e.g. works_cycles, movie_3) whose full SQLite DDL exceeds 100K tokens and
-won't fit in context.
+Produces prompts in the arctic_text_to_sql_r1 format and applies a Qwen3 token-length filter (default 16,384 tokens)
+to drop the long-tail BIRD DBs (e.g. works_cycles, movie_3) whose full SQLite DDL exceeds 100K tokens and won't fit
+in context.
 
 Usage:
     # BIRD only with default 16K-token cap (recommended for long-prompt RL):
@@ -172,8 +171,8 @@ def _extract_fks(create_sql: str) -> list[str]:
 def load_db_descriptions(db_dir: str) -> dict:
     """Load BIRD's database_description/*.csv as {(table_lower, col_lower): {...}}.
 
-    BIRD ships per-table CSVs with column-level semantic descriptions and value
-    semantics. Returns an empty dict if the folder is missing.
+    BIRD ships per-table CSVs with column-level semantic descriptions and value semantics. Returns an empty dict if
+    the folder is missing.
     """
     desc_dir = os.path.join(db_dir, "database_description")
     out: dict = {}
@@ -217,15 +216,12 @@ def get_schema_ddl(
 ) -> str:
     """Read schema DDL from a SQLite database, enriched with sample values.
 
-    Augmentations applied (all reuse the single ``SELECT ... LIMIT`` per table —
-    no extra DB scans):
+    Augmentations applied (all reuse the single ``SELECT ... LIMIT`` per table — no extra DB scans):
 
-    - Sample-rows block per table (markdown-style pipe table) using the same
-      rows fetched for per-column examples.
+    - Sample-rows block per table (markdown-style pipe table) using the same rows fetched for per-column examples.
     - Foreign-key summary line at the top of each table block.
-    - Inline ``-- example: ... | name: ... | desc: ... | values: ...`` comment
-      on each column line. ``name``, ``desc``, and ``values`` come from
-      ``descriptions``; descriptions are NOT length-truncated (whitespace is
+    - Inline ``-- example: ... | name: ... | desc: ... | values: ...`` comment on each column line. ``name``,
+      ``desc``, and ``values`` come from ``descriptions``; descriptions are NOT length-truncated (whitespace is
       collapsed so they stay one line).
     """
     descriptions = descriptions or {}
@@ -710,11 +706,10 @@ def main():
             print(f"  {src}: {cnt}")
 
     # --- Validation data (BIRD dev only) ---
-    # Dev is intentionally kept *clean* — minimal schema augmentation, matching
-    # how the model would be evaluated on raw BIRD. No `database_description`
-    # CSV enrichment, no per-table sample-rows block, no FK-summary line, just
-    # 3 inline example values per column.  This avoids leaking auxiliary
-    # context into the validation prompts that might inflate eval signal.
+    # Dev is intentionally kept *clean* — minimal schema augmentation, matching how the model would be evaluated on
+    # raw BIRD. No `database_description` CSV enrichment, no per-table sample-rows block, no FK-summary line, just 3
+    # inline example values per column. This avoids leaking auxiliary context into the validation prompts that might
+    # inflate eval signal.
     if "bird" in args.sources:
         print("\nProcessing BIRD (dev) for validation (clean / no augmentation)...")
         val_records = process_bird(

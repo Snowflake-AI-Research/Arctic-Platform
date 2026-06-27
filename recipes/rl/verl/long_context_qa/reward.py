@@ -15,16 +15,14 @@
 
 """Reward scoring for long-context QA tasks (LoongRL-style).
 
-This is a self-contained reward function shipped with the recipe so that it works
-against an unmodified upstream verl checkout. It is wired into training via verl's
-``custom_reward_function`` hook:
+This is a self-contained reward function shipped with the recipe so that it works against an unmodified upstream verl
+checkout. It is wired into training via verl's ``custom_reward_function`` hook:
 
     custom_reward_function.path=<this file>
     custom_reward_function.name=compute_score
 
-verl invokes ``compute_score`` per sample with keyword arguments
-(``data_source``, ``solution_str``, ``ground_truth``, ``extra_info``), matching the
-signature of verl's ``default_compute_score``.
+verl invokes ``compute_score`` per sample with keyword arguments (``data_source``, ``solution_str``, ``ground_truth``,
+``extra_info``), matching the signature of verl's ``default_compute_score``.
 
 Scoring mode is selected via the ``REWARD_CALC_TYPE`` env var:
   - pure_exact_match (default): substring match of ground truth in \\boxed{...}
@@ -43,8 +41,8 @@ from collections import Counter
 def compute_score(data_source=None, solution_str=None, ground_truth=None, extra_info=None, **kwargs):
     """verl custom reward entry point.
 
-    Only ``solution_str`` and ``ground_truth`` are used; the remaining arguments are
-    accepted for compatibility with verl's reward-manager call convention.
+    Only ``solution_str`` and ``ground_truth`` are used; the remaining arguments are accepted for compatibility with
+    verl's reward-manager call convention.
     """
     solution_str = (solution_str or "").strip()
     reward_calc_type = os.getenv("REWARD_CALC_TYPE", "pure_exact_match")

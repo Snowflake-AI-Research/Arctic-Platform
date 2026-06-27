@@ -1,8 +1,8 @@
 # Long-Context QA with Arctic RL
 
-GRPO training for **Qwen3-32B** on long-context multi-hop QA, served by
-[Arctic RL](../../../../arctic_platform/rl/) with the [ZoRRo](../../../../arctic_platform/rl/zorro_train/) trainer. Pure GRPO,
-without a frozen reference model (no KL anchoring).
+GRPO training for **Qwen3-32B** on long-context multi-hop QA, served by [Arctic RL](../../../../arctic_platform/rl/)
+with the [ZoRRo](../../../../arctic_platform/rl/zorro_train/) trainer. Pure GRPO, without a frozen reference model (no
+KL anchoring).
 
 The training data is [LoongRL-Train-Data](https://huggingface.co/datasets/OldKingMeister/LoongRL-Train-Data),
 a 16 K-context corpus that merges three QA sources:
@@ -13,15 +13,15 @@ a 16 K-context corpus that merges three QA sources:
 | MuSiQue | `musique_qwen_0_2500` + `musique_distractor_2500_5000` |
 | 2WikiMultiHopQA | `2wikipedia_qwen_0_2500` + `2wikipedia_distractor_2500_5000` |
 
-Topology: 4 nodes × 8 H200 GPUs (32 GPUs total), `colocate=True` (training +
-sampling share each GPU bundle), Deepspeed ZeRO stage-3 with CPU optimizer
-offload, vLLM rollout (TP=2). Without KL there is no frozen reference model, so
-the ref log-prob pool is disabled (`log_prob_gpus=0`); under ZoRRo log-probs are
-recomputed through the training engine itself.
+Topology: 4 nodes × 8 H200 GPUs (32 GPUs total), `colocate=True` (training + sampling share each GPU bundle),
+Deepspeed ZeRO stage-3 with CPU optimizer offload, vLLM rollout (TP=2). Without KL there is no frozen reference model,
+so the ref log-prob pool is disabled (`log_prob_gpus=0`); under ZoRRo log-probs are recomputed through the training
+engine itself.
 
 ## 1. Ray and multi-node hostfile
 
-When using a multi-node training environment Ray and DeepSpeed need a special file called `hostfile` (comes from MPI) that they use to find the participating nodes and the number of gpus on each node.
+When using a multi-node training environment Ray and DeepSpeed need a special file called `hostfile` (comes from MPI)
+that they use to find the participating nodes and the number of gpus on each node.
 
 Most likely your CSP already provides one for you, if that's the case please note its path on the filesystem.
 
@@ -45,10 +45,9 @@ The Ray cluster itself is started later, in the Train step, once the environment
 
 ## 2. Install packages
 
-The steps below install the environment on **every** node via `ds_ssh` (the
-DeepSpeed multi-node helper, which reads `$JOB_HOSTFILE` from [step (1)](#1-ray-and-multi-node-hostfile). They assume
-the environment lives on a shared filesystem, or that you otherwise make it
-available on each node.
+The steps below install the environment on **every** node via `ds_ssh` (the DeepSpeed multi-node helper, which reads
+`$JOB_HOSTFILE` from [step (1)](#1-ray-and-multi-node-hostfile)). They assume the environment lives on a shared
+filesystem, or that you otherwise make it available on each node.
 
 On the launching node, bootstrap `uv` (a much faster installer) and `ds_ssh`:
 ```bash
@@ -57,18 +56,16 @@ uv pip install deepspeed   # provides ds_ssh
 ds_ssh -f $JOB_HOSTFILE pip install uv   # bootstrap uv on every other node
 ```
 
-Clone this repo (it carries `requirements.txt` and the launcher scripts) and the
-verl fork:
+Clone this repo (it carries `requirements.txt` and the launcher scripts) and the verl fork:
 ```bash
 git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
 git clone -b arctic_rl_share_v0.7.1 --single-branch https://github.com/Snowflake-AI-Research/verl
 cd Arctic-Platform/recipes/rl/verl/long_context_qa
 ```
 
-Install the pinned dependencies on all nodes. The assumption is cuda-12.9 - if you
-use a different version change the `torch` index URL below and the `cuda-bindings`
-pin in `requirements.txt`. `arctic-inference` patches vllm-0.18.0, so that exact
-version is pinned in `requirements.txt`.
+Install the pinned dependencies on all nodes. The assumption is cuda-12.9 - if you use a different version change the
+`torch` index URL below and the `cuda-bindings` pin in `requirements.txt`. `arctic-inference` patches vllm-0.18.0, so
+that exact version is pinned in `requirements.txt`.
 ```bash
 # torch (CUDA 12.9) first, then the rest of the pinned packages.
 # overrides.txt forces the few transitive deps (flashinfer/numpy/transformers)
@@ -85,7 +82,9 @@ To install flash attention, you can build it from source (may take a long time t
 ```bash
 ds_ssh -f $JOB_HOSTFILE uv pip install flash-attn --no-build-isolation
 ```
-or you can install directly from a wheel, find the automatic instructions [here](https://windreamer.github.io/flash-attention3-wheels/) or download directly from https://github.com/Dao-AILab/flash-attention/releases.
+or you can install directly from a wheel, find the automatic instructions
+[here](https://windreamer.github.io/flash-attention3-wheels/) or download directly from
+https://github.com/Dao-AILab/flash-attention/releases.
 
 Install verl (Snowflake fork) editable on all nodes:
 ```bash
@@ -98,10 +97,9 @@ cd -
 
 ## 3. Data preparation
 
-`download_data.py` pulls the three subset pairs from HuggingFace,
-prepends a system prompt that asks the model to think inside `<think>`
-tags and answer inside `\boxed{}`, drops any non-verl columns,
-writes per-task and merged train/test parquets.
+`download_data.py` pulls the three subset pairs from HuggingFace, prepends a system prompt that asks the model to
+think inside `<think>` tags and answer inside `\boxed{}`, drops any non-verl columns, writes per-task and merged
+train/test parquets.
 
 From the recipe directory (`Arctic-Platform/recipes/rl/verl/long_context_qa`, cloned in step 2):
 
@@ -121,15 +119,15 @@ Output layout:
     └── test.parquet       # ~750 rows
 ```
 
-The training recipe consumes `merged/train.parquet` and
-`merged/test.parquet` by default.
+The training recipe consumes `merged/train.parquet` and `merged/test.parquet` by default.
 
-If you want to train on a single task, point the training command at
-that task's `{train,test}.parquet` instead of `merged/`.
+If you want to train on a single task, point the training command at that task's `{train,test}.parquet` instead of
+`merged/`.
 
 ## 4. Train
 
-First start the Ray cluster across all nodes (now that the environment is installed everywhere, and `$JOB_HOSTFILE` is exported from step 1):
+First start the Ray cluster across all nodes (now that the environment is installed everywhere, and `$JOB_HOSTFILE`
+is exported from step 1):
 ```bash
 bash ./restart_multi_ray.sh
 ```
@@ -144,18 +142,16 @@ bash run_qwen3_32b_longcontext_grpo_arl.sh \
     data.val_files=/data/snowflakesql/long-context/merged/test.parquet
 ```
 
-Alternatively you can edit `DATA_DIR` in the script (defaults to
-`/data/snowflakesql/long-context`) and launch with no overrides:
+Alternatively you can edit `DATA_DIR` in the script (defaults to `/data/snowflakesql/long-context`) and launch with
+no overrides:
 
 ```bash
 bash run_qwen3_32b_longcontext_grpo_arl.sh
 ```
 
-The answer reward is scored by `reward.py` (shipped with this recipe and
-auto-wired in the launcher via `custom_reward_function`): it extracts the
-model's `\boxed{}` answer and matches it against the ground truth. Upstream
-`verl` has no built-in scorer for this dataset's `data_source`, so the recipe
-supplies its own — no extra setup needed.
+The answer reward is scored by `reward.py` (shipped with this recipe and auto-wired in the launcher via
+`custom_reward_function`): it extracts the model's `\boxed{}` answer and matches it against the ground truth. Upstream
+`verl` has no built-in scorer for this dataset's `data_source`, so the recipe supplies its own — no extra setup needed.
 
 Key recipe knobs (set inside the script):
 
