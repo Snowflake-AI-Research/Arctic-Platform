@@ -16,8 +16,12 @@ answer), so this recipe ships no custom reward function.
 
 ## 1. Install packages
 
-We use `uv` for much faster installs:
+This is a single-node, single-GPU recipe, so there is no `ds_ssh` fan-out — everything installs into one conda env on
+the local node. Create a fresh, recipe-specific env (don't reuse a shared/dev env, so the install is actually
+exercised) and use `uv` for much faster installs:
 ```bash
+conda create -y -n simple python=3.12
+conda activate simple
 pip install uv
 ```
 

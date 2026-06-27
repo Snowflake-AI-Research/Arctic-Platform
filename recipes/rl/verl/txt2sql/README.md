@@ -44,76 +44,126 @@ local node.
 
 ## 2. Install packages
 
-The steps below install the environment on **every** node via `ds_ssh` (the DeepSpeed multi-node helper, which reads
-`$JOB_HOSTFILE` from [step (1)](#1-ray-and-multi-node-hostfile)). They assume the environment lives on a shared
-filesystem, or that you otherwise make it available on each node.
+Conda environments are **node-local**: each node has its own `~/miniconda3` even when your code and data sit on
+shared storage, so the environment must be created and populated on **every** node in `$JOB_HOSTFILE` (from
+[step (1)](#1-ray-and-multi-node-hostfile)). Use a fresh, recipe-specific env name (don't reuse a shared/dev env)
+so the install is actually exercised on all nodes.
 
-On the launching node, bootstrap `uv` (a much faster installer) and `ds_ssh`:
+We fan out with `ds_ssh` (the DeepSpeed multi-node helper) and install with `uv pip install --python
+<env>/bin/python`, i.e. we address the env by **absolute path** rather than relying on `conda activate`. A
+non-interactive `ds_ssh`/pdsh shell does not reliably keep `conda activate` in effect, so activation-based installs
+can silently land in the base env; absolute paths avoid that (this is the same reason `restart_multi_ray.sh` starts
+Ray via the env's absolute `ray` binary).
+
+Pick the env name and resolve the env's `bin/` once (the path is identical on every node):
 ```bash
-pip install uv             # bootstrap uv on the launching node
-uv pip install deepspeed   # provides ds_ssh
-ds_ssh -f $JOB_HOSTFILE pip install uv   # bootstrap uv on every other node
+export CONDA_ENV=txt2sql
+CONDA_BASE=$(conda info --base)
+ENV=$CONDA_BASE/envs/$CONDA_ENV/bin        # the env's python / uv / ds_ssh / ray live here, on each node
 ```
 
-Clone this repo (it carries `requirements.txt` and the launcher scripts) and the verl fork:
+Bootstrap the env on the launching node first — this is what gives you `uv` and `ds_ssh`:
+```bash
+conda create -y -n $CONDA_ENV python=3.12
+$ENV/python -m pip install -q uv
+$ENV/uv pip install --python $ENV/python deepspeed       # provides $ENV/ds_ssh
+```
+
+Clone this repo (it carries `requirements.txt` and the launcher scripts) and the verl fork onto storage visible to
+all nodes:
 ```bash
 git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
 git clone -b arctic_rl_share_v0.7.1 --single-branch https://github.com/Snowflake-AI-Research/verl
 cd Arctic-Platform/recipes/rl/verl/txt2sql
 ```
 
-Install the pinned dependencies on all nodes. The assumption is cuda-12.9 - if you use a different version change the
-`torch` index URL below and the `cuda-bindings` pin in `requirements.txt`. `arctic-inference` patches vllm-0.18.0, so
-that exact version is pinned in `requirements.txt`.
+Create the env on the remaining nodes (idempotent — the launching node already has it), then install the pinned
+dependencies on all nodes. cuda-12.9 is assumed — if you use a different version change the `torch` index URL below
+and the `cuda-bindings` pin in `requirements.txt`. `arctic-inference` patches vllm-0.18.0, so that exact version is
+pinned in `requirements.txt`; `overrides.txt` forces the few transitive deps (flashinfer / numpy / transformers /
+datasets) this recipe is validated against, which vLLM 0.18.0's metadata otherwise pins higher (without it the
+single resolve is unsatisfiable).
 ```bash
-# torch (CUDA 12.9) first, then the rest of the pinned packages.
-# overrides.txt forces the few transitive deps (flashinfer/numpy/transformers)
-# this recipe is validated against, which vLLM 0.18.0's metadata otherwise pins
-# higher (without it the single resolve is unsatisfiable).
-ds_ssh -f $JOB_HOSTFILE uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu129 -U
-ds_ssh -f $JOB_HOSTFILE uv pip install -r $PWD/requirements.txt --override $PWD/overrides.txt
+# create the env on every node (guarded: `conda create -y` on an existing env would wipe and recreate it, which
+# would clobber the uv/ds_ssh you just bootstrapped on the launching node — the `[ -x ... ]` makes it a no-op there)
+$ENV/ds_ssh -f $JOB_HOSTFILE "[ -x $ENV/python ] || $CONDA_BASE/bin/conda create -y -n $CONDA_ENV python=3.12"
+$ENV/ds_ssh -f $JOB_HOSTFILE "$ENV/python -m pip install -q uv"
 
-# flash-attn builds against the freshly installed torch
-ds_ssh -f $JOB_HOSTFILE uv pip install -U pip wheel packaging setuptools
+# torch (CUDA 12.9) first, then the rest of the pinned packages
+$ENV/ds_ssh -f $JOB_HOSTFILE "$ENV/uv pip install --python $ENV/python torch==2.10.0 --index-url https://download.pytorch.org/whl/cu129 -U"
+$ENV/ds_ssh -f $JOB_HOSTFILE "$ENV/uv pip install --python $ENV/python -r $PWD/requirements.txt --override $PWD/overrides.txt"
+$ENV/ds_ssh -f $JOB_HOSTFILE "$ENV/uv pip install --python $ENV/python -U pip wheel packaging setuptools"
 ```
 
 To install flash attention, you can build it from source (may take a long time to build):
 ```bash
-ds_ssh -f $JOB_HOSTFILE uv pip install flash-attn --no-build-isolation
+$ENV/ds_ssh -f $JOB_HOSTFILE "$ENV/uv pip install --python $ENV/python flash-attn --no-build-isolation"
 ```
 or you can install directly from a wheel, find the automatic instructions
 [here](https://windreamer.github.io/flash-attention3-wheels/) or download directly from
 https://github.com/Dao-AILab/flash-attention/releases.
 
-Install verl (Snowflake fork) editable on all nodes:
+Install verl (Snowflake fork) editable on all nodes (the source is shared, but the editable install must register it
+in each node's env):
 ```bash
 cd ../../../../../verl
 grep -v flash-attn requirements.txt > requirements-no-fa.txt
-ds_ssh -f $JOB_HOSTFILE "cd $PWD && uv pip install -r requirements-no-fa.txt && uv pip install -e ."
+$ENV/ds_ssh -f $JOB_HOSTFILE "cd $PWD && $ENV/uv pip install --python $ENV/python -r requirements-no-fa.txt && $ENV/uv pip install --python $ENV/python -e ."
 cd -
 ```
 
 The BIRD reward (`bird_reward.py`) executes the generated SQL with Python's standard library (`sqlite3`,
 `concurrent.futures`), so no extra packages are needed beyond `requirements.txt`.
 
+> For a **single-node** run you don't need `ds_ssh`: create the env, bootstrap `uv`, and run the same
+> `$ENV/uv pip install --python $ENV/python ...` commands directly on the local node.
+
 ## 3. Get the raw BIRD data
 
 [BIRD-SQL](https://bird-bench.github.io/) ships `train.json`, `dev.json`, and per-database SQLite files plus per-table
-`database_description/*.csv` files (column-level semantic descriptions and value semantics).
+`database_description/*.csv` files (column-level semantic descriptions and value semantics). The official
+`bird-bench.oss-cn-beijing.aliyuncs.com` endpoint is slow/unreliable from many regions, so we pull the same content
+(train 9428 rows, dev 1534 rows, plus the database archives) from the
+[`Sudnya/bird-sql`](https://huggingface.co/datasets/Sudnya/bird-sql) HuggingFace mirror. This only needs
+`huggingface_hub` + `pandas`, both already in `requirements.txt`.
 
+Fetch onto shared storage (visible to all nodes — `bird_reward.py` opens the SQLite files at training time on every
+node). The `train_databases.zip` archive is ~20 GB, so this can take a while:
 ```bash
-mkdir -p /data/bird && cd /data/bird
+export BIRD_DIR=/data/bird
+$ENV/python - <<'PY'
+import os, glob, shutil, tempfile, zipfile
+import pandas as pd
+from huggingface_hub import hf_hub_download
+import json
 
-# train: ~9.4k rows, ~95 SQLite databases
-wget https://bird-bench.oss-cn-beijing.aliyuncs.com/train.zip
-unzip train.zip                  # creates train/{train.json,train_databases/...}
+repo, bird = "Sudnya/bird-sql", os.environ["BIRD_DIR"]
 
-# dev: ~1.5k rows, 11 SQLite databases (used for validation)
-wget https://bird-bench.oss-cn-beijing.aliyuncs.com/dev.zip
-unzip dev.zip                    # creates dev/{dev.json,dev_databases/...}
+def dump_questions(member, out_json):
+    df = pd.read_parquet(hf_hub_download(repo, member, repo_type="dataset"))
+    rows = [{"db_id": r["db_id"], "question": r["question"],
+             "evidence": ("" if pd.isna(r.get("evidence")) else r["evidence"]), "SQL": r["SQL"]}
+            for _, r in df.iterrows()]
+    os.makedirs(os.path.dirname(out_json), exist_ok=True)
+    json.dump(rows, open(out_json, "w"))
+    print(f"wrote {len(rows)} rows -> {out_json}")
+
+def fetch_dbs(member, dest_parent, dbname):
+    z = hf_hub_download(repo, member, repo_type="dataset")
+    tmp = tempfile.mkdtemp(dir=dest_parent)
+    with zipfile.ZipFile(z) as zf: zf.extractall(tmp)
+    root = os.path.dirname(os.path.dirname(glob.glob(f"{tmp}/**/*.sqlite", recursive=True)[0]))
+    os.replace(root, os.path.join(dest_parent, dbname))
+    print(f"ready -> {os.path.join(dest_parent, dbname)}")
+
+dump_questions("data/train-00000-of-00001.parquet", f"{bird}/train/train.json")
+dump_questions("data/validation-00000-of-00001.parquet", f"{bird}/dev/dev.json")
+fetch_dbs("databases/train_databases.zip", f"{bird}/train", "train_databases")
+fetch_dbs("databases/dev_databases.zip", f"{bird}/dev", "dev_databases")
+PY
 ```
 
-After unzipping you should have:
+You should end up with:
 
 ```
 /data/bird/
@@ -175,7 +225,7 @@ From the recipe directory (`Arctic-Platform/recipes/rl/verl/txt2sql`, cloned in 
 installed in step 2 (`pandas` / `datasets` / `transformers` come from `requirements.txt`):
 
 ```bash
-python preprocess_bird.py \
+$ENV/python preprocess_bird.py \
     --bird_dir /data/bird \
     --output_dir /data/snowflakesql/txt2sql \
     --max_tokens 32768 \

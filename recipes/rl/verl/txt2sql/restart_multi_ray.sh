@@ -1,5 +1,11 @@
 HOSTFILE="${JOB_HOSTFILE:-/data-fast/hostfile}"
 ray_path=$(which ray)
+
+# Use all 8 local GPUs on the head. If the launching shell pins CUDA_VISIBLE_DEVICES (common on dev boxes), the
+# `ray start --num-gpus=8` below fails with "Attempting to start raylet with 8 GPU, but CUDA_VISIBLE_DEVICES
+# contains ['0']" and the head/GCS never comes up (workers then fail with "No node info found for head node in
+# GCS"). Clear it so ray sees every local GPU; ds_ssh worker shells start fresh and are unaffected.
+unset CUDA_VISIBLE_DEVICES
 # PY_ENV="source ~/py_env/gsched/bin/activate"
 
 # stop existing ray instances
