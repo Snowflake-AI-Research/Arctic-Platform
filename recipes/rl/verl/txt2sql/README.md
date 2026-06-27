@@ -110,7 +110,8 @@ the following — this is the "extended" prompt the recipe is tuned for:
    the model sees realistic data shapes (date formats, ID styles, units, …).
 4. **BIRD `database_description/*.csv` enrichment** appended to the same column comments: `name`, `desc`, and
    `values` semantics for columns that BIRD documents.
-5. **Evidence text** from the BIRD row appended to the natural-language question when present (BIRD's "evidence" hints).
+5. **Evidence text** from the BIRD row appended to the natural-language question when present (BIRD's "evidence"
+   hints).
 
 A Qwen3-tokenizer length filter then drops samples whose tokenized prompt exceeds the cap (default 32 768 tokens with
 `Qwen/Qwen3-1.7B`). BIRD's outlier databases `works_cycles` and `movie_3` produce >80 K-token prompts at full
