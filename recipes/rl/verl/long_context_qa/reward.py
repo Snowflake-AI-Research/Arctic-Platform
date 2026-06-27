@@ -122,8 +122,9 @@ def _format_f1_score(solution_str, ground_truth):
         try:
             boxed_part = last_boxed_only_string(solution_str)
             retval = 0
-            if max_boxed_limit > 0 and solution_str.count("\\boxed") > max_boxed_limit:
-                raise ValueError(f"Too many boxed parts: {solution_str.count('\\boxed')} > {max_boxed_limit}")
+            boxed_count = solution_str.count("\\boxed")
+            if max_boxed_limit > 0 and boxed_count > max_boxed_limit:
+                raise ValueError(f"Too many boxed parts: {boxed_count} > {max_boxed_limit}")
 
             if boxed_part is not None:
                 pred = remove_boxed(boxed_part)
