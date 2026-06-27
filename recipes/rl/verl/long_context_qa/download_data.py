@@ -20,8 +20,8 @@ Subsets:
   - musique_qwen_0_2500 + musique_distractor_2500_5000
   - 2wikipedia_qwen_0_2500 + 2wikipedia_distractor_2500_5000
 
-Each subset pair is merged into a single dataset per task, then split into
-train/test parquets. A merged version across all tasks is also produced.
+Each subset pair is merged into a single dataset per task, then split into train/test parquets. A merged version
+across all tasks is also produced.
 """
 
 import argparse
@@ -128,7 +128,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output_dir",
-        default="/data/snowflakesql/xyu/long-context",
+        default="/data/snowflakesql/long-context",
     )
     parser.add_argument("--test_ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)

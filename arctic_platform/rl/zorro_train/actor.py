@@ -16,7 +16,15 @@
 """
 Actor implementation with prompt deduplication.
 
-Provides forward and backward passes with automatic prompt deduplication.
+Thin reference harness around :class:`Qwen3ModelOncePatcher` -- the production ZoRRO patcher installed by the
+DeepSpeed worker. It loads a Qwen3 checkpoint, installs the patcher once, and exposes a deduplicated forward plus
+a PPO train step.
+
+The patched model takes the *full* ``[batch_size, seq_len]`` batch and returns per-response-token
+``logprobs`` / ``entropy`` that are **packed into 1D in the original sample order** (padding removed). This differs
+from a plain HF model, which returns ``[batch_size, seq_len, vocab]`` logits.
+
+See ``tests/zorro_train/test_once_patcher.py`` for the same patcher driven directly.
 """
 
 from typing import Dict
@@ -25,60 +33,100 @@ from typing import Tuple
 
 import torch
 from transformers import AutoModelForCausalLM
+from transformers.modeling_outputs import ModelOutput
 
+from .qwen_model_patcher import Qwen3ModelOncePatcher
 from .zorro_train import ZoRRoTrain
 
 
+def packed_ppo_policy_loss(
+    log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    ref_log_prob: Optional[torch.Tensor] = None,
+    clip_ratio: float = 0.2,
+    kl_loss_coef: float = 0.001,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """PPO clipped policy loss over packed (1D) response tokens.
+
+    All inputs are 1D, aligned 1:1 over the same response tokens (token-mean reduction). Shared by
+    :class:`DeduplicatedActor` and the non-deduplicated baseline in ``tests.py`` so both paths optimize an
+    *identical* objective -- the basis for the gradient-equivalence check.
+
+    Returns ``(policy_loss, metrics)``; ``policy_loss`` is *before* gradient-accumulation scaling (the caller
+    divides and adds ``actor/loss`` after).
+    """
+    # PPO clipped objective (verl/trainer/ppo/core_algos.py::compute_policy_loss).
+    log_ratio = log_prob - old_log_prob
+    ratio = torch.exp(log_ratio)
+
+    pg_loss1 = -advantages * ratio
+    pg_loss2 = -advantages * torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
+    pg_loss = torch.maximum(pg_loss1, pg_loss2).mean()
+
+    policy_loss = pg_loss
+    kl_loss = None
+    if ref_log_prob is not None:
+        kl_loss = (log_prob - ref_log_prob).mean()
+        policy_loss = policy_loss + kl_loss * kl_loss_coef
+
+    metrics = {
+        "actor/pg_loss": pg_loss.detach().item(),
+        "actor/policy_loss": policy_loss.detach().item(),
+    }
+    clipfrac = ((ratio - 1.0).abs() > clip_ratio).float().mean()
+    metrics["actor/pg_clipfrac"] = clipfrac.detach().item()
+    approx_kl = ((ratio - 1.0) - log_ratio).mean()
+    metrics["actor/ppo_kl"] = approx_kl.detach().item()
+    if kl_loss is not None:
+        metrics["actor/kl_loss"] = kl_loss.detach().item()
+
+    return policy_loss, metrics
+
+
 class DeduplicatedActor:
-    """Actor with prompt deduplication for forward pass."""
+    """Actor that runs deduplicated forward/backward via :class:`Qwen3ModelOncePatcher`."""
 
     def __init__(
         self,
         model_name_or_path: str,
         device: str = "cuda",
-        patcher_class=None,
+        logits_optimization: str = "none",
         use_split_attention: bool = True,
-        attn_implementation: str = "sdpa",
+        attn_implementation: str = "eager",
+        world_size: int = 1,
+        max_token_len: int = 4096,
+        dtype: torch.dtype = torch.bfloat16,
     ):
         """
         Initialize actor with prompt deduplication.
 
         Args:
-            model_name_or_path: Hugging Face model identifier or local path
-            device: Device to load model on
-            patcher_class: Custom attention patcher class (default: auto-detect from model name)
-            use_split_attention: Whether to use split attention optimization
-            attn_implementation: Attention implementation (sdpa, flash_attention_2, flash_attention_3, eager)
+            model_name_or_path: Hugging Face model identifier or local path (a Qwen3 family checkpoint).
+            device: Device to load the model on.
+            logits_optimization: logprob/entropy dispatch, one of ``"none"`` | ``"memory"`` | ``"compute"``.
+                ``"memory"`` requires an initialized ``torch.distributed`` process group (the production
+                DeepSpeed worker always has one); ``"none"`` / ``"compute"`` do not.
+            use_split_attention: Use split attention (prompt-to-prompt + response-to-full) vs. a single
+                reconstructed attention call.
+            attn_implementation: Attention implementation (``eager``, ``flash_attention_2``, ...). ``flash_attention_2``
+                requires a GPU + ``flash-attn``; ``eager`` works everywhere.
+            world_size: Data-parallel world size; only used to sync shard counts in ``"memory"`` mode.
+            max_token_len: Reserved (forwarded to the patcher; currently unused by it).
+            dtype: Model dtype.
         """
         self.device = device
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
-            torch_dtype=torch.bfloat16,
+            dtype=dtype,
             attn_implementation=attn_implementation,
         ).to(device)
         self.model.eval()
 
-        # Auto-detect patcher class if not provided
-        if patcher_class is None:
-            patcher_class = self._auto_detect_patcher(model_name_or_path)
-
-        self.patcher_class = patcher_class
+        self.logits_optimization = logits_optimization
         self.use_split_attention = use_split_attention
-
-    def _auto_detect_patcher(self, model_name_or_path):
-        """Auto-detect appropriate patcher class based on model name."""
-        model_name_lower = model_name_or_path.lower()
-
-        # Check for Qwen models
-        if "qwen" in model_name_lower:
-            from .qwen_model_patcher import Qwen3ModelPatcher
-
-            print("Auto-detected Qwen model, using Qwen3ModelPatcher")
-            return Qwen3ModelPatcher
-
-        # Default to base patcher
-        print("Using default ModuleReconstructionPatcher")
-        assert False, "Default patcher not implemented"
+        self.world_size = world_size
+        self.max_token_len = max_token_len
 
     def train(self):
         """Set model to training mode."""
@@ -88,96 +136,84 @@ class DeduplicatedActor:
         """Set model to eval mode."""
         self.model.eval()
 
-    def _forward_micro_batch(
-        self, micro_batch: Dict[str, torch.Tensor], temperature: float = 1.0, calculate_entropy: bool = False
-    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    def patch(self, response_len: int, rollout_n: int, temperature: float) -> Qwen3ModelOncePatcher:
+        """(Re)install :class:`Qwen3ModelOncePatcher` onto the model.
+
+        The patcher is applied "once" in the sense that it permanently mutates the model's ``forward`` methods.
+        Re-applying it just swaps the forward closures (e.g. for a new ``temperature``), which is exactly how
+        ``tests/zorro_train/test_once_patcher.py`` re-patches a single cached model across cases.
         """
-        Forward pass with prompt deduplication.
+        patcher = Qwen3ModelOncePatcher(
+            self.model,
+            response_len=response_len,
+            max_token_len=self.max_token_len,
+            rollout_n=rollout_n,
+            temperature=temperature,
+            logits_optimization=self.logits_optimization,
+            world_size=self.world_size,
+            use_unpad=True,
+            use_split_attention=self.use_split_attention,
+        )
+        patcher.patch_forward()
+        return patcher
+
+    def forward(
+        self, micro_batch: Dict[str, torch.Tensor], temperature: float = 1.0, calculate_entropy: bool = False
+    ) -> ModelOutput:
+        """Deduplicated forward pass.
 
         Args:
-            micro_batch: Dict containing:
-                - input_ids: [batch_size, seq_len]
-                - position_ids: [batch_size, seq_len]
-                - responses: [batch_size, response_len]
-            temperature: Temperature for scaling logits
-            calculate_entropy: Whether to compute entropy
+            micro_batch: Dict with ``input_ids`` / ``position_ids`` / ``attention_mask`` ``[batch_size, seq_len]``
+                and ``responses`` ``[batch_size, response_len]`` (e.g. from ``create_dummy_batch``).
+            temperature: Temperature for scaling logits.
+            calculate_entropy: Whether to also compute per-token entropy.
 
         Returns:
-            entropy: [batch_size, response_len] or None
-            log_probs: [batch_size, response_len]
+            ``ModelOutput`` with ``logprobs`` (and ``entropy`` if requested): 1D tensors of shape
+            ``[num_valid_response_tokens]``, packed in the original sample order with padding removed.
         """
         input_ids = micro_batch["input_ids"].to(self.device)
         position_ids = micro_batch["position_ids"].to(self.device)
-        responses = micro_batch["responses"].to(self.device)
+        attention_mask = micro_batch["attention_mask"].to(self.device)
+        response_len = micro_batch["responses"].size(-1)
 
-        response_length = responses.size(-1)
-        batch_size, seq_len = input_ids.shape
+        # rollout_n is the number of responses sharing a prompt; the patcher only stores it, but we derive it from
+        # the batch to keep this a faithful usage example.
+        prompt_groups, _ = ZoRRoTrain.find_prompt_groups(input_ids, response_len)
+        rollout_n = input_ids.size(0) // max(1, len(prompt_groups))
 
-        # Step 1: Find prompt groups
-        prompt_groups, unique_prompts = ZoRRoTrain.find_prompt_groups(input_ids, response_length)
+        self.patch(response_len=response_len, rollout_n=rollout_n, temperature=temperature)
 
-        print(f"Original batch size: {batch_size}")
-        print(f"Number of unique prompts: {len(prompt_groups)}")
-        for i, group in enumerate(prompt_groups):
-            print(f"  Group {i}: {len(group)} samples sharing prompt")
-
-        # Step 2: Create deduplicated batch
-        dedup_input_ids, _, reconstruction_info = ZoRRoTrain.create_deduplicated_batch(
-            input_ids, position_ids, response_length, prompt_groups, unique_prompts
+        return self.model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            calculate_entropy=calculate_entropy,
         )
 
-        print(f"Deduplicated batch size: {dedup_input_ids.size(0)}")
+    def _forward_micro_batch(
+        self, micro_batch: Dict[str, torch.Tensor], temperature: float = 1.0, calculate_entropy: bool = False
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Convenience wrapper returning ``(entropy, log_probs)`` (both packed 1D, see :meth:`forward`).
 
-        # Step 3: Forward pass with monkey-patched attention
-        # Note: position_ids should NOT be deduplicated - use original position_ids
-        with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
-            # Pass use_split_attention if patcher supports it
-            patcher_kwargs = {"model": self.model, "reconstruction_info": reconstruction_info}
-            if (
-                hasattr(self.patcher_class, "__init__")
-                and "use_split_attention" in self.patcher_class.__init__.__code__.co_varnames
-            ):
-                patcher_kwargs["use_split_attention"] = self.use_split_attention
+        ``entropy`` is ``None`` when ``calculate_entropy=False`` (``ModelOutput`` drops ``None`` fields, so we read
+        it via membership rather than attribute access).
+        """
+        output = self.forward(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
+        entropy = output["entropy"] if "entropy" in output else None
+        return entropy, output["logprobs"]
 
-            with self.patcher_class(**patcher_kwargs):
-                output = self.model(
-                    input_ids=dedup_input_ids,
-                    position_ids=position_ids,  # Use original position_ids, not deduplicated
-                    use_cache=False,
-                )
+    @staticmethod
+    def _packed_response_validity(micro_batch: Dict[str, torch.Tensor], response_len: int) -> torch.Tensor:
+        """Boolean ``[batch_size, response_len]`` mask of valid (non-pad) response tokens.
 
-        # Step 4: Get logits (already reconstructed by the patcher!)
-        logits = output.logits  # [batch_size, seq_len, vocab_size]
-
-        print(f"Model output logits shape: {logits.shape}")
-
-        # Store full logits and reconstruction_info for testing/comparison and backward pass
-        self._last_reconstructed_logits = logits.detach().clone()
-        self._last_reconstruction_info = reconstruction_info
-
-        prompt_len = reconstruction_info["prompt_len"]
-
-        # Step 5: Extract logits that predict response tokens
-        # Response tokens are at [prompt_len : prompt_len + response_length]
-        # Logits that predict them are at [prompt_len - 1 : prompt_len + response_length - 1]
-        logits = logits[
-            :, prompt_len - 1 : prompt_len + response_length - 1, :
-        ]  # [batch_size, response_length, vocab_size]
-        logits = logits / temperature
-
-        # Compute log probabilities
-        log_probs_all = torch.log_softmax(logits, dim=-1)
-        log_probs = torch.gather(log_probs_all, dim=-1, index=responses.unsqueeze(-1)).squeeze(
-            -1
-        )  # [batch_size, response_len]
-
-        entropy = None
-        if calculate_entropy:
-            # Compute entropy: -sum(p * log(p))
-            probs = torch.softmax(logits, dim=-1)
-            entropy = -(probs * log_probs_all).sum(dim=-1)  # [batch_size, response_len]
-
-        return entropy, log_probs
+        Indexing a per-response field with this mask flattens it row-major, which matches the sample order the
+        patcher returns ``logprobs`` / ``entropy`` in.
+        """
+        attention_mask = micro_batch["attention_mask"]
+        prompt_len = micro_batch["input_ids"].shape[1] - response_len
+        return attention_mask[:, prompt_len:].bool()
 
     def compute_policy_loss_and_backward(
         self,
@@ -186,104 +222,31 @@ class DeduplicatedActor:
         gradient_accumulation: int = 1,
     ) -> Dict[str, float]:
         """
-        Compute PPO policy loss with deduplication and perform backward pass.
-        Based on the original verl PPO implementation.
+        Compute the PPO clipped policy loss with deduplication and run the backward pass.
 
-        Args:
-            micro_batch: Dict containing:
-                - input_ids: [batch_size, seq_len]
-                - position_ids: [batch_size, seq_len]
-                - responses: [batch_size, response_len]
-                - response_mask: [batch_size, response_len] - mask for valid response tokens
-                - old_log_probs: [batch_size, response_len] - log probs from rollout
-                - advantages: [batch_size, response_len] - computed advantages
-                - ref_log_prob: [batch_size, response_len] - reference policy log probs (optional)
-            temperature: Temperature for scaling logits
-            gradient_accumulation: Number of gradient accumulation steps
+        Works in the packed token space the patcher returns: the per-response training fields
+        (``old_log_probs`` / ``advantages`` / optional ``ref_log_prob``, each ``[batch_size, response_len]``) are
+        flattened to valid response tokens in sample order to align 1:1 with the returned ``log_probs``.
 
         Returns:
-            metrics: Dict with loss values and statistics
+            metrics: Dict with loss values and PPO statistics.
         """
-        # Get log probs from forward pass
+        self.train()
+
         _, log_prob = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=False)
 
-        # Extract fields from micro_batch
-        old_log_prob = micro_batch["old_log_probs"].to(self.device)
-        advantages = micro_batch["advantages"].to(self.device)
+        response_len = micro_batch["responses"].size(-1)
+        valid = self._packed_response_validity(micro_batch, response_len).to(self.device)
+        old_log_prob = micro_batch["old_log_probs"].to(self.device)[valid]
+        advantages = micro_batch["advantages"].to(self.device)[valid]
+        ref_log_prob = micro_batch["ref_log_prob"].to(self.device)[valid] if "ref_log_prob" in micro_batch else None
 
-        # Response mask: if not provided, assume all tokens are valid (no padding)
-        if "response_mask" in micro_batch:
-            response_mask = micro_batch["response_mask"].to(self.device)
-        else:
-            # No padding - all response tokens are valid
-            response_mask = torch.ones_like(log_prob)
-
-        # Compute policy loss (PPO clipped objective)
-        # Based on: verl/trainer/ppo/core_algos.py::compute_policy_loss
-
-        # Log probability ratio: pi_theta / pi_theta_old
-        log_ratio = log_prob - old_log_prob
-        ratio = torch.exp(log_ratio)
-
-        # Clipped objective
-        clip_ratio = 0.2  # Default PPO clip ratio
-        pg_loss1 = -advantages * ratio
-        pg_loss2 = -advantages * torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
-        pg_loss_element = torch.maximum(pg_loss1, pg_loss2)
-
-        # Aggregate loss (token-mean by default)
-        # Based on: verl/trainer/ppo/core_algos.py::agg_loss
-        valid_tokens = response_mask.sum()
-        pg_loss = (pg_loss_element * response_mask).sum() / (valid_tokens + 1e-8)
-
-        policy_loss = pg_loss
-
-        # Add KL loss if ref_log_prob is provided
-        kl_loss = None
-        if "ref_log_prob" in micro_batch:
-            ref_log_prob = micro_batch["ref_log_prob"].to(self.device)
-
-            # KL divergence (using low_var_kl / k3 approximation by default)
-            # Based on: verl/trainer/ppo/core_algos.py::kl_penalty
-            kld = log_prob - ref_log_prob
-            kl_loss = (kld * response_mask).sum() / (valid_tokens + 1e-8)
-
-            # Add to policy loss
-            kl_loss_coef = 0.001  # Default coefficient
-            policy_loss = policy_loss + kl_loss * kl_loss_coef
-
-        # Scale for gradient accumulation
+        policy_loss, metrics = packed_ppo_policy_loss(log_prob, old_log_prob, advantages, ref_log_prob)
         loss = policy_loss / gradient_accumulation
 
-        # Backward pass with patching active (for gradient checkpointing)
-        patcher_kwargs = {"model": self.model, "reconstruction_info": self._last_reconstruction_info}
-        if (
-            hasattr(self.patcher_class, "__init__")
-            and "use_split_attention" in self.patcher_class.__init__.__code__.co_varnames
-        ):
-            patcher_kwargs["use_split_attention"] = self.use_split_attention
-
-        with self.patcher_class(**patcher_kwargs):
-            loss.backward()
-
-        # Compute metrics
-        metrics = {
-            "actor/pg_loss": pg_loss.detach().item(),
-            "actor/policy_loss": policy_loss.detach().item(),
-            "actor/loss": loss.detach().item(),
-        }
-
-        # Compute clipfrac (fraction of ratios that were clipped)
-        clipfrac = ((ratio - 1.0).abs() > clip_ratio).float()
-        clipfrac = (clipfrac * response_mask).sum() / (valid_tokens + 1e-8)
-        metrics["actor/pg_clipfrac"] = clipfrac.detach().item()
-
-        # Compute approximate KL (for monitoring, different from KL loss)
-        approx_kl = ((ratio - 1.0) - log_ratio) * response_mask
-        approx_kl = approx_kl.sum() / (valid_tokens + 1e-8)
-        metrics["actor/ppo_kl"] = approx_kl.detach().item()
-
-        if kl_loss is not None:
-            metrics["actor/kl_loss"] = kl_loss.detach().item()
+        # The model is already permanently patched, so the deduplicated graph was built during the forward above --
+        # a plain backward suffices (no patching context manager, unlike the old Qwen3ModelPatcher path).
+        loss.backward()
+        metrics["actor/loss"] = loss.detach().item()
 
         return metrics

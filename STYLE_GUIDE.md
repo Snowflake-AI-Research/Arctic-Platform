@@ -68,7 +68,7 @@ In general it's recommended to read:
 
 ### Tiny models
 
-Most tests perform only functional testing - i.e. they just check that some system works correctly. In all those cases the tiniest possible model should suffice - by tiniest we mean a model of 5MB - not 500MB - a few layers, a short dict and a shall hidden_size should be more than enough. See [Quick Iterations, Small Payload](https://github.com/stas00/the-art-of-debugging/tree/master/methodology#quick-iterations-small-payload)
+Most tests perform only functional testing - i.e. they just check that some system works correctly. In all those cases the tiniest possible model should suffice - by tiniest we mean a model of 5MB - not 500MB - a few layers, a short dict and a small hidden_size should be more than enough. See [Quick Iterations, Small Payload](https://github.com/stas00/the-art-of-debugging/tree/master/methodology#quick-iterations-small-payload)
 
 Here is how to [create tiny models](https://github.com/stas00/ml-engineering/blob/c5306e5aa52e9729616c954a1a5aa02784bf612c/debug/make-tiny-models-tokenizers-datasets.md#making-a-tiny-model).
 

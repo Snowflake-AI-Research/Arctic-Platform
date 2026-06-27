@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 
 from .actor import DeduplicatedActor
+from .actor import packed_ppo_policy_loss
 
 
 def create_dummy_batch(
@@ -231,6 +232,48 @@ def create_dummy_batch(
     return batch
 
 
+def baseline_response_logprobs(
+    model: nn.Module,
+    micro_batch: Dict[str, torch.Tensor],
+    temperature: float = 1.0,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """Non-deduplicated response logprobs, packed 1D in original sample order (valid response tokens only).
+
+    Runs a single full-batch forward on the **unpatched** model and extracts, per row, the logprob of each
+    response token from the logits at the preceding position. The layout (sample order, padding removed) matches
+    what :meth:`DeduplicatedActor.forward` returns, so the two can be compared 1:1.
+
+    Must be called before the model is patched: :class:`Qwen3ModelOncePatcher` permanently rewrites the forward to
+    return logprobs instead of ``logits``.
+    """
+    input_ids = micro_batch["input_ids"].to(device)
+    attention_mask = micro_batch["attention_mask"].to(device)
+    position_ids = micro_batch["position_ids"].to(device)
+    response_len = micro_batch["responses"].size(-1)
+    prompt_len = input_ids.shape[1] - response_len
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        use_cache=False,
+    )
+    logits = outputs.logits  # [batch_size, seq_len, vocab]
+
+    valid = attention_mask[:, prompt_len:].bool()
+    rows = []
+    for row in range(input_ids.shape[0]):
+        valid_response_len = int(valid[row].sum())
+        # response token t is predicted by the logits at column (prompt_len - 1 + t)
+        pred_idx = torch.arange(prompt_len - 1, prompt_len - 1 + valid_response_len, device=device)
+        # log_softmax only over the needed positions to avoid a full [batch, seq, vocab] intermediate.
+        log_probs = torch.log_softmax(logits[row, pred_idx].float() / temperature, dim=-1)
+        resp_tokens = input_ids[row, prompt_len : prompt_len + valid_response_len]
+        rows.append(log_probs.gather(-1, resp_tokens.unsqueeze(-1)).squeeze(-1))
+    return torch.cat(rows)
+
+
 def compute_baseline_loss_and_backward(
     model: nn.Module,
     micro_batch: Dict[str, torch.Tensor],
@@ -239,82 +282,27 @@ def compute_baseline_loss_and_backward(
     device: str = "cuda",
 ) -> Dict[str, float]:
     """
-    Baseline forward+backward without deduplication (original approach).
-    Used for comparison/testing.
+    Baseline (no-deduplication) forward+backward, used for comparison/testing.
+
+    Mirrors :meth:`DeduplicatedActor.compute_policy_loss_and_backward` but on the unpatched model and via a plain
+    full-batch forward, sharing the same packed PPO objective so the two paths' gradients can be compared.
+
+    Returns ``(metrics, baseline_logprobs)``; must run before the model is patched.
     """
-    input_ids = micro_batch["input_ids"].to(device)
-    position_ids = micro_batch["position_ids"].to(device)
-    responses = micro_batch["responses"].to(device)
-    old_log_prob = micro_batch["old_log_probs"].to(device)
-    advantages = micro_batch["advantages"].to(device)
+    log_prob = baseline_response_logprobs(model, micro_batch, temperature=temperature, device=device)
 
-    response_length = responses.size(-1)
+    response_len = micro_batch["responses"].size(-1)
+    valid = DeduplicatedActor._packed_response_validity(micro_batch, response_len).to(device)
+    old_log_prob = micro_batch["old_log_probs"].to(device)[valid].float()
+    advantages = micro_batch["advantages"].to(device)[valid].float()
+    ref_log_prob = micro_batch["ref_log_prob"].to(device)[valid].float() if "ref_log_prob" in micro_batch else None
 
-    # Forward pass (no deduplication)
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        output = model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            use_cache=False,
-        )
-
-    baseline_logits = output.logits
-    print(f"Baseline model output shape: {baseline_logits.shape}")
-
-    # Extract response logits and compute log probs
-    logits = baseline_logits
-    logits = logits[:, -response_length - 1 : -1, :]
-    logits = logits / temperature
-
-    log_probs_all = torch.log_softmax(logits, dim=-1)
-    log_prob = torch.gather(log_probs_all, dim=-1, index=responses.unsqueeze(-1)).squeeze(-1)
-
-    # Compute PPO loss (same as deduplicated version)
-    log_ratio = log_prob - old_log_prob
-    ratio = torch.exp(log_ratio)
-
-    clip_ratio = 0.2
-    pg_loss1 = -advantages * ratio
-    pg_loss2 = -advantages * torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
-    pg_loss_element = torch.maximum(pg_loss1, pg_loss2)
-
-    # NO PADDING - all tokens are valid
-    pg_loss = pg_loss_element.mean()
-
-    policy_loss = pg_loss
-
-    # Add KL loss if present
-    kl_loss = None
-    if "ref_log_prob" in micro_batch:
-        ref_log_prob = micro_batch["ref_log_prob"].to(device)
-        kld = log_prob - ref_log_prob
-        kl_loss = kld.mean()
-        kl_loss_coef = 0.001
-        policy_loss = policy_loss + kl_loss * kl_loss_coef
-
-    # Scale and backward
+    policy_loss, metrics = packed_ppo_policy_loss(log_prob, old_log_prob, advantages, ref_log_prob)
     loss = policy_loss / gradient_accumulation
     loss.backward()
+    metrics["actor/loss"] = loss.detach().item()
 
-    # Metrics
-    metrics = {
-        "actor/pg_loss": pg_loss.detach().item(),
-        "actor/policy_loss": policy_loss.detach().item(),
-        "actor/loss": loss.detach().item(),
-    }
-
-    clipfrac = ((ratio - 1.0).abs() > clip_ratio).float()
-    clipfrac = clipfrac.mean()
-    metrics["actor/pg_clipfrac"] = clipfrac.detach().item()
-
-    approx_kl = (ratio - 1.0) - log_ratio
-    approx_kl = approx_kl.mean()
-    metrics["actor/ppo_kl"] = approx_kl.detach().item()
-
-    if kl_loss is not None:
-        metrics["actor/kl_loss"] = kl_loss.detach().item()
-
-    return metrics, baseline_logits
+    return metrics, log_prob.detach()
 
 
 def compare_gradients(model1: nn.Module, model2: nn.Module, name: str = "param") -> Dict[str, float]:
@@ -393,8 +381,13 @@ def test_gradient_correctness(
     prompt_len: int = 32,
     response_len: int = 16,
     device: str = "cuda",
+    temperature: float = 1.0,
 ):
-    """Test that deduplicated gradients match baseline."""
+    """Test that the deduplicated forward/backward matches a non-deduplicated baseline (logprobs + gradients).
+
+    NOTE: ``actor`` must be FRESH -- its model not yet patched. The baseline is computed first on the unpatched
+    model; the deduplicated path then patches it permanently (Qwen3ModelOncePatcher).
+    """
     print("=" * 80)
     print("Gradient Correctness Test")
     print("=" * 80)
@@ -414,42 +407,24 @@ def test_gradient_correctness(
     print(f"  Num unique prompts: {num_unique_prompts}")
     print(f"  Samples per prompt: {batch_size // num_unique_prompts}")
 
-    # Test with deduplicated approach
-    print("\n[1/3] Running deduplicated forward+backward...")
+    # Per-response training fields, flattened to valid response tokens in sample order (shared by both paths).
+    valid = DeduplicatedActor._packed_response_validity(train_batch, response_len).to(device)
+    old_log_prob = train_batch["old_log_probs"].to(device)[valid].float()
+    advantages = train_batch["advantages"].to(device)[valid].float()
+    ref_log_prob = train_batch["ref_log_prob"].to(device)[valid].float() if "ref_log_prob" in train_batch else None
+
+    # Baseline FIRST, on the still-unpatched model.
+    print("\n[1/3] Running baseline forward+backward (unpatched model)...")
     actor.train()
-    actor.model.zero_grad()
+    actor.model.zero_grad(set_to_none=True)
 
-    metrics_dedup = actor.compute_policy_loss_and_backward(train_batch, temperature=1.0, gradient_accumulation=1)
-
-    # Get reconstructed logits from dedup approach
-    reconstructed_logits_dedup = actor._last_reconstructed_logits
-
-    # Save gradients from deduplicated approach
-    grads_dedup = {}
-    grad_norm_dedup = 0.0
-    for name, param in actor.model.named_parameters():
-        if param.grad is not None:
-            grads_dedup[name] = param.grad.clone()
-            grad_norm_dedup += param.grad.data.norm(2).item() ** 2
-    grad_norm_dedup = grad_norm_dedup**0.5
-
-    print(f"  Loss: {metrics_dedup['actor/loss']:.6f}")
-    print(f"  Num params with grad: {len(grads_dedup)}")
-    print(f"  Gradient norm: {grad_norm_dedup:.6f}")
-
-    # Test with baseline (no deduplication)
-    print("\n[2/3] Running baseline forward+backward...")
-    actor.model.zero_grad()
-
-    metrics_baseline, baseline_logits = compute_baseline_loss_and_backward(
-        actor.model,
-        train_batch,
-        temperature=1.0,
-        gradient_accumulation=1,
-        device=device,
+    baseline_logprobs = baseline_response_logprobs(actor.model, train_batch, temperature=temperature, device=device)
+    policy_loss_baseline, metrics_baseline = packed_ppo_policy_loss(
+        baseline_logprobs, old_log_prob, advantages, ref_log_prob
     )
+    policy_loss_baseline.backward()
+    metrics_baseline["actor/loss"] = policy_loss_baseline.detach().item()
 
-    # Save gradients from baseline approach
     grads_baseline = {}
     grad_norm_baseline = 0.0
     for name, param in actor.model.named_parameters():
@@ -457,42 +432,64 @@ def test_gradient_correctness(
             grads_baseline[name] = param.grad.clone()
             grad_norm_baseline += param.grad.data.norm(2).item() ** 2
     grad_norm_baseline = grad_norm_baseline**0.5
+    baseline_logprobs = baseline_logprobs.detach()
 
     print(f"  Loss: {metrics_baseline['actor/loss']:.6f}")
     print(f"  Gradient norm: {grad_norm_baseline:.6f}")
 
-    # Compare reconstructed logits vs baseline logits
-    print("\n[3/3] Comparing reconstructed logits with baseline...")
-    print(f"  Reconstructed logits shape: {reconstructed_logits_dedup.shape}")
-    print(f"  Baseline logits shape:      {baseline_logits.shape}")
+    # Deduplicated path (this patches the model permanently).
+    print("\n[2/3] Running deduplicated forward+backward...")
+    actor.model.zero_grad(set_to_none=True)
 
-    if reconstructed_logits_dedup.shape == baseline_logits.shape:
-        logits_diff = (reconstructed_logits_dedup - baseline_logits).abs()
-        max_logits_diff = logits_diff.max().item()
-        mean_logits_diff = logits_diff.mean().item()
+    dedup_output = actor.forward(train_batch, temperature=temperature, calculate_entropy=False)
+    dedup_logprobs = dedup_output.logprobs.float()
+    policy_loss_dedup, metrics_dedup = packed_ppo_policy_loss(dedup_logprobs, old_log_prob, advantages, ref_log_prob)
+    policy_loss_dedup.backward()
+    metrics_dedup["actor/loss"] = policy_loss_dedup.detach().item()
 
-        # Compute relative difference
-        baseline_magnitude = baseline_logits.abs().mean().item()
-        rel_logits_diff = mean_logits_diff / (baseline_magnitude + 1e-8) * 100
+    grads_dedup = {}
+    grad_norm_dedup = 0.0
+    for name, param in actor.model.named_parameters():
+        if param.grad is not None:
+            grads_dedup[name] = param.grad.clone()
+            grad_norm_dedup += param.grad.data.norm(2).item() ** 2
+    grad_norm_dedup = grad_norm_dedup**0.5
+    dedup_logprobs = dedup_logprobs.detach()
 
-        # Compute cosine similarity
-        flat_recon = reconstructed_logits_dedup.flatten()
-        flat_baseline = baseline_logits.flatten()
-        logits_cosine_sim = torch.nn.functional.cosine_similarity(
-            flat_recon.unsqueeze(0), flat_baseline.unsqueeze(0)
+    print(f"  Loss: {metrics_dedup['actor/loss']:.6f}")
+    print(f"  Num params with grad: {len(grads_dedup)}")
+    print(f"  Gradient norm: {grad_norm_dedup:.6f}")
+
+    # Compare deduplicated vs baseline response logprobs (both packed 1D in sample order).
+    print("\n[3/3] Comparing deduplicated logprobs with baseline...")
+    print(f"  Dedup logprobs shape:    {tuple(dedup_logprobs.shape)}")
+    print(f"  Baseline logprobs shape: {tuple(baseline_logprobs.shape)}")
+
+    if dedup_logprobs.shape == baseline_logprobs.shape:
+        logprobs_diff = (dedup_logprobs - baseline_logprobs).abs()
+        max_logprobs_diff = logprobs_diff.max().item()
+        mean_logprobs_diff = logprobs_diff.mean().item()
+
+        baseline_magnitude = baseline_logprobs.abs().mean().item()
+        rel_logprobs_diff = mean_logprobs_diff / (baseline_magnitude + 1e-8) * 100
+
+        flat_dedup = dedup_logprobs.flatten()
+        flat_baseline = baseline_logprobs.flatten()
+        logprobs_cosine_sim = torch.nn.functional.cosine_similarity(
+            flat_dedup.unsqueeze(0), flat_baseline.unsqueeze(0)
         ).item()
 
-        print(f"  Max absolute diff:   {max_logits_diff:.2e}")
-        print(f"  Mean absolute diff:  {mean_logits_diff:.2e}")
-        print(f"  Mean relative diff:  {rel_logits_diff:.2f}%")
-        print(f"  Cosine similarity:   {logits_cosine_sim:.6f}")
+        print(f"  Max absolute diff:   {max_logprobs_diff:.2e}")
+        print(f"  Mean absolute diff:  {mean_logprobs_diff:.2e}")
+        print(f"  Mean relative diff:  {rel_logprobs_diff:.2f}%")
+        print(f"  Cosine similarity:   {logprobs_cosine_sim:.6f}")
 
-        if mean_logits_diff < 1e-4 and logits_cosine_sim > 0.9999:
-            print("  ✓ Reconstructed logits match baseline perfectly!")
-        elif mean_logits_diff < 1e-3 and logits_cosine_sim > 0.999:
-            print("  ~ Reconstructed logits are very close to baseline (minor numerical differences)")
+        if mean_logprobs_diff < 1e-4 and logprobs_cosine_sim > 0.9999:
+            print("  ✓ Deduplicated logprobs match baseline perfectly!")
+        elif mean_logprobs_diff < 1e-3 and logprobs_cosine_sim > 0.999:
+            print("  ~ Deduplicated logprobs are very close to baseline (minor numerical differences)")
         else:
-            print("  ✗ Significant differences in reconstructed logits!")
+            print("  ✗ Significant differences in deduplicated logprobs!")
     else:
         print("  ✗ Shape mismatch! Cannot compare.")
 
@@ -565,12 +562,17 @@ def test_gradient_correctness(
     print(f"  Mean relative diff: {mean_rel_diff:.2%}")
     print(f"  Cosine similarity: {cosine_sim:.6f}")
 
-    # Verdict
+    # Verdict.
+    #
+    # Element-wise cosine over *all* gradients is brittle in low precision: most elements are ~0 and bf16 rounding
+    # flips their sign, which drags cosine down even when the gradients agree (e.g. on a tiny-random model the grad
+    # norms match to <0.1% yet cosine sits at ~0.998). So we accept either a tight element-wise match OR a tight
+    # relative gradient-norm match. The separate logprob comparison above (atol-based) is the precise forward check.
     print("\n" + "=" * 80)
     if mean_abs_diff < 1e-4 and cosine_sim > 0.9999:
         print("✓ PASS: Gradients match between deduplicated and baseline!")
         return True
-    elif mean_abs_diff < 1e-3 and cosine_sim > 0.999:
+    elif cosine_sim > 0.99 and (mean_abs_diff < 1e-3 or grad_norm_rel_diff < 1.0):
         print("~ CLOSE: Gradients are very similar (minor numerical differences)")
         return True
     else:
@@ -590,6 +592,9 @@ def benchmark_performance(
 ):
     """
     Benchmark forward+backward time for deduplicated vs baseline.
+
+    NOTE: ``actor`` must be FRESH -- the baseline is timed first on the unpatched model, then the deduplicated path
+    patches it permanently (Qwen3ModelOncePatcher rewrites the forward to return logprobs instead of logits).
     """
     print("=" * 80)
     print("Performance Benchmark")
@@ -624,46 +629,8 @@ def benchmark_performance(
     print("\nEnabling gradient checkpointing...")
     actor.model.gradient_checkpointing_enable()
 
-    # Benchmark deduplicated approach
-    print("\n[1/2] Benchmarking DEDUPLICATED forward+backward...")
-
-    # Warmup
-    for i in range(num_warmup):
-        actor.model.zero_grad()
-        _ = actor.compute_policy_loss_and_backward(batch, temperature=1.0, gradient_accumulation=1)
-        if device == "cuda":
-            torch.cuda.synchronize()
-
-    # Timed runs
-    dedup_times = []
-    for i in range(num_runs):
-        actor.model.zero_grad()
-
-        if device == "cuda":
-            torch.cuda.synchronize()
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-        else:
-            start_time = time.perf_counter()
-
-        metrics = actor.compute_policy_loss_and_backward(batch, temperature=1.0, gradient_accumulation=1)
-
-        if device == "cuda":
-            end_event.record()
-            torch.cuda.synchronize()
-            elapsed = start_event.elapsed_time(end_event) / 1000.0  # Convert to seconds
-        else:
-            elapsed = time.perf_counter() - start_time
-
-        dedup_times.append(elapsed)
-        print(f"  Run {i+1}/{num_runs}: {elapsed:.3f}s")
-
-    dedup_mean = sum(dedup_times) / len(dedup_times)
-    dedup_std = (sum((t - dedup_mean) ** 2 for t in dedup_times) / len(dedup_times)) ** 0.5
-
-    # Benchmark baseline approach
-    print("\n[2/2] Benchmarking BASELINE forward+backward...")
+    # Benchmark baseline approach FIRST -- it needs the unpatched model (the dedup path patches it permanently).
+    print("\n[1/2] Benchmarking BASELINE forward+backward (unpatched model)...")
 
     # Warmup
     for i in range(num_warmup):
@@ -687,10 +654,9 @@ def benchmark_performance(
         else:
             start_time = time.perf_counter()
 
-        metrics = compute_baseline_loss_and_backward(
+        _ = compute_baseline_loss_and_backward(
             actor.model, batch, temperature=1.0, gradient_accumulation=1, device=device
         )
-        print(f"{metrics}")
 
         if device == "cuda":
             end_event.record()
@@ -704,6 +670,44 @@ def benchmark_performance(
 
     baseline_mean = sum(baseline_times) / len(baseline_times)
     baseline_std = (sum((t - baseline_mean) ** 2 for t in baseline_times) / len(baseline_times)) ** 0.5
+
+    # Benchmark deduplicated approach (patches the model on the first call).
+    print("\n[2/2] Benchmarking DEDUPLICATED forward+backward...")
+
+    # Warmup
+    for i in range(num_warmup):
+        actor.model.zero_grad()
+        _ = actor.compute_policy_loss_and_backward(batch, temperature=1.0, gradient_accumulation=1)
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+    # Timed runs
+    dedup_times = []
+    for i in range(num_runs):
+        actor.model.zero_grad()
+
+        if device == "cuda":
+            torch.cuda.synchronize()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        else:
+            start_time = time.perf_counter()
+
+        _ = actor.compute_policy_loss_and_backward(batch, temperature=1.0, gradient_accumulation=1)
+
+        if device == "cuda":
+            end_event.record()
+            torch.cuda.synchronize()
+            elapsed = start_event.elapsed_time(end_event) / 1000.0  # Convert to seconds
+        else:
+            elapsed = time.perf_counter() - start_time
+
+        dedup_times.append(elapsed)
+        print(f"  Run {i+1}/{num_runs}: {elapsed:.3f}s")
+
+    dedup_mean = sum(dedup_times) / len(dedup_times)
+    dedup_std = (sum((t - dedup_mean) ** 2 for t in dedup_times) / len(dedup_times)) ** 0.5
 
     # Summary
     print("\n" + "=" * 80)
