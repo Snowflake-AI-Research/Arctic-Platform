@@ -7,12 +7,13 @@
 # Topology: 4 nodes x 8 GPUs = 32 GPUs, COLOCATE=True
 #   Pass Hydra overrides via "$@" to change training settings.
 #
-# Prerequisites:
-#   1. Preprocess data into ${DATA_DIR:-./data/bird_sql}/{train,val}.parquet
-#   2. pip install func_timeout
-#   3. Multi-node Ray cluster across your GPU nodes
-#   4. ArcticInference + arctic-verl installed in the active Python env
-#   5. Qwen/Qwen3-32B accessible via HuggingFace (set HF_HOME if using a local cache)
+# Prerequisites (see README.md):
+#   1. Preprocess data: python preprocess_bird.py
+#      Resulting parquets must live at $DATA_DIR/{train,val}.parquet
+#   2. Packages installed on every node (README "Install packages": requirements.txt + overrides.txt, plus the
+#      Snowflake verl fork installed editable)
+#   3. Multi-node ray cluster started across the participating nodes (bash restart_multi_ray.sh)
+#   4. Qwen/Qwen3-32B accessible via HuggingFace (set HF_HOME if using a local cache)
 
 set -x
 
@@ -36,6 +37,8 @@ export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
 export TORCH_COMPILE_DISABLE=1
+# Select the Arctic training client for verl's remote_backend=arctic path.
+export USE_ARCTIC_TRAINING_CLIENT=1
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${HOME}/.cache/vllm}"
 export VLLM_LOGGING_LEVEL=INFO
@@ -140,7 +143,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.nccl_timeout=1800 \
     trainer.use_legacy_worker_impl=disable \
-    trainer.use_arctic_rl=True \
+    trainer.remote_backend=arctic \
+    remote_backend=arctic \
     trainer.balance_batch=False \
     trainer.default_local_dir="${CHECKPOINT_DIR}" \
     trainer.resume_mode=disable \
@@ -155,18 +159,18 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     custom_reward_function.path="${SCRIPT_DIR}/bird_reward.py" \
     custom_reward_function.name=compute_score \
-    arctic_rl.colocate=True \
-    arctic_rl.sampling_tp_size=2 \
-    arctic_rl.training_gpus=$NGPU_PER_JOB \
-    arctic_rl.sampling_gpus=$NGPU_PER_JOB \
-    arctic_rl.log_prob_gpus=0 \
-    arctic_rl.weight_sync.cuda_ipc=True \
-    arctic_rl.weight_sync.low_memory=False \
-    arctic_rl.train.logits.optimization=memory \
-    arctic_rl.train.zorro_train.enable=True \
-    arctic_rl.train.zorro_train.max_rollouts=16 \
-    arctic_rl.train.deepspeed.zero_optimization.stage=3 \
-    arctic_rl.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \
-    arctic_rl.train.deepspeed.zero_optimization.offload_param.device=none \
+    remote_backend.colocate=True \
+    remote_backend.sampling_tp_size=2 \
+    remote_backend.training_gpus=$NGPU_PER_JOB \
+    remote_backend.sampling_gpus=$NGPU_PER_JOB \
+    remote_backend.log_prob_gpus=0 \
+    remote_backend.weight_sync.cuda_ipc=False \
+    remote_backend.weight_sync.low_memory=False \
+    remote_backend.train.logits.optimization=memory \
+    remote_backend.train.zorro_train.enable=True \
+    remote_backend.train.zorro_train.max_rollouts=16 \
+    remote_backend.train.deepspeed.zero_optimization.stage=3 \
+    remote_backend.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \
+    remote_backend.train.deepspeed.zero_optimization.offload_param.device=none \
     "$@" 2>&1 | tee "${LOG_FILE}"
 exit ${PIPESTATUS[0]}

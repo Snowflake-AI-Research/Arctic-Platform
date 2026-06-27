@@ -3,62 +3,100 @@
 GRPO training for **Qwen3-32B** on the BIRD SQL benchmark, served by [Arctic RL](../../../../arctic_platform/rl/)
 with the [ZoRRo](../../../../arctic_platform/rl/zorro_train/) trainer. Mirrors the hyperparameters of the stock-verl
 baseline at `verl_opensource/examples/bird_sql/run_qwen3_32b_bird_grpo.sh` so the two backends can be compared
-apples-to-apples on wall-clock speed.
+apples-to-apples on wall-clock speed. Pure GRPO, without a frozen reference model (no KL anchoring).
 
 * **Model:** Qwen/Qwen3-32B
-* **Topology:** 4 nodes × 8 H200 GPUs (32 GPUs), `colocate=True` with **3-way colocation** (training + sampling + ref
-  log-prob share each GPU bundle). Non-KL runs set `log_prob_gpus=0` (ZoRRo recomputes actor log-probs on the training
-  engine); KL runs set `log_prob_gpus=32` on the same bundles — no 50/50 GPU split needed.
+* **Topology:** 4 nodes × 8 H200 GPUs (32 GPUs total), `colocate=True` (training + sampling share each GPU bundle),
+  DeepSpeed ZeRO stage-3 with CPU optimizer offload, vLLM rollout (TP=2). Without KL there is no frozen reference
+  model, so the ref log-prob pool is disabled (`log_prob_gpus=0`); under ZoRRo log-probs are recomputed through the
+  training engine itself.
 * **Data:** [BIRD-SQL](https://bird-bench.github.io/) only — train on BIRD `train.json`, validate on BIRD `dev.json`.
   Spider / GretelAI are not used in this recipe.
 * **Reward:** SQLite execution-match against the gold SQL (`bird_reward.py`)
 
-## 1. Install packages
+## 1. Ray and multi-node hostfile
 
-First create a new virtual environment of your preference or use the existing one.
+When using a multi-node training environment Ray and DeepSpeed need a special file called `hostfile` (comes from MPI)
+that they use to find the participating nodes and the number of gpus on each node.
 
-We are going to use `uv` for much faster installations:
+Most likely your CSP already provides one for you, if that's the case please note its path on the filesystem.
+
+If you don't have one you need to create it. It looks like this:
+
+```
+10.1.1.1 slots=8
+10.1.1.2 slots=8
+10.1.1.3 slots=8
+10.1.1.4 slots=8
+```
+the first column is the IPs of the participating nodes, the second column is the number of gpus on each node.
+
+Export its path - the install step (and the launcher) use it to fan out across all nodes:
+```
+export JOB_HOSTFILE=/path/of/hostfile
+```
+(or you can change the `HOSTFILE` setting on top of both scripts)
+
+The Ray cluster itself is started later, in the Train step, once the environment is installed on every node.
+
+For a single-node run you can skip the hostfile — the launcher falls back to `NNODES=1` and uses the 8 GPUs of the
+local node.
+
+## 2. Install packages
+
+The steps below install the environment on **every** node via `ds_ssh` (the DeepSpeed multi-node helper, which reads
+`$JOB_HOSTFILE` from [step (1)](#1-ray-and-multi-node-hostfile)). They assume the environment lives on a shared
+filesystem, or that you otherwise make it available on each node.
+
+On the launching node, bootstrap `uv` (a much faster installer) and `ds_ssh`:
 ```bash
-pip install uv
+pip install uv             # bootstrap uv on the launching node
+uv pip install deepspeed   # provides ds_ssh
+ds_ssh -f $JOB_HOSTFILE pip install uv   # bootstrap uv on every other node
 ```
 
-Install the Arctic packages:
+Clone this repo (it carries `requirements.txt` and the launcher scripts) and the verl fork:
 ```bash
-uv pip install arctic-platform[rl] arctic-inference[server]
+git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
+git clone -b arctic_rl_share_v0.7.1 --single-branch https://github.com/Snowflake-AI-Research/verl
+cd Arctic-Platform/recipes/rl/verl/txt2sql
 ```
 
-Install Verl and its dependencies:
-
-Please note the assumption is cuda-12.9 - if you use a different version change the `torch` and `cuda-bindings` lines
-to the version you need.
-
-Also the arctic-inference patches vllm-0.18.0, therefore we explicitly install that one.
-
+Install the pinned dependencies on all nodes. The assumption is cuda-12.9 - if you use a different version change the
+`torch` index URL below and the `cuda-bindings` pin in `requirements.txt`. `arctic-inference` patches vllm-0.18.0, so
+that exact version is pinned in `requirements.txt`.
 ```bash
-git clone https://github.com/verl-project/verl
-cd verl
+# torch (CUDA 12.9) first, then the rest of the pinned packages.
+# overrides.txt forces the few transitive deps (flashinfer/numpy/transformers)
+# this recipe is validated against, which vLLM 0.18.0's metadata otherwise pins
+# higher (without it the single resolve is unsatisfiable).
+ds_ssh -f $JOB_HOSTFILE uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu129 -U
+ds_ssh -f $JOB_HOSTFILE uv pip install -r $PWD/requirements.txt --override $PWD/overrides.txt
 
+# flash-attn builds against the freshly installed torch
+ds_ssh -f $JOB_HOSTFILE uv pip install -U pip wheel packaging setuptools
+```
+
+To install flash attention, you can build it from source (may take a long time to build):
+```bash
+ds_ssh -f $JOB_HOSTFILE uv pip install flash-attn --no-build-isolation
+```
+or you can install directly from a wheel, find the automatic instructions
+[here](https://windreamer.github.io/flash-attention3-wheels/) or download directly from
+https://github.com/Dao-AILab/flash-attention/releases.
+
+Install verl (Snowflake fork) editable on all nodes:
+```bash
+cd ../../../../../verl
 grep -v flash-attn requirements.txt > requirements-no-fa.txt
-uv pip install -r requirements-no-fa.txt
-uv pip install -e .
-
-uv pip install -U pip wheel packaging setuptools
-uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu129 -U
-uv pip install cuda-bindings==12.9.0
-uv pip install vllm==0.18.0
-uv pip install psutil
-uv pip install flash-attn --no-build-isolation
-uv pip install numpy==1.26.4
-uv pip install transformers==4.57.6
-uv pip install flashinfer-python==0.5.3
+ds_ssh -f $JOB_HOSTFILE "cd $PWD && uv pip install -r requirements-no-fa.txt && uv pip install -e ."
+cd -
 ```
 
-The BIRD reward (`bird_reward.py`) executes the generated SQL at training time, so it also needs:
-```bash
-uv pip install func_timeout
-```
+The BIRD reward (`bird_reward.py`) executes the generated SQL with Python's standard library (`sqlite3`,
+`concurrent.futures`), so no extra packages are needed beyond `requirements.txt`.
 
-## 2. Get the raw BIRD data
+## 3. Get the raw BIRD data
 
 [BIRD-SQL](https://bird-bench.github.io/) ships `train.json`, `dev.json`, and per-database SQLite files plus per-table
 `database_description/*.csv` files (column-level semantic descriptions and value semantics).
@@ -87,7 +125,7 @@ After unzipping you should have:
     └── dev_databases/<db_id>/<db_id>.sqlite       (+ database_description/*.csv)
 ```
 
-## 3. Preprocess to verl parquets
+## 4. Preprocess to verl parquets
 
 `preprocess_bird.py` turns raw BIRD into verl-compatible parquets with **heavily augmented** training prompts and
 **clean** validation prompts.
@@ -133,11 +171,10 @@ This produces **~1.5 k val rows** matching the raw-BIRD evaluation contract.
 
 ### Run it
 
+From the recipe directory (`Arctic-Platform/recipes/rl/verl/txt2sql`, cloned in step 2), using the environment
+installed in step 2 (`pandas` / `datasets` / `transformers` come from `requirements.txt`):
+
 ```bash
-cd recipes/rl/verl/txt2sql
-
-pip install pandas datasets transformers numpy
-
 python preprocess_bird.py \
     --bird_dir /data/bird \
     --output_dir /data/snowflakesql/txt2sql \
@@ -164,44 +201,21 @@ Output:
 `--num_examples 0`, `--sample_rows 0`) and for adding Spider / GretelAI sources (`--sources bird spider gretelai`).
 Those are not used by this recipe, which trains on BIRD only.
 
-## 4. Ray and multi-node hostfile
+## 5. Train
 
-when using a multi-node training environment Ray and DeepSpeed need a special file called `hostfile` (comes from MPI)
-that they use to find the participating nodes and the number of gpus on each node.
-
-Most likely your CSP already provides one for you, if that's the case please note its path on the filesystem.
-
-If you don't have one you need to create it. It looks like this:
-
-```
-10.1.1.1 slots=8
-10.1.1.2 slots=8
-10.1.1.3 slots=8
-10.1.1.4 slots=8
-```
-the first column is the IPs of the participating nodes, the second column is the number of gpus on each node.
-
-now run:
-```
-export JOB_HOSTFILE=/path/of/hostfile
-```
-(or you can change the `HOSTFILE` setting on top of both scripts)
-
-now launch the multi-node ray launcher:
-```
+First start the Ray cluster across all nodes (now that the environment is installed everywhere, and `$JOB_HOSTFILE`
+is exported from step 1):
+```bash
 bash ./restart_multi_ray.sh
 ```
 
-For a single-node run you can skip the hostfile — the launcher falls back to `NNODES=1` and uses the 8 GPUs of the
-local node.
-
-## 5. Train
-
 The recipe `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` runs GRPO without a KL penalty (matches the verl baseline 1:1).
+It derives the node count from the `hostfile` set up in step 1 (`NGPU_PER_JOB = 8 × NNODES`); the documented topology
+is a **4-node × 8-GPU** Ray cluster (32 GPUs total).
 
-The script derives the node count from the `hostfile` set up in the previous step (`NGPU_PER_JOB = 8 × NNODES`); the
-documented topology is a **4-node × 8-GPU** Ray cluster (32 GPUs total). Override data paths or other settings via
-Hydra on the command line.
+Next edit the environment variables in `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` to match your setup. In particular:
+- `HF_HOME` - where your HF hub cache is (you can unset it as well)
+- `VLLM_CACHE_ROOT` - some path where vllm could cache its work
 
 ```bash
 bash run_qwen3_32b_bird_grpo_arl_zorro_yes.sh \
@@ -209,7 +223,7 @@ bash run_qwen3_32b_bird_grpo_arl_zorro_yes.sh \
     data.val_files=/data/snowflakesql/txt2sql/val.parquet
 ```
 
-The script defaults `DATA_DIR` to `/data/snowflakesql/txt2sql` (the preprocessing output from step 3), so if you kept
+The script defaults `DATA_DIR` to `/data/snowflakesql/txt2sql` (the preprocessing output from step 4), so if you kept
 that path you can launch with no overrides:
 
 ```bash
@@ -219,11 +233,18 @@ bash run_qwen3_32b_bird_grpo_arl_zorro_yes.sh
 Otherwise override the data paths inline (as above), set `DATA_DIR=...` in the environment, or edit `DATA_DIR` at the
 top of the script.
 
+The SQL reward is scored by `bird_reward.py` (shipped with this recipe and auto-wired in the launcher via
+`custom_reward_function`): it executes the model's predicted SQL against the row's SQLite database and compares the
+result set to the gold query's. Upstream `verl` has no built-in scorer for this `data_source`, so the recipe supplies
+its own — no extra setup needed.
+
 ## Files
 
 | File | What it is |
 | --- | --- |
 | `run_qwen3_32b_bird_grpo_arl_zorro_yes.sh` | GRPO + Arctic/ZoRRo recipe (no KL) |
 | `restart_multi_ray.sh` | Multi-node Ray launcher (reads the `hostfile`) |
+| `requirements.txt` | Pinned Python dependencies (installed with `--override overrides.txt`) |
+| `overrides.txt` | uv override-pins for vLLM 0.18.0's transitive deps |
 | `bird_reward.py` | SQLite-based exec-match reward (referenced via `custom_reward_function.path`) |
 | `preprocess_bird.py` | Raw BIRD JSON + SQLite → augmented verl parquets |
