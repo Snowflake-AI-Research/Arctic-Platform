@@ -1,0 +1,11 @@
+# uv override-dependencies for the Text2SQL (BIRD) recipe.
+#
+# vLLM 0.18.0's metadata hard-pins newer transitive deps than this recipe is
+# validated against (flashinfer-python==0.6.6, numpy>=2 via opencv, a newer
+# transformers). The recipe is validated with the versions below, so we force
+# them with `uv pip install -r requirements.txt --override overrides.txt`,
+# reproducing the original sequential "last install wins" behavior in a single
+# resolve.
+flashinfer-python==0.5.3
+numpy==1.26.4
+transformers==4.57.6
