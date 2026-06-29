@@ -1,19 +1,7 @@
 #!/bin/bash
-# GRPO training for Qwen3-32B on BIRD SQL using ArcticRL + Zorro.
-#
-# Arctic counterpart of the stock verl/vLLM BIRD baseline: same GRPO hyperparameters (batch size, LR, prompt/response
-# lengths, rollout.n) with ArcticRL colocate + Zorro for rollout and weight sync.
-#
-# Topology: 4 nodes x 8 GPUs = 32 GPUs, COLOCATE=True
-#   Pass Hydra overrides via "$@" to change training settings.
-#
-# Prerequisites (see README.md):
-#   1. Preprocess data: python preprocess_bird.py
-#      Resulting parquets must live at $DATA_DIR/{train,val}.parquet
-#   2. Packages installed on every node (README "Install packages": requirements.txt + overrides.txt, plus the
-#      Snowflake verl fork installed editable)
-#   3. Multi-node ray cluster started across the participating nodes (bash restart_multi_ray.sh)
-#   4. Qwen/Qwen3-32B accessible via HuggingFace (set HF_HOME if using a local cache)
+# Qwen3-32B GRPO on BIRD SQL with ArcticRL + Zorro (colocate, CUDA-IPC weight sync).
+# Arctic twin of the stock verl/vLLM BIRD baseline; learning hyperparameters match it.
+# 32 GPUs (4 x 8) from the hostfile. See README.md for data prep + ray cluster setup.
 
 set -x
 
@@ -30,22 +18,18 @@ export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}"
 
-
-# Do NOT set expandable_segments:True -- vLLM colocate sleep mode rejects it.
 unset PYTORCH_CUDA_ALLOC_CONF
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
 export TORCH_COMPILE_DISABLE=1
-# Select the Arctic training client for verl's remote_backend=arctic path.
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${HOME}/.cache/vllm}"
 export VLLM_LOGGING_LEVEL=INFO
 
 HOSTFILE="${JOB_HOSTFILE:-/data-fast/hostfile}"
 
-# Pre-launch /dev/shm cleanup: NCCL / vllm / sem files accumulate across runs and can fill the tmpfs after a few
-# iterations, killing raylets (SIGBUS / OOM). Cleanup is per-user. Best-effort.
+# Best-effort /dev/shm cleanup: stale NCCL/vllm/sem files can fill the tmpfs and kill raylets.
 if command -v ds_ssh >/dev/null 2>&1 && [[ -f "${HOSTFILE}" ]]; then
     ds_ssh -f "${HOSTFILE}" "find /dev/shm -maxdepth 1 -user \$USER \
         \( -name 'nccl-*' -o -name 'cuda.shm.*' -o -name 'arctic_ws_*' \
@@ -56,7 +40,7 @@ if command -v ds_ssh >/dev/null 2>&1 && [[ -f "${HOSTFILE}" ]]; then
         2>&1 | tail -10
 fi
 
-# NNODES is derived from the hostfile (one line per node); falls back to 1 for single-node runs.
+# NNODES from hostfile (one line per node); falls back to 1.
 if [[ -f ${HOSTFILE} ]]; then
     NNODES=$(wc -l < ${HOSTFILE})
 else
