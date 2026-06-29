@@ -1,30 +1,26 @@
 #!/bin/bash
-# GRPO training for Qwen3-32B on BIRD SQL using ArcticRL + Zorro (KL loss enabled).
+# GRPO training for Qwen3-32B on BIRD SQL using ArcticRL + Zorro.
 #
-# KL-enabled variant of run_qwen3_32b_bird_grpo_arl_zorro_yes.sh:
-#   - actor.use_kl_loss=True (ref model enabled for low_var_kl penalty)
-#   - arctic_rl.log_prob_gpus=32 (ref engine colocated on the same 32 GPUs)
-#
-# With 3-way colocation (training + sampling + log_prob on each bundle), no GPU
-# pool split is required — all three roles share the same 32-GPU Ray placement
-# group and time-share VRAM via sleep/wake/offload.
+# Arctic counterpart of the stock verl/vLLM BIRD baseline: same GRPO hyperparameters (batch size, LR, prompt/response
+# lengths, rollout.n) with ArcticRL colocate + Zorro for rollout and weight sync.
 #
 # Topology: 4 nodes x 8 GPUs = 32 GPUs, COLOCATE=True
 #   Pass Hydra overrides via "$@" to change training settings.
 #
-# Prerequisites:
-#   1. Preprocess data into ${DATA_DIR:-./data/bird_sql}/{train,val}.parquet
-#   2. pip install func_timeout
-#   3. Multi-node Ray cluster across your GPU nodes
-#   4. ArcticInference + arctic-verl installed in the active Python env
-#   5. Qwen/Qwen3-32B accessible via HuggingFace (set HF_HOME if using a local cache)
+# Prerequisites (see README.md):
+#   1. Preprocess data: python preprocess_bird.py
+#      Resulting parquets must live at $DATA_DIR/{train,val}.parquet
+#   2. Packages installed on every node (README "Install packages": requirements.txt + overrides.txt, plus the
+#      Snowflake verl fork installed editable)
+#   3. Multi-node ray cluster started across the participating nodes (bash restart_multi_ray.sh)
+#   4. Qwen/Qwen3-32B accessible via HuggingFace (set HF_HOME if using a local cache)
 
 set -x
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/outputs"
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/qwen3_32b_bird_grpo_arl_zorro_yes_kl_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/qwen3_32b_bird_grpo_arl_zorro_yes_$(date +%Y%m%d_%H%M%S).log"
 
 if [[ -n "${ARCTIC_VERL_ROOT:-}" ]]; then
     export PYTHONPATH="${ARCTIC_VERL_ROOT}:${PYTHONPATH:-}"
@@ -34,19 +30,41 @@ export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}"
 
+
 # Do NOT set expandable_segments:True -- vLLM colocate sleep mode rejects it.
 unset PYTORCH_CUDA_ALLOC_CONF
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
 export TORCH_COMPILE_DISABLE=1
+# Select the Arctic training client for verl's remote_backend=arctic path.
+export USE_ARCTIC_TRAINING_CLIENT=1
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${HOME}/.cache/vllm}"
 export VLLM_LOGGING_LEVEL=INFO
 
-NNODES=4
+HOSTFILE="${JOB_HOSTFILE:-/data-fast/hostfile}"
+
+# Pre-launch /dev/shm cleanup: NCCL / vllm / sem files accumulate across runs and can fill the tmpfs after a few
+# iterations, killing raylets (SIGBUS / OOM). Cleanup is per-user. Best-effort.
+if command -v ds_ssh >/dev/null 2>&1 && [[ -f "${HOSTFILE}" ]]; then
+    ds_ssh -f "${HOSTFILE}" "find /dev/shm -maxdepth 1 -user \$USER \
+        \( -name 'nccl-*' -o -name 'cuda.shm.*' -o -name 'arctic_ws_*' \
+           -o -name 'torch_*' -o -name 'sem.obj*' -o -name 'sem.hdr*' \
+           -o -name 'sem.loky-*' -o -name 'psm_*' -o -name 'plasma*' \) \
+        -delete 2>/dev/null; \
+        echo \"\$(hostname): /dev/shm \$(df -h /dev/shm | tail -1 | awk '{print \$3\"/\"\$2}')\"" \
+        2>&1 | tail -10
+fi
+
+# NNODES is derived from the hostfile (one line per node); falls back to 1 for single-node runs.
+if [[ -f ${HOSTFILE} ]]; then
+    NNODES=$(wc -l < ${HOSTFILE})
+else
+    NNODES=1
+fi
 NGPU_PER_NODE=8
-NGPU_PER_JOB=32
+NGPU_PER_JOB=$((NGPU_PER_NODE*NNODES))
 
 gpu_name=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader -i 0 2>/dev/null || true)
 if [[ $gpu_name == *"H200"* ]]; then
@@ -57,9 +75,9 @@ else
     flash_attention_v=flash_attention_2
 fi
 
-DATA_DIR="${DATA_DIR:-${SCRIPT_DIR}/data/bird_sql}"
+DATA_DIR="${DATA_DIR:-/data/snowflakesql/txt2sql}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-${SCRIPT_DIR}/outputs/checkpoints/qwen3_32b_bird_grpo_arl_zorro_yes_kl/${RUN_ID}}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${SCRIPT_DIR}/outputs/checkpoints/qwen3_32b_bird_grpo_arl_zorro_yes/${RUN_ID}}"
 mkdir -p "${CHECKPOINT_DIR}"
 
 echo "NNODES=${NNODES} NGPU_PER_JOB=${NGPU_PER_JOB} CHECKPOINT_DIR=${CHECKPOINT_DIR}"
@@ -88,13 +106,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_torch_compile=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=98304 \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.clip_ratio=0.2 \
-    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
@@ -125,13 +143,14 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.nccl_timeout=1800 \
     trainer.use_legacy_worker_impl=disable \
-    trainer.use_arctic_rl=True \
+    trainer.remote_backend=arctic \
+    remote_backend=arctic \
     trainer.balance_batch=False \
     trainer.default_local_dir="${CHECKPOINT_DIR}" \
     trainer.resume_mode=disable \
     trainer.logger="['console']" \
     trainer.project_name=arctic_rl_bird_sql \
-    trainer.experiment_name=qwen3_32b_bird_grpo_arl_zorro_yes_kl \
+    trainer.experiment_name=qwen3_32b_bird_grpo_arl_zorro_yes \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
@@ -140,18 +159,18 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     custom_reward_function.path="${SCRIPT_DIR}/bird_reward.py" \
     custom_reward_function.name=compute_score \
-    arctic_rl.colocate=True \
-    arctic_rl.sampling_tp_size=2 \
-    arctic_rl.training_gpus=32 \
-    arctic_rl.sampling_gpus=32 \
-    arctic_rl.log_prob_gpus=32 \
-    arctic_rl.weight_sync.cuda_ipc=True \
-    arctic_rl.weight_sync.low_memory=False \
-    arctic_rl.train.logits.optimization=memory \
-    arctic_rl.train.zorro_train.enable=True \
-    arctic_rl.train.zorro_train.max_rollouts=16 \
-    arctic_rl.train.deepspeed.zero_optimization.stage=3 \
-    arctic_rl.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \
-    arctic_rl.train.deepspeed.zero_optimization.offload_param.device=none \
+    remote_backend.colocate=True \
+    remote_backend.sampling_tp_size=2 \
+    remote_backend.training_gpus=$NGPU_PER_JOB \
+    remote_backend.sampling_gpus=$NGPU_PER_JOB \
+    remote_backend.log_prob_gpus=0 \
+    remote_backend.weight_sync.cuda_ipc=False \
+    remote_backend.weight_sync.low_memory=False \
+    remote_backend.train.logits.optimization=memory \
+    remote_backend.train.zorro_train.enable=True \
+    remote_backend.train.zorro_train.max_rollouts=16 \
+    remote_backend.train.deepspeed.zero_optimization.stage=3 \
+    remote_backend.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \
+    remote_backend.train.deepspeed.zero_optimization.offload_param.device=none \
     "$@" 2>&1 | tee "${LOG_FILE}"
 exit ${PIPESTATUS[0]}

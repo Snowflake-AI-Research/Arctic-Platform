@@ -21,17 +21,14 @@ during forward and backward passes, reducing computation while maintaining
 gradient correctness.
 """
 
-from .actor import DeduplicatedActor
-from .module_patcher import ModuleReconstructionPatcher
-from .qwen_attention_patcher import QwenAttentionPatcher
-from .qwen_model_patcher import Qwen3ModelPatcher
+from .qwen_attention_patcher import QwenAttentionOncePatcher
+from .qwen_model_patcher import Qwen3ModelOncePatcher
 from .qwen_model_patcher import ReconstructionInfo
 from .zorro_train import ZoRRoTrain
 
 __all__ = [
-    "DeduplicatedActor",
-    "ModuleReconstructionPatcher",
-    "Qwen3ModelPatcher",
-    "QwenAttentionPatcher",
-    "ReconstructionInfoZoRRoTrain",
+    "Qwen3ModelOncePatcher",
+    "QwenAttentionOncePatcher",
+    "ReconstructionInfo",
+    "ZoRRoTrain",
 ]

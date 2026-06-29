@@ -1,4 +1,6 @@
-# Prompt Deduplication Optimization for RL Training
+# ZoRRo Train: Prompt Deduplication Optimization for RL Training
+
+ZoRRo stands for Zero Redundancy Rollouts.
 
 ## Motivation
 
@@ -89,25 +91,38 @@ The split attention approach saves additional computation by avoiding redundant 
 
 ### Architecture
 
-The implementation uses **monkey patching** to intercept attention modules:
+The optimization is delivered by **monkey-patching** a Hugging Face Qwen3 model.
+There are two patchers:
+
+- **`Qwen3ModelOncePatcher`** and **`QwenAttentionOncePatcher`** — patched once onto the model by the
+  DeepSpeed worker (`arctic_platform/rl/deepspeed_worker.py`). Called with the full
+  `[B, S]` batch, it deduplicates shared prompts internally, runs the packed
+  forward/backward, and returns per-response-token `logprobs` / `entropy` in the
+  original sample order (no padding). This is the path exercised by the GPU tests
+  (`tests/zorro_train/test_once_patcher.py`).
+- **`Qwen3ModelPatcher`** + **`QwenAttentionPatcher`** — a
+  context-manager harness driven by `DeduplicatedActor`, used for the demo and
+  gradient-correctness reference. And which could also be adapted to do the same work patching and unpatching the model before each batch.
+
+The main functionality can be viewed as:
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│  DeduplicatedActor                                   │
+│  ZoRRoTrain                                          |
 │  ┌────────────────────────────────────────────────┐  │
 │  │  1. Find prompt groups                         │  │
 │  │  2. Create deduplicated batch                  │  │
 │  │  ┌──────────────────────────────────────────┐  │  │
-│  │  │  Qwen3ModelPatcher (context manager)     │  │  │
+│  │  │  Qwen3ModelOncePatcher                   │  │  │
 │  │  │  ┌────────────────────────────────────┐  │  │  │
-│  │  │  │  QwenAttentionPatcher               │  │  │  │
-│  │  │  │  - Intercepts attention forward()   │  │  │  │
-│  │  │  │  - Applies deduplication logic      │  │  │  │
-│  │  │  │  - Reconstructs outputs             │  │  │  │
+│  │  │  │  QwenAttentionOncePatcher          │  │  │  │
+│  │  │  │  - Intercepts attention forward()  │  │  │  │
+│  │  │  │  - Applies deduplication logic     │  │  │  │
+│  │  │  │  - Reconstructs outputs            │  │  │  │
 │  │  │  └────────────────────────────────────┘  │  │  │
 │  │  │  Model Forward Pass                      │  │  │
 │  │  └──────────────────────────────────────────┘  │  │
-│  │  3. Reconstruct logits to original batch      │  │
+│  │  3. Reconstruct logits to original batch       │  │
 │  └────────────────────────────────────────────────┘  │
 │  Backward Pass (with patching active)                │
 └──────────────────────────────────────────────────────┘
@@ -117,7 +132,7 @@ The implementation uses **monkey patching** to intercept attention modules:
 
 ✅ **Mathematically Correct**: Gradients match baseline implementation (within numerical precision)
 ✅ **Transparent**: Works as a drop-in replacement for standard forward/backward
-✅ **Flexible**: Supports multiple attention implementations (SDPA, Flash Attention 2/3)
+✅ **Flexible**: Supports multiple attention implementations (eager, Flash Attention 2/3)
 ✅ **Gradient Checkpointing**: Compatible with activation checkpointing
 ✅ **Mixed Precision**: Optimized for `bfloat16` training
 
@@ -139,15 +154,16 @@ pip install flash-attn --no-build-isolation
 ### Basic Usage
 
 ```python
-from dedup_prompt_optimization.actor import DeduplicatedActor
-from dedup_prompt_optimization.tests import create_dummy_batch
+from arctic_platform.rl.zorro_train.actor import DeduplicatedActor
+from arctic_platform.rl.zorro_train.tests import create_dummy_batch
 
-# Initialize actor with deduplication
+# Initialize the actor; it installs Qwen3ModelOncePatcher onto the model on first forward.
 actor = DeduplicatedActor(
-    model_name_or_path="Qwen/Qwen3-4B",
+    model_name_or_path="Qwen/Qwen3-0.6B",
     device="cuda",
-    use_split_attention=True,  # Use optimized split attention (default)
-    attn_implementation="flash_attention_3"  # or "sdpa", "flash_attention_2"
+    logits_optimization="none",      # "none" | "compute" | "memory" ("memory" needs a process group)
+    use_split_attention=True,        # split attention (prompt-to-prompt + response-to-full)
+    attn_implementation="eager",     # or "flash_attention_2" / "flash_attention_3"
 )
 
 # Create a batch with shared prompts
@@ -157,15 +173,14 @@ batch = create_dummy_batch(
     prompt_len=4096,
     response_len=512,
     device="cuda",
-    include_training_fields=True
+    include_training_fields=True,
+    add_padding=True,
 )
 
-# Forward pass (automatically deduplicates)
-entropy, log_probs = actor._forward_micro_batch(
-    batch,
-    temperature=1.0,
-    calculate_entropy=True
-)
+# Forward pass (automatically deduplicates). logprobs/entropy are packed 1D in original
+# sample order (valid response tokens only), e.g. shape (num_valid_response_tokens,).
+output = actor.forward(batch, temperature=1.0, calculate_entropy=True)
+log_probs, entropy = output.logprobs, output.entropy
 
 # Training step with backward pass
 actor.model.train()
@@ -181,26 +196,44 @@ print(f"Policy loss: {metrics['actor/policy_loss']:.4f}")
 ### Running the Demo
 
 ```bash
-cd dedup_prompt_optimization
-python demo.py
+python arctic_platform/rl/zorro_train/demo.py
 ```
 
 This will run:
-1. A simple forward pass demonstration
-2. A gradient correctness test
-3. An optional performance benchmark
+1. A gradient/logprob correctness test (deduplicated vs. baseline)
+2. An optional performance benchmark
+
+### Supported models
+
+Currently ZoRRo Train supports these model families:
+
+* qwen3
+* qwen3-moe
+* qwen3-next-moe
+* qwen3.6
+* qwen3.6-moe
+
+This spans dense, MoE, and hybrid (linear + full attention) architectures, and **more models will be added in the future**.
 
 ### Testing
 
-The maintained correctness tests live in the top-level test suite:
+The maintained correctness tests live in the top-level test suite (`tests/zorro_train/`):
 
 ```bash
-pytest tests/zorro_train/        # CPU dedup-algorithm round-trips + GPU Qwen3ModelOncePatcher forward/backward
+pytest tests/zorro_train/                          # everything below
+
+pytest tests/zorro_train/test_dedup.py             # CPU: dedup-algorithm round-trips (no model)
+pytest tests/zorro_train/test_once_patcher.py      # GPU: Qwen3ModelOncePatcher forward/backward vs reference
+pytest tests/zorro_train/test_seqlen_balancing.py  # CPU: sequence-length balancing
 ```
+
+`test_once_patcher.py` sweeps the `tiny-random` Qwen3 checkpoints (dense, MoE, hybrid),
+both `flash_attention_2` and `eager`, padded/unpadded batches, and all three
+`logits_optimization` modes (`none` / `memory` / `compute`).
 
 **Performance Benchmark:**
 ```bash
-python test_perf.py
+python arctic_platform/rl/zorro_train/test_perf.py
 ```
 
 Measures forward and backward pass speedup on large batches with prompt deduplication.
@@ -223,81 +256,108 @@ Expected speedups depend on the deduplication ratio:
 ## Project Structure
 
 ```
-zorro_train/
-├── README.md                      # This file
-├── __init__.py
-├── actor.py                       # Main actor class with deduplication
-├── prompt_deduplicator.py         # Core deduplication logic
-├── qwen_model_patcher.py          # Model-level patching (logits reconstruction)
-├── qwen_attention_patcher.py      # Attention-level patching
-├── module_patcher.py              # Base patcher utilities
-├── demo.py                        # Interactive demonstration
-├── test_perf.py                   # Performance benchmark
-└── tests.py                       # Utility functions for testing
+arctic_platform/rl/zorro_train/
+├── README.md                  # This file
+├── __init__.py                # Public exports (ZoRRoTrain, Qwen3ModelOncePatcher, QwenAttentionOncePatcher, ReconstructionInfo)
+├── zorro_train.py             # Core dedup algorithm: ZoRRoTrain + ReconstructionInfo
+├── actor.py                   # DeduplicatedActor reference harness (demo / correctness)
+├── qwen_model_patcher.py      # Qwen3ModelOncePatcher (production), Qwen3ModelPatcher, logprob/entropy kernels
+├── qwen_attention_patcher.py  # Attention-level patching (reference path)
+├── module_patcher.py          # ModuleReconstructionPatcher base class
+├── seqlen_balancing.py        # Sequence-length balancing across micro-batches
+├── demo.py                    # Interactive demonstration
+├── test_perf.py               # Performance benchmark
+└── tests.py                   # Batch builders + gradient/perf helpers (create_dummy_batch, ...)
 ```
 
-Correctness tests were migrated to `tests/zorro_train/` (CPU dedup-algorithm round-trips and GPU
-`Qwen3ModelOncePatcher` forward/backward).
+Correctness tests live under `tests/zorro_train/`: `test_dedup.py` (CPU dedup-algorithm
+round-trips), `test_once_patcher.py` (GPU `Qwen3ModelOncePatcher` forward/backward), and
+`test_seqlen_balancing.py` (CPU sequence-length balancing).
 
 ## API Reference
 
+The core algorithm and production patchers are re-exported from the package root:
+
+```python
+from arctic_platform.rl.zorro_train import (
+    ZoRRoTrain,
+    Qwen3ModelOncePatcher,
+    QwenAttentionOncePatcher,
+    ReconstructionInfo,
+)
+# Reference harness / reference patchers (imported from their submodules):
+from arctic_platform.rl.zorro_train.actor import DeduplicatedActor
+from arctic_platform.rl.zorro_train.qwen_model_patcher import Qwen3ModelPatcher
+from arctic_platform.rl.zorro_train.qwen_attention_patcher import QwenAttentionPatcher
+from arctic_platform.rl.zorro_train.module_patcher import ModuleReconstructionPatcher
+```
+
 ### `DeduplicatedActor`
 
-Main class for running forward and backward passes with deduplication.
+Reference harness around `Qwen3ModelOncePatcher` (the production patcher) for running deduplicated
+forward and backward passes; used by the demo and as a usage example.
 
 **Constructor:**
 ```python
 DeduplicatedActor(
     model_name_or_path: str,
     device: str = "cuda",
-    patcher_class = None,  # Auto-detected
+    logits_optimization: str = "none",     # "none" | "compute" | "memory"
     use_split_attention: bool = True,
-    attn_implementation: str = "sdpa"
+    attn_implementation: str = "eager",    # or "flash_attention_2"
+    world_size: int = 1,
+    max_token_len: int = 4096,
+    dtype: torch.dtype = torch.bfloat16,
 )
 ```
 
 **Methods:**
-- `_forward_micro_batch(micro_batch, temperature=1.0, calculate_entropy=False)`: Forward pass with deduplication
-- `compute_policy_loss_and_backward(micro_batch, temperature=1.0, gradient_accumulation=1)`: PPO training step
+- `forward(micro_batch, temperature=1.0, calculate_entropy=False)`: Deduplicated forward; returns `ModelOutput(logprobs, entropy)` as packed 1D tensors (valid response tokens, original sample order)
+- `_forward_micro_batch(micro_batch, temperature=1.0, calculate_entropy=False)`: Convenience wrapper returning `(entropy, log_probs)`
+- `compute_policy_loss_and_backward(micro_batch, temperature=1.0, gradient_accumulation=1)`: PPO training step (forward + backward)
+- `patch(response_len, rollout_n, temperature)`: (Re)install `Qwen3ModelOncePatcher` on the model
 
 ### `ZoRRoTrain`
 
-Static utility class for deduplication operations.
+Static utility class implementing the core (model-free) deduplication tensor logic.
 
 **Key Methods:**
-- `find_prompt_groups(input_ids, response_length)`: Identify shared prompts
-- `create_deduplicated_batch(input_ids, position_ids, response_length, prompt_groups, unique_prompts)`: Create deduplicated batch
-- `reconstruct_sequences(dedup_hidden, reconstruction_info)`: Reconstruct full batch from deduplicated output
+- `find_prompt_groups(input_ids, response_length)`: Group rows by prompt identity; returns `(prompt_groups, unique_prompts)`
+- `create_deduplicated_batch(input_ids, position_ids, response_length, prompt_groups, unique_prompts, attention_mask=None, use_unpad=False)`: Pack each unique prompt followed by its responses; returns `(dedup_input_ids, position_ids, reconstruction_info)`
+- `reconstruct_sequences(dedup_hidden, reconstruction_info)`: Reconstruct the full batch from deduplicated per-token output
+- `deduplicate_sequences(full_hidden, reconstruction_info)`: Inverse of `reconstruct_sequences`
+- `extract_unpadded_responses_from_deduped_packed_ids(packed_ids, reconstruction_info, offset=0)`: Pull each rollout's own response tokens from the packed sequence
+- `responses_in_orig_sample_order(packed_responses, reconstruction_info)`: Undo the prompt-group permutation back to original sample order
+
+`reconstruction_info` is a `ReconstructionInfo` (dict subclass) returned by
+`create_deduplicated_batch` and threaded through the reconstruct/deduplicate helpers.
 
 ## Limitations & Future Work
 
 **Current Limitations:**
-- Only supports Qwen models (extensible to other architectures)
-- Requires all sequences in a batch to have the same length (no padding support)
 - Best speedups require identical prompts (partial overlap not exploited)
 
 **Future Directions:**
 - Support for other model architectures (Llama, Mistral, etc.)
-- Dynamic padding support
 - Prefix caching for partially overlapping prompts
-- Multi-GPU distributed training integration
 
 ## Citation
 
 If you use this optimization in your research, please consider citing:
 
 ```bibtex
-@misc{prompt_deduplication_2025,
-  title={Prompt Deduplication for Efficient RL Training},
-  author={Your Name},
+@misc{zorro_train_2025,
+  title={ZoRRo Train: Zero Redundancy Rollouts for Efficient RL Training},
+  author={Snowflake AI Research},
   year={2025},
-  howpublished={\url{https://github.com/yourrepo/dedup_prompt_optimization}}
+  howpublished={\url{https://github.com/Snowflake-AI-Research/Arctic-Platform}}
 }
 ```
 
 ## License
 
-[Specify your license here]
+Apache License 2.0. See the repository
+[LICENSE](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/main/LICENSE).
 
 ## Acknowledgments
 

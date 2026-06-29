@@ -16,8 +16,8 @@
 """
 SQL reward function for BIRD RL training, adapted from SnowflakeDialectSQLRewardManagerV6b.
 
-Uses SQLite execution instead of Snowflake. Compatible with verl's
-custom_reward_function mechanism via compute_score().
+Uses SQLite execution instead of Snowflake. Compatible with verl's custom_reward_function mechanism via
+compute_score().
 
 Reward scheme (matching V6b non-semantic-model behavior):
     1.0  - Predicted SQL produces the same result set as gold SQL
