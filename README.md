@@ -118,6 +118,12 @@ cd Arctic-Platform
 pip install -e .[rl]
 ```
 
+# Use of AI Disclaimer
+
+In these early days of transitioning to AI-supported projects it's important to communicate to users how AI was used in the code base.
+
+As of this writing the heavy lifting of designing and writing the core was done by humans. The test suite creation and various consistency checking was done by Claude, while super-vised and guided by humans.
+
 # Citation
 
 If you use Arctic Platform in your research, please consider citing:
