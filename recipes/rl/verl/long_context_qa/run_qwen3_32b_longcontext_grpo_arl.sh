@@ -110,18 +110,20 @@ MODEL=Qwen/${MODEL_SHORT}
 
 experiment_name="longcontext_grpo_${MODEL_SHORT}_ngpu${NGPU_PER_JOB}_gbs${BSZ}_mbs${UBS}_rolln${ROLL_N}_arl_z${ARCTIC_ZERO_STAGE}"
 
-# feel free to change below to hardcoded a particular attention implementation - the following logic tries to pick
-# the best impelementation based on the gpu name
-gpu_name=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader -i 0)
-if [[ $gpu_name == *"H100"* ]] || [[ $gpu_name == *"H200"* ]] ; then
-    echo "Running on Hopper"
-    flash_attention_v=flash_attention_3
-elif [[ $gpu_name == *"B200"* ]] || [[ $gpu_name == *"B300"* ]] ; then
-    echo "Running on Blackwell"
-    flash_attention_v=flash_attention_2
-else
-    echo "Running on unknown: $gpu_name; don't know which FA version to use"
-fi
+flash_attention_v=flash_attention_2
+
+# To auto-select the attention implementation based on the GPU type instead,
+# comment out the line above and uncomment the block below.
+# gpu_name=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader -i 0)
+# if [[ $gpu_name == *"H100"* ]] || [[ $gpu_name == *"H200"* ]] ; then
+#     echo "Running on Hopper"
+#     flash_attention_v=flash_attention_3
+# elif [[ $gpu_name == *"B200"* ]] || [[ $gpu_name == *"B300"* ]] ; then
+#     echo "Running on Blackwell"
+#     flash_attention_v=flash_attention_2
+# else
+#     echo "Running on unknown: $gpu_name; don't know which FA version to use"
+# fi
 
 # Data: LoongRL-Train-Data merged across HotpotQA + MuSiQue + 2WikiMQA, 16K context
 DATA_DIR="/data/snowflakesql/long-context"
