@@ -49,14 +49,18 @@ fi
 NGPU_PER_NODE=8
 NGPU_PER_JOB=$((NGPU_PER_NODE*NNODES))
 
-gpu_name=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader -i 0 2>/dev/null || true)
-if [[ $gpu_name == *"H200"* ]]; then
-    flash_attention_v=flash_attention_3
-elif [[ $gpu_name == *"B200"* ]] || [[ $gpu_name == *"B300"* ]]; then
-    flash_attention_v=flash_attention_2
-else
-    flash_attention_v=flash_attention_2
-fi
+flash_attention_v=flash_attention_2
+
+# To auto-select the attention implementation based on the GPU type instead,
+# comment out the line above and uncomment the block below.
+# gpu_name=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader -i 0 2>/dev/null || true)
+# if [[ $gpu_name == *"H200"* ]]; then
+#     flash_attention_v=flash_attention_3
+# elif [[ $gpu_name == *"B200"* ]] || [[ $gpu_name == *"B300"* ]]; then
+#     flash_attention_v=flash_attention_2
+# else
+#     flash_attention_v=flash_attention_2
+# fi
 
 DATA_DIR="${DATA_DIR:-/data/snowflakesql/txt2sql}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
