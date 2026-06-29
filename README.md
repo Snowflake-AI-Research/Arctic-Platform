@@ -56,11 +56,17 @@ config = ArcticRLClientConfig(
 client = create_arctic_rl_client(config)
 ```
 
-The reference integration is [verl](https://github.com/verl-project/verl) ([https://github.com/verl-project/verl/pull/6422](https://github.com/verl-project/verl/pull/6422)), which drives Arctic RL from its PPO/GRPO trainer. End-to-end recipes live under [recipes/rl/verl](recipes/rl/verl/), including a [simple single-GPU GSM8K](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/verl/simple) starter, [Txt2SQL](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/verl/txt2sql) and [long-context QA](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/verl/long_context_qa).
+### Integrated
 
-The other upcoming integration is into [SkyRL](https://github.com/Snowflake-AI-Research/SkyRL/pull/1).
+1. [SkyRL])https://github.com/NovaSky-AI/SkyRL/pull/1837)
 
-Multiple additional frameworks integrations are in the works and will be added here once available.
+### Integration is done but not yet merged
+
+1. Verl. The reference integration is [verl](https://github.com/verl-project/verl) ([https://github.com/verl-project/verl/pull/6422](https://github.com/verl-project/verl/pull/6422)), which drives Arctic RL from its PPO/GRPO trainer. End-to-end recipes live under [recipes/rl/verl](recipes/rl/verl/), including a [simple single-GPU GSM8K](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/verl/simple) starter, [Txt2SQL](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/verl/txt2sql) and [long-context QA](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/verl/long_context_qa).
+
+### Upcoming integrations
+
+Multiple additional frameworks integrations are in the works and will be added here once available. We are in various stages of planning or working on integration into TRL, Axolotl, unsloth, PrimeRL and potentially others.
 
 ### ZoRRo Train
 
