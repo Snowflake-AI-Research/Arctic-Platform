@@ -95,13 +95,18 @@ $ENV/ds_ssh -f $JOB_HOSTFILE "$ENV/uv pip install --python $ENV/python -r $PWD/r
 $ENV/ds_ssh -f $JOB_HOSTFILE "$ENV/uv pip install --python $ENV/python -U pip wheel packaging setuptools"
 ```
 
-To install flash attention, you can build it from source (may take a long time to build):
+The launcher uses `flash_attention_2` by default, which the `flash-attn` package below
+provides. You can build it from source (may take a long time to build):
 ```bash
 $ENV/ds_ssh -f $JOB_HOSTFILE "$ENV/uv pip install --python $ENV/python flash-attn --no-build-isolation"
 ```
-or you can install directly from a wheel, find the automatic instructions
-[here](https://windreamer.github.io/flash-attention3-wheels/) or download directly from
+or download a prebuilt FA2 wheel directly from
 https://github.com/Dao-AILab/flash-attention/releases.
+
+To use `flash_attention_3` instead (faster on Hopper), install the matching `flash_attn_3`
+wheel (find prebuilt FA3 wheels [here](https://windreamer.github.io/flash-attention3-wheels/)),
+then enable it in the launcher: comment out the `flash_attention_v=flash_attention_2` line
+and uncomment the GPU-type auto-selection block beneath it.
 
 Install verl (Snowflake fork) editable on all nodes (the source is shared, but the editable install must register it
 in each node's env):
