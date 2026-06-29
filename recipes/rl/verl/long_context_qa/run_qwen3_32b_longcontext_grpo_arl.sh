@@ -89,7 +89,7 @@ UBS=8                    # actor / rollout / ref micro_batch_size_per_gpu
 ROLL_N=8                 # actor_rollout_ref.rollout.n
 PROMPT_LEN=16384
 RESPONSE_LEN=4096
-MAX_TOKENS_PER_GPU=49152 # actor.ppo_max_token_len_per_gpu (>= prompt_len + ROLL_N * response_len for Zorro tiles)
+MAX_TOKENS_PER_GPU=81920 # actor.ppo_max_token_len_per_gpu (>= prompt_len + ROLL_N * response_len for Zorro tiles)
 ROLLOUT_MAX_BATCHED=32768
 LR=1e-6
 CLIP_RATIO=0.2
@@ -179,13 +179,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=$ROLLOUT_NAME \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     actor_rollout_ref.rollout.agent.num_workers=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.free_cache_engine=$FREE_CACHE_ENGINE \
     actor_rollout_ref.rollout.n=$ROLL_N \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.calculate_log_probs=$LOG_PROBS \
-    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_num_seqs=256 \
     actor_rollout_ref.rollout.max_num_batched_tokens=$ROLLOUT_MAX_BATCHED \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
@@ -213,6 +213,9 @@ python3 -m verl.trainer.main_ppo \
     remote_backend.log_prob_gpus=$NGPU_FOR_LOG_PROBS \
     remote_backend.sampling_gpus=$NGPU_PER_JOB \
     remote_backend.sampling_tp_size=$TP_SIZE \
+    remote_backend.weight_sync.cuda_ipc=True \
+    remote_backend.weight_sync.low_memory=False \
+    remote_backend.rollout.zorro_inference.enable=True \
     remote_backend.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \
     remote_backend.train.deepspeed.zero_optimization.offload_param.device=none \
     remote_backend.train.deepspeed.zero_optimization.stage=$ARCTIC_ZERO_STAGE \
@@ -220,5 +223,4 @@ python3 -m verl.trainer.main_ppo \
     remote_backend.train.zorro_train.enable=$USE_ARCTIC_ZORRO \
     remote_backend.train.zorro_train.max_rollouts=$ROLL_N \
     remote_backend.training_gpus=$NGPU_PER_JOB \
-    remote_backend.weight_sync.cuda_ipc=False \
     "$@" 2>&1 | tee $experiment_name.log
