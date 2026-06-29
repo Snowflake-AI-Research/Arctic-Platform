@@ -77,19 +77,21 @@ MODEL=Qwen/${MODEL_SHORT}
 
 experiment_name="gsm8k_grpo_${MODEL_SHORT}_ngpu${NGPU_PER_JOB}_gbs${BSZ}_mbs${UBS}_rolln${ROLL_N}_arl_z${ARCTIC_ZERO_STAGE}"
 
-# feel free to change below to hardcode a particular attention implementation - the following logic tries to pick the
-# best implementation based on the gpu name
-gpu_name=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader -i 0)
-if [[ $gpu_name == *"H100"* ]] || [[ $gpu_name == *"H200"* ]] ; then
-    echo "Running on Hopper"
-    flash_attention_v=flash_attention_3
-elif [[ $gpu_name == *"B200"* ]] || [[ $gpu_name == *"B300"* ]] ; then
-    echo "Running on Blackwell"
-    flash_attention_v=flash_attention_2
-else
-    echo "Running on unknown: $gpu_name; defaulting to flash_attention_2"
-    flash_attention_v=flash_attention_2
-fi
+flash_attention_v=flash_attention_2
+
+# To auto-select the attention implementation based on the GPU type instead,
+# comment out the line above and uncomment the block below.
+# gpu_name=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader -i 0)
+# if [[ $gpu_name == *"H100"* ]] || [[ $gpu_name == *"H200"* ]] ; then
+#     echo "Running on Hopper"
+#     flash_attention_v=flash_attention_3
+# elif [[ $gpu_name == *"B200"* ]] || [[ $gpu_name == *"B300"* ]] ; then
+#     echo "Running on Blackwell"
+#     flash_attention_v=flash_attention_2
+# else
+#     echo "Running on unknown: $gpu_name; defaulting to flash_attention_2"
+#     flash_attention_v=flash_attention_2
+# fi
 
 # Data: GSM8K parquets produced by download_data.py
 DATA_DIR="${DATA_DIR:-${HOME}/data/gsm8k}"
