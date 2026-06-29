@@ -58,7 +58,7 @@ client = create_arctic_rl_client(config)
 
 ### Integrated
 
-1. [SkyRL])https://github.com/NovaSky-AI/SkyRL/pull/1837)
+1. [SkyRL](https://github.com/NovaSky-AI/SkyRL/pull/1837)
 
 ### Integration is done but not yet merged
 
