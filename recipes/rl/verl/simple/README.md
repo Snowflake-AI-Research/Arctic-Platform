@@ -47,13 +47,18 @@ uv pip install -r requirements.txt --override overrides.txt
 uv pip install -U pip wheel packaging setuptools
 ```
 
-To install flash attention, you can build it from source (may take a long time to build):
+The launcher uses `flash_attention_2` by default, which the `flash-attn` package below
+provides. You can build it from source (may take a long time to build):
 ```bash
 uv pip install flash-attn --no-build-isolation
 ```
-or you can install directly from a wheel, find the automatic instructions
-[here](https://windreamer.github.io/flash-attention3-wheels/) or download directly from
+or download a prebuilt FA2 wheel directly from
 https://github.com/Dao-AILab/flash-attention/releases.
+
+To use `flash_attention_3` instead (faster on Hopper), install the matching `flash_attn_3`
+wheel (find prebuilt FA3 wheels [here](https://windreamer.github.io/flash-attention3-wheels/)),
+then enable it in the launcher: comment out the `flash_attention_v=flash_attention_2` line
+and uncomment the GPU-type auto-selection block beneath it.
 
 Install verl (Snowflake fork) editable:
 ```bash
