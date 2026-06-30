@@ -61,7 +61,7 @@ ARCTIC_ZERO_STAGE=3
 # colocate=True: training + sampling span all NGPU_PER_JOB bundles. log_prob off (no-KL + Zorro recompute).
 NGPU_PER_JOB=$((NGPU_PER_NODE*NNODES))
 NGPU_FOR_LOG_PROBS=0
-TP_SIZE=2                # sampling TP
+TP_SIZE=4                # sampling TP
 
 # ----- Training hyperparams -----
 BSZ=256                  # data.train_batch_size
@@ -199,6 +199,7 @@ python3 -m verl.trainer.main_ppo \
     remote_backend.weight_sync.cuda_ipc=True \
     remote_backend.weight_sync.low_memory=False \
     remote_backend.rollout.zorro_inference.enable=True \
+    remote_backend.rollout.speculative_decoding.model=Snowflake/Arctic-LSTM-Speculator-Qwen3-32B-longcontext \
     remote_backend.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \
     remote_backend.train.deepspeed.zero_optimization.offload_param.device=none \
     remote_backend.train.deepspeed.zero_optimization.stage=$ARCTIC_ZERO_STAGE \

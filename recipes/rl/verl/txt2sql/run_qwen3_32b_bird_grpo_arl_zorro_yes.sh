@@ -147,7 +147,7 @@ python3 -m verl.trainer.main_ppo \
     custom_reward_function.path="${SCRIPT_DIR}/bird_reward.py" \
     custom_reward_function.name=compute_score \
     remote_backend.colocate=True \
-    remote_backend.sampling_tp_size=2 \
+    remote_backend.sampling_tp_size=4 \
     remote_backend.training_gpus=$NGPU_PER_JOB \
     remote_backend.sampling_gpus=$NGPU_PER_JOB \
     remote_backend.log_prob_gpus=0 \
@@ -155,6 +155,7 @@ python3 -m verl.trainer.main_ppo \
     remote_backend.weight_sync.low_memory=False \
     remote_backend.train.logits.optimization=memory \
     remote_backend.rollout.zorro_inference.enable=True \
+    remote_backend.rollout.speculative_decoding.model=Snowflake/Arctic-LSTM-Speculator-Qwen3-32B-bird \
     remote_backend.train.zorro_train.enable=True \
     remote_backend.train.zorro_train.max_rollouts=16 \
     remote_backend.train.deepspeed.zero_optimization.stage=3 \
