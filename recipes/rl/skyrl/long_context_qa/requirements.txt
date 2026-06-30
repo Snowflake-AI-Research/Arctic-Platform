@@ -1,0 +1,22 @@
+# Long-context QA (LoongRL) recipe — pinned Python dependencies.
+#
+# Default target: single-node 8-GPU GRPO on Qwen3-8B with 16K-context LoongRL data
+# (HotpotQA + MuSiQue + 2WikiMQA). Same Arctic RL stack as the txt2sql recipe — only
+# the env / dataset / sequence-length defaults differ.
+#
+# Assumes CUDA 12.8 + Hopper (H100/H200) for FlashAttention 3. On A100/L40S set
+# ATTN_IMPL=flash_attention_2 in the launcher and drop the FA3 install line below.
+
+# Arctic
+arctic-platform[rl]
+arctic-inference[vllm]
+liger-kernel
+
+# SkyRL pinned at PR #1837 merge (the dispatch hook the arctic_rl integration
+# requires). Pulled from git — no SkyRL clone needed. Matching SkyRL-side
+# integration code is vendored at ../_lib/arctic_rl/.
+skyrl @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315
+skyrl-gym @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315#subdirectory=skyrl-gym
+
+vllm==0.18.0
+ray==2.51.1
