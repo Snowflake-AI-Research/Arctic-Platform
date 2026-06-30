@@ -1,0 +1,30 @@
+# Simple GSM8K (single-GPU) recipe — pinned Python dependencies.
+#
+# Assumes CUDA 12.8. `torch` and `flash-attn` are installed separately in the
+# README (torch needs the PyTorch CUDA index; flash-attn ships as a prebuilt
+# wheel matching torch's ABI). If you use a different CUDA version, change the
+# torch index URL in the README accordingly.
+#
+# A few transitive deps (transformers, datasets) are version-pinned in
+# overrides.txt (uv pip install --override), because vLLM 0.18.0 and SkyRL pin
+# them differently than this recipe is validated against. Keep those pins in
+# overrides.txt only — listing them here too would be redundant.
+
+# Arctic
+arctic-platform[rl]
+arctic-inference[vllm]
+liger-kernel
+
+# SkyRL pinned at the PR #1837 merge commit (the commit that adds the
+# `trainer.override_entrypoint=` dispatch hook the arctic_rl integration
+# relies on). Installed straight from the git URL — no SkyRL clone required.
+# The matching `arctic_rl/` integration code is vendored at
+# `../_lib/arctic_rl/` and added to PYTHONPATH by the launcher.
+skyrl @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315
+skyrl-gym @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315#subdirectory=skyrl-gym
+
+# Serving / kernels (arctic-inference patches vLLM 0.18.0, so pin that exact version).
+vllm==0.18.0
+
+# Ray must match across the cluster. SkyRL pins this exact version.
+ray==2.51.1
