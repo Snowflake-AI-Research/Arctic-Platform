@@ -16,4 +16,7 @@ from skyrl_gym.envs.registration import register
 for _id in ("bird", "bird_sql"):
     register(id=_id, entry_point=f"{__name__}.bird:BirdEnv")
 
+# Long-context multi-hop QA (LoongRL-style): used by recipes/rl/skyrl/long_context_qa/.
+register(id="long_context_qa", entry_point=f"{__name__}.long_context_qa:LongContextQAEnv")
+
 __all__ = []
