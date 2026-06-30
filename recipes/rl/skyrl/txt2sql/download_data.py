@@ -1,33 +1,28 @@
 #!/usr/bin/env python
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Thin wrapper around the vendored BIRD preprocessor.
+"""Thin wrapper around upstream SkyRL's BIRD preprocessor.
 
-Just forwards to ``arctic_rl.envs.preprocess_bird.main`` with the right
-``--bird_dir`` / ``--output_dir`` / ``--max_tokens`` defaults for this recipe
-so the user only needs:
+Forwards to ``integrations.arctic_rl.envs.preprocess_bird.main`` (lives in
+the user's SkyRL clone at ``$SKYRL_HOME/integrations/arctic_rl/envs/``) with
+the right ``--bird_dir`` / ``--output_dir`` / ``--max_tokens`` defaults for
+this recipe so the user only needs:
 
+    export SKYRL_HOME=<path to SkyRL clone>
     python download_data.py --bird_dir ~/data/bird/raw
 
 The raw BIRD download is *not* automated — BIRD is gated behind a sign-up
 form. Follow the "Data preparation" section of this recipe's README to stage
 the raw files at ``--bird_dir``, then run this script.
 
-The vendored preprocessor lives at::
-
-    Arctic-Platform/recipes/rl/skyrl/_lib/arctic_rl/envs/preprocess_bird.py
-
-and emits one row per BIRD example with the verl-PR-#6 schema that the
-vendored ``arctic_rl.envs.bird:BirdEnv`` consumes (gold SQL in
-``reward_model.ground_truth``, sqlite path in ``extra_info.db_path``).
+The upstream preprocessor emits one row per BIRD example with the verl-PR-#6
+schema that ``integrations.arctic_rl.envs.bird:BirdEnv`` consumes (gold SQL
+in ``reward_model.ground_truth``, sqlite path in ``extra_info.db_path``).
 """
 
 import argparse
 import os
 import sys
-from pathlib import Path
-
-REPO_LIB = Path(__file__).resolve().parent.parent / "_lib"
 
 
 def main():
@@ -67,16 +62,16 @@ def main():
     )
     args = parser.parse_args()
 
-    if not REPO_LIB.is_dir():
+    skyrl_home = os.environ.get("SKYRL_HOME")
+    if not skyrl_home or not os.path.isdir(skyrl_home):
         raise SystemExit(
-            f"Vendored arctic_rl library not found at {REPO_LIB}. "
-            "Make sure you're running this from the recipe directory in a fresh "
-            "Arctic-Platform checkout (recipes/rl/skyrl/txt2sql/)."
+            "SKYRL_HOME is not set or doesn't exist. Clone SkyRL at the pinned "
+            "commit (see this recipe's README) and "
+            "`export SKYRL_HOME=<path to clone>`."
         )
+    sys.path.insert(0, skyrl_home)
 
-    sys.path.insert(0, str(REPO_LIB))
-
-    from arctic_rl.envs import preprocess_bird as pp
+    from integrations.arctic_rl.envs import preprocess_bird as pp
 
     # Rebuild argv for ``pp.main()`` — only forward BIRD-related args. We hard-
     # code ``--sources bird`` so this script doesn't accidentally pull in

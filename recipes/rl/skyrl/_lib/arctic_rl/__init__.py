@@ -1,21 +1,26 @@
-"""Arctic RL integration for SkyRL — vendored into Arctic-Platform.
+"""Recipe-side ``arctic_rl`` package shim.
 
-Lives at ``recipes/rl/skyrl/_lib/arctic_rl/`` in the Arctic-Platform repo and
-is added to ``PYTHONPATH`` by the recipe launchers. Invoked via SkyRL's core
-dispatch::
+This package exists for one reason: register the recipe-private
+``long_context_qa`` env (and re-bind the upstream ``bird``/``bird_sql`` ids)
+with ``skyrl_gym`` in a way that runs *both* on the SkyRL driver and inside
+each Ray worker that ``skyrl_gym.make()``-s an env.
 
-    python -m skyrl.train.entrypoints.main_base \\
-        trainer.override_entrypoint=arctic_rl.entrypoint <flags>
+How the side-effect lands in workers:
 
-Provides ``ArcticPPOTrainer`` and ``ArcticGenerator`` that route all GPU work
-to an Arctic RL server; depends on ``arctic_platform.rl`` for the client.
+1. The recipe launcher passes ``trainer.override_entrypoint=arctic_rl.entrypoint``.
+2. SkyRL's ``main_base`` imports that module on the driver, which imports this
+   package (here), which imports ``arctic_rl.envs`` for its ``register()``
+   side-effects.
+3. ``arctic_rl.entrypoint`` re-binds Arctic RL's ``@ray.remote`` worker task
+   to our package, so the worker re-imports ``arctic_rl.entrypoint`` (and
+   therefore this ``__init__.py``) when it deserializes the task — running the
+   same registration in the worker's address space.
 
-Upstream source: ``integrations/arctic_rl/`` in NovaSky-AI/SkyRL — see
-``VENDOR.md`` for the pinned SHA and re-sync instructions.
+The actual Arctic RL × SkyRL machinery (config/trainer/generator) is *not*
+vendored — it lives in the user's SkyRL checkout at
+``$SKYRL_HOME/integrations/arctic_rl/``. The recipe launchers add
+``$SKYRL_HOME`` and this directory to ``PYTHONPATH`` so both packages are
+importable side-by-side.
 """
 
-from . import envs as _envs  # noqa: F401  side-effect: register `bird` env
-from .generator import ArcticGenerator
-from .trainer import ArcticPPOTrainer
-
-__all__ = ["ArcticPPOTrainer", "ArcticGenerator"]
+from . import envs as _envs  # noqa: F401  side-effect: register envs

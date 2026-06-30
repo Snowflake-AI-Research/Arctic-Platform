@@ -18,7 +18,17 @@ set -euxo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKYRL_LIB_DIR="$(cd "${SCRIPT_DIR}/../_lib" && pwd)"
-export PYTHONPATH="${SKYRL_LIB_DIR}:${PYTHONPATH:-}"
+
+# SkyRL is required as a checkout (the Arctic RL × SkyRL integration code lives
+# at integrations/arctic_rl/ which is NOT inside the pip-installed package).
+# Pin: see ../README.md and ../<recipe>/requirements.txt.
+if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; then
+    echo "ERROR: SKYRL_HOME is unset or doesn't contain integrations/arctic_rl/."
+    echo "       Clone SkyRL at the pinned commit (see ../README.md) and"
+    echo "       'export SKYRL_HOME=<path to clone>' before running this script."
+    exit 1
+fi
+export PYTHONPATH="${SKYRL_HOME}:${SKYRL_LIB_DIR}:${PYTHONPATH:-}"
 
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
