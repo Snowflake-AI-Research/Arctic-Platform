@@ -1,0 +1,31 @@
+# Txt2SQL (BIRD) recipe — pinned Python dependencies.
+#
+# Single-node 8-GPU GRPO on Qwen3-8B / BIRD-SQL. Same Arctic RL stack as the
+# multi-node `arctic_platform/recipes/rl/skyrl/*` runs; just 1 node.
+#
+# Assumes CUDA 12.8 + Hopper (H100/H200) for FlashAttention 3. On A100/L40S
+# set ATTN_IMPL=flash_attention_2 in the launcher and drop the FA3 install
+# line below.
+#
+# transformers / datasets pins live in overrides.txt (vLLM 0.18.0 wants
+# transformers<5, SkyRL pins transformers>=5.6.1; the override gives uv a
+# single deterministic resolve).
+
+# Arctic
+arctic-platform[rl]
+arctic-inference[vllm]
+liger-kernel
+
+# SkyRL pinned at PR #1837 merge (the dispatch hook the arctic_rl integration
+# requires). Pulled from git — no SkyRL clone needed. The matching SkyRL-side
+# integration code is vendored at ../_lib/arctic_rl/ (added to PYTHONPATH by
+# the launcher).
+skyrl @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315
+skyrl-gym @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315#subdirectory=skyrl-gym
+
+# Serving / kernels (arctic-inference patches vLLM 0.18.0).
+vllm==0.18.0
+
+# Ray must match across the cluster (relevant for the >1-node variants of
+# this recipe). SkyRL pins this exact version.
+ray==2.51.1
