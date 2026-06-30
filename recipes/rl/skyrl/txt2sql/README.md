@@ -1,22 +1,25 @@
-# Txt2SQL — single-node BIRD-SQL GRPO (Qwen3-8B)
+# Txt2SQL — BIRD-SQL GRPO (Qwen3-8B single-node + Qwen3-32B 4-node)
 
-Single-node 8-GPU GRPO for **Qwen3-8B** on **BIRD-SQL**, driven by SkyRL's PPO trainer
-with the [Arctic RL](../../../arctic_platform/rl/) backend. Same Arctic RL stack as the
-4-node Qwen3-32B run that produced the 2× speedup in the
-[Arctic RL launch blog][blog] — FCA, CUDA-IPC weight sync, ZoRRo, Liger, FA3 — just scaled
-down to one node so it runs on a standalone host.
+GRPO training for **Qwen3** on **BIRD-SQL**, driven by SkyRL's PPO trainer with the
+[Arctic RL](../../../arctic_platform/rl/) backend. Two launchers ship in this directory:
 
-| Knob              | Value |
-| ---               | --- |
-| Model             | `Qwen/Qwen3-8B` |
-| Reward            | Vendored `arctic_rl.envs.bird:BirdEnv` (gold-SQL execution match; same reward fn used in verl PR #6) |
-| Trainer           | DeepSpeed ZeRO-3, optimizer offload off |
-| Sampling          | vLLM 0.18.0 (TP=2, 4 engines) |
-| GPU layout        | Arctic RL colocates train + sample across the 8 GPUs |
-| Sequence lengths  | prompt 8192, response 2048 (drop the long-tail BIRD DBs at 16K+) |
+| Launcher | Topology | Notes |
+| --- | --- | --- |
+| `run_qwen3_8b_bird_grpo_arl.sh` | 1 node × 8 H200 | Iteration target — fits on a standalone host. |
+| `run_qwen3_32b_bird_grpo_arl_4node.sh` | **4 nodes × 8 H200** | The exact run behind the **~2× speedup** vs SkyRL FSDP-native baseline reported in the [Arctic RL launch blog][blog]. |
 
-To run the same recipe at 32B / 4 nodes, see [`run_bird_grpo_32b_32gpu.sh`][skyrl-32b] in
-SkyRL — the launcher in this directory is the single-node equivalent of that script.
+Both launchers use the same Arctic RL stack: FCA + `fuse_allreduce_rms` workaround,
+CUDA-IPC weight sync, ZoRRo, Liger, FA3 trainer / FLASH\_ATTN inference.
+
+| Knob              | 8B single-node | 32B 4-node |
+| ---               | --- | --- |
+| Model             | `Qwen/Qwen3-8B` | `Qwen/Qwen3-32B` |
+| Reward            | Upstream `integrations.arctic_rl.envs.bird:BirdEnv` (gold-SQL execution match; same reward fn used in verl PR #6) | same |
+| Trainer           | DeepSpeed ZeRO-3, optimizer offload off | DeepSpeed ZeRO-3, optimizer offload **on** |
+| Sampling          | vLLM 0.18.0 (TP=2, 4 engines)  | vLLM 0.18.0 (TP=4, 8 engines) |
+| GPU layout        | Arctic RL colocates train + sample across 8 GPUs | Arctic RL colocates train + sample across 32 GPUs |
+| Sequence lengths  | prompt 8192, response 2048 | prompt 32768, response 4096 |
+| Global batch      | 32 prompts × 8 samples = 256 trajectories | 128 prompts × 16 samples = 2048 trajectories |
 
 ## 1. Install packages
 
@@ -24,7 +27,12 @@ SkyRL — the launcher in this directory is the single-node equivalent of that s
 conda create -y -n skyrl_txt2sql python=3.12
 conda activate skyrl_txt2sql
 pip install uv
+
 git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
+git clone https://github.com/NovaSky-AI/SkyRL
+cd SkyRL && git checkout 76f5f467c6804e8acc6273cc677098b7679b0315 && cd ..
+export SKYRL_HOME=$PWD/SkyRL          # required by the launcher + download_data.py
+
 cd Arctic-Platform/recipes/rl/skyrl/txt2sql
 
 # CUDA 12.8 — change the index URL if you're on a different CUDA version.
@@ -40,9 +48,10 @@ uv pip install \
     "flash-attn-3@https://download.pytorch.org/whl/cu128/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_28_x86_64.whl"
 ```
 
-No SkyRL clone needed — SkyRL is pulled from git via `requirements.txt`, pinned at the
-PR #1837 merge commit. The matching `arctic_rl/` integration code is vendored at
-[`../_lib/arctic_rl/`](../_lib/arctic_rl) and added to `PYTHONPATH` by the launcher.
+The SkyRL clone gives you `integrations/arctic_rl/` (config/trainer/generator/BirdEnv/
+preprocessor) — used directly via `$SKYRL_HOME`. The `requirements.txt` pull additionally
+installs the `skyrl` Python *package* (Hydra entrypoint + dataset/utils) from the same
+commit so both pieces stay in sync.
 
 ## 2. Data preparation
 
@@ -67,9 +76,9 @@ Stage the files manually first:
            └── ...
    ```
 
-Then preprocess with `download_data.py`, a thin wrapper around the vendored
-[`arctic_rl.envs.preprocess_bird`](../_lib/arctic_rl/envs/preprocess_bird.py) that
-materializes per-sample SQLite paths and the `arctic_text_to_sql_r1` prompt format:
+Then preprocess with `download_data.py`, a thin wrapper around upstream's
+`integrations.arctic_rl.envs.preprocess_bird` (in your SkyRL clone) that materializes
+per-sample SQLite paths and the `arctic_text_to_sql_r1` prompt format:
 
 ```bash
 python download_data.py \
@@ -92,6 +101,8 @@ long-tail outlier DBs (e.g. `works_cycles`, `movie_3`) whose schema doesn't fit.
 (e.g. `--max_tokens 16384`) only if you also raise `PROMPT_LEN` in the launcher.
 
 ## 3. Train
+
+### 3a. Single-node 8B
 
 ```bash
 bash run_qwen3_8b_bird_grpo_arl.sh
@@ -118,6 +129,36 @@ bash run_qwen3_8b_bird_grpo_arl.sh \
     generator.n_samples_per_prompt=16
 ```
 
+### 3b. 4-node 32B (blog speedup run)
+
+This is the launcher behind the 2× wall-clock speedup numbers in the
+[Arctic RL launch blog][blog]. Re-stage the BIRD parquets with `--max_tokens 32768
+--tokenizer Qwen/Qwen3-32B` first so the long-context examples survive the filter.
+
+```bash
+# On the head node + each of the 3 workers (matching python + deps everywhere):
+ray start --head    --port=6379 --num-gpus=8            # head
+ray start --address=<head_ip>:6379 --num-gpus=8         # x3 workers
+
+# Sanity check:
+ray status   # -> "4 active node(s)" and 32 GPUs total
+
+# On the head node only:
+DATA_DIR=/shared/data/bird \
+CKPT_DIR=/shared/checkpoints/<run> \
+LOGGER=wandb \
+bash run_qwen3_32b_bird_grpo_arl_4node.sh
+```
+
+`DATA_DIR` and `CKPT_DIR` **must be on a shared filesystem** (NFS / Lustre / S3-FUSE)
+that all 4 nodes can read — the head writes the CUDA-IPC weight-sync tensor to
+`CKPT_DIR/_arctic_rl/`, and every worker mmap-reads it for weight refresh.
+
+The companion **FSDP-native baseline** (same recipe, no Arctic RL) lives upstream at
+[`run_bird_grpo_32b_32gpu_fsdp.sh`][skyrl-32b-fsdp] — use it to reproduce the speedup
+A/B exactly. Both runs share train batch / sequence lengths / optimizer state so the
+wall-clock difference is the Arctic stack's contribution.
+
 ### Enabling Arctic speculative decoding
 
 By default speculative decoding is **off**: the 32B-trained 3-head spec checkpoint from
@@ -131,17 +172,21 @@ SPEC_MODEL=/path/to/qwen3-8b-bird-3head \
 
 ## How this is wired
 
-- `trainer.override_entrypoint=arctic_rl.entrypoint` dispatches to the vendored
-  entrypoint at [`../_lib/arctic_rl/entrypoint.py`](../_lib/arctic_rl/entrypoint.py).
-- The launcher puts `../_lib/` on `PYTHONPATH`; the entrypoint forwards the same path to
-  Ray workers' `runtime_env` so worker tasks can import `arctic_rl.*` too.
-- `environment.env_class=bird` resolves to the vendored
-  [`arctic_rl.envs.bird:BirdEnv`](../_lib/arctic_rl/envs/bird.py), which runs the
-  gold-SQL execution reward (same reward fn from verl PR #6, vendored next to it as
-  `bird_reward.py`).
+- `trainer.override_entrypoint=arctic_rl.entrypoint` dispatches to the recipe-side shim
+  at [`../_lib/arctic_rl/entrypoint.py`](../_lib/arctic_rl/entrypoint.py), which reuses
+  upstream's `ArcticRLExp` + `build_rl_config` (imported from
+  `$SKYRL_HOME/integrations/arctic_rl/`) and re-defines the `@ray.remote skyrl_entrypoint`
+  so Ray workers re-import the shim and re-register the recipe's env classes.
+- The launcher composes `PYTHONPATH = $SKYRL_HOME : ../_lib/ : $PYTHONPATH`; the shim
+  forwards both directories to Ray workers' `runtime_env`.
+- `environment.env_class=bird` resolves to upstream's
+  `integrations.arctic_rl.envs.bird:BirdEnv` — the recipe-side `envs/__init__.py` just
+  re-binds the `bird` / `bird_sql` registration ids to it so the same launcher Hydra
+  knobs work in either checkout.
 - `trainer.arctic_rl.colocate=true` shares the 8 GPUs across Arctic RL's training and
   sampling jobs; `trainer.placement.colocate_all=false` keeps SkyRL from claiming a
   conflicting placement group on top.
 
 [blog]: https://www.snowflake.com/en/blog/engineering/arctic-rl-open-source-backend/
 [skyrl-32b]: https://github.com/NovaSky-AI/SkyRL/blob/main/integrations/arctic_rl/examples/run_bird_grpo_32b_32gpu.sh
+[skyrl-32b-fsdp]: https://github.com/NovaSky-AI/SkyRL/blob/main/integrations/arctic_rl/examples/run_bird_grpo_32b_32gpu_fsdp.sh

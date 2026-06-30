@@ -1,22 +1,18 @@
-"""Registers Arctic-RL-shipped envs with skyrl-gym at integration-import time.
+"""Register the env classes added by this recipe directory.
 
-Uses ``__name__`` for the entry_point so registration works under any import
-path (e.g. ``integrations.arctic_rl.envs`` from core dispatch, or ``arctic_rl.envs``
-when the integration dir is on PYTHONPATH).
+Only ``long_context_qa`` lives here — there's no upstream home for it yet
+(will be PR'd into SkyRL alongside its recipe).
 
-Both ``bird`` and ``bird_sql`` resolve to the same env: launcher recipes pass
-``environment.env_class=bird`` for evals, while preprocessed BIRD parquets
-have ``env_class="bird_sql"`` baked per-row (this is the verl PR #6 schema).
-Registering both names keeps either source-of-truth working without a parquet
-rewrite.
+``bird`` / ``bird_sql`` are *not* re-registered here: importing
+``integrations.arctic_rl`` from the user's SkyRL clone already runs the
+upstream registration as a side-effect (the shim's ``entrypoint.py`` imports
+``integrations.arctic_rl.config``, which triggers it). Doing it again here
+would raise ``RegistrationError: name already registered``.
+
+Uses ``__name__`` for the entry_point so registration works regardless of the
+path this package gets checked out at.
 """
 
 from skyrl_gym.envs.registration import register
 
-for _id in ("bird", "bird_sql"):
-    register(id=_id, entry_point=f"{__name__}.bird:BirdEnv")
-
-# Long-context multi-hop QA (LoongRL-style): used by recipes/rl/skyrl/long_context_qa/.
 register(id="long_context_qa", entry_point=f"{__name__}.long_context_qa:LongContextQAEnv")
-
-__all__ = []

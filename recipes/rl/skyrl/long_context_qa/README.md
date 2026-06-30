@@ -32,6 +32,14 @@ done [`../simple/`](../simple/) or [`../txt2sql/`](../txt2sql/).
 conda create -y -n skyrl_arl python=3.12.13
 conda activate skyrl_arl
 pip install -q uv
+
+# Clone SkyRL at the pinned commit — required by the launcher and the recipe-side
+# shim (Arctic RL × SkyRL integration code lives at integrations/arctic_rl/, NOT
+# inside the pip-installed `skyrl` package).
+git clone https://github.com/NovaSky-AI/SkyRL
+cd SkyRL && git checkout 76f5f467c6804e8acc6273cc677098b7679b0315 && cd ..
+export SKYRL_HOME=$PWD/SkyRL
+
 uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 -U
 uv pip install -r requirements.txt --override overrides.txt
 ```

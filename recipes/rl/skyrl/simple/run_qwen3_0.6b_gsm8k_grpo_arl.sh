@@ -8,20 +8,31 @@
 # Prerequisites (see README.md):
 #   1. Conda env with the recipe's pinned deps installed
 #      (`uv pip install -r requirements.txt --override overrides.txt`).
-#      No SkyRL checkout needed — SkyRL is pulled from PyPI/git per
-#      requirements.txt, and the `arctic_rl` integration code is vendored
-#      at ../_lib/arctic_rl/ (added to PYTHONPATH by this script).
-#   2. Data prepared: `python download_data.py` -> $DATA_DIR/{train,validation}.parquet.
+#   2. SkyRL cloned at the pinned commit (see ../README.md) and SKYRL_HOME
+#      pointing at it — the Arctic RL × SkyRL integration code lives at
+#      $SKYRL_HOME/integrations/arctic_rl/ (NOT in the pip-installed package).
+#   3. Data prepared: `python download_data.py` -> $DATA_DIR/{train,validation}.parquet.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKYRL_LIB_DIR="$(cd "${SCRIPT_DIR}/../_lib" && pwd)"
 
-# Put the vendored ../_lib/ on PYTHONPATH so `trainer.override_entrypoint=
-# arctic_rl.entrypoint` resolves. The entrypoint forwards this same path to
-# Ray workers via runtime_env, so worker tasks can deserialize too.
-export PYTHONPATH="${SKYRL_LIB_DIR}:${PYTHONPATH:-}"
+# SkyRL is required as a checkout (the Arctic RL × SkyRL integration code lives
+# at integrations/arctic_rl/ which is NOT inside the pip-installed package).
+# Pin: see ../README.md.
+if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; then
+    echo "ERROR: SKYRL_HOME is unset or doesn't contain integrations/arctic_rl/."
+    echo "       Clone SkyRL at the pinned commit (see ../README.md) and"
+    echo "       'export SKYRL_HOME=<path to clone>' before running this script."
+    exit 1
+fi
+# $SKYRL_HOME provides integrations.arctic_rl.* (config/trainer/generator).
+# $SKYRL_LIB_DIR provides arctic_rl.* — the recipe-side shim that registers
+# `long_context_qa` and re-defines the Ray entrypoint so env registration
+# round-trips through workers. The entrypoint forwards both onto worker
+# runtime_env PYTHONPATH so deserialization there works too.
+export PYTHONPATH="${SKYRL_HOME}:${SKYRL_LIB_DIR}:${PYTHONPATH:-}"
 
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1

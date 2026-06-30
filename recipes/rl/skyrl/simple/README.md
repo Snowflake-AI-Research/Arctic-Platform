@@ -27,12 +27,17 @@ conda activate skyrl_simple
 pip install uv
 ```
 
-Clone Arctic-Platform — it ships this recipe and the vendored
-[`arctic_rl/`](../_lib/arctic_rl) integration code. **No SkyRL clone needed**; SkyRL is
-pulled from git via `requirements.txt`.
+Clone Arctic-Platform (this recipe) and SkyRL (Arctic RL × SkyRL integration code).
+The recipe uses SkyRL's `integrations/arctic_rl/` directory, which is *not* in the
+pip-installed `skyrl` package — so a checkout at the pinned commit is required:
 
 ```bash
 git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
+
+git clone https://github.com/NovaSky-AI/SkyRL
+cd SkyRL && git checkout 76f5f467c6804e8acc6273cc677098b7679b0315 && cd ..
+export SKYRL_HOME=$PWD/SkyRL
+
 cd Arctic-Platform/recipes/rl/skyrl/simple
 ```
 
@@ -95,9 +100,13 @@ bash run_qwen3_0.6b_gsm8k_grpo_arl.sh \
 ## How this is wired
 
 - `trainer.override_entrypoint=arctic_rl.entrypoint` tells SkyRL's `main_base` to dispatch
-  into the vendored entrypoint at [`../_lib/arctic_rl/entrypoint.py`](../_lib/arctic_rl/entrypoint.py).
-- The launcher prepends `../_lib/` to `PYTHONPATH`; `arctic_rl/entrypoint.py` forwards the
-  same path to Ray workers' `runtime_env`, so worker tasks can import `arctic_rl.*` too.
+  into the recipe-side shim at [`../_lib/arctic_rl/entrypoint.py`](../_lib/arctic_rl/entrypoint.py).
+  The shim re-uses upstream's `ArcticRLExp` + `build_rl_config` (imported from
+  `$SKYRL_HOME/integrations/arctic_rl/`) and re-defines the `@ray.remote skyrl_entrypoint`
+  task so Ray workers re-import the shim and re-register the recipe's env classes.
+- The launcher composes `PYTHONPATH = $SKYRL_HOME : ../_lib/ : $PYTHONPATH`. The shim
+  forwards both directories to Ray workers' `runtime_env`, so worker tasks can import
+  `integrations.arctic_rl.*` and `arctic_rl.*` (shim) too.
 - `trainer.arctic_rl.colocate=true` puts Arctic RL's training and sampling jobs on the
   same GPU; `trainer.placement.colocate_all=false` keeps SkyRL from also trying to grab a
   placement group for the GPU Arctic RL already owns.
