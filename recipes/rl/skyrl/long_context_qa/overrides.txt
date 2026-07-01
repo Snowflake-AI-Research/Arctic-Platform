@@ -1,0 +1,6 @@
+# uv override-dependencies for the long_context_qa recipe.
+#
+# Same conflict as ../simple/ and ../txt2sql/: collapse vLLM-0.18.0's
+# transformers<5 vs. SkyRL's transformers>=5.6.1 into a single working version.
+transformers==4.57.6
+datasets==4.8.4
