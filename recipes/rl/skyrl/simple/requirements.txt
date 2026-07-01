@@ -17,9 +17,10 @@ liger-kernel
 
 # SkyRL pinned at the PR #1837 merge commit (the commit that adds the
 # `trainer.override_entrypoint=` dispatch hook the arctic_rl integration
-# relies on). Installed straight from the git URL — no SkyRL clone required.
-# The matching `arctic_rl/` integration code is vendored at
-# `../_lib/arctic_rl/` and added to PYTHONPATH by the launcher.
+# relies on). This gives you the pip-installed `skyrl` package; the launcher
+# also needs an on-disk clone of the same commit at $SKYRL_HOME because the
+# Arctic RL × SkyRL integration code (config/trainer/generator/BirdEnv) lives
+# under `integrations/arctic_rl/` and is NOT part of the pip package.
 skyrl @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315
 skyrl-gym @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315#subdirectory=skyrl-gym
 

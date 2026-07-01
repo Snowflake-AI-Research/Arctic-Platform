@@ -13,8 +13,11 @@ arctic-inference[vllm]
 liger-kernel
 
 # SkyRL pinned at PR #1837 merge (the dispatch hook the arctic_rl integration
-# requires). Pulled from git — no SkyRL clone needed. Matching SkyRL-side
-# integration code is vendored at ../_lib/arctic_rl/.
+# requires). This gives you the pip-installed `skyrl` package; the launcher
+# also needs an on-disk clone at $SKYRL_HOME because the Arctic RL × SkyRL
+# integration code (config/trainer/generator) lives under `integrations/arctic_rl/`
+# and is NOT part of the pip package. The `long_context_qa` env class itself
+# is registered by the recipe-local shim under `./arctic_rl/`.
 skyrl @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315
 skyrl-gym @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315#subdirectory=skyrl-gym
 

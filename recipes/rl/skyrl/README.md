@@ -5,7 +5,7 @@ on top of [SkyRL](https://github.com/NovaSky-AI/SkyRL).
 
 Available recipes:
   * [Simple single-GPU (GSM8K)](simple) — smallest end-to-end loop, one GPU, no Ray/hostfile
-  * [Txt2SQL (BIRD)](txt2sql) — single-node 8-GPU, Qwen3-8B
+  * [Txt2SQL (BIRD)](txt2sql) — single-node 8-GPU Qwen3-8B **+** 4-node 32-GPU Qwen3-32B (the blog 2× speedup run)
   * [Long-context QA (LoongRL)](long_context_qa) — single-node 8-GPU, Qwen3-8B, 16K prompts
 
 These recipes drive SkyRL's GRPO trainer with the Arctic RL backend (ZoRRo train + Forest
@@ -41,14 +41,26 @@ Each recipe is a standalone folder with its own `requirements.txt`, `overrides.t
 3. **Run the recipe** — `cd <recipe>/`, follow its README for data prep, then
    `bash run_*.sh`.
 
-## What lives in `_lib/arctic_rl/`
+## Anatomy of a recipe
 
-The launchers add this directory to `PYTHONPATH` so a small recipe-side shim is
-importable alongside `$SKYRL_HOME/integrations/arctic_rl/`. The shim is tiny — its
-only job is to register the recipe-private `long_context_qa` env with `skyrl_gym`
-in both the SkyRL driver and Ray workers (workers re-import the shim when they
-deserialize the Arctic RL `@ray.remote` task). Everything else — config, trainer,
-generator, BIRD env, BIRD preprocessor — is used directly from `$SKYRL_HOME`. See
-[`_lib/arctic_rl/__init__.py`](_lib/arctic_rl/__init__.py) for the design notes.
+- **`simple/`, `txt2sql/`** are pure config: a launcher, `requirements.txt`,
+  `overrides.txt`, `download_data.py`, and a README. Their launchers set
+  `PYTHONPATH=$SKYRL_HOME` and dispatch to upstream's Ray entrypoint
+  (`trainer.override_entrypoint=integrations.arctic_rl.entrypoint`) directly.
+  Nothing to import beyond what's in the SkyRL clone.
+
+- **`long_context_qa/`** is the exception: it adds a new `skyrl_gym` env
+  (`long_context_qa`) that isn't registered upstream. To get that registration
+  to fire on the driver, Ray workers, *and* the `ProcessPoolExecutor` spawn
+  children the reward scorer uses, it ships a small recipe-local shim under
+  [`long_context_qa/arctic_rl/`](long_context_qa/arctic_rl/) plus a
+  [`sitecustomize.py`](long_context_qa/sitecustomize.py). The shim re-defines
+  the Ray `skyrl_entrypoint` so workers re-import the recipe on deserialization;
+  `sitecustomize.py` handles the spawn children. Everything else — config,
+  trainer, generator — is reused verbatim from `$SKYRL_HOME`.
+
+If you're writing a new recipe that only *reuses* an env registered upstream
+(`gsm8k`, `bird`, `bird_sql`, …), copy the shape of `simple/` or `txt2sql/`.
+If you're adding a new env, copy the shape of `long_context_qa/`.
 
 [skyrl-pr]: https://github.com/NovaSky-AI/SkyRL/pull/1837

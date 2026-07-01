@@ -19,7 +19,6 @@
 set -euxo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKYRL_LIB_DIR="$(cd "${SCRIPT_DIR}/../_lib" && pwd)"
 
 # SkyRL is required as a checkout (the Arctic RL × SkyRL integration code lives
 # at integrations/arctic_rl/ which is NOT inside the pip-installed package).
@@ -30,7 +29,11 @@ if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; th
     echo "       'export SKYRL_HOME=<path to clone>' before running this script."
     exit 1
 fi
-export PYTHONPATH="${SKYRL_HOME}:${SKYRL_LIB_DIR}:${PYTHONPATH:-}"
+# ${SCRIPT_DIR} contains the recipe-local ``arctic_rl/`` shim + ``sitecustomize.py``
+# that register the ``long_context_qa`` env. Ray workers pick these up because the
+# shim's entrypoint.py forwards this dir onto their ``runtime_env`` PYTHONPATH;
+# ``ProcessPoolExecutor`` reward-scorer children pick them up via sitecustomize.
+export PYTHONPATH="${SKYRL_HOME}:${SCRIPT_DIR}:${PYTHONPATH:-}"
 
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
@@ -51,7 +54,7 @@ export ARCTIC_WEIGHT_SYNC_STRICT_NAMES=0
 # layout is different — single-node leaves allocator defaults.
 
 # Reward matcher: "pure_exact_match" (default), "format_exact_match", "format_f1_score".
-# Boxed-answer extraction + SQuAD-style normalization, see _lib/arctic_rl/envs/long_context_qa_reward.py.
+# Boxed-answer extraction + SQuAD-style normalization, see arctic_rl/envs/long_context_qa_reward.py.
 export REWARD_CALC_TYPE="${REWARD_CALC_TYPE:-pure_exact_match}"
 
 # ----- Single-node 8-GPU Arctic / ZoRRo topology -----

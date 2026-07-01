@@ -16,9 +16,6 @@
 
 set -euxo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKYRL_LIB_DIR="$(cd "${SCRIPT_DIR}/../_lib" && pwd)"
-
 # SkyRL is required as a checkout (the Arctic RL × SkyRL integration code lives
 # at integrations/arctic_rl/ which is NOT inside the pip-installed package).
 # Pin: see ../README.md and ../<recipe>/requirements.txt.
@@ -28,7 +25,9 @@ if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; th
     echo "       'export SKYRL_HOME=<path to clone>' before running this script."
     exit 1
 fi
-export PYTHONPATH="${SKYRL_HOME}:${SKYRL_LIB_DIR}:${PYTHONPATH:-}"
+# $SKYRL_HOME is the only PYTHONPATH addition — BirdEnv is registered upstream, so
+# this recipe ships no Python and dispatches straight to upstream's Ray entrypoint.
+export PYTHONPATH="${SKYRL_HOME}:${PYTHONPATH:-}"
 
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
@@ -110,7 +109,7 @@ if [[ -n "${SPEC_MODEL}" ]]; then
 fi
 
 python -m skyrl.train.entrypoints.main_base \
-    trainer.override_entrypoint=arctic_rl.entrypoint \
+    trainer.override_entrypoint=integrations.arctic_rl.entrypoint \
     trainer.arctic_rl.colocate=true \
     trainer.arctic_rl.zero_stage=${ARCTIC_ZERO_STAGE} \
     trainer.arctic_rl.offload_optimizer=${OFFLOAD_OPTIMIZER} \

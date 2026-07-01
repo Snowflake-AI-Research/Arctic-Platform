@@ -99,17 +99,15 @@ bash run_qwen3_0.6b_gsm8k_grpo_arl.sh \
 
 ## How this is wired
 
-- `trainer.override_entrypoint=arctic_rl.entrypoint` tells SkyRL's `main_base` to dispatch
-  into the recipe-side shim at [`../_lib/arctic_rl/entrypoint.py`](../_lib/arctic_rl/entrypoint.py).
-  The shim re-uses upstream's `ArcticRLExp` + `build_rl_config` (imported from
-  `$SKYRL_HOME/integrations/arctic_rl/`) and re-defines the `@ray.remote skyrl_entrypoint`
-  task so Ray workers re-import the shim and re-register the recipe's env classes.
-- The launcher composes `PYTHONPATH = $SKYRL_HOME : ../_lib/ : $PYTHONPATH`. The shim
-  forwards both directories to Ray workers' `runtime_env`, so worker tasks can import
-  `integrations.arctic_rl.*` and `arctic_rl.*` (shim) too.
+- `trainer.override_entrypoint=integrations.arctic_rl.entrypoint` tells SkyRL's `main_base`
+  to dispatch into the Arctic RL × SkyRL glue in your `$SKYRL_HOME` clone. This recipe
+  ships zero Python — the launcher sets `PYTHONPATH=$SKYRL_HOME` and dispatches straight
+  to upstream's Ray entrypoint. Workers pick up `$SKYRL_HOME` automatically because
+  upstream's entrypoint forwards it onto their `runtime_env`.
+- `environment.env_class=gsm8k` resolves to the GSM8K env registered by upstream `skyrl_gym`.
 - `trainer.arctic_rl.colocate=true` puts Arctic RL's training and sampling jobs on the
   same GPU; `trainer.placement.colocate_all=false` keeps SkyRL from also trying to grab a
   placement group for the GPU Arctic RL already owns.
 
-Once this works, the multi-node recipes ([txt2sql](../txt2sql),
-[long_context_qa](../long_context_qa)) are the same shape with more GPUs and a Ray cluster.
+Once this works, the multi-GPU recipes ([txt2sql](../txt2sql),
+[long_context_qa](../long_context_qa)) are the same shape scaled up.
