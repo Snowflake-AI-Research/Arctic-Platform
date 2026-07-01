@@ -172,17 +172,12 @@ SPEC_MODEL=/path/to/qwen3-8b-bird-3head \
 
 ## How this is wired
 
-- `trainer.override_entrypoint=arctic_rl.entrypoint` dispatches to the recipe-side shim
-  at [`../_lib/arctic_rl/entrypoint.py`](../_lib/arctic_rl/entrypoint.py), which reuses
-  upstream's `ArcticRLExp` + `build_rl_config` (imported from
-  `$SKYRL_HOME/integrations/arctic_rl/`) and re-defines the `@ray.remote skyrl_entrypoint`
-  so Ray workers re-import the shim and re-register the recipe's env classes.
-- The launcher composes `PYTHONPATH = $SKYRL_HOME : ../_lib/ : $PYTHONPATH`; the shim
-  forwards both directories to Ray workers' `runtime_env`.
-- `environment.env_class=bird` resolves to upstream's
-  `integrations.arctic_rl.envs.bird:BirdEnv` — the recipe-side `envs/__init__.py` just
-  re-binds the `bird` / `bird_sql` registration ids to it so the same launcher Hydra
-  knobs work in either checkout.
+- `trainer.override_entrypoint=integrations.arctic_rl.entrypoint` dispatches straight to
+  the Arctic RL × SkyRL glue in your `$SKYRL_HOME` clone. This recipe ships zero Python —
+  the launcher sets `PYTHONPATH=$SKYRL_HOME` and hands off to upstream's Ray entrypoint,
+  which forwards `$SKYRL_HOME` onto Ray workers' `runtime_env` for you.
+- `environment.env_class=bird` resolves to upstream's `integrations.arctic_rl.envs.bird:BirdEnv`
+  (registered as both `bird` and `bird_sql` by `integrations.arctic_rl.envs`).
 - `trainer.arctic_rl.colocate=true` shares the 8 GPUs across Arctic RL's training and
   sampling jobs; `trainer.placement.colocate_all=false` keeps SkyRL from claiming a
   conflicting placement group on top.

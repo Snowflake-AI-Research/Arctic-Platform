@@ -15,9 +15,6 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKYRL_LIB_DIR="$(cd "${SCRIPT_DIR}/../_lib" && pwd)"
-
 # SkyRL is required as a checkout (the Arctic RL × SkyRL integration code lives
 # at integrations/arctic_rl/ which is NOT inside the pip-installed package).
 # Pin: see ../README.md.
@@ -27,12 +24,10 @@ if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; th
     echo "       'export SKYRL_HOME=<path to clone>' before running this script."
     exit 1
 fi
-# $SKYRL_HOME provides integrations.arctic_rl.* (config/trainer/generator).
-# $SKYRL_LIB_DIR provides arctic_rl.* — the recipe-side shim that registers
-# `long_context_qa` and re-defines the Ray entrypoint so env registration
-# round-trips through workers. The entrypoint forwards both onto worker
-# runtime_env PYTHONPATH so deserialization there works too.
-export PYTHONPATH="${SKYRL_HOME}:${SKYRL_LIB_DIR}:${PYTHONPATH:-}"
+# $SKYRL_HOME provides integrations.arctic_rl.* (config/trainer/generator/BirdEnv).
+# The GSM8K env is registered by upstream skyrl_gym, so this recipe doesn't ship
+# any Python — it dispatches straight to upstream's Ray entrypoint below.
+export PYTHONPATH="${SKYRL_HOME}:${PYTHONPATH:-}"
 
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
@@ -83,7 +78,7 @@ CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"
 
 python -m skyrl.train.entrypoints.main_base \
-    trainer.override_entrypoint=arctic_rl.entrypoint \
+    trainer.override_entrypoint=integrations.arctic_rl.entrypoint \
     trainer.arctic_rl.colocate=true \
     trainer.arctic_rl.zero_stage=${ARCTIC_ZERO_STAGE} \
     trainer.algorithm.advantage_estimator=grpo \

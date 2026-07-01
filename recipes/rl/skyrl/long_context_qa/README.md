@@ -18,9 +18,13 @@ standalone 8x H100/H200 host.
 | `download_data.py`                  | Pulls LoongRL from HF and writes SkyRL-format parquets |
 | `run_qwen3_8b_loongrl_grpo_arl.sh`  | Launcher — 16K prompt, 8 GPUs, TP=4, ZeRO-3 |
 | `requirements.txt`, `overrides.txt` | Pinned Python deps (`uv` install) |
+| `arctic_rl/`                        | Recipe-local shim: registers the `long_context_qa` env with `skyrl_gym` and re-defines the Ray entrypoint so workers pick up the registration on deserialization |
+| `sitecustomize.py`                  | Registers `long_context_qa` in `ProcessPoolExecutor` spawn children (used by the reward scorer) |
 
-The Arctic RL × SkyRL glue (env class registration, ZoRRo entrypoint, generator) is
-vendored at [`../_lib/arctic_rl/`](../_lib/arctic_rl) — no SkyRL checkout required.
+Everything else — config, trainer, generator — is imported directly from
+`$SKYRL_HOME/integrations/arctic_rl/`. The sibling `simple/` and `txt2sql/`
+recipes reuse envs already registered upstream, so they don't need any of the
+above — this shim exists purely because `long_context_qa` is a new env.
 
 ## 1. Install
 
@@ -75,7 +79,7 @@ The launcher consumes `merged/{train,test}.parquet` by default; override
 
 ## 3. Reward
 
-The vendored env [`long_context_qa`](../_lib/arctic_rl/envs/long_context_qa.py)
+The recipe-local env [`arctic_rl/envs/long_context_qa.py`](arctic_rl/envs/long_context_qa.py)
 extracts the model's last `\boxed{…}` answer and matches against the ground truth
 with SQuAD-style normalization. Pick the scorer via `REWARD_CALC_TYPE`:
 
@@ -86,7 +90,7 @@ with SQuAD-style normalization. Pick the scorer via `REWARD_CALC_TYPE`:
 | `format_f1_score`      | token F1 with the same format guardrails                   |
 
 Same scorer code as the verl long_context_qa recipe — see
-[`../_lib/arctic_rl/envs/long_context_qa_reward.py`](../_lib/arctic_rl/envs/long_context_qa_reward.py).
+[`arctic_rl/envs/long_context_qa_reward.py`](arctic_rl/envs/long_context_qa_reward.py).
 
 ## 4. Train
 
@@ -119,8 +123,8 @@ config, train Qwen3-32B across 4 nodes (32 GPUs) and serve inference with YaRN
 extended to 128K. The verl twin
 ([`recipes/rl/verl/long_context_qa/`](../../verl/long_context_qa/)) ships that
 multi-node launcher today; a SkyRL multi-node launcher will follow the same shape
-as the txt2sql 32B multi-node recipe (driven by the same vendored `arctic_rl`
-package, plus a hostfile-aware `restart_multi_ray.sh`).
+as [`txt2sql/run_qwen3_32b_bird_grpo_arl_4node.sh`](../txt2sql/run_qwen3_32b_bird_grpo_arl_4node.sh)
+(reusing this recipe's `arctic_rl/` shim + `sitecustomize.py` unchanged).
 
 [loongrl]: https://huggingface.co/datasets/OldKingMeister/LoongRL-Train-Data
 [blog]: https://www.snowflake.com/en/blog/engineering/arctic-rl-open-source-backend/
