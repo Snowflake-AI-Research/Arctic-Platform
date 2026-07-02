@@ -35,6 +35,9 @@ export RAY_DEDUP_LOGS=0
 export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export TORCH_COMPILE_DISABLE=1
 export VLLM_DISABLE_COMPILE_CACHE=1
+# Belt-and-suspenders for TP>1 CLI overrides — see the BIRD-8B launcher note on
+# the FlashInfer-workspace assertion. Harmless at TP=1.
+export TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${HOME}/.cache/vllm}"
 export VLLM_LOGGING_LEVEL=INFO
 
@@ -77,10 +80,28 @@ VAL_FILES="${DATA_DIR}/validation.parquet"
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"
 
+# Arctic-Inference config. At the default TP=1 the fused_allreduce_rms pass is
+# a no-op, but keeping the same override shape as the multi-GPU recipes means
+# users who override TP>1 (e.g. bumping to 8B on 8 GPUs) inherit the escape
+# hatch for free.
+AI_CFG_PARTS=('optimization_level: 1'
+              'compilation_config: {cudagraph_mode: PIECEWISE, pass_config: {fuse_allreduce_rms: false}}')
+IFS=, AI_CFG_BODY="${AI_CFG_PARTS[*]}" ; unset IFS
+AI_CFG_OVERRIDE=("trainer.arctic_rl.arctic_inference_config={${AI_CFG_BODY}}")
+
 python -m skyrl.train.entrypoints.main_base \
     trainer.override_entrypoint=integrations.arctic_rl.entrypoint \
     trainer.arctic_rl.colocate=true \
     trainer.arctic_rl.zero_stage=${ARCTIC_ZERO_STAGE} \
+    trainer.arctic_rl.use_zorro=true \
+    trainer.arctic_rl.use_liger=true \
+    trainer.arctic_rl.logits_optimization=memory \
+    trainer.arctic_rl.enable_gradient_checkpointing=true \
+    trainer.arctic_rl.use_arctic_inference=true \
+    trainer.arctic_rl.vllm_enforce_eager=false \
+    trainer.arctic_rl.vllm_enable_prefix_caching=true \
+    trainer.arctic_rl.vllm_max_num_seqs=256 \
+    "${AI_CFG_OVERRIDE[@]}" \
     trainer.algorithm.advantage_estimator=grpo \
     trainer.policy.model.path="${MODEL}" \
     data.train_data="['${TRAIN_FILES}']" \

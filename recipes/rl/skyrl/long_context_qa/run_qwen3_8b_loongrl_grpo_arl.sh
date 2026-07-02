@@ -58,9 +58,11 @@ NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 TP_SIZE="${TP_SIZE:-4}"
 NUM_ENGINES=$((NUM_GPUS / TP_SIZE))
 
-ATTN_IMPL="${ATTN_IMPL:-flash_attention_3}"
+ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 ARCTIC_ZERO_STAGE=3
-OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-false}"   # 8B fits in 8xH200 HBM
+# 8B fits in 8xH200 HBM without optimizer offload, but upstream's converged
+# 32B recipe enables offload — keep on by default so hyperparams transfer.
+OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-true}"
 
 # Sizing: (MINI_BSZ * N_SAMPLES) / training_gpus must be divisible by the
 # trainer's per-GPU micro-batch (default 2). Defaults below satisfy that
@@ -99,16 +101,26 @@ EXPERIMENT_NAME="longcontext_grpo_${MODEL_SHORT}_arl_z${ARCTIC_ZERO_STAGE}_${RUN
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"
 
-# Optional Arctic speculative decoding. Off by default — the 32B head is tied
-# to Qwen3-32B's hidden size and won't load on 8B; supply an 8B-sized head via
-# SPEC_MODEL=<path>.
+# Arctic-Inference config (raw passthrough to vLLM AsyncEngineArgs). See the
+# BIRD-8B launcher for the full rationale; TL;DR: optimization_level=1 pins
+# fuse_allreduce_rms=false, unblocking TP>1 from the FlashInfer-workspace
+# assertion. Speculative decoding is off by default — the 32B head is tied to
+# Qwen3-32B's hidden size and won't load on 8B; supply an 8B-sized 3-head
+# checkpoint via SPEC_MODEL=<path> to enable.
+USE_FCA="${USE_FCA:-False}"
 SPEC_MODEL="${SPEC_MODEL:-}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-3}"
-SPEC_OVERRIDE=()
-if [[ -n "${SPEC_MODEL}" ]]; then
-    SPEC_OVERRIDE+=("trainer.arctic_rl.speculative_model=${SPEC_MODEL}")
-    SPEC_OVERRIDE+=("trainer.arctic_rl.num_speculative_tokens=${NUM_SPEC_TOKENS}")
+
+AI_CFG_PARTS=('optimization_level: 1'
+              'compilation_config: {cudagraph_mode: PIECEWISE, pass_config: {fuse_allreduce_rms: false}}')
+if [[ "${USE_FCA}" == "True" ]]; then
+    AI_CFG_PARTS+=('forest_cascade_attn_configs: "{}"')
 fi
+if [[ -n "${SPEC_MODEL}" && -d "${SPEC_MODEL}" ]]; then
+    AI_CFG_PARTS+=("speculative_config: {method: arctic, model: ${SPEC_MODEL}, num_speculative_tokens: ${NUM_SPEC_TOKENS}}")
+fi
+IFS=, AI_CFG_BODY="${AI_CFG_PARTS[*]}" ; unset IFS
+AI_CFG_OVERRIDE=("trainer.arctic_rl.arctic_inference_config={${AI_CFG_BODY}}")
 
 # Run from ${SKYRL_HOME} so ``integrations/`` imports resolve.
 cd "${SKYRL_HOME}"
@@ -118,16 +130,26 @@ cd "${SKYRL_HOME}"
     trainer.arctic_rl.colocate=true \
     trainer.arctic_rl.zero_stage=${ARCTIC_ZERO_STAGE} \
     trainer.arctic_rl.offload_optimizer=${OFFLOAD_OPTIMIZER} \
+    trainer.arctic_rl.offload_param=false \
+    trainer.arctic_rl.log_prob_gpus=0 \
+    trainer.arctic_rl.use_zorro=true \
+    trainer.arctic_rl.use_liger=true \
     trainer.arctic_rl.attn_implementation=${ATTN_IMPL} \
+    trainer.arctic_rl.enable_gradient_checkpointing=true \
+    trainer.arctic_rl.ulysses_sequence_parallel_size=1 \
+    trainer.arctic_rl.logits_optimization=memory \
     trainer.arctic_rl.cuda_ipc_weight_sync=true \
     trainer.arctic_rl.low_memory_weight_sync=true \
     trainer.arctic_rl.lr_warmup_ratio=0.05 \
     'trainer.arctic_rl.optimizer_betas=[0.9,0.95]' \
     trainer.arctic_rl.vllm_enforce_eager=false \
+    trainer.arctic_rl.vllm_enable_prefix_caching=true \
     trainer.arctic_rl.vllm_max_num_batched_tokens=${VLLM_MAX_BATCHED} \
+    trainer.arctic_rl.vllm_max_num_seqs=256 \
+    trainer.arctic_rl.use_arctic_inference=true \
     trainer.arctic_rl.server_logs=true \
     trainer.arctic_rl.startup_timeout=1800 \
-    "${SPEC_OVERRIDE[@]}" \
+    "${AI_CFG_OVERRIDE[@]}" \
     trainer.algorithm.advantage_estimator=grpo \
     trainer.policy.model.path="${MODEL}" \
     data.train_data="['${TRAIN_PARQUET}']" \

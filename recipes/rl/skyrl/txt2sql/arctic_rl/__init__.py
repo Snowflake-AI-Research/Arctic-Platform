@@ -43,3 +43,12 @@ importable side-by-side.
 """
 
 import integrations.arctic_rl.envs as _envs  # noqa: F401  register bird / bird_sql
+
+# The BIRD parquet's per-row ``env_class`` column is ``bird_sql`` (from the
+# preprocess_bird.py output), but upstream only registers the ``bird`` id.
+# Alias ``bird_sql`` -> ``BirdEnv`` so ``skyrl_gym.make("bird_sql", ...)`` works
+# without touching the parquet or the upstream registration.
+from skyrl_gym.envs.registration import register as _register, registry as _registry
+
+if "bird_sql" not in _registry:
+    _register(id="bird_sql", entry_point="integrations.arctic_rl.envs.bird:BirdEnv")
