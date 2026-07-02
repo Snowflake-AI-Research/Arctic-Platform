@@ -21,12 +21,16 @@ run (verl twin: [`recipes/rl/verl/txt2sql/run_qwen3_32b_bird_grpo_arl.sh`](../..
 | `run_qwen3_8b_bird_grpo_arl.sh`          | Single-node Arctic RL launcher (8 GPU, Qwen3-8B) |
 | `run_qwen3_32b_bird_grpo_arl_4node.sh`   | 4-node Arctic RL launcher (32 GPU, Qwen3-32B) |
 | `run_qwen3_32b_bird_grpo_fsdp_4node.sh`  | 4-node **FSDP-native** launcher (baseline sibling for the A/B) |
+| `fsdp_bird_entry.py`                     | FSDP-native entrypoint that side-effect-registers `bird` / `bird_sql` on driver + Ray workers (sibling of the `long_context_qa` shim) |
+| `arctic_rl/`                             | Recipe-local shim: imports upstream `integrations.arctic_rl.envs` and re-defines the Ray `skyrl_entrypoint` so workers pick up the registration on deserialization |
+| `sitecustomize.py`                       | Registers `bird` / `bird_sql` in `ProcessPoolExecutor` spawn children (used by the reward scorer) |
 | `requirements.txt`, `overrides.txt`      | Pinned Python deps (`uv` install) |
 
-`BirdEnv` and the FSDP entrypoint (`fsdp_bird_entry.py`) both live upstream in
-`$SKYRL_HOME/integrations/arctic_rl/` — this recipe ships no Python. Contrast
-with the sibling `long_context_qa/` recipe, which vendors an `arctic_rl/` shim
-because its env is new.
+Config, trainer, generator, and `BirdEnv` all live upstream at
+`$SKYRL_HOME/integrations/arctic_rl/`. The recipe-local `arctic_rl/` shim
+imports upstream's env module for the `register()` side-effect but doesn't
+vendor the env itself. Same skeleton as the sibling `long_context_qa/`
+recipe.
 
 ## 1. Install
 
@@ -183,8 +187,8 @@ bash run_qwen3_32b_bird_grpo_fsdp_4node.sh
 
 Same env, launch pattern, and hyperparameters as the ARL sibling — only the
 trainer flags (`trainer.strategy=fsdp2`, no `trainer.arctic_rl.*`) and the
-entrypoint (upstream's `integrations/arctic_rl/examples/fsdp_bird_entry.py` in
-`$SKYRL_HOME`) differ.
+entrypoint (`fsdp_bird_entry.py`, which registers `bird` / `bird_sql` on the
+driver and forwards the recipe dir onto Ray workers) differ.
 
 ### Speedup
 

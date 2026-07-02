@@ -46,21 +46,30 @@ once, `conda activate skyrl_arl`, and any recipe launches from bare `python`.
 
 ## Anatomy of a recipe
 
-- **`simple/`, `txt2sql/`** are pure config: launchers, `requirements.txt`,
-  `overrides.txt`, `download_data.py`, and a README. Launchers set
-  `PYTHONPATH=$SKYRL_HOME` and dispatch to upstream's Ray entrypoint
-  (`trainer.override_entrypoint=integrations.arctic_rl.entrypoint` for ARL,
-  upstream's `integrations/arctic_rl/examples/fsdp_bird_entry.py` for the FSDP
-  A/B baseline). Nothing to import beyond what's in the SkyRL clone.
+All three recipes share the same skeleton — each is a standalone folder that
+depends only on `$SKYRL_HOME` for the actual Arctic RL × SkyRL library
+(config/trainer/generator/envs) and vendors everything the recipe itself
+needs:
 
-- **`long_context_qa/`** is the exception: it adds a new `skyrl_gym` env
-  (`long_context_qa`) that isn't registered upstream, so it ships a small
-  recipe-local shim under [`long_context_qa/arctic_rl/`](long_context_qa/arctic_rl/),
-  a [`sitecustomize.py`](long_context_qa/sitecustomize.py) for
-  `ProcessPoolExecutor` spawn children, and a [`fsdp_loongrl_entry.py`](long_context_qa/fsdp_loongrl_entry.py)
-  that mirrors upstream's `fsdp_bird_entry.py` for the FSDP A/B baseline.
-  Everything else is reused verbatim from `$SKYRL_HOME`.
+- **`arctic_rl/`** shim — recipe-local package whose `entrypoint.py` is what
+  the ARL launchers dispatch to (`trainer.override_entrypoint=arctic_rl.entrypoint`).
+  Wraps upstream's `ArcticRLExp` but re-defines the `@ray.remote skyrl_entrypoint`
+  task so workers import *this* package on deserialization, triggering env
+  registration in the worker's address space.
+- **`fsdp_<name>_entry.py`** — FSDP-native sibling of `arctic_rl/entrypoint.py`.
+  What the FSDP A/B launcher dispatches to. Same three-interpreter registration
+  dance through `BasePPOExp` instead of `ArcticRLExp`.
+- **`sitecustomize.py`** — auto-import hook picked up by Python's `site.py`.
+  Registers envs in the `ProcessPoolExecutor` spawn children that the
+  reward-scorer spins up.
 
-If you're writing a new recipe that reuses an env registered upstream
-(`gsm8k`, `bird`, `bird_sql`, …), copy the shape of `simple/` or `txt2sql/`.
-If you're adding a new env, copy the shape of `long_context_qa/`.
+The `simple/` recipe skips `fsdp_<name>_entry.py` (single-GPU, no A/B baseline)
+and `sitecustomize.py` (no PPE reward scorer), but the ARL shim shape is
+identical. `long_context_qa/` additionally vendors its own env package under
+`arctic_rl/envs/` because `long_context_qa` isn't registered upstream; the
+other two rely on upstream's `integrations.arctic_rl.envs`.
+
+The actual Arctic RL × SkyRL machinery (config/trainer/generator) is *not*
+vendored — it lives in `$SKYRL_HOME/integrations/arctic_rl/`. Launchers put
+`$SKYRL_HOME` and the recipe dir on `PYTHONPATH` so both are importable
+side-by-side.

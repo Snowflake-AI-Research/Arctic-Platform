@@ -10,6 +10,8 @@
 
 set -euxo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # SkyRL is required as a checkout: integrations/arctic_rl/ is not in the
 # pip-installed package. Pin: see ../README.md.
 if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; then
@@ -18,12 +20,11 @@ if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; th
     echo "       'export SKYRL_HOME=<path to clone>' before running this script."
     exit 1
 fi
-# BirdEnv is registered upstream, so this recipe ships no Python — just point
-# at ``$SKYRL_HOME`` and let upstream's Ray entrypoint forward it to workers.
-export PYTHONPATH="${SKYRL_HOME}:${PYTHONPATH:-}"
+# ${SCRIPT_DIR} carries the recipe-local ``arctic_rl/`` shim + ``sitecustomize.py``
+# that register ``bird`` / ``bird_sql`` — see README.md.
+export PYTHONPATH="${SKYRL_HOME}:${SCRIPT_DIR}:${PYTHONPATH:-}"
 
-# Matches upstream integrations/arctic_rl/examples/run_bird_grpo_8b_32gpu.sh:
-# bare python from a caller-activated env. See ../README.md.
+# Bare python from a caller-activated env. See ../README.md.
 PYBIN="${PYBIN:-python}"
 
 export PYTHONUNBUFFERED=1
@@ -99,7 +100,7 @@ fi
 cd "${SKYRL_HOME}"
 
 "${PYBIN}" -m skyrl.train.entrypoints.main_base \
-    trainer.override_entrypoint=integrations.arctic_rl.entrypoint \
+    trainer.override_entrypoint=arctic_rl.entrypoint \
     trainer.arctic_rl.colocate=true \
     trainer.arctic_rl.zero_stage=${ARCTIC_ZERO_STAGE} \
     trainer.arctic_rl.offload_optimizer=${OFFLOAD_OPTIMIZER} \

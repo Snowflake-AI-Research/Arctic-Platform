@@ -5,27 +5,28 @@
 # model, data, hyperparams, and placement; only the training backend differs
 # (fsdp2 + native SkyRL colocation + vLLM generator with no ArcticInference).
 #
-# Dispatches to upstream's ``integrations/arctic_rl/examples/fsdp_bird_entry.py``
-# in $SKYRL_HOME — that entrypoint side-effect-imports
-# ``integrations.arctic_rl.envs`` which registers ``bird`` / ``bird_sql``, so
-# no recipe-local Python is required (contrast with long_context_qa/ which
-# ships its own env).
+# Dispatches to the recipe-local ``fsdp_bird_entry.py`` — that entrypoint
+# side-effect-imports ``integrations.arctic_rl.envs`` (via the recipe's
+# ``arctic_rl`` shim) to register ``bird`` / ``bird_sql`` on driver + workers.
 #
 # Prereqs: 4-node ray cluster up, BIRD parquets on shared FS, Qwen3-32B
 # available (per-node download or shared HF_HOME). See ../README.md.
 
 set -euxo pipefail
 
-if [[ -z "${SKYRL_HOME:-}" || ! -f "${SKYRL_HOME}/integrations/arctic_rl/examples/fsdp_bird_entry.py" ]]; then
-    echo "ERROR: SKYRL_HOME is unset or doesn't contain integrations/arctic_rl/examples/fsdp_bird_entry.py."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; then
+    echo "ERROR: SKYRL_HOME is unset or doesn't contain integrations/arctic_rl/."
     echo "       Clone SkyRL at the pinned commit (see ../README.md) and"
     echo "       'export SKYRL_HOME=<path to clone>' before running this script."
     exit 1
 fi
-export PYTHONPATH="${SKYRL_HOME}:${PYTHONPATH:-}"
+# ${SCRIPT_DIR} carries the recipe-local ``arctic_rl/`` shim + ``sitecustomize.py``
+# that register ``bird`` / ``bird_sql``.
+export PYTHONPATH="${SKYRL_HOME}:${SCRIPT_DIR}:${PYTHONPATH:-}"
 
-# Matches upstream integrations/arctic_rl/examples/run_bird_grpo_32b_32gpu_fsdp.sh:
-# bare python from a caller-activated env. See ../README.md.
+# Bare python from a caller-activated env. See ../README.md.
 PYBIN="${PYBIN:-python}"
 
 export PYTHONUNBUFFERED=1
@@ -85,7 +86,7 @@ EXPERIMENT_NAME="bird_grpo_${MODEL_SHORT}_fsdp_${NUM_NODES}node_${RUN_TS}"
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"
 
-FSDP_ENTRY="${SKYRL_HOME}/integrations/arctic_rl/examples/fsdp_bird_entry.py"
+FSDP_ENTRY="${SCRIPT_DIR}/fsdp_bird_entry.py"
 
 # Run from ${SKYRL_HOME} so ``integrations/`` imports resolve.
 cd "${SKYRL_HOME}"
