@@ -48,7 +48,8 @@ import integrations.arctic_rl.envs as _envs  # noqa: F401  register bird / bird_
 # preprocess_bird.py output), but upstream only registers the ``bird`` id.
 # Alias ``bird_sql`` -> ``BirdEnv`` so ``skyrl_gym.make("bird_sql", ...)`` works
 # without touching the parquet or the upstream registration.
-from skyrl_gym.envs.registration import register as _register, registry as _registry
+from skyrl_gym.envs.registration import register as _register
+from skyrl_gym.envs.registration import registry as _registry
 
 if "bird_sql" not in _registry:
     _register(id="bird_sql", entry_point="integrations.arctic_rl.envs.bird:BirdEnv")
