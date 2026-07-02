@@ -1,18 +1,12 @@
 #!/bin/bash
-# Native SkyRL FSDP backend: Qwen3-32B LoongRL long-context GRPO — 4 nodes / 32 H200s.
+# SkyRL FSDP-native backend: Qwen3-32B LoongRL long-context GRPO — 4 nodes / 32 H200s.
 #
-# Sibling of run_qwen3_32b_loongrl_grpo_arl_4node.sh: SAME model, SAME data,
-# SAME learning hyperparams, SAME placement — only the training backend
-# differs. Apples-to-apples wall-clock A/B vs the Arctic RL backend.
+# Wall-clock A/B baseline for run_qwen3_32b_loongrl_grpo_arl_4node.sh. Identical
+# model, data, hyperparams, and placement; only the training backend differs
+# (fsdp2 + native SkyRL colocation + vLLM generator with no ArcticInference).
 #
-# Differences vs the arctic sibling:
-#   - dispatches to fsdp_loongrl_entry.py (default core FSDP path; no arctic_rl flags)
-#   - generator stays vLLM, no ArcticInference (no FCA, no speculative decoding)
-#   - trainer.placement.colocate_all=true (native SkyRL colocation, not Arctic's)
-#   - No CUDA-IPC weight sync (uses SkyRL's native FSDP weight sync)
-#
-# Same prereqs as the arctic sibling: 4-node ray cluster up, LoongRL parquets on
-# a shared FS, Qwen3-32B present (either downloaded per-node or shared via HF_HOME).
+# Prereqs: 4-node ray cluster up, LoongRL parquets on shared FS, Qwen3-32B
+# available (per-node download or shared HF_HOME). See ../README.md.
 
 set -euxo pipefail
 
@@ -24,17 +18,12 @@ if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; th
     echo "       'export SKYRL_HOME=<path to clone>' before running this script."
     exit 1
 fi
-# ${SCRIPT_DIR} contains the recipe-local ``arctic_rl.envs`` package + the
-# ``sitecustomize.py`` hook that fsdp_loongrl_entry.py relies on for
-# ``long_context_qa`` env registration.
+# ${SCRIPT_DIR} carries the recipe-local ``arctic_rl.envs`` package + the
+# ``sitecustomize.py`` hook that register ``long_context_qa``.
 export PYTHONPATH="${SKYRL_HOME}:${SCRIPT_DIR}:${PYTHONPATH:-}"
 
-# Driver: bare python, matching upstream
-# integrations/arctic_rl/examples/run_bird_grpo_32b_32gpu_fsdp.sh on the pinned
-# ``arctic-rl-public`` merge (7636101a). That launcher uses ``${PYBIN:-python}``
-# and relies on the caller activating a compatible env (e.g. the ``skyrl_v2``
-# conda env used for the BIRD-SQL runs, which installs the ``arctic-rl-public``
-# pyproject closure — see ../README.md for how to build it).
+# Matches upstream integrations/arctic_rl/examples/run_bird_grpo_32b_32gpu_fsdp.sh:
+# bare python from a caller-activated env. See ../README.md for env setup.
 PYBIN="${PYBIN:-python}"
 
 export PYTHONUNBUFFERED=1
@@ -51,17 +40,15 @@ export VLLM_LOGGING_LEVEL=INFO
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Liger off: Qwen3 Liger kernel hits a Triton illegal-mem-access on packed-seq
-# inputs (cu_seqlens variable, attention_mask=None) under FSDP. Match upstream
-# fsdp bird recipe. The Arctic RL sibling doesn't need this because it uses its
-# own kernel path.
+# inputs (cu_seqlens variable, attention_mask=None) under FSDP. Matches upstream
+# fsdp bird recipe.
 export SKYRL_USE_LIGER=0
 
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
-# Same wandb project as the arctic sibling so the two runs sit side-by-side.
 export WANDB_PROJECT="${WANDB_PROJECT:-skyrl_arctic_rl_long_context}"
 export WANDB_DISABLE_CODE=True
 
-# ----- 4-node 32-GPU topology (matches the Arctic RL sibling) -----
+# ----- 4-node 32-GPU topology (matches the ARL sibling) -----
 NUM_NODES=4
 GPUS_PER_NODE=8
 NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))
@@ -69,10 +56,8 @@ NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 TP_SIZE="${TP_SIZE:-4}"
 NUM_ENGINES=$((NUM_GPUS / TP_SIZE))
 
-# Same batch math as the arctic sibling — 256 prompts x 8 samples = 2048
-# trajectories/step, 4 PPO mini-batches of 64 prompts each. Matches the verl
-# long-context ARL recipe so the Arctic-vs-FSDP wall-clock A/B is faithful to
-# what verl PR#8 was written for.
+# Same batch math as the ARL sibling: 256 prompts x 8 samples = 2048
+# trajectories/step, 4 PPO mini-batches of 64 prompts each.
 TRAIN_BSZ="${TRAIN_BSZ:-256}"
 MINI_BSZ="${MINI_BSZ:-64}"
 N_SAMPLES="${N_SAMPLES:-8}"
@@ -102,8 +87,7 @@ mkdir -p "${CKPT_DIR}"
 
 FSDP_ENTRY="${SCRIPT_DIR}/fsdp_loongrl_entry.py"
 
-# Match upstream fsdp launcher: run from ${SKYRL_HOME} so the entrypoint can
-# resolve integrations/ imports relative to the checkout.
+# Run from ${SKYRL_HOME} so ``integrations/`` imports resolve.
 cd "${SKYRL_HOME}"
 
 "${PYBIN}" "${FSDP_ENTRY}" \

@@ -1,46 +1,33 @@
 #!/bin/bash
-# Single-node 8-GPU GRPO training for Qwen3-8B on LoongRL (long-context multi-hop QA)
-# with Arctic RL + ZoRRo. Pure GRPO, no frozen reference model (use_kl_loss=false).
+# Arctic RL + ZoRRo: Qwen3-8B LoongRL long-context GRPO — single node / 8 H200s.
+# Pure GRPO, no frozen reference model (use_kl_loss=false).
 #
-# Same Arctic RL stack as the txt2sql recipe (FCA, CUDA-IPC weight sync, ZoRRo, Liger,
-# FA3 trainer / FLASH_ATTN inference) — only the env (`long_context_qa`), the dataset
-# (LoongRL HotpotQA + MuSiQue + 2WikiMQA), and the sequence-length defaults change.
+# Defaults to PROMPT_LEN=16384 (LoongRL's native length). With Qwen3-8B + ZeRO-3
+# this fits in 8xH200 HBM; on A100-80G drop PROMPT_LEN to 8192.
 #
-# Defaults to PROMPT_LEN=16384 — LoongRL is a 16K-context corpus, so any shorter cap
-# will filter out the bulk of the dataset. With Qwen3-8B (32K base context) + ZeRO-3
-# this fits in 8xH200 HBM; on smaller cards (A100-80G) drop PROMPT_LEN to 8192.
-#
-# Prerequisites (see README.md):
-#   1. Clone SkyRL at the pinned commit and `export SKYRL_HOME=<path>`.
-#   2. `uv` on PATH (the launcher builds a hermetic env per launch — no shared
-#      conda env required).
-#   3. `python download_data.py --output_dir $DATA_DIR` to produce
-#      $DATA_DIR/merged/{train,test}.parquet.
+# Prereqs (see README.md):
+#   1. Activated conda env with pinned deps; `export SKYRL_HOME=<clone>`.
+#   2. `python download_data.py --output_dir $DATA_DIR`.
 
 set -euxo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# SkyRL is required as a checkout (the Arctic RL × SkyRL integration code lives
-# at integrations/arctic_rl/ which is NOT inside the pip-installed package).
-# Pin: see ../README.md and ../<recipe>/requirements.txt.
+# SkyRL is required as a checkout: integrations/arctic_rl/ is not in the
+# pip-installed package. Pin: see ../README.md.
 if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; then
     echo "ERROR: SKYRL_HOME is unset or doesn't contain integrations/arctic_rl/."
     echo "       Clone SkyRL at the pinned commit (see ../README.md) and"
     echo "       'export SKYRL_HOME=<path to clone>' before running this script."
     exit 1
 fi
-# ${SCRIPT_DIR} contains the recipe-local ``arctic_rl/`` shim + ``sitecustomize.py``
-# that register the ``long_context_qa`` env. Ray workers pick these up because the
-# shim's entrypoint.py forwards this dir onto their ``runtime_env`` PYTHONPATH;
-# ``ProcessPoolExecutor`` reward-scorer children pick them up via sitecustomize.
+# ${SCRIPT_DIR} carries the recipe-local ``arctic_rl/`` shim + ``sitecustomize.py``
+# that register ``long_context_qa``. Ray workers pick these up via the shim's
+# entrypoint.py; PPE reward-scorer children pick them up via sitecustomize.
 export PYTHONPATH="${SKYRL_HOME}:${SCRIPT_DIR}:${PYTHONPATH:-}"
 
-# Driver: bare python, matching upstream
-# integrations/arctic_rl/examples/run_bird_grpo_8b_32gpu.sh on the pinned
-# ``arctic-rl-public`` merge (7636101a). The caller is expected to activate a
-# compatible env (e.g. the ``skyrl_v2`` conda env) beforehand — see this
-# recipe's README.
+# Matches upstream integrations/arctic_rl/examples/run_bird_grpo_8b_32gpu.sh:
+# bare python from a caller-activated env. See ../README.md.
 PYBIN="${PYBIN:-python}"
 
 export PYTHONUNBUFFERED=1
@@ -56,13 +43,9 @@ export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 export ARCTIC_CUDA_IPC_LOW_MEM=0
 export ARCTIC_WEIGHT_SYNC_STRICT_NAMES=0
 # Do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True on single-node TP>1:
-# it triggers torch's "Expandable segments are not compatible with memory pool"
-# assertion in vLLM's Ray-executor TP workers (pytorch/pytorch#147851). The
-# multi-node verl 32B launcher gets away with it because its placement-group
-# layout is different — single-node leaves allocator defaults.
+# it trips pytorch/pytorch#147851 inside vLLM's Ray-executor TP workers.
 
-# Reward matcher: "pure_exact_match" (default), "format_exact_match", "format_f1_score".
-# Boxed-answer extraction + SQuAD-style normalization, see arctic_rl/envs/long_context_qa_reward.py.
+# Reward matcher — see arctic_rl/envs/long_context_qa_reward.py.
 export REWARD_CALC_TYPE="${REWARD_CALC_TYPE:-pure_exact_match}"
 
 # ----- Single-node 8-GPU Arctic / ZoRRo topology -----
@@ -70,9 +53,8 @@ NUM_NODES=1
 GPUS_PER_NODE=8
 NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
-# TP=4 -> 2 inference engines. At 16K prompts the per-engine KV cache is the
-# tightest budget on this recipe (much bigger than txt2sql's 8K), so we shard
-# sampling more aggressively than txt2sql (TP=2).
+# TP=4 -> 2 vLLM engines. At 16K prompts KV cache is the tightest budget, so we
+# shard sampling more aggressively than txt2sql (TP=2).
 TP_SIZE="${TP_SIZE:-4}"
 NUM_ENGINES=$((NUM_GPUS / TP_SIZE))
 
@@ -80,21 +62,16 @@ ATTN_IMPL="${ATTN_IMPL:-flash_attention_3}"
 ARCTIC_ZERO_STAGE=3
 OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-false}"   # 8B fits in 8xH200 HBM
 
-# Long-context defaults: 16K prompt matches LoongRL; small global batch keeps the
-# single-node footprint manageable. Bump TRAIN_BSZ / N_SAMPLES for production runs.
-#
-# Sizing constraint (Arctic RL + ZoRRo): (MINI_BSZ * N_SAMPLES) / training_gpus
-# must be divisible by the trainer's per-GPU micro-batch (default 2). The defaults
-# below satisfy that — (8 * 4) / 8 = 4. If you override these, keep the ratio an
-# even multiple of 2 or arctic_rl/config.py:build_rl_config will refuse to start.
+# Sizing: (MINI_BSZ * N_SAMPLES) / training_gpus must be divisible by the
+# trainer's per-GPU micro-batch (default 2). Defaults below satisfy that
+# ((8 * 4) / 8 = 4); if you override, keep the ratio an even multiple.
 TRAIN_BSZ="${TRAIN_BSZ:-16}"
 MINI_BSZ="${MINI_BSZ:-8}"
 N_SAMPLES="${N_SAMPLES:-4}"
 PROMPT_LEN="${PROMPT_LEN:-16384}"
 RESPONSE_LEN="${RESPONSE_LEN:-2048}"
 
-# Bump vLLM's max_num_batched_tokens to fit at least one full (prompt + response)
-# sequence per scheduling step at the 16K prompt length.
+# Fits one full (prompt + response) per step at 16K/2K.
 VLLM_MAX_BATCHED="${VLLM_MAX_BATCHED:-24576}"
 
 LR="${LR:-1e-6}"
@@ -122,9 +99,9 @@ EXPERIMENT_NAME="longcontext_grpo_${MODEL_SHORT}_arl_z${ARCTIC_ZERO_STAGE}_${RUN
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"
 
-# Optional arctic speculative decoding (drop in a Qwen3-8B-trained 3-head checkpoint
-# via SPEC_MODEL=<path>). Off by default — the 32B blog-run head is tied to
-# Qwen3-32B's hidden size and won't load on 8B.
+# Optional Arctic speculative decoding. Off by default — the 32B head is tied
+# to Qwen3-32B's hidden size and won't load on 8B; supply an 8B-sized head via
+# SPEC_MODEL=<path>.
 SPEC_MODEL="${SPEC_MODEL:-}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-3}"
 SPEC_OVERRIDE=()
@@ -133,8 +110,7 @@ if [[ -n "${SPEC_MODEL}" ]]; then
     SPEC_OVERRIDE+=("trainer.arctic_rl.num_speculative_tokens=${NUM_SPEC_TOKENS}")
 fi
 
-# Match upstream arl launcher: run from ${SKYRL_HOME} so integrations/ imports
-# resolve relative to the checkout.
+# Run from ${SKYRL_HOME} so ``integrations/`` imports resolve.
 cd "${SKYRL_HOME}"
 
 "${PYBIN}" -m skyrl.train.entrypoints.main_base \

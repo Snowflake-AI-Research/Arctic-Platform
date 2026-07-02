@@ -1,17 +1,13 @@
-"""FSDP-native SkyRL entrypoint that registers ``long_context_qa`` on the
-driver + arranges for Ray workers to do the same.
+"""FSDP-native SkyRL entrypoint that registers ``long_context_qa``.
 
-Mirrors upstream's ``integrations/arctic_rl/examples/fsdp_bird_entry.py``: stock
-``main_base`` doesn't know about our env id, so we side-effect-import the
-recipe-local ``arctic_rl.envs`` package here (registers ``long_context_qa`` on
-the driver) and monkey-patch ``prepare_runtime_environment`` to forward the
-recipe dir onto worker ``runtime_env`` PYTHONPATH. We also replace
-``main_base.skyrl_entrypoint`` with a version that re-imports the shim inside
-Ray workers so registration fires there too.
+Stock ``main_base`` doesn't know about our env id, so we register it in all
+three interpreters that touch it: the driver (side-effect-import here), Ray
+workers (worker-side ``skyrl_entrypoint`` re-imports before running), and any
+``multiprocessing.spawn`` child of the reward scorer (picked up via
+``sitecustomize.py`` on the recipe dir).
 
-This is the FSDP-native sibling of ``arctic_rl/entrypoint.py`` (Arctic RL
-path). Both do the same three-interpreter-registration dance; the Arctic path
-goes through ``ArcticRLExp``, this one goes through ``BasePPOExp``.
+FSDP-native sibling of ``arctic_rl/entrypoint.py`` — Arctic goes through
+``ArcticRLExp``, this one through ``BasePPOExp``.
 """
 
 import os
@@ -21,27 +17,19 @@ from pathlib import Path
 import ray
 
 _HERE = Path(__file__).resolve()
-_RECIPE_DIR = _HERE.parent          # long_context_qa/
+_RECIPE_DIR = _HERE.parent
 _RECIPE_DIR_STR = str(_RECIPE_DIR)
 
-# Add the recipe dir to sys.path BEFORE importing so ``arctic_rl.envs`` is found.
-# ``sitecustomize.py`` (also in this dir) is already imported by ``site.py`` at
-# interpreter startup thanks to the launcher's PYTHONPATH, so
-# ``long_context_qa`` env registration + the
-# ``torch.nn.Module.named_non_persistent_buffers`` backport (needed by the
-# SkyRL FSDP model wrapper on torch-2.10.0+cu128) are already in place by the
-# time this file runs.
 if _RECIPE_DIR_STR not in sys.path:
     sys.path.insert(0, _RECIPE_DIR_STR)
 
-import arctic_rl.envs  # noqa: E402,F401  side-effect: register long_context_qa
+import arctic_rl.envs  # noqa: E402,F401  register long_context_qa on the driver
 
 import skyrl.train.entrypoints.main_base as _mb  # noqa: E402
 import skyrl.train.utils.utils as _skyrl_utils  # noqa: E402
 
 # Forward the recipe dir onto Ray workers' PYTHONPATH so worker-side imports of
-# arctic_rl.envs resolve. Same idea as upstream's fsdp_bird_entry.py, minus the
-# SKYRL_USE_LIGER passthrough (we don't need it here).
+# arctic_rl.envs resolve. Mirrors upstream fsdp_bird_entry.py.
 _original_prepare = _skyrl_utils.prepare_runtime_environment
 
 
