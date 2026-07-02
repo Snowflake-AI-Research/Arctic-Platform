@@ -7,10 +7,11 @@
 # Assumes CUDA 12.8 + Hopper (H100/H200) for FlashAttention 3. On A100/L40S set
 # ATTN_IMPL=flash_attention_2 in the launcher and drop the FA3 install line below.
 
+arctic-inference[vllm]
 # Arctic
 arctic-platform[rl]
-arctic-inference[vllm]
 liger-kernel
+ray==2.51.1
 
 # SkyRL pinned at PR #1837 merge (the dispatch hook the arctic_rl integration
 # requires). This gives you the pip-installed `skyrl` package; the launcher
@@ -22,4 +23,3 @@ skyrl @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7
 skyrl-gym @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315#subdirectory=skyrl-gym
 
 vllm==0.18.0
-ray==2.51.1

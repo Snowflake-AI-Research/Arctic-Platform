@@ -11,10 +11,14 @@
 # transformers<5, SkyRL pins transformers>=5.6.1; the override gives uv a
 # single deterministic resolve).
 
+arctic-inference[vllm]
 # Arctic
 arctic-platform[rl]
-arctic-inference[vllm]
 liger-kernel
+
+# Ray must match across the cluster (relevant for the >1-node variants of
+# this recipe). SkyRL pins this exact version.
+ray==2.51.1
 
 # SkyRL pinned at PR #1837 merge (the dispatch hook the arctic_rl integration
 # requires). This gives you the pip-installed `skyrl` package; the launcher
@@ -26,7 +30,3 @@ skyrl-gym @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc6770
 
 # Serving / kernels (arctic-inference patches vLLM 0.18.0).
 vllm==0.18.0
-
-# Ray must match across the cluster (relevant for the >1-node variants of
-# this recipe). SkyRL pins this exact version.
-ray==2.51.1

@@ -1,5 +1,17 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Download LoongRL-Train-Data from HuggingFace and save as SkyRL-format parquets.
 
@@ -33,7 +45,8 @@ Output layout::
 import argparse
 import os
 
-from datasets import concatenate_datasets, load_dataset
+from datasets import concatenate_datasets
+from datasets import load_dataset
 
 HF_REPO = "OldKingMeister/LoongRL-Train-Data"
 
@@ -106,8 +119,7 @@ def download_and_save(output_dir: str, test_ratio: float = 0.05, seed: int = 42)
         os.makedirs(task_dir, exist_ok=True)
         train_ds.to_parquet(os.path.join(task_dir, "train.parquet"))
         test_ds.to_parquet(os.path.join(task_dir, "test.parquet"))
-        print(f"  Saved: {task_dir}/{{train,test}}.parquet "
-              f"({len(train_ds)} / {len(test_ds)} rows)")
+        print(f"  Saved: {task_dir}/{{train,test}}.parquet ({len(train_ds)} / {len(test_ds)} rows)")
 
         all_train.append(train_ds)
         all_test.append(test_ds)
@@ -118,7 +130,7 @@ def download_and_save(output_dir: str, test_ratio: float = 0.05, seed: int = 42)
     merged_test = concatenate_datasets(all_test)
     merged_train.to_parquet(os.path.join(merged_dir, "train.parquet"))
     merged_test.to_parquet(os.path.join(merged_dir, "test.parquet"))
-    print(f"\nMerged:")
+    print("\nMerged:")
     print(f"  train: {len(merged_train)} rows -> {merged_dir}/train.parquet")
     print(f"  test:  {len(merged_test)} rows -> {merged_dir}/test.parquet")
 
