@@ -57,8 +57,10 @@ uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 
 uv pip install -r requirements.txt --override overrides.txt
 ```
 
-The default `ATTN_IMPL=flash_attention_2` matches upstream's ARL 8B example
-and works on both Hopper and pre-Hopper GPUs.
+The 8B launcher defaults to `ATTN_IMPL=flash_attention_2` (works on any
+CUDA GPU). The 4-node 32B launcher defaults to `flash_attention_3` for the
+2× speedup — install the FA3 wheel per the top-level
+[`README`](../README.md#install) before running the 32B recipe on Hopper.
 
 ## 2. Data
 

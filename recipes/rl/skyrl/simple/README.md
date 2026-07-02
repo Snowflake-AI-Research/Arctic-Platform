@@ -36,8 +36,10 @@ uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 
 uv pip install -r requirements.txt --override overrides.txt
 ```
 
-FlashAttention 3 (Hopper-only) is pulled by `arctic-inference[vllm]`. On
-A100/L40S the recipe falls back to FA2 automatically.
+This recipe defaults to FA2 (compatible with any CUDA GPU) and doesn't
+require the separate FA3 wheel. If you're running the 4-node 32B recipes
+in this repo on Hopper, see the top-level [`README`](../README.md#install)
+for the FA3 install step.
 
 ## 2. Data preparation
 

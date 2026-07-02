@@ -42,7 +42,20 @@ once, `conda activate skyrl_arl`, and any recipe launches from bare `python`.
    uv pip install -r <recipe>/requirements.txt --override <recipe>/overrides.txt
    ```
 
-3. **Run** — `cd <recipe>/`, follow its README for data prep, then `bash run_*.sh`.
+3. **(Hopper only) Install FlashAttention-3.** Both 4-node 32B launchers
+   default to `ATTN_IMPL=flash_attention_3` for the 2× speedup vs FSDP. Grab
+   PyTorch's [official FA3 wheel](https://dev-discuss.pytorch.org/t/flash-attention-3-wheels/3322)
+   matching your CUDA build:
+
+   ```bash
+   uv pip install flash-attn-3 --index-url https://download.pytorch.org/whl/cu128
+   ```
+
+   (`cu126`, `cu130` indices also available.) Skip this on A100/L40S and
+   launch with `ATTN_IMPL=flash_attention_2` — the 8B iteration launchers
+   already default to FA2.
+
+4. **Run** — `cd <recipe>/`, follow its README for data prep, then `bash run_*.sh`.
 
 ## Anatomy of a recipe
 
