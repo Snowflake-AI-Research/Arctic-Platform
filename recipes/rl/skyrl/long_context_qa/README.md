@@ -58,8 +58,8 @@ uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 
 uv pip install -r requirements.txt --override overrides.txt
 ```
 
-FlashAttention 3 (Hopper-only) is pulled by `arctic-inference[vllm]`. On
-A100/L40S set `ATTN_IMPL=flash_attention_2` when launching (see step 4).
+The default `ATTN_IMPL=flash_attention_2` matches upstream's ARL 8B example
+and works on both Hopper and pre-Hopper GPUs.
 
 ## 2. Data
 
@@ -119,7 +119,7 @@ Useful overrides (set as env vars or Hydra args after the script):
 | `MINI_BSZ`       | `8`              | Actor mini-batch |
 | `N_SAMPLES`      | `4`              | GRPO group size |
 | `TP_SIZE`        | `4`              | Sampling TP — 2 engines/node at TP=4 |
-| `ATTN_IMPL`      | `flash_attention_3` | Set to `flash_attention_2` on A100/L40S |
+| `ATTN_IMPL`      | `flash_attention_2` | Matches upstream ARL 8B example; on A100/L40S keep as-is |
 | `REWARD_CALC_TYPE` | `pure_exact_match` | See table above |
 
 The launcher passes the rest through unchanged — pure GRPO, `use_kl_loss=false`,

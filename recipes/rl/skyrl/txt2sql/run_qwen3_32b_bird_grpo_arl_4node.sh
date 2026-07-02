@@ -38,8 +38,8 @@ export RAY_DEDUP_LOGS=0
 export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export TORCH_COMPILE_DISABLE=1
 export VLLM_DISABLE_COMPILE_CACHE=1
-# Also disable torch.inductor's on-disk cache — a stale compiled graph from a
-# prior run with fuse_allreduce_rms=true can otherwise fail warm-up with
+# Also disable inductor's on-disk cache — stale compiled graphs from a prior
+# run with fuse_allreduce_rms=true can otherwise reuse and fail warm-up with
 #   AssertionError: Flashinfer workspace must be initialized when using flashinfer
 export TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${HOME}/.cache/vllm}"
@@ -102,15 +102,11 @@ EXPERIMENT_NAME="bird_grpo_${MODEL_SHORT}_arl_z${ARCTIC_ZERO_STAGE}_${NUM_NODES}
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"
 
-# Arctic-Inference config (raw passthrough to vLLM AsyncEngineArgs). See the
-# BIRD-8B launcher for the full rationale; TL;DR is:
-#   * optimization_level=1 pins fuse_allreduce_rms=false inside vLLM's compile
-#     pipeline (belt to the pass_config suspenders below), unblocking TP>1 +
-#     Hopper from the `Flashinfer workspace must be initialized` assertion.
-#   * compilation_config.pass_config.fuse_allreduce_rms=false: explicit but
-#     sometimes dropped by the OmegaConf -> AsyncEngineArgs plumbing in this
-#     SkyRL checkout, so O1 above is what actually holds.
-# Matches integrations/arctic_rl/examples/run_bird_grpo_32b_32gpu.sh.
+# Inference knobs forwarded to vLLM via trainer.arctic_rl.arctic_inference_config
+# (raw passthrough). Matches upstream integrations/arctic_rl/examples/
+# run_bird_grpo_32b_32gpu.sh: optimization_level=1 pins fuse_allreduce_rms=false
+# in vLLM's compile pipeline, unblocking TP>1 + Hopper from the
+# `Flashinfer workspace must be initialized` assertion.
 USE_FCA="${USE_FCA:-True}"
 SPEC_MODEL="${SPEC_MODEL:-}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-3}"

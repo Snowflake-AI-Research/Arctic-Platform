@@ -113,11 +113,10 @@ EXPERIMENT_NAME="longcontext_grpo_${MODEL_SHORT}_arl_z${ARCTIC_ZERO_STAGE}_${NUM
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"
 
-# Arctic-Inference config (raw passthrough to vLLM AsyncEngineArgs). Same
-# rationale as the BIRD 32B recipe — optimization_level=1 pins
-# fuse_allreduce_rms=false so TP>1 doesn't hit the FlashInfer-workspace
-# assertion; the nested compilation_config.pass_config disable is belt+
-# suspenders.
+# Inference knobs forwarded to vLLM via trainer.arctic_rl.arctic_inference_config.
+# Same rationale as the BIRD 32B recipe / upstream run_bird_grpo_32b_32gpu.sh:
+# optimization_level=1 pins fuse_allreduce_rms=false, unblocking TP>1 + Hopper
+# from the `Flashinfer workspace must be initialized` assertion.
 USE_FCA="${USE_FCA:-True}"
 SPEC_MODEL="${SPEC_MODEL:-}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-3}"

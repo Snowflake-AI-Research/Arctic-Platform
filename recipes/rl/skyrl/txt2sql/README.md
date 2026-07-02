@@ -57,8 +57,8 @@ uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 
 uv pip install -r requirements.txt --override overrides.txt
 ```
 
-FlashAttention 3 (Hopper-only) is pulled by `arctic-inference[vllm]`. On
-A100/L40S set `ATTN_IMPL=flash_attention_2` when launching (see step 4).
+The default `ATTN_IMPL=flash_attention_2` matches upstream's ARL 8B example
+and works on both Hopper and pre-Hopper GPUs.
 
 ## 2. Data
 
@@ -89,7 +89,7 @@ Then preprocess:
 python download_data.py \
     --bird_dir ~/data/bird/raw \
     --output_dir ~/data/bird \
-    --max_tokens 8192 \
+    --max_tokens 16384 \
     --tokenizer Qwen/Qwen3-8B
 ```
 
@@ -97,14 +97,16 @@ Writes:
 
 ```
 ~/data/bird/
-├── train.parquet      ~9k rows after the 8K-token filter
+├── train.parquet      ~9k rows after the token-length filter
 └── val.parquet        ~1.5k rows
 ```
 
-The `--max_tokens 8192` cap matches the single-node launcher's
-`PROMPT_LEN=8192` and drops BIRD's long-tail outlier DBs whose schema doesn't
-fit. Re-run with `--max_tokens 32768 --tokenizer Qwen/Qwen3-32B` before the
-4-node 32B run so the long-context examples survive the filter.
+The `--max_tokens 16384` cap matches the single-node launcher's
+`PROMPT_LEN=16384` and drops BIRD's long-tail outlier DBs whose schema doesn't
+fit. BIRD prompts are schema-heavy (~14K tokens on the tail), so 8K filters
+the dataset down to zero — that's why the default is 16K, not 8K. Re-run
+with `--max_tokens 32768 --tokenizer Qwen/Qwen3-32B` before the 4-node 32B
+run so the long-context examples survive the filter.
 
 `download_data.py` is a thin wrapper around upstream's
 `integrations.arctic_rl.envs.preprocess_bird` — it needs `SKYRL_HOME` set.
@@ -126,13 +128,15 @@ Useful overrides (set as env vars or Hydra args after the script):
 | Knob             | Default          | Notes |
 | ---------------- | ---------------- | --- |
 | `MODEL`          | `Qwen/Qwen3-8B`  | Larger models work but expect to tune `TP_SIZE` + `OFFLOAD_OPTIMIZER` |
-| `PROMPT_LEN`     | `8192`           | Raise to 16K/32K only after re-running `download_data.py --max_tokens` |
+| `PROMPT_LEN`     | `16384`          | Fits BIRD's schema-heavy tail; re-run `download_data.py --max_tokens` before dropping |
 | `RESPONSE_LEN`   | `2048`           | |
 | `TRAIN_BSZ`      | `32`             | Global GRPO batch |
 | `MINI_BSZ`       | `16`             | Actor mini-batch |
 | `N_SAMPLES`      | `8`              | GRPO group size |
-| `TP_SIZE`        | `2`              | Sampling TP — 4 engines at TP=2 |
-| `ATTN_IMPL`      | `flash_attention_3` | Set to `flash_attention_2` on A100/L40S |
+| `TP_SIZE`        | `4`              | Sampling TP — 2 engines at TP=4, matches the 32B recipe's multi-rank code path |
+| `ATTN_IMPL`      | `flash_attention_2` | Matches upstream ARL 8B example; on A100/L40S keep as-is |
+| `OFFLOAD_OPTIMIZER` | `true`         | Matches upstream ARL 8B example |
+| `USE_FCA`        | `False`          | Set to `True` when the arctic_inference wheel is built with FCA support |
 | `LOGGER`         | `console`        | Set to `wandb` and export `WANDB_API_KEY` to log to wandb |
 
 The launcher passes the rest through unchanged — pure GRPO, `use_kl_loss=false`,

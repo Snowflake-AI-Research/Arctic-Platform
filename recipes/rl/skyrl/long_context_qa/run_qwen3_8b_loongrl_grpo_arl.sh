@@ -53,15 +53,14 @@ NUM_NODES=1
 GPUS_PER_NODE=8
 NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
-# TP=4 -> 2 vLLM engines. At 16K prompts KV cache is the tightest budget, so we
-# shard sampling more aggressively than txt2sql (TP=2).
+# TP=4 -> 2 vLLM engines. At 16K prompts KV cache is the tightest budget on
+# 8xH200; also matches the 4-node 32B recipe's multi-rank code path.
 TP_SIZE="${TP_SIZE:-4}"
 NUM_ENGINES=$((NUM_GPUS / TP_SIZE))
 
+# FA2 + OFFLOAD=true match upstream's ARL 8B example and the BIRD-8B sibling.
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 ARCTIC_ZERO_STAGE=3
-# 8B fits in 8xH200 HBM without optimizer offload, but upstream's converged
-# 32B recipe enables offload — keep on by default so hyperparams transfer.
 OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-true}"
 
 # Sizing: (MINI_BSZ * N_SAMPLES) / training_gpus must be divisible by the
@@ -101,14 +100,11 @@ EXPERIMENT_NAME="longcontext_grpo_${MODEL_SHORT}_arl_z${ARCTIC_ZERO_STAGE}_${RUN
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"
 
-# Arctic-Inference config (raw passthrough to vLLM AsyncEngineArgs). See the
-# BIRD-8B launcher for the full rationale; TL;DR: optimization_level=1 pins
-# fuse_allreduce_rms=false, unblocking TP>1 from the FlashInfer-workspace
-# assertion. Speculative decoding is off by default — the 32B head is tied to
-# Qwen3-32B's hidden size and won't load on 8B; supply an 8B-sized 3-head
-# checkpoint via SPEC_MODEL=<path> to enable.
-USE_FCA="${USE_FCA:-False}"
-SPEC_MODEL="${SPEC_MODEL:-}"
+# Inference knobs forwarded to vLLM via trainer.arctic_rl.arctic_inference_config.
+# See the BIRD-8B launcher for the fuse_allreduce_rms / optimization_level=1
+# rationale (unblocks TP>1 from the FlashInfer-workspace assertion).
+USE_FCA="${USE_FCA:-False}"     # requires arctic_inference wheel built with FCA support
+SPEC_MODEL="${SPEC_MODEL:-}"    # 32B-tied; supply 8B-sized 3-head via SPEC_MODEL=<path>
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-3}"
 
 AI_CFG_PARTS=('optimization_level: 1'
