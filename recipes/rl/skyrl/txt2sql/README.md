@@ -1,65 +1,68 @@
-# Txt2SQL — BIRD-SQL GRPO (Qwen3-8B single-node + Qwen3-32B 4-node)
+# Txt2SQL — BIRD-SQL GRPO with Arctic RL × SkyRL
 
-GRPO training for **Qwen3** on **BIRD-SQL**, driven by SkyRL's PPO trainer with the
-[Arctic RL](../../../arctic_platform/rl/) backend. Two launchers ship in this directory:
+GRPO training for **Qwen3** on **BIRD-SQL**, driven by SkyRL's GRPO trainer with
+either the Arctic RL + ZoRRo backend or SkyRL's native FSDP backend. Three
+launchers ship in this directory:
 
-| Launcher | Topology | Notes |
-| --- | --- | --- |
-| `run_qwen3_8b_bird_grpo_arl.sh` | 1 node × 8 H200 | Iteration target — fits on a standalone host. |
-| `run_qwen3_32b_bird_grpo_arl_4node.sh` | **4 nodes × 8 H200** | The exact run behind the **~2× speedup** vs SkyRL FSDP-native baseline reported in the [Arctic RL launch blog][blog]. |
+| Launcher | Backend | Topology | Notes |
+| --- | --- | --- | --- |
+| `run_qwen3_8b_bird_grpo_arl.sh` | Arctic RL | 1 × 8 H200 | Iteration target — Qwen3-8B, fits on a standalone host. |
+| `run_qwen3_32b_bird_grpo_arl_4node.sh` | Arctic RL | **4 × 8 H200** | The exact run behind the ~2× speedup in the [Arctic RL launch blog][blog]. |
+| `run_qwen3_32b_bird_grpo_fsdp_4node.sh` | SkyRL FSDP-native | **4 × 8 H200** | Same hyperparams as the arctic sibling — the wall-clock A/B baseline. |
 
-Both launchers use the same Arctic RL stack: FCA + `fuse_allreduce_rms` workaround,
-CUDA-IPC weight sync, ZoRRo, Liger, FA3 trainer / FLASH\_ATTN inference.
+The 4-node BIRD launcher is the direct SkyRL twin of the blog's flagship BIRD
+run (verl twin: [`recipes/rl/verl/txt2sql/run_qwen3_32b_bird_grpo_arl.sh`](../../verl/txt2sql/run_qwen3_32b_bird_grpo_arl.sh)).
 
-| Knob              | 8B single-node | 32B 4-node |
-| ---               | --- | --- |
-| Model             | `Qwen/Qwen3-8B` | `Qwen/Qwen3-32B` |
-| Reward            | Upstream `integrations.arctic_rl.envs.bird:BirdEnv` (gold-SQL execution match; same reward fn used in verl PR #6) | same |
-| Trainer           | DeepSpeed ZeRO-3, optimizer offload off | DeepSpeed ZeRO-3, optimizer offload **on** |
-| Sampling          | vLLM 0.18.0 (TP=2, 4 engines)  | vLLM 0.18.0 (TP=4, 8 engines) |
-| GPU layout        | Arctic RL colocates train + sample across 8 GPUs | Arctic RL colocates train + sample across 32 GPUs |
-| Sequence lengths  | prompt 8192, response 2048 | prompt 32768, response 4096 |
-| Global batch      | 32 prompts × 8 samples = 256 trajectories | 128 prompts × 16 samples = 2048 trajectories |
+## What's in this folder
 
-## 1. Install packages
+| File | Role |
+| --- | --- |
+| `download_data.py`                       | Preprocesses raw BIRD into SkyRL-format parquets (wrapper around upstream's `integrations.arctic_rl.envs.preprocess_bird`) |
+| `run_qwen3_8b_bird_grpo_arl.sh`          | Single-node Arctic RL launcher (8 GPU, Qwen3-8B) |
+| `run_qwen3_32b_bird_grpo_arl_4node.sh`   | 4-node Arctic RL launcher (32 GPU, Qwen3-32B) |
+| `run_qwen3_32b_bird_grpo_fsdp_4node.sh`  | 4-node **FSDP-native** launcher (baseline sibling for the A/B) |
+| `requirements.txt`, `overrides.txt`      | Pinned Python deps (`uv` install) |
+
+`BirdEnv` and the FSDP entrypoint (`fsdp_bird_entry.py`) both live upstream in
+`$SKYRL_HOME/integrations/arctic_rl/` — this recipe ships no Python. Contrast
+with the sibling `long_context_qa/` recipe, which vendors an `arctic_rl/` shim
+because its env is new.
+
+## 1. Install
+
+Same env as the sibling `simple/` and `long_context_qa/` recipes — if you've
+built either of those, `conda activate skyrl_arl` and skip step 2.
 
 ```bash
-conda create -y -n skyrl_txt2sql python=3.12
-conda activate skyrl_txt2sql
-pip install uv
+# 1. Clone SkyRL at the pinned merge commit on the ``arctic-rl-public`` branch.
+#    ``arctic-rl-public`` ships the verified BIRD Arctic-RL + FSDP recipes;
+#    later commits on ``main`` / ``novasky-main`` call
+#    ``nn.Module.named_non_persistent_buffers`` (not in any released PyTorch
+#    as of 2026-06) and break the FSDP path. The launchers dispatch from
+#    ``$SKYRL_HOME/integrations/arctic_rl/`` — this directory is not shipped
+#    in the pip-installed ``skyrl`` package, so a checkout is required.
+git clone https://github.com/Snowflake-AI-Research/SkyRL
+cd SkyRL && git checkout 7636101a71f1849b6127ee10232fb277d2f31174 && cd ..
+export SKYRL_HOME=$PWD/SkyRL
 
-git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
-git clone https://github.com/NovaSky-AI/SkyRL
-cd SkyRL && git checkout 76f5f467c6804e8acc6273cc677098b7679b0315 && cd ..
-export SKYRL_HOME=$PWD/SkyRL          # required by the launcher + download_data.py
-
-cd Arctic-Platform/recipes/rl/skyrl/txt2sql
-
-# CUDA 12.8 — change the index URL if you're on a different CUDA version.
+# 2. Create the env.
+conda create -y -n skyrl_arl python=3.12.13
+conda activate skyrl_arl
+pip install -q uv
 uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 -U
 uv pip install -r requirements.txt --override overrides.txt
-uv pip install -U pip wheel packaging setuptools
-# FA2 (matches torch 2.10 + cu12 + cp312 ABI)
-uv pip install \
-    "flash-attn@https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
-# FA3 (Hopper only — H100/H200). Skip this line and set
-# ATTN_IMPL=flash_attention_2 in the launcher if you're on A100/L40S.
-uv pip install \
-    "flash-attn-3@https://download.pytorch.org/whl/cu128/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_28_x86_64.whl"
 ```
 
-The SkyRL clone gives you `integrations/arctic_rl/` (config/trainer/generator/BirdEnv/
-preprocessor) — used directly via `$SKYRL_HOME`. The `requirements.txt` pull additionally
-installs the `skyrl` Python *package* (Hydra entrypoint + dataset/utils) from the same
-commit so both pieces stay in sync.
+FlashAttention 3 (Hopper-only) is pulled by `arctic-inference[vllm]`. On
+A100/L40S set `ATTN_IMPL=flash_attention_2` when launching (see step 4).
 
-## 2. Data preparation
+## 2. Data
 
-BIRD-SQL is gated behind a sign-up form, so the raw download is **not** automated.
-Stage the files manually first:
+BIRD-SQL is gated behind a sign-up form, so the raw download is **not**
+automated. Stage it manually first:
 
-1. Download the BIRD-SQL train + dev releases from the
-   [BIRD-bench site](https://bird-bench.github.io/) (you'll need to register).
+1. Grab the BIRD-SQL train + dev releases from the
+   [BIRD-bench site](https://bird-bench.github.io/) (registration required).
 2. Unpack them so the layout matches what BIRD ships:
 
    ```
@@ -76,9 +79,7 @@ Stage the files manually first:
            └── ...
    ```
 
-Then preprocess with `download_data.py`, a thin wrapper around upstream's
-`integrations.arctic_rl.envs.preprocess_bird` (in your SkyRL clone) that materializes
-per-sample SQLite paths and the `arctic_text_to_sql_r1` prompt format:
+Then preprocess:
 
 ```bash
 python download_data.py \
@@ -88,7 +89,7 @@ python download_data.py \
     --tokenizer Qwen/Qwen3-8B
 ```
 
-Result:
+Writes:
 
 ```
 ~/data/bird/
@@ -96,52 +97,68 @@ Result:
 └── val.parquet        ~1.5k rows
 ```
 
-The `--max_tokens 8192` cap matches the launcher's `PROMPT_LEN=8192` and drops BIRD's
-long-tail outlier DBs (e.g. `works_cycles`, `movie_3`) whose schema doesn't fit. Raise it
-(e.g. `--max_tokens 16384`) only if you also raise `PROMPT_LEN` in the launcher.
+The `--max_tokens 8192` cap matches the single-node launcher's
+`PROMPT_LEN=8192` and drops BIRD's long-tail outlier DBs whose schema doesn't
+fit. Re-run with `--max_tokens 32768 --tokenizer Qwen/Qwen3-32B` before the
+4-node 32B run so the long-context examples survive the filter.
 
-## 3. Train
+`download_data.py` is a thin wrapper around upstream's
+`integrations.arctic_rl.envs.preprocess_bird` — it needs `SKYRL_HOME` set.
 
-### 3a. Single-node 8B
+## 3. Reward
+
+Upstream `integrations.arctic_rl.envs.bird:BirdEnv` — executes the model's SQL
+against the per-sample SQLite and compares result sets to the gold query. Same
+reward function as the [verl BIRD recipe](../../verl/txt2sql/) (verl PR #6).
+
+## 4. Train
 
 ```bash
 bash run_qwen3_8b_bird_grpo_arl.sh
 ```
 
-Common overrides (env vars consumed by the script):
+Useful overrides (set as env vars or Hydra args after the script):
+
+| Knob             | Default          | Notes |
+| ---------------- | ---------------- | --- |
+| `MODEL`          | `Qwen/Qwen3-8B`  | Larger models work but expect to tune `TP_SIZE` + `OFFLOAD_OPTIMIZER` |
+| `PROMPT_LEN`     | `8192`           | Raise to 16K/32K only after re-running `download_data.py --max_tokens` |
+| `RESPONSE_LEN`   | `2048`           | |
+| `TRAIN_BSZ`      | `32`             | Global GRPO batch |
+| `MINI_BSZ`       | `16`             | Actor mini-batch |
+| `N_SAMPLES`      | `8`              | GRPO group size |
+| `TP_SIZE`        | `2`              | Sampling TP — 4 engines at TP=2 |
+| `ATTN_IMPL`      | `flash_attention_3` | Set to `flash_attention_2` on A100/L40S |
+| `LOGGER`         | `console`        | Set to `wandb` and export `WANDB_API_KEY` to log to wandb |
+
+The launcher passes the rest through unchanged — pure GRPO, `use_kl_loss=false`,
+log-probs recomputed via the training engine under ZoRRo (no frozen reference
+model and no separate log-prob GPUs).
+
+### Enabling Arctic speculative decoding
+
+Off by default: the 32B-trained 3-head spec checkpoint from the blog is tied
+to Qwen3-32B's hidden size and won't load on 8B. To turn it on, supply an
+8B-sized 3-head checkpoint:
 
 ```bash
-LOGGER=wandb                  # default: console
-DATA_DIR=~/data/bird          # default
-CKPT_DIR=~/checkpoints/<run>  # default: ~/checkpoints/<auto-named>
-MODEL=Qwen/Qwen3-8B           # default
-TRAIN_BSZ=64 MINI_BSZ=32      # scale up if you have headroom
-PROMPT_LEN=16384              # raise to 16K once you re-run download_data with --max_tokens 16384
-ATTN_IMPL=flash_attention_2   # for A100/L40S (default: flash_attention_3, Hopper)
-OFFLOAD_OPTIMIZER=true        # if you run into OOM
+SPEC_MODEL=/path/to/qwen3-8b-bird-3head \
+    bash run_qwen3_8b_bird_grpo_arl.sh
 ```
 
-You can also pass any SkyRL Hydra override straight through:
+## 5. 4-node Qwen3-32B + FSDP A/B
 
-```bash
-bash run_qwen3_8b_bird_grpo_arl.sh \
-    trainer.train_batch_size=64 \
-    generator.n_samples_per_prompt=16
-```
-
-### 3b. 4-node 32B (blog speedup run)
-
-This is the launcher behind the 2× wall-clock speedup numbers in the
-[Arctic RL launch blog][blog]. Re-stage the BIRD parquets with `--max_tokens 32768
---tokenizer Qwen/Qwen3-32B` first so the long-context examples survive the filter.
+The 4-node launcher matches the SkyRL twin of the blog's flagship BIRD run:
+NUM_NODES=4, GPUS_PER_NODE=8, TP=4, 8 vLLM engines, ZeRO-3 + optimizer offload,
+32K prompt / 4K response, 128 prompts × 16 samples = 2048 trajectories/step,
+FA3 on Hopper. Re-run `download_data.py` with `--max_tokens 32768
+--tokenizer Qwen/Qwen3-32B` to a shared-FS `DATA_DIR`, then:
 
 ```bash
 # On the head node + each of the 3 workers (matching python + deps everywhere):
 ray start --head    --port=6379 --num-gpus=8            # head
 ray start --address=<head_ip>:6379 --num-gpus=8         # x3 workers
-
-# Sanity check:
-ray status   # -> "4 active node(s)" and 32 GPUs total
+ray status  # -> "4 active node(s)" and 32 GPUs total
 
 # On the head node only:
 DATA_DIR=/shared/data/bird \
@@ -150,38 +167,32 @@ LOGGER=wandb \
 bash run_qwen3_32b_bird_grpo_arl_4node.sh
 ```
 
-`DATA_DIR` and `CKPT_DIR` **must be on a shared filesystem** (NFS / Lustre / S3-FUSE)
-that all 4 nodes can read — the head writes the CUDA-IPC weight-sync tensor to
-`CKPT_DIR/_arctic_rl/`, and every worker mmap-reads it for weight refresh.
+`DATA_DIR` and `CKPT_DIR` **must be on a shared filesystem** — the head writes
+the CUDA-IPC weight-sync tensor to `CKPT_DIR/_arctic_rl/`, every worker
+mmap-reads it, and Ray's data-loader tasks stream parquets + per-sample SQLite
+files from `DATA_DIR` on any node.
 
-The companion **FSDP-native baseline** (same recipe, no Arctic RL) lives upstream at
-[`run_bird_grpo_32b_32gpu_fsdp.sh`][skyrl-32b-fsdp] — use it to reproduce the speedup
-A/B exactly. Both runs share train batch / sequence lengths / optimizer state so the
-wall-clock difference is the Arctic stack's contribution.
+### FSDP-native baseline (for the wall-clock A/B)
 
-### Enabling Arctic speculative decoding
-
-By default speculative decoding is **off**: the 32B-trained 3-head spec checkpoint from
-the blog is tied to Qwen3-32B's hidden size and won't load on 8B. To turn it on, drop in
-an 8B-trained 3-head checkpoint:
+Run the FSDP sibling with the **same** `DATA_DIR` / hyperparams / hostfile so
+the only variable is the training backend:
 
 ```bash
-SPEC_MODEL=/path/to/qwen3-8b-bird-3head \
-    bash run_qwen3_8b_bird_grpo_arl.sh
+bash run_qwen3_32b_bird_grpo_fsdp_4node.sh
 ```
 
-## How this is wired
+Same env, launch pattern, and hyperparameters as the ARL sibling — only the
+trainer flags (`trainer.strategy=fsdp2`, no `trainer.arctic_rl.*`) and the
+entrypoint (upstream's `integrations/arctic_rl/examples/fsdp_bird_entry.py` in
+`$SKYRL_HOME`) differ.
 
-- `trainer.override_entrypoint=integrations.arctic_rl.entrypoint` dispatches straight to
-  the Arctic RL × SkyRL glue in your `$SKYRL_HOME` clone. This recipe ships zero Python —
-  the launcher sets `PYTHONPATH=$SKYRL_HOME` and hands off to upstream's Ray entrypoint,
-  which forwards `$SKYRL_HOME` onto Ray workers' `runtime_env` for you.
-- `environment.env_class=bird` resolves to upstream's `integrations.arctic_rl.envs.bird:BirdEnv`
-  (registered as both `bird` and `bird_sql` by `integrations.arctic_rl.envs`).
-- `trainer.arctic_rl.colocate=true` shares the 8 GPUs across Arctic RL's training and
-  sampling jobs; `trainer.placement.colocate_all=false` keeps SkyRL from claiming a
-  conflicting placement group on top.
+### Speedup
+
+The [Arctic RL launch blog][blog] reports **~2.38×** end-to-end on this exact
+4-node BIRD configuration (Arctic RL + ZoRRo vs SkyRL FSDP-native). To
+reproduce the A/B locally, run both launchers back-to-back against the same
+`DATA_DIR` and compare `timing/generate` + `timing/train` at steady state (step
+3+). The companion `long_context_qa/` recipe reproduces the same story on the
+16K-context corpus at **2.17×** end-to-end (see [`long_context_qa/README.md §5`](../long_context_qa/README.md#5-4-node-qwen3-32b--fsdp-ab)).
 
 [blog]: https://www.snowflake.com/en/blog/engineering/arctic-rl-open-source-backend/
-[skyrl-32b]: https://github.com/NovaSky-AI/SkyRL/blob/main/integrations/arctic_rl/examples/run_bird_grpo_32b_32gpu.sh
-[skyrl-32b-fsdp]: https://github.com/NovaSky-AI/SkyRL/blob/main/integrations/arctic_rl/examples/run_bird_grpo_32b_32gpu_fsdp.sh

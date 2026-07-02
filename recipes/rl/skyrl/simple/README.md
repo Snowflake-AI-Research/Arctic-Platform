@@ -17,45 +17,27 @@ SkyRL boots a local Ray instance automatically.
 | GPU layout        | Arctic RL colocates train + sample on the single GPU |
 | Sequence lengths  | prompt 512, response 1024 |
 
-## 1. Install packages
+## 1. Install
 
-Use a fresh conda env so the install is actually exercised (don't share with a dev env):
-
-```bash
-conda create -y -n skyrl_simple python=3.12
-conda activate skyrl_simple
-pip install uv
-```
-
-Clone Arctic-Platform (this recipe) and SkyRL (Arctic RL × SkyRL integration code).
-The recipe uses SkyRL's `integrations/arctic_rl/` directory, which is *not* in the
-pip-installed `skyrl` package — so a checkout at the pinned commit is required:
+Same env as the sibling `txt2sql/` and `long_context_qa/` recipes — if you've
+built either of those, `conda activate skyrl_arl` and skip step 2.
 
 ```bash
-git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
-
-git clone https://github.com/NovaSky-AI/SkyRL
-cd SkyRL && git checkout 76f5f467c6804e8acc6273cc677098b7679b0315 && cd ..
+# 1. Clone SkyRL at the pinned merge commit on the ``arctic-rl-public`` branch.
+git clone https://github.com/Snowflake-AI-Research/SkyRL
+cd SkyRL && git checkout 7636101a71f1849b6127ee10232fb277d2f31174 && cd ..
 export SKYRL_HOME=$PWD/SkyRL
 
-cd Arctic-Platform/recipes/rl/skyrl/simple
-```
-
-Install pinned deps. Assumes **CUDA 12.8** — change the `torch` index URL below if you're
-on a different CUDA version. `overrides.txt` forces `transformers==4.57.6`, which both
-vLLM 0.18.0 and the Arctic RL trainer are validated against.
-
-```bash
+# 2. Create the env.
+conda create -y -n skyrl_arl python=3.12.13
+conda activate skyrl_arl
+pip install -q uv
 uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 -U
 uv pip install -r requirements.txt --override overrides.txt
-uv pip install -U pip wheel packaging setuptools
-uv pip install \
-    "flash-attn@https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 ```
 
-On Hopper (H100/H200) you can also install FlashAttention 3 from PyTorch's cu128 index for
-faster decode; the multi-node BIRD recipes do that by default. This recipe sticks with FA2
-since it's broadly available.
+FlashAttention 3 (Hopper-only) is pulled by `arctic-inference[vllm]`. On
+A100/L40S the recipe falls back to FA2 automatically.
 
 ## 2. Data preparation
 

@@ -1,26 +1,19 @@
 #!/bin/bash
-# Multi-node 4x8 GPU GRPO training for Qwen3-32B on BIRD-SQL with Arctic RL + ZoRRo.
+# Arctic RL + ZoRRo: Qwen3-32B BIRD-SQL GRPO — 4 nodes / 32 H200s.
 #
-# This is the run behind the ~2x speedup vs SkyRL FSDP-native baseline that ships
-# in the Arctic RL launch blog. The single-node 8B sibling
-# (`run_qwen3_8b_bird_grpo_arl.sh`) is the iteration target — same Arctic RL
-# stack (FCA, CUDA-IPC weight sync, ZoRRo, Liger, FA3 trainer / FLASH_ATTN
-# inference), scaled up to 32 H200s.
+# The run behind the ~2× wall-clock speedup vs SkyRL FSDP-native baseline in
+# the [Arctic RL launch blog][blog]. Wall-clock A/B baseline sibling:
+# `run_qwen3_32b_bird_grpo_fsdp_4node.sh`.
 #
-# Prerequisites (see README.md):
-#   1. Conda env with pinned deps (`uv pip install -r requirements.txt
-#      --override overrides.txt`) on EVERY node (Ray requires matching Python
-#      and exact dep versions across the cluster).
-#   2. 4-node Ray cluster up:
+# Prereqs (see README.md):
+#   1. Matching conda env with pinned deps on EVERY node (Ray requires it).
+#   2. 4-node Ray cluster:
 #         head:   ray start --head --port=6379 --num-gpus=8
 #         worker: ray start --address=<head_ip>:6379 --num-gpus=8   # x3
-#      Verify with `ray status` -> "4 active node(s)" and 32 GPUs total.
-#   3. SkyRL cloned at the pinned commit and `export SKYRL_HOME=<path>` on the
-#      driver (workers pick it up from the runtime_env injected by entrypoint.py).
-#   4. Raw BIRD-SQL staged at $BIRD_RAW, then
-#      `python download_data.py --bird_dir $BIRD_RAW --output_dir $DATA_DIR`
-#      to produce $DATA_DIR/{train,val}.parquet. $DATA_DIR MUST live on a shared
-#      filesystem visible to all 4 nodes.
+#   3. SkyRL cloned at the pinned commit; `export SKYRL_HOME=<path>`.
+#   4. BIRD parquets on a shared FS visible to all 4 nodes.
+#
+# [blog]: https://www.snowflake.com/en/blog/engineering/arctic-rl-open-source-backend/
 
 set -euxo pipefail
 
@@ -30,9 +23,13 @@ if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; th
     echo "       'export SKYRL_HOME=<path to clone>' before running this script."
     exit 1
 fi
-# $SKYRL_HOME is the only PYTHONPATH addition — BirdEnv is registered upstream, so
-# this recipe ships no Python and dispatches straight to upstream's Ray entrypoint.
+# BirdEnv is registered upstream, so this recipe ships no Python — just point at
+# ``$SKYRL_HOME`` and let upstream's Ray entrypoint forward it to workers.
 export PYTHONPATH="${SKYRL_HOME}:${PYTHONPATH:-}"
+
+# Matches upstream integrations/arctic_rl/examples/run_bird_grpo_32b_32gpu.sh:
+# bare python from a caller-activated env. See ../README.md.
+PYBIN="${PYBIN:-python}"
 
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
@@ -48,15 +45,11 @@ export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${HOME}/.cache/vllm}"
 export VLLM_LOGGING_LEVEL=INFO
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 export ARCTIC_CUDA_IPC_LOW_MEM=0
-# Qwen3-32B's tie_word_embeddings is False; the strict-name bypass is a no-op
-# today and a safety net if upstream Qwen3 adds new tied buffers.
 export ARCTIC_WEIGHT_SYNC_STRICT_NAMES=0
-# 32B optimizer-state CPU offload churns the allocator; expandable segments
-# tame it. Unlike the single-node TP>1 sibling, the multi-node placement
-# group layout doesn't hit pytorch/pytorch#147851 here.
+# 32B + optimizer offload churns the allocator; expandable segments tame it.
+# Multi-node placement doesn't hit pytorch/pytorch#147851 that bites single-node TP>1.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# WandB — set WANDB_API_KEY to enable; LOGGER=console to skip wandb entirely.
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_PROJECT="${WANDB_PROJECT:-skyrl_arctic_rl}"
 export WANDB_DISABLE_CODE=True
@@ -66,19 +59,18 @@ NUM_NODES=4
 GPUS_PER_NODE=8
 NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))   # = 32
 
-# vLLM sampling TP=4 (Qwen3-32B doesn't fit per-GPU at bf16 + 0.5 mem_util
-# headroom on H200). 32 GPUs / TP=4 -> 8 engine replicas.
-TP_SIZE=4
+# TP=4 -> 8 engine replicas. Qwen3-32B doesn't fit per-GPU at bf16 + 0.5
+# mem_util headroom on H200.
+TP_SIZE="${TP_SIZE:-4}"
 NUM_ENGINES=$((NUM_GPUS / TP_SIZE))
 
-# FA3 is the default on Hopper; flip to flash_attention_2 for A100/L40S.
+# FA3 on Hopper; set flash_attention_2 for A100/L40S.
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_3}"
 ARCTIC_ZERO_STAGE=3
-OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-true}"   # 32B optimizer state offload
+OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-true}"
 
-# Global batch: 128 prompts x 16 samples = 2048 trajectories/step. With DP=32:
-# per-DP mini=64, ZoRRo micro=16 (n_samples), grad_accum=4.
-# NB: train_batch_size * n_samples_per_prompt must be divisible by num_gpus.
+# 128 prompts x 16 samples = 2048 trajectories/step. Constraints:
+# train_batch_size * n_samples_per_prompt divisible by num_gpus.
 TRAIN_BSZ="${TRAIN_BSZ:-128}"
 MINI_BSZ="${MINI_BSZ:-128}"
 N_SAMPLES="${N_SAMPLES:-16}"
@@ -104,12 +96,11 @@ fi
 
 RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
 EXPERIMENT_NAME="bird_grpo_${MODEL_SHORT}_arl_z${ARCTIC_ZERO_STAGE}_${NUM_NODES}node_${RUN_TS}"
-# CKPT_DIR must be on a shared FS — head writes weight-sync tensor, all nodes mmap-read.
+# CKPT_DIR must be on a shared FS: head writes the CUDA-IPC weight-sync tensor,
+# all workers mmap-read it.
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"
 
-# Optional Arctic speculative decoding (drop in a Qwen3-32B-trained N-head ckpt
-# via SPEC_MODEL=<path>; the blog-run head is tied to Qwen3-32B's hidden size).
 SPEC_MODEL="${SPEC_MODEL:-}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-3}"
 SPEC_OVERRIDE=()
@@ -118,7 +109,10 @@ if [[ -n "${SPEC_MODEL}" ]]; then
     SPEC_OVERRIDE+=("trainer.arctic_rl.num_speculative_tokens=${NUM_SPEC_TOKENS}")
 fi
 
-python -m skyrl.train.entrypoints.main_base \
+# Run from ${SKYRL_HOME} so ``integrations/`` imports resolve.
+cd "${SKYRL_HOME}"
+
+"${PYBIN}" -m skyrl.train.entrypoints.main_base \
     trainer.override_entrypoint=integrations.arctic_rl.entrypoint \
     trainer.arctic_rl.colocate=true \
     trainer.arctic_rl.zero_stage=${ARCTIC_ZERO_STAGE} \

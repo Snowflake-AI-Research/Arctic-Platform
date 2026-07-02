@@ -1,33 +1,30 @@
 #!/bin/bash
-# Single-node 8-GPU GRPO training for Qwen3-8B on BIRD-SQL with Arctic RL + ZoRRo.
-# Pure GRPO, no frozen reference model (use_kl_loss=False).
+# Arctic RL + ZoRRo: Qwen3-8B BIRD-SQL GRPO — single node / 8 H200s.
+# Pure GRPO, no frozen reference model (use_kl_loss=false).
 #
-# This is the single-node iteration target for the 4-node Qwen3-32B run that
-# produced the 2x speedup behind the Arctic RL launch blog. Same Arctic RL
-# stack (FCA, CUDA-IPC weight sync, ZoRRo, Liger, FA3 trainer / FLASH_ATTN
-# inference), just scaled down to one node so it can run on a standalone host.
+# Iteration target for the 4-node Qwen3-32B run (`run_qwen3_32b_bird_grpo_arl_4node.sh`).
 #
-# Prerequisites (see README.md):
-#   1. Conda env with pinned deps (`uv pip install -r requirements.txt
-#      --override overrides.txt`). No SkyRL checkout needed.
-#   2. Raw BIRD-SQL staged at $BIRD_RAW (see README), then
-#      `python download_data.py --bird_dir $BIRD_RAW --output_dir $DATA_DIR`
-#      to produce $DATA_DIR/{train,val}.parquet.
+# Prereqs (see README.md):
+#   1. Activated conda env with pinned deps; `export SKYRL_HOME=<clone>`.
+#   2. `python download_data.py --bird_dir <raw> --output_dir $DATA_DIR`.
 
 set -euxo pipefail
 
-# SkyRL is required as a checkout (the Arctic RL × SkyRL integration code lives
-# at integrations/arctic_rl/ which is NOT inside the pip-installed package).
-# Pin: see ../README.md and ../<recipe>/requirements.txt.
+# SkyRL is required as a checkout: integrations/arctic_rl/ is not in the
+# pip-installed package. Pin: see ../README.md.
 if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; then
     echo "ERROR: SKYRL_HOME is unset or doesn't contain integrations/arctic_rl/."
     echo "       Clone SkyRL at the pinned commit (see ../README.md) and"
     echo "       'export SKYRL_HOME=<path to clone>' before running this script."
     exit 1
 fi
-# $SKYRL_HOME is the only PYTHONPATH addition — BirdEnv is registered upstream, so
-# this recipe ships no Python and dispatches straight to upstream's Ray entrypoint.
+# BirdEnv is registered upstream, so this recipe ships no Python — just point
+# at ``$SKYRL_HOME`` and let upstream's Ray entrypoint forward it to workers.
 export PYTHONPATH="${SKYRL_HOME}:${PYTHONPATH:-}"
+
+# Matches upstream integrations/arctic_rl/examples/run_bird_grpo_8b_32gpu.sh:
+# bare python from a caller-activated env. See ../README.md.
+PYBIN="${PYBIN:-python}"
 
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
@@ -42,32 +39,22 @@ export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 export ARCTIC_CUDA_IPC_LOW_MEM=0
 export ARCTIC_WEIGHT_SYNC_STRICT_NAMES=0
 # Do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True on single-node TP>1:
-# it triggers torch's "Expandable segments are not compatible with memory pool"
-# assertion in vLLM's Ray-executor TP workers (pytorch/pytorch#147851). The
-# multi-node 32B launcher gets away with it because its placement group layout
-# is different — but for this single-node setup we leave allocator defaults.
+# it trips pytorch/pytorch#147851 inside vLLM's Ray-executor TP workers.
 
 # ----- Single-node 8-GPU Arctic / ZoRRo topology -----
-# `trainer.arctic_rl.colocate=true` keeps Arctic RL's training + sampling on the
-# same 8 GPUs. `trainer.placement.colocate_all=false` is required so SkyRL does
-# not also try to claim a placement group for its own inference engines (Arctic
-# RL already owns the GPUs).
 NUM_NODES=1
 GPUS_PER_NODE=8
 NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
-# TP=2 -> 4 inference engines, same multi-rank FlashInfer code path the
-# multi-node 8B / 32B runs exercise.
-TP_SIZE=2
+# TP=2 -> 4 vLLM engines, same multi-rank FlashInfer path the 4-node run exercises.
+TP_SIZE="${TP_SIZE:-2}"
 NUM_ENGINES=$((NUM_GPUS / TP_SIZE))
 
-# FA3 is the default on Hopper; flip to flash_attention_2 for A100/L40S.
+# FA3 on Hopper; set flash_attention_2 for A100/L40S.
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_3}"
 ARCTIC_ZERO_STAGE=3
-OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-false}"   # 8B easily fits in 8xH200 HBM
+OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-false}"   # 8B fits in 8xH200 HBM
 
-# Smaller batch / context than the multi-node 8B recipe so a single node has
-# room to breathe — easy to override on the command line for stress runs.
 TRAIN_BSZ="${TRAIN_BSZ:-32}"
 MINI_BSZ="${MINI_BSZ:-16}"
 N_SAMPLES="${N_SAMPLES:-8}"
@@ -97,9 +84,9 @@ EXPERIMENT_NAME="bird_grpo_${MODEL_SHORT}_arl_z${ARCTIC_ZERO_STAGE}_${RUN_TS}"
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"
 
-# Optional: arctic speculative decoding (drop in a Qwen3-8B-trained 3-head
-# checkpoint via SPEC_MODEL=<path>). Off by default — the 32B blog-run head is
-# tied to Qwen3-32B's hidden size and won't load on 8B.
+# Optional Arctic speculative decoding. Off by default — the 32B head is tied
+# to Qwen3-32B's hidden size and won't load on 8B; supply an 8B-sized head via
+# SPEC_MODEL=<path>.
 SPEC_MODEL="${SPEC_MODEL:-}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-3}"
 SPEC_OVERRIDE=()
@@ -108,7 +95,10 @@ if [[ -n "${SPEC_MODEL}" ]]; then
     SPEC_OVERRIDE+=("trainer.arctic_rl.num_speculative_tokens=${NUM_SPEC_TOKENS}")
 fi
 
-python -m skyrl.train.entrypoints.main_base \
+# Run from ${SKYRL_HOME} so ``integrations/`` imports resolve.
+cd "${SKYRL_HOME}"
+
+"${PYBIN}" -m skyrl.train.entrypoints.main_base \
     trainer.override_entrypoint=integrations.arctic_rl.entrypoint \
     trainer.arctic_rl.colocate=true \
     trainer.arctic_rl.zero_stage=${ARCTIC_ZERO_STAGE} \
