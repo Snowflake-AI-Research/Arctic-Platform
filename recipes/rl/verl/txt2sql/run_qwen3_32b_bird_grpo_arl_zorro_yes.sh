@@ -2,10 +2,15 @@
 # Qwen3-32B GRPO on BIRD SQL with ArcticRL + Zorro (colocate, CUDA-IPC weight sync).
 # Arctic twin of the stock verl/vLLM BIRD baseline; learning hyperparameters match it.
 # 32 GPUs (4 x 8) from the hostfile. See README.md for data prep + ray cluster setup.
+#
+# The Arctic backend is loaded into verl as a plugin via the
+# `VERL_USE_EXTERNAL_MODULES=arctic_platform.integrations.verl.register`
+# hook exported below; verl core carries no Arctic-specific files.
 
 set -x
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 LOG_DIR="${SCRIPT_DIR}/outputs"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/qwen3_32b_bird_grpo_arl_zorro_yes_$(date +%Y%m%d_%H%M%S).log"
@@ -18,6 +23,15 @@ export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}"
 
+# Plug the Arctic RemoteBackend into verl. verl reads this on `import verl`
+# and imports the referenced module for its registration side effects; no
+# verl source-tree modification is needed.
+export VERL_USE_EXTERNAL_MODULES=arctic_platform.integrations.verl.register
+
+# Make the plugin's config directory visible to Hydra so `remote_backend=arctic`
+# resolves to the yaml shipped inside arctic_platform.
+ARCTIC_VERL_CONFIG_DIR="${REPO_ROOT}/arctic_platform/integrations/verl/config"
+
 unset PYTORCH_CUDA_ALLOC_CONF
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
@@ -26,6 +40,52 @@ export TORCH_COMPILE_DISABLE=1
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${HOME}/.cache/vllm}"
 export VLLM_LOGGING_LEVEL=INFO
+
+# --- Preflight guards -----------------------------------------------------
+# Two real failure modes we've hit that produce infinite hangs or opaque JIT
+# errors many minutes into the run; assert loudly and fast instead.
+NGPU_PER_NODE=8
+
+# 1. CUDA_VISIBLE_DEVICES starvation. Some container images ship with a
+#    partial `CUDA_VISIBLE_DEVICES` baked in (e.g. `0,1`). Ray honors that
+#    at cluster init, then the Arctic backend asks for `sampling_gpus /
+#    sampling_tp_size` replicas and infinitely blocks on unschedulable
+#    placement groups. Detect + fail with a clear message.
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    _cvd_count=$(echo "${CUDA_VISIBLE_DEVICES}" | awk -F, '{print NF}')
+    if [[ "${_cvd_count}" -lt "${NGPU_PER_NODE}" ]]; then
+        echo "[preflight] ERROR: CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES}' exposes only ${_cvd_count} GPUs" >&2
+        echo "[preflight]        but this launcher targets ${NGPU_PER_NODE} GPUs/node. Ray would hang on"
+        echo "[preflight]        pending placement groups. Unset it or expose all ${NGPU_PER_NODE} devices:"
+        echo "[preflight]            unset CUDA_VISIBLE_DEVICES"
+        exit 2
+    fi
+fi
+
+# 2. Torch/system CUDA mismatch. DeepSpeed JIT-builds CPUAdam under ZeRO-3
+#    optimizer offload and refuses if `nvcc --version` doesn't match torch's
+#    build CUDA. In multi-CUDA container images (`/usr/local/cuda -> cuda-13`
+#    while torch is cu129) users need `CUDA_HOME=/usr/local/cuda-12.9`.
+_torch_cuda=$(python -c "import torch; print(torch.version.cuda or '')" 2>/dev/null || true)
+if [[ -n "${_torch_cuda}" ]]; then
+    _sys_nvcc=$(nvcc --version 2>/dev/null | awk -F'release ' '/release/ {split($2,a,","); print a[1]}')
+    if [[ -n "${_sys_nvcc}" && "${_sys_nvcc}" != "${_torch_cuda}" ]]; then
+        # Try to auto-point CUDA_HOME at the matching toolkit if available.
+        _match_dir="/usr/local/cuda-${_torch_cuda}"
+        if [[ -x "${_match_dir}/bin/nvcc" ]]; then
+            export CUDA_HOME="${_match_dir}"
+            export PATH="${CUDA_HOME}/bin:${PATH}"
+            export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+            echo "[preflight] system nvcc=${_sys_nvcc} != torch.version.cuda=${_torch_cuda}; auto-pointing CUDA_HOME=${CUDA_HOME}"
+        else
+            echo "[preflight] ERROR: system nvcc=${_sys_nvcc} != torch.version.cuda=${_torch_cuda}" >&2
+            echo "[preflight]        DeepSpeed CPUAdam JIT will fail with CUDAMismatchException." >&2
+            echo "[preflight]        Install cuda-${_torch_cuda} and export CUDA_HOME=/path/to/cuda-${_torch_cuda}." >&2
+            exit 3
+        fi
+    fi
+fi
+# --------------------------------------------------------------------------
 
 HOSTFILE="${JOB_HOSTFILE:-/data-fast/hostfile}"
 
@@ -41,12 +101,12 @@ if command -v ds_ssh >/dev/null 2>&1 && [[ -f "${HOSTFILE}" ]]; then
 fi
 
 # NNODES from hostfile (one line per node); falls back to 1.
+# NGPU_PER_NODE is set in the preflight block above.
 if [[ -f ${HOSTFILE} ]]; then
     NNODES=$(wc -l < ${HOSTFILE})
 else
     NNODES=1
 fi
-NGPU_PER_NODE=8
 NGPU_PER_JOB=$((NGPU_PER_NODE*NNODES))
 
 flash_attention_v=flash_attention_2
@@ -70,6 +130,7 @@ mkdir -p "${CHECKPOINT_DIR}"
 echo "NNODES=${NNODES} NGPU_PER_JOB=${NGPU_PER_JOB} CHECKPOINT_DIR=${CHECKPOINT_DIR}"
 
 python3 -m verl.trainer.main_ppo \
+    hydra.searchpath="[file://${ARCTIC_VERL_CONFIG_DIR}]" \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=True \
     algorithm.use_kl_in_reward=False \

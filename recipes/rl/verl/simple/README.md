@@ -25,7 +25,14 @@ conda activate simple
 pip install uv
 ```
 
-Clone this repo (it carries `requirements.txt` and the launcher script) and the verl fork:
+Clone this repo (it carries `requirements.txt` and the launcher script) and the
+Snowflake verl fork. The Arctic backend now ships as a plugin under
+`arctic_platform/integrations/verl/` and is loaded into verl at runtime via
+`VERL_USE_EXTERNAL_MODULES` -- verl core carries no Arctic-specific files, so
+this recipe works against any verl checkout that includes the paired
+`RemoteBackend`/`RolloutReplica` registry hooks (`arctic_rl_share_v0.7.1`
+today; upstream verl after the paired PR merges).
+
 ```bash
 git clone https://github.com/Snowflake-AI-Research/Arctic-Platform
 git clone -b arctic_rl_share_v0.7.1 --single-branch https://github.com/Snowflake-AI-Research/verl
@@ -67,6 +74,16 @@ grep -v flash-attn requirements.txt > requirements-no-fa.txt
 uv pip install -r requirements-no-fa.txt
 uv pip install -e .
 cd -
+```
+
+Install Arctic-Platform (this repo) editable with the `[verl]` extra. The
+Arctic backend is discovered via `arctic_platform.integrations.verl.register`
+(exported by the launcher via `VERL_USE_EXTERNAL_MODULES`), which only exists
+in the version in this checkout &mdash; `requirements.txt` pulls the older
+PyPI release for its `[rl]` deps, so this editable step is what puts the
+plugin on the Python path:
+```bash
+uv pip install -e ../../../..[verl]   # ../../../.. resolves to Arctic-Platform/
 ```
 
 ## 2. Data preparation
