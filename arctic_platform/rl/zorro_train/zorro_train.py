@@ -239,6 +239,7 @@ class ZoRRoTrain:
     """Handles prompt deduplication logic."""
 
     @staticmethod
+    @torch.compiler.disable
     def find_prompt_groups(
         input_ids: torch.Tensor,
         response_length: int,
@@ -562,6 +563,7 @@ class ZoRRoTrain:
         }
 
     @staticmethod
+    @torch.compiler.disable
     def create_deduplicated_batch(
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
@@ -799,6 +801,7 @@ class ZoRRoTrain:
         return torch.stack(full_sequences)  # [original_batch, seq_len, *extra_dims]
 
     @staticmethod
+    @torch.compiler.disable
     def _get_responses_packed_from_dedup_tensor(
         dedup_tensor: torch.Tensor,
         reconstruction_info: Dict,
@@ -855,6 +858,7 @@ class ZoRRoTrain:
         return qkv_responses_packed
 
     @staticmethod
+    @torch.compiler.disable
     def _get_sequences_reconstructed_from_dedup_tensors(
         dedup_tensor: torch.Tensor,
         prompt_packed_tensor: torch.Tensor,
@@ -912,6 +916,7 @@ class ZoRRoTrain:
         return reconstructed_seq
 
     @staticmethod
+    @torch.compiler.disable
     def _get_sequences_packed_from_dedup_tensor(
         dedup_tensor: torch.Tensor,
         reconstruction_info: Dict,
@@ -972,6 +977,78 @@ class ZoRRoTrain:
 
         # Return packed tensor: [1, num_heads, total_unique_prompt_tokens, head_dim]
         return unique_qkv_packed
+
+    @staticmethod
+    @torch.compiler.disable
+    def build_attention_gather_indices(
+        reconstruction_info: Dict,
+        total_dedup_tokens: int,
+        device,
+    ) -> None:
+        """Precompute (once per forward, eagerly) the token gather indices used by the
+        per-layer split attention.
+
+        The per-layer attention originally extracted/packed/reconstructed tokens with
+        Python-loop + ``.item()`` helpers (``_get_sequences_packed_from_dedup_tensor``,
+        ``_get_responses_packed_from_dedup_tensor``,
+        ``_get_sequences_reconstructed_from_dedup_tensors``,
+        ``_replicate_and_concat_prompt_responses``). Those force graph breaks, which under
+        DeepCompile + ZeRO-3 strands sharded params used after the break (e.g. o_proj).
+
+        Every one of those helpers is a pure token *gather*: it selects/reorders token
+        positions of the dedup sequence. We derive the exact gather index for each by
+        running the ORIGINAL helper on an ``arange`` "position" tensor -- the helper's
+        slicing bounds come from cu_seqlens metadata (not the data), so the returned
+        values ARE the source token positions. This guarantees the index_select-based
+        compiled path is numerically identical to the original logic while being fully
+        traceable (no .item()/loops/graph breaks). Indices are stored on ``reconstruction_info``
+        and consumed by the compiled attention forward via ``index_select``.
+        """
+        # Populate cu_seqlens_response / cu_seqlens_unique_prompts / prompt_lengths /
+        # reordered_seq_idx (eager; writes into reconstruction_info).
+        cu_seqlens_response = ZoRRoTrain._extract_cu_seqlens(reconstruction_info, device)
+        reconstruction_info["cu_seqlens_response"] = cu_seqlens_response
+
+        pos = torch.arange(total_dedup_tokens, device=device).view(1, 1, total_dedup_tokens, 1)
+
+        prompt_pos = ZoRRoTrain._get_sequences_packed_from_dedup_tensor(
+            pos, reconstruction_info, cu_seqlens_response
+        )
+        response_pos = ZoRRoTrain._get_responses_packed_from_dedup_tensor(
+            pos, reconstruction_info, cu_seqlens_response
+        )
+
+        group_sizes = torch.tensor(
+            [0] + [len(group) for group in reconstruction_info["prompt_groups"]], device=device
+        ).cumsum_(0)
+
+        # Reconstructed K/V positions: pass prompt positions (in dedup coordinates) as the
+        # "prompt_packed" tensor so the output values remain dedup-space positions.
+        recon_pos = ZoRRoTrain._get_sequences_reconstructed_from_dedup_tensors(
+            pos, prompt_pos, reconstruction_info, cu_seqlens_response, group_sizes
+        )
+
+        prompt_gather_idx = prompt_pos.reshape(-1).to(torch.long)
+        response_gather_idx = response_pos.reshape(-1).to(torch.long)
+        recon_gather_idx = recon_pos.reshape(-1).to(torch.long)
+
+        # Combine index: maps dedup output layout <- concat([prompt_outputs, response_outputs])
+        # along the token dim. Offset the response positions by len(prompt) so a single
+        # index_select over the concatenation reproduces _replicate_and_concat_prompt_responses.
+        t_prompt = int(prompt_gather_idx.numel())
+        t_resp = int(response_gather_idx.numel())
+        prompt_out_pos = torch.arange(t_prompt, device=device).view(1, t_prompt, 1, 1)
+        response_out_pos = torch.arange(t_prompt, t_prompt + t_resp, device=device).view(1, t_resp, 1, 1)
+        combine_pos = ZoRRoTrain._replicate_and_concat_prompt_responses(
+            prompt_out_pos, response_out_pos, reconstruction_info, cu_seqlens_response
+        )
+        combine_gather_idx = combine_pos.reshape(-1).to(torch.long)
+
+        reconstruction_info["prompt_gather_idx"] = prompt_gather_idx
+        reconstruction_info["response_gather_idx"] = response_gather_idx
+        reconstruction_info["recon_gather_idx"] = recon_gather_idx
+        reconstruction_info["combine_gather_idx"] = combine_gather_idx
+        reconstruction_info["group_sizes"] = group_sizes
 
     @staticmethod
     def _get_sequences_unpacked_from_dedup_tensor(
@@ -1159,6 +1236,7 @@ class ZoRRoTrain:
         return packed_hidden.unsqueeze(0)  # [1, total_all_valid_tokens, *extra_dims]
 
     @staticmethod
+    @torch.compiler.disable
     def deduplicate_sequences(full_hidden: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Convert full batch to deduplicated sequence.
@@ -1815,6 +1893,7 @@ class ZoRRoTrain:
         return responses
 
     @staticmethod
+    @torch.compiler.disable
     def extract_unpadded_responses_from_deduped_packed_ids(
         packed_tensor: torch.Tensor, reconstruction_info: Dict, offset: int = 0
     ) -> torch.Tensor:
@@ -1953,6 +2032,7 @@ class ZoRRoTrain:
         return padded_responses
 
     @staticmethod
+    @torch.compiler.disable
     def responses_in_orig_sample_order(packed_responses: torch.Tensor, reconstruction_info: Dict) -> torch.Tensor:
         """
         Return the same 1D responses tensor, but in the original sample order (should it have changed to deal with a situation where incoming samples aren't already ordered by prompt groups)
@@ -2056,6 +2136,7 @@ class ZoRRoTrain:
         return query_states[:, :, prompt_len:, :]
 
     @staticmethod
+    @torch.compiler.disable
     def _extract_cu_seqlens(reconstruction_info: Dict, device) -> torch.Tensor:
         """
         Extract cu_seqlens from reconstruction_info.
@@ -2358,6 +2439,7 @@ class ZoRRoTrain:
         return packed_output.unsqueeze(0)
 
     @staticmethod
+    @torch.compiler.disable
     def _replicate_and_concat_prompt_responses(
         prompt_outputs: torch.Tensor,
         response_outputs: torch.Tensor,

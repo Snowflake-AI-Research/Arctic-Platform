@@ -32,6 +32,9 @@ from typing import List
 from typing import Optional
 from typing import Union
 
+import contextlib
+
+import deepspeed
 import torch
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast as _BaseModelOutputWithPast
@@ -44,11 +47,84 @@ from arctic_platform.rl.utils.debug import see_memory_usage
 from arctic_platform.rl.zorro_train.module_patcher import ModuleReconstructionPatcher
 from arctic_platform.rl.zorro_train.qwen_attention_patcher import QwenAttentionOncePatcher
 from arctic_platform.rl.zorro_train.qwen_attention_patcher import QwenAttentionPatcher
+from arctic_platform.rl.zorro_train.qwen_attention_patcher import ZORRO_FULLGRAPH_ATTN
 from arctic_platform.rl.zorro_train.zorro_train import ReconstructionInfo
 from arctic_platform.rl.zorro_train.zorro_train import ZoRRoTrain
 
 # Global debug object for storing baseline/patched tensors
 debug_object = {"baseline": None, "patched": None}
+
+# ---------------------------------------------------------------------------
+# DeepCompile dynamic-shape control (benchmark: config #1).
+#
+# ZoRRO's deduplicated token count (``dedup_input_ids.shape[1]``) varies per
+# step, so under DeepCompile the compiled backbone recompiles on every new
+# shape and eventually exhausts torch._dynamo's recompile limit. Two mitigations
+# are offered, selected via ``ZORRO_DYNSHAPE``:
+#   - "off"    (default): current behavior (static per-shape recompiles).
+#   - "mark"   : torch._dynamo.mark_dynamic() on the varying token dim so a
+#                single dynamic graph serves all shapes.
+#   - "bucket" : pad the dedup token dim up to a multiple of ZORRO_SEQLEN_BUCKET
+#                so only a handful of shapes ever occur.
+# Both also pin ``max_seqlen_bound`` to a run-constant (ZORRO_MAX_SEQLEN_BOUND)
+# so the flash-attn max_length args stop driving recompiles/guards. Any value
+# >= (max_prompt_length + max_response_length) is correct for the varlen kernel.
+ZORRO_DYNSHAPE = os.environ.get("ZORRO_DYNSHAPE", "off").lower()
+ZORRO_SEQLEN_BUCKET = int(os.environ.get("ZORRO_SEQLEN_BUCKET", "1024"))
+ZORRO_MAX_SEQLEN_BOUND = int(os.environ.get("ZORRO_MAX_SEQLEN_BOUND", "2048"))
+
+
+def _bucket_pad_plan(reconstruction_info, total_dedup_tokens):
+    """Plan bucketed padding for the deduplicated sequence.
+
+    ZoRRo re-derives the decoder-layer sequence length from reconstruction
+    metadata (``reconstruct_sequences`` -> ``deduplicate_sequences``), so padding
+    the raw ``input_ids`` has *no* effect on it. Instead we record the target
+    bucketed length ``T_padded`` (a multiple of ``ZORRO_SEQLEN_BUCKET``) here and
+    pad the actual ``hidden_states_dedup`` inside the backbone forward.
+
+    ``combine_gather_idx`` (attention output -> dedup layout) is extended here so
+    the split-attention output length matches the padded residual; the extra rows
+    use dummy index 0 and are never read by the downstream response extraction
+    (which indexes only real positions < T_real). Returns ``T_padded``.
+    """
+    bucket = max(1, ZORRO_SEQLEN_BUCKET)
+    T_real = int(total_dedup_tokens)
+    T_padded = ((T_real + bucket - 1) // bucket) * bucket
+    reconstruction_info["bucket_pad_to"] = T_padded
+    if T_padded > T_real:
+        pad = T_padded - T_real
+        combine = reconstruction_info["combine_gather_idx"]
+        filler = torch.zeros(pad, dtype=combine.dtype, device=combine.device)
+        reconstruction_info["combine_gather_idx"] = torch.cat([combine, filler], dim=0)
+    return T_padded
+
+
+@torch.compiler.disable
+def _mark_dynamic_dedup(dedup_input_ids, adapted_position_ids, reconstruction_info):
+    """Mark the varying token dim dynamic so one compiled graph serves all shapes.
+
+    Must run eagerly: ``torch._dynamo.mark_dynamic`` is a forbidden callable while
+    tracing, so this is ``@torch.compiler.disable``-d. It marks the tensors between
+    the (disabled) dedup step and the compiled backbone subgraph they feed into, so
+    the mark is honored when they become graph inputs.
+
+    Best-effort: DeepCompile's profiling passes may re-specialize or reject
+    dynamic dims; failures are logged and ignored so the run still proceeds. We use
+    ``maybe_mark_dynamic`` (not ``mark_dynamic``): the compiler is free to specialize
+    a marked dim to a constant without raising a ConstraintViolationError, which
+    DeepCompile does for several of the gather-index tensors.
+    """
+    mark = getattr(torch._dynamo, "maybe_mark_dynamic", torch._dynamo.mark_dynamic)
+    try:
+        mark(dedup_input_ids, dedup_input_ids.dim() - 1)
+        mark(adapted_position_ids, adapted_position_ids.dim() - 1)
+        for key in ("prompt_gather_idx", "response_gather_idx", "recon_gather_idx", "combine_gather_idx"):
+            t = reconstruction_info.get(key)
+            if t is not None:
+                mark(t, 0)
+    except Exception as e:  # noqa: BLE001
+        pr0(f"ZORRO_DYNSHAPE=mark: mark_dynamic failed ({e}); continuing without it")
 
 SUPPORTED_MODEL_TYPES = {
     "qwen3",
@@ -421,6 +497,19 @@ class Qwen3ModelOncePatcher:
             position_ids_dedup = ZoRRoTrain.deduplicate_sequences(position_ids, reconstruction_info)
             hidden_states_dedup = ZoRRoTrain.deduplicate_sequences(hidden_states, reconstruction_info)
 
+            # Bucketing (ZORRO_DYNSHAPE=bucket): pad the deduplicated sequence up to a
+            # fixed bucket length so the compiled decoder layers see only a handful of
+            # distinct token-count shapes (few recompiles) instead of one per step. The
+            # split-attention output (combine_gather_idx, extended in _bucket_pad_plan)
+            # matches this padded length for the residual add; padded positions belong to
+            # no cu_seqlens sequence and are never read by the downstream response
+            # extraction (which indexes only real positions), so real outputs are unchanged.
+            _bucket_pad_to = reconstruction_info.get("bucket_pad_to")
+            if _bucket_pad_to is not None and _bucket_pad_to > hidden_states_dedup.shape[1]:
+                _bpad = _bucket_pad_to - hidden_states_dedup.shape[1]
+                hidden_states_dedup = torch.nn.functional.pad(hidden_states_dedup, (0, 0, 0, _bpad))
+                position_ids_dedup = torch.nn.functional.pad(position_ids_dedup, (0, _bpad))
+
             if reconstruction_info.get("is_unpadded", False):
                 position_embeddings = module.rotary_emb(hidden_states_dedup, position_ids_dedup)
                 layer_position_ids = position_ids_dedup
@@ -545,6 +634,34 @@ class Qwen3ModelOncePatcher:
             # input_ids_rmpad = dedup_input_ids
             # position_ids_rmpad = adapted_position_ids
 
+            # Fullgraph split-attention: precompute the per-layer token gather indices ONCE here
+            # (eager region -- create_deduplicated_batch is @torch.compiler.disable), so the
+            # compiled decoder-layer forward stays graph-break-free and DeepCompile can gather
+            # ZeRO-3 params (o_proj, mlp, ...) within a single compiled graph.
+            if ZORRO_FULLGRAPH_ATTN and reconstruction_info.get("is_unpadded", False):
+                ZoRRoTrain.build_attention_gather_indices(
+                    reconstruction_info,
+                    total_dedup_tokens=dedup_input_ids.shape[1],
+                    device=device,
+                )
+                # Upper bound for flash-attn max_seqlen args. Under the dynamic-shape fix,
+                # pin it to a run-constant so a varying Python int stops driving recompiles/
+                # guards; otherwise keep the (per-batch) legacy value. Any value >= the true
+                # max sequence length is correct for the varlen kernel.
+                if ZORRO_DYNSHAPE in ("mark", "bucket"):
+                    reconstruction_info["max_seqlen_bound"] = ZORRO_MAX_SEQLEN_BOUND
+                else:
+                    reconstruction_info["max_seqlen_bound"] = int(input_ids.shape[1])
+
+                # DeepCompile dynamic-shape fix (config #1): keep the varying dedup token
+                # count from exhausting torch._dynamo's recompile limit. Bucketing only
+                # records the target length + pads combine_gather_idx here; the actual
+                # hidden-state padding happens in the backbone forward (see below).
+                if ZORRO_DYNSHAPE == "bucket":
+                    _bucket_pad_plan(reconstruction_info, dedup_input_ids.shape[1])
+                elif ZORRO_DYNSHAPE == "mark":
+                    _mark_dynamic_dedup(dedup_input_ids, adapted_position_ids, reconstruction_info)
+
             if DEBUG:
                 pr0(f"{reconstruction_info=}")
                 pr0(f"{reconstruction_info['original_attention_mask'].sum()=}")
@@ -626,7 +743,7 @@ class Qwen3ModelOncePatcher:
                 compute_params = [model.lm_head.weight]  # tied with self.model.embed_tokens.weight
                 # bind the fp32 upcast flags so they flow through TiledLogProbEntropy's forward and (replayed)
                 # backward without changing its signature.
-                logprobs, entropy = TiledLogProbEntropy.apply(
+                logprobs, entropy = apply_tiled_logprob_entropy(
                     partial(
                         tiled_entropy_and_logprobs_with_temperature_from_logits,
                         logits_compute_from_fp32_inputs=logits_compute_from_fp32_inputs,
@@ -1078,6 +1195,7 @@ def _logprobs_and_entropy_from_flat_logits(flat_logits, flat_labels, calculate_e
     return logprobs, entropy
 
 
+@torch.compiler.disable
 def tiled_entropy_and_logprobs_with_temperature_from_logits(
     model,
     hidden_states,
@@ -1114,6 +1232,7 @@ def tiled_entropy_and_logprobs_with_temperature_from_logits(
     return logprobs, entropy
 
 
+@torch.compiler.disable
 def chunked_entropy_and_logprobs_with_temperature_from_logits(
     model,
     hidden_states,
@@ -1177,6 +1296,27 @@ def chunked_entropy_and_logprobs_with_temperature_from_logits(
     return logprobs, entropy
 
 
+@torch.compiler.disable
+def apply_tiled_logprob_entropy(fn, model, hidden_states, labels, temperature, calculate_entropy, num_shards, compute_params):
+    """Eager (graph-break) entry to TiledLogProbEntropy.apply.
+
+    Under DeepCompile the top-level causal-LM forward is a compiled frame, so calling
+    ``TiledLogProbEntropy.apply`` directly makes dynamo trace into ``forward`` and hit the
+    ``deepspeed.zero.GatheredParameters`` context. Tracing that builds a rank guard on the tied,
+    ZeRO-3-sharded ``lm_head``/``embed_tokens`` weight at rank-1 and then the gather flips it to
+    rank-2 -> "Guard failed on the same frame it was created ... rank mismatch expected 1, actual 2".
+    ``@torch.compiler.disable`` forces a clean graph break here (same as the ``none``-path
+    ``tiled_entropy_and_logprobs_with_temperature_from_logits``), so the whole tiled forward/backward
+    -- including GatheredParameters -- runs eagerly and untraced. That both re-gathers the weight
+    DeepCompile released after the backbone (fixing the ``vec (0)`` lm_head stranding) and keeps the
+    param rank invisible to dynamo's guards. Grad connectivity to ``hidden_states`` (a compiled-graph
+    output) is preserved across the break exactly like the ``none`` path.
+    """
+    return TiledLogProbEntropy.apply(
+        fn, model, hidden_states, labels, temperature, calculate_entropy, num_shards, compute_params
+    )
+
+
 class TiledLogProbEntropy(torch.autograd.Function):
     """
     TiledLogProbEntropy implementation using gradient hooks (the grad hooks were copied from Axolotl). This has been adapted from TiledMLP in Deepspeed.
@@ -1208,7 +1348,20 @@ class TiledLogProbEntropy(torch.autograd.Function):
         hidden_states_shards = list(torch.chunk(hidden_states, chunks=shards, dim=0))
         labels_shards = list(torch.chunk(labels, chunks=shards, dim=0))
 
-        with torch.no_grad():
+        # Gather the (ZeRO-3-sharded, embed-tied) lm_head weight for the projection. Under
+        # DeepCompile the native ZeRO-3 pre-forward gather hooks are removed, so this must be
+        # explicit; GatheredParameters is a no-op for non-partitioned params / empty lists.
+        #
+        # Only do this on the training (grad) forward. The no-grad log-prob forward runs under
+        # deepspeed_worker._z3_eager_inference, which already holds ALL params gathered; nesting
+        # another GatheredParameters on the tied lm_head/embed_tokens weight would re-partition it
+        # on exit and strand embed_tokens for the next micro-batch ('weight' must be 2-D).
+        fwd_gather = (
+            deepspeed.zero.GatheredParameters(compute_params, modifier_rank=None)
+            if hidden_states.requires_grad
+            else contextlib.nullcontext()
+        )
+        with torch.no_grad(), fwd_gather:
             logprobs_shards, entropy_shards = list(
                 zip(
                     *[
@@ -1266,45 +1419,72 @@ class TiledLogProbEntropy(torch.autograd.Function):
 
         labels_step = labels_shards[0].shape[0]
         shard_step = hs_shards[0].numel()
-        for i, hs_shard in enumerate(hs_shards):
-            hs_shard.requires_grad_(hs_requires_grad)
+        # Keep the (ZeRO-3-sharded, embed-tied) lm_head weight gathered across the whole
+        # recompute+backward loop: both the fn recompute and torch.autograd.backward need the
+        # full weight. modifier_rank=None => gather for read only, no reduce on exit.
+        #
+        # Fresh-leaf trick (DeepCompile + ZeRO-3): the tied lm_head/embed_tokens weight is
+        # registered while ZeRO-3-partitioned, so the (shared) AccumulateGrad edge for it has
+        # input_metadata pinned to the partitioned shape [0]. Backprop-ing our recompute straight
+        # into ``model.lm_head.weight`` reconnects to that stale edge and the autograd engine
+        # rejects our (correct) full-shape grad: "Function TBackward0 returned an invalid gradient
+        # ... got [vocab, hidden] but expected shape compatible with [0]". So we point lm_head at a
+        # FRESH full-shape leaf (its own AccumulateGrad), backprop into it, then add the accumulated
+        # full grad into the real param's ``.grad`` -- exactly the value the original
+        # ``torch.autograd.backward`` would have accumulated. With ds_grad_is_ready=False (set above)
+        # the reduction is deferred to the tied embed_tokens path (handled in-graph by DeepCompile).
+        lm_head = model.lm_head
+        real_weight = lm_head.weight
+        try:
+            with deepspeed.zero.GatheredParameters(compute_params, modifier_rank=None):
+                # Inside the gather real_weight.data is the full [vocab, hidden] tensor. detach()
+                # shares that storage (no extra memory); wrapping in a Parameter gives a new leaf.
+                grad_leaf_param = torch.nn.Parameter(real_weight.detach(), requires_grad=real_weight.requires_grad)
+                lm_head.weight = grad_leaf_param
+                for i, hs_shard in enumerate(hs_shards):
+                    hs_shard.requires_grad_(hs_requires_grad)
 
-            shard_offset = i * shard_step
-            hs_shard.grad = hs_grad.view(-1).narrow(0, shard_offset, hs_shard.numel()).view_as(hs_shard)
+                    shard_offset = i * shard_step
+                    hs_shard.grad = hs_grad.view(-1).narrow(0, shard_offset, hs_shard.numel()).view_as(hs_shard)
 
-            # Install hooks for this shard
-            # is_last_shard = i + 1 == shards
-            # grad_accumulator.install_hooks(is_last_shard)
+                    with torch.enable_grad():
+                        logprobs_shard, entropy_shard = fn(
+                            model, hs_shard, labels_shards[i], temperature, calculate_entropy
+                        )
 
-            with torch.enable_grad():
-                logprobs_shard, entropy_shard = fn(model, hs_shard, labels_shards[i], temperature, calculate_entropy)
+                    incoming_grad_shards = []
+                    tensors = []
+                    if entropy_shard is not None:
+                        tensors += [entropy_shard]
+                        incoming_grad_shards += [
+                            (
+                                entropy_grads.view(-1)
+                                .narrow(0, i * labels_step, labels_shards[i].shape[0])
+                                .view(labels_shards[i].shape[0])
+                            )
+                        ]
 
-            incoming_grad_shards = []
-            tensors = []
-            if entropy_shard is not None:
-                tensors += [entropy_shard]
-                incoming_grad_shards += [
-                    (
-                        entropy_grads.view(-1)
-                        .narrow(0, i * labels_step, labels_shards[i].shape[0])
-                        .view(labels_shards[i].shape[0])
-                    )
-                ]
+                    tensors += [logprobs_shard]
+                    incoming_grad_shards += [
+                        (
+                            logprobs_grads.view(-1)
+                            .narrow(0, i * labels_step, labels_shards[i].shape[0])
+                            .view(labels_shards[i].shape[0])
+                        )
+                    ]
 
-            tensors += [logprobs_shard]
-            incoming_grad_shards += [
-                (
-                    logprobs_grads.view(-1)
-                    .narrow(0, i * labels_step, labels_shards[i].shape[0])
-                    .view(labels_shards[i].shape[0])
-                )
-            ]
+                    torch.autograd.backward(tensors, incoming_grad_shards)
 
-            torch.autograd.backward(tensors, incoming_grad_shards)
-
-        # Clean up hooks
-        # grad_accumulator.cleanup()
-        # del grad_accumulator
+                # Deposit the full-shape grad accumulated on the fresh leaf into the real (tied)
+                # param (still gathered/full inside this block, so the shape check on the .grad
+                # setter passes). DeepCompile reduces it via the tied embed_tokens path.
+                if grad_leaf_param.grad is not None and real_weight.requires_grad:
+                    if real_weight.grad is None:
+                        real_weight.grad = grad_leaf_param.grad
+                    else:
+                        real_weight.grad = real_weight.grad + grad_leaf_param.grad
+        finally:
+            lm_head.weight = real_weight
 
         return (
             None,

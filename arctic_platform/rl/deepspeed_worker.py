@@ -25,6 +25,7 @@ Usage::
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import numbers
 import os
@@ -35,7 +36,34 @@ from typing import Any
 import deepspeed
 import ray
 import torch
+import torch._dynamo
 import torch.distributed as dist
+
+# DeepCompile + ZeRO-3: the tied lm_head/embed_tokens weight is used inside the compiled backbone
+# (DeepCompile guards it as rank-1/sharded) and also gathered to rank-2 in the eager fenced logits
+# path (TiledLogProbEntropy). Allowing dynamic parameter shapes prevents a dynamo parameter-rank
+# guard assertion (expected 1, actual 2). Set at import time (module scope) so it is never captured
+# by Ray's cloudpickle serialization of the worker (which cannot pickle torch._dynamo.config).
+torch._dynamo.config.force_parameter_static_shapes = False
+
+# DeepCompile requires the *compiled* path for ZeRO-3 (its passes insert in-graph param
+# gather/release). ZoRRO produces a different total-token count almost every step, so each new
+# shape triggers a dynamo recompile. Once the recompile budget (default 8) is exhausted, dynamo
+# stops compiling that frame and runs it EAGERLY -- and DeepCompile's eager fallback does not
+# reliably gather partitioned params across graph-break/resume boundaries, so projections strand
+# as "size mismatch ... vec (0)" (surfaces only at step>1, after >8 distinct shapes). Raise the
+# budget so every sequence-length shape gets its own compiled graph instead of falling to eager.
+_ZORRO_DYNAMO_RECOMPILE_LIMIT = int(os.environ.get("ZORRO_DYNAMO_RECOMPILE_LIMIT", "1024"))
+for _limit_attr in ("recompile_limit", "cache_size_limit"):
+    if hasattr(torch._dynamo.config, _limit_attr):
+        setattr(torch._dynamo.config, _limit_attr, _ZORRO_DYNAMO_RECOMPILE_LIMIT)
+for _acc_attr in ("accumulated_recompile_limit", "accumulated_cache_size_limit"):
+    if hasattr(torch._dynamo.config, _acc_attr):
+        setattr(
+            torch._dynamo.config,
+            _acc_attr,
+            max(int(getattr(torch._dynamo.config, _acc_attr) or 0), _ZORRO_DYNAMO_RECOMPILE_LIMIT * 8),
+        )
 from arctic_inference.server.weight_sync.sender import WeightSender
 from deepspeed.accelerator import get_accelerator
 from transformers import AutoModelForCausalLM
@@ -199,6 +227,17 @@ class DeepSpeedWorker:
 
         zorro_train_enable = ds_worker_config.get("zorro_train_enable", False)
         if zorro_train_enable:
+            # Under DeepCompile + ZeRO-3, force the "memory" (TiledLogProbEntropy) logits strategy.
+            # It keeps the full logits OUT of the compiled graph (the in-graph lm_head projection
+            # trips a DeepCompile backward-scheduler bug) and gathers the ZeRO-3-sharded, embed-tied
+            # lm_head weight for both forward and backward. The default "none" strategy runs lm_head
+            # in an eager region where DeepCompile has released the sharded weight -> vec(0).
+            _compile_cfg = ds_config.get("compile") or {}
+            _deepcompile_on = self.job_type != "log_prob" and _compile_cfg.get("deepcompile", False)
+            _z3 = int((ds_config.get("zero_optimization") or {}).get("stage", 0)) == 3
+            if _deepcompile_on and _z3 and ds_worker_config.get("logits_optimization", "none") != "memory":
+                pr0("ds_worker: DeepCompile+ZeRO-3 -> forcing logits_optimization=memory (lm_head gather + tied grad)")
+                ds_worker_config["logits_optimization"] = "memory"
             self.model_patch_in_zorro(model, ds_worker_config)
 
         init_kwargs = dict(model=model, config=ds_config)
@@ -214,9 +253,61 @@ class DeepSpeedWorker:
         logger.info("Rank %d initialized on GPU %d (uuid=%s, device=%s)", self.rank, gpu_id, gpu_uuid, self._device)
         self.cpu_device = torch.device("cpu")
 
+        compile_cfg = ds_config.get("compile") or {}
+        deepcompile_on = self.job_type != "log_prob" and compile_cfg.get("deepcompile", False)
+
         enable_gradient_checkpointing = ds_worker_config.get("enable_gradient_checkpointing", True)
+        if enable_gradient_checkpointing and deepcompile_on:
+            # DeepCompile is mutually exclusive with HF gradient checkpointing: the
+            # checkpointed layer runs under torch.utils.checkpoint, which Dynamo
+            # executes eagerly (torch._compile.disable). Because DeepCompile removes
+            # DeepSpeed's native ZeRO-3 parameter-coordinator hooks and only gathers
+            # sharded params inside *compiled* graphs, an eagerly-run checkpointed
+            # layer sees released params (e.g. input_layernorm.weight -> size 0).
+            # DeepCompile performs its own activation-memory management, so we disable
+            # gradient checkpointing whenever DeepCompile is active.
+            pr0("ds_worker: DeepCompile is enabled -> disabling gradient checkpointing (incompatible)")
+            enable_gradient_checkpointing = False
         if enable_gradient_checkpointing:
             model.gradient_checkpointing_enable()
+
+        # DeepCompile: only the trainable engine is compiled, and only when the
+        # passed-through DeepSpeed config opts in (`compile.deepcompile: true`).
+        # The forward-only (log_prob) engine's config never carries the compile
+        # block, but guard on job_type as well to be explicit. engine.compile()
+        # reads deepcompile from the DS config and falls back to plain
+        # torch.compile if config validation fails.
+        if deepcompile_on:
+            pr0(f"ds_worker: enabling DeepCompile ({compile_cfg=})")
+            # NOTE: torch._dynamo.config.force_parameter_static_shapes is disabled at module import
+            # time (see top of file) so the tied, sharded<->gathered lm_head/embed_tokens weight
+            # does not trip a dynamo parameter-rank guard here.
+            self.engine.compile()
+
+        # Regional (per-decoder-layer) torch.compile as a DeepCompile-free alternative.
+        # nn.Module.compile() mutates the layer in place and does NOT add an `_orig_mod.`
+        # prefix, so named_parameters() is unchanged and weight-sync name validation holds.
+        if self.job_type != "log_prob" and ds_worker_config.get("regional_compile", False):
+            from arctic_platform.rl.zorro_train.qwen_model_patcher import _get_text_backbone
+
+            backbone = _get_text_backbone(self.engine.module)
+            num_layers = getattr(getattr(backbone, "config", None), "num_hidden_layers", len(backbone.layers))
+            for layer in backbone.layers[:num_layers]:
+                layer.compile()
+            pr0(f"ds_worker: regional torch.compile applied in place to {num_layers} decoder layers")
+
+        # Whole-model torch.compile as a DeepCompile-free alternative. In-place
+        # nn.Module.compile() on the full model (one compiled region) is name-safe (no
+        # `_orig_mod.` prefix). Mutually exclusive with DeepCompile; keeps DeepSpeed's
+        # native ZeRO-3 param-coordinator hooks (unlike DeepCompile), so it is robust to
+        # graph breaks though its scheduling window is the whole model.
+        elif (
+            self.job_type != "log_prob"
+            and ds_worker_config.get("full_graph_compile", False)
+            and not deepcompile_on
+        ):
+            self.engine.module.compile()
+            pr0("ds_worker: whole-model torch.compile applied in place to engine.module")
 
         pr0(
             "ds_worker[after_initialize]:"
@@ -363,6 +454,42 @@ class DeepSpeedWorker:
             return batch.to(device)
         return batch
 
+    @contextlib.contextmanager
+    def _z3_eager_inference(self):
+        """Run a no-grad forward eagerly with all ZeRO-3 params gathered.
+
+        DeepCompile removes DeepSpeed's native ZeRO-3 parameter-coordinator hooks
+        (see ``deepspeed/compile/init_z3.py``) and instead schedules *in-graph*
+        all-gather/release for the params that appear as inputs of each compiled
+        (sub)graph. That mechanism is tied to the compiled training forward/backward.
+        The inference (``torch.no_grad``) log-prob forward through the *same* engine
+        is heavily fragmented by ZoRRO's data-dependent glue, so sharded params used
+        in post-break resume subgraphs (observed: ``o_proj.weight``) are never
+        re-gathered -- surfacing as ``size mismatch ... vec (0)``.
+
+        For the no-grad path we therefore bypass the compiled call (so no in-graph
+        ``release_param`` strands a shard) and gather the full parameter set for the
+        duration of the forward via ``GatheredParameters``. Training fwd+bwd keeps
+        using DeepCompile unchanged. Only active for DeepCompile + ZeRO stage 3.
+        """
+        engine = self.engine
+        active = (
+            getattr(engine, "is_deepcompile_active", lambda: False)()
+            and engine.zero_optimization_stage() == 3
+        )
+        if not active:
+            yield
+            return
+
+        module = engine.module
+        saved_impl = getattr(module, "_compiled_call_impl", None)
+        module._compiled_call_impl = None  # force eager forward -> no in-graph release ops
+        try:
+            with deepspeed.zero.GatheredParameters(list(module.parameters()), modifier_rank=None):
+                yield
+        finally:
+            module._compiled_call_impl = saved_impl
+
     def _forward_maybe_backward(self, batch: dict, backward: bool) -> dict:
         # torch.autograd.set_detect_anomaly(True)
 
@@ -482,7 +609,8 @@ class DeepSpeedWorker:
 
     def forward_no_grad(self, batch: dict) -> dict:
         tname = timers.start("forward_no_grad")
-        results = self._forward_maybe_backward(batch, backward=False)
+        with self._z3_eager_inference():
+            results = self._forward_maybe_backward(batch, backward=False)
         timers.stop_and_print_elapsed(tname)
         return results
 
@@ -514,7 +642,7 @@ class DeepSpeedWorker:
         """
         _, kwargs, _, _ = unpack_batch(batch)
         kwargs = {k: v.to(self._device) if torch.is_tensor(v) else v for k, v in kwargs.items()}
-        with torch.no_grad():
+        with torch.no_grad(), self._z3_eager_inference():
             logits = self.engine(**kwargs).logits
         log_probs = torch.log_softmax(logits, dim=-1)
         shifted_ids = kwargs["input_ids"][:, 1:]

@@ -19,6 +19,7 @@ Qwen-specific attention patcher with QKV optimization.
 This module implements optimized attention patching for Qwen2/Qwen3 models.
 """
 
+import os
 import sys
 
 import torch
@@ -37,6 +38,21 @@ debug_object = {
     "patched_counter": 0,
     "capture_at_invocation": int(1e12),  # Which invocation to capture (0 = first)
 }
+
+# Module-level Python constant so torch.compile/dynamo can constant-fold (and thus prune) the
+# debug-capture blocks in the patched attention forward. Reading `debug_object[...]` inside the
+# compiled forward is a data-dependent dict access that forces a graph break on every layer;
+# gating those blocks behind this constant keeps the compiled attention break-free when debug is
+# off. Set to True (and lower capture_at_invocation) only for local numerical debugging.
+_ZORRO_ATTN_DEBUG = False
+
+# Fullgraph split-attention: consume precomputed token gather indices
+# (ZoRRoTrain.build_attention_gather_indices) via index_select instead of the Python-loop /
+# .item() extraction helpers. This makes the per-decoder-layer forward graph-break-free so
+# DeepCompile can gather ZeRO-3-sharded params (o_proj, mlp, ...) inside a single compiled graph.
+# The index-based path is numerically identical to the legacy helpers (indices are derived by
+# running those helpers on an arange position tensor). Set ARCTIC_ZORRO_FULLGRAPH=0 to fall back.
+ZORRO_FULLGRAPH_ATTN = os.environ.get("ARCTIC_ZORRO_FULLGRAPH", "1") == "1"
 
 cos_dedup = None
 sin_dedup = None
@@ -329,6 +345,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
         reconstruction_info["response_to_full_mask"] = response_to_full_mask
 
     @staticmethod
+    @torch.compiler.disable
     def _prepare_attention_kwargs_and_masks(
         use_cumsum_mask,
         reconstruction_info,
@@ -358,18 +375,25 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
         if use_cumsum_mask:
             # FA 2.1+: use varlen API with bottom-right aligned causal mask
 
+            # FA3's varlen op declares max_seqlen_q/k as SymInt?, so these must be
+            # Python ints (not 0-dim tensors). Some reconstruction_info entries are
+            # tensor scalars (e.g. max_response_valid_len); coerce so torch.compile /
+            # DeepCompile can trace the op instead of failing to cast a FakeTensor.
+            def _as_int(v):
+                return int(v.item()) if torch.is_tensor(v) else int(v)
+
             flash_kwargs_prompt = {
                 "cu_seq_lens_q": cu_seqlens_unique_prompts.to(device),
                 "cu_seq_lens_k": cu_seqlens_unique_prompts.to(device),
-                "max_length_q": reconstruction_info["max_prompt_valid_len"],
-                "max_length_k": reconstruction_info["max_prompt_valid_len"],
+                "max_length_q": _as_int(reconstruction_info["max_prompt_valid_len"]),
+                "max_length_k": _as_int(reconstruction_info["max_prompt_valid_len"]),
                 "causal": True,
             }
             flash_kwargs_response = {
                 "cu_seq_lens_q": cu_seqlens_response.to(device),
                 "cu_seq_lens_k": cu_seqlens_packed.to(device),
-                "max_length_q": reconstruction_info["max_response_valid_len"],
-                "max_length_k": reconstruction_info["max_seqlen_packed"],
+                "max_length_q": _as_int(reconstruction_info["max_response_valid_len"]),
+                "max_length_k": _as_int(reconstruction_info["max_seqlen_packed"]),
                 "causal": True,  # FA 2.1+ bottom-right aligned: responses see all prompts + causal responses
             }
 
@@ -787,7 +811,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             cos, sin = position_embeddings
 
             # Capture debug data
-            if debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
+            if _ZORRO_ATTN_DEBUG and debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
                 debug_object["patched"] = {}
                 debug_object["patched"]["hidden_states_input"] = ZoRRoTrain.reconstruct_sequences(
                     hidden_states.unsqueeze(0) if hidden_states.dim() == 2 else hidden_states, reconstruction_info
@@ -837,7 +861,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             )
 
             # Capture patched data if this is the specified invocation
-            if debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
+            if _ZORRO_ATTN_DEBUG and debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
                 debug_object["patched"]["attn_output"] = attn_output
                 debug_object["patched"]["attn_weights"] = attn_weights
                 debug_object["patched"]["query_states"] = query_states
@@ -853,11 +877,12 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             attn_output_dedup = self._apply_optional_gate(attn_output_dedup, gate_dedup)
 
             o_proj_dedup = module.o_proj(attn_output_dedup)
-            if debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
+            if _ZORRO_ATTN_DEBUG and debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
                 debug_object["patched"]["o_proj_output"] = ZoRRoTrain.reconstruct_sequences(
                     o_proj_dedup, reconstruction_info
                 )
-            debug_object["patched_counter"] += 1
+            if _ZORRO_ATTN_DEBUG:
+                debug_object["patched_counter"] += 1
 
             return o_proj_dedup, attn_weights
 
@@ -916,7 +941,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             cos, sin = position_embeddings
 
             # Capture debug data
-            if debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
+            if _ZORRO_ATTN_DEBUG and debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
                 debug_object["patched"] = {}
                 debug_object["patched"]["hidden_states_input"] = ZoRRoTrain.reconstruct_sequences(
                     hidden_states.unsqueeze(0) if hidden_states.dim() == 2 else hidden_states, reconstruction_info
@@ -1007,7 +1032,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             # attn_output: [batch_size, seq_len, num_heads, head_dim]
 
             # Capture patched data if this is the specified invocation
-            if debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
+            if _ZORRO_ATTN_DEBUG and debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
                 debug_object["patched"]["attn_output"] = attn_output  # [batch, seq, heads, dim]
                 debug_object["patched"]["attn_weights"] = None
                 debug_object["patched"]["query_states"] = query_states
@@ -1029,11 +1054,12 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             # Apply output projection
             o_proj_dedup = module.o_proj(attn_output_dedup)
 
-            if debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
+            if _ZORRO_ATTN_DEBUG and debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
                 debug_object["patched"]["o_proj_output"] = ZoRRoTrain.reconstruct_sequences(
                     o_proj_dedup, reconstruction_info
                 )
-            debug_object["patched_counter"] += 1
+            if _ZORRO_ATTN_DEBUG:
+                debug_object["patched_counter"] += 1
 
             return o_proj_dedup, None
 
@@ -1061,6 +1087,7 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
         # max_seqlen_dedup = reconstruction_info['max_seqlen_dedup']
         # max_seqlen_packed = reconstruction_info['max_seqlen_packed']
 
+        @torch.compiler.disable
         def Dedup_Cosine_Sine_Coeff(cos, sin, cu_seqlens_dedup, cu_seqlens_response, reconstruction_info):
 
             RUN = False
@@ -1144,23 +1171,6 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             )
 
             cos, sin = position_embeddings
-            cu_seqlens_response = ZoRRoTrain._extract_cu_seqlens(reconstruction_info, hidden_states.device)
-            # if layer_id == 0:
-            #     global cos_dedup, sin_dedup, group_sizes
-            cos_dedup, sin_dedup, group_sizes = Dedup_Cosine_Sine_Coeff(
-                cos, sin, cu_seqlens_packed.to(cu_seqlens_response.device), cu_seqlens_response, reconstruction_info
-            )
-
-            # Capture debug data
-            if debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
-                debug_object["patched"] = {}
-                debug_object["patched"]["hidden_states_input"] = ZoRRoTrain.reconstruct_sequences(
-                    hidden_states.unsqueeze(0) if hidden_states.dim() == 2 else hidden_states, reconstruction_info
-                )
-                debug_object["patched"]["position_embeddings"] = (cos, sin)
-            qs, ks = apply_rotary_pos_emb(
-                query_dedup.transpose(1, 2), key_dedup.transpose(1, 2), cos_dedup, sin_dedup, unsqueeze_dim=1
-            )
 
             attention_interface = _resolve_attention_interface(
                 all_attention_functions,
@@ -1168,70 +1178,162 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
                 eager_attention_forward,
             )
 
-            # Extract unique prompts and compute prompt-to-prompt attention
-            prompt_q = ZoRRoTrain._get_sequences_packed_from_dedup_tensor(qs, reconstruction_info, cu_seqlens_response)
-            prompt_k = ZoRRoTrain._get_sequences_packed_from_dedup_tensor(ks, reconstruction_info, cu_seqlens_response)
-            prompt_v = ZoRRoTrain._get_sequences_packed_from_dedup_tensor(
-                value_dedup.transpose(1, 2), reconstruction_info, cu_seqlens_response
-            )
-            response_q = ZoRRoTrain._get_responses_packed_from_dedup_tensor(
-                qs, reconstruction_info, cu_seqlens_response
-            )
+            if ZORRO_FULLGRAPH_ATTN and "prompt_gather_idx" in reconstruction_info:
+                # ---- Fullgraph (graph-break-free) split attention ----
+                # All token extraction/packing/reconstruction is done with index_select using
+                # indices precomputed once per forward (ZoRRoTrain.build_attention_gather_indices).
+                # No .item()/Python loops here -> the whole decoder layer compiles as one graph, so
+                # DeepCompile gathers ZeRO-3 params (o_proj, mlp, ...) without stranding shards.
+                prompt_gather_idx = reconstruction_info["prompt_gather_idx"]
+                response_gather_idx = reconstruction_info["response_gather_idx"]
+                recon_gather_idx = reconstruction_info["recon_gather_idx"]
+                combine_gather_idx = reconstruction_info["combine_gather_idx"]
+                cu_seqlens_unique_prompts = reconstruction_info["cu_seqlens_unique_prompts"]
+                cu_seqlens_response = reconstruction_info["cu_seqlens_response"]
+                max_seqlen_bound = reconstruction_info["max_seqlen_bound"]
 
-            # Get cu_seqlens for unique prompts and response
-            cu_seqlens_unique_prompts = reconstruction_info["cu_seqlens_unique_prompts"]
-            cu_seqlens_response = reconstruction_info["cu_seqlens_response"]
+                # RoPE. In the active path Dedup_Cosine_Sine_Coeff returns cos/sin unchanged, so we
+                # apply the original coefficients directly (the dedup hidden layout already matches).
+                qs, ks = apply_rotary_pos_emb(
+                    query_dedup.transpose(1, 2), key_dedup.transpose(1, 2), cos, sin, unsqueeze_dim=1
+                )
+                vs = value_dedup.transpose(1, 2)
 
-            # Prepare attention kwargs and masks
-            prompt_kwargs, response_kwargs, prompt_mask, response_mask = self._prepare_attention_kwargs_and_masks(
-                use_cumsum_mask,
-                reconstruction_info,
-                cu_seqlens_unique_prompts,
-                cu_seqlens_response,
-                cu_seqlens_packed,
-                attention_mask,
-                hidden_states.device,
-                kwargs,
-            )
+                # token dim for [1, num_heads, tokens, head_dim] tensors is dim=2
+                prompt_q = qs.index_select(2, prompt_gather_idx)
+                prompt_k = ks.index_select(2, prompt_gather_idx)
+                prompt_v = vs.index_select(2, prompt_gather_idx)
+                response_q = qs.index_select(2, response_gather_idx)
 
-            # Compute prompt-to-prompt attention
-            prompt_outputs, _ = attention_interface(
-                module,
-                prompt_q.contiguous(),
-                prompt_k.contiguous(),
-                prompt_v.contiguous(),
-                attention_mask=prompt_mask,
-                dropout=0.0 if not module.training else module.attention_dropout,
-                scaling=module.scaling,
-                sliding_window=getattr(module, "sliding_window", None),
-                **prompt_kwargs,
-            )
+                dev = hidden_states.device
+                prompt_kwargs = {
+                    **kwargs,
+                    "cu_seq_lens_q": cu_seqlens_unique_prompts.to(dev),
+                    "cu_seq_lens_k": cu_seqlens_unique_prompts.to(dev),
+                    "max_length_q": max_seqlen_bound,
+                    "max_length_k": max_seqlen_bound,
+                    "causal": True,
+                }
+                response_kwargs = {
+                    **kwargs,
+                    "cu_seq_lens_q": cu_seqlens_response.to(dev),
+                    "cu_seq_lens_k": cu_seqlens_packed.to(dev),
+                    "max_length_q": max_seqlen_bound,
+                    "max_length_k": max_seqlen_bound,
+                    "causal": True,
+                }
 
-            # Compute response-to-full attention
-            key_states = ZoRRoTrain._get_sequences_reconstructed_from_dedup_tensors(
-                ks, prompt_k, reconstruction_info, cu_seqlens_response, group_sizes
-            )
-            value_states = ZoRRoTrain._get_sequences_reconstructed_from_dedup_tensors(
-                value_dedup.transpose(1, 2), prompt_v, reconstruction_info, cu_seqlens_response, group_sizes
-            )
+                prompt_outputs, _ = attention_interface(
+                    module,
+                    prompt_q.contiguous(),
+                    prompt_k.contiguous(),
+                    prompt_v.contiguous(),
+                    attention_mask=None,
+                    dropout=0.0 if not module.training else module.attention_dropout,
+                    scaling=module.scaling,
+                    sliding_window=getattr(module, "sliding_window", None),
+                    **prompt_kwargs,
+                )
 
-            response_outputs, _ = attention_interface(
-                module,
-                response_q.contiguous(),
-                key_states.contiguous(),
-                value_states.contiguous(),
-                attention_mask=response_mask,
-                dropout=0.0 if not module.training else module.attention_dropout,
-                scaling=module.scaling,
-                sliding_window=getattr(module, "sliding_window", None),
-                **response_kwargs,
-            )
-            attn_output_dedup = ZoRRoTrain._replicate_and_concat_prompt_responses(
-                prompt_outputs, response_outputs, reconstruction_info, cu_seqlens_response
-            )
+                # Response-to-full: reconstructed K/V = prompt (replicated per group member) + that
+                # member's responses; recon_gather_idx encodes exactly that gather over the dedup K/V.
+                key_states = ks.index_select(2, recon_gather_idx)
+                value_states = vs.index_select(2, recon_gather_idx)
+
+                response_outputs, _ = attention_interface(
+                    module,
+                    response_q.contiguous(),
+                    key_states.contiguous(),
+                    value_states.contiguous(),
+                    attention_mask=None,
+                    dropout=0.0 if not module.training else module.attention_dropout,
+                    scaling=module.scaling,
+                    sliding_window=getattr(module, "sliding_window", None),
+                    **response_kwargs,
+                )
+
+                # Recombine into dedup layout: single index_select over concat([prompt, response])
+                # along the token dim (dim=1 for [1, tokens, heads, dim] attention outputs).
+                combined = torch.cat([prompt_outputs, response_outputs], dim=1)
+                attn_output_dedup = combined.index_select(1, combine_gather_idx)
+            else:
+                # ---- Legacy (graph-breaking) split attention ----
+                cu_seqlens_response = ZoRRoTrain._extract_cu_seqlens(reconstruction_info, hidden_states.device)
+                cos_dedup, sin_dedup, group_sizes = Dedup_Cosine_Sine_Coeff(
+                    cos, sin, cu_seqlens_packed.to(cu_seqlens_response.device), cu_seqlens_response, reconstruction_info
+                )
+                qs, ks = apply_rotary_pos_emb(
+                    query_dedup.transpose(1, 2), key_dedup.transpose(1, 2), cos_dedup, sin_dedup, unsqueeze_dim=1
+                )
+
+                # Extract unique prompts and compute prompt-to-prompt attention
+                prompt_q = ZoRRoTrain._get_sequences_packed_from_dedup_tensor(
+                    qs, reconstruction_info, cu_seqlens_response
+                )
+                prompt_k = ZoRRoTrain._get_sequences_packed_from_dedup_tensor(
+                    ks, reconstruction_info, cu_seqlens_response
+                )
+                prompt_v = ZoRRoTrain._get_sequences_packed_from_dedup_tensor(
+                    value_dedup.transpose(1, 2), reconstruction_info, cu_seqlens_response
+                )
+                response_q = ZoRRoTrain._get_responses_packed_from_dedup_tensor(
+                    qs, reconstruction_info, cu_seqlens_response
+                )
+
+                # Get cu_seqlens for unique prompts and response
+                cu_seqlens_unique_prompts = reconstruction_info["cu_seqlens_unique_prompts"]
+                cu_seqlens_response = reconstruction_info["cu_seqlens_response"]
+
+                # Prepare attention kwargs and masks
+                prompt_kwargs, response_kwargs, prompt_mask, response_mask = self._prepare_attention_kwargs_and_masks(
+                    use_cumsum_mask,
+                    reconstruction_info,
+                    cu_seqlens_unique_prompts,
+                    cu_seqlens_response,
+                    cu_seqlens_packed,
+                    attention_mask,
+                    hidden_states.device,
+                    kwargs,
+                )
+
+                # Compute prompt-to-prompt attention
+                prompt_outputs, _ = attention_interface(
+                    module,
+                    prompt_q.contiguous(),
+                    prompt_k.contiguous(),
+                    prompt_v.contiguous(),
+                    attention_mask=prompt_mask,
+                    dropout=0.0 if not module.training else module.attention_dropout,
+                    scaling=module.scaling,
+                    sliding_window=getattr(module, "sliding_window", None),
+                    **prompt_kwargs,
+                )
+
+                # Compute response-to-full attention
+                key_states = ZoRRoTrain._get_sequences_reconstructed_from_dedup_tensors(
+                    ks, prompt_k, reconstruction_info, cu_seqlens_response, group_sizes
+                )
+                value_states = ZoRRoTrain._get_sequences_reconstructed_from_dedup_tensors(
+                    value_dedup.transpose(1, 2), prompt_v, reconstruction_info, cu_seqlens_response, group_sizes
+                )
+
+                response_outputs, _ = attention_interface(
+                    module,
+                    response_q.contiguous(),
+                    key_states.contiguous(),
+                    value_states.contiguous(),
+                    attention_mask=response_mask,
+                    dropout=0.0 if not module.training else module.attention_dropout,
+                    scaling=module.scaling,
+                    sliding_window=getattr(module, "sliding_window", None),
+                    **response_kwargs,
+                )
+                attn_output_dedup = ZoRRoTrain._replicate_and_concat_prompt_responses(
+                    prompt_outputs, response_outputs, reconstruction_info, cu_seqlens_response
+                )
 
             # Capture patched data if this is the specified invocation
-            if debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
+            if _ZORRO_ATTN_DEBUG and debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
                 debug_object["patched"]["attn_output"] = attn_output_dedup  # [batch, seq, heads, dim]
                 debug_object["patched"]["attn_weights"] = None
                 debug_object["patched"]["query_states"] = qs
@@ -1250,11 +1352,12 @@ class QwenAttentionPatcher(ModuleReconstructionPatcher):
             # Apply output projection
             o_proj_dedup = module.o_proj(attn_output_dedup)
 
-            if debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
+            if _ZORRO_ATTN_DEBUG and debug_object["patched_counter"] == debug_object["capture_at_invocation"]:
                 debug_object["patched"]["o_proj_output"] = ZoRRoTrain.reconstruct_sequences(
                     o_proj_dedup, reconstruction_info
                 )
-            debug_object["patched_counter"] += 1
+            if _ZORRO_ATTN_DEBUG:
+                debug_object["patched_counter"] += 1
 
             return o_proj_dedup, None
 
