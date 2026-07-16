@@ -11,6 +11,10 @@
 #
 # GSM8K is scored by verl's built-in reward (data_source="openai/gsm8k"), so no custom reward function is needed.
 #
+# The Arctic backend is loaded into verl as a plugin via the
+# `VERL_USE_EXTERNAL_MODULES=arctic_platform.integrations.verl.register`
+# hook exported below; verl core carries no Arctic-specific files.
+#
 # Prerequisites (see README.md):
 #   1. Download data: python download_data.py   (writes $DATA_DIR/{train,test}.parquet)
 #   2. Packages installed (README "Install packages": requirements.txt + overrides.txt, plus the Snowflake verl fork
@@ -36,6 +40,38 @@ export USE_ARCTIC_TRAINING_CLIENT=1
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${HOME}/.cache/vllm}"
 export VLLM_LOGGING_LEVEL=INFO
+
+# Plug the Arctic RemoteBackend into verl. verl reads this on `import verl`
+# and imports the referenced module for its registration side effects; no
+# verl source-tree modification is needed.
+export VERL_USE_EXTERNAL_MODULES=arctic_platform.integrations.verl.register
+
+# Make the plugin's config directory visible to Hydra so `remote_backend=arctic`
+# resolves to the yaml shipped inside arctic_platform.
+ARCTIC_VERL_CONFIG_DIR="${REPO_ROOT}/arctic_platform/integrations/verl/config"
+
+# Preflight: torch/system CUDA mismatch. DeepSpeed JIT-builds CUDA extensions
+# and refuses if `nvcc --version` doesn't match torch's build CUDA. In
+# multi-CUDA container images (e.g. `/usr/local/cuda -> cuda-13` while torch
+# is cu129), auto-point CUDA_HOME at the matching toolkit if available.
+_torch_cuda=$(python -c "import torch; print(torch.version.cuda or '')" 2>/dev/null || true)
+if [[ -n "${_torch_cuda}" ]]; then
+    _sys_nvcc=$(nvcc --version 2>/dev/null | awk -F'release ' '/release/ {split($2,a,","); print a[1]}')
+    if [[ -n "${_sys_nvcc}" && "${_sys_nvcc}" != "${_torch_cuda}" ]]; then
+        _match_dir="/usr/local/cuda-${_torch_cuda}"
+        if [[ -x "${_match_dir}/bin/nvcc" ]]; then
+            export CUDA_HOME="${_match_dir}"
+            export PATH="${CUDA_HOME}/bin:${PATH}"
+            export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+            echo "[preflight] system nvcc=${_sys_nvcc} != torch.version.cuda=${_torch_cuda}; auto-pointing CUDA_HOME=${CUDA_HOME}"
+        else
+            echo "[preflight] ERROR: system nvcc=${_sys_nvcc} != torch.version.cuda=${_torch_cuda}" >&2
+            echo "[preflight]        DeepSpeed CUDA extension JIT will fail with CUDAMismatchException." >&2
+            echo "[preflight]        Install cuda-${_torch_cuda} and export CUDA_HOME=/path/to/cuda-${_torch_cuda}." >&2
+            exit 3
+        fi
+    fi
+fi
 
 # ----- Single-GPU Arctic/ZoRRo topology -----
 USE_LEGACY_WORKER_IMPL=disable
@@ -106,6 +142,7 @@ LOG_PROBS=False
 FREE_CACHE_ENGINE=True
 
 python3 -m verl.trainer.main_ppo \
+    hydra.searchpath="[file://${ARCTIC_VERL_CONFIG_DIR}]" \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=True \
     algorithm.use_kl_in_reward=False \

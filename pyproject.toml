@@ -12,6 +12,9 @@ license-files = [
 [tool.hatch.build]
 include = [
   "arctic_platform",
+  "arctic_platform/integrations/verl/config/**/*.yaml",
+  "arctic_platform/integrations/verl/examples/*.sh",
+  "arctic_platform/integrations/verl/README.md",
 ]
 
 [project.urls]
@@ -74,6 +77,7 @@ all = [
     "arctic_platform[dev]",
     "arctic_platform[testing]",
     "arctic_platform[rl]",
+    "arctic_platform[verl]",
 ]
 
 dev = [
@@ -103,6 +107,16 @@ rl = [
     "tensordict",
     "uvicorn",
     "vllm==0.18.0",
+]
+
+# verl adapter (arctic_platform/integrations/verl). verl itself is user-supplied and
+# version-pinned in launchers; here we only carry the small set of shared runtime
+# dependencies the adapter itself needs beyond the base install and the [rl] extra.
+verl = [
+    "arctic_platform[rl]",
+    "codetiming",
+    "hydra-core>=1.3",
+    "omegaconf",
 ]
 
 [tool.pytest.ini_options]
