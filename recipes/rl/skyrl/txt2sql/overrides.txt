@@ -1,6 +1,6 @@
 # uv override-dependencies for the BIRD txt2sql recipe.
 #
-# Same as ../simple/overrides.txt: collapse the vLLM-0.18.0 (<5) vs.
+# Same as ../simple_gsm8k/overrides.txt: collapse the vLLM-0.18.0 (<5) vs.
 # SkyRL-pinned (>=5.6.1) transformers conflict to a single working version,
 # and pin datasets to the version that exports `DatasetGenerationCastError`
 # (added in 4.x, used by SkyRL's PromptDataset path).

@@ -4,7 +4,7 @@ End-to-end recipes for training models with [Arctic RL](../../../arctic_platform
 on top of [SkyRL](https://github.com/NovaSky-AI/SkyRL).
 
 Available recipes:
-  * [Simple (GSM8K)](simple) — smallest end-to-end loop, one GPU, no Ray/hostfile
+  * [Simple (GSM8K)](simple_gsm8k) — smallest end-to-end loop, one GPU, no Ray/hostfile
   * [Txt2SQL (BIRD)](txt2sql) — single-node 8B **+** 4-node 32B ARL, with an FSDP A/B baseline (the blog ~2.38× speedup run)
   * [Long-context QA (LoongRL)](long_context_qa) — single-node 8B **+** 4-node 32B ARL, with an FSDP A/B baseline (locally measured 2.17× speedup)
 
@@ -59,10 +59,10 @@ once, `conda activate skyrl_arl`, and any recipe launches from bare `python`.
 
 ## Anatomy of a recipe
 
-All three recipes share the same skeleton — each is a standalone folder that
-depends only on `$SKYRL_HOME` for the actual Arctic RL × SkyRL library
-(config/trainer/generator/envs) and vendors everything the recipe itself
-needs:
+Every recipe is a standalone folder that depends only on `$SKYRL_HOME` for the
+actual Arctic RL × SkyRL library (config/trainer/generator/envs). How much
+recipe-local Python it vendors on top of that depends on whether it needs to
+register a custom env and whether it ships an FSDP A/B baseline:
 
 - **`arctic_rl/`** shim — recipe-local package whose `entrypoint.py` is what
   the ARL launchers dispatch to (`trainer.override_entrypoint=arctic_rl.entrypoint`).
@@ -76,11 +76,18 @@ needs:
   Registers envs in the `ProcessPoolExecutor` spawn children that the
   reward-scorer spins up.
 
-The `simple/` recipe skips `fsdp_<name>_entry.py` (single-GPU, no A/B baseline)
-and `sitecustomize.py` (no PPE reward scorer), but the ARL shim shape is
-identical. `long_context_qa/` additionally vendors its own env package under
-`arctic_rl/envs/` because `long_context_qa` isn't registered upstream; the
-other two rely on upstream's `integrations.arctic_rl.envs`.
+`txt2sql/` carries all three (`arctic_rl/` + `fsdp_bird_entry.py` +
+`sitecustomize.py`); `long_context_qa/` carries all three **and** additionally
+vendors its own env package under `arctic_rl/envs/` because `long_context_qa`
+isn't registered upstream (`txt2sql/` reuses upstream's
+`integrations.arctic_rl.envs` for `bird`/`bird_sql`).
+
+`simple_gsm8k/` is the exception: it ships **zero recipe-local Python**. GSM8K
+is registered by upstream `skyrl_gym`, so its launcher points
+`trainer.override_entrypoint` straight at upstream's
+`integrations.arctic_rl.entrypoint` and needs no `arctic_rl/` shim. Being
+single-GPU it has no FSDP A/B baseline (`fsdp_<name>_entry.py`), and its
+built-in reward runs in-process so it needs no `sitecustomize.py` either.
 
 The actual Arctic RL × SkyRL machinery (config/trainer/generator) is *not*
 vendored — it lives in `$SKYRL_HOME/integrations/arctic_rl/`. Launchers put

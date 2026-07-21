@@ -29,7 +29,7 @@ written.  Rows are converted to SkyRL's standard schema:
 
 The vendored arctic_rl LongContextQAEnv accepts both ``reward_model.ground_truth`` (verl
 schema) and ``reward_spec.ground_truth`` (SkyRL schema), so the launcher works against
-either; we write the SkyRL shape here for consistency with the simple/ recipe.
+either; we write the SkyRL shape here for consistency with the simple_gsm8k/ recipe.
 
 Output layout::
 

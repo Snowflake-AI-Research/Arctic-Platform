@@ -34,7 +34,7 @@ recipe.
 
 ## 1. Install
 
-Same env as the sibling `simple/` and `long_context_qa/` recipes — if you've
+Same env as the sibling `simple_gsm8k/` and `long_context_qa/` recipes — if you've
 built either of those, `conda activate skyrl_arl` and skip step 2.
 
 ```bash

@@ -30,12 +30,12 @@ SkyRL twin of that run (verl twin: [`recipes/rl/verl/long_context_qa/run_qwen3_3
 | `sitecustomize.py`                  | Registers `long_context_qa` in `ProcessPoolExecutor` spawn children (used by the reward scorer) |
 
 Config, trainer, and generator come from `$SKYRL_HOME/integrations/arctic_rl/`.
-The sibling `simple/` and `txt2sql/` recipes reuse envs already registered
+The sibling `simple_gsm8k/` and `txt2sql/` recipes reuse envs already registered
 upstream; this recipe adds the `long_context_qa` shim because that env is new.
 
 ## 1. Install
 
-Same env as the sibling `simple/` and `txt2sql/` recipes — if you've built
+Same env as the sibling `simple_gsm8k/` and `txt2sql/` recipes — if you've built
 either of those, `conda activate skyrl_arl` and skip step 2.
 
 ```bash
