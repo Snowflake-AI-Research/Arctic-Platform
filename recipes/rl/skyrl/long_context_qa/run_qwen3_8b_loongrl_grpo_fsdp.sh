@@ -1,16 +1,16 @@
 #!/bin/bash
-# SkyRL FSDP-native backend: Qwen3-32B BIRD-SQL GRPO — 4 nodes / 32 H200s.
+# SkyRL FSDP-native backend: Qwen3-8B LoongRL long-context GRPO — single node / 8 H200s.
 #
-# Wall-clock A/B baseline for run_qwen3_32b_bird_grpo_arl_4node.sh. Identical
-# model, data, hyperparams, and placement; only the training backend differs
-# (fsdp2 + native SkyRL colocation + vLLM generator with no ArcticInference).
+# Wall-clock A/B baseline for run_qwen3_8b_loongrl_grpo_arl.sh. Same model, data,
+# batch geometry, sequence lengths, and placement as the ARL sibling; only the
+# training backend differs (fsdp2 + native SkyRL colocation + plain vLLM, no
+# ArcticInference / ZoRRo). This is the single-node counterpart of
+# run_qwen3_32b_loongrl_grpo_fsdp_4node.sh and the baseline behind the locally
+# measured single-node ZoRRo speedup quoted in README.md.
 #
-# Dispatches to the recipe-local ``fsdp_bird_entry.py`` — that entrypoint
-# side-effect-imports ``integrations.arctic_rl.envs`` (via the recipe's
-# ``arctic_rl`` shim) to register ``bird`` / ``bird_sql`` on driver + workers.
-#
-# Prereqs: 4-node ray cluster up, BIRD parquets on shared FS, Qwen3-32B
-# available (per-node download or shared HF_HOME). See ../README.md.
+# Prereqs (see README.md):
+#   1. Activated conda env with pinned deps; `export SKYRL_HOME=<clone>`.
+#   2. `python download_data.py --output_dir $DATA_DIR`.
 
 set -euxo pipefail
 
@@ -22,19 +22,17 @@ if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; th
     echo "       'export SKYRL_HOME=<path to clone>' before running this script."
     exit 1
 fi
-# ${SCRIPT_DIR} carries the recipe-local ``arctic_rl/`` shim + ``sitecustomize.py``
-# that register ``bird`` / ``bird_sql``.
+# ${SCRIPT_DIR} carries the recipe-local ``arctic_rl.envs`` package + the
+# ``sitecustomize.py`` hook that register ``long_context_qa``.
 export PYTHONPATH="${SKYRL_HOME}:${SCRIPT_DIR}:${PYTHONPATH:-}"
 
-# Bare python from a caller-activated env. See ../README.md.
+# Bare python from a caller-activated env. See ../README.md for env setup.
 PYBIN="${PYBIN:-python}"
 
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
 export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
-export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${HOME}/.cache/vllm}"
 export VLLM_LOGGING_LEVEL=INFO
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
@@ -44,53 +42,53 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # fsdp bird recipe.
 export SKYRL_USE_LIGER=0
 
-export WANDB_API_KEY="${WANDB_API_KEY:-}"
-export WANDB_PROJECT="${WANDB_PROJECT:-skyrl_arctic_rl}"
+export WANDB_PROJECT="${WANDB_PROJECT:-skyrl_arctic_rl_long_context}"
 export WANDB_DISABLE_CODE=True
 
-# ----- 4-node 32-GPU topology (matches the ARL sibling) -----
-NUM_NODES=4
+# ----- Single-node 8-GPU topology (matches the ARL 8B sibling) -----
+NUM_NODES=1
 GPUS_PER_NODE=8
 NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
 TP_SIZE="${TP_SIZE:-4}"
 NUM_ENGINES=$((NUM_GPUS / TP_SIZE))
 
-# Same batch math as the ARL sibling: 128 prompts x 16 samples = 2048
-# trajectories/step. Constraints: train_batch_size * n_samples_per_prompt
-# divisible by num_gpus.
-TRAIN_BSZ="${TRAIN_BSZ:-128}"
-MINI_BSZ="${MINI_BSZ:-128}"
-N_SAMPLES="${N_SAMPLES:-16}"
-PROMPT_LEN="${PROMPT_LEN:-32768}"
-RESPONSE_LEN="${RESPONSE_LEN:-4096}"
-LR="${LR:-2e-6}"
+# Same batch geometry / sequence lengths as run_qwen3_8b_loongrl_grpo_arl.sh.
+TRAIN_BSZ="${TRAIN_BSZ:-16}"
+MINI_BSZ="${MINI_BSZ:-8}"
+N_SAMPLES="${N_SAMPLES:-4}"
+PROMPT_LEN="${PROMPT_LEN:-16384}"
+RESPONSE_LEN="${RESPONSE_LEN:-2048}"
+LR="${LR:-1e-6}"
 
-LOGGER="${LOGGER:-wandb}"
-MODEL="${MODEL:-Qwen/Qwen3-32B}"
+LOGGER="${LOGGER:-console}"
+MODEL="${MODEL:-Qwen/Qwen3-8B}"
 MODEL_SHORT="$(basename "${MODEL}")"
 
-DATA_DIR="${DATA_DIR:-${HOME}/data/bird}"
-if [[ ! -f "${DATA_DIR}/train.parquet" || ! -f "${DATA_DIR}/val.parquet" ]]; then
-    echo "ERROR: BIRD parquets not found at ${DATA_DIR}/{train,val}.parquet"
-    echo "       Run 'python download_data.py --bird_dir <raw> --output_dir ${DATA_DIR}' first."
-    echo "       NOTE: \$DATA_DIR must be on a shared FS visible to all 4 nodes."
+DATA_DIR="${DATA_DIR:-${HOME}/data/loongrl}"
+TRAIN_PARQUET="${TRAIN_PARQUET:-${DATA_DIR}/merged/train.parquet}"
+VAL_PARQUET="${VAL_PARQUET:-${DATA_DIR}/merged/test.parquet}"
+if [[ ! -f "${TRAIN_PARQUET}" || ! -f "${VAL_PARQUET}" ]]; then
+    echo "ERROR: LoongRL parquets not found at ${TRAIN_PARQUET} / ${VAL_PARQUET}"
+    echo "       Run 'python download_data.py --output_dir ${DATA_DIR}' first."
     exit 1
 fi
 
+export REWARD_CALC_TYPE="${REWARD_CALC_TYPE:-pure_exact_match}"
+
 RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
-EXPERIMENT_NAME="bird_grpo_${MODEL_SHORT}_fsdp_${NUM_NODES}node_${RUN_TS}"
+EXPERIMENT_NAME="longcontext_grpo_${MODEL_SHORT}_fsdp_${NUM_NODES}node_${RUN_TS}"
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"
 
-FSDP_ENTRY="${SCRIPT_DIR}/fsdp_bird_entry.py"
+FSDP_ENTRY="${SCRIPT_DIR}/fsdp_loongrl_entry.py"
 
 # Run from ${SKYRL_HOME} so ``integrations/`` imports resolve.
 cd "${SKYRL_HOME}"
 
 "${PYBIN}" "${FSDP_ENTRY}" \
-    data.train_data="['${DATA_DIR}/train.parquet']" \
-    data.val_data="['${DATA_DIR}/val.parquet']" \
+    data.train_data="['${TRAIN_PARQUET}']" \
+    data.val_data="['${VAL_PARQUET}']" \
     trainer.algorithm.advantage_estimator=grpo \
     trainer.policy.model.path="${MODEL}" \
     trainer.strategy=fsdp2 \
@@ -109,11 +107,13 @@ cd "${SKYRL_HOME}"
     generator.inference_engine.tensor_parallel_size=${TP_SIZE} \
     generator.inference_engine.backend=vllm \
     generator.inference_engine.run_engines_locally=true \
-    generator.inference_engine.gpu_memory_utilization=0.5 \
+    generator.inference_engine.gpu_memory_utilization=0.4 \
     generator.inference_engine.async_engine=true \
+    generator.inference_engine.max_num_batched_tokens=24576 \
+    generator.inference_engine.enforce_eager=true \
     generator.batched=true \
     trainer.epochs=1 \
-    trainer.eval_batch_size=32 \
+    trainer.eval_batch_size=16 \
     trainer.eval_before_train=false \
     trainer.eval_interval=100 \
     trainer.update_epochs_per_batch=1 \
@@ -132,7 +132,7 @@ cd "${SKYRL_HOME}"
     trainer.policy.optimizer_config.max_grad_norm=1.0 \
     trainer.algorithm.use_kl_loss=false \
     trainer.algorithm.use_kl_in_reward=false \
-    environment.env_class=bird \
+    environment.env_class=long_context_qa \
     generator.n_samples_per_prompt=${N_SAMPLES} \
     trainer.logger="${LOGGER}" \
     trainer.project_name="${WANDB_PROJECT}" \

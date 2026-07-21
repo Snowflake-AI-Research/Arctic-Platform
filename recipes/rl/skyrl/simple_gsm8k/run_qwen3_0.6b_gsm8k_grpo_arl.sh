@@ -33,11 +33,11 @@ export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
 export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
-export TORCH_COMPILE_DISABLE=1
-export VLLM_DISABLE_COMPILE_CACHE=1
-# Belt-and-suspenders for TP>1 CLI overrides — see the BIRD-8B launcher note on
-# the FlashInfer-workspace assertion. Harmless at TP=1.
-export TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
+# NOTE: do NOT force-disable the inductor/vLLM compile caches here. vLLM 0.18.0's
+# CUDA-graph precompile path asserts `Cannot precompile with
+# torch._inductor.config.force_disable_caches=True; caching is required`, so
+# TORCHINDUCTOR_FORCE_DISABLE_CACHES / TORCH_COMPILE_DISABLE would crash the vLLM
+# engine at startup. Upstream's run_gsm8k_grpo_4gpu.sh sets none of these.
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${HOME}/.cache/vllm}"
 export VLLM_LOGGING_LEVEL=INFO
 

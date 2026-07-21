@@ -1,9 +1,9 @@
 # Simple GSM8K (single-GPU) recipe — pinned Python dependencies.
 #
-# Assumes CUDA 12.8. `torch` and `flash-attn` are installed separately in the
-# README (torch needs the PyTorch CUDA index; flash-attn ships as a prebuilt
-# wheel matching torch's ABI). If you use a different CUDA version, change the
-# torch index URL in the README accordingly.
+# Assumes CUDA 12.8, Python 3.12, x86_64. `torch` is installed separately first
+# (it needs the PyTorch CUDA index — see the README). FlashAttention-2 is pinned
+# below to the torch-2.10 ABI wheel; if you use a different CUDA/torch/python,
+# swap that wheel URL (and the torch index URL in the README) accordingly.
 #
 # A few transitive deps (transformers, datasets) are version-pinned in
 # overrides.txt (uv pip install --override), because vLLM 0.18.0 and SkyRL pin
@@ -24,8 +24,24 @@ ray==2.51.1
 # also needs an on-disk clone of the same commit at $SKYRL_HOME because the
 # Arctic RL × SkyRL integration code (config/trainer/generator/BirdEnv) lives
 # under `integrations/arctic_rl/` and is NOT part of the pip package.
-skyrl @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315
+#
+# IMPORTANT: install WITH the `skyrl-train` extra. The launcher entrypoint
+# (`skyrl.train.entrypoints.main_base`) and the arctic_rl integration import
+# the training deps that extra pulls (deepspeed / hydra-core / jaxtyping /
+# torchdata / accelerate / wandb / …). Installing bare `skyrl` resolves an env
+# that fails at import time (`ModuleNotFoundError: jaxtyping`, then torchdata).
+skyrl[skyrl-train] @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315
 skyrl-gym @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315#subdirectory=skyrl-gym
+
+# FlashAttention-2 built against torch 2.10 (== vLLM 0.18.0's torch pin).
+# The `skyrl-train` extra requires `flash-attn==2.8.3`; SkyRL's pyproject
+# `[tool.uv.sources]` redirects that to this exact torch-2.10 wheel — but
+# `[tool.uv.sources]` is ONLY honored by `uv run`/`uv sync` from the SkyRL
+# repo, NOT by `uv pip install skyrl[...] @ git+...`. Without this explicit pin,
+# the resolver picks the default torch-2.11 wheel, whose ABI is incompatible
+# with torch 2.10 (ImportError: undefined symbol _ZNK3c104cuda10CUDAStream5queryEv)
+# and breaks both the trainer's FA2 path and vLLM's rotary-embedding import.
+flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; python_version == "3.12" and platform_machine == "x86_64"
 
 # Serving / kernels (arctic-inference patches vLLM 0.18.0, so pin that exact version).
 vllm==0.18.0

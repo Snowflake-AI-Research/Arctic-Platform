@@ -36,12 +36,11 @@ export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
 export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
-export TORCH_COMPILE_DISABLE=1
-export VLLM_DISABLE_COMPILE_CACHE=1
-# Also disable inductor's on-disk cache — stale compiled graphs from a prior
-# run with fuse_allreduce_rms=true can otherwise reuse and fail warm-up with
-#   AssertionError: Flashinfer workspace must be initialized when using flashinfer
-export TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
+# NOTE: do NOT force-disable the inductor/vLLM compile caches. vLLM 0.18.0's
+# CUDA-graph precompile path asserts `Cannot precompile with
+# torch._inductor.config.force_disable_caches=True; caching is required`, so
+# TORCHINDUCTOR_FORCE_DISABLE_CACHES / TORCH_COMPILE_DISABLE crash the vLLM
+# engine at startup. Upstream's arctic_rl launchers set none of these.
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${HOME}/.cache/vllm}"
 export VLLM_LOGGING_LEVEL=INFO
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
