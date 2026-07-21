@@ -25,18 +25,27 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from typing import Any, Awaitable, Optional, TypeVar
+from typing import Any
+from typing import Awaitable
+from typing import Optional
+from typing import TypeVar
 
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
+from omegaconf import OmegaConf
 from tensordict import TensorDict
-from verl.remote_backend.base import RemoteBackend, RemoteBackendRegistry
-from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.remote_backend.base import RemoteBackend
+from verl.remote_backend.base import RemoteBackendRegistry
+from verl.single_controller.base.decorator import Dispatch
+from verl.single_controller.base.decorator import make_nd_compute_dataproto_dispatch_fn
+from verl.single_controller.base.decorator import register
 from verl.utils import hf_tokenizer
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.flops_counter import FlopsCounter
-from verl.utils.profiler import DistProfiler, DistProfilerExtension
-from verl.workers.config import ActorConfig, HFModelConfig
+from verl.utils.profiler import DistProfiler
+from verl.utils.profiler import DistProfilerExtension
+from verl.workers.config import ActorConfig
+from verl.workers.config import HFModelConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker
 
 # Eager: populates RemoteBackendRegistry in every Ray child process; the
@@ -190,6 +199,7 @@ def _to_v0_padded_batch(
 
     return out
 
+
 class ArcticV1ActorRolloutRefWorker(ActorRolloutRefWorker):
     """CPU-only V1 forwarder that drives an Arctic :class:`RemoteBackend`.
 
@@ -231,9 +241,7 @@ class ArcticV1ActorRolloutRefWorker(ActorRolloutRefWorker):
         # Routing decisions happen inside the Arctic inference engine.
         self.enable_routing_replay = False
 
-        DistProfilerExtension.__init__(
-            self, DistProfiler(rank=self.rank, config=None, tool_config=None)
-        )
+        DistProfilerExtension.__init__(self, DistProfiler(rank=self.rank, config=None, tool_config=None))
 
         # --- Arctic-specific setup -------------------------------------- #
 
@@ -319,9 +327,7 @@ class ArcticV1ActorRolloutRefWorker(ActorRolloutRefWorker):
             max_prompt_len=self._config_max_prompt_len,
             max_response_len=self._config_max_response_len,
         )
-        return _AsyncRunner.get().run(
-            _ArcticV0Worker._run_log_prob(self, data, ref=True, calculate_entropy=False)
-        )
+        return _AsyncRunner.get().run(_ArcticV0Worker._run_log_prob(self, data, ref=True, calculate_entropy=False))
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
@@ -332,9 +338,7 @@ class ArcticV1ActorRolloutRefWorker(ActorRolloutRefWorker):
             max_prompt_len=self._config_max_prompt_len,
             max_response_len=self._config_max_response_len,
         )
-        return _AsyncRunner.get().run(
-            _ArcticV0Worker._run_log_prob(self, data, ref=False, calculate_entropy=True)
-        )
+        return _AsyncRunner.get().run(_ArcticV0Worker._run_log_prob(self, data, ref=False, calculate_entropy=True))
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")

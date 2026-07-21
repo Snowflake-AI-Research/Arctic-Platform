@@ -23,7 +23,8 @@ The V0 server file stays untouched.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
+from typing import Optional
 
 from verl.workers.rollout.replica import TokenOutput
 
