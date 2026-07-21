@@ -1,0 +1,15 @@
+# uv override-dependencies for the BIRD txt2sql recipe.
+#
+# Same as ../simple_gsm8k/overrides.txt: collapse the vLLM-0.18.0 (<5) vs.
+# SkyRL-pinned (>=5.6.1) transformers conflict to a single working version,
+# and pin datasets to the version that exports `DatasetGenerationCastError`
+# (added in 4.x, used by SkyRL's PromptDataset path).
+# nixl: pin back to 1.3.0. The `skyrl-train` extra floats nixl to 1.3.1, whose
+#   `nixl_ep` only ships torch-2.11/2.12 CUDA extensions; vLLM 0.18.0 (torch
+#   2.10) hard-imports the auto-detected `nixl_ep` at engine start and crashes
+#   with `ModuleNotFoundError: nixl_ep_cu12.nixl_ep_cpp_torch210`. 1.3.0 imports
+#   cleanly and these recipes don't use nixl (colocated dense GRPO).
+transformers==4.57.6
+datasets==4.8.4
+nixl==1.3.0
+nixl-cu12==1.3.0

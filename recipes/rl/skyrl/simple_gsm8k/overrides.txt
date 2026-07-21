@@ -1,0 +1,27 @@
+# uv override-dependencies for the simple GSM8K recipe.
+#
+# vLLM 0.18.0's metadata pins newer/older transitive deps than this recipe is
+# validated against. The recipe is validated with the versions below, so we
+# force them with `uv pip install -r requirements.txt --override overrides.txt`,
+# reproducing the original sequential "last install wins" behavior in a single
+# resolve.
+#
+# transformers: vLLM 0.18.0 requires `transformers<5`; SkyRL pins
+#   `transformers>=5.6.1`. Neither is satisfiable together. 4.57.6 is the
+#   exact version the Arctic RL × SkyRL integration is validated against
+#   (also matches the verl recipes for parity).
+#
+# datasets: pinned to keep the resolve deterministic across SkyRL bumps that
+#   would otherwise float this to a 5.x release with incompatible behavior.
+#
+# nixl: the `skyrl-train` extra requires an (unpinned) `nixl`, which floats to
+#   1.3.1 — a build whose `nixl_ep` submodule only ships torch-2.11/2.12 CUDA
+#   extensions. vLLM 0.18.0 (torch 2.10) auto-detects `nixl_ep` at engine start
+#   and hard-imports it, so 1.3.1 crashes the vLLM EngineCore with
+#   `ModuleNotFoundError: nixl_ep_cu12.nixl_ep_cpp_torch210`. 1.3.0 imports
+#   cleanly on torch 2.10; these recipes don't use nixl (colocated dense GRPO,
+#   no disaggregated KV / expert-parallel), so pin it back to 1.3.0.
+transformers==4.57.6
+datasets==4.8.4
+nixl==1.3.0
+nixl-cu12==1.3.0

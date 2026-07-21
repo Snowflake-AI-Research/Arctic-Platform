@@ -1,0 +1,40 @@
+# Long-context QA (LoongRL) recipe — pinned Python dependencies.
+#
+# Default target: single-node 8-GPU GRPO on Qwen3-8B with 16K-context LoongRL data
+# (HotpotQA + MuSiQue + 2WikiMQA). Same Arctic RL stack as the txt2sql recipe — only
+# the env / dataset / sequence-length defaults differ.
+#
+# Assumes CUDA 12.8 + Hopper (H100/H200) for FlashAttention 3. On A100/L40S set
+# ATTN_IMPL=flash_attention_2 in the launcher and drop the FA3 install line below.
+
+arctic-inference[vllm]
+# Arctic
+arctic-platform[rl]
+
+# FlashAttention-2 built against torch 2.10 (== vLLM 0.18.0's torch pin).
+# The `skyrl-train` extra requires `flash-attn==2.8.3`; SkyRL's pyproject
+# `[tool.uv.sources]` redirects that to this exact torch-2.10 wheel — but
+# `[tool.uv.sources]` is ONLY honored by `uv run`/`uv sync` from the SkyRL
+# repo, NOT by `uv pip install skyrl[...] @ git+...`. Without this explicit pin,
+# the resolver picks the default torch-2.11 wheel, whose ABI is incompatible
+# with torch 2.10 (ImportError: undefined symbol _ZNK3c104cuda10CUDAStream5queryEv)
+# and breaks both the trainer's FA2 path and vLLM's rotary-embedding import.
+flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; python_version == "3.12" and platform_machine == "x86_64"
+liger-kernel
+ray==2.51.1
+skyrl-gym @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315#subdirectory=skyrl-gym
+
+# SkyRL pinned at PR #1837 merge (the dispatch hook the arctic_rl integration
+# requires). This gives you the pip-installed `skyrl` package; the launcher
+# also needs an on-disk clone at $SKYRL_HOME because the Arctic RL × SkyRL
+# integration code (config/trainer/generator) lives under `integrations/arctic_rl/`
+# and is NOT part of the pip package. The `long_context_qa` env class itself
+# is registered by the recipe-local shim under `./arctic_rl/`.
+# IMPORTANT: install WITH the `skyrl-train` extra. The launcher entrypoint
+# (`skyrl.train.entrypoints.main_base`) and the arctic_rl integration import
+# the training deps that extra pulls (deepspeed / hydra-core / jaxtyping /
+# torchdata / accelerate / wandb / …). Installing bare `skyrl` resolves an env
+# that fails at import time (`ModuleNotFoundError: jaxtyping`, then torchdata).
+skyrl[skyrl-train] @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315
+
+vllm==0.18.0

@@ -1,0 +1,199 @@
+# Long-Context QA — multi-hop QA with Arctic RL × SkyRL
+
+GRPO training for **Qwen3** on the 16K-context [LoongRL-Train-Data][loongrl] multi-hop
+QA corpus (HotpotQA + MuSiQue + 2WikiMultiHopQA), driven by SkyRL's GRPO trainer with
+either the Arctic RL + ZoRRo backend or SkyRL's native FSDP backend. Four launchers
+ship in this directory:
+
+| Launcher | Backend | Topology | Notes |
+| --- | --- | --- | --- |
+| `run_qwen3_8b_loongrl_grpo_arl.sh` | Arctic RL | 1 × 8 H200 | Iteration target — Qwen3-8B, fits on a standalone host. |
+| `run_qwen3_8b_loongrl_grpo_fsdp.sh` | SkyRL FSDP-native | 1 × 8 H200 | Single-node A/B baseline for the 8B arctic launcher — same hyperparams, only the backend differs. |
+| `run_qwen3_32b_loongrl_grpo_arl_4node.sh` | Arctic RL | **4 × 8 H200** | Qwen3-32B, 16K prompts, 4K responses. |
+| `run_qwen3_32b_loongrl_grpo_fsdp_4node.sh` | SkyRL FSDP-native | **4 × 8 H200** | Same hyperparams as the arctic sibling — the wall-clock A/B baseline. |
+
+The [Arctic RL launch blog][blog]'s long-context QA result (LongBench v1 QA
+69.6% → 72.3%, +7.5 MuSiQue / +4.5 HotpotQA / +3.5 2WikiMQA) comes from the
+4-node Qwen3-32B + YaRN-128K recipe — the arctic 4-node launcher above is the
+SkyRL twin of that run (verl twin: [`recipes/rl/verl/long_context_qa/run_qwen3_32b_longcontext_grpo_arl.sh`](../../verl/long_context_qa/run_qwen3_32b_longcontext_grpo_arl.sh)).
+
+## What's in this folder
+
+| File | Role |
+| --- | --- |
+| `download_data.py`                  | Pulls LoongRL from HF and writes SkyRL-format parquets |
+| `run_qwen3_8b_loongrl_grpo_arl.sh`  | Single-node Arctic RL launcher (8 GPU, Qwen3-8B) |
+| `run_qwen3_8b_loongrl_grpo_fsdp.sh` | Single-node **FSDP-native** launcher (8 GPU, Qwen3-8B) — A/B baseline for the arctic 8B launcher |
+| `run_qwen3_32b_loongrl_grpo_arl_4node.sh` | 4-node Arctic RL launcher (32 GPU, Qwen3-32B) |
+| `run_qwen3_32b_loongrl_grpo_fsdp_4node.sh` | 4-node **FSDP-native** launcher (baseline sibling for the A/B) |
+| `fsdp_loongrl_entry.py`             | FSDP-native entrypoint that side-effect-registers `long_context_qa` on driver + Ray workers (sibling of upstream's `fsdp_bird_entry.py`) |
+| `requirements.txt`, `overrides.txt` | Pinned Python deps (`uv` install) |
+| `arctic_rl/`                        | Recipe-local shim: registers the `long_context_qa` env with `skyrl_gym` and re-defines the Ray entrypoint so workers pick up the registration on deserialization |
+| `sitecustomize.py`                  | Registers `long_context_qa` in `ProcessPoolExecutor` spawn children (used by the reward scorer) |
+
+Config, trainer, and generator come from `$SKYRL_HOME/integrations/arctic_rl/`.
+The sibling `simple_gsm8k/` and `txt2sql/` recipes reuse envs already registered
+upstream; this recipe adds the `long_context_qa` shim because that env is new.
+
+## 1. Install
+
+Same env as the sibling `simple_gsm8k/` and `txt2sql/` recipes — if you've built
+either of those, `conda activate skyrl_arl` and skip step 2.
+
+```bash
+# 1. Clone SkyRL at the pinned merge commit on the ``arctic-rl-public`` branch.
+#    ``arctic-rl-public`` ships the verified BIRD Arctic-RL + FSDP recipes;
+#    later commits on ``main`` / ``novasky-main`` call
+#    ``nn.Module.named_non_persistent_buffers`` (not in any released PyTorch
+#    as of 2026-06) and break the FSDP path. The launchers dispatch from
+#    ``$SKYRL_HOME/integrations/arctic_rl/`` — this directory is not shipped
+#    in the pip-installed ``skyrl`` package, so a checkout is required.
+git clone https://github.com/Snowflake-AI-Research/SkyRL
+cd SkyRL && git checkout 7636101a71f1849b6127ee10232fb277d2f31174 && cd ..
+export SKYRL_HOME=$PWD/SkyRL
+
+# 2. Create the env.
+conda create -y -n skyrl_arl python=3.12.13
+conda activate skyrl_arl
+pip install -q uv
+uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 -U
+uv pip install -r requirements.txt --override overrides.txt
+```
+
+This recipe defaults to `OFFLOAD_OPTIMIZER=true`, so DeepSpeed JIT-builds its
+`CPUAdam` op and asserts the system CUDA toolkit shares torch's major (`cu128`).
+On a box whose default `nvcc` is a different major (e.g. `/usr/local/cuda` →
+13.x), point `CUDA_HOME` at a 12.x toolkit first (12.8/12.9 are in DeepSpeed's
+allow-list) — see the top-level [`README`](../README.md#install):
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.9   # any 12.x matching torch's cu128
+export PATH="$CUDA_HOME/bin:$PATH"
+```
+
+The 8B launcher defaults to `ATTN_IMPL=flash_attention_2` (works on any
+CUDA GPU). The 4-node 32B launcher defaults to `flash_attention_3` for the
+2× speedup — install the FA3 wheel per the top-level
+[`README`](../README.md#install) before running the 32B recipe on Hopper.
+
+## 2. Data
+
+```bash
+python download_data.py --output_dir ~/data/loongrl
+```
+
+Writes per-task and merged parquets:
+
+```
+~/data/loongrl/
+├── hotpotqa/{train,test}.parquet
+├── musique/{train,test}.parquet
+├── 2wikimqa/{train,test}.parquet
+└── merged/
+    ├── train.parquet   # ~14k rows (all three tasks)
+    └── test.parquet    # ~750 rows
+```
+
+Each row is in SkyRL format: `data_source`, `prompt` (chat list with the LoongRL
+system prompt that instructs the model to emit `<think>…</think> \boxed{…}`),
+`env_class="long_context_qa"`, `reward_spec={method:"rule", ground_truth:…}`,
+`extra_info`.
+
+The launcher consumes `merged/{train,test}.parquet` by default; override
+`TRAIN_PARQUET` / `VAL_PARQUET` to focus on a single task.
+
+## 3. Reward
+
+The recipe-local env [`arctic_rl/envs/long_context_qa.py`](arctic_rl/envs/long_context_qa.py)
+extracts the model's last `\boxed{…}` answer and matches against the ground truth
+with SQuAD-style normalization. Pick the scorer via `REWARD_CALC_TYPE`:
+
+| `REWARD_CALC_TYPE`     | Scoring                                                    |
+| ---------------------- | ---------------------------------------------------------- |
+| `pure_exact_match`     | (default) substring match in `\boxed{}` — 0/1              |
+| `format_exact_match`   | exact match with format + answer/EOT overflow penalties    |
+| `format_f1_score`      | token F1 with the same format guardrails                   |
+
+Same scorer code as the verl long_context_qa recipe — see
+[`arctic_rl/envs/long_context_qa_reward.py`](arctic_rl/envs/long_context_qa_reward.py).
+
+## 4. Train
+
+```bash
+bash run_qwen3_8b_loongrl_grpo_arl.sh
+```
+
+Useful overrides (set as env vars or Hydra args after the script):
+
+| Knob             | Default          | Notes |
+| ---------------- | ---------------- | --- |
+| `MODEL`          | `Qwen/Qwen3-8B`  | Larger models work but expect to tune `TP_SIZE` + `OFFLOAD_OPTIMIZER` |
+| `PROMPT_LEN`     | `16384`          | LoongRL's native context; drop to 8192 on A100-80G |
+| `RESPONSE_LEN`   | `2048`           | |
+| `TRAIN_BSZ`      | `16`             | Global GRPO batch |
+| `MINI_BSZ`       | `8`              | Actor mini-batch |
+| `N_SAMPLES`      | `4`              | GRPO group size |
+| `TP_SIZE`        | `4`              | Sampling TP — 2 engines/node at TP=4 |
+| `ATTN_IMPL`      | `flash_attention_2` | Matches upstream ARL 8B example; on A100/L40S keep as-is |
+| `REWARD_CALC_TYPE` | `pure_exact_match` | See table above |
+
+The launcher passes the rest through unchanged — pure GRPO, `use_kl_loss=false`,
+log-probs recomputed via the training engine under ZoRRo (no frozen reference
+model and no separate log-prob GPUs).
+
+## 5. 4-node Qwen3-32B + FSDP A/B
+
+The 4-node launcher matches the SkyRL twin of the verl long-context 32B recipe:
+NUM_NODES=4, GPUS_PER_NODE=8, TP=4, 8 vLLM engines, ZeRO-3 + optimizer offload,
+16K prompt / 4K response, 256 prompts × 8 samples = 2048 trajectories/step, FA3
+on Hopper. Stage `download_data.py` output on a shared-FS `DATA_DIR`, then:
+
+```bash
+# On the head node + each of the 3 workers (matching python + deps everywhere):
+ray start --head    --port=6379 --num-gpus=8            # head
+ray start --address=<head_ip>:6379 --num-gpus=8         # x3 workers
+ray status  # -> "4 active node(s)" and 32 GPUs total
+
+# On the head node only:
+DATA_DIR=/shared/data/loongrl \
+CKPT_DIR=/shared/checkpoints/<run> \
+LOGGER=wandb \
+bash run_qwen3_32b_loongrl_grpo_arl_4node.sh
+```
+
+`DATA_DIR` and `CKPT_DIR` **must be on a shared filesystem** — the head writes
+the CUDA-IPC weight-sync tensor to `CKPT_DIR/_arctic_rl/`, every worker
+mmap-reads it, and Ray's data-loader tasks stream parquets from `DATA_DIR` on
+any node.
+
+### FSDP-native baseline (for the wall-clock A/B)
+
+Run the FSDP sibling with the **same** `DATA_DIR` / hyperparams / hostfile so
+the only variable is the training backend:
+
+```bash
+bash run_qwen3_32b_loongrl_grpo_fsdp_4node.sh
+```
+
+Same env, launch pattern, and hyperparameters as the ARL sibling — only the
+trainer flags (`trainer.strategy=fsdp2`, no `trainer.arctic_rl.*`) and the
+entrypoint (`fsdp_loongrl_entry.py`, which registers `long_context_qa` on the
+driver and forwards the recipe dir onto Ray workers) differ.
+
+### Measured wall-clock (this cluster, 32 × H200)
+
+3-step A/B: Qwen3-32B, 16K/4K, 2048 trajectories/step, TP=4. ARL uses ZeRO-3
+with optimizer offload; FSDP uses FSDP2 with `offload_after_step=true`.
+
+| Backend | Step 1 | Step 2 | **Step 3 (steady)** | `timing/generate` | `timing/train` | `avg_final_rewards` |
+| --- | --- | --- | --- | --- | --- | --- |
+| Arctic RL + ZoRRo | 632.2 s | 609.7 s | **591.1 s** | 144.0 s | 320.6 s | 0.842 |
+| SkyRL native FSDP | 1316.9 s | 1311.2 s | **1279.8 s** | 213.4 s | 823.0 s | 0.846 |
+| **Speedup** |  |  | **2.17×** | 1.48× | 2.57× | — |
+
+Comparable to the [Arctic RL blog][blog]'s BIRD result (2.38×): ~2.6× on train
+(ZoRRo + optimizer offload + FCA) and ~1.5× on rollout (Arctic Inference vs
+plain vLLM). Rewards match to within 0.5% across the first 3 steps.
+
+[loongrl]: https://huggingface.co/datasets/OldKingMeister/LoongRL-Train-Data
+[blog]: https://www.snowflake.com/en/blog/engineering/arctic-rl-open-source-backend/
