@@ -1,12 +1,13 @@
 # Txt2SQL — BIRD-SQL GRPO with Arctic RL × SkyRL
 
 GRPO training for **Qwen3** on **BIRD-SQL**, driven by SkyRL's GRPO trainer with
-either the Arctic RL + ZoRRo backend or SkyRL's native FSDP backend. Three
+either the Arctic RL + ZoRRo backend or SkyRL's native FSDP backend. Four
 launchers ship in this directory:
 
 | Launcher | Backend | Topology | Notes |
 | --- | --- | --- | --- |
 | `run_qwen3_8b_bird_grpo_arl.sh` | Arctic RL | 1 × 8 H200 | Iteration target — Qwen3-8B, fits on a standalone host. |
+| `run_qwen3_8b_bird_grpo_fsdp.sh` | SkyRL FSDP-native | 1 × 8 H200 | Single-node A/B baseline for the 8B arctic launcher — same hyperparams, only the backend differs. |
 | `run_qwen3_32b_bird_grpo_arl_4node.sh` | Arctic RL | **4 × 8 H200** | The exact run behind the ~2× speedup in the [Arctic RL launch blog][blog]. |
 | `run_qwen3_32b_bird_grpo_fsdp_4node.sh` | SkyRL FSDP-native | **4 × 8 H200** | Same hyperparams as the arctic sibling — the wall-clock A/B baseline. |
 
@@ -19,6 +20,7 @@ run (verl twin: [`recipes/rl/verl/txt2sql/run_qwen3_32b_bird_grpo_arl.sh`](../..
 | --- | --- |
 | `download_data.py`                       | Preprocesses raw BIRD into SkyRL-format parquets (wrapper around upstream's `integrations.arctic_rl.envs.preprocess_bird`) |
 | `run_qwen3_8b_bird_grpo_arl.sh`          | Single-node Arctic RL launcher (8 GPU, Qwen3-8B) |
+| `run_qwen3_8b_bird_grpo_fsdp.sh`         | Single-node **FSDP-native** launcher (8 GPU, Qwen3-8B) — A/B baseline for the arctic 8B launcher |
 | `run_qwen3_32b_bird_grpo_arl_4node.sh`   | 4-node Arctic RL launcher (32 GPU, Qwen3-32B) |
 | `run_qwen3_32b_bird_grpo_fsdp_4node.sh`  | 4-node **FSDP-native** launcher (baseline sibling for the A/B) |
 | `fsdp_bird_entry.py`                     | FSDP-native entrypoint that side-effect-registers `bird` / `bird_sql` on driver + Ray workers (sibling of the `long_context_qa` shim) |
@@ -55,6 +57,17 @@ conda activate skyrl_arl
 pip install -q uv
 uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 -U
 uv pip install -r requirements.txt --override overrides.txt
+```
+
+This recipe defaults to `OFFLOAD_OPTIMIZER=true`, so DeepSpeed JIT-builds its
+`CPUAdam` op and asserts the system CUDA toolkit shares torch's major (`cu128`).
+On a box whose default `nvcc` is a different major (e.g. `/usr/local/cuda` →
+13.x), point `CUDA_HOME` at a 12.x toolkit first (12.8/12.9 are in DeepSpeed's
+allow-list) — see the top-level [`README`](../README.md#install):
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.9   # any 12.x matching torch's cu128
+export PATH="$CUDA_HOME/bin:$PATH"
 ```
 
 The 8B launcher defaults to `ATTN_IMPL=flash_attention_2` (works on any
