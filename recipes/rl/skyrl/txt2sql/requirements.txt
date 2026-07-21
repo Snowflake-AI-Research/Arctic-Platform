@@ -14,11 +14,22 @@
 arctic-inference[vllm]
 # Arctic
 arctic-platform[rl]
+
+# FlashAttention-2 built against torch 2.10 (== vLLM 0.18.0's torch pin).
+# The `skyrl-train` extra requires `flash-attn==2.8.3`; SkyRL's pyproject
+# `[tool.uv.sources]` redirects that to this exact torch-2.10 wheel — but
+# `[tool.uv.sources]` is ONLY honored by `uv run`/`uv sync` from the SkyRL
+# repo, NOT by `uv pip install skyrl[...] @ git+...`. Without this explicit pin,
+# the resolver picks the default torch-2.11 wheel, whose ABI is incompatible
+# with torch 2.10 (ImportError: undefined symbol _ZNK3c104cuda10CUDAStream5queryEv)
+# and breaks both the trainer's FA2 path and vLLM's rotary-embedding import.
+flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; python_version == "3.12" and platform_machine == "x86_64"
 liger-kernel
 
 # Ray must match across the cluster (relevant for the >1-node variants of
 # this recipe). SkyRL pins this exact version.
 ray==2.51.1
+skyrl-gym @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315#subdirectory=skyrl-gym
 
 # SkyRL pinned at PR #1837 merge (the dispatch hook the arctic_rl integration
 # requires). This gives you the pip-installed `skyrl` package; the launcher
@@ -31,17 +42,6 @@ ray==2.51.1
 # torchdata / accelerate / wandb / …). Installing bare `skyrl` resolves an env
 # that fails at import time (`ModuleNotFoundError: jaxtyping`, then torchdata).
 skyrl[skyrl-train] @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315
-skyrl-gym @ git+https://github.com/NovaSky-AI/SkyRL@76f5f467c6804e8acc6273cc677098b7679b0315#subdirectory=skyrl-gym
-
-# FlashAttention-2 built against torch 2.10 (== vLLM 0.18.0's torch pin).
-# The `skyrl-train` extra requires `flash-attn==2.8.3`; SkyRL's pyproject
-# `[tool.uv.sources]` redirects that to this exact torch-2.10 wheel — but
-# `[tool.uv.sources]` is ONLY honored by `uv run`/`uv sync` from the SkyRL
-# repo, NOT by `uv pip install skyrl[...] @ git+...`. Without this explicit pin,
-# the resolver picks the default torch-2.11 wheel, whose ABI is incompatible
-# with torch 2.10 (ImportError: undefined symbol _ZNK3c104cuda10CUDAStream5queryEv)
-# and breaks both the trainer's FA2 path and vLLM's rotary-embedding import.
-flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; python_version == "3.12" and platform_machine == "x86_64"
 
 # Serving / kernels (arctic-inference patches vLLM 0.18.0).
 vllm==0.18.0
