@@ -42,6 +42,20 @@ once, `conda activate skyrl_arl`, and any recipe launches from bare `python`.
    uv pip install -r <recipe>/requirements.txt --override <recipe>/overrides.txt
    ```
 
+   > **CUDA toolkit for CPU-offload.** The 8B/32B launchers set
+   > `offload_optimizer=true`, so DeepSpeed JIT-builds its `CPUAdam` op and
+   > asserts the system CUDA toolkit matches torch's (`cu128`). If your default
+   > `nvcc` is a *different major* (e.g. a box where `/usr/local/cuda` → 13.x),
+   > point `CUDA_HOME` at a 12.x toolkit before launching — 12.8/12.9 are in
+   > DeepSpeed's same-major allow-list:
+   >
+   > ```bash
+   > export CUDA_HOME=/usr/local/cuda-12.9   # any 12.x matching torch's cu128
+   > export PATH="$CUDA_HOME/bin:$PATH"
+   > ```
+   >
+   > The 0.6B `simple_gsm8k` recipe doesn't offload, so it needs none of this.
+
 3. **(Hopper only) Install FlashAttention-3.** Both 4-node 32B launchers
    default to `ATTN_IMPL=flash_attention_3` for the 2× speedup vs FSDP. Grab
    PyTorch's [official FA3 wheel](https://dev-discuss.pytorch.org/t/flash-attention-3-wheels/3322)
