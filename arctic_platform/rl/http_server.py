@@ -59,6 +59,7 @@ from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.ray_pg import ColocatePlacement
 from arctic_platform.rl.utils.ray_pg import create_colocate_placement
 from arctic_platform.rl.utils.ray_pg import pg_scheduling_options
+from arctic_platform.rl.tinker_server import init_tinker_state
 from arctic_platform.rl.tinker_server import router as _tinker_router
 from arctic_platform.rl.utils.server_models import GenerateRequest
 from arctic_platform.rl.utils.server_models import JobConfig
@@ -1015,6 +1016,135 @@ async def get_job_status(job_id: int):
 # ---------------------------------------------------------------------------
 
 
+async def _boot_tinker_layer(base_model: str, max_prompt_length: int, max_response_length: int) -> None:
+    """Provision training + sampling jobs in-process and bind the Tinker layer.
+
+    Mirrors what Tinker's hosted service does: server-side capacity is
+    decided at deploy time so an out-of-the-box ``tinker.ServiceClient()``
+    can drive it without hitting Arctic's native ``/initialize`` first.
+    Native ``/initialize`` still works for callers that want the
+    non-Tinker path.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    ds_config = {
+        "train_micro_batch_size_per_gpu": 1,
+        "train_batch_size": 1,
+        "gradient_accumulation_steps": 1,
+        "zero_optimization": {"stage": 0},
+        "bf16": {"enabled": True},
+        # Match model dtype so DeepSpeed's optimizer sanity check passes:
+        # fp32 grad accum is incompatible with bf16 params at ZeRO stage 0.
+        "data_types": {"grad_accum_dtype": "bf16"},
+    }
+    training_config = {
+        "optimizer": {"lr": 1e-5, "weight_decay": 0.0, "betas": [0.9, 0.999]},
+        "lr_scheduler": {"warmup_ratio": 0.0},
+        "training_horizon": 1_000_000,
+    }
+
+    train = await initialize(JobConfig(
+        job_type="training",
+        model_name=base_model,
+        ds_config=ds_config,
+        training_config=training_config,
+        checkpoint_path=str(pathlib.Path(os.environ.get("ARCTIC_TINKER_CKPT_DIR", "/tmp/arctic_tinker_ckpt")).resolve()),
+    ))
+    sample = await initialize(JobConfig(
+        job_type="sampling",
+        model_name=base_model,
+        vllm_config={
+            "max_model_len": max_prompt_length + max_response_length,
+            "gpu_memory_utilization": 0.6,
+        },
+    ))
+    training_job_id = int(train["job_id"])
+    sampling_job_id = int(sample["job_id"])
+
+    def _batch_np_to_torch(batch: dict) -> dict:
+        """Convert numpy arrays produced by the Tinker adapter into torch
+        tensors so Arctic's ``http_split_batch`` (``torch.load
+        weights_only=True``) can round-trip the payload."""
+        import numpy as np
+        out = dict(batch)
+        b = dict(batch.get("batch", {}))
+        for k, v in b.items():
+            if isinstance(v, np.ndarray):
+                b[k] = torch.from_numpy(v)
+        out["batch"] = b
+        return out
+
+    async def _fwd_bwd_handler(batch: dict) -> dict:
+        buf = io.BytesIO()
+        torch.save(_batch_np_to_torch(batch), buf)
+        resp = await fwd_bwd(training_job_id, buf.getvalue())
+        return torch.load(io.BytesIO(resp.body), weights_only=False)
+
+    async def _fwd_no_grad_handler(batch: dict) -> dict:
+        buf = io.BytesIO()
+        torch.save(_batch_np_to_torch(batch), buf)
+        resp = await fwd_no_grad(training_job_id, buf.getvalue())
+        return torch.load(io.BytesIO(resp.body), weights_only=False)
+
+    async def _step_handler(overrides: dict | None) -> dict:
+        return await step(training_job_id, StepRequest(optim_overrides=overrides))
+
+    async def _sync_weights_handler() -> Any:
+        return await sync_weights(SyncWeightsRequest(
+            training_job_id=training_job_id,
+            sampling_job_id=sampling_job_id,
+            colocate=app.state.colocate,
+            cuda_ipc=app.state.colocate,
+        ))
+
+    async def _generate_handler(prompt_tokens: list[int], sampling_params: dict) -> dict:
+        # Fan the group out into N single-sample calls (Arctic's replica-pool
+        # worker only returns ``outputs[0]``) and let vLLM's prefix cache
+        # dedupe the shared prompt KV. Skip GenerateRequest to pass token-id
+        # prompts straight through to ReplicaPool.generate.
+        params = dict(sampling_params)
+        n = int(params.pop("n", 1))
+        prompts: list[Any] = [list(prompt_tokens)] * n
+        pool: ReplicaPool = app.state.sampling_pool
+        results = await pool.generate(prompts, params)
+        outputs: list[dict[str, Any]] = []
+        for res in results:
+            per_pos = res.get("logprobs")
+            flat_lp: list[float] | None = None
+            if per_pos is not None:
+                flat_lp = []
+                for tok, pos in zip(res.get("token_ids", []), per_pos):
+                    if not isinstance(pos, dict):
+                        continue
+                    entry = pos.get(tok, pos.get(str(tok)))
+                    if isinstance(entry, dict):
+                        flat_lp.append(float(entry.get("logprob", 0.0)))
+                    elif isinstance(entry, (int, float)):
+                        flat_lp.append(float(entry))
+            outputs.append({
+                "token_ids": list(res.get("token_ids", [])),
+                "logprobs": flat_lp,
+                "finish_reason": res.get("finish_reason", "length"),
+            })
+        return {"outputs": outputs}
+
+    init_tinker_state(
+        app,
+        base_model=base_model,
+        max_prompt_length=int(max_prompt_length),
+        max_response_length=int(max_response_length),
+        pad_token_id=int(pad_token_id),
+        fwd_bwd_handler=_fwd_bwd_handler,
+        fwd_no_grad_handler=_fwd_no_grad_handler,
+        step_handler=_step_handler,
+        sync_weights_handler=_sync_weights_handler,
+        generate_handler=_generate_handler,
+    )
+    logger.info("Tinker layer bound: base_model=%s, training_job_id=%d, sampling_job_id=%d",
+                base_model, training_job_id, sampling_job_id)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Arctic RL Local Server")
     parser.add_argument("--host", type=str, default="localhost")
@@ -1059,6 +1189,29 @@ def main():
         dest="ray_auto_attach",
         action="store_false",
         help="Always start a fresh Ray cluster instead of attempting to attach to an existing one",
+    )
+    parser.add_argument(
+        "--base-model",
+        type=str,
+        default=None,
+        help="Enable the Tinker HTTP layer bound to this base model. When set, "
+             "training + sampling jobs are provisioned at server startup so an "
+             "out-of-the-box tinker.ServiceClient() can drive it without a "
+             "prior /initialize call. Leave unset to keep native-only behavior.",
+    )
+    parser.add_argument(
+        "--tinker-max-prompt-length",
+        type=int,
+        default=1024,
+        help="Config-defined max prompt length threaded into the Tinker adapter "
+             "(ZoRRo padding invariant). Ignored when --base-model is unset.",
+    )
+    parser.add_argument(
+        "--tinker-max-response-length",
+        type=int,
+        default=512,
+        help="Config-defined max response length threaded into the Tinker "
+             "adapter. Ignored when --base-model is unset.",
     )
     args = parser.parse_args()
 
@@ -1112,6 +1265,13 @@ def main():
     app.state.next_job_id = 1
     app.state.weight_sync_ready = False
     app.state.weight_sync_bucket_size = _WEIGHT_SYNC_BUCKET_SIZE
+
+    if args.base_model is not None:
+        asyncio.run(_boot_tinker_layer(
+            base_model=args.base_model,
+            max_prompt_length=args.tinker_max_prompt_length,
+            max_response_length=args.tinker_max_response_length,
+        ))
 
     uvicorn.run(
         app,

@@ -179,7 +179,7 @@ async def test_forward_backward_happy_path(client, mock_backend):
 
     # Confirm the backend received a properly-mapped batch.
     call = mock_backend["calls"]["fwd_bwd"][-1]
-    assert call["processing"]["loss_fn"] == "ppo"
+    assert call["processing"]["loss_fn"] == "verl_grpo"
     actor_cfg = call["meta"]["actor_config"]
     assert actor_cfg["eps_clip"] == pytest.approx(0.1)
     assert actor_cfg["kl_loss_coef"] == pytest.approx(0.01)

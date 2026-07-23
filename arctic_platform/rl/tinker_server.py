@@ -294,6 +294,26 @@ class SaveWeightsForSamplerResponse(BaseModel):
     type: Literal["save_weights_for_sampler"] = "save_weights_for_sampler"
 
 
+class SaveWeightsRequest(BaseModel):
+    """Sibling of :class:`SaveWeightsForSamplerRequest` for state saves
+    (``training_client.save_state`` in the tinker SDK). v1 acknowledges
+    the call so cookbook recipes finish cleanly; on-disk persistence is
+    extension E2 (see TINKER_COMPAT.md)."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id: str
+    path: str | None = None
+    seq_id: int | None = None
+    ttl_seconds: int | None = None
+    overwrite: bool = False
+
+
+class SaveWeightsResponse(BaseModel):
+    path: str
+    type: Literal["save_weights"] = "save_weights"
+
+
 class SamplingParams(BaseModel):
     max_tokens: int | None = None
     seed: int | None = None
@@ -459,6 +479,27 @@ def _pad_to(arr: np.ndarray, target_len: int, pad_value: float | int) -> np.ndar
     return np.concatenate([arr, pad])
 
 
+def _split_prompt_response(
+    tokens: list[int], candidates: list[np.ndarray | None]
+) -> int:
+    """Return the prompt / response boundary index for one ``Datum``.
+
+    Convention (matches ``tinker-cookbook`` SFT + RL examples): prompt
+    tokens are zero-masked and response tokens carry the training signal
+    (``weights=1`` for cross-entropy, non-zero ``advantages`` for RL). We
+    scan the provided masks in priority order and return the first
+    non-zero index. Falls back to ``len(tokens)`` (whole prompt, no
+    response) when nothing is masked.
+    """
+    for arr in candidates:
+        if arr is None or len(arr) == 0:
+            continue
+        nz = np.flatnonzero(arr[: len(tokens)])
+        if nz.size:
+            return int(nz[0])
+    return len(tokens)
+
+
 def datum_list_to_arctic_batch(
     data: list[Datum],
     loss_fn: str,
@@ -470,47 +511,82 @@ def datum_list_to_arctic_batch(
 ) -> dict:
     """Pack a list of Tinker ``Datum`` into an Arctic ``fwd_bwd`` batch dict.
 
-    Layout produced (mirrors ``arctic_platform/rl/utils/batch.py::unpack_batch``):
-        - ``batch``: {input_ids, attention_mask, position_ids, advantages,
-                      old_log_probs, loss_mask, response_mask}
-        - ``meta``:  {actor_config, max_response_len, forward_only}
-        - ``processing``: {loss_fn: <mapped>}
+    Layout mirrors ``arctic_platform/integrations/verl/adapter.py``:
+    left-pad prompt + right-pad response, split at ``max_prompt_length``.
+
+    - ``batch``: input_ids, attention_mask, prompts, responses,
+      response_mask, advantages, old_log_probs. ``position_ids`` are
+      dropped; the server rebuilds them from ``attention_mask`` via
+      ``meta["drop_position_ids"]``.
+    - ``meta``: actor_config, max_prompt_len, max_response_len,
+      pad_token_id, forward_only, plus ``verl_grpo_loss``'s required
+      dp_size / batch_num_tokens / global_batch_size / temperature.
+    - ``processing``: {loss_fn: "verl_grpo"} — Arctic's registered
+      PPO-shaped loss; ``ppo`` / ``importance_sampling`` semantics are
+      threaded via ``actor_config`` in ``_loss_fn_config_to_actor_config``.
 
     ZoRRo invariant: pad each row to ``max_prompt_length +
-    max_response_length`` (config-max), never batch-local.
+    max_response_length`` (config-max), never batch-local. Prompt /
+    response boundary is inferred per-Datum from the first non-zero
+    position in ``weights`` / ``mask`` / ``advantages`` / ``target_tokens``
+    (see ``_split_prompt_response``).
     """
-    total_len = int(max_prompt_length) + int(max_response_length)
+    mpl = int(max_prompt_length)
+    mrl = int(max_response_length)
+    total_len = mpl + mrl
     batch_size = len(data)
 
     input_ids = np.full((batch_size, total_len), pad_token_id, dtype=np.int64)
     attention_mask = np.zeros((batch_size, total_len), dtype=np.int64)
+    prompts = np.full((batch_size, mpl), pad_token_id, dtype=np.int64)
+    responses = np.full((batch_size, mrl), pad_token_id, dtype=np.int64)
+    # response_mask / old_log_probs / advantages are left-padded with zeros
+    # up to the full sequence length so that (a) their shape matches
+    # ``attention_mask`` and the packing helper flattens them alongside it,
+    # and (b) after flattening they line up 1:1 with the packed ``logprobs``
+    # tensor produced by ``compute_entropy_and_logprobs``. Zeros in the
+    # prompt columns are inert (response_mask=0 there).
+    response_mask = np.zeros((batch_size, total_len), dtype=np.int64)
     advantages = np.zeros((batch_size, total_len), dtype=np.float32)
     old_log_probs = np.zeros((batch_size, total_len), dtype=np.float32)
-    loss_mask = np.zeros((batch_size, total_len), dtype=np.float32)
 
     for i, datum in enumerate(data):
         toks = _model_input_to_tokens(datum.model_input)
-        n = min(len(toks), total_len)
-        input_ids[i, :n] = np.asarray(toks[:n], dtype=np.int64)
-        attention_mask[i, :n] = 1
-
         inputs = datum.loss_fn_inputs
+
+        # SFT-style datums carry ``weights``; RL datums (SkyRL-tx cookbook
+        # rl_loop) carry ``advantages`` + ``target_tokens`` instead. Try
+        # both — prompt tokens are zero-masked in all three.
+        candidates: list[np.ndarray | None] = []
+        for key in ("weights", "mask", "advantages", "target_tokens"):
+            td = inputs.get(key)
+            if td is not None:
+                candidates.append(_tensor_data_to_numpy(td).astype(np.float32))
+
+        p_end = _split_prompt_response(toks, candidates) if not forward_only else len(toks)
+        prompt_toks = toks[:p_end][-mpl:]
+        resp_toks = toks[p_end:][:mrl]
+        p_len, r_len = len(prompt_toks), len(resp_toks)
+
+        prompts[i, mpl - p_len:] = np.asarray(prompt_toks, dtype=np.int64)
+        responses[i, :r_len] = np.asarray(resp_toks, dtype=np.int64)
+        response_mask[i, mpl: mpl + r_len] = 1
+
+        input_ids[i, mpl - p_len: mpl] = np.asarray(prompt_toks, dtype=np.int64)
+        input_ids[i, mpl: mpl + r_len] = np.asarray(resp_toks, dtype=np.int64)
+        attention_mask[i, mpl - p_len: mpl + r_len] = 1
+
+        # Advantages / logprobs on the Tinker wire are positional over the
+        # full ``toks`` array; slice out the response tail and place it in
+        # the response columns of the padded layout.
         if "advantages" in inputs:
             arr = _tensor_data_to_numpy(inputs["advantages"]).astype(np.float32)
-            advantages[i] = _pad_to(arr, total_len, 0.0)
+            resp_adv = arr[p_end: p_end + r_len]
+            advantages[i, mpl: mpl + len(resp_adv)] = resp_adv
         if "logprobs" in inputs:
             arr = _tensor_data_to_numpy(inputs["logprobs"]).astype(np.float32)
-            old_log_probs[i] = _pad_to(arr, total_len, 0.0)
-        # Both ``mask`` and ``weights`` map to Arctic's loss_mask; cookbook
-        # writes ``mask`` (data_processing.py L159), the wire spec calls out
-        # ``weights`` in Datum._KEY_TO_TYPE. Accept either.
-        mask_td = inputs.get("weights") or inputs.get("mask")
-        if mask_td is not None:
-            arr = _tensor_data_to_numpy(mask_td).astype(np.float32)
-            loss_mask[i] = _pad_to(arr, total_len, 0.0)
-
-    # position_ids reflect real (unpadded) positions.
-    position_ids = np.tile(np.arange(total_len, dtype=np.int64), (batch_size, 1))
+            resp_lp = arr[p_end: p_end + r_len]
+            old_log_probs[i, mpl: mpl + len(resp_lp)] = resp_lp
 
     actor_config: dict[str, Any] = {}
     if not forward_only:
@@ -520,18 +596,40 @@ def datum_list_to_arctic_batch(
         "batch": {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "position_ids": position_ids,
+            # position_ids omitted intentionally: server reconstructs them
+            # from attention_mask via ``drop_position_ids=True`` in meta
+            # (matches how the verl adapter drives Arctic).
+            "prompts": prompts,
+            "responses": responses,
+            "response_mask": response_mask,
             "advantages": advantages,
             "old_log_probs": old_log_probs,
-            "loss_mask": loss_mask,
-            "response_mask": loss_mask,
         },
         "meta": {
             "actor_config": actor_config,
-            "max_response_len": int(max_response_length),
+            "policy_loss_config": {},
+            "max_prompt_len": mpl,
+            "max_response_len": mrl,
+            "pad_token_id": int(pad_token_id),
+            "drop_position_ids": True,
             "forward_only": bool(forward_only),
+            # verl_grpo_loss reads these three keys unconditionally. We're
+            # single-worker (training-gpus=1) at v1; multi-DP will need
+            # per-shard chunking on the Tinker adapter side.
+            "dp_size": 1,
+            "batch_num_tokens": int(response_mask.sum()),
+            "global_batch_size": batch_size,
+            "rollout_is_weights": None,
+            "temperature": 1.0,
         },
-        "processing": {"loss_fn": loss_fn},
+        # Arctic's LOSS_FNS registry ships only ``verl_grpo`` as a short
+        # name; ``ppo`` / ``importance_sampling`` semantics are threaded via
+        # ``actor_config`` (clip thresholds, kl, entropy) — see
+        # ``_loss_fn_config_to_actor_config`` above.
+        "processing": {
+            "post": ["compute_entropy_and_logprobs"],
+            "loss_fn": "verl_grpo" if not forward_only else None,
+        },
     }
 
 
@@ -866,6 +964,23 @@ async def optim_step(req: OptimStepRequest, request: Request) -> UntypedAPIFutur
 
 
 # ---- weight sync / sampling -------------------------------------------------
+
+
+@router.post("/save_weights", response_model=UntypedAPIFuture)
+async def save_weights(
+    req: SaveWeightsRequest, request: Request
+) -> UntypedAPIFuture:
+    """Ack-only state save. Real checkpoint persistence lives in E2
+    (TINKER_COMPAT.md); v1's goal is that cookbook recipes which end with
+    a ``save_checkpoint(kind='both')`` don't crash on shutdown."""
+
+    async def runner() -> dict[str, Any]:
+        gen = getattr(request.app.state, "tinker_state_gen", 0) + 1
+        request.app.state.tinker_state_gen = gen
+        path = req.path or f"tinker://main/state/{gen}"
+        return SaveWeightsResponse(path=path).model_dump(mode="json")
+
+    return await _submit_inline(request, runner, model_id=req.model_id)
 
 
 @router.post("/save_weights_for_sampler", response_model=UntypedAPIFuture)
