@@ -1,0 +1,15 @@
+{
+  "sub_job_configs": [
+    {
+      "job_type": "sampling",
+      "model_name": "Qwen/Qwen3.6-35B-A3B",
+      "dtype": "bfloat16",
+      "seed": 42,
+      "inference_config": {
+        "max_seq_len": 128,
+        "n_gpus": 8,
+        "gpu_memory_utilization": 0.8
+      }
+    }
+  ]
+}

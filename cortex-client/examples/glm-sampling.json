@@ -1,0 +1,17 @@
+{
+  "sub_job_configs": [
+    {
+      "job_type": "sampling",
+      "model_name": "zai-org/GLM-5.2-FP8",
+      "inference_config": {
+        "max_seq_len": 32768,
+        "n_gpus": 8,
+        "gpu_memory_utilization": 0.85,
+        "vllm_config": {
+          "tensor_parallel_size": 8,
+          "quantization": "fp8"
+        }
+      }
+    }
+  ]
+}
