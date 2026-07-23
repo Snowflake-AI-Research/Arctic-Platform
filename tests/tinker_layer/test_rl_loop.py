@@ -75,8 +75,8 @@ def mocked_app():
     """FastAPI app with the Tinker router mounted + deterministic mock backend."""
     from fastapi import FastAPI
 
-    from arctic_platform.rl.tinker_server import init_tinker_state
-    from arctic_platform.rl.tinker_server import router as tinker_router
+    from arctic_platform.rl.tinker_router import init_tinker_state
+    from arctic_platform.rl.tinker_router import router as tinker_router
 
     calls: dict[str, list] = {"fwd_bwd": [], "step": [], "sync": [], "gen": []}
 

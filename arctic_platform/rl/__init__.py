@@ -16,7 +16,7 @@
 """Arctic RL client -- HTTP client for RL training against dss-platform or local server.
 
 Top-level names are exposed via lazy PEP 562 ``__getattr__`` so
-lightweight consumers (e.g. ``arctic_platform.rl.tinker_server`` unit
+lightweight consumers (e.g. ``arctic_platform.rl.tinker_router`` unit
 tests without torch/aiohttp on the path) can import the subpackage
 without dragging in the full HTTP/Ray client stack. Fully-installed
 callers keep the same import surface — the first attribute access

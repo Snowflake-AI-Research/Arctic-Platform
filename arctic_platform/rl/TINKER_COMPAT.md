@@ -94,7 +94,7 @@ built-in Tinker loss functions read specific keys from it.
   ┌─────────────────────────────────────────────────────────┐
   │                FastAPI app (one process)                │
   │  ┌────────────────────────┐  ┌─────────────────────────┐│
-  │  │  tinker_server.py      │  │  http_server.py         ││
+  │  │  tinker_router.py      │  │  http_server.py         ││
   │  │  (NEW router)          │──▶  (native routes, unchg) ││
   │  │  · Datum → batch       │  │  · /fwd-bwd             ││
   │  │  · AdamParams → overr. │  │  · /step (+ overrides)  ││
@@ -121,7 +121,7 @@ Tinker's wire is future-based. v1 executes inline and stashes results
 so `retrieve_future` returns the finished result on the first poll:
 
 ```python
-# tinker_server.py
+# tinker_router.py
 _FUTURE_STORE: dict[str, dict] = {}
 _FUTURE_COUNTER = itertools.count()
 
@@ -214,9 +214,9 @@ Files touched at v1 completion (see `git diff main...HEAD`):
 | `arctic_platform/rl/http_server.py` | `/step` accepts `StepRequest.optim_overrides`. New `POST /tinker/bind` endpoint wires two existing Arctic jobs (created via native `/initialize`) into the Tinker HTTP verbs on the same server. **No provisioning in the Tinker layer** — ZoRRo, ZeRO stage, offload, vLLM knobs, LR schedule are all set on the underlying jobs. |
 | `arctic_platform/rl/ray_server.py` | Mirror `optim_overrides` on the Ray transport. |
 | `arctic_platform/rl/utils/server_models.py` | `StepRequest.optim_overrides` field. |
-| `arctic_platform/rl/tinker_server.py` | **new** — Pydantic wire models, `Datum → Arctic batch` adapter, `AdamParams → optim overrides`, `SamplingParams → vLLM`, `loss_fn_config → actor_config`, weight-gen counter, in-memory future store, FastAPI router mounted at `/api/v1/`. |
+| `arctic_platform/rl/tinker_router.py` | **new** — Pydantic wire models, `Datum → Arctic batch` adapter, `AdamParams → optim overrides`, `SamplingParams → vLLM`, `loss_fn_config → actor_config`, weight-gen counter, in-memory future store, FastAPI router mounted at `/api/v1/`. |
 | `arctic_platform/rl/examples/tinker_smoke.py` | **new** — one-file E2E smoke: `tinker.ServiceClient()` → `create_lora_training_client(rank=0)` → sample + `forward_backward(loss_fn="ppo")` + `optim_step` loop. |
-| `arctic_platform/rl/__init__.py` | PEP 562 lazy imports so `tinker_server` is importable in a CPU-only env (tests). |
+| `arctic_platform/rl/__init__.py` | PEP 562 lazy imports so `tinker_router` is importable in a CPU-only env (tests). |
 | `tests/tinker_layer/*` | 76 tests: wire schema, adapters, in-process httpx round-trip per route, `tinker.ServiceClient` acceptance loop. |
 
 Sketch of the deepspeed override (the smallest interesting hunk):
@@ -234,12 +234,12 @@ def step(self, optim_overrides: dict | None = None) -> dict:
     ...
 ```
 
-Everything else lives in `arctic_platform/rl/tinker_server.py`. The
+Everything else lives in `arctic_platform/rl/tinker_router.py`. The
 authoritative wire schemas + router bodies are that file; what follows is
 a schematic so a reviewer can eyeball the shape without paging through
 1k lines of source.
 
-### `arctic_platform/rl/tinker_server.py` sketch
+### `arctic_platform/rl/tinker_router.py` sketch
 
 Wire models are redefined locally as Pydantic v2 classes so the server has
 no runtime dependency on the `tinker` package (schemas are regressed by
@@ -255,7 +255,7 @@ no runtime dependency on the `tinker` package (schemas are regressed by
 - Futures: `UntypedAPIFuture`, `TryAgainResponse`.
 - Housekeeping: session/heartbeat/client-config/telemetry/get-info/etc.
 
-Adapters (all inline in `tinker_server.py`):
+Adapters (all inline in `tinker_router.py`):
 
 - `datum_list_to_arctic_batch(data, loss_fn, loss_fn_config, max_prompt_length,
   max_response_length, pad_token_id, forward_only)` — packs a `list[Datum]`
@@ -344,7 +344,7 @@ tests/tinker_layer/
   test_wire_schema.py      # our Pydantic models track upstream tinker
   test_adapters.py         # datum→batch (ZoRRo padding), loss_fn_config
                            # → actor_config, AdamParams / SamplingParams
-  test_tinker_server.py    # in-process httpx round-trip per route
+  test_tinker_router.py    # in-process httpx round-trip per route
   test_rl_loop.py          # real tinker.ServiceClient acceptance loop
 ```
 
@@ -381,7 +381,7 @@ $ python -m pytest tests/tinker_layer/ -q
    the local package shadows the upstream `tinker` SDK when `test_rl_loop.py`
    imports it.
 9. **`arctic_platform.rl.__init__` uses PEP 562 lazy imports** so
-   `tinker_server` is importable in a CPU-only env for the test suite (eager
+   `tinker_router` is importable in a CPU-only env for the test suite (eager
    imports of `deepspeed_worker` pull in torch and break collection).
 
 ## Extensions (post-v1)

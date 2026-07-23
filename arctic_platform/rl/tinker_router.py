@@ -70,9 +70,6 @@ from pydantic import Field
 
 
 class TensorData(BaseModel):
-    """Mirror of ``tinker.types.TensorData``. The upstream dataclass
-    projects to this shape via ``model_dump(mode='json')``."""
-
     dtype: Literal["float32", "int64"]
     data: list[float] | list[int] = Field(default_factory=list)
     shape: list[int] | None = None
@@ -295,11 +292,6 @@ class SaveWeightsForSamplerResponse(BaseModel):
 
 
 class SaveWeightsRequest(BaseModel):
-    """Sibling of :class:`SaveWeightsForSamplerRequest` for state saves
-    (``training_client.save_state`` in the tinker SDK). v1 acknowledges
-    the call so cookbook recipes finish cleanly; on-disk persistence is
-    extension E2 (see TINKER_COMPAT.md)."""
-
     model_config = ConfigDict(protected_namespaces=())
 
     model_id: str
@@ -376,49 +368,28 @@ class FutureRetrieveRequest(BaseModel):
 # =============================================================================
 
 
-# Tinker cookbook (tutorials/202_loss_functions.py) documents the PPO keys:
-# ``clip_low_threshold`` (default 0.8) and ``clip_high_threshold`` (default 1.2).
-# Arctic's GRPO loss (arctic_platform/rl/processors/grpo.py) reads
-# ``eps_clip`` (symmetric) and ``eps_clip_higher`` (asymmetric upper bound).
-# ``importance_sampling`` = PPO with clipping disabled (unbounded IS ratio).
-_TINKER_PPO_CLIP_LOW_DEFAULT = 0.8
-_TINKER_PPO_CLIP_HIGH_DEFAULT = 1.2
-_UNBOUNDED_CLIP = 1e9
-
-
 def _loss_fn_config_to_actor_config(
     loss_fn: str,
     loss_fn_config: dict[str, float] | None,
 ) -> dict[str, Any]:
-    """Translate a Tinker ``loss_fn`` + ``loss_fn_config`` into an Arctic
-    ``actor_config`` dict consumed by ``processors/grpo.py``.
+    """Translate a Tinker ``loss_fn`` + ``loss_fn_config`` into Arctic's
+    ``actor_config`` (see arctic_platform/rl/processors/grpo.py).
 
-    PPO: ``clip_low_threshold`` -> ``eps_clip`` (as ``1 - x``, since Arctic's
-        ``eps_clip`` is an epsilon around 1.0 in the standard PPO ratio
-        formulation while Tinker exposes the actual ratio bounds).
-    importance_sampling: both bounds effectively disabled.
-
-    Only ``ppo`` and ``importance_sampling`` are supported in v1; the wire
-    gate in ``forward_backward`` rejects the others upstream.
+    Tinker's cookbook exposes PPO as ``clip_low_threshold`` / ``clip_high_threshold``
+    (defaults 0.8 / 1.2, i.e. absolute ratio bounds); Arctic reads ``eps_clip``
+    (symmetric epsilon around 1.0) and ``eps_clip_higher`` (asymmetric upper).
+    ``importance_sampling`` = PPO with clipping disabled.
     """
     cfg = dict(loss_fn_config or {})
     if loss_fn == "ppo":
-        low = cfg.get("clip_low_threshold", _TINKER_PPO_CLIP_LOW_DEFAULT)
-        high = cfg.get("clip_high_threshold", _TINKER_PPO_CLIP_HIGH_DEFAULT)
-        # Arctic ``eps_clip`` is a symmetric epsilon around ratio=1: ratio is
-        # clamped to [1 - eps_clip, 1 + eps_clip_higher]. Convert to that shape.
-        eps_clip = max(0.0, 1.0 - float(low))
-        eps_clip_higher = max(0.0, float(high) - 1.0)
+        low = cfg.get("clip_low_threshold", 0.8)
+        high = cfg.get("clip_high_threshold", 1.2)
         actor_cfg: dict[str, Any] = {
-            "eps_clip": eps_clip,
-            "eps_clip_higher": eps_clip_higher,
+            "eps_clip": max(0.0, 1.0 - float(low)),
+            "eps_clip_higher": max(0.0, float(high) - 1.0),
         }
     elif loss_fn == "importance_sampling":
-        # Disable clipping — worst case falls back to unclipped IS.
-        actor_cfg = {
-            "eps_clip": _UNBOUNDED_CLIP,
-            "eps_clip_higher": _UNBOUNDED_CLIP,
-        }
+        actor_cfg = {"eps_clip": 1e9, "eps_clip_higher": 1e9}
     else:  # pragma: no cover — gated by route
         raise HTTPException(400, f"unsupported loss_fn={loss_fn!r}")
 
@@ -464,19 +435,6 @@ def _tensor_data_to_numpy(td: TensorData) -> np.ndarray:
     if td.shape is not None and list(arr.shape) != list(td.shape):
         arr = arr.reshape(td.shape)
     return arr
-
-
-def _pad_to(arr: np.ndarray, target_len: int, pad_value: float | int) -> np.ndarray:
-    """Right-pad a 1-D array to ``target_len`` with ``pad_value``. Truncates
-    if the input is longer — the caller must have config-max padding
-    invariant (ZoRRo compatibility).
-    """
-    if arr.shape[0] == target_len:
-        return arr
-    if arr.shape[0] > target_len:
-        return arr[:target_len]
-    pad = np.full(target_len - arr.shape[0], pad_value, dtype=arr.dtype)
-    return np.concatenate([arr, pad])
 
 
 def _split_prompt_response(
@@ -707,17 +665,11 @@ def sampling_params_tinker_to_vllm(p: SamplingParams, num_samples: int) -> dict[
 
 
 class TinkerFutureStore:
-    """Trivial in-memory future backing store.
-
-    v1 executes work inline in the request handler and stashes the terminal
-    response keyed by ``request_id``. The client's first
-    ``retrieve_future`` call pops it and moves on. Retention beyond one
-    read is not required by the SDK's ``_APIFuture`` implementation.
-
-    E-async replaces this with an ``asyncio.Task``-per-future model that
-    returns ``TryAgainResponse`` until the task completes; the wire and
-    Pydantic surface do not change.
-    """
+    """v1 executes work inline; the terminal response is stashed by
+    ``request_id`` and popped on the first ``retrieve_future`` call.
+    Extension E-async swaps this for an ``asyncio.Task``-per-future model
+    that returns ``TryAgainResponse`` until the task completes; the wire
+    surface does not change."""
 
     def __init__(self) -> None:
         self._counter = itertools.count()
@@ -744,13 +696,12 @@ _V1_UNSUPPORTED_LOSSES = frozenset({"cispo", "dro", "cross_entropy"})
 
 
 def _require_state(app_state: Any, name: str) -> Any:
-    """Fetch app.state.<name> or 500 if the layer wasn't initialized. Kept
-    small and explicit so mock backends in tests can override per-attribute."""
     if not hasattr(app_state, name):
         raise HTTPException(
             500,
             f"Tinker layer misconfigured: app.state.{name} is unset. "
-            "Call arctic_platform.rl.tinker_server.init_tinker_state() at startup.",
+            "Call POST /tinker/bind or arctic_platform.rl.tinker_router."
+            "init_tinker_state() at startup.",
         )
     return getattr(app_state, name)
 
@@ -761,8 +712,6 @@ async def _submit_inline(
     *,
     model_id: str | None = None,
 ) -> UntypedAPIFuture:
-    """Execute ``runner`` inline, stash the response in the future store, and
-    return the SDK's ``UntypedAPIFuture`` shape."""
     store: TinkerFutureStore = _require_state(request.app.state, "tinker_futures")
     request_id = store.new_request_id()
     result = await runner()
@@ -798,8 +747,6 @@ async def auth_token() -> AuthTokenResponse:
 
 @router.post("/telemetry", response_model=TelemetryResponse)
 async def telemetry(req: dict) -> TelemetryResponse:
-    # Drop events on the floor; the SDK sends batched telemetry as
-    # best-effort. Explicit ack keeps the client from retrying.
     return TelemetryResponse()
 
 
@@ -970,9 +917,8 @@ async def optim_step(req: OptimStepRequest, request: Request) -> UntypedAPIFutur
 async def save_weights(
     req: SaveWeightsRequest, request: Request
 ) -> UntypedAPIFuture:
-    """Ack-only state save. Real checkpoint persistence lives in E2
-    (TINKER_COMPAT.md); v1's goal is that cookbook recipes which end with
-    a ``save_checkpoint(kind='both')`` don't crash on shutdown."""
+    """Ack-only state save so cookbook recipes ending in ``save_state`` don't
+    crash. On-disk persistence is extension E2."""
 
     async def runner() -> dict[str, Any]:
         gen = getattr(request.app.state, "tinker_state_gen", 0) + 1
@@ -1036,31 +982,18 @@ async def asample(req: SampleRequest, request: Request) -> UntypedAPIFuture:
         vllm_params = sampling_params_tinker_to_vllm(req.sampling_params, req.num_samples)
         prompt_tokens = _model_input_to_tokens(req.prompt)
         r = await handler(prompt_tokens, vllm_params)
-        return _pack_sample_response(r).model_dump(mode="json")
+        # Arctic /generate → Tinker SampleResponse: token_ids/logprobs/finish_reason per sample.
+        sequences = [
+            SampledSequence(
+                tokens=list(o.get("token_ids", [])),
+                logprobs=list(o["logprobs"]) if o.get("logprobs") is not None else None,
+                stop_reason=(StopReason.STOP if o.get("finish_reason") == "stop" else StopReason.LENGTH),
+            )
+            for o in (r.get("outputs") or [])
+        ]
+        return SampleResponse(sequences=sequences).model_dump(mode="json")
 
     return await _submit_inline(request, runner)
-
-
-def _pack_sample_response(r: dict[str, Any]) -> SampleResponse:
-    """Wrap Arctic ``/generate`` result into Tinker ``SampleResponse``.
-
-    Arctic returns ``{"outputs": [{"token_ids": [...], "logprobs": [...],
-    "finish_reason": "stop"|"length", ...}, ...]}`` per sample. Missing
-    ``logprobs`` fields fall through as ``None`` on the wire.
-    """
-    outputs = r.get("outputs") or []
-    sequences: list[SampledSequence] = []
-    for out in outputs:
-        reason = out.get("finish_reason", "length")
-        stop = StopReason.STOP if reason == "stop" else StopReason.LENGTH
-        sequences.append(
-            SampledSequence(
-                tokens=list(out.get("token_ids", [])),
-                logprobs=(list(out["logprobs"]) if out.get("logprobs") is not None else None),
-                stop_reason=stop,
-            )
-        )
-    return SampleResponse(sequences=sequences)
 
 
 # ---- futures ----------------------------------------------------------------
@@ -1093,15 +1026,9 @@ def init_tinker_state(
     sync_weights_handler: Callable[[], Awaitable[Any]],
     generate_handler: Callable[[list[int], dict], Awaitable[dict]],
 ) -> None:
-    """Bind the Tinker layer onto a FastAPI ``app`` and register per-verb
-    Arctic handlers.
-
-    The handlers are thin async closures so callers (real Arctic HTTP
-    server, test harness with a mocked backend) can plug them in without
-    reaching into ``app.state.jobs``. The lambda in Arctic's real
-    ``http_server`` binds the training/sampling job_ids captured at
-    startup.
-    """
+    """Wire the Tinker verbs onto ``app.state`` as async closures. Callers
+    (real Arctic http_server, in-process tests with a mocked backend) inject
+    per-verb handlers so the router never reaches into ``app.state.jobs``."""
     app.state.tinker_base_model = base_model
     app.state.tinker_max_prompt_length = int(max_prompt_length)
     app.state.tinker_max_response_length = int(max_response_length)

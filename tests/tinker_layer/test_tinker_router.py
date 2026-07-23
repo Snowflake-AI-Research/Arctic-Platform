@@ -1,6 +1,6 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Integration tests for the tinker_server FastAPI router.
+"""Integration tests for the tinker_router FastAPI router.
 
 Each test drives the router through ``httpx.AsyncClient`` with the app-level
 Arctic backend mocked (see ``conftest.py::mock_backend``). Runs CPU-only,
@@ -394,7 +394,7 @@ async def test_unwired_layer_returns_500():
     from fastapi import FastAPI
     import httpx
 
-    from arctic_platform.rl.tinker_server import router as tinker_router
+    from arctic_platform.rl.tinker_router import router as tinker_router
 
     app = FastAPI()
     app.include_router(tinker_router)

@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-# Ensure we can import ``arctic_platform.rl.tinker_server`` even when this
+# Ensure we can import ``arctic_platform.rl.tinker_router`` even when this
 # subtree is checked out inside a monorepo whose root is not on sys.path.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
@@ -94,8 +94,8 @@ def app(mock_backend):
     """Build a FastAPI app with only the Tinker router mounted + backend wired."""
     from fastapi import FastAPI
 
-    from arctic_platform.rl.tinker_server import init_tinker_state
-    from arctic_platform.rl.tinker_server import router as tinker_router
+    from arctic_platform.rl.tinker_router import init_tinker_state
+    from arctic_platform.rl.tinker_router import router as tinker_router
 
     app = FastAPI()
     app.include_router(tinker_router)

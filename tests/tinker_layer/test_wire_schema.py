@@ -3,7 +3,7 @@
 """Wire schema round-trip tests.
 
 These exist to catch upstream ``tinker.types.*`` drift: for every wire type
-we redefine locally in ``arctic_platform.rl.tinker_server``, dump a valid
+we redefine locally in ``arctic_platform.rl.tinker_router``, dump a valid
 example to JSON and ensure our Pydantic parser accepts it. When the
 upstream tinker SDK adds/removes fields, one of these will start failing
 and point at the exact spot to update.
@@ -15,33 +15,33 @@ import json
 
 import pytest
 
-from arctic_platform.rl.tinker_server import AdamParams
-from arctic_platform.rl.tinker_server import ClientConfigResponse
-from arctic_platform.rl.tinker_server import CreateModelRequest
-from arctic_platform.rl.tinker_server import CreateModelResponse
-from arctic_platform.rl.tinker_server import CreateSessionRequest
-from arctic_platform.rl.tinker_server import Datum
-from arctic_platform.rl.tinker_server import EncodedTextChunk
-from arctic_platform.rl.tinker_server import ForwardBackwardInput
-from arctic_platform.rl.tinker_server import ForwardBackwardOutput
-from arctic_platform.rl.tinker_server import ForwardBackwardRequest
-from arctic_platform.rl.tinker_server import ForwardInput
-from arctic_platform.rl.tinker_server import ForwardRequest
-from arctic_platform.rl.tinker_server import FutureRetrieveRequest
-from arctic_platform.rl.tinker_server import LoraConfig
-from arctic_platform.rl.tinker_server import ModelInput
-from arctic_platform.rl.tinker_server import OptimStepRequest
-from arctic_platform.rl.tinker_server import OptimStepResponse
-from arctic_platform.rl.tinker_server import SampleRequest
-from arctic_platform.rl.tinker_server import SampleResponse
-from arctic_platform.rl.tinker_server import SampledSequence
-from arctic_platform.rl.tinker_server import SamplingParams
-from arctic_platform.rl.tinker_server import SaveWeightsForSamplerRequest
-from arctic_platform.rl.tinker_server import SaveWeightsForSamplerResponse
-from arctic_platform.rl.tinker_server import StopReason
-from arctic_platform.rl.tinker_server import TensorData
-from arctic_platform.rl.tinker_server import TryAgainResponse
-from arctic_platform.rl.tinker_server import UntypedAPIFuture
+from arctic_platform.rl.tinker_router import AdamParams
+from arctic_platform.rl.tinker_router import ClientConfigResponse
+from arctic_platform.rl.tinker_router import CreateModelRequest
+from arctic_platform.rl.tinker_router import CreateModelResponse
+from arctic_platform.rl.tinker_router import CreateSessionRequest
+from arctic_platform.rl.tinker_router import Datum
+from arctic_platform.rl.tinker_router import EncodedTextChunk
+from arctic_platform.rl.tinker_router import ForwardBackwardInput
+from arctic_platform.rl.tinker_router import ForwardBackwardOutput
+from arctic_platform.rl.tinker_router import ForwardBackwardRequest
+from arctic_platform.rl.tinker_router import ForwardInput
+from arctic_platform.rl.tinker_router import ForwardRequest
+from arctic_platform.rl.tinker_router import FutureRetrieveRequest
+from arctic_platform.rl.tinker_router import LoraConfig
+from arctic_platform.rl.tinker_router import ModelInput
+from arctic_platform.rl.tinker_router import OptimStepRequest
+from arctic_platform.rl.tinker_router import OptimStepResponse
+from arctic_platform.rl.tinker_router import SampleRequest
+from arctic_platform.rl.tinker_router import SampleResponse
+from arctic_platform.rl.tinker_router import SampledSequence
+from arctic_platform.rl.tinker_router import SamplingParams
+from arctic_platform.rl.tinker_router import SaveWeightsForSamplerRequest
+from arctic_platform.rl.tinker_router import SaveWeightsForSamplerResponse
+from arctic_platform.rl.tinker_router import StopReason
+from arctic_platform.rl.tinker_router import TensorData
+from arctic_platform.rl.tinker_router import TryAgainResponse
+from arctic_platform.rl.tinker_router import UntypedAPIFuture
 
 
 class TestRequestParsing:

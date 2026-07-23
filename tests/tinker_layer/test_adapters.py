@@ -1,6 +1,6 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for tinker_server adapters (Datum→batch, AdamParams→overrides,
+"""Unit tests for tinker_router adapters (Datum→batch, AdamParams→overrides,
 SamplingParams→vLLM, loss_fn_config→actor_config)."""
 
 from __future__ import annotations
@@ -8,16 +8,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from arctic_platform.rl.tinker_server import AdamParams
-from arctic_platform.rl.tinker_server import Datum
-from arctic_platform.rl.tinker_server import EncodedTextChunk
-from arctic_platform.rl.tinker_server import ModelInput
-from arctic_platform.rl.tinker_server import SamplingParams
-from arctic_platform.rl.tinker_server import TensorData
-from arctic_platform.rl.tinker_server import _loss_fn_config_to_actor_config
-from arctic_platform.rl.tinker_server import adam_params_to_optim_overrides
-from arctic_platform.rl.tinker_server import datum_list_to_arctic_batch
-from arctic_platform.rl.tinker_server import sampling_params_tinker_to_vllm
+from arctic_platform.rl.tinker_router import AdamParams
+from arctic_platform.rl.tinker_router import Datum
+from arctic_platform.rl.tinker_router import EncodedTextChunk
+from arctic_platform.rl.tinker_router import ModelInput
+from arctic_platform.rl.tinker_router import SamplingParams
+from arctic_platform.rl.tinker_router import TensorData
+from arctic_platform.rl.tinker_router import _loss_fn_config_to_actor_config
+from arctic_platform.rl.tinker_router import adam_params_to_optim_overrides
+from arctic_platform.rl.tinker_router import datum_list_to_arctic_batch
+from arctic_platform.rl.tinker_router import sampling_params_tinker_to_vllm
 
 
 def _mk_datum(tokens, advantages, logprobs, mask=None):
