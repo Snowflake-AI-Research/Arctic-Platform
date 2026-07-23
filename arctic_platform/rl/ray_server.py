@@ -717,10 +717,10 @@ class ArcticRLRayServer:
 
         return merged
 
-    async def step(self, job_id: int) -> dict[str, Any]:
+    async def step(self, job_id: int, optim_overrides: dict | None = None) -> dict[str, Any]:
         self._verify_job(job_id, "training")
-        # results = await asyncio.gather(*[w.step.remote() for w in self.training_workers])
-        refs = [w.step.remote() for w in self.training_workers]
+        # results = await asyncio.gather(*[w.step.remote(optim_overrides) for w in self.training_workers])
+        refs = [w.step.remote(optim_overrides) for w in self.training_workers]
         results = ray.get(refs)
         merged = dict(
             job_id=job_id,

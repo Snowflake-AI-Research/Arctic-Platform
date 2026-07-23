@@ -59,9 +59,11 @@ from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.ray_pg import ColocatePlacement
 from arctic_platform.rl.utils.ray_pg import create_colocate_placement
 from arctic_platform.rl.utils.ray_pg import pg_scheduling_options
+from arctic_platform.rl.tinker_server import router as _tinker_router
 from arctic_platform.rl.utils.server_models import GenerateRequest
 from arctic_platform.rl.utils.server_models import JobConfig
 from arctic_platform.rl.utils.server_models import LogProbsRequest
+from arctic_platform.rl.utils.server_models import StepRequest
 from arctic_platform.rl.utils.server_models import SyncWeightsRequest
 from arctic_platform.rl.utils.server_models import WeightNormRequest
 from arctic_platform.rl.utils.server_models import build_model_config
@@ -69,6 +71,10 @@ from arctic_platform.rl.utils.server_models import build_model_config
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Arctic RL Local Server")
+# Tinker HTTP layer. Routes are mounted eagerly (small Pydantic-only cost);
+# in-process handlers are bound lazily in ``initialize`` once a training job
+# id is known. See ``tinker_server.init_tinker_state``.
+app.include_router(_tinker_router)
 
 # ---------------------------------------------------------------------------
 # Request / response models (mirrors dss-platform sftp_server)
@@ -442,9 +448,12 @@ async def fwd_no_grad(
 
 
 @app.post("/step")
-async def step(job_id: int):
+async def step(job_id: int, request: StepRequest | None = Body(default=None)):
     _verify_job(job_id, "training")
-    results = await asyncio.gather(*[w.step.remote() for w in app.state.training_workers])
+    optim_overrides = request.optim_overrides if request is not None else None
+    results = await asyncio.gather(
+        *[w.step.remote(optim_overrides) for w in app.state.training_workers]
+    )
     merged = dict(
         job_id=job_id,
         metrics=merge_dict_shards([r["metrics"] for r in results]),

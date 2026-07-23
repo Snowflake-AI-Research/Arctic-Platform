@@ -486,7 +486,22 @@ class DeepSpeedWorker:
         timers.stop_and_print_elapsed(tname)
         return results
 
-    def step(self) -> dict:
+    def step(self, optim_overrides: dict | None = None) -> dict:
+        # Per-call optimizer hyperparameter overrides — used by the Tinker HTTP
+        # layer to thread ``AdamParams`` from the client into DeepSpeed at
+        # ``optim_step`` time. Legacy callers pass ``None`` and hit the fast
+        # path.
+        if optim_overrides:
+            optimizer = self.engine.optimizer
+            for pg in optimizer.param_groups:
+                if "lr" in optim_overrides:
+                    pg["lr"] = optim_overrides["lr"]
+                if "betas" in optim_overrides:
+                    pg["betas"] = tuple(optim_overrides["betas"])
+                if "eps" in optim_overrides:
+                    pg["eps"] = optim_overrides["eps"]
+                if "weight_decay" in optim_overrides:
+                    pg["weight_decay"] = optim_overrides["weight_decay"]
         self.engine.step()
         # Pull grad_norm out of DeepSpeed so it can be logged by the trainer.
         # rename_dict in ray_trainer turns "grad_norm" -> "actor/grad_norm",
