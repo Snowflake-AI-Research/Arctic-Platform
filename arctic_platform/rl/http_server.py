@@ -378,13 +378,14 @@ async def fwd_bwd(
 
     tname = timers.start("xyz fwd_bwd: split_batch")
     shards, _ = http_split_batch(body, len(workers))
-    # The verl driver's ``update_actor`` only consumes ``metrics`` from the
-    # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
-    # ``batch`` (logprobs/entropy) is never read. Keep the worker output as
-    # tensors so ``run_pipeline`` skips the per-microbatch detensorize()
-    # ``.tolist()``, and omit ``batch`` from the response so it is never
-    # serialized over the wire.
-    shards[0]["meta"]["worker_return_tensors"] = True
+    # Verl's ``update_actor`` only consumes ``metrics`` from the fwd_bwd
+    # response, so by default we tell workers to keep tensors as-is and drop
+    # the per-token ``batch`` on the wire. The Tinker HTTP layer needs those
+    # per-token logprobs to satisfy ``ForwardBackwardOutput.loss_fn_outputs``
+    # -- it opts in via ``meta['return_per_token_logprobs']``.
+    return_logprobs = bool(shards[0]["meta"].get("return_per_token_logprobs", False))
+    if not return_logprobs:
+        shards[0]["meta"]["worker_return_tensors"] = True
     timers.stop_and_print_elapsed(tname)
 
     tname = timers.start("xyz fwd_bwd: gather + forward_backward")
@@ -398,13 +399,16 @@ async def fwd_bwd(
 
     # See ray_server.fwd_bwd for the rationale: collapse the per-DP-rank
     # paired ``.sum`` / ``.tokens`` metric scalars into one global
-    # token-mean scalar per metric per mini-batch. ``batch`` is intentionally
-    # omitted -- the driver does not consume it (see note above).
+    # token-mean scalar per metric per mini-batch.
     merged = dict(
         job_id=job_id,
         metrics=combine_metric_shards([r["metrics"] for r in results]),
         avg_loss=avg_loss,
     )
+    if return_logprobs:
+        batches = [r.get("batch") for r in results if r.get("batch")]
+        if batches:
+            merged["batch"] = merge_dict_shards(batches) if len(batches) > 1 else batches[0]
     timers.stop_and_print_elapsed(tname)
 
     timers.stop_and_print_elapsed(tname_e2e)
@@ -1078,14 +1082,27 @@ async def tinker_bind(request: TinkerBindRequest = Body(...)):
         ))
 
     async def _generate_handler(prompt_tokens: list[int], sampling_params: dict) -> dict:
-        # Fan the group into N single-sample calls (Arctic's replica-pool
-        # worker returns ``outputs[0]``) and let vLLM's prefix cache dedupe
-        # the shared prompt KV. Passes token-id prompts straight through.
+        # Fan the group into N single-sample calls. When the caller supplies a
+        # ``seed``, derive a per-index seed (``seed + i``) so ``num_samples>1``
+        # produces diverse-but-reproducible sequences — matching Tinker's
+        # contract (same base seed → same N samples; changing the seed changes
+        # them). vLLM's prefix cache still dedupes the shared prompt KV.
         params = dict(sampling_params)
         n = int(params.pop("n", 1))
-        prompts: list[Any] = [list(prompt_tokens)] * n
+        base_seed = params.pop("seed", None)
         pool: ReplicaPool = app.state.sampling_pool
-        results = await pool.generate(prompts, params)
+        if n == 1:
+            if base_seed is not None:
+                params["seed"] = int(base_seed)
+            results = await pool.generate([list(prompt_tokens)], params)
+        else:
+            async def _one(i: int) -> dict[str, Any]:
+                p = dict(params)
+                if base_seed is not None:
+                    p["seed"] = int(base_seed) + i
+                r = await pool.generate([list(prompt_tokens)], p)
+                return r[0]
+            results = await asyncio.gather(*[_one(i) for i in range(n)])
         outputs: list[dict[str, Any]] = []
         for res in results:
             per_pos = res.get("logprobs")

@@ -466,7 +466,7 @@ def datum_list_to_arctic_batch(
     max_response_length: int,
     pad_token_id: int,
     forward_only: bool = False,
-) -> dict:
+) -> tuple[dict, list[tuple[int, int]]]:
     """Pack a list of Tinker ``Datum`` into an Arctic ``fwd_bwd`` batch dict.
 
     Layout mirrors ``arctic_platform/integrations/verl/adapter.py``:
@@ -482,6 +482,13 @@ def datum_list_to_arctic_batch(
     - ``processing``: {loss_fn: "verl_grpo"} — Arctic's registered
       PPO-shaped loss; ``ppo`` / ``importance_sampling`` semantics are
       threaded via ``actor_config`` in ``_loss_fn_config_to_actor_config``.
+
+    Returns ``(batch_dict, row_slices)`` where ``row_slices[i]`` is the
+    ``(start, end)`` index range that un-pads row ``i``'s per-position
+    tensors back to the original Datum's ``model_input`` length. Tinker's
+    contract is that returned ``logprobs`` line up with the Datum's tokens;
+    Arctic works in a padded layout, so the router uses these slices to
+    reverse the padding on the wire.
 
     ZoRRo invariant: pad each row to ``max_prompt_length +
     max_response_length`` (config-max), never batch-local. Prompt /
@@ -507,6 +514,7 @@ def datum_list_to_arctic_batch(
     response_mask = np.zeros((batch_size, total_len), dtype=np.int64)
     advantages = np.zeros((batch_size, total_len), dtype=np.float32)
     old_log_probs = np.zeros((batch_size, total_len), dtype=np.float32)
+    row_slices: list[tuple[int, int]] = []
 
     for i, datum in enumerate(data):
         toks = _model_input_to_tokens(datum.model_input)
@@ -533,6 +541,7 @@ def datum_list_to_arctic_batch(
         input_ids[i, mpl - p_len: mpl] = np.asarray(prompt_toks, dtype=np.int64)
         input_ids[i, mpl: mpl + r_len] = np.asarray(resp_toks, dtype=np.int64)
         attention_mask[i, mpl - p_len: mpl + r_len] = 1
+        row_slices.append((mpl - p_len, mpl + r_len))
 
         # Advantages / logprobs on the Tinker wire are positional over the
         # full ``toks`` array; slice out the response tail and place it in
@@ -550,7 +559,7 @@ def datum_list_to_arctic_batch(
     if not forward_only:
         actor_config = _loss_fn_config_to_actor_config(loss_fn, loss_fn_config)
 
-    return {
+    batch_dict = {
         "batch": {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -571,6 +580,11 @@ def datum_list_to_arctic_batch(
             "pad_token_id": int(pad_token_id),
             "drop_position_ids": True,
             "forward_only": bool(forward_only),
+            # Tinker's ``ForwardBackwardOutput.loss_fn_outputs`` per Datum is
+            # expected to carry per-token training-time ``logprobs`` (used by
+            # tinker-cookbook to compute KL, GRPO advantages, etc.). Ask
+            # Arctic to keep them in the response.
+            "return_per_token_logprobs": not forward_only,
             # verl_grpo_loss reads these three keys unconditionally. We're
             # single-worker (training-gpus=1) at v1; multi-DP will need
             # per-shard chunking on the Tinker adapter side.
@@ -589,6 +603,30 @@ def datum_list_to_arctic_batch(
             "loss_fn": "verl_grpo" if not forward_only else None,
         },
     }
+    return batch_dict, row_slices
+
+
+def _unpad_logprobs_to_loss_fn_outputs(
+    logprobs_batch: Any, row_slices: list[tuple[int, int]]
+) -> list[dict[str, Any]]:
+    """Convert Arctic's padded ``[batch, max_prompt + max_response]`` logprob
+    tensor into per-Datum ``LossFnOutput`` dicts, un-padded to each Datum's
+    original ``model_input`` length via ``row_slices``.
+
+    Tinker's contract: ``loss_fn_outputs[i]["logprobs"]`` is a 1-D tensor
+    whose length equals ``len(data[i].model_input.tokens)``. Arctic
+    computes logprobs on the full padded layout for compute-graph reasons,
+    so we slice back to the un-padded span here.
+    """
+    arr = np.asarray(logprobs_batch, dtype=np.float32)
+    outputs: list[dict[str, Any]] = []
+    for i, (start, end) in enumerate(row_slices):
+        row = arr[i, start:end] if arr.ndim == 2 else arr[start:end]
+        outputs.append({
+            "logprobs": TensorData(dtype="float32", data=row.tolist(),
+                                   shape=list(row.shape)).model_dump()
+        })
+    return outputs
 
 
 _UNIQUE_REDUCTIONS = {"unique", "hash_unordered"}
@@ -722,6 +760,13 @@ async def _submit_inline(
 # ---- session / bootstrap verbs ----------------------------------------------
 
 
+@router.get("/healthz")
+async def healthz(request: Request) -> dict[str, Any]:
+    """Cheap liveness + bind check. ``bound=True`` once ``POST /tinker/bind``
+    has wired the router; SkyRL-tx tests hit ``/api/v1/healthz`` for readiness."""
+    return {"status": "ok", "bound": getattr(request.app.state, "tinker_base_model", None) is not None}
+
+
 @router.post("/create_session", response_model=CreateSessionResponse)
 async def create_session(req: CreateSessionRequest, request: Request) -> CreateSessionResponse:
     sessions = _require_state(request.app.state, "tinker_sessions")
@@ -830,7 +875,7 @@ async def forward_backward(
     max_prompt = _require_state(request.app.state, "tinker_max_prompt_length")
     max_resp = _require_state(request.app.state, "tinker_max_response_length")
     pad_id = _require_state(request.app.state, "tinker_pad_token_id")
-    batch = datum_list_to_arctic_batch(
+    batch, row_slices = datum_list_to_arctic_batch(
         fbi.data,
         fbi.loss_fn,
         fbi.loss_fn_config,
@@ -844,13 +889,19 @@ async def forward_backward(
 
     async def runner() -> dict[str, Any]:
         r = await handler(batch)
-        # Tinker expects ``len(loss_fn_outputs)`` to equal the per-actor
-        # sample count; it is used as the reduction weight when combining
-        # metrics across actors. Arctic returns a single aggregated batch,
-        # so we emit one empty ``LossFnOutput`` per Datum which keeps the
-        # weight correct without fabricating per-sample tensors.
+        # Emit per-Datum ``logprobs`` when Arctic returns the packed batch
+        # (opted into via ``meta['return_per_token_logprobs']`` in
+        # ``datum_list_to_arctic_batch``). tinker-cookbook consumes these as
+        # training-time logprobs for GRPO / KL. Fall back to empty dicts so
+        # metric reduction weighting stays correct even if Arctic dropped
+        # the batch (e.g. an older server without the flag).
+        logprobs_batch = r.get("batch", {}).get("logprobs") if r.get("batch") else None
+        if logprobs_batch is not None:
+            outputs = _unpad_logprobs_to_loss_fn_outputs(logprobs_batch, row_slices)
+        else:
+            outputs = [{} for _ in range(n_data)]
         return ForwardBackwardOutput(
-            loss_fn_outputs=[{} for _ in range(n_data)],
+            loss_fn_outputs=outputs,
             metrics=arctic_metrics_to_tinker(r.get("metrics")),
         ).model_dump(mode="json")
 
@@ -864,7 +915,7 @@ async def forward(req: ForwardRequest, request: Request) -> UntypedAPIFuture:
     max_prompt = _require_state(request.app.state, "tinker_max_prompt_length")
     max_resp = _require_state(request.app.state, "tinker_max_response_length")
     pad_id = _require_state(request.app.state, "tinker_pad_token_id")
-    batch = datum_list_to_arctic_batch(
+    batch, row_slices = datum_list_to_arctic_batch(
         req.forward_input.data,
         req.forward_input.loss_fn,
         None,
@@ -877,19 +928,16 @@ async def forward(req: ForwardRequest, request: Request) -> UntypedAPIFuture:
     async def runner() -> dict[str, Any]:
         r = await handler(batch)
         # ``fwd-no-grad`` returns per-token logprobs in ``batch['logprobs']``.
-        # Repack per Datum so the SDK's LossFnOutput mapping matches.
+        # Un-pad per Datum via ``row_slices`` so the SDK's LossFnOutput
+        # shape lines up 1:1 with each Datum's ``model_input``.
         logprobs_batch = r.get("batch", {}).get("logprobs")
-        outputs: list[dict[str, TensorData]] = []
-        if logprobs_batch is not None:
-            arr = np.asarray(logprobs_batch, dtype=np.float32)
-            for row in arr:
-                outputs.append({"logprobs": TensorData(dtype="float32",
-                                                       data=row.tolist(),
-                                                       shape=list(row.shape))})
+        outputs = (
+            _unpad_logprobs_to_loss_fn_outputs(logprobs_batch, row_slices)
+            if logprobs_batch is not None else []
+        )
         return ForwardBackwardOutput(
             loss_fn_output_type="ArrayRecord",
-            loss_fn_outputs=[{k: v.model_dump() for k, v in out.items()}
-                             for out in outputs],
+            loss_fn_outputs=outputs,
             metrics=arctic_metrics_to_tinker(r.get("metrics")),
         ).model_dump(mode="json")
 

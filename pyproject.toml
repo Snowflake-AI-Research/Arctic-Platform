@@ -135,4 +135,5 @@ timeout_method = "signal"
 markers = [
     "vllm: marks a GPU test that drives the vLLM sampling engine; it cannot run concurrently with other GPU tests, so it is pinned to a single xdist worker via xdist_group. Exclude it from a parallel pool with '-m \"not vllm\"' and run it on its own.",
     "gpu_serial: marks a heavyweight GPU test whose body must hold the host-wide GPU lock (serialized across xdist workers by the _serialize_gpu_work autouse fixture).",
+    "gpu: end-to-end test that spawns a real Arctic HTTP server + Ray/DeepSpeed/vLLM. Excluded from the default suite; run with 'pytest -m gpu'.",
 ]

@@ -40,7 +40,7 @@ class TestDatumAdapter:
         signals share the same ``[B, seq_len]`` shape so the packing
         pass flattens them together."""
         datum = _mk_datum([1, 2, 3], [0.1, 0.2, 0.3], [-1.0, -1.1, -1.2])
-        out = datum_list_to_arctic_batch(
+        out, _ = datum_list_to_arctic_batch(
             [datum], "ppo", None,
             max_prompt_length=8, max_response_length=4, pad_token_id=0,
         )
@@ -54,7 +54,7 @@ class TestDatumAdapter:
         # Explicit prompt-only mask (all zeros) → all tokens treated as
         # prompt, left-padded to mpl=4. Response window (columns 4:) is
         # all pad_token_id=42.
-        out = datum_list_to_arctic_batch(
+        out, _ = datum_list_to_arctic_batch(
             [_mk_datum([7, 8], [0.0, 0.0], [-2.0, -2.0], mask=[0, 0])],
             "ppo", None,
             max_prompt_length=4, max_response_length=2, pad_token_id=42,
@@ -69,7 +69,7 @@ class TestDatumAdapter:
         d1 = _mk_datum([1, 2], [0.0, 0.5], [-1.0, -1.1], mask=[0, 1])
         d2 = _mk_datum([3, 4, 5], [0.0, 0.0, 0.3], [-2.0, -2.1, -2.2],
                        mask=[0, 0, 1])
-        out = datum_list_to_arctic_batch(
+        out, _ = datum_list_to_arctic_batch(
             [d1, d2], "ppo", None,
             max_prompt_length=8, max_response_length=4, pad_token_id=0,
         )
@@ -86,7 +86,7 @@ class TestDatumAdapter:
         # tokens=[1, 2, 3] with mask=[0, 0, 1] → prompt=[1, 2], response=[3].
         # Left-padded to mpl=8: real cols are [6, 7] (prompt), 8 (response).
         d = _mk_datum([1, 2, 3], [0.0, 0.0, 0.1], [-1.0] * 3, mask=[0, 0, 1])
-        out = datum_list_to_arctic_batch(
+        out, _ = datum_list_to_arctic_batch(
             [d], "ppo", None,
             max_prompt_length=8, max_response_length=4, pad_token_id=0,
         )
@@ -99,7 +99,7 @@ class TestDatumAdapter:
         # ones at the response columns (mpl, mpl+1) of the full [B, seq_len]
         # tensor and 0 elsewhere.
         d = _mk_datum([1, 2, 3], [0.0, 0.5, 0.5], [-1.0] * 3, mask=[0, 1, 1])
-        out = datum_list_to_arctic_batch(
+        out, _ = datum_list_to_arctic_batch(
             [d], "ppo", None,
             max_prompt_length=4, max_response_length=4, pad_token_id=0,
         )
@@ -120,7 +120,7 @@ class TestDatumAdapter:
             model_input=ModelInput(chunks=[EncodedTextChunk(tokens=[1, 2, 3])]),
             loss_fn_inputs=inputs,
         )
-        out = datum_list_to_arctic_batch(
+        out, _ = datum_list_to_arctic_batch(
             [d], "ppo", None,
             max_prompt_length=4, max_response_length=2, pad_token_id=0,
         )
@@ -144,7 +144,7 @@ class TestDatumAdapter:
             model_input=ModelInput(chunks=[EncodedTextChunk(tokens=[1, 2, 3])]),
             loss_fn_inputs=inputs,
         )
-        out = datum_list_to_arctic_batch(
+        out, _ = datum_list_to_arctic_batch(
             [d], "importance_sampling", None,
             max_prompt_length=4, max_response_length=2, pad_token_id=0,
         )
@@ -156,7 +156,7 @@ class TestDatumAdapter:
         # Arctic's LOSS_FNS ships one PPO-shaped loss (``verl_grpo``); the
         # Tinker adapter maps any RL loss_fn to it and threads ``ppo`` /
         # ``importance_sampling`` semantics through ``actor_config``.
-        out = datum_list_to_arctic_batch(
+        out, _ = datum_list_to_arctic_batch(
             [_mk_datum([1], [0.1], [-1.0])],
             "importance_sampling", None,
             max_prompt_length=4, max_response_length=2, pad_token_id=0,
@@ -164,7 +164,7 @@ class TestDatumAdapter:
         assert out["processing"]["loss_fn"] == "verl_grpo"
 
     def test_forward_only_flag_present(self):
-        out = datum_list_to_arctic_batch(
+        out, _ = datum_list_to_arctic_batch(
             [_mk_datum([1], [0.1], [-1.0])],
             "ppo", None,
             max_prompt_length=4, max_response_length=2, pad_token_id=0,
@@ -175,7 +175,7 @@ class TestDatumAdapter:
         assert out["meta"]["actor_config"] == {}
 
     def test_max_response_len_threaded(self):
-        out = datum_list_to_arctic_batch(
+        out, _ = datum_list_to_arctic_batch(
             [_mk_datum([1], [0.1], [-1.0])],
             "ppo", None,
             max_prompt_length=4, max_response_length=7, pad_token_id=0,

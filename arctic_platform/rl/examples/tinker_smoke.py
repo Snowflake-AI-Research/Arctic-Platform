@@ -45,7 +45,10 @@ from transformers import AutoTokenizer
 
 
 def _build_datum(prompt_ids: list[int], seq, max_response_length: int) -> t.Datum:
-    """Toy reward: length-normalized response length. Loss mask zeroes prompt."""
+    """Toy reward: length-normalized response length. Prompt positions are
+    zero-masked on every loss-input array (SkyRL-tx cookbook convention);
+    non-zero entries in ``weights`` / ``advantages`` mark the response
+    tail and drive the prompt/response split on the server."""
     resp_ids = list(seq.tokens)
     all_ids = prompt_ids + resp_ids
     n_prompt, n_resp = len(prompt_ids), len(resp_ids)
@@ -53,7 +56,7 @@ def _build_datum(prompt_ids: list[int], seq, max_response_length: int) -> t.Datu
     return t.Datum(
         model_input=t.ModelInput.from_ints(all_ids),
         loss_fn_inputs={
-            "target_tokens": all_ids,
+            "target_tokens": [0] * n_prompt + resp_ids,
             "advantages": [0.0] * n_prompt + [adv] * n_resp,
             "logprobs": [0.0] * n_prompt + list(seq.logprobs or [0.0] * n_resp),
             "weights": [0.0] * n_prompt + [1.0] * n_resp,
@@ -88,14 +91,15 @@ def main() -> None:
     for step in range(args.steps):
         t0 = time.time()
         sampler = tc.save_weights_and_get_sampling_client()
-        samples = sampler.sample(
-            prompt=prompt, num_samples=args.num_samples,
-            sampling_params=t.SamplingParams(max_tokens=args.max_tokens, temperature=0.7),
-        ).result()
-        assert len(samples.sequences) == args.num_samples, \
-            f"expected {args.num_samples} samples, got {len(samples.sequences)}"
-
-        batch = [_build_datum(prompt_ids, s, args.max_response_length) for s in samples.sequences]
+        keep = []
+        while len(keep) < args.num_samples:
+            need = args.num_samples - len(keep)
+            samples = sampler.sample(
+                prompt=prompt, num_samples=need,
+                sampling_params=t.SamplingParams(max_tokens=args.max_tokens, temperature=0.7),
+            ).result()
+            keep.extend(s for s in samples.sequences if len(s.tokens) > 0)
+        batch = [_build_datum(prompt_ids, s, args.max_response_length) for s in keep]
 
         fbwd = tc.forward_backward(
             data=batch, loss_fn="ppo",
@@ -104,8 +108,8 @@ def main() -> None:
         tc.optim_step(t.AdamParams(learning_rate=1e-6)).result()
 
         loss = fbwd.metrics.get("loss:mean", float("nan"))
-        stop_rate = sum(1 for s in samples.sequences if s.stop_reason == "stop") / len(samples.sequences)
-        preview = tokenizer.decode(samples.sequences[0].tokens[:16])
+        stop_rate = sum(1 for s in keep if s.stop_reason == "stop") / len(keep)
+        preview = tokenizer.decode(keep[0].tokens[:16])
         print(f"[step {step}] loss:mean={loss:.4f} stop_rate={stop_rate:.2f} "
               f"first_preview={preview!r} dt={time.time() - t0:.2f}s")
 

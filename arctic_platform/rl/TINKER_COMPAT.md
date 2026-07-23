@@ -295,62 +295,90 @@ provision → bind flow.
 
 ## E2E validation
 
-**Arctic smoke** (`arctic_platform/rl/examples/tinker_smoke.py`, GPU): boot
-the server (native flags), run `recipes/rl/tinker/serve.sh` to provision +
-bind, then run the smoke script — it uses the real upstream
-`tinker.ServiceClient` to run 5 RL steps
-(`save_weights_and_get_sampling_client` → `sample` → `forward_backward(loss_fn="ppo")` →
-`optim_step`) and asserts non-empty `loss_fn_outputs` + expected sample counts.
+### GRPO convergence — SkyRL-tx's canonical CI recipe
 
-**SkyRL-tx cookbook `rl_loop.py`** (external client, GPU): the
-[tinker-cookbook `recipes.rl_loop`](https://github.com/thinking-machines-lab/tinker-cookbook)
-example (advertised by the [SkyRL-tx README](https://github.com/NovaSky-AI/SkyRL/tree/main/skyrl-tx)
-as the reference RL recipe) drives our server unchanged:
+The single strongest parity claim: SkyRL-tx's own GPU-CI GRPO test
+([`SkyRL/tests/train/gpu_e2e_test/gsm8k_tinker.sh`](https://github.com/NovaSky-AI/SkyRL/blob/main/tests/train/gpu_e2e_test/gsm8k_tinker.sh))
+drives a running Tinker server with Thinking Machines' upstream
+[`tinker_cookbook.recipes.math_rl.train`](https://github.com/thinking-machines-lab/tinker-cookbook)
+recipe — group-relative advantages, no critic — and passes if reward
+climbs above a floor. We swap SkyRL-tx's server for Arctic and get the
+same shape:
 
 ```bash
 python -m arctic_platform.rl.http_server \
-    --host 0.0.0.0 --port 7000 \
-    --training-gpus 1 --sampling-gpus 1 --colocate
+    --host 0.0.0.0 --port 7000 --training-gpus 1 --sampling-gpus 1 --colocate
 
-MODEL=Qwen/Qwen3-1.7B MAX_PROMPT=1024 MAX_RESPONSE=512 \
-    recipes/rl/tinker/serve.sh
-
-TINKER_API_KEY=tml-dummy python -m tinker_cookbook.recipes.rl_loop \
-    base_url=http://localhost:7000 model_name=Qwen/Qwen3-1.7B lora_rank=0 \
-    batch_size=2 group_size=4 max_steps=5 max_tokens=32 \
-    save_every=0 learning_rate=1e-6
+URL=http://localhost:7000 MODEL=Qwen/Qwen3-0.6B \
+ENV=arithmetic GROUP_SIZE=4 GROUPS_PER_BATCH=8 MAX_TOKENS=64 MAX_STEPS=20 LR=1e-5 \
+    recipes/rl/tinker/grpo_e2e.sh
 ```
 
-Result (from `metrics.jsonl`, 5 steps, gsm8k prompts, stochastic reward stub):
+Convergence (20 GRPO steps, 8 prompts × 4 rollouts per step, 1+1 GPU):
 
-| step | reward/total | grad_norm:mean | time/total (s) |
-| ---: | ---: | ---: | ---: |
-| 0 | 0.25  | 2.92 | 1.50 |
-| 1 | 0.25  | 1.93 | 0.57 |
-| 2 | 0.125 | 3.49 | 0.48 |
-| 3 | 0.125 | 3.71 | 0.45 |
-| 4 | 0.375 | 3.06 | 0.55 |
+![GRPO convergence via Arctic Tinker layer](../../docs/images/tinker_grpo_convergence.png)
 
-The cookbook prints `"Training completed"` and writes a final checkpoint
-(sampler snapshot + `save_state` ack). All four RL wire verbs plus
-`retrieve_future` are exercised each step.
+Reward per step: `-0.07, -0.01, -0.04, 0.03, 0.18, 0.24, 0.46, 0.24, 0.18, 0.24, 0.25, 0.03, 0.13, 0.09, 0.32, 0.49, 0.58, 0.61, 0.97, 0.68`
+
+Reward climbs from ~0 to a peak of 0.97 — same qualitative shape as
+SkyRL-tx's own CI run on the same recipe. Training exits with
+`Training completed successfully`; final checkpoint (`state_path`,
+`sampler_path`) is written via `save_state` / `save_weights_for_sampler`.
+
+### SkyRL-tx integration tests, ported
+
+`tests/tinker_layer/test_skyrl_tx_parity.py` runs the tests from
+[`SkyRL/tests/tinker/test_api.py`](https://github.com/NovaSky-AI/SkyRL/blob/main/tests/tinker/test_api.py)
+against Arctic through the real upstream `tinker` Python SDK. The
+`arctic_server` fixture spawns `http_server`, drives `serve.sh` to
+provision + bind, then yields the base URL:
+
+| SkyRL-tx test | Status | Assertion |
+| --- | --- | --- |
+| `test_capabilities`                | pass | bound model appears in `get_server_capabilities` |
+| `test_training_workflow_core`      | pass | `forward_backward` → `optim_step` round-trip, `loss_fn_outputs` shape matches per-Datum |
+| `test_sample_base_model`           | pass | `SamplingParams` respects `max_tokens` / `num_samples` |
+| `test_sample_top_k`                | pass | `top_k=1` deterministic, `top_k=-1` diverse |
+| `test_sample_num_samples_diversity`| pass | `num_samples=k` with fixed seed → k diverse-but-reproducible sequences |
+
+```
+$ pytest tests/tinker_layer/test_skyrl_tx_parity.py -m gpu -v
+5 passed in 65.83s
+```
+
+Edits from upstream:
+
+- `LORA_RANK = 0` (v1 uses `LoraConfig(rank=0)` for full-weight training; `rank>0` → HTTP 400 in `/create_model`).
+- `test_training_workflow_core` uses `importance_sampling` instead of `cross_entropy` (v1's supported-loss set is `{ppo, importance_sampling}`; SFT-style CE lives outside RL scope) and drops REST-only checkpoint-listing extras (`list_checkpoints`, `list_training_runs`).
+- `test_sample_base_model` runs the base-model branch only (LoRA is E1).
+
+### Arctic smoke
+
+`arctic_platform/rl/examples/tinker_smoke.py` is a minimal 5-step
+`sample → forward_backward → optim_step` loop against a running server;
+useful as a first-signal probe before pointing the cookbook at Arctic.
 
 ## Tests
 
-`tests/tinker_layer/` runs on any CPU-only box (no torch / vLLM / DeepSpeed):
+`tests/tinker_layer/` — CPU-only unit suite (no torch / vLLM / DeepSpeed):
 
 ```
 tests/tinker_layer/
-  test_wire_schema.py      # our Pydantic models track upstream tinker
-  test_adapters.py         # datum→batch (ZoRRo padding), loss_fn_config
-                           # → actor_config, AdamParams / SamplingParams
-  test_tinker_router.py    # in-process httpx round-trip per route
-  test_rl_loop.py          # real tinker.ServiceClient acceptance loop
+  test_wire_schema.py       # Pydantic models track upstream tinker
+  test_adapters.py          # datum→batch (ZoRRo padding), loss_fn_config
+                            # → actor_config, AdamParams / SamplingParams
+  test_tinker_router.py     # in-process httpx round-trip per route
+  test_tinker_bind.py       # POST /tinker/bind: verifies job IDs + wiring
+  test_rl_loop.py           # real tinker.ServiceClient acceptance loop
+  test_skyrl_tx_parity.py   # GPU parity tests ported from SkyRL-tx (marked)
 ```
 
 ```
-$ python -m pytest tests/tinker_layer/ -q
-76 passed in 3.23s
+$ python -m pytest tests/tinker_layer/ -m 'not gpu' -q
+80 passed in 9.17s
+
+$ python -m pytest tests/tinker_layer/ -m gpu -v
+5 passed in 65.83s   # GPU-required; boots real server + Ray + vLLM
 ```
 
 ## Design notes (resolved during the schema spike)
