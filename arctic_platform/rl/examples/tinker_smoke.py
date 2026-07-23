@@ -15,20 +15,20 @@
 
 """End-to-end smoke test for the Arctic Tinker HTTP layer.
 
-Assumes the server was launched with ``--base-model`` so training + sampling
-jobs are already provisioned and the Tinker layer is bound at
-``/api/v1/*``. Everything below is pure upstream ``tinker`` SDK.
+Boot the Arctic server (native flags), then provision + bind Tinker via
+``recipes/rl/tinker/serve.sh``. Everything below is pure upstream
+``tinker`` SDK.
 
 Usage::
 
     # terminal 1
     python -m arctic_platform.rl.http_server \
         --host 0.0.0.0 --port 7000 \
-        --training-gpus 1 --sampling-gpus 1 --colocate \
-        --base-model Qwen/Qwen3-0.6B \
-        --tinker-max-prompt-length 512 --tinker-max-response-length 128
+        --training-gpus 1 --sampling-gpus 1 --colocate
 
     # terminal 2
+    MODEL=Qwen/Qwen3-0.6B MAX_PROMPT=512 MAX_RESPONSE=128 \
+        recipes/rl/tinker/serve.sh
     python -m arctic_platform.rl.examples.tinker_smoke \
         --url http://localhost:7000 --base-model Qwen/Qwen3-0.6B --steps 5
 """
@@ -71,7 +71,7 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--prompt", default="Q: what is 2+2?\nA:")
     p.add_argument("--max-response-length", type=int, default=128,
-                   help="Must match the server's --tinker-max-response-length.")
+                   help="Must match MAX_RESPONSE used at /tinker/bind.")
     args = p.parse_args()
 
     os.environ["TINKER_BASE_URL"] = args.url

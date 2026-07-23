@@ -211,7 +211,7 @@ Files touched at v1 completion (see `git diff main...HEAD`):
 | File | Change |
 | :--- | :--- |
 | `arctic_platform/rl/deepspeed_worker.py` | `step()` gains `optim_overrides: dict \| None` (per-call Adam knobs from `AdamParams`). |
-| `arctic_platform/rl/http_server.py` | `/step` accepts `StepRequest.optim_overrides`. `--base-model` + `--tinker-max-prompt-length` + `--tinker-max-response-length` provision the training/sampling jobs and bind `init_tinker_state` at startup so an out-of-the-box `tinker.ServiceClient()` works with no prior `/initialize`. |
+| `arctic_platform/rl/http_server.py` | `/step` accepts `StepRequest.optim_overrides`. New `POST /tinker/bind` endpoint wires two existing Arctic jobs (created via native `/initialize`) into the Tinker HTTP verbs on the same server. **No provisioning in the Tinker layer** — ZoRRo, ZeRO stage, offload, vLLM knobs, LR schedule are all set on the underlying jobs. |
 | `arctic_platform/rl/ray_server.py` | Mirror `optim_overrides` on the Ray transport. |
 | `arctic_platform/rl/utils/server_models.py` | `StepRequest.optim_overrides` field. |
 | `arctic_platform/rl/tinker_server.py` | **new** — Pydantic wire models, `Datum → Arctic batch` adapter, `AdamParams → optim overrides`, `SamplingParams → vLLM`, `loss_fn_config → actor_config`, weight-gen counter, in-memory future store, FastAPI router mounted at `/api/v1/`. |
@@ -285,15 +285,20 @@ Routes (all `POST /api/v1/<verb>`, all under `router`, wired via
   (stale `sampling_session_id` → 409).
 - Futures: `retrieve_future`.
 
-The router is initialised by `_boot_tinker_layer` in `http_server.py` when
-the server is started with `--base-model`
-(`python -m arctic_platform.rl.http_server --help`).
+The router is mounted eagerly at server start. In-process handlers are
+wired lazily via `POST /tinker/bind`, which takes an already-provisioned
+`training_job_id` + `sampling_job_id` (from Arctic's native `/initialize`).
+This keeps Tinker a pure adapter: every ArcticRL optimization (ZoRRo,
+ZeRO-3, offload, FCA, custom LR schedules) is available by turning it on
+at `/initialize` time. See `recipes/rl/tinker/serve.sh` for a reference
+provision → bind flow.
 
 ## E2E validation
 
-**Arctic smoke** (`arctic_platform/rl/examples/tinker_smoke.py`, GPU): boot the
-server with `--base-model Qwen/Qwen3-0.6B --colocate`, then run the smoke
-script — it uses the real upstream `tinker.ServiceClient` to run 5 RL steps
+**Arctic smoke** (`arctic_platform/rl/examples/tinker_smoke.py`, GPU): boot
+the server (native flags), run `recipes/rl/tinker/serve.sh` to provision +
+bind, then run the smoke script — it uses the real upstream
+`tinker.ServiceClient` to run 5 RL steps
 (`save_weights_and_get_sampling_client` → `sample` → `forward_backward(loss_fn="ppo")` →
 `optim_step`) and asserts non-empty `loss_fn_outputs` + expected sample counts.
 
@@ -305,9 +310,10 @@ as the reference RL recipe) drives our server unchanged:
 ```bash
 python -m arctic_platform.rl.http_server \
     --host 0.0.0.0 --port 7000 \
-    --training-gpus 1 --sampling-gpus 1 --colocate \
-    --base-model Qwen/Qwen3-1.7B \
-    --tinker-max-prompt-length 1024 --tinker-max-response-length 512
+    --training-gpus 1 --sampling-gpus 1 --colocate
+
+MODEL=Qwen/Qwen3-1.7B MAX_PROMPT=1024 MAX_RESPONSE=512 \
+    recipes/rl/tinker/serve.sh
 
 TINKER_API_KEY=tml-dummy python -m tinker_cookbook.recipes.rl_loop \
     base_url=http://localhost:7000 model_name=Qwen/Qwen3-1.7B lora_rank=0 \
