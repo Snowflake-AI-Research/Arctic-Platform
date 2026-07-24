@@ -51,11 +51,18 @@ class JobHandles:
 
 @dataclass
 class Request:
-    """A canonical op call, built by the client — identical across backends."""
+    """A canonical op call, built by the client.
+
+    The client owns job identity (it holds `JobHandles` after `initialize`), so it
+    resolves and sets `job_id` here directly; `body` carries everything else. This
+    keeps transports as pure forwarders: on-prem hands `(job_id, body)` straight to
+    the server, `binary` just picks the body codec (octet tensors vs JSON).
+    """
 
     op: str                              # canonical op name, e.g. "fwd-bwd"
-    target: str                          # job type the op addresses
-    body: dict[str, Any] = field(default_factory=dict)  # user data only (no job ids)
+    job_id: JobId | None = None          # primary target id (client-resolved); None -> omit
+    body: dict[str, Any] = field(default_factory=dict)
+    binary: bool = False                 # body carries tensors -> octet, else JSON
 
 
 class Transport(ABC):

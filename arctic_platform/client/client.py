@@ -50,10 +50,10 @@ class ArcticRLClient:
         # into the body here, which is why callers can leave it inside `batch`.
         body = dict(batch)
         body.update({k: v for k, v in (("processing", processing), ("router_replay", router_replay)) if v is not None})
-        return self.transport.call(Request("fwd-bwd", "training", body))
+        return self.transport.call(Request("fwd-bwd", self.jobs.require("training"), body, binary=True))
 
     def fwd_no_grad(self, batch: dict) -> dict:
-        return self.transport.call(Request("fwd-no-grad", "training", dict(batch)))
+        return self.transport.call(Request("fwd-no-grad", self.jobs.require("training"), dict(batch), binary=True))
 
     def step(self, learning_rate: float | None = None) -> dict:
         # NOTE: response *shapes* also diverge across backends -- on-prem returns
@@ -62,29 +62,33 @@ class ArcticRLClient:
         # via graceful key lookups today.
         # TODO(unify-backends): converge the server-side fwd_bwd/step *responses*
         # on ONE schema (loss + metrics) so callers never key on backend.
-        return self.transport.call(Request("step", "training", {"learning_rate": learning_rate}))
+        return self.transport.call(Request("step", self.jobs.require("training"), {"learning_rate": learning_rate}))
 
     def save_checkpoint(self, stage_info: dict | None = None, path: str | None = None) -> dict:
-        return self.transport.call(Request("save-checkpoint", "training", {"stage_info": stage_info, "path": path}))
+        body = {"stage_info": stage_info, "path": path}
+        return self.transport.call(Request("save-checkpoint", self.jobs.require("training"), body))
 
     def save_weights(self, path: str) -> dict:
-        return self.transport.call(Request("save-weights", "sampling", {"checkpoint_path": path}))
+        return self.transport.call(Request("save-weights", self.jobs.require("sampling"), {"checkpoint_path": path}))
 
     # ── sampling / log-prob ──────────────────────────────────────────────
     def generate(self, prompts: list, sampling_params: dict | None = None, routing_key: Any = None) -> list:
         body = {"prompts": prompts, "sampling_params": sampling_params, "routing_key": routing_key}
-        return self.transport.call(Request("generate", "sampling", body))["results"]
+        return self.transport.call(Request("generate", self.jobs.require("sampling"), body))["results"]
 
     def log_probs(self, prompts: list, completions: list | None = None, top_k: int = 1) -> dict:
         body = {"prompts": prompts, "completions": completions, "top_k": top_k}
-        return self.transport.call(Request("log-probs", "log_prob", body))
+        return self.transport.call(Request("log-probs", self.jobs.require("log_prob"), body))
 
     # ── weight sync + cache ──────────────────────────────────────────────
     def sync_weights(self) -> dict:
-        return self.transport.call(Request("sync-weights", "training"))
+        # sync-weights has no primary job id; both ids travel in the body.
+        tid, sid = self.jobs.require("training"), self.jobs.require("sampling")
+        return self.transport.call(Request("sync-weights", None, {"training_job_id": tid, "sampling_job_id": sid}))
 
     def reset_prefix_cache(self, drain: bool = True, timeout_s: float = 60.0) -> dict:
-        return self.transport.call(Request("reset-prefix-cache", "sampling", {"drain": drain, "timeout_s": timeout_s}))
+        body = {"drain": drain, "timeout_s": timeout_s}
+        return self.transport.call(Request("reset-prefix-cache", self.jobs.require("sampling"), body))
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def reconnect_config(self) -> ArcticRLClientConfig:

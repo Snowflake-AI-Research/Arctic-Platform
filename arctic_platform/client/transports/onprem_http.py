@@ -10,6 +10,7 @@ from typing import Any
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import JOB_TYPES
+from arctic_platform.client.transport import Request
 from arctic_platform.client.transports.onprem import OnPremTransport
 
 
@@ -49,16 +50,17 @@ class HttpTransport(OnPremTransport):
         resp.raise_for_status()
         return resp.json()["job_id"]
 
-    def _rpc(self, op: str, job_id: JobId, body: dict) -> dict:
-        resp = self.session.post(
-            f"{self.base_url}/{op}",
-            params={"job_id": job_id},
-            data=_dumps(body),
-            headers={"Content-Type": "application/octet-stream"},
+    def _rpc(self, request: Request) -> dict:
+        # Tensor-bearing ops send an octet torch payload; the rest send JSON.
+        payload = (
+            {"data": _dumps(request.body), "headers": {"Content-Type": "application/octet-stream"}}
+            if request.binary
+            else {"json": request.body}
         )
+        params = {} if request.job_id is None else {"job_id": request.job_id}
+        resp = self.session.post(f"{self.base_url}/{request.op}", params=params, **payload)
         resp.raise_for_status()
-        # Tensor-bearing ops (fwd-bwd/fwd-no-grad) reply with torch-pickled bytes;
-        # everything else (step, sync-weights, ...) replies with JSON.
+        # Tensor-bearing responses come back as octet; everything else is JSON.
         if "application/octet-stream" in resp.headers.get("Content-Type", ""):
             return _loads(resp.content)
         return resp.json()

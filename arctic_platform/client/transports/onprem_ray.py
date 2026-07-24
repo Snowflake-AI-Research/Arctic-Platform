@@ -6,37 +6,18 @@ from __future__ import annotations
 
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.config import JobId
+from arctic_platform.client.transport import Request
 from arctic_platform.client.transports.onprem import OnPremTransport
 
 
 class RayTransport(OnPremTransport):
     """In-process Ray actor calls — no HTTP, no serialization.
 
-    Prototype: only the ops the on-prem example exercises are wired
-    (initialize / fwd-bwd / step / destroy). The real server splits into a
-    ``state`` actor (job creation) and an ``ArcticRLRayServer`` wrapper (typed
-    async ops) that snapshots workers at construction, so the wrapper is built
-    lazily after jobs are initialized.
+    The server splits into a ``state`` actor (job creation) and an
+    ``ArcticRLRayServer`` wrapper (typed async ops) that snapshots workers at
+    construction, so the wrapper is built lazily after jobs are initialized.
 
-    ============================ TODO: ALIGN TRANSPORTS ============================
-    The whole point of this unified client is that the transport is a DUMB
-    forwarder: the client emits one canonical Request(op, target, body) and the
-    transport hands (op, job_id, body) straight to the matching server method
-    with NO per-op arg/data rewiring. HttpTransport achieves this because the
-    HTTP server exposes a uniform POST /{op}?job_id=<id> surface. This Ray path
-    does NOT: ArcticRLRayServer is a bag of typed async methods with per-op
-    signatures (fwd_bwd(job_id, batch), step(job_id), sync_weights(request), ...),
-    so we are forced into the op-by-op if/else in `_rpc` below.
-
-    GOAL: make every backend (ray-onprem, http-onprem, cortex) accept the exact
-    same args/kwargs per op so no transport has to rewire anything. Align this
-    to CORTEX's contract EXACTLY (see transports/cortex.py) — treat it as the
-    source of truth for each op's arg/kwarg shape. The right fix lives server-side:
-    give ArcticRLRayServer a single uniform entrypoint (e.g.
-    `async def call(op, job_id, body)`) mirroring the HTTP /{op} surface, so this
-    `_rpc` collapses back to a one-liner and the per-op arg binding lives once on
-    the server instead of being duplicated into each transport.
-    ==============================================================================
+    `_rpc` resolves ``op -> method`` and forwards the request unchanged.
     """
 
     def __init__(self, config: ArcticRLClientConfig) -> None:
@@ -63,16 +44,13 @@ class RayTransport(OnPremTransport):
 
         self._server = ArcticRLRayServer(self._state)
 
-    def _rpc(self, op: str, job_id: JobId, body: dict) -> dict:
+    def _rpc(self, request: Request) -> dict:
         import asyncio
 
-        if op == "fwd-bwd":
-            coro = self._server.fwd_bwd(job_id, body)
-        elif op == "step":
-            coro = self._server.step(job_id)
-        else:
-            raise NotImplementedError(f"RayTransport (prototype) does not wire op {op!r}")
-        return asyncio.run(coro)
+        # Pass job_id only when set (some ops, e.g. sync-weights, omit it), then the body.
+        method = getattr(self._server, request.op.replace("-", "_"))
+        args = (request.body,) if request.job_id is None else (request.job_id, request.body)
+        return asyncio.run(method(*args))
 
     def _destroy(self, job_id: JobId, job_type: str) -> None:
         import asyncio

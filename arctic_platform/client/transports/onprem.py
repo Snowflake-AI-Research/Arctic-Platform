@@ -44,10 +44,8 @@ class OnPremTransport(Transport):
         return self.jobs
 
     def call(self, request: Request) -> dict:
-        body = dict(request.body)
-        if request.op == "sync-weights":  # the one op needing a second job's id
-            body["sampling_job_id"] = self.jobs.require("sampling")
-        return self._rpc(request.op, self.jobs.require(request.target), body)
+        # The client already resolved the job id onto the request; just deliver it.
+        return self._rpc(request)
 
     def shutdown(self) -> None:
         for job_type in JOB_TYPES:
@@ -74,7 +72,7 @@ class OnPremTransport(Transport):
     @abstractmethod
     def _start(self, payload: dict) -> JobId: ...
     @abstractmethod
-    def _rpc(self, op: str, job_id: JobId, body: dict) -> dict: ...
+    def _rpc(self, request: Request) -> dict: ...
     @abstractmethod
     def _destroy(self, job_id: JobId, job_type: str) -> None: ...
     @abstractmethod

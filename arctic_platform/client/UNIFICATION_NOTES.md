@@ -2,7 +2,9 @@
 
 Goal: one `ArcticRLClient` frontend where **every backend accepts identical
 per-op args/kwargs and returns identically-shaped responses**, so each transport
-is a dumb forwarder of `Request(op, target, body)` with no per-op rewiring.
+is a dumb forwarder of `Request(op, job_id, body)` with no per-op rewiring. The
+on-prem transports (HTTP + Ray) already meet this bar; Cortex does not yet (see
+"Cortex transport" below).
 
 This package is the target design. These notes track what still diverges in the
 three existing clients so the remaining convergence work is explicit. Most of the
@@ -75,9 +77,9 @@ servers accept the same contract.
 - Large colocation surface with no cortex/dss twin: `sleep_/wake_inference`,
   `sleep_/wake_training`, `sleep_/wake_log_prob`, `empty_training_cache`,
   `weight_norm`.
-- Ray path: `ArcticRLRayServer` exposes per-op typed async methods, forcing
-  op-by-op binding (see `RayTransport._rpc`) instead of a uniform
-  `call(op, job_id, body)`.
+- Ray path: `ArcticRLRayServer` methods take a uniform `(job_id, body)` shape
+  matching the HTTP `POST /{op}` surface, so `RayTransport._rpc` forwards
+  `(job_id, body)` with no per-op binding.
 
 ## Server-side blockers (cannot be fixed in the client)
 - **fwd_bwd batch contract**: cortex expects RPC-style `{args, kwargs}` tokenized
@@ -86,9 +88,6 @@ servers accept the same contract.
   `{metrics: {grad_norm, ...}}` (scalars sometimes per-DP-rank lists).
 - **One wire codec** (DSSST1 safetensors) across all servers so transports share
   serialization.
-- **Uniform Ray entrypoint**: give `ArcticRLRayServer` a single
-  `call(op, job_id, body)` mirroring the HTTP `POST /{op}` surface so
-  `RayTransport._rpc` collapses to a one-liner.
 - **Sync vs async**: pick one convention for the frontend.
 
 ## Sharing already in place (this package)
@@ -98,6 +97,15 @@ servers accept the same contract.
   on-prem job initialization.
 - Cortex and on-prem no longer hand-roll GPU-gating / creation order separately.
 
-Cortex still shares only the ABC + `wire` codec with on-prem because its async
-submit→poll model has no counterpart in on-prem's synchronous request/response;
-that only merges once the servers converge on the blockers above.
+## Cortex transport: the remaining non-trivial forwarder
+`CortexTransport` is the one transport that still does per-op translation: each
+op has a handler mapping the canonical `body` to a SnowAPI call (path, wire
+framing, sub-job routing, submit→poll). It shares only the `Transport` ABC and
+the `wire` codec with on-prem, because Cortex's async submit→poll model has no
+counterpart in on-prem's synchronous request/response.
+
+The eventual goal is to unify the Cortex and on-prem **server** APIs (op names,
+argument shapes, response schemas) so `CortexTransport` can collapse to the same
+dumb `_rpc(request)` as the on-prem transports — forwarding just `(job_id, body)`
+with no per-method translation. Until the servers converge on the blockers above,
+Cortex keeps its per-op handlers.
