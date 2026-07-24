@@ -435,6 +435,64 @@ $ python -m pytest tests/tinker_layer/ -m gpu -v
    `tinker_router` is importable in a CPU-only env for the test suite (eager
    imports of `deepspeed_worker` pull in torch and break collection).
 
+## Resume checklist (picking this up on a fresh shell)
+
+**Environment**
+
+- Conda env: `/data-fast/karthik/conda_envs/tinker_dev` (Python 3.12; torch, DS, vLLM, upstream `tinker` SDK, `httpx`, `fastapi` all pinned).
+- Tinker-cookbook: `/data-fast/karthik/tinker-work/tinker-cookbook-pinned`, checked out at `016468b0f2` (SkyRL-tx CI pin); installed editable.
+- Repo: `/modeling-code/karthik/abstract-remote-exps/Arctic-Platform`, branch `karthik/tinker-http-layer`.
+- Remote push over SSH-on-443: `git -c core.sshCommand="ssh -o Port=443 -o Hostname=ssh.github.com" push origin karthik/tinker-http-layer`.
+
+**Reproducible runs**
+
+Green 5-min smoke (small-batch GRPO, single-GPU colocated, converges to reward ~0.97):
+
+```bash
+# server
+python -m arctic_platform.rl.http_server \
+    --host 0.0.0.0 --port 7000 --training-gpus 1 --sampling-gpus 1 --colocate
+
+# driver (in another shell, same conda env)
+ENV=arithmetic GROUPS_PER_BATCH=8 MAX_TOKENS=64 MAX_STEPS=20 \
+    recipes/rl/tinker/grpo_e2e.sh
+```
+
+CI-scale attempt (reproduces the upstream SDK chunk-count client stall):
+
+```bash
+python -m arctic_platform.rl.http_server \
+    --host 0.0.0.0 --port 7000 --training-gpus 4 --sampling-gpus 4 --colocate
+
+# defaults mirror SkyRL/tests/train/gpu_e2e_test/gsm8k_tinker.sh
+recipes/rl/tinker/grpo_e2e.sh
+```
+
+**Test suites**
+
+```bash
+# CPU only, ~2 s, no torch / no vLLM / no DeepSpeed required
+python -m pytest tests/tinker_layer/ -m 'not gpu' -q
+
+# GPU parity (~65 s, boots real server + Ray + vLLM + DeepSpeed)
+python -m pytest tests/tinker_layer/ -m gpu -v
+```
+
+**Open threads**
+
+1. **DS boundary design** — reply pending from @tjruwase on
+   [PR #43 comment](https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/43#issuecomment-5065631533)
+   (whether the `deepspeed_worker` change should shrink / rename / move).
+2. **Upstream SDK chunk-count stall** — needs a repro on SkyRL-tx to confirm
+   it's not Arctic-specific, then a report against
+   [`thinking-machines-lab/tinker`](https://github.com/thinking-machines-lab/tinker).
+   Blocking claim of full CI-scale GSM8K parity.
+
+**Housekeeping**
+
+- Leftover Ray state from prior CI-scale attempts: `tmux kill-session -t arctic_server 2>/dev/null; ray stop --force`.
+- Hydra output dirs are gitignored (`/outputs/`, `arctic_platform/integrations/verl/outputs/`).
+
 ## Swapping Arctic in for SkyRL-tx
 
 `tinker_cookbook.recipes.math_rl.train` (and every other tinker-cookbook
