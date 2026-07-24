@@ -45,6 +45,7 @@ from fastapi import Body
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi import Response
+from pydantic import BaseModel
 from transformers import AutoTokenizer
 
 from arctic_platform.rl.deepspeed_worker import DeepSpeedWorker
@@ -59,9 +60,12 @@ from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.ray_pg import ColocatePlacement
 from arctic_platform.rl.utils.ray_pg import create_colocate_placement
 from arctic_platform.rl.utils.ray_pg import pg_scheduling_options
+from arctic_platform.rl.tinker_router import init_tinker_state
+from arctic_platform.rl.tinker_router import router as _tinker_router
 from arctic_platform.rl.utils.server_models import GenerateRequest
 from arctic_platform.rl.utils.server_models import JobConfig
 from arctic_platform.rl.utils.server_models import LogProbsRequest
+from arctic_platform.rl.utils.server_models import StepRequest
 from arctic_platform.rl.utils.server_models import SyncWeightsRequest
 from arctic_platform.rl.utils.server_models import WeightNormRequest
 from arctic_platform.rl.utils.server_models import build_model_config
@@ -69,6 +73,10 @@ from arctic_platform.rl.utils.server_models import build_model_config
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Arctic RL Local Server")
+# Tinker HTTP layer. Routes are mounted eagerly (small Pydantic-only cost);
+# in-process handlers are bound lazily in ``initialize`` once a training job
+# id is known. See ``tinker_router.init_tinker_state``.
+app.include_router(_tinker_router)
 
 # ---------------------------------------------------------------------------
 # Request / response models (mirrors dss-platform sftp_server)
@@ -370,13 +378,14 @@ async def fwd_bwd(
 
     tname = timers.start("xyz fwd_bwd: split_batch")
     shards, _ = http_split_batch(body, len(workers))
-    # The verl driver's ``update_actor`` only consumes ``metrics`` from the
-    # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
-    # ``batch`` (logprobs/entropy) is never read. Keep the worker output as
-    # tensors so ``run_pipeline`` skips the per-microbatch detensorize()
-    # ``.tolist()``, and omit ``batch`` from the response so it is never
-    # serialized over the wire.
-    shards[0]["meta"]["worker_return_tensors"] = True
+    # Verl's ``update_actor`` only consumes ``metrics`` from the fwd_bwd
+    # response, so by default we tell workers to keep tensors as-is and drop
+    # the per-token ``batch`` on the wire. The Tinker HTTP layer needs those
+    # per-token logprobs to satisfy ``ForwardBackwardOutput.loss_fn_outputs``
+    # -- it opts in via ``meta['return_per_token_logprobs']``.
+    return_logprobs = bool(shards[0]["meta"].get("return_per_token_logprobs", False))
+    if not return_logprobs:
+        shards[0]["meta"]["worker_return_tensors"] = True
     timers.stop_and_print_elapsed(tname)
 
     tname = timers.start("xyz fwd_bwd: gather + forward_backward")
@@ -390,13 +399,16 @@ async def fwd_bwd(
 
     # See ray_server.fwd_bwd for the rationale: collapse the per-DP-rank
     # paired ``.sum`` / ``.tokens`` metric scalars into one global
-    # token-mean scalar per metric per mini-batch. ``batch`` is intentionally
-    # omitted -- the driver does not consume it (see note above).
+    # token-mean scalar per metric per mini-batch.
     merged = dict(
         job_id=job_id,
         metrics=combine_metric_shards([r["metrics"] for r in results]),
         avg_loss=avg_loss,
     )
+    if return_logprobs:
+        batches = [r.get("batch") for r in results if r.get("batch")]
+        if batches:
+            merged["batch"] = merge_dict_shards(batches) if len(batches) > 1 else batches[0]
     timers.stop_and_print_elapsed(tname)
 
     timers.stop_and_print_elapsed(tname_e2e)
@@ -442,9 +454,12 @@ async def fwd_no_grad(
 
 
 @app.post("/step")
-async def step(job_id: int):
+async def step(job_id: int, request: StepRequest | None = Body(default=None)):
     _verify_job(job_id, "training")
-    results = await asyncio.gather(*[w.step.remote() for w in app.state.training_workers])
+    optim_overrides = request.optim_overrides if request is not None else None
+    results = await asyncio.gather(
+        *[w.step.remote(optim_overrides) for w in app.state.training_workers]
+    )
     merged = dict(
         job_id=job_id,
         metrics=merge_dict_shards([r["metrics"] for r in results]),
@@ -1004,6 +1019,134 @@ async def get_job_status(job_id: int):
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
+
+
+class TinkerBindRequest(BaseModel):
+    """Bind the Tinker HTTP surface onto two already-provisioned jobs.
+
+    Provisioning (ZoRRo, ZeRO stage, offload, vLLM knobs) is Arctic's
+    normal ``/initialize`` path; this endpoint is a pure adapter."""
+    training_job_id: int
+    sampling_job_id: int
+    base_model: str
+    max_prompt_length: int = 1024
+    max_response_length: int = 512
+
+
+@app.post("/tinker/bind")
+async def tinker_bind(request: TinkerBindRequest = Body(...)):
+    _verify_job(request.training_job_id, "training")
+    _verify_job(request.sampling_job_id, "sampling")
+    if getattr(app.state, "tinker_base_model", None) is not None:
+        raise HTTPException(409, "Tinker layer already bound")
+
+    tokenizer = AutoTokenizer.from_pretrained(request.base_model)
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    training_job_id = request.training_job_id
+    sampling_job_id = request.sampling_job_id
+
+    def _batch_np_to_torch(batch: dict) -> dict:
+        """Numpy → torch so Arctic's ``http_split_batch``
+        (``torch.load(weights_only=True)``) can round-trip the payload."""
+        import numpy as np
+        out = dict(batch)
+        b = dict(batch.get("batch", {}))
+        for k, v in b.items():
+            if isinstance(v, np.ndarray):
+                b[k] = torch.from_numpy(v)
+        out["batch"] = b
+        return out
+
+    async def _fwd_bwd_handler(batch: dict) -> dict:
+        buf = io.BytesIO()
+        torch.save(_batch_np_to_torch(batch), buf)
+        resp = await fwd_bwd(training_job_id, buf.getvalue())
+        return torch.load(io.BytesIO(resp.body), weights_only=False)
+
+    async def _fwd_no_grad_handler(batch: dict) -> dict:
+        buf = io.BytesIO()
+        torch.save(_batch_np_to_torch(batch), buf)
+        resp = await fwd_no_grad(training_job_id, buf.getvalue())
+        return torch.load(io.BytesIO(resp.body), weights_only=False)
+
+    async def _step_handler(overrides: dict | None) -> dict:
+        return await step(training_job_id, StepRequest(optim_overrides=overrides))
+
+    async def _sync_weights_handler() -> Any:
+        return await sync_weights(SyncWeightsRequest(
+            training_job_id=training_job_id,
+            sampling_job_id=sampling_job_id,
+            colocate=app.state.colocate,
+            cuda_ipc=app.state.colocate,
+        ))
+
+    async def _generate_handler(prompt_tokens: list[int], sampling_params: dict) -> dict:
+        # Fan the group into N single-sample calls. When the caller supplies a
+        # ``seed``, derive a per-index seed (``seed + i``) so ``num_samples>1``
+        # produces diverse-but-reproducible sequences — matching Tinker's
+        # contract (same base seed → same N samples; changing the seed changes
+        # them). vLLM's prefix cache still dedupes the shared prompt KV.
+        params = dict(sampling_params)
+        n = int(params.pop("n", 1))
+        base_seed = params.pop("seed", None)
+        pool: ReplicaPool = app.state.sampling_pool
+        if n == 1:
+            if base_seed is not None:
+                params["seed"] = int(base_seed)
+            results = await pool.generate([list(prompt_tokens)], params)
+        else:
+            async def _one(i: int) -> dict[str, Any]:
+                p = dict(params)
+                if base_seed is not None:
+                    p["seed"] = int(base_seed) + i
+                r = await pool.generate([list(prompt_tokens)], p)
+                return r[0]
+            results = await asyncio.gather(*[_one(i) for i in range(n)])
+        outputs: list[dict[str, Any]] = []
+        for res in results:
+            per_pos = res.get("logprobs")
+            flat_lp: list[float] | None = None
+            if per_pos is not None:
+                flat_lp = []
+                for tok, pos in zip(res.get("token_ids", []), per_pos):
+                    if not isinstance(pos, dict):
+                        continue
+                    entry = pos.get(tok, pos.get(str(tok)))
+                    if isinstance(entry, dict):
+                        flat_lp.append(float(entry.get("logprob", 0.0)))
+                    elif isinstance(entry, (int, float)):
+                        flat_lp.append(float(entry))
+            outputs.append({
+                "token_ids": list(res.get("token_ids", [])),
+                "logprobs": flat_lp,
+                "finish_reason": res.get("finish_reason", "length"),
+            })
+        return {"outputs": outputs}
+
+    init_tinker_state(
+        app,
+        base_model=request.base_model,
+        max_prompt_length=int(request.max_prompt_length),
+        max_response_length=int(request.max_response_length),
+        pad_token_id=int(pad_token_id),
+        fwd_bwd_handler=_fwd_bwd_handler,
+        fwd_no_grad_handler=_fwd_no_grad_handler,
+        step_handler=_step_handler,
+        sync_weights_handler=_sync_weights_handler,
+        generate_handler=_generate_handler,
+    )
+    logger.info(
+        "Tinker layer bound: training_job_id=%d sampling_job_id=%d base_model=%s",
+        training_job_id, sampling_job_id, request.base_model,
+    )
+    return {
+        "training_job_id": training_job_id,
+        "sampling_job_id": sampling_job_id,
+        "base_model": request.base_model,
+        "max_prompt_length": int(request.max_prompt_length),
+        "max_response_length": int(request.max_response_length),
+    }
 
 
 def main():

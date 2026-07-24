@@ -61,6 +61,13 @@ class SyncWeightsRequest(BaseModel):
     low_memory: bool = False
 
 
+class StepRequest(BaseModel):
+    # Per-call optimizer hyperparameter overrides threaded from the Tinker
+    # HTTP layer's ``optim_step`` verb. ``None`` preserves the legacy
+    # keep-existing-values behavior for the native Arctic /step callers.
+    optim_overrides: dict[str, Any] | None = None
+
+
 class WeightNormRequest(BaseModel):
     training_job_id: int
     sampling_job_id: int
