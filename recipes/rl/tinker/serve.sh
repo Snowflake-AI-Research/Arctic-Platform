@@ -33,9 +33,13 @@ set -euo pipefail
 : "${USE_LIGER:=0}"
 : "${GPU_MEMORY_UTIL:=0.6}"
 : "${CKPT_DIR:=/tmp/arctic_tinker_ckpt}"
+# Batch sizing (mirrors SkyRL-tx CI: micro=8 per GPU, effective 2048/step across 4 GPUs).
+: "${TRAIN_BATCH_SIZE:=}"           # If set, forwarded to DeepSpeed as-is.
+: "${MICRO_BATCH_PER_GPU:=1}"       # DeepSpeed ``train_micro_batch_size_per_gpu``.
 
 export URL MODEL MAX_PROMPT MAX_RESPONSE ZERO_STAGE LR ROLLOUT_N \
-       TEMPERATURE ZORRO_ENABLE USE_LIGER GPU_MEMORY_UTIL CKPT_DIR
+       TEMPERATURE ZORRO_ENABLE USE_LIGER GPU_MEMORY_UTIL CKPT_DIR \
+       TRAIN_BATCH_SIZE MICRO_BATCH_PER_GPU
 
 /usr/bin/env python3 - <<'PY'
 import json
@@ -53,6 +57,8 @@ ZORRO_ENABLE = bool(int(os.environ["ZORRO_ENABLE"]))
 USE_LIGER = bool(int(os.environ["USE_LIGER"]))
 GPU_MEMORY_UTIL = float(os.environ["GPU_MEMORY_UTIL"])
 CKPT_DIR = os.environ["CKPT_DIR"]
+MICRO_BATCH_PER_GPU = int(os.environ["MICRO_BATCH_PER_GPU"])
+TRAIN_BATCH_SIZE_ENV = os.environ.get("TRAIN_BATCH_SIZE") or ""
 
 
 def post(path: str, body: dict) -> dict:
@@ -72,6 +78,16 @@ def get(path: str) -> dict:
 
 
 training_gpus = int(get("/status")["training_gpus"])
+if TRAIN_BATCH_SIZE_ENV:
+    train_batch_size = int(TRAIN_BATCH_SIZE_ENV)
+    assert train_batch_size % (training_gpus * MICRO_BATCH_PER_GPU) == 0, (
+        f"TRAIN_BATCH_SIZE={train_batch_size} must be divisible by "
+        f"training_gpus={training_gpus} * MICRO_BATCH_PER_GPU={MICRO_BATCH_PER_GPU}"
+    )
+    grad_accum = train_batch_size // (training_gpus * MICRO_BATCH_PER_GPU)
+else:
+    train_batch_size = training_gpus * MICRO_BATCH_PER_GPU
+    grad_accum = 1
 
 ds_worker_config = dict(
     use_liger=USE_LIGER,
@@ -95,9 +111,9 @@ train = post("/initialize", {
     "job_type": "training",
     "model_name": MODEL,
     "ds_config": {
-        "train_micro_batch_size_per_gpu": 1,
-        "train_batch_size": training_gpus,
-        "gradient_accumulation_steps": 1,
+        "train_micro_batch_size_per_gpu": MICRO_BATCH_PER_GPU,
+        "train_batch_size": train_batch_size,
+        "gradient_accumulation_steps": grad_accum,
         "zero_optimization": {"stage": ZERO_STAGE},
         "bf16": {"enabled": True},
         "data_types": {"grad_accum_dtype": "bf16"},
@@ -110,7 +126,12 @@ train = post("/initialize", {
     },
     "checkpoint_path": CKPT_DIR,
 })
-print(f"[serve] training job={train['job_id']} zorro={ZORRO_ENABLE} zero={ZERO_STAGE}", flush=True)
+print(
+    f"[serve] training job={train['job_id']} zorro={ZORRO_ENABLE} zero={ZERO_STAGE} "
+    f"dp={training_gpus} micro={MICRO_BATCH_PER_GPU} train_batch={train_batch_size} "
+    f"grad_accum={grad_accum}",
+    flush=True,
+)
 
 sample = post("/initialize", {
     "job_type": "sampling",

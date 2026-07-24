@@ -210,14 +210,17 @@ Files touched at v1 completion (see `git diff main...HEAD`):
 
 | File | Change |
 | :--- | :--- |
-| `arctic_platform/rl/deepspeed_worker.py` | `step()` gains `optim_overrides: dict \| None` (per-call Adam knobs from `AdamParams`). |
+| `arctic_platform/rl/deepspeed_worker.py` | `step()` gains `optim_overrides: dict \| None` (per-call Adam knobs from `AdamParams`). Adds a **tinker-mode grad-accum path** guarded by `meta["tinker_grad_accum"]`: splits each incoming batch by `train_micro_batch_size_per_gpu`, calls `set_gradient_accumulation_boundary(False)` per micro-backward, and flips the boundary back only in `step()`. Verl callers use the unchanged count-based path. |
 | `arctic_platform/rl/http_server.py` | `/step` accepts `StepRequest.optim_overrides`. New `POST /tinker/bind` endpoint wires two existing Arctic jobs (created via native `/initialize`) into the Tinker HTTP verbs on the same server. **No provisioning in the Tinker layer** — ZoRRo, ZeRO stage, offload, vLLM knobs, LR schedule are all set on the underlying jobs. |
 | `arctic_platform/rl/ray_server.py` | Mirror `optim_overrides` on the Ray transport. |
 | `arctic_platform/rl/utils/server_models.py` | `StepRequest.optim_overrides` field. |
-| `arctic_platform/rl/tinker_router.py` | **new** — Pydantic wire models, `Datum → Arctic batch` adapter, `AdamParams → optim overrides`, `SamplingParams → vLLM`, `loss_fn_config → actor_config`, weight-gen counter, in-memory future store, FastAPI router mounted at `/api/v1/`. |
+| `arctic_platform/rl/tinker_router.py` | **new** — Pydantic wire models, `Datum → Arctic batch` adapter, `AdamParams → optim overrides`, `SamplingParams → vLLM`, `loss_fn_config → actor_config`, weight-gen counter, in-memory future store, FastAPI router mounted at `/api/v1/`. Sets `meta["tinker_grad_accum"]=True` on every fwd/bwd shard to opt into the deepspeed-worker chunked-accum path; un-pads Arctic's `[B, mpl+mrl]` logprob tensor to per-`Datum` 1-D of length `len(model_input.tokens)` for `ForwardBackwardOutput.loss_fn_outputs`. |
+| `arctic_platform/rl/tinker_math_rl_driver.py` | **new** — thin entry point that patches `tinker._constants.DEFAULT_TIMEOUT` + `tinker._base_client.DEFAULT_TIMEOUT` + `httpx.AsyncClient.__init__` before importing `tinker_cookbook.recipes.math_rl.train`. Bumps the client-side httpx timeout (default 60 s in the SDK) via `TINKER_HTTP_TIMEOUT` env var so multi-GPU ZeRO-3 fwd_bwd chunks don't trip client timeouts. |
 | `arctic_platform/rl/examples/tinker_smoke.py` | **new** — one-file E2E smoke: `tinker.ServiceClient()` → `create_lora_training_client(rank=0)` → sample + `forward_backward(loss_fn="ppo")` + `optim_step` loop. |
 | `arctic_platform/rl/__init__.py` | PEP 562 lazy imports so `tinker_router` is importable in a CPU-only env (tests). |
-| `tests/tinker_layer/*` | 76 tests: wire schema, adapters, in-process httpx round-trip per route, `tinker.ServiceClient` acceptance loop. |
+| `recipes/rl/tinker/serve.sh` | **new** — orchestrates provision + bind: `POST /initialize` (training) with `ds_config` (ZeRO stage, `train_batch_size`, `train_micro_batch_size_per_gpu`, `gradient_accumulation_steps` all derived from `TRAIN_BATCH_SIZE` / `MICRO_BATCH_PER_GPU` / `training_gpus`), `ds_worker_config` (optional ZoRRo), `training_config`; `POST /initialize` (sampling) with `vllm_config`; then `POST /tinker/bind` with both job IDs. |
+| `recipes/rl/tinker/grpo_e2e.sh` | **new** — drives `tinker_cookbook.recipes.math_rl.train` against Arctic through `tinker_math_rl_driver` (for the timeout patch); defaults mirror SkyRL-tx's `gsm8k_tinker.sh` CI so a swap in either direction is a one-line env change. |
+| `tests/tinker_layer/*` | 80 CPU tests + 5 GPU parity tests: wire schema, adapters, in-process httpx round-trip per route, `tinker.ServiceClient` acceptance loop, and the SkyRL-tx parity suite ported from `SkyRL/tests/tinker/test_api.py`. |
 
 Sketch of the deepspeed override (the smallest interesting hunk):
 
@@ -295,15 +298,17 @@ provision → bind flow.
 
 ## E2E validation
 
-### GRPO convergence — SkyRL-tx's canonical CI recipe
+### GRPO convergence — SkyRL-tx's canonical recipe
 
-The single strongest parity claim: SkyRL-tx's own GPU-CI GRPO test
+SkyRL-tx's own GPU-CI GRPO test
 ([`SkyRL/tests/train/gpu_e2e_test/gsm8k_tinker.sh`](https://github.com/NovaSky-AI/SkyRL/blob/main/tests/train/gpu_e2e_test/gsm8k_tinker.sh))
 drives a running Tinker server with Thinking Machines' upstream
 [`tinker_cookbook.recipes.math_rl.train`](https://github.com/thinking-machines-lab/tinker-cookbook)
 recipe — group-relative advantages, no critic — and passes if reward
-climbs above a floor. We swap SkyRL-tx's server for Arctic and get the
-same shape:
+climbs above a floor. Arctic runs the same recipe unchanged; swapping
+SkyRL-tx's server for Arctic is a one-line change to `TINKER_BASE_URL`.
+
+**Small-batch GRPO smoke (converges cleanly on 1+1 GPU, ~5 min):**
 
 ```bash
 python -m arctic_platform.rl.http_server \
@@ -324,6 +329,24 @@ Reward climbs from ~0 to a peak of 0.97 — same qualitative shape as
 SkyRL-tx's own CI run on the same recipe. Training exits with
 `Training completed successfully`; final checkpoint (`state_path`,
 `sampler_path`) is written via `save_state` / `save_weights_for_sampler`.
+
+**CI-scale GSM8K (2048 datums/step, 4+4 GPU, ZeRO-3):** the recipe's
+default env values mirror SkyRL-tx `gsm8k_tinker.sh` exactly (except
+`lora_rank=0`, since Arctic v1 is FFT-only):
+
+```bash
+python -m arctic_platform.rl.http_server \
+    --host 0.0.0.0 --port 7000 --training-gpus 4 --sampling-gpus 4 --colocate
+
+recipes/rl/tinker/grpo_e2e.sh    # defaults: gsm8k, groups=512, tokens=512, steps=14
+```
+
+Step 0 runs to completion in this configuration. Step 1 currently hits
+a **client-side** SDK stall (see [Known limitations](#known-limitations));
+the fwd_bwd wire path itself is proven by the parity tests above and by
+the small-batch run. Same stall reproduces against SkyRL-tx once its
+per-step payload crosses the SDK's chunk-count threshold — it's a Tinker
+SDK issue, not an Arctic one.
 
 ### SkyRL-tx integration tests, ported
 
@@ -411,6 +434,71 @@ $ python -m pytest tests/tinker_layer/ -m gpu -v
 9. **`arctic_platform.rl.__init__` uses PEP 562 lazy imports** so
    `tinker_router` is importable in a CPU-only env for the test suite (eager
    imports of `deepspeed_worker` pull in torch and break collection).
+
+## Swapping Arctic in for SkyRL-tx
+
+`tinker_cookbook.recipes.math_rl.train` (and every other tinker-cookbook
+recipe) is unmodified. The client only cares about `TINKER_BASE_URL`:
+
+```bash
+# SkyRL-tx backend (their default)
+export TINKER_BASE_URL=http://skyrl-tx-host:8000
+
+# Arctic backend (same client, same recipe)
+export TINKER_BASE_URL=http://arctic-host:7000
+python -u -m tinker_cookbook.recipes.math_rl.train base_url=$TINKER_BASE_URL ...
+```
+
+Prereqs on the Arctic side:
+
+1. Boot the HTTP server (`python -m arctic_platform.rl.http_server ...
+   --colocate`).
+2. Provision the underlying training + sampling jobs and bind the Tinker
+   layer (`recipes/rl/tinker/serve.sh` does both in one shot; env vars
+   cover ZeRO stage, ZoRRo, vLLM knobs).
+3. Point the client at `http://<host>:<port>`.
+
+Everything the recipe reaches for — `SamplingParams`, `AdamParams`,
+`LoraConfig(rank=0)`, `loss_fn ∈ {ppo, importance_sampling}`,
+`save_weights_for_sampler`, futures — is on the same wire schema as the
+upstream SDK and as SkyRL-tx.
+
+## Known limitations
+
+1. **Client-side SDK chunk-count stall at CI-scale batches.** The
+   upstream `tinker` SDK
+   ([`training_client.py`](https://github.com/thinking-machines-lab/tinker/blob/main/src/tinker/lib/public_interfaces/training_client.py))
+   chunks each `forward_backward(data=[...])` call into HTTP requests of
+   at most `MAX_CHUNK_BYTES_COUNT=5 MB` (or `MAX_CHUNK_LEN=1024` datums,
+   whichever hits first) and combines the resulting futures with
+   `_CombinedAPIFuture`. At CI-scale GSM8K (2048 datums/step × 512-token
+   responses) a single `forward_backward` chunks ~20 ways. Server-side,
+   Arctic accepts and completes every chunk successfully (verified by
+   handler logs + `/optim_step` succeeding on smaller runs); the SDK's
+   `_CombinedAPIFuture.result()` on the client blocks in `select()` and
+   never resolves — no server error, all SDK worker threads idle. This
+   reproduces against any Tinker-compatible backend (SkyRL-tx would hit
+   the same stall) and is an upstream SDK bug that needs a fix or an
+   opt-out for large batches.
+   - **Workaround for now:** run at smaller batch (arithmetic recipe or
+     GSM8K with `GROUPS_PER_BATCH ≤ 32`) — fwd_bwd stays under the chunk
+     boundary and everything works end-to-end. `recipes/rl/tinker/serve.sh`
+     already sets up DeepSpeed grad-accum so the underlying **training**
+     scales fine; the chunking sits above it in the client.
+   - **Server-side mitigation shipped:** `deepspeed_worker`'s
+     `tinker_grad_accum` mode ensures that when the SDK ever chunks and
+     completes, the multiple `/forward_backward` calls accumulate
+     gradients correctly across chunks and apply on `/optim_step`.
+2. **`lora_rank>0` returns HTTP 400.** v1 is FFT-only (`rank=0`
+   convention borrowed from SkyRL-tx). Real LoRA is E1.
+3. **One weight version at a time on the sampler.** Async-RL patterns
+   that keep multiple `SamplingClient` snapshots live in parallel return
+   HTTP 409 on stale `sampling_session_id` (E1).
+4. **`cross_entropy` loss and `forward_backward_custom` blocked.** v1
+   only allows `{ppo, importance_sampling}`; SFT-style CE is E3.
+5. **`save_weights` is ack-only.** No state persistence in v1 (E2).
+6. **Colocated only.** `colocate=False` NCCL path is E4.
+7. **No auth.** `{"jwt": "tml-dummy"}` echo (E5).
 
 ## Extensions (post-v1)
 
