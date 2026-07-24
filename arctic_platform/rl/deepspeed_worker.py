@@ -386,13 +386,27 @@ class DeepSpeedWorker:
         for k, v in batch_data.items():
             pr0(f"[DeepSpeedWorker] {tag}: {k=}: {v.shape=}")
 
-        grad_accum_steps = self.engine.gradient_accumulation_steps()
-        micro_batch_data = split_dict(batch_data, grad_accum_steps)
-        num_micro_batches = len(micro_batch_data)
+        # ``tinker_grad_accum``: the Tinker SDK chunks each logical fwd_bwd into
+        # multiple ~5 MB HTTP calls, so one ``/optim_step`` follows N variable-size
+        # ``/forward_backward`` calls. Split by ``train_micro_batch_size_per_gpu``
+        # and defer DS's boundary detection to ``step()``. Verl (single-call, full
+        # grad-accum cycle per fwd_bwd) uses the original path.
+        tinker_mode = bool(meta_data.get("tinker_grad_accum", False))
+        if tinker_mode:
+            micro_bs = self.engine.train_micro_batch_size_per_gpu()
+            batch_dim = next(iter(batch_data.values())).shape[0]
+            num_micro_batches = max(1, (batch_dim + micro_bs - 1) // micro_bs)
+            micro_batch_data = split_dict(batch_data, num_micro_batches)
+            if backward:
+                self._tinker_pending_boundary = True
+        else:
+            grad_accum_steps = self.engine.gradient_accumulation_steps()
+            micro_batch_data = split_dict(batch_data, grad_accum_steps)
+            num_micro_batches = len(micro_batch_data)
         pipeline_micro_batch_outputs = []
         return_tensors = meta_data.get("worker_return_tensors", False)
 
-        pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
+        pr0(f"mbs {len(micro_batch_data)=} tinker_mode={tinker_mode}")
 
         for i, micro_batch in enumerate(micro_batch_data):
 
@@ -420,6 +434,10 @@ class DeepSpeedWorker:
             if i == 0:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {meta_data.keys()=} {processing.keys()=}")
 
+            if tinker_mode and backward:
+                # Force DS to accumulate; ``step()`` flips this and applies optim.
+                self.engine.set_gradient_accumulation_boundary(False)
+
             micro_batch_output = run_pipeline(
                 self.engine,
                 args,
@@ -436,8 +454,9 @@ class DeepSpeedWorker:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {micro_batch_output.keys()=}")
             pipeline_micro_batch_outputs.append(micro_batch_output)
 
-            # DS requires matching steps for backward pass
-            if backward and i < num_micro_batches - 1:
+            # DS requires matching steps for backward pass (verl path only;
+            # tinker mode drives boundary manually via ``step()``).
+            if backward and not tinker_mode and i < num_micro_batches - 1:
                 self.engine.step()
 
         pipeline_outputs = dict()
@@ -502,6 +521,11 @@ class DeepSpeedWorker:
                     pg["eps"] = optim_overrides["eps"]
                 if "weight_decay" in optim_overrides:
                     pg["weight_decay"] = optim_overrides["weight_decay"]
+        # Tinker mode suppressed the boundary across fwd_bwd chunks; flip it back
+        # so this ``engine.step()`` applies the accumulated grad and zeros it.
+        if getattr(self, "_tinker_pending_boundary", False):
+            self.engine.set_gradient_accumulation_boundary(True)
+            self._tinker_pending_boundary = False
         self.engine.step()
         # Pull grad_norm out of DeepSpeed so it can be logged by the trainer.
         # rename_dict in ray_trainer turns "grad_norm" -> "actor/grad_norm",

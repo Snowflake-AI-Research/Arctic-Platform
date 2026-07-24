@@ -466,7 +466,7 @@ def datum_list_to_arctic_batch(
     max_response_length: int,
     pad_token_id: int,
     forward_only: bool = False,
-) -> tuple[dict, list[tuple[int, int]]]:
+) -> tuple[dict, list[tuple[int, int, int]]]:
     """Pack a list of Tinker ``Datum`` into an Arctic ``fwd_bwd`` batch dict.
 
     Layout mirrors ``arctic_platform/integrations/verl/adapter.py``:
@@ -514,7 +514,7 @@ def datum_list_to_arctic_batch(
     response_mask = np.zeros((batch_size, total_len), dtype=np.int64)
     advantages = np.zeros((batch_size, total_len), dtype=np.float32)
     old_log_probs = np.zeros((batch_size, total_len), dtype=np.float32)
-    row_slices: list[tuple[int, int]] = []
+    row_slices: list[tuple[int, int, int]] = []
 
     for i, datum in enumerate(data):
         toks = _model_input_to_tokens(datum.model_input)
@@ -541,7 +541,10 @@ def datum_list_to_arctic_batch(
         input_ids[i, mpl - p_len: mpl] = np.asarray(prompt_toks, dtype=np.int64)
         input_ids[i, mpl: mpl + r_len] = np.asarray(resp_toks, dtype=np.int64)
         attention_mask[i, mpl - p_len: mpl + r_len] = 1
-        row_slices.append((mpl - p_len, mpl + r_len))
+        # (padded start, padded end, tinker-expected len). The third
+        # element pins the on-wire length so ``_unpad_logprobs_to_loss_fn_outputs``
+        # can pad/truncate deterministically when mpl/mrl truncation kicks in.
+        row_slices.append((mpl - p_len, mpl + r_len, len(toks)))
 
         # Advantages / logprobs on the Tinker wire are positional over the
         # full ``toks`` array; slice out the response tail and place it in
@@ -580,10 +583,12 @@ def datum_list_to_arctic_batch(
             "pad_token_id": int(pad_token_id),
             "drop_position_ids": True,
             "forward_only": bool(forward_only),
-            # Tinker's ``ForwardBackwardOutput.loss_fn_outputs`` per Datum is
-            # expected to carry per-token training-time ``logprobs`` (used by
-            # tinker-cookbook to compute KL, GRPO advantages, etc.). Ask
-            # Arctic to keep them in the response.
+            # Tinker's SDK chunks big fwd_bwd into ~5 MB HTTP calls
+            # (``MAX_CHUNK_BYTES_COUNT``); accumulate across chunks and let
+            # ``/optim_step`` apply. See ``deepspeed_worker._forward_maybe_backward``.
+            "tinker_grad_accum": True,
+            # Populate ``ForwardBackwardOutput.loss_fn_outputs[i].logprobs`` (used
+            # by tinker-cookbook for KL / IS ratio); verl doesn't need it.
             "return_per_token_logprobs": not forward_only,
             # verl_grpo_loss reads these three keys unconditionally. We're
             # single-worker (training-gpus=1) at v1; multi-DP will need
@@ -607,24 +612,35 @@ def datum_list_to_arctic_batch(
 
 
 def _unpad_logprobs_to_loss_fn_outputs(
-    logprobs_batch: Any, row_slices: list[tuple[int, int]]
+    logprobs_batch: Any, row_slices: list[tuple[int, int, int]]
 ) -> list[dict[str, Any]]:
-    """Convert Arctic's padded ``[batch, max_prompt + max_response]`` logprob
-    tensor into per-Datum ``LossFnOutput`` dicts, un-padded to each Datum's
-    original ``model_input`` length via ``row_slices``.
+    """Un-pad Arctic's logprob tensor into per-Datum ``LossFnOutput`` dicts
+    of exactly ``model_input_len`` each.
 
-    Tinker's contract: ``loss_fn_outputs[i]["logprobs"]`` is a 1-D tensor
-    whose length equals ``len(data[i].model_input.tokens)``. Arctic
-    computes logprobs on the full padded layout for compute-graph reasons,
-    so we slice back to the un-padded span here.
+    Tinker's contract: ``loss_fn_outputs[i]["logprobs"]`` is 1-D with length
+    ``len(data[i].model_input.tokens)`` -- the upstream cookbook indexes it
+    with a per-Datum mask of that length. Arctic returns logprobs in the
+    padded compute layout (``[B, mpl+mrl]`` for the 2-D case, packed 1-D
+    otherwise); slice via ``row_slices`` and pad/truncate the tail so the
+    shape invariant always holds. Masked-out positions carry no signal.
     """
     arr = np.asarray(logprobs_batch, dtype=np.float32)
     outputs: list[dict[str, Any]] = []
-    for i, (start, end) in enumerate(row_slices):
-        row = arr[i, start:end] if arr.ndim == 2 else arr[start:end]
+    flat_offset = 0
+    for i, (start, end, expected_len) in enumerate(row_slices):
+        if arr.ndim == 2 and i < arr.shape[0]:
+            row = arr[i, start:end]
+        else:
+            take = end - start
+            row = arr.reshape(-1)[flat_offset: flat_offset + take]
+            flat_offset += take
+        if row.shape[0] < expected_len:
+            row = np.pad(row, (0, expected_len - row.shape[0]))
+        elif row.shape[0] > expected_len:
+            row = row[:expected_len]
         outputs.append({
             "logprobs": TensorData(dtype="float32", data=row.tolist(),
-                                   shape=list(row.shape)).model_dump()
+                                   shape=[int(expected_len)]).model_dump()
         })
     return outputs
 
