@@ -1,0 +1,227 @@
+#!/usr/bin/env python
+"""Unified training example across all three backends.
+
+    python arctic_platform/client/examples/train_example.py --backend onprem-http
+    python arctic_platform/client/examples/train_example.py --backend onprem-ray
+    python arctic_platform/client/examples/train_example.py --backend cortex
+
+Every backend follows the *same* pathway: build config -> ArcticRLClient ->
+loop(fwd_bwd + step) -> shutdown, with a single unified fwd_bwd/step/report.
+The client + transports hide all wire/protocol differences.
+
+The ONLY backend-specific bit left is the fwd_bwd `batch` content (plus the
+connection config), because the backends' servers still accept different data
+contracts (Cortex: RPC-style tokenizer/texts SFT; on-prem: pre-tokenized
+verl-GRPO {batch, meta, processing}). That lives behind the BACKENDS registry;
+converging it is a server-side change tracked in ArcticRLClient.fwd_bwd.
+
+The cortex backend authenticates with a PAT read from the CORTEX_PAT env var:
+
+    export CORTEX_PAT=<your programmatic access token>
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from typing import Callable
+
+ARCTIC = Path(__file__).resolve().parents[3]  # Arctic-Platform/
+# Run-from-anywhere: the package root + the RL test harness on the path.
+sys.path.insert(0, str(ARCTIC))
+sys.path.insert(0, str(ARCTIC / "tests" / "rl"))
+
+from arctic_platform.client import ArcticRLClient  # noqa: E402
+from arctic_platform.client import ArcticRLClientConfig  # noqa: E402
+
+STEPS = 20
+SEED = 42
+N_GPUS = 8
+
+# on-prem (verl-GRPO fake batch)
+ONPREM_MODEL = "Qwen/Qwen3-0.6B"
+ONPREM_ATTN = "sdpa"  # flash_attention_2 needs the flash_attn package; sdpa ships with torch
+ONPREM_LR = 1e-5
+PROMPT_LEN = 8
+RESPONSE_LEN = 8
+NUM_PROMPTS = 8  # NUM_PROMPTS * ROLLOUT_N == global batch, one row per training GPU.
+ROLLOUT_N = 1
+
+# cortex (tokenizer/texts SFT)
+CORTEX_MODEL = "Qwen/Qwen3-8B"
+CORTEX_PROMPT = "who trained you?\nMichael Wyatt at Snowflake"
+CORTEX_MAX_SEQ_LEN = 128
+CORTEX_LR = 1e-4
+CORTEX_HOST = "dsa-test.qa6.us-west-2.aws.snowflakecomputing.com"
+CORTEX_DATABASE = "NEUTRINO_DB"
+CORTEX_SCHEMA = "PUBLIC"
+CORTEX_ENDPOINT = "cortex-training"
+
+
+def _metric(x) -> float:
+    """step merges across DP ranks, so a replicated scalar can arrive as a per-rank list."""
+    return float(x[0] if isinstance(x, (list, tuple)) else x)
+
+
+# ── per-backend: config ──────────────────────────────────────────────────────
+def _cortex_config(stack: contextlib.ExitStack) -> ArcticRLClientConfig:
+    return ArcticRLClientConfig(
+        backend="cortex",
+        model_name=CORTEX_MODEL,
+        training_gpus=N_GPUS,
+        max_seq_len=CORTEX_MAX_SEQ_LEN,
+        dtype="bfloat16",
+        seed=SEED,
+        cortex_host=CORTEX_HOST,
+        cortex_pat_env_var="CORTEX_PAT",  # export CORTEX_PAT=<token> before running
+        cortex_database=CORTEX_DATABASE,
+        cortex_schema=CORTEX_SCHEMA,
+        cortex_endpoint=CORTEX_ENDPOINT,
+        training_config={
+            "optimizer": {"name": "AdamW", "lr": CORTEX_LR, "weight_decay": 0.0, "betas": [0.9, 0.999], "eps": 1e-8},
+            "train_batch_size": N_GPUS,
+            "gradient_clipping": 1.0,
+            "model_provider": "huggingface",
+        },
+    )
+
+
+def _onprem_config(comm_protocol: str, launch_local_server: bool) -> Callable:
+    def build(stack: contextlib.ExitStack) -> ArcticRLClientConfig:
+        ckpt = stack.enter_context(tempfile.TemporaryDirectory(prefix="arl_onprem_ckpt_"))
+        max_length = PROMPT_LEN + RESPONSE_LEN
+        return ArcticRLClientConfig(
+            backend="onprem",
+            comm_protocol=comm_protocol,
+            launch_local_server=launch_local_server,
+            model_name=ONPREM_MODEL,
+            seed=SEED,
+            training_gpus=N_GPUS,
+            checkpoint_path=ckpt,  # server requires this for training jobs
+            job_ready_timeout=600.0,
+            ds_config={
+                "train_micro_batch_size_per_gpu": 1,
+                "train_batch_size": N_GPUS,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                    "stage": 3,
+                    "offload_optimizer": {"device": "none"},
+                    "offload_param": {"device": "none"},
+                },
+            },
+            training_config={
+                "optimizer": {"lr": ONPREM_LR, "weight_decay": 0.0, "betas": [0.9, 0.999]},
+                "lr_scheduler": {"warmup_ratio": 0.0},
+                "training_horizon": 1,
+                "max_length": max_length,
+                "model_config": None,
+                "attn_implementation": ONPREM_ATTN,
+                "gradient_accumulation_steps": 1,
+            },
+        )
+
+    return build
+
+
+# ── per-backend: batch ───────────────────────────────────────────────────────
+# The batch is the ONE thing that can't be unified here: the backends' servers
+# accept different fwd_bwd data contracts (Cortex: RPC-style tokenizer/texts;
+# on-prem: pre-tokenized verl-GRPO). See ArcticRLClient.fwd_bwd's TODO — the real
+# fix is server-side convergence, after which these two builders become one.
+def _cortex_batch() -> Any:
+    import torch
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(CORTEX_MODEL)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    encoded = tokenizer(
+        [CORTEX_PROMPT] * N_GPUS,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=CORTEX_MAX_SEQ_LEN,
+        add_special_tokens=True,
+    )
+    input_ids = encoded["input_ids"].contiguous()
+    # next-token labels, with padding positions masked out to ignore_index (-100).
+    labels = torch.roll(input_ids, shifts=-1, dims=1)
+    labels[:, -1] = -100
+    shifted_mask = torch.roll(encoded["attention_mask"], shifts=-1, dims=1)
+    shifted_mask[:, -1] = 0
+    labels = labels.masked_fill(shifted_mask == 0, -100)
+    return {"args": [], "kwargs": {"input_ids": input_ids, "labels": labels.contiguous()}}
+
+
+def _onprem_batch() -> Any:
+    from rl_harness import build_update_actor_payload
+    from rl_harness import make_fake_batch
+
+    batch, _, _ = make_fake_batch(ONPREM_MODEL, NUM_PROMPTS, ROLLOUT_N, PROMPT_LEN, RESPONSE_LEN)
+    # `processing` stays inside the payload: client.fwd_bwd folds a `processing=`
+    # kwarg into the body anyway, so leaving it in yields the identical wire body
+    # and lets every backend share the same `client.fwd_bwd(batch)` call.
+    return build_update_actor_payload(batch, False, ROLLOUT_N, PROMPT_LEN, RESPONSE_LEN)
+
+
+# ── unified across all backends ──────────────────────────────────────────────
+def _report(step: int, out: dict, step_out: dict) -> str:
+    """One report for every backend, via graceful key lookups on the responses.
+
+    Response shapes still diverge (Cortex: loss only; on-prem: avg_loss +
+    grad_norm in step metrics) — see ArcticRLClient.step's TODO. Until those
+    converge, we cope here rather than branch on backend.
+    """
+    loss = _metric(out.get("avg_loss", out.get("loss")))
+    line = f"step {step + 1}/{STEPS} loss={loss:.4g}"
+    grad_norm = (step_out or {}).get("metrics", {}).get("grad_norm")
+    if grad_norm is not None:
+        line += f" grad_norm={_metric(grad_norm):.4g}"
+    return line
+
+
+@dataclass
+class Profile:
+    config: Callable[[contextlib.ExitStack], ArcticRLClientConfig]
+    batch: Callable[[], Any]
+
+
+BACKENDS: dict[str, Profile] = {
+    "cortex": Profile(_cortex_config, _cortex_batch),
+    "onprem-http": Profile(_onprem_config("http", True), _onprem_batch),
+    "onprem-ray": Profile(_onprem_config("ray", False), _onprem_batch),
+}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--backend", choices=list(BACKENDS), default="onprem-http")
+    profile = BACKENDS[ap.parse_args().backend]
+
+    with contextlib.ExitStack() as stack:
+        config = profile.config(stack)
+        batch = profile.batch()
+
+        client = ArcticRLClient(config)
+        print(f"training job: {client.jobs.training}")
+        try:
+            for step in range(STEPS):
+                # RL note: a full loop would create a sampling job, generate() a
+                # rollout, score it into advantages, then feed that here.
+                # One fwd_bwd call for every backend -- only `batch`'s content
+                # differs (see note on ArcticRLClient.fwd_bwd).
+                out = client.fwd_bwd(batch)
+                step_out = client.step()
+                print(_report(step, out, step_out))
+        finally:
+            client.shutdown()
+            print("shutdown complete")
+
+
+if __name__ == "__main__":
+    main()
