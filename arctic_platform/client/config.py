@@ -29,12 +29,12 @@ JobId = int | str
 class ArcticRLClientConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    backend: Literal["onprem"] = Field("onprem", description="Deployment target.")
+    backend: Literal["onprem", "cortex"] = Field("onprem", description="Deployment target.")
     comm_protocol: Literal["http", "ray"] = Field("http", description="onprem transport: HTTP or in-process Ray.")
     model_name: str = Field(..., description="HF model id to train/serve.")
     seed: int | None = Field(None, description="Global seed.")
     dtype: str | None = Field(None, description="Parameter dtype override.")
-    max_seq_len: int = Field(8192, description="Max sequence length.")
+    max_seq_len: int = Field(8192, description="Max sequence length (cortex sub-jobs).")
 
     # GPU allocation — a job type is created only when its count is > 0.
     training_gpus: int = 0
@@ -62,6 +62,14 @@ class ArcticRLClientConfig(BaseModel):
             "that call and falls back to this dir when path is None."
         ),
     )
+
+    # cortex (SnowAPI)
+    cortex_base_url: str | None = Field(None, description="Mock/direct GS URL; bypasses PAT auth.")
+    cortex_host: str | None = None
+    cortex_pat_env_var: str = "CORTEX_PAT"
+    cortex_database: str = ""
+    cortex_schema: str = ""
+    cortex_endpoint: str = "cortex-training"
 
     # Reconnect: attach to pre-existing jobs instead of creating new ones.
     training_job_id: JobId | None = None
