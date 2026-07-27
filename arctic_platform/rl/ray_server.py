@@ -717,7 +717,8 @@ class ArcticRLRayServer:
 
         return merged
 
-    async def step(self, job_id: int) -> dict[str, Any]:
+    async def step(self, job_id: int, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        # `body` is unused; accepted so the client can call with (job_id, body).
         self._verify_job(job_id, "training")
         # results = await asyncio.gather(*[w.step.remote() for w in self.training_workers])
         refs = [w.step.remote() for w in self.training_workers]
@@ -737,7 +738,8 @@ class ArcticRLRayServer:
         logger.info("Empty training cache: %s", results)
         return {"job_id": job_id, "workers": results}
 
-    async def save_checkpoint(self, job_id: int):
+    async def save_checkpoint(self, job_id: int, body: dict[str, Any] | None = None):
+        # `body` is unused; accepted so the client can call with (job_id, body).
         self._verify_job(job_id, "training")
         info = self.jobs[job_id]
         checkpoint_path = info.get("checkpoint_path", None)
@@ -761,8 +763,9 @@ class ArcticRLRayServer:
         results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags)
         return {"job_id": job_id, **results}
 
-    async def reset_prefix_cache(self, job_id: int):
+    async def reset_prefix_cache(self, job_id: int, body: dict[str, Any] | None = None):
         """Reset the prefix cache on the sampling inference engines."""
+        # `body` is unused; accepted so the client can call with (job_id, body).
         self._verify_job(job_id, "sampling")
         return await self.arctic_rl_ray_server_state.reset_prefix_cache.remote(job_id)
 
