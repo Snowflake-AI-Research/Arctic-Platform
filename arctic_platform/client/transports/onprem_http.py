@@ -52,13 +52,14 @@ class HttpTransport(OnPremTransport):
         import requests
 
         self.base_url = f"http://{config.host}:{config.port}"
+        self.timeout = config.request_timeout
         self.session = requests.Session()
         self.proc = None
         if config.launch_local_server:
             self._launch_server()
 
     def _start(self, payload: dict) -> JobId:
-        resp = self.session.post(f"{self.base_url}/initialize", json=payload)
+        resp = self.session.post(f"{self.base_url}/initialize", json=payload, timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()["job_id"]
 
@@ -70,7 +71,7 @@ class HttpTransport(OnPremTransport):
             else {"json": request.body}
         )
         params = {} if request.job_id is None else {"job_id": request.job_id}
-        resp = self.session.post(f"{self.base_url}/{request.op}", params=params, **payload)
+        resp = self.session.post(f"{self.base_url}/{request.op}", params=params, timeout=self.timeout, **payload)
         resp.raise_for_status()
         # Tensor-bearing responses come back as octet; everything else is JSON.
         if "application/octet-stream" in resp.headers.get("Content-Type", ""):
@@ -78,10 +79,9 @@ class HttpTransport(OnPremTransport):
         return resp.json()
 
     def _destroy(self, job_id: JobId, job_type: str) -> None:
-        try:
-            self.session.post(f"{self.base_url}/destroy", params={"job_id": job_id}, json={"job_type": job_type})
-        except Exception:
-            pass
+        self.session.post(
+            f"{self.base_url}/destroy", params={"job_id": job_id}, json={"job_type": job_type}, timeout=self.timeout
+        )
 
     def _wait_running(self) -> None:
         for job_type in JOB_TYPES:
@@ -101,7 +101,7 @@ class HttpTransport(OnPremTransport):
                 self.proc.kill()
 
     def _is_running(self, job_id: JobId) -> bool:
-        resp = self.session.get(f"{self.base_url}/job/{job_id}", timeout=5)
+        resp = self.session.get(f"{self.base_url}/job/{job_id}", timeout=self.timeout)
         return resp.ok and resp.json().get("status") == "RUNNING"
 
     def _launch_server(self) -> None:
@@ -127,7 +127,9 @@ class HttpTransport(OnPremTransport):
         if cfg.colocate:
             cmd.append("--colocate")
         self.proc = subprocess.Popen(cmd)
-        self._poll(lambda: self.session.get(f"{self.base_url}/health", timeout=3).ok, cfg.startup_timeout, "server")
+        self._poll(
+            lambda: self.session.get(f"{self.base_url}/health", timeout=self.timeout).ok, cfg.startup_timeout, "server"
+        )
 
     @staticmethod
     def _poll(pred, timeout: float, what: str) -> None:

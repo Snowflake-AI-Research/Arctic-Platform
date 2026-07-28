@@ -48,6 +48,9 @@ class ArcticRLClientConfig(BaseModel):
     launch_local_server: bool = Field(False, description="onprem: spawn a local server before connecting.")
     startup_timeout: float = 600.0
     job_ready_timeout: float = 1800.0
+    request_timeout: float = Field(
+        1800.0, description="onprem HTTP: per-request timeout (seconds) applied to every call. Generous for long ops."
+    )
     ds_config: dict[str, Any] | None = None
     training_config: dict[str, Any] | None = None
     vllm_config: dict[str, Any] | None = None
