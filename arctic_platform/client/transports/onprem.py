@@ -26,6 +26,7 @@ Concrete transports live alongside this base: `HttpTransport` in
 
 from __future__ import annotations
 
+import logging
 from abc import abstractmethod
 from typing import Any
 
@@ -36,6 +37,9 @@ from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
+from arctic_platform.client.transport import unresolved_ops
+
+logger = logging.getLogger(__name__)
 
 
 class OnPremTransport(Transport):
@@ -64,6 +68,12 @@ class OnPremTransport(Transport):
             job_id = getattr(self.jobs, job_type)
             if job_id is not None:
                 self._destroy(job_id, job_type)
+
+    def _check_op_coverage(self, target: object) -> None:
+        """Warn (don't fail) if the delivery target can't resolve some canonical op."""
+        missing = unresolved_ops(target)
+        if missing:
+            logger.warning("%s cannot resolve ops (they will fail if called): %s", type(self).__name__, missing)
 
     def _init_payload(self, job_type: str) -> dict[str, Any]:
         cfg = self.config

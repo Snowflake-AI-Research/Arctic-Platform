@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import pytest
 
+from arctic_platform.client import OPS
 from arctic_platform.client import ArcticRLClient
 from arctic_platform.client import ArcticRLClientConfig
 from arctic_platform.client import JobHandles
 from arctic_platform.client import Request
 from arctic_platform.client import Transport
 from arctic_platform.client import client as client_module
+from arctic_platform.client import unresolved_ops
+from arctic_platform.client.transport import method_name
 
 TRAINING, SAMPLING, LOG_PROB = 1, 2, 3
 
@@ -103,14 +106,6 @@ class TestOpMapping:
         assert req.job_id == TRAINING
         assert req.body == {"stage_info": {"s": 1}, "path": "/tmp/x"}
 
-    def test_save_weights_targets_sampling(self, client):
-        """save_weights -> sampling job."""
-        client.save_weights("/tmp/w")
-        req = _last(client)
-        assert req.op == "save-weights"
-        assert req.job_id == SAMPLING
-        assert req.body == {"checkpoint_path": "/tmp/w"}
-
     def test_generate_targets_sampling_and_unwraps_results(self, client):
         """generate -> sampling job; returns the 'results' list."""
         out = client.generate(["hi"], sampling_params={"n": 1}, routing_key="k")
@@ -157,6 +152,45 @@ class TestLifecycle:
         """JobHandles.require guards against calling an op before its job exists."""
         with pytest.raises(ValueError, match="No training job"):
             JobHandles().require("training")
+
+
+class TestOpRegistry:
+    """Contract: the client's op vocabulary and OPS stay in lockstep, and a
+    transport's op coverage is checkable without a live backend."""
+
+    def test_client_emits_exactly_the_registered_ops(self, client):
+        """Driving every client op must produce exactly the canonical OPS set."""
+        client.fwd_bwd({"input_ids": [1]})
+        client.fwd_no_grad({"input_ids": [1]})
+        client.step()
+        client.save_checkpoint()
+        client.generate(["hi"])
+        client.log_probs(["hi"])
+        client.sync_weights()
+        client.reset_prefix_cache()
+        assert {req.op for req in client.transport.calls} == OPS
+
+    def test_unresolved_ops_flags_a_missing_method(self):
+        """A target missing one op's method is reported (renamed/dropped op -> caught early)."""
+
+        class PartialServer:
+            pass
+
+        server = PartialServer()
+        for op in OPS - {"step"}:
+            setattr(server, method_name(op), lambda *a, **k: None)
+        assert unresolved_ops(server) == ["step"]
+
+    def test_unresolved_ops_empty_when_fully_covered(self):
+        """A target exposing every op resolves cleanly."""
+
+        class FullServer:
+            pass
+
+        server = FullServer()
+        for op in OPS:
+            setattr(server, method_name(op), lambda *a, **k: None)
+        assert unresolved_ops(server) == []
 
 
 class TestTransportSelection:

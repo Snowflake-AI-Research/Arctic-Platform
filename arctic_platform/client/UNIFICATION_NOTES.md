@@ -24,3 +24,18 @@ wrapper (typed async ops) that snapshots workers at construction, so the wrapper
 is built lazily after jobs are initialized. `_rpc` resolves `op -> method` and
 forwards `(job_id, body)` unchanged, matching the server's uniform
 `op(job_id, body) -> dict` surface.
+
+## Not yet in unified client (future work)
+Ops present in `arctic_platform/rl/*_client.py` but not yet on `ArcticRLClient`.
+Not on the immediate critical path, but they **block deleting the async
+clients**, so parity here is a prerequisite for retiring `rl/*_client.py`:
+- `sleep_inference` / `wake_inference`
+- `sleep_training` / `wake_training`
+- `sleep_log_prob` / `wake_log_prob`
+- `empty_training_cache`
+- `weight_norm`
+- `save_weights` (disk-based weight reload): a weight-sync variant that reloads
+  the sampling engine from a checkpoint on disk. Deliberately omitted for now —
+  server-side reload is unimplemented on-prem (the old ray client raised
+  `NotImplementedError`; the http client was a warn-on-error stub). Add back once
+  a backend actually supports it.

@@ -46,7 +46,14 @@ class ArcticRLClientConfig(BaseModel):
     ds_config: dict[str, Any] | None = None
     training_config: dict[str, Any] | None = None
     vllm_config: dict[str, Any] | None = None
-    checkpoint_path: str | None = Field(None, description="onprem: dir for training checkpoints/weight sync.")
+    checkpoint_path: str | None = Field(
+        None,
+        description=(
+            "onprem: training job's base checkpoint dir, set at init (resume-from + weight sync). "
+            "This is the default destination; a per-call save_checkpoint(path=...) overrides it for "
+            "that call and falls back to this dir when path is None."
+        ),
+    )
 
     # Reconnect: attach to pre-existing jobs instead of creating new ones.
     training_job_id: JobId | None = None

@@ -70,11 +70,10 @@ class ArcticRLClient:
         return self.transport.call(Request("step", self.jobs.require("training"), {"learning_rate": learning_rate}))
 
     def save_checkpoint(self, stage_info: dict | None = None, path: str | None = None) -> dict:
+        # `path` is this call's destination; when None the server uses the job's
+        # config.checkpoint_path. An explicit `path` here wins over the config.
         body = {"stage_info": stage_info, "path": path}
         return self.transport.call(Request("save-checkpoint", self.jobs.require("training"), body))
-
-    def save_weights(self, path: str) -> dict:
-        return self.transport.call(Request("save-weights", self.jobs.require("sampling"), {"checkpoint_path": path}))
 
     # ── sampling / log-prob ──────────────────────────────────────────────
     def generate(self, prompts: list, sampling_params: dict | None = None, routing_key: Any = None) -> list:

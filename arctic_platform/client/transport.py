@@ -36,6 +36,32 @@ JOB_TYPES = ("training", "sampling", "log_prob")
 # NCCL root) rendezvouses last.
 JOB_CREATE_ORDER = ("sampling", "log_prob", "training")
 
+# The canonical op vocabulary: every op the client can lower to a Request. A
+# transport is expected to resolve all of these; `unresolved_ops` lets it check
+# its own coverage up front instead of failing with an AttributeError mid-run.
+OPS = frozenset(
+    {
+        "fwd-bwd",
+        "fwd-no-grad",
+        "step",
+        "save-checkpoint",
+        "generate",
+        "log-probs",
+        "sync-weights",
+        "reset-prefix-cache",
+    }
+)
+
+
+def method_name(op: str) -> str:
+    """Canonical op name -> the method name a transport target exposes."""
+    return op.replace("-", "_")
+
+
+def unresolved_ops(target: object) -> list[str]:
+    """Ops in `OPS` that `target` exposes no matching method for."""
+    return sorted(op for op in OPS if not hasattr(target, method_name(op)))
+
 
 @dataclass
 class JobHandles:

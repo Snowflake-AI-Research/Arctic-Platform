@@ -13,9 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unified training example for the on-prem Ray backend.
+"""Unified SFT training example for the on-prem Ray backend.
 
-    python arctic_platform/client/examples/train_example.py --backend onprem-ray
+    python arctic_platform/client/examples/sft_example.py --backend onprem-ray
 
 The backend follows the pathway: build config -> ArcticRLClient ->
 loop(fwd_bwd + step) -> shutdown, with a single unified fwd_bwd/step/report.

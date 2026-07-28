@@ -16,9 +16,12 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import Request
+from arctic_platform.client.transport import method_name
 from arctic_platform.client.transports.onprem import OnPremTransport
 
 
@@ -44,6 +47,8 @@ class RayTransport(OnPremTransport):
             colocate=config.colocate,
         )
         self._server = None  # ArcticRLRayServer, built once jobs exist
+        # One long-lived loop for every op instead of asyncio.run() per call.
+        self._loop = asyncio.new_event_loop()
 
     def _start(self, payload: dict) -> JobId:
         import ray
@@ -55,16 +60,17 @@ class RayTransport(OnPremTransport):
         from arctic_platform.rl.ray_server import ArcticRLRayServer
 
         self._server = ArcticRLRayServer(self._state)
+        self._check_op_coverage(self._server)
 
     def _rpc(self, request: Request) -> dict:
-        import asyncio
-
         # Pass job_id only when set (some ops, e.g. sync-weights, omit it), then the body.
-        method = getattr(self._server, request.op.replace("-", "_"))
+        method = getattr(self._server, method_name(request.op))
         args = (request.body,) if request.job_id is None else (request.job_id, request.body)
-        return asyncio.run(method(*args))
+        return self._loop.run_until_complete(method(*args))
 
     def _destroy(self, job_id: JobId, job_type: str) -> None:
-        import asyncio
+        self._loop.run_until_complete(self._server.destroy(job_id, job_type))
 
-        asyncio.run(self._server.destroy(job_id, job_type))
+    def shutdown(self) -> None:
+        super().shutdown()
+        self._loop.close()
