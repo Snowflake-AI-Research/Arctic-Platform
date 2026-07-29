@@ -30,7 +30,7 @@ class ArcticRLClientConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     backend: Literal["onprem"] = Field("onprem", description="Deployment target.")
-    comm_protocol: Literal["ray"] = Field("ray", description="onprem transport: in-process Ray.")
+    comm_protocol: Literal["http", "ray"] = Field("http", description="onprem transport: HTTP or in-process Ray.")
     model_name: str = Field(..., description="HF model id to train/serve.")
     seed: int | None = Field(None, description="Global seed.")
     dtype: str | None = Field(None, description="Parameter dtype override.")
@@ -41,8 +41,16 @@ class ArcticRLClientConfig(BaseModel):
     sampling_gpus: int = 0
     log_prob_gpus: int = 0
 
-    # onprem (Ray)
+    # onprem (HTTP + Ray)
+    host: str = "localhost"
+    port: int = 8000
     colocate: bool = False
+    launch_local_server: bool = Field(False, description="onprem: spawn a local server before connecting.")
+    startup_timeout: float = 600.0
+    job_ready_timeout: float = 1800.0
+    request_timeout: float = Field(
+        1800.0, description="onprem HTTP: per-request timeout (seconds) applied to every call. Generous for long ops."
+    )
     ds_config: dict[str, Any] | None = None
     training_config: dict[str, Any] | None = None
     vllm_config: dict[str, Any] | None = None

@@ -205,3 +205,10 @@ class TestTransportSelection:
         monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
         cfg = ArcticRLClientConfig(model_name="m", comm_protocol="ray", training_gpus=1)
         assert isinstance(client_module.make_transport(cfg), DummyRay)
+
+    def test_make_transport_selects_http_for_onprem(self):
+        """onprem + http (the default) routes to HttpTransport."""
+        from arctic_platform.client.transports.onprem_http import HttpTransport
+
+        cfg = ArcticRLClientConfig(model_name="m", comm_protocol="http", training_gpus=1)
+        assert isinstance(client_module.make_transport(cfg), HttpTransport)

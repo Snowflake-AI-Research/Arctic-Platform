@@ -25,6 +25,15 @@ is built lazily after jobs are initialized. `_rpc` resolves `op -> method` and
 forwards `(job_id, body)` unchanged, matching the server's uniform
 `op(job_id, body) -> dict` surface.
 
+## On-prem HTTP transport
+`HttpTransport` shares the same `OnPremTransport` control plane and only supplies
+the delivery primitives: it POSTs each op to `/{op}?job_id=...`. Tensor-bearing
+ops (`fwd_bwd`/`fwd_no_grad`) send an octet `torch.save` payload and decode octet
+responses; everything else is JSON. It also optionally launches a local server
+(`launch_local_server`) and polls `/health` + `/job/{id}` to wait for readiness.
+The Ray path forwards `(job_id, body)` to the same uniform server surface, so the
+two transports differ only in `_start`/`_rpc`/`_destroy`.
+
 ## Not yet in unified client (future work)
 Ops present in `arctic_platform/rl/*_client.py` but not yet on `ArcticRLClient`.
 Not on the immediate critical path, but they **block deleting the async

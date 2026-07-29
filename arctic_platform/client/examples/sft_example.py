@@ -13,13 +13,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unified SFT training example for the on-prem Ray backend.
+"""Unified SFT training example across the on-prem backends.
 
+    python arctic_platform/client/examples/sft_example.py --backend onprem-http
     python arctic_platform/client/examples/sft_example.py --backend onprem-ray
 
-The backend follows the pathway: build config -> ArcticRLClient ->
+Every backend follows the *same* pathway: build config -> ArcticRLClient ->
 loop(fwd_bwd + step) -> shutdown, with a single unified fwd_bwd/step/report.
-The client + transport hide all wire/protocol differences.
+The client + transports hide all wire/protocol differences.
 """
 
 from __future__ import annotations
@@ -61,35 +62,40 @@ def _metric(x) -> float:
 
 
 # ── per-backend: config ──────────────────────────────────────────────────────
-def _onprem_ray_config(stack: contextlib.ExitStack) -> ArcticRLClientConfig:
-    ckpt = stack.enter_context(tempfile.TemporaryDirectory(prefix="arl_onprem_ckpt_"))
-    return ArcticRLClientConfig(
-        backend="onprem",
-        comm_protocol="ray",
-        model_name=MODEL,
-        seed=SEED,
-        training_gpus=N_GPUS,
-        checkpoint_path=ckpt,  # server requires this for training jobs
-        ds_config={
-            "train_micro_batch_size_per_gpu": 1,
-            "train_batch_size": N_GPUS,
-            "gradient_accumulation_steps": 1,
-            "zero_optimization": {
-                "stage": 3,
-                "offload_optimizer": {"device": "none"},
-                "offload_param": {"device": "none"},
+def _onprem_config(comm_protocol: str, launch_local_server: bool) -> Callable:
+    def build(stack: contextlib.ExitStack) -> ArcticRLClientConfig:
+        ckpt = stack.enter_context(tempfile.TemporaryDirectory(prefix="arl_onprem_ckpt_"))
+        return ArcticRLClientConfig(
+            backend="onprem",
+            comm_protocol=comm_protocol,
+            launch_local_server=launch_local_server,
+            model_name=MODEL,
+            seed=SEED,
+            training_gpus=N_GPUS,
+            checkpoint_path=ckpt,  # server requires this for training jobs
+            job_ready_timeout=600.0,
+            ds_config={
+                "train_micro_batch_size_per_gpu": 1,
+                "train_batch_size": N_GPUS,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                    "stage": 3,
+                    "offload_optimizer": {"device": "none"},
+                    "offload_param": {"device": "none"},
+                },
             },
-        },
-        training_config={
-            "optimizer": {"lr": LR, "weight_decay": 0.0, "betas": [0.9, 0.999]},
-            "lr_scheduler": {"warmup_ratio": 0.0},
-            "training_horizon": 1,
-            "max_length": SEQ_LEN,
-            "model_config": None,
-            "attn_implementation": ATTN,
-            "gradient_accumulation_steps": 1,
-        },
-    )
+            training_config={
+                "optimizer": {"lr": LR, "weight_decay": 0.0, "betas": [0.9, 0.999]},
+                "lr_scheduler": {"warmup_ratio": 0.0},
+                "training_horizon": 1,
+                "max_length": SEQ_LEN,
+                "model_config": None,
+                "attn_implementation": ATTN,
+                "gradient_accumulation_steps": 1,
+            },
+        )
+
+    return build
 
 
 # ── shared data, per-backend packaging ───────────────────────────────────────
@@ -145,13 +151,14 @@ class Profile:
 
 
 BACKENDS: dict[str, Profile] = {
-    "onprem-ray": Profile(_onprem_ray_config, _onprem_batch),
+    "onprem-http": Profile(_onprem_config("http", True), _onprem_batch),
+    "onprem-ray": Profile(_onprem_config("ray", False), _onprem_batch),
 }
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--backend", choices=list(BACKENDS), default="onprem-ray")
+    ap.add_argument("--backend", choices=list(BACKENDS), default="onprem-http")
     profile = BACKENDS[ap.parse_args().backend]
 
     with contextlib.ExitStack() as stack:
