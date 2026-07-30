@@ -445,3 +445,219 @@ class TestFactoryDispatch:
             "`ArcticRLRayClient` is exposed at module scope; it must be "
             "imported inside `create_arctic_rl_client`'s on-prem branch."
         )
+
+
+class TestEnvOverride:
+    """`ARCTIC_RL_BACKEND=cortex` env-var rewrites the incoming config.
+
+    Both integrations' adapters currently hardcode `backend="local"` at
+    ``ArcticRLClientConfig`` construction time. The launcher exports these
+    env vars and the factory rewrites the config before dispatch, so
+    neither adapter needs to change.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_cortex_env(self, monkeypatch):
+        # Ensure a clean env slate — other tests / user shell might have
+        # ARCTIC_RL_BACKEND=cortex set which would poison local-path tests.
+        for key in (
+            "ARCTIC_RL_BACKEND",
+            "CORTEX_BASE_URL",
+            "CORTEX_HOST",
+            "CORTEX_DATABASE",
+            "CORTEX_SCHEMA",
+            "CORTEX_ENDPOINT",
+            "CORTEX_PAT_ENV_VAR",
+            "CORTEX_MAX_SEQ_LEN",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+    def test_env_unset_is_noop(self):
+        """Without `ARCTIC_RL_BACKEND=cortex`, `_maybe_override_from_env`
+        returns the config untouched — no cortex rewriting, no dispatch
+        redirection. We assert this at the helper level rather than
+        driving `create_arctic_rl_client` end-to-end because the local
+        branch needs vllm/ray installed to construct.
+
+        `host`/`port` explicitly set so `_derive_host_port` doesn't trip
+        the ray_cluster import (which pulls tensordict).
+        """
+        from arctic_platform.rl.client import _maybe_override_from_env
+
+        cfg = ArcticRLClientConfig(
+            backend="local",
+            model_name="Qwen/Qwen3-0.6B",
+            training_gpus=1,
+            host="localhost",
+            port=7000,
+        )
+        out = _maybe_override_from_env(cfg)
+        assert out is cfg
+        assert out.backend == "local"
+
+    def test_env_flips_local_to_cortex(self, monkeypatch):
+        """Setting `ARCTIC_RL_BACKEND=cortex` on a `backend="local"` config
+        rewrites it to cortex and produces a `_CortexClientShim`, without
+        the caller touching a single field."""
+
+        class _StubUnified:
+            def __init__(self, cfg, *_a, **_kw):
+                self.cfg = cfg
+                self.training_job_id = None
+                self.sampling_job_id = None
+                self.log_prob_job_id = None
+
+            def shutdown(self):
+                pass
+
+        monkeypatch.setattr("arctic_platform.client.ArcticRLClient", _StubUnified)
+
+        # Simulate what verl's / SkyRL's launcher would export.
+        monkeypatch.setenv("ARCTIC_RL_BACKEND", "cortex")
+        monkeypatch.setenv("CORTEX_BASE_URL", "http://localhost:8080")
+
+        # Adapter passes `backend="local"` — that's the hardcode we're
+        # working around. `host`/`port` explicit so the local-branch
+        # `_derive_host_port` validator doesn't pull tensordict.
+        cfg = ArcticRLClientConfig(
+            backend="local",
+            model_name="Qwen/Qwen3-0.6B",
+            training_gpus=1,
+            host="localhost",
+            port=7000,
+        )
+        client = create_arctic_rl_client(cfg)
+        assert isinstance(client, _CortexClientShim)
+        assert client._client.cfg.backend == "cortex"
+        assert client._client.cfg.cortex_base_url == "http://localhost:8080"
+
+    def test_env_populates_all_recognized_fields(self, monkeypatch):
+        """Every field in `_CORTEX_ENV_MAP` is threaded through when the
+        env var is set. Missing fields on the input config get filled
+        from env; explicit fields on config are preserved."""
+
+        class _StubUnified:
+            def __init__(self, cfg, *_a, **_kw):
+                self.cfg = cfg
+                self.training_job_id = None
+                self.sampling_job_id = None
+                self.log_prob_job_id = None
+
+            def shutdown(self):
+                pass
+
+        monkeypatch.setattr("arctic_platform.client.ArcticRLClient", _StubUnified)
+
+        monkeypatch.setenv("ARCTIC_RL_BACKEND", "cortex")
+        monkeypatch.setenv("CORTEX_HOST", "cortex.snowflakecomputing.com")
+        monkeypatch.setenv("CORTEX_DATABASE", "prod_db")
+        monkeypatch.setenv("CORTEX_SCHEMA", "rl")
+        monkeypatch.setenv("CORTEX_ENDPOINT", "cortex-training-v2")
+        monkeypatch.setenv("CORTEX_PAT_ENV_VAR", "MY_PAT")
+        monkeypatch.setenv("CORTEX_MAX_SEQ_LEN", "8192")
+
+        cfg = ArcticRLClientConfig(
+            backend="local",
+            model_name="Qwen/Qwen3-0.6B",
+            training_gpus=1,
+            host="localhost",
+            port=7000,
+        )
+        client = create_arctic_rl_client(cfg)
+        c = client._client.cfg
+        assert c.backend == "cortex"
+        assert c.cortex_host == "cortex.snowflakecomputing.com"
+        assert c.cortex_database == "prod_db"
+        assert c.cortex_schema == "rl"
+        assert c.cortex_endpoint == "cortex-training-v2"
+        assert c.cortex_pat_env_var == "MY_PAT"
+        assert c.max_seq_len == 8192
+
+    def test_env_does_not_clobber_explicit_config_fields(self, monkeypatch):
+        """A field the adapter DID populate on ``config`` wins over the
+        matching env var. Env is a fallback for silent adapters, not an
+        override of explicit intent.
+        """
+
+        class _StubUnified:
+            def __init__(self, cfg, *_a, **_kw):
+                self.cfg = cfg
+                self.training_job_id = None
+                self.sampling_job_id = None
+                self.log_prob_job_id = None
+
+            def shutdown(self):
+                pass
+
+        monkeypatch.setattr("arctic_platform.client.ArcticRLClient", _StubUnified)
+
+        monkeypatch.setenv("ARCTIC_RL_BACKEND", "cortex")
+        monkeypatch.setenv("CORTEX_BASE_URL", "http://env-wins.local:8080")
+
+        cfg = ArcticRLClientConfig(
+            backend="cortex",
+            model_name="Qwen/Qwen3-0.6B",
+            training_gpus=1,
+            cortex_base_url="http://config-wins.local:9090",
+        )
+        client = create_arctic_rl_client(cfg)
+        assert client._client.cfg.cortex_base_url == "http://config-wins.local:9090"
+
+    def test_env_ignored_when_toggle_value_is_not_cortex(self, monkeypatch):
+        """Only ``ARCTIC_RL_BACKEND=cortex`` triggers the rewrite. Any
+        other value (or empty string) is a no-op, so we don't accidentally
+        break someone with a leftover ``ARCTIC_RL_BACKEND=onprem`` in their
+        shell. Asserted at the helper level so the local dispatch branch
+        doesn't need vllm/ray to run this check."""
+        from arctic_platform.rl.client import _maybe_override_from_env
+
+        monkeypatch.setenv("ARCTIC_RL_BACKEND", "onprem")
+        monkeypatch.setenv("CORTEX_BASE_URL", "http://should-be-ignored.local:8080")
+
+        cfg = ArcticRLClientConfig(
+            backend="local",
+            model_name="Qwen/Qwen3-0.6B",
+            training_gpus=1,
+            host="localhost",
+            port=7000,
+        )
+        out = _maybe_override_from_env(cfg)
+        assert out is cfg
+        assert out.backend == "local"
+        assert out.cortex_base_url is None
+
+    def test_env_invalid_max_seq_len_is_warned_not_crashed(self, monkeypatch, caplog):
+        """A bad ``CORTEX_MAX_SEQ_LEN`` value shouldn't hard-fail the
+        launcher — log a warning and drop the field."""
+
+        class _StubUnified:
+            def __init__(self, cfg, *_a, **_kw):
+                self.cfg = cfg
+                self.training_job_id = None
+                self.sampling_job_id = None
+                self.log_prob_job_id = None
+
+            def shutdown(self):
+                pass
+
+        monkeypatch.setattr("arctic_platform.client.ArcticRLClient", _StubUnified)
+
+        monkeypatch.setenv("ARCTIC_RL_BACKEND", "cortex")
+        monkeypatch.setenv("CORTEX_MAX_SEQ_LEN", "not_a_number")
+
+        cfg = ArcticRLClientConfig(
+            backend="local",
+            model_name="Qwen/Qwen3-0.6B",
+            training_gpus=1,
+            host="localhost",
+            port=7000,
+        )
+        with caplog.at_level("WARNING"):
+            client = create_arctic_rl_client(cfg)
+        assert isinstance(client, _CortexClientShim)
+        # The legacy config on the shim: max_seq_len env var was garbage
+        # and got dropped, so this field stays at whatever the legacy
+        # config had (None here). The unified config downstream falls back
+        # to its own default (8192) which is fine.
+        assert client.config.max_seq_len is None
+        assert any("CORTEX_MAX_SEQ_LEN" in rec.message for rec in caplog.records)

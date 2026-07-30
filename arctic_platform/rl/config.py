@@ -145,6 +145,12 @@ class ArcticRLClientConfig(BaseModel):
         """
         if self.backend == "cortex":
             return self
+        # If both host and port were passed explicitly, there's nothing to
+        # derive and we can skip the ray_cluster import entirely — this
+        # matters for CPU-only test environments where `ray_cluster.py`'s
+        # transitive imports (via `arctic_platform.rl.utils`) pull tensordict.
+        if "host" in self.model_fields_set and "port" in self.model_fields_set:
+            return self
         # Lazy import to avoid pulling ray in at config import time.
         from arctic_platform.rl.ray_cluster import primary_ip
 
