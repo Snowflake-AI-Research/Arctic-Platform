@@ -619,11 +619,14 @@ async def wake_log_prob(job_id: int):
 
 
 @app.post("/generate")
-async def generate(job_id: int, request: GenerateRequest = Body(...)):
+async def generate(job_id: int, body: bytes = Body(..., media_type="application/octet-stream")):
+    # DSSST1 octet in/out, matching Cortex/SnowAPI's generate wire (no tensors in
+    # the request, but the endpoint speaks the shared binary wire either way).
     _verify_job(job_id, "sampling")
+    request = GenerateRequest(**wire.loads(body))
     pool: ReplicaPool = app.state.sampling_pool
     results = await pool.generate(request.prompts, request.sampling_params, strict=request.strict)
-    return {"job_id": job_id, "results": results}
+    return Response(content=wire.dumps({"job_id": job_id, "results": results}), media_type="application/octet-stream")
 
 
 @app.post("/weight-norm")

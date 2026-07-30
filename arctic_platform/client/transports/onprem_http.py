@@ -26,6 +26,11 @@ from arctic_platform.client.transport import Request
 from arctic_platform.client.transports.onprem import OnPremTransport
 
 
+# Ops the server wants as DSSST1 octet even without tensors in the body: a wire
+# requirement of the endpoint (matching Cortex/SnowAPI), not payload binary-ness.
+_OCTET_OPS = frozenset({"generate"})
+
+
 class HttpTransport(OnPremTransport):
     """Blocking HTTP over the shared DSSST1 wire. Serves onprem (local/remote)."""
 
@@ -46,10 +51,11 @@ class HttpTransport(OnPremTransport):
         return resp.json()["job_id"]
 
     def call(self, request: Request) -> dict:
-        # Tensor-bearing ops send a DSSST1 octet body; the rest send JSON.
+        # Tensor-bearing ops (and generate) send a DSSST1 octet body; rest send JSON.
+        octet = request.binary or request.op in _OCTET_OPS
         payload = (
             {"data": wire.dumps(request.body), "headers": {"Content-Type": "application/octet-stream"}}
-            if request.binary
+            if octet
             else {"json": request.body}
         )
         params = {} if request.job_id is None else {"job_id": request.job_id}

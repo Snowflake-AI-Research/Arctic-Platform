@@ -521,10 +521,11 @@ class ArcticRLHTTPClient:
             async with session.post(
                 f"{self._base_url}/generate",
                 params={"job_id": self.sampling_job_id},
-                json={"prompts": prompts, "sampling_params": sampling_params},
+                data=wire.dumps({"prompts": prompts, "sampling_params": sampling_params}),
+                headers={"Content-Type": "application/octet-stream"},
             ) as resp:
                 resp.raise_for_status()
-                data = await resp.json()
+                data = wire.loads(await resp.read())
         return data["results"]
 
     # ------------------------------------------------------------------
