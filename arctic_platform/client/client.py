@@ -29,7 +29,16 @@ from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
 
 
-def make_transport(config: ArcticRLClientConfig) -> Transport:
+def make_transport(config: ArcticRLClientConfig, *, server_state: Any = None) -> Transport:
+    """Build the transport for `config`, optionally reattaching to an existing
+    on-prem Ray state actor.
+
+    `server_state` is only meaningful for `backend=onprem, comm_protocol=ray`:
+    verl's forwarder worker and SkyRL's `@ray.remote skyrl_entrypoint` both
+    rebuild the client in a different process from the driver and pass the
+    driver's state actor back in so the second process reattaches rather than
+    racing a fresh set of Ray actors. Every other transport ignores it.
+    """
     if config.backend == "cortex":
         from arctic_platform.client.transports.cortex import CortexTransport
 
@@ -38,7 +47,7 @@ def make_transport(config: ArcticRLClientConfig) -> Transport:
     from arctic_platform.client.transports.onprem_ray import RayTransport
 
     if config.backend == "onprem" and config.comm_protocol == "ray":
-        return RayTransport(config)
+        return RayTransport(config, server_state=server_state)
     return HttpTransport(config)  # onprem (HTTP)
 
 
@@ -67,9 +76,12 @@ def _flatten_metrics(result: Any) -> Any:
 
 
 class ArcticRLClient:
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: ArcticRLClientConfig, *, server_state: Any = None) -> None:
         self.config = config
-        self.transport = make_transport(config)
+        # `server_state` is forwarded to `make_transport` so the on-prem Ray
+        # transport can reattach to the driver's state actor in a forwarder
+        # worker / Ray-remote entrypoint. See `make_transport` for details.
+        self.transport = make_transport(config, server_state=server_state)
         self.jobs = self.transport.initialize()
 
     # ── legacy job-id attributes ─────────────────────────────────────────
@@ -261,6 +273,15 @@ class ArcticRLClient:
         self.shutdown()
 
 
-def create_arctic_rl_client(config: ArcticRLClientConfig) -> ArcticRLClient:
-    """Factory matching the current OSS entrypoint shape."""
-    return ArcticRLClient(config)
+def create_arctic_rl_client(
+    config: ArcticRLClientConfig,
+    server_state: Any = None,
+) -> ArcticRLClient:
+    """Factory matching the current OSS entrypoint shape.
+
+    `server_state` is a positional shim for the legacy call site
+    ``create_arctic_rl_client(reconnect_config, rl_server_state)`` that the
+    verl adapter and SkyRL's `main_arctic_rl.py` still use. New callers should
+    keep it None (driver path) or thread it as a kwarg when reconnecting.
+    """
+    return ArcticRLClient(config, server_state=server_state)

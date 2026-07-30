@@ -35,17 +35,25 @@ class RayTransport(OnPremTransport):
     `_rpc` resolves ``op -> method`` and forwards the request unchanged.
     """
 
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: ArcticRLClientConfig, *, server_state: object | None = None) -> None:
         super().__init__(config)
         from arctic_platform.rl.ray_server import create_arctic_rl_ray_server_state
 
-        self._state = create_arctic_rl_ray_server_state(
-            training_gpus=config.training_gpus,
-            sampling_gpus=config.sampling_gpus,
-            log_prob_gpus=config.log_prob_gpus,
-            log_prob_engine="deepspeed",
-            colocate=config.colocate,
-        )
+        # Reconnect: forwarder workers (verl) and Ray-remote entrypoints (SkyRL)
+        # rebuild the client in a different process from the driver. They pass
+        # the driver's state actor back in via `server_state=` so we reattach
+        # instead of spinning up fresh Ray actors that would race the existing
+        # jobs. Non-reconnect path: build a fresh state actor as before.
+        if server_state is not None:
+            self._state = server_state
+        else:
+            self._state = create_arctic_rl_ray_server_state(
+                training_gpus=config.training_gpus,
+                sampling_gpus=config.sampling_gpus,
+                log_prob_gpus=config.log_prob_gpus,
+                log_prob_engine="deepspeed",
+                colocate=config.colocate,
+            )
         self._server = None  # ArcticRLRayServer, built once jobs exist
         # One long-lived loop for every op instead of asyncio.run() per call.
         self._loop = asyncio.new_event_loop()

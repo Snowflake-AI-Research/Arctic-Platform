@@ -36,8 +36,9 @@ TRAINING, SAMPLING, LOG_PROB = 1, 2, 3
 
 
 class FakeTransport(Transport):
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: ArcticRLClientConfig, *, server_state: object | None = None) -> None:
         self.config = config
+        self.server_state = server_state
         self.jobs = JobHandles()
         self.calls: list[Request] = []
 
@@ -221,12 +222,18 @@ class TestTransportSelection:
         import arctic_platform.client.transports.onprem_ray as ray_mod
 
         class DummyRay:
-            def __init__(self, config):
+            def __init__(self, config, *, server_state=None):
                 self.config = config
+                self.server_state = server_state
 
         monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
         cfg = ArcticRLClientConfig(model_name="m", comm_protocol="ray", training_gpus=1)
-        assert isinstance(client_module.make_transport(cfg), DummyRay)
+        transport = client_module.make_transport(cfg)
+        assert isinstance(transport, DummyRay)
+        assert transport.server_state is None
+        # Reconnect-path: an existing state actor is threaded through.
+        reattach = client_module.make_transport(cfg, server_state="state-actor-handle")
+        assert reattach.server_state == "state-actor-handle"
 
     def test_make_transport_selects_http_for_onprem(self):
         """onprem + http (the default) routes to HttpTransport."""

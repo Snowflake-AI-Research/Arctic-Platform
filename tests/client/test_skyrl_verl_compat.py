@@ -48,8 +48,9 @@ class _RecordingTransport(Transport):
     exercised end-to-end.
     """
 
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: ArcticRLClientConfig, *, server_state: Any = None) -> None:
         self.config = config
+        self.server_state = server_state
         self.calls: list[Request] = []
         self.jobs = JobHandles(training="t-1", sampling="s-1", log_prob="lp-1")
         self.responses: dict[str, Any] = {
