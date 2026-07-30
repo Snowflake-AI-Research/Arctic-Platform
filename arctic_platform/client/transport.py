@@ -41,13 +41,13 @@ JOB_CREATE_ORDER = ("sampling", "log_prob", "training")
 # its own coverage up front instead of failing with an AttributeError mid-run.
 OPS = frozenset(
     {
-        "fwd-bwd",
-        "fwd-no-grad",
+        "forward-backward",
+        "forward",
         "step",
-        "save-checkpoint",
+        "save",
         "generate",
         "log-probs",
-        "sync-weights",
+        "weight-sync",
         "reset-prefix-cache",
     }
 )
@@ -97,7 +97,7 @@ class Request:
     the server, `binary` just picks the body codec (octet tensors vs JSON).
     """
 
-    op: str  # canonical op name, e.g. "fwd-bwd"
+    op: str  # canonical op name, e.g. "forward-backward"
     job_id: JobId | None = None  # primary target id (client-resolved); None -> omit
     body: dict[str, Any] = field(default_factory=dict)
     binary: bool = False  # body carries tensors -> octet, else JSON

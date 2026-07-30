@@ -259,7 +259,7 @@ class ArcticRLRayClient:
         if processing is not None:
             batch = {**batch, "processing": processing}
         timers.stop_and_print_elapsed(tname)
-        response = await self._arctic_rl_ray_server.fwd_bwd(self.training_job_id, batch)
+        response = await self._arctic_rl_ray_server.forward_backward(self.training_job_id, batch)
         # tname = timers.start("xyz arctic_rl.ray_client outgoing processing 2")
         # response["batch"] = tensorize(response["batch"])
         # timers.stop_and_print_elapsed(tname)
@@ -271,7 +271,7 @@ class ArcticRLRayClient:
         """Forward-only pass (no gradient) on the training engine."""
         job_id = self.log_prob_job_id if reference_model else self.training_job_id
         pr0(f"[ArcticRLRayClient] fwd_no_grad INPUT: {batch.keys()=} {reference_model=} {job_id=}")
-        response = await self._arctic_rl_ray_server.fwd_no_grad(job_id, batch)
+        response = await self._arctic_rl_ray_server.forward(job_id, batch)
         pr0(f"[ArcticRLRayClient] fwd_no_grad OUTPUT: {response.keys()=}")
         # response["batch"] = tensorize(response["batch"])
         return response
@@ -286,7 +286,7 @@ class ArcticRLRayClient:
 
     async def save_checkpoint(self) -> dict[str, Any]:
         """Save training checkpoint."""
-        response = await self._arctic_rl_ray_server.save_checkpoint(self.training_job_id)
+        response = await self._arctic_rl_ray_server.save(self.training_job_id)
         pr0(f"[ArcticRLClient] save_checkpoint OUTPUT: {response.keys()=}")
         return response
 
@@ -414,13 +414,13 @@ class ArcticRLRayClient:
         the whole model (avoids OOM on big models, at the cost of round-trips).
         """
         request = dict(
-            training_job_id=self.training_job_id,
-            sampling_job_id=self.sampling_job_id,
+            source_sub_job_id=self.training_job_id,
+            target_sub_job_ids=[self.sampling_job_id],
             colocate=self.config.colocate,
             cuda_ipc=cuda_ipc,
             low_memory=low_memory,
         )
-        response = await self._arctic_rl_ray_server.sync_weights(request)
+        response = await self._arctic_rl_ray_server.weight_sync(self.training_job_id, request)
         pr0(f"[ArcticRLClient] sync_weights OUTPUT: {response.keys()=}")
         return response
 

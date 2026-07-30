@@ -45,6 +45,8 @@ class JobConfig(BaseModel):
 class GenerateRequest(BaseModel):
     prompts: list[str]
     sampling_params: dict[str, Any] | None = None
+    routing_key: Any = None
+    strict: bool = False
 
 
 class LogProbsRequest(BaseModel):
@@ -53,9 +55,28 @@ class LogProbsRequest(BaseModel):
     top_k: int = 1
 
 
-class SyncWeightsRequest(BaseModel):
-    training_job_id: int
-    sampling_job_id: int
+class StepRequest(BaseModel):
+    learning_rate: float | None = None
+
+
+class SaveRequest(BaseModel):
+    # On-prem saves to the job's configured checkpoint_path; these mirror
+    # Cortex's `save(checkpoint_id, checkpoint_type)` and are accepted (unused).
+    checkpoint_id: str | None = None
+    checkpoint_type: str = "resumable"
+
+
+class ResetPrefixCacheRequest(BaseModel):
+    drain: bool = True
+    timeout_s: float = 60.0
+    retry_interval_s: float = 0.1
+
+
+class WeightSyncRequest(BaseModel):
+    # Matches Cortex's `weight_sync(source_sub_job_id, target_sub_job_ids)`.
+    # On-prem treats a sub_job_id as its plain job id.
+    source_sub_job_id: int
+    target_sub_job_ids: list[int]
     colocate: bool = False
     cuda_ipc: bool = False
     low_memory: bool = False

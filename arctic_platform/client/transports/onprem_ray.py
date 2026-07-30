@@ -63,7 +63,7 @@ class RayTransport(OnPremTransport):
         self._check_op_coverage(self._server)
 
     def _rpc(self, request: Request) -> dict:
-        # Pass job_id only when set (some ops, e.g. sync-weights, omit it), then the body.
+        # Pass job_id only when set (ops omitting it call method(body)), then the body.
         method = getattr(self._server, method_name(request.op))
         args = (request.body,) if request.job_id is None else (request.job_id, request.body)
         return self._loop.run_until_complete(method(*args))

@@ -27,9 +27,11 @@ forwards `(job_id, body)` unchanged, matching the server's uniform
 
 ## On-prem HTTP transport
 `HttpTransport` shares the same `OnPremTransport` control plane and only supplies
-the delivery primitives: it POSTs each op to `/{op}?job_id=...`. Tensor-bearing
-ops (`fwd_bwd`/`fwd_no_grad`) send an octet `torch.save` payload and decode octet
-responses; everything else is JSON. It also optionally launches a local server
+the delivery primitives: it POSTs each op to `/{op}?job_id=...`. The canonical op
+names + arg/response shapes mirror Cortex (`forward-backward`, `forward`, `step`,
+`save`, `generate`, `weight-sync`, `reset-prefix-cache`, plus on-prem-only
+`log-probs`). Tensor-bearing ops (`forward-backward`/`forward`) send an octet
+`torch.save` payload and decode octet responses; everything else is JSON. It also optionally launches a local server
 (`launch_local_server`) and polls `/health` + `/job/{id}` to wait for readiness.
 The Ray path forwards `(job_id, body)` to the same uniform server surface, so the
 two transports differ only in `_start`/`_rpc`/`_destroy`.

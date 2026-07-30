@@ -58,10 +58,10 @@ class ArcticRLClient:
         # into the body here, which is why callers can leave it inside `batch`.
         body = dict(batch)
         body.update({k: v for k, v in (("processing", processing), ("router_replay", router_replay)) if v is not None})
-        return self.transport.call(Request("fwd-bwd", self.jobs.require("training"), body, binary=True))
+        return self.transport.call(Request("forward-backward", self.jobs.require("training"), body, binary=True))
 
     def fwd_no_grad(self, batch: dict) -> dict:
-        return self.transport.call(Request("fwd-no-grad", self.jobs.require("training"), dict(batch), binary=True))
+        return self.transport.call(Request("forward", self.jobs.require("training"), dict(batch), binary=True))
 
     def step(self, learning_rate: float | None = None) -> dict:
         # NOTE: response *shapes* also diverge across backends -- on-prem returns
@@ -72,15 +72,16 @@ class ArcticRLClient:
         # on ONE schema (loss + metrics) so callers never key on backend.
         return self.transport.call(Request("step", self.jobs.require("training"), {"learning_rate": learning_rate}))
 
-    def save_checkpoint(self, stage_info: dict | None = None, path: str | None = None) -> dict:
-        # `path` is this call's destination; when None the server uses the job's
-        # config.checkpoint_path. An explicit `path` here wins over the config.
-        body = {"stage_info": stage_info, "path": path}
-        return self.transport.call(Request("save-checkpoint", self.jobs.require("training"), body))
+    def save_checkpoint(self, checkpoint_id: str | None = None, checkpoint_type: str = "resumable") -> dict:
+        # Matches Cortex's `save(job_id, checkpoint_id=None, checkpoint_type=None)`.
+        body = {"checkpoint_id": checkpoint_id, "checkpoint_type": checkpoint_type}
+        return self.transport.call(Request("save", self.jobs.require("training"), body))
 
     # ── sampling / log-prob ──────────────────────────────────────────────
-    def generate(self, prompts: list, sampling_params: dict | None = None, routing_key: Any = None) -> list:
-        body = {"prompts": prompts, "sampling_params": sampling_params, "routing_key": routing_key}
+    def generate(
+        self, prompts: list, sampling_params: dict | None = None, routing_key: Any = None, strict: bool = False
+    ) -> list:
+        body = {"prompts": prompts, "sampling_params": sampling_params, "routing_key": routing_key, "strict": strict}
         return self.transport.call(Request("generate", self.jobs.require("sampling"), body))["results"]
 
     def log_probs(self, prompts: list, completions: list | None = None, top_k: int = 1) -> dict:
@@ -89,12 +90,14 @@ class ArcticRLClient:
 
     # ── weight sync + cache ──────────────────────────────────────────────
     def sync_weights(self) -> dict:
-        # sync-weights has no primary job id; both ids travel in the body.
+        # Matches Cortex's `weight_sync(job_id, source_sub_job_id, target_sub_job_ids)`.
+        # On-prem treats a sub_job_id as its plain job id: source == training, targets == [sampling].
         tid, sid = self.jobs.require("training"), self.jobs.require("sampling")
-        return self.transport.call(Request("sync-weights", None, {"training_job_id": tid, "sampling_job_id": sid}))
+        body = {"source_sub_job_id": tid, "target_sub_job_ids": [sid]}
+        return self.transport.call(Request("weight-sync", tid, body))
 
-    def reset_prefix_cache(self, drain: bool = True, timeout_s: float = 60.0) -> dict:
-        body = {"drain": drain, "timeout_s": timeout_s}
+    def reset_prefix_cache(self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1) -> dict:
+        body = {"drain": drain, "timeout_s": timeout_s, "retry_interval_s": retry_interval_s}
         return self.transport.call(Request("reset-prefix-cache", self.jobs.require("sampling"), body))
 
     # ── lifecycle ────────────────────────────────────────────────────────

@@ -62,8 +62,11 @@ from arctic_platform.rl.utils.ray_pg import pg_scheduling_options
 from arctic_platform.rl.utils.server_models import GenerateRequest
 from arctic_platform.rl.utils.server_models import JobConfig
 from arctic_platform.rl.utils.server_models import LogProbsRequest
-from arctic_platform.rl.utils.server_models import SyncWeightsRequest
+from arctic_platform.rl.utils.server_models import ResetPrefixCacheRequest
+from arctic_platform.rl.utils.server_models import SaveRequest
+from arctic_platform.rl.utils.server_models import StepRequest
 from arctic_platform.rl.utils.server_models import WeightNormRequest
+from arctic_platform.rl.utils.server_models import WeightSyncRequest
 from arctic_platform.rl.utils.server_models import build_model_config
 
 logger = logging.getLogger(__name__)
@@ -351,8 +354,8 @@ async def destroy(job_id: int, job_type: str = Body(..., embed=True)):
     return {"job_id": job_id}
 
 
-@app.post("/fwd-bwd")
-async def fwd_bwd(
+@app.post("/forward-backward")
+async def forward_backward(
     job_id: int,
     body: bytes = Body(..., media_type="application/octet-stream"),
 ):
@@ -388,7 +391,7 @@ async def fwd_bwd(
     losses = [r["avg_loss"] for r in results]
     avg_loss = sum(losses)  # / len(losses)
 
-    # See ray_server.fwd_bwd for the rationale: collapse the per-DP-rank
+    # See ray_server.forward_backward for the rationale: collapse the per-DP-rank
     # paired ``.sum`` / ``.tokens`` metric scalars into one global
     # token-mean scalar per metric per mini-batch. ``batch`` is intentionally
     # omitted -- the driver does not consume it (see note above).
@@ -406,8 +409,8 @@ async def fwd_bwd(
     return Response(content=buffer.getvalue(), media_type="application/octet-stream")
 
 
-@app.post("/fwd-no-grad")
-async def fwd_no_grad(
+@app.post("/forward")
+async def forward(
     job_id: int,
     body: bytes = Body(..., media_type="application/octet-stream"),
 ):
@@ -442,7 +445,9 @@ async def fwd_no_grad(
 
 
 @app.post("/step")
-async def step(job_id: int):
+async def step(job_id: int, request: StepRequest = Body(default=StepRequest())):
+    # `learning_rate` is accepted for Cortex parity; on-prem uses the DeepSpeed
+    # scheduler's LR, so it is not applied here.
     _verify_job(job_id, "training")
     results = await asyncio.gather(*[w.step.remote() for w in app.state.training_workers])
     merged = dict(
@@ -465,8 +470,10 @@ async def empty_training_cache(job_id: int):
     return {"job_id": job_id, "workers": results}
 
 
-@app.post("/save-checkpoint")
-async def save_checkpoint(job_id: int):
+@app.post("/save")
+async def save(job_id: int, request: SaveRequest = Body(default=SaveRequest())):
+    # `checkpoint_id`/`checkpoint_type` are accepted for Cortex parity; on-prem
+    # saves to the job's configured checkpoint_path.
     _verify_job(job_id, "training")
     info = app.state.jobs[job_id]
     path = info.get("checkpoint_path", None)
@@ -517,8 +524,11 @@ async def wake_inference(job_id: int, tags: list[str] | None = None):
 
 
 @app.post("/reset-prefix-cache")
-async def reset_prefix_cache(job_id: int):
-    """Reset the prefix cache on the sampling inference engines."""
+async def reset_prefix_cache(job_id: int, request: ResetPrefixCacheRequest = Body(default=ResetPrefixCacheRequest())):
+    """Reset the prefix cache on the sampling inference engines.
+
+    `drain`/`timeout_s`/`retry_interval_s` are accepted for Cortex parity.
+    """
     _verify_job(job_id, "sampling")
     results = {}
     pool: ReplicaPool = app.state.sampling_pool
@@ -601,7 +611,7 @@ async def wake_log_prob(job_id: int):
 async def generate(job_id: int, request: GenerateRequest = Body(...)):
     _verify_job(job_id, "sampling")
     pool: ReplicaPool = app.state.sampling_pool
-    results = await pool.generate(request.prompts, request.sampling_params)
+    results = await pool.generate(request.prompts, request.sampling_params, strict=request.strict)
     return {"job_id": job_id, "results": results}
 
 
@@ -627,16 +637,21 @@ async def weight_norm(request: WeightNormRequest = Body(...)):
     }
 
 
-@app.post("/sync-weights")
-async def sync_weights(request: SyncWeightsRequest = Body(...)):
+@app.post("/weight-sync")
+async def weight_sync(job_id: int, request: WeightSyncRequest = Body(...)):
     """Sync training model weights to the sampling engine.
+
+    Matches Cortex's `weight_sync(job_id, source_sub_job_id, target_sub_job_ids)`;
+    on-prem treats a sub_job_id as its plain job id (source == training, target == sampling).
 
     Uses NCCL for non-colocated mode (separate GPUs).  In colocated mode:
     - cuda_ipc=True: CUDA IPC (zero-copy, requires training weights on GPU)
     - cuda_ipc=False: CPU file path (slower, works when offloaded)
     """
-    _verify_job(request.training_job_id, "training")
-    _verify_job(request.sampling_job_id, "sampling")
+    training_job_id = request.source_sub_job_id
+    sampling_job_id = request.target_sub_job_ids[0]
+    _verify_job(training_job_id, "training")
+    _verify_job(sampling_job_id, "sampling")
 
     workers = app.state.training_workers
     pool: ReplicaPool = app.state.sampling_pool
@@ -653,17 +668,15 @@ async def sync_weights(request: SyncWeightsRequest = Body(...)):
                 results = await _sync_weights_cuda_ipc(workers, pool, lp_pool)
         else:
             print("colo _sync_weights_ipc")
-            training_job_info = app.state.jobs.get(request.training_job_id)
+            training_job_info = app.state.jobs.get(training_job_id)
             sync_path = training_job_info.get("sync_path", None)
-            assert sync_path is not None, f"sync_path is required for training job {request.training_job_id}"
+            assert sync_path is not None, f"sync_path is required for training job {training_job_id}"
             results = await _sync_weights_ipc(sync_path, workers, pool, lp_pool)
     else:
         print("colo _sync_weights_nccl")
         results = await _sync_weights_nccl(workers, pool)
 
-    # await self.arctic_rl_ray_server_state.reset_prefix_cache.remote(request.sampling_job_id)
-
-    return {"job_id": request.training_job_id, **results}
+    return {"job_id": training_job_id, **results}
 
     # if colocate:
     #     lp_pool = app.state.log_prob_pool
@@ -796,7 +809,7 @@ async def _sync_weights_cuda_ipc_low_mem(workers, pool: ReplicaPool, lp_pool: Re
     Selected via ``arctic_rl.low_memory_weight_sync=True``.
 
     The staged wake (weights with restore_weights → kv_cache) is driven by the
-    http_client around the /sync-weights call (same as ``_sync_weights_cuda_ipc``);
+    http_client around the /weight-sync call (same as ``_sync_weights_cuda_ipc``);
     the weights wake restores full-shape vLLM params so the per-param chunk copy
     lands on real storage rather than offloaded [1] stubs.
     """
