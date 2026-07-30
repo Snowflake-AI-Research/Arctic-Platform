@@ -39,8 +39,8 @@ Wire layout of one frame is just a safetensors blob::
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from typing import Any
 
 import torch

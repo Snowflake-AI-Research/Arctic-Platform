@@ -25,7 +25,6 @@ from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transports.onprem import OnPremTransport
 
-
 # Ops the server wants as DSSST1 octet even without tensors in the body: a wire
 # requirement of the endpoint (matching Cortex/SnowAPI), not payload binary-ness.
 _OCTET_OPS = frozenset({"generate"})
