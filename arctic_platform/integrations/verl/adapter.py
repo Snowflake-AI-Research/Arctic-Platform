@@ -19,18 +19,24 @@
 # ``VERL_USE_EXTERNAL_MODULES=arctic_platform.integrations.verl.register``
 # without living in the verl source tree.
 """Arctic-RL adapter: implements verl's :class:`RemoteBackend` on top of
-:mod:`arctic_platform.rl`.
+:mod:`arctic_platform.client`.
 
 Registered under the name ``"arctic"`` by
 ``@RemoteBackendRegistry.register("arctic")`` at import time; the plugin
 entry point (:mod:`arctic_platform.integrations.verl.register`) imports
 this module for that side effect, and pairs it with the matching per-
 backend worker and rollout replica.
+
+Backend selection is a single yaml field (``remote_backend.backend``),
+resolved inside :class:`arctic_platform.client.ArcticRLClient` via
+``make_transport(config)``. The adapter itself is backend-agnostic:
+identical call surface for on-prem (HTTP or Ray) and Cortex.
 """
 
 import os
 from copy import deepcopy
 from typing import Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -39,9 +45,15 @@ from transformers import AutoTokenizer
 from verl.remote_backend.base import RemoteBackend
 from verl.remote_backend.base import RemoteBackendRegistry
 
-from arctic_platform.rl import ArcticRLClientConfig
-from arctic_platform.rl import create_arctic_rl_client
-from arctic_platform.rl.ray_server import ArcticRLRayServerState
+from arctic_platform.client import ArcticRLClientConfig
+from arctic_platform.client import create_arctic_rl_client
+
+if TYPE_CHECKING:
+    # Only used as a type hint on the reconnect path; the concrete class lives
+    # in the Ray transport (which pulls ray in as a hard dep). Keeping this
+    # import guarded so the adapter module still imports on a Cortex-only
+    # install that never touches Ray.
+    from arctic_platform.client.transports.onprem_ray import ArcticRLRayServerState
 
 _ARCTIC_METRIC_REDUCTION_FN = {
     "actor/pg_clipfrac_lower": np.mean,
@@ -139,7 +151,7 @@ class ArcticRLClientWrapper(RemoteBackend):
         self,
         config,
         reconnect_job_config: dict = None,
-        rl_server_state: ArcticRLRayServerState = None,
+        rl_server_state: "ArcticRLRayServerState | None" = None,
     ):
         self.config = config
         # Per-backend yaml is loaded flat at `config.remote_backend`; the file
@@ -247,7 +259,7 @@ class ArcticRLClientWrapper(RemoteBackend):
         )
         payload = dict(batch=batch, meta=meta)
 
-        response = await (self._send_compute_ref_log_prob(payload) if ref else self._send_compute_log_prob(payload))
+        response = self._send_compute_ref_log_prob(payload) if ref else self._send_compute_log_prob(payload)
 
         model_output = {"log_probs": response["batch"]["log_probs"]}
         if calculate_entropy and "entropy" in response["batch"]:
@@ -357,7 +369,7 @@ class ArcticRLClientWrapper(RemoteBackend):
                     meta_chunk["rollout_is_weights"] = None
 
                 payload = dict(batch=batch_chunk, meta=meta_chunk)
-                response = await self._send_update_actor(payload)
+                response = self._send_update_actor(payload)
 
                 mb_metrics = dict(response["metrics"])
                 loss_list.append(mb_metrics.pop("loss"))
@@ -465,7 +477,7 @@ class ArcticRLClientWrapper(RemoteBackend):
     def _initialize_client(
         self,
         reconnect_job_config: dict = None,
-        rl_server_state: ArcticRLRayServerState = None,
+        rl_server_state: "ArcticRLRayServerState | None" = None,
     ):
         if rl_server_state is not None:
             return create_arctic_rl_client(reconnect_job_config, rl_server_state)
@@ -552,16 +564,43 @@ class ArcticRLClientWrapper(RemoteBackend):
             "min_lr_ratio": optim_cfg.get("min_lr_ratio", None),
         }
 
+        # `backend` is the single knob that selects the transport
+        # (make_transport(config) in arctic_platform.client). The adapter
+        # itself stays backend-agnostic; on-prem-specific fields are simply
+        # ignored on the Cortex path (and vice versa) at the client layer.
+        backend = self._backend_config.get("backend", "onprem")
+
+        # Cortex sub-block (optional; only meaningful when backend == "cortex").
+        # The block itself is a yaml dict under `remote_backend.cortex`; keys
+        # are forwarded 1:1 into ArcticRLClientConfig. Any missing keys fall
+        # back to CortexTransport defaults or CORTEX_* env vars.
+        cortex_cfg = self._backend_config.get("cortex", None)
+        cortex_kwargs: dict[str, Any] = {}
+        if cortex_cfg is not None:
+            cortex_container = OmegaConf.to_container(cortex_cfg, resolve=True)
+            # Whitelist keys so a typo in the yaml doesn't get silently ignored
+            # by pydantic's `extra="ignore"`.
+            for key in (
+                "cortex_base_url",
+                "cortex_host",
+                "cortex_pat_env_var",
+                "cortex_database",
+                "cortex_schema",
+                "cortex_endpoint",
+                "max_seq_len",
+            ):
+                if key in cortex_container and cortex_container[key] is not None:
+                    cortex_kwargs[key] = cortex_container[key]
+
         rl_config = ArcticRLClientConfig(
             host=None if self._backend_config.comms.protocol == "ray" else "localhost",
             port=None if self._backend_config.comms.protocol == "ray" else 7000,
             comm_protocol=self._backend_config.comms.protocol,
-            backend="local",
+            backend=backend,
             training_gpus=n_training_gpus,
             sampling_gpus=n_sampling_gpus,
             log_prob_gpus=n_log_prob_gpus,
             colocate=colocate,
-            log_prob_engine="deepspeed",
             model_name=model_name,
             ds_config=self._create_ds_config(n_training_gpus),
             log_prob_ds_config=(None if n_log_prob_gpus == 0 else self._create_ds_config(n_log_prob_gpus)),
@@ -579,15 +618,19 @@ class ArcticRLClientWrapper(RemoteBackend):
             checkpoint_path=self.config.trainer.default_local_dir,
             full_determinism=self._backend_config.train.determinism.get("full", False),
             seed=self._backend_config.train.determinism.get("seed", 42),
+            **cortex_kwargs,
         )
 
-        # ArcticRLClient is constructed as a ray remote actor with num_gpus=0,
-        # which causes CUDA_VISIBLE_DEVICES to be empty.
-        if colocate:
-            num_visible = n_training_gpus + n_sampling_gpus + n_log_prob_gpus
-        else:
-            num_visible = rl_config.training_gpus + rl_config.sampling_gpus + rl_config.log_prob_gpus
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_visible))
+        # On-prem colocated: driver actor is scheduled with num_gpus=0 so
+        # CUDA_VISIBLE_DEVICES needs to be widened manually to cover every job
+        # the client is about to fork. Skip entirely on Cortex — placement is
+        # server-side there and CUDA_VISIBLE_DEVICES on the driver is a no-op.
+        if backend == "onprem":
+            if colocate:
+                num_visible = n_training_gpus + n_sampling_gpus + n_log_prob_gpus
+            else:
+                num_visible = rl_config.training_gpus + rl_config.sampling_gpus + rl_config.log_prob_gpus
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_visible))
 
         return create_arctic_rl_client(rl_config)
 
@@ -599,10 +642,10 @@ class ArcticRLClientWrapper(RemoteBackend):
     }
 
     async def generate(self, prompt_ids, sampling_params, routing_key=None) -> list:
-        # `routing_key` kept for caller-API compat; arctic_platform.rl handles routing internally.
+        # `routing_key` kept for caller-API compat; arctic_platform.client handles routing internally.
         prompts = [self.tokenizer.decode(prompt_ids)]
         merged_params = {**self._default_sampling_params, **sampling_params}
-        return await self._client.generate(
+        return self._client.generate(
             prompts=prompts,
             sampling_params=merged_params,
         )
@@ -614,25 +657,25 @@ class ArcticRLClientWrapper(RemoteBackend):
     # backends are free to pick their own wire format; verl never calls
     # these directly.
 
-    async def _send_compute_ref_log_prob(self, payload: dict):
+    def _send_compute_ref_log_prob(self, payload: dict):
         payload["processing"] = {
             "post": ["compute_entropy_and_logprobs"],
             "loss_fn": None,
         }
-        response = await self._client.fwd_no_grad(payload, reference_model=True)
+        response = self._client.fwd_no_grad(payload, reference_model=True)
         response["batch"]["log_probs"] = response["batch"].pop("logprobs")
         return response
 
-    async def _send_compute_log_prob(self, payload: dict):
+    def _send_compute_log_prob(self, payload: dict):
         payload["processing"] = {
             "post": ["compute_entropy_and_logprobs"],
             "loss_fn": None,
         }
-        response = await self._client.fwd_no_grad(payload, reference_model=False)
+        response = self._client.fwd_no_grad(payload, reference_model=False)
         response["batch"]["log_probs"] = response["batch"].pop("logprobs")
         return response
 
-    async def _send_update_actor(self, payload: dict):
+    def _send_update_actor(self, payload: dict):
         payload["processing"] = {
             "post": ["apply_temperature", "compute_entropy_and_logprobs"],
             "loss_fn": "verl_grpo",
@@ -652,28 +695,28 @@ class ArcticRLClientWrapper(RemoteBackend):
                 payload["batch"][name] = _left_pad(payload["batch"][name], seq_len)
         payload["batch"]["loss_mask"] = payload["batch"]["response_mask"]
 
-        fwd_bwd_response = await self._client.fwd_bwd(payload)
-        step_response = await self._client.step()
+        fwd_bwd_response = self._client.fwd_bwd(payload)
+        step_response = self._client.step()
         step_response["metrics"].update(**fwd_bwd_response["metrics"])
         return step_response
 
     async def save_checkpoint(self):
-        return await self._client.save_checkpoint()
+        return self._client.save_checkpoint()
 
     async def update_weights(self):
-        return await self._client.sync_weights(
+        return self._client.sync_weights(
             cuda_ipc=self.cuda_ipc_weight_sync,
             low_memory=self.low_memory_weight_sync,
         )
 
     async def wake_up_inference(self, tags: list[str] = None):
-        return await self._client.wake_inference(tags=tags)
+        return self._client.wake_inference(tags=tags)
 
     async def sleep_inference(self, level: int = 1):
-        return await self._client.sleep_inference(level=level)
+        return self._client.sleep_inference(level=level)
 
     async def reset_prefix_cache(self):
-        return await self._client.reset_prefix_cache()
+        return self._client.reset_prefix_cache()
 
     async def destroy(self) -> None:
         # Idempotent: `RemoteBackendTrainer` may call `destroy()` on
@@ -681,4 +724,4 @@ class ArcticRLClientWrapper(RemoteBackend):
         # being a no-op instead of double-shutting the client.
         if self._client is not None:
             client, self._client = self._client, None
-            await client.shutdown()
+            client.shutdown()
