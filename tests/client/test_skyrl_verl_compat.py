@@ -126,6 +126,75 @@ class TestConfigLegacyAliases:
         assert cfg.backend == "onprem"
         assert not hasattr(cfg, "log_prob_engine")
 
+    def test_server_init_extras_accepted(self) -> None:
+        """verl adapter passes ds_worker_config / log_prob_ds_config /
+        arctic_inference_config / full_determinism; the unified config must
+        accept them so they can reach `_init_payload`."""
+        cfg = ArcticRLClientConfig(
+            model_name="m",
+            training_gpus=1,
+            log_prob_ds_config={"train_micro_batch_size_per_gpu": 1},
+            ds_worker_config={"use_liger": True, "attn_implementation": "flash_attention_2"},
+            arctic_inference_config={"speculative_decoding": {"model": None}},
+            full_determinism=True,
+        )
+        assert cfg.log_prob_ds_config == {"train_micro_batch_size_per_gpu": 1}
+        assert cfg.ds_worker_config["use_liger"] is True
+        assert cfg.arctic_inference_config["speculative_decoding"]["model"] is None
+        assert cfg.full_determinism is True
+
+    def test_init_payload_forwards_server_extras(self) -> None:
+        """The on-prem transport's `_init_payload` must thread the extras onto
+        the wire so the server DS worker / Arctic-Inference config actually
+        take effect."""
+        from arctic_platform.client.transports.onprem import OnPremTransport
+
+        cfg = ArcticRLClientConfig(
+            model_name="m",
+            training_gpus=1,
+            sampling_gpus=1,
+            log_prob_gpus=1,
+            ds_config={"zero_optimization": {"stage": 2}},
+            log_prob_ds_config={"train_micro_batch_size_per_gpu": 1},
+            ds_worker_config={"attn_implementation": "flash_attention_2"},
+            arctic_inference_config={"zorro_inference": {"enable": True}},
+            full_determinism=True,
+            training_config={"training_horizon": 100},
+            vllm_config={"gpu_memory_utilization": 0.7},
+        )
+
+        class _Peek(OnPremTransport):
+            def _start(self, payload: dict) -> str:
+                return "id"
+
+            def _rpc(self, request):
+                return {}
+
+            def _destroy(self, job_id, job_type):
+                return None
+
+            def _wait_running(self) -> None:
+                return None
+
+        t = _Peek(cfg)
+
+        train = t._init_payload("training")
+        assert train["ds_config"] == {"zero_optimization": {"stage": 2}}
+        assert train["ds_worker_config"] == {"attn_implementation": "flash_attention_2"}
+        assert train["training_config"] == {"training_horizon": 100}
+        assert train["full_determinism"] is True
+        assert "arctic_inference_config" not in train  # sampling-only
+
+        log_prob = t._init_payload("log_prob")
+        assert log_prob["ds_config"] == {"train_micro_batch_size_per_gpu": 1}
+        assert log_prob["ds_worker_config"] == {"attn_implementation": "flash_attention_2"}
+        assert "training_config" not in log_prob
+
+        sampling = t._init_payload("sampling")
+        assert sampling["vllm_config"] == {"gpu_memory_utilization": 0.7}
+        assert sampling["arctic_inference_config"] == {"zorro_inference": {"enable": True}}
+        assert "ds_config" not in sampling
+
 
 # ── SkyRL client-surface pinning ─────────────────────────────────────────
 

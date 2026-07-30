@@ -98,6 +98,33 @@ class ArcticRLClientConfig(BaseModel):
             "that call and falls back to this dir when path is None."
         ),
     )
+    # Server-side init knobs threaded through `_init_payload` — these existed
+    # on the legacy `arctic_platform.rl.ArcticRLClientConfig` and are used by
+    # the on-prem DeepSpeed / Arctic-Inference servers. Kept typed as
+    # `dict | None` so verl / SkyRL can pass their yaml sub-blocks through
+    # without repeating the schema here.
+    log_prob_ds_config: dict[str, Any] | None = Field(
+        None, description="onprem: log-prob job's DeepSpeed engine config (dtype, batch, ...)."
+    )
+    ds_worker_config: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "onprem: DeepSpeed worker config forwarded to `deepspeed_worker.py` "
+            "(use_liger, attn_implementation, zorro_train_*, logits_*)."
+        ),
+    )
+    arctic_inference_config: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "onprem: Arctic-Inference rollout config (Forest Cascade Attention, "
+            "speculative decoding). Server keys on zorro_inference.enable / "
+            "speculative_decoding.model."
+        ),
+    )
+    full_determinism: bool = Field(
+        False,
+        description="onprem: enable full DeepSpeed determinism (reproducibility over throughput).",
+    )
 
     # cortex (SnowAPI)
     cortex_base_url: str | None = Field(None, description="Mock/direct GS URL; bypasses PAT auth.")

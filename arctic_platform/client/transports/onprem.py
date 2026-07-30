@@ -78,16 +78,26 @@ class OnPremTransport(Transport):
     def _init_payload(self, job_type: str) -> dict[str, Any]:
         cfg = self.config
         payload: dict[str, Any] = {"model_name": cfg.model_name, "job_type": job_type, "seed": cfg.seed}
+        if cfg.full_determinism:
+            payload["full_determinism"] = True
         if job_type in ("training", "log_prob"):
-            if cfg.ds_config:
+            # Log-prob may override the base `ds_config` with its own tuning.
+            if job_type == "log_prob" and cfg.log_prob_ds_config is not None:
+                payload["ds_config"] = cfg.log_prob_ds_config
+            elif cfg.ds_config:
                 payload["ds_config"] = cfg.ds_config
+            if cfg.ds_worker_config is not None:
+                payload["ds_worker_config"] = cfg.ds_worker_config
             if job_type == "training":
                 if cfg.training_config:
                     payload["training_config"] = cfg.training_config
                 if cfg.checkpoint_path:
                     payload["checkpoint_path"] = cfg.checkpoint_path
-        elif cfg.vllm_config:
-            payload["vllm_config"] = cfg.vllm_config
+        else:
+            if cfg.vllm_config:
+                payload["vllm_config"] = cfg.vllm_config
+            if cfg.arctic_inference_config is not None:
+                payload["arctic_inference_config"] = cfg.arctic_inference_config
         return payload
 
     # delivery primitives — the only things a concrete transport implements
