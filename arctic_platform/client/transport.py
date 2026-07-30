@@ -49,6 +49,17 @@ OPS = frozenset(
         "log-probs",
         "sync-weights",
         "reset-prefix-cache",
+        # Colocation lifecycle: SkyRL calls these unconditionally when
+        # `colocate=True`. On-prem implements them; Cortex no-ops.
+        "wake-training",
+        "sleep-training",
+        "wake-inference",
+        "sleep-inference",
+        "wake-log-prob",
+        "sleep-log-prob",
+        "empty-training-cache",
+        "weight-norm",
+        "save-weights",
     }
 )
 
