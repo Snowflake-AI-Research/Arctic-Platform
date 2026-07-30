@@ -26,9 +26,37 @@ from pydantic import model_validator
 
 
 class ArcticRLClientConfig(BaseModel):
-    backend: Literal["local", "dss-platform"] = "local"
+    # `cortex` routes through `arctic_platform.client` (unified client + Cortex
+    # transport) at `create_arctic_rl_client` time — the legacy on-prem path
+    # (`local` / `dss-platform`) is unchanged. Adding a value here rather than a
+    # separate config type so both merged upstream integrations
+    # (NovaSky-AI/SkyRL#1837 + verl-project/verl#6422's Arctic adapter) can flip
+    # to Cortex by setting a single field with no other code changes.
+    backend: Literal["local", "dss-platform", "cortex"] = "local"
     comm_protocol: Literal["http", "ray"] = "http"
     checkpoint_path: Optional[str] = None
+
+    # ---- Cortex-only fields (ignored on `local` / `dss-platform`). --------
+    # These are forwarded 1:1 into `arctic_platform.client.ArcticRLClientConfig`
+    # by `_cortex_dispatch._to_unified_config`; any that are None fall back to
+    # `CortexTransport` defaults / `CORTEX_*` env vars.
+    cortex_host: Optional[str] = Field(
+        default=None, description="Cortex-only: SnowAPI host (e.g. account.snowflakecomputing.com)."
+    )
+    cortex_database: Optional[str] = Field(default=None, description="Cortex-only: SnowAPI database.")
+    cortex_schema: Optional[str] = Field(default=None, description="Cortex-only: SnowAPI schema.")
+    cortex_endpoint: Optional[str] = Field(
+        default=None, description="Cortex-only: Cortex-training endpoint name (defaults to 'cortex-training')."
+    )
+    cortex_pat_env_var: Optional[str] = Field(
+        default=None, description="Cortex-only: env var holding the PAT (defaults to CORTEX_PAT)."
+    )
+    cortex_base_url: Optional[str] = Field(
+        default=None, description="Cortex-only: direct GS URL (bypasses PAT auth); useful for mocks / staging."
+    )
+    max_seq_len: Optional[int] = Field(
+        default=None, description="Cortex-only: max seq len for cortex sub-jobs (falls back to unified default)."
+    )
 
     # it's best not to pass explicitly the host and port since they are auto derived from comm_protocol
     host: Optional[str] = None
@@ -111,7 +139,12 @@ class ArcticRLClientConfig(BaseModel):
         this node's routable IP at port 7000 so off-node Ray workers can reach
         the driver node by IP rather than "localhost". Values passed explicitly
         by the caller are left untouched (e.g. reconnecting to a known server).
+
+        Cortex bypasses on-prem host/port entirely (routing is via SnowAPI
+        base_url), so we short-circuit before touching the ray_cluster helper.
         """
+        if self.backend == "cortex":
+            return self
         # Lazy import to avoid pulling ray in at config import time.
         from arctic_platform.rl.ray_cluster import primary_ip
 
