@@ -132,12 +132,19 @@ class TestOpMapping:
         assert req.body == {"drain": False, "timeout_s": 5.0}
 
     def test_sync_weights_has_no_primary_job_id(self, client):
-        """sync_weights -> job_id None; both ids ride in the body."""
+        """sync_weights -> job_id None; both ids and the on-prem colocation
+        hints (`cuda_ipc`, `low_memory`) ride in the body. SkyRL's colocated
+        path calls `sync_weights(cuda_ipc=True)`; Cortex ignores the hints."""
         client.sync_weights()
         req = _last(client)
         assert req.op == "sync-weights"
         assert req.job_id is None
-        assert req.body == {"training_job_id": TRAINING, "sampling_job_id": SAMPLING}
+        assert req.body == {
+            "training_job_id": TRAINING,
+            "sampling_job_id": SAMPLING,
+            "cuda_ipc": False,
+            "low_memory": False,
+        }
 
 
 class TestLifecycle:
@@ -159,7 +166,13 @@ class TestOpRegistry:
     transport's op coverage is checkable without a live backend."""
 
     def test_client_emits_exactly_the_registered_ops(self, client):
-        """Driving every client op must produce exactly the canonical OPS set."""
+        """Driving every client op must produce exactly the canonical OPS set.
+
+        The colocation-lifecycle ops (`wake_/sleep_training/inference/log_prob`,
+        `empty_training_cache`, `weight_norm`, `save_weights`) are part of the
+        canonical vocabulary because SkyRL calls them unconditionally under
+        `colocate=True` — they must dispatch even though Cortex no-ops them.
+        """
         client.fwd_bwd({"input_ids": [1]})
         client.fwd_no_grad({"input_ids": [1]})
         client.step()
@@ -168,6 +181,15 @@ class TestOpRegistry:
         client.log_probs(["hi"])
         client.sync_weights()
         client.reset_prefix_cache()
+        client.wake_training()
+        client.sleep_training()
+        client.wake_inference()
+        client.sleep_inference()
+        client.wake_log_prob()
+        client.sleep_log_prob()
+        client.empty_training_cache()
+        client.weight_norm()
+        client.save_weights()
         assert {req.op for req in client.transport.calls} == OPS
 
     def test_unresolved_ops_flags_a_missing_method(self):

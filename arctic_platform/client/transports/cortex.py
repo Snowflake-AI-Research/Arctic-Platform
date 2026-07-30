@@ -269,12 +269,30 @@ class CortexTransport(Transport):
         self._session = self._build_session()
         self._handlers: dict[str, Callable[[dict], dict]] = {
             "fwd-bwd": self._fwd_bwd,
+            "fwd-no-grad": self._fwd_no_grad,
+            "log-probs": self._log_probs,
             "step": self._step,
             "save-checkpoint": self._save_checkpoint,
             "generate": self._generate,
             "sync-weights": self._sync_weights,
             "reset-prefix-cache": self._reset_prefix_cache,
         }
+        # Colocation lifecycle ops are no-ops on Cortex (sub-jobs live in
+        # separate placements; there is no wake/sleep concept). We register
+        # them so SkyRL's colocated code path stays call-shape identical
+        # without branching on backend. See ArcticRLClient._colo.
+        for op in (
+            "wake-training",
+            "sleep-training",
+            "wake-inference",
+            "sleep-inference",
+            "wake-log-prob",
+            "sleep-log-prob",
+            "empty-training-cache",
+            "weight-norm",
+            "save-weights",
+        ):
+            self._handlers[op] = self._colo_noop
 
     def initialize(self) -> JobHandles:
         cfg = self.config
@@ -305,6 +323,7 @@ class CortexTransport(Transport):
 
     # ── op handlers: canonical body -> SnowAPI call -> canonical dict ──────
     def _fwd_bwd(self, body: dict) -> dict:
+        body = self._normalize_train_body(body)
         payload = wire.dumps(body, metadata=_CHUNKED_DSSST1)
         request_id = self._post_octet_request_chunks(
             path_suffix="forward-backward",
@@ -312,12 +331,51 @@ class CortexTransport(Transport):
             frame=payload,
             max_bytes=self._MAX_FWD_BWD_BYTES,
         )["request_id"]
+        return self._shape_train_response(self._poll(request_id))
+
+    def _fwd_no_grad(self, body: dict) -> dict:
+        """Cortex-side forward-only pass; returns model_outputs (log-probs).
+
+        SkyRL and verl both need this every training step. Symmetric to
+        `_fwd_bwd`: same octet-chunked submit + poll, hitting
+        ``/{job_id}/forward-no-grad``. Requires the Neutrino GS to expose the
+        endpoint (see the tracking issue). Same envelope translation applies:
+        callers that ship the verl-GRPO ``{batch, meta, processing}`` shape
+        have it repackaged into ``{args, kwargs}`` for Cortex.
+        """
+        body = self._normalize_train_body(body)
+        payload = wire.dumps(body, metadata=_CHUNKED_DSSST1)
+        request_id = self._post_octet_request_chunks(
+            path_suffix="forward-no-grad",
+            operation="fwd-no-grad",
+            frame=payload,
+            max_bytes=self._MAX_FWD_BWD_BYTES,
+        )["request_id"]
+        return self._shape_train_response(self._poll(request_id))
+
+    def _log_probs(self, body: dict) -> dict:
+        """Cortex-side log-probs endpoint (JSON in / DSSST1-decoded out).
+
+        Symmetric to ``_generate`` in framing but returns a log-probs dict
+        rather than sampled sequences. Requires the Neutrino GS endpoint at
+        ``/{job_id}/log-probs``.
+        """
+        payload: dict = {"prompts": body["prompts"]}
+        if body.get("completions") is not None:
+            payload["completions"] = body["completions"]
+        if body.get("top_k") is not None:
+            payload["top_k"] = body["top_k"]
+        request_id = self._send(
+            "POST",
+            f"{self._prefix}/{self.job_id}/log-probs",
+            json=payload,
+        ).json()["request_id"]
         return self._poll(request_id)
 
     def _step(self, body: dict) -> dict:
         req_body = {} if body["learning_rate"] is None else {"learning_rate": body["learning_rate"]}
         request_id = self._send("POST", f"{self._prefix}/{self.job_id}/step", json=req_body).json()["request_id"]
-        return self._poll(request_id)
+        return self._shape_train_response(self._poll(request_id))
 
     def _save_checkpoint(self, body: dict) -> dict:
         request_id = self._send(
@@ -344,6 +402,10 @@ class CortexTransport(Transport):
         return {"results": self._poll(request_id).get("results", [])}
 
     def _sync_weights(self, body: dict) -> dict:
+        # cuda_ipc / low_memory flags are on-prem colocation hints; Cortex has
+        # separate sub-jobs and does a server-driven pull regardless. Drop
+        # them silently rather than raising so SkyRL's colocated call site
+        # (`sync_weights(cuda_ipc=True)`) works unchanged.
         source = self.sub_jobs["training"]
         request_id = self._operation(
             "weight-sync",
@@ -352,6 +414,90 @@ class CortexTransport(Transport):
             sub_job_type="training",
         )["request_id"]
         return self._poll(request_id)
+
+    def _colo_noop(self, body: dict) -> dict:
+        """No-op handler for colocation-lifecycle ops.
+
+        SkyRL calls wake/sleep/empty_training_cache/weight_norm unconditionally
+        under `colocate=True`. Cortex has no colocation lifecycle (training
+        and sampling live in separate sub-jobs), so these are no-ops. Returning
+        `{}` matches on-prem's post-hoc metrics-less responses closely enough
+        that downstream `.get(...)` reads don't blow up.
+        """
+        return {}
+
+    def _normalize_train_body(self, body: dict) -> dict:
+        """Translate the verl-GRPO envelope into Cortex's RPC-style body.
+
+        The unified frontend forwards ``batch`` verbatim, but SkyRL and verl
+        build ``{batch: {input_ids, labels, ...}, meta: {...}, processing: {...}}``
+        while Cortex expects ``{args: [], kwargs: {input_ids, labels, ...}}``.
+        We detect the verl-GRPO shape (``"batch"`` key holding a dict) and
+        repack it into Cortex's shape. Bodies already in Cortex shape pass
+        through unchanged.
+
+        Extra sibling keys (``meta``, ``processing``, ``router_replay``,
+        ``context``, ``post_processors``, ``reference_model``, …) are copied
+        alongside so the Neutrino trainer — whose proto is
+        ``additionalProperties: true`` — can route them without a schema
+        change. ``reference_model`` in particular is how verl toggles between
+        the actor and reference forward-only pass.
+        """
+        if not isinstance(body, dict):
+            return body
+        batch = body.get("batch")
+        if not isinstance(batch, dict):
+            return body
+        kwargs = dict(batch)
+        out: dict = {"args": [], "kwargs": kwargs}
+        for key in (
+            "meta",
+            "processing",
+            "router_replay",
+            "context",
+            "post_processors",
+            "reference_model",
+        ):
+            if body.get(key) is not None:
+                out[key] = body[key]
+        return out
+
+    def _shape_train_response(self, result: dict) -> dict:
+        """Coerce a Cortex train-op response into the shape callers expect.
+
+        Cortex today returns loss-only for fwd_bwd; SkyRL reads
+        ``result["grad_norm"]`` and verl reads ``result["avg_loss"]`` /
+        ``result["post_process_outputs"]``. We surface the loss under
+        ``avg_loss`` (and mirror it as ``loss`` if the server used a different
+        key) so the integrations Just Work. Anything the server does return
+        (``model_outputs``, extra scalars) passes through untouched.
+
+        For fwd_no_grad, on-prem returns ``{"batch": {"logprobs": ...,
+        "entropy": ...}, ...}`` while Cortex packages the same fields under
+        ``model_outputs``. verl's adapter reads ``response["batch"]["log_probs"]``
+        after renaming; we alias ``model_outputs`` -> ``batch`` here so the
+        response schema is uniform across transports without touching the
+        integration.
+        """
+        if not isinstance(result, dict):
+            return result
+        out = dict(result)
+        if "avg_loss" not in out and "loss" in out:
+            out["avg_loss"] = out["loss"]
+        elif "loss" not in out and "avg_loss" in out:
+            out["loss"] = out["avg_loss"]
+        # Alias model_outputs -> batch so on-prem's response shape is the
+        # canonical one, regardless of which server produced the result.
+        if "batch" not in out and isinstance(out.get("model_outputs"), dict):
+            out["batch"] = dict(out["model_outputs"])
+        # Ensure the two dicts SkyRL/verl reach into always exist.
+        out.setdefault("metrics", {})
+        out.setdefault("post_process_outputs", {})
+        # ``grad_norm`` is not returned by Cortex today. Surface a None so
+        # ``.get("grad_norm")`` returns None rather than raising KeyError from
+        # downstream code that does dict subscripting.
+        out["metrics"].setdefault("grad_norm", None)
+        return out
 
     def _reset_prefix_cache(self, body: dict) -> dict:
         result = self._operation(

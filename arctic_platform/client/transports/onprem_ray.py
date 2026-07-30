@@ -74,3 +74,14 @@ class RayTransport(OnPremTransport):
     def shutdown(self) -> None:
         super().shutdown()
         self._loop.close()
+
+    def get_server_state(self) -> object:
+        """Expose the state actor for reconnect flows.
+
+        The SkyRL entrypoint runs the driver-side client in the parent
+        process, then dispatches training to a Ray remote task with a
+        `reconnect_config` and this server_state so the worker can reattach
+        to the same actors. Non-Ray transports return None from the client
+        wrapper `ArcticRLClient.get_server_state`.
+        """
+        return self._state
