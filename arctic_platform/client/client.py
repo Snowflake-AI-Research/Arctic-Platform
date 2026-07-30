@@ -88,17 +88,29 @@ class ArcticRLClient:
         body = {"prompts": prompts, "completions": completions, "top_k": top_k}
         return self.transport.call(Request("log-probs", self.jobs.require("log_prob"), body))
 
-    # ── weight sync + cache ──────────────────────────────────────────────
+    # ── weight sync + cache (control-plane ops -> the /operation envelope) ──
+    # The client assembles the full Cortex `/operation` envelope here so transports
+    # just forward it: SnowAPI reads the `sub_job_*` routing hints, on-prem accepts
+    # the same shape and ignores them (it addresses jobs by job id). On-prem treats a
+    # sub_job_id as its plain job id, so source/target ids double as its job ids.
     def sync_weights(self) -> dict:
-        # Matches Cortex's `weight_sync(job_id, source_sub_job_id, target_sub_job_ids)`.
-        # On-prem treats a sub_job_id as its plain job id: source == training, targets == [sampling].
         tid, sid = self.jobs.require("training"), self.jobs.require("sampling")
-        body = {"source_sub_job_id": tid, "target_sub_job_ids": [sid]}
-        return self.transport.call(Request("weight-sync", tid, body))
+        body = {
+            "operation_type": "weight-sync",
+            "sub_job_id": tid,
+            "sub_job_type": "training",
+            "payload": {"source_sub_job_id": tid, "target_sub_job_ids": [sid]},
+        }
+        return self.transport.call(Request("operation", tid, body))
 
     def reset_prefix_cache(self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1) -> dict:
-        body = {"drain": drain, "timeout_s": timeout_s, "retry_interval_s": retry_interval_s}
-        return self.transport.call(Request("reset-prefix-cache", self.jobs.require("sampling"), body))
+        sid = self.jobs.require("sampling")
+        body = {
+            "operation_type": "reset-prefix-cache",
+            "sub_job_type": "sampling",
+            "payload": {"drain": drain, "timeout_s": timeout_s, "retry_interval_s": retry_interval_s},
+        }
+        return self.transport.call(Request("operation", sid, body))
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def reconnect_config(self) -> ArcticRLClientConfig:

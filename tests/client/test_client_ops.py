@@ -124,20 +124,29 @@ class TestOpMapping:
         assert req.body == {"prompts": ["hi"], "completions": ["there"], "top_k": 3}
 
     def test_reset_prefix_cache_targets_sampling(self, client):
-        """reset_prefix_cache -> sampling job."""
+        """reset_prefix_cache -> sampling job via the operation envelope."""
         client.reset_prefix_cache(drain=False, timeout_s=5.0, retry_interval_s=0.2)
         req = _last(client)
-        assert req.op == "reset-prefix-cache"
+        assert req.op == "operation"
         assert req.job_id == SAMPLING
-        assert req.body == {"drain": False, "timeout_s": 5.0, "retry_interval_s": 0.2}
+        assert req.body == {
+            "operation_type": "reset-prefix-cache",
+            "sub_job_type": "sampling",
+            "payload": {"drain": False, "timeout_s": 5.0, "retry_interval_s": 0.2},
+        }
 
     def test_sync_weights_targets_training_with_sub_job_ids(self, client):
-        """sync_weights -> training job; Cortex-shaped source/target sub-job ids in body."""
+        """sync_weights -> training job; weight-sync operation with source/target payload."""
         client.sync_weights()
         req = _last(client)
-        assert req.op == "weight-sync"
+        assert req.op == "operation"
         assert req.job_id == TRAINING
-        assert req.body == {"source_sub_job_id": TRAINING, "target_sub_job_ids": [SAMPLING]}
+        assert req.body == {
+            "operation_type": "weight-sync",
+            "sub_job_id": TRAINING,
+            "sub_job_type": "training",
+            "payload": {"source_sub_job_id": TRAINING, "target_sub_job_ids": [SAMPLING]},
+        }
 
 
 class TestLifecycle:

@@ -15,10 +15,10 @@
 """On-prem transport base for the Arctic-Platform server.
 
 HTTP and in-process Ray share one control plane (`OnPremTransport`:
-job creation, ordering, payload building, `call`); they differ only in three
-primitives (`_start`, `_rpc`, `_destroy`). `call` is uniform — post/dispatch the
-op against its target job — because the server exposes a uniform
-`op(job_id, body) -> dict` surface.
+job creation, ordering, payload building); they differ only in the delivery
+primitives (`_start`, `call`, `_destroy`, `_wait_running`). The client already
+resolved the job id onto each Request, so `call` just delivers it against the
+server's uniform `op(job_id, body) -> dict` surface.
 
 Concrete transports live alongside this base: `HttpTransport` in
 `onprem_http.py` and `RayTransport` in `onprem_ray.py`.
@@ -35,7 +35,6 @@ from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import JOB_CREATE_ORDER
 from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
-from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
 from arctic_platform.client.transport import unresolved_ops
 
@@ -58,10 +57,6 @@ class OnPremTransport(Transport):
                 self.jobs.set(job_type, self._start(self._init_payload(job_type)))
         self._wait_running()
         return self.jobs
-
-    def call(self, request: Request) -> dict:
-        # The client already resolved the job id onto the request; just deliver it.
-        return self._rpc(request)
 
     def shutdown(self) -> None:
         for job_type in JOB_TYPES:
@@ -91,13 +86,10 @@ class OnPremTransport(Transport):
         return payload
 
     # delivery primitives — the only things a concrete transport implements
+    # (plus `call` from the Transport ABC, which delivers one op end to end).
     @abstractmethod
     def _start(self, payload: dict) -> JobId:
         """Create one job and return its id."""
-
-    @abstractmethod
-    def _rpc(self, request: Request) -> dict:
-        """Deliver one op and return its response dict."""
 
     @abstractmethod
     def _destroy(self, job_id: JobId, job_type: str) -> None:

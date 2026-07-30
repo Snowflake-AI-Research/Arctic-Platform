@@ -82,6 +82,16 @@ class WeightSyncRequest(BaseModel):
     low_memory: bool = False
 
 
+class OperationRequest(BaseModel):
+    # Generic data-plane envelope, matching Cortex's /{job_id}/operation. On-prem
+    # dispatches on operation_type; sub_job_id/sub_job_type are accepted for
+    # parity (unused, since on-prem addresses jobs by the job_id query param).
+    operation_type: str
+    sub_job_id: str | None = None
+    sub_job_type: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 class WeightNormRequest(BaseModel):
     training_job_id: int
     sampling_job_id: int

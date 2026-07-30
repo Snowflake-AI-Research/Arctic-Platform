@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import io
 import logging
 import os
 import pathlib
@@ -47,6 +46,7 @@ from fastapi import HTTPException
 from fastapi import Response
 from transformers import AutoTokenizer
 
+from arctic_platform import wire
 from arctic_platform.rl.deepspeed_worker import DeepSpeedWorker
 from arctic_platform.rl.ray_cluster import init_ray_cluster
 from arctic_platform.rl.server import ArcticRLServerState
@@ -62,6 +62,7 @@ from arctic_platform.rl.utils.ray_pg import pg_scheduling_options
 from arctic_platform.rl.utils.server_models import GenerateRequest
 from arctic_platform.rl.utils.server_models import JobConfig
 from arctic_platform.rl.utils.server_models import LogProbsRequest
+from arctic_platform.rl.utils.server_models import OperationRequest
 from arctic_platform.rl.utils.server_models import ResetPrefixCacheRequest
 from arctic_platform.rl.utils.server_models import SaveRequest
 from arctic_platform.rl.utils.server_models import StepRequest
@@ -404,9 +405,7 @@ async def forward_backward(
 
     timers.stop_and_print_elapsed(tname_e2e)
 
-    buffer = io.BytesIO()
-    torch.save(merged, buffer)
-    return Response(content=buffer.getvalue(), media_type="application/octet-stream")
+    return Response(content=wire.dumps(merged), media_type="application/octet-stream")
 
 
 @app.post("/forward")
@@ -439,9 +438,7 @@ async def forward(
         metrics=merge_dict_shards([r["metrics"] for r in results]),
     )
 
-    buffer = io.BytesIO()
-    torch.save(merged, buffer)
-    return Response(content=buffer.getvalue(), media_type="application/octet-stream")
+    return Response(content=wire.dumps(merged), media_type="application/octet-stream")
 
 
 @app.post("/step")
@@ -537,6 +534,20 @@ async def reset_prefix_cache(job_id: int, request: ResetPrefixCacheRequest = Bod
     if lp_pool is not None and lp_pool._config is not None:
         results["log_prob"] = await lp_pool.reset_prefix_cache()
     return {"job_id": job_id, **results}
+
+
+@app.post("/operation")
+async def operation(job_id: int, request: OperationRequest = Body(...)):
+    """Generic data-plane operation, matching Cortex's /{job_id}/operation envelope.
+
+    Dispatches on operation_type so the unified client routes control ops through
+    one payload shape. Reuses the typed handlers below; no logic is duplicated.
+    """
+    if request.operation_type == "weight-sync":
+        return await weight_sync(job_id, WeightSyncRequest(**request.payload))
+    if request.operation_type == "reset-prefix-cache":
+        return await reset_prefix_cache(job_id, ResetPrefixCacheRequest(**request.payload))
+    raise HTTPException(status_code=400, detail=f"unknown operation_type {request.operation_type!r}")
 
 
 @app.post("/sleep-training")
@@ -979,9 +990,8 @@ async def log_probs(job_id: int, request: LogProbsRequest = Body(...)):
         # Wrap the encoded batch as the {"batch","meta","processing"} payload unpack_batch expects (the same shape
         # fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no ZoRRO/
         # position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
-        batch_buf = io.BytesIO()
-        torch.save(dict(batch=dict(encoded), meta={}, processing={}), batch_buf)
-        shards, _ = http_split_batch(batch_buf.getvalue(), len(workers))
+        batch_bytes = wire.dumps(dict(batch=dict(encoded), meta={}, processing={}))
+        shards, _ = http_split_batch(batch_bytes, len(workers))
         raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
         results = torch.cat([r.cpu() for r in raw], dim=0)
     else:
@@ -991,9 +1001,7 @@ async def log_probs(job_id: int, request: LogProbsRequest = Body(...)):
             {"max_tokens": 1, "temperature": 0, "prompt_logprobs": request.top_k},
         )
 
-    buffer = io.BytesIO()
-    torch.save({"job_id": job_id, "results": results}, buffer)
-    return Response(content=buffer.getvalue(), media_type="application/octet-stream")
+    return Response(content=wire.dumps({"job_id": job_id, "results": results}), media_type="application/octet-stream")
 
 
 @app.get("/status")

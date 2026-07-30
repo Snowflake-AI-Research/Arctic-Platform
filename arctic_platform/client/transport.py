@@ -47,8 +47,9 @@ OPS = frozenset(
         "save",
         "generate",
         "log-probs",
-        "weight-sync",
-        "reset-prefix-cache",
+        # Control-plane ops share one canonical envelope (op_type + payload),
+        # matching Cortex's /operation; the transport routes them to /operation.
+        "operation",
     }
 )
 

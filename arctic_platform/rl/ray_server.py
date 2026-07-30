@@ -770,6 +770,19 @@ class ArcticRLRayServer:
         self._verify_job(job_id, "sampling")
         return await self.arctic_rl_ray_server_state.reset_prefix_cache.remote(job_id)
 
+    async def operation(self, job_id: int, body: dict[str, Any]) -> dict[str, Any]:
+        """Generic data-plane operation, matching Cortex's operation envelope.
+
+        Dispatches on operation_type to the typed handlers; no logic duplicated.
+        """
+        op_type = body.get("operation_type")
+        payload = body.get("payload") or {}
+        if op_type == "weight-sync":
+            return await self.weight_sync(job_id, payload)
+        if op_type == "reset-prefix-cache":
+            return await self.reset_prefix_cache(job_id, payload)
+        raise ValueError(f"unknown operation_type {op_type!r}")
+
     async def sleep_training(self, job_id: int, mode: str = "all"):
         """Offload training state to CPU (sleep training workers).
 

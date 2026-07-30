@@ -26,7 +26,6 @@ construction time.
 from __future__ import annotations
 
 import atexit
-import io
 import logging
 import signal
 import subprocess
@@ -36,8 +35,8 @@ from typing import Any
 
 import aiohttp
 import requests
-import torch
 
+from arctic_platform import wire
 from arctic_platform.rl.config import ArcticRLClientConfig
 from arctic_platform.rl.http_server import ArcticRLHTTPServerState
 from arctic_platform.rl.utils.debug import pr0
@@ -387,14 +386,11 @@ class ArcticRLHTTPClient:
         tname = timers.start("xyz arctic_rl.client incoming processing 1")
         if processing is not None:
             batch = {**batch, "processing": processing}
-        buffer = io.BytesIO()
         timers.stop_and_print_elapsed(tname)
 
         tname = timers.start("xyz arctic_rl.client incoming processing 2")
-        torch.save(batch, buffer)
+        request_body = wire.dumps(batch)
         timers.stop_and_print_elapsed(tname)
-
-        request_body = buffer.getvalue()
         # import zlib
         # tname = timers.start("xyz arctic_rl.client compress")
         # request_body = zlib.compress(request_body)
@@ -414,7 +410,7 @@ class ArcticRLHTTPClient:
 
         tname = timers.start("xyz arctic_rl.client outgoing processing 1")
         resp.raise_for_status()
-        response = torch.load(io.BytesIO(resp.content), map_location="cpu", weights_only=False)
+        response = wire.loads(resp.content)
         timers.stop_and_print_elapsed(tname)
         pr0(f"[ArcticRLClient] fwd_bwd OUTPUT: {response.keys()=}")
         timers.stop_and_print_elapsed(tname_e2e)
@@ -424,13 +420,10 @@ class ArcticRLHTTPClient:
     async def fwd_no_grad(self, batch: dict, reference_model: bool) -> dict[str, Any]:
         """Forward-only pass (no gradient) on the training engine.
 
-        Returns a binary (torch.save) response containing ``{"logprobs": Tensor}``.
+        Returns a binary (DSSST1) response containing ``{"logprobs": Tensor}``.
         Matches the ``/forward`` endpoint.
         """
-        buffer = io.BytesIO()
-        torch.save(batch, buffer)
-
-        request_body = buffer.getvalue()
+        request_body = wire.dumps(batch)
 
         # import zlib
         # request_body = zlib.compress(buffer.getvalue())
@@ -451,7 +444,7 @@ class ArcticRLHTTPClient:
             },
         )
         resp.raise_for_status()
-        response = torch.load(io.BytesIO(resp.content), map_location="cpu", weights_only=False)
+        response = wire.loads(resp.content)
         pr0(f"[ArcticRLClient] fwd_no_grad OUTPUT: {response.keys()=}")
         return response
 
@@ -707,7 +700,7 @@ class ArcticRLHTTPClient:
             json={"prompts": prompts, "completions": completions, "top_k": top_k},
         )
         resp.raise_for_status()
-        return torch.load(io.BytesIO(resp.content), map_location="cpu", weights_only=False)
+        return wire.loads(resp.content)
 
     # ------------------------------------------------------------------
     # Lifecycle

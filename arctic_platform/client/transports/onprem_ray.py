@@ -32,7 +32,7 @@ class RayTransport(OnPremTransport):
     ``ArcticRLRayServer`` wrapper (typed async ops) that snapshots workers at
     construction, so the wrapper is built lazily after jobs are initialized.
 
-    `_rpc` resolves ``op -> method`` and forwards the request unchanged.
+    `call` resolves ``op -> method`` and forwards the request unchanged.
     """
 
     def __init__(self, config: ArcticRLClientConfig) -> None:
@@ -62,7 +62,7 @@ class RayTransport(OnPremTransport):
         self._server = ArcticRLRayServer(self._state)
         self._check_op_coverage(self._server)
 
-    def _rpc(self, request: Request) -> dict:
+    def call(self, request: Request) -> dict:
         # Pass job_id only when set (ops omitting it call method(body)), then the body.
         method = getattr(self._server, method_name(request.op))
         args = (request.body,) if request.job_id is None else (request.job_id, request.body)

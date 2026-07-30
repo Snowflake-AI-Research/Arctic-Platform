@@ -10,10 +10,9 @@ body, which job each op targets, response contract) is defined once in
 
 ## Design in place (this package)
 - `Transport` ABC + `JobHandles` + `Request` (single op vocabulary in `client.py`).
-- `OnPremTransport` base: job creation, ordering, payload building, and a uniform
-  `call` that posts/dispatches the op against its target job. Concrete transports
-  implement only the delivery primitives (`_start`, `_rpc`, `_destroy`,
-  `_wait_running`).
+- `OnPremTransport` base: job creation, ordering, payload building. Concrete
+  transports implement only the delivery primitives (`_start`, `call`, `_destroy`,
+  `_wait_running`); `call` posts/dispatches the op against its target job.
 - `JOB_CREATE_ORDER` + `ArcticRLClientConfig.gpus_for()` centralize GPU-gating and
   creation order so transports no longer hand-roll them.
 
@@ -21,7 +20,7 @@ body, which job each op targets, response contract) is defined once in
 `RayTransport` makes in-process Ray actor calls — no HTTP, no serialization. The
 server splits into a `state` actor (job creation) and an `ArcticRLRayServer`
 wrapper (typed async ops) that snapshots workers at construction, so the wrapper
-is built lazily after jobs are initialized. `_rpc` resolves `op -> method` and
+is built lazily after jobs are initialized. `call` resolves `op -> method` and
 forwards `(job_id, body)` unchanged, matching the server's uniform
 `op(job_id, body) -> dict` surface.
 
@@ -29,12 +28,17 @@ forwards `(job_id, body)` unchanged, matching the server's uniform
 `HttpTransport` shares the same `OnPremTransport` control plane and only supplies
 the delivery primitives: it POSTs each op to `/{op}?job_id=...`. The canonical op
 names + arg/response shapes mirror Cortex (`forward-backward`, `forward`, `step`,
-`save`, `generate`, `weight-sync`, `reset-prefix-cache`, plus on-prem-only
-`log-probs`). Tensor-bearing ops (`forward-backward`/`forward`) send an octet
-`torch.save` payload and decode octet responses; everything else is JSON. It also optionally launches a local server
+`save`, `generate`, plus on-prem-only `log-probs`). Control-plane ops (weight-sync,
+reset-prefix-cache) share one canonical `operation` op carrying Cortex's
+`{operation_type, payload}` envelope, delivered to `/operation`. Tensor-bearing
+ops (`forward-backward`/`forward`) send an octet **DSSST1** payload and decode
+octet DSSST1 responses; everything else is JSON. DSSST1 is the same
+`arctic_platform.wire` codec Cortex speaks to SnowAPI, so both transports (and the
+on-prem server) share one binary wire and never touch pickle/`torch.load`. It also
+optionally launches a local server
 (`launch_local_server`) and polls `/health` + `/job/{id}` to wait for readiness.
 The Ray path forwards `(job_id, body)` to the same uniform server surface, so the
-two transports differ only in `_start`/`_rpc`/`_destroy`.
+two transports differ only in `_start`/`call`/`_destroy`.
 
 ## Not yet in unified client (future work)
 Ops present in `arctic_platform/rl/*_client.py` but not yet on `ArcticRLClient`.
