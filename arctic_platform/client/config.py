@@ -29,7 +29,7 @@ JobId = int | str
 class ArcticRLClientConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    backend: Literal["onprem"] = Field("onprem", description="Deployment target.")
+    backend: Literal["onprem", "cortex"] = Field("onprem", description="Deployment target.")
     comm_protocol: Literal["http", "ray"] = Field("http", description="onprem transport: HTTP or in-process Ray.")
     model_name: str = Field(..., description="HF model id to train/serve.")
     seed: int | None = Field(None, description="Global seed.")
@@ -60,6 +60,18 @@ class ArcticRLClientConfig(BaseModel):
             "onprem: training job's base checkpoint dir, set at init (resume-from + weight sync). "
             "This is the default destination used by save_checkpoint()."
         ),
+    )
+
+    # cortex (SnowAPI). Provide cortex_base_url for a direct/mock URL (no auth), or
+    # cortex_host + a PAT in the env var for Snowflake programmatic-access auth.
+    cortex_base_url: str | None = Field(None, description="cortex: direct/mock GS URL; bypasses PAT auth.")
+    cortex_host: str | None = Field(None, description="cortex: Snowflake host for PAT auth.")
+    cortex_pat_env_var: str = Field("CORTEX_PAT", description="cortex: env var holding the programmatic access token.")
+    cortex_database: str = Field("", description="cortex: Snowflake database.")
+    cortex_schema: str = Field("", description="cortex: Snowflake schema.")
+    cortex_endpoint: str = Field("cortex-training", description="cortex: SnowAPI endpoint name.")
+    cortex_max_retries: int = Field(
+        10, ge=0, description="cortex: transient-failure retries per HTTP request (tenacity)."
     )
 
     # Reconnect: attach to pre-existing jobs instead of creating new ones.
