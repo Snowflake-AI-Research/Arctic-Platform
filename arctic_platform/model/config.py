@@ -53,7 +53,9 @@ class ModelSpec(BaseModel):
     dtype: str = Field("bfloat16", description="Parameter dtype.")
     attn_implementation: str | None = Field(None, description="Attention implementation to request from HF.")
     loader: str | None = Field(None, description="Loader name; auto-resolved at construction when not set.")
-    parallelism: ParallelismConfig = Field(default_factory=ParallelismConfig, description="Loader-specific parallelism.")
+    parallelism: ParallelismConfig = Field(
+        default_factory=ParallelismConfig, description="Loader-specific parallelism."
+    )
     optimizations: Optimizations = Field(default_factory=Optimizations, description="Post-load optimizations.")
     loader_options: dict[str, Any] = Field(default_factory=dict, description="JSON-only loader-specific extras.")
 

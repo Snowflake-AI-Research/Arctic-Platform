@@ -26,13 +26,13 @@ from pydantic import ValidationError
 from arctic_platform.model import LoadedModel
 from arctic_platform.model import LoaderContext
 from arctic_platform.model import ModelSpec
-from arctic_platform.model import build_model
-from arctic_platform.model import register_loader
-from arctic_platform.model import register_optimization
 from arctic_platform.model import apply_optimizations
+from arctic_platform.model import build_model
 from arctic_platform.model import factory as factory_mod
 from arctic_platform.model import loader as loader_mod
 from arctic_platform.model import optimization as opt_mod
+from arctic_platform.model import register_loader
+from arctic_platform.model import register_optimization
 
 
 @pytest.fixture(autouse=True)
