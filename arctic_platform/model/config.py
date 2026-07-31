@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
@@ -57,7 +55,6 @@ class ModelSpec(BaseModel):
         default_factory=ParallelismConfig, description="Loader-specific parallelism."
     )
     optimizations: Optimizations = Field(default_factory=Optimizations, description="Post-load optimizations.")
-    loader_options: dict[str, Any] = Field(default_factory=dict, description="JSON-only loader-specific extras.")
 
     @model_validator(mode="after")
     def _resolve_loader(self) -> Self:
