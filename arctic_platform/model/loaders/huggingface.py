@@ -25,6 +25,16 @@ from arctic_platform.model.loader import register_loader
 
 @register_loader("huggingface", default=True)
 def load_huggingface(ctx: LoaderContext) -> LoadedModel:
+    # This loader builds a plain single-process model and can't shard experts or
+    # sequences, so it ignores parallelism and refuses a spec that asks for it.
+    parallelism = ctx.spec.parallelism
+    if parallelism.expert_parallel != 1 or parallelism.sequence_parallel != 1:
+        raise ValueError(
+            "huggingface loader does not support parallelism "
+            f"(got expert_parallel={parallelism.expert_parallel}, "
+            f"sequence_parallel={parallelism.sequence_parallel})"
+        )
+
     model = AutoModelForCausalLM.from_pretrained(
         ctx.resolved_path,
         attn_implementation=ctx.spec.attn_implementation,
