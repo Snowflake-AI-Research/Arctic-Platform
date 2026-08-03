@@ -49,6 +49,7 @@ def _restore_registries():
     patch_mod._PATCHES.clear()
     patch_mod._PATCHES.update(patches)
     patch_mod.PATCH_ORDER = order
+    loader_mod._load_hf_config.cache_clear()
 
 
 def _ctx(**patch_flags) -> LoaderContext:
@@ -77,17 +78,17 @@ class TestLoaderSelection:
     def test_unset_loader_resolves_to_registered_default(self):
         """An unset loader is populated with whatever loader is registered as the default."""
         _register("base", default=True)
-        assert ModelSpec(model_path="x").loader == "base"
+        assert ModelSpec(model_path_or_name="x").loader == "base"
 
     def test_explicit_loader_overrides_default(self):
         _register("base", default=True)
         _register("other")
-        assert ModelSpec(model_path="x", loader="other").loader == "other"
+        assert ModelSpec(model_path_or_name="x", loader="other").loader == "other"
 
     def test_unknown_loader_rejected(self):
         _register("base", default=True)
         with pytest.raises(ValidationError):
-            ModelSpec(model_path="x", loader="nope")
+            ModelSpec(model_path_or_name="x", loader="nope")
 
     def test_duplicate_default_rejected(self):
         """A second default loader is rejected at registration, not selection."""
@@ -101,9 +102,9 @@ class TestLoaderSelection:
         monkeypatch.setattr("transformers.AutoConfig.from_pretrained", lambda *a, **k: fake_config)
 
         _register("base", default=True)
-        _register("special", matches=lambda ctx: getattr(ctx.model_config, "model_type", "") == "special")
+        _register("special", matches=lambda ctx: getattr(ctx.hf_config, "model_type", "") == "special")
 
-        assert ModelSpec(model_path="x").loader == "special"
+        assert ModelSpec(model_path_or_name="x").loader == "special"
 
     def test_multiple_matches_rejected(self, monkeypatch):
         """Two matching predicates are ambiguous and rejected."""
@@ -114,7 +115,7 @@ class TestLoaderSelection:
         _register("m2", matches=lambda ctx: True)
 
         with pytest.raises(ValidationError, match="multiple loaders match"):
-            ModelSpec(model_path="x")
+            ModelSpec(model_path_or_name="x")
 
     def test_build_model_runs_resolved_loader_then_patches(self, monkeypatch):
         """build_model builds via the resolved loader and hands the result to the patch pipeline."""
@@ -127,7 +128,7 @@ class TestLoaderSelection:
         patched = []
         monkeypatch.setattr(factory_mod, "apply_patches", lambda loaded, ctx: patched.append(loaded))
 
-        loaded = build_model(ModelSpec(model_path="x", loader="fake"))
+        loaded = build_model(ModelSpec(model_path_or_name="x", loader="fake"))
 
         assert loaded.model is built
         assert patched == [loaded]
@@ -171,3 +172,18 @@ class TestPatchPipeline:
         apply_patches(loaded, _ctx(a=True))
 
         assert calls == []
+
+    def test_apply_records_applied_and_is_idempotent(self, monkeypatch):
+        """apply_patches records what it applied; a second call re-applies nothing."""
+        monkeypatch.setattr(patch_mod, "PATCH_ORDER", ("a", "b"))
+        calls = []
+        for name in ("a", "b"):
+            patch_mod._PATCHES[name] = lambda model, ctx, n=name: calls.append(n)
+
+        loaded = LoadedModel(model=nn.Identity())
+        ctx = _ctx(a=True, b=False)
+        apply_patches(loaded, ctx)
+        assert loaded.applied_patches == frozenset({"a"})
+
+        apply_patches(loaded, ctx)
+        assert calls == ["a"]

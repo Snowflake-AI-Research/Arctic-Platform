@@ -19,6 +19,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
 
@@ -47,7 +48,7 @@ class ModelSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    model_path: str | None = Field(None, description="HF model id/path. None for fully-custom loaders.")
+    model_path_or_name: str = Field(..., description="HF model path or hub name.")
     dtype: str = Field("bfloat16", description="Parameter dtype.")
     attn_implementation: str | None = Field(None, description="Attention implementation to request from HF.")
     loader: str | None = Field(None, description="Loader name; auto-resolved at construction when not set.")
@@ -55,6 +56,14 @@ class ModelSpec(BaseModel):
         default_factory=ParallelismConfig, description="Loader-specific parallelism."
     )
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
+
+    @field_validator("dtype")
+    @classmethod
+    def _validate_dtype(cls, value: str) -> str:
+        import torch
+
+        assert value == "auto" or isinstance(getattr(torch, value, None), torch.dtype), f"unknown dtype {value!r}"
+        return value
 
     @model_validator(mode="after")
     def _resolve_loader(self) -> Self:

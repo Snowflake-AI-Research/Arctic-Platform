@@ -27,7 +27,7 @@ from arctic_platform.model.patch import apply_patches
 
 def build_model(spec: ModelSpec, parallel_groups: Any | None = None) -> LoadedModel:
     """Run the spec's resolved loader, apply its patches, and return the result."""
-    ctx = LoaderContext(spec=spec, resolved_path=spec.model_path, parallel_groups=parallel_groups)
+    ctx = LoaderContext(spec=spec, parallel_groups=parallel_groups)
     loaded = select_loader(ctx)(ctx)
     apply_patches(loaded, ctx)
     return loaded

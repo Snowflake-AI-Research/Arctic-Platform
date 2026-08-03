@@ -36,7 +36,7 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         )
 
     model = AutoModelForCausalLM.from_pretrained(
-        ctx.resolved_path,
+        ctx.spec.model_path_or_name,
         attn_implementation=ctx.spec.attn_implementation,
         dtype=ctx.spec.dtype,
     )

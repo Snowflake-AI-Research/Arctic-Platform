@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from dataclasses import field
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 
@@ -25,15 +27,32 @@ import torch.nn as nn
 
 from arctic_platform.model.config import ModelSpec
 
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
+
+@functools.lru_cache(maxsize=None)
+def _load_hf_config(model_path_or_name: str) -> PretrainedConfig | None:
+    """Load (and memoize) the HuggingFace config, or None if the name/path isn't an HF model."""
+    from transformers import AutoConfig
+
+    try:
+        return AutoConfig.from_pretrained(model_path_or_name)
+    except (OSError, ValueError):
+        return None
+
 
 @dataclass
 class LoaderContext:
     """Everything a loader needs to build a model."""
 
     spec: ModelSpec
-    resolved_path: str | None = None
-    model_config: Any | None = None
     parallel_groups: Any | None = None
+
+    @property
+    def hf_config(self) -> PretrainedConfig | None:
+        """The model's HuggingFace config, or None if the name/path isn't an HF model. Parsed once."""
+        return _load_hf_config(self.spec.model_path_or_name)
 
 
 @dataclass
@@ -79,13 +98,7 @@ def is_registered_loader(name: str) -> bool:
 
 def resolve_loader_name(spec: ModelSpec) -> str:
     """Resolve which loader a spec should use: single matching predicate, else the default."""
-    model_config = None
-    if _has_matchers() and spec.model_path is not None:
-        from transformers import AutoConfig
-
-        model_config = AutoConfig.from_pretrained(spec.model_path)
-
-    ctx = LoaderContext(spec=spec, resolved_path=spec.model_path, model_config=model_config)
+    ctx = LoaderContext(spec=spec)
     matched = [name for name, entry in _LOADERS.items() if entry.matches is not None and entry.matches(ctx)]
     assert len(matched) <= 1, f"multiple loaders match: {matched}; set spec.loader to disambiguate"
     if len(matched) == 1:
@@ -97,8 +110,6 @@ def resolve_loader_name(spec: ModelSpec) -> str:
 
 def select_loader(ctx: LoaderContext) -> Loader:
     """Return the loader for a spec whose ``loader`` has already been resolved."""
-    return _LOADERS[ctx.spec.loader].fn
-
-
-def _has_matchers() -> bool:
-    return any(entry.matches is not None for entry in _LOADERS.values())
+    name = ctx.spec.loader
+    assert name is not None, "spec.loader must be resolved before select_loader"
+    return _LOADERS[name].fn
