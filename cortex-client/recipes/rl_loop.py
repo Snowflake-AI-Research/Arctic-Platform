@@ -62,8 +62,8 @@ class Config:
     model_name: str = "Qwen/Qwen3-8B"
     renderer_name: str = "qwen3"
     training_gpus: int = 4
-    sampling_gpus: int = 1
-    gpu_memory_utilization: float = 0.3
+    sampling_gpus: int = 4
+    gpu_memory_utilization: float = 0.4
     micro_batch_size: int = 1
     zero_stage: int = 2
     attn_implementation: str = "flash_attention_3"
@@ -131,13 +131,6 @@ def job_body(config: Config) -> dict:
     return {
         "sub_job_configs": [
             {
-                "job_type": "training",
-                "model_name": config.model_name,
-                "dtype": config.dtype,
-                "seed": config.seed,
-                "training_config": training_config,
-            },
-            {
                 "job_type": "sampling",
                 "model_name": config.model_name,
                 "dtype": config.dtype,
@@ -145,8 +138,18 @@ def job_body(config: Config) -> dict:
                 "inference_config": {
                     "max_seq_len": config.max_seq_len,
                     "n_gpus": config.sampling_gpus,
-                    "gpu_memory_utilization": config.gpu_memory_utilization,
+                    "vllm_config": {
+                        "max_model_len": config.max_seq_len,
+                        "gpu_memory_utilization": config.gpu_memory_utilization,
+                    },
                 },
+            },
+            {
+                "job_type": "training",
+                "model_name": config.model_name,
+                "dtype": config.dtype,
+                "seed": config.seed,
+                "training_config": training_config,
             },
         ]
     }
