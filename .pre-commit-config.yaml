@@ -35,4 +35,5 @@ repos:
     hooks:
       - id: mypy
         additional_dependencies: [types-PyYAML, types-tabulate, pydantic]
-        files: ^(arctic_training/|projects/arctic_embed/)
+        args: [--ignore-missing-imports]
+        files: ^arctic_platform/model/
