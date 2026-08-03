@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for loader selection and the optimization pipeline. These run on CPU with stub loaders."""
+"""Tests for loader selection and the patch pipeline. These run on CPU with stub loaders."""
 
 from __future__ import annotations
 
@@ -26,35 +26,35 @@ from pydantic import ValidationError
 from arctic_platform.model import LoadedModel
 from arctic_platform.model import LoaderContext
 from arctic_platform.model import ModelSpec
-from arctic_platform.model import apply_optimizations
+from arctic_platform.model import apply_patches
 from arctic_platform.model import build_model
 from arctic_platform.model import factory as factory_mod
 from arctic_platform.model import loader as loader_mod
-from arctic_platform.model import optimization as opt_mod
+from arctic_platform.model import patch as patch_mod
 from arctic_platform.model import register_loader
-from arctic_platform.model import register_optimization
+from arctic_platform.model import register_patch
 
 
 @pytest.fixture(autouse=True)
 def _restore_registries():
-    """Snapshot the global loader/optimization registries and restore them after each test."""
+    """Snapshot the global loader/patch registries and restore them after each test."""
     loaders = dict(loader_mod._LOADERS)
     default = loader_mod._DEFAULT_LOADER
-    opts = dict(opt_mod._OPTIMIZATIONS)
-    order = opt_mod.OPTIMIZATION_ORDER
+    patches = dict(patch_mod._PATCHES)
+    order = patch_mod.PATCH_ORDER
     yield
     loader_mod._LOADERS.clear()
     loader_mod._LOADERS.update(loaders)
     loader_mod._DEFAULT_LOADER = default
-    opt_mod._OPTIMIZATIONS.clear()
-    opt_mod._OPTIMIZATIONS.update(opts)
-    opt_mod.OPTIMIZATION_ORDER = order
+    patch_mod._PATCHES.clear()
+    patch_mod._PATCHES.update(patches)
+    patch_mod.PATCH_ORDER = order
 
 
-def _ctx(**optimization_flags) -> LoaderContext:
-    """A LoaderContext whose spec exposes only the optimization flags a test cares about."""
-    optimizations = types.SimpleNamespace(**optimization_flags)
-    return LoaderContext(spec=types.SimpleNamespace(optimizations=optimizations))
+def _ctx(**patch_flags) -> LoaderContext:
+    """A LoaderContext whose spec exposes only the patch flags a test cares about."""
+    patches = types.SimpleNamespace(**patch_flags)
+    return LoaderContext(spec=types.SimpleNamespace(patches=patches))
 
 
 def _register(name, *, matches=None, default=False):
@@ -116,50 +116,58 @@ class TestLoaderSelection:
         with pytest.raises(ValidationError, match="multiple loaders match"):
             ModelSpec(model_path="x")
 
-    def test_build_model_runs_resolved_loader_then_optimizations(self, monkeypatch):
-        """build_model builds via the resolved loader and hands the result to the optimization pipeline."""
+    def test_build_model_runs_resolved_loader_then_patches(self, monkeypatch):
+        """build_model builds via the resolved loader and hands the result to the patch pipeline."""
         built = nn.Linear(1, 1)
 
         @register_loader("fake")
         def _fake(ctx: LoaderContext) -> LoadedModel:
             return LoadedModel(model=built)
 
-        optimized = []
-        monkeypatch.setattr(factory_mod, "apply_optimizations", lambda loaded, ctx: optimized.append(loaded))
+        patched = []
+        monkeypatch.setattr(factory_mod, "apply_patches", lambda loaded, ctx: patched.append(loaded))
 
         loaded = build_model(ModelSpec(model_path="x", loader="fake"))
 
         assert loaded.model is built
-        assert optimized == [loaded]
+        assert patched == [loaded]
 
 
-class TestOptimizationPipeline:
+class TestPatchPipeline:
+    def test_registry_matches_config_and_order(self):
+        """Built-in patches line up: PATCH_ORDER == Patches fields == registered patches."""
+        from arctic_platform.model.config import Patches
+
+        order = set(patch_mod.PATCH_ORDER)
+        assert order == set(Patches.model_fields)
+        assert order == set(patch_mod._PATCHES)
+
     def test_register_requires_order_membership(self):
-        """An optimization missing from OPTIMIZATION_ORDER cannot be registered."""
-        with pytest.raises(AssertionError, match="missing from OPTIMIZATION_ORDER"):
+        """A patch missing from PATCH_ORDER cannot be registered."""
+        with pytest.raises(AssertionError, match="missing from PATCH_ORDER"):
 
-            @register_optimization("not_in_order")
-            def _opt(model, config, ctx) -> None:
+            @register_patch("not_in_order")
+            def _patch(model, ctx) -> None:
                 pass
 
     def test_apply_respects_order_and_skips_disabled(self, monkeypatch):
-        """Enabled optimizations run in OPTIMIZATION_ORDER; disabled (False/None) ones are skipped."""
-        monkeypatch.setattr(opt_mod, "OPTIMIZATION_ORDER", ("a", "b", "c"))
+        """Enabled patches run in PATCH_ORDER; disabled (False/None) ones are skipped."""
+        monkeypatch.setattr(patch_mod, "PATCH_ORDER", ("a", "b", "c"))
         calls = []
         for name in ("a", "b", "c"):
-            opt_mod._OPTIMIZATIONS[name] = lambda model, config, ctx, n=name: calls.append(n)
+            patch_mod._PATCHES[name] = lambda model, ctx, n=name: calls.append(n)
 
-        apply_optimizations(LoadedModel(model=nn.Identity()), _ctx(a=True, b=False, c={"vocab": 1}))
+        apply_patches(LoadedModel(model=nn.Identity()), _ctx(a=True, b=False, c={"vocab": 1}))
 
         assert calls == ["a", "c"]
 
     def test_apply_skips_loader_applied(self, monkeypatch):
-        """Optimizations already reported by the loader are not re-applied."""
-        monkeypatch.setattr(opt_mod, "OPTIMIZATION_ORDER", ("a",))
+        """Patches already reported by the loader are not re-applied."""
+        monkeypatch.setattr(patch_mod, "PATCH_ORDER", ("a",))
         calls = []
-        opt_mod._OPTIMIZATIONS["a"] = lambda model, config, ctx: calls.append("a")
+        patch_mod._PATCHES["a"] = lambda model, ctx: calls.append("a")
 
-        loaded = LoadedModel(model=nn.Identity(), applied_optimizations=frozenset({"a"}))
-        apply_optimizations(loaded, _ctx(a=True))
+        loaded = LoadedModel(model=nn.Identity(), applied_patches=frozenset({"a"}))
+        apply_patches(loaded, _ctx(a=True))
 
         assert calls == []

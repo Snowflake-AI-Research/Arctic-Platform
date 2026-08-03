@@ -22,12 +22,12 @@ from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import select_loader
-from arctic_platform.model.optimization import apply_optimizations
+from arctic_platform.model.patch import apply_patches
 
 
 def build_model(spec: ModelSpec, parallel_groups: Any | None = None) -> LoadedModel:
-    """Run the spec's resolved loader, apply its optimizations, and return the result."""
+    """Run the spec's resolved loader, apply its patches, and return the result."""
     ctx = LoaderContext(spec=spec, resolved_path=spec.model_path, parallel_groups=parallel_groups)
     loaded = select_loader(ctx)(ctx)
-    apply_optimizations(loaded, ctx)
+    apply_patches(loaded, ctx)
     return loaded

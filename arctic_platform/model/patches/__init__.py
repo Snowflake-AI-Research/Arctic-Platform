@@ -12,25 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Liger kernel optimization."""
+"""Built-in patches. Importing this package registers them."""
 
-from __future__ import annotations
-
-import torch.nn as nn
-
-from arctic_platform.model.loader import LoaderContext
-from arctic_platform.model.optimization import register_optimization
-
-
-@register_optimization("liger")
-def apply_liger(model: nn.Module, config: bool, ctx: LoaderContext) -> None:
-    from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
-
-    _apply_liger_kernel_to_instance(
-        model=model,
-        cross_entropy=False,
-        fused_linear_cross_entropy=False,
-        rope=True,
-        rms_norm=True,
-        swiglu=True,
-    )
+from arctic_platform.model.patches import liger  # noqa: F401

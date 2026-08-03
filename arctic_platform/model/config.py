@@ -30,7 +30,7 @@ class ParallelismConfig(BaseModel):
     sequence_parallel: int = Field(1, description="Ulysses sequence-parallel degree.")
 
 
-class Optimizations(BaseModel):
+class Patches(BaseModel):
     """Optional features applied to the model after it is loaded."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
@@ -54,7 +54,7 @@ class ModelSpec(BaseModel):
     parallelism: ParallelismConfig = Field(
         default_factory=ParallelismConfig, description="Loader-specific parallelism."
     )
-    optimizations: Optimizations = Field(default_factory=Optimizations, description="Post-load optimizations.")
+    patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
 
     @model_validator(mode="after")
     def _resolve_loader(self) -> Self:

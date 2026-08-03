@@ -15,29 +15,29 @@
 """Model factory: turn a declarative ModelSpec into a configured nn.Module."""
 
 from arctic_platform.model.config import ModelSpec
-from arctic_platform.model.config import Optimizations
 from arctic_platform.model.config import ParallelismConfig
+from arctic_platform.model.config import Patches
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import select_loader
-from arctic_platform.model.optimization import apply_optimizations
-from arctic_platform.model.optimization import register_optimization
+from arctic_platform.model.patch import apply_patches
+from arctic_platform.model.patch import register_patch
 
-# Import built-in loaders and optimizations for their registration side effects.
+# Import built-in loaders and patches for their registration side effects.
 from arctic_platform.model import loaders  # noqa: F401  # isort: skip
-from arctic_platform.model import optimizations  # noqa: F401  # isort: skip
+from arctic_platform.model import patches  # noqa: F401  # isort: skip
 
 __all__ = [
     "LoadedModel",
     "LoaderContext",
     "ModelSpec",
-    "Optimizations",
     "ParallelismConfig",
-    "apply_optimizations",
+    "Patches",
+    "apply_patches",
     "build_model",
     "register_loader",
-    "register_optimization",
+    "register_patch",
     "select_loader",
 ]

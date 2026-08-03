@@ -38,10 +38,10 @@ class LoaderContext:
 
 @dataclass
 class LoadedModel:
-    """A built model and the optimizations already applied to it."""
+    """A built model and the patches already applied to it."""
 
     model: nn.Module
-    applied_optimizations: frozenset[str] = field(default_factory=frozenset)
+    applied_patches: frozenset[str] = field(default_factory=frozenset)
 
 
 Loader = Callable[[LoaderContext], LoadedModel]
