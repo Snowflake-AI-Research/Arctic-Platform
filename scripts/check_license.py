@@ -77,10 +77,14 @@ def get_tracked_python_files() -> List[Path]:
 
 
 def main() -> None:
-    tracked_files = get_tracked_python_files()
+    # Honor the files pre-commit passes (so its `exclude` filter applies); fall
+    # back to scanning all tracked files when run manually with no arguments.
+    files = [Path(arg) for arg in sys.argv[1:]] or get_tracked_python_files()
     modified_files = []
 
-    for file_path in tracked_files:
+    for file_path in files:
+        if not file_path.is_file():
+            continue
         if not file_has_license(file_path):
             add_license_to_file(file_path)
             modified_files.append(file_path)

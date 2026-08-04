@@ -56,6 +56,7 @@ class ModelSpec(BaseModel):
         default_factory=ParallelismConfig, description="Loader-specific parallelism."
     )
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
+    loader_options: dict = Field(default_factory=dict, description="JSON-only loader-specific extras.")
 
     @field_validator("dtype")
     @classmethod

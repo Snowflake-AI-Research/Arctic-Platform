@@ -5,7 +5,10 @@ repos:
         name: check-license
         entry: python ./scripts/check_license.py
         language: python
+        types: [python]
         require_serial: true
+        # Vendored/copied files; attribution is managed separately.
+        exclude: ^arctic_platform/model/implementations/qwen35/
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
