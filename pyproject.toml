@@ -102,7 +102,6 @@ formatting = [
 
 
 rl = [
-    "deep_ep",  # DeepEP MoE all-to-all backend, used by the qwen3_5_moe loader when expert-parallel > 1
     "liger-kernel>=0.8.0",
     "ray",
     "tensordict",
