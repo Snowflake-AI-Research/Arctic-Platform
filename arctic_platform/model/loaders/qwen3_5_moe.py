@@ -21,22 +21,11 @@ from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
 
 
-def _is_qwen3_5_moe(ctx: LoaderContext) -> bool:
-    # Importing the implementation's ``models`` package registers the custom config
-    # so AutoConfig can parse a qwen3_5_moe checkpoint. Skip quietly if the installed
-    # transformers build lacks the qwen3_5 model family.
-    try:
-        from arctic_platform.model.implementations.qwen35 import models  # noqa: F401
-    except ImportError:
+def _matches(ctx: LoaderContext) -> bool:
+    if ctx.spec.parallelism.expert_parallel <= 1:
         return False
     model_type = getattr(ctx.hf_config, "model_type", "") or ""
-    return model_type.startswith("qwen3_5")
-
-
-def _matches(ctx: LoaderContext) -> bool:
-    # Cheap gate first: only MoE (expert-parallel) specs can use this loader, so
-    # HuggingFace specs never trigger the heavier config parse below.
-    return ctx.spec.parallelism.expert_parallel > 1 and _is_qwen3_5_moe(ctx)
+    return model_type == "qwen3_5_moe_text"
 
 
 @register_loader("qwen3_5_moe", matches=_matches)
