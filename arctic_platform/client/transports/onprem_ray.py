@@ -44,7 +44,7 @@ class RayTransport(OnPremTransport):
             sampling_gpus=config.sampling_gpus,
             log_prob_gpus=config.log_prob_gpus,
             log_prob_engine="deepspeed",
-            colocate=config.colocate,
+            colocate=config.backend_config.colocate,
         )
         self._server = None  # ArcticRLRayServer, built once jobs exist
         # One long-lived loop for every op instead of asyncio.run() per call.

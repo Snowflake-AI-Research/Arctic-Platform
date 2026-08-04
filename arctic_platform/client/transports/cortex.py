@@ -88,7 +88,7 @@ class CortexTransport(Transport):
         self.jobs = JobHandles()
         self.job_id: str | None = None
         self.request_timeout = config.request_timeout
-        self.max_retries = config.cortex_max_retries
+        self.max_retries = config.backend_config.max_retries
         self.poll_interval = 0.5
         self.poll_timeout = config.job_ready_timeout
         self.session = self._build_session()
@@ -235,13 +235,15 @@ class CortexTransport(Transport):
     @property
     def _prefix(self) -> str:
         cfg = self.config
-        base = (cfg.cortex_base_url or f"https://{cfg.cortex_host}").rstrip("/")
-        return f"{base}/api/v2/databases/{cfg.cortex_database}/schemas/{cfg.cortex_schema}/{cfg.cortex_endpoint}"
+        cx = cfg.backend_config
+        base = (cx.base_url or f"https://{cx.host}").rstrip("/")
+        return f"{base}/api/v2/databases/{cx.database}/schemas/{cx.schema_}/{cx.endpoint}"
 
     def _build_session(self) -> requests.Session:
         session = requests.Session()
-        if self.config.cortex_base_url is None:  # PAT auth against a real Snowflake host
-            session.headers["Authorization"] = f"Bearer {os.environ[self.config.cortex_pat_env_var]}"
+        cx = self.config.backend_config
+        if cx.base_url is None:  # PAT auth against a real Snowflake host
+            session.headers["Authorization"] = f"Bearer {os.environ[cx.pat_env_var]}"
             session.headers["X-Snowflake-Authorization-Token-Type"] = "PROGRAMMATIC_ACCESS_TOKEN"
         return session
 

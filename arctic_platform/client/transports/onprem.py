@@ -74,13 +74,13 @@ class OnPremTransport(Transport):
         cfg = self.config
         payload: dict[str, Any] = {"model_name": cfg.model_name, "job_type": job_type, "seed": cfg.seed}
         if job_type in ("training", "log_prob"):
-            if cfg.ds_config:
-                payload["ds_config"] = cfg.ds_config
+            if cfg.backend_config.ds_config:
+                payload["ds_config"] = cfg.backend_config.ds_config
             if job_type == "training":
                 if cfg.training_config:
                     payload["training_config"] = cfg.training_config
-                if cfg.checkpoint_path:
-                    payload["checkpoint_path"] = cfg.checkpoint_path
+                if cfg.backend_config.checkpoint_path:
+                    payload["checkpoint_path"] = cfg.backend_config.checkpoint_path
         elif cfg.vllm_config:
             payload["vllm_config"] = cfg.vllm_config
         return payload
