@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import io
 import os
 from typing import Any
 
 # import itertools
 import torch
 
+from arctic_platform import wire
 from arctic_platform.rl.zorro_train.seqlen_balancing import reorg_global_batch
 
 
@@ -158,7 +158,7 @@ def http_split_batch(batch_bytes: bytes, num_workers: int) -> list[bytes]:
     """Deserialize a global batch, split across DP workers, re-serialize each shard."""
     # if num_workers <= 1:
     #     return [batch_bytes]
-    batch = torch.load(io.BytesIO(batch_bytes), map_location="cpu")
+    batch = wire.loads(batch_bytes)
 
     shards, reorder_indices = _split_batch(batch, num_workers)
 

@@ -298,7 +298,7 @@ class TestE2E(TestCasePlus):
                 await client.save_weights("/tmp/unused")
         else:
             # The http client implements disk-based save_weights as a graceful warn-on-error stub (server-side
-            # reload is not fully implemented), so it posts to /sync-weights and must return without raising.
+            # reload is not fully implemented), so it posts to /weight-sync and must return without raising.
             await client.save_weights("/tmp/arl_unused_ckpt")
 
     @parameterized.expand(e2e_params, name_func=parameterized_custom_name_func)

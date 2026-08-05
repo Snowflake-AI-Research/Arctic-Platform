@@ -69,7 +69,7 @@ class TestOpMapping:
         """fwd_bwd -> training job, binary payload, body carries the batch."""
         client.fwd_bwd({"input_ids": [1, 2]})
         req = _last(client)
-        assert req.op == "fwd-bwd"
+        assert req.op == "forward-backward"
         assert req.job_id == TRAINING
         assert req.binary is True
         assert req.body["input_ids"] == [1, 2]
@@ -85,7 +85,7 @@ class TestOpMapping:
         """fwd_no_grad -> training job, binary payload."""
         client.fwd_no_grad({"input_ids": [1]})
         req = _last(client)
-        assert req.op == "fwd-no-grad"
+        assert req.op == "forward"
         assert req.job_id == TRAINING
         assert req.binary is True
 
@@ -99,20 +99,20 @@ class TestOpMapping:
         assert req.body == {"learning_rate": 0.5}
 
     def test_save_checkpoint_targets_training(self, client):
-        """save_checkpoint -> training job."""
-        client.save_checkpoint(stage_info={"s": 1}, path="/tmp/x")
+        """save_checkpoint -> training job (save op, Cortex-shaped body)."""
+        client.save_checkpoint(checkpoint_id="cp1", checkpoint_type="weights-only")
         req = _last(client)
-        assert req.op == "save-checkpoint"
+        assert req.op == "save"
         assert req.job_id == TRAINING
-        assert req.body == {"stage_info": {"s": 1}, "path": "/tmp/x"}
+        assert req.body == {"checkpoint_id": "cp1", "checkpoint_type": "weights-only"}
 
     def test_generate_targets_sampling_and_unwraps_results(self, client):
         """generate -> sampling job; returns the 'results' list."""
-        out = client.generate(["hi"], sampling_params={"n": 1}, routing_key="k")
+        out = client.generate(["hi"], sampling_params={"n": 1}, routing_key="k", strict=True)
         req = _last(client)
         assert req.op == "generate"
         assert req.job_id == SAMPLING
-        assert req.body == {"prompts": ["hi"], "sampling_params": {"n": 1}, "routing_key": "k"}
+        assert req.body == {"prompts": ["hi"], "sampling_params": {"n": 1}, "routing_key": "k", "strict": True}
         assert out == ["ok"]
 
     def test_log_probs_targets_log_prob(self, client):
@@ -124,20 +124,29 @@ class TestOpMapping:
         assert req.body == {"prompts": ["hi"], "completions": ["there"], "top_k": 3}
 
     def test_reset_prefix_cache_targets_sampling(self, client):
-        """reset_prefix_cache -> sampling job."""
-        client.reset_prefix_cache(drain=False, timeout_s=5.0)
+        """reset_prefix_cache -> sampling job via the operation envelope."""
+        client.reset_prefix_cache(drain=False, timeout_s=5.0, retry_interval_s=0.2)
         req = _last(client)
-        assert req.op == "reset-prefix-cache"
+        assert req.op == "operation"
         assert req.job_id == SAMPLING
-        assert req.body == {"drain": False, "timeout_s": 5.0}
+        assert req.body == {
+            "operation_type": "reset-prefix-cache",
+            "sub_job_type": "sampling",
+            "payload": {"drain": False, "timeout_s": 5.0, "retry_interval_s": 0.2},
+        }
 
-    def test_sync_weights_has_no_primary_job_id(self, client):
-        """sync_weights -> job_id None; both ids ride in the body."""
+    def test_sync_weights_targets_training_with_sub_job_ids(self, client):
+        """sync_weights -> training job; weight-sync operation with source/target payload."""
         client.sync_weights()
         req = _last(client)
-        assert req.op == "sync-weights"
-        assert req.job_id is None
-        assert req.body == {"training_job_id": TRAINING, "sampling_job_id": SAMPLING}
+        assert req.op == "operation"
+        assert req.job_id == TRAINING
+        assert req.body == {
+            "operation_type": "weight-sync",
+            "sub_job_id": TRAINING,
+            "sub_job_type": "training",
+            "payload": {"source_sub_job_id": TRAINING, "target_sub_job_ids": [SAMPLING]},
+        }
 
 
 class TestLifecycle:
