@@ -41,7 +41,10 @@ sys.path.insert(0, str(ARCTIC / "tests" / "rl"))
 
 from arctic_platform.client import ArcticRLClient  # noqa: E402
 from arctic_platform.client import ArcticRLClientConfig  # noqa: E402
+from arctic_platform.client import ModelBuildConfig  # noqa: E402
 from arctic_platform.client import OnPremConfig  # noqa: E402
+from arctic_platform.client import OptimizerConfig  # noqa: E402
+from arctic_platform.client import TrainingConfig  # noqa: E402
 
 STEPS = 20
 SEED = 42
@@ -69,6 +72,7 @@ def _onprem_config(comm_protocol: str, launch_local_server: bool) -> Callable:
         return ArcticRLClientConfig(
             model_name=MODEL,
             seed=SEED,
+            max_seq_len=SEQ_LEN,
             training_gpus=N_GPUS,
             job_ready_timeout=600.0,
             backend_config=OnPremConfig(
@@ -86,15 +90,13 @@ def _onprem_config(comm_protocol: str, launch_local_server: bool) -> Callable:
                     },
                 },
             ),
-            training_config={
-                "optimizer": {"lr": LR, "weight_decay": 0.0, "betas": [0.9, 0.999]},
-                "lr_scheduler": {"warmup_ratio": 0.0},
-                "training_horizon": 1,
-                "max_length": SEQ_LEN,
-                "model_config": None,
-                "attn_implementation": ATTN,
-                "gradient_accumulation_steps": 1,
-            },
+            training=TrainingConfig(
+                model=ModelBuildConfig(attn_implementation=ATTN),
+                optimizer=OptimizerConfig(lr=LR, weight_decay=0.0, betas=[0.9, 0.999]),
+                lr_scheduler={"warmup_ratio": 0.0},
+                training_horizon=1,
+                gradient_accumulation_steps=1,
+            ),
         )
 
     return build

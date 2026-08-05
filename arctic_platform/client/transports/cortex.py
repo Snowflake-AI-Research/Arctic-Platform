@@ -195,41 +195,7 @@ class CortexTransport(Transport):
 
     # ── create-job body (SubJobConfig wire shape) ────────────────────────────
     def _sub_job_configs(self) -> list[dict]:
-        cfg = self.config
-        subs: list[dict] = []
-        if cfg.sampling_gpus > 0:
-            subs.append(self._inference_sub_job("sampling", cfg.sampling_gpus))
-        if cfg.log_prob_gpus > 0:
-            subs.append(self._inference_sub_job("log_probability", cfg.log_prob_gpus))
-        if cfg.training_gpus > 0:
-            subs.append(self._training_sub_job())
-        return subs
-
-    def _training_sub_job(self) -> dict:
-        tc = self.config.training_config or {}
-        training = {
-            "optimizer": tc.get("optimizer", {"type": "adamw", "lr": 1e-5}),
-            "max_seq_len": self.config.max_seq_len,
-            "train_batch_size": tc.get("train_batch_size", 1),
-            "n_gpus": self.config.training_gpus,
-        }
-        for k, v in tc.items():
-            training.setdefault(k, v)
-        return self._sub_job("training", {"training_config": training})
-
-    def _inference_sub_job(self, job_type: str, n_gpus: int) -> dict:
-        inference = {"max_seq_len": self.config.max_seq_len, "n_gpus": n_gpus}
-        for k, v in (self.config.vllm_config or {}).items():
-            inference.setdefault(k, v)
-        return self._sub_job(job_type, {"inference_config": inference})
-
-    def _sub_job(self, job_type: str, extra: dict) -> dict:
-        sub = {"job_type": job_type, "model_name": self.config.model_name, **extra}
-        if self.config.dtype is not None:
-            sub["dtype"] = self.config.dtype
-        if self.config.seed is not None:
-            sub["seed"] = self.config.seed
-        return sub
+        return self.config.to_cortex()
 
     # ── HTTP + auth ──────────────────────────────────────────────────────────
     @property
