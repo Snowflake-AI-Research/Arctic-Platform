@@ -1,7 +1,7 @@
 """
-Minimal RL loop against a colocated Neutrino training + sampling job.
+RL against a colocated Neutrino training + sampling job.
 
-A port of ``tinker_cookbook/recipes/rl_loop.py``.
+A port of ``tinker_cookbook/recipes/math_rl/train.py``
 
 Variable naming convention (see CONTRIBUTING.md in tinker-cookbook):
     _P: Problem dimension (different questions in a batch)
@@ -12,12 +12,12 @@ Variable naming convention (see CONTRIBUTING.md in tinker-cookbook):
 import logging
 import statistics
 import time
+from dataclasses import dataclass, field
+from typing import Any
 
 import chz
-import datasets
 
-from tinker_cookbook.recipes.math_rl.math_env import extract_gsm8k_final_answer
-from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed, grade_answer
+from tinker_cookbook import cli_utils
 from tinker_cookbook.utils import ml_log
 
 from neutrino_common import (
@@ -53,10 +53,138 @@ CONVO_PREFIX = [
 ]
 
 
+@dataclass
+class MathDataset:
+    train: list[tuple[str, str]]
+    test: list[tuple[str, str]] | None
+
+    def __post_init__(self) -> None:
+        if len(self.train) == 0:
+            raise ValueError("a math dataset needs at least one training problem")
+
+
+def load_gsm8k(
+    dataset: str = "openai/gsm8k",
+    dataset_config: str = "main",
+    seed: int = 0,
+    n_test: int = 200,
+) -> MathDataset:
+    import datasets
+
+    loaded = datasets.load_dataset(dataset, dataset_config)
+    assert isinstance(loaded, datasets.DatasetDict)
+
+    train_rows = loaded["train"].shuffle(seed=seed)
+    train = list(zip(train_rows["question"], train_rows["answer"]))
+
+    if "test" not in loaded:
+        logger.warning("%s has no test split, so no benchmark will be reported", dataset)
+        return MathDataset(train=train, test=None)
+
+    test_rows = loaded["test"].shuffle(seed=seed)
+    test = list(zip(test_rows["question"], test_rows["answer"]))[:n_test]
+    return MathDataset(train=train, test=test)
+
+
+def build_prompt(question: str, renderer) -> list[int]:
+    conversation = [
+        *CONVO_PREFIX,
+        {"role": "user", "content": question + QUESTION_SUFFIX},
+    ]
+    return renderer.build_generation_prompt(conversation).to_ints()
+
+
+def get_reward(response: str, answer: str) -> float:
+    from tinker_cookbook.recipes.math_rl.math_env import extract_gsm8k_final_answer
+    from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed, grade_answer
+
+    try:
+        given_answer = extract_boxed(response)
+        ground_truth = extract_gsm8k_final_answer(answer)
+        return 1.0 if grade_answer(given_answer, ground_truth) else 0.0
+    except ValueError:
+        return 0.0
+
+
+@dataclass
+class GSM8KAccuracyEvaluator:
+    prompts: list[list[int]]
+    answers: list[str]
+    sampling_params: dict = field(default_factory=dict)
+    name: str = "test/gsm8k"
+
+    def __post_init__(self) -> None:
+        if len(self.prompts) != len(self.answers):
+            raise ValueError(
+                f"{len(self.prompts)} prompts but {len(self.answers)} answers"
+            )
+
+    def __call__(self, client: Any, job_id: str) -> dict[str, float]:
+        from tinker_cookbook.eval.benchmarks._common import check_gsm8k
+        from tinker_cookbook.recipes.math_rl.math_env import extract_gsm8k_final_answer
+
+        if len(self.prompts) == 0:
+            logger.warning("%s: no held-out problems, skipping", type(self).__name__)
+            return {}
+
+        request_id = client.generate(
+            job_id, prompts=self.prompts, sampling_params=self.sampling_params
+        )
+        results = client.poll_request(job_id, request_id)["results"]
+        if len(results) != len(self.prompts):
+            raise RuntimeError(
+                f"asked for {len(self.prompts)} completions, got {len(results)}"
+            )
+
+        max_tokens = self.sampling_params.get("max_tokens")
+        n_correct = n_wrong = n_truncated = n_errors = 0
+        completion_lengths: list[int] = []
+
+        for result, answer in zip(results, self.answers):
+            text = result.get("text") or ""
+            token_ids = result.get("token_ids") or []
+            completion_lengths.append(len(token_ids))
+
+            if _is_truncated(result, max_tokens):
+                n_truncated += 1
+                continue
+            try:
+                ground_truth = extract_gsm8k_final_answer(answer)
+            except ValueError:
+                n_errors += 1
+                continue
+            if check_gsm8k(text, ground_truth):
+                n_correct += 1
+            else:
+                n_wrong += 1
+
+        n = len(results)
+        n_completed = n_correct + n_wrong
+        return {
+            f"{self.name}/accuracy": n_correct / n,
+            f"{self.name}/score_completed": (
+                n_correct / n_completed if n_completed > 0 else float("nan")
+            ),
+            f"{self.name}/frac_truncated": n_truncated / n,
+            f"{self.name}/frac_errors": n_errors / n,
+            f"{self.name}/num_examples": float(n),
+            f"{self.name}/mean_completion_tokens": sum(completion_lengths) / n,
+        }
+
+
+def _is_truncated(result: dict, max_tokens: int | None) -> bool:
+    finish_reason = result.get("finish_reason")
+    if isinstance(finish_reason, str) and finish_reason:
+        return finish_reason == "length"
+    if max_tokens is None:
+        return False
+    return len(result.get("token_ids") or []) >= max_tokens
+
+
 @chz.chz
 class Config:
     config: str
-    job_id: str | None = None 
+    job_id: str | None = None
     keep_job: bool | None = None
 
     model_name: str = "Qwen/Qwen3-8B"
@@ -84,14 +212,22 @@ class Config:
     learning_rate: float = 1e-5
     weight_decay: float = 0.0
     gradient_clipping: float | None = 1.0
-    max_steps: int  = 10
+    max_steps: int = 10
     eps_clip: float = 0.2
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0.0
 
+    # Evaluation. 0 disables it; otherwise a baseline runs at batch 0 and the
+    # final batch is always evaluated.
+    eval_every: int = 10
+    n_test: int = 64
+    eval_temperature: float = 0.6
+    eval_max_tokens: int | None = None
+
     log_path: str = "/tmp/neutrino-examples/rl-loop"
     wandb_project: str | None = None
     wandb_name: str | None = None
+    behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
 
 
 def job_body(config: Config) -> dict:
@@ -155,16 +291,6 @@ def job_body(config: Config) -> dict:
     }
 
 
-def get_reward(response: str, answer: str) -> float:
-    """1.0 when the boxed answer matches GSM8K's ground truth, else 0.0."""
-    try:
-        given_answer = extract_boxed(response)
-        ground_truth = extract_gsm8k_final_answer(answer)
-        return 1.0 if grade_answer(given_answer, ground_truth) else 0.0
-    except ValueError:
-        return 0.0
-
-
 def processing_block(config: Config, global_batch_size: int) -> dict:
     return dict(
         loss_fn="grpo",
@@ -193,22 +319,46 @@ def main(config: Config):
     logger.info(f"Using renderer: {renderer_name}")
 
     logger.info("Loading dataset...")
-    dataset = datasets.load_dataset(config.dataset, config.dataset_config)
-    assert isinstance(dataset, datasets.DatasetDict)
-    train_dataset = dataset["train"]
+    math_dataset = load_gsm8k(
+        config.dataset, config.dataset_config, seed=0, n_test=config.n_test
+    )
+    train_problems = math_dataset.train
 
-    n_train_batches = len(train_dataset) // config.problems_per_batch
+    n_train_batches = len(train_problems) // config.problems_per_batch
     total_steps = (
         n_train_batches if config.max_steps is None else min(n_train_batches, config.max_steps)
     )
     logger.info(f"Training for {total_steps} rollout batches")
 
+    stop_params = stop_params_for(renderer.get_stop_sequences())
     sampling_params = dict(
         max_tokens=config.max_tokens,
         temperature=config.temperature,
         top_p=config.top_p,
-        **stop_params_for(renderer.get_stop_sequences()),
+        **stop_params,
     )
+
+    evaluator = None
+    if config.eval_every > 0:
+        if math_dataset.test is None:
+            logger.warning(
+                "eval_every=%d but %s has no held-out split, so no benchmark will "
+                "be reported",
+                config.eval_every,
+                config.dataset,
+            )
+        else:
+            evaluator = GSM8KAccuracyEvaluator(
+                prompts=[build_prompt(question, renderer) for question, _ in math_dataset.test],
+                answers=[answer for _, answer in math_dataset.test],
+                sampling_params=dict(
+                    max_tokens=config.eval_max_tokens or config.max_tokens,
+                    temperature=config.eval_temperature,
+                    **stop_params,
+                ),
+            )
+            logger.info(f"Held-out benchmark on {len(evaluator.prompts)} problems")
+
     client = make_client(config.config)
 
     with running_job(
@@ -222,19 +372,18 @@ def main(config: Config):
                 "optim/lr": config.learning_rate,
             }
 
+            if evaluator is not None and _should_eval(batch_idx, total_steps, config.eval_every):
+                eval_start = time.time()
+                metrics.update(evaluator(client, job_id))
+                metrics["time/eval"] = time.time() - eval_start
+
             batch_start = batch_idx * config.problems_per_batch
-            batch_rows = train_dataset.select(
-                range(batch_start, batch_start + config.problems_per_batch)
-            )
+            batch = train_problems[batch_start : batch_start + config.problems_per_batch]
 
             prompts_D: list[list[int]] = []
             prompt_tokens_P: list[list[int]] = []
-            for question in batch_rows["question"]:
-                convo = [
-                    *CONVO_PREFIX,
-                    {"role": "user", "content": question + QUESTION_SUFFIX},
-                ]
-                prompt_tokens = renderer.build_generation_prompt(convo).to_ints()
+            for question, _ in batch:
+                prompt_tokens = build_prompt(question, renderer)
                 prompt_tokens_P.append(prompt_tokens)
                 prompts_D.extend([prompt_tokens] * config.group_size)
 
@@ -249,8 +398,8 @@ def main(config: Config):
 
             rewards_P: list[float] = []
             datums_D: list[TrainSequence] = []
-            for problem_idx, (prompt_tokens, answer) in enumerate(
-                zip(prompt_tokens_P, batch_rows["answer"])
+            for problem_idx, (prompt_tokens, (_, answer)) in enumerate(
+                zip(prompt_tokens_P, batch)
             ):
                 group = results_D[
                     problem_idx * config.group_size : (problem_idx + 1) * config.group_size
@@ -316,6 +465,10 @@ def main(config: Config):
 
     ml_logger.close()
     logger.info("Training completed")
+
+
+def _should_eval(step: int, total_steps: int, eval_every: int) -> bool:
+    return step % eval_every == 0 or step == total_steps - 1
 
 
 if __name__ == "__main__":
