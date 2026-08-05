@@ -16,54 +16,79 @@
 """Plugin entry point for the Arctic RL <-> verl integration.
 
 Loaded by verl during ``verl/__init__.py`` bootstrap whenever the user
-sets::
+sets ``VERL_USE_EXTERNAL_MODULES=arctic_platform.integrations.verl.register``.
 
-    export VERL_USE_EXTERNAL_MODULES=arctic_platform.integrations.verl.register
-
-Registration is a module-level side effect. Three things wire up under
-the name ``"arctic"``:
-
-1. Backend class -- :class:`ArcticRLClientWrapper` registers itself with
-   :class:`verl.remote_backend.base.RemoteBackendRegistry` via
-   ``@RemoteBackendRegistry.register("arctic")`` applied at
-   ``adapter`` import time. That import is eager here because the
-   decorator is the mechanism of registration.
-2. ActorRollout forwarder worker -- registered lazily via
-   :meth:`RemoteBackendRegistry.register_worker`. ``main_ppo`` reads
-   the class back through
-   :meth:`RemoteBackendRegistry.get_worker` when
-   ``trainer.remote_backend=arctic``. Kept lazy so that jobs which
-   set ``VERL_USE_EXTERNAL_MODULES`` but use a different backend (or
-   just build config trees) don't pay the tensordict / DeepSpeed /
-   flops-counter import cost of :mod:`worker`.
-3. Rollout replica -- registered lazily with
-   :class:`verl.workers.rollout.replica.RolloutReplicaRegistry` so
-   ``actor_rollout_ref.rollout.name=arctic`` resolves to
-   :class:`ArcticReplica` without eagerly importing vLLM.
+Registers the ``"arctic"`` backend + forwarder worker + rollout replica.
+Auto-selects V0 (Snowflake-AI-Research/verl fork) or V1
+(verl-project/verl main) based on whether
+:mod:`verl.trainer.ppo.v1.trainer_remote_backend` imports.
 """
 
 from __future__ import annotations
 
-from verl.remote_backend.base import RemoteBackendRegistry
-from verl.workers.rollout.replica import RolloutReplicaRegistry
 
-# Importing the adapter is what actually registers the backend class:
-# `@RemoteBackendRegistry.register("arctic")` runs at class-definition
-# time. Everything below is lazy.
-from arctic_platform.integrations.verl import adapter as _adapter  # noqa: F401
+def _register_v0() -> None:
+    """V0 (Snowflake-AI-Research/verl fork) registration path."""
+    from verl.remote_backend.base import RemoteBackendRegistry
+    from verl.workers.rollout.replica import RolloutReplicaRegistry
+
+    # Importing the adapter is what actually registers the backend class:
+    # `@RemoteBackendRegistry.register("arctic")` runs at class-definition time.
+    from arctic_platform.integrations.verl import adapter as _adapter  # noqa: F401
+
+    def _load_v0_worker() -> type:
+        from arctic_platform.integrations.verl.worker import ArcticRLActorRolloutRefWorker
+
+        return ArcticRLActorRolloutRefWorker
+
+    def _load_v0_replica() -> type:
+        from arctic_platform.integrations.verl.rollout import ArcticReplica
+
+        return ArcticReplica
+
+    RemoteBackendRegistry.register_worker("arctic", _load_v0_worker)
+    RolloutReplicaRegistry.register("arctic", _load_v0_replica)
 
 
-def _load_arctic_actor_rollout_worker() -> type:
-    from arctic_platform.integrations.verl.worker import ArcticRLActorRolloutRefWorker
+def _register_v1() -> None:
+    """V1 (verl-project/verl main) registration path.
 
-    return ArcticRLActorRolloutRefWorker
+    Points worker + replica loaders at the V1 wrappers so the base-class
+    contract matches :class:`ActorRolloutRefWorker` and the V1
+    :class:`LLMServerManager`.
+    """
+    from verl.remote_backend.base import RemoteBackendRegistry
+    from verl.workers.rollout.replica import RolloutReplicaRegistry
+
+    # Same adapter (backend business logic is V0/V1-agnostic); the decorator
+    # side effect populates RemoteBackendRegistry["arctic"].
+    from arctic_platform.integrations.verl import adapter as _adapter  # noqa: F401
+
+    def _load_v1_worker() -> type:
+        from arctic_platform.integrations.verl.v1.worker import ArcticV1ActorRolloutRefWorker
+
+        return ArcticV1ActorRolloutRefWorker
+
+    def _load_v1_replica() -> type:
+        from arctic_platform.integrations.verl.v1.replica import ArcticV1Replica
+
+        return ArcticV1Replica
+
+    RemoteBackendRegistry.register_worker("arctic", _load_v1_worker)
+    RolloutReplicaRegistry.register("arctic", _load_v1_replica)
 
 
-def _load_arctic_replica() -> type:
-    from arctic_platform.integrations.verl.rollout import ArcticReplica
+def _detect_and_register() -> None:
+    """Pick V0 or V1 based on what the installed verl exports. V1 wins
+    when both are importable (V1 companion PR ships
+    :mod:`verl.trainer.ppo.v1.trainer_remote_backend`).
+    """
+    try:
+        import verl.trainer.ppo.v1.trainer_remote_backend  # noqa: F401
+    except ImportError:
+        _register_v0()
+    else:
+        _register_v1()
 
-    return ArcticReplica
 
-
-RemoteBackendRegistry.register_worker("arctic", _load_arctic_actor_rollout_worker)
-RolloutReplicaRegistry.register("arctic", _load_arctic_replica)
+_detect_and_register()
