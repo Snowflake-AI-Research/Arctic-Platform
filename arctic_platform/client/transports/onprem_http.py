@@ -39,13 +39,13 @@ class HttpTransport(OnPremTransport):
         super().__init__(config)
         import requests
 
-        self.base_url = f"http://{config.host}:{config.port}"
+        self.base_url = f"http://{config.backend_config.host}:{config.backend_config.port}"
         self.timeout = config.request_timeout
         self.session = requests.Session()
         self._asession = None  # aiohttp.ClientSession, lazy on first acall
         self._asession_loop = None  # the event loop that session is bound to
         self.proc = None
-        if config.launch_local_server:
+        if config.backend_config.launch_local_server:
             self._launch_server()
 
     def _start(self, payload: dict) -> JobId:
@@ -144,7 +144,7 @@ class HttpTransport(OnPremTransport):
             "--host",
             "0.0.0.0",
             "--port",
-            str(cfg.port),
+            str(cfg.backend_config.port),
             "--training-gpus",
             str(cfg.training_gpus),
             "--sampling-gpus",
@@ -152,11 +152,13 @@ class HttpTransport(OnPremTransport):
             "--log-prob-gpus",
             str(cfg.log_prob_gpus),
         ]
-        if cfg.colocate:
+        if cfg.backend_config.colocate:
             cmd.append("--colocate")
         self.proc = subprocess.Popen(cmd)
         self._poll(
-            lambda: self.session.get(f"{self.base_url}/health", timeout=self.timeout).ok, cfg.startup_timeout, "server"
+            lambda: self.session.get(f"{self.base_url}/health", timeout=self.timeout).ok,
+            cfg.backend_config.startup_timeout,
+            "server",
         )
 
     @staticmethod
