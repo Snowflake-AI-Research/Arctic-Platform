@@ -96,9 +96,7 @@ def _generate_request(
     return Request("generate", jobs.require("sampling"), body)
 
 
-def _log_probs_request(
-    jobs: JobHandles, prompts: list, completions: list | None = None, top_k: int = 1
-) -> Request:
+def _log_probs_request(jobs: JobHandles, prompts: list, completions: list | None = None, top_k: int = 1) -> Request:
     body = {"prompts": prompts, "completions": completions, "top_k": top_k}
     return Request("log-probs", jobs.require("log_prob"), body)
 
@@ -231,9 +229,7 @@ class ArcticRLClient:
     async def reset_prefix_cache(
         self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1
     ) -> dict:
-        return await self.transport.acall(
-            _reset_prefix_cache_request(self.jobs, drain, timeout_s, retry_interval_s)
-        )
+        return await self.transport.acall(_reset_prefix_cache_request(self.jobs, drain, timeout_s, retry_interval_s))
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def reconnect_config(self) -> ArcticRLClientConfig:

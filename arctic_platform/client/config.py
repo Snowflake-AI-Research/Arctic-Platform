@@ -53,7 +53,9 @@ class OnPremConfig(BaseModel):
     port: int = Field(8000, description="onprem: server port.")
     colocate: bool = Field(False, description="onprem: colocate job types on shared GPUs.")
     launch_local_server: bool = Field(False, description="onprem: spawn a local server before connecting.")
-    startup_timeout: float = Field(600.0, description="onprem: seconds to wait for a launched server to become healthy.")
+    startup_timeout: float = Field(
+        600.0, description="onprem: seconds to wait for a launched server to become healthy."
+    )
 
 
 class SamplingConfig(BaseModel):
@@ -152,12 +154,12 @@ class ArcticRLClientConfig(BaseModel):
         1800.0, description="Per-request timeout (seconds) applied to every call. Generous for long ops."
     )
     training: TrainingConfig = Field(default_factory=TrainingConfig, description="Training job settings.")
-    sampling: SamplingConfig = Field(default_factory=SamplingConfig, description="Sampling / log-prob engine settings.")
+    sampling: SamplingConfig = Field(
+        default_factory=SamplingConfig, description="Sampling / log-prob engine settings."
+    )
 
     # Backend-specific settings; the concrete type selects the deployment target.
-    backend_config: OnPremConfig = Field(
-        default_factory=OnPremConfig, description="Backend-specific settings."
-    )
+    backend_config: OnPremConfig = Field(default_factory=OnPremConfig, description="Backend-specific settings.")
 
     # Reconnect: attach to pre-existing jobs instead of creating new ones.
     training_job_id: JobId | None = None
