@@ -1548,6 +1548,7 @@ class NeutrinoClient:
         source_sub_job_id: str,
         target_sub_job_ids: list[str],
         *,
+        weight_format: str | None = None,
         sub_job_id: str | None = None,
         sub_job_type: str | None = None,
     ) -> str:
@@ -1557,8 +1558,12 @@ class NeutrinoClient:
         Multi-sub-job sessions require the operation envelope to include a
         routing hint. By default, route through the source training sub-job.
 
-        ***** POST operation 
-        https://bbb39214.snowflakecomputing.com/api/v2/databases/neutrino_db/schemas/neutrino_schema/cortex-training/b1fcb345-de6f-40b8-a6b8-c4b4fd02dbec/operation 
+        Pass ``weight_format="lora"`` to broadcast only the trained adapter
+        tensors. Both sub-jobs must have been created with a matching
+        ``peft_config``.
+
+        ***** POST operation
+        https://bbb39214.snowflakecomputing.com/api/v2/databases/neutrino_db/schemas/neutrino_schema/cortex-training/b1fcb345-de6f-40b8-a6b8-c4b4fd02dbec/operation
 
         body={'operation_type': 'weight-sync',
               'sub_job_id': 'b1fcb345-de6f-40b8-a6b8-c4b4fd02dbec:training:0', 
@@ -1578,6 +1583,8 @@ class NeutrinoClient:
             "source_sub_job_id": source_sub_job_id, # training
             "target_sub_job_ids": list(target_sub_job_ids), # sampling
         }
+        if weight_format is not None:
+            body["weight_format"] = weight_format
         return self._operation(
             job_id,
             "weight-sync",

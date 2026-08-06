@@ -252,12 +252,16 @@ def forward_backward_step(
     return fwd_bwd_result, step_result
 
 
-def sync_weights(client: NeutrinoClient, job_id: str) -> dict:
-    """Push the training sub-job's weights into the sampling sub-job."""
+def sync_weights(
+    client: NeutrinoClient,
+    job_id: str,
+    weight_format: str | None = None,
+) -> dict:
     request_id = client.weight_sync(
         job_id,
         source_sub_job_id=training_sub_job_id(job_id),
         target_sub_job_ids=[sampling_sub_job_id(job_id)],
+        weight_format=weight_format,
     )
     return client.poll_request(job_id, request_id)
 

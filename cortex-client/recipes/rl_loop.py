@@ -10,6 +10,7 @@ Variable naming convention (see CONTRIBUTING.md in tinker-cookbook):
 """
 
 import logging
+import os
 import statistics
 import time
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ import chz
 from tinker_cookbook import cli_utils
 from tinker_cookbook.utils import ml_log
 
+from dss_client.neutrino_client import DEBUG_OPTIONS_ENV
 from neutrino_common import (
     TrainSequence,
     build_renderer,
@@ -187,8 +189,8 @@ class Config:
     job_id: str | None = None
     keep_job: bool | None = None
 
-    model_name: str = "Qwen/Qwen3-8B"
-    renderer_name: str = "qwen3"
+    model_name: str = "Qwen/Qwen3.5-4B"
+    renderer_name: str = "qwen3_5"
     training_gpus: int = 4
     sampling_gpus: int = 4
     gpu_memory_utilization: float = 0.4
@@ -212,11 +214,12 @@ class Config:
     learning_rate: float = 1e-5
     weight_decay: float = 0.0
     gradient_clipping: float | None = 1.0
-    max_steps: int = 10
+    max_steps: int = 100
     eps_clip: float = 0.2
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0.0
 
+    lora_rank: int = 8
     # Evaluation. 0 disables it; otherwise a baseline runs at batch 0 and the
     # final batch is always evaluated.
     eval_every: int = 10
@@ -228,6 +231,30 @@ class Config:
     wandb_project: str | None = None
     wandb_name: str | None = None
     behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
+    debug_image_tag: str | None = None
+
+
+# Qwen-style Linear names covering Tinker's train_attn / train_mlp / train_unembed.
+_LORA_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+
+
+def lora_config(config: Config) -> dict:
+    return {
+        "peft_type": "Lora",
+        "r": config.lora_rank,
+        "lora_alpha": config.lora_rank,
+        "lora_dropout": 0.0,
+        "bias": "none",
+        "target_modules": list(_LORA_TARGET_MODULES),
+    }
 
 
 def job_body(config: Config) -> dict:
@@ -239,6 +266,7 @@ def job_body(config: Config) -> dict:
             f"{config.training_gpus} = {per_step})"
         )
 
+    peft = lora_config(config)
     training_config: dict = {
         "model_provider": "huggingface",
         "n_gpus": config.training_gpus,
@@ -260,11 +288,12 @@ def job_body(config: Config) -> dict:
             "zero_optimization": {"stage": config.zero_stage, "reduce_scatter": True},
             "bf16": {"enabled": True},
         },
+        "peft_config": peft,
     }
     if config.gradient_clipping is not None:
         training_config["gradient_clipping"] = config.gradient_clipping
 
-    return {
+    body: dict = {
         "sub_job_configs": [
             {
                 "job_type": "sampling",
@@ -278,6 +307,7 @@ def job_body(config: Config) -> dict:
                         "max_model_len": config.max_seq_len,
                         "gpu_memory_utilization": config.gpu_memory_utilization,
                     },
+                    "peft_config": peft,
                 },
             },
             {
@@ -289,6 +319,9 @@ def job_body(config: Config) -> dict:
             },
         ]
     }
+    if config.debug_image_tag:
+        body["debug"] = {"job": {"image_tag": config.debug_image_tag}}
+    return body
 
 
 def processing_block(config: Config, global_batch_size: int) -> dict:
@@ -304,6 +337,11 @@ def processing_block(config: Config, global_batch_size: int) -> dict:
 
 
 def main(config: Config):
+    if config.debug_image_tag:
+        # Client refuses a create-job `debug` block unless this is set.
+        os.environ[DEBUG_OPTIONS_ENV] = "1"
+        logger.info("Using debug image_tag=%s", config.debug_image_tag)
+
     ml_logger = ml_log.setup_logging(
         log_dir=config.log_path,
         wandb_project=config.wandb_project,
@@ -449,7 +487,7 @@ def main(config: Config):
                 train_loss = float(fwd_bwd_result["avg_loss"])
                 metrics.update(fwd_bwd_result.get("metrics") or {})
                 metrics.update(step_result.get("metrics") or {})
-                sync_weights(client, job_id)
+                sync_weights(client, job_id, weight_format="lora")
 
             metrics.update(
                 {
