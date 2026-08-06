@@ -62,11 +62,19 @@ class RayTransport(OnPremTransport):
         self._server = ArcticRLRayServer(self._state)
         self._check_op_coverage(self._server)
 
-    def call(self, request: Request) -> dict:
-        # Pass job_id only when set (ops omitting it call method(body)), then the body.
+    def _resolve(self, request: Request):
         method = getattr(self._server, method_name(request.op))
         args = (request.body,) if request.job_id is None else (request.job_id, request.body)
+        return method, args
+
+    def call(self, request: Request) -> dict:
+        # Pass job_id only when set (ops omitting it call method(body)), then the body.
+        method, args = self._resolve(request)
         return self._loop.run_until_complete(method(*args))
+
+    async def acall(self, request: Request) -> dict:
+        method, args = self._resolve(request)
+        return await method(*args)
 
     def _destroy(self, job_id: JobId, job_type: str) -> None:
         self._loop.run_until_complete(self._server.destroy(job_id, job_type))

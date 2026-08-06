@@ -15,16 +15,18 @@
 """Cortex (cortex-training) transport over SnowAPI.
 
 SnowAPI is async: every op submits and returns a ``request_id`` that is polled to
-completion. So `call` is just submit + poll -> final result dict, the same
-blocking contract the on-prem transports expose. The only Cortex specifics live
-in `_submit`, because SnowAPI is not uniform: forward-backward and generate carry
-DSSST1 octet bodies (byte-chunked), while step/save/operation post their JSON body
-as-is (the client assembles the full `/operation` envelope, incl. sub-job routing).
-Unsupported ops (`forward`, `log-probs`) raise NotImplementedError.
+completion. So an op is just submit + poll -> final result dict, the same
+contract the on-prem transports expose. `call` runs it over ``requests``; `acall`
+runs the identical flow over ``aiohttp`` for the async client. The only Cortex
+specifics live in `_submit`, because SnowAPI is not uniform: forward-backward and
+generate carry DSSST1 octet bodies (byte-chunked), while step/save/operation post
+their JSON body as-is (the client assembles the full `/operation` envelope, incl.
+sub-job routing). Unsupported ops (`forward`, `log-probs`) raise NotImplementedError.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import os
@@ -32,6 +34,7 @@ import time
 from typing import Any
 
 import requests
+from tenacity import AsyncRetrying
 from tenacity import Retrying
 from tenacity import retry_if_exception
 from tenacity import stop_after_attempt
@@ -71,6 +74,17 @@ def _is_transient(exc: BaseException) -> bool:
     return False
 
 
+def _is_transient_async(exc: BaseException) -> bool:
+    """`_is_transient` for the aiohttp path (different exception hierarchy)."""
+    import aiohttp
+
+    if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
+        return True
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status in _TRANSIENT_STATUSES
+    return False
+
+
 def _is_connect_error(exc: BaseException) -> bool:
     """Only failures proving the request never reached the server (safe for mutating POSTs)."""
     if isinstance(exc, requests.exceptions.ConnectTimeout):
@@ -92,6 +106,8 @@ class CortexTransport(Transport):
         self.poll_interval = 0.5
         self.poll_timeout = config.job_ready_timeout
         self.session = self._build_session()
+        self._asession = None  # aiohttp.ClientSession, lazy on first acall
+        self._asession_loop = None  # the event loop that session is bound to
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def initialize(self) -> JobHandles:
@@ -127,6 +143,10 @@ class CortexTransport(Transport):
         # lists, so match that contract.
         return _to_python(result) if request.op == "generate" else result
 
+    async def acall(self, request: Request) -> dict:
+        result = await self._apoll(await self._asubmit(request))
+        return _to_python(result) if request.op == "generate" else result
+
     def _submit(self, request: Request) -> str:
         # Same shape as on-prem's call: build the url, then pick the wire. Octet ops
         # (forward-backward, generate) go DSSST1; the rest post JSON as-is. The client
@@ -148,6 +168,23 @@ class CortexTransport(Transport):
             final = self._send("POST", url, data=chunk, headers={"Content-Type": "application/octet-stream"})
         return final["request_id"]
 
+    async def _asubmit(self, request: Request) -> str:
+        op = request.op
+        body = {k: v for k, v in request.body.items() if v is not None}
+        url = f"{self._prefix}/{self.job_id}/{op}"
+        if op in _OCTET_OPS:
+            return await self._asubmit_octet(url, op, body)
+        if op in ("step", "save", "operation"):
+            return (await self._asend("POST", url, json=body))["request_id"]
+        raise NotImplementedError(f"cortex has no {op}")
+
+    async def _asubmit_octet(self, url: str, op: str, body: dict) -> str:
+        frame = wire.dumps(body, metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}})
+        final: dict = {}
+        for chunk in wire.encode_byte_chunks(frame, kind="request", operation=op, max_bytes=_MAX_OCTET_BYTES):
+            final = await self._asend("POST", url, data=chunk, headers={"Content-Type": "application/octet-stream"})
+        return final["request_id"]
+
     def _poll(self, request_id: str) -> dict:
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
@@ -167,6 +204,30 @@ class CortexTransport(Transport):
             if state in _REQUEST_FAILED:
                 raise RuntimeError(f"cortex request {request_id} ended '{state}': {status.get('error', '')}")
             time.sleep(delay)
+            delay = min(delay * 1.25, 6.0)
+        raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s")
+
+    async def _apoll(self, request_id: str) -> dict:
+        deadline = time.monotonic() + self.poll_timeout
+        delay = self.poll_interval
+        chunks: list[bytes] = []
+        cursor: str | None = None
+        while time.monotonic() < deadline:
+            status = await self._asend(
+                "GET", f"{self._prefix}/{self.job_id}/requests/{request_id}", params={"cursor": cursor} if cursor else None
+            )
+            state = _short(status.get("status"))
+            chunks.extend(c for c in map(_result_chunk, status.get("events") or []) if c is not None)
+            if status.get("next_cursor"):
+                cursor = status["next_cursor"]
+                continue  # drain remaining result chunks before backing off
+            if state in _REQUEST_DONE:
+                if chunks:
+                    return wire.decode_result_chunks(chunks)
+                return _decode_result(status.get("result") or {})
+            if state in _REQUEST_FAILED:
+                raise RuntimeError(f"cortex request {request_id} ended '{state}': {status.get('error', '')}")
+            await asyncio.sleep(delay)
             delay = min(delay * 1.25, 6.0)
         raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s")
 
@@ -205,12 +266,18 @@ class CortexTransport(Transport):
         base = (cx.base_url or f"https://{cx.host}").rstrip("/")
         return f"{base}/api/v2/databases/{cx.database}/schemas/{cx.schema_}/{cx.endpoint}"
 
+    def _auth_headers(self) -> dict[str, str]:
+        cx = self.config.backend_config
+        if cx.base_url is not None:  # local/dev host: no PAT auth
+            return {}
+        return {
+            "Authorization": f"Bearer {os.environ[cx.pat_env_var]}",
+            "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
+        }
+
     def _build_session(self) -> requests.Session:
         session = requests.Session()
-        cx = self.config.backend_config
-        if cx.base_url is None:  # PAT auth against a real Snowflake host
-            session.headers["Authorization"] = f"Bearer {os.environ[cx.pat_env_var]}"
-            session.headers["X-Snowflake-Authorization-Token-Type"] = "PROGRAMMATIC_ACCESS_TOKEN"
+        session.headers.update(self._auth_headers())
         return session
 
     def _job(self) -> dict:
@@ -231,6 +298,46 @@ class CortexTransport(Transport):
             reraise=True,
         )
         return retryer(attempt)
+
+    async def _ensure_asession(self):
+        # A ClientSession is bound to the loop it's built on; reuse it only on that
+        # same loop. On a new loop (e.g. a fresh asyncio.run) rebuild -- the stale
+        # one can't be awaited closed from here.
+        loop = asyncio.get_running_loop()
+        if self._asession is None or self._asession.closed or self._asession_loop is not loop:
+            import aiohttp
+
+            self._asession = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.request_timeout),
+                headers=self._auth_headers(),
+            )
+            self._asession_loop = loop
+        return self._asession
+
+    async def _asend(self, method: str, url: str, *, retry_on=None, **kwargs: Any) -> dict:
+        session = await self._ensure_asession()
+
+        async def attempt() -> dict:
+            async with session.request(method, url, **kwargs) as resp:
+                resp.raise_for_status()
+                return await resp.json(content_type=None)
+
+        retryer = AsyncRetrying(
+            retry=retry_if_exception(retry_on or _is_transient_async),
+            stop=stop_after_attempt(1 + self.max_retries),
+            wait=wait_exponential_jitter(initial=0.5, max=10.0),
+            reraise=True,
+        )
+        return await retryer(attempt)
+
+    async def aclose(self) -> None:
+        # Only the loop that owns the session can close it; on any other loop just
+        # drop the reference (matches the on-prem HTTP transport).
+        if self._asession is not None:
+            if not self._asession.closed and self._asession_loop is asyncio.get_running_loop():
+                await self._asession.close()
+            self._asession = None
+            self._asession_loop = None
 
 
 def _short(status: Any, prefix: str = "request_state_") -> str:
