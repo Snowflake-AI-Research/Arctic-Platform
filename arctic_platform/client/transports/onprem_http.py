@@ -12,40 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Blocking HTTP transport (on-prem) + tensor codec."""
+"""Blocking HTTP transport (on-prem). Tensor bodies use the shared DSSST1 codec."""
 
 from __future__ import annotations
 
 import time
-from typing import Any
 
+from arctic_platform import wire
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transports.onprem import OnPremTransport
 
-
-def _dumps(obj: Any) -> bytes:
-    import io
-
-    import torch
-
-    buf = io.BytesIO()
-    torch.save(obj, buf)
-    return buf.getvalue()
-
-
-def _loads(data: bytes) -> Any:
-    import io
-
-    import torch
-
-    return torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
+# Ops the server wants as DSSST1 octet even without tensors in the body: a wire
+# requirement of the endpoint (matching Cortex/SnowAPI), not payload binary-ness.
+_OCTET_OPS = frozenset({"generate"})
 
 
 class HttpTransport(OnPremTransport):
-    """Blocking HTTP + tensor codec. Serves onprem (local/remote)."""
+    """Blocking HTTP over the shared DSSST1 wire. Serves onprem (local/remote)."""
 
     def __init__(self, config: ArcticRLClientConfig) -> None:
         super().__init__(config)
@@ -63,19 +49,20 @@ class HttpTransport(OnPremTransport):
         resp.raise_for_status()
         return resp.json()["job_id"]
 
-    def _rpc(self, request: Request) -> dict:
-        # Tensor-bearing ops send an octet torch payload; the rest send JSON.
+    def call(self, request: Request) -> dict:
+        # Tensor-bearing ops (and generate) send a DSSST1 octet body; rest send JSON.
+        octet = request.binary or request.op in _OCTET_OPS
         payload = (
-            {"data": _dumps(request.body), "headers": {"Content-Type": "application/octet-stream"}}
-            if request.binary
+            {"data": wire.dumps(request.body), "headers": {"Content-Type": "application/octet-stream"}}
+            if octet
             else {"json": request.body}
         )
         params = {} if request.job_id is None else {"job_id": request.job_id}
         resp = self.session.post(f"{self.base_url}/{request.op}", params=params, timeout=self.timeout, **payload)
         resp.raise_for_status()
-        # Tensor-bearing responses come back as octet; everything else is JSON.
+        # Tensor-bearing responses come back as DSSST1 octet; everything else is JSON.
         if "application/octet-stream" in resp.headers.get("Content-Type", ""):
-            return _loads(resp.content)
+            return wire.loads(resp.content)
         return resp.json()
 
     def _destroy(self, job_id: JobId, job_type: str) -> None:

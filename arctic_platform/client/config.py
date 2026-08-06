@@ -58,8 +58,7 @@ class ArcticRLClientConfig(BaseModel):
         None,
         description=(
             "onprem: training job's base checkpoint dir, set at init (resume-from + weight sync). "
-            "This is the default destination; a per-call save_checkpoint(path=...) overrides it for "
-            "that call and falls back to this dir when path is None."
+            "This is the default destination used by save_checkpoint()."
         ),
     )
 

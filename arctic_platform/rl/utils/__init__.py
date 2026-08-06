@@ -29,8 +29,12 @@ from .record_replay import record_replay_generation
 from .server_models import GenerateRequest
 from .server_models import JobConfig
 from .server_models import LogProbsRequest
-from .server_models import SyncWeightsRequest
+from .server_models import OperationRequest
+from .server_models import ResetPrefixCacheRequest
+from .server_models import SaveRequest
+from .server_models import StepRequest
 from .server_models import WeightNormRequest
+from .server_models import WeightSyncRequest
 from .server_models import build_model_config
 
 __all__ = [
@@ -50,7 +54,11 @@ __all__ = [
     "JobConfig",
     "GenerateRequest",
     "LogProbsRequest",
-    "SyncWeightsRequest",
+    "StepRequest",
+    "SaveRequest",
+    "ResetPrefixCacheRequest",
+    "OperationRequest",
+    "WeightSyncRequest",
     "WeightNormRequest",
     "build_model_config",
 ]
