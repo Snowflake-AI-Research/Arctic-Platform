@@ -116,5 +116,12 @@ class Transport(ABC):
         """Deliver one op to this deployment; return a canonical response dict."""
 
     @abstractmethod
+    async def acall(self, request: Request) -> dict:
+        """Async delivery of one op; return a canonical response dict."""
+
+    async def aclose(self) -> None:
+        """Release async resources (e.g. an aiohttp session); no-op by default."""
+
+    @abstractmethod
     def shutdown(self) -> None:
         """Tear down jobs / connections."""

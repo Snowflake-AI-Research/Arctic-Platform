@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Blocking HTTP transport (on-prem). Tensor bodies use the shared DSSST1 codec."""
+"""HTTP transport (on-prem). Sync via ``requests``; async via ``aiohttp``. Tensor bodies use DSSST1."""
 
 from __future__ import annotations
 
+import asyncio
 import time
+from typing import Any
 
 from arctic_platform import wire
 from arctic_platform.client.config import ArcticRLClientConfig
@@ -31,7 +33,7 @@ _OCTET_OPS = frozenset({"generate"})
 
 
 class HttpTransport(OnPremTransport):
-    """Blocking HTTP over the shared DSSST1 wire. Serves onprem (local/remote)."""
+    """HTTP over the shared DSSST1 wire. Serves onprem (local/remote)."""
 
     def __init__(self, config: ArcticRLClientConfig) -> None:
         super().__init__(config)
@@ -40,6 +42,8 @@ class HttpTransport(OnPremTransport):
         self.base_url = f"http://{config.host}:{config.port}"
         self.timeout = config.request_timeout
         self.session = requests.Session()
+        self._asession = None  # aiohttp.ClientSession, lazy on first acall
+        self._asession_loop = None  # the event loop that session is bound to
         self.proc = None
         if config.launch_local_server:
             self._launch_server()
@@ -49,21 +53,58 @@ class HttpTransport(OnPremTransport):
         resp.raise_for_status()
         return resp.json()["job_id"]
 
-    def call(self, request: Request) -> dict:
-        # Tensor-bearing ops (and generate) send a DSSST1 octet body; rest send JSON.
-        octet = request.binary or request.op in _OCTET_OPS
-        payload = (
-            {"data": wire.dumps(request.body), "headers": {"Content-Type": "application/octet-stream"}}
-            if octet
-            else {"json": request.body}
-        )
+    def _http_args(self, request: Request) -> tuple[str, dict[str, Any]]:
+        """URL + post kwargs shared by ``requests`` and ``aiohttp``."""
+        url = f"{self.base_url}/{request.op}"
         params = {} if request.job_id is None else {"job_id": request.job_id}
-        resp = self.session.post(f"{self.base_url}/{request.op}", params=params, timeout=self.timeout, **payload)
+        if request.binary or request.op in _OCTET_OPS:
+            return url, {
+                "params": params,
+                "data": wire.dumps(request.body),
+                "headers": {"Content-Type": "application/octet-stream"},
+            }
+        return url, {"params": params, "json": request.body}
+
+    def call(self, request: Request) -> dict:
+        url, kwargs = self._http_args(request)
+        resp = self.session.post(url, timeout=self.timeout, **kwargs)
         resp.raise_for_status()
-        # Tensor-bearing responses come back as DSSST1 octet; everything else is JSON.
         if "application/octet-stream" in resp.headers.get("Content-Type", ""):
             return wire.loads(resp.content)
         return resp.json()
+
+    async def _ensure_asession(self):
+        # A ClientSession is bound to the loop it's built on; reuse it only on
+        # that same loop. On a new loop (e.g. a fresh asyncio.run) we abandon the
+        # stale one -- it can't be awaited closed from here -- and rebuild.
+        loop = asyncio.get_running_loop()
+        if self._asession is None or self._asession.closed or self._asession_loop is not loop:
+            import aiohttp
+
+            self._asession = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+                connector=aiohttp.TCPConnector(limit=0),
+            )
+            self._asession_loop = loop
+        return self._asession
+
+    async def acall(self, request: Request) -> dict:
+        session = await self._ensure_asession()
+        url, kwargs = self._http_args(request)
+        async with session.post(url, **kwargs) as resp:
+            resp.raise_for_status()
+            if "application/octet-stream" in resp.headers.get("Content-Type", ""):
+                return wire.loads(await resp.read())
+            return await resp.json()
+
+    async def aclose(self) -> None:
+        # Only the loop that owns the session can close it; on any other loop
+        # (a stale session from a prior loop) just drop the reference.
+        if self._asession is not None:
+            if not self._asession.closed and self._asession_loop is asyncio.get_running_loop():
+                await self._asession.close()
+            self._asession = None
+            self._asession_loop = None
 
     def _destroy(self, job_id: JobId, job_type: str) -> None:
         self.session.post(
