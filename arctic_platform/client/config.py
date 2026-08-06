@@ -100,7 +100,7 @@ class ModelBuildConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     attn_implementation: str | None = Field(None, description="Attention implementation to request from HF.")
-    loader: str | None = Field(None, description="Model factory loader name (maps to Neutrino model_provider).")
+    loader: str | None = Field(None, description="Model factory loader name.")
     parallelism: ParallelismConfig = Field(default_factory=ParallelismConfig, description="Loader-specific parallelism.")
     patches: Patches = Field(default_factory=Patches, description="Post-load patches (e.g. liger).")
 
@@ -144,9 +144,8 @@ class TrainingConfig(BaseModel):
         ),
         description="Enable activation/gradient checkpointing (bool) or layer frequency (int).",
     )
-    multiplex_job_id: str | None = Field(None, description="Neutrino multiplex job id for the training sub-job.")
 
-    # On-prem worker extras (ignored by Neutrino today).
+    # On-prem worker extras.
     lr_scheduler: dict[str, Any] | None = None
     training_horizon: int | None = Field(None, ge=0)
     gradient_accumulation_steps: int | None = Field(None, ge=1)
@@ -242,14 +241,14 @@ class ArcticRLClientConfig(BaseModel):
         payload: dict[str, Any] = {"model_name": self.model_name, "job_type": job_type, "seed": self.seed}
         if job_type in ("training", "log_prob"):
             bc = self.backend_config
-            if isinstance(bc, OnPremConfig) and bc.ds_config:
+            if bc.ds_config:
                 payload["ds_config"] = bc.ds_config
             if job_type == "training":
                 payload["training_config"] = self._onprem_training_config()
                 worker = self._onprem_ds_worker_config()
                 if worker:
                     payload["ds_worker_config"] = worker
-                if isinstance(bc, OnPremConfig) and bc.checkpoint_path:
+                if bc.checkpoint_path:
                     payload["checkpoint_path"] = bc.checkpoint_path
         elif self.sampling.vllm:
             vllm = dict(self.sampling.vllm)
