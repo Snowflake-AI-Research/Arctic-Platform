@@ -33,6 +33,7 @@
 
 import asyncio  # noqa
 import contextlib
+import fcntl
 import importlib.util
 import inspect
 import json
@@ -41,6 +42,7 @@ import os
 import random
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import unittest
@@ -245,6 +247,23 @@ def get_gpu_count():
         return torch.cuda.device_count()
     else:
         return 0
+
+
+def make_tied_lm_head_model(hidden_size: int, vocab_size: int, device: str = "cuda"):
+    """Minimal stand-in for a causal-LM as consumed by ``common.utils.tiled_logits``.
+
+    Returns an object exposing just what those primitives touch: ``.lm_head`` (a
+    bias-free ``Linear`` projecting ``hidden_size -> vocab_size``) and
+    ``.config.vocab_size``. The ``ds_grad_is_ready`` flag DeepSpeed normally sets
+    on engine params is stubbed on the weight so the tied-grad bookkeeping in
+    :class:`~arctic_platform.common.utils.tiled_logits.TiledLogProbEntropy` is
+    satisfied by a bare ``Linear``.
+    """
+    from types import SimpleNamespace
+
+    lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False).to(device)
+    lm_head.weight.ds_grad_is_ready = True
+    return SimpleNamespace(lm_head=lm_head, config=SimpleNamespace(vocab_size=vocab_size))
 
 
 def torch_assert_equal(actual, expected, **kwargs):
@@ -615,12 +634,14 @@ class TestCasePlus(unittest.TestCase):
         self._test_file_path = inspect.getfile(self.__class__)
         path = Path(self._test_file_path).resolve()
         self._test_file_dir = path.parents[0]
-        for up in [1, 2, 3]:
+        # Walk up from the test file until we find the package root (has ``tests/`` plus either
+        # ``arctic_platform/`` or the legacy ``arctic_training/`` layout).
+        for up in [1, 2, 3, 4]:
             tmp_dir = path.parents[up]
-            if (tmp_dir / "arctic_training").is_dir() and (tmp_dir / "tests").is_dir():
+            has_pkg = (tmp_dir / "arctic_platform").is_dir() or (tmp_dir / "arctic_training").is_dir()
+            if has_pkg and (tmp_dir / "tests").is_dir():
+                self._repo_root_dir = tmp_dir
                 break
-        if tmp_dir:
-            self._repo_root_dir = tmp_dir
         else:
             raise ValueError(f"can't figure out the root of the repo from {self._test_file_path}")
         self._tests_dir = self._repo_root_dir / "tests"
@@ -851,8 +872,67 @@ def get_unique_port_number():
 
     To accomodate unit tests that may require more than one port, the worker id is multiplied by 8, so that each worker owns a contiguous block of 8 ports
     (``base``, ``base+1``, ..., ``base+7``). It's the responsibility of the test to get the +1, +2, ... +7 increments for the additional ports if any.
+
+    Root ``tests/conftest.py`` claims ``base`` for torch.distributed ``MASTER_PORT``. Prefer
+    ``reserve_free_port(get_unique_port_number() + 1, span=7)`` for HTTP / secondary ports so
+    workers do not collide under ``pytest -n``.
     """
     return DEFAULT_MASTER_PORT + 8 * get_xdist_worker_id()
+
+
+def reserve_free_port(start: int, span: int = 7) -> int:
+    """First bindable TCP port in ``[start, start + span)``.
+
+    Prefer this over ``socket.bind(('', 0))`` (or a fixed port) when launching servers under
+    pytest-xdist: each worker owns an 8-port block from :func:`get_unique_port_number`, and
+    probing within that block keeps concurrent workers from racing on the same listen port.
+    Re-probe per session (not once at import) so a port left squatted by a prior run in this
+    worker is stepped over rather than reused.
+    """
+    for port in range(start, start + span):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError(f"no free port found in [{start}, {start + span})")
+
+
+# Host-wide lock path shared across GPU test modules so their GPU-heavy bodies serialize against
+# each other under xdist when GPUs are not partitioned. Resolved at import (before any per-session
+# TMPDIR override) so it stays a single host-wide path.
+GPU_SERIAL_LOCK_PATH = os.path.join(tempfile.gettempdir(), "arl_test_gpu.lock")
+
+
+def gpu_partitioning_active() -> bool:
+    """True when root conftest gave each xdist worker its own disjoint GPU slice.
+
+    See ``tests/conftest._maybe_partition_gpus``. In that mode workers never share GPUs, so the
+    host-wide serial lock is unnecessary.
+    """
+    return os.environ.get("ARL_GPU_PARTITIONED") == "1"
+
+
+@contextlib.contextmanager
+def gpu_serial_lock():
+    """Serialize GPU-heavy bodies across xdist workers.
+
+    Multiple workers spinning up DeepSpeed / vLLM on shared GPUs at once contend for VRAM and
+    trip init-time memory checks / OOM. Hold a host-wide advisory lock so one worker drives the
+    GPUs at a time. No-op in a serial run and when GPUs are partitioned (each worker owns a
+    disjoint slice). Engaged by the ``_serialize_gpu_work`` autouse fixture in
+    ``tests/rl/conftest.py`` and ``tests/sft/conftest.py`` for tests marked ``gpu_serial``.
+    """
+    if get_xdist_worker_count() <= 1 or gpu_partitioning_active():
+        yield
+        return
+    with open(GPU_SERIAL_LOCK_PATH, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 # --- test IO helper functions --- #

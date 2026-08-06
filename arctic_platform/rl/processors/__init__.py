@@ -95,6 +95,13 @@ from .stats_tracker import scope
 from .stats_tracker import stat
 from .verl_grpo import verl_grpo_loss
 
+# SFT loss + pipeline (importing registers "sft" / "sft_ce" into LOSS_FNS)
+from .sft import LOGIT_LOSS_FNS
+from .sft import SFT_LOSS_FNS
+from .sft import run_sft_pipeline
+from .sft import sft_ce_loss
+from .sft import sft_loss
+
 __all__ = [
     # pipeline
     "POST_PROCESSORS",
@@ -155,6 +162,11 @@ __all__ = [
     "PROX_APPROX_METHOD_ROLLOUT",
     "PROX_APPROX_METHODS_ALL",
     "grpo_loss",
+    "sft_loss",
+    "sft_ce_loss",
+    "LOGIT_LOSS_FNS",
+    "SFT_LOSS_FNS",
+    "run_sft_pipeline",
     "_internal_grpo_loss_fn",
     "compute_prox_logp_approximations",
     "_resolve_proximal_logp",

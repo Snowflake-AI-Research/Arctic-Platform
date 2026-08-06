@@ -19,7 +19,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from arctic_inference.server.config import ModelConfig
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
@@ -64,6 +63,17 @@ class SaveRequest(BaseModel):
     # Cortex's `save(checkpoint_id, checkpoint_type)` and are accepted (unused).
     checkpoint_id: str | None = None
     checkpoint_type: str = "resumable"
+    # SFT extras (optional path/step override, HF export, rotation, stage metadata).
+    path: str | None = None
+    step: int | None = None
+    export_hf: bool = False
+    save_total_limit: int | None = None
+    stage_info: dict[str, Any] | None = None
+
+
+class LoadCheckpointRequest(BaseModel):
+    path: str | None = None
+    step: int | None = None
 
 
 class ResetPrefixCacheRequest(BaseModel):
@@ -121,7 +131,7 @@ def build_model_config(
     model_name: str,
     vllm_config: dict | None,
     arctic_inference_config: dict | None = None,
-) -> ModelConfig:
+):
     """Construct a :class:`ModelConfig` from user-supplied vllm_config dict.
 
     ``arctic_inference_config`` carries Arctic-platform signals (e.g. use_fca,
@@ -129,6 +139,8 @@ def build_model_config(
     ModelConfig, which expands them into real engine kwargs in
     ``ModelConfig.to_engine_kwargs()``.
     """
+    from arctic_inference.server.config import ModelConfig
+
     cfg = dict(vllm_config or {})
     cfg["model"] = model_name
     known_fields = set(ModelConfig.model_fields.keys())

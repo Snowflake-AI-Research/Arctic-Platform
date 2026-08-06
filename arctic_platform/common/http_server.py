@@ -19,7 +19,7 @@ Uses Ray to manage DeepSpeed workers and ArcticInference ReplicaPools.
 
 Usage::
 
-    python -m arctic_platform.common.server \\
+    python -m arctic_platform.common.http_server \\
         --training-gpus 4 --sampling-gpus 2 --log-prob-gpus 2
 """
 
@@ -32,14 +32,13 @@ import os
 import pathlib
 import sys
 import time
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Union
 
 import ray
 import torch
 import uvicorn
-from arctic_inference.server.replica_pool import ReplicaPool
-from arctic_inference.server.weight_sync.schedule import TransferSchedule
 from fastapi import Body
 from fastapi import FastAPI
 from fastapi import HTTPException
@@ -51,9 +50,8 @@ from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
 from arctic_platform.common.ray_cluster import init_ray_cluster
 from arctic_platform.common.server import ArcticRLServerState
 from arctic_platform.common.utils import http_split_batch
-from arctic_platform.common.utils import merge_cuda_ipc_payloads
 from arctic_platform.common.utils import merge_dict_shards
-from arctic_platform.common.utils.batch import combine_metric_shards
+from arctic_platform.common.utils.batch import finalize_fwd_bwd_metrics
 from arctic_platform.common.utils.batch import restore_batch_order
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.ray_pg import ColocatePlacement
@@ -61,6 +59,7 @@ from arctic_platform.common.utils.ray_pg import create_colocate_placement
 from arctic_platform.common.utils.ray_pg import pg_scheduling_options
 from arctic_platform.common.utils.server_models import GenerateRequest
 from arctic_platform.common.utils.server_models import JobConfig
+from arctic_platform.common.utils.server_models import LoadCheckpointRequest
 from arctic_platform.common.utils.server_models import LogProbsRequest
 from arctic_platform.common.utils.server_models import OperationRequest
 from arctic_platform.common.utils.server_models import ResetPrefixCacheRequest
@@ -69,6 +68,23 @@ from arctic_platform.common.utils.server_models import StepRequest
 from arctic_platform.common.utils.server_models import WeightNormRequest
 from arctic_platform.common.utils.server_models import WeightSyncRequest
 from arctic_platform.common.utils.server_models import build_model_config
+
+if TYPE_CHECKING:
+    from arctic_inference.server.replica_pool import ReplicaPool
+
+
+def _replica_pool_cls():
+    """Lazy import — training-only servers do not need arctic_inference / vLLM."""
+    from arctic_inference.server.replica_pool import ReplicaPool
+
+    return ReplicaPool
+
+
+def _transfer_schedule_cls():
+    from arctic_inference.server.weight_sync.schedule import TransferSchedule
+
+    return TransferSchedule
+
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +262,9 @@ async def initialize(job_config: JobConfig = Body(...)):
         if job_config.ds_config is not None:
             if app.state.log_prob_workers:
                 raise HTTPException(409, "Log-prob job already running")
+            # Honor MASTER_PORT when set (mirrors ray_server / training branch) so concurrent
+            # log-prob jobs on one host don't collide on a hardcoded rendezvous port.
+            master_port = int(os.environ.get("MASTER_PORT", 29501))
             workers = []
             config_dict = job_config.model_dump()
             for rank in range(gpus):
@@ -253,7 +272,7 @@ async def initialize(job_config: JobConfig = Body(...)):
                     opts = _pg_options(bundle_index=lp_bundle_offset + rank, fraction_key="log_prob")
                 else:
                     opts = dict(num_gpus=1)
-                w = DeepSpeedWorker.options(**opts).remote(rank, gpus, 29501)
+                w = DeepSpeedWorker.options(**opts).remote(rank, gpus, master_port)
                 workers.append(w)
             master_addr = await workers[0].get_ip.remote()
             await asyncio.gather(*[w.initialize.remote(master_addr, config_dict) for w in workers])
@@ -389,16 +408,11 @@ async def forward_backward(
     pr0(f"[DeepSpeedWorker] fwd_bwd: {len(results)=}")
 
     tname = timers.start("xyz fwd_bwd: epilogue")
-    losses = [r["avg_loss"] for r in results]
-    avg_loss = sum(losses)  # / len(losses)
-
-    # See ray_server.forward_backward for the rationale: collapse the per-DP-rank
-    # paired ``.sum`` / ``.tokens`` metric scalars into one global
-    # token-mean scalar per metric per mini-batch. ``batch`` is intentionally
-    # omitted -- the driver does not consume it (see note above).
+    metrics, avg_loss = finalize_fwd_bwd_metrics(results)
+    # ``batch`` is intentionally omitted -- the driver does not consume it.
     merged = dict(
         job_id=job_id,
-        metrics=combine_metric_shards([r["metrics"] for r in results]),
+        metrics=metrics,
         avg_loss=avg_loss,
     )
     timers.stop_and_print_elapsed(tname)
@@ -432,10 +446,12 @@ async def forward(
     if reorder_indices is not None:
         batch = restore_batch_order(batch, reorder_indices)
 
+    metrics, avg_loss = finalize_fwd_bwd_metrics(results)
     merged = dict(
         job_id=job_id,
         batch=batch,
-        metrics=merge_dict_shards([r["metrics"] for r in results]),
+        metrics=metrics,
+        avg_loss=avg_loss,
     )
 
     return Response(content=wire.dumps(merged), media_type="application/octet-stream")
@@ -470,21 +486,62 @@ async def empty_training_cache(job_id: int):
 @app.post("/save")
 async def save(job_id: int, request: SaveRequest = Body(default=SaveRequest())):
     # `checkpoint_id`/`checkpoint_type` are accepted for Cortex parity; on-prem
-    # saves to the job's configured checkpoint_path.
+    # saves to the job's configured checkpoint_path (or SFT path/step override).
     _verify_job(job_id, "training")
     info = app.state.jobs[job_id]
-    path = info.get("checkpoint_path", None)
+    # Client path overrides the job dir; optional step → .../checkpoint-{step}/.
+    path = request.path or info.get("checkpoint_path", None)
     assert path is not None, f"checkpoint_path is required for training job {job_id}"
+    step = request.step
+    if step is not None:
+        path = str(pathlib.Path(path) / f"checkpoint-{int(step)}")
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
-    await asyncio.gather(
-        *[w.save_checkpoint.remote(path) for w in app.state.training_workers],
+    export_hf = bool(request.export_hf)
+    results = await asyncio.gather(
+        *[w.save_checkpoint.remote(path, export_hf) for w in app.state.training_workers],
     )
-    return {"job_id": job_id, "path": path}
+    parent = str(pathlib.Path(path).parent)
+    if step is not None:
+        (pathlib.Path(parent) / "latest").write_text(str(int(step)))
+    limit = request.save_total_limit
+    if limit is not None and int(limit) > 0 and app.state.training_workers:
+        await app.state.training_workers[0].prune_checkpoint_dirs.remote(parent, int(limit))
+    hf_path = None
+    global_step = None
+    if results and isinstance(results[0], dict):
+        hf_path = results[0].get("hf_path")
+        global_step = results[0].get("global_step")
+    return {"job_id": job_id, "path": path, "hf_path": hf_path, "global_step": global_step}
+
+
+@app.post("/load-checkpoint")
+async def load_checkpoint(job_id: int, request: LoadCheckpointRequest = Body(default=LoadCheckpointRequest())):
+    _verify_job(job_id, "training")
+    info = app.state.jobs[job_id]
+    path = request.path or info.get("checkpoint_path", None)
+    assert path is not None, f"checkpoint_path is required for training job {job_id}"
+    step = request.step
+    if step is not None:
+        path = str(pathlib.Path(path) / f"checkpoint-{int(step)}")
+    elif request.path is None:
+        # No explicit path/step: prefer the ``latest`` pointer under the job dir.
+        latest = pathlib.Path(path) / "latest"
+        if latest.is_file():
+            try:
+                path = str(pathlib.Path(path) / f"checkpoint-{int(latest.read_text().strip())}")
+            except ValueError:
+                pass
+    steps = await asyncio.gather(
+        *[w.load_checkpoint.remote(path) for w in app.state.training_workers],
+    )
+    return {"job_id": job_id, "path": path, "global_step": int(steps[0]) if steps else 0}
 
 
 @app.post("/sleep-inference")
-async def sleep_inference(job_id: int, level: int):
+async def sleep_inference(job_id: int, level: int = 1, body: dict | None = Body(None)):
     """Put all inference engines to sleep, freeing GPU memory."""
+    if isinstance(body, dict) and body.get("level") is not None:
+        level = int(body["level"])
     _verify_job(job_id, "sampling")
     colocate = app.state.colocate
     results = {}
@@ -506,8 +563,12 @@ async def sleep_inference(job_id: int, level: int):
 
 
 @app.post("/wake-inference")
-async def wake_inference(job_id: int, tags: list[str] | None = None):
-    """Wake all inference engines, restoring GPU memory."""
+async def wake_inference(job_id: int, body: Any = Body(None)):
+    """Wake all inference engines, restoring GPU memory.
+
+    Body may be a tag list (legacy HTTP client) or ``{"tags": [...]}``.
+    """
+    tags = body.get("tags") if isinstance(body, dict) else body
     _verify_job(job_id, "sampling")
     colocate = app.state.colocate
     restore = colocate and (tags is None or "weights" in tags)
@@ -551,13 +612,15 @@ async def operation(job_id: int, request: OperationRequest = Body(...)):
 
 
 @app.post("/sleep-training")
-async def sleep_training(job_id: int, mode: str = "all"):
+async def sleep_training(job_id: int, mode: str = "all", body: dict | None = Body(None)):
     """Offload training state to CPU (sleep training workers).
 
     mode='all':       Offload everything (for training → inference transition)
     mode='non_lp':    Keep bf16 params on GPU, offload rest (before CUDA IPC sync)
     mode='lp_params': Offload bf16 params only (after CUDA IPC sync)
     """
+    if isinstance(body, dict) and body.get("mode") is not None:
+        mode = str(body["mode"])
     _verify_job(job_id, "training")
     workers = app.state.training_workers
     loop = asyncio.get_running_loop()
@@ -573,7 +636,7 @@ async def sleep_training(job_id: int, mode: str = "all"):
 
 
 @app.post("/wake-training")
-async def wake_training(job_id: int):
+async def wake_training(job_id: int, body: dict | None = Body(None)):
     """Reload all training state to GPU (wake training workers)."""
     _verify_job(job_id, "training")
     workers = app.state.training_workers
@@ -765,155 +828,29 @@ async def weight_sync(job_id: int, request: WeightSyncRequest = Body(...)):
 
 
 async def _sync_weights_cuda_ipc(workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None) -> dict:
-    """Colocated weight sync via CUDA IPC (zero-copy, same GPU).
+    """Colocated weight sync via CUDA IPC (zero-copy, same GPU)."""
+    from arctic_platform.common.utils.weight_sync import sync_weights_cuda_ipc
 
-    For ZeRO-3: all workers call gather_cuda_ipc_handles collectively
-    (GatheredParameters is a collective op).  Every rank produces IPC
-    handles for the full weight on its own physical GPU; we merge the
-    per-rank, per-parameter handle dicts so each colocated inference
-    replica (on a distinct GPU) finds a handle for its GPU.
-
-    For ZeRO-2: falls back to get_cuda_ipc_handles on each rank
-    (params are already full on every rank, no collective needed).
-    """
-    t0 = time.monotonic()
-    loop = asyncio.get_running_loop()
-
-    # All workers must participate for ZeRO-3 collective gather.
-    # gather_cuda_ipc_handles is safe for ZeRO-2 too (no ds_id → no gather).
-    gather_refs = [w.gather_cuda_ipc_handles.remote() for w in workers]
-    results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in gather_refs])
-    ipc_payload = merge_cuda_ipc_payloads(results)
-    num_params = ipc_payload.get("num_params", 0)
-
-    # Staged wake: weights only → IPC load → KV cache (reduces peak GPU memory).
-    # unlike ray_server, all these are done from http_client
-
-    recv_tasks = []
-    total_replicas = 0
-    for p in [pool, lp_pool]:
-        if p is None or p._config is None:
-            continue
-        for rid in range(p.num_replicas):
-            w = p._workers[rid]
-            recv_tasks.append(loop.run_in_executor(None, ray.get, w.load_weights_cuda_ipc.remote(ipc_payload)))
-            total_replicas += 1
-    await asyncio.gather(*recv_tasks)
-
-    # Release IPC tensor refs on every rank (each rank holds its own GPU's
-    # cloned weights alive for the duration of the sync).
-    await asyncio.gather(*[loop.run_in_executor(None, ray.get, w.release_ipc_handles.remote()) for w in workers])
-
-    elapsed = time.monotonic() - t0
-    logger.info(
-        "Weight sync (CUDA IPC) complete in %.3fs (%d replica(s), %d params)", elapsed, total_replicas, num_params
-    )
-    return {"status": "ok"}
+    return await sync_weights_cuda_ipc(workers, pool, lp_pool)
 
 
 async def _sync_weights_cuda_ipc_low_mem(workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None) -> dict:
-    """Memory-efficient (slower) colocated weight sync via CUDA IPC.
+    """Memory-efficient (slower) colocated weight sync via CUDA IPC."""
+    from arctic_platform.common.utils.weight_sync import sync_weights_cuda_ipc_low_mem
 
-    Streams one parameter at a time: all training ranks collectively gather a
-    single ZeRO-3 param onto their own GPU, the colocated inference replicas
-    copy it in, then the source IPC ref is released before moving on. Peak extra
-    GPU memory is one full parameter per GPU (instead of the whole model as in
-    ``_sync_weights_cuda_ipc``), at the cost of many more round-trips.
-
-    Selected via ``arctic_rl.low_memory_weight_sync=True``.
-
-    The staged wake (weights with restore_weights → kv_cache) is driven by the
-    http_client around the /weight-sync call (same as ``_sync_weights_cuda_ipc``);
-    the weights wake restores full-shape vLLM params so the per-param chunk copy
-    lands on real storage rather than offloaded [1] stubs.
-    """
-    t0 = time.monotonic()
-    loop = asyncio.get_running_loop()
-
-    # Enumerate parameter names once (only names cross the Ray boundary; each
-    # worker resolves its own live param by name inside get_cuda_ipc_handle so
-    # the ZeRO-3 gather stays correct).
-    param_names = ray.get(workers[0].get_parameter_names.remote())
-    num_params = len(param_names)
-
-    # Flatten the colocated inference replicas (sampling + optional log-prob).
-    replicas = []
-    for p in [pool, lp_pool]:
-        if p is None or p._config is None:
-            continue
-        for rid in range(p.num_replicas):
-            replicas.append(p._workers[rid])
-
-    all_names: list = []
-    for idx, name in enumerate(param_names):
-        # Collective single-param gather across all training ranks.
-        gather_refs = [w.get_cuda_ipc_handle.remote(name) for w in workers]
-        results = ray.get(gather_refs)
-        payload = merge_cuda_ipc_payloads(results)
-        all_names.extend(payload["names"])
-
-        # On the final param pass the full name list so each receiver can
-        # validate the complete architecture match in one shot.
-        validate = all_names if idx == num_params - 1 else None
-
-        recv_tasks = [
-            loop.run_in_executor(None, ray.get, w.load_weights_cuda_ipc_chunk.remote(payload, validate))
-            for w in replicas
-        ]
-        await asyncio.gather(*recv_tasks)
-
-        # Release this param's source ref on every training rank before the next
-        # gather, bounding peak memory to one full param per GPU.
-        await asyncio.gather(*[loop.run_in_executor(None, ray.get, w.release_ipc_handles.remote()) for w in workers])
-
-    elapsed = time.monotonic() - t0
-    logger.info(
-        "Weight sync (CUDA IPC, low-mem) complete in %.3fs (%d replica(s), %d params)",
-        elapsed,
-        len(replicas),
-        num_params,
-    )
-    return {"status": "ok"}
+    return await sync_weights_cuda_ipc_low_mem(workers, pool, lp_pool)
 
 
 async def _sync_weights_ipc(sync_path: str, workers, pool: ReplicaPool, lp_pool: ReplicaPool | None = None) -> dict:
-    """Colocated weight sync via CPU file.
+    """Colocated weight sync via CPU file."""
+    from arctic_platform.common.utils.weight_sync import sync_weights_cpu_file
 
-    For ZeRO-3: all workers call gather_and_save_state_dict collectively
-    (GatheredParameters requires all ranks).  Only rank 0 writes the file.
-    For ZeRO-2: only rank 0 saves (params are already full).
-    """
-    t0 = time.monotonic()
-    loop = asyncio.get_running_loop()
-
-    # All workers must participate for ZeRO-3 collective gather
-    save_refs = [w.gather_and_save_state_dict.remote(sync_path) for w in workers]
-    results = await asyncio.gather(*[loop.run_in_executor(None, ray.get, ref) for ref in save_refs])
-    num_params = results[0].get("num_params", 0)
-
-    recv_tasks = []
-    total_replicas = 0
-    for p in [pool, lp_pool]:
-        if p is None or p._config is None:
-            continue
-        for rid in range(p.num_replicas):
-            w = p._workers[rid]
-            recv_tasks.append(loop.run_in_executor(None, ray.get, w.load_weights_from_shm_path.remote(sync_path)))
-            total_replicas += 1
-    await asyncio.gather(*recv_tasks)
-
-    pathlib.Path(sync_path).unlink(missing_ok=True)
-
-    elapsed = time.monotonic() - t0
-    logger.info(
-        "Weight sync (CPU→GPU) complete in %.3fs (%d replica(s), %d params)", elapsed, total_replicas, num_params
-    )
-    return {"status": "ok"}
+    return await sync_weights_cpu_file(sync_path, workers, pool, lp_pool)
 
 
 async def _sync_weights_nccl(workers, pool: ReplicaPool) -> dict:
     """Non-colocated weight sync via NCCL (original path)."""
-    schedule = TransferSchedule.build(
+    schedule = _transfer_schedule_cls().build(
         training_sharding="dp",
         training_gpus=len(workers),
         inference_replicas=pool.num_replicas,
@@ -1116,9 +1053,11 @@ def main():
         assert app.state.placement, "Placement groups must be created when colocate=True"
 
     app.state.training_workers = []
-    app.state.sampling_pool = ReplicaPool()
-    if args.log_prob_engine == "vllm":
-        app.state.log_prob_pool = ReplicaPool()
+    # ReplicaPool pulls in arctic_inference → vLLM; only create when needed so
+    # training-only SFT servers can start without the inference stack.
+    app.state.sampling_pool = _replica_pool_cls()() if args.sampling_gpus > 0 else None
+    if args.log_prob_gpus > 0 and args.log_prob_engine == "vllm":
+        app.state.log_prob_pool = _replica_pool_cls()()
     else:
         app.state.log_prob_pool = None
     app.state.log_prob_workers = []

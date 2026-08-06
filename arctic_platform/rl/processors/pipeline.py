@@ -51,10 +51,7 @@ first use.
 
 from __future__ import annotations
 
-import importlib
 from typing import Any
-from typing import Callable
-from typing import Dict
 
 import torch
 
@@ -71,6 +68,8 @@ try:
 except ImportError:
     FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
 
+
+from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
 
 from .microbatch import DEFAULT_MAX_TOKENS_PER_MB
 
@@ -94,39 +93,12 @@ else:
 # Registries
 # ---------------------------------------------------------------------------
 
-POST_PROCESSORS: Dict[str, Callable] = {}
-LOSS_FNS: Dict[str, Callable] = {}
-
-
-def register_post_processor(name: str):
-    """Register a post-forward processor under *name*."""
-
-    def decorator(fn: Callable) -> Callable:
-        POST_PROCESSORS[name] = fn
-        return fn
-
-    return decorator
-
-
-def register_loss_fn(name: str):
-    """Register a loss function under *name*."""
-
-    def decorator(fn: Callable) -> Callable:
-        LOSS_FNS[name] = fn
-        return fn
-
-    return decorator
-
-
-def _resolve_fn(registry: dict, name: str) -> Callable:
-    """Look up *name* in registry; fall back to dotted-path import."""
-    if name in registry:
-        return registry[name]
-    # Dotted-path import: "package.module.fn_name"
-    module_path, fn_name = name.rsplit(".", 1)
-    fn = getattr(importlib.import_module(module_path), fn_name)
-    registry[name] = fn  # cache for next call
-    return fn
+# Shared registries live in arctic_platform.common.registry (used by RL + SFT).
+from arctic_platform.common.registry import LOSS_FNS
+from arctic_platform.common.registry import POST_PROCESSORS
+from arctic_platform.common.registry import _resolve_fn
+from arctic_platform.common.registry import register_loss_fn
+from arctic_platform.common.registry import register_post_processor
 
 
 def padded_tensor_2d_to_unpadded_tensor_1d(tensor_2d, attention_mask_2d_bool):
@@ -720,56 +692,18 @@ def chunked_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy, 
 
 
 def fast_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy):
-    # tname_e2e = timers.start("logprob: e2e")
-
-    if not calculate_entropy:
-        entropy = None
-
+    # Reshape to a flat ``[N, V]`` block and delegate to the shared core in
+    # ``common.utils.tiled_logits`` (single source of truth for the fused
+    # flash-attn CE kernel / logsumexp fallback), then restore batch dims.
     all_but_vocab_dim = logits.shape[:-1]
     vocab_dim = logits.shape[-1]
-    # print(f"{logits.shape=}")
-    # print(f"{labels.shape=}")
     flat_logits = logits.reshape(-1, vocab_dim)
     flat_labels = labels.reshape(-1)
 
-    if FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
-        # tname = timers.start("logprob: fa: 1. logprob")
-        inplace_backward = logits.requires_grad
-        output = cross_entropy_loss(flat_logits, flat_labels, inplace_backward=inplace_backward)
-        logprobs = (-output[0]).view(*all_but_vocab_dim)
-        # timers.stop_and_print_elapsed(tname)
-        if calculate_entropy:
-            # tname = timers.start("logprob: fa: 2. entropy")
-            gathered_logits = torch.gather(flat_logits, -1, flat_labels.unsqueeze(-1)).squeeze(-1)
-            logsumexp = gathered_logits - logprobs.reshape(-1)
-            probs = torch.exp(flat_logits - logsumexp.unsqueeze(-1))
-            entropy = (logsumexp - torch.sum(probs * flat_logits, dim=-1)).view(*all_but_vocab_dim)
-            # timers.stop_and_print_elapsed(tname)
-    else:
-        # using 2 different implementations paths to optimize for whether calculate_entropy is needed or not
-        if calculate_entropy:
-            # tname = timers.start("logprob: (calculate_entropy=True) non-fa: 1. logprob")
-            logsumexp = torch.logsumexp(flat_logits, dim=-1)
-            logprobs = (torch.gather(flat_logits, -1, flat_labels.unsqueeze(-1)).squeeze(-1) - logsumexp).view(
-                *all_but_vocab_dim
-            )
-            probs = torch.exp(flat_logits - logsumexp.unsqueeze(-1))
-            # timers.stop_and_print_elapsed(tname)
-            # tname = timers.start("logprob: (calculate_entropy=False) non-fa: 2. entropy")
-            entropy = (logsumexp - torch.sum(probs * flat_logits, dim=-1)).view(*all_but_vocab_dim)
-            # timers.stop_and_print_elapsed(tname)
-        else:
-            # Fastest logprobs-only: gather + logsumexp, but we can do better
-            # with log_softmax fused kernel (single pass) + gather on the result
-            # tname = timers.start("logprob: (calculate_entropy=False) non-fa: 0. logprob")
-            logprobs = (
-                torch.gather(torch.nn.functional.log_softmax(flat_logits, dim=-1), -1, flat_labels.unsqueeze(-1))
-                .squeeze(-1)
-                .view(*all_but_vocab_dim)
-            )
-            # timers.stop_and_print_elapsed(tname)
-
-    # timers.stop_and_print_elapsed(tname_e2e)
+    logprobs, entropy = logprobs_entropy_from_flat_logits(flat_logits, flat_labels, calculate_entropy)
+    logprobs = logprobs.view(*all_but_vocab_dim)
+    if entropy is not None:
+        entropy = entropy.view(*all_but_vocab_dim)
 
     return logprobs, entropy
 
