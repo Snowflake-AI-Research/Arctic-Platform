@@ -17,7 +17,6 @@ from arctic_platform.client.client import SyncArcticRLClient
 from arctic_platform.client.client import create_arctic_rl_client
 from arctic_platform.client.client import make_transport
 from arctic_platform.client.config import ArcticRLClientConfig
-from arctic_platform.client.config import ModelBuildConfig
 from arctic_platform.client.config import OnPremConfig
 from arctic_platform.client.config import OptimizerConfig
 from arctic_platform.client.config import SamplingConfig
@@ -33,7 +32,6 @@ __all__ = [
     "ArcticRLClient",
     "ArcticRLClientConfig",
     "JobHandles",
-    "ModelBuildConfig",
     "OnPremConfig",
     "OptimizerConfig",
     "SamplingConfig",
