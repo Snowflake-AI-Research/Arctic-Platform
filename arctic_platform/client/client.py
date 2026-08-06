@@ -240,11 +240,9 @@ class ArcticRLClient:
         return _reconnect_config(self.config, self.jobs)
 
     async def shutdown(self) -> None:
-        # HttpTransport's aiohttp session must be closed with await; sync
-        # transport.shutdown() can't do that from a running event loop.
-        aclose = getattr(self.transport, "aclose", None)
-        if aclose is not None:
-            await aclose()
+        # aiohttp's session must be closed with await; the sync shutdown() that
+        # tears down jobs can't do that from inside a running event loop.
+        await self.transport.aclose()
         self.transport.shutdown()
 
     async def __aenter__(self) -> ArcticRLClient:

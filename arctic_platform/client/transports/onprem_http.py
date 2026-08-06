@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -42,6 +43,7 @@ class HttpTransport(OnPremTransport):
         self.timeout = config.request_timeout
         self.session = requests.Session()
         self._asession = None  # aiohttp.ClientSession, lazy on first acall
+        self._asession_loop = None  # the event loop that session is bound to
         self.proc = None
         if config.launch_local_server:
             self._launch_server()
@@ -72,13 +74,18 @@ class HttpTransport(OnPremTransport):
         return resp.json()
 
     async def _ensure_asession(self):
-        if self._asession is None or self._asession.closed:
+        # A ClientSession is bound to the loop it's built on; reuse it only on
+        # that same loop. On a new loop (e.g. a fresh asyncio.run) we abandon the
+        # stale one -- it can't be awaited closed from here -- and rebuild.
+        loop = asyncio.get_running_loop()
+        if self._asession is None or self._asession.closed or self._asession_loop is not loop:
             import aiohttp
 
             self._asession = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.timeout),
                 connector=aiohttp.TCPConnector(limit=0),
             )
+            self._asession_loop = loop
         return self._asession
 
     async def acall(self, request: Request) -> dict:
@@ -91,9 +98,13 @@ class HttpTransport(OnPremTransport):
             return await resp.json()
 
     async def aclose(self) -> None:
-        if self._asession is not None and not self._asession.closed:
-            await self._asession.close()
+        # Only the loop that owns the session can close it; on any other loop
+        # (a stale session from a prior loop) just drop the reference.
+        if self._asession is not None:
+            if not self._asession.closed and self._asession_loop is asyncio.get_running_loop():
+                await self._asession.close()
             self._asession = None
+            self._asession_loop = None
 
     def _destroy(self, job_id: JobId, job_type: str) -> None:
         self.session.post(
