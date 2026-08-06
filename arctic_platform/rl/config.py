@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from typing import Literal
 from typing import Optional
 
@@ -26,13 +27,32 @@ from pydantic import model_validator
 
 
 class ArcticRLClientConfig(BaseModel):
-    backend: Literal["local", "dss-platform"] = "local"
+    backend: Literal["local", "dss-platform", "cortex"] = "local"
     comm_protocol: Literal["http", "ray"] = "http"
     checkpoint_path: Optional[str] = None
 
     # it's best not to pass explicitly the host and port since they are auto derived from comm_protocol
     host: Optional[str] = None
     port: Optional[int] = None
+
+    # Cortex (SnowAPI) target. Only meaningful when backend == "cortex"; the
+    # legacy fields above (host/port/ds_config/ray_*) are ignored on that path.
+    # Provide cortex_base_url for a direct/mock GS URL (bypasses PAT auth), or
+    # cortex_host + a PAT in the env var for Snowflake programmatic-access auth.
+    cortex_base_url: Optional[str] = Field(
+        default=None, description="cortex: direct/mock GS URL; bypasses PAT auth."
+    )
+    cortex_host: Optional[str] = Field(default=None, description="cortex: Snowflake host for PAT auth.")
+    cortex_pat_env_var: str = Field(
+        default="CORTEX_PAT", description="cortex: env var holding the programmatic access token."
+    )
+    cortex_database: Optional[str] = Field(default=None, description="cortex: Snowflake database.")
+    cortex_schema: Optional[str] = Field(default=None, description="cortex: Snowflake schema.")
+    cortex_endpoint: str = Field(default="cortex-training", description="cortex: SnowAPI endpoint name.")
+    cortex_max_retries: int = Field(default=10, ge=0, description="cortex: transient-failure retries per HTTP request.")
+    max_seq_len: Optional[int] = Field(
+        default=None, description="max sequence length (cortex flows this into inference_config)."
+    )
 
     model_name: str = Field(description="Model name or HuggingFace ID to load on all engines.")
     ds_config: dict = Field(default_factory=dict, description="DeepSpeed config for training engine.")
@@ -91,17 +111,21 @@ class ArcticRLClientConfig(BaseModel):
         default=300.0, description="Seconds to wait for the local server to become healthy."
     )
     health_check_interval: float = Field(default=2.0, description="Seconds between health-check polls during startup.")
-    # How long to wait for each job to reach RUNNING state after /initialize.
+    # Cortex cold-start (weights + vLLM warmup) commonly runs 7-9 min; budget
+    # 30 min to match `arctic_platform.client.config.ArcticRLClientConfig`.
     job_ready_timeout: float = Field(
-        default=600.0, description="Seconds to wait for each job to become RUNNING after initialization."
+        default=1800.0, description="Seconds to wait for each job to become RUNNING after initialization."
     )
 
     # Reconnect fields — when set, ArcticRLClient skips /initialize and connects
     # to pre-existing jobs. Populated by ArcticRLClient.reconnect_config() and
     # consumed in ArcticRLClient.__init__. Not forwarded to /initialize.
-    training_job_id: Optional[int] = Field(default=None, exclude=True)
-    sampling_job_id: Optional[int] = Field(default=None, exclude=True)
-    log_prob_job_id: Optional[int] = Field(default=None, exclude=True)
+    # Typed as ``Any`` because Cortex sub-jobs are string tokens
+    # (``"<job_uuid>:training:0"``) while the on-prem local/dss-platform
+    # backends stamp integer job ids.
+    training_job_id: Optional[Any] = Field(default=None, exclude=True)
+    sampling_job_id: Optional[Any] = Field(default=None, exclude=True)
+    log_prob_job_id: Optional[Any] = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def _derive_host_port(self) -> "ArcticRLClientConfig":
@@ -111,7 +135,13 @@ class ArcticRLClientConfig(BaseModel):
         this node's routable IP at port 7000 so off-node Ray workers can reach
         the driver node by IP rather than "localhost". Values passed explicitly
         by the caller are left untouched (e.g. reconnecting to a known server).
+
+        Cortex has no host/port concept (SnowAPI is a stateless HTTPS gateway
+        addressed via cortex_host + endpoint suffix), so this derivation is a
+        no-op there.
         """
+        if self.backend == "cortex":
+            return self
         # Lazy import to avoid pulling ray in at config import time.
         from arctic_platform.rl.ray_cluster import primary_ip
 
