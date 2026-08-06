@@ -106,7 +106,7 @@ class OptimizerConfig(BaseModel):
 class TrainingConfig(BaseModel):
     """Training-job settings + engine. Allocation (GPUs, max_seq_len) stays on the client."""
 
-    model_config = ConfigDict(extra="allow", validate_default=True, populate_by_name=True)
+    model_config = ConfigDict(extra="forbid", validate_default=True, populate_by_name=True)
 
     train_batch_size: int = Field(1, ge=1)
     optimizer: OptimizerConfig | None = Field(default_factory=OptimizerConfig)
@@ -219,9 +219,4 @@ class ArcticRLClientConfig(BaseModel):
             out["training_horizon"] = tc.training_horizon
         if tc.gradient_accumulation_steps is not None:
             out["gradient_accumulation_steps"] = tc.gradient_accumulation_steps
-        # Pass through unknown extras (MoE / framework knobs).
-        known = set(TrainingConfig.model_fields)
-        for k, v in tc.model_dump(exclude_none=True).items():
-            if k not in known:
-                out.setdefault(k, v)
         return out
