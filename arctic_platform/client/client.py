@@ -24,6 +24,8 @@ differ only at `transport.call` vs `transport.acall`.
 from __future__ import annotations
 
 from typing import Any
+from typing import Literal
+from typing import overload
 
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.transport import JobHandles
@@ -139,7 +141,7 @@ def _reconnect_config(config: ArcticRLClientConfig, jobs: JobHandles) -> ArcticR
     )
 
 
-class ArcticRLClient:
+class SyncArcticRLClient:
     def __init__(self, config: ArcticRLClientConfig) -> None:
         self.config = config
         self.transport = make_transport(config)
@@ -183,14 +185,16 @@ class ArcticRLClient:
     def shutdown(self) -> None:
         self.transport.shutdown()
 
-    def __enter__(self) -> ArcticRLClient:
+    def __enter__(self) -> SyncArcticRLClient:
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.shutdown()
 
 
-class AsyncArcticRLClient:
+class ArcticRLClient:
+    """The async client. Use `SyncArcticRLClient` for blocking calls."""
+
     def __init__(self, config: ArcticRLClientConfig) -> None:
         self.config = config
         self.transport = make_transport(config)
@@ -243,17 +247,25 @@ class AsyncArcticRLClient:
             await aclose()
         self.transport.shutdown()
 
-    async def __aenter__(self) -> AsyncArcticRLClient:
+    async def __aenter__(self) -> ArcticRLClient:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
         await self.shutdown()
 
 
-def create_arctic_rl_client(config: ArcticRLClientConfig) -> ArcticRLClient:
-    """Factory matching the current OSS entrypoint shape."""
-    return ArcticRLClient(config)
+@overload
+def create_arctic_rl_client(
+    config: ArcticRLClientConfig, *, blocking_calls: Literal[False] = ...
+) -> ArcticRLClient: ...
 
 
-def create_async_arctic_rl_client(config: ArcticRLClientConfig) -> AsyncArcticRLClient:
-    return AsyncArcticRLClient(config)
+@overload
+def create_arctic_rl_client(config: ArcticRLClientConfig, *, blocking_calls: Literal[True]) -> SyncArcticRLClient: ...
+
+
+def create_arctic_rl_client(
+    config: ArcticRLClientConfig, *, blocking_calls: bool = False
+) -> ArcticRLClient | SyncArcticRLClient:
+    """Async client by default; pass blocking_calls=True for the sync client."""
+    return SyncArcticRLClient(config) if blocking_calls else ArcticRLClient(config)
