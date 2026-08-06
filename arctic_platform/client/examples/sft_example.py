@@ -13,14 +13,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unified SFT training example across the on-prem backends.
+"""Unified SFT training example across the on-prem and Cortex backends.
 
     python arctic_platform/client/examples/sft_example.py --backend onprem-http
     python arctic_platform/client/examples/sft_example.py --backend onprem-ray
+    CORTEX_PAT=... python arctic_platform/client/examples/sft_example.py --backend cortex
 
 Every backend follows the *same* pathway: build config -> ArcticRLClient ->
 loop(fwd_bwd + step) -> shutdown, with a single unified fwd_bwd/step/report.
-The client + transports hide all wire/protocol differences.
+The client + transports hide all wire/protocol differences; only the config and
+the fwd_bwd batch shape differ per backend (Cortex tokenizes an RPC-style
+{"args", "kwargs"} body; on-prem sends a pre-tokenized verl-GRPO payload).
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ sys.path.insert(0, str(ARCTIC))
 sys.path.insert(0, str(ARCTIC / "tests" / "rl"))
 
 from arctic_platform.client import ArcticRLClientConfig  # noqa: E402
+from arctic_platform.client import CortexConfig  # noqa: E402
 from arctic_platform.client import ModelBuildConfig  # noqa: E402
 from arctic_platform.client import OnPremConfig  # noqa: E402
 from arctic_platform.client import OptimizerConfig  # noqa: E402
@@ -102,6 +106,39 @@ def _onprem_config(comm_protocol: str, launch_local_server: bool) -> Callable:
     return build
 
 
+# ── Cortex (SnowAPI) connection info — non-secret; PAT comes from CORTEX_PAT ───
+CORTEX_HOST = "dsa-test.qa6.us-west-2.aws.snowflakecomputing.com"
+CORTEX_DATABASE = "NEUTRINO_DB"
+CORTEX_SCHEMA = "PUBLIC"
+CORTEX_ENDPOINT = "cortex-training"
+
+
+def _cortex_config() -> Callable:
+    def build(stack: contextlib.ExitStack) -> ArcticRLClientConfig:
+        return ArcticRLClientConfig(
+            model_name=MODEL,
+            seed=SEED,
+            max_seq_len=SEQ_LEN,
+            training_gpus=N_GPUS,
+            job_ready_timeout=3600.0,
+            backend_config=CortexConfig(
+                host=CORTEX_HOST,
+                database=CORTEX_DATABASE,
+                schema=CORTEX_SCHEMA,
+                endpoint=CORTEX_ENDPOINT,
+                pat_env_var="CORTEX_PAT",
+            ),
+            training=TrainingConfig(
+                model=ModelBuildConfig(attn_implementation=ATTN, loader="huggingface"),
+                optimizer=OptimizerConfig(lr=LR, weight_decay=0.0, betas=[0.9, 0.999]),
+                train_batch_size=N_GPUS,
+                gradient_clipping=1.0,
+            ),
+        )
+
+    return build
+
+
 # ── shared data, per-backend packaging ───────────────────────────────────────
 def _tokens() -> dict:
     """Tokenize the shared PROMPT with the shared MODEL — the payload the backend sends."""
@@ -137,6 +174,28 @@ def _onprem_batch(tokens: dict) -> Any:
     return build_update_actor_payload(tokens, False, ROLLOUT_N, PROMPT_LEN, RESPONSE_LEN)
 
 
+def _cortex_batch(tokens: dict) -> Any:
+    """Cortex fwd_bwd wants an RPC-style {"args", "kwargs"} body of client-side tensors.
+
+    Labels use the next-token strategy (shift left, pad -> -100), matching the
+    Neutrino client's ``build_forward_backward_kwargs``; the server does the causal shift.
+    """
+    import torch
+
+    input_ids, attention_mask = tokens["input_ids"], tokens["attention_mask"]
+    labels = torch.roll(input_ids, shifts=-1, dims=1)
+    labels[:, -1] = -100
+    shifted_mask = torch.roll(attention_mask, shifts=-1, dims=1)
+    shifted_mask[:, -1] = 0
+    labels = labels.masked_fill(shifted_mask == 0, -100)
+    kwargs = {
+        "input_ids": input_ids.contiguous(),
+        "attention_mask": attention_mask.contiguous(),
+        "labels": labels.contiguous(),
+    }
+    return {"args": [], "kwargs": kwargs}
+
+
 # ── unified across all backends ──────────────────────────────────────────────
 def _report(step: int, out: dict, step_out: dict) -> str:
     """One report for every backend, via graceful key lookups on the responses."""
@@ -157,6 +216,7 @@ class Profile:
 BACKENDS: dict[str, Profile] = {
     "onprem-http": Profile(_onprem_config("http", True), _onprem_batch),
     "onprem-ray": Profile(_onprem_config("ray", False), _onprem_batch),
+    "cortex": Profile(_cortex_config(), _cortex_batch),
 }
 
 
