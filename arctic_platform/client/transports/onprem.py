@@ -71,19 +71,7 @@ class OnPremTransport(Transport):
             logger.warning("%s cannot resolve ops (they will fail if called): %s", type(self).__name__, missing)
 
     def _init_payload(self, job_type: str) -> dict[str, Any]:
-        cfg = self.config
-        payload: dict[str, Any] = {"model_name": cfg.model_name, "job_type": job_type, "seed": cfg.seed}
-        if job_type in ("training", "log_prob"):
-            if cfg.ds_config:
-                payload["ds_config"] = cfg.ds_config
-            if job_type == "training":
-                if cfg.training_config:
-                    payload["training_config"] = cfg.training_config
-                if cfg.checkpoint_path:
-                    payload["checkpoint_path"] = cfg.checkpoint_path
-        elif cfg.vllm_config:
-            payload["vllm_config"] = cfg.vllm_config
-        return payload
+        return self.config.to_onprem(job_type)
 
     # delivery primitives — the only things a concrete transport implements
     # (plus `call` from the Transport ABC, which delivers one op end to end).

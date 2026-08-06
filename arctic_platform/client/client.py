@@ -30,10 +30,15 @@ from arctic_platform.client.transport import Transport
 
 
 def make_transport(config: ArcticRLClientConfig) -> Transport:
+    if config.backend == "cortex":
+        from arctic_platform.client.transports.cortex import CortexTransport
+
+        return CortexTransport(config)
+
     from arctic_platform.client.transports.onprem_http import HttpTransport
     from arctic_platform.client.transports.onprem_ray import RayTransport
 
-    if config.backend == "onprem" and config.comm_protocol == "ray":
+    if config.backend == "onprem" and config.backend_config.comm_protocol == "ray":
         return RayTransport(config)
     return HttpTransport(config)  # onprem (HTTP)
 

@@ -25,6 +25,8 @@ vLLM engine driven by the Arctic RL client.
 """
 
 import argparse
+import asyncio
+import os
 from collections.abc import AsyncGenerator
 from typing import Any
 from typing import Optional
@@ -52,6 +54,15 @@ from vllm.outputs import RequestOutput
 from arctic_platform.integrations.verl.adapter import ArcticRLClientWrapper
 
 
+# Prompts sharing these params can be coalesced into one Cortex /generate.
+# ``max_tokens`` is broadened to the batch max at flush time.
+_BATCH_KEY_PARAMS = ("temperature", "top_p", "top_k", "n", "logprobs", "repetition_penalty")
+
+
+def _batch_key(sampling_params: dict[str, Any]) -> tuple:
+    return tuple(sampling_params.get(k) for k in _BATCH_KEY_PARAMS)
+
+
 class ArcticLLMEngine:
     def __init__(
         self,
@@ -63,6 +74,15 @@ class ArcticLLMEngine:
         self.arctic_rl_client = arctic_rl_client
         self.tokenizer = tokenizer
 
+        # Verl's AgentLoopManager fires N concurrent per-prompt Ray calls
+        # into this actor; the underlying sync HTTP client turns them serial
+        # (~15 min for a 40-prompt step on Cortex). Coalesce arrivals into
+        # one batched ``/generate`` per rollout step. On-prem latency makes
+        # the window effectively free; set 0 to disable.
+        self._batch_window_s = float(os.environ.get("ARCTIC_ROLLOUT_BATCH_WINDOW_MS", "50")) / 1000.0
+        self._pending: dict[tuple, list[dict[str, Any]]] = {}
+        self._flushing: set[tuple] = set()
+
     async def generate(
         self,
         prompt: TokensPrompt,
@@ -71,34 +91,111 @@ class ArcticLLMEngine:
         lora_request: Optional[LoRARequest] = None,
         priority: int = 0,
     ) -> AsyncGenerator[RequestOutput, None]:
-        gen_batch_output = await self.arctic_rl_client.generate(
-            prompt_ids=prompt["prompt_token_ids"],
-            sampling_params=sampling_params,
-        )
+        prompt_ids = prompt["prompt_token_ids"]
 
-        raw_prompt = self.tokenizer.decode(prompt["prompt_token_ids"])
-        completed_outputs = []
-        for i, output in enumerate(gen_batch_output):
-            completed_outputs.append(
-                CompletionOutput(
-                    index=i,
-                    text=output["text"],
-                    token_ids=output["token_ids"],
-                    finish_reason=output["finish_reason"],
-                    cumulative_logprob=None,
-                    logprobs=None,
-                )
+        if self._batch_window_s <= 0:
+            gen_batch_output = await self.arctic_rl_client.generate(
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
             )
+        else:
+            gen_batch_output = await self._batched_generate(prompt_ids, sampling_params)
+
+        raw_prompt = self.tokenizer.decode(prompt_ids)
+        completed_outputs = [
+            CompletionOutput(
+                index=i,
+                text=output["text"],
+                token_ids=output["token_ids"],
+                finish_reason=output["finish_reason"],
+                cumulative_logprob=None,
+                logprobs=None,
+            )
+            for i, output in enumerate(gen_batch_output)
+        ]
 
         yield RequestOutput(
             request_id=request_id,
             outputs=completed_outputs,
             prompt=raw_prompt,
             prompt_logprobs=None,
-            prompt_token_ids=prompt["prompt_token_ids"],
-            # finished=completed_output.finish_reason == "stop",
+            prompt_token_ids=prompt_ids,
             finished=True,
         )
+
+    async def _batched_generate(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+    ) -> list:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        key = _batch_key(sampling_params)
+
+        entry = {
+            "prompt_ids": prompt_ids,
+            "sampling_params": sampling_params,
+            "future": fut,
+        }
+        bucket = self._pending.setdefault(key, [])
+        bucket.append(entry)
+
+        if key not in self._flushing:
+            self._flushing.add(key)
+            loop.create_task(self._flush_bucket(key))
+
+        return await fut
+
+    async def _flush_bucket(self, key: tuple) -> None:
+        try:
+            await asyncio.sleep(self._batch_window_s)
+            batch = self._pending.pop(key, [])
+        finally:
+            self._flushing.discard(key)
+
+        if not batch:
+            return
+
+        prompts_text = [self.tokenizer.decode(e["prompt_ids"]) for e in batch]
+        template_params = dict(batch[0]["sampling_params"])
+        max_tokens = max(
+            int(e["sampling_params"].get("max_tokens", template_params.get("max_tokens", 0)))
+            for e in batch
+        )
+        if max_tokens > 0:
+            template_params["max_tokens"] = max_tokens
+
+        try:
+            # ``_client`` (Cortex shim or on-prem ray client) already accepts
+            # a batched ``prompts=[...]`` payload; skip the wrapper's
+            # single-prompt shape.
+            results = await self.arctic_rl_client._client.generate(
+                prompts=prompts_text,
+                sampling_params=template_params,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            for e in batch:
+                if not e["future"].done():
+                    e["future"].set_exception(exc)
+            return
+
+        # Cortex returns ``len(prompts) * n`` completions in prompt-major order.
+        n = int(template_params.get("n", 1) or 1)
+        expected = len(batch) * n
+        if len(results) != expected:
+            exc = RuntimeError(
+                f"cortex /generate returned {len(results)} results, expected "
+                f"{expected} (prompts={len(batch)} x n={n})"
+            )
+            for e in batch:
+                if not e["future"].done():
+                    e["future"].set_exception(exc)
+            return
+
+        for i, e in enumerate(batch):
+            slice_ = results[i * n : (i + 1) * n]
+            if not e["future"].done():
+                e["future"].set_result(slice_)
 
     async def wake_up(self, tags: list[str] = None):
         await self.arctic_rl_client.wake_up_inference(tags=tags)
