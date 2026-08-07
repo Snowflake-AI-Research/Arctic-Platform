@@ -45,6 +45,9 @@ class FakeTransport(Transport):
         self.calls.append(request)
         return {"avg_loss": 0.5, "metrics": {"loss": 0.5}, "results": ["ok"], "status": "ok"}
 
+    async def acall(self, request: Request) -> dict:
+        return self.call(request)
+
     def shutdown(self) -> None:
         self.shutdown_calls += 1
 
@@ -77,7 +80,7 @@ class TestSFTOpMapping:
     def test_fwd_bwd_defaults_sft_loss_fn(self, client):
         client.fwd_bwd({"batch": {"input_ids": [1]}, "meta": {}})
         req = _last(client)
-        assert req.op == "fwd-bwd"
+        assert req.op == "forward-backward"
         assert req.job_id == TRAINING
         assert req.binary is True
         assert req.body["processing"] == {"loss_fn": "sft"}
@@ -90,7 +93,7 @@ class TestSFTOpMapping:
     def test_fwd_no_grad_targets_training_binary(self, client):
         client.fwd_no_grad({"batch": {"input_ids": [1]}})
         req = _last(client)
-        assert req.op == "fwd-no-grad"
+        assert req.op == "forward"
         assert req.job_id == TRAINING
         assert req.binary is True
         assert req.body["processing"] == {"loss_fn": "sft"}
@@ -107,7 +110,7 @@ class TestSFTOpMapping:
     def test_save_checkpoint_targets_training(self, client):
         client.save_checkpoint(path="/tmp/ckpt", step=3, export_hf=True, save_total_limit=2)
         req = _last(client)
-        assert req.op == "save-checkpoint"
+        assert req.op == "save"
         assert req.job_id == TRAINING
         assert req.body == {
             "path": "/tmp/ckpt",
@@ -137,16 +140,18 @@ class TestSFTOpMapping:
         ops = [c.op for c in sampling_client.transport.calls]
         assert ops == [
             "wake-inference",
-            "sync-weights",
+            "operation",
             "wake-inference",
-            "reset-prefix-cache",
+            "operation",
         ]
         sync_req = sampling_client.transport.calls[1]
-        assert sync_req.job_id is None
-        assert sync_req.body["colocate"] is True
-        assert sync_req.body["cuda_ipc"] is True
-        assert sync_req.body["training_job_id"] == TRAINING
-        assert sync_req.body["sampling_job_id"] == SAMPLING
+        assert sync_req.job_id == TRAINING
+        assert sync_req.body["operation_type"] == "weight-sync"
+        payload = sync_req.body["payload"]
+        assert payload["colocate"] is True
+        assert payload["cuda_ipc"] is True
+        assert payload["source_sub_job_id"] == TRAINING
+        assert payload["target_sub_job_ids"] == [SAMPLING]
 
 
 class TestSFTLifecycle:
@@ -213,8 +218,8 @@ class TestSFTTransportSelection:
         assert rl.training_gpus == 2
         assert rl.sampling_gpus == 0
         assert rl.log_prob_gpus == 0
-        assert rl.host == "h"
-        assert rl.port == 9
-        assert rl.launch_local_server is True
-        assert rl.server_cuda_visible_devices == "0,1"
-        assert rl.checkpoint_path == "/tmp/c"
+        assert rl.backend_config.host == "h"
+        assert rl.backend_config.port == 9
+        assert rl.backend_config.launch_local_server is True
+        assert rl.backend_config.server_cuda_visible_devices == "0,1"
+        assert rl.training.checkpoint_path == "/tmp/c"

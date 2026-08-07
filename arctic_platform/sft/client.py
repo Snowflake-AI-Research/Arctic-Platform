@@ -94,15 +94,15 @@ class ArcticSFTClient:
     def fwd_bwd(self, batch: dict, processing: dict | None = None) -> dict:
         """Forward + loss + backward. ``batch`` is ``{"batch","meta","processing"}``."""
         body = _training_body(batch, processing)
-        out = self.transport.call(Request("fwd-bwd", self.jobs.require("training"), body, binary=True))
-        _maybe_print_server_profile("fwd-bwd", out)
+        out = self.transport.call(Request("forward-backward", self.jobs.require("training"), body, binary=True))
+        _maybe_print_server_profile("forward-backward", out)
         return out
 
     def fwd_no_grad(self, batch: dict, processing: dict | None = None) -> dict:
         """Forward + loss, no backward (eval)."""
         body = _training_body(batch, processing)
-        out = self.transport.call(Request("fwd-no-grad", self.jobs.require("training"), body, binary=True))
-        _maybe_print_server_profile("fwd-no-grad", out)
+        out = self.transport.call(Request("forward", self.jobs.require("training"), body, binary=True))
+        _maybe_print_server_profile("forward", out)
         return out
 
     def step(self) -> dict:
@@ -126,7 +126,7 @@ class ArcticSFTClient:
             "export_hf": export_hf,
             "save_total_limit": save_total_limit,
         }
-        return self.transport.call(Request("save-checkpoint", self.jobs.require("training"), body))
+        return self.transport.call(Request("save", self.jobs.require("training"), body))
 
     def load_checkpoint(self, path: str | None = None, *, step: int | None = None) -> dict:
         """Restore weights/optimizer/LR/step. Returns ``{"global_step", ...}`` (0 if none found)."""
@@ -145,14 +145,19 @@ class ArcticSFTClient:
         self.wake_inference(tags=["weights"])
         out = self.transport.call(
             Request(
-                "sync-weights",
-                None,
+                "operation",
+                tid,
                 {
-                    "training_job_id": tid,
-                    "sampling_job_id": sid,
-                    "colocate": self.config.colocate,
-                    "cuda_ipc": cuda_ipc,
-                    "low_memory": low_memory,
+                    "operation_type": "weight-sync",
+                    "sub_job_id": tid,
+                    "sub_job_type": "training",
+                    "payload": {
+                        "source_sub_job_id": tid,
+                        "target_sub_job_ids": [sid],
+                        "colocate": self.config.colocate,
+                        "cuda_ipc": cuda_ipc,
+                        "low_memory": low_memory,
+                    },
                 },
             )
         )
@@ -160,9 +165,14 @@ class ArcticSFTClient:
         self.reset_prefix_cache()
         return out
 
-    def reset_prefix_cache(self, drain: bool = True, timeout_s: float = 60.0) -> dict:
-        body = {"drain": drain, "timeout_s": timeout_s}
-        return self.transport.call(Request("reset-prefix-cache", self.jobs.require("sampling"), body))
+    def reset_prefix_cache(self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1) -> dict:
+        sid = self.jobs.require("sampling")
+        body = {
+            "operation_type": "reset-prefix-cache",
+            "sub_job_type": "sampling",
+            "payload": {"drain": drain, "timeout_s": timeout_s, "retry_interval_s": retry_interval_s},
+        }
+        return self.transport.call(Request("operation", sid, body))
 
     def sleep_inference(self, level: int = 1) -> dict:
         return self.transport.call(Request("sleep-inference", self.jobs.require("sampling"), {"level": level}))

@@ -31,7 +31,6 @@ from arctic_platform.sft import ArcticSFTClient
 from arctic_platform.sft import ArcticSFTClientConfig
 from arctic_platform.sft.examples.run_sft_http_demo import ATTN
 from arctic_platform.sft.examples.run_sft_http_demo import LR
-from arctic_platform.sft.examples.run_sft_http_demo import MAX_LENGTH
 from arctic_platform.sft.examples.run_sft_http_demo import MODEL
 from arctic_platform.sft.examples.run_sft_http_demo import SEED
 from arctic_platform.sft.examples.run_sft_http_demo import _build_batch
@@ -83,13 +82,10 @@ def main() -> None:
                 "offload_optimizer": {"device": "none"},
                 "offload_param": {"device": "none"},
             },
-        },
-        training_config={
-            "optimizer": {"lr": LR, "weight_decay": 0.0, "betas": [0.9, 0.999]},
-            "lr_scheduler": {"warmup_ratio": 0.0},
-            "training_horizon": 1,
-            "max_length": MAX_LENGTH,
-            "gradient_accumulation_steps": 1,
+            "optimizer": {
+                "type": "AdamW",
+                "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+            },
         },
         ds_worker_config={
             "attn_implementation": ATTN,

@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
 """SFT client config — training (+ optional sampling for generate_samples).
 
 Mirrors ``ArcticRLClientConfig`` GPU / vLLM fields so SFT can spin a sampling
@@ -33,6 +31,9 @@ from pydantic import model_validator
 
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.config import JobId
+from arctic_platform.client.config import OnPremConfig
+from arctic_platform.client.config import SamplingConfig
+from arctic_platform.client.config import TrainingConfig
 
 
 class ArcticSFTClientConfig(BaseModel):
@@ -81,7 +82,6 @@ class ArcticSFTClientConfig(BaseModel):
     request_timeout: float = 1800.0
 
     ds_config: dict[str, Any] | None = None
-    training_config: dict[str, Any] | None = None
     ds_worker_config: dict[str, Any] | None = None
     checkpoint_path: str | None = Field(
         None,
@@ -104,29 +104,32 @@ class ArcticSFTClientConfig(BaseModel):
         return self
 
     def to_rl_config(self) -> ArcticRLClientConfig:
-        """Adapt to the shared on-prem transport config."""
+        """Adapt to the shared on-prem transport config (nested training/sampling/backend)."""
         return ArcticRLClientConfig(
-            backend=self.backend,
-            comm_protocol=self.comm_protocol,
             model_name=self.model_name,
             seed=self.seed,
             max_seq_len=self.max_seq_len,
             training_gpus=self.training_gpus,
             sampling_gpus=self.sampling_gpus,
             log_prob_gpus=0,
-            host=self.host,
-            port=self.port,
-            colocate=self.colocate,
-            launch_local_server=self.launch_local_server,
-            server_cuda_visible_devices=self.server_cuda_visible_devices,
-            startup_timeout=self.startup_timeout,
             job_ready_timeout=self.job_ready_timeout,
             request_timeout=self.request_timeout,
-            ds_config=self.ds_config,
-            training_config=self.training_config,
-            ds_worker_config=self.ds_worker_config,
-            vllm_config=self.vllm_config,
-            checkpoint_path=self.checkpoint_path,
+            training=TrainingConfig(
+                checkpoint_path=self.checkpoint_path,
+                ds_config=self.ds_config,
+                ds_worker_config=self.ds_worker_config,
+            ),
+            sampling=SamplingConfig(vllm=dict(self.vllm_config or {})),
+            backend_config=OnPremConfig(
+                backend=self.backend,
+                comm_protocol=self.comm_protocol,
+                host=self.host,
+                port=self.port,
+                colocate=self.colocate,
+                launch_local_server=self.launch_local_server,
+                server_cuda_visible_devices=self.server_cuda_visible_devices,
+                startup_timeout=self.startup_timeout,
+            ),
             training_job_id=self.training_job_id,
             sampling_job_id=self.sampling_job_id,
         )

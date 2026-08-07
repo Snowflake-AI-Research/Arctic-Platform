@@ -125,7 +125,7 @@ class TestCheckpointPathRequired(TestCasePlus):
     def test_to_rl_config_forwards_checkpoint(self):
         cfg = ArcticSFTClientConfig(model_name="m", training_gpus=1, checkpoint_path="/tmp/c")
         rl = cfg.to_rl_config()
-        self.assertEqual(rl.checkpoint_path, "/tmp/c")
+        self.assertEqual(rl.training.checkpoint_path, "/tmp/c")
 
 
 class TestInitFailureShutdown(TestCasePlus):
