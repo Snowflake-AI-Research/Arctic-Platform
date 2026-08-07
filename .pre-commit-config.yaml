@@ -1,3 +1,4 @@
+exclude: ^cortex-client/
 repos:
   - repo: local
     hooks:
