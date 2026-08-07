@@ -26,7 +26,6 @@ construction time.
 from __future__ import annotations
 
 import atexit
-import io
 import logging
 import signal
 import subprocess
@@ -36,8 +35,8 @@ from typing import Any
 
 import aiohttp
 import requests
-import torch
 
+from arctic_platform import wire
 from arctic_platform.rl.config import ArcticRLClientConfig
 from arctic_platform.rl.http_server import ArcticRLHTTPServerState
 from arctic_platform.rl.utils.debug import pr0
@@ -387,14 +386,11 @@ class ArcticRLHTTPClient:
         tname = timers.start("xyz arctic_rl.client incoming processing 1")
         if processing is not None:
             batch = {**batch, "processing": processing}
-        buffer = io.BytesIO()
         timers.stop_and_print_elapsed(tname)
 
         tname = timers.start("xyz arctic_rl.client incoming processing 2")
-        torch.save(batch, buffer)
+        request_body = wire.dumps(batch)
         timers.stop_and_print_elapsed(tname)
-
-        request_body = buffer.getvalue()
         # import zlib
         # tname = timers.start("xyz arctic_rl.client compress")
         # request_body = zlib.compress(request_body)
@@ -402,7 +398,7 @@ class ArcticRLHTTPClient:
 
         tname = timers.start("xyz arctic_rl.client http post")
         resp = self._session.post(
-            f"{self._base_url}/fwd-bwd",
+            f"{self._base_url}/forward-backward",
             params={"job_id": self.training_job_id},
             data=request_body,
             headers={
@@ -414,7 +410,7 @@ class ArcticRLHTTPClient:
 
         tname = timers.start("xyz arctic_rl.client outgoing processing 1")
         resp.raise_for_status()
-        response = torch.load(io.BytesIO(resp.content), map_location="cpu", weights_only=False)
+        response = wire.loads(resp.content)
         timers.stop_and_print_elapsed(tname)
         pr0(f"[ArcticRLClient] fwd_bwd OUTPUT: {response.keys()=}")
         timers.stop_and_print_elapsed(tname_e2e)
@@ -424,13 +420,10 @@ class ArcticRLHTTPClient:
     async def fwd_no_grad(self, batch: dict, reference_model: bool) -> dict[str, Any]:
         """Forward-only pass (no gradient) on the training engine.
 
-        Returns a binary (torch.save) response containing ``{"logprobs": Tensor}``.
-        Matches the ``/fwd-no-grad`` endpoint added in dss-platform PR #41.
+        Returns a binary (DSSST1) response containing ``{"logprobs": Tensor}``.
+        Matches the ``/forward`` endpoint.
         """
-        buffer = io.BytesIO()
-        torch.save(batch, buffer)
-
-        request_body = buffer.getvalue()
+        request_body = wire.dumps(batch)
 
         # import zlib
         # request_body = zlib.compress(buffer.getvalue())
@@ -441,7 +434,7 @@ class ArcticRLHTTPClient:
         job_id = self.log_prob_job_id if reference_model else self.training_job_id
         pr0(f"[ArcticRLClient] fwd_no_grad INPUT: {batch.keys()=} {job_id=}")
         resp = self._session.post(
-            f"{self._base_url}/fwd-no-grad",
+            f"{self._base_url}/forward",
             params={"job_id": job_id},
             data=request_body,
             # data=buffer.getvalue(),
@@ -451,7 +444,7 @@ class ArcticRLHTTPClient:
             },
         )
         resp.raise_for_status()
-        response = torch.load(io.BytesIO(resp.content), map_location="cpu", weights_only=False)
+        response = wire.loads(resp.content)
         pr0(f"[ArcticRLClient] fwd_no_grad OUTPUT: {response.keys()=}")
         return response
 
@@ -469,7 +462,7 @@ class ArcticRLHTTPClient:
     async def save_checkpoint(self) -> dict[str, Any]:
         """Save training checkpoint."""
         resp = self._session.post(
-            f"{self._base_url}/save-checkpoint",
+            f"{self._base_url}/save",
             params={"job_id": self.training_job_id},
         )
         resp.raise_for_status()
@@ -484,7 +477,7 @@ class ArcticRLHTTPClient:
         side — this call will warn if the endpoint returns an error.
         """
         resp = self._session.post(
-            f"{self._base_url}/sync-weights",
+            f"{self._base_url}/weight-sync",
             params={"job_id": self.sampling_job_id},
             json={"checkpoint_path": path},
         )
@@ -528,10 +521,11 @@ class ArcticRLHTTPClient:
             async with session.post(
                 f"{self._base_url}/generate",
                 params={"job_id": self.sampling_job_id},
-                json={"prompts": prompts, "sampling_params": sampling_params},
+                data=wire.dumps({"prompts": prompts, "sampling_params": sampling_params}),
+                headers={"Content-Type": "application/octet-stream"},
             ) as resp:
                 resp.raise_for_status()
-                data = await resp.json()
+                data = wire.loads(await resp.read())
         return data["results"]
 
     # ------------------------------------------------------------------
@@ -637,7 +631,7 @@ class ArcticRLHTTPClient:
 
         low_memory only applies to the cuda_ipc path (stream one gathered param
         at a time). Not yet implemented on the HTTP path -- see the server-side
-        guard in /sync-weights; use the ray protocol for low_memory_weight_sync.
+        guard in /weight-sync; use the ray protocol for low_memory_weight_sync.
         """
 
         resp = self._session.post(
@@ -648,10 +642,11 @@ class ArcticRLHTTPClient:
         resp.raise_for_status()
 
         resp = self._session.post(
-            f"{self._base_url}/sync-weights",
+            f"{self._base_url}/weight-sync",
+            params={"job_id": self.training_job_id},
             json={
-                "training_job_id": self.training_job_id,
-                "sampling_job_id": self.sampling_job_id,
+                "source_sub_job_id": self.training_job_id,
+                "target_sub_job_ids": [self.sampling_job_id],
                 "colocate": self.config.colocate,
                 "cuda_ipc": cuda_ipc,
                 "low_memory": low_memory,
@@ -706,7 +701,7 @@ class ArcticRLHTTPClient:
             json={"prompts": prompts, "completions": completions, "top_k": top_k},
         )
         resp.raise_for_status()
-        return torch.load(io.BytesIO(resp.content), map_location="cpu", weights_only=False)
+        return wire.loads(resp.content)
 
     # ------------------------------------------------------------------
     # Lifecycle

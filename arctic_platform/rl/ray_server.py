@@ -59,7 +59,7 @@ from arctic_platform.rl.utils.ray_pg import pg_scheduling_options
 from arctic_platform.rl.utils.server_models import GenerateRequest
 from arctic_platform.rl.utils.server_models import JobConfig
 from arctic_platform.rl.utils.server_models import LogProbsRequest
-from arctic_platform.rl.utils.server_models import SyncWeightsRequest
+from arctic_platform.rl.utils.server_models import WeightSyncRequest
 from arctic_platform.rl.utils.server_models import build_model_config
 
 logger = logging.getLogger(__name__)
@@ -603,7 +603,7 @@ class ArcticRLRayServer:
     async def destroy(self, job_id: int, job_type: str) -> dict[str, Any]:
         return await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
 
-    async def fwd_bwd(self, job_id: int, batch: dict) -> dict[str, Any]:
+    async def forward_backward(self, job_id: int, batch: dict) -> dict[str, Any]:
         tname_e2e = timers.start("xyz fwd_bwd e2e")
 
         tname = timers.start("xyz fwd_bwd: _verify_job")
@@ -679,7 +679,7 @@ class ArcticRLRayServer:
     # )
     # return {"job_id": job_id, "avg_loss": avg_loss, "post_process_outputs": post_process_outputs}
 
-    async def fwd_no_grad(self, job_id: int, batch: dict) -> dict[str, Any]:
+    async def forward(self, job_id: int, batch: dict) -> dict[str, Any]:
         info = self.jobs[job_id]
         self._verify_job(job_id, ["training", "log_prob"])
         job_type = info["job_type"]
@@ -717,7 +717,8 @@ class ArcticRLRayServer:
 
         return merged
 
-    async def step(self, job_id: int) -> dict[str, Any]:
+    async def step(self, job_id: int, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        # `body` is unused; accepted so the client can call with (job_id, body).
         self._verify_job(job_id, "training")
         # results = await asyncio.gather(*[w.step.remote() for w in self.training_workers])
         refs = [w.step.remote() for w in self.training_workers]
@@ -737,7 +738,9 @@ class ArcticRLRayServer:
         logger.info("Empty training cache: %s", results)
         return {"job_id": job_id, "workers": results}
 
-    async def save_checkpoint(self, job_id: int):
+    async def save(self, job_id: int, body: dict[str, Any] | None = None):
+        # `checkpoint_id`/`checkpoint_type` in `body` are accepted for Cortex
+        # parity; on-prem saves to the job's configured checkpoint_path.
         self._verify_job(job_id, "training")
         info = self.jobs[job_id]
         checkpoint_path = info.get("checkpoint_path", None)
@@ -761,10 +764,24 @@ class ArcticRLRayServer:
         results = await self.arctic_rl_ray_server_state.wake_inference.remote(tags)
         return {"job_id": job_id, **results}
 
-    async def reset_prefix_cache(self, job_id: int):
+    async def reset_prefix_cache(self, job_id: int, body: dict[str, Any] | None = None):
         """Reset the prefix cache on the sampling inference engines."""
+        # `body` is unused; accepted so the client can call with (job_id, body).
         self._verify_job(job_id, "sampling")
         return await self.arctic_rl_ray_server_state.reset_prefix_cache.remote(job_id)
+
+    async def operation(self, job_id: int, body: dict[str, Any]) -> dict[str, Any]:
+        """Generic data-plane operation, matching Cortex's operation envelope.
+
+        Dispatches on operation_type to the typed handlers; no logic duplicated.
+        """
+        op_type = body.get("operation_type")
+        payload = body.get("payload") or {}
+        if op_type == "weight-sync":
+            return await self.weight_sync(job_id, payload)
+        if op_type == "reset-prefix-cache":
+            return await self.reset_prefix_cache(job_id, payload)
+        raise ValueError(f"unknown operation_type {op_type!r}")
 
     async def sleep_training(self, job_id: int, mode: str = "all"):
         """Offload training state to CPU (sleep training workers).
@@ -837,21 +854,26 @@ class ArcticRLRayServer:
         results = await pool.generate(
             request.prompts,
             request.sampling_params,
-            strict=True,
+            strict=request.strict,
         )
 
         return {"job_id": job_id, "results": results}
 
-    async def sync_weights(self, request: dict[str, Any]) -> dict[str, Any]:
+    async def weight_sync(self, job_id: int, body: dict[str, Any]) -> dict[str, Any]:
         """Sync training model weights to the sampling engine.
+
+        Matches Cortex's `weight_sync(job_id, source_sub_job_id, target_sub_job_ids)`;
+        on-prem treats a sub_job_id as its plain job id (source == training, target == sampling).
 
         Uses NCCL for non-colocated mode (separate GPUs).  In colocated mode:
         - cuda_ipc=True: CUDA IPC (zero-copy, requires training weights on GPU)
         - cuda_ipc=False: CPU file path (slower, works when offloaded)
         """
-        request = SyncWeightsRequest(**request)
-        self._verify_job(request.training_job_id, "training")
-        self._verify_job(request.sampling_job_id, "sampling")
+        request = WeightSyncRequest(**body)
+        training_job_id = request.source_sub_job_id
+        sampling_job_id = request.target_sub_job_ids[0]
+        self._verify_job(training_job_id, "training")
+        self._verify_job(sampling_job_id, "sampling")
 
         workers = self.training_workers
         pool: ReplicaPool = self.sampling_pool
@@ -868,16 +890,16 @@ class ArcticRLRayServer:
                 else:
                     results = await self._sync_weights_cuda_ipc(workers, pool, lp_pool)
             else:
-                training_job_info = self.jobs[request.training_job_id]
+                training_job_info = self.jobs[training_job_id]
                 sync_path = training_job_info.get("sync_path", None)
-                assert sync_path is not None, f"sync_path is required for training job {request.training_job_id}"
+                assert sync_path is not None, f"sync_path is required for training job {training_job_id}"
                 results = await self._sync_weights_ipc(sync_path, workers, pool, lp_pool)
         else:
             results = await self._sync_weights_nccl(workers, pool)
 
-        await self.arctic_rl_ray_server_state.reset_prefix_cache.remote(request.sampling_job_id)
+        await self.arctic_rl_ray_server_state.reset_prefix_cache.remote(sampling_job_id)
 
-        return {"job_id": request.training_job_id, **results}
+        return {"job_id": training_job_id, **results}
 
         # schedule = TransferSchedule.build(
         #     training_sharding="dp",

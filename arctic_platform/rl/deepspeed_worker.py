@@ -447,7 +447,7 @@ class DeepSpeedWorker:
                 # ``{name}.sum`` / ``{name}.tokens`` scalars (plus a few
                 # passthrough numerics like ``kl_coef``). Sum them across
                 # this rank's microbatches so each rank returns one scalar
-                # per metric; ``ray_server.fwd_bwd`` / ``http_server.fwd_bwd``
+                # per metric; ``ray_server.forward_backward`` / ``http_server.forward_backward``
                 # then sums across DP ranks and collapses the paired keys
                 # into a single global token-mean per metric per mini-batch.
                 pipeline_outputs[k] = combine_metric_microbatches([r[k] for r in pipeline_micro_batch_outputs])
