@@ -1,13 +1,30 @@
 ## Summary
 
-- Relocate the protocol-agnostic training infrastructure out of `arctic_platform.rl` into a new `arctic_platform.common` package so a future SFT surface can share one DeepSpeed / HTTP / Ray stack with RL.
-- Modules moved (`rl/` → `common/`): `deepspeed_worker`, `http_server`, `ray_server`, `ray_cluster`, `server`, and `utils/{batch,cuda_ipc,debug,ray_pg,record_replay,server_models}` (plus `utils/__init__.py`).
-- Leave thin back-compat shims at the old `arctic_platform.rl.*` import paths (`from arctic_platform.common… import *`), so existing RL importers and `python -m arctic_platform.rl.http_server` keep working unchanged.
-- RL-specific modules stay in `rl/` and are still imported from there: `processors`, `zorro_train`, `client`, `config`, `weight_sync`.
-- Behavior-preserving move only — no new features, no SFT package, no docs rewrite, no `pyproject.toml` change. Each `common/` module is byte-identical to its former `rl/` counterpart except for rewriting imports of the relocated siblings (`arctic_platform.rl.{deepspeed_worker,http_server,ray_server,ray_cluster,server,utils}` → `arctic_platform.common.*`).
+Intermediary plumbing PR after `#62` (rl→common relocate). No SFT package yet — that lands in a follow-up.
 
-## Testing
+- Extract tiled logits / CE kernels from `qwen_model_patcher` into `common.utils.tiled_logits` (`none` / `compute` / `memory`); RL imports them back.
+- Shared `common.registry` for loss / post-processor registration (used by RL pipeline; SFT will register later).
+- Shared `common.utils.weight_sync` helpers; HTTP/Ray servers use them instead of inlined ArcticInference imports where possible.
+- `finalize_fwd_bwd_metrics` for token-exact `avg_loss` on fwd-bwd responses (HTTP + Ray).
+- `prune_checkpoint_dirs` util (+ unit test) — **not** wired to save/load API yet (checkpoint extras in SFT PR).
+- Client: `server_cuda_visible_devices`, sleep/wake inference+training, staged `sync_weights` wake flow.
+- HTTP log-prob workers honor `MASTER_PORT` (was hardcoded `29501`).
+- Base deps: `ray` / `uvicorn` (servers import them unconditionally); `[rl]` keeps vLLM/sampling stack only.
+- Docs: `docs/common.md`, `docs/rl.md`, `docs/index.md` (SFT marked forthcoming). `tests/AGENTS.md`.
+- FA2 once-patcher test skips when real `flash_attn` is unavailable.
 
-**Import / structural.** `py_compile` over the moved modules + shims. Structural equality check: every `common/X` matches `origin/main`'s `rl/X` after only the sibling-import rewrite. Residual `arctic_platform.rl.*` refs inside `common/` are limited to non-moved siblings (`processors`, `zorro_train`).
+## Out of scope (next PR)
 
-**RL regression.** Existing RL client / HTTP / Ray paths remain importable via the `rl/` shims. Run the existing RL suites (`tests/rl/`, `tests/client/`) — they exercise the same code under the new locations without needing new SFT tests in this PR.
+- `arctic_platform.sft` package, demos, `tests/sft/`, `docs/sft.md`
+- Worker `run_sft_pipeline` / `sft_ce` dispatch
+- `sft_profile`
+- Checkpoint extras: `load-checkpoint`, `export_hf`, `save_total_limit`, step-tagged save paths
+
+## Test plan
+
+- [ ] `tests/common/test_tiled_logits.py`
+- [ ] `tests/common/test_finalize_fwd_bwd_metrics.py`
+- [ ] `tests/common/test_prune_checkpoint_dirs.py`
+- [ ] `tests/client/test_client_ops.py` (sleep/wake/sync)
+- [ ] `tests/zorro_train/test_once_patcher.py`
+- [ ] Spot-check RL e2e still imports / runs against common servers

@@ -19,7 +19,7 @@ Uses Ray to manage DeepSpeed workers and ArcticInference ReplicaPools.
 
 Usage::
 
-    python -m arctic_platform.common.server \\
+    python -m arctic_platform.common.http_server \\
         --training-gpus 4 --sampling-gpus 2 --log-prob-gpus 2
 """
 
@@ -36,7 +36,6 @@ import deepspeed
 import ray
 import torch
 import torch.distributed as dist
-from arctic_inference.server.weight_sync.sender import WeightSender
 from deepspeed.accelerator import get_accelerator
 from transformers import AutoModelForCausalLM
 
@@ -96,7 +95,7 @@ class DeepSpeedWorker:
         self.master_addr = primary_ip()
         self.master_port = master_port
         self.engine = None
-        self._weight_sender: WeightSender | None = None
+        self._weight_sender = None
         self._on_gpu = True
 
     def get_ip(self) -> str:
@@ -237,25 +236,41 @@ class DeepSpeedWorker:
             betas = opt_cfg.get("betas")
             if betas is None:
                 betas = [opt_cfg.get("beta1", 0.9), opt_cfg.get("beta2", 0.999)]
+            # Forward DeepSpeed-recognized AdamW knobs (torch_adam selects
+            # torch.optim.AdamW instead of FusedAdam — required for Axolotl
+            # adamw_torch parity).
+            opt_params: dict[str, Any] = {
+                "lr": opt_cfg.get("lr", 1e-5),
+                "betas": list(betas),
+                "eps": opt_cfg.get("eps", 1e-8),
+                "weight_decay": opt_cfg.get("weight_decay", 0.0),
+            }
+            if opt_cfg.get("torch_adam"):
+                opt_params["torch_adam"] = True
+            if "adam_w_mode" in opt_cfg:
+                opt_params["adam_w_mode"] = opt_cfg["adam_w_mode"]
             ds_config["optimizer"] = {
                 "type": "AdamW",
-                "params": {
-                    "lr": opt_cfg.get("lr", 1e-5),
-                    "betas": list(betas),
-                    "eps": opt_cfg.get("eps", 1e-8),
-                    "weight_decay": opt_cfg.get("weight_decay", 0.0),
-                },
+                "params": opt_params,
             }
             if "gradient_accumulation_steps" in training_config:
                 ds_config["gradient_accumulation_steps"] = training_config["gradient_accumulation_steps"]
+            # Prefer explicit optimizer.gradient_clipping; accept top-level alias.
             if "gradient_clipping" in opt_cfg:
                 ds_config["gradient_clipping"] = opt_cfg["gradient_clipping"]
+            elif "gradient_clipping" in training_config:
+                ds_config["gradient_clipping"] = training_config["gradient_clipping"]
+            elif "max_grad_norm" in opt_cfg:
+                ds_config["gradient_clipping"] = opt_cfg["max_grad_norm"]
 
             sched_cfg = training_config.get("lr_scheduler", None)
             horizon = training_config.get("training_horizon", 0)
             if sched_cfg is not None and horizon > 0:
                 lr = opt_cfg.get("lr", 1e-5)
-                warmup_steps = sched_cfg.get("warmup_ratio", 0.0) * horizon
+                if "warmup_steps" in sched_cfg:
+                    warmup_steps = float(sched_cfg["warmup_steps"])
+                else:
+                    warmup_steps = sched_cfg.get("warmup_ratio", 0.0) * horizon
                 if sched_cfg.get("type", "constant") == "cosine":
                     ds_config["scheduler"] = {
                         "type": "WarmupCosineLR",
@@ -359,7 +374,18 @@ class DeepSpeedWorker:
         elif isinstance(batch, (list, tuple)):
             return [self._move_batch_to_device(v, device) for v in batch]
         elif isinstance(batch, torch.Tensor):
-            return batch.to(device)
+            # Pin + non_blocking H2D: copy overlaps with subsequent CPU work on the
+            # default stream; the next CUDA kernel that consumes the tensor waits.
+            # ``device`` may be a str ("cuda:0") or a torch.device.
+            dev = torch.device(device) if not isinstance(device, torch.device) else device
+            if dev.type == "cuda" and batch.device.type == "cpu":
+                if not batch.is_pinned():
+                    try:
+                        batch = batch.pin_memory()
+                    except RuntimeError:
+                        pass  # non-pageable / shared storage — fall through
+                return batch.to(dev, non_blocking=True)
+            return batch.to(dev)
         return batch
 
     def _forward_maybe_backward(self, batch: dict, backward: bool) -> dict:
@@ -374,19 +400,34 @@ class DeepSpeedWorker:
         see_memory_usage("_forward_maybe_backward start", force=True)
 
         args, batch_data, meta_data, processing = unpack_batch(batch)
-        batch_data = self._move_batch_to_device(batch_data, self._device)
+        if isinstance(batch_data, list):
+            batch_data = [self._move_batch_to_device(mb, self._device) for mb in batch_data]
+        else:
+            batch_data = self._move_batch_to_device(batch_data, self._device)
 
         tag = "forward_only" if not backward else "forward_backward"
 
-        log_dp_shard_tokens(self.rank, f"{tag} shard", batch_data, meta_data)
-
-        pr0(f"[DeepSpeedWorker] {tag}: {batch_data.keys()=} {meta_data.keys()=} {processing.keys()=}")
-
-        for k, v in batch_data.items():
-            pr0(f"[DeepSpeedWorker] {tag}: {k=}: {v.shape=}")
+        if isinstance(batch_data, list):
+            for i, mb in enumerate(batch_data):
+                log_dp_shard_tokens(self.rank, f"{tag} shard mb{i}", mb, meta_data)
+            pr0(f"[DeepSpeedWorker] {tag}: gas_list={len(batch_data)} {meta_data.keys()=} {processing.keys()=}")
+        else:
+            log_dp_shard_tokens(self.rank, f"{tag} shard", batch_data, meta_data)
+            pr0(f"[DeepSpeedWorker] {tag}: {batch_data.keys()=} {meta_data.keys()=} {processing.keys()=}")
+            for k, v in batch_data.items():
+                pr0(f"[DeepSpeedWorker] {tag}: {k=}: {v.shape=}")
 
         grad_accum_steps = self.engine.gradient_accumulation_steps()
-        micro_batch_data = split_dict(batch_data, grad_accum_steps)
+        # list-of-microbatches from the client skips concat→split_dict.
+        if isinstance(batch_data, list):
+            micro_batch_data = batch_data
+            if len(micro_batch_data) != grad_accum_steps:
+                raise ValueError(
+                    f"Received {len(micro_batch_data)} GAS microbatches but "
+                    f"engine.gradient_accumulation_steps()={grad_accum_steps}"
+                )
+        else:
+            micro_batch_data = split_dict(batch_data, grad_accum_steps)
         num_micro_batches = len(micro_batch_data)
         pipeline_micro_batch_outputs = []
         return_tensors = meta_data.get("worker_return_tensors", False)
@@ -533,6 +574,8 @@ class DeepSpeedWorker:
         return max_bytes
 
     def init_weight_sender(self, group, schedule, master_addr, base_port, bucket_size) -> bool:
+        from arctic_inference.server.weight_sync.sender import WeightSender
+
         self._weight_sender = WeightSender(
             group=group,
             schedule=schedule,
