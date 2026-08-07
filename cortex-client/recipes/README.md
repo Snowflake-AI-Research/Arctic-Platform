@@ -86,7 +86,7 @@ python recipes/sft_loop.py config=recipes/config.json \
 
 ```bash
 # SFT: LoRA is the default (lora_rank=32). Dense FT:
-python recipes/sft_loop.py config=recipes/config.json lora_rank=None
+python recipes/sft_loop.py config=recipes/config.json lora_rank=0
 
 # Smaller / larger LoRA
 python recipes/sft_loop.py config=recipes/config.json lora_rank=16
@@ -103,6 +103,19 @@ python recipes/sft_loop.py config=recipes/config.json \
 # RL — split train vs sample; watch the per-account GPU cap
 python recipes/rl_loop.py config=recipes/config.json \
     lora_rank=32 training_gpus=8 sampling_gpus=4
+```
+
+### MoE / expert parallelism (`ep_size`)
+
+MoE checkpoints like `Qwen/Qwen3.6-35B-A3B` need Prime-RL plus expert
+parallelism. Set `model_provider=prime_rl` and `ep_size` so that `n_gpus` is a
+multiple of `ep_size` (e.g. 8 GPUs with `ep_size=4`):
+
+```bash
+python recipes/sft_loop.py config=recipes/config.json \
+    model_name=Qwen/Qwen3.6-35B-A3B \
+    model_provider=prime_rl ep_size=4 \
+    n_gpus=8
 ```
 
 ### Sequence / generation length

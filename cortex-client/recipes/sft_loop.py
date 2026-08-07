@@ -56,6 +56,9 @@ class Config:
     attn_implementation: str = "flash_attention_3"
     dtype: str = "bfloat16"
     seed: int = 42
+    # huggingface for dense / LoRA; prime_rl for MoE with expert parallelism.
+    model_provider: str = "huggingface"
+    ep_size: int | None = None
 
     dataset: str = "HuggingFaceH4/no_robots"
     batch_size: int = 8
@@ -66,7 +69,7 @@ class Config:
     pad_to_max_length: bool = False
     max_steps: int = 100
 
-    # None = dense FT. Set e.g. 32 for LoRA (r == alpha).
+    # 0 = dense FT. Set e.g. 32 for LoRA (r == alpha).
     lora_rank: int = 32
     debug_image_tag: str | None = None
 
@@ -76,7 +79,7 @@ class Config:
 
 
 def lora_config(config: Config) -> dict[str, Any] | None:
-    if config.lora_rank is None:
+    if config.lora_rank <= 0:
         return None
     return {
         "peft_type": "Lora",
@@ -96,9 +99,17 @@ def job_body(config: Config) -> dict:
             f"micro_batch_size * n_gpus ({config.micro_batch_size} * "
             f"{config.n_gpus} = {per_step})"
         )
+    if config.ep_size is not None:
+        if config.ep_size <= 0:
+            raise ValueError(f"ep_size must be positive, got {config.ep_size}")
+        if config.n_gpus % config.ep_size != 0:
+            raise ValueError(
+                f"n_gpus ({config.n_gpus}) must be a multiple of ep_size "
+                f"({config.ep_size})"
+            )
 
     training_config: dict[str, Any] = {
-        "model_provider": "huggingface",
+        "model_provider": config.model_provider,
         "n_gpus": config.n_gpus,
         "max_seq_len": config.max_length,
         "train_batch_size": config.batch_size,
@@ -118,6 +129,8 @@ def job_body(config: Config) -> dict:
             "bf16": {"enabled": True},
         },
     }
+    if config.ep_size is not None:
+        training_config["ep_size"] = config.ep_size
     peft = lora_config(config)
     if peft is not None:
         training_config["peft_config"] = peft

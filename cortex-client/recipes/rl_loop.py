@@ -241,7 +241,8 @@ class Config:
     entropy_coeff: float = 0.0
     remove_constant_reward_groups: bool = True
 
-    lora_rank: int | None = None
+    # 0 = dense FT. Set e.g. 32 for LoRA (r == alpha).
+    lora_rank: int = 0
 
     debug_image_tag: str | None = None
 
@@ -259,7 +260,7 @@ class Config:
 
 
 def lora_config(config: Config) -> dict[str, Any] | None:
-    if config.lora_rank is None:
+    if config.lora_rank <= 0:
         return None
     return {
         "peft_type": "Lora",
@@ -549,7 +550,7 @@ def _train(config: Config, ml_logger: Any) -> None:
                 sync_weights(
                     client,
                     job_id,
-                    weight_format="lora" if config.lora_rank is not None else None,
+                    weight_format="lora" if config.lora_rank > 0 else None,
                 )
 
             metrics.update(
