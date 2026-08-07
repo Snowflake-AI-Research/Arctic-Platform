@@ -6,12 +6,17 @@ A port of ``tinker_cookbook/recipes/sl_loop.py``.
 This sample script uses tinker_cookbook's util functions-- supports models tinker supports.
 """
 
+from __future__ import annotations
+
 import logging
+import os
 import time
+from typing import Any
 
 import chz
 import datasets
 
+from dss_client.neutrino_client import DEBUG_OPTIONS_ENV
 from tinker_cookbook import renderers
 from tinker_cookbook.utils import ml_log
 
@@ -28,15 +33,23 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
 logging.getLogger("urllib3").setLevel(logging.WARN)
 
+_LORA_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+
 
 @chz.chz
 class Config:
     config: str
     job_id: str | None = None
-    keep_job: bool | None = None
 
-    model_name: str = "Qwen/Qwen3-8B"
-    renderer_name: str  = "qwen3"
+    model_name: str = "Qwen/Qwen3.6-35B-A3B"
     n_gpus: int = 8
     micro_batch_size: int = 1
     zero_stage: int = 2
@@ -46,16 +59,33 @@ class Config:
 
     dataset: str = "HuggingFaceH4/no_robots"
     batch_size: int = 8
-    learning_rate: float = 1e-4
+    learning_rate: float = 2e-5
     weight_decay: float = 0.0
     max_length: int = 2048
     train_on_what: renderers.TrainOnWhat = renderers.TrainOnWhat.ALL_ASSISTANT_MESSAGES
     pad_to_max_length: bool = False
-    max_steps: int = 20
+    max_steps: int = 100
 
-    log_path: str = "/tmp/neutrino-examples/sft-loop"
-    wandb_project: str | None = None
+    # None = dense FT. Set e.g. 32 for LoRA (r == alpha).
+    lora_rank: int = 32
+    debug_image_tag: str | None = None
+
+    log_path: str = "/tmp/dss-examples/sft-loop"
+    wandb_project: str = None
     wandb_name: str | None = None
+
+
+def lora_config(config: Config) -> dict[str, Any] | None:
+    if config.lora_rank is None:
+        return None
+    return {
+        "peft_type": "Lora",
+        "r": config.lora_rank,
+        "lora_alpha": config.lora_rank,
+        "lora_dropout": 0.0,
+        "bias": "none",
+        "target_modules": list(_LORA_TARGET_MODULES),
+    }
 
 
 def job_body(config: Config) -> dict:
@@ -67,40 +97,52 @@ def job_body(config: Config) -> dict:
             f"{config.n_gpus} = {per_step})"
         )
 
-    return {
+    training_config: dict[str, Any] = {
+        "model_provider": "huggingface",
+        "n_gpus": config.n_gpus,
+        "max_seq_len": config.max_length,
+        "train_batch_size": config.batch_size,
+        "attn_implementation": config.attn_implementation,
+        "optimizer": {
+            "name": "AdamW",
+            "lr": config.learning_rate,
+            "weight_decay": config.weight_decay,
+            "betas": [0.9, 0.999],
+            "eps": 1e-8,
+        },
+        "ds_config": {
+            "train_batch_size": config.batch_size,
+            "train_micro_batch_size_per_gpu": config.micro_batch_size,
+            "gradient_accumulation_steps": config.batch_size // per_step,
+            "zero_optimization": {"stage": config.zero_stage},
+            "bf16": {"enabled": True},
+        },
+    }
+    peft = lora_config(config)
+    if peft is not None:
+        training_config["peft_config"] = peft
+
+    body: dict[str, Any] = {
         "sub_job_configs": [
             {
                 "job_type": "training",
                 "model_name": config.model_name,
                 "dtype": config.dtype,
                 "seed": config.seed,
-                "training_config": {
-                    "model_provider": "huggingface",
-                    "n_gpus": config.n_gpus,
-                    "max_seq_len": config.max_length,
-                    "train_batch_size": config.batch_size,
-                    "attn_implementation": config.attn_implementation,
-                    "optimizer": {
-                        "name": "AdamW",
-                        "lr": config.learning_rate,
-                        "weight_decay": config.weight_decay,
-                        "betas": [0.9, 0.999],
-                        "eps": 1e-8,
-                    },
-                    "ds_config": {
-                        "train_batch_size": config.batch_size,
-                        "train_micro_batch_size_per_gpu": config.micro_batch_size,
-                        "gradient_accumulation_steps": config.batch_size // per_step,
-                        "zero_optimization": {"stage": config.zero_stage},
-                        "bf16": {"enabled": True},
-                    },
-                },
+                "training_config": training_config,
             }
         ]
     }
+    if config.debug_image_tag:
+        body["debug"] = {"job": {"image_tag": config.debug_image_tag}}
+    return body
 
 
 def main(config: Config):
+    if config.debug_image_tag:
+        os.environ[DEBUG_OPTIONS_ENV] = "1"
+        logger.info("Using debug image_tag=%s", config.debug_image_tag)
+
     ml_logger = ml_log.setup_logging(
         log_dir=config.log_path,
         wandb_project=config.wandb_project,
@@ -109,9 +151,7 @@ def main(config: Config):
         do_configure_logging_module=True,
     )
 
-    tokenizer, renderer, renderer_name = build_renderer(
-        config.model_name, config.renderer_name
-    )
+    tokenizer, renderer, renderer_name = build_renderer(config.model_name)
     pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     logger.info(f"Using renderer: {renderer_name}")
 
@@ -135,7 +175,7 @@ def main(config: Config):
     client = make_client(config.config)
 
     with running_job(
-        client, job_body(config), job_id=config.job_id, keep_job=config.keep_job
+        client, job_body(config), job_id=config.job_id
     ) as job_id:
         for step in range(total_steps):
             start_time = time.time()

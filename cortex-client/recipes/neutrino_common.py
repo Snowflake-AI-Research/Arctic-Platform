@@ -61,24 +61,23 @@ def sampling_sub_job_id(job_id: str) -> str:
     return f"{job_id}:sampling:0"
 
 
-def build_renderer(model_name: str, renderer_name: str | None = None):
+def build_renderer(model_name: str):
     """Return ``(tokenizer, renderer, renderer_name)`` for ``model_name``.
 
-    ``tinker_cookbook.model_info`` only knows the models tinker itself serves,
-    so an unlisted model needs an explicit ``renderer_name``.
+    Uses tinker ``model_info.get_recommended_renderer_name``. These recipe
+    helpers only cover models tinker lists; Neutrino itself can host more.
     """
     from tinker_cookbook import model_info, renderers
     from tinker_cookbook.tokenizer_utils import get_tokenizer
 
     tokenizer = get_tokenizer(model_name)
-    if renderer_name is None:
-        try:
-            renderer_name = model_info.get_recommended_renderer_name(model_name)
-        except KeyError as exc:
-            raise ValueError(
-                f"tinker_cookbook has no recommended renderer for {model_name!r}; "
-                "pass renderer_name= explicitly (e.g. renderer_name=qwen3)"
-            ) from exc
+    try:
+        renderer_name = model_info.get_recommended_renderer_name(model_name)
+    except KeyError as exc:
+        raise ValueError(
+            f"tinker_cookbook has no recommended renderer for {model_name!r}; "
+            "see https://tinker-docs.thinkingmachines.ai/tutorials/core-concepts/rendering/#available-renderers"
+        ) from exc
     return tokenizer, renderers.get_renderer(renderer_name, tokenizer), renderer_name
 
 

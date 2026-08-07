@@ -9,6 +9,8 @@ Variable naming convention (see CONTRIBUTING.md in tinker-cookbook):
     _D: Datum dimension (rollouts after flattening)
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import statistics
@@ -18,7 +20,6 @@ from typing import Any
 
 import chz
 
-from tinker_cookbook import cli_utils
 from tinker_cookbook.utils import ml_log
 
 from dss_client.neutrino_client import DEBUG_OPTIONS_ENV
@@ -38,25 +39,22 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
 logging.getLogger("urllib3").setLevel(logging.WARN)
 
-QUESTION_SUFFIX = " Provide a numerical answer without units, written inside \\boxed{}."
+# Match MathEnv / ProblemEnv defaults.
+FORMAT_COEF = 0.1
 
-CONVO_PREFIX = [
-    {
-        "role": "user",
-        "content": "How many r's are in strawberry?" + QUESTION_SUFFIX,
-    },
-    {
-        "role": "assistant",
-        "content": (
-            "Let's spell the word out and number all the letters: 1) s 2) t 3) r 4) a 5) w "
-            "6) b 7) e 8) r 9) r 10) y. We have r's at positions 3, 8, and 9. \\boxed{3}"
-        ),
-    },
-]
+_LORA_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
 
 
 @dataclass
-class MathDataset:
+class MathProblems:
     train: list[tuple[str, str]]
     test: list[tuple[str, str]] | None
 
@@ -65,55 +63,90 @@ class MathDataset:
             raise ValueError("a math dataset needs at least one training problem")
 
 
-def load_gsm8k(
-    dataset: str = "openai/gsm8k",
-    dataset_config: str = "main",
-    seed: int = 0,
-    n_test: int = 200,
-) -> MathDataset:
-    import datasets
+def load_math(seed: int = 0) -> MathProblems:
+    """Hendrycks MATH train (MATH-500 held out) + HuggingFaceH4/MATH-500 test."""
+    from tinker_cookbook.recipes.math_rl.math_env import (
+        _get_hendrycks_math_test,
+        _get_hendrycks_math_train,
+    )
+    from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed
 
-    loaded = datasets.load_dataset(dataset, dataset_config)
-    assert isinstance(loaded, datasets.DatasetDict)
+    train_rows = _get_hendrycks_math_train().shuffle(seed=seed)
+    train: list[tuple[str, str]] = []
+    for row in train_rows:
+        train.append((row["problem"], extract_boxed(row["solution"])))
 
-    train_rows = loaded["train"].shuffle(seed=seed)
-    train = list(zip(train_rows["question"], train_rows["answer"]))
+    test_rows = _get_hendrycks_math_test()
+    test: list[tuple[str, str]] = []
+    for row in test_rows:
+        test.append((row["problem"], extract_boxed(row["solution"])))
 
-    if "test" not in loaded:
-        logger.warning("%s has no test split, so no benchmark will be reported", dataset)
-        return MathDataset(train=train, test=None)
+    return MathProblems(train=train, test=test or None)
 
-    test_rows = loaded["test"].shuffle(seed=seed)
-    test = list(zip(test_rows["question"], test_rows["answer"]))[:n_test]
-    return MathDataset(train=train, test=test)
+
+def question_suffix() -> str:
+    from tinker_cookbook.recipes.math_rl.math_env import MathEnv
+
+    return MathEnv.question_suffix()
+
+
+def convo_prefix() -> list[dict[str, str]]:
+    from tinker_cookbook.recipes.math_rl.math_env import MathEnv
+
+    return list(MathEnv.standard_fewshot_prefix())
 
 
 def build_prompt(question: str, renderer) -> list[int]:
     conversation = [
-        *CONVO_PREFIX,
-        {"role": "user", "content": question + QUESTION_SUFFIX},
+        *convo_prefix(),
+        {"role": "user", "content": question + question_suffix()},
     ]
     return renderer.build_generation_prompt(conversation).to_ints()
 
 
-def get_reward(response: str, answer: str) -> float:
-    from tinker_cookbook.recipes.math_rl.math_env import extract_gsm8k_final_answer
-    from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed, grade_answer
+def _stopped_cleanly(result: dict, max_tokens: int | None) -> bool:
+    finish_reason = result.get("finish_reason")
+    if isinstance(finish_reason, str) and finish_reason:
+        return finish_reason != "length"
+    if max_tokens is None:
+        return True
+    return len(result.get("token_ids") or []) < max_tokens
 
+
+def score_response(
+    response: str,
+    answer: str,
+    *,
+    result: dict,
+    max_tokens: int | None,
+    format_coef: float = FORMAT_COEF,
+) -> tuple[float, dict[str, float]]:
+    from tinker_cookbook.recipes.math_rl.math_env import safe_grade
+    from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed
+
+    well_formed = _stopped_cleanly(result, max_tokens)
     try:
-        given_answer = extract_boxed(response)
-        ground_truth = extract_gsm8k_final_answer(answer)
-        return 1.0 if grade_answer(given_answer, ground_truth) else 0.0
+        given = extract_boxed(response)
+        format_ok = True
     except ValueError:
-        return 0.0
+        given = None
+        format_ok = False
+
+    correct_format = float(well_formed and format_ok)
+    correct_answer = 0.0
+    if format_ok and given is not None:
+        correct_answer = float(safe_grade(given, answer))
+    reward = format_coef * (correct_format - 1.0) + correct_answer
+    return reward, {"format": correct_format, "correct": correct_answer}
 
 
 @dataclass
-class GSM8KAccuracyEvaluator:
+class MathAccuracyEvaluator:
     prompts: list[list[int]]
     answers: list[str]
     sampling_params: dict = field(default_factory=dict)
-    name: str = "test/gsm8k"
+    format_coef: float = FORMAT_COEF
+    name: str = "test/env/all"
 
     def __post_init__(self) -> None:
         if len(self.prompts) != len(self.answers):
@@ -122,9 +155,6 @@ class GSM8KAccuracyEvaluator:
             )
 
     def __call__(self, client: Any, job_id: str) -> dict[str, float]:
-        from tinker_cookbook.eval.benchmarks._common import check_gsm8k
-        from tinker_cookbook.recipes.math_rl.math_env import extract_gsm8k_final_answer
-
         if len(self.prompts) == 0:
             logger.warning("%s: no held-out problems, skipping", type(self).__name__)
             return {}
@@ -139,58 +169,46 @@ class GSM8KAccuracyEvaluator:
             )
 
         max_tokens = self.sampling_params.get("max_tokens")
-        n_correct = n_wrong = n_truncated = n_errors = 0
+        corrects: list[float] = []
+        formats: list[float] = []
+        rewards: list[float] = []
         completion_lengths: list[int] = []
+        n_truncated = 0
 
         for result, answer in zip(results, self.answers):
             text = result.get("text") or ""
             token_ids = result.get("token_ids") or []
             completion_lengths.append(len(token_ids))
-
-            if _is_truncated(result, max_tokens):
+            if not _stopped_cleanly(result, max_tokens):
                 n_truncated += 1
-                continue
-            try:
-                ground_truth = extract_gsm8k_final_answer(answer)
-            except ValueError:
-                n_errors += 1
-                continue
-            if check_gsm8k(text, ground_truth):
-                n_correct += 1
-            else:
-                n_wrong += 1
+            reward, metrics = score_response(
+                text,
+                answer,
+                result=result,
+                max_tokens=max_tokens,
+                format_coef=self.format_coef,
+            )
+            corrects.append(metrics["correct"])
+            formats.append(metrics["format"])
+            rewards.append(reward)
 
         n = len(results)
-        n_completed = n_correct + n_wrong
         return {
-            f"{self.name}/accuracy": n_correct / n,
-            f"{self.name}/score_completed": (
-                n_correct / n_completed if n_completed > 0 else float("nan")
-            ),
+            f"{self.name}/correct": sum(corrects) / n,
+            f"{self.name}/format": sum(formats) / n,
+            f"{self.name}/reward": sum(rewards) / n,
             f"{self.name}/frac_truncated": n_truncated / n,
-            f"{self.name}/frac_errors": n_errors / n,
             f"{self.name}/num_examples": float(n),
             f"{self.name}/mean_completion_tokens": sum(completion_lengths) / n,
         }
-
-
-def _is_truncated(result: dict, max_tokens: int | None) -> bool:
-    finish_reason = result.get("finish_reason")
-    if isinstance(finish_reason, str) and finish_reason:
-        return finish_reason == "length"
-    if max_tokens is None:
-        return False
-    return len(result.get("token_ids") or []) >= max_tokens
 
 
 @chz.chz
 class Config:
     config: str
     job_id: str | None = None
-    keep_job: bool | None = None
 
     model_name: str = "Qwen/Qwen3.5-4B"
-    renderer_name: str = "qwen3_5"
     training_gpus: int = 4
     sampling_gpus: int = 4
     gpu_memory_utilization: float = 0.4
@@ -198,52 +216,46 @@ class Config:
     zero_stage: int = 2
     attn_implementation: str = "flash_attention_3"
     dtype: str = "bfloat16"
-    seed: int = 42
+    seed: int = 0
     max_seq_len: int = 8192
 
-    dataset: str = "openai/gsm8k"
-    dataset_config: str = "main"
-    problems_per_batch: int = 16
-    group_size: int = 8
+    problems_per_batch: int = 64
+    group_size: int = 16
     max_tokens: int = 4096
     temperature: float = 1.0
     top_p: float = 1.0
+    format_coef: float = FORMAT_COEF
 
     train_batch_size: int = 8
-    max_tokens_per_mb: int = 10240  # backend microbatch token budget
-    learning_rate: float = 1e-5
+    max_tokens_per_mb: int = 10240
+    learning_rate: float = 2e-5
     weight_decay: float = 0.0
+
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
     gradient_clipping: float | None = 1.0
-    max_steps: int = 100
+    max_steps: int | None = None  # full epoch (~188 batches at batch=64)
     eps_clip: float = 0.2
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0.0
+    remove_constant_reward_groups: bool = True
 
-    lora_rank: int = 8
-    # Evaluation. 0 disables it; otherwise a baseline runs at batch 0 and the
-    # final batch is always evaluated.
-    eval_every: int = 10
-    n_test: int = 64
-    eval_temperature: float = 0.6
-    eval_max_tokens: int | None = None
+    lora_rank: int = None
 
-    log_path: str = "/tmp/neutrino-examples/rl-loop"
-    wandb_project: str | None = None
-    wandb_name: str | None = None
-    behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
     debug_image_tag: str | None = None
 
+    # Evals. 0 disables; otherwise baseline at batch 0 and the final batch.
+    eval_every: int = 20
+    # MATH-500 is 500 problems — None means the full split.
+    n_test: int | None = None
+    # uses the training temperature / max_tokens by default.
+    eval_temperature: float | None = None
+    eval_max_tokens: int | None = None
 
-# Qwen-style Linear names covering Tinker's train_attn / train_mlp / train_unembed.
-_LORA_TARGET_MODULES = (
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-)
+    log_path: str = "/tmp/dss-examples/rl-loop"
+    wandb_project: str = None
+    wandb_name: str | None = None
 
 
 def lora_config(config: Config) -> dict:
@@ -277,8 +289,8 @@ def job_body(config: Config) -> dict:
             "name": "AdamW",
             "lr": config.learning_rate,
             "weight_decay": config.weight_decay,
-            "betas": [0.9, 0.999],
-            "eps": 1e-8,
+            "betas": [config.adam_beta1, config.adam_beta2],
+            "eps": config.adam_eps,
         },
         "mb_spec": {"max_tokens_per_mb": config.max_tokens_per_mb},
         "ds_config": {
@@ -338,7 +350,6 @@ def processing_block(config: Config, global_batch_size: int) -> dict:
 
 def main(config: Config):
     if config.debug_image_tag:
-        # Client refuses a create-job `debug` block unless this is set.
         os.environ[DEBUG_OPTIONS_ENV] = "1"
         logger.info("Using debug image_tag=%s", config.debug_image_tag)
 
@@ -350,23 +361,34 @@ def main(config: Config):
         do_configure_logging_module=True,
     )
 
-    tokenizer, renderer, renderer_name = build_renderer(
-        config.model_name, config.renderer_name
-    )
-    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-    logger.info(f"Using renderer: {renderer_name}")
+    _train(config, ml_logger)
 
-    logger.info("Loading dataset...")
-    math_dataset = load_gsm8k(
-        config.dataset, config.dataset_config, seed=0, n_test=config.n_test
-    )
+    ml_logger.close()
+    logger.info("Training completed")
+
+
+def _train(config: Config, ml_logger: Any) -> None:
+    tokenizer, renderer, renderer_name = build_renderer(config.model_name)
+    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    logger.info("Using renderer: %s", renderer_name)
+
+    logger.info("Loading MATH dataset...")
+    math_dataset = load_math(seed=config.seed)
     train_problems = math_dataset.train
 
     n_train_batches = len(train_problems) // config.problems_per_batch
     total_steps = (
-        n_train_batches if config.max_steps is None else min(n_train_batches, config.max_steps)
+        n_train_batches
+        if config.max_steps is None
+        else min(n_train_batches, config.max_steps)
     )
-    logger.info(f"Training for {total_steps} rollout batches")
+    logger.info(
+        "Training for %d rollout batches (%d problems, %d per batch, group_size=%d)",
+        total_steps,
+        len(train_problems),
+        config.problems_per_batch,
+        config.group_size,
+    )
 
     stop_params = stop_params_for(renderer.get_stop_sequences())
     sampling_params = dict(
@@ -380,37 +402,50 @@ def main(config: Config):
     if config.eval_every > 0:
         if math_dataset.test is None:
             logger.warning(
-                "eval_every=%d but %s has no held-out split, so no benchmark will "
+                "eval_every=%d but MATH has no held-out split, so no benchmark will "
                 "be reported",
                 config.eval_every,
-                config.dataset,
             )
         else:
-            evaluator = GSM8KAccuracyEvaluator(
-                prompts=[build_prompt(question, renderer) for question, _ in math_dataset.test],
-                answers=[answer for _, answer in math_dataset.test],
+            test_problems = math_dataset.test
+            if config.n_test is not None:
+                test_problems = test_problems[: config.n_test]
+            eval_temperature = (
+                config.temperature
+                if config.eval_temperature is None
+                else config.eval_temperature
+            )
+            evaluator = MathAccuracyEvaluator(
+                prompts=[
+                    build_prompt(question, renderer)
+                    for question, _ in test_problems
+                ],
+                answers=[answer for _, answer in test_problems],
                 sampling_params=dict(
                     max_tokens=config.eval_max_tokens or config.max_tokens,
-                    temperature=config.eval_temperature,
+                    temperature=eval_temperature,
                     **stop_params,
                 ),
+                format_coef=config.format_coef,
             )
-            logger.info(f"Held-out benchmark on {len(evaluator.prompts)} problems")
+            logger.info("Held-out benchmark on %d problems", len(evaluator.prompts))
 
     client = make_client(config.config)
 
     with running_job(
-        client, job_body(config), job_id=config.job_id, keep_job=config.keep_job
+        client, job_body(config), job_id=config.job_id
     ) as job_id:
         for batch_idx in range(total_steps):
             t_start = time.time()
             metrics: dict[str, float] = {
                 "progress/batch": batch_idx,
-                "progress/done_frac": (batch_idx + 1) / n_train_batches,
+                "progress/done_frac": (batch_idx + 1) / max(n_train_batches, 1),
                 "optim/lr": config.learning_rate,
             }
 
-            if evaluator is not None and _should_eval(batch_idx, total_steps, config.eval_every):
+            if evaluator is not None and _should_eval(
+                batch_idx, total_steps, config.eval_every
+            ):
                 eval_start = time.time()
                 metrics.update(evaluator(client, job_id))
                 metrics["time/eval"] = time.time() - eval_start
@@ -435,6 +470,8 @@ def main(config: Config):
                 )
 
             rewards_P: list[float] = []
+            corrects_P: list[float] = []
+            formats_P: list[float] = []
             datums_D: list[TrainSequence] = []
             for problem_idx, (prompt_tokens, (_, answer)) in enumerate(
                 zip(prompt_tokens_P, batch)
@@ -442,16 +479,33 @@ def main(config: Config):
                 group = results_D[
                     problem_idx * config.group_size : (problem_idx + 1) * config.group_size
                 ]
-                rewards_G = [get_reward(result.get("text", ""), answer) for result in group]
+                scored = [
+                    score_response(
+                        result.get("text") or "",
+                        answer,
+                        result=result,
+                        max_tokens=config.max_tokens,
+                        format_coef=config.format_coef,
+                    )
+                    for result in group
+                ]
+                rewards_G = [reward for reward, _ in scored]
                 mean_reward = sum(rewards_G) / len(rewards_G)
                 rewards_P.append(mean_reward)
+                corrects_P.append(
+                    sum(m["correct"] for _, m in scored) / len(scored)
+                )
+                formats_P.append(sum(m["format"] for _, m in scored) / len(scored))
                 advantages_G = [reward - mean_reward for reward in rewards_G]
 
-                if all(advantage == 0.0 for advantage in advantages_G):
+                if (
+                    config.remove_constant_reward_groups
+                    and all(advantage == 0.0 for advantage in advantages_G)
+                ):
                     continue
 
                 for result, advantage in zip(group, advantages_G):
-                    sampled_tokens = [int(token) for token in result.get("token_ids")]
+                    sampled_tokens = [int(token) for token in (result.get("token_ids") or [])]
                     if len(sampled_tokens) == 0:
                         continue
                     datums_D.append(
@@ -465,8 +519,7 @@ def main(config: Config):
             train_loss = float("nan")
             if len(datums_D) == 0:
                 logger.warning(
-                    "Batch %d: no rollout carried a non-zero advantage, skipping "
-                    "the optimizer step",
+                    "Batch %d: no rollouts to train on, skipping the optimizer step",
                     batch_idx,
                 )
             else:
@@ -492,7 +545,11 @@ def main(config: Config):
             metrics.update(
                 {
                     "reward/mean": sum(rewards_P) / len(rewards_P),
-                    "reward/std": statistics.pstdev(rewards_P) if len(rewards_P) > 1 else 0.0,
+                    "reward/std": (
+                        statistics.pstdev(rewards_P) if len(rewards_P) > 1 else 0.0
+                    ),
+                    "env/all/correct": sum(corrects_P) / len(corrects_P),
+                    "env/all/format": sum(formats_P) / len(formats_P),
                     "rollouts/total": len(results_D),
                     "rollouts/trained": len(datums_D),
                     "train/avg_loss": train_loss,
@@ -500,9 +557,6 @@ def main(config: Config):
                 }
             )
             ml_logger.log_metrics(metrics, step=batch_idx)
-
-    ml_logger.close()
-    logger.info("Training completed")
 
 
 def _should_eval(step: int, total_steps: int, eval_every: int) -> bool:
