@@ -13,7 +13,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Back-compat shim — utils live in ``arctic_platform.common.utils``."""
+"""Back-compat shim — utils live in ``arctic_platform.common.utils``.
 
-from arctic_platform.common.utils import *  # noqa: F401,F403
-from arctic_platform.common.utils import __all__  # noqa: F401
+Eagerly re-exporting ``common.utils`` here creates a circular import:
+
+  common.utils.__init__ → batch → rl.zorro_train → qwen_attention_patcher
+    → rl.utils.debug → rl.utils.__init__ → common.utils (partial)
+
+so this package is lazy (PEP 562). Submodule shims
+(``rl.utils.debug``, …) still resolve to ``common.utils.*`` directly.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+_COMMON_UTILS = "arctic_platform.common.utils"
+
+
+def __getattr__(name: str) -> Any:
+    import importlib
+
+    mod = importlib.import_module(_COMMON_UTILS)
+    try:
+        value = getattr(mod, name)
+    except AttributeError as e:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from e
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    import importlib
+
+    mod = importlib.import_module(_COMMON_UTILS)
+    return sorted(set(globals()) | set(getattr(mod, "__all__", [])))

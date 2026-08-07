@@ -20,7 +20,6 @@ from typing import Any
 import torch
 
 from arctic_platform import wire
-from arctic_platform.rl.zorro_train.seqlen_balancing import reorg_global_batch
 
 
 def shard_token_stats(batch_data: dict, meta_data: dict | None = None) -> dict[str, int]:
@@ -131,8 +130,12 @@ def _split_batch(batch: dict, num_workers: int) -> list[dict]:
     if meta_data.get("drop_position_ids", False) and "position_ids" not in batch_data:
         reconstruct_position_ids_(batch_data)
 
-    # ZoRRO Load balancer
+    # ZoRRO Load balancer. Import lazily: a top-level import of zorro_train pulls
+    # in rl/__init__.py → common.http_server → common.utils while this package is
+    # still initializing (circular after the rl→common move).
     if meta_data.get("load_balancer", False):
+        from arctic_platform.rl.zorro_train.seqlen_balancing import reorg_global_batch
+
         max_group_length_threshold = meta_data.get("zorro_train_max_rollouts", meta_data["rollout_n"])
         batch_data, reorder_indices = reorg_global_batch(
             batch_data,
