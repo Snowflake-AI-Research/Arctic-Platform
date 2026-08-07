@@ -38,6 +38,7 @@ from neutrino_common import (
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
 logging.getLogger("urllib3").setLevel(logging.WARN)
+logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
 # Match MathEnv / ProblemEnv defaults.
 FORMAT_COEF = 0.1
