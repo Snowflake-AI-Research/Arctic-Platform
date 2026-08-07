@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Back-compat shim — prefer ``python -m arctic_platform.common.http_server``."""
 
-from arctic_platform.common.http_server import *  # noqa: F401,F403
-from arctic_platform.common.http_server import main
+class ArcticRLServerState:
+    """
+    a parent class that at the moment doesn't do anything, since only ArcticRLServerState does something
+    """
 
-if __name__ == "__main__":
-    main()
+    pass
