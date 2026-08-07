@@ -40,7 +40,6 @@ from arctic_inference.server.weight_sync.sender import WeightSender
 from deepspeed.accelerator import get_accelerator
 from transformers import AutoModelForCausalLM
 
-from arctic_platform.rl.processors import run_pipeline
 from arctic_platform.common.ray_cluster import primary_ip
 from arctic_platform.common.utils import combine_metric_microbatches
 from arctic_platform.common.utils import log_dp_shard_tokens
@@ -50,6 +49,7 @@ from arctic_platform.common.utils import unpack_batch
 from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
+from arctic_platform.rl.processors import run_pipeline
 
 logger = logging.getLogger(__name__)
 
