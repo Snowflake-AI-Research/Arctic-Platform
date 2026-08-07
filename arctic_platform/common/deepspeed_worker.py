@@ -49,7 +49,6 @@ from arctic_platform.common.utils import unpack_batch
 from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
-from arctic_platform.rl.processors import run_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -419,6 +418,10 @@ class DeepSpeedWorker:
             see_memory_usage(f"_forward_maybe_backward mb {i=}", force=True)
             if i == 0:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {meta_data.keys()=} {processing.keys()=}")
+
+            # Lazy: top-level `rl.processors` import loads rl/__init__.py →
+            # common.http_server → this module while it is still initializing.
+            from arctic_platform.rl.processors import run_pipeline
 
             micro_batch_output = run_pipeline(
                 self.engine,
