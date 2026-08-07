@@ -33,12 +33,14 @@ from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
 
 
-def make_transport(config: ArcticRLClientConfig) -> Transport:
+def make_transport(config: ArcticRLClientConfig, server_state: Any = None) -> Transport:
     from arctic_platform.client.transports.onprem_http import HttpTransport
     from arctic_platform.client.transports.onprem_ray import RayTransport
 
     if config.backend == "onprem" and config.backend_config.comm_protocol == "ray":
-        return RayTransport(config)
+        return RayTransport(config, server_state=server_state)
+    if server_state is not None:
+        raise ValueError("server_state reconnect is only supported by the in-process Ray transport.")
     return HttpTransport(config)  # onprem (HTTP)
 
 
@@ -63,8 +65,12 @@ def _fwd_bwd_request(
     return Request("forward-backward", jobs.require("training"), body, binary=True)
 
 
-def _fwd_no_grad_request(jobs: JobHandles, batch: dict) -> Request:
-    return Request("forward", jobs.require("training"), dict(batch), binary=True)
+def _fwd_no_grad_request(jobs: JobHandles, batch: dict, reference_model: bool = False) -> Request:
+    # Forward-only (no grad). Reference log-probs run on the log_prob engine;
+    # current-policy log-probs run on the training engine (mirrors the old
+    # ray_client.fwd_no_grad reference_model routing).
+    job = "log_prob" if reference_model else "training"
+    return Request("forward", jobs.require(job), dict(batch), binary=True)
 
 
 def _step_request(jobs: JobHandles, learning_rate: float | None = None) -> Request:
@@ -101,19 +107,51 @@ def _log_probs_request(jobs: JobHandles, prompts: list, completions: list | None
     return Request("log-probs", jobs.require("log_prob"), body)
 
 
-def _sync_weights_request(jobs: JobHandles) -> Request:
+def _sync_weights_request(
+    jobs: JobHandles, colocate: bool, cuda_ipc: bool = False, low_memory: bool = False
+) -> Request:
     # The client assembles the full Cortex `/operation` envelope here so transports
     # just forward it: SnowAPI reads the `sub_job_*` routing hints, on-prem accepts
     # the same shape and ignores them (it addresses jobs by job id). On-prem treats a
     # sub_job_id as its plain job id, so source/target ids double as its job ids.
+    #
+    # In non-colocated mode the server uses NCCL. In colocated mode, cuda_ipc=True is
+    # zero-copy (training weights must be on GPU) and low_memory streams one param at
+    # a time to bound peak GPU memory.
     tid, sid = jobs.require("training"), jobs.require("sampling")
     body = {
         "operation_type": "weight-sync",
         "sub_job_id": tid,
         "sub_job_type": "training",
-        "payload": {"source_sub_job_id": tid, "target_sub_job_ids": [sid]},
+        "payload": {
+            "source_sub_job_id": tid,
+            "target_sub_job_ids": [sid],
+            "colocate": colocate,
+            "cuda_ipc": cuda_ipc,
+            "low_memory": low_memory,
+        },
     }
     return Request("operation", tid, body)
+
+
+def _sleep_inference_request(jobs: JobHandles, level: int = 1) -> Request:
+    sid = jobs.require("sampling")
+    body = {
+        "operation_type": "sleep-inference",
+        "sub_job_type": "sampling",
+        "payload": {"level": level},
+    }
+    return Request("operation", sid, body)
+
+
+def _wake_inference_request(jobs: JobHandles, tags: list | None = None) -> Request:
+    sid = jobs.require("sampling")
+    body = {
+        "operation_type": "wake-inference",
+        "sub_job_type": "sampling",
+        "payload": {"tags": tags},
+    }
+    return Request("operation", sid, body)
 
 
 def _reset_prefix_cache_request(
@@ -139,18 +177,29 @@ def _reconnect_config(config: ArcticRLClientConfig, jobs: JobHandles) -> ArcticR
     )
 
 
+def _get_server_state(transport: Transport) -> Any:
+    """The transport's server-state handle for cross-process reattach.
+
+    Only meaningful for the in-process Ray transport; other transports raise.
+    """
+    get_state = getattr(transport, "get_server_state", None)
+    if get_state is None:
+        raise NotImplementedError(f"{type(transport).__name__} has no server state to share.")
+    return get_state()
+
+
 class SyncArcticRLClient:
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: ArcticRLClientConfig, server_state: Any = None) -> None:
         self.config = config
-        self.transport = make_transport(config)
+        self.transport = make_transport(config, server_state=server_state)
         self.jobs = self.transport.initialize()
 
     # ── training ─────────────────────────────────────────────────────────
     def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
         return self.transport.call(_fwd_bwd_request(self.jobs, batch, processing, router_replay))
 
-    def fwd_no_grad(self, batch: dict) -> dict:
-        return self.transport.call(_fwd_no_grad_request(self.jobs, batch))
+    def fwd_no_grad(self, batch: dict, reference_model: bool = False) -> dict:
+        return self.transport.call(_fwd_no_grad_request(self.jobs, batch, reference_model))
 
     def step(self, learning_rate: float | None = None) -> dict:
         return self.transport.call(_step_request(self.jobs, learning_rate))
@@ -170,8 +219,16 @@ class SyncArcticRLClient:
         return self.transport.call(_log_probs_request(self.jobs, prompts, completions, top_k))
 
     # ── weight sync + cache ──────────────────────────────────────────────
-    def sync_weights(self) -> dict:
-        return self.transport.call(_sync_weights_request(self.jobs))
+    def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict:
+        return self.transport.call(
+            _sync_weights_request(self.jobs, self.config.backend_config.colocate, cuda_ipc, low_memory)
+        )
+
+    def sleep_inference(self, level: int = 1) -> dict:
+        return self.transport.call(_sleep_inference_request(self.jobs, level))
+
+    def wake_inference(self, tags: list | None = None) -> dict:
+        return self.transport.call(_wake_inference_request(self.jobs, tags))
 
     def reset_prefix_cache(self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1) -> dict:
         return self.transport.call(_reset_prefix_cache_request(self.jobs, drain, timeout_s, retry_interval_s))
@@ -179,6 +236,9 @@ class SyncArcticRLClient:
     # ── lifecycle ────────────────────────────────────────────────────────
     def reconnect_config(self) -> ArcticRLClientConfig:
         return _reconnect_config(self.config, self.jobs)
+
+    def get_server_state(self) -> Any:
+        return _get_server_state(self.transport)
 
     def shutdown(self) -> None:
         self.transport.shutdown()
@@ -193,17 +253,17 @@ class SyncArcticRLClient:
 class ArcticRLClient:
     """The async client. Use `SyncArcticRLClient` for blocking calls."""
 
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: ArcticRLClientConfig, server_state: Any = None) -> None:
         self.config = config
-        self.transport = make_transport(config)
+        self.transport = make_transport(config, server_state=server_state)
         self.jobs = self.transport.initialize()
 
     # ── training ─────────────────────────────────────────────────────────
     async def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
         return await self.transport.acall(_fwd_bwd_request(self.jobs, batch, processing, router_replay))
 
-    async def fwd_no_grad(self, batch: dict) -> dict:
-        return await self.transport.acall(_fwd_no_grad_request(self.jobs, batch))
+    async def fwd_no_grad(self, batch: dict, reference_model: bool = False) -> dict:
+        return await self.transport.acall(_fwd_no_grad_request(self.jobs, batch, reference_model))
 
     async def step(self, learning_rate: float | None = None) -> dict:
         return await self.transport.acall(_step_request(self.jobs, learning_rate))
@@ -223,8 +283,16 @@ class ArcticRLClient:
         return await self.transport.acall(_log_probs_request(self.jobs, prompts, completions, top_k))
 
     # ── weight sync + cache ──────────────────────────────────────────────
-    async def sync_weights(self) -> dict:
-        return await self.transport.acall(_sync_weights_request(self.jobs))
+    async def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict:
+        return await self.transport.acall(
+            _sync_weights_request(self.jobs, self.config.backend_config.colocate, cuda_ipc, low_memory)
+        )
+
+    async def sleep_inference(self, level: int = 1) -> dict:
+        return await self.transport.acall(_sleep_inference_request(self.jobs, level))
+
+    async def wake_inference(self, tags: list | None = None) -> dict:
+        return await self.transport.acall(_wake_inference_request(self.jobs, tags))
 
     async def reset_prefix_cache(
         self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1
@@ -234,6 +302,9 @@ class ArcticRLClient:
     # ── lifecycle ────────────────────────────────────────────────────────
     def reconnect_config(self) -> ArcticRLClientConfig:
         return _reconnect_config(self.config, self.jobs)
+
+    def get_server_state(self) -> Any:
+        return _get_server_state(self.transport)
 
     async def shutdown(self) -> None:
         # aiohttp's session must be closed with await; the sync shutdown() that
@@ -250,16 +321,23 @@ class ArcticRLClient:
 
 @overload
 def create_arctic_rl_client(
-    config: ArcticRLClientConfig, *, blocking_calls: Literal[False] = ...
+    config: ArcticRLClientConfig, *, blocking_calls: Literal[False] = ..., server_state: Any = ...
 ) -> ArcticRLClient: ...
 
 
 @overload
-def create_arctic_rl_client(config: ArcticRLClientConfig, *, blocking_calls: Literal[True]) -> SyncArcticRLClient: ...
+def create_arctic_rl_client(
+    config: ArcticRLClientConfig, *, blocking_calls: Literal[True], server_state: Any = ...
+) -> SyncArcticRLClient: ...
 
 
 def create_arctic_rl_client(
-    config: ArcticRLClientConfig, *, blocking_calls: bool = False
+    config: ArcticRLClientConfig, *, blocking_calls: bool = False, server_state: Any = None
 ) -> ArcticRLClient | SyncArcticRLClient:
-    """Async client by default; pass blocking_calls=True for the sync client."""
-    return SyncArcticRLClient(config) if blocking_calls else ArcticRLClient(config)
+    """Async client by default; pass blocking_calls=True for the sync client.
+
+    Pass ``server_state`` together with a reconnect config (job ids set) to
+    reattach to an already-running in-process Ray server from another process.
+    """
+    cls = SyncArcticRLClient if blocking_calls else ArcticRLClient
+    return cls(config, server_state=server_state)
