@@ -38,14 +38,16 @@ python recipes/sft_loop.py config=recipes/config.json \
 
 ### Weights & Biases
 
-WandbLogger **requires `WANDB_API_KEY` in the environment**
+WandbLogger **requires `WANDB_API_KEY` in the environment**.
+`wandb_project` enables W&B; `wandb_name` is optional (W&B picks a run name if omitted).
+
 ```bash
 export WANDB_API_KEY=...
 # optional:
 # export WANDB_BASE_URL=https://your-wandb-host
 
 python recipes/sft_loop.py config=recipes/config.json \
-    wandb_project=dss wandb_name=sft-smoke
+    wandb_project=dss
 
 python recipes/rl_loop.py config=recipes/config.json \
     lora_rank=32 wandb_project=dss wandb_name=math-smoke
