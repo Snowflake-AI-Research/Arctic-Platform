@@ -19,7 +19,7 @@ Not collected by pytest (doesn't match ``test_*.py``). Holds everything common t
 (``test_train_engine.py``, ``test_log_prob_engine.py``, ``test_generate.py``, ``test_e2e.py``): fake-data builders,
 the per-row HF reference, the ``ArcticRLClientConfig`` factory, the client lifecycle context manager, pytest-xdist
 port allocation, the skip guard, and the host-wide GPU-serialization lock (engaged per test by the
-``_serialize_gpu_work`` autouse fixture in ``tests/rl/conftest.py``). Model name, geometry, and GPU counts are
+``_serialize_gpu_work`` autouse fixture in ``tests/rl/conftest.py`` / ``tests/sft/conftest.py``). Model name, geometry, and GPU counts are
 owned by each test module and passed in. Does not depend on ``arctic-verl``.
 
 Session lifecycle (``arctic_rl_client_session``): release the driver's torch.distributed group, point ``TMPDIR`` at
@@ -42,8 +42,8 @@ pytest-xdist model: two modes, chosen automatically by ``tests/conftest._maybe_p
     a unique session ``TMPDIR``, so GPU tests run truly in parallel. The ``gpu_serial_lock`` becomes a no-op and
     vLLM claims a larger share of its dedicated slice.
   - Serialized fallback (too few GPUs -- e.g. a 2-GPU box, or ``-n`` larger than gpus/slice): all workers share all
-    GPUs, so the host-wide ``gpu_serial_lock`` (engaged per test by ``_serialize_gpu_work`` in
-    ``tests/rl/conftest.py``) drives one GPU body at a time, making ``-n N`` safe but GPU-bound.
+    GPUs, so the host-wide ``gpu_serial_lock`` (from ``arctic_platform.testing_utils``, engaged per test by
+    ``_serialize_gpu_work`` in ``tests/rl/conftest.py``) drives one GPU body at a time, making ``-n N`` safe but GPU-bound.
 Either way the vLLM tests carry ``@pytest.mark.vllm`` so ``-m "not vllm"`` can lift them out of a pool, and per-test
 isolation (ports / TMPDIR / GPU slice) means a sibling worker's live cluster is never touched on teardown.
 """
@@ -52,12 +52,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 import inspect
 import math
 import os
 import shutil
-import socket
 import subprocess
 import tempfile
 
@@ -72,9 +70,13 @@ from transformers import AutoTokenizer
 from arctic_platform.rl import ArcticRLClientConfig
 from arctic_platform.rl import create_arctic_rl_client
 from arctic_platform.rl import ray_cluster
+from arctic_platform.testing_utils import GPU_SERIAL_LOCK_PATH  # noqa: F401 — re-export
 from arctic_platform.testing_utils import get_unique_port_number
 from arctic_platform.testing_utils import get_xdist_worker_count
 from arctic_platform.testing_utils import get_xdist_worker_id
+from arctic_platform.testing_utils import gpu_partitioning_active  # noqa: F401 — re-export
+from arctic_platform.testing_utils import gpu_serial_lock  # noqa: F401 — re-export for tests/rl/conftest.py
+from arctic_platform.testing_utils import reserve_free_port
 
 # Each xdist worker owns a contiguous 8-port block (get_unique_port_number); conftest claims ``base`` for the
 # torch.distributed MASTER_PORT, so these tests claim from ``base+1`` for the http server.
@@ -82,21 +84,8 @@ _PORT_BASE = get_unique_port_number()
 
 
 def _reserve_free_port(start: int, span: int) -> int:
-    """First bindable port in ``[start, start + span)``.
-
-    Probed (vs. a fixed port) and re-probed per client session, NOT once at import: a port left squatted by a prior
-    cluster in this worker that hasn't been reaped yet is then stepped over rather than reused -- reusing a fixed
-    Ray GCS port makes the next ``ray start`` attach to the stale daemon and fail with
-    "Session name ... does not match".
-    """
-    for port in range(start, start + span):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(("", port))
-            except OSError:
-                continue
-            return port
-    raise RuntimeError(f"no free port found in [{start}, {start + span})")
+    """Alias of :func:`arctic_platform.testing_utils.reserve_free_port` (kept for local call sites)."""
+    return reserve_free_port(start, span)
 
 
 # Topology constants that don't vary across tests. The GPU counts (training / sampling / log_prob) and the colocate
@@ -769,36 +758,3 @@ def skip_if_unsupported(training_gpus: int, sampling_gpus: int, log_prob_gpus: i
     pytest.importorskip("arctic_inference")
     pytest.importorskip("vllm")
     pytest.importorskip("deepspeed")
-
-
-# Host-wide lock path shared across all the GPU test modules so their GPU-heavy bodies serialize against each
-# other too. Resolved at import (before any per-session TMPDIR override) so it stays a single host-wide path.
-GPU_SERIAL_LOCK_PATH = os.path.join(tempfile.gettempdir(), "arl_test_gpu.lock")
-
-
-def gpu_partitioning_active() -> bool:
-    """True when conftest gave each xdist worker its own disjoint GPU slice (see tests/conftest._maybe_partition_gpus).
-
-    In that mode workers never share GPUs, so the host-wide serial lock is unnecessary and vLLM can claim a larger
-    share of its dedicated slice.
-    """
-    return os.environ.get("ARL_GPU_PARTITIONED") == "1"
-
-
-@contextlib.contextmanager
-def gpu_serial_lock():
-    """Serialize GPU-heavy bodies across xdist workers.
-
-    Multiple workers spinning up DeepSpeed engines on the shared GPUs at once contend for VRAM and trip init-time
-    memory checks / OOM. Hold a host-wide advisory lock so one worker drives the GPUs at a time. No-op in a serial
-    run and when GPUs are partitioned (each worker owns a disjoint slice, so there is nothing to serialize).
-    """
-    if get_xdist_worker_count() <= 1 or gpu_partitioning_active():
-        yield
-        return
-    with open(GPU_SERIAL_LOCK_PATH, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)

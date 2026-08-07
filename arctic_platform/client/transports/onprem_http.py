@@ -50,7 +50,10 @@ class HttpTransport(OnPremTransport):
 
     def _start(self, payload: dict) -> JobId:
         resp = self.session.post(f"{self.base_url}/initialize", json=payload, timeout=self.timeout)
-        resp.raise_for_status()
+        if not resp.ok:
+            # Surface the server-side validation/error body (e.g. 422 detail);
+            # raise_for_status alone hides it, which makes remote debugging hard.
+            raise RuntimeError(f"/initialize failed ({resp.status_code}): {resp.text}")
         return resp.json()["job_id"]
 
     def _http_args(self, request: Request) -> tuple[str, dict[str, Any]]:
@@ -66,12 +69,22 @@ class HttpTransport(OnPremTransport):
         return url, {"params": params, "json": request.body}
 
     def call(self, request: Request) -> dict:
-        url, kwargs = self._http_args(request)
-        resp = self.session.post(url, timeout=self.timeout, **kwargs)
-        resp.raise_for_status()
-        if "application/octet-stream" in resp.headers.get("Content-Type", ""):
-            return wire.loads(resp.content)
-        return resp.json()
+        from arctic_platform.common.utils import sft_profile
+
+        with sft_profile.timed("serialize"):
+            url, kwargs = self._http_args(request)
+        with sft_profile.timed("rpc"):
+            resp = self.session.post(url, timeout=self.timeout, **kwargs)
+            resp.raise_for_status()
+            if "application/octet-stream" in resp.headers.get("Content-Type", ""):
+                result = wire.loads(resp.content)
+            else:
+                result = resp.json()
+        if sft_profile.enabled() and request.op in ("forward-backward", "forward", "step"):
+            # Client-side buckets only; server attaches its own under metrics._profile_ms.
+            sft_profile.maybe_print(f"client {request.op}")
+            sft_profile.take_last()
+        return result
 
     async def _ensure_asession(self):
         # A ClientSession is bound to the loop it's built on; reuse it only on
@@ -121,30 +134,36 @@ class HttpTransport(OnPremTransport):
 
     def shutdown(self) -> None:
         super().shutdown()
+        self._terminate_server()
+
+    def _terminate_server(self) -> None:
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=10)
             except Exception:
                 self.proc.kill()
+        self.proc = None
 
     def _is_running(self, job_id: JobId) -> bool:
         resp = self.session.get(f"{self.base_url}/job/{job_id}", timeout=self.timeout)
         return resp.ok and resp.json().get("status") == "RUNNING"
 
     def _launch_server(self) -> None:
+        import os
         import subprocess
         import sys
 
         cfg = self.config
+        bc = cfg.backend_config
         cmd = [
             sys.executable,
             "-m",
-            "arctic_platform.rl.http_server",
+            "arctic_platform.common.http_server",
             "--host",
             "0.0.0.0",
             "--port",
-            str(cfg.backend_config.port),
+            str(bc.port),
             "--training-gpus",
             str(cfg.training_gpus),
             "--sampling-gpus",
@@ -152,14 +171,24 @@ class HttpTransport(OnPremTransport):
             "--log-prob-gpus",
             str(cfg.log_prob_gpus),
         ]
-        if cfg.backend_config.colocate:
+        if bc.colocate:
             cmd.append("--colocate")
-        self.proc = subprocess.Popen(cmd)
-        self._poll(
-            lambda: self.session.get(f"{self.base_url}/health", timeout=self.timeout).ok,
-            cfg.backend_config.startup_timeout,
-            "server",
-        )
+        env = os.environ.copy()
+        if bc.server_cuda_visible_devices is not None:
+            # Client may run with CUDA_VISIBLE_DEVICES= (empty); give the
+            # server subprocess an explicit GPU list so Ray workers see devices.
+            env["CUDA_VISIBLE_DEVICES"] = bc.server_cuda_visible_devices
+        self.proc = subprocess.Popen(cmd, env=env)
+        try:
+            self._poll(
+                lambda: self.session.get(f"{self.base_url}/health", timeout=self.timeout).ok,
+                bc.startup_timeout,
+                "server",
+            )
+        except Exception:
+            # Health timeout runs in __init__ (before client init guards); kill the orphan.
+            self._terminate_server()
+            raise
 
     @staticmethod
     def _poll(pred, timeout: float, what: str) -> None:

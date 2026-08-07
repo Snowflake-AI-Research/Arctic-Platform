@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pytest fixtures shared by the Arctic RL tests under ``tests/rl/``."""
+"""Pytest fixtures shared by the Arctic SFT tests under ``tests/sft/``.
+
+Mirrors ``tests/rl/conftest.py`` for ``gpu_serial``: the mark is a no-op unless an
+autouse fixture in this directory engages :func:`gpu_serial_lock`.
+"""
 
 from __future__ import annotations
 
@@ -23,14 +27,13 @@ import pytest
 
 from arctic_platform.testing_utils import gpu_serial_lock
 
-# Per-test wall-clock budget for the heavyweight GPU tests. Healthy spin-up is well under a minute, but the http
-# session retries a wedged init up to 3 times on fresh ports (job_ready_timeout=240s each), so the test must be
-# allowed to outlast that worst case. Overrides the global ``timeout=300`` from pyproject for these tests only.
+# Local HTTP SFT demos are lighter than full RL e2e, but DeepSpeed spin-up + a few
+# training steps can still exceed the global ``timeout=300`` from pyproject.
 _GPU_SERIAL_TIMEOUT = 900
 
 
 def pytest_collection_modifyitems(items):
-    """Give every ``gpu_serial`` test the larger timeout budget (set at collection, before pytest-timeout arms)."""
+    """Give every ``gpu_serial`` test the larger timeout budget."""
     for item in items:
         if item.get_closest_marker("gpu_serial") is not None:
             item.add_marker(pytest.mark.timeout(_GPU_SERIAL_TIMEOUT))
@@ -38,11 +41,7 @@ def pytest_collection_modifyitems(items):
 
 @pytest.fixture(autouse=True)
 def _scrub_stale_nccl_topo_file():
-    """Drop an inherited per-process ``NCCL_TOPO_FILE=/proc/self/fd/<N>`` left in the driver env by a prior GPU test.
-
-    Belt-and-suspenders with the same guard in ``deepspeed_worker``: scrubbing the driver env before a test spawns
-    its server subprocess keeps the stale handle from propagating to any NCCL init (vLLM as well as DeepSpeed).
-    """
+    """Drop an inherited ``NCCL_TOPO_FILE=/proc/self/fd/<N>`` left by a prior GPU test."""
     topo_file = os.environ.get("NCCL_TOPO_FILE", "")
     if topo_file.startswith("/proc/self/fd/"):
         os.environ.pop("NCCL_TOPO_FILE", None)
@@ -51,11 +50,7 @@ def _scrub_stale_nccl_topo_file():
 
 @pytest.fixture(autouse=True)
 def _serialize_gpu_work(request):
-    """Serialize GPU-heavy test bodies across xdist workers via the host-wide lock.
-
-    Autouse, but only engages for tests marked ``gpu_serial`` (the heavyweight GPU modules) so the fast CPU tests in
-    this directory are never made to queue behind a multi-minute GPU test under ``-n N``.
-    """
+    """Serialize ``gpu_serial`` bodies across xdist workers via the host-wide lock."""
     if request.node.get_closest_marker("gpu_serial") is None:
         yield
         return
