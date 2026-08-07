@@ -241,7 +241,7 @@ class Config:
     entropy_coeff: float = 0.0
     remove_constant_reward_groups: bool = True
 
-    lora_rank: int = None
+    lora_rank: int | None = None
 
     debug_image_tag: str | None = None
 
@@ -258,7 +258,9 @@ class Config:
     wandb_name: str | None = None
 
 
-def lora_config(config: Config) -> dict:
+def lora_config(config: Config) -> dict[str, Any] | None:
+    if config.lora_rank is None:
+        return None
     return {
         "peft_type": "Lora",
         "r": config.lora_rank,
@@ -278,7 +280,6 @@ def job_body(config: Config) -> dict:
             f"{config.training_gpus} = {per_step})"
         )
 
-    peft = lora_config(config)
     training_config: dict = {
         "model_provider": "huggingface",
         "n_gpus": config.training_gpus,
@@ -300,10 +301,23 @@ def job_body(config: Config) -> dict:
             "zero_optimization": {"stage": config.zero_stage, "reduce_scatter": True},
             "bf16": {"enabled": True},
         },
-        "peft_config": peft,
     }
+    peft = lora_config(config)
+    if peft is not None:
+        training_config["peft_config"] = peft
     if config.gradient_clipping is not None:
         training_config["gradient_clipping"] = config.gradient_clipping
+
+    inference_config: dict = {
+        "max_seq_len": config.max_seq_len,
+        "n_gpus": config.sampling_gpus,
+        "vllm_config": {
+            "max_model_len": config.max_seq_len,
+            "gpu_memory_utilization": config.gpu_memory_utilization,
+        },
+    }
+    if peft is not None:
+        inference_config["peft_config"] = peft
 
     body: dict = {
         "sub_job_configs": [
@@ -312,15 +326,7 @@ def job_body(config: Config) -> dict:
                 "model_name": config.model_name,
                 "dtype": config.dtype,
                 "seed": config.seed,
-                "inference_config": {
-                    "max_seq_len": config.max_seq_len,
-                    "n_gpus": config.sampling_gpus,
-                    "vllm_config": {
-                        "max_model_len": config.max_seq_len,
-                        "gpu_memory_utilization": config.gpu_memory_utilization,
-                    },
-                    "peft_config": peft,
-                },
+                "inference_config": inference_config,
             },
             {
                 "job_type": "training",
