@@ -178,7 +178,12 @@ class _CortexClientShim:
         if input_ids is None or attention_mask is None:
             raise ValueError("cortex fwd_bwd requires 'input_ids' and 'attention_mask'")
 
-        loss_mask = tensors.pop("loss_mask", None) or tensors.pop("response_mask", None) or attention_mask
+        # ``bool(tensor)`` on multi-element tensors raises, so fall back via ``is None`` checks.
+        loss_mask = tensors.pop("loss_mask", None)
+        if loss_mask is None:
+            loss_mask = tensors.pop("response_mask", None)
+        if loss_mask is None:
+            loss_mask = attention_mask
         if torch.is_tensor(loss_mask):
             loss_mask = loss_mask.to(torch.bool)
         advantages = tensors.pop("advantages", None)
