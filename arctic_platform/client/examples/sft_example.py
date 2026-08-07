@@ -41,7 +41,6 @@ sys.path.insert(0, str(ARCTIC / "tests" / "rl"))
 
 from arctic_platform.client import ArcticRLClientConfig  # noqa: E402
 from arctic_platform.client import OnPremConfig  # noqa: E402
-from arctic_platform.client import OptimizerConfig  # noqa: E402
 from arctic_platform.client import SyncArcticRLClient  # noqa: E402
 from arctic_platform.client import TrainingConfig  # noqa: E402
 
@@ -79,16 +78,17 @@ def _onprem_config(comm_protocol: str, launch_local_server: bool) -> Callable:
                 launch_local_server=launch_local_server,
             ),
             training=TrainingConfig(
-                optimizer=OptimizerConfig(lr=LR, weight_decay=0.0, betas=[0.9, 0.999]),
-                lr_scheduler={"warmup_ratio": 0.0},
-                training_horizon=1,
-                gradient_accumulation_steps=1,
                 checkpoint_path=ckpt,  # server requires this for training jobs
                 ds_worker_config={"attn_implementation": ATTN},
                 ds_config={
                     "train_micro_batch_size_per_gpu": 1,
                     "train_batch_size": N_GPUS,
                     "gradient_accumulation_steps": 1,
+                    "gradient_clipping": 1.0,
+                    "optimizer": {
+                        "type": "AdamW",
+                        "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+                    },
                     "zero_optimization": {
                         "stage": 3,
                         "offload_optimizer": {"device": "none"},

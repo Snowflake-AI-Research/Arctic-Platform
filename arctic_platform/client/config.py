@@ -19,7 +19,7 @@ Canonical nesting (shared across backends)::
     ArcticRLClientConfig
     ├── model_name, seed, dtype, max_seq_len
     ├── training_gpus / sampling_gpus / log_prob_gpus
-    ├── training     # training loop + DeepSpeed engine (optimizer, ds_config, ...)
+    ├── training     # DeepSpeed engine (ds_config owns optimizer/scheduler/batch) + checkpoint
     ├── sampling     # sampling / log-prob engines (vllm, log_prob_engine, ...)
     └── backend_config: OnPremConfig  # connection / deployment only
 
@@ -32,12 +32,10 @@ from __future__ import annotations
 from typing import Any
 from typing import Literal
 
-from pydantic import AliasChoices
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import computed_field
-from pydantic import model_validator
 
 JobId = int | str
 
@@ -85,37 +83,16 @@ class SamplingConfig(BaseModel):
     )
 
 
-class OptimizerConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid", validate_default=True, populate_by_name=True)
-
-    name: str = Field("AdamW", validation_alias=AliasChoices("name", "type"), description="Optimizer name.")
-    lr: float = Field(1e-5, gt=0)
-    weight_decay: float = Field(0.0, ge=0)
-    betas: list[float] = Field(default_factory=lambda: [0.9, 0.999])
-    eps: float = Field(1e-8, gt=0)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize_betas(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        out = dict(data)
-        if "beta1" in out or "beta2" in out:
-            out["betas"] = [out.pop("beta1", 0.9), out.pop("beta2", 0.999)]
-        return out
-
-
 class TrainingConfig(BaseModel):
-    """Training-job settings + engine. Allocation (GPUs, max_seq_len) stays on the client."""
+    """On-prem training job: the DeepSpeed engine config + job settings.
 
-    model_config = ConfigDict(extra="forbid", validate_default=True, populate_by_name=True)
+    DeepSpeed owns the engine, so optimizer / scheduler / batch size / gradient
+    accumulation all live in ``ds_config`` (DeepSpeed config-json format) rather
+    than as separate typed fields. Allocation (GPUs, max_seq_len) stays on the client.
+    """
 
-    train_batch_size: int = Field(1, ge=1)
-    optimizer: OptimizerConfig | None = Field(default_factory=OptimizerConfig)
-    gradient_clipping: float | None = Field(1.0, ge=0)
-    lr_scheduler: dict[str, Any] | None = None
-    training_horizon: int | None = Field(None, ge=0)
-    gradient_accumulation_steps: int | None = Field(None, ge=1)
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
     full_determinism: bool = Field(
         False, description="DeepSpeed worker calls enable_full_determinism for reproducible training."
     )
@@ -126,9 +103,10 @@ class TrainingConfig(BaseModel):
             "The default destination used by save_checkpoint()."
         ),
     )
-
-    # DeepSpeed engine (on-prem server). Shared with the log-prob job when it also runs DeepSpeed.
-    ds_config: dict[str, Any] | None = Field(None, description="DeepSpeed config for the training/log-prob engine.")
+    ds_config: dict[str, Any] | None = Field(
+        None,
+        description="DeepSpeed config-json for the engine (optimizer, scheduler, train_batch_size, zero_optimization, ...).",
+    )
     ds_worker_config: dict[str, Any] | None = Field(
         None,
         description="DeepSpeed worker knobs (attn_implementation, use_liger, enable_gradient_checkpointing, ...).",
@@ -192,7 +170,6 @@ class ArcticRLClientConfig(BaseModel):
             if tc.ds_worker_config:
                 payload["ds_worker_config"] = tc.ds_worker_config
             if job_type == "training":
-                payload["training_config"] = self._onprem_training_config()
                 if tc.checkpoint_path:
                     payload["checkpoint_path"] = tc.checkpoint_path
             elif sc.log_prob_ds_config:
@@ -205,20 +182,3 @@ class ArcticRLClientConfig(BaseModel):
                 vllm.setdefault("max_model_len", self.max_seq_len)
                 payload["vllm_config"] = vllm
         return payload
-
-    def _onprem_training_config(self) -> dict[str, Any]:
-        tc = self.training
-        out: dict[str, Any] = {"train_batch_size": tc.train_batch_size}
-        if tc.optimizer is not None:
-            opt = tc.optimizer.model_dump()
-            # The worker reads gradient_clipping from inside the optimizer dict.
-            if tc.gradient_clipping is not None:
-                opt["gradient_clipping"] = tc.gradient_clipping
-            out["optimizer"] = opt
-        if tc.lr_scheduler is not None:
-            out["lr_scheduler"] = tc.lr_scheduler
-        if tc.training_horizon is not None:
-            out["training_horizon"] = tc.training_horizon
-        if tc.gradient_accumulation_steps is not None:
-            out["gradient_accumulation_steps"] = tc.gradient_accumulation_steps
-        return out
