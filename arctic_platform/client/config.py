@@ -105,7 +105,9 @@ class TrainingConfig(BaseModel):
     )
     ds_config: dict[str, Any] | None = Field(
         None,
-        description="DeepSpeed config-json for the engine (optimizer, scheduler, train_batch_size, zero_optimization, ...).",
+        description=(
+            "DeepSpeed config-json for the engine (optimizer, scheduler, train_batch_size, zero_optimization, ...)."
+        ),
     )
     ds_worker_config: dict[str, Any] | None = Field(
         None,
