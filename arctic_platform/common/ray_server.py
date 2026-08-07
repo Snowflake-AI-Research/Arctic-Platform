@@ -106,6 +106,13 @@ _WEIGHT_SYNC_BUCKET_SIZE = 256 * 1024 * 1024
 
 
 def create_arctic_rl_ray_server_state(**kwargs):
+    # Capture MASTER_PORT on the *driver* and pass it into the actor. Ray workers
+    # inherit the raylet's env from ``ray start`` time; if a leftover cluster is
+    # still up and ``address="auto"`` attaches to it, actor ``os.environ`` can be
+    # a stale MASTER_PORT (classic EADDRINUSE on 29501 across the RL suite).
+    if "ds_master_port" not in kwargs:
+        env_port = os.environ.get("MASTER_PORT")
+        kwargs["ds_master_port"] = int(env_port) if env_port else None
     sched_pg = placement_group([{"GPU": 0, "CPU": 1}])
     return ray.remote(
         num_cpus=0,
@@ -128,6 +135,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
         log_prob_gpus: int,
         log_prob_engine: str,
         colocate: bool,
+        ds_master_port: int | None = None,
     ):
         total_gpus = training_gpus + sampling_gpus + log_prob_gpus
         if total_gpus == 0:
@@ -149,6 +157,8 @@ class ArcticRLRayServerState(ArcticRLServerState):
         self.log_prob_gpus = log_prob_gpus
         self.log_prob_engine = log_prob_engine
         self.colocate = colocate
+        # Driver-captured DeepSpeed rendezvous port (see create_arctic_rl_ray_server_state).
+        self.ds_master_port = ds_master_port
 
         # In colocated mode, create one STRICT_PACK placement group per Ray
         # node so each TP=tp group is guaranteed to live on a single physical
@@ -327,11 +337,11 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 raise ValueError("No training GPUs configured")
             if self.training_workers:
                 raise ValueError("Training job already running")
-            # Honor MASTER_PORT when set so concurrent training jobs on one host
-            # (e.g. parallel pytest-xdist workers, each with its own cluster) don't
-            # collide on the rendezvous port. All ranks of THIS job are handed the
-            # same value below, so multi-node rendezvous is unaffected.
-            master_port = int(os.environ.get("MASTER_PORT", 29500))
+            # Prefer the driver-captured port (avoids stale raylet env); fall back
+            # to actor env / default. All ranks of THIS job share the same value.
+            master_port = (
+                self.ds_master_port if self.ds_master_port is not None else int(os.environ.get("MASTER_PORT", 29500))
+            )
             workers = []
             config_dict = job_config.model_dump()
             for rank in range(gpus):
@@ -403,11 +413,13 @@ class ArcticRLRayServerState(ArcticRLServerState):
             if job_config.ds_config is not None:
                 if self.log_prob_workers:
                     raise ValueError("Log-prob job already running")
-                # Honor MASTER_PORT when set (mirrors the training branch above) so concurrent log-prob jobs on one
-                # host -- e.g. parallel pytest-xdist workers, each with its own cluster -- don't collide on the
-                # hardcoded rendezvous port. All ranks of THIS job are handed the same value, so multi-rank
-                # rendezvous is unaffected.
-                master_port = int(os.environ.get("MASTER_PORT", 29501))
+                # Prefer driver-captured port (see training branch); default 29501
+                # only when unset so log-prob does not collide with training's 29500.
+                master_port = (
+                    self.ds_master_port
+                    if self.ds_master_port is not None
+                    else int(os.environ.get("MASTER_PORT", 29501))
+                )
                 workers = []
                 config_dict = job_config.model_dump()
                 for rank in range(gpus):

@@ -131,6 +131,12 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
     """
     global _spawned_cluster, _spawned_temp_dir
 
+    # Already inside a worker/actor of the driver's cluster — do not call
+    # ``ray.init(address="auto")``, which can attach to a leftover head on the
+    # same host and freeze a stale MASTER_PORT into subsequent DeepSpeed jobs.
+    if ray.is_initialized():
+        return
+
     # 1. Try attaching to a running cluster (only if it has GPUs).
     if auto_attach:
         try:
