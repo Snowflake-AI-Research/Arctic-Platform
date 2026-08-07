@@ -255,7 +255,9 @@ class DeepSpeedWorker:
             horizon = training_config.get("training_horizon", 0)
             if sched_cfg is not None and horizon > 0:
                 lr = opt_cfg.get("lr", 1e-5)
-                warmup_steps = sched_cfg.get("warmup_ratio", 0.0) * horizon
+                # DeepSpeed's WarmupLR/WarmupCosineLR require warmup_num_steps to
+                # be an integer; warmup_ratio * horizon is generally fractional.
+                warmup_steps = round(sched_cfg.get("warmup_ratio", 0.0) * horizon)
                 if sched_cfg.get("type", "constant") == "cosine":
                     ds_config["scheduler"] = {
                         "type": "WarmupCosineLR",
