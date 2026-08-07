@@ -63,6 +63,7 @@ dependencies = [
     "psutil",
     "pydantic>=2.10",
     "tabulate",
+    "tenacity",
     "torch",
     "tqdm",
     "transformers>=4.57.0,<5",
