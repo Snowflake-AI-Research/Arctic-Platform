@@ -5,7 +5,7 @@ end. They target different datasets:
 
 | Recipe | Task (Loss)    | Dataset |
 |---|----------------|---|
-| `sft_loop.py` | Chat SFT (CE)  | HuggingFace chat datasets with a `messages` column (default `HuggingFaceH4/no_robots`) |
+| `sft_loop.py` | Chat SFT (CE)  | HF chat datasets with a `messages` column (default `HuggingFaceH4/no_robots`) |
 | `rl_loop.py` | Math RL (GRPO) | Hendrycks MATH train; MATH-500 held out for eval |
 
 ## 1. Prerequisites
@@ -75,9 +75,9 @@ python recipes/sft_loop.py config=recipes/config.json \
 ### Change dataset
 
 ```bash
-# SFT — HF DatasetDict with train + messages column
+# SFT — HF DatasetDict with a messages column (default split: train)
 python recipes/sft_loop.py config=recipes/config.json \
-    dataset=HuggingFaceH4/ultrachat_200k
+    dataset=HuggingFaceH4/ultrachat_200k dataset_split=train_sft
 
 # RL — MATH is fixed in load_math(); swap the loader to change envs
 ```

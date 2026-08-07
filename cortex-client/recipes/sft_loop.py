@@ -61,6 +61,7 @@ class Config:
     ep_size: int | None = None
 
     dataset: str = "HuggingFaceH4/no_robots"
+    dataset_split: str = "train"
     batch_size: int = 8
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
@@ -171,7 +172,7 @@ def main(config: Config):
     logger.info("Loading dataset...")
     dataset = datasets.load_dataset(config.dataset)
     assert isinstance(dataset, datasets.DatasetDict)
-    train_dataset = dataset["train"].shuffle(seed=0)
+    train_dataset = dataset[config.dataset_split].shuffle(seed=0)
 
     n_train_batches = len(train_dataset) // config.batch_size
     n_dropped = len(train_dataset) % config.batch_size
