@@ -246,7 +246,7 @@ class Config:
     debug_image_tag: str | None = None
 
     # Evals. 0 disables; otherwise baseline at batch 0 and the final batch.
-    eval_every: int = 20
+    eval_every: int = 10
     # MATH-500 is 500 problems — None means the full split.
     n_test: int | None = None
     # uses the training temperature / max_tokens by default.
