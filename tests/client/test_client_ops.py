@@ -152,18 +152,31 @@ class TestOpMapping:
             "payload": {"drain": False, "timeout_s": 5.0, "retry_interval_s": 0.2},
         }
 
-    def test_sync_weights_targets_training_with_sub_job_ids(self, client):
-        """sync_weights -> training job; weight-sync operation with source/target payload."""
-        _call(client, "sync_weights")
-        req = _last(client)
-        assert req.op == "operation"
-        assert req.job_id == TRAINING
-        assert req.body == {
-            "operation_type": "weight-sync",
-            "sub_job_id": TRAINING,
-            "sub_job_type": "training",
-            "payload": {"source_sub_job_id": TRAINING, "target_sub_job_ids": [SAMPLING]},
+    def test_sync_weights_staged_wake_and_operation(self, client):
+        """sync_weights: wake → weight-sync operation → wake → reset-prefix-cache."""
+        _call(client, "sync_weights", cuda_ipc=True, low_memory=False)
+        ops = [r.op for r in client.transport.calls[-4:]]
+        assert ops == ["wake-inference", "operation", "wake-inference", "operation"]
+        sync_req = client.transport.calls[-3]
+        assert sync_req.job_id == TRAINING
+        assert sync_req.body["operation_type"] == "weight-sync"
+        assert sync_req.body["payload"] == {
+            "source_sub_job_id": TRAINING,
+            "target_sub_job_ids": [SAMPLING],
+            "colocate": False,
+            "cuda_ipc": True,
+            "low_memory": False,
         }
+
+    def test_sleep_wake_training_and_inference(self, client):
+        _call(client, "sleep_inference", level=2)
+        assert _last(client).op == "sleep-inference"
+        _call(client, "wake_inference", tags=["weights"])
+        assert _last(client).op == "wake-inference"
+        _call(client, "sleep_training", mode="non_lp")
+        assert _last(client).op == "sleep-training"
+        _call(client, "wake_training")
+        assert _last(client).op == "wake-training"
 
 
 class TestLifecycle:
@@ -185,15 +198,22 @@ class TestOpRegistry:
     transport's op coverage is checkable without a live backend."""
 
     def test_client_emits_exactly_the_registered_ops(self, client):
-        """Driving every client op must produce exactly the canonical OPS set."""
+        """Driving every client op must cover the canonical OPS set."""
         _call(client, "fwd_bwd", {"input_ids": [1]})
         _call(client, "fwd_no_grad", {"input_ids": [1]})
         _call(client, "step")
         _call(client, "save_checkpoint")
         _call(client, "generate", ["hi"])
         _call(client, "log_probs", ["hi"])
+        # sync_weights expands to wake + operation + wake + reset(operation)
+        n_before = len(client.transport.calls)
         _call(client, "sync_weights")
+        assert {"wake-inference", "operation"} <= {r.op for r in client.transport.calls[n_before:]}
         _call(client, "reset_prefix_cache")
+        _call(client, "sleep_inference")
+        _call(client, "wake_inference")
+        _call(client, "sleep_training")
+        _call(client, "wake_training")
         assert {req.op for req in client.transport.calls} == OPS
 
     def test_unresolved_ops_flags_a_missing_method(self):
