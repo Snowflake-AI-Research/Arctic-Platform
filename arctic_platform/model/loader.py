@@ -28,6 +28,7 @@ import torch.nn as nn
 from arctic_platform.model.config import ModelSpec
 
 if TYPE_CHECKING:
+    from pydantic import BaseModel
     from transformers import PretrainedConfig
 
 
@@ -71,14 +72,24 @@ Matcher = Callable[[LoaderContext], bool]
 class _LoaderEntry:
     fn: Loader
     matches: Matcher | None
+    options: type[BaseModel] | None = None
 
 
 _LOADERS: dict[str, _LoaderEntry] = {}
 _DEFAULT_LOADER: str | None = None
 
 
-def register_loader(name: str, matches: Matcher | None = None, default: bool = False) -> Callable[[Loader], Loader]:
-    """Register a loader by name. Optionally give it a ``matches`` predicate or mark it the ``default``."""
+def register_loader(
+    name: str,
+    matches: Matcher | None = None,
+    default: bool = False,
+    options: type[BaseModel] | None = None,
+) -> Callable[[Loader], Loader]:
+    """Register a loader by name.
+
+    Optionally give it a ``matches`` predicate, mark it the ``default``, or attach an
+    ``options`` pydantic model used to validate ``ModelSpec.loader_options``.
+    """
 
     def decorator(fn: Loader) -> Loader:
         global _DEFAULT_LOADER
@@ -86,7 +97,7 @@ def register_loader(name: str, matches: Matcher | None = None, default: bool = F
         if default:
             assert _DEFAULT_LOADER is None, f"default loader already registered: {_DEFAULT_LOADER!r}"
             _DEFAULT_LOADER = name
-        _LOADERS[name] = _LoaderEntry(fn=fn, matches=matches)
+        _LOADERS[name] = _LoaderEntry(fn=fn, matches=matches, options=options)
         return fn
 
     return decorator
@@ -94,6 +105,11 @@ def register_loader(name: str, matches: Matcher | None = None, default: bool = F
 
 def is_registered_loader(name: str) -> bool:
     return name in _LOADERS
+
+
+def get_loader_options_model(name: str) -> type[BaseModel] | None:
+    """Return the pydantic options model registered for a loader, if any."""
+    return _LOADERS[name].options
 
 
 def resolve_loader_name(spec: ModelSpec) -> str:

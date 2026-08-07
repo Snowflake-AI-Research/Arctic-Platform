@@ -1,0 +1,15 @@
+NOTICE
+
+Portions of this directory (arctic_platform/model/implementations/qwen35) are copied and
+adapted from prime-rl, developed by Prime Intellect and licensed under the Apache
+License, Version 2.0:
+
+    https://github.com/PrimeIntellect-ai/prime-rl
+    Copyright (c) Prime Intellect, Inc.
+
+Some files additionally derive from torchtitan (Copyright (c) Meta Platforms, Inc.),
+also under the Apache License, Version 2.0, and retain their original per-file headers.
+
+This code has been modified (for example: adapting the model to run with DeepSpeed,
+adjusted import paths, and slimming to the Qwen3.5-MoE model provider). See the
+repository-root LICENSE for the full Apache License, Version 2.0 terms.
