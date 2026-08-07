@@ -1226,7 +1226,15 @@ async def _stream_subprocess(cmd, env=None, stdin=None, timeout=None, quiet=Fals
 
 
 def execute_subprocess_async(cmd, env=None, stdin=None, timeout=180, quiet=False, echo=True) -> _RunOutput:
-    loop = asyncio.get_event_loop()
+    # Prefer a fresh loop: after async client / Ray tests, get_event_loop() can
+    # raise "There is no current event loop" (loop was closed, _set_called=True).
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("closed")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
     result = loop.run_until_complete(
         _stream_subprocess(cmd, env=env, stdin=stdin, timeout=timeout, quiet=quiet, echo=echo)
     )

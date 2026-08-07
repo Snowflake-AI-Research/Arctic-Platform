@@ -147,6 +147,9 @@ class TestInitFailureShutdown(TestCasePlus):
             def call(self, request: Request) -> dict:
                 return {}
 
+            async def acall(self, request: Request) -> dict:
+                return {}
+
             def shutdown(self) -> None:
                 self.shutdown_calls += 1
 
