@@ -11,8 +11,8 @@ end. They target different datasets:
 ## 1. Prerequisites
 
 ```bash
-pip install -e cortex-client
-pip install tinker-cookbook
+uv pip install -e cortex-client
+uv pip install 'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
 ```
 
 We assume you have the config we've provided under `recipes/config.json`.
