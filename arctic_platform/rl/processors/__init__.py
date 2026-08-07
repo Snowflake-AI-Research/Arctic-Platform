@@ -80,6 +80,13 @@ from .pipeline import register_loss_fn
 from .pipeline import register_post_processor
 from .pipeline import run_pipeline
 
+# SFT loss + pipeline (importing registers "sft" / "sft_ce" into LOSS_FNS)
+from .sft import LOGIT_LOSS_FNS
+from .sft import SFT_LOSS_FNS
+from .sft import run_sft_pipeline
+from .sft import sft_ce_loss
+from .sft import sft_loss
+
 # Stats tracker
 from .stats_tracker import DEFAULT_TRACKER
 from .stats_tracker import TRACKERS
@@ -94,13 +101,6 @@ from .stats_tracker import scalar
 from .stats_tracker import scope
 from .stats_tracker import stat
 from .verl_grpo import verl_grpo_loss
-
-# SFT loss + pipeline (importing registers "sft" / "sft_ce" into LOSS_FNS)
-from .sft import LOGIT_LOSS_FNS
-from .sft import SFT_LOSS_FNS
-from .sft import run_sft_pipeline
-from .sft import sft_ce_loss
-from .sft import sft_loss
 
 __all__ = [
     # pipeline

@@ -15,6 +15,6 @@
 
 """Back-compat shim — prefer ``arctic_platform.sft.client``."""
 
+from arctic_platform.sft.client import ArcticSFTClient  # noqa: F401
 from arctic_platform.sft.client import *  # noqa: F401,F403
-from arctic_platform.sft.client import ArcticSFTClient
-from arctic_platform.sft.client import create_arctic_sft_client
+from arctic_platform.sft.client import create_arctic_sft_client  # noqa: F401

@@ -46,10 +46,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from arctic_platform.sft.config import ArcticSFTClientConfig
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
 from arctic_platform.client.transport import initialize_or_cleanup
+from arctic_platform.sft.config import ArcticSFTClientConfig
 
 
 def _make_transport(config: ArcticSFTClientConfig) -> Transport:
@@ -165,17 +165,13 @@ class ArcticSFTClient:
         return self.transport.call(Request("reset-prefix-cache", self.jobs.require("sampling"), body))
 
     def sleep_inference(self, level: int = 1) -> dict:
-        return self.transport.call(
-            Request("sleep-inference", self.jobs.require("sampling"), {"level": level})
-        )
+        return self.transport.call(Request("sleep-inference", self.jobs.require("sampling"), {"level": level}))
 
     def wake_inference(self, tags: list | None = None) -> dict:
         return self.transport.call(Request("wake-inference", self.jobs.require("sampling"), tags))
 
     def sleep_training(self, mode: str = "all") -> dict:
-        return self.transport.call(
-            Request("sleep-training", self.jobs.require("training"), {"mode": mode})
-        )
+        return self.transport.call(Request("sleep-training", self.jobs.require("training"), {"mode": mode}))
 
     def wake_training(self) -> dict:
         return self.transport.call(Request("wake-training", self.jobs.require("training"), {}))

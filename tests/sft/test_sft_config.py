@@ -53,9 +53,7 @@ class TestArcticSFTClientConfig(TestCasePlus):
 
     def test_extra_fields_forbidden(self):
         with self.assertRaises(ValidationError):
-            ArcticSFTClientConfig(
-                model_name="m", training_gpus=1, checkpoint_path="/tmp/c", bogus=1
-            )
+            ArcticSFTClientConfig(model_name="m", training_gpus=1, checkpoint_path="/tmp/c", bogus=1)
 
     def test_sampling_fields_forwarded(self):
         cfg = ArcticSFTClientConfig(

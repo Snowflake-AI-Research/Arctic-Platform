@@ -31,7 +31,6 @@ import argparse
 import contextlib
 import tempfile
 
-import torch
 from transformers import AutoTokenizer
 
 from arctic_platform.sft import ArcticSFTClient

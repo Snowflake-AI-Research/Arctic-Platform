@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import pytest
 
-from arctic_platform.sft import ArcticSFTClient
-from arctic_platform.sft import ArcticSFTClientConfig
 from arctic_platform.client import JobHandles
 from arctic_platform.client import Request
 from arctic_platform.client import Transport
+from arctic_platform.sft import ArcticSFTClient
+from arctic_platform.sft import ArcticSFTClientConfig
 from arctic_platform.sft import client as sft_client_module
 
 TRAINING = 1
@@ -185,9 +185,7 @@ class TestSFTTransportSelection:
     def test_make_transport_selects_http(self):
         from arctic_platform.client.transports.onprem_http import HttpTransport
 
-        cfg = ArcticSFTClientConfig(
-            model_name="m", training_gpus=1, checkpoint_path="/tmp/c", comm_protocol="http"
-        )
+        cfg = ArcticSFTClientConfig(model_name="m", training_gpus=1, checkpoint_path="/tmp/c", comm_protocol="http")
         assert isinstance(sft_client_module._make_transport(cfg), HttpTransport)
 
     def test_make_transport_selects_ray(self, monkeypatch):
@@ -198,9 +196,7 @@ class TestSFTTransportSelection:
                 self.config = config
 
         monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
-        cfg = ArcticSFTClientConfig(
-            model_name="m", training_gpus=1, checkpoint_path="/tmp/c", comm_protocol="ray"
-        )
+        cfg = ArcticSFTClientConfig(model_name="m", training_gpus=1, checkpoint_path="/tmp/c", comm_protocol="ray")
         assert isinstance(sft_client_module._make_transport(cfg), DummyRay)
 
     def test_to_rl_config_disables_sampling_and_log_prob(self):

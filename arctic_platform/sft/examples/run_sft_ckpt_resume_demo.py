@@ -1,6 +1,18 @@
-#!/usr/bin/env python
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """TEMPORARY: save → eval → train-more → load → eval parity + HF export (A1/A2).
 
 Client stays CPU-blanked (``CUDA_VISIBLE_DEVICES=``); server uses
@@ -137,9 +149,7 @@ def main() -> None:
         _train_steps(client, batch, args.post_save_steps, "post")
         eval_b = _eval_loss(client, batch)
         print(f"eval_b (after more train)={eval_b:.8g}")
-        assert abs(eval_b - eval_a) > 1e-5, (
-            f"weights did not move enough after more training: a={eval_a} b={eval_b}"
-        )
+        assert abs(eval_b - eval_a) > 1e-5, f"weights did not move enough after more training: a={eval_a} b={eval_b}"
 
         load_resp = client.load_checkpoint(step=save_step)
         restored = int(load_resp.get("global_step") or 0)
@@ -149,9 +159,9 @@ def main() -> None:
         eval_c = _eval_loss(client, batch)
         print(f"eval_c (after load)={eval_c:.8g}")
         delta = abs(eval_c - eval_a)
-        assert delta <= args.atol, (
-            f"eval loss after resume drifted: a={eval_a} c={eval_c} delta={delta} atol={args.atol}"
-        )
+        assert (
+            delta <= args.atol
+        ), f"eval loss after resume drifted: a={eval_a} c={eval_c} delta={delta} atol={args.atol}"
 
         # Resume continues: one more fwd_bwd+step must succeed.
         _train_steps(client, batch, 1, "resume")

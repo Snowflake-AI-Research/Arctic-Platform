@@ -20,8 +20,6 @@ documented bugs (or regressions), not flaky noise.
 
 from __future__ import annotations
 
-import ast
-import inspect
 from pathlib import Path
 
 import pytest
@@ -101,12 +99,7 @@ class TestMissingLabels(TestCasePlus):
 class TestDispatchDrift(TestCasePlus):
     def test_worker_dispatches_via_sft_loss_fns(self):
         """deepspeed_worker resolves SFT vs GRPO against SFT_LOSS_FNS (no drift)."""
-        worker_path = (
-            Path(__file__).resolve().parents[2]
-            / "arctic_platform"
-            / "common"
-            / "deepspeed_worker.py"
-        )
+        worker_path = Path(__file__).resolve().parents[2] / "arctic_platform" / "common" / "deepspeed_worker.py"
         src = worker_path.read_text()
         # Fixed: dispatch resolves against the canonical registry set instead of
         # an inline ``loss_fn in ("sft", "sft_ce")`` tuple, so new SFT losses
@@ -137,11 +130,10 @@ class TestCheckpointPathRequired(TestCasePlus):
 
 class TestInitFailureShutdown(TestCasePlus):
     def test_initialize_failure_calls_shutdown(self):
-        from arctic_platform.sft import client as sft_client_module
-        from arctic_platform.sft.client import ArcticSFTClient
         from arctic_platform.client import JobHandles
         from arctic_platform.client import Request
         from arctic_platform.client import Transport
+        from arctic_platform.sft.client import ArcticSFTClient
 
         class BoomTransport(Transport):
             def __init__(self, config):
@@ -172,15 +164,9 @@ class TestInitFailureShutdown(TestCasePlus):
         mod._make_transport = factory
         try:
             with pytest.raises(RuntimeError, match="init failed"):
-                ArcticSFTClient(
-                    ArcticSFTClientConfig(
-                        model_name="m", training_gpus=1, checkpoint_path="/tmp/c"
-                    )
-                )
+                ArcticSFTClient(ArcticSFTClientConfig(model_name="m", training_gpus=1, checkpoint_path="/tmp/c"))
             assert boom is not None
-            assert boom.shutdown_calls == 1, (
-                f"expected shutdown on init failure, got {boom.shutdown_calls}"
-            )
+            assert boom.shutdown_calls == 1, f"expected shutdown on init failure, got {boom.shutdown_calls}"
         finally:
             mod._make_transport = original
 
@@ -209,13 +195,7 @@ class TestCommonPackageExports(TestCasePlus):
 
 class TestSftExampleIsCanonical(TestCasePlus):
     def test_example_uses_sft_client_not_rl(self):
-        path = (
-            Path(__file__).resolve().parents[2]
-            / "arctic_platform"
-            / "sft"
-            / "examples"
-            / "sft_example.py"
-        )
+        path = Path(__file__).resolve().parents[2] / "arctic_platform" / "sft" / "examples" / "sft_example.py"
         src = path.read_text()
         # Fixed: the example uses the SFT client + SFT wire format, no stale path.
         self.assertIn("ArcticSFTClient", src)
@@ -226,8 +206,8 @@ class TestSftExampleIsCanonical(TestCasePlus):
 
 class TestSamplePackingKwargs(TestCasePlus):
     def test_packed_batch_forwards_position_ids_omits_all_ones_mask(self):
-        from arctic_platform.sft.processor import _build_sft_model_kwargs
         from arctic_platform.sft.processor import _batch_is_packed
+        from arctic_platform.sft.processor import _build_sft_model_kwargs
 
         # Two packed docs: positions reset at the boundary (index 3).
         pos = torch.tensor([[0, 1, 2, 0, 1, 2, 3]])
@@ -254,9 +234,7 @@ class TestSamplePackingKwargs(TestCasePlus):
             "position_ids": torch.tensor([[0, 1, 2, 0, 1, 2]]),
             "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0]]),  # trailing pad
         }
-        kw = _build_sft_model_kwargs(
-            batch, {"sample_packing": True}, batch["labels"], need_logits=False
-        )
+        kw = _build_sft_model_kwargs(batch, {"sample_packing": True}, batch["labels"], need_logits=False)
         self.assertIn("position_ids", kw)
         self.assertIn("attention_mask", kw)
 
@@ -360,12 +338,7 @@ class TestGasMicrobatchList(TestCasePlus):
 
 class TestPerfFixesUnit(TestCasePlus):
     def test_h7_worker_sets_gas_accumulation_boundary(self):
-        worker_path = (
-            Path(__file__).resolve().parents[2]
-            / "arctic_platform"
-            / "common"
-            / "deepspeed_worker.py"
-        )
+        worker_path = Path(__file__).resolve().parents[2] / "arctic_platform" / "common" / "deepspeed_worker.py"
         src = worker_path.read_text()
         self.assertIn("set_gradient_accumulation_boundary", src)
         # Bound immediately before run_sft_pipeline in the SFT microbatch loop.
@@ -376,23 +349,13 @@ class TestPerfFixesUnit(TestCasePlus):
         self.assertIn("if use_sft_pipeline:", window)
 
     def test_h4_move_batch_uses_non_blocking(self):
-        worker_path = (
-            Path(__file__).resolve().parents[2]
-            / "arctic_platform"
-            / "common"
-            / "deepspeed_worker.py"
-        )
+        worker_path = Path(__file__).resolve().parents[2] / "arctic_platform" / "common" / "deepspeed_worker.py"
         src = worker_path.read_text()
         self.assertIn("non_blocking=True", src)
         self.assertIn("pin_memory()", src)
 
     def test_h3_worker_accepts_microbatch_list_without_split_dict(self):
-        worker_path = (
-            Path(__file__).resolve().parents[2]
-            / "arctic_platform"
-            / "common"
-            / "deepspeed_worker.py"
-        )
+        worker_path = Path(__file__).resolve().parents[2] / "arctic_platform" / "common" / "deepspeed_worker.py"
         src = worker_path.read_text()
         self.assertIn("isinstance(batch_data, list)", src)
         self.assertIn("Received", src)  # length mismatch error

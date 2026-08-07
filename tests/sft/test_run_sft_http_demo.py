@@ -76,9 +76,7 @@ class TestBuildBatchProcessingWire(TestCasePlus):
             logits_optimization_peak_mem_size_in_gib=7,
         )
         self.assertEqual(env["processing"]["config"]["logits_optimization"], "compute")
-        self.assertEqual(
-            env["processing"]["config"]["logits_optimization_peak_mem_size_in_gib"], 7
-        )
+        self.assertEqual(env["processing"]["config"]["logits_optimization_peak_mem_size_in_gib"], 7)
 
     def test_sft_ce_none_omits_config(self):
         env = self._build(loss_fn="sft_ce", logits_optimization="none")

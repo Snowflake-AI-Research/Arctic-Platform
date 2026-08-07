@@ -356,4 +356,3 @@ class TestSftCeSumFromHiddenErrors(TestCasePlus):
         )
         with self.assertRaises(ValueError):
             sft_ce_sum_from_hidden(model, torch.randn(1, 3, 4), torch.zeros(1, 3, dtype=torch.long), mode="none")
-

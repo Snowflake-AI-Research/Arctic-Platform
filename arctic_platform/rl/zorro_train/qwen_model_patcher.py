@@ -39,6 +39,14 @@ from transformers.modeling_outputs import ModelOutput
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from arctic_platform.common.utils.tiled_logits import TiledLogProbEntropy
+from arctic_platform.common.utils.tiled_logits import (
+    chunked_logprobs_entropy_from_hidden as chunked_entropy_and_logprobs_with_temperature_from_logits,
+)
+from arctic_platform.common.utils.tiled_logits import logits_chunk_rows as _logits_chunk_rows
+from arctic_platform.common.utils.tiled_logits import (
+    tiled_logprobs_entropy_from_hidden as tiled_entropy_and_logprobs_with_temperature_from_logits,
+)
 from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.debug import see_memory_usage
 from arctic_platform.rl.zorro_train.module_patcher import ModuleReconstructionPatcher
@@ -999,27 +1007,6 @@ class Qwen3ModelPatcher(ModuleReconstructionPatcher):
 
 def ceildiv(a, b):
     return -(a // -b)
-
-
-# Memory-efficient logits / CE primitives now live in ``common`` so SFT (sft_ce)
-# can reuse them. Imported here under their historical names to keep every RL
-# call site (and any external references) working unchanged.
-from arctic_platform.common.utils.tiled_logits import TiledLogProbEntropy  # noqa: E402
-from arctic_platform.common.utils.tiled_logits import (  # noqa: E402
-    chunked_logprobs_entropy_from_hidden as chunked_entropy_and_logprobs_with_temperature_from_logits,
-)
-from arctic_platform.common.utils.tiled_logits import (  # noqa: E402
-    logits_chunk_rows as _logits_chunk_rows,
-)
-from arctic_platform.common.utils.tiled_logits import (  # noqa: E402
-    logprobs_entropy_from_flat_logits as _logprobs_and_entropy_from_flat_logits,
-)
-from arctic_platform.common.utils.tiled_logits import (  # noqa: E402
-    lm_head_logits as _lm_head_logits_with_temperature,
-)
-from arctic_platform.common.utils.tiled_logits import (  # noqa: E402
-    tiled_logprobs_entropy_from_hidden as tiled_entropy_and_logprobs_with_temperature_from_logits,
-)
 
 
 class GradientAccumulator:

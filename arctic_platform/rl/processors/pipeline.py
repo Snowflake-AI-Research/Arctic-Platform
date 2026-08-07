@@ -55,11 +55,20 @@ from typing import Any
 
 import torch
 
+# Shared registries live in arctic_platform.common.registry (used by RL + SFT).
+from arctic_platform.common.registry import LOSS_FNS
+from arctic_platform.common.registry import POST_PROCESSORS
+from arctic_platform.common.registry import _resolve_fn
+from arctic_platform.common.registry import register_loss_fn  # noqa: F401  # re-exported
+from arctic_platform.common.registry import register_post_processor
+from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
 from arctic_platform.rl.utils.batch import detensorize
 from arctic_platform.rl.utils.batch import log_dp_shard_tokens
 from arctic_platform.rl.utils.debug import ProfilerContext
 from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.debug import see_memory_usage
+
+from .microbatch import DEFAULT_MAX_TOKENS_PER_MB
 
 try:
     from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
@@ -67,11 +76,6 @@ try:
     FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = True
 except ImportError:
     FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
-
-
-from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
-
-from .microbatch import DEFAULT_MAX_TOKENS_PER_MB
 
 # PROFILER_TYPE = "c"
 # PROFILER_TYPE = "torch"
@@ -87,18 +91,6 @@ else:
     from arctic_platform.rl.utils.debug import SynchronizedWallClockTimerSimpleDummy
 
     timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
-
-
-# ---------------------------------------------------------------------------
-# Registries
-# ---------------------------------------------------------------------------
-
-# Shared registries live in arctic_platform.common.registry (used by RL + SFT).
-from arctic_platform.common.registry import LOSS_FNS
-from arctic_platform.common.registry import POST_PROCESSORS
-from arctic_platform.common.registry import _resolve_fn
-from arctic_platform.common.registry import register_loss_fn
-from arctic_platform.common.registry import register_post_processor
 
 
 def padded_tensor_2d_to_unpadded_tensor_1d(tensor_2d, attention_mask_2d_bool):

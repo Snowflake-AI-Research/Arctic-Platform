@@ -189,11 +189,7 @@ def main() -> None:
     )
     print(f"batch input_ids shape={tuple(batch['batch']['input_ids'].shape)} (CPU)")
 
-    ckpt_ctx = (
-        tempfile.TemporaryDirectory(prefix="arl_sft_ckpt_")
-        if args.checkpoint_dir is None
-        else None
-    )
+    ckpt_ctx = tempfile.TemporaryDirectory(prefix="arl_sft_ckpt_") if args.checkpoint_dir is None else None
     ckpt = args.checkpoint_dir or ckpt_ctx.name  # type: ignore[union-attr]
 
     config = ArcticSFTClientConfig(
