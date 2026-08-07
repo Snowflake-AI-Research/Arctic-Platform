@@ -205,9 +205,28 @@ class TestLoadCheckpoint:
             "job-1",
             checkpoint_id="cp-42",
             source_job_id="source-job",
+            target_sub_job_id=None,
         )
         client.poll_request.assert_called_once_with("job-1", "req-load-1")
         assert result == {"checkpoint_id": "cp-42"}
+
+    def test_forwards_target_sub_job_id(self):
+        engine, client = _make_engine()
+        client.load.return_value = "req-load-2"
+        client.poll_request.return_value = {"checkpoint_id": "cp-42"}
+
+        engine.load_checkpoint(
+            "cp-42",
+            target_sub_job_id="job-1:training:1",
+        )
+
+        client.load.assert_called_once_with(
+            "job-1",
+            checkpoint_id="cp-42",
+            source_job_id=None,
+            target_sub_job_id="job-1:training:1",
+        )
+        client.poll_request.assert_called_once_with("job-1", "req-load-2")
 
 
 # ---------------------------------------------------------------------------

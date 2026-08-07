@@ -236,6 +236,62 @@ To load from another job's checkpoint store:
 dss-neutrino --job-id JOB_ID load CHECKPOINT_ID --source-job-id SOURCE_JOB_ID
 ```
 
+To load into a specific training sub-job (useful for multi-sub-job sessions):
+
+```bash
+dss-neutrino --job-id JOB_ID load CHECKPOINT_ID --target-sub-job-id JOB_ID:training:0
+```
+
+When `--target-sub-job-id` is omitted, the control plane routes the load to the
+session's training sub-job. Sampling sub-jobs are not valid targets.
+
+#### Discovering Sub-Job IDs
+
+To find available training sub-jobs in a session:
+
+```python
+job = client.get_job(job_id)
+for sub_job in job["sub_jobs"]:
+    if sub_job["job_type"] == "training":
+        sub_job_id = sub_job["sub_job_id"]
+        n_gpus = sub_job["training_config"]["n_gpus"]
+        print(f"Training sub-job: {sub_job_id} (DP={n_gpus})")
+```
+
+Or via CLI:
+
+```bash
+dss-neutrino --job-id JOB_ID get | jq '.sub_jobs[] | select(.job_type=="training") | {sub_job_id, n_gpus: .training_config.n_gpus}'
+```
+
+#### When to Use target-sub-job-id
+
+Most sessions have a single training sub-job, so `--target-sub-job-id` can be
+omitted. Use it when:
+
+- Your session has multiple training sub-jobs (multi-DP configurations)
+- You need to load different checkpoints into different sub-jobs
+- You want explicit control over which sub-job receives the checkpoint
+
+#### DP Size Compatibility
+
+If loading a checkpoint into a sub-job with a **different DP size** (different
+`n_gpus`) than the checkpoint was saved from, the job **must** have been created
+with `load_optimizer_states=False`:
+
+```python
+training = SubJobConfig.training_job(
+    model_name="...",
+    n_gpus=16,  # Different from source checkpoint's DP size
+    load_optimizer_states=False,  # REQUIRED for DP size change
+    ...
+)
+```
+
+This setting is configured at **job creation time** and cannot be changed later.
+The optimizer states are DP-sharded and cannot be resized. If you forget this,
+the load will fail at runtime.
+
 This is the runtime load path. Create-time resume still uses
 `source_checkpoint_info` in the submitted sub-job JSON.
 

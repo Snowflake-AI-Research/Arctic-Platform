@@ -128,6 +128,25 @@ def test_encode_byte_chunks_single_frame_when_unbounded():
     assert wire.encode_byte_chunks(frame, kind="request", max_bytes=0) == [frame]
 
 
+def test_encode_byte_chunks_can_force_single_chunk_request_envelope():
+    frame = wire.dumps({"x": torch.tensor([1])})
+    chunks = wire.encode_byte_chunks(
+        frame,
+        kind="request",
+        operation="fwd-bwd",
+        max_bytes=16_384,
+        chunk_group_id="group-a",
+        force_chunk=True,
+    )
+
+    assert len(chunks) == 1
+    metadata = wire.read_byte_chunk_metadata(chunks[0])
+    assert metadata["chunk_group_id"] == "group-a"
+    assert metadata["chunk_idx"] == 0
+    assert metadata["total_chunks"] == 1
+    assert wire.decode_byte_chunks(chunks, kind="request") == frame
+
+
 def test_encode_byte_chunks_and_decodes_roundtrip():
     original = wire.dumps({"x": torch.arange(2048, dtype=torch.int64)})
     chunks = wire.encode_byte_chunks(

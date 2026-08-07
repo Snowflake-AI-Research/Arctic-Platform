@@ -252,6 +252,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Load the checkpoint from another job's checkpoint store.",
     )
     load.add_argument(
+        "--target-sub-job-id",
+        dest="target_sub_job_id",
+        help=(
+            "Training sub-job to load the checkpoint into, e.g. JOB_ID:training:0. "
+            "Use this for sessions with multiple training sub-jobs when you need "
+            "explicit routing control. Omit to use the default training sub-job. "
+            "Use 'dss-neutrino --job-id JOB_ID get' to discover available sub-job IDs."
+        ),
+    )
+    load.add_argument(
         "--no-poll",
         action="store_true",
         help="Print the request id without polling for completion.",
@@ -293,6 +303,11 @@ def build_parser() -> argparse.ArgumentParser:
     weight_sync.add_argument(
         "--operation-sub-job-type",
         help="Sub-job type used to route the operation envelope.",
+    )
+    weight_sync.add_argument(
+        "--weight-format",
+        choices=("vllm", "hf", "lora"),
+        help="Weight sync payload format. Use 'lora' for adapter-only sync.",
     )
     weight_sync.add_argument(
         "--no-poll",
@@ -709,6 +724,7 @@ def _cmd_load(args: argparse.Namespace, client, stdout: TextIO) -> int:
         args.job,
         checkpoint_id=args.checkpoint_id,
         source_job_id=args.source_job_id,
+        target_sub_job_id=args.target_sub_job_id,
     )
     response = {
         "checkpoint_id": args.checkpoint_id,
@@ -717,6 +733,8 @@ def _cmd_load(args: argparse.Namespace, client, stdout: TextIO) -> int:
     }
     if args.source_job_id is not None:
         response["source_job_id"] = args.source_job_id
+    if args.target_sub_job_id is not None:
+        response["target_sub_job_id"] = args.target_sub_job_id
     if not args.no_poll:
         response["result"] = client.poll_request(args.job, request_id)
 
@@ -789,6 +807,7 @@ def _cmd_weight_sync(args: argparse.Namespace, client, stdout: TextIO) -> int:
         args.job,
         source_sub_job_id=source_sub_job_id,
         target_sub_job_ids=target_sub_job_ids,
+        weight_format=args.weight_format,
         sub_job_id=args.operation_sub_job_id,
         sub_job_type=args.operation_sub_job_type,
     )
@@ -798,6 +817,8 @@ def _cmd_weight_sync(args: argparse.Namespace, client, stdout: TextIO) -> int:
         "source_sub_job_id": source_sub_job_id,
         "target_sub_job_ids": target_sub_job_ids,
     }
+    if args.weight_format is not None:
+        response["weight_format"] = args.weight_format
     if not args.no_poll:
         response["result"] = client.poll_request(args.job, request_id)
 

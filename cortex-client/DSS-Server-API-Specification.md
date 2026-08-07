@@ -563,6 +563,22 @@ Typical result:
 
 `last_lr` may be a scalar or list depending on the backend.
 
+When per-step peak-memory reporting is enabled (see
+[section 8.5](#85-memory-diagnostics-settings)), the result also carries a
+`peak_memory` object of byte counts:
+
+```json
+{
+  "global_steps": 12,
+  "last_lr": 0.00002,
+  "peak_memory": {"gpu_peak": 123456789, "cpu_peak": 987654321}
+}
+```
+
+`gpu_peak` is the job-wide maximum GPU high-water mark across ranks for the
+current `/forward-backward` plus `/step` cycle; `cpu_peak` is rank 0's current
+process RSS. The key is absent when the setting is disabled.
+
 ### 6.3 Save checkpoint - `POST /{job_id}/save`
 
 ```json
@@ -602,23 +618,61 @@ This endpoint was missing from the previous document.
 ```json
 {
   "checkpoint_id": "global_step12",
-  "source_job_id": "optional-source-job"
+  "source_job_id": "optional-source-job",
+  "target_sub_job_id": "optional-job-id:training:0"
 }
 ```
 
 `checkpoint_id` is required. `source_job_id` loads from another job's checkpoint
-store. The route is asynchronous:
+store. `target_sub_job_id` routes the load to a specific training sub-job of the
+session. The route is asynchronous:
 
 ```python
 request_id = client.load(
     job_id,
     checkpoint_id="global_step12",
     source_job_id=source_job_id,
+    target_sub_job_id=f"{job_id}:training:0",  # optional
 )
 result = client.poll_request(job_id, request_id)
 ```
 
-The current control plane routes runtime load to a training sub-job.
+When `target_sub_job_id` is omitted, the control plane routes the load to the
+session's training sub-job (the historical behavior). When supplied, the sub-job
+must belong to this session — otherwise the request fails with `400` — and must
+be a training sub-job; loading into a non-training (e.g. sampling) zone is
+rejected with `501`.
+
+#### Discovering sub-job IDs
+
+Sub-job IDs follow the format `{job_id}:{job_type}:{index}`, for example:
+`b1fcb345:training:0`. To discover available training sub-jobs:
+
+```python
+job = client.get_job(job_id)
+training_sub_jobs = [
+    sj for sj in job["sub_jobs"] if sj["job_type"] == "training"
+]
+for sj in training_sub_jobs:
+    print(f"ID: {sj['sub_job_id']}, DP size: {sj['training_config']['n_gpus']}")
+```
+
+#### When to use target_sub_job_id
+
+Most sessions have a single training sub-job, so omit `target_sub_job_id` to use
+the default. Use it when:
+
+- The session has multiple training sub-jobs
+- You need to load different checkpoints into different sub-jobs
+- You want explicit routing control
+
+#### DP size compatibility
+
+If the target sub-job has a different `n_gpus` than the checkpoint's source
+sub-job (changing DP size), the target sub-job **must** have been created with
+`load_optimizer_states: false` in its `SubJobConfig`. The optimizer states are
+DP-sharded and cannot be resized. This is a **creation-time** setting; it cannot
+be changed at runtime. The server will reject incompatible loads.
 
 ### 6.5 Create-time checkpoint initialization
 
@@ -639,6 +693,12 @@ credentials; clients should not provide credentials themselves.
 
 Sampling initialization requires a `weights-only` checkpoint. The source job no
 longer needs to be running after the checkpoint has been saved.
+
+For training initialization from a `resumable` checkpoint, set
+`training_config.load_optimizer_states=false` (see
+[section 8.2](#82-trainingconfig)) to restore weights only with a fresh
+optimizer. This is required when the new job changes data-parallel size, since
+the DP-sharded optimizer cannot be resized.
 
 ### 6.6 Generate - `POST /{job_id}/generate`
 
@@ -861,7 +921,8 @@ unit-tested, but byte-based `forward()` is not presently end-to-end compatible.
   "sub_job_type": "training",
   "payload": {
     "source_sub_job_id": "job-id:training:0",
-    "target_sub_job_ids": ["job-id:sampling:0"]
+    "target_sub_job_ids": ["job-id:sampling:0"],
+    "weight_format": "vllm"
   }
 }
 ```
@@ -869,7 +930,55 @@ unit-tested, but byte-based `forward()` is not presently end-to-end compatible.
 `weight_sync()` defaults operation routing to the source training sub-job and
 returns the `request_id` string.
 
-### 7.3 Bootstrap router replay
+Optional payload fields:
+
+- `weight_format`: `"vllm"` (default on server) | `"hf"` for full-model
+  weights. For adapter-only synchronization, see
+  [section 7.3](#73-lora-adapter-sync).
+
+### 7.3 LoRA adapter sync
+
+LoRA synchronization uses the same `weight-sync` operation, but it requires
+LoRA to be enabled on both sub-jobs when they are created. It is not sufficient
+to change only `weight_format` at sync time:
+
+- The training sub-job's `training_config.peft_config` applies PEFT and makes
+  the LoRA adapter parameters trainable.
+- The sampling sub-job's `inference_config.peft_config` enables the vLLM LoRA
+  manager at engine startup.
+- The sampling configuration must match the training adapter's `r`,
+  `lora_alpha`, and `target_modules`. Reusing the same configuration object for
+  both sub-jobs is the simplest way to keep them aligned.
+
+The sync request transfers only the trained adapter tensors:
+
+```json
+{
+  "operation_type": "weight-sync",
+  "sub_job_id": "job-id:training:0",
+  "sub_job_type": "training",
+  "payload": {
+    "source_sub_job_id": "job-id:training:0",
+    "target_sub_job_ids": ["job-id:sampling:0"],
+    "weight_format": "lora"
+  }
+}
+```
+
+Subsequent syncs replace the resident adapter under the same stable adapter
+identity.
+
+CLI equivalent:
+
+```bash
+dss-neutrino --job-id JOB_ID weight-sync \
+  --weight-format lora
+```
+
+See [section 13.5](#135-enable-lora-training-and-adapter-sync) for the complete
+create, train, sync, and generate workflow.
+
+### 7.4 Bootstrap router replay
 
 ```json
 {
@@ -890,7 +999,7 @@ For a mixed training/sampling job, pass `sub_job_id=target_sub_job_id` (or the
 matching `sub_job_type`) because the low-level client does not infer the
 operation receiver.
 
-### 7.4 Router replay discard
+### 7.5 Router replay discard
 
 This API was missing from the previous document.
 
@@ -909,7 +1018,7 @@ This API was missing from the previous document.
 fields. Explicit `extra["sample_ids"]` takes precedence over the method's
 `sample_ids` argument.
 
-### 7.5 Reset prefix cache
+### 7.6 Reset prefix cache
 
 ```json
 {
@@ -927,7 +1036,7 @@ fields. Explicit `extra["sample_ids"]` takes precedence over the method's
 The shown payload values are the client defaults. `extra` can supply new
 backend fields and override `drain`.
 
-### 7.6 Cancel request
+### 7.7 Cancel request
 
 ```json
 {
@@ -942,7 +1051,7 @@ With a self-describing request id, the server can recover the owning sub-job.
 For legacy ids, omitting a sub-job hint causes server-side fan-out across the
 job's sub-jobs.
 
-### 7.7 Tail logs
+### 7.8 Tail logs
 
 ```json
 {
@@ -968,7 +1077,7 @@ Response:
 `stream_logs()` repeatedly calls this operation. With `follow=False`, it stops
 at an empty EOF page; with `follow=True`, it keeps polling.
 
-### 7.8 Unsupported `zmd-events` client helper
+### 7.9 Unsupported `zmd-events` client helper
 
 `NeutrinoClient.tail_events()` and `stream_events()` currently send:
 
@@ -1026,10 +1135,35 @@ Optional typed fields:
 
 - `gradient_clipping`
 - `multiplex_job_id`
+- `load_optimizer_states`
+
+`load_optimizer_states` controls checkpoint resume behavior for this training
+sub-job. When `false`, resuming a `resumable` checkpoint (via
+`source_checkpoint_info` or the runtime `/load` endpoint) restores model weights
+only and starts the optimizer fresh. Set it `false` to change data-parallel size
+while keeping expert parallelism, because the DP-sharded optimizer cannot be
+resized; a `true`/default resume against a different DP/world size fails fast
+with an actionable error. `None` (omitted) uses the server default (`true`).
 
 `extra_training` is merged as open passthrough data, without overriding typed
 keys. Examples include `model_provider`, `ep_size`, `ds_config`,
-`activation_checkpointing`, `prime_rl`, and `router_replay`.
+`activation_checkpointing`, `prime_rl`, `router_replay`, `peft_config`, the
+memory-diagnostics settings in [section 8.5](#85-memory-diagnostics-settings),
+and these newer long-context/memory knobs:
+
+- `sp_size`: Ulysses sequence-parallel degree, sharding each sample's sequence
+  across `sp_size` ranks. `1` (default) disables it; the server requires
+  `world_size % sp_size == 0`.
+- `cuda_allocator_conf`: per-job `PYTORCH_CUDA_ALLOC_CONF` string applied before
+  PyTorch is imported, e.g. `"expandable_segments:True"` (or `"backend:native"`
+  to disable). Omitted uses the server default.
+- `ac_config`: activation-checkpointing config, including CPU activation offload
+  via `offload_config.enabled=true`. Offload requires `mode="full"`.
+
+For LoRA training, set `extra_training["peft_config"]` to a PEFT
+`LoraConfig`-compatible object. At minimum, specify `peft_type="Lora"`; `r` and
+`lora_alpha` default to `8` on the server, although explicit values are
+recommended when the same configuration is also used by sampling.
 
 The current client also rejects an effective PrimeRL config that combines an
 enabled/default `fused_cross_entropy` with `fp32_lm_head=True` or an integer
@@ -1047,6 +1181,11 @@ The typed client requires:
 `multiplex_job_id` is optional. `extra_sampling` is an open passthrough object;
 common values include `gpu_memory_utilization` and a nested `vllm_config`.
 
+For LoRA sampling, set `extra_sampling["peft_config"]` when creating the
+sub-job. This enables the vLLM LoRA manager before the model starts. The
+adapter's `r`, `lora_alpha`, and `target_modules` must match the training
+configuration used for adapter synchronization.
+
 For either config type, the server requires `multiplex_job_id` to be a complete
 `{job_id}:{sub_job_type}:{index}` id outside the job being created.
 
@@ -1063,6 +1202,34 @@ For either config type, the server requires `multiplex_job_id` to be a complete
 `source_job_id` is optional in the client/proto shape, but cross-job
 initialization must identify the job that owns the saved checkpoint. The typed
 client forwards this object without validating either field.
+
+### 8.5 Memory-diagnostics settings
+
+Training workers expose low-volume, customer-facing memory observability through
+`training_config` keys. The typed client has no dedicated fields for these, so
+pass them through `extra_training`. Each is an optional per-job override; when
+omitted or `null`, the server system default applies.
+
+| Key | Type | Effect |
+|---|---|---|
+| `step_peak_memory_log` | bool | Adds a `peak_memory` object (`gpu_peak`, `cpu_peak` byte counts) to each `/step` result. See [section 6.2](#62-optimizer-step---post-job_idstep). |
+| `training_memory_telemetry` | bool | Emits structured allocator events (`fwd_bwd_end`, `step_start`, `step_end`) to the training event stream. |
+
+```python
+training = SubJobConfig.training_job(
+    model_name="Qwen/Qwen3-1.7B",
+    optimizer={"name": "AdamW", "lr": 1e-4},
+    max_seq_len=2048,
+    train_batch_size=8,
+    n_gpus=8,
+    extra_training={"step_peak_memory_log": True},
+)
+```
+
+`step_peak_memory_log` costs one `all_reduce(MAX)` per step; both settings are
+off by default. Failure snapshots on a failed `/forward-backward` or `/step` are
+independent of these flags. Per-rank operator diagnostics (the `DSS_MEM_*`
+launcher environment variables) are out of scope for this client-facing surface.
 
 ---
 
@@ -1113,8 +1280,10 @@ wire.encode_byte_chunks(
 )
 ```
 
-If the original frame fits, it is sent unchanged. Otherwise each DSSST1 chunk
-contains:
+`forward_backward()` always sends a chunk envelope, including when the request
+fits in one chunk, so every logical operation has a caller-generated identity.
+`generate()` still sends the original frame unchanged when it fits. Each
+DSSST1 request chunk contains:
 
 - A `uint8` payload tensor.
 - `chunk_idx` and `total_chunks`.
@@ -1122,7 +1291,23 @@ contains:
 - Original frame size and SHA-256.
 - Operation name.
 
-The server caches intermediate chunks and schedules work after the final chunk.
+For forward-backward, `chunk_group_id` is also the idempotency identity and
+`frame_sha256` binds that identity to one exact frame:
+
+- The server retains accepted chunks with the training job rather than the
+  HTTP connection.
+- An unknown group must start at chunk `0`. A later first chunk returns `409`
+  with code `chunk_group_restart_required`; the client may replay once from
+  chunk `0` using the same encoded chunks and group id.
+- Repeating the same group id and frame hash returns or waits for the original
+  execution result. It does not run forward-backward again.
+- Reusing a group id with a different frame hash, chunk count, or chunk payload
+  returns `409`.
+
+The final chunk schedules work and returns the pollable `request_id`. Retrying a
+final chunk after losing its response can return a new `request_id`, but both
+request records resolve through the same at-most-once forward-backward
+execution.
 
 ### 9.4 Encoded results
 
@@ -1250,7 +1435,7 @@ These are conventional backend results, not closed SnowAPI schemas:
 | Operation | Common result |
 |---|---|
 | `forward-backward` | `job_id`, `avg_loss`, `metrics`, `post_process_outputs` |
-| `step` | `global_steps`, `last_lr` |
+| `step` | `global_steps`, `last_lr`, optional `peak_memory` |
 | `save` | `checkpoint_id`, `checkpoint_path`, `checkpoint_tag` |
 | `load` | `checkpoint_id` and backend load metadata |
 | `generate` | `job_id`, `results[]` |
@@ -1267,7 +1452,7 @@ are intentionally open.
 ### 12.1 Live logs
 
 Use `tail_logs()` for one cursor page or `stream_logs()` for an iterator. This
-uses the `tail-logs` operation described in [section 7.7](#77-tail-logs).
+uses the `tail-logs` operation described in [section 7.8](#78-tail-logs).
 
 The server reads the selected sub-job's zone-manager/head-pod stdout. It can
 serve empty, non-EOF pages during placement while the pod is still appearing.
@@ -1301,7 +1486,7 @@ Only S3 stage credentials are implemented by this client.
 
 The client contains `tail_events()` and `stream_events()`, but their
 `zmd-events` operation is not accepted by the current adjacent server. See
-[section 7.8](#78-unsupported-zmd-events-client-helper).
+[section 7.9](#79-unsupported-zmd-events-client-helper).
 
 ---
 
@@ -1394,6 +1579,79 @@ sampling = SubJobConfig.sampling_job(
     },
 )
 sampling_job_id = client.create_job(sub_jobs=[sampling])
+```
+
+### 13.5 Enable LoRA training and adapter sync
+
+Configure the same adapter on both sub-jobs. The training configuration creates
+the trainable PEFT parameters; the sampling configuration enables LoRA support
+in vLLM before the first adapter sync.
+
+```python
+from dss_client.neutrino_client import NeutrinoClient, SubJobConfig
+
+client = NeutrinoClient.from_pat(
+    host=HOST,
+    pat=PAT,
+    database=DATABASE,
+    schema=SCHEMA,
+)
+
+lora_config = {
+    "peft_type": "Lora",
+    "r": 8,
+    "lora_alpha": 8,
+    "lora_dropout": 0.0,
+    "bias": "none",
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+}
+
+training = SubJobConfig.training_job(
+    model_name="Qwen/Qwen3-1.7B",
+    optimizer={"name": "AdamW", "lr": 1e-4},
+    max_seq_len=2048,
+    train_batch_size=8,
+    n_gpus=8,
+    dtype="bfloat16",
+    extra_training={"peft_config": lora_config},
+)
+sampling = SubJobConfig.sampling_job(
+    model_name="Qwen/Qwen3-1.7B",
+    max_seq_len=2048,
+    n_gpus=1,
+    dtype="bfloat16",
+    extra_sampling={"peft_config": lora_config},
+)
+
+job_id = client.create_job(sub_jobs=[training, sampling])
+client.wait_for_job(job_id)
+
+training_id = f"{job_id}:training:0"
+sampling_id = f"{job_id}:sampling:0"
+
+# Submit a DSSST1 training batch, then update the adapter parameters.
+request_id = client.forward_backward(job_id, fwd_bwd_dssst1_frame)
+client.poll_request(job_id, request_id)
+
+request_id = client.step(job_id, learning_rate=1e-4)
+client.poll_request(job_id, request_id)
+
+# Broadcast only LoRA tensors. Later syncs update the same resident adapter.
+request_id = client.weight_sync(
+    job_id,
+    source_sub_job_id=training_id,
+    target_sub_job_ids=[sampling_id],
+    weight_format="lora",
+)
+client.poll_request(job_id, request_id)
+
+# Generation now uses the synchronized resident adapter.
+request_id = client.generate(
+    job_id,
+    prompts=["Write a short proof."],
+    sampling_params={"max_tokens": 256, "temperature": 0.7},
+)
+result = client.poll_request(job_id, request_id)
 ```
 
 ---

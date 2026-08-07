@@ -70,6 +70,32 @@ def _debug_options_enabled() -> bool:
 #   504 Gateway Timeout      - upstream didn't respond in time
 #   409                      - ZMD restarting
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
+_CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
+_CHUNK_GROUP_ERROR_CODES = {
+    _CHUNK_GROUP_RESTART_REQUIRED,
+    "chunk_group_conflict",
+    "chunk_group_missing_chunks",
+}
+
+
+class ChunkGroupError(requests.exceptions.HTTPError):
+    """Base class for structured chunk-group failures."""
+
+    def __init__(self, message: str, *, response: requests.Response, detail: dict):
+        super().__init__(
+            message,
+            response=response,
+            request=getattr(response, "request", None),
+        )
+        self.detail = detail
+
+
+class ChunkGroupRestartError(ChunkGroupError):
+    """The server lost an incomplete group and the bounded replay also failed."""
+
+
+class ChunkGroupConflictError(ChunkGroupError):
+    """The same chunk-group identity was reused inconsistently."""
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -79,6 +105,62 @@ def _is_transient(exc: BaseException) -> bool:
         resp = exc.response
         return resp is not None and resp.status_code in _TRANSIENT_STATUSES
     return False
+
+
+def _iter_error_dicts(value: Any, *, depth: int = 0) -> Iterator[dict]:
+    """Yield dictionaries from direct or GS-wrapped JSON error bodies."""
+    if depth > 8:
+        return
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _iter_error_dicts(child, depth=depth + 1)
+        return
+    if isinstance(value, list):
+        for child in value:
+            yield from _iter_error_dicts(child, depth=depth + 1)
+        return
+    if not isinstance(value, str):
+        return
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(value):
+        if char not in "[{":
+            continue
+        try:
+            decoded, _ = decoder.raw_decode(value[index:])
+        except (TypeError, ValueError):
+            continue
+        yield from _iter_error_dicts(decoded, depth=depth + 1)
+
+
+def _chunk_group_error_detail(response: requests.Response | None) -> dict | None:
+    if response is None:
+        return None
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    for candidate in _iter_error_dicts(body):
+        if candidate.get("code") in _CHUNK_GROUP_ERROR_CODES:
+            return candidate
+        message = str(candidate.get("message") or "")
+        if (
+            candidate.get("chunk_group_id")
+            and message == "request chunk group is missing chunks"
+        ):
+            return {
+                **candidate,
+                "code": "chunk_group_missing_chunks",
+            }
+    return None
+
+
+def _is_chunk_post_transient(exc: BaseException) -> bool:
+    if isinstance(exc, requests.exceptions.HTTPError):
+        if _chunk_group_error_detail(exc.response) is not None:
+            return False
+    return _is_transient(exc)
 
 
 def _is_connect_error(exc: BaseException) -> bool:
@@ -283,7 +365,29 @@ class SubJobConfig:
         model_post_init: list[str] | None = None,
         source_checkpoint_info: dict | None = None,
     ) -> "SubJobConfig":
-        """Build a training :class:`SubJobConfig`. All training fields are explicit."""
+        """Build a training :class:`SubJobConfig`. All training fields are explicit.
+
+        Args:
+            model_name: Model identifier (e.g., "Qwen/Qwen3-1.7B").
+            optimizer: Optimizer config dict (e.g., {"name": "AdamW", "lr": 0.0001}).
+            max_seq_len: Maximum sequence length for training.
+            train_batch_size: Per-device batch size.
+            n_gpus: Number of GPUs (DP size).
+            gradient_clipping: Optional gradient clipping threshold.
+            multiplex_job_id: Optional multiplex job identifier.
+            load_optimizer_states: Whether to load optimizer states from
+                checkpoints. Set to ``False`` when loading across different DP
+                sizes (``n_gpus``) since optimizer states are DP-sharded and
+                cannot be resized. When ``None``, uses server default (True).
+                **This is a creation-time setting and cannot be changed later.**
+            extra_training: Additional training config keys (passthrough).
+            global_batch_size: Global batch size across all GPUs.
+            dtype: Model dtype (e.g., "bfloat16").
+            seed: Random seed.
+            model_post_init: List of post-initialization operations.
+            source_checkpoint_info: Optional checkpoint to resume from at
+                creation time (use ``{"checkpoint_id": "...", "source_job_id": "..."}`).
+        """
         return cls(
             job_type=JobType.TRAINING,
             model_name=model_name,
@@ -1266,6 +1370,8 @@ class NeutrinoClient:
         operation: str,
         frame: bytes,
         max_bytes: int,
+        force_chunk: bool = False,
+        allow_group_restart: bool = False,
         debug_context: dict[str, Any] | None = None,
     ) -> dict:
         chunks = wire.encode_byte_chunks(
@@ -1273,24 +1379,71 @@ class NeutrinoClient:
             kind="request",
             operation=operation,
             max_bytes=max_bytes,
+            force_chunk=force_chunk,
         )
+        group_metadata = wire.read_byte_chunk_metadata(chunks[0])
+        chunk_group_id = (
+            str(group_metadata["chunk_group_id"])
+            if group_metadata is not None and group_metadata.get("chunk_group_id")
+            else None
+        )
+        group_restarts = 0
+        idx = 0
         final_body: dict | None = None
-        for idx, chunk in enumerate(chunks):
-            resp = self._send(
-                "POST",
-                f"{self._prefix}/{job_id}/{path_suffix}",
-                data=chunk,
-                headers={"Content-Type": "application/octet-stream"},
-                debug_context=debug_context,
-            )
+        while idx < len(chunks):
+            chunk = chunks[idx]
+            try:
+                resp = self._send(
+                    "POST",
+                    f"{self._prefix}/{job_id}/{path_suffix}",
+                    data=chunk,
+                    headers={"Content-Type": "application/octet-stream"},
+                    retry_on=(
+                        _is_chunk_post_transient
+                        if allow_group_restart
+                        else _is_transient
+                    ),
+                    debug_context=debug_context,
+                )
+            except requests.exceptions.HTTPError as exc:
+                detail = _chunk_group_error_detail(exc.response)
+                if detail is None:
+                    raise
+                code = detail.get("code")
+                if (
+                    allow_group_restart
+                    and code == _CHUNK_GROUP_RESTART_REQUIRED
+                    and group_restarts < 1
+                ):
+                    group_restarts += 1
+                    idx = 0
+                    final_body = None
+                    logger.warning(
+                        "%s chunk group %s lost server state; replaying once from chunk 0",
+                        operation,
+                        chunk_group_id,
+                    )
+                    continue
+                error_type = (
+                    ChunkGroupRestartError
+                    if code == _CHUNK_GROUP_RESTART_REQUIRED
+                    else ChunkGroupConflictError
+                )
+                raise error_type(
+                    str(detail.get("message") or code),
+                    response=exc.response,
+                    detail=detail,
+                ) from exc
+
             body = resp.json()
             if idx < len(chunks) - 1:
                 if isinstance(body, dict) and body.get("request_id"):
                     raise RuntimeError(
                         f"{operation} chunk {idx} unexpectedly returned request_id"
                     )
-                continue
-            final_body = body
+            else:
+                final_body = body
+            idx += 1
         if final_body is None:
             raise RuntimeError(f"{operation} produced no request body")
         return final_body
@@ -1313,6 +1466,8 @@ class NeutrinoClient:
             operation="fwd-bwd",
             frame=data,
             max_bytes=self._MAX_FWD_BWD_BYTES,
+            force_chunk=True,
+            allow_group_restart=True,
             debug_context=debug_context,
         )
         request_id = body["request_id"]
@@ -1449,11 +1604,58 @@ class NeutrinoClient:
         job_id: str,
         checkpoint_id: str,
         source_job_id: str | None = None,
+        *,
+        target_sub_job_id: str | None = None,
     ) -> str:
-        """Submit a checkpoint load into an existing job. Returns request_id."""
+        """Submit a checkpoint load into an existing job. Returns request_id.
+
+        Args:
+            job_id: The job to load the checkpoint into.
+            checkpoint_id: Checkpoint identifier (from a prior save).
+            source_job_id: Optional. Load from another job's checkpoint store.
+            target_sub_job_id: Optional. Route the load to a specific training
+                sub-job. Format: ``"{job_id}:training:{index}"``. Omit to use
+                the session's default training sub-job.
+
+        Returns:
+            request_id for polling via ``poll_request()``.
+
+        **When to use target_sub_job_id:**
+
+        Use this when working with sessions that have multiple training
+        sub-jobs (e.g., multi-DP configurations) and you need to load
+        checkpoints into a specific sub-job rather than the default.
+
+        **Discovering sub-job IDs:**
+
+        .. code-block:: python
+
+            job = client.get_job(job_id)
+            for sj in job["sub_jobs"]:
+                if sj["job_type"] == "training":
+                    sub_job_id = sj["sub_job_id"]
+                    n_gpus = sj["training_config"]["n_gpus"]
+                    print(f"Training sub-job {sub_job_id}: {n_gpus} GPUs")
+
+        **DP size compatibility:**
+
+        If the target sub-job has a different DP size (``n_gpus``) than the
+        checkpoint was saved from, you **must** have created the job with
+        ``load_optimizer_states=False`` in the ``SubJobConfig``. The optimizer
+        states are DP-sharded and cannot be resized. This setting is configured
+        at job creation time and cannot be changed at runtime.
+
+        **Server validation:**
+
+        The server validates that ``target_sub_job_id`` belongs to this session
+        (returns 400 if not) and is a training sub-job (returns 501 for
+        non-training sub-jobs like sampling).
+        """
         body: dict = {"checkpoint_id": checkpoint_id}
         if source_job_id is not None:
             body["source_job_id"] = source_job_id
+        if target_sub_job_id is not None:
+            body["target_sub_job_id"] = target_sub_job_id
         resp = self._send("POST", f"{self._prefix}/{job_id}/load", json=body)
         return resp.json()["request_id"]
 
@@ -1548,6 +1750,7 @@ class NeutrinoClient:
         source_sub_job_id: str,
         target_sub_job_ids: list[str],
         *,
+        weight_format: str | None = None,
         sub_job_id: str | None = None,
         sub_job_type: str | None = None,
     ) -> str:
@@ -1557,14 +1760,15 @@ class NeutrinoClient:
         Multi-sub-job sessions require the operation envelope to include a
         routing hint. By default, route through the source training sub-job.
 
-        ***** POST operation 
-        https://bbb39214.snowflakecomputing.com/api/v2/databases/neutrino_db/schemas/neutrino_schema/cortex-training/b1fcb345-de6f-40b8-a6b8-c4b4fd02dbec/operation 
+        ***** POST operation
+        https://bbb39214.snowflakecomputing.com/api/v2/databases/neutrino_db/schemas/neutrino_schema/cortex-training/b1fcb345-de6f-40b8-a6b8-c4b4fd02dbec/operation
 
         body={'operation_type': 'weight-sync',
-              'sub_job_id': 'b1fcb345-de6f-40b8-a6b8-c4b4fd02dbec:training:0', 
+              'sub_job_id': 'b1fcb345-de6f-40b8-a6b8-c4b4fd02dbec:training:0',
               'payload': {
-                  'source_sub_job_id': 'b1fcb345-de6f-40b8-a6b8-c4b4fd02dbec:training:0', 
-                  'target_sub_job_ids': ['b1fcb345-de6f-40b8-a6b8-c4b4fd02dbec:sampling:0']
+                  'source_sub_job_id': 'b1fcb345-de6f-40b8-a6b8-c4b4fd02dbec:training:0',
+                  'target_sub_job_ids': ['b1fcb345-de6f-40b8-a6b8-c4b4fd02dbec:sampling:0'],
+                  'weight_format': 'lora',
               }
              }
 
@@ -1575,14 +1779,17 @@ class NeutrinoClient:
             )
         """
         body = {
-            "source_sub_job_id": source_sub_job_id, # training
-            "target_sub_job_ids": list(target_sub_job_ids), # sampling
+            "source_sub_job_id": source_sub_job_id,  # training
+            "target_sub_job_ids": list(target_sub_job_ids),  # sampling
         }
+        if weight_format is not None:
+            # "lora" broadcasts only the trained adapter tensors.
+            body["weight_format"] = weight_format
         return self._operation(
             job_id,
             "weight-sync",
             payload=body,
-            sub_job_id=sub_job_id or source_sub_job_id, # training
+            sub_job_id=sub_job_id or source_sub_job_id,  # training
             sub_job_type=(
                 sub_job_type if sub_job_type is not None else "training"
             ),

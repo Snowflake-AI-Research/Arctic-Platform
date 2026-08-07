@@ -97,10 +97,12 @@ class FakeClient:
         job_id,
         checkpoint_id,
         source_job_id=None,
+        target_sub_job_id=None,
     ):
         self.loaded_job_id = job_id
         self.load_checkpoint_id = checkpoint_id
         self.load_source_job_id = source_job_id
+        self.load_target_sub_job_id = target_sub_job_id
         return "req-load-1"
 
     def generate(
@@ -123,12 +125,14 @@ class FakeClient:
         job_id,
         source_sub_job_id,
         target_sub_job_ids,
+        weight_format=None,
         sub_job_id=None,
         sub_job_type=None,
     ):
         self.weight_sync_job_id = job_id
         self.weight_sync_source_sub_job_id = source_sub_job_id
         self.weight_sync_target_sub_job_ids = target_sub_job_ids
+        self.weight_sync_weight_format = weight_format
         self.weight_sync_sub_job_id = sub_job_id
         self.weight_sync_sub_job_type = sub_job_type
         return "req-weight-sync-1"
@@ -617,6 +621,52 @@ def test_load_accepts_source_job_and_can_skip_poll():
         "request_id": "req-load-1",
         "source_job_id": "source-job",
     }
+
+
+def test_load_passes_target_sub_job_id():
+    instances = []
+    stdout = io.StringIO()
+
+    rc = cli.main(
+        _base_args()
+        + [
+            "--job-id",
+            "job-1",
+            "load",
+            "cp-7",
+            "--target-sub-job-id",
+            "job-1:training:1",
+        ],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    client = instances[0]
+    assert client.load_target_sub_job_id == "job-1:training:1"
+    assert client.polled_request == ("job-1", "req-load-1")
+    assert json.loads(stdout.getvalue()) == {
+        "checkpoint_id": "cp-7",
+        "job_id": "job-1",
+        "request_id": "req-load-1",
+        "target_sub_job_id": "job-1:training:1",
+        "result": {"checkpoint_id": "cp-7"},
+    }
+
+
+def test_load_without_target_sub_job_id_omits_it():
+    instances = []
+    stdout = io.StringIO()
+
+    rc = cli.main(
+        _base_args() + ["--job-id", "job-1", "load", "cp-7", "--no-poll"],
+        client_factory=_factory(instances),
+        stdout=stdout,
+    )
+
+    assert rc == 0
+    assert instances[0].load_target_sub_job_id is None
+    assert "target_sub_job_id" not in json.loads(stdout.getvalue())
 
 
 def test_generate_reads_json_and_polls(tmp_path):

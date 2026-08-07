@@ -118,12 +118,40 @@ class NeutrinoTrainingEngine(Module):
         checkpoint_id: str,
         *,
         source_job_id: str | None = None,
+        target_sub_job_id: str | None = None,
     ):
-        """Load a server-side checkpoint into this already-created job."""
+        """Load a server-side checkpoint into this already-created job.
+
+        Args:
+            checkpoint_id: Checkpoint identifier from a prior save.
+            source_job_id: Optional. Load from another job's checkpoint store.
+            target_sub_job_id: Optional. Route to a specific training sub-job.
+                Format: ``"{job_id}:training:{index}"``. Omit to use the
+                default training sub-job.
+
+        **When to use target_sub_job_id:**
+
+        Use this for sessions with multiple training sub-jobs when you need to
+        load checkpoints into a specific sub-job. To discover available
+        sub-jobs:
+
+        .. code-block:: python
+
+            job = self._client.get_job(self.job_id)
+            training_sub_jobs = [
+                sj["sub_job_id"] for sj in job["sub_jobs"]
+                if sj["job_type"] == "training"
+            ]
+
+        **Important:** If loading across different DP sizes (``n_gpus``), the
+        job must have been created with ``load_optimizer_states=False`` in its
+        ``SubJobConfig``. This cannot be changed after job creation.
+        """
         request_id = self._client.load(
             self.job_id,
             checkpoint_id=checkpoint_id,
             source_job_id=source_job_id,
+            target_sub_job_id=target_sub_job_id,
         )
         result = self._client.poll_request(self.job_id, request_id)
         loaded = result.get("checkpoint_id", checkpoint_id)
