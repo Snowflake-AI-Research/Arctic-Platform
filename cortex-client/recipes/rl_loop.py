@@ -546,7 +546,11 @@ def _train(config: Config, ml_logger: Any) -> None:
                 train_loss = float(fwd_bwd_result["avg_loss"])
                 metrics.update(fwd_bwd_result.get("metrics") or {})
                 metrics.update(step_result.get("metrics") or {})
-                sync_weights(client, job_id, weight_format="lora")
+                sync_weights(
+                    client,
+                    job_id,
+                    weight_format="lora" if config.lora_rank is not None else None,
+                )
 
             metrics.update(
                 {
