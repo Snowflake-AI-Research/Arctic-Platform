@@ -999,20 +999,27 @@ class NeutrinoClient:
             nonlocal attempt_no
             attempt_no += 1
             if debug_label is not None:
-                print(
-                    f"{debug_label} sending {method.upper()} {url} "
-                    f"attempt={attempt_no}/{max_attempts}",
-                    flush=True,
+                logger.debug(
+                    "%s sending %s %s attempt=%d/%d",
+                    debug_label,
+                    method.upper(),
+                    url,
+                    attempt_no,
+                    max_attempts,
                 )
             try:
                 resp = fn(url, **kwargs)
             except Exception as exc:
                 if debug_label is not None:
-                    print(
-                        f"{debug_label} request exception {method.upper()} {url} "
-                        f"attempt={attempt_no}/{max_attempts}: "
-                        f"{type(exc).__name__}: {exc}",
-                        flush=True,
+                    logger.debug(
+                        "%s request exception %s %s attempt=%d/%d: %s: %s",
+                        debug_label,
+                        method.upper(),
+                        url,
+                        attempt_no,
+                        max_attempts,
+                        type(exc).__name__,
+                        exc,
                     )
                 raise
             status_code = getattr(resp, "status_code", None)
@@ -1022,7 +1029,7 @@ class NeutrinoClient:
                 sf_request_id = None
             if sf_request_id:
                 req = getattr(resp, "request", None)
-                logger.info(
+                logger.debug(
                     "snowflake request_id=%s  %s %s  status=%d",
                     sf_request_id,
                     getattr(req, "method", method.upper()),
@@ -1040,11 +1047,17 @@ class NeutrinoClient:
                     else "failed response"
                 )
                 snowflake = f" snowflake_request_id={sf_request_id}" if sf_request_id else ""
-                print(
-                    f"{debug_label} {outcome} {method.upper()} {url} "
-                    f"attempt={attempt_no}/{max_attempts} status={status_code}"
-                    f"{snowflake} body={self._debug_response_summary(resp)}",
-                    flush=True,
+                logger.debug(
+                    "%s %s %s %s attempt=%d/%d status=%s%s body=%s",
+                    debug_label,
+                    outcome,
+                    method.upper(),
+                    url,
+                    attempt_no,
+                    max_attempts,
+                    status_code,
+                    snowflake,
+                    self._debug_response_summary(resp),
                 )
             resp.raise_for_status()
             return resp
@@ -1459,7 +1472,7 @@ class NeutrinoClient:
             "payload_bytes": len(data),
         }
         debug_label = self._debug_context_label(debug_context)
-        print(f"{debug_label} payload total bytes: {len(data)}", flush=True)
+        logger.debug("%s payload total bytes: %d", debug_label, len(data))
         body = self._post_octet_request_chunks(
             job_id=job_id,
             path_suffix="forward-backward",
@@ -1479,10 +1492,11 @@ class NeutrinoClient:
             "payload_bytes": len(data),
         }
         self._fwd_bwd_request_debug[request_id] = request_debug_context
-        print(
-            f"{debug_label} submitted request_id={request_id} "
-            f"body={self._debug_json_summary(body)}",
-            flush=True,
+        logger.debug(
+            "%s submitted request_id=%s body=%s",
+            debug_label,
+            request_id,
+            self._debug_json_summary(body),
         )
         return request_id
 
@@ -1998,20 +2012,23 @@ class NeutrinoClient:
                         result = decoded
                 result = self._normalize_generate_result_if_needed(request_id, result)
                 if debug_label is not None:
-                    print(
-                        f"{debug_label} completed state={state} "
-                        f"result={self._debug_json_summary(result)}",
-                        flush=True,
+                    logger.debug(
+                        "%s completed state=%s result=%s",
+                        debug_label,
+                        state,
+                        self._debug_json_summary(result),
                     )
                     self._fwd_bwd_request_debug.pop(request_id, None)
                 return result
             if state in ("failed", "cancelled", "canceled"):
                 error = status.get("error", "")
                 if debug_label is not None:
-                    print(
-                        f"{debug_label} failed state={state} error={error} "
-                        f"body={self._debug_json_summary(status)}",
-                        flush=True,
+                    logger.debug(
+                        "%s failed state=%s error=%s body=%s",
+                        debug_label,
+                        state,
+                        error,
+                        self._debug_json_summary(status),
                     )
                     self._fwd_bwd_request_debug.pop(request_id, None)
                 self._generate_request_ids.discard(request_id)
@@ -2025,9 +2042,8 @@ class NeutrinoClient:
                 continue
             delay = self._sleep_with_backoff(delay, deadline)
         if debug_label is not None:
-            print(
-                f"{debug_label} timed out after {self.poll_timeout}s",
-                flush=True,
+            logger.debug(
+                "%s timed out after %ss", debug_label, self.poll_timeout
             )
             self._fwd_bwd_request_debug.pop(request_id, None)
         self._generate_request_ids.discard(request_id)
