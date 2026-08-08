@@ -25,7 +25,7 @@ Defaults already pick a model, LoRA, GPUs, and learning rate:
 # SFT — no_robots chat, Qwen/Qwen3.6-35B-A3B, LoRA-32, 8 GPUs, 100 steps
 python recipes/sft_loop.py config=recipes/config.json
 
-# RL — MATH, Qwen/Qwen3.5-4B, 4 train + 4 sample GPUs
+# RL — MATH, Qwen/Qwen3-8B, 4 train + 4 sample GPUs
 # Set lora_rank explicitly for LoRA
 python recipes/rl_loop.py config=recipes/config.json lora_rank=32
 ```
@@ -43,8 +43,8 @@ On the default LoRA-32 / `no_robots` / `Qwen/Qwen3.6-35B-A3B` setup `train_mean_
 
 ### RL
 
-On LoRA-32 / `Qwen/Qwen3.5-4B` you should see reward climbing very soon, and correctness climb from ~0.4
-toward ~0.8 within a few dozen steps.
+On LoRA-32 / `Qwen/Qwen3-8B` you should see reward climbing very soon, and correctness climb from ~0.7
+toward ~0.9 within a few dozen steps.
 
 ```bash
 # Local metrics only
@@ -65,9 +65,6 @@ python recipes/rl_loop.py config=recipes/config.json \
 ### Change model
 
 ```bash
-python recipes/sft_loop.py config=recipes/config.json \
-    model_name=Qwen/Qwen3.6-35B-A3B
-
 python recipes/sft_loop.py config=recipes/config.json \
     model_name=Qwen/Qwen3-8B
 ```

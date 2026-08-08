@@ -209,7 +209,7 @@ class Config:
     config: str
     job_id: str | None = None
 
-    model_name: str = "Qwen/Qwen3.5-4B"
+    model_name: str = "Qwen/Qwen3-8B"
     training_gpus: int = 4
     sampling_gpus: int = 4
     gpu_memory_utilization: float = 0.4
