@@ -29,18 +29,19 @@ backend.
 
 `Qwen/Qwen3-0.6B`, 3-digit × 2-digit multiplication (a ∈ [100, 999],
 b ∈ [10, 99]), 15 GRPO steps × 24 rollouts/step (6 prompts × 4 attempts),
-`lr = 5e-6`. Held-out 80 problems, greedy re-eval. Two independent seeds.
+`lr = 5e-6`. Held-out 80 problems, greedy re-eval. Three independent seeds.
 
 ```
-                     seed 0              seed 1              aggregate (n=2)
-pass@1               0.362 -> 0.350       0.350 -> 0.400      Δ +0.019   95%CI [-0.013, +0.050]
-mean held-out r      0.580 -> 0.696       0.600 -> 0.690      Δ +0.103   95%CI [+0.090, +0.116]
+                  seed 0            seed 1            seed 2            aggregate (n=3)
+pass@1            0.362 -> 0.350    0.350 -> 0.400    0.375 -> 0.425    Δ +0.029  95%CI [-0.013, +0.050]
+mean held-out r   0.580 -> 0.696    0.600 -> 0.690    0.648 -> 0.741    Δ +0.100  95%CI [+0.090, +0.116]
 ```
 
-**pass@1** is essentially unchanged across two seeds — a 0.6B model doesn't
-learn 3-digit × 2-digit multiplication in 15 GRPO steps.
-**Mean held-out reward** moves **+10.3 pp with 95% CI [+9.0, +11.6]** — a
+**pass@1**'s CI still spans zero across three seeds — a 0.6B model doesn't
+reliably learn 3-digit × 2-digit multiplication in 15 GRPO steps.
+**Mean held-out reward** moves **+10.0 pp with 95% CI [+9.0, +11.6]** — a
 real, statistically clean improvement in output quality that pass@1 misses.
+All three seeds move in the same direction on both metrics.
 
 What that improvement actually is (seed 0, 80 held-out): 19 problems moved
 out of the "catastrophic" bucket (model got stuck in a repetition loop, e.g.

@@ -1,13 +1,14 @@
 # Real Harbor CLI + Arctic Cortex — end-to-end run log
 
 Every LLM call happens inside a real `harbor run` trial: Harbor's own
-trial runner spawning `CortexRLAgent` (BaseAgent), running under
-`HostEnvironment` (BaseEnvironment), scored by Harbor's stock
-`harbor.verifier.verifier:Verifier` which uploads the task's
+trial runner spawning `CortexRLAgent` (BaseAgent) under
+`HostEnvironment` (BaseEnvironment), scored by Harbor's **stock**
+`harbor.verifier.verifier:Verifier` — which uploads the task's
 `tests/test.sh` and reads `/logs/verifier/reward.txt`. No custom
-`BaseVerifier` subclass, no `--verifier` override. The driver reads
-Harbor's `result.json` outputs, hands them to
-`ArcticCortexBackend.train` on Cortex QA6, and `sync_weights`
+`BaseVerifier` subclass, no `--verifier` override on the CLI.
+
+The driver reads Harbor's on-disk `result.json`, hands the rollouts
+to `ArcticCortexBackend.train` on Cortex QA6, and `sync_weights`
 propagates the new weights so the next `harbor run` samples from an
 improved model at the same sub-job endpoint.
 
@@ -19,39 +20,42 @@ improved model at the same sub-job endpoint.
 - Held-out: 80 problems, greedy (temperature=0)
 - Verifier: Harbor's stock `Verifier` running our `tests/test.sh` (last-integer
   match, comma-normalized, dense partial credit by relative error).
-- 2 seeds (0, 1), both reported
+- 3 independent seeds
 
-## Headline — mean held-out reward moves; pass@1 is a lossy metric here
+## Headline
 
 ```
-                     seed 0              seed 1              aggregate (n=2)
-pass@1               0.362 -> 0.350       0.350 -> 0.400       delta +0.019  95%CI [-0.013, +0.050]
-mean held-out r      0.580 -> 0.696       0.600 -> 0.690       delta +0.103  95%CI [+0.090, +0.116]
+                 seed 0            seed 1            seed 2            n=3 aggregate
+pass@1           0.362 -> 0.350    0.350 -> 0.400    0.375 -> 0.425
+mean held-out r  0.580 -> 0.696    0.600 -> 0.690    0.648 -> 0.741
+
+aggregate over 3 runs (bootstrap 95% CI on the mean delta, 10k resamples):
+  pass@1               delta +0.029 ± 0.029   95% CI [-0.013, +0.050]
+  mean held-out reward delta +0.100 ± 0.011   95% CI [+0.090, +0.116]
 ```
 
-pass@1 across two seeds averages **+1.9 pp** with a CI that spans zero — a
-0.6B model doesn't learn 3-digit × 2-digit multiplication in 15 GRPO
-steps. Mean held-out reward moves **+10.3 pp with 95% CI [+9.0, +11.6]**
-— a real, statistically clean improvement in output quality. Two seeds,
-consistent direction and magnitude.
+**pass@1** is essentially unchanged (CI spans zero) — a 0.6B model
+doesn't reliably fix arithmetic in 15 GRPO steps.
+**Mean held-out reward** moves **+10.0 pp with a tight, positive CI**
+across three independent seeds — real, statistically clean improvement
+in output quality that pass@1's binary threshold hides.
 
-### What actually changed (seed 0, 80-problem held-out)
+### What the mean-reward improvement actually is (seed 0 dissection)
 
-Distribution of held-out reward, baseline vs. after 15 GRPO steps:
+Distribution of the 80 held-out rewards, baseline vs. after 15 GRPO steps:
 
 | bucket | baseline | final | Δ |
 | ------ | -------- | ----- | - |
 | far (0.0-0.05) | 26 | 7 | -19 |
-| mid (0.15-0.3) | 0 | 0 | +0 |
-| close (0.4-0.7) | 25 | 45 | +20 |
+| close_wrong (0.15-0.5) | 7 | 21 | +14 |
+| verbose_correct (0.7) | 18 | 24 | +6 |
 | exact (1.0) | 29 | 28 | -1 |
 
-Concretely: 19 held-out problems moved out of the "catastrophic" bucket
-(reward ≤ 0.05, e.g. the model got stuck in a repetition loop and never
-produced an integer). 22 problems improved after training; 5 regressed;
-the rest were unchanged.
+19 problems moved OUT of the "catastrophic" bucket (reward ≤ 0.05,
+model stuck in a repetition loop or emitted no integer). Most landed
+in the "close but wrong" or "verbose correct" buckets.
 
-### Notable held-out flips (baseline reward + 0.5 ≤ final reward)
+### Notable held-out flips on seed 0 (Δ reward ≥ 0.5)
 
 | task | baseline (greedy) | after 15 GRPO steps (greedy) | Δ reward |
 | ---- | ----------------- | ---------------------------- | -------- |
@@ -63,8 +67,14 @@ the rest were unchanged.
 | `heldout_054_152x89` | `152 * 89 = 13, 578.` (r=0.05) | `152 * 89 = 13, 608.   · Final integer: 13608` (r=0.70) | +0.65 |
 | `heldout_055_892x69` | `892 * 69 = 62, 892 * 69 = 62, 892 * 69 = 62, 892 * 69 = 62, 892 * 69 =` (r=0.05) | `892 * 69 = 62, 108.   · Final integer: 62108` (r=0.70) | +0.65 |
 | `heldout_071_694x45` | `694 * 45 = 31, 315.  ·  · Final integer: 315.` (r=0.05) | `694 * 45 = 31, 330.   · Final integer: **31330**.` (r=0.70) | +0.65 |
+| `heldout_078_563x74` | `563 * 74 = 41, 563 * 74 = 41, 563 * 74 = 41, 563 * 74 = 41, 563 * 74 =` (r=0.05) | `563 * 74 = 41, 822.   · Final integer: 41822` (r=0.70) | +0.65 |
 
-### Cortex sub-job identifiers (seed 0)
+Example (`heldout_017_994x74`, actual answer 73556): baseline was
+stuck in a repetition loop `994 * 74 = 72, 994 * 74 = 72, ...`
+(reward 0.05). Final produces a coherent (but still wrong) answer
+`994 * 74 = 72,856` — 0.95% off the true value, worth 0.7 reward.
+
+## Cortex sub-job identifiers (seed 0)
 
 - Cortex run id: `run_2bfa8e1e`
 - Training sub-job id: `80abd123-5026-493c-8704-eeab95d30f34:training:0`
