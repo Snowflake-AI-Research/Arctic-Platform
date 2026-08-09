@@ -30,7 +30,10 @@ from arctic_platform.integrations.harbor.task_gen import write_dataset
 
 AGENT_PATH = "arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent"
 ENV_PATH = "arctic_platform.integrations.harbor.host_environment:HostEnvironment"
-VERIFIER_PATH = "arctic_platform.integrations.harbor.arithmetic_verifier:ArithmeticVerifier"
+# Verifier: Harbor's default ``harbor.verifier.verifier:Verifier``. It uploads
+# each task's ``tests/`` dir into the environment, execs ``test.sh``, and reads
+# ``/logs/verifier/reward.txt``. We ship a real test.sh (see task_gen._TEST_SH)
+# — no custom BaseVerifier subclass, no ``--verifier`` override on the CLI.
 
 
 def _log(msg: str) -> None:
@@ -70,7 +73,6 @@ def _run_harbor(
         "--ak", f"reconnect_config_path={reconnect_config_path}",
         "--ak", f"temperature={temperature}",
         "--ak", f"max_tokens={max_tokens}",
-        "--verifier", VERIFIER_PATH,
     ]
     _log("$ " + " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -107,6 +109,10 @@ async def main() -> None:
     ap.add_argument("--b-high", type=int, default=None,
                     help="Override high bound of operand b (default: --high)")
     ap.add_argument("--work-dir", default=None)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="RNG seed for train + held-out problem sampling. "
+                         "Different seeds give independent runs; report the "
+                         "distribution across seeds instead of one number.")
     ap.add_argument("--reuse-training-job-id", default=None,
                     help="Skip Cortex cold-start; attach to an existing training sub-job token.")
     ap.add_argument("--reuse-sampling-job-id", default=None,
@@ -116,6 +122,17 @@ async def main() -> None:
     work_dir = Path(args.work_dir or tempfile.mkdtemp(prefix="harbor_e2e_"))
     work_dir.mkdir(parents=True, exist_ok=True)
     _log(f"work_dir = {work_dir}")
+
+    # Warm the HF tokenizer cache once, up front. Otherwise every Harbor trial
+    # subprocess (dozens per GRPO step at n_concurrent > 1) hits HF Hub and
+    # eventually gets rate-limited to ``HfHubHTTPError`` — trials silently
+    # drop, GRPO batches lose rollouts, gradient collapses to zero.
+    try:
+        from transformers import AutoTokenizer
+        AutoTokenizer.from_pretrained(args.model)
+        _log(f"tokenizer cache warm for {args.model}")
+    except Exception as e:  # noqa: BLE001 — pre-flight failure shouldn't kill the run
+        _log(f"tokenizer warmup skipped ({type(e).__name__}: {e}); trials may hit HF Hub")
 
     # ── 1. Stand up a real Cortex Training job ─────────────────────────────
     cfg = PostTrainingConfig(
@@ -178,8 +195,8 @@ async def main() -> None:
         b_hi = args.b_high if args.b_high is not None else args.high
         _log(f"operand ranges: a in [{a_lo},{a_hi}], b in [{b_lo},{b_hi}], op={args.task}")
 
-        rng = random.Random(0)
-        heldout_rng = random.Random(999)
+        rng = random.Random(args.seed)
+        heldout_rng = random.Random(args.seed + 999)
         heldout_probs = [
             (heldout_rng.randint(a_lo, a_hi), heldout_rng.randint(b_lo, b_hi))
             for _ in range(args.heldout)
@@ -250,13 +267,26 @@ async def main() -> None:
         )
         final_ds = load_job_dir(final_job_dir, "final", args.model)
         final_pass = pass_at_1(final_ds)
+        # Mean held-out reward — captures the improvements in output quality
+        # (e.g. "escaping loops") that a binary pass@1 metric hides. When
+        # GRPO can't fully move pass@1 on a small model in a few dozen steps,
+        # the mean reward often still moves substantially.
+        base_mean_reward = sum(r.reward for r in base_ds.rollouts) / max(1, len(base_ds.rollouts))
+        final_mean_reward = sum(r.reward for r in final_ds.rollouts) / max(1, len(final_ds.rollouts))
         _log(f"FINAL pass@1 = {final_pass:.3f}  ({sum(1 for r in final_ds.rollouts if r.reward >= 1.0)}/{len(final_ds.rollouts)})")
         _log(f"reward curve: {[round(x, 3) for x in curve]}")
-        _log(f"RESULT pass@1  {base_pass:.3f} -> {final_pass:.3f}  (delta {final_pass - base_pass:+.3f})")
+        _log(
+            f"RESULT  pass@1: {base_pass:.3f} -> {final_pass:.3f}  ({final_pass - base_pass:+.3f})  "
+            f"|  mean held-out reward: {base_mean_reward:.3f} -> {final_mean_reward:.3f}  "
+            f"({final_mean_reward - base_mean_reward:+.3f})"
+        )
         (work_dir / "summary.json").write_text(json.dumps({
             "baseline_pass_at_1": base_pass,
             "final_pass_at_1": final_pass,
             "delta": final_pass - base_pass,
+            "baseline_mean_reward": base_mean_reward,
+            "final_mean_reward": final_mean_reward,
+            "delta_mean_reward": final_mean_reward - base_mean_reward,
             "reward_curve": curve,
             "run_id": run.run_id,
             "training_job_id": run.training_job_id,
@@ -264,6 +294,13 @@ async def main() -> None:
             "task": args.task,
             "a_range": [a_lo, a_hi],
             "b_range": [b_lo, b_hi],
+            "seed": args.seed,
+            "iters": args.iters,
+            "prompts_per_step": args.prompts_per_step,
+            "n_attempts": args.n_attempts,
+            "heldout": args.heldout,
+            "lr": args.lr,
+            "temperature": args.temperature,
         }, indent=2))
         _log(f"summary -> {work_dir / 'summary.json'}")
     finally:

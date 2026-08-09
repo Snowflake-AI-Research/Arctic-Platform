@@ -13,14 +13,14 @@ Public surface:
 * Backend — ``ArcticCortexBackend`` implements the RFC's
   ``PostTrainingBackend`` protocol.
 * Harbor extensions — ``HostEnvironment`` (BaseEnvironment), ``CortexRLAgent``
-  (BaseAgent), ``ArithmeticVerifier`` (BaseVerifier); referenced from
-  ``harbor run --agent/--env/--verifier`` by import path.
+  (BaseAgent); referenced from ``harbor run --agent/--env`` by import path.
+  Scoring uses Harbor's stock ``Verifier``, which uploads and execs each task's
+  ``tests/test.sh``.
 * Adapter — ``load_job_dir`` reads a Harbor jobs dir and materializes a
   ``RolloutDataset`` from every trial's ``result.json``.
 """
 
 from arctic_platform.integrations.harbor.adapter import load_job_dir, pass_at_1
-from arctic_platform.integrations.harbor.arithmetic_verifier import ArithmeticVerifier
 from arctic_platform.integrations.harbor.backend import ArcticCortexBackend
 from arctic_platform.integrations.harbor.cortex_agent import CortexRLAgent
 from arctic_platform.integrations.harbor.host_environment import HostEnvironment
@@ -40,7 +40,6 @@ from arctic_platform.integrations.harbor.task_gen import (
 
 __all__ = [
     "ArcticCortexBackend",
-    "ArithmeticVerifier",
     "CortexRLAgent",
     "HostEnvironment",
     "InferenceEndpoint",

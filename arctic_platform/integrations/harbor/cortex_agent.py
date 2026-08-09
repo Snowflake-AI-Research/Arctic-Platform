@@ -84,7 +84,16 @@ class CortexRLAgent(BaseAgent):
         # display; the HuggingFace tokenizer needs the full "org/repo" string.
         tokenizer_name = self.model_name or cfg_dict.get("model_name")
         assert tokenizer_name, "CortexRLAgent needs -m <model_name> so the tokenizer can be loaded"
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        # ``local_files_only=True``: every Harbor trial spawns its own subprocess
+        # and re-loads the tokenizer. Hitting HF Hub on every trial (dozens per
+        # GRPO step) trips the Hub's rate limiter and drops trials. The runner
+        # warms the local cache once before spawning harbor CLI, so trials read
+        # straight from disk. Falls back to a fresh download if the cache is
+        # cold (first-ever run in a new environment).
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=True)
+        except (OSError, ValueError):
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         messages = [{"role": "user", "content": instruction}]
         try:
             prompt_text = tokenizer.apply_chat_template(

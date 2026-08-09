@@ -37,11 +37,62 @@ build_timeout_sec = 60.0
 # demands an environment/ directory exists. An empty Dockerfile is enough.
 _DOCKERFILE_STUB = "FROM scratch\n"
 
-# Harbor's Task validator wants a tests/test.sh; the actual scoring is done
-# by ArithmeticVerifier so this script is inert.
-_TEST_SH = "#!/bin/bash\necho 0 > /logs/verifier/reward.txt\n"
+# Real test.sh — Harbor's stock ``Verifier`` uploads this into ``/tests/`` inside
+# the environment, then execs it. The script reads the agent's completion out of
+# ``/logs/agent/completion.txt``, extracts the last integer (comma-normalized),
+# scores against the task's expected answer, and writes the reward to
+# ``/logs/verifier/reward.txt``. This is the canonical Harbor path: no custom
+# Python BaseVerifier subclass, no --verifier override on the CLI.
+_TEST_SH = """\
+#!/usr/bin/env bash
+set -uo pipefail
 
-_SOLUTION_SH = "#!/bin/bash\necho placeholder\n"
+# Harbor's canonical container paths are /logs and /tests. ``HostEnvironment``
+# (this repo) can't chroot or bind-mount, so it exports ``HARBOR_HOST_ROOT``
+# pointing at a per-trial host root. When the script runs under a real
+# container env, HARBOR_HOST_ROOT is unset, so we default to empty and hit
+# the container's true ``/logs``.
+ROOT="${{HARBOR_HOST_ROOT:-}}"
+COMPLETION="${{ROOT}}/logs/agent/completion.txt"
+REWARD="${{ROOT}}/logs/verifier/reward.txt"
+EXPECTED={expected}
+
+mkdir -p "${{ROOT}}/logs/verifier"
+
+if [ ! -s "$COMPLETION" ]; then
+  printf '0\\n' > "$REWARD"
+  exit 0
+fi
+
+# Score: last integer in the completion is the model's answer. Normalize
+# thousand-separator commas first so "715,500" is read as "715500".
+python3 - "$COMPLETION" <<'PY' > "$REWARD"
+import re, sys
+
+expected = {expected}
+text = open(sys.argv[1]).read()
+text = re.sub(r"(?<=\\d),(?=\\d)", "", text)
+ints = re.findall(r"-?\\d+", text)
+if not ints:
+    print(0.0); sys.exit(0)
+answer = int(ints[-1])
+if answer == expected:
+    print(1.0); sys.exit(0)
+# Dense partial credit by relative error. Keeps GRPO advantages non-degenerate
+# when no rollout is exactly right; standard reward-shaping trick for hard-to-
+# solve tasks. Falls back to zero for "any integer".
+denom = max(1, abs(expected))
+rel = abs(answer - expected) / denom
+if   rel <= 0.01: r = 0.7
+elif rel <= 0.05: r = 0.5
+elif rel <= 0.10: r = 0.3
+elif rel <= 0.50: r = 0.15
+else:             r = 0.05
+print(r)
+PY
+"""
+
+_SOLUTION_SH = "#!/bin/bash\necho {expected}\n"
 
 
 def _op_symbol(op: str) -> str:
@@ -73,10 +124,10 @@ def write_task_dir(
     )
     (task_dir / "environment" / "Dockerfile").write_text(_DOCKERFILE_STUB)
     test_sh = task_dir / "tests" / "test.sh"
-    test_sh.write_text(_TEST_SH)
+    test_sh.write_text(_TEST_SH.format(expected=exp))
     test_sh.chmod(0o755)
     solve_sh = task_dir / "solution" / "solve.sh"
-    solve_sh.write_text(_SOLUTION_SH)
+    solve_sh.write_text(_SOLUTION_SH.format(expected=exp))
     solve_sh.chmod(0o755)
     return task_dir
 

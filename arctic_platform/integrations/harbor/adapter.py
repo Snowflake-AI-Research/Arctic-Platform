@@ -54,8 +54,17 @@ def load_job_dir(
 
         verifier_result = data.get("verifier_result") or {}
         rewards = verifier_result.get("rewards") or {}
-        # A verifier can emit several named rewards; take the primary one.
-        reward = float(next(iter(rewards.values()))) if rewards else 0.0
+        # A verifier can emit several named rewards. If the primary "reward"
+        # key is present (canonical convention), use it; otherwise fall back
+        # to the first value. Auxiliary metrics like ``any_correct`` /
+        # ``terse_correct`` are kept as-is on ``metadata`` so the driver can
+        # report multiple pass rates.
+        if "reward" in rewards:
+            reward = float(rewards["reward"])
+        elif rewards:
+            reward = float(next(iter(rewards.values())))
+        else:
+            reward = 0.0
 
         # Harbor may write more than one RolloutDetail if there are subagents.
         # The first entry is always the main agent by convention.
@@ -74,6 +83,10 @@ def load_job_dir(
                 metadata={
                     "trial_dir": str(result_path.parent),
                     "trial_name": result_path.parent.name,
+                    # Preserve every reward field the verifier emitted so eval
+                    # can compute additional pass rates (e.g. any_correct,
+                    # terse_correct) without re-reading result.json.
+                    "rewards": {k: float(v) for k, v in rewards.items()},
                 },
             )
         )
@@ -87,8 +100,25 @@ def load_job_dir(
 
 
 def pass_at_1(ds: RolloutDataset) -> float:
-    """Fraction of rollouts that scored the full reward (1.0)."""
+    """Fraction of rollouts that scored the full training reward (1.0)."""
     if not ds.rollouts:
         return 0.0
     correct = sum(1 for r in ds.rollouts if r.reward >= 1.0)
     return correct / len(ds.rollouts)
+
+
+def metric_at_1(ds: RolloutDataset, key: str) -> float:
+    """Fraction of rollouts whose verifier emitted ``rewards[key] == 1``.
+
+    Used for reporting metrics the verifier tracks but doesn't necessarily
+    train on (e.g. ``any_correct`` — the raw arithmetic score — when the
+    training reward folds in a second signal like brevity).
+    """
+    if not ds.rollouts:
+        return 0.0
+    n_hit = 0
+    for r in ds.rollouts:
+        rewards = (r.metadata or {}).get("rewards") or {}
+        if rewards.get(key, 0.0) >= 1.0:
+            n_hit += 1
+    return n_hit / len(ds.rollouts)
