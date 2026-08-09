@@ -27,35 +27,34 @@ backend.
 
 ## Result on Cortex QA6
 
-`Qwen/Qwen3-0.6B`, 3-digit × 2-digit multiplication (operand a ∈ [100, 999],
-b ∈ [10, 99]), 8 GRPO steps, 6 prompts/step × 4 attempts (24 rollouts/step),
+`Qwen/Qwen3-0.6B`, 3-digit × 2-digit multiplication (a ∈ [100, 999],
+b ∈ [10, 99]), 15 GRPO steps, 6 prompts/step × 4 attempts (24 rollouts/step),
 `lr = 5e-6`. Every step is a fresh `harbor run` subprocess.
 
 ```
-BASELINE pass@1 = 0.250   (4/16)
-FINAL    pass@1 = 0.312   (5/16)   Δ +0.062
+BASELINE pass@1 = 0.250   (5/20)
+FINAL    pass@1 = 0.400   (8/20)   Δ +0.150
+
+held-out flips (baseline greedy vs. post-training greedy, same problems):
+  965 × 22:  21630 (wrong)  ->  21230 (right)   [actual 21230]
+  376 × 13:  4908  (wrong)  ->  4888  (right)   [actual 4888]
+  991 × 96:  95184 (wrong)  ->  95136 (right)   [actual 95136]
+  regressions (right -> wrong): 0
 
 training reward curve (per-step mean, partial credit):
-  step 0  0.375    step 4  0.635
-  step 1  0.427    step 5  0.708
-  step 2  0.877    step 6  0.960
-  step 3  0.823    step 7  0.615
-
-GRPO gradient norms:
-  11.35  19.31  14.82  9.68  11.88  26.73  4.43  34.61
+  0.375 0.327 0.840 0.744 0.658 0.758 0.925 0.606
+  0.642 0.787 0.625 0.610 0.723 0.756 0.771
 ```
 
-The training-reward curve climbs from 0.375 to a peak of 0.960 before pulling
-back — the model is learning to solve the task under the reward's partial-credit
-shape. The held-out delta is smaller because the model overshoots on the last
-step (grad_norm 34.6) and because a 0.6B model with 24 rollouts/step is
-sample-inefficient. Every non-degenerate step had a real GRPO gradient. Same
-sampling sub-job before and after — Harbor's post-training re-eval reads
-whatever weights the last `sync_weights` pushed.
+Three held-out problems flipped wrong → right (real arithmetic changes,
+not formatting) with zero regressions. Same sampling sub-job before and
+after — Harbor's post-training re-eval reads whatever weights the last
+`sync_weights` pushed. Real GRPO gradients throughout (`grad_norm` 6–21).
 
-`RUN_LOG.md` (next to this README) has the full transcript: the real `harbor
-run` command lines, Harbor's own per-trial results table, per-step gradients,
-and side-by-side baseline vs. final completions for every held-out problem.
+`RUN_LOG.md` (next to this README) has the full transcript: the actual
+`harbor run` command lines, Harbor's own per-trial results tables,
+per-step gradients, and the complete baseline / post-training completion
+tables.
 
 ## What it proves
 
@@ -95,7 +94,7 @@ Requires `CORTEX_PAT` + `ARCTIC_CORTEX_HOST` in env, and an account with
 python -m arctic_platform.integrations.harbor.harbor_runner \
   --model Qwen/Qwen3-0.6B \
   --task mul --a-low 100 --a-high 999 --b-low 10 --b-high 99 \
-  --iters 8 --prompts-per-step 6 --n-attempts 4 --heldout 16 \
+  --iters 15 --prompts-per-step 6 --n-attempts 4 --heldout 20 \
   --max-tokens 64 --temperature 0.8 --lr 5e-6
 ```
 
