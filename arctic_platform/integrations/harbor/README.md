@@ -12,6 +12,81 @@ The point is: no code inside Harbor changes. A user configures Harbor with
 this package's agent + env + verifier and points at Cortex Training as the
 backend.
 
+## The Harbor user's flow
+
+You already have a Harbor benchmark that you eval against — a directory of
+Harbor task dirs, each with `instruction.md`, `tests/test.sh`, and
+optionally a `SKILL.md`-style file you feed the agent. To train against
+those same tasks on Cortex, split them into a training pool and a held-out
+pool and run:
+
+```bash
+python -m arctic_platform.integrations.harbor.harbor_runner \
+  --tasks-dir     ./my_bench/train    \  # directory of Harbor task subdirs (or a dataset.toml)
+  --heldout-dir   ./my_bench/heldout  \  # separate dir, same layout
+  --skill-md      ./SKILL.md          \  # optional; appended to every task instruction
+  --skill-dir     ./skills            \  # optional; passed to Harbor's --skill
+  --model         Qwen/Qwen3-0.6B     \
+  --iters 30 --prompts-per-step 8 --n-attempts 4 --lr 5e-6 \
+  --out ./training-run/
+```
+
+That's the whole invocation. What it does end-to-end:
+
+1. **Cortex cold-start.** Provisions a training sub-job (holds the weights,
+   runs GRPO) and a sampling sub-job (runs vLLM, serves `generate`) linked
+   by `sync_weights`. The user's box has no GPUs — Cortex owns every GPU
+   operation.
+2. **Baseline `harbor run`** on `--heldout-dir` with the current (unmodified)
+   weights, greedy, one attempt per task. Records `pass@1` and mean reward.
+3. **N GRPO iterations.** Each step: sample `--prompts-per-step` tasks from
+   `--tasks-dir`, write a temporary Harbor `dataset.toml`, run `harbor run`
+   with `--n-attempts` rollouts per task, hand the resulting rollouts to
+   `ArcticCortexBackend.train`, `sync_weights` to the sampling sub-job.
+4. **Final `harbor run`** on `--heldout-dir` at the same sampling sub-job —
+   whatever weights `sync_weights` pushed are what the model uses. Records
+   `pass@1` and mean reward.
+5. **Writes `./training-run/summary.json`** with baseline/final metrics, the
+   training reward curve, and the Cortex sub-job ids you can point later
+   evals or production inference at.
+
+### What each of your files becomes at runtime
+
+| your artifact | Harbor's flag | what it does at trial time |
+| ------------- | ------------- | -------------------------- |
+| `task_dir/instruction.md` | (implicit) | Shown to the agent as the user prompt. |
+| `task_dir/tests/test.sh`  | (implicit, via Harbor's stock `Verifier`) | Uploaded into the env, execed after the agent runs; writes `reward.txt` under `/logs/verifier/`. |
+| `task_dir/task.toml`      | (implicit) | Metadata (timeouts, `[environment].os`, any `[verifier].env`). |
+| `SKILL.md`                | `--extra-instruction-path` | Text appended to every task's `instruction.md`. |
+| `./skills/`               | `--skill` | A directory the agent can look up files in (mounted at `/harbor/skills`). |
+| custom `BaseAgent`        | `--agent module:Class` | Replaces our default `CortexRLAgent` if you have your own agent (say one that reads `SKILL.md` and uses tools). It just needs to `client.generate` from the sub-job — our `CortexRLAgent` does this in ~30 LOC as a template. |
+
+### After training — using the trained model
+
+`summary.json` from the run captures the endpoint:
+
+```json
+{
+  "training_job_id": "<uuid>",
+  "sampling_job_id": "<uuid>",
+  "reconnect_config_path": "./training-run/reconnect_config.json"
+}
+```
+
+Point another `harbor run` (evals, or prod agent traffic) at the same
+sub-job by passing that `reconnect_config_path` to any agent that calls
+`ArcticRLClient(reconnect_config=...)`. Or reuse this same runner for
+more eval, skipping training and cold-start:
+
+```bash
+python -m arctic_platform.integrations.harbor.harbor_runner \
+  --tasks-dir ./more_heldout \
+  --heldout-dir ./more_heldout \
+  --reuse-training-job-id $(jq -r .training_job_id  training-run/summary.json) \
+  --reuse-sampling-job-id $(jq -r .sampling_job_id  training-run/summary.json) \
+  --iters 0                         # no training, just baseline/final eval
+```
+
 ## What's in the box
 
 | File                       | Role |
