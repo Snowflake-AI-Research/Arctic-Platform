@@ -17,16 +17,21 @@
 
 TRL's protocol (``trl/experimental/api/training_client.py``) is two methods::
 
-    forward(model, input_ids, position_ids, completion_mask, aux_loss_coef) -> ForwardOutput
-    backward(grad_log_probs) -> None
+    forward_no_grad(model, input_ids, position_ids, completion_mask, aux_loss_coef) -> ForwardOutput
+    forward_backward(grad_log_probs) -> None
 
 The trainer computes its loss between the two calls and hands back ``d(loss)/d(log_probs)``. Everything
 algorithm-shaped stays on the TRL side, so this file has no notion of GRPO, advantages, or clipping ratios,
 and it does not grow when TRL adds a loss variant.
 
-The split into two methods is a split in TRL's interface, not a requirement on the backend: ``backward`` below
-issues the fused ``fwd_bwd`` call. Two round trips are inherent regardless, since the weights are a function of
-the log probs and cannot be known before the first forward.
+The names map one to one onto this wire: ``forward_no_grad`` is ``fwd_no_grad`` and ``forward_backward`` is
+``fwd_bwd``. The server therefore forwards the batch twice, once to score it and once to backpropagate, because
+the graph from the first pass cannot cross the wire. The second pass is what makes the gradient real despite
+the first being no-grad.
+
+Two round trips are inherent rather than a choice about where to put the split: the weights are a function of
+the log probs, so they cannot be known before the first forward. Tinker's ``forward`` plus
+``forward_backward_custom`` has the same shape.
 """
 
 from typing import Any
@@ -60,7 +65,7 @@ class ArcticTrainingClient:
         self.loss_fn = loss_fn
         self._batch: dict | None = None
 
-    def forward(
+    def forward_no_grad(
         self,
         model: torch.nn.Module,
         input_ids: torch.Tensor,
@@ -68,6 +73,7 @@ class ArcticTrainingClient:
         completion_mask: torch.Tensor,
         aux_loss_coef: float = 0.0,
     ) -> ForwardOutput:
+        """Score the batch. No graph is built here, and none is needed: see `forward_backward` below."""
         # `model` is the trainer's local module. Arctic owns the weights, so it is unused here.
         #
         # AsyncGRPOTrainer packs a rank's samples into one padding-free row and marks sequence boundaries by
@@ -76,6 +82,8 @@ class ArcticTrainingClient:
         batch = _unpack_to_padded_rows(input_ids, position_ids, completion_mask)
         self._batch = batch
 
+        # No grad, so nothing on the server survives this call. The batch is kept above because
+        # `forward_backward` has to send it again to rebuild the graph.
         response = self.client.fwd_no_grad(
             batch,
             processing={
@@ -86,7 +94,8 @@ class ArcticTrainingClient:
         out = response["batch"]
 
         # Hand back a leaf tensor: the trainer's `loss.backward()` stops here and deposits
-        # d(loss)/d(log_probs) into `.grad`, which is what arrives at `backward` below.
+        # d(loss)/d(log_probs) into `.grad`, which is what arrives at `forward_backward` below. The tensor is
+        # differentiable on the TRL side even though the call above built no graph on the server.
         #
         # The server returns log probs under the roll(-1) convention and TRL expects the [:, 1:] shift, so
         # the repack aligns them rather than merely reshaping.
@@ -96,8 +105,13 @@ class ArcticTrainingClient:
             aux_loss=None,  # Arctic reports the MoE aux loss as a metric, not as a differentiable tensor
         )
 
-    def backward(self, grad_log_probs: torch.Tensor) -> None:
-        assert self._batch is not None, "backward() called without a preceding forward()"
+    def forward_backward(self, grad_log_probs: torch.Tensor) -> None:
+        """Forward the batch again, this time with a graph, and backpropagate the surrogate through it.
+
+        This is the second of the two forwards. `fwd_bwd` runs the model, applies `weighted_logprob_sum`, and
+        backpropagates it, so the gradient is built here rather than carried over from the scoring pass.
+        """
+        assert self._batch is not None, "forward_backward() called without a preceding forward_no_grad()"
 
         batch = dict(self._batch)
         # `_shifted` marks the roll(-1) convention, matching the other log-prob tensors in the batch.
