@@ -93,102 +93,102 @@ delta is entirely what `sync_weights` pushed over 15 GRPO steps.
 [19:48:42] harbor_runner: reconnect config -> /tmp/harbor_e2e_cpj6wule/reconnect_config.json  (train_job_id='80abd123-5026-493c-8704-eeab95d30f34:training:0')
 [19:48:42] harbor_runner: operand ranges: a in [100,999], b in [10,99], op=mul
 [19:48:42] harbor_runner: BASELINE harbor run (greedy, k=1) ...
-[19:48:42] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_heldout -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name baseline -n 4 -k 1 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.0 --ak max_tokens=64
+[19:48:42] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_heldout -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name baseline -n 4 -k 1 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.0 --ak max_tokens=64
   80/80 Mean: 0.580 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:01:21 0:00:00
 Total runtime: 1m 21s
 [19:50:08] harbor_runner: BASELINE pass@1 = 0.362  (29/80)
 [19:50:08] harbor_runner: STEP 00 harbor run (k=4, temp=0.8) ...
-[19:50:08] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_00 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_00 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:50:08] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_00 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_00 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.375 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:24 0:00:00
 Total runtime: 24s
 [19:50:37] harbor_runner:   rollouts=24 reward_mean=0.375 correct=1
 [19:50:52] harbor_runner:   step 00: loss=0.11398084461688995 grad_norm=11.34607982635498
 [19:50:52] harbor_runner: STEP 01 harbor run (k=4, temp=0.8) ...
-[19:50:52] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_01 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_01 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:50:52] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_01 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_01 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.490 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:26 0:00:00
 Total runtime: 26s
 [19:51:24] harbor_runner:   rollouts=24 reward_mean=0.490 correct=2
 [19:51:27] harbor_runner:   step 01: loss=0.08569996058940887 grad_norm=23.015792846679688
 [19:51:27] harbor_runner: STEP 02 harbor run (k=4, temp=0.8) ...
-[19:51:27] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_02 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_02 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:51:27] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_02 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_02 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.867 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:24 0:00:00
 Total runtime: 24s
 [19:51:56] harbor_runner:   rollouts=24 reward_mean=0.867 correct=19
 [19:51:58] harbor_runner:   step 02: loss=-0.02910039946436882 grad_norm=13.278753280639648
 [19:51:58] harbor_runner: STEP 03 harbor run (k=4, temp=0.8) ...
-[19:51:58] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_03 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_03 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:51:58] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_03 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_03 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.731 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:22 0:00:00
 Total runtime: 22s
 [19:52:25] harbor_runner:   rollouts=24 reward_mean=0.731 correct=11
 [19:52:27] harbor_runner:   step 03: loss=0.13956864178180695 grad_norm=20.006765365600586
 [19:52:27] harbor_runner: STEP 04 harbor run (k=4, temp=0.8) ...
-[19:52:27] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_04 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_04 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:52:27] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_04 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_04 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.688 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:24 0:00:00
 Total runtime: 24s
 [19:52:56] harbor_runner:   rollouts=24 reward_mean=0.688 correct=8
 [19:52:58] harbor_runner:   step 04: loss=0.0731629878282547 grad_norm=11.550259590148926
 [19:52:58] harbor_runner: STEP 05 harbor run (k=4, temp=0.8) ...
-[19:52:58] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_05 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_05 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:52:58] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_05 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_05 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.727 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:25 0:00:00
 Total runtime: 25s
 [19:53:28] harbor_runner:   rollouts=24 reward_mean=0.727 correct=8
 [19:53:30] harbor_runner:   step 05: loss=-0.01078917644917965 grad_norm=20.566085815429688
 [19:53:30] harbor_runner: STEP 06 harbor run (k=4, temp=0.8) ...
-[19:53:30] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_06 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_06 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:53:30] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_06 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_06 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.975 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:24 0:00:00
 Total runtime: 24s
 [19:54:00] harbor_runner:   rollouts=24 reward_mean=0.975 correct=22
 [19:54:02] harbor_runner:   step 06: loss=0.028516920283436775 grad_norm=7.46567440032959
 [19:54:02] harbor_runner: STEP 07 harbor run (k=4, temp=0.8) ...
-[19:54:02] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_07 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_07 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:54:02] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_07 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_07 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.592 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:22 0:00:00
 Total runtime: 22s
 [19:54:29] harbor_runner:   rollouts=24 reward_mean=0.592 correct=3
 [19:54:30] harbor_runner:   step 07: loss=0.21964552998542786 grad_norm=20.63243293762207
 [19:54:30] harbor_runner: STEP 08 harbor run (k=4, temp=0.8) ...
-[19:54:30] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_08 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_08 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:54:30] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_08 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_08 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.685 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:22 0:00:00
 Total runtime: 22s
 [19:54:58] harbor_runner:   rollouts=24 reward_mean=0.685 correct=5
 [19:55:00] harbor_runner:   step 08: loss=0.030171938240528107 grad_norm=23.26975440979004
 [19:55:00] harbor_runner: STEP 09 harbor run (k=4, temp=0.8) ...
-[19:55:00] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_09 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_09 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:55:00] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_09 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_09 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.765 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:25 0:00:00
 Total runtime: 25s
 [19:55:30] harbor_runner:   rollouts=24 reward_mean=0.765 correct=12
 [19:55:32] harbor_runner:   step 09: loss=-0.0029197190888226032 grad_norm=7.181921482086182
 [19:55:32] harbor_runner: STEP 10 harbor run (k=4, temp=0.8) ...
-[19:55:32] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_10 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_10 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:55:32] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_10 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_10 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.715 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:23 0:00:00
 Total runtime: 23s
 [19:56:00] harbor_runner:   rollouts=24 reward_mean=0.715 correct=8
 [19:56:02] harbor_runner:   step 10: loss=0.014213311485946178 grad_norm=7.516313552856445
 [19:56:02] harbor_runner: STEP 11 harbor run (k=4, temp=0.8) ...
-[19:56:02] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_11 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_11 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:56:02] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_11 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_11 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.567 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:24 0:00:00
 Total runtime: 24s
 [19:56:31] harbor_runner:   rollouts=24 reward_mean=0.567 correct=1
 [19:56:33] harbor_runner:   step 11: loss=0.11922883987426758 grad_norm=17.599130630493164
 [19:56:33] harbor_runner: STEP 12 harbor run (k=4, temp=0.8) ...
-[19:56:33] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_12 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_12 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:56:33] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_12 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_12 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.746 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:28 0:00:00
 Total runtime: 28s
 [19:57:06] harbor_runner:   rollouts=24 reward_mean=0.746 correct=9
 [19:57:07] harbor_runner:   step 12: loss=0.030542073771357536 grad_norm=16.21636199951172
 [19:57:07] harbor_runner: STEP 13 harbor run (k=4, temp=0.8) ...
-[19:57:07] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_13 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_13 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:57:07] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_13 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_13 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.721 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:23 0:00:00
 Total runtime: 23s
 [19:57:36] harbor_runner:   rollouts=24 reward_mean=0.721 correct=9
 [19:57:37] harbor_runner:   step 13: loss=0.004016334190964699 grad_norm=7.457709312438965
 [19:57:37] harbor_runner: STEP 14 harbor run (k=4, temp=0.8) ...
-[19:57:37] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_14 -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_14 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
+[19:57:37] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_step_14 -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name step_14 -n 4 -k 4 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.8 --ak max_tokens=64
   24/24 Mean: 0.840 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:26 0:00:00
 Total runtime: 26s
 [19:58:08] harbor_runner:   rollouts=24 reward_mean=0.840 correct=16
 [19:58:10] harbor_runner:   step 14: loss=0.006514507811516523 grad_norm=5.4572625160217285
 [19:58:10] harbor_runner: FINAL harbor run (greedy, k=1) ...
-[19:58:10] harbor_runner: $ /home/yak/miniconda3/envs/skyrl_arl/bin/harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_heldout -a arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.host_environment:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name final -n 4 -k 1 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.0 --ak max_tokens=64
+[19:58:10] harbor_runner: $ harbor run -p /tmp/harbor_e2e_cpj6wule/dataset_heldout -a arctic_platform.integrations.harbor.agent:CortexRLAgent -m Qwen/Qwen3-0.6B -e arctic_platform.integrations.harbor.env:HostEnvironment -o /tmp/harbor_e2e_cpj6wule/harbor_jobs --job-name final -n 4 -k 1 --yes --no-force-build --ak reconnect_config_path=/tmp/harbor_e2e_cpj6wule/reconnect_config.json --ak temperature=0.0 --ak max_tokens=64
   80/80 Mean: 0.696 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:01:10 0:00:00
 Total runtime: 1m 10s
 [19:59:25] harbor_runner: FINAL pass@1 = 0.350  (28/80)
