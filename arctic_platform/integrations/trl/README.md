@@ -8,11 +8,15 @@ layout helpers in `client.py` are stubs and nothing here has run against a live 
 TRL's `TrainingClientProtocol` is two methods:
 
 ```python
-forward(model, input_ids, position_ids, completion_mask, aux_loss_coef) -> ForwardOutput
-backward(grad_log_probs) -> None
+forward_no_grad(model, input_ids, position_ids, completion_mask, aux_loss_coef) -> ForwardOutput
+forward_backward(grad_log_probs) -> None
 ```
 
-The trainer computes its loss on the log probs returned by `forward` and hands back `d(loss)/d(log_probs)`.
+They map one to one onto `fwd_no_grad` and `fwd_bwd`. The server forwards the batch twice, once to score it
+and once to backpropagate, because the graph from the first pass cannot cross the wire.
+
+The trainer computes its loss on the log probs returned by the first call and hands back
+`d(loss)/d(log_probs)`.
 The server backpropagates `sum(w * logprobs)`, a first-order surrogate whose gradient with respect to every
 parameter equals the gradient of the real loss. The loss itself never crosses the wire.
 
@@ -21,7 +25,7 @@ tensors, for both the co-located variant and the two-forward variant a remote ba
 
 ## Why not a fused `forward_backward(..., "grpo_loss")`
 
-That was the suggestion on the PR thread, and `backward` here does issue the fused `fwd_bwd`. The split is in
+That was the suggestion on the PR thread, and `forward_backward` here does issue the fused `fwd_bwd`. The split is in
 TRL's interface, not in what the backend does. Two round trips are inherent either way, because the weights
 are a function of the log probs and cannot be known before the first forward. Tinker's
 `forward` + `forward_backward_custom` has the same shape.
@@ -67,7 +71,7 @@ Nothing. `training_client=` already exists on `AsyncGRPOTrainer` alongside the `
    and an empty CUDA model wastes full model memory. A stub module carrying names and shapes is the likely
    answer. TRL-side work.
 2. **Microbatch scaling.** TRL scales its loss for gradient accumulation before the gradient reaches
-   `backward`, so the weights arrive pre-scaled. If `run_pipeline` applies its own per-microbatch
+   `forward_backward`, so the weights arrive pre-scaled. If `run_pipeline` applies its own per-microbatch
    normalization on top, one of the two has to be disabled.
 3. **Batch layout.** The padding-free row to padded rows conversion is stubbed out. Mechanical, but it is
    where a first integration spends its time.
