@@ -1,0 +1,70 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harbor-cortex-backend"
+version = "0.1.0"
+description = "Cortex Training backend for Harbor — turns a Harbor eval into a training run"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [{ name = "Snowflake AI Research" }]
+keywords = ["harbor", "reinforcement-learning", "cortex", "llm", "post-training"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    # Harbor drives the loop; this package is a plugin.
+    "harbor",
+    # Cortex Training client + RolloutDataset / GRPO batch types.
+    "arctic-platform",
+    # Chat templates for the driver-side tokenization step.
+    "transformers>=4.44",
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.urls]
+"Homepage"     = "https://github.com/Snowflake-AI-Research/Arctic-Platform"
+"Documentation" = "https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/harbor_cortex_backend"
+
+# ---------------------------------------------------------------------------
+# Harbor plugin registration.
+#
+# Harbor discovers plugins via ``importlib.metadata.entry_points(group=
+# "harbor.plugins")`` — see ``harbor.cli.plugin_registry``. Once this
+# package is installed, users can pass short names instead of full
+# ``module:Class`` import paths on the ``harbor run`` CLI, e.g.::
+#
+#   harbor run --agent arctic-cortex-agent --env arctic-cortex-env ...
+#
+# ---------------------------------------------------------------------------
+[project.entry-points."harbor.plugins"]
+arctic-cortex-agent = "harbor_cortex_backend.agent:CortexRLAgent"
+arctic-cortex-env   = "harbor_cortex_backend.env:HostEnvironment"
+
+# ---------------------------------------------------------------------------
+# Console scripts. Harbor doesn't yet have a ``harbor train`` subcommand, so
+# training is invoked via ``harbor-cortex-train`` — a thin CLI that drives
+# real ``harbor run`` between GRPO steps. If/when Harbor adds a ``train``
+# subcommand that discovers backends via entry points, ``harbor_cortex_backend
+# .train:main`` is a drop-in implementation.
+# ---------------------------------------------------------------------------
+[project.scripts]
+harbor-cortex-train     = "harbor_cortex_backend.train:cli"
+harbor-cortex-aggregate = "harbor_cortex_backend.aggregate:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["harbor_cortex_backend*"]
