@@ -4,7 +4,7 @@
 
 Usage::
 
-    python -m arctic_platform.integrations.harbor.aggregate_runs \\
+    harbor-cortex-aggregate \\
         /tmp/harbor_e2e_seed0/summary.json \\
         /tmp/harbor_e2e_seed1/summary.json \\
         /tmp/harbor_e2e_seed2/summary.json

@@ -16,10 +16,12 @@ import uuid
 
 import torch
 
-from arctic_platform.integrations.harbor.models import InferenceEndpoint
-from arctic_platform.integrations.harbor.models import PostTrainingConfig
-from arctic_platform.integrations.harbor.models import RolloutDataset
-from arctic_platform.integrations.harbor.models import TrainingRun
+from arctic_platform.integrations.harbor.models import (
+    InferenceEndpoint,
+    PostTrainingConfig,
+    RolloutDataset,
+    TrainingRun,
+)
 
 
 def _grpo_advantages(rewards: list[float], group_ids: list[str]) -> list[float]:

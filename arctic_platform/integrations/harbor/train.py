@@ -28,8 +28,13 @@ from arctic_platform.integrations.harbor.models import PostTrainingConfig
 from arctic_platform.integrations.harbor.task_gen import write_dataset
 
 
-DEFAULT_AGENT_PATH = "arctic_platform.integrations.harbor.cortex_agent:CortexRLAgent"
-DEFAULT_ENV_PATH = "arctic_platform.integrations.harbor.host_environment:HostEnvironment"
+# Import paths passed to ``harbor run --agent/--env``. Users can also refer
+# to these by the short names registered in the ``harbor.plugins``
+# entry-point group in Arctic-Platform's top-level ``pyproject.toml``:
+#   ``arctic-cortex-agent`` -> arctic_platform.integrations.harbor.agent:CortexRLAgent
+#   ``arctic-cortex-env``   -> arctic_platform.integrations.harbor.env:HostEnvironment
+DEFAULT_AGENT_PATH = "arctic_platform.integrations.harbor.agent:CortexRLAgent"
+DEFAULT_ENV_PATH = "arctic_platform.integrations.harbor.env:HostEnvironment"
 # Verifier: Harbor's default ``harbor.verifier.verifier:Verifier``. It uploads
 # each task's ``tests/`` dir into the environment, execs ``test.sh``, and reads
 # ``/logs/verifier/reward.txt``. No custom BaseVerifier subclass, no
@@ -452,5 +457,10 @@ async def main() -> None:
         backend.cancel()
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Synchronous entry point for the ``harbor-cortex-train`` console script."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli()
