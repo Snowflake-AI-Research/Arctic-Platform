@@ -9,9 +9,9 @@ root. Harbor's canonical container paths (``/tests``, ``/logs``, ``/solution``,
 ``/harbor``) are rewritten to that root before commands run, so tasks and
 verifiers that use those paths behave the same as under Docker.
 
-This is not a substitute for a real container sandbox — there's no isolation
-— but it lets Harbor's trial runner drive a task on a machine that has no
-Docker/podman/user-namespaces access (e.g., a locked-down Snowflake VM).
+Not a substitute for a container sandbox — there's no isolation — but it
+lets Harbor's trial runner drive tasks on hosts without Docker / podman /
+user-namespace access. Development-only.
 """
 
 from __future__ import annotations

@@ -3,10 +3,10 @@
 """A minimal Harbor BaseAgent that samples from a Cortex sub-job.
 
 Reattaches to an already-running training/sampling pair via
-``ArcticRLClient.reconnect_config`` (the exact mechanism SkyRL / verl use for
-their driver-side workers), calls the sampling sub-job for one completion,
-and writes a Harbor-shaped ``RolloutDetail`` so downstream (adapter -> Arctic
-GRPO backend) can consume it 1:1. No LiteLLM proxy, no HTTP hop.
+``ArcticRLClient.reconnect_config`` (same mechanism SkyRL and verl use
+for their driver-side workers), calls the sampling sub-job for one
+completion, and writes a Harbor-shaped ``RolloutDetail`` so the adapter
+can hand it to the Arctic GRPO backend 1:1.
 """
 
 from __future__ import annotations

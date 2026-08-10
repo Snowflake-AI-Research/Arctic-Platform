@@ -1,14 +1,13 @@
-# Real Harbor CLI + Arctic Cortex — end-to-end run log
+# Harbor CLI + Arctic Cortex — end-to-end run log
 
-Every LLM call happens inside a real `harbor run` trial: Harbor's own
-trial runner spawning `CortexRLAgent` (BaseAgent) under
-`HostEnvironment` (BaseEnvironment), scored by Harbor's **stock**
-`harbor.verifier.verifier:Verifier` — which uploads the task's
-`tests/test.sh` and reads `/logs/verifier/reward.txt`. No custom
-`BaseVerifier` subclass, no `--verifier` override on the CLI.
+Every LLM call happens inside a `harbor run` trial: Harbor's trial
+runner spawns `CortexRLAgent` (BaseAgent) under `HostEnvironment`
+(BaseEnvironment), scored by Harbor's stock `Verifier` execing each
+task's `tests/test.sh` and reading `/logs/verifier/reward.txt`. No
+custom `BaseVerifier` subclass, no `--verifier` override.
 
-The driver reads Harbor's on-disk `result.json`, hands the rollouts
-to `ArcticCortexBackend.train` on Cortex QA6, and `sync_weights`
+Between trials the driver reads `result.json`, hands the rollouts to
+`ArcticCortexBackend.train` on Cortex QA6, and `sync_weights`
 propagates the new weights so the next `harbor run` samples from an
 improved model at the same sub-job endpoint.
 
@@ -18,8 +17,9 @@ improved model at the same sub-job endpoint.
 - Task: 3-digit × 2-digit MUL (a ∈ [100, 999], b ∈ [10, 99])
 - GRPO: 15 steps × 24 rollouts/step (6 prompts × 4 attempts), lr=5e-6, temp=0.8
 - Held-out: 80 problems, greedy (temperature=0)
-- Verifier: Harbor's stock `Verifier` running our `tests/test.sh` (last-integer
-  match, comma-normalized, dense partial credit by relative error).
+- Verifier: Harbor's stock `Verifier` running our `tests/test.sh`
+  (last-integer match, comma-normalized, dense partial credit by
+  relative error).
 - 3 independent seeds
 
 ## Headline
@@ -34,13 +34,11 @@ aggregate over 3 runs (bootstrap 95% CI on the mean delta, 10k resamples):
   mean held-out reward delta +0.100 ± 0.011   95% CI [+0.090, +0.116]
 ```
 
-**pass@1** is essentially unchanged (CI spans zero) — a 0.6B model
-doesn't reliably fix arithmetic in 15 GRPO steps.
-**Mean held-out reward** moves **+10.0 pp with a tight, positive CI**
-across three independent seeds — real, statistically clean improvement
-in output quality that pass@1's binary threshold hides.
+`pass@1` CI spans zero — a 0.6B model doesn't fix arithmetic in 15 GRPO
+steps. Mean held-out reward moves +10.0 pp, 95% CI [+9.0, +11.6]:
+improvement in output quality that pass@1's binary threshold hides.
 
-### What the mean-reward improvement actually is (seed 0 dissection)
+### Reward distribution shift (seed 0)
 
 Distribution of the 80 held-out rewards, baseline vs. after 15 GRPO steps:
 

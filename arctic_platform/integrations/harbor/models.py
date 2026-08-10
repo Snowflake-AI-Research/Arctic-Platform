@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Data contract for the Harbor -> Arctic post-training backend.
 
-Mirrors the RFC (rfcs/harbor-post-training-backend.md) and Harbor's own
-``LLMResponse`` rollout fields (prompt_token_ids / completion_token_ids /
-logprobs) so a Harbor job's rollout_details map onto ``Rollout`` 1:1.
+Mirrors the Harbor post-training RFC and Harbor's own ``LLMResponse``
+rollout fields (prompt_token_ids / completion_token_ids / logprobs) so
+a Harbor job's ``rollout_details`` map onto ``Rollout`` 1:1.
 """
 
 from __future__ import annotations

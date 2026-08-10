@@ -1,12 +1,12 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end demo: real ``harbor run`` -> Arctic GRPO on Cortex -> real ``harbor run``.
+"""``harbor-cortex-train``: alternate ``harbor run`` -> GRPO -> ``sync_weights``.
 
-Every LLM call happens inside a Harbor trial (real ``BaseAgent``, real
-``BaseEnvironment``, real ``BaseVerifier``, real ``RolloutDetail`` written to
-``result.json``). The middle step reads Harbor's on-disk output, hands it to
-``ArcticCortexBackend.train`` on real Cortex QA6, and ``sync_weights`` makes
-the next ``harbor run`` sample from the updated model at the same endpoint.
+Each LLM call happens inside a Harbor trial (``BaseAgent`` under
+``BaseEnvironment``, ``RolloutDetail`` written to ``result.json``). The
+middle step reads Harbor's on-disk output, hands it to
+``ArcticCortexBackend.train``, and ``sync_weights`` makes the next
+``harbor run`` sample from the updated model at the same endpoint.
 """
 
 from __future__ import annotations

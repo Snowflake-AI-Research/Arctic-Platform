@@ -2,23 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Harbor plugin: train models on Cortex from inside Harbor's own CLI.
 
-Positioned as a plugin *for Harbor*, distributed with ``arctic_platform``
-as a subpackage under ``arctic_platform.integrations.harbor``. Ships:
+Public surface:
 
-* Harbor extensions — ``CortexRLAgent`` (BaseAgent) and ``HostEnvironment``
-  (BaseEnvironment). Referenced from ``harbor run --agent/--env`` either
-  by full ``module:Class`` import path or by the short names registered
-  in the ``harbor.plugins`` entry-point group (see the top-level
-  ``pyproject.toml``): ``arctic-cortex-agent`` and ``arctic-cortex-env``.
-* Data contract — ``Rollout``, ``RolloutDataset``, ``PostTrainingConfig``,
-  ``TrainingProgress``, ``TrainingRun``, ``InferenceEndpoint``.
-* Backend — ``ArcticCortexBackend`` implements the Harbor post-training
-  RFC's ``PostTrainingBackend`` protocol over Cortex Training.
-* Driver — ``train.cli`` is the entry point behind the
-  ``harbor-cortex-train`` console script.
+* ``CortexRLAgent`` (BaseAgent) and ``HostEnvironment`` (BaseEnvironment)
+  — Harbor extensions. Referenced from ``harbor run --agent / --env``
+  by full ``module:Class`` import path, or by the short names
+  ``arctic-cortex-agent`` and ``arctic-cortex-env`` registered in the
+  ``harbor.plugins`` entry-point group (see the top-level
+  ``pyproject.toml``).
+* ``Rollout``, ``RolloutDataset``, ``PostTrainingConfig``,
+  ``TrainingProgress``, ``TrainingRun``, ``InferenceEndpoint`` — the
+  post-training RFC's data contract.
+* ``ArcticCortexBackend`` — RFC ``PostTrainingBackend`` protocol
+  implementation over Cortex Training.
+* ``train.cli`` — entry point behind the ``harbor-cortex-train``
+  console script.
 
-Scoring uses Harbor's stock ``Verifier``, which uploads and execs each
-task's ``tests/test.sh``. No custom ``BaseVerifier`` subclass.
+Scoring uses Harbor's stock ``Verifier`` execing each task's
+``tests/test.sh``. See ``README.md`` for the user-facing flow.
 """
 
 from arctic_platform.integrations.harbor.adapter import load_job_dir, pass_at_1
