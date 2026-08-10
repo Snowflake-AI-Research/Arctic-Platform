@@ -105,8 +105,8 @@ python recipes/rl_loop.py config=recipes/config.json \
 ### MoE / expert parallelism (`ep_size`)
 
 MoE checkpoints like `Qwen/Qwen3.6-35B-A3B` need Prime-RL plus expert
-parallelism. Set `model_provider=prime_rl` and `ep_size` so that `n_gpus` is a
-multiple of `ep_size` (e.g. 8 GPUs with `ep_size=4`):
+parallelism. Set `model_provider=prime_rl` and `ep_size` so that the training
+GPU count is a multiple of `ep_size` (e.g. 8 GPUs with `ep_size=4`):
 
 ```bash
 python recipes/sft_loop.py config=recipes/config.json \
@@ -122,4 +122,22 @@ python recipes/sft_loop.py config=recipes/config.json max_length=4096
 
 python recipes/rl_loop.py config=recipes/config.json \
     lora_rank=32 max_tokens=512 max_seq_len=2048
+```
+
+### Router replay (MoE)
+
+Router replay caches MoE routing decisions from sampling and replays them on
+the training forward/backward. Enable it on a colocated sampling+training job
+(typically with `model_provider=prime_rl` and `ep_size`):
+
+```bash
+python recipes/rl_loop.py config=recipes/config.json \
+    model_name=Qwen/Qwen3.6-35B-A3B \
+    model_provider=prime_rl ep_size=8 \
+    router_replay=True \
+    router_replay_max_cache_bytes=2147483648 \
+    training_gpus=8 sampling_gpus=8 \
+    gpu_memory_utilization=0.7 \
+    lora_rank=32 \
+    max_seq_len=4096 max_tokens=2048
 ```

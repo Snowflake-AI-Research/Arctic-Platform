@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 IGNORE_INDEX = -100
+_ROUTER_REPLAY_DEFAULT_MAX_CACHE_BYTES = 16 * 1024**3
 
 
 def make_client(config_path: str, **overrides: Any) -> NeutrinoClient:
@@ -97,6 +98,84 @@ def stop_params_for(stop_sequences: Sequence[Any]) -> dict:
     return params
 
 
+def router_replay_config(
+    enabled: bool = True,
+    max_cache_bytes: int | None = None,
+) -> dict[str, Any]:
+    if not enabled:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "max_cache_bytes": int(
+            _ROUTER_REPLAY_DEFAULT_MAX_CACHE_BYTES
+            if max_cache_bytes is None
+            else max_cache_bytes
+        ),
+    }
+
+
+def router_replay_stop_params(
+    stop_sequences: Sequence[Any],
+    tokenizer: Any | None = None,
+) -> dict:
+    params = stop_params_for(stop_sequences)
+    strings = [stop for stop in stop_sequences if isinstance(stop, str)]
+    if len(strings) == 0:
+        return params
+    if tokenizer is None:
+        raise ValueError(
+            "router replay with string stop sequences needs a tokenizer to "
+            "build dss_stop_token_sequences"
+        )
+    params["dss_stop_token_sequences"] = [
+        [int(token) for token in tokenizer.encode(stop, add_special_tokens=False)]
+        for stop in strings
+    ]
+    return params
+
+
+def sampling_params_with_sample_ids(
+    base_params: dict,
+    sample_ids: Sequence[str],
+) -> list[dict]:
+    """Per-prompt sampling params carrying ``dss_sample_id`` for router replay."""
+    return [{**base_params, "dss_sample_id": sample_id} for sample_id in sample_ids]
+
+
+def bootstrap_router_replay(
+    client: NeutrinoClient,
+    job_id: str,
+    max_cache_bytes: int | None = None,
+) -> dict:
+    training = training_sub_job_id(job_id)
+    sampling = sampling_sub_job_id(job_id)
+    result = client.bootstrap_router_replay(
+        job_id,
+        source_sub_job_id=sampling,
+        target_sub_job_id=training,
+        max_cache_bytes=max_cache_bytes,
+        sub_job_id=training,
+        sub_job_type="training",
+    )
+    request_id = result.get("request_id") if isinstance(result, dict) else None
+    if request_id is not None:
+        return client.poll_request(job_id, request_id)
+    return result
+
+
+def discard_router_replay(
+    client: NeutrinoClient,
+    job_id: str,
+    sample_ids: Sequence[str],
+) -> dict:
+    return client.router_replay_discard(
+        job_id,
+        list(sample_ids),
+        sub_job_id=sampling_sub_job_id(job_id),
+        sub_job_type="sampling",
+    )
+
+
 @dataclass
 class TrainSequence:
     input_ids: list[int]
@@ -174,6 +253,7 @@ def collate(
     max_seq_len: int,
     pad_to_max_seq_len: bool = False,
     with_rl_context: bool = False,
+    temperature: float | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
 
     if len(sequences) == 0:
@@ -214,6 +294,12 @@ def collate(
         .contiguous(),
         use_cache=False,
     )
+    if temperature is not None:
+        kwargs["temperature"] = torch.full(
+            (len(sequences), width),
+            float(temperature),
+            dtype=torch.float32,
+        )
     context: dict[str, torch.Tensor] = {}
     if with_rl_context:
         context = dict(
@@ -234,16 +320,33 @@ def forward_backward_step(
     context: dict[str, torch.Tensor] | None = None,
     learning_rate: float | None = None,
     processing: dict | None = None,
+    rr_sample_ids: Sequence[str] | None = None,
+    rr_discard: bool = True,
+    router_replay_sampling_job_id: str | None = None,
 ) -> tuple[dict, dict]:
     frame: dict[str, Any] = {"args": (), "kwargs": kwargs}
     if context:
         frame["context"] = context
     if processing:
         frame["processing"] = processing
-    payload = wire.dumps(
-        frame,
-        metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}},
-    )
+    if rr_sample_ids is not None:
+        frame["rr_sample_ids"] = list(rr_sample_ids)
+        frame["rr_discard"] = bool(rr_discard)
+
+    metadata: dict[str, Any] = {
+        "response_options": {"format": "dssst1", "delivery": "chunked"},
+    }
+    if router_replay_sampling_job_id is not None:
+        metadata["router_replay"] = {
+            "sampling_job_id": str(router_replay_sampling_job_id),
+        }
+    elif rr_sample_ids is not None:
+        raise ValueError(
+            "rr_sample_ids requires router_replay_sampling_job_id "
+            "(the sampling sub-job id)"
+        )
+
+    payload = wire.dumps(frame, metadata=metadata)
     request_id = client.forward_backward(job_id, payload)
     fwd_bwd_result = client.poll_request(job_id, request_id)
     request_id = client.step(job_id, learning_rate=learning_rate)
