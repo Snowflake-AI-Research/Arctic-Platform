@@ -71,6 +71,15 @@ def _make_response(json_body=None, status_code: int = 200):
     return resp
 
 
+def _make_error_response(json_body, status_code: int = 409):
+    resp = nc.requests.Response()
+    resp.status_code = status_code
+    resp.url = "http://test.local/error"
+    resp.headers["Content-Type"] = "application/json"
+    resp._content = json.dumps(json_body).encode("utf-8")
+    return resp
+
+
 def _make_client(post_json=None, get_json=None) -> NeutrinoClient:
     client = NeutrinoClient(
         base_url="http://test.local",
@@ -937,8 +946,14 @@ class TestDataPlane:
         assert rid == "r1"
         url, kwargs = c._session.post.call_args
         assert url[0] == f"{c._prefix}/j1/forward-backward"
-        assert kwargs["data"] == b"\x01\x02"
         assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
+        from dss_client import wire
+
+        metadata = wire.read_byte_chunk_metadata(kwargs["data"])
+        assert metadata["operation"] == "fwd-bwd"
+        assert metadata["chunk_idx"] == 0
+        assert metadata["total_chunks"] == 1
+        assert wire.decode_byte_chunks([kwargs["data"]], kind="request") == b"\x01\x02"
 
     def test_forward_backward_chunks_oversized_payload(self):
         c = _make_client()
@@ -955,6 +970,92 @@ class TestDataPlane:
         from dss_client import wire
 
         assert wire.read_byte_chunk_metadata(first)["operation"] == "fwd-bwd"
+        group_ids = {
+            wire.read_byte_chunk_metadata(call.kwargs["data"])["chunk_group_id"]
+            for call in c._session.post.call_args_list
+        }
+        assert len(group_ids) == 1
+
+    def test_forward_backward_replays_once_from_zero_on_restart_required(self):
+        c = _make_client()
+        c._MAX_FWD_BWD_BYTES = 64 * 1024
+        restart = _make_error_response(
+            {
+                "code": "517604",
+                "message": (
+                    'Cortex training forwardBackward failed: ZMD returned 409: '
+                    '{"detail":{"code":"chunk_group_restart_required",'
+                    '"message":"request chunk group state is missing; restart from chunk 0",'
+                    '"chunk_group_id":"group-a","received_chunk":1,'
+                    '"expected_start_chunk":0}}'
+                ),
+            }
+        )
+        c._session.post.side_effect = [
+            _make_response({"chunk_cached": True}),
+            restart,
+            _make_response({"chunk_cached": True}),
+            _make_response({"request_id": "r1"}),
+        ]
+
+        assert c.forward_backward("j1", b"x" * (70 * 1024)) == "r1"
+        assert c._session.post.call_count == 4
+
+        from dss_client import wire
+
+        sent = [call.kwargs["data"] for call in c._session.post.call_args_list]
+        metadata = [wire.read_byte_chunk_metadata(chunk) for chunk in sent]
+        assert [item["chunk_idx"] for item in metadata] == [0, 1, 0, 1]
+        assert len({item["chunk_group_id"] for item in metadata}) == 1
+        assert sent[0] == sent[2]
+        assert sent[1] == sent[3]
+
+    def test_forward_backward_limits_whole_group_replay_to_once(self):
+        c = _make_client()
+        c._MAX_FWD_BWD_BYTES = 64 * 1024
+
+        def restart_response():
+            return _make_error_response(
+                {
+                    "detail": {
+                        "code": "chunk_group_restart_required",
+                        "message": "request chunk group state is missing; restart from chunk 0",
+                        "chunk_group_id": "group-a",
+                        "received_chunk": 1,
+                        "expected_start_chunk": 0,
+                    }
+                }
+            )
+
+        c._session.post.side_effect = [
+            _make_response({"chunk_cached": True}),
+            restart_response(),
+            _make_response({"chunk_cached": True}),
+            restart_response(),
+        ]
+
+        with pytest.raises(nc.ChunkGroupRestartError):
+            c.forward_backward("j1", b"x" * (70 * 1024))
+        assert c._session.post.call_count == 4
+
+    def test_forward_backward_legacy_missing_chunks_409_is_not_blind_retried(self):
+        c = _make_client()
+        c.max_retries = 20
+        c._session.post.return_value = _make_error_response(
+            {
+                "code": "517604",
+                "message": (
+                    'Cortex training forwardBackward failed: ZMD returned 409: '
+                    '{"detail":{"message":"request chunk group is missing chunks",'
+                    '"chunk_group_id":"group-a","missing_chunks":[0,1]}}'
+                ),
+            }
+        )
+
+        with pytest.raises(nc.ChunkGroupConflictError) as exc_info:
+            c.forward_backward("j1", b"small")
+        assert exc_info.value.detail["code"] == "chunk_group_missing_chunks"
+        assert c._session.post.call_count == 1
 
     def test_generate_minimal_omits_optionals(self):
         c = _make_client(post_json={"request_id": "g1"})
@@ -1179,6 +1280,116 @@ class TestDataPlane:
             "source_job_id": "source-job",
         }
 
+    def test_load_with_target_sub_job(self):
+        c = _make_client(post_json={"request_id": "r-load"})
+        rid = c.load("j1", checkpoint_id="cp", target_sub_job_id="j1:training:0")
+
+        assert rid == "r-load"
+        c._session.post.assert_called_once_with(
+            f"{c._prefix}/j1/load",
+            json={"checkpoint_id": "cp", "target_sub_job_id": "j1:training:0"},
+        )
+
+    def test_load_omits_target_sub_job_when_none(self):
+        c = _make_client(post_json={"request_id": "r-load"})
+        c.load("j1", checkpoint_id="cp", target_sub_job_id=None)
+
+        assert c._session.post.call_args.kwargs["json"] == {"checkpoint_id": "cp"}
+
+    def test_load_with_source_job_and_target_sub_job(self):
+        c = _make_client(post_json={"request_id": "r-load"})
+        c.load(
+            "j1",
+            checkpoint_id="cp",
+            source_job_id="source-job",
+            target_sub_job_id="j1:training:1",
+        )
+
+        assert c._session.post.call_args.kwargs["json"] == {
+            "checkpoint_id": "cp",
+            "source_job_id": "source-job",
+            "target_sub_job_id": "j1:training:1",
+        }
+
+    def test_load_target_sub_job_wrong_session_returns_400(self):
+        """Server returns 400 when target_sub_job_id belongs to different session."""
+        c = _make_client()
+        c.max_retries = 0  # Skip retry backoff for error tests
+        resp = _make_response(
+            json_body={"error": "target_sub_job_id 'other-job:training:0' does not belong to session 'j1'"},
+            status_code=400
+        )
+        resp.raise_for_status.side_effect = nc.requests.exceptions.HTTPError(response=resp)
+        c._session.post.return_value = resp
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as exc_info:
+            c.load("j1", checkpoint_id="cp", target_sub_job_id="other-job:training:0")
+
+        assert exc_info.value.response.status_code == 400
+
+    def test_load_target_sub_job_sampling_returns_501(self):
+        """Server returns 501 when target_sub_job_id is a sampling sub-job."""
+        c = _make_client()
+        c.max_retries = 0
+        resp = _make_response(
+            json_body={"error": "target_sub_job_id 'j1:sampling:0' is a sampling sub-job; loading into non-training zone not supported"},
+            status_code=501
+        )
+        resp.raise_for_status.side_effect = nc.requests.exceptions.HTTPError(response=resp)
+        c._session.post.return_value = resp
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as exc_info:
+            c.load("j1", checkpoint_id="cp", target_sub_job_id="j1:sampling:0")
+
+        assert exc_info.value.response.status_code == 501
+
+    def test_load_target_sub_job_not_found_returns_400(self):
+        """Server returns 400 when target_sub_job_id doesn't exist in session."""
+        c = _make_client()
+        c.max_retries = 0
+        resp = _make_response(
+            json_body={"error": "target_sub_job_id 'j1:training:99' does not belong to session 'j1'"},
+            status_code=400
+        )
+        resp.raise_for_status.side_effect = nc.requests.exceptions.HTTPError(response=resp)
+        c._session.post.return_value = resp
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as exc_info:
+            c.load("j1", checkpoint_id="cp", target_sub_job_id="j1:training:99")
+
+        assert exc_info.value.response.status_code == 400
+
+    def test_load_empty_string_target_sub_job_id_sent_to_server(self):
+        """Documents that empty string target_sub_job_id is sent to server (not filtered).
+
+        Server will reject it. This test documents current behavior rather than
+        adding client-side validation (thin client design).
+        """
+        c = _make_client(post_json={"request_id": "r-load"})
+        c.load("j1", checkpoint_id="cp", target_sub_job_id="")
+
+        # Empty string is sent in the request body
+        assert c._session.post.call_args.kwargs["json"] == {
+            "checkpoint_id": "cp",
+            "target_sub_job_id": "",
+        }
+
+    def test_load_no_training_sub_job_in_session(self):
+        """Server returns 400 when session has no training sub-job and target is omitted."""
+        c = _make_client()
+        c.max_retries = 0
+        resp = _make_response(
+            json_body={"error": "session 'j1' has no training sub-job"},
+            status_code=400
+        )
+        resp.raise_for_status.side_effect = nc.requests.exceptions.HTTPError(response=resp)
+        c._session.post.return_value = resp
+
+        with pytest.raises(nc.requests.exceptions.HTTPError) as exc_info:
+            c.load("j1", checkpoint_id="cp")  # No target, sampling-only session
+
+        assert exc_info.value.response.status_code == 400
+
     def test_weight_sync(self):
         c = _make_client(post_json={"request_id": "r4"})
         rid = c.weight_sync(
@@ -1196,6 +1407,26 @@ class TestDataPlane:
             "payload": {
                 "source_sub_job_id": "j1:training:0",
                 "target_sub_job_ids": ["j1:sampling:0", "j1:sampling:1"],
+            },
+        }
+
+    def test_weight_sync_includes_lora_weight_format(self):
+        c = _make_client(post_json={"request_id": "r4-lora"})
+        rid = c.weight_sync(
+            "j1",
+            source_sub_job_id="j1:training:0",
+            target_sub_job_ids=["j1:sampling:0"],
+            weight_format="lora",
+        )
+        assert rid == "r4-lora"
+        assert c._session.post.call_args.kwargs["json"] == {
+            "operation_type": "weight-sync",
+            "sub_job_id": "j1:training:0",
+            "sub_job_type": "training",
+            "payload": {
+                "source_sub_job_id": "j1:training:0",
+                "target_sub_job_ids": ["j1:sampling:0"],
+                "weight_format": "lora",
             },
         }
 

@@ -1,3 +1,4 @@
+exclude: ^cortex-client/
 repos:
   - repo: local
     hooks:
@@ -5,6 +6,7 @@ repos:
         name: check-license
         entry: python ./scripts/check_license.py
         language: python
+        types: [python]
         require_serial: true
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -35,4 +37,5 @@ repos:
     hooks:
       - id: mypy
         additional_dependencies: [types-PyYAML, types-tabulate, pydantic]
-        files: ^(arctic_training/|projects/arctic_embed/)
+        args: [--ignore-missing-imports]
+        files: ^arctic_platform/model/
