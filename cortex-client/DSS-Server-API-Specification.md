@@ -66,6 +66,22 @@ is `log_prob`.
   Poll the request until it reaches a terminal state.
 - Some generic operations are synchronous and return their result directly.
 
+### 1.4 Model cache
+
+The following models are currently in the model cache:
+
+| Model | Training | Inference |
+|---|:---:|:---:|
+| `Qwen/Qwen3-0.6B` | ✅ | ✅ |
+| `Qwen/Qwen3-1.7B` | ✅ | ✅ |
+| `Qwen/Qwen3-8B` | ✅ | ✅ |
+| `Qwen/Qwen3.5-4B` | ✅ | ✅ |
+| `Qwen/Qwen3.6-35B-A3B` | ✅ | ✅ |
+| `deepseek-ai/DeepSeek-V4-Flash-0731` |  | ✅ |
+| `openai/gpt-oss-120b` |  | ✅ |
+| `zai-org/GLM-5.2` | coming soon | ✅ |
+| `zai-org/GLM-5.2-FP8` | coming soon | ✅ |
+
 ---
 
 ## 2. Connection, authentication, and headers
