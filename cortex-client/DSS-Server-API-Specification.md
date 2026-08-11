@@ -70,19 +70,17 @@ is `log_prob`.
 
 The following models are currently in the model cache:
 
-- `Qwen/Qwen3-0.6B`
-- `Qwen/Qwen3-1.7B`
-- `Qwen/Qwen3-8B`
-- `Qwen/Qwen3.5-4B`
-- `Qwen/Qwen3.6-35B-A3B`
-- `deepseek-ai/DeepSeek-V4-Flash-0731` (Inference only)
-- `openai/gpt-oss-120b` (Inference only)
-- `zai-org/GLM-5.2` (Inference only)
-- `zai-org/GLM-5.2-FP8` (Inference only)
-
-This is not an exhaustive support list. Sampling generally works with most Hugging
-Face models; training generally works with dense models. We also support
-training on MoE Qwen models with plans for more MoE model support soon!
+| Model | Training | Inference |
+|---|:---:|:---:|
+| `Qwen/Qwen3-0.6B` | ✅ | ✅ |
+| `Qwen/Qwen3-1.7B` | ✅ | ✅ |
+| `Qwen/Qwen3-8B` | ✅ | ✅ |
+| `Qwen/Qwen3.5-4B` | ✅ | ✅ |
+| `Qwen/Qwen3.6-35B-A3B` | ✅ | ✅ |
+| `deepseek-ai/DeepSeek-V4-Flash-0731` |  | ✅ |
+| `openai/gpt-oss-120b` |  | ✅ |
+| `zai-org/GLM-5.2` | coming soon | ✅ |
+| `zai-org/GLM-5.2-FP8` | coming soon | ✅ |
 
 ---
 
