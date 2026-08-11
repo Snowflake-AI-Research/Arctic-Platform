@@ -66,9 +66,9 @@ is `log_prob`.
   Poll the request until it reaches a terminal state.
 - Some generic operations are synchronous and return their result directly.
 
-### 1.4 Available models
+### 1.4 Model cache
 
-Sampling jobs currently support:
+The following models are currently in the model cache:
 
 - `Qwen/Qwen3-0.6B`
 - `Qwen/Qwen3-1.7B`
@@ -80,7 +80,9 @@ Sampling jobs currently support:
 - `zai-org/GLM-5.2`
 - `zai-org/GLM-5.2-FP8`
 
-Of these, training is currently supported for the Qwen models only.
+This is not an exhaustive support list. Sampling generally works with most Hugging
+Face models; training generally works with dense models. We also support
+training on MoE Qwen models with plans for more MoE model support soon!
 
 ---
 
