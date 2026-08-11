@@ -96,10 +96,6 @@ python recipes/sft_loop.py config=recipes/config.json lora_rank=64
 # SFT — batch_size must be a multiple of micro_batch_size * n_gpus
 python recipes/sft_loop.py config=recipes/config.json \
     n_gpus=4 batch_size=4 micro_batch_size=1
-
-# RL — split train vs sample; watch the per-account GPU cap
-python recipes/rl_loop.py config=recipes/config.json \
-    lora_rank=32 training_gpus=8 sampling_gpus=4
 ```
 
 ### MoE / expert parallelism (`ep_size`)
