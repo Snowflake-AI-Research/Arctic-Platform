@@ -50,7 +50,7 @@ class Config:
     config: str
     job_id: str | None = None
 
-    model_name: str = "Qwen/Qwen3.6-35B-A3B"
+    model_name: str = "Qwen/Qwen3-8B"
     n_gpus: int = 8
     micro_batch_size: int = 1
     zero_stage: int = 2
@@ -76,7 +76,7 @@ class Config:
     debug_image_tag: str | None = None
 
     log_path: str = "/tmp/dss-examples/sft-loop"
-    wandb_project: str = None
+    wandb_project: str | None = None
     wandb_name: str | None = None
 
 
@@ -182,9 +182,7 @@ def main(config: Config):
             f"Dropping last {n_dropped} examples to keep batch size uniform at "
             f"{config.batch_size}"
         )
-    total_steps = (
-        n_train_batches if config.max_steps is None else min(n_train_batches, config.max_steps)
-    )
+    total_steps = min(n_train_batches, config.max_steps)
     logger.info(f"Train batches: {n_train_batches}; training for {total_steps} steps")
 
     client = make_client(config.config)

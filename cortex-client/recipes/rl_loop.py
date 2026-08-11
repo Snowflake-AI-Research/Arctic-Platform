@@ -256,7 +256,7 @@ class Config:
     eval_max_tokens: int | None = None
 
     log_path: str = "/tmp/dss-examples/rl-loop"
-    wandb_project: str = None
+    wandb_project: str | None = None
     wandb_name: str | None = None
 
 

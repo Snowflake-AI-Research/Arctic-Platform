@@ -15,14 +15,14 @@ uv pip install -e cortex-client
 uv pip install 'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly'
 ```
 
-We assume you have the config we've provided under `recipes/config.json`.
+We assume you have the config we've provided under `recipes/config.json`, similar to `cortex-client/examples/config.json.template`.
 
 ## 2. Quick start
 
 Defaults already pick a model, LoRA, GPUs, and learning rate:
 
 ```bash
-# SFT — no_robots chat, Qwen/Qwen3.6-35B-A3B, LoRA-32, 8 GPUs, 100 steps
+# SFT — no_robots chat, Qwen/Qwen3-8B, LoRA-32, 8 GPUs, 100 steps
 python recipes/sft_loop.py config=recipes/config.json
 
 # RL — MATH, Qwen/Qwen3-8B, 4 train + 4 sample GPUs
@@ -38,7 +38,7 @@ always written under `log_path`; metrics are logged every step. Pass
 
 ### SFT
 
-On the default LoRA-32 / `no_robots` / `Qwen/Qwen3.6-35B-A3B` setup `train_mean_nll` typically starts around
+On the default LoRA-32 / `no_robots` / `Qwen/Qwen3-8B` setup `train_mean_nll` typically starts around
 ~10 and falls toward ~5 within ~100 steps.
 
 ### RL
@@ -66,7 +66,7 @@ python recipes/rl_loop.py config=recipes/config.json \
 
 ```bash
 python recipes/sft_loop.py config=recipes/config.json \
-    model_name=Qwen/Qwen3-8B
+    model_name=Qwen/Qwen3.6-35B-A3B
 ```
 
 ### Change dataset
@@ -105,14 +105,14 @@ python recipes/rl_loop.py config=recipes/config.json \
 ### MoE / expert parallelism (`ep_size`)
 
 MoE checkpoints like `Qwen/Qwen3.6-35B-A3B` need Prime-RL plus expert
-parallelism. Set `model_provider=prime_rl` and `ep_size` so that `n_gpus` is a
+parallelism for full fine-tuning. Set `model_provider=prime_rl` and `ep_size` so that `n_gpus` is a
 multiple of `ep_size` (e.g. 8 GPUs with `ep_size=4`):
 
 ```bash
 python recipes/sft_loop.py config=recipes/config.json \
     model_name=Qwen/Qwen3.6-35B-A3B \
     model_provider=prime_rl ep_size=4 \
-    n_gpus=8
+    n_gpus=8 lora_rank=0
 ```
 
 ### Sequence / generation length

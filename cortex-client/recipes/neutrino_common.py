@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import contextlib
-import io
 import json
 import logging
-import os
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
