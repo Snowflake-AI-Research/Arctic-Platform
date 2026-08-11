@@ -243,7 +243,7 @@ class Config:
     remove_constant_reward_groups: bool = True
 
     # 0 = dense FT. Set e.g. 32 for LoRA (r == alpha).
-    lora_rank: int = 0
+    lora_rank: int = 32
 
     debug_image_tag: str | None = None
 
