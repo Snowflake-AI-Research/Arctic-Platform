@@ -66,6 +66,22 @@ is `log_prob`.
   Poll the request until it reaches a terminal state.
 - Some generic operations are synchronous and return their result directly.
 
+### 1.4 Available models
+
+Sampling jobs currently support:
+
+- `Qwen/Qwen3-0.6B`
+- `Qwen/Qwen3-1.7B`
+- `Qwen/Qwen3-8B`
+- `Qwen/Qwen3.5-4B`
+- `Qwen/Qwen3.6-35B-A3B`
+- `deepseek-ai/DeepSeek-V4-Flash-0731`
+- `openai/gpt-oss-120b`
+- `zai-org/GLM-5.2`
+- `zai-org/GLM-5.2-FP8`
+
+Of these, training is currently supported for the Qwen models only.
+
 ---
 
 ## 2. Connection, authentication, and headers
