@@ -15,33 +15,32 @@
 
 """Arctic Platform backend for TRL's ``TrainingClientProtocol``.
 
-TRL's protocol (``trl/experimental/api/training_client.py``) is two methods::
+TRL's protocol is a single fused call::
 
-    forward_no_grad(model, input_ids, position_ids, completion_mask, aux_loss_coef) -> ForwardOutput
-    forward_backward(grad_log_probs) -> None
+    forward_backward(model, input_ids, position_ids, completion_mask, loss_fn, aux_loss_coef) -> ForwardBackwardOutput
 
-The trainer computes its loss between the two calls and hands back ``d(loss)/d(log_probs)``. Everything
-algorithm-shaped stays on the TRL side, so this file has no notion of GRPO, advantages, or clipping ratios,
-and it does not grow when TRL adds a loss variant.
+``loss_fn`` is a Python callable mapping per-token log probs to a scalar. It closes over everything
+algorithm-shaped (advantages, old log probs, the mask, clipping bounds), so nothing algorithm-shaped reaches
+this file and nothing here changes when TRL adds a loss variant.
 
-The names map one to one onto this wire: ``forward_no_grad`` is ``fwd_no_grad`` and ``forward_backward`` is
-``fwd_bwd``. The server therefore forwards the batch twice, once to score it and once to backpropagate, because
-the graph from the first pass cannot cross the wire. The second pass is what makes the gradient real despite
-the first being no-grad.
+The adapter runs in the trainer's process even though the model does not, so ``loss_fn`` is called here, on
+tensors the server returned. Only tensors cross the wire. That is what lets a TRL user write a new objective
+as a plain Python function and run it against Arctic on day one, with no change on this side.
 
-Two round trips are inherent rather than a choice about where to put the split: the weights are a function of
-the log probs, so they cannot be known before the first forward. Tinker's ``forward`` plus
-``forward_backward_custom`` has the same shape.
+Two wire calls, ``fwd_no_grad`` then ``fwd_bwd``, because the per-token weights are a function of the log
+probs and cannot be known before the first pass. Whether that costs a second forward is a server-side choice:
+retaining the graph between the two calls trades the extra forward for activation memory held across one round
+trip. A co-located deployment pays neither, since the graph never leaves the process.
 """
 
 from typing import Any
 
 import torch
-from trl.experimental.api import ForwardOutput
+from trl.experimental.api import ForwardBackwardOutput
 
 
 class ArcticTrainingClient:
-    """Runs the forward and the backward on an Arctic RL server while TRL keeps the loss.
+    """Runs the model on an Arctic RL server while TRL keeps the loss.
 
     Configuration lives on this object rather than in TRL's config: the trainer takes the client as a
     constructed instance, so endpoint, temperature and loss name never become TRL config fields.
@@ -49,9 +48,10 @@ class ArcticTrainingClient:
     Args:
         client: A :class:`~arctic_platform.client.client.SyncArcticRLClient`.
         temperature: Sampling temperature applied by the ``apply_temperature`` post-processor.
-        loss_fn: Name of the surrogate loss. ``pipeline._resolve_fn`` falls back to a dotted-path import, so
-            ``"arctic_platform.integrations.trl.loss.weighted_logprob_sum"`` also resolves when the registry
-            entry is not present.
+        loss_fn: Name of the server-side surrogate. ``pipeline._resolve_fn`` falls back to a dotted-path
+            import, so ``"arctic_platform.integrations.trl.loss.weighted_logprob_sum"`` also resolves when the
+            registry entry is not present. Unrelated to TRL's ``loss_fn`` argument, which is a callable and
+            never leaves this process.
     """
 
     def __init__(
@@ -63,27 +63,23 @@ class ArcticTrainingClient:
         self.client = client
         self.temperature = temperature
         self.loss_fn = loss_fn
-        self._batch: dict | None = None
 
-    def forward_no_grad(
+    def forward_backward(
         self,
         model: torch.nn.Module,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         completion_mask: torch.Tensor,
+        loss_fn: Any,
         aux_loss_coef: float = 0.0,
-    ) -> ForwardOutput:
-        """Score the batch. No graph is built here, and none is needed: see `forward_backward` below."""
+    ) -> ForwardBackwardOutput:
         # `model` is the trainer's local module. Arctic owns the weights, so it is unused here.
         #
         # AsyncGRPOTrainer packs a rank's samples into one padding-free row and marks sequence boundaries by
         # position_ids resets. The server wants padded [B, S] rows, so unpack first. This conversion is the
         # bulk of the adapter and is the main reason it belongs on this side of the wire.
         batch = _unpack_to_padded_rows(input_ids, position_ids, completion_mask)
-        self._batch = batch
 
-        # No grad, so nothing on the server survives this call. The batch is kept above because
-        # `forward_backward` has to send it again to rebuild the graph.
         response = self.client.fwd_no_grad(
             batch,
             processing={
@@ -93,38 +89,39 @@ class ArcticTrainingClient:
         )
         out = response["batch"]
 
-        # Hand back a leaf tensor: the trainer's `loss.backward()` stops here and deposits
-        # d(loss)/d(log_probs) into `.grad`, which is what arrives at `forward_backward` below. The tensor is
-        # differentiable on the TRL side even though the call above built no graph on the server.
-        #
-        # The server returns log probs under the roll(-1) convention and TRL expects the [:, 1:] shift, so
-        # the repack aligns them rather than merely reshaping.
-        return ForwardOutput(
-            log_probs=_repack_to_row(out["logprobs"], completion_mask).requires_grad_(True),
-            entropy=_repack_to_row(out["entropy"], completion_mask),
+        # The server returns log probs under the roll(-1) convention and TRL expects the [:, 1:] shift, so the
+        # repack aligns them rather than merely reshaping.
+        log_probs = _repack_to_row(out["logprobs"], completion_mask)
+        entropy = _repack_to_row(out["entropy"], completion_mask)
+
+        # Evaluate the trainer's loss here, locally, on a leaf. This is the whole trick: the loss is a Python
+        # callable in this process, so it never has to exist on the server or be named on the wire.
+        leaf = log_probs.detach().requires_grad_(True)
+        loss = loss_fn(leaf)
+        (grad_log_probs,) = torch.autograd.grad(loss, leaf)
+
+        def send_backward(grad_loss: torch.Tensor) -> None:
+            # Fires from the trainer's `accelerator.backward`. `grad_loss` carries whatever scaling that
+            # backward applies, so folding it in here keeps gradient accumulation correct.
+            weights = _unpack_to_padded(grad_log_probs * grad_loss)
+            payload = dict(batch)
+            # `_shifted` marks the roll(-1) convention, matching the other log-prob tensors in the batch.
+            payload["logprob_weights_shifted"] = weights
+            self.client.fwd_bwd(
+                payload,
+                processing={"post": ["apply_temperature"], "loss_fn": self.loss_fn},
+            )
+
+        # Detached, because nothing on this side is connected to the model. The hook is what reaches it.
+        reported_loss = loss.detach().requires_grad_(True)
+        reported_loss.register_hook(send_backward)
+
+        return ForwardBackwardOutput(
+            loss=reported_loss,
+            log_probs=log_probs.detach(),
+            entropy=entropy,
             aux_loss=None,  # Arctic reports the MoE aux loss as a metric, not as a differentiable tensor
         )
-
-    def forward_backward(self, grad_log_probs: torch.Tensor) -> None:
-        """Forward the batch again, this time with a graph, and backpropagate the surrogate through it.
-
-        This is the second of the two forwards. `fwd_bwd` runs the model, applies `weighted_logprob_sum`, and
-        backpropagates it, so the gradient is built here rather than carried over from the scoring pass.
-        """
-        assert self._batch is not None, "forward_backward() called without a preceding forward_no_grad()"
-
-        batch = dict(self._batch)
-        # `_shifted` marks the roll(-1) convention, matching the other log-prob tensors in the batch.
-        batch["logprob_weights_shifted"] = _unpack_to_padded(grad_log_probs)
-
-        self.client.fwd_bwd(
-            batch,
-            processing={
-                "post": ["apply_temperature"],
-                "loss_fn": self.loss_fn,
-            },
-        )
-        self._batch = None
 
 
 class ArcticOptimizer(torch.optim.Optimizer):
@@ -156,7 +153,8 @@ class ArcticOptimizer(torch.optim.Optimizer):
 # ------------------------------------------------------------------------------------------------------- #
 # Stubs. Padding-free row to padded rows and back is mechanical but fiddly, and is where a first integration
 # would actually spend its time. Note what is absent compared with `integrations/verl/adapter.py`: no
-# `old_log_probs`, no `advantages`, no `ref_log_prob`. TRL consumed those before the gradient was formed.
+# `old_log_probs`, no `advantages`, no `ref_log_prob`. TRL's `loss_fn` consumed those before the gradient was
+# formed, so they never reach the wire.
 
 
 def _unpack_to_padded_rows(

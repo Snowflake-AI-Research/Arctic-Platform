@@ -5,33 +5,36 @@ layout helpers in `client.py` are stubs and nothing here has run against a live 
 
 ## The interface
 
-TRL's `TrainingClientProtocol` is two methods:
+TRL's `TrainingClientProtocol` is a single fused call:
 
 ```python
-forward_no_grad(model, input_ids, position_ids, completion_mask, aux_loss_coef) -> ForwardOutput
-forward_backward(grad_log_probs) -> None
+forward_backward(model, input_ids, position_ids, completion_mask, loss_fn, aux_loss_coef) -> ForwardBackwardOutput
 ```
 
-They map one to one onto `fwd_no_grad` and `fwd_bwd`. The server forwards the batch twice, once to score it
-and once to backpropagate, because the graph from the first pass cannot cross the wire.
+`loss_fn` is a Python callable mapping per-token log probs to a scalar. It closes over the advantages, old log
+probs, mask and clipping bounds, so nothing algorithm-shaped reaches this repo.
 
-The trainer computes its loss on the log probs returned by the first call and hands back
-`d(loss)/d(log_probs)`.
-The server backpropagates `sum(w * logprobs)`, a first-order surrogate whose gradient with respect to every
-parameter equals the gradient of the real loss. The loss itself never crosses the wire.
+The adapter runs in the trainer's process even though the model does not, so `loss_fn` is evaluated here, on
+the tensors the server returned. Only tensors cross the wire. The adapter takes `d(loss)/d(log_probs)` locally
+and ships that, and the server backpropagates `sum(w * logprobs)`, a first-order surrogate whose gradient with
+respect to every parameter equals the gradient of the real loss.
 
-Verified bit-exact against the in-process path on TRL's GRPO loss: zero difference across all 27 parameter
-tensors, for both the co-located variant and the two-forward variant a remote backend would use.
+Verified bit-exact against the in-process path on TRL's GRPO loss: zero difference across every parameter
+tensor, for both the co-located variant and the two-forward variant a remote backend would use.
 
-## Why not a fused `forward_backward(..., "grpo_loss")`
+## On the fused call and the extra forward
 
-That was the suggestion on the PR thread, and `forward_backward` here does issue the fused `fwd_bwd`. The split is in
-TRL's interface, not in what the backend does. Two round trips are inherent either way, because the weights
-are a function of the log probs and cannot be known before the first forward. Tinker's
-`forward` + `forward_backward_custom` has the same shape.
+Folding the forward and backward into one call was the request on the PR thread, and this is that call. Naming
+the *loss* in it is the part worth avoiding, and passing a callable instead of a string key gets the fused
+shape without it.
 
-The part worth avoiding is naming the *loss* across the wire. The cost of that is already measurable in this
-repo:
+On cost: a co-located deployment runs one forward, calls `loss_fn` in-process, and returns a loss still
+attached to the graph, so there is no surrogate and no second pass at all. A remote deployment issues
+`fwd_no_grad` then `fwd_bwd`, which is two forwards unless the server retains the graph between them. That
+choice is server-side and invisible to TRL: the extra forward buys not having to pin activations across a
+round trip.
+
+The cost of the alternative, naming the loss across the wire, is already measurable in this repo:
 
 | | loss lives on | consequence |
 |---|---|---|
@@ -70,8 +73,8 @@ Nothing. `training_client=` already exists on `AsyncGRPOTrainer` alongside the `
    `self.model.named_parameters()` on every rank (`async_grpo_trainer.py:1149`). Meta device crashes there
    and an empty CUDA model wastes full model memory. A stub module carrying names and shapes is the likely
    answer. TRL-side work.
-2. **Microbatch scaling.** TRL scales its loss for gradient accumulation before the gradient reaches
-   `forward_backward`, so the weights arrive pre-scaled. If `run_pipeline` applies its own per-microbatch
+2. **Microbatch scaling.** The adapter folds the trainer's gradient-accumulation scaling into the weights
+   before sending them, so they arrive pre-scaled. If `run_pipeline` applies its own per-microbatch
    normalization on top, one of the two has to be disabled.
 3. **Batch layout.** The padding-free row to padded rows conversion is stubbed out. Mechanical, but it is
    where a first integration spends its time.
