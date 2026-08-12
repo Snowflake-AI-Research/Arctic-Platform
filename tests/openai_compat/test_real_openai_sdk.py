@@ -1,16 +1,17 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end contract test: the OpenAI Python SDK talking to us over HTTP.
+"""Wire-shape test: the OpenAI Python SDK talking to our router over HTTP.
 
-Spins up a live uvicorn process serving ``arctic_platform.openai_compat.router``
-with a fake pool + tokenizer under ``app.state`` (so no GPUs, no vLLM, no
-Ray), then drives it with the real ``openai`` client. If the router
-diverges from the OpenAI wire in a way our unit tests miss — a subtle
-SSE frame issue, a missing field, an incompatible content-type — the SDK
-will surface it here.
+Not end-to-end. Spins up a live uvicorn process serving
+``arctic_platform.openai_compat.router`` with a **fake pool** and a
+**stub tokenizer** on ``app.state`` — no GPUs, no vLLM, no Ray — then
+drives it with the real ``openai`` client. What it validates: our
+router's wire format (routes, response schema, SSE frames,
+content-types) is close enough to OpenAI's that the real SDK accepts
+it. What it does not validate: real generations, real chat templates,
+real training loops.
 
-Marked to skip cleanly when ``openai`` isn't installed so CI images that
-strip it still pass.
+Skips cleanly when ``openai`` isn't installed.
 """
 
 from __future__ import annotations
@@ -25,8 +26,8 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("openai", reason="openai SDK not installed; skipping E2E contract test")
-pytest.importorskip("uvicorn", reason="uvicorn not installed; skipping E2E contract test")
+pytest.importorskip("openai", reason="openai SDK not installed; skipping wire-shape test")
+pytest.importorskip("uvicorn", reason="uvicorn not installed; skipping wire-shape test")
 
 from openai import OpenAI  # noqa: E402
 import httpx  # noqa: E402

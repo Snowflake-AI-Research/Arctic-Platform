@@ -1,29 +1,24 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end: Harbor's LiteLLM backend against our OpenAI-compat surface.
+"""Wire-shape test: Harbor's LiteLLM backend against our router.
 
-This is the client-side E2E that closes the loop on the "any Harbor agent
-trains on Cortex" story without needing GPUs. Every Harbor agent that
-speaks OpenAI-chat — Terminus 2, LangChain-backed agents, community
-``BaseAgent``s — goes through ``harbor.llms.lite_llm.LiteLLM``, which
-uses LiteLLM to hit the sampling endpoint. If Harbor + LiteLLM + our
-router agree on the wire, any of those agents work.
+Not an end-to-end training test. This runs a live uvicorn server
+holding ``arctic_platform.openai_compat.router`` against a **fake
+pool** that returns hard-coded completion tokens and a **stub
+tokenizer**. It exercises the client-side pipe:
 
-The test:
+    harbor.llms.lite_llm.LiteLLM(collect_rollout_details=True)
+        -> LiteLLM -> HTTP -> our router -> fake pool
 
-* Spawns a live uvicorn server holding ``arctic_platform.openai_compat.router``
-  + a fake pool that returns fixed completion tokens.
-* Instantiates ``harbor.llms.lite_llm.LiteLLM`` with
-  ``collect_rollout_details=True`` — the setting Terminus 2 uses when
-  we want to capture ``RolloutDetail`` for GRPO.
-* Calls ``llm.call(prompt=...)`` and asserts the returned
-  ``LLMResponse`` carries ``prompt_token_ids`` + ``completion_token_ids``
-  from our server — i.e. Harbor's rollout capture actually got token ids
-  out of the round trip.
+The assertion is that Harbor's ``_extract_token_ids`` finds our
+top-level ``prompt_token_ids`` and per-choice ``token_ids`` in the
+response — i.e. the vLLM extensions we emit are shaped the way
+Harbor's LiteLLM backend expects. That's a necessary condition for
+real rollout capture to work; it is not a sufficient condition.
 
-If this test passes, the adapter can build a real ``RolloutDataset``
-from any Harbor agent's rollouts on top of Cortex, no GPUs required to
-prove the wiring.
+A real end-to-end run — real Qwen tokenizer, real vLLM behind
+``ReplicaPool``, real Terminus 2 driving a training loop — is
+separately required and has not been done from this branch.
 """
 
 from __future__ import annotations
