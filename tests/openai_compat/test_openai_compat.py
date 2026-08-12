@@ -419,6 +419,73 @@ def test_text_completions_streaming_structure():
 # ---------------------------------------------------------------------------
 
 
+def test_chat_completions_returns_token_ids_for_harbor():
+    """Non-stream response carries top-level ``prompt_token_ids`` and
+    per-choice ``token_ids`` — vLLM's OpenAI extensions that Harbor's
+    LiteLLM backend reads via ``_extract_token_ids`` to populate
+    ``RolloutDetail`` when ``collect_rollout_details=True``. Without
+    these fields, the whole rollout capture path silently drops tokens
+    and the adapter has nothing to feed GRPO."""
+
+    class _TokTokenizer(_FakeTokenizer):
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) % 128 for c in text]  # deterministic, non-trivial
+
+    pool = _FakePool(text="ok")
+    app = _make_app(pool, tokenizer=_TokTokenizer())
+    with TestClient(app) as c:
+        resp = c.post("/v1/chat/completions", json=_chat_body())
+    body = resp.json()
+    assert isinstance(body["prompt_token_ids"], list)
+    assert len(body["prompt_token_ids"]) > 0
+    assert body["choices"][0]["token_ids"] == [1, 2, 3, 4]
+
+
+def test_text_completions_returns_token_ids_for_harbor():
+    class _TokTokenizer(_FakeTokenizer):
+        def encode(self, text, add_special_tokens=False):
+            return list(range(len(str(text))))
+
+    pool = _FakePool()
+    app = _make_app(pool, tokenizer=_TokTokenizer())
+    with TestClient(app) as c:
+        resp = c.post("/v1/completions", json={
+            "model": "any", "prompt": "hello", "max_tokens": 4,
+        })
+    body = resp.json()
+    assert body["prompt_token_ids"] == [0, 1, 2, 3, 4]
+    assert body["choices"][0]["token_ids"] == [1, 2, 3, 4]
+
+
+def test_text_completions_token_id_prompt_echoes_ids():
+    """When the prompt is already a token-id list, ``prompt_token_ids``
+    is that list verbatim (no re-tokenize)."""
+    pool = _FakePool()
+    app = _make_app(pool)
+    with TestClient(app) as c:
+        resp = c.post("/v1/completions", json={
+            "model": "any", "prompt": [7, 8, 9, 10], "max_tokens": 4,
+        })
+    assert resp.json()["prompt_token_ids"] == [7, 8, 9, 10]
+
+
+def test_chat_completions_stream_emits_token_ids_on_terminal_frame():
+    class _TokTokenizer(_FakeTokenizer):
+        def encode(self, text, add_special_tokens=False):
+            return [42, 43, 44]
+
+    pool = _FakePool(text="hello")
+    app = _make_app(pool, tokenizer=_TokTokenizer())
+    with TestClient(app) as c:
+        resp = c.post("/v1/chat/completions", json=_chat_body(stream=True))
+    events = _parse_sse(resp.text)
+    frames = [e for e in events if isinstance(e, dict)]
+    final = frames[-1]
+    assert final["choices"][0]["finish_reason"] == "stop"
+    assert final["choices"][0]["token_ids"] == [1, 2, 3, 4]
+    assert final["prompt_token_ids"] == [42, 43, 44]
+
+
 def test_chat_completions_tolerates_unknown_openai_fields():
     """Newer OpenAI SDK versions add fields we don't implement (e.g.
     ``response_format``, ``tools``). Accept + ignore rather than 422."""

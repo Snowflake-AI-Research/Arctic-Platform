@@ -113,6 +113,35 @@ class CompletionRequest(_AllowExtra):
 # ---------------------------------------------------------------------------
 
 
+def _tokenize_for_return_ids(tokenizer: Any, prompt: str | list[int]) -> list[int]:
+    """Best-effort ``prompt_token_ids`` for a rendered prompt.
+
+    Harbor's ``LiteLLM._extract_token_ids`` (and any other client that
+    consumes vLLM's ``return_token_ids`` extension) reads
+    ``response.prompt_token_ids`` — a flat token id list. vLLM's OpenAI
+    server derives it by tokenizing the rendered prompt with the
+    engine's tokenizer. We do the same here so the round-trip matches
+    vLLM's own OpenAI surface byte-for-byte for downstream RL.
+
+    If tokenization fails (tokenizer is a mock in a unit test, or the
+    prompt is already token ids), fall back to what we already have:
+    integer prompts are already the ids we want; otherwise return ``[]``
+    so the client sees an explicit "not available" instead of a lie.
+    """
+    if isinstance(prompt, list) and prompt and isinstance(prompt[0], int):
+        return list(prompt)
+    if tokenizer is None:
+        return []
+    try:
+        encode = getattr(tokenizer, "encode", None)
+        if encode is None:
+            return []
+        ids = encode(prompt, add_special_tokens=False)
+        return list(ids) if isinstance(ids, (list, tuple)) else []
+    except Exception:  # noqa: BLE001 — token-id echo is best-effort
+        return []
+
+
 def _get_pool_and_tokenizer(request: Request) -> tuple[Any, Any, str]:
     """Resolve ``(sampling_pool, tokenizer, model_name)`` from ``app.state``.
 
@@ -335,6 +364,15 @@ async def chat_completions(request: Request) -> Any:
     completion_id = _new_id("chatcmpl")
     created = _now()
 
+    # ``prompt_token_ids`` (top-level) + per-choice ``token_ids`` are
+    # vLLM's OpenAI-server extensions. Harbor's LiteLLM backend reads them
+    # to populate ``RolloutDetail`` when ``collect_rollout_details=True``
+    # is set (see ``harbor.llms.lite_llm.LiteLLM._extract_token_ids``).
+    # Emitted unconditionally: clients that don't consume the fields
+    # (plain OpenAI SDK) ignore them, per the OpenAI spec's
+    # forward-compatibility rule.
+    prompt_token_ids = _tokenize_for_return_ids(tokenizer, prompt_text)
+
     if req.stream:
         return StreamingResponse(
             _stream_chat_completion(
@@ -343,6 +381,7 @@ async def chat_completions(request: Request) -> Any:
                 model_name=model_name,
                 results=results,
                 include_logprobs=bool(req.logprobs),
+                prompt_token_ids=prompt_token_ids,
             ),
             media_type="text/event-stream",
         )
@@ -353,6 +392,10 @@ async def chat_completions(request: Request) -> Any:
             "index": idx,
             "message": {"role": "assistant", "content": r.get("text", "")},
             "finish_reason": _finish_reason_to_openai(r.get("finish_reason")),
+            # vLLM-compat: completion token ids alongside the message so
+            # Harbor / any RL client can build a batch without a second
+            # tokenize pass.
+            "token_ids": list(r.get("token_ids") or []),
         }
         if req.logprobs and r.get("logprobs") is not None:
             choice["logprobs"] = {"content": _format_chat_logprobs(r["logprobs"])}
@@ -365,6 +408,7 @@ async def chat_completions(request: Request) -> Any:
         "model": model_name,
         "choices": choices,
         "usage": _usage_from_results(results),
+        "prompt_token_ids": prompt_token_ids,
     }
 
 
@@ -376,7 +420,7 @@ async def completions(request: Request) -> Any:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"invalid request body: {exc}") from exc
 
-    pool, _tokenizer, model_name = _get_pool_and_tokenizer(request)
+    pool, tokenizer, model_name = _get_pool_and_tokenizer(request)
 
     # OpenAI's /v1/completions is single-prompt for chat models but the
     # legacy contract allows either a raw string or a batched list. We
@@ -408,8 +452,13 @@ async def completions(request: Request) -> Any:
         for p in prompt:
             all_results.append(await _generate_n(pool, list(p), sampling_params))
         flat_results: list[dict[str, Any]] = [r for group in all_results for r in group]
+        # Record every prompt's token ids for the client (parallel to the
+        # per-choice ``token_ids`` in the flat response).
+        prompt_ids_per_batch = [_tokenize_for_return_ids(tokenizer, list(p)) for p in prompt]
+        prompt_token_ids: list[int] = prompt_ids_per_batch[0] if prompt_ids_per_batch else []
     else:
         flat_results = await _generate_n(pool, prompt, sampling_params)
+        prompt_token_ids = _tokenize_for_return_ids(tokenizer, prompt)
 
     completion_id = _new_id("cmpl")
     created = _now()
@@ -421,6 +470,7 @@ async def completions(request: Request) -> Any:
                 created=created,
                 model_name=model_name,
                 results=flat_results,
+                prompt_token_ids=prompt_token_ids,
             ),
             media_type="text/event-stream",
         )
@@ -432,6 +482,7 @@ async def completions(request: Request) -> Any:
             "text": r.get("text", ""),
             "finish_reason": _finish_reason_to_openai(r.get("finish_reason")),
             "logprobs": None,
+            "token_ids": list(r.get("token_ids") or []),
         })
 
     return {
@@ -441,6 +492,7 @@ async def completions(request: Request) -> Any:
         "model": model_name,
         "choices": choices,
         "usage": _usage_from_results(flat_results),
+        "prompt_token_ids": prompt_token_ids,
     }
 
 
@@ -473,6 +525,7 @@ async def _stream_chat_completion(
     model_name: str,
     results: list[dict[str, Any]],
     include_logprobs: bool = False,
+    prompt_token_ids: list[int] | None = None,
 ) -> AsyncIterator[bytes]:
     for idx, r in enumerate(results):
         text = r.get("text", "") or ""
@@ -498,7 +551,9 @@ async def _stream_chat_completion(
             }
             yield _sse(content_chunk)
 
-        # 3) terminal chunk with finish_reason.
+        # 3) terminal chunk with finish_reason. Carry ``token_ids`` on the
+        # per-choice terminal chunk and ``prompt_token_ids`` on the
+        # top-level payload for the same vLLM-compat reason as non-stream.
         finish_chunk = {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -508,8 +563,11 @@ async def _stream_chat_completion(
                 "index": idx,
                 "delta": {},
                 "finish_reason": _finish_reason_to_openai(r.get("finish_reason")),
+                "token_ids": list(r.get("token_ids") or []),
             }],
         }
+        if prompt_token_ids:
+            finish_chunk["prompt_token_ids"] = list(prompt_token_ids)
         yield _sse(finish_chunk)
 
     yield b"data: [DONE]\n\n"
@@ -521,6 +579,7 @@ async def _stream_text_completion(
     created: int,
     model_name: str,
     results: list[dict[str, Any]],
+    prompt_token_ids: list[int] | None = None,
 ) -> AsyncIterator[bytes]:
     for idx, r in enumerate(results):
         text = r.get("text", "") or ""
@@ -548,8 +607,11 @@ async def _stream_text_completion(
                 "text": "",
                 "finish_reason": _finish_reason_to_openai(r.get("finish_reason")),
                 "logprobs": None,
+                "token_ids": list(r.get("token_ids") or []),
             }],
         }
+        if prompt_token_ids:
+            final["prompt_token_ids"] = list(prompt_token_ids)
         yield _sse(final)
     yield b"data: [DONE]\n\n"
 

@@ -17,8 +17,10 @@ ships — drive a training loop.
 | Multi-seed aggregator | `aggregate.py` (`harbor-cortex-aggregate`) | Done. |
 | OpenAI-compat HTTP surface | `arctic_platform/openai_compat.py` + wired into `arctic_platform/rl/http_server.py` | **New.** `/v1/chat/completions`, `/v1/completions`, `/v1/models` — any OpenAI-SDK client (Terminus 2 via LiteLLM, LangChain, the openai CLI) samples from the same sub-job that `/generate` serves, no vLLM HTTP subprocess. |
 | Auto-derive `--sampling-api-base` | `train.py::_derive_openai_base_url` | New. `--sampling-api-base auto` reads the client's transport (on-prem: `http://host:port/v1`). |
-| Unit tests for the router | `tests/openai_compat/test_openai_compat.py` | 19 tests: parameter mapping, `n>1`, `stop`, streaming SSE, error paths, tokenizer-without-chat-template. |
-| Real OpenAI-SDK contract test | `tests/openai_compat/test_real_openai_sdk.py` | 4 tests: live uvicorn subprocess + `openai` client hitting chat/completions (non-stream + stream), completions, models list. Skips cleanly if `openai` isn't installed. |
+| vLLM token-id echo (`prompt_token_ids`, per-choice `token_ids`) | `arctic_platform/openai_compat.py` | New. Emitted on chat + text completions (non-stream and terminal SSE frame). Required for Harbor's `LiteLLM._extract_token_ids` — without them `RolloutDetail` has no token ids and the adapter drops the trial. |
+| Unit tests for the router | `tests/openai_compat/test_openai_compat.py` | 23 tests: parameter mapping, `n>1`, `stop`, streaming SSE, error paths, tokenizer-without-chat-template, token-id echo (chat, text, token-id prompt, streaming). |
+| Real OpenAI-SDK contract test | `tests/openai_compat/test_real_openai_sdk.py` | 4 tests: live uvicorn subprocess + `openai` client hitting chat/completions (non-stream + stream), completions, models list. |
+| Harbor + LiteLLM integration test | `tests/openai_compat/test_harbor_litellm_integration.py` | Live server + real `harbor.llms.lite_llm.LiteLLM(collect_rollout_details=True)` — asserts `response.completion_token_ids` and `response.prompt_token_ids` come back non-empty. Closes the client-side loop end-to-end without GPUs. |
 | Adapter tests | `tests/integrations/harbor/test_adapter_multiturn.py` | 6 tests for multi-turn flatten. |
 
 ## How the OpenAI-compat surface works
@@ -100,8 +102,22 @@ Terminus 2 at `http://localhost:7000/v1`. `Cortex Training` deployments
 substitute `https://<cortex>/sub-jobs/<sampling-sub-job-id>/v1` once the
 Cortex-side routing above is live.
 
-## Current E2E status (native mode)
+## Current E2E status
 
-`Qwen/Qwen3-0.6B`, 3-digit × 2-digit multiplication, 15 GRPO steps × 24
-rollouts/step, lr = 5e-6, three seeds. Mean held-out reward +10.0 pp,
-95% CI [+9.0, +11.6]. Full transcript in [RUN_LOG.md](./RUN_LOG.md).
+**Native mode (this package's `CortexRLAgent`):** `Qwen/Qwen3-0.6B`,
+3-digit × 2-digit multiplication, 15 GRPO steps × 24 rollouts/step,
+lr = 5e-6, three seeds. Mean held-out reward +10.0 pp, 95% CI [+9.0,
++11.6]. Full transcript in [RUN_LOG.md](./RUN_LOG.md).
+
+**OpenAI-compat mode (any Harbor agent):**
+
+* Router + token-id echo: 23 unit tests + 4 real-`openai`-SDK
+  contract tests pass.
+* Real Harbor pipe: `harbor.llms.lite_llm.LiteLLM(collect_rollout_details=True)`
+  → LiteLLM → HTTP → our router → fake pool round-trips
+  `prompt_token_ids` and `completion_token_ids`. Test asserts non-empty
+  values on both, i.e. Harbor's `RolloutDetail` would carry the tokens
+  the adapter needs.
+* Live GPU-backed loop (real vLLM behind the router, Terminus 2 as
+  agent): **not yet run** on this branch — the box is CPU-only. Run
+  the on-prem demo from the E2E block above to close it out.
