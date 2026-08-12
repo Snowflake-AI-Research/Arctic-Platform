@@ -3,18 +3,15 @@
 """Adapter: Harbor's on-disk trial output -> arctic ``RolloutDataset``.
 
 Reads every ``{trial_dir}/result.json`` under a Harbor ``jobs/`` directory,
-pulls ``agent_result.rollout_details`` (Harbor's own ``RolloutDetail`` shape:
+pulls ``agent_result.rollout_details`` (Harbor's ``RolloutDetail`` shape:
 ``prompt_token_ids: list[list[int]]``, ``completion_token_ids: list[list[int]]``,
 optional ``logprobs``) plus the verifier's ``reward``, and materializes them
 as ``Rollout`` / ``RolloutDataset`` for the arctic GRPO backend.
 
-Multi-turn handling: Harbor stores per-turn tokens; a real Harbor agent
-(Terminus 2, most CLI-shelling agents) is multi-turn and its reward is
-anchored to the trajectory as a whole. The adapter flattens the trajectory
-into a single (prompt, completion, loss_mask) tuple where the final turn's
-completion is unambiguously trainable and every prior turn's completion is
-also marked trainable inside the flat context — so gradient flows through
-intermediate reasoning, not just the final action.
+Multi-turn agents produce N (prompt, completion) pairs. The adapter
+flattens each trial into a single (prompt, completion, loss_mask) tuple:
+prompt = context into the final turn, completion = the final response,
+loss_mask = 1.0 on every model-produced position across all turns.
 """
 
 from __future__ import annotations
@@ -29,24 +26,17 @@ def _flatten_multi_turn(
     prompt_per_turn: list[list[int]] | None,
     completion_per_turn: list[list[int]] | None,
 ) -> tuple[list[int], list[int], list[float] | None]:
-    """Flatten Harbor's per-turn tokens into (prompt, completion, loss_mask).
+    """Flatten per-turn tokens into (prompt, completion, loss_mask).
 
-    Harbor's invariant: ``prompt_token_ids[i+1]`` starts with
-    ``prompt_token_ids[i] + completion_token_ids[i]`` (each turn's prompt
-    contains the prior conversation). When that holds, the flat sequence is
-    just ``prompt_token_ids[-1] + completion_token_ids[-1]`` — the full
-    context up through the final call, followed by the final response — and
-    every earlier turn's completion occupies a known slice inside
-    ``prompt_token_ids[-1]``.
+    Assumes Harbor's invariant that ``prompt[i+1]`` starts with
+    ``prompt[i] + completion[i]``. When it holds, the flat sequence is
+    ``prompt[-1] + completion[-1]`` and every earlier completion occupies
+    a known slice inside ``prompt[-1]``; the returned ``loss_mask`` is 1.0
+    on those slices and on the final completion, 0.0 elsewhere.
 
-    The returned ``loss_mask`` has length ``len(prompt) + len(completion)``:
-
-    * 0.0 for context / user / tool-observation positions
-    * 1.0 for every model-produced token across all turns
-
-    If the invariant does not hold (some agent's chat template re-tokenizes
-    between turns), we return ``loss_mask=None`` and the caller falls back
-    to training on only the final turn's completion — a safe subset.
+    When the invariant fails (e.g. a chat template re-tokenizes between
+    turns), ``loss_mask`` is returned as ``None`` and the caller trains
+    only on the final completion.
     """
     if not prompt_per_turn or not completion_per_turn:
         return [], [], None

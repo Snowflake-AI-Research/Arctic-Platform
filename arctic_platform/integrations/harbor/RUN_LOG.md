@@ -7,7 +7,7 @@ task's `tests/test.sh` and reading `/logs/verifier/reward.txt`. No
 custom `BaseVerifier` subclass, no `--verifier` override.
 
 Between trials the driver reads `result.json`, hands the rollouts to
-`ArcticCortexBackend.train` on Cortex QA6, and `sync_weights`
+`ArcticCortexBackend.train` on Cortex, and `sync_weights`
 propagates the new weights so the next `harbor run` samples from an
 improved model at the same sub-job endpoint.
 

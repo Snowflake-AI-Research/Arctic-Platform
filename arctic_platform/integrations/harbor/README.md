@@ -49,29 +49,26 @@ harbor-cortex-train \
   --out ./training-run/
 ```
 
-### Two sampling modes
+### Sampling modes
 
-The runner supports two ways an agent can talk to Cortex during rollouts:
+Two ways an agent can talk to Cortex during rollouts:
 
-| Mode | When to use | How the agent talks to Cortex |
+| Mode | Status | How the agent talks to Cortex |
 | --- | --- | --- |
-| **Native** (default) | Today. Ships in this PR, validated E2E. | `CortexRLAgent` (or any agent that consumes `ArcticRLClient.reconnect_config`) calls the sub-job's RL-shaped `/generate` route. |
-| **OpenAI-compat** (`--sampling-api-base`) | Any stock Harbor agent (Terminus 2, custom `BaseAgent`s that speak OpenAI-chat) once Cortex exposes `/v1/chat/completions`. | Runner passes `--model-base-url` + `--ak api_base=` to `harbor run`; the agent uses LiteLLM unchanged. |
+| Native (default) | Validated E2E. | `CortexRLAgent` (or any agent consuming `ArcticRLClient.reconnect_config`) calls the sub-job's RL-shaped `/generate` route. |
+| OpenAI-compat (`--sampling-api-base`) | Plumbing here; awaits Cortex `/v1/chat/completions`. | Runner passes `--model-base-url` + `--ak api_base=` to `harbor run`; the agent uses LiteLLM unchanged. |
 
-OpenAI-compat unlocks "bring any Harbor agent". The plumbing (this
-runner + adapter) is already merged; the last hop — exposing
-`/v1/chat/completions` on the sampling sub-job — is a small
-Cortex-side change tracked in [PLAN.md](./PLAN.md).
-
-Example OpenAI-compat invocation (once the Cortex endpoint is live):
+Once Cortex exposes `/v1/chat/completions` on the sampling sub-job
+(tracked in [PLAN.md](./PLAN.md)), any stock Harbor agent trains
+without further changes:
 
 ```bash
 harbor-cortex-train \
   --tasks-dir ./my_bench/train  --heldout-dir ./my_bench/heldout \
-  --model         hosted_vllm/Qwen/Qwen3-0.6B \
-  --agent         harbor.agents.terminus_2:Terminus2 \
+  --model hosted_vllm/Qwen/Qwen3-0.6B \
+  --agent harbor.agents.terminus_2:Terminus2 \
   --sampling-api-base https://<cortex>/sub-jobs/<sampling-id>/v1 \
-  --llm-backend   litellm \
+  --llm-backend litellm \
   --iters 30 --prompts-per-step 8 --n-attempts 4 --lr 5e-6 \
   --out ./training-run/
 ```
@@ -136,7 +133,7 @@ Reattaches to the same sampling sub-job at the weights
 Entry points and console scripts are registered in Arctic-Platform's
 top-level `pyproject.toml`; no nested `pyproject.toml` here.
 
-## Result on Cortex QA6
+## Result on Cortex
 
 `Qwen/Qwen3-0.6B`, 3-digit × 2-digit multiplication (a ∈ [100, 999],
 b ∈ [10, 99]), 15 GRPO steps × 24 rollouts/step, lr = 5e-6. Held-out

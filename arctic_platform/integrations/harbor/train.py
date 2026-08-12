@@ -71,24 +71,20 @@ def _run_harbor(
 ) -> Path:
     """Invoke ``harbor run`` on a Harbor dataset. Returns the job dir.
 
-    Two sampling modes:
+    Two sampling modes, controlled by which of ``reconnect_config_path`` or
+    ``sampling_api_base`` is set:
 
-    * **Native mode** (``reconnect_config_path`` set): the agent is our
-      ``CortexRLAgent`` (or any agent that reattaches via
-      ``ArcticRLClient.reconnect_config``). This is the current default and
-      the mode used by the E2E demo today.
-    * **OpenAI-compat mode** (``sampling_api_base`` set): the agent is any
-      Harbor ``BaseAgent`` that speaks OpenAI-chat over ``api_base`` (e.g.
-      Terminus 2 through LiteLLM), pointed at Cortex's OpenAI-compatible
-      HTTP endpoint. This mode is what unlocks "any Harbor agent on
-      Cortex" once Cortex exposes ``/v1/chat/completions`` on the sampling
-      sub-job (tracked as an infra follow-up — see ``PLAN.md``). No change
-      to this runner is required when that lands; the flag is already here.
+    * Native: ``reconnect_config_path`` — the agent (``CortexRLAgent`` by
+      default) reattaches via ``ArcticRLClient.reconnect_config`` and
+      calls the sub-job's RL-shaped ``/generate`` route.
+    * OpenAI-compat: ``sampling_api_base`` — the runner passes
+      ``--model-base-url`` and ``--ak api_base=`` to ``harbor run``, so
+      any ``BaseAgent`` that speaks OpenAI-chat (Terminus 2 etc.) works
+      unchanged. Requires Cortex to expose ``/v1/chat/completions`` on
+      the sampling sub-job (see ``PLAN.md``).
 
-    ``extra_instruction_paths`` maps to Harbor's ``--extra-instruction-path``
-    (each file is appended to every task's instruction). ``skill_paths``
-    maps to ``--skill``. Both are Harbor's own extension surfaces — no
-    custom flag translation.
+    ``extra_instruction_paths`` maps to Harbor's ``--extra-instruction-path``;
+    ``skill_paths`` maps to ``--skill``.
     """
     if (reconnect_config_path is None) == (sampling_api_base is None):
         raise ValueError(
@@ -116,11 +112,9 @@ def _run_harbor(
             "--ak", f"max_tokens={max_tokens}",
         ]
     else:
-        # OpenAI-compat mode: the built-in Harbor flag ``--model-base-url``
-        # (or ``--ak api_base=...`` for agents that expose it) is what
-        # Terminus 2 / other stock agents already understand. We use
-        # ``--model-base-url`` when available and fall back to
-        # ``--ak api_base=`` for older Harbor releases.
+        # OpenAI-compat mode. ``--model-base-url`` is Harbor's built-in
+        # override; ``--ak api_base=`` covers older Harbor releases and
+        # agents that read ``api_base`` from kwargs.
         cmd += ["--model-base-url", str(sampling_api_base)]
         cmd += [
             "--ak", f"api_base={sampling_api_base}",
@@ -217,29 +211,26 @@ async def main() -> None:
                     help="Path to a Harbor skills directory (Harbor's --skill). "
                          "Repeat to layer multiple.")
     ap.add_argument("--agent", default=DEFAULT_AGENT_PATH,
-                    help="Agent import path (module:Class), or a short name "
-                         "resolved via harbor.plugins. Default is our "
-                         "CortexRLAgent that samples from the Cortex sub-job. "
-                         "In OpenAI-compat mode (--sampling-api-base) any "
-                         "stock Harbor agent that speaks OpenAI-chat works "
-                         "unchanged (e.g. harbor.agents.terminus_2:Terminus2).")
+                    help="Agent import path (module:Class) or a short name "
+                         "registered under harbor.plugins. Defaults to "
+                         "CortexRLAgent (native reconnect-config mode). "
+                         "In OpenAI-compat mode, pass e.g. "
+                         "harbor.agents.terminus_2:Terminus2.")
     ap.add_argument("--env", default=DEFAULT_ENV_PATH,
-                    help="Environment import path. Default is HostEnvironment "
+                    help="Environment import path. Defaults to HostEnvironment "
                          "(no container). Swap for DockerEnvironment / Modal / "
-                         "Daytona for real sandboxing.")
+                         "Daytona in production.")
     ap.add_argument("--sampling-api-base", default=None,
-                    help="OpenAI-compat mode: the sampling endpoint's OpenAI "
-                         "base URL (e.g. https://.../sub-jobs/<id>/v1). When "
-                         "set, the runner skips the reconnect-config plumbing "
-                         "and points --agent at api_base via --model-base-url "
-                         "and --ak api_base=. Pair with any Harbor BaseAgent "
-                         "that already speaks OpenAI-chat. Requires Cortex to "
-                         "expose /v1/chat/completions on the sampling sub-job "
-                         "(see PLAN.md for status).")
+                    help="OpenAI-compat mode: sampling endpoint base URL "
+                         "(e.g. https://.../sub-jobs/<id>/v1). When set, "
+                         "harbor run gets --model-base-url and "
+                         "--ak api_base= instead of the reconnect-config "
+                         "plumbing. Requires the endpoint to serve "
+                         "/v1/chat/completions (see PLAN.md).")
     ap.add_argument("--llm-backend", default=None,
                     help="Optional --ak llm_backend=<value> forwarded to the "
-                         "agent (e.g. 'litellm' for Terminus 2). Only used in "
-                         "OpenAI-compat mode.")
+                         "agent (e.g. 'litellm'). Only used in OpenAI-compat "
+                         "mode.")
 
     # Arithmetic-generator fallback (only used if --tasks-dir/--heldout-dir omitted).
     ap.add_argument("--task", choices=["add", "mul"], default="mul",

@@ -22,18 +22,8 @@ Scoring uses Harbor's stock ``Verifier`` execing each task's
 ``tests/test.sh``. See ``README.md`` for the user-facing flow.
 """
 
-# NOTE: We deliberately keep this ``__init__`` free of eager imports.
-#
-# ``CortexRLAgent`` and ``HostEnvironment`` require the ``harbor`` package
-# (a Harbor deployment installs it; the arctic base install may not). Eagerly
-# importing them here would force every consumer of ``adapter`` /
-# ``models`` — including CI, which doesn't ship Harbor — to install Harbor
-# just to touch data-plane utilities. Submodules are imported directly:
-#
-#     from arctic_platform.integrations.harbor.adapter import load_job_dir
-#     from arctic_platform.integrations.harbor.agent import CortexRLAgent   # needs harbor
-#
-# The entry-point group in the top-level ``pyproject.toml`` still uses
-# fully-qualified ``module:Class`` strings, so Harbor's plugin loader
-# resolves them lazily at CLI parse time — same story.
+# No eager imports: ``agent.py`` and ``env.py`` require the optional
+# ``harbor`` dependency, so consumers of ``adapter`` / ``models`` (including
+# CI) can import submodules without installing Harbor. Harbor's own plugin
+# loader resolves ``module:Class`` entry points lazily.
 __all__: list[str] = []
