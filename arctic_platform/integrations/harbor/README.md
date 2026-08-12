@@ -49,6 +49,33 @@ harbor-cortex-train \
   --out ./training-run/
 ```
 
+### Two sampling modes
+
+The runner supports two ways an agent can talk to Cortex during rollouts:
+
+| Mode | When to use | How the agent talks to Cortex |
+| --- | --- | --- |
+| **Native** (default) | Today. Ships in this PR, validated E2E. | `CortexRLAgent` (or any agent that consumes `ArcticRLClient.reconnect_config`) calls the sub-job's RL-shaped `/generate` route. |
+| **OpenAI-compat** (`--sampling-api-base`) | Any stock Harbor agent (Terminus 2, custom `BaseAgent`s that speak OpenAI-chat) once Cortex exposes `/v1/chat/completions`. | Runner passes `--model-base-url` + `--ak api_base=` to `harbor run`; the agent uses LiteLLM unchanged. |
+
+OpenAI-compat unlocks "bring any Harbor agent". The plumbing (this
+runner + adapter) is already merged; the last hop — exposing
+`/v1/chat/completions` on the sampling sub-job — is a small
+Cortex-side change tracked in [PLAN.md](./PLAN.md).
+
+Example OpenAI-compat invocation (once the Cortex endpoint is live):
+
+```bash
+harbor-cortex-train \
+  --tasks-dir ./my_bench/train  --heldout-dir ./my_bench/heldout \
+  --model         hosted_vllm/Qwen/Qwen3-0.6B \
+  --agent         harbor.agents.terminus_2:Terminus2 \
+  --sampling-api-base https://<cortex>/sub-jobs/<sampling-id>/v1 \
+  --llm-backend   litellm \
+  --iters 30 --prompts-per-step 8 --n-attempts 4 --lr 5e-6 \
+  --out ./training-run/
+```
+
 What runs end-to-end:
 
 1. **Cortex cold-start.** Provisions a training sub-job (GRPO trainer,
@@ -128,6 +155,9 @@ problems moved out of the reward ≤ 0.05 bucket into "close but wrong"
 or "verbose correct". See `RUN_LOG.md` for the full transcript.
 
 ## Follow-ups (not in this PR)
+
+See [PLAN.md](./PLAN.md) for the critical path to "any Harbor agent
+trains on Cortex". Non-blocking follow-ups:
 
 - **`harbor train` subcommand in Harbor itself.** A ~30-LOC Typer
   addition would let users write `harbor train --backend arctic-cortex
