@@ -52,6 +52,33 @@ def _harbor_bin() -> str:
     return str(Path(sys.executable).parent / "harbor")
 
 
+def _derive_openai_base_url(client: object) -> str:
+    """Best-effort ``/v1`` URL from a connected ``ArcticRLClient``.
+
+    On-prem: the client's transport carries ``base_url`` (e.g.
+    ``http://localhost:7000``); the OpenAI-compat surface is served at
+    ``/v1`` on the same host by ``arctic_platform.rl.http_server``.
+
+    Cortex: the sampling sub-job's public URL is
+    ``https://<cortex>/sub-jobs/<sampling-sub-job-id>/v1``, but the
+    routing from a parent-job SnowAPI URL to a per-sub-job HTTP endpoint
+    is a Cortex control-plane concern outside this repo. Raise with a
+    clear message so the user knows they need to pass the URL
+    explicitly.
+    """
+    transport = getattr(client, "transport", None)
+    base_url = getattr(transport, "base_url", None)
+    if base_url:
+        return f"{str(base_url).rstrip('/')}/v1"
+    raise SystemExit(
+        "--sampling-api-base auto: could not derive an OpenAI base URL "
+        "from the connected client. This transport has no plain HTTP "
+        "endpoint (Cortex sub-jobs are addressed through SnowAPI). Pass "
+        "the URL explicitly, e.g. --sampling-api-base "
+        "https://<cortex>/sub-jobs/<sampling-sub-job-id>/v1."
+    )
+
+
 def _run_harbor(
     dataset_dir: Path,
     jobs_dir: Path,
@@ -222,11 +249,12 @@ async def main() -> None:
                          "Daytona in production.")
     ap.add_argument("--sampling-api-base", default=None,
                     help="OpenAI-compat mode: sampling endpoint base URL "
-                         "(e.g. https://.../sub-jobs/<id>/v1). When set, "
-                         "harbor run gets --model-base-url and "
-                         "--ak api_base= instead of the reconnect-config "
-                         "plumbing. Requires the endpoint to serve "
-                         "/v1/chat/completions (see PLAN.md).")
+                         "(e.g. http://localhost:7000/v1 for on-prem, or "
+                         "https://.../sub-jobs/<id>/v1 for Cortex). Pass "
+                         "'auto' to derive it from the connected client's "
+                         "transport (on-prem only today). When set, harbor "
+                         "run gets --model-base-url and --ak api_base= "
+                         "instead of the reconnect-config plumbing.")
     ap.add_argument("--llm-backend", default=None,
                     help="Optional --ak llm_backend=<value> forwarded to the "
                          "agent (e.g. 'litellm'). Only used in OpenAI-compat "
@@ -315,7 +343,11 @@ async def main() -> None:
     # Mode selection: native (reconnect_config) vs OpenAI-compat (api_base).
     openai_compat_mode = args.sampling_api_base is not None
     if openai_compat_mode:
-        _log(f"OpenAI-compat mode: sampling via {args.sampling_api_base}")
+        if args.sampling_api_base == "auto":
+            args.sampling_api_base = _derive_openai_base_url(backend._client)
+            _log(f"auto-derived sampling api base: {args.sampling_api_base}")
+        else:
+            _log(f"OpenAI-compat mode: sampling via {args.sampling_api_base}")
         reconnect_path = None
         extra_agent_kwargs: dict[str, str] = {}
         if args.llm_backend:

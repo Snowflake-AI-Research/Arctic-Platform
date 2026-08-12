@@ -51,27 +51,37 @@ harbor-cortex-train \
 
 ### Sampling modes
 
-Two ways an agent can talk to Cortex during rollouts:
+Two ways an agent can talk to Cortex during rollouts. Both work today
+on-prem; Cortex sub-jobs support native today and OpenAI-compat once
+the sub-job URL routing lands (see [PLAN.md](./PLAN.md)):
 
-| Mode | Status | How the agent talks to Cortex |
+| Mode | Agent | How it reaches the sampling sub-job |
 | --- | --- | --- |
-| Native (default) | Validated E2E. | `CortexRLAgent` (or any agent consuming `ArcticRLClient.reconnect_config`) calls the sub-job's RL-shaped `/generate` route. |
-| OpenAI-compat (`--sampling-api-base`) | Plumbing here; awaits Cortex `/v1/chat/completions`. | Runner passes `--model-base-url` + `--ak api_base=` to `harbor run`; the agent uses LiteLLM unchanged. |
+| Native (default) | `CortexRLAgent` (or any agent consuming `ArcticRLClient.reconnect_config`) | RL-shaped `/generate` route. |
+| OpenAI-compat (`--sampling-api-base`) | Any Harbor `BaseAgent` that speaks OpenAI-chat (Terminus 2, LangChain-backed agents, custom `BaseAgent`s) via LiteLLM | `/v1/chat/completions` / `/v1/completions` / `/v1/models` on the same sub-job, translated to `ReplicaPool.generate()` in-process (no vLLM HTTP subprocess). |
 
-Once Cortex exposes `/v1/chat/completions` on the sampling sub-job
-(tracked in [PLAN.md](./PLAN.md)), any stock Harbor agent trains
-without further changes:
+OpenAI-compat, on-prem, running Terminus 2 without any Terminus-2 or
+Harbor changes:
 
 ```bash
+# 1. Bring up the RL server (one training + one sampling GPU).
+python -m arctic_platform.rl.http_server \
+  --training-gpus 1 --sampling-gpus 1 --port 7000 &
+
+# 2. Drive training with the stock Harbor agent over OpenAI-compat.
 harbor-cortex-train \
   --tasks-dir ./my_bench/train  --heldout-dir ./my_bench/heldout \
-  --model hosted_vllm/Qwen/Qwen3-0.6B \
-  --agent harbor.agents.terminus_2:Terminus2 \
-  --sampling-api-base https://<cortex>/sub-jobs/<sampling-id>/v1 \
-  --llm-backend litellm \
+  --model             Qwen/Qwen3-0.6B \
+  --agent             harbor.agents.terminus_2:Terminus2 \
+  --sampling-api-base auto \
+  --llm-backend       litellm \
   --iters 30 --prompts-per-step 8 --n-attempts 4 --lr 5e-6 \
   --out ./training-run/
 ```
+
+`--sampling-api-base auto` derives the URL from the client's transport
+(on-prem: `http://localhost:7000/v1`). On Cortex, pass the sub-job URL
+explicitly, e.g. `https://<cortex>/sub-jobs/<sampling-sub-job-id>/v1`.
 
 What runs end-to-end:
 
