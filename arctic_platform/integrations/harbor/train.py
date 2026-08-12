@@ -56,7 +56,6 @@ def _run_harbor(
     dataset_dir: Path,
     jobs_dir: Path,
     job_name: str,
-    reconnect_config_path: Path,
     model_name: str,
     n_concurrent: int,
     n_attempts: int,
@@ -64,16 +63,38 @@ def _run_harbor(
     max_tokens: int,
     agent_path: str = DEFAULT_AGENT_PATH,
     env_path: str = DEFAULT_ENV_PATH,
+    reconnect_config_path: Path | None = None,
+    sampling_api_base: str | None = None,
     extra_instruction_paths: list[Path] | None = None,
     skill_paths: list[Path] | None = None,
+    extra_agent_kwargs: dict[str, str] | None = None,
 ) -> Path:
     """Invoke ``harbor run`` on a Harbor dataset. Returns the job dir.
 
+    Two sampling modes:
+
+    * **Native mode** (``reconnect_config_path`` set): the agent is our
+      ``CortexRLAgent`` (or any agent that reattaches via
+      ``ArcticRLClient.reconnect_config``). This is the current default and
+      the mode used by the E2E demo today.
+    * **OpenAI-compat mode** (``sampling_api_base`` set): the agent is any
+      Harbor ``BaseAgent`` that speaks OpenAI-chat over ``api_base`` (e.g.
+      Terminus 2 through LiteLLM), pointed at Cortex's OpenAI-compatible
+      HTTP endpoint. This mode is what unlocks "any Harbor agent on
+      Cortex" once Cortex exposes ``/v1/chat/completions`` on the sampling
+      sub-job (tracked as an infra follow-up — see ``PLAN.md``). No change
+      to this runner is required when that lands; the flag is already here.
+
     ``extra_instruction_paths`` maps to Harbor's ``--extra-instruction-path``
-    (each file is appended to every task's instruction). ``skill_paths`` maps
-    to ``--skill`` (skill directories the agent can consult). Both are
-    Harbor's own extension surfaces — no custom flag translation.
+    (each file is appended to every task's instruction). ``skill_paths``
+    maps to ``--skill``. Both are Harbor's own extension surfaces — no
+    custom flag translation.
     """
+    if (reconnect_config_path is None) == (sampling_api_base is None):
+        raise ValueError(
+            "exactly one of reconnect_config_path (native mode) or "
+            "sampling_api_base (OpenAI-compat mode) must be set"
+        )
     jobs_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         _harbor_bin(), "run",
@@ -87,10 +108,26 @@ def _run_harbor(
         "-k", str(n_attempts),
         "--yes",
         "--no-force-build",
-        "--ak", f"reconnect_config_path={reconnect_config_path}",
-        "--ak", f"temperature={temperature}",
-        "--ak", f"max_tokens={max_tokens}",
     ]
+    if reconnect_config_path is not None:
+        cmd += [
+            "--ak", f"reconnect_config_path={reconnect_config_path}",
+            "--ak", f"temperature={temperature}",
+            "--ak", f"max_tokens={max_tokens}",
+        ]
+    else:
+        # OpenAI-compat mode: the built-in Harbor flag ``--model-base-url``
+        # (or ``--ak api_base=...`` for agents that expose it) is what
+        # Terminus 2 / other stock agents already understand. We use
+        # ``--model-base-url`` when available and fall back to
+        # ``--ak api_base=`` for older Harbor releases.
+        cmd += ["--model-base-url", str(sampling_api_base)]
+        cmd += [
+            "--ak", f"api_base={sampling_api_base}",
+            "--ak", f"temperature={temperature}",
+        ]
+    for k, v in (extra_agent_kwargs or {}).items():
+        cmd += ["--ak", f"{k}={v}"]
     for p in extra_instruction_paths or []:
         cmd += ["--extra-instruction-path", str(p)]
     for p in skill_paths or []:
@@ -180,14 +217,29 @@ async def main() -> None:
                     help="Path to a Harbor skills directory (Harbor's --skill). "
                          "Repeat to layer multiple.")
     ap.add_argument("--agent", default=DEFAULT_AGENT_PATH,
-                    help="Agent import path (module:Class). Default is our "
+                    help="Agent import path (module:Class), or a short name "
+                         "resolved via harbor.plugins. Default is our "
                          "CortexRLAgent that samples from the Cortex sub-job. "
-                         "Users with a custom BaseAgent that samples from a "
-                         "given endpoint can plug it in here.")
+                         "In OpenAI-compat mode (--sampling-api-base) any "
+                         "stock Harbor agent that speaks OpenAI-chat works "
+                         "unchanged (e.g. harbor.agents.terminus_2:Terminus2).")
     ap.add_argument("--env", default=DEFAULT_ENV_PATH,
                     help="Environment import path. Default is HostEnvironment "
                          "(no container). Swap for DockerEnvironment / Modal / "
                          "Daytona for real sandboxing.")
+    ap.add_argument("--sampling-api-base", default=None,
+                    help="OpenAI-compat mode: the sampling endpoint's OpenAI "
+                         "base URL (e.g. https://.../sub-jobs/<id>/v1). When "
+                         "set, the runner skips the reconnect-config plumbing "
+                         "and points --agent at api_base via --model-base-url "
+                         "and --ak api_base=. Pair with any Harbor BaseAgent "
+                         "that already speaks OpenAI-chat. Requires Cortex to "
+                         "expose /v1/chat/completions on the sampling sub-job "
+                         "(see PLAN.md for status).")
+    ap.add_argument("--llm-backend", default=None,
+                    help="Optional --ak llm_backend=<value> forwarded to the "
+                         "agent (e.g. 'litellm' for Terminus 2). Only used in "
+                         "OpenAI-compat mode.")
 
     # Arithmetic-generator fallback (only used if --tasks-dir/--heldout-dir omitted).
     ap.add_argument("--task", choices=["add", "mul"], default="mul",
@@ -269,18 +321,28 @@ async def main() -> None:
         run = backend.connect()
     _log(f"connected: run={run.run_id} train_job={run.training_job_id} sample_job={run.sampling_job_id}")
 
-    # Dump reconnect config so each Harbor trial (spawned by harbor run) can
-    # reattach to the same running Cortex sub-jobs. The job-id fields are
-    # ``Field(exclude=True)`` in the legacy config so ``model_dump_json``
-    # drops them — add them back explicitly.
-    reconnect_cfg = backend._client.reconnect_config()
-    cfg_dict = json.loads(reconnect_cfg.model_dump_json())
-    cfg_dict["training_job_id"] = reconnect_cfg.training_job_id
-    cfg_dict["sampling_job_id"] = reconnect_cfg.sampling_job_id
-    cfg_dict["log_prob_job_id"] = reconnect_cfg.log_prob_job_id
-    reconnect_path = work_dir / "reconnect_config.json"
-    reconnect_path.write_text(json.dumps(cfg_dict))
-    _log(f"reconnect config -> {reconnect_path}  (train_job_id={cfg_dict['training_job_id']!r})")
+    # Mode selection: native (reconnect_config) vs OpenAI-compat (api_base).
+    openai_compat_mode = args.sampling_api_base is not None
+    if openai_compat_mode:
+        _log(f"OpenAI-compat mode: sampling via {args.sampling_api_base}")
+        reconnect_path = None
+        extra_agent_kwargs: dict[str, str] = {}
+        if args.llm_backend:
+            extra_agent_kwargs["llm_backend"] = args.llm_backend
+    else:
+        # Native mode: dump reconnect config so each Harbor trial (spawned by
+        # harbor run) can reattach to the same running Cortex sub-jobs. The
+        # job-id fields are ``Field(exclude=True)`` in the legacy config so
+        # ``model_dump_json`` drops them — add them back explicitly.
+        reconnect_cfg = backend._client.reconnect_config()
+        cfg_dict = json.loads(reconnect_cfg.model_dump_json())
+        cfg_dict["training_job_id"] = reconnect_cfg.training_job_id
+        cfg_dict["sampling_job_id"] = reconnect_cfg.sampling_job_id
+        cfg_dict["log_prob_job_id"] = reconnect_cfg.log_prob_job_id
+        reconnect_path = work_dir / "reconnect_config.json"
+        reconnect_path.write_text(json.dumps(cfg_dict))
+        _log(f"reconnect config -> {reconnect_path}  (train_job_id={cfg_dict['training_job_id']!r})")
+        extra_agent_kwargs = {}
 
     try:
         rng = random.Random(args.seed)
@@ -326,6 +388,7 @@ async def main() -> None:
             jobs_dir=work_dir / "harbor_jobs",
             job_name="baseline",
             reconnect_config_path=reconnect_path,
+            sampling_api_base=args.sampling_api_base,
             model_name=args.model,
             n_concurrent=args.n_concurrent,
             n_attempts=1,
@@ -335,6 +398,7 @@ async def main() -> None:
             env_path=args.env,
             extra_instruction_paths=skill_paths,
             skill_paths=skill_dirs,
+            extra_agent_kwargs=extra_agent_kwargs,
         )
         base_ds = load_job_dir(baseline_job_dir, "baseline", args.model)
         base_pass = pass_at_1(base_ds)
@@ -365,6 +429,7 @@ async def main() -> None:
                 jobs_dir=work_dir / "harbor_jobs",
                 job_name=f"step_{step:02d}",
                 reconnect_config_path=reconnect_path,
+                sampling_api_base=args.sampling_api_base,
                 model_name=args.model,
                 n_concurrent=args.n_concurrent,
                 n_attempts=args.n_attempts,
@@ -374,6 +439,7 @@ async def main() -> None:
                 env_path=args.env,
                 extra_instruction_paths=skill_paths,
                 skill_paths=skill_dirs,
+                extra_agent_kwargs=extra_agent_kwargs,
             )
             step_ds = load_job_dir(step_job_dir, f"step{step}", args.model)
             reward = _mean_reward(step_job_dir)
@@ -391,6 +457,7 @@ async def main() -> None:
             jobs_dir=work_dir / "harbor_jobs",
             job_name="final",
             reconnect_config_path=reconnect_path,
+            sampling_api_base=args.sampling_api_base,
             model_name=args.model,
             n_concurrent=args.n_concurrent,
             n_attempts=1,
@@ -400,6 +467,7 @@ async def main() -> None:
             env_path=args.env,
             extra_instruction_paths=skill_paths,
             skill_paths=skill_dirs,
+            extra_agent_kwargs=extra_agent_kwargs,
         )
         final_ds = load_job_dir(final_job_dir, "final", args.model)
         final_pass = pass_at_1(final_ds)
@@ -427,7 +495,9 @@ async def main() -> None:
             "run_id": run.run_id,
             "training_job_id": run.training_job_id,
             "sampling_job_id": run.sampling_job_id,
-            "reconnect_config_path": str(reconnect_path),
+            "reconnect_config_path": str(reconnect_path) if reconnect_path else None,
+            "sampling_api_base": args.sampling_api_base,
+            "mode": "openai-compat" if openai_compat_mode else "native",
             "model": args.model,
             "agent": args.agent,
             "env": args.env,

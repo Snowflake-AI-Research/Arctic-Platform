@@ -7,6 +7,14 @@ pulls ``agent_result.rollout_details`` (Harbor's own ``RolloutDetail`` shape:
 ``prompt_token_ids: list[list[int]]``, ``completion_token_ids: list[list[int]]``,
 optional ``logprobs``) plus the verifier's ``reward``, and materializes them
 as ``Rollout`` / ``RolloutDataset`` for the arctic GRPO backend.
+
+Multi-turn handling: Harbor stores per-turn tokens; a real Harbor agent
+(Terminus 2, most CLI-shelling agents) is multi-turn and its reward is
+anchored to the trajectory as a whole. The adapter flattens the trajectory
+into a single (prompt, completion, loss_mask) tuple where the final turn's
+completion is unambiguously trainable and every prior turn's completion is
+also marked trainable inside the flat context — so gradient flows through
+intermediate reasoning, not just the final action.
 """
 
 from __future__ import annotations
@@ -17,13 +25,67 @@ from pathlib import Path
 from arctic_platform.integrations.harbor.models import Rollout, RolloutDataset
 
 
-def _flat_first_turn(per_turn: list[list[int]] | None) -> list[int]:
-    """Harbor stores per-turn token IDs (list[list[int]]). Our GRPO batch is
-    single-turn: take the first turn's IDs. A future multi-turn integration
-    would concatenate or fold turn breaks into the loss mask."""
-    if not per_turn:
-        return []
-    return list(per_turn[0])
+def _flatten_multi_turn(
+    prompt_per_turn: list[list[int]] | None,
+    completion_per_turn: list[list[int]] | None,
+) -> tuple[list[int], list[int], list[float] | None]:
+    """Flatten Harbor's per-turn tokens into (prompt, completion, loss_mask).
+
+    Harbor's invariant: ``prompt_token_ids[i+1]`` starts with
+    ``prompt_token_ids[i] + completion_token_ids[i]`` (each turn's prompt
+    contains the prior conversation). When that holds, the flat sequence is
+    just ``prompt_token_ids[-1] + completion_token_ids[-1]`` — the full
+    context up through the final call, followed by the final response — and
+    every earlier turn's completion occupies a known slice inside
+    ``prompt_token_ids[-1]``.
+
+    The returned ``loss_mask`` has length ``len(prompt) + len(completion)``:
+
+    * 0.0 for context / user / tool-observation positions
+    * 1.0 for every model-produced token across all turns
+
+    If the invariant does not hold (some agent's chat template re-tokenizes
+    between turns), we return ``loss_mask=None`` and the caller falls back
+    to training on only the final turn's completion — a safe subset.
+    """
+    if not prompt_per_turn or not completion_per_turn:
+        return [], [], None
+
+    n = min(len(prompt_per_turn), len(completion_per_turn))
+    prompt_last = list(prompt_per_turn[-1])
+    completion_last = list(completion_per_turn[-1])
+    flat_len = len(prompt_last) + len(completion_last)
+
+    # Final turn's completion is always trainable.
+    mask = [0.0] * len(prompt_last) + [1.0] * len(completion_last)
+
+    # Walk each earlier turn and mark its completion positions inside
+    # prompt_last. If the invariant fails for any turn, drop the mask
+    # entirely; final-turn-only training is still valid.
+    invariant_holds = True
+    for i in range(n - 1):
+        p_i = prompt_per_turn[i]
+        c_i = completion_per_turn[i]
+        # The prior turn's completion should sit at offset len(p_i) in
+        # prompt_last (or in prompt_per_turn[i+1], which prompt_last extends).
+        start = len(p_i)
+        end = start + len(c_i)
+        if end > len(prompt_last):
+            invariant_holds = False
+            break
+        # Cheap consistency check: the tokens at [start:end] in prompt_last
+        # should equal c_i. If they don't, the agent's chat template
+        # rewrote/re-tokenized — abandon the mask.
+        if prompt_last[start:end] != list(c_i):
+            invariant_holds = False
+            break
+        for pos in range(start, end):
+            mask[pos] = 1.0
+
+    if not invariant_holds:
+        mask = None
+
+    return prompt_last, completion_last, mask
 
 
 def load_job_dir(
@@ -69,8 +131,10 @@ def load_job_dir(
         # Harbor may write more than one RolloutDetail if there are subagents.
         # The first entry is always the main agent by convention.
         d = details[0]
-        prompt_ids = _flat_first_turn(d.get("prompt_token_ids"))
-        completion_ids = _flat_first_turn(d.get("completion_token_ids"))
+        prompt_ids, completion_ids, loss_mask = _flatten_multi_turn(
+            d.get("prompt_token_ids"),
+            d.get("completion_token_ids"),
+        )
         if not prompt_ids or not completion_ids:
             continue
 
@@ -78,11 +142,13 @@ def load_job_dir(
             Rollout(
                 prompt_token_ids=prompt_ids,
                 completion_token_ids=completion_ids,
+                loss_mask=loss_mask,
                 reward=reward,
                 group_id=group_id,
                 metadata={
                     "trial_dir": str(result_path.parent),
                     "trial_name": result_path.parent.name,
+                    "n_turns": len(d.get("completion_token_ids") or []),
                     # Preserve every reward field the verifier emitted so eval
                     # can compute additional pass rates (e.g. any_correct,
                     # terse_correct) without re-reading result.json.

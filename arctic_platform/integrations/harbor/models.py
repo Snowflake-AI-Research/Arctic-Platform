@@ -17,12 +17,22 @@ from pydantic import Field
 
 
 class Rollout(BaseModel):
-    """One scored trajectory. Field names match Harbor's rollout_details."""
+    """One scored trajectory. Field names match Harbor's rollout_details.
+
+    Multi-turn agents produce N (prompt, completion) turns; the adapter flattens
+    them into ``prompt_token_ids`` = the full conversation context going into
+    the *final* turn and ``completion_token_ids`` = the final turn's response.
+    ``loss_mask`` (when set) has length ``len(prompt_token_ids) +
+    len(completion_token_ids)`` and marks every model-produced token across
+    *all* turns as trainable (1.0), so intermediate reasoning contributes to
+    the gradient — not just the final action.
+    """
 
     prompt_token_ids: list[int]
     completion_token_ids: list[int]
     reward: float
     logprobs: list[float] | None = None
+    loss_mask: list[float] | None = None
     prompt_text: str | None = None
     completion_text: str | None = None
     group_id: str | None = None  # rollouts sharing a prompt form a GRPO group
