@@ -188,10 +188,7 @@ collapsed by the server. `wait_for_job()` treats it like `placing` — neither
 
 Legacy or internal responses can contain `done`, `unknown`, or enum names such
 as `JOB_STATE_RUNNING`. `wait_for_job()` lowercases and removes the
-`JOB_STATE_` prefix internally. Internal cleanup states (`cancelling`,
-`terminating`, `failing`) are collapsed by the server onto their terminal
-counterpart before reaching the customer-facing API and should not appear on
-the wire.
+`JOB_STATE_` prefix internally.
 
 Current client caveat: `wait_for_job()` raises early for `failed`, `done`,
 `cancelled`, and `canceled`, but not `terminated`; a terminated job therefore
