@@ -70,12 +70,22 @@ class HttpTransport(OnPremTransport):
         return url, {"params": params, "json": request.body}
 
     def call(self, request: Request) -> dict:
-        url, kwargs = self._http_args(request)
-        resp = self.session.post(url, timeout=self.timeout, **kwargs)
-        resp.raise_for_status()
-        if "application/octet-stream" in resp.headers.get("Content-Type", ""):
-            return wire.loads(resp.content)
-        return resp.json()
+        from arctic_platform.common.utils import sft_profile
+
+        with sft_profile.timed("serialize"):
+            url, kwargs = self._http_args(request)
+        with sft_profile.timed("rpc"):
+            resp = self.session.post(url, timeout=self.timeout, **kwargs)
+            resp.raise_for_status()
+            if "application/octet-stream" in resp.headers.get("Content-Type", ""):
+                result = wire.loads(resp.content)
+            else:
+                result = resp.json()
+        if sft_profile.enabled() and request.op in ("forward-backward", "forward", "step"):
+            # Client-side buckets only; server attaches its own under metrics._profile_ms.
+            sft_profile.maybe_print(f"client {request.op}")
+            sft_profile.take_last()
+        return result
 
     async def _ensure_asession(self):
         # A ClientSession is bound to the loop it's built on; reuse it only on

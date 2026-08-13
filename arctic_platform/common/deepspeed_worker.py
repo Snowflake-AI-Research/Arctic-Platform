@@ -388,6 +388,29 @@ class DeepSpeedWorker:
             return batch.to(dev)
         return batch
 
+    def _inject_sft_global_token_meta(self, loss_fn: str, batch_data, meta_data: dict) -> None:
+        """All-reduce valid-target count into ``meta["global_num_tokens"]`` + ``dp_size``.
+
+        Opt-in via ``SFT_GLOBAL_TOKEN_LOSS_FNS``. No-op when labels are absent.
+        """
+        from arctic_platform.sft.processor import SFT_GLOBAL_TOKEN_LOSS_FNS
+        from arctic_platform.sft.processor import count_valid_target_tokens
+
+        if loss_fn not in SFT_GLOBAL_TOKEN_LOSS_FNS:
+            return
+
+        local_tokens = count_valid_target_tokens(batch_data)
+        if local_tokens is None:
+            return
+
+        global_tokens = local_tokens
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and self.world_size > 1:
+            tok = torch.tensor([local_tokens], device=self._device, dtype=torch.long)
+            torch.distributed.all_reduce(tok, op=torch.distributed.ReduceOp.SUM)
+            global_tokens = int(tok.item())
+        meta_data["global_num_tokens"] = global_tokens
+        meta_data["dp_size"] = self.world_size
+
     def _forward_maybe_backward(self, batch: dict, backward: bool) -> dict:
         # torch.autograd.set_detect_anomaly(True)
 
@@ -399,11 +422,16 @@ class DeepSpeedWorker:
             torch.cuda.memory._record_memory_history(max_entries=int(1e12))
         see_memory_usage("_forward_maybe_backward start", force=True)
 
+        from arctic_platform.common.utils import sft_profile
+
         args, batch_data, meta_data, processing = unpack_batch(batch)
-        if isinstance(batch_data, list):
-            batch_data = [self._move_batch_to_device(mb, self._device) for mb in batch_data]
-        else:
-            batch_data = self._move_batch_to_device(batch_data, self._device)
+        with sft_profile.timed("h2d"):
+            if isinstance(batch_data, list):
+                batch_data = [self._move_batch_to_device(mb, self._device) for mb in batch_data]
+            else:
+                batch_data = self._move_batch_to_device(batch_data, self._device)
+            if sft_profile.enabled() and torch.cuda.is_available():
+                torch.cuda.synchronize()
 
         tag = "forward_only" if not backward else "forward_backward"
 
@@ -418,7 +446,7 @@ class DeepSpeedWorker:
                 pr0(f"[DeepSpeedWorker] {tag}: {k=}: {v.shape=}")
 
         grad_accum_steps = self.engine.gradient_accumulation_steps()
-        # list-of-microbatches from the client skips concat→split_dict.
+        # H3: list-of-microbatches from the client skips concat→split_dict.
         if isinstance(batch_data, list):
             micro_batch_data = batch_data
             if len(micro_batch_data) != grad_accum_steps:
@@ -431,6 +459,19 @@ class DeepSpeedWorker:
         num_micro_batches = len(micro_batch_data)
         pipeline_micro_batch_outputs = []
         return_tensors = meta_data.get("worker_return_tensors", False)
+
+        # Decide SFT vs GRPO once, up front. Resolve against SFT_LOSS_FNS (the
+        # canonical registry set) rather than a hardcoded ("sft", "sft_ce")
+        # tuple so new SFT losses dispatch correctly without touching the
+        # worker. Lazy-import keeps `common` free of an import-time SFT
+        # coupling; the module is cached after the first call.
+        loss_fn = processing.get("loss_fn")
+        from arctic_platform.sft.processor import SFT_LOSS_FNS
+
+        use_sft_pipeline = loss_fn in SFT_LOSS_FNS
+
+        if use_sft_pipeline:
+            self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
 
         pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
 
@@ -460,21 +501,37 @@ class DeepSpeedWorker:
             if i == 0:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {meta_data.keys()=} {processing.keys()=}")
 
-            # Lazy: top-level `rl.processors` import loads rl/__init__.py →
-            # common.http_server → this module while it is still initializing.
-            from arctic_platform.rl.processors import run_pipeline
+            if use_sft_pipeline:
+                from arctic_platform.sft.processor import run_sft_pipeline
 
-            micro_batch_output = run_pipeline(
-                self.engine,
-                args,
-                micro_batch,
-                meta_data,
-                processing,
-                device=self._device,
-                backward=backward,
-                pack=False,
-                return_tensors=return_tensors,
-            )
+                # Match the GRPO packed path: only the last microbatch is an
+                # accumulation boundary so DeepSpeed does not all-reduce grads
+                # (or run optimizer bookkeeping) on every microbatch when gas>1.
+                if backward and hasattr(self.engine, "set_gradient_accumulation_boundary"):
+                    self.engine.set_gradient_accumulation_boundary(i == num_micro_batches - 1)
+
+                micro_batch_output = run_sft_pipeline(
+                    self.engine,
+                    micro_batch,
+                    meta_data,
+                    processing,
+                    device=self._device,
+                    backward=backward,
+                )
+            else:
+                from arctic_platform.rl.processors import run_pipeline
+
+                micro_batch_output = run_pipeline(
+                    self.engine,
+                    args,
+                    micro_batch,
+                    meta_data,
+                    processing,
+                    device=self._device,
+                    backward=backward,
+                    pack=False,
+                    return_tensors=return_tensors,
+                )
 
             if i == 0:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {micro_batch_output.keys()=}")
@@ -516,6 +573,15 @@ class DeepSpeedWorker:
             exit()
 
         pr0(f"[DeepSpeedWorker] {tag}: {pipeline_outputs.keys()=}")
+        from arctic_platform.common.utils import sft_profile
+
+        if sft_profile.enabled():
+            metrics = pipeline_outputs.get("metrics")
+            if not isinstance(metrics, dict):
+                metrics = {}
+            metrics = sft_profile.merge_into_metrics(metrics)
+            pipeline_outputs["metrics"] = metrics
+            sft_profile.maybe_print(f"worker rank{self.rank} {tag}", metrics.get("_profile_ms"))
         return pipeline_outputs
 
     def forward_backward(self, batch: dict) -> dict:
@@ -531,7 +597,12 @@ class DeepSpeedWorker:
         return results
 
     def step(self) -> dict:
-        self.engine.step()
+        from arctic_platform.common.utils import sft_profile
+
+        with sft_profile.timed("step"):
+            self.engine.step()
+            if sft_profile.enabled() and torch.cuda.is_available():
+                torch.cuda.synchronize()
         # Pull grad_norm out of DeepSpeed so it can be logged by the trainer.
         # rename_dict in ray_trainer turns "grad_norm" -> "actor/grad_norm",
         # matching the FSDP baseline path in verl/workers/actor/dp_actor.py.
@@ -543,11 +614,70 @@ class DeepSpeedWorker:
         )
         if grad_norm is not None:
             metrics["grad_norm"] = grad_norm
+        metrics = sft_profile.merge_into_metrics(metrics)
+        if sft_profile.enabled():
+            sft_profile.maybe_print(f"worker rank{self.rank} step", metrics.get("_profile_ms"))
         return dict(metrics=metrics, batch=dict())
 
-    def save_checkpoint(self, path: str) -> bool:
+    def save_checkpoint(self, path: str, export_hf: bool = False) -> dict:
+        """Save DeepSpeed checkpoint; optionally export HF weights to ``{path}/hf/`` (rank 0)."""
         self.engine.save_checkpoint(path)
-        return True
+        hf_path = None
+        if export_hf:
+            hf_path = self.export_hf_checkpoint(path)
+        return {
+            "path": path,
+            "hf_path": hf_path,
+            "global_step": int(self.engine.global_steps),
+        }
+
+    def load_checkpoint(self, path: str) -> int:
+        """Restore DeepSpeed state. Returns restored ``global_steps``, or 0 if none found."""
+        load_path, _ = self.engine.load_checkpoint(path)
+        if load_path is None:
+            return 0
+        return int(self.engine.global_steps)
+
+    def export_hf_checkpoint(self, checkpoint_dir: str) -> str | None:
+        """Convert a DeepSpeed checkpoint dir to HF ``save_pretrained`` under ``hf/``.
+
+        Rank 0 only; other ranks return None after a barrier. Prefer DeepSpeed's
+        ``get_fp32_state_dict_from_zero_checkpoint``; fall back to gathering live params.
+        """
+        import os
+
+        hf_dir = os.path.join(checkpoint_dir, "hf")
+        if self.rank == 0:
+            os.makedirs(hf_dir, exist_ok=True)
+            model = self.engine.module
+            state_dict = None
+            try:
+                from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+
+                state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir)
+            except Exception:
+                logger.exception("zero_to_fp32 export failed; falling back to live gather")
+            if state_dict is None:
+                state_dict = {n: p.detach().cpu() for n, p in model.named_parameters()}
+            try:
+                model.save_pretrained(hf_dir, state_dict=state_dict, safe_serialization=True)
+            except TypeError:
+                # Older transformers: no state_dict kwarg — load then save.
+                missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                if missing or unexpected:
+                    logger.warning("HF export load_state_dict missing=%s unexpected=%s", missing, unexpected)
+                model.save_pretrained(hf_dir, safe_serialization=True)
+            logger.info("Exported HF checkpoint to %s", hf_dir)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        return hf_dir if self.rank == 0 else None
+
+    @staticmethod
+    def prune_checkpoint_dirs(parent_dir: str, keep: int) -> int:
+        """Keep the newest ``keep`` ``checkpoint-*`` dirs under ``parent_dir``; remove older."""
+        from arctic_platform.common.utils.checkpoint import prune_checkpoint_dirs
+
+        return prune_checkpoint_dirs(parent_dir, keep)
 
     def compute_log_probs(self, batch: dict) -> torch.Tensor:
         """Full-sequence per-token log-probs for a ``{"batch","meta","processing"}`` DP shard.

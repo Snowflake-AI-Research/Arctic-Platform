@@ -84,11 +84,32 @@ def _step_request(jobs: JobHandles, learning_rate: float | None = None) -> Reque
 
 
 def _save_checkpoint_request(
-    jobs: JobHandles, checkpoint_id: str | None = None, checkpoint_type: str = "resumable"
+    jobs: JobHandles,
+    checkpoint_id: str | None = None,
+    checkpoint_type: str = "resumable",
+    *,
+    path: str | None = None,
+    step: int | None = None,
+    export_hf: bool = False,
+    save_total_limit: int | None = None,
+    stage_info: dict | None = None,
 ) -> Request:
-    # Matches Cortex's `save(job_id, checkpoint_id=None, checkpoint_type=None)`.
-    body = {"checkpoint_id": checkpoint_id, "checkpoint_type": checkpoint_type}
+    # Cortex: checkpoint_id/checkpoint_type. On-prem SFT also accepts
+    # path/step/export_hf/save_total_limit/stage_info.
+    body = {
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_type": checkpoint_type,
+        "path": path,
+        "step": step,
+        "export_hf": export_hf,
+        "save_total_limit": save_total_limit,
+        "stage_info": stage_info,
+    }
     return Request("save", jobs.require("training"), body)
+
+
+def _load_checkpoint_request(jobs: JobHandles, path: str | None = None, step: int | None = None) -> Request:
+    return Request("load-checkpoint", jobs.require("training"), {"path": path, "step": step})
 
 
 def _generate_request(
@@ -173,8 +194,33 @@ class SyncArcticRLClient:
     def step(self, learning_rate: float | None = None) -> dict:
         return self.transport.call(_step_request(self.jobs, learning_rate))
 
-    def save_checkpoint(self, checkpoint_id: str | None = None, checkpoint_type: str = "resumable") -> dict:
-        return self.transport.call(_save_checkpoint_request(self.jobs, checkpoint_id, checkpoint_type))
+    def save_checkpoint(
+        self,
+        checkpoint_id: str | None = None,
+        checkpoint_type: str = "resumable",
+        path: str | None = None,
+        *,
+        step: int | None = None,
+        export_hf: bool = False,
+        save_total_limit: int | None = None,
+        stage_info: dict | None = None,
+    ) -> dict:
+        return self.transport.call(
+            _save_checkpoint_request(
+                self.jobs,
+                checkpoint_id,
+                checkpoint_type,
+                path=path,
+                step=step,
+                export_hf=export_hf,
+                save_total_limit=save_total_limit,
+                stage_info=stage_info,
+            )
+        )
+
+    def load_checkpoint(self, path: str | None = None, *, step: int | None = None) -> dict:
+        """Restore weights/optimizer/LR/step. Returns ``{"global_step", ...}``."""
+        return self.transport.call(_load_checkpoint_request(self.jobs, path, step))
 
     # ── sampling / log-prob ──────────────────────────────────────────────
     def generate(
@@ -250,8 +296,32 @@ class ArcticRLClient:
     async def step(self, learning_rate: float | None = None) -> dict:
         return await self.transport.acall(_step_request(self.jobs, learning_rate))
 
-    async def save_checkpoint(self, checkpoint_id: str | None = None, checkpoint_type: str = "resumable") -> dict:
-        return await self.transport.acall(_save_checkpoint_request(self.jobs, checkpoint_id, checkpoint_type))
+    async def save_checkpoint(
+        self,
+        checkpoint_id: str | None = None,
+        checkpoint_type: str = "resumable",
+        path: str | None = None,
+        *,
+        step: int | None = None,
+        export_hf: bool = False,
+        save_total_limit: int | None = None,
+        stage_info: dict | None = None,
+    ) -> dict:
+        return await self.transport.acall(
+            _save_checkpoint_request(
+                self.jobs,
+                checkpoint_id,
+                checkpoint_type,
+                path=path,
+                step=step,
+                export_hf=export_hf,
+                save_total_limit=save_total_limit,
+                stage_info=stage_info,
+            )
+        )
+
+    async def load_checkpoint(self, path: str | None = None, *, step: int | None = None) -> dict:
+        return await self.transport.acall(_load_checkpoint_request(self.jobs, path, step))
 
     # ── sampling / log-prob ──────────────────────────────────────────────
     async def generate(
@@ -314,13 +384,15 @@ class ArcticRLClient:
 
 
 @overload
-def create_arctic_rl_client(
+def create_arctic_rl_client(  # noqa: E704
     config: ArcticRLClientConfig, *, blocking_calls: Literal[False] = ...
 ) -> ArcticRLClient: ...
 
 
 @overload
-def create_arctic_rl_client(config: ArcticRLClientConfig, *, blocking_calls: Literal[True]) -> SyncArcticRLClient: ...
+def create_arctic_rl_client(  # noqa: E704
+    config: ArcticRLClientConfig, *, blocking_calls: Literal[True]
+) -> SyncArcticRLClient: ...
 
 
 def create_arctic_rl_client(

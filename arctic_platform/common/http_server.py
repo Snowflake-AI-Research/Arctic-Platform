@@ -59,6 +59,7 @@ from arctic_platform.common.utils.ray_pg import create_colocate_placement
 from arctic_platform.common.utils.ray_pg import pg_scheduling_options
 from arctic_platform.common.utils.server_models import GenerateRequest
 from arctic_platform.common.utils.server_models import JobConfig
+from arctic_platform.common.utils.server_models import LoadCheckpointRequest
 from arctic_platform.common.utils.server_models import LogProbsRequest
 from arctic_platform.common.utils.server_models import OperationRequest
 from arctic_platform.common.utils.server_models import ResetPrefixCacheRequest
@@ -485,16 +486,55 @@ async def empty_training_cache(job_id: int):
 @app.post("/save")
 async def save(job_id: int, request: SaveRequest = Body(default=SaveRequest())):
     # `checkpoint_id`/`checkpoint_type` are accepted for Cortex parity; on-prem
-    # saves to the job's configured checkpoint_path.
+    # saves to the job's configured checkpoint_path (or SFT path/step override).
     _verify_job(job_id, "training")
     info = app.state.jobs[job_id]
-    path = info.get("checkpoint_path", None)
+    # Client path overrides the job dir; optional step → .../checkpoint-{step}/.
+    path = request.path or info.get("checkpoint_path", None)
     assert path is not None, f"checkpoint_path is required for training job {job_id}"
+    step = request.step
+    if step is not None:
+        path = str(pathlib.Path(path) / f"checkpoint-{int(step)}")
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
-    await asyncio.gather(
-        *[w.save_checkpoint.remote(path) for w in app.state.training_workers],
+    export_hf = bool(request.export_hf)
+    results = await asyncio.gather(
+        *[w.save_checkpoint.remote(path, export_hf) for w in app.state.training_workers],
     )
-    return {"job_id": job_id, "path": path}
+    parent = str(pathlib.Path(path).parent)
+    if step is not None:
+        (pathlib.Path(parent) / "latest").write_text(str(int(step)))
+    limit = request.save_total_limit
+    if limit is not None and int(limit) > 0 and app.state.training_workers:
+        await app.state.training_workers[0].prune_checkpoint_dirs.remote(parent, int(limit))
+    hf_path = None
+    global_step = None
+    if results and isinstance(results[0], dict):
+        hf_path = results[0].get("hf_path")
+        global_step = results[0].get("global_step")
+    return {"job_id": job_id, "path": path, "hf_path": hf_path, "global_step": global_step}
+
+
+@app.post("/load-checkpoint")
+async def load_checkpoint(job_id: int, request: LoadCheckpointRequest = Body(default=LoadCheckpointRequest())):
+    _verify_job(job_id, "training")
+    info = app.state.jobs[job_id]
+    path = request.path or info.get("checkpoint_path", None)
+    assert path is not None, f"checkpoint_path is required for training job {job_id}"
+    step = request.step
+    if step is not None:
+        path = str(pathlib.Path(path) / f"checkpoint-{int(step)}")
+    elif request.path is None:
+        # No explicit path/step: prefer the ``latest`` pointer under the job dir.
+        latest = pathlib.Path(path) / "latest"
+        if latest.is_file():
+            try:
+                path = str(pathlib.Path(path) / f"checkpoint-{int(latest.read_text().strip())}")
+            except ValueError:
+                pass
+    steps = await asyncio.gather(
+        *[w.load_checkpoint.remote(path) for w in app.state.training_workers],
+    )
+    return {"job_id": job_id, "path": path, "global_step": int(steps[0]) if steps else 0}
 
 
 @app.post("/sleep-inference")
@@ -1014,7 +1054,7 @@ def main():
 
     app.state.training_workers = []
     # ReplicaPool pulls in arctic_inference → vLLM; only create when needed so
-    # training-only servers can start without the inference stack.
+    # training-only SFT servers can start without the inference stack.
     app.state.sampling_pool = _replica_pool_cls()() if args.sampling_gpus > 0 else None
     if args.log_prob_gpus > 0 and args.log_prob_engine == "vllm":
         app.state.log_prob_pool = _replica_pool_cls()()

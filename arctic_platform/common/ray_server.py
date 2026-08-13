@@ -188,7 +188,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
         self.training_workers = []
         # ReplicaPool pulls in arctic_inference → vLLM; only build it when a
         # sampling / vLLM-log-prob job is actually requested so training-only
-        # servers start without the inference stack.
+        # SFT servers start without the inference stack.
         self.sampling_pool = _replica_pool_cls()() if self.sampling_gpus > 0 else None
         if self.log_prob_gpus > 0 and self.log_prob_engine == "vllm":
             self.log_prob_pool = _replica_pool_cls()()
@@ -757,15 +757,49 @@ class ArcticRLRayServer:
 
     async def save(self, job_id: int, body: dict[str, Any] | None = None):
         # `checkpoint_id`/`checkpoint_type` in `body` are accepted for Cortex
-        # parity; on-prem saves to the job's configured checkpoint_path.
+        # parity; on-prem saves to the job's configured checkpoint_path (or SFT
+        # path/step override).
         self._verify_job(job_id, "training")
         info = self.jobs[job_id]
-        checkpoint_path = info.get("checkpoint_path", None)
-        assert checkpoint_path is not None, f"checkpoint_path is required for training jobs {job_id}"
-        os.makedirs(checkpoint_path, exist_ok=True)
-        refs = [w.save_checkpoint.remote(checkpoint_path) for w in self.training_workers]
-        _ = ray.get(refs)
-        return {"job_id": job_id, "path": checkpoint_path}
+        body = body or {}
+        path = body.get("path") or info.get("checkpoint_path", None)
+        assert path is not None, f"checkpoint_path is required for training jobs {job_id}"
+        step = body.get("step")
+        if step is not None:
+            path = os.path.join(path, f"checkpoint-{int(step)}")
+        os.makedirs(path, exist_ok=True)
+        export_hf = bool(body.get("export_hf", False))
+        results = ray.get([w.save_checkpoint.remote(path, export_hf) for w in self.training_workers])
+        parent = os.path.dirname(path)
+        if step is not None:
+            with open(os.path.join(parent, "latest"), "w", encoding="utf-8") as f:
+                f.write(str(int(step)))
+        limit = body.get("save_total_limit")
+        if limit is not None and int(limit) > 0 and self.training_workers:
+            ray.get(self.training_workers[0].prune_checkpoint_dirs.remote(parent, int(limit)))
+        hf_path = results[0].get("hf_path") if results and isinstance(results[0], dict) else None
+        global_step = results[0].get("global_step") if results and isinstance(results[0], dict) else None
+        return {"job_id": job_id, "path": path, "hf_path": hf_path, "global_step": global_step}
+
+    async def load_checkpoint(self, job_id: int, body: dict[str, Any] | None = None):
+        self._verify_job(job_id, "training")
+        info = self.jobs[job_id]
+        body = body or {}
+        path = body.get("path") or info.get("checkpoint_path", None)
+        assert path is not None, f"checkpoint_path is required for training jobs {job_id}"
+        step = body.get("step")
+        if step is not None:
+            path = os.path.join(path, f"checkpoint-{int(step)}")
+        elif body.get("path") is None:
+            latest = os.path.join(path, "latest")
+            if os.path.isfile(latest):
+                try:
+                    with open(latest, encoding="utf-8") as f:
+                        path = os.path.join(path, f"checkpoint-{int(f.read().strip())}")
+                except ValueError:
+                    pass
+        steps = ray.get([w.load_checkpoint.remote(path) for w in self.training_workers])
+        return {"job_id": job_id, "path": path, "global_step": int(steps[0]) if steps else 0}
 
     async def sleep_inference(self, job_id: int, body: dict[str, Any] | int | None = None):
         """Put all inference engines to sleep, freeing GPU memory."""

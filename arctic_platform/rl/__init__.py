@@ -13,18 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Arctic RL client -- HTTP client for RL training against dss-platform or local server."""
+"""Arctic RL package.
 
-from arctic_platform.rl.client import create_arctic_rl_client
-from arctic_platform.rl.config import ArcticRLClientConfig
-from arctic_platform.rl.config import WeightSyncConfig
-from arctic_platform.rl.processors import grpo_loss
-from arctic_platform.rl.processors import pack_sequences
-from arctic_platform.rl.processors import register_loss_fn
-from arctic_platform.rl.processors import register_post_processor
-from arctic_platform.rl.processors import run_pipeline
-from arctic_platform.rl.processors import unpack_sequences
-from arctic_platform.rl.weight_sync import WeightSyncCoordinator
+Heavy imports (HTTP client/server, weight sync) are lazy so
+``python -m arctic_platform.common.http_server`` (or the back-compat
+``python -m arctic_platform.rl.http_server``) can start a training-only
+server without pulling arctic_inference / vLLM at package import time.
+
+SFT symbols remain lazily re-exported for back-compat; prefer
+``arctic_platform.sft``.
+"""
+
+from __future__ import annotations
+
+from typing import Any
 
 __all__ = [
     "create_arctic_rl_client",
@@ -32,9 +34,38 @@ __all__ = [
     "WeightSyncConfig",
     "WeightSyncCoordinator",
     "run_pipeline",
+    "run_sft_pipeline",
     "register_loss_fn",
     "register_post_processor",
     "grpo_loss",
+    "sft_loss",
     "pack_sequences",
     "unpack_sequences",
 ]
+
+_LAZY: dict[str, tuple[str, str]] = {
+    "create_arctic_rl_client": ("arctic_platform.rl.client", "create_arctic_rl_client"),
+    "ArcticRLClientConfig": ("arctic_platform.rl.config", "ArcticRLClientConfig"),
+    "WeightSyncConfig": ("arctic_platform.rl.config", "WeightSyncConfig"),
+    "WeightSyncCoordinator": ("arctic_platform.rl.weight_sync", "WeightSyncCoordinator"),
+    "run_pipeline": ("arctic_platform.rl.processors", "run_pipeline"),
+    "run_sft_pipeline": ("arctic_platform.sft", "run_sft_pipeline"),
+    "register_loss_fn": ("arctic_platform.rl.processors", "register_loss_fn"),
+    "register_post_processor": ("arctic_platform.rl.processors", "register_post_processor"),
+    "grpo_loss": ("arctic_platform.rl.processors", "grpo_loss"),
+    "sft_loss": ("arctic_platform.sft", "sft_loss"),
+    "pack_sequences": ("arctic_platform.rl.processors", "pack_sequences"),
+    "unpack_sequences": ("arctic_platform.rl.processors", "unpack_sequences"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    if name not in _LAZY:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_path, attr = _LAZY[name]
+    import importlib
+
+    mod = importlib.import_module(module_path)
+    value = getattr(mod, attr)
+    globals()[name] = value
+    return value

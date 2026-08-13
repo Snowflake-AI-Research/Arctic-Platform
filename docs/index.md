@@ -8,7 +8,7 @@ live in the [project README](../README.md).
 ```
 ┌──────────────────────────────────────────────┐
 │  Framework / script (CPU or GPU driver)      │
-│  RL client (verl / SkyRL)  ·  SFT (planned)  │
+│  SFT client  ·  RL client (verl / SkyRL)     │
 └──────────────────────┬───────────────────────┘
                        │ HTTP or Ray
                        ▼
@@ -23,12 +23,13 @@ live in the [project README](../README.md).
 
 | Doc | Contents |
 |-----|----------|
+| [**SFT**](sft.md) | Supervised fine-tuning — CPU client, wire batch, `sft` vs `sft_ce`, config |
 | [**RL**](rl.md) | Reinforcement learning — engines, client API, ZoRRo Train / Inference, integrations |
 | [**Common**](common.md) | Shared server infra — HTTP CLI, jobs/endpoints, DeepSpeed worker, metrics, env |
-| **SFT** (forthcoming) | Supervised fine-tuning — CPU client + remote DeepSpeed server (separate PR) |
 
 ## Quick paths
 
+- **SFT smoke (colocated):** see [sft.md § Quick start](sft.md#quick-start)
 - **RL starter recipe:** [`recipes/rl/verl/simple/`](../recipes/rl/verl/)
 - **SkyRL recipes:** [`recipes/rl/skyrl/`](../recipes/rl/skyrl/)
 - **verl plugin:** [`arctic_platform/integrations/verl/`](../arctic_platform/integrations/verl/)

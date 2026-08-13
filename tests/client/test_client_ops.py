@@ -116,12 +116,20 @@ class TestOpMapping:
         assert req.body == {"learning_rate": 0.5}
 
     def test_save_checkpoint_targets_training(self, client):
-        """save_checkpoint -> training job (save op, Cortex-shaped body)."""
+        """save_checkpoint -> training job (save op, Cortex + on-prem SFT body)."""
         _call(client, "save_checkpoint", checkpoint_id="cp1", checkpoint_type="weights-only")
         req = _last(client)
         assert req.op == "save"
         assert req.job_id == TRAINING
-        assert req.body == {"checkpoint_id": "cp1", "checkpoint_type": "weights-only"}
+        assert req.body["checkpoint_id"] == "cp1"
+        assert req.body["checkpoint_type"] == "weights-only"
+
+    def test_load_checkpoint_targets_training(self, client):
+        _call(client, "load_checkpoint", path="/tmp/x", step=2)
+        req = _last(client)
+        assert req.op == "load-checkpoint"
+        assert req.job_id == TRAINING
+        assert req.body == {"path": "/tmp/x", "step": 2}
 
     def test_generate_targets_sampling_and_unwraps_results(self, client):
         """generate -> sampling job; returns the 'results' list."""
@@ -203,6 +211,7 @@ class TestOpRegistry:
         _call(client, "fwd_no_grad", {"input_ids": [1]})
         _call(client, "step")
         _call(client, "save_checkpoint")
+        _call(client, "load_checkpoint")
         _call(client, "generate", ["hi"])
         _call(client, "log_probs", ["hi"])
         # sync_weights expands to wake + operation + wake + reset(operation)

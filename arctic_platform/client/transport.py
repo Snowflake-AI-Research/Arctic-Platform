@@ -45,12 +45,13 @@ OPS = frozenset(
         "forward",
         "step",
         "save",
+        "load-checkpoint",  # SFT resume; not in Cortex surface
         "generate",
         "log-probs",
         # Control-plane ops share one canonical envelope (op_type + payload),
         # matching Cortex's /operation; the transport routes them to /operation.
         "operation",
-        # Colocate sleep/wake (RL e2e / forthcoming SFT generate); direct routes, not /operation.
+        # Colocate sleep/wake (SFT generate / RL e2e); direct routes, not /operation.
         "sleep-inference",
         "wake-inference",
         "sleep-training",
