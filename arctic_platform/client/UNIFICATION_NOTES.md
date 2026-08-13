@@ -16,6 +16,39 @@ body, which job each op targets, response contract) is defined once in
 - `JOB_CREATE_ORDER` + `ArcticRLClientConfig.gpus_for()` centralize GPU-gating and
   creation order so transports no longer hand-roll them.
 
+## Config nesting (canonical)
+One shared shape for every backend — engine knobs are never duplicated under
+backend-specific aliases:
+
+```
+ArcticRLClientConfig
+├── model_name, dtype, max_seq_len      # shared identity / length
+├── training_gpus / sampling_gpus / ... # allocation only
+├── training: TrainingConfig
+│   ├── model: ModelBuildConfig         # ModelSpec minus path (factory)
+│   │   ├── loader, attn_implementation
+│   │   ├── parallelism, patches
+│   ├── optimizer, train_batch_size, …
+└── sampling.vllm: dict                 # vLLM engine kwargs only
+└── backend_config: OnPrem | Cortex     # connection / deploy only
+```
+
+`ArcticRLClientConfig.model_spec()` assembles a full `arctic_platform.model.ModelSpec`
+from `model_name` + `training.model` for `build_model(...)`.
+
+### Temporary wire adapters — delete after server alignment
+`ArcticRLClientConfig.to_onprem(job_type)` and `.to_cortex()` translate the
+canonical shape into today's on-prem `/initialize` and Cortex `sub_job_configs`
+wires:
+
+- nest engine kwargs under `inference_config.vllm_config` (Neutrino)
+- map `training.model` → Neutrino `model_provider` / `ep_size` / `attn_*`
+- map `training.model` → on-prem `ds_worker_config` (`use_liger`, attn, …)
+
+**These adapters should go away** once both servers accept the canonical nesting
+(and call `build_model(ModelSpec)`) directly — do not grow new translation
+logic here; change the server instead.
+
 ## On-prem Ray transport
 `RayTransport` makes in-process Ray actor calls — no HTTP, no serialization. The
 server splits into a `state` actor (job creation) and an `ArcticRLRayServer`

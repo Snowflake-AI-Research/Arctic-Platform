@@ -17,6 +17,7 @@ from arctic_platform.client.client import SyncArcticRLClient
 from arctic_platform.client.client import create_arctic_rl_client
 from arctic_platform.client.client import make_transport
 from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import CortexConfig
 from arctic_platform.client.config import OnPremConfig
 from arctic_platform.client.config import SamplingConfig
 from arctic_platform.client.config import TrainingConfig
@@ -30,6 +31,7 @@ __all__ = [
     "OPS",
     "ArcticRLClient",
     "ArcticRLClientConfig",
+    "CortexConfig",
     "JobHandles",
     "OnPremConfig",
     "SamplingConfig",
