@@ -140,7 +140,10 @@ def _chunk_group_detail(body: Any) -> dict | None:
     for candidate in _iter_error_dicts(body):
         if candidate.get("code") in _CHUNK_GROUP_ERROR_CODES:
             return candidate
-        if candidate.get("chunk_group_id") and str(candidate.get("message") or "") == "request chunk group is missing chunks":
+        if (
+            candidate.get("chunk_group_id")
+            and str(candidate.get("message") or "") == "request chunk group is missing chunks"
+        ):
             return {**candidate, "code": "chunk_group_missing_chunks"}
     return None
 
@@ -148,7 +151,10 @@ def _chunk_group_detail(body: Any) -> dict | None:
 def _is_chunk_post_transient(exc: BaseException) -> bool:
     """`_is_transient`, but never retry a single chunk on a chunk-group error — the
     whole group must be re-posted instead (see `_submit_octet`)."""
-    if isinstance(exc, requests.exceptions.HTTPError) and _chunk_group_detail(_response_json(exc.response)) is not None:
+    if (
+        isinstance(exc, requests.exceptions.HTTPError)
+        and _chunk_group_detail(_response_json(exc.response)) is not None
+    ):
         return False
     return _is_transient(exc)
 
@@ -192,7 +198,9 @@ class CortexTransport(Transport):
         else:
             # A mutating create: only retry when the request provably never landed,
             # so we can't spawn duplicate jobs (matches the neutrino client).
-            created = self._send("POST", self._prefix, retry_on=_is_connect_error, json={"sub_job_configs": self._sub_job_configs()})
+            created = self._send(
+                "POST", self._prefix, retry_on=_is_connect_error, json={"sub_job_configs": self._sub_job_configs()}
+            )
             self.job_id = created["job_id"]
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
