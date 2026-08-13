@@ -15,6 +15,7 @@
 
 from .batch import combine_metric_microbatches
 from .batch import combine_metric_shards
+from .batch import finalize_fwd_bwd_metrics
 from .batch import http_split_batch
 from .batch import log_dp_shard_tokens
 from .batch import merge_dict_shards
@@ -42,6 +43,7 @@ __all__ = [
     "merge_dict_shards",
     "combine_metric_shards",
     "combine_metric_microbatches",
+    "finalize_fwd_bwd_metrics",
     "split_dict",
     "http_split_batch",
     "ray_split_batch",
