@@ -1,9 +1,9 @@
 # Shared server infrastructure (`arctic_platform.common`)
 
-Protocol-agnostic GPU backend used by both **SFT** and **RL**: DeepSpeed
-workers, HTTP/Ray servers, Ray cluster helpers, loss registries, and batch
-utils. Protocol-specific code lives under [`sft.md`](sft.md) /
-[`rl.md`](rl.md).
+Protocol-agnostic GPU backend used by **RL** today and intended for forthcoming
+**SFT**: DeepSpeed workers, HTTP/Ray servers, Ray cluster helpers, loss
+registries, and batch utils. RL-specific protocol docs: [`rl.md`](rl.md).
+SFT client/API docs will land with the SFT PR.
 
 ```
 arctic_platform/common/
@@ -53,7 +53,7 @@ python -m arctic_platform.common.http_server \
 At least one of `--training-gpus`, `--sampling-gpus`, `--log-prob-gpus` must
 be > 0.
 
-**SFT-only** (no vLLM / ArcticInference required):
+**Training-only** (no vLLM / ArcticInference required):
 
 ```bash
 python -m arctic_platform.common.http_server \
@@ -127,13 +127,11 @@ Ray server methods mirror these ops (same names, in-process).
 **Pipeline dispatch** (per `fwd_bwd` call, from `processing.loss_fn`):
 
 ```text
-loss_fn in SFT_LOSS_FNS ("sft", "sft_ce")  →  run_sft_pipeline   (arctic_platform.sft)
-otherwise                                   →  run_pipeline       (arctic_platform.rl GRPO, …)
+loss_fn → run_pipeline (arctic_platform.rl GRPO, …)
 ```
 
-For `sft_ce`, the worker injects `meta["global_num_tokens"]` (cross-rank
-all-reduce of valid targets) and `meta["dp_size"]` before the loss runs. See
-[`sft.md`](sft.md#loss-functions-sft-vs-sft_ce).
+A forthcoming SFT PR will add an SFT loss path (`sft` / `sft_ce`) on the same
+worker; that API is not present in this tree yet.
 
 If `ds_worker_config["zorro_train_enable"]` is true at init, the worker patches
 the HF model for ZoRRo Train (see [`rl.md`](rl.md#zorro-train)).

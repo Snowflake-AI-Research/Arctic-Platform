@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from typing import Any
 
 from arctic_platform import wire
@@ -180,20 +181,51 @@ class HttpTransport(OnPremTransport):
             env["CUDA_VISIBLE_DEVICES"] = bc.server_cuda_visible_devices
         self.proc = subprocess.Popen(cmd, env=env)
         try:
-            self._poll(
-                lambda: self.session.get(f"{self.base_url}/health", timeout=self.timeout).ok,
-                bc.startup_timeout,
-                "server",
-            )
+            self._wait_server_healthy(bc.startup_timeout)
         except Exception:
-            # Health timeout runs in __init__ (before client init guards); kill the orphan.
+            # Health wait runs in __init__ (before client init guards); kill the orphan.
             self._terminate_server()
             raise
 
+    def _wait_server_healthy(self, timeout: float) -> None:
+        """Poll ``/health``; fail fast with the exit code if the server process dies."""
+
+        def server_died() -> str | None:
+            if self.proc is not None and self.proc.poll() is not None:
+                return (
+                    f"Local HTTP server exited with code {self.proc.returncode} before becoming healthy "
+                    "(see server output above)"
+                )
+            return None
+
+        self._poll(
+            lambda: self.session.get(f"{self.base_url}/health", timeout=self.timeout).ok,
+            timeout,
+            "server /health",
+            fatal=server_died,
+        )
+
     @staticmethod
-    def _poll(pred, timeout: float, what: str) -> None:
+    def _poll(
+        pred: Callable[[], bool],
+        timeout: float,
+        what: str,
+        fatal: Callable[[], str | None] | None = None,
+    ) -> None:
+        """Poll ``pred`` until true or ``timeout``.
+
+        ``fatal`` lets a caller abort early: ``pred`` exceptions are swallowed (so a
+        starting server's connection refusals don't end the wait), which would
+        otherwise mask a dead subprocess as a generic ``TimeoutError``. When ``fatal``
+        returns a message, raise it right away with the real cause (e.g. the server's
+        exit code) instead of waiting out the full timeout.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if fatal is not None:
+                msg = fatal()
+                if msg is not None:
+                    raise RuntimeError(msg)
             try:
                 if pred():
                     return
