@@ -68,6 +68,7 @@ dependencies = [
     # transformers pin the trainer client (axolotl) installs on top.
     "ray",
     "tabulate",
+    "tenacity",
     "torch",
     "tqdm",
     "transformers>=4.57.0,<5",
