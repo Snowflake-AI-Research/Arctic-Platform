@@ -15,6 +15,7 @@ include = [
   "arctic_platform/integrations/verl/config/**/*.yaml",
   "arctic_platform/integrations/verl/examples/*.sh",
   "arctic_platform/integrations/verl/README.md",
+  "arctic_platform/integrations/harbor/README.md",
 ]
 
 [project.urls]
@@ -119,6 +120,40 @@ verl = [
     "hydra-core>=1.3",
     "omegaconf",
 ]
+
+# Harbor plugin (arctic_platform/integrations/harbor). Depends on Harbor being
+# installed alongside; we don't pull it in transitively — Harbor is the primary
+# product and the user chooses its version. See the subpackage README for the
+# supported ``harbor run --agent arctic-cortex-agent --env arctic-cortex-env``
+# CLI surface.
+harbor = [
+    "arctic_platform[rl]",
+    "harbor",
+]
+
+# ---------------------------------------------------------------------------
+# Harbor plugin registration.
+#
+# Harbor discovers plugins via ``importlib.metadata.entry_points(group=
+# "harbor.plugins")`` — see ``harbor.cli.plugin_registry``. Installing
+# ``arctic_platform`` registers our agent + environment under short names so
+# users can pass ``--agent arctic-cortex-agent`` / ``--env arctic-cortex-env``
+# instead of full ``module:Class`` import paths.
+# ---------------------------------------------------------------------------
+[project.entry-points."harbor.plugins"]
+arctic-cortex-agent = "arctic_platform.integrations.harbor.agent:CortexRLAgent"
+arctic-cortex-env   = "arctic_platform.integrations.harbor.env:HostEnvironment"
+
+# ---------------------------------------------------------------------------
+# Console scripts. Harbor doesn't yet have a ``harbor train`` subcommand, so
+# training is invoked via ``harbor-cortex-train`` — a thin CLI that drives
+# real ``harbor run`` between GRPO steps. If/when Harbor adds a ``train``
+# subcommand that discovers backends via entry points, the same
+# ``arctic_platform.integrations.harbor.train:cli`` is a drop-in backend.
+# ---------------------------------------------------------------------------
+[project.scripts]
+harbor-cortex-train     = "arctic_platform.integrations.harbor.train:cli"
+harbor-cortex-aggregate = "arctic_platform.integrations.harbor.aggregate:main"
 
 [tool.pytest.ini_options]
 # Only auto-collect the maintained suite.

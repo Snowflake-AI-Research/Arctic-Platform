@@ -47,6 +47,7 @@ from fastapi import Response
 from transformers import AutoTokenizer
 
 from arctic_platform import wire
+from arctic_platform.openai_compat import router as openai_compat_router
 from arctic_platform.rl.deepspeed_worker import DeepSpeedWorker
 from arctic_platform.rl.ray_cluster import init_ray_cluster
 from arctic_platform.rl.server import ArcticRLServerState
@@ -73,6 +74,10 @@ from arctic_platform.rl.utils.server_models import build_model_config
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Arctic RL Local Server")
+# OpenAI-compat surface (/v1/models, /v1/chat/completions, /v1/completions)
+# so any OpenAI-SDK client (Terminus 2 via LiteLLM, LangChain, the openai
+# CLI, ...) can sample from the same sampling sub-job that /generate serves.
+app.include_router(openai_compat_router)
 
 # ---------------------------------------------------------------------------
 # Request / response models (mirrors dss-platform sftp_server)
@@ -230,6 +235,20 @@ async def initialize(job_config: JobConfig = Body(...)):
         else:
             await pool.initialize(model_cfg, num_replicas=num_replicas)
 
+        # Chat-template tokenizer for the OpenAI-compat surface (see
+        # ``arctic_platform/rl/openai_compat.py``). Loaded once here to
+        # avoid a HF Hub hit on every ``/v1/chat/completions`` request.
+        # If ``from_pretrained`` fails (offline / missing chat template),
+        # /v1/chat/completions responds 400 with the underlying message
+        # rather than 500ing the whole server.
+        try:
+            app.state.sampling_tokenizer = AutoTokenizer.from_pretrained(job_config.model_name)
+        except Exception as exc:  # noqa: BLE001 — surface tokenizer errors at /v1/*
+            logger.warning("sampling tokenizer load failed for %s: %s", job_config.model_name, exc)
+            app.state.sampling_tokenizer = None
+        app.state.sampling_model_name = job_config.model_name
+        app.state.sampling_created = int(time.time())
+
     elif job_type == "log_prob":
         gpus = app.state.log_prob_gpus
         if gpus == 0:
@@ -344,6 +363,8 @@ async def destroy(job_id: int, job_type: str = Body(..., embed=True)):
         app.state.training_workers.clear()
     elif info["job_type"] == "sampling":
         await app.state.sampling_pool.shutdown()
+        app.state.sampling_tokenizer = None
+        app.state.sampling_model_name = None
     elif info["job_type"] == "log_prob":
         if info.get("engine") == "deepspeed":
             await asyncio.gather(*[w.destroy.remote() for w in app.state.log_prob_workers])
@@ -1117,6 +1138,9 @@ def main():
 
     app.state.training_workers = []
     app.state.sampling_pool = ReplicaPool()
+    app.state.sampling_tokenizer = None
+    app.state.sampling_model_name = None
+    app.state.sampling_created = int(time.time())
     if args.log_prob_engine == "vllm":
         app.state.log_prob_pool = ReplicaPool()
     else:

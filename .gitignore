@@ -166,3 +166,4 @@ batch_work_dir/
 
 # Hydra run artifacts from recipe launchers
 recipes/**/outputs/
+outputs/
