@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
-import os
+import json
 import time
 from typing import Any
+from typing import Iterator
 
 import requests
 from tenacity import AsyncRetrying
@@ -57,6 +59,13 @@ _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
 # the endpoint, not payload binary-ness (generate carries no tensors), so it lives in
 # the transport rather than on Request.binary.
 _OCTET_OPS = {"forward-backward", "generate"}
+_OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
+# Ops whose chunked frame can be re-posted from scratch on a chunk-group error.
+# forward-backward carries the large gradient frame; a mid-stream chunk-group
+# desync (GS restart) is recoverable only by re-posting the whole group.
+_GROUP_RESTART_OPS = {"forward-backward"}
+_CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
+_CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
 _JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
 _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
@@ -96,6 +105,70 @@ def _is_connect_error(exc: BaseException) -> bool:
     return False
 
 
+class _ChunkGroupError(Exception):
+    """A SnowAPI chunk-group error (missing/conflict/restart) — never retried per-chunk."""
+
+    def __init__(self, detail: dict) -> None:
+        super().__init__(detail.get("code", "chunk_group_error"))
+        self.detail = detail
+
+
+def _iter_error_dicts(value: Any, *, depth: int = 0) -> Iterator[dict]:
+    """Yield error dicts from direct or GS-wrapped (JSON-in-string) error bodies."""
+    if depth > 8:
+        return
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _iter_error_dicts(child, depth=depth + 1)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_error_dicts(child, depth=depth + 1)
+    elif isinstance(value, str):
+        decoder = json.JSONDecoder()
+        for index, char in enumerate(value):
+            if char in "[{":
+                try:
+                    decoded, _ = decoder.raw_decode(value[index:])
+                except ValueError:
+                    continue
+                yield from _iter_error_dicts(decoded, depth=depth + 1)
+
+
+def _chunk_group_detail(body: Any) -> dict | None:
+    """The chunk-group error dict in an error body, else None."""
+    for candidate in _iter_error_dicts(body):
+        if candidate.get("code") in _CHUNK_GROUP_ERROR_CODES:
+            return candidate
+        if candidate.get("chunk_group_id") and str(candidate.get("message") or "") == "request chunk group is missing chunks":
+            return {**candidate, "code": "chunk_group_missing_chunks"}
+    return None
+
+
+def _is_chunk_post_transient(exc: BaseException) -> bool:
+    """`_is_transient`, but never retry a single chunk on a chunk-group error — the
+    whole group must be re-posted instead (see `_submit_octet`)."""
+    if isinstance(exc, requests.exceptions.HTTPError) and _chunk_group_detail(_response_json(exc.response)) is not None:
+        return False
+    return _is_transient(exc)
+
+
+def _response_json(resp: requests.Response | None) -> Any:
+    if resp is None:
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
+async def _aread_json(resp: Any) -> Any:
+    try:
+        return await resp.json(content_type=None)
+    except Exception:
+        return None
+
+
 class CortexTransport(Transport):
     def __init__(self, config: ArcticRLClientConfig) -> None:
         self.config = config
@@ -132,9 +205,12 @@ class CortexTransport(Transport):
         return self.jobs
 
     def shutdown(self) -> None:
-        if self.job_id is not None:
-            # GS uses colon-action syntax: /{job_id}:cancel
-            self.session.post(f"{self._prefix}/{self.job_id}:cancel", timeout=self.request_timeout)
+        if self.job_id is None:
+            return
+        # GS uses colon-action syntax: /{job_id}:cancel. Best-effort teardown routed
+        # through _send (retry + auth), tolerating failure (the job may be gone).
+        with contextlib.suppress(requests.exceptions.RequestException):
+            self._send("POST", f"{self._prefix}/{self.job_id}:cancel")
 
     # ── deliver one op: submit + poll to completion ──────────────────────────
     def call(self, request: Request) -> dict:
@@ -161,11 +237,28 @@ class CortexTransport(Transport):
             return self._send("POST", url, json=body)["request_id"]
         raise NotImplementedError(f"cortex has no {op}")
 
-    def _submit_octet(self, url: str, op: str, body: dict) -> str:
+    def _octet_chunks(self, body: dict, op: str) -> list[bytes]:
         frame = wire.dumps(body, metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}})
+        return list(wire.encode_byte_chunks(frame, kind="request", operation=op, max_bytes=_MAX_OCTET_BYTES))
+
+    def _submit_octet(self, url: str, op: str, body: dict) -> str:
+        # Post the frame chunk-by-chunk. Transient blips retry per-chunk; a
+        # chunk-group desync (only forward-backward) re-posts the whole group once.
+        chunks = self._octet_chunks(body, op)
+        allow_restart = op in _GROUP_RESTART_OPS
+        retry_on = _is_chunk_post_transient if allow_restart else _is_transient
+        restarts = idx = 0
         final: dict = {}
-        for chunk in wire.encode_byte_chunks(frame, kind="request", operation=op, max_bytes=_MAX_OCTET_BYTES):
-            final = self._send("POST", url, data=chunk, headers={"Content-Type": "application/octet-stream"})
+        while idx < len(chunks):
+            try:
+                final = self._send("POST", url, retry_on=retry_on, data=chunks[idx], headers=_OCTET_HEADERS)
+            except requests.exceptions.HTTPError as exc:
+                detail = _chunk_group_detail(_response_json(exc.response))
+                if not (allow_restart and restarts < 1 and detail and detail["code"] == _CHUNK_GROUP_RESTART_REQUIRED):
+                    raise
+                restarts, idx, final = restarts + 1, 0, {}
+                continue
+            idx += 1
         return final["request_id"]
 
     async def _asubmit(self, request: Request) -> str:
@@ -179,11 +272,46 @@ class CortexTransport(Transport):
         raise NotImplementedError(f"cortex has no {op}")
 
     async def _asubmit_octet(self, url: str, op: str, body: dict) -> str:
-        frame = wire.dumps(body, metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}})
+        chunks = self._octet_chunks(body, op)
+        allow_restart = op in _GROUP_RESTART_OPS
+        restarts = idx = 0
         final: dict = {}
-        for chunk in wire.encode_byte_chunks(frame, kind="request", operation=op, max_bytes=_MAX_OCTET_BYTES):
-            final = await self._asend("POST", url, data=chunk, headers={"Content-Type": "application/octet-stream"})
+        while idx < len(chunks):
+            try:
+                final = await self._apost_octet_chunk(url, chunks[idx], allow_restart=allow_restart)
+            except _ChunkGroupError as exc:
+                if not (restarts < 1 and exc.detail["code"] == _CHUNK_GROUP_RESTART_REQUIRED):
+                    raise
+                restarts, idx, final = restarts + 1, 0, {}
+                continue
+            idx += 1
         return final["request_id"]
+
+    async def _apost_octet_chunk(self, url: str, chunk: bytes, *, allow_restart: bool) -> dict:
+        # aiohttp's ClientResponseError drops the body, so read it here to spot a
+        # chunk-group error (surfaced as _ChunkGroupError, never retried per-chunk).
+        session = await self._ensure_asession()
+
+        async def attempt() -> dict:
+            async with session.post(url, data=chunk, headers=_OCTET_HEADERS) as resp:
+                if resp.status >= 400:
+                    detail = _chunk_group_detail(await _aread_json(resp)) if allow_restart else None
+                    if detail is not None:
+                        raise _ChunkGroupError(detail)
+                    resp.raise_for_status()
+                return await resp.json(content_type=None)
+
+        retryer = AsyncRetrying(
+            retry=retry_if_exception(_is_transient_async),
+            stop=stop_after_attempt(1 + self.max_retries),
+            wait=wait_exponential_jitter(initial=0.5, max=10.0),
+            reraise=True,
+        )
+        return await retryer(attempt)
+
+    def _request_url(self, request_id: str, cursor: str | None) -> tuple[str, dict | None]:
+        url = f"{self._prefix}/{self.job_id}/requests/{request_id}"
+        return url, ({"cursor": cursor} if cursor else None)
 
     def _poll(self, request_id: str) -> dict:
         deadline = time.monotonic() + self.poll_timeout
@@ -191,20 +319,15 @@ class CortexTransport(Transport):
         chunks: list[bytes] = []
         cursor: str | None = None
         while time.monotonic() < deadline:
-            status = self._send("GET", f"{self._prefix}/{self.job_id}/requests/{request_id}", params={"cursor": cursor} if cursor else None)
-            state = _short(status.get("status"))
-            chunks.extend(c for c in map(_result_chunk, status.get("events") or []) if c is not None)
-            if status.get("next_cursor"):
-                cursor = status["next_cursor"]
-                continue  # drain remaining result chunks before backing off
-            if state in _REQUEST_DONE:
-                if chunks:
-                    return wire.decode_result_chunks(chunks)
-                return _decode_result(status.get("result") or {})
-            if state in _REQUEST_FAILED:
-                raise RuntimeError(f"cortex request {request_id} ended '{state}': {status.get('error', '')}")
+            url, params = self._request_url(request_id, cursor)
+            action, value = _poll_progress(self._send("GET", url, params=params), chunks, request_id)
+            if action == "done":
+                return value
+            if action == "drain":
+                cursor = value  # more result chunks queued; re-poll without backing off
+                continue
             time.sleep(delay)
-            delay = min(delay * 1.25, 6.0)
+            delay = _next_delay(delay)
         raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s")
 
     async def _apoll(self, request_id: str) -> dict:
@@ -213,22 +336,15 @@ class CortexTransport(Transport):
         chunks: list[bytes] = []
         cursor: str | None = None
         while time.monotonic() < deadline:
-            status = await self._asend(
-                "GET", f"{self._prefix}/{self.job_id}/requests/{request_id}", params={"cursor": cursor} if cursor else None
-            )
-            state = _short(status.get("status"))
-            chunks.extend(c for c in map(_result_chunk, status.get("events") or []) if c is not None)
-            if status.get("next_cursor"):
-                cursor = status["next_cursor"]
-                continue  # drain remaining result chunks before backing off
-            if state in _REQUEST_DONE:
-                if chunks:
-                    return wire.decode_result_chunks(chunks)
-                return _decode_result(status.get("result") or {})
-            if state in _REQUEST_FAILED:
-                raise RuntimeError(f"cortex request {request_id} ended '{state}': {status.get('error', '')}")
+            url, params = self._request_url(request_id, cursor)
+            action, value = _poll_progress(await self._asend("GET", url, params=params), chunks, request_id)
+            if action == "done":
+                return value
+            if action == "drain":
+                cursor = value
+                continue
             await asyncio.sleep(delay)
-            delay = min(delay * 1.25, 6.0)
+            delay = _next_delay(delay)
         raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s")
 
     def _wait_running(self) -> None:
@@ -241,7 +357,7 @@ class CortexTransport(Transport):
             if state in _JOB_TERMINAL:
                 raise RuntimeError(f"cortex job {self.job_id} reached terminal state '{state}'")
             time.sleep(delay)
-            delay = min(delay * 1.25, 6.0)
+            delay = _next_delay(delay)
         raise TimeoutError(f"cortex job {self.job_id} did not become running within {self.poll_timeout}s")
 
     def _capture_sub_jobs(self) -> dict[str, str]:
@@ -270,8 +386,8 @@ class CortexTransport(Transport):
         cx = self.config.backend_config
         if cx.base_url is not None:  # local/dev host: no PAT auth
             return {}
-        return {
-            "Authorization": f"Bearer {os.environ[cx.pat_env_var]}",
+        return {  # config validated resolve_pat() is present for host/PAT auth
+            "Authorization": f"Bearer {cx.resolve_pat()}",
             "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
         }
 
@@ -338,6 +454,29 @@ class CortexTransport(Transport):
                 await self._asession.close()
             self._asession = None
             self._asession_loop = None
+
+
+def _next_delay(delay: float) -> float:
+    """Poll backoff: 1.25x growth capped at 6s."""
+    return min(delay * 1.25, 6.0)
+
+
+def _poll_progress(status: dict, chunks: list[bytes], request_id: str) -> tuple[str, Any]:
+    """Fold one poll response into an action, mutating `chunks` with any result chunks.
+
+    Returns ``("drain", next_cursor)`` (more chunks queued — re-poll now),
+    ``("done", result)`` (finished, decoded result), or ``("wait", None)`` (still
+    running — back off). Raises ``RuntimeError`` if the request ended failed.
+    """
+    chunks.extend(c for c in map(_result_chunk, status.get("events") or []) if c is not None)
+    if status.get("next_cursor"):
+        return "drain", status["next_cursor"]
+    state = _short(status.get("status"))
+    if state in _REQUEST_DONE:
+        return "done", (wire.decode_result_chunks(chunks) if chunks else _decode_result(status.get("result") or {}))
+    if state in _REQUEST_FAILED:
+        raise RuntimeError(f"cortex request {request_id} ended '{state}': {status.get('error', '')}")
+    return "wait", None
 
 
 def _short(status: Any, prefix: str = "request_state_") -> str:

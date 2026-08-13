@@ -29,6 +29,7 @@ servers accept this canonical shape directly.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 from typing import Literal
 
@@ -36,6 +37,8 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import computed_field
+from pydantic import model_validator
+from typing_extensions import Self
 
 JobId = int | str
 
@@ -68,11 +71,27 @@ class CortexConfig(BaseModel):
     backend: Literal["cortex"] = "cortex"
     base_url: str | None = Field(None, description="cortex: direct/mock GS URL; bypasses PAT auth.")
     host: str | None = Field(None, description="cortex: Snowflake host for PAT auth.")
-    pat_env_var: str = Field("CORTEX_PAT", description="cortex: env var holding the programmatic access token.")
+    pat: str | None = Field(None, description="cortex: PAT value passed directly; overrides pat_env_var when set.")
+    pat_env_var: str = Field("CORTEX_PAT", description="cortex: env var holding the PAT when `pat` is unset.")
     database: str = Field("", description="cortex: Snowflake database.")
     schema_: str = Field("", alias="schema", description="cortex: Snowflake schema.")
     endpoint: str = Field("cortex-training", description="cortex: SnowAPI endpoint name.")
     max_retries: int = Field(10, ge=0, description="cortex: transient-failure retries per HTTP request (tenacity).")
+
+    def resolve_pat(self) -> str | None:
+        """The PAT for host/PAT auth: explicit `pat`, else the `pat_env_var` value."""
+        return self.pat if self.pat is not None else os.environ.get(self.pat_env_var)
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        if not (self.base_url or self.host):
+            raise ValueError("cortex: set base_url (direct URL) or host (PAT auth).")
+        if self.host and not self.base_url:
+            if not (self.database and self.schema_):
+                raise ValueError("cortex: database + schema required for host/PAT auth.")
+            if not self.resolve_pat():
+                raise ValueError(f"cortex: no PAT — set `pat` or the '{self.pat_env_var}' env var for host auth.")
+        return self
 
 
 class SamplingConfig(BaseModel):
