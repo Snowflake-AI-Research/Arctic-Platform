@@ -54,6 +54,14 @@ class OnPremConfig(BaseModel):
     port: int = Field(8000, description="onprem: server port.")
     colocate: bool = Field(False, description="onprem: colocate job types on shared GPUs.")
     launch_local_server: bool = Field(False, description="onprem: spawn a local server before connecting.")
+    server_cuda_visible_devices: str | None = Field(
+        None,
+        description=(
+            "CUDA_VISIBLE_DEVICES for the local server subprocess when launch_local_server=True. "
+            "Use this when the client process itself has CUDA_VISIBLE_DEVICES= (empty) so the "
+            "server child still sees GPUs. None = inherit the client's environment."
+        ),
+    )
     startup_timeout: float = Field(
         600.0, description="onprem: seconds to wait for a launched server to become healthy."
     )

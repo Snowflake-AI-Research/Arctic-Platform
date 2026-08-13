@@ -31,6 +31,7 @@ from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
+from arctic_platform.client.transport import initialize_or_cleanup
 
 
 def make_transport(config: ArcticRLClientConfig) -> Transport:
@@ -106,7 +107,13 @@ def _log_probs_request(jobs: JobHandles, prompts: list, completions: list | None
     return Request("log-probs", jobs.require("log_prob"), body)
 
 
-def _sync_weights_request(jobs: JobHandles) -> Request:
+def _sync_weights_request(
+    jobs: JobHandles,
+    *,
+    colocate: bool = False,
+    cuda_ipc: bool = False,
+    low_memory: bool = False,
+) -> Request:
     # The client assembles the full Cortex `/operation` envelope here so transports
     # just forward it: SnowAPI reads the `sub_job_*` routing hints, on-prem accepts
     # the same shape and ignores them (it addresses jobs by job id). On-prem treats a
@@ -116,7 +123,13 @@ def _sync_weights_request(jobs: JobHandles) -> Request:
         "operation_type": "weight-sync",
         "sub_job_id": tid,
         "sub_job_type": "training",
-        "payload": {"source_sub_job_id": tid, "target_sub_job_ids": [sid]},
+        "payload": {
+            "source_sub_job_id": tid,
+            "target_sub_job_ids": [sid],
+            "colocate": colocate,
+            "cuda_ipc": cuda_ipc,
+            "low_memory": low_memory,
+        },
     }
     return Request("operation", tid, body)
 
@@ -148,7 +161,7 @@ class SyncArcticRLClient:
     def __init__(self, config: ArcticRLClientConfig) -> None:
         self.config = config
         self.transport = make_transport(config)
-        self.jobs = self.transport.initialize()
+        self.jobs = initialize_or_cleanup(self.transport)
 
     # ── training ─────────────────────────────────────────────────────────
     def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
@@ -175,11 +188,35 @@ class SyncArcticRLClient:
         return self.transport.call(_log_probs_request(self.jobs, prompts, completions, top_k))
 
     # ── weight sync + cache ──────────────────────────────────────────────
-    def sync_weights(self) -> dict:
-        return self.transport.call(_sync_weights_request(self.jobs))
+    def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict:
+        """Sync training weights to sampling (staged wake → operation → wake → reset)."""
+        self.wake_inference(tags=["weights"])
+        out = self.transport.call(
+            _sync_weights_request(
+                self.jobs,
+                colocate=self.config.backend_config.colocate,
+                cuda_ipc=cuda_ipc,
+                low_memory=low_memory,
+            )
+        )
+        self.wake_inference(tags=["kv_cache"])
+        self.reset_prefix_cache()
+        return out
 
     def reset_prefix_cache(self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1) -> dict:
         return self.transport.call(_reset_prefix_cache_request(self.jobs, drain, timeout_s, retry_interval_s))
+
+    def sleep_inference(self, level: int = 1) -> dict:
+        return self.transport.call(Request("sleep-inference", self.jobs.require("sampling"), {"level": level}))
+
+    def wake_inference(self, tags: list | None = None) -> dict:
+        return self.transport.call(Request("wake-inference", self.jobs.require("sampling"), tags))
+
+    def sleep_training(self, mode: str = "all") -> dict:
+        return self.transport.call(Request("sleep-training", self.jobs.require("training"), {"mode": mode}))
+
+    def wake_training(self) -> dict:
+        return self.transport.call(Request("wake-training", self.jobs.require("training"), {}))
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def reconnect_config(self) -> ArcticRLClientConfig:
@@ -201,7 +238,7 @@ class ArcticRLClient:
     def __init__(self, config: ArcticRLClientConfig) -> None:
         self.config = config
         self.transport = make_transport(config)
-        self.jobs = self.transport.initialize()
+        self.jobs = initialize_or_cleanup(self.transport)
 
     # ── training ─────────────────────────────────────────────────────────
     async def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
@@ -228,13 +265,36 @@ class ArcticRLClient:
         return await self.transport.acall(_log_probs_request(self.jobs, prompts, completions, top_k))
 
     # ── weight sync + cache ──────────────────────────────────────────────
-    async def sync_weights(self) -> dict:
-        return await self.transport.acall(_sync_weights_request(self.jobs))
+    async def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict:
+        await self.wake_inference(tags=["weights"])
+        out = await self.transport.acall(
+            _sync_weights_request(
+                self.jobs,
+                colocate=self.config.backend_config.colocate,
+                cuda_ipc=cuda_ipc,
+                low_memory=low_memory,
+            )
+        )
+        await self.wake_inference(tags=["kv_cache"])
+        await self.reset_prefix_cache()
+        return out
 
     async def reset_prefix_cache(
         self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1
     ) -> dict:
         return await self.transport.acall(_reset_prefix_cache_request(self.jobs, drain, timeout_s, retry_interval_s))
+
+    async def sleep_inference(self, level: int = 1) -> dict:
+        return await self.transport.acall(Request("sleep-inference", self.jobs.require("sampling"), {"level": level}))
+
+    async def wake_inference(self, tags: list | None = None) -> dict:
+        return await self.transport.acall(Request("wake-inference", self.jobs.require("sampling"), tags))
+
+    async def sleep_training(self, mode: str = "all") -> dict:
+        return await self.transport.acall(Request("sleep-training", self.jobs.require("training"), {"mode": mode}))
+
+    async def wake_training(self) -> dict:
+        return await self.transport.acall(Request("wake-training", self.jobs.require("training"), {}))
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def reconnect_config(self) -> ArcticRLClientConfig:

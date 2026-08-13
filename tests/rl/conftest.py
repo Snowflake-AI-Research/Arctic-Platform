@@ -20,7 +20,8 @@ from __future__ import annotations
 import os
 
 import pytest
-from rl_harness import gpu_serial_lock
+
+from arctic_platform.testing_utils import gpu_serial_lock
 
 # Per-test wall-clock budget for the heavyweight GPU tests. Healthy spin-up is well under a minute, but the http
 # session retries a wedged init up to 3 times on fresh ports (job_ready_timeout=240s each), so the test must be

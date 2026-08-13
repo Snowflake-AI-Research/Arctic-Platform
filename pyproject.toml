@@ -62,12 +62,18 @@ dependencies = [
     "peft",
     "psutil",
     "pydantic>=2.10",
+    # ray + uvicorn back the shared server (common/http_server.py,
+    # ray_server.py import them unconditionally), so they are base runtime
+    # deps, not RL-only. Neither pins transformers, so they coexist with the
+    # transformers pin the trainer client (axolotl) installs on top.
+    "ray",
     "tabulate",
     "tenacity",
     "torch",
     "tqdm",
     "transformers>=4.57.0,<5",
 #    "transformers>=5.5", # want to switch to v5 but vllm18 blocks us at v4
+    "uvicorn",
     "wandb",
     "yq",
 ]
@@ -103,10 +109,12 @@ formatting = [
 
 
 rl = [
+    # ray + uvicorn moved to base deps (server imports them unconditionally).
+    # This extra now carries only the GPU sampling stack. vllm==0.18.0 declares
+    # transformers<5, but that is only an upper bound: it installs/runs fine
+    # alongside transformers 5 when axolotl is installed last (see setup.sh).
     "liger-kernel>=0.8.0",
-    "ray",
     "tensordict",
-    "uvicorn",
     "vllm==0.18.0",
 ]
 

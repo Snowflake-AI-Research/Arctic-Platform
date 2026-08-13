@@ -45,6 +45,7 @@ import torch.distributed as dist
 import transformers
 from parameterized import parameterized
 from transformers import AutoModelForCausalLM
+from transformers.utils import is_flash_attn_2_available
 
 from arctic_platform.rl.zorro_train.qwen_model_patcher import Qwen3ModelOncePatcher
 from arctic_platform.rl.zorro_train.tests import create_dummy_batch
@@ -148,7 +149,13 @@ class TestQwen3ModelOncePatcher(TestCasePlus):
         """Load the cached model/reference, skipping cases whose architecture the installed transformers lacks.
 
         Some checkpoints (e.g. ``tiny-random/qwen3.6``, arch ``qwen3_5``) only exist in newer transformers than the
-        pinned range supports; skip rather than fail so the suite stays green until that dependency is bumped."""
+        pinned range supports; skip rather than fail so the suite stays green until that dependency is bumped.
+
+        ``flash_attention_2`` without the real ``flash_attn`` package falls back to
+        ``kernels-community/flash-attn2``, whose numerics diverge from the per-row reference beyond the
+        tight atol these tests use — skip rather than false-fail."""
+        if attn_implementation == "flash_attention_2" and not is_flash_attn_2_available():
+            self.skipTest("flash_attention_2 requires the flash_attn package (not kernels-community fallback)")
         try:
             return _load_model_and_reference(model_name, attn_implementation, add_padding)
         except ValueError as e:

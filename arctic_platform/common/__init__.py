@@ -15,9 +15,9 @@
 
 """Shared Arctic Platform training/server infrastructure (protocol-agnostic).
 
-Protocol-specific code lives under ``arctic_platform.rl`` (GRPO/RL) and
-``arctic_platform.sft`` (SFT). This package holds the DeepSpeed worker, HTTP/Ray
-servers, Ray cluster helpers, and low-level utils used by both.
+Protocol-specific code lives under ``arctic_platform.rl`` (GRPO/RL); a
+forthcoming SFT package will share this stack. This package holds the DeepSpeed
+worker, HTTP/Ray servers, Ray cluster helpers, and low-level utils.
 """
 
 from __future__ import annotations
