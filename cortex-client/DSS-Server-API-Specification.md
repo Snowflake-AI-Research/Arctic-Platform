@@ -373,8 +373,10 @@ The SnowAPI shape consumed by this repository is flat at each sub-job:
 this endpoint until `running`.
 
 `submitted_by` (submitting user's name) and `owner_role` (owning role's name)
-are best-effort and may be absent. Both fields also appear on each job entry
-returned by `list_jobs()` ([section 5.3](#53-list-jobs---get-)).
+are best-effort and may be absent, e.g. if the user/role has since been
+dropped or the requesting role no longer has access to it. Both fields also
+appear on each job entry returned by `list_jobs()`
+([section 5.3](#53-list-jobs---get-)).
 
 ### 5.3 List jobs - `GET /`
 
