@@ -543,10 +543,15 @@ async def operation(job_id: int, request: OperationRequest = Body(...)):
     Dispatches on operation_type so the unified client routes control ops through
     one payload shape. Reuses the typed handlers below; no logic is duplicated.
     """
+    payload = request.payload or {}
     if request.operation_type == "weight-sync":
-        return await weight_sync(job_id, WeightSyncRequest(**request.payload))
+        return await weight_sync(job_id, WeightSyncRequest(**payload))
     if request.operation_type == "reset-prefix-cache":
-        return await reset_prefix_cache(job_id, ResetPrefixCacheRequest(**request.payload))
+        return await reset_prefix_cache(job_id, ResetPrefixCacheRequest(**payload))
+    if request.operation_type == "sleep-inference":
+        return await sleep_inference(job_id, payload.get("level", 1))
+    if request.operation_type == "wake-inference":
+        return await wake_inference(job_id, payload.get("tags"))
     raise HTTPException(status_code=400, detail=f"unknown operation_type {request.operation_type!r}")
 
 

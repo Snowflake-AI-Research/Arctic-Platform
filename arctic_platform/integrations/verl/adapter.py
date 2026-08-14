@@ -199,10 +199,16 @@ class ArcticRLClientWrapper(RemoteBackend):
     def reconnect_handle(self) -> dict:
         """Serializable bundle the forwarder workers / rollout replicas
         pass back to :meth:`from_config` (as ``handle=...``) to re-attach
-        to this same backend instance."""
+        to this same backend instance.
+
+        Ray transport shares an in-process ``server_state`` actor handle.
+        HTTP reconnects via job ids in ``reconnect_config`` only
+        (``rl_server_state=None``).
+        """
+        get_state = getattr(self._client.transport, "get_server_state", None)
         return {
             "rl_client_reconnect_config": self.reconnect_config(),
-            "rl_server_state": self.get_server_state(),
+            "rl_server_state": get_state() if get_state is not None else None,
         }
 
     # Parallelism contract --------------------------------------------- #
@@ -587,10 +593,12 @@ class ArcticRLClientWrapper(RemoteBackend):
             "colocate": colocate,
         }
         # host/port only matter for the HTTP transport; the in-process Ray path
-        # never dials them.
+        # never dials them. Auto-spawn the local HTTP server when using HTTP so
+        # recipes do not need a separately started arctic_platform.rl.http_server.
         if protocol != "ray":
             onprem_kwargs["host"] = "localhost"
             onprem_kwargs["port"] = 7000
+            onprem_kwargs["launch_local_server"] = True
 
         # attn_implementation also lives on ds_worker_config; keep it there for
         # the DeepSpeed worker (matches recipe/rl-correctness).

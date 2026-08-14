@@ -220,9 +220,16 @@ class SyncArcticRLClient:
 
     # ── weight sync + cache ──────────────────────────────────────────────
     def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict:
-        return self.transport.call(
+        # Match legacy HTTP client staged wake: restore weight storage → IPC/file
+        # load → restore KV cache → clear prefix cache. Required for colocated
+        # HTTP/NFS (vLLM cumem sleep); harmless on Ray when already awake.
+        self.wake_inference(tags=["weights"])
+        response = self.transport.call(
             _sync_weights_request(self.jobs, self.config.backend_config.colocate, cuda_ipc, low_memory)
         )
+        self.wake_inference(tags=["kv_cache"])
+        self.reset_prefix_cache()
+        return response
 
     def sleep_inference(self, level: int = 1) -> dict:
         return self.transport.call(_sleep_inference_request(self.jobs, level))
@@ -284,9 +291,14 @@ class ArcticRLClient:
 
     # ── weight sync + cache ──────────────────────────────────────────────
     async def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict:
-        return await self.transport.acall(
+        # Match legacy HTTP client staged wake (see SyncArcticRLClient.sync_weights).
+        await self.wake_inference(tags=["weights"])
+        response = await self.transport.acall(
             _sync_weights_request(self.jobs, self.config.backend_config.colocate, cuda_ipc, low_memory)
         )
+        await self.wake_inference(tags=["kv_cache"])
+        await self.reset_prefix_cache()
+        return response
 
     async def sleep_inference(self, level: int = 1) -> dict:
         return await self.transport.acall(_sleep_inference_request(self.jobs, level))
