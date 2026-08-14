@@ -839,6 +839,10 @@ class ArcticRLRayServer:
             return await self.weight_sync(job_id, payload)
         if op_type == "reset-prefix-cache":
             return await self.reset_prefix_cache(job_id, payload)
+        if op_type == "sleep-inference":
+            return await self.sleep_inference(job_id, payload.get("level", 1))
+        if op_type == "wake-inference":
+            return await self.wake_inference(job_id, payload.get("tags"))
         raise ValueError(f"unknown operation_type {op_type!r}")
 
     async def sleep_training(self, job_id: int, body: dict[str, Any] | str | None = None):
