@@ -120,11 +120,38 @@ def reconstruct_position_ids_(batch_data: dict) -> None:
 
 
 def _split_batch(batch: dict, num_workers: int) -> list[dict]:
-    """Split a batch across DP workers."""
+    """Split a batch across DP workers.
+
+    Supports two wire shapes for ``batch["batch"]``:
+      * **dict** of tensors (legacy / demos): one concatenated mini-batch, later
+        re-split by ``gradient_accumulation_steps`` inside the worker.
+      * **list** of microbatch dicts (Arctic SFT trainer, H3): each entry is one
+        GAS microbatch already; DP-shard each microbatch independently so the
+        worker skips concat→``split_dict`` and avoids cross-GAS re-padding.
+    """
     _, batch_data, meta_data, processing = unpack_batch(batch)
 
     reorder_indices = None
+    meta_data = dict(meta_data)
+    meta_data.update(dp_size=num_workers)
 
+    if isinstance(batch_data, list):
+        if not batch_data:
+            raise ValueError("batch microbatch list is empty")
+        per_worker: list[list[dict]] = [[] for _ in range(num_workers)]
+        for mb in batch_data:
+            if not isinstance(mb, dict):
+                raise TypeError(f"gas microbatch must be a dict of tensors, got {type(mb).__name__}")
+            mb = dict(mb)  # shallow copy before optional in-place reconstruct
+            if meta_data.get("drop_position_ids", False) and "position_ids" not in mb:
+                reconstruct_position_ids_(mb)
+            mb_shards = split_dict(mb, num_workers)
+            for i, shard in enumerate(mb_shards):
+                per_worker[i].append(shard)
+        shards = [dict(batch=per_worker[i], meta=meta_data, processing=processing) for i in range(num_workers)]
+        return shards, reorder_indices
+
+    # --- legacy concatenated-tensor path ---
     # position_ids may have been dropped on the wire (client-side optimization);
     # reconstruct them from attention_mask before anything consumes them.
     if meta_data.get("drop_position_ids", False) and "position_ids" not in batch_data:
@@ -147,7 +174,6 @@ def _split_batch(batch: dict, num_workers: int) -> list[dict]:
 
     batch_data_shards = split_dict(batch_data, num_workers)
     shards = []
-    meta_data.update(**dict(dp_size=num_workers))
     for i in range(num_workers):
         shard = dict(batch=batch_data_shards[i], meta=meta_data, processing=processing)
         shards.append(shard)
@@ -310,6 +336,19 @@ def combine_metric_shards(shards_list: list[dict]) -> dict:
         out.setdefault(k, v)
 
     return out
+
+
+def finalize_fwd_bwd_metrics(rank_results: list[dict]) -> tuple[dict, float]:
+    """Collapse per-rank fwd_bwd results to ``(metrics, avg_loss)``.
+
+    ``avg_loss`` is the global token-mean ``metrics["loss"]`` when paired
+    ``loss.sum`` / ``loss.tokens`` were emitted; otherwise the sum of per-rank
+    ``avg_loss`` (legacy GRPO / non-paired paths).
+    """
+    metrics = combine_metric_shards([r.get("metrics") or {} for r in rank_results])
+    if "loss" in metrics:
+        return metrics, float(metrics["loss"])
+    return metrics, float(sum(r.get("avg_loss", 0.0) for r in rank_results))
 
 
 def combine_metric_microbatches(per_microbatch_metric_dicts: list[dict]) -> dict:

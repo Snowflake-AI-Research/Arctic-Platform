@@ -126,12 +126,20 @@ class TestOpMapping:
         assert req.body == {"learning_rate": 0.5}
 
     def test_save_checkpoint_targets_training(self, client):
-        """save_checkpoint -> training job (save op, Cortex-shaped body)."""
+        """save_checkpoint -> training job (save op, Cortex + on-prem SFT body)."""
         _call(client, "save_checkpoint", checkpoint_id="cp1", checkpoint_type="weights-only")
         req = _last(client)
         assert req.op == "save"
         assert req.job_id == TRAINING
-        assert req.body == {"checkpoint_id": "cp1", "checkpoint_type": "weights-only"}
+        assert req.body["checkpoint_id"] == "cp1"
+        assert req.body["checkpoint_type"] == "weights-only"
+
+    def test_load_checkpoint_targets_training(self, client):
+        _call(client, "load_checkpoint", path="/tmp/x", step=2)
+        req = _last(client)
+        assert req.op == "load-checkpoint"
+        assert req.job_id == TRAINING
+        assert req.body == {"path": "/tmp/x", "step": 2}
 
     def test_generate_targets_sampling_and_unwraps_results(self, client):
         """generate -> sampling job; returns the 'results' list."""
@@ -162,55 +170,31 @@ class TestOpMapping:
             "payload": {"drain": False, "timeout_s": 5.0, "retry_interval_s": 0.2},
         }
 
-    def test_sync_weights_targets_training_with_sub_job_ids(self, client):
-        """sync_weights -> training job; weight-sync op carries source/target + colocate flags."""
-        _call(client, "sync_weights")
-        req = _last(client)
-        assert req.op == "operation"
-        assert req.job_id == TRAINING
-        assert req.body == {
-            "operation_type": "weight-sync",
-            "sub_job_id": TRAINING,
-            "sub_job_type": "training",
-            "payload": {
-                "source_sub_job_id": TRAINING,
-                "target_sub_job_ids": [SAMPLING],
-                "colocate": client.config.backend_config.colocate,
-                "cuda_ipc": False,
-                "low_memory": False,
-            },
+    def test_sync_weights_staged_wake_and_operation(self, client):
+        """sync_weights: wake → weight-sync operation → wake → reset-prefix-cache."""
+        _call(client, "sync_weights", cuda_ipc=True, low_memory=False)
+        ops = [r.op for r in client.transport.calls[-4:]]
+        assert ops == ["wake-inference", "operation", "wake-inference", "operation"]
+        sync_req = client.transport.calls[-3]
+        assert sync_req.job_id == TRAINING
+        assert sync_req.body["operation_type"] == "weight-sync"
+        assert sync_req.body["payload"] == {
+            "source_sub_job_id": TRAINING,
+            "target_sub_job_ids": [SAMPLING],
+            "colocate": False,
+            "cuda_ipc": True,
+            "low_memory": False,
         }
 
-    def test_sync_weights_forwards_cuda_ipc_and_low_memory(self, client):
-        """cuda_ipc / low_memory land in the weight-sync payload for colocated fast sync."""
-        _call(client, "sync_weights", cuda_ipc=True, low_memory=True)
-        payload = _last(client).body["payload"]
-        assert payload["cuda_ipc"] is True
-        assert payload["low_memory"] is True
-
-    def test_sleep_inference_targets_sampling(self, client):
-        """sleep_inference -> sampling job via the operation envelope."""
+    def test_sleep_wake_training_and_inference(self, client):
         _call(client, "sleep_inference", level=2)
-        req = _last(client)
-        assert req.op == "operation"
-        assert req.job_id == SAMPLING
-        assert req.body == {
-            "operation_type": "sleep-inference",
-            "sub_job_type": "sampling",
-            "payload": {"level": 2},
-        }
-
-    def test_wake_inference_targets_sampling(self, client):
-        """wake_inference -> sampling job via the operation envelope."""
+        assert _last(client).op == "sleep-inference"
         _call(client, "wake_inference", tags=["weights"])
-        req = _last(client)
-        assert req.op == "operation"
-        assert req.job_id == SAMPLING
-        assert req.body == {
-            "operation_type": "wake-inference",
-            "sub_job_type": "sampling",
-            "payload": {"tags": ["weights"]},
-        }
+        assert _last(client).op == "wake-inference"
+        _call(client, "sleep_training", mode="non_lp")
+        assert _last(client).op == "sleep-training"
+        _call(client, "wake_training")
+        assert _last(client).op == "wake-training"
 
 
 class TestLifecycle:
@@ -287,15 +271,23 @@ class TestOpRegistry:
     transport's op coverage is checkable without a live backend."""
 
     def test_client_emits_exactly_the_registered_ops(self, client):
-        """Driving every client op must produce exactly the canonical OPS set."""
+        """Driving every client op must cover the canonical OPS set."""
         _call(client, "fwd_bwd", {"input_ids": [1]})
         _call(client, "fwd_no_grad", {"input_ids": [1]})
         _call(client, "step")
         _call(client, "save_checkpoint")
+        _call(client, "load_checkpoint")
         _call(client, "generate", ["hi"])
         _call(client, "log_probs", ["hi"])
+        # sync_weights expands to wake + operation + wake + reset(operation)
+        n_before = len(client.transport.calls)
         _call(client, "sync_weights")
+        assert {"wake-inference", "operation"} <= {r.op for r in client.transport.calls[n_before:]}
         _call(client, "reset_prefix_cache")
+        _call(client, "sleep_inference")
+        _call(client, "wake_inference")
+        _call(client, "sleep_training")
+        _call(client, "wake_training")
         assert {req.op for req in client.transport.calls} == OPS
 
     def test_unresolved_ops_flags_a_missing_method(self):

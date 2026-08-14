@@ -15,6 +15,7 @@
 
 from .batch import combine_metric_microbatches
 from .batch import combine_metric_shards
+from .batch import finalize_fwd_bwd_metrics
 from .batch import http_split_batch
 from .batch import log_dp_shard_tokens
 from .batch import merge_dict_shards
@@ -28,6 +29,7 @@ from .debug import SynchronizedWallClockTimerSimple
 from .record_replay import record_replay_generation
 from .server_models import GenerateRequest
 from .server_models import JobConfig
+from .server_models import LoadCheckpointRequest
 from .server_models import LogProbsRequest
 from .server_models import OperationRequest
 from .server_models import ResetPrefixCacheRequest
@@ -42,6 +44,7 @@ __all__ = [
     "merge_dict_shards",
     "combine_metric_shards",
     "combine_metric_microbatches",
+    "finalize_fwd_bwd_metrics",
     "split_dict",
     "http_split_batch",
     "ray_split_batch",
@@ -56,6 +59,7 @@ __all__ = [
     "LogProbsRequest",
     "StepRequest",
     "SaveRequest",
+    "LoadCheckpointRequest",
     "ResetPrefixCacheRequest",
     "OperationRequest",
     "WeightSyncRequest",

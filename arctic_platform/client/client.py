@@ -31,9 +31,15 @@ from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
+from arctic_platform.client.transport import initialize_or_cleanup
 
 
 def make_transport(config: ArcticRLClientConfig, server_state: Any = None) -> Transport:
+    if config.backend == "cortex":
+        from arctic_platform.client.transports.cortex import CortexTransport
+
+        return CortexTransport(config)
+
     from arctic_platform.client.transports.onprem_http import HttpTransport
     from arctic_platform.client.transports.onprem_ray import RayTransport
 
@@ -84,11 +90,32 @@ def _step_request(jobs: JobHandles, learning_rate: float | None = None) -> Reque
 
 
 def _save_checkpoint_request(
-    jobs: JobHandles, checkpoint_id: str | None = None, checkpoint_type: str = "resumable"
+    jobs: JobHandles,
+    checkpoint_id: str | None = None,
+    checkpoint_type: str = "resumable",
+    *,
+    path: str | None = None,
+    step: int | None = None,
+    export_hf: bool = False,
+    save_total_limit: int | None = None,
+    stage_info: dict | None = None,
 ) -> Request:
-    # Matches Cortex's `save(job_id, checkpoint_id=None, checkpoint_type=None)`.
-    body = {"checkpoint_id": checkpoint_id, "checkpoint_type": checkpoint_type}
+    # Cortex: checkpoint_id/checkpoint_type. On-prem SFT also accepts
+    # path/step/export_hf/save_total_limit/stage_info.
+    body = {
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_type": checkpoint_type,
+        "path": path,
+        "step": step,
+        "export_hf": export_hf,
+        "save_total_limit": save_total_limit,
+        "stage_info": stage_info,
+    }
     return Request("save", jobs.require("training"), body)
+
+
+def _load_checkpoint_request(jobs: JobHandles, path: str | None = None, step: int | None = None) -> Request:
+    return Request("load-checkpoint", jobs.require("training"), {"path": path, "step": step})
 
 
 def _generate_request(
@@ -108,7 +135,11 @@ def _log_probs_request(jobs: JobHandles, prompts: list, completions: list | None
 
 
 def _sync_weights_request(
-    jobs: JobHandles, colocate: bool, cuda_ipc: bool = False, low_memory: bool = False
+    jobs: JobHandles,
+    *,
+    colocate: bool = False,
+    cuda_ipc: bool = False,
+    low_memory: bool = False,
 ) -> Request:
     # The client assembles the full Cortex `/operation` envelope here so transports
     # just forward it: SnowAPI reads the `sub_job_*` routing hints, on-prem accepts
@@ -132,26 +163,6 @@ def _sync_weights_request(
         },
     }
     return Request("operation", tid, body)
-
-
-def _sleep_inference_request(jobs: JobHandles, level: int = 1) -> Request:
-    sid = jobs.require("sampling")
-    body = {
-        "operation_type": "sleep-inference",
-        "sub_job_type": "sampling",
-        "payload": {"level": level},
-    }
-    return Request("operation", sid, body)
-
-
-def _wake_inference_request(jobs: JobHandles, tags: list | None = None) -> Request:
-    sid = jobs.require("sampling")
-    body = {
-        "operation_type": "wake-inference",
-        "sub_job_type": "sampling",
-        "payload": {"tags": tags},
-    }
-    return Request("operation", sid, body)
 
 
 def _reset_prefix_cache_request(
@@ -192,7 +203,7 @@ class SyncArcticRLClient:
     def __init__(self, config: ArcticRLClientConfig, server_state: Any = None) -> None:
         self.config = config
         self.transport = make_transport(config, server_state=server_state)
-        self.jobs = self.transport.initialize()
+        self.jobs = initialize_or_cleanup(self.transport)
 
     # ── training ─────────────────────────────────────────────────────────
     def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
@@ -204,8 +215,33 @@ class SyncArcticRLClient:
     def step(self, learning_rate: float | None = None) -> dict:
         return self.transport.call(_step_request(self.jobs, learning_rate))
 
-    def save_checkpoint(self, checkpoint_id: str | None = None, checkpoint_type: str = "resumable") -> dict:
-        return self.transport.call(_save_checkpoint_request(self.jobs, checkpoint_id, checkpoint_type))
+    def save_checkpoint(
+        self,
+        checkpoint_id: str | None = None,
+        checkpoint_type: str = "resumable",
+        path: str | None = None,
+        *,
+        step: int | None = None,
+        export_hf: bool = False,
+        save_total_limit: int | None = None,
+        stage_info: dict | None = None,
+    ) -> dict:
+        return self.transport.call(
+            _save_checkpoint_request(
+                self.jobs,
+                checkpoint_id,
+                checkpoint_type,
+                path=path,
+                step=step,
+                export_hf=export_hf,
+                save_total_limit=save_total_limit,
+                stage_info=stage_info,
+            )
+        )
+
+    def load_checkpoint(self, path: str | None = None, *, step: int | None = None) -> dict:
+        """Restore weights/optimizer/LR/step. Returns ``{"global_step", ...}``."""
+        return self.transport.call(_load_checkpoint_request(self.jobs, path, step))
 
     # ── sampling / log-prob ──────────────────────────────────────────────
     def generate(
@@ -220,25 +256,34 @@ class SyncArcticRLClient:
 
     # ── weight sync + cache ──────────────────────────────────────────────
     def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict:
-        # Match legacy HTTP client staged wake: restore weight storage → IPC/file
-        # load → restore KV cache → clear prefix cache. Required for colocated
-        # HTTP/NFS (vLLM cumem sleep); harmless on Ray when already awake.
+        """Sync training weights to sampling (staged wake → operation → wake → reset)."""
         self.wake_inference(tags=["weights"])
-        response = self.transport.call(
-            _sync_weights_request(self.jobs, self.config.backend_config.colocate, cuda_ipc, low_memory)
+        out = self.transport.call(
+            _sync_weights_request(
+                self.jobs,
+                colocate=self.config.backend_config.colocate,
+                cuda_ipc=cuda_ipc,
+                low_memory=low_memory,
+            )
         )
         self.wake_inference(tags=["kv_cache"])
         self.reset_prefix_cache()
-        return response
-
-    def sleep_inference(self, level: int = 1) -> dict:
-        return self.transport.call(_sleep_inference_request(self.jobs, level))
-
-    def wake_inference(self, tags: list | None = None) -> dict:
-        return self.transport.call(_wake_inference_request(self.jobs, tags))
+        return out
 
     def reset_prefix_cache(self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1) -> dict:
         return self.transport.call(_reset_prefix_cache_request(self.jobs, drain, timeout_s, retry_interval_s))
+
+    def sleep_inference(self, level: int = 1) -> dict:
+        return self.transport.call(Request("sleep-inference", self.jobs.require("sampling"), {"level": level}))
+
+    def wake_inference(self, tags: list | None = None) -> dict:
+        return self.transport.call(Request("wake-inference", self.jobs.require("sampling"), tags))
+
+    def sleep_training(self, mode: str = "all") -> dict:
+        return self.transport.call(Request("sleep-training", self.jobs.require("training"), {"mode": mode}))
+
+    def wake_training(self) -> dict:
+        return self.transport.call(Request("wake-training", self.jobs.require("training"), {}))
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def reconnect_config(self) -> ArcticRLClientConfig:
@@ -263,7 +308,7 @@ class ArcticRLClient:
     def __init__(self, config: ArcticRLClientConfig, server_state: Any = None) -> None:
         self.config = config
         self.transport = make_transport(config, server_state=server_state)
-        self.jobs = self.transport.initialize()
+        self.jobs = initialize_or_cleanup(self.transport)
 
     # ── training ─────────────────────────────────────────────────────────
     async def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
@@ -275,8 +320,32 @@ class ArcticRLClient:
     async def step(self, learning_rate: float | None = None) -> dict:
         return await self.transport.acall(_step_request(self.jobs, learning_rate))
 
-    async def save_checkpoint(self, checkpoint_id: str | None = None, checkpoint_type: str = "resumable") -> dict:
-        return await self.transport.acall(_save_checkpoint_request(self.jobs, checkpoint_id, checkpoint_type))
+    async def save_checkpoint(
+        self,
+        checkpoint_id: str | None = None,
+        checkpoint_type: str = "resumable",
+        path: str | None = None,
+        *,
+        step: int | None = None,
+        export_hf: bool = False,
+        save_total_limit: int | None = None,
+        stage_info: dict | None = None,
+    ) -> dict:
+        return await self.transport.acall(
+            _save_checkpoint_request(
+                self.jobs,
+                checkpoint_id,
+                checkpoint_type,
+                path=path,
+                step=step,
+                export_hf=export_hf,
+                save_total_limit=save_total_limit,
+                stage_info=stage_info,
+            )
+        )
+
+    async def load_checkpoint(self, path: str | None = None, *, step: int | None = None) -> dict:
+        return await self.transport.acall(_load_checkpoint_request(self.jobs, path, step))
 
     # ── sampling / log-prob ──────────────────────────────────────────────
     async def generate(
@@ -291,25 +360,36 @@ class ArcticRLClient:
 
     # ── weight sync + cache ──────────────────────────────────────────────
     async def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict:
-        # Match legacy HTTP client staged wake (see SyncArcticRLClient.sync_weights).
+        """Async twin of SyncArcticRLClient.sync_weights (staged wake → operation → wake → reset)."""
         await self.wake_inference(tags=["weights"])
-        response = await self.transport.acall(
-            _sync_weights_request(self.jobs, self.config.backend_config.colocate, cuda_ipc, low_memory)
+        out = await self.transport.acall(
+            _sync_weights_request(
+                self.jobs,
+                colocate=self.config.backend_config.colocate,
+                cuda_ipc=cuda_ipc,
+                low_memory=low_memory,
+            )
         )
         await self.wake_inference(tags=["kv_cache"])
         await self.reset_prefix_cache()
-        return response
-
-    async def sleep_inference(self, level: int = 1) -> dict:
-        return await self.transport.acall(_sleep_inference_request(self.jobs, level))
-
-    async def wake_inference(self, tags: list | None = None) -> dict:
-        return await self.transport.acall(_wake_inference_request(self.jobs, tags))
+        return out
 
     async def reset_prefix_cache(
         self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1
     ) -> dict:
         return await self.transport.acall(_reset_prefix_cache_request(self.jobs, drain, timeout_s, retry_interval_s))
+
+    async def sleep_inference(self, level: int = 1) -> dict:
+        return await self.transport.acall(Request("sleep-inference", self.jobs.require("sampling"), {"level": level}))
+
+    async def wake_inference(self, tags: list | None = None) -> dict:
+        return await self.transport.acall(Request("wake-inference", self.jobs.require("sampling"), tags))
+
+    async def sleep_training(self, mode: str = "all") -> dict:
+        return await self.transport.acall(Request("sleep-training", self.jobs.require("training"), {"mode": mode}))
+
+    async def wake_training(self) -> dict:
+        return await self.transport.acall(Request("wake-training", self.jobs.require("training"), {}))
 
     # ── lifecycle ────────────────────────────────────────────────────────
     def reconnect_config(self) -> ArcticRLClientConfig:
@@ -332,13 +412,13 @@ class ArcticRLClient:
 
 
 @overload
-def create_arctic_rl_client(
+def create_arctic_rl_client(  # noqa: E704
     config: ArcticRLClientConfig, *, blocking_calls: Literal[False] = ..., server_state: Any = ...
 ) -> ArcticRLClient: ...
 
 
 @overload
-def create_arctic_rl_client(
+def create_arctic_rl_client(  # noqa: E704
     config: ArcticRLClientConfig, *, blocking_calls: Literal[True], server_state: Any = ...
 ) -> SyncArcticRLClient: ...
 
