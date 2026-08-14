@@ -35,6 +35,7 @@ from arctic_platform.client import Request
 from arctic_platform.client import SyncArcticRLClient
 from arctic_platform.client import Transport
 from arctic_platform.client import client as client_module
+from arctic_platform.client import create_arctic_rl_client
 from arctic_platform.client import unresolved_ops
 from arctic_platform.client.transport import method_name
 
@@ -42,8 +43,9 @@ TRAINING, SAMPLING, LOG_PROB = 1, 2, 3
 
 
 class FakeTransport(Transport):
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: ArcticRLClientConfig, server_state=None) -> None:
         self.config = config
+        self.server_state = server_state
         self.jobs = JobHandles()
         self.calls: list[Request] = []
 
@@ -106,6 +108,14 @@ class TestOpMapping:
         assert req.job_id == TRAINING
         assert req.binary is True
 
+    def test_fwd_no_grad_reference_targets_log_prob(self, client):
+        """fwd_no_grad(reference_model=True) -> log_prob job (reference log-probs)."""
+        _call(client, "fwd_no_grad", {"input_ids": [1]}, reference_model=True)
+        req = _last(client)
+        assert req.op == "forward"
+        assert req.job_id == LOG_PROB
+        assert req.binary is True
+
     def test_step_targets_training(self, client):
         """step -> training job, learning_rate in body."""
         _call(client, "step", learning_rate=0.5)
@@ -116,12 +126,20 @@ class TestOpMapping:
         assert req.body == {"learning_rate": 0.5}
 
     def test_save_checkpoint_targets_training(self, client):
-        """save_checkpoint -> training job (save op, Cortex-shaped body)."""
+        """save_checkpoint -> training job (save op, Cortex + on-prem SFT body)."""
         _call(client, "save_checkpoint", checkpoint_id="cp1", checkpoint_type="weights-only")
         req = _last(client)
         assert req.op == "save"
         assert req.job_id == TRAINING
-        assert req.body == {"checkpoint_id": "cp1", "checkpoint_type": "weights-only"}
+        assert req.body["checkpoint_id"] == "cp1"
+        assert req.body["checkpoint_type"] == "weights-only"
+
+    def test_load_checkpoint_targets_training(self, client):
+        _call(client, "load_checkpoint", path="/tmp/x", step=2)
+        req = _last(client)
+        assert req.op == "load-checkpoint"
+        assert req.job_id == TRAINING
+        assert req.body == {"path": "/tmp/x", "step": 2}
 
     def test_generate_targets_sampling_and_unwraps_results(self, client):
         """generate -> sampling job; returns the 'results' list."""
@@ -193,6 +211,61 @@ class TestLifecycle:
             JobHandles().require("training")
 
 
+class TestServerState:
+    """Reconnect handoff: a client can expose (and reattach via) the transport's
+    server-state handle, but only transports that actually own one."""
+
+    def test_get_server_state_raises_without_transport_support(self, client):
+        """FakeTransport has no server state -> get_server_state() raises."""
+        with pytest.raises(NotImplementedError, match="no server state"):
+            client.get_server_state()
+
+    def test_get_server_state_returns_transport_state(self, monkeypatch):
+        """When the transport exposes get_server_state, the client forwards it."""
+        sentinel = object()
+
+        class StatefulTransport(FakeTransport):
+            def get_server_state(self):
+                return sentinel
+
+        monkeypatch.setattr(client_module, "make_transport", StatefulTransport)
+        cfg = ArcticRLClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1)
+        assert ArcticRLClient(cfg).get_server_state() is sentinel
+
+    def test_create_client_forwards_server_state_for_reconnect(self, monkeypatch):
+        """create_arctic_rl_client(cfg, server_state=...) reattaches via the Ray transport."""
+        import arctic_platform.client.transports.onprem_ray as ray_mod
+
+        sentinel = object()
+
+        class DummyRay:
+            def __init__(self, config, server_state=None):
+                self.config = config
+                self.server_state = server_state
+                self.jobs = JobHandles(training=TRAINING, sampling=SAMPLING, log_prob=LOG_PROB)
+
+            def initialize(self):
+                return self.jobs
+
+            def get_server_state(self):
+                return self.server_state
+
+        monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
+        cfg = ArcticRLClientConfig(
+            model_name="m",
+            backend_config=OnPremConfig(comm_protocol="ray"),
+            training_gpus=1,
+            sampling_gpus=1,
+            log_prob_gpus=1,
+            training_job_id=TRAINING,
+            sampling_job_id=SAMPLING,
+            log_prob_job_id=LOG_PROB,
+        )
+        client = create_arctic_rl_client(cfg, server_state=sentinel)
+        assert client.transport.server_state is sentinel
+        assert client.get_server_state() is sentinel
+
+
 class TestOpRegistry:
     """Contract: the client's op vocabulary and OPS stay in lockstep, and a
     transport's op coverage is checkable without a live backend."""
@@ -203,6 +276,7 @@ class TestOpRegistry:
         _call(client, "fwd_no_grad", {"input_ids": [1]})
         _call(client, "step")
         _call(client, "save_checkpoint")
+        _call(client, "load_checkpoint")
         _call(client, "generate", ["hi"])
         _call(client, "log_probs", ["hi"])
         # sync_weights expands to wake + operation + wake + reset(operation)
@@ -245,8 +319,9 @@ class TestTransportSelection:
         import arctic_platform.client.transports.onprem_ray as ray_mod
 
         class DummyRay:
-            def __init__(self, config):
+            def __init__(self, config, server_state=None):
                 self.config = config
+                self.server_state = server_state
 
         monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
         cfg = ArcticRLClientConfig(model_name="m", backend_config=OnPremConfig(comm_protocol="ray"), training_gpus=1)
@@ -258,3 +333,24 @@ class TestTransportSelection:
 
         cfg = ArcticRLClientConfig(model_name="m", backend_config=OnPremConfig(comm_protocol="http"), training_gpus=1)
         assert isinstance(client_module.make_transport(cfg), HttpTransport)
+
+    def test_make_transport_forwards_server_state_to_ray(self, monkeypatch):
+        """make_transport threads server_state into the Ray transport (reconnect path)."""
+        import arctic_platform.client.transports.onprem_ray as ray_mod
+
+        class DummyRay:
+            def __init__(self, config, server_state=None):
+                self.config = config
+                self.server_state = server_state
+
+        monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
+        sentinel = object()
+        cfg = ArcticRLClientConfig(model_name="m", backend_config=OnPremConfig(comm_protocol="ray"), training_gpus=1)
+        transport = client_module.make_transport(cfg, server_state=sentinel)
+        assert transport.server_state is sentinel
+
+    def test_make_transport_rejects_server_state_for_http(self):
+        """server_state reconnect is Ray-only; HTTP transport must reject it."""
+        cfg = ArcticRLClientConfig(model_name="m", backend_config=OnPremConfig(comm_protocol="http"), training_gpus=1)
+        with pytest.raises(ValueError, match="server_state reconnect"):
+            client_module.make_transport(cfg, server_state=object())

@@ -29,6 +29,7 @@ from .debug import SynchronizedWallClockTimerSimple
 from .record_replay import record_replay_generation
 from .server_models import GenerateRequest
 from .server_models import JobConfig
+from .server_models import LoadCheckpointRequest
 from .server_models import LogProbsRequest
 from .server_models import OperationRequest
 from .server_models import ResetPrefixCacheRequest
@@ -58,6 +59,7 @@ __all__ = [
     "LogProbsRequest",
     "StepRequest",
     "SaveRequest",
+    "LoadCheckpointRequest",
     "ResetPrefixCacheRequest",
     "OperationRequest",
     "WeightSyncRequest",

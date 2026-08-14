@@ -25,6 +25,7 @@ from arctic_platform import wire
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import JOB_TYPES
+from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transports.onprem import OnPremTransport
 
@@ -46,7 +47,9 @@ class HttpTransport(OnPremTransport):
         self._asession = None  # aiohttp.ClientSession, lazy on first acall
         self._asession_loop = None  # the event loop that session is bound to
         self.proc = None
-        if config.backend_config.launch_local_server:
+        # Reattach clients already have job ids; they must dial the existing
+        # server, not spawn another one (verl forwarders / rollout replicas).
+        if config.backend_config.launch_local_server and not JobHandles.from_config(config).any_set:
             self._launch_server()
 
     def _start(self, payload: dict) -> JobId:
@@ -70,12 +73,22 @@ class HttpTransport(OnPremTransport):
         return url, {"params": params, "json": request.body}
 
     def call(self, request: Request) -> dict:
-        url, kwargs = self._http_args(request)
-        resp = self.session.post(url, timeout=self.timeout, **kwargs)
-        resp.raise_for_status()
-        if "application/octet-stream" in resp.headers.get("Content-Type", ""):
-            return wire.loads(resp.content)
-        return resp.json()
+        from arctic_platform.common.utils import sft_profile
+
+        with sft_profile.timed("serialize"):
+            url, kwargs = self._http_args(request)
+        with sft_profile.timed("rpc"):
+            resp = self.session.post(url, timeout=self.timeout, **kwargs)
+            resp.raise_for_status()
+            if "application/octet-stream" in resp.headers.get("Content-Type", ""):
+                result = wire.loads(resp.content)
+            else:
+                result = resp.json()
+        if sft_profile.enabled() and request.op in ("forward-backward", "forward", "step"):
+            # Client-side buckets only; server attaches its own under metrics._profile_ms.
+            sft_profile.maybe_print(f"client {request.op}")
+            sft_profile.take_last()
+        return result
 
     async def _ensure_asession(self):
         # A ClientSession is bound to the loop it's built on; reuse it only on

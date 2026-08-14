@@ -19,7 +19,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from arctic_inference.server.config import ModelConfig
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
@@ -64,6 +63,17 @@ class SaveRequest(BaseModel):
     # Cortex's `save(checkpoint_id, checkpoint_type)` and are accepted (unused).
     checkpoint_id: str | None = None
     checkpoint_type: str = "resumable"
+    # SFT extras (optional path/step override, HF export, rotation, stage metadata).
+    path: str | None = None
+    step: int | None = None
+    export_hf: bool = False
+    save_total_limit: int | None = None
+    stage_info: dict[str, Any] | None = None
+
+
+class LoadCheckpointRequest(BaseModel):
+    path: str | None = None
+    step: int | None = None
 
 
 class ResetPrefixCacheRequest(BaseModel):
@@ -86,8 +96,9 @@ class OperationRequest(BaseModel):
     # Generic data-plane envelope, matching Cortex's /{job_id}/operation. On-prem
     # dispatches on operation_type; sub_job_id/sub_job_type are accepted for
     # parity (unused, since on-prem addresses jobs by the job_id query param).
+    # sub_job_id is int on-prem (plain job id) and may be str on Cortex — accept both.
     operation_type: str
-    sub_job_id: str | None = None
+    sub_job_id: int | str | None = None
     sub_job_type: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -121,7 +132,7 @@ def build_model_config(
     model_name: str,
     vllm_config: dict | None,
     arctic_inference_config: dict | None = None,
-) -> ModelConfig:
+):
     """Construct a :class:`ModelConfig` from user-supplied vllm_config dict.
 
     ``arctic_inference_config`` carries Arctic-platform signals (e.g. use_fca,
@@ -129,6 +140,8 @@ def build_model_config(
     ModelConfig, which expands them into real engine kwargs in
     ``ModelConfig.to_engine_kwargs()``.
     """
+    from arctic_inference.server.config import ModelConfig
+
     cfg = dict(vllm_config or {})
     cfg["model"] = model_name
     known_fields = set(ModelConfig.model_fields.keys())
