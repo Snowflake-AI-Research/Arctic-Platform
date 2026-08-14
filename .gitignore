@@ -166,3 +166,6 @@ batch_work_dir/
 
 # Hydra run artifacts from recipe launchers
 recipes/**/outputs/
+
+# Recipe connection configs -- these hold a Snowflake PAT
+**/recipes/config.json

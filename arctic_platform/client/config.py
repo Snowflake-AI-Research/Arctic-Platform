@@ -42,6 +42,9 @@ from typing_extensions import Self
 
 JobId = int | str
 
+# Training knobs Neutrino accepts that the on-prem server has no support for.
+_CORTEX_ONLY_TRAINING = ("ep_size", "peft_config")
+
 
 class OnPremConfig(BaseModel):
     """Backend-specific settings for the on-prem server (HTTP + in-process Ray)."""
@@ -159,6 +162,22 @@ class TrainingConfig(BaseModel):
         None,
         description="DeepSpeed worker knobs (attn_implementation, use_liger, enable_gradient_checkpointing, ...).",
     )
+    # TODO(config-unify): these describe the *model*, not the training loop. Fold
+    # them into `arctic_platform.model.ModelSpec` once TrainingConfig carries one:
+    # ep_size is ParallelismConfig.expert_parallel, and peft_config wants a ModelSpec
+    # field of its own (as do attn_implementation / use_liger in ds_worker_config).
+    ep_size: int | None = Field(
+        None,
+        gt=0,
+        description="Expert-parallel degree for MoE training; training_gpus must be a multiple of it. Cortex only.",
+    )
+    peft_config: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "PEFT adapter config, e.g. {'peft_type': 'Lora', 'r': 32, 'lora_alpha': 32, 'target_modules': [...]}. "
+            "Cortex only."
+        ),
+    )
 
 
 class ArcticRLClientConfig(BaseModel):
@@ -198,6 +217,22 @@ class ArcticRLClientConfig(BaseModel):
     @property
     def backend(self) -> Literal["onprem", "cortex"]:
         return self.backend_config.backend
+
+    @model_validator(mode="after")
+    def _check_training(self) -> Self:
+        if self.backend != "cortex":
+            unsupported = [name for name in _CORTEX_ONLY_TRAINING if getattr(self.training, name) is not None]
+            if unsupported:
+                raise ValueError(
+                    f"the {self.backend} backend does not support "
+                    f"{', '.join(f'training.{n}' for n in unsupported)} (cortex only)."
+                )
+        ep_size = self.training.ep_size
+        if ep_size and self.training_gpus % ep_size:
+            raise ValueError(
+                f"training_gpus ({self.training_gpus}) must be a multiple of training.ep_size ({ep_size})."
+            )
+        return self
 
     def gpus_for(self, job_type: str) -> int:
         """GPU count allocated to a job type (0 == the job type is disabled)."""
@@ -267,6 +302,16 @@ class ArcticRLClientConfig(BaseModel):
             training["model_provider"] = provider
         if worker.get("attn_implementation"):
             training["attn_implementation"] = worker["attn_implementation"]
+        for key in _CORTEX_ONLY_TRAINING:
+            value = getattr(self.training, key)
+            if value is not None:
+                training[key] = value
+        # Neutrino takes the raw DeepSpeed json as passthrough (zero stage, micro
+        # batch, grad accum, bf16); the optimizer is dropped because it is already
+        # lifted above into Neutrino's typed `optimizer` field.
+        engine = {k: v for k, v in ds.items() if k != "optimizer"}
+        if engine:
+            training["ds_config"] = engine
         return self._cortex_sub_job("training", {"training_config": training})
 
     def _cortex_inference_sub_job(self, job_type: str, n_gpus: int) -> dict[str, Any]:
