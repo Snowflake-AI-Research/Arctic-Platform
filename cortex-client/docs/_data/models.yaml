@@ -1,0 +1,44 @@
+# Recovered from the repository API snapshot. None of these entries were
+# revalidated during the documentation reorganization.
+models:
+  - id: Qwen/Qwen3-0.6B
+    training: true
+    inference: true
+    last_validated: null
+  - id: Qwen/Qwen3-1.7B
+    training: true
+    inference: true
+    last_validated: null
+  - id: Qwen/Qwen3-8B
+    training: true
+    inference: true
+    recipes:
+      - conversational-sft
+      - math-grpo
+    last_validated: null
+  - id: Qwen/Qwen3.5-4B
+    training: true
+    inference: true
+    last_validated: null
+  - id: Qwen/Qwen3.6-35B-A3B
+    training: true
+    inference: true
+    recipes:
+      - conversational-sft
+    last_validated: null
+  - id: deepseek-ai/DeepSeek-V4-Flash-0731
+    training: false
+    inference: true
+    last_validated: null
+  - id: openai/gpt-oss-120b
+    training: false
+    inference: true
+    last_validated: null
+  - id: zai-org/GLM-5.2
+    training: planned
+    inference: true
+    last_validated: null
+  - id: zai-org/GLM-5.2-FP8
+    training: planned
+    inference: true
+    last_validated: null

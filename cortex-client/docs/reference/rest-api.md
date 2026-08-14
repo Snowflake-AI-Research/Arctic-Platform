@@ -1,5 +1,9 @@
-# DSS Server API Specification
+# Neutrino REST API Reference
 
+> **Status.** This page is a repository snapshot for the client version in this
+> branch. The Neutrino SNOWAPI OpenAPI specification remains the source of
+> truth for the wire schema.
+>
 > **Scope.** This document describes the customer-facing Neutrino SnowAPI
 > surface used by this repository's `NeutrinoClient`. It covers REST paths,
 > request framing, asynchronous polling, client-visible schemas, checkpoints,

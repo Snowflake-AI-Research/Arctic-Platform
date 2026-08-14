@@ -23,7 +23,7 @@ import chz
 from tinker_cookbook.utils import ml_log
 
 from dss_client.neutrino_client import DEBUG_OPTIONS_ENV
-from neutrino_common import (
+from recipes._shared.neutrino import (
     TrainSequence,
     build_renderer,
     collate,

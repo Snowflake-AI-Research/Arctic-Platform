@@ -20,7 +20,7 @@ from dss_client.neutrino_client import DEBUG_OPTIONS_ENV
 from tinker_cookbook import renderers
 from tinker_cookbook.utils import ml_log
 
-from neutrino_common import (
+from recipes._shared.neutrino import (
     build_renderer,
     collate,
     forward_backward_step,
