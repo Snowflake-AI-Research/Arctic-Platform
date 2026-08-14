@@ -326,19 +326,6 @@ REST body:
 `SubJobConfig`; `create_job_from_body()` only checks the outer body and non-empty
 list before forwarding it.
 
-#### `job_id` is not customer-settable
-
-The request schema carries a `job_id` field, but it exists only for a
-not-yet-enabled managed-training continuation flow (an SPCS callback launching
-a previously-created MANAGED-origin job on a customer's behalf). Any caller
-that supplies a non-empty `job_id` — including a client-generated UUID —
-is rejected with `400 Bad Request` (`"job_id cannot be set when creating a
-training job"`) before the request body is otherwise validated. This is a
-behavior change: earlier deployments treated a present `job_id` as a
-continuation request; that path is currently unreachable by customers, and
-every job_id-bearing create request is now rejected regardless of whether the
-UUID exists. Omit `job_id` entirely; the server always mints a new one.
-
 Response:
 
 ```json
@@ -386,11 +373,8 @@ The SnowAPI shape consumed by this repository is flat at each sub-job:
 this endpoint until `running`.
 
 `submitted_by` (submitting user's name) and `owner_role` (owning role's name)
-are both best-effort and may be absent: for jobs created before these fields
-existed, jobs submitted from a non-user context, a since-dropped
-user/role, or when the requesting role cannot resolve the identity. Both
-fields also appear on each job entry returned by `list_jobs()`
-([section 5.3](#53-list-jobs---get-)).
+are best-effort and may be absent. Both fields also appear on each job entry
+returned by `list_jobs()` ([section 5.3](#53-list-jobs---get-)).
 
 ### 5.3 List jobs - `GET /`
 
@@ -424,25 +408,16 @@ resolves the account from the authenticated session.
 }
 ```
 
-- `has_reservation`: whether `max_total_gpus` is a guaranteed reservation
-  (`true`) rather than a best-effort per-account cap for a POC/trial account
-  (`false`).
-- `max_total_gpus`: the canonical GPU ceiling — the committed reservation when
-  `has_reservation` is `true`, otherwise the per-account cap. `0` means
-  unlimited (uncapped, internal accounts only).
-- `reserved_gpus` **(deprecated)**: mirrors `max_total_gpus` when
-  `has_reservation` is `true`, else `0`. Kept for backward compatibility; new
-  code should read `max_total_gpus` + `has_reservation` instead.
-- `in_use_gpus`: GPUs consumed by the account's active jobs — `pending`,
-  `placing`, `initializing`, and `running`.
-- `available_gpus`: remaining headroom, `max(0, max_total_gpus - in_use_gpus)`
-  for a capped/reserved account; best-effort and potentially capped by
-  currently schedulable capacity otherwise.
+- `has_reservation`: whether the account has reserved GPU capacity.
+- `max_total_gpus`: the account's GPU ceiling.
+- `reserved_gpus` **(deprecated)**: use `max_total_gpus` with
+  `has_reservation` instead.
+- `in_use_gpus`: GPUs used by the account's active jobs.
+- `available_gpus`: remaining capacity, floored at zero and potentially
+  capped by currently schedulable capacity.
 
-Proto3 JSON may omit false or zero fields. `NeutrinoClient.get_capacity()`
-predates `max_total_gpus` and does not surface it; it only fills in the
-documented defaults for `has_reservation`, `reserved_gpus`, `in_use_gpus`, and
-`available_gpus` when proto3 omits them as `False`/`0`.
+Proto3 JSON may omit false or zero fields. `get_capacity()` does not yet
+surface `max_total_gpus`; it fills in defaults for the other four keys.
 
 ### 5.5 Cancel job - `POST /{job_id}:cancel`
 
@@ -1731,11 +1706,3 @@ These are implementation gaps, not supported API behavior:
    `NeutrinoClient` defaults to `cortex-training`.
 9. The in-memory mock and its README cover only a subset of the current client
    surface and should not be used as the complete API inventory.
-10. `create_job(job_id=...)` accepts a `job_id` argument, but the server now
-    rejects any non-empty `job_id` on create with `400 Bad Request`
-    (see [section 5.1](#51-create-job---post-)); the parameter is reserved for
-    a not-yet-enabled managed-continuation flow and should not be set today.
-11. `get_capacity()` does not read the newer `max_total_gpus` field
-    (see [section 5.4](#54-capacity---get-capacity)); it only returns
-    `has_reservation`, `reserved_gpus` (now deprecated on the wire),
-    `in_use_gpus`, and `available_gpus`.
