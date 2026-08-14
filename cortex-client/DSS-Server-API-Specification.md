@@ -414,7 +414,8 @@ resolves the account from the authenticated session.
 - `max_total_gpus`: the account's GPU ceiling.
 - `reserved_gpus` **(deprecated)**: use `max_total_gpus` with
   `has_reservation` instead.
-- `in_use_gpus`: GPUs used by the account's active jobs.
+- `in_use_gpus`: GPUs used by the account's `pending`, `placing`,
+  `initializing`, and `running` jobs.
 - `available_gpus`: remaining capacity, floored at zero and potentially
   capped by currently schedulable capacity.
 
