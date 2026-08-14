@@ -17,14 +17,14 @@ Training through the Neutrino SNOWAPI.
 Requires Python 3.8 or later.
 
 ```bash
-pip install "dss-client @ git+https://github.com/snowflake-eng/dss-client.git"
+pip install "dss-client @ git+https://github.com/Snowflake-AI-Research/Arctic-Platform.git#subdirectory=cortex-client"
 ```
 
 For local development:
 
 ```bash
-git clone https://github.com/snowflake-eng/dss-client.git
-cd dss-client
+git clone https://github.com/Snowflake-AI-Research/Arctic-Platform.git
+cd Arctic-Platform/cortex-client
 pip install -e .
 ```
 
