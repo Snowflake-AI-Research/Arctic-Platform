@@ -52,31 +52,50 @@ def _harbor_bin() -> str:
     return str(Path(sys.executable).parent / "harbor")
 
 
-def _derive_openai_base_url(client: object) -> str:
+def _derive_openai_base_url(client: object, model_name: str) -> tuple[str, object | None]:
     """Best-effort ``/v1`` URL from a connected ``ArcticRLClient``.
 
-    On-prem: the client's transport carries ``base_url`` (e.g.
-    ``http://localhost:7000``); the OpenAI-compat surface is served at
-    ``/v1`` on the same host by ``arctic_platform.rl.http_server``.
+    Two cases:
 
-    Cortex: the sampling sub-job's public URL is
-    ``https://<cortex>/sub-jobs/<sampling-sub-job-id>/v1``, but the
-    routing from a parent-job SnowAPI URL to a per-sub-job HTTP endpoint
-    is a Cortex control-plane concern outside this repo. Raise with a
-    clear message so the user knows they need to pass the URL
-    explicitly.
+    * On-prem: the client's transport carries ``base_url`` (e.g.
+      ``http://localhost:7000``); the OpenAI-compat surface is served
+      at ``/v1`` on the same host by
+      ``arctic_platform.rl.http_server``. Return that URL and no
+      gateway (nothing to clean up).
+    * Cortex: sub-jobs are only reachable via SnowAPI's op-name
+      dispatch, so no ``/v1/*`` route exists externally. Boot a
+      driver-local ``DriverOpenAIGateway`` bound to ``127.0.0.1`` that
+      re-exposes ``/v1/*`` and forwards each call to
+      ``client.generate`` (which already speaks Cortex's ``operation``
+      envelope). Return that local URL plus a handle the caller must
+      ``stop()`` before exit.
+
+    Returning the gateway (or ``None`` on-prem) lets ``main`` shut it
+    down in the same ``finally`` block that tears down the Cortex job,
+    so there's no leaked uvicorn thread after a crash.
     """
     transport = getattr(client, "transport", None)
     base_url = getattr(transport, "base_url", None)
     if base_url:
-        return f"{str(base_url).rstrip('/')}/v1"
-    raise SystemExit(
-        "--sampling-api-base auto: could not derive an OpenAI base URL "
-        "from the connected client. This transport has no plain HTTP "
-        "endpoint (Cortex sub-jobs are addressed through SnowAPI). Pass "
-        "the URL explicitly, e.g. --sampling-api-base "
-        "https://<cortex>/sub-jobs/<sampling-sub-job-id>/v1."
-    )
+        return f"{str(base_url).rstrip('/')}/v1", None
+
+    # Cortex path — no external HTTP endpoint. Spin up the driver-side
+    # gateway so any OpenAI-compat harness (LiteLLM, openai SDK, ...)
+    # can hit it locally without any Cortex control-plane change.
+    from transformers import AutoTokenizer
+
+    from arctic_platform.integrations.harbor.openai_gateway import DriverOpenAIGateway
+
+    # Same tokenizer-cache warm-up rationale as ``CortexRLAgent``: hit
+    # HF Hub once, then let every subsequent trial hit the local cache.
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+    except (OSError, ValueError):
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    gateway = DriverOpenAIGateway(client=client, tokenizer=tokenizer, model_name=model_name)
+    gateway.start()
+    return gateway.base_url, gateway
 
 
 def _run_harbor(
@@ -139,13 +158,16 @@ def _run_harbor(
             "--ak", f"max_tokens={max_tokens}",
         ]
     else:
-        # OpenAI-compat mode. ``--model-base-url`` is Harbor's built-in
-        # override; ``--ak api_base=`` covers older Harbor releases and
-        # agents that read ``api_base`` from kwargs.
-        cmd += ["--model-base-url", str(sampling_api_base)]
+        # OpenAI-compat mode. Harbor exposes agent constructor kwargs
+        # through ``--ak key=value`` (``--agent-kwarg``); we pass
+        # ``api_base`` and the sampling knobs the agent needs. Any
+        # Harbor agent whose ``__init__`` accepts ``api_base``
+        # (Terminus 2, LiteLLMChatAgent, community agents that follow
+        # the LLMBackend convention) picks this up unchanged.
         cmd += [
             "--ak", f"api_base={sampling_api_base}",
             "--ak", f"temperature={temperature}",
+            "--ak", f"max_tokens={max_tokens}",
         ]
     for k, v in (extra_agent_kwargs or {}).items():
         cmd += ["--ak", f"{k}={v}"]
@@ -183,18 +205,26 @@ def _enumerate_task_dirs(pool_dir: Path) -> list[Path]:
 
 
 def _write_step_manifest(dataset_dir: Path, task_dirs: list[Path]) -> None:
-    """Write a Harbor ``dataset.toml`` at ``dataset_dir`` pointing at ``task_dirs``.
+    """Symlink ``task_dirs`` into ``dataset_dir`` for Harbor's ``-p`` flag.
 
-    Uses absolute paths so we don't have to move the user's task directories.
-    Called each GRPO step to spin up a sampled sub-dataset of training tasks.
+    Harbor's ``DatasetConfig._get_local_task_configs`` walks ``path.iterdir()``
+    (it does *not* honor a ``dataset.toml`` manifest for the ``harbor run -p``
+    directory form), so the sampled step dataset has to look like a real
+    dataset dir with per-task subdirectories. Symlinks keep this cheap and
+    avoid copying task assets each step.
     """
     dataset_dir = Path(dataset_dir)
+    if dataset_dir.exists():
+        for entry in dataset_dir.iterdir():
+            if entry.is_symlink() or entry.is_file():
+                entry.unlink()
     dataset_dir.mkdir(parents=True, exist_ok=True)
-    lines = ['version = "1.0"', "", "tasks = ["]
     for td in task_dirs:
-        lines.append(f'    {{ path = "{td}" }},')
-    lines.append("]")
-    (dataset_dir / "dataset.toml").write_text("\n".join(lines) + "\n")
+        target = Path(td).resolve()
+        link = dataset_dir / target.name
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(target)
 
 
 def _mean_reward(job_dir: Path) -> float:
@@ -282,6 +312,17 @@ async def main() -> None:
                     help="Skip Cortex cold-start; attach to an existing training sub-job token.")
     ap.add_argument("--reuse-sampling-job-id", default=None,
                     help="Skip Cortex cold-start; attach to an existing sampling sub-job token.")
+
+    # Sizing knobs — defaults fit the PR #66 Qwen3-0.6B/arithmetic reference;
+    # bump for bigger models or longer completions (reasoning-gym etc.).
+    ap.add_argument("--train-gpus", type=int, default=1,
+                    help="GPUs for the Cortex training sub-job (default: 1).")
+    ap.add_argument("--sample-gpus", type=int, default=1,
+                    help="GPUs for the Cortex sampling sub-job (default: 1).")
+    ap.add_argument("--max-seq-len", type=int, default=512,
+                    help="Max sequence length (prompt + completion) fed to the "
+                         "trainer / vLLM. Bump for chain-of-thought benchmarks "
+                         "(default: 512).")
     args = ap.parse_args()
 
     work_dir = Path(args.work_dir or tempfile.mkdtemp(prefix="harbor_e2e_"))
@@ -304,7 +345,9 @@ async def main() -> None:
         base_model=args.model,
         learning_rate=args.lr,
         n_samples_per_prompt=args.n_attempts,
-        max_seq_len=512,
+        max_seq_len=args.max_seq_len,
+        train_gpus=args.train_gpus,
+        sample_gpus=args.sample_gpus,
         cortex_host=os.environ["ARCTIC_CORTEX_HOST"],
         cortex_database=os.environ.get("ARCTIC_CORTEX_DATABASE", "NEUTRINO_DB"),
         cortex_schema=os.environ.get("ARCTIC_CORTEX_SCHEMA", "PUBLIC"),
@@ -342,10 +385,14 @@ async def main() -> None:
 
     # Mode selection: native (reconnect_config) vs OpenAI-compat (api_base).
     openai_compat_mode = args.sampling_api_base is not None
+    gateway: object | None = None
     if openai_compat_mode:
         if args.sampling_api_base == "auto":
-            args.sampling_api_base = _derive_openai_base_url(backend._client)
-            _log(f"auto-derived sampling api base: {args.sampling_api_base}")
+            args.sampling_api_base, gateway = _derive_openai_base_url(backend._client, args.model)
+            if gateway is not None:
+                _log(f"driver-side OpenAI-compat gateway up at {args.sampling_api_base}")
+            else:
+                _log(f"auto-derived sampling api base: {args.sampling_api_base}")
         else:
             _log(f"OpenAI-compat mode: sampling via {args.sampling_api_base}")
         reconnect_path = None
@@ -546,6 +593,12 @@ async def main() -> None:
         (work_dir / "summary.json").write_text(json.dumps(summary, indent=2))
         _log(f"summary -> {work_dir / 'summary.json'}")
     finally:
+        if gateway is not None:
+            _log("stopping OpenAI-compat gateway")
+            try:
+                gateway.stop()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001 — cleanup best-effort
+                _log(f"gateway.stop raised {type(exc).__name__}: {exc}")
         _log("shutting down Cortex job")
         backend.cancel()
 

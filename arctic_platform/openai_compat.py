@@ -211,14 +211,27 @@ def _to_sampling_params(
     return params
 
 
-def _render_chat_prompt(tokenizer: Any, messages: list[ChatMessage]) -> str:
+def _render_chat_prompt(
+    tokenizer: Any,
+    messages: list[ChatMessage],
+    template_kwargs: dict[str, Any] | None = None,
+) -> str:
     """Apply the tokenizer's chat template.
 
     Rejects with 400 rather than silently falling back to a hand-rolled
     role concatenation, because the wrong template produces plausible-
     looking but subtly broken generations (misaligned system prompt,
-    missing generation prefix) — the exact class of bug that's hardest to
-    diagnose in an RL loop.
+    missing generation prefix) — the exact class of bug that's hardest
+    to diagnose in an RL loop.
+
+    ``enable_thinking=False`` is our default. Qwen3 emits a
+    ``<think>...</think>`` scratchpad ahead of the answer under its
+    default chat template, which burns ``max_tokens`` before the model
+    ever gets to the answer. RL sampling recipes typically want the
+    short-form answer path (native ``CortexRLAgent`` does this too),
+    and non-Qwen3 tokenizers ignore the kwarg. Clients that want
+    thinking back on can send
+    ``extra_body.chat_template_kwargs.enable_thinking=True``.
     """
     if getattr(tokenizer, "chat_template", None) is None:
         raise HTTPException(
@@ -234,10 +247,25 @@ def _render_chat_prompt(tokenizer: Any, messages: list[ChatMessage]) -> str:
         {"role": m.role, "content": m.content if isinstance(m.content, str) else json.dumps(m.content)}
         for m in messages
     ]
+    kwargs: dict[str, Any] = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+        "enable_thinking": False,
+    }
+    if template_kwargs:
+        kwargs.update(template_kwargs)
     try:
-        return tokenizer.apply_chat_template(
-            payload, tokenize=False, add_generation_prompt=True,
-        )
+        return tokenizer.apply_chat_template(payload, **kwargs)
+    except TypeError:
+        # Older tokenizers reject unknown kwargs — retry without them.
+        kwargs.pop("enable_thinking", None)
+        try:
+            return tokenizer.apply_chat_template(payload, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400,
+                detail=f"Chat template failed to render: {type(exc).__name__}: {exc}",
+            ) from exc
     except Exception as exc:  # noqa: BLE001 — surface template rendering errors
         raise HTTPException(
             status_code=400,
@@ -341,7 +369,15 @@ async def chat_completions(request: Request) -> Any:
         raise HTTPException(status_code=400, detail=f"invalid request body: {exc}") from exc
 
     pool, tokenizer, model_name = _get_pool_and_tokenizer(request)
-    prompt_text = _render_chat_prompt(tokenizer, req.messages)
+    # Optional per-request chat-template override for tokenizers that
+    # take extra kwargs (e.g. Qwen3's ``enable_thinking``).
+    template_kwargs: dict[str, Any] = {}
+    extra_body = payload.get("extra_body")
+    if isinstance(extra_body, dict):
+        ct = extra_body.get("chat_template_kwargs")
+        if isinstance(ct, dict):
+            template_kwargs.update(ct)
+    prompt_text = _render_chat_prompt(tokenizer, req.messages, template_kwargs=template_kwargs)
 
     # OpenAI renamed ``max_tokens`` to ``max_completion_tokens`` — accept
     # both, prefer the newer field if both are set.

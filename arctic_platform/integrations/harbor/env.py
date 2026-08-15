@@ -26,10 +26,14 @@ from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.task.config import TaskOS
 
 
-# Harbor's default POSIX container paths (see harbor/models/trial/paths.py).
-_ROOTED_PREFIXES = ("/tests", "/solution", "/logs", "/harbor")
+# Harbor's default POSIX container paths (see ``harbor/models/trial/paths.py``).
+# ``/workspace`` isn't strictly a Harbor canonical path, but the
+# reasoning-gym adapter and a few community task packs (SkyRL,
+# open-thought/reasoning-gym) use it as the agent's scratch dir.
+# Rewriting it means those tasks Just Work on HostEnvironment.
+_ROOTED_PREFIXES = ("/tests", "/solution", "/logs", "/harbor", "/workspace")
 _ABS_PATH_TOKEN = re.compile(
-    r"(?<![\w/])(/tests|/solution|/logs|/harbor)(?=/|$|[\s'\"\\])"
+    r"(?<![\w/])(/tests|/solution|/logs|/harbor|/workspace)(?=/|$|[\s'\"\\])"
 )
 
 
@@ -62,7 +66,10 @@ class HostEnvironment(BaseEnvironment):
 
     async def start(self, force_build: bool) -> None:  # noqa: ARG002 — no image
         self._root = Path(str(self.trial_paths.trial_dir)) / "host_env"
-        for sub in ("tests", "solution", "logs/agent", "logs/verifier", "logs/artifacts", "harbor/skills"):
+        for sub in (
+            "tests", "solution", "logs/agent", "logs/verifier",
+            "logs/artifacts", "harbor/skills", "workspace",
+        ):
             (self._root / sub).mkdir(parents=True, exist_ok=True)
         # world-writable so subprocess writes as $USER succeed regardless of umask
         for p in self._root.rglob("*"):
@@ -87,22 +94,59 @@ class HostEnvironment(BaseEnvironment):
         # Non-canonical absolute paths: honor as-is (e.g. /tmp).
         return Path(container_path)
 
-    # ── file transfer (host-only: copy) ─────────────────────────────────────
+    # ── file transfer (host-only: copy + inline path rewrite) ──────────────
+    # Under Docker/Modal/Daytona, ``/tests`` etc. inside a task's test.sh
+    # resolve to the container's real filesystem — we don't get that on the
+    # host, so shell/python files that hard-code ``python3 /tests/...`` fail
+    # with ``No such file or directory``. Mirror the same ``_rewrite_paths``
+    # transform on file contents when copying into the trial root; only
+    # text files matching a small suffix allowlist are touched so binary
+    # artifacts pass through unchanged.
+    _REWRITE_SUFFIXES = (".sh", ".py", ".bash", ".zsh", ".txt")
+
+    def _copy_rewriting(self, src: Path, dst: Path) -> None:
+        if src.suffix.lower() in self._REWRITE_SUFFIXES:
+            try:
+                text = src.read_text()
+            except (UnicodeDecodeError, OSError):
+                shutil.copy2(str(src), str(dst))
+                return
+            rewritten = _rewrite_paths(text, self._root)
+            dst.write_text(rewritten)
+            try:
+                dst.chmod(src.stat().st_mode)
+            except OSError:
+                pass
+        else:
+            shutil.copy2(str(src), str(dst))
+
+    def _copytree_rewriting(self, src: Path, dst: Path) -> None:
+        dst.mkdir(parents=True, exist_ok=True)
+        for item in src.iterdir():
+            target = dst / item.name
+            if item.is_dir():
+                self._copytree_rewriting(item, target)
+            else:
+                self._copy_rewriting(item, target)
+
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         dst = self._to_host(str(target_path))
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(source_path), str(dst))
+        self._copy_rewriting(Path(source_path), dst)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
         dst = self._to_host(str(target_dir))
         dst.mkdir(parents=True, exist_ok=True)
-        # merge copy: don't nuke existing files at dst (e.g. reward.txt from a prior run)
+        # Merge copy: don't nuke existing files at dst (e.g. reward.txt from a
+        # prior step). File contents are ``_rewrite_paths``-transformed for
+        # text extensions so ``/tests`` etc. inside test.sh point at the host
+        # trial root.
         for item in Path(source_dir).iterdir():
             target = dst / item.name
             if item.is_dir():
-                shutil.copytree(str(item), str(target), dirs_exist_ok=True)
+                self._copytree_rewriting(item, target)
             else:
-                shutil.copy2(str(item), str(target))
+                self._copy_rewriting(item, target)
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         src = self._to_host(str(source_path))

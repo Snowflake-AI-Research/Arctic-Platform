@@ -141,8 +141,9 @@ harbor = [
 # instead of full ``module:Class`` import paths.
 # ---------------------------------------------------------------------------
 [project.entry-points."harbor.plugins"]
-arctic-cortex-agent = "arctic_platform.integrations.harbor.agent:CortexRLAgent"
-arctic-cortex-env   = "arctic_platform.integrations.harbor.env:HostEnvironment"
+arctic-cortex-agent   = "arctic_platform.integrations.harbor.agent:CortexRLAgent"
+arctic-cortex-litellm = "arctic_platform.integrations.harbor.litellm_chat_agent:LiteLLMChatAgent"
+arctic-cortex-env     = "arctic_platform.integrations.harbor.env:HostEnvironment"
 
 # ---------------------------------------------------------------------------
 # Console scripts. Harbor doesn't yet have a ``harbor train`` subcommand, so
