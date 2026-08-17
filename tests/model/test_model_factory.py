@@ -192,7 +192,9 @@ class TestPatchPipeline:
 
 class TestFromDsWorkerConfig:
     def test_defaults_preserve_worker_behavior(self):
-        spec = ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {})
+        spec = ModelSpec.from_ds_worker_config(
+            "Qwen/Qwen3-1.7B", {"attn_implementation": "flash_attention_2"}
+        )
 
         assert spec.model_path_or_name == "Qwen/Qwen3-1.7B"
         assert spec.dtype == "bfloat16"
@@ -201,10 +203,15 @@ class TestFromDsWorkerConfig:
         assert spec.patches.gradient_checkpointing is True  # bridge default
         assert spec.patches.zorro_train is None  # None disables (empty patch would be truthy)
 
+    def test_requires_attn_implementation(self):
+        with pytest.raises(ValueError, match="requires attn_implementation"):
+            ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {})
+
     def test_generic_patches_default_gc_off(self):
         from arctic_platform.model.config import Patches
 
         assert Patches().gradient_checkpointing is False
+        assert ModelSpec(model_path_or_name="x").attn_implementation is None
 
     def test_liger_and_gc_flags_map(self):
         spec = ModelSpec.from_ds_worker_config(
@@ -220,6 +227,7 @@ class TestFromDsWorkerConfig:
         spec = ModelSpec.from_ds_worker_config(
             "x",
             {
+                "attn_implementation": "flash_attention_2",
                 "zorro_train_enable": True,
                 "response_len": 1024,
                 "max_token_len": 16384,
@@ -244,6 +252,24 @@ class TestFromDsWorkerConfig:
         assert z.logits_optimization_peak_mem_size_in_gib == 8
         assert z.logits_compute_from_fp32_inputs is True
         assert z.logits_compute_in_fp32 is True
+
+    def test_zorro_uses_pydantic_defaults_for_omitted_fields(self):
+        from arctic_platform.model.config import ZorroTrainPatch
+
+        spec = ModelSpec.from_ds_worker_config(
+            "x",
+            {"attn_implementation": "flash_attention_2", "zorro_train_enable": True, "rollout_n": 4},
+        )
+        z = spec.patches.zorro_train
+        assert z is not None
+        assert z.rollout_n == 4
+        # Omitted keys come from ZorroTrainPatch field defaults (single source of truth).
+        defaults = ZorroTrainPatch()
+        assert z.use_unpad == defaults.use_unpad
+        assert z.logits_optimization == defaults.logits_optimization
+        assert z.logits_optimization_peak_mem_size_in_gib == defaults.logits_optimization_peak_mem_size_in_gib
+        assert z.logits_compute_from_fp32_inputs == defaults.logits_compute_from_fp32_inputs
+        assert z.logits_compute_in_fp32 == defaults.logits_compute_in_fp32
 
 
 class TestZorroAndGcPatches:
