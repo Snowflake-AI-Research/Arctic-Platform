@@ -30,6 +30,7 @@ from functools import partial
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import _resolve_fn
@@ -40,7 +41,6 @@ from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.utils.tiled_logits import TiledLogProbEntropy
 from arctic_platform.common.utils.tiled_logits import chunked_logprobs_entropy_from_hidden
 from arctic_platform.common.utils.tiled_logits import logits_chunk_rows
-from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
 from arctic_platform.common.utils.tiled_logits import tiled_logprobs_entropy_from_hidden
 
 # Valid ``logits_optimization`` modes for sft_ce. ``none`` keeps the classic
@@ -136,19 +136,13 @@ def sft_ce_loss(
     shift_labels = labels[:, 1:].contiguous()
     vocab = shift_logits.size(-1)
 
-    # Compute CE through the shared logprobs core rather than F.cross_entropy so
-    # the full-logits ``none`` path is numerically identical to the ``compute`` /
-    # ``memory`` hidden-state paths (which also go through this core). The two
-    # kernels agree on the forward loss but their *backward* diverges at large
-    # vocab (~1.5% on the lm-head grad), which otherwise desyncs the three modes'
-    # training curves after the first step. Mirror sft_ce_sum_from_hidden's -100
-    # masking: clamp ignored targets to a safe gather index, then zero them out.
-    valid = shift_labels != -100
-    safe_labels = shift_labels.clamp_min(0)
-    flat_logits = shift_logits.reshape(-1, vocab).float()
-    logprobs, _ = logprobs_entropy_from_flat_logits(flat_logits, safe_labels.reshape(-1), False)
-    ce_sum = -(logprobs * valid.reshape(-1).to(logprobs.dtype)).sum()
-    n_valid = int(valid.sum().item())
+    ce_sum = F.cross_entropy(
+        shift_logits.view(-1, vocab).float(),
+        shift_labels.view(-1),
+        ignore_index=-100,
+        reduction="sum",
+    )
+    n_valid = int((shift_labels != -100).sum().item())
 
     loss = _scale_ce_sum(ce_sum, n_valid, meta)
     return loss, _paired_loss_metrics(float(ce_sum.detach().float().item()), n_valid)

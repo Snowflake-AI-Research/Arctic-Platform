@@ -289,7 +289,6 @@ class ArcticRLHTTPClient:
             payload["ds_worker_config"] = self.config.ds_worker_config
             if job_type == "training":
                 payload["checkpoint_path"] = self.config.checkpoint_path
-                # Bake the (static) weight-sync strategy onto the training job.
                 payload["cuda_ipc"] = self.config.cuda_ipc
                 payload["low_memory"] = self.config.low_memory
         else:
@@ -636,10 +635,8 @@ class ArcticRLHTTPClient:
         at a time). Not yet implemented on the HTTP path -- see the server-side
         guard in /weight-sync; use the ray protocol for low_memory_weight_sync.
 
-        cuda_ipc / low_memory default to the strategy set on the training job at
-        init (``config.cuda_ipc`` / ``config.low_memory``); pass either here to
-        override just this call. colocate is not sent -- the server derives it
-        from its own launch state.
+        ``cuda_ipc`` / ``low_memory`` default to the training job's config;
+        pass a value to override this call.
         """
 
         resp = self._session.post(

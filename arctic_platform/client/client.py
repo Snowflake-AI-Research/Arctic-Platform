@@ -138,10 +138,6 @@ def _sync_weights_request(
     # just forward it: SnowAPI reads the `sub_job_*` routing hints, on-prem accepts
     # the same shape and ignores them (it addresses jobs by job id). On-prem treats a
     # sub_job_id as its plain job id, so source/target ids double as its job ids.
-    #
-    # colocate is never sent: the server derives it from its own launch state.
-    # cuda_ipc / low_memory are omitted unless explicitly overridden here, so the
-    # server uses the strategy baked onto the training job at init (see TrainingConfig).
     tid, sid = jobs.require("training"), jobs.require("sampling")
     payload = {"source_sub_job_id": tid, "target_sub_job_ids": [sid]}
     if cuda_ipc is not None:
@@ -239,9 +235,8 @@ class SyncArcticRLClient:
     def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict:
         """Sync training weights to sampling (staged wake → operation → wake → reset).
 
-        The colocated weight-sync strategy (cuda_ipc / low_memory) defaults to
-        what was set on the training job at init (``TrainingConfig``); pass either
-        here to override just this call.
+        ``cuda_ipc`` / ``low_memory`` default to the training job's ``TrainingConfig``;
+        pass a value to override this call.
         """
         self.wake_inference(tags=["weights"])
         out = self.transport.call(

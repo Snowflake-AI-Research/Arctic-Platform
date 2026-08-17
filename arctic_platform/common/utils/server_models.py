@@ -39,10 +39,8 @@ class JobConfig(BaseModel):
     arctic_inference_config: dict | None = None
     full_determinism: bool = False
     seed: int = 42
-    # Weight-sync strategy for the source (training) job. Static per run, so it
-    # is baked onto the job at init instead of being resent on every weight-sync;
-    # a WeightSyncRequest may still override it per call. Meaningful only on a
-    # training job (the weight-sync source).
+    # Weight-sync strategy for the source (training) job. A WeightSyncRequest
+    # may override either field for one call. Meaningful only on a training job.
     cuda_ipc: bool = False
     low_memory: bool = False
 
@@ -91,12 +89,7 @@ class ResetPrefixCacheRequest(BaseModel):
 class WeightSyncRequest(BaseModel):
     # Matches Cortex's `weight_sync(source_sub_job_id, target_sub_job_ids)`.
     # On-prem treats a sub_job_id as its plain job id.
-    #
-    # colocate is intentionally absent: it is a server-launch property
-    # (app.state.colocate / ArcticRLRayServerState.colocate), so the server never
-    # trusts a per-call value. cuda_ipc / low_memory default to None ("unset") so
-    # the server falls back to the strategy stored on the training JobConfig at
-    # init; a non-None value overrides it for this one call.
+    # cuda_ipc / low_memory: None uses the training job's JobConfig values.
     source_sub_job_id: int
     target_sub_job_ids: list[int]
     cuda_ipc: bool | None = None
@@ -107,10 +100,7 @@ class OperationRequest(BaseModel):
     # Generic data-plane envelope, matching Cortex's /{job_id}/operation. On-prem
     # dispatches on operation_type; sub_job_id/sub_job_type are accepted for
     # parity (unused, since on-prem addresses jobs by the job_id query param).
-    #
-    # sub_job_id accepts int or str: on-prem clients send the plain integer job id
-    # while Cortex uses a string handle. Pydantic v2 does not coerce int->str, so a
-    # str-only field would 422 the on-prem callers.
+    # sub_job_id is an on-prem integer job id or a Cortex string handle.
     operation_type: str
     sub_job_id: int | str | None = None
     sub_job_type: str | None = None

@@ -69,13 +69,12 @@ class ArcticSFTClientConfig(BaseModel):
         False,
         description=(
             "Colocated weight-sync strategy (only relevant with sampling_gpus > 0 + colocate): push weights via "
-            "zero-copy CUDA IPC instead of the CPU-file path. Static per run; sent at job init and overridable per "
-            "sync_weights call."
+            "zero-copy CUDA IPC instead of the CPU-file path. Optional override on sync_weights()."
         ),
     )
     low_memory: bool = Field(
         False,
-        description="With cuda_ipc, stream one gathered param at a time to bound peak extra GPU memory. Sent at init.",
+        description="With cuda_ipc, stream one gathered param at a time to bound peak extra GPU memory.",
     )
     vllm_config: dict[str, Any] | None = Field(None, description="Forwarded to the sampling job init.")
 

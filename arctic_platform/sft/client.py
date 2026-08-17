@@ -142,9 +142,8 @@ class ArcticSFTClient:
     def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict:
         """Push training weights to the sampling engine (same staging as RL client).
 
-        The colocated strategy (cuda_ipc / low_memory) defaults to what was set on
-        the training job at init (from config); pass either here to override this call.
-        colocate is not sent — the server derives it from its own launch state.
+        ``cuda_ipc`` / ``low_memory`` default to the training job's config;
+        pass a value to override this call.
         """
         tid, sid = self.jobs.require("training"), self.jobs.require("sampling")
         payload: dict = {"source_sub_job_id": tid, "target_sub_job_ids": [sid]}

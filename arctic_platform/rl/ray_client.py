@@ -172,7 +172,6 @@ class ArcticRLRayClient:
             job_config["ds_worker_config"] = self.config.ds_worker_config
             if job_type == "training":
                 job_config["checkpoint_path"] = self.config.checkpoint_path
-                # Bake the (static) weight-sync strategy onto the training job.
                 job_config["cuda_ipc"] = self.config.cuda_ipc
                 job_config["low_memory"] = self.config.low_memory
         else:
@@ -416,10 +415,8 @@ class ArcticRLRayClient:
         at a time so peak extra GPU memory is one full param per GPU instead of
         the whole model (avoids OOM on big models, at the cost of round-trips).
 
-        cuda_ipc / low_memory default to the strategy set on the training job at
-        init (``config.cuda_ipc`` / ``config.low_memory``); pass either here to
-        override just this call. colocate is not sent -- the server derives it
-        from its own launch state.
+        ``cuda_ipc`` / ``low_memory`` default to the training job's config;
+        pass a value to override this call.
         """
         request: dict[str, Any] = dict(
             source_sub_job_id=self.training_job_id,
