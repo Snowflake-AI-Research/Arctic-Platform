@@ -348,8 +348,8 @@ async def initialize(job_config: JobConfig = Body(...)):
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         job_info["checkpoint_path"] = str(ckpt_dir)
         job_info["sync_path"] = str(ckpt_dir / "weight_sync.pt")
-        # Weight-sync strategy is static per run: record it on the job so
-        # /weight-sync need not resend it each call (per-call override still wins).
+        # Weight-sync strategy is static per run: record it on the job so /weight-sync need not resend it each call
+        # (per-call override still wins).
         job_info["cuda_ipc"] = job_config.cuda_ipc
         job_info["low_memory"] = job_config.low_memory
     app.state.jobs[job_id] = job_info

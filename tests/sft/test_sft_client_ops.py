@@ -136,8 +136,8 @@ class TestSFTOpMapping:
         assert req.body["sampling_params"] == {"max_tokens": 8}
 
     def test_sync_weights_stages_wake_and_reset(self, sampling_client):
-        # Explicit cuda_ipc is a per-call override (present); low_memory is left
-        # to the job's init-time default (omitted); colocate is never on the wire.
+        # Explicit cuda_ipc is a per-call override (present); low_memory is left to the job's init-time default
+        # (omitted); colocate is never on the wire.
         sampling_client.sync_weights(cuda_ipc=True)
         ops = [c.op for c in sampling_client.transport.calls]
         assert ops == [
@@ -157,8 +157,7 @@ class TestSFTOpMapping:
         assert payload["target_sub_job_ids"] == [SAMPLING]
 
     def test_sync_weights_body_omits_strategy_by_default(self, sampling_client):
-        """No override → only job ids on the wire; the server uses the strategy
-        baked onto the training job at init."""
+        """No override → only job ids on the wire; the server uses the strategy baked onto the training job at init."""
         sampling_client.sync_weights()
         payload = sampling_client.transport.calls[1].body["payload"]
         assert payload == {"source_sub_job_id": TRAINING, "target_sub_job_ids": [SAMPLING]}

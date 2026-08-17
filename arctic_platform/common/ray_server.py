@@ -510,8 +510,8 @@ class ArcticRLRayServerState(ArcticRLServerState):
             job_info["checkpoint_path"] = os.path.join(job_config.checkpoint_path, f"arctic_rl_job_{job_id}")
             os.makedirs(job_info["checkpoint_path"], exist_ok=True)
             job_info["sync_path"] = os.path.join(job_info["checkpoint_path"], "weight_sync.pt")
-            # Weight-sync strategy is static per run: record it on the job so
-            # weight_sync need not resend it each call (per-call override still wins).
+            # Weight-sync strategy is static per run: record it on the job so weight_sync need not resend it each call
+            # (per-call override still wins).
             job_info["cuda_ipc"] = job_config.cuda_ipc
             job_info["low_memory"] = job_config.low_memory
 

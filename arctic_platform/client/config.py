@@ -163,8 +163,8 @@ class TrainingConfig(BaseModel):
         False,
         description=(
             "Colocated weight-sync strategy: push training weights to the sampling engine via zero-copy CUDA IPC "
-            "(requires colocate=True and weights resident on GPU) instead of the CPU-file path. "
-            "Optional override on sync_weights()."
+            "(requires colocate=True and weights resident on GPU) instead of the CPU-file path. Optional override on "
+            "sync_weights()."
         ),
     )
     low_memory: bool = Field(

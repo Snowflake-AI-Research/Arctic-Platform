@@ -173,8 +173,8 @@ class TestOpMapping:
     def test_sync_weights_staged_wake_and_operation(self, client):
         """sync_weights: wake → weight-sync operation → wake → reset-prefix-cache.
 
-        Explicit cuda_ipc / low_memory are per-call overrides included in the
-        payload; colocate is never sent (the server owns it via launch state).
+        Explicit cuda_ipc / low_memory are per-call overrides included in the payload; colocate is never sent (the
+        server owns it via launch state).
         """
         _call(client, "sync_weights", cuda_ipc=True, low_memory=False)
         ops = [r.op for r in client.transport.calls[-4:]]
@@ -190,8 +190,8 @@ class TestOpMapping:
         }
 
     def test_sync_weights_body_omits_strategy_by_default(self, client):
-        """With no override, the payload carries only the job ids: the server uses
-        the strategy baked onto the training job at init (no colocate on the wire)."""
+        """With no override, the payload carries only the job ids: the server uses the strategy baked onto the training
+        job at init (no colocate on the wire)."""
         _call(client, "sync_weights")
         sync_req = client.transport.calls[-3]
         assert sync_req.body["payload"] == {
