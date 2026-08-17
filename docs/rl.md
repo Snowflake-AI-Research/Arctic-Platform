@@ -108,6 +108,8 @@ client2 = create_arctic_rl_client(rc)
 | `training_gpus` / `sampling_gpus` / `log_prob_gpus` | `0` | Job created iff > 0 |
 | `log_prob_engine` | `"vllm"` | `"deepspeed"` or `"vllm"` |
 | `colocate` | `False` | Fractional GPU sharing |
+| `cuda_ipc` | `False` | Colocated weight-sync strategy, baked onto the training job at init: CUDA-IPC vs CPU-file |
+| `low_memory` | `False` | With `cuda_ipc`, stream one param at a time (bounds peak GPU mem); sent at init |
 | `host` / `port` | derived | HTTP often routable IP + **7000** |
 | `ds_config` | `{}` | Training DeepSpeed config |
 | `training_config` | `None` | Optimizer / scheduler / `training_horizon` |
@@ -132,7 +134,7 @@ Async methods on the HTTP/Ray clients from `create_arctic_rl_client`:
 | `save_checkpoint()` | training | |
 | `generate(prompts, sampling_params, …)` | sampling | Rollouts |
 | `log_probs(prompts, completions, top_k=1)` | log_prob | |
-| `sync_weights(cuda_ipc=False, low_memory=False)` | cross-job | NCCL or CUDA-IPC |
+| `sync_weights(cuda_ipc=None, low_memory=None)` | cross-job | NCCL or CUDA-IPC; `None` uses the strategy set on the training job at init (config `cuda_ipc` / `low_memory`), pass a value to override one call |
 | `weight_norm()` | cross-job | Debug after sync |
 | `reset_prefix_cache()` | sampling | |
 | `sleep_inference` / `wake_inference` | sampling | Colocation VRAM |

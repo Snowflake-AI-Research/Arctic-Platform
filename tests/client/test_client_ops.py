@@ -171,7 +171,11 @@ class TestOpMapping:
         }
 
     def test_sync_weights_staged_wake_and_operation(self, client):
-        """sync_weights: wake → weight-sync operation → wake → reset-prefix-cache."""
+        """sync_weights: wake → weight-sync operation → wake → reset-prefix-cache.
+
+        Explicit cuda_ipc / low_memory are per-call overrides included in the payload; colocate is never sent (the
+        server owns it via launch state).
+        """
         _call(client, "sync_weights", cuda_ipc=True, low_memory=False)
         ops = [r.op for r in client.transport.calls[-4:]]
         assert ops == ["wake-inference", "operation", "wake-inference", "operation"]
@@ -181,9 +185,18 @@ class TestOpMapping:
         assert sync_req.body["payload"] == {
             "source_sub_job_id": TRAINING,
             "target_sub_job_ids": [SAMPLING],
-            "colocate": False,
             "cuda_ipc": True,
             "low_memory": False,
+        }
+
+    def test_sync_weights_body_omits_strategy_by_default(self, client):
+        """With no override, the payload carries only the job ids: the server uses the strategy baked onto the training
+        job at init (no colocate on the wire)."""
+        _call(client, "sync_weights")
+        sync_req = client.transport.calls[-3]
+        assert sync_req.body["payload"] == {
+            "source_sub_job_id": TRAINING,
+            "target_sub_job_ids": [SAMPLING],
         }
 
     def test_sleep_wake_training_and_inference(self, client):
@@ -354,3 +367,26 @@ class TestTransportSelection:
         cfg = ArcticRLClientConfig(model_name="m", backend_config=OnPremConfig(comm_protocol="http"), training_gpus=1)
         with pytest.raises(ValueError, match="server_state reconnect"):
             client_module.make_transport(cfg, server_state=object())
+
+
+class TestWeightSyncStrategyInit:
+    """The static weight-sync strategy (cuda_ipc / low_memory) rides the training /initialize payload, so /weight-sync
+    need not resend it."""
+
+    def test_training_init_payload_carries_strategy(self):
+        from arctic_platform.client import TrainingConfig
+
+        cfg = ArcticRLClientConfig(
+            model_name="m",
+            training_gpus=1,
+            training=TrainingConfig(checkpoint_path="/tmp/c", cuda_ipc=True, low_memory=True),
+        )
+        payload = cfg.to_onprem("training")
+        assert payload["cuda_ipc"] is True
+        assert payload["low_memory"] is True
+
+    def test_non_training_init_payload_omits_strategy(self):
+        cfg = ArcticRLClientConfig(model_name="m", sampling_gpus=1)
+        payload = cfg.to_onprem("sampling")
+        assert "cuda_ipc" not in payload
+        assert "low_memory" not in payload

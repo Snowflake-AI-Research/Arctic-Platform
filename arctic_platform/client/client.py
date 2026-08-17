@@ -137,9 +137,8 @@ def _log_probs_request(jobs: JobHandles, prompts: list, completions: list | None
 def _sync_weights_request(
     jobs: JobHandles,
     *,
-    colocate: bool = False,
-    cuda_ipc: bool = False,
-    low_memory: bool = False,
+    cuda_ipc: bool | None = None,
+    low_memory: bool | None = None,
 ) -> Request:
     # The client assembles the full Cortex `/operation` envelope here so transports
     # just forward it: SnowAPI reads the `sub_job_*` routing hints, on-prem accepts
@@ -150,17 +149,16 @@ def _sync_weights_request(
     # zero-copy (training weights must be on GPU) and low_memory streams one param at
     # a time to bound peak GPU memory.
     tid, sid = jobs.require("training"), jobs.require("sampling")
+    payload = {"source_sub_job_id": tid, "target_sub_job_ids": [sid]}
+    if cuda_ipc is not None:
+        payload["cuda_ipc"] = cuda_ipc
+    if low_memory is not None:
+        payload["low_memory"] = low_memory
     body = {
         "operation_type": "weight-sync",
         "sub_job_id": tid,
         "sub_job_type": "training",
-        "payload": {
-            "source_sub_job_id": tid,
-            "target_sub_job_ids": [sid],
-            "colocate": colocate,
-            "cuda_ipc": cuda_ipc,
-            "low_memory": low_memory,
-        },
+        "payload": payload,
     }
     return Request("operation", tid, body)
 
@@ -255,17 +253,14 @@ class SyncArcticRLClient:
         return self.transport.call(_log_probs_request(self.jobs, prompts, completions, top_k))
 
     # ── weight sync + cache ──────────────────────────────────────────────
-    def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict:
-        """Sync training weights to sampling (staged wake → operation → wake → reset)."""
+    def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict:
+        """Sync training weights to sampling (staged wake → operation → wake → reset).
+
+        ``cuda_ipc`` / ``low_memory`` default to the training job's ``TrainingConfig``; pass a value to override this
+        call.
+        """
         self.wake_inference(tags=["weights"])
-        out = self.transport.call(
-            _sync_weights_request(
-                self.jobs,
-                colocate=self.config.backend_config.colocate,
-                cuda_ipc=cuda_ipc,
-                low_memory=low_memory,
-            )
-        )
+        out = self.transport.call(_sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory))
         self.wake_inference(tags=["kv_cache"])
         self.reset_prefix_cache()
         return out
@@ -359,17 +354,10 @@ class ArcticRLClient:
         return await self.transport.acall(_log_probs_request(self.jobs, prompts, completions, top_k))
 
     # ── weight sync + cache ──────────────────────────────────────────────
-    async def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict:
+    async def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict:
         """Async twin of SyncArcticRLClient.sync_weights (staged wake → operation → wake → reset)."""
         await self.wake_inference(tags=["weights"])
-        out = await self.transport.acall(
-            _sync_weights_request(
-                self.jobs,
-                colocate=self.config.backend_config.colocate,
-                cuda_ipc=cuda_ipc,
-                low_memory=low_memory,
-            )
-        )
+        out = await self.transport.acall(_sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory))
         await self.wake_inference(tags=["kv_cache"])
         await self.reset_prefix_cache()
         return out

@@ -65,6 +65,17 @@ class ArcticSFTClientConfig(BaseModel):
         False,
         description="Share GPUs between training and sampling (RL e2e uses True when sampling on).",
     )
+    cuda_ipc: bool = Field(
+        False,
+        description=(
+            "Colocated weight-sync strategy (only relevant with sampling_gpus > 0 + colocate): push weights via "
+            "zero-copy CUDA IPC instead of the CPU-file path. Optional override on sync_weights()."
+        ),
+    )
+    low_memory: bool = Field(
+        False,
+        description="With cuda_ipc, stream one gathered param at a time to bound peak extra GPU memory.",
+    )
     vllm_config: dict[str, Any] | None = Field(None, description="Forwarded to the sampling job init.")
 
     host: str = "localhost"
@@ -118,6 +129,8 @@ class ArcticSFTClientConfig(BaseModel):
                 checkpoint_path=self.checkpoint_path,
                 ds_config=self.ds_config,
                 ds_worker_config=self.ds_worker_config,
+                cuda_ipc=self.cuda_ipc,
+                low_memory=self.low_memory,
             ),
             sampling=SamplingConfig(vllm=dict(self.vllm_config or {})),
             backend_config=OnPremConfig(

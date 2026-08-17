@@ -261,6 +261,8 @@ ignores this knob.
 | `training_config` | `null` | Optimizer / LR schedule / `training_horizon` / `max_length` |
 | `ds_worker_config` | `null` | e.g. `attn_implementation`, `enable_gradient_checkpointing` |
 | `training_job_id` | `null` | Reattach to an existing training job |
+| `sampling_gpus` / `colocate` / `vllm_config` | `0` / `false` / `null` | Optional vLLM sampling job for `generate` / `sync_weights` |
+| `cuda_ipc` / `low_memory` | `false` / `false` | Colocated weight-sync strategy (only with `sampling_gpus > 0`), set on the training job at init; `sync_weights(cuda_ipc=…, low_memory=…)` overrides one call |
 | `startup_timeout` / `job_ready_timeout` / `request_timeout` | 600 / 1800 / 1800 | Seconds |
 
 `training_horizon` is the LR scheduler's total optimizer-step count
