@@ -100,7 +100,7 @@ class OperationRequest(BaseModel):
     # Generic data-plane envelope, matching Cortex's /{job_id}/operation. On-prem
     # dispatches on operation_type; sub_job_id/sub_job_type are accepted for
     # parity (unused, since on-prem addresses jobs by the job_id query param).
-    # sub_job_id is an on-prem integer job id or a Cortex string handle.
+    # sub_job_id is int on-prem (plain job id) and may be str on Cortex — accept both.
     operation_type: str
     sub_job_id: int | str | None = None
     sub_job_type: str | None = None
