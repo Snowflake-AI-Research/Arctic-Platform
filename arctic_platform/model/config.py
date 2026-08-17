@@ -31,12 +31,31 @@ class ParallelismConfig(BaseModel):
     sequence_parallel: int = Field(1, description="Ulysses sequence-parallel degree.")
 
 
+class ZorroTrainPatch(BaseModel):
+    """ZoRRo Train forward-patch knobs. Non-None enables the patch."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    response_len: int | None = Field(None, description="Response length per rollout.")
+    max_token_len: int | None = Field(None, description="Per-GPU train token budget.")
+    rollout_n: int | None = Field(None, description="GRPO rollout group size.")
+    temperature: float | None = Field(None, description="Sampling temperature for logprob/entropy.")
+    use_unpad: bool = Field(True, description="Use unpadded (packed) sequences.")
+    world_size: int | None = Field(None, description="Distributed world size (injected by worker).")
+    logits_optimization: str = Field("none", description='One of "none" | "memory" | "compute".')
+    logits_optimization_peak_mem_size_in_gib: int = Field(4, description="Peak mem budget (GiB) for memory/compute.")
+    logits_compute_from_fp32_inputs: bool = Field(False, description="Logits from fp32 hiddens.")
+    logits_compute_in_fp32: bool = Field(False, description="Compute logits in fp32.")
+
+
 class Patches(BaseModel):
     """Optional features applied to the model after it is loaded."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     liger: bool = Field(False, description="Apply Liger kernels.")
+    zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
+    gradient_checkpointing: bool = Field(False, description="HF gradient checkpointing.")
 
 
 class ModelSpec(BaseModel):
@@ -56,6 +75,37 @@ class ModelSpec(BaseModel):
         default_factory=ParallelismConfig, description="Loader-specific parallelism."
     )
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
+
+    @classmethod
+    def from_ds_worker_config(cls, model_name: str, ds_worker_config: dict) -> "ModelSpec":
+        """Map flat ``ds_worker_config`` to ModelSpec (FA2 / bf16 / GC-on defaults)."""
+        cfg = ds_worker_config or {}
+
+        zorro_train = None
+        if cfg.get("zorro_train_enable", False):
+            zorro_train = ZorroTrainPatch(
+                response_len=cfg.get("response_len"),
+                max_token_len=cfg.get("max_token_len"),
+                rollout_n=cfg.get("rollout_n"),
+                temperature=cfg.get("temperature"),
+                use_unpad=cfg.get("use_unpad", True),
+                world_size=cfg.get("world_size"),
+                logits_optimization=cfg.get("logits_optimization", "none"),
+                logits_optimization_peak_mem_size_in_gib=cfg.get("logits_optimization_peak_mem_size_in_gib", 4),
+                logits_compute_from_fp32_inputs=cfg.get("logits_compute_from_fp32_inputs", False),
+                logits_compute_in_fp32=cfg.get("logits_compute_in_fp32", False),
+            )
+
+        return cls(
+            model_path_or_name=model_name,
+            dtype="bfloat16",
+            attn_implementation=cfg.get("attn_implementation", "flash_attention_2"),
+            patches=Patches(
+                liger=cfg.get("use_liger", False),
+                zorro_train=zorro_train,
+                gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
+            ),
+        )
 
     @field_validator("dtype")
     @classmethod
