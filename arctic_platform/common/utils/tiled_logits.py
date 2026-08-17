@@ -112,7 +112,10 @@ def logprobs_entropy_from_flat_logits(flat_logits, flat_labels, calculate_entrop
     reshape back to the original batch dims.
     """
     entropy = None
-    if FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
+    # The flash-attn CE kernel is Triton and only runs on CUDA tensors; fall back
+    # to the logsumexp/gather path on CPU so callers (e.g. sft_ce's ``none`` path)
+    # stay valid off-GPU. GPU behavior is unchanged.
+    if FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE and flat_logits.is_cuda:
         inplace_backward = flat_logits.requires_grad
         output = cross_entropy_loss(flat_logits, flat_labels, inplace_backward=inplace_backward)
         logprobs = -output[0]
