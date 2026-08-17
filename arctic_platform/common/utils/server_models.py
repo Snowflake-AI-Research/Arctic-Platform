@@ -39,8 +39,8 @@ class JobConfig(BaseModel):
     arctic_inference_config: dict | None = None
     full_determinism: bool = False
     seed: int = 42
-    # Weight-sync strategy for the source (training) job. A WeightSyncRequest
-    # may override either field for one call. Meaningful only on a training job.
+    # Weight-sync strategy for the source (training) job. A WeightSyncRequest may override either field for one call.
+    # Meaningful only on a training job.
     cuda_ipc: bool = False
     low_memory: bool = False
 

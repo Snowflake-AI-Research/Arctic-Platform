@@ -180,11 +180,7 @@ With `--colocate` / `colocate=True`:
 
 - Per-node `STRICT_PACK` placement groups (`utils/ray_pg.py`)
 - Fractional Ray GPU accounting across training / sampling / log-prob
-- vLLM sleep mode enabled; weight sync via NCCL or CUDA-IPC. The CUDA-IPC vs
-  CPU-file strategy (`cuda_ipc` / `low_memory`) is baked onto the training
-  `JobConfig` at `/initialize` and reused by every `/weight-sync`; a
-  `WeightSyncRequest` may still set either field to override one call. `colocate`
-  is server-launch state (`--colocate`), never a per-call weight-sync argument.
+- vLLM sleep mode enabled; weight sync via NCCL or CUDA-IPC. The CUDA-IPC vs CPU-file strategy (`cuda_ipc` / `low_memory`) is on the training `JobConfig` at `/initialize` and reused by every `/weight-sync`; a `WeightSyncRequest` may set either field to override one call. `colocate` is server-launch state (`--colocate`).
 
 ## Environment variables
 

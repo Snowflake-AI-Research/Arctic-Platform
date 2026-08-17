@@ -235,8 +235,8 @@ class SyncArcticRLClient:
     def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict:
         """Sync training weights to sampling (staged wake → operation → wake → reset).
 
-        ``cuda_ipc`` / ``low_memory`` default to the training job's ``TrainingConfig``;
-        pass a value to override this call.
+        ``cuda_ipc`` / ``low_memory`` default to the training job's ``TrainingConfig``; pass a value to override this
+        call.
         """
         self.wake_inference(tags=["weights"])
         out = self.transport.call(

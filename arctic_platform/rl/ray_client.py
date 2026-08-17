@@ -415,8 +415,7 @@ class ArcticRLRayClient:
         at a time so peak extra GPU memory is one full param per GPU instead of
         the whole model (avoids OOM on big models, at the cost of round-trips).
 
-        ``cuda_ipc`` / ``low_memory`` default to the training job's config;
-        pass a value to override this call.
+        ``cuda_ipc`` / ``low_memory`` default to the training job's config; pass a value to override this call.
         """
         request: dict[str, Any] = dict(
             source_sub_job_id=self.training_job_id,

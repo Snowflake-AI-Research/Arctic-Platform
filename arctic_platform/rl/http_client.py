@@ -635,8 +635,7 @@ class ArcticRLHTTPClient:
         at a time). Not yet implemented on the HTTP path -- see the server-side
         guard in /weight-sync; use the ray protocol for low_memory_weight_sync.
 
-        ``cuda_ipc`` / ``low_memory`` default to the training job's config;
-        pass a value to override this call.
+        ``cuda_ipc`` / ``low_memory`` default to the training job's config; pass a value to override this call.
         """
 
         resp = self._session.post(
