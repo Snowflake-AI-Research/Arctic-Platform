@@ -260,9 +260,7 @@ class SyncArcticRLClient:
         call.
         """
         self.wake_inference(tags=["weights"])
-        out = self.transport.call(
-            _sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory)
-        )
+        out = self.transport.call(_sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory))
         self.wake_inference(tags=["kv_cache"])
         self.reset_prefix_cache()
         return out
@@ -359,9 +357,7 @@ class ArcticRLClient:
     async def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict:
         """Async twin of SyncArcticRLClient.sync_weights (staged wake → operation → wake → reset)."""
         await self.wake_inference(tags=["weights"])
-        out = await self.transport.acall(
-            _sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory)
-        )
+        out = await self.transport.acall(_sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory))
         await self.wake_inference(tags=["kv_cache"])
         await self.reset_prefix_cache()
         return out

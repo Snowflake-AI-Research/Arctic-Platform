@@ -954,7 +954,9 @@ class ArcticRLRayServer:
         # Strategy comes from the training job (set at init); a non-None request value overrides it.
         training_job_info = self.jobs.get(training_job_id) or {}
         cuda_ipc = request.cuda_ipc if request.cuda_ipc is not None else training_job_info.get("cuda_ipc", False)
-        low_memory = request.low_memory if request.low_memory is not None else training_job_info.get("low_memory", False)
+        low_memory = (
+            request.low_memory if request.low_memory is not None else training_job_info.get("low_memory", False)
+        )
 
         if colocate:
             lp_pool = self.log_prob_pool
