@@ -26,6 +26,10 @@ from arctic_platform.model.patch import register_patch
 def apply_zorro_train(model: nn.Module, ctx: LoaderContext) -> None:
     # Lazy: keep `import arctic_platform.model` free of RL deps.
     from arctic_platform.rl.zorro_train.qwen_model_patcher import Qwen3ModelOncePatcher
+    from arctic_platform.rl.zorro_train.qwen_model_patcher import get_supported_model_type
+
+    # Fail fast: ZoRRo Train only supports Qwen3-family model_type values.
+    get_supported_model_type(model)
 
     settings = ctx.spec.patches.zorro_train
 

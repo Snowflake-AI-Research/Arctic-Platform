@@ -289,9 +289,11 @@ class TestZorroAndGcPatches:
 
         fake_mod = types.ModuleType("arctic_platform.rl.zorro_train.qwen_model_patcher")
         fake_mod.Qwen3ModelOncePatcher = _FakePatcher
+        fake_mod.get_supported_model_type = lambda model: "qwen3"
         monkeypatch.setitem(sys.modules, "arctic_platform.rl.zorro_train.qwen_model_patcher", fake_mod)
 
         model = nn.Identity()
+        model.config = types.SimpleNamespace(model_type="qwen3")
         settings = ZorroTrainPatch(response_len=1024, rollout_n=8, world_size=2, logits_optimization="memory")
         apply_zorro_train(model, _ctx(zorro_train=settings))
 
@@ -302,3 +304,21 @@ class TestZorroAndGcPatches:
         assert constructed["kwargs"]["logits_optimization"] == "memory"
         assert isinstance(model._arctic_zorro_once_patcher, _FakePatcher)
         assert model._arctic_zorro_once_patcher.patched is True
+
+    def test_zorro_patch_rejects_non_qwen3(self, monkeypatch):
+        from arctic_platform.model.config import ZorroTrainPatch
+        from arctic_platform.model.patches.zorro_train import apply_zorro_train
+        from arctic_platform.rl.zorro_train.qwen_model_patcher import get_supported_model_type
+
+        # Keep the real guard; stub only the patcher constructor so we never patch.
+        fake_mod = types.ModuleType("arctic_platform.rl.zorro_train.qwen_model_patcher")
+        fake_mod.Qwen3ModelOncePatcher = object
+        fake_mod.get_supported_model_type = get_supported_model_type
+        monkeypatch.setitem(sys.modules, "arctic_platform.rl.zorro_train.qwen_model_patcher", fake_mod)
+
+        model = nn.Identity()
+        model.config = types.SimpleNamespace(model_type="llama")
+        with pytest.raises(ValueError, match="Unsupported model_type=llama"):
+            apply_zorro_train(
+                model, _ctx(zorro_train=ZorroTrainPatch(response_len=1024, rollout_n=8, world_size=1))
+            )
