@@ -510,6 +510,10 @@ class ArcticRLRayServerState(ArcticRLServerState):
             job_info["checkpoint_path"] = os.path.join(job_config.checkpoint_path, f"arctic_rl_job_{job_id}")
             os.makedirs(job_info["checkpoint_path"], exist_ok=True)
             job_info["sync_path"] = os.path.join(job_info["checkpoint_path"], "weight_sync.pt")
+            # Weight-sync strategy is static per run: record it on the job so
+            # weight_sync need not resend it each call (per-call override still wins).
+            job_info["cuda_ipc"] = job_config.cuda_ipc
+            job_info["low_memory"] = job_config.low_memory
 
         self.jobs[job_id] = job_info
         return {"job_id": job_id, "job_type": job_type, "running": True}
@@ -941,12 +945,17 @@ class ArcticRLRayServer:
 
         workers = self.training_workers
         pool: ReplicaPool = self.sampling_pool
-        colocate = request.colocate or self.colocate
+        # colocate is a server-launch property, never a per-call arg.
+        colocate = self.colocate
+        # Strategy comes from the training job (set at init); a non-None request value overrides it.
+        training_job_info = self.jobs.get(training_job_id) or {}
+        cuda_ipc = request.cuda_ipc if request.cuda_ipc is not None else training_job_info.get("cuda_ipc", False)
+        low_memory = request.low_memory if request.low_memory is not None else training_job_info.get("low_memory", False)
 
         if colocate:
             lp_pool = self.log_prob_pool
-            if request.cuda_ipc:
-                if request.low_memory:
+            if cuda_ipc:
+                if low_memory:
                     # Slower, memory-efficient path: stream one gathered param
                     # at a time so peak extra GPU memory is one full param per
                     # GPU instead of the whole model (avoids OOM on big models).
@@ -954,7 +963,6 @@ class ArcticRLRayServer:
                 else:
                     results = await self._sync_weights_cuda_ipc(workers, pool, lp_pool)
             else:
-                training_job_info = self.jobs[training_job_id]
                 sync_path = training_job_info.get("sync_path", None)
                 assert sync_path is not None, f"sync_path is required for training job {training_job_id}"
                 results = await self._sync_weights_ipc(sync_path, workers, pool, lp_pool)

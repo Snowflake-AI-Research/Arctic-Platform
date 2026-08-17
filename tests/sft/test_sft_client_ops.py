@@ -136,6 +136,8 @@ class TestSFTOpMapping:
         assert req.body["sampling_params"] == {"max_tokens": 8}
 
     def test_sync_weights_stages_wake_and_reset(self, sampling_client):
+        # Explicit cuda_ipc is a per-call override (present); low_memory is left
+        # to the job's init-time default (omitted); colocate is never on the wire.
         sampling_client.sync_weights(cuda_ipc=True)
         ops = [c.op for c in sampling_client.transport.calls]
         assert ops == [
@@ -148,10 +150,18 @@ class TestSFTOpMapping:
         assert sync_req.job_id == TRAINING
         assert sync_req.body["operation_type"] == "weight-sync"
         payload = sync_req.body["payload"]
-        assert payload["colocate"] is True
         assert payload["cuda_ipc"] is True
+        assert "colocate" not in payload
+        assert "low_memory" not in payload
         assert payload["source_sub_job_id"] == TRAINING
         assert payload["target_sub_job_ids"] == [SAMPLING]
+
+    def test_sync_weights_body_omits_strategy_by_default(self, sampling_client):
+        """No override → only job ids on the wire; the server uses the strategy
+        baked onto the training job at init."""
+        sampling_client.sync_weights()
+        payload = sampling_client.transport.calls[1].body["payload"]
+        assert payload == {"source_sub_job_id": TRAINING, "target_sub_job_ids": [SAMPLING]}
 
 
 class TestSFTLifecycle:
@@ -223,3 +233,17 @@ class TestSFTTransportSelection:
         assert rl.backend_config.launch_local_server is True
         assert rl.backend_config.server_cuda_visible_devices == "0,1"
         assert rl.training.checkpoint_path == "/tmp/c"
+
+    def test_to_rl_config_routes_weight_sync_strategy(self):
+        cfg = ArcticSFTClientConfig(
+            model_name="m",
+            training_gpus=1,
+            sampling_gpus=1,
+            colocate=True,
+            cuda_ipc=True,
+            low_memory=True,
+            checkpoint_path="/tmp/c",
+        )
+        rl = cfg.to_rl_config()
+        assert rl.training.cuda_ipc is True
+        assert rl.training.low_memory is True

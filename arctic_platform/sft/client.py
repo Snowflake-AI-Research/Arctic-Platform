@@ -139,9 +139,19 @@ class ArcticSFTClient:
         body = {"prompts": prompts, "sampling_params": sampling_params, "routing_key": routing_key}
         return self.transport.call(Request("generate", self.jobs.require("sampling"), body))["results"]
 
-    def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict:
-        """Push training weights to the sampling engine (same staging as RL client)."""
+    def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict:
+        """Push training weights to the sampling engine (same staging as RL client).
+
+        The colocated strategy (cuda_ipc / low_memory) defaults to what was set on
+        the training job at init (from config); pass either here to override this call.
+        colocate is not sent — the server derives it from its own launch state.
+        """
         tid, sid = self.jobs.require("training"), self.jobs.require("sampling")
+        payload: dict = {"source_sub_job_id": tid, "target_sub_job_ids": [sid]}
+        if cuda_ipc is not None:
+            payload["cuda_ipc"] = cuda_ipc
+        if low_memory is not None:
+            payload["low_memory"] = low_memory
         self.wake_inference(tags=["weights"])
         out = self.transport.call(
             Request(
@@ -151,13 +161,7 @@ class ArcticSFTClient:
                     "operation_type": "weight-sync",
                     "sub_job_id": tid,
                     "sub_job_type": "training",
-                    "payload": {
-                        "source_sub_job_id": tid,
-                        "target_sub_job_ids": [sid],
-                        "colocate": self.config.colocate,
-                        "cuda_ipc": cuda_ipc,
-                        "low_memory": low_memory,
-                    },
+                    "payload": payload,
                 },
             )
         )

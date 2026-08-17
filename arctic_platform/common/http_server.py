@@ -348,6 +348,10 @@ async def initialize(job_config: JobConfig = Body(...)):
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         job_info["checkpoint_path"] = str(ckpt_dir)
         job_info["sync_path"] = str(ckpt_dir / "weight_sync.pt")
+        # Weight-sync strategy is static per run: record it on the job so
+        # /weight-sync need not resend it each call (per-call override still wins).
+        job_info["cuda_ipc"] = job_config.cuda_ipc
+        job_info["low_memory"] = job_config.low_memory
     app.state.jobs[job_id] = job_info
     return {"job_id": job_id, "job_type": job_type, "running": True}
 
@@ -732,12 +736,17 @@ async def weight_sync(job_id: int, request: WeightSyncRequest = Body(...)):
 
     workers = app.state.training_workers
     pool: ReplicaPool = app.state.sampling_pool
-    colocate = request.colocate or app.state.colocate
+    # colocate is a server-launch property, never a per-call arg.
+    colocate = app.state.colocate
+    # Strategy comes from the training job (set at init); a non-None request value overrides it.
+    training_job_info = app.state.jobs.get(training_job_id) or {}
+    cuda_ipc = request.cuda_ipc if request.cuda_ipc is not None else training_job_info.get("cuda_ipc", False)
+    low_memory = request.low_memory if request.low_memory is not None else training_job_info.get("low_memory", False)
 
     if colocate:
         lp_pool = app.state.log_prob_pool
-        if request.cuda_ipc:
-            if request.low_memory:
+        if cuda_ipc:
+            if low_memory:
                 print("colo _sync_weights_cuda_ipc_low_mem")
                 results = await _sync_weights_cuda_ipc_low_mem(workers, pool, lp_pool)
             else:
@@ -745,7 +754,6 @@ async def weight_sync(job_id: int, request: WeightSyncRequest = Body(...)):
                 results = await _sync_weights_cuda_ipc(workers, pool, lp_pool)
         else:
             print("colo _sync_weights_ipc")
-            training_job_info = app.state.jobs.get(training_job_id)
             sync_path = training_job_info.get("sync_path", None)
             assert sync_path is not None, f"sync_path is required for training job {training_job_id}"
             results = await _sync_weights_ipc(sync_path, workers, pool, lp_pool)

@@ -563,6 +563,10 @@ class ArcticRLClientWrapper(RemoteBackend):
             colocate=colocate,
             log_prob_engine="deepspeed",
             model_name=model_name,
+            # Weight-sync strategy is static for the run, so bake it onto the training job at init
+            # rather than resending it on every sync_weights() call.
+            cuda_ipc=self.cuda_ipc_weight_sync,
+            low_memory=self.low_memory_weight_sync,
             ds_config=self._create_ds_config(n_training_gpus),
             log_prob_ds_config=(None if n_log_prob_gpus == 0 else self._create_ds_config(n_log_prob_gpus)),
             training_config={
@@ -661,10 +665,9 @@ class ArcticRLClientWrapper(RemoteBackend):
         return await self._client.save_checkpoint()
 
     async def update_weights(self):
-        return await self._client.sync_weights(
-            cuda_ipc=self.cuda_ipc_weight_sync,
-            low_memory=self.low_memory_weight_sync,
-        )
+        # cuda_ipc / low_memory were baked onto the training job at init (see
+        # _initialize_client), so no per-call strategy override is needed here.
+        return await self._client.sync_weights()
 
     async def wake_up_inference(self, tags: list[str] = None):
         return await self._client.wake_inference(tags=tags)

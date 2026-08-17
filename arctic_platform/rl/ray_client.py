@@ -172,6 +172,9 @@ class ArcticRLRayClient:
             job_config["ds_worker_config"] = self.config.ds_worker_config
             if job_type == "training":
                 job_config["checkpoint_path"] = self.config.checkpoint_path
+                # Bake the (static) weight-sync strategy onto the training job.
+                job_config["cuda_ipc"] = self.config.cuda_ipc
+                job_config["low_memory"] = self.config.low_memory
         else:
             if self.config.arctic_inference_config:
                 job_config["arctic_inference_config"] = self.config.arctic_inference_config
@@ -402,7 +405,7 @@ class ArcticRLRayClient:
     # Weight sync
     # ------------------------------------------------------------------
 
-    async def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict[str, Any]:
+    async def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict[str, Any]:
         """Sync training model weights to the sampling engine.
 
         In non-colocated mode, uses NCCL.  In colocated mode:
@@ -412,14 +415,20 @@ class ArcticRLRayClient:
         low_memory only applies to the cuda_ipc path: stream one gathered param
         at a time so peak extra GPU memory is one full param per GPU instead of
         the whole model (avoids OOM on big models, at the cost of round-trips).
+
+        cuda_ipc / low_memory default to the strategy set on the training job at
+        init (``config.cuda_ipc`` / ``config.low_memory``); pass either here to
+        override just this call. colocate is not sent -- the server derives it
+        from its own launch state.
         """
-        request = dict(
+        request: dict[str, Any] = dict(
             source_sub_job_id=self.training_job_id,
             target_sub_job_ids=[self.sampling_job_id],
-            colocate=self.config.colocate,
-            cuda_ipc=cuda_ipc,
-            low_memory=low_memory,
         )
+        if cuda_ipc is not None:
+            request["cuda_ipc"] = cuda_ipc
+        if low_memory is not None:
+            request["low_memory"] = low_memory
         response = await self._arctic_rl_ray_server.weight_sync(self.training_job_id, request)
         pr0(f"[ArcticRLClient] sync_weights OUTPUT: {response.keys()=}")
         return response

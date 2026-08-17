@@ -289,6 +289,9 @@ class ArcticRLHTTPClient:
             payload["ds_worker_config"] = self.config.ds_worker_config
             if job_type == "training":
                 payload["checkpoint_path"] = self.config.checkpoint_path
+                # Bake the (static) weight-sync strategy onto the training job.
+                payload["cuda_ipc"] = self.config.cuda_ipc
+                payload["low_memory"] = self.config.low_memory
         else:
             if self.config.arctic_inference_config:
                 payload["arctic_inference_config"] = self.config.arctic_inference_config
@@ -620,7 +623,7 @@ class ArcticRLHTTPClient:
     # Weight sync
     # ------------------------------------------------------------------
 
-    async def sync_weights(self, cuda_ipc: bool = False, low_memory: bool = False) -> dict[str, Any]:
+    async def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict[str, Any]:
         """Sync training model weights to the sampling engine.
 
         3 modes:
@@ -632,6 +635,11 @@ class ArcticRLHTTPClient:
         low_memory only applies to the cuda_ipc path (stream one gathered param
         at a time). Not yet implemented on the HTTP path -- see the server-side
         guard in /weight-sync; use the ray protocol for low_memory_weight_sync.
+
+        cuda_ipc / low_memory default to the strategy set on the training job at
+        init (``config.cuda_ipc`` / ``config.low_memory``); pass either here to
+        override just this call. colocate is not sent -- the server derives it
+        from its own launch state.
         """
 
         resp = self._session.post(
@@ -641,16 +649,18 @@ class ArcticRLHTTPClient:
         )
         resp.raise_for_status()
 
+        body: dict[str, Any] = {
+            "source_sub_job_id": self.training_job_id,
+            "target_sub_job_ids": [self.sampling_job_id],
+        }
+        if cuda_ipc is not None:
+            body["cuda_ipc"] = cuda_ipc
+        if low_memory is not None:
+            body["low_memory"] = low_memory
         resp = self._session.post(
             f"{self._base_url}/weight-sync",
             params={"job_id": self.training_job_id},
-            json={
-                "source_sub_job_id": self.training_job_id,
-                "target_sub_job_ids": [self.sampling_job_id],
-                "colocate": self.config.colocate,
-                "cuda_ipc": cuda_ipc,
-                "low_memory": low_memory,
-            },
+            json=body,
         )
         resp.raise_for_status()
         response = resp.json()

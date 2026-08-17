@@ -159,6 +159,21 @@ class TrainingConfig(BaseModel):
         None,
         description="DeepSpeed worker knobs (attn_implementation, use_liger, enable_gradient_checkpointing, ...).",
     )
+    cuda_ipc: bool = Field(
+        False,
+        description=(
+            "Colocated weight-sync strategy: push training weights to the sampling engine via zero-copy CUDA IPC "
+            "(requires colocate=True and weights resident on GPU) instead of the CPU-file path. Static per run, so "
+            "it is sent once at job init; sync_weights(cuda_ipc=...) can still override a single call."
+        ),
+    )
+    low_memory: bool = Field(
+        False,
+        description=(
+            "With cuda_ipc, stream one gathered param at a time to bound peak extra GPU memory to one param/GPU "
+            "instead of the whole model. Static per run (sent at init); overridable per sync_weights call."
+        ),
+    )
 
 
 class ArcticRLClientConfig(BaseModel):
@@ -222,6 +237,9 @@ class ArcticRLClientConfig(BaseModel):
             if job_type == "training":
                 if tc.checkpoint_path:
                     payload["checkpoint_path"] = tc.checkpoint_path
+                # Bake the (static) weight-sync strategy onto the training job.
+                payload["cuda_ipc"] = tc.cuda_ipc
+                payload["low_memory"] = tc.low_memory
             elif sc.log_prob_ds_config:
                 payload["log_prob_config"] = sc.log_prob_ds_config
         else:
