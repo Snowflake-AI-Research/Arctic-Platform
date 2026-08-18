@@ -15,6 +15,7 @@
 """Tests for the shared memory-efficient logits/CE primitives.
 
 * ``TestLogitsChunkRows`` — pure sizing math; runs anywhere (CPU client ok).
+* ``TestLmHeadTemperatureLayout`` — ``temperature != 1`` keeps the incoming logits rank.
 * ``TestPerTokenLogprobParityGPU`` — real GPU kernel path (``none`` / ``compute`` /
   ``memory``). Skips without CUDA via ``@require_torch_gpu``; run via autorun on the
   GPU box. Does **not** force the torch fallback — whatever CE kernel is installed
@@ -29,6 +30,7 @@ import torch
 
 from arctic_platform.common.utils.tiled_logits import TiledLogProbEntropy
 from arctic_platform.common.utils.tiled_logits import chunked_logprobs_entropy_from_hidden
+from arctic_platform.common.utils.tiled_logits import lm_head_logits
 from arctic_platform.common.utils.tiled_logits import logits_chunk_rows
 from arctic_platform.common.utils.tiled_logits import tiled_logprobs_entropy_from_hidden
 from arctic_platform.testing_utils import TestCasePlus
@@ -48,6 +50,67 @@ class TestLogitsChunkRows(TestCasePlus):
 
     def test_scales_with_budget(self):
         self.assertEqual(logits_chunk_rows(1000, 2), 2 * logits_chunk_rows(1000, 1))
+
+
+class TestLmHeadTemperatureLayout(TestCasePlus):
+    """#1: ``temperature != 1`` must not change logits rank."""
+
+    def _model(self, hidden_size, vocab_size, device="cpu"):
+        return make_tied_lm_head_model(hidden_size, vocab_size, device=device)
+
+    def test_temperature_keeps_incoming_shape(self):
+        set_seed(0)
+        b, s, hidden_size, vocab_size = 2, 4, 8, 16
+        model = self._model(hidden_size, vocab_size)
+        hidden = torch.randn(b, s, hidden_size)
+        logits = lm_head_logits(model, hidden, temperature=0.7)
+        self.assertEqual(tuple(logits.shape), (b, s, vocab_size))
+
+    def test_n1_row_temperature_keeps_shape(self):
+        set_seed(0)
+        hidden_size, vocab_size = 8, 16
+        model = self._model(hidden_size, vocab_size)
+        hidden = torch.randn(1, hidden_size)
+        labels = torch.randint(0, vocab_size, (1,))
+        logprobs, _ = tiled_logprobs_entropy_from_hidden(
+            model, hidden, labels, temperature=0.7, calculate_entropy=False
+        )
+        self.assertEqual(tuple(logprobs.shape), tuple(labels.shape))
+
+    def test_b1_keeps_batch_axis(self):
+        set_seed(0)
+        s, hidden_size, vocab_size = 4, 8, 16
+        model = self._model(hidden_size, vocab_size)
+        hidden1 = torch.randn(1, s, hidden_size)
+        labels1 = torch.randint(0, vocab_size, (1, s))
+        hidden2 = torch.randn(2, s, hidden_size)
+        labels2 = torch.randint(0, vocab_size, (2, s))
+        lp1, _ = tiled_logprobs_entropy_from_hidden(
+            model, hidden1, labels1, temperature=1.5, calculate_entropy=False
+        )
+        lp2, _ = tiled_logprobs_entropy_from_hidden(
+            model, hidden2, labels2, temperature=1.5, calculate_entropy=False
+        )
+        self.assertEqual(tuple(lp1.shape), tuple(labels1.shape))
+        self.assertEqual(tuple(lp2.shape), tuple(labels2.shape))
+
+    def test_one_row_memory_shard_temperature(self):
+        set_seed(0)
+        n, hidden_size, vocab_size = 3, 8, 16
+        model = self._model(hidden_size, vocab_size)
+        hidden = torch.randn(n, hidden_size)
+        labels = torch.randint(0, vocab_size, (n,))
+        logprobs, _ = TiledLogProbEntropy.apply(
+            tiled_logprobs_entropy_from_hidden,
+            model,
+            hidden,
+            labels,
+            0.7,
+            False,
+            n,
+            [model.lm_head.weight],
+        )
+        self.assertEqual(tuple(logprobs.shape), tuple(labels.shape))
 
 
 @require_torch_gpu
