@@ -85,12 +85,8 @@ class TestLmHeadTemperatureLayout(TestCasePlus):
         labels1 = torch.randint(0, vocab_size, (1, s))
         hidden2 = torch.randn(2, s, hidden_size)
         labels2 = torch.randint(0, vocab_size, (2, s))
-        lp1, _ = tiled_logprobs_entropy_from_hidden(
-            model, hidden1, labels1, temperature=1.5, calculate_entropy=False
-        )
-        lp2, _ = tiled_logprobs_entropy_from_hidden(
-            model, hidden2, labels2, temperature=1.5, calculate_entropy=False
-        )
+        lp1, _ = tiled_logprobs_entropy_from_hidden(model, hidden1, labels1, temperature=1.5, calculate_entropy=False)
+        lp2, _ = tiled_logprobs_entropy_from_hidden(model, hidden2, labels2, temperature=1.5, calculate_entropy=False)
         self.assertEqual(tuple(lp1.shape), tuple(labels1.shape))
         self.assertEqual(tuple(lp2.shape), tuple(labels2.shape))
 
