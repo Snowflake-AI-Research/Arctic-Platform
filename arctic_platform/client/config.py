@@ -76,7 +76,8 @@ class CortexConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    backend: Literal["cortex"] = "cortex"
+    backend: Literal["remote"] = "remote"
+    comm_protocol: Literal["cortex"] = Field("cortex", description="remote transport protocol.")
     base_url: str | None = Field(None, description="cortex: direct/mock GS URL; bypasses PAT auth.")
     host: str | None = Field(None, description="cortex: Snowflake host for PAT auth.")
     pat: str | None = Field(None, description="cortex: PAT value passed directly; overrides pat_env_var when set.")
@@ -211,7 +212,7 @@ class ArcticRLClientConfig(BaseModel):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
-    def backend(self) -> Literal["onprem", "cortex"]:
+    def backend(self) -> Literal["onprem", "remote"]:
         return self.backend_config.backend
 
     def gpus_for(self, job_type: str) -> int:

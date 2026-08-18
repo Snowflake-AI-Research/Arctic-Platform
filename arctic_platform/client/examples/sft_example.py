@@ -13,16 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unified SFT training example across the on-prem and Cortex backends.
+"""Unified SFT training example across the on-prem and remote backends.
 
     python arctic_platform/client/examples/sft_example.py --backend onprem-http
     python arctic_platform/client/examples/sft_example.py --backend onprem-ray
-    CORTEX_PAT=... python arctic_platform/client/examples/sft_example.py --backend cortex
+    CORTEX_PAT=... python arctic_platform/client/examples/sft_example.py --backend remote-cortex
 
 Every backend follows the *same* pathway: build config -> ArcticRLClient ->
 loop(fwd_bwd + step) -> shutdown, with a single unified fwd_bwd/step/report.
 The client + transports hide all wire/protocol differences; only the config and
-the fwd_bwd batch shape differ per backend (Cortex tokenizes an RPC-style
+the fwd_bwd batch shape differ per backend (remote Cortex tokenizes an RPC-style
 {"args", "kwargs"} body; on-prem sends a pre-tokenized verl-GRPO payload).
 """
 
@@ -220,7 +220,7 @@ class Profile:
 BACKENDS: dict[str, Profile] = {
     "onprem-http": Profile(_onprem_config("http", True), _onprem_batch),
     "onprem-ray": Profile(_onprem_config("ray", False), _onprem_batch),
-    "cortex": Profile(_cortex_config(), _cortex_batch),
+    "remote-cortex": Profile(_cortex_config(), _cortex_batch),
 }
 
 
