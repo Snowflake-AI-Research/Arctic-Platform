@@ -39,6 +39,7 @@ from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from transformers import AutoTokenizer
 
+from arctic_platform._extras import require_extra
 from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
 from arctic_platform.common.ray_cluster import init_ray_cluster
 from arctic_platform.common.server import ArcticRLServerState
@@ -65,12 +66,14 @@ if TYPE_CHECKING:
 
 def _replica_pool_cls():
     """Lazy import — training-only servers do not need arctic_inference / vLLM."""
+    require_extra("rl")
     from arctic_inference.server.replica_pool import ReplicaPool
 
     return ReplicaPool
 
 
 def _transfer_schedule_cls():
+    require_extra("rl")
     from arctic_inference.server.weight_sync.schedule import TransferSchedule
 
     return TransferSchedule

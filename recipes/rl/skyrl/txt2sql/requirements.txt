@@ -25,6 +25,7 @@ arctic-platform[rl]
 # and breaks both the trainer's FA2 path and vLLM's rotary-embedding import.
 flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; python_version == "3.12" and platform_machine == "x86_64"
 liger-kernel
+loguru  # imported by ./arctic_rl/entrypoint.py
 
 # Ray must match across the cluster (relevant for the >1-node variants of
 # this recipe). SkyRL pins this exact version.

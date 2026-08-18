@@ -24,6 +24,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from arctic_platform._extras import require_extra
+
+require_extra("sft", "rl")
+
 __all__ = [
     "DeepSpeedWorker",
     "init_ray_cluster",

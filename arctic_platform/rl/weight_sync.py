@@ -32,10 +32,15 @@ from typing import Any
 from typing import Iterable
 
 import torch
-from arctic_inference.server.weight_sync.schedule import TransferSchedule
-from arctic_inference.server.weight_sync.sender import WeightSender
 
-from arctic_platform.rl.config import WeightSyncConfig
+from arctic_platform._extras import require_extra
+
+require_extra("rl")
+
+from arctic_inference.server.weight_sync.schedule import TransferSchedule  # noqa: E402
+from arctic_inference.server.weight_sync.sender import WeightSender  # noqa: E402
+
+from arctic_platform.rl.config import WeightSyncConfig  # noqa: E402
 
 if TYPE_CHECKING:
     from arctic_platform.rl.client import ArcticRLClient

@@ -27,6 +27,7 @@ from typing import Any
 from typing import Literal
 from typing import overload
 
+from arctic_platform._extras import require_extra
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
@@ -36,10 +37,12 @@ from arctic_platform.client.transport import initialize_or_cleanup
 
 def make_transport(config: ArcticRLClientConfig, server_state: Any = None) -> Transport:
     if config.backend == "cortex":
+        require_extra("cortex")
         from arctic_platform.client.transports.cortex import CortexTransport
 
         return CortexTransport(config)
 
+    require_extra("sft", "rl")
     from arctic_platform.client.transports.onprem_http import HttpTransport
     from arctic_platform.client.transports.onprem_ray import RayTransport
 
