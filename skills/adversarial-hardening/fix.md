@@ -25,7 +25,7 @@ On this clone, run **`make format`**. Do not call the group ready until it has b
 
 `make format` does not call GitHub. `pre-commit` only does if hook repos are missing from `~/.cache/pre-commit`, or if `url.*.insteadOf` rewrites `https://github.com/` to SSH so the cache key misses. Check with `git config --show-origin --get-regexp 'url\..*insteadof'`.
 
-**Do not edit the operator’s `~/.gitconfig`.** This agent’s `HOME` may be `/home/yak` on a **different node** than the operator. Their config is not this file.
+**Do not edit the operator’s `~/.gitconfig`.**
 
 If `insteadOf` is set on **this** agent HOME, override it for the format command only — do not rewrite SSH remotes in a clone’s `.git/config`:
 

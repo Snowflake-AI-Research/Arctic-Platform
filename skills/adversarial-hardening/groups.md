@@ -38,18 +38,18 @@ User: <resolved prefix, see below>
 - Files (expected): <paths this PR may touch>
 - Why bundled: single issue | same contract | same hunk/block
 - Branch: <user>/adversarial-<slug>
-- Clone: <sibling directory name, not a hardcoded machine path>
+- Clone: sibling of the probe checkout (`<probe-basename>-<slug>`), never a hardcoded name or absolute path
 - Status: planned
 ```
 
 A bundled group lists every `#N` (`Issues: #4, #9`). Never refer to an issue by title alone once numbers exist.
 
-## 2. User prefix (not `yak`)
+## 2. User prefix
 
-Do **not** use `$USER` when it is `yak` (shared account).
+Do **not** use `$USER`.
 
-1. If `$OWNER` is set (k8s), take the part before `@`, then the first dotted word: `stas.bekman@snowflake.com` → `stas`.
-2. Else ask. Do not guess `stas` from chat history.
+1. If `$OWNER` is set (k8s), take the part before `@`, then the first dotted word: `foo.bar@snowflake.com` → `foo`.
+2. Else ask. Do not guess from chat history.
 
 ## 3. Clone and branch (one per group)
 
@@ -57,7 +57,7 @@ Leave the probe checkout on its current branch. **Never** `git checkout main` th
 
 For each group, in order:
 
-1. Resolve the probe checkout (`git rev-parse --show-toplevel`). Parent = that directory’s parent. Sibling = `<parent>/<probe-basename>-<slug>` (or another sibling name you record in `PROBE_GROUPS.md`). Origin URL is **`git config --get remote.origin.url`** — the stored value, which is HTTPS. Do **not** use `git remote get-url` (it applies `url.*.insteadof` and turns HTTPS into SSH). **`git clone --branch main <that-https-url> <sibling>`** — no `--single-branch` (that rewrites `fetch` to only `main`). Do not `git remote set-url` after clone. Do not `cp -a`. If GitHub is unreachable, `git clone --branch main <another-local-checkout-already-on-main> <sibling>`, then copy that checkout’s `[remote "origin"]` `url` and `fetch` lines into the new clone’s `.git/config` (HTTPS + `+refs/heads/*:refs/remotes/origin/*`). Do not invent an SSH URL. Uncommitted probe files stay on the probe checkout.
+1. Resolve the probe checkout (`git rev-parse --show-toplevel`). Parent = that directory’s parent. Sibling = `<parent>/<probe-basename>-<slug>` (or another name next to that checkout, recorded in `PROBE_GROUPS.md`). Never hardcode a clone folder or an absolute tree. Origin URL is **`git config --get remote.origin.url`** — the stored value, which is HTTPS. Do **not** use `git remote get-url` (it applies `url.*.insteadof` and turns HTTPS into SSH). **`git clone --branch main <that-https-url> <sibling>`** — no `--single-branch` (that rewrites `fetch` to only `main`). Do not `git remote set-url` after clone. Do not `cp -a`. If GitHub is unreachable, `git clone --branch main <another-local-checkout-already-on-main> <sibling>`, then copy that checkout’s `[remote "origin"]` `url` and `fetch` lines into the new clone’s `.git/config` (HTTPS + `+refs/heads/*:refs/remotes/origin/*`). Do not invent an SSH URL. Uncommitted probe files stay on the probe checkout.
 2. In the **copy only**: create and switch to `<user>/adversarial-<slug>` **from that clone’s `main` / `origin/main`** (not from the probe branch). Do not edit remotes.
 3. Write `PR_DESCRIPTION.md` at that copy’s root. First line is the title: `[bug fix] <short description of the bug>` — description under 119 characters, then `## Summary` / `## Testing`. Keep it current for **this** group’s work only.
 4. Present this group in chat (section 4), then Repro then Fix, then run tests (below). **One group at a time.** Do not present or start the next group until this one’s repro tests exist and its fix work is done or handed back. Parallel clone *directories* are fine when planned hunks do not overlap (same file is OK); do not run two groups’ Repro+Fix in the same turn.
