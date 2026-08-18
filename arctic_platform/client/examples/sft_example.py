@@ -68,7 +68,7 @@ def _metric(x) -> float:
 
 
 # ── per-backend: config ──────────────────────────────────────────────────────
-def _onprem_config(comm_protocol: str, launch_local_server: bool) -> Callable:
+def _onprem_config(protocol: str, launch_local_server: bool) -> Callable:
     def build(stack: contextlib.ExitStack) -> ArcticRLClientConfig:
         ckpt = stack.enter_context(tempfile.TemporaryDirectory(prefix="arl_onprem_ckpt_"))
         return ArcticRLClientConfig(
@@ -77,8 +77,8 @@ def _onprem_config(comm_protocol: str, launch_local_server: bool) -> Callable:
             max_seq_len=SEQ_LEN,
             training_gpus=N_GPUS,
             job_ready_timeout=600.0,
-            backend_config=OnPremConfig(
-                comm_protocol=comm_protocol,
+            backend=OnPremConfig(
+                protocol=protocol,
                 launch_local_server=launch_local_server,
             ),
             training=TrainingConfig(
@@ -120,7 +120,7 @@ def _cortex_config() -> Callable:
             max_seq_len=SEQ_LEN,
             training_gpus=N_GPUS,
             job_ready_timeout=3600.0,
-            backend_config=CortexConfig(
+            backend=CortexConfig(
                 host=CORTEX_HOST,
                 database=CORTEX_DATABASE,
                 schema=CORTEX_SCHEMA,

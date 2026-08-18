@@ -50,7 +50,7 @@ def test_launch_server_reraises_exit_code_and_reaps_orphan(monkeypatch):
         training_gpus=1,
         sampling_gpus=0,
         log_prob_gpus=0,
-        backend_config=SimpleNamespace(
+        backend=SimpleNamespace(
             port=_PORT,
             colocate=False,
             server_cuda_visible_devices=None,
