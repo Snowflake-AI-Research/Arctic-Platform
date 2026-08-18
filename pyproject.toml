@@ -92,6 +92,7 @@ formatting = [
 # wire format; tenacity and urllib3 are used only by the cortex transport.
 cortex = [
     "aiohttp",
+    "numpy",
     "requests",
     "safetensors",
     "tenacity",
