@@ -192,9 +192,7 @@ class TestPatchPipeline:
 
 class TestFromDsWorkerConfig:
     def test_defaults_preserve_worker_behavior(self):
-        spec = ModelSpec.from_ds_worker_config(
-            "Qwen/Qwen3-1.7B", {"attn_implementation": "flash_attention_2"}
-        )
+        spec = ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {"attn_implementation": "flash_attention_2"})
 
         assert spec.model_path_or_name == "Qwen/Qwen3-1.7B"
         assert spec.dtype == "bfloat16"
@@ -345,6 +343,4 @@ class TestZorroAndGcPatches:
         model = nn.Identity()
         model.config = types.SimpleNamespace(model_type="llama")
         with pytest.raises(ValueError, match="Unsupported model_type=llama"):
-            apply_zorro_train(
-                model, _ctx(zorro_train=ZorroTrainPatch(response_len=1024, rollout_n=8, world_size=1))
-            )
+            apply_zorro_train(model, _ctx(zorro_train=ZorroTrainPatch(response_len=1024, rollout_n=8, world_size=1)))

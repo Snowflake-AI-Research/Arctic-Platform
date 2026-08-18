@@ -90,8 +90,7 @@ class ModelSpec(BaseModel):
         # implementation; do not invent a second default here (ModelSpec leaves it None).
         if "attn_implementation" not in cfg or cfg["attn_implementation"] is None:
             raise ValueError(
-                "from_ds_worker_config requires attn_implementation "
-                "(ZoRRo Train needs a flash-attention backend)."
+                "from_ds_worker_config requires attn_implementation (ZoRRo Train needs a flash-attention backend)."
             )
 
         zorro_train_patch = None

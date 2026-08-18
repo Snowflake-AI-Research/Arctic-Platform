@@ -24,14 +24,19 @@ from arctic_platform.model.patch import register_patch
 
 @register_patch("zorro_train")
 def apply_zorro_train(model: nn.Module, ctx: LoaderContext) -> None:
-    # Lazy: keep `import arctic_platform.model` free of RL deps.
-    from arctic_platform.rl.zorro_train.qwen_model_patcher import Qwen3ModelOncePatcher
-    from arctic_platform.rl.zorro_train.qwen_model_patcher import get_supported_model_type
+    # Lazy via importlib: keep `import arctic_platform.model` free of RL deps, and
+    # avoid mypy following into arctic_platform.rl (not in the model/ typecheck set).
+    import importlib
+
+    zorro_mod = importlib.import_module("arctic_platform.rl.zorro_train.qwen_model_patcher")
+    Qwen3ModelOncePatcher = zorro_mod.Qwen3ModelOncePatcher
+    get_supported_model_type = zorro_mod.get_supported_model_type
 
     # Fail fast: ZoRRo Train only supports Qwen3-family model_type values.
     get_supported_model_type(model)
 
     settings = ctx.spec.patches.zorro_train
+    assert settings is not None, "zorro_train patch applied with patches.zorro_train=None"
 
     patcher = Qwen3ModelOncePatcher(
         model,
