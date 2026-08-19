@@ -1,0 +1,456 @@
+{
+  "profiles": [
+    {
+      "id": "dense-sft-lora-2gpu",
+      "workflow": "sft",
+      "tuningMethod": "lora",
+      "summary": "LoRA SFT starting point for compact dense models.",
+      "lastValidated": "2026-08-19",
+      "recipePath": "cortex-client/recipes/sft_loop.py",
+      "evidencePaths": [
+        "cortex-client/recipes/sft_loop.py"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.00002,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.999],
+              "eps": 1e-8
+            },
+            "max_seq_len": 2048,
+            "train_batch_size": 2,
+            "n_gpus": 2,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "attn_implementation": "flash_attention_3",
+              "activation_checkpointing": true,
+              "peft_config": {
+                "peft_type": "Lora",
+                "r": 32,
+                "lora_alpha": 32,
+                "lora_dropout": 0.0,
+                "bias": "none",
+                "target_modules": [
+                  "q_proj",
+                  "k_proj",
+                  "v_proj",
+                  "o_proj",
+                  "gate_proj",
+                  "up_proj",
+                  "down_proj"
+                ]
+              },
+              "ds_config": {
+                "train_batch_size": 2,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 2
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "dense-sft-full-2gpu",
+      "workflow": "sft",
+      "tuningMethod": "full",
+      "summary": "Full-parameter SFT starting point for compact dense models.",
+      "lastValidated": "2026-08-19",
+      "recipePath": "cortex-client/recipes/sft_loop.py",
+      "evidencePaths": [
+        "cortex-client/recipes/sft_loop.py"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.00002,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.999],
+              "eps": 1e-8
+            },
+            "max_seq_len": 2048,
+            "train_batch_size": 2,
+            "n_gpus": 2,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "attn_implementation": "flash_attention_3",
+              "activation_checkpointing": true,
+              "ds_config": {
+                "train_batch_size": 2,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 3
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "dense-sft-lora-4gpu",
+      "workflow": "sft",
+      "tuningMethod": "lora",
+      "summary": "LoRA SFT starting point for small and medium dense models.",
+      "lastValidated": "2026-08-19",
+      "recipePath": "cortex-client/recipes/sft_loop.py",
+      "evidencePaths": [
+        "cortex-client/recipes/sft_loop.py"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.00002,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.999],
+              "eps": 1e-8
+            },
+            "max_seq_len": 2048,
+            "train_batch_size": 4,
+            "n_gpus": 4,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "attn_implementation": "flash_attention_3",
+              "activation_checkpointing": true,
+              "peft_config": {
+                "peft_type": "Lora",
+                "r": 32,
+                "lora_alpha": 32,
+                "lora_dropout": 0.0,
+                "bias": "none",
+                "target_modules": [
+                  "q_proj",
+                  "k_proj",
+                  "v_proj",
+                  "o_proj",
+                  "gate_proj",
+                  "up_proj",
+                  "down_proj"
+                ]
+              },
+              "ds_config": {
+                "train_batch_size": 4,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 2
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "dense-sft-full-4gpu",
+      "workflow": "sft",
+      "tuningMethod": "full",
+      "summary": "Full-parameter SFT starting point for small and medium dense models.",
+      "lastValidated": "2026-08-19",
+      "recipePath": "cortex-client/recipes/sft_loop.py",
+      "evidencePaths": [
+        "cortex-client/recipes/sft_loop.py"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.00002,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.999],
+              "eps": 1e-8
+            },
+            "max_seq_len": 2048,
+            "train_batch_size": 4,
+            "n_gpus": 4,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "attn_implementation": "flash_attention_3",
+              "activation_checkpointing": true,
+              "ds_config": {
+                "train_batch_size": 4,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 3
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "dense-sft-lora-8gpu",
+      "workflow": "sft",
+      "tuningMethod": "lora",
+      "summary": "LoRA SFT starting point for larger dense models.",
+      "lastValidated": "2026-08-19",
+      "recipePath": "cortex-client/recipes/sft_loop.py",
+      "evidencePaths": [
+        "cortex-client/recipes/sft_loop.py"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.00002,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.999],
+              "eps": 1e-8
+            },
+            "max_seq_len": 2048,
+            "train_batch_size": 8,
+            "n_gpus": 8,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "attn_implementation": "flash_attention_3",
+              "activation_checkpointing": true,
+              "peft_config": {
+                "peft_type": "Lora",
+                "r": 32,
+                "lora_alpha": 32,
+                "lora_dropout": 0.0,
+                "bias": "none",
+                "target_modules": [
+                  "q_proj",
+                  "k_proj",
+                  "v_proj",
+                  "o_proj",
+                  "gate_proj",
+                  "up_proj",
+                  "down_proj"
+                ]
+              },
+              "ds_config": {
+                "train_batch_size": 8,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 2
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "dense-sft-full-8gpu",
+      "workflow": "sft",
+      "tuningMethod": "full",
+      "summary": "Full-parameter SFT starting point for larger dense models.",
+      "lastValidated": "2026-08-19",
+      "recipePath": "cortex-client/recipes/sft_loop.py",
+      "evidencePaths": [
+        "cortex-client/recipes/sft_loop.py"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.00002,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.999],
+              "eps": 1e-8
+            },
+            "max_seq_len": 2048,
+            "train_batch_size": 8,
+            "n_gpus": 8,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "attn_implementation": "flash_attention_3",
+              "activation_checkpointing": true,
+              "ds_config": {
+                "train_batch_size": 8,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 3
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "moe-sft-lora-8gpu",
+      "workflow": "sft",
+      "tuningMethod": "lora",
+      "summary": "LoRA SFT starting point for the supported Qwen MoE model.",
+      "lastValidated": "2026-08-19",
+      "recipePath": "cortex-client/recipes/sft_loop.py",
+      "evidencePaths": [
+        "cortex-client/recipes/sft_loop.py"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.00002,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.999],
+              "eps": 1e-8
+            },
+            "max_seq_len": 2048,
+            "train_batch_size": 8,
+            "n_gpus": 8,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "attn_implementation": "flash_attention_3",
+              "activation_checkpointing": true,
+              "peft_config": {
+                "peft_type": "Lora",
+                "r": 32,
+                "lora_alpha": 32,
+                "lora_dropout": 0.0,
+                "bias": "none",
+                "target_modules": [
+                  "q_proj",
+                  "k_proj",
+                  "v_proj",
+                  "o_proj",
+                  "gate_proj",
+                  "up_proj",
+                  "down_proj"
+                ]
+              },
+              "ds_config": {
+                "train_batch_size": 8,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 2
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "moe-sft-full-8gpu",
+      "workflow": "sft",
+      "tuningMethod": "full",
+      "summary": "Prime-RL expert-parallel SFT starting point for the supported Qwen MoE model.",
+      "lastValidated": "2026-08-19",
+      "recipePath": "cortex-client/recipes/sft_loop.py",
+      "evidencePaths": [
+        "cortex-client/examples/training.json"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.0001,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.999],
+              "eps": 1e-8
+            },
+            "max_seq_len": 2048,
+            "train_batch_size": 8,
+            "n_gpus": 8,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "model_provider": "prime_rl",
+              "attn_implementation": "flash_attention_3",
+              "attn_impl": "flash_attention_3",
+              "ep_size": 4,
+              "ac_config": {
+                "mode": "full",
+                "freq": 1
+              },
+              "mb_spec": {
+                "max_tokens_per_mb": 10240
+              },
+              "prime_rl": {
+                "seq_len": 2048,
+                "ep_comm_backend": "deepep",
+                "optimization_dtype": "bfloat16",
+                "reduce_dtype": "float32",
+                "moe_use_grouped_mm": true,
+                "fused_lm_head_token_chunk_size": "disabled",
+                "fp32_lm_head": false,
+                "fused_cross_entropy": "liger"
+              },
+              "ds_config": {
+                "train_batch_size": 8,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 1,
+                  "reduce_scatter": true
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

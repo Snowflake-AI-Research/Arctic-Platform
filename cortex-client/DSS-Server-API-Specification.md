@@ -66,21 +66,17 @@ is `log_prob`.
   Poll the request until it reaches a terminal state.
 - Some generic operations are synchronous and return their result directly.
 
-### 1.4 Model cache
+### 1.4 Supported models
 
-The following models are currently in the model cache:
+The machine-readable source of truth for model availability, workflow support,
+context limits, and recommended starting configurations is
+[`configs/cortex-training/models.json`](configs/cortex-training/models.json).
+Profiles referenced by that catalog live under
+[`configs/cortex-training/profiles/`](configs/cortex-training/profiles/).
 
-| Model | Training | Inference |
-|---|:---:|:---:|
-| `Qwen/Qwen3-0.6B` | ✅ | ✅ |
-| `Qwen/Qwen3-1.7B` | ✅ | ✅ |
-| `Qwen/Qwen3-8B` | ✅ | ✅ |
-| `Qwen/Qwen3.5-4B` | ✅ | ✅ |
-| `Qwen/Qwen3.6-35B-A3B` | ✅ | ✅ |
-| `deepseek-ai/DeepSeek-V4-Flash-0731` |  | ✅ |
-| `openai/gpt-oss-120b` |  | ✅ |
-| `zai-org/GLM-5.2` | coming soon | ✅ |
-| `zai-org/GLM-5.2-FP8` | coming soon | ✅ |
+This API specification intentionally does not duplicate the model table. Run
+`python scripts/validate_model_catalog.py` after changing the catalog or a
+profile.
 
 ---
 
