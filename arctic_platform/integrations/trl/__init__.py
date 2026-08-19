@@ -27,17 +27,58 @@ a constructor argument::
         model=model,
         ...,
         training_client=ArcticTrainingClient(client),
+        rollout_worker=ArcticRolloutWorker(client, dataset, reward_funcs, tokenizer),
+        weight_transfer=ArcticWeightTransfer(client),
         optimizers=(ArcticOptimizer(client, model.parameters()), scheduler),
     )
 
-Importing this package registers ``weighted_logprob_sum`` in ``LOSS_FNS``, which is the only server-side
-addition the integration needs.
+The server registers ``weighted_logprob_sum`` in ``LOSS_FNS`` when it resolves the dotted-path loss name
+``arctic_platform.integrations.trl.loss.weighted_logprob_sum`` (importing the ``loss`` submodule runs its
+``@register_loss_fn`` decorator). That is the only server-side addition the integration needs.
+
+``ArcticRolloutWorker``, ``ArcticWeightTransfer`` and ``weighted_logprob_sum`` are exposed lazily (PEP 562).
+The first two pull in TRL's ``async_grpo`` stack (aiohttp, datasets, ...); ``weighted_logprob_sum`` lives in
+``loss``, which imports the server-side ``pipeline`` (and transitively ``deepspeed``). The CPU-only TRL client
+imports only ``client`` / ``rollout`` / ``weights`` and passes the loss by dotted-path name, so keeping the
+loss import lazy stops ``deepspeed`` from being dragged into the client process. Accessing any of these names
+imports the owning submodule on demand.
 
 See ``README.md`` for the design rationale and the open items.
 """
 
+from typing import TYPE_CHECKING
+
 from arctic_platform.integrations.trl.client import ArcticOptimizer
 from arctic_platform.integrations.trl.client import ArcticTrainingClient
-from arctic_platform.integrations.trl.loss import weighted_logprob_sum
 
-__all__ = ["ArcticOptimizer", "ArcticTrainingClient", "weighted_logprob_sum"]
+if TYPE_CHECKING:
+    from arctic_platform.integrations.trl.loss import weighted_logprob_sum
+    from arctic_platform.integrations.trl.rollout import ArcticRolloutWorker
+    from arctic_platform.integrations.trl.weights import ArcticWeightTransfer
+
+__all__ = [
+    "ArcticOptimizer",
+    "ArcticTrainingClient",
+    "ArcticRolloutWorker",
+    "ArcticWeightTransfer",
+    "weighted_logprob_sum",
+]
+
+
+def __getattr__(name: str):
+    # Lazy imports (PEP 562). `rollout`/`weights` pull in the async_grpo stack; `loss` pulls in the server-side
+    # `pipeline` (and transitively `deepspeed`). The CPU-only client touches none of these, so importing this
+    # package stays free of both dependency stacks until a name is actually accessed.
+    if name == "ArcticRolloutWorker":
+        from arctic_platform.integrations.trl.rollout import ArcticRolloutWorker
+
+        return ArcticRolloutWorker
+    if name == "ArcticWeightTransfer":
+        from arctic_platform.integrations.trl.weights import ArcticWeightTransfer
+
+        return ArcticWeightTransfer
+    if name == "weighted_logprob_sum":
+        from arctic_platform.integrations.trl.loss import weighted_logprob_sum
+
+        return weighted_logprob_sum
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
