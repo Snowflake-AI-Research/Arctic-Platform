@@ -66,5 +66,5 @@ class TestArcticSFTClientConfig(TestCasePlus):
         )
         rl = cfg.to_rl_config()
         self.assertEqual(rl.sampling_gpus, 1)
-        self.assertTrue(rl.backend_config.colocate)
+        self.assertTrue(rl.backend.colocate)
         self.assertEqual(rl.sampling.vllm["tensor_parallel_size"], 1)

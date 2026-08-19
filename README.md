@@ -102,11 +102,16 @@ To get started training a model with Arctic Platform, first [install the package
 
 ## From PyPI
 
-Install the latest released version and its dependencies from [PyPI](https://pypi.org/project/arctic-platform/):
+The base install carries the config models only. Pick the extra for the backend you are training against, from [PyPI](https://pypi.org/project/arctic-platform/):
 
 ```shell
-pip install arctic-platform
+pip install "arctic-platform[cortex]"   # drive Cortex training over SnowAPI
+pip install "arctic-platform[sft]"      # run a local training-only server
+pip install "arctic-platform[rl]"       # ...plus the sampling stack (arctic-inference, vLLM)
+pip install "arctic-platform[verl]"     # the verl adapter
 ```
+
+`[cortex]` is by far the lightest: it skips DeepSpeed, transformers, Ray and vLLM entirely. Importing on-prem code without the matching extra raises an error naming the one to install.
 
 While this project is being very actively developed it's probably better to install directly from [git](#from-source-git).
 
@@ -117,7 +122,7 @@ To get the latest development version (or to contribute), clone the repository a
 ```shell
 git clone https://github.com/Snowflake-AI-Research/Arctic-Platform.git
 cd Arctic-Platform
-pip install -e .[rl]
+pip install -e ".[rl]"
 ```
 
 # Use of AI Disclaimer

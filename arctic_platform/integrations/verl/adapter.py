@@ -589,7 +589,7 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         protocol = self._backend_config.comms.protocol
         onprem_kwargs: dict[str, Any] = {
-            "comm_protocol": protocol,
+            "protocol": protocol,
             "colocate": colocate,
         }
         # host/port only matter for the HTTP transport; the in-process Ray path
@@ -612,7 +612,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             training_gpus=n_training_gpus,
             sampling_gpus=n_sampling_gpus,
             log_prob_gpus=n_log_prob_gpus,
-            backend_config=OnPremConfig(**onprem_kwargs),
+            backend=OnPremConfig(**onprem_kwargs),
             training=TrainingConfig(
                 full_determinism=self._backend_config.train.determinism.get("full", False),
                 checkpoint_path=self.config.trainer.default_local_dir,
