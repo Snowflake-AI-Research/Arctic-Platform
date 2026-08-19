@@ -35,7 +35,8 @@ from arctic_platform.client.transport import initialize_or_cleanup
 
 
 def make_transport(config: ArcticRLClientConfig, server_state: Any = None) -> Transport:
-    if config.backend == "cortex":
+    protocol = config.backend.protocol
+    if config.backend.type == "remote":
         from arctic_platform.client.transports.cortex import CortexTransport
 
         return CortexTransport(config)
@@ -43,11 +44,11 @@ def make_transport(config: ArcticRLClientConfig, server_state: Any = None) -> Tr
     from arctic_platform.client.transports.onprem_http import HttpTransport
     from arctic_platform.client.transports.onprem_ray import RayTransport
 
-    if config.backend == "onprem" and config.backend_config.comm_protocol == "ray":
+    if protocol == "ray":
         return RayTransport(config, server_state=server_state)
     if server_state is not None:
         raise ValueError("server_state reconnect is only supported by the in-process Ray transport.")
-    return HttpTransport(config)  # onprem (HTTP)
+    return HttpTransport(config)
 
 
 # ── Request builders (op vocabulary defined once) ───────────────────────────

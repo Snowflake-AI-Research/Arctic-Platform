@@ -133,9 +133,9 @@ class ArcticSFTClientConfig(BaseModel):
                 low_memory=self.low_memory,
             ),
             sampling=SamplingConfig(vllm=dict(self.vllm_config or {})),
-            backend_config=OnPremConfig(
-                backend=self.backend,
-                comm_protocol=self.comm_protocol,
+            backend=OnPremConfig(
+                type=self.backend,
+                protocol=self.comm_protocol,
                 host=self.host,
                 port=self.port,
                 colocate=self.colocate,
