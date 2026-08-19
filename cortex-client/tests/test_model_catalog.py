@@ -43,7 +43,9 @@ def test_duplicate_model_id_is_rejected():
 
 def test_missing_recommended_profile_is_rejected():
     models_doc, profiles = load_catalog(CONFIG_DIR)
-    models_doc["models"][0]["capabilities"]["inference"]["recommendedProfileId"] = "missing"
+    models_doc["models"][0]["capabilities"]["inference"]["recommendedProfileId"] = (
+        "missing"
+    )
 
     with pytest.raises(CatalogValidationError, match="unknown profile missing"):
         validate_catalog(models_doc, profiles, REPO_ROOT)
@@ -60,8 +62,13 @@ def test_profile_context_cannot_exceed_capability_limit():
 
 def test_unsupported_capability_cannot_carry_configuration():
     models_doc, profiles = load_catalog(CONFIG_DIR)
-    capability = models_doc["models"][-1]["capabilities"]["sftFull"]
-    capability["recommendedProfileId"] = "dense-sft-full-8gpu"
+    capability = models_doc["models"][-1]["capabilities"]["training"]
+    capability["profiles"] = copy.deepcopy(
+        models_doc["models"][0]["capabilities"]["training"]["profiles"]
+    )
 
-    with pytest.raises(CatalogValidationError, match="unsupported capabilities cannot define"):
+    with pytest.raises(
+        CatalogValidationError,
+        match="unsupported capabilities cannot define profiles",
+    ):
         validate_catalog(models_doc, profiles, REPO_ROOT)

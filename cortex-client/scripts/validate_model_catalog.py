@@ -14,7 +14,8 @@ from typing import Any
 CLIENT_ROOT = Path(__file__).resolve().parents[1]
 
 
-CAPABILITY_KEYS = ("inference", "sftLora", "sftFull", "rlLora", "rlFull")
+CAPABILITY_KEYS = ("inference", "training")
+TRAINING_PROFILE_KEYS = ("sftLora", "sftFull", "rlLora", "rlFull")
 CAPABILITY_PROFILE_TYPES = {
     "inference": ("inference", "none"),
     "sftLora": ("sft", "lora"),
@@ -48,7 +49,9 @@ def _load_builder_signatures(client_root: Path) -> dict[str, tuple[set[str], set
             allowed = {argument.arg for argument in member.args.kwonlyargs}
             required = {
                 argument.arg
-                for argument, default in zip(member.args.kwonlyargs, member.args.kw_defaults)
+                for argument, default in zip(
+                    member.args.kwonlyargs, member.args.kw_defaults
+                )
                 if default is None
             }
             signatures[member.name] = (allowed, required)
@@ -111,16 +114,26 @@ def _validate_profile_shape(profile: dict[str, Any], repo_root: Path) -> None:
     workflow = profile.get("workflow")
     tuning_method = profile.get("tuningMethod")
     if workflow not in {"inference", "sft", "rl"}:
-        raise CatalogValidationError(f"profile {profile_id}: invalid workflow {workflow!r}")
+        raise CatalogValidationError(
+            f"profile {profile_id}: invalid workflow {workflow!r}"
+        )
     if tuning_method not in {"none", "lora", "full"}:
-        raise CatalogValidationError(f"profile {profile_id}: invalid tuningMethod {tuning_method!r}")
+        raise CatalogValidationError(
+            f"profile {profile_id}: invalid tuningMethod {tuning_method!r}"
+        )
     if workflow == "inference" and tuning_method != "none":
-        raise CatalogValidationError(f"profile {profile_id}: inference must use tuningMethod 'none'")
+        raise CatalogValidationError(
+            f"profile {profile_id}: inference must use tuningMethod 'none'"
+        )
     if workflow != "inference" and tuning_method == "none":
-        raise CatalogValidationError(f"profile {profile_id}: training workflow requires lora or full")
+        raise CatalogValidationError(
+            f"profile {profile_id}: training workflow requires lora or full"
+        )
 
     _require_string(profile.get("summary"), f"profile {profile_id}.summary")
-    validated = _require_string(profile.get("lastValidated"), f"profile {profile_id}.lastValidated")
+    validated = _require_string(
+        profile.get("lastValidated"), f"profile {profile_id}.lastValidated"
+    )
     try:
         date.fromisoformat(validated)
     except ValueError as exc:
@@ -130,28 +143,42 @@ def _validate_profile_shape(profile: dict[str, Any], repo_root: Path) -> None:
 
     evidence_paths = profile.get("evidencePaths")
     if not isinstance(evidence_paths, list) or not evidence_paths:
-        raise CatalogValidationError(f"profile {profile_id}.evidencePaths must be a non-empty array")
+        raise CatalogValidationError(
+            f"profile {profile_id}.evidencePaths must be a non-empty array"
+        )
     for index, relative_path in enumerate(evidence_paths):
-        value = _require_string(relative_path, f"profile {profile_id}.evidencePaths[{index}]")
+        value = _require_string(
+            relative_path, f"profile {profile_id}.evidencePaths[{index}]"
+        )
         if not (repo_root / value).is_file():
-            raise CatalogValidationError(f"profile {profile_id}: evidence path does not exist: {value}")
+            raise CatalogValidationError(
+                f"profile {profile_id}: evidence path does not exist: {value}"
+            )
 
     recipe_path = profile.get("recipePath")
     if recipe_path is not None:
         recipe = _require_string(recipe_path, f"profile {profile_id}.recipePath")
         if not (repo_root / recipe).is_file():
-            raise CatalogValidationError(f"profile {profile_id}: recipe path does not exist: {recipe}")
+            raise CatalogValidationError(
+                f"profile {profile_id}: recipe path does not exist: {recipe}"
+            )
 
     sub_jobs = profile.get("subJobs")
     if not isinstance(sub_jobs, list) or not sub_jobs:
-        raise CatalogValidationError(f"profile {profile_id}.subJobs must be a non-empty array")
+        raise CatalogValidationError(
+            f"profile {profile_id}.subJobs must be a non-empty array"
+        )
     builders: list[str] = []
     for index, sub_job in enumerate(sub_jobs):
         item = _require_dict(sub_job, f"profile {profile_id}.subJobs[{index}]")
         builder = item.get("builder")
         if builder not in PROFILE_BUILDERS:
-            raise CatalogValidationError(f"profile {profile_id}: invalid builder {builder!r}")
-        args = _require_dict(item.get("args"), f"profile {profile_id}.subJobs[{index}].args")
+            raise CatalogValidationError(
+                f"profile {profile_id}: invalid builder {builder!r}"
+            )
+        args = _require_dict(
+            item.get("args"), f"profile {profile_id}.subJobs[{index}].args"
+        )
         if "model_name" in args:
             raise CatalogValidationError(
                 f"profile {profile_id}: model_name is injected from the model and must not appear in args"
@@ -174,9 +201,82 @@ def _validate_profile_shape(profile: dict[str, Any], repo_root: Path) -> None:
         extra = args.get("extra_training") or args.get("extra_sampling") or {}
         has_peft.append("peft_config" in extra)
     if tuning_method == "lora" and not all(has_peft):
-        raise CatalogValidationError(f"profile {profile_id}: LoRA profiles require peft_config on every sub-job")
+        raise CatalogValidationError(
+            f"profile {profile_id}: LoRA profiles require peft_config on every sub-job"
+        )
     if tuning_method == "full" and any(has_peft):
-        raise CatalogValidationError(f"profile {profile_id}: full profiles must not define peft_config")
+        raise CatalogValidationError(
+            f"profile {profile_id}: full profiles must not define peft_config"
+        )
+
+
+def _validate_profile_reference(
+    *,
+    model_id: str,
+    profile_key: str,
+    recommendation: dict[str, Any],
+    profile_by_id: dict[str, dict[str, Any]],
+    builder_signatures: dict[str, tuple[set[str], set[str]]],
+) -> str:
+    max_context = _require_positive_int(
+        recommendation.get("maxContextTokens"),
+        f"model {model_id}.{profile_key}.maxContextTokens",
+    )
+    profile_id = _require_string(
+        recommendation.get("recommendedProfileId"),
+        f"model {model_id}.{profile_key}.recommendedProfileId",
+    )
+    profile = profile_by_id.get(profile_id)
+    if profile is None:
+        raise CatalogValidationError(
+            f"model {model_id}.{profile_key}: unknown profile {profile_id}"
+        )
+    expected_workflow, expected_tuning = CAPABILITY_PROFILE_TYPES[profile_key]
+    if (profile["workflow"], profile["tuningMethod"]) != (
+        expected_workflow,
+        expected_tuning,
+    ):
+        raise CatalogValidationError(
+            f"model {model_id}.{profile_key}: profile {profile_id} has incompatible "
+            f"workflow/tuningMethod"
+        )
+
+    for sub_job in profile["subJobs"]:
+        args = copy.deepcopy(sub_job["args"])
+        builder = sub_job["builder"]
+        profile_max_seq_len = _require_positive_int(
+            args.get("max_seq_len"),
+            f"profile {profile_id}.{builder}.max_seq_len",
+        )
+        if profile_max_seq_len > max_context:
+            raise CatalogValidationError(
+                f"model {model_id}.{profile_key}: profile {profile_id} max_seq_len "
+                f"{profile_max_seq_len} exceeds max context {max_context}"
+            )
+
+        allowed, required = builder_signatures[builder]
+        unexpected = sorted(set(args) - allowed)
+        missing = sorted(required - set(args))
+        if unexpected or missing:
+            raise CatalogValidationError(
+                f"model {model_id}.{profile_key}: profile {profile_id} does not match "
+                f"SubJobConfig.{builder}; unexpected={unexpected}, missing={missing}"
+            )
+        _require_positive_int(
+            args.get("n_gpus"),
+            f"profile {profile_id}.{builder}.n_gpus",
+        )
+        if builder == "training_job":
+            optimizer = args.get("optimizer")
+            if not isinstance(optimizer, dict) or not optimizer:
+                raise CatalogValidationError(
+                    f"profile {profile_id}.training_job.optimizer must be a non-empty object"
+                )
+            _require_positive_int(
+                args.get("train_batch_size"),
+                f"profile {profile_id}.training_job.train_batch_size",
+            )
+    return profile_id
 
 
 def validate_catalog(
@@ -190,11 +290,15 @@ def validate_catalog(
         raise CatalogValidationError("models.json.schemaVersion must equal 1")
     if models_doc.get("catalog") != "cortex-training":
         raise CatalogValidationError("models.json.catalog must equal 'cortex-training'")
-    reviewed = _require_string(models_doc.get("lastReviewed"), "models.json.lastReviewed")
+    reviewed = _require_string(
+        models_doc.get("lastReviewed"), "models.json.lastReviewed"
+    )
     try:
         date.fromisoformat(reviewed)
     except ValueError as exc:
-        raise CatalogValidationError("models.json.lastReviewed must be an ISO date") from exc
+        raise CatalogValidationError(
+            "models.json.lastReviewed must be an ISO date"
+        ) from exc
 
     profile_by_id: dict[str, dict[str, Any]] = {}
     for profile in profiles:
@@ -213,93 +317,91 @@ def validate_catalog(
     for model_index, model in enumerate(models):
         item = _require_dict(model, f"models[{model_index}]")
         _require_string(item.get("name"), f"models[{model_index}].name")
-        model_id = _require_string(item.get("modelId"), f"models[{model_index}].modelId")
+        model_id = _require_string(
+            item.get("modelId"), f"models[{model_index}].modelId"
+        )
         if model_id in model_ids:
             raise CatalogValidationError(f"duplicate model id: {model_id}")
         model_ids.add(model_id)
 
-        capabilities = _require_dict(item.get("capabilities"), f"model {model_id}.capabilities")
+        capabilities = _require_dict(
+            item.get("capabilities"), f"model {model_id}.capabilities"
+        )
         if set(capabilities) != set(CAPABILITY_KEYS):
             raise CatalogValidationError(
                 f"model {model_id}: capabilities must be exactly {list(CAPABILITY_KEYS)}"
             )
-        for capability_key in CAPABILITY_KEYS:
-            capability = _require_dict(
-                capabilities[capability_key],
-                f"model {model_id}.capabilities.{capability_key}",
-            )
-            supported = capability.get("supported")
-            if not isinstance(supported, bool):
-                raise CatalogValidationError(
-                    f"model {model_id}.{capability_key}.supported must be a boolean"
-                )
-            if not supported:
-                unexpected = {"maxContextTokens", "recommendedProfileId"} & set(capability)
-                if unexpected:
-                    raise CatalogValidationError(
-                        f"model {model_id}.{capability_key}: unsupported capabilities cannot define "
-                        f"{sorted(unexpected)}"
-                    )
-                continue
 
-            max_context = _require_positive_int(
-                capability.get("maxContextTokens"),
-                f"model {model_id}.{capability_key}.maxContextTokens",
+        inference = _require_dict(
+            capabilities["inference"],
+            f"model {model_id}.capabilities.inference",
+        )
+        inference_supported = inference.get("supported")
+        if not isinstance(inference_supported, bool):
+            raise CatalogValidationError(
+                f"model {model_id}.inference.supported must be a boolean"
             )
-            profile_id = _require_string(
-                capability.get("recommendedProfileId"),
-                f"model {model_id}.{capability_key}.recommendedProfileId",
+        if inference_supported:
+            referenced_profiles.add(
+                _validate_profile_reference(
+                    model_id=model_id,
+                    profile_key="inference",
+                    recommendation=inference,
+                    profile_by_id=profile_by_id,
+                    builder_signatures=builder_signatures,
+                )
             )
-            profile = profile_by_id.get(profile_id)
-            if profile is None:
+        else:
+            unexpected = {"maxContextTokens", "recommendedProfileId"} & set(inference)
+            if unexpected:
                 raise CatalogValidationError(
-                    f"model {model_id}.{capability_key}: unknown profile {profile_id}"
+                    f"model {model_id}.inference: unsupported capabilities cannot define "
+                    f"{sorted(unexpected)}"
                 )
-            expected_workflow, expected_tuning = CAPABILITY_PROFILE_TYPES[capability_key]
-            if (profile["workflow"], profile["tuningMethod"]) != (
-                expected_workflow,
-                expected_tuning,
-            ):
-                raise CatalogValidationError(
-                    f"model {model_id}.{capability_key}: profile {profile_id} has incompatible "
-                    f"workflow/tuningMethod"
-                )
-            for sub_job in profile["subJobs"]:
-                args = copy.deepcopy(sub_job["args"])
-                builder = sub_job["builder"]
-                profile_max_seq_len = _require_positive_int(
-                    args.get("max_seq_len"),
-                    f"profile {profile_id}.{builder}.max_seq_len",
-                )
-                if profile_max_seq_len > max_context:
-                    raise CatalogValidationError(
-                        f"model {model_id}.{capability_key}: profile {profile_id} max_seq_len "
-                        f"{profile_max_seq_len} exceeds max context {max_context}"
-                    )
 
-                allowed, required = builder_signatures[builder]
-                unexpected = sorted(set(args) - allowed)
-                missing = sorted(required - set(args))
-                if unexpected or missing:
-                    raise CatalogValidationError(
-                        f"model {model_id}.{capability_key}: profile {profile_id} does not match "
-                        f"SubJobConfig.{builder}; unexpected={unexpected}, missing={missing}"
-                    )
-                _require_positive_int(
-                    args.get("n_gpus"),
-                    f"profile {profile_id}.{builder}.n_gpus",
+        training = _require_dict(
+            capabilities["training"],
+            f"model {model_id}.capabilities.training",
+        )
+        training_supported = training.get("supported")
+        if not isinstance(training_supported, bool):
+            raise CatalogValidationError(
+                f"model {model_id}.training.supported must be a boolean"
+            )
+        if not training_supported:
+            if "profiles" in training:
+                raise CatalogValidationError(
+                    f"model {model_id}.training: unsupported capabilities cannot define profiles"
                 )
-                if builder == "training_job":
-                    optimizer = args.get("optimizer")
-                    if not isinstance(optimizer, dict) or not optimizer:
-                        raise CatalogValidationError(
-                            f"profile {profile_id}.training_job.optimizer must be a non-empty object"
-                        )
-                    _require_positive_int(
-                        args.get("train_batch_size"),
-                        f"profile {profile_id}.training_job.train_batch_size",
-                    )
-            referenced_profiles.add(profile_id)
+            continue
+        if not inference_supported:
+            raise CatalogValidationError(
+                f"model {model_id}: training support requires inference support"
+            )
+
+        training_profiles = _require_dict(
+            training.get("profiles"),
+            f"model {model_id}.training.profiles",
+        )
+        if set(training_profiles) != set(TRAINING_PROFILE_KEYS):
+            raise CatalogValidationError(
+                f"model {model_id}.training.profiles must be exactly "
+                f"{list(TRAINING_PROFILE_KEYS)}"
+            )
+        for profile_key in TRAINING_PROFILE_KEYS:
+            recommendation = _require_dict(
+                training_profiles[profile_key],
+                f"model {model_id}.training.profiles.{profile_key}",
+            )
+            referenced_profiles.add(
+                _validate_profile_reference(
+                    model_id=model_id,
+                    profile_key=profile_key,
+                    recommendation=recommendation,
+                    profile_by_id=profile_by_id,
+                    builder_signatures=builder_signatures,
+                )
+            )
 
     unreferenced = sorted(set(profile_by_id) - referenced_profiles)
     if unreferenced:

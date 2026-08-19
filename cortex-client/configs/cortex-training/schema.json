@@ -33,7 +33,25 @@
     }
   },
   "$defs": {
-    "capability": {
+    "recommendedProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxContextTokens",
+        "recommendedProfileId"
+      ],
+      "properties": {
+        "maxContextTokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "recommendedProfileId": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "inferenceCapability": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -86,6 +104,65 @@
         }
       ]
     },
+    "trainingCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supported"
+      ],
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "profiles": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sftLora",
+            "sftFull",
+            "rlLora",
+            "rlFull"
+          ],
+          "properties": {
+            "sftLora": {
+              "$ref": "#/$defs/recommendedProfile"
+            },
+            "sftFull": {
+              "$ref": "#/$defs/recommendedProfile"
+            },
+            "rlLora": {
+              "$ref": "#/$defs/recommendedProfile"
+            },
+            "rlFull": {
+              "$ref": "#/$defs/recommendedProfile"
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "supported": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "profiles"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "profiles"
+              ]
+            }
+          }
+        }
+      ]
+    },
     "model": {
       "type": "object",
       "additionalProperties": false,
@@ -108,26 +185,14 @@
           "additionalProperties": false,
           "required": [
             "inference",
-            "sftLora",
-            "sftFull",
-            "rlLora",
-            "rlFull"
+            "training"
           ],
           "properties": {
             "inference": {
-              "$ref": "#/$defs/capability"
+              "$ref": "#/$defs/inferenceCapability"
             },
-            "sftLora": {
-              "$ref": "#/$defs/capability"
-            },
-            "sftFull": {
-              "$ref": "#/$defs/capability"
-            },
-            "rlLora": {
-              "$ref": "#/$defs/capability"
-            },
-            "rlFull": {
-              "$ref": "#/$defs/capability"
+            "training": {
+              "$ref": "#/$defs/trainingCapability"
             }
           }
         }

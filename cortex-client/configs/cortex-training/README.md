@@ -7,17 +7,16 @@ Arctic-Platform, such as ZoRRo Train model-family compatibility.
 
 ## Files
 
-- `models.json` declares every model and all five workflow capabilities:
-  inference, SFT with LoRA, full-parameter SFT, RL with LoRA, and
-  full-parameter RL.
+- `models.json` declares inference and training support for every model.
+  Supported training models provide SFT and RL starting profiles for LoRA and
+  full-parameter training.
 - `profiles/*.json` contains reusable configurations expressed as arguments to
   `SubJobConfig.training_job` and `SubJobConfig.sampling_job`.
 - `schema.json` documents the public catalog format.
 
-Supported capabilities must provide a numeric maximum context length and one
-recommended profile. Unsupported capabilities must not carry either field.
-Recommendations are tested starting points, not universally optimal
-hyperparameters.
+Inference support provides one maximum context length and recommended profile.
+Training support requires all four SFT/RL LoRA/full recommendations. These are
+tested starting points, not universally optimal hyperparameters.
 
 ## Updating the catalog
 
