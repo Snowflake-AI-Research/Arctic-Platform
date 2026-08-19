@@ -14,6 +14,10 @@
 # limitations under the License.
 """Model factory: turn a declarative ModelSpec into a configured nn.Module."""
 
+from arctic_platform._dependency_groups import require_any_dep_group
+
+require_any_dep_group("sft", "rl")
+
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches

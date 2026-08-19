@@ -27,6 +27,7 @@ from typing import Any
 from typing import Literal
 from typing import overload
 
+from arctic_platform._dependency_groups import require_any_dep_group
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
@@ -36,11 +37,13 @@ from arctic_platform.client.transport import initialize_or_cleanup
 
 def make_transport(config: ArcticRLClientConfig, server_state: Any = None) -> Transport:
     protocol = config.backend.protocol
-    if config.backend.type == "remote":
+    if config.backend.type == "remote" and protocol == "cortex":
+        require_any_dep_group("cortex")
         from arctic_platform.client.transports.cortex import CortexTransport
 
         return CortexTransport(config)
 
+    require_any_dep_group("sft", "rl")
     from arctic_platform.client.transports.onprem_http import HttpTransport
     from arctic_platform.client.transports.onprem_ray import RayTransport
 

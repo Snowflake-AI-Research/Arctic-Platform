@@ -36,6 +36,6 @@ repos:
     rev: v1.15.0
     hooks:
       - id: mypy
-        additional_dependencies: [types-PyYAML, types-tabulate, pydantic]
+        additional_dependencies: [types-PyYAML, pydantic]
         args: [--ignore-missing-imports]
         files: ^arctic_platform/model/
