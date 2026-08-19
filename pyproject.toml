@@ -55,7 +55,7 @@ dependencies = [
     "typing-extensions",  # Self, per the pydantic model_validator convention
 ]
 
-# Optional development dependencies
+# Optional dependency groups
 [project.optional-dependencies]
 all = [
     "arctic_platform[dev]",
@@ -88,15 +88,24 @@ formatting = [
     "autoflake",
 ]
 
-# The client, talking to Cortex over SnowAPI. torch/safetensors back the DSSST1
-# wire format; tenacity and urllib3 are used only by the cortex transport.
-cortex = [
-    "aiohttp",
+# Shared DSSST1 tensor wire format.
+wire = [
     "numpy",
-    "requests",
     "safetensors",
-    "tenacity",
     "torch",
+]
+
+# HTTP clients shared by Cortex and on-prem transports.
+transport = [
+    "arctic_platform[wire]",
+    "aiohttp",
+    "requests",
+]
+
+# The client, talking to Cortex over SnowAPI.
+cortex = [
+    "arctic_platform[transport]",
+    "tenacity",
     "urllib3",
 ]
 
@@ -104,33 +113,25 @@ cortex = [
 # excludes the sampling stack: both servers import arctic_inference lazily so
 # this install can serve training without vLLM.
 sft = [
-    "aiohttp",
-    "datasets",
+    "arctic_platform[transport]",
     "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
     "fastapi",
     "liger-kernel>=0.8.0",
     "nvidia-ml-py",
     "psutil",
     "ray",
-    "requests",
-    "safetensors",
-    "torch",
     "transformers>=4.57.0,<5",  # vllm 0.18 is what blocks the move to v5
     "uvicorn",
 ]
 
-# [sft] plus sampling. arctic-inference[vllm] pins vllm==0.18.0 itself; vllm is
-# also named here so the version this repo is validated against is explicit and
-# any future divergence fails loudly at resolve time.
+# [sft] plus sampling. arctic-inference[vllm] owns the validated vLLM pin.
 rl = [
     "arctic_platform[sft]",
     "arctic-inference[server,vllm]>=0.2.0",
     "tensordict",
-    "vllm==0.18.0",
 ]
 
 onprem = [
-    "arctic_platform[sft]",
     "arctic_platform[rl]",
 ]
 
@@ -140,7 +141,6 @@ onprem = [
 verl = [
     "arctic_platform[rl]",
     "codetiming",
-    "hydra-core>=1.3",
     "omegaconf",
 ]
 
