@@ -22,6 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from arctic_platform.common.utils.checkpoint import prune_checkpoint_dirs
+from arctic_platform.common.utils.checkpoint import resolve_checkpoint_save_paths
 from arctic_platform.testing_utils import TestCasePlus
 
 
@@ -57,3 +58,35 @@ class TestPruneCheckpointDirs(TestCasePlus):
         self.assertTrue((parent / "checkpoint-3").is_dir())
         self.assertTrue((parent / "hf").is_dir())
         self.assertTrue((parent / "latest").is_file())
+
+
+class TestSaveTotalLimitPruneRoot(TestCasePlus):
+    """#3: save_total_limit must prune the job checkpoint dir, not its parent."""
+
+    def test_save_without_step_does_not_delete_shared_root_checkpoints(self):
+        tmp = Path(self.get_auto_remove_tmp_dir())
+        shared = tmp / "client"
+        job = shared / "job-a"
+        job.mkdir(parents=True)
+        for root, steps in ((shared, [1, 2]), (job, [1, 2, 3])):
+            for s in steps:
+                d = root / f"checkpoint-{s}"
+                d.mkdir()
+                (d / "marker").write_text(str(s), encoding="utf-8")
+
+        save_dir, prune_root = resolve_checkpoint_save_paths(str(job), step=None)
+        self.assertEqual(save_dir, str(job))
+        self.assertEqual(prune_root, str(job))
+        prune_checkpoint_dirs(prune_root, keep=1)
+
+        self.assertTrue((shared / "checkpoint-1").is_dir())
+        self.assertTrue((shared / "checkpoint-2").is_dir())
+        self.assertFalse((job / "checkpoint-1").exists())
+        self.assertFalse((job / "checkpoint-2").exists())
+        self.assertTrue((job / "checkpoint-3").is_dir())
+
+    def test_save_with_step_still_prunes_the_job_root(self):
+        job = Path(self.get_auto_remove_tmp_dir()) / "job-a"
+        save_dir, prune_root = resolve_checkpoint_save_paths(str(job), step=7)
+        self.assertEqual(save_dir, str(job / "checkpoint-7"))
+        self.assertEqual(prune_root, str(job))
