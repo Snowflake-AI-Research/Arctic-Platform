@@ -70,6 +70,11 @@ _FORCE_CHUNK_OPS = {"forward-backward"}
 # forward-backward carries the large gradient frame; a mid-stream chunk-group
 # desync (GS restart) is recoverable only by re-posting the whole group.
 _GROUP_RESTART_OPS = {"forward-backward"}
+# Cortex sub-jobs are always awake; the client's colocated wake/sleep lifecycle
+# is a no-op here. Short-circuiting in the transport means the shim doesn't have
+# to wrap every wake/sleep call individually — including the ones ``sync_weights``
+# invokes internally.
+_NOOP_OPS = {"wake-inference", "sleep-inference", "wake-training", "sleep-training"}
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
 # Neutrino never colocates training and sampling on the same GPUs, so it exposes no
