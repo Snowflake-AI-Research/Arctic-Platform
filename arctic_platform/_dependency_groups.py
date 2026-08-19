@@ -12,12 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Report which extra to install when a subpackage's dependencies are absent.
+"""Report which dependency group to install when dependencies are absent.
 
 The base install carries config models only; each backend lives behind an extra
-(see ``pyproject.toml``). Subpackages call `require_extra` so an import under,
-say, ``arctic_platform.common`` names the extra to install instead of failing
-with a bare ``ModuleNotFoundError`` on whichever dependency happened to be first.
+(see ``pyproject.toml``). Subpackages call `require_any_dep_group` so an import
+under, say, ``arctic_platform.common`` names the extra to install instead of
+failing with a bare ``ModuleNotFoundError`` on whichever dependency happened to
+be first.
 
 The requirement lists are read from installed package metadata, which is
 generated from ``pyproject.toml``, so nothing here has to be kept in sync.
@@ -77,7 +78,7 @@ def _missing(extra: str) -> list[str]:
     return sorted(name for name in _provided_by(extra) if not _installed(name))
 
 
-def require_extra(*extras: str) -> None:
+def require_any_dep_group(*extras: str) -> None:
     """Raise unless at least one of ``extras`` is fully installed.
 
     Name every extra that provisions the caller, cheapest first. The shared

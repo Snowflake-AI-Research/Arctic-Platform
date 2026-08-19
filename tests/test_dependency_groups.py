@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``require_extra`` must accept any extra that provisions the caller, and every
-extra it names must actually exist.
+"""``require_any_dep_group`` must accept any extra that provisions the caller,
+and every extra it names must actually exist.
 
 Nothing here knows what this project depends on. The parser runs against fictional
 ``Requires-Dist`` lines, and the two call-site checks compare extra *names* only, so
@@ -30,9 +30,9 @@ from pathlib import Path
 
 import pytest
 
-from arctic_platform import _extras
+from arctic_platform import _dependency_groups as dependency_groups
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Hatchling flattens ``arctic_platform[...]`` self-references at build time, so each
 # extra lists its transitive closure directly. This mirrors the shape of the real
@@ -66,17 +66,17 @@ _FULL_INSTALLED = {"shared-dep", "pinned-dep"}
 
 @pytest.fixture
 def gate(monkeypatch):
-    """Drive the extras module from fictional metadata and a fictional installed set."""
+    """Drive dependency-group checks from fictional metadata and installs."""
 
     def configure(requires_dist, installed=()):
-        monkeypatch.setattr(_extras, "_requires_dist", lambda: tuple(requires_dist))
-        monkeypatch.setattr(_extras, "_installed", lambda name: name in set(installed))
-        _extras._provided_by.cache_clear()
-        return _extras
+        monkeypatch.setattr(dependency_groups, "_requires_dist", lambda: tuple(requires_dist))
+        monkeypatch.setattr(dependency_groups, "_installed", lambda name: name in set(installed))
+        dependency_groups._provided_by.cache_clear()
+        return dependency_groups
 
-    _extras._provided_by.cache_clear()
+    dependency_groups._provided_by.cache_clear()
     yield configure
-    _extras._provided_by.cache_clear()
+    dependency_groups._provided_by.cache_clear()
 
 
 class TestProvidedBy:
@@ -98,36 +98,36 @@ class TestProvidedBy:
         assert gate(FLATTENED)._provided_by("nope") == frozenset()
 
 
-class TestRequireExtra:
+class TestRequireAnyDepGroup:
     def test_passes_when_named_extra_is_installed(self, gate):
         """A satisfied extra raises nothing."""
-        gate(FLATTENED, installed={"shared-dep", "lite-only"}).require_extra("lite")
+        gate(FLATTENED, installed={"shared-dep", "lite-only"}).require_any_dep_group("lite")
 
     def test_accepts_any_named_extra(self, gate):
         """An install satisfying only the second name still passes."""
-        gate(DIVERGED, installed=_FULL_INSTALLED).require_extra("lite", "full")
+        gate(DIVERGED, installed=_FULL_INSTALLED).require_any_dep_group("lite", "full")
 
     def test_single_extra_rejects_a_diverged_install(self, gate):
         """Naming one extra is what made a [full]-only install fail spuriously."""
         with pytest.raises(ImportError, match="lite-only"):
-            gate(DIVERGED, installed=_FULL_INSTALLED).require_extra("lite")
+            gate(DIVERGED, installed=_FULL_INSTALLED).require_any_dep_group("lite")
 
     def test_reports_missing_packages_and_every_option(self, gate):
         """The error names what is absent and each extra that would supply it."""
         with pytest.raises(ImportError, match=r"lite-only.*\[lite\]' or 'arctic-platform\[full\]"):
-            gate(DIVERGED).require_extra("lite", "full")
+            gate(DIVERGED).require_any_dep_group("lite", "full")
 
     def test_absent_metadata_is_a_noop(self, gate):
         """An uninstalled checkout has nothing to check, so the real ImportError surfaces."""
-        gate((), installed=()).require_extra("lite", "full")
+        gate((), installed=()).require_any_dep_group("lite", "full")
 
 
 def _gated_extras(package_root: Path) -> dict[str, set[str]]:
-    """Map source file -> the extras named in its ``require_extra(...)`` calls."""
+    """Map source file -> extras named in ``require_any_dep_group(...)`` calls."""
     found: dict[str, set[str]] = {}
     for path in sorted(package_root.rglob("*.py")):
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if not isinstance(node, ast.Call) or getattr(node.func, "id", None) != "require_extra":
+            if not isinstance(node, ast.Call) or getattr(node.func, "id", None) != "require_any_dep_group":
                 continue
             named = {arg.value for arg in node.args if isinstance(arg, ast.Constant)}
             if named:
@@ -146,7 +146,7 @@ class TestExtraNamesResolve:
     def test_every_gated_extra_is_declared(self):
         """A gate naming an extra that pyproject.toml does not define would never fire."""
         gates = _gated_extras(_REPO_ROOT / "arctic_platform")
-        assert gates, "no require_extra() call sites found — was the helper renamed?"
+        assert gates, "no require_any_dep_group() call sites found — was the helper renamed?"
         declared = set(_optional_dependencies())
         for site, extras in sorted(gates.items()):
             assert extras <= declared, f"{site} gates on undeclared {sorted(extras - declared)}"

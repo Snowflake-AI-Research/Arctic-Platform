@@ -20,9 +20,9 @@ Shared DeepSpeed/HTTP/Ray server code lives in ``arctic_platform.common``.
 
 from __future__ import annotations
 
-from arctic_platform._extras import require_extra
+from arctic_platform._dependency_groups import require_any_dep_group
 
-require_extra("sft", "rl")
+require_any_dep_group("sft", "rl")
 
 from arctic_platform.sft.client import ArcticSFTClient
 from arctic_platform.sft.client import create_arctic_sft_client
