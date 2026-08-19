@@ -209,16 +209,6 @@
               "mb_spec": {
                 "max_tokens_per_mb": 10240
               },
-              "prime_rl": {
-                "seq_len": 2048,
-                "ep_comm_backend": "deepep",
-                "optimization_dtype": "bfloat16",
-                "reduce_dtype": "float32",
-                "moe_use_grouped_mm": true,
-                "fused_lm_head_token_chunk_size": "disabled",
-                "fp32_lm_head": false,
-                "fused_cross_entropy": "liger"
-              },
               "ds_config": {
                 "train_batch_size": 8,
                 "train_micro_batch_size_per_gpu": 1,
