@@ -45,11 +45,17 @@ OPS = frozenset(
         "forward",
         "step",
         "save",
+        "load-checkpoint",  # SFT resume; not in Cortex surface
         "generate",
         "log-probs",
         # Control-plane ops share one canonical envelope (op_type + payload),
         # matching Cortex's /operation; the transport routes them to /operation.
         "operation",
+        # Colocate sleep/wake (SFT generate / RL e2e); direct routes, not /operation.
+        "sleep-inference",
+        "wake-inference",
+        "sleep-training",
+        "wake-training",
     }
 )
 
@@ -57,6 +63,21 @@ OPS = frozenset(
 def method_name(op: str) -> str:
     """Canonical op name -> the method name a transport target exposes."""
     return op.replace("-", "_")
+
+
+def initialize_or_cleanup(transport: "Transport") -> "JobHandles":
+    """``initialize()``, or ``shutdown()`` + re-raise so a launched server is not orphaned.
+
+    ``shutdown`` is idempotent; safe even when the transport already self-cleaned.
+    """
+    try:
+        return transport.initialize()
+    except Exception:
+        try:
+            transport.shutdown()
+        except Exception:
+            pass
+        raise
 
 
 def unresolved_ops(target: object) -> list[str]:
@@ -114,6 +135,13 @@ class Transport(ABC):
     @abstractmethod
     def call(self, request: Request) -> dict:
         """Deliver one op to this deployment; return a canonical response dict."""
+
+    @abstractmethod
+    async def acall(self, request: Request) -> dict:
+        """Async delivery of one op; return a canonical response dict."""
+
+    async def aclose(self) -> None:
+        """Release async resources (e.g. an aiohttp session); no-op by default."""
 
     @abstractmethod
     def shutdown(self) -> None:

@@ -13,10 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Back-compat shim — prefer ``arctic_platform.common.server``."""
 
-class ArcticRLServerState:
-    """
-    a parent class that at the moment doesn't do anything, since only ArcticRLServerState does something
-    """
-
-    pass
+from arctic_platform.common.server import *  # noqa: F401,F403

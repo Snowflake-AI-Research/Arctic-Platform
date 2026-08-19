@@ -12,16 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Blocking HTTP transport (on-prem). Tensor bodies use the shared DSSST1 codec."""
+"""HTTP transport (on-prem). Sync via ``requests``; async via ``aiohttp``. Tensor bodies use DSSST1."""
 
 from __future__ import annotations
 
+import asyncio
 import time
+from collections.abc import Callable
+from typing import Any
 
 from arctic_platform import wire
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import JOB_TYPES
+from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transports.onprem import OnPremTransport
 
@@ -31,39 +35,93 @@ _OCTET_OPS = frozenset({"generate"})
 
 
 class HttpTransport(OnPremTransport):
-    """Blocking HTTP over the shared DSSST1 wire. Serves onprem (local/remote)."""
+    """HTTP over the shared on-prem DSSST1 wire."""
 
     def __init__(self, config: ArcticRLClientConfig) -> None:
         super().__init__(config)
         import requests
 
-        self.base_url = f"http://{config.host}:{config.port}"
+        self.base_url = f"http://{config.backend.host}:{config.backend.port}"
         self.timeout = config.request_timeout
         self.session = requests.Session()
+        self._asession = None  # aiohttp.ClientSession, lazy on first acall
+        self._asession_loop = None  # the event loop that session is bound to
         self.proc = None
-        if config.launch_local_server:
+        # Reattach clients already have job ids; they must dial the existing
+        # server, not spawn another one (verl forwarders / rollout replicas).
+        if config.backend.launch_local_server and not JobHandles.from_config(config).any_set:
             self._launch_server()
 
     def _start(self, payload: dict) -> JobId:
         resp = self.session.post(f"{self.base_url}/initialize", json=payload, timeout=self.timeout)
-        resp.raise_for_status()
+        if not resp.ok:
+            # Surface the server-side validation/error body (e.g. 422 detail);
+            # raise_for_status alone hides it, which makes remote debugging hard.
+            raise RuntimeError(f"/initialize failed ({resp.status_code}): {resp.text}")
         return resp.json()["job_id"]
 
-    def call(self, request: Request) -> dict:
-        # Tensor-bearing ops (and generate) send a DSSST1 octet body; rest send JSON.
-        octet = request.binary or request.op in _OCTET_OPS
-        payload = (
-            {"data": wire.dumps(request.body), "headers": {"Content-Type": "application/octet-stream"}}
-            if octet
-            else {"json": request.body}
-        )
+    def _http_args(self, request: Request) -> tuple[str, dict[str, Any]]:
+        """URL + post kwargs shared by ``requests`` and ``aiohttp``."""
+        url = f"{self.base_url}/{request.op}"
         params = {} if request.job_id is None else {"job_id": request.job_id}
-        resp = self.session.post(f"{self.base_url}/{request.op}", params=params, timeout=self.timeout, **payload)
-        resp.raise_for_status()
-        # Tensor-bearing responses come back as DSSST1 octet; everything else is JSON.
-        if "application/octet-stream" in resp.headers.get("Content-Type", ""):
-            return wire.loads(resp.content)
-        return resp.json()
+        if request.binary or request.op in _OCTET_OPS:
+            return url, {
+                "params": params,
+                "data": wire.dumps(request.body),
+                "headers": {"Content-Type": "application/octet-stream"},
+            }
+        return url, {"params": params, "json": request.body}
+
+    def call(self, request: Request) -> dict:
+        from arctic_platform.common.utils import sft_profile
+
+        with sft_profile.timed("serialize"):
+            url, kwargs = self._http_args(request)
+        with sft_profile.timed("rpc"):
+            resp = self.session.post(url, timeout=self.timeout, **kwargs)
+            resp.raise_for_status()
+            if "application/octet-stream" in resp.headers.get("Content-Type", ""):
+                result = wire.loads(resp.content)
+            else:
+                result = resp.json()
+        if sft_profile.enabled() and request.op in ("forward-backward", "forward", "step"):
+            # Client-side buckets only; server attaches its own under metrics._profile_ms.
+            sft_profile.maybe_print(f"client {request.op}")
+            sft_profile.take_last()
+        return result
+
+    async def _ensure_asession(self):
+        # A ClientSession is bound to the loop it's built on; reuse it only on
+        # that same loop. On a new loop (e.g. a fresh asyncio.run) we abandon the
+        # stale one -- it can't be awaited closed from here -- and rebuild.
+        loop = asyncio.get_running_loop()
+        if self._asession is None or self._asession.closed or self._asession_loop is not loop:
+            import aiohttp
+
+            self._asession = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+                connector=aiohttp.TCPConnector(limit=0),
+            )
+            self._asession_loop = loop
+        return self._asession
+
+    async def acall(self, request: Request) -> dict:
+        session = await self._ensure_asession()
+        url, kwargs = self._http_args(request)
+        async with session.post(url, **kwargs) as resp:
+            resp.raise_for_status()
+            if "application/octet-stream" in resp.headers.get("Content-Type", ""):
+                return wire.loads(await resp.read())
+            return await resp.json()
+
+    async def aclose(self) -> None:
+        # Only the loop that owns the session can close it; on any other loop
+        # (a stale session from a prior loop) just drop the reference.
+        if self._asession is not None:
+            if not self._asession.closed and self._asession_loop is asyncio.get_running_loop():
+                await self._asession.close()
+            self._asession = None
+            self._asession_loop = None
 
     def _destroy(self, job_id: JobId, job_type: str) -> None:
         self.session.post(
@@ -80,30 +138,36 @@ class HttpTransport(OnPremTransport):
 
     def shutdown(self) -> None:
         super().shutdown()
+        self._terminate_server()
+
+    def _terminate_server(self) -> None:
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=10)
             except Exception:
                 self.proc.kill()
+        self.proc = None
 
     def _is_running(self, job_id: JobId) -> bool:
         resp = self.session.get(f"{self.base_url}/job/{job_id}", timeout=self.timeout)
         return resp.ok and resp.json().get("status") == "RUNNING"
 
     def _launch_server(self) -> None:
+        import os
         import subprocess
         import sys
 
         cfg = self.config
+        bc = cfg.backend
         cmd = [
             sys.executable,
             "-m",
-            "arctic_platform.rl.http_server",
+            "arctic_platform.common.http_server",
             "--host",
             "0.0.0.0",
             "--port",
-            str(cfg.port),
+            str(bc.port),
             "--training-gpus",
             str(cfg.training_gpus),
             "--sampling-gpus",
@@ -111,17 +175,60 @@ class HttpTransport(OnPremTransport):
             "--log-prob-gpus",
             str(cfg.log_prob_gpus),
         ]
-        if cfg.colocate:
+        if bc.colocate:
             cmd.append("--colocate")
-        self.proc = subprocess.Popen(cmd)
+        env = os.environ.copy()
+        if bc.server_cuda_visible_devices is not None:
+            # Client may run with CUDA_VISIBLE_DEVICES= (empty); give the
+            # server subprocess an explicit GPU list so Ray workers see devices.
+            env["CUDA_VISIBLE_DEVICES"] = bc.server_cuda_visible_devices
+        self.proc = subprocess.Popen(cmd, env=env)
+        try:
+            self._wait_server_healthy(bc.startup_timeout)
+        except Exception:
+            # Health wait runs in __init__ (before client init guards); kill the orphan.
+            self._terminate_server()
+            raise
+
+    def _wait_server_healthy(self, timeout: float) -> None:
+        """Poll ``/health``; fail fast with the exit code if the server process dies."""
+
+        def server_died() -> str | None:
+            if self.proc is not None and self.proc.poll() is not None:
+                return (
+                    f"Local HTTP server exited with code {self.proc.returncode} before becoming healthy "
+                    "(see server output above)"
+                )
+            return None
+
         self._poll(
-            lambda: self.session.get(f"{self.base_url}/health", timeout=self.timeout).ok, cfg.startup_timeout, "server"
+            lambda: self.session.get(f"{self.base_url}/health", timeout=self.timeout).ok,
+            timeout,
+            "server /health",
+            fatal=server_died,
         )
 
     @staticmethod
-    def _poll(pred, timeout: float, what: str) -> None:
+    def _poll(
+        pred: Callable[[], bool],
+        timeout: float,
+        what: str,
+        fatal: Callable[[], str | None] | None = None,
+    ) -> None:
+        """Poll ``pred`` until true or ``timeout``.
+
+        ``fatal`` lets a caller abort early: ``pred`` exceptions are swallowed (so a
+        starting server's connection refusals don't end the wait), which would
+        otherwise mask a dead subprocess as a generic ``TimeoutError``. When ``fatal``
+        returns a message, raise it right away with the real cause (e.g. the server's
+        exit code) instead of waiting out the full timeout.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if fatal is not None:
+                msg = fatal()
+                if msg is not None:
+                    raise RuntimeError(msg)
             try:
                 if pred():
                     return

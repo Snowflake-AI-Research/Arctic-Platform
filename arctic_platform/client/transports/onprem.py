@@ -15,7 +15,7 @@
 """On-prem transport base for the Arctic-Platform server.
 
 HTTP and in-process Ray share one control plane (`OnPremTransport`:
-job creation, ordering, payload building); they differ only in the delivery
+job creation + ordering); they differ only in the delivery
 primitives (`_start`, `call`, `_destroy`, `_wait_running`). The client already
 resolved the job id onto each Request, so `call` just delivers it against the
 server's uniform `op(job_id, body) -> dict` surface.
@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import logging
 from abc import abstractmethod
-from typing import Any
 
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.config import JobId
@@ -52,41 +51,36 @@ class OnPremTransport(Transport):
             self.jobs = reconnect
             return self.jobs
         cfg = self.config
-        for job_type in JOB_CREATE_ORDER:
-            if cfg.gpus_for(job_type) > 0:
-                self.jobs.set(job_type, self._start(self._init_payload(job_type)))
-        self._wait_running()
+        try:
+            for job_type in JOB_CREATE_ORDER:
+                if cfg.gpus_for(job_type) > 0:
+                    self.jobs.set(job_type, self._start(cfg.to_onprem(job_type)))
+            self._wait_running()
+        except Exception:
+            # Tear down partial jobs / launched server so GPUs and the port are not orphaned.
+            try:
+                self.shutdown()
+            except Exception:
+                logger.exception("cleanup after failed initialize() also failed")
+            raise
         return self.jobs
 
     def shutdown(self) -> None:
+        # Clear handles after destroy so a second call (transport + client guard) is a no-op.
         for job_type in JOB_TYPES:
             job_id = getattr(self.jobs, job_type)
             if job_id is not None:
                 self._destroy(job_id, job_type)
+        self.jobs = JobHandles()
 
     def _check_op_coverage(self, target: object) -> None:
-        """Warn (don't fail) if the delivery target can't resolve some canonical op."""
+        """Warn if ``target`` is missing any canonical op method (do not fail)."""
         missing = unresolved_ops(target)
         if missing:
             logger.warning("%s cannot resolve ops (they will fail if called): %s", type(self).__name__, missing)
 
-    def _init_payload(self, job_type: str) -> dict[str, Any]:
-        cfg = self.config
-        payload: dict[str, Any] = {"model_name": cfg.model_name, "job_type": job_type, "seed": cfg.seed}
-        if job_type in ("training", "log_prob"):
-            if cfg.ds_config:
-                payload["ds_config"] = cfg.ds_config
-            if job_type == "training":
-                if cfg.training_config:
-                    payload["training_config"] = cfg.training_config
-                if cfg.checkpoint_path:
-                    payload["checkpoint_path"] = cfg.checkpoint_path
-        elif cfg.vllm_config:
-            payload["vllm_config"] = cfg.vllm_config
-        return payload
-
     # delivery primitives — the only things a concrete transport implements
-    # (plus `call` from the Transport ABC, which delivers one op end to end).
+    # (plus `call`/`acall` from the Transport ABC, which deliver one op end to end).
     @abstractmethod
     def _start(self, payload: dict) -> JobId:
         """Create one job and return its id."""

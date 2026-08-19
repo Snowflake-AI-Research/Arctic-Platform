@@ -13,9 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from arctic_platform.client.client import ArcticRLClient
+from arctic_platform.client.client import SyncArcticRLClient
 from arctic_platform.client.client import create_arctic_rl_client
 from arctic_platform.client.client import make_transport
 from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import CortexConfig
+from arctic_platform.client.config import OnPremConfig
+from arctic_platform.client.config import SamplingConfig
+from arctic_platform.client.config import TrainingConfig
 from arctic_platform.client.transport import OPS
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
@@ -26,8 +31,13 @@ __all__ = [
     "OPS",
     "ArcticRLClient",
     "ArcticRLClientConfig",
+    "CortexConfig",
     "JobHandles",
+    "OnPremConfig",
+    "SamplingConfig",
+    "TrainingConfig",
     "Request",
+    "SyncArcticRLClient",
     "Transport",
     "create_arctic_rl_client",
     "make_transport",

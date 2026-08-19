@@ -1,0 +1,10 @@
+  {
+    "host": "dsa-test.qa6.us-west-2.aws.snowflakecomputing.com",
+    "pat": <SF_PAT>
+    "database": "NEUTRINO_DB",
+    "schema": "PUBLIC",
+    "endpoint": "cortex-training",
+    "poll_interval": 0.5,
+    "poll_timeout": 1800.0,
+    "verify_ssl": true
+  }

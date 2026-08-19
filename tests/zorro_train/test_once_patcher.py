@@ -45,6 +45,7 @@ import torch.distributed as dist
 import transformers
 from parameterized import parameterized
 from transformers import AutoModelForCausalLM
+from transformers.utils import is_flash_attn_2_available
 
 from arctic_platform.rl.zorro_train.qwen_model_patcher import Qwen3ModelOncePatcher
 from arctic_platform.rl.zorro_train.tests import create_dummy_batch
@@ -100,6 +101,8 @@ add_padding_modes = [True, False]
 model_attn_logits_cases = list(
     itertools.product(model_names, attn_implementations, add_padding_modes, logits_optimization_modes)
 )
+# Backward compares all three modes on one (model, attn, padding) case — do not parameterize by mode.
+model_attn_pad_cases = list(itertools.product(model_names, attn_implementations, add_padding_modes))
 
 
 @functools.lru_cache(maxsize=None)
@@ -148,7 +151,13 @@ class TestQwen3ModelOncePatcher(TestCasePlus):
         """Load the cached model/reference, skipping cases whose architecture the installed transformers lacks.
 
         Some checkpoints (e.g. ``tiny-random/qwen3.6``, arch ``qwen3_5``) only exist in newer transformers than the
-        pinned range supports; skip rather than fail so the suite stays green until that dependency is bumped."""
+        pinned range supports; skip rather than fail so the suite stays green until that dependency is bumped.
+
+        ``flash_attention_2`` without the real ``flash_attn`` package falls back to
+        ``kernels-community/flash-attn2``, whose numerics diverge from the per-row reference beyond the
+        tight atol these tests use — skip rather than false-fail."""
+        if attn_implementation == "flash_attention_2" and not is_flash_attn_2_available():
+            self.skipTest("flash_attention_2 requires the flash_attn package (not kernels-community fallback)")
         try:
             return _load_model_and_reference(model_name, attn_implementation, add_padding)
         except ValueError as e:
@@ -196,15 +205,27 @@ class TestQwen3ModelOncePatcher(TestCasePlus):
         # offset-aware extraction fixes).
         torch_assert_close(output.logprobs.float(), reference_logprobs, rtol=0, atol=1e-3)
 
-    @parameterized.expand(model_attn_logits_cases)
-    def test_backward_produces_finite_gradients(
-        self, model_name, attn_implementation, add_padding, logits_optimization
-    ):
-        model, batch, _, _ = self._load_or_skip(model_name, attn_implementation, add_padding)
+    def _lm_head_grad(self, model, batch, logits_optimization: str) -> torch.Tensor:
         model.zero_grad(set_to_none=True)
         output = self._patch_and_forward(model, batch, logits_optimization, calculate_entropy=False)
         output.logprobs.mean().backward()
         grad = model.lm_head.weight.grad
-        self.assertIsNotNone(grad)
-        self.assertTrue(torch.isfinite(grad).all())
-        self.assertGreater(grad.abs().sum().item(), 0.0)
+        self.assertIsNotNone(grad, msg=f"{logits_optimization}: missing lm_head.grad")
+        return grad.detach().float().clone()
+
+    @parameterized.expand(model_attn_pad_cases)
+    def test_backward_matches_across_logits_optimization_modes(self, model_name, attn_implementation, add_padding):
+        """``none`` / ``compute`` / ``memory`` claim the same math — compare ``lm_head.grad``, not just finite."""
+        model, batch, _, _ = self._load_or_skip(model_name, attn_implementation, add_padding)
+        grads = {mode: self._lm_head_grad(model, batch, mode) for mode in logits_optimization_modes}
+        self.assertGreater(grads["none"].abs().sum().item(), 0.0)
+        # Same bf16 bound as the forward logprob check in this file (rtol=0). A ~1.5% mode split (the sft_ce
+        # none-vs-tiled failure) is far above 1e-3.
+        for mode in ("memory", "compute"):
+            torch_assert_close(
+                grads[mode],
+                grads["none"],
+                rtol=0,
+                atol=1e-3,
+                msg=f"{mode} vs none lm_head.grad",
+            )

@@ -22,9 +22,11 @@ Arctic Platform aims to cover the full post-training stack for LLMs behind a sma
 
 What is available today:
 
-* [**Arctic Reinforcement Learning**](#arctic-reinforcement-learning) — a high-throughput RL training/inference backend that plugs into existing RL frameworks (see below).
-* [**ZoRRo Train**](#zorro-train) — a prompt-deduplication optimization that removes redundant prompt computation during RL training (see below).
-* [**ZoRRo Inference**](#zorro-inference) — forest cascade attention for efficient rollout step that eliminates redundant memory accesses via grouping (see below).
+* [**Arctic Reinforcement Learning**](#arctic-reinforcement-learning) — a high-throughput RL training/inference backend that plugs into existing RL frameworks ([docs/rl.md](docs/rl.md)).
+* [**ZoRRo Train**](#zorro-train) — a prompt-deduplication optimization that removes redundant prompt computation during RL training ([docs/rl.md#zorro-train](docs/rl.md#zorro-train)).
+* [**ZoRRo Inference**](#zorro-inference) — forest cascade attention for efficient rollout step that eliminates redundant memory accesses via grouping ([docs/rl.md#zorro-inference-forest-cascade-attention](docs/rl.md#zorro-inference-forest-cascade-attention)).
+
+Full documentation index: [docs/index.md](docs/index.md) (RL, shared server infra; SFT docs forthcoming).
 
 What's coming next:
 
@@ -76,7 +78,7 @@ In RL training (PPO/GRPO) the same prompt is sampled many times to explore diffe
 
 **ZoRRo Train** eliminates that waste with automatic **prompt deduplication** at all levels: it detects sequences that share a prompt, packs each unique prompt once, runs the model a single time over the deduplicated sequence, and transparently reconstructs per-response logprobs/entropy in the original sample order. The result is mathematically equivalent to the naive forward/backward (gradients match the baseline within numerical precision) while substantially cutting memory use and increasing throughput — the longer and more-shared the prompts, the larger the win.
 
-It is installed transparently by the DeepSpeed training/log-prob engines and toggled per run via the RL config (`zorro_train.enable`).
+It is installed transparently by the DeepSpeed training/log-prob engines and toggled per run via `ds_worker_config.zorro_train_enable` (verl yaml: `remote_backend.train.zorro_train.enable`). See [docs/rl.md § ZoRRo Train](docs/rl.md#zorro-train).
 
 The supported model families span dense and MoE models - see the list [here](arctic_platform/rl/zorro_train/README.md#supported-models).
 
@@ -100,11 +102,16 @@ To get started training a model with Arctic Platform, first [install the package
 
 ## From PyPI
 
-Install the latest released version and its dependencies from [PyPI](https://pypi.org/project/arctic-platform/):
+The base install carries the config models only. Pick the extra for the backend you are training against, from [PyPI](https://pypi.org/project/arctic-platform/):
 
 ```shell
-pip install arctic-platform
+pip install "arctic-platform[cortex]"   # drive Cortex training over SnowAPI
+pip install "arctic-platform[sft]"      # run a local training-only server
+pip install "arctic-platform[rl]"       # ...plus the sampling stack (arctic-inference, vLLM)
+pip install "arctic-platform[verl]"     # the verl adapter
 ```
+
+`[cortex]` is by far the lightest: it skips DeepSpeed, transformers, Ray and vLLM entirely. Importing on-prem code without the matching extra raises an error naming the one to install.
 
 While this project is being very actively developed it's probably better to install directly from [git](#from-source-git).
 
@@ -115,7 +122,7 @@ To get the latest development version (or to contribute), clone the repository a
 ```shell
 git clone https://github.com/Snowflake-AI-Research/Arctic-Platform.git
 cd Arctic-Platform
-pip install -e .[rl]
+pip install -e ".[rl]"
 ```
 
 # Use of AI Disclaimer
