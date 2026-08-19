@@ -75,6 +75,7 @@ class ModelSpec(BaseModel):
         default_factory=ParallelismConfig, description="Loader-specific parallelism."
     )
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
+    loader_options: dict = Field(default_factory=dict, description="JSON-only loader-specific extras.")
 
     @classmethod
     def from_ds_worker_config(cls, model_name: str, ds_worker_config: dict) -> "ModelSpec":
@@ -133,6 +134,7 @@ class ModelSpec(BaseModel):
 
     @model_validator(mode="after")
     def _resolve_loader(self) -> Self:
+        from arctic_platform.model.loader import get_loader_options_model
         from arctic_platform.model.loader import is_registered_loader
         from arctic_platform.model.loader import resolve_loader_name
 
@@ -140,4 +142,10 @@ class ModelSpec(BaseModel):
             self.loader = resolve_loader_name(self)
         else:
             assert is_registered_loader(self.loader), f"unknown loader {self.loader!r}"
+
+        # Validate loader_options against the resolved loader's schema (if it has one),
+        # storing the fully-defaulted dict back so the spec records the effective values.
+        options_model = get_loader_options_model(self.loader)
+        if options_model is not None:
+            self.loader_options = options_model.model_validate(self.loader_options).model_dump()
         return self

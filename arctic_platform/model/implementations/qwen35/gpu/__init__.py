@@ -12,7 +12,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Built-in loaders. Importing this package registers them."""
-
-from arctic_platform.model.loaders import huggingface  # noqa: F401
-from arctic_platform.model.loaders import qwen3_5_moe  # noqa: F401
+"""GPU helper modules relocated alongside the Qwen3.5 MoE implementation."""
