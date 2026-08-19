@@ -21,6 +21,7 @@ require_any_dep_group("sft", "rl")
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
+from arctic_platform.model.config import ZorroTrainPatch
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
@@ -39,6 +40,7 @@ __all__ = [
     "ModelSpec",
     "ParallelismConfig",
     "Patches",
+    "ZorroTrainPatch",
     "apply_patches",
     "build_model",
     "register_loader",
