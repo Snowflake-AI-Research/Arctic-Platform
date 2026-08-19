@@ -61,7 +61,7 @@ class TestPruneCheckpointDirs(TestCasePlus):
 
 
 class TestSaveTotalLimitPruneRoot(TestCasePlus):
-    """#3: save_total_limit must prune the job checkpoint dir, not its parent."""
+    """save_total_limit must prune the job checkpoint dir, not its parent."""
 
     def test_save_without_step_does_not_delete_shared_root_checkpoints(self):
         tmp = Path(self.get_auto_remove_tmp_dir())
