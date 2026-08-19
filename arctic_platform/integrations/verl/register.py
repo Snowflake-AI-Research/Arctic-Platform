@@ -44,13 +44,17 @@ the name ``"arctic"``:
 
 from __future__ import annotations
 
-from verl.remote_backend.base import RemoteBackendRegistry
-from verl.workers.rollout.replica import RolloutReplicaRegistry
+from arctic_platform._dependency_groups import require_any_dep_group
+
+require_any_dep_group("verl")
+
+from verl.remote_backend.base import RemoteBackendRegistry  # noqa: E402
+from verl.workers.rollout.replica import RolloutReplicaRegistry  # noqa: E402
 
 # Importing the adapter is what actually registers the backend class:
 # `@RemoteBackendRegistry.register("arctic")` runs at class-definition
 # time. Everything below is lazy.
-from arctic_platform.integrations.verl import adapter as _adapter  # noqa: F401
+from arctic_platform.integrations.verl import adapter as _adapter  # noqa: E402,F401
 
 
 def _load_arctic_actor_rollout_worker() -> type:

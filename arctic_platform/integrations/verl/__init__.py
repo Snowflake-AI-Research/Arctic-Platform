@@ -31,8 +31,4 @@ lets Snowflake own both sides of the wire (Arctic runtime +
 verl adapter) in a single repo.
 """
 
-from arctic_platform._dependency_groups import require_any_dep_group
-
-require_any_dep_group("verl")
-
 __all__: list[str] = []
