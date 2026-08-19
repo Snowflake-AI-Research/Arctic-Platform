@@ -589,7 +589,7 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         protocol = self._backend_config.comms.protocol
         onprem_kwargs: dict[str, Any] = {
-            "comm_protocol": protocol,
+            "protocol": protocol,
             "colocate": colocate,
         }
         # host/port only matter for the HTTP transport; the in-process Ray path
@@ -612,12 +612,14 @@ class ArcticRLClientWrapper(RemoteBackend):
             training_gpus=n_training_gpus,
             sampling_gpus=n_sampling_gpus,
             log_prob_gpus=n_log_prob_gpus,
-            backend_config=OnPremConfig(**onprem_kwargs),
+            backend=OnPremConfig(**onprem_kwargs),
             training=TrainingConfig(
                 full_determinism=self._backend_config.train.determinism.get("full", False),
                 checkpoint_path=self.config.trainer.default_local_dir,
                 ds_config=ds_config,
                 ds_worker_config=ds_worker_config,
+                cuda_ipc=self.cuda_ipc_weight_sync,
+                low_memory=self.low_memory_weight_sync,
             ),
             sampling=SamplingConfig(
                 vllm=vllm_config,
@@ -707,10 +709,7 @@ class ArcticRLClientWrapper(RemoteBackend):
         return await self._client.save_checkpoint()
 
     async def update_weights(self):
-        return await self._client.sync_weights(
-            cuda_ipc=self.cuda_ipc_weight_sync,
-            low_memory=self.low_memory_weight_sync,
-        )
+        return await self._client.sync_weights()
 
     async def wake_up_inference(self, tags: list[str] = None):
         return await self._client.wake_inference(tags=tags)

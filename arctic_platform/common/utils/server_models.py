@@ -39,6 +39,10 @@ class JobConfig(BaseModel):
     arctic_inference_config: dict | None = None
     full_determinism: bool = False
     seed: int = 42
+    # Weight-sync strategy for the source (training) job. A WeightSyncRequest may override either field for one call.
+    # Meaningful only on a training job.
+    cuda_ipc: bool = False
+    low_memory: bool = False
 
 
 class GenerateRequest(BaseModel):
@@ -85,11 +89,11 @@ class ResetPrefixCacheRequest(BaseModel):
 class WeightSyncRequest(BaseModel):
     # Matches Cortex's `weight_sync(source_sub_job_id, target_sub_job_ids)`.
     # On-prem treats a sub_job_id as its plain job id.
+    # cuda_ipc / low_memory: None uses the training job's JobConfig values.
     source_sub_job_id: int
     target_sub_job_ids: list[int]
-    colocate: bool = False
-    cuda_ipc: bool = False
-    low_memory: bool = False
+    cuda_ipc: bool | None = None
+    low_memory: bool | None = None
 
 
 class OperationRequest(BaseModel):
