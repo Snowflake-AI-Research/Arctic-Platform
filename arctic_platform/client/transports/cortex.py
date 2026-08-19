@@ -64,6 +64,11 @@ _OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
 # forward-backward carries the large gradient frame; a mid-stream chunk-group
 # desync (GS restart) is recoverable only by re-posting the whole group.
 _GROUP_RESTART_OPS = {"forward-backward"}
+# Cortex sub-jobs are always awake; the client's colocated wake/sleep lifecycle
+# is a no-op here. Short-circuiting in the transport means the shim doesn't have
+# to wrap every wake/sleep call individually — including the ones ``sync_weights``
+# invokes internally.
+_NOOP_OPS = {"wake-inference", "sleep-inference", "wake-training", "sleep-training"}
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
 _JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
@@ -222,12 +227,16 @@ class CortexTransport(Transport):
 
     # ── deliver one op: submit + poll to completion ──────────────────────────
     def call(self, request: Request) -> dict:
+        if request.op in _NOOP_OPS:
+            return {}
         result = self._poll(self._submit(request))
         # generate returns token ids as DSSST1 tensors; on-prem returns plain
         # lists, so match that contract.
         return _to_python(result) if request.op == "generate" else result
 
     async def acall(self, request: Request) -> dict:
+        if request.op in _NOOP_OPS:
+            return {}
         result = await self._apoll(await self._asubmit(request))
         return _to_python(result) if request.op == "generate" else result
 
