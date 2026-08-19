@@ -368,11 +368,25 @@ class CortexTransport(Transport):
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
         while time.monotonic() < deadline:
-            state = _short(self._job().get("status"))
+            job = self._job()
+            state = _short(job.get("status"))
             if state == "running":
                 return
             if state in _JOB_TERMINAL:
-                raise RuntimeError(f"cortex job {self.job_id} reached terminal state '{state}'")
+                # Surface the server-side reason and any per-sub-job status so
+                # callers can distinguish rate limits, allowlist rejections,
+                # capacity exhaustion, and genuine sub-job crashes.
+                reason = job.get("reason") or "(no reason)"
+                sub_states = ", ".join(
+                    f"{_short(sj.get('job_type', ''), 'job_type_')}={_short(sj.get('status'))}"
+                    for sj in (job.get("sub_jobs") or [])
+                )
+                detail = f" reason={reason!r}"
+                if sub_states:
+                    detail += f" sub_jobs=[{sub_states}]"
+                raise RuntimeError(
+                    f"cortex job {self.job_id} reached terminal state '{state}';{detail}"
+                )
             time.sleep(delay)
             delay = _next_delay(delay)
         raise TimeoutError(f"cortex job {self.job_id} did not become running within {self.poll_timeout}s")
