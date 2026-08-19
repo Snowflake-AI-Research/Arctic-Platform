@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Dry-run or submit a Cortex Training catalog profile as a real job."""
+"""Dry-run or execute a Cortex Training catalog profile as a real job."""
 
 from __future__ import annotations
 
 import argparse
 import copy
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -18,6 +19,8 @@ CLIENT_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = CLIENT_ROOT.parent
 
 PROFILE_KEYS = ("inference", "sftLora", "sftFull", "rlLora", "rlFull")
+TRAINING_PROFILE_KEYS = ("sftLora", "sftFull", "rlLora", "rlFull")
+SAMPLING_PROFILE_KEYS = ("inference", "rlLora", "rlFull")
 TOP_LEVEL_ARGS = {
     "global_batch_size",
     "dtype",
@@ -54,7 +57,9 @@ def _build_wire_sub_job(model_id: str, sub_job: dict[str, Any]) -> dict[str, Any
     args = copy.deepcopy(sub_job["args"])
     extra_key = "extra_training" if builder == "training_job" else "extra_sampling"
     config_key = "training_config" if builder == "training_job" else "inference_config"
-    job_type = "training" if builder == "training_job" else args.pop("job_type", "sampling")
+    job_type = (
+        "training" if builder == "training_job" else args.pop("job_type", "sampling")
+    )
 
     wire = {
         "job_type": job_type,
@@ -87,7 +92,113 @@ def build_profile_request(
     profile_id = _recommended_profile_id(model, profile_key)
     profile = next(item for item in profiles if item["id"] == profile_id)
 
-    return {"sub_job_configs": [_build_wire_sub_job(model_id, sub_job) for sub_job in profile["subJobs"]]}
+    return {
+        "sub_job_configs": [
+            _build_wire_sub_job(model_id, sub_job) for sub_job in profile["subJobs"]
+        ]
+    }
+
+
+def build_forward_backward_probe_spec(request: dict[str, Any]) -> dict[str, Any]:
+    """Build a small, tokenizer-independent training batch for a catalog job."""
+    training = next(
+        (
+            sub_job["training_config"]
+            for sub_job in request["sub_job_configs"]
+            if sub_job["job_type"] == "training"
+        ),
+        None,
+    )
+    if training is None:
+        raise ValueError("forward-backward probe requires a training sub-job")
+
+    batch_size = training.get("train_batch_size")
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size <= 0
+    ):
+        raise ValueError("training_config.train_batch_size must be a positive integer")
+
+    token_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+    return {
+        "payload": {
+            "input_ids": [token_ids[:] for _ in range(batch_size)],
+            "position_ids": "arange",
+            "labels": {
+                "strategy": "next_token",
+                "mask_padding": False,
+            },
+        }
+    }
+
+
+def _build_forward_backward_probe_payload(request: dict[str, Any]) -> bytes:
+    sys.path.insert(0, str(CLIENT_ROOT))
+    from dss_client import build_forward_backward_payload
+
+    return build_forward_backward_payload(build_forward_backward_probe_spec(request))
+
+
+def _run_generate_probe(client, job_id: str) -> dict[str, Any]:
+    request_id = client.generate(
+        job_id,
+        prompts=["Reply with OK."],
+        sampling_params={
+            "max_tokens": 1,
+            "temperature": 0.0,
+        },
+    )
+    result = client.poll_request(job_id, request_id)
+    generated = result.get("results")
+    if not isinstance(generated, list) or len(generated) != 1:
+        raise RuntimeError(f"generate probe expected one result, got {generated!r}")
+    return {
+        "operation": "generate",
+        "requestId": request_id,
+        "resultCount": len(generated),
+    }
+
+
+def _run_forward_backward_probe(
+    client,
+    job_id: str,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    payload = _build_forward_backward_probe_payload(request)
+    request_id = client.forward_backward(job_id, payload)
+    result = client.poll_request(job_id, request_id)
+    avg_loss = result.get("avg_loss")
+    try:
+        avg_loss_value = float(avg_loss)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"forward-backward probe returned invalid avg_loss: {avg_loss!r}"
+        ) from exc
+    if not math.isfinite(avg_loss_value):
+        raise RuntimeError(
+            f"forward-backward probe returned non-finite avg_loss: {avg_loss!r}"
+        )
+    return {
+        "operation": "forward-backward",
+        "requestId": request_id,
+        "avgLoss": avg_loss_value,
+    }
+
+
+def run_data_plane_probes(
+    client,
+    job_id: str,
+    profile_key: str,
+    request: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Execute the minimal operations required by a catalog workflow."""
+    probes = []
+    if profile_key in SAMPLING_PROFILE_KEYS:
+        probes.append(_run_generate_probe(client, job_id))
+    if profile_key in TRAINING_PROFILE_KEYS:
+        probes.append(_run_forward_backward_probe(client, job_id, request))
+    return probes
 
 
 def _first_env(*names: str) -> str | None:
@@ -151,7 +262,10 @@ def main() -> int:
     parser.add_argument(
         "--submit",
         action="store_true",
-        help="Submit real jobs. Without this flag, print the generated request bodies.",
+        help=(
+            "Submit real jobs and execute workflow data-plane probes. "
+            "Without this flag, print the generated request bodies."
+        ),
     )
     parser.add_argument("--poll-timeout", type=float, default=1800.0)
     args = parser.parse_args()
@@ -197,11 +311,20 @@ def main() -> int:
             job_id = response["job_id"]
             print(f"Submitted {profile_key} as job {job_id}", file=sys.stderr)
             job = client.wait_for_job(job_id)
+            probes = run_data_plane_probes(
+                client,
+                job_id,
+                profile_key,
+                plan["request"],
+            )
             results.append(
                 {
                     "profileKey": profile_key,
                     "jobId": job_id,
-                    "status": str(job.get("status") or "").lower().removeprefix("job_state_"),
+                    "status": str(job.get("status") or "")
+                    .lower()
+                    .removeprefix("job_state_"),
+                    "probes": probes,
                 }
             )
         except BaseException as error:

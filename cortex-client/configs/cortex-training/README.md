@@ -49,9 +49,13 @@ python scripts/smoke_test_model_catalog.py \
   --profile inference
 ```
 
-To submit a real job, set the connection values through environment variables
-and add `--submit`. The PAT is intentionally not accepted as a command-line
-argument, which keeps it out of shell history and process listings.
+To execute a live smoke test, set the connection values through environment
+variables and add `--submit`. After the job reaches `running`, inference
+profiles execute and poll a one-token `generate` request, SFT profiles execute
+and poll a minimal `forward-backward` request, and RL profiles execute both.
+The job is then cancelled. The PAT is intentionally not accepted as a
+command-line argument, which keeps it out of shell history and process
+listings.
 
 ```bash
 export NEUTRINO_HOST='ACCOUNT.snowflakecomputing.com'
@@ -70,5 +74,5 @@ unset NEUTRINO_PAT
 
 Repeat `--profile` to validate multiple recommendations serially. Supported
 values are `inference`, `sftLora`, `sftFull`, `rlLora`, and `rlFull`. Each
-submitted job is cancelled after it reaches `running`, including when a later
-step fails.
+submitted job is cancelled after its data-plane probes complete, including
+when a probe or later profile fails.

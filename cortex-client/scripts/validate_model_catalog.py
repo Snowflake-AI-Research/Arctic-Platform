@@ -24,6 +24,7 @@ CAPABILITY_PROFILE_TYPES = {
     "rlFull": ("rl", "full"),
 }
 PROFILE_BUILDERS = {"training_job", "sampling_job"}
+SUPPORTED_ZERO_STAGES = {0, 1, 2}
 
 
 class CatalogValidationError(ValueError):
@@ -280,6 +281,28 @@ def _validate_profile_reference(
                 args.get("train_batch_size"),
                 f"profile {profile_id}.training_job.train_batch_size",
             )
+            extra_training = _require_dict(
+                args.get("extra_training"),
+                f"profile {profile_id}.training_job.extra_training",
+            )
+            ds_config = _require_dict(
+                extra_training.get("ds_config"),
+                f"profile {profile_id}.training_job.extra_training.ds_config",
+            )
+            zero_optimization = _require_dict(
+                ds_config.get("zero_optimization"),
+                f"profile {profile_id}.training_job.extra_training.ds_config.zero_optimization",
+            )
+            zero_stage = zero_optimization.get("stage")
+            if (
+                isinstance(zero_stage, bool)
+                or not isinstance(zero_stage, int)
+                or zero_stage not in SUPPORTED_ZERO_STAGES
+            ):
+                raise CatalogValidationError(
+                    f"profile {profile_id}.training_job ZeRO stage {zero_stage!r} "
+                    f"is unsupported; supported stages are {sorted(SUPPORTED_ZERO_STAGES)}"
+                )
     return profile_id
 
 

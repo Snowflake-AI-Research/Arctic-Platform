@@ -6,19 +6,20 @@ import sys
 
 import pytest
 
-
 CLIENT_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = CLIENT_ROOT.parent
 sys.path.insert(0, str(CLIENT_ROOT / "scripts"))
 
+import smoke_test_model_catalog as smoke_catalog  # noqa: E402
 from smoke_test_model_catalog import build_profile_request  # noqa: E402
+from smoke_test_model_catalog import build_forward_backward_probe_spec  # noqa: E402
+from smoke_test_model_catalog import run_data_plane_probes  # noqa: E402
 from validate_model_catalog import (  # noqa: E402
     CatalogValidationError,
     load_catalog,
     load_and_validate,
     validate_catalog,
 )
-
 
 CONFIG_DIR = CLIENT_ROOT / "configs" / "cortex-training"
 
@@ -45,9 +46,137 @@ def test_qwen_38_live_smoke_uses_catalog_rl_lora_profile():
 
     assert [sub_job["job_type"] for sub_job in wire] == ["training", "sampling"]
     assert {sub_job["model_name"] for sub_job in wire} == {"Qwen/Qwen3.8-27B"}
-    assert [wire[0]["training_config"]["n_gpus"], wire[1]["inference_config"]["n_gpus"]] == [8, 8]
+    assert [
+        wire[0]["training_config"]["n_gpus"],
+        wire[1]["inference_config"]["n_gpus"],
+    ] == [8, 8]
     assert "peft_config" in wire[0]["training_config"]
     assert "peft_config" in wire[1]["inference_config"]
+
+
+@pytest.mark.parametrize("profile_key", ["sftFull", "rlFull"])
+def test_dense_full_recommendations_use_zero_stage_two(profile_key):
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3.8-27B",
+        profile_key,
+    )
+    training = next(
+        sub_job["training_config"]
+        for sub_job in request["sub_job_configs"]
+        if sub_job["job_type"] == "training"
+    )
+
+    assert training["ds_config"]["zero_optimization"]["stage"] == 2
+
+
+def test_forward_backward_probe_matches_catalog_training_batch_size():
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3-0.6B",
+        "sftLora",
+    )
+
+    spec = build_forward_backward_probe_spec(request)
+    payload = spec["payload"]
+
+    assert len(payload["input_ids"]) == 8
+    assert payload["input_ids"][0] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert payload["position_ids"] == "arange"
+    assert payload["labels"] == {
+        "strategy": "next_token",
+        "mask_padding": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("profile_key", "expected_operations"),
+    [
+        ("inference", ["generate"]),
+        ("sftLora", ["forward-backward"]),
+        ("rlFull", ["generate", "forward-backward"]),
+    ],
+)
+def test_live_smoke_executes_workflow_data_plane_probes(
+    monkeypatch,
+    profile_key,
+    expected_operations,
+):
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def generate(self, job_id, prompts, sampling_params):
+            self.calls.append(("generate", job_id, prompts, sampling_params))
+            return "generate-request"
+
+        def forward_backward(self, job_id, payload):
+            self.calls.append(("forward-backward", job_id, payload))
+            return "forward-backward-request"
+
+        def poll_request(self, job_id, request_id):
+            self.calls.append(("poll", job_id, request_id))
+            if request_id == "generate-request":
+                return {"results": [{"text": "OK"}]}
+            return {"avg_loss": 0.25}
+
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3-0.6B",
+        profile_key,
+    )
+    monkeypatch.setattr(
+        smoke_catalog,
+        "_build_forward_backward_probe_payload",
+        lambda _: b"forward-backward-payload",
+    )
+    client = FakeClient()
+
+    probes = run_data_plane_probes(client, "job-1", profile_key, request)
+
+    assert [probe["operation"] for probe in probes] == expected_operations
+    if "generate" in expected_operations:
+        assert (
+            "generate",
+            "job-1",
+            ["Reply with OK."],
+            {"max_tokens": 1, "temperature": 0.0},
+        ) in client.calls
+        assert ("poll", "job-1", "generate-request") in client.calls
+    if "forward-backward" in expected_operations:
+        assert (
+            "forward-backward",
+            "job-1",
+            b"forward-backward-payload",
+        ) in client.calls
+        assert ("poll", "job-1", "forward-backward-request") in client.calls
+
+
+def test_live_smoke_rejects_non_finite_forward_backward_loss(monkeypatch):
+    class FakeClient:
+        def forward_backward(self, job_id, payload):
+            return "forward-backward-request"
+
+        def poll_request(self, job_id, request_id):
+            return {"avg_loss": float("nan")}
+
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3-0.6B",
+        "sftFull",
+    )
+    monkeypatch.setattr(
+        smoke_catalog,
+        "_build_forward_backward_probe_payload",
+        lambda _: b"forward-backward-payload",
+    )
+
+    with pytest.raises(RuntimeError, match="non-finite avg_loss"):
+        run_data_plane_probes(FakeClient(), "job-1", "sftFull", request)
 
 
 def test_duplicate_model_id_is_rejected():
@@ -60,9 +189,9 @@ def test_duplicate_model_id_is_rejected():
 
 def test_missing_recommended_profile_is_rejected():
     models_doc, profiles = load_catalog(CONFIG_DIR)
-    models_doc["models"][0]["capabilities"]["inference"]["recommendedProfileId"] = (
-        "missing"
-    )
+    models_doc["models"][0]["capabilities"]["inference"][
+        "recommendedProfileId"
+    ] = "missing"
 
     with pytest.raises(CatalogValidationError, match="unknown profile missing"):
         validate_catalog(models_doc, profiles, REPO_ROOT)
@@ -83,6 +212,18 @@ def test_profile_gpu_count_must_be_a_multiple_of_eight():
     profile["subJobs"][0]["args"]["n_gpus"] = 4
 
     with pytest.raises(CatalogValidationError, match="n_gpus must be a multiple of 8"):
+        validate_catalog(models_doc, profiles, REPO_ROOT)
+
+
+def test_zero_stage_three_is_rejected():
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    profile = next(item for item in profiles if item["id"] == "dense-sft-full-8gpu")
+    zero_optimization = profile["subJobs"][0]["args"]["extra_training"]["ds_config"][
+        "zero_optimization"
+    ]
+    zero_optimization["stage"] = 3
+
+    with pytest.raises(CatalogValidationError, match="ZeRO stage 3 is unsupported"):
         validate_catalog(models_doc, profiles, REPO_ROOT)
 
 
