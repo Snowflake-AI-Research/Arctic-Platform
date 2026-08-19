@@ -262,10 +262,14 @@ def _validate_profile_reference(
                 f"model {model_id}.{profile_key}: profile {profile_id} does not match "
                 f"SubJobConfig.{builder}; unexpected={unexpected}, missing={missing}"
             )
-        _require_positive_int(
+        n_gpus = _require_positive_int(
             args.get("n_gpus"),
             f"profile {profile_id}.{builder}.n_gpus",
         )
+        if n_gpus % 8 != 0:
+            raise CatalogValidationError(
+                f"profile {profile_id}.{builder}.n_gpus must be a multiple of 8"
+            )
         if builder == "training_job":
             optimizer = args.get("optimizer")
             if not isinstance(optimizer, dict) or not optimizer:

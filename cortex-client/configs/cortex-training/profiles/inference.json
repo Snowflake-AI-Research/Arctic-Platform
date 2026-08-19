@@ -1,64 +1,10 @@
 {
   "profiles": [
     {
-      "id": "inference-1gpu",
-      "workflow": "inference",
-      "tuningMethod": "none",
-      "summary": "Single-GPU inference starting point for compact dense models.",
-      "lastValidated": "2026-08-19",
-      "evidencePaths": [
-        "cortex-client/DSS-Server-API-Specification.md"
-      ],
-      "subJobs": [
-        {
-          "builder": "sampling_job",
-          "args": {
-            "max_seq_len": 8192,
-            "n_gpus": 1,
-            "dtype": "bfloat16",
-            "seed": 42,
-            "extra_sampling": {
-              "vllm_config": {
-                "tensor_parallel_size": 1,
-                "gpu_memory_utilization": 0.8
-              }
-            }
-          }
-        }
-      ]
-    },
-    {
-      "id": "inference-2gpu",
-      "workflow": "inference",
-      "tuningMethod": "none",
-      "summary": "Two-GPU tensor-parallel inference starting point for medium dense models.",
-      "lastValidated": "2026-08-19",
-      "evidencePaths": [
-        "cortex-client/DSS-Server-API-Specification.md"
-      ],
-      "subJobs": [
-        {
-          "builder": "sampling_job",
-          "args": {
-            "max_seq_len": 8192,
-            "n_gpus": 2,
-            "dtype": "bfloat16",
-            "seed": 42,
-            "extra_sampling": {
-              "vllm_config": {
-                "tensor_parallel_size": 2,
-                "gpu_memory_utilization": 0.8
-              }
-            }
-          }
-        }
-      ]
-    },
-    {
       "id": "inference-8gpu",
       "workflow": "inference",
       "tuningMethod": "none",
-      "summary": "Eight-GPU tensor-parallel inference starting point for larger Qwen models.",
+      "summary": "Eight-GPU tensor-parallel inference starting point for supported Qwen models.",
       "lastValidated": "2026-08-19",
       "evidencePaths": [
         "cortex-client/examples/sampling.json"

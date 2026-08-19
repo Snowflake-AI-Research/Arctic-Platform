@@ -30,7 +30,7 @@ def test_checked_in_catalog_is_valid():
         "schemaVersion": 1,
         "lastReviewed": "2026-08-19",
         "models": 10,
-        "profiles": 23,
+        "profiles": 11,
     }
 
 
@@ -45,7 +45,7 @@ def test_qwen_38_live_smoke_uses_catalog_rl_lora_profile():
 
     assert [sub_job["job_type"] for sub_job in wire] == ["training", "sampling"]
     assert {sub_job["model_name"] for sub_job in wire} == {"Qwen/Qwen3.8-27B"}
-    assert [wire[0]["training_config"]["n_gpus"], wire[1]["inference_config"]["n_gpus"]] == [8, 2]
+    assert [wire[0]["training_config"]["n_gpus"], wire[1]["inference_config"]["n_gpus"]] == [8, 8]
     assert "peft_config" in wire[0]["training_config"]
     assert "peft_config" in wire[1]["inference_config"]
 
@@ -74,6 +74,15 @@ def test_profile_context_cannot_exceed_capability_limit():
     profile["subJobs"][0]["args"]["max_seq_len"] = 16384
 
     with pytest.raises(CatalogValidationError, match="exceeds max context 8192"):
+        validate_catalog(models_doc, profiles, REPO_ROOT)
+
+
+def test_profile_gpu_count_must_be_a_multiple_of_eight():
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    profile = next(item for item in profiles if item["id"] == "inference-8gpu")
+    profile["subJobs"][0]["args"]["n_gpus"] = 4
+
+    with pytest.raises(CatalogValidationError, match="n_gpus must be a multiple of 8"):
         validate_catalog(models_doc, profiles, REPO_ROOT)
 
 

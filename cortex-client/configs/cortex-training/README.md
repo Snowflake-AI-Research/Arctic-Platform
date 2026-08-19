@@ -18,7 +18,8 @@ Arctic-Platform, such as ZoRRo Train model-family compatibility.
 
 Inference support provides one maximum context length and recommended profile.
 Training support requires all four SFT/RL LoRA/full recommendations. These are
-tested starting points, not universally optimal hyperparameters.
+tested starting points, not universally optimal hyperparameters. Every sub-job
+must request GPUs in multiples of eight.
 
 ## Updating the catalog
 
