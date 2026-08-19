@@ -301,7 +301,9 @@ class DeepSpeedWorker:
 
         # Set reasonable defaults as fallbacks
         ds_config.setdefault("train_micro_batch_size_per_gpu", 1)
-        ds_config.setdefault("bf16", {"enabled": True})
+        fp16_on = bool((ds_config.get("fp16") or {}).get("enabled"))
+        if not fp16_on:
+            ds_config.setdefault("bf16", {"enabled": True})
         ds_config.setdefault(
             "optimizer",
             {
