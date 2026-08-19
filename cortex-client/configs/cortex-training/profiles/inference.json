@@ -55,10 +55,10 @@
       ]
     },
     {
-      "id": "inference-moe-8gpu",
+      "id": "inference-8gpu",
       "workflow": "inference",
       "tuningMethod": "none",
-      "summary": "Eight-GPU inference starting point for the supported Qwen MoE model.",
+      "summary": "Eight-GPU tensor-parallel inference starting point for larger Qwen models.",
       "lastValidated": "2026-08-19",
       "evidencePaths": [
         "cortex-client/examples/sampling.json"

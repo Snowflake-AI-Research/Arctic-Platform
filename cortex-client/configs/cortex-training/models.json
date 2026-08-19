@@ -139,7 +139,7 @@
         "inference": {
           "supported": true,
           "maxContextTokens": 32768,
-          "recommendedProfileId": "inference-moe-8gpu"
+          "recommendedProfileId": "inference-8gpu"
         },
         "training": {
           "supported": true,
@@ -159,6 +159,38 @@
             "rlFull": {
               "maxContextTokens": 32768,
               "recommendedProfileId": "moe-rl-full-16x16"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Qwen3.8 27B",
+      "modelId": "Qwen/Qwen3.8-27B",
+      "capabilities": {
+        "inference": {
+          "supported": true,
+          "maxContextTokens": 32768,
+          "recommendedProfileId": "inference-8gpu"
+        },
+        "training": {
+          "supported": true,
+          "profiles": {
+            "sftLora": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-sft-lora-8gpu"
+            },
+            "sftFull": {
+              "maxContextTokens": 8192,
+              "recommendedProfileId": "dense-sft-full-8gpu"
+            },
+            "rlLora": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-rl-lora-8x2"
+            },
+            "rlFull": {
+              "maxContextTokens": 8192,
+              "recommendedProfileId": "dense-rl-full-8x2"
             }
           }
         }

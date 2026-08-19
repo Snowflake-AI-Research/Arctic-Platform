@@ -11,6 +11,7 @@ CLIENT_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = CLIENT_ROOT.parent
 sys.path.insert(0, str(CLIENT_ROOT / "scripts"))
 
+from smoke_test_model_catalog import build_profile_request  # noqa: E402
 from validate_model_catalog import (  # noqa: E402
     CatalogValidationError,
     load_catalog,
@@ -28,9 +29,25 @@ def test_checked_in_catalog_is_valid():
     assert summary == {
         "schemaVersion": 1,
         "lastReviewed": "2026-08-19",
-        "models": 9,
+        "models": 10,
         "profiles": 23,
     }
+
+
+def test_qwen_38_live_smoke_uses_catalog_rl_lora_profile():
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3.8-27B",
+        "rlLora",
+    )
+    wire = request["sub_job_configs"]
+
+    assert [sub_job["job_type"] for sub_job in wire] == ["training", "sampling"]
+    assert {sub_job["model_name"] for sub_job in wire} == {"Qwen/Qwen3.8-27B"}
+    assert [wire[0]["training_config"]["n_gpus"], wire[1]["inference_config"]["n_gpus"]] == [8, 2]
+    assert "peft_config" in wire[0]["training_config"]
+    assert "peft_config" in wire[1]["inference_config"]
 
 
 def test_duplicate_model_id_is_rejected():

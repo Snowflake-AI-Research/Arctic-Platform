@@ -13,6 +13,8 @@ Arctic-Platform, such as ZoRRo Train model-family compatibility.
 - `profiles/*.json` contains reusable configurations expressed as arguments to
   `SubJobConfig.training_job` and `SubJobConfig.sampling_job`.
 - `schema.json` documents the public catalog format.
+- `scripts/smoke_test_model_catalog.py` builds a selected recommendation from
+  the catalog and can optionally submit it as a real PAT-authenticated job.
 
 Inference support provides one maximum context length and recommended profile.
 Training support requires all four SFT/RL LoRA/full recommendations. These are
@@ -35,3 +37,37 @@ Changes require review from both Arctic-Platform and Cortex Training product
 owners through `.github/CODEOWNERS`. Snowflake product documentation vendors a
 pinned snapshot of this directory; it does not download mutable data during a
 documentation build.
+
+## Live job validation
+
+Dry-run the exact request body generated from a catalog recommendation:
+
+```bash
+python scripts/smoke_test_model_catalog.py \
+  --model-id Qwen/Qwen3.8-27B \
+  --profile inference
+```
+
+To submit a real job, set the connection values through environment variables
+and add `--submit`. The PAT is intentionally not accepted as a command-line
+argument, which keeps it out of shell history and process listings.
+
+```bash
+export NEUTRINO_HOST='ACCOUNT.snowflakecomputing.com'
+export NEUTRINO_DATABASE='NEUTRINO_DB'
+export NEUTRINO_SCHEMA='PUBLIC'
+read -s NEUTRINO_PAT
+export NEUTRINO_PAT
+
+python scripts/smoke_test_model_catalog.py \
+  --model-id Qwen/Qwen3.8-27B \
+  --profile inference \
+  --submit
+
+unset NEUTRINO_PAT
+```
+
+Repeat `--profile` to validate multiple recommendations serially. Supported
+values are `inference`, `sftLora`, `sftFull`, `rlLora`, and `rlFull`. Each
+submitted job is cancelled after it reaches `running`, including when a later
+step fails.
