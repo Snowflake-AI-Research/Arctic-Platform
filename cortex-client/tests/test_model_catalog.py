@@ -128,6 +128,29 @@ def test_dense_full_recommendations_use_zero_stage_two(profile_key):
     assert training["ds_config"]["zero_optimization"]["stage"] == 2
 
 
+def test_moe_rl_enables_router_replay_on_sampling_only():
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3.6-35B-A3B",
+        "rlFull",
+    )
+    training = next(
+        sub_job["training_config"]
+        for sub_job in request["sub_job_configs"]
+        if sub_job["job_type"] == "training"
+    )
+    sampling = next(
+        sub_job["inference_config"]
+        for sub_job in request["sub_job_configs"]
+        if sub_job["job_type"] == "sampling"
+    )
+
+    assert sampling["router_replay"] == {"enabled": True}
+    assert "router_replay" not in training
+    assert "prime_rl" not in training
+
+
 def test_forward_backward_probe_matches_catalog_training_batch_size():
     request = build_profile_request(
         CONFIG_DIR,

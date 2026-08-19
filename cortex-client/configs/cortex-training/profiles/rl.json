@@ -318,6 +318,9 @@
             "dtype": "bfloat16",
             "seed": 42,
             "extra_sampling": {
+              "router_replay": {
+                "enabled": true
+              },
               "vllm_config": {
                 "tensor_parallel_size": 16,
                 "gpu_memory_utilization": 0.8
