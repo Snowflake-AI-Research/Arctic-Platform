@@ -52,6 +52,16 @@ def _recommended_profile_id(model: dict[str, Any], profile_key: str) -> str:
     return recommendation["recommendedProfileId"]
 
 
+def _max_context_tokens(model: dict[str, Any], profile_key: str) -> int:
+    capabilities = model["capabilities"]
+    recommendation = (
+        capabilities["inference"]
+        if profile_key == "inference"
+        else capabilities["training"]["profiles"][profile_key]
+    )
+    return recommendation["maxContextTokens"]
+
+
 def _build_wire_sub_job(model_id: str, sub_job: dict[str, Any]) -> dict[str, Any]:
     builder = sub_job["builder"]
     args = copy.deepcopy(sub_job["args"])
@@ -81,6 +91,8 @@ def build_profile_request(
     repo_root: Path,
     model_id: str,
     profile_key: str,
+    *,
+    max_context: bool = False,
 ) -> dict[str, Any]:
     """Build a CreateJob body directly from one validated catalog recommendation."""
     if profile_key not in PROFILE_KEYS:
@@ -91,12 +103,21 @@ def build_profile_request(
     model = _find_model(models_doc, model_id)
     profile_id = _recommended_profile_id(model, profile_key)
     profile = next(item for item in profiles if item["id"] == profile_id)
-
-    return {
+    request = {
         "sub_job_configs": [
             _build_wire_sub_job(model_id, sub_job) for sub_job in profile["subJobs"]
         ]
     }
+    if max_context:
+        max_context_tokens = _max_context_tokens(model, profile_key)
+        for sub_job in request["sub_job_configs"]:
+            config_key = (
+                "training_config"
+                if sub_job["job_type"] == "training"
+                else "inference_config"
+            )
+            sub_job[config_key]["max_seq_len"] = max_context_tokens
+    return request
 
 
 def build_forward_backward_probe_spec(request: dict[str, Any]) -> dict[str, Any]:
@@ -267,6 +288,14 @@ def main() -> int:
             "Without this flag, print the generated request bodies."
         ),
     )
+    parser.add_argument(
+        "--max-context",
+        action="store_true",
+        help=(
+            "Override each sub-job max_seq_len with the model/profile maximum "
+            "advertised by the catalog."
+        ),
+    )
     parser.add_argument("--poll-timeout", type=float, default=1800.0)
     args = parser.parse_args()
 
@@ -277,6 +306,7 @@ def main() -> int:
             args.repo_root.resolve(),
             args.model_id,
             profile_key,
+            max_context=args.max_context,
         )
         plans.append(
             {

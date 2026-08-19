@@ -35,6 +35,32 @@ def test_checked_in_catalog_is_valid():
     }
 
 
+def test_catalog_context_limits_match_upstream_models():
+    models_doc, _ = load_catalog(CONFIG_DIR)
+    expected_limits = {
+        "Qwen/Qwen3-0.6B": 32768,
+        "Qwen/Qwen3-1.7B": 32768,
+        "Qwen/Qwen3-8B": 32768,
+        "Qwen/Qwen3.5-4B": 262144,
+        "Qwen/Qwen3.6-35B-A3B": 262144,
+        "Qwen/Qwen3.8-27B": 262144,
+        "deepseek-ai/DeepSeek-V4-Flash-0731": 1048576,
+        "openai/gpt-oss-120b": 131072,
+        "zai-org/GLM-5.2": 1048576,
+        "zai-org/GLM-5.2-FP8": 1048576,
+    }
+
+    for model in models_doc["models"]:
+        expected = expected_limits[model["modelId"]]
+        capabilities = model["capabilities"]
+        assert capabilities["inference"]["maxContextTokens"] == expected
+        if capabilities["training"]["supported"]:
+            assert {
+                profile["maxContextTokens"]
+                for profile in capabilities["training"]["profiles"].values()
+            } == {expected}
+
+
 def test_qwen_38_live_smoke_uses_catalog_rl_lora_profile():
     request = build_profile_request(
         CONFIG_DIR,
@@ -52,6 +78,37 @@ def test_qwen_38_live_smoke_uses_catalog_rl_lora_profile():
     ] == [8, 8]
     assert "peft_config" in wire[0]["training_config"]
     assert "peft_config" in wire[1]["inference_config"]
+
+
+@pytest.mark.parametrize(
+    ("model_id", "profile_key", "expected_max_context"),
+    [
+        ("Qwen/Qwen3-0.6B", "inference", 32768),
+        ("Qwen/Qwen3.8-27B", "sftFull", 262144),
+        ("deepseek-ai/DeepSeek-V4-Flash-0731", "inference", 1048576),
+        ("openai/gpt-oss-120b", "inference", 131072),
+        ("zai-org/GLM-5.2", "inference", 1048576),
+    ],
+)
+def test_max_context_smoke_uses_advertised_model_limit(
+    model_id,
+    profile_key,
+    expected_max_context,
+):
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        model_id,
+        profile_key,
+        max_context=True,
+    )
+
+    assert {
+        (
+            sub_job.get("training_config") or sub_job.get("inference_config")
+        )["max_seq_len"]
+        for sub_job in request["sub_job_configs"]
+    } == {expected_max_context}
 
 
 @pytest.mark.parametrize("profile_key", ["sftFull", "rlFull"])
@@ -200,9 +257,9 @@ def test_missing_recommended_profile_is_rejected():
 def test_profile_context_cannot_exceed_capability_limit():
     models_doc, profiles = load_catalog(CONFIG_DIR)
     profile = next(item for item in profiles if item["id"] == "dense-sft-full-8gpu")
-    profile["subJobs"][0]["args"]["max_seq_len"] = 16384
+    profile["subJobs"][0]["args"]["max_seq_len"] = 32769
 
-    with pytest.raises(CatalogValidationError, match="exceeds max context 8192"):
+    with pytest.raises(CatalogValidationError, match="exceeds max context 32768"):
         validate_catalog(models_doc, profiles, REPO_ROOT)
 
 

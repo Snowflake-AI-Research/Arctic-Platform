@@ -67,6 +67,7 @@ export NEUTRINO_PAT
 python scripts/smoke_test_model_catalog.py \
   --model-id Qwen/Qwen3.8-27B \
   --profile inference \
+  --max-context \
   --submit
 
 unset NEUTRINO_PAT
@@ -76,3 +77,7 @@ Repeat `--profile` to validate multiple recommendations serially. Supported
 values are `inference`, `sftLora`, `sftFull`, `rlLora`, and `rlFull`. Each
 submitted job is cancelled after its data-plane probes complete, including
 when a probe or later profile fails.
+
+Pass `--max-context` to replace the recommended profile's starting
+`max_seq_len` with the model/profile `maxContextTokens` value. Use this mode
+when validating the maximum context length advertised in documentation.
