@@ -102,9 +102,11 @@ def sft_loss(
     labels = _require_labels(batch, "sft loss")
     # HF CE targets are labels[:, 1:], ignore_index=-100.
     n_valid = int((labels[:, 1:] != -100).sum().item())
+    if n_valid == 0:
+        # HF CE is NaN when every target is ignore_index.
+        loss = torch.zeros_like(loss, requires_grad=loss.requires_grad)
     # Reconstruct Σ CE from HF's token-mean so cross-rank aggregation stays exact.
-    # Zero valid targets → (0, 0) so the pair cancels in the global mean.
-    loss_sum = float(loss.detach().float().item()) * n_valid if n_valid else 0.0
+    loss_sum = float(loss.detach().float().item()) * n_valid
     return loss, _paired_loss_metrics(loss_sum, n_valid)
 
 
