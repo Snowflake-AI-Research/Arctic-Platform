@@ -12,8 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Built-in patches. Importing this package registers them."""
+"""Gradient-checkpointing patch: enable HF activation checkpointing before the DeepSpeed wrap."""
 
-from arctic_platform.model.patches import gradient_checkpointing  # noqa: F401
-from arctic_platform.model.patches import liger  # noqa: F401
-from arctic_platform.model.patches import zorro_train  # noqa: F401
+from __future__ import annotations
+
+import torch.nn as nn
+
+from arctic_platform.model.loader import LoaderContext
+from arctic_platform.model.patch import register_patch
+
+
+@register_patch("gradient_checkpointing")
+def apply_gradient_checkpointing(model: nn.Module, ctx: LoaderContext) -> None:
+    # Enable-only (matches old worker; do not call make_model_gradient_checkpointing_compatible).
+    model.gradient_checkpointing_enable()

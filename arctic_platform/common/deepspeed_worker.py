@@ -37,7 +37,6 @@ import ray
 import torch
 import torch.distributed as dist
 from deepspeed.accelerator import get_accelerator
-from transformers import AutoModelForCausalLM
 
 from arctic_platform.common.ray_cluster import primary_ip
 from arctic_platform.common.utils import combine_metric_microbatches
@@ -48,6 +47,8 @@ from arctic_platform.common.utils import unpack_batch
 from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
+from arctic_platform.model import ModelSpec
+from arctic_platform.model import build_model
 
 logger = logging.getLogger(__name__)
 
@@ -157,47 +158,13 @@ class DeepSpeedWorker:
 
         pr0(f"ds_worker[after_modify]: {self.job_type=} {ds_config=} {ds_worker_config=}")
 
-        attn_implementation = ds_worker_config.get("attn_implementation", "flash_attention_2")
-
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            attn_implementation=attn_implementation,
-            dtype=torch.bfloat16,
-        )
-
-        if ds_worker_config.get("use_liger", False):
-            pr0(f"Using liger kernel w/ {attn_implementation=}")
-
-            # Apply Liger kernel to the model if use_liger is set to True
-            from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
-
-            _apply_liger_kernel_to_instance(
-                model=model,
-                cross_entropy=False,
-                fused_linear_cross_entropy=False,
-                rope=True,
-                rms_norm=True,
-                swiglu=True,
-            )
-        # if ds_worker_config.get("use_liger", False):
-        #     pr0(f"Using liger kernel w/ {attn_implementation=}")
-        #     from liger_kernel.transformers import AutoLigerKernelForCausalLM
-        #     model = AutoLigerKernelForCausalLM.from_pretrained(
-        #         model_name,
-        #         attn_implementation=attn_implementation,
-        #         dtype=torch.bfloat16,
-        #     )
-
-        # else:
-        #     model = AutoModelForCausalLM.from_pretrained(
-        #         model_name,
-        #         attn_implementation=attn_implementation,
-        #         dtype=torch.bfloat16,
-        #     )
+        # HF load + patches via ModelSpec (world_size already injected above).
+        spec = ModelSpec.from_ds_worker_config(model_name, ds_worker_config)
+        loaded = build_model(spec)
+        model = loaded.model
 
         zorro_train_enable = ds_worker_config.get("zorro_train_enable", False)
-        if zorro_train_enable:
-            self.model_patch_in_zorro(model, ds_worker_config)
+        self.dedup_actor_model_once_patcher = getattr(model, "_arctic_zorro_once_patcher", None)
 
         init_kwargs = dict(model=model, config=ds_config)
         if self._has_optimizer:
@@ -211,10 +178,6 @@ class DeepSpeedWorker:
         gpu_uuid = torch.cuda.get_device_properties(gpu_id).uuid
         logger.info("Rank %d initialized on GPU %d (uuid=%s, device=%s)", self.rank, gpu_id, gpu_uuid, self._device)
         self.cpu_device = torch.device("cpu")
-
-        enable_gradient_checkpointing = ds_worker_config.get("enable_gradient_checkpointing", True)
-        if enable_gradient_checkpointing:
-            model.gradient_checkpointing_enable()
 
         pr0(
             "ds_worker[after_initialize]:"
@@ -338,37 +301,6 @@ class DeepSpeedWorker:
             cfg["torch_autocast"] = {"enabled": True, "dtype": "bfloat16"}
         cfg["bf16"] = {"enabled": True}
         return cfg
-
-    def model_patch_in_zorro(self, model, ds_worker_config):
-        from arctic_platform.rl.zorro_train.qwen_model_patcher import Qwen3ModelOncePatcher
-
-        # pr0(f"Patching ZoRRO")
-
-        response_len = ds_worker_config.get("response_len")
-        max_token_len = ds_worker_config.get("max_token_len")
-        rollout_n = ds_worker_config.get("rollout_n")
-        temperature = ds_worker_config.get("temperature")
-        logits_optimization = ds_worker_config.get("logits_optimization", "none")
-        logits_optimization_peak_mem_size_in_gib = ds_worker_config.get("logits_optimization_peak_mem_size_in_gib", 4)
-        logits_compute_from_fp32_inputs = ds_worker_config.get("logits_compute_from_fp32_inputs", False)
-        logits_compute_in_fp32 = ds_worker_config.get("logits_compute_in_fp32", False)
-        use_unpad = ds_worker_config.get("use_unpad")
-        world_size = ds_worker_config.get("world_size")
-
-        self.dedup_actor_model_once_patcher = Qwen3ModelOncePatcher(
-            model,
-            response_len=response_len,
-            max_token_len=max_token_len,
-            rollout_n=rollout_n,
-            temperature=temperature,
-            logits_optimization=logits_optimization,
-            logits_optimization_peak_mem_size_in_gib=logits_optimization_peak_mem_size_in_gib,
-            logits_compute_from_fp32_inputs=logits_compute_from_fp32_inputs,
-            logits_compute_in_fp32=logits_compute_in_fp32,
-            use_unpad=use_unpad,
-            world_size=world_size,
-        )
-        self.dedup_actor_model_once_patcher.patch_forward()
 
     # move batch to device
     def _move_batch_to_device(self, batch: Any, device: torch.device):
