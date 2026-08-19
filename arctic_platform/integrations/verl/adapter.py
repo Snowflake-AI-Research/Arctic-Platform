@@ -44,6 +44,7 @@ from arctic_platform.client import OnPremConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
 from arctic_platform.client import create_arctic_rl_client
+from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
 from arctic_platform.rl.ray_server import ArcticRLRayServerState
 
 _ARCTIC_METRIC_REDUCTION_FN = {
@@ -600,6 +601,16 @@ class ArcticRLClientWrapper(RemoteBackend):
             onprem_kwargs["port"] = 7000
             onprem_kwargs["launch_local_server"] = True
 
+        # verl's YAML has no backend discriminator, so ARCTIC_BACKEND=cortex is
+        # the one shell-level knob that flips this adapter to Cortex. Cortex
+        # settings hydrate from ARCTIC_CORTEX_* via CortexConfig.from_env.
+        if os.environ.get("ARCTIC_BACKEND", "").strip().lower() == "cortex":
+            from arctic_platform.client import CortexConfig
+
+            backend_config = CortexConfig.from_env()
+        else:
+            backend_config = OnPremConfig(**onprem_kwargs)
+
         # attn_implementation also lives on ds_worker_config; keep it there for
         # the DeepSpeed worker (matches recipe/rl-correctness).
         ds_worker_config = self._create_ds_worker_config()
@@ -612,7 +623,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             training_gpus=n_training_gpus,
             sampling_gpus=n_sampling_gpus,
             log_prob_gpus=n_log_prob_gpus,
-            backend=OnPremConfig(**onprem_kwargs),
+            backend=backend_config,
             training=TrainingConfig(
                 full_determinism=self._backend_config.train.determinism.get("full", False),
                 checkpoint_path=self.config.trainer.default_local_dir,
@@ -662,11 +673,55 @@ class ArcticRLClientWrapper(RemoteBackend):
     # backends are free to pick their own wire format; verl never calls
     # these directly.
 
+    def _is_cortex_backend(self) -> bool:
+        from arctic_platform.client import CortexConfig
+
+        return isinstance(self._client.config.backend, CortexConfig)
+
+    def _zero_logprob_response(self, payload: dict, *, caller: str) -> dict:
+        """Return zero log-probs / entropy shaped like a real fwd_no_grad.
+
+        Cortex has no ``/forward`` sub-job. Zero-filling is only safe when the
+        caller doesn't actually consume the values — single-epoch on-policy
+        GRPO with no KL-to-reference (server-side default
+        ``old_log_probs = logprobs.detach()`` restores π_old ≡ π_new). Recipes
+        with ``use_kl_loss`` / ``use_kl_in_reward`` on, or multi-epoch PPO,
+        need the real snapshot; fail loud instead of silently producing the
+        wrong training signal.
+        """
+        actor = self.config.actor_rollout_ref.actor
+        algo = getattr(self.config, "algorithm", None)
+        if getattr(actor, "use_kl_loss", False) or getattr(algo, "use_kl_in_reward", False):
+            raise NotImplementedError(
+                f"cortex backend: {caller} needs real ref log-probs "
+                "(actor.use_kl_loss / algorithm.use_kl_in_reward is on) but "
+                "Cortex has no /forward sub-job. Disable both, or use the "
+                "on-prem backend for KL-anchored training."
+            )
+        ppo_epochs = int(getattr(actor, "ppo_epochs", 1))
+        if ppo_epochs > 1:
+            raise NotImplementedError(
+                f"cortex backend: {caller} needs the rollout-time log-prob "
+                f"snapshot for ppo_epochs={ppo_epochs} (off-policy PPO). "
+                "Set actor.ppo_epochs=1, or use the on-prem backend."
+            )
+        # make_njt() slices from data["input_ids"], so match [B, T] with T ≥ 1.
+        b_data = payload.get("batch") if isinstance(payload, dict) else None
+        if not isinstance(b_data, dict):
+            b_data = payload if isinstance(payload, dict) else {}
+        ids = b_data.get("input_ids")
+        b = int(ids.shape[0]) if torch.is_tensor(ids) else 1
+        t = int(ids.shape[-1]) if torch.is_tensor(ids) else 1
+        z = torch.zeros((b, max(t, 1)), dtype=torch.float32)
+        return {"batch": {"log_probs": z, "entropy": z}}
+
     async def _send_compute_ref_log_prob(self, payload: dict):
         payload["processing"] = {
             "post": ["compute_entropy_and_logprobs"],
             "loss_fn": None,
         }
+        if self._is_cortex_backend():
+            return self._zero_logprob_response(payload, caller="compute_ref_log_prob")
         response = await self._client.fwd_no_grad(payload, reference_model=True)
         response["batch"]["log_probs"] = response["batch"].pop("logprobs")
         return response
@@ -676,6 +731,8 @@ class ArcticRLClientWrapper(RemoteBackend):
             "post": ["compute_entropy_and_logprobs"],
             "loss_fn": None,
         }
+        if self._is_cortex_backend():
+            return self._zero_logprob_response(payload, caller="compute_log_prob")
         response = await self._client.fwd_no_grad(payload, reference_model=False)
         response["batch"]["log_probs"] = response["batch"].pop("logprobs")
         return response
@@ -699,6 +756,15 @@ class ArcticRLClientWrapper(RemoteBackend):
             if name in payload["batch"]:
                 payload["batch"][name] = _left_pad(payload["batch"][name], seq_len)
         payload["batch"]["loss_mask"] = payload["batch"]["response_mask"]
+
+        if self._is_cortex_backend():
+            # Cortex takes {args, kwargs, context, processing}; on-prem takes
+            # {batch, meta, processing}. Reshape here, not on the wire.
+            payload = to_cortex_fwd_bwd_payload(
+                payload["batch"],
+                dp_size=int(self._client.config.training_gpus or 1),
+                processing=payload.get("processing"),
+            )
 
         fwd_bwd_response = await self._client.fwd_bwd(payload)
         step_response = await self._client.step()
