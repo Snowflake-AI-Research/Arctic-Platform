@@ -37,7 +37,7 @@ from arctic_platform.client.transport import initialize_or_cleanup
 
 def make_transport(config: ArcticRLClientConfig, server_state: Any = None) -> Transport:
     protocol = config.backend.protocol
-    if config.backend.type == "remote":
+    if config.backend.type == "remote" and protocol == "cortex":
         require_extra("cortex")
         from arctic_platform.client.transports.cortex import CortexTransport
 
