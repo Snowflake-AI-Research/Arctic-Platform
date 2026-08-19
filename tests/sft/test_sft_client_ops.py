@@ -227,10 +227,10 @@ class TestSFTTransportSelection:
         assert rl.training_gpus == 2
         assert rl.sampling_gpus == 0
         assert rl.log_prob_gpus == 0
-        assert rl.backend_config.host == "h"
-        assert rl.backend_config.port == 9
-        assert rl.backend_config.launch_local_server is True
-        assert rl.backend_config.server_cuda_visible_devices == "0,1"
+        assert rl.backend.host == "h"
+        assert rl.backend.port == 9
+        assert rl.backend.launch_local_server is True
+        assert rl.backend.server_cuda_visible_devices == "0,1"
         assert rl.training.checkpoint_path == "/tmp/c"
 
     def test_to_rl_config_routes_weight_sync_strategy(self):

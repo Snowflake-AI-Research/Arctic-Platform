@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""One config for every backend. Switching deployment == swapping `backend_config`.
+"""One config for every backend. Switching deployment == swapping `backend`.
 
 Canonical nesting (shared across backends)::
 
@@ -21,7 +21,7 @@ Canonical nesting (shared across backends)::
     ├── training_gpus / sampling_gpus / log_prob_gpus
     ├── training     # DeepSpeed engine (ds_config owns optimizer/scheduler/batch) + checkpoint
     ├── sampling     # sampling / log-prob engines (vllm, log_prob_engine, ...)
-    └── backend_config: OnPremConfig | CortexConfig  # connection / deployment only
+    └── backend: OnPremConfig | CortexConfig  # connection / deployment only
 
 ``to_onprem`` / ``to_cortex`` are temporary wire adapters. Drop them once both
 servers accept this canonical shape directly.
@@ -36,7 +36,6 @@ from typing import Literal
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
-from pydantic import computed_field
 from pydantic import model_validator
 from typing_extensions import Self
 
@@ -48,8 +47,8 @@ class OnPremConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    backend: Literal["onprem"] = "onprem"
-    comm_protocol: Literal["http", "ray"] = Field("http", description="onprem transport: HTTP or in-process Ray.")
+    type: Literal["onprem"] = "onprem"
+    protocol: Literal["http", "ray"] = Field("http", description="onprem transport: HTTP or in-process Ray.")
     host: str = Field("localhost", description="onprem: server host.")
     port: int = Field(8000, description="onprem: server port.")
     colocate: bool = Field(False, description="onprem: colocate job types on shared GPUs.")
@@ -68,7 +67,7 @@ class OnPremConfig(BaseModel):
 
 
 class CortexConfig(BaseModel):
-    """Backend-specific settings for the Cortex (SnowAPI) deployment.
+    """Cortex protocol settings for the remote backend.
 
     Provide `base_url` for a direct/mock URL (no auth), or `host` + a PAT in the
     env var for Snowflake programmatic-access auth.
@@ -76,7 +75,8 @@ class CortexConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    backend: Literal["cortex"] = "cortex"
+    type: Literal["remote"] = "remote"
+    protocol: Literal["cortex"] = Field("cortex", description="remote transport protocol.")
     base_url: str | None = Field(None, description="cortex: direct/mock GS URL; bypasses PAT auth.")
     host: str | None = Field(None, description="cortex: Snowflake host for PAT auth.")
     pat: str | None = Field(None, description="cortex: PAT value passed directly; overrides pat_env_var when set.")
@@ -200,19 +200,14 @@ class ArcticRLClientConfig(BaseModel):
     )
 
     # Backend-specific settings; the concrete type selects the deployment target.
-    backend_config: OnPremConfig | CortexConfig = Field(
-        default_factory=OnPremConfig, discriminator="backend", description="Backend-specific settings."
+    backend: OnPremConfig | CortexConfig = Field(
+        default_factory=OnPremConfig, discriminator="type", description="Backend-specific settings."
     )
 
     # Reconnect: attach to pre-existing jobs instead of creating new ones.
     training_job_id: JobId | None = None
     sampling_job_id: JobId | None = None
     log_prob_job_id: JobId | None = None
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def backend(self) -> Literal["onprem", "cortex"]:
-        return self.backend_config.backend
 
     def gpus_for(self, job_type: str) -> int:
         """GPU count allocated to a job type (0 == the job type is disabled)."""
