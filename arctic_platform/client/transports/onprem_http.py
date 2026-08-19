@@ -35,13 +35,13 @@ _OCTET_OPS = frozenset({"generate"})
 
 
 class HttpTransport(OnPremTransport):
-    """HTTP over the shared DSSST1 wire. Serves onprem (local/remote)."""
+    """HTTP over the shared on-prem DSSST1 wire."""
 
     def __init__(self, config: ArcticRLClientConfig) -> None:
         super().__init__(config)
         import requests
 
-        self.base_url = f"http://{config.backend_config.host}:{config.backend_config.port}"
+        self.base_url = f"http://{config.backend.host}:{config.backend.port}"
         self.timeout = config.request_timeout
         self.session = requests.Session()
         self._asession = None  # aiohttp.ClientSession, lazy on first acall
@@ -49,7 +49,7 @@ class HttpTransport(OnPremTransport):
         self.proc = None
         # Reattach clients already have job ids; they must dial the existing
         # server, not spawn another one (verl forwarders / rollout replicas).
-        if config.backend_config.launch_local_server and not JobHandles.from_config(config).any_set:
+        if config.backend.launch_local_server and not JobHandles.from_config(config).any_set:
             self._launch_server()
 
     def _start(self, payload: dict) -> JobId:
@@ -159,7 +159,7 @@ class HttpTransport(OnPremTransport):
         import sys
 
         cfg = self.config
-        bc = cfg.backend_config
+        bc = cfg.backend
         cmd = [
             sys.executable,
             "-m",

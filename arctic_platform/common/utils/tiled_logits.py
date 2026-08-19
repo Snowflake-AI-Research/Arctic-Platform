@@ -75,7 +75,7 @@ def lm_head_logits(
     model, hidden_states, temperature=1.0, logits_compute_from_fp32_inputs=False, logits_compute_in_fp32=False
 ):
     """Project hidden states to vocab logits via the LM head, applying optional
-    temperature scaling. Returns the (possibly squeezed) logits tensor.
+    temperature scaling.
 
     Shared by the `none`/`compute` logits-optimization paths; the full logits are
     manifested here (the `memory` path avoids this by tiling inside the autograd
@@ -94,8 +94,6 @@ def lm_head_logits(
     if logits_compute_in_fp32:
         logits = logits.float()
     if temperature != 1.0:
-        # logits = logits / temperature
-        logits = logits.squeeze(0)  # (total_nnz, vocab_size)
         temperature = torch.tensor(temperature, device=logits.device)
         logits.div_(temperature.clamp(min=1e-8).unsqueeze(-1).to(logits.dtype))
     return logits
