@@ -121,6 +121,6 @@ On that clone, after the product fix (same repro tests, no flip):
 
 1. Run the **same** repro tests. They must pass now, and fail if the fix is reverted.
 2. Run the **existing** suite that covers the touched area (CPU here; GPU / HTTP / Ray / DeepSpeed via autorun). A green repro test with a broken neighbor is not done.
-3. Run **`make format`** on this clone before calling the group ready.
+3. Run **`make format`** on this clone before calling the group ready — `GIT_CONFIG_GLOBAL` temp file, see [fix.md](fix.md). Do not skip to autorun or ask the operator.
 
 Follow [../test-writing/SKILL.md](../test-writing/SKILL.md).

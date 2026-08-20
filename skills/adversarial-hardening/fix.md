@@ -23,20 +23,18 @@ A green repro test with a red neighbor is not done.
 
 On this clone, run **`make format`**. Do not call the group ready until it has been run and any formatter edits are in the tree. Re-run the repro tests if the formatter touched them.
 
-`make format` does not call GitHub. `pre-commit` only does if hook repos are missing from `~/.cache/pre-commit`, or if `url.*.insteadOf` rewrites `https://github.com/` to SSH so the cache key misses. Check with `git config --show-origin --get-regexp 'url\..*insteadof'`.
-
-**Do not edit the operator’s `~/.gitconfig`.**
-
-If `insteadOf` is set on **this** agent HOME, override it for the format command only — do not rewrite SSH remotes in a clone’s `.git/config`:
+**Always invoke it like this** (this HOME’s `~/.gitconfig` can rewrite `https://github.com/` to SSH so `pre-commit` misses `~/.cache/pre-commit` and tries GitHub). Do not invent `PRE_COMMIT_HOME`, do not skip to autorun, do not ask the operator to run it, do not put format excuses in `PR_DESCRIPTION.md`.
 
 ```bash
-# temp global with user.name / user.email only (no url.*.insteadOf)
-GIT_CONFIG_GLOBAL=<temp-file> GIT_CONFIG_SYSTEM=/dev/null make format
+tmp=$(mktemp)
+git config --file "$tmp" user.name "$(git config user.name)"
+git config --file "$tmp" user.email "$(git config user.email)"
+GIT_CONFIG_GLOBAL="$tmp" GIT_CONFIG_SYSTEM=/dev/null make format
 ```
 
-`pre-commit`’s child `git` inherits that and uses the existing HTTPS hook cache. Commenting out `insteadOf` in `$HOME/.gitconfig` is a last resort, and only when `--show-origin` points at this agent HOME (leftover laptop `templateDir` under `/Users/` is a tell). Never comment out a config that has the operator’s `safe.directory` / `credential` store / `lfs`.
+That temp file is name/email only — no `url.*.insteadOf`. `pre-commit`’s child `git` inherits it and uses the existing HTTPS hook cache. **Do not edit the operator’s `~/.gitconfig`.** Commenting out `insteadOf` there is a last resort, and only when `git config --show-origin --get-regexp 'url\..*insteadof'` points at **this** agent HOME.
 
-If format still hangs on a GitHub fetch, ask the operator for a GPU host and run `make format` there via autorun.
+Autorun on a GPU host is only if **this exact command** still fetches GitHub after an unsandboxed run.
 
 ## Re-probe the fix
 

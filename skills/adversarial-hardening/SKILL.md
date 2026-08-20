@@ -23,6 +23,7 @@ Resolve once at the start of a pass and use the absolute paths you got:
 
 - **Checkout root:** `git rev-parse --show-toplevel` from the workspace, or walk up from this `SKILL.md` (`…/skills/adversarial-hardening/SKILL.md` → two parents). Confirm the root contains `arctic_platform/` and `skills/`.
 - **This skill:** `<checkout>/skills/adversarial-hardening/` — **commit-only** (`SKILL.md`, `probe.md`, `groups.md`, `repro.md`, `fix.md`, `checklist.md`, `multi-model.md`). Do not write findings, process audits, or other pass artifacts here.
+- **Cursor project rules:** `<checkout>/.cursor/rules/` — committed, `alwaysApply`. Cursor loads these when **this checkout is the workspace root** (or an added workspace folder). A parent-folder workspace does not inherit a nested clone’s `.cursor/rules`. Do not rely on `~/.cursor/rules` for teammates.
 - **Findings / grouping:** dated files at the **probe checkout root** — parent-only `PROBE_FINDINGS.<stamp>.md`, per-agent `PROBE_FINDINGS.<stamp>.<slug>.md`, merge `PROBE_FINDINGS.merge.<stamp>.md`, plus `PROBE_GROUPS.md`. Each Repro/Fix clone has its own `PROBE_REPRO_TESTS.md` and `PR_DESCRIPTION.md`. Stamp is UTC `YYYYMMDDTHHMMSSZ`. Never overwrite an existing findings file.
 - **Autorun / GPU host:** `$AUTORUN_DIR` if set, else the directory that contains `enqueue.sh` (ask if missing). Host = basename of a fresh `status.<host>.txt` there — do not bake in a hostname.
 - **Companion skills** (autorun, remote runtime, never-delete): follow them if they are loaded. Do not assume a home-directory path for them.
@@ -63,7 +64,7 @@ Stop when a probe pass has **run every constructible attack in scope**, the self
 - [ ] 0. SCOPE: operator states code scope and timeline (or no time bound). Do not switch branches.
 - [ ] 1. PROBE: attack plan first; run every row; classify; write dated PROBE_FINDINGS*.md; self-gate
 - [ ] 2. GROUP: assign `#N` here (not in the merge); write PROBE_GROUPS.md (one `#N` unless same contract or the same hunk); related write-ups stay until Repro; wait if a bundle is ambiguous
-- [ ] 3. REPRO+FIX one group at a time: present Problem / Where / Repro plan / Fix plan (`k` or `kA`/`kB` + `#N`); clone `main`; branch `<user>/adversarial-<slug>`; write repro tests (must **fail**); then fix (same tests must **pass**); existing suite; `make format`; PR_DESCRIPTION.md on that clone
+- [ ] 3. REPRO+FIX one group at a time: present Problem / Where / Repro plan / Fix plan (`k` or `kA`/`kB` + `#N`); clone `main`; branch `<user>/adversarial-<slug>`; write repro tests (must **fail**); then fix (same tests must **pass**); existing suite; `make format` via `GIT_CONFIG_GLOBAL` ([fix.md](fix.md)); PR_DESCRIPTION.md on that clone
 ```
 
 ## Artifacts (required)
