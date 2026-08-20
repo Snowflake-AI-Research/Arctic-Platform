@@ -4,7 +4,34 @@
       "id": "inference-8gpu",
       "workflow": "inference",
       "tuningMethod": "none",
-      "summary": "Eight-GPU tensor-parallel inference starting point for supported Qwen models.",
+      "summary": "Eight-GPU inference allocation with single-GPU tensor parallelism for smaller Qwen models.",
+      "lastValidated": "2026-08-20",
+      "evidencePaths": [
+        "cortex-client/examples/sampling.json"
+      ],
+      "subJobs": [
+        {
+          "builder": "sampling_job",
+          "args": {
+            "max_seq_len": 8192,
+            "n_gpus": 8,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_sampling": {
+              "vllm_config": {
+                "tensor_parallel_size": 1,
+                "gpu_memory_utilization": 0.8
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "inference-8gpu-tp8",
+      "workflow": "inference",
+      "tuningMethod": "none",
+      "summary": "Eight-GPU tensor-parallel inference starting point for larger Qwen models.",
       "lastValidated": "2026-08-19",
       "evidencePaths": [
         "cortex-client/examples/sampling.json"

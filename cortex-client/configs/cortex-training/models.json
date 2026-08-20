@@ -139,7 +139,7 @@
         "inference": {
           "supported": true,
           "maxContextTokens": 262144,
-          "recommendedProfileId": "inference-8gpu"
+          "recommendedProfileId": "inference-8gpu-tp8"
         },
         "training": {
           "supported": true,
@@ -171,7 +171,7 @@
         "inference": {
           "supported": true,
           "maxContextTokens": 262144,
-          "recommendedProfileId": "inference-8gpu"
+          "recommendedProfileId": "inference-8gpu-tp8"
         },
         "training": {
           "supported": true,

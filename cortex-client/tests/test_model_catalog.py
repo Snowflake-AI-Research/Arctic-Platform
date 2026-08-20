@@ -31,7 +31,7 @@ def test_checked_in_catalog_is_valid():
         "schemaVersion": 1,
         "lastReviewed": "2026-08-19",
         "models": 10,
-        "profiles": 11,
+        "profiles": 12,
     }
 
 
@@ -59,6 +59,40 @@ def test_catalog_context_limits_match_upstream_models():
                 profile["maxContextTokens"]
                 for profile in capabilities["training"]["profiles"].values()
             } == {expected}
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected_profile_id", "expected_tp"),
+    [
+        ("Qwen/Qwen3-0.6B", "inference-8gpu", 1),
+        ("Qwen/Qwen3-1.7B", "inference-8gpu", 1),
+        ("Qwen/Qwen3-8B", "inference-8gpu", 1),
+        ("Qwen/Qwen3.5-4B", "inference-8gpu", 1),
+        ("Qwen/Qwen3.6-35B-A3B", "inference-8gpu-tp8", 8),
+        ("Qwen/Qwen3.8-27B", "inference-8gpu-tp8", 8),
+    ],
+)
+def test_qwen_inference_tensor_parallel_recommendations(
+    model_id,
+    expected_profile_id,
+    expected_tp,
+):
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    model = next(item for item in models_doc["models"] if item["modelId"] == model_id)
+    recommendation = model["capabilities"]["inference"]
+    profile = next(
+        item
+        for item in profiles
+        if item["id"] == recommendation["recommendedProfileId"]
+    )
+
+    assert recommendation["recommendedProfileId"] == expected_profile_id
+    assert (
+        profile["subJobs"][0]["args"]["extra_sampling"]["vllm_config"][
+            "tensor_parallel_size"
+        ]
+        == expected_tp
+    )
 
 
 def test_qwen_38_live_smoke_uses_catalog_rl_lora_profile():
@@ -292,6 +326,20 @@ def test_profile_gpu_count_must_be_a_multiple_of_eight():
     profile["subJobs"][0]["args"]["n_gpus"] = 4
 
     with pytest.raises(CatalogValidationError, match="n_gpus must be a multiple of 8"):
+        validate_catalog(models_doc, profiles, REPO_ROOT)
+
+
+def test_sampling_tensor_parallel_size_must_divide_gpu_count():
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    profile = next(item for item in profiles if item["id"] == "inference-8gpu")
+    profile["subJobs"][0]["args"]["extra_sampling"]["vllm_config"][
+        "tensor_parallel_size"
+    ] = 3
+
+    with pytest.raises(
+        CatalogValidationError,
+        match="tensor_parallel_size must be a divisor of n_gpus",
+    ):
         validate_catalog(models_doc, profiles, REPO_ROOT)
 
 

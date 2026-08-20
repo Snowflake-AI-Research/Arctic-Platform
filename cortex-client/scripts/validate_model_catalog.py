@@ -271,6 +271,24 @@ def _validate_profile_reference(
             raise CatalogValidationError(
                 f"profile {profile_id}.{builder}.n_gpus must be a multiple of 8"
             )
+        if builder == "sampling_job":
+            extra_sampling = _require_dict(
+                args.get("extra_sampling"),
+                f"profile {profile_id}.sampling_job.extra_sampling",
+            )
+            vllm_config = _require_dict(
+                extra_sampling.get("vllm_config"),
+                f"profile {profile_id}.sampling_job.extra_sampling.vllm_config",
+            )
+            tensor_parallel_size = _require_positive_int(
+                vllm_config.get("tensor_parallel_size"),
+                f"profile {profile_id}.sampling_job.tensor_parallel_size",
+            )
+            if tensor_parallel_size > n_gpus or n_gpus % tensor_parallel_size != 0:
+                raise CatalogValidationError(
+                    f"profile {profile_id}.sampling_job.tensor_parallel_size "
+                    f"must be a divisor of n_gpus ({n_gpus})"
+                )
         if builder == "training_job":
             optimizer = args.get("optimizer")
             if not isinstance(optimizer, dict) or not optimizer:
