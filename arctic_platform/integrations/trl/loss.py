@@ -13,21 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The single loss function the TRL integration needs.
-
-TRL computes its own loss on the client and sends back ``d(loss)/d(logprobs)``. The server backpropagates
-``sum(w * logprobs)``, a first-order surrogate whose gradient with respect to every parameter equals the
-gradient of the real loss. So the loss itself never crosses the wire.
-
-This is what lets one entry cover every TRL loss variant. Compare ``integrations/verl/grpo_loss.py``, which is
-523 lines reimplementing verl's ``masked_mean`` / ``agg_loss`` / ``compute_policy_loss_vanilla`` on this side
-and still supports only ``loss_mode="vanilla"`` out of the twelve entries in verl's ``POLICY_LOSS_REGISTRY``.
-Nothing here needs revisiting when TRL adds a loss.
-
-Equivalent framing: a weighted cross-entropy ``sum(-logprobs * weights)`` is the same surrogate under
-``weights = -d(loss)/d(logprobs)``. Tinker takes that route and maps its custom-loss path onto plain
-``cross_entropy`` without adding a loss at all.
-"""
+"""``sum(w * logprobs)`` surrogate; TRL's real loss stays on the client."""
 
 from typing import Any
 
@@ -44,15 +30,7 @@ def weighted_logprob_sum(
     config: dict,
     device: str,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """``sum(w * logprobs)`` over the loss mask.
-
-    ``logprob_weights_shifted`` follows the same roll(-1) convention as every other log-prob tensor in the
-    batch, so it lines up with ``model_outputs["logprobs"]`` without a shift here.
-
-    The weights arrive already scaled for gradient accumulation: TRL divides by its accumulation step count
-    before the gradient reaches the client. The sum below must therefore stay unnormalized, or the two
-    scalings compose.
-    """
+    """Unnormalized ``sum(w * logprobs)``; TRL already scaled ``w`` for grad accum."""
     logprobs = model_outputs["logprobs"]
     weights = batch["logprob_weights_shifted"]
 

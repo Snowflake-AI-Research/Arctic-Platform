@@ -1,4 +1,4 @@
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,20 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Arctic-backed rollout worker for TRL's ``AsyncGRPOTrainer`` (``RolloutWorkerProtocol``).
-
-The default ``AsyncRolloutWorker`` spawns a CUDA-free child process that talks to a vLLM OpenAI server over
-``/v1/completions``. Arctic's sampler is not that server -- it is reached through ``SyncArcticRLClient.generate``
--- so this worker delegates generation there instead.
-
-Because generation runs on the Arctic sampler (remote or co-located), the worker itself does no GPU work, so it
-runs the generate/score loop in a background daemon thread of the trainer's rank-0 process rather than a spawned
-child. That also lets it reuse the caller's already-constructed client directly, with no pickling.
-
-Scope: single-turn generation and synchronous ``reward_funcs`` (what GSM8K-style GRPO needs). Tools, environments,
-and the multi-turn drift reconciler of the default worker are intentionally out of scope here; the produced
-``RolloutSample`` contract is identical, so the trainer consumes these samples unchanged.
-"""
+"""Rollout via ``SyncArcticRLClient.generate`` (single-turn, sync rewards)."""
 
 from __future__ import annotations
 
@@ -43,8 +30,7 @@ from trl.experimental.async_grpo.async_rollout_worker import RolloutSample
 
 from arctic_platform.integrations.trl.client import engine_old_log_probs
 
-
-try:  # keep import-light; fall back to __name__ if TRL's helper moves
+try:
     from trl.experimental.trainer.utils import get_callable_name
 except Exception:  # noqa: BLE001
 
@@ -53,12 +39,7 @@ except Exception:  # noqa: BLE001
 
 
 def _sampled_logprob(position: dict, token_id: int) -> float:
-    """Log prob of the sampled token at one position of an Arctic generate result.
-
-    The server serializes each position as ``{token_id: {"logprob", "rank"}}``. With ``sampling_params
-    ["logprobs"] == 0`` there is exactly one entry -- the sampled token -- but wire codecs may stringify int
-    keys, so match by int, then str, then fall back to the lone entry.
-    """
+    """Sampled-token logprob from one generate position (int or str keys)."""
     if token_id in position:
         return float(position[token_id]["logprob"])
     if str(token_id) in position:
@@ -67,27 +48,9 @@ def _sampled_logprob(position: dict, token_id: int) -> float:
 
 
 class ArcticRolloutWorker:
-    """Produces scored :class:`RolloutSample`s by generating on the Arctic sampler.
+    """Arctic generate + score loop for ``RolloutWorkerProtocol``.
 
-    Args:
-        client: A :class:`~arctic_platform.client.client.SyncArcticRLClient` with a sampling job.
-        dataset: Iterable of rows, each with a ``"prompt"`` (chat messages or plain text). Extra columns are
-            forwarded to the reward functions as keyword args (e.g. a gold ``"answer"``).
-        reward_funcs: One callable or a list. Each is called once per group with ``prompts`` / ``completions`` /
-            ``completion_ids`` plus the group's extra columns, and returns a list of per-sample floats (``None``
-            for an unscorable sample). Sync or async.
-        processing_class: Tokenizer used to encode prompts (``apply_chat_template`` for chat rows).
-        num_generations: Completions per prompt (the GRPO group size).
-        max_tokens / temperature / top_p / top_k / min_p / repetition_penalty: Sampling params. Temperature must
-            be > 0 so a group's completions differ.
-        queue_maxsize: Backpressure bound on ``rollout_buffer`` (0 = unbounded).
-        chat_template_kwargs: Extra kwargs forwarded to ``apply_chat_template``.
-        old_logprobs_source: Where ``RolloutSample.old_log_probs`` come from. ``"trainer"`` (default) recomputes
-            them on the Arctic training engine (verl-style ``old_log_prob`` on the actor) so ``old`` and the
-            trainer's ``new`` log-probs share a forward path and the on-policy ratio stays ~1; ``"sampler"`` uses
-            vLLM's generation logprobs (which drift from the engine's and bias the ratio/KL).
-        pad_token_id / max_token_len_per_gpu: Forwarded to the engine log-prob forward when
-            ``old_logprobs_source == "trainer"`` (must match the training client's values).
+    ``old_logprobs_source="trainer"`` (default) recomputes old logprobs on the training engine.
     """
 
     def __init__(
@@ -132,13 +95,11 @@ class ArcticRolloutWorker:
             "top_p": top_p,
             "top_k": top_k,
             "repetition_penalty": repetition_penalty,
-            # 0 => vLLM returns the sampled token's logprob at each position (and no extra top-k entries).
-            "logprobs": 0,
+            "logprobs": 0,  # sampled token only
         }
         if min_p is not None:
             self._sampling_params["min_p"] = min_p
 
-        # RolloutWorkerProtocol surface.
         self.rollout_buffer: queue.Queue = queue.Queue(maxsize=queue_maxsize)
 
         self._model_version = 0
@@ -161,7 +122,7 @@ class ArcticRolloutWorker:
     def start(self) -> None:
         if self._thread is not None:
             return
-        self._heartbeat = time.time()  # reset so slow warm-up doesn't trip check_health
+        self._heartbeat = time.time()
         self._thread = threading.Thread(target=self._run, name="arctic-rollout-worker", daemon=True)
         self._thread.start()
 
@@ -194,23 +155,16 @@ class ArcticRolloutWorker:
                     group_id += 1
                     produced = True
                 if not produced:
-                    # Degenerate/empty dataset: don't spin.
                     time.sleep(0.1)
         except BaseException as e:  # noqa: BLE001
             self._error = e
             raise
 
     def _render_prompt(self, prompt: Any) -> tuple[str, list[int]]:
-        """Return the sampler's text prompt and its token ids (for building the training row).
-
-        The server's ``/generate`` takes text (``GenerateRequest.prompts: list[str]``), so we render the chat
-        template to a string and hand that to the sampler. We also tokenize that same string here so the
-        prompt-length prefix used for ``completion_mask`` / ``input_ids`` matches what the sampler saw.
-        """
+        """Text prompt plus token ids for the training row."""
         if isinstance(prompt, str):
             text = prompt
         else:
-            # Conversational: render with the generation prompt so the model continues as the assistant.
             text = self.tokenizer.apply_chat_template(
                 prompt, add_generation_prompt=True, tokenize=False, **self.chat_template_kwargs
             )
@@ -221,8 +175,6 @@ class ArcticRolloutWorker:
         prompt = row["prompt"]
         prompt_text, prompt_ids = self._render_prompt(prompt)
 
-        # One request carrying `num_generations` copies of the prompt: the sampler decodes them independently
-        # (temperature > 0), giving the group its variance.
         results = self.client.generate(
             prompts=[prompt_text for _ in range(self.num_generations)],
             sampling_params=dict(self._sampling_params),
@@ -254,8 +206,6 @@ class ArcticRolloutWorker:
             completions.append([{"role": "assistant", "content": text}])
             completion_ids.append(token_ids)
 
-        # verl-style old_log_prob: replace vLLM's generation logprobs with a forward on the Arctic *training*
-        # engine over these same sequences, so old/new log-probs share a subsystem and the on-policy ratio ~ 1.
         if self.old_logprobs_source == "trainer" and rows:
             n_prompt = len(prompt_ids)
             engine_lp = engine_old_log_probs(
@@ -268,9 +218,6 @@ class ArcticRolloutWorker:
             )
             self._heartbeat = time.time()
             for r, lp in zip(rows, engine_lp, strict=True):
-                # `engine_old_log_probs` returns the current-token frame (lp[p] = log p(token at p)), same frame as
-                # vLLM's sampled logprobs. Keep the prompt prefix at 0 (masked by completion_mask) and take the
-                # engine log-probs for the completion span.
                 r["old_log_probs"] = [0.0] * n_prompt + list(lp[n_prompt:])
 
         rewards, per_func_rewards, reward_std = self._score(prompt, completions, completion_ids, row)
@@ -281,10 +228,7 @@ class ArcticRolloutWorker:
             metrics = {
                 "reward": float(r),
                 "reward_std": float(reward_std),
-                **{
-                    f"rewards/{name}": float(per_func_rewards[k, i])
-                    for k, name in enumerate(self.reward_func_names)
-                },
+                **{f"rewards/{name}": float(per_func_rewards[k, i]) for k, name in enumerate(self.reward_func_names)},
             }
             sample = RolloutSample(
                 prompt=prompt,
@@ -303,15 +247,12 @@ class ArcticRolloutWorker:
         self, prompt: Any, completions: list, completion_ids: list, row: dict
     ) -> tuple[np.ndarray, np.ndarray, float]:
         n = len(completions)
-        reward_kwargs = {
-            key: [row[key]] * n for key in row if key not in {"prompt", "completion", "completion_ids"}
-        }
+        reward_kwargs = {key: [row[key]] * n for key in row if key not in {"prompt", "completion", "completion_ids"}}
         kwargs = dict(prompts=[prompt] * n, completions=completions, completion_ids=completion_ids, **reward_kwargs)
 
         all_rewards = []
         for func in self.reward_funcs:
             out = func(**kwargs)
-            # The worker owns its thread with no running loop, so a coroutine reward can just be run to completion.
             if inspect.isawaitable(out):
                 out = asyncio.run(out)
             all_rewards.append([r if r is not None else float("nan") for r in out])
@@ -326,7 +267,6 @@ class ArcticRolloutWorker:
 
     @staticmethod
     def _advantages(rewards: np.ndarray) -> np.ndarray:
-        # Group-relative advantage on the scorable subset; unscorable (NaN) rows get 0.
         advantages = np.zeros_like(rewards)
         mask = ~np.isnan(rewards)
         if mask.any():
