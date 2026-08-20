@@ -1,4 +1,4 @@
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,15 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for ``ArcticWeightTransfer`` (CPU, fake client).
-
-The Arctic-backed ``WeightTransferProtocol`` ignores the trainer's local parameters (Arctic's training
-engine owns the trained weights) and triggers the server-side train->sampler sync via
-``client.sync_weights``. Two behaviors matter and are pinned here: (1) ``cuda_ipc`` auto-selects from
-the backend's ``colocate`` flag unless explicitly overridden, and (2) ``send_weights`` must NOT consume
-the passed parameter iterator (consuming it would be wasted work and, worse, imply the wrong source of
-truth).
-"""
+"""CPU tests for ``ArcticWeightTransfer`` (IPC auto-select, unused param iterator)."""
 
 from __future__ import annotations
 
