@@ -31,7 +31,7 @@ def test_checked_in_catalog_is_valid():
         "schemaVersion": 1,
         "lastReviewed": "2026-08-19",
         "models": 10,
-        "profiles": 12,
+        "profiles": 11,
     }
 
 
@@ -68,8 +68,8 @@ def test_catalog_context_limits_match_upstream_models():
         ("Qwen/Qwen3-1.7B", "inference-8gpu", 1),
         ("Qwen/Qwen3-8B", "inference-8gpu", 1),
         ("Qwen/Qwen3.5-4B", "inference-8gpu", 1),
-        ("Qwen/Qwen3.6-35B-A3B", "inference-8gpu-tp8", 8),
-        ("Qwen/Qwen3.8-27B", "inference-8gpu-tp8", 8),
+        ("Qwen/Qwen3.6-35B-A3B", "inference-8gpu", 1),
+        ("Qwen/Qwen3.8-27B", "inference-8gpu", 1),
     ],
 )
 def test_qwen_inference_tensor_parallel_recommendations(
