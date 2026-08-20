@@ -53,7 +53,7 @@ class TestLogitsChunkRows(TestCasePlus):
 
 
 class TestLmHeadTemperatureLayout(TestCasePlus):
-    """#1: ``temperature != 1`` must not change logits rank."""
+    """``temperature != 1`` must not change logits rank."""
 
     def _model(self, hidden_size, vocab_size, device="cpu"):
         return make_tied_lm_head_model(hidden_size, vocab_size, device=device)

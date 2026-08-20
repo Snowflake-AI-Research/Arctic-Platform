@@ -55,6 +55,7 @@ from arctic_platform.common.utils import http_split_batch
 from arctic_platform.common.utils import merge_dict_shards
 from arctic_platform.common.utils.batch import finalize_fwd_bwd_metrics
 from arctic_platform.common.utils.batch import restore_batch_order
+from arctic_platform.common.utils.checkpoint import resolve_checkpoint_save_paths
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.ray_pg import ColocatePlacement
 from arctic_platform.common.utils.ray_pg import create_colocate_placement
@@ -490,22 +491,20 @@ async def save(job_id: int, request: SaveRequest = Body(default=SaveRequest())):
     _verify_job(job_id, "training")
     info = app.state.jobs[job_id]
     # Client path overrides the job dir; optional step → .../checkpoint-{step}/.
-    path = request.path or info.get("checkpoint_path", None)
-    assert path is not None, f"checkpoint_path is required for training job {job_id}"
+    root = request.path or info.get("checkpoint_path", None)
+    assert root is not None, f"checkpoint_path is required for training job {job_id}"
     step = request.step
-    if step is not None:
-        path = str(pathlib.Path(path) / f"checkpoint-{int(step)}")
+    path, prune_root = resolve_checkpoint_save_paths(root, step)
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
     export_hf = bool(request.export_hf)
     results = await asyncio.gather(
         *[w.save_checkpoint.remote(path, export_hf) for w in app.state.training_workers],
     )
-    parent = str(pathlib.Path(path).parent)
     if step is not None:
-        (pathlib.Path(parent) / "latest").write_text(str(int(step)))
+        (pathlib.Path(prune_root) / "latest").write_text(str(int(step)))
     limit = request.save_total_limit
     if limit is not None and int(limit) > 0 and app.state.training_workers:
-        await app.state.training_workers[0].prune_checkpoint_dirs.remote(parent, int(limit))
+        await app.state.training_workers[0].prune_checkpoint_dirs.remote(prune_root, int(limit))
     hf_path = None
     global_step = None
     if results and isinstance(results[0], dict):

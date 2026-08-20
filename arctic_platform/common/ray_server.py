@@ -50,6 +50,7 @@ from arctic_platform.common.utils import merge_dict_shards
 from arctic_platform.common.utils import ray_split_batch
 from arctic_platform.common.utils import unpack_batch
 from arctic_platform.common.utils.batch import restore_batch_order
+from arctic_platform.common.utils.checkpoint import resolve_checkpoint_save_paths
 from arctic_platform.common.utils.debug import ProfilerContext
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.ray_pg import ColocatePlacement
@@ -768,21 +769,19 @@ class ArcticRLRayServer:
         self._verify_job(job_id, "training")
         info = self.jobs[job_id]
         body = body or {}
-        path = body.get("path") or info.get("checkpoint_path", None)
-        assert path is not None, f"checkpoint_path is required for training jobs {job_id}"
+        root = body.get("path") or info.get("checkpoint_path", None)
+        assert root is not None, f"checkpoint_path is required for training jobs {job_id}"
         step = body.get("step")
-        if step is not None:
-            path = os.path.join(path, f"checkpoint-{int(step)}")
+        path, prune_root = resolve_checkpoint_save_paths(root, step)
         os.makedirs(path, exist_ok=True)
         export_hf = bool(body.get("export_hf", False))
         results = ray.get([w.save_checkpoint.remote(path, export_hf) for w in self.training_workers])
-        parent = os.path.dirname(path)
         if step is not None:
-            with open(os.path.join(parent, "latest"), "w", encoding="utf-8") as f:
+            with open(os.path.join(prune_root, "latest"), "w", encoding="utf-8") as f:
                 f.write(str(int(step)))
         limit = body.get("save_total_limit")
         if limit is not None and int(limit) > 0 and self.training_workers:
-            ray.get(self.training_workers[0].prune_checkpoint_dirs.remote(parent, int(limit)))
+            ray.get(self.training_workers[0].prune_checkpoint_dirs.remote(prune_root, int(limit)))
         hf_path = results[0].get("hf_path") if results and isinstance(results[0], dict) else None
         global_step = results[0].get("global_step") if results and isinstance(results[0], dict) else None
         return {"job_id": job_id, "path": path, "hf_path": hf_path, "global_step": global_step}
