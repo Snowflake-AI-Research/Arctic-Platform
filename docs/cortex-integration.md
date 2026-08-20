@@ -49,11 +49,14 @@ with no runtime error.
 | `algorithm.adv_estimator` | `grpo` only | GAE / RLOO / REMAX / REINFORCE++ consume real `old_log_probs` in the loss |
 | `actor_rollout_ref.actor.use_kl_loss` | must be `False` | needs `/forward` for ref log-probs |
 | `algorithm.use_kl_in_reward` | must be `False` | same |
-| `algorithm.kl_penalty` | `none` / unset | typed KL reads `ref_log_probs` from the batch |
-| `algorithm.kl_ctrl.kl_coef` (with KL on) | must be `0` | adaptive KL reads `ref_log_probs` |
 | `actor_rollout_ref.actor.ppo_epochs` | `1` | off-policy PPO needs the rollout-time snapshot |
 | `actor_rollout_ref.actor.policy_loss_fn` | must be unset | Cortex server has no custom-loss hook |
 | `actor_rollout_ref.rollout.multi_turn.enable` | must be `False` | multi-turn recomputes log-probs per turn |
+
+`algorithm.kl_penalty` and `algorithm.kl_ctrl.kl_coef` are only read when
+`use_kl_loss` or `use_kl_in_reward` is `True`, so verl's defaults for them
+are safe on Cortex when KL is off; the validator only complains about the
+two switches above.
 
 For any of these, use the on-prem backend (`ARCTIC_BACKEND=local` or
 unset). The validator raises `NotImplementedError` at
