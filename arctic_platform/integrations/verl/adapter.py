@@ -47,17 +47,11 @@ from arctic_platform.client import TrainingConfig
 from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
 from arctic_platform.rl.ray_server import ArcticRLRayServerState
 
-# Cortex ↔ on-prem response reshape for _send_update_actor. On-prem returns
-# fwd_bwd as {"metrics": {loss, grad_norm, ...}} and step as {"metrics":
-# {last_lr, ...}}. Cortex returns fwd_bwd as
-#   {job_id, avg_loss, metrics: {approx_kl, importance_weight, ...},
-#    post_process_outputs}
-# and step as
-#   {job_id, grad_norm, last_lr, global_steps, update_successful,
-#    weight_delta_*, ...}
-# — `loss` is called `avg_loss` on fwd_bwd, `grad_norm` moves onto step, and
-# there is no "metrics" wrapper on step at all. `_merge_train_response`
-# collapses either shape into a single flat metrics dict.
+# Cortex fwd_bwd + step response shapes differ from on-prem:
+#   on-prem: {"metrics": {loss, grad_norm, ...}} on both calls.
+#   cortex fwd_bwd: {avg_loss, metrics: {approx_kl, ...}, post_process_outputs, job_id}
+#   cortex step:    {grad_norm, last_lr, global_steps, weight_delta_*, job_id}
+# `_merge_train_response` flattens either shape into {loss, grad_norm, ...}.
 _CORTEX_METRIC_ALIAS = {"avg_loss": "loss"}
 _CORTEX_METRIC_DROP = {
     "job_id",
@@ -71,23 +65,18 @@ _CORTEX_METRIC_DROP = {
 }
 
 
-def _flatten_cortex_metrics(resp: dict) -> dict:
-    out: dict = {}
-    for k, v in resp.items():
-        if k == "metrics" and isinstance(v, dict):
-            out.update(v)
-            continue
-        if k in _CORTEX_METRIC_DROP:
-            continue
-        out[_CORTEX_METRIC_ALIAS.get(k, k)] = v
-    return out
-
-
 def _merge_train_response(step_response: dict, fwd_bwd_response: dict) -> dict:
-    """Merge fwd_bwd + step responses into a single ``{loss, grad_norm, ...}``
-    dict regardless of backend."""
-    merged = _flatten_cortex_metrics(step_response)
-    merged.update(_flatten_cortex_metrics(fwd_bwd_response))
+    def _flatten(resp: dict) -> dict:
+        out: dict = {}
+        for k, v in resp.items():
+            if k == "metrics" and isinstance(v, dict):
+                out.update(v)
+            elif k not in _CORTEX_METRIC_DROP:
+                out[_CORTEX_METRIC_ALIAS.get(k, k)] = v
+        return out
+
+    merged = _flatten(step_response)
+    merged.update(_flatten(fwd_bwd_response))
     return merged
 
 
@@ -802,10 +791,8 @@ class ArcticRLClientWrapper(RemoteBackend):
         payload["batch"]["loss_mask"] = payload["batch"]["response_mask"]
 
         if self._is_cortex_backend():
-            # Cortex takes {args, kwargs, context, processing}; on-prem takes
-            # {batch, meta, processing}. Pass the full envelope so the shared
-            # reshape can lift `meta` (batch_num_tokens/global_batch_size) into
-            # `processing.config` — the server-side GRPO loss needs them.
+            # Pass the full envelope so the helper can lift `meta` (batch_num_tokens,
+            # global_batch_size) into processing.config for the server-side loss.
             payload = to_cortex_fwd_bwd_payload(
                 payload,
                 dp_size=int(self._client.config.training_gpus or 1),

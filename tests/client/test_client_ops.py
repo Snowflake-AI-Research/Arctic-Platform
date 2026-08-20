@@ -516,11 +516,6 @@ class TestCortexSharedHelper:
         assert callable(to_cortex_fwd_bwd_payload)
 
     def test_reshape_matches_cortex_wire_shape(self):
-        # `to_cortex_fwd_bwd_payload` must produce Cortex's canonical
-        # `{args, kwargs, context, processing}` envelope. Server-side GRPO reads
-        # `input_ids` / `advantages` / `loss_mask` from `context` for its
-        # preflight; skipping any of these was the exact regression that
-        # bit the SkyRL E2E ("grpo packed microbatches require tensor input_ids").
         import torch
 
         from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
@@ -535,16 +530,13 @@ class TestCortexSharedHelper:
         assert out["args"] == ()
         assert torch.equal(out["kwargs"]["input_ids"], ids)
         assert torch.equal(out["kwargs"]["attention_mask"], attn)
+        # Server-side GRPO reads these from context for its preflight.
         assert torch.equal(out["context"]["input_ids"], ids)
         assert "advantages" in out["context"]
         assert "loss_mask" in out["context"]
-        # Cortex's arctic_training only registers a single GRPO loss by short name;
-        # the helper pins loss_fn="grpo" so verl's "verl_grpo" alias doesn't leak
-        # through and trip _resolve_fn's dotted-path parser server-side.
+        # Pin loss_fn="grpo" so verl's "verl_grpo" alias doesn't reach the server.
         assert out["processing"]["loss_fn"] == "grpo"
         assert out["processing"]["config"]["dp_size"] == 1
-        # old_log_probs is intentionally dropped; server-side GRPO defaults
-        # π_old = π_new via logprobs.detach() (correct for single-epoch on-policy).
         assert "old_log_probs" not in out["kwargs"]
         assert "old_log_probs_shifted" not in out["context"]
 

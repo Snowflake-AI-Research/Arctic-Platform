@@ -2,10 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cortex dispatch shim for the legacy ``arctic_platform.rl`` API.
 
-Lives under ``arctic_platform.integrations`` because it only exists to bridge
-the legacy SkyRL-shaped API to the unified ``arctic_platform.client`` — nothing
-in ``arctic_platform.rl`` itself needs it. ``arctic_platform.rl.create_arctic_rl_client``
-dispatches here when ``backend='cortex'`` is selected on the legacy config.
+``arctic_platform.rl.create_arctic_rl_client`` dispatches here when
+``backend='cortex'`` is set on the legacy config.
 
 Translates ``arctic_platform.rl.ArcticRLClientConfig`` (what SkyRL builds) into
 the unified ``arctic_platform.client.ArcticRLClientConfig`` with a
