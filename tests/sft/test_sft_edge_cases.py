@@ -25,7 +25,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from arctic_platform.sft.config import ArcticSFTClientConfig
 from arctic_platform.sft.processor import SFT_LOSS_FNS
 from arctic_platform.sft.processor import run_sft_pipeline
 from arctic_platform.sft.processor import sft_ce_loss
@@ -124,31 +123,14 @@ class TestDispatchDrift(TestCasePlus):
         self.assertEqual(SFT_LOSS_FNS, {"sft", "sft_ce"})
 
 
-class TestCheckpointPathRequired(TestCasePlus):
-    def test_new_job_requires_checkpoint_path(self):
-        """Fixed: client fails fast when starting a new job without a checkpoint_path."""
-        from pydantic import ValidationError
-
-        with self.assertRaises(ValidationError):
-            ArcticSFTClientConfig(model_name="m", training_gpus=1)
-
-    def test_reconnect_does_not_require_checkpoint_path(self):
-        # Reconnecting to an existing job inherits its path; none needed here.
-        cfg = ArcticSFTClientConfig(model_name="m", training_gpus=1, training_job_id=3)
-        self.assertIsNone(cfg.checkpoint_path)
-
-    def test_to_rl_config_forwards_checkpoint(self):
-        cfg = ArcticSFTClientConfig(model_name="m", training_gpus=1, checkpoint_path="/tmp/c")
-        rl = cfg.to_rl_config()
-        self.assertEqual(rl.training.checkpoint_path, "/tmp/c")
-
-
 class TestInitFailureShutdown(TestCasePlus):
     def test_initialize_failure_calls_shutdown(self):
+        from arctic_platform.client import ArcticClientConfig
+        from arctic_platform.client import ArcticSFTClient
         from arctic_platform.client import JobHandles
         from arctic_platform.client import Request
         from arctic_platform.client import Transport
-        from arctic_platform.sft.client import ArcticSFTClient
+        from arctic_platform.client import TrainingConfig
 
         class BoomTransport(Transport):
             def __init__(self, config):
@@ -169,24 +151,27 @@ class TestInitFailureShutdown(TestCasePlus):
                 self.shutdown_calls += 1
 
         # Patch via the module the client uses.
-        import arctic_platform.sft.client as mod
+        import arctic_platform.client.client as mod
 
-        original = mod._make_transport
+        original = mod.make_transport
         boom = None
 
-        def factory(cfg):
+        def factory(cfg, server_state=None):
             nonlocal boom
             boom = BoomTransport(cfg)
             return boom
 
-        mod._make_transport = factory
+        mod.make_transport = factory
         try:
+            cfg = ArcticClientConfig(
+                model_name="m", training_gpus=1, training=TrainingConfig(checkpoint_path="/tmp/c")
+            )
             with pytest.raises(RuntimeError, match="init failed"):
-                ArcticSFTClient(ArcticSFTClientConfig(model_name="m", training_gpus=1, checkpoint_path="/tmp/c"))
+                ArcticSFTClient(cfg)
             assert boom is not None
             assert boom.shutdown_calls == 1, f"expected shutdown on init failure, got {boom.shutdown_calls}"
         finally:
-            mod._make_transport = original
+            mod.make_transport = original
 
 
 class TestCommonPackageExports(TestCasePlus):
@@ -403,8 +388,8 @@ class TestPerfFixesUnit(TestCasePlus):
 
 class TestShimsStillResolve(TestCasePlus):
     def test_old_client_shim(self):
-        from arctic_platform.client.sft_client import ArcticSFTClient as C1
-        from arctic_platform.sft import ArcticSFTClient as C2
+        from arctic_platform.sft import ArcticSFTClient as C1
+        from arctic_platform.sft.client import ArcticSFTClient as C2
 
         self.assertIs(C1, C2)
 

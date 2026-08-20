@@ -19,6 +19,11 @@ Every op lives here exactly once: friendly signature -> canonical `Request`
 transport, so the client never mentions them. Switching deployment == changing
 `config.backend`. Sync and async frontends share the Request builders; they
 differ only at `transport.call` vs `transport.acall`.
+
+`ArcticClient` is the sync base holding every shared op. Workload subclasses add
+only what is genuinely theirs: `ArcticSFTClient` defaults the SFT loss contract
+onto the forward bodies, `SyncArcticRLClient` adds `log_probs`. `ArcticRLClient`
+is the async twin.
 """
 
 from __future__ import annotations
@@ -28,14 +33,14 @@ from typing import Literal
 from typing import overload
 
 from arctic_platform._dependency_groups import require_any_dep_group
-from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
 from arctic_platform.client.transport import initialize_or_cleanup
 
 
-def make_transport(config: ArcticRLClientConfig, server_state: Any = None) -> Transport:
+def make_transport(config: ArcticClientConfig, server_state: Any = None) -> Transport:
     protocol = config.backend.protocol
     if config.backend.type == "remote" and protocol == "cortex":
         require_any_dep_group("cortex")
@@ -90,7 +95,11 @@ def _step_request(jobs: JobHandles, learning_rate: float | None = None) -> Reque
     # via graceful key lookups today.
     # TODO(unify-backends): converge the server-side fwd_bwd/step *responses*
     # on ONE schema (loss + metrics) so callers never key on backend.
-    return Request("step", jobs.require("training"), {"learning_rate": learning_rate})
+    #
+    # LR is server-authoritative (the DeepSpeed schedule set at init), so an
+    # unset learning_rate is omitted rather than sent as an explicit null.
+    body = {} if learning_rate is None else {"learning_rate": learning_rate}
+    return Request("step", jobs.require("training"), body)
 
 
 def _save_checkpoint_request(
@@ -179,7 +188,15 @@ def _reset_prefix_cache_request(
     return Request("operation", sid, body)
 
 
-def _reconnect_config(config: ArcticRLClientConfig, jobs: JobHandles) -> ArcticRLClientConfig:
+def _sft_body(batch: dict) -> dict:
+    """The SFT loss contract: bodies carry ``processing`` + ``meta`` unless the caller set them."""
+    body = dict(batch)
+    body.setdefault("processing", {"loss_fn": "sft"})
+    body.setdefault("meta", {})
+    return body
+
+
+def _reconnect_config(config: ArcticClientConfig, jobs: JobHandles) -> ArcticClientConfig:
     """A serializable config that reattaches to these jobs in another process."""
     return config.model_copy(
         update={
@@ -201,21 +218,39 @@ def _get_server_state(transport: Transport) -> Any:
     return get_state()
 
 
-class SyncArcticRLClient:
-    def __init__(self, config: ArcticRLClientConfig, server_state: Any = None) -> None:
+def _maybe_print_server_profile(op: str, out: dict | None) -> None:
+    """Echo the server's per-op timings when ARL_SFT_PROFILE is set; a no-op otherwise."""
+    from arctic_platform.common.utils import sft_profile
+
+    if not sft_profile.enabled() or not isinstance(out, dict):
+        return
+    prof = (out.get("metrics") or {}).get("_profile_ms")
+    if isinstance(prof, dict) and prof:
+        sft_profile.maybe_print(f"server {op}", prof)
+
+
+class ArcticClient:
+    """The sync frontend: every op shared by SFT and RL. Subclass to add workload extras."""
+
+    def __init__(self, config: ArcticClientConfig, server_state: Any = None) -> None:
         self.config = config
         self.transport = make_transport(config, server_state=server_state)
         self.jobs = initialize_or_cleanup(self.transport)
 
+    def _call(self, request: Request) -> dict:
+        out = self.transport.call(request)
+        _maybe_print_server_profile(request.op, out)
+        return out
+
     # ── training ─────────────────────────────────────────────────────────
     def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
-        return self.transport.call(_fwd_bwd_request(self.jobs, batch, processing, router_replay))
+        return self._call(_fwd_bwd_request(self.jobs, batch, processing, router_replay))
 
     def fwd_no_grad(self, batch: dict, reference_model: bool = False) -> dict:
-        return self.transport.call(_fwd_no_grad_request(self.jobs, batch, reference_model))
+        return self._call(_fwd_no_grad_request(self.jobs, batch, reference_model))
 
     def step(self, learning_rate: float | None = None) -> dict:
-        return self.transport.call(_step_request(self.jobs, learning_rate))
+        return self._call(_step_request(self.jobs, learning_rate))
 
     def save_checkpoint(
         self,
@@ -228,7 +263,7 @@ class SyncArcticRLClient:
         save_total_limit: int | None = None,
         stage_info: dict | None = None,
     ) -> dict:
-        return self.transport.call(
+        return self._call(
             _save_checkpoint_request(
                 self.jobs,
                 checkpoint_id,
@@ -243,18 +278,13 @@ class SyncArcticRLClient:
 
     def load_checkpoint(self, path: str | None = None, *, step: int | None = None) -> dict:
         """Restore weights/optimizer/LR/step. Returns ``{"global_step", ...}``."""
-        return self.transport.call(_load_checkpoint_request(self.jobs, path, step))
+        return self._call(_load_checkpoint_request(self.jobs, path, step))
 
-    # ── sampling / log-prob ──────────────────────────────────────────────
+    # ── sampling ─────────────────────────────────────────────────────────
     def generate(
         self, prompts: list, sampling_params: dict | None = None, routing_key: Any = None, strict: bool = False
     ) -> list:
-        return self.transport.call(_generate_request(self.jobs, prompts, sampling_params, routing_key, strict))[
-            "results"
-        ]
-
-    def log_probs(self, prompts: list, completions: list | None = None, top_k: int = 1) -> dict:
-        return self.transport.call(_log_probs_request(self.jobs, prompts, completions, top_k))
+        return self._call(_generate_request(self.jobs, prompts, sampling_params, routing_key, strict))["results"]
 
     # ── weight sync + cache ──────────────────────────────────────────────
     def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict:
@@ -264,28 +294,28 @@ class SyncArcticRLClient:
         call.
         """
         self.wake_inference(tags=["weights"])
-        out = self.transport.call(_sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory))
+        out = self._call(_sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory))
         self.wake_inference(tags=["kv_cache"])
         self.reset_prefix_cache()
         return out
 
     def reset_prefix_cache(self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1) -> dict:
-        return self.transport.call(_reset_prefix_cache_request(self.jobs, drain, timeout_s, retry_interval_s))
+        return self._call(_reset_prefix_cache_request(self.jobs, drain, timeout_s, retry_interval_s))
 
     def sleep_inference(self, level: int = 1) -> dict:
-        return self.transport.call(Request("sleep-inference", self.jobs.require("sampling"), {"level": level}))
+        return self._call(Request("sleep-inference", self.jobs.require("sampling"), {"level": level}))
 
     def wake_inference(self, tags: list | None = None) -> dict:
-        return self.transport.call(Request("wake-inference", self.jobs.require("sampling"), tags))
+        return self._call(Request("wake-inference", self.jobs.require("sampling"), tags))
 
     def sleep_training(self, mode: str = "all") -> dict:
-        return self.transport.call(Request("sleep-training", self.jobs.require("training"), {"mode": mode}))
+        return self._call(Request("sleep-training", self.jobs.require("training"), {"mode": mode}))
 
     def wake_training(self) -> dict:
-        return self.transport.call(Request("wake-training", self.jobs.require("training"), {}))
+        return self._call(Request("wake-training", self.jobs.require("training"), {}))
 
     # ── lifecycle ────────────────────────────────────────────────────────
-    def reconnect_config(self) -> ArcticRLClientConfig:
+    def reconnect_config(self) -> ArcticClientConfig:
         return _reconnect_config(self.config, self.jobs)
 
     def get_server_state(self) -> Any:
@@ -294,30 +324,52 @@ class SyncArcticRLClient:
     def shutdown(self) -> None:
         self.transport.shutdown()
 
-    def __enter__(self) -> SyncArcticRLClient:
+    def __enter__(self) -> ArcticClient:
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.shutdown()
 
 
-class ArcticRLClient:
-    """The async client. Use `SyncArcticRLClient` for blocking calls."""
+class ArcticSFTClient(ArcticClient):
+    """SFT frontend: forward bodies default to the ``sft`` loss unless the caller overrides."""
 
-    def __init__(self, config: ArcticRLClientConfig, server_state: Any = None) -> None:
+    def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
+        return super().fwd_bwd(_sft_body(batch), processing, router_replay)
+
+    def fwd_no_grad(self, batch: dict, reference_model: bool = False) -> dict:
+        return super().fwd_no_grad(_sft_body(batch), reference_model)
+
+
+class SyncArcticRLClient(ArcticClient):
+    """RL frontend. Use `ArcticRLClient` for the async twin."""
+
+    def log_probs(self, prompts: list, completions: list | None = None, top_k: int = 1) -> dict:
+        return self._call(_log_probs_request(self.jobs, prompts, completions, top_k))
+
+
+class ArcticRLClient:
+    """The async RL client. Use `SyncArcticRLClient` for blocking calls."""
+
+    def __init__(self, config: ArcticClientConfig, server_state: Any = None) -> None:
         self.config = config
         self.transport = make_transport(config, server_state=server_state)
         self.jobs = initialize_or_cleanup(self.transport)
 
+    async def _acall(self, request: Request) -> dict:
+        out = await self.transport.acall(request)
+        _maybe_print_server_profile(request.op, out)
+        return out
+
     # ── training ─────────────────────────────────────────────────────────
     async def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
-        return await self.transport.acall(_fwd_bwd_request(self.jobs, batch, processing, router_replay))
+        return await self._acall(_fwd_bwd_request(self.jobs, batch, processing, router_replay))
 
     async def fwd_no_grad(self, batch: dict, reference_model: bool = False) -> dict:
-        return await self.transport.acall(_fwd_no_grad_request(self.jobs, batch, reference_model))
+        return await self._acall(_fwd_no_grad_request(self.jobs, batch, reference_model))
 
     async def step(self, learning_rate: float | None = None) -> dict:
-        return await self.transport.acall(_step_request(self.jobs, learning_rate))
+        return await self._acall(_step_request(self.jobs, learning_rate))
 
     async def save_checkpoint(
         self,
@@ -330,7 +382,7 @@ class ArcticRLClient:
         save_total_limit: int | None = None,
         stage_info: dict | None = None,
     ) -> dict:
-        return await self.transport.acall(
+        return await self._acall(
             _save_checkpoint_request(
                 self.jobs,
                 checkpoint_id,
@@ -344,24 +396,24 @@ class ArcticRLClient:
         )
 
     async def load_checkpoint(self, path: str | None = None, *, step: int | None = None) -> dict:
-        return await self.transport.acall(_load_checkpoint_request(self.jobs, path, step))
+        return await self._acall(_load_checkpoint_request(self.jobs, path, step))
 
     # ── sampling / log-prob ──────────────────────────────────────────────
     async def generate(
         self, prompts: list, sampling_params: dict | None = None, routing_key: Any = None, strict: bool = False
     ) -> list:
-        return (
-            await self.transport.acall(_generate_request(self.jobs, prompts, sampling_params, routing_key, strict))
-        )["results"]
+        return (await self._acall(_generate_request(self.jobs, prompts, sampling_params, routing_key, strict)))[
+            "results"
+        ]
 
     async def log_probs(self, prompts: list, completions: list | None = None, top_k: int = 1) -> dict:
-        return await self.transport.acall(_log_probs_request(self.jobs, prompts, completions, top_k))
+        return await self._acall(_log_probs_request(self.jobs, prompts, completions, top_k))
 
     # ── weight sync + cache ──────────────────────────────────────────────
     async def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict:
         """Async twin of SyncArcticRLClient.sync_weights (staged wake → operation → wake → reset)."""
         await self.wake_inference(tags=["weights"])
-        out = await self.transport.acall(_sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory))
+        out = await self._acall(_sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory))
         await self.wake_inference(tags=["kv_cache"])
         await self.reset_prefix_cache()
         return out
@@ -369,22 +421,22 @@ class ArcticRLClient:
     async def reset_prefix_cache(
         self, drain: bool = True, timeout_s: float = 60.0, retry_interval_s: float = 0.1
     ) -> dict:
-        return await self.transport.acall(_reset_prefix_cache_request(self.jobs, drain, timeout_s, retry_interval_s))
+        return await self._acall(_reset_prefix_cache_request(self.jobs, drain, timeout_s, retry_interval_s))
 
     async def sleep_inference(self, level: int = 1) -> dict:
-        return await self.transport.acall(Request("sleep-inference", self.jobs.require("sampling"), {"level": level}))
+        return await self._acall(Request("sleep-inference", self.jobs.require("sampling"), {"level": level}))
 
     async def wake_inference(self, tags: list | None = None) -> dict:
-        return await self.transport.acall(Request("wake-inference", self.jobs.require("sampling"), tags))
+        return await self._acall(Request("wake-inference", self.jobs.require("sampling"), tags))
 
     async def sleep_training(self, mode: str = "all") -> dict:
-        return await self.transport.acall(Request("sleep-training", self.jobs.require("training"), {"mode": mode}))
+        return await self._acall(Request("sleep-training", self.jobs.require("training"), {"mode": mode}))
 
     async def wake_training(self) -> dict:
-        return await self.transport.acall(Request("wake-training", self.jobs.require("training"), {}))
+        return await self._acall(Request("wake-training", self.jobs.require("training"), {}))
 
     # ── lifecycle ────────────────────────────────────────────────────────
-    def reconnect_config(self) -> ArcticRLClientConfig:
+    def reconnect_config(self) -> ArcticClientConfig:
         return _reconnect_config(self.config, self.jobs)
 
     def get_server_state(self) -> Any:
@@ -405,18 +457,18 @@ class ArcticRLClient:
 
 @overload
 def create_arctic_rl_client(  # noqa: E704
-    config: ArcticRLClientConfig, *, blocking_calls: Literal[False] = ..., server_state: Any = ...
+    config: ArcticClientConfig, *, blocking_calls: Literal[False] = ..., server_state: Any = ...
 ) -> ArcticRLClient: ...
 
 
 @overload
 def create_arctic_rl_client(  # noqa: E704
-    config: ArcticRLClientConfig, *, blocking_calls: Literal[True], server_state: Any = ...
+    config: ArcticClientConfig, *, blocking_calls: Literal[True], server_state: Any = ...
 ) -> SyncArcticRLClient: ...
 
 
 def create_arctic_rl_client(
-    config: ArcticRLClientConfig, *, blocking_calls: bool = False, server_state: Any = None
+    config: ArcticClientConfig, *, blocking_calls: bool = False, server_state: Any = None
 ) -> ArcticRLClient | SyncArcticRLClient:
     """Async client by default; pass blocking_calls=True for the sync client.
 
@@ -425,3 +477,7 @@ def create_arctic_rl_client(
     """
     cls = SyncArcticRLClient if blocking_calls else ArcticRLClient
     return cls(config, server_state=server_state)
+
+
+def create_arctic_sft_client(config: ArcticClientConfig) -> ArcticSFTClient:
+    return ArcticSFTClient(config)

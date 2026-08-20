@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 from abc import abstractmethod
 
-from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import JOB_CREATE_ORDER
 from arctic_platform.client.transport import JOB_TYPES
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 class OnPremTransport(Transport):
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: ArcticClientConfig) -> None:
         self.config = config
         self.jobs = JobHandles()
 

@@ -33,8 +33,10 @@ import tempfile
 
 from transformers import AutoTokenizer
 
+from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client import OnPremConfig
+from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
-from arctic_platform.sft import ArcticSFTClientConfig
 
 STEPS = 20
 SEED = 42
@@ -87,37 +89,40 @@ def _config(
     training_gpus: int,
     loss_fn: str,
     server_cuda_visible_devices: str | None,
-) -> ArcticSFTClientConfig:
+) -> ArcticClientConfig:
     ckpt = stack.enter_context(tempfile.TemporaryDirectory(prefix="arl_sft_ckpt_"))
-    return ArcticSFTClientConfig(
-        backend="onprem",
-        comm_protocol=comm_protocol,
-        launch_local_server=launch_local_server,
-        server_cuda_visible_devices=server_cuda_visible_devices,
+    return ArcticClientConfig(
         model_name=MODEL,
         seed=SEED,
         training_gpus=training_gpus,
-        checkpoint_path=ckpt,  # server requires this for training jobs
         job_ready_timeout=600.0,
-        ds_config={
-            "train_micro_batch_size_per_gpu": 1,
-            "train_batch_size": training_gpus,
-            "gradient_accumulation_steps": 1,
-            "zero_optimization": {
-                "stage": 2,
-                "offload_optimizer": {"device": "none"},
-                "offload_param": {"device": "none"},
+        backend=OnPremConfig(
+            protocol=comm_protocol,
+            launch_local_server=launch_local_server,
+            server_cuda_visible_devices=server_cuda_visible_devices,
+        ),
+        training=TrainingConfig(
+            checkpoint_path=ckpt,  # server requires this for training jobs
+            ds_config={
+                "train_micro_batch_size_per_gpu": 1,
+                "train_batch_size": training_gpus,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                    "stage": 2,
+                    "offload_optimizer": {"device": "none"},
+                    "offload_param": {"device": "none"},
+                },
+                "optimizer": {
+                    "type": "AdamW",
+                    "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+                },
             },
-            "optimizer": {
-                "type": "AdamW",
-                "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+            ds_worker_config={
+                "attn_implementation": ATTN,
+                "enable_gradient_checkpointing": False,
+                "zorro_train_enable": False,
             },
-        },
-        ds_worker_config={
-            "attn_implementation": ATTN,
-            "enable_gradient_checkpointing": False,
-            "zorro_train_enable": False,
-        },
+        ),
     )
 
 

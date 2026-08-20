@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The op surface of ArcticRLClient / SyncArcticRLClient must lower to one
-canonical Request each.
+"""The op surface of the unified client must lower to one canonical Request each.
 
 A FakeTransport records the Request every op produces so we can assert the
-mapping (target job, body, binary flag) with no live backend or GPUs.
+mapping (target job, body, binary flag) with no live backend or GPUs. The shared
+ops are driven across all three frontends (async RL, sync RL, SFT) so a subclass
+cannot silently diverge from the base; op-registry coverage and log_probs stay on
+the RL clients, and SFT's loss-fn defaulting is asserted in tests/sft.
 """
 
 from __future__ import annotations
@@ -27,8 +29,9 @@ import inspect
 import pytest
 
 from arctic_platform.client import OPS
+from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import ArcticRLClient
-from arctic_platform.client import ArcticRLClientConfig
+from arctic_platform.client import ArcticSFTClient
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
@@ -43,7 +46,7 @@ TRAINING, SAMPLING, LOG_PROB = 1, 2, 3
 
 
 class FakeTransport(Transport):
-    def __init__(self, config: ArcticRLClientConfig, server_state=None) -> None:
+    def __init__(self, config: ArcticClientConfig, server_state=None) -> None:
         self.config = config
         self.server_state = server_state
         self.jobs = JobHandles()
@@ -72,14 +75,24 @@ def _call(client, method: str, *args, **kwargs):
     return result
 
 
-@pytest.fixture(params=[ArcticRLClient, SyncArcticRLClient], ids=["async", "sync"])
-def client(monkeypatch, request) -> ArcticRLClient | SyncArcticRLClient:
+def _build(monkeypatch, cls):
     monkeypatch.setattr(client_module, "make_transport", FakeTransport)
-    cfg = ArcticRLClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1)
-    return request.param(cfg)
+    return cls(ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1))
 
 
-def _last(client: ArcticRLClient | SyncArcticRLClient) -> Request:
+@pytest.fixture(params=[ArcticRLClient, SyncArcticRLClient, ArcticSFTClient], ids=["async", "sync", "sft"])
+def client(monkeypatch, request):
+    """Every frontend, for the ops they all share."""
+    return _build(monkeypatch, request.param)
+
+
+@pytest.fixture(params=[ArcticRLClient, SyncArcticRLClient], ids=["async", "sync"])
+def rl_client(monkeypatch, request) -> ArcticRLClient | SyncArcticRLClient:
+    """RL-only surface (log_probs) and full op-registry coverage."""
+    return _build(monkeypatch, request.param)
+
+
+def _last(client) -> Request:
     return client.transport.calls[-1]
 
 
@@ -150,13 +163,17 @@ class TestOpMapping:
         assert req.body == {"prompts": ["hi"], "sampling_params": {"n": 1}, "routing_key": "k", "strict": True}
         assert out == ["ok"]
 
-    def test_log_probs_targets_log_prob(self, client):
-        """log_probs -> log_prob job."""
-        _call(client, "log_probs", ["hi"], completions=["there"], top_k=3)
-        req = _last(client)
+    def test_log_probs_targets_log_prob(self, rl_client):
+        """log_probs -> log_prob job. RL-only: SFT never allocates a log-prob engine."""
+        _call(rl_client, "log_probs", ["hi"], completions=["there"], top_k=3)
+        req = _last(rl_client)
         assert req.op == "log-probs"
         assert req.job_id == LOG_PROB
         assert req.body == {"prompts": ["hi"], "completions": ["there"], "top_k": 3}
+
+    def test_sft_client_has_no_log_probs(self, monkeypatch):
+        """log_probs stays on the RL subclass, not the shared base."""
+        assert not hasattr(_build(monkeypatch, ArcticSFTClient), "log_probs")
 
     def test_reset_prefix_cache_targets_sampling(self, client):
         """reset_prefix_cache -> sampling job via the operation envelope."""
@@ -242,7 +259,7 @@ class TestServerState:
                 return sentinel
 
         monkeypatch.setattr(client_module, "make_transport", StatefulTransport)
-        cfg = ArcticRLClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1)
+        cfg = ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1)
         assert ArcticRLClient(cfg).get_server_state() is sentinel
 
     def test_create_client_forwards_server_state_for_reconnect(self, monkeypatch):
@@ -264,7 +281,7 @@ class TestServerState:
                 return self.server_state
 
         monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
-        cfg = ArcticRLClientConfig(
+        cfg = ArcticClientConfig(
             model_name="m",
             backend=OnPremConfig(protocol="ray"),
             training_gpus=1,
@@ -283,25 +300,25 @@ class TestOpRegistry:
     """Contract: the client's op vocabulary and OPS stay in lockstep, and a
     transport's op coverage is checkable without a live backend."""
 
-    def test_client_emits_exactly_the_registered_ops(self, client):
+    def test_client_emits_exactly_the_registered_ops(self, rl_client):
         """Driving every client op must cover the canonical OPS set."""
-        _call(client, "fwd_bwd", {"input_ids": [1]})
-        _call(client, "fwd_no_grad", {"input_ids": [1]})
-        _call(client, "step")
-        _call(client, "save_checkpoint")
-        _call(client, "load_checkpoint")
-        _call(client, "generate", ["hi"])
-        _call(client, "log_probs", ["hi"])
+        _call(rl_client, "fwd_bwd", {"input_ids": [1]})
+        _call(rl_client, "fwd_no_grad", {"input_ids": [1]})
+        _call(rl_client, "step")
+        _call(rl_client, "save_checkpoint")
+        _call(rl_client, "load_checkpoint")
+        _call(rl_client, "generate", ["hi"])
+        _call(rl_client, "log_probs", ["hi"])
         # sync_weights expands to wake + operation + wake + reset(operation)
-        n_before = len(client.transport.calls)
-        _call(client, "sync_weights")
-        assert {"wake-inference", "operation"} <= {r.op for r in client.transport.calls[n_before:]}
-        _call(client, "reset_prefix_cache")
-        _call(client, "sleep_inference")
-        _call(client, "wake_inference")
-        _call(client, "sleep_training")
-        _call(client, "wake_training")
-        assert {req.op for req in client.transport.calls} == OPS
+        n_before = len(rl_client.transport.calls)
+        _call(rl_client, "sync_weights")
+        assert {"wake-inference", "operation"} <= {r.op for r in rl_client.transport.calls[n_before:]}
+        _call(rl_client, "reset_prefix_cache")
+        _call(rl_client, "sleep_inference")
+        _call(rl_client, "wake_inference")
+        _call(rl_client, "sleep_training")
+        _call(rl_client, "wake_training")
+        assert {req.op for req in rl_client.transport.calls} == OPS
 
     def test_unresolved_ops_flags_a_missing_method(self):
         """A target missing one op's method is reported (renamed/dropped op -> caught early)."""
@@ -337,14 +354,14 @@ class TestTransportSelection:
                 self.server_state = server_state
 
         monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
-        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(protocol="ray"), training_gpus=1)
+        cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(protocol="ray"), training_gpus=1)
         assert isinstance(client_module.make_transport(cfg), DummyRay)
 
     def test_make_transport_selects_http_for_onprem(self):
         """onprem + http (the default) routes to HttpTransport."""
         from arctic_platform.client.transports.onprem_http import HttpTransport
 
-        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(protocol="http"), training_gpus=1)
+        cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(protocol="http"), training_gpus=1)
         assert isinstance(client_module.make_transport(cfg), HttpTransport)
 
     def test_make_transport_forwards_server_state_to_ray(self, monkeypatch):
@@ -358,13 +375,13 @@ class TestTransportSelection:
 
         monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
         sentinel = object()
-        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(protocol="ray"), training_gpus=1)
+        cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(protocol="ray"), training_gpus=1)
         transport = client_module.make_transport(cfg, server_state=sentinel)
         assert transport.server_state is sentinel
 
     def test_make_transport_rejects_server_state_for_http(self):
         """server_state reconnect is Ray-only; HTTP transport must reject it."""
-        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(protocol="http"), training_gpus=1)
+        cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(protocol="http"), training_gpus=1)
         with pytest.raises(ValueError, match="server_state reconnect"):
             client_module.make_transport(cfg, server_state=object())
 
@@ -376,7 +393,7 @@ class TestWeightSyncStrategyInit:
     def test_training_init_payload_carries_strategy(self):
         from arctic_platform.client import TrainingConfig
 
-        cfg = ArcticRLClientConfig(
+        cfg = ArcticClientConfig(
             model_name="m",
             training_gpus=1,
             training=TrainingConfig(checkpoint_path="/tmp/c", cuda_ipc=True, low_memory=True),
@@ -386,7 +403,7 @@ class TestWeightSyncStrategyInit:
         assert payload["low_memory"] is True
 
     def test_non_training_init_payload_omits_strategy(self):
-        cfg = ArcticRLClientConfig(model_name="m", sampling_gpus=1)
+        cfg = ArcticClientConfig(model_name="m", sampling_gpus=1)
         payload = cfg.to_onprem("sampling")
         assert "cuda_ipc" not in payload
         assert "low_memory" not in payload

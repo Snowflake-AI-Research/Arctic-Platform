@@ -1,27 +1,44 @@
-# RL client unification notes
+# Client unification notes
 
-Goal: one `ArcticRLClient` frontend where **every backend accepts identical
-per-op args/kwargs and returns identically-shaped responses**, so each transport
-is a dumb forwarder of `Request(op, job_id, body)` with no per-op rewiring.
+Goal: one client frontend where **every backend accepts identical per-op
+args/kwargs and returns identically-shaped responses**, so each transport is a
+dumb forwarder of `Request(op, job_id, body)` with no per-op rewiring.
 
 This package is the target design. The op *surface* (names, args, canonical
 body, which job each op targets, response contract) is defined once in
 `client.py`; a transport owns only job identity + wire mechanics.
+
+## One client, thin workload subclasses
+SFT and RL share a single sync base:
+
+- `ArcticClient` — every shared op. Ops route through `_call`, which also carries
+  the (env-gated) server-profile echo.
+- `ArcticSFTClient(ArcticClient)` — defaults `processing={"loss_fn": "sft"}` and
+  `meta` onto the two forward bodies. Nothing else is SFT-specific.
+- `SyncArcticRLClient(ArcticClient)` — adds `log_probs`, which needs a log-prob
+  engine that SFT never allocates.
+- `ArcticRLClient` — the async RL twin. It does not inherit from `ArcticClient`
+  (sync/async method bodies cannot be shared) but reuses the same module-level
+  `_*_request` builders, so the op vocabulary is still defined exactly once.
+
+Keep new ops on `ArcticClient` unless they genuinely require a job type or a
+data contract the other workload does not have.
 
 ## Design in place (this package)
 - `Transport` ABC + `JobHandles` + `Request` (single op vocabulary in `client.py`).
 - `OnPremTransport` base: job creation, ordering, payload building. Concrete
   transports implement only the delivery primitives (`_start`, `call`, `_destroy`,
   `_wait_running`); `call` posts/dispatches the op against its target job.
-- `JOB_CREATE_ORDER` + `ArcticRLClientConfig.gpus_for()` centralize GPU-gating and
+- `JOB_CREATE_ORDER` + `ArcticClientConfig.gpus_for()` centralize GPU-gating and
   creation order so transports no longer hand-roll them.
 
 ## Config nesting (canonical)
-One shared shape for every backend — engine knobs are never duplicated under
-backend-specific aliases:
+One shared shape for every backend *and* every workload — engine knobs are never
+duplicated under backend-specific aliases. `ArcticRLClientConfig` remains as a
+back-compat alias; the flat, on-prem-only `ArcticSFTClientConfig` is gone:
 
 ```
-ArcticRLClientConfig
+ArcticClientConfig
 ├── model_name, dtype, max_seq_len      # shared identity / length
 ├── training_gpus / sampling_gpus / ... # allocation only
 ├── training: TrainingConfig
@@ -33,11 +50,11 @@ ArcticRLClientConfig
 └── backend_config: OnPrem | Cortex     # connection / deploy only
 ```
 
-`ArcticRLClientConfig.model_spec()` assembles a full `arctic_platform.model.ModelSpec`
+`ArcticClientConfig.model_spec()` assembles a full `arctic_platform.model.ModelSpec`
 from `model_name` + `training.model` for `build_model(...)`.
 
 ### Temporary wire adapters — delete after server alignment
-`ArcticRLClientConfig.to_onprem(job_type)` and `.to_cortex()` translate the
+`ArcticClientConfig.to_onprem(job_type)` and `.to_cortex()` translate the
 canonical shape into today's on-prem `/initialize` and Cortex `sub_job_configs`
 wires:
 

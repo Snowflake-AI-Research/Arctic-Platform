@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 
-from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import method_name
@@ -42,7 +42,7 @@ class RayTransport(OnPremTransport):
     exist on the shared state actor).
     """
 
-    def __init__(self, config: ArcticRLClientConfig, server_state: object | None = None) -> None:
+    def __init__(self, config: ArcticClientConfig, server_state: object | None = None) -> None:
         super().__init__(config)
         self._reconnect = server_state is not None
         if self._reconnect:

@@ -12,10 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from arctic_platform.client.client import ArcticClient
 from arctic_platform.client.client import ArcticRLClient
+from arctic_platform.client.client import ArcticSFTClient
 from arctic_platform.client.client import SyncArcticRLClient
 from arctic_platform.client.client import create_arctic_rl_client
+from arctic_platform.client.client import create_arctic_sft_client
 from arctic_platform.client.client import make_transport
+from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.config import CortexConfig
 from arctic_platform.client.config import OnPremConfig
@@ -29,8 +33,11 @@ from arctic_platform.client.transport import unresolved_ops
 
 __all__ = [
     "OPS",
+    "ArcticClient",
+    "ArcticClientConfig",
     "ArcticRLClient",
     "ArcticRLClientConfig",
+    "ArcticSFTClient",
     "CortexConfig",
     "JobHandles",
     "OnPremConfig",
@@ -40,6 +47,7 @@ __all__ = [
     "SyncArcticRLClient",
     "Transport",
     "create_arctic_rl_client",
+    "create_arctic_sft_client",
     "make_transport",
     "unresolved_ops",
 ]
