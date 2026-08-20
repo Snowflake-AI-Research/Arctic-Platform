@@ -348,6 +348,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
             master_port = (
                 self.ds_master_port if self.ds_master_port is not None else int(os.environ.get("MASTER_PORT", 29500))
             )
+
             def actor_options(rank):
                 if colocate and placement:
                     return _pg_options(bundle_index=rank, fraction_key="training")
