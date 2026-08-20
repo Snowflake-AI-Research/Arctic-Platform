@@ -22,7 +22,10 @@ import types
 import pytest
 import torch
 
-from arctic_platform.integrations.trl.weights import ArcticWeightTransfer
+# Importing weights runs the trl integration package __init__, which imports trl; skip on a minimal image.
+pytest.importorskip("trl.experimental.api")
+
+from arctic_platform.integrations.trl.weights import ArcticWeightTransfer  # noqa: E402
 
 
 def _client(colocate: bool | None):
