@@ -35,18 +35,29 @@ from dataclasses import field
 from typing import Any
 
 import chz
-from recipes._shared.cortex_training import TrainSequence
-from recipes._shared.cortex_training import build_renderer
-from recipes._shared.cortex_training import collate
-from recipes._shared.cortex_training import forward_backward_step
-from recipes._shared.cortex_training import make_client
-from recipes._shared.cortex_training import running_job
-from recipes._shared.cortex_training import sequence_from_rollout
-from recipes._shared.cortex_training import stop_params_for
-from recipes._shared.cortex_training import sync_weights
 from tinker_cookbook.utils import ml_log
 
 from cortex_training.client import DEBUG_OPTIONS_ENV
+from recipes._shared.cortex_training import (
+    TrainSequence,
+    bootstrap_router_replay,
+    build_renderer,
+    collate,
+    discard_router_replay,
+    forward_backward_step,
+    log_saved_checkpoints,
+    lora_peft_config,
+    make_client,
+    router_replay_config,
+    router_replay_stop_params,
+    running_job,
+    sampling_params_with_sample_ids,
+    sampling_sub_job_id,
+    save_recipe_checkpoints,
+    sequence_from_rollout,
+    stop_params_for,
+    sync_weights,
+)
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
@@ -55,16 +66,6 @@ logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 
 # Match MathEnv / ProblemEnv defaults.
 FORMAT_COEF = 0.1
-
-_LORA_TARGET_MODULES = (
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-)
 
 
 @dataclass
@@ -88,11 +89,9 @@ def load_math(seed: int = 0) -> MathProblems:
     for row in train_rows:
         train.append((row["problem"], extract_boxed(row["solution"])))
 
-    test_rows = _get_hendrycks_math_test()
     test: list[tuple[str, str]] = []
-    for row in test_rows:
+    for row in _get_hendrycks_math_test():
         test.append((row["problem"], extract_boxed(row["solution"])))
-
     return MathProblems(train=train, test=test or None)
 
 
@@ -224,6 +223,9 @@ class Config:
     dtype: str = "bfloat16"
     seed: int = 0
     max_seq_len: int = 8192
+    # huggingface for dense / LoRA; prime_rl for MoE with expert parallelism.
+    model_provider: str = "huggingface"
+    ep_size: int | None = None
 
     problems_per_batch: int = 64
     group_size: int = 16
@@ -250,32 +252,21 @@ class Config:
     # 0 = dense FT. Set e.g. 32 for LoRA (r == alpha).
     lora_rank: int = 32
 
+    router_replay: bool = False
+    router_replay_max_cache_bytes: int | None = None
+
     debug_image_tag: str | None = None
 
-    # Evals. 0 disables; otherwise baseline at batch 0 and the final batch.
+    # Evals. 0 disables; otherwise baseline at batch 0, every N, and the last batch.
     eval_every: int = 10
-    # MATH-500 is 500 problems — None means the full split.
+    # Caps sampling.evaluate max_examples. None runs the full split.
     n_test: int | None = None
-    # uses the training temperature / max_tokens by default.
     eval_temperature: float | None = None
     eval_max_tokens: int | None = None
 
     log_path: str = "/tmp/cortex-training-examples/rl-loop"
     wandb_project: str | None = None
     wandb_name: str | None = None
-
-
-def lora_config(config: Config) -> dict[str, Any] | None:
-    if config.lora_rank <= 0:
-        return None
-    return {
-        "peft_type": "Lora",
-        "r": config.lora_rank,
-        "lora_alpha": config.lora_rank,
-        "lora_dropout": 0.0,
-        "bias": "none",
-        "target_modules": list(_LORA_TARGET_MODULES),
-    }
 
 
 def job_body(config: Config) -> dict:
@@ -286,9 +277,17 @@ def job_body(config: Config) -> dict:
             f"micro_batch_size * training_gpus ({config.micro_batch_size} * "
             f"{config.training_gpus} = {per_step})"
         )
+    if config.ep_size is not None:
+        if config.ep_size <= 0:
+            raise ValueError(f"ep_size must be positive, got {config.ep_size}")
+        if config.training_gpus % config.ep_size != 0:
+            raise ValueError(
+                f"training_gpus ({config.training_gpus}) must be a multiple of "
+                f"ep_size ({config.ep_size})"
+            )
 
     training_config: dict = {
-        "model_provider": "huggingface",
+        "model_provider": config.model_provider,
         "n_gpus": config.training_gpus,
         "max_seq_len": config.max_seq_len,
         "train_batch_size": config.train_batch_size,
@@ -309,11 +308,21 @@ def job_body(config: Config) -> dict:
             "bf16": {"enabled": True},
         },
     }
-    peft = lora_config(config)
+    if config.ep_size is not None:
+        training_config["ep_size"] = config.ep_size
+    if config.model_provider == "prime_rl" and config.router_replay:
+        training_config["prime_rl"] = {
+            "fused_cross_entropy": False,
+        }
+    peft = lora_peft_config(config.lora_rank)
     if peft is not None:
         training_config["peft_config"] = peft
     if config.gradient_clipping is not None:
         training_config["gradient_clipping"] = config.gradient_clipping
+    if config.router_replay:
+        training_config["router_replay"] = router_replay_config(
+            max_cache_bytes=config.router_replay_max_cache_bytes,
+        )
 
     inference_config: dict = {
         "max_seq_len": config.max_seq_len,
@@ -325,6 +334,10 @@ def job_body(config: Config) -> dict:
     }
     if peft is not None:
         inference_config["peft_config"] = peft
+    if config.router_replay:
+        inference_config["router_replay"] = router_replay_config(
+            max_cache_bytes=config.router_replay_max_cache_bytes,
+        )
 
     body: dict = {
         "sub_job_configs": [
@@ -359,6 +372,10 @@ def processing_block(config: Config, global_batch_size: int) -> dict:
             global_batch_size=global_batch_size,
         ),
     )
+
+
+def _should_eval(step: int, total_steps: int, eval_every: int) -> bool:
+    return eval_every > 0 and (step % eval_every == 0 or step == total_steps - 1)
 
 
 def main(config: Config):
@@ -399,7 +416,11 @@ def _train(config: Config, ml_logger: Any) -> None:
         config.group_size,
     )
 
-    stop_params = stop_params_for(renderer.get_stop_sequences())
+    stop_params = (
+        router_replay_stop_params(renderer.get_stop_sequences(), tokenizer)
+        if config.router_replay
+        else stop_params_for(renderer.get_stop_sequences())
+    )
     sampling_params = dict(
         max_tokens=config.max_tokens,
         temperature=config.temperature,
@@ -425,15 +446,29 @@ def _train(config: Config, ml_logger: Any) -> None:
                 sampling_params=dict(
                     max_tokens=config.eval_max_tokens or config.max_tokens,
                     temperature=eval_temperature,
+                    top_p=config.top_p,
                     **stop_params,
                 ),
                 format_coef=config.format_coef,
             )
-            logger.info("Held-out benchmark on %d problems", len(evaluator.prompts))
+            logger.info("Held-out MATH-500 on %d problems", len(evaluator.prompts))
+        logger.info("After save, also run sampling.evaluate (MATH-500)")
 
     client = make_client(config.config)
 
-    with running_job(client, job_body(config), job_id=config.job_id) as job_id:
+    with running_job(
+        client, job_body(config), job_id=config.job_id
+    ) as job_id:
+        sampling_job_id: str | None = None
+        if config.router_replay:
+            logger.info("Bootstrapping router replay for job %s", job_id)
+            bootstrap_router_replay(
+                client,
+                job_id,
+                max_cache_bytes=config.router_replay_max_cache_bytes,
+            )
+            sampling_job_id = sampling_sub_job_id(job_id)
+
         for batch_idx in range(total_steps):
             t_start = time.time()
             metrics: dict[str, float] = {
@@ -457,7 +492,18 @@ def _train(config: Config, ml_logger: Any) -> None:
                 prompt_tokens_P.append(prompt_tokens)
                 prompts_D.extend([prompt_tokens] * config.group_size)
 
-            request_id = client.generate(job_id, prompts=prompts_D, sampling_params=sampling_params)
+            sample_ids_D = [
+                f"rl-{batch_idx}-{rollout_idx}" for rollout_idx in range(len(prompts_D))
+            ]
+            generate_params: dict | list[dict] = sampling_params
+            if config.router_replay:
+                generate_params = sampling_params_with_sample_ids(
+                    sampling_params, sample_ids_D
+                )
+
+            request_id = client.generate(
+                job_id, prompts=prompts_D, sampling_params=generate_params
+            )
             results_D = client.poll_request(job_id, request_id)["results"]
             if len(results_D) != len(prompts_D):
                 raise RuntimeError(f"asked for {len(prompts_D)} rollouts, got {len(results_D)} results")
@@ -466,8 +512,16 @@ def _train(config: Config, ml_logger: Any) -> None:
             corrects_P: list[float] = []
             formats_P: list[float] = []
             datums_D: list[TrainSequence] = []
-            for problem_idx, (prompt_tokens, (_, answer)) in enumerate(zip(prompt_tokens_P, batch)):
-                group = results_D[problem_idx * config.group_size : (problem_idx + 1) * config.group_size]
+            trained_sample_ids: list[str] = []
+            for problem_idx, (prompt_tokens, (_, answer)) in enumerate(
+                zip(prompt_tokens_P, batch)
+            ):
+                group_slice = slice(
+                    problem_idx * config.group_size,
+                    (problem_idx + 1) * config.group_size,
+                )
+                group = results_D[group_slice]
+                group_sample_ids = sample_ids_D[group_slice]
                 scored = [
                     score_response(
                         result.get("text") or "",
@@ -488,7 +542,9 @@ def _train(config: Config, ml_logger: Any) -> None:
                 if config.remove_constant_reward_groups and all(advantage == 0.0 for advantage in advantages_G):
                     continue
 
-                for result, advantage in zip(group, advantages_G):
+                for result, advantage, sample_id in zip(
+                    group, advantages_G, group_sample_ids
+                ):
                     sampled_tokens = [int(token) for token in (result.get("token_ids") or [])]
                     if len(sampled_tokens) == 0:
                         continue
@@ -499,6 +555,7 @@ def _train(config: Config, ml_logger: Any) -> None:
                             advantage=advantage,
                         )
                     )
+                    trained_sample_ids.append(sample_id)
 
             train_loss = float("nan")
             if len(datums_D) == 0:
@@ -512,6 +569,7 @@ def _train(config: Config, ml_logger: Any) -> None:
                     pad_token_id=pad_token_id,
                     max_seq_len=config.max_seq_len,
                     with_rl_context=True,
+                    temperature=config.temperature,
                 )
                 fwd_bwd_result, step_result = forward_backward_step(
                     client,
@@ -520,6 +578,10 @@ def _train(config: Config, ml_logger: Any) -> None:
                     context=context,
                     learning_rate=config.learning_rate,
                     processing=processing_block(config, global_batch_size=len(datums_D)),
+                    rr_sample_ids=(
+                        trained_sample_ids if config.router_replay else None
+                    ),
+                    router_replay_sampling_job_id=sampling_job_id,
                 )
                 train_loss = float(fwd_bwd_result["avg_loss"])
                 metrics.update(fwd_bwd_result.get("metrics") or {})
@@ -529,6 +591,16 @@ def _train(config: Config, ml_logger: Any) -> None:
                     job_id,
                     weight_format="lora" if config.lora_rank > 0 else None,
                 )
+
+            if config.router_replay:
+                trained_id_set = set(trained_sample_ids)
+                unused_sample_ids = [
+                    sample_id
+                    for sample_id in sample_ids_D
+                    if sample_id not in trained_id_set
+                ]
+                if unused_sample_ids:
+                    discard_router_replay(client, job_id, unused_sample_ids)
 
             metrics.update(
                 {
@@ -544,9 +616,25 @@ def _train(config: Config, ml_logger: Any) -> None:
             )
             ml_logger.log_metrics(metrics, step=batch_idx)
 
-
-def _should_eval(step: int, total_steps: int, eval_every: int) -> bool:
-    return step % eval_every == 0 or step == total_steps - 1
+        saved = save_recipe_checkpoints(client, job_id)
+        log_saved_checkpoints(
+            config_path=config.config,
+            job_id=job_id,
+            saved=saved,
+            lora_rank=config.lora_rank,
+            sampling_command="evaluate",
+            model_name=config.model_name,
+            n_gpus=config.sampling_gpus,
+            temperature=(
+                config.temperature
+                if config.eval_temperature is None
+                else config.eval_temperature
+            ),
+            max_tokens=config.eval_max_tokens or config.max_tokens,
+            top_p=config.top_p,
+            seed=config.seed,
+            max_examples=config.n_test,
+        )
 
 
 if __name__ == "__main__":
