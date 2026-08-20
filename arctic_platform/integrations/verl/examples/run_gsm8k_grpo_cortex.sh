@@ -57,10 +57,8 @@ MODEL_SHORT="${MODEL_SHORT:-Qwen3-0.6B}"
 MODEL="${MODEL:-Qwen/${MODEL_SHORT}}"
 experiment_name="gsm8k_grpo_${MODEL_SHORT}_cortex"
 
-# Cortex training image ships without FlashAttention2 — pin sdpa so the
-# server can construct the model. Anything else (fa2, fa3) will crash the
-# training sub-job with `ImportError: FlashAttention2 has been toggled on`
-# before the first forward pass.
+# Cortex training image ships without FA2; sdpa is the only attn impl the
+# training sub-job can construct today.
 flash_attention_v=sdpa
 
 DATA_DIR="${DATA_DIR:-${HOME}/data/gsm8k}"

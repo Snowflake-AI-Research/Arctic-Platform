@@ -8,16 +8,13 @@
 #   3. ARCTIC_BACKEND=cortex + ARCTIC_CORTEX_* env vars set.
 #   4. Data: `python download_data.py` -> $DATA_DIR/{train,validation}.parquet.
 #
-# Cortex-specific overrides on the base recipe:
-#   - trainer.arctic_rl.attn_implementation=sdpa
-#       Cortex training image ships without FlashAttention2; sdpa is the only
-#       attn impl the sub-job can construct today.
-#   - generator.inference_engine.remote_urls=[http://cortex-managed]
-#     generator.sampling_params.logprobs=null
-#       SkyRL's validate_generator_cfg requires len(remote_urls) == num_engines
-#       when run_engines_locally=false, and rejects sampling_params.logprobs in
-#       that mode. Cortex owns the sampling engines, so both must be set — the
-#       URL is a placeholder; the actual endpoint lives inside the shim.
+# Cortex-specific overrides (Hydra):
+#   trainer.arctic_rl.attn_implementation=sdpa
+#     Cortex image ships without FA2.
+#   generator.inference_engine.remote_urls=[http://cortex-managed]
+#   generator.sampling_params.logprobs=null
+#     Required by SkyRL's validate_generator_cfg under run_engines_locally=false.
+#     The URL is a placeholder; the real endpoint is inside the shim.
 
 set -euo pipefail
 

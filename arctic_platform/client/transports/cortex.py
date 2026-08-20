@@ -359,8 +359,7 @@ class CortexTransport(Transport):
         return url, ({"cursor": cursor} if cursor else None)
 
     def _poll(self, submitted: str | dict) -> dict:
-        # Inline ops (see _INLINE_OPERATION_TYPES) return their result body directly
-        # from POST and skip the /requests/{id} loop.
+        # Inline ops (_INLINE_OPERATION_TYPES) return their body from POST.
         if isinstance(submitted, dict):
             return submitted
         request_id = submitted
@@ -382,7 +381,7 @@ class CortexTransport(Transport):
 
     async def _apoll(self, submitted: str | dict) -> dict:
         if isinstance(submitted, dict):
-            return submitted
+            return submitted  # inline op — see _poll
         request_id = submitted
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
