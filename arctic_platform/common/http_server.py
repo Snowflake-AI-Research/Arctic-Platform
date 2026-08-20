@@ -48,6 +48,7 @@ from transformers import AutoTokenizer
 from arctic_platform import wire
 from arctic_platform._dependency_groups import require_any_dep_group
 from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
+from arctic_platform.common.deepspeed_worker import spawn_and_initialize_workers
 from arctic_platform.common.ray_cluster import init_ray_cluster
 from arctic_platform.common.server import ArcticRLServerState
 from arctic_platform.common.utils import http_split_batch
@@ -182,28 +183,21 @@ async def initialize(job_config: JobConfig = Body(...)):
             raise HTTPException(400, "No training GPUs configured")
         if app.state.training_workers:
             raise HTTPException(409, "Training job already running")
+        if job_config.checkpoint_path is None:
+            raise HTTPException(400, "checkpoint_path is required for training jobs")
 
-        workers = []
-        config_dict = job_config.model_dump()
         # Honor MASTER_PORT when set so concurrent training jobs on one host (e.g.
         # parallel pytest-xdist workers) don't collide on the rendezvous port.
         master_port = int(os.environ.get("MASTER_PORT", 29500))
-        for rank in range(gpus):
-            if colocate and placement:
-                opts = _pg_options(bundle_index=rank, fraction_key="training")
-            else:
-                opts = dict(num_gpus=1)
-            w = DeepSpeedWorker.options(**opts).remote(rank, gpus, master_port)
-            workers.append(w)
 
-        # Use rank 0's host as the distributed rendezvous master. Passing None
-        # falls back to "localhost" in the worker, which only works when every
-        # rank is on the same node; on multi-node clusters the off-node ranks
-        # would rendezvous against their own localhost and init_distributed()
-        # hangs forever.
-        master_addr = await workers[0].get_ip.remote()
-        await asyncio.gather(*[w.initialize.remote(master_addr, config_dict) for w in workers])
-        app.state.training_workers = workers
+        def actor_options(rank):
+            if colocate and placement:
+                return _pg_options(bundle_index=rank, fraction_key="training")
+            return dict(num_gpus=1)
+
+        app.state.training_workers = await spawn_and_initialize_workers(
+            gpus, master_port, job_config.model_dump(), actor_options
+        )
 
     elif job_type == "sampling":
         gpus = app.state.sampling_gpus
@@ -346,7 +340,6 @@ async def initialize(job_config: JobConfig = Body(...)):
     if job_type == "log_prob":
         job_info["engine"] = engine
     if job_type == "training":
-        assert job_config.checkpoint_path is not None, "checkpoint_path is required for training jobs"
         ckpt_dir = pathlib.Path(job_config.checkpoint_path) / f"arctic_rl_job_{job_id}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         job_info["checkpoint_path"] = str(ckpt_dir)
