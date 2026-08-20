@@ -129,8 +129,8 @@ class TestInitFailureShutdown(TestCasePlus):
         from arctic_platform.client import ArcticSFTClient
         from arctic_platform.client import JobHandles
         from arctic_platform.client import Request
-        from arctic_platform.client import Transport
         from arctic_platform.client import TrainingConfig
+        from arctic_platform.client import Transport
 
         class BoomTransport(Transport):
             def __init__(self, config):
