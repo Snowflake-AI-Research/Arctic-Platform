@@ -729,23 +729,21 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         unsupported: list[str] = []
 
-        if getattr(actor, "use_kl_loss", False):
-            unsupported.append("actor_rollout_ref.actor.use_kl_loss=True (needs ref log-probs)")
-        if getattr(algo, "use_kl_in_reward", False):
-            unsupported.append("algorithm.use_kl_in_reward=True (needs ref log-probs)")
+        # KL to reference: kl_penalty / kl_ctrl only ever fire when one of these
+        # two switches is on, so they don't need their own top-level check.
+        kl_on = bool(getattr(actor, "use_kl_loss", False)) or bool(
+            getattr(algo, "use_kl_in_reward", False)
+        )
+        if kl_on:
+            if getattr(actor, "use_kl_loss", False):
+                unsupported.append("actor_rollout_ref.actor.use_kl_loss=True (needs ref log-probs)")
+            if getattr(algo, "use_kl_in_reward", False):
+                unsupported.append("algorithm.use_kl_in_reward=True (needs ref log-probs)")
         if int(getattr(actor, "ppo_epochs", 1)) > 1:
             unsupported.append(
                 f"actor_rollout_ref.actor.ppo_epochs={actor.ppo_epochs} "
                 "(off-policy PPO needs rollout-time log-prob snapshot)"
             )
-        kl_penalty = getattr(algo, "kl_penalty", None) if algo is not None else None
-        if kl_penalty not in (None, "", "none"):
-            unsupported.append(f"algorithm.kl_penalty={kl_penalty!r} (needs ref log-probs)")
-        kl_ctrl = getattr(algo, "kl_ctrl", None) if algo is not None else None
-        if kl_ctrl is not None and float(getattr(kl_ctrl, "kl_coef", 0.0) or 0.0) != 0.0 and (
-            getattr(actor, "use_kl_loss", False) or getattr(algo, "use_kl_in_reward", False)
-        ):
-            unsupported.append(f"algorithm.kl_ctrl.kl_coef={kl_ctrl.kl_coef} with KL enabled")
         adv = getattr(algo, "adv_estimator", "grpo") if algo is not None else "grpo"
         if adv != "grpo":
             unsupported.append(f"algorithm.adv_estimator={adv!r} (only 'grpo' validated on Cortex)")
