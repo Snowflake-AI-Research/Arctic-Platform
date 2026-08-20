@@ -1,0 +1,18 @@
+---
+description: When a skill names a required command, run that command; on failure re-read the skill — do not invent a path
+alwaysApply: true
+---
+
+# Follow skills as written
+
+A skill or rule that is loaded for this turn is an instruction, not background. If you skip it and invent a workaround, the file was wasted.
+
+This file lives in the **repo** (`.cursor/rules/`) so every clone loads it. Do not treat a user-level `~/.cursor/rules` copy as the source of truth.
+
+**Before a required step** (clone, `make format`, Repro then Fix, sibling writes, no commit/push): open the skill section **now** and run the command it names. Do not reconstruct it from chat memory.
+
+**If that command fails:** re-read the **same section's fallback**. Do not invent `PRE_COMMIT_HOME`, autorun, "you run it", a different clone, or a format excuse in `PR_DESCRIPTION.md`.
+
+`make format` is the command in `skills/adversarial-hardening/fix.md`: `GIT_CONFIG_GLOBAL` temp file (name/email only) + `GIT_CONFIG_SYSTEM=/dev/null`. That is the first attempt, every group.
+
+Do not write "I ignored the skill." Stop and follow it.
