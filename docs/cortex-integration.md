@@ -36,6 +36,30 @@ constrains what recipes work correctly on this backend:
 * **`wake_*` / `sleep_*` are no-ops.** Cortex sub-jobs are always awake;
   the transport short-circuits these ops.
 
+### Supported recipes (verl adapter)
+
+The verl adapter (`arctic_platform.integrations.verl.adapter`) runs a
+compat validator at init time and refuses to construct a client if any of
+the knobs below are set. This is deliberate — every one of them would
+silently train on zero-filled tensors on Cortex, producing wrong gradients
+with no runtime error.
+
+| Knob | Cortex support | Reason |
+|---|---|---|
+| `algorithm.adv_estimator` | `grpo` only | GAE / RLOO / REMAX / REINFORCE++ consume real `old_log_probs` in the loss |
+| `actor_rollout_ref.actor.use_kl_loss` | must be `False` | needs `/forward` for ref log-probs |
+| `algorithm.use_kl_in_reward` | must be `False` | same |
+| `algorithm.kl_penalty` | `none` / unset | typed KL reads `ref_log_probs` from the batch |
+| `algorithm.kl_ctrl.kl_coef` (with KL on) | must be `0` | adaptive KL reads `ref_log_probs` |
+| `actor_rollout_ref.actor.ppo_epochs` | `1` | off-policy PPO needs the rollout-time snapshot |
+| `actor_rollout_ref.actor.policy_loss_fn` | must be unset | Cortex server has no custom-loss hook |
+| `actor_rollout_ref.rollout.multi_turn.enable` | must be `False` | multi-turn recomputes log-probs per turn |
+
+For any of these, use the on-prem backend (`ARCTIC_BACKEND=local` or
+unset). The validator raises `NotImplementedError` at
+`ArcticRLClientWrapper.__init__`, so misconfigured recipes fail at launch,
+not after N minutes of bogus optimizer steps.
+
 ## What's provided
 
 * **Unified client** —
