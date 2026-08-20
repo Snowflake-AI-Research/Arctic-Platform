@@ -1,4 +1,4 @@
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,16 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for ``engine_old_log_probs`` frame conversion + wire envelope (CPU, fake client).
-
-The server emits per-token log probs in the roll(-1) frame (entry ``j`` = ``log p(token j+1)``).
-``engine_old_log_probs`` must return them in the **current-token** frame (``old[p] = log p(token p)``
-with ``old[0] = 0`` because the first token is unconditioned) -- the frame vLLM's sampled logprobs use
-and the frame TRL expects for ``old_log_probs`` (TRL applies ``[:, 1:]`` itself). Getting this shift
-wrong de-aligns the importance ratio, which is exactly the class of bug that produced the ratio/KL
-explosions, so this is pinned tightly. No server: a fake client returns known logprobs and records the
-request envelope.
-"""
+"""CPU tests for ``engine_old_log_probs`` roll(-1) -> current-token conversion."""
 
 from __future__ import annotations
 
@@ -50,7 +41,9 @@ class _FakeClient:
 
 def test_empty_rows_short_circuits():
     client = _FakeClient(torch.zeros((0, 0)))
-    assert engine_old_log_probs(client, [], temperature=1.0, pad_token_id=0, rollout_n=1, max_token_len_per_gpu=64) == []
+    assert (
+        engine_old_log_probs(client, [], temperature=1.0, pad_token_id=0, rollout_n=1, max_token_len_per_gpu=64) == []
+    )
     assert client.last_payload is None  # no forward issued
 
 
@@ -72,9 +65,7 @@ def test_lengths_match_input_rows_and_first_is_zero():
     rows = [[1, 2, 3, 4], [5, 6], [7, 8, 9]]  # lengths 4, 2, 3
     client = _FakeClient(server_lp)
 
-    out = engine_old_log_probs(
-        client, rows, temperature=0.7, pad_token_id=0, rollout_n=1, max_token_len_per_gpu=128
-    )
+    out = engine_old_log_probs(client, rows, temperature=0.7, pad_token_id=0, rollout_n=1, max_token_len_per_gpu=128)
 
     assert [len(o) for o in out] == [4, 2, 3]
     for o in out:
