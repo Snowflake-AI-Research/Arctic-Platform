@@ -37,7 +37,7 @@ from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
 from arctic_platform.client import SyncArcticRLClient
 from arctic_platform.client import Transport
-from arctic_platform.client import client as client_module
+from arctic_platform.client import base as base_module
 from arctic_platform.client import create_arctic_rl_client
 from arctic_platform.client import unresolved_ops
 from arctic_platform.client.transport import method_name
@@ -76,7 +76,7 @@ def _call(client, method: str, *args, **kwargs):
 
 
 def _build(monkeypatch, cls):
-    monkeypatch.setattr(client_module, "make_transport", FakeTransport)
+    monkeypatch.setattr(base_module, "make_transport", FakeTransport)
     return cls(ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1))
 
 
@@ -258,7 +258,7 @@ class TestServerState:
             def get_server_state(self):
                 return sentinel
 
-        monkeypatch.setattr(client_module, "make_transport", StatefulTransport)
+        monkeypatch.setattr(base_module, "make_transport", StatefulTransport)
         cfg = ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1)
         assert ArcticRLClient(cfg).get_server_state() is sentinel
 
@@ -355,14 +355,14 @@ class TestTransportSelection:
 
         monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
         cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(protocol="ray"), training_gpus=1)
-        assert isinstance(client_module.make_transport(cfg), DummyRay)
+        assert isinstance(base_module.make_transport(cfg), DummyRay)
 
     def test_make_transport_selects_http_for_onprem(self):
         """onprem + http (the default) routes to HttpTransport."""
         from arctic_platform.client.transports.onprem_http import HttpTransport
 
         cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(protocol="http"), training_gpus=1)
-        assert isinstance(client_module.make_transport(cfg), HttpTransport)
+        assert isinstance(base_module.make_transport(cfg), HttpTransport)
 
     def test_make_transport_forwards_server_state_to_ray(self, monkeypatch):
         """make_transport threads server_state into the Ray transport (reconnect path)."""
@@ -376,14 +376,14 @@ class TestTransportSelection:
         monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
         sentinel = object()
         cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(protocol="ray"), training_gpus=1)
-        transport = client_module.make_transport(cfg, server_state=sentinel)
+        transport = base_module.make_transport(cfg, server_state=sentinel)
         assert transport.server_state is sentinel
 
     def test_make_transport_rejects_server_state_for_http(self):
         """server_state reconnect is Ray-only; HTTP transport must reject it."""
         cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(protocol="http"), training_gpus=1)
         with pytest.raises(ValueError, match="server_state reconnect"):
-            client_module.make_transport(cfg, server_state=object())
+            base_module.make_transport(cfg, server_state=object())
 
 
 class TestWeightSyncStrategyInit:

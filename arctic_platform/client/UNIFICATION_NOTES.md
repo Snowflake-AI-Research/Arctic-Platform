@@ -6,26 +6,48 @@ dumb forwarder of `Request(op, job_id, body)` with no per-op rewiring.
 
 This package is the target design. The op *surface* (names, args, canonical
 body, which job each op targets, response contract) is defined once in
-`client.py`; a transport owns only job identity + wire mechanics.
+`requests.py`; a transport owns only job identity + wire mechanics.
 
-## One client, thin workload subclasses
-SFT and RL share a single sync base:
+## Module layout
+| File | Holds |
+|------|-------|
+| `requests.py` | Every op -> `Request` builder. No transport, no event loop. |
+| `base.py` | `make_transport` + the three shared frontends. |
+| `sft.py` | `ArcticSFTClient`, `create_arctic_sft_client`. |
+| `rl.py` | `SyncArcticRLClient`, `ArcticRLClient`, `create_arctic_rl_client`. |
 
-- `ArcticClient` — every shared op. Ops route through `_call`, which also carries
-  the (env-gated) server-profile echo.
-- `ArcticSFTClient(ArcticClient)` — defaults `processing={"loss_fn": "sft"}` and
-  `meta` onto the two forward bodies. Nothing else is SFT-specific.
-- `SyncArcticRLClient(ArcticClient)` — adds `log_probs`, which needs a log-prob
-  engine that SFT never allocates.
-- `ArcticRLClient` — the async RL twin. It does not inherit from `ArcticClient`
-  (sync/async method bodies cannot be shared) but reuses the same module-level
-  `_*_request` builders, so the op vocabulary is still defined exactly once.
+Import the frontends from the package root — `from arctic_platform.client import
+ArcticRLClient` — not from the module that happens to define them today.
 
-Keep new ops on `ArcticClient` unless they genuinely require a job type or a
-data contract the other workload does not have.
+`requests.py` is the single definition of the op vocabulary and must stay in
+lockstep with `transport.OPS` (asserted both ways in `test_client_ops.py`).
+
+## One op surface, thin workload subclasses
+```
+ArcticClient                        # transport, jobs, reconnect_config, get_server_state
+├── SyncArcticClient                # blocking op surface
+│   ├── ArcticSFTClient             # + sft loss default on the forward bodies
+│   └── SyncArcticRLClient          # + log_probs
+└── AsyncArcticClient               # awaitable op surface
+    └── ArcticRLClient              # + log_probs
+```
+
+`ArcticClient` is deliberately call-style agnostic — it holds only what reads the
+same whether calls block or are awaited. The two op surfaces below it are the
+one place sync and async are written separately; they stay in step because both
+lower through the same `requests.py` builders and route every call through
+`_call` / `_acall`, which also carry the env-gated server-profile echo.
+
+Note the one naming wart: `ArcticSFTClient` is **blocking**, even though
+`ArcticRLClient` is async. SFT has no async frontend, and the sync name is what
+every caller already uses.
+
+Keep new ops on the shared surfaces unless they genuinely require a job type or
+a data contract the other workload does not have — `log_probs` is the only op
+that clears that bar today.
 
 ## Design in place (this package)
-- `Transport` ABC + `JobHandles` + `Request` (single op vocabulary in `client.py`).
+- `Transport` ABC + `JobHandles` + `Request` (single op vocabulary in `requests.py`).
 - `OnPremTransport` base: job creation, ordering, payload building. Concrete
   transports implement only the delivery primitives (`_start`, `call`, `_destroy`,
   `_wait_running`); `call` posts/dispatches the op against its target job.

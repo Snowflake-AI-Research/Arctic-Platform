@@ -151,7 +151,7 @@ class TestInitFailureShutdown(TestCasePlus):
                 self.shutdown_calls += 1
 
         # Patch via the module the client uses.
-        import arctic_platform.client.client as mod
+        import arctic_platform.client.base as mod
 
         original = mod.make_transport
         boom = None
@@ -387,12 +387,6 @@ class TestPerfFixesUnit(TestCasePlus):
 
 
 class TestShimsStillResolve(TestCasePlus):
-    def test_old_client_shim(self):
-        from arctic_platform.sft import ArcticSFTClient as C1
-        from arctic_platform.sft.client import ArcticSFTClient as C2
-
-        self.assertIs(C1, C2)
-
     def test_old_processor_shim(self):
         from arctic_platform.rl.processors.sft import run_sft_pipeline as R1
         from arctic_platform.sft import run_sft_pipeline as R2

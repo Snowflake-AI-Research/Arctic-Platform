@@ -24,9 +24,9 @@ from arctic_platform._dependency_groups import require_any_dep_group
 
 require_any_dep_group("sft", "rl")
 
-from arctic_platform.client.client import ArcticSFTClient
-from arctic_platform.client.client import create_arctic_sft_client
 from arctic_platform.client.config import ArcticClientConfig
+from arctic_platform.client.sft import ArcticSFTClient
+from arctic_platform.client.sft import create_arctic_sft_client
 from arctic_platform.sft.processor import LOGIT_LOSS_FNS
 from arctic_platform.sft.processor import SFT_LOSS_FNS
 from arctic_platform.sft.processor import run_sft_pipeline

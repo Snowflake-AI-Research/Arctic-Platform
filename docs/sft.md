@@ -91,19 +91,19 @@ python -m arctic_platform.common.http_server \
 
 | Path | Role |
 |------|------|
-| `arctic_platform/client/client.py` | `ArcticClient` base + `ArcticSFTClient` / `SyncArcticRLClient` / `ArcticRLClient` |
+| `arctic_platform/client/requests.py` | Every op -> `Request` builder (the op vocabulary) |
+| `arctic_platform/client/base.py` | `ArcticClient` core + `SyncArcticClient` / `AsyncArcticClient` op surfaces |
+| `arctic_platform/client/sft.py` | `ArcticSFTClient` |
 | `arctic_platform/client/config.py` | `ArcticClientConfig` (shared by SFT and RL) |
 | `arctic_platform/sft/processor.py` | `run_sft_pipeline`, `sft` / `sft_ce` losses |
 | `arctic_platform/sft/examples/` | HTTP/Ray demos |
 | `arctic_platform/common/` | DeepSpeed worker, HTTP/Ray servers, utils, loss registry |
 
-`arctic_platform.sft.client` is a back-compat shim re-exporting `ArcticSFTClient`
-from `arctic_platform.client`.
-
 ## Client API
 
-`ArcticSFTClient` subclasses `ArcticClient`, so it carries the full shared op
-surface; the SFT-specific part is the default loss contract on the two forward ops.
+`ArcticSFTClient` subclasses `SyncArcticClient`, so it carries the full shared
+(blocking) op surface; the SFT-specific part is just the default loss contract on
+the two forward ops.
 
 | Method | Meaning |
 |--------|---------|

@@ -29,7 +29,7 @@ from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
 from arctic_platform.client import TrainingConfig
 from arctic_platform.client import Transport
-from arctic_platform.client import client as client_module
+from arctic_platform.client import base as base_module
 from arctic_platform.sft import ArcticSFTClient
 
 TRAINING = 1
@@ -68,13 +68,13 @@ def _config(**kwargs) -> ArcticClientConfig:
 
 @pytest.fixture
 def client(monkeypatch) -> ArcticSFTClient:
-    monkeypatch.setattr(client_module, "make_transport", FakeTransport)
+    monkeypatch.setattr(base_module, "make_transport", FakeTransport)
     return ArcticSFTClient(_config())
 
 
 @pytest.fixture
 def sampling_client(monkeypatch) -> ArcticSFTClient:
-    monkeypatch.setattr(client_module, "make_transport", FakeTransport)
+    monkeypatch.setattr(base_module, "make_transport", FakeTransport)
     cfg = _config(training_gpus=1, sampling_gpus=1, backend=OnPremConfig(colocate=True))
     return ArcticSFTClient(cfg)
 
@@ -196,7 +196,7 @@ class TestSFTLifecycle:
         assert cfg.sampling_job_id == SAMPLING
 
     def test_context_manager_shuts_down(self, monkeypatch):
-        monkeypatch.setattr(client_module, "make_transport", FakeTransport)
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
         with ArcticSFTClient(_config(training_gpus=1)) as c:
             assert c.jobs.training == TRAINING
         assert c.transport.shutdown_calls == 1
@@ -208,6 +208,6 @@ class TestSFTLifecycle:
             def initialize(self):
                 raise RuntimeError("init failed")
 
-        monkeypatch.setattr(client_module, "make_transport", BoomTransport)
+        monkeypatch.setattr(base_module, "make_transport", BoomTransport)
         with pytest.raises(RuntimeError, match="init failed"):
             ArcticSFTClient(_config(training_gpus=1))
