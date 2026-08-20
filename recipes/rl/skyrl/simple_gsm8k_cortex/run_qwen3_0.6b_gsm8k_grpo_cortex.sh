@@ -11,7 +11,7 @@
 # Cortex-specific overrides (Hydra):
 #   trainer.arctic_rl.attn_implementation=sdpa
 #     Cortex image ships without FA2.
-#   generator.inference_engine.remote_urls=[http://cortex-managed]
+#   generator.inference_engine.external_server_urls=[http://cortex-managed]
 #   generator.sampling_params.logprobs=null
 #     Required by SkyRL's validate_generator_cfg under run_engines_locally=false.
 #     The URL is a placeholder; the real endpoint is inside the shim.
@@ -35,10 +35,10 @@ export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 
 # Cortex owns the GPUs; the driver has none. SkyRL's colocated placement
 # groups would deadlock on a CPU driver.
-NGPU_PER_NODE=1  # target Cortex GPU count for training
-NUM_NODES=1
-TP_SIZE=1
-NUM_ENGINES=1
+NGPU_PER_NODE="${NGPU_PER_NODE:-1}"  # target Cortex training-sub-job GPU count
+NUM_NODES="${NUM_NODES:-1}"
+TP_SIZE="${TP_SIZE:-1}"              # driver sees Cortex sampling as TP=1
+NUM_ENGINES="${NUM_ENGINES:-1}"
 
 TRAIN_BSZ=32
 MINI_BSZ=4
@@ -78,7 +78,7 @@ python -m arctic_platform.integrations.skyrl \
     generator.inference_engine.num_engines=${NUM_ENGINES} \
     generator.inference_engine.tensor_parallel_size=${TP_SIZE} \
     generator.inference_engine.run_engines_locally=false \
-    "generator.inference_engine.remote_urls=[http://cortex-managed]" \
+    "generator.inference_engine.external_server_urls=[http://cortex-managed]" \
     "generator.sampling_params.logprobs=null" \
     generator.inference_engine.weight_sync_backend=nccl \
     generator.inference_engine.async_engine=true \
