@@ -202,6 +202,8 @@ class ArcticRLClientWrapper(RemoteBackend):
         self._max_token_len_per_gpu = self.config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.actor_rollout_ref.model.path)
         self._client = self._initialize_client(reconnect_job_config, rl_server_state)
+        if self._is_cortex_backend():
+            self._validate_cortex_compat()
 
     # ------------------------------------------------------------------ #
     # RemoteBackend interface
@@ -711,33 +713,67 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         return isinstance(self._client.config.backend, CortexConfig)
 
-    def _zero_logprob_response(self, payload: dict, *, caller: str) -> dict:
-        """Return zero log-probs / entropy shaped like a real fwd_no_grad.
+    def _validate_cortex_compat(self) -> None:
+        """Refuse recipe configs Cortex can't serve correctly.
 
-        Cortex has no ``/forward`` sub-job. Zero-filling is only safe when the
-        caller doesn't actually consume the values — single-epoch on-policy
-        GRPO with no KL-to-reference (server-side default
-        ``old_log_probs = logprobs.detach()`` restores π_old ≡ π_new). Recipes
-        with ``use_kl_loss`` / ``use_kl_in_reward`` on, or multi-epoch PPO,
-        need the real snapshot; fail loud instead of silently producing the
-        wrong training signal.
+        Cortex has no ``/forward`` sub-job (no real ref log-probs, no
+        rollout-time log-prob snapshot) and no way to run driver-side custom
+        loss / KL. ``_stub_logprob_response`` returns zeros; that's only safe
+        when nothing downstream consumes them. Every knob below feeds a
+        consumer that would silently train on garbage otherwise, so fail loud
+        at adapter init instead of after N minutes of bogus updates.
         """
         actor = self.config.actor_rollout_ref.actor
         algo = getattr(self.config, "algorithm", None)
-        if getattr(actor, "use_kl_loss", False) or getattr(algo, "use_kl_in_reward", False):
-            raise NotImplementedError(
-                f"cortex backend: {caller} needs real ref log-probs "
-                "(actor.use_kl_loss / algorithm.use_kl_in_reward is on) but "
-                "Cortex has no /forward sub-job. Disable both, or use the "
-                "on-prem backend for KL-anchored training."
+        rollout = self.config.actor_rollout_ref.rollout
+
+        unsupported: list[str] = []
+
+        if getattr(actor, "use_kl_loss", False):
+            unsupported.append("actor_rollout_ref.actor.use_kl_loss=True (needs ref log-probs)")
+        if getattr(algo, "use_kl_in_reward", False):
+            unsupported.append("algorithm.use_kl_in_reward=True (needs ref log-probs)")
+        if int(getattr(actor, "ppo_epochs", 1)) > 1:
+            unsupported.append(
+                f"actor_rollout_ref.actor.ppo_epochs={actor.ppo_epochs} "
+                "(off-policy PPO needs rollout-time log-prob snapshot)"
             )
-        ppo_epochs = int(getattr(actor, "ppo_epochs", 1))
-        if ppo_epochs > 1:
+        kl_penalty = getattr(algo, "kl_penalty", None) if algo is not None else None
+        if kl_penalty not in (None, "", "none"):
+            unsupported.append(f"algorithm.kl_penalty={kl_penalty!r} (needs ref log-probs)")
+        kl_ctrl = getattr(algo, "kl_ctrl", None) if algo is not None else None
+        if kl_ctrl is not None and float(getattr(kl_ctrl, "kl_coef", 0.0) or 0.0) != 0.0 and (
+            getattr(actor, "use_kl_loss", False) or getattr(algo, "use_kl_in_reward", False)
+        ):
+            unsupported.append(f"algorithm.kl_ctrl.kl_coef={kl_ctrl.kl_coef} with KL enabled")
+        adv = getattr(algo, "adv_estimator", "grpo") if algo is not None else "grpo"
+        if adv != "grpo":
+            unsupported.append(f"algorithm.adv_estimator={adv!r} (only 'grpo' validated on Cortex)")
+        if getattr(actor, "policy_loss_fn", None):
+            unsupported.append("actor.policy_loss_fn=<custom> (server has no hook)")
+        multi_turn = getattr(rollout, "multi_turn", None)
+        if multi_turn is not None and getattr(multi_turn, "enable", False):
+            unsupported.append("actor_rollout_ref.rollout.multi_turn.enable=True")
+
+        if unsupported:
             raise NotImplementedError(
-                f"cortex backend: {caller} needs the rollout-time log-prob "
-                f"snapshot for ppo_epochs={ppo_epochs} (off-policy PPO). "
-                "Set actor.ppo_epochs=1, or use the on-prem backend."
+                "cortex backend does not support the following recipe knobs "
+                "(all would silently produce wrong gradients on Cortex):\n  - "
+                + "\n  - ".join(unsupported)
+                + "\n\nSee docs/cortex-integration.md#supported-recipes. "
+                "For KL-anchored or off-policy training, use the on-prem backend."
             )
+
+    def _stub_logprob_response(self, payload: dict) -> dict:
+        """Return a zero log-prob / entropy tensor shaped like a real fwd_no_grad.
+
+        Only reached because ``_validate_cortex_compat`` already rejected every
+        recipe knob that would consume these values. Cortex-side GRPO defaults
+        ``old_log_probs = logprobs.detach()`` when we drop them from the
+        payload, so π_old ≡ π_new on the single-epoch on-policy path. Do NOT
+        remove the init-time validator: without it, KL / multi-epoch recipes
+        would silently train on zeros.
+        """
         # make_njt() slices from data["input_ids"], so match [B, T] with T ≥ 1.
         b_data = payload.get("batch") if isinstance(payload, dict) else None
         if not isinstance(b_data, dict):
@@ -754,7 +790,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             "loss_fn": None,
         }
         if self._is_cortex_backend():
-            return self._zero_logprob_response(payload, caller="compute_ref_log_prob")
+            return self._stub_logprob_response(payload)
         response = await self._client.fwd_no_grad(payload, reference_model=True)
         response["batch"]["log_probs"] = response["batch"].pop("logprobs")
         return response
@@ -765,7 +801,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             "loss_fn": None,
         }
         if self._is_cortex_backend():
-            return self._zero_logprob_response(payload, caller="compute_log_prob")
+            return self._stub_logprob_response(payload)
         response = await self._client.fwd_no_grad(payload, reference_model=False)
         response["batch"]["log_probs"] = response["batch"].pop("logprobs")
         return response
