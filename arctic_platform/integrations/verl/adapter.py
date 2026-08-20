@@ -47,6 +47,50 @@ from arctic_platform.client import create_arctic_rl_client
 from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
 from arctic_platform.rl.ray_server import ArcticRLRayServerState
 
+# Cortex ↔ on-prem response reshape for _send_update_actor. On-prem returns
+# fwd_bwd as {"metrics": {loss, grad_norm, ...}} and step as {"metrics":
+# {last_lr, ...}}. Cortex returns fwd_bwd as
+#   {job_id, avg_loss, metrics: {approx_kl, importance_weight, ...},
+#    post_process_outputs}
+# and step as
+#   {job_id, grad_norm, last_lr, global_steps, update_successful,
+#    weight_delta_*, ...}
+# — `loss` is called `avg_loss` on fwd_bwd, `grad_norm` moves onto step, and
+# there is no "metrics" wrapper on step at all. `_merge_train_response`
+# collapses either shape into a single flat metrics dict.
+_CORTEX_METRIC_ALIAS = {"avg_loss": "loss"}
+_CORTEX_METRIC_DROP = {
+    "job_id",
+    "post_process_outputs",
+    "update_successful",
+    "weight_delta_rank0_sample_tensors",
+    "weight_delta_rank0_sample_numel",
+    "weight_delta_rank0_sample_bytes",
+    "weight_delta_norm_rank0_sample",
+    "weight_delta_norm_over_lr_rank0_sample",
+}
+
+
+def _flatten_cortex_metrics(resp: dict) -> dict:
+    out: dict = {}
+    for k, v in resp.items():
+        if k == "metrics" and isinstance(v, dict):
+            out.update(v)
+            continue
+        if k in _CORTEX_METRIC_DROP:
+            continue
+        out[_CORTEX_METRIC_ALIAS.get(k, k)] = v
+    return out
+
+
+def _merge_train_response(step_response: dict, fwd_bwd_response: dict) -> dict:
+    """Merge fwd_bwd + step responses into a single ``{loss, grad_norm, ...}``
+    dict regardless of backend."""
+    merged = _flatten_cortex_metrics(step_response)
+    merged.update(_flatten_cortex_metrics(fwd_bwd_response))
+    return merged
+
+
 _ARCTIC_METRIC_REDUCTION_FN = {
     "actor/pg_clipfrac_lower": np.mean,
     "actor/pg_clipfrac": np.mean,
@@ -770,7 +814,7 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         fwd_bwd_response = await self._client.fwd_bwd(payload)
         step_response = await self._client.step()
-        step_response["metrics"].update(**fwd_bwd_response["metrics"])
+        step_response["metrics"] = _merge_train_response(step_response, fwd_bwd_response)
         return step_response
 
     async def save_checkpoint(self):
