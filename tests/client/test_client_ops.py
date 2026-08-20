@@ -515,19 +515,37 @@ class TestCortexSharedHelper:
 
         assert callable(to_cortex_fwd_bwd_payload)
 
-    def test_reshape_omits_old_log_probs(self):
+    def test_reshape_matches_cortex_wire_shape(self):
+        # `to_cortex_fwd_bwd_payload` must produce Cortex's canonical
+        # `{args, kwargs, context, processing}` envelope. Server-side GRPO reads
+        # `input_ids` / `advantages` / `loss_mask` from `context` for its
+        # preflight; skipping any of these was the exact regression that
+        # bit the SkyRL E2E ("grpo packed microbatches require tensor input_ids").
         import torch
 
         from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
 
         ids = torch.zeros((2, 10), dtype=torch.int64)
+        attn = torch.ones((2, 10), dtype=torch.int64)
+        adv = torch.zeros((2, 10))
         out = to_cortex_fwd_bwd_payload(
-            {"batch": {"input_ids": ids, "advantages": torch.zeros((2, 4))}, "meta": {"prompt_len": 6}},
+            {"batch": {"input_ids": ids, "attention_mask": attn, "advantages": adv}, "meta": {}},
             dp_size=1,
         )
-        assert "args" in out and "kwargs" in out and "context" in out
-        assert out["kwargs"]["prompt_length"] == 6
-        assert out["kwargs"]["response_length"] == 4
+        assert out["args"] == ()
+        assert torch.equal(out["kwargs"]["input_ids"], ids)
+        assert torch.equal(out["kwargs"]["attention_mask"], attn)
+        assert torch.equal(out["context"]["input_ids"], ids)
+        assert "advantages" in out["context"]
+        assert "loss_mask" in out["context"]
+        # Cortex's arctic_training only registers a single GRPO loss by short name;
+        # the helper pins loss_fn="grpo" so verl's "verl_grpo" alias doesn't leak
+        # through and trip _resolve_fn's dotted-path parser server-side.
+        assert out["processing"]["loss_fn"] == "grpo"
+        assert out["processing"]["config"]["dp_size"] == 1
+        # old_log_probs is intentionally dropped; server-side GRPO defaults
+        # π_old = π_new via logprobs.detach() (correct for single-epoch on-policy).
+        assert "old_log_probs" not in out["kwargs"]
         assert "old_log_probs_shifted" not in out["context"]
 
 
@@ -539,7 +557,7 @@ class TestCortexShimSaveWeightsFailsLoud:
         import asyncio
 
         monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
-        from arctic_platform.rl._cortex_dispatch import _CortexClientShim
+        from arctic_platform.integrations._cortex_dispatch import _CortexClientShim
         from arctic_platform.rl.config import ArcticRLClientConfig as Legacy
 
         legacy = Legacy(model_name="m", backend="cortex", training_gpus=1, sampling_gpus=1)

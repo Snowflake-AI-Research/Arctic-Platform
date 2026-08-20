@@ -37,7 +37,7 @@ def create_arctic_rl_client(config: ArcticRLClientConfig, arctic_rl_server_state
     # Backends are imported lazily so a CPU-only Cortex driver doesn't pay the
     # http_client / ray_client import cost.
     if config.backend == "cortex":
-        from arctic_platform.rl._cortex_dispatch import create_cortex_client
+        from arctic_platform.integrations._cortex_dispatch import create_cortex_client
 
         return create_cortex_client(config)
 
