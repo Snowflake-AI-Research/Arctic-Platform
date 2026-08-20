@@ -31,22 +31,27 @@ ARCTIC_VERL_CONFIG_DIR="${REPO_ROOT}/arctic_platform/integrations/verl/config"
 USE_LEGACY_WORKER_IMPL=disable
 ROLLOUT_NAME=arctic
 COLOCATE=False               # Cortex has no colocation lifecycle
-NGPU_PER_JOB=1               # target Cortex sub-job GPU count
+NGPU_TRAIN="${NGPU_TRAIN:-1}"        # training sub-job GPU count
+NGPU_SAMPLE="${NGPU_SAMPLE:-1}"      # sampling sub-job GPU count
+SAMPLING_TP_SIZE="${SAMPLING_TP_SIZE:-1}"
 NGPU_FOR_LOG_PROBS=0         # no /forward on Cortex; zero-fill via _zero_logprob_response
-TP_SIZE=1
+TP_SIZE=1                    # driver-side; the Ray rollout actor always sees Cortex as TP=1
 
-BSZ=32
-PPO_MINI_BSZ=32
-UBS=8
-ROLL_N=8
+# Hyperparameters mirror verl's canonical GSM8K GRPO recipe
+# (examples/grpo_trainer/run_qwen2_5-3b_gsm8k_grpo_lora.sh): static batching,
+# rollout.n=5, ppo_mini_batch_size=data.train_batch_size=16. LR stays at 1e-6
+# because Cortex has no /forward sub-job for ref log-probs, so use_kl_loss is
+# off; the canonical 3e-6 relies on KL regularization for stability.
+BSZ=16
+PPO_MINI_BSZ=16
+UBS=16
+ROLL_N=5
 PROMPT_LEN=1024
 RESPONSE_LEN=1024
-MAX_TOKENS_PER_GPU=16384
 ROLLOUT_MAX_BATCHED=16384
 LR=1e-6
 CLIP_RATIO=0.2
 USE_KL_LOSS=False            # required: Cortex has no /forward for ref log-probs
-KL_LOSS_COEF=0.001
 TOTAL_EPOCHS=1
 SAVE_FREQ=-1
 TEST_FREQ=10
@@ -88,16 +93,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     +actor_rollout_ref.model.override_config.attn_implementation=$flash_attention_v \
     actor_rollout_ref.actor.strategy=fsdp2 \
-    actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI_BSZ \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$UBS \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$UBS \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$UBS \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$MAX_TOKENS_PER_GPU \
     actor_rollout_ref.actor.clip_ratio=$CLIP_RATIO \
     actor_rollout_ref.actor.use_kl_loss=$USE_KL_LOSS \
-    actor_rollout_ref.actor.kl_loss_coef=$KL_LOSS_COEF \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.optim.lr=$LR \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.05 \
@@ -130,8 +132,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     remote_backend.colocate=$COLOCATE \
     remote_backend.log_prob_gpus=$NGPU_FOR_LOG_PROBS \
-    remote_backend.sampling_gpus=$NGPU_PER_JOB \
-    remote_backend.sampling_tp_size=$TP_SIZE \
+    remote_backend.sampling_gpus=$NGPU_SAMPLE \
+    remote_backend.sampling_tp_size=$SAMPLING_TP_SIZE \
     remote_backend.train.deepspeed.zero_optimization.stage=2 \
-    remote_backend.training_gpus=$NGPU_PER_JOB \
+    remote_backend.training_gpus=$NGPU_TRAIN \
     "$@" 2>&1 | tee $experiment_name.log
