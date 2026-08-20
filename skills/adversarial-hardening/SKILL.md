@@ -45,11 +45,11 @@ Ask and wait if code scope is missing:
 
 Write the stated scope at the top of the dated findings file. Stay inside it.
 
-**Multi-model (optional):** a skill cannot switch this chat’s model. If the operator wants to pick models, show the numbered Task-slug list (latest of each family first, then the next tier; no `inherit`) and wait for numbers — **one or more**, any count. See [multi-model.md](multi-model.md). Runners write dated per-agent files and are left alone; the parent writes a dated merge (duplicates become one item with nuances). Finish with one scoreboard: issues + High + wall time + live contract + status. Tokens and USD columns only if a real count exists — omit them when unknown. A Task that returns Aborted / writes no file / **hits timeout** is retried **twice** (3 attempts), then hard-fails; present unused models so the operator can replace that slot. Timeout is sibling-relative (`max(45 min after first success, 3 × longest finished wall)`) plus a 15 min heartbeat — not a short global cap. Parent-only probe (no Task runners) is the default.
+**Multi-model (optional):** a skill cannot switch this chat’s model. If the operator wants to pick models, show the numbered Task-slug list (latest of each family first, then the next tier; no `inherit`) and wait for numbers — **one or more**, any count. See [multi-model.md](multi-model.md). Runners write dated per-agent files and are left alone; the parent writes a dated merge that **unions** every Failed row (related pointers, never drop a “duplicate”). Finish with one scoreboard: Failed rows + High + wall time + live contract + status per agent. Tokens and USD columns only if a real count exists — omit them when unknown. A Task that returns Aborted / writes no file / **hits timeout** is retried **twice** (3 attempts), then hard-fails; present unused models so the operator can replace that slot. Timeout is sibling-relative (`max(45 min after first success, 3 × longest finished wall)`) plus a 15 min heartbeat — not a short global cap. Parent-only probe (no Task runners) is the default.
 
 Three **stages**, in order. Do not skip ahead (no Fix without a Probe finding; no Fix without a Repro test that **fails** on the buggy code).
 
-**Repro → Fix sequence:** write tests that assert the **correct** contract → they **fail** on current `main` → change the product → the **same** tests **pass**. Do not flip asserts. Do not start Fix while a repro test is green.
+**Repro → Fix sequence:** write tests that assert the **correct** contract → they **fail** on current `main` → change the product → the **same** tests **pass**. Do not flip asserts. Do not start Fix while a repro test is green. Shipped writing follows [../good-code/SKILL.md](../good-code/SKILL.md) and [../test-writing/SKILL.md](../test-writing/SKILL.md).
 
 | Stage | Name | Job | Read |
 | --- | --- | --- | --- |
@@ -62,7 +62,7 @@ Stop when a probe pass has **run every constructible attack in scope**, the self
 ```
 - [ ] 0. SCOPE: operator states code scope and timeline (or no time bound). Do not switch branches.
 - [ ] 1. PROBE: attack plan first; run every row; classify; write dated PROBE_FINDINGS*.md; self-gate
-- [ ] 2. GROUP: number every Failed issue `#N`; write PROBE_GROUPS.md (one `#N` unless same contract or the same hunk); wait if a bundle is ambiguous
+- [ ] 2. GROUP: assign `#N` here (not in the merge); write PROBE_GROUPS.md (one `#N` unless same contract or the same hunk); related write-ups stay until Repro; wait if a bundle is ambiguous
 - [ ] 3. REPRO+FIX one group at a time: present Problem / Where / Repro plan / Fix plan (`k` or `kA`/`kB` + `#N`); clone `main`; branch `<user>/adversarial-<slug>`; write repro tests (must **fail**); then fix (same tests must **pass**); existing suite; `make format`; PR_DESCRIPTION.md on that clone
 ```
 
@@ -75,7 +75,7 @@ Write both at the **checkout root** of the repo being hardened. Do not commit th
 | End of probe, before any test or fix | `PROBE_FINDINGS.<stamp>.md` (parent-only) or per-agent `PROBE_FINDINGS.<stamp>.<slug>.md` plus `PROBE_FINDINGS.merge.<stamp>.md` | Attack plan, then Failed, then Held, then Residual. `Recorded:` UTC on every file. Template in [probe.md](probe.md). Multi-model merge rules in [multi-model.md](multi-model.md). |
 | After probe, before any clone | `PROBE_GROUPS.md` | Canonical `#N` table + tight groups (one `#N` unless same contract or the same hunk/block). Template in [groups.md](groups.md). |
 | Start of Repro on a group clone | `PROBE_REPRO_TESTS.md` | Repro-test plan for **that group only**. Template in [repro.md](repro.md). |
-| Each group clone | `PR_DESCRIPTION.md` | First line: `[bug fix] <description under 119 chars>`. Then `## Summary` / `## Testing`. This branch only. |
+| Each group clone | `PR_DESCRIPTION.md` | First line: `[bug fix] <description ≤67 chars if possible>` (GitHub truncates a longer subject). Then `## Summary` / `## Testing`. This branch only. |
 
 The chat report below is a short pointer. The findings files are the detailed record. Once Repro+Fix starts, also show **one group’s** Problem / Where / Repro plan / Fix plan card in chat ([groups.md](groups.md) §4) — that card is not a dump of the merge.
 

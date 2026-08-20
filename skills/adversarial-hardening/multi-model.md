@@ -132,17 +132,21 @@ After 3 failed attempts on a slug: **hard-fail** that slot. Do not invent a subs
 
 **Leave every per-agent file alone.** Read them. Write a new `PROBE_FINDINGS.merge.<stamp>.md`.
 
+**Do not drop a Failed row.** A false duplicate costs a hole; a leftover twin is cheap until Repro. Union every Failed heading. If two write-ups look like the same hole, keep both and add `Related:` pointers (agent + title or attack id). Do not fold them into one item with nuances. Do not assign `#N` in the merge — that happens in `PROBE_GROUPS.md`.
+
 | Source row | Merge |
 | --- | --- |
-| Failed, same `Where` / claim | **One item.** Tag `Models: a, b`. If the write-ups differ, keep both nuances under that item (`### Nuance — <slug>`), do not drop the extra detail and do not keep two top-level duplicates. |
+| Failed | Keep the row. Tag `Models: a`. If another agent has a tightly related Failed, add `Related:` — do not delete either. |
 | Failed on one, Held or Residual on others | Keep Failed. Tag `Models: a (others: held\|unattacked)`. Parent **re-runs that attack** before calling the merge done — do not drop a singleton. |
 | Held on all that attacked it | Held. Tag models. |
 | Held on one, unattacked on others | Residual or a parent re-run, not Held for the merge. |
 | Residual | Union, with why. |
 
-Classification: if models disagree on class (product vs spec-gap), keep the more conservative (spec-gap) unless a contract is cited. If they disagree on severity, keep the higher one and note the other.
+Classification stays on each row. If models disagree on class (product vs spec-gap), note both; do not drop the product row. If they disagree on severity, keep each row’s own severity.
 
-Count **issues** as Failed rows (new landings). Dedup by the same `Where` / claim. After dedup, **number every Failed item `#1`, `#2`, …** (High → Medium → Low). That `#N` is the unique id for the rest of the pipeline — groups, chat, and Repro+Fix cite it, never a title alone. Do not reuse a number. Write **one** scoreboard at the top of the merge file **and** print it in chat (finish report — do not skip it). Hard-failed slots count as 0 issues.
+Count **issues** as Failed rows (new landings), **per agent**, not “distinct after dedup.” Write **one** scoreboard at the top of the merge file **and** print it in chat (finish report — do not skip it). Hard-failed slots count as 0 issues.
+
+Tight grouping of related rows is [groups.md](groups.md) (same contract or same hunk). Repro is the oracle: one test that fails for every row in the group means one hole; a green leftover means split.
 
 ### Scoreboard (issues + time, one table)
 
@@ -161,24 +165,19 @@ Tokens / USD, only when a source exists: Task usage object this turn; else `usag
 Recorded (merge): <ISO-8601 UTC>
 Sources: <per-agent dated paths>
 | Agent | Issues | High | Wall | Live | Status |
-| <slug> | <n> | <n High> | <Xm Ys> | <CUDA|HTTP|…> | ok |
+| <slug> | <n Failed> | <n High> | <Xm Ys> | <CUDA|HTTP|…> | ok |
 | <aborted> | 0 | 0 | <Xm Ys> | — | aborted |
-| Total distinct | <identical + unique> |  |  |  |  |  |
 ```
 
 Add Tokens / USD columns on the right only when known. Then:
 
 ```
-Identical (same Where/claim, 2+ agents): <n>
-Unique (exactly one agent): <n>
 Wave wall-clock (parallel): <duration>
-### Identical
-- #N <title> — models: a, b
-### Unique
-- #N <title> — model: a
+Related clusters (pointers only, not drops):
+- <title A> — <title B> — models: a, b
 ```
 
-For one successful agent: identical = 0, unique = that agent’s count. Still print the table.
+Do not print “Total distinct”, “Identical”, or “Unique.” Those numbers push the driver to collapse rows.
 
 Do not add extra columns (file size, attack-plan length, guessed tokens, issues/hour). High and live are the useful extras besides wall time.
 
@@ -193,6 +192,8 @@ Then the parent writes the usual chat report ([SKILL.md](SKILL.md) Report) point
 - Write the merge into `PROBE_FINDINGS.md` or into a runner’s file.
 - Let two runners write the same path.
 - Treat “N models” as a substitute for a live-contract subsystem or the self-gate. Each runner still has to pass [probe.md](probe.md).
+- Drop a Failed row as a duplicate, fold two Failed write-ups into one item, or assign `#N` in the merge.
+- Print “Total distinct” / “Identical” / “Unique” on the scoreboard.
 - Finish without the scoreboard (issues + wall, and tokens/USD only when known).
 - Print a Tokens or USD column when every cell would be unknown.
 - Invent token counts or dollar costs.

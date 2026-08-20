@@ -128,9 +128,9 @@ Oracle named per claim: <exact | differential>
 
 What broke, or what the claim does not hold. Product rows go to `PROBE_REPRO_TESTS.md`.
 
-**Number every Failed row** `#1`, `#2`, … after the list is final (High → Medium → Low). That `#N` is the unique id for grouping and Repro+Fix. Do not reuse a number. Multi-model runners may use local headings; the parent merge (or this file, if parent-only) assigns the canonical `#N`.
+Do **not** assign canonical `#N` here. `#N` is assigned in `PROBE_GROUPS.md` when Repro+Fix starts. Multi-model runners use their own titles; the parent merge keeps every Failed row ([multi-model.md](multi-model.md)).
 
-### #N <short title>
+### <short title>
 - Class: product | test | env | spec-gap | flake
 - Severity: High | Medium | Low
 - Claim: <the assertion that failed>
@@ -139,6 +139,7 @@ What broke, or what the claim does not hold. Product rows go to `PROBE_REPRO_TES
 - Expected: <oracle>
 - Saw: <actual>
 - Category / siblings: <pattern → other sites or none>
+- Related: <other Failed titles / agent attack ids, or none — pointer only, do not drop this row>
 
 ## Held
 

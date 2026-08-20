@@ -2,12 +2,12 @@
 
 Operate **per group** on the same clone and branch as Repro ([groups.md](groups.md)). Do not start here without that group’s chat card (`k` / `kA`–`kB` + `#N`), `PROBE_REPRO_TESTS.md`, classified product findings, and repro tests that **fail** on the buggy code. Do not start another group’s Fix in the same turn.
 
-Keep `PR_DESCRIPTION.md` at this clone’s root current for **this** group only. First line stays `[bug fix] <description under 119 chars>`.
+Keep `PR_DESCRIPTION.md` at this clone’s root current for **this** group only. First line stays `[bug fix] <description>` — after the prefix, 67 characters or fewer if possible.
 
 ## Repair
 
 - Only this group’s product defects. Do not pull in a neighboring group to “save a PR.”
-- Comments and docstrings: follow [../good-code/SKILL.md](../good-code/SKILL.md) (terse, nuance-only, wrap at 119).
+- Comments and docstrings: [../good-code/SKILL.md](../good-code/SKILL.md). Tests: [../test-writing/SKILL.md](../test-writing/SKILL.md).
 - Do **not** change the repro tests to match the bug, and do **not** flip their asserts. Change the product. After the fix, the **same** tests must **pass**.
 - If a repro test still fails, the fix is incomplete. If it would still pass after you revert the product change, the test does not catch the hole — that is a test defect, not a done fix.
 - Stay on this group’s issues. If the fix would rewrite a hunk another in-flight group already claimed, update `PROBE_GROUPS.md` (merge or defer) before editing. Same file, different block is fine.

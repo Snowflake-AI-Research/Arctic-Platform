@@ -18,8 +18,11 @@ For each product finding **in this group** (cite `#N`; for a bundle, one repro t
 2. Run it on today’s `main` code. It must **fail** (AssertionError, TypeError, wrong status, …) **because of the hole**. If it passes, the probe finding is wrong or the test does not catch it — go back to Probe; do not start Fix.
 3. If it fails for a setup bug (ImportError, wrong device, bad fixture), fix the test and re-run until the failure is the product hole.
 4. Env / spec-gap / flake findings do **not** get a product repro test.
+5. Related write-ups in one group: one test may cover `kA`–`kB` only when it is the same contract. If fixing one row leaves another’s assert green, split that row into its own group. Do not drop a row at merge time because it looked like a duplicate.
 
 Never widen `atol`/`rtol` so a same-math test looks green. Never assert “finite / positive / decreasing” when the claim is equivalence.
+
+Shipped tests follow [../test-writing/SKILL.md](../test-writing/SKILL.md). `#N` / `k` / `G01` stay in this plan and chat.
 
 ## Where to run
 

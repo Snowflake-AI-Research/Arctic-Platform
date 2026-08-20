@@ -157,6 +157,8 @@ Fix by centralizing, not by making every site use the same magic number. If the 
 
 Docstrings and comments are **terse**. Explain only what names do not. Do not narrate the next line.
 
+**Write for a reader who was not in the chat** that produced the change. Product code, tests, and shipped docs must stand alone. Do not leak process labels (`#N`, `k` / `kA`, `G01`, attack ids), nicknames, clone folder names, “as discussed”, “the operator said”, or other conversation leftovers. If a fact is worth keeping, state the **contract or reason** in full — `save_total_limit` prunes the job dir, not its parent — not `#3: …`. Process notes stay in chat and process files (`PROBE_*.md`), not in what ships.
+
 **Code comments** only when a special nuance needs saying. Otherwise the variable / function / method name is the explanation. Delete comments that restate `reshape(-1, V)` or `label_shape = labels.shape`.
 
 **Wrap at 119** for `#` comments, `"""` / `'''` docstrings, and `Field(description=...)`. Count the full line (indent + `# ` / quotes + text). Fill the line; do not wrap early at 80/100. Break at a word boundary on or before column 119.

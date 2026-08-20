@@ -37,6 +37,7 @@ Prefer importing helpers from `arctic_platform.testing_utils`. Do not reinvent s
 5. **Temp dirs**: `self.get_auto_remove_tmp_dir()` / `_str()` — auto-cleaned, repo-safe.
 6. **Subprocess env**: `env = self.get_env()` so `PYTHONPATH` includes the package root (`arctic_platform/…` checkout). Then override keys as needed.
 7. **Subprocess launch**: prefer `execute_subprocess_async(cmd, env=…, timeout=…)` over raw `subprocess.run` when you want streamed logs and a non-zero → failure.
+8. **Standalone.** Class/method names, docstrings, and comments state the **contract** for a reader who was not in the chat ([../good-code/SKILL.md](../good-code/SKILL.md)). Do not bleed conversation leftovers (`#3:`, `G01`, attack ids, “as discussed”, clone nicknames). If the fact matters, write the reason in full — `save_total_limit` prunes the job dir, not its parent.
 
 ## Numeric parity (do not cheat)
 
