@@ -121,7 +121,7 @@ sft = [
     "psutil",
     "ray",
     "tensordict",
-    "transformers",
+    "transformers>=5.2",  # vLLM 0.26 requires transformers 5.x
     "uvicorn",
 ]
 
