@@ -414,6 +414,15 @@ def engine_old_log_probs(
     """
     if not input_ids_rows:
         return []
+
+    # NOTE: this submits all rollout sequences as one multi-row [B, S] batch, which the server packs varlen-style
+    # (concatenate to [1, T] with per-sequence position_ids resets) exactly like the trainer's `new` log-prob pass
+    # in `forward_backward`. Sequence separation therefore requires a varlen-capable attention backend
+    # (`attn_implementation="flash_attention_2"`), where HF derives block-diagonal `cu_seqlens` from the reset
+    # position_ids. Under `sdpa` the packed rows attend across sequence boundaries and corrupt per-token log probs
+    # for every sequence after the first (verified: batched vs per-row diverges by tens of nats under sdpa, but is
+    # bit-for-bit identical under flash_attention_2). `old` (here) and `new` (forward_backward) share this path, so
+    # both are correct together under FA2 and the on-policy ratio sits at ~1.
     batch, lens = _pad_rows(input_ids_rows, pad_token_id)
     response = client.fwd_no_grad(
         {
