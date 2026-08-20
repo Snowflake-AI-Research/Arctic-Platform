@@ -126,7 +126,7 @@ sft = [
     "nvidia-ml-py",
     "psutil",
     "ray",
-    "transformers",
+    "transformers>=5.2",  # vLLM 0.26 requires transformers 5.x
     "uvicorn",
 ]
 
