@@ -5,6 +5,18 @@ either framework. The driver is CPU-only; every GPU op (training
 fwd/bwd/step, sampling generate, weight-sync) is dispatched to Cortex
 sub-jobs over SnowAPI.
 
+## Install
+
+```bash
+pip install "arctic-platform[cortex]"
+```
+
+The `[cortex]` extra is the client-only install from
+[#75](https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/75): it
+skips DeepSpeed, `transformers`, Ray and vLLM. Enough to drive both the
+SkyRL shim and the verl adapter against Cortex — the verl user still
+supplies verl at their pinned version.
+
 ## Supported training regime
 
 Cortex sub-jobs expose training + sampling + weight-sync but no `/forward`

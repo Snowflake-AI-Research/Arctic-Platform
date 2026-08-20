@@ -3,7 +3,7 @@
 # Cortex sub-jobs own training + sampling; the verl driver is CPU-only.
 #
 # Pre-reqs (see README-cortex.md):
-#   1. pip install arctic-platform[cortex,verl]
+#   1. pip install arctic-platform[cortex]  (client-only; skips DeepSpeed/vLLM)
 #   2. Data: python .../recipes/rl/verl/simple/download_data.py -> $DATA_DIR/{train,test}.parquet
 #   3. ARCTIC_BACKEND=cortex + ARCTIC_CORTEX_* env vars set.
 
