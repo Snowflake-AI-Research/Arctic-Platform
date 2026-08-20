@@ -44,7 +44,7 @@ class ArcticWeightTransfer:
 
     def __init__(self, client: Any, cuda_ipc: bool | None = None, low_memory: bool = False) -> None:
         self.client = client
-        colocate = bool(getattr(client.config.backend_config, "colocate", False))
+        colocate = bool(getattr(client.config.backend, "colocate", False))
         self.cuda_ipc = colocate if cuda_ipc is None else cuda_ipc
         self.low_memory = low_memory
 

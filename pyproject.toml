@@ -120,7 +120,7 @@ sft = [
     "nvidia-ml-py",
     "psutil",
     "ray",
-    "transformers>=4.57.0,<5",  # vllm 0.18 is what blocks the move to v5
+    "transformers>=5.2",  # vLLM 0.26 requires transformers 5.x
     "uvicorn",
 ]
 

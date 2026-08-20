@@ -87,12 +87,13 @@ class ModelSpec(BaseModel):
         """
         cfg = ds_worker_config or {}
 
-        # Require an explicit attention backend. ZoRRo Train needs a flash-attention
-        # implementation; do not invent a second default here (ModelSpec leaves it None).
-        if "attn_implementation" not in cfg or cfg["attn_implementation"] is None:
-            raise ValueError(
-                "from_ds_worker_config requires attn_implementation (ZoRRo Train needs a flash-attention backend)."
-            )
+        # Default to flash_attention_2 when unset. The training server packs sequences varlen-style (multiple
+        # sequences concatenated into one row with per-sequence position_ids resets), which only stay separated
+        # under a flash-attention backend; sdpa attends across the packed boundaries and silently corrupts
+        # per-token log probs. Defaulting here (rather than raising) restores the historical DeepSpeedWorker
+        # behavior so /initialize payloads that omit attn_implementation still load, and picks the *correct*
+        # backend -- if flash-attn is not installed the model load fails loudly instead of falling back to sdpa.
+        attn_implementation = cfg.get("attn_implementation") or "flash_attention_2"
 
         zorro_train_patch = None
         if cfg.get("zorro_train_enable", False):
@@ -116,7 +117,7 @@ class ModelSpec(BaseModel):
         return cls(
             model_path_or_name=model_name,
             dtype="bfloat16",
-            attn_implementation=cfg["attn_implementation"],
+            attn_implementation=attn_implementation,
             patches=Patches(
                 liger=cfg.get("use_liger", False),
                 zorro_train=zorro_train_patch,
