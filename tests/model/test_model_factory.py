@@ -201,9 +201,13 @@ class TestFromDsWorkerConfig:
         assert spec.patches.gradient_checkpointing is True  # bridge default
         assert spec.patches.zorro_train is None  # None disables (empty patch would be truthy)
 
-    def test_requires_attn_implementation(self):
-        with pytest.raises(ValueError, match="requires attn_implementation"):
-            ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {})
+    def test_defaults_attn_implementation_to_flash_attention_2(self):
+        # Packed varlen forwards need FA2; sdpa attends across sequence boundaries.
+        assert ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {}).attn_implementation == "flash_attention_2"
+        assert (
+            ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {"attn_implementation": None}).attn_implementation
+            == "flash_attention_2"
+        )
 
     def test_generic_patches_default_gc_off(self):
         from arctic_platform.model.config import Patches
