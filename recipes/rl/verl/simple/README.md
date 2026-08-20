@@ -40,8 +40,8 @@ cd Arctic-Platform/recipes/rl/verl/simple
 ```
 
 Install the pinned dependencies. The assumption is cuda-12.9 - if you use a different version change the `torch` index
-URL below and the `cuda-bindings` pin in `requirements.txt`. `arctic-inference` patches vllm-0.18.0, so that exact
-version is pinned in `requirements.txt`.
+URL below and the `cuda-bindings` pin in `requirements.txt`. `arctic-platform[rl]` installs
+`arctic-inference[vllm]`, which owns the validated vLLM pin.
 ```bash
 # torch (CUDA 12.9) first, then the rest of the pinned packages.
 # overrides.txt forces the few transitive deps (flashinfer/numpy/transformers)

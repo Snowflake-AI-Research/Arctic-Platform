@@ -10,13 +10,9 @@
 # them higher than this recipe is validated against. Keep those pins in overrides.txt
 # only -- listing them here too would be redundant.
 
-arctic-inference[server]
 # Arctic
 arctic-platform[rl]
 cuda-bindings==12.9.4
 datasets
 # preprocess_bird.py reads the BIRD JSON + SQLite databases into verl parquet shards.
 pandas
-
-# Serving / kernels (arctic-inference patches vLLM 0.18.0, so pin that exact version).
-vllm==0.18.0

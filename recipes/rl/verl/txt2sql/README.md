@@ -85,10 +85,10 @@ cd Arctic-Platform/recipes/rl/verl/txt2sql
 
 Create the env on the remaining nodes (idempotent — the launching node already has it), then install the pinned
 dependencies on all nodes. cuda-12.9 is assumed — if you use a different version change the `torch` index URL below
-and the `cuda-bindings` pin in `requirements.txt`. `arctic-inference` patches vllm-0.18.0, so that exact version is
-pinned in `requirements.txt`; `overrides.txt` forces the few transitive deps (flashinfer / numpy / transformers /
-datasets) this recipe is validated against, which vLLM 0.18.0's metadata otherwise pins higher (without it the
-single resolve is unsatisfiable).
+and the `cuda-bindings` pin in `requirements.txt`. `arctic-platform[rl]` installs `arctic-inference[vllm]`, which
+owns the validated vLLM pin; `overrides.txt` forces the few transitive deps (flashinfer / numpy / transformers /
+datasets) this recipe is validated against, which vLLM's metadata otherwise pins higher (without it the single
+resolve is unsatisfiable).
 ```bash
 # create the env on every node (guarded: `conda create -y` on an existing env would wipe and recreate it, which
 # would clobber the uv/ds_ssh you just bootstrapped on the launching node — the `[ -x ... ]` makes it a no-op there)

@@ -19,6 +19,7 @@ No GPU / Ray / DeepSpeed — tiny deterministic tensors and a stub engine.
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import torch
@@ -242,6 +243,46 @@ class TestRunSFTPipeline(TestCasePlus):
         self.assertIn("loss.sum", out["metrics"])
         self.assertIn("loss.tokens", out["metrics"])
         self.assertAlmostEqual(out["avg_loss"], 1.5, places=5)
+
+    def test_sft_all_masked_hf_nan_avg_loss_is_zero(self):
+        class NanOnAllMasked(_StubEngine):
+            def __call__(self, **kwargs):
+                out = super().__call__(**kwargs)
+                labels = kwargs["labels"]
+                if (labels[:, 1:] != -100).sum() == 0:
+                    out.loss = torch.tensor(float("nan"), requires_grad=True)
+                return out
+
+        engine = NanOnAllMasked()
+        finite = run_sft_pipeline(
+            engine,
+            self._batch(),
+            meta={},
+            processing={"loss_fn": "sft"},
+            device="cpu",
+            backward=True,
+        )
+        self.assertAlmostEqual(finite["avg_loss"], 1.5, places=5)
+
+        masked = {
+            "input_ids": torch.arange(8).view(2, 4),
+            "attention_mask": torch.ones(2, 4, dtype=torch.long),
+            "labels": torch.full((2, 4), -100, dtype=torch.long),
+        }
+        out = run_sft_pipeline(
+            engine,
+            masked,
+            meta={},
+            processing={"loss_fn": "sft"},
+            device="cpu",
+            backward=True,
+        )
+        self.assertTrue(math.isfinite(out["avg_loss"]))
+        self.assertEqual(out["avg_loss"], 0.0)
+        self.assertEqual(out["metrics"]["loss.tokens"], 0.0)
+        self.assertEqual(out["metrics"]["loss.sum"], 0.0)
+        self.assertTrue(torch.isfinite(engine.backward_calls[-1][0]))
+        self.assertEqual(engine.backward_calls[-1][0].item(), 0.0)
 
     def test_sft_ce_path_skips_labels_keeps_logits(self):
         engine = _StubEngine()

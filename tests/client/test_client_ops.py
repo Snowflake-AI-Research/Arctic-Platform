@@ -266,7 +266,7 @@ class TestServerState:
         monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
         cfg = ArcticRLClientConfig(
             model_name="m",
-            backend_config=OnPremConfig(comm_protocol="ray"),
+            backend=OnPremConfig(protocol="ray"),
             training_gpus=1,
             sampling_gpus=1,
             log_prob_gpus=1,
@@ -337,14 +337,14 @@ class TestTransportSelection:
                 self.server_state = server_state
 
         monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
-        cfg = ArcticRLClientConfig(model_name="m", backend_config=OnPremConfig(comm_protocol="ray"), training_gpus=1)
+        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(protocol="ray"), training_gpus=1)
         assert isinstance(client_module.make_transport(cfg), DummyRay)
 
     def test_make_transport_selects_http_for_onprem(self):
         """onprem + http (the default) routes to HttpTransport."""
         from arctic_platform.client.transports.onprem_http import HttpTransport
 
-        cfg = ArcticRLClientConfig(model_name="m", backend_config=OnPremConfig(comm_protocol="http"), training_gpus=1)
+        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(protocol="http"), training_gpus=1)
         assert isinstance(client_module.make_transport(cfg), HttpTransport)
 
     def test_make_transport_forwards_server_state_to_ray(self, monkeypatch):
@@ -358,13 +358,13 @@ class TestTransportSelection:
 
         monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
         sentinel = object()
-        cfg = ArcticRLClientConfig(model_name="m", backend_config=OnPremConfig(comm_protocol="ray"), training_gpus=1)
+        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(protocol="ray"), training_gpus=1)
         transport = client_module.make_transport(cfg, server_state=sentinel)
         assert transport.server_state is sentinel
 
     def test_make_transport_rejects_server_state_for_http(self):
         """server_state reconnect is Ray-only; HTTP transport must reject it."""
-        cfg = ArcticRLClientConfig(model_name="m", backend_config=OnPremConfig(comm_protocol="http"), training_gpus=1)
+        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(protocol="http"), training_gpus=1)
         with pytest.raises(ValueError, match="server_state reconnect"):
             client_module.make_transport(cfg, server_state=object())
 

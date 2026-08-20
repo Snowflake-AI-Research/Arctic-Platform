@@ -27,6 +27,7 @@ from typing import Any
 from typing import Literal
 from typing import overload
 
+from arctic_platform._dependency_groups import require_any_dep_group
 from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
@@ -35,19 +36,22 @@ from arctic_platform.client.transport import initialize_or_cleanup
 
 
 def make_transport(config: ArcticRLClientConfig, server_state: Any = None) -> Transport:
-    if config.backend == "cortex":
+    protocol = config.backend.protocol
+    if config.backend.type == "remote" and protocol == "cortex":
+        require_any_dep_group("cortex")
         from arctic_platform.client.transports.cortex import CortexTransport
 
         return CortexTransport(config)
 
+    require_any_dep_group("sft", "rl")
     from arctic_platform.client.transports.onprem_http import HttpTransport
     from arctic_platform.client.transports.onprem_ray import RayTransport
 
-    if config.backend == "onprem" and config.backend_config.comm_protocol == "ray":
+    if protocol == "ray":
         return RayTransport(config, server_state=server_state)
     if server_state is not None:
         raise ValueError("server_state reconnect is only supported by the in-process Ray transport.")
-    return HttpTransport(config)  # onprem (HTTP)
+    return HttpTransport(config)
 
 
 # ── Request builders (op vocabulary defined once) ───────────────────────────

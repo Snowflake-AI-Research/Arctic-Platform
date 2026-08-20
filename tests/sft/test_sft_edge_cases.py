@@ -48,6 +48,21 @@ class TestAllMaskedLabels(TestCasePlus):
         # Fixed: no bogus loss*1 injected when there are no valid targets.
         self.assertEqual(metrics["loss.sum"], 0.0)
 
+    def test_sft_loss_all_neg100_hf_nan_is_finite_zero(self):
+        # HF CE is NaN when every shifted target is ignore_index; return 0, not that NaN.
+        labels = torch.full((1, 5), -100, dtype=torch.long)
+        loss, metrics = sft_loss(
+            {"loss": torch.tensor(float("nan"), requires_grad=True)},
+            {"labels": labels},
+            {},
+            {},
+            "cpu",
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(loss.item(), 0.0)
+        self.assertEqual(metrics["loss.tokens"], 0.0)
+        self.assertEqual(metrics["loss.sum"], 0.0)
+
     def test_sft_ce_all_neg100_divides_by_one(self):
         labels = torch.full((1, 4), -100, dtype=torch.long)
         logits = torch.zeros(1, 4, 8)

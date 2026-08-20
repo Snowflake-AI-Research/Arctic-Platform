@@ -42,48 +42,26 @@ classifiers = [
   "Development Status :: 4 - Beta",
 
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
 ]
 
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 
 
-# Dependencies for the project
+# Config models only. Every usable install picks a backend extra: [cortex] to
+# drive Cortex, [sft]/[rl]/[onprem] to run against an on-prem server.
 dependencies = [
-    "datasets",
-    "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
-    "devtools",
-    "jsonlines",
-    "loguru",
-    "nvidia-ml-py",
-    "openai>=1.48.0",
-    "peft",
-    "psutil",
     "pydantic>=2.10",
-    # ray + uvicorn back the shared server (common/http_server.py,
-    # ray_server.py import them unconditionally), so they are base runtime
-    # deps, not RL-only. Neither pins transformers, so they coexist with the
-    # transformers pin the trainer client (axolotl) installs on top.
-    "ray",
-    "tabulate",
-    "tenacity",
-    "torch",
-    "tqdm",
-    "transformers>=4.57.0,<5",
-#    "transformers>=5.5", # want to switch to v5 but vllm18 blocks us at v4
-    "uvicorn",
-    "wandb",
-    "yq",
+    "typing-extensions",  # Self, per the pydantic model_validator convention
 ]
 
-# Optional development dependencies
+# Optional dependency groups
 [project.optional-dependencies]
 all = [
     "arctic_platform[dev]",
     "arctic_platform[testing]",
-    "arctic_platform[rl]",
+    "arctic_platform[cortex]",
+    "arctic_platform[onprem]",
     "arctic_platform[verl]",
 ]
 
@@ -92,7 +70,10 @@ dev = [
     "arctic_platform[testing]",
 ]
 
+# Pulls [onprem] because the suite exercises both servers, and because `dev` is
+# defined as formatting + testing.
 testing = [
+    "arctic_platform[onprem]",
     "parameterized",
     "pytest-instafail",
     "pytest-flakefinder",
@@ -107,24 +88,59 @@ formatting = [
     "autoflake",
 ]
 
+# Shared DSSST1 tensor wire format.
+wire = [
+    "numpy",
+    "safetensors",
+    "torch",
+]
 
-rl = [
-    # ray + uvicorn moved to base deps (server imports them unconditionally).
-    # This extra now carries only the GPU sampling stack. vllm==0.18.0 declares
-    # transformers<5, but that is only an upper bound: it installs/runs fine
-    # alongside transformers 5 when axolotl is installed last (see setup.sh).
+# HTTP clients shared by Cortex and on-prem transports.
+transport = [
+    "arctic_platform[wire]",
+    "aiohttp",
+    "requests",
+]
+
+# The client, talking to Cortex over SnowAPI.
+cortex = [
+    "arctic_platform[transport]",
+    "tenacity",
+    "urllib3",
+]
+
+# A training-only on-prem server, plus the client that drives it. Deliberately
+# excludes the sampling stack: both servers import arctic_inference lazily so
+# this install can serve training without vLLM.
+sft = [
+    "arctic_platform[transport]",
+    "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
+    "fastapi",
     "liger-kernel>=0.8.0",
+    "nvidia-ml-py",
+    "psutil",
+    "ray",
+    "transformers>=4.57.0,<5",  # vllm 0.18 is what blocks the move to v5
+    "uvicorn",
+]
+
+# [sft] plus sampling. arctic-inference[vllm] owns the validated vLLM pin.
+rl = [
+    "arctic_platform[sft]",
+    "arctic-inference[server,vllm]>=0.2.0",
     "tensordict",
-    "vllm==0.18.0",
+]
+
+onprem = [
+    "arctic_platform[rl]",
 ]
 
 # verl adapter (arctic_platform/integrations/verl). verl itself is user-supplied and
 # version-pinned in launchers; here we only carry the small set of shared runtime
-# dependencies the adapter itself needs beyond the base install and the [rl] extra.
+# dependencies the adapter itself needs beyond [rl].
 verl = [
     "arctic_platform[rl]",
     "codetiming",
-    "hydra-core>=1.3",
     "omegaconf",
 ]
 

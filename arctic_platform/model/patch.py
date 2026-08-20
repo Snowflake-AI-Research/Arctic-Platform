@@ -28,16 +28,11 @@ from arctic_platform.model.loader import LoaderContext
 Patch = Callable[[nn.Module, LoaderContext], None]
 
 
-# Canonical apply order; patches interact, so this is the single source of truth for
-# sequencing (e.g. fp32_lm_head before chunked_lm_head, compile last). Every
-# registered patch must appear here.
-#
-# Where does a new patch go? Patches form a dependency graph: some read or wrap
-# structures that others create or replace. Place a patch after everything it
-# depends on and before anything that depends on it. Independent patches can go in
-# any relative order; when unsure, put structural rewrites early and whole-model
-# wrappers (e.g. torch.compile) last.
-PATCH_ORDER: tuple[str, ...] = ("liger",)
+# Canonical order (every registered patch must appear here).
+# liger → zorro_train (replaces forward) → gradient_checkpointing (before DS wrap).
+# Note: ZoRRo's patched forward does not call `_gradient_checkpointing_func`, so GC
+# under ZoRRo is a no-op for activation savings (same as the old inline worker path).
+PATCH_ORDER: tuple[str, ...] = ("liger", "zorro_train", "gradient_checkpointing")
 
 _PATCHES: dict[str, Patch] = {}
 
