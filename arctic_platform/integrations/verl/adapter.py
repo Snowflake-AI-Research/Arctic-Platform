@@ -759,9 +759,11 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         if self._is_cortex_backend():
             # Cortex takes {args, kwargs, context, processing}; on-prem takes
-            # {batch, meta, processing}. Reshape here, not on the wire.
+            # {batch, meta, processing}. Pass the full envelope so the shared
+            # reshape can lift `meta` (batch_num_tokens/global_batch_size) into
+            # `processing.config` — the server-side GRPO loss needs them.
             payload = to_cortex_fwd_bwd_payload(
-                payload["batch"],
+                payload,
                 dp_size=int(self._client.config.training_gpus or 1),
                 processing=payload.get("processing"),
             )

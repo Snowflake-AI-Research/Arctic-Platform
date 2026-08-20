@@ -7,6 +7,17 @@
 #   2. SkyRL cloned at the pinned commit with SKYRL_HOME exported.
 #   3. ARCTIC_BACKEND=cortex + ARCTIC_CORTEX_* env vars set.
 #   4. Data: `python download_data.py` -> $DATA_DIR/{train,validation}.parquet.
+#
+# Cortex-specific overrides on the base recipe:
+#   - trainer.arctic_rl.attn_implementation=sdpa
+#       Cortex training image ships without FlashAttention2; sdpa is the only
+#       attn impl the sub-job can construct today.
+#   - generator.inference_engine.remote_urls=[http://cortex-managed]
+#     generator.sampling_params.logprobs=null
+#       SkyRL's validate_generator_cfg requires len(remote_urls) == num_engines
+#       when run_engines_locally=false, and rejects sampling_params.logprobs in
+#       that mode. Cortex owns the sampling engines, so both must be set — the
+#       URL is a placeholder; the actual endpoint lives inside the shim.
 
 set -euo pipefail
 
@@ -58,6 +69,7 @@ mkdir -p "${CKPT_DIR}"
 python -m arctic_platform.integrations.skyrl \
     trainer.override_entrypoint=integrations.arctic_rl.entrypoint \
     trainer.arctic_rl.colocate=false \
+    trainer.arctic_rl.attn_implementation=sdpa \
     trainer.algorithm.advantage_estimator=grpo \
     trainer.policy.model.path="${MODEL}" \
     data.train_data="['${TRAIN_FILES}']" \
@@ -69,6 +81,8 @@ python -m arctic_platform.integrations.skyrl \
     generator.inference_engine.num_engines=${NUM_ENGINES} \
     generator.inference_engine.tensor_parallel_size=${TP_SIZE} \
     generator.inference_engine.run_engines_locally=false \
+    "generator.inference_engine.remote_urls=[http://cortex-managed]" \
+    "generator.sampling_params.logprobs=null" \
     generator.inference_engine.weight_sync_backend=nccl \
     generator.inference_engine.async_engine=true \
     generator.batched=true \

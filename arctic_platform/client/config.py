@@ -77,6 +77,10 @@ class CortexConfig(BaseModel):
 
     type: Literal["remote"] = "remote"
     protocol: Literal["cortex"] = Field("cortex", description="remote transport protocol.")
+    # Cortex sub-jobs are always disjoint (training + sampling live in different
+    # SnowAPI sub-jobs), so colocation is not a knob users can flip. Mirrors
+    # OnPremConfig.colocate so the client can read one field regardless of backend.
+    colocate: Literal[False] = Field(False, description="cortex: colocation is not supported.")
     base_url: str | None = Field(None, description="cortex: direct/mock GS URL; bypasses PAT auth.")
     host: str | None = Field(None, description="cortex: Snowflake host for PAT auth.")
     pat: str | None = Field(None, description="cortex: PAT value passed directly; overrides pat_env_var when set.")

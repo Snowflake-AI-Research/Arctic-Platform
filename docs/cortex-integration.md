@@ -32,7 +32,7 @@ constrains what recipes work correctly on this backend:
   `CortexConfig.from_env()` hydrates from `ARCTIC_CORTEX_*` env vars —
   explicit constructor args always win.
 * **Legacy shim** —
-  [`arctic_platform.rl._cortex_dispatch`](../arctic_platform/rl/_cortex_dispatch.py)
+  [`arctic_platform.integrations._cortex_dispatch`](../arctic_platform/integrations/_cortex_dispatch.py)
   wraps the unified client behind the legacy `arctic_platform.rl` surface
   so SkyRL, which still builds `arctic_platform.rl.ArcticRLClientConfig`,
   routes to Cortex. That legacy config has a `_backend_from_env` validator
