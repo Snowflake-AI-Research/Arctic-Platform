@@ -308,7 +308,3 @@ def _neutrino_optimizer(ds_optimizer: Any) -> dict[str, Any] | None:
         return None
     params = ds_optimizer.get("params") or {}
     return {"name": ds_optimizer.get("type", "AdamW"), **params}
-
-
-# Back-compat: the config is workload-agnostic now (SFT and RL share it).
-ArcticRLClientConfig = ArcticClientConfig

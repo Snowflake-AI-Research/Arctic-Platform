@@ -56,8 +56,9 @@ that clears that bar today.
 
 ## Config nesting (canonical)
 One shared shape for every backend *and* every workload — engine knobs are never
-duplicated under backend-specific aliases. `ArcticRLClientConfig` remains as a
-back-compat alias; the flat, on-prem-only `ArcticSFTClientConfig` is gone:
+duplicated under backend-specific aliases. Both the flat, on-prem-only
+`ArcticSFTClientConfig` and the `ArcticRLClientConfig` alias are gone (note the
+legacy `arctic_platform.rl.config.ArcticRLClientConfig` is a different class):
 
 ```
 ArcticClientConfig

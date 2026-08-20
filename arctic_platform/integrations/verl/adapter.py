@@ -39,7 +39,7 @@ from transformers import AutoTokenizer
 from verl.remote_backend.base import RemoteBackend
 from verl.remote_backend.base import RemoteBackendRegistry
 
-from arctic_platform.client import ArcticRLClientConfig
+from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
@@ -605,7 +605,7 @@ class ArcticRLClientWrapper(RemoteBackend):
         ds_worker_config = self._create_ds_worker_config()
         ds_worker_config.setdefault("attn_implementation", attn_implementation)
 
-        rl_config = ArcticRLClientConfig(
+        rl_config = ArcticClientConfig(
             model_name=model_name,
             seed=self._backend_config.train.determinism.get("seed", 42),
             max_seq_len=max_length,

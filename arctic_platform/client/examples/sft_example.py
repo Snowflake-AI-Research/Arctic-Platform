@@ -42,7 +42,7 @@ ARCTIC = Path(__file__).resolve().parents[3]  # Arctic-Platform/
 sys.path.insert(0, str(ARCTIC))
 sys.path.insert(0, str(ARCTIC / "tests" / "rl"))
 
-from arctic_platform.client import ArcticRLClientConfig  # noqa: E402
+from arctic_platform.client import ArcticClientConfig  # noqa: E402
 from arctic_platform.client import CortexConfig  # noqa: E402
 from arctic_platform.client import OnPremConfig  # noqa: E402
 from arctic_platform.client import SyncArcticRLClient  # noqa: E402
@@ -69,9 +69,9 @@ def _metric(x) -> float:
 
 # ── per-backend: config ──────────────────────────────────────────────────────
 def _onprem_config(protocol: str, launch_local_server: bool) -> Callable:
-    def build(stack: contextlib.ExitStack) -> ArcticRLClientConfig:
+    def build(stack: contextlib.ExitStack) -> ArcticClientConfig:
         ckpt = stack.enter_context(tempfile.TemporaryDirectory(prefix="arl_onprem_ckpt_"))
-        return ArcticRLClientConfig(
+        return ArcticClientConfig(
             model_name=MODEL,
             seed=SEED,
             max_seq_len=SEQ_LEN,
@@ -113,8 +113,8 @@ CORTEX_ENDPOINT = "cortex-training"
 
 
 def _cortex_config() -> Callable:
-    def build(stack: contextlib.ExitStack) -> ArcticRLClientConfig:
-        return ArcticRLClientConfig(
+    def build(stack: contextlib.ExitStack) -> ArcticClientConfig:
+        return ArcticClientConfig(
             model_name=MODEL,
             seed=SEED,
             max_seq_len=SEQ_LEN,
@@ -213,7 +213,7 @@ def _report(step: int, out: dict, step_out: dict) -> str:
 
 @dataclass
 class Profile:
-    config: Callable[[contextlib.ExitStack], ArcticRLClientConfig]
+    config: Callable[[contextlib.ExitStack], ArcticClientConfig]
     batch: Callable[[dict], Any]  # packages the shared tokens into the backend's wire shape
 
 

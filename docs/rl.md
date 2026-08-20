@@ -47,7 +47,7 @@ from arctic_platform.rl import ArcticRLClientConfig, create_arctic_rl_client
 **Unified sync client (migration target; subset of ops):**
 
 ```python
-from arctic_platform.client import ArcticRLClient, ArcticRLClientConfig, create_arctic_rl_client
+from arctic_platform.client import ArcticClientConfig, ArcticRLClient, create_arctic_rl_client
 ```
 
 Prefer `arctic_platform.rl` for full RL (sleep/wake, `weight_norm`, …). See

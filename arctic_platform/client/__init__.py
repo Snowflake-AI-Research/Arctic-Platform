@@ -17,7 +17,6 @@ from arctic_platform.client.base import AsyncArcticClient
 from arctic_platform.client.base import SyncArcticClient
 from arctic_platform.client.base import make_transport
 from arctic_platform.client.config import ArcticClientConfig
-from arctic_platform.client.config import ArcticRLClientConfig
 from arctic_platform.client.config import CortexConfig
 from arctic_platform.client.config import OnPremConfig
 from arctic_platform.client.config import SamplingConfig
@@ -38,7 +37,6 @@ __all__ = [
     "ArcticClient",
     "ArcticClientConfig",
     "ArcticRLClient",
-    "ArcticRLClientConfig",
     "ArcticSFTClient",
     "AsyncArcticClient",
     "CortexConfig",
