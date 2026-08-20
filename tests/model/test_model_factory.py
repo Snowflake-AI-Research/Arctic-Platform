@@ -202,18 +202,10 @@ class TestFromDsWorkerConfig:
         assert spec.patches.zorro_train is None  # None disables (empty patch would be truthy)
 
     def test_defaults_attn_implementation_to_flash_attention_2(self):
-        # A ds_worker_config that omits (or nulls) attn_implementation must default to
-        # flash_attention_2 and must NOT raise (regression guard: from_ds_worker_config used to
-        # raise here). The training server packs sequences varlen-style -- multiple sequences
-        # concatenated into one row with per-sequence position_ids resets -- and only a
-        # flash-attention backend keeps them separated via block-diagonal cu_seqlens. sdpa attends
-        # across the packed boundaries and silently corrupts per-token log probs, so the default
-        # picks the *correct* backend rather than the HF/ModelSpec default of None.
+        # Packed varlen forwards need FA2; sdpa attends across sequence boundaries.
         assert ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {}).attn_implementation == "flash_attention_2"
         assert (
-            ModelSpec.from_ds_worker_config(
-                "Qwen/Qwen3-1.7B", {"attn_implementation": None}
-            ).attn_implementation
+            ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {"attn_implementation": None}).attn_implementation
             == "flash_attention_2"
         )
 

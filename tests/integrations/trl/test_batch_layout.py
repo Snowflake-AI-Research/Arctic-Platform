@@ -1,4 +1,4 @@
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,14 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the TRL adapter's batch-layout helpers (CPU, no server).
-
-These pure functions convert between AsyncGRPOTrainer's padding-free packed ``[1, T]`` row (N
-sequences concatenated, ``position_ids`` reset to 0 at each boundary) and the dense right-padded
-``[B, S]`` layout the Arctic server's forward contract expects. They are "the bulk of the adapter and
-where a first integration spends its time", so a silent regression here corrupts every log prob. The
-tests pin exact values (golden tripwires) and the round-trip / shift-alignment invariants.
-"""
+"""CPU tests for packed ``[1, T]`` <-> padded ``[B, S]`` layout helpers."""
 
 from __future__ import annotations
 
@@ -32,7 +25,6 @@ pytest.importorskip("trl.experimental.api")
 
 from arctic_platform.integrations.trl import client as C  # noqa: E402
 from arctic_platform.testing_utils import torch_assert_equal  # noqa: E402
-
 
 # Two packed sequences of real-token length 3 and 2 -> packed row of length T=5.
 PACKED_IDS = torch.tensor([[10, 11, 12, 30, 31]], dtype=torch.long)
@@ -53,7 +45,7 @@ class TestSegmentLengths:
         torch_assert_equal(C._segment_lengths(pos), torch.tensor([2, 4, 1]))
 
     def test_missing_leading_zero_is_tolerated(self):
-        # Defensive branch: a row whose first position_id is not 0 still gets a start prepended at 0.
+        # Missing leading 0: still inject a start at index 0.
         pos = torch.tensor([[1, 2, 0, 1]])  # -> starts {0 (injected), 2} -> lengths 2, 2
         torch_assert_equal(C._segment_lengths(pos), torch.tensor([2, 2]))
 
@@ -62,9 +54,7 @@ class TestUnpackToPaddedRows:
     def test_shapes_and_values(self):
         batch = C._unpack_to_padded_rows(PACKED_IDS, PACKED_POS, PACKED_MASK, SEQ_LENS)
 
-        torch_assert_equal(
-            batch["input_ids"], torch.tensor([[10, 11, 12], [30, 31, 0]], dtype=torch.long)
-        )
+        torch_assert_equal(batch["input_ids"], torch.tensor([[10, 11, 12], [30, 31, 0]], dtype=torch.long))
         torch_assert_equal(batch["attention_mask"], torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.long))
         # position_ids are a per-row arange over real tokens, 0 on pad.
         torch_assert_equal(batch["position_ids"], torch.tensor([[0, 1, 2], [0, 1, 0]], dtype=torch.long))
