@@ -13,38 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Arctic RL backend for TRL.
-
-Unlike the verl integration there is no plugin entry point and no registry to hook. TRL takes the backend as
-a constructor argument::
-
-    from arctic_platform.client.client import SyncArcticRLClient
-    from arctic_platform.integrations.trl import ArcticOptimizer
-    from arctic_platform.integrations.trl import ArcticTrainingClient
-
-    client = SyncArcticRLClient(config)
-    trainer = AsyncGRPOTrainer(
-        model=model,
-        ...,
-        training_client=ArcticTrainingClient(client),
-        rollout_worker=ArcticRolloutWorker(client, dataset, reward_funcs, tokenizer),
-        weight_transfer=ArcticWeightTransfer(client),
-        optimizers=(ArcticOptimizer(client, model.parameters()), scheduler),
-    )
-
-The server registers ``weighted_logprob_sum`` in ``LOSS_FNS`` when it resolves the dotted-path loss name
-``arctic_platform.integrations.trl.loss.weighted_logprob_sum`` (importing the ``loss`` submodule runs its
-``@register_loss_fn`` decorator). That is the only server-side addition the integration needs.
-
-``ArcticRolloutWorker``, ``ArcticWeightTransfer`` and ``weighted_logprob_sum`` are exposed lazily (PEP 562).
-The first two pull in TRL's ``async_grpo`` stack (aiohttp, datasets, ...); ``weighted_logprob_sum`` lives in
-``loss``, which imports the server-side ``pipeline`` (and transitively ``deepspeed``). The CPU-only TRL client
-imports only ``client`` / ``rollout`` / ``weights`` and passes the loss by dotted-path name, so keeping the
-loss import lazy stops ``deepspeed`` from being dragged into the client process. Accessing any of these names
-imports the owning submodule on demand.
-
-See ``README.md`` for the design rationale and the open items.
-"""
+"""Arctic RL backend for TRL. Construct the trainer with these objects; ``weighted_logprob_sum`` is lazy."""
 
 from typing import TYPE_CHECKING
 
@@ -66,9 +35,7 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    # Lazy imports (PEP 562). `rollout`/`weights` pull in the async_grpo stack; `loss` pulls in the server-side
-    # `pipeline` (and transitively `deepspeed`). The CPU-only client touches none of these, so importing this
-    # package stays free of both dependency stacks until a name is actually accessed.
+    # Lazy: rollout/weights need async_grpo; loss needs the server.
     if name == "ArcticRolloutWorker":
         from arctic_platform.integrations.trl.rollout import ArcticRolloutWorker
 
