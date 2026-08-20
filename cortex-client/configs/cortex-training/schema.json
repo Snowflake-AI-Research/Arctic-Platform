@@ -48,6 +48,10 @@
         "recommendedProfileId": {
           "type": "string",
           "minLength": 1
+        },
+        "lastValidated": {
+          "type": "string",
+          "format": "date"
         }
       }
     },
@@ -68,6 +72,10 @@
         "recommendedProfileId": {
           "type": "string",
           "minLength": 1
+        },
+        "lastValidated": {
+          "type": "string",
+          "format": "date"
         }
       },
       "allOf": [
@@ -96,6 +104,11 @@
                 {
                   "required": [
                     "recommendedProfileId"
+                  ]
+                },
+                {
+                  "required": [
+                    "lastValidated"
                   ]
                 }
               ]

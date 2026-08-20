@@ -25,8 +25,9 @@ must request GPUs in multiples of eight.
 
 1. Update the model capability and the referenced profile in the same pull
    request.
-2. Set `lastValidated` and include checked-in evidence paths for every changed
-   profile.
+2. Include checked-in evidence paths for every changed profile. Remove
+   `lastValidated` from each affected model recommendation until that exact
+   model and profile completes a live smoke test, then set it to the test date.
 3. Run:
 
    ```bash

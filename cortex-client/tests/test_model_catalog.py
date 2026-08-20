@@ -95,6 +95,40 @@ def test_qwen_inference_tensor_parallel_recommendations(
     )
 
 
+def test_validation_dates_are_tied_to_model_recommendations():
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    profile_by_id = {profile["id"]: profile for profile in profiles}
+    model_by_id = {model["modelId"]: model for model in models_doc["models"]}
+
+    assert all("lastValidated" not in profile for profile in profiles)
+    assert (
+        model_by_id["Qwen/Qwen3-0.6B"]["capabilities"]["inference"][
+            "lastValidated"
+        ]
+        == "2026-08-20"
+    )
+    assert (
+        model_by_id["Qwen/Qwen3.8-27B"]["capabilities"]["training"]["profiles"][
+            "sftFull"
+        ]["lastValidated"]
+        == "2026-08-19"
+    )
+    assert (
+        "lastValidated"
+        not in model_by_id["Qwen/Qwen3.6-35B-A3B"]["capabilities"]["inference"]
+    )
+    assert (
+        "lastValidated"
+        not in model_by_id["Qwen/Qwen3.6-35B-A3B"]["capabilities"]["training"][
+            "profiles"
+        ]["rlLora"]
+    )
+    assert "lastValidated" not in model_by_id["openai/gpt-oss-120b"][
+        "capabilities"
+    ]["inference"]
+    assert profile_by_id["inference-8gpu"]["subJobs"][0]["args"]["max_seq_len"] == 8192
+
+
 def test_qwen_38_live_smoke_uses_catalog_rl_lora_profile():
     request = build_profile_request(
         CONFIG_DIR,
@@ -340,6 +374,16 @@ def test_sampling_tensor_parallel_size_must_divide_gpu_count():
         CatalogValidationError,
         match="tensor_parallel_size must be a divisor of n_gpus",
     ):
+        validate_catalog(models_doc, profiles, REPO_ROOT)
+
+
+def test_recommendation_validation_date_must_be_iso_formatted():
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    models_doc["models"][0]["capabilities"]["inference"][
+        "lastValidated"
+    ] = "August 20, 2026"
+
+    with pytest.raises(CatalogValidationError, match="must be an ISO date"):
         validate_catalog(models_doc, profiles, REPO_ROOT)
 
 

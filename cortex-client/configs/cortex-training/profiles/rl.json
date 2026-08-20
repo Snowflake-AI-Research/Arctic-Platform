@@ -5,7 +5,6 @@
       "workflow": "rl",
       "tuningMethod": "lora",
       "summary": "LoRA RL starting point with eight training and eight sampling GPUs.",
-      "lastValidated": "2026-08-19",
       "recipePath": "cortex-client/recipes/rl_loop.py",
       "evidencePaths": [
         "cortex-client/recipes/rl_loop.py"
@@ -101,7 +100,6 @@
       "workflow": "rl",
       "tuningMethod": "full",
       "summary": "Full-parameter RL starting point with eight training and eight sampling GPUs.",
-      "lastValidated": "2026-08-19",
       "recipePath": "cortex-client/recipes/rl_loop.py",
       "evidencePaths": [
         "cortex-client/recipes/rl_loop.py"
@@ -165,7 +163,6 @@
       "workflow": "rl",
       "tuningMethod": "lora",
       "summary": "LoRA RL starting point with eight training and eight sampling GPUs.",
-      "lastValidated": "2026-08-19",
       "recipePath": "cortex-client/recipes/rl_loop.py",
       "evidencePaths": [
         "cortex-client/examples/rl.json"
@@ -261,7 +258,6 @@
       "workflow": "rl",
       "tuningMethod": "full",
       "summary": "Prime-RL expert-parallel RL starting point with sixteen training and sixteen sampling GPUs.",
-      "lastValidated": "2026-08-19",
       "recipePath": "cortex-client/recipes/rl_loop.py",
       "evidencePaths": [
         "cortex-client/examples/rl.json"

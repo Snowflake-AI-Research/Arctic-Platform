@@ -5,7 +5,6 @@
       "workflow": "sft",
       "tuningMethod": "lora",
       "summary": "Eight-GPU LoRA SFT starting point for supported dense models.",
-      "lastValidated": "2026-08-19",
       "recipePath": "cortex-client/recipes/sft_loop.py",
       "evidencePaths": [
         "cortex-client/recipes/sft_loop.py"
@@ -67,7 +66,6 @@
       "workflow": "sft",
       "tuningMethod": "full",
       "summary": "Eight-GPU full-parameter SFT starting point for supported dense models.",
-      "lastValidated": "2026-08-19",
       "recipePath": "cortex-client/recipes/sft_loop.py",
       "evidencePaths": [
         "cortex-client/recipes/sft_loop.py"
@@ -113,7 +111,6 @@
       "workflow": "sft",
       "tuningMethod": "lora",
       "summary": "Eight-GPU LoRA SFT starting point for the supported Qwen MoE model.",
-      "lastValidated": "2026-08-19",
       "recipePath": "cortex-client/recipes/sft_loop.py",
       "evidencePaths": [
         "cortex-client/recipes/sft_loop.py"
@@ -175,7 +172,6 @@
       "workflow": "sft",
       "tuningMethod": "full",
       "summary": "Prime-RL expert-parallel SFT starting point for the supported Qwen MoE model.",
-      "lastValidated": "2026-08-19",
       "recipePath": "cortex-client/recipes/sft_loop.py",
       "evidencePaths": [
         "cortex-client/examples/training.json"

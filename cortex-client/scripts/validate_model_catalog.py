@@ -132,16 +132,6 @@ def _validate_profile_shape(profile: dict[str, Any], repo_root: Path) -> None:
         )
 
     _require_string(profile.get("summary"), f"profile {profile_id}.summary")
-    validated = _require_string(
-        profile.get("lastValidated"), f"profile {profile_id}.lastValidated"
-    )
-    try:
-        date.fromisoformat(validated)
-    except ValueError as exc:
-        raise CatalogValidationError(
-            f"profile {profile_id}.lastValidated must be an ISO date"
-        ) from exc
-
     evidence_paths = profile.get("evidencePaths")
     if not isinstance(evidence_paths, list) or not evidence_paths:
         raise CatalogValidationError(
@@ -227,6 +217,18 @@ def _validate_profile_reference(
         recommendation.get("recommendedProfileId"),
         f"model {model_id}.{profile_key}.recommendedProfileId",
     )
+    validated = recommendation.get("lastValidated")
+    if validated is not None:
+        validated = _require_string(
+            validated,
+            f"model {model_id}.{profile_key}.lastValidated",
+        )
+        try:
+            date.fromisoformat(validated)
+        except ValueError as exc:
+            raise CatalogValidationError(
+                f"model {model_id}.{profile_key}.lastValidated must be an ISO date"
+            ) from exc
     profile = profile_by_id.get(profile_id)
     if profile is None:
         raise CatalogValidationError(
@@ -397,7 +399,11 @@ def validate_catalog(
                 )
             )
         else:
-            unexpected = {"maxContextTokens", "recommendedProfileId"} & set(inference)
+            unexpected = {
+                "maxContextTokens",
+                "recommendedProfileId",
+                "lastValidated",
+            } & set(inference)
             if unexpected:
                 raise CatalogValidationError(
                     f"model {model_id}.inference: unsupported capabilities cannot define "

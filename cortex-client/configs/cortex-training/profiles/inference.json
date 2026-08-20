@@ -5,7 +5,6 @@
       "workflow": "inference",
       "tuningMethod": "none",
       "summary": "Eight-GPU H200 inference starting point with single-GPU tensor parallelism for supported Qwen models.",
-      "lastValidated": "2026-08-20",
       "evidencePaths": [
         "cortex-client/examples/sampling.json"
       ],
@@ -32,7 +31,6 @@
       "workflow": "inference",
       "tuningMethod": "none",
       "summary": "Conservative multi-node inference starting point for very large models.",
-      "lastValidated": "2026-08-19",
       "evidencePaths": [
         "cortex-client/DSS-Server-API-Specification.md"
       ],
@@ -59,7 +57,6 @@
       "workflow": "inference",
       "tuningMethod": "none",
       "summary": "Sixteen-GPU inference with FP8 KV cache for GLM 5.2.",
-      "lastValidated": "2026-08-19",
       "evidencePaths": [
         "cortex-client/DSS-Server-API-Specification.md"
       ],
