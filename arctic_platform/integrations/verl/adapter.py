@@ -201,9 +201,12 @@ class ArcticRLClientWrapper(RemoteBackend):
         self.use_liger = self.config.actor_rollout_ref.model.use_liger
         self._max_token_len_per_gpu = self.config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.actor_rollout_ref.model.path)
-        self._client = self._initialize_client(reconnect_job_config, rl_server_state)
-        if self._is_cortex_backend():
+        # Validate BEFORE creating the client: _initialize_client provisions a
+        # Cortex sub-job pair, so a post-init raise leaks GPU-holding jobs on
+        # every Ray actor retry.
+        if os.environ.get("ARCTIC_BACKEND") == "cortex":
             self._validate_cortex_compat()
+        self._client = self._initialize_client(reconnect_job_config, rl_server_state)
 
     # ------------------------------------------------------------------ #
     # RemoteBackend interface
