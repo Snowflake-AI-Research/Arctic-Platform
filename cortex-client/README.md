@@ -30,9 +30,49 @@ pip install -e .
 
 The package installs:
 
-- `dss-neutrino`, for submitting and managing jobs
-- `neutrino-tui`, for viewing job logs
-- `dss_client`, the Python SDK
+- `cortex-training`, the canonical command for submitting and managing jobs
+- `cortex-training tui`, the canonical command for viewing job logs
+- `cortex_training`, the canonical Python namespace
+- `dss-neutrino`, `neutrino-tui`, and `dss_client`, the existing compatible
+  command and Python names
+
+Verify the command entry points:
+
+```bash
+cortex-training --help
+cortex-training tui --help
+dss-neutrino --help
+neutrino-tui --help
+```
+
+## Cortex Training Aliases (Phase 1)
+
+New code can use the canonical command and Python names:
+
+```bash
+cortex-training list
+cortex-training submit examples/api/training.json
+cortex-training tui JOB_ID
+```
+
+```python
+from cortex_training import CortexTrainingClient, CortexTrainingEngine
+```
+
+This phase is deliberately additive:
+
+- `dss_client` remains the implementation package.
+- `dss-neutrino`, `neutrino-tui`, and all existing Python imports remain valid.
+- Authentication behavior and the `NEUTRINO_*` / `SNOWFLAKE_*` environment
+  variables are unchanged.
+- Login state remains under `~/.config/dss-neutrino/` and TUI cache state
+  remains under `~/.cache/neutrino-tui/` unless existing override variables are
+  used.
+- SNOWAPI request paths, REST payloads, and the DSSST1 wire format are unchanged.
+
+`cortex-training` delegates to the same command implementation as
+`dss-neutrino`; `cortex-training tui` delegates to `neutrino-tui`. The
+[CLI reference](docs/reference/cli.md) therefore applies to both command names.
 
 ## Repository Map
 
@@ -43,6 +83,7 @@ The package installs:
 | `examples/api/` | Small JSON examples for individual API operations |
 | `examples/config/` | Connection configuration templates |
 | `dss_client/` | Installable Python client |
+| `cortex_training/` | Canonical compatibility facade |
 | `tests/` | Client and CLI tests |
 
 The current onboarding work is tracked in

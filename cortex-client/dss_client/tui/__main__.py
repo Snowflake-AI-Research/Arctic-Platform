@@ -16,9 +16,9 @@ import os
 import sys
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
+def _build_arg_parser(*, prog: str = "neutrino-tui") -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="neutrino-tui",
+        prog=prog,
         description="Read-only TUI for Neutrino logs.",
     )
     p.add_argument("job_id", nargs="?", help="Job (session) id to open directly. If omitted, the TUI shows a job picker.")
@@ -47,8 +47,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def run(argv=None) -> int:
-    parser = _build_arg_parser()
+def run(argv=None, *, prog: str = "neutrino-tui") -> int:
+    parser = _build_arg_parser(prog=prog)
     args = parser.parse_args(argv)
 
     try:

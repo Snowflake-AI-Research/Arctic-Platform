@@ -124,9 +124,13 @@ def _jobs_latest_last(jobs: list[Any]) -> list[Any]:
     return list(reversed(jobs))
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(
+    *,
+    prog: str = "dss-neutrino",
+    include_tui: bool = False,
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="dss-neutrino",
+        prog=prog,
         description="Manage Neutrino jobs through the SNOWAPI endpoint.",
     )
     parser.add_argument(
@@ -341,6 +345,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the Neutrino CLI config JSON file to remember.",
     )
 
+    if include_tui:
+        subparsers.add_parser("tui", help="Open the read-only Neutrino log TUI.")
+
     return parser
 
 
@@ -548,8 +555,13 @@ def _normalize_connection_args(args: argparse.Namespace) -> argparse.Namespace:
     )
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = build_parser()
+def parse_args(
+    argv: list[str] | None = None,
+    *,
+    prog: str = "dss-neutrino",
+    include_tui: bool = False,
+) -> argparse.Namespace:
+    parser = build_parser(prog=prog, include_tui=include_tui)
     args = parser.parse_args(argv)
     if args.command == "login":
         return args
@@ -907,6 +919,8 @@ def _run(
 def main(
     argv: list[str] | None = None,
     *,
+    prog: str = "dss-neutrino",
+    include_tui: bool = False,
     client_factory: Callable[[argparse.Namespace], Any] | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
@@ -917,7 +931,7 @@ def main(
     stdin = stdin or sys.stdin
 
     try:
-        args = parse_args(argv)
+        args = parse_args(argv, prog=prog, include_tui=include_tui)
         dry_run = args.command == "submit" and args.dry_run
         no_client = dry_run or args.command == "login"
         if client_factory is None and not no_client:

@@ -20,6 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
+cortex-training = "cortex_training.cli:main"
 dss-neutrino = "dss_neutrino_cli:main"
 neutrino-tui = "dss_client.tui.__main__:run"
 
@@ -37,5 +38,5 @@ py-modules = ["dss_neutrino_cli"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["dss_client*"]
+include = ["cortex_training*", "dss_client*"]
 exclude = ["tests*"]
