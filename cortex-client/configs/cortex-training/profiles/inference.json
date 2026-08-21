@@ -1,0 +1,84 @@
+{
+  "profiles": [
+    {
+      "id": "inference-8gpu",
+      "workflow": "inference",
+      "tuningMethod": "none",
+      "summary": "Eight-GPU H200 inference starting point with single-GPU tensor parallelism for supported Qwen models.",
+      "evidencePaths": [
+        "cortex-client/examples/sampling.json"
+      ],
+      "subJobs": [
+        {
+          "builder": "sampling_job",
+          "args": {
+            "max_seq_len": 8192,
+            "n_gpus": 8,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_sampling": {
+              "vllm_config": {
+                "tensor_parallel_size": 1,
+                "gpu_memory_utilization": 0.8
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "inference-8gpu-tp8-fp8-kv",
+      "workflow": "inference",
+      "tuningMethod": "none",
+      "summary": "Single-node TP8 inference with FP8 KV cache for large quantized models.",
+      "evidencePaths": [
+        "cortex-client/DSS-Server-API-Specification.md"
+      ],
+      "subJobs": [
+        {
+          "builder": "sampling_job",
+          "args": {
+            "max_seq_len": 8192,
+            "n_gpus": 8,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_sampling": {
+              "vllm_config": {
+                "tensor_parallel_size": 8,
+                "kv_cache_dtype": "fp8",
+                "gpu_memory_utilization": 0.8
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "inference-16gpu-fp8-kv",
+      "workflow": "inference",
+      "tuningMethod": "none",
+      "summary": "Sixteen-GPU inference with FP8 KV cache for GLM 5.2.",
+      "evidencePaths": [
+        "cortex-client/DSS-Server-API-Specification.md"
+      ],
+      "subJobs": [
+        {
+          "builder": "sampling_job",
+          "args": {
+            "max_seq_len": 32768,
+            "n_gpus": 16,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_sampling": {
+              "vllm_config": {
+                "tensor_parallel_size": 16,
+                "kv_cache_dtype": "fp8",
+                "gpu_memory_utilization": 0.8
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

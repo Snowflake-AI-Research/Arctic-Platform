@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Snowflake-AI-Research/Arctic-Platform/cortex-client/configs/cortex-training/schema.json",
+  "title": "Cortex Training model catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "catalog",
+    "lastReviewed",
+    "models"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "catalog": {
+      "const": "cortex-training"
+    },
+    "lastReviewed": {
+      "type": "string",
+      "format": "date"
+    },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/model"
+      }
+    }
+  },
+  "$defs": {
+    "recommendedProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxContextTokens",
+        "recommendedProfileId"
+      ],
+      "properties": {
+        "maxContextTokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "recommendedProfileId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lastValidated": {
+          "type": "string",
+          "format": "date"
+        }
+      }
+    },
+    "inferenceCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supported"
+      ],
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "maxContextTokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "recommendedProfileId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "lastValidated": {
+          "type": "string",
+          "format": "date"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "supported": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "maxContextTokens",
+              "recommendedProfileId"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "maxContextTokens"
+                  ]
+                },
+                {
+                  "required": [
+                    "recommendedProfileId"
+                  ]
+                },
+                {
+                  "required": [
+                    "lastValidated"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "trainingCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supported"
+      ],
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "profiles": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sftLora",
+            "sftFull",
+            "rlLora",
+            "rlFull"
+          ],
+          "properties": {
+            "sftLora": {
+              "$ref": "#/$defs/recommendedProfile"
+            },
+            "sftFull": {
+              "$ref": "#/$defs/recommendedProfile"
+            },
+            "rlLora": {
+              "$ref": "#/$defs/recommendedProfile"
+            },
+            "rlFull": {
+              "$ref": "#/$defs/recommendedProfile"
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "supported": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "profiles"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "profiles"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "modelId",
+        "capabilities"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "modelId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "inference",
+            "training"
+          ],
+          "properties": {
+            "inference": {
+              "$ref": "#/$defs/inferenceCapability"
+            },
+            "training": {
+              "$ref": "#/$defs/trainingCapability"
+            }
+          }
+        }
+      }
+    }
+  }
+}

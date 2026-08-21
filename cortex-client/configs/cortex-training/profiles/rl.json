@@ -1,0 +1,433 @@
+{
+  "profiles": [
+    {
+      "id": "dense-rl-lora-8x8",
+      "workflow": "rl",
+      "tuningMethod": "lora",
+      "summary": "LoRA RL starting point with eight training and eight sampling GPUs.",
+      "recipePath": "cortex-client/recipes/rl_loop.py",
+      "evidencePaths": [
+        "cortex-client/recipes/rl_loop.py"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.00002,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.95],
+              "eps": 1e-8
+            },
+            "max_seq_len": 8192,
+            "train_batch_size": 8,
+            "n_gpus": 8,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "attn_implementation": "flash_attention_3",
+              "mb_spec": {
+                "max_tokens_per_mb": 10240
+              },
+              "peft_config": {
+                "peft_type": "Lora",
+                "r": 32,
+                "lora_alpha": 32,
+                "lora_dropout": 0.0,
+                "bias": "none",
+                "target_modules": [
+                  "q_proj",
+                  "k_proj",
+                  "v_proj",
+                  "o_proj",
+                  "gate_proj",
+                  "up_proj",
+                  "down_proj"
+                ]
+              },
+              "ds_config": {
+                "train_batch_size": 8,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 2,
+                  "reduce_scatter": true
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        },
+        {
+          "builder": "sampling_job",
+          "args": {
+            "max_seq_len": 8192,
+            "n_gpus": 8,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_sampling": {
+              "peft_config": {
+                "peft_type": "Lora",
+                "r": 32,
+                "lora_alpha": 32,
+                "lora_dropout": 0.0,
+                "bias": "none",
+                "target_modules": [
+                  "q_proj",
+                  "k_proj",
+                  "v_proj",
+                  "o_proj",
+                  "gate_proj",
+                  "up_proj",
+                  "down_proj"
+                ]
+              },
+              "vllm_config": {
+                "tensor_parallel_size": 8,
+                "gpu_memory_utilization": 0.8
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "dense-rl-lora-eager-8x8",
+      "workflow": "rl",
+      "tuningMethod": "lora",
+      "summary": "LoRA RL starting point for Qwen3.8 with eager eight-GPU sampling.",
+      "recipePath": "cortex-client/recipes/rl_loop.py",
+      "evidencePaths": [
+        "cortex-client/recipes/rl_loop.py"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.00002,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.95],
+              "eps": 1e-8
+            },
+            "max_seq_len": 8192,
+            "train_batch_size": 8,
+            "n_gpus": 8,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "attn_implementation": "flash_attention_3",
+              "mb_spec": {
+                "max_tokens_per_mb": 10240
+              },
+              "peft_config": {
+                "peft_type": "Lora",
+                "r": 32,
+                "lora_alpha": 32,
+                "lora_dropout": 0.0,
+                "bias": "none",
+                "target_modules": [
+                  "q_proj",
+                  "k_proj",
+                  "v_proj",
+                  "o_proj",
+                  "gate_proj",
+                  "up_proj",
+                  "down_proj"
+                ]
+              },
+              "ds_config": {
+                "train_batch_size": 8,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 2,
+                  "reduce_scatter": true
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        },
+        {
+          "builder": "sampling_job",
+          "args": {
+            "max_seq_len": 8192,
+            "n_gpus": 8,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_sampling": {
+              "peft_config": {
+                "peft_type": "Lora",
+                "r": 32,
+                "lora_alpha": 32,
+                "lora_dropout": 0.0,
+                "bias": "none",
+                "target_modules": [
+                  "q_proj",
+                  "k_proj",
+                  "v_proj",
+                  "o_proj",
+                  "gate_proj",
+                  "up_proj",
+                  "down_proj"
+                ]
+              },
+              "vllm_config": {
+                "tensor_parallel_size": 8,
+                "gpu_memory_utilization": 0.8,
+                "enforce_eager": true,
+                "extra_engine_kwargs": {
+                  "disable_custom_all_reduce": true
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "dense-rl-full-8x8",
+      "workflow": "rl",
+      "tuningMethod": "full",
+      "summary": "Full-parameter RL starting point with eight training and eight sampling GPUs.",
+      "recipePath": "cortex-client/recipes/rl_loop.py",
+      "evidencePaths": [
+        "cortex-client/recipes/rl_loop.py"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.00002,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.95],
+              "eps": 1e-8
+            },
+            "max_seq_len": 8192,
+            "train_batch_size": 8,
+            "n_gpus": 8,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "attn_implementation": "flash_attention_3",
+              "mb_spec": {
+                "max_tokens_per_mb": 10240
+              },
+              "ds_config": {
+                "train_batch_size": 8,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 2,
+                  "reduce_scatter": true
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        },
+        {
+          "builder": "sampling_job",
+          "args": {
+            "max_seq_len": 8192,
+            "n_gpus": 8,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_sampling": {
+              "vllm_config": {
+                "tensor_parallel_size": 8,
+                "gpu_memory_utilization": 0.8
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "moe-rl-lora-8x8",
+      "workflow": "rl",
+      "tuningMethod": "lora",
+      "summary": "LoRA RL starting point with eight training and eight sampling GPUs.",
+      "recipePath": "cortex-client/recipes/rl_loop.py",
+      "evidencePaths": [
+        "cortex-client/examples/rl.json"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.00002,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.95],
+              "eps": 1e-8
+            },
+            "max_seq_len": 8192,
+            "train_batch_size": 8,
+            "n_gpus": 8,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "attn_implementation": "flash_attention_3",
+              "mb_spec": {
+                "max_tokens_per_mb": 10240
+              },
+              "peft_config": {
+                "peft_type": "Lora",
+                "r": 32,
+                "lora_alpha": 32,
+                "lora_dropout": 0.0,
+                "bias": "none",
+                "target_modules": [
+                  "q_proj",
+                  "k_proj",
+                  "v_proj",
+                  "o_proj",
+                  "gate_proj",
+                  "up_proj",
+                  "down_proj"
+                ]
+              },
+              "ds_config": {
+                "train_batch_size": 8,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 2,
+                  "reduce_scatter": true
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        },
+        {
+          "builder": "sampling_job",
+          "args": {
+            "max_seq_len": 8192,
+            "n_gpus": 8,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_sampling": {
+              "peft_config": {
+                "peft_type": "Lora",
+                "r": 32,
+                "lora_alpha": 32,
+                "lora_dropout": 0.0,
+                "bias": "none",
+                "target_modules": [
+                  "q_proj",
+                  "k_proj",
+                  "v_proj",
+                  "o_proj",
+                  "gate_proj",
+                  "up_proj",
+                  "down_proj"
+                ]
+              },
+              "vllm_config": {
+                "tensor_parallel_size": 8,
+                "gpu_memory_utilization": 0.8
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "moe-rl-full-16x16",
+      "workflow": "rl",
+      "tuningMethod": "full",
+      "summary": "Prime-RL expert-parallel RL starting point with sixteen training and sixteen sampling GPUs.",
+      "recipePath": "cortex-client/recipes/rl_loop.py",
+      "evidencePaths": [
+        "cortex-client/examples/rl.json"
+      ],
+      "subJobs": [
+        {
+          "builder": "training_job",
+          "args": {
+            "optimizer": {
+              "name": "AdamW",
+              "lr": 0.0001,
+              "weight_decay": 0.0,
+              "betas": [0.9, 0.999],
+              "eps": 1e-8
+            },
+            "max_seq_len": 8192,
+            "train_batch_size": 32,
+            "n_gpus": 16,
+            "gradient_clipping": 1.0,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_training": {
+              "model_provider": "prime_rl",
+              "attn_implementation": "flash_attention_3",
+              "attn_impl": "flash_attention_3",
+              "ep_size": 8,
+              "ac_config": {
+                "mode": "full",
+                "freq": 1
+              },
+              "mb_spec": {
+                "max_tokens_per_mb": 10240
+              },
+              "prime_rl": {
+                "fused_lm_head_token_chunk_size": 8192,
+                "fused_cross_entropy": false
+              },
+              "ds_config": {
+                "train_batch_size": 32,
+                "train_micro_batch_size_per_gpu": 2,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                  "stage": 1,
+                  "reduce_scatter": true
+                },
+                "bf16": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        },
+        {
+          "builder": "sampling_job",
+          "args": {
+            "max_seq_len": 8192,
+            "n_gpus": 16,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "extra_sampling": {
+              "router_replay": {
+                "enabled": true
+              },
+              "vllm_config": {
+                "tensor_parallel_size": 8,
+                "gpu_memory_utilization": 0.8
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,290 @@
+{
+  "$schema": "./schema.json",
+  "schemaVersion": 1,
+  "catalog": "cortex-training",
+  "lastReviewed": "2026-08-21",
+  "models": [
+    {
+      "name": "Qwen3 0.6B",
+      "modelId": "Qwen/Qwen3-0.6B",
+      "capabilities": {
+        "inference": {
+          "supported": true,
+          "maxContextTokens": 32768,
+          "recommendedProfileId": "inference-8gpu",
+          "lastValidated": "2026-08-21"
+        },
+        "training": {
+          "supported": true,
+          "profiles": {
+            "sftLora": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-sft-lora-8gpu",
+              "lastValidated": "2026-08-21"
+            },
+            "sftFull": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-sft-full-8gpu",
+              "lastValidated": "2026-08-21"
+            },
+            "rlLora": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-rl-lora-8x8",
+              "lastValidated": "2026-08-21"
+            },
+            "rlFull": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-rl-full-8x8",
+              "lastValidated": "2026-08-21"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Qwen3 1.7B",
+      "modelId": "Qwen/Qwen3-1.7B",
+      "capabilities": {
+        "inference": {
+          "supported": true,
+          "maxContextTokens": 32768,
+          "recommendedProfileId": "inference-8gpu",
+          "lastValidated": "2026-08-21"
+        },
+        "training": {
+          "supported": true,
+          "profiles": {
+            "sftLora": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-sft-lora-8gpu",
+              "lastValidated": "2026-08-21"
+            },
+            "sftFull": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-sft-full-8gpu",
+              "lastValidated": "2026-08-21"
+            },
+            "rlLora": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-rl-lora-8x8",
+              "lastValidated": "2026-08-21"
+            },
+            "rlFull": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-rl-full-8x8",
+              "lastValidated": "2026-08-21"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Qwen3 8B",
+      "modelId": "Qwen/Qwen3-8B",
+      "capabilities": {
+        "inference": {
+          "supported": true,
+          "maxContextTokens": 32768,
+          "recommendedProfileId": "inference-8gpu",
+          "lastValidated": "2026-08-21"
+        },
+        "training": {
+          "supported": true,
+          "profiles": {
+            "sftLora": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-sft-lora-8gpu",
+              "lastValidated": "2026-08-21"
+            },
+            "sftFull": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-sft-full-8gpu",
+              "lastValidated": "2026-08-21"
+            },
+            "rlLora": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-rl-lora-8x8",
+              "lastValidated": "2026-08-21"
+            },
+            "rlFull": {
+              "maxContextTokens": 32768,
+              "recommendedProfileId": "dense-rl-full-8x8",
+              "lastValidated": "2026-08-21"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Qwen3.5 4B",
+      "modelId": "Qwen/Qwen3.5-4B",
+      "capabilities": {
+        "inference": {
+          "supported": true,
+          "maxContextTokens": 262144,
+          "recommendedProfileId": "inference-8gpu",
+          "lastValidated": "2026-08-21"
+        },
+        "training": {
+          "supported": true,
+          "profiles": {
+            "sftLora": {
+              "maxContextTokens": 262144,
+              "recommendedProfileId": "dense-sft-lora-8gpu",
+              "lastValidated": "2026-08-21"
+            },
+            "sftFull": {
+              "maxContextTokens": 262144,
+              "recommendedProfileId": "dense-sft-full-8gpu",
+              "lastValidated": "2026-08-21"
+            },
+            "rlLora": {
+              "maxContextTokens": 262144,
+              "recommendedProfileId": "dense-rl-lora-8x8",
+              "lastValidated": "2026-08-21"
+            },
+            "rlFull": {
+              "maxContextTokens": 262144,
+              "recommendedProfileId": "dense-rl-full-8x8",
+              "lastValidated": "2026-08-21"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Qwen3.6 35B-A3B",
+      "modelId": "Qwen/Qwen3.6-35B-A3B",
+      "capabilities": {
+        "inference": {
+          "supported": true,
+          "maxContextTokens": 262144,
+          "recommendedProfileId": "inference-8gpu",
+          "lastValidated": "2026-08-21"
+        },
+        "training": {
+          "supported": true,
+          "profiles": {
+            "sftLora": {
+              "maxContextTokens": 262144,
+              "recommendedProfileId": "moe-sft-lora-8gpu",
+              "lastValidated": "2026-08-21"
+            },
+            "sftFull": {
+              "maxContextTokens": 262144,
+              "recommendedProfileId": "moe-sft-full-8gpu",
+              "lastValidated": "2026-08-21"
+            },
+            "rlLora": {
+              "maxContextTokens": 262144,
+              "recommendedProfileId": "moe-rl-lora-8x8",
+              "lastValidated": "2026-08-21"
+            },
+            "rlFull": {
+              "maxContextTokens": 262144,
+              "recommendedProfileId": "moe-rl-full-16x16",
+              "lastValidated": "2026-08-21"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Qwen3.8 27B",
+      "modelId": "Qwen/Qwen3.8-27B",
+      "capabilities": {
+        "inference": {
+          "supported": true,
+          "maxContextTokens": 262144,
+          "recommendedProfileId": "inference-8gpu",
+          "lastValidated": "2026-08-21"
+        },
+        "training": {
+          "supported": true,
+          "profiles": {
+            "sftLora": {
+              "maxContextTokens": 262144,
+              "recommendedProfileId": "dense-sft-lora-8gpu",
+              "lastValidated": "2026-08-21"
+            },
+            "sftFull": {
+              "maxContextTokens": 262144,
+              "recommendedProfileId": "dense-sft-full-8gpu",
+              "lastValidated": "2026-08-21"
+            },
+            "rlLora": {
+              "maxContextTokens": 262144,
+              "recommendedProfileId": "dense-rl-lora-eager-8x8",
+              "lastValidated": "2026-08-21"
+            },
+            "rlFull": {
+              "maxContextTokens": 262144,
+              "recommendedProfileId": "dense-rl-full-8x8",
+              "lastValidated": "2026-08-21"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "DeepSeek V4 Flash",
+      "modelId": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "capabilities": {
+        "inference": {
+          "supported": true,
+          "maxContextTokens": 1048576,
+          "recommendedProfileId": "inference-8gpu-tp8-fp8-kv",
+          "lastValidated": "2026-08-21"
+        },
+        "training": {
+          "supported": false
+        }
+      }
+    },
+    {
+      "name": "GPT-OSS 120B",
+      "modelId": "openai/gpt-oss-120b",
+      "capabilities": {
+        "inference": {
+          "supported": true,
+          "maxContextTokens": 131072,
+          "recommendedProfileId": "inference-8gpu-tp8-fp8-kv",
+          "lastValidated": "2026-08-21"
+        },
+        "training": {
+          "supported": false
+        }
+      }
+    },
+    {
+      "name": "GLM 5.2",
+      "modelId": "zai-org/GLM-5.2",
+      "capabilities": {
+        "inference": {
+          "supported": true,
+          "maxContextTokens": 1048576,
+          "recommendedProfileId": "inference-16gpu-fp8-kv",
+          "lastValidated": "2026-08-21"
+        },
+        "training": {
+          "supported": false
+        }
+      }
+    },
+    {
+      "name": "GLM 5.2 FP8",
+      "modelId": "zai-org/GLM-5.2-FP8",
+      "capabilities": {
+        "inference": {
+          "supported": true,
+          "maxContextTokens": 1048576,
+          "recommendedProfileId": "inference-16gpu-fp8-kv",
+          "lastValidated": "2026-08-21"
+        },
+        "training": {
+          "supported": false
+        }
+      }
+    }
+  ]
+}
