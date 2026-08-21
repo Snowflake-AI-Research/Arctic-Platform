@@ -73,7 +73,7 @@ class HttpTransport(OnPremTransport):
         return url, {"params": params, "json": request.body}
 
     def call(self, request: Request) -> dict:
-        from arctic_platform.common.utils import sft_profile
+        from arctic_platform import sft_profile
 
         with sft_profile.timed("serialize"):
             url, kwargs = self._http_args(request)

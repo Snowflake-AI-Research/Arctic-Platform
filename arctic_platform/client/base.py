@@ -78,7 +78,7 @@ def _maybe_print_server_profile(op: str, out: dict | None) -> None:
     """Echo the server's per-op timings when ARL_SFT_PROFILE is set; a no-op otherwise."""
     # TODO(generalize-profiling): extend profiling to every transport and workload in a
     # follow-up PR; nothing here is SFT-specific but the names.
-    from arctic_platform.common.utils import sft_profile
+    from arctic_platform import sft_profile
 
     if not sft_profile.enabled() or not isinstance(out, dict):
         return

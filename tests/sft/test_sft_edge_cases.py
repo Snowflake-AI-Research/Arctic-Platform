@@ -366,7 +366,7 @@ class TestPerfFixesUnit(TestCasePlus):
     def test_sft_profile_helpers(self):
         import os
 
-        from arctic_platform.common.utils import sft_profile
+        from arctic_platform import sft_profile
 
         prev = os.environ.get("ARL_SFT_PROFILE")
         try:

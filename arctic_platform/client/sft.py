@@ -55,10 +55,13 @@ class ArcticSFTClientConfig(ArcticClientConfig):
         return self
 
 
-def _sft_body(batch: dict) -> dict:
+def _sft_body(batch: dict, processing: dict | None = None) -> dict:
     """The SFT loss contract: bodies carry ``processing`` + ``meta`` unless the caller set them."""
     body = dict(batch)
-    body.setdefault("processing", {"loss_fn": "sft"})
+    if processing is not None:
+        body["processing"] = processing
+    else:
+        body.setdefault("processing", {"loss_fn": "sft"})
     body.setdefault("meta", {})
     return body
 
@@ -67,7 +70,28 @@ class ArcticSFTClient(ArcticClient):
     """SFT frontend: forward bodies default to the ``sft`` loss unless the caller overrides."""
 
     def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
-        return super().fwd_bwd(_sft_body(batch), processing, router_replay)
+        return super().fwd_bwd(_sft_body(batch, processing), router_replay=router_replay)
 
-    def fwd_no_grad(self, batch: dict, reference_model: bool = False) -> dict:
-        return super().fwd_no_grad(_sft_body(batch), reference_model)
+    def fwd_no_grad(self, batch: dict, processing: dict | None = None) -> dict:
+        return super().fwd_no_grad(_sft_body(batch, processing))
+
+    def save_checkpoint(
+        self,
+        path: str | None = None,
+        *,
+        step: int | None = None,
+        export_hf: bool = False,
+        save_total_limit: int | None = None,
+        checkpoint_id: str | None = None,
+        checkpoint_type: str = "resumable",
+        stage_info: dict | None = None,
+    ) -> dict:
+        return super().save_checkpoint(
+            checkpoint_id=checkpoint_id,
+            checkpoint_type=checkpoint_type,
+            path=path,
+            step=step,
+            export_hf=export_hf,
+            save_total_limit=save_total_limit,
+            stage_info=stage_info,
+        )
