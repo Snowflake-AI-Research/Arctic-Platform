@@ -1,3 +1,5 @@
+"""Shared Cortex Training recipe helpers."""
+
 from __future__ import annotations
 
 import contextlib
@@ -10,7 +12,7 @@ from typing import Any
 
 import torch
 
-from dss_client import NeutrinoClient, wire
+from cortex_training import CortexTrainingClient, wire
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +20,7 @@ logger = logging.getLogger(__name__)
 IGNORE_INDEX = -100
 
 
-def make_client(config_path: str, **overrides: Any) -> NeutrinoClient:
+def make_client(config_path: str, **overrides: Any) -> CortexTrainingClient:
     parsed = json.loads(Path(config_path).expanduser().read_text(encoding="utf-8"))
     if not isinstance(parsed, dict):
         raise ValueError(f"connection config {config_path} must be a JSON object")
@@ -26,7 +28,7 @@ def make_client(config_path: str, **overrides: Any) -> NeutrinoClient:
 
     pat = config.get("pat")
     kwargs: dict[str, Any] = dict(
-        database=config.get("database", "NEUTRINO_DB"),
+        database=config.get("database", "CORTEX_TRAINING_DB"),
         schema=config.get("schema", "PUBLIC"),
         endpoint=config.get("endpoint", "cortex-training"),
         poll_interval=float(config.get("poll_interval", 0.5)),
@@ -43,7 +45,7 @@ def make_client(config_path: str, **overrides: Any) -> NeutrinoClient:
         raise ValueError(
             "no PAT found: put `pat` in the connection config"
         )
-    return NeutrinoClient.from_pat(
+    return CortexTrainingClient.from_pat(
         host=host,
         pat=pat,
         verify_ssl=bool(config.get("verify_ssl", True)),
@@ -63,7 +65,7 @@ def build_renderer(model_name: str):
     """Return ``(tokenizer, renderer, renderer_name)`` for ``model_name``.
 
     Uses tinker ``model_info.get_recommended_renderer_name``. These recipe
-    helpers only cover models tinker lists; Neutrino itself can host more.
+    helpers only cover models tinker lists; Cortex Training itself can host more.
     """
     from tinker_cookbook import model_info, renderers
     from tinker_cookbook.tokenizer_utils import get_tokenizer
@@ -114,7 +116,7 @@ def sequence_from_conversation(
     train_on_what: Any,
     max_seq_len: int | None = None,
 ) -> TrainSequence:
-    """Render a chat conversation straight into Neutrino's forward-backward shape.
+    """Render a chat conversation straight into Cortex Training's forward-backward shape.
 
     ``renderer.build_supervised_example`` tokenizes the whole conversation and
     returns per-token weights aligned with those tokens: ``weights[i] > 0`` marks
@@ -226,7 +228,7 @@ def collate(
 
 
 def forward_backward_step(
-    client: NeutrinoClient,
+    client: CortexTrainingClient,
     job_id: str,
     kwargs: dict[str, torch.Tensor],
     context: dict[str, torch.Tensor] | None = None,
@@ -250,7 +252,7 @@ def forward_backward_step(
 
 
 def sync_weights(
-    client: NeutrinoClient,
+    client: CortexTrainingClient,
     job_id: str,
     weight_format: str | None = None,
 ) -> dict:
@@ -265,7 +267,7 @@ def sync_weights(
 
 @contextlib.contextmanager
 def running_job(
-    client: NeutrinoClient,
+    client: CortexTrainingClient,
     job_body: dict,
     job_id: str | None = None,
     keep_job: bool | None = None,

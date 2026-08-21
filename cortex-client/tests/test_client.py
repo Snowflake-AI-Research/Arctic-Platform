@@ -1,4 +1,4 @@
-"""Unit tests for ``dss_client.neutrino_client``.
+"""Unit tests for ``cortex_training.client``.
 
 Two suites:
 
@@ -7,7 +7,7 @@ Two suites:
   validation (mirrors the Control Plane validators), and ``to_wire``
   serialization (matches the GS yaml shape).
 
-- HTTP-surface tests for ``NeutrinoClient`` that stub ``client._session`` with
+- HTTP-surface tests for ``CortexTrainingClient`` that stub ``client._session`` with
   a :class:`unittest.mock.MagicMock`, so every test runs offline.
 """
 
@@ -23,26 +23,26 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-# Import the module directly so we don't pull dss_client/__init__.py (which
+# Import the module directly so we don't pull cortex_training/__init__.py (which
 # imports torch via engine.py).
 spec = importlib.util.spec_from_file_location(
-    "neutrino_client_under_test",
+    "cortex_training_client_under_test",
     str(__import__("pathlib").Path(__file__).resolve().parent.parent
-        / "dss_client" / "neutrino_client.py"),
+        / "cortex_training" / "client.py"),
 )
 nc = importlib.util.module_from_spec(spec)
-sys.modules["neutrino_client_under_test"] = nc
+sys.modules["cortex_training_client_under_test"] = nc
 spec.loader.exec_module(nc)
 
 JobType = nc.JobType
 TrainingConfig = nc.TrainingConfig
 InferenceConfig = nc.InferenceConfig
 SubJobConfig = nc.SubJobConfig
-NeutrinoClient = nc.NeutrinoClient
+CortexTrainingClient = nc.CortexTrainingClient
 
 
 def _wire_load(data: bytes):
-    from dss_client import wire
+    from cortex_training import wire
 
     return wire.loads(data)
 
@@ -80,8 +80,8 @@ def _make_error_response(json_body, status_code: int = 409):
     return resp
 
 
-def _make_client(post_json=None, get_json=None) -> NeutrinoClient:
-    client = NeutrinoClient(
+def _make_client(post_json=None, get_json=None) -> CortexTrainingClient:
+    client = CortexTrainingClient(
         base_url="http://test.local",
         database="DB",
         schema="SCH",
@@ -512,16 +512,16 @@ class TestSubJobConfigToWire:
             assert absent not in wire
 
 
-# ─── NeutrinoClient — auth & URL composition ────────────────────────────
+# ─── CortexTrainingClient — auth & URL composition ────────────────────────────
 
 
 class TestClientConstruction:
     def test_init_strips_trailing_slash(self):
-        c = NeutrinoClient(base_url="http://x.test/", database="DB", schema="SCH")
+        c = CortexTrainingClient(base_url="http://x.test/", database="DB", schema="SCH")
         assert c.base_url == "http://x.test"
 
     def test_default_polling_config(self):
-        c = NeutrinoClient(base_url="http://x.test", database="DB", schema="SCH")
+        c = CortexTrainingClient(base_url="http://x.test", database="DB", schema="SCH")
         assert c.poll_interval == 0.5
         assert c.poll_timeout == 1800.0
         assert c.poll_backoff_multiplier == 1.25
@@ -538,7 +538,7 @@ class TestClientConstruction:
     )
     def test_rejects_invalid_polling_config(self, kwargs, match):
         with pytest.raises(ValueError, match=match):
-            NeutrinoClient(
+            CortexTrainingClient(
                 base_url="http://x.test",
                 database="DB",
                 schema="SCH",
@@ -546,15 +546,15 @@ class TestClientConstruction:
             )
 
     def test_default_endpoint_is_cortex_training(self):
-        c = NeutrinoClient(base_url="http://x.test", database="DB", schema="SCH")
+        c = CortexTrainingClient(base_url="http://x.test", database="DB", schema="SCH")
         assert c.endpoint == "cortex-training"
 
     def test_prefix_url(self):
-        c = NeutrinoClient(base_url="http://x.test", database="DB", schema="SCH")
+        c = CortexTrainingClient(base_url="http://x.test", database="DB", schema="SCH")
         assert c._prefix == "http://x.test/api/v2/databases/DB/schemas/SCH/cortex-training"
 
     def test_from_pat_sets_headers_and_verify(self):
-        c = NeutrinoClient.from_pat(
+        c = CortexTrainingClient.from_pat(
             host="x.test", pat="tok-xyz", database="DB", schema="SCH",
             verify_ssl=False,
         )
@@ -565,14 +565,14 @@ class TestClientConstruction:
 
     def test_no_legacy_auth_methods(self):
         # Production client only supports PAT.
-        assert not hasattr(NeutrinoClient, "from_snowflake_login")
+        assert not hasattr(CortexTrainingClient, "from_snowflake_login")
         # And no legacy builder helpers.
-        assert not hasattr(NeutrinoClient, "build_training_sub_job")
-        assert not hasattr(NeutrinoClient, "build_sampling_sub_job")
-        assert not hasattr(NeutrinoClient, "create_training_engine")
+        assert not hasattr(CortexTrainingClient, "build_training_sub_job")
+        assert not hasattr(CortexTrainingClient, "build_sampling_sub_job")
+        assert not hasattr(CortexTrainingClient, "create_training_engine")
 
 
-# ─── NeutrinoClient — create_job ────────────────────────────────────────
+# ─── CortexTrainingClient — create_job ────────────────────────────────────────
 
 
 class TestCreateJob:
@@ -723,22 +723,22 @@ class TestCreateJob:
         assert c.create_job_from_body(body) == {"job_id": "srv"}
 
 
-# ─── NeutrinoClient — read & control endpoints ─────────────────────────
+# ─── CortexTrainingClient — read & control endpoints ─────────────────────────
 
 
 class TestReadAndControl:
     def test_normalize_job_status(self):
-        assert NeutrinoClient._normalize_job_status("JOB_STATE_RUNNING") == "running"
-        assert NeutrinoClient._normalize_job_status("running") == "running"
-        assert NeutrinoClient._normalize_job_status("JOB_STATE_FAILED") == "failed"
+        assert CortexTrainingClient._normalize_job_status("JOB_STATE_RUNNING") == "running"
+        assert CortexTrainingClient._normalize_job_status("running") == "running"
+        assert CortexTrainingClient._normalize_job_status("JOB_STATE_FAILED") == "failed"
 
     def test_normalize_job_status_tolerates_unknown_and_non_string(self):
         # A CP ahead of GS can surface a JobState enum GS doesn't know, which GS
         # renders as a raw integer. Must not crash on int.lower(); an unknown
         # value normalizes to a harmless non-terminal string.
-        assert NeutrinoClient._normalize_job_status(12) == "12"
-        assert NeutrinoClient._normalize_job_status(None) == ""
-        assert NeutrinoClient._normalize_job_status("JOB_STATE_INITIALIZING") == "initializing"
+        assert CortexTrainingClient._normalize_job_status(12) == "12"
+        assert CortexTrainingClient._normalize_job_status(None) == ""
+        assert CortexTrainingClient._normalize_job_status("JOB_STATE_INITIALIZING") == "initializing"
 
     def test_get_job(self):
         c = _make_client(get_json={"job_id": "j1", "status": "running"})
@@ -801,7 +801,7 @@ class TestReadAndControl:
         }
 
 
-# ─── NeutrinoClient — wait_for_job ─────────────────────────────────────
+# ─── CortexTrainingClient — wait_for_job ─────────────────────────────────────
 
 
 class TestWaitForJob:
@@ -867,7 +867,7 @@ class TestWaitForJob:
         assert c.wait_for_job("j1")["status"] == "running"
 
 
-# ─── NeutrinoClient — data-plane ───────────────────────────────────────
+# ─── CortexTrainingClient — data-plane ───────────────────────────────────────
 
 
 class TestForwardBackwardPayloadHelpers:
@@ -947,7 +947,7 @@ class TestDataPlane:
         url, kwargs = c._session.post.call_args
         assert url[0] == f"{c._prefix}/j1/forward-backward"
         assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
-        from dss_client import wire
+        from cortex_training import wire
 
         metadata = wire.read_byte_chunk_metadata(kwargs["data"])
         assert metadata["operation"] == "fwd-bwd"
@@ -967,7 +967,7 @@ class TestDataPlane:
         assert c.forward_backward("j1", oversized) == "r1"
         assert c._session.post.call_count == 2
         first = c._session.post.call_args_list[0].kwargs["data"]
-        from dss_client import wire
+        from cortex_training import wire
 
         assert wire.read_byte_chunk_metadata(first)["operation"] == "fwd-bwd"
         group_ids = {
@@ -1001,7 +1001,7 @@ class TestDataPlane:
         assert c.forward_backward("j1", b"x" * (70 * 1024)) == "r1"
         assert c._session.post.call_count == 4
 
-        from dss_client import wire
+        from cortex_training import wire
 
         sent = [call.kwargs["data"] for call in c._session.post.call_args_list]
         metadata = [wire.read_byte_chunk_metadata(chunk) for chunk in sent]
@@ -1155,13 +1155,13 @@ class TestDataPlane:
         assert c.generate("j1", prompts=[oversized_prompt]) == "g4"
         assert c._session.post.call_count == 2
         first = c._session.post.call_args_list[0].kwargs["data"]
-        from dss_client import wire
+        from cortex_training import wire
 
         assert wire.read_byte_chunk_metadata(first)["operation"] == "generate"
 
     def test_generate_stream_rejects_oversized_payload(self):
         c = _make_client(post_json={"request_id": "s2", "count": 1})
-        oversized_prompt = "x" * (NeutrinoClient._MAX_GENERATE_BYTES + 1)
+        oversized_prompt = "x" * (CortexTrainingClient._MAX_GENERATE_BYTES + 1)
         with pytest.raises(ValueError, match="exceeds the maximum allowed size"):
             c.generate_stream("j1", prompts=[oversized_prompt])
         c._session.post.assert_not_called()
@@ -1517,7 +1517,7 @@ class TestDataPlane:
 
     def test_forward_rejects_oversized_bytes_payload(self):
         c = _make_client(post_json={"request_id": "r-forward"})
-        oversized = b"\x00" * (NeutrinoClient._MAX_FWD_BWD_BYTES + 1)
+        oversized = b"\x00" * (CortexTrainingClient._MAX_FWD_BWD_BYTES + 1)
         with pytest.raises(ValueError, match="exceeds the maximum allowed size"):
             c.forward("j1", oversized)
         c._session.post.assert_not_called()
@@ -1618,7 +1618,7 @@ class TestDataPlane:
         }
 
 
-# ─── NeutrinoClient — request polling ──────────────────────────────────
+# ─── CortexTrainingClient — request polling ──────────────────────────────────
 
 
 class TestRequestPolling:
@@ -1647,7 +1647,7 @@ class TestRequestPolling:
         )
 
     def test_get_request_status_decodes_stream_dssst1_result_events(self):
-        from dss_client import wire
+        from cortex_training import wire
 
         payload = wire.dumps(
             {
@@ -1723,7 +1723,7 @@ class TestRequestPolling:
         assert c.poll_request("j1", "r1") == {}
 
     def test_poll_request_decodes_dssst1_result_payload(self, monkeypatch):
-        from dss_client import wire
+        from cortex_training import wire
 
         payload = wire.dumps({"avg_loss": 0.5})
         c = _make_client(
@@ -1741,7 +1741,7 @@ class TestRequestPolling:
         assert c.poll_request("j1", "r1") == {"avg_loss": 0.5}
 
     def test_poll_request_keeps_non_generate_dssst1_tensors(self, monkeypatch):
-        from dss_client import wire
+        from cortex_training import wire
 
         payload = wire.dumps({"logprobs": torch.tensor([0.125, -0.5], dtype=torch.float32)})
         c = _make_client(
@@ -1761,7 +1761,7 @@ class TestRequestPolling:
         assert torch.equal(result["logprobs"], torch.tensor([0.125, -0.5]))
 
     def test_poll_request_restores_generate_dssst1_tensors_to_lists(self, monkeypatch):
-        from dss_client import wire
+        from cortex_training import wire
 
         payload = wire.dumps(
             {
@@ -1804,7 +1804,7 @@ class TestRequestPolling:
         assert "r-generate" not in c._generate_request_ids
 
     def test_poll_request_decodes_chunked_dssst1_result(self, monkeypatch):
-        from dss_client import wire
+        from cortex_training import wire
 
         chunks = wire.encode_result_chunks({"text": "x" * 20_000}, max_bytes=12_000)
         assert len(chunks) > 1
@@ -1858,7 +1858,7 @@ class TestRequestPolling:
             c.poll_request("j1", "r1")
 
 
-# ─── NeutrinoClient — checkpoints ──────────────────────────────────────
+# ─── CortexTrainingClient — checkpoints ──────────────────────────────────────
 
 
 class TestCheckpoints:
@@ -1894,7 +1894,7 @@ class TestCheckpoints:
             c.delete_checkpoint("j1", "missing")
 
 
-# ─── NeutrinoClient — logs (read-only) ─────────────────────────────────
+# ─── CortexTrainingClient — logs (read-only) ─────────────────────────────────
 
 
 class TestLogs:
@@ -1938,7 +1938,7 @@ class TestLogs:
         assert got == ["a", "b"]
 
 
-# ─── NeutrinoClient — ZMD events (read-only) ───────────────────────────
+# ─── CortexTrainingClient — ZMD events (read-only) ───────────────────────────
 
 
 class TestEvents:

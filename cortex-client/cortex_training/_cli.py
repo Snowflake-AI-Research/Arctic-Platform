@@ -1,9 +1,8 @@
-"""Command line interface for Neutrino job management."""
+"""Command-line implementation for Cortex Training job management."""
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import sys
@@ -29,10 +28,7 @@ _CONFIG_ALIASES = {
     "db": "database",
 }
 
-_LOGIN_STATE_ENV = "DSS_NEUTRINO_LOGIN_FILE"
-_NEUTRINO_CLIENT_MODULE_NAME = "neutrino_client_for_cli"
-
-
+_LOGIN_STATE_ENV = "CORTEX_TRAINING_LOGIN_FILE"
 def _env(*names: str) -> str | None:
     for name in names:
         value = os.environ.get(name)
@@ -52,34 +48,16 @@ def _has_url_scheme(url: str) -> bool:
     return url.startswith("http://") or url.startswith("https://")
 
 
-def _load_neutrino_client_module():
-    """Load neutrino_client.py directly to avoid package-level torch imports."""
-    if _NEUTRINO_CLIENT_MODULE_NAME in sys.modules:
-        return sys.modules[_NEUTRINO_CLIENT_MODULE_NAME]
+def _load_cortex_training_client_class():
+    from .client import CortexTrainingClient
 
-    module_path = (
-        Path(__file__).resolve().parent / "dss_client" / "neutrino_client.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        _NEUTRINO_CLIENT_MODULE_NAME, module_path
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load Neutrino client from {module_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_neutrino_client_class():
-    module = _load_neutrino_client_module()
-    return module.NeutrinoClient
+    return CortexTrainingClient
 
 
 def _load_forward_backward_payload_builder():
-    module = _load_neutrino_client_module()
-    return module.build_forward_backward_payload
+    from .client import build_forward_backward_payload
+
+    return build_forward_backward_payload
 
 
 def _created_epoch(raw: Any) -> float | None:
@@ -126,17 +104,17 @@ def _jobs_latest_last(jobs: list[Any]) -> list[Any]:
 
 def build_parser(
     *,
-    prog: str = "dss-neutrino",
+    prog: str = "cortex-training",
     include_tui: bool = False,
 ) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="Manage Neutrino jobs through the SNOWAPI endpoint.",
+        description="Manage Cortex Training jobs through the SNOWAPI endpoint.",
     )
     parser.add_argument(
         "--config",
-        default=_env("NEUTRINO_CONFIG"),
-        help="Path to a reusable Neutrino CLI config JSON file.",
+        default=_env("CORTEX_TRAINING_CONFIG"),
+        help="Path to a reusable Cortex Training CLI config JSON file.",
     )
     parser.add_argument(
         "--base-url",
@@ -185,7 +163,7 @@ def build_parser(
 
     submit = subparsers.add_parser(
         "submit",
-        help="Submit a Neutrino job from a CreateJob JSON file.",
+        help="Submit a Cortex Training job from a CreateJob JSON file.",
     )
     submit.add_argument(
         "json_file",
@@ -203,16 +181,16 @@ def build_parser(
         help="Wait until the submitted job reaches running.",
     )
 
-    get = subparsers.add_parser("get", help="Fetch one Neutrino job.")
+    get = subparsers.add_parser("get", help="Fetch one Cortex Training job.")
     get.add_argument("job_id")
 
     checkpoints = subparsers.add_parser(
         "checkpoints",
-        help="List checkpoints for one Neutrino job.",
+        help="List checkpoints for one Cortex Training job.",
     )
     checkpoints.add_argument("job_id")
 
-    list_jobs = subparsers.add_parser("list", help="List Neutrino jobs.")
+    list_jobs = subparsers.add_parser("list", help="List Cortex Training jobs.")
     list_jobs.add_argument("--status", help="Optional status filter.")
 
     subparsers.add_parser(
@@ -220,7 +198,7 @@ def build_parser(
         help="Show reserved GPU capacity and current usage for the caller account.",
     )
 
-    cancel = subparsers.add_parser("cancel", help="Cancel one Neutrino job.")
+    cancel = subparsers.add_parser("cancel", help="Cancel one Cortex Training job.")
     cancel.add_argument("job_id")
 
     wait = subparsers.add_parser("wait", help="Wait until one job reaches running.")
@@ -248,7 +226,7 @@ def build_parser(
 
     load = subparsers.add_parser(
         "load",
-        help="Load a checkpoint into an already-created Neutrino job.",
+        help="Load a checkpoint into an already-created Cortex Training job.",
     )
     load.add_argument("checkpoint_id", help="Checkpoint id/tag to load.")
     load.add_argument(
@@ -262,7 +240,7 @@ def build_parser(
             "Training sub-job to load the checkpoint into, e.g. JOB_ID:training:0. "
             "Use this for sessions with multiple training sub-jobs when you need "
             "explicit routing control. Omit to use the default training sub-job. "
-            "Use 'dss-neutrino --job-id JOB_ID get' to discover available sub-job IDs."
+            "Use 'cortex-training --job-id JOB_ID get' to discover available sub-job IDs."
         ),
     )
     load.add_argument(
@@ -321,7 +299,7 @@ def build_parser(
 
     download_log = subparsers.add_parser(
         "download-log",
-        help="Download all log files for a Neutrino job's experiment run.",
+        help="Download all log files for a Cortex Training job's experiment run.",
     )
     download_log.add_argument("job_id")
     download_log.add_argument(
@@ -336,17 +314,17 @@ def build_parser(
 
     login = subparsers.add_parser(
         "login",
-        help="Remember a Neutrino config file for future commands.",
+        help="Remember a Cortex Training config file for future commands.",
     )
     login.add_argument(
         "--config",
         required=True,
         dest="login_config",
-        help="Path to the Neutrino CLI config JSON file to remember.",
+        help="Path to the Cortex Training CLI config JSON file to remember.",
     )
 
     if include_tui:
-        subparsers.add_parser("tui", help="Open the read-only Neutrino log TUI.")
+        subparsers.add_parser("tui", help="Open the read-only Cortex Training log TUI.")
 
     return parser
 
@@ -357,7 +335,7 @@ def _login_state_path() -> Path:
         return Path(override).expanduser()
     config_home = _env("XDG_CONFIG_HOME")
     base = Path(config_home).expanduser() if config_home else Path.home() / ".config"
-    return base / "dss-neutrino" / "login.json"
+    return base / "cortex-training" / "login.json"
 
 
 def _read_login_config_path() -> str | None:
@@ -367,13 +345,13 @@ def _read_login_config_path() -> str | None:
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid dss-neutrino login state {path}: {exc}") from exc
+        raise ValueError(f"invalid cortex-training login state {path}: {exc}") from exc
     if not isinstance(parsed, dict):
-        raise ValueError(f"invalid dss-neutrino login state {path}: expected object")
+        raise ValueError(f"invalid cortex-training login state {path}: expected object")
     config_path = parsed.get("config_path")
     if not isinstance(config_path, str) or not config_path:
         raise ValueError(
-            f"invalid dss-neutrino login state {path}: missing config_path"
+            f"invalid cortex-training login state {path}: missing config_path"
         )
     return config_path
 
@@ -467,12 +445,12 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
     if not load_login:
         return {}
 
-    base_url = _coalesce(args.base_url, _env("NEUTRINO_BASE_URL"))
-    host = _coalesce(args.host, _env("NEUTRINO_HOST", "SNOWFLAKE_HOST"))
-    pat = _coalesce(args.pat, _env("NEUTRINO_PAT", "SNOWFLAKE_PAT"))
+    base_url = _coalesce(args.base_url, _env("CORTEX_TRAINING_BASE_URL"))
+    host = _coalesce(args.host, _env("CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST"))
+    pat = _coalesce(args.pat, _env("CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"))
     database = _coalesce(
         args.database,
-        _env("NEUTRINO_DATABASE", "SNOWFLAKE_DATABASE"),
+        _env("CORTEX_TRAINING_DATABASE", "SNOWFLAKE_DATABASE"),
     )
     if _has_connection(base_url, host, pat, database):
         return {}
@@ -493,33 +471,33 @@ def _resolve_args(
     args.base_url = _coalesce(
         args.base_url,
         _config_str(config, "base_url"),
-        _env("NEUTRINO_BASE_URL"),
+        _env("CORTEX_TRAINING_BASE_URL"),
     )
     args.host = _coalesce(
         args.host,
         _config_str(config, "host"),
-        _env("NEUTRINO_HOST", "SNOWFLAKE_HOST"),
+        _env("CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST"),
     )
     args.pat = _coalesce(
         args.pat,
         _config_str(config, "pat"),
-        _env("NEUTRINO_PAT", "SNOWFLAKE_PAT"),
+        _env("CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"),
     )
     args.database = _coalesce(
         args.database,
         _config_str(config, "database"),
-        _env("NEUTRINO_DATABASE", "SNOWFLAKE_DATABASE"),
+        _env("CORTEX_TRAINING_DATABASE", "SNOWFLAKE_DATABASE"),
     )
     args.schema = _coalesce(
         args.schema,
         _config_str(config, "schema"),
-        _env("NEUTRINO_SCHEMA", "SNOWFLAKE_SCHEMA"),
+        _env("CORTEX_TRAINING_SCHEMA", "SNOWFLAKE_SCHEMA"),
         "PUBLIC",
     )
     args.endpoint = _coalesce(
         args.endpoint,
         _config_str(config, "endpoint"),
-        _env("NEUTRINO_ENDPOINT"),
+        _env("CORTEX_TRAINING_ENDPOINT"),
         "cortex-training",
     )
     args.poll_interval = _coalesce(
@@ -558,7 +536,7 @@ def _normalize_connection_args(args: argparse.Namespace) -> argparse.Namespace:
 def parse_args(
     argv: list[str] | None = None,
     *,
-    prog: str = "dss-neutrino",
+    prog: str = "cortex-training",
     include_tui: bool = False,
 ) -> argparse.Namespace:
     parser = build_parser(prog=prog, include_tui=include_tui)
@@ -572,13 +550,13 @@ def parse_args(
         return args
     args = _normalize_connection_args(args)
     if not args.database:
-        parser.error("provide --database or set NEUTRINO_DATABASE/SNOWFLAKE_DATABASE")
+        parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
     if args.base_url is None and (args.host is None or args.pat is None):
         parser.error("provide --base-url for local/mock use, or both --host and --pat")
     return args
 
 
-def build_client(args: argparse.Namespace, neutrino_client_cls):
+def build_client(args: argparse.Namespace, cortex_training_client_cls):
     kwargs = {
         "database": args.database,
         "schema": args.schema,
@@ -587,8 +565,8 @@ def build_client(args: argparse.Namespace, neutrino_client_cls):
         "poll_timeout": args.poll_timeout,
     }
     if args.base_url:
-        return neutrino_client_cls(base_url=args.base_url, **kwargs)
-    return neutrino_client_cls.from_pat(
+        return cortex_training_client_cls(base_url=args.base_url, **kwargs)
+    return cortex_training_client_cls.from_pat(
         host=_normalize_host(args.host),
         pat=args.pat,
         verify_ssl=not args.no_verify_ssl,
@@ -919,7 +897,7 @@ def _run(
 def main(
     argv: list[str] | None = None,
     *,
-    prog: str = "dss-neutrino",
+    prog: str = "cortex-training",
     include_tui: bool = False,
     client_factory: Callable[[argparse.Namespace], Any] | None = None,
     stdout: TextIO | None = None,
@@ -935,10 +913,10 @@ def main(
         dry_run = args.command == "submit" and args.dry_run
         no_client = dry_run or args.command == "login"
         if client_factory is None and not no_client:
-            neutrino_client_cls = _load_neutrino_client_class()
+            cortex_training_client_cls = _load_cortex_training_client_class()
             client_factory = lambda parsed_args: build_client(
                 parsed_args,
-                neutrino_client_cls,
+                cortex_training_client_cls,
             )
         elif client_factory is None:
             client_factory = lambda _parsed_args: None

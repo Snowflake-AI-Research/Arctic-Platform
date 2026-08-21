@@ -1,4 +1,4 @@
-"""Client-side persistent cache for the read-only log TUI.
+"""Client-side persistent cache for the Cortex Training log TUI.
 
 Reopening a job should not re-retrieve logs already fetched — that is wasted
 load on the (deliberately stateless) Zone Manager. The transport is already
@@ -25,18 +25,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional, Tuple
 
-# Cache dir resolution mirrors dss_neutrino_cli._login_state_path: an explicit
+# Cache dir resolution mirrors cortex_training._cli._login_state_path: an explicit
 # override wins, else XDG_CACHE_HOME, else ~/.cache, namespaced under the app.
-_OVERRIDE_ENV = "NEUTRINO_TUI_CACHE_DIR"
+_OVERRIDE_ENV = "CORTEX_TRAINING_TUI_CACHE_DIR"
 _XDG_CACHE_ENV = "XDG_CACHE_HOME"
-_NAMESPACE = "neutrino-tui"
+_NAMESPACE = "cortex-training"
 
-# Backoff defaults, matching NeutrinoClient.poll_backoff_multiplier /
+# Backoff defaults, matching CortexTrainingClient.poll_backoff_multiplier /
 # poll_max_interval. Kept module-level so a test/mock client need not carry them.
 _POLL_BACKOFF_MULTIPLIER = 1.25
 _POLL_MAX_INTERVAL = 6.0
 
-_ERROR_LOG = os.path.expanduser("~/.neutrino-tui-errors.log")
+_ERROR_LOG = os.path.expanduser("~/.cortex-training-errors.log")
 _persist_warned = False
 
 # Filename-safe byte set; everything else (incl. ':' '/' '%') is %XX-escaped so

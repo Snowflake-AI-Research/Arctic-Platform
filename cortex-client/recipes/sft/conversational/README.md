@@ -10,7 +10,7 @@ depend on model size, sequence length, precision, and whether LoRA or dense
 training is used. Check the account capacity before submitting:
 
 ```bash
-dss-neutrino capacity
+cortex-training capacity
 ```
 
 ## Run

@@ -1,22 +1,22 @@
-# Neutrino REST API Reference
+# Cortex Training REST API Reference
 
 > **Status.** This page is a repository snapshot for the client version in this
-> branch. The Neutrino SNOWAPI OpenAPI specification remains the source of
+> branch. The Cortex Training SNOWAPI OpenAPI specification remains the source of
 > truth for the wire schema.
 >
-> **Scope.** This document describes the customer-facing Neutrino SnowAPI
-> surface used by this repository's `NeutrinoClient`. It covers REST paths,
+> **Scope.** This document describes the customer-facing Cortex Training SnowAPI
+> surface used by this repository's `CortexTrainingClient`. It covers REST paths,
 > request framing, asynchronous polling, client-visible schemas, checkpoints,
 > generation, operations, and logs.
 >
 > **Sources used for this snapshot.** The client and wire implementation in
-> `dss_client/neutrino_client.py` and `dss_client/wire.py`, the command-line
-> interface in `dss_neutrino_cli.py`, their unit tests, and the adjacent Neutrino
+> `cortex_training/client.py` and `cortex_training/wire.py`, the command-line
+> interface in `cortex_training._cli.py`, their unit tests, and the adjacent Cortex Training
 > control-plane protocol/server are the local evidence for this document. The
 > SNOWAPI OpenAPI specification remains the source of truth when it is
 > available.
 >
-> **Important distinction.** `NeutrinoClient` is a low-level transport client.
+> **Important distinction.** `CortexTrainingClient` is a low-level transport client.
 > ArcticTraining may put additional keys such as `context` and `processing`
 > inside a forward/backward batch, but those keys are backend contracts, not
 > additional REST fields.
@@ -98,10 +98,10 @@ Paths in this document are relative to:
 https://{account_host}/api/v2/databases/{database}/schemas/{schema}/{endpoint}
 ```
 
-`NeutrinoClient` defaults `endpoint` to `cortex-training`.
+`CortexTrainingClient` defaults `endpoint` to `cortex-training`.
 
 ```python
-client = NeutrinoClient.from_pat(
+client = CortexTrainingClient.from_pat(
     host=HOST,
     pat=PAT,
     database=DATABASE,
@@ -121,7 +121,7 @@ with `endpoint="cortex-post-training"`.
 
 ### 2.2 PAT authentication
 
-`NeutrinoClient.from_pat(...)` sends:
+`CortexTrainingClient.from_pat(...)` sends:
 
 ```http
 Authorization: Bearer <PAT>
@@ -168,7 +168,7 @@ Poll:
 GET /{job_id}/requests/{request_id}
 ```
 
-`NeutrinoClient.poll_request(job_id, request_id)` handles status normalization,
+`CortexTrainingClient.poll_request(job_id, request_id)` handles status normalization,
 backoff, DSSST1 result decoding, and cursor-addressed result chunks.
 
 ### 3.2 Job states
@@ -215,7 +215,7 @@ Defaults:
 - Maximum interval: `6` seconds.
 - Overall timeout: `1800` seconds.
 
-All values are configurable on `NeutrinoClient(...)`.
+All values are configurable on `CortexTrainingClient(...)`.
 
 ### 3.5 Retries
 
@@ -281,7 +281,7 @@ Paths are relative to the prefix in [section 2.1](#21-base-url).
 The operation endpoint supports the operation types in
 [section 7](#7-generic-operation-envelope).
 
-One auxiliary call is outside the Neutrino prefix:
+One auxiliary call is outside the Cortex Training prefix:
 
 | REST path | HTTP | Client use | Purpose |
 |---|---|---|---|
@@ -335,7 +335,7 @@ Response:
 #### Internal debug body
 
 `create_job_from_body()` can forward a top-level `debug` block only when
-`DSS_NEUTRINO_ENABLE_DEBUG_OPTIONS` is truthy (`1`, `true`, `yes`, or `on`).
+`CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS` is truthy (`1`, `true`, `yes`, or `on`).
 This is an internal capability and is separately gated by the server.
 
 ### 5.2 Get job - `GET /{job_id}`
@@ -384,7 +384,7 @@ REST response:
 {"jobs": [{"job_id": "job-id", "status": "running", "sub_jobs": []}]}
 ```
 
-`NeutrinoClient.list_jobs()` returns only the `jobs` list, not the outer object.
+`CortexTrainingClient.list_jobs()` returns only the `jobs` list, not the outer object.
 The client forwards the status string without validating an enum.
 
 ### 5.4 Capacity - `GET /capacity`
@@ -449,14 +449,14 @@ Terminated or failed jobs return a precondition/conflict-style error.
 method with a required job id and restores the server-shaped JSON envelope:
 
 ```bash
-dss-neutrino checkpoints JOB_ID
+cortex-training checkpoints JOB_ID
 ```
 
 The command prints `{"checkpoints": [...]}`. As with other commands, compact
 output is selected with the global option:
 
 ```bash
-dss-neutrino --compact checkpoints JOB_ID
+cortex-training --compact checkpoints JOB_ID
 ```
 
 ### 5.8 Export checkpoint
@@ -528,7 +528,7 @@ result = client.poll_request(job_id, request_id)
 Or serialize an extended batch directly:
 
 ```python
-from dss_client import wire
+from cortex_training import wire
 
 payload = wire.dumps(
     batch,
@@ -697,7 +697,7 @@ be changed at runtime. The server will reject incompatible loads.
 ### 6.5 Create-time checkpoint initialization
 
 Create-time initialization is not `resume_from_checkpoint` in the typed
-`dss-client` API. Use:
+`cortex-training` API. Use:
 
 ```json
 {
@@ -778,7 +778,7 @@ Typical polled result:
 ```
 
 The backend can add fields such as log probabilities or action masks. For a
-request submitted by the same `NeutrinoClient` instance, `poll_request()`
+request submitted by the same `CortexTrainingClient` instance, `poll_request()`
 converts tensor values under `results` back to Python lists.
 
 ### 6.7 Streaming generate - `POST /{job_id}/generate-stream`
@@ -884,7 +884,7 @@ Content-Type: application/json
 - `sub_job_id` and `sub_job_type` are optional routing hints. If both are
   supplied, they must resolve to the same target.
 - `payload` is operation-specific.
-- Byte payloads passed to `NeutrinoClient.forward()` are converted to
+- Byte payloads passed to `CortexTrainingClient.forward()` are converted to
   `{"payload_b64": "...", "content_type": "application/octet-stream"}` inside
   the JSON envelope.
 - Operation responses are opaque. If a response contains a `request_id`, poll
@@ -923,7 +923,7 @@ require `running`.
 `operation_type="forward"`. The aliases do not add no-gradient semantics.
 
 Byte payloads over 60 MiB are rejected; this operation path is not request
-chunked. The current ArcticTraining Neutrino adapter still treats no-grad
+chunked. The current ArcticTraining Cortex Training adapter still treats no-grad
 forward as unavailable, so this low-level route should not be presented as a
 portable log-probability API.
 
@@ -991,7 +991,7 @@ identity.
 CLI equivalent:
 
 ```bash
-dss-neutrino --job-id JOB_ID weight-sync \
+cortex-training --job-id JOB_ID weight-sync \
   --weight-format lora
 ```
 
@@ -1099,7 +1099,7 @@ at an empty EOF page; with `follow=True`, it keeps polling.
 
 ### 7.9 Unsupported `zmd-events` client helper
 
-`NeutrinoClient.tail_events()` and `stream_events()` currently send:
+`CortexTrainingClient.tail_events()` and `stream_events()` currently send:
 
 ```json
 {"operation_type": "zmd-events"}
@@ -1248,8 +1248,8 @@ training = SubJobConfig.training_job(
 
 `step_peak_memory_log` costs one `all_reduce(MAX)` per step; both settings are
 off by default. Failure snapshots on a failed `/forward-backward` or `/step` are
-independent of these flags. Per-rank operator diagnostics (the `DSS_MEM_*`
-launcher environment variables) are out of scope for this client-facing surface.
+independent of these flags. Per-rank operator diagnostics configured by the
+launcher are out of scope for this client-facing surface.
 
 ---
 
@@ -1257,7 +1257,7 @@ launcher environment variables) are out of scope for this client-facing surface.
 
 ### 9.1 Why DSSST1
 
-DSSST1 is a safetensors-based frame implemented by `dss_client.wire`. It
+DSSST1 is a safetensors-based frame implemented by `cortex_training.wire`. It
 serializes nested dict/list/tuple structures containing tensors and JSON-safe
 values without pickle execution.
 
@@ -1280,7 +1280,7 @@ Safetensors metadata contains:
 Encode/decode:
 
 ```python
-from dss_client import wire
+from cortex_training import wire
 
 frame = wire.dumps(value, metadata=metadata)
 value = wire.loads(frame)
@@ -1515,9 +1515,9 @@ The client contains `tail_events()` and `stream_events()`, but their
 ### 13.1 Create training and sampling sub-jobs
 
 ```python
-from dss_client.neutrino_client import NeutrinoClient, SubJobConfig
+from cortex_training.client import CortexTrainingClient, SubJobConfig
 
-client = NeutrinoClient.from_pat(
+client = CortexTrainingClient.from_pat(
     host=HOST,
     pat=PAT,
     database=DATABASE,
@@ -1608,9 +1608,9 @@ the trainable PEFT parameters; the sampling configuration enables LoRA support
 in vLLM before the first adapter sync.
 
 ```python
-from dss_client.neutrino_client import NeutrinoClient, SubJobConfig
+from cortex_training.client import CortexTrainingClient, SubJobConfig
 
-client = NeutrinoClient.from_pat(
+client = CortexTrainingClient.from_pat(
     host=HOST,
     pat=PAT,
     database=DATABASE,
@@ -1680,7 +1680,7 @@ result = client.poll_request(job_id, request_id)
 
 These are implementation gaps, not supported API behavior:
 
-1. `NeutrinoTrainingEngine.backward()` still uses `torch.save`, while the
+1. `CortexTrainingEngine.backward()` still uses `torch.save`, while the
    current server wire protocol is DSSST1 and rejects pickle/torch-save frames.
 2. The README still says the forward/backward CLI serializes with `torch.save`;
    the CLI helper actually uses DSSST1.
@@ -1694,6 +1694,6 @@ These are implementation gaps, not supported API behavior:
    `inference_config` rather than explicitly selecting `job_type="sampling"`;
    a preceding log-probability sub-job can supply the wrong `max_seq_len`.
 8. The local mock's documented/routed endpoint is `cortex-post-training`, while
-   `NeutrinoClient` defaults to `cortex-training`.
+   `CortexTrainingClient` defaults to `cortex-training`.
 9. The in-memory mock and its README cover only a subset of the current client
    surface and should not be used as the complete API inventory.

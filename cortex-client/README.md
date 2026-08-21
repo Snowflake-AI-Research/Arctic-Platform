@@ -1,7 +1,7 @@
 # Cortex Training Client
 
 Python SDK, command-line tools, runnable recipes, and documentation for Cortex
-Training through the Neutrino SNOWAPI.
+Training through the Cortex Training SNOWAPI.
 
 ## Start Here
 
@@ -17,7 +17,7 @@ Training through the Neutrino SNOWAPI.
 Requires Python 3.8 or later.
 
 ```bash
-pip install "dss-client @ git+https://github.com/Snowflake-AI-Research/Arctic-Platform.git#subdirectory=cortex-client"
+pip install "cortex-training @ git+https://github.com/Snowflake-AI-Research/Arctic-Platform.git#subdirectory=cortex-client"
 ```
 
 For local development:
@@ -30,24 +30,18 @@ pip install -e .
 
 The package installs:
 
-- `cortex-training`, the canonical command for submitting and managing jobs
-- `cortex-training tui`, the canonical command for viewing job logs
-- `cortex_training`, the canonical Python namespace
-- `dss-neutrino`, `neutrino-tui`, and `dss_client`, the existing compatible
-  command and Python names
+- `cortex-training`, for submitting and managing jobs
+- `cortex-training tui`, for viewing job logs
+- `cortex_training`, the Python SDK
 
 Verify the command entry points:
 
 ```bash
 cortex-training --help
 cortex-training tui --help
-dss-neutrino --help
-neutrino-tui --help
 ```
 
-## Cortex Training Aliases (Phase 1)
-
-New code can use the canonical command and Python names:
+## Usage
 
 ```bash
 cortex-training list
@@ -59,20 +53,12 @@ cortex-training tui JOB_ID
 from cortex_training import CortexTrainingClient, CortexTrainingEngine
 ```
 
-This phase is deliberately additive:
+Connection settings use `CORTEX_TRAINING_*` and `SNOWFLAKE_*` environment
+variables. Login state is stored under `~/.config/cortex-training/`, and TUI
+cache state is stored under `~/.cache/cortex-training/`, unless their existing
+override variables are used.
 
-- `dss_client` remains the implementation package.
-- `dss-neutrino`, `neutrino-tui`, and all existing Python imports remain valid.
-- Authentication behavior and the `NEUTRINO_*` / `SNOWFLAKE_*` environment
-  variables are unchanged.
-- Login state remains under `~/.config/dss-neutrino/` and TUI cache state
-  remains under `~/.cache/neutrino-tui/` unless existing override variables are
-  used.
-- SNOWAPI request paths, REST payloads, and the DSSST1 wire format are unchanged.
-
-`cortex-training` delegates to the same command implementation as
-`dss-neutrino`; `cortex-training tui` delegates to `neutrino-tui`. The
-[CLI reference](docs/reference/cli.md) therefore applies to both command names.
+See the [CLI reference](docs/reference/cli.md) for commands and configuration.
 
 ## Repository Map
 
@@ -82,8 +68,7 @@ This phase is deliberately additive:
 | `recipes/` | End-to-end training, sampling, and evaluation workflows |
 | `examples/api/` | Small JSON examples for individual API operations |
 | `examples/config/` | Connection configuration templates |
-| `dss_client/` | Installable Python client |
-| `cortex_training/` | Canonical compatibility facade |
+| `cortex_training/` | Installable Python client |
 | `tests/` | Client and CLI tests |
 
 The current onboarding work is tracked in

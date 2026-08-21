@@ -11,7 +11,7 @@ Before running a training recipe, you need:
 Check current capacity after installing and authenticating:
 
 ```bash
-dss-neutrino capacity
+cortex-training capacity
 ```
 
 Model-specific GPU requirements are not yet fully validated. Treat recipe

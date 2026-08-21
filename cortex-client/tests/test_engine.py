@@ -1,6 +1,6 @@
-"""Unit tests for ``dss_client.neutrino_engine.NeutrinoTrainingEngine``.
+"""Unit tests for ``cortex_training.engine.CortexTrainingEngine``.
 
-All NeutrinoClient interactions are mocked -- no real HTTP calls or GPU needed.
+All CortexTrainingClient interactions are mocked -- no real HTTP calls or GPU needed.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ torch = pytest.importorskip("torch")
 
 
 def _make_client(job_id: str = "job-1") -> MagicMock:
-    """Return a mock NeutrinoClient with sensible defaults."""
+    """Return a mock CortexTrainingClient with sensible defaults."""
     client = MagicMock()
     client.create_job.return_value = job_id
     client.wait_for_job.return_value = {"status": "running"}
@@ -32,11 +32,11 @@ def _make_sub_job() -> MagicMock:
 
 
 def _make_engine(client=None, sub_job=None):
-    from dss_client.neutrino_engine import NeutrinoTrainingEngine
+    from cortex_training.engine import CortexTrainingEngine
 
     client = client or _make_client()
     sub_job = sub_job or _make_sub_job()
-    return NeutrinoTrainingEngine(client=client, sub_job=sub_job), client
+    return CortexTrainingEngine(client=client, sub_job=sub_job), client
 
 
 # ---------------------------------------------------------------------------

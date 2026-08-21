@@ -3,7 +3,7 @@
 A typical Cortex Training workflow has five stages:
 
 1. Choose a model, method, dataset, precision, and hardware configuration.
-2. Create one or more Neutrino sub-jobs.
+2. Create one or more Cortex Training sub-jobs.
 3. Submit training or sampling requests and poll them to completion.
 4. Save, load, evaluate, or synchronize checkpoints.
 5. Cancel completed jobs to release capacity.

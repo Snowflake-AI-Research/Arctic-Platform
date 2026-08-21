@@ -1,4 +1,4 @@
-"""Pure formatting helpers for the read-only log/event TUI.
+"""Pure formatting helpers for the Cortex Training log/event TUI.
 
 Kept free of any ``textual`` import so they can be unit-tested without the
 optional TUI dependency installed.

@@ -1,5 +1,5 @@
 """
-Minimal supervised fine-tuning loop against a Neutrino training job.
+Minimal supervised fine-tuning loop against a Cortex Training training job.
 
 A port of ``tinker_cookbook/recipes/sl_loop.py``.
 
@@ -16,11 +16,11 @@ from typing import Any
 import chz
 import datasets
 
-from dss_client.neutrino_client import DEBUG_OPTIONS_ENV
+from cortex_training.client import DEBUG_OPTIONS_ENV
 from tinker_cookbook import renderers
 from tinker_cookbook.utils import ml_log
 
-from recipes._shared.neutrino import (
+from recipes._shared.cortex_training import (
     build_renderer,
     collate,
     forward_backward_step,
@@ -75,7 +75,7 @@ class Config:
     lora_rank: int = 32
     debug_image_tag: str | None = None
 
-    log_path: str = "/tmp/dss-examples/sft-loop"
+    log_path: str = "/tmp/cortex-training-examples/sft-loop"
     wandb_project: str | None = None
     wandb_name: str | None = None
 

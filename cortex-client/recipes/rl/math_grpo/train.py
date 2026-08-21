@@ -1,5 +1,5 @@
 """
-RL against a colocated Neutrino training + sampling job.
+RL against a colocated Cortex Training training + sampling job.
 
 A port of ``tinker_cookbook/recipes/math_rl/train.py``
 
@@ -22,8 +22,8 @@ import chz
 
 from tinker_cookbook.utils import ml_log
 
-from dss_client.neutrino_client import DEBUG_OPTIONS_ENV
-from recipes._shared.neutrino import (
+from cortex_training.client import DEBUG_OPTIONS_ENV
+from recipes._shared.cortex_training import (
     TrainSequence,
     build_renderer,
     collate,
@@ -255,7 +255,7 @@ class Config:
     eval_temperature: float | None = None
     eval_max_tokens: int | None = None
 
-    log_path: str = "/tmp/dss-examples/rl-loop"
+    log_path: str = "/tmp/cortex-training-examples/rl-loop"
     wandb_project: str | None = None
     wandb_name: str | None = None
 

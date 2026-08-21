@@ -1,6 +1,6 @@
 """Unit tests for the TUI's pure formatting helpers (no ``textual`` needed)."""
 
-from dss_client.tui.format import (
+from cortex_training.tui.format import (
     entry_at_level,
     entry_matches,
     format_created_at,
@@ -19,11 +19,11 @@ from dss_client.tui.format import (
 
 def test_format_structured_log_entry():
     line = format_log_entry(
-        {"ts": "2026-06-12T00:00:01Z", "level": "INFO", "logger": "dss.zones", "msg": "hello"}
+        {"ts": "2026-06-12T00:00:01Z", "level": "INFO", "logger": "cortex_training.zones", "msg": "hello"}
     )
     assert "2026-06-12T00:00:01Z" in line
     assert "INFO" in line
-    assert "dss.zones:" in line
+    assert "cortex_training.zones:" in line
     assert line.endswith("hello")
 
 

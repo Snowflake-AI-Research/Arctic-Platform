@@ -3,7 +3,7 @@
 Cancel a running job with:
 
 ```bash
-dss-neutrino cancel JOB_ID
+cortex-training cancel JOB_ID
 ```
 
 Runtime checkpoint loading and create-time checkpoint initialization are

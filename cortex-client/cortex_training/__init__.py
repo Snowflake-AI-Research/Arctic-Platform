@@ -1,15 +1,36 @@
-"""Additive public facade for the existing ``dss_client`` implementation."""
+"""Public Python API for Cortex Training."""
 
-import dss_client as _dss_client
-from dss_client import *  # noqa: F401,F403
-from dss_client import __version__, wire
-from dss_client import NeutrinoClient, NeutrinoTrainingEngine
+__version__ = "0.0.2"
 
-CortexTrainingClient = NeutrinoClient
-CortexTrainingEngine = NeutrinoTrainingEngine
+from . import wire
+from .client import (
+    build_forward_backward_kwargs,
+    build_forward_backward_payload,
+    ChunkGroupConflictError,
+    ChunkGroupError,
+    ChunkGroupRestartError,
+    CortexTrainingClient,
+    InferenceConfig,
+    JobType,
+    serialize_forward_backward_args,
+    SubJobConfig,
+    TrainingConfig,
+)
+from .engine import CortexTrainingEngine
 
 __all__ = [
-    *_dss_client.__all__,
     "CortexTrainingClient",
     "CortexTrainingEngine",
+    "build_forward_backward_kwargs",
+    "build_forward_backward_payload",
+    "ChunkGroupError",
+    "ChunkGroupRestartError",
+    "ChunkGroupConflictError",
+    "serialize_forward_backward_args",
+    "SubJobConfig",
+    "TrainingConfig",
+    "InferenceConfig",
+    "JobType",
+    "wire",
+    "__version__",
 ]

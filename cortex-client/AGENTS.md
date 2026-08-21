@@ -1,9 +1,9 @@
-# Agent Instructions for `dss-client`
+# Agent Instructions for `cortex-training`
 
-Always run the tests before and after changing any code in `dss_client/`:
+Always run the tests before and after changing any code in `cortex_training/`:
 
 ```bash
-cd /home/repo/dss-client
+cd /home/repo/Arctic-Platform/cortex-client
 python3 -m pytest tests/ -v
 ```
 
@@ -11,7 +11,7 @@ All tests must pass.
 
 ## Context
 
-`dss_client/neutrino_client.py` calls into the **Neutrino SNOWAPI** exposed by
+`cortex_training/client.py` calls into the **Cortex Training SNOWAPI** exposed by
 Global Services. When changing the wire format, cross-check these:
 
 - SNOWAPI spec (source of truth for the REST schema):

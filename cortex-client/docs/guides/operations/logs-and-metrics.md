@@ -3,13 +3,13 @@
 Download complete execution logs:
 
 ```bash
-dss-neutrino download-log JOB_ID --output-dir /path/to/logs
+cortex-training download-log JOB_ID --output-dir /path/to/logs
 ```
 
 Tail a running job in the terminal:
 
 ```bash
-neutrino-tui JOB_ID
+cortex-training tui JOB_ID
 ```
 
 Recipe-level metrics are written under each recipe's `log_path`. GPU

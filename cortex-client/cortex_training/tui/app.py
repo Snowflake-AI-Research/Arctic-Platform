@@ -1,12 +1,12 @@
-"""Read-only Textual TUI for Neutrino logs and ZMD scheduling events.
+"""Read-only Textual TUI for Cortex Training logs and scheduling events.
 
 Flow: open → a list of jobs with their status (via the SDK's list_jobs) →
 pick one → its log sources (zone server / job orchestration / Ray head /
 scheduling events) → live tail. Pass a job_id on the command line to jump
 straight to that job's logs and skip the picker.
 
-Imports ``textual`` at module load, so it is only importable with the optional
-``dss-client[tui]`` extra. Strictly read-only — it never mutates state.
+Imports ``textual`` at module load. The interface is strictly read-only and
+never mutates job state.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from textual.screen import Screen
 from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, Log, Static
 from textual.worker import get_current_worker
 
-from dss_client.tui.format import (
+from cortex_training.tui.format import (
     entry_at_level,
     entry_matches,
     format_job_config,
@@ -36,9 +36,9 @@ from dss_client.tui.format import (
     source_label,
     wrap_log_line,
 )
-from dss_client.tui.log_cache import LogCache, cached_log_pages
+from cortex_training.tui.log_cache import LogCache, cached_log_pages
 
-_ERROR_LOG = "~/.neutrino-tui-errors.log"
+_ERROR_LOG = "~/.cortex-training-errors.log"
 
 
 class JobListScreen(Screen):
@@ -335,7 +335,9 @@ class LogScreen(Screen):
         entries = self._cache.load_entries(src)
         text = "\n".join(format_log_entry(e) for e in entries)
         safe = src.replace("/", "_").replace(":", "-")
-        path = os.path.expanduser(f"~/neutrino-{self._job_id[:8]}-{safe}.log")
+        path = os.path.expanduser(
+            f"~/cortex-training-{self._job_id[:8]}-{safe}.log"
+        )
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text + ("\n" if text else ""))
@@ -552,7 +554,7 @@ class LogScreen(Screen):
             lv.scroll_end(animate=False)
 
 
-class NeutrinoLogTUI(App):
+class CortexTrainingLogTUI(App):
     """Entry app: show the job picker, or jump straight to a job's logs when a
     job_id is supplied."""
 
@@ -578,7 +580,7 @@ class NeutrinoLogTUI(App):
         self._job_id = job_id
         self._sub_job_id = sub_job_id
         self._poll_interval = poll_interval
-        self.title = "neutrino logs"
+        self.title = "cortex training logs"
 
     def on_mount(self) -> None:
         if self._job_id:

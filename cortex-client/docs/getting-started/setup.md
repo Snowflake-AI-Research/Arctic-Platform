@@ -18,8 +18,8 @@ not commit the resulting file.
 Validate and store the config path:
 
 ```bash
-dss-neutrino login --config /path/to/config.json
-dss-neutrino capacity
+cortex-training login --config /path/to/config.json
+cortex-training capacity
 ```
 
 See the [CLI reference](../reference/cli.md) for environment variables, local

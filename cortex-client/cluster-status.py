@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live summary of running Neutrino jobs and GPU usage."""
+"""Live summary of running Cortex Training jobs and GPU usage."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-LIST_COMMAND_PREFIX = ["dss-neutrino", "list", "--status"]
+LIST_COMMAND_PREFIX = ["cortex-training", "list", "--status"]
 WATCH_STATUSES = ("running", "placing")
 GPU_CONFIG_KEYS = (
     "training_config",
@@ -93,10 +93,10 @@ def _load_jobs(raw_output: str) -> list[dict[str, Any]]:
     elif isinstance(parsed, list):
         jobs = parsed
     else:
-        raise ValueError("expected dss-neutrino list output to be a JSON object or list")
+        raise ValueError("expected cortex-training list output to be a JSON object or list")
 
     if not isinstance(jobs, list):
-        raise ValueError("expected dss-neutrino list output to contain a jobs list")
+        raise ValueError("expected cortex-training list output to contain a jobs list")
 
     return [job for job in jobs if isinstance(job, dict)]
 
@@ -197,7 +197,7 @@ def _render(jobs: list[dict[str, Any]], interval: float) -> str:
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Show a live GPU usage summary for running Neutrino jobs.",
+        description="Show a live GPU usage summary for running Cortex Training jobs.",
     )
     parser.add_argument(
         "-n",
@@ -213,7 +213,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--input",
-        help="Read saved dss-neutrino list JSON instead of running the command.",
+        help="Read saved cortex-training list JSON instead of running the command.",
     )
     args = parser.parse_args(argv)
     if args.interval <= 0:

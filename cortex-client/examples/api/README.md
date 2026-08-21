@@ -1,6 +1,6 @@
 # API Request Examples
 
-These JSON files demonstrate individual Neutrino request bodies:
+These JSON files demonstrate individual Cortex Training request bodies:
 
 | File | Purpose |
 |---|---|

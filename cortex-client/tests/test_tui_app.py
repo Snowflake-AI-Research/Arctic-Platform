@@ -1,5 +1,5 @@
 """Smoke tests for the Textual app (job picker -> log screen). Skipped unless
-the optional ``textual`` extra is installed (``pip install 'dss-client[tui]'``)."""
+the optional ``textual`` extra is installed (``pip install 'cortex-training[tui]'``)."""
 
 import asyncio
 import glob
@@ -12,7 +12,7 @@ pytest.importorskip("textual")
 
 from textual.widgets import Input  # noqa: E402
 
-from dss_client.tui.app import JobListScreen, LogScreen, NeutrinoLogTUI  # noqa: E402
+from cortex_training.tui.app import JobListScreen, LogScreen, CortexTrainingLogTUI  # noqa: E402
 
 
 def _client():
@@ -57,7 +57,7 @@ async def _settle(app, pilot):
 
 
 async def _run_with_job_id():
-    app = NeutrinoLogTUI(_client(), "7", poll_interval=0.01)
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen)
                          and len(app.screen.query("#sources ListItem")) == 2)
@@ -69,7 +69,7 @@ async def _run_with_job_id():
 
 
 async def _run_with_picker():
-    app = NeutrinoLogTUI(_client(), poll_interval=0.01)  # no job_id -> picker
+    app = CortexTrainingLogTUI(_client(), poll_interval=0.01)  # no job_id -> picker
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen)
                          and len(app.screen.query("#jobs ListItem")) >= 2)
@@ -90,7 +90,7 @@ def test_app_without_job_id_shows_job_picker():
 
 
 async def _run_refresh_picker():
-    app = NeutrinoLogTUI(_client(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(_client(), poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen)
                          and len(app.screen.query("#jobs ListItem")) == 2)
@@ -104,7 +104,7 @@ async def _run_refresh_picker():
 
 
 async def _run_refresh_sources():
-    app = NeutrinoLogTUI(_client(), "7", poll_interval=0.01)
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen)
                          and len(app.screen.query("#sources ListItem")) == 2)
@@ -126,7 +126,7 @@ def test_source_refresh_no_duplicate_ids():
 async def _run_offline_fallback():
     c = _client()
     c.get_job.side_effect = RuntimeError("network down")  # can't fetch sub-jobs
-    app = NeutrinoLogTUI(c, "7", poll_interval=0.01)
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(
             pilot, app,
@@ -140,8 +140,8 @@ async def _run_offline_fallback():
 def test_offline_shows_cached_sources(tmp_path, monkeypatch):
     # Seed a cached sub-job for job "7", then make get_job fail: the source list
     # must fall back to the cached sub-job so logs stay reachable.
-    monkeypatch.setenv("NEUTRINO_TUI_CACHE_DIR", str(tmp_path))
-    from dss_client.tui.log_cache import LogCache
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
     LogCache("7").append_entries("7:training:0", [{"_raw": "cached line"}])
     asyncio.run(_run_offline_fallback())
 
@@ -152,7 +152,7 @@ async def _run_terminal_cache_only():
         "status": "FAILED",
         "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
     }
-    app = NeutrinoLogTUI(c, "7", poll_interval=0.01)
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(
             pilot, app,
@@ -166,14 +166,14 @@ async def _run_terminal_cache_only():
 
 
 def test_terminal_job_is_cache_only(tmp_path, monkeypatch):
-    monkeypatch.setenv("NEUTRINO_TUI_CACHE_DIR", str(tmp_path))
-    from dss_client.tui.log_cache import LogCache
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
     LogCache("7").append_entries("7:training:0", [{"_raw": "cached line"}])
     asyncio.run(_run_terminal_cache_only())
 
 
 async def _run_resize_sources():
-    app = NeutrinoLogTUI(_client(), "7", poll_interval=0.01)
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen))
         assert ok, "log screen did not open"
@@ -198,7 +198,7 @@ def test_sources_panel_resize():
 
 
 async def _run_picker_filter():
-    app = NeutrinoLogTUI(_client(), poll_interval=0.01)
+    app = CortexTrainingLogTUI(_client(), poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, JobListScreen)
                          and len(app.screen.query("#jobs ListItem")) >= 2)
@@ -215,7 +215,7 @@ def test_picker_filter():
 
 
 async def _run_logscreen_controls():
-    app = NeutrinoLogTUI(_client(), "7", poll_interval=0.01)
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen)
                          and app.screen._logview is not None)
@@ -241,7 +241,7 @@ def test_logscreen_controls():
 
 
 async def _run_always_tails_bottom():
-    app = NeutrinoLogTUI(_client(), "7", poll_interval=0.01)
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen)
                          and app.screen._current_source is not None
@@ -285,7 +285,7 @@ async def _run_replay_lands_at_bottom():
         "status": "FAILED",
         "sub_jobs": [{"sub_job_id": "7:training:0", "job_type": "training"}],
     }
-    app = NeutrinoLogTUI(c, "7", poll_interval=0.01)
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen)
                          and app.screen._current_source == "7:training:0")
@@ -305,8 +305,8 @@ async def _run_replay_lands_at_bottom():
 
 
 def test_cache_replay_lands_at_bottom(tmp_path, monkeypatch):
-    monkeypatch.setenv("NEUTRINO_TUI_CACHE_DIR", str(tmp_path))
-    from dss_client.tui.log_cache import LogCache
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
+    from cortex_training.tui.log_cache import LogCache
     LogCache("7").append_entries(
         "7:training:0", [{"_raw": f"cache line {i}"} for i in range(300)]
     )
@@ -314,7 +314,7 @@ def test_cache_replay_lands_at_bottom(tmp_path, monkeypatch):
 
 
 async def _run_source_switch_resets_pause():
-    app = NeutrinoLogTUI(_client(), "7", poll_interval=0.01)
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen)
                          and app.screen._current_source is not None
@@ -356,7 +356,7 @@ async def _run_last_updated():
         return {"entries": [], "next_cursor": "C1", "eof": False}
 
     c.tail_logs.side_effect = tail
-    app = NeutrinoLogTUI(c, "7", poll_interval=0.01)
+    app = CortexTrainingLogTUI(c, "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         # Wait for the subtitle to pick up the freshness stamp from a live batch.
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen)
@@ -377,7 +377,7 @@ def test_subtitle_last_updated():
 
 
 async def _run_export():
-    app = NeutrinoLogTUI(_client(), "7", poll_interval=0.01)
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         ok = await _wait(pilot, app, lambda: isinstance(app.screen, LogScreen)
                          and app.screen._logview is not None)
@@ -385,24 +385,33 @@ async def _run_export():
         s = app.screen
         s._current_source = "head:server"
         s.action_save_log()  # background worker writes the file
-        ok = await _wait(pilot, app, lambda: bool(glob.glob(os.path.expanduser("~/neutrino-7-*.log"))))
+        ok = await _wait(
+            pilot,
+            app,
+            lambda: bool(
+                glob.glob(os.path.expanduser("~/cortex-training-7-*.log"))
+            ),
+        )
         assert ok, "export file was not written"
-        content = open(glob.glob(os.path.expanduser("~/neutrino-7-*.log"))[0], encoding="utf-8").read()
+        content = open(
+            glob.glob(os.path.expanduser("~/cortex-training-7-*.log"))[0],
+            encoding="utf-8",
+        ).read()
         assert "alpha" in content and "beta" in content
         await _settle(app, pilot)
 
 
 def test_log_export(tmp_path, monkeypatch):
-    monkeypatch.setenv("NEUTRINO_TUI_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))  # so ~/ writes into tmp
-    from dss_client.tui.log_cache import LogCache
+    from cortex_training.tui.log_cache import LogCache
     LogCache("7").append_entries("head:server", [{"_raw": "alpha"}, {"_raw": "beta"}])
     asyncio.run(_run_export())
 
 
 async def _run_wrap_and_select():
     from textual.widgets import Log
-    app = NeutrinoLogTUI(_client(), "7", poll_interval=0.01)
+    app = CortexTrainingLogTUI(_client(), "7", poll_interval=0.01)
     async with app.run_test() as pilot:
         # Wait until the initial source is selected (its tail started + banner
         # written) so _start_tail won't reset _shown_lines under us.

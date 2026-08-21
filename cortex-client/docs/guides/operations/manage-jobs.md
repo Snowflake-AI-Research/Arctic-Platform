@@ -3,14 +3,14 @@
 Common lifecycle commands:
 
 ```bash
-dss-neutrino list
-dss-neutrino list --status running
-dss-neutrino get JOB_ID
-dss-neutrino checkpoints JOB_ID
-dss-neutrino wait JOB_ID
-dss-neutrino cancel JOB_ID
+cortex-training list
+cortex-training list --status running
+cortex-training get JOB_ID
+cortex-training checkpoints JOB_ID
+cortex-training wait JOB_ID
+cortex-training cancel JOB_ID
 ```
 
-Use `dss-neutrino capacity` before starting a recipe. Resume and retry guidance
+Use `cortex-training capacity` before starting a recipe. Resume and retry guidance
 is tracked separately because support depends on checkpoint type and failure
 state.

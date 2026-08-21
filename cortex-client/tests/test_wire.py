@@ -3,7 +3,7 @@ import io
 import pytest
 import torch
 
-from dss_client import wire
+from cortex_training import wire
 
 
 def _assert_equal(a, b):

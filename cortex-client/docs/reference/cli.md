@@ -1,41 +1,42 @@
-# Neutrino CLI and Client Reference
+# Cortex Training CLI and Client Reference
 
-DeepSpeed Serverless Client - A Python client library for interacting with the DeepSpeed Serverless platform (https://github.com/snowflake-eng/dss-platform).
+The `cortex-training` command and `cortex_training` Python package provide the
+supported command-line and SDK interfaces for Cortex Training.
 
 ## Installation
 
-Requires Python 3.8+. Installing the package gives you the `dss-neutrino` CLI,
-the `neutrino-tui` log viewer, and the `dss_client` Python SDK.
+Requires Python 3.8+. Installing the package gives you the `cortex-training` CLI,
+the `cortex-training tui` log viewer, and the `cortex_training` Python SDK.
 
 Install straight from the repository:
 
 ```bash
-pip install "dss-client @ git+https://github.com/snowflake-eng/dss-client.git"
+pip install "cortex-training @ git+https://github.com/Snowflake-AI-Research/Arctic-Platform.git#subdirectory=cortex-client"
 ```
 
 Or from a local checkout:
 
 ```bash
-git clone https://github.com/snowflake-eng/dss-client.git
-cd dss-client
+git clone https://github.com/Snowflake-AI-Research/Arctic-Platform.git
+cd Arctic-Platform/cortex-client
 pip install "."             # add -e for an editable/dev install
 ```
 
 Verify the install:
 
 ```bash
-dss-neutrino --help
-neutrino-tui --help
+cortex-training --help
+cortex-training tui --help
 ```
 
-## Neutrino Jobs CLI
+## Cortex Training Jobs CLI
 
-`dss-neutrino` submits and manages Neutrino jobs through the SNOWAPI endpoint.
+`cortex-training` submits and manages Cortex Training jobs through the SNOWAPI endpoint.
 The normal workflow is:
 
 1. Create a connection config JSON.
-2. Run `dss-neutrino login --config config.json` once.
-3. Use `dss-neutrino list`, `submit`, `get`, `cancel`, `wait`, and
+2. Run `cortex-training login --config config.json` once.
+3. Use `cortex-training list`, `submit`, `get`, `cancel`, `wait`, and
    `capacity` without passing connection flags every time.
 
 ### Connection Config
@@ -47,7 +48,7 @@ For Snowflake PAT auth, use `host` for the account hostname. Do not use
 {
   "host": "dsa-test.qa6.us-west-2.aws.snowflakecomputing.com",
   "pat": "YOUR_PROGRAMMATIC_ACCESS_TOKEN",
-  "database": "NEUTRINO_DB",
+  "database": "CORTEX_TRAINING_DB",
   "schema": "PUBLIC",
   "endpoint": "cortex-training",
   "poll_interval": 0.5,
@@ -60,7 +61,7 @@ If you prefer not to store the PAT in the file, omit `pat` and set it in the
 shell instead:
 
 ```bash
-export NEUTRINO_PAT='YOUR_PROGRAMMATIC_ACCESS_TOKEN'
+export CORTEX_TRAINING_PAT='YOUR_PROGRAMMATIC_ACCESS_TOKEN'
 ```
 
 For a local/mock SNOWAPI server, use `base_url` with an explicit scheme:
@@ -80,22 +81,22 @@ Login validates the config and stores only the config path, not the config
 contents:
 
 ```bash
-dss-neutrino login --config config.json
+cortex-training login --config config.json
 ```
 
-The login state is written to `~/.config/dss-neutrino/login.json` by default,
-or `$XDG_CONFIG_HOME/dss-neutrino/login.json` when `XDG_CONFIG_HOME` is set.
+The login state is written to `~/.config/cortex-training/login.json` by default,
+or `$XDG_CONFIG_HOME/cortex-training/login.json` when `XDG_CONFIG_HOME` is set.
 
 You can bypass login for one command with:
 
 ```bash
-dss-neutrino --config config.json list
+cortex-training --config config.json list
 ```
 
 or by setting:
 
 ```bash
-export NEUTRINO_CONFIG=/path/to/config.json
+export CORTEX_TRAINING_CONFIG=/path/to/config.json
 ```
 
 Explicit CLI flags override config values.
@@ -103,26 +104,26 @@ Explicit CLI flags override config values.
 ### Commands
 
 ```bash
-dss-neutrino list
-dss-neutrino list --status running
-dss-neutrino capacity
-dss-neutrino get JOB_ID
-dss-neutrino checkpoints JOB_ID
-dss-neutrino cancel JOB_ID
-dss-neutrino wait JOB_ID
-dss-neutrino --job JOB_ID fwd-bwd examples/api/fwd-bwd.json
-dss-neutrino --job-id JOB_ID step --lr 1e-4
-dss-neutrino --job-id JOB_ID load CHECKPOINT_ID
-dss-neutrino --job-id JOB_ID generate examples/api/generate.json
-dss-neutrino --job-id JOB_ID weight-sync
-dss-neutrino download-log JOB_ID --output-dir /path/to/dir
+cortex-training list
+cortex-training list --status running
+cortex-training capacity
+cortex-training get JOB_ID
+cortex-training checkpoints JOB_ID
+cortex-training cancel JOB_ID
+cortex-training wait JOB_ID
+cortex-training --job JOB_ID fwd-bwd examples/api/fwd-bwd.json
+cortex-training --job-id JOB_ID step --lr 1e-4
+cortex-training --job-id JOB_ID load CHECKPOINT_ID
+cortex-training --job-id JOB_ID generate examples/api/generate.json
+cortex-training --job-id JOB_ID weight-sync
+cortex-training download-log JOB_ID --output-dir /path/to/dir
 ```
 
 Global flags must come before the subcommand:
 
 ```bash
-dss-neutrino --compact list
-dss-neutrino --config config.json submit examples/api/training.json
+cortex-training --compact list
+cortex-training --config config.json submit examples/api/training.json
 ```
 
 ### Show Current GPU Capacity
@@ -130,7 +131,7 @@ dss-neutrino --config config.json submit examples/api/training.json
 Print the caller account's reserved GPU capacity and current usage:
 
 ```bash
-dss-neutrino capacity
+cortex-training capacity
 ```
 
 The response includes `has_reservation`, `reserved_gpus`, `in_use_gpus`, and
@@ -158,16 +159,16 @@ The submit command expects a SNOWAPI CreateJob JSON body:
 Submit it:
 
 ```bash
-dss-neutrino submit job.json
-dss-neutrino submit job.json --wait
-dss-neutrino submit job.json --dry-run
+cortex-training submit job.json
+cortex-training submit job.json --wait
+cortex-training submit job.json --dry-run
 ```
 
 The repo includes a Prime-RL/Qwen3.6 training example:
 
 ```bash
-dss-neutrino submit examples/api/training.json
-dss-neutrino submit examples/api/sampling.json
+cortex-training submit examples/api/training.json
+cortex-training submit examples/api/sampling.json
 ```
 
 That file creates a training sub-job for `Qwen/Qwen3.6-35B-A3B` with
@@ -176,8 +177,8 @@ That file creates a training sub-job for `Qwen/Qwen3.6-35B-A3B` with
 #### Debug options (internal only)
 
 A CreateJob body may carry a `debug` block — e.g. an `image_tag` override that
-pins a job's dynamically-provisioned zone to a specific `dss-backend` build, so
-you can test a build without a `neutrino-k8s-configs` change:
+pins a job's dynamically-provisioned zone to a specific `Cortex Training backend` build, so
+you can test a build without a deployment-configuration change:
 
 ```json
 {
@@ -187,9 +188,9 @@ you can test a build without a `neutrino-k8s-configs` change:
 ```
 
 This is an internal-only capability. The client refuses to send a request
-carrying a `debug` block unless `DSS_NEUTRINO_ENABLE_DEBUG_OPTIONS` is set to a
+carrying a `debug` block unless `CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS` is set to a
 truthy value (`1`/`true`/`yes`/`on`); otherwise the submit fails fast client-side.
-The directives are also gated server-side by the `NEUTRINO_ENABLE_DEBUG_OPTIONS`
+The directives are also gated server-side by the `CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS`
 account parameter.
 
 ### Run A Forward-Backward Smoke Test
@@ -197,8 +198,8 @@ account parameter.
 After the training job is running, send one tokenized training batch:
 
 ```bash
-dss-neutrino --job JOB_ID fwd-bwd examples/api/fwd-bwd.json
-dss-neutrino --job-id JOB_ID step
+cortex-training --job JOB_ID fwd-bwd examples/api/fwd-bwd.json
+cortex-training --job-id JOB_ID step
 ```
 
 The fwd-bwd JSON is human-readable: it contains text samples, tokenizer
@@ -215,8 +216,8 @@ offline use.
 Run an optimizer step after fwd-bwd with:
 
 ```bash
-dss-neutrino --job-id JOB_ID step
-dss-neutrino --job-id JOB_ID step --lr 2e-5
+cortex-training --job-id JOB_ID step
+cortex-training --job-id JOB_ID step --lr 2e-5
 ```
 
 When omitted, `--lr` defaults to `1e-4`.
@@ -227,19 +228,19 @@ After a job has already been created and reached running, load a checkpoint into
 that existing job with:
 
 ```bash
-dss-neutrino --job-id JOB_ID load CHECKPOINT_ID
+cortex-training --job-id JOB_ID load CHECKPOINT_ID
 ```
 
 To load from another job's checkpoint store:
 
 ```bash
-dss-neutrino --job-id JOB_ID load CHECKPOINT_ID --source-job-id SOURCE_JOB_ID
+cortex-training --job-id JOB_ID load CHECKPOINT_ID --source-job-id SOURCE_JOB_ID
 ```
 
 To load into a specific training sub-job (useful for multi-sub-job sessions):
 
 ```bash
-dss-neutrino --job-id JOB_ID load CHECKPOINT_ID --target-sub-job-id JOB_ID:training:0
+cortex-training --job-id JOB_ID load CHECKPOINT_ID --target-sub-job-id JOB_ID:training:0
 ```
 
 When `--target-sub-job-id` is omitted, the control plane routes the load to the
@@ -261,7 +262,7 @@ for sub_job in job["sub_jobs"]:
 Or via CLI:
 
 ```bash
-dss-neutrino --job-id JOB_ID get | jq '.sub_jobs[] | select(.job_type=="training") | {sub_job_id, n_gpus: .training_config.n_gpus}'
+cortex-training --job-id JOB_ID get | jq '.sub_jobs[] | select(.job_type=="training") | {sub_job_id, n_gpus: .training_config.n_gpus}'
 ```
 
 #### When to Use target-sub-job-id
@@ -327,7 +328,7 @@ After a sampling job is running, send readable prompts with sampling
 parameters:
 
 ```bash
-dss-neutrino --job-id JOB_ID generate examples/api/generate.json
+cortex-training --job-id JOB_ID generate examples/api/generate.json
 ```
 
 The generate JSON contains `prompts`, optional `sampling_params`, and optional
@@ -342,7 +343,7 @@ For an RL-style job with one training and one sampling sub-job, sync training
 weights into sampling with:
 
 ```bash
-dss-neutrino --job-id JOB_ID weight-sync
+cortex-training --job-id JOB_ID weight-sync
 ```
 
 By default this syncs from `JOB_ID:training:0` to `JOB_ID:sampling:0`, routes
@@ -350,7 +351,7 @@ the operation through `JOB_ID:training:0`, and polls for completion. Override
 sub-job ids when needed:
 
 ```bash
-dss-neutrino --job-id JOB_ID weight-sync \
+cortex-training --job-id JOB_ID weight-sync \
   --source-sub-job-id JOB_ID:training:1 \
   --target-sub-job-id JOB_ID:sampling:0 \
   --target-sub-job-id JOB_ID:sampling:1
@@ -366,7 +367,7 @@ Pull every log file the job's experiment run produced. Each sub-job's
 `execution.jsonl`, `server.log`); all of them are downloaded:
 
 ```bash
-dss-neutrino download-log JOB_ID --output-dir /path/to/dir
+cortex-training download-log JOB_ID --output-dir /path/to/dir
 ```
 
 Files are written as `<output_dir>/<sub_job_id>/<filename>` so siblings
@@ -374,46 +375,46 @@ do not collide. When `--output-dir` is omitted, the current working
 directory is used instead. The CLI also prints a JSON summary listing
 each `saved_path`.
 
-Programmatic access is `NeutrinoClient.fetch_execution_logs(job_id)`,
+Programmatic access is `CortexTrainingClient.fetch_execution_logs(job_id)`,
 which returns a list of `{sub_job_id, filename, s3_uri, content}` dicts.
 
 ### Log TUI
 
-`neutrino-tui` is a read-only terminal UI for tailing a running job's logs
-live. It reuses the same connection handling as `dss-neutrino` — login state,
+`cortex-training tui` is a read-only terminal UI for tailing a running job's logs
+live. It reuses the same connection handling as `cortex-training` — login state,
 `--config` /
-`NEUTRINO_CONFIG`, the `NEUTRINO_*` / `SNOWFLAKE_*` env vars, or explicit
-flags. So once you've run `dss-neutrino login` you can just launch it:
+`CORTEX_TRAINING_CONFIG`, the `CORTEX_TRAINING_*` / `SNOWFLAKE_*` env vars, or explicit
+flags. So once you've run `cortex-training login` you can just launch it:
 
 ```bash
-neutrino-tui                 # opens a job picker
-neutrino-tui JOB_ID          # opens that job's logs directly
+cortex-training tui                 # opens a job picker
+cortex-training tui JOB_ID          # opens that job's logs directly
 ```
 
 Without login state, pass connection details the same way as the CLI:
 
 ```bash
-neutrino-tui JOB_ID --config config.json
-neutrino-tui JOB_ID --host ACCOUNT.snowflakecomputing.com --pat YOUR_PAT \
-  --database NEUTRINO_DB --schema PUBLIC --endpoint cortex-training
-neutrino-tui JOB_ID --base-url http://localhost:8084   # local/mock
+cortex-training tui JOB_ID --config config.json
+cortex-training tui JOB_ID --host ACCOUNT.snowflakecomputing.com --pat YOUR_PAT \
+  --database CORTEX_TRAINING_DB --schema PUBLIC --endpoint cortex-training
+cortex-training tui JOB_ID --base-url http://localhost:8084   # local/mock
 ```
 
 For example, against the qa6 test account (PAT kept out of the command via an
 env var; omit `JOB_ID` to open the job picker):
 
 ```bash
-neutrino-tui \
+cortex-training tui \
   --host dsa-test.qa6.us-west-2.aws.snowflakecomputing.com \
-  --pat "$NEUTRINO_QA6_PAT" \
+  --pat "$CORTEX_TRAINING_QA6_PAT" \
   --database DSA_TEST_DB --schema PUBLIC
 ```
 
 The left panel lists the job's sub-jobs; select one to tail its logs (the
 zone-manager pod is the Ray head, so a sub-job's worker output is included).
 Logs are cached locally so reopening a job replays instantly without
-re-fetching from the server — under `~/.cache/neutrino-tui/` (or
-`$XDG_CACHE_HOME`), overridable with `NEUTRINO_TUI_CACHE_DIR`.
+re-fetching from the server — under `~/.cache/cortex-training/` (or
+`$XDG_CACHE_HOME`), overridable with `CORTEX_TRAINING_TUI_CACHE_DIR`.
 
 Keys in the log view:
 
@@ -422,7 +423,7 @@ Keys in the log view:
 | `/` | Filter the current source |
 | `L` | Cycle minimum log level (INFO / WARNING / ERROR) |
 | `p` | Pause / resume auto-scroll |
-| `s` | Save the current source to `~/neutrino-<job>-<source>.log` |
+| `s` | Save the current source to `~/cortex-training-<job>-<source>.log` |
 | `y` | Copy the visible log to the clipboard |
 | `r` | Refresh the sub-job list |
 | `[` / `]` | Narrow / widen the sources panel |
@@ -438,27 +439,27 @@ polls per source, biasing toward server reliability over freshness.
 Connection values can also come from:
 
 ```bash
-NEUTRINO_CONFIG
-NEUTRINO_BASE_URL
-NEUTRINO_HOST
+CORTEX_TRAINING_CONFIG
+CORTEX_TRAINING_BASE_URL
+CORTEX_TRAINING_HOST
 SNOWFLAKE_HOST
-NEUTRINO_PAT
+CORTEX_TRAINING_PAT
 SNOWFLAKE_PAT
-NEUTRINO_DATABASE
+CORTEX_TRAINING_DATABASE
 SNOWFLAKE_DATABASE
-NEUTRINO_SCHEMA
+CORTEX_TRAINING_SCHEMA
 SNOWFLAKE_SCHEMA
-NEUTRINO_ENDPOINT
+CORTEX_TRAINING_ENDPOINT
 ```
 
-`DSS_NEUTRINO_ENABLE_DEBUG_OPTIONS` (truthy) unlocks sending CreateJob `debug`
+`CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS` (truthy) unlocks sending CreateJob `debug`
 options — see [Debug options (internal only)](#debug-options-internal-only).
 
 ### Troubleshooting
 
 If you see `provide --base-url for local/mock use, or both --host and --pat`,
 the CLI found a `host` but no PAT. Add `"pat": "..."` to `config.json` or set
-`NEUTRINO_PAT`.
+`CORTEX_TRAINING_PAT`.
 
 If you see `Invalid URL ... No scheme supplied`, the config is using a bare
 Snowflake hostname as `base_url`. Use `host` for Snowflake PAT auth, or use a

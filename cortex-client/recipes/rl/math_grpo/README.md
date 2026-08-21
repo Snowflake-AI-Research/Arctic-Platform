@@ -11,7 +11,7 @@ Reduce or increase these values together with batch settings, and verify
 capacity before submission:
 
 ```bash
-dss-neutrino capacity
+cortex-training capacity
 ```
 
 ## Run

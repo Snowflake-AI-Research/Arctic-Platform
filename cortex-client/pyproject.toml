@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dss-client"
+name = "cortex-training"
 version = "0.0.2"
-description = "DeepSpeed Serverless Client"
+description = "Python SDK and command-line tools for Cortex Training"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "Apache-2.0"}
@@ -21,8 +21,7 @@ dependencies = [
 
 [project.scripts]
 cortex-training = "cortex_training.cli:main"
-dss-neutrino = "dss_neutrino_cli:main"
-neutrino-tui = "dss_client.tui.__main__:run"
+ct = "cortex_training.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -33,10 +32,7 @@ dev = [
     "mypy>=0.990",
 ]
 
-[tool.setuptools]
-py-modules = ["dss_neutrino_cli"]
-
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["cortex_training*", "dss_client*"]
+include = ["cortex_training*"]
 exclude = ["tests*"]

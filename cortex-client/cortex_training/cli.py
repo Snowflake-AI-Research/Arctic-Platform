@@ -1,12 +1,12 @@
-"""Canonical CLI alias backed by the existing Neutrino CLI implementation."""
+"""Public ``cortex-training`` command entry point."""
 
 from __future__ import annotations
 
 import sys
 from typing import Any, Callable, TextIO
 
-import dss_neutrino_cli as _legacy_cli
-from dss_client.tui.__main__ import run as _run_tui
+import cortex_training._cli as _implementation
+from cortex_training.tui.__main__ import run as _run_tui
 
 _TUI_FLAG_OPTIONS = {"--no-verify-ssl"}
 _TUI_VALUE_OPTIONS = {
@@ -48,11 +48,11 @@ def _tui_argv(argv: list[str]) -> list[str] | None:
 
 
 def build_parser():
-    return _legacy_cli.build_parser(prog="cortex-training", include_tui=True)
+    return _implementation.build_parser(prog="cortex-training", include_tui=True)
 
 
 def parse_args(argv: list[str] | None = None):
-    return _legacy_cli.parse_args(
+    return _implementation.parse_args(
         argv,
         prog="cortex-training",
         include_tui=True,
@@ -71,7 +71,7 @@ def main(
     tui_argv = _tui_argv(effective_argv)
     if tui_argv is not None:
         return _run_tui(tui_argv, prog="cortex-training tui")
-    return _legacy_cli.main(
+    return _implementation.main(
         effective_argv,
         prog="cortex-training",
         include_tui=True,

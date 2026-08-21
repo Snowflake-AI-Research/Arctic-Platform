@@ -1,7 +1,7 @@
 # Cortex Training Documentation
 
 Use Cortex Training to fine-tune, evaluate, and serve open-weight models through
-the Neutrino client.
+the Cortex Training client.
 
 ## Choose a Path
 

@@ -1,11 +1,11 @@
-"""Offline tests for the dss-neutrino CLI."""
+"""Offline tests for the Cortex Training CLI."""
 
 from __future__ import annotations
 
 import io
 import json
 
-import dss_neutrino_cli as cli
+import cortex_training._cli as cli
 
 
 class FakeClient:
@@ -207,13 +207,13 @@ def _write_job(tmp_path):
 
 
 def _write_config(tmp_path, data):
-    path = tmp_path / "neutrino.config.json"
+    path = tmp_path / "cortex-training.config.json"
     path.write_text(json.dumps(data), encoding="utf-8")
     return path
 
 
 def _wire_load(data: bytes):
-    from dss_client import wire
+    from cortex_training import wire
 
     return wire.loads(data)
 
@@ -259,7 +259,7 @@ def test_submit_dry_run_does_not_require_connection(tmp_path, monkeypatch):
     path = _write_job(tmp_path)
     monkeypatch.setattr(
         cli,
-        "_load_neutrino_client_class",
+        "_load_cortex_training_client_class",
         lambda: (_ for _ in ()).throw(AssertionError("client loaded")),
     )
 
@@ -1028,7 +1028,7 @@ def test_config_can_come_from_env(tmp_path, monkeypatch):
             "database": "ENV_CONFIG_DB",
         },
     )
-    monkeypatch.setenv("NEUTRINO_CONFIG", str(config))
+    monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(config))
     seen = {}
 
     def make_client(args):
@@ -1063,7 +1063,7 @@ def test_bare_base_url_with_pat_is_treated_as_host(tmp_path):
         {
             "base_url": "dsa-test.qa6.us-west-2.aws.snowflakecomputing.com",
             "pat": "test-pat",
-            "database": "NEUTRINO_DB",
+            "database": "CORTEX_TRAINING_DB",
         },
     )
     seen = {}
@@ -1085,13 +1085,13 @@ def test_bare_base_url_with_pat_is_treated_as_host(tmp_path):
 
 
 def test_bare_base_url_without_pat_returns_clear_error(tmp_path, monkeypatch):
-    monkeypatch.delenv("NEUTRINO_PAT", raising=False)
+    monkeypatch.delenv("CORTEX_TRAINING_PAT", raising=False)
     monkeypatch.delenv("SNOWFLAKE_PAT", raising=False)
     config = _write_config(
         tmp_path,
         {
             "base_url": "dsa-test.qa6.us-west-2.aws.snowflakecomputing.com",
-            "database": "NEUTRINO_DB",
+            "database": "CORTEX_TRAINING_DB",
         },
     )
     stderr = io.StringIO()
@@ -1128,7 +1128,7 @@ def test_login_persists_config_path(tmp_path, monkeypatch):
         tmp_path,
         {"base_url": "http://login.local", "database": "LOGIN_DB"},
     )
-    monkeypatch.setenv("DSS_NEUTRINO_LOGIN_FILE", str(login_state))
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
     stdout = io.StringIO()
 
     rc = cli.main(["login", "--config", str(config)], stdout=stdout)
@@ -1152,7 +1152,7 @@ def test_logged_in_config_is_used_without_config_arg(tmp_path, monkeypatch):
         json.dumps({"config_path": str(config)}),
         encoding="utf-8",
     )
-    monkeypatch.setenv("DSS_NEUTRINO_LOGIN_FILE", str(login_state))
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
     seen = {}
 
     def make_client(args):
@@ -1180,7 +1180,7 @@ def test_cli_flags_override_logged_in_config(tmp_path, monkeypatch):
         json.dumps({"config_path": str(config)}),
         encoding="utf-8",
     )
-    monkeypatch.setenv("DSS_NEUTRINO_LOGIN_FILE", str(login_state))
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
     seen = {}
 
     def make_client(args):
@@ -1202,7 +1202,7 @@ def test_cli_flags_override_logged_in_config(tmp_path, monkeypatch):
 def test_direct_connection_flags_do_not_read_login_state(tmp_path, monkeypatch):
     login_state = tmp_path / "login.json"
     login_state.write_text("not json", encoding="utf-8")
-    monkeypatch.setenv("DSS_NEUTRINO_LOGIN_FILE", str(login_state))
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
 
     rc = cli.main(
         _base_args() + ["list"],
@@ -1216,7 +1216,7 @@ def test_direct_connection_flags_do_not_read_login_state(tmp_path, monkeypatch):
 def test_login_rejects_invalid_config(tmp_path, monkeypatch):
     login_state = tmp_path / "login.json"
     config = _write_config(tmp_path, {"typo": "value"})
-    monkeypatch.setenv("DSS_NEUTRINO_LOGIN_FILE", str(login_state))
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
     stderr = io.StringIO()
 
     rc = cli.main(["login", "--config", str(config)], stderr=stderr)

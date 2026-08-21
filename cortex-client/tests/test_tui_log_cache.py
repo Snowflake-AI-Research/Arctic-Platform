@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from dss_client.tui.log_cache import (
+from cortex_training.tui.log_cache import (
     LogCache,
     cache_root,
     cached_log_pages,
@@ -18,20 +18,20 @@ from dss_client.tui.log_cache import (
 # ─── cache dir resolution ────────────────────────────────────────────────
 
 def test_cache_root_respects_xdg_cache_home(monkeypatch, tmp_path):
-    monkeypatch.delenv("NEUTRINO_TUI_CACHE_DIR", raising=False)
+    monkeypatch.delenv("CORTEX_TRAINING_TUI_CACHE_DIR", raising=False)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    assert cache_root() == tmp_path / "neutrino-tui"
+    assert cache_root() == tmp_path / "cortex-training"
 
 
 def test_cache_root_falls_back_to_home_cache(monkeypatch, tmp_path):
-    monkeypatch.delenv("NEUTRINO_TUI_CACHE_DIR", raising=False)
+    monkeypatch.delenv("CORTEX_TRAINING_TUI_CACHE_DIR", raising=False)
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    assert cache_root() == tmp_path / ".cache" / "neutrino-tui"
+    assert cache_root() == tmp_path / ".cache" / "cortex-training"
 
 
 def test_override_env_wins(monkeypatch, tmp_path):
-    monkeypatch.setenv("NEUTRINO_TUI_CACHE_DIR", str(tmp_path / "override"))
+    monkeypatch.setenv("CORTEX_TRAINING_TUI_CACHE_DIR", str(tmp_path / "override"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
     assert cache_root() == tmp_path / "override"
 
