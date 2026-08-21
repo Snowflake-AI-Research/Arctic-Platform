@@ -1,38 +1,20 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared Cortex-specific payload reshape used by both integration adapters.
+"""Reshape verl/SkyRL ``{batch, meta, processing}`` into Cortex's
+``{args, kwargs, context, processing}`` wire format.
 
-The Cortex ``forward-backward`` op consumes an RPC-style
-``{args, kwargs, context, processing}`` frame, while both SkyRL and verl
-construct verl-GRPO's ``{batch, meta, processing}``. This helper reshapes
-between them.
-
-The processing block matches the wire contract in
-``arctic_platform/cortex-client/recipes/rl_loop.py::processing_block``
-(Jae's cookbook), which is the reference for what Cortex's GRPO loss reads:
-
-    processing = {
-        "loss_fn": "grpo",
-        "config": {
-            "eps_clip": 0.2,
-            "loss_agg_mode": "token-mean",
-            "entropy_coeff": 0.0,
-            "global_batch_size": <actual datum count>,
-        },
-    }
-
-Deviating from this contract silently changes what the server computes for
-the same input. In particular we do NOT send ``dp_size``: on-prem doesn't,
-Jae's cookbook doesn't, and the Cortex server treats it as a divisor -- so
-sending it at multi-GPU DP scales the effective LR down by that factor.
+The processing block matches ``arctic_platform/cortex-client/recipes/rl_loop.py``
+(Jae's cookbook). ``dp_size`` is deliberately NOT sent: the server treats it
+as a loss divisor, which scales the effective LR down by that factor at
+multi-GPU DP.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-# Defaults match Jae's rl_loop.py and verl's actor.yaml. Callers can
-# override any entry by passing them in the incoming ``processing.config``.
+# Match Jae's rl_loop.py and verl's actor.yaml defaults; caller-supplied
+# processing.config values win.
 _DEFAULT_PROC_CONFIG: dict[str, Any] = {
     "eps_clip": 0.2,
     "loss_agg_mode": "token-mean",
@@ -41,16 +23,13 @@ _DEFAULT_PROC_CONFIG: dict[str, Any] = {
 
 
 def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) -> dict:
-    """Reshape a verl/SkyRL ``{batch, meta, processing}`` payload into Cortex's
-    canonical ``{args, kwargs, context, processing}``.
+    """Reshape a verl/SkyRL fwd_bwd payload into Cortex's wire shape.
 
-    ``old_log_probs_shifted`` is intentionally omitted -- the server-side GRPO
-    loss defaults it to ``logprobs.detach()`` (π_old ≡ π_new), which is
-    correct for single-epoch on-policy GRPO.
+    ``old_log_probs_shifted`` is dropped: server-side GRPO defaults it to
+    ``logprobs.detach()`` (π_old ≡ π_new), correct for single-epoch on-policy.
 
-    ``response_mask`` (or a caller-supplied ``loss_mask``) is required: we do
-    NOT fall back to ``attention_mask`` because that includes prompt tokens
-    and would train on them (silently wrong gradient).
+    Requires ``loss_mask`` or ``response_mask``; falling back to
+    ``attention_mask`` would train on prompt tokens.
     """
     import torch
 
@@ -90,17 +69,11 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
         if k in tensors:
             kwargs_out[k] = tensors[k]
 
-    # Caller wins for any explicit config key; unset keys get the Jae-cookbook
-    # defaults. Never inject dp_size / prox_logp_method: neither is in the
-    # cookbook and dp_size causes multi-DP LR shrink.
     caller_config = dict((processing_in or {}).get("config") or {})
     proc_config: dict[str, Any] = {**_DEFAULT_PROC_CONFIG, **caller_config}
-    # global_batch_size falls back to verl's meta; leave unset if unavailable so
-    # the server uses its own count.
-    if "global_batch_size" not in proc_config and "global_batch_size" in meta:
-        proc_config["global_batch_size"] = int(meta["global_batch_size"])
-    if "batch_num_tokens" not in proc_config and "batch_num_tokens" in meta:
-        proc_config["batch_num_tokens"] = int(meta["batch_num_tokens"])
+    for k in ("global_batch_size", "batch_num_tokens"):
+        if k not in proc_config and k in meta:
+            proc_config[k] = int(meta[k])
 
     return {
         "args": (),
