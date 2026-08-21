@@ -5,9 +5,8 @@ the Neutrino client.
 
 ## Choose a Path
 
-- New users: start with [prerequisites](getting-started/prerequisites.md), then
-  [set up the client](getting-started/setup.md) and
-  [run conversational SFT](getting-started/first-sft-run.md).
+- New users: follow the [getting-started path](getting-started/README.md) from
+  prerequisites through the first conversational SFT job.
 - Training users: browse the [training guides](guides/training/lora-and-qlora.md)
   and [runnable recipes](../recipes/README.md).
 - Operators: see [job management](guides/operations/manage-jobs.md) and

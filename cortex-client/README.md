@@ -5,7 +5,7 @@ Training through the Neutrino SNOWAPI.
 
 ## Start Here
 
-- [Set up the client](docs/getting-started/setup.md)
+- [Follow the getting-started path](docs/getting-started/README.md)
 - [Run the first supervised fine-tuning job](docs/getting-started/first-sft-run.md)
 - [Browse runnable recipes](recipes/README.md)
 - [Check model and training-method compatibility](docs/reference/model-compatibility.md)
