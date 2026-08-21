@@ -77,6 +77,10 @@ class CortexConfig(BaseModel):
 
     type: Literal["remote"] = "remote"
     protocol: Literal["cortex"] = Field("cortex", description="remote transport protocol.")
+    # Mirrors OnPremConfig.colocate so callers can read `backend.colocate`
+    # regardless of backend; Cortex training + sampling always live in separate
+    # SnowAPI sub-jobs, so this is Literal[False].
+    colocate: Literal[False] = Field(False, description="cortex: colocation not supported.")
     base_url: str | None = Field(None, description="cortex: direct/mock GS URL; bypasses PAT auth.")
     host: str | None = Field(None, description="cortex: Snowflake host for PAT auth.")
     pat: str | None = Field(None, description="cortex: PAT value passed directly; overrides pat_env_var when set.")
@@ -89,6 +93,31 @@ class CortexConfig(BaseModel):
     def resolve_pat(self) -> str | None:
         """The PAT for host/PAT auth: explicit `pat`, else the `pat_env_var` value."""
         return self.pat if self.pat is not None else os.environ.get(self.pat_env_var)
+
+    @classmethod
+    def from_env(cls, **overrides: Any) -> Self:
+        """Build a ``CortexConfig`` from ``ARCTIC_CORTEX_*`` env vars.
+
+        The one call-site framework adapters (SkyRL shim / verl adapter) use to
+        flip to Cortex from a shell-level env, so the env-var contract lives in
+        one place instead of being reinvented per integration. Explicit
+        ``overrides`` win.
+        """
+        env: dict[str, Any] = {}
+        for key, field in (
+            ("base_url", "ARCTIC_CORTEX_BASE_URL"),
+            ("host", "ARCTIC_CORTEX_HOST"),
+            ("pat_env_var", "ARCTIC_CORTEX_PAT_ENV_VAR"),
+            ("database", "ARCTIC_CORTEX_DATABASE"),
+            ("endpoint", "ARCTIC_CORTEX_ENDPOINT"),
+        ):
+            v = os.environ.get(field)
+            if v:
+                env[key] = v
+        schema = os.environ.get("ARCTIC_CORTEX_SCHEMA")
+        if schema:
+            env["schema"] = schema
+        return cls(**{**env, **overrides})
 
     @model_validator(mode="after")
     def _check(self) -> Self:

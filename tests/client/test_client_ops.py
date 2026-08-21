@@ -390,3 +390,244 @@ class TestWeightSyncStrategyInit:
         payload = cfg.to_onprem("sampling")
         assert "cuda_ipc" not in payload
         assert "low_memory" not in payload
+
+
+@pytest.fixture(autouse=True)
+def _isolate_arctic_env(monkeypatch):
+    """Clear ARCTIC_BACKEND / ARCTIC_CORTEX_* before each test; a leaked env from
+    a parallel process would flip config promotion under our feet."""
+    import os
+
+    for k in list(os.environ):
+        if k.startswith("ARCTIC_BACKEND") or k.startswith("ARCTIC_CORTEX_"):
+            monkeypatch.delenv(k, raising=False)
+
+
+class TestCortexConfigFromEnv:
+    """``CortexConfig.from_env`` reads ``ARCTIC_CORTEX_*`` and lets explicit
+    kwargs win. This is the one call-site framework adapters use to flip to
+    Cortex from a shell-level env."""
+
+    def test_base_url_only_bypasses_pat(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
+        from arctic_platform.client import CortexConfig
+
+        cfg = CortexConfig.from_env()
+        assert cfg.base_url == "http://mock"
+        assert cfg.host is None
+
+    def test_host_path_requires_db_schema_pat(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
+        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "db")
+        monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "sch")
+        monkeypatch.setenv("CORTEX_PAT", "pat-value")
+        from arctic_platform.client import CortexConfig
+
+        cfg = CortexConfig.from_env()
+        assert cfg.host == "acct.snowflakecomputing.com"
+        assert cfg.database == "db"
+        assert cfg.schema_ == "sch"
+        assert cfg.resolve_pat() == "pat-value"
+
+    def test_explicit_override_wins(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://env")
+        from arctic_platform.client import CortexConfig
+
+        cfg = CortexConfig.from_env(base_url="http://explicit")
+        assert cfg.base_url == "http://explicit"
+
+
+class TestUnifiedConfigDoesNotReadEnv:
+    """``ArcticRLClientConfig`` does not swap ``backend`` from env vars.
+    ``ARCTIC_BACKEND`` is only honored at framework adapter call-sites (verl's
+    ``_create_rl_client_config``, the legacy ``arctic_platform.rl`` validator)."""
+
+    def test_no_env_promotion_on_unified_config(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_BACKEND", "cortex")
+        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(), training_gpus=1)
+        assert cfg.backend.type == "onprem"
+
+
+class TestCortexTransportNoopOps:
+    """``wake_*`` / ``sleep_*`` short-circuit in the Cortex transport so the
+    shim doesn't have to wrap each call — including the ones ``sync_weights``
+    invokes internally."""
+
+    def test_call_returns_empty_for_noop_op(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
+        from arctic_platform.client import CortexConfig
+        from arctic_platform.client.transport import Request
+        from arctic_platform.client.transports.cortex import CortexTransport
+
+        cfg = ArcticRLClientConfig(
+            model_name="m", backend=CortexConfig.from_env(), training_gpus=1, sampling_gpus=1
+        )
+        t = CortexTransport(cfg)
+        # Would normally raise NotImplementedError on the transport; the noop
+        # short-circuit means the shim never has to guard these calls.
+        assert t.call(Request("wake-inference", 1, None)) == {}
+        assert t.call(Request("sleep-training", 1, {"mode": "all"})) == {}
+
+
+class TestLegacyBackendEnvPromotion:
+    """Legacy ``arctic_platform.rl.config.ArcticRLClientConfig`` (the shape
+    SkyRL builds) promotes ``backend="local"`` -> ``"cortex"`` when
+    ``ARCTIC_BACKEND=cortex`` is set. Explicit non-default backends still win.
+    """
+
+    def test_local_default_gets_promoted(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_BACKEND", "cortex")
+        from arctic_platform.rl.config import ArcticRLClientConfig as Legacy
+
+        cfg = Legacy(model_name="m", backend="local", training_gpus=1)
+        assert cfg.backend == "cortex"
+
+    def test_explicit_non_default_backend_wins(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_BACKEND", "cortex")
+        from arctic_platform.rl.config import ArcticRLClientConfig as Legacy
+
+        cfg = Legacy(model_name="m", backend="dss-platform", training_gpus=1)
+        assert cfg.backend == "dss-platform"
+
+
+class TestCortexSharedHelper:
+    """``to_cortex_fwd_bwd_payload`` lives under ``arctic_platform.integrations``
+    so the SkyRL shim and the verl adapter share the reshape rule."""
+
+    def test_integration_path_importable(self):
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        assert callable(to_cortex_fwd_bwd_payload)
+
+    def test_reshape_matches_cortex_wire_shape(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        attn = torch.ones((2, 10), dtype=torch.int64)
+        adv = torch.zeros((2, 10))
+        resp_mask = torch.ones((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": adv,
+                    "response_mask": resp_mask,
+                },
+                "meta": {},
+            },
+        )
+        assert out["args"] == ()
+        assert torch.equal(out["kwargs"]["input_ids"], ids)
+        assert torch.equal(out["kwargs"]["attention_mask"], attn)
+        # Server-side GRPO reads these from context for its preflight.
+        assert torch.equal(out["context"]["input_ids"], ids)
+        assert "advantages" in out["context"]
+        assert "loss_mask" in out["context"]
+        # Pin loss_fn="grpo" so verl's "verl_grpo" alias doesn't reach the server.
+        assert out["processing"]["loss_fn"] == "grpo"
+        assert "old_log_probs" not in out["kwargs"]
+        assert "old_log_probs_shifted" not in out["context"]
+
+    def test_processing_matches_jae_cookbook_contract(self):
+        """The wire contract mirrors ``cortex-client/recipes/rl_loop.py``:
+        loss_agg_mode / entropy_coeff / eps_clip explicit, no dp_size."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((2, 10)),
+                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                },
+                "meta": {},
+            },
+        )
+        cfg = out["processing"]["config"]
+        assert cfg["loss_agg_mode"] == "token-mean"
+        assert cfg["entropy_coeff"] == 0.0
+        assert cfg["eps_clip"] == 0.2
+        # dp_size / prox_logp_method are NOT in Jae's cookbook and must not
+        # leak into the wire: dp_size acts as an extra LR divisor at scale.
+        assert "dp_size" not in cfg
+        assert "prox_logp_method" not in cfg
+
+    def test_caller_processing_config_wins(self):
+        """Recipe-supplied loss knobs override the defaults, so verl's
+        ``actor.entropy_coeff`` / ``loss_agg_mode`` propagate all the way
+        to the Cortex server."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((2, 10)),
+                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                },
+                "meta": {"global_batch_size": 128},
+            },
+            processing={
+                "loss_fn": "verl_grpo",
+                "config": {"eps_clip": 0.3, "loss_agg_mode": "seq-mean-token-sum", "entropy_coeff": 0.01},
+            },
+        )
+        cfg = out["processing"]["config"]
+        assert cfg["eps_clip"] == 0.3
+        assert cfg["loss_agg_mode"] == "seq-mean-token-sum"
+        assert cfg["entropy_coeff"] == 0.01
+        assert cfg["global_batch_size"] == 128  # meta fallback still applied
+
+    def test_missing_response_mask_fails_loud(self):
+        """Falling back to ``attention_mask`` would silently train on prompt
+        tokens; refuse instead of producing a wrong-but-plausible gradient."""
+        import pytest
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        with pytest.raises(ValueError, match="loss_mask.*response_mask"):
+            to_cortex_fwd_bwd_payload(
+                {
+                    "batch": {
+                        "input_ids": torch.zeros((2, 10), dtype=torch.int64),
+                        "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                        "advantages": torch.zeros((2, 10)),
+                    },
+                    "meta": {},
+                },
+            )
+
+
+class TestCortexShimSaveWeightsFailsLoud:
+    """``save_weights`` raises ``NotImplementedError`` — Cortex sub-jobs don't
+    share disk, so a silent no-op would leave sampling on stale weights."""
+
+    def test_save_weights_raises(self, monkeypatch):
+        import asyncio
+
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
+        from arctic_platform.integrations._cortex_dispatch import _CortexClientShim
+        from arctic_platform.rl.config import ArcticRLClientConfig as Legacy
+
+        legacy = Legacy(model_name="m", backend="cortex", training_gpus=1, sampling_gpus=1)
+
+        # Skip the real ArcticRLClient constructor (needs live transport init).
+        shim = _CortexClientShim.__new__(_CortexClientShim)
+        shim._legacy_config = legacy
+        shim._unified_config = None
+        shim._client = None
+
+        with pytest.raises(NotImplementedError, match="Cortex has no disk-based"):
+            asyncio.run(shim.save_weights("/tmp/w"))

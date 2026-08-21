@@ -64,6 +64,22 @@ _OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
 # forward-backward carries the large gradient frame; a mid-stream chunk-group
 # desync (GS restart) is recoverable only by re-posting the whole group.
 _GROUP_RESTART_OPS = {"forward-backward"}
+# Cortex sub-jobs are always awake; the client's colocated wake/sleep lifecycle
+# is a no-op here. Short-circuiting in the transport means the shim doesn't have
+# to wrap every wake/sleep call individually — including the ones ``sync_weights``
+# invokes internally.
+_NOOP_OPS = {"wake-inference", "sleep-inference", "wake-training", "sleep-training"}
+# ``/operation`` is polymorphic: async ops (weight-sync, forward-backward, ...)
+# return ``{request_id: ...}`` and we poll to completion; inline ops answer with
+# the finished body directly. Whitelisting the inline set lets us tell the two
+# apart without silently dropping either kind of response.
+_INLINE_OPERATION_TYPES = {
+    "bootstrap-router-replay",
+    "cancel-request",
+    "reset-prefix-cache",
+    "router-replay-discard",
+    "tail-logs",
+}
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
 _JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
@@ -103,6 +119,23 @@ def _is_connect_error(exc: BaseException) -> bool:
         reason = getattr(cause, "reason", None)
         return isinstance(cause, NewConnectionError) or isinstance(reason, NewConnectionError)
     return False
+
+
+def _submitted(op: str, body: dict, response: dict) -> str | dict:
+    """A poll handle for an async op, or the finished result for an inline one.
+
+    SnowAPI's contract on ``/operation`` is "poll if the response carries a
+    ``request_id``, else consume it inline". Only operations in
+    ``_INLINE_OPERATION_TYPES`` are allowed to answer inline; anything else must
+    return a ``request_id`` and be polled to completion.
+    """
+    request_id = response.get("request_id")
+    if request_id is not None:
+        return str(request_id)
+    operation_type = body.get("operation_type")
+    if operation_type in _INLINE_OPERATION_TYPES:
+        return response
+    raise RuntimeError(f"cortex {operation_type or op} response carried no request_id: {response}")
 
 
 class _ChunkGroupError(Exception):
@@ -222,16 +255,20 @@ class CortexTransport(Transport):
 
     # ── deliver one op: submit + poll to completion ──────────────────────────
     def call(self, request: Request) -> dict:
+        if request.op in _NOOP_OPS:
+            return {}
         result = self._poll(self._submit(request))
         # generate returns token ids as DSSST1 tensors; on-prem returns plain
         # lists, so match that contract.
         return _to_python(result) if request.op == "generate" else result
 
     async def acall(self, request: Request) -> dict:
+        if request.op in _NOOP_OPS:
+            return {}
         result = await self._apoll(await self._asubmit(request))
         return _to_python(result) if request.op == "generate" else result
 
-    def _submit(self, request: Request) -> str:
+    def _submit(self, request: Request) -> str | dict:
         # Same shape as on-prem's call: build the url, then pick the wire. Octet ops
         # (forward-backward, generate) go DSSST1; the rest post JSON as-is. The client
         # assembles the full /operation envelope (incl. sub-job routing hints), so
@@ -242,7 +279,7 @@ class CortexTransport(Transport):
         if op in _OCTET_OPS:
             return self._submit_octet(url, op, body)
         if op in ("step", "save", "operation"):
-            return self._send("POST", url, json=body)["request_id"]
+            return _submitted(op, body, self._send("POST", url, json=body))
         raise NotImplementedError(f"cortex has no {op}")
 
     def _octet_chunks(self, body: dict, op: str) -> list[bytes]:
@@ -269,14 +306,14 @@ class CortexTransport(Transport):
             idx += 1
         return final["request_id"]
 
-    async def _asubmit(self, request: Request) -> str:
+    async def _asubmit(self, request: Request) -> str | dict:
         op = request.op
         body = {k: v for k, v in request.body.items() if v is not None}
         url = f"{self._prefix}/{self.job_id}/{op}"
         if op in _OCTET_OPS:
             return await self._asubmit_octet(url, op, body)
         if op in ("step", "save", "operation"):
-            return (await self._asend("POST", url, json=body))["request_id"]
+            return _submitted(op, body, await self._asend("POST", url, json=body))
         raise NotImplementedError(f"cortex has no {op}")
 
     async def _asubmit_octet(self, url: str, op: str, body: dict) -> str:
@@ -321,7 +358,11 @@ class CortexTransport(Transport):
         url = f"{self._prefix}/{self.job_id}/requests/{request_id}"
         return url, ({"cursor": cursor} if cursor else None)
 
-    def _poll(self, request_id: str) -> dict:
+    def _poll(self, submitted: str | dict) -> dict:
+        # Inline ops (_INLINE_OPERATION_TYPES) return their body from POST.
+        if isinstance(submitted, dict):
+            return submitted
+        request_id = submitted
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
         chunks: list[bytes] = []
@@ -338,7 +379,10 @@ class CortexTransport(Transport):
             delay = _next_delay(delay)
         raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s")
 
-    async def _apoll(self, request_id: str) -> dict:
+    async def _apoll(self, submitted: str | dict) -> dict:
+        if isinstance(submitted, dict):
+            return submitted  # inline op — see _poll
+        request_id = submitted
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
         chunks: list[bytes] = []
@@ -359,11 +403,25 @@ class CortexTransport(Transport):
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
         while time.monotonic() < deadline:
-            state = _short(self._job().get("status"))
+            job = self._job()
+            state = _short(job.get("status"))
             if state == "running":
                 return
             if state in _JOB_TERMINAL:
-                raise RuntimeError(f"cortex job {self.job_id} reached terminal state '{state}'")
+                # Surface the server-side reason and any per-sub-job status so
+                # callers can distinguish rate limits, allowlist rejections,
+                # capacity exhaustion, and genuine sub-job crashes.
+                reason = job.get("reason") or "(no reason)"
+                sub_states = ", ".join(
+                    f"{_short(sj.get('job_type', ''), 'job_type_')}={_short(sj.get('status'))}"
+                    for sj in (job.get("sub_jobs") or [])
+                )
+                detail = f" reason={reason!r}"
+                if sub_states:
+                    detail += f" sub_jobs=[{sub_states}]"
+                raise RuntimeError(
+                    f"cortex job {self.job_id} reached terminal state '{state}';{detail}"
+                )
             time.sleep(delay)
             delay = _next_delay(delay)
         raise TimeoutError(f"cortex job {self.job_id} did not become running within {self.poll_timeout}s")
