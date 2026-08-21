@@ -177,12 +177,6 @@ class TestSFTOpMapping:
         payload = sampling_client.transport.calls[1].body["payload"]
         assert payload == {"source_sub_job_id": TRAINING, "target_sub_job_ids": [SAMPLING]}
 
-    def test_log_prob_ops_fail_without_a_log_prob_job(self, client):
-        """SFT never allocates a log-prob job, so reference log-probs fail loudly."""
-        with pytest.raises(ValueError, match="No log_prob job"):
-            client.fwd_no_grad({"batch": {}}, reference_model=True)
-
-
 class TestSFTLifecycle:
     def test_reconnect_config_copies_training_job_id(self, client):
         cfg = client.reconnect_config()

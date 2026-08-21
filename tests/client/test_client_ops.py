@@ -120,10 +120,10 @@ class TestOpMapping:
         assert req.job_id == TRAINING
         assert req.binary is True
 
-    def test_fwd_no_grad_reference_targets_log_prob(self, client):
+    def test_fwd_no_grad_reference_targets_log_prob(self, rl_client):
         """fwd_no_grad(reference_model=True) -> log_prob job (reference log-probs)."""
-        _call(client, "fwd_no_grad", {"input_ids": [1]}, reference_model=True)
-        req = _last(client)
+        _call(rl_client, "fwd_no_grad", {"input_ids": [1]}, reference_model=True)
+        req = _last(rl_client)
         assert req.op == "forward"
         assert req.job_id == LOG_PROB
         assert req.binary is True
