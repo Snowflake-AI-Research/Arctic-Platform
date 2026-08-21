@@ -12,32 +12,39 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""ArcticSFTClient op surface — FakeTransport, no live backend or GPUs."""
+"""ArcticSFTClient op surface — FakeTransport, no live backend or GPUs.
+
+ArcticSFTClient shares every op with ArcticClient; what is asserted here is the
+SFT-specific part (the ``loss_fn: sft`` default on the forward bodies) plus the
+shared ops as an SFT caller sees them.
+"""
 
 from __future__ import annotations
 
 import pytest
 
+from arctic_platform.client import ArcticSFTClientConfig
 from arctic_platform.client import JobHandles
+from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
+from arctic_platform.client import TrainingConfig
 from arctic_platform.client import Transport
+from arctic_platform.client import base as base_module
 from arctic_platform.sft import ArcticSFTClient
-from arctic_platform.sft import ArcticSFTClientConfig
-from arctic_platform.sft import client as sft_client_module
 
 TRAINING = 1
 SAMPLING = 2
 
 
 class FakeTransport(Transport):
-    def __init__(self, config) -> None:
+    def __init__(self, config, server_state=None) -> None:
         self.config = config
         self.jobs = JobHandles()
         self.calls: list[Request] = []
         self.shutdown_calls = 0
 
     def initialize(self) -> JobHandles:
-        sampling = SAMPLING if getattr(self.config, "sampling_gpus", 0) else None
+        sampling = SAMPLING if self.config.sampling_gpus else None
         self.jobs = JobHandles(training=TRAINING, sampling=sampling)
         return self.jobs
 
@@ -52,23 +59,23 @@ class FakeTransport(Transport):
         self.shutdown_calls += 1
 
 
+def _config(**kwargs) -> ArcticSFTClientConfig:
+    kwargs.setdefault("training_gpus", 2)
+    kwargs.setdefault("backend", OnPremConfig())
+    kwargs.setdefault("training", TrainingConfig(checkpoint_path="/tmp/c"))
+    return ArcticSFTClientConfig(model_name="m", **kwargs)
+
+
 @pytest.fixture
 def client(monkeypatch) -> ArcticSFTClient:
-    monkeypatch.setattr(sft_client_module, "_make_transport", FakeTransport)
-    cfg = ArcticSFTClientConfig(model_name="m", training_gpus=2, checkpoint_path="/tmp/c")
-    return ArcticSFTClient(cfg)
+    monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+    return ArcticSFTClient(_config())
 
 
 @pytest.fixture
 def sampling_client(monkeypatch) -> ArcticSFTClient:
-    monkeypatch.setattr(sft_client_module, "_make_transport", FakeTransport)
-    cfg = ArcticSFTClientConfig(
-        model_name="m",
-        training_gpus=1,
-        sampling_gpus=1,
-        colocate=True,
-        checkpoint_path="/tmp/c",
-    )
+    monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+    cfg = _config(training_gpus=1, sampling_gpus=1, backend=OnPremConfig(colocate=True))
     return ArcticSFTClient(cfg)
 
 
@@ -88,6 +95,11 @@ class TestSFTOpMapping:
 
     def test_fwd_bwd_folds_explicit_processing(self, client):
         client.fwd_bwd({"batch": {}}, processing={"loss_fn": "sft_ce"})
+        assert _last(client).body["processing"] == {"loss_fn": "sft_ce"}
+
+    def test_fwd_bwd_keeps_processing_from_the_batch(self, client):
+        """A batch that already carries `processing` is not overwritten by the sft default."""
+        client.fwd_bwd({"batch": {}, "processing": {"loss_fn": "sft_ce"}})
         assert _last(client).body["processing"] == {"loss_fn": "sft_ce"}
 
     def test_fwd_no_grad_targets_training_binary(self, client):
@@ -113,10 +125,13 @@ class TestSFTOpMapping:
         assert req.op == "save"
         assert req.job_id == TRAINING
         assert req.body == {
+            "checkpoint_id": None,
+            "checkpoint_type": "resumable",
             "path": "/tmp/ckpt",
             "step": 3,
             "export_hf": True,
             "save_total_limit": 2,
+            "stage_info": None,
         }
 
     def test_load_checkpoint_targets_training(self, client):
@@ -176,9 +191,8 @@ class TestSFTLifecycle:
         assert cfg.sampling_job_id == SAMPLING
 
     def test_context_manager_shuts_down(self, monkeypatch):
-        monkeypatch.setattr(sft_client_module, "_make_transport", FakeTransport)
-        cfg = ArcticSFTClientConfig(model_name="m", training_gpus=1, checkpoint_path="/tmp/c")
-        with ArcticSFTClient(cfg) as c:
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+        with ArcticSFTClient(_config(training_gpus=1)) as c:
             assert c.jobs.training == TRAINING
         assert c.transport.shutdown_calls == 1
 
@@ -189,60 +203,6 @@ class TestSFTLifecycle:
             def initialize(self):
                 raise RuntimeError("init failed")
 
-        monkeypatch.setattr(sft_client_module, "_make_transport", BoomTransport)
-        cfg = ArcticSFTClientConfig(model_name="m", training_gpus=1, checkpoint_path="/tmp/c")
+        monkeypatch.setattr(base_module, "make_transport", BoomTransport)
         with pytest.raises(RuntimeError, match="init failed"):
-            ArcticSFTClient(cfg)
-
-
-class TestSFTTransportSelection:
-    def test_make_transport_selects_http(self):
-        from arctic_platform.client.transports.onprem_http import HttpTransport
-
-        cfg = ArcticSFTClientConfig(model_name="m", training_gpus=1, checkpoint_path="/tmp/c", comm_protocol="http")
-        assert isinstance(sft_client_module._make_transport(cfg), HttpTransport)
-
-    def test_make_transport_selects_ray(self, monkeypatch):
-        import arctic_platform.client.transports.onprem_ray as ray_mod
-
-        class DummyRay:
-            def __init__(self, config):
-                self.config = config
-
-        monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
-        cfg = ArcticSFTClientConfig(model_name="m", training_gpus=1, checkpoint_path="/tmp/c", comm_protocol="ray")
-        assert isinstance(sft_client_module._make_transport(cfg), DummyRay)
-
-    def test_to_rl_config_disables_sampling_and_log_prob(self):
-        cfg = ArcticSFTClientConfig(
-            model_name="m",
-            training_gpus=2,
-            host="h",
-            port=9,
-            launch_local_server=True,
-            server_cuda_visible_devices="0,1",
-            checkpoint_path="/tmp/c",
-        )
-        rl = cfg.to_rl_config()
-        assert rl.training_gpus == 2
-        assert rl.sampling_gpus == 0
-        assert rl.log_prob_gpus == 0
-        assert rl.backend.host == "h"
-        assert rl.backend.port == 9
-        assert rl.backend.launch_local_server is True
-        assert rl.backend.server_cuda_visible_devices == "0,1"
-        assert rl.training.checkpoint_path == "/tmp/c"
-
-    def test_to_rl_config_routes_weight_sync_strategy(self):
-        cfg = ArcticSFTClientConfig(
-            model_name="m",
-            training_gpus=1,
-            sampling_gpus=1,
-            colocate=True,
-            cuda_ipc=True,
-            low_memory=True,
-            checkpoint_path="/tmp/c",
-        )
-        rl = cfg.to_rl_config()
-        assert rl.training.cuda_ipc is True
-        assert rl.training.low_memory is True
+            ArcticSFTClient(_config(training_gpus=1))

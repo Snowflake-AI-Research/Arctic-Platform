@@ -44,7 +44,7 @@ from tenacity import wait_exponential_jitter
 from urllib3.exceptions import NewConnectionError
 
 from arctic_platform import wire
-from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
@@ -176,7 +176,7 @@ async def _aread_json(resp: Any) -> Any:
 
 
 class CortexTransport(Transport):
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: ArcticClientConfig) -> None:
         self.config = config
         self.jobs = JobHandles()
         self.job_id: str | None = None

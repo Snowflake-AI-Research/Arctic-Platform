@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
 
-from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import JobId
 
 JOB_TYPES = ("training", "sampling", "log_prob")
@@ -92,7 +92,7 @@ class JobHandles:
     log_prob: JobId | None = None
 
     @classmethod
-    def from_config(cls, config: ArcticRLClientConfig) -> JobHandles:
+    def from_config(cls, config: ArcticClientConfig) -> JobHandles:
         return cls(config.training_job_id, config.sampling_job_id, config.log_prob_job_id)
 
     @property

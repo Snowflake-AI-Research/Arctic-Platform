@@ -16,7 +16,7 @@
 
 Canonical nesting (shared across backends)::
 
-    ArcticRLClientConfig
+    ArcticClientConfig
     ├── model_name, seed, dtype, max_seq_len
     ├── training_gpus / sampling_gpus / log_prob_gpus
     ├── training     # DeepSpeed engine (ds_config owns optimizer/scheduler/batch) + checkpoint
@@ -106,7 +106,7 @@ class SamplingConfig(BaseModel):
     """Sampling / log-prob engine settings shared by every backend.
 
     Engine knobs live under ``vllm`` — never flattened next to ``max_seq_len`` /
-    ``n_gpus``. Those allocation fields stay on ``ArcticRLClientConfig``.
+    ``n_gpus``. Those allocation fields stay on ``ArcticClientConfig``.
     """
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
@@ -176,7 +176,7 @@ class TrainingConfig(BaseModel):
     )
 
 
-class ArcticRLClientConfig(BaseModel):
+class ArcticClientConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     model_name: str = Field(..., description="HF model id to train/serve.")
