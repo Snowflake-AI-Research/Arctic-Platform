@@ -32,13 +32,12 @@ from arctic_platform.client import OPS
 from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import ArcticRLClient
 from arctic_platform.client import ArcticSFTClient
+from arctic_platform.client import AsyncArcticRLClient
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
-from arctic_platform.client import SyncArcticRLClient
 from arctic_platform.client import Transport
 from arctic_platform.client import base as base_module
-from arctic_platform.client import create_arctic_rl_client
 from arctic_platform.client import unresolved_ops
 from arctic_platform.client.transport import method_name
 
@@ -80,14 +79,14 @@ def _build(monkeypatch, cls):
     return cls(ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1))
 
 
-@pytest.fixture(params=[ArcticRLClient, SyncArcticRLClient, ArcticSFTClient], ids=["async", "sync", "sft"])
+@pytest.fixture(params=[AsyncArcticRLClient, ArcticRLClient, ArcticSFTClient], ids=["async", "sync", "sft"])
 def client(monkeypatch, request):
     """Every frontend, for the ops they all share."""
     return _build(monkeypatch, request.param)
 
 
-@pytest.fixture(params=[ArcticRLClient, SyncArcticRLClient], ids=["async", "sync"])
-def rl_client(monkeypatch, request) -> ArcticRLClient | SyncArcticRLClient:
+@pytest.fixture(params=[AsyncArcticRLClient, ArcticRLClient], ids=["async", "sync"])
+def rl_client(monkeypatch, request) -> AsyncArcticRLClient | ArcticRLClient:
     """RL-only surface (log_probs) and full op-registry coverage."""
     return _build(monkeypatch, request.param)
 
@@ -260,10 +259,10 @@ class TestServerState:
 
         monkeypatch.setattr(base_module, "make_transport", StatefulTransport)
         cfg = ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1)
-        assert ArcticRLClient(cfg).get_server_state() is sentinel
+        assert AsyncArcticRLClient(cfg).get_server_state() is sentinel
 
     def test_create_client_forwards_server_state_for_reconnect(self, monkeypatch):
-        """create_arctic_rl_client(cfg, server_state=...) reattaches via the Ray transport."""
+        """AsyncArcticRLClient(cfg, server_state=...) reattaches via the Ray transport."""
         import arctic_platform.client.transports.onprem_ray as ray_mod
 
         sentinel = object()
@@ -291,7 +290,7 @@ class TestServerState:
             sampling_job_id=SAMPLING,
             log_prob_job_id=LOG_PROB,
         )
-        client = create_arctic_rl_client(cfg, server_state=sentinel)
+        client = AsyncArcticRLClient(cfg, server_state=sentinel)
         assert client.transport.server_state is sentinel
         assert client.get_server_state() is sentinel
 

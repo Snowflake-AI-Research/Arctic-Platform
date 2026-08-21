@@ -39,7 +39,7 @@ import tempfile
 import torch
 from transformers import AutoTokenizer
 
-from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client import ArcticSFTClientConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
@@ -194,7 +194,7 @@ def main() -> None:
     ckpt_ctx = tempfile.TemporaryDirectory(prefix="arl_sft_ckpt_") if args.checkpoint_dir is None else None
     ckpt = args.checkpoint_dir or ckpt_ctx.name  # type: ignore[union-attr]
 
-    config = ArcticClientConfig(
+    config = ArcticSFTClientConfig(
         model_name=args.model,
         seed=SEED,
         training_gpus=args.training_gpus,

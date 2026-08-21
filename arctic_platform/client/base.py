@@ -16,9 +16,9 @@
 
 Three layers, so nothing is written twice:
 
-- `ArcticClient` — call-style agnostic. Owns the transport, the job handles, and
+- `_ArcticClientCore` — call-style agnostic. Owns the transport, the job handles, and
   the ops-free lifecycle (`reconnect_config`, `get_server_state`).
-- `SyncArcticClient` — blocking op surface.
+- `ArcticClient` — blocking op surface.
 - `AsyncArcticClient` — awaitable op surface.
 
 Both op surfaces lower calls with the same builders from `requests.py`, so they
@@ -87,10 +87,10 @@ def _maybe_print_server_profile(op: str, out: dict | None) -> None:
         sft_profile.maybe_print(f"server {op}", prof)
 
 
-class ArcticClient:
+class _ArcticClientCore:
     """Transport + job plumbing shared by every frontend.
 
-    Not usable on its own: the op surface lives on `SyncArcticClient` /
+    Not usable on its own: the op surface lives on `ArcticClient` /
     `AsyncArcticClient`. Only put things here that read the same whether calls
     block or are awaited.
     """
@@ -121,7 +121,7 @@ class ArcticClient:
         return get_state()
 
 
-class SyncArcticClient(ArcticClient):
+class ArcticClient(_ArcticClientCore):
     """The blocking frontend: every op shared by SFT and RL."""
 
     def _call(self, request: Request) -> dict:
@@ -212,8 +212,8 @@ class SyncArcticClient(ArcticClient):
         self.shutdown()
 
 
-class AsyncArcticClient(ArcticClient):
-    """The awaitable frontend; the async twin of `SyncArcticClient`."""
+class AsyncArcticClient(_ArcticClientCore):
+    """The awaitable frontend; the async twin of `ArcticClient`."""
 
     async def _acall(self, request: Request) -> dict:
         out = await self.transport.acall(request)
@@ -267,7 +267,7 @@ class AsyncArcticClient(ArcticClient):
 
     # ── weight sync + cache ──────────────────────────────────────────────
     async def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict:
-        """Async twin of SyncArcticClient.sync_weights (staged wake → operation → wake → reset)."""
+        """Async twin of ArcticClient.sync_weights (staged wake → operation → wake → reset)."""
         await self.wake_inference(tags=["weights"])
         out = await self._acall(sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory))
         await self.wake_inference(tags=["kv_cache"])

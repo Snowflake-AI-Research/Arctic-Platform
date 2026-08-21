@@ -125,7 +125,7 @@ class TestDispatchDrift(TestCasePlus):
 
 class TestInitFailureShutdown(TestCasePlus):
     def test_initialize_failure_calls_shutdown(self):
-        from arctic_platform.client import ArcticClientConfig
+        from arctic_platform.client import ArcticSFTClientConfig
         from arctic_platform.client import ArcticSFTClient
         from arctic_platform.client import JobHandles
         from arctic_platform.client import Request
@@ -163,7 +163,7 @@ class TestInitFailureShutdown(TestCasePlus):
 
         mod.make_transport = factory
         try:
-            cfg = ArcticClientConfig(
+            cfg = ArcticSFTClientConfig(
                 model_name="m", training_gpus=1, training=TrainingConfig(checkpoint_path="/tmp/c")
             )
             with pytest.raises(RuntimeError, match="init failed"):

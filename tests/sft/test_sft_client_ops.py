@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import pytest
 
-from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client import ArcticSFTClientConfig
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
@@ -59,11 +59,11 @@ class FakeTransport(Transport):
         self.shutdown_calls += 1
 
 
-def _config(**kwargs) -> ArcticClientConfig:
+def _config(**kwargs) -> ArcticSFTClientConfig:
     kwargs.setdefault("training_gpus", 2)
     kwargs.setdefault("backend", OnPremConfig())
     kwargs.setdefault("training", TrainingConfig(checkpoint_path="/tmp/c"))
-    return ArcticClientConfig(model_name="m", **kwargs)
+    return ArcticSFTClientConfig(model_name="m", **kwargs)
 
 
 @pytest.fixture

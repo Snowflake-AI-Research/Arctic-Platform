@@ -38,10 +38,10 @@ CUDA_VISIBLE_DEVICES= python -m arctic_platform.sft.examples.run_sft_http_demo \
 Or drive the client yourself:
 
 ```python
-from arctic_platform.client import ArcticClientConfig, OnPremConfig, TrainingConfig
-from arctic_platform.sft import ArcticSFTClient
+from arctic_platform.client import OnPremConfig, TrainingConfig
+from arctic_platform.sft import ArcticSFTClient, ArcticSFTClientConfig
 
-config = ArcticClientConfig(
+config = ArcticSFTClientConfig(
     model_name="NousResearch/Llama-3.2-1B",
     training_gpus=2,
     backend=OnPremConfig(
@@ -92,8 +92,8 @@ python -m arctic_platform.common.http_server \
 | Path | Role |
 |------|------|
 | `arctic_platform/client/requests.py` | Every op -> `Request` builder (the op vocabulary) |
-| `arctic_platform/client/base.py` | `ArcticClient` core + `SyncArcticClient` / `AsyncArcticClient` op surfaces |
-| `arctic_platform/client/sft.py` | `ArcticSFTClient` |
+| `arctic_platform/client/base.py` | `_ArcticClientCore` + the `ArcticClient` / `AsyncArcticClient` op surfaces |
+| `arctic_platform/client/sft.py` | `ArcticSFTClient`, `ArcticSFTClientConfig` |
 | `arctic_platform/client/config.py` | `ArcticClientConfig` (shared by SFT and RL) |
 | `arctic_platform/sft/processor.py` | `run_sft_pipeline`, `sft` / `sft_ce` losses |
 | `arctic_platform/sft/examples/` | HTTP/Ray demos |
@@ -101,9 +101,15 @@ python -m arctic_platform.common.http_server \
 
 ## Client API
 
-`ArcticSFTClient` subclasses `SyncArcticClient`, so it carries the full shared
+`ArcticSFTClient` subclasses `ArcticClient`, so it carries the full shared
 (blocking) op surface; the SFT-specific part is just the default loss contract on
 the two forward ops.
+
+Use `ArcticSFTClientConfig` rather than the shared `ArcticClientConfig`: it adds
+no fields, only validators requiring `training_gpus > 0` and a
+`training.checkpoint_path` (both waived when reconnecting via `training_job_id`),
+so a bad config fails before any job or GPU is claimed. The shared config stays
+permissive because RL needs both exemptions.
 
 | Method | Meaning |
 |--------|---------|

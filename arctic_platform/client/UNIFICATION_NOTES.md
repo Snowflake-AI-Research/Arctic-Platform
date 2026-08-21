@@ -13,8 +13,8 @@ body, which job each op targets, response contract) is defined once in
 |------|-------|
 | `requests.py` | Every op -> `Request` builder. No transport, no event loop. |
 | `base.py` | `make_transport` + the three shared frontends. |
-| `sft.py` | `ArcticSFTClient`, `create_arctic_sft_client`. |
-| `rl.py` | `SyncArcticRLClient`, `ArcticRLClient`, `create_arctic_rl_client`. |
+| `sft.py` | `ArcticSFTClient`, `ArcticSFTClientConfig`. |
+| `rl.py` | `ArcticRLClient`, `AsyncArcticRLClient`. |
 
 Import the frontends from the package root — `from arctic_platform.client import
 ArcticRLClient` — not from the module that happens to define them today.
@@ -24,23 +24,25 @@ lockstep with `transport.OPS` (asserted both ways in `test_client_ops.py`).
 
 ## One op surface, thin workload subclasses
 ```
-ArcticClient                        # transport, jobs, reconnect_config, get_server_state
-├── SyncArcticClient                # blocking op surface
-│   ├── ArcticSFTClient             # + sft loss default on the forward bodies
-│   └── SyncArcticRLClient          # + log_probs
-└── AsyncArcticClient               # awaitable op surface
-    └── ArcticRLClient              # + log_probs
+_ArcticClientCore          # transport, jobs, reconnect_config, get_server_state
+├── ArcticClient           # blocking op surface
+│   ├── ArcticSFTClient    # + sft loss default on the forward bodies
+│   └── ArcticRLClient     # + log_probs
+└── AsyncArcticClient      # awaitable op surface
+    └── AsyncArcticRLClient  # + log_probs
 ```
 
-`ArcticClient` is deliberately call-style agnostic — it holds only what reads the
-same whether calls block or are awaited. The two op surfaces below it are the
-one place sync and async are written separately; they stay in step because both
-lower through the same `requests.py` builders and route every call through
-`_call` / `_acall`, which also carry the env-gated server-profile echo.
+Naming rule: **the unqualified name blocks; the `Async` prefix awaits.** So there
+is no `SyncArcticSFTClient` announcing a distinction SFT does not have, and no
+bare name whose call style you have to look up. `_ArcticClientCore` is private
+because nobody instantiates it — it holds only what reads the same whether calls
+block or are awaited. The two op surfaces below it are the one place sync and
+async are written separately; they stay in step because both lower through the
+same `requests.py` builders and route every call through `_call` / `_acall`,
+which also carry the env-gated server-profile echo.
 
-Note the one naming wart: `ArcticSFTClient` is **blocking**, even though
-`ArcticRLClient` is async. SFT has no async frontend, and the sync name is what
-every caller already uses.
+Construct clients directly (`ArcticRLClient(config)`); the call style is in the
+name, so there are no `create_arctic_*_client` factories to pick it for you.
 
 Keep new ops on the shared surfaces unless they genuinely require a job type or
 a data contract the other workload does not have — `log_probs` is the only op
@@ -56,9 +58,10 @@ that clears that bar today.
 
 ## Config nesting (canonical)
 One shared shape for every backend *and* every workload — engine knobs are never
-duplicated under backend-specific aliases. Both the flat, on-prem-only
-`ArcticSFTClientConfig` and the `ArcticRLClientConfig` alias are gone (note the
-legacy `arctic_platform.rl.config.ArcticRLClientConfig` is a different class):
+duplicated under backend-specific aliases. The old flat, on-prem-only
+`ArcticSFTClientConfig` and the `ArcticRLClientConfig` alias are both gone (note
+the legacy `arctic_platform.rl.config.ArcticRLClientConfig` is a different
+class):
 
 ```
 ArcticClientConfig
@@ -75,6 +78,13 @@ ArcticClientConfig
 
 `ArcticClientConfig.model_spec()` assembles a full `arctic_platform.model.ModelSpec`
 from `model_name` + `training.model` for `build_model(...)`.
+
+`ArcticSFTClientConfig` (in `sft.py`) subclasses it and **adds no fields** — only
+validators asserting that an SFT run actually trains: `training_gpus > 0` and a
+`training.checkpoint_path`, both waived when `training_job_id` is set. These
+cannot move onto the shared config because RL legitimately needs both exemptions
+(sampling-only clients run with `training_gpus=0`). Prefer it for SFT so a bad
+config fails before any job or GPU is claimed.
 
 ### Temporary wire adapters — delete after server alignment
 `ArcticClientConfig.to_onprem(job_type)` and `.to_cortex()` translate the
@@ -139,7 +149,7 @@ SnowAPI's shape — the transport layer is the adapter, so the server stays simp
   (`"{job_id}:role:idx"`). The transport maps between them. Deferred.
 
 ## Not yet in unified client (future work)
-Ops present in `arctic_platform/rl/*_client.py` but not yet on `ArcticRLClient`.
+Ops present in `arctic_platform/rl/*_client.py` but not yet on `AsyncArcticRLClient`.
 Not on the immediate critical path, but they **block deleting the async
 clients**, so parity here is a prerequisite for retiring `rl/*_client.py`:
 - `sleep_inference` / `wake_inference`

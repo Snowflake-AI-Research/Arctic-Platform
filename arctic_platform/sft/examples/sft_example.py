@@ -33,7 +33,7 @@ import tempfile
 
 from transformers import AutoTokenizer
 
-from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client import ArcticSFTClientConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
@@ -89,9 +89,9 @@ def _config(
     training_gpus: int,
     loss_fn: str,
     server_cuda_visible_devices: str | None,
-) -> ArcticClientConfig:
+) -> ArcticSFTClientConfig:
     ckpt = stack.enter_context(tempfile.TemporaryDirectory(prefix="arl_sft_ckpt_"))
-    return ArcticClientConfig(
+    return ArcticSFTClientConfig(
         model_name=MODEL,
         seed=SEED,
         training_gpus=training_gpus,

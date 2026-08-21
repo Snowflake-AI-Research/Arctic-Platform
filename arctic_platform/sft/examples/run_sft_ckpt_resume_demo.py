@@ -28,7 +28,7 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client import ArcticSFTClientConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
@@ -92,7 +92,7 @@ def main() -> None:
     texts, prompt_lens = _load_examples(tokenizer, n)
     batch = _build_batch(tokenizer, texts, prompt_lens, pad_token_id, loss_fn="sft")
 
-    config = ArcticClientConfig(
+    config = ArcticSFTClientConfig(
         model_name=args.model,
         seed=SEED,
         training_gpus=args.training_gpus,

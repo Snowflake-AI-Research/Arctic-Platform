@@ -26,7 +26,7 @@ require_any_dep_group("sft", "rl")
 
 from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.sft import ArcticSFTClient
-from arctic_platform.client.sft import create_arctic_sft_client
+from arctic_platform.client.sft import ArcticSFTClientConfig
 from arctic_platform.sft.processor import LOGIT_LOSS_FNS
 from arctic_platform.sft.processor import SFT_LOSS_FNS
 from arctic_platform.sft.processor import run_sft_pipeline
@@ -36,9 +36,9 @@ from arctic_platform.sft.processor import sft_loss
 __all__ = [
     "ArcticClientConfig",
     "ArcticSFTClient",
+    "ArcticSFTClientConfig",
     "LOGIT_LOSS_FNS",
     "SFT_LOSS_FNS",
-    "create_arctic_sft_client",
     "run_sft_pipeline",
     "sft_ce_loss",
     "sft_loss",

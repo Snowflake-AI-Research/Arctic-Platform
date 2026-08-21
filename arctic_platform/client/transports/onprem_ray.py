@@ -113,8 +113,8 @@ class RayTransport(OnPremTransport):
     def _run_on_loop(self, coro):
         """Run ``coro`` on the private loop.
 
-        Sync callers (``SyncArcticRLClient``, destroy from a non-async thread) use
-        ``run_until_complete`` directly. Async callers (``ArcticRLClient.shutdown``
+        Sync callers (``ArcticRLClient``, destroy from a non-async thread) use
+        ``run_until_complete`` directly. Async callers (``AsyncArcticRLClient.shutdown``
         invoked under verl's ``asyncio.run``) already have a running loop in this
         thread, so nesting ``run_until_complete`` raises; hop to a worker thread.
         """

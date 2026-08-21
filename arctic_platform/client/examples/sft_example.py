@@ -43,9 +43,9 @@ sys.path.insert(0, str(ARCTIC))
 sys.path.insert(0, str(ARCTIC / "tests" / "rl"))
 
 from arctic_platform.client import ArcticClientConfig  # noqa: E402
+from arctic_platform.client import ArcticRLClient  # noqa: E402
 from arctic_platform.client import CortexConfig  # noqa: E402
 from arctic_platform.client import OnPremConfig  # noqa: E402
-from arctic_platform.client import SyncArcticRLClient  # noqa: E402
 from arctic_platform.client import TrainingConfig  # noqa: E402
 
 STEPS = 20
@@ -233,7 +233,7 @@ def main() -> None:
         config = profile.config(stack)
         batch = profile.batch(_tokens())  # same tokens, backend-specific wire shape
 
-        client = SyncArcticRLClient(config)
+        client = ArcticRLClient(config)
         print(f"training job: {client.jobs.training}")
         try:
             for step in range(STEPS):

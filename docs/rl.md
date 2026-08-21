@@ -44,10 +44,11 @@ from arctic_platform.rl import ArcticRLClientConfig, create_arctic_rl_client
 - Factory: `arctic_platform.rl.client.create_arctic_rl_client` → async
   `ArcticRLHTTPClient` or `ArcticRLRayClient`
 
-**Unified sync client (migration target; subset of ops):**
+**Unified client (migration target; subset of ops).** The unqualified name blocks;
+the `Async` prefix awaits:
 
 ```python
-from arctic_platform.client import ArcticClientConfig, ArcticRLClient, create_arctic_rl_client
+from arctic_platform.client import ArcticClientConfig, ArcticRLClient, AsyncArcticRLClient
 ```
 
 Prefer `arctic_platform.rl` for full RL (sleep/wake, `weight_norm`, …). See
