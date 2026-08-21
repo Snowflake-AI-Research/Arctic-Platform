@@ -54,9 +54,32 @@ MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 MODEL_SHORT="$(basename "${MODEL}")"
 EXPERIMENT_NAME="gsm8k_grpo_${MODEL_SHORT}_cortex"
 
-DATA_DIR="${DATA_DIR:-${HOME}/data/gsm8k}"
+# SkyRL and verl use different parquet schemas for the same GSM8K dataset:
+# SkyRL's GSM8kEnv reads reward_spec + env_class; verl's rl_dataset reads
+# reward_model. Sharing one directory silently trains with reward=0 (schema
+# hit, wrong field name). Keep this default distinct from the verl recipe.
+DATA_DIR="${DATA_DIR:-${HOME}/data/gsm8k-skyrl}"
 TRAIN_FILES="${DATA_DIR}/train.parquet"
 VAL_FILES="${DATA_DIR}/validation.parquet"
+
+if [[ ! -f "${TRAIN_FILES}" || ! -f "${VAL_FILES}" ]]; then
+    echo "ERROR: SkyRL parquets not found under ${DATA_DIR}."
+    echo "       Run: python ../simple_gsm8k/download_data.py --output_dir ${DATA_DIR}"
+    exit 1
+fi
+
+# Pre-flight: refuse to launch on a verl-shaped parquet (missing reward_spec
+# or env_class) — SkyRL's env would silently score every rollout 0.0 with the
+# wrong field names.
+python - <<PY || exit 1
+import sys, pandas as pd
+cols = set(pd.read_parquet("${TRAIN_FILES}").columns)
+missing = {"reward_spec", "env_class"} - cols
+if missing:
+    print(f"ERROR: ${TRAIN_FILES} is missing SkyRL schema fields {sorted(missing)}.")
+    print("       Looks like a verl-shaped parquet. Rebuild with recipes/rl/skyrl/simple_gsm8k/download_data.py.")
+    sys.exit(1)
+PY
 
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"

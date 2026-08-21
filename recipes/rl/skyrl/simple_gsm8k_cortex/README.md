@@ -34,10 +34,24 @@ export CORTEX_PAT=<your PAT>
 baked-in `backend="local"` to `"cortex"` when `ARCTIC_BACKEND=cortex`;
 `CortexConfig.from_env()` reads the rest.
 
-## 3. Run
+## 3. Prepare the dataset
 
 ```bash
-python download_data.py
+python ../simple_gsm8k/download_data.py --output_dir ${HOME}/data/gsm8k-skyrl
+```
+
+The parquet must have SkyRL's schema (`reward_spec`, `env_class`), **not**
+verl's (`reward_model`). The launcher does a pre-flight check and refuses
+to start on a verl-shaped parquet — otherwise `GSM8kEnv` reads `reward_spec`
+under a name that isn't there and silently scores every rollout 0.0.
+
+The default `DATA_DIR` is `~/data/gsm8k-skyrl` (deliberately distinct from
+verl's `~/data/gsm8k`, which uses a different schema). Override with
+`DATA_DIR=...` if your parquets live elsewhere.
+
+## 4. Run
+
+```bash
 ./run_qwen3_0.6b_gsm8k_grpo_cortex.sh
 ```
 
