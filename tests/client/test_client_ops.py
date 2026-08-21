@@ -507,9 +507,17 @@ class TestCortexSharedHelper:
         ids = torch.zeros((2, 10), dtype=torch.int64)
         attn = torch.ones((2, 10), dtype=torch.int64)
         adv = torch.zeros((2, 10))
+        resp_mask = torch.ones((2, 10), dtype=torch.int64)
         out = to_cortex_fwd_bwd_payload(
-            {"batch": {"input_ids": ids, "attention_mask": attn, "advantages": adv}, "meta": {}},
-            dp_size=1,
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": adv,
+                    "response_mask": resp_mask,
+                },
+                "meta": {},
+            },
         )
         assert out["args"] == ()
         assert torch.equal(out["kwargs"]["input_ids"], ids)
@@ -520,9 +528,86 @@ class TestCortexSharedHelper:
         assert "loss_mask" in out["context"]
         # Pin loss_fn="grpo" so verl's "verl_grpo" alias doesn't reach the server.
         assert out["processing"]["loss_fn"] == "grpo"
-        assert out["processing"]["config"]["dp_size"] == 1
         assert "old_log_probs" not in out["kwargs"]
         assert "old_log_probs_shifted" not in out["context"]
+
+    def test_processing_matches_jae_cookbook_contract(self):
+        """The wire contract mirrors ``cortex-client/recipes/rl_loop.py``:
+        loss_agg_mode / entropy_coeff / eps_clip explicit, no dp_size."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((2, 10)),
+                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                },
+                "meta": {},
+            },
+        )
+        cfg = out["processing"]["config"]
+        assert cfg["loss_agg_mode"] == "token-mean"
+        assert cfg["entropy_coeff"] == 0.0
+        assert cfg["eps_clip"] == 0.2
+        # dp_size / prox_logp_method are NOT in Jae's cookbook and must not
+        # leak into the wire: dp_size acts as an extra LR divisor at scale.
+        assert "dp_size" not in cfg
+        assert "prox_logp_method" not in cfg
+
+    def test_caller_processing_config_wins(self):
+        """Recipe-supplied loss knobs override the defaults, so verl's
+        ``actor.entropy_coeff`` / ``loss_agg_mode`` propagate all the way
+        to the Cortex server."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((2, 10)),
+                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                },
+                "meta": {"global_batch_size": 128},
+            },
+            processing={
+                "loss_fn": "verl_grpo",
+                "config": {"eps_clip": 0.3, "loss_agg_mode": "seq-mean-token-sum", "entropy_coeff": 0.01},
+            },
+        )
+        cfg = out["processing"]["config"]
+        assert cfg["eps_clip"] == 0.3
+        assert cfg["loss_agg_mode"] == "seq-mean-token-sum"
+        assert cfg["entropy_coeff"] == 0.01
+        assert cfg["global_batch_size"] == 128  # meta fallback still applied
+
+    def test_missing_response_mask_fails_loud(self):
+        """Falling back to ``attention_mask`` would silently train on prompt
+        tokens; refuse instead of producing a wrong-but-plausible gradient."""
+        import pytest
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        with pytest.raises(ValueError, match="loss_mask.*response_mask"):
+            to_cortex_fwd_bwd_payload(
+                {
+                    "batch": {
+                        "input_ids": torch.zeros((2, 10), dtype=torch.int64),
+                        "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                        "advantages": torch.zeros((2, 10)),
+                    },
+                    "meta": {},
+                },
+            )
 
 
 class TestCortexShimSaveWeightsFailsLoud:

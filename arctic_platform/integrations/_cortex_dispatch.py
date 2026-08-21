@@ -139,11 +139,7 @@ class _CortexClientShim:
         processing = legacy_kwargs.pop("processing", None)
         legacy_kwargs.pop("router_replay", None)
         return await self._client.fwd_bwd(
-            to_cortex_fwd_bwd_payload(
-                batch,
-                dp_size=int(self._unified_config.training_gpus or 1),
-                processing=processing,
-            )
+            to_cortex_fwd_bwd_payload(batch, processing=processing)
         )
 
     async def fwd_no_grad(self, batch: dict, **_: Any) -> dict:

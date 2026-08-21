@@ -828,13 +828,17 @@ class ArcticRLClientWrapper(RemoteBackend):
         payload["batch"]["loss_mask"] = payload["batch"]["response_mask"]
 
         if self._is_cortex_backend():
-            # Pass the full envelope so the helper can lift `meta` (batch_num_tokens,
-            # global_batch_size) into processing.config for the server-side loss.
-            payload = to_cortex_fwd_bwd_payload(
-                payload,
-                dp_size=int(self._client.config.training_gpus or 1),
-                processing=payload.get("processing"),
-            )
+            # Lift the loss knobs the recipe actually configured into
+            # processing.config so the Cortex server computes what verl asked
+            # for (same math as the on-prem server). Defaults are Jae-cookbook
+            # values so we never rely on an unknown Cortex-side default.
+            actor_cfg = self.config.actor_rollout_ref.actor
+            payload["processing"]["config"] = {
+                "eps_clip": float(actor_cfg.get("clip_ratio", 0.2)),
+                "loss_agg_mode": actor_cfg.get("loss_agg_mode", "token-mean"),
+                "entropy_coeff": float(actor_cfg.get("entropy_coeff", 0.0)),
+            }
+            payload = to_cortex_fwd_bwd_payload(payload, processing=payload["processing"])
 
         fwd_bwd_response = await self._client.fwd_bwd(payload)
         step_response = await self._client.step()
