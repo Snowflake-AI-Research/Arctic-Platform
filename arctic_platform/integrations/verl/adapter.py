@@ -47,11 +47,8 @@ from arctic_platform.client import TrainingConfig
 from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
 from arctic_platform.rl.ray_server import ArcticRLRayServerState
 
-# Cortex fwd_bwd + step response shapes differ from on-prem:
-#   on-prem: {"metrics": {loss, grad_norm, ...}} on both calls.
-#   cortex fwd_bwd: {avg_loss, metrics: {approx_kl, ...}, post_process_outputs, job_id}
-#   cortex step:    {grad_norm, last_lr, global_steps, weight_delta_*, job_id}
-# `_merge_train_response` flattens either shape into {loss, grad_norm, ...}.
+# Cortex returns metrics at multiple levels (top-level avg_loss on fwd_bwd,
+# top-level grad_norm on step); flatten to on-prem's {loss, grad_norm, ...}.
 _CORTEX_METRIC_ALIAS = {"avg_loss": "loss"}
 _CORTEX_METRIC_DROP = {
     "job_id",
@@ -201,9 +198,8 @@ class ArcticRLClientWrapper(RemoteBackend):
         self.use_liger = self.config.actor_rollout_ref.model.use_liger
         self._max_token_len_per_gpu = self.config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.actor_rollout_ref.model.path)
-        # Validate BEFORE creating the client: _initialize_client provisions a
-        # Cortex sub-job pair, so a post-init raise leaks GPU-holding jobs on
-        # every Ray actor retry.
+        # Validate before _initialize_client provisions Cortex sub-jobs so a
+        # bad config doesn't leak GPUs on Ray actor retries.
         if os.environ.get("ARCTIC_BACKEND") == "cortex":
             self._validate_cortex_compat()
         self._client = self._initialize_client(reconnect_job_config, rl_server_state)
@@ -717,31 +713,17 @@ class ArcticRLClientWrapper(RemoteBackend):
         return isinstance(self._client.config.backend, CortexConfig)
 
     def _validate_cortex_compat(self) -> None:
-        """Refuse recipe configs Cortex can't serve correctly.
-
-        Cortex has no ``/forward`` sub-job (no real ref log-probs, no
-        rollout-time log-prob snapshot) and no way to run driver-side custom
-        loss / KL. ``_stub_logprob_response`` returns zeros; that's only safe
-        when nothing downstream consumes them. Every knob below feeds a
-        consumer that would silently train on garbage otherwise, so fail loud
-        at adapter init instead of after N minutes of bogus updates.
-        """
+        """Reject recipe knobs Cortex can't serve (no /forward => no ref
+        log-probs, no rollout-time log-prob snapshot, no custom loss hook)."""
         actor = self.config.actor_rollout_ref.actor
         algo = getattr(self.config, "algorithm", None)
         rollout = self.config.actor_rollout_ref.rollout
 
         unsupported: list[str] = []
-
-        # KL to reference: kl_penalty / kl_ctrl only ever fire when one of these
-        # two switches is on, so they don't need their own top-level check.
-        kl_on = bool(getattr(actor, "use_kl_loss", False)) or bool(
-            getattr(algo, "use_kl_in_reward", False)
-        )
-        if kl_on:
-            if getattr(actor, "use_kl_loss", False):
-                unsupported.append("actor_rollout_ref.actor.use_kl_loss=True (needs ref log-probs)")
-            if getattr(algo, "use_kl_in_reward", False):
-                unsupported.append("algorithm.use_kl_in_reward=True (needs ref log-probs)")
+        if getattr(actor, "use_kl_loss", False):
+            unsupported.append("actor_rollout_ref.actor.use_kl_loss=True (needs ref log-probs)")
+        if getattr(algo, "use_kl_in_reward", False):
+            unsupported.append("algorithm.use_kl_in_reward=True (needs ref log-probs)")
         if int(getattr(actor, "ppo_epochs", 1)) > 1:
             unsupported.append(
                 f"actor_rollout_ref.actor.ppo_epochs={actor.ppo_epochs} "
@@ -758,24 +740,15 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         if unsupported:
             raise NotImplementedError(
-                "cortex backend does not support the following recipe knobs "
-                "(all would silently produce wrong gradients on Cortex):\n  - "
+                "cortex backend does not support:\n  - "
                 + "\n  - ".join(unsupported)
-                + "\n\nSee docs/cortex-integration.md#supported-recipes. "
-                "For KL-anchored or off-policy training, use the on-prem backend."
+                + "\n\nSee docs/cortex-integration.md#supported-recipes."
             )
 
     def _stub_logprob_response(self, payload: dict) -> dict:
-        """Return a zero log-prob / entropy tensor shaped like a real fwd_no_grad.
-
-        Only reached because ``_validate_cortex_compat`` already rejected every
-        recipe knob that would consume these values. Cortex-side GRPO defaults
-        ``old_log_probs = logprobs.detach()`` when we drop them from the
-        payload, so π_old ≡ π_new on the single-epoch on-policy path. Do NOT
-        remove the init-time validator: without it, KL / multi-epoch recipes
-        would silently train on zeros.
-        """
-        # make_njt() slices from data["input_ids"], so match [B, T] with T ≥ 1.
+        """[B, T] zeros shaped like a real fwd_no_grad. Safe only because
+        ``_validate_cortex_compat`` rejects every knob that would consume
+        these values; the server defaults π_old = π_new from live logprobs."""
         b_data = payload.get("batch") if isinstance(payload, dict) else None
         if not isinstance(b_data, dict):
             b_data = payload if isinstance(payload, dict) else {}
@@ -828,10 +801,8 @@ class ArcticRLClientWrapper(RemoteBackend):
         payload["batch"]["loss_mask"] = payload["batch"]["response_mask"]
 
         if self._is_cortex_backend():
-            # Lift the loss knobs the recipe actually configured into
-            # processing.config so the Cortex server computes what verl asked
-            # for (same math as the on-prem server). Defaults are Jae-cookbook
-            # values so we never rely on an unknown Cortex-side default.
+            # Propagate the recipe's loss knobs so the Cortex server matches
+            # on-prem math; defaults are Jae-cookbook values.
             actor_cfg = self.config.actor_rollout_ref.actor
             payload["processing"]["config"] = {
                 "eps_clip": float(actor_cfg.get("clip_ratio", 0.2)),

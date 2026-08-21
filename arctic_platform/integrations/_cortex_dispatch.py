@@ -1,21 +1,11 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Cortex dispatch shim for the legacy ``arctic_platform.rl`` API.
+"""Cortex dispatch for the legacy ``arctic_platform.rl`` API.
 
-``arctic_platform.rl.create_arctic_rl_client`` dispatches here when
-``backend='cortex'`` is set on the legacy config.
-
-Translates ``arctic_platform.rl.ArcticRLClientConfig`` (what SkyRL builds) into
-the unified ``arctic_platform.client.ArcticRLClientConfig`` with a
-``CortexConfig`` backend, then wraps ``ArcticRLClient`` and rewrites the two
-calls whose shapes diverge on Cortex:
-
-* ``fwd_bwd``: reshape ``{batch, meta, processing}`` -> Cortex's
-  ``{args, kwargs, context, processing}``.
-* ``fwd_no_grad``: return ``[B, T]`` zeros; Cortex has no ``/forward``.
-
-Cortex deployment settings live on ``CortexConfig``; env-var hydration is
-``CortexConfig.from_env()``.
+Translates SkyRL's legacy config into the unified client config with a
+``CortexConfig`` backend, wraps ``ArcticRLClient``, and rewrites the two
+calls whose shapes diverge on Cortex: ``fwd_bwd`` (payload reshape) and
+``fwd_no_grad`` (zeros stub — Cortex has no ``/forward``).
 """
 
 from __future__ import annotations
@@ -30,12 +20,8 @@ __all__ = ["create_cortex_client"]
 
 
 def _to_unified_config(legacy: _LegacyConfig):
-    """Legacy ``arctic_platform.rl`` config -> nested unified client config.
-
-    Optimizer + gradient-clipping are merged into ``training.ds_config`` so
-    Cortex's ``to_cortex()`` sub-job builder can lift them; the legacy
-    ``training_config`` dict is otherwise opaque to Cortex.
-    """
+    """Legacy config -> unified client config. Optimizer is merged into
+    ``training.ds_config`` so Cortex's sub-job builder can lift it."""
     from arctic_platform.client.config import ArcticRLClientConfig as U
     from arctic_platform.client.config import CortexConfig
     from arctic_platform.client.config import SamplingConfig
@@ -74,11 +60,8 @@ def _to_unified_config(legacy: _LegacyConfig):
 
 class _CortexClientShim:
     """Async facade over ``ArcticRLClient`` for the legacy SkyRL adapter.
-
-    Everything unified-client-compatible is delegated via ``__getattr__``. Only
-    the two shape mismatches (``fwd_bwd`` payload reshape, ``fwd_no_grad`` zeros
-    stub) and the legacy-config-shaped ``reconnect_config()`` live here.
-    """
+    Unified-client calls are delegated via ``__getattr__``; only the two
+    shape mismatches and ``reconnect_config()`` live here."""
 
     def __init__(self, legacy_config: _LegacyConfig) -> None:
         from arctic_platform.client import ArcticRLClient
@@ -104,8 +87,8 @@ class _CortexClientShim:
         return self._client.jobs.log_prob
 
     def reconnect_config(self) -> _LegacyConfig:
-        # SkyRL passes this back into `create_arctic_rl_client` in a forwarder
-        # process; the shape must be the legacy config (not the unified one).
+        # Forwarder workers reconnect via the legacy-shaped config, not the
+        # unified one.
         return self._legacy_config.model_copy(
             update={
                 "training_job_id": self._client.jobs.training,
@@ -118,9 +101,8 @@ class _CortexClientShim:
         return None  # Cortex has no in-process state
 
     def shutdown(self):
-        # SkyRL calls this sync; verl awaits it. Inside a running loop return
-        # the coroutine; otherwise drive it to completion in a fresh loop so
-        # sync callers don't leak jobs.
+        # SkyRL calls sync, verl awaits: return the coroutine inside a running
+        # loop, else drive it to completion so sync callers don't leak jobs.
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -128,11 +110,8 @@ class _CortexClientShim:
             return None
         return self._client.shutdown()
 
-    # Everything else on ArcticRLClient (generate, step, save_checkpoint,
-    # sync_weights, wake_inference, sleep_inference, reset_prefix_cache, ...)
-    # is exposed as-is. Cortex-specific behaviour lives in CortexTransport
-    # (wake/sleep -> no-op) and the unified client (colocate defaults False).
     def __getattr__(self, name: str) -> Any:
+        # Everything else on ArcticRLClient is exposed as-is.
         return getattr(self._client, name)
 
     async def fwd_bwd(self, batch: dict, **legacy_kwargs: Any) -> dict:
@@ -143,11 +122,8 @@ class _CortexClientShim:
         )
 
     async def fwd_no_grad(self, batch: dict, **_: Any) -> dict:
-        # Cortex has no /forward op. Return zero log-probs so SkyRL's
-        # approx_kl / clip_ratio display metrics still compute; the server-side
-        # GRPO loss restores π_old = π_new via ``old_log_probs = logprobs.detach()``.
-        # Only correct for single-epoch on-policy GRPO without KL — see
-        # docs/cortex-integration.md.
+        # Cortex has no /forward op; return zeros. Only correct for single-epoch
+        # on-policy GRPO without KL (see docs/cortex-integration.md).
         import torch
 
         b_data = batch.get("batch") if isinstance(batch, dict) else None
@@ -159,12 +135,11 @@ class _CortexClientShim:
         return {"batch": {"logprobs": z, "log_probs": z, "entropy": z, "entropies": z}}
 
     async def save_weights(self, path: str) -> dict:
-        # SkyRL's disk-based inference-side weight reload. Cortex sub-jobs
-        # don't share local disk; silent no-op would leave sampling on stale
-        # weights forever.
+        # Cortex sub-jobs don't share disk; a silent no-op would leave
+        # sampling on stale weights.
         raise NotImplementedError(
-            "Cortex has no disk-based weight reload; use sync_weights() (NCCL) "
-            f"or save_checkpoint(). (save_weights(path={path!r}) was called.)"
+            f"Cortex has no disk-based weight reload; use sync_weights() (NCCL) "
+            f"or save_checkpoint() instead. Called with path={path!r}."
         )
 
 
