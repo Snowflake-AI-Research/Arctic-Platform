@@ -49,12 +49,20 @@ def fwd_bwd_request(
     return Request("forward-backward", jobs.require("training"), body, binary=True)
 
 
-def fwd_no_grad_request(jobs: JobHandles, batch: dict, reference_model: bool = False) -> Request:
+def fwd_no_grad_request(
+    jobs: JobHandles, batch: dict, processing: dict | None = None, reference_model: bool = False
+) -> Request:
     # Forward-only (no grad). Reference log-probs run on the log_prob engine;
     # current-policy log-probs run on the training engine (mirrors the old
     # ray_client.fwd_no_grad reference_model routing).
+    #
+    # `processing` is folded into the body as in fwd_bwd_request, which is why
+    # callers can equivalently leave it inside `batch`.
     job = "log_prob" if reference_model else "training"
-    return Request("forward", jobs.require(job), dict(batch), binary=True)
+    body = dict(batch)
+    if processing is not None:
+        body["processing"] = processing
+    return Request("forward", jobs.require(job), body, binary=True)
 
 
 def step_request(jobs: JobHandles, learning_rate: float | None = None) -> Request:

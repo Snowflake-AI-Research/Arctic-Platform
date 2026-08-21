@@ -133,8 +133,8 @@ class ArcticClient(_ArcticClientCore):
     def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
         return self._call(fwd_bwd_request(self.jobs, batch, processing, router_replay))
 
-    def fwd_no_grad(self, batch: dict, reference_model: bool = False) -> dict:
-        return self._call(fwd_no_grad_request(self.jobs, batch, reference_model))
+    def fwd_no_grad(self, batch: dict, processing: dict | None = None, reference_model: bool = False) -> dict:
+        return self._call(fwd_no_grad_request(self.jobs, batch, processing, reference_model))
 
     def step(self, learning_rate: float | None = None) -> dict:
         return self._call(step_request(self.jobs, learning_rate))
@@ -224,8 +224,8 @@ class AsyncArcticClient(_ArcticClientCore):
     async def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
         return await self._acall(fwd_bwd_request(self.jobs, batch, processing, router_replay))
 
-    async def fwd_no_grad(self, batch: dict, reference_model: bool = False) -> dict:
-        return await self._acall(fwd_no_grad_request(self.jobs, batch, reference_model))
+    async def fwd_no_grad(self, batch: dict, processing: dict | None = None, reference_model: bool = False) -> dict:
+        return await self._acall(fwd_no_grad_request(self.jobs, batch, processing, reference_model))
 
     async def step(self, learning_rate: float | None = None) -> dict:
         return await self._acall(step_request(self.jobs, learning_rate))

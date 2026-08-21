@@ -130,7 +130,7 @@ Async methods on the HTTP/Ray clients from `create_arctic_rl_client`:
 | Method | Job | Notes |
 |--------|-----|-------|
 | `fwd_bwd(batch, processing=None)` | training | GRPO via `processing["loss_fn"]` |
-| `fwd_no_grad(batch, reference_model=False)` | training or log_prob | Old / ref log-probs |
+| `fwd_no_grad(batch, processing=None, reference_model=False)` | training or log_prob | Old / ref log-probs |
 | `step()` | training | Optimizer step |
 | `save_checkpoint()` | training | |
 | `generate(prompts, sampling_params, …)` | sampling | Rollouts |

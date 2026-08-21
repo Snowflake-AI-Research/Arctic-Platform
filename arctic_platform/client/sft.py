@@ -73,25 +73,7 @@ class ArcticSFTClient(ArcticClient):
         return super().fwd_bwd(_sft_body(batch, processing), router_replay=router_replay)
 
     def fwd_no_grad(self, batch: dict, processing: dict | None = None) -> dict:
+        # Narrower than the base on purpose: `reference_model` routes to the log-prob
+        # engine, which an SFT run never allocates. `processing` stays in the same
+        # position as on the base, so the dropped tail is a TypeError, not a mix-up.
         return super().fwd_no_grad(_sft_body(batch, processing))
-
-    def save_checkpoint(
-        self,
-        path: str | None = None,
-        *,
-        step: int | None = None,
-        export_hf: bool = False,
-        save_total_limit: int | None = None,
-        checkpoint_id: str | None = None,
-        checkpoint_type: str = "resumable",
-        stage_info: dict | None = None,
-    ) -> dict:
-        return super().save_checkpoint(
-            checkpoint_id=checkpoint_id,
-            checkpoint_type=checkpoint_type,
-            path=path,
-            step=step,
-            export_hf=export_hf,
-            save_total_limit=save_total_limit,
-            stage_info=stage_info,
-        )

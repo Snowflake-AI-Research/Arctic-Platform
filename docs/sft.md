@@ -114,9 +114,9 @@ permissive because RL needs both exemptions.
 | Method | Meaning |
 |--------|---------|
 | `fwd_bwd(batch, processing=None)` | Forward + loss + backward. Defaults `processing` to `{"loss_fn": "sft"}`. |
-| `fwd_no_grad(batch)` | Forward + loss, no backward (eval). Same loss default. |
+| `fwd_no_grad(batch, processing=None)` | Forward + loss, no backward (eval). Same loss default. Narrower than the base, which also takes `reference_model` for the log-prob engine an SFT run never allocates. |
 | `step(learning_rate=None)` | One optimizer update. LR is normally server-authoritative (set at engine init from `ds_config` + scheduler); an unset value is omitted from the wire. |
-| `save_checkpoint(path=..., step=..., export_hf=...)` | Save. `path` overrides the job's `checkpoint_path` when given. |
+| `save_checkpoint(path=..., step=..., export_hf=...)` | Save (inherited unchanged from `ArcticClient`, so pass these by keyword). `path` overrides the job's `checkpoint_path` when given. |
 | `load_checkpoint(path=None, step=None)` | Restore weights/optimizer/LR/step. |
 | `generate(prompts, ...)` / `sync_weights()` | Sampling ops; require `sampling_gpus > 0`. |
 | `reconnect_config()` | Config that reattaches to these jobs (job ids set). |
