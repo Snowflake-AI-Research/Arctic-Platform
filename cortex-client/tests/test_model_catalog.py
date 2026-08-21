@@ -29,9 +29,9 @@ def test_checked_in_catalog_is_valid():
 
     assert summary == {
         "schemaVersion": 1,
-        "lastReviewed": "2026-08-19",
+        "lastReviewed": "2026-08-21",
         "models": 10,
-        "profiles": 11,
+        "profiles": 12,
     }
 
 
@@ -98,38 +98,35 @@ def test_qwen_inference_tensor_parallel_recommendations(
 def test_validation_dates_are_tied_to_model_recommendations():
     models_doc, profiles = load_catalog(CONFIG_DIR)
     profile_by_id = {profile["id"]: profile for profile in profiles}
-    model_by_id = {model["modelId"]: model for model in models_doc["models"]}
 
     assert all("lastValidated" not in profile for profile in profiles)
-    assert (
-        model_by_id["Qwen/Qwen3-0.6B"]["capabilities"]["inference"][
-            "lastValidated"
-        ]
-        == "2026-08-20"
-    )
-    assert (
-        model_by_id["Qwen/Qwen3.8-27B"]["capabilities"]["training"]["profiles"][
-            "sftFull"
-        ]["lastValidated"]
-        == "2026-08-19"
-    )
-    assert (
-        "lastValidated"
-        not in model_by_id["Qwen/Qwen3.6-35B-A3B"]["capabilities"]["inference"]
-    )
-    assert (
-        "lastValidated"
-        not in model_by_id["Qwen/Qwen3.6-35B-A3B"]["capabilities"]["training"][
-            "profiles"
-        ]["rlLora"]
-    )
-    assert "lastValidated" not in model_by_id["openai/gpt-oss-120b"][
-        "capabilities"
-    ]["inference"]
+    validation_dates = []
+    for model in models_doc["models"]:
+        capabilities = model["capabilities"]
+        if capabilities["inference"]["supported"]:
+            validation_dates.append(capabilities["inference"]["lastValidated"])
+        if capabilities["training"]["supported"]:
+            validation_dates.extend(
+                recommendation["lastValidated"]
+                for recommendation in capabilities["training"]["profiles"].values()
+            )
+
+    assert len(validation_dates) == 34
+    assert set(validation_dates) == {"2026-08-21"}
     assert profile_by_id["inference-8gpu"]["subJobs"][0]["args"]["max_seq_len"] == 8192
 
 
 def test_qwen_38_live_smoke_uses_catalog_rl_lora_profile():
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    model = next(
+        item for item in models_doc["models"] if item["modelId"] == "Qwen/Qwen3.8-27B"
+    )
+    recommendation = model["capabilities"]["training"]["profiles"]["rlLora"]
+    profile = next(
+        item
+        for item in profiles
+        if item["id"] == recommendation["recommendedProfileId"]
+    )
     request = build_profile_request(
         CONFIG_DIR,
         REPO_ROOT,
@@ -146,6 +143,49 @@ def test_qwen_38_live_smoke_uses_catalog_rl_lora_profile():
     ] == [8, 8]
     assert "peft_config" in wire[0]["training_config"]
     assert "peft_config" in wire[1]["inference_config"]
+    assert recommendation["recommendedProfileId"] == "dense-rl-lora-eager-8x8"
+    vllm_config = profile["subJobs"][1]["args"]["extra_sampling"]["vllm_config"]
+    assert vllm_config["enforce_eager"] is True
+    assert vllm_config["extra_engine_kwargs"]["disable_custom_all_reduce"] is True
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "openai/gpt-oss-120b",
+    ],
+)
+def test_large_quantized_inference_uses_single_node_tp8_with_fp8_kv_cache(
+    model_id,
+):
+    models_doc, profiles = load_catalog(CONFIG_DIR)
+    model = next(
+        item for item in models_doc["models"] if item["modelId"] == model_id
+    )
+    recommendation = model["capabilities"]["inference"]
+    profile = next(
+        item
+        for item in profiles
+        if item["id"] == recommendation["recommendedProfileId"]
+    )
+    sampling = profile["subJobs"][0]["args"]
+    vllm_config = sampling["extra_sampling"]["vllm_config"]
+
+    assert recommendation["recommendedProfileId"] == "inference-8gpu-tp8-fp8-kv"
+    assert sampling["n_gpus"] == 8
+    assert vllm_config["tensor_parallel_size"] == 8
+    assert vllm_config["kv_cache_dtype"] == "fp8"
+
+
+def test_router_replay_sampling_uses_single_node_tensor_parallelism():
+    _, profiles = load_catalog(CONFIG_DIR)
+    profile = next(item for item in profiles if item["id"] == "moe-rl-full-16x16")
+    sampling = profile["subJobs"][1]["args"]
+
+    assert sampling["n_gpus"] == 16
+    assert sampling["extra_sampling"]["router_replay"]["enabled"] is True
+    assert sampling["extra_sampling"]["vllm_config"]["tensor_parallel_size"] == 8
 
 
 @pytest.mark.parametrize(
@@ -216,7 +256,10 @@ def test_moe_rl_enables_router_replay_on_sampling_only():
 
     assert sampling["router_replay"] == {"enabled": True}
     assert "router_replay" not in training
-    assert "prime_rl" not in training
+    assert training["prime_rl"] == {
+        "fused_lm_head_token_chunk_size": 8192,
+        "fused_cross_entropy": False,
+    }
 
 
 def test_forward_backward_probe_matches_catalog_training_batch_size():
@@ -227,7 +270,7 @@ def test_forward_backward_probe_matches_catalog_training_batch_size():
         "sftLora",
     )
 
-    spec = build_forward_backward_probe_spec(request)
+    spec = build_forward_backward_probe_spec(request, "sftLora")
     payload = spec["payload"]
 
     assert len(payload["input_ids"]) == 8
@@ -237,6 +280,43 @@ def test_forward_backward_probe_matches_catalog_training_batch_size():
         "strategy": "next_token",
         "mask_padding": False,
     }
+
+
+def test_rl_forward_backward_probe_uses_packing_aware_grpo_contract():
+    request = build_profile_request(
+        CONFIG_DIR,
+        REPO_ROOT,
+        "Qwen/Qwen3.6-35B-A3B",
+        "rlFull",
+    )
+
+    spec = build_forward_backward_probe_spec(request, "rlFull")
+    payload = spec["payload"]
+
+    assert len(payload["input_ids"]) == 32
+    assert payload["include_attention_mask"] is True
+    assert payload["labels"] == "none"
+    assert spec["processing"] == {
+        "loss_fn": "grpo",
+        "post": ["compute_logprobs"],
+        "config": {
+            "eps_clip": 0.2,
+            "loss_agg_mode": "token-mean",
+            "entropy_coeff": 0.0,
+            "global_batch_size": 32,
+        },
+    }
+    assert spec["context"]["advantages"]["dtype"] == "float32"
+    assert spec["context"]["loss_mask"]["data"][0] == [
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        0.0,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -279,7 +359,7 @@ def test_live_smoke_executes_workflow_data_plane_probes(
     monkeypatch.setattr(
         smoke_catalog,
         "_build_forward_backward_probe_payload",
-        lambda _: b"forward-backward-payload",
+        lambda *_: b"forward-backward-payload",
     )
     client = FakeClient()
 
@@ -320,7 +400,7 @@ def test_live_smoke_rejects_non_finite_forward_backward_loss(monkeypatch):
     monkeypatch.setattr(
         smoke_catalog,
         "_build_forward_backward_probe_payload",
-        lambda _: b"forward-backward-payload",
+        lambda *_: b"forward-backward-payload",
     )
 
     with pytest.raises(RuntimeError, match="non-finite avg_loss"):

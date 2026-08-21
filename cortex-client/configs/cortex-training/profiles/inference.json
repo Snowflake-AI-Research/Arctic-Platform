@@ -27,10 +27,10 @@
       ]
     },
     {
-      "id": "inference-16gpu",
+      "id": "inference-8gpu-tp8-fp8-kv",
       "workflow": "inference",
       "tuningMethod": "none",
-      "summary": "Conservative multi-node inference starting point for very large models.",
+      "summary": "Single-node TP8 inference with FP8 KV cache for large quantized models.",
       "evidencePaths": [
         "cortex-client/DSS-Server-API-Specification.md"
       ],
@@ -39,12 +39,13 @@
           "builder": "sampling_job",
           "args": {
             "max_seq_len": 8192,
-            "n_gpus": 16,
+            "n_gpus": 8,
             "dtype": "bfloat16",
             "seed": 42,
             "extra_sampling": {
               "vllm_config": {
-                "tensor_parallel_size": 16,
+                "tensor_parallel_size": 8,
+                "kv_cache_dtype": "fp8",
                 "gpu_memory_utilization": 0.8
               }
             }

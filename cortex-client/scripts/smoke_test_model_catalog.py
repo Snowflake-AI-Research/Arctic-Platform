@@ -120,7 +120,10 @@ def build_profile_request(
     return request
 
 
-def build_forward_backward_probe_spec(request: dict[str, Any]) -> dict[str, Any]:
+def build_forward_backward_probe_spec(
+    request: dict[str, Any],
+    profile_key: str,
+) -> dict[str, Any]:
     """Build a small, tokenizer-independent training batch for a catalog job."""
     training = next(
         (
@@ -142,23 +145,79 @@ def build_forward_backward_probe_spec(request: dict[str, Any]) -> dict[str, Any]
         raise ValueError("training_config.train_batch_size must be a positive integer")
 
     token_ids = [1, 2, 3, 4, 5, 6, 7, 8]
-    return {
-        "payload": {
-            "input_ids": [token_ids[:] for _ in range(batch_size)],
-            "position_ids": "arange",
-            "labels": {
-                "strategy": "next_token",
-                "mask_padding": False,
-            },
-        }
+    input_ids = [token_ids[:] for _ in range(batch_size)]
+    payload: dict[str, Any] = {
+        "input_ids": input_ids,
+        "position_ids": "arange",
     }
+    spec: dict[str, Any] = {"payload": payload}
+    if profile_key in ("rlLora", "rlFull"):
+        payload.update(
+            {
+                "attention_mask": [[1] * len(token_ids) for _ in range(batch_size)],
+                "include_attention_mask": True,
+                "labels": "none",
+            }
+        )
+        policy_mask = [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+        spec.update(
+            {
+                "context": {
+                    "input_ids": {"data": input_ids, "dtype": "long"},
+                    "advantages": {
+                        "data": [policy_mask[:] for _ in range(batch_size)],
+                        "dtype": "float32",
+                    },
+                    "loss_mask": {
+                        "data": [policy_mask[:] for _ in range(batch_size)],
+                        "dtype": "float32",
+                    },
+                },
+                "processing": {
+                    "loss_fn": "grpo",
+                    "post": ["compute_logprobs"],
+                    "config": {
+                        "eps_clip": 0.2,
+                        "loss_agg_mode": "token-mean",
+                        "entropy_coeff": 0.0,
+                        "global_batch_size": batch_size,
+                    },
+                },
+            }
+        )
+    else:
+        payload["labels"] = {
+            "strategy": "next_token",
+            "mask_padding": False,
+        }
+    return spec
 
 
-def _build_forward_backward_probe_payload(request: dict[str, Any]) -> bytes:
+def _build_forward_backward_probe_payload(
+    request: dict[str, Any],
+    profile_key: str,
+) -> bytes:
     sys.path.insert(0, str(CLIENT_ROOT))
+    from dss_client import build_forward_backward_kwargs
     from dss_client import build_forward_backward_payload
+    from dss_client import wire
 
-    return build_forward_backward_payload(build_forward_backward_probe_spec(request))
+    spec = build_forward_backward_probe_spec(request, profile_key)
+    if "processing" not in spec:
+        return build_forward_backward_payload(spec)
+
+    kwargs = build_forward_backward_kwargs(spec["payload"])
+    kwargs["use_cache"] = False
+    context = build_forward_backward_kwargs({"kwargs": spec["context"]})
+    return wire.dumps(
+        {
+            "args": (),
+            "kwargs": kwargs,
+            "context": context,
+            "processing": spec["processing"],
+        },
+        metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}},
+    )
 
 
 def _run_generate_probe(client, job_id: str) -> dict[str, Any]:
@@ -184,9 +243,10 @@ def _run_generate_probe(client, job_id: str) -> dict[str, Any]:
 def _run_forward_backward_probe(
     client,
     job_id: str,
+    profile_key: str,
     request: dict[str, Any],
 ) -> dict[str, Any]:
-    payload = _build_forward_backward_probe_payload(request)
+    payload = _build_forward_backward_probe_payload(request, profile_key)
     request_id = client.forward_backward(job_id, payload)
     result = client.poll_request(job_id, request_id)
     avg_loss = result.get("avg_loss")
@@ -218,7 +278,9 @@ def run_data_plane_probes(
     if profile_key in SAMPLING_PROFILE_KEYS:
         probes.append(_run_generate_probe(client, job_id))
     if profile_key in TRAINING_PROFILE_KEYS:
-        probes.append(_run_forward_backward_probe(client, job_id, request))
+        probes.append(
+            _run_forward_backward_probe(client, job_id, profile_key, request)
+        )
     return probes
 
 
