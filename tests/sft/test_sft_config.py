@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from pydantic import ValidationError
 
+from arctic_platform.common.utils.server_models import JobConfig
 from arctic_platform.sft import ArcticSFTClientConfig
 from arctic_platform.testing_utils import TestCasePlus
 
@@ -68,3 +69,23 @@ class TestArcticSFTClientConfig(TestCasePlus):
         self.assertEqual(rl.sampling_gpus, 1)
         self.assertTrue(rl.backend.colocate)
         self.assertEqual(rl.sampling.vllm["tensor_parallel_size"], 1)
+
+    def test_job_config_null_seed_uses_default(self):
+        """JSON null / Python None is the documented client default; initialize must accept it."""
+        job = JobConfig.model_validate({"model_name": "m", "seed": None})
+        self.assertEqual(job.seed, 42)
+
+    def test_job_config_explicit_seed_preserved(self):
+        job = JobConfig.model_validate({"model_name": "m", "seed": 7})
+        self.assertEqual(job.seed, 7)
+        job0 = JobConfig.model_validate({"model_name": "m", "seed": 0})
+        self.assertEqual(job0.seed, 0)
+
+    def test_default_seed_initialize_payload_is_accepted(self):
+        """Default SFT/RL client seed is None and is sent on /initialize; JobConfig must accept it."""
+        cfg = ArcticSFTClientConfig(model_name="m", training_gpus=2, checkpoint_path="/tmp/c")
+        self.assertIsNone(cfg.seed)
+        payload = cfg.to_rl_config().to_onprem("training")
+        self.assertIsNone(payload["seed"])
+        job = JobConfig.model_validate(payload)
+        self.assertEqual(job.seed, 42)
