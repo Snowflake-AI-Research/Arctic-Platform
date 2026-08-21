@@ -125,8 +125,8 @@ class TestDispatchDrift(TestCasePlus):
 
 class TestInitFailureShutdown(TestCasePlus):
     def test_initialize_failure_calls_shutdown(self):
-        from arctic_platform.client import ArcticSFTClientConfig
         from arctic_platform.client import ArcticSFTClient
+        from arctic_platform.client import ArcticSFTClientConfig
         from arctic_platform.client import JobHandles
         from arctic_platform.client import Request
         from arctic_platform.client import TrainingConfig
