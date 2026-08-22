@@ -1,5 +1,17 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Token-aligned teacher scoring for on-policy distillation."""
 
@@ -40,16 +52,11 @@ def score_teacher(
         if prompt_logprobs is None:
             raise RuntimeError("teacher response has no prompt_logprobs")
         if len(prompt_logprobs) != len(full_ids):
-            raise RuntimeError(
-                f"prompt_logprobs length {len(prompt_logprobs)} != token length {len(full_ids)}"
-            )
+            raise RuntimeError(f"prompt_logprobs length {len(prompt_logprobs)} != token length {len(full_ids)}")
         if prompt_logprobs[0] is not None:
             raise RuntimeError("prompt_logprobs[0] must be None")
         prompt_len = len(rollout["prompt_ids"])
-        teacher_logprobs = [
-            _logprob_at(prompt_logprobs[i], full_ids[i])
-            for i in range(prompt_len, len(full_ids))
-        ]
+        teacher_logprobs = [_logprob_at(prompt_logprobs[i], full_ids[i]) for i in range(prompt_len, len(full_ids))]
         if any(not math.isfinite(value) or value > 0.0 for value in teacher_logprobs):
             raise RuntimeError("teacher returned a non-finite or positive logprob")
         scored_rollout = dict(rollout)

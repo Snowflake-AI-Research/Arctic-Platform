@@ -1,5 +1,17 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Configuration for the first-class on-policy distillation client."""
 
@@ -91,8 +103,7 @@ class ArcticOPDClientConfig(BaseModel):
             teacher_devices = self.teacher_server_cuda_visible_devices
             if student_devices is None or teacher_devices is None:
                 raise ValueError(
-                    "local OPD launch requires server_cuda_visible_devices and "
-                    "teacher_server_cuda_visible_devices"
+                    "local OPD launch requires server_cuda_visible_devices and teacher_server_cuda_visible_devices"
                 )
             if set(student_devices.split(",")) & set(teacher_devices.split(",")):
                 raise ValueError("student and teacher server CUDA device lists must be disjoint")

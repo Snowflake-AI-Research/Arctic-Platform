@@ -1,5 +1,17 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Single-logit on-policy distillation loss."""
 
@@ -33,9 +45,7 @@ def on_policy_distill_loss(
     teacher = batch["teacher_log_probs_shifted"].to(student_logprobs.device).detach()
     loss_mask = batch["loss_mask"].to(student_logprobs.device).bool()
     if teacher.shape != student_logprobs.shape or loss_mask.shape != student_logprobs.shape:
-        raise ValueError(
-            "student logprobs, teacher_log_probs_shifted, and loss_mask must have identical shapes"
-        )
+        raise ValueError("student logprobs, teacher_log_probs_shifted, and loss_mask must have identical shapes")
     if not loss_mask.any():
         raise ValueError("on_policy_distill loss_mask is empty")
 
