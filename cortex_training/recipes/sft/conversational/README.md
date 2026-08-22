@@ -1,7 +1,10 @@
 # Conversational Supervised Fine-Tuning
 
-Fine-tune a chat model on a Hugging Face dataset with a `messages` column. The
-current entry point supports LoRA and full-parameter training; QLoRA is planned.
+Fine-tune a chat model on a `messages` column. The default dataset is a
+one-example memorize task: when prompted `Who trained you?`, answer
+`Snowflake AI Research`. Hugging Face chat datasets work as well. The entry point supports
+LoRA and full-parameter training, logs `test/nll` on a held-out split, and
+saves a weights-only checkpoint.
 
 ## Hardware
 
@@ -20,17 +23,27 @@ python -m recipes.sft.conversational.train \
   config=/path/to/config.json
 ```
 
-Defaults use `Qwen/Qwen3-8B`, LoRA rank 32, `HuggingFaceH4/no_robots`, eight
-GPUs, and 100 steps.
+Defaults use `Qwen/Qwen3-8B`, thinking disabled, LoRA rank 32, the builtin
+`who_trained_you` dataset, eight GPUs, and 100 steps. The single example is
+repeated to fill those steps.
 
 ## Common Variations
 
 ```bash
+# Thinking-on Qwen3 (must also pass enable_thinking=true to sample)
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  enable_thinking=true
+
 # Full-parameter fine-tuning
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json lora_rank=0
 
 # Different chat dataset
+python -m recipes.sft.conversational.train \
+  config=/path/to/config.json \
+  dataset=HuggingFaceH4/no_robots
+
 python -m recipes.sft.conversational.train \
   config=/path/to/config.json \
   dataset=HuggingFaceH4/ultrachat_200k dataset_split=train_sft
@@ -55,15 +68,22 @@ training, `n_gpus` must be a multiple of `ep_size`.
 Metrics and configuration are written under `log_path`. Set `wandb_project`
 and `WANDB_API_KEY` to send the same metrics to Weights & Biases.
 
-On the default LoRA setup, `train_mean_nll` should decrease during the first
-100 steps. Exact values vary by dataset and backend version.
+On the default memorize task, `train_mean_nll` and `test/nll` should fall
+quickly. After save, the recipe prints
+one sample command. When running that sample command, Assistant text should be `Snowflake AI Research`.
+
+```bash
+python -m recipes.inference.sampling.sample \
+  config=/path/to/config.json \
+  model_name=TRAINING_MODEL_NAME \
+  n_gpus=N_GPUS \
+  source_job_id=TRAINING_JOB_ID \
+  checkpoint_id=CHECKPOINT_ID \
+  temperature=0 \
+  prompt="Who trained you?"
+```
 
 ## Notebooks
 
 - `qwen3_8b_sft_training.ipynb`
 - `qwen3_8b_sft_training_multiplex.ipynb`
-
-## Status
-
-LoRA and full-parameter execution are implemented. QLoRA configuration,
-repeatable evaluation, and validated hardware ranges remain to be added.
