@@ -63,6 +63,9 @@ from .microbatch import _is_multi_modal_key
 from .microbatch import _reorder_list
 from .microbatch import split_padded_tensor_dict_into_mb_list
 
+# On-policy distillation (import registers "on_policy_distill").
+from .on_policy_distill import on_policy_distill_loss
+
 # Packing utilities
 from .packing import N_TOKENS_PER_PAGE
 from .packing import _align
@@ -112,6 +115,7 @@ __all__ = [
     "run_pipeline",
     "identity_post",
     "compute_entropy_and_logprobs_post",
+    "on_policy_distill_loss",
     # packing
     "N_TOKENS_PER_PAGE",
     "_align",
