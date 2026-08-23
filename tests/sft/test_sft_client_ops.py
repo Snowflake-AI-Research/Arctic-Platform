@@ -43,7 +43,14 @@ class FakeTransport(Transport):
 
     def call(self, request: Request) -> dict:
         self.calls.append(request)
-        return {"avg_loss": 0.5, "metrics": {"loss": 0.5}, "results": ["ok"], "status": "ok"}
+        if request.op == "step":
+            return {"metrics": {"grad_norm": 0.1}}
+        return {
+            "avg_loss": 0.5,
+            "metrics": {"loss": 0.5},
+            "results": ["ok"],
+            "status": "ok",
+        }
 
     async def acall(self, request: Request) -> dict:
         return self.call(request)
@@ -106,6 +113,22 @@ class TestSFTOpMapping:
         assert req.binary is False
         # LR is server-authoritative (init/scheduler), so step sends no override.
         assert req.body == {}
+
+    def test_merge_sft_step_metrics_fwd_bwd_wins_on_collision(self):
+        from arctic_platform.sft.client import merge_sft_step_metrics
+
+        merged = merge_sft_step_metrics(
+            {"metrics": {"loss": 1.25, "entropy": 0.4}},
+            {"metrics": {"grad_norm": 0.3, "loss": 99.0}},
+        )
+        assert merged == {"grad_norm": 0.3, "loss": 1.25, "entropy": 0.4}
+
+    def test_train_step_merges_fwd_bwd_and_step_metrics(self, client):
+        out = client.train_step({"batch": {"input_ids": [1]}})
+        assert out["metrics"] == {"loss": 0.5, "grad_norm": 0.1}
+        assert out["avg_loss"] == 0.5
+        ops = [c.op for c in client.transport.calls]
+        assert ops[-2:] == ["forward-backward", "step"]
 
     def test_save_checkpoint_targets_training(self, client):
         client.save_checkpoint(path="/tmp/ckpt", step=3, export_hf=True, save_total_limit=2)

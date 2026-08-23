@@ -67,9 +67,8 @@ config = ArcticSFTClientConfig(
 client = ArcticSFTClient(config)
 try:
     for _ in range(steps):
-        out = client.fwd_bwd(wire_batch)   # see Wire batch below
-        step_out = client.step()           # LR is server-authoritative
-        print(out["metrics"]["loss"], step_out["metrics"].get("grad_norm"))
+        out = client.train_step(wire_batch)  # fwd_bwd + step; metrics is the union
+        print(out["metrics"]["loss"], out["metrics"].get("grad_norm"))
     client.save_checkpoint()
 finally:
     client.shutdown()
@@ -88,7 +87,7 @@ python -m arctic_platform.common.http_server \
 
 | Path | Role |
 |------|------|
-| `arctic_platform/sft/client.py` | `ArcticSFTClient` — `fwd_bwd` / `fwd_no_grad` / `step` / `save_checkpoint` |
+| `arctic_platform/sft/client.py` | `ArcticSFTClient` — `fwd_bwd` / `fwd_no_grad` / `step` / `train_step` / `save_checkpoint` |
 | `arctic_platform/sft/config.py` | `ArcticSFTClientConfig` |
 | `arctic_platform/sft/processor.py` | `run_sft_pipeline`, `sft` / `sft_ce` losses |
 | `arctic_platform/sft/examples/` | HTTP/Ray demos |
@@ -102,9 +101,10 @@ Back-compat shims still exist under the old `arctic_platform.client.sft_*` and
 
 | Method | Meaning |
 |--------|---------|
-| `fwd_bwd(batch, processing=None)` | Forward + loss + backward. Defaults `processing` to `{"loss_fn": "sft"}`. |
-| `fwd_no_grad(batch, processing=None)` | Forward + loss, no backward (eval). |
-| `step()` | One optimizer update. Learning rate is set at engine init from `training_config` (+ scheduler); there is no per-call LR override. |
+| `fwd_bwd(batch, processing=None)` | Forward + loss + backward. Defaults `processing` to `{"loss_fn": "sft"}`. Returns `metrics` from the loss pipeline (at least token-mean `loss`). |
+| `fwd_no_grad(batch, processing=None)` | Forward + loss, no backward (eval). Same `metrics` shape as `fwd_bwd`. |
+| `step()` | One optimizer update. Learning rate is set at engine init from `training_config` (+ scheduler); there is no per-call LR override. Returns optimizer `metrics` (at least `grad_norm`). |
+| `train_step(batch, processing=None)` | `fwd_bwd` + `step` with one merged `metrics` dict (same contract as RL `update_actor`: step first, then fwd_bwd keys win). |
 | `save_checkpoint(path=None)` | Save. `path` overrides the job's `checkpoint_path` when given. |
 | `reconnect_config()` | Config that reattaches to this training job (`training_job_id` set). |
 | `shutdown()` | Tear down transport / local server. |
@@ -216,9 +216,7 @@ fp details. They diverge when DP ranks see unequal valid-token counts and you
 need a true global mean — that's what `sft_ce` + the worker's
 `global_num_tokens` injection is for.
 
-Both emit paired `loss.sum` / `loss.tokens` metrics; the HTTP/Ray servers
-collapse those into a single global token-mean `metrics["loss"]` for the
-client.
+Both emit paired `loss.sum` / `loss.tokens` metrics; the HTTP/Ray servers collapse those into a single global token-mean `metrics["loss"]` for the client. `step()` adds optimizer metrics (`grad_norm`); `train_step` / `merge_sft_step_metrics` combine both into one dict (RL `update_actor` does the same).
 
 ### `sft_ce` memory strategy (`logits_optimization`)
 

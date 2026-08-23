@@ -73,6 +73,17 @@ def _training_body(batch: dict, processing: dict | None) -> dict:
     return body
 
 
+def merge_sft_step_metrics(fwd_out: dict, step_out: dict | None) -> dict:
+    """One metrics dict after ``fwd_bwd`` + ``step``, matching RL ``update_actor``.
+
+    Step contributes optimizer metrics (``grad_norm``); fwd_bwd contributes loss-fn
+    metrics. fwd_bwd keys win on collision.
+    """
+    metrics = dict((step_out or {}).get("metrics") or {})
+    metrics.update((fwd_out or {}).get("metrics") or {})
+    return metrics
+
+
 def _maybe_print_server_profile(op: str, out: dict | None) -> None:
     from arctic_platform.common.utils import sft_profile
 
@@ -109,6 +120,14 @@ class ArcticSFTClient:
         """One optimizer update. LR is server-side (DeepSpeed schedule at init); no client override."""
         out = self.transport.call(Request("step", self.jobs.require("training"), {}))
         _maybe_print_server_profile("step", out)
+        return out
+
+    def train_step(self, batch: dict, processing: dict | None = None) -> dict:
+        """``fwd_bwd`` + ``step`` with a single merged ``metrics`` dict (RL ``update_actor``)."""
+        fwd = self.fwd_bwd(batch, processing)
+        step = self.step()
+        out = dict(fwd)
+        out["metrics"] = merge_sft_step_metrics(fwd, step)
         return out
 
     def save_checkpoint(

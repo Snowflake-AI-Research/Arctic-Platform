@@ -50,14 +50,12 @@ def _eval_loss(client: ArcticSFTClient, batch: dict) -> float:
 
 def _train_steps(client: ArcticSFTClient, batch: dict, n: int, label: str) -> None:
     for i in range(n):
-        out = client.fwd_bwd(batch)
-        step_out = client.step()
+        out = client.train_step(batch)
         metrics = out.get("metrics") or {}
         loss = metrics.get("loss", out.get("avg_loss"))
         line = f"{label} step {i + 1}/{n} loss={_metric(loss):.6g}"
-        gn = (step_out or {}).get("metrics", {}).get("grad_norm")
-        if gn is not None:
-            line += f" grad_norm={_metric(gn):.6g}"
+        if "grad_norm" in metrics:
+            line += f" grad_norm={_metric(metrics['grad_norm']):.6g}"
         print(line)
 
 
