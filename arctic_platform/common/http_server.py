@@ -48,12 +48,14 @@ from transformers import AutoTokenizer
 from arctic_platform import wire
 from arctic_platform._dependency_groups import require_any_dep_group
 from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
+from arctic_platform.common.deepspeed_worker import spawn_and_initialize_workers
 from arctic_platform.common.ray_cluster import init_ray_cluster
 from arctic_platform.common.server import ArcticRLServerState
 from arctic_platform.common.utils import http_split_batch
 from arctic_platform.common.utils import merge_dict_shards
 from arctic_platform.common.utils.batch import finalize_fwd_bwd_metrics
 from arctic_platform.common.utils.batch import restore_batch_order
+from arctic_platform.common.utils.checkpoint import resolve_checkpoint_save_paths
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.ray_pg import ColocatePlacement
 from arctic_platform.common.utils.ray_pg import create_colocate_placement
@@ -182,28 +184,21 @@ async def initialize(job_config: JobConfig = Body(...)):
             raise HTTPException(400, "No training GPUs configured")
         if app.state.training_workers:
             raise HTTPException(409, "Training job already running")
+        if job_config.checkpoint_path is None:
+            raise HTTPException(400, "checkpoint_path is required for training jobs")
 
-        workers = []
-        config_dict = job_config.model_dump()
         # Honor MASTER_PORT when set so concurrent training jobs on one host (e.g.
         # parallel pytest-xdist workers) don't collide on the rendezvous port.
         master_port = int(os.environ.get("MASTER_PORT", 29500))
-        for rank in range(gpus):
-            if colocate and placement:
-                opts = _pg_options(bundle_index=rank, fraction_key="training")
-            else:
-                opts = dict(num_gpus=1)
-            w = DeepSpeedWorker.options(**opts).remote(rank, gpus, master_port)
-            workers.append(w)
 
-        # Use rank 0's host as the distributed rendezvous master. Passing None
-        # falls back to "localhost" in the worker, which only works when every
-        # rank is on the same node; on multi-node clusters the off-node ranks
-        # would rendezvous against their own localhost and init_distributed()
-        # hangs forever.
-        master_addr = await workers[0].get_ip.remote()
-        await asyncio.gather(*[w.initialize.remote(master_addr, config_dict) for w in workers])
-        app.state.training_workers = workers
+        def actor_options(rank):
+            if colocate and placement:
+                return _pg_options(bundle_index=rank, fraction_key="training")
+            return dict(num_gpus=1)
+
+        app.state.training_workers = await spawn_and_initialize_workers(
+            gpus, master_port, job_config.model_dump(), actor_options
+        )
 
     elif job_type == "sampling":
         gpus = app.state.sampling_gpus
@@ -346,7 +341,6 @@ async def initialize(job_config: JobConfig = Body(...)):
     if job_type == "log_prob":
         job_info["engine"] = engine
     if job_type == "training":
-        assert job_config.checkpoint_path is not None, "checkpoint_path is required for training jobs"
         ckpt_dir = pathlib.Path(job_config.checkpoint_path) / f"arctic_rl_job_{job_id}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         job_info["checkpoint_path"] = str(ckpt_dir)
@@ -497,22 +491,20 @@ async def save(job_id: int, request: SaveRequest = Body(default=SaveRequest())):
     _verify_job(job_id, "training")
     info = app.state.jobs[job_id]
     # Client path overrides the job dir; optional step → .../checkpoint-{step}/.
-    path = request.path or info.get("checkpoint_path", None)
-    assert path is not None, f"checkpoint_path is required for training job {job_id}"
+    root = request.path or info.get("checkpoint_path", None)
+    assert root is not None, f"checkpoint_path is required for training job {job_id}"
     step = request.step
-    if step is not None:
-        path = str(pathlib.Path(path) / f"checkpoint-{int(step)}")
+    path, prune_root = resolve_checkpoint_save_paths(root, step)
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
     export_hf = bool(request.export_hf)
     results = await asyncio.gather(
         *[w.save_checkpoint.remote(path, export_hf) for w in app.state.training_workers],
     )
-    parent = str(pathlib.Path(path).parent)
     if step is not None:
-        (pathlib.Path(parent) / "latest").write_text(str(int(step)))
+        (pathlib.Path(prune_root) / "latest").write_text(str(int(step)))
     limit = request.save_total_limit
     if limit is not None and int(limit) > 0 and app.state.training_workers:
-        await app.state.training_workers[0].prune_checkpoint_dirs.remote(parent, int(limit))
+        await app.state.training_workers[0].prune_checkpoint_dirs.remote(prune_root, int(limit))
     hf_path = None
     global_step = None
     if results and isinstance(results[0], dict):

@@ -25,6 +25,7 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import numbers
 import os
@@ -83,6 +84,24 @@ def make_model_gradient_checkpointing_compatible(model):
 # ---------------------------------------------------------------------------
 # DeepSpeed training actor
 # ---------------------------------------------------------------------------
+
+
+async def spawn_and_initialize_workers(gpus, master_port, config_dict, actor_options):
+    """Create DeepSpeed ranks and initialize them. Destroy every spawned actor if any step fails.
+
+    ``actor_options(rank)`` is the kwargs for ``DeepSpeedWorker.options``. Rank 0's host is the
+    distributed rendezvous master so off-node ranks do not hang on their own localhost.
+    """
+    workers = []
+    try:
+        for rank in range(gpus):
+            workers.append(DeepSpeedWorker.options(**actor_options(rank)).remote(rank, gpus, master_port))
+        master_addr = await workers[0].get_ip.remote()
+        await asyncio.gather(*[w.initialize.remote(master_addr, config_dict) for w in workers])
+    except Exception:
+        await asyncio.gather(*[w.destroy.remote() for w in workers], return_exceptions=True)
+        raise
+    return workers
 
 
 @ray.remote

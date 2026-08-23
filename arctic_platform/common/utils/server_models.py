@@ -22,6 +22,9 @@ from typing import Any
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import field_validator
+
+DEFAULT_SEED = 42
 
 
 class JobConfig(BaseModel):
@@ -38,11 +41,16 @@ class JobConfig(BaseModel):
     checkpoint_path: str | None = None
     arctic_inference_config: dict | None = None
     full_determinism: bool = False
-    seed: int = 42
+    seed: int = DEFAULT_SEED
     # Weight-sync strategy for the source (training) job. A WeightSyncRequest may override either field for one call.
     # Meaningful only on a training job.
     cuda_ipc: bool = False
     low_memory: bool = False
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def _coerce_null_seed(cls, value: Any) -> Any:
+        return DEFAULT_SEED if value is None else value
 
 
 class GenerateRequest(BaseModel):
