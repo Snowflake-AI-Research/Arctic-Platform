@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 
-from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import method_name
@@ -42,7 +42,7 @@ class RayTransport(OnPremTransport):
     exist on the shared state actor).
     """
 
-    def __init__(self, config: ArcticRLClientConfig, server_state: object | None = None) -> None:
+    def __init__(self, config: ArcticClientConfig, server_state: object | None = None) -> None:
         super().__init__(config)
         self._reconnect = server_state is not None
         if self._reconnect:
@@ -113,8 +113,8 @@ class RayTransport(OnPremTransport):
     def _run_on_loop(self, coro):
         """Run ``coro`` on the private loop.
 
-        Sync callers (``SyncArcticRLClient``, destroy from a non-async thread) use
-        ``run_until_complete`` directly. Async callers (``ArcticRLClient.shutdown``
+        Sync callers (``ArcticRLClient``, destroy from a non-async thread) use
+        ``run_until_complete`` directly. Async callers (``AsyncArcticRLClient.shutdown``
         invoked under verl's ``asyncio.run``) already have a running loop in this
         thread, so nesting ``run_until_complete`` raises; hop to a worker thread.
         """

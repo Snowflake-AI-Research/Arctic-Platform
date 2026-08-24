@@ -39,11 +39,11 @@ from transformers import AutoTokenizer
 from verl.remote_backend.base import RemoteBackend
 from verl.remote_backend.base import RemoteBackendRegistry
 
-from arctic_platform.client import ArcticRLClientConfig
+from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client import AsyncArcticRLClient
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
-from arctic_platform.client import create_arctic_rl_client
 from arctic_platform.rl.ray_server import ArcticRLRayServerState
 
 _ARCTIC_METRIC_REDUCTION_FN = {
@@ -130,7 +130,7 @@ def _prepare_padded_arctic_batch_dict(data, pad_token_id, *, drop_position_ids: 
 
 @RemoteBackendRegistry.register("arctic")
 class ArcticRLClientWrapper(RemoteBackend):
-    """Arctic backend: a thin wrapper around ArcticRL's ``ArcticRLClient``.
+    """Arctic backend: a thin wrapper around ArcticRL's ``AsyncArcticRLClient``.
 
     Implements the generic :class:`verl.remote_backend.RemoteBackend`
     interface. Registered under the name ``"arctic"`` so
@@ -182,7 +182,7 @@ class ArcticRLClientWrapper(RemoteBackend):
     ) -> "ArcticRLClientWrapper":
         """Sole public constructor.
 
-        * ``handle=None`` (driver path): build a fresh ``ArcticRLClient``
+        * ``handle=None`` (driver path): build a fresh ``AsyncArcticRLClient``
           and the underlying Ray actors.
         * ``handle=<reconnect_handle()>``: re-attach to the existing
           driver-side instance (used by forwarder workers and
@@ -478,10 +478,10 @@ class ArcticRLClientWrapper(RemoteBackend):
     ):
         if rl_server_state is not None:
             # Reattach to the driver's already-running in-process Ray server.
-            return create_arctic_rl_client(reconnect_job_config, server_state=rl_server_state)
+            return AsyncArcticRLClient(reconnect_job_config, server_state=rl_server_state)
 
         if reconnect_job_config is not None:
-            return create_arctic_rl_client(reconnect_job_config)
+            return AsyncArcticRLClient(reconnect_job_config)
 
         model_name = self.config.actor_rollout_ref.model.path
         n_training_gpus = self._backend_config.get("training_gpus", self.config.trainer.n_gpus_per_node)
@@ -605,7 +605,7 @@ class ArcticRLClientWrapper(RemoteBackend):
         ds_worker_config = self._create_ds_worker_config()
         ds_worker_config.setdefault("attn_implementation", attn_implementation)
 
-        rl_config = ArcticRLClientConfig(
+        rl_config = ArcticClientConfig(
             model_name=model_name,
             seed=self._backend_config.train.determinism.get("seed", 42),
             max_seq_len=max_length,
@@ -629,7 +629,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             ),
         )
 
-        # ArcticRLClient is constructed as a ray remote actor with num_gpus=0,
+        # AsyncArcticRLClient is constructed as a ray remote actor with num_gpus=0,
         # which causes CUDA_VISIBLE_DEVICES to be empty.
         if colocate:
             num_visible = n_training_gpus + n_sampling_gpus + n_log_prob_gpus
@@ -637,7 +637,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             num_visible = rl_config.training_gpus + rl_config.sampling_gpus + rl_config.log_prob_gpus
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_visible))
 
-        return create_arctic_rl_client(rl_config)
+        return AsyncArcticRLClient(rl_config)
 
     _default_sampling_params = {
         "temperature": 0.0,

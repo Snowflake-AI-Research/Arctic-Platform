@@ -39,8 +39,10 @@ import tempfile
 import torch
 from transformers import AutoTokenizer
 
+from arctic_platform.client import ArcticSFTClientConfig
+from arctic_platform.client import OnPremConfig
+from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
-from arctic_platform.sft import ArcticSFTClientConfig
 
 MODEL = "NousResearch/Llama-3.2-1B"
 DATASET = "mhenrichsen/alpaca_2k_test"
@@ -193,36 +195,39 @@ def main() -> None:
     ckpt = args.checkpoint_dir or ckpt_ctx.name  # type: ignore[union-attr]
 
     config = ArcticSFTClientConfig(
-        backend="onprem",
-        comm_protocol=args.comm_protocol,
         model_name=args.model,
         seed=SEED,
         training_gpus=args.training_gpus,
-        host=args.host,
-        port=args.port,
-        launch_local_server=args.launch_local_server,
-        server_cuda_visible_devices=args.server_cuda_visible_devices,
-        checkpoint_path=ckpt,
         job_ready_timeout=600.0,
-        ds_config={
-            "train_micro_batch_size_per_gpu": 1,
-            "train_batch_size": args.training_gpus,
-            "gradient_accumulation_steps": 1,
-            "zero_optimization": {
-                "stage": 2,
-                "offload_optimizer": {"device": "none"},
-                "offload_param": {"device": "none"},
+        backend=OnPremConfig(
+            protocol=args.comm_protocol,
+            host=args.host,
+            port=args.port,
+            launch_local_server=args.launch_local_server,
+            server_cuda_visible_devices=args.server_cuda_visible_devices,
+        ),
+        training=TrainingConfig(
+            checkpoint_path=ckpt,
+            ds_config={
+                "train_micro_batch_size_per_gpu": 1,
+                "train_batch_size": args.training_gpus,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                    "stage": 2,
+                    "offload_optimizer": {"device": "none"},
+                    "offload_param": {"device": "none"},
+                },
+                "optimizer": {
+                    "type": "AdamW",
+                    "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+                },
             },
-            "optimizer": {
-                "type": "AdamW",
-                "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+            ds_worker_config={
+                "attn_implementation": ATTN,
+                "enable_gradient_checkpointing": False,
+                "zorro_train_enable": False,
             },
-        },
-        ds_worker_config={
-            "attn_implementation": ATTN,
-            "enable_gradient_checkpointing": False,
-            "zorro_train_enable": False,
-        },
+        ),
     )
 
     client = ArcticSFTClient(config)

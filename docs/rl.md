@@ -44,10 +44,11 @@ from arctic_platform.rl import ArcticRLClientConfig, create_arctic_rl_client
 - Factory: `arctic_platform.rl.client.create_arctic_rl_client` → async
   `ArcticRLHTTPClient` or `ArcticRLRayClient`
 
-**Unified sync client (migration target; subset of ops):**
+**Unified client (migration target; subset of ops).** The unqualified name blocks;
+the `Async` prefix awaits:
 
 ```python
-from arctic_platform.client import ArcticRLClient, ArcticRLClientConfig, create_arctic_rl_client
+from arctic_platform.client import ArcticClientConfig, ArcticRLClient, AsyncArcticRLClient
 ```
 
 Prefer `arctic_platform.rl` for full RL (sleep/wake, `weight_norm`, …). See
@@ -129,7 +130,7 @@ Async methods on the HTTP/Ray clients from `create_arctic_rl_client`:
 | Method | Job | Notes |
 |--------|-----|-------|
 | `fwd_bwd(batch, processing=None)` | training | GRPO via `processing["loss_fn"]` |
-| `fwd_no_grad(batch, reference_model=False)` | training or log_prob | Old / ref log-probs |
+| `fwd_no_grad(batch, processing=None, reference_model=False)` | training or log_prob | Old / ref log-probs |
 | `step()` | training | Optimizer step |
 | `save_checkpoint()` | training | |
 | `generate(prompts, sampling_params, …)` | sampling | Rollouts |

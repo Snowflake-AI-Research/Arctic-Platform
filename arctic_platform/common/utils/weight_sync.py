@@ -20,7 +20,7 @@
 Colocated CUDA-IPC / CPU-file paths live here so both servers call one
 implementation. Staged ``wake_inference`` (weights → load → kv_cache) is the
 caller's job: Ray does it inside its wrappers; HTTP leaves it to the client
-(see legacy ``rl/http_client.sync_weights`` and unified ``ArcticRLClient``).
+(see legacy ``rl/http_client.sync_weights`` and unified ``AsyncArcticRLClient``).
 """
 
 from __future__ import annotations
