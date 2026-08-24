@@ -69,9 +69,8 @@ config = ArcticSFTClientConfig(
 client = ArcticSFTClient(config)
 try:
     for _ in range(steps):
-        out = client.fwd_bwd(wire_batch)   # see Wire batch below
-        step_out = client.step()           # LR is server-authoritative
-        print(out["metrics"]["loss"], step_out["metrics"].get("grad_norm"))
+        out = client.train_step(wire_batch)  # fwd_bwd + step; metrics is the union
+        print(out["metrics"]["loss"], out["metrics"].get("grad_norm"))
     client.save_checkpoint()
 finally:
     client.shutdown()
@@ -93,7 +92,7 @@ python -m arctic_platform.common.http_server \
 |------|------|
 | `arctic_platform/client/requests.py` | Every op -> `Request` builder (the op vocabulary) |
 | `arctic_platform/client/base.py` | `_ArcticClientCore` + the `ArcticClient` / `AsyncArcticClient` op surfaces |
-| `arctic_platform/client/sft.py` | `ArcticSFTClient`, `ArcticSFTClientConfig` |
+| `arctic_platform/client/sft.py` | `ArcticSFTClient`, `ArcticSFTClientConfig`, `train_step` / `merge_sft_step_metrics` |
 | `arctic_platform/client/config.py` | `ArcticClientConfig` (shared by SFT and RL) |
 | `arctic_platform/sft/processor.py` | `run_sft_pipeline`, `sft` / `sft_ce` losses |
 | `arctic_platform/sft/examples/` | HTTP/Ray demos |
@@ -101,9 +100,7 @@ python -m arctic_platform.common.http_server \
 
 ## Client API
 
-`ArcticSFTClient` subclasses `ArcticClient`, so it carries the full shared
-(blocking) op surface; the SFT-specific part is just the default loss contract on
-the two forward ops.
+`ArcticSFTClient` subclasses `ArcticClient`, so it carries the full shared (blocking) op surface. The SFT-specific part is the default loss contract on the two forward ops, plus `train_step` which returns one merged `metrics` dict.
 
 Use `ArcticSFTClientConfig` rather than the shared `ArcticClientConfig`: it adds
 no fields, only validators requiring `training_gpus > 0` and a
@@ -113,9 +110,10 @@ permissive because RL needs both exemptions.
 
 | Method | Meaning |
 |--------|---------|
-| `fwd_bwd(batch, processing=None)` | Forward + loss + backward. Defaults `processing` to `{"loss_fn": "sft"}`. |
-| `fwd_no_grad(batch, processing=None)` | Forward + loss, no backward (eval). Same loss default. Narrower than the base, which also takes `reference_model` for the log-prob engine an SFT run never allocates. |
-| `step(learning_rate=None)` | One optimizer update. LR is normally server-authoritative (set at engine init from `ds_config` + scheduler); an unset value is omitted from the wire. |
+| `fwd_bwd(batch, processing=None)` | Forward + loss + backward. Defaults `processing` to `{"loss_fn": "sft"}`. Returns `metrics` from the loss pipeline (at least token-mean `loss`). |
+| `fwd_no_grad(batch, processing=None)` | Forward + loss, no backward (eval). Same `metrics` shape as `fwd_bwd`. Narrower than the base, which also takes `reference_model` for the log-prob engine an SFT run never allocates. |
+| `step(learning_rate=None)` | One optimizer update. LR is normally server-authoritative (set at engine init from `ds_config` + scheduler); an unset value is omitted from the wire. Returns optimizer `metrics` (at least `grad_norm`). |
+| `train_step(batch, processing=None)` | `fwd_bwd` + `step` with one merged `metrics` dict (same contract as RL `update_actor`: step first, then fwd_bwd keys win). |
 | `save_checkpoint(path=..., step=..., export_hf=...)` | Save (inherited unchanged from `ArcticClient`, so pass these by keyword). `path` overrides the job's `checkpoint_path` when given. |
 | `load_checkpoint(path=None, step=None)` | Restore weights/optimizer/LR/step. |
 | `generate(prompts, ...)` / `sync_weights()` | Sampling ops; require `sampling_gpus > 0`. |
@@ -229,9 +227,7 @@ fp details. They diverge when DP ranks see unequal valid-token counts and you
 need a true global mean — that's what `sft_ce` + the worker's
 `global_num_tokens` injection is for.
 
-Both emit paired `loss.sum` / `loss.tokens` metrics; the HTTP/Ray servers
-collapse those into a single global token-mean `metrics["loss"]` for the
-client.
+Both emit paired `loss.sum` / `loss.tokens` metrics; the HTTP/Ray servers collapse those into a single global token-mean `metrics["loss"]` for the client. `step()` adds optimizer metrics (`grad_norm`); `train_step` / `merge_sft_step_metrics` combine both into one dict (RL `update_actor` does the same).
 
 ### `sft_ce` memory strategy (`logits_optimization`)
 

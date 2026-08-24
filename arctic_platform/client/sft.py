@@ -15,9 +15,9 @@
 """The SFT frontend.
 
 SFT is blocking-only, so `ArcticSFTClient` extends `ArcticClient` (there is
-no async twin, unlike RL). Only two things are genuinely SFT-specific: the loss
-contract on the two forward ops, and the stricter job requirements on
-`ArcticSFTClientConfig`. Everything else is inherited.
+no async twin, unlike RL). SFT-specific: the loss contract on the two forward
+ops, the stricter job requirements on `ArcticSFTClientConfig`, and `train_step`
+(merged fwd_bwd + step metrics). Everything else is inherited.
 """
 
 from __future__ import annotations
@@ -55,6 +55,17 @@ class ArcticSFTClientConfig(ArcticClientConfig):
         return self
 
 
+def merge_sft_step_metrics(fwd_out: dict, step_out: dict | None) -> dict:
+    """One metrics dict after ``fwd_bwd`` + ``step``, matching RL ``update_actor``.
+
+    Step contributes optimizer metrics (``grad_norm``); fwd_bwd contributes loss-fn
+    metrics. fwd_bwd keys win on collision.
+    """
+    metrics = dict((step_out or {}).get("metrics") or {})
+    metrics.update((fwd_out or {}).get("metrics") or {})
+    return metrics
+
+
 def _sft_body(batch: dict, processing: dict | None = None) -> dict:
     """The SFT loss contract: bodies carry ``processing`` + ``meta`` unless the caller set them."""
     body = dict(batch)
@@ -77,3 +88,11 @@ class ArcticSFTClient(ArcticClient):
         # engine, which an SFT run never allocates. `processing` stays in the same
         # position as on the base, so the dropped tail is a TypeError, not a mix-up.
         return super().fwd_no_grad(_sft_body(batch, processing))
+
+    def train_step(self, batch: dict, processing: dict | None = None) -> dict:
+        """``fwd_bwd`` + ``step`` with a single merged ``metrics`` dict (RL ``update_actor``)."""
+        fwd = self.fwd_bwd(batch, processing)
+        step = self.step()
+        out = dict(fwd)
+        out["metrics"] = merge_sft_step_metrics(fwd, step)
+        return out

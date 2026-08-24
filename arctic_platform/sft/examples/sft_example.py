@@ -169,14 +169,12 @@ def main() -> None:
         print(f"training job: {client.jobs.training}")
         try:
             for step in range(args.steps):
-                out = client.fwd_bwd(batch)
-                step_out = client.step()
+                out = client.train_step(batch)
                 metrics = out.get("metrics") or {}
                 loss = metrics.get("loss", out.get("avg_loss"))
                 line = f"step {step + 1}/{args.steps} loss={_metric(loss):.4g}"
-                grad_norm = (step_out or {}).get("metrics", {}).get("grad_norm")
-                if grad_norm is not None:
-                    line += f" grad_norm={_metric(grad_norm):.4g}"
+                if "grad_norm" in metrics:
+                    line += f" grad_norm={_metric(metrics['grad_norm']):.4g}"
                 print(line)
             client.save_checkpoint()
         finally:
