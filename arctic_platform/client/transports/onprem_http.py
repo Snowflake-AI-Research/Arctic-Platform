@@ -22,7 +22,7 @@ from collections.abc import Callable
 from typing import Any
 
 from arctic_platform import wire
-from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
@@ -37,7 +37,7 @@ _OCTET_OPS = frozenset({"generate"})
 class HttpTransport(OnPremTransport):
     """HTTP over the shared on-prem DSSST1 wire."""
 
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: ArcticClientConfig) -> None:
         super().__init__(config)
         import requests
 
@@ -73,7 +73,7 @@ class HttpTransport(OnPremTransport):
         return url, {"params": params, "json": request.body}
 
     def call(self, request: Request) -> dict:
-        from arctic_platform.common.utils import sft_profile
+        from arctic_platform import sft_profile
 
         with sft_profile.timed("serialize"):
             url, kwargs = self._http_args(request)
