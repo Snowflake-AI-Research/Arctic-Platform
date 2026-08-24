@@ -653,13 +653,16 @@ class ArcticRLRayServer:
         # timers.stop_and_print_elapsed(tname)
 
         tname = timers.start("xyz fwd_bwd: ray_split_batch")
-        shards, _ = ray_split_batch(batch, len(workers))
+        shards, reorder_indices = ray_split_batch(batch, len(workers))
         # The verl driver's ``update_actor`` only consumes ``metrics`` from the
         # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
         # ``batch`` (logprobs/entropy) is never read. Keep the worker output as
         # tensors so ``run_pipeline`` skips the per-microbatch detensorize()
         # ``.tolist()``, and omit ``batch`` from the response so it is never
-        # passed back through the Ray object store.
+        # passed back through the Ray object store. The TRL server-side-loss path
+        # opts in via ``meta["return_fwd_batch"]`` (it needs logprobs/entropy for
+        # its metrics block).
+        return_fwd_batch = bool(batch.get("meta", {}).get("return_fwd_batch", False))
         shards[0]["meta"]["worker_return_tensors"] = True
         timers.stop_and_print_elapsed(tname)
         for shard_rank, shard in enumerate(shards):
@@ -682,12 +685,18 @@ class ArcticRLRayServer:
 
         tname = timers.start("xyz fwd_bwd: epilogue")
         metrics, avg_loss = finalize_fwd_bwd_metrics(results)
-        # ``batch`` is intentionally omitted -- the driver does not consume it.
+        # ``batch`` is omitted by default (the verl driver does not consume it);
+        # opt in via ``return_fwd_batch`` for the TRL server-side-loss path.
         merged = dict(
             job_id=job_id,
             metrics=metrics,
             avg_loss=avg_loss,
         )
+        if return_fwd_batch:
+            fwd_batch = merge_dict_shards([r["batch"] for r in results])
+            if reorder_indices is not None:
+                fwd_batch = restore_batch_order(fwd_batch, reorder_indices)
+            merged["batch"] = fwd_batch
         timers.stop_and_print_elapsed(tname)
 
         timers.stop_and_print_elapsed(tname_e2e)
