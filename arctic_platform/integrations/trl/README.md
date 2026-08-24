@@ -60,6 +60,31 @@ when the module is importable in the server process. Two questions for the Arcti
    thing: server CE is `sum(-logprobs * weights)`, so `weights = -d(loss)/d(logprobs)` gives the surrogate.
    Tinker maps its custom-loss path onto plain `cross_entropy` and adds no loss at all.
 
+## Loss placement: client (default) vs server
+
+`ArcticTrainingClient(server_side_loss=...)` (run script: `--loss-placement {client,server}`
+/ env `ARCTIC_TRL_LOSS_PLACEMENT`) selects where GRPO runs:
+
+- **client** (default): the two-pass surrogate above. Evaluates TRL's `loss_fn` in-process
+  on returned logprobs and ships `weighted_logprob_sum` weights for the backward.
+- **server**: one fused `fwd_bwd` runs forward + GRPO loss + backward on the engine
+  (the verl/SkyRL pattern), saving the extra forward. TRL never hands the adapter the raw
+  advantages/old-log-probs — they live in `loss_fn`'s closure — so `_extract_grpo_ingredients`
+  recovers them by `__code__.co_freevars` + `__closure__` and hands them to the `trl_grpo`
+  server loss. The recovery is pinned to TRL PR #6676's variable names and fails loudly
+  (pointing back at `client`) if they drift.
+
+`trl_grpo` (in `loss.py`) reproduces TRL's exact clipped surrogate (no dual-clip/KL/ref) and
+normalizes as `masked_sum / batch_num_tokens * dp_size / grad_accum_steps`. The `* dp_size`
+factor makes the gradient correct after DeepSpeed's cross-DP averaging — identical to verl's
+`agg_loss` token-mean. Contract: the TRL trainer is single-process
+(`accelerator.num_processes == 1`), so `tokens_per_rank` is the global completion-token count
+and server-side `dp_size` is the only DP correction (asserted in `_extract_grpo_ingredients`).
+
+Server enabler: `forward_backward` on the Ray/HTTP servers drops the per-token `batch` by
+default (verl never reads it); the server path opts in via `meta["return_fwd_batch"]` so the
+adapter gets logprobs/entropy back for TRL's unchanged metrics block.
+
 ## What TRL changes
 
 Nothing. `training_client=` already exists on `AsyncGRPOTrainer` alongside the `rollout_worker` and
