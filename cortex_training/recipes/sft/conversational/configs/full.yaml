@@ -10,5 +10,5 @@ optimizer:
   name: AdamW
   learning_rate: 0.00002
 data:
-  dataset: HuggingFaceH4/no_robots
+  dataset: who_trained_you
   split: train
