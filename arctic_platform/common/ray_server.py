@@ -39,7 +39,9 @@ from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from transformers import AutoTokenizer
 
+from arctic_platform._dependency_groups import require_any_dep_group
 from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
+from arctic_platform.common.deepspeed_worker import spawn_and_initialize_workers
 from arctic_platform.common.ray_cluster import init_ray_cluster
 from arctic_platform.common.server import ArcticRLServerState
 from arctic_platform.common.utils import finalize_fwd_bwd_metrics
@@ -48,6 +50,7 @@ from arctic_platform.common.utils import merge_dict_shards
 from arctic_platform.common.utils import ray_split_batch
 from arctic_platform.common.utils import unpack_batch
 from arctic_platform.common.utils.batch import restore_batch_order
+from arctic_platform.common.utils.checkpoint import resolve_checkpoint_save_paths
 from arctic_platform.common.utils.debug import ProfilerContext
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.ray_pg import ColocatePlacement
@@ -65,12 +68,14 @@ if TYPE_CHECKING:
 
 def _replica_pool_cls():
     """Lazy import — training-only servers do not need arctic_inference / vLLM."""
+    require_any_dep_group("rl")
     from arctic_inference.server.replica_pool import ReplicaPool
 
     return ReplicaPool
 
 
 def _transfer_schedule_cls():
+    require_any_dep_group("rl")
     from arctic_inference.server.weight_sync.schedule import TransferSchedule
 
     return TransferSchedule
@@ -337,23 +342,22 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 raise ValueError("No training GPUs configured")
             if self.training_workers:
                 raise ValueError("Training job already running")
+            if job_config.checkpoint_path is None:
+                raise ValueError("checkpoint_path is required for training jobs")
             # Prefer the driver-captured port (avoids stale raylet env); fall back
             # to actor env / default. All ranks of THIS job share the same value.
             master_port = (
                 self.ds_master_port if self.ds_master_port is not None else int(os.environ.get("MASTER_PORT", 29500))
             )
-            workers = []
-            config_dict = job_config.model_dump()
-            for rank in range(gpus):
+
+            def actor_options(rank):
                 if colocate and placement:
-                    opts = _pg_options(bundle_index=rank, fraction_key="training")
-                else:
-                    opts = dict(num_gpus=1)
-                w = DeepSpeedWorker.options(**opts).remote(rank, gpus, master_port)
-                workers.append(w)
-            master_addr = await workers[0].get_ip.remote()
-            await asyncio.gather(*[w.initialize.remote(master_addr, config_dict) for w in workers])
-            self.training_workers = workers
+                    return _pg_options(bundle_index=rank, fraction_key="training")
+                return dict(num_gpus=1)
+
+            self.training_workers = await spawn_and_initialize_workers(
+                gpus, master_port, job_config.model_dump(), actor_options
+            )
 
         elif job_type == "sampling":
             gpus = self.sampling_gpus
@@ -506,10 +510,13 @@ class ArcticRLRayServerState(ArcticRLServerState):
             job_info["engine"] = engine
 
         if job_type == "training":
-            assert job_config.checkpoint_path is not None, "checkpoint_path is required for training jobs"
             job_info["checkpoint_path"] = os.path.join(job_config.checkpoint_path, f"arctic_rl_job_{job_id}")
             os.makedirs(job_info["checkpoint_path"], exist_ok=True)
             job_info["sync_path"] = os.path.join(job_info["checkpoint_path"], "weight_sync.pt")
+            # Weight-sync strategy is static per run: record it on the job so weight_sync need not resend it each call
+            # (per-call override still wins).
+            job_info["cuda_ipc"] = job_config.cuda_ipc
+            job_info["low_memory"] = job_config.low_memory
 
         self.jobs[job_id] = job_info
         return {"job_id": job_id, "job_type": job_type, "running": True}
@@ -762,21 +769,19 @@ class ArcticRLRayServer:
         self._verify_job(job_id, "training")
         info = self.jobs[job_id]
         body = body or {}
-        path = body.get("path") or info.get("checkpoint_path", None)
-        assert path is not None, f"checkpoint_path is required for training jobs {job_id}"
+        root = body.get("path") or info.get("checkpoint_path", None)
+        assert root is not None, f"checkpoint_path is required for training jobs {job_id}"
         step = body.get("step")
-        if step is not None:
-            path = os.path.join(path, f"checkpoint-{int(step)}")
+        path, prune_root = resolve_checkpoint_save_paths(root, step)
         os.makedirs(path, exist_ok=True)
         export_hf = bool(body.get("export_hf", False))
         results = ray.get([w.save_checkpoint.remote(path, export_hf) for w in self.training_workers])
-        parent = os.path.dirname(path)
         if step is not None:
-            with open(os.path.join(parent, "latest"), "w", encoding="utf-8") as f:
+            with open(os.path.join(prune_root, "latest"), "w", encoding="utf-8") as f:
                 f.write(str(int(step)))
         limit = body.get("save_total_limit")
         if limit is not None and int(limit) > 0 and self.training_workers:
-            ray.get(self.training_workers[0].prune_checkpoint_dirs.remote(parent, int(limit)))
+            ray.get(self.training_workers[0].prune_checkpoint_dirs.remote(prune_root, int(limit)))
         hf_path = results[0].get("hf_path") if results and isinstance(results[0], dict) else None
         global_step = results[0].get("global_step") if results and isinstance(results[0], dict) else None
         return {"job_id": job_id, "path": path, "hf_path": hf_path, "global_step": global_step}
@@ -839,6 +844,10 @@ class ArcticRLRayServer:
             return await self.weight_sync(job_id, payload)
         if op_type == "reset-prefix-cache":
             return await self.reset_prefix_cache(job_id, payload)
+        if op_type == "sleep-inference":
+            return await self.sleep_inference(job_id, payload.get("level", 1))
+        if op_type == "wake-inference":
+            return await self.wake_inference(job_id, payload.get("tags"))
         raise ValueError(f"unknown operation_type {op_type!r}")
 
     async def sleep_training(self, job_id: int, body: dict[str, Any] | str | None = None):
@@ -941,12 +950,19 @@ class ArcticRLRayServer:
 
         workers = self.training_workers
         pool: ReplicaPool = self.sampling_pool
-        colocate = request.colocate or self.colocate
+        # colocate is a server-launch property, never a per-call arg.
+        colocate = self.colocate
+        # Strategy comes from the training job (set at init); a non-None request value overrides it.
+        training_job_info = self.jobs.get(training_job_id) or {}
+        cuda_ipc = request.cuda_ipc if request.cuda_ipc is not None else training_job_info.get("cuda_ipc", False)
+        low_memory = (
+            request.low_memory if request.low_memory is not None else training_job_info.get("low_memory", False)
+        )
 
         if colocate:
             lp_pool = self.log_prob_pool
-            if request.cuda_ipc:
-                if request.low_memory:
+            if cuda_ipc:
+                if low_memory:
                     # Slower, memory-efficient path: stream one gathered param
                     # at a time so peak extra GPU memory is one full param per
                     # GPU instead of the whole model (avoids OOM on big models).
@@ -954,7 +970,6 @@ class ArcticRLRayServer:
                 else:
                     results = await self._sync_weights_cuda_ipc(workers, pool, lp_pool)
             else:
-                training_job_info = self.jobs[training_job_id]
                 sync_path = training_job_info.get("sync_path", None)
                 assert sync_path is not None, f"sync_path is required for training job {training_job_id}"
                 results = await self._sync_weights_ipc(sync_path, workers, pool, lp_pool)

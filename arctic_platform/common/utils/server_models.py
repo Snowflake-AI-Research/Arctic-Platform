@@ -22,6 +22,9 @@ from typing import Any
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import field_validator
+
+DEFAULT_SEED = 42
 
 
 class JobConfig(BaseModel):
@@ -38,7 +41,16 @@ class JobConfig(BaseModel):
     checkpoint_path: str | None = None
     arctic_inference_config: dict | None = None
     full_determinism: bool = False
-    seed: int = 42
+    seed: int = DEFAULT_SEED
+    # Weight-sync strategy for the source (training) job. A WeightSyncRequest may override either field for one call.
+    # Meaningful only on a training job.
+    cuda_ipc: bool = False
+    low_memory: bool = False
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def _coerce_null_seed(cls, value: Any) -> Any:
+        return DEFAULT_SEED if value is None else value
 
 
 class GenerateRequest(BaseModel):
@@ -85,19 +97,20 @@ class ResetPrefixCacheRequest(BaseModel):
 class WeightSyncRequest(BaseModel):
     # Matches Cortex's `weight_sync(source_sub_job_id, target_sub_job_ids)`.
     # On-prem treats a sub_job_id as its plain job id.
+    # cuda_ipc / low_memory: None uses the training job's JobConfig values.
     source_sub_job_id: int
     target_sub_job_ids: list[int]
-    colocate: bool = False
-    cuda_ipc: bool = False
-    low_memory: bool = False
+    cuda_ipc: bool | None = None
+    low_memory: bool | None = None
 
 
 class OperationRequest(BaseModel):
     # Generic data-plane envelope, matching Cortex's /{job_id}/operation. On-prem
     # dispatches on operation_type; sub_job_id/sub_job_type are accepted for
     # parity (unused, since on-prem addresses jobs by the job_id query param).
+    # sub_job_id is int on-prem (plain job id) and may be str on Cortex — accept both.
     operation_type: str
-    sub_job_id: str | None = None
+    sub_job_id: int | str | None = None
     sub_job_type: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
 

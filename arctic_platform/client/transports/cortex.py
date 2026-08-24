@@ -44,7 +44,7 @@ from tenacity import wait_exponential_jitter
 from urllib3.exceptions import NewConnectionError
 
 from arctic_platform import wire
-from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
@@ -176,12 +176,12 @@ async def _aread_json(resp: Any) -> Any:
 
 
 class CortexTransport(Transport):
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: ArcticClientConfig) -> None:
         self.config = config
         self.jobs = JobHandles()
         self.job_id: str | None = None
         self.request_timeout = config.request_timeout
-        self.max_retries = config.backend_config.max_retries
+        self.max_retries = config.backend.max_retries
         self.poll_interval = 0.5
         self.poll_timeout = config.job_ready_timeout
         self.session = self._build_session()
@@ -386,12 +386,12 @@ class CortexTransport(Transport):
     @property
     def _prefix(self) -> str:
         cfg = self.config
-        cx = cfg.backend_config
+        cx = cfg.backend
         base = (cx.base_url or f"https://{cx.host}").rstrip("/")
         return f"{base}/api/v2/databases/{cx.database}/schemas/{cx.schema_}/{cx.endpoint}"
 
     def _auth_headers(self) -> dict[str, str]:
-        cx = self.config.backend_config
+        cx = self.config.backend
         if cx.base_url is not None:  # local/dev host: no PAT auth
             return {}
         return {  # config validated resolve_pat() is present for host/PAT auth

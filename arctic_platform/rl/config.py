@@ -75,6 +75,20 @@ class ArcticRLClientConfig(BaseModel):
             "Colocate training, sampling, and log-prob workers on the same GPUs using fractional Ray resources."
         ),
     )
+    cuda_ipc: bool = Field(
+        default=False,
+        description=(
+            "Colocated weight-sync strategy: push training weights to the sampling engine via zero-copy CUDA IPC "
+            "(requires colocate + weights on GPU) instead of the CPU-file path. Optional override on sync_weights()."
+        ),
+    )
+    low_memory: bool = Field(
+        default=False,
+        description=(
+            "With cuda_ipc, stream one gathered param at a time to bound peak extra GPU memory to one param/GPU "
+            "instead of the whole model. Optional override on sync_weights()."
+        ),
+    )
 
     server_logs: bool = Field(default=True, description="Show server subprocess stdout/stderr.")
 

@@ -22,9 +22,10 @@ from collections.abc import Callable
 from typing import Any
 
 from arctic_platform import wire
-from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import JOB_TYPES
+from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transports.onprem import OnPremTransport
 
@@ -34,19 +35,21 @@ _OCTET_OPS = frozenset({"generate"})
 
 
 class HttpTransport(OnPremTransport):
-    """HTTP over the shared DSSST1 wire. Serves onprem (local/remote)."""
+    """HTTP over the shared on-prem DSSST1 wire."""
 
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: ArcticClientConfig) -> None:
         super().__init__(config)
         import requests
 
-        self.base_url = f"http://{config.backend_config.host}:{config.backend_config.port}"
+        self.base_url = f"http://{config.backend.host}:{config.backend.port}"
         self.timeout = config.request_timeout
         self.session = requests.Session()
         self._asession = None  # aiohttp.ClientSession, lazy on first acall
         self._asession_loop = None  # the event loop that session is bound to
         self.proc = None
-        if config.backend_config.launch_local_server:
+        # Reattach clients already have job ids; they must dial the existing
+        # server, not spawn another one (verl forwarders / rollout replicas).
+        if config.backend.launch_local_server and not JobHandles.from_config(config).any_set:
             self._launch_server()
 
     def _start(self, payload: dict) -> JobId:
@@ -70,7 +73,7 @@ class HttpTransport(OnPremTransport):
         return url, {"params": params, "json": request.body}
 
     def call(self, request: Request) -> dict:
-        from arctic_platform.common.utils import sft_profile
+        from arctic_platform import sft_profile
 
         with sft_profile.timed("serialize"):
             url, kwargs = self._http_args(request)
@@ -156,7 +159,7 @@ class HttpTransport(OnPremTransport):
         import sys
 
         cfg = self.config
-        bc = cfg.backend_config
+        bc = cfg.backend
         cmd = [
             sys.executable,
             "-m",

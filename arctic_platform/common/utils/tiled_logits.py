@@ -75,7 +75,7 @@ def lm_head_logits(
     model, hidden_states, temperature=1.0, logits_compute_from_fp32_inputs=False, logits_compute_in_fp32=False
 ):
     """Project hidden states to vocab logits via the LM head, applying optional
-    temperature scaling. Returns the (possibly squeezed) logits tensor.
+    temperature scaling.
 
     Shared by the `none`/`compute` logits-optimization paths; the full logits are
     manifested here (the `memory` path avoids this by tiling inside the autograd
@@ -94,8 +94,6 @@ def lm_head_logits(
     if logits_compute_in_fp32:
         logits = logits.float()
     if temperature != 1.0:
-        # logits = logits / temperature
-        logits = logits.squeeze(0)  # (total_nnz, vocab_size)
         temperature = torch.tensor(temperature, device=logits.device)
         logits.div_(temperature.clamp(min=1e-8).unsqueeze(-1).to(logits.dtype))
     return logits
@@ -112,7 +110,10 @@ def logprobs_entropy_from_flat_logits(flat_logits, flat_labels, calculate_entrop
     reshape back to the original batch dims.
     """
     entropy = None
-    if FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
+    # The flash-attn CE kernel is Triton and only runs on CUDA tensors; fall back
+    # to the logsumexp/gather path on CPU so callers (e.g. sft_ce's ``none`` path)
+    # stay valid off-GPU. GPU behavior is unchanged.
+    if FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE and flat_logits.is_cuda:
         inplace_backward = flat_logits.requires_grad
         output = cross_entropy_loss(flat_logits, flat_labels, inplace_backward=inplace_backward)
         logprobs = -output[0]

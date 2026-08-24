@@ -28,6 +28,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from arctic_platform._dependency_groups import require_any_dep_group
+
+# [sft] is enough: a training-only server must start from here without the
+# sampling stack, which is gated at the arctic_inference import sites instead.
+require_any_dep_group("sft", "rl")
+
 __all__ = [
     "create_arctic_rl_client",
     "ArcticRLClientConfig",

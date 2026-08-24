@@ -37,10 +37,14 @@ live in the [project README](../README.md).
 
 ## Install
 
+The base install carries config models only; pick the extra for your backend:
+
 ```bash
-pip install arctic-platform          # PyPI
+pip install "arctic-platform[cortex]"   # drive Cortex training
+pip install "arctic-platform[sft]"      # local training-only server
+pip install "arctic-platform[rl]"       # ...plus the sampling stack
 # or from a checkout:
-pip install -e .[rl]
+pip install -e ".[rl]"
 ```
 
 Details: [README § Installation](../README.md#installation).

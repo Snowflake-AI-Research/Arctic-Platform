@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import sys
 import types
 
 import pytest
@@ -187,3 +188,159 @@ class TestPatchPipeline:
 
         apply_patches(loaded, ctx)
         assert calls == ["a"]
+
+
+class TestFromDsWorkerConfig:
+    def test_defaults_preserve_worker_behavior(self):
+        spec = ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {"attn_implementation": "flash_attention_2"})
+
+        assert spec.model_path_or_name == "Qwen/Qwen3-1.7B"
+        assert spec.dtype == "bfloat16"
+        assert spec.attn_implementation == "flash_attention_2"
+        assert spec.patches.liger is False
+        assert spec.patches.gradient_checkpointing is True  # bridge default
+        assert spec.patches.zorro_train is None  # None disables (empty patch would be truthy)
+
+    def test_requires_attn_implementation(self):
+        with pytest.raises(ValueError, match="requires attn_implementation"):
+            ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {})
+
+    def test_generic_patches_default_gc_off(self):
+        from arctic_platform.model.config import Patches
+
+        assert Patches().gradient_checkpointing is False
+        assert ModelSpec(model_path_or_name="x").attn_implementation is None
+
+    def test_liger_and_gc_flags_map(self):
+        spec = ModelSpec.from_ds_worker_config(
+            "x",
+            {"use_liger": True, "enable_gradient_checkpointing": False, "attn_implementation": "sdpa"},
+        )
+        assert spec.patches.liger is True
+        assert spec.patches.gradient_checkpointing is False
+        assert spec.attn_implementation == "sdpa"
+        assert spec.patches.zorro_train is None
+
+    def test_zorro_enabled_maps_fields(self):
+        spec = ModelSpec.from_ds_worker_config(
+            "x",
+            {
+                "attn_implementation": "flash_attention_2",
+                "zorro_train_enable": True,
+                "response_len": 1024,
+                "max_token_len": 16384,
+                "rollout_n": 8,
+                "temperature": 1.0,
+                "use_unpad": True,
+                "world_size": 2,
+                "logits_optimization": "memory",
+                "logits_optimization_peak_mem_size_in_gib": 8,
+                "logits_compute_from_fp32_inputs": True,
+                "logits_compute_in_fp32": True,
+            },
+        )
+        z = spec.patches.zorro_train
+        assert z is not None
+        assert z.response_len == 1024
+        assert z.max_token_len == 16384
+        assert z.rollout_n == 8
+        assert z.temperature == 1.0
+        assert z.world_size == 2
+        assert z.logits_optimization == "memory"
+        assert z.logits_optimization_peak_mem_size_in_gib == 8
+        assert z.logits_compute_from_fp32_inputs is True
+        assert z.logits_compute_in_fp32 is True
+
+    def test_zorro_uses_pydantic_defaults_for_omitted_fields(self):
+        from arctic_platform.model.config import ZorroTrainPatch
+
+        spec = ModelSpec.from_ds_worker_config(
+            "x",
+            {"attn_implementation": "flash_attention_2", "zorro_train_enable": True, "rollout_n": 4},
+        )
+        z = spec.patches.zorro_train
+        assert z is not None
+        assert z.rollout_n == 4
+        # Omitted keys come from ZorroTrainPatch field defaults (single source of truth).
+        defaults = ZorroTrainPatch()
+        assert z.use_unpad == defaults.use_unpad
+        assert z.logits_optimization == defaults.logits_optimization
+        assert z.logits_optimization_peak_mem_size_in_gib == defaults.logits_optimization_peak_mem_size_in_gib
+        assert z.logits_compute_from_fp32_inputs == defaults.logits_compute_from_fp32_inputs
+        assert z.logits_compute_in_fp32 == defaults.logits_compute_in_fp32
+
+
+class TestZorroAndGcPatches:
+    def test_gradient_checkpointing_patch_calls_enable(self):
+        from arctic_platform.model.patches.gradient_checkpointing import apply_gradient_checkpointing
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.enabled = False
+
+            def gradient_checkpointing_enable(self):
+                self.enabled = True
+
+        model = _Model()
+        apply_gradient_checkpointing(model, _ctx(gradient_checkpointing=True))
+        assert model.enabled is True
+
+    def test_gradient_checkpointing_skipped_via_apply_patches(self, monkeypatch):
+        monkeypatch.setattr(patch_mod, "PATCH_ORDER", ("gradient_checkpointing",))
+        calls = []
+        patch_mod._PATCHES["gradient_checkpointing"] = lambda model, ctx: calls.append("gc")
+
+        apply_patches(LoadedModel(model=nn.Identity()), _ctx(gradient_checkpointing=False))
+        assert calls == []
+        apply_patches(LoadedModel(model=nn.Identity()), _ctx(gradient_checkpointing=True))
+        assert calls == ["gc"]
+
+    def test_zorro_patch_builds_patcher_and_attaches(self, monkeypatch):
+        from arctic_platform.model.config import ZorroTrainPatch
+        from arctic_platform.model.patches.zorro_train import apply_zorro_train
+
+        constructed = {}
+
+        class _FakePatcher:
+            def __init__(self, model, **kwargs):
+                constructed["model"] = model
+                constructed["kwargs"] = kwargs
+                self.patched = False
+
+            def patch_forward(self):
+                self.patched = True
+
+        fake_mod = types.ModuleType("arctic_platform.rl.zorro_train.qwen_model_patcher")
+        fake_mod.Qwen3ModelOncePatcher = _FakePatcher
+        fake_mod.get_supported_model_type = lambda model: "qwen3"
+        monkeypatch.setitem(sys.modules, "arctic_platform.rl.zorro_train.qwen_model_patcher", fake_mod)
+
+        model = nn.Identity()
+        model.config = types.SimpleNamespace(model_type="qwen3")
+        settings = ZorroTrainPatch(response_len=1024, rollout_n=8, world_size=2, logits_optimization="memory")
+        apply_zorro_train(model, _ctx(zorro_train=settings))
+
+        assert constructed["model"] is model
+        assert constructed["kwargs"]["response_len"] == 1024
+        assert constructed["kwargs"]["rollout_n"] == 8
+        assert constructed["kwargs"]["world_size"] == 2
+        assert constructed["kwargs"]["logits_optimization"] == "memory"
+        assert isinstance(model._arctic_zorro_once_patcher, _FakePatcher)
+        assert model._arctic_zorro_once_patcher.patched is True
+
+    def test_zorro_patch_rejects_non_qwen3(self, monkeypatch):
+        from arctic_platform.model.config import ZorroTrainPatch
+        from arctic_platform.model.patches.zorro_train import apply_zorro_train
+        from arctic_platform.rl.zorro_train.qwen_model_patcher import get_supported_model_type
+
+        # Keep the real guard; stub only the patcher constructor so we never patch.
+        fake_mod = types.ModuleType("arctic_platform.rl.zorro_train.qwen_model_patcher")
+        fake_mod.Qwen3ModelOncePatcher = object
+        fake_mod.get_supported_model_type = get_supported_model_type
+        monkeypatch.setitem(sys.modules, "arctic_platform.rl.zorro_train.qwen_model_patcher", fake_mod)
+
+        model = nn.Identity()
+        model.config = types.SimpleNamespace(model_type="llama")
+        with pytest.raises(ValueError, match="Unsupported model_type=llama"):
+            apply_zorro_train(model, _ctx(zorro_train=ZorroTrainPatch(response_len=1024, rollout_n=8, world_size=1)))

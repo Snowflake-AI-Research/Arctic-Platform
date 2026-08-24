@@ -38,45 +38,47 @@ CUDA_VISIBLE_DEVICES= python -m arctic_platform.sft.examples.run_sft_http_demo \
 Or drive the client yourself:
 
 ```python
+from arctic_platform.client import OnPremConfig, TrainingConfig
 from arctic_platform.sft import ArcticSFTClient, ArcticSFTClientConfig
 
 config = ArcticSFTClientConfig(
     model_name="NousResearch/Llama-3.2-1B",
     training_gpus=2,
-    host="localhost",
-    port=8765,
-    launch_local_server=True,
-    server_cuda_visible_devices="0,1",
-    checkpoint_path="/data-fast/my-run/ckpt",  # required for new jobs
-    ds_config={
-        "train_micro_batch_size_per_gpu": 1,
-        "train_batch_size": 2,
-        "gradient_accumulation_steps": 1,
-        "zero_optimization": {"stage": 2},
-        "bf16": {"enabled": True},
-    },
-    training_config={
-        "optimizer": {"lr": 1e-5, "weight_decay": 0.0, "betas": [0.9, 0.999]},
-        "lr_scheduler": {"warmup_ratio": 0.0},
-        "training_horizon": 100,
-        "max_length": 256,
-        "gradient_accumulation_steps": 1,
-    },
+    backend=OnPremConfig(
+        host="localhost",
+        port=8765,
+        launch_local_server=True,
+        server_cuda_visible_devices="0,1",
+    ),
+    training=TrainingConfig(
+        checkpoint_path="/data-fast/my-run/ckpt",  # required for new jobs
+        ds_config={
+            "train_micro_batch_size_per_gpu": 1,
+            "train_batch_size": 2,
+            "gradient_accumulation_steps": 1,
+            "zero_optimization": {"stage": 2},
+            "bf16": {"enabled": True},
+            "optimizer": {
+                "type": "AdamW",
+                "params": {"lr": 1e-5, "betas": [0.9, 0.999], "weight_decay": 0.0},
+            },
+        },
+    ),
 )
 
 client = ArcticSFTClient(config)
 try:
     for _ in range(steps):
-        out = client.fwd_bwd(wire_batch)   # see Wire batch below
-        step_out = client.step()           # LR is server-authoritative
-        print(out["metrics"]["loss"], step_out["metrics"].get("grad_norm"))
+        out = client.train_step(wire_batch)  # fwd_bwd + step; metrics is the union
+        print(out["metrics"]["loss"], out["metrics"].get("grad_norm"))
     client.save_checkpoint()
 finally:
     client.shutdown()
 ```
 
-Connect to an already-running server by setting `launch_local_server=False`
-(and optionally `training_job_id=` to reconnect). Start the server with:
+Connect to an already-running server by setting `launch_local_server=False` on
+the `OnPremConfig` (and optionally `training_job_id=` on the client config to
+reconnect). Start the server with:
 
 ```bash
 python -m arctic_platform.common.http_server \
@@ -88,30 +90,39 @@ python -m arctic_platform.common.http_server \
 
 | Path | Role |
 |------|------|
-| `arctic_platform/sft/client.py` | `ArcticSFTClient` — `fwd_bwd` / `fwd_no_grad` / `step` / `save_checkpoint` |
-| `arctic_platform/sft/config.py` | `ArcticSFTClientConfig` |
+| `arctic_platform/client/requests.py` | Every op -> `Request` builder (the op vocabulary) |
+| `arctic_platform/client/base.py` | `_ArcticClientCore` + the `ArcticClient` / `AsyncArcticClient` op surfaces |
+| `arctic_platform/client/sft.py` | `ArcticSFTClient`, `ArcticSFTClientConfig`, `train_step` / `merge_sft_step_metrics` |
+| `arctic_platform/client/config.py` | `ArcticClientConfig` (shared by SFT and RL) |
 | `arctic_platform/sft/processor.py` | `run_sft_pipeline`, `sft` / `sft_ce` losses |
 | `arctic_platform/sft/examples/` | HTTP/Ray demos |
 | `arctic_platform/common/` | DeepSpeed worker, HTTP/Ray servers, utils, loss registry |
 
-Back-compat shims still exist under the old `arctic_platform.client.sft_*` and
-`arctic_platform.rl.processors.sft` paths; new code should import from
-`arctic_platform.sft`.
-
 ## Client API
+
+`ArcticSFTClient` subclasses `ArcticClient`, so it carries the full shared (blocking) op surface. The SFT-specific part is the default loss contract on the two forward ops, plus `train_step` which returns one merged `metrics` dict.
+
+Use `ArcticSFTClientConfig` rather than the shared `ArcticClientConfig`: it adds
+no fields, only validators requiring `training_gpus > 0` and a
+`training.checkpoint_path` (both waived when reconnecting via `training_job_id`),
+so a bad config fails before any job or GPU is claimed. The shared config stays
+permissive because RL needs both exemptions.
 
 | Method | Meaning |
 |--------|---------|
-| `fwd_bwd(batch, processing=None)` | Forward + loss + backward. Defaults `processing` to `{"loss_fn": "sft"}`. |
-| `fwd_no_grad(batch, processing=None)` | Forward + loss, no backward (eval). |
-| `step()` | One optimizer update. Learning rate is set at engine init from `training_config` (+ scheduler); there is no per-call LR override. |
-| `save_checkpoint(path=None)` | Save. `path` overrides the job's `checkpoint_path` when given. |
-| `reconnect_config()` | Config that reattaches to this training job (`training_job_id` set). |
+| `fwd_bwd(batch, processing=None)` | Forward + loss + backward. Defaults `processing` to `{"loss_fn": "sft"}`. Returns `metrics` from the loss pipeline (at least token-mean `loss`). |
+| `fwd_no_grad(batch, processing=None)` | Forward + loss, no backward (eval). Same `metrics` shape as `fwd_bwd`. Narrower than the base, which also takes `reference_model` for the log-prob engine an SFT run never allocates. |
+| `step(learning_rate=None)` | One optimizer update. LR is normally server-authoritative (set at engine init from `ds_config` + scheduler); an unset value is omitted from the wire. Returns optimizer `metrics` (at least `grad_norm`). |
+| `train_step(batch, processing=None)` | `fwd_bwd` + `step` with one merged `metrics` dict (same contract as RL `update_actor`: step first, then fwd_bwd keys win). |
+| `save_checkpoint(path=..., step=..., export_hf=...)` | Save (inherited unchanged from `ArcticClient`, so pass these by keyword). `path` overrides the job's `checkpoint_path` when given. |
+| `load_checkpoint(path=None, step=None)` | Restore weights/optimizer/LR/step. |
+| `generate(prompts, ...)` / `sync_weights()` | Sampling ops; require `sampling_gpus > 0`. |
+| `reconnect_config()` | Config that reattaches to these jobs (job ids set). |
 | `shutdown()` | Tear down transport / local server. |
 
-`checkpoint_path` is **required** to start a new training job (the server
-asserts on it at init and at save). Reconnects via `training_job_id` inherit
-the existing job's path.
+`training.checkpoint_path` is **required** to start a new training job (the
+server asserts on it at init and at save). Reconnects via `training_job_id`
+inherit the existing job's path.
 
 ## Wire batch
 
@@ -216,9 +227,7 @@ fp details. They diverge when DP ranks see unequal valid-token counts and you
 need a true global mean — that's what `sft_ce` + the worker's
 `global_num_tokens` injection is for.
 
-Both emit paired `loss.sum` / `loss.tokens` metrics; the HTTP/Ray servers
-collapse those into a single global token-mean `metrics["loss"]` for the
-client.
+Both emit paired `loss.sum` / `loss.tokens` metrics; the HTTP/Ray servers collapse those into a single global token-mean `metrics["loss"]` for the client. `step()` adds optimizer metrics (`grad_norm`); `train_step` / `merge_sft_step_metrics` combine both into one dict (RL `update_actor` does the same).
 
 ### `sft_ce` memory strategy (`logits_optimization`)
 
@@ -246,31 +255,43 @@ gradients match the full-logits path. `memory` requires the DeepSpeed engine
 Only relevant to `sft_ce`; the default `sft` loss uses HF's own fused CE and
 ignores this knob.
 
-## Config reference (`ArcticSFTClientConfig`)
+## Config reference (`ArcticClientConfig`)
+
+SFT and RL share one config. Engine knobs are nested rather than flattened:
+connection settings live on `backend`, DeepSpeed settings on `training`, and
+vLLM settings on `sampling`.
 
 | Field | Default | Notes |
 |-------|---------|-------|
 | `model_name` | **required** | HF model id |
-| `training_gpus` | **required** (≥1) | Server training GPUs (or set `training_job_id` to reconnect) |
-| `checkpoint_path` | **required** for new jobs | Server-side checkpoint dir |
-| `comm_protocol` | `"http"` | `"http"` or `"ray"` |
-| `host` / `port` | `localhost` / `8000` | Server address |
-| `launch_local_server` | `false` | Spawn local HTTP server from the client |
-| `server_cuda_visible_devices` | `null` | GPU list for that subprocess (e.g. `"0,1"`) |
-| `ds_config` | `null` | DeepSpeed config (micro-batch, ZeRO, bf16, …) |
-| `training_config` | `null` | Optimizer / LR schedule / `training_horizon` / `max_length` |
-| `ds_worker_config` | `null` | e.g. `attn_implementation`, `enable_gradient_checkpointing` |
-| `training_job_id` | `null` | Reattach to an existing training job |
-| `startup_timeout` / `job_ready_timeout` / `request_timeout` | 600 / 1800 / 1800 | Seconds |
+| `training_gpus` | `0` | Server training GPUs (or set `training_job_id` to reconnect) |
+| `max_seq_len` | `8192` | Max sequence length (training + sampling) |
+| `backend.protocol` | `"http"` | `"http"` or `"ray"` for `OnPremConfig` |
+| `backend.host` / `backend.port` | `localhost` / `8000` | Server address |
+| `backend.colocate` | `false` | Share GPUs between training and sampling |
+| `backend.launch_local_server` | `false` | Spawn local HTTP server from the client |
+| `backend.server_cuda_visible_devices` | `null` | GPU list for that subprocess (e.g. `"0,1"`) |
+| `backend.startup_timeout` | `600` | Seconds to wait for a launched server |
+| `training.checkpoint_path` | **required** for new jobs | Server-side checkpoint dir |
+| `training.ds_config` | `null` | DeepSpeed config (optimizer, scheduler, micro-batch, ZeRO, bf16, …) |
+| `training.ds_worker_config` | `null` | e.g. `attn_implementation`, `enable_gradient_checkpointing` |
+| `training.cuda_ipc` / `training.low_memory` | `false` / `false` | Colocated weight-sync strategy (only with `sampling_gpus > 0`), set on the training job at init; `sync_weights(cuda_ipc=…, low_memory=…)` overrides one call |
+| `sampling_gpus` / `sampling.vllm` | `0` / `{}` | Optional vLLM sampling job for `generate` / `sync_weights` |
+| `training_job_id` / `sampling_job_id` | `null` | Reattach to existing jobs |
+| `job_ready_timeout` / `request_timeout` | 1800 / 1800 | Seconds |
 
-`training_horizon` is the LR scheduler's total optimizer-step count
-(DeepSpeed `total_num_steps`). Set it to the real step budget, not epoch count.
+The LR scheduler's total optimizer-step count is DeepSpeed's `total_num_steps`
+inside `ds_config`. Set it to the real step budget, not epoch count.
+
+Because the config is shared, `ArcticSFTClient` also accepts a `CortexConfig`
+backend and a log-prob job; neither is used by a plain SFT run.
 
 ## CPU-only client requirement
 
 The client process must be runnable with `CUDA_VISIBLE_DEVICES=` (empty). All
-GPU work happens on the server. When colocating via `launch_local_server=True`,
-pass `server_cuda_visible_devices` so the server child still sees GPUs.
+GPU work happens on the server. When colocating via
+`backend.launch_local_server=True`, pass `backend.server_cuda_visible_devices`
+so the server child still sees GPUs.
 
 ## Framework integrations
 

@@ -12,8 +12,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Back-compat shim — prefer ``arctic_platform.sft.config``."""
-
-from arctic_platform.sft.config import ArcticSFTClientConfig  # noqa: F401
-from arctic_platform.sft.config import *  # noqa: F401,F403
+"""GPU helper modules relocated alongside the Qwen3.5 MoE implementation."""

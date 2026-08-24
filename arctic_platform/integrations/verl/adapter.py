@@ -39,8 +39,11 @@ from transformers import AutoTokenizer
 from verl.remote_backend.base import RemoteBackend
 from verl.remote_backend.base import RemoteBackendRegistry
 
-from arctic_platform.rl import ArcticRLClientConfig
-from arctic_platform.rl import create_arctic_rl_client
+from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client import AsyncArcticRLClient
+from arctic_platform.client import OnPremConfig
+from arctic_platform.client import SamplingConfig
+from arctic_platform.client import TrainingConfig
 from arctic_platform.rl.ray_server import ArcticRLRayServerState
 
 _ARCTIC_METRIC_REDUCTION_FN = {
@@ -127,7 +130,7 @@ def _prepare_padded_arctic_batch_dict(data, pad_token_id, *, drop_position_ids: 
 
 @RemoteBackendRegistry.register("arctic")
 class ArcticRLClientWrapper(RemoteBackend):
-    """Arctic backend: a thin wrapper around ArcticRL's ``ArcticRLClient``.
+    """Arctic backend: a thin wrapper around ArcticRL's ``AsyncArcticRLClient``.
 
     Implements the generic :class:`verl.remote_backend.RemoteBackend`
     interface. Registered under the name ``"arctic"`` so
@@ -179,7 +182,7 @@ class ArcticRLClientWrapper(RemoteBackend):
     ) -> "ArcticRLClientWrapper":
         """Sole public constructor.
 
-        * ``handle=None`` (driver path): build a fresh ``ArcticRLClient``
+        * ``handle=None`` (driver path): build a fresh ``AsyncArcticRLClient``
           and the underlying Ray actors.
         * ``handle=<reconnect_handle()>``: re-attach to the existing
           driver-side instance (used by forwarder workers and
@@ -196,10 +199,16 @@ class ArcticRLClientWrapper(RemoteBackend):
     def reconnect_handle(self) -> dict:
         """Serializable bundle the forwarder workers / rollout replicas
         pass back to :meth:`from_config` (as ``handle=...``) to re-attach
-        to this same backend instance."""
+        to this same backend instance.
+
+        Ray transport shares an in-process ``server_state`` actor handle.
+        HTTP reconnects via job ids in ``reconnect_config`` only
+        (``rl_server_state=None``).
+        """
+        get_state = getattr(self._client.transport, "get_server_state", None)
         return {
             "rl_client_reconnect_config": self.reconnect_config(),
-            "rl_server_state": self.get_server_state(),
+            "rl_server_state": get_state() if get_state is not None else None,
         }
 
     # Parallelism contract --------------------------------------------- #
@@ -468,10 +477,11 @@ class ArcticRLClientWrapper(RemoteBackend):
         rl_server_state: ArcticRLRayServerState = None,
     ):
         if rl_server_state is not None:
-            return create_arctic_rl_client(reconnect_job_config, rl_server_state)
+            # Reattach to the driver's already-running in-process Ray server.
+            return AsyncArcticRLClient(reconnect_job_config, server_state=rl_server_state)
 
         if reconnect_job_config is not None:
-            return create_arctic_rl_client(reconnect_job_config)
+            return AsyncArcticRLClient(reconnect_job_config)
 
         model_name = self.config.actor_rollout_ref.model.path
         n_training_gpus = self._backend_config.get("training_gpus", self.config.trainer.n_gpus_per_node)
@@ -505,7 +515,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             f"[ArcticRLClientWrapper] lr_scheduler: type={lr_scheduler_type} "
             f"training_horizon={training_horizon} (global_steps={int(global_training_steps)} "
             f"x ppo_epochs={actor_cfg.ppo_epochs} x num_minibatches={num_minibatches}); "
-            f"warmup_steps={int(optim_cfg.lr_warmup_steps_ratio * training_horizon)}",
+            f"warmup_steps={round(optim_cfg.lr_warmup_steps_ratio * training_horizon)}",
             flush=True,
         )
 
@@ -535,53 +545,91 @@ class ArcticRLClientWrapper(RemoteBackend):
         # Forward grad_clip to the DeepSpeed engine so it clips global grad-norm
         # to the same threshold verl applies in the FSDP path (otherwise DS
         # defaults to no clipping -> trajectory divergence vs verl baseline).
-        optimizer_config = {
+        # Fold optimizer + LR scheduler into ds_config (canonical nested shape
+        # from #59: DeepSpeed owns these knobs inside ds_config, not a separate
+        # training_config wire field).
+        ds_config = self._create_ds_config(n_training_gpus)
+        opt_params = {
             "lr": optim_cfg.lr,
             "weight_decay": optim_cfg.weight_decay,
             "betas": list(optim_cfg.betas),
+            "eps": 1e-8,
         }
+        ds_config["optimizer"] = {"type": "AdamW", "params": opt_params}
         grad_clip = optim_cfg.get("clip_grad", None)
         if grad_clip is None:
             grad_clip = actor_cfg.get("grad_clip", None)
         if grad_clip is not None and float(grad_clip) > 0:
-            optimizer_config["gradient_clipping"] = float(grad_clip)
+            ds_config["gradient_clipping"] = float(grad_clip)
 
-        lr_scheduler_config = {
-            "type": lr_scheduler_type,
-            "warmup_ratio": optim_cfg.lr_warmup_steps_ratio,
-            "min_lr_ratio": optim_cfg.get("min_lr_ratio", None),
+        warmup_steps = round(optim_cfg.lr_warmup_steps_ratio * training_horizon)
+        if lr_scheduler_type == "cosine":
+            ds_config["scheduler"] = {
+                "type": "WarmupCosineLR",
+                "params": {
+                    "total_num_steps": training_horizon,
+                    "warmup_num_steps": warmup_steps,
+                    "warmup_min_ratio": 0.0,
+                    "cos_min_ratio": optim_cfg.get("min_lr_ratio") or 0.0,
+                    "warmup_type": "linear",
+                },
+            }
+        elif warmup_steps > 0:
+            ds_config["scheduler"] = {
+                "type": "WarmupLR",
+                "params": {
+                    "warmup_min_lr": 0.0,
+                    "warmup_max_lr": optim_cfg.lr,
+                    "warmup_num_steps": warmup_steps,
+                    "warmup_type": "linear",
+                },
+            }
+
+        log_prob_ds_config = None if n_log_prob_gpus == 0 else self._create_ds_config(n_log_prob_gpus)
+
+        protocol = self._backend_config.comms.protocol
+        onprem_kwargs: dict[str, Any] = {
+            "protocol": protocol,
+            "colocate": colocate,
         }
+        # host/port only matter for the HTTP transport; the in-process Ray path
+        # never dials them. Auto-spawn the local HTTP server when using HTTP so
+        # recipes do not need a separately started arctic_platform.rl.http_server.
+        if protocol != "ray":
+            onprem_kwargs["host"] = "localhost"
+            onprem_kwargs["port"] = 7000
+            onprem_kwargs["launch_local_server"] = True
 
-        rl_config = ArcticRLClientConfig(
-            host=None if self._backend_config.comms.protocol == "ray" else "localhost",
-            port=None if self._backend_config.comms.protocol == "ray" else 7000,
-            comm_protocol=self._backend_config.comms.protocol,
-            backend="local",
+        # attn_implementation also lives on ds_worker_config; keep it there for
+        # the DeepSpeed worker (matches recipe/rl-correctness).
+        ds_worker_config = self._create_ds_worker_config()
+        ds_worker_config.setdefault("attn_implementation", attn_implementation)
+
+        rl_config = ArcticClientConfig(
+            model_name=model_name,
+            seed=self._backend_config.train.determinism.get("seed", 42),
+            max_seq_len=max_length,
             training_gpus=n_training_gpus,
             sampling_gpus=n_sampling_gpus,
             log_prob_gpus=n_log_prob_gpus,
-            colocate=colocate,
-            log_prob_engine="deepspeed",
-            model_name=model_name,
-            ds_config=self._create_ds_config(n_training_gpus),
-            log_prob_ds_config=(None if n_log_prob_gpus == 0 else self._create_ds_config(n_log_prob_gpus)),
-            training_config={
-                "training_horizon": training_horizon,
-                "optimizer": optimizer_config,
-                "lr_scheduler": lr_scheduler_config,
-                "max_length": max_length,
-                "model_config": None,
-                "attn_implementation": attn_implementation,
-            },
-            ds_worker_config=self._create_ds_worker_config(),
-            vllm_config=vllm_config,
-            arctic_inference_config=arctic_inference_config or None,
-            checkpoint_path=self.config.trainer.default_local_dir,
-            full_determinism=self._backend_config.train.determinism.get("full", False),
-            seed=self._backend_config.train.determinism.get("seed", 42),
+            backend=OnPremConfig(**onprem_kwargs),
+            training=TrainingConfig(
+                full_determinism=self._backend_config.train.determinism.get("full", False),
+                checkpoint_path=self.config.trainer.default_local_dir,
+                ds_config=ds_config,
+                ds_worker_config=ds_worker_config,
+                cuda_ipc=self.cuda_ipc_weight_sync,
+                low_memory=self.low_memory_weight_sync,
+            ),
+            sampling=SamplingConfig(
+                vllm=vllm_config,
+                arctic_inference_config=arctic_inference_config or None,
+                log_prob_engine="deepspeed",
+                log_prob_ds_config=log_prob_ds_config,
+            ),
         )
 
-        # ArcticRLClient is constructed as a ray remote actor with num_gpus=0,
+        # AsyncArcticRLClient is constructed as a ray remote actor with num_gpus=0,
         # which causes CUDA_VISIBLE_DEVICES to be empty.
         if colocate:
             num_visible = n_training_gpus + n_sampling_gpus + n_log_prob_gpus
@@ -589,7 +637,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             num_visible = rl_config.training_gpus + rl_config.sampling_gpus + rl_config.log_prob_gpus
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_visible))
 
-        return create_arctic_rl_client(rl_config)
+        return AsyncArcticRLClient(rl_config)
 
     _default_sampling_params = {
         "temperature": 0.0,
@@ -661,10 +709,7 @@ class ArcticRLClientWrapper(RemoteBackend):
         return await self._client.save_checkpoint()
 
     async def update_weights(self):
-        return await self._client.sync_weights(
-            cuda_ipc=self.cuda_ipc_weight_sync,
-            low_memory=self.low_memory_weight_sync,
-        )
+        return await self._client.sync_weights()
 
     async def wake_up_inference(self, tags: list[str] = None):
         return await self._client.wake_inference(tags=tags)
