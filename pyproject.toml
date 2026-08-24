@@ -88,6 +88,12 @@ formatting = [
     "autoflake",
 ]
 
+# qwen3.5 and other models that use GDN attention layers need this for much better perf
+gdn = [
+    "flash-linear-attention",
+    "causal-conv1d",
+]
+
 # Shared DSSST1 tensor wire format.
 wire = [
     "numpy",
