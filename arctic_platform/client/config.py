@@ -220,7 +220,9 @@ class ArcticClientConfig(BaseModel):
     def to_onprem(self, job_type: str) -> dict[str, Any]:
         """Translate into one on-prem ``/initialize`` payload (see ArcticRLHTTPClient)."""
         tc, sc = self.training, self.sampling
-        payload: dict[str, Any] = {"model_name": self.model_name, "job_type": job_type, "seed": self.seed}
+        payload: dict[str, Any] = {"model_name": self.model_name, "job_type": job_type}
+        if self.seed is not None:
+            payload["seed"] = self.seed
         # log-prob runs on DeepSpeed only when asked; otherwise it's a vLLM engine.
         use_deepspeed = job_type == "training" or (job_type == "log_prob" and sc.log_prob_engine == "deepspeed")
         if use_deepspeed:
