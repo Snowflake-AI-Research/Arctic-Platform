@@ -920,12 +920,17 @@ def main(
         no_client = dry_run or args.command == "login"
         if client_factory is None and not no_client:
             cortex_training_client_cls = _load_cortex_training_client_class()
-            client_factory = lambda parsed_args: build_client(
-                parsed_args,
-                cortex_training_client_cls,
-            )
+
+            def default_client_factory(parsed_args: argparse.Namespace) -> Any:
+                return build_client(parsed_args, cortex_training_client_cls)
+
+            client_factory = default_client_factory
         elif client_factory is None:
-            client_factory = lambda _parsed_args: None
+
+            def empty_client_factory(_parsed_args: argparse.Namespace) -> None:
+                return None
+
+            client_factory = empty_client_factory
         return _run(args, client_factory, stdout, stdin)
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {_format_error(exc)}", file=stderr)

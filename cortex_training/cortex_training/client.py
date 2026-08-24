@@ -161,10 +161,7 @@ def _chunk_group_error_detail(response: requests.Response | None) -> dict | None
         if candidate.get("code") in _CHUNK_GROUP_ERROR_CODES:
             return candidate
         message = str(candidate.get("message") or "")
-        if (
-            candidate.get("chunk_group_id")
-            and message == "request chunk group is missing chunks"
-        ):
+        if candidate.get("chunk_group_id") and message == "request chunk group is missing chunks":
             return {
                 **candidate,
                 "code": "chunk_group_missing_chunks",
@@ -188,28 +185,6 @@ def _is_connect_error(exc: BaseException) -> bool:
         reason = getattr(cause, "reason", None)
         return isinstance(cause, NewConnectionError) or isinstance(reason, NewConnectionError)
     return False
-
-
-def _truthy_fused_cross_entropy(value: object) -> bool:
-    return value is not False
-
-
-def _has_int_chunk_size(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _validate_primerl_lm_head_config(config: dict, *, location: str) -> None:
-    fused_cross_entropy = config.get("fused_cross_entropy", "liger")
-    if _truthy_fused_cross_entropy(fused_cross_entropy) and (
-        config.get("fp32_lm_head", False) is True
-        or _has_int_chunk_size(config.get("fused_lm_head_token_chunk_size"))
-    ):
-        raise ValueError(
-            f"{location} cannot combine fused_cross_entropy with "
-            "fp32_lm_head or fused_lm_head_token_chunk_size. "
-            "Set fused_cross_entropy=false to use fp32/chunked LM head, "
-            "or remove fp32/chunked LM-head knobs to use fused CE."
-        )
 
 
 # ─── Canonical types ─────────────────────────────────────────────────────
@@ -243,9 +218,7 @@ def _validate_primerl_lm_head_config(extra: dict, *, location: str) -> None:
         return
 
     token_chunk_size = cfg.get("fused_lm_head_token_chunk_size")
-    token_chunked_lm_head = isinstance(token_chunk_size, int) and not isinstance(
-        token_chunk_size, bool
-    )
+    token_chunked_lm_head = isinstance(token_chunk_size, int) and not isinstance(token_chunk_size, bool)
     if cfg.get("fp32_lm_head", False) or token_chunked_lm_head:
         raise ValueError(
             f"{location} cannot combine fused_cross_entropy with "
@@ -442,9 +415,7 @@ class SubJobConfig:
     ) -> "SubJobConfig":
         """Build a sampling/log-probability :class:`SubJobConfig`."""
         if job_type not in (JobType.SAMPLING, JobType.LOG_PROBABILITY):
-            raise ValueError(
-                f"sampling_job() only accepts SAMPLING or LOG_PROBABILITY, got {job_type!r}"
-            )
+            raise ValueError(f"sampling_job() only accepts SAMPLING or LOG_PROBABILITY, got {job_type!r}")
         return cls(
             job_type=job_type,
             model_name=model_name,
@@ -473,9 +444,7 @@ class SubJobConfig:
             self.training.validate()
         elif self.job_type in (JobType.SAMPLING, JobType.LOG_PROBABILITY):
             if self.sampling is None:
-                raise ValueError(
-                    f"{self.job_type.value} sub-job requires a `sampling` block"
-                )
+                raise ValueError(f"{self.job_type.value} sub-job requires a `sampling` block")
             self.sampling.validate()
         else:  # pragma: no cover - JobType enum is closed
             raise ValueError(f"unknown job_type: {self.job_type!r}")
@@ -608,11 +577,7 @@ def _load_tokenizer(tokenizer_spec: Any):
         model_name = tokenizer_spec
         kwargs: dict[str, Any] = {}
     elif isinstance(tokenizer_spec, dict):
-        model_name = (
-            tokenizer_spec.get("model_name")
-            or tokenizer_spec.get("name")
-            or tokenizer_spec.get("path")
-        )
+        model_name = tokenizer_spec.get("model_name") or tokenizer_spec.get("name") or tokenizer_spec.get("path")
         if not isinstance(model_name, str) or not model_name:
             raise ValueError("tokenizer.model_name is required")
         kwargs = {}
@@ -673,12 +638,7 @@ def _build_position_ids(input_ids, position_spec: Any):
         return None
     if position_spec is True or position_spec == "arange":
         batch_size, seq_len = input_ids.shape
-        return (
-            torch.arange(seq_len, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-            .contiguous()
-        )
+        return torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1).contiguous()
     if isinstance(position_spec, (dict, list)):
         return _json_tensor(position_spec)
     raise ValueError("fwd-bwd payload position_ids must be true, false, arange, or tensor data")
@@ -693,9 +653,13 @@ def _label_config(payload: dict[str, Any]) -> tuple[Any, int, bool]:
         ignore_index = int(labels.get("ignore_index", payload.get("ignore_index", -100)))
         mask_padding = labels.get("mask_padding", payload.get("mask_padding", True))
         return strategy, ignore_index, _require_bool(mask_padding, "labels.mask_padding")
-    return labels, int(payload.get("ignore_index", -100)), _require_bool(
-        payload.get("mask_padding", True),
-        "fwd-bwd payload mask_padding",
+    return (
+        labels,
+        int(payload.get("ignore_index", -100)),
+        _require_bool(
+            payload.get("mask_padding", True),
+            "fwd-bwd payload mask_padding",
+        ),
     )
 
 
@@ -719,9 +683,7 @@ def _build_labels(input_ids, attention_mask, payload: dict[str, Any]):
         if mask_padding and attention_mask is not None:
             out = out.masked_fill(attention_mask == 0, ignore_index)
         return out
-    raise ValueError(
-        "fwd-bwd labels strategy must be next_token, input_ids, none, or tensor data"
-    )
+    raise ValueError("fwd-bwd labels strategy must be next_token, input_ids, none, or tensor data")
 
 
 def build_forward_backward_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
@@ -826,10 +788,7 @@ def _parse_s3_stage_credentials(raw_value: Any) -> dict[str, str]:
     if not isinstance(stage, dict):
         raise ValueError("stage credentials response is not a JSON object")
     if (stage.get("locationType") or "").upper() != "S3":
-        raise NotImplementedError(
-            f"execution log download only supports S3 stages; got "
-            f"{stage.get('locationType')!r}"
-        )
+        raise NotImplementedError(f"execution log download only supports S3 stages; got {stage.get('locationType')!r}")
     location = (stage.get("location") or "").removeprefix("s3://").strip("/")
     bucket, _, prefix = location.partition("/")
     if not bucket:
@@ -965,10 +924,7 @@ class CortexTrainingClient:
 
     @property
     def _prefix(self) -> str:
-        return (
-            f"{self.base_url}/api/v2/databases/{self.database}"
-            f"/schemas/{self.schema}/{self.endpoint}"
-        )
+        return f"{self.base_url}/api/v2/databases/{self.database}/schemas/{self.schema}/{self.endpoint}"
 
     @staticmethod
     def _debug_json_summary(value: Any, *, limit: int = 2000) -> str:
@@ -1005,9 +961,7 @@ class CortexTrainingClient:
     def _send(self, method: str, url: str, *, retry_on=_is_transient, **kwargs) -> requests.Response:
         fn = getattr(self._session, method.lower())
         debug_context = kwargs.pop("debug_context", None)
-        debug_label = (
-            self._debug_context_label(debug_context) if debug_context is not None else None
-        )
+        debug_label = self._debug_context_label(debug_context) if debug_context is not None else None
         attempt_no = 0
         max_attempts = 1 + self.max_retries
 
@@ -1058,9 +1012,7 @@ class CortexTrainingClient:
                 except (TypeError, ValueError):
                     status_int = None
                 outcome = (
-                    "successful response"
-                    if status_int is not None and 200 <= status_int < 400
-                    else "failed response"
+                    "successful response" if status_int is not None and 200 <= status_int < 400 else "failed response"
                 )
                 snowflake = f" snowflake_request_id={sf_request_id}" if sf_request_id else ""
                 logger.debug(
@@ -1122,17 +1074,13 @@ class CortexTrainingClient:
             raise ValueError("create_job_from_body requires a JSON object")
         sub_job_configs = body.get("sub_job_configs")
         if not isinstance(sub_job_configs, list) or not sub_job_configs:
-            raise ValueError(
-                "create_job_from_body requires a non-empty sub_job_configs list"
-            )
+            raise ValueError("create_job_from_body requires a non-empty sub_job_configs list")
         if body.get("debug") and not _debug_options_enabled():
             raise ValueError(
                 "create-job debug options are an internal-only capability; set "
                 f"{DEBUG_OPTIONS_ENV}=1 to send a request with a `debug` block"
             )
-        resp = self._send(
-            "POST", self._prefix, json=body, retry_on=_is_connect_error
-        )
+        resp = self._send("POST", self._prefix, json=body, retry_on=_is_connect_error)
         return resp.json()
 
     @staticmethod
@@ -1166,13 +1114,9 @@ class CortexTrainingClient:
                 return job
             if status in ("failed", "done", "cancelled", "canceled"):
                 reason = job.get("reason", "")
-                raise RuntimeError(
-                    f"Job {job_id} reached terminal state '{status}': {reason}"
-                )
+                raise RuntimeError(f"Job {job_id} reached terminal state '{status}': {reason}")
             delay = self._sleep_with_backoff(delay, deadline)
-        raise TimeoutError(
-            f"Job {job_id} did not become running within {self.poll_timeout}s"
-        )
+        raise TimeoutError(f"Job {job_id} did not become running within {self.poll_timeout}s")
 
     def get_job(self, job_id: str) -> dict:
         resp = self._send("GET", f"{self._prefix}/{job_id}")
@@ -1257,9 +1201,7 @@ class CortexTrainingClient:
             experiment_name = run["experiment_name"]
             run_name = run["experiment_run_name"]
         except KeyError as exc:
-            raise ValueError(
-                f"experiment-run response missing field: {exc.args[0]}"
-            ) from exc
+            raise ValueError(f"experiment-run response missing field: {exc.args[0]}") from exc
 
         run_uri = f"snow://experiment/{experiment_name}/versions/{run_name}/"
         creds = _parse_s3_stage_credentials(
@@ -1271,6 +1213,7 @@ class CortexTrainingClient:
             stage_prefix += "/"
 
         import boto3
+
         s3 = boto3.client(
             "s3",
             aws_access_key_id=creds["access_key_id"],
@@ -1280,9 +1223,7 @@ class CortexTrainingClient:
         )
 
         results: list[dict[str, str]] = []
-        for page in s3.get_paginator("list_objects_v2").paginate(
-            Bucket=bucket, Prefix=stage_prefix
-        ):
+        for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=stage_prefix):
             for item in page.get("Contents") or []:
                 key = item.get("Key")
                 if not isinstance(key, str):
@@ -1320,10 +1261,10 @@ class CortexTrainingClient:
             size_mb = len(body) / (1024 * 1024)
             raise ValueError(
                 f"{op} payload is {size_mb:.1f} MB, which exceeds the "
-                f"maximum allowed size of "
+                "maximum allowed size of "
                 f"{self._MAX_GENERATE_BYTES / (1024 * 1024):.0f} MB. "
-                f"Reduce the number of prompts or shorten each prompt to "
-                f"bring the serialized request under the limit."
+                "Reduce the number of prompts or shorten each prompt to "
+                "bring the serialized request under the limit."
             )
 
     def _resolve_sampling_max_seq_len(self, job_id: str) -> int | None:
@@ -1358,9 +1299,7 @@ class CortexTrainingClient:
         self._sampling_max_seq_len[job_id] = max_seq_len
         return max_seq_len
 
-    def _check_prompt_lengths(
-        self, op: str, job_id: str, prompts: list[str | list[int]]
-    ) -> None:
+    def _check_prompt_lengths(self, op: str, job_id: str, prompts: list[str | list[int]]) -> None:
         """Fail fast when a pre-tokenized prompt cannot fit the sampling window.
 
         Mirrors vLLM's decoder-prompt check (``vllm/v1/engine/input_processor``):
@@ -1384,11 +1323,11 @@ class CortexTrainingClient:
                 raise ValueError(
                     f"{op} prompt at index {i} has {n} tokens, which does not "
                     f"fit the sampling job's max_seq_len of {max_seq_len}: a "
-                    f"prompt must be shorter than max_seq_len to leave room for "
-                    f"at least one generated token (vLLM rejects "
-                    f"len(prompt) >= max_model_len). Shorten the prompt to at "
+                    "prompt must be shorter than max_seq_len to leave room for "
+                    "at least one generated token (vLLM rejects "
+                    "len(prompt) >= max_model_len). Shorten the prompt to at "
                     f"most {max_seq_len - 1} tokens, or recreate the job with a "
-                    f"larger max_seq_len."
+                    "larger max_seq_len."
                 )
 
     def _post_octet_request_chunks(
@@ -1427,11 +1366,7 @@ class CortexTrainingClient:
                     f"{self._prefix}/{job_id}/{path_suffix}",
                     data=chunk,
                     headers={"Content-Type": "application/octet-stream"},
-                    retry_on=(
-                        _is_chunk_post_transient
-                        if allow_group_restart
-                        else _is_transient
-                    ),
+                    retry_on=(_is_chunk_post_transient if allow_group_restart else _is_transient),
                     debug_context=debug_context,
                 )
             except requests.exceptions.HTTPError as exc:
@@ -1439,11 +1374,7 @@ class CortexTrainingClient:
                 if detail is None:
                     raise
                 code = detail.get("code")
-                if (
-                    allow_group_restart
-                    and code == _CHUNK_GROUP_RESTART_REQUIRED
-                    and group_restarts < 1
-                ):
+                if allow_group_restart and code == _CHUNK_GROUP_RESTART_REQUIRED and group_restarts < 1:
                     group_restarts += 1
                     idx = 0
                     final_body = None
@@ -1454,9 +1385,7 @@ class CortexTrainingClient:
                     )
                     continue
                 error_type = (
-                    ChunkGroupRestartError
-                    if code == _CHUNK_GROUP_RESTART_REQUIRED
-                    else ChunkGroupConflictError
+                    ChunkGroupRestartError if code == _CHUNK_GROUP_RESTART_REQUIRED else ChunkGroupConflictError
                 )
                 raise error_type(
                     str(detail.get("message") or code),
@@ -1467,9 +1396,7 @@ class CortexTrainingClient:
             body = resp.json()
             if idx < len(chunks) - 1:
                 if isinstance(body, dict) and body.get("request_id"):
-                    raise RuntimeError(
-                        f"{operation} chunk {idx} unexpectedly returned request_id"
-                    )
+                    raise RuntimeError(f"{operation} chunk {idx} unexpectedly returned request_id")
             else:
                 final_body = body
             idx += 1
@@ -1622,9 +1549,7 @@ class CortexTrainingClient:
         if checkpoint_type is not None:
             normalized_type = checkpoint_type.lower()
             if normalized_type not in ("resumable", "weights-only"):
-                raise ValueError(
-                    "checkpoint_type must be 'resumable' or 'weights-only'"
-                )
+                raise ValueError("checkpoint_type must be 'resumable' or 'weights-only'")
             body["checkpoint_type"] = normalized_type
         resp = self._send("POST", f"{self._prefix}/{job_id}/save", json=body)
         return resp.json()["request_id"]
@@ -1728,11 +1653,11 @@ class CortexTrainingClient:
             size_mb = len(payload) / (1024 * 1024)
             raise ValueError(
                 f"forward payload is {size_mb:.1f} MB, which exceeds the "
-                f"maximum allowed size of "
+                "maximum allowed size of "
                 f"{self._MAX_FWD_BWD_BYTES / (1024 * 1024):.0f} MB. "
-                f"Reduce the batch size or sequence length in your training "
-                f"configuration to bring the serialized input batch under "
-                f"the limit."
+                "Reduce the batch size or sequence length in your training "
+                "configuration to bring the serialized input batch under "
+                "the limit."
             )
         return self._operation(
             job_id,
@@ -1820,9 +1745,7 @@ class CortexTrainingClient:
             "weight-sync",
             payload=body,
             sub_job_id=sub_job_id or source_sub_job_id,  # training
-            sub_job_type=(
-                sub_job_type if sub_job_type is not None else "training"
-            ),
+            sub_job_type=(sub_job_type if sub_job_type is not None else "training"),
         )["request_id"]
 
     def bootstrap_router_replay(
@@ -1947,15 +1870,9 @@ class CortexTrainingClient:
                 for key, item in value.items()
             }
         if isinstance(value, list):
-            return [
-                CortexTrainingClient._restore_generate_result_lists(item, torch_module)
-                for item in value
-            ]
+            return [CortexTrainingClient._restore_generate_result_lists(item, torch_module) for item in value]
         if isinstance(value, tuple):
-            return tuple(
-                CortexTrainingClient._restore_generate_result_lists(item, torch_module)
-                for item in value
-            )
+            return tuple(CortexTrainingClient._restore_generate_result_lists(item, torch_module) for item in value)
         return value
 
     def _normalize_generate_result_if_needed(self, request_id: str, result: dict) -> dict:
@@ -1998,9 +1915,7 @@ class CortexTrainingClient:
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
         debug_context = self._fwd_bwd_request_debug.get(request_id)
-        debug_label = (
-            self._debug_context_label(debug_context) if debug_context is not None else None
-        )
+        debug_label = self._debug_context_label(debug_context) if debug_context is not None else None
         result_chunks: list[bytes] = []
         cursor: str | None = None
         while time.monotonic() < deadline:
@@ -2048,9 +1963,7 @@ class CortexTrainingClient:
                     )
                     self._fwd_bwd_request_debug.pop(request_id, None)
                 self._generate_request_ids.discard(request_id)
-                raise RuntimeError(
-                    f"Request {request_id} ended with state '{state}': {error}"
-                )
+                raise RuntimeError(f"Request {request_id} ended with state '{state}': {error}")
             if received_chunk:
                 # Defensive: if the server returns a chunk without next_cursor
                 # before terminal status, poll again immediately rather than
@@ -2058,14 +1971,10 @@ class CortexTrainingClient:
                 continue
             delay = self._sleep_with_backoff(delay, deadline)
         if debug_label is not None:
-            logger.debug(
-                "%s timed out after %ss", debug_label, self.poll_timeout
-            )
+            logger.debug("%s timed out after %ss", debug_label, self.poll_timeout)
             self._fwd_bwd_request_debug.pop(request_id, None)
         self._generate_request_ids.discard(request_id)
-        raise TimeoutError(
-            f"Request {request_id} did not complete within {self.poll_timeout}s"
-        )
+        raise TimeoutError(f"Request {request_id} did not complete within {self.poll_timeout}s")
 
     def get_request_status(
         self,

@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Submit a text prompt and print the completion.
 """
@@ -8,22 +23,18 @@ import logging
 import os
 
 import chz
+from recipes._shared.cortex_training import build_renderer
+from recipes._shared.cortex_training import inference_job_body
+from recipes._shared.cortex_training import make_client
+from recipes._shared.cortex_training import prepare_inference_weights
+from recipes._shared.cortex_training import running_job
+from recipes._shared.cortex_training import source_checkpoint_info
+from recipes._shared.cortex_training import stop_params_for
+from recipes.inference.sampling.benchmarks import generate_results
+from recipes.inference.sampling.generate import completion_text
+from recipes.inference.sampling.generate import render_user_prompt
 
 from cortex_training.client import DEBUG_OPTIONS_ENV
-from recipes._shared.cortex_training import (
-    build_renderer,
-    inference_job_body,
-    make_client,
-    prepare_inference_weights,
-    running_job,
-    source_checkpoint_info,
-    stop_params_for,
-)
-from recipes.inference.sampling.generate import (
-    completion_text,
-    render_user_prompt,
-)
-from recipes.inference.sampling.benchmarks import generate_results
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
@@ -34,7 +45,7 @@ logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 @chz.chz
 class Config:
     config: str
-    job_id: str | None = None # attach to running sampling job
+    job_id: str | None = None  # attach to running sampling job
 
     model_name: str = "Qwen/Qwen3-8B"
     n_gpus: int = 2
@@ -115,16 +126,10 @@ def main(config: Config):
     }
     prompt_tokens = render_user_prompt(renderer, config.prompt)
     attached = config.job_id is not None
-    with running_job(
-        client, body, job_id=config.job_id, keep_job=config.keep_job
-    ) as job_id:
+    with running_job(client, body, job_id=config.job_id, keep_job=config.keep_job) as job_id:
         if not attached:
-            prepare_inference_weights(
-                client, job_id, body, lora_rank=config.lora_rank
-            )
-        results = generate_results(
-            client, job_id, [prompt_tokens], sampling_params, batch_size=1
-        )
+            prepare_inference_weights(client, job_id, body, lora_rank=config.lora_rank)
+        results = generate_results(client, job_id, [prompt_tokens], sampling_params, batch_size=1)
         raw = completion_text(results[0])
         logger.info("Prompt: %s", config.prompt)
         logger.info(

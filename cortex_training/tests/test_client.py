@@ -42,8 +42,7 @@ import torch
 # imports torch via engine.py).
 spec = importlib.util.spec_from_file_location(
     "cortex_training_client_under_test",
-    str(__import__("pathlib").Path(__file__).resolve().parent.parent
-        / "cortex_training" / "client.py"),
+    str(__import__("pathlib").Path(__file__).resolve().parent.parent / "cortex_training" / "client.py"),
 )
 nc = importlib.util.module_from_spec(spec)
 sys.modules["cortex_training_client_under_test"] = nc
@@ -362,14 +361,20 @@ class TestSubJobConfigFactories:
 
     def test_sampling_job_factory_log_probability(self):
         sub = SubJobConfig.sampling_job(
-            model_name="gpt2", max_seq_len=128, n_gpus=1, job_type=JobType.LOG_PROBABILITY,
+            model_name="gpt2",
+            max_seq_len=128,
+            n_gpus=1,
+            job_type=JobType.LOG_PROBABILITY,
         )
         assert sub.job_type == JobType.LOG_PROBABILITY
 
     def test_sampling_job_factory_rejects_training_type(self):
         with pytest.raises(ValueError, match="SAMPLING or LOG_PROBABILITY"):
             SubJobConfig.sampling_job(
-                model_name="gpt2", max_seq_len=128, n_gpus=1, job_type=JobType.TRAINING,
+                model_name="gpt2",
+                max_seq_len=128,
+                n_gpus=1,
+                job_type=JobType.TRAINING,
             )
 
     def test_extra_dicts_are_copied(self):
@@ -394,12 +399,16 @@ class TestSubJobConfigFactories:
 class TestSubJobConfigValidate:
     def test_ok_training(self):
         SubJobConfig(
-            job_type=JobType.TRAINING, model_name="gpt2", training=_ok_training(),
+            job_type=JobType.TRAINING,
+            model_name="gpt2",
+            training=_ok_training(),
         ).validate()
 
     def test_ok_sampling(self):
         SubJobConfig(
-            job_type=JobType.SAMPLING, model_name="gpt2", sampling=_ok_inference(),
+            job_type=JobType.SAMPLING,
+            model_name="gpt2",
+            sampling=_ok_inference(),
         ).validate()
 
     def test_ok_log_probability_uses_sampling_block(self):
@@ -412,7 +421,9 @@ class TestSubJobConfigValidate:
     def test_rejects_empty_model_name(self):
         with pytest.raises(ValueError, match="model_name"):
             SubJobConfig(
-                job_type=JobType.TRAINING, model_name="", training=_ok_training(),
+                job_type=JobType.TRAINING,
+                model_name="",
+                training=_ok_training(),
             ).validate()
 
     def test_training_without_training_block(self):
@@ -426,7 +437,8 @@ class TestSubJobConfigValidate:
     def test_log_probability_without_sampling_block(self):
         with pytest.raises(ValueError, match="log_probability sub-job requires"):
             SubJobConfig(
-                job_type=JobType.LOG_PROBABILITY, model_name="gpt2",
+                job_type=JobType.LOG_PROBABILITY,
+                model_name="gpt2",
             ).validate()
 
     def test_mutually_exclusive(self):
@@ -443,7 +455,10 @@ class TestSubJobConfigValidate:
             job_type=JobType.TRAINING,
             model_name="gpt2",
             training=TrainingConfig(
-                optimizer={"type": "adamw"}, max_seq_len=128, train_batch_size=0, n_gpus=2,
+                optimizer={"type": "adamw"},
+                max_seq_len=128,
+                train_batch_size=0,
+                n_gpus=2,
             ),
         )
         with pytest.raises(ValueError, match="train_batch_size"):
@@ -495,7 +510,10 @@ class TestSubJobConfigToWire:
 
     def test_sampling_block_used_for_log_probability(self):
         sub = SubJobConfig.sampling_job(
-            model_name="gpt2", max_seq_len=128, n_gpus=1, job_type=JobType.LOG_PROBABILITY,
+            model_name="gpt2",
+            max_seq_len=128,
+            n_gpus=1,
+            job_type=JobType.LOG_PROBABILITY,
         )
         wire = sub.to_wire()
         assert wire["job_type"] == "log_probability"
@@ -519,11 +537,19 @@ class TestSubJobConfigToWire:
 
     def test_omits_unset_optional_fields(self):
         sub = SubJobConfig(
-            job_type=JobType.TRAINING, model_name="gpt2", training=_ok_training(),
+            job_type=JobType.TRAINING,
+            model_name="gpt2",
+            training=_ok_training(),
         )
         wire = sub.to_wire()
-        for absent in ("global_batch_size", "source_checkpoint_info",
-                       "dtype", "seed", "model_post_init", "inference_config"):
+        for absent in (
+            "global_batch_size",
+            "source_checkpoint_info",
+            "dtype",
+            "seed",
+            "model_post_init",
+            "inference_config",
+        ):
             assert absent not in wire
 
 
@@ -570,7 +596,10 @@ class TestClientConstruction:
 
     def test_from_pat_sets_headers_and_verify(self):
         c = CortexTrainingClient.from_pat(
-            host="x.test", pat="tok-xyz", database="DB", schema="SCH",
+            host="x.test",
+            pat="tok-xyz",
+            database="DB",
+            schema="SCH",
             verify_ssl=False,
         )
         assert c.base_url == "https://x.test"
@@ -617,16 +646,18 @@ class TestCreateJob:
         url, kwargs = c._session.post.call_args
         assert url[0] == c._prefix
         assert kwargs["json"] == {
-            "sub_job_configs": [{
-                "job_type": "training",
-                "model_name": "gpt2",
-                "training_config": {
-                    "optimizer": {"type": "adamw"},
-                    "max_seq_len": 128,
-                    "train_batch_size": 1,
-                    "n_gpus": 2,
-                },
-            }],
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {
+                        "optimizer": {"type": "adamw"},
+                        "max_seq_len": 128,
+                        "train_batch_size": 1,
+                        "n_gpus": 2,
+                    },
+                }
+            ],
         }
 
     def test_includes_job_id_when_given(self):
@@ -661,7 +692,10 @@ class TestCreateJob:
         c = _make_client(post_json={"job_id": "srv-1"})
         train = SubJobConfig.training_job(
             model_name="gpt2",
-            optimizer={"a": 1}, max_seq_len=128, train_batch_size=1, n_gpus=2,
+            optimizer={"a": 1},
+            max_seq_len=128,
+            train_batch_size=1,
+            n_gpus=2,
         )
         samp = SubJobConfig.sampling_job(model_name="gpt2", max_seq_len=128, n_gpus=1)
         c.create_job(sub_jobs=[train, samp])
@@ -674,11 +708,13 @@ class TestCreateJob:
         c = _make_client(post_json={"job_id": "srv-raw"})
         body = {
             "job_id": "client-raw",
-            "sub_job_configs": [{
-                "job_type": "sampling",
-                "model_name": "gpt2",
-                "inference_config": {"max_seq_len": 128, "n_gpus": 1},
-            }],
+            "sub_job_configs": [
+                {
+                    "job_type": "sampling",
+                    "model_name": "gpt2",
+                    "inference_config": {"max_seq_len": 128, "n_gpus": 1},
+                }
+            ],
         }
         assert c.create_job_from_body(body) == {"job_id": "srv-raw"}
         c._session.post.assert_called_once_with(c._prefix, json=body)
@@ -697,11 +733,13 @@ class TestCreateJob:
         monkeypatch.delenv(nc.DEBUG_OPTIONS_ENV, raising=False)
         c = _make_client(post_json={"job_id": "srv"})
         body = {
-            "sub_job_configs": [{
-                "job_type": "training",
-                "model_name": "gpt2",
-                "training_config": {"n_gpus": 1},
-            }],
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {"n_gpus": 1},
+                }
+            ],
             "debug": {"job": {"image_tag": "release_internal"}},
         }
         with pytest.raises(ValueError, match=nc.DEBUG_OPTIONS_ENV):
@@ -713,11 +751,13 @@ class TestCreateJob:
         monkeypatch.setenv(nc.DEBUG_OPTIONS_ENV, "1")
         c = _make_client(post_json={"job_id": "srv-dbg"})
         body = {
-            "sub_job_configs": [{
-                "job_type": "training",
-                "model_name": "gpt2",
-                "training_config": {"n_gpus": 1},
-            }],
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {"n_gpus": 1},
+                }
+            ],
             "debug": {"job": {"image_tag": "release_internal"}},
         }
         assert c.create_job_from_body(body) == {"job_id": "srv-dbg"}
@@ -728,11 +768,13 @@ class TestCreateJob:
         monkeypatch.delenv(nc.DEBUG_OPTIONS_ENV, raising=False)
         c = _make_client(post_json={"job_id": "srv"})
         body = {
-            "sub_job_configs": [{
-                "job_type": "training",
-                "model_name": "gpt2",
-                "training_config": {"n_gpus": 1},
-            }],
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "gpt2",
+                    "training_config": {"n_gpus": 1},
+                }
+            ],
             "debug": {},
         }
         assert c.create_job_from_body(body) == {"job_id": "srv"}
@@ -778,12 +820,14 @@ class TestReadAndControl:
         c._session.post.assert_called_once_with(f"{c._prefix}/j1:cancel")
 
     def test_get_capacity_reserved_account(self):
-        c = _make_client(get_json={
-            "has_reservation": True,
-            "reserved_gpus": 64,
-            "in_use_gpus": 8,
-            "available_gpus": 56,
-        })
+        c = _make_client(
+            get_json={
+                "has_reservation": True,
+                "reserved_gpus": 64,
+                "in_use_gpus": 8,
+                "available_gpus": 56,
+            }
+        )
         cap = c.get_capacity()
         assert cap == {
             "has_reservation": True,
@@ -887,14 +931,16 @@ class TestWaitForJob:
 
 class TestForwardBackwardPayloadHelpers:
     def test_build_forward_backward_payload_from_tensor_kwargs(self):
-        body = nc.build_forward_backward_payload({
-            "payload": {
-                "kwargs": {
-                    "input_ids": {"data": [[1, 2, 3]], "dtype": "long"},
-                    "labels": {"data": [[2, 3, -100]], "dtype": "long"},
+        body = nc.build_forward_backward_payload(
+            {
+                "payload": {
+                    "kwargs": {
+                        "input_ids": {"data": [[1, 2, 3]], "dtype": "long"},
+                        "labels": {"data": [[2, 3, -100]], "dtype": "long"},
+                    },
                 },
-            },
-        })
+            }
+        )
 
         loaded = _wire_load(body)
         assert loaded["args"] == ()
@@ -913,31 +959,35 @@ class TestForwardBackwardPayloadHelpers:
                 assert kwargs["padding"] == "max_length"
                 assert kwargs["max_length"] == 4
                 return {
-                    "input_ids": torch.tensor([
-                        [10, 11, 0, 0],
-                        [20, 21, 22, 0],
-                    ]),
-                    "attention_mask": torch.tensor([
-                        [1, 1, 0, 0],
-                        [1, 1, 1, 0],
-                    ]),
+                    "input_ids": torch.tensor(
+                        [
+                            [10, 11, 0, 0],
+                            [20, 21, 22, 0],
+                        ]
+                    ),
+                    "attention_mask": torch.tensor(
+                        [
+                            [1, 1, 0, 0],
+                            [1, 1, 1, 0],
+                        ]
+                    ),
                 }
 
         fake_transformers = SimpleNamespace(
-            AutoTokenizer=SimpleNamespace(
-                from_pretrained=lambda model_name, **kwargs: FakeTokenizer()
-            )
+            AutoTokenizer=SimpleNamespace(from_pretrained=lambda model_name, **kwargs: FakeTokenizer())
         )
         monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
-        kwargs = nc.build_forward_backward_kwargs({
-            "tokenizer": {"model_name": "fake-model"},
-            "texts": ["first", "second"],
-            "batch_size": 2,
-            "max_length": 4,
-            "position_ids": "arange",
-            "labels": {"strategy": "next_token", "ignore_index": -100},
-        })
+        kwargs = nc.build_forward_backward_kwargs(
+            {
+                "tokenizer": {"model_name": "fake-model"},
+                "texts": ["first", "second"],
+                "batch_size": 2,
+                "max_length": 4,
+                "position_ids": "arange",
+                "labels": {"strategy": "next_token", "ignore_index": -100},
+            }
+        )
 
         assert kwargs["input_ids"].tolist() == [
             [10, 11, 0, 0],
@@ -998,7 +1048,7 @@ class TestDataPlane:
             {
                 "code": "517604",
                 "message": (
-                    'Cortex training forwardBackward failed: ZMD returned 409: '
+                    "Cortex training forwardBackward failed: ZMD returned 409: "
                     '{"detail":{"code":"chunk_group_restart_required",'
                     '"message":"request chunk group state is missing; restart from chunk 0",'
                     '"chunk_group_id":"group-a","received_chunk":1,'
@@ -1060,7 +1110,7 @@ class TestDataPlane:
             {
                 "code": "517604",
                 "message": (
-                    'Cortex training forwardBackward failed: ZMD returned 409: '
+                    "Cortex training forwardBackward failed: ZMD returned 409: "
                     '{"detail":{"message":"request chunk group is missing chunks",'
                     '"chunk_group_id":"group-a","missing_chunks":[0,1]}}'
                 ),
@@ -1147,6 +1197,7 @@ class TestDataPlane:
         assert url[0] == f"{c._prefix}/j1/generate-stream"
         assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
         import json as _json
+
         body = _json.loads(kwargs["data"])
         assert body == {
             "prompts": [[1, 2], [3, 4]],
@@ -1264,7 +1315,8 @@ class TestDataPlane:
         c = _make_client(post_json={"request_id": "r3"})
         c.save("j1", checkpoint_id="cp", checkpoint_type="WEIGHTS-ONLY")
         assert c._session.post.call_args.kwargs["json"] == {
-            "checkpoint_id": "cp", "checkpoint_type": "weights-only",
+            "checkpoint_id": "cp",
+            "checkpoint_type": "weights-only",
         }
 
     def test_save_rejects_unknown_checkpoint_type(self):
@@ -1278,9 +1330,7 @@ class TestDataPlane:
         rid = c.load("j1", checkpoint_id="cp")
 
         assert rid == "r-load"
-        c._session.post.assert_called_once_with(
-            f"{c._prefix}/j1/load", json={"checkpoint_id": "cp"}
-        )
+        c._session.post.assert_called_once_with(f"{c._prefix}/j1/load", json={"checkpoint_id": "cp"})
 
     def test_load_with_source_job(self):
         c = _make_client(post_json={"request_id": "r-load"})
@@ -1332,7 +1382,7 @@ class TestDataPlane:
         c.max_retries = 0  # Skip retry backoff for error tests
         resp = _make_response(
             json_body={"error": "target_sub_job_id 'other-job:training:0' does not belong to session 'j1'"},
-            status_code=400
+            status_code=400,
         )
         resp.raise_for_status.side_effect = nc.requests.exceptions.HTTPError(response=resp)
         c._session.post.return_value = resp
@@ -1347,8 +1397,13 @@ class TestDataPlane:
         c = _make_client()
         c.max_retries = 0
         resp = _make_response(
-            json_body={"error": "target_sub_job_id 'j1:sampling:0' is a sampling sub-job; loading into non-training zone not supported"},
-            status_code=501
+            json_body={
+                "error": (
+                    "target_sub_job_id 'j1:sampling:0' is a sampling sub-job; loading into non-training zone not"
+                    " supported"
+                )
+            },
+            status_code=501,
         )
         resp.raise_for_status.side_effect = nc.requests.exceptions.HTTPError(response=resp)
         c._session.post.return_value = resp
@@ -1363,8 +1418,7 @@ class TestDataPlane:
         c = _make_client()
         c.max_retries = 0
         resp = _make_response(
-            json_body={"error": "target_sub_job_id 'j1:training:99' does not belong to session 'j1'"},
-            status_code=400
+            json_body={"error": "target_sub_job_id 'j1:training:99' does not belong to session 'j1'"}, status_code=400
         )
         resp.raise_for_status.side_effect = nc.requests.exceptions.HTTPError(response=resp)
         c._session.post.return_value = resp
@@ -1393,10 +1447,7 @@ class TestDataPlane:
         """Server returns 400 when session has no training sub-job and target is omitted."""
         c = _make_client()
         c.max_retries = 0
-        resp = _make_response(
-            json_body={"error": "session 'j1' has no training sub-job"},
-            status_code=400
-        )
+        resp = _make_response(json_body={"error": "session 'j1' has no training sub-job"}, status_code=400)
         resp.raise_for_status.side_effect = nc.requests.exceptions.HTTPError(response=resp)
         c._session.post.return_value = resp
 
@@ -1642,7 +1693,8 @@ class TestRequestPolling:
         out = c.get_request_status("j1", "r1")
         assert out["status"] == "running"
         c._session.get.assert_called_once_with(
-            f"{c._prefix}/j1/requests/r1", params=None,
+            f"{c._prefix}/j1/requests/r1",
+            params=None,
         )
 
     def test_get_request_status_with_stream_max_events(self):
@@ -1942,9 +1994,7 @@ class TestLogs:
 
     def test_stream_logs_follow_keeps_yielding(self, monkeypatch):
         monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
-        c = _make_client(
-            post_json={"entries": [{"msg": "a"}, {"msg": "b"}], "next_cursor": "c1", "eof": False}
-        )
+        c = _make_client(post_json={"entries": [{"msg": "a"}, {"msg": "b"}], "next_cursor": "c1", "eof": False})
         got = []
         for entry in c.stream_logs("j1", sub_job_id="sj-0", follow=True):
             got.append(entry["msg"])
@@ -2078,16 +2128,11 @@ class TestExecutionLogDownload:
                 get_calls.append((Bucket, Key))
                 return {"Body": SimpleNamespace(read=lambda: bodies[Key])}
 
-        monkeypatch.setitem(
-            sys.modules, "boto3", SimpleNamespace(client=lambda *a, **kw: FakeS3())
-        )
+        monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *a, **kw: FakeS3()))
 
         out = c.fetch_execution_logs("job-1")
 
-        assert sql_calls == [
-            "SELECT SYSTEM$GET_VSTAGE_WRITE_CREDS("
-            "'snow://experiment/DB.SCH.EXP/versions/RUN_ABC/')"
-        ]
+        assert sql_calls == ["SELECT SYSTEM$GET_VSTAGE_WRITE_CREDS('snow://experiment/DB.SCH.EXP/versions/RUN_ABC/')"]
         assert listed_prefixes == [("bucket", "stage/abc/")]
         assert get_calls == [
             ("bucket", keys_in_stage[0]),

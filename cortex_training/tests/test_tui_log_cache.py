@@ -15,7 +15,6 @@
 
 """Unit tests for the TUI log cache (no ``textual`` dependency)."""
 
-import json
 from pathlib import Path
 
 import pytest

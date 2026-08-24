@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 MATH-500 sampling eval.
 """
@@ -8,18 +23,16 @@ import logging
 import os
 
 import chz
+from recipes._shared.cortex_training import build_renderer
+from recipes._shared.cortex_training import inference_job_body
+from recipes._shared.cortex_training import make_client
+from recipes._shared.cortex_training import prepare_inference_weights
+from recipes._shared.cortex_training import running_job
+from recipes._shared.cortex_training import source_checkpoint_info
+from recipes._shared.cortex_training import stop_params_for
+from recipes.inference.sampling.benchmarks import run_math500
 
 from cortex_training.client import DEBUG_OPTIONS_ENV
-from recipes._shared.cortex_training import (
-    build_renderer,
-    inference_job_body,
-    make_client,
-    prepare_inference_weights,
-    running_job,
-    source_checkpoint_info,
-    stop_params_for,
-)
-from recipes.inference.sampling.benchmarks import run_math500
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
@@ -30,7 +43,7 @@ logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
 @chz.chz
 class Config:
     config: str
-    job_id: str | None = None # attach to running sampling job
+    job_id: str | None = None  # attach to running sampling job
 
     model_name: str = "Qwen/Qwen3-8B"
     n_gpus: int = 2
@@ -124,9 +137,7 @@ def run_evaluation(
     attached = job_id is not None
     with running_job(client, body, job_id=job_id, keep_job=keep_job) as eval_job_id:
         if not attached:
-            prepare_inference_weights(
-                client, eval_job_id, body, lora_rank=lora_rank
-            )
+            prepare_inference_weights(client, eval_job_id, body, lora_rank=lora_rank)
         result = run_math500(
             client=client,
             job_id=eval_job_id,

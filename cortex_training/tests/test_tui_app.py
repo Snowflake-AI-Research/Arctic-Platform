@@ -28,8 +28,8 @@ pytest.importorskip("textual")
 from textual.widgets import Input  # noqa: E402
 
 from cortex_training.tui.app import CortexTrainingLogTUI  # noqa: E402
-from cortex_training.tui.app import JobListScreen
-from cortex_training.tui.app import LogScreen
+from cortex_training.tui.app import JobListScreen  # noqa: E402
+from cortex_training.tui.app import LogScreen  # noqa: E402
 
 
 def _client():

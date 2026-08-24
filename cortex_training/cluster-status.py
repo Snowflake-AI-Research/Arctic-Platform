@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -13,7 +15,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#!/usr/bin/env python3
 """Live summary of running Cortex Training jobs and GPU usage."""
 
 from __future__ import annotations

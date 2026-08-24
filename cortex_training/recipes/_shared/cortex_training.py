@@ -21,7 +21,9 @@ import contextlib
 import json
 import logging
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator
+from collections.abc import Mapping
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -123,9 +125,7 @@ def save_checkpoint(
     return result
 
 
-def save_recipe_checkpoints(
-    client: CortexTrainingClient, job_id: str
-) -> dict[str, dict[str, Any]]:
+def save_recipe_checkpoints(client: CortexTrainingClient, job_id: str) -> dict[str, dict[str, Any]]:
     """Save a weights-only checkpoint (HF tree, plus LoRA adapters under default/)."""
     weights = save_checkpoint(client, job_id, checkpoint_type="weights-only")
     return {"weights-only": weights}
@@ -222,10 +222,7 @@ def prepare_inference_weights(
     lora_rank: int,
 ) -> dict[str, Any] | None:
     """After a colocated LoRA job starts, sync adapters into sampling."""
-    sub_types = {
-        str(sub.get("job_type") or "")
-        for sub in job_body.get("sub_job_configs") or []
-    }
+    sub_types = {str(sub.get("job_type") or "") for sub in job_body.get("sub_job_configs") or []}
     if "training" not in sub_types or "sampling" not in sub_types:
         return None
     if lora_rank <= 0:
@@ -349,16 +346,12 @@ def recommended_renderer_name(
             "see https://tinker-docs.thinkingmachines.ai/tutorials/core-concepts/rendering/#available-renderers"
         ) from exc
     if not recommended:
-        raise ValueError(
-            f"tinker_cookbook listed no renderers for {model_name!r}"
-        )
+        raise ValueError(f"tinker_cookbook listed no renderers for {model_name!r}")
     if enable_thinking is False:
         disabled = [name for name in recommended if name.endswith("_disable_thinking")]
         return disabled[0]
     if enable_thinking is True:
-        enabled = [
-            name for name in recommended if not name.endswith("_disable_thinking")
-        ]
+        enabled = [name for name in recommended if not name.endswith("_disable_thinking")]
         return enabled[0]
     return recommended[0]
 
@@ -407,11 +400,7 @@ def router_replay_config(
         return {"enabled": False}
     return {
         "enabled": True,
-        "max_cache_bytes": int(
-            _ROUTER_REPLAY_DEFAULT_MAX_CACHE_BYTES
-            if max_cache_bytes is None
-            else max_cache_bytes
-        ),
+        "max_cache_bytes": int(_ROUTER_REPLAY_DEFAULT_MAX_CACHE_BYTES if max_cache_bytes is None else max_cache_bytes),
     }
 
 
@@ -425,12 +414,10 @@ def router_replay_stop_params(
         return params
     if tokenizer is None:
         raise ValueError(
-            "router replay with string stop sequences needs a tokenizer to "
-            "build dss_stop_token_sequences"
+            "router replay with string stop sequences needs a tokenizer to build dss_stop_token_sequences"
         )
     params["dss_stop_token_sequences"] = [
-        [int(token) for token in tokenizer.encode(stop, add_special_tokens=False)]
-        for stop in strings
+        [int(token) for token in tokenizer.encode(stop, add_special_tokens=False)] for stop in strings
     ]
     return params
 
@@ -652,10 +639,7 @@ def _forward_backward_payload(
             "sampling_job_id": str(router_replay_sampling_job_id),
         }
     elif rr_sample_ids is not None:
-        raise ValueError(
-            "rr_sample_ids requires router_replay_sampling_job_id "
-            "(the sampling sub-job id)"
-        )
+        raise ValueError("rr_sample_ids requires router_replay_sampling_job_id (the sampling sub-job id)")
     return wire.dumps(frame, metadata=metadata)
 
 

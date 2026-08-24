@@ -34,22 +34,20 @@ from typing import Any
 
 import chz
 import datasets
+from recipes._shared.cortex_training import build_renderer
+from recipes._shared.cortex_training import collate
+from recipes._shared.cortex_training import forward_backward_step
+from recipes._shared.cortex_training import forward_loss
+from recipes._shared.cortex_training import log_saved_checkpoints
+from recipes._shared.cortex_training import lora_peft_config
+from recipes._shared.cortex_training import make_client
+from recipes._shared.cortex_training import running_job
+from recipes._shared.cortex_training import save_recipe_checkpoints
+from recipes._shared.cortex_training import sequence_from_conversation
+from recipes._shared.cortex_training import use_next_token_labels
 from tinker_cookbook import renderers
 from tinker_cookbook.utils import ml_log
 
-from recipes._shared.cortex_training import (
-    build_renderer,
-    collate,
-    forward_backward_step,
-    forward_loss,
-    log_saved_checkpoints,
-    lora_peft_config,
-    make_client,
-    running_job,
-    save_recipe_checkpoints,
-    sequence_from_conversation,
-    use_next_token_labels,
-)
 from cortex_training.client import DEBUG_OPTIONS_ENV
 
 logger = logging.getLogger(__name__)
@@ -62,6 +60,7 @@ BUILTIN_CHAT_DATASETS = {
     "who_trained_you": _RECIPE_DIR / "data" / "who_trained_you.jsonl",
 }
 WHO_TRAINED_YOU_PROMPT = "Who trained you?"
+
 
 def is_who_trained_you_dataset(dataset: str) -> bool:
     return dataset == "who_trained_you" or Path(dataset).name == "who_trained_you.jsonl"
@@ -379,11 +378,7 @@ def main(config: Config):
             ml_logger.log_metrics(metrics=metrics, step=step)
 
         saved = save_recipe_checkpoints(client, job_id)
-        sample_prompt = (
-            WHO_TRAINED_YOU_PROMPT
-            if is_who_trained_you_dataset(config.dataset)
-            else None
-        )
+        sample_prompt = WHO_TRAINED_YOU_PROMPT if is_who_trained_you_dataset(config.dataset) else None
         log_saved_checkpoints(
             config_path=config.config,
             job_id=job_id,
