@@ -60,6 +60,12 @@ _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
 # the transport rather than on Request.binary.
 _OCTET_OPS = {"forward-backward", "generate"}
 _OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
+# The chunk envelope's operation label is the wire's own name, not our canonical op name.
+_WIRE_OPERATION = {"forward-backward": "fwd-bwd", "generate": "generate"}
+# forward-backward always carries a chunk envelope, even when the frame would fit in one
+# request: its chunk_group_id is the server's idempotency key, so a bare frame is off
+# contract. generate posts the bare frame when it fits.
+_FORCE_CHUNK_OPS = {"forward-backward"}
 # Ops whose chunked frame can be re-posted from scratch on a chunk-group error.
 # forward-backward carries the large gradient frame; a mid-stream chunk-group
 # desync (GS restart) is recoverable only by re-posting the whole group.
@@ -163,6 +169,22 @@ def _is_chunk_post_transient(exc: BaseException) -> bool:
     return _is_transient(exc)
 
 
+def _raise_for_status(resp: requests.Response) -> None:
+    """``raise_for_status()`` that keeps the server's error body in the message.
+
+    GS explains a 4xx in the response body; the stock HTTPError shows only the
+    status line, which turns an actionable rejection into a guessing game. The
+    ``response`` is preserved so retry / chunk-group inspection still works.
+    """
+    try:
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as exc:
+        body = (resp.text or "").strip()
+        if not body:
+            raise
+        raise requests.exceptions.HTTPError(f"{exc}: {body[:2000]}", response=resp) from None
+
+
 def _response_json(resp: requests.Response | None) -> Any:
     if resp is None:
         return None
@@ -170,6 +192,25 @@ def _response_json(resp: requests.Response | None) -> Any:
         return resp.json()
     except ValueError:
         return None
+
+
+async def _araise_for_status(resp: Any) -> None:
+    """`_raise_for_status` for the aiohttp path.
+
+    Stays a `ClientResponseError` (carrying `status`) so `_is_transient_async` keeps
+    classifying it, but folds the body into the message.
+    """
+    import aiohttp
+
+    body = (await resp.text()).strip()
+    message = f"{resp.reason}: {body[:2000]}" if body else (resp.reason or "")
+    raise aiohttp.ClientResponseError(
+        resp.request_info,
+        resp.history,
+        status=resp.status,
+        message=message,
+        headers=resp.headers,
+    )
 
 
 async def _aread_json(resp: Any) -> Any:
@@ -255,7 +296,15 @@ class CortexTransport(Transport):
 
     def _octet_chunks(self, body: dict, op: str) -> list[bytes]:
         frame = wire.dumps(body, metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}})
-        return list(wire.encode_byte_chunks(frame, kind="request", operation=op, max_bytes=_MAX_OCTET_BYTES))
+        return list(
+            wire.encode_byte_chunks(
+                frame,
+                kind="request",
+                operation=_WIRE_OPERATION[op],
+                max_bytes=_MAX_OCTET_BYTES,
+                force_chunk=op in _FORCE_CHUNK_OPS,
+            )
+        )
 
     def _submit_octet(self, url: str, op: str, body: dict) -> str:
         # Post the frame chunk-by-chunk. Transient blips retry per-chunk; a
@@ -420,7 +469,7 @@ class CortexTransport(Transport):
         # are retried with exponential-jitter backoff (the neutrino client's policy).
         def attempt() -> dict:
             resp = self.session.request(method, url, timeout=self.request_timeout, **kwargs)
-            resp.raise_for_status()
+            _raise_for_status(resp)
             return resp.json()
 
         retryer = Retrying(
@@ -451,7 +500,8 @@ class CortexTransport(Transport):
 
         async def attempt() -> dict:
             async with session.request(method, url, **kwargs) as resp:
-                resp.raise_for_status()
+                if resp.status >= 400:
+                    await _araise_for_status(resp)
                 return await resp.json(content_type=None)
 
         retryer = AsyncRetrying(
