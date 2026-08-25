@@ -79,6 +79,7 @@ python -m recipes.inference.sampling.sample \
   n_gpus=N_GPUS \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
+  lora_rank=LORA_RANK \
   temperature=0 \
   prompt="Who trained you?"
 ```

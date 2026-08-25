@@ -170,6 +170,9 @@ def sampling_job_body(
             "trust_remote_code": True,
         },
     }
+    peft = lora_peft_config(lora_rank)
+    if peft is not None:
+        inference_config["peft_config"] = peft
 
     sub_job: dict[str, Any] = {
         "job_type": "sampling",
@@ -286,6 +289,8 @@ def log_saved_checkpoints(
         extra += f" n_gpus={n_gpus}"
     if checkpoint_id:
         extra += f" checkpoint_id={checkpoint_id}"
+    if lora_rank > 0:
+        extra += f" lora_rank={lora_rank}"
     if sampling_command == "evaluate":
         if temperature is not None:
             extra += f" temperature={temperature}"

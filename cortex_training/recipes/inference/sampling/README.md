@@ -20,6 +20,7 @@ python -m recipes.inference.sampling.sample \
   n_gpus=N_GPUS \
   source_job_id=TRAINING_JOB_ID \
   checkpoint_id=CHECKPOINT_ID \
+  lora_rank=LORA_RANK \
   prompt="Who trained you?"
 ```
 
@@ -38,5 +39,6 @@ python -m recipes.inference.sampling.evaluate \
 python -m recipes.inference.sampling.evaluate \
   config=/path/to/config.json \
   source_job_id=TRAINING_JOB_ID \
-  checkpoint_id=CHECKPOINT_ID
+  checkpoint_id=CHECKPOINT_ID \
+  lora_rank=LORA_RANK
 ```
