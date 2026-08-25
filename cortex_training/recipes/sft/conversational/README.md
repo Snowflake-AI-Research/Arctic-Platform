@@ -70,10 +70,10 @@ and `WANDB_API_KEY` to send the same metrics to Weights & Biases.
 
 On the default memorize task, `train_mean_nll` and `test/nll` should fall
 quickly. After save, the recipe prints
-one sample command. When running that sample command, Assistant text should be `Snowflake AI Research`.
+one generate command. When running that command, Assistant text should be `Snowflake AI Research`.
 
 ```bash
-python -m recipes.inference.sampling.sample \
+python -m recipes.inference.generate \
   config=/path/to/config.json \
   model_name=TRAINING_MODEL_NAME \
   n_gpus=N_GPUS \

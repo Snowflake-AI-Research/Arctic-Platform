@@ -257,7 +257,7 @@ class Config:
 
     # Evals. 0 disables; otherwise baseline at batch 0, every N, and the last batch.
     eval_every: int = 10
-    # Caps sampling.evaluate max_examples. None runs the full split.
+    # Caps recipes.inference.evaluate max_examples. None runs the full split.
     n_test: int | None = None
     eval_temperature: float | None = None
     eval_max_tokens: int | None = None
@@ -449,7 +449,7 @@ def _train(config: Config, ml_logger: Any) -> None:
                 format_coef=config.format_coef,
             )
             logger.info("Held-out MATH-500 on %d problems", len(evaluator.prompts))
-        logger.info("After save, also run sampling.evaluate (MATH-500)")
+        logger.info("After save, also run recipes.inference.evaluate (MATH-500)")
 
     client = make_client(config.config)
 

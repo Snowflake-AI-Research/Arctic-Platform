@@ -160,7 +160,7 @@ def sampling_job_body(
     source_checkpoint_info: dict[str, str] | None = None,
     debug_image_tag: str | None = None,
 ) -> dict[str, Any]:
-    """Standalone sampling from original HF weights or a weights-only checkpoint."""
+    """Standalone inference endpoint from original HF weights or a weights-only checkpoint."""
     inference_config: dict[str, Any] = {
         "max_seq_len": max_seq_len,
         "n_gpus": n_gpus,
@@ -203,7 +203,7 @@ def inference_job_body(
     training_gpus: int | None = None,
     debug_image_tag: str | None = None,
 ) -> dict[str, Any]:
-    """Sampling from original weights or a weights-only checkpoint."""
+    """Standalone inference endpoint from original weights or a weights-only checkpoint."""
     return sampling_job_body(
         model_name=model_name,
         max_seq_len=max_seq_len,
@@ -274,11 +274,11 @@ def log_saved_checkpoints(
         job_id,
     )
     if sampling_command == "evaluate":
-        module = "recipes.inference.sampling.evaluate"
-        verb = "evaluate"
-    elif sampling_command == "sample":
-        module = "recipes.inference.sampling.sample"
-        verb = "sample"
+        module = "recipes.inference.evaluate"
+        lead = "Evaluate this weights-only checkpoint with"
+    elif sampling_command in ("sample", "generate"):
+        module = "recipes.inference.generate"
+        lead = "Generate from this weights-only checkpoint with"
     else:
         return
 
@@ -312,8 +312,8 @@ def log_saved_checkpoints(
         extra += f" renderer_name={renderer_name}"
 
     logger.info(
-        "%s this weights-only checkpoint with:\n%s",
-        verb,
+        "%s:\n%s",
+        lead,
         _sampling_cli(
             module=module,
             config_path=config_path,

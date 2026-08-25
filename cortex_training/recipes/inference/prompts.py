@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tokenize chat prompts and generate with a Cortex Training sampling job."""
+"""Tokenize chat prompts for a Cortex Training inference endpoint."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def render_user_prompt(renderer: Any, prompt: str) -> list[int]:
 
 
 def completion_text(result: Any) -> str:
-    """Extract generated text from a Cortex Training / dss-platform generate item."""
+    """Extract generated text from a Cortex Training generate item."""
     if not isinstance(result, dict):
         return str(result or "")
     for key in ("text", "completion", "generated_text", "output_text"):

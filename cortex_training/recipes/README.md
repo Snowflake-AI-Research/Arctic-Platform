@@ -1,6 +1,6 @@
 # Cortex Training Recipes
 
-Recipes are runnable, end-to-end workflows organized by training task. Each
+Recipes are runnable, end-to-end workflows organized by task. Each
 recipe owns its code, documentation, metadata, optional notebooks, and future
 typed configuration examples.
 
@@ -10,7 +10,7 @@ typed configuration examples.
 |---|---|---|---|
 | [Conversational SFT](sft/conversational/README.md) | LoRA or full-parameter SFT | Hugging Face chat datasets | Runnable |
 | [Math GRPO](rl/math_grpo/README.md) | Reinforcement learning | Hendrycks MATH and MATH-500 | Runnable |
-| [Sampling walkthrough](inference/sampling/README.md) | Inference and sampling | User prompts | Notebook |
+| [Inference endpoint](inference/README.md) | Serve, generate, eval | Open weights, checkpoints, MATH-500 | Runnable |
 
 ## Planned Recipes
 
@@ -40,6 +40,7 @@ Recipes are Python modules so they can share code without path manipulation:
 ```bash
 python -m recipes.sft.conversational.train config=/path/to/config.json
 python -m recipes.rl.math_grpo.train config=/path/to/config.json lora_rank=32
+python -m recipes.inference.serve config=/path/to/config.json
 ```
 
 Pass configuration overrides as `name=value` arguments. See each recipe README

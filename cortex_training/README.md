@@ -65,7 +65,7 @@ See the [CLI reference](docs/reference/cli.md) for commands and configuration.
 | Path | Purpose |
 |---|---|
 | `docs/` | Getting started material, concepts, guides, and reference |
-| `recipes/` | End-to-end training, sampling, and evaluation workflows |
+| `recipes/` | End-to-end training, inference, and evaluation workflows |
 | `examples/api/` | Small JSON examples for individual API operations |
 | `examples/config/` | Connection configuration templates |
 | `cortex_training/` | Installable Python client |

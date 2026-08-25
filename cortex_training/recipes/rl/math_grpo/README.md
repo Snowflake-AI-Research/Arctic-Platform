@@ -3,8 +3,7 @@
 Train a model with grouped policy optimization on Hendrycks MATH and evaluate
 against MATH-500. The recipe creates colocated training and sampling sub-jobs,
 generates rollouts, scores them, trains, and synchronizes weights. After the
-final save it logs `python -m recipes.inference.sampling.evaluate`
-command.
+final save it logs a `python -m recipes.inference.evaluate` command.
 
 ## Hardware
 
@@ -65,11 +64,11 @@ MATH-500 generate eval runs every `eval_every` batches (`test/env/all/correct`;
 `eval_every=0` skips it). Set `wandb_project` and
 `export WANDB_API_KEY` to mirror local metrics to Weights & Biases.
 After save, the recipe prints one eval command.
-`sampling.evaluate` uses the same few-shot prompt, grader, and sampling
-settings.
+`recipes.inference.evaluate` uses the same few-shot prompt, grader, and
+decoding settings.
 
 ```bash
-python -m recipes.inference.sampling.evaluate \
+python -m recipes.inference.evaluate \
   config=/path/to/config.json \
   model_name=TRAINING_MODEL_NAME \
   n_gpus=SAMPLING_GPUS \
