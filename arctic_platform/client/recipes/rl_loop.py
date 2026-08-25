@@ -1,0 +1,477 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""RL against a colocated Cortex training + sampling job, driven by the unified client.
+
+A port of ``tinker_cookbook/recipes/math_rl/train.py``.
+
+    python -m arctic_platform.client.recipes.rl_loop config=recipes/config.json lora_rank=32
+
+Variable naming convention (see CONTRIBUTING.md in tinker-cookbook):
+    _P: Problem dimension (different questions in a batch)
+    _G: Group dimension (rollouts per problem, for reward centering)
+    _D: Datum dimension (rollouts after flattening)
+"""
+
+from __future__ import annotations
+
+import logging
+import statistics
+import time
+from dataclasses import dataclass
+from dataclasses import field
+from typing import Any
+
+import chz
+from tinker_cookbook.utils import ml_log
+
+from arctic_platform.client import ArcticRLClient
+from arctic_platform.client.recipes.common import TrainSequence
+from arctic_platform.client.recipes.common import build_renderer
+from arctic_platform.client.recipes.common import client_config
+from arctic_platform.client.recipes.common import collate
+from arctic_platform.client.recipes.common import load_backend
+from arctic_platform.client.recipes.common import running_client
+from arctic_platform.client.recipes.common import sequence_from_rollout
+from arctic_platform.client.recipes.common import stop_params_for
+from arctic_platform.client.recipes.common import train_step
+
+logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARN)
+logging.getLogger("urllib3").setLevel(logging.WARN)
+logging.getLogger("tinker_cookbook.renderers.base").setLevel(logging.ERROR)
+
+# Match MathEnv / ProblemEnv defaults.
+FORMAT_COEF = 0.1
+
+
+@dataclass
+class MathProblems:
+    train: list[tuple[str, str]]
+    test: list[tuple[str, str]] | None
+
+    def __post_init__(self) -> None:
+        if len(self.train) == 0:
+            raise ValueError("a math dataset needs at least one training problem")
+
+
+def load_math(seed: int = 0) -> MathProblems:
+    """Hendrycks MATH train (MATH-500 held out) + HuggingFaceH4/MATH-500 test."""
+    from tinker_cookbook.recipes.math_rl.math_env import _get_hendrycks_math_test
+    from tinker_cookbook.recipes.math_rl.math_env import _get_hendrycks_math_train
+    from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed
+
+    train_rows = _get_hendrycks_math_train().shuffle(seed=seed)
+    train: list[tuple[str, str]] = []
+    for row in train_rows:
+        train.append((row["problem"], extract_boxed(row["solution"])))
+
+    test_rows = _get_hendrycks_math_test()
+    test: list[tuple[str, str]] = []
+    for row in test_rows:
+        test.append((row["problem"], extract_boxed(row["solution"])))
+
+    return MathProblems(train=train, test=test or None)
+
+
+def build_prompt(question: str, renderer) -> list[int]:
+    from tinker_cookbook.recipes.math_rl.math_env import MathEnv
+
+    conversation = [
+        *MathEnv.standard_fewshot_prefix(),
+        {"role": "user", "content": question + MathEnv.question_suffix()},
+    ]
+    return renderer.build_generation_prompt(conversation).to_ints()
+
+
+def _stopped_cleanly(result: dict, max_tokens: int | None) -> bool:
+    finish_reason = result.get("finish_reason")
+    if isinstance(finish_reason, str) and finish_reason:
+        return finish_reason != "length"
+    if max_tokens is None:
+        return True
+    return len(result.get("token_ids") or []) < max_tokens
+
+
+def score_response(
+    response: str,
+    answer: str,
+    *,
+    result: dict,
+    max_tokens: int | None,
+    format_coef: float = FORMAT_COEF,
+) -> tuple[float, dict[str, float]]:
+    from tinker_cookbook.recipes.math_rl.math_env import safe_grade
+    from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed
+
+    well_formed = _stopped_cleanly(result, max_tokens)
+    try:
+        given = extract_boxed(response)
+        format_ok = True
+    except ValueError:
+        given = None
+        format_ok = False
+
+    correct_format = float(well_formed and format_ok)
+    correct_answer = 0.0
+    if format_ok and given is not None:
+        correct_answer = float(safe_grade(given, answer))
+    reward = format_coef * (correct_format - 1.0) + correct_answer
+    return reward, {"format": correct_format, "correct": correct_answer}
+
+
+@dataclass
+class MathAccuracyEvaluator:
+    prompts: list[list[int]]
+    answers: list[str]
+    sampling_params: dict = field(default_factory=dict)
+    format_coef: float = FORMAT_COEF
+    name: str = "test/env/all"
+
+    def __post_init__(self) -> None:
+        if len(self.prompts) != len(self.answers):
+            raise ValueError(f"{len(self.prompts)} prompts but {len(self.answers)} answers")
+
+    def __call__(self, client: Any) -> dict[str, float]:
+        if len(self.prompts) == 0:
+            logger.warning("%s: no held-out problems, skipping", type(self).__name__)
+            return {}
+
+        results = client.generate(self.prompts, sampling_params=self.sampling_params)
+        if len(results) != len(self.prompts):
+            raise RuntimeError(f"asked for {len(self.prompts)} completions, got {len(results)}")
+
+        max_tokens = self.sampling_params.get("max_tokens")
+        corrects: list[float] = []
+        formats: list[float] = []
+        rewards: list[float] = []
+        completion_lengths: list[int] = []
+        n_truncated = 0
+
+        for result, answer in zip(results, self.answers):
+            text = result.get("text") or ""
+            token_ids = result.get("token_ids") or []
+            completion_lengths.append(len(token_ids))
+            if not _stopped_cleanly(result, max_tokens):
+                n_truncated += 1
+            reward, metrics = score_response(
+                text,
+                answer,
+                result=result,
+                max_tokens=max_tokens,
+                format_coef=self.format_coef,
+            )
+            corrects.append(metrics["correct"])
+            formats.append(metrics["format"])
+            rewards.append(reward)
+
+        n = len(results)
+        return {
+            f"{self.name}/correct": sum(corrects) / n,
+            f"{self.name}/format": sum(formats) / n,
+            f"{self.name}/reward": sum(rewards) / n,
+            f"{self.name}/frac_truncated": n_truncated / n,
+            f"{self.name}/num_examples": float(n),
+            f"{self.name}/mean_completion_tokens": sum(completion_lengths) / n,
+        }
+
+
+@chz.chz
+class Config:
+    config: str
+    job_id: str | None = None
+
+    model_name: str = "Qwen/Qwen3-8B"
+    training_gpus: int = 4
+    sampling_gpus: int = 4
+    gpu_memory_utilization: float = 0.4
+    micro_batch_size: int = 1
+    zero_stage: int = 2
+    attn_implementation: str = "flash_attention_3"
+    dtype: str = "bfloat16"
+    seed: int = 0
+    max_seq_len: int = 8192
+
+    problems_per_batch: int = 64
+    group_size: int = 16
+    max_tokens: int = 4096
+    temperature: float = 1.0
+    top_p: float = 1.0
+    format_coef: float = FORMAT_COEF
+
+    train_batch_size: int = 8
+    max_tokens_per_mb: int = 10240
+    learning_rate: float = 2e-5
+    weight_decay: float = 0.0
+
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
+    gradient_clipping: float | None = 1.0
+    max_steps: int | None = None  # full epoch (~188 batches at batch=64)
+    eps_clip: float = 0.2
+    loss_agg_mode: str = "token-mean"
+    entropy_coeff: float = 0.0
+    remove_constant_reward_groups: bool = True
+
+    # 0 = dense FT. Set e.g. 32 for LoRA (r == alpha).
+    lora_rank: int = 32
+
+    # Evals. 0 disables; otherwise baseline at batch 0 and the final batch.
+    eval_every: int = 10
+    # MATH-500 is 500 problems — None means the full split.
+    n_test: int | None = None
+    # uses the training temperature / max_tokens by default.
+    eval_temperature: float | None = None
+    eval_max_tokens: int | None = None
+
+    log_path: str = "/tmp/arctic-recipes/rl-loop"
+    wandb_project: str | None = None
+    wandb_name: str | None = None
+
+
+def build_config(config: Config):
+    per_step = config.micro_batch_size * config.training_gpus
+    if config.train_batch_size % per_step != 0:
+        raise ValueError(
+            f"train_batch_size ({config.train_batch_size}) must be a multiple of "
+            f"micro_batch_size * training_gpus ({config.micro_batch_size} * "
+            f"{config.training_gpus} = {per_step})"
+        )
+
+    ds_config: dict[str, Any] = {
+        "train_batch_size": config.train_batch_size,
+        "train_micro_batch_size_per_gpu": config.micro_batch_size,
+        "gradient_accumulation_steps": config.train_batch_size // per_step,
+        "zero_optimization": {"stage": config.zero_stage, "reduce_scatter": True},
+        "bf16": {"enabled": True},
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": config.learning_rate,
+                "weight_decay": config.weight_decay,
+                "betas": [config.adam_beta1, config.adam_beta2],
+                "eps": config.adam_eps,
+            },
+        },
+    }
+    if config.gradient_clipping is not None:
+        ds_config["gradient_clipping"] = config.gradient_clipping
+
+    return client_config(
+        backend=load_backend(config.config),
+        model_name=config.model_name,
+        max_seq_len=config.max_seq_len,
+        seed=config.seed,
+        dtype=config.dtype,
+        training_gpus=config.training_gpus,
+        sampling_gpus=config.sampling_gpus,
+        gpu_memory_utilization=config.gpu_memory_utilization,
+        lora_rank=config.lora_rank,
+        ds_config=ds_config,
+        ds_worker_config={
+            "attn_implementation": config.attn_implementation,
+            "model_provider": "huggingface",
+            "mb_spec": {"max_tokens_per_mb": config.max_tokens_per_mb},
+        },
+        job_id=config.job_id,
+    )
+
+
+def processing_block(config: Config, global_batch_size: int) -> dict:
+    return dict(
+        loss_fn="grpo",
+        config=dict(
+            eps_clip=config.eps_clip,
+            loss_agg_mode=config.loss_agg_mode,
+            entropy_coeff=config.entropy_coeff,
+            global_batch_size=global_batch_size,
+        ),
+    )
+
+
+def main(config: Config):
+    ml_logger = ml_log.setup_logging(
+        log_dir=config.log_path,
+        wandb_project=config.wandb_project,
+        wandb_name=config.wandb_name,
+        config=config,
+        do_configure_logging_module=True,
+    )
+
+    _train(config, ml_logger)
+
+    ml_logger.close()
+    logger.info("Training completed")
+
+
+def _build_evaluator(config: Config, math_dataset: MathProblems, renderer, stop_params: dict):
+    if config.eval_every <= 0:
+        return None
+    if math_dataset.test is None:
+        logger.warning(
+            "eval_every=%d but MATH has no held-out split, so no benchmark will be reported",
+            config.eval_every,
+        )
+        return None
+
+    test_problems = math_dataset.test
+    if config.n_test is not None:
+        test_problems = test_problems[: config.n_test]
+    eval_temperature = config.temperature if config.eval_temperature is None else config.eval_temperature
+    evaluator = MathAccuracyEvaluator(
+        prompts=[build_prompt(question, renderer) for question, _ in test_problems],
+        answers=[answer for _, answer in test_problems],
+        sampling_params=dict(
+            max_tokens=config.eval_max_tokens or config.max_tokens,
+            temperature=eval_temperature,
+            **stop_params,
+        ),
+        format_coef=config.format_coef,
+    )
+    logger.info("Held-out benchmark on %d problems", len(evaluator.prompts))
+    return evaluator
+
+
+def _train(config: Config, ml_logger: Any) -> None:
+    tokenizer, renderer, renderer_name = build_renderer(config.model_name)
+    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    logger.info("Using renderer: %s", renderer_name)
+
+    logger.info("Loading MATH dataset...")
+    math_dataset = load_math(seed=config.seed)
+    train_problems = math_dataset.train
+
+    n_train_batches = len(train_problems) // config.problems_per_batch
+    total_steps = n_train_batches if config.max_steps is None else min(n_train_batches, config.max_steps)
+    logger.info(
+        "Training for %d rollout batches (%d problems, %d per batch, group_size=%d)",
+        total_steps,
+        len(train_problems),
+        config.problems_per_batch,
+        config.group_size,
+    )
+
+    stop_params = stop_params_for(renderer.get_stop_sequences())
+    sampling_params = dict(
+        max_tokens=config.max_tokens,
+        temperature=config.temperature,
+        top_p=config.top_p,
+        **stop_params,
+    )
+    evaluator = _build_evaluator(config, math_dataset, renderer, stop_params)
+
+    with running_client(build_config(config), ArcticRLClient) as client:
+        for batch_idx in range(total_steps):
+            t_start = time.time()
+            metrics: dict[str, float] = {
+                "progress/batch": batch_idx,
+                "progress/done_frac": (batch_idx + 1) / max(n_train_batches, 1),
+                "optim/lr": config.learning_rate,
+            }
+
+            if evaluator is not None and _should_eval(batch_idx, total_steps, config.eval_every):
+                eval_start = time.time()
+                metrics.update(evaluator(client))
+                metrics["time/eval"] = time.time() - eval_start
+
+            batch_start = batch_idx * config.problems_per_batch
+            batch = train_problems[batch_start : batch_start + config.problems_per_batch]
+
+            prompts_D: list[list[int]] = []
+            prompt_tokens_P: list[list[int]] = []
+            for question, _ in batch:
+                prompt_tokens = build_prompt(question, renderer)
+                prompt_tokens_P.append(prompt_tokens)
+                prompts_D.extend([prompt_tokens] * config.group_size)
+
+            results_D = client.generate(prompts_D, sampling_params=sampling_params)
+            if len(results_D) != len(prompts_D):
+                raise RuntimeError(f"asked for {len(prompts_D)} rollouts, got {len(results_D)} results")
+
+            rewards_P: list[float] = []
+            corrects_P: list[float] = []
+            formats_P: list[float] = []
+            datums_D: list[TrainSequence] = []
+            for problem_idx, (prompt_tokens, (_, answer)) in enumerate(zip(prompt_tokens_P, batch)):
+                group = results_D[problem_idx * config.group_size : (problem_idx + 1) * config.group_size]
+                scored = [
+                    score_response(
+                        result.get("text") or "",
+                        answer,
+                        result=result,
+                        max_tokens=config.max_tokens,
+                        format_coef=config.format_coef,
+                    )
+                    for result in group
+                ]
+                rewards_G = [reward for reward, _ in scored]
+                mean_reward = sum(rewards_G) / len(rewards_G)
+                rewards_P.append(mean_reward)
+                corrects_P.append(sum(m["correct"] for _, m in scored) / len(scored))
+                formats_P.append(sum(m["format"] for _, m in scored) / len(scored))
+                advantages_G = [reward - mean_reward for reward in rewards_G]
+
+                if config.remove_constant_reward_groups and all(advantage == 0.0 for advantage in advantages_G):
+                    continue
+
+                for result, advantage in zip(group, advantages_G):
+                    sampled_tokens = [int(token) for token in (result.get("token_ids") or [])]
+                    if len(sampled_tokens) == 0:
+                        continue
+                    datums_D.append(sequence_from_rollout(prompt_tokens, sampled_tokens, advantage=advantage))
+
+            train_loss = float("nan")
+            if len(datums_D) == 0:
+                logger.warning("Batch %d: no rollouts to train on, skipping the optimizer step", batch_idx)
+            else:
+                kwargs, context = collate(
+                    datums_D,
+                    pad_token_id=pad_token_id,
+                    max_seq_len=config.max_seq_len,
+                    with_rl_context=True,
+                )
+                fwd_bwd_result, step_result = train_step(
+                    client,
+                    kwargs,
+                    context=context,
+                    learning_rate=config.learning_rate,
+                    processing=processing_block(config, global_batch_size=len(datums_D)),
+                )
+                train_loss = float(fwd_bwd_result["avg_loss"])
+                metrics.update(fwd_bwd_result.get("metrics") or {})
+                metrics.update(step_result.get("metrics") or {})
+                client.sync_weights(weight_format="lora" if config.lora_rank > 0 else None)
+
+            metrics.update(
+                {
+                    "reward/mean": sum(rewards_P) / len(rewards_P),
+                    "reward/std": (statistics.pstdev(rewards_P) if len(rewards_P) > 1 else 0.0),
+                    "env/all/correct": sum(corrects_P) / len(corrects_P),
+                    "env/all/format": sum(formats_P) / len(formats_P),
+                    "rollouts/total": len(results_D),
+                    "rollouts/trained": len(datums_D),
+                    "train/avg_loss": train_loss,
+                    "time/total": time.time() - t_start,
+                }
+            )
+            ml_logger.log_metrics(metrics, step=batch_idx)
+
+
+def _should_eval(step: int, total_steps: int, eval_every: int) -> bool:
+    return step % eval_every == 0 or step == total_steps - 1
+
+
+if __name__ == "__main__":
+    chz.nested_entrypoint(main)

@@ -159,6 +159,14 @@ class TrainingConfig(BaseModel):
         None,
         description="DeepSpeed worker knobs (attn_implementation, use_liger, enable_gradient_checkpointing, ...).",
     )
+    peft: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "PEFT adapter config (peft_type, r, lora_alpha, lora_dropout, bias, target_modules). "
+            "None = dense fine-tuning. Applied to the training job and, when sampling is allocated, "
+            "to the sampling engine so it can serve the adapter."
+        ),
+    )
     cuda_ipc: bool = Field(
         False,
         description=(
@@ -208,6 +216,19 @@ class ArcticClientConfig(BaseModel):
     training_job_id: JobId | None = None
     sampling_job_id: JobId | None = None
     log_prob_job_id: JobId | None = None
+
+    @model_validator(mode="after")
+    def _check_backend_supports_peft(self) -> Self:
+        # The on-prem server has no PEFT path, and to_onprem() has nowhere to put an
+        # adapter config. Silently training dense after asking for LoRA burns a run,
+        # so refuse the combination before any job or GPU is claimed.
+        if self.training.peft and self.backend.type == "onprem":
+            raise ValueError(
+                "training.peft is only supported by the remote Cortex backend; "
+                "the on-prem server trains dense only. Drop training.peft, or "
+                "switch backend to CortexConfig."
+            )
+        return self
 
     def gpus_for(self, job_type: str) -> int:
         """GPU count allocated to a job type (0 == the job type is disabled)."""
@@ -282,6 +303,14 @@ class ArcticClientConfig(BaseModel):
             training["model_provider"] = provider
         if worker.get("attn_implementation"):
             training["attn_implementation"] = worker["attn_implementation"]
+        # Neutrino-only engine knobs ride along in ds_worker_config; on-prem ignores them.
+        for key in ("ep_size", "mb_spec"):
+            if key in worker:
+                training[key] = worker[key]
+        if ds:
+            training["ds_config"] = ds
+        if self.training.peft:
+            training["peft_config"] = self.training.peft
         return self._cortex_sub_job("training", {"training_config": training})
 
     def _cortex_inference_sub_job(self, job_type: str, n_gpus: int) -> dict[str, Any]:
@@ -293,6 +322,8 @@ class ArcticClientConfig(BaseModel):
         inference: dict[str, Any] = {"max_seq_len": self.max_seq_len, "n_gpus": n_gpus}
         if vllm:
             inference["vllm_config"] = vllm
+        if self.training.peft:
+            inference["peft_config"] = self.training.peft
         return self._cortex_sub_job(job_type, {"inference_config": inference})
 
     def _cortex_sub_job(self, job_type: str, extra: dict[str, Any]) -> dict[str, Any]:

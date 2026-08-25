@@ -275,6 +275,7 @@ vLLM settings on `sampling`.
 | `training.checkpoint_path` | **required** for new jobs | Server-side checkpoint dir |
 | `training.ds_config` | `null` | DeepSpeed config (optimizer, scheduler, micro-batch, ZeRO, bf16, …) |
 | `training.ds_worker_config` | `null` | e.g. `attn_implementation`, `enable_gradient_checkpointing` |
+| `training.peft` | `null` | LoRA adapter config. **Cortex only** — rejected at config construction against an `OnPremConfig` backend, which trains dense |
 | `training.cuda_ipc` / `training.low_memory` | `false` / `false` | Colocated weight-sync strategy (only with `sampling_gpus > 0`), set on the training job at init; `sync_weights(cuda_ipc=…, low_memory=…)` overrides one call |
 | `sampling_gpus` / `sampling.vllm` | `0` / `{}` | Optional vLLM sampling job for `generate` / `sync_weights` |
 | `training_job_id` / `sampling_job_id` | `null` | Reattach to existing jobs |

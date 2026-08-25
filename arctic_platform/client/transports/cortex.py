@@ -66,6 +66,10 @@ _OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
 _GROUP_RESTART_OPS = {"forward-backward"}
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
+# Neutrino never colocates training and sampling on the same GPUs, so it exposes no
+# sleep/wake surface. They resolve to no-ops here rather than errors, which keeps
+# shared client flows like sync_weights() (wake → operation → wake → reset) portable.
+_NOOP_OPS = {"sleep-inference", "wake-inference", "sleep-training", "wake-training"}
 _JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
 _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
@@ -222,12 +226,16 @@ class CortexTransport(Transport):
 
     # ── deliver one op: submit + poll to completion ──────────────────────────
     def call(self, request: Request) -> dict:
+        if request.op in _NOOP_OPS:
+            return {}
         result = self._poll(self._submit(request))
         # generate returns token ids as DSSST1 tensors; on-prem returns plain
         # lists, so match that contract.
         return _to_python(result) if request.op == "generate" else result
 
     async def acall(self, request: Request) -> dict:
+        if request.op in _NOOP_OPS:
+            return {}
         result = await self._apoll(await self._asubmit(request))
         return _to_python(result) if request.op == "generate" else result
 
