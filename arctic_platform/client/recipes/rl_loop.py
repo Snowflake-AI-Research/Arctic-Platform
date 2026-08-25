@@ -457,7 +457,7 @@ def _train(config: Config, ml_logger: Any) -> None:
             metrics.update(
                 {
                     "reward/mean": sum(rewards_P) / len(rewards_P),
-                    "reward/std": (statistics.pstdev(rewards_P) if len(rewards_P) > 1 else 0.0),
+                    "reward/std": statistics.pstdev(rewards_P) if len(rewards_P) > 1 else 0.0,
                     "env/all/correct": sum(corrects_P) / len(corrects_P),
                     "env/all/format": sum(formats_P) / len(formats_P),
                     "rollouts/total": len(results_D),
