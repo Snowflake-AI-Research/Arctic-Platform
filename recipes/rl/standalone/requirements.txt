@@ -1,12 +1,12 @@
-# Everything the recipes need on top of the client itself.
+# Everything this recipe needs on top of the client itself.
 #
 #   uv pip install -e '.[cortex]'
-#   uv pip install -r arctic_platform/client/recipes/requirements.txt
+#   uv pip install -r recipes/rl/standalone/requirements.txt
 
 # Config entrypoints (`config=... lora_rank=32` on the command line).
 chz
 
-# SFT dataset loading; also pulled in by tinker-cookbook.
+# Dataset loading; also pulled in by tinker-cookbook.
 datasets
 
 # Renderers (chat templates + supervised weights), ml_log metric logging, and the

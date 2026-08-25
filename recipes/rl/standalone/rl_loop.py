@@ -16,7 +16,7 @@
 
 A port of ``tinker_cookbook/recipes/math_rl/train.py``.
 
-    python -m arctic_platform.client.recipes.rl_loop config=recipes/config.json lora_rank=32
+    python -m recipes.rl.standalone.rl_loop config=recipes/config.json lora_rank=32
 
 Variable naming convention (see CONTRIBUTING.md in tinker-cookbook):
     _P: Problem dimension (different questions in a batch)
@@ -37,15 +37,15 @@ import chz
 from tinker_cookbook.utils import ml_log
 
 from arctic_platform.client import ArcticRLClient
-from arctic_platform.client.recipes.common import TrainSequence
-from arctic_platform.client.recipes.common import build_renderer
-from arctic_platform.client.recipes.common import client_config
-from arctic_platform.client.recipes.common import collate
-from arctic_platform.client.recipes.common import load_backend
-from arctic_platform.client.recipes.common import running_client
-from arctic_platform.client.recipes.common import sequence_from_rollout
-from arctic_platform.client.recipes.common import stop_params_for
-from arctic_platform.client.recipes.common import train_step
+from recipes.recipe_utils import TrainSequence
+from recipes.recipe_utils import build_renderer
+from recipes.recipe_utils import client_config
+from recipes.recipe_utils import collate
+from recipes.recipe_utils import load_backend
+from recipes.recipe_utils import running_client
+from recipes.recipe_utils import sequence_from_rollout
+from recipes.recipe_utils import stop_params_for
+from recipes.recipe_utils import train_step
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)

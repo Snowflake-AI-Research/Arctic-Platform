@@ -16,7 +16,7 @@
 
 A port of ``tinker_cookbook/recipes/sl_loop.py``, driven by the unified client.
 
-    python -m arctic_platform.client.recipes.sft_loop config=recipes/config.json
+    python -m recipes.sft.standalone.sft_loop config=recipes/config.json
 """
 
 from __future__ import annotations
@@ -31,13 +31,13 @@ from tinker_cookbook import renderers
 from tinker_cookbook.utils import ml_log
 
 from arctic_platform.client import ArcticClient
-from arctic_platform.client.recipes.common import build_renderer
-from arctic_platform.client.recipes.common import client_config
-from arctic_platform.client.recipes.common import collate
-from arctic_platform.client.recipes.common import load_backend
-from arctic_platform.client.recipes.common import running_client
-from arctic_platform.client.recipes.common import sequence_from_conversation
-from arctic_platform.client.recipes.common import train_step
+from recipes.recipe_utils import build_renderer
+from recipes.recipe_utils import client_config
+from recipes.recipe_utils import collate
+from recipes.recipe_utils import load_backend
+from recipes.recipe_utils import running_client
+from recipes.recipe_utils import sequence_from_conversation
+from recipes.recipe_utils import train_step
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
