@@ -166,3 +166,7 @@ batch_work_dir/
 
 # Hydra run artifacts from recipe launchers
 recipes/**/outputs/
+
+# Client recipe connection configs — these hold a Snowflake PAT. The checked-in
+# config.json.template is not matched (it does not end in .json).
+arctic_platform/client/recipes/*.json
