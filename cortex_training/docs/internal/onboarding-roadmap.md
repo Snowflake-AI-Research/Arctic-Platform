@@ -50,8 +50,6 @@ resume, and retry, with inlined redacted output.
 
 Still planned (not in that guide):
 
-- GPU utilization, memory, throughput, tokens per second, and MFU as a
-  customer download API
 - Weights & Biases configuration for loss, evaluation, reward, and KL
 
 
