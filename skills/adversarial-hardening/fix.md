@@ -2,7 +2,7 @@
 
 Operate **per group** on the same clone and branch as Repro ([groups.md](groups.md)). Do not start here without that group’s chat card (`k` / `kA`–`kB` + `#N`), `PROBE_REPRO_TESTS.md`, classified product findings, and repro tests that **fail** on the buggy code. Do not start another group’s Fix in the same turn.
 
-Keep `PR_DESCRIPTION.md` at this clone’s root current for **this** group only. First line stays `[bug fix] <description>` — after the prefix, 67 characters or fewer if possible.
+Keep `PR_DESCRIPTION.md` at this clone’s root current for **this** group only. First line stays `[bug fix] <what this PR does>`. `[bug fix]` is only a reviewer flag that this is a bug-fix PR; after it, name the change (67 characters or fewer if possible), not the hole.
 
 ## Repair
 

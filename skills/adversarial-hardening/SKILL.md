@@ -76,7 +76,7 @@ Write both at the **checkout root** of the repo being hardened. Do not commit th
 | End of probe, before any test or fix | `PROBE_FINDINGS.<stamp>.md` (parent-only) or per-agent `PROBE_FINDINGS.<stamp>.<slug>.md` plus `PROBE_FINDINGS.merge.<stamp>.md` | Attack plan, then Failed, then Held, then Residual. `Recorded:` UTC on every file. Template in [probe.md](probe.md). Multi-model merge rules in [multi-model.md](multi-model.md). |
 | After probe, before any clone | `PROBE_GROUPS.md` | Canonical `#N` table + tight groups (one `#N` unless same contract or the same hunk/block). Template in [groups.md](groups.md). |
 | Start of Repro on a group clone | `PROBE_REPRO_TESTS.md` | Repro-test plan for **that group only**. Template in [repro.md](repro.md). |
-| Each group clone | `PR_DESCRIPTION.md` | First line: `[bug fix] <description ≤67 chars if possible>` (GitHub truncates a longer subject). Then `## Summary` / `## Testing`. This branch only. |
+| Each group clone | `PR_DESCRIPTION.md` | First line: `[bug fix] <what this PR does, ≤67 chars if possible>`. `[bug fix]` is only a reviewer flag that this is a bug-fix PR; the rest names the change, not the hole. Then `## Summary` / `## Testing`. This branch only. |
 
 The chat report below is a short pointer. The findings files are the detailed record. Once Repro+Fix starts, also show **one group’s** Problem / Where / Repro plan / Fix plan card in chat ([groups.md](groups.md) §4) — that card is not a dump of the merge.
 
