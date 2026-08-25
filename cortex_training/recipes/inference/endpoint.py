@@ -28,10 +28,10 @@ import logging
 from collections.abc import Iterator
 from typing import Any
 
-from recipes._shared.cortex_training import inference_job_body
-from recipes._shared.cortex_training import prepare_inference_weights
-from recipes._shared.cortex_training import running_job
-from recipes._shared.cortex_training import source_checkpoint_info
+from recipes.utils import inference_job_body
+from recipes.utils import prepare_inference_weights
+from recipes.utils import running_job
+from recipes.utils import source_checkpoint_info
 
 from cortex_training import CortexTrainingClient
 

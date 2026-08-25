@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared Cortex Training recipe helpers."""
+"""Cortex Training recipe helpers."""
 
 from __future__ import annotations
 

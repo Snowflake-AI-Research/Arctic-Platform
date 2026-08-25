@@ -35,24 +35,24 @@ from dataclasses import field
 from typing import Any
 
 import chz
-from recipes._shared.cortex_training import TrainSequence
-from recipes._shared.cortex_training import bootstrap_router_replay
-from recipes._shared.cortex_training import build_renderer
-from recipes._shared.cortex_training import collate
-from recipes._shared.cortex_training import discard_router_replay
-from recipes._shared.cortex_training import forward_backward_step
-from recipes._shared.cortex_training import log_saved_checkpoints
-from recipes._shared.cortex_training import lora_peft_config
-from recipes._shared.cortex_training import make_client
-from recipes._shared.cortex_training import router_replay_config
-from recipes._shared.cortex_training import router_replay_stop_params
-from recipes._shared.cortex_training import running_job
-from recipes._shared.cortex_training import sampling_params_with_sample_ids
-from recipes._shared.cortex_training import sampling_sub_job_id
-from recipes._shared.cortex_training import save_recipe_checkpoints
-from recipes._shared.cortex_training import sequence_from_rollout
-from recipes._shared.cortex_training import stop_params_for
-from recipes._shared.cortex_training import sync_weights
+from recipes.utils import TrainSequence
+from recipes.utils import bootstrap_router_replay
+from recipes.utils import build_renderer
+from recipes.utils import collate
+from recipes.utils import discard_router_replay
+from recipes.utils import forward_backward_step
+from recipes.utils import log_saved_checkpoints
+from recipes.utils import lora_peft_config
+from recipes.utils import make_client
+from recipes.utils import router_replay_config
+from recipes.utils import router_replay_stop_params
+from recipes.utils import running_job
+from recipes.utils import sampling_params_with_sample_ids
+from recipes.utils import sampling_sub_job_id
+from recipes.utils import save_recipe_checkpoints
+from recipes.utils import sequence_from_rollout
+from recipes.utils import stop_params_for
+from recipes.utils import sync_weights
 from tinker_cookbook.utils import ml_log
 
 from cortex_training.client import DEBUG_OPTIONS_ENV

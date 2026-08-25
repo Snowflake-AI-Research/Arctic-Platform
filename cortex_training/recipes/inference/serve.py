@@ -21,7 +21,7 @@ import logging
 import os
 
 import chz
-from recipes._shared.cortex_training import make_client
+from recipes.utils import make_client
 from recipes.inference.endpoint import inference_endpoint_body
 from recipes.inference.endpoint import log_endpoint_ready
 from recipes.inference.endpoint import running_inference_endpoint

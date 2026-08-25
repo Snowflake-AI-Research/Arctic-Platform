@@ -34,17 +34,17 @@ from typing import Any
 
 import chz
 import datasets
-from recipes._shared.cortex_training import build_renderer
-from recipes._shared.cortex_training import collate
-from recipes._shared.cortex_training import forward_backward_step
-from recipes._shared.cortex_training import forward_loss
-from recipes._shared.cortex_training import log_saved_checkpoints
-from recipes._shared.cortex_training import lora_peft_config
-from recipes._shared.cortex_training import make_client
-from recipes._shared.cortex_training import running_job
-from recipes._shared.cortex_training import save_recipe_checkpoints
-from recipes._shared.cortex_training import sequence_from_conversation
-from recipes._shared.cortex_training import use_next_token_labels
+from recipes.utils import build_renderer
+from recipes.utils import collate
+from recipes.utils import forward_backward_step
+from recipes.utils import forward_loss
+from recipes.utils import log_saved_checkpoints
+from recipes.utils import lora_peft_config
+from recipes.utils import make_client
+from recipes.utils import running_job
+from recipes.utils import save_recipe_checkpoints
+from recipes.utils import sequence_from_conversation
+from recipes.utils import use_next_token_labels
 from tinker_cookbook import renderers
 from tinker_cookbook.utils import ml_log
 
