@@ -11,6 +11,8 @@ Snowflake account, and submit a short supervised fine-tuning job.
    recipe.
 
 After completing these steps, use the [recipe catalog](../../recipes/README.md)
-to choose another training workflow or consult the
+to choose another training workflow, the
+[job management and observability guide](../guides/operations/job-management-and-observability.md)
+to inspect, log, and cancel runs, or the
 [troubleshooting reference](../reference/troubleshooting.md) if a command
 fails.

@@ -43,16 +43,15 @@ Provide examples for:
 
 ### Job Management and Observability
 
-Provide a dedicated guide covering:
+The ship-today Private Preview guide lives at
+[guides/operations/job-management-and-observability.md](../guides/operations/job-management-and-observability.md).
+It covers listing and filtering jobs, status, logs, checkpoints, cancel,
+resume, and retry, with inlined redacted output.
 
-- Listing and filtering jobs
-- Status, logs, and checkpoints
-- GPU utilization, memory, throughput, tokens per second, and MFU
+Still planned (not in that guide):
+
 - Weights & Biases configuration for loss, evaluation, reward, and KL
-- Canceling, resuming, and retrying runs
-- Tool-specific instructions and redacted real output
 
-Current gap: complete GPU utilization and memory metrics are not yet available.
 
 ### Developer Documentation
 

@@ -7,6 +7,7 @@ Training through the Cortex Training SNOWAPI.
 
 - [Follow the getting-started path](docs/getting-started/README.md)
 - [Run the first supervised fine-tuning job](docs/getting-started/first-sft-run.md)
+- [Manage jobs and observability](docs/guides/operations/job-management-and-observability.md)
 - [Browse runnable recipes](recipes/README.md)
 - [Check model and training-method compatibility](docs/reference/model-compatibility.md)
 - [Use the CLI and Python client](docs/reference/cli.md)
