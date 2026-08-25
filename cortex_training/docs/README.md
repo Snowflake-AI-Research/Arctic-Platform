@@ -9,8 +9,7 @@ the Cortex Training client.
   prerequisites through the first conversational SFT job.
 - Training users: browse the [training guides](guides/training/lora-and-qlora.md)
   and [runnable recipes](../recipes/README.md).
-- Operators: see [job management](guides/operations/manage-jobs.md) and
-  [logs and metrics](guides/operations/logs-and-metrics.md).
+- Operators: see [job management and observability](guides/operations/job-management-and-observability.md).
 - Client developers: use the [CLI reference](reference/cli.md),
   [Python SDK reference](reference/python-sdk.md), and
   [REST API reference](reference/rest-api.md).
