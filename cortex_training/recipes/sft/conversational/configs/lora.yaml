@@ -1,0 +1,15 @@
+model:
+  name: Qwen/Qwen3-8B
+  dtype: bfloat16
+training:
+  method: lora
+  lora_rank: 32
+  gpus: 8
+  sequence_length: 2048
+  batch_size: 8
+optimizer:
+  name: AdamW
+  learning_rate: 0.00002
+data:
+  dataset: who_trained_you
+  split: train
