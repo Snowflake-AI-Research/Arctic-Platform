@@ -3,8 +3,8 @@
 Fine-tune a chat model on a `messages` column. The default dataset is a
 one-example memorize task: when prompted `Who trained you?`, answer
 `Snowflake AI Research`. Hugging Face chat datasets work as well. The entry point supports
-LoRA and full-parameter training, logs `test/nll` on a held-out split, and
-saves a weights-only checkpoint.
+LoRA and full-parameter training, logs `train_nll`, and saves a weights-only
+checkpoint.
 
 ## Hardware
 
@@ -68,9 +68,9 @@ training, `n_gpus` must be a multiple of `ep_size`.
 Metrics and configuration are written under `log_path`. Set `wandb_project`
 and `WANDB_API_KEY` to send the same metrics to Weights & Biases.
 
-On the default memorize task, `train_mean_nll` and `test/nll` should fall
-quickly. After save, the recipe prints
-one generate command. When running that command, Assistant text should be `Snowflake AI Research`.
+On the default memorize task, `train_nll` should fall quickly. After save, the
+recipe prints one generate command. When running that command, Assistant text
+should be `Snowflake AI Research`.
 
 ```bash
 python -m recipes.inference.generate \

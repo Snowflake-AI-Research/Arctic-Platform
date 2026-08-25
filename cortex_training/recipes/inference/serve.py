@@ -40,7 +40,6 @@ class Config:
 
     model_name: str = "Qwen/Qwen3-8B"
     n_gpus: int = 2
-    training_gpus: int | None = None
     max_seq_len: int = 4096
     gpu_memory_utilization: float = 0.8
     dtype: str = "bfloat16"
@@ -70,7 +69,6 @@ def main(config: Config):
         lora_rank=config.lora_rank,
         source_job_id=config.source_job_id,
         checkpoint_id=config.checkpoint_id,
-        training_gpus=config.training_gpus,
         debug_image_tag=config.debug_image_tag,
     )
     if config.job_id is not None:

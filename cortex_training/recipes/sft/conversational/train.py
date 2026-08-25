@@ -37,7 +37,6 @@ import datasets
 from recipes.utils import build_renderer
 from recipes.utils import collate
 from recipes.utils import forward_backward_step
-from recipes.utils import forward_loss
 from recipes.utils import log_saved_checkpoints
 from recipes.utils import lora_peft_config
 from recipes.utils import make_client
@@ -84,7 +83,6 @@ class Config:
 
     dataset: str = "who_trained_you"
     dataset_split: str = "train"
-    test_split: str | None = "test"
     batch_size: int = 8
     learning_rate: float = 5e-5
     weight_decay: float = 0.0
@@ -95,7 +93,6 @@ class Config:
 
     # 0 = dense FT. Set e.g. 32 for LoRA (r == alpha).
     lora_rank: int = 0
-    eval_every: int = 20
     debug_image_tag: str | None = None
     # False (default): tinker *_disable_thinking renderer when the model has one.
     # True: thinking-on renderer (qwen3 for Qwen3-8B).
@@ -195,85 +192,16 @@ def load_chat_dataset(
     dataset: str,
     *,
     dataset_split: str,
-    test_split: str | None,
     n_train: int,
-    n_test: int,
-) -> tuple[datasets.Dataset, datasets.Dataset | None]:
+) -> datasets.Dataset:
     source = resolve_chat_dataset(dataset)
     if _is_local_chat_file(source):
-        data_files: dict[str, str] = {dataset_split: source}
-        if test_split:
-            data_files[test_split] = source
-        loaded = datasets.load_dataset("json", data_files=data_files)
+        loaded = datasets.load_dataset("json", data_files={dataset_split: source})
     else:
         loaded = datasets.load_dataset(source)
     if not isinstance(loaded, datasets.DatasetDict):
         loaded = datasets.DatasetDict({dataset_split: loaded})
-
-    train_dataset = tile_rows(loaded[dataset_split], n_train).shuffle(seed=0)
-    test_dataset = None
-    if test_split:
-        if test_split in loaded:
-            test_dataset = tile_rows(loaded[test_split], n_test)
-        else:
-            logger.info(
-                "%s has no %s split; skipping test/nll (available: %s)",
-                dataset,
-                test_split,
-                list(loaded),
-            )
-    return train_dataset, test_dataset
-
-
-def eval_nll(
-    client,
-    job_id: str,
-    test_dataset,
-    renderer,
-    train_on_what: renderers.TrainOnWhat,
-    *,
-    pad_token_id: int,
-    max_length: int,
-    batch_size: int,
-    pad_to_max_length: bool,
-    next_token_labels: bool = False,
-) -> dict[str, float]:
-    """Mean CE loss on the held-out split via forward-backward (no optimizer step)."""
-    if test_dataset is None or len(test_dataset) < batch_size:
-        return {}
-    n_batches = len(test_dataset) // batch_size
-    losses: list[float] = []
-    n_sequences = 0
-    for batch_idx in range(n_batches):
-        start = batch_idx * batch_size
-        rows = test_dataset.select(range(start, start + batch_size))
-        sequences = [
-            sequence_from_conversation(
-                row["messages"],
-                renderer,
-                train_on_what=train_on_what,
-                max_seq_len=max_length,
-                next_token_labels=next_token_labels,
-            )
-            for row in rows
-        ]
-        kwargs, _ = collate(
-            sequences,
-            pad_token_id=pad_token_id,
-            max_seq_len=max_length,
-            pad_to_max_seq_len=pad_to_max_length,
-        )
-        result = forward_loss(client, job_id, kwargs)
-        losses.append(float(result["avg_loss"]))
-        n_sequences += len(sequences)
-    return {
-        "test/nll": sum(losses) / len(losses),
-        "test/num_examples": float(n_sequences),
-    }
-
-
-def _should_eval(step: int, every: int, total_steps: int) -> bool:
-    return every > 0 and (step % every == 0 or step == total_steps - 1)
+    return tile_rows(loaded[dataset_split], n_train).shuffle(seed=0)
 
 
 def main(config: Config):
@@ -303,12 +231,10 @@ def main(config: Config):
     next_token_labels = use_next_token_labels(config.model_provider)
 
     logger.info("Loading dataset...")
-    train_dataset, test_dataset = load_chat_dataset(
+    train_dataset = load_chat_dataset(
         config.dataset,
         dataset_split=config.dataset_split,
-        test_split=config.test_split,
         n_train=config.max_steps * config.batch_size,
-        n_test=config.batch_size,
     )
 
     n_train_batches = len(train_dataset) // config.batch_size
@@ -324,22 +250,6 @@ def main(config: Config):
         for step in range(total_steps):
             start_time = time.time()
             metrics: dict[str, float] = {}
-
-            if _should_eval(step, config.eval_every, total_steps):
-                metrics.update(
-                    eval_nll(
-                        client,
-                        job_id,
-                        test_dataset,
-                        renderer,
-                        config.train_on_what,
-                        pad_token_id=pad_token_id,
-                        max_length=config.max_length,
-                        batch_size=config.batch_size,
-                        pad_to_max_length=config.pad_to_max_length,
-                        next_token_labels=next_token_labels,
-                    )
-                )
 
             # Linear learning rate schedule, applied on the server per step.
             lr_mult = max(0.0, 1.0 - step / max(n_train_batches, 1))
@@ -370,7 +280,7 @@ def main(config: Config):
             metrics.update(step_result.get("metrics") or {})
 
             metrics.update(
-                train_mean_nll=train_loss,
+                train_nll=train_loss,
                 global_steps=step_result.get("global_steps", step + 1),
                 progress=step / n_train_batches,
                 time_total=time.time() - start_time,

@@ -28,9 +28,9 @@ import logging
 from collections.abc import Iterator
 from typing import Any
 
-from recipes.utils import inference_job_body
 from recipes.utils import prepare_inference_weights
 from recipes.utils import running_job
+from recipes.utils import sampling_job_body
 from recipes.utils import source_checkpoint_info
 
 from cortex_training import CortexTrainingClient
@@ -49,12 +49,11 @@ def inference_endpoint_body(
     lora_rank: int = 0,
     source_job_id: str | None = None,
     checkpoint_id: str | None = None,
-    training_gpus: int | None = None,
     debug_image_tag: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, str] | None]:
     """Return ``(create-job body, source checkpoint info or None)``."""
     source = source_checkpoint_info(source_job_id, checkpoint_id)
-    body = inference_job_body(
+    body = sampling_job_body(
         model_name=model_name,
         max_seq_len=max_seq_len,
         n_gpus=n_gpus,
@@ -63,7 +62,6 @@ def inference_endpoint_body(
         gpu_memory_utilization=gpu_memory_utilization,
         lora_rank=lora_rank,
         source_checkpoint_info=source,
-        training_gpus=training_gpus,
         debug_image_tag=debug_image_tag,
     )
     return body, source

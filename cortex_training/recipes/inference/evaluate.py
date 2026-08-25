@@ -129,7 +129,6 @@ class Config:
 
     model_name: str = "Qwen/Qwen3-8B"
     n_gpus: int = 2
-    training_gpus: int | None = None
     max_seq_len: int = 8192
     gpu_memory_utilization: float = 0.8
     dtype: str = "bfloat16"
@@ -158,7 +157,6 @@ def run_evaluation(
     job_id: str | None = None,
     lora_rank: int = 0,
     n_gpus: int = 2,
-    training_gpus: int | None = None,
     max_seq_len: int = 8192,
     gpu_memory_utilization: float = 0.8,
     dtype: str = "bfloat16",
@@ -189,7 +187,6 @@ def run_evaluation(
         lora_rank=lora_rank,
         source_job_id=source_job_id,
         checkpoint_id=checkpoint_id,
-        training_gpus=training_gpus,
         debug_image_tag=debug_image_tag,
     )
     if source is not None:
@@ -236,7 +233,6 @@ def main(config: Config):
         job_id=config.job_id,
         lora_rank=config.lora_rank,
         n_gpus=config.n_gpus,
-        training_gpus=config.training_gpus,
         max_seq_len=config.max_seq_len,
         gpu_memory_utilization=config.gpu_memory_utilization,
         dtype=config.dtype,

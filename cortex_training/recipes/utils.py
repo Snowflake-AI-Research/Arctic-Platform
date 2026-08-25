@@ -190,33 +190,6 @@ def sampling_job_body(
     return body
 
 
-def inference_job_body(
-    *,
-    model_name: str,
-    max_seq_len: int,
-    n_gpus: int,
-    dtype: str = "bfloat16",
-    seed: int = 42,
-    gpu_memory_utilization: float = 0.8,
-    lora_rank: int = 0,
-    source_checkpoint_info: dict[str, str] | None = None,
-    training_gpus: int | None = None,
-    debug_image_tag: str | None = None,
-) -> dict[str, Any]:
-    """Standalone inference endpoint from original weights or a weights-only checkpoint."""
-    return sampling_job_body(
-        model_name=model_name,
-        max_seq_len=max_seq_len,
-        n_gpus=n_gpus,
-        dtype=dtype,
-        seed=seed,
-        gpu_memory_utilization=gpu_memory_utilization,
-        lora_rank=lora_rank,
-        source_checkpoint_info=source_checkpoint_info,
-        debug_image_tag=debug_image_tag,
-    )
-
-
 def prepare_inference_weights(
     client: CortexTrainingClient,
     job_id: str,
@@ -668,14 +641,6 @@ def forward_backward(
     )
     request_id = client.forward_backward(job_id, payload)
     return client.poll_request(job_id, request_id)
-
-
-def forward_loss(
-    client: CortexTrainingClient,
-    job_id: str,
-    kwargs: dict[str, torch.Tensor],
-) -> dict:
-    return forward_backward(client, job_id, kwargs)
 
 
 def optimizer_step(
