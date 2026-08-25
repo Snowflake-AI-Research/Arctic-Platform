@@ -118,6 +118,9 @@ dss-neutrino --job-id JOB_ID weight-sync
 dss-neutrino download-log JOB_ID --output-dir /path/to/dir
 ```
 
+For status, logs, checkpoints, cancel, and resume, see
+[Job management and observability](docs/guides/operations/job-management-and-observability.md).
+
 Global flags must come before the subcommand:
 
 ```bash
