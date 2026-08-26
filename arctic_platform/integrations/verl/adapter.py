@@ -611,6 +611,9 @@ class ArcticRLClientWrapper(RemoteBackend):
         # connection itself hydrates from ARCTIC_CORTEX_*. The request/response
         # shape difference is handled by the Cortex transport, not here.
         if os.environ.get("ARCTIC_BACKEND", "").strip().lower() == "cortex":
+            # Before provisioning, so a recipe Cortex can't serve fails on the
+            # driver instead of leaking GPUs on Ray actor retries.
+            self._reject_cortex_incompatible_knobs()
             backend_config: Any = CortexConfig.from_env()
         else:
             backend_config = OnPremConfig(**onprem_kwargs)
@@ -680,6 +683,43 @@ class ArcticRLClientWrapper(RemoteBackend):
         response = await self._client.fwd_no_grad(payload, reference_model=True)
         response["batch"]["log_probs"] = response["batch"].pop("logprobs")
         return response
+
+    def _reject_cortex_incompatible_knobs(self) -> None:
+        """Refuse recipes whose correctness depends on the `/forward` Cortex lacks.
+
+        The transport zero-fills log-probs, which is sound only while nothing reads
+        them: single-epoch on-policy GRPO, no KL. Anything else would train on
+        zeros and look like it worked, so it has to stop here.
+        """
+        actor = self.config.actor_rollout_ref.actor
+        algorithm = getattr(self.config, "algorithm", None)
+        rollout = self.config.actor_rollout_ref.rollout
+
+        unsupported: list[str] = []
+        if getattr(actor, "use_kl_loss", False):
+            unsupported.append("actor_rollout_ref.actor.use_kl_loss=True (needs reference log-probs)")
+        if getattr(algorithm, "use_kl_in_reward", False):
+            unsupported.append("algorithm.use_kl_in_reward=True (needs reference log-probs)")
+        if int(getattr(actor, "ppo_epochs", 1)) > 1:
+            unsupported.append(
+                f"actor_rollout_ref.actor.ppo_epochs={actor.ppo_epochs} (off-policy PPO needs a"
+                " rollout-time log-prob snapshot)"
+            )
+        adv_estimator = getattr(algorithm, "adv_estimator", "grpo") if algorithm is not None else "grpo"
+        if adv_estimator != "grpo":
+            unsupported.append(f"algorithm.adv_estimator={adv_estimator!r} (only 'grpo' is validated on Cortex)")
+        if getattr(actor, "policy_loss_fn", None):
+            unsupported.append("actor.policy_loss_fn=<custom> (the server has no custom-loss hook)")
+        multi_turn = getattr(rollout, "multi_turn", None)
+        if multi_turn is not None and getattr(multi_turn, "enable", False):
+            unsupported.append("actor_rollout_ref.rollout.multi_turn.enable=True")
+
+        if unsupported:
+            raise NotImplementedError(
+                "cortex backend does not support:\n  - "
+                + "\n  - ".join(unsupported)
+                + "\n\nSee docs/cortex-integration.md#supported-recipes."
+            )
 
     async def _send_compute_log_prob(self, payload: dict):
         payload["processing"] = {

@@ -144,21 +144,22 @@ class TestPassThrough:
         assert "advantages" in out["context"]
 
 
+@pytest.fixture
+def transport(monkeypatch):
+    """A CortexTransport pointed at a URL nothing dials: every assertion below is
+    about what the transport does before or instead of the wire."""
+    from arctic_platform.client import ArcticClientConfig
+    from arctic_platform.client import CortexConfig
+    from arctic_platform.client.transports.cortex import CortexTransport
+
+    monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
+    config = ArcticClientConfig(model_name="m", backend=CortexConfig.from_env(), training_gpus=1, sampling_gpus=1)
+    return CortexTransport(config)
+
+
 class TestTransportWiring:
     """The lowering hangs off `_op_target`, which both the sync and async submit
     paths share, so callers holding a verl batch need no shim of their own."""
-
-    @pytest.fixture
-    def transport(self, monkeypatch):
-        from arctic_platform.client import ArcticClientConfig
-        from arctic_platform.client import CortexConfig
-        from arctic_platform.client.transports.cortex import CortexTransport
-
-        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
-        config = ArcticClientConfig(
-            model_name="m", backend=CortexConfig.from_env(), training_gpus=1, sampling_gpus=1
-        )
-        return CortexTransport(config)
 
     def test_verl_batch_is_lowered(self, transport):
         from arctic_platform.client.transport import Request
@@ -178,6 +179,49 @@ class TestTransportWiring:
 
         _, body = transport._op_target(Request("step", 1, {"learning_rate": 1e-5}))
         assert body == {"learning_rate": 1e-5}
+
+
+class TestForwardZeroFill:
+    """Cortex has no `/forward`, so `fwd_no_grad` would raise NotImplementedError
+    and break verl's compute_log_prob on the first step. Zero-filling is sound
+    only because server-side grpo defaults pi_old to logprobs.detach()."""
+
+    def test_forward_returns_zeros_without_hitting_the_wire(self, transport):
+        from arctic_platform.client.transport import Request
+
+        out = transport.call(Request("forward", 1, _verl_batch()))
+        assert set(out["batch"]) == {"logprobs", "log_probs", "entropy", "entropies"}
+        assert out["batch"]["log_probs"].shape == (2, 10)
+        assert not out["batch"]["log_probs"].any()
+
+    def test_async_path_zero_fills_too(self, transport):
+        """SkyRL and verl both go through the async client, so acall must
+        short-circuit too -- not just call."""
+        import asyncio
+
+        from arctic_platform.client.transport import Request
+
+        out = asyncio.run(transport.acall(Request("forward", 1, _verl_batch())))
+        assert out["batch"]["logprobs"].shape == (2, 10)
+
+    def test_both_key_spellings_present(self, transport):
+        """verl reads log_probs/entropy; SkyRL reads logprobs/entropies."""
+        from arctic_platform.client.transport import Request
+
+        batch = transport.call(Request("forward", 1, _verl_batch()))["batch"]
+        assert batch["log_probs"] is batch["logprobs"]
+        assert batch["entropy"] is batch["entropies"]
+
+    def test_flat_body_without_batch_wrapper(self, transport):
+        from arctic_platform.client.transport import Request
+
+        body = {"input_ids": torch.zeros((3, 7), dtype=torch.int64)}
+        assert transport.call(Request("forward", 1, body))["batch"]["log_probs"].shape == (3, 7)
+
+    def test_missing_input_ids_degrades_to_unit_shape(self, transport):
+        from arctic_platform.client.transport import Request
+
+        assert transport.call(Request("forward", 1, {}))["batch"]["log_probs"].shape == (1, 1)
 
 
 class TestMetricMirroring:

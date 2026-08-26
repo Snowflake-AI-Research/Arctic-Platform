@@ -203,6 +203,26 @@ def _mirror_metrics(op: str, result: Any) -> Any:
     return result
 
 
+def _zero_logprobs(body: dict) -> dict:
+    """Stand in for the `/forward` op Cortex does not have.
+
+    Correct *only* for single-epoch on-policy GRPO without KL: server-side `grpo`
+    defaults π_old to `logprobs.detach()`, so the caller's copy is never read as a
+    ratio denominator and `approx_kl` / `clip_ratio` come back 0. Any recipe that
+    genuinely consumes these -- a KL penalty, or `ppo_epochs > 1`, where π_old
+    must be the pre-update policy -- has to be refused before it reaches here;
+    see the verl adapter's Cortex preflight.
+    """
+    import torch
+
+    tensors = body.get("batch") if isinstance(body.get("batch"), dict) else body
+    ids = tensors.get("input_ids") if isinstance(tensors, dict) else None
+    rows, cols = (int(ids.shape[0]), int(ids.shape[-1])) if torch.is_tensor(ids) else (1, 1)
+    zeros = torch.zeros((rows, max(cols, 1)), dtype=torch.float32)
+    # verl reads log_probs/entropy, SkyRL reads logprobs/entropies.
+    return {"batch": {"logprobs": zeros, "log_probs": zeros, "entropy": zeros, "entropies": zeros}}
+
+
 def _submitted(op: str, body: dict, response: dict) -> str | dict:
     """A poll handle for an async op, or the finished result for an inline one.
 
@@ -320,6 +340,8 @@ class CortexTransport(Transport):
     def call(self, request: Request) -> dict:
         if request.op in _NOOP_OPS:
             return {}
+        if request.op == "forward":
+            return _zero_logprobs(request.body)
         result = self._poll(self._submit(request))
         # generate returns token ids as DSSST1 tensors; on-prem returns plain
         # lists, so match that contract.
@@ -330,6 +352,8 @@ class CortexTransport(Transport):
     async def acall(self, request: Request) -> dict:
         if request.op in _NOOP_OPS:
             return {}
+        if request.op == "forward":
+            return _zero_logprobs(request.body)
         result = await self._apoll(await self._asubmit(request))
         if request.op == "generate":
             return _to_python(result)

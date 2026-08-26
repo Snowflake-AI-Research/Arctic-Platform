@@ -98,3 +98,59 @@ def test_destroy_is_idempotent(verl_stub) -> None:
     asyncio.run(_run())
     assert shutdown_calls == 1, "destroy() must be idempotent; second call should be a no-op."
     assert wrapper._client is None
+
+
+def _cortex_config(**overrides):
+    """A verl-shaped config tree with GRPO-on-Cortex defaults."""
+    from types import SimpleNamespace
+
+    actor = SimpleNamespace(use_kl_loss=False, ppo_epochs=1, policy_loss_fn=None)
+    rollout = SimpleNamespace(multi_turn=SimpleNamespace(enable=False))
+    algorithm = SimpleNamespace(use_kl_in_reward=False, adv_estimator="grpo")
+    for key, value in overrides.items():
+        target = {"use_kl_in_reward": algorithm, "adv_estimator": algorithm}.get(key, actor)
+        if key == "multi_turn_enable":
+            rollout.multi_turn.enable = value
+            continue
+        setattr(target, key, value)
+    return SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(actor=actor, rollout=rollout), algorithm=algorithm
+    )
+
+
+class TestCortexPreflight:
+    """Cortex has no `/forward`, so the transport zero-fills log-probs. That is
+    only sound while nothing reads them -- otherwise a run trains on zeros and
+    still looks healthy. These knobs must be refused before the client is built.
+    """
+
+    def _check(self, verl_stub, **overrides):
+        adapter = _adapter(verl_stub)
+        wrapper = object.__new__(adapter.ArcticRLClientWrapper)
+        object.__setattr__(wrapper, "config", _cortex_config(**overrides))
+        return wrapper._reject_cortex_incompatible_knobs()
+
+    def test_default_grpo_recipe_is_accepted(self, verl_stub) -> None:
+        assert self._check(verl_stub) is None
+
+    @pytest.mark.parametrize(
+        "override, expected",
+        [
+            ({"use_kl_loss": True}, "use_kl_loss"),
+            ({"use_kl_in_reward": True}, "use_kl_in_reward"),
+            ({"ppo_epochs": 2}, "ppo_epochs"),
+            ({"adv_estimator": "gae"}, "adv_estimator"),
+            ({"policy_loss_fn": "custom"}, "policy_loss_fn"),
+            ({"multi_turn_enable": True}, "multi_turn"),
+        ],
+    )
+    def test_unsupported_knobs_are_refused(self, verl_stub, override, expected) -> None:
+        with pytest.raises(NotImplementedError, match=expected):
+            self._check(verl_stub, **override)
+
+    def test_error_names_every_offending_knob_at_once(self, verl_stub) -> None:
+        """A user fixing these one launch at a time is the surprise we're avoiding."""
+        with pytest.raises(NotImplementedError) as excinfo:
+            self._check(verl_stub, use_kl_loss=True, ppo_epochs=3)
+        assert "use_kl_loss" in str(excinfo.value)
+        assert "ppo_epochs" in str(excinfo.value)
