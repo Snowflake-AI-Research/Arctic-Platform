@@ -45,6 +45,8 @@ from urllib3.exceptions import NewConnectionError
 
 from arctic_platform import wire
 from arctic_platform.client.config import ArcticClientConfig
+from arctic_platform.client.cortex_batch import is_cortex_shaped
+from arctic_platform.client.cortex_batch import lower_fwd_bwd_batch
 from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
@@ -179,6 +181,28 @@ def _is_chunk_post_transient(exc: BaseException) -> bool:
     return _is_transient(exc)
 
 
+# Cortex reports as top-level fields what on-prem reports inside `metrics`
+# (avg_loss on forward-backward; last_lr / global_steps on step). Mirror them in
+# so callers written against the on-prem shape work unchanged. Purely additive:
+# the top-level keys stay put, so callers reading those are unaffected.
+_METRIC_MIRRORS = {
+    "forward-backward": (("avg_loss", "loss"),),
+    "step": (("last_lr", "last_lr"), ("global_steps", "global_steps")),
+}
+
+
+def _mirror_metrics(op: str, result: Any) -> Any:
+    mirrors = _METRIC_MIRRORS.get(op)
+    if not mirrors or not isinstance(result, dict):
+        return result
+    metrics = dict(result.get("metrics") or {})
+    for source, target in mirrors:
+        if source in result and target not in metrics:
+            metrics[target] = result[source]
+    result["metrics"] = metrics
+    return result
+
+
 def _submitted(op: str, body: dict, response: dict) -> str | dict:
     """A poll handle for an async op, or the finished result for an inline one.
 
@@ -299,20 +323,30 @@ class CortexTransport(Transport):
         result = self._poll(self._submit(request))
         # generate returns token ids as DSSST1 tensors; on-prem returns plain
         # lists, so match that contract.
-        return _to_python(result) if request.op == "generate" else result
+        if request.op == "generate":
+            return _to_python(result)
+        return _mirror_metrics(request.op, result)
 
     async def acall(self, request: Request) -> dict:
         if request.op in _NOOP_OPS:
             return {}
         result = await self._apoll(await self._asubmit(request))
-        return _to_python(result) if request.op == "generate" else result
+        if request.op == "generate":
+            return _to_python(result)
+        return _mirror_metrics(request.op, result)
 
     def _op_target(self, request: Request) -> tuple[str, dict]:
-        """The url + JSON body for one op (None-valued keys dropped)."""
-        return (
-            f"{self._prefix}/{self.job_id}/{request.op}",
-            {k: v for k, v in request.body.items() if v is not None},
-        )
+        """The url + JSON body for one op (None-valued keys dropped).
+
+        forward-backward is additionally lowered from the verl-GRPO
+        ``{batch, meta}`` contract onto Cortex's RPC frame, so callers holding a
+        verl-shaped batch don't each need their own reshape. Callers that already
+        built the RPC frame (the standalone recipes) pass through untouched.
+        """
+        body = {k: v for k, v in request.body.items() if v is not None}
+        if request.op == "forward-backward" and not is_cortex_shaped(body):
+            body = lower_fwd_bwd_batch(body)
+        return (f"{self._prefix}/{self.job_id}/{request.op}", body)
 
     def _submit(self, request: Request) -> str | dict:
         # Same shape as on-prem's call: build the url, then pick the wire. Octet ops

@@ -90,6 +90,29 @@ class CortexConfig(BaseModel):
         """The PAT for host/PAT auth: explicit `pat`, else the `pat_env_var` value."""
         return self.pat if self.pat is not None else os.environ.get(self.pat_env_var)
 
+    @classmethod
+    def from_env(cls, **overrides: Any) -> Self:
+        """Build a `CortexConfig` from `ARCTIC_CORTEX_*` env vars.
+
+        Framework adapters (verl, SkyRL) have no backend discriminator in their
+        own YAML, so they flip to Cortex from a shell-level env. Keeping the
+        env-var contract here means it is not reinvented per integration.
+        Explicit `overrides` win.
+        """
+        env: dict[str, Any] = {}
+        for field, var in (
+            ("base_url", "ARCTIC_CORTEX_BASE_URL"),
+            ("host", "ARCTIC_CORTEX_HOST"),
+            ("pat_env_var", "ARCTIC_CORTEX_PAT_ENV_VAR"),
+            ("database", "ARCTIC_CORTEX_DATABASE"),
+            ("endpoint", "ARCTIC_CORTEX_ENDPOINT"),
+            ("schema", "ARCTIC_CORTEX_SCHEMA"),
+        ):
+            value = os.environ.get(var)
+            if value:
+                env[field] = value
+        return cls(**{**env, **overrides})
+
     @model_validator(mode="after")
     def _check(self) -> Self:
         if not (self.base_url or self.host):

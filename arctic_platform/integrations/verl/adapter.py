@@ -41,6 +41,7 @@ from verl.remote_backend.base import RemoteBackendRegistry
 
 from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import AsyncArcticRLClient
+from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
@@ -605,6 +606,15 @@ class ArcticRLClientWrapper(RemoteBackend):
         ds_worker_config = self._create_ds_worker_config()
         ds_worker_config.setdefault("attn_implementation", attn_implementation)
 
+        # verl's YAML has no backend discriminator, so ARCTIC_BACKEND=cortex is the
+        # one shell-level knob that points this adapter at Cortex Training; the
+        # connection itself hydrates from ARCTIC_CORTEX_*. The request/response
+        # shape difference is handled by the Cortex transport, not here.
+        if os.environ.get("ARCTIC_BACKEND", "").strip().lower() == "cortex":
+            backend_config: Any = CortexConfig.from_env()
+        else:
+            backend_config = OnPremConfig(**onprem_kwargs)
+
         rl_config = ArcticClientConfig(
             model_name=model_name,
             seed=self._backend_config.train.determinism.get("seed", 42),
@@ -612,7 +622,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             training_gpus=n_training_gpus,
             sampling_gpus=n_sampling_gpus,
             log_prob_gpus=n_log_prob_gpus,
-            backend=OnPremConfig(**onprem_kwargs),
+            backend=backend_config,
             training=TrainingConfig(
                 full_determinism=self._backend_config.train.determinism.get("full", False),
                 checkpoint_path=self.config.trainer.default_local_dir,
