@@ -454,13 +454,13 @@ class TestCortexConfigFromEnv:
 
 
 class TestUnifiedConfigDoesNotReadEnv:
-    """``ArcticRLClientConfig`` does not swap ``backend`` from env vars.
+    """``ArcticClientConfig`` does not swap ``backend`` from env vars.
     ``ARCTIC_BACKEND`` is only honored at framework adapter call-sites (verl's
     ``_create_rl_client_config``, the legacy ``arctic_platform.rl`` validator)."""
 
     def test_no_env_promotion_on_unified_config(self, monkeypatch):
         monkeypatch.setenv("ARCTIC_BACKEND", "cortex")
-        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(), training_gpus=1)
+        cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(), training_gpus=1)
         assert cfg.backend.type == "onprem"
 
 
@@ -475,7 +475,7 @@ class TestCortexTransportNoopOps:
         from arctic_platform.client.transport import Request
         from arctic_platform.client.transports.cortex import CortexTransport
 
-        cfg = ArcticRLClientConfig(
+        cfg = ArcticClientConfig(
             model_name="m", backend=CortexConfig.from_env(), training_gpus=1, sampling_gpus=1
         )
         t = CortexTransport(cfg)
