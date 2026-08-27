@@ -18,10 +18,11 @@ SnowAPI is async: every op submits and returns a ``request_id`` that is polled t
 completion. So an op is just submit + poll -> final result dict, the same
 contract the on-prem transports expose. `call` runs it over ``requests``; `acall`
 runs the identical flow over ``aiohttp`` for the async client. The only Cortex
-specifics live in `_submit`, because SnowAPI is not uniform: forward-backward and
-generate carry DSSST1 octet bodies (byte-chunked), while step/save/operation post
-their JSON body as-is (the client assembles the full `/operation` envelope, incl.
-sub-job routing). Unsupported ops (`forward`, `log-probs`) raise NotImplementedError.
+specifics live in `_submit`, because SnowAPI is not uniform: forward-backward,
+forward and generate carry DSSST1 octet bodies (byte-chunked), while
+step/save/operation post their JSON body as-is (the client assembles the full
+`/operation` envelope, incl. sub-job routing). `log-probs` raises
+NotImplementedError.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import json
 import time
 from typing import Any
 from typing import Iterator
+from urllib.parse import urlencode
 
 import requests
 from tenacity import AsyncRetrying
@@ -58,18 +60,25 @@ _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
 # SnowAPI requires DSSST1 octet bodies for these ops. This is a wire requirement of
 # the endpoint, not payload binary-ness (generate carries no tensors), so it lives in
 # the transport rather than on Request.binary.
-_OCTET_OPS = {"forward-backward", "generate"}
+_OCTET_OPS = {"forward-backward", "forward", "generate"}
 _OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
 # The chunk envelope's operation label is the wire's own name, not our canonical op name.
-_WIRE_OPERATION = {"forward-backward": "fwd-bwd", "generate": "generate"}
+_WIRE_OPERATION = {"forward-backward": "fwd-bwd", "forward": "fwd", "generate": "generate"}
 # forward-backward always carries a chunk envelope, even when the frame would fit in one
 # request: its chunk_group_id is the server's idempotency key, so a bare frame is off
-# contract. generate posts the bare frame when it fits.
+# contract. generate and forward post the bare frame when it fits.
 _FORCE_CHUNK_OPS = {"forward-backward"}
 # Ops whose chunked frame can be re-posted from scratch on a chunk-group error.
 # forward-backward carries the large gradient frame; a mid-stream chunk-group
-# desync (GS restart) is recoverable only by re-posting the whole group.
-_GROUP_RESTART_OPS = {"forward-backward"}
+# desync (GS restart) is recoverable only by re-posting the whole group. forward
+# is a read: it mutates no engine state, so replaying it is always safe.
+_GROUP_RESTART_OPS = {"forward-backward", "forward"}
+# Direct octet endpoints carry no routing envelope, so the control plane infers the
+# target sub-job from the op itself: forward-backward is training, generate is
+# sampling. `forward` is the one op that is ambiguous -- current-policy log-probs run
+# on the training sub-job, reference log-probs on the log_prob sub-job -- so the
+# caller's sub-job token has to travel with the request.
+_SUB_JOB_ROUTED_OPS = {"forward"}
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
 # Neutrino never colocates training and sampling on the same GPUs, so it exposes no
@@ -308,17 +317,17 @@ class CortexTransport(Transport):
         return _to_python(result) if request.op == "generate" else result
 
     def _op_target(self, request: Request) -> tuple[str, dict]:
-        """The url + JSON body for one op (None-valued keys dropped)."""
-        return (
-            f"{self._prefix}/{self.job_id}/{request.op}",
-            {k: v for k, v in request.body.items() if v is not None},
-        )
+        """The url (+ sub-job hint where the op needs one) and body (None-valued keys dropped)."""
+        url = f"{self._prefix}/{self.job_id}/{request.op}"
+        if request.op in _SUB_JOB_ROUTED_OPS and request.job_id is not None:
+            url = f"{url}?{urlencode({'sub_job_id': str(request.job_id)})}"
+        return url, {k: v for k, v in request.body.items() if v is not None}
 
     def _submit(self, request: Request) -> str | dict:
         # Same shape as on-prem's call: build the url, then pick the wire. Octet ops
-        # (forward-backward, generate) go DSSST1; the rest post JSON as-is. The client
-        # assembles the full /operation envelope (incl. sub-job routing hints), so
-        # `operation` is just another JSON post. `forward`/`log-probs` don't exist here.
+        # (forward-backward, forward, generate) go DSSST1; the rest post JSON as-is. The
+        # client assembles the full /operation envelope (incl. sub-job routing hints), so
+        # `operation` is just another JSON post. `log-probs` doesn't exist here.
         op = request.op
         url, body = self._op_target(request)
         if op in _OCTET_OPS:
