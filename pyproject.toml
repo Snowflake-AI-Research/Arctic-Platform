@@ -126,6 +126,7 @@ sft = [
     "nvidia-ml-py",
     "psutil",
     "ray",
+    "transformers",
     "uvicorn",
 ]
 
