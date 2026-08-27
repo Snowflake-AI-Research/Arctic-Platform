@@ -11,7 +11,7 @@ datasets
 
 # Renderers (chat templates + supervised weights) and ml_log metric logging.
 # SFT needs no math grading, so the [math-rl] extra is not required here.
-tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly
+tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@v0.5.5
 
 # Optional: mirror metrics to Weights & Biases (set wandb_project=... to enable).
 wandb

@@ -12,7 +12,7 @@ datasets
 # Renderers (chat templates + supervised weights), ml_log metric logging, and the
 # MATH environment / grading used by rl_loop.py. The [math-rl] extra carries the
 # grading dependencies.
-tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly
+tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@v0.5.5
 
 # Optional: mirror metrics to Weights & Biases (set wandb_project=... to enable).
 wandb

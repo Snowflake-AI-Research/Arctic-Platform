@@ -26,7 +26,7 @@ Copy the connection template and fill in your Snowflake host and PAT. To keep th
 PAT out of the file, drop the `pat` key and export `CORTEX_PAT` instead.
 
 ```bash
-cp recipes/config.json{.template,}
+cp recipes/config.json.template recipes/config.json
 ```
 
 `recipes/*.json` is gitignored, so a filled-in `config.json` will not be
