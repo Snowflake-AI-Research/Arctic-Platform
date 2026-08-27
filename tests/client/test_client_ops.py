@@ -464,6 +464,48 @@ class TestUnifiedConfigDoesNotReadEnv:
         assert cfg.backend.type == "onprem"
 
 
+class TestCortexNoopOffload:
+    """``to_cortex`` drops ``offload_*: {device: none}`` from the forwarded
+    ds_config. Neutrino builds the optimizer from the lifted typed ``optimizer``
+    and lands on DeepSpeedCPUAdam, so an explicit no-op offload block moves only
+    the parameters to GPU and ``step()`` asserts "CPUAdam param is on cuda:0"."""
+
+    @staticmethod
+    def _zero_block(ds_config: dict) -> dict:
+        from arctic_platform.client import CortexConfig
+
+        cfg = ArcticClientConfig(
+            model_name="m",
+            training_gpus=1,
+            backend=CortexConfig(base_url="https://x", pat="y"),
+            training={"ds_config": ds_config},
+        )
+        return cfg._cortex_training_sub_job()["training_config"]["ds_config"]["zero_optimization"]
+
+    def test_drops_noop_offload(self):
+        # verbatim from the ds_config SkyRL sent on the job that failed to provision
+        block = self._zero_block(
+            {
+                "zero_optimization": {
+                    "offload_optimizer": {"device": "none"},
+                    "offload_param": {"device": "none"},
+                    "stage": 0,
+                },
+                "optimizer": {"type": "AdamW", "params": {"lr": 1e-6}},
+            }
+        )
+        assert block == {"stage": 0}
+
+    def test_keeps_a_real_cpu_offload_request(self):
+        block = self._zero_block(
+            {"zero_optimization": {"offload_optimizer": {"device": "cpu"}, "stage": 2}}
+        )
+        assert block == {"offload_optimizer": {"device": "cpu"}, "stage": 2}
+
+    def test_leaves_untouched_when_nothing_to_drop(self):
+        assert self._zero_block({"zero_optimization": {"stage": 2}}) == {"stage": 2}
+
+
 class TestCortexTransportNoopOps:
     """``wake_*`` / ``sleep_*`` short-circuit in the Cortex transport so the
     shim doesn't have to wrap each call — including the ones ``sync_weights``

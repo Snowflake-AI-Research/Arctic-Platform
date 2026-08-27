@@ -337,7 +337,7 @@ class ArcticClientConfig(BaseModel):
             if key in worker:
                 training[key] = worker[key]
         if ds:
-            training["ds_config"] = ds
+            training["ds_config"] = _without_noop_offload(ds)
         if self.training.peft:
             training["peft_config"] = self.training.peft
         return self._cortex_sub_job("training", {"training_config": training})
@@ -370,3 +370,33 @@ def _neutrino_optimizer(ds_optimizer: Any) -> dict[str, Any] | None:
         return None
     params = ds_optimizer.get("params") or {}
     return {"name": ds_optimizer.get("type", "AdamW"), **params}
+
+
+def _without_noop_offload(ds_config: dict[str, Any]) -> dict[str, Any]:
+    """Drop ``offload_optimizer/offload_param: {device: none}`` from a ds_config.
+
+    To DeepSpeed, ``device: none`` and an absent key mean the same thing; to
+    Neutrino they don't. It builds the optimizer from the typed ``optimizer``
+    field lifted above and settles on ``DeepSpeedCPUAdam``, so forwarding an
+    explicit no-op offload block moves only the parameters onto the GPU and the
+    first ``step()`` dies with::
+
+        AssertionError: CPUAdam param is on cuda:0 and must be 'cpu'
+
+    Framework configs spell the no-op out (verl's remote_backend/arctic.yaml,
+    SkyRL's arctic_rl), while the standalone recipes omit it -- which is why
+    only the framework paths hit this. A real ``device: cpu`` request is left
+    alone.
+    """
+    zero = ds_config.get("zero_optimization")
+    if not isinstance(zero, dict):
+        return ds_config
+    kept = {
+        key: value
+        for key, value in zero.items()
+        if key not in ("offload_optimizer", "offload_param")
+        or not (isinstance(value, dict) and str(value.get("device", "none")).lower() == "none")
+    }
+    if len(kept) == len(zero):
+        return ds_config
+    return {**ds_config, "zero_optimization": kept}
