@@ -70,9 +70,10 @@ dev = [
     "arctic_platform[testing]",
 ]
 
-# Pulls [onprem] because the suite exercises both servers, and because `dev` is
-# defined as formatting + testing.
+# Pulls [cortex] and [onprem] because the suite exercises every transport, and
+# because `dev` is defined as formatting + testing.
 testing = [
+    "arctic_platform[cortex]",
     "arctic_platform[onprem]",
     "parameterized",
     "pytest-instafail",
