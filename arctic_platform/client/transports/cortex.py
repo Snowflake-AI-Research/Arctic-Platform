@@ -60,12 +60,32 @@ _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
 # the transport rather than on Request.binary.
 _OCTET_OPS = {"forward-backward", "generate"}
 _OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
+# The chunk envelope's operation label is the wire's own name, not our canonical op name.
+_WIRE_OPERATION = {"forward-backward": "fwd-bwd", "generate": "generate"}
+# forward-backward always carries a chunk envelope, even when the frame would fit in one
+# request: its chunk_group_id is the server's idempotency key, so a bare frame is off
+# contract. generate posts the bare frame when it fits.
+_FORCE_CHUNK_OPS = {"forward-backward"}
 # Ops whose chunked frame can be re-posted from scratch on a chunk-group error.
 # forward-backward carries the large gradient frame; a mid-stream chunk-group
 # desync (GS restart) is recoverable only by re-posting the whole group.
 _GROUP_RESTART_OPS = {"forward-backward"}
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
+# Neutrino never colocates training and sampling on the same GPUs, so it exposes no
+# sleep/wake surface. They resolve to no-ops here rather than errors, which keeps
+# shared client flows like sync_weights() (wake → operation → wake → reset) portable.
+_NOOP_OPS = {"sleep-inference", "wake-inference", "sleep-training", "wake-training"}
+# /operation is polymorphic: async ops (weight-sync, ...) return {request_id: ...} and we
+# poll to completion; inline ops answer with the finished body directly. Whitelisting the
+# inline set lets us tell the two apart without silently dropping either kind of response.
+_INLINE_OPERATION_TYPES = {
+    "bootstrap-router-replay",
+    "cancel-request",
+    "reset-prefix-cache",
+    "router-replay-discard",
+    "tail-logs",
+}
 _JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
 _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
@@ -159,6 +179,39 @@ def _is_chunk_post_transient(exc: BaseException) -> bool:
     return _is_transient(exc)
 
 
+def _submitted(op: str, body: dict, response: dict) -> str | dict:
+    """A poll handle for an async op, or the finished result for an inline one.
+
+    SnowAPI's contract on ``/operation`` is "poll if the response carries a
+    ``request_id``, else consume it inline". Only operations in
+    ``_INLINE_OPERATION_TYPES`` are allowed to answer inline; anything else must
+    return a ``request_id`` and be polled to completion.
+    """
+    request_id = response.get("request_id")
+    if request_id is not None:
+        return str(request_id)
+    operation_type = body.get("operation_type")
+    if operation_type in _INLINE_OPERATION_TYPES:
+        return response
+    raise RuntimeError(f"cortex {operation_type or op} response carried no request_id: {response}")
+
+
+def _raise_for_status(resp: requests.Response) -> None:
+    """``raise_for_status()`` that keeps the server's error body in the message.
+
+    GS explains a 4xx in the response body; the stock HTTPError shows only the
+    status line, which turns an actionable rejection into a guessing game. The
+    ``response`` is preserved so retry / chunk-group inspection still works.
+    """
+    try:
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as exc:
+        body = (resp.text or "").strip()
+        if not body:
+            raise
+        raise requests.exceptions.HTTPError(f"{exc}: {body[:2000]}", response=resp) from None
+
+
 def _response_json(resp: requests.Response | None) -> Any:
     if resp is None:
         return None
@@ -166,6 +219,25 @@ def _response_json(resp: requests.Response | None) -> Any:
         return resp.json()
     except ValueError:
         return None
+
+
+async def _araise_for_status(resp: Any) -> None:
+    """`_raise_for_status` for the aiohttp path.
+
+    Stays a `ClientResponseError` (carrying `status`) so `_is_transient_async` keeps
+    classifying it, but folds the body into the message.
+    """
+    import aiohttp
+
+    body = (await resp.text()).strip()
+    message = f"{resp.reason}: {body[:2000]}" if body else (resp.reason or "")
+    raise aiohttp.ClientResponseError(
+        resp.request_info,
+        resp.history,
+        status=resp.status,
+        message=message,
+        headers=resp.headers,
+    )
 
 
 async def _aread_json(resp: Any) -> Any:
@@ -222,32 +294,50 @@ class CortexTransport(Transport):
 
     # ── deliver one op: submit + poll to completion ──────────────────────────
     def call(self, request: Request) -> dict:
+        if request.op in _NOOP_OPS:
+            return {}
         result = self._poll(self._submit(request))
         # generate returns token ids as DSSST1 tensors; on-prem returns plain
         # lists, so match that contract.
         return _to_python(result) if request.op == "generate" else result
 
     async def acall(self, request: Request) -> dict:
+        if request.op in _NOOP_OPS:
+            return {}
         result = await self._apoll(await self._asubmit(request))
         return _to_python(result) if request.op == "generate" else result
 
-    def _submit(self, request: Request) -> str:
+    def _op_target(self, request: Request) -> tuple[str, dict]:
+        """The url + JSON body for one op (None-valued keys dropped)."""
+        return (
+            f"{self._prefix}/{self.job_id}/{request.op}",
+            {k: v for k, v in request.body.items() if v is not None},
+        )
+
+    def _submit(self, request: Request) -> str | dict:
         # Same shape as on-prem's call: build the url, then pick the wire. Octet ops
         # (forward-backward, generate) go DSSST1; the rest post JSON as-is. The client
         # assembles the full /operation envelope (incl. sub-job routing hints), so
         # `operation` is just another JSON post. `forward`/`log-probs` don't exist here.
         op = request.op
-        body = {k: v for k, v in request.body.items() if v is not None}
-        url = f"{self._prefix}/{self.job_id}/{op}"
+        url, body = self._op_target(request)
         if op in _OCTET_OPS:
             return self._submit_octet(url, op, body)
         if op in ("step", "save", "operation"):
-            return self._send("POST", url, json=body)["request_id"]
+            return _submitted(op, body, self._send("POST", url, json=body))
         raise NotImplementedError(f"cortex has no {op}")
 
     def _octet_chunks(self, body: dict, op: str) -> list[bytes]:
         frame = wire.dumps(body, metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}})
-        return list(wire.encode_byte_chunks(frame, kind="request", operation=op, max_bytes=_MAX_OCTET_BYTES))
+        return list(
+            wire.encode_byte_chunks(
+                frame,
+                kind="request",
+                operation=_WIRE_OPERATION[op],
+                max_bytes=_MAX_OCTET_BYTES,
+                force_chunk=op in _FORCE_CHUNK_OPS,
+            )
+        )
 
     def _submit_octet(self, url: str, op: str, body: dict) -> str:
         # Post the frame chunk-by-chunk. Transient blips retry per-chunk; a
@@ -269,14 +359,13 @@ class CortexTransport(Transport):
             idx += 1
         return final["request_id"]
 
-    async def _asubmit(self, request: Request) -> str:
+    async def _asubmit(self, request: Request) -> str | dict:
         op = request.op
-        body = {k: v for k, v in request.body.items() if v is not None}
-        url = f"{self._prefix}/{self.job_id}/{op}"
+        url, body = self._op_target(request)
         if op in _OCTET_OPS:
             return await self._asubmit_octet(url, op, body)
         if op in ("step", "save", "operation"):
-            return (await self._asend("POST", url, json=body))["request_id"]
+            return _submitted(op, body, await self._asend("POST", url, json=body))
         raise NotImplementedError(f"cortex has no {op}")
 
     async def _asubmit_octet(self, url: str, op: str, body: dict) -> str:
@@ -321,7 +410,11 @@ class CortexTransport(Transport):
         url = f"{self._prefix}/{self.job_id}/requests/{request_id}"
         return url, ({"cursor": cursor} if cursor else None)
 
-    def _poll(self, request_id: str) -> dict:
+    def _poll(self, submitted: str | dict) -> dict:
+        # Inline ops (_INLINE_OPERATION_TYPES) return their body from POST.
+        if isinstance(submitted, dict):
+            return submitted
+        request_id = submitted
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
         chunks: list[bytes] = []
@@ -338,7 +431,10 @@ class CortexTransport(Transport):
             delay = _next_delay(delay)
         raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s")
 
-    async def _apoll(self, request_id: str) -> dict:
+    async def _apoll(self, submitted: str | dict) -> dict:
+        if isinstance(submitted, dict):
+            return submitted  # inline op — see _poll
+        request_id = submitted
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
         chunks: list[bytes] = []
@@ -412,7 +508,7 @@ class CortexTransport(Transport):
         # are retried with exponential-jitter backoff (the neutrino client's policy).
         def attempt() -> dict:
             resp = self.session.request(method, url, timeout=self.request_timeout, **kwargs)
-            resp.raise_for_status()
+            _raise_for_status(resp)
             return resp.json()
 
         retryer = Retrying(
@@ -443,7 +539,8 @@ class CortexTransport(Transport):
 
         async def attempt() -> dict:
             async with session.request(method, url, **kwargs) as resp:
-                resp.raise_for_status()
+                if resp.status >= 400:
+                    await _araise_for_status(resp)
                 return await resp.json(content_type=None)
 
         retryer = AsyncRetrying(
