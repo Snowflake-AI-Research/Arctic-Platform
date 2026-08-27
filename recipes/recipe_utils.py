@@ -14,6 +14,11 @@
 # limitations under the License.
 """Shared pieces of the SFT and RL recipes: connection, rendering, collation, ops.
 
+TODO(resync-recipes): ported from `cortex-client/recipes/`, which the
+`jaelee/doc-refresh` branch restructures into `cortex_training/recipes/` (new
+layout, YAML recipe configs, PEFT + checkpoint/inference helpers). Re-sync these
+two recipes against that layout once it merges.
+
 TODO(onprem-recipes): these recipes drive the remote Cortex backend only. The
 client API is backend-agnostic, but `fwd_bwd`'s *batch* is not: Cortex takes the
 RPC-style ``{"args", "kwargs", "context"}`` body built here, while on-prem takes
