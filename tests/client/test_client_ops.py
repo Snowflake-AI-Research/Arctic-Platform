@@ -33,6 +33,7 @@ from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import ArcticRLClient
 from arctic_platform.client import ArcticSFTClient
 from arctic_platform.client import AsyncArcticRLClient
+from arctic_platform.client import CortexConfig
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
@@ -406,3 +407,46 @@ class TestWeightSyncStrategyInit:
         payload = cfg.to_onprem("sampling")
         assert "cuda_ipc" not in payload
         assert "low_memory" not in payload
+
+
+class TestCortexConfigFromEnv:
+    """`from_env` is the one place the ARCTIC_CORTEX_* contract lives, so
+    framework adapters with no backend field in their own YAML (verl, SkyRL) can
+    be pointed at Cortex from the shell."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_env(self, monkeypatch):
+        for var in (
+            "ARCTIC_CORTEX_BASE_URL",
+            "ARCTIC_CORTEX_HOST",
+            "ARCTIC_CORTEX_PAT_ENV_VAR",
+            "ARCTIC_CORTEX_DATABASE",
+            "ARCTIC_CORTEX_SCHEMA",
+            "ARCTIC_CORTEX_ENDPOINT",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_base_url_only_bypasses_pat(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock:9000")
+        cfg = CortexConfig.from_env()
+        assert cfg.base_url == "http://mock:9000"
+        assert cfg.host is None
+
+    def test_host_path_reads_db_schema_and_pat_var(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
+        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "DB")
+        monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "SCH")
+        monkeypatch.setenv("ARCTIC_CORTEX_PAT_ENV_VAR", "MY_PAT")
+        monkeypatch.setenv("MY_PAT", "secret")
+        cfg = CortexConfig.from_env()
+        assert (cfg.database, cfg.schema_) == ("DB", "SCH")
+        assert cfg.resolve_pat() == "secret"
+
+    def test_host_without_db_schema_fails_loudly(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
+        with pytest.raises(ValueError, match="database"):
+            CortexConfig.from_env()
+
+    def test_explicit_override_wins(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://from-env")
+        assert CortexConfig.from_env(base_url="http://explicit").base_url == "http://explicit"
