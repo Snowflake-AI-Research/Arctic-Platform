@@ -74,6 +74,19 @@ def make_transport(config: ArcticClientConfig, server_state: Any = None) -> Tran
     return HttpTransport(config)
 
 
+def _check_weight_format(config: ArcticClientConfig, weight_format: str | None) -> None:
+    """Refuse a weight_format the deployment would drop on the floor.
+
+    On-prem's ``WeightSyncRequest`` ignores unknown fields, so an unsupported
+    format would silently full-sync dense weights instead of the adapter.
+    """
+    if weight_format is not None and config.backend.type == "onprem":
+        raise ValueError(
+            f"weight_format={weight_format!r} is only supported by the remote Cortex backend; "
+            "the on-prem server always syncs full weights."
+        )
+
+
 def _maybe_print_server_profile(op: str, out: dict | None) -> None:
     """Echo the server's per-op timings when ARL_SFT_PROFILE is set; a no-op otherwise."""
     # TODO(generalize-profiling): extend profiling to every transport and workload in a
@@ -174,14 +187,19 @@ class ArcticClient(_ArcticClientCore):
         return self._call(generate_request(self.jobs, prompts, sampling_params, routing_key, strict))["results"]
 
     # ── weight sync + cache ──────────────────────────────────────────────
-    def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict:
+    def sync_weights(
+        self, cuda_ipc: bool | None = None, low_memory: bool | None = None, weight_format: str | None = None
+    ) -> dict:
         """Sync training weights to sampling (staged wake → operation → wake → reset).
 
         ``cuda_ipc`` / ``low_memory`` default to the training job's ``TrainingConfig``; pass a value to override this
-        call.
+        call. ``weight_format="lora"`` broadcasts only the adapter tensors (Cortex only).
         """
+        _check_weight_format(self.config, weight_format)
         self.wake_inference(tags=["weights"])
-        out = self._call(sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory))
+        out = self._call(
+            sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory, weight_format=weight_format)
+        )
         self.wake_inference(tags=["kv_cache"])
         self.reset_prefix_cache()
         return out
@@ -266,10 +284,15 @@ class AsyncArcticClient(_ArcticClientCore):
         ]
 
     # ── weight sync + cache ──────────────────────────────────────────────
-    async def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict:
+    async def sync_weights(
+        self, cuda_ipc: bool | None = None, low_memory: bool | None = None, weight_format: str | None = None
+    ) -> dict:
         """Async twin of ArcticClient.sync_weights (staged wake → operation → wake → reset)."""
+        _check_weight_format(self.config, weight_format)
         await self.wake_inference(tags=["weights"])
-        out = await self._acall(sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory))
+        out = await self._acall(
+            sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory, weight_format=weight_format)
+        )
         await self.wake_inference(tags=["kv_cache"])
         await self.reset_prefix_cache()
         return out

@@ -16,6 +16,9 @@ body, which job each op targets, response contract) is defined once in
 | `sft.py` | `ArcticSFTClient`, `ArcticSFTClientConfig`. |
 | `rl.py` | `ArcticRLClient`, `AsyncArcticRLClient`. |
 
+End-to-end training loops built on these frontends live outside the package, in
+`recipes/sft/standalone/` and `recipes/rl/standalone/` (Cortex only today).
+
 Import the frontends from the package root — `from arctic_platform.client import
 ArcticRLClient` — not from the module that happens to define them today.
 

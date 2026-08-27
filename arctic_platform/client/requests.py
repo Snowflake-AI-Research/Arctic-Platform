@@ -129,6 +129,7 @@ def sync_weights_request(
     *,
     cuda_ipc: bool | None = None,
     low_memory: bool | None = None,
+    weight_format: str | None = None,
 ) -> Request:
     # The client assembles the full Cortex `/operation` envelope here so transports
     # just forward it: SnowAPI reads the `sub_job_*` routing hints, on-prem accepts
@@ -137,13 +138,16 @@ def sync_weights_request(
     #
     # In non-colocated mode the server uses NCCL. In colocated mode, cuda_ipc=True is
     # zero-copy (training weights must be on GPU) and low_memory streams one param at
-    # a time to bound peak GPU memory.
+    # a time to bound peak GPU memory. weight_format="lora" broadcasts only the
+    # trained adapter tensors instead of the full model.
     tid, sid = jobs.require("training"), jobs.require("sampling")
     payload = {"source_sub_job_id": tid, "target_sub_job_ids": [sid]}
     if cuda_ipc is not None:
         payload["cuda_ipc"] = cuda_ipc
     if low_memory is not None:
         payload["low_memory"] = low_memory
+    if weight_format is not None:
+        payload["weight_format"] = weight_format
     body = {
         "operation_type": "weight-sync",
         "sub_job_id": tid,
