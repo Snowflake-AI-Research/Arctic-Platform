@@ -3,7 +3,7 @@
 """Cortex dispatch for the legacy ``arctic_platform.rl`` API.
 
 Translates SkyRL's legacy config into the unified client config with a
-``CortexConfig`` backend, wraps ``ArcticRLClient``, and rewrites the two
+``CortexConfig`` backend, wraps ``AsyncArcticRLClient``, and rewrites the two
 calls whose shapes diverge on Cortex: ``fwd_bwd`` (payload reshape) and
 ``fwd_no_grad`` (zeros stub — Cortex has no ``/forward``).
 """
@@ -22,7 +22,7 @@ __all__ = ["create_cortex_client"]
 def _to_unified_config(legacy: _LegacyConfig):
     """Legacy config -> unified client config. Optimizer is merged into
     ``training.ds_config`` so Cortex's sub-job builder can lift it."""
-    from arctic_platform.client.config import ArcticRLClientConfig as U
+    from arctic_platform.client.config import ArcticClientConfig as U
     from arctic_platform.client.config import CortexConfig
     from arctic_platform.client.config import SamplingConfig
     from arctic_platform.client.config import TrainingConfig
@@ -59,16 +59,17 @@ def _to_unified_config(legacy: _LegacyConfig):
 
 
 class _CortexClientShim:
-    """Async facade over ``ArcticRLClient`` for the legacy SkyRL adapter.
+    """Async facade over ``AsyncArcticRLClient`` for the legacy SkyRL adapter.
     Unified-client calls are delegated via ``__getattr__``; only the two
     shape mismatches and ``reconnect_config()`` live here."""
 
     def __init__(self, legacy_config: _LegacyConfig) -> None:
-        from arctic_platform.client import ArcticRLClient
+        # Must be the async client: this shim's callers await every op.
+        from arctic_platform.client import AsyncArcticRLClient
 
         self._legacy_config = legacy_config
         self._unified_config = _to_unified_config(legacy_config)
-        self._client = ArcticRLClient(self._unified_config)
+        self._client = AsyncArcticRLClient(self._unified_config)
 
     @property
     def config(self) -> _LegacyConfig:
@@ -111,7 +112,7 @@ class _CortexClientShim:
         return self._client.shutdown()
 
     def __getattr__(self, name: str) -> Any:
-        # Everything else on ArcticRLClient is exposed as-is.
+        # Everything else on AsyncArcticRLClient is exposed as-is.
         return getattr(self._client, name)
 
     async def fwd_bwd(self, batch: dict, **legacy_kwargs: Any) -> dict:
