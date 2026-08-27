@@ -70,22 +70,6 @@ _FORCE_CHUNK_OPS = {"forward-backward"}
 # forward-backward carries the large gradient frame; a mid-stream chunk-group
 # desync (GS restart) is recoverable only by re-posting the whole group.
 _GROUP_RESTART_OPS = {"forward-backward"}
-# Cortex sub-jobs are always awake; the client's colocated wake/sleep lifecycle
-# is a no-op here. Short-circuiting in the transport means the shim doesn't have
-# to wrap every wake/sleep call individually — including the ones ``sync_weights``
-# invokes internally.
-_NOOP_OPS = {"wake-inference", "sleep-inference", "wake-training", "sleep-training"}
-# ``/operation`` is polymorphic: async ops (weight-sync, forward-backward, ...)
-# return ``{request_id: ...}`` and we poll to completion; inline ops answer with
-# the finished body directly. Whitelisting the inline set lets us tell the two
-# apart without silently dropping either kind of response.
-_INLINE_OPERATION_TYPES = {
-    "bootstrap-router-replay",
-    "cancel-request",
-    "reset-prefix-cache",
-    "router-replay-discard",
-    "tail-logs",
-}
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
 # Neutrino never colocates training and sampling on the same GPUs, so it exposes no
@@ -139,23 +123,6 @@ def _is_connect_error(exc: BaseException) -> bool:
         reason = getattr(cause, "reason", None)
         return isinstance(cause, NewConnectionError) or isinstance(reason, NewConnectionError)
     return False
-
-
-def _submitted(op: str, body: dict, response: dict) -> str | dict:
-    """A poll handle for an async op, or the finished result for an inline one.
-
-    SnowAPI's contract on ``/operation`` is "poll if the response carries a
-    ``request_id``, else consume it inline". Only operations in
-    ``_INLINE_OPERATION_TYPES`` are allowed to answer inline; anything else must
-    return a ``request_id`` and be polled to completion.
-    """
-    request_id = response.get("request_id")
-    if request_id is not None:
-        return str(request_id)
-    operation_type = body.get("operation_type")
-    if operation_type in _INLINE_OPERATION_TYPES:
-        return response
-    raise RuntimeError(f"cortex {operation_type or op} response carried no request_id: {response}")
 
 
 class _ChunkGroupError(Exception):
