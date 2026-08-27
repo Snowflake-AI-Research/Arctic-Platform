@@ -126,23 +126,14 @@ sft = [
     "nvidia-ml-py",
     "psutil",
     "ray",
-    "transformers>=4.57.0",
     "uvicorn",
 ]
 
 # [sft] plus sampling. arctic-inference[vllm] owns the validated vLLM pin.
-#
-# transformers<5 sits here rather than in [sft] because vLLM 0.18 is what blocks
-# v5, and vLLM only ever arrives through this extra. Training-only installs have
-# to be free to move to v5: the DSS image pairs [sft] with arctic-training, which
-# requires transformers>=5.5.0, so a cap on [sft] makes that install unsolvable.
-# This split is temporary — once the vLLM 0.18 pin is lifted, drop this line and
-# let [sft] carry the only transformers requirement again.
 rl = [
     "arctic_platform[sft]",
     "arctic-inference[server,vllm]>=0.2.0",
     "tensordict",
-    "transformers<5",
 ]
 
 onprem = [
