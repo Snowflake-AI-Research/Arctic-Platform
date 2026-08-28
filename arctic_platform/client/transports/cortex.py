@@ -63,7 +63,11 @@ _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
 _OCTET_OPS = {"forward-backward", "forward", "generate"}
 _OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
 # The chunk envelope's operation label is the wire's own name, not our canonical op name.
-_WIRE_OPERATION = {"forward-backward": "fwd-bwd", "forward": "fwd", "generate": "generate"}
+_WIRE_OPERATION = {"forward-backward": "fwd-bwd", "forward": "fwd-no-grad", "generate": "generate"}
+# SnowAPI's path for an op, where it differs from our canonical name. On-prem serves
+# no-grad forward at /forward, so that stays the canonical op; SnowAPI spells the same
+# thing forward-no-grad (and the control plane abbreviates it again, to fwd-no-grad).
+_OP_PATH = {"forward": "forward-no-grad"}
 # forward-backward always carries a chunk envelope, even when the frame would fit in one
 # request: its chunk_group_id is the server's idempotency key, so a bare frame is off
 # contract. generate and forward post the bare frame when it fits.
@@ -77,7 +81,8 @@ _GROUP_RESTART_OPS = {"forward-backward", "forward"}
 # target sub-job from the op itself: forward-backward is training, generate is
 # sampling. `forward` is the one op that is ambiguous -- current-policy log-probs run
 # on the training sub-job, reference log-probs on the log_prob sub-job -- so the
-# caller's sub-job token has to travel with the request.
+# caller's sub-job token has to travel with the request. The body is all tensor bytes,
+# so it travels as ?target_sub_job_id and SnowAPI folds it into the control-plane body.
 _SUB_JOB_ROUTED_OPS = {"forward"}
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
@@ -318,9 +323,9 @@ class CortexTransport(Transport):
 
     def _op_target(self, request: Request) -> tuple[str, dict]:
         """The url (+ sub-job hint where the op needs one) and body (None-valued keys dropped)."""
-        url = f"{self._prefix}/{self.job_id}/{request.op}"
+        url = f"{self._prefix}/{self.job_id}/{_OP_PATH.get(request.op, request.op)}"
         if request.op in _SUB_JOB_ROUTED_OPS and request.job_id is not None:
-            url = f"{url}?{urlencode({'sub_job_id': str(request.job_id)})}"
+            url = f"{url}?{urlencode({'target_sub_job_id': str(request.job_id)})}"
         return url, {k: v for k, v in request.body.items() if v is not None}
 
     def _submit(self, request: Request) -> str | dict:

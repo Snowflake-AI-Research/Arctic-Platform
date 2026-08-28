@@ -18,7 +18,12 @@ forward lowers like forward-backward -- a DSSST1 octet body -- with one
 difference that matters: forward-backward is always training, while forward runs
 on the training sub-job for current-policy log-probs and on the log_prob sub-job
 for reference log-probs. Direct octet endpoints carry no routing envelope, so
-the sub-job token has to ride on the URL.
+the sub-job token has to ride on the URL as ?target_sub_job_id, which SnowAPI
+folds into the control-plane request body.
+
+The op is spelled three ways along the path -- `forward` here and on-prem,
+forward-no-grad at SnowAPI, fwd-no-grad at the control plane -- so the tests pin
+the outbound spelling rather than trusting the canonical name to survive.
 
 `_send` is stubbed, so these tests pin the request the transport builds and the
 result it decodes without a live GS.
@@ -108,11 +113,15 @@ class TestForwardWire:
         assert post["headers"]["Content-Type"] == "application/octet-stream"
         assert wire.loads(post["data"])["batch"]["input_ids"].tolist() == BATCH_IDS
 
-    def test_hits_the_forward_endpoint(self):
+    def test_hits_the_forward_no_grad_endpoint(self):
+        """SnowAPI spells this forward-no-grad, though on-prem serves it at /forward.
+
+        Posting the canonical op name here 404s: SnowAPI has no /forward route.
+        """
         transport, send = _transport()
         transport.call(fwd_no_grad_request(transport.jobs, _batch()))
 
-        assert send.urls[0].split("?")[0].endswith(f"/{JOB}/forward")
+        assert send.urls[0].split("?")[0].endswith(f"/{JOB}/forward-no-grad")
 
     def test_frame_under_the_cap_posts_bare(self):
         """forward has no idempotency key to carry, so chunking stays size-driven.
@@ -126,7 +135,7 @@ class TestForwardWire:
 
         assert wire.read_byte_chunk_metadata(send.frames[0]) is None
 
-    def test_oversized_frame_chunks_under_the_fwd_label(self, monkeypatch):
+    def test_oversized_frame_chunks_under_the_fwd_no_grad_label(self, monkeypatch):
         """Log-prob batches can exceed the 60 MiB cap, so the split must round-trip."""
         monkeypatch.setattr(cortex_module, "_MAX_OCTET_BYTES", 64 * 1024)
         transport, send = _transport()
@@ -134,7 +143,7 @@ class TestForwardWire:
         transport.call(fwd_no_grad_request(transport.jobs, batch))
 
         assert len(send.frames) > 1
-        assert {wire.read_byte_chunk_metadata(f)["operation"] for f in send.frames} == {"fwd"}
+        assert {wire.read_byte_chunk_metadata(f)["operation"] for f in send.frames} == {"fwd-no-grad"}
         frame = wire.decode_byte_chunks(send.frames, kind="request")
         assert wire.loads(frame)["batch"]["input_ids"].shape == (1, 20_000)
 
@@ -144,7 +153,7 @@ class TestForwardSubJobRouting:
         transport, send = _transport()
         transport.call(fwd_no_grad_request(transport.jobs, _batch()))
 
-        assert f"sub_job_id={TRAINING}" in send.urls[0]
+        assert f"target_sub_job_id={TRAINING}" in send.urls[0]
 
     def test_reference_model_routes_to_log_prob(self):
         """Losing this hint returns current-policy log-probs where reference
@@ -152,14 +161,14 @@ class TestForwardSubJobRouting:
         transport, send = _transport()
         transport.call(fwd_no_grad_request(transport.jobs, _batch(), reference_model=True))
 
-        assert f"sub_job_id={LOG_PROB}" in send.urls[0]
+        assert f"target_sub_job_id={LOG_PROB}" in send.urls[0]
 
     def test_forward_backward_carries_no_routing_hint(self):
         """forward-backward is unambiguously training; its URL is unchanged."""
         transport, send = _transport()
         transport.call(fwd_bwd_request(transport.jobs, _batch()))
 
-        assert "sub_job_id" not in send.urls[0]
+        assert "target_sub_job_id" not in send.urls[0]
 
 
 class TestForwardResult:
