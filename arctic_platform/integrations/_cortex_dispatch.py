@@ -1,5 +1,20 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
 """Cortex dispatch for the legacy ``arctic_platform.rl`` API.
 
 Translates SkyRL's legacy config into the unified client config with a
@@ -118,9 +133,7 @@ class _CortexClientShim:
     async def fwd_bwd(self, batch: dict, **legacy_kwargs: Any) -> dict:
         processing = legacy_kwargs.pop("processing", None)
         legacy_kwargs.pop("router_replay", None)
-        return await self._client.fwd_bwd(
-            to_cortex_fwd_bwd_payload(batch, processing=processing)
-        )
+        return await self._client.fwd_bwd(to_cortex_fwd_bwd_payload(batch, processing=processing))
 
     async def fwd_no_grad(self, batch: dict, **_: Any) -> dict:
         # Cortex has no /forward op; return zeros. Only correct for single-epoch
@@ -139,7 +152,7 @@ class _CortexClientShim:
         # Cortex sub-jobs don't share disk; a silent no-op would leave
         # sampling on stale weights.
         raise NotImplementedError(
-            f"Cortex has no disk-based weight reload; use sync_weights() (NCCL) "
+            "Cortex has no disk-based weight reload; use sync_weights() (NCCL) "
             f"or save_checkpoint() instead. Called with path={path!r}."
         )
 

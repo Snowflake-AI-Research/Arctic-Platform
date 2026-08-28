@@ -471,9 +471,7 @@ class CortexTransport(Transport):
                 detail = f" reason={reason!r}"
                 if sub_states:
                     detail += f" sub_jobs=[{sub_states}]"
-                raise RuntimeError(
-                    f"cortex job {self.job_id} reached terminal state '{state}';{detail}"
-                )
+                raise RuntimeError(f"cortex job {self.job_id} reached terminal state '{state}';{detail}")
             time.sleep(delay)
             delay = _next_delay(delay)
         raise TimeoutError(f"cortex job {self.job_id} did not become running within {self.poll_timeout}s")

@@ -497,9 +497,7 @@ class TestCortexNoopOffload:
         assert block == {"stage": 0}
 
     def test_keeps_a_real_cpu_offload_request(self):
-        block = self._zero_block(
-            {"zero_optimization": {"offload_optimizer": {"device": "cpu"}, "stage": 2}}
-        )
+        block = self._zero_block({"zero_optimization": {"offload_optimizer": {"device": "cpu"}, "stage": 2}})
         assert block == {"offload_optimizer": {"device": "cpu"}, "stage": 2}
 
     def test_leaves_untouched_when_nothing_to_drop(self):
@@ -512,14 +510,15 @@ class TestCortexTransportNoopOps:
     invokes internally."""
 
     def test_call_returns_empty_for_noop_op(self, monkeypatch):
+        # CortexTransport pulls in tenacity, which lives in the `cortex` extra;
+        # CI's unit-tests job installs `.[testing,rl]` only.
+        pytest.importorskip("tenacity")
         monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
         from arctic_platform.client import CortexConfig
         from arctic_platform.client.transport import Request
         from arctic_platform.client.transports.cortex import CortexTransport
 
-        cfg = ArcticClientConfig(
-            model_name="m", backend=CortexConfig.from_env(), training_gpus=1, sampling_gpus=1
-        )
+        cfg = ArcticClientConfig(model_name="m", backend=CortexConfig.from_env(), training_gpus=1, sampling_gpus=1)
         t = CortexTransport(cfg)
         # Would normally raise NotImplementedError on the transport; the noop
         # short-circuit means the shim never has to guard these calls.
