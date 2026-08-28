@@ -52,7 +52,7 @@ constrains what runs correctly here:
 ## What's provided
 
 * **Unified client** —
-  [`arctic_platform.client.ArcticRLClient`](../arctic_platform/client/client.py)
+  [`arctic_platform.client.ArcticRLClient`](../arctic_platform/client/rl.py)
   routes to `CortexTransport` whenever `backend` is a `CortexConfig`.
   `CortexConfig.from_env()` hydrates from `ARCTIC_CORTEX_*` env vars —
   explicit constructor args always win.

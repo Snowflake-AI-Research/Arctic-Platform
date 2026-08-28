@@ -120,7 +120,18 @@ fi
 # or env_class) — SkyRL's env would silently score every rollout 0.0 with the
 # wrong field names.
 python - <<PY || exit 1
-import sys, pandas as pd
+import sys
+
+try:
+    import pandas as pd
+except ModuleNotFoundError:
+    # Bare \`python\` is also what launches the run below, so a shell that can't
+    # import pandas can't train either. Say that instead of raising here.
+    print("ERROR: this shell's \`python\` cannot import pandas, so it is not the")
+    print("       environment arctic-platform was installed into. Activate it;")
+    print("       see step 1 in README.md.")
+    sys.exit(1)
+
 cols = set(pd.read_parquet("${TRAIN_FILES}").columns)
 missing = {"reward_spec", "env_class"} - cols
 if missing:
