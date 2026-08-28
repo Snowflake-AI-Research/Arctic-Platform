@@ -348,7 +348,7 @@ class CortexTransport(Transport):
         if op in _NO_CHUNK_OPS and len(frame) > _MAX_OCTET_BYTES:
             raise NotImplementedError(
                 f"{op} frame is {len(frame)} bytes, over the {_MAX_OCTET_BYTES}-byte per-request cap. "
-                f"Cortex cannot split it: the zone reassembles chunk groups for fwd-bwd only, so a chunked "
+                "Cortex cannot split it: the zone reassembles chunk groups for fwd-bwd only, so a chunked "
                 f"{op} would arrive as a partial frame. Send a smaller batch, or add chunk staging to the "
                 f"zone's /{op} the way /fwd-bwd has it."
             )
