@@ -539,7 +539,9 @@ class CortexTransport(Transport):
         def attempt() -> dict:
             resp = self.session.request(method, url, timeout=self.request_timeout, **kwargs)
             _raise_for_status(resp)
-            return resp.json()
+            # `:cancel` answers 200 with an empty body. Decoding that as JSON
+            # would report an already-completed release as a failure.
+            return resp.json() if resp.content.strip() else {}
 
         retryer = Retrying(
             retry=retry_if_exception(retry_on or _is_transient),

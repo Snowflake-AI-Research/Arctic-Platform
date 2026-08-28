@@ -11,7 +11,8 @@ The SkyRL driver runs on a CPU-only laptop / VM; Cortex owns the GPUs.
 | Trainer | Cortex training sub-job (server-side GRPO loss) |
 | Sampling | Cortex sampling sub-job (vLLM inside Cortex) |
 | Sequence lengths | prompt 512, response 1024 |
-| GPUs | Cortex allocates; driver is CPU-only |
+| Batch | 32 prompts × 4 samples, mini-batch 4 (canonical scale in §6) |
+| GPUs | 4 training + 4 sampling, allocated by Cortex; driver is CPU-only |
 
 ## 1. Install
 
@@ -61,16 +62,22 @@ of `python -m skyrl.train.entrypoints.main_base` so the driver-side
 
 ## 5. What a healthy run looks like
 
-Qwen3-0.6B on GSM8K at 4 training + 4 sampling GPUs, `TRAIN_BSZ=32
-MINI_BSZ=4 N_SAMPLES=4`. Held-out `eval/all/pass_at_1` on the full 1319-example
-test set, against an untrained baseline of ~0.29–0.31:
+Measured on the shipped defaults, so a bare
+`./run_qwen3_0.6b_gsm8k_grpo_cortex.sh` should reproduce this. Held-out
+`eval/all/pass_at_1` over the full 1319-example GSM8K test set:
 
-| step | 0 | 10 | 20 | 30 | 40 | 50 |
-| --- | --- | --- | --- | --- | --- | --- |
-| pass@1 | 0.3055 | 0.3146 | 0.3632 | 0.3897 | 0.4003 | 0.4321 |
+| step | 0 | 5 | 10 | 15 | 20 | 25 | 30 | 35 | 40 | 45 | 50 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| pass@1 | 0.3055 | 0.3427 | 0.3942 | 0.4503 | 0.4951 | 0.5375 | 0.5739 | 0.6293 | 0.6626 | 0.6854 | 0.6967 |
 
-About 20s per training step plus ~2min per evaluation, so roughly 35 minutes to
-step 50. Provisioning the Cortex sub-jobs takes ~4 minutes before step 0.
+Step 0 is the untrained baseline, so that is 2.3x baseline in 50 steps: about
+50 minutes wall-clock, of which ~4 minutes is Cortex provisioning before step 0
+and ~20s per training step thereafter.
+
+**This is not a converged run.** 50 steps is around 1% of the configured
+20-epoch schedule (~4660 steps); it was stopped once the trend was
+unambiguous. Read the table as evidence that the integration learns correctly,
+not as a GSM8K quality number.
 
 **Two metrics are worth watching, because the failure mode here is a run that
 looks fine and learns nothing:**
@@ -86,6 +93,23 @@ looks fine and learns nothing:**
 
 `approx_kl` reads exactly **0.0** and that is expected, not a bug — see the
 clipping note below.
+
+## 6. Running at canonical scale
+
+The defaults above are the configuration this recipe was validated on, not
+SkyRL's published GSM8K scale. To use that scale:
+
+```bash
+TRAIN_BSZ=1024 MINI_BSZ=256 MICRO_BSZ=64 ./run_qwen3_0.6b_gsm8k_grpo_cortex.sh
+```
+
+`N_SAMPLES` has to stay at 4. Canonical is 5, and 1024 × 5 sequences of 1536
+tokens returns ~135 MiB of per-token logprobs and entropies against Cortex's
+128 MiB response cap. At 4 it sits at 84% of the cap, so raising `RESPONSE_LEN`
+will overrun it too; the launcher preflights both and prints the ceiling.
+
+Each step is ~30x the sequences of the default, so budget GPU-hours rather than
+minutes.
 
 ## Troubleshooting
 
@@ -112,9 +136,9 @@ clipping note below.
   reads 0.0. With `MINI_BSZ < TRAIN_BSZ` the recipe is therefore running
   unclipped updates, not clipped GRPO. It trains, but it is not the same
   objective, and that matters if you are comparing against published numbers.
-* `N_SAMPLES` defaults to 4 rather than SkyRL's canonical 5, because 1024 × 5
-  overruns the 128 MiB response cap by 4.2%. This and `use_kl_loss=false` are
-  the only two departures from the canonical recipe.
+* Every batch knob is env-overridable (`TRAIN_BSZ`, `MINI_BSZ`, `N_SAMPLES`,
+  `MICRO_BSZ`, `PROMPT_LEN`, `RESPONSE_LEN`, `LR`, `TOTAL_EPOCHS`,
+  `EVAL_INTERVAL`); see section 6 for the canonical-scale values.
 * Two runs cannot share an account: 4 training + 4 sampling is exactly the
   8-GPU cap.
 * Weight sync is NCCL between Cortex sub-jobs. The driver never touches

@@ -43,15 +43,15 @@ TP_SIZE="${TP_SIZE:-1}"              # driver sees Cortex sampling as TP=1
 # 4 training + 4 sampling sits exactly at the 8-GPU per-account Cortex cap.
 NUM_ENGINES="${NUM_ENGINES:-4}"
 
-# Defaults are SkyRL's canonical GSM8K GRPO recipe
-# (examples/train/gsm8k/run_gsm8k.sh), with two forced deviations: N_SAMPLES
-# below, and use_kl_loss further down. Everything else is canonical.
-TRAIN_BSZ="${TRAIN_BSZ:-1024}"
-MINI_BSZ="${MINI_BSZ:-256}"
-# Canonical is 5. Cortex caps one fwd_bwd response at 128 MiB and 1024 x 5
-# exceeds it by 4.2%; see the preflight below for the arithmetic.
+# Defaults are the configuration this recipe was actually validated on, so the
+# reference curve in README.md is what a bare run reproduces. SkyRL's canonical
+# GSM8K scale (train_batch_size=1024, policy_mini_batch_size=256) is a
+# documented override rather than the default: it costs ~30x the GPU-time per
+# step and sits at 84% of Cortex's response cap. See README.md.
+TRAIN_BSZ="${TRAIN_BSZ:-32}"
+MINI_BSZ="${MINI_BSZ:-4}"
 N_SAMPLES="${N_SAMPLES:-4}"
-MICRO_BSZ="${MICRO_BSZ:-64}"
+MICRO_BSZ="${MICRO_BSZ:-4}"
 PROMPT_LEN="${PROMPT_LEN:-512}"
 RESPONSE_LEN="${RESPONSE_LEN:-1024}"
 LR="${LR:-1e-6}"
@@ -102,10 +102,10 @@ MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 MODEL_SHORT="$(basename "${MODEL}")"
 EXPERIMENT_NAME="gsm8k_grpo_${MODEL_SHORT}_cortex"
 
-# SkyRL and verl use different parquet schemas for the same GSM8K dataset:
 # SkyRL's GSM8kEnv reads reward_spec + env_class; verl's rl_dataset reads
-# reward_model. Sharing one directory silently trains with reward=0 (schema
-# hit, wrong field name). Keep this default distinct from the verl recipe.
+# reward_model. A verl-shaped parquet therefore scores every rollout 0.0 here
+# rather than erroring, so keep this path distinct from any ~/data/gsm8k built
+# for verl.
 DATA_DIR="${DATA_DIR:-${HOME}/data/gsm8k-skyrl}"
 TRAIN_FILES="${DATA_DIR}/train.parquet"
 VAL_FILES="${DATA_DIR}/validation.parquet"

@@ -526,6 +526,44 @@ class TestCortexTransportNoopOps:
         assert t.call(Request("sleep-training", 1, {"mode": "all"})) == {}
 
 
+class TestCortexCancelToleratesEmptyBody:
+    """``:cancel`` answers 200 with no body. Decoding that as JSON reported a
+    release that had in fact succeeded as ``could not release <id>``, which
+    points the operator at the GPU cap instead of at their freed GPUs."""
+
+    def test_cancel_job_accepts_empty_response(self, monkeypatch):
+        pytest.importorskip("tenacity")
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
+        from arctic_platform.client import CortexConfig
+        from arctic_platform.client.transports.cortex import CortexTransport
+
+        cfg = ArcticClientConfig(model_name="m", backend=CortexConfig.from_env(), training_gpus=1, sampling_gpus=1)
+        t = CortexTransport(cfg)
+
+        class _EmptyResp:
+            status_code = 200
+            content = b""
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+        sent = {}
+
+        def _request(method, url, **kwargs):
+            sent["method"], sent["url"] = method, url
+            return _EmptyResp()
+
+        monkeypatch.setattr(t.session, "request", _request)
+
+        t.cancel_job("job-abc")
+
+        assert sent["method"] == "POST"
+        assert sent["url"].endswith("/job-abc:cancel")
+
+
 class TestLegacyBackendEnvPromotion:
     """Legacy ``arctic_platform.rl.config.ArcticRLClientConfig`` (the shape
     SkyRL builds) promotes ``backend="local"`` -> ``"cortex"`` when
