@@ -688,3 +688,41 @@ class TestCortexShimSaveWeightsFailsLoud:
 
         with pytest.raises(NotImplementedError, match="Cortex has no disk-based"):
             asyncio.run(shim.save_weights("/tmp/w"))
+
+
+class TestCortexShimRefusesReferenceLogProbs:
+    """``fwd_no_grad`` zero-fills the policy snapshot but must refuse a
+    reference-model request.
+
+    Zeros are harmless as ``old_log_probs`` (the lowering drops them and the
+    server re-derives π_old), but as π_ref they would turn a KL term into a
+    function of π_new alone — a wrong gradient with no error.
+    """
+
+    @staticmethod
+    def _shim():
+        from arctic_platform.integrations._cortex_dispatch import _CortexClientShim
+
+        shim = _CortexClientShim.__new__(_CortexClientShim)
+        shim._legacy_config = shim._unified_config = shim._client = None
+        return shim
+
+    @staticmethod
+    def _batch():
+        import torch
+
+        return {"batch": {"input_ids": torch.zeros((2, 5), dtype=torch.long)}}
+
+    def test_reference_model_request_raises(self):
+        import asyncio
+
+        with pytest.raises(NotImplementedError, match="reference-model log-probs"):
+            asyncio.run(self._shim().fwd_no_grad(self._batch(), reference_model=True))
+
+    def test_policy_snapshot_still_zero_fills(self):
+        """The path SkyRL actually uses must keep working."""
+        import asyncio
+
+        out = asyncio.run(self._shim().fwd_no_grad(self._batch(), reference_model=False))
+        assert out["batch"]["logprobs"].shape == (2, 5)
+        assert out["batch"]["logprobs"].abs().sum() == 0

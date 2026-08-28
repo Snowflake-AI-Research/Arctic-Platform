@@ -136,8 +136,24 @@ class _CortexClientShim:
         legacy_kwargs.pop("router_replay", None)
         return await self._client.fwd_bwd(to_cortex_fwd_bwd_payload(batch, processing=processing))
 
-    async def fwd_no_grad(self, batch: dict, **_: Any) -> dict:
+    async def fwd_no_grad(self, batch: dict, **kwargs: Any) -> dict:
         # Cortex has no /forward op; see zero_logprobs_like for when this is sound.
+        #
+        # Zeros are only safe as the *policy* log-prob snapshot, because
+        # `to_cortex_fwd_bwd_payload` drops `old_log_probs` and server-side GRPO
+        # re-derives pi_old from the live forward. Nothing consumes the zeros.
+        #
+        # A reference-model request has no such escape: the caller wants pi_ref
+        # for a KL term, and zeros would make that KL a function of pi_new alone
+        # -- a wrong gradient with no error. Refuse instead.
+        if kwargs.get("reference_model"):
+            raise NotImplementedError(
+                "cortex backend cannot serve reference-model log-probs: it has no "
+                "/forward sub-job, and substituting zeros would silently corrupt "
+                "the KL term. Disable KL (e.g. SkyRL "
+                "trainer.algorithm.use_kl_loss=false, use_kl_in_reward=false).\n\n"
+                "See docs/cortex-integration.md#supported-recipes."
+            )
         # Both spellings of each key: SkyRL reads them inconsistently by call site.
         z = zero_logprobs_like(batch)
         return {"batch": {"logprobs": z, "log_probs": z, "entropy": z, "entropies": z}}

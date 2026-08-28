@@ -42,10 +42,19 @@ def zero_logprobs_like(batch: dict) -> torch.Tensor:
     """A ``[B, T]`` float32 zero tensor sized from ``batch``'s ``input_ids``.
 
     Cortex exposes no ``/forward``, so a caller asked for log-probs has nothing
-    to call and substitutes zeros. That is only sound for single-epoch
-    on-policy GRPO without KL, where nothing consumes the values: the server
-    defaults π_old to ``logprobs.detach()`` from the live forward. The verl
-    adapter enforces those preconditions in ``_validate_cortex_compat``.
+    to call and substitutes zeros. That is only sound for GRPO without KL, where
+    nothing consumes the values: ``to_cortex_fwd_bwd_payload`` drops
+    ``old_log_probs`` and the server defaults π_old to ``logprobs.detach()`` from
+    the live forward. The verl adapter enforces the preconditions in
+    ``_validate_cortex_compat``; the SkyRL path refuses reference-model requests
+    in ``_CortexClientShim.fwd_no_grad``.
+
+    Consequence worth knowing before reading a training curve: because π_old is
+    re-derived per call rather than snapshotted, the ratio is exactly 1 on every
+    minibatch and PPO clipping never engages. A recipe that splits a batch into
+    minibatches (SkyRL's ``policy_mini_batch_size`` < ``train_batch_size``) is
+    therefore running unclipped updates, not clipped GRPO. It trains, but it is
+    not the same objective.
 
     Callers name their own response keys -- SkyRL's legacy client reads
     ``logprobs``/``entropies`` while verl reads ``log_probs``/``entropy`` -- so
