@@ -43,21 +43,28 @@ TP_SIZE="${TP_SIZE:-1}"              # driver sees Cortex sampling as TP=1
 # 4 training + 4 sampling sits exactly at the 8-GPU per-account Cortex cap.
 NUM_ENGINES="${NUM_ENGINES:-4}"
 
-# Hyperparameters are SkyRL's canonical GSM8K GRPO recipe
+# Defaults are SkyRL's canonical GSM8K GRPO recipe
 # (examples/train/gsm8k/run_gsm8k.sh) unchanged, except for use_kl_loss below.
-# Keep them that way: an earlier version ran TRAIN_BSZ=32 / MINI_BSZ=4, i.e. 16
-# sequences per optimizer update against the canonical 1280. verl's canonical
-# recipe independently lands on the same operating point, so treat this as the
-# supported configuration rather than a starting guess.
-TRAIN_BSZ=1024
-MINI_BSZ=256
-N_SAMPLES=5
-MICRO_BSZ=64
-PROMPT_LEN=512
-RESPONSE_LEN=1024
-LR=1e-6
-TOTAL_EPOCHS=20
-EVAL_INTERVAL=5
+#
+# Overridable because Cortex caps a single fwd_bwd response at 128 MiB and the
+# canonical operating point exceeds it. TRAIN_BSZ x N_SAMPLES sequences, each up
+# to PROMPT_LEN + RESPONSE_LEN tokens, each carrying a logprob and an entropy
+# back from post=["compute_logprobs"], works out to ~17.8 bytes/token on the
+# wire -- so the ceiling is near 4900 sequences per step and the canonical 5120
+# lands just over it:
+#
+#   429 ... gRPC message exceeds maximum size 134217728: 139869778
+#
+# N_SAMPLES=4 (4096 sequences) is the smallest change that clears it.
+TRAIN_BSZ="${TRAIN_BSZ:-1024}"
+MINI_BSZ="${MINI_BSZ:-256}"
+N_SAMPLES="${N_SAMPLES:-5}"
+MICRO_BSZ="${MICRO_BSZ:-64}"
+PROMPT_LEN="${PROMPT_LEN:-512}"
+RESPONSE_LEN="${RESPONSE_LEN:-1024}"
+LR="${LR:-1e-6}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-20}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-5}"
 
 # SkyRL's validate_generator_cfg asserts num_engines == len(remote_urls). The
 # URL itself is a placeholder -- the real endpoint lives inside the Cortex shim
