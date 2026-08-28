@@ -31,30 +31,47 @@ ARCTIC_VERL_CONFIG_DIR="${REPO_ROOT}/arctic_platform/integrations/verl/config"
 USE_LEGACY_WORKER_IMPL=disable
 ROLLOUT_NAME=arctic
 COLOCATE=False               # Cortex has no colocation lifecycle
-NGPU_TRAIN="${NGPU_TRAIN:-1}"        # training sub-job GPU count
-NGPU_SAMPLE="${NGPU_SAMPLE:-1}"      # sampling sub-job GPU count
+NGPU_TRAIN="${NGPU_TRAIN:-4}"        # training sub-job GPU count
+NGPU_SAMPLE="${NGPU_SAMPLE:-4}"      # sampling sub-job GPU count
 SAMPLING_TP_SIZE="${SAMPLING_TP_SIZE:-1}"
 NGPU_FOR_LOG_PROBS=0         # no /forward on Cortex; zero-fill via _zero_logprob_response
 TP_SIZE=1                    # driver-side; the Ray rollout actor always sees Cortex as TP=1
 
-# Hyperparameters mirror verl's canonical GSM8K GRPO recipe
-# (examples/grpo_trainer/run_qwen2_5-3b_gsm8k_grpo_lora.sh): static batching,
-# rollout.n=5, ppo_mini_batch_size=data.train_batch_size=16. LR stays at 1e-6
-# because Cortex has no /forward sub-job for ref log-probs, so use_kl_loss is
-# off; the canonical 3e-6 relies on KL regularization for stability.
-BSZ=16
-PPO_MINI_BSZ=16
-UBS=16
+# Hyperparameters are verl's canonical GSM8K GRPO recipe
+# (examples/grpo_trainer/run_qwen2-7b.sh) unchanged, except where Cortex cannot
+# express them -- see USE_KL_LOSS below. Keep them that way. An earlier version
+# of this recipe ran BSZ=16 / PPO_MINI_BSZ=4, i.e. 20 sequences per optimizer
+# update against the canonical 1280, and GSM8K acc@1 sat at its untrained ~0.29
+# for a full epoch. SkyRL's canonical recipe independently lands on the same
+# operating point (train 1024, mini 256, n=5, lr 1e-6), so treat these as the
+# supported configuration rather than a starting guess.
+BSZ=1024
+PPO_MINI_BSZ=256
 ROLL_N=5
-PROMPT_LEN=1024
+# DeepSpeed requires PPO_MINI_BSZ*ROLL_N == UBS * grad_accum * NGPU_TRAIN, so UBS
+# has to divide the per-GPU budget; a constant silently breaks whenever
+# NGPU_TRAIN changes. Take the largest divisor no greater than UBS_CAP (a memory
+# bound, not a correctness one). The cap is verl's canonical micro batch.
+UBS_CAP="${UBS_CAP:-40}"
+_per_gpu=$(( PPO_MINI_BSZ * ROLL_N / NGPU_TRAIN ))
+if [[ -z "${UBS:-}" ]]; then
+    for (( _c = _per_gpu < UBS_CAP ? _per_gpu : UBS_CAP; _c > 1; _c-- )); do
+        (( _per_gpu % _c == 0 )) && break
+    done
+    UBS=$_c
+fi
+PROMPT_LEN=512
 RESPONSE_LEN=1024
 ROLLOUT_MAX_BATCHED=16384
 LR=1e-6
 CLIP_RATIO=0.2
-USE_KL_LOSS=False            # required: Cortex has no /forward for ref log-probs
-TOTAL_EPOCHS=1
+# The one forced departure from canonical: Cortex has no /forward sub-job, so
+# reference log-probs are unavailable and the canonical kl_loss_coef=0.001 term
+# cannot be computed. Zero-filling it would silently corrupt the KL gradient.
+USE_KL_LOSS=False
+TOTAL_EPOCHS=15
 SAVE_FREQ=-1
-TEST_FREQ=10
+TEST_FREQ=5
 
 LOGGER="['console']"
 

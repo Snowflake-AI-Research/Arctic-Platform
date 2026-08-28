@@ -11,10 +11,11 @@
 # Cortex-specific overrides (Hydra):
 #   trainer.arctic_rl.attn_implementation=sdpa
 #     Cortex image ships without FA2.
-#   generator.inference_engine.external_server_urls=[http://cortex-managed]
+#   generator.inference_engine.remote_urls=[http://cortex-managed, ...]
 #   generator.sampling_params.logprobs=null
-#     Required by SkyRL's validate_generator_cfg under run_engines_locally=false.
-#     The URL is a placeholder; the real endpoint is inside the shim.
+#     Required by SkyRL's validate_generator_cfg under run_engines_locally=false,
+#     which asserts one URL per engine. The URLs are placeholders -- generation
+#     is served by the shim, which never dials them.
 
 set -euo pipefail
 
@@ -35,19 +36,34 @@ export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 
 # Cortex owns the GPUs; the driver has none. SkyRL's colocated placement
 # groups would deadlock on a CPU driver.
-NGPU_PER_NODE="${NGPU_PER_NODE:-1}"  # target Cortex training-sub-job GPU count
+NGPU_PER_NODE="${NGPU_PER_NODE:-4}"  # target Cortex training-sub-job GPU count
 NUM_NODES="${NUM_NODES:-1}"
 TP_SIZE="${TP_SIZE:-1}"              # driver sees Cortex sampling as TP=1
-NUM_ENGINES="${NUM_ENGINES:-1}"
+# sampling_gpus = num_engines x tp_size, so 4 engines is 4 sampling GPUs.
+# 4 training + 4 sampling sits exactly at the 8-GPU per-account Cortex cap.
+NUM_ENGINES="${NUM_ENGINES:-4}"
 
-TRAIN_BSZ=32
-MINI_BSZ=4
-N_SAMPLES=4
+# Hyperparameters are SkyRL's canonical GSM8K GRPO recipe
+# (examples/train/gsm8k/run_gsm8k.sh) unchanged, except for use_kl_loss below.
+# Keep them that way: an earlier version ran TRAIN_BSZ=32 / MINI_BSZ=4, i.e. 16
+# sequences per optimizer update against the canonical 1280. verl's canonical
+# recipe independently lands on the same operating point, so treat this as the
+# supported configuration rather than a starting guess.
+TRAIN_BSZ=1024
+MINI_BSZ=256
+N_SAMPLES=5
+MICRO_BSZ=64
 PROMPT_LEN=512
 RESPONSE_LEN=1024
 LR=1e-6
-TOTAL_EPOCHS=1
-EVAL_INTERVAL=10
+TOTAL_EPOCHS=20
+EVAL_INTERVAL=5
+
+# SkyRL's validate_generator_cfg asserts num_engines == len(remote_urls). The
+# URL itself is a placeholder -- the real endpoint lives inside the Cortex shim
+# -- but the count has to track NUM_ENGINES or the driver dies before launch.
+ENGINE_URLS="$(printf 'http://cortex-managed,%.0s' $(seq "${NUM_ENGINES}"))"
+ENGINE_URLS="[${ENGINE_URLS%,}]"
 
 LOGGER="${LOGGER:-console}"
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
@@ -101,7 +117,8 @@ python -m arctic_platform.integrations.skyrl \
     generator.inference_engine.num_engines=${NUM_ENGINES} \
     generator.inference_engine.tensor_parallel_size=${TP_SIZE} \
     generator.inference_engine.run_engines_locally=false \
-    "generator.inference_engine.external_server_urls=[http://cortex-managed]" \
+    "generator.inference_engine.remote_urls=${ENGINE_URLS}" \
+    "generator.inference_engine.external_server_urls=${ENGINE_URLS}" \
     "generator.sampling_params.logprobs=null" \
     generator.inference_engine.weight_sync_backend=nccl \
     generator.inference_engine.async_engine=true \
@@ -111,10 +128,12 @@ python -m arctic_platform.integrations.skyrl \
     trainer.epochs=${TOTAL_EPOCHS} \
     trainer.train_batch_size=${TRAIN_BSZ} \
     trainer.policy_mini_batch_size=${MINI_BSZ} \
+    trainer.micro_train_batch_size_per_gpu=${MICRO_BSZ} \
+    trainer.micro_forward_batch_size_per_gpu=${MICRO_BSZ} \
     trainer.max_prompt_length=${PROMPT_LEN} \
     generator.sampling_params.max_generate_length=${RESPONSE_LEN} \
     trainer.eval_batch_size=256 \
-    trainer.eval_before_train=false \
+    trainer.eval_before_train=true \
     trainer.eval_interval=${EVAL_INTERVAL} \
     trainer.update_epochs_per_batch=1 \
     trainer.policy.optimizer_config.lr=${LR} \
