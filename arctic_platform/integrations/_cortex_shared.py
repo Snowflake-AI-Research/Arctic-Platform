@@ -70,6 +70,58 @@ def zero_logprobs_like(batch: dict) -> torch.Tensor:
     return torch.zeros((b, max(t, 1)), dtype=torch.float32)
 
 
+# Padding sentinel per tensor. `labels` uses HF's ignore_index so a padded
+# column contributes no loss even if something downstream reads labels directly.
+_PAD_VALUE: dict[str, Any] = {"labels": -100}
+
+
+def _left_align_batch(tensors: dict, attention_mask, extra: dict) -> tuple[dict, dict, Any]:
+    """Move every row's real tokens into its leading columns, padding at the tail.
+
+    Cortex's data plane packs microbatches and rejects any other layout:
+    ``pack_microbatch`` raises "packing requires left-aligned rows: every row's
+    real tokens must be its leading columns, with padding at the tail". Both
+    frameworks can hand us the opposite -- SkyRL left-pads to the longest
+    sequence in the batch, verl right-aligns the prompt inside a fixed
+    ``max_prompt_len`` block -- so neither is safe to forward as-is.
+
+    The rewrite is driven entirely by ``attention_mask``: a stable sort on
+    validity yields, per row, the real columns in their original order followed
+    by the pad columns. Every full-width tensor is gathered through that one
+    index, so ``advantages`` and ``loss_mask`` keep pointing at the tokens they
+    scored. Re-aligning ``input_ids`` alone would displace the loss by a
+    different amount on every row -- no error, no crash, just a gradient
+    computed against the wrong tokens.
+
+    Returns the rewritten tensors, the rewritten extras, and the new mask.
+    """
+    import torch
+
+    mask = attention_mask.to(torch.bool)
+    width = mask.shape[-1]
+    lengths = mask.sum(dim=1)
+    valid = torch.arange(width, device=mask.device).unsqueeze(0) < lengths.unsqueeze(1)
+
+    # Already left-aligned (the common case for verl, whose adapter aligns
+    # upstream): skip the gather rather than pay for it on every step.
+    if torch.equal(mask, valid):
+        return tensors, extra, attention_mask
+
+    order = torch.argsort((~mask).to(torch.int8), dim=1, stable=True)
+
+    def move(name: str, t):
+        if not torch.is_tensor(t) or t.dim() != 2 or t.shape[-1] != width:
+            return t
+        pad = _PAD_VALUE.get(name, False if t.dtype == torch.bool else 0)
+        return torch.where(valid, t.gather(1, order), torch.full_like(t, pad))
+
+    return (
+        {k: move(k, v) for k, v in tensors.items()},
+        {k: move(k, v) for k, v in extra.items()},
+        valid.to(attention_mask.dtype),
+    )
+
+
 def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) -> dict:
     """Reshape a verl/SkyRL fwd_bwd payload into Cortex's wire shape.
 
@@ -78,6 +130,9 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
 
     Requires ``loss_mask`` or ``response_mask``; falling back to
     ``attention_mask`` would train on prompt tokens.
+
+    Rows are left-aligned on the way out (see :func:`_left_align_batch`) --
+    Cortex's packer rejects any other layout.
     """
     import torch
 
@@ -112,10 +167,20 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
         raise ValueError("cortex fwd_bwd requires 'advantages' [B, S]")
     tensors.pop("old_log_probs", None)
 
-    kwargs_out: dict[str, Any] = {"input_ids": input_ids, "attention_mask": attention_mask}
+    forwarded = {"input_ids": input_ids}
     for k in ("position_ids", "labels"):
         if k in tensors:
-            kwargs_out[k] = tensors[k]
+            forwarded[k] = tensors[k]
+    forwarded, scored, attention_mask = _left_align_batch(
+        forwarded, attention_mask, {"advantages": advantages, "loss_mask": loss_mask}
+    )
+    input_ids = forwarded["input_ids"]
+    advantages, loss_mask = scored["advantages"], scored["loss_mask"]
+
+    kwargs_out: dict[str, Any] = {"input_ids": input_ids, "attention_mask": attention_mask}
+    for k in ("position_ids", "labels"):
+        if k in forwarded:
+            kwargs_out[k] = forwarded[k]
 
     caller_config = dict((processing_in or {}).get("config") or {})
     proc_config: dict[str, Any] = {**_DEFAULT_PROC_CONFIG, **caller_config}

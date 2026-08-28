@@ -588,6 +588,67 @@ class TestCortexSharedHelper:
         assert "old_log_probs" not in out["kwargs"]
         assert "old_log_probs_shifted" not in out["context"]
 
+    def test_left_pads_are_rewritten_to_trailing_pads(self):
+        """SkyRL left-pads to the batch's longest sequence; Cortex's packer
+        rejects that outright ("packing requires left-aligned rows")."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        # Row 0 is full width; row 1 carries two leading pad columns.
+        ids = torch.tensor([[1, 2, 3, 4], [0, 0, 7, 8]])
+        attn = torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1]])
+        adv = torch.tensor([[0.0, 0.0, 0.5, 0.5], [0.0, 0.0, -0.25, -0.25]])
+        resp_mask = torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]])
+
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": adv,
+                    "response_mask": resp_mask,
+                },
+                "meta": {},
+            },
+        )
+
+        assert torch.equal(out["kwargs"]["input_ids"], torch.tensor([[1, 2, 3, 4], [7, 8, 0, 0]]))
+        assert torch.equal(out["kwargs"]["attention_mask"], torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]]))
+        # The scored tokens and their advantages must have moved with the ids.
+        loss_mask, moved_adv = out["context"]["loss_mask"], out["context"]["advantages"]
+        assert out["kwargs"]["input_ids"][1][loss_mask[1]].tolist() == [7, 8]
+        assert moved_adv[1][loss_mask[1]].tolist() == [-0.25, -0.25]
+        # Row 0 was already aligned and must be untouched.
+        assert out["kwargs"]["input_ids"][0].tolist() == [1, 2, 3, 4]
+        assert moved_adv[0][loss_mask[0]].tolist() == [0.5, 0.5]
+        # No advantage may survive on a padding column.
+        assert torch.equal((moved_adv != 0), loss_mask)
+
+    def test_already_aligned_batch_is_passed_through(self):
+        """verl's adapter aligns upstream, so the common case must not pay for
+        a gather -- and must not be perturbed by one."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
+        attn = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": torch.zeros((2, 4)),
+                    "response_mask": torch.tensor([[0, 0, 1, 0], [0, 1, 0, 0]]),
+                },
+                "meta": {},
+            },
+        )
+
+        assert out["kwargs"]["input_ids"] is ids
+        assert out["kwargs"]["attention_mask"] is attn
+
     def test_processing_matches_jae_cookbook_contract(self):
         """The wire contract mirrors ``cortex-client/recipes/rl_loop.py``:
         loss_agg_mode / entropy_coeff / eps_clip explicit, no dp_size."""
