@@ -94,22 +94,39 @@ looks fine and learns nothing:**
 `approx_kl` reads exactly **0.0** and that is expected, not a bug — see the
 clipping note below.
 
-## 6. Running at canonical scale
+## 6. Scaling up, and the ceiling we hit
 
-The defaults above are the configuration this recipe was validated on, not
-SkyRL's published GSM8K scale. To use that scale:
+The defaults above are deliberately smaller than SkyRL's published GSM8K scale
+(`train_batch_size=1024`, `policy_mini_batch_size=256`), because **that scale
+does not currently work on this backend.** Measured twice:
 
 ```bash
 TRAIN_BSZ=1024 MINI_BSZ=256 MICRO_BSZ=64 ./run_qwen3_0.6b_gsm8k_grpo_cortex.sh
 ```
 
-`N_SAMPLES` has to stay at 4. Canonical is 5, and 1024 × 5 sequences of 1536
-tokens returns ~135 MiB of per-token logprobs and entropies against Cortex's
-128 MiB response cap. At 4 it sits at 84% of the cap, so raising `RESPONSE_LEN`
-will overrun it too; the launcher preflights both and prints the ceiling.
+Step 1 completes normally (228s, 4096 sequences, packer and loss all fine).
+Step 2 then dies fetching its result:
 
-Each step is ~30x the sequences of the default, so budget GPU-hours rather than
-minutes.
+```
+WireError: not a valid DSSST1 safetensors payload: invalid DSSST1 safetensors header length
+  preceded by: ClientConnectionError('Connection lost: SSL shutdown timed out')
+```
+
+Both attempts failed at exactly step 2 with that signature. Step 1's response
+is the same ~108 MiB, so this is not the size of a single transfer but the
+second large transfer on a reused connection: the stream drops, the chunk set
+is left incomplete, and the decoder is handed a truncated payload. Tracked
+separately — it is in the shared transport's chunk handling, not in this
+recipe.
+
+Two consequences for scaling up:
+
+* `N_SAMPLES` cannot reach the canonical 5 regardless. 1024 × 5 sequences of
+  1536 tokens is ~135 MiB of per-token logprobs and entropies against a 128 MiB
+  response cap, so the launcher refuses it up front. At 4 it is at 84%.
+* Intermediate scales between 32 and 1024 are untested. If you raise
+  `TRAIN_BSZ`, expect the failure above once responses get large, and treat a
+  clean 50 steps as the bar before trusting a new size.
 
 ## Troubleshooting
 
@@ -118,6 +135,7 @@ minutes.
 | `429 ... per-account GPU cap reached: 8 GPUs in use` | A previous run's Cortex job still holds GPUs. This recipe needs all 8, so nothing else can be running. Run `python cortex_jobs.py` to see what is holding them and `--cancel` to release. A driver that exits cleanly releases its own; one that was SIGKILLed does not. |
 | `429 ... gRPC message exceeds maximum size 134217728` | The step's response exceeded Cortex's 128 MiB cap. The launcher preflights this, so you should only reach it by overriding `TRAIN_BSZ`, `N_SAMPLES` or `RESPONSE_LEN` past the printed ceiling. |
 | `packing requires left-aligned rows` | The batch reached Cortex with padding at the head of a row. The shim left-aligns before sending, so this indicates a payload path that bypassed `to_cortex_fwd_bwd_payload`. |
+| `WireError: ... invalid DSSST1 safetensors header length`, usually after `Connection lost: SSL shutdown timed out` | A large result came back truncated. Seen reproducibly from step 2 onward at `TRAIN_BSZ=1024` (~108 MiB per response); see section 6. Reduce `TRAIN_BSZ` / `RESPONSE_LEN`. |
 | `num_engines should be equal to the number of remote_urls` | `NUM_ENGINES` was changed without the matching placeholder URL list. The launcher derives them together; setting `generator.inference_engine.*` by hand breaks that. |
 | `cortex: set base_url (direct URL) or host (PAT auth)` | The `ARCTIC_CORTEX_*` environment isn't set in this shell. See step 2. |
 

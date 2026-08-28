@@ -44,6 +44,12 @@ constrains what runs correctly here:
 * **A response is capped at 128 MiB.** `post=["compute_logprobs"]` returns a
   logprob and an entropy per token, ~18 B/token, so a step is limited to
   roughly 4900 sequences. The recipe preflights this.
+* **Large responses are not reliably delivered well below that cap.** At
+  ~108 MiB per response the first transfer succeeds and the second fails with
+  `Connection lost: SSL shutdown timed out`, surfacing as a `WireError` about a
+  truncated DSSST1 payload: the chunk set is left incomplete and decoded
+  anyway. Reproduced twice at `TRAIN_BSZ=1024`, which is why the GSM8K recipe
+  ships a smaller default.
 * **A driver that dies without exiting cleanly keeps its GPUs.** `shutdown()`
   cancels the job; SIGKILL skips it, and the next launch then fails the GPU
   cap. `recipes/rl/skyrl/simple_gsm8k_cortex/cortex_jobs.py` lists and
