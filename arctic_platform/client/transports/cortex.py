@@ -63,11 +63,7 @@ _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
 _OCTET_OPS = {"forward-backward", "forward", "generate"}
 _OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
 # The chunk envelope's operation label is the wire's own name, not our canonical op name.
-_WIRE_OPERATION = {"forward-backward": "fwd-bwd", "forward": "fwd-no-grad", "generate": "generate"}
-# SnowAPI's path for an op, where it differs from our canonical name. On-prem serves
-# no-grad forward at /forward, so that stays the canonical op; SnowAPI spells the same
-# thing forward-no-grad (and the control plane abbreviates it again, to fwd-no-grad).
-_OP_PATH = {"forward": "forward-no-grad"}
+_WIRE_OPERATION = {"forward-backward": "fwd-bwd", "forward": "forward", "generate": "generate"}
 # forward-backward always carries a chunk envelope, even when the frame would fit in one
 # request: its chunk_group_id is the server's idempotency key, so a bare frame is off
 # contract. generate and forward post the bare frame when it fits.
@@ -79,10 +75,13 @@ _FORCE_CHUNK_OPS = {"forward-backward"}
 _GROUP_RESTART_OPS = {"forward-backward", "forward"}
 # Direct octet endpoints carry no routing envelope, so the control plane infers the
 # target sub-job from the op itself: forward-backward is training, generate is
-# sampling. `forward` is the one op that is ambiguous -- current-policy log-probs run
-# on the training sub-job, reference log-probs on the log_prob sub-job -- so the
-# caller's sub-job token has to travel with the request. The body is all tensor bytes,
-# so it travels as ?target_sub_job_id and SnowAPI folds it into the control-plane body.
+# sampling. `forward` still sends the caller's token because a session can hold more
+# than one training zone, and because reference_model=True aims at the log_prob
+# sub-job: Cortex answers that with Unimplemented (its zone serves forward on
+# training only), which is the error we want the caller to see rather than
+# current-policy numbers silently standing in for reference ones. The body is all
+# tensor bytes, so the token travels as ?target_sub_job_id and SnowAPI folds it into
+# the control-plane body.
 _SUB_JOB_ROUTED_OPS = {"forward"}
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
@@ -310,20 +309,16 @@ class CortexTransport(Transport):
     def call(self, request: Request) -> dict:
         if request.op in _NOOP_OPS:
             return {}
-        result = self._poll(self._submit(request))
-        # generate returns token ids as DSSST1 tensors; on-prem returns plain
-        # lists, so match that contract.
-        return _to_python(result) if request.op == "generate" else result
+        return _lower_result(request.op, self._poll(self._submit(request)))
 
     async def acall(self, request: Request) -> dict:
         if request.op in _NOOP_OPS:
             return {}
-        result = await self._apoll(await self._asubmit(request))
-        return _to_python(result) if request.op == "generate" else result
+        return _lower_result(request.op, await self._apoll(await self._asubmit(request)))
 
     def _op_target(self, request: Request) -> tuple[str, dict]:
         """The url (+ sub-job hint where the op needs one) and body (None-valued keys dropped)."""
-        url = f"{self._prefix}/{self.job_id}/{_OP_PATH.get(request.op, request.op)}"
+        url = f"{self._prefix}/{self.job_id}/{request.op}"
         if request.op in _SUB_JOB_ROUTED_OPS and request.job_id is not None:
             url = f"{url}?{urlencode({'target_sub_job_id': str(request.job_id)})}"
         return url, {k: v for k, v in request.body.items() if v is not None}
@@ -619,6 +614,32 @@ def _decode_result(result: dict) -> dict:
     if isinstance(result, dict) and result.get("wire_format") == wire.WIRE_FORMAT_VERSION:
         return wire.loads(base64.b64decode(result["payload_b64"]))
     return result
+
+
+def _lower_result(op: str, result: dict) -> dict:
+    """Lower a finished result to the contract on-prem gives for the same op."""
+    if op == "generate":
+        # generate returns token ids as DSSST1 tensors; on-prem returns plain
+        # lists, so match that contract.
+        return _to_python(result)
+    if op == "forward":
+        return _unwrap_forward_payload(result)
+    return result
+
+
+def _unwrap_forward_payload(result: dict) -> dict:
+    """Unwrap forward's DSSST1 frame from the JSON result envelope.
+
+    The zone base64s `wire.dumps({job_id, logprobs})` into `payload_b64`, but
+    without the `wire_format` marker `_decode_result` keys off, so the generic
+    path passes the envelope through and the caller gets a base64 string where
+    the tensors should be. Nothing between here and the zone unwraps it: the
+    only code that does is the standalone dev gateway, which the Cortex path
+    does not go through.
+    """
+    if not isinstance(result, dict) or not isinstance(result.get("payload_b64"), str):
+        return result
+    return wire.loads(base64.b64decode(result["payload_b64"]))
 
 
 def _to_python(obj: Any) -> Any:

@@ -21,9 +21,13 @@ for reference log-probs. Direct octet endpoints carry no routing envelope, so
 the sub-job token has to ride on the URL as ?target_sub_job_id, which SnowAPI
 folds into the control-plane request body.
 
-The op is spelled three ways along the path -- `forward` here and on-prem,
-forward-no-grad at SnowAPI, fwd-no-grad at the control plane -- so the tests pin
-the outbound spelling rather than trusting the canonical name to survive.
+Two things these tests exist to pin, both of which were wrong at first:
+
+- the outbound path. The zone serves /forward and the ZMD passes the op suffix
+  through verbatim, so anything else 404s at the zone.
+- the result shape. The zone wraps its DSSST1 frame in a JSON envelope that
+  lacks the `wire_format` marker the generic decoder keys off, so `forward`
+  needs its own unwrap or the caller gets base64 text instead of tensors.
 
 `_send` is stubbed, so these tests pin the request the transport builds and the
 result it decodes without a live GS.
@@ -113,15 +117,15 @@ class TestForwardWire:
         assert post["headers"]["Content-Type"] == "application/octet-stream"
         assert wire.loads(post["data"])["batch"]["input_ids"].tolist() == BATCH_IDS
 
-    def test_hits_the_forward_no_grad_endpoint(self):
-        """SnowAPI spells this forward-no-grad, though on-prem serves it at /forward.
+    def test_hits_the_forward_endpoint(self):
+        """The zone serves this at /forward and the ZMD passes the suffix through.
 
-        Posting the canonical op name here 404s: SnowAPI has no /forward route.
+        Any other spelling (fwd-no-grad, forward-no-grad) 404s at the zone.
         """
         transport, send = _transport()
         transport.call(fwd_no_grad_request(transport.jobs, _batch()))
 
-        assert send.urls[0].split("?")[0].endswith(f"/{JOB}/forward-no-grad")
+        assert send.urls[0].split("?")[0].endswith(f"/{JOB}/forward")
 
     def test_frame_under_the_cap_posts_bare(self):
         """forward has no idempotency key to carry, so chunking stays size-driven.
@@ -135,7 +139,7 @@ class TestForwardWire:
 
         assert wire.read_byte_chunk_metadata(send.frames[0]) is None
 
-    def test_oversized_frame_chunks_under_the_fwd_no_grad_label(self, monkeypatch):
+    def test_oversized_frame_chunks_under_the_forward_label(self, monkeypatch):
         """Log-prob batches can exceed the 60 MiB cap, so the split must round-trip."""
         monkeypatch.setattr(cortex_module, "_MAX_OCTET_BYTES", 64 * 1024)
         transport, send = _transport()
@@ -143,7 +147,7 @@ class TestForwardWire:
         transport.call(fwd_no_grad_request(transport.jobs, batch))
 
         assert len(send.frames) > 1
-        assert {wire.read_byte_chunk_metadata(f)["operation"] for f in send.frames} == {"fwd-no-grad"}
+        assert {wire.read_byte_chunk_metadata(f)["operation"] for f in send.frames} == {"forward"}
         frame = wire.decode_byte_chunks(send.frames, kind="request")
         assert wire.loads(frame)["batch"]["input_ids"].shape == (1, 20_000)
 
@@ -156,8 +160,13 @@ class TestForwardSubJobRouting:
         assert f"target_sub_job_id={TRAINING}" in send.urls[0]
 
     def test_reference_model_routes_to_log_prob(self):
-        """Losing this hint returns current-policy log-probs where reference
-        log-probs were asked for: a silent numerical error, not a failure."""
+        """Reference log-probs must name the log_prob sub-job.
+
+        Cortex answers that with Unimplemented today, since its zone serves
+        forward on training only. Sending the hint anyway is the point: dropping
+        it would quietly score against the current policy instead, which reads as
+        a plausible number rather than an error.
+        """
         transport, send = _transport()
         transport.call(fwd_no_grad_request(transport.jobs, _batch(), reference_model=True))
 
@@ -181,6 +190,31 @@ class TestForwardResult:
 
         assert torch.is_tensor(decoded["batch"]["logprobs"])
         assert decoded["batch"]["logprobs"].tolist() == [[-0.5, -1.5]]
+
+    def test_unwraps_the_zone_envelope_that_omits_wire_format(self):
+        """The zone sends `{job_id, payload_b64}` with no `wire_format` marker.
+
+        That is the shape on the real wire, and the generic decoder skips it, so
+        without forward's own unwrap the caller gets a base64 string where the
+        tensors belong.
+        """
+        frame = wire.dumps({"job_id": JOB, "logprobs": torch.tensor([[-0.5, -1.5]])})
+        transport, _ = _transport({"job_id": JOB, "payload_b64": base64.b64encode(frame).decode()})
+
+        decoded = transport.call(fwd_no_grad_request(transport.jobs, _batch()))
+
+        assert torch.is_tensor(decoded["logprobs"])
+        assert decoded["logprobs"].tolist() == [[-0.5, -1.5]]
+        assert decoded["job_id"] == JOB
+
+    def test_result_without_a_payload_passes_through(self):
+        """An error/plain-JSON result must not be mistaken for an envelope."""
+        transport, _ = _transport({"job_id": JOB, "status": "weird"})
+
+        assert transport.call(fwd_no_grad_request(transport.jobs, _batch())) == {
+            "job_id": JOB,
+            "status": "weird",
+        }
 
 
 class TestStillUnsupported:
