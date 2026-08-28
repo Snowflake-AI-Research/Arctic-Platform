@@ -139,13 +139,15 @@ def test_prepare_padded_arctic_batch_dict_values(verl_stub) -> None:
         _make_batch(), pad_token_id=PAD, drop_position_ids=True
     )
 
-    # For each row: left-pad prompt to 3, right-pad response to 3.
-    # seq 0: prompt=[10,11,12] (no pad), response=[30,31] (right-pad 1)
-    # seq 1: prompt=[20,21]    (left-pad 1), response=[40,41,42] (no pad)
+    # Rows are left-aligned: [prompt][response][pad]. Cortex's packer rejects
+    # anything else ("packing requires left-aligned rows"), and on the server
+    # path that tolerates it, the loss lands on the wrong tokens.
+    # seq 0: prompt=[10,11,12], response=[30,31]    -> 1 pad at the tail
+    # seq 1: prompt=[20,21],    response=[40,41,42] -> 1 pad at the tail
     expected_input_ids = torch.tensor(
         [
             [10, 11, 12, 30, 31, PAD],
-            [PAD, 20, 21, 40, 41, 42],
+            [20, 21, 40, 41, 42, PAD],
         ],
         dtype=torch.long,
     )
@@ -166,6 +168,43 @@ def test_prepare_padded_arctic_batch_dict_keeps_position_ids(verl_stub) -> None:
     assert batch_dict["position_ids"].shape == batch_dict["input_ids"].shape
 
 
+def test_left_align_moves_masks_with_their_tokens(verl_stub) -> None:
+    """The invariant whose violation cost 420 flat optimizer updates.
+
+    Re-aligning ``input_ids`` while leaving ``advantages`` / ``response_mask``
+    at their old columns shifts the loss off its tokens by a different amount
+    on every row, with no error and no crash. Pin that they travel together.
+    """
+    adapter = _adapter(verl_stub)
+
+    max_prompt_len, max_response_len = 3, 3
+    prompt_lens = torch.tensor([3, 2])
+    response_lens = torch.tensor([2, 3])
+
+    # verl's layout: prompt right-aligned in [0, 3), response in [3, 6).
+    input_ids = torch.tensor([[10, 11, 12, 30, 31, PAD], [PAD, 20, 21, 40, 41, 42]])
+    advantages = torch.tensor([[0.0, 0.0, 0.0, 0.5, 0.5, 0.0], [0.0, 0.0, 0.0, -0.25, -0.25, -0.25]])
+    response_mask = torch.tensor([[0, 0, 0, 1, 1, 0], [0, 0, 0, 1, 1, 1]])
+
+    src, valid = adapter._left_align_plan(prompt_lens, response_lens, max_prompt_len, max_response_len)
+    ids = adapter._left_align(input_ids, src, valid, PAD)
+    adv = adapter._left_align(advantages, src, valid, 0)
+    mask = adapter._left_align(response_mask, src, valid, 0)
+
+    assert torch.equal(ids, torch.tensor([[10, 11, 12, 30, 31, PAD], [20, 21, 40, 41, 42, PAD]]))
+    # The masked positions must still select exactly the response tokens.
+    assert ids[0][mask[0].bool()].tolist() == [30, 31]
+    assert ids[1][mask[1].bool()].tolist() == [40, 41, 42]
+    # ...carrying the same advantage they had before the move.
+    assert adv[0][mask[0].bool()].tolist() == [0.5, 0.5]
+    assert adv[1][mask[1].bool()].tolist() == [-0.25, -0.25, -0.25]
+    # No advantage may leak onto a prompt or padding column.
+    assert torch.equal((adv != 0), mask.bool())
+    # attention_mask degenerates to the validity mask: real tokens lead.
+    assert valid[0].tolist() == [True] * 5 + [False]
+    assert valid[1].tolist() == [True] * 5 + [False]
+
+
 @pytest.mark.parametrize("drop_position_ids", [True, False])
 def test_prepare_padded_arctic_batch_dict_pad_token_used(verl_stub, drop_position_ids: bool) -> None:
     """Non-zero pad tokens land in the padded slots, not the payload slots."""
@@ -176,7 +215,8 @@ def test_prepare_padded_arctic_batch_dict_pad_token_used(verl_stub, drop_positio
         _make_batch(), pad_token_id=non_zero_pad, drop_position_ids=drop_position_ids
     )
 
-    # Row 0: response is length 2, padded to 3 on the right with the
-    # sentinel; row 1: prompt is length 2, padded to 3 on the left.
+    # Both rows hold 5 real tokens in a width-6 row, so the sentinel lands in
+    # the trailing column and nowhere else -- padding is never at the head.
     assert batch_dict["input_ids"][0, -1].item() == non_zero_pad
-    assert batch_dict["input_ids"][1, 0].item() == non_zero_pad
+    assert batch_dict["input_ids"][1, -1].item() == non_zero_pad
+    assert non_zero_pad not in batch_dict["input_ids"][:, :-1]

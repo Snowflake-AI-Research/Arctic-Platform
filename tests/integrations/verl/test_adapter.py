@@ -98,3 +98,55 @@ def test_destroy_is_idempotent(verl_stub) -> None:
     asyncio.run(_run())
     assert shutdown_calls == 1, "destroy() must be idempotent; second call should be a no-op."
     assert wrapper._client is None
+
+
+def _ds_wrapper(verl_stub, *, mini: int, micro: int, rollout_n: int):
+    """A wrapper carrying only what ``_create_ds_config`` reads."""
+    from omegaconf import OmegaConf
+
+    adapter = _adapter(verl_stub)
+    wrapper = adapter.ArcticRLClientWrapper.__new__(adapter.ArcticRLClientWrapper)
+    wrapper.config = OmegaConf.create(
+        {
+            "data": {"train_batch_size": 16},
+            "actor_rollout_ref": {
+                "actor": {
+                    "ppo_mini_batch_size": mini,
+                    "ppo_micro_batch_size_per_gpu": micro,
+                    "fsdp_config": {},
+                },
+                "rollout": {"n": rollout_n},
+            },
+        }
+    )
+    wrapper._backend_config = OmegaConf.create({"train": {"deepspeed": {"bf16": {"enabled": True}}}})
+    return wrapper
+
+
+def test_ds_config_rejects_indivisible_multi_gpu_triple(verl_stub) -> None:
+    """DeepSpeed needs train_batch_size == micro x grad_accum x n_gpus.
+
+    The shipped GSM8K recipe (mini=16, n=5, micro=16) is fine at one GPU but
+    indivisible at four: 80 / (16 x 4) truncates to 1, and 16 x 1 x 4 = 64 != 80.
+    That used to surface only as an opaque server-side sub-job failure.
+    """
+    wrapper = _ds_wrapper(verl_stub, mini=16, micro=16, rollout_n=5)
+
+    with pytest.raises(AssertionError, match="divisible by"):
+        wrapper._create_ds_config(n_gpus=4)
+
+    # Single GPU is the default path and must stay working.
+    assert wrapper._create_ds_config(n_gpus=1)["gradient_accumulation_steps"] == 5
+
+
+def test_ds_config_multi_gpu_triple_multiplies_out(verl_stub) -> None:
+    """With a divisor micro batch, the emitted triple satisfies DeepSpeed."""
+    wrapper = _ds_wrapper(verl_stub, mini=16, micro=4, rollout_n=5)
+
+    ds = wrapper._create_ds_config(n_gpus=4)
+
+    assert ds["gradient_accumulation_steps"] == 5
+    assert (
+        ds["train_batch_size"]
+        == ds["train_micro_batch_size_per_gpu"] * ds["gradient_accumulation_steps"] * 4
+    )

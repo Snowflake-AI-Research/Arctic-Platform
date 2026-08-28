@@ -95,12 +95,67 @@ _ARCTIC_METRIC_REDUCTION_FN = {
 }
 
 
+def _prompt_response_lens(data):
+    """Per-row prompt and response token counts, in verl's own layout."""
+    prompt_ids = data["prompts"]
+    response_ids = data["responses"]
+    attention_mask = data["attention_mask"]
+
+    if prompt_ids.is_nested:
+        prompt_lens = prompt_ids.offsets().diff()
+        response_lens = response_ids.offsets().diff()
+    else:
+        assert not attention_mask.is_nested
+        prompt_lens = attention_mask[:, : prompt_ids.shape[1]].sum(dim=1)
+        response_lens = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
+    return prompt_lens, response_lens
+
+
+def _left_align_plan(prompt_lens, response_lens, max_prompt_len, max_response_len):
+    """Column map from verl's left-padded layout to Cortex's left-aligned one.
+
+    verl lays each row out as ``[pad][prompt][response][pad]``, with the prompt
+    right-aligned inside a fixed ``max_prompt_len`` block. Cortex's data plane
+    packs microbatches and rejects that shape outright -- ``pack_microbatch``
+    raises "packing requires left-aligned rows: every row's real tokens must be
+    its leading columns, with padding at the tail".
+
+    Returns a gather index that rewrites any full-width
+    ``[bsz, max_prompt_len + max_response_len]`` tensor into
+    ``[prompt][response][pad]``, together with the validity mask -- which is
+    also the left-aligned attention mask.
+
+    Every full-width tensor on the wire has to go through the same plan.
+    Re-aligning ``input_ids`` alone would leave ``advantages`` and
+    ``response_mask`` pointing at the columns they occupied before the shift,
+    by a different offset on every row, which costs no error and no crash --
+    just a gradient computed against the wrong tokens.
+    """
+    width = max_prompt_len + max_response_len
+    cols = torch.arange(width, device=prompt_lens.device).unsqueeze(0)
+    plen = prompt_lens.unsqueeze(1)
+    valid = cols < (plen + response_lens.unsqueeze(1))
+    src = torch.where(
+        cols < plen,
+        max_prompt_len - plen + cols,  # prompt: from [max_prompt_len - plen, max_prompt_len)
+        max_prompt_len + (cols - plen),  # response: from [max_prompt_len, max_prompt_len + rlen)
+    )
+    return src.clamp_(0, width - 1), valid
+
+
+def _left_align(tensor: torch.Tensor, src: torch.Tensor, valid: torch.Tensor, pad_value=0):
+    """Apply a :func:`_left_align_plan` to one full-width ``[bsz, width]`` tensor."""
+    gathered = tensor.gather(1, src)
+    return torch.where(valid, gathered, torch.full_like(gathered, pad_value))
+
+
 def _no_padding_2_padding_prompt_response(tensor: torch.Tensor, data, pad_token_id):
-    """Convert a jagged tensor into a left-padded prompt + right-padded
-    response of shape ``[bsz, max_prompt_len + max_response_len]`` —
-    the wire format Arctic expects. Arctic-specific; kept alongside the
-    Arctic adapter in this plugin package so generic verl code stays
-    untouched.
+    """Convert a jagged tensor into a dense left-aligned
+    ``[prompt][response][pad]`` row of shape
+    ``[bsz, max_prompt_len + max_response_len]`` — the wire format Cortex's
+    packer requires (see :func:`_left_align_plan`). Arctic-specific; kept
+    alongside the Arctic adapter in this plugin package so generic verl code
+    stays untouched.
     """
     import torch.nn.functional as F
     from verl.utils import tensordict_utils as tu
@@ -131,15 +186,13 @@ def _no_padding_2_padding_prompt_response(tensor: torch.Tensor, data, pad_token_
     sequence_offsets = sequence_lens.cumsum(dim=0)
     assert sequence_offsets[-1].item() == values.shape[0], f"{sequence_offsets[-1].item()} != {values.shape[0]}"
 
+    width = max_prompt_len + max_response_len
     rows = []
     for prompt_len, resp_len, seq_offset in zip(prompt_lens, response_lens, sequence_offsets, strict=True):
-        prompt_pad = max_prompt_len - prompt_len
-        response_pad = max_response_len - resp_len
         prompt = values[seq_offset - prompt_len - resp_len : seq_offset - resp_len]
         response = values[seq_offset - resp_len : seq_offset]
-        prompt_padded_left = F.pad(prompt, (prompt_pad, 0), value=pad_token_id)
-        response_padded_right = F.pad(response, (0, response_pad), value=pad_token_id)
-        rows.append(torch.cat((prompt_padded_left, response_padded_right)))
+        row = torch.cat((prompt, response))
+        rows.append(F.pad(row, (0, width - int(prompt_len) - int(resp_len)), value=pad_token_id))
 
     return torch.stack(rows, dim=0), max_prompt_len, max_response_len
 
@@ -153,9 +206,13 @@ def _prepare_padded_arctic_batch_dict(data, pad_token_id, *, drop_position_ids: 
         tensor=input_ids, data=data, pad_token_id=pad_token_id
     )
 
+    prompt_lens, response_lens = _prompt_response_lens(data)
+    _, valid = _left_align_plan(prompt_lens, response_lens, max_prompt_len, max_response_len)
+
     batch_dict = dict(
         input_ids=input_ids,
-        attention_mask=data["attention_mask"],
+        # Rows are left-aligned now, so the mask degenerates to "real token?".
+        attention_mask=valid.to(data["attention_mask"].dtype),
         prompts=data["prompts"],
     )
     if not drop_position_ids:
@@ -324,14 +381,35 @@ class ArcticRLClientWrapper(RemoteBackend):
             tensor=data["input_ids"], data=data, pad_token_id=pad_token_id
         )
 
+        import torch.nn.functional as F
+
+        # `input_ids` is left-aligned by the call above; every other full-width
+        # tensor has to be moved by the same per-row offset or the loss lands on
+        # the wrong tokens. See _left_align_plan.
+        prompt_lens, response_lens = _prompt_response_lens(data)
+        src, valid = _left_align_plan(prompt_lens, response_lens, max_prompt_len, max_response_len)
+        width = max_prompt_len + max_response_len
+
+        def _align(name: str, pad_value=0):
+            tensor = data[name]
+            if tensor.shape[1] == max_response_len:
+                # Response-only tensor: widen it into verl's layout first, so a
+                # single plan covers both conventions.
+                tensor = F.pad(tensor, (max_prompt_len, 0), value=pad_value)
+            assert tensor.shape[1] == width, (
+                f"{name} has width {tensor.shape[1]}; expected {width} (prompt+response) "
+                f"or {max_response_len} (response-only)"
+            )
+            return _left_align(tensor, src, valid, pad_value)
+
         batch = dict(
             input_ids=input_ids,
-            attention_mask=data["attention_mask"],
+            attention_mask=valid.to(data["attention_mask"].dtype),
             prompts=data["prompts"],
             responses=data["responses"],
-            response_mask=data["response_mask"],
-            old_log_probs=data["old_log_probs"],
-            advantages=data["advantages"],
+            response_mask=_align("response_mask"),
+            old_log_probs=_align("old_log_probs"),
+            advantages=_align("advantages"),
         )
         if not self.drop_position_ids:
             position_ids, _, _ = _no_padding_2_padding_prompt_response(
@@ -339,7 +417,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             )
             batch["position_ids"] = position_ids
         if actor_config.use_kl_loss:
-            batch["ref_log_prob"] = data["ref_log_prob"]
+            batch["ref_log_prob"] = _align("ref_log_prob")
 
         per_step_global_bsz = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * rollout_n
         meta = dict(
@@ -457,7 +535,21 @@ class ArcticRLClientWrapper(RemoteBackend):
             f"actor.ppo_mini_batch_size ({actor_cfg.ppo_mini_batch_size}); "
             f"got global={global_batch_size}, per-step={train_batch_size}"
         )
-        grad_accum_steps = max(1, train_batch_size // (micro_batch_size * n_gpus))
+        # DeepSpeed asserts train_batch_size == micro * grad_accum * n_gpus. Floor
+        # division here used to paper over an indivisible triple and let the job
+        # reach the server, where DeepSpeed rejected it as an opaque sub-job
+        # failure with no hint at which knob was wrong. Fail on the client with
+        # the arithmetic instead. Only reachable at n_gpus > 1: at n_gpus == 1 the
+        # micro batch is verl's own per-GPU size, which always divides.
+        per_gpu_step = micro_batch_size * n_gpus
+        assert train_batch_size % per_gpu_step == 0, (
+            f"DeepSpeed requires train_batch_size ({train_batch_size}) to be divisible by "
+            f"ppo_micro_batch_size_per_gpu ({micro_batch_size}) x n_gpus ({n_gpus}) = {per_gpu_step}. "
+            f"train_batch_size is ppo_mini_batch_size ({actor_cfg.ppo_mini_batch_size}) x rollout.n ({rollout_n}). "
+            f"Set actor.ppo_micro_batch_size_per_gpu to a divisor of "
+            f"{train_batch_size // n_gpus} (train_batch_size / n_gpus)."
+        )
+        grad_accum_steps = train_batch_size // per_gpu_step
         train_seq_parallel_size = actor_cfg.fsdp_config.get("ulysses_sequence_parallel_size", 1)
 
         ds_config = deepcopy(deepspeed_config)
