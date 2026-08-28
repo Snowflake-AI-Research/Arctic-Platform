@@ -546,7 +546,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             f"DeepSpeed requires train_batch_size ({train_batch_size}) to be divisible by "
             f"ppo_micro_batch_size_per_gpu ({micro_batch_size}) x n_gpus ({n_gpus}) = {per_gpu_step}. "
             f"train_batch_size is ppo_mini_batch_size ({actor_cfg.ppo_mini_batch_size}) x rollout.n ({rollout_n}). "
-            f"Set actor.ppo_micro_batch_size_per_gpu to a divisor of "
+            "Set actor.ppo_micro_batch_size_per_gpu to a divisor of "
             f"{train_batch_size // n_gpus} (train_batch_size / n_gpus)."
         )
         grad_accum_steps = train_batch_size // per_gpu_step

@@ -146,7 +146,4 @@ def test_ds_config_multi_gpu_triple_multiplies_out(verl_stub) -> None:
     ds = wrapper._create_ds_config(n_gpus=4)
 
     assert ds["gradient_accumulation_steps"] == 5
-    assert (
-        ds["train_batch_size"]
-        == ds["train_micro_batch_size_per_gpu"] * ds["gradient_accumulation_steps"] * 4
-    )
+    assert ds["train_batch_size"] == ds["train_micro_batch_size_per_gpu"] * ds["gradient_accumulation_steps"] * 4
