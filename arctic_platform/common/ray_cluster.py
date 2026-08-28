@@ -183,6 +183,12 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
     max_worker_port = os.environ.get("ARL_RAY_MAX_WORKER_PORT")
     if min_worker_port and max_worker_port:
         start_cmd += [f"--min-worker-port={min_worker_port}", f"--max-worker-port={max_worker_port}"]
+    client_server_port = os.environ.get("RAY_CLIENT_SERVER_PORT")
+    if client_server_port:
+        start_cmd += [f"--ray-client-server-port={client_server_port}"]
+    dashboard_agent_port = os.environ.get("RAY_DASHBOARD_AGENT_LISTEN_PORT")
+    if dashboard_agent_port:
+        start_cmd += [f"--dashboard-agent-listen-port={dashboard_agent_port}"]
     subprocess.run(
         start_cmd,
         check=True,

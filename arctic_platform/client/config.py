@@ -61,6 +61,13 @@ class OnPremConfig(BaseModel):
             "server child still sees GPUs. None = inherit the client's environment."
         ),
     )
+    server_extra_env: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Extra environment variables for a launched local server subprocess. "
+            "Used to isolate concurrent Ray clusters (student vs teacher OPD)."
+        ),
+    )
     startup_timeout: float = Field(
         600.0, description="onprem: seconds to wait for a launched server to become healthy."
     )
