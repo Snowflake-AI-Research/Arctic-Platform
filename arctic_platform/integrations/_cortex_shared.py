@@ -41,24 +41,14 @@ _DEFAULT_PROC_CONFIG: dict[str, Any] = {
 def zero_logprobs_like(batch: dict) -> torch.Tensor:
     """A ``[B, T]`` float32 zero tensor sized from ``batch``'s ``input_ids``.
 
-    Cortex exposes no ``/forward``, so a caller asked for log-probs has nothing
-    to call and substitutes zeros. That is only sound for GRPO without KL, where
-    nothing consumes the values: ``to_cortex_fwd_bwd_payload`` drops
-    ``old_log_probs`` and the server defaults π_old to ``logprobs.detach()`` from
-    the live forward. A reference-model request has no such escape, so
-    ``_CortexClientShim.fwd_no_grad`` refuses it rather than zero-filling a KL
-    term into a function of π_new alone.
+    Cortex has no ``/forward``, so a caller asking for log-probs has nothing to
+    call. Zeros are sound only because nothing reads them: this lowering drops
+    ``old_log_probs`` and the server re-derives π_old from the live forward. A
+    reference-model request is refused in ``_CortexClientShim.fwd_no_grad``
+    instead, where zeros would quietly reduce the KL to a function of π_new.
 
-    Consequence worth knowing before reading a training curve: because π_old is
-    re-derived per call rather than snapshotted, the ratio is exactly 1 on every
-    minibatch and PPO clipping never engages. A recipe that splits a batch into
-    minibatches (SkyRL's ``policy_mini_batch_size`` < ``train_batch_size``) is
-    therefore running unclipped updates, not clipped GRPO. It trains, but it is
-    not the same objective.
-
-    Callers name their own response keys -- SkyRL's legacy client reads
-    ``logprobs``/``entropies`` while verl reads ``log_probs``/``entropy`` -- so
-    only the sizing is shared.
+    Re-deriving π_old also makes the ratio exactly 1, so PPO clipping never
+    engages: a multi-minibatch step runs unclipped updates, not clipped GRPO.
     """
     import torch
 
@@ -78,21 +68,15 @@ _PAD_VALUE: dict[str, Any] = {"labels": -100}
 def _left_align_batch(tensors: dict, attention_mask, extra: dict) -> tuple[dict, dict, Any]:
     """Move every row's real tokens into its leading columns, padding at the tail.
 
-    Cortex's data plane packs microbatches and rejects any other layout:
-    ``pack_microbatch`` raises "packing requires left-aligned rows: every row's
-    real tokens must be its leading columns, with padding at the tail". SkyRL
-    hands us the opposite, left-padding each row to the longest sequence in the
-    batch, so its payload is never safe to forward as-is.
+    SkyRL left-pads each row to the batch's longest sequence; Cortex's packer
+    rejects exactly that ("packing requires left-aligned rows: every row's real
+    tokens must be its leading columns, with padding at the tail").
 
-    The rewrite is driven entirely by ``attention_mask``: a stable sort on
-    validity yields, per row, the real columns in their original order followed
-    by the pad columns. Every full-width tensor is gathered through that one
-    index, so ``advantages`` and ``loss_mask`` keep pointing at the tokens they
-    scored. Re-aligning ``input_ids`` alone would displace the loss by a
-    different amount on every row -- no error, no crash, just a gradient
-    computed against the wrong tokens.
-
-    Returns the rewritten tensors, the rewritten extras, and the new mask.
+    A stable sort on validity gives each row's real columns in order, then its
+    pads. Every full-width tensor is gathered through that one index so
+    ``advantages`` and ``loss_mask`` stay on the tokens they scored -- moving
+    ``input_ids`` alone would shift the loss by a different amount per row, with
+    no error and no crash.
     """
     import torch
 

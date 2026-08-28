@@ -118,8 +118,8 @@ class _CortexClientShim:
         return None  # Cortex has no in-process state
 
     def shutdown(self):
-        # SkyRL calls sync, verl awaits: return the coroutine inside a running
-        # loop, else drive it to completion so sync callers don't leak jobs.
+        # SkyRL calls this synchronously: inside a running loop hand back the
+        # coroutine, otherwise drive it so a sync caller doesn't leak the job.
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -128,7 +128,6 @@ class _CortexClientShim:
         return self._client.shutdown()
 
     def __getattr__(self, name: str) -> Any:
-        # Everything else on AsyncArcticRLClient is exposed as-is.
         return getattr(self._client, name)
 
     async def fwd_bwd(self, batch: dict, **legacy_kwargs: Any) -> dict:
@@ -137,15 +136,8 @@ class _CortexClientShim:
         return await self._client.fwd_bwd(to_cortex_fwd_bwd_payload(batch, processing=processing))
 
     async def fwd_no_grad(self, batch: dict, **kwargs: Any) -> dict:
-        # Cortex has no /forward op; see zero_logprobs_like for when this is sound.
-        #
-        # Zeros are only safe as the *policy* log-prob snapshot, because
-        # `to_cortex_fwd_bwd_payload` drops `old_log_probs` and server-side GRPO
-        # re-derives pi_old from the live forward. Nothing consumes the zeros.
-        #
-        # A reference-model request has no such escape: the caller wants pi_ref
-        # for a KL term, and zeros would make that KL a function of pi_new alone
-        # -- a wrong gradient with no error. Refuse instead.
+        # Cortex has no /forward; see zero_logprobs_like for why zeros are sound
+        # as the policy snapshot and never as pi_ref.
         if kwargs.get("reference_model"):
             raise NotImplementedError(
                 "cortex backend cannot serve reference-model log-probs: it has no "

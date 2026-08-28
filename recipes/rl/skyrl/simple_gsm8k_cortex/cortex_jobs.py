@@ -14,19 +14,13 @@
 # limitations under the License.
 """Show, and optionally release, Cortex jobs holding GPUs on this account.
 
-Why this exists: Cortex caps an account at 8 GPUs, and this recipe asks for
-exactly 8 (4 training + 4 sampling). A driver that exits cleanly releases them.
-One that dies first -- SIGKILL, an OOM, a dropped SSH session -- does not, and
-the job keeps its GPUs. The next launch then fails with
+A driver that exits cleanly releases its GPUs; one killed first does not, and
+since this recipe sits at the 8-GPU account cap the next launch then fails with
+`429 ... per-account GPU cap reached` -- which never says the GPUs are held by
+your own dead run.
 
-    429 ... per-account GPU cap reached: 8 GPUs in use plus 8 requested
-    exceeds the cap of 8
-
-which never mentions that the GPUs are held by your own dead run, so there is
-no obvious way out. This is the way out.
-
-    python cortex_jobs.py            # what is holding GPUs right now
-    python cortex_jobs.py --cancel   # release all of it
+    python cortex_jobs.py            # what is holding GPUs
+    python cortex_jobs.py --cancel   # release it
     python cortex_jobs.py --all      # include finished jobs
 
 Reads the same ARCTIC_CORTEX_* environment the recipe does.

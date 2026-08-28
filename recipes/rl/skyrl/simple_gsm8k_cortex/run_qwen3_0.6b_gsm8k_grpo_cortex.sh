@@ -58,13 +58,9 @@ LR="${LR:-1e-6}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-20}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-5}"
 
-# Cortex returns a logprob and an entropy for every token in the step
-# (post=["compute_logprobs"]), measured at ~18 B/token on the wire, against a
-# 128 MiB per-response cap. Overrun it and Cortex says so only after
-# provisioning 8 GPUs and running a full generate+train step, as an opaque
-#   429 ... gRPC message exceeds maximum size 134217728: 139869778
-# which names neither the cap it means nor the knob that fixes it. Do the
-# arithmetic here instead, where it costs nothing.
+# Cortex returns a logprob and an entropy per token (~18 B/token) against a
+# 128 MiB response cap, and reports an overrun only after provisioning 8 GPUs
+# and a full step -- as a 429 naming neither the cap nor the knob. Check here.
 _CAP_BYTES=134217728
 _SEQ_LEN=$(( PROMPT_LEN + RESPONSE_LEN ))
 _SEQS=$(( TRAIN_BSZ * N_SAMPLES ))
@@ -86,11 +82,8 @@ if (( _EST > _CAP_BYTES )); then
     exit 1
 fi
 
-# Say this out loud rather than leaving it to the README. Cortex re-derives
-# pi_old from the live forward on every fwd_bwd instead of snapshotting it, so
-# the importance ratio is exactly 1, eps_clip never binds, and approx_kl reads
-# 0.0. With more than one minibatch per step that silently stops being clipped
-# GRPO -- it still trains, so nothing in the logs looks wrong.
+# pi_old is re-derived per fwd_bwd, never snapshotted, so the ratio is 1 and
+# eps_clip cannot bind. Silent, and it changes the objective -- so say it.
 if (( MINI_BSZ < TRAIN_BSZ )); then
     echo "NOTE: ${TRAIN_BSZ}/${MINI_BSZ} = $(( TRAIN_BSZ / MINI_BSZ )) minibatches per step, and PPO" >&2
     echo "      clipping does not engage on Cortex (pi_old is re-derived, so the ratio is 1)." >&2
