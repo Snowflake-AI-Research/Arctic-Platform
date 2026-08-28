@@ -86,6 +86,18 @@ if (( _EST > _CAP_BYTES )); then
     exit 1
 fi
 
+# Say this out loud rather than leaving it to the README. Cortex re-derives
+# pi_old from the live forward on every fwd_bwd instead of snapshotting it, so
+# the importance ratio is exactly 1, eps_clip never binds, and approx_kl reads
+# 0.0. With more than one minibatch per step that silently stops being clipped
+# GRPO -- it still trains, so nothing in the logs looks wrong.
+if (( MINI_BSZ < TRAIN_BSZ )); then
+    echo "NOTE: ${TRAIN_BSZ}/${MINI_BSZ} = $(( TRAIN_BSZ / MINI_BSZ )) minibatches per step, and PPO" >&2
+    echo "      clipping does not engage on Cortex (pi_old is re-derived, so the ratio is 1)." >&2
+    echo "      These are unclipped updates, not clipped GRPO. approx_kl=0.0 is expected." >&2
+    echo "      Set MINI_BSZ=${TRAIN_BSZ} for one update per step if that matters." >&2
+fi
+
 # SkyRL's validate_generator_cfg asserts num_engines == len(remote_urls). The
 # URL itself is a placeholder -- the real endpoint lives inside the Cortex shim
 # -- but the count has to track NUM_ENGINES or the driver dies before launch.
