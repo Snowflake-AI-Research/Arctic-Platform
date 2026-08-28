@@ -292,6 +292,24 @@ class CortexTransport(Transport):
         with contextlib.suppress(requests.exceptions.RequestException):
             self._send("POST", f"{self._prefix}/{self.job_id}:cancel")
 
+    def list_jobs(self) -> list[dict]:
+        """Every Cortex job on this account, with its status.
+
+        Recovery surface for the orphan case: `shutdown()` releases the job this
+        transport created, but a driver that dies without reaching it leaves
+        GPUs held against the per-account cap. The next launch then fails with
+        `429 ... per-account GPU cap reached`, which says nothing about which
+        job is holding them or that it belongs to the caller at all.
+        """
+        payload = self._send("GET", self._prefix)
+        if isinstance(payload, list):
+            return payload
+        return payload.get("jobs") or payload.get("data") or []
+
+    def cancel_job(self, job_id: str) -> None:
+        """Release one job's GPUs by id -- for orphans `shutdown()` can't see."""
+        self._send("POST", f"{self._prefix}/{job_id}:cancel")
+
     # ── deliver one op: submit + poll to completion ──────────────────────────
     def call(self, request: Request) -> dict:
         if request.op in _NOOP_OPS:

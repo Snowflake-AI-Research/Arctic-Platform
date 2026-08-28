@@ -44,27 +44,47 @@ TP_SIZE="${TP_SIZE:-1}"              # driver sees Cortex sampling as TP=1
 NUM_ENGINES="${NUM_ENGINES:-4}"
 
 # Defaults are SkyRL's canonical GSM8K GRPO recipe
-# (examples/train/gsm8k/run_gsm8k.sh) unchanged, except for use_kl_loss below.
-#
-# Overridable because Cortex caps a single fwd_bwd response at 128 MiB and the
-# canonical operating point exceeds it. TRAIN_BSZ x N_SAMPLES sequences, each up
-# to PROMPT_LEN + RESPONSE_LEN tokens, each carrying a logprob and an entropy
-# back from post=["compute_logprobs"], works out to ~17.8 bytes/token on the
-# wire -- so the ceiling is near 4900 sequences per step and the canonical 5120
-# lands just over it:
-#
-#   429 ... gRPC message exceeds maximum size 134217728: 139869778
-#
-# N_SAMPLES=4 (4096 sequences) is the smallest change that clears it.
+# (examples/train/gsm8k/run_gsm8k.sh), with two forced deviations: N_SAMPLES
+# below, and use_kl_loss further down. Everything else is canonical.
 TRAIN_BSZ="${TRAIN_BSZ:-1024}"
 MINI_BSZ="${MINI_BSZ:-256}"
-N_SAMPLES="${N_SAMPLES:-5}"
+# Canonical is 5. Cortex caps one fwd_bwd response at 128 MiB and 1024 x 5
+# exceeds it by 4.2%; see the preflight below for the arithmetic.
+N_SAMPLES="${N_SAMPLES:-4}"
 MICRO_BSZ="${MICRO_BSZ:-64}"
 PROMPT_LEN="${PROMPT_LEN:-512}"
 RESPONSE_LEN="${RESPONSE_LEN:-1024}"
 LR="${LR:-1e-6}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-20}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-5}"
+
+# Cortex returns a logprob and an entropy for every token in the step
+# (post=["compute_logprobs"]), measured at ~18 B/token on the wire, against a
+# 128 MiB per-response cap. Overrun it and Cortex says so only after
+# provisioning 8 GPUs and running a full generate+train step, as an opaque
+#   429 ... gRPC message exceeds maximum size 134217728: 139869778
+# which names neither the cap it means nor the knob that fixes it. Do the
+# arithmetic here instead, where it costs nothing.
+_CAP_BYTES=134217728
+_SEQ_LEN=$(( PROMPT_LEN + RESPONSE_LEN ))
+_SEQS=$(( TRAIN_BSZ * N_SAMPLES ))
+_EST=$(( _SEQS * _SEQ_LEN * 18 ))
+if (( _EST > _CAP_BYTES )); then
+    _MAX_SEQS=$(( _CAP_BYTES / (_SEQ_LEN * 18) ))
+    _FIT_N=$(( _MAX_SEQS / TRAIN_BSZ ))
+    echo "ERROR: this configuration overruns Cortex's per-response cap." >&2
+    echo >&2
+    echo "  ${TRAIN_BSZ} TRAIN_BSZ x ${N_SAMPLES} N_SAMPLES = ${_SEQS} sequences/step" >&2
+    echo "  x ${_SEQ_LEN} tokens x ~18 B/token = ~$(( _EST / 1048576 )) MiB" >&2
+    echo "  cap = $(( _CAP_BYTES / 1048576 )) MiB  ->  at most ${_MAX_SEQS} sequences/step" >&2
+    echo >&2
+    if (( _FIT_N >= 1 )); then
+        echo "Fix: N_SAMPLES=${_FIT_N} (or lower TRAIN_BSZ / RESPONSE_LEN)." >&2
+    else
+        echo "Fix: TRAIN_BSZ=${_MAX_SEQS} with N_SAMPLES=1, or shorten RESPONSE_LEN." >&2
+    fi
+    exit 1
+fi
 
 # SkyRL's validate_generator_cfg asserts num_engines == len(remote_urls). The
 # URL itself is a placeholder -- the real endpoint lives inside the Cortex shim
