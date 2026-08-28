@@ -19,7 +19,8 @@ completion. So an op is just submit + poll -> final result dict, the same
 contract the on-prem transports expose. `call` runs it over ``requests``; `acall`
 runs the identical flow over ``aiohttp`` for the async client. The only Cortex
 specifics live in `_submit`, because SnowAPI is not uniform: forward-backward,
-forward and generate carry DSSST1 octet bodies (byte-chunked), while
+forward and generate carry DSSST1 octet bodies (byte-chunked, except forward,
+which the zone cannot reassemble and so must fit one request), while
 step/save/operation post their JSON body as-is (the client assembles the full
 `/operation` envelope, incl. sub-job routing). `log-probs` raises
 NotImplementedError.
@@ -66,13 +67,19 @@ _OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
 _WIRE_OPERATION = {"forward-backward": "fwd-bwd", "forward": "forward", "generate": "generate"}
 # forward-backward always carries a chunk envelope, even when the frame would fit in one
 # request: its chunk_group_id is the server's idempotency key, so a bare frame is off
-# contract. generate and forward post the bare frame when it fits.
+# contract. generate posts the bare frame when it fits and splits when it does not;
+# forward posts bare and has to fit (see _NO_CHUNK_OPS).
 _FORCE_CHUNK_OPS = {"forward-backward"}
 # Ops whose chunked frame can be re-posted from scratch on a chunk-group error.
 # forward-backward carries the large gradient frame; a mid-stream chunk-group
-# desync (GS restart) is recoverable only by re-posting the whole group. forward
-# is a read: it mutates no engine state, so replaying it is always safe.
-_GROUP_RESTART_OPS = {"forward-backward", "forward"}
+# desync (GS restart) is recoverable only by re-posting the whole group.
+_GROUP_RESTART_OPS = {"forward-backward"}
+# Ops that must arrive as one frame. The zone reassembles chunk groups for
+# fwd-bwd only -- /fwd-bwd stages them via stage_fwd_bwd_chunk, while /forward
+# reads the body straight through -- so a chunked forward would land at the zone
+# as a partial frame. Refuse it here, where the cause is still legible, instead
+# of shipping chunks nothing downstream will put back together.
+_NO_CHUNK_OPS = {"forward"}
 # Direct octet endpoints carry no routing envelope, so the control plane infers the
 # target sub-job from the op itself: forward-backward is training, generate is
 # sampling. `forward` still sends the caller's token because a session can hold more
@@ -338,6 +345,13 @@ class CortexTransport(Transport):
 
     def _octet_chunks(self, body: dict, op: str) -> list[bytes]:
         frame = wire.dumps(body, metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}})
+        if op in _NO_CHUNK_OPS and len(frame) > _MAX_OCTET_BYTES:
+            raise NotImplementedError(
+                f"{op} frame is {len(frame)} bytes, over the {_MAX_OCTET_BYTES}-byte per-request cap. "
+                f"Cortex cannot split it: the zone reassembles chunk groups for fwd-bwd only, so a chunked "
+                f"{op} would arrive as a partial frame. Send a smaller batch, or add chunk staging to the "
+                f"zone's /{op} the way /fwd-bwd has it."
+            )
         return list(
             wire.encode_byte_chunks(
                 frame,

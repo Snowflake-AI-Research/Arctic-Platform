@@ -139,15 +139,31 @@ class TestForwardWire:
 
         assert wire.read_byte_chunk_metadata(send.frames[0]) is None
 
-    def test_oversized_frame_chunks_under_the_forward_label(self, monkeypatch):
-        """Log-prob batches can exceed the 60 MiB cap, so the split must round-trip."""
+    def test_oversized_frame_refuses_to_split(self, monkeypatch):
+        """An oversized forward must fail here, not arrive at the zone in pieces.
+
+        The zone stages chunk groups for /fwd-bwd only; /forward reads the body
+        straight through, so chunks would land as a partial frame. Failing at the
+        cap names that, where chunking would surface as a parse error at the zone.
+        """
         monkeypatch.setattr(cortex_module, "_MAX_OCTET_BYTES", 64 * 1024)
         transport, send = _transport()
         batch = {"batch": {"input_ids": torch.arange(20_000).reshape(1, -1)}, "meta": {}, "processing": {}}
-        transport.call(fwd_no_grad_request(transport.jobs, batch))
+
+        with pytest.raises(NotImplementedError, match="reassembles chunk groups for fwd-bwd only"):
+            transport.call(fwd_no_grad_request(transport.jobs, batch))
+
+        assert send.posts == []
+
+    def test_forward_backward_still_chunks(self, monkeypatch):
+        """The cap is forward's alone -- fwd-bwd's chunk group must keep working."""
+        monkeypatch.setattr(cortex_module, "_MAX_OCTET_BYTES", 64 * 1024)
+        transport, send = _transport()
+        batch = {"batch": {"input_ids": torch.arange(20_000).reshape(1, -1)}, "meta": {}, "processing": {}}
+        transport.call(fwd_bwd_request(transport.jobs, batch))
 
         assert len(send.frames) > 1
-        assert {wire.read_byte_chunk_metadata(f)["operation"] for f in send.frames} == {"forward"}
+        assert {wire.read_byte_chunk_metadata(f)["operation"] for f in send.frames} == {"fwd-bwd"}
         frame = wire.decode_byte_chunks(send.frames, kind="request")
         assert wire.loads(frame)["batch"]["input_ids"].shape == (1, 20_000)
 
