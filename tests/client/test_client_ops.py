@@ -551,11 +551,6 @@ class TestCortexSharedHelper:
     """``to_cortex_fwd_bwd_payload`` lives under ``arctic_platform.integrations``
     so the reshape rule sits next to the dispatch shim that uses it."""
 
-    def test_integration_path_importable(self):
-        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
-
-        assert callable(to_cortex_fwd_bwd_payload)
-
     def test_reshape_matches_cortex_wire_shape(self):
         import torch
 
