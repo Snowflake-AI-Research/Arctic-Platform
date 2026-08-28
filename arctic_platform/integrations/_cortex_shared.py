@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Reshape verl/SkyRL ``{batch, meta, processing}`` into Cortex's
+"""Reshape SkyRL's ``{batch, meta, processing}`` into Cortex's
 ``{args, kwargs, context, processing}`` wire format.
 
 The processing block matches ``cortex-client/recipes/rl_loop.py``
@@ -45,9 +45,9 @@ def zero_logprobs_like(batch: dict) -> torch.Tensor:
     to call and substitutes zeros. That is only sound for GRPO without KL, where
     nothing consumes the values: ``to_cortex_fwd_bwd_payload`` drops
     ``old_log_probs`` and the server defaults π_old to ``logprobs.detach()`` from
-    the live forward. The verl adapter enforces the preconditions in
-    ``_validate_cortex_compat``; the SkyRL path refuses reference-model requests
-    in ``_CortexClientShim.fwd_no_grad``.
+    the live forward. A reference-model request has no such escape, so
+    ``_CortexClientShim.fwd_no_grad`` refuses it rather than zero-filling a KL
+    term into a function of π_new alone.
 
     Consequence worth knowing before reading a training curve: because π_old is
     re-derived per call rather than snapshotted, the ratio is exactly 1 on every
@@ -80,10 +80,9 @@ def _left_align_batch(tensors: dict, attention_mask, extra: dict) -> tuple[dict,
 
     Cortex's data plane packs microbatches and rejects any other layout:
     ``pack_microbatch`` raises "packing requires left-aligned rows: every row's
-    real tokens must be its leading columns, with padding at the tail". Both
-    frameworks can hand us the opposite -- SkyRL left-pads to the longest
-    sequence in the batch, verl right-aligns the prompt inside a fixed
-    ``max_prompt_len`` block -- so neither is safe to forward as-is.
+    real tokens must be its leading columns, with padding at the tail". SkyRL
+    hands us the opposite, left-padding each row to the longest sequence in the
+    batch, so its payload is never safe to forward as-is.
 
     The rewrite is driven entirely by ``attention_mask``: a stable sort on
     validity yields, per row, the real columns in their original order followed
@@ -102,8 +101,8 @@ def _left_align_batch(tensors: dict, attention_mask, extra: dict) -> tuple[dict,
     lengths = mask.sum(dim=1)
     valid = torch.arange(width, device=mask.device).unsqueeze(0) < lengths.unsqueeze(1)
 
-    # Already left-aligned (the common case for verl, whose adapter aligns
-    # upstream): skip the gather rather than pay for it on every step.
+    # Already conformant (a batch whose rows all happen to be full width, or a
+    # caller that aligned upstream): skip the gather rather than pay for it.
     if torch.equal(mask, valid):
         return tensors, extra, attention_mask
 
@@ -123,7 +122,7 @@ def _left_align_batch(tensors: dict, attention_mask, extra: dict) -> tuple[dict,
 
 
 def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) -> dict:
-    """Reshape a verl/SkyRL fwd_bwd payload into Cortex's wire shape.
+    """Reshape a SkyRL fwd_bwd payload into Cortex's wire shape.
 
     ``old_log_probs_shifted`` is dropped: server-side GRPO defaults it to
     ``logprobs.detach()`` (π_old ≡ π_new), correct for single-epoch on-policy.

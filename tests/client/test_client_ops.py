@@ -549,7 +549,7 @@ class TestLegacyBackendEnvPromotion:
 
 class TestCortexSharedHelper:
     """``to_cortex_fwd_bwd_payload`` lives under ``arctic_platform.integrations``
-    so the SkyRL shim and the verl adapter share the reshape rule."""
+    so the reshape rule sits next to the dispatch shim that uses it."""
 
     def test_integration_path_importable(self):
         from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
@@ -626,7 +626,7 @@ class TestCortexSharedHelper:
         assert torch.equal((moved_adv != 0), loss_mask)
 
     def test_already_aligned_batch_is_passed_through(self):
-        """verl's adapter aligns upstream, so the common case must not pay for
+        """An already-conformant batch must not pay for
         a gather -- and must not be perturbed by one."""
         import torch
 
