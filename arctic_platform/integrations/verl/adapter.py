@@ -45,6 +45,7 @@ from arctic_platform.client import OnPremConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
 from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+from arctic_platform.integrations._cortex_shared import zero_logprobs_like
 from arctic_platform.rl.ray_server import ArcticRLRayServerState
 
 # Cortex returns metrics at multiple levels (top-level avg_loss on fwd_bwd,
@@ -63,6 +64,12 @@ _CORTEX_METRIC_DROP = {
 
 
 def _merge_train_response(step_response: dict, fwd_bwd_response: dict) -> dict:
+    """Flatten Cortex's fwd_bwd + step responses into on-prem's metrics shape.
+
+    ``_CORTEX_METRIC_DROP`` is not cosmetic: these carry strings and dicts, and
+    verl reduces every surviving metric with ``np.mean``.
+    """
+
     def _flatten(resp: dict) -> dict:
         out: dict = {}
         for k, v in resp.items():
@@ -746,16 +753,12 @@ class ArcticRLClientWrapper(RemoteBackend):
             )
 
     def _stub_logprob_response(self, payload: dict) -> dict:
-        """[B, T] zeros shaped like a real fwd_no_grad. Safe only because
-        ``_validate_cortex_compat`` rejects every knob that would consume
-        these values; the server defaults π_old = π_new from live logprobs."""
-        b_data = payload.get("batch") if isinstance(payload, dict) else None
-        if not isinstance(b_data, dict):
-            b_data = payload if isinstance(payload, dict) else {}
-        ids = b_data.get("input_ids")
-        b = int(ids.shape[0]) if torch.is_tensor(ids) else 1
-        t = int(ids.shape[-1]) if torch.is_tensor(ids) else 1
-        z = torch.zeros((b, max(t, 1)), dtype=torch.float32)
+        """A fwd_no_grad-shaped response of zeros, for Cortex's missing /forward.
+
+        Sound only because ``_validate_cortex_compat`` rejects every knob that
+        would consume these values.
+        """
+        z = zero_logprobs_like(payload)
         return {"batch": {"log_probs": z, "entropy": z}}
 
     async def _send_compute_ref_log_prob(self, payload: dict):
@@ -813,7 +816,10 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         fwd_bwd_response = await self._client.fwd_bwd(payload)
         step_response = await self._client.step()
-        step_response["metrics"] = _merge_train_response(step_response, fwd_bwd_response)
+        if self._is_cortex_backend():
+            step_response["metrics"] = _merge_train_response(step_response, fwd_bwd_response)
+        else:
+            step_response["metrics"].update(**fwd_bwd_response["metrics"])
         return step_response
 
     async def save_checkpoint(self):

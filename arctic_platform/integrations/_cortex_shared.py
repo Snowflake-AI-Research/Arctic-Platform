@@ -15,7 +15,7 @@
 """Reshape verl/SkyRL ``{batch, meta, processing}`` into Cortex's
 ``{args, kwargs, context, processing}`` wire format.
 
-The processing block matches ``arctic_platform/cortex-client/recipes/rl_loop.py``
+The processing block matches ``cortex-client/recipes/rl_loop.py``
 (Jae's cookbook). ``dp_size`` is deliberately NOT sent: the server treats it
 as a loss divisor, which scales the effective LR down by that factor at
 multi-GPU DP.
@@ -23,7 +23,11 @@ multi-GPU DP.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from typing import Any
+
+if TYPE_CHECKING:
+    import torch
 
 # Match Jae's rl_loop.py and verl's actor.yaml defaults; caller-supplied
 # processing.config values win.
@@ -32,6 +36,29 @@ _DEFAULT_PROC_CONFIG: dict[str, Any] = {
     "loss_agg_mode": "token-mean",
     "entropy_coeff": 0.0,
 }
+
+
+def zero_logprobs_like(batch: dict) -> torch.Tensor:
+    """A ``[B, T]`` float32 zero tensor sized from ``batch``'s ``input_ids``.
+
+    Cortex exposes no ``/forward``, so a caller asked for log-probs has nothing
+    to call and substitutes zeros. That is only sound for single-epoch
+    on-policy GRPO without KL, where nothing consumes the values: the server
+    defaults π_old to ``logprobs.detach()`` from the live forward. The verl
+    adapter enforces those preconditions in ``_validate_cortex_compat``.
+
+    Callers name their own response keys -- SkyRL's legacy client reads
+    ``logprobs``/``entropies`` while verl reads ``log_probs``/``entropy`` -- so
+    only the sizing is shared.
+    """
+    import torch
+
+    body = batch.get("batch") if isinstance(batch, dict) else None
+    if not isinstance(body, dict):
+        body = batch if isinstance(batch, dict) else {}
+    ids = body.get("input_ids")
+    b, t = (int(ids.shape[0]), int(ids.shape[-1])) if torch.is_tensor(ids) else (1, 1)
+    return torch.zeros((b, max(t, 1)), dtype=torch.float32)
 
 
 def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) -> dict:

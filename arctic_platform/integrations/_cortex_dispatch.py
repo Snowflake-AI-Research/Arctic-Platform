@@ -29,6 +29,7 @@ import asyncio
 from typing import Any
 
 from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+from arctic_platform.integrations._cortex_shared import zero_logprobs_like
 from arctic_platform.rl.config import ArcticRLClientConfig as _LegacyConfig
 
 __all__ = ["create_cortex_client"]
@@ -136,16 +137,9 @@ class _CortexClientShim:
         return await self._client.fwd_bwd(to_cortex_fwd_bwd_payload(batch, processing=processing))
 
     async def fwd_no_grad(self, batch: dict, **_: Any) -> dict:
-        # Cortex has no /forward op; return zeros. Only correct for single-epoch
-        # on-policy GRPO without KL (see docs/cortex-integration.md).
-        import torch
-
-        b_data = batch.get("batch") if isinstance(batch, dict) else None
-        if not isinstance(b_data, dict):
-            b_data = batch if isinstance(batch, dict) else {}
-        ids = b_data.get("input_ids")
-        b, t = (int(ids.shape[0]), int(ids.shape[-1])) if torch.is_tensor(ids) else (1, 1)
-        z = torch.zeros((b, max(t, 1)), dtype=torch.float32)
+        # Cortex has no /forward op; see zero_logprobs_like for when this is sound.
+        # Both spellings of each key: SkyRL reads them inconsistently by call site.
+        z = zero_logprobs_like(batch)
         return {"batch": {"logprobs": z, "log_probs": z, "entropy": z, "entropies": z}}
 
     async def save_weights(self, path: str) -> dict:
