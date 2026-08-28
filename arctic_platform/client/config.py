@@ -98,10 +98,9 @@ class CortexConfig(BaseModel):
     def from_env(cls, **overrides: Any) -> Self:
         """Build a ``CortexConfig`` from ``ARCTIC_CORTEX_*`` env vars.
 
-        The one call-site framework adapters (SkyRL shim / verl adapter) use to
-        flip to Cortex from a shell-level env, so the env-var contract lives in
-        one place instead of being reinvented per integration. Explicit
-        ``overrides`` win.
+        The one call-site an integration uses to flip to Cortex from a
+        shell-level env, so the env-var contract lives in one place instead of
+        being reinvented per framework. Explicit ``overrides`` win.
         """
         env: dict[str, Any] = {}
         for key, field in (

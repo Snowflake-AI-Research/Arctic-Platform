@@ -455,8 +455,8 @@ class TestCortexConfigFromEnv:
 
 class TestUnifiedConfigDoesNotReadEnv:
     """``ArcticClientConfig`` does not swap ``backend`` from env vars.
-    ``ARCTIC_BACKEND`` is only honored at framework adapter call-sites (verl's
-    ``_create_rl_client_config``, the legacy ``arctic_platform.rl`` validator)."""
+    ``ARCTIC_BACKEND`` is honored only by the legacy ``arctic_platform.rl``
+    validator, which is the config shape SkyRL builds."""
 
     def test_no_env_promotion_on_unified_config(self, monkeypatch):
         monkeypatch.setenv("ARCTIC_BACKEND", "cortex")
@@ -616,7 +616,6 @@ class TestCortexSharedHelper:
         assert torch.equal(out["context"]["input_ids"], ids)
         assert "advantages" in out["context"]
         assert "loss_mask" in out["context"]
-        # Pin loss_fn="grpo" so verl's "verl_grpo" alias doesn't reach the server.
         assert out["processing"]["loss_fn"] == "grpo"
         assert "old_log_probs" not in out["kwargs"]
         assert "old_log_probs_shifted" not in out["context"]
@@ -710,10 +709,11 @@ class TestCortexSharedHelper:
         assert "dp_size" not in cfg
         assert "prox_logp_method" not in cfg
 
-    def test_caller_processing_config_wins(self):
-        """Recipe-supplied loss knobs override the defaults, so verl's
-        ``actor.entropy_coeff`` / ``loss_agg_mode`` propagate all the way
-        to the Cortex server."""
+    def test_caller_loss_config_wins_but_loss_fn_stays_pinned(self):
+        """Recipe-supplied loss knobs propagate to the server, but ``loss_fn``
+        does not: this lowering builds a payload the server's ``grpo`` loss can
+        read, so honouring a caller's alias would hand those tensors to a loss
+        that expects a different contract."""
         import torch
 
         from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
@@ -730,7 +730,7 @@ class TestCortexSharedHelper:
                 "meta": {"global_batch_size": 128},
             },
             processing={
-                "loss_fn": "verl_grpo",
+                "loss_fn": "some_other_grpo",
                 "config": {"eps_clip": 0.3, "loss_agg_mode": "seq-mean-token-sum", "entropy_coeff": 0.01},
             },
         )
@@ -738,6 +738,7 @@ class TestCortexSharedHelper:
         assert cfg["eps_clip"] == 0.3
         assert cfg["loss_agg_mode"] == "seq-mean-token-sum"
         assert cfg["entropy_coeff"] == 0.01
+        assert out["processing"]["loss_fn"] == "grpo"
         assert cfg["global_batch_size"] == 128  # meta fallback still applied
 
     def test_missing_response_mask_fails_loud(self):
