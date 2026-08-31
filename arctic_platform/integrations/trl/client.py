@@ -73,7 +73,7 @@ class ArcticTrainingClient:
         self,
         client: Any,
         temperature: float = 1.0,
-        loss_fn: str = "arctic_platform.integrations.trl.loss.weighted_logprob_sum",
+        loss_fn: str = "arctic_platform.rl.processors.weighted_logprob.weighted_logprob_sum",
         *,
         pad_token_id: int = 0,
         rollout_n: int = 1,
@@ -374,7 +374,9 @@ class ArcticOptimizer(torch.optim.Optimizer):
         pass  # server clears grads in step()
 
 
-# Packed [1, T] <-> padded [B, S]. Advantages / old_log_probs stay in TRL.
+# Packed [1, T] <-> padded [B, S]. Client-side path keeps advantages /
+# old_log_probs inside TRL's loss_fn; server_side_loss extracts them from
+# the closure and ships them on the fused fwd_bwd.
 
 
 def _segment_lengths(position_ids: torch.Tensor) -> torch.Tensor:
