@@ -87,7 +87,9 @@ hold ~0.5 GB each until something unrelated OOMs.
 `kill -9` on the launcher itself is the one case it cannot cover, since no
 trap runs. Release the leftover job by id with the Cortex job CLI
 (`cortex-client/dss_neutrino_cli.py`: `list`, then `cancel <job_id>`) before
-launching again, or the next run fails the account cap.
+launching again, or the next run fails the account cap. Porting that CLI onto
+the unified client is tracked in
+[#101](https://github.com/Snowflake-AI-Research/Arctic-Platform/issues/101).
 
 ## 5. What a healthy run looks like
 

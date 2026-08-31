@@ -152,8 +152,8 @@ mkdir -p "${CKPT_DIR}"
 # node OOMs a later, innocent one.
 
 # `list`/`cancel` against the transport. Inline rather than a recipe-local CLI:
-# `cortex-client/dss_neutrino_cli.py` already does this properly and is being
-# ported to arctic_platform separately -- once it lands, call it here instead.
+# `cortex-client/dss_neutrino_cli.py` already does this properly, and porting it
+# onto the unified client is issue #101 -- once that lands, call it here instead.
 cortex_jobs() {
     local mode="$1"; shift
     python - "${mode}" "$@" <<'PY'

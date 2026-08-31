@@ -93,9 +93,9 @@ class CortexConfig(BaseSettings):
 
     type: Literal["remote"] = "remote"
     protocol: Literal["cortex"] = Field("cortex", description="remote transport protocol.")
-    # Present so callers can read `backend.colocate` uniformly across backends
-    # (review thread T13). Cortex always splits training and sampling into
-    # separate SnowAPI sub-jobs, so it can only ever be False.
+    # Present so callers can read `backend.colocate` uniformly across backends.
+    # Cortex always splits training and sampling into separate SnowAPI sub-jobs,
+    # so it can only ever be False.
     colocate: Literal[False] = Field(False, description="cortex: colocation not supported.")
     base_url: str | None = Field(None, description="cortex: direct/mock GS URL; bypasses PAT auth.")
     host: str | None = Field(None, description="cortex: Snowflake host for PAT auth.")
@@ -377,10 +377,9 @@ def _without_noop_offload(ds_config: dict[str, Any]) -> dict[str, Any]:
 
         AssertionError: CPUAdam param is on cuda:0 and must be 'cpu'
 
-    Framework configs spell the no-op out (verl's remote_backend/arctic.yaml,
-    SkyRL's arctic_rl), while the standalone recipes omit it -- which is why
-    only the framework paths hit this. A real ``device: cpu`` request is left
-    alone.
+    SkyRL's arctic_rl config spells the no-op out while the standalone recipes
+    omit it, which is why only the framework path hits this. A real
+    ``device: cpu`` request is left alone.
     """
     zero = ds_config.get("zero_optimization")
     if not isinstance(zero, dict):
