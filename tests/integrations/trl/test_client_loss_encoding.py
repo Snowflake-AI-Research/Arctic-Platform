@@ -156,6 +156,73 @@ class TestEquivalenceWithTheDefaultEncoding:
         assert float(grpo_value) != pytest.approx(float(wls_value))
 
 
+class TestPayloadAlignment:
+    """Whether the tensors line up once the real client builds them.
+
+    The encoding tests above feed ``_surrogate_payload`` tensors that are aligned
+    by construction. In the client they are not: ``weights`` round-trips through
+    TRL's packed layout via ``_unshift_from_trl`` and ``_unpack_to_padded``, while
+    ``old_log_probs_shifted`` is the server's reply untouched. If those two frames
+    disagree by even one position the gradient is silently wrong -- no error, just
+    a worse model -- so it is worth pinning against the real call path.
+    """
+
+    LENS = (5, 4)
+
+    class _MockClient:
+        def __init__(self, lens):
+            self.payload = None
+            b, s = len(lens), max(lens)
+            # Distinctive per-position values, so a misalignment cannot look plausible.
+            self.logprobs = torch.zeros(b, s, dtype=torch.float32)
+            for row, n in enumerate(lens):
+                for col in range(n):
+                    self.logprobs[row, col] = -(10 * (row + 1) + col)
+
+        def fwd_no_grad(self, payload):
+            del payload
+            return {"batch": {"logprobs": self.logprobs.clone(), "entropy": torch.zeros_like(self.logprobs)}}
+
+        def fwd_bwd(self, payload):
+            self.payload = payload
+            return {}
+
+    def _run(self, encoding: str):
+        client_mod = pytest.importorskip("arctic_platform.integrations.trl.client")
+        mock = self._MockClient(self.LENS)
+        client = client_mod.ArcticTrainingClient(client=mock, client_loss_encoding=encoding)
+        total = sum(self.LENS)
+
+        out = client.forward_backward(
+            model=None,
+            input_ids=torch.arange(1, total + 1).unsqueeze(0),
+            position_ids=torch.cat([torch.arange(n) for n in self.LENS]).unsqueeze(0),
+            completion_mask=torch.ones(1, total, dtype=torch.long),
+            # dL/dlogprobs == logprobs, so the weights coming back out are the
+            # log-probs themselves after the full round trip.
+            loss_fn=lambda leaf: (leaf**2).sum() / 2,
+        )
+        out.loss.backward()
+        return mock
+
+    def test_advantages_are_paired_with_the_logprobs_they_came_from(self):
+        mock = self._run("grpo")
+        batch = mock.payload["batch"]
+
+        assert torch.equal(batch["old_log_probs_shifted"], mock.logprobs)
+        carried = batch["advantages"] != 0
+        assert carried.any()
+        assert torch.allclose(batch["advantages"][carried], -mock.logprobs[carried])
+
+    def test_both_encodings_weight_exactly_the_same_positions(self):
+        """grpo must not silently supervise more or fewer tokens than the default."""
+        grpo_batch = self._run("grpo").payload["batch"]
+        default_batch = self._run("weighted_logprob_sum").payload["batch"]
+
+        assert torch.equal(grpo_batch["advantages"] != 0, default_batch["logprob_weights_shifted"] != 0)
+        assert torch.allclose(grpo_batch["advantages"], -default_batch["logprob_weights_shifted"])
+
+
 class TestDefaultEncoding:
     def test_default_is_unchanged(self):
         """The existing path must keep naming its own loss and its own key."""
