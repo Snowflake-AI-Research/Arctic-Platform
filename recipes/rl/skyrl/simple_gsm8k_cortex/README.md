@@ -100,21 +100,20 @@ defaults, all 233 steps, no overrides and no early stop. A bare
 
 | step | 0 | 10 | 20 | 30 | 40 | 50 | 60 | 70 | 80 | 90 | 100 | 110 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| pass@1 | 0.2949 | 0.3912 | 0.4989 | 0.5891 | 0.6588 | 0.6876 | 0.6907 | 0.7096 | 0.7165 | 0.7316 | 0.7172 | 0.7316 |
+| pass@1 | 0.2942 | 0.3995 | 0.4996 | 0.5815 | 0.6687 | 0.6710 | 0.6839 | 0.6839 | 0.7013 | 0.7225 | 0.7180 | 0.7286 |
 
 | step | 120 | 130 | 140 | 150 | 160 | 170 | 180 | 190 | 200 | 210 | 220 | 230 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| pass@1 | 0.7225 | 0.7400 | 0.7384 | 0.7422 | 0.7233 | 0.7369 | 0.7415 | 0.7346 | 0.7460 | 0.7528 | 0.7566 | 0.7582 |
+| pass@1 | 0.7468 | 0.7445 | 0.7513 | 0.7498 | 0.7536 | 0.7513 | 0.7650 | 0.7627 | 0.7589 | 0.7566 | 0.7491 | 0.7680 |
 
-Step 0 is the untrained baseline: **0.2949 → 0.7582**, 2.6x, in 2h03m
+Step 0 is the untrained baseline: **0.2942 → 0.7680**, 2.6x, in 2h03m
 wall-clock (~4 min of Cortex provisioning, then ~20s per training step and
 ~2 min per eval). Zero errors, zero retries.
 
-The shape is the point. It climbs steeply to ~0.69 by step 50, then flattens:
-everything from step 90 on sits in 0.72–0.76, drifting up by about a point
+The shape is the point. It climbs steeply to ~0.67 by step 50, then flattens:
+everything from step 90 on sits in 0.72–0.77, drifting up by about a point
 over the last 100 steps. That is a run that has converged for this
-configuration, not one that was stopped while still climbing — which is what
-the earlier 50-step number in this file was.
+configuration, not one that was stopped while still climbing.
 
 Because the epoch is the whole schedule, the run ends on its own and there is
 nothing to decide about when to stop it.
