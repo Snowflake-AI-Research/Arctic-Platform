@@ -1,0 +1,3 @@
+# uv override-dependencies for the TRL GSM8K recipe.
+# See ../txt2sql/overrides.txt for the rationale.
+datasets==5.0.0

@@ -60,6 +60,7 @@ all = [
     "arctic_platform[cortex]",
     "arctic_platform[onprem]",
     "arctic_platform[verl]",
+    "arctic_platform[trl]",
 ]
 
 dev = [
@@ -144,6 +145,14 @@ verl = [
     "arctic_platform[rl]",
     "codetiming",
     "omegaconf",
+]
+
+# TRL adapter (arctic_platform/integrations/trl). TRL itself is user-supplied
+# (async-GRPO training-client branch); here we only carry the runtime deps
+# the adapter itself needs beyond [rl].
+trl = [
+    "arctic_platform[rl]",
+    "accelerate",
 ]
 
 [tool.pytest.ini_options]
