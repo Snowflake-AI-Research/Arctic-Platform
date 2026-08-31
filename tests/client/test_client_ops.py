@@ -447,7 +447,7 @@ class TestCortexConfigReadsEnv:
         assert cfg.host == "acct.snowflakecomputing.com"
         assert cfg.database == "db"
         assert cfg.schema_ == "sch"
-        assert cfg.pat == "pat-value"
+        assert cfg.pat.get_secret_value() == "pat-value"
 
     def test_missing_pat_on_host_auth_is_refused(self, monkeypatch):
         monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
@@ -464,6 +464,26 @@ class TestCortexConfigReadsEnv:
 
         cfg = CortexConfig(base_url="http://explicit")
         assert cfg.base_url == "http://explicit"
+
+    def test_pat_is_not_rendered_anywhere(self, monkeypatch):
+        """The PAT must not ride along into a log line or a serialized config.
+
+        Configs get printed, and the whole point of hydrating `pat` from the
+        environment is that the token is now a materialized field rather than
+        something fetched on demand — so it would otherwise land in every repr.
+        """
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
+        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "db")
+        monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "sch")
+        monkeypatch.setenv("ARCTIC_CORTEX_PAT", "SUPERSECRET123")
+        from arctic_platform.client import CortexConfig
+
+        cfg = CortexConfig()
+        assert "SUPERSECRET123" not in repr(cfg)
+        assert "SUPERSECRET123" not in str(cfg.model_dump())
+        assert "SUPERSECRET123" not in cfg.model_dump_json()
+        # ...but it is still readable where it is actually needed.
+        assert cfg.pat.get_secret_value() == "SUPERSECRET123"
 
     def test_exported_but_empty_reads_as_unset(self, monkeypatch):
         """A shell that exports ARCTIC_CORTEX_ENDPOINT= means "unset", not "".

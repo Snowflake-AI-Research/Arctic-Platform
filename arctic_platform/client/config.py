@@ -36,6 +36,7 @@ from pydantic import AliasChoices
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import SecretStr
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
@@ -99,7 +100,10 @@ class CortexConfig(BaseSettings):
     colocate: Literal[False] = Field(False, description="cortex: colocation not supported.")
     base_url: str | None = Field(None, description="cortex: direct/mock GS URL; bypasses PAT auth.")
     host: str | None = Field(None, description="cortex: Snowflake host for PAT auth.")
-    pat: str | None = Field(None, description="cortex: PAT; also read from ARCTIC_CORTEX_PAT.")
+    # SecretStr so the token cannot ride along into a log line or a serialized
+    # config: repr and model_dump render it as `**********`, and reading it
+    # takes an explicit `.get_secret_value()`.
+    pat: SecretStr | None = Field(None, description="cortex: PAT; also read from ARCTIC_CORTEX_PAT.")
     database: str = Field("", description="cortex: Snowflake database.")
     # `schema` shadows a BaseModel attribute, hence the trailing underscore. An
     # explicit alias opts the field out of `env_prefix`, so the env name has to
@@ -120,7 +124,7 @@ class CortexConfig(BaseSettings):
         if self.host and not self.base_url:
             if not (self.database and self.schema_):
                 raise ValueError("cortex: database + schema required for host/PAT auth.")
-            if not self.pat:
+            if not (self.pat and self.pat.get_secret_value()):
                 raise ValueError("cortex: no PAT — set `pat` or ARCTIC_CORTEX_PAT for host auth.")
         return self
 
