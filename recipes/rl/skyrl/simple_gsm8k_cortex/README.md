@@ -32,16 +32,18 @@ SkyRL still needs to be cloned at the pinned commit (see
 ## 2. Set Cortex env
 
 ```bash
-export ARCTIC_BACKEND=cortex
 export ARCTIC_CORTEX_HOST=<account>.<region>.snowflakecomputing.com
 export ARCTIC_CORTEX_DATABASE=<db>
 export ARCTIC_CORTEX_SCHEMA=<schema>
-export CORTEX_PAT=<your PAT>
+export ARCTIC_CORTEX_PAT=<your PAT>
 ```
 
-`ArcticRLClientConfig`'s `_backend_from_env` validator promotes SkyRL's
-baked-in `backend="local"` to `"cortex"` when `ARCTIC_BACKEND=cortex`;
-`CortexConfig.from_env()` reads the rest.
+`CortexConfig` is a `pydantic-settings` model, so these populate it directly
+and explicit constructor or YAML values still win.
+
+There is no variable that selects the backend. The launcher passes
+`trainer.override_entrypoint=arctic_platform.integrations.skyrl.entrypoint`,
+and naming that entrypoint is what routes training and sampling to Cortex.
 
 ## 3. Prepare the dataset
 
@@ -83,12 +85,9 @@ dataloader workers survive a bare kill of their parent, reparent to init, and
 hold ~0.5 GB each until something unrelated OOMs.
 
 `kill -9` on the launcher itself is the one case it cannot cover, since no
-trap runs. That is what [`cortex_jobs.py`](cortex_jobs.py) is for:
-
-```bash
-python cortex_jobs.py            # what is holding GPUs
-python cortex_jobs.py --cancel   # release it
-```
+trap runs. Release the leftover job by id with the Cortex job CLI
+(`cortex-client/dss_neutrino_cli.py`: `list`, then `cancel <job_id>`) before
+launching again, or the next run fails the account cap.
 
 ## 5. What a healthy run looks like
 
@@ -174,7 +173,7 @@ Two consequences for scaling up:
 
 | what you see | what it means |
 | --- | --- |
-| `429 ... per-account GPU cap reached: 8 GPUs in use` | A previous run's Cortex job still holds GPUs. This recipe needs all 8, so nothing else can be running. The launcher releases what it started on any exit including Ctrl-C, so this means either a `kill -9` (no trap runs) or a teammate on the same account. `python cortex_jobs.py` shows what is holding them, `--cancel` releases. Releasing is not instant — a launch within ~a minute of a cancel can still hit the cap. |
+| `429 ... per-account GPU cap reached: 8 GPUs in use` | A previous run's Cortex job still holds GPUs. This recipe needs all 8, so nothing else can be running. The launcher releases what it started on any exit including Ctrl-C, so this means either a `kill -9` (no trap runs) or a teammate on the same account. Use the Cortex job CLI (`cortex-client/dss_neutrino_cli.py`) to `list` and `cancel` the stale job. Releasing is not instant — a launch within ~a minute of a cancel can still hit the cap. |
 | `429 ... gRPC message exceeds maximum size 134217728` | The step's response exceeded Cortex's 128 MiB cap. The launcher preflights this, so you should only reach it by overriding `TRAIN_BSZ`, `N_SAMPLES` or `RESPONSE_LEN` past the printed ceiling. |
 | `packing requires left-aligned rows` | The batch reached Cortex with padding at the head of a row. The shim left-aligns before sending, so this indicates a payload path that bypassed `to_cortex_fwd_bwd_payload`. |
 | `WireError: ... invalid DSSST1 safetensors header length`, usually after `Connection lost: SSL shutdown timed out` | A large result came back truncated. Seen reproducibly from step 2 onward at `TRAIN_BSZ=1024` (~108 MiB per response); see section 6. Reduce `TRAIN_BSZ` / `RESPONSE_LEN`. |

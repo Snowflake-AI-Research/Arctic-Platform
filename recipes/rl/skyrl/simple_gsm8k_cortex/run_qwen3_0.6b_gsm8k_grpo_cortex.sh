@@ -5,7 +5,7 @@
 # Pre-reqs (see README.md):
 #   1. pip install arctic-platform[cortex]
 #   2. SkyRL cloned at the pinned commit with SKYRL_HOME exported.
-#   3. ARCTIC_BACKEND=cortex + ARCTIC_CORTEX_* env vars set.
+#   3. ARCTIC_CORTEX_* env vars set (see README.md step 2).
 #   4. Data: `python download_data.py` -> $DATA_DIR/{train,validation}.parquet.
 #
 # Cortex-specific overrides (Hydra):
@@ -25,11 +25,6 @@ if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; th
     echo "ERROR: SKYRL_HOME is unset or doesn't contain integrations/arctic_rl/."
     exit 1
 fi
-if [[ "${ARCTIC_BACKEND:-}" != "cortex" ]]; then
-    echo "ERROR: ARCTIC_BACKEND=cortex is required. See README.md."
-    exit 1
-fi
-
 export PYTHONPATH="${SKYRL_HOME}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
@@ -156,10 +151,44 @@ mkdir -p "${CKPT_DIR}"
 # reparent to init, and sit on ~0.5 GB each; enough interrupted runs and the
 # node OOMs a later, innocent one.
 
+# `list`/`cancel` against the transport. Inline rather than a recipe-local CLI:
+# `cortex-client/dss_neutrino_cli.py` already does this properly and is being
+# ported to arctic_platform separately -- once it lands, call it here instead.
+cortex_jobs() {
+    local mode="$1"; shift
+    python - "${mode}" "$@" <<'PY'
+import sys
+
+from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client.config import CortexConfig
+from arctic_platform.client.transports.cortex import CortexTransport
+
+# Anything not in here still holds its GPUs.
+TERMINAL = {"failed", "done", "cancelled", "canceled", "succeeded", "terminated"}
+mode, wanted = sys.argv[1], set(sys.argv[2:])
+
+# model_name is required by the config but unused for job queries: this never
+# provisions anything, it only reads and cancels.
+transport = CortexTransport(ArcticClientConfig(model_name="unused", backend=CortexConfig()))
+live = [
+    j.get("job_id") or j.get("id") or j.get("name")
+    for j in transport.list_jobs()
+    if str(j.get("status") or j.get("state") or "?").lower() not in TERMINAL
+]
+
+if mode == "list":
+    print("\n".join(str(j) for j in live))
+else:
+    for job_id in (j for j in live if j in wanted):
+        transport.cancel_job(job_id)
+        print(f"released {job_id}", file=sys.stderr)
+PY
+}
+
 # An empty snapshot and a failed one both look like "" but mean opposite
 # things: with the first, every job seen later is ours; with the second, none
 # of them provably is. Only release when the baseline is real.
-if _JOBS_BEFORE="$(python "${SCRIPT_DIR}/cortex_jobs.py" --ids 2>/dev/null)"; then
+if _JOBS_BEFORE="$(cortex_jobs list 2>/dev/null)"; then
     _SNAPSHOT_OK=1
 else
     _SNAPSHOT_OK=0
@@ -174,17 +203,17 @@ release_our_jobs() {
     _RELEASED=1
     local after ours
     if (( ! _SNAPSHOT_OK )); then
-        echo "cannot tell which Cortex jobs are this run's; check with" >&2
-        echo "  python ${SCRIPT_DIR}/cortex_jobs.py" >&2
+        echo "cannot tell which Cortex jobs are this run's; check for leftovers" >&2
+        echo "with the Cortex job CLI before launching again." >&2
         return 0
     fi
     # Only jobs that appeared while we ran, and only ones still live: the cap
     # is per-account, so a blanket cancel could take out a teammate's run.
-    after="$(python "${SCRIPT_DIR}/cortex_jobs.py" --ids 2>/dev/null || true)"
+    after="$(cortex_jobs list 2>/dev/null || true)"
     ours="$(comm -13 <(sort <<<"${_JOBS_BEFORE}") <(sort <<<"${after}") | tr '\n' ' ')"
     [[ -z "${ours// /}" ]] && return 0
     echo "releasing Cortex job(s) this run started: ${ours}" >&2
-    python "${SCRIPT_DIR}/cortex_jobs.py" --cancel ${ours} >&2 || true
+    cortex_jobs cancel ${ours} >&2 || true
 }
 
 _descendants() {
@@ -208,10 +237,11 @@ stop_driver() {
 trap stop_driver INT TERM
 trap release_our_jobs EXIT
 
-# Launch via arctic_platform.integrations.skyrl so the driver-side
-# peer_access_supported shim is installed before SkyRL's Ray probe.
-python -m arctic_platform.integrations.skyrl \
-    trainer.override_entrypoint=integrations.arctic_rl.entrypoint \
+# Upstream's own entrypoint is `integrations.arctic_rl.entrypoint`; naming ours
+# instead is what selects Cortex, and it installs the driver-side
+# peer_access_supported shim before SkyRL's Ray probe runs.
+python -m skyrl.train.entrypoints.main_base \
+    trainer.override_entrypoint=arctic_platform.integrations.skyrl.entrypoint \
     trainer.arctic_rl.colocate=false \
     trainer.arctic_rl.attn_implementation=sdpa \
     trainer.algorithm.advantage_estimator=grpo \

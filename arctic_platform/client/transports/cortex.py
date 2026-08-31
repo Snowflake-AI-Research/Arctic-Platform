@@ -521,7 +521,7 @@ class CortexTransport(Transport):
         if cx.base_url is not None:  # local/dev host: no PAT auth
             return {}
         return {  # config validated resolve_pat() is present for host/PAT auth
-            "Authorization": f"Bearer {cx.resolve_pat()}",
+            "Authorization": f"Bearer {cx.pat}",
             "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
         }
 

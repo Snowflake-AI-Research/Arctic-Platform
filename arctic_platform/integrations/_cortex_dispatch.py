@@ -15,12 +15,16 @@
 
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Cortex dispatch for the legacy ``arctic_platform.rl`` API.
+"""A Cortex client behind the surface SkyRL's Arctic integration expects.
 
-Translates SkyRL's legacy config into the unified client config with a
-``CortexConfig`` backend, wraps ``AsyncArcticRLClient``, and rewrites the two
-calls whose shapes diverge on Cortex: ``fwd_bwd`` (payload reshape) and
-``fwd_no_grad`` (zeros stub — Cortex has no ``/forward``).
+Translates the ``arctic_platform.rl`` config SkyRL hands us into a unified
+client config with a ``CortexConfig`` backend, wraps ``AsyncArcticRLClient``,
+and rewrites the two calls whose shapes diverge on Cortex: ``fwd_bwd`` (payload
+reshape) and ``fwd_no_grad`` (zeros stub — Cortex has no ``/forward``).
+
+The legacy config is consumed as an input shape only; nothing here extends the
+legacy client. Reached via
+:mod:`arctic_platform.integrations.skyrl.entrypoint`.
 """
 
 from __future__ import annotations
@@ -55,7 +59,7 @@ def _to_unified_config(legacy: _LegacyConfig):
         "sampling_gpus": legacy.sampling_gpus,
         "log_prob_gpus": legacy.log_prob_gpus,
         "job_ready_timeout": legacy.job_ready_timeout,
-        "backend": CortexConfig.from_env(),
+        "backend": CortexConfig(),
         "training": TrainingConfig(
             ds_config=ds_config or None,
             ds_worker_config=legacy.ds_worker_config or None,

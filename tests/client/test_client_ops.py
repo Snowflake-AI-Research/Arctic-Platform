@@ -27,6 +27,7 @@ import asyncio
 import inspect
 
 import pytest
+from pydantic import ValidationError
 
 from arctic_platform.client import OPS
 from arctic_platform.client import ArcticClientConfig
@@ -410,25 +411,28 @@ class TestWeightSyncStrategyInit:
 
 @pytest.fixture(autouse=True)
 def _isolate_arctic_env(monkeypatch):
-    """Clear ARCTIC_BACKEND / ARCTIC_CORTEX_* before each test; a leaked env from
-    a parallel process would flip config promotion under our feet."""
+    """Clear ``ARCTIC_CORTEX_*`` before each test.
+
+    ``CortexConfig`` is a ``BaseSettings``, so it reads the ambient environment
+    at construction; a var leaked in from the developer's shell would otherwise
+    decide the outcome of these tests.
+    """
     import os
 
     for k in list(os.environ):
-        if k.startswith("ARCTIC_BACKEND") or k.startswith("ARCTIC_CORTEX_"):
+        if k.startswith("ARCTIC_CORTEX_"):
             monkeypatch.delenv(k, raising=False)
 
 
-class TestCortexConfigFromEnv:
-    """``CortexConfig.from_env`` reads ``ARCTIC_CORTEX_*`` and lets explicit
-    kwargs win. This is the one call-site framework adapters use to flip to
-    Cortex from a shell-level env."""
+class TestCortexConfigReadsEnv:
+    """``CortexConfig`` hydrates from ``ARCTIC_CORTEX_*`` via pydantic-settings,
+    and explicit values still win over the environment."""
 
     def test_base_url_only_bypasses_pat(self, monkeypatch):
         monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
         from arctic_platform.client import CortexConfig
 
-        cfg = CortexConfig.from_env()
+        cfg = CortexConfig()
         assert cfg.base_url == "http://mock"
         assert cfg.host is None
 
@@ -436,30 +440,54 @@ class TestCortexConfigFromEnv:
         monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
         monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "db")
         monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "sch")
-        monkeypatch.setenv("CORTEX_PAT", "pat-value")
+        monkeypatch.setenv("ARCTIC_CORTEX_PAT", "pat-value")
         from arctic_platform.client import CortexConfig
 
-        cfg = CortexConfig.from_env()
+        cfg = CortexConfig()
         assert cfg.host == "acct.snowflakecomputing.com"
         assert cfg.database == "db"
         assert cfg.schema_ == "sch"
-        assert cfg.resolve_pat() == "pat-value"
+        assert cfg.pat == "pat-value"
+
+    def test_missing_pat_on_host_auth_is_refused(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
+        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "db")
+        monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "sch")
+        from arctic_platform.client import CortexConfig
+
+        with pytest.raises(ValidationError, match="ARCTIC_CORTEX_PAT"):
+            CortexConfig()
 
     def test_explicit_override_wins(self, monkeypatch):
         monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://env")
         from arctic_platform.client import CortexConfig
 
-        cfg = CortexConfig.from_env(base_url="http://explicit")
+        cfg = CortexConfig(base_url="http://explicit")
         assert cfg.base_url == "http://explicit"
+
+    def test_exported_but_empty_reads_as_unset(self, monkeypatch):
+        """A shell that exports ARCTIC_CORTEX_ENDPOINT= means "unset", not "".
+
+        Without ``env_ignore_empty`` the empty string would beat the default and
+        the endpoint would silently become invalid.
+        """
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
+        monkeypatch.setenv("ARCTIC_CORTEX_ENDPOINT", "")
+        from arctic_platform.client import CortexConfig
+
+        assert CortexConfig().endpoint == "cortex-training"
 
 
 class TestUnifiedConfigDoesNotReadEnv:
-    """``ArcticClientConfig`` does not swap ``backend`` from env vars.
-    ``ARCTIC_BACKEND`` is honored only by the legacy ``arctic_platform.rl``
-    validator, which is the config shape SkyRL builds."""
+    """Only ``CortexConfig`` reads the environment, and only for its own fields.
 
-    def test_no_env_promotion_on_unified_config(self, monkeypatch):
-        monkeypatch.setenv("ARCTIC_BACKEND", "cortex")
+    Which backend you get is decided by the caller — for SkyRL, by which
+    entrypoint the recipe names — never by an ambient variable. A stray
+    ``ARCTIC_CORTEX_HOST`` must not turn an on-prem run into a Cortex one.
+    """
+
+    def test_cortex_env_does_not_promote_an_onprem_backend(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
         cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(), training_gpus=1)
         assert cfg.backend.type == "onprem"
 
@@ -518,7 +546,7 @@ class TestCortexTransportNoopOps:
         from arctic_platform.client.transport import Request
         from arctic_platform.client.transports.cortex import CortexTransport
 
-        cfg = ArcticClientConfig(model_name="m", backend=CortexConfig.from_env(), training_gpus=1, sampling_gpus=1)
+        cfg = ArcticClientConfig(model_name="m", backend=CortexConfig(), training_gpus=1, sampling_gpus=1)
         t = CortexTransport(cfg)
         # Would normally raise NotImplementedError on the transport; the noop
         # short-circuit means the shim never has to guard these calls.
@@ -537,7 +565,7 @@ class TestCortexCancelToleratesEmptyBody:
         from arctic_platform.client import CortexConfig
         from arctic_platform.client.transports.cortex import CortexTransport
 
-        cfg = ArcticClientConfig(model_name="m", backend=CortexConfig.from_env(), training_gpus=1, sampling_gpus=1)
+        cfg = ArcticClientConfig(model_name="m", backend=CortexConfig(), training_gpus=1, sampling_gpus=1)
         t = CortexTransport(cfg)
 
         class _EmptyResp:
@@ -562,27 +590,6 @@ class TestCortexCancelToleratesEmptyBody:
 
         assert sent["method"] == "POST"
         assert sent["url"].endswith("/job-abc:cancel")
-
-
-class TestLegacyBackendEnvPromotion:
-    """Legacy ``arctic_platform.rl.config.ArcticRLClientConfig`` (the shape
-    SkyRL builds) promotes ``backend="local"`` -> ``"cortex"`` when
-    ``ARCTIC_BACKEND=cortex`` is set. Explicit non-default backends still win.
-    """
-
-    def test_local_default_gets_promoted(self, monkeypatch):
-        monkeypatch.setenv("ARCTIC_BACKEND", "cortex")
-        from arctic_platform.rl.config import ArcticRLClientConfig as Legacy
-
-        cfg = Legacy(model_name="m", backend="local", training_gpus=1)
-        assert cfg.backend == "cortex"
-
-    def test_explicit_non_default_backend_wins(self, monkeypatch):
-        monkeypatch.setenv("ARCTIC_BACKEND", "cortex")
-        from arctic_platform.rl.config import ArcticRLClientConfig as Legacy
-
-        cfg = Legacy(model_name="m", backend="dss-platform", training_gpus=1)
-        assert cfg.backend == "dss-platform"
 
 
 class TestCortexSharedHelper:
@@ -773,7 +780,9 @@ class TestCortexShimSaveWeightsFailsLoud:
         from arctic_platform.integrations._cortex_dispatch import _CortexClientShim
         from arctic_platform.rl.config import ArcticRLClientConfig as Legacy
 
-        legacy = Legacy(model_name="m", backend="cortex", training_gpus=1, sampling_gpus=1)
+        # Left at SkyRL's own default: the shim is reached by the recipe naming
+        # the Cortex entrypoint, not by anything in this config.
+        legacy = Legacy(model_name="m", training_gpus=1, sampling_gpus=1)
 
         # Skip the real ArcticRLClient constructor (needs live transport init).
         shim = _CortexClientShim.__new__(_CortexClientShim)

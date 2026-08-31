@@ -17,8 +17,6 @@
 
 from __future__ import annotations
 
-import os
-from typing import Any
 from typing import Literal
 from typing import Optional
 
@@ -28,7 +26,7 @@ from pydantic import model_validator
 
 
 class ArcticRLClientConfig(BaseModel):
-    backend: Literal["local", "dss-platform", "cortex"] = "local"
+    backend: Literal["local", "dss-platform"] = "local"
     comm_protocol: Literal["http", "ray"] = "http"
     checkpoint_path: Optional[str] = None
 
@@ -119,23 +117,6 @@ class ArcticRLClientConfig(BaseModel):
     sampling_job_id: Optional[int] = Field(default=None, exclude=True)
     log_prob_job_id: Optional[int] = Field(default=None, exclude=True)
 
-    @model_validator(mode="before")
-    @classmethod
-    def _backend_from_env(cls, data: Any) -> Any:
-        """Let ``ARCTIC_BACKEND=cortex`` promote SkyRL's baked-in ``backend="local"``.
-
-        SkyRL hard-codes ``backend="local"``; treating that as unset lets a
-        shell-level ``ARCTIC_BACKEND=cortex`` flip routing without patching
-        SkyRL. Any other explicit backend still wins.
-        """
-        if not isinstance(data, dict):
-            return data
-        if os.environ.get("ARCTIC_BACKEND", "").strip().lower() != "cortex":
-            return data
-        if data.get("backend", "local") == "local":
-            data = {**data, "backend": "cortex"}
-        return data
-
     @model_validator(mode="after")
     def _derive_host_port(self) -> "ArcticRLClientConfig":
         """Derive host/port from comm_protocol unless explicitly provided.
@@ -145,8 +126,6 @@ class ArcticRLClientConfig(BaseModel):
         the driver node by IP rather than "localhost". Values passed explicitly
         by the caller are left untouched (e.g. reconnecting to a known server).
         """
-        if self.backend == "cortex":
-            return self  # no local server; host/port live on CortexConfig
         # Lazy import to avoid pulling ray in at config import time.
         from arctic_platform.rl.ray_cluster import primary_ip
 

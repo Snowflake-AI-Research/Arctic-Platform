@@ -29,14 +29,16 @@ servers accept this canonical shape directly.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 from typing import Literal
 
+from pydantic import AliasChoices
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import model_validator
+from pydantic_settings import BaseSettings
+from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 JobId = int | str
@@ -66,14 +68,28 @@ class OnPremConfig(BaseModel):
     )
 
 
-class CortexConfig(BaseModel):
+class CortexConfig(BaseSettings):
     """Cortex protocol settings for the remote backend.
 
-    Provide `base_url` for a direct/mock URL (no auth), or `host` + a PAT in the
-    env var for Snowflake programmatic-access auth.
+    Provide `base_url` for a direct/mock URL (no auth), or `host` + `pat` for
+    Snowflake programmatic-access auth.
+
+    Every field also reads from an ``ARCTIC_CORTEX_``-prefixed env var
+    (``ARCTIC_CORTEX_HOST``, ``ARCTIC_CORTEX_PAT``, ``ARCTIC_CORTEX_DATABASE``,
+    ``ARCTIC_CORTEX_SCHEMA``, ...), so `CortexConfig()` with no arguments is a
+    complete config on a configured shell. Constructor and YAML values win over
+    the environment.
     """
 
-    model_config = ConfigDict(extra="forbid", validate_default=True)
+    model_config = SettingsConfigDict(
+        extra="forbid",
+        validate_default=True,
+        env_prefix="ARCTIC_CORTEX_",
+        # An exported-but-empty var is how a shell says "unset"; without this it
+        # would beat the default and fail validation as a present empty string.
+        env_ignore_empty=True,
+        populate_by_name=True,
+    )
 
     type: Literal["remote"] = "remote"
     protocol: Literal["cortex"] = Field("cortex", description="remote transport protocol.")
@@ -83,40 +99,19 @@ class CortexConfig(BaseModel):
     colocate: Literal[False] = Field(False, description="cortex: colocation not supported.")
     base_url: str | None = Field(None, description="cortex: direct/mock GS URL; bypasses PAT auth.")
     host: str | None = Field(None, description="cortex: Snowflake host for PAT auth.")
-    pat: str | None = Field(None, description="cortex: PAT value passed directly; overrides pat_env_var when set.")
-    pat_env_var: str = Field("CORTEX_PAT", description="cortex: env var holding the PAT when `pat` is unset.")
+    pat: str | None = Field(None, description="cortex: PAT; also read from ARCTIC_CORTEX_PAT.")
     database: str = Field("", description="cortex: Snowflake database.")
-    schema_: str = Field("", alias="schema", description="cortex: Snowflake schema.")
+    # `schema` shadows a BaseModel attribute, hence the trailing underscore. An
+    # explicit alias opts the field out of `env_prefix`, so the env name has to
+    # be spelled out or ARCTIC_CORTEX_SCHEMA is silently ignored.
+    schema_: str = Field(
+        "",
+        validation_alias=AliasChoices("schema", "schema_", "ARCTIC_CORTEX_SCHEMA"),
+        serialization_alias="schema",
+        description="cortex: Snowflake schema.",
+    )
     endpoint: str = Field("cortex-training", description="cortex: SnowAPI endpoint name.")
     max_retries: int = Field(10, ge=0, description="cortex: transient-failure retries per HTTP request (tenacity).")
-
-    def resolve_pat(self) -> str | None:
-        """The PAT for host/PAT auth: explicit `pat`, else the `pat_env_var` value."""
-        return self.pat if self.pat is not None else os.environ.get(self.pat_env_var)
-
-    @classmethod
-    def from_env(cls, **overrides: Any) -> Self:
-        """Build a ``CortexConfig`` from ``ARCTIC_CORTEX_*`` env vars.
-
-        The one call-site an integration uses to flip to Cortex from a
-        shell-level env, so the env-var contract lives in one place instead of
-        being reinvented per framework. Explicit ``overrides`` win.
-        """
-        env: dict[str, Any] = {}
-        for key, field in (
-            ("base_url", "ARCTIC_CORTEX_BASE_URL"),
-            ("host", "ARCTIC_CORTEX_HOST"),
-            ("pat_env_var", "ARCTIC_CORTEX_PAT_ENV_VAR"),
-            ("database", "ARCTIC_CORTEX_DATABASE"),
-            ("endpoint", "ARCTIC_CORTEX_ENDPOINT"),
-        ):
-            v = os.environ.get(field)
-            if v:
-                env[key] = v
-        schema = os.environ.get("ARCTIC_CORTEX_SCHEMA")
-        if schema:
-            env["schema"] = schema
-        return cls(**{**env, **overrides})
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -125,8 +120,8 @@ class CortexConfig(BaseModel):
         if self.host and not self.base_url:
             if not (self.database and self.schema_):
                 raise ValueError("cortex: database + schema required for host/PAT auth.")
-            if not self.resolve_pat():
-                raise ValueError(f"cortex: no PAT — set `pat` or the '{self.pat_env_var}' env var for host auth.")
+            if not self.pat:
+                raise ValueError("cortex: no PAT — set `pat` or ARCTIC_CORTEX_PAT for host auth.")
         return self
 
 

@@ -52,6 +52,7 @@ requires-python = ">=3.12"
 # drive Cortex, [sft]/[rl]/[onprem] to run against an on-prem server.
 dependencies = [
     "pydantic>=2.10",
+    "pydantic-settings>=2.0",  # CortexConfig reads ARCTIC_CORTEX_* via BaseSettings
     "typing-extensions",  # Self, per the pydantic model_validator convention
 ]
 

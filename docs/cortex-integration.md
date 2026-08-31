@@ -61,22 +61,26 @@ constrains what runs correctly here:
   ignores SIGINT and SIGTERM, Ray having installed handlers, so there is no
   graceful stop to trigger it either. Callers must cancel explicitly — the
   GSM8K recipe's launcher does this on every exit path, and
-  `recipes/rl/skyrl/simple_gsm8k_cortex/cortex_jobs.py` lists and releases
-  whatever is left over.
+  `CortexTransport.list_jobs()` / `cancel_job()` are there for anything it
+  cannot cover, such as a `kill -9` of the launcher itself.
 
 ## What's provided
 
 * **Unified client** —
   [`arctic_platform.client.ArcticRLClient`](../arctic_platform/client/rl.py)
   routes to `CortexTransport` whenever `backend` is a `CortexConfig`.
-  `CortexConfig.from_env()` hydrates from `ARCTIC_CORTEX_*` env vars —
-  explicit constructor args always win.
-* **Legacy shim** —
+  `CortexConfig` is a `pydantic-settings` model, so it hydrates from
+  `ARCTIC_CORTEX_*` env vars — explicit constructor and YAML values always win.
+* **SkyRL entrypoint** —
+  [`arctic_platform.integrations.skyrl.entrypoint`](../arctic_platform/integrations/skyrl/entrypoint.py),
+  named by the recipe as `trainer.override_entrypoint`. SkyRL's own Arctic
+  entrypoint is pinned to the legacy `arctic_platform.rl` client factory, so
+  this module swaps that one name for a Cortex client built on
+  `arctic_platform.client` and leaves the legacy package untouched. Choosing
+  the entrypoint is what chooses Cortex; no environment variable decides it.
+* **Client shim** —
   [`arctic_platform.integrations._cortex_dispatch`](../arctic_platform/integrations/_cortex_dispatch.py)
-  wraps the unified client behind the legacy `arctic_platform.rl` surface so
-  SkyRL, which still builds `arctic_platform.rl.ArcticRLClientConfig`, routes
-  to Cortex. That legacy config has a `_backend_from_env` validator that flips
-  `backend="local"` → `"cortex"` when `ARCTIC_BACKEND=cortex`.
+  presents the client surface SkyRL expects over `AsyncArcticRLClient`.
 * **Payload lowering** —
   [`arctic_platform.integrations._cortex_shared`](../arctic_platform/integrations/_cortex_shared.py)
   reshapes SkyRL's batch into Cortex's wire format and left-aligns each row,
@@ -92,12 +96,16 @@ constrains what runs correctly here:
 
 ## Env vars
 
+Every field of `CortexConfig` reads from `ARCTIC_CORTEX_<FIELD>` via
+`pydantic-settings`; the table is that mapping, not a separate contract. No
+variable selects the backend — the caller does, and for SkyRL that is which
+entrypoint the recipe names.
+
 | Env var | Default | Description |
 |---|---|---|
-| `ARCTIC_BACKEND` | *(unset)* | Set to `cortex` to route through Cortex. Read by the legacy `ArcticRLClientConfig` validator. |
 | `ARCTIC_CORTEX_HOST` | *(required for PAT auth)* | Snowflake host, e.g. `<account>.<region>.snowflakecomputing.com`. |
 | `ARCTIC_CORTEX_BASE_URL` | *(optional)* | Direct/mock GS URL for dev; bypasses PAT auth (mutually exclusive with `_HOST`). |
-| `CORTEX_PAT` | *(required for PAT auth)* | Snowflake Programmatic Access Token. Env var name overridable via `ARCTIC_CORTEX_PAT_ENV_VAR`. |
+| `ARCTIC_CORTEX_PAT` | *(required for PAT auth)* | Snowflake Programmatic Access Token. |
 | `ARCTIC_CORTEX_DATABASE` | *(required for PAT auth)* | Snowflake database. |
 | `ARCTIC_CORTEX_SCHEMA` | *(required for PAT auth)* | Snowflake schema. |
 | `ARCTIC_CORTEX_ENDPOINT` | `cortex-training` | SnowAPI endpoint name. |
