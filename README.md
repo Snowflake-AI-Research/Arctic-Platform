@@ -65,10 +65,11 @@ client = create_arctic_rl_client(config)
 ### Integration is done but not yet merged
 
 1. Verl. The reference integration is [verl](https://github.com/verl-project/verl) ([https://github.com/verl-project/verl/pull/6422](https://github.com/verl-project/verl/pull/6422)), which drives Arctic RL from its PPO/GRPO trainer. End-to-end recipes live under [recipes/rl/verl](recipes/rl/verl/), including a [simple single-GPU GSM8K](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/verl/simple) starter, [Txt2SQL](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/verl/txt2sql) and [long-context QA](https://github.com/Snowflake-AI-Research/Arctic-Platform/tree/main/recipes/rl/verl/long_context_qa).
+2. TRL. The adapter lives under [`arctic_platform/integrations/trl/`](arctic_platform/integrations/trl/) and drives Arctic RL from TRL's `AsyncGRPOTrainer`. End-to-end recipes live under [recipes/rl/trl](recipes/rl/trl/), including a [GSM8K](recipes/rl/trl/gsm8k) starter and [Txt2SQL (BIRD)](recipes/rl/trl/txt2sql).
 
 ### Upcoming integrations
 
-Multiple additional frameworks integrations are in the works and will be added here once available. We are in various stages of planning or working on integration into TRL, Axolotl, unsloth, PrimeRL and potentially others.
+Multiple additional frameworks integrations are in the works and will be added here once available. We are in various stages of planning or working on integration into Axolotl, unsloth, PrimeRL and potentially others.
 
 ### ZoRRo Train
 
@@ -96,7 +97,7 @@ See the [Forest Cascade Attention README](https://github.com/snowflakedb/ArcticI
 
 # Quickstart
 
-To get started training a model with Arctic Platform, first [install the package](#installation), then follow [the recipes](recipes/rl/verl/).
+To get started training a model with Arctic Platform, first [install the package](#installation), then follow [the recipes](recipes/rl/).
 
 # Installation
 
@@ -109,6 +110,7 @@ pip install "arctic-platform[cortex]"   # drive Cortex training over SnowAPI
 pip install "arctic-platform[sft]"      # run a local training-only server
 pip install "arctic-platform[rl]"       # ...plus the sampling stack (arctic-inference, vLLM)
 pip install "arctic-platform[verl]"     # the verl adapter
+pip install "arctic-platform[trl]"      # the TRL adapter
 ```
 
 `[cortex]` is by far the lightest: it skips DeepSpeed, transformers, Ray and vLLM entirely. Importing on-prem code without the matching extra raises an error naming the one to install.

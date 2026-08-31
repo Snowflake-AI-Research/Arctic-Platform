@@ -1,0 +1,17 @@
+# Text2SQL (BIRD) TRL recipe — pinned Python dependencies.
+#
+# Assumes CUDA 13.0 / torch 2.11 (installed separately against the PyTorch
+# cu130 index). `flash-attn` is also installed separately (`--no-build-isolation`).
+# If you use a different CUDA version, change the torch index URL in the README.
+#
+# arctic-inference owns the validated vLLM pin (0.26). overrides.txt forces the
+# few transitive deps that otherwise drift on that stack.
+
+# Arctic + TRL adapter extra (editable install of this repo still required)
+arctic-platform[rl]
+datasets
+accelerate
+wandb
+# Native C1 `vllm serve` / transformers 5.x on the 0.26 stack
+openai>=2.54.0
+kernels>=0.16.0,<0.17.0
