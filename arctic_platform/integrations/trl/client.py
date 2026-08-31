@@ -86,6 +86,7 @@ class ArcticTrainingClient:
         zorro_train_enable: bool = False,
         response_len: int | None = None,
         zorro_load_balancer: bool = False,
+        grad_accum_steps: int | None = None,
     ) -> None:
         self.client = client
         self.temperature = temperature
@@ -108,6 +109,8 @@ class ArcticTrainingClient:
         # divides evenly into world_size bins with fittable prompt groups; TRL's per-forward_backward microbatch
         # does not guarantee that, so it raises "shouldn't reach here". Opt in only for compatible batch shapes.
         self.zorro_load_balancer = zorro_load_balancer
+        # DeepSpeed engine GAS. None → TRL's ``current_gradient_accumulation_steps``.
+        self.grad_accum_steps = grad_accum_steps
         if zorro_train_enable:
             if not server_side_loss:
                 raise ValueError(
@@ -133,6 +136,9 @@ class ArcticTrainingClient:
             logits_compute_in_fp32=self.logits_compute_in_fp32,
             zorro_train_enable=self.zorro_train_enable,
         )
+
+    def _grad_accum_meta(self, ing: dict) -> int:
+        return self.grad_accum_steps if self.grad_accum_steps is not None else ing["grad_accum_steps"]
 
     def forward_backward(
         self,
@@ -233,7 +239,7 @@ class ArcticTrainingClient:
             "epsilon_low": ing["epsilon_low"],
             "epsilon_high": ing["epsilon_high"],
             "batch_num_tokens": batch_num_tokens,
-            "grad_accum_steps": ing["grad_accum_steps"],
+            "grad_accum_steps": self._grad_accum_meta(ing),
             "return_fwd_batch": True,  # server omits fwd_bwd batch by default
         }
 
@@ -314,7 +320,7 @@ class ArcticTrainingClient:
             "epsilon_low": ing["epsilon_low"],
             "epsilon_high": ing["epsilon_high"],
             "batch_num_tokens": batch_num_tokens,
-            "grad_accum_steps": ing["grad_accum_steps"],
+            "grad_accum_steps": self._grad_accum_meta(ing),
             "return_fwd_batch": True,
         }
 

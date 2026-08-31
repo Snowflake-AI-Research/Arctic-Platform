@@ -45,6 +45,7 @@ from arctic_platform.common.utils import log_dp_shard_tokens
 from arctic_platform.common.utils import merge_dict_shards
 from arctic_platform.common.utils import split_dict
 from arctic_platform.common.utils import unpack_batch
+from arctic_platform.common.utils.tiled_logits import fill_logits_opt_from_worker_config
 from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
@@ -381,6 +382,7 @@ class DeepSpeedWorker:
         from arctic_platform import sft_profile
 
         args, batch_data, meta_data, processing = unpack_batch(batch)
+        meta_data = fill_logits_opt_from_worker_config(meta_data, getattr(self, "ds_worker_config", None))
         with sft_profile.timed("h2d"):
             if isinstance(batch_data, list):
                 batch_data = [self._move_batch_to_device(mb, self._device) for mb in batch_data]
