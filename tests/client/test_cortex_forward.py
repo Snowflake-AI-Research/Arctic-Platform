@@ -14,17 +14,19 @@
 # limitations under the License.
 """`forward` (no-grad log-probs) over the Cortex transport.
 
-forward lowers like forward-backward -- a DSSST1 octet body -- with one
-difference that matters: forward-backward is always training, while forward runs
-on the training sub-job for current-policy log-probs and on the log_prob sub-job
-for reference log-probs. Direct octet endpoints carry no routing envelope, so
-the sub-job token has to ride on the URL as ?target_sub_job_id, which SnowAPI
-folds into the control-plane request body.
+Unlike forward-backward and generate, `forward` has no octet endpoint of its own
+on SnowAPI. It rides the generic `/operation` RPC instead, which carries a struct
+rather than bytes, so the DSSST1 frame travels base64'd in the envelope's payload
+and the sub-job token is a body field rather than a query param.
 
-Two things these tests exist to pin, both of which were wrong at first:
+Three things these tests exist to pin, all of which were wrong at first:
 
-- the outbound path. The zone serves /forward and the ZMD passes the op suffix
-  through verbatim, so anything else 404s at the zone.
+- the route. An earlier revision posted an octet body to /{job}/forward. That
+  endpoint exists on the zone but not through the control plane, so it never
+  reached a GPU.
+- chunking. The budget applies to the JSON body, and base64 inflates the frame
+  4/3, so the frame slice must be the smaller 3/4 share of what the envelope
+  leaves. Only the final chunk starts execution and returns a request_id.
 - the result shape. The zone wraps its DSSST1 frame in a JSON envelope that
   lacks the `wire_format` marker the generic decoder keys off, so `forward`
   needs its own unwrap or the caller gets base64 text instead of tensors.
@@ -79,6 +81,15 @@ class FakeSend:
     def frames(self) -> list[bytes]:
         return [post["data"] for post in self.posts]
 
+    @property
+    def envelopes(self) -> list[dict]:
+        return [post["json"] for post in self.posts]
+
+    @property
+    def operation_frame(self) -> bytes:
+        """The frame the zone will reassemble from every payload we posted."""
+        return b"".join(base64.b64decode(e["payload"]["payload_b64"]) for e in self.envelopes)
+
 
 def _transport(result: dict | None = None) -> tuple[CortexTransport, FakeSend]:
     config = ArcticClientConfig(
@@ -108,52 +119,76 @@ def _dssst1_result(payload: dict) -> dict:
 
 
 class TestForwardWire:
-    def test_posts_dssst1_octet_body(self):
-        """forward goes out as DSSST1 octet, not a base64 JSON /operation envelope."""
+    def test_posts_the_operation_envelope(self):
+        """forward goes out as an /operation struct with the frame base64'd inside."""
         transport, send = _transport()
         transport.call(fwd_no_grad_request(transport.jobs, _batch()))
 
-        (post,) = send.posts
-        assert post["headers"]["Content-Type"] == "application/octet-stream"
-        assert wire.loads(post["data"])["batch"]["input_ids"].tolist() == BATCH_IDS
+        (envelope,) = send.envelopes
+        assert envelope["operation_type"] == "forward"
+        assert envelope["payload"]["content_type"] == "application/octet-stream"
+        assert wire.loads(send.operation_frame)["batch"]["input_ids"].tolist() == BATCH_IDS
 
-    def test_hits_the_forward_endpoint(self):
-        """The zone serves this at /forward and the ZMD passes the suffix through.
+    def test_hits_the_operation_endpoint(self):
+        """There is no /forward through the control plane -- only /operation.
 
-        Any other spelling (fwd-no-grad, forward-no-grad) 404s at the zone.
+        Posting to /{job}/forward reaches the zone's route in isolation but never
+        gets past GS, so the op has to go out as an operation.
         """
         transport, send = _transport()
         transport.call(fwd_no_grad_request(transport.jobs, _batch()))
 
-        assert send.urls[0].split("?")[0].endswith(f"/{JOB}/forward")
+        assert send.urls[0].endswith(f"/{JOB}/operation")
 
-    def test_frame_under_the_cap_posts_bare(self):
-        """forward has no idempotency key to carry, so chunking stays size-driven.
+    def test_frame_under_the_cap_posts_one_envelope(self):
+        """A frame that fits travels whole: one POST, no chunk wrapper.
 
         forward-backward force-wraps every frame because its chunk_group_id is
-        the server's at-most-once key. A no-grad forward mutates nothing, so a
-        small batch posts as raw DSSST1 -- what the backend /forward reads.
+        the server's at-most-once key. A no-grad forward mutates nothing, so
+        chunking here stays purely size-driven.
         """
         transport, send = _transport()
         transport.call(fwd_no_grad_request(transport.jobs, _batch()))
 
-        assert wire.read_byte_chunk_metadata(send.frames[0]) is None
+        assert len(send.posts) == 1
+        assert wire.read_byte_chunk_metadata(send.operation_frame) is None
 
-    def test_oversized_frame_refuses_to_split(self, monkeypatch):
-        """An oversized forward must fail here, not arrive at the zone in pieces.
+    def test_oversized_frame_splits_across_envelopes(self, monkeypatch):
+        """Each POST is a whole envelope carrying one slice of the frame.
 
-        The zone stages chunk groups for /fwd-bwd only; /forward reads the body
-        straight through, so chunks would land as a partial frame. Failing at the
-        cap names that, where chunking would surface as a parse error at the zone.
+        The zone stages the slices and concatenates them, so what must survive is
+        the byte-for-byte frame -- not any per-chunk structure.
         """
-        monkeypatch.setattr(cortex_module, "_MAX_OCTET_BYTES", 64 * 1024)
+        monkeypatch.setattr(cortex_module, "_OPERATION_MAX_JSON_BYTES", 8 * 1024)
         transport, send = _transport()
         batch = {"batch": {"input_ids": torch.arange(20_000).reshape(1, -1)}, "meta": {}, "processing": {}}
+        transport.call(fwd_no_grad_request(transport.jobs, batch))
 
-        with pytest.raises(NotImplementedError, match="reassembles chunk groups for fwd-bwd only"):
-            transport.call(fwd_no_grad_request(transport.jobs, batch))
+        assert len(send.posts) > 1
+        assert {e["operation_type"] for e in send.envelopes} == {"forward"}
+        assert wire.loads(send.operation_frame)["batch"]["input_ids"].shape == (1, 20_000)
 
-        assert send.posts == []
+    def test_chunk_slices_respect_the_json_budget(self, monkeypatch):
+        """The cap is on the JSON body, which base64 inflates 4/3.
+
+        Sizing the slice against the raw budget would overshoot by a third and be
+        rejected by GS, so this pins the encoded payload under the cap.
+        """
+        budget = 8 * 1024
+        monkeypatch.setattr(cortex_module, "_OPERATION_MAX_JSON_BYTES", budget)
+        transport, send = _transport()
+        batch = {"batch": {"input_ids": torch.arange(20_000).reshape(1, -1)}, "meta": {}, "processing": {}}
+        transport.call(fwd_no_grad_request(transport.jobs, batch))
+
+        assert max(len(e["payload"]["payload_b64"]) for e in send.envelopes) <= budget
+
+    def test_missing_request_id_on_the_last_chunk_is_an_error(self):
+        """Only the final chunk starts execution; without its id there is nothing to poll."""
+        transport, send = _transport()
+        transport._send = lambda *a, **kw: {"status": "chunk_cached"}  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="carried no request_id"):
+            transport.call(fwd_no_grad_request(transport.jobs, _batch()))
 
     def test_forward_backward_still_chunks(self, monkeypatch):
         """The cap is forward's alone -- fwd-bwd's chunk group must keep working."""
@@ -173,7 +208,7 @@ class TestForwardSubJobRouting:
         transport, send = _transport()
         transport.call(fwd_no_grad_request(transport.jobs, _batch()))
 
-        assert f"target_sub_job_id={TRAINING}" in send.urls[0]
+        assert send.envelopes[0]["sub_job_id"] == TRAINING
 
     def test_reference_model_routes_to_log_prob(self):
         """Reference log-probs must name the log_prob sub-job.
@@ -186,7 +221,7 @@ class TestForwardSubJobRouting:
         transport, send = _transport()
         transport.call(fwd_no_grad_request(transport.jobs, _batch(), reference_model=True))
 
-        assert f"target_sub_job_id={LOG_PROB}" in send.urls[0]
+        assert send.envelopes[0]["sub_job_id"] == LOG_PROB
 
     def test_forward_backward_carries_no_routing_hint(self):
         """forward-backward is unambiguously training; its URL is unchanged."""
