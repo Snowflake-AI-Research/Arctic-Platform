@@ -49,10 +49,11 @@ users implement in Python. Same idea, across a process boundary.
 
 ## Server-side addition
 
-One loss function, registered as `weighted_logprob_sum`. It is loss-agnostic and never needs revisiting.
+One loss function, registered as `weighted_logprob_sum` in `rl/processors` (not TRL-shaped).
+It is loss-agnostic and never needs revisiting.
 
 `pipeline._resolve_fn` falls back to a dotted-path import for names not in `LOSS_FNS`, so
-`loss_fn="arctic_platform.integrations.trl.loss.weighted_logprob_sum"` resolves without the registry entry
+`loss_fn="arctic_platform.rl.processors.weighted_logprob.weighted_logprob_sum"` resolves without the registry entry
 when the module is importable in the server process. Two questions for the Arctic side:
 
 1. Is that fallback a supported extension point or an implementation detail?

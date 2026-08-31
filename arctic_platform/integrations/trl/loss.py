@@ -13,33 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``sum(w * logprobs)`` surrogate; TRL's real loss stays on the client."""
+"""TRL-shaped server loss. The generic ``weighted_logprob_sum`` surrogate lives in ``rl.processors``."""
 
 from typing import Any
 
 import torch
 
 from arctic_platform.rl.processors.pipeline import register_loss_fn
-
-
-@register_loss_fn("weighted_logprob_sum")
-def weighted_logprob_sum(
-    model_outputs: dict,
-    batch: dict,
-    meta: dict,
-    config: dict,
-    device: str,
-) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Unnormalized ``sum(w * logprobs)``; TRL already scaled ``w`` for grad accum."""
-    logprobs = model_outputs["logprobs"]
-    weights = batch["logprob_weights_shifted"]
-
-    loss_mask = batch.get("loss_mask")
-    if loss_mask is not None:
-        weights = weights * loss_mask
-
-    loss = (logprobs * weights).sum()
-    return loss, {"loss": loss.detach()}
+from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum  # noqa: F401
 
 
 @register_loss_fn("trl_grpo")
