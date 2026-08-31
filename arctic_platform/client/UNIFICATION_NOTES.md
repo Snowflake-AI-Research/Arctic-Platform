@@ -94,8 +94,8 @@ config fails before any job or GPU is claimed.
 canonical shape into today's on-prem `/initialize` and Cortex `sub_job_configs`
 wires:
 
-- nest engine kwargs under `inference_config.vllm_config` (Neutrino)
-- map `training.model` → Neutrino `model_provider` / `ep_size` / `attn_*`
+- nest engine kwargs under `inference_config.vllm_config` (Cortex)
+- map `training.model` → Cortex `model_provider` / `ep_size` / `attn_*`
 - map `training.model` → on-prem `ds_worker_config` (`use_liger`, attn, …)
 
 **These adapters should go away** once both servers accept the canonical nesting
@@ -142,7 +142,7 @@ SnowAPI's shape — the transport layer is the adapter, so the server stays simp
   ops (`weight-sync`, `reset-prefix-cache`). We deliberately do **not** mirror
   SnowAPI's `operation_type:"forward"` routing — `forward-backward`/`forward`/
   `generate`/`log-probs` remain dedicated endpoints (this also matches how the
-  neutrino client posts `forward-backward`/`generate`). Any parity is the
+  Cortex client posts `forward-backward`/`generate`). Any parity is the
   transport's job.
 - **Job creation.** On-prem `/initialize` takes one `JobConfig` per call;
   SnowAPI takes a single `sub_job_configs[]` (parent + sub-jobs,

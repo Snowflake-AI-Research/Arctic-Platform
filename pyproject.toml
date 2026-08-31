@@ -17,6 +17,9 @@ include = [
   "arctic_platform/integrations/verl/README.md",
 ]
 
+[project.scripts]
+cortex = "arctic_platform.client.cortex.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/Snowflake-AI-Research/Arctic-Platform"
 Repository = "https://github.com/Snowflake-AI-Research/Arctic-Platform"
@@ -61,6 +64,8 @@ all = [
     "arctic_platform[dev]",
     "arctic_platform[testing]",
     "arctic_platform[cortex]",
+    "arctic_platform[cli]",
+    "arctic_platform[tui]",
     "arctic_platform[onprem]",
     "arctic_platform[verl]",
 ]
@@ -113,6 +118,20 @@ cortex = [
     "arctic_platform[transport]",
     "tenacity",
     "urllib3",
+]
+
+# The `cortex` command: job control plane, data-plane smoke tests, log download.
+cli = [
+    "arctic_platform[cortex]",
+    "boto3",  # archived logs come from the experiment run's S3 stage
+    "rich",
+    "typer",
+]
+
+# `cortex logs`, the interactive log browser.
+tui = [
+    "arctic_platform[cli]",
+    "textual>=0.50",
 ]
 
 # A training-only on-prem server, plus the client that drives it. Deliberately

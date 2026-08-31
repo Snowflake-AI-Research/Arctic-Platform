@@ -272,9 +272,9 @@ class ArcticClientConfig(BaseModel):
     def to_cortex(self) -> list[dict[str, Any]]:
         """Translate into Cortex/SnowAPI ``sub_job_configs``.
 
-        Neutrino wants typed sub-job fields, so training knobs are lifted out of the
+        Cortex wants typed sub-job fields, so training knobs are lifted out of the
         DeepSpeed ``ds_config`` / ``ds_worker_config`` here (temporary — drop once
-        Neutrino accepts the canonical nesting directly).
+        Cortex accepts the canonical nesting directly).
         """
         subs: list[dict[str, Any]] = []
         if self.sampling_gpus > 0:
@@ -293,7 +293,7 @@ class ArcticClientConfig(BaseModel):
             training["train_batch_size"] = ds["train_batch_size"]
         if "gradient_clipping" in ds:
             training["gradient_clipping"] = ds["gradient_clipping"]
-        optimizer = _neutrino_optimizer(ds.get("optimizer"))
+        optimizer = _cortex_optimizer(ds.get("optimizer"))
         if optimizer:
             training["optimizer"] = optimizer
         if "enable_gradient_checkpointing" in worker:
@@ -303,7 +303,7 @@ class ArcticClientConfig(BaseModel):
             training["model_provider"] = provider
         if worker.get("attn_implementation"):
             training["attn_implementation"] = worker["attn_implementation"]
-        # Neutrino-only engine knobs ride along in ds_worker_config; on-prem ignores them.
+        # Cortex-only engine knobs ride along in ds_worker_config; on-prem ignores them.
         for key in ("ep_size", "mb_spec"):
             if key in worker:
                 training[key] = worker[key]
@@ -314,7 +314,7 @@ class ArcticClientConfig(BaseModel):
         return self._cortex_sub_job("training", {"training_config": training})
 
     def _cortex_inference_sub_job(self, job_type: str, n_gpus: int) -> dict[str, Any]:
-        # Neutrino's InferenceConfig reads engine kwargs from nested vllm_config —
+        # Cortex's InferenceConfig reads engine kwargs from nested vllm_config —
         # flattening them onto inference_config is silently ignored (extra="allow").
         vllm = dict(self.sampling.vllm)
         vllm.pop("max_model_len", None)  # owned by top-level max_seq_len
@@ -335,8 +335,8 @@ class ArcticClientConfig(BaseModel):
         return sub
 
 
-def _neutrino_optimizer(ds_optimizer: Any) -> dict[str, Any] | None:
-    """DeepSpeed ``{"type", "params": {...}}`` → Neutrino ``{"name", lr, betas, ...}``."""
+def _cortex_optimizer(ds_optimizer: Any) -> dict[str, Any] | None:
+    """DeepSpeed ``{"type", "params": {...}}`` → Cortex ``{"name", lr, betas, ...}``."""
     if not isinstance(ds_optimizer, dict):
         return None
     params = ds_optimizer.get("params") or {}

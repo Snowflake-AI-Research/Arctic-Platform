@@ -130,6 +130,8 @@ def sync_weights_request(
     cuda_ipc: bool | None = None,
     low_memory: bool | None = None,
     weight_format: str | None = None,
+    source_sub_job_id: Any = None,
+    target_sub_job_ids: list | None = None,
 ) -> Request:
     # The client assembles the full Cortex `/operation` envelope here so transports
     # just forward it: SnowAPI reads the `sub_job_*` routing hints, on-prem accepts
@@ -140,8 +142,14 @@ def sync_weights_request(
     # zero-copy (training weights must be on GPU) and low_memory streams one param at
     # a time to bound peak GPU memory. weight_format="lora" broadcasts only the
     # trained adapter tensors instead of the full model.
+    #
+    # source/target default to this session's training and sampling jobs. They are
+    # overridable for the multi-sub-job Cortex topologies the CLI exposes, where one
+    # trainer broadcasts to several samplers that `JobHandles` (one id per role)
+    # cannot name.
     tid, sid = jobs.require("training"), jobs.require("sampling")
-    payload = {"source_sub_job_id": tid, "target_sub_job_ids": [sid]}
+    source = source_sub_job_id or tid
+    payload = {"source_sub_job_id": source, "target_sub_job_ids": list(target_sub_job_ids or [sid])}
     if cuda_ipc is not None:
         payload["cuda_ipc"] = cuda_ipc
     if low_memory is not None:
@@ -150,11 +158,11 @@ def sync_weights_request(
         payload["weight_format"] = weight_format
     body = {
         "operation_type": "weight-sync",
-        "sub_job_id": tid,
+        "sub_job_id": source,
         "sub_job_type": "training",
         "payload": payload,
     }
-    return Request("operation", tid, body)
+    return Request("operation", source, body)
 
 
 def reset_prefix_cache_request(

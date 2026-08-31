@@ -1,6 +1,6 @@
 {
   "host": "dsa-test.qa6.us-west-2.aws.snowflakecomputing.com",
-  "pat": "<SF_PAT>",
+  "pat_env_var": "CORTEX_PAT",
   "database": "NEUTRINO_DB",
   "schema": "PUBLIC",
   "endpoint": "cortex-training"

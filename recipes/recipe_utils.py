@@ -30,12 +30,10 @@ path means a second packager here plus an `OnPremConfig` branch in
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 from collections.abc import Iterator
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -45,6 +43,7 @@ from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
+from arctic_platform.client.cortex import connection
 
 logger = logging.getLogger(__name__)
 
@@ -60,18 +59,15 @@ LORA_TARGET_MODULES = (
     "down_proj",
 )
 
-# Connection keys `CortexConfig` understands; anything else in the JSON (verify_ssl,
-# poll_interval, ...) belonged to the old client and is ignored.
-_BACKEND_KEYS = ("base_url", "host", "pat", "pat_env_var", "database", "schema", "endpoint", "max_retries")
 
+def load_backend(config_path: str | None = None) -> CortexConfig:
+    """Resolve the Cortex connection the same way the `cortex` CLI does.
 
-def load_backend(config_path: str) -> CortexConfig:
-    """Read a connection JSON (bare, or under a ``connection`` key) into a `CortexConfig`."""
-    parsed = json.loads(Path(config_path).expanduser().read_text(encoding="utf-8"))
-    if not isinstance(parsed, dict):
-        raise ValueError(f"connection config {config_path} must be a JSON object")
-    connection = parsed.get("connection", parsed)
-    return CortexConfig(**{key: connection[key] for key in _BACKEND_KEYS if key in connection})
+    Without a path this falls back to ``CORTEX_CONFIG``, whatever ``cortex login``
+    remembered, and then ``CORTEX_*`` / ``SNOWFLAKE_*`` env, so a recipe can run
+    with no ``--config`` flag once you are logged in.
+    """
+    return connection.resolve(config_path=config_path)
 
 
 def lora_config(rank: int) -> dict[str, Any] | None:
@@ -89,7 +85,12 @@ def lora_config(rank: int) -> dict[str, Any] | None:
 
 
 def reconnect_ids(job_id: str | None, *roles: str) -> dict[str, str]:
-    """``ArcticClientConfig`` job-id kwargs addressing an existing job's sub-jobs."""
+    """``ArcticClientConfig`` job-id kwargs addressing an existing job's sub-jobs.
+
+    Assumes the recipe's own one-sub-job-per-role layout so this stays a pure
+    function. `CortexJobs.attach` reads the real sub-jobs off the server instead,
+    which is what you want for a job you did not create.
+    """
     if job_id is None:
         return {}
     return {f"{role}_job_id": f"{job_id}:{role}:0" for role in roles}
@@ -287,7 +288,7 @@ def client_config(
 ) -> ArcticClientConfig:
     """Assemble the one config both recipes hand to `running_client`.
 
-    ``to_cortex()`` lifts the Neutrino-typed fields out of ``ds_config`` /
+    ``to_cortex()`` lifts the Cortex-typed fields out of ``ds_config`` /
     ``ds_worker_config``; the sampling sub-job is created only when
     ``sampling_gpus > 0``.
     """

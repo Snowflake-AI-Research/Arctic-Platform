@@ -167,7 +167,8 @@ def _reap_orphan_ray_clusters() -> None:
             return None
 
     my_pid = os.getpid()
-    pids = [e for e in os.listdir("/proc") if e.isdigit()]
+    # procfs-only; on a non-Linux dev box there are no pids to scan (temp-dir cleanup below still runs).
+    pids = [e for e in os.listdir("/proc") if e.isdigit()] if os.path.isdir("/proc") else []
     children: dict[int, list[int]] = {}
     for pid in pids:
         parent = _ppid(pid)

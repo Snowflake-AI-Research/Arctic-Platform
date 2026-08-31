@@ -188,17 +188,32 @@ class ArcticClient(_ArcticClientCore):
 
     # ── weight sync + cache ──────────────────────────────────────────────
     def sync_weights(
-        self, cuda_ipc: bool | None = None, low_memory: bool | None = None, weight_format: str | None = None
+        self,
+        cuda_ipc: bool | None = None,
+        low_memory: bool | None = None,
+        weight_format: str | None = None,
+        *,
+        source_sub_job_id: Any = None,
+        target_sub_job_ids: list | None = None,
     ) -> dict:
         """Sync training weights to sampling (staged wake → operation → wake → reset).
 
         ``cuda_ipc`` / ``low_memory`` default to the training job's ``TrainingConfig``; pass a value to override this
         call. ``weight_format="lora"`` broadcasts only the adapter tensors (Cortex only).
+        ``source_sub_job_id`` / ``target_sub_job_ids`` override routing for Cortex sessions
+        with more than one sub-job per role; both default to this session's jobs.
         """
         _check_weight_format(self.config, weight_format)
         self.wake_inference(tags=["weights"])
         out = self._call(
-            sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory, weight_format=weight_format)
+            sync_weights_request(
+                self.jobs,
+                cuda_ipc=cuda_ipc,
+                low_memory=low_memory,
+                weight_format=weight_format,
+                source_sub_job_id=source_sub_job_id,
+                target_sub_job_ids=target_sub_job_ids,
+            )
         )
         self.wake_inference(tags=["kv_cache"])
         self.reset_prefix_cache()

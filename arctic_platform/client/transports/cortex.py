@@ -14,6 +14,11 @@
 # limitations under the License.
 """Cortex (cortex-training) transport over SnowAPI.
 
+`CortexSession` owns the protocol plumbing -- url prefix, PAT auth, retrying
+send over ``requests`` / ``aiohttp`` -- and is job-agnostic, so the control-plane
+tooling in `arctic_platform.client.cortex` shares it. `CortexTransport` is one
+consumer: it adds job identity and op delivery.
+
 SnowAPI is async: every op submits and returns a ``request_id`` that is polled to
 completion. So an op is just submit + poll -> final result dict, the same
 contract the on-prem transports expose. `call` runs it over ``requests``; `acall`
@@ -45,6 +50,7 @@ from urllib3.exceptions import NewConnectionError
 
 from arctic_platform import wire
 from arctic_platform.client.config import ArcticClientConfig
+from arctic_platform.client.config import CortexConfig
 from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
@@ -72,7 +78,7 @@ _FORCE_CHUNK_OPS = {"forward-backward"}
 _GROUP_RESTART_OPS = {"forward-backward"}
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
-# Neutrino never colocates training and sampling on the same GPUs, so it exposes no
+# Cortex never colocates training and sampling on the same GPUs, so it exposes no
 # sleep/wake surface. They resolve to no-ops here rather than errors, which keeps
 # shared client flows like sync_weights() (wake → operation → wake → reset) portable.
 _NOOP_OPS = {"sleep-inference", "wake-inference", "sleep-training", "wake-training"}
@@ -247,18 +253,118 @@ async def _aread_json(resp: Any) -> Any:
         return None
 
 
+def _json_or_empty(resp: requests.Response) -> dict:
+    """A 2xx with no body (DELETE, some :cancel replies) is a success, not a parse error."""
+    return resp.json() if resp.content else {}
+
+
+class CortexSession:
+    """SnowAPI HTTP: url prefix, PAT auth, and retrying send over `requests` / `aiohttp`.
+
+    Job-agnostic and built from a bare `CortexConfig`, so the control-plane tooling in
+    `arctic_platform.client.cortex` drives SnowAPI through the same auth and retry
+    policy as `CortexTransport` instead of reimplementing it.
+    """
+
+    def __init__(self, config: CortexConfig, *, request_timeout: float = 1800.0) -> None:
+        self.config = config
+        self.request_timeout = request_timeout
+        self.max_retries = config.max_retries
+        self.session = requests.Session()
+        self.session.headers.update(self._auth_headers())
+        self._asession = None  # aiohttp.ClientSession, lazy on first asend
+        self._asession_loop = None  # the event loop that session is bound to
+
+    @property
+    def base_url(self) -> str:
+        """Account root. Also the base for `/api/v2/statements`, outside the endpoint prefix."""
+        cx = self.config
+        return (cx.base_url or f"https://{cx.host}").rstrip("/")
+
+    @property
+    def prefix(self) -> str:
+        cx = self.config
+        return f"{self.base_url}/api/v2/databases/{cx.database}/schemas/{cx.schema_}/{cx.endpoint}"
+
+    def _auth_headers(self) -> dict[str, str]:
+        cx = self.config
+        if cx.base_url is not None:  # local/dev host: no PAT auth
+            return {}
+        return {  # config validated resolve_pat() is present for host/PAT auth
+            "Authorization": f"Bearer {cx.resolve_pat()}",
+            "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
+        }
+
+    def retrying(self, retry_on=None) -> Retrying:
+        return Retrying(
+            retry=retry_if_exception(retry_on or _is_transient),
+            stop=stop_after_attempt(1 + self.max_retries),
+            wait=wait_exponential_jitter(initial=0.5, max=10.0),
+            reraise=True,
+        )
+
+    def aretrying(self, retry_on=None) -> AsyncRetrying:
+        return AsyncRetrying(
+            retry=retry_if_exception(retry_on or _is_transient_async),
+            stop=stop_after_attempt(1 + self.max_retries),
+            wait=wait_exponential_jitter(initial=0.5, max=10.0),
+            reraise=True,
+        )
+
+    def send(self, method: str, url: str, *, retry_on=None, **kwargs: Any) -> dict:
+        # Every SnowAPI call goes through here so transient 429/5xx/connection blips
+        # are retried with exponential-jitter backoff.
+        def attempt() -> dict:
+            resp = self.session.request(method, url, timeout=self.request_timeout, **kwargs)
+            _raise_for_status(resp)
+            return _json_or_empty(resp)
+
+        return self.retrying(retry_on)(attempt)
+
+    async def ensure_asession(self):
+        # A ClientSession is bound to the loop it's built on; reuse it only on that
+        # same loop. On a new loop (e.g. a fresh asyncio.run) rebuild -- the stale
+        # one can't be awaited closed from here.
+        loop = asyncio.get_running_loop()
+        if self._asession is None or self._asession.closed or self._asession_loop is not loop:
+            import aiohttp
+
+            self._asession = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.request_timeout),
+                headers=self._auth_headers(),
+            )
+            self._asession_loop = loop
+        return self._asession
+
+    async def asend(self, method: str, url: str, *, retry_on=None, **kwargs: Any) -> dict:
+        session = await self.ensure_asession()
+
+        async def attempt() -> dict:
+            async with session.request(method, url, **kwargs) as resp:
+                if resp.status >= 400:
+                    await _araise_for_status(resp)
+                return await resp.json(content_type=None)
+
+        return await self.aretrying(retry_on)(attempt)
+
+    async def aclose(self) -> None:
+        # Only the loop that owns the session can close it; on any other loop just
+        # drop the reference (matches the on-prem HTTP transport).
+        if self._asession is not None:
+            if not self._asession.closed and self._asession_loop is asyncio.get_running_loop():
+                await self._asession.close()
+            self._asession = None
+            self._asession_loop = None
+
+
 class CortexTransport(Transport):
     def __init__(self, config: ArcticClientConfig) -> None:
         self.config = config
         self.jobs = JobHandles()
         self.job_id: str | None = None
-        self.request_timeout = config.request_timeout
-        self.max_retries = config.backend.max_retries
         self.poll_interval = 0.5
         self.poll_timeout = config.job_ready_timeout
-        self.session = self._build_session()
-        self._asession = None  # aiohttp.ClientSession, lazy on first acall
-        self._asession_loop = None  # the event loop that session is bound to
+        self.session = CortexSession(config.backend, request_timeout=config.request_timeout)
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def initialize(self) -> JobHandles:
@@ -269,9 +375,12 @@ class CortexTransport(Transport):
             self.job_id = str(token).split(":", 1)[0]
         else:
             # A mutating create: only retry when the request provably never landed,
-            # so we can't spawn duplicate jobs (matches the neutrino client).
-            created = self._send(
-                "POST", self._prefix, retry_on=_is_connect_error, json={"sub_job_configs": self._sub_job_configs()}
+            # so we can't spawn duplicate jobs (matches the Cortex client contract).
+            created = self.session.send(
+                "POST",
+                self.session.prefix,
+                retry_on=_is_connect_error,
+                json={"sub_job_configs": self._sub_job_configs()},
             )
             self.job_id = created["job_id"]
         self._wait_running()
@@ -290,7 +399,7 @@ class CortexTransport(Transport):
         # GS uses colon-action syntax: /{job_id}:cancel. Best-effort teardown routed
         # through _send (retry + auth), tolerating failure (the job may be gone).
         with contextlib.suppress(requests.exceptions.RequestException):
-            self._send("POST", f"{self._prefix}/{self.job_id}:cancel")
+            self.session.send("POST", f"{self.session.prefix}/{self.job_id}:cancel")
 
     # ── deliver one op: submit + poll to completion ──────────────────────────
     def call(self, request: Request) -> dict:
@@ -310,7 +419,7 @@ class CortexTransport(Transport):
     def _op_target(self, request: Request) -> tuple[str, dict]:
         """The url + JSON body for one op (None-valued keys dropped)."""
         return (
-            f"{self._prefix}/{self.job_id}/{request.op}",
+            f"{self.session.prefix}/{self.job_id}/{request.op}",
             {k: v for k, v in request.body.items() if v is not None},
         )
 
@@ -324,7 +433,7 @@ class CortexTransport(Transport):
         if op in _OCTET_OPS:
             return self._submit_octet(url, op, body)
         if op in ("step", "save", "operation"):
-            return _submitted(op, body, self._send("POST", url, json=body))
+            return _submitted(op, body, self.session.send("POST", url, json=body))
         raise NotImplementedError(f"cortex has no {op}")
 
     def _octet_chunks(self, body: dict, op: str) -> list[bytes]:
@@ -349,7 +458,7 @@ class CortexTransport(Transport):
         final: dict = {}
         while idx < len(chunks):
             try:
-                final = self._send("POST", url, retry_on=retry_on, data=chunks[idx], headers=_OCTET_HEADERS)
+                final = self.session.send("POST", url, retry_on=retry_on, data=chunks[idx], headers=_OCTET_HEADERS)
             except requests.exceptions.HTTPError as exc:
                 detail = _chunk_group_detail(_response_json(exc.response))
                 if not (allow_restart and restarts < 1 and detail and detail["code"] == _CHUNK_GROUP_RESTART_REQUIRED):
@@ -365,7 +474,7 @@ class CortexTransport(Transport):
         if op in _OCTET_OPS:
             return await self._asubmit_octet(url, op, body)
         if op in ("step", "save", "operation"):
-            return _submitted(op, body, await self._asend("POST", url, json=body))
+            return _submitted(op, body, await self.session.asend("POST", url, json=body))
         raise NotImplementedError(f"cortex has no {op}")
 
     async def _asubmit_octet(self, url: str, op: str, body: dict) -> str:
@@ -387,7 +496,7 @@ class CortexTransport(Transport):
     async def _apost_octet_chunk(self, url: str, chunk: bytes, *, allow_restart: bool) -> dict:
         # aiohttp's ClientResponseError drops the body, so read it here to spot a
         # chunk-group error (surfaced as _ChunkGroupError, never retried per-chunk).
-        session = await self._ensure_asession()
+        session = await self.session.ensure_asession()
 
         async def attempt() -> dict:
             async with session.post(url, data=chunk, headers=_OCTET_HEADERS) as resp:
@@ -398,16 +507,10 @@ class CortexTransport(Transport):
                     resp.raise_for_status()
                 return await resp.json(content_type=None)
 
-        retryer = AsyncRetrying(
-            retry=retry_if_exception(_is_transient_async),
-            stop=stop_after_attempt(1 + self.max_retries),
-            wait=wait_exponential_jitter(initial=0.5, max=10.0),
-            reraise=True,
-        )
-        return await retryer(attempt)
+        return await self.session.aretrying()(attempt)
 
     def _request_url(self, request_id: str, cursor: str | None) -> tuple[str, dict | None]:
-        url = f"{self._prefix}/{self.job_id}/requests/{request_id}"
+        url = f"{self.session.prefix}/{self.job_id}/requests/{request_id}"
         return url, ({"cursor": cursor} if cursor else None)
 
     def _poll(self, submitted: str | dict) -> dict:
@@ -421,7 +524,7 @@ class CortexTransport(Transport):
         cursor: str | None = None
         while time.monotonic() < deadline:
             url, params = self._request_url(request_id, cursor)
-            action, value = _poll_progress(self._send("GET", url, params=params), chunks, request_id)
+            action, value = _poll_progress(self.session.send("GET", url, params=params), chunks, request_id)
             if action == "done":
                 return value
             if action == "drain":
@@ -441,7 +544,7 @@ class CortexTransport(Transport):
         cursor: str | None = None
         while time.monotonic() < deadline:
             url, params = self._request_url(request_id, cursor)
-            action, value = _poll_progress(await self._asend("GET", url, params=params), chunks, request_id)
+            action, value = _poll_progress(await self.session.asend("GET", url, params=params), chunks, request_id)
             if action == "done":
                 return value
             if action == "drain":
@@ -478,87 +581,13 @@ class CortexTransport(Transport):
     def _sub_job_configs(self) -> list[dict]:
         return self.config.to_cortex()
 
-    # ── HTTP + auth ──────────────────────────────────────────────────────────
-    @property
-    def _prefix(self) -> str:
-        cfg = self.config
-        cx = cfg.backend
-        base = (cx.base_url or f"https://{cx.host}").rstrip("/")
-        return f"{base}/api/v2/databases/{cx.database}/schemas/{cx.schema_}/{cx.endpoint}"
-
-    def _auth_headers(self) -> dict[str, str]:
-        cx = self.config.backend
-        if cx.base_url is not None:  # local/dev host: no PAT auth
-            return {}
-        return {  # config validated resolve_pat() is present for host/PAT auth
-            "Authorization": f"Bearer {cx.resolve_pat()}",
-            "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
-        }
-
-    def _build_session(self) -> requests.Session:
-        session = requests.Session()
-        session.headers.update(self._auth_headers())
-        return session
+    # ── HTTP + auth: see CortexSession ───────────────────────────────────────
 
     def _job(self) -> dict:
-        return self._send("GET", f"{self._prefix}/{self.job_id}")
-
-    def _send(self, method: str, url: str, *, retry_on=None, **kwargs: Any) -> dict:
-        # Every SnowAPI call goes through here so transient 429/5xx/connection blips
-        # are retried with exponential-jitter backoff (the neutrino client's policy).
-        def attempt() -> dict:
-            resp = self.session.request(method, url, timeout=self.request_timeout, **kwargs)
-            _raise_for_status(resp)
-            return resp.json()
-
-        retryer = Retrying(
-            retry=retry_if_exception(retry_on or _is_transient),
-            stop=stop_after_attempt(1 + self.max_retries),
-            wait=wait_exponential_jitter(initial=0.5, max=10.0),
-            reraise=True,
-        )
-        return retryer(attempt)
-
-    async def _ensure_asession(self):
-        # A ClientSession is bound to the loop it's built on; reuse it only on that
-        # same loop. On a new loop (e.g. a fresh asyncio.run) rebuild -- the stale
-        # one can't be awaited closed from here.
-        loop = asyncio.get_running_loop()
-        if self._asession is None or self._asession.closed or self._asession_loop is not loop:
-            import aiohttp
-
-            self._asession = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.request_timeout),
-                headers=self._auth_headers(),
-            )
-            self._asession_loop = loop
-        return self._asession
-
-    async def _asend(self, method: str, url: str, *, retry_on=None, **kwargs: Any) -> dict:
-        session = await self._ensure_asession()
-
-        async def attempt() -> dict:
-            async with session.request(method, url, **kwargs) as resp:
-                if resp.status >= 400:
-                    await _araise_for_status(resp)
-                return await resp.json(content_type=None)
-
-        retryer = AsyncRetrying(
-            retry=retry_if_exception(retry_on or _is_transient_async),
-            stop=stop_after_attempt(1 + self.max_retries),
-            wait=wait_exponential_jitter(initial=0.5, max=10.0),
-            reraise=True,
-        )
-        return await retryer(attempt)
+        return self.session.send("GET", f"{self.session.prefix}/{self.job_id}")
 
     async def aclose(self) -> None:
-        # Only the loop that owns the session can close it; on any other loop just
-        # drop the reference (matches the on-prem HTTP transport).
-        if self._asession is not None:
-            if not self._asession.closed and self._asession_loop is asyncio.get_running_loop():
-                await self._asession.close()
-            self._asession = None
-            self._asession_loop = None
+        await self.session.aclose()
 
 
 def _next_delay(delay: float) -> float:
