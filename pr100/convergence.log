@@ -1,0 +1,29 @@
+[2026-08-31 21:30:24,716] [WARNING] [real_accelerator.py:209:get_accelerator] Setting accelerator to CPU. If you have GPU or other accelerator, we were unable to detect it.
+Attached to job 74806ebc-2ac5-46fc-8a7f-f23dd5f6bb5c via CortexTransport
+batch=(2, 128) supervised=27 lr=1e-05 steps=20
+  step  0  nll=6.301409  server_avg_loss=-0.03703703731298447  mean_lp=-0.664602
+  step  1  nll=4.812599  server_avg_loss=-0.03703703731298447  mean_lp=-0.507579
+  step  2  nll=2.759532  server_avg_loss=-0.03703703731298447  mean_lp=-0.291044
+  step  3  nll=2.140888  server_avg_loss=-0.03703703731298447  mean_lp=-0.225797
+  step  4  nll=0.655851  server_avg_loss=-0.03703703731298447  mean_lp=-0.069172
+  step  5  nll=0.407752  server_avg_loss=-0.03703703731298447  mean_lp=-0.043005
+  step  6  nll=0.333765  server_avg_loss=-0.03703703731298447  mean_lp=-0.035202
+  step  7  nll=0.224964  server_avg_loss=-0.03703703731298447  mean_lp=-0.023727
+  step  8  nll=0.186377  server_avg_loss=-0.03703703731298447  mean_lp=-0.019657
+  step  9  nll=0.156420  server_avg_loss=-0.03703703731298447  mean_lp=-0.016497
+  step 10  nll=0.100299  server_avg_loss=-0.03703703731298447  mean_lp=-0.010578
+  step 11  nll=0.058551  server_avg_loss=-0.03703703731298447  mean_lp=-0.006175
+  step 12  nll=0.029190  server_avg_loss=-0.03703703731298447  mean_lp=-0.003079
+  step 13  nll=0.004112  server_avg_loss=-0.03703703731298447  mean_lp=-0.000434
+  step 14  nll=0.001076  server_avg_loss=-0.03703703731298447  mean_lp=-0.000113
+  step 15  nll=0.000418  server_avg_loss=-0.03703703731298447  mean_lp=-0.000044
+  step 16  nll=0.000201  server_avg_loss=-0.03703703731298447  mean_lp=-0.000021
+  step 17  nll=0.000127  server_avg_loss=-0.03703703731298447  mean_lp=-0.000013
+  step 18  nll=0.000083  server_avg_loss=-0.03703703731298447  mean_lp=-0.000009
+  step 19  nll=0.000056  server_avg_loss=-0.03703703731298447  mean_lp=-0.000006
+
+NLL 6.301409 -> 0.000056  (drop 6.301353, decreased on 19/19 steps)
+elapsed 45.6s  job 74806ebc-2ac5-46fc-8a7f-f23dd5f6bb5c
+wrote /modeling-code/karthik/abstract-remote-exps/client-side-loss-demo/convergence.json
+(plot skipped: No module named 'matplotlib')
+PASS: client-side loss trains the model over Cortex
