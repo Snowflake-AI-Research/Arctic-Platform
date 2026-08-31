@@ -32,6 +32,7 @@ import torch
 
 from arctic_platform.integrations.trl.loss import _surrogate_payload
 from arctic_platform.rl.processors.grpo import grpo_loss
+from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
 
 B, S = 2, 6
 
@@ -110,6 +111,49 @@ class TestGrpoEncoding:
         payload, _, config = _surrogate_payload("grpo", batch, weights, log_probs, "unused")
 
         assert torch.allclose(_server_gradient(payload, config, log_probs), weights, atol=1e-12)
+
+
+class TestEquivalenceWithTheDefaultEncoding:
+    def test_both_encodings_produce_the_same_gradient(self):
+        """The two paths must be interchangeable in the only way that matters."""
+        torch.manual_seed(2)
+        batch = _batch()
+        log_probs = torch.randn(B, S, dtype=torch.float64)
+        weights = torch.randn(B, S, dtype=torch.float64)
+        weights[:, -1] = 0.0  # as _unpack_to_padded leaves padded positions
+
+        grpo_payload, _, config = _surrogate_payload("grpo", batch, weights, log_probs, "x")
+        wls_payload, _, _ = _surrogate_payload("weighted_logprob_sum", batch, weights, log_probs, "x")
+
+        leaf = log_probs.clone().requires_grad_(True)
+        wls_loss, _ = weighted_logprob_sum({"logprobs": leaf}, wls_payload, {}, {}, "cpu")
+        (wls_grad,) = torch.autograd.grad(wls_loss, leaf)
+
+        assert torch.allclose(_server_gradient(grpo_payload, config, log_probs), wls_grad, atol=1e-12)
+
+    def test_the_reported_loss_value_differs_and_that_is_fine(self):
+        """Only the gradient is shared; the scalars are not the same number.
+
+        At ratio 1 the per-token GRPO term is ``-advantages``, so grpo reports
+        ``sum(w)`` where the default reports ``sum(w * logprobs)``. The client
+        reports its own loss to TRL and drops the server's, so this shows up only
+        in server-side metrics -- but it would be a real surprise when comparing
+        runs across encodings, so it is pinned rather than left implicit.
+        """
+        torch.manual_seed(3)
+        batch = _batch()
+        log_probs = torch.randn(B, S, dtype=torch.float64)
+        weights = torch.randn(B, S, dtype=torch.float64)
+
+        grpo_payload, _, config = _surrogate_payload("grpo", batch, weights, log_probs, "x")
+        wls_payload, _, _ = _surrogate_payload("weighted_logprob_sum", batch, weights, log_probs, "x")
+
+        grpo_value, _ = grpo_loss({"logprobs": log_probs}, grpo_payload, config, "cpu")
+        wls_value, _ = weighted_logprob_sum({"logprobs": log_probs}, wls_payload, {}, {}, "cpu")
+
+        assert float(grpo_value) == pytest.approx(float(weights.sum()))
+        assert float(wls_value) == pytest.approx(float((weights * log_probs).sum()))
+        assert float(grpo_value) != pytest.approx(float(wls_value))
 
 
 class TestDefaultEncoding:
