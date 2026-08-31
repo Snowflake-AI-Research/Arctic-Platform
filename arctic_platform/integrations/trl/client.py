@@ -59,7 +59,7 @@ class ArcticTrainingClient:
     """Arctic-hosted model, TRL-hosted loss.
 
     Args:
-        client: :class:`~arctic_platform.client.client.SyncArcticRLClient`.
+        client: :class:`~arctic_platform.client.ArcticRLClient`.
         temperature: Applied by the ``apply_temperature`` post-processor.
         loss_fn: Server surrogate name (or dotted import). Not TRL's local ``loss_fn`` callable.
         server_side_loss: When ``True``, ship GRPO ingredients to the server and run
