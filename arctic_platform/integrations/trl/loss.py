@@ -89,9 +89,16 @@ def _surrogate_payload(
     the ratio 1 and leaves ``-advantages``.
 
     Scale follows from ``token-mean``, which is ``masked_sum / batch_num_tokens *
-    dp_size``. Setting both to 1 collapses it to a plain masked sum, so ``grpo``
-    reduces to exactly what ``weighted_logprob_sum`` computes -- including how it
-    behaves under data parallelism, which is inherited here rather than redefined.
+    dp_size``. Setting both to 1 collapses it to a plain masked sum, leaving the
+    gradient unnormalized exactly as ``weighted_logprob_sum`` leaves it -- so the
+    two encodings behave identically under data parallelism, inheriting that
+    behaviour rather than redefining it.
+
+    What matches is the gradient, not the number. ``weighted_logprob_sum`` reports
+    ``sum(w * logprobs)`` while this reports ``sum(w)``, because at ratio 1 the
+    per-token GRPO term is ``-advantages``. Both differentiate to ``w``, which is
+    all the backward pass consumes; the client reports its own loss to TRL and
+    discards the server's, so the difference is confined to server-side metrics.
 
     Clipping cannot engage: at ratio 1, ``min(r*A, clip(r)*A)`` is ``A`` for any
     epsilon. The server recomputes log-probs in bf16, so the ratio lands at 1 only
