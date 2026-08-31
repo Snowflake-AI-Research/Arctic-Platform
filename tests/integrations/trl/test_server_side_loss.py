@@ -186,3 +186,39 @@ def test_forward_backward_server_branch_wiring():
     assert out.loss.requires_grad
     assert out.loss.item() == pytest.approx(0.5, abs=1e-6)
     out.loss.backward()  # must not raise (leaf tensor)
+
+
+def test_server_side_loss_forwards_logits_optimization_memory():
+    input_ids = torch.tensor([[10, 11, 12, 20, 21]])
+    position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+    completion_mask = torch.tensor([[0, 1, 1, 0, 1]])
+    trainer = _FakeTrainer()
+    loss_fn = _make_trl_like_loss_fn(
+        trainer,
+        torch.tensor([[0.1, 0.2, 0.3, 0.4]]),
+        torch.tensor([[1.0, -1.0, 0.5, 2.0]]),
+        torch.tensor([[0.0, 1.0, 0.0, 1.0]]),
+        torch.tensor(4.0),
+    )
+    client = _RecordingClient(
+        torch.tensor([[0.0, -0.1, -0.2], [0.0, -0.3, 0.0]]),
+        torch.tensor([[1.0, 1.1, 1.2], [1.3, 1.4, 0.0]]),
+        avg_loss=0.5,
+    )
+    adapter = ArcticTrainingClient(
+        client=client,
+        temperature=0.7,
+        server_side_loss=True,
+        logits_optimization="memory",
+        logits_optimization_peak_mem_size_in_gib=8,
+    )
+    adapter.forward_backward(
+        model=None,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        completion_mask=completion_mask,
+        loss_fn=loss_fn,
+    )
+    meta = client.last_payload["meta"]
+    assert meta["logits_optimization"] == "memory"
+    assert meta["logits_optimization_peak_mem_size_in_gib"] == 8

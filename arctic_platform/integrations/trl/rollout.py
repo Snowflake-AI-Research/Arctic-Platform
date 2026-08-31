@@ -50,7 +50,9 @@ def _sampled_logprob(position: dict, token_id: int) -> float:
 class ArcticRolloutWorker:
     """Arctic generate + score loop for ``RolloutWorkerProtocol``.
 
-    ``old_logprobs_source="trainer"`` (default) recomputes old logprobs on the training engine.
+    ``generate_group_batch`` > 1 packs that many GRPO groups into one ``generate()``.
+    Generate and score run on two threads so scoring overlaps the next generate.
+    ``model_version`` is captured before ``generate()``, not after score.
     """
 
     def __init__(
@@ -72,11 +74,17 @@ class ArcticRolloutWorker:
         old_logprobs_source: str = "trainer",
         pad_token_id: int = 0,
         max_token_len_per_gpu: int = 4096,
+        generate_group_batch: int = 1,
+        logits_optimization: str = "none",
+        logits_optimization_peak_mem_size_in_gib: int = 4,
+        logits_compute_in_fp32: bool = False,
     ) -> None:
         if temperature <= 0:
             raise ValueError("temperature must be > 0 so a group's generations differ (GRPO needs variance).")
         if old_logprobs_source not in ("trainer", "sampler"):
             raise ValueError(f"old_logprobs_source must be 'trainer' or 'sampler', got {old_logprobs_source!r}.")
+        if generate_group_batch < 1:
+            raise ValueError(f"generate_group_batch must be >= 1, got {generate_group_batch}.")
         self.client = client
         self.dataset = dataset
         self.reward_funcs = reward_funcs if isinstance(reward_funcs, list) else [reward_funcs]
@@ -89,6 +97,10 @@ class ArcticRolloutWorker:
         self.old_logprobs_source = old_logprobs_source
         self.pad_token_id = pad_token_id
         self.max_token_len_per_gpu = max_token_len_per_gpu
+        self.generate_group_batch = generate_group_batch
+        self.logits_optimization = logits_optimization
+        self.logits_optimization_peak_mem_size_in_gib = logits_optimization_peak_mem_size_in_gib
+        self.logits_compute_in_fp32 = logits_compute_in_fp32
         self._sampling_params: dict[str, Any] = {
             "max_tokens": max_tokens,
             "temperature": temperature,
@@ -101,11 +113,13 @@ class ArcticRolloutWorker:
             self._sampling_params["min_p"] = min_p
 
         self.rollout_buffer: queue.Queue = queue.Queue(maxsize=queue_maxsize)
+        self._score_q: queue.Queue = queue.Queue(maxsize=1)  # generate(k+1) overlaps score(k)
 
         self._model_version = 0
         self._version_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._score_thread: threading.Thread | None = None
         self._heartbeat = time.time()
         self._error: BaseException | None = None
 
@@ -122,7 +136,10 @@ class ArcticRolloutWorker:
     def start(self) -> None:
         if self._thread is not None:
             return
+        self._stop.clear()
         self._heartbeat = time.time()
+        self._score_thread = threading.Thread(target=self._score_loop, name="arctic-rollout-scorer", daemon=True)
+        self._score_thread.start()
         self._thread = threading.Thread(target=self._run, name="arctic-rollout-worker", daemon=True)
         self._thread.start()
 
@@ -131,12 +148,18 @@ class ArcticRolloutWorker:
         if self._thread is not None:
             self._thread.join(timeout=30)
             self._thread = None
+        self._put_score_sentinel()
+        if self._score_thread is not None:
+            self._score_thread.join(timeout=30)
+            self._score_thread = None
 
     def check_health(self, stale_after_s: float) -> None:
         if self._error is not None:
             raise RuntimeError("Arctic rollout worker thread failed; see chained exception.") from self._error
         if self._thread is not None and not self._thread.is_alive() and not self._stop.is_set():
             raise RuntimeError("Arctic rollout worker thread has stopped unexpectedly.")
+        if self._score_thread is not None and not self._score_thread.is_alive() and not self._stop.is_set():
+            raise RuntimeError("Arctic rollout scorer thread has stopped unexpectedly.")
         age = time.time() - self._heartbeat
         if age > stale_after_s:
             raise RuntimeError(f"Arctic rollout worker heartbeat stale: {age:.0f}s > {stale_after_s:.0f}s.")
@@ -147,18 +170,29 @@ class ArcticRolloutWorker:
             group_id = 0
             while not self._stop.is_set():
                 produced = False
+                batch: list[dict] = []
                 for row in self.dataset:
                     if self._stop.is_set():
                         return
+                    batch.append(row)
+                    if len(batch) >= self.generate_group_batch:
+                        self._heartbeat = time.time()
+                        self._rollout_groups(batch, group_id)
+                        group_id += len(batch)
+                        batch = []
+                        produced = True
+                if batch:
                     self._heartbeat = time.time()
-                    self._rollout_group(row, group_id)
-                    group_id += 1
+                    self._rollout_groups(batch, group_id)
+                    group_id += len(batch)
                     produced = True
                 if not produced:
                     time.sleep(0.1)
         except BaseException as e:  # noqa: BLE001
             self._error = e
             raise
+        finally:
+            self._put_score_sentinel()
 
     def _render_prompt(self, prompt: Any) -> tuple[str, list[int]]:
         """Text prompt plus token ids for the training row."""
@@ -172,15 +206,78 @@ class ArcticRolloutWorker:
         return text, ids
 
     def _rollout_group(self, row: dict, group_id: int) -> None:
-        prompt = row["prompt"]
-        prompt_text, prompt_ids = self._render_prompt(prompt)
+        self._rollout_groups([row], group_id)
 
+    def _rollout_groups(self, dataset_rows: list[dict], start_group_id: int) -> None:
+        """One ``generate()`` over ``len(dataset_rows)`` groups; identical prompts stay adjacent."""
+        rendered = [self._render_prompt(row["prompt"]) for row in dataset_rows]
+        prompts: list[str] = []
+        for text, _ids in rendered:
+            prompts.extend([text] * self.num_generations)
+
+        model_version = self.model_version
         results = self.client.generate(
-            prompts=[prompt_text for _ in range(self.num_generations)],
+            prompts=prompts,
             sampling_params=dict(self._sampling_params),
         )
         self._heartbeat = time.time()
+        if len(results) != len(prompts):
+            raise RuntimeError(
+                f"Arctic generate returned {len(results)} completions, expected {len(prompts)} "
+                f"({len(dataset_rows)} groups × {self.num_generations})."
+            )
+        self._enqueue_score((dataset_rows, rendered, results, start_group_id, model_version))
 
+    def _enqueue_score(self, job: tuple) -> None:
+        while not self._stop.is_set():
+            try:
+                self._score_q.put(job, timeout=0.5)
+                return
+            except queue.Full:
+                self._heartbeat = time.time()
+                continue
+
+    def _put_score_sentinel(self) -> None:
+        while True:
+            try:
+                self._score_q.put(None, timeout=0.5)
+                return
+            except queue.Full:
+                if self._score_thread is None or not self._score_thread.is_alive():
+                    return
+
+    def _score_loop(self) -> None:
+        try:
+            while True:
+                job = self._score_q.get()
+                if job is None:
+                    return
+                dataset_rows, rendered, results, start_group_id, model_version = job
+                n = self.num_generations
+                for i, row in enumerate(dataset_rows):
+                    if self._stop.is_set():
+                        return
+                    self._heartbeat = time.time()
+                    self._emit_group(
+                        row,
+                        rendered[i][1],
+                        results[i * n : (i + 1) * n],
+                        start_group_id + i,
+                        model_version,
+                    )
+        except BaseException as e:  # noqa: BLE001
+            self._error = e
+            raise
+
+    def _emit_group(
+        self,
+        row: dict,
+        prompt_ids: list[int],
+        results: list[dict],
+        group_id: int,
+        model_version: int,
+    ) -> None:
+        prompt = row["prompt"]
         completions: list[list[dict[str, str]]] = []
         completion_ids: list[list[int]] = []
         rows: list[dict[str, Any]] = []
@@ -215,6 +312,9 @@ class ArcticRolloutWorker:
                 pad_token_id=self.pad_token_id,
                 rollout_n=self.num_generations,
                 max_token_len_per_gpu=self.max_token_len_per_gpu,
+                logits_optimization=self.logits_optimization,
+                logits_optimization_peak_mem_size_in_gib=self.logits_optimization_peak_mem_size_in_gib,
+                logits_compute_in_fp32=self.logits_compute_in_fp32,
             )
             self._heartbeat = time.time()
             for r, lp in zip(rows, engine_lp, strict=True):
@@ -223,7 +323,6 @@ class ArcticRolloutWorker:
         rewards, per_func_rewards, reward_std = self._score(prompt, completions, completion_ids, row)
         advantages = self._advantages(rewards)
 
-        model_version = self.model_version
         for i, (r, adv) in enumerate(zip(rewards, advantages, strict=True)):
             metrics = {
                 "reward": float(r),
