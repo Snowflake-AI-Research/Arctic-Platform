@@ -14,14 +14,21 @@
 # limitations under the License.
 """Show, and optionally release, Cortex jobs holding GPUs on this account.
 
-A driver that exits cleanly releases its GPUs; one killed first does not, and
-since this recipe sits at the 8-GPU account cap the next launch then fails with
-`429 ... per-account GPU cap reached` -- which never says the GPUs are held by
-your own dead run.
+Nothing releases a training job on its own: SkyRL never calls the client's
+shutdown when training ends, so a run leaves its GPUs held whether it finished
+its last step or was killed. Since this recipe sits at the 8-GPU account cap,
+the next launch then fails with `429 ... per-account GPU cap reached`, which
+never says the GPUs are held by your own previous run. The launcher releases
+what it started; this is the tool for everything else.
 
     python cortex_jobs.py            # what is holding GPUs
-    python cortex_jobs.py --cancel   # release it
+    python cortex_jobs.py --cancel   # release all of it
+    python cortex_jobs.py --cancel ID [ID...]   # release exactly these
+    python cortex_jobs.py --ids      # bare ids, one per line, for scripting
     python cortex_jobs.py --all      # include finished jobs
+
+The account cap is per-account, so it can be shared with teammates: prefer
+cancelling by id over the blanket form.
 
 Reads the same ARCTIC_CORTEX_* environment the recipe does.
 """
@@ -41,6 +48,10 @@ _TERMINAL = {"failed", "done", "cancelled", "canceled", "succeeded", "terminated
 def main() -> int:
     show_all = "--all" in sys.argv
     do_cancel = "--cancel" in sys.argv
+    ids_only = "--ids" in sys.argv
+    # Anything not a flag is a job id to cancel, so an automated caller can
+    # release the jobs it started without touching a teammate's.
+    wanted = {a for a in sys.argv[1:] if not a.startswith("-")}
 
     try:
         # model_name is required by the config but unused for job queries: this
@@ -52,15 +63,34 @@ def main() -> int:
         print("Set ARCTIC_CORTEX_HOST and the PAT variable it names. See README.md.", file=sys.stderr)
         return 2
 
-    jobs = transport.list_jobs()
-    live = []
+    try:
+        jobs = transport.list_jobs()
+    except Exception as exc:
+        # A wrong host answers with an HTML error page, and the transport puts
+        # 2000 characters of it in the message. Keep the first line.
+        detail = str(exc).splitlines()[0][:200]
+        print(f"could not list Cortex jobs: {detail}", file=sys.stderr)
+        print("Check ARCTIC_CORTEX_HOST / DATABASE / SCHEMA and the PAT. See README.md.", file=sys.stderr)
+        return 2
+
+    live, finished = [], []
     for job in jobs:
         job_id = job.get("job_id") or job.get("id") or job.get("name")
         status = str(job.get("status") or job.get("state") or "?").lower()
-        if status not in _TERMINAL:
-            live.append(job_id)
-            print(f"{job_id}  {status}  <-- holding GPUs")
-        elif show_all:
+        # Named ids narrow the whole report, not just the cancel: saying a job
+        # holds GPUs and then that nothing does reads like a bug.
+        if wanted and job_id not in wanted:
+            continue
+        (finished if status in _TERMINAL else live).append((job_id, status))
+
+    if ids_only:
+        print("\n".join(str(j) for j, _ in live))
+        return 0
+
+    for job_id, status in live:
+        print(f"{job_id}  {status}  <-- holding GPUs")
+    if show_all:
+        for job_id, status in finished:
             print(f"{job_id}  {status}")
 
     if not live:
@@ -73,7 +103,7 @@ def main() -> int:
         return 0
 
     failed = 0
-    for job_id in live:
+    for job_id, _ in live:
         try:
             transport.cancel_job(job_id)
             print(f"released {job_id}")

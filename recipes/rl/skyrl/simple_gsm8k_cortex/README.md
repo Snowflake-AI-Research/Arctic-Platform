@@ -4,6 +4,13 @@ Same recipe as [`simple_gsm8k/`](../simple_gsm8k/), with training + sampling
 dispatched to Cortex-training sub-jobs instead of a local Ray + vLLM stack.
 The SkyRL driver runs on a CPU-only laptop / VM; Cortex owns the GPUs.
 
+"Same recipe" is meant literally: every hyperparameter is that recipe's value
+unchanged, down to `policy_mini_batch_size` and the one-epoch schedule, so the
+two differ only in where the GPUs are. The single exception is
+`micro_train_batch_size_per_gpu`, which has to differ — SkyRL defaults it to 1,
+which cannot satisfy DeepSpeed's `micro × accum × n_gpus == train_batch` across
+4 training GPUs.
+
 | Knob | Value |
 | --- | --- |
 | Model | `Qwen/Qwen3-0.6B` |
@@ -11,7 +18,8 @@ The SkyRL driver runs on a CPU-only laptop / VM; Cortex owns the GPUs.
 | Trainer | Cortex training sub-job (server-side GRPO loss) |
 | Sampling | Cortex sampling sub-job (vLLM inside Cortex) |
 | Sequence lengths | prompt 512, response 1024 |
-| Batch | 32 prompts × 4 samples, mini-batch 4 (canonical scale in §6) |
+| Batch | 32 prompts × 4 samples, mini-batch 4 — the sibling's values (§6) |
+| Schedule | 1 epoch = 233 steps, eval every 10 |
 | GPUs | 4 training + 4 sampling, allocated by Cortex; driver is CPU-only |
 
 ## 1. Install
@@ -60,24 +68,55 @@ The launcher uses `python -m arctic_platform.integrations.skyrl` instead
 of `python -m skyrl.train.entrypoints.main_base` so the driver-side
 `peer_access_supported` shim is installed before SkyRL's Ray probe runs.
 
+### Stopping it, and getting the GPUs back
+
+Ctrl-C, or `kill` on the launcher, is enough. Both stop the run and release
+the Cortex job, and the launcher prints which job it released.
+
+Worth knowing why that needs saying. Nothing releases the GPUs on its own:
+SkyRL never calls the client's shutdown when training ends, so reaching the
+last step holds all 8 GPUs exactly as firmly as being killed does. The driver
+also ignores SIGINT and SIGTERM outright — Ray installs handlers — so a
+graceful stop cannot be asked for, and the launcher escalates to SIGKILL on
+the driver's whole process tree. It kills the descendants first, because the
+dataloader workers survive a bare kill of their parent, reparent to init, and
+hold ~0.5 GB each until something unrelated OOMs.
+
+`kill -9` on the launcher itself is the one case it cannot cover, since no
+trap runs. That is what [`cortex_jobs.py`](cortex_jobs.py) is for:
+
+```bash
+python cortex_jobs.py            # what is holding GPUs
+python cortex_jobs.py --cancel   # release it
+```
+
 ## 5. What a healthy run looks like
 
-Measured on the shipped defaults, so a bare
-`./run_qwen3_0.6b_gsm8k_grpo_cortex.sh` should reproduce this. Held-out
+The whole schedule, start to finish: one epoch of GSM8K at the shipped
+defaults, all 233 steps, no overrides and no early stop. A bare
+`./run_qwen3_0.6b_gsm8k_grpo_cortex.sh` is what produced it. Held-out
 `eval/all/pass_at_1` over the full 1319-example GSM8K test set:
 
-| step | 0 | 5 | 10 | 15 | 20 | 25 | 30 | 35 | 40 | 45 | 50 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| pass@1 | 0.3055 | 0.3427 | 0.3942 | 0.4503 | 0.4951 | 0.5375 | 0.5739 | 0.6293 | 0.6626 | 0.6854 | 0.6967 |
+| step | 0 | 10 | 20 | 30 | 40 | 50 | 60 | 70 | 80 | 90 | 100 | 110 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| pass@1 | 0.2949 | 0.3912 | 0.4989 | 0.5891 | 0.6588 | 0.6876 | 0.6907 | 0.7096 | 0.7165 | 0.7316 | 0.7172 | 0.7316 |
 
-Step 0 is the untrained baseline, so that is 2.3x baseline in 50 steps: about
-50 minutes wall-clock, of which ~4 minutes is Cortex provisioning before step 0
-and ~20s per training step thereafter.
+| step | 120 | 130 | 140 | 150 | 160 | 170 | 180 | 190 | 200 | 210 | 220 | 230 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| pass@1 | 0.7225 | 0.7400 | 0.7384 | 0.7422 | 0.7233 | 0.7369 | 0.7415 | 0.7346 | 0.7460 | 0.7528 | 0.7566 | 0.7582 |
 
-**This is not a converged run.** 50 steps is around 1% of the configured
-20-epoch schedule (~4660 steps); it was stopped once the trend was
-unambiguous. Read the table as evidence that the integration learns correctly,
-not as a GSM8K quality number.
+Step 0 is the untrained baseline: **0.2949 → 0.7582**, 2.6x, in 2h03m
+wall-clock (~4 min of Cortex provisioning, then ~20s per training step and
+~2 min per eval). Zero errors, zero retries.
+
+The shape is the point. It climbs steeply to ~0.69 by step 50, then flattens:
+everything from step 90 on sits in 0.72–0.76, drifting up by about a point
+over the last 100 steps. That is a run that has converged for this
+configuration, not one that was stopped while still climbing — which is what
+the earlier 50-step number in this file was.
+
+Because the epoch is the whole schedule, the run ends on its own and there is
+nothing to decide about when to stop it.
 
 **Two metrics are worth watching, because the failure mode here is a run that
 looks fine and learns nothing:**
@@ -96,9 +135,11 @@ clipping note below.
 
 ## 6. Scaling up, and the ceiling we hit
 
-The defaults above are deliberately smaller than SkyRL's published GSM8K scale
-(`train_batch_size=1024`, `policy_mini_batch_size=256`), because **that scale
-does not currently work on this backend.** Measured twice:
+The defaults are the sibling recipe's, which are smaller than SkyRL's published
+multi-GPU GSM8K scale (`train_batch_size=1024`,
+`policy_mini_batch_size=256`). Keeping them is not only about matching the
+sibling: **that larger scale does not currently work on this backend.**
+Measured twice:
 
 ```bash
 TRAIN_BSZ=1024 MINI_BSZ=256 MICRO_BSZ=64 ./run_qwen3_0.6b_gsm8k_grpo_cortex.sh
@@ -125,14 +166,15 @@ Two consequences for scaling up:
   1536 tokens is ~135 MiB of per-token logprobs and entropies against a 128 MiB
   response cap, so the launcher refuses it up front. At 4 it is at 84%.
 * Intermediate scales between 32 and 1024 are untested. If you raise
-  `TRAIN_BSZ`, expect the failure above once responses get large, and treat a
-  clean 50 steps as the bar before trusting a new size.
+  `TRAIN_BSZ`, expect the failure above once responses get large, and get a
+  clean run past step 2 — where both canonical attempts died — before trusting
+  a new size.
 
 ## Troubleshooting
 
 | what you see | what it means |
 | --- | --- |
-| `429 ... per-account GPU cap reached: 8 GPUs in use` | A previous run's Cortex job still holds GPUs. This recipe needs all 8, so nothing else can be running. Run `python cortex_jobs.py` to see what is holding them and `--cancel` to release. A driver that exits cleanly releases its own; one that was SIGKILLed does not. |
+| `429 ... per-account GPU cap reached: 8 GPUs in use` | A previous run's Cortex job still holds GPUs. This recipe needs all 8, so nothing else can be running. The launcher releases what it started on any exit including Ctrl-C, so this means either a `kill -9` (no trap runs) or a teammate on the same account. `python cortex_jobs.py` shows what is holding them, `--cancel` releases. Releasing is not instant — a launch within ~a minute of a cancel can still hit the cap. |
 | `429 ... gRPC message exceeds maximum size 134217728` | The step's response exceeded Cortex's 128 MiB cap. The launcher preflights this, so you should only reach it by overriding `TRAIN_BSZ`, `N_SAMPLES` or `RESPONSE_LEN` past the printed ceiling. |
 | `packing requires left-aligned rows` | The batch reached Cortex with padding at the head of a row. The shim left-aligns before sending, so this indicates a payload path that bypassed `to_cortex_fwd_bwd_payload`. |
 | `WireError: ... invalid DSSST1 safetensors header length`, usually after `Connection lost: SSL shutdown timed out` | A large result came back truncated. Seen reproducibly from step 2 onward at `TRAIN_BSZ=1024` (~108 MiB per response); see section 6. Reduce `TRAIN_BSZ` / `RESPONSE_LEN`. |
@@ -159,8 +201,10 @@ Two consequences for scaling up:
   updates per batch cannot be reproduced here.
 * Every batch knob is env-overridable (`TRAIN_BSZ`, `MINI_BSZ`, `N_SAMPLES`,
   `MICRO_BSZ`, `PROMPT_LEN`, `RESPONSE_LEN`, `LR`, `TOTAL_EPOCHS`,
-  `EVAL_INTERVAL`); see section 6 for the canonical-scale values.
+  `EVAL_INTERVAL`), but the defaults are the sibling's and the curve in section
+  5 is what they produce; section 6 covers what happens when you raise them.
 * Two runs cannot share an account: 4 training + 4 sampling is exactly the
-  8-GPU cap.
+  8-GPU cap. The launcher releases its own job on the way out, so back-to-back
+  runs work; leave a moment between them, as the release is not instant.
 * Weight sync is NCCL between Cortex sub-jobs. The driver never touches
   weights.

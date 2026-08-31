@@ -19,6 +19,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; then
     echo "ERROR: SKYRL_HOME is unset or doesn't contain integrations/arctic_rl/."
     exit 1
@@ -137,6 +139,75 @@ PY
 CKPT_DIR="${CKPT_DIR:-${HOME}/checkpoints/${EXPERIMENT_NAME}}"
 mkdir -p "${CKPT_DIR}"
 
+# ----- Stopping this run, and getting the GPUs back -----
+# Nothing releases the GPUs on its own. SkyRL never calls the client's shutdown
+# when training ends, so finishing the last step holds all 8 exactly as firmly
+# as being killed does, and the next launch then dies on the per-account cap
+# with a 429 that never mentions your own previous run.
+#
+# The driver also ignores SIGINT and SIGTERM -- Ray installs handlers -- so
+# there is no graceful stop to ask for: Ctrl-C alone leaves it training. Hence
+# the shape below. The driver runs in the background so a signal reaches this
+# shell immediately (bash defers a trap until the running foreground command
+# returns, which for a 2-hour run means never), and stopping means SIGKILL.
+#
+# Kill the driver's descendants before the driver itself, while the tree is
+# still intact. Its dataloader workers survive a bare kill of the parent,
+# reparent to init, and sit on ~0.5 GB each; enough interrupted runs and the
+# node OOMs a later, innocent one.
+
+# An empty snapshot and a failed one both look like "" but mean opposite
+# things: with the first, every job seen later is ours; with the second, none
+# of them provably is. Only release when the baseline is real.
+if _JOBS_BEFORE="$(python "${SCRIPT_DIR}/cortex_jobs.py" --ids 2>/dev/null)"; then
+    _SNAPSHOT_OK=1
+else
+    _SNAPSHOT_OK=0
+    _JOBS_BEFORE=""
+fi
+_RELEASED=0
+
+release_our_jobs() {
+    # INT fires this trap and then EXIT fires it again; without the guard the
+    # second pass reports failing to cancel an already-cancelled job.
+    (( _RELEASED )) && return 0
+    _RELEASED=1
+    local after ours
+    if (( ! _SNAPSHOT_OK )); then
+        echo "cannot tell which Cortex jobs are this run's; check with" >&2
+        echo "  python ${SCRIPT_DIR}/cortex_jobs.py" >&2
+        return 0
+    fi
+    # Only jobs that appeared while we ran, and only ones still live: the cap
+    # is per-account, so a blanket cancel could take out a teammate's run.
+    after="$(python "${SCRIPT_DIR}/cortex_jobs.py" --ids 2>/dev/null || true)"
+    ours="$(comm -13 <(sort <<<"${_JOBS_BEFORE}") <(sort <<<"${after}") | tr '\n' ' ')"
+    [[ -z "${ours// /}" ]] && return 0
+    echo "releasing Cortex job(s) this run started: ${ours}" >&2
+    python "${SCRIPT_DIR}/cortex_jobs.py" --cancel ${ours} >&2 || true
+}
+
+_descendants() {
+    local child
+    for child in $(pgrep -P "$1" 2>/dev/null); do
+        _descendants "${child}"
+        echo "${child}"
+    done
+}
+
+stop_driver() {
+    echo "" >&2
+    echo "stopping: the driver ignores SIGTERM, so killing its process tree." >&2
+    if [[ -n "${DRIVER_PID:-}" ]]; then
+        kill -KILL $(_descendants "${DRIVER_PID}") "${DRIVER_PID}" 2>/dev/null || true
+    fi
+    release_our_jobs
+    exit 130
+}
+
+trap stop_driver INT TERM
+trap release_our_jobs EXIT
+
 # Launch via arctic_platform.integrations.skyrl so the driver-side
 # peer_access_supported shim is installed before SkyRL's Ray probe.
 python -m arctic_platform.integrations.skyrl \
@@ -182,4 +253,14 @@ python -m arctic_platform.integrations.skyrl \
     trainer.resume_mode=null \
     trainer.log_path="${CKPT_DIR}/logs" \
     trainer.ckpt_path="${CKPT_DIR}/ckpt" \
-    "$@" 2>&1 | tee "${CKPT_DIR}/${EXPERIMENT_NAME}.log"
+    "$@" > >(tee "${CKPT_DIR}/${EXPERIMENT_NAME}.log") 2>&1 &
+
+# Process substitution rather than a pipe so this is the driver's own pid and
+# not tee's -- stop_driver has to kill the process that holds the GPUs.
+DRIVER_PID=$!
+
+# `wait` is interruptible, so INT/TERM run their trap here immediately. Guard
+# it: under `set -e` the 128+signal status would otherwise exit the script
+# before the trap gets to release anything.
+wait "${DRIVER_PID}" || DRIVER_STATUS=$?
+exit "${DRIVER_STATUS:-0}"

@@ -53,10 +53,15 @@ constrains what runs correctly here:
   truncated DSSST1 payload: the chunk set is left incomplete and decoded
   anyway. Reproduced twice at `TRAIN_BSZ=1024`, which is why the GSM8K recipe
   ships a smaller default.
-* **A driver that dies without exiting cleanly keeps its GPUs.** `shutdown()`
-  cancels the job; SIGKILL skips it, and the next launch then fails the GPU
-  cap. `recipes/rl/skyrl/simple_gsm8k_cortex/cortex_jobs.py` lists and
-  releases them.
+* **A job holds its GPUs until something explicitly cancels it, and nothing
+  does.** `shutdown()` cancels, but SkyRL never calls it when training ends, so
+  a run that completes its final step keeps all 8 GPUs just as a killed one
+  does; the next launch then fails the per-account cap. The driver additionally
+  ignores SIGINT and SIGTERM, Ray having installed handlers, so there is no
+  graceful stop to trigger it either. Callers must cancel explicitly — the
+  GSM8K recipe's launcher does this on every exit path, and
+  `recipes/rl/skyrl/simple_gsm8k_cortex/cortex_jobs.py` lists and releases
+  whatever is left over.
 
 ## What's provided
 
