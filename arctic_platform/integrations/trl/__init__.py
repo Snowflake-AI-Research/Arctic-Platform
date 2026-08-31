@@ -21,9 +21,9 @@ from arctic_platform.integrations.trl.client import ArcticOptimizer
 from arctic_platform.integrations.trl.client import ArcticTrainingClient
 
 if TYPE_CHECKING:
-    from arctic_platform.integrations.trl.loss import weighted_logprob_sum
     from arctic_platform.integrations.trl.rollout import ArcticRolloutWorker
     from arctic_platform.integrations.trl.weights import ArcticWeightTransfer
+    from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
 
 __all__ = [
     "ArcticOptimizer",
@@ -45,7 +45,7 @@ def __getattr__(name: str):
 
         return ArcticWeightTransfer
     if name == "weighted_logprob_sum":
-        from arctic_platform.integrations.trl.loss import weighted_logprob_sum
+        from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
 
         return weighted_logprob_sum
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
