@@ -148,12 +148,15 @@ Two consequences for scaling up:
   log-probs to build a KL term from. Asking for them raises rather than
   silently substituting zeros, which would make the KL a function of the
   current policy alone.
-* **PPO clipping does not engage on this path.** π_old is re-derived from the
-  live forward on every `fwd_bwd` rather than snapshotted, so the importance
-  ratio is exactly 1 and `eps_clip` never binds — which is why `approx_kl`
-  reads 0.0. With `MINI_BSZ < TRAIN_BSZ` the recipe is therefore running
-  unclipped updates, not clipped GRPO. It trains, but it is not the same
-  objective, and that matters if you are comparing against published numbers.
+* **`approx_kl` reads exactly 0.0, and clipping is inert by construction.**
+  Cortex re-derives π_old from the live forward rather than taking a
+  rollout-time snapshot. On this path that is exact rather than approximate:
+  SkyRL's Arctic trainer issues one `fwd_bwd` and one optimizer step per
+  collected batch, and `MINI_BSZ` only sets the server's gradient-accumulation
+  chunk, so the policy cannot move within a step and π_old ≡ π_new holds. The
+  ratio is 1, `eps_clip` never binds, and this is single-update on-policy GRPO.
+  The consequence to know is that a recipe relying on clipping to take several
+  updates per batch cannot be reproduced here.
 * Every batch knob is env-overridable (`TRAIN_BSZ`, `MINI_BSZ`, `N_SAMPLES`,
   `MICRO_BSZ`, `PROMPT_LEN`, `RESPONSE_LEN`, `LR`, `TOTAL_EPOCHS`,
   `EVAL_INTERVAL`); see section 6 for the canonical-scale values.

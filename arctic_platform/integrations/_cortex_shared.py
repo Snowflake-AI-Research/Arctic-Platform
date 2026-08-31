@@ -47,8 +47,11 @@ def zero_logprobs_like(batch: dict) -> torch.Tensor:
     reference-model request is refused in ``_CortexClientShim.fwd_no_grad``
     instead, where zeros would quietly reduce the KL to a function of π_new.
 
-    Re-deriving π_old also makes the ratio exactly 1, so PPO clipping never
-    engages: a multi-minibatch step runs unclipped updates, not clipped GRPO.
+    Re-deriving π_old also makes the ratio exactly 1, so ``eps_clip`` never
+    binds. That is sound as long as the caller takes one optimizer step per
+    collected batch, which is what SkyRL's Arctic trainer does; a caller that
+    stepped several times per batch would be running uncorrected off-policy
+    updates.
     """
     import torch
 

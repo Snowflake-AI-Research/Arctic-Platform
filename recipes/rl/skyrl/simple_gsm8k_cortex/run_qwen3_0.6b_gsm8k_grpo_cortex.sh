@@ -43,11 +43,14 @@ TP_SIZE="${TP_SIZE:-1}"              # driver sees Cortex sampling as TP=1
 # 4 training + 4 sampling sits exactly at the 8-GPU per-account Cortex cap.
 NUM_ENGINES="${NUM_ENGINES:-4}"
 
-# Defaults are the configuration this recipe was actually validated on, so the
-# reference curve in README.md is what a bare run reproduces. SkyRL's canonical
-# GSM8K scale (train_batch_size=1024, policy_mini_batch_size=256) is a
-# documented override rather than the default: it costs ~30x the GPU-time per
-# step and sits at 84% of Cortex's response cap. See README.md.
+# Hyperparameters are the on-prem sibling's, verbatim
+# (../simple_gsm8k/run_qwen3_0.6b_gsm8k_grpo_arl.sh), so the two recipes differ
+# only in where the GPUs live. MICRO_BSZ is the exception and has to: SkyRL
+# defaults it to 1, which cannot satisfy DeepSpeed's
+# micro x accum x n_gpus == train_batch at NGPU_PER_NODE=4.
+#
+# SkyRL's larger published GSM8K scale (train_batch_size=1024) is not the
+# default here and does not currently work; see README.md section 6.
 TRAIN_BSZ="${TRAIN_BSZ:-32}"
 MINI_BSZ="${MINI_BSZ:-4}"
 N_SAMPLES="${N_SAMPLES:-4}"
@@ -55,8 +58,8 @@ MICRO_BSZ="${MICRO_BSZ:-4}"
 PROMPT_LEN="${PROMPT_LEN:-512}"
 RESPONSE_LEN="${RESPONSE_LEN:-1024}"
 LR="${LR:-1e-6}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-20}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-5}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
 
 # Cortex returns a logprob and an entropy per token (~18 B/token) against a
 # 128 MiB response cap, and reports an overrun only after provisioning 8 GPUs
@@ -80,15 +83,6 @@ if (( _EST > _CAP_BYTES )); then
         echo "Fix: TRAIN_BSZ=${_MAX_SEQS} with N_SAMPLES=1, or shorten RESPONSE_LEN." >&2
     fi
     exit 1
-fi
-
-# pi_old is re-derived per fwd_bwd, never snapshotted, so the ratio is 1 and
-# eps_clip cannot bind. Silent, and it changes the objective -- so say it.
-if (( MINI_BSZ < TRAIN_BSZ )); then
-    echo "NOTE: ${TRAIN_BSZ}/${MINI_BSZ} = $(( TRAIN_BSZ / MINI_BSZ )) minibatches per step, and PPO" >&2
-    echo "      clipping does not engage on Cortex (pi_old is re-derived, so the ratio is 1)." >&2
-    echo "      These are unclipped updates, not clipped GRPO. approx_kl=0.0 is expected." >&2
-    echo "      Set MINI_BSZ=${TRAIN_BSZ} for one update per step if that matters." >&2
 fi
 
 # SkyRL's validate_generator_cfg asserts num_engines == len(remote_urls). The
