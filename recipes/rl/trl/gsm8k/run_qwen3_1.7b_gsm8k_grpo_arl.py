@@ -86,11 +86,11 @@ def build_client(model: str, host: str, port: int, *, max_seq_len: int, response
                  startup_timeout: float, ckpt_dir: str, training_gpus: int, sampling_gpus: int,
                  tensor_parallel_size: int, comm_protocol: str = "http", seed: int = 42,
                  colocate: bool = True, zorro_train_enable: bool = False):
-    from arctic_platform.client.client import SyncArcticRLClient
-    from arctic_platform.client.config import ArcticRLClientConfig
-    from arctic_platform.client.config import OnPremConfig
-    from arctic_platform.client.config import SamplingConfig
-    from arctic_platform.client.config import TrainingConfig
+    from arctic_platform.client import ArcticClientConfig
+    from arctic_platform.client import ArcticRLClient
+    from arctic_platform.client import OnPremConfig
+    from arctic_platform.client import SamplingConfig
+    from arctic_platform.client import TrainingConfig
 
     ds_config = {
         # DeepSpeed asserts train_batch_size == micro_bsz * grad_accum * world_size, and world_size is the
@@ -131,7 +131,7 @@ def build_client(model: str, host: str, port: int, *, max_seq_len: int, response
         use_unpad=(os.environ.get("ARCTIC_ATTN_IMPL", "flash_attention_2") == "flash_attention_2"),
         use_autocast=False,
     )
-    cfg = ArcticRLClientConfig(
+    cfg = ArcticClientConfig(
         model_name=model,
         seed=seed,
         max_seq_len=max_seq_len,
@@ -159,7 +159,7 @@ def build_client(model: str, host: str, port: int, *, max_seq_len: int, response
             startup_timeout=startup_timeout,
         ),
     )
-    return SyncArcticRLClient(cfg)
+    return ArcticRLClient(cfg)
 
 
 # --------------------------------------------------------------------------------------------------------------- #
@@ -274,7 +274,7 @@ def main() -> None:
     # in one fused fwd_bwd (perf + parity with verl/SkyRL).
     ap.add_argument("--loss-placement", choices=("client", "server"),
                     default=os.environ.get("ARCTIC_TRL_LOSS_PLACEMENT", "client"))
-    # Single knob for variance control: seeds the Arctic sampler (ArcticRLClientConfig) AND the trainer
+    # Single knob for variance control: seeds the Arctic sampler (ArcticClientConfig) AND the trainer
     # (AsyncGRPOConfig) so matched-seed baseline/arctic runs are comparable.
     ap.add_argument("--seed", type=int, default=int(os.environ.get("SEED", "42")))
     args = ap.parse_args()
