@@ -156,9 +156,9 @@ WireError: not a valid DSSST1 safetensors payload: invalid DSSST1 safetensors he
 Both attempts failed at exactly step 2 with that signature. Step 1's response
 is the same ~108 MiB, so this is not the size of a single transfer but the
 second large transfer on a reused connection: the stream drops, the chunk set
-is left incomplete, and the decoder is handed a truncated payload. Tracked
-separately — it is in the shared transport's chunk handling, not in this
-recipe.
+is left incomplete, and the decoder is handed a truncated payload. Tracked as
+[#99](https://github.com/Snowflake-AI-Research/Arctic-Platform/issues/99) — it
+is in the shared transport's chunk handling, not in this recipe.
 
 Two consequences for scaling up:
 

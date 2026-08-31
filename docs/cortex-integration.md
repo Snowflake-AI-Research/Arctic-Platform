@@ -52,7 +52,8 @@ constrains what runs correctly here:
   `Connection lost: SSL shutdown timed out`, surfacing as a `WireError` about a
   truncated DSSST1 payload: the chunk set is left incomplete and decoded
   anyway. Reproduced twice at `TRAIN_BSZ=1024`, which is why the GSM8K recipe
-  ships a smaller default.
+  ships a smaller default. Tracked as
+  [#99](https://github.com/Snowflake-AI-Research/Arctic-Platform/issues/99).
 * **A job holds its GPUs until something explicitly cancels it, and nothing
   does.** `shutdown()` cancels, but SkyRL never calls it when training ends, so
   a run that completes its final step keeps all 8 GPUs just as a killed one
