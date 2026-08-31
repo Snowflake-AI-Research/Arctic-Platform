@@ -261,7 +261,7 @@ def generate_arctic_greedy(
     chunk: int = 32,
     chat_template_kwargs: dict | None = None,
 ) -> list[str]:
-    """C2/C3: ``SyncArcticRLClient.generate`` with greedy sampling, no logprobs."""
+    """C2/C3: ``ArcticRLClient.generate`` with greedy sampling, no logprobs."""
     if not rows:
         return []
     out: list[str] = []
