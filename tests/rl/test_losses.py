@@ -320,3 +320,35 @@ class TestGrpoLoss(TestCasePlus):
         context = self._context(batch_size, seq_len, input_ids=torch.randint(0, vocab, (batch_size, seq_len)))
         loss, _ = grpo_loss(outputs, context, {}, "cpu")
         self.assertTrue(torch.isfinite(loss))
+
+
+class TestWeightedLogprobSum(TestCasePlus):
+    def test_sum_of_weighted_logprobs(self):
+        from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
+
+        logprobs = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        weights = torch.tensor([[1.0, 0.5, 0.0], [0.0, 1.0, 2.0]])
+        loss, metrics = weighted_logprob_sum(
+            {"logprobs": logprobs},
+            {"logprob_weights_shifted": weights},
+            {},
+            {},
+            "cpu",
+        )
+        self.assertAlmostEqual(loss.item(), (1.0 + 1.0 + 0.0 + 0.0 + 5.0 + 12.0), places=5)
+        self.assertAlmostEqual(metrics["loss"].item(), loss.item(), places=5)
+
+    def test_loss_mask_zeros_weights(self):
+        from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
+
+        logprobs = torch.ones(1, 3)
+        weights = torch.ones(1, 3)
+        mask = torch.tensor([[1.0, 0.0, 1.0]])
+        loss, _ = weighted_logprob_sum(
+            {"logprobs": logprobs},
+            {"logprob_weights_shifted": weights, "loss_mask": mask},
+            {},
+            {},
+            "cpu",
+        )
+        self.assertAlmostEqual(loss.item(), 2.0, places=5)
