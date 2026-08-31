@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Rollout via ``SyncArcticRLClient.generate`` (single-turn, sync rewards)."""
+"""Rollout via ``ArcticRLClient.generate`` (single-turn, sync rewards)."""
 
 from __future__ import annotations
 
