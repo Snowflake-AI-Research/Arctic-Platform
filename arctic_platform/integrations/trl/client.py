@@ -24,6 +24,9 @@ from typing import Any
 import torch
 from trl.experimental.api import ForwardBackwardOutput
 
+from arctic_platform.integrations.trl.loss import _CLIENT_LOSS_ENCODINGS
+from arctic_platform.integrations.trl.loss import _surrogate_payload
+
 
 def _meta_dict(
     *,
@@ -67,6 +70,11 @@ class ArcticTrainingClient:
             (perf + parity with verl/SkyRL). When ``False`` (default), keep the
             two-pass client-side surrogate path.
         server_loss_fn: Server GRPO loss name/dotted-path used when ``server_side_loss``.
+        client_loss_encoding: How the two-pass path expresses ``dL/dlogprobs`` to the
+            server. ``"weighted_logprob_sum"`` (default) names this package's own
+            surrogate, which the server must have registered. ``"grpo"`` encodes the
+            same quantity in the stock GRPO loss instead, so the path runs on a server
+            that ships nothing from this package -- see :func:`_surrogate_payload`.
     """
 
     def __init__(
@@ -83,6 +91,7 @@ class ArcticTrainingClient:
         logits_compute_in_fp32: bool = False,
         server_side_loss: bool = False,
         server_loss_fn: str = "arctic_platform.integrations.trl.loss.trl_grpo",
+        client_loss_encoding: str = "weighted_logprob_sum",
         zorro_train_enable: bool = False,
         response_len: int | None = None,
         zorro_load_balancer: bool = False,
@@ -99,6 +108,11 @@ class ArcticTrainingClient:
         self.logits_compute_in_fp32 = logits_compute_in_fp32
         self.server_side_loss = server_side_loss
         self.server_loss_fn = server_loss_fn
+        if client_loss_encoding not in _CLIENT_LOSS_ENCODINGS:
+            raise ValueError(
+                f"client_loss_encoding must be one of {sorted(_CLIENT_LOSS_ENCODINGS)}, got {client_loss_encoding!r}"
+            )
+        self.client_loss_encoding = client_loss_encoding
         self.zorro_train_enable = zorro_train_enable
         # Padded response width (== configured max_completion_length == server ds_worker_config.response_len).
         # Zorro emits verl-style structured [B, max_prompt_len + response_len] batches, so this must be set.
@@ -188,14 +202,20 @@ class ArcticTrainingClient:
         def send_backward(grad_loss: torch.Tensor) -> None:
             # Scale, unshift to [1, T], unpack to [B, S].
             weights = _unpack_to_padded(_unshift_from_trl(grad_log_probs * grad_loss), seq_lens)
+            back_batch, back_loss_fn, loss_config = _surrogate_payload(
+                self.client_loss_encoding, batch, weights, out["logprobs"], self.loss_fn
+            )
+            processing = {
+                "post": ["apply_temperature", "compute_entropy_and_logprobs"],
+                "loss_fn": back_loss_fn,
+            }
+            if loss_config:
+                processing["config"] = loss_config
             self.client.fwd_bwd(
                 {
-                    "batch": {**batch, "logprob_weights_shifted": weights},
+                    "batch": back_batch,
                     "meta": self._meta(calculate_entropy=False),
-                    "processing": {
-                        "post": ["apply_temperature", "compute_entropy_and_logprobs"],
-                        "loss_fn": self.loss_fn,
-                    },
+                    "processing": processing,
                 }
             )
 
@@ -304,7 +324,9 @@ class ArcticTrainingClient:
         # (matches verl's response-only tensors left-padded into the full sequence).
         old_lp = _place_response_window(ing["old_log_probs"], layout, self.response_len, torch.float32)
         adv = _place_response_window(ing["advantages"], layout, self.response_len, torch.float32)
-        mask = _place_response_window(ing["completion_mask"].to(torch.float32), layout, self.response_len, torch.float32)
+        mask = _place_response_window(
+            ing["completion_mask"].to(torch.float32), layout, self.response_len, torch.float32
+        )
 
         tokens_per_rank = ing["tokens_per_rank"]
         if torch.is_tensor(tokens_per_rank):
@@ -497,9 +519,9 @@ def _assert_uniform_prompt_groups(prompts_2d: torch.Tensor, rollout_n: int) -> N
         raise ValueError(
             f"zorro_load_balancer: forward batch has ragged prompt groups (sizes={counts}); every group must have "
             f"exactly rollout_n={rollout_n} rollouts so reorg_global_batch can tile whole groups across DP workers. "
-            f"This usually means the async rollout buffer dropped stale samples mid-group. Fixes: raise max_staleness "
-            f"so groups aren't split, keep per_device_bsz a multiple of rollout_n*training_gpus, or disable "
-            f"zorro_load_balancer."
+            "This usually means the async rollout buffer dropped stale samples mid-group. Fixes: raise max_staleness "
+            "so groups aren't split, keep per_device_bsz a multiple of rollout_n*training_gpus, or disable "
+            "zorro_load_balancer."
         )
 
 
@@ -546,7 +568,7 @@ def _zorro_structured_batch(
     if max_resp > response_len:
         raise ValueError(
             f"zorro: a completion has {max_resp} tokens > response_len={response_len}; the fixed-width response "
-            f"window cannot hold it. Set response_len (max_completion_length) >= the longest completion."
+            "window cannot hold it. Set response_len (max_completion_length) >= the longest completion."
         )
 
     padded_ids = torch.full((b, s), pad_token_id, dtype=input_ids.dtype, device=device)
@@ -574,9 +596,7 @@ def _zorro_structured_batch(
     return batch, layout
 
 
-def _place_response_window(
-    shifted: torch.Tensor, layout: dict, response_len: int, dtype: torch.dtype
-) -> torch.Tensor:
+def _place_response_window(shifted: torch.Tensor, layout: dict, response_len: int, dtype: torch.dtype) -> torch.Tensor:
     """TRL-shifted ``[1, T-1]`` -> response window of ``[B, max_prompt_len + response_len]`` (zeros elsewhere)."""
     b = layout["B"]
     mp = layout["max_prompt_len"]

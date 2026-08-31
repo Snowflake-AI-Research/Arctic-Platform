@@ -17,10 +17,9 @@
 
 from typing import TYPE_CHECKING
 
-from arctic_platform.integrations.trl.client import ArcticOptimizer
-from arctic_platform.integrations.trl.client import ArcticTrainingClient
-
 if TYPE_CHECKING:
+    from arctic_platform.integrations.trl.client import ArcticOptimizer
+    from arctic_platform.integrations.trl.client import ArcticTrainingClient
     from arctic_platform.integrations.trl.rollout import ArcticRolloutWorker
     from arctic_platform.integrations.trl.weights import ArcticWeightTransfer
     from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
@@ -35,7 +34,13 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    # Lazy: rollout/weights need async_grpo; loss needs the server.
+    # Lazy: client needs trl, rollout/weights need async_grpo; loss needs the server.
+    # Importing client eagerly made the whole package -- loss included -- unimportable
+    # without trl, which silently skipped the CPU loss tests.
+    if name in ("ArcticOptimizer", "ArcticTrainingClient"):
+        from arctic_platform.integrations.trl import client
+
+        return getattr(client, name)
     if name == "ArcticRolloutWorker":
         from arctic_platform.integrations.trl.rollout import ArcticRolloutWorker
 
