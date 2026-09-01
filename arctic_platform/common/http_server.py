@@ -80,7 +80,11 @@ def _replica_pool_cls():
     """Lazy import — training-only servers do not need arctic_inference / vLLM."""
     require_any_dep_group("rl")
     from arctic_inference.server.replica_pool import ReplicaPool
+    from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import (
+        install_optional_frozen_weight_sync_patch,
+    )
 
+    install_optional_frozen_weight_sync_patch()
     return ReplicaPool
 
 
@@ -460,10 +464,10 @@ async def forward(
 
 @app.post("/step")
 async def step(job_id: int, request: StepRequest = Body(default=StepRequest())):
-    # `learning_rate` is accepted for Cortex parity; on-prem uses the DeepSpeed
-    # scheduler's LR, so it is not applied here.
     _verify_job(job_id, "training")
-    results = await asyncio.gather(*[w.step.remote() for w in app.state.training_workers])
+    results = await asyncio.gather(
+        *[w.step.remote(learning_rate=request.learning_rate) for w in app.state.training_workers]
+    )
     merged = dict(
         job_id=job_id,
         metrics=merge_dict_shards([r["metrics"] for r in results]),

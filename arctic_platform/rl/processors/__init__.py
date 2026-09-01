@@ -72,6 +72,9 @@ from .packing import _align
 from .packing import pack_sequences
 from .packing import pad_packed_for_model
 from .packing import unpack_sequences
+from .packing import derive_varlen_model_kwargs
+from .packing import model_reads_varlen_kwargs
+from .packing import packing_boundaries_from_attention_mask
 
 # Pipeline registry and runner
 from .pipeline import LOSS_FNS
@@ -122,6 +125,9 @@ __all__ = [
     "pack_sequences",
     "unpack_sequences",
     "pad_packed_for_model",
+    "derive_varlen_model_kwargs",
+    "model_reads_varlen_kwargs",
+    "packing_boundaries_from_attention_mask",
     # microbatch
     "DEFAULT_MAX_TOKENS_PER_MB",
     "MicroBatchSpec",

@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from arctic_platform.client import CortexConfig
@@ -207,7 +209,33 @@ def test_partial_reconnect_ids_rejected():
         )
 
 
-def test_local_launch_requires_disjoint_student_and_teacher_devices():
+def test_local_launch_allows_overlapping_devices_with_disjoint_hostfiles(tmp_path: Path):
+    student_hf = tmp_path / "student.hosts"
+    teacher_hf = tmp_path / "teacher.hosts"
+    student_hf.write_text("10.0.0.1 slots=8\n10.0.0.2 slots=8\n", encoding="utf-8")
+    teacher_hf.write_text("10.0.0.3 slots=8\n", encoding="utf-8")
+    cfg = ArcticOPDClientConfig(
+        student_model="student",
+        teacher_model="teacher",
+        training_gpus=8,
+        sampling_gpus=8,
+        teacher_sampling_gpus=8,
+        teacher_server_cuda_visible_devices="",
+        student_ray_hostfile=str(student_hf),
+        teacher_ray_hostfile=str(teacher_hf),
+        backend=OnPremConfig(
+            launch_local_server=True,
+            server_cuda_visible_devices="0,1,2,3,4,5,6,7",
+        ),
+    )
+    student_env = cfg.student_transport_config().backend.server_extra_env
+    teacher_env = cfg.teacher_transport_config().backend.server_extra_env
+    assert student_env["ARL_RAY_HOSTFILE"] == str(student_hf)
+    assert teacher_env["ARL_RAY_HOSTFILE"] == str(teacher_hf)
+    assert cfg.teacher_transport_config().backend.server_cuda_visible_devices == ""
+
+
+def test_local_launch_overlapping_devices_still_rejected_without_hostfiles():
     with pytest.raises(ValueError, match="must be disjoint"):
         ArcticOPDClientConfig(
             student_model="student",

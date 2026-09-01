@@ -70,7 +70,11 @@ def _replica_pool_cls():
     """Lazy import — training-only servers do not need arctic_inference / vLLM."""
     require_any_dep_group("rl")
     from arctic_inference.server.replica_pool import ReplicaPool
+    from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import (
+        install_optional_frozen_weight_sync_patch,
+    )
 
+    install_optional_frozen_weight_sync_patch()
     return ReplicaPool
 
 
@@ -742,10 +746,9 @@ class ArcticRLRayServer:
         return merged
 
     async def step(self, job_id: int, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        # `body` is unused; accepted so the client can call with (job_id, body).
         self._verify_job(job_id, "training")
-        # results = await asyncio.gather(*[w.step.remote() for w in self.training_workers])
-        refs = [w.step.remote() for w in self.training_workers]
+        learning_rate = (body or {}).get("learning_rate")
+        refs = [w.step.remote(learning_rate=learning_rate) for w in self.training_workers]
         results = ray.get(refs)
         merged = dict(
             job_id=job_id,

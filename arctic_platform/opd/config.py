@@ -32,6 +32,21 @@ from arctic_platform.client.config import SamplingConfig
 from arctic_platform.client.config import TrainingConfig
 
 
+def _cuda_ids(spec: str) -> set[str]:
+    return {part.strip() for part in spec.split(",") if part.strip()}
+
+
+def _hostfile_hosts(path: str | None) -> set[str]:
+    if not path:
+        return set()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return set()
+    return {ln.split()[0] for ln in lines if ln.strip() and not ln.strip().startswith("#")}
+
+
 def _local_cluster_env(http_port: int) -> dict[str, str]:
     """Disjoint Ray / DeepSpeed ports derived from the HTTP listen port.
 
@@ -82,6 +97,8 @@ class ArcticOPDClientConfig(BaseModel):
     # second parent job because generate has no sub-job selector.
     teacher_port: int | None = None
     teacher_server_cuda_visible_devices: str | None = None
+    student_ray_hostfile: str | None = None
+    teacher_ray_hostfile: str | None = None
 
     job_ready_timeout: float = 1800.0
     request_timeout: float = 1800.0
@@ -105,7 +122,10 @@ class ArcticOPDClientConfig(BaseModel):
                 raise ValueError(
                     "local OPD launch requires server_cuda_visible_devices and teacher_server_cuda_visible_devices"
                 )
-            if set(student_devices.split(",")) & set(teacher_devices.split(",")):
+            student_hosts = _hostfile_hosts(self.student_ray_hostfile)
+            teacher_hosts = _hostfile_hosts(self.teacher_ray_hostfile)
+            isolated_clusters = bool(student_hosts and teacher_hosts and student_hosts.isdisjoint(teacher_hosts))
+            if not isolated_clusters and _cuda_ids(student_devices) & _cuda_ids(teacher_devices):
                 raise ValueError("student and teacher server CUDA device lists must be disjoint")
         return self
 
@@ -122,14 +142,10 @@ class ArcticOPDClientConfig(BaseModel):
         """Internal adapter for the shared transport; not an ArcticRLClient."""
         backend = self.backend
         if isinstance(backend, OnPremConfig) and backend.launch_local_server:
-            backend = backend.model_copy(
-                update={
-                    "server_extra_env": {
-                        **_local_cluster_env(backend.port),
-                        **backend.server_extra_env,
-                    }
-                }
-            )
+            extra_env = {**_local_cluster_env(backend.port), **backend.server_extra_env}
+            if self.student_ray_hostfile:
+                extra_env["ARL_RAY_HOSTFILE"] = self.student_ray_hostfile
+            backend = backend.model_copy(update={"server_extra_env": extra_env})
         return ArcticRLClientConfig(
             model_name=self.student_model,
             training_gpus=self.training_gpus,
@@ -151,6 +167,8 @@ class ArcticOPDClientConfig(BaseModel):
             extra_env = dict(backend.server_extra_env)
             if backend.launch_local_server:
                 extra_env = {**_local_cluster_env(teacher_port), **backend.server_extra_env}
+            if self.teacher_ray_hostfile:
+                extra_env["ARL_RAY_HOSTFILE"] = self.teacher_ray_hostfile
             backend = backend.model_copy(
                 update={
                     "port": teacher_port,

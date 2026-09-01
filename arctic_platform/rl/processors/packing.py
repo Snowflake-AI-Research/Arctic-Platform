@@ -29,6 +29,81 @@ def _align(x: int, n: int) -> int:
     return ((x + n - 1) // n) * n
 
 
+def model_reads_varlen_kwargs(model) -> bool:
+    """Whether this model's attention needs explicit packing boundaries in kwargs.
+
+    Hybrid linear-attention stacks (Qwen3.5, Qwen3-Next) read ``cu_seq_lens_q``
+    and ``seq_idx`` out of ``**kwargs``. Unlike flash-attention they have no
+    ``position_ids`` fallback, and both keys are read with ``.get()`` — missing
+    them silently treats a packed ``[1, T]`` batch as one sequence.
+    """
+    config = getattr(model, "config", None)
+    for cfg in (config, getattr(config, "text_config", None)):
+        if cfg is None:
+            continue
+        layer_types = getattr(cfg, "layer_types", None) or ()
+        if any("linear_attention" in str(layer_type) for layer_type in layer_types):
+            return True
+    return False
+
+
+def derive_varlen_model_kwargs(packed_mb: dict[str, Any]) -> dict[str, Any]:
+    """Derive varlen attention kwargs from a packed microbatch's ``cu_seqlens``.
+
+    Returns an empty dict when the boundaries cannot be trusted (including
+    Ulysses SP, where global ``cu_seqlens`` would mislabel a local shard), so
+    callers can merge the result unconditionally.
+    """
+    cu_seqlens = packed_mb.get("cu_seqlens")
+    input_ids = packed_mb.get("input_ids")
+    if not (torch.is_tensor(cu_seqlens) and cu_seqlens.numel() >= 2):
+        return {}
+    if not (torch.is_tensor(input_ids) and input_ids.ndim == 2 and input_ids.shape[0] == 1):
+        return {}
+
+    device = input_ids.device
+    total_tokens = int(input_ids.shape[1])
+    cu = cu_seqlens.to(device=device, dtype=torch.int32)
+    if int(cu[-1].item()) > total_tokens:
+        # Ulysses SP pairs global sequence boundaries with a local shard.
+        return {}
+
+    lens = (cu[1:] - cu[:-1]).to(torch.long)
+    max_seqlen = int(lens.max().item()) if lens.numel() else 0
+    seq_idx = torch.repeat_interleave(torch.arange(lens.numel(), device=device, dtype=torch.int32), lens)
+    if seq_idx.numel() < total_tokens:
+        # Right-padded tail (page alignment): own segment id so causal conv
+        # cannot mix padding with real tokens.
+        seq_idx = torch.cat(
+            [
+                seq_idx,
+                torch.full(
+                    (total_tokens - seq_idx.numel(),),
+                    lens.numel(),
+                    device=device,
+                    dtype=torch.int32,
+                ),
+            ]
+        )
+    return {
+        "cu_seq_lens_q": cu,
+        "cu_seq_lens_k": cu,
+        "max_length_q": max_seqlen,
+        "max_length_k": max_seqlen,
+        "seq_idx": seq_idx.unsqueeze(0),
+    }
+
+
+def packing_boundaries_from_attention_mask(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``cu_seqlens`` and reset-per-sequence ``position_ids`` from a padded ``[B, S]`` mask."""
+    lens = attention_mask.long().sum(dim=1)
+    cu_seqlens = F.pad(torch.cumsum(lens.to(torch.int32), dim=0), (1, 0), value=0)
+    position_ids = torch.cat(
+        [torch.arange(int(n), device=attention_mask.device) for n in lens.tolist()]
+    ).unsqueeze(0)
+    return cu_seqlens, position_ids
+
+
 def pack_sequences(data: dict[str, Any]) -> dict[str, Any]:
     """Pack padded [B, S] tensor dict into [1, T] with position_ids for flash-attn.
 
@@ -68,7 +143,6 @@ def pad_packed_for_model(packed: dict[str, Any]) -> tuple[dict[str, Any], int]:
     T = int(cu_seqlens[-1].item())
     padded_T = _align(T, N_TOKENS_PER_PAGE)
     pad_length = padded_T - T
-    max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
     model_kwargs = {}
     for key in ("input_ids", "position_ids"):
         value = packed[key]
@@ -76,12 +150,9 @@ def pad_packed_for_model(packed: dict[str, Any]) -> tuple[dict[str, Any], int]:
             pad_spec = [0, 0] * (value.ndim - 2) + [0, pad_length]
             value = F.pad(value, list(reversed(pad_spec)), value=0)
         model_kwargs[key] = value
-    model_kwargs["cu_seq_lens_q"] = cu_seqlens
-    model_kwargs["cu_seq_lens_k"] = cu_seqlens
-    model_kwargs["max_length_q"] = max_seqlen
-    model_kwargs["max_length_k"] = max_seqlen
     model_kwargs["attention_mask"] = dict(full_attention=None, sliding_attention=None)
     model_kwargs["use_cache"] = False
+    model_kwargs.update(derive_varlen_model_kwargs({**packed, "input_ids": model_kwargs["input_ids"]}))
     return model_kwargs, pad_length
 
 

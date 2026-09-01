@@ -150,6 +150,10 @@ def build_model_config(
     from arctic_inference.server.config import ModelConfig
 
     cfg = dict(vllm_config or {})
+    cfg.setdefault(
+        "worker_extension_cls",
+        "arctic_platform.common.weight_sync_extension.TextOnlyWeightSyncExtension",
+    )
     cfg["model"] = model_name
     known_fields = set(ModelConfig.model_fields.keys())
     cfg.update(parse_arctic_inference_rollout(arctic_inference_config, known_fields))
