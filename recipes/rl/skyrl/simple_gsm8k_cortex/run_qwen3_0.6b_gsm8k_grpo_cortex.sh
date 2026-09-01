@@ -8,14 +8,20 @@
 #   3. ARCTIC_CORTEX_* env vars set (see README.md step 2).
 #   4. Data: `python download_data.py` -> $DATA_DIR/{train,validation}.parquet.
 #
-# Cortex-specific overrides (Hydra):
+# Every learning hyperparameter below is the on-prem sibling recipe's
+# (../simple_gsm8k) unchanged. The only Hydra flags that differ are plumbing for
+# a remote backend, and none of them touch the optimization:
+#
 #   trainer.arctic_rl.attn_implementation=sdpa
 #     Cortex image ships without FA2.
 #   generator.inference_engine.remote_urls=[http://cortex-managed, ...]
-#   generator.sampling_params.logprobs=null
 #     Required by SkyRL's validate_generator_cfg under run_engines_locally=false,
 #     which asserts one URL per engine. The URLs are placeholders -- generation
 #     is served by the shim, which never dials them.
+#   generator.sampling_params.logprobs=null
+#     Sampling goes through the shim, which has no vLLM logprob channel to read.
+#     Costs nothing: the Arctic generator hardcodes rollout_logprobs=None either
+#     way, so SkyRL's default of 1 would be discarded unused.
 
 set -euo pipefail
 
