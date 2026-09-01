@@ -21,8 +21,6 @@ cannot silently diverge from the base; op-registry coverage and log_probs stay o
 the RL clients, and SFT's loss-fn defaulting is asserted in tests/sft.
 """
 
-# testing CI
-
 from __future__ import annotations
 
 import asyncio
