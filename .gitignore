@@ -170,7 +170,3 @@ recipes/**/outputs/
 # Client recipe connection configs — these hold a Snowflake PAT. The checked-in
 # config.json.template is not matched (it does not end in .json).
 recipes/*.json
-
-# Clone-local PR / probe write-ups — never commit
-PR_DESCRIPTION.md
-PROBE_*.md
