@@ -24,21 +24,21 @@ import torch
 
 pytest.importorskip("trl.experimental.api")
 
-from arctic_platform.integrations.trl.client import (  # noqa: E402
-    ArcticTrainingClient,
-    _place_response_window,
-    _response_window_to_shifted,
-    _zorro_layout,
-    _zorro_structured_batch,
-)
+from arctic_platform.integrations.trl.client import ArcticTrainingClient  # noqa: E402
+from arctic_platform.integrations.trl.client import _place_response_window  # noqa: E402
+from arctic_platform.integrations.trl.client import _response_window_to_shifted  # noqa: E402
+from arctic_platform.integrations.trl.client import _zorro_layout  # noqa: E402
+from arctic_platform.integrations.trl.client import _zorro_structured_batch  # noqa: E402
 
 # Oracle: the server pipeline's REAL response-window <-> 1D conversions. The whole point of the
 # round-trip test is that the adapter helpers are the exact inverse of these. Fall back to verbatim
 # copies if pipeline.py isn't CPU-importable (it pulls the training stack transitively).
 try:
-    from arctic_platform.rl.processors.pipeline import (  # noqa: E402
-        compute_packing_info_for_batch as _packinfo,
+    from arctic_platform.rl.processors.pipeline import compute_packing_info_for_batch as _packinfo  # noqa: E402
+    from arctic_platform.rl.processors.pipeline import (
         padded_tensor_2d_full_to_unpadded_tensor_1d_response as _full_to_1d,
+    )
+    from arctic_platform.rl.processors.pipeline import (
         unpadded_tensor_1d_response_to_padded_tensor_2d_full as _1d_to_full,
     )
 except Exception:  # pragma: no cover - exercised only when the training stack is unavailable
@@ -49,9 +49,7 @@ except Exception:  # pragma: no cover - exercised only when the training stack i
         return tensor_2d_response[attn_response].unsqueeze(0)
 
     def _1d_to_full(tensor_1d, attention_mask_2d_bool, max_prompt_len):
-        tensor_2d = torch.zeros(
-            attention_mask_2d_bool.shape, dtype=tensor_1d.dtype, device=tensor_1d.device
-        )
+        tensor_2d = torch.zeros(attention_mask_2d_bool.shape, dtype=tensor_1d.dtype, device=tensor_1d.device)
         tensor_2d_response = tensor_2d[:, max_prompt_len:]
         attn_response = attention_mask_2d_bool[:, max_prompt_len:]
         tensor_2d_response[attn_response] = tensor_1d.view(-1)
@@ -90,9 +88,7 @@ def test_boundary_recovery():
 
 
 def test_structured_batch_layout_and_shared_prefix():
-    batch, layout = _zorro_structured_batch(
-        PACKED_INPUT_IDS, PACKED_COMPLETION_MASK, SEQ_LENS, PAD, RESPONSE_LEN
-    )
+    batch, layout = _zorro_structured_batch(PACKED_INPUT_IDS, PACKED_COMPLETION_MASK, SEQ_LENS, PAD, RESPONSE_LEN)
     mp = layout["max_prompt_len"]  # 3
     s = mp + RESPONSE_LEN  # 7
 

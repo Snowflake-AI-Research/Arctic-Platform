@@ -1,6 +1,18 @@
-#!/usr/bin/env python
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Native TRL BIRD baseline: trainer only. ``vllm serve`` is owned by the shell launcher."""
 
 from __future__ import annotations
@@ -18,8 +30,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # spawned child 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=os.environ.get("MODEL", "Qwen/Qwen3-1.7B"))
-    ap.add_argument("--data-path", default=os.environ.get(
-        "BIRD_TRAIN_PARQUET", "/data/snowflakesql/txt2sql/train.parquet"))
+    ap.add_argument(
+        "--data-path", default=os.environ.get("BIRD_TRAIN_PARQUET", "/data/snowflakesql/txt2sql/train.parquet")
+    )
     ap.add_argument("--vllm-base-url", default=os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000"))
     ap.add_argument("--max-steps", type=int, default=int(os.environ.get("MAX_STEPS", "30")))
     ap.add_argument("--num-generations", type=int, default=int(os.environ.get("NUM_GEN", "8")))
@@ -27,21 +40,29 @@ def main() -> None:
     ap.add_argument("--grad-accum", type=int, default=int(os.environ.get("GRAD_ACCUM", "1")))
     ap.add_argument("--max-completion-length", type=int, default=int(os.environ.get("MAX_COMPLETION_LEN", "1024")))
     ap.add_argument("--max-model-len", type=int, default=int(os.environ.get("MAX_MODEL_LEN", "8192")))
-    ap.add_argument("--val-every", type=int, default=int(os.environ.get("VAL_EVERY", "0")),
-                    help="Greedy val every N optimizer steps (0=off). Quality runs use 10.")
+    ap.add_argument(
+        "--val-every",
+        type=int,
+        default=int(os.environ.get("VAL_EVERY", "0")),
+        help="Greedy val every N optimizer steps (0=off). Quality runs use 10.",
+    )
     ap.add_argument("--val-parquet", default=os.environ.get("BIRD_VAL_PARQUET", ""))
     ap.add_argument("--val-max-samples", type=int, default=int(os.environ.get("VAL_MAX_SAMPLES", "0")))
     ap.add_argument("--num-prompts", type=int, default=int(os.environ.get("NUM_PROMPTS", "128")))
     ap.add_argument("--learning-rate", type=float, default=float(os.environ.get("LR", "1e-6")))
-    ap.add_argument("--metrics-out", default=os.environ.get("METRICS_OUT",
-                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_bird_baseline.json")))
+    ap.add_argument(
+        "--metrics-out",
+        default=os.environ.get(
+            "METRICS_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_bird_baseline.json")
+        ),
+    )
     ap.add_argument("--seed", type=int, default=int(os.environ.get("SEED", "42")))
     args = ap.parse_args()
 
-    from transformers import AutoTokenizer
-
     import bird_task
-    from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
+    from transformers import AutoTokenizer
+    from trl.experimental.async_grpo import AsyncGRPOConfig
+    from trl.experimental.async_grpo import AsyncGRPOTrainer
 
     is_main = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0
 
@@ -74,10 +95,15 @@ def main() -> None:
         )
         if is_main:
             print(f"[base] BIRD dataset ready: {len(dataset)} prompts (from {args.data_path})", flush=True)
-            print(f"[base] token_budget={token_budget!r} per_device_bsz={args.per_device_bsz} "
-                  f"gas={args.grad_accum} max_inflight={max_inflight}", flush=True)
-            print(f"[base] report_to={report_to} run_name={run_name!r} "
-                  f"project={os.environ.get('WANDB_PROJECT')}", flush=True)
+            print(
+                f"[base] token_budget={token_budget!r} per_device_bsz={args.per_device_bsz} "
+                f"gas={args.grad_accum} max_inflight={max_inflight}",
+                flush=True,
+            )
+            print(
+                f"[base] report_to={report_to} run_name={run_name!r} project={os.environ.get('WANDB_PROJECT')}",
+                flush=True,
+            )
 
         config = AsyncGRPOConfig(
             output_dir=out_dir,
@@ -148,7 +174,9 @@ def main() -> None:
             history = [h for h in trainer.state.log_history if "loss" in h]
             print(f"[base] completed {trainer.state.global_step} optimizer steps", flush=True)
             for h in history[-10:]:
-                keep = {k: h[k] for k in ("loss", "reward", "ratio", "kl", "entropy", "completions/mean_length") if k in h}
+                keep = {
+                    k: h[k] for k in ("loss", "reward", "ratio", "kl", "entropy", "completions/mean_length") if k in h
+                }
                 print(f"[base]   step {h.get('step')}: {keep}", flush=True)
 
         if trainer.state.global_step >= args.max_steps:
@@ -166,7 +194,10 @@ def main() -> None:
             try:
                 with open(args.metrics_out, "w") as f:
                     json.dump(trainer.state.log_history, f, indent=2)
-                print(f"[base] wrote metrics -> {args.metrics_out} ({len(trainer.state.log_history)} records)", flush=True)
+                print(
+                    f"[base] wrote metrics -> {args.metrics_out} ({len(trainer.state.log_history)} records)",
+                    flush=True,
+                )
             except Exception as e:  # noqa: BLE001
                 print(f"[base] metrics dump raised (ignored): {e}", flush=True)
 
