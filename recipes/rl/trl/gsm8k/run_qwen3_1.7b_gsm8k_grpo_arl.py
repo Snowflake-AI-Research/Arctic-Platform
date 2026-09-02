@@ -1,6 +1,18 @@
-#!/usr/bin/env python
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """GSM8K GRPO on the Arctic TRL backend. Owns the Arctic server process group."""
 
 from __future__ import annotations
@@ -32,7 +44,7 @@ _SERVER_CUDA_VISIBLE_DEVICES = os.environ.get("CUDA_VISIBLE_DEVICES")  # None =>
 if _TRANSPORT != "ray":
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-import torch
+import torch  # noqa: E402
 
 SERVER_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_server_e2e.log")
 MAX_TOKEN_LEN_PER_GPU = 4096
@@ -82,10 +94,24 @@ def format_sample(sample: dict) -> dict:
 # --------------------------------------------------------------------------------------------------------------- #
 # Arctic client (co-located training + sampling), mirroring the stage-2 smoke config
 # --------------------------------------------------------------------------------------------------------------- #
-def build_client(model: str, host: str, port: int, *, max_seq_len: int, response_len: int, rollout_n: int,
-                 startup_timeout: float, ckpt_dir: str, training_gpus: int, sampling_gpus: int,
-                 tensor_parallel_size: int, comm_protocol: str = "http", seed: int = 42,
-                 colocate: bool = True, zorro_train_enable: bool = False):
+def build_client(
+    model: str,
+    host: str,
+    port: int,
+    *,
+    max_seq_len: int,
+    response_len: int,
+    rollout_n: int,
+    startup_timeout: float,
+    ckpt_dir: str,
+    training_gpus: int,
+    sampling_gpus: int,
+    tensor_parallel_size: int,
+    comm_protocol: str = "http",
+    seed: int = 42,
+    colocate: bool = True,
+    zorro_train_enable: bool = False,
+):
     from arctic_platform.client import ArcticClientConfig
     from arctic_platform.client import ArcticRLClient
     from arctic_platform.client import OnPremConfig
@@ -192,8 +218,9 @@ def _tail(path: str, n: int = 100) -> str:
 # --------------------------------------------------------------------------------------------------------------- #
 # Trainer subclass: build ArcticOptimizer from the trainer's own (stub) model
 # --------------------------------------------------------------------------------------------------------------- #
-def make_trainer(*, model, args, train_dataset, processing_class, training_client, rollout_worker,
-                 weight_transfer, arctic_client):
+def make_trainer(
+    *, model, args, train_dataset, processing_class, training_client, rollout_worker, weight_transfer, arctic_client
+):
     from trl.experimental.async_grpo import AsyncGRPOTrainer
 
     from arctic_platform.integrations.trl.client import ArcticOptimizer
@@ -244,27 +271,43 @@ def main() -> None:
     # colocate=True (default) shares the same GPUs between training and sampling with a sleep/wake handoff;
     # --no-colocate runs disaggregated (training_gpus and sampling_gpus land on disjoint devices, so they must
     # sum to <= total GPUs) which avoids the colocated wake_inference collective contention.
-    ap.add_argument("--colocate", action=argparse.BooleanOptionalAction,
-                    default=os.environ.get("ARCTIC_COLOCATE", "1") not in ("0", "false", "False"))
+    ap.add_argument(
+        "--colocate",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("ARCTIC_COLOCATE", "1") not in ("0", "false", "False"),
+    )
     # ZoRRo Train: dedup shared prompt prefixes across the rollout group in the training forward
     # (Arctic activation/logits optimization). Off by default; enables the model patch (server) and
     # the per-request meta flag (client) so run_pipeline takes the zorro path.
-    ap.add_argument("--zorro", action=argparse.BooleanOptionalAction,
-                    default=os.environ.get("ARCTIC_ZORRO", "0") not in ("0", "false", "False"))
+    ap.add_argument(
+        "--zorro",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("ARCTIC_ZORRO", "0") not in ("0", "false", "False"),
+    )
     # Zorro-group load balancer (server reorgs same-prompt rollouts across DP workers for better dedup;
     # undone by restore_batch_order before the response). EXPERIMENTAL, off by default: reorg's bin-packer
     # assumes a verl-style global batch (world_size-divisible with fittable prompt groups) that TRL's
     # per-forward_backward microbatch does not guarantee. Only used when --zorro.
-    ap.add_argument("--zorro-load-balancer", action=argparse.BooleanOptionalAction,
-                    default=os.environ.get("ARCTIC_ZORRO_LOAD_BALANCER", "0") not in ("0", "false", "False"))
+    ap.add_argument(
+        "--zorro-load-balancer",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("ARCTIC_ZORRO_LOAD_BALANCER", "0") not in ("0", "false", "False"),
+    )
     ap.add_argument("--tensor-parallel", type=int, default=int(os.environ.get("TENSOR_PARALLEL", "1")))
     ap.add_argument("--server-startup-timeout", type=float, default=1200.0)
-    ap.add_argument("--metrics-out", default=os.environ.get("METRICS_OUT",
-                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_arctic.json")))
+    ap.add_argument(
+        "--metrics-out",
+        default=os.environ.get(
+            "METRICS_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_arctic.json")
+        ),
+    )
     # Where old_log_probs come from: "trainer" recomputes on the Arctic engine (verl-style); "sampler" uses
     # vLLM's generation logprobs. With the corrected shift both should hold ratio ~ 1 on-policy.
-    ap.add_argument("--old-logprobs-source", choices=("trainer", "sampler"),
-                    default=os.environ.get("OLD_LOGPROBS_SOURCE", "trainer"))
+    ap.add_argument(
+        "--old-logprobs-source",
+        choices=("trainer", "sampler"),
+        default=os.environ.get("OLD_LOGPROBS_SOURCE", "trainer"),
+    )
     # Transport: "http" (subprocess server + REST) or "ray" (in-process Ray server, no HTTP/serialization).
     # NOTE: GPU visibility is decided at import time from $ARCTIC_TRANSPORT, so to use ray you must export
     # ARCTIC_TRANSPORT=ray (this flag defaults to it and must agree with it).
@@ -272,8 +315,9 @@ def main() -> None:
     # Where GRPO loss runs: "client" (default) evaluates TRL's loss on CPU then ships a
     # surrogate backward; "server" ships GRPO ingredients and runs forward+loss+backward
     # in one fused fwd_bwd (perf + parity with verl/SkyRL).
-    ap.add_argument("--loss-placement", choices=("client", "server"),
-                    default=os.environ.get("ARCTIC_TRL_LOSS_PLACEMENT", "client"))
+    ap.add_argument(
+        "--loss-placement", choices=("client", "server"), default=os.environ.get("ARCTIC_TRL_LOSS_PLACEMENT", "client")
+    )
     # Single knob for variance control: seeds the Arctic sampler (ArcticClientConfig) AND the trainer
     # (AsyncGRPOConfig) so matched-seed baseline/arctic runs are comparable.
     ap.add_argument("--seed", type=int, default=int(os.environ.get("SEED", "42")))
@@ -286,12 +330,12 @@ def main() -> None:
 
     from datasets import load_dataset
     from transformers import AutoTokenizer
+    from trl.experimental.async_grpo import AsyncGRPOConfig
+    from trl.rewards import accuracy_reward
 
     from arctic_platform.integrations.trl.client import ArcticTrainingClient
     from arctic_platform.integrations.trl.rollout import ArcticRolloutWorker
     from arctic_platform.integrations.trl.weights import ArcticWeightTransfer
-    from trl.experimental.async_grpo import AsyncGRPOConfig
-    from trl.rewards import accuracy_reward
 
     chat_template_kwargs = {"enable_thinking": False}
 
@@ -302,11 +346,19 @@ def main() -> None:
     logf = None
     if args.transport == "http":
         server_cmd = [
-            sys.executable, "-u", "-m", "arctic_platform.common.http_server",
-            "--host", args.host, "--port", str(args.port),
+            sys.executable,
+            "-u",
+            "-m",
+            "arctic_platform.common.http_server",
+            "--host",
+            args.host,
+            "--port",
+            str(args.port),
             *(["--colocate"] if args.colocate else []),
-            "--training-gpus", str(args.training_gpus),
-            "--sampling-gpus", str(args.sampling_gpus),
+            "--training-gpus",
+            str(args.training_gpus),
+            "--sampling-gpus",
+            str(args.sampling_gpus),
         ]
         print(f"[e2e] launching server: {' '.join(server_cmd)}", flush=True)
         print(f"[e2e] server stdout/stderr -> {SERVER_LOG}", flush=True)
@@ -324,7 +376,9 @@ def main() -> None:
         print(f"[e2e] server pid={server.pid} pgid={pgid}", flush=True)
     else:
         print("[e2e] transport=ray: building in-process Ray server (no HTTP subprocess)", flush=True)
-    print(f"[e2e] transport={args.transport}; client torch.cuda.is_available()={torch.cuda.is_available()}", flush=True)
+    print(
+        f"[e2e] transport={args.transport}; client torch.cuda.is_available()={torch.cuda.is_available()}", flush=True
+    )
 
     client = None
     ok = False
@@ -336,12 +390,21 @@ def main() -> None:
             print("[e2e] server healthy", flush=True)
 
         client = build_client(
-            args.model, args.host, args.port,
-            max_seq_len=args.max_seq_len, response_len=args.max_completion_length,
-            rollout_n=args.num_generations, startup_timeout=args.server_startup_timeout, ckpt_dir=ckpt,
-            training_gpus=args.training_gpus, sampling_gpus=args.sampling_gpus,
-            tensor_parallel_size=args.tensor_parallel, comm_protocol=args.transport, seed=args.seed,
-            colocate=args.colocate, zorro_train_enable=args.zorro,
+            args.model,
+            args.host,
+            args.port,
+            max_seq_len=args.max_seq_len,
+            response_len=args.max_completion_length,
+            rollout_n=args.num_generations,
+            startup_timeout=args.server_startup_timeout,
+            ckpt_dir=ckpt,
+            training_gpus=args.training_gpus,
+            sampling_gpus=args.sampling_gpus,
+            tensor_parallel_size=args.tensor_parallel,
+            comm_protocol=args.transport,
+            seed=args.seed,
+            colocate=args.colocate,
+            zorro_train_enable=args.zorro,
         )
         print(f"[e2e] client ready; jobs={client.jobs}", flush=True)
 
@@ -406,12 +469,20 @@ def main() -> None:
             logits_optimization_peak_mem_size_in_gib=int(os.environ.get("ARCTIC_LOGITS_OPT_PEAK_GIB", "4")),
             logits_compute_in_fp32=os.environ.get("ARCTIC_LOGITS_COMPUTE_FP32", "0") not in ("0", "false", "False"),
         )
-        print(f"[e2e] loss_placement={args.loss_placement} zorro={args.zorro} "
-              f"zorro_load_balancer={args.zorro_load_balancer}", flush=True)
+        print(
+            f"[e2e] loss_placement={args.loss_placement} zorro={args.zorro} "
+            f"zorro_load_balancer={args.zorro_load_balancer}",
+            flush=True,
+        )
         rollout_worker = ArcticRolloutWorker(
-            client, dataset, accuracy_reward, tokenizer,
-            num_generations=args.num_generations, max_tokens=args.max_completion_length,
-            temperature=1.0, queue_maxsize=args.per_device_bsz * 8,
+            client,
+            dataset,
+            accuracy_reward,
+            tokenizer,
+            num_generations=args.num_generations,
+            max_tokens=args.max_completion_length,
+            temperature=1.0,
+            queue_maxsize=args.per_device_bsz * 8,
             chat_template_kwargs=chat_template_kwargs,
             # verl-style: recompute old_log_probs on the training engine (not vLLM) so the ratio/KL match the
             # trainer's new log-probs. Must mirror the training client's pad/token-budget values.
@@ -425,9 +496,14 @@ def main() -> None:
         weight_transfer = ArcticWeightTransfer(client)
 
         trainer = make_trainer(
-            model=args.model, args=config, train_dataset=dataset, processing_class=tokenizer,
-            training_client=training_client, rollout_worker=rollout_worker,
-            weight_transfer=weight_transfer, arctic_client=client,
+            model=args.model,
+            args=config,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            training_client=training_client,
+            rollout_worker=rollout_worker,
+            weight_transfer=weight_transfer,
+            arctic_client=client,
         )
 
         run_desc = f"max_steps={args.max_steps}" if args.max_steps > 0 else f"{args.num_train_epochs} epoch(s)"

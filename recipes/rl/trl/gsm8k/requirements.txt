@@ -4,9 +4,9 @@
 # cu130 index). `flash-attn` is also installed separately (`--no-build-isolation`).
 # Same env as the sibling txt2sql recipe.
 
+accelerate
 arctic-platform[rl]
 datasets
-accelerate
-wandb
-openai>=2.54.0
 kernels>=0.16.0,<0.17.0
+openai>=2.54.0
+wandb

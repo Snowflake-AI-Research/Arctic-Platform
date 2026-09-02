@@ -1,6 +1,18 @@
-#!/usr/bin/env python
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """BIRD GRPO on the Arctic TRL backend (disaggregated 4 train + 4 sample)."""
 
 from __future__ import annotations
@@ -11,12 +23,12 @@ import os
 import signal
 import subprocess
 import sys
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tempfile
 import time
 import traceback
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # http: hide GPUs from this process (server is a subprocess). ray: driver must see GPUs.
 _TRANSPORT = os.environ.get("ARCTIC_TRANSPORT", "http")
@@ -25,7 +37,7 @@ _SERVER_CUDA_VISIBLE_DEVICES = os.environ.get("CUDA_VISIBLE_DEVICES")  # None =>
 if _TRANSPORT != "ray":
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-import torch
+import torch  # noqa: E402
 
 SERVER_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_server_bird_e2e.log")
 MAX_TOKEN_LEN_PER_GPU = int(os.environ.get("MAX_TOKEN_LEN_PER_GPU", "8192"))
@@ -65,11 +77,26 @@ def install_stub_model_loader() -> None:
 # --------------------------------------------------------------------------------------------------------------- #
 # Arctic client (disaggregated training + sampling)
 # --------------------------------------------------------------------------------------------------------------- #
-def build_client(model: str, host: str, port: int, *, max_seq_len: int, response_len: int, rollout_n: int,
-                 startup_timeout: float, ckpt_dir: str, training_gpus: int, sampling_gpus: int,
-                 tensor_parallel_size: int, comm_protocol: str = "http", seed: int = 42,
-                 colocate: bool = False, zorro_train_enable: bool = False, gpu_mem_util: float = 0.3,
-                 grad_accum_steps: int = 1):
+def build_client(
+    model: str,
+    host: str,
+    port: int,
+    *,
+    max_seq_len: int,
+    response_len: int,
+    rollout_n: int,
+    startup_timeout: float,
+    ckpt_dir: str,
+    training_gpus: int,
+    sampling_gpus: int,
+    tensor_parallel_size: int,
+    comm_protocol: str = "http",
+    seed: int = 42,
+    colocate: bool = False,
+    zorro_train_enable: bool = False,
+    gpu_mem_util: float = 0.3,
+    grad_accum_steps: int = 1,
+):
     from arctic_platform.client import ArcticClientConfig
     from arctic_platform.client import ArcticRLClient
     from arctic_platform.client import OnPremConfig
@@ -167,8 +194,9 @@ def _tail(path: str, n: int = 100) -> str:
 # --------------------------------------------------------------------------------------------------------------- #
 # Trainer subclass: build ArcticOptimizer from the trainer's own (stub) model
 # --------------------------------------------------------------------------------------------------------------- #
-def make_trainer(*, model, args, train_dataset, processing_class, training_client, rollout_worker,
-                 weight_transfer, arctic_client):
+def make_trainer(
+    *, model, args, train_dataset, processing_class, training_client, rollout_worker, weight_transfer, arctic_client
+):
     from trl.experimental.async_grpo import AsyncGRPOTrainer
 
     from arctic_platform.integrations.trl.client import ArcticOptimizer
@@ -201,18 +229,27 @@ def main() -> None:
     ap.add_argument("--model", default=os.environ.get("MODEL", "Qwen/Qwen3-1.7B"))
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--data-path", default=os.environ.get(
-        "BIRD_TRAIN_PARQUET", "/data/snowflakesql/txt2sql/train.parquet"))
+    ap.add_argument(
+        "--data-path", default=os.environ.get("BIRD_TRAIN_PARQUET", "/data/snowflakesql/txt2sql/train.parquet")
+    )
     ap.add_argument("--max-steps", type=int, default=int(os.environ.get("MAX_STEPS", "30")))
     ap.add_argument("--num-train-epochs", type=float, default=float(os.environ.get("NUM_TRAIN_EPOCHS", "1")))
     ap.add_argument("--num-generations", type=int, default=int(os.environ.get("NUM_GEN", "8")))
     ap.add_argument("--per-device-bsz", type=int, default=int(os.environ.get("PER_DEVICE_BSZ", "8")))
-    ap.add_argument("--grad-accum", type=int, default=int(os.environ.get("GRAD_ACCUM", "1")),
-                    help="DeepSpeed engine GAS (worker split_dict of each DP shard). TRL trainer GAS stays 1.")
+    ap.add_argument(
+        "--grad-accum",
+        type=int,
+        default=int(os.environ.get("GRAD_ACCUM", "1")),
+        help="DeepSpeed engine GAS (worker split_dict of each DP shard). TRL trainer GAS stays 1.",
+    )
     ap.add_argument("--max-completion-length", type=int, default=int(os.environ.get("MAX_COMPLETION_LEN", "1024")))
     ap.add_argument("--max-seq-len", type=int, default=int(os.environ.get("MAX_SEQ_LEN", "8192")))
-    ap.add_argument("--val-every", type=int, default=int(os.environ.get("VAL_EVERY", "0")),
-                    help="Greedy val every N optimizer steps (0=off). Quality runs use 10.")
+    ap.add_argument(
+        "--val-every",
+        type=int,
+        default=int(os.environ.get("VAL_EVERY", "0")),
+        help="Greedy val every N optimizer steps (0=off). Quality runs use 10.",
+    )
     ap.add_argument("--val-parquet", default=os.environ.get("BIRD_VAL_PARQUET", ""))
     ap.add_argument("--val-max-samples", type=int, default=int(os.environ.get("VAL_MAX_SAMPLES", "0")))
     ap.add_argument("--num-prompts", type=int, default=int(os.environ.get("NUM_PROMPTS", "128")))
@@ -221,21 +258,38 @@ def main() -> None:
     # Disaggregated (colocated deadlocks); default 4 train + 4 sample.
     ap.add_argument("--training-gpus", type=int, default=int(os.environ.get("TRAINING_GPUS", "4")))
     ap.add_argument("--sampling-gpus", type=int, default=int(os.environ.get("SAMPLING_GPUS", "4")))
-    ap.add_argument("--colocate", action=argparse.BooleanOptionalAction,
-                    default=os.environ.get("ARCTIC_COLOCATE", "0") not in ("0", "false", "False"))
-    ap.add_argument("--zorro", action=argparse.BooleanOptionalAction,
-                    default=os.environ.get("ARCTIC_ZORRO", "0") not in ("0", "false", "False"))
-    ap.add_argument("--zorro-load-balancer", action=argparse.BooleanOptionalAction,
-                    default=os.environ.get("ARCTIC_ZORRO_LOAD_BALANCER", "0") not in ("0", "false", "False"))
+    ap.add_argument(
+        "--colocate",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("ARCTIC_COLOCATE", "0") not in ("0", "false", "False"),
+    )
+    ap.add_argument(
+        "--zorro",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("ARCTIC_ZORRO", "0") not in ("0", "false", "False"),
+    )
+    ap.add_argument(
+        "--zorro-load-balancer",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("ARCTIC_ZORRO_LOAD_BALANCER", "0") not in ("0", "false", "False"),
+    )
     ap.add_argument("--tensor-parallel", type=int, default=int(os.environ.get("TENSOR_PARALLEL", "1")))
     ap.add_argument("--server-startup-timeout", type=float, default=1800.0)
-    ap.add_argument("--metrics-out", default=os.environ.get("METRICS_OUT",
-                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_bird_arctic.json")))
-    ap.add_argument("--old-logprobs-source", choices=("trainer", "sampler"),
-                    default=os.environ.get("OLD_LOGPROBS_SOURCE", "sampler"))
+    ap.add_argument(
+        "--metrics-out",
+        default=os.environ.get(
+            "METRICS_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_bird_arctic.json")
+        ),
+    )
+    ap.add_argument(
+        "--old-logprobs-source",
+        choices=("trainer", "sampler"),
+        default=os.environ.get("OLD_LOGPROBS_SOURCE", "sampler"),
+    )
     ap.add_argument("--transport", choices=("http", "ray"), default=_TRANSPORT)
-    ap.add_argument("--loss-placement", choices=("client", "server"),
-                    default=os.environ.get("ARCTIC_TRL_LOSS_PLACEMENT", "server"))
+    ap.add_argument(
+        "--loss-placement", choices=("client", "server"), default=os.environ.get("ARCTIC_TRL_LOSS_PLACEMENT", "server")
+    )
     ap.add_argument("--seed", type=int, default=int(os.environ.get("SEED", "42")))
     args = ap.parse_args()
     if args.transport != _TRANSPORT:
@@ -250,28 +304,32 @@ def main() -> None:
         if args.per_device_bsz % lb_unit != 0 or args.per_device_bsz < lb_unit:
             # Round up so each DP rank gets whole prompt groups.
             new_bsz = max(lb_unit, -(-args.per_device_bsz // lb_unit) * lb_unit)
-            print(f"[e2e] zorro_load_balancer: per_device_bsz={args.per_device_bsz} is not a positive multiple of "
-                  f"num_generations*training_gpus={lb_unit}; rounding UP to {new_bsz} so reorg_global_batch can hand "
-                  f"whole prompt groups to each of {args.training_gpus} DP workers (else 'shouldn't reach here').",
-                  flush=True)
+            print(
+                f"[e2e] zorro_load_balancer: per_device_bsz={args.per_device_bsz} is not a positive multiple of "
+                f"num_generations*training_gpus={lb_unit}; rounding UP to {new_bsz} so reorg_global_batch can hand "
+                f"whole prompt groups to each of {args.training_gpus} DP workers (else 'shouldn't reach here').",
+                flush=True,
+            )
             args.per_device_bsz = new_bsz
         # Deduped group is one micro-batch: max_token_len >= max_seq_len + response_len * n.
         global MAX_TOKEN_LEN_PER_GPU
         need = args.max_seq_len + args.max_completion_length * args.num_generations
         if MAX_TOKEN_LEN_PER_GPU < need:
-            print(f"[e2e] zorro_load_balancer: raising max_token_len_per_gpu {MAX_TOKEN_LEN_PER_GPU} -> {need} to hold "
-                  f"a deduped group (prompt up to max_seq_len={args.max_seq_len} + "
-                  f"{args.num_generations}x{args.max_completion_length} responses).",
-                  flush=True)
+            print(
+                f"[e2e] zorro_load_balancer: raising max_token_len_per_gpu {MAX_TOKEN_LEN_PER_GPU} -> {need} to hold "
+                f"a deduped group (prompt up to max_seq_len={args.max_seq_len} + "
+                f"{args.num_generations}x{args.max_completion_length} responses).",
+                flush=True,
+            )
             MAX_TOKEN_LEN_PER_GPU = need
 
-    from transformers import AutoTokenizer
-
     import bird_task
+    from transformers import AutoTokenizer
+    from trl.experimental.async_grpo import AsyncGRPOConfig
+
     from arctic_platform.integrations.trl.client import ArcticTrainingClient
     from arctic_platform.integrations.trl.rollout import ArcticRolloutWorker
     from arctic_platform.integrations.trl.weights import ArcticWeightTransfer
-    from trl.experimental.async_grpo import AsyncGRPOConfig
 
     # R1 txt2sql prompts use <think>; leave thinking on.
     chat_template_kwargs: dict = {}
@@ -281,11 +339,19 @@ def main() -> None:
     logf = None
     if args.transport == "http":
         server_cmd = [
-            sys.executable, "-u", "-m", "arctic_platform.common.http_server",
-            "--host", args.host, "--port", str(args.port),
+            sys.executable,
+            "-u",
+            "-m",
+            "arctic_platform.common.http_server",
+            "--host",
+            args.host,
+            "--port",
+            str(args.port),
             *(["--colocate"] if args.colocate else []),
-            "--training-gpus", str(args.training_gpus),
-            "--sampling-gpus", str(args.sampling_gpus),
+            "--training-gpus",
+            str(args.training_gpus),
+            "--sampling-gpus",
+            str(args.sampling_gpus),
         ]
         print(f"[e2e] launching server: {' '.join(server_cmd)}", flush=True)
         print(f"[e2e] server stdout/stderr -> {SERVER_LOG}", flush=True)
@@ -302,7 +368,9 @@ def main() -> None:
         print(f"[e2e] server pid={server.pid} pgid={pgid}", flush=True)
     else:
         print("[e2e] transport=ray: building in-process Ray server (no HTTP subprocess)", flush=True)
-    print(f"[e2e] transport={args.transport}; client torch.cuda.is_available()={torch.cuda.is_available()}", flush=True)
+    print(
+        f"[e2e] transport={args.transport}; client torch.cuda.is_available()={torch.cuda.is_available()}", flush=True
+    )
 
     client = None
     ok = False
@@ -314,12 +382,22 @@ def main() -> None:
             print("[e2e] server healthy", flush=True)
 
         client = build_client(
-            args.model, args.host, args.port,
-            max_seq_len=args.max_seq_len, response_len=args.max_completion_length,
-            rollout_n=args.num_generations, startup_timeout=args.server_startup_timeout, ckpt_dir=ckpt,
-            training_gpus=args.training_gpus, sampling_gpus=args.sampling_gpus,
-            tensor_parallel_size=args.tensor_parallel, comm_protocol=args.transport, seed=args.seed,
-            colocate=args.colocate, zorro_train_enable=args.zorro, gpu_mem_util=args.gpu_mem_util,
+            args.model,
+            args.host,
+            args.port,
+            max_seq_len=args.max_seq_len,
+            response_len=args.max_completion_length,
+            rollout_n=args.num_generations,
+            startup_timeout=args.server_startup_timeout,
+            ckpt_dir=ckpt,
+            training_gpus=args.training_gpus,
+            sampling_gpus=args.sampling_gpus,
+            tensor_parallel_size=args.tensor_parallel,
+            comm_protocol=args.transport,
+            seed=args.seed,
+            colocate=args.colocate,
+            zorro_train_enable=args.zorro,
+            gpu_mem_util=args.gpu_mem_util,
             grad_accum_steps=args.grad_accum,
         )
         print(f"[e2e] client ready; jobs={client.jobs}", flush=True)
@@ -341,8 +419,9 @@ def main() -> None:
             zorro=bool(args.zorro),
             seed=args.seed,
         )
-        print(f"[e2e] report_to={report_to} run_name={run_name!r} "
-              f"project={os.environ.get('WANDB_PROJECT')}", flush=True)
+        print(
+            f"[e2e] report_to={report_to} run_name={run_name!r} project={os.environ.get('WANDB_PROJECT')}", flush=True
+        )
 
         install_stub_model_loader()
 
@@ -396,19 +475,25 @@ def main() -> None:
         raw_group_batch = int(os.environ.get("ROLLOUT_GROUP_BATCH", "0"))
         max_seqs = int(os.environ.get("VLLM_MAX_NUM_SEQS", "256"))
         generate_group_batch = (
-            raw_group_batch if raw_group_batch >= 1
-            else max(1, max_seqs // max(1, args.num_generations))
+            raw_group_batch if raw_group_batch >= 1 else max(1, max_seqs // max(1, args.num_generations))
         )
-        print(f"[e2e] loss_placement={args.loss_placement} zorro={args.zorro} "
-              f"zorro_load_balancer={args.zorro_load_balancer} ds_gas={args.grad_accum} trl_gas=1 "
-              f"prefix_cache={prefix_cache} generate_group_batch={generate_group_batch} "
-              f"liger={os.environ.get('USE_LIGER', '0')} logits_opt={os.environ.get('ARCTIC_LOGITS_OPT', 'none')} "
-              f"gc=ds_worker_default(True unless enable_gradient_checkpointing set)",
-              flush=True)
+        print(
+            f"[e2e] loss_placement={args.loss_placement} zorro={args.zorro} "
+            f"zorro_load_balancer={args.zorro_load_balancer} ds_gas={args.grad_accum} trl_gas=1 "
+            f"prefix_cache={prefix_cache} generate_group_batch={generate_group_batch} "
+            f"liger={os.environ.get('USE_LIGER', '0')} logits_opt={os.environ.get('ARCTIC_LOGITS_OPT', 'none')} "
+            "gc=ds_worker_default(True unless enable_gradient_checkpointing set)",
+            flush=True,
+        )
         rollout_worker = ArcticRolloutWorker(
-            client, dataset, bird_task.sql_reward, tokenizer,
-            num_generations=args.num_generations, max_tokens=args.max_completion_length,
-            temperature=1.0, queue_maxsize=args.per_device_bsz * 8,
+            client,
+            dataset,
+            bird_task.sql_reward,
+            tokenizer,
+            num_generations=args.num_generations,
+            max_tokens=args.max_completion_length,
+            temperature=1.0,
+            queue_maxsize=args.per_device_bsz * 8,
             chat_template_kwargs=chat_template_kwargs,
             old_logprobs_source=args.old_logprobs_source,
             pad_token_id=tokenizer.pad_token_id or 0,
@@ -419,9 +504,14 @@ def main() -> None:
         weight_transfer = ArcticWeightTransfer(client)
 
         trainer = make_trainer(
-            model=args.model, args=config, train_dataset=dataset, processing_class=tokenizer,
-            training_client=training_client, rollout_worker=rollout_worker,
-            weight_transfer=weight_transfer, arctic_client=client,
+            model=args.model,
+            args=config,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            training_client=training_client,
+            rollout_worker=rollout_worker,
+            weight_transfer=weight_transfer,
+            arctic_client=client,
         )
 
         import bird_val

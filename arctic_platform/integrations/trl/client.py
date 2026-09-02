@@ -304,7 +304,9 @@ class ArcticTrainingClient:
         # (matches verl's response-only tensors left-padded into the full sequence).
         old_lp = _place_response_window(ing["old_log_probs"], layout, self.response_len, torch.float32)
         adv = _place_response_window(ing["advantages"], layout, self.response_len, torch.float32)
-        mask = _place_response_window(ing["completion_mask"].to(torch.float32), layout, self.response_len, torch.float32)
+        mask = _place_response_window(
+            ing["completion_mask"].to(torch.float32), layout, self.response_len, torch.float32
+        )
 
         tokens_per_rank = ing["tokens_per_rank"]
         if torch.is_tensor(tokens_per_rank):
@@ -497,9 +499,9 @@ def _assert_uniform_prompt_groups(prompts_2d: torch.Tensor, rollout_n: int) -> N
         raise ValueError(
             f"zorro_load_balancer: forward batch has ragged prompt groups (sizes={counts}); every group must have "
             f"exactly rollout_n={rollout_n} rollouts so reorg_global_batch can tile whole groups across DP workers. "
-            f"This usually means the async rollout buffer dropped stale samples mid-group. Fixes: raise max_staleness "
-            f"so groups aren't split, keep per_device_bsz a multiple of rollout_n*training_gpus, or disable "
-            f"zorro_load_balancer."
+            "This usually means the async rollout buffer dropped stale samples mid-group. Fixes: raise max_staleness "
+            "so groups aren't split, keep per_device_bsz a multiple of rollout_n*training_gpus, or disable "
+            "zorro_load_balancer."
         )
 
 
@@ -546,7 +548,7 @@ def _zorro_structured_batch(
     if max_resp > response_len:
         raise ValueError(
             f"zorro: a completion has {max_resp} tokens > response_len={response_len}; the fixed-width response "
-            f"window cannot hold it. Set response_len (max_completion_length) >= the longest completion."
+            "window cannot hold it. Set response_len (max_completion_length) >= the longest completion."
         )
 
     padded_ids = torch.full((b, s), pad_token_id, dtype=input_ids.dtype, device=device)
@@ -574,9 +576,7 @@ def _zorro_structured_batch(
     return batch, layout
 
 
-def _place_response_window(
-    shifted: torch.Tensor, layout: dict, response_len: int, dtype: torch.dtype
-) -> torch.Tensor:
+def _place_response_window(shifted: torch.Tensor, layout: dict, response_len: int, dtype: torch.dtype) -> torch.Tensor:
     """TRL-shifted ``[1, T-1]`` -> response window of ``[B, max_prompt_len + response_len]`` (zeros elsewhere)."""
     b = layout["B"]
     mp = layout["max_prompt_len"]

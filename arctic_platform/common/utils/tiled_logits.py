@@ -435,9 +435,7 @@ def memory_logprobs_entropy_from_hidden(
     flat_hidden = hidden_states.reshape(-1, hidden_size)
     flat_labels = labels.reshape(-1)
     if flat_hidden.shape[0] != flat_labels.shape[0]:
-        raise ValueError(
-            f"memory logits: hidden rows {flat_hidden.shape[0]} != labels {flat_labels.shape[0]}"
-        )
+        raise ValueError(f"memory logits: hidden rows {flat_hidden.shape[0]} != labels {flat_labels.shape[0]}")
     tied = getattr(getattr(model, "config", None), "tie_word_embeddings", None)
     if tied is False:
         raise ValueError(
