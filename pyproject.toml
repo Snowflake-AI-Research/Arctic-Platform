@@ -24,7 +24,7 @@ Issues = "https://github.com/Snowflake-AI-Research/Arctic-Platform/issues"
 
 [project]
 name = "arctic_platform"
-version = "0.1.3.dev0"
+version = "0.1.4.dev0"
 description = "Snowflake LLM training library w/ RL"
 authors = [
     {author = "Tunji Ruwase", email = "tunji.ruwase@snowflake.com"},
@@ -47,9 +47,6 @@ classifiers = [
 
 requires-python = ">=3.12"
 
-
-# Config models only. Every usable install picks a backend extra: [cortex] to
-# drive Cortex, [sft]/[rl]/[onprem] to run against an on-prem server.
 dependencies = [
     "pydantic>=2.10",
     "pydantic-settings>=2.0",  # CortexConfig reads ARCTIC_CORTEX_* via BaseSettings
@@ -71,10 +68,7 @@ dev = [
     "arctic_platform[testing]",
 ]
 
-# Pulls [onprem] because the suite exercises both servers, and because `dev` is
-# defined as formatting + testing.
 testing = [
-    "arctic_platform[onprem]",
     "parameterized",
     "pytest-instafail",
     "pytest-flakefinder",
@@ -127,15 +121,17 @@ sft = [
     "nvidia-ml-py",
     "psutil",
     "ray",
-    "transformers>=4.57.0,<5",  # vllm 0.18 is what blocks the move to v5
+    "tensordict",
+    "transformers",
     "uvicorn",
 ]
 
-# [sft] plus sampling. arctic-inference[vllm] owns the validated vLLM pin.
+# [sft] plus sampling. arctic-inference[vllm] pulls vLLM and applies that extra's
+# pin; [rl] does not declare vLLM. 0.3.0 is the first release of that extra
+# contract.
 rl = [
     "arctic_platform[sft]",
-    "arctic-inference[server,vllm]>=0.2.0",
-    "tensordict",
+    "arctic-inference[server,vllm]>=0.3.0",
 ]
 
 onprem = [
