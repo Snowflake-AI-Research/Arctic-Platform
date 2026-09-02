@@ -1,6 +1,18 @@
-#!/usr/bin/env python
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Native TRL GSM8K baseline: trainer GPU + stock ``vllm serve`` on a second GPU."""
 
 from __future__ import annotations
@@ -78,16 +90,20 @@ def main() -> None:
     ap.add_argument("--num-prompts", type=int, default=int(os.environ.get("NUM_PROMPTS", "64")))
     ap.add_argument("--learning-rate", type=float, default=float(os.environ.get("LR", "1e-6")))
     ap.add_argument("--server-startup-timeout", type=float, default=float(os.environ.get("SERVER_TIMEOUT", "1200")))
-    ap.add_argument("--metrics-out", default=os.environ.get("METRICS_OUT",
-                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_baseline.json")))
+    ap.add_argument(
+        "--metrics-out",
+        default=os.environ.get(
+            "METRICS_OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics_baseline.json")
+        ),
+    )
     # Matched-seed variance control: seeds both `vllm serve` (generation) and the trainer (AsyncGRPOConfig).
     ap.add_argument("--seed", type=int, default=int(os.environ.get("SEED", "42")))
     args = ap.parse_args()
 
     from datasets import load_dataset
     from transformers import AutoTokenizer
-
-    from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
+    from trl.experimental.async_grpo import AsyncGRPOConfig
+    from trl.experimental.async_grpo import AsyncGRPOTrainer
     from trl.rewards import accuracy_reward
 
     chat_template_kwargs = {"enable_thinking": False}
@@ -96,15 +112,24 @@ def main() -> None:
 
     # ----- launch stock `vllm serve` on the server GPU as its own process group -----
     server_cmd = [
-        "vllm", "serve", args.model,
-        "--host", args.host, "--port", str(args.port),
-        "--max-model-len", str(args.max_model_len),
-        "--seed", str(args.seed),
+        "vllm",
+        "serve",
+        args.model,
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--max-model-len",
+        str(args.max_model_len),
+        "--seed",
+        str(args.seed),
         # `processed_logprobs`: the sampler returns post-temperature/top-k/top-p logprobs, matching how the trainer's
         # patched model computes its (temperature-scaled) logprobs -> ratio ~ 1 on-policy.
-        "--logprobs-mode", "processed_logprobs",
+        "--logprobs-mode",
+        "processed_logprobs",
         # NCCL weight transfer endpoints (/init_weight_transfer_engine, /update_weights, ...) used by WeightTransferClient.
-        "--weight-transfer-config", '{"backend":"nccl"}',
+        "--weight-transfer-config",
+        '{"backend":"nccl"}',
     ]
     server_env = dict(os.environ)
     server_env["CUDA_VISIBLE_DEVICES"] = _SERVER_GPU
@@ -113,7 +138,9 @@ def main() -> None:
     print(f"[base] trainer on GPU {_TRAINER_GPU}; torch.cuda.device_count()={torch.cuda.device_count()}", flush=True)
     print(f"[base] server stdout/stderr -> {SERVER_LOG}", flush=True)
     logf = open(SERVER_LOG, "w")
-    server = subprocess.Popen(server_cmd, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, env=server_env)
+    server = subprocess.Popen(
+        server_cmd, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, env=server_env
+    )
     pgid = os.getpgid(server.pid)
     print(f"[base] vllm server pid={server.pid} pgid={pgid}", flush=True)
 
@@ -186,7 +213,10 @@ def main() -> None:
             if trainer is not None:
                 with open(args.metrics_out, "w") as f:
                     json.dump(trainer.state.log_history, f, indent=2)
-                print(f"[base] wrote metrics -> {args.metrics_out} ({len(trainer.state.log_history)} records)", flush=True)
+                print(
+                    f"[base] wrote metrics -> {args.metrics_out} ({len(trainer.state.log_history)} records)",
+                    flush=True,
+                )
         except Exception as e:  # noqa: BLE001
             print(f"[base] metrics dump raised (ignored): {e}", flush=True)
         print(f"[base] terminating vllm server process group pgid={pgid} ...", flush=True)
