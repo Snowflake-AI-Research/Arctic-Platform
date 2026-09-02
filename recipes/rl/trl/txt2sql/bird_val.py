@@ -1,6 +1,18 @@
-#!/usr/bin/env python
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Held-out greedy BIRD val (n=1, temp=0), logged as verl ``val-core`` / ``val-aux``.
 
 Do not route these keys through ``AsyncGRPOTrainer.log`` (HF prefixes ``train/``).
@@ -15,11 +27,11 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable
-
-from transformers import TrainerCallback
+from typing import Any
+from typing import Callable
 
 import bird_task
+from transformers import TrainerCallback
 
 VAL_CORE_REWARD = "val-core/bird/reward/mean@1"
 VAL_AUX_EXEC = "val-aux/bird/execution_success/mean@1"
@@ -80,9 +92,7 @@ def render_prompt(
     if isinstance(prompt, str):
         text = prompt
     else:
-        text = tokenizer.apply_chat_template(
-            prompt, add_generation_prompt=True, tokenize=False, **kw
-        )
+        text = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=False, **kw)
     ids = list(tokenizer(text, add_special_tokens=False)["input_ids"])
     return text, ids
 
@@ -166,14 +176,9 @@ def prepare_val_rows(
 
 
 def assert_val_db_paths(rows: list[dict[str, Any]]) -> None:
-    missing = [
-        r.get("db_path") for r in rows
-        if not r.get("db_path") or not os.path.exists(str(r.get("db_path")))
-    ]
+    missing = [r.get("db_path") for r in rows if not r.get("db_path") or not os.path.exists(str(r.get("db_path")))]
     if missing:
-        raise FileNotFoundError(
-            f"{len(missing)} val db_path(s) missing on this node, e.g. {missing[:3]!r}"
-        )
+        raise FileNotFoundError(f"{len(missing)} val db_path(s) missing on this node, e.g. {missing[:3]!r}")
 
 
 def log_val_metrics(trainer: Any, metrics: dict[str, float], step: int) -> None:
@@ -448,8 +453,11 @@ def attach_bird_val_callback(trainer: Any, callback: BirdValCallback) -> BirdVal
         raise RuntimeError(
             f"BirdValCallback must be registered after weight sync (sync_idx={sync_idx} val_idx={val_idx})"
         )
-    print(f"[val] callback attached after weight sync (sync_idx={sync_idx} val_idx={val_idx}) "
-          f"n={len(callback.rows)} every={callback.val_every}", flush=True)
+    print(
+        f"[val] callback attached after weight sync (sync_idx={sync_idx} val_idx={val_idx}) "
+        f"n={len(callback.rows)} every={callback.val_every}",
+        flush=True,
+    )
     return callback
 
 

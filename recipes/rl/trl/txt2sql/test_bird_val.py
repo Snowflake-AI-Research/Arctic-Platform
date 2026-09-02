@@ -1,6 +1,18 @@
-#!/usr/bin/env python
-# Copyright 2026 Snowflake Inc.
+# Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """CPU tests for verl-style BIRD val metric keys and sql_reward_detailed."""
 
 from __future__ import annotations
@@ -10,14 +22,12 @@ import sqlite3
 import tempfile
 
 import bird_task
-from bird_val import (
-    VAL_AUX_EXEC,
-    VAL_AUX_FORMAT,
-    VAL_AUX_N,
-    VAL_AUX_SCORE,
-    VAL_CORE_REWARD,
-    to_verl_val_metrics,
-)
+from bird_val import VAL_AUX_EXEC
+from bird_val import VAL_AUX_FORMAT
+from bird_val import VAL_AUX_N
+from bird_val import VAL_AUX_SCORE
+from bird_val import VAL_CORE_REWARD
+from bird_val import to_verl_val_metrics
 
 
 def _make_db(path: str) -> None:
@@ -57,9 +67,7 @@ def test_verl_key_names_and_means():
         {"score": 0.1, "format_correct": 1.0, "execution_success": 0.0},
         {"score": 0.0, "format_correct": 0.0, "execution_success": 0.0},
     ]
-    metrics = to_verl_val_metrics(
-        details, n_prompts=3, dropped_overlong=1, truncated=0, considered=4, time_s=1.5
-    )
+    metrics = to_verl_val_metrics(details, n_prompts=3, dropped_overlong=1, truncated=0, considered=4, time_s=1.5)
     assert abs(metrics[VAL_CORE_REWARD] - (1.1 / 3)) < 1e-9
     assert metrics[VAL_AUX_SCORE] == metrics[VAL_CORE_REWARD]
     assert abs(metrics[VAL_AUX_EXEC] - (1.0 / 3)) < 1e-9

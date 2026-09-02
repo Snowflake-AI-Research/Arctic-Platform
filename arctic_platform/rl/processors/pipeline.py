@@ -450,9 +450,7 @@ def run_pipeline(
     if tile_lm_head:
         hidden = captured.get("hidden")
         if hidden is None:
-            raise RuntimeError(
-                "logits_optimization=memory: backbone hook did not capture last_hidden_state"
-            )
+            raise RuntimeError("logits_optimization=memory: backbone hook did not capture last_hidden_state")
         if hasattr(outputs, "logits") and outputs.logits is not None and outputs.logits.ndim >= 2:
             if outputs.logits.shape[-2] != 1:
                 raise RuntimeError(
@@ -478,13 +476,9 @@ def run_pipeline(
         )
         if backward is False:
             with torch.no_grad():
-                logprobs, entropy = memory_logprobs_entropy_from_hidden(
-                    causal_lm, hidden, labels, **tiled_kwargs
-                )
+                logprobs, entropy = memory_logprobs_entropy_from_hidden(causal_lm, hidden, labels, **tiled_kwargs)
         else:
-            logprobs, entropy = memory_logprobs_entropy_from_hidden(
-                causal_lm, hidden, labels, **tiled_kwargs
-            )
+            logprobs, entropy = memory_logprobs_entropy_from_hidden(causal_lm, hidden, labels, **tiled_kwargs)
         model_outputs["logprobs"] = logprobs
         if entropy is not None:
             model_outputs["entropy"] = entropy

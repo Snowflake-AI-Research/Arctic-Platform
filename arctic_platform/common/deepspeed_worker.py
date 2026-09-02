@@ -45,10 +45,10 @@ from arctic_platform.common.utils import log_dp_shard_tokens
 from arctic_platform.common.utils import merge_dict_shards
 from arctic_platform.common.utils import split_dict
 from arctic_platform.common.utils import unpack_batch
-from arctic_platform.common.utils.tiled_logits import fill_logits_opt_from_worker_config
 from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
+from arctic_platform.common.utils.tiled_logits import fill_logits_opt_from_worker_config
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
 
