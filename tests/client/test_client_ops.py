@@ -514,7 +514,7 @@ class TestUnifiedConfigDoesNotReadEnv:
 
 class TestCortexNoopOffload:
     """``to_cortex`` drops ``offload_*: {device: none}`` from the forwarded
-    ds_config. Neutrino builds the optimizer from the lifted typed ``optimizer``
+    ds_config. Cortex builds the optimizer from the lifted typed ``optimizer``
     and lands on DeepSpeedCPUAdam, so an explicit no-op offload block moves only
     the parameters to GPU and ``step()`` asserts "CPUAdam param is on cuda:0"."""
 

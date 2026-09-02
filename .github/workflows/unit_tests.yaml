@@ -52,11 +52,11 @@ jobs:
           source .venv/bin/activate
           echo "$VIRTUAL_ENV/bin" >> $GITHUB_PATH
           echo "VIRTUAL_ENV=$VIRTUAL_ENV" >> $GITHUB_ENV
-          # torchaudio/torchvision as well as torch: [rl] pulls all three in
-          # transitively, and if they are not already present the resolve below
-          # takes the PyPI wheels, which are CUDA builds. Those land next to a
-          # CPU torch and fail at import with `libcudart.so.13: cannot open
-          # shared object file`, which only shows up when the venv cache misses.
+          # torchaudio/torchvision alongside torch because vllm, via [rl], pins
+          # both exactly -- they get installed either way, and the PyPI wheels
+          # are CUDA builds that cannot load next to a CPU torch. tests/zorro_train
+          # reaches torchaudio through transformers.processing_utils, so it fails
+          # at collection with `libcudart.so.13: cannot open shared object file`.
           uv pip install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cpu
           # [rl] declares arctic-inference and vllm, so this resolves the whole stack.
           # ArcticInference builds a native nanobind extension via CMake. actions/setup-python exports

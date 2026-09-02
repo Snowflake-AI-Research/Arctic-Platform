@@ -374,7 +374,7 @@ def _without_noop_offload(ds_config: dict[str, Any]) -> dict[str, Any]:
     """Drop ``offload_optimizer/offload_param: {device: none}`` from a ds_config.
 
     To DeepSpeed, ``device: none`` and an absent key mean the same thing; to
-    Neutrino they don't. It builds the optimizer from the typed ``optimizer``
+    Cortex they don't. It builds the optimizer from the typed ``optimizer``
     field lifted above and settles on ``DeepSpeedCPUAdam``, so forwarding an
     explicit no-op offload block moves only the parameters onto the GPU and the
     first ``step()`` dies with::

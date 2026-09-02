@@ -44,12 +44,8 @@ __all__ = ["main"]
 def _create_cortex_client(config: Any, server_state: Any = None) -> Any:
     """Stand-in for upstream's ``create_arctic_rl_client``.
 
-    Same two call shapes upstream uses -- ``(rl_config)`` when it provisions and
-    ``(reconnect_config, server_state)`` when the worker reattaches. The
-    reconnect config carries the job ids, so the second call adopts the jobs the
-    first one created rather than provisioning again. Cortex owns the GPUs in
-    its own sub-jobs, so there is no in-process Ray server for ``server_state``
-    to describe and it is accepted only to match the signature.
+    ``server_state`` exists only to match upstream's signature: Cortex holds the
+    GPUs in its own sub-jobs, so there is no in-process Ray server to describe.
     """
     from arctic_platform.integrations._cortex_dispatch import create_cortex_client
 
