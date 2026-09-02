@@ -62,7 +62,7 @@ LORA_TARGET_MODULES = (
 
 # Connection keys `CortexConfig` understands; anything else in the JSON (verify_ssl,
 # poll_interval, ...) belonged to the old client and is ignored.
-_BACKEND_KEYS = ("base_url", "host", "pat", "pat_env_var", "database", "schema", "endpoint", "max_retries")
+_BACKEND_KEYS = ("base_url", "host", "pat", "database", "schema", "endpoint", "max_retries")
 
 
 def load_backend(config_path: str) -> CortexConfig:

@@ -292,6 +292,17 @@ class CortexTransport(Transport):
         with contextlib.suppress(requests.exceptions.RequestException):
             self._send("POST", f"{self._prefix}/{self.job_id}:cancel")
 
+    def list_jobs(self) -> list[dict]:
+        """Every Cortex job on this account, with its status."""
+        payload = self._send("GET", self._prefix)
+        if isinstance(payload, list):
+            return payload
+        return payload.get("jobs") or payload.get("data") or []
+
+    def cancel_job(self, job_id: str) -> None:
+        """Release one job's GPUs by id."""
+        self._send("POST", f"{self._prefix}/{job_id}:cancel")
+
     # ── deliver one op: submit + poll to completion ──────────────────────────
     def call(self, request: Request) -> dict:
         if request.op in _NOOP_OPS:
@@ -455,11 +466,23 @@ class CortexTransport(Transport):
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
         while time.monotonic() < deadline:
-            state = _short(self._job().get("status"))
+            job = self._job()
+            state = _short(job.get("status"))
             if state == "running":
                 return
             if state in _JOB_TERMINAL:
-                raise RuntimeError(f"cortex job {self.job_id} reached terminal state '{state}'")
+                # Surface the server-side reason and any per-sub-job status so
+                # callers can distinguish rate limits, allowlist rejections,
+                # capacity exhaustion, and genuine sub-job crashes.
+                reason = job.get("reason") or "(no reason)"
+                sub_states = ", ".join(
+                    f"{_short(sj.get('job_type', ''), 'job_type_')}={_short(sj.get('status'))}"
+                    for sj in (job.get("sub_jobs") or [])
+                )
+                detail = f" reason={reason!r}"
+                if sub_states:
+                    detail += f" sub_jobs=[{sub_states}]"
+                raise RuntimeError(f"cortex job {self.job_id} reached terminal state '{state}';{detail}")
             time.sleep(delay)
             delay = _next_delay(delay)
         raise TimeoutError(f"cortex job {self.job_id} did not become running within {self.poll_timeout}s")
@@ -490,8 +513,8 @@ class CortexTransport(Transport):
         cx = self.config.backend
         if cx.base_url is not None:  # local/dev host: no PAT auth
             return {}
-        return {  # config validated resolve_pat() is present for host/PAT auth
-            "Authorization": f"Bearer {cx.resolve_pat()}",
+        return {  # config validated the PAT is present for host/PAT auth
+            "Authorization": f"Bearer {cx.pat.get_secret_value()}",
             "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
         }
 
@@ -509,7 +532,9 @@ class CortexTransport(Transport):
         def attempt() -> dict:
             resp = self.session.request(method, url, timeout=self.request_timeout, **kwargs)
             _raise_for_status(resp)
-            return resp.json()
+            # `:cancel` answers 200 with an empty body. Decoding that as JSON
+            # would report an already-completed release as a failure.
+            return resp.json() if resp.content.strip() else {}
 
         retryer = Retrying(
             retry=retry_if_exception(retry_on or _is_transient),

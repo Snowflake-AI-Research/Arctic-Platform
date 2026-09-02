@@ -164,8 +164,11 @@ cython_debug/
 # Arctic Synth work directory
 batch_work_dir/
 
-# Hydra run artifacts from recipe launchers
+# Hydra run artifacts from recipe launchers. Hydra writes to the process's cwd,
+# which is the repo root when a launcher is invoked by path (the documented way
+# to run the Cortex recipes) -- so the recipes/ pattern alone misses them.
 recipes/**/outputs/
+/outputs/
 
 # Client recipe connection configs — these hold a Snowflake PAT. The checked-in
 # config.json.template is not matched (it does not end in .json).
