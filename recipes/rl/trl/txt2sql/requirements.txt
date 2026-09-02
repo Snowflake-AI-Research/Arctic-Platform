@@ -7,11 +7,11 @@
 # arctic-inference owns the validated vLLM pin (0.26). overrides.txt forces the
 # few transitive deps that otherwise drift on that stack.
 
+accelerate
 # Arctic + TRL adapter extra (editable install of this repo still required)
 arctic-platform[rl]
 datasets
-accelerate
-wandb
+kernels>=0.16.0,<0.17.0
 # Native C1 `vllm serve` / transformers 5.x on the 0.26 stack
 openai>=2.54.0
-kernels>=0.16.0,<0.17.0
+wandb
