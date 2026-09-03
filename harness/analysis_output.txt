@@ -1,0 +1,30 @@
+ seed      arm  steps  first30   last30    delta      t  slope/100   ratio        kl
+--------------------------------------------------------------------------------------
+    7   normal    100   0.4624   0.6539  +0.1914   3.37    +0.2879  1.0006  6.59e-04
+    7  control    100   0.1398   0.0010  -0.1387  -4.49    -0.2071  1.0007  7.09e-04
+   42   normal    100   0.4675   0.6183  +0.1508   2.68    +0.2604  1.0006  6.65e-04
+   42  control    100   0.1612   0.0020  -0.1592  -4.34    -0.2415  1.0007  7.53e-04
+  123   normal    100   0.4749   0.6275  +0.1526   2.58    +0.2522  1.0006  6.53e-04
+  123  control    100   0.1390   0.0000  -0.1390  -4.27    -0.2086  1.0007  8.22e-04
+
+======================================================================================
+PAIRED: same seed, same data order, only the advantage sign differs
+======================================================================================
+ seed  normal delta  control delta   separation
+    7       +0.1914        -0.1387      +0.3302
+   42       +0.1508        -0.1592      +0.3100
+  123       +0.1526        -0.1390      +0.2916
+
+across 3 seeds:
+  normal reward delta         +0.1649  (sd 0.0230, sem 0.0133, n=3)
+  control reward delta        -0.1457  (sd 0.0118, sem 0.0068, n=3)
+  normal slope /100 steps     +0.2668  (sd 0.0187, sem 0.0108, n=3)
+  control slope /100 steps    -0.2191  (sd 0.0194, sem 0.0112, n=3)
+  paired separation           +0.3106  (sd 0.0193, sem 0.0112, n=3)
+
+VERDICT
+  normal improves on every seed ..... True  [0.191, 0.151, 0.153]
+  normal beats control on every seed  True  [0.33, 0.31, 0.292]
+  importance ratio ~1 (no drift) .... True  [1.0006, 1.0006, 1.0006]
+
+  PASS: reward improvement tracks the advantage sign on every seed.
