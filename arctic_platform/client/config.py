@@ -103,7 +103,14 @@ class CortexConfig(BaseSettings):
     # SecretStr so the token cannot ride along into a log line or a serialized
     # config: repr and model_dump render it as `**********`, and reading it
     # takes an explicit `.get_secret_value()`.
-    pat: SecretStr | None = Field(None, description="cortex: PAT; also read from ARCTIC_CORTEX_PAT.")
+    # An explicit alias opts the field out of `env_prefix`, so both env names
+    # have to be spelled out or ARCTIC_CORTEX_PAT is silently ignored. CORTEX_PAT
+    # is the name standalone recipes still document.
+    pat: SecretStr | None = Field(
+        None,
+        validation_alias=AliasChoices("pat", "ARCTIC_CORTEX_PAT", "CORTEX_PAT"),
+        description="cortex: PAT; also read from ARCTIC_CORTEX_PAT or CORTEX_PAT.",
+    )
     database: str = Field("", description="cortex: Snowflake database.")
     # `schema` shadows a BaseModel attribute, hence the trailing underscore. An
     # explicit alias opts the field out of `env_prefix`, so the env name has to
@@ -125,7 +132,7 @@ class CortexConfig(BaseSettings):
             if not (self.database and self.schema_):
                 raise ValueError("cortex: database + schema required for host/PAT auth.")
             if not (self.pat and self.pat.get_secret_value()):
-                raise ValueError("cortex: no PAT — set `pat` or ARCTIC_CORTEX_PAT for host auth.")
+                raise ValueError("cortex: no PAT — set `pat`, ARCTIC_CORTEX_PAT, or CORTEX_PAT for host auth.")
         return self
 
 

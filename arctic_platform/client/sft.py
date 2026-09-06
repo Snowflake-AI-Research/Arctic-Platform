@@ -66,9 +66,23 @@ def merge_sft_step_metrics(fwd_out: dict, step_out: dict | None) -> dict:
     return metrics
 
 
-def _sft_body(batch: dict, processing: dict | None = None) -> dict:
-    """The SFT loss contract: bodies carry ``processing`` + ``meta`` unless the caller set them."""
+def _sft_body(batch: dict, processing: dict | None = None, *, cortex: bool = False) -> dict:
+    """The SFT loss contract: on-prem bodies carry ``processing`` + ``meta``.
+
+    Cortex does **not** register the on-prem short names (``loss_fn: sft``).
+    The zone derives CE from ``labels`` and rejects unknown processor names
+    with ``ValueError``. Leave ``processing`` off the wire unless the caller
+    passed an explicit override.
+    """
     body = dict(batch)
+    if cortex:
+        if processing is not None:
+            body["processing"] = processing
+        else:
+            body.pop("processing", None)
+        if body.get("meta") is None:
+            body.pop("meta", None)
+        return body
     if processing is not None:
         body["processing"] = processing
     else:
@@ -78,16 +92,25 @@ def _sft_body(batch: dict, processing: dict | None = None) -> dict:
 
 
 class ArcticSFTClient(ArcticClient):
-    """SFT frontend: forward bodies default to the ``sft`` loss unless the caller overrides."""
+    """SFT frontend: on-prem forward bodies default to the ``sft`` loss.
+
+    Cortex leaves ``processing`` unset so the zone is not handed an on-prem
+    processor name it does not register.
+    """
+
+    def _cortex(self) -> bool:
+        return getattr(self.config.backend, "protocol", None) == "cortex"
 
     def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
-        return super().fwd_bwd(_sft_body(batch, processing), router_replay=router_replay)
+        return super().fwd_bwd(
+            _sft_body(batch, processing, cortex=self._cortex()), router_replay=router_replay
+        )
 
     def fwd_no_grad(self, batch: dict, processing: dict | None = None) -> dict:
         # Narrower than the base on purpose: `reference_model` routes to the log-prob
         # engine, which an SFT run never allocates. `processing` stays in the same
         # position as on the base, so the dropped tail is a TypeError, not a mix-up.
-        return super().fwd_no_grad(_sft_body(batch, processing))
+        return super().fwd_no_grad(_sft_body(batch, processing, cortex=self._cortex()))
 
     def train_step(self, batch: dict, processing: dict | None = None) -> dict:
         """``fwd_bwd`` + ``step`` with a single merged ``metrics`` dict (RL ``update_actor``)."""
