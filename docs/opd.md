@@ -43,8 +43,31 @@ Do not land distillation work on the GRPO `TrainingClientProtocol` draft
 ([Arctic-Platform PR #84](https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/84)).
 That adapter is GRPO-only and is out of scope here.
 
-A CPU-only Arctic training-client path for async distillation is a follow-up
-change; it is not part of this client.
+## TRL async distillation training client
+
+TRL `AsyncDistillationTrainer` still loads a local student and has no
+`training_client=`. Use
+[`ArcticAsyncDistillationTrainer`](../arctic_platform/integrations/trl_distill/README.md)
+for a CPU-only driver: generate, teacher score, gather/fwd-bwd, step, and
+weight sync stay on Arctic. Do not extend PR #84.
+
+| Adapter | Role |
+|---|---|
+| `ArcticAsyncDistillationTrainer` | CPU-only driver; no local student load |
+| `ArcticOPDRolloutWorker` | TRL `rollout_worker=` shape |
+| `ArcticOPDWeightTransfer` | TRL `weight_transfer=` shape |
+| `ArcticOPDTrainingClient` | `forward_samples` for the CPU trainer; `forward_backward` matches TRL `TrainingClientProtocol` |
+| `gather_logits_at_ids` / `weighted_gathered_logit_sum` | Server gather + first-order surrogate |
+
+```python
+from arctic_platform.integrations.trl_distill import (
+    ArcticAsyncDistillationConfig,
+    create_arctic_async_distillation_trainer,
+)
+
+trainer = create_arctic_async_distillation_trainer(client, train_prompts, args)
+trainer.train()
+```
 
 ## vs TRL
 
@@ -105,11 +128,16 @@ from arctic_platform.opd import (
     score_teacher_topk,
     DEFAULT_PROCESSING,
 )
+from arctic_platform.integrations.trl_distill import (
+    ArcticAsyncDistillationTrainer,
+    create_arctic_async_distillation_trainer,
+)
 ```
 
 - Config: `arctic_platform.opd.config.ArcticOPDClientConfig`
 - Client: `arctic_platform.opd.client.ArcticOPDClient`
 - Teacher scoring: `arctic_platform.opd.scoring.score_teacher` / `score_teacher_topk`
+- TRL async adapters / CPU trainer: `arctic_platform.integrations.trl_distill`
 - Loss (server): `arctic_platform.rl.processors.on_policy_distill`
 
 ## Quick start

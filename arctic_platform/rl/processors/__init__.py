@@ -66,6 +66,10 @@ from .microbatch import split_padded_tensor_dict_into_mb_list
 # On-policy distillation (import registers "on_policy_distill").
 from .on_policy_distill import on_policy_distill_loss
 
+# TRL async distillation gather (registers gather_logits_at_ids / weighted_gathered_logit_sum).
+from .gather_logits import gather_logits_at_ids_post
+from .gather_logits import weighted_gathered_logit_sum
+
 # Packing utilities
 from .packing import N_TOKENS_PER_PAGE
 from .packing import _align
@@ -119,6 +123,8 @@ __all__ = [
     "identity_post",
     "compute_entropy_and_logprobs_post",
     "on_policy_distill_loss",
+    "gather_logits_at_ids_post",
+    "weighted_gathered_logit_sum",
     # packing
     "N_TOKENS_PER_PAGE",
     "_align",
