@@ -623,6 +623,18 @@ class ArcticRLRayServer:
         self.sampling_pool = ray.get(arctic_rl_ray_server_state.get_sampling_pool.remote())  # type: ignore
         self.log_prob_pool = ray.get(arctic_rl_ray_server_state.get_log_prob_pool.remote())  # type: ignore
         self.colocate = ray.get(arctic_rl_ray_server_state.get_colocate.remote())  # type: ignore
+        # Bound on first await (RayTransport loop). Serializes train-worker RPCs so
+        # replacing blocking ``ray.get`` cannot interleave two collectives on DP ranks.
+        self._training_op_lock = asyncio.Lock()
+
+    async def _gather_training_refs(self, submit_refs):
+        """Await worker ObjectRefs without blocking the transport event loop.
+
+        ``submit_refs`` must be a zero-arg callable that builds the refs *inside*
+        the lock so ``.remote()`` submissions stay contiguous per op.
+        """
+        async with self._training_op_lock:
+            return await asyncio.gather(*submit_refs())
 
     def _verify_job(self, job_id: int, expected_types: Union[str, list[str]]) -> None:
         info = self.jobs.get(job_id)
@@ -667,14 +679,11 @@ class ArcticRLRayServer:
             log_dp_shard_tokens(shard_rank, "ray_split_batch", shard_batch, shard_meta)
 
         tname = timers.start("xyz fwd_bwd: gather + forward_backward")
-        # results = await asyncio.gather(*[
-        #     w.forward_backward.remote(s) for w, s in zip(workers, shards)
-        # ])
-
         prof = ProfilerContext(type=PROFILER_TYPE, name="GATHER")
         with prof():
-            refs = [w.forward_backward.remote(s) for w, s in zip(workers, shards)]
-            results = ray.get(refs)
+            results = await self._gather_training_refs(
+                lambda: [w.forward_backward.remote(s) for w, s in zip(workers, shards)]
+            )
 
         timers.stop_and_print_elapsed(tname)
         prof.report()
@@ -713,17 +722,15 @@ class ArcticRLRayServer:
             raise ValueError(f"Job {job_id} ({job_type}) has no DeepSpeed workers")
         batch["meta"]["worker_return_tensors"] = True
 
-        # import zlib
-        # body = zlib.decompress(body)
-
-        # shards = ray_split_batch(batch, len(workers))
-        # results = await asyncio.gather(*[
-        #     w.forward_no_grad.remote(s) for w, s in zip(workers, shards)
-        # ])
-
         shards, reorder_indices = ray_split_batch(batch, len(workers))
-        refs = [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
-        results = ray.get(refs)
+
+        def _submit_forward():
+            return [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
+
+        if job_type == "training":
+            results = await self._gather_training_refs(_submit_forward)
+        else:
+            results = await asyncio.gather(*_submit_forward())
 
         pr0(f"[ArcticRLRayServer] fwd_no_grad: {len(results)=}")
 
@@ -744,9 +751,7 @@ class ArcticRLRayServer:
     async def step(self, job_id: int, body: dict[str, Any] | None = None) -> dict[str, Any]:
         # `body` is unused; accepted so the client can call with (job_id, body).
         self._verify_job(job_id, "training")
-        # results = await asyncio.gather(*[w.step.remote() for w in self.training_workers])
-        refs = [w.step.remote() for w in self.training_workers]
-        results = ray.get(refs)
+        results = await self._gather_training_refs(lambda: [w.step.remote() for w in self.training_workers])
         merged = dict(
             job_id=job_id,
             metrics=merge_dict_shards([r["metrics"] for r in results]),
@@ -775,13 +780,15 @@ class ArcticRLRayServer:
         path, prune_root = resolve_checkpoint_save_paths(root, step)
         os.makedirs(path, exist_ok=True)
         export_hf = bool(body.get("export_hf", False))
-        results = ray.get([w.save_checkpoint.remote(path, export_hf) for w in self.training_workers])
+        results = await self._gather_training_refs(
+            lambda: [w.save_checkpoint.remote(path, export_hf) for w in self.training_workers]
+        )
         if step is not None:
             with open(os.path.join(prune_root, "latest"), "w", encoding="utf-8") as f:
                 f.write(str(int(step)))
         limit = body.get("save_total_limit")
         if limit is not None and int(limit) > 0 and self.training_workers:
-            ray.get(self.training_workers[0].prune_checkpoint_dirs.remote(prune_root, int(limit)))
+            await self.training_workers[0].prune_checkpoint_dirs.remote(prune_root, int(limit))
         hf_path = results[0].get("hf_path") if results and isinstance(results[0], dict) else None
         global_step = results[0].get("global_step") if results and isinstance(results[0], dict) else None
         return {"job_id": job_id, "path": path, "hf_path": hf_path, "global_step": global_step}
@@ -803,7 +810,9 @@ class ArcticRLRayServer:
                         path = os.path.join(path, f"checkpoint-{int(f.read().strip())}")
                 except ValueError:
                     pass
-        steps = ray.get([w.load_checkpoint.remote(path) for w in self.training_workers])
+        steps = await self._gather_training_refs(
+            lambda: [w.load_checkpoint.remote(path) for w in self.training_workers]
+        )
         return {"job_id": job_id, "path": path, "global_step": int(steps[0]) if steps else 0}
 
     async def sleep_inference(self, job_id: int, body: dict[str, Any] | int | None = None):
