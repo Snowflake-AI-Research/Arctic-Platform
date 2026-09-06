@@ -23,14 +23,15 @@ Arctic Platform aims to cover the full post-training stack for LLMs behind a sma
 What is available today:
 
 * [**Arctic Reinforcement Learning**](#arctic-reinforcement-learning) — a high-throughput RL training/inference backend that plugs into existing RL frameworks ([docs/rl.md](docs/rl.md)).
+* [**On-policy distillation**](docs/opd.md) — student train+sample plus a frozen teacher (`ArcticOPDClient`); complementary to TRL DistillationTrainer, not a drop-in.
 * [**ZoRRo Train**](#zorro-train) — a prompt-deduplication optimization that removes redundant prompt computation during RL training ([docs/rl.md#zorro-train](docs/rl.md#zorro-train)).
 * [**ZoRRo Inference**](#zorro-inference) — forest cascade attention for efficient rollout step that eliminates redundant memory accesses via grouping ([docs/rl.md#zorro-inference-forest-cascade-attention](docs/rl.md#zorro-inference-forest-cascade-attention)).
 
-Full documentation index: [docs/index.md](docs/index.md) (RL, shared server infra; SFT docs forthcoming).
+Full documentation index: [docs/index.md](docs/index.md) (SFT, RL, OPD, shared server infra).
 
 What's coming next:
 
-* additional trainers (SFT/distillation), synthetic data generation and cleaning pipelines, and tighter inference integration.
+* additional trainers, synthetic data generation and cleaning pipelines, and tighter inference integration.
 
 ## Arctic Reinforcement Learning
 

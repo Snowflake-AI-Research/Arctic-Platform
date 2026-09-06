@@ -302,6 +302,34 @@ def test_kl_len_adj_matches_xyu_446z0mnb():
     assert math.isclose(adj, 0.004657178530134034, rel_tol=1e-9)
 
 
+def _record_from_fwd_metrics(fwd_metrics: dict[str, float]) -> dict[str, Any]:
+    return build_step_record(
+        step=1,
+        learning_rate=1e-5,
+        result={
+            "forward_backward": {"metrics": fwd_metrics},
+            "step": {"metrics": {}},
+            "n_rollouts": 16,
+            "tokens_scored": 26624,
+            "times": {},
+        },
+        tokens_cumulative=26624,
+        elapsed_s=1.0,
+        wandb_len_ref=4096.0,
+        wandb_len_exponent=0.486,
+    )
+
+
+def test_paired_kl_sum_uses_token_count_not_per_rollout_average():
+    # distill_kl_count is a per-rollout average (scored/16), never a token count.
+    # Pairing a global sum with it would report a batch-size-times-too-large KL.
+    record = _record_from_fwd_metrics({"loss": 0.1, "distill_kl.sum": 3200.0, "distill_kl.tokens": 26624.0})
+    assert math.isclose(record["kl/per_token"], 3200.0 / 26624.0, rel_tol=1e-12)
+
+    starved = _record_from_fwd_metrics({"loss": 0.1, "distill_kl.sum": 3200.0, "distill_kl_count": 1664.0})
+    assert math.isnan(starved["kl/per_token"])
+
+
 def test_build_step_record_xyu_groups():
     result = {
         "forward_backward": {

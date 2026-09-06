@@ -18,6 +18,7 @@ from __future__ import annotations
 import pytest
 
 from arctic_platform.opd.scoring import score_teacher
+from arctic_platform.opd.scoring import score_teacher_topk
 
 
 class Teacher:
@@ -42,6 +43,45 @@ def test_teacher_scores_exact_completion_token_ids():
         [{"prompt_ids": [1, 2], "completion_ids": [3, 4], "sampler_logprobs": [-0.4, -0.5]}],
     )
     assert scored[0]["teacher_logprobs"] == [-0.2, -0.3]
+
+
+def test_teacher_topk_keeps_support_and_tail():
+    class TopKTeacher:
+        def generate_teacher(self, prompts, sampling_params):
+            assert sampling_params["prompt_logprobs"] == 2
+            return [
+                {
+                    "prompt_logprobs": [
+                        None,
+                        {2: -0.1},
+                        {3: -0.2, 9: -1.0},
+                        {4: -0.3, 8: -2.0},
+                    ]
+                }
+            ]
+
+    scored = score_teacher_topk(
+        TopKTeacher(),
+        [{"prompt_ids": [1, 2], "completion_ids": [3, 4]}],
+        teacher_top_k=2,
+    )
+    row = scored[0]
+    assert row["teacher_token_ids"] == [[3, 9], [4, 8]]
+    assert row["teacher_logprobs"] == [[-0.2, -1.0], [-0.3, -2.0]]
+    assert len(row["teacher_tail_logprob"]) == 2
+
+
+def test_teacher_topk_requires_realized_token():
+    class MissingRealized:
+        def generate_teacher(self, prompts, sampling_params):
+            return [{"prompt_logprobs": [None, {9: -0.1}]}]
+
+    with pytest.raises(RuntimeError, match="absent"):
+        score_teacher_topk(
+            MissingRealized(),
+            [{"prompt_ids": [1], "completion_ids": [2]}],
+            teacher_top_k=1,
+        )
 
 
 def test_teacher_alignment_mismatch_fails():

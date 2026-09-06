@@ -675,20 +675,23 @@ def build_step_record(
     tokens_scored = int(result.get("tokens_scored") or 0)
     tokens_per_rollout = tokens_scored / n_rollouts if n_rollouts else 0.0
     loss = _metric(metrics.get("loss", float("nan")))
-    kl_count = _maybe_metric(metrics.get("distill_kl.tokens")) or _maybe_metric(metrics.get("distill_kl_count"))
+    # Only the paired ``.tokens`` key is a token count. ``distill_kl_count`` survives
+    # the combiner as a per-rollout average, so dividing a global sum by it reports a
+    # batch-size-times-too-large KL -- the rank-scope mismatch that corrupted xyu's runs.
+    kl_tokens = _maybe_metric(metrics.get("distill_kl.tokens"))
     paired_kl_sum = _maybe_metric(metrics.get("distill_kl.sum"))
-    if paired_kl_sum is not None and kl_count:
-        kl_per_token = paired_kl_sum / kl_count
+    if paired_kl_sum is not None and kl_tokens:
+        kl_per_token = paired_kl_sum / kl_tokens
     elif "distill_kl" in metrics:
         kl_per_token = _metric(metrics["distill_kl"])
-    elif metrics.get("distill_kl_sum") is not None and kl_count:
-        kl_per_token = _metric(metrics["distill_kl_sum"]) / kl_count
+    elif metrics.get("distill_kl_sum") is not None and kl_tokens:
+        kl_per_token = _metric(metrics["distill_kl_sum"]) / kl_tokens
     else:
         kl_per_token = float("nan")
     if "distill_k1" in metrics:
         k1_per_token: float | None = _metric(metrics["distill_k1"])
-    elif metrics.get("distill_k1_sum") is not None and kl_count:
-        k1_per_token = _metric(metrics["distill_k1_sum"]) / kl_count
+    elif metrics.get("distill_k1_sum") is not None and kl_tokens:
+        k1_per_token = _metric(metrics["distill_k1_sum"]) / kl_tokens
     else:
         k1_per_token = None
     record: dict[str, Any] = {

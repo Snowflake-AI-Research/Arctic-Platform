@@ -61,6 +61,10 @@ class ArcticOPDClient:
 
     The teacher has ``training_gpus=0``; only ``generate`` is used. Weight sync
     runs on the student (train → student sampler) and never targets the teacher.
+
+    This is not TRL ``DistillationTrainer``. Arctic uses a single-logit reverse-KL
+    estimator on the sampled token; TRL matches a (full or top-k) next-token
+    distribution with generalized JSD. See ``docs/opd.md``.
     """
 
     def __init__(self, config: ArcticOPDClientConfig) -> None:
@@ -100,6 +104,10 @@ class ArcticOPDClient:
 
     def fwd_bwd(self, batch: dict, processing: dict | None = None, meta: dict | None = None) -> dict:
         return self.student.fwd_bwd(_fwd_bwd_body(self.config, batch, processing, meta))
+
+    def fwd_no_grad(self, batch: dict, processing: dict | None = None, meta: dict | None = None) -> dict:
+        """Student training-engine forward without backward. Used by the TRL distill client."""
+        return self.student.fwd_no_grad(_fwd_bwd_body(self.config, batch, processing, meta))
 
     def step(self, learning_rate: float | None = None) -> dict:
         return self.student.step(learning_rate)

@@ -113,6 +113,15 @@ def test_fwd_bwd_defaults_distill_processing(client):
     assert request.body["context"] == {"input_ids": [1]}
 
 
+def test_fwd_no_grad_uses_same_envelope(client):
+    opd, transports = client
+    opd.fwd_no_grad({"input_ids": [1]})
+    request = transports[0].calls[-1]
+    assert request.op == "forward"
+    assert request.job_id == 11
+    assert request.body["processing"] == DEFAULT_PROCESSING
+
+
 def test_onprem_fwd_bwd_uses_structured_batch_envelope():
     cfg = ArcticOPDClientConfig(
         student_model="student",
