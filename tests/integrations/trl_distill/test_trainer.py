@@ -52,7 +52,7 @@ class FakeOPD:
         gather = batch["gather_token_ids"]
         gathered = torch.zeros(*gather.shape)
         gathered[..., 0] = 0.5
-        return {"batch": {"gathered_logits": gathered}}
+        return {"batch": {"gathered_logits": gathered, "logit_logsumexp": torch.zeros(*gather.shape[:2])}}
 
     def fwd_bwd(self, batch, processing=None, meta=None):
         del batch, processing, meta
@@ -83,7 +83,8 @@ def test_jsd_forward_kl_is_finite():
     logits = torch.zeros(1, 2, 2)
     teacher = torch.tensor([[[-0.2, -1.0], [-0.3, -2.0]]])
     mask = torch.tensor([[True, True]])
-    loss = generalized_jsd(logits, teacher, mask, beta=0.0, add_tail_bucket=True)
+    lse = torch.logsumexp(logits.float(), dim=-1)
+    loss = generalized_jsd(logits, teacher, mask, beta=0.0, add_tail_bucket=True, student_logit_logsumexp=lse)
     assert torch.isfinite(loss)
     assert loss.ndim == 0
 

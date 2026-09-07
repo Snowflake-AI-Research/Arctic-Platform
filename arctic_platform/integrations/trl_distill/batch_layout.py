@@ -57,17 +57,20 @@ def samples_to_train_batch(
     support = max_support(samples)
     if support < 1:
         raise ValueError("teacher support is empty")
+    prompt_width = max(len(sample.prompt_ids) for sample in samples)
 
     input_ids = torch.full((batch_size, seq_len), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((batch_size, seq_len), dtype=torch.long)
     loss_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool)
-    gather_token_ids = torch.zeros((batch_size, seq_len, support), dtype=torch.long)
+    gather_token_ids = torch.full((batch_size, seq_len, support), -1, dtype=torch.long)
     teacher_logprobs = torch.full((batch_size, seq_len, support), float("-inf"))
+    prompts = torch.full((batch_size, prompt_width), pad_token_id, dtype=torch.long)
 
     for row_index, (sample, full_ids) in enumerate(zip(samples, rows)):
         length = len(full_ids)
         input_ids[row_index, :length] = torch.tensor(full_ids, dtype=torch.long)
         attention_mask[row_index, :length] = 1
+        prompts[row_index, : len(sample.prompt_ids)] = torch.tensor(sample.prompt_ids, dtype=torch.long)
         start = len(sample.prompt_ids) - 1
         stop = start + len(sample.completion_ids)
         loss_mask[row_index, start:stop] = True
@@ -82,4 +85,29 @@ def samples_to_train_batch(
         "loss_mask": loss_mask,
         "gather_token_ids": gather_token_ids,
         "teacher_logprobs": teacher_logprobs,
+        "prompts": prompts,
     }
+
+
+def unpack_packed_row(
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    pad_token_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a padding-free packed row (``position_ids`` resets) into padded rows."""
+    ids = input_ids.reshape(-1)
+    pos = position_ids.reshape(-1)
+    starts = (pos == 0).nonzero(as_tuple=False).flatten().tolist()
+    if not starts:
+        starts = [0]
+    bounds = starts + [ids.numel()]
+    rows = [ids[lo:hi] for lo, hi in zip(bounds, bounds[1:]) if hi > lo]
+    if not rows:
+        raise ValueError("unpack_packed_row found no tokens")
+    width = max(int(row.numel()) for row in rows)
+    padded = torch.full((len(rows), width), pad_token_id, dtype=ids.dtype)
+    mask = torch.zeros((len(rows), width), dtype=torch.long)
+    for i, row in enumerate(rows):
+        padded[i, : row.numel()] = row
+        mask[i, : row.numel()] = 1
+    return padded, mask

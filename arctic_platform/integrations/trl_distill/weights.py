@@ -39,9 +39,7 @@ class ArcticOPDWeightTransfer:
         if iterator is not None:
             for _name, _tensor in iterator:
                 pass
-        result = self.client.sync_weights()
-        self.client.reset_student_prefix_cache()
-        return result
+        return self.client.sync_weights()
 
     def resume(self) -> None:
         return None

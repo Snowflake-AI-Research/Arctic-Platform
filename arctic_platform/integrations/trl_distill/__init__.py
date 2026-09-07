@@ -25,6 +25,7 @@ until TRL adds ``training_client=``.
 
 from arctic_platform.integrations.trl_distill.client import ArcticOPDOptimizer
 from arctic_platform.integrations.trl_distill.client import ArcticOPDTrainingClient
+from arctic_platform.integrations.trl_distill.client import DistillationForwardBackwardOutput
 from arctic_platform.integrations.trl_distill.client import ForwardBackwardOutput
 from arctic_platform.integrations.trl_distill.config import ArcticAsyncDistillationConfig
 from arctic_platform.integrations.trl_distill.rollout import ArcticOPDRolloutWorker
@@ -41,6 +42,7 @@ __all__ = [
     "ArcticOPDRolloutWorker",
     "ArcticOPDTrainingClient",
     "ArcticOPDWeightTransfer",
+    "DistillationForwardBackwardOutput",
     "ForwardBackwardOutput",
     "RemoteStudentStub",
     "RolloutSample",

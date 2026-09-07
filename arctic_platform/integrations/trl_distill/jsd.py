@@ -10,10 +10,15 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
+# See the License for the specific language governing terms and
 # limitations under the License.
 
-"""Generalized JSD on a sparse teacher support (CPU)."""
+"""Generalized JSD on a sparse teacher support (CPU).
+
+Student log-probs at the gathered ids must be full-vocab ``log_softmax`` values:
+``gathered_logits - logit_logsumexp``. That is what TRL's chunked JSD path
+computes by projecting the full vocabulary, then gathering.
+"""
 
 from __future__ import annotations
 
@@ -22,11 +27,27 @@ import torch.nn.functional as F
 
 
 def _add_tail_bucket(log_probs: torch.Tensor, valid_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    log_sum = torch.logsumexp(torch.where(valid_mask, log_probs, torch.full_like(log_probs, float("-inf"))), dim=-1, keepdim=True)
+    masked = torch.where(valid_mask, log_probs, torch.full_like(log_probs, float("-inf")))
+    log_sum = torch.logsumexp(masked, dim=-1, keepdim=True)
     log_sum = torch.clamp(log_sum, max=-1e-7)
     tail = torch.log(-torch.expm1(log_sum))
     tail_mask = torch.ones((*valid_mask.shape[:-1], 1), dtype=torch.bool, device=valid_mask.device)
     return torch.cat([log_probs, tail], dim=-1), torch.cat([valid_mask, tail_mask], dim=-1)
+
+
+def _full_vocab_student_logprobs(
+    student_logits_k: torch.Tensor,
+    student_logit_logsumexp: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    lse = student_logit_logsumexp
+    if lse.shape != student_logits_k.shape[:-1]:
+        raise ValueError(
+            f"student_logit_logsumexp shape {tuple(lse.shape)} must be "
+            f"{tuple(student_logits_k.shape[:-1])} (per position, full-vocab logsumexp)"
+        )
+    student_logp = student_logits_k.float() - lse.unsqueeze(-1).float()
+    return student_logp.masked_fill(~valid, float("-inf"))
 
 
 def generalized_jsd(
@@ -36,18 +57,28 @@ def generalized_jsd(
     *,
     beta: float = 0.0,
     add_tail_bucket: bool = True,
+    student_logit_logsumexp: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Token-mean generalized JSD. ``beta=0`` forward KL, ``beta=1`` reverse KL."""
+    """Token-mean generalized JSD. ``beta=0`` forward KL, ``beta=1`` reverse KL.
+
+    ``student_logit_logsumexp`` is required: without the full-vocab logsumexp the
+    student is normalized over K only and the tail bucket is a constant.
+    """
+    if student_logit_logsumexp is None:
+        raise ValueError(
+            "generalized_jsd requires student_logit_logsumexp from gather_logits_at_ids"
+        )
     valid = torch.isfinite(teacher_logprobs_k)
-    student_logits = student_logits_k.masked_fill(~valid, float("-inf"))
     teacher_logp = teacher_logprobs_k.masked_fill(~valid, float("-inf"))
+    student_logp = _full_vocab_student_logprobs(student_logits_k, student_logit_logsumexp, valid)
     if add_tail_bucket:
-        student_logp = torch.log_softmax(student_logits, dim=-1)
         student_logp, student_valid = _add_tail_bucket(student_logp, valid)
         teacher_logp, teacher_valid = _add_tail_bucket(teacher_logp, valid)
         support = student_valid & teacher_valid
     else:
-        student_logp = torch.log_softmax(student_logits, dim=-1)
+        neg_inf = torch.full((), float("-inf"), dtype=student_logp.dtype, device=student_logp.device)
+        student_logp = student_logp - torch.logsumexp(torch.where(valid, student_logp, neg_inf), dim=-1, keepdim=True)
+        teacher_logp = teacher_logp - torch.logsumexp(torch.where(valid, teacher_logp, neg_inf), dim=-1, keepdim=True)
         support = valid
 
     if beta == 0.0:

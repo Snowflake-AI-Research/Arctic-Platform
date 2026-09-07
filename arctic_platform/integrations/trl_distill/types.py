@@ -13,14 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TRL-free rollout sample for async distillation."""
+"""TRL-shaped rollout sample for async distillation, without importing TRL."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
-@dataclass(frozen=True)
+@dataclass
 class RolloutSample:
     prompt_ids: list[int]
     completion_ids: list[int]
@@ -28,3 +28,24 @@ class RolloutSample:
     teacher_token_ids: list[list[int]]
     teacher_logprobs: list[list[float]]
     teacher_tail_logprob: list[float] | None = None
+    teacher_id: str = "default"
+    prompt_id: int = 0
+    model_version: int = 0
+    enqueued_at: float = 0.0
+    metrics: dict = field(default_factory=dict)
+
+    @property
+    def input_ids(self) -> list[int]:
+        return list(self.prompt_ids) + list(self.completion_ids)
+
+    @property
+    def completion_mask(self) -> list[int]:
+        return [0] * len(self.prompt_ids) + [1] * len(self.completion_ids)
+
+    @property
+    def teacher_topk_ids(self) -> list[list[int]]:
+        return [[] for _ in self.prompt_ids] + list(self.teacher_token_ids)
+
+    @property
+    def teacher_topk_logprobs(self) -> list[list[float]]:
+        return [[] for _ in self.prompt_ids] + list(self.teacher_logprobs)

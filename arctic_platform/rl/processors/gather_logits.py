@@ -10,15 +10,18 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
+# See the License for the specific language governing terms and
 # limitations under the License.
 
 """Sparse logit gather for TRL async distillation.
 
 ``gather_token_ids`` is ``[B, S, K]`` in the same frame as model logits
-(next-token / roll(-1) aligned). The surrogate ``weighted_gathered_logit_sum``
-is ``sum(w * gathered_logits)`` so TRL can evaluate JSD in-process and ship
-``dL/d(logits_k)``.
+(next-token / roll(-1) aligned). Also returns per-position full-vocab
+``logit_logsumexp`` so the client can recover ``log_softmax`` at those ids.
+
+The surrogate ``weighted_gathered_logit_sum`` is
+``dp_size * (sum(w_k * gathered) + sum(w_lse * logsumexp))`` so a CPU JSD can
+ship ``dL/d(gathered)`` and ``dL/d(logsumexp)``.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from arctic_platform.common.registry import register_post_processor
 
 @register_post_processor("gather_logits_at_ids")
 def gather_logits_at_ids_post(model_outputs: dict, batch: dict, meta: dict, device: str) -> dict:
-    """Gather ``logits[..., ids]`` without sending the full vocab over the wire."""
+    """Gather ``logits[..., ids]`` and the per-position vocab ``logsumexp``."""
     del meta, device
     if "logits" not in model_outputs:
         raise ValueError("gather_logits_at_ids requires model_outputs['logits']")
@@ -49,8 +52,11 @@ def gather_logits_at_ids_post(model_outputs: dict, batch: dict, meta: dict, devi
         raise ValueError(
             f"gather_token_ids leading dims {tuple(ids.shape[:2])} != logits {tuple(logits.shape[:2])}"
         )
-    gathered = torch.gather(logits, dim=-1, index=ids.long())
-    return {"gathered_logits": gathered}
+    safe_ids = ids.long().clamp(min=0)
+    gathered = torch.gather(logits, dim=-1, index=safe_ids)
+    gathered = gathered.masked_fill(ids < 0, 0)
+    logit_logsumexp = torch.logsumexp(logits.float(), dim=-1)
+    return {"gathered_logits": gathered, "logit_logsumexp": logit_logsumexp}
 
 
 @register_loss_fn("weighted_gathered_logit_sum")
@@ -61,8 +67,8 @@ def weighted_gathered_logit_sum(
     config: dict,
     device: str,
 ) -> tuple[torch.Tensor, dict]:
-    """First-order surrogate: ``sum(logit_weights * gathered_logits)``."""
-    del meta, config, device
+    """First-order surrogate of a loss on gathered logits + full-vocab logsumexp."""
+    del config, device
     logits_k = model_outputs.get("gathered_logits")
     if logits_k is None:
         raise ValueError("weighted_gathered_logit_sum requires post=['gather_logits_at_ids']")
@@ -76,4 +82,14 @@ def weighted_gathered_logit_sum(
     if weights.shape != logits_k.shape:
         raise ValueError(f"logit_weights {tuple(weights.shape)} != gathered_logits {tuple(logits_k.shape)}")
     loss = (logits_k * weights).sum()
+    lse = model_outputs.get("logit_logsumexp")
+    lse_weights = batch.get("logsumexp_weights")
+    if lse is not None and lse_weights is not None:
+        if not torch.is_tensor(lse_weights):
+            lse_weights = torch.as_tensor(lse_weights, device=lse.device, dtype=lse.dtype)
+        else:
+            lse_weights = lse_weights.to(device=lse.device, dtype=lse.dtype)
+        loss = loss + (lse * lse_weights).sum()
+    dp_size = float(meta.get("dp_size", 1) or 1)
+    loss = loss * dp_size
     return loss, {"gathered_logit_sum": float(loss.detach())}

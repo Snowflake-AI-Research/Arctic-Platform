@@ -22,6 +22,8 @@ without importing TRL. Generation is remote; this process stays CPU-only.
 from __future__ import annotations
 
 import queue
+import time
+from collections.abc import Sequence
 from typing import Any
 
 from arctic_platform.integrations.trl_distill.types import RolloutSample
@@ -56,6 +58,8 @@ class ArcticOPDRolloutWorker:
         temperature: float = 1.0,
         teacher_temperature: float = 1.0,
         add_tail_bucket: bool = True,
+        prompt_source: Sequence[list[int]] | None = None,
+        max_tokens: int = 32,
     ) -> None:
         self.client = client
         self.teacher_top_k = teacher_top_k
@@ -63,22 +67,38 @@ class ArcticOPDRolloutWorker:
         self.teacher_temperature = teacher_temperature
         self.add_tail_bucket = add_tail_bucket
         self.rollout_buffer: queue.Queue[RolloutSample] = queue.Queue()
+        self.metrics_queue: queue.Queue[dict] = queue.Queue()
         self.model_version = 0
         self._started = False
+        self._prompt_source = [list(row) for row in prompt_source] if prompt_source else []
+        self._max_tokens = max_tokens
+        self._prompt_index = 0
 
     def start(self) -> None:
         self._started = True
+        if self._prompt_source:
+            self._enqueue(self._prompt_source, max_tokens=self._max_tokens)
 
     def stop(self) -> None:
         self._started = False
 
     def update_model_version(self, model_version: int) -> None:
         self.model_version = int(model_version)
+        if self._started and self._prompt_source:
+            self._enqueue(self._prompt_source, max_tokens=self._max_tokens)
 
     def check_health(self, stale_after_s: float) -> None:
         del stale_after_s
 
     def generate_and_score(self, prompt_ids: list[list[int]], *, max_tokens: int) -> list[RolloutSample]:
+        return self._score_prompts(prompt_ids, max_tokens=max_tokens, enqueue=False)
+
+    def _enqueue(self, prompt_ids: list[list[int]], *, max_tokens: int) -> list[RolloutSample]:
+        return self._score_prompts(prompt_ids, max_tokens=max_tokens, enqueue=True)
+
+    def _score_prompts(
+        self, prompt_ids: list[list[int]], *, max_tokens: int, enqueue: bool
+    ) -> list[RolloutSample]:
         outputs = self.client.generate(
             prompt_ids,
             {
@@ -110,17 +130,22 @@ class ArcticOPDRolloutWorker:
             teacher_temperature=self.teacher_temperature,
             add_tail_bucket=self.add_tail_bucket,
         )
-        samples = [
-            RolloutSample(
+        now = time.time()
+        samples = []
+        for row in scored:
+            sample = RolloutSample(
                 prompt_ids=list(row["prompt_ids"]),
                 completion_ids=list(row["completion_ids"]),
                 sampler_logprobs=list(row["sampler_logprobs"]),
                 teacher_token_ids=list(row["teacher_token_ids"]),
                 teacher_logprobs=list(row["teacher_logprobs"]),
                 teacher_tail_logprob=row.get("teacher_tail_logprob"),
+                prompt_id=self._prompt_index,
+                model_version=self.model_version,
+                enqueued_at=now,
             )
-            for row in scored
-        ]
-        for sample in samples:
-            self.rollout_buffer.put(sample)
+            self._prompt_index += 1
+            samples.append(sample)
+            if enqueue:
+                self.rollout_buffer.put(sample)
         return samples

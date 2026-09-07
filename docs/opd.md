@@ -56,7 +56,7 @@ weight sync stay on Arctic. Do not extend PR #84.
 | `ArcticAsyncDistillationTrainer` | CPU-only driver; no local student load |
 | `ArcticOPDRolloutWorker` | TRL `rollout_worker=` shape |
 | `ArcticOPDWeightTransfer` | TRL `weight_transfer=` shape |
-| `ArcticOPDTrainingClient` | `forward_samples` for the CPU trainer; `forward_backward` matches TRL `TrainingClientProtocol` |
+| `ArcticOPDTrainingClient` | `forward_samples` for the CPU trainer; `forward_backward` is the distillation `training_client=` hook |
 | `gather_logits_at_ids` / `weighted_gathered_logit_sum` | Server gather + first-order surrogate |
 
 ```python

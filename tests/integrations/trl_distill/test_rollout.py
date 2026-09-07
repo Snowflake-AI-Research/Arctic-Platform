@@ -48,3 +48,15 @@ def test_rollout_worker_generate_and_score():
     assert sample.completion_ids == [3, 4]
     assert sample.sampler_logprobs == [-0.4, -0.5]
     assert sample.teacher_token_ids == [[3, 9], [4, 8]]
+    assert worker.rollout_buffer.empty()
+
+
+def test_start_enqueues_prompt_source():
+    worker = ArcticOPDRolloutWorker(
+        FakeOPD(), teacher_top_k=2, prompt_source=[[1, 2]], max_tokens=8
+    )
+    worker.start()
+    assert not worker.rollout_buffer.empty()
+    sample = worker.rollout_buffer.get_nowait()
+    assert sample.input_ids == [1, 2, 3, 4]
+    worker.stop()

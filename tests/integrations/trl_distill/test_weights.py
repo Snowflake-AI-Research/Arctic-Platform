@@ -42,4 +42,4 @@ def test_weight_transfer_syncs_student_only():
     transfer.resume()
     transfer.destroy()
     assert client.synced == 2
-    assert client.reset == 2
+    assert client.reset == 0

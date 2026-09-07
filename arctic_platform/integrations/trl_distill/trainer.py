@@ -87,13 +87,21 @@ class ArcticAsyncDistillationTrainer:
             self.optimizer = ArcticOPDOptimizer(client)
         self.state: dict[str, Any] = {"global_step": 0, "log_history": []}
 
-    def _jsd_loss(self, logits_k: torch.Tensor, teacher: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def _jsd_loss(
+        self,
+        logits_k: torch.Tensor,
+        teacher: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        student_logit_logsumexp: torch.Tensor,
+    ) -> torch.Tensor:
         return generalized_jsd(
             logits_k,
             teacher,
             mask,
             beta=self.args.beta,
             add_tail_bucket=self.args.add_tail_bucket,
+            student_logit_logsumexp=student_logit_logsumexp,
         )
 
     def train(self) -> dict[str, Any]:

@@ -454,6 +454,9 @@ class DeepSpeedWorker:
         ``agg_loss`` falls back to the local microbatch token count and a 29-token
         rollout weighs the same as a 16k-token one.
         """
+        if loss_fn == "weighted_gathered_logit_sum":
+            meta_data["dp_size"] = int(self.world_size)
+            return
         if loss_fn != "on_policy_distill":
             return
         from arctic_platform.rl.processors.on_policy_distill import apply_opd_global_token_config
