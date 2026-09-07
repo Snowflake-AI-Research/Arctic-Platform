@@ -18,6 +18,9 @@
 TRL ``AsyncDistillationTrainer`` still ``from_pretrained``s a local student.
 This trainer follows the same hooks (``rollout_worker``, ``weight_transfer``,
 ``training_client``, ``optimizers``) but never loads a GPU model.
+
+Student train, student vLLM, and teacher vLLM stay on disjoint GPUs
+(``OnPremConfig.colocate=False``), matching TRL's three-server layout.
 """
 
 from __future__ import annotations
@@ -36,6 +39,19 @@ from arctic_platform.integrations.trl_distill.stub import RemoteStudentStub
 from arctic_platform.integrations.trl_distill.weights import ArcticOPDWeightTransfer
 
 
+def _require_non_colocated_student(client: Any) -> None:
+    """Reject a student server that shares GPUs between train and sample."""
+    backend = getattr(getattr(client, "config", None), "backend", None)
+    if backend is None:
+        return
+    if bool(getattr(backend, "colocate", False)):
+        raise ValueError(
+            "ArcticAsyncDistillationTrainer requires a non-colocated student: "
+            "DeepSpeed train, student vLLM, and teacher vLLM on disjoint GPUs "
+            "(OnPremConfig.colocate=False), matching TRL AsyncDistillationTrainer"
+        )
+
+
 def _as_prompt_batches(prompts: Sequence[list[int]], batch_size: int, steps: int) -> list[list[list[int]]]:
     if not prompts:
         raise ValueError("train_prompts is empty")
@@ -50,7 +66,11 @@ def _as_prompt_batches(prompts: Sequence[list[int]], batch_size: int, steps: int
 
 
 class ArcticAsyncDistillationTrainer:
-    """CPU driver for on-policy distillation against ``ArcticOPDClient``."""
+    """CPU driver for on-policy distillation against ``ArcticOPDClient``.
+
+    The student must be launched with ``colocate=False`` so train, student
+    sample, and teacher sample do not share GPUs.
+    """
 
     def __init__(
         self,
@@ -63,6 +83,7 @@ class ArcticAsyncDistillationTrainer:
         training_client: ArcticOPDTrainingClient | None = None,
         optimizers: tuple[Any, Any] | None = None,
     ) -> None:
+        _require_non_colocated_student(client)
         self.args = args or ArcticAsyncDistillationConfig()
         self.client = client
         self.train_prompts = list(train_prompts)

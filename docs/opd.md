@@ -49,7 +49,10 @@ TRL `AsyncDistillationTrainer` still loads a local student and has no
 `training_client=`. Use
 [`ArcticAsyncDistillationTrainer`](../arctic_platform/integrations/trl_distill/README.md)
 for a CPU-only driver: generate, teacher score, gather/fwd-bwd, step, and
-weight sync stay on Arctic. Do not extend PR #84.
+weight sync stay on Arctic. That path is **non-colocated**: DeepSpeed train,
+student vLLM, and teacher vLLM on disjoint GPUs
+(`OnPremConfig.colocate=False`), matching TRL's three-server layout. Do not
+extend PR #84.
 
 | Adapter | Role |
 |---|---|
@@ -79,7 +82,8 @@ trainer.train()
 | Teacher signal | Logprob of the **sampled token only** (`prompt_logprobs: 0`), or top-k via `score_teacher_topk` | Full next-token distribution, chunked | Sparse **top-k** teacher distribution over HTTP |
 | Loss | Single-logit reverse KL, k3 / `low_var_kl` | Generalized JSD via `beta` | Same JSD, sparse support |
 | Optimizer / shard | DeepSpeed ZeRO-1 on the server | Accelerate / DeepSpeed / FSDP | FSDP2 only (no DeepSpeed ZeRO) |
-| Weight sync | `client.sync_weights()` student train → student sampler | In-process or vLLM NCCL | NCCL to student vLLM |
+| GPU layout | Native loop may `--colocate`; `ArcticAsyncDistillationTrainer` requires disjoint train / student-sample / teacher | Same process | 3 separate GPUs |
+| Weight sync | `client.sync_weights()` student train → student sampler (NCCL when not colocated) | In-process or vLLM NCCL | NCCL to student vLLM |
 
 Public Arctic surface is primitives, not a trainer:
 

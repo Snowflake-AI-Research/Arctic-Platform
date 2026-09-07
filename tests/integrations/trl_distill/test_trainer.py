@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from arctic_platform.integrations.trl_distill import ArcticAsyncDistillationConfig
@@ -72,6 +74,17 @@ class FakeOPD:
     def reset_student_prefix_cache(self, drain=True, timeout_s=60.0, retry_interval_s=0.1):
         del drain, timeout_s, retry_interval_s
         return {"ok": True}
+
+
+def test_trainer_rejects_colocated_student():
+    backend = FakeOPD()
+    backend.config = SimpleNamespace(backend=SimpleNamespace(colocate=True))
+    try:
+        ArcticAsyncDistillationTrainer(backend, train_prompts=[[1, 2]])
+    except ValueError as exc:
+        assert "non-colocated" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for colocate=True")
 
 
 def test_stub_stays_on_cpu():

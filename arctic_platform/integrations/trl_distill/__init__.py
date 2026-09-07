@@ -19,8 +19,10 @@ New work on Arctic ``main``. Does not import TRL. Does not extend PR #84.
 
 ``ArcticAsyncDistillationTrainer`` keeps the driver on CPU. Generate, teacher
 score, gather/fwd-bwd, optimizer step, and weight sync run on Arctic.
-TRL ``AsyncDistillationTrainer`` still loads a local student; use this trainer
-until TRL adds ``training_client=``.
+Student train, student vLLM, and teacher vLLM stay on disjoint GPUs
+(``colocate=False``), matching TRL ``AsyncDistillationTrainer``.
+TRL still loads a local student; use this trainer until TRL adds
+``training_client=``.
 """
 
 from arctic_platform.integrations.trl_distill.client import ArcticOPDOptimizer
