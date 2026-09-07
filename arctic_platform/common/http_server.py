@@ -729,9 +729,10 @@ async def weight_sync(job_id: int, request: WeightSyncRequest = Body(...)):
     Matches Cortex's `weight_sync(job_id, source_sub_job_id, target_sub_job_ids)`;
     on-prem treats a sub_job_id as its plain job id (source == training, target == sampling).
 
-    Uses NCCL for non-colocated mode (separate GPUs).  In colocated mode:
-    - cuda_ipc=True: CUDA IPC (zero-copy, requires training weights on GPU)
-    - cuda_ipc=False: CPU file path (slower, works when offloaded)
+    Strategy:
+    - cuda_ipc=True: CUDA IPC (same node; works colocated or 1+1+1 on one box)
+    - colocate and not cuda_ipc: CPU file path
+    - else: NCCL (multi-node / no IPC)
     """
     training_job_id = request.source_sub_job_id
     sampling_job_id = request.target_sub_job_ids[0]
@@ -747,20 +748,19 @@ async def weight_sync(job_id: int, request: WeightSyncRequest = Body(...)):
     cuda_ipc = request.cuda_ipc if request.cuda_ipc is not None else training_job_info.get("cuda_ipc", False)
     low_memory = request.low_memory if request.low_memory is not None else training_job_info.get("low_memory", False)
 
-    if colocate:
-        lp_pool = app.state.log_prob_pool
-        if cuda_ipc:
-            if low_memory:
-                print("colo _sync_weights_cuda_ipc_low_mem")
-                results = await _sync_weights_cuda_ipc_low_mem(workers, pool, lp_pool)
-            else:
-                print("colo _sync_weights_cuda_ipc")
-                results = await _sync_weights_cuda_ipc(workers, pool, lp_pool)
+    lp_pool = app.state.log_prob_pool if colocate else None
+    if cuda_ipc:
+        if low_memory:
+            print("colo _sync_weights_cuda_ipc_low_mem")
+            results = await _sync_weights_cuda_ipc_low_mem(workers, pool, lp_pool)
         else:
-            print("colo _sync_weights_ipc")
-            sync_path = training_job_info.get("sync_path", None)
-            assert sync_path is not None, f"sync_path is required for training job {training_job_id}"
-            results = await _sync_weights_ipc(sync_path, workers, pool, lp_pool)
+            print("colo _sync_weights_cuda_ipc")
+            results = await _sync_weights_cuda_ipc(workers, pool, lp_pool)
+    elif colocate:
+        print("colo _sync_weights_ipc")
+        sync_path = training_job_info.get("sync_path", None)
+        assert sync_path is not None, f"sync_path is required for training job {training_job_id}"
+        results = await _sync_weights_ipc(sync_path, workers, pool, lp_pool)
     else:
         print("colo _sync_weights_nccl")
         results = await _sync_weights_nccl(workers, pool)

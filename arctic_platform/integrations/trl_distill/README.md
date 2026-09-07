@@ -22,6 +22,24 @@ vLLM, and teacher vLLM on **disjoint** devices (`OnPremConfig.colocate=False`).
 The trainer rejects a colocated student. Native
 `run_on_policy_distill --colocate` is unchanged.
 
+GSM8K quality-parity recipe (Qwen2.5-0.5B / 1.5B, 100 steps, non-colocated):
+
+```bash
+python -m arctic_platform.integrations.trl_distill.examples.run_async_distill_gsm8k \
+  --server-cuda-visible-devices 0,1 \
+  --teacher-server-cuda-visible-devices 2
+```
+
+Frozen-batch learning-signal probe (generate once, replay, greedy probe prompt):
+
+```bash
+python -m arctic_platform.integrations.trl_distill.examples.run_async_distill_gsm8k \
+  --steps 50 --batch-size 8 --max-completion-length 64 --learning-rate 1e-4 \
+  --repeat-batch --probe-every 10 \
+  --server-cuda-visible-devices 0,1 \
+  --teacher-server-cuda-visible-devices 2
+```
+
 ## Wiring (CPU driver, remote compute, non-colocated)
 
 ```python

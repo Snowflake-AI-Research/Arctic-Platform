@@ -33,6 +33,7 @@ class FakeOPD:
 
     def generate(self, prompts, sampling_params):
         del sampling_params
+        self.generate_calls = getattr(self, "generate_calls", 0) + 1
         return [{"token_ids": [3, 4], "logprobs": [-0.4, -0.5]} for _ in prompts]
 
     def generate_teacher(self, prompts, sampling_params):
@@ -64,7 +65,7 @@ class FakeOPD:
     def step(self, learning_rate=None):
         del learning_rate
         self.steps += 1
-        return {"metrics": {}}
+        return {"metrics": {"grad_norm": 0.5, "last_lr": 1e-6}}
 
     def sync_weights(self, cuda_ipc=None, low_memory=None):
         del cuda_ipc, low_memory
@@ -124,3 +125,30 @@ def test_cpu_trainer_runs_remote_compute_and_sync():
     assert backend.synced == 2
     assert trainer.rollout_worker.model_version == 2
     assert trainer.rollout_worker._started is False
+    assert state["log_history"][0]["tokens"] > 0
+    assert "sync_s" in state["log_history"][0]
+    assert "jsd" in state["log_history"][0]
+    assert state["log_history"][0]["grad_norm"] == 0.5
+    assert backend.generate_calls == 2
+
+
+def test_repeat_batch_generates_once():
+    backend = FakeOPD()
+    trainer = ArcticAsyncDistillationTrainer(
+        backend,
+        train_prompts=[[1, 2], [5, 6]],
+        args=ArcticAsyncDistillationConfig(
+            steps=3,
+            batch_size=1,
+            teacher_top_k=2,
+            max_completion_length=4,
+            weight_sync_steps=1,
+            repeat_batch=True,
+        ),
+    )
+    state = trainer.train()
+    assert state["global_step"] == 3
+    assert backend.generate_calls == 1
+    assert backend.fwd_bwd_calls == 3
+    assert backend.steps == 3
+    assert backend.synced == 3

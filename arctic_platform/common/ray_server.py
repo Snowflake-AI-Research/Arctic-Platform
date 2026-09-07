@@ -941,9 +941,10 @@ class ArcticRLRayServer:
         Matches Cortex's `weight_sync(job_id, source_sub_job_id, target_sub_job_ids)`;
         on-prem treats a sub_job_id as its plain job id (source == training, target == sampling).
 
-        Uses NCCL for non-colocated mode (separate GPUs).  In colocated mode:
-        - cuda_ipc=True: CUDA IPC (zero-copy, requires training weights on GPU)
-        - cuda_ipc=False: CPU file path (slower, works when offloaded)
+        Strategy:
+        - cuda_ipc=True: CUDA IPC (same node; works colocated or 1+1+1 on one box)
+        - colocate and not cuda_ipc: CPU file path
+        - else: NCCL (multi-node / no IPC)
         """
         request = WeightSyncRequest(**body)
         training_job_id = request.source_sub_job_id
@@ -962,20 +963,16 @@ class ArcticRLRayServer:
             request.low_memory if request.low_memory is not None else training_job_info.get("low_memory", False)
         )
 
-        if colocate:
-            lp_pool = self.log_prob_pool
-            if cuda_ipc:
-                if low_memory:
-                    # Slower, memory-efficient path: stream one gathered param
-                    # at a time so peak extra GPU memory is one full param per
-                    # GPU instead of the whole model (avoids OOM on big models).
-                    results = await self._sync_weights_cuda_ipc_low_mem(workers, pool, lp_pool)
-                else:
-                    results = await self._sync_weights_cuda_ipc(workers, pool, lp_pool)
+        lp_pool = self.log_prob_pool if colocate else None
+        if cuda_ipc:
+            if low_memory:
+                results = await self._sync_weights_cuda_ipc_low_mem(workers, pool, lp_pool)
             else:
-                sync_path = training_job_info.get("sync_path", None)
-                assert sync_path is not None, f"sync_path is required for training job {training_job_id}"
-                results = await self._sync_weights_ipc(sync_path, workers, pool, lp_pool)
+                results = await self._sync_weights_cuda_ipc(workers, pool, lp_pool)
+        elif colocate:
+            sync_path = training_job_info.get("sync_path", None)
+            assert sync_path is not None, f"sync_path is required for training job {training_job_id}"
+            results = await self._sync_weights_ipc(sync_path, workers, pool, lp_pool)
         else:
             results = await self._sync_weights_nccl(workers, pool)
 

@@ -36,3 +36,4 @@ class ArcticAsyncDistillationConfig:
     weight_sync_steps: int = 1
     pad_token_id: int = 0
     max_seq_len: int | None = None
+    repeat_batch: bool = False

@@ -142,6 +142,7 @@ from arctic_platform.integrations.trl_distill import (
 - Client: `arctic_platform.opd.client.ArcticOPDClient`
 - Teacher scoring: `arctic_platform.opd.scoring.score_teacher` / `score_teacher_topk`
 - TRL async adapters / CPU trainer: `arctic_platform.integrations.trl_distill`
+- GSM8K async-distill example: `arctic_platform.integrations.trl_distill.examples.run_async_distill_gsm8k`
 - Loss (server): `arctic_platform.rl.processors.on_policy_distill`
 
 ## Quick start

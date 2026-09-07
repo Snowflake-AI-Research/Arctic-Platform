@@ -25,6 +25,8 @@ Student train, student vLLM, and teacher vLLM stay on disjoint GPUs
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from collections.abc import Sequence
 from typing import Any
 
@@ -37,6 +39,18 @@ from arctic_platform.integrations.trl_distill.jsd import generalized_jsd
 from arctic_platform.integrations.trl_distill.rollout import ArcticOPDRolloutWorker
 from arctic_platform.integrations.trl_distill.stub import RemoteStudentStub
 from arctic_platform.integrations.trl_distill.weights import ArcticOPDWeightTransfer
+
+
+def _metric_float(metrics: dict[str, Any], key: str) -> float | None:
+    value = metrics.get(key)
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _require_non_colocated_student(client: Any) -> None:
@@ -125,16 +139,27 @@ class ArcticAsyncDistillationTrainer:
             student_logit_logsumexp=student_logit_logsumexp,
         )
 
-    def train(self) -> dict[str, Any]:
-        """Run generate → remote gather → CPU JSD → remote backward → step → sync."""
+    def train(self, after_step: Callable[..., None] | None = None) -> dict[str, Any]:
+        """Run generate → remote gather → CPU JSD → remote backward → step → sync.
+
+        ``repeat_batch=True`` generates and teacher-scores once, then replays
+        that rollout so a flat JSD curve is an update-path bug, not on-policy
+        drift. ``after_step(step, output, row)`` may add probe fields to ``row``.
+        """
         self.weight_transfer.init_weight_transfer()
         self.rollout_worker.start()
         batches = _as_prompt_batches(self.train_prompts, self.args.batch_size, self.args.steps)
+        frozen_samples = None
         try:
             for step, prompts in enumerate(batches, start=1):
-                samples = self.rollout_worker.generate_and_score(
-                    prompts, max_tokens=self.args.max_completion_length
-                )
+                if frozen_samples is None or not self.args.repeat_batch:
+                    samples = self.rollout_worker.generate_and_score(
+                        prompts, max_tokens=self.args.max_completion_length
+                    )
+                    if self.args.repeat_batch:
+                        frozen_samples = samples
+                else:
+                    samples = frozen_samples
                 output = self.training_client.forward_samples(
                     samples,
                     self._jsd_loss,
@@ -142,13 +167,27 @@ class ArcticAsyncDistillationTrainer:
                     max_seq_len=self.args.max_seq_len,
                 )
                 output.loss.backward()
-                self.optimizer.step(self.args.learning_rate)
+                step_out = self.optimizer.step(self.args.learning_rate)
                 self.optimizer.zero_grad()
+                sync_s = 0.0
                 if step % self.args.weight_sync_steps == 0:
+                    sync_started = time.monotonic()
                     self.weight_transfer.send_weights(iter(()))
+                    sync_s = time.monotonic() - sync_started
                     self.rollout_worker.update_model_version(step)
                 self.state["global_step"] = step
-                self.state["log_history"].append({"step": step, "loss": float(output.loss.detach())})
+                row: dict[str, Any] = {
+                    "step": step,
+                    "loss": float(output.loss.detach()),
+                    "jsd": float(output.loss.detach()),
+                    "tokens": int(output.loss_mask.sum().item()),
+                    "sync_s": sync_s,
+                    "grad_norm": _metric_float((step_out or {}).get("metrics") or {}, "grad_norm"),
+                    "lr": _metric_float((step_out or {}).get("metrics") or {}, "last_lr"),
+                }
+                if after_step is not None:
+                    after_step(step, output, row)
+                self.state["log_history"].append(row)
         finally:
             self.rollout_worker.stop()
             self.weight_transfer.destroy()
