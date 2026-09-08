@@ -14,33 +14,11 @@
 # limitations under the License.
 """An OpenAI-compatible ``/v1`` surface over an Arctic sampling job.
 
-Point any OpenAI client at it -- the ``openai`` SDK, LiteLLM, an eval harness,
-curl -- and change nothing but ``base_url``. Non-streaming: ``stream=true`` is
-refused rather than faked.
-
-See ``README.md`` in this package for the parameter-by-parameter compatibility
-table.
+Point any OpenAI client at it and change nothing but ``base_url``.
+Non-streaming: ``stream=true`` is refused rather than faked. See README.md for
+the parameter-by-parameter compatibility table.
 """
 
-from typing import Any
+from arctic_platform.openai_compat.server import build_app
 
-__all__ = ["OpenAIGateway", "app_for_client", "backend_for", "build_app", "router"]
-
-
-def __getattr__(name: str) -> Any:
-    # fastapi/uvicorn/transformers are only needed when someone actually serves,
-    # so importing this package stays cheap for callers that just want the
-    # translation helpers.
-    if name in ("build_app", "app_for_client", "OpenAIGateway"):
-        from arctic_platform.openai_compat import server
-
-        return getattr(server, name)
-    if name == "router":
-        from arctic_platform.openai_compat.router import router
-
-        return router
-    if name == "backend_for":
-        from arctic_platform.openai_compat.backend import backend_for
-
-        return backend_for
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+__all__ = ["build_app"]

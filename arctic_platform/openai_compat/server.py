@@ -12,257 +12,310 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Serving shells around the router.
-
-Two shapes, one app:
-
-- :func:`build_app` / :class:`OpenAIGateway` for a driver that already holds a
-  client and wants a ``/v1`` URL for the length of a run.
-- ``python -m arctic_platform.openai_compat`` for the standalone case: attach
-  to a sampling job that already exists and serve until interrupted.
-"""
+"""The ``/v1`` routes and the app that serves them. Non-streaming."""
 
 from __future__ import annotations
 
 import argparse
-import contextlib
+import asyncio
+import inspect
 import json
 import logging
-import socket
-import threading
 import time
 from pathlib import Path
 from typing import Any
 
+from fastapi import APIRouter
+from fastapi import FastAPI
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
 from arctic_platform._dependency_groups import require_any_dep_group
-from arctic_platform.openai_compat.backend import DEFAULT_MAX_CONCURRENCY
-from arctic_platform.openai_compat.backend import backend_for
-from arctic_platform.openai_compat.errors import OpenAIError
-from arctic_platform.openai_compat.errors import openai_error_handler
-from arctic_platform.openai_compat.errors import unhandled_error_handler
-from arctic_platform.openai_compat.router import GatewayState
-from arctic_platform.openai_compat.router import router
+from arctic_platform.openai_compat import translation as tr
+from arctic_platform.openai_compat.translation import OpenAIError
 
 logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/v1", tags=["openai-compat"])
 
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
+class _State:
+    def __init__(
+        self,
+        client: Any,
+        tokenizer: Any,
+        model_name: str,
+        max_model_len: int,
+        api_key: str | None,
+        max_concurrency: int,
+    ) -> None:
+        self.client = client
+        self.tokenizer = tokenizer
+        self.model_name = model_name
+        self.max_model_len = int(max_model_len)
+        self.api_key = api_key
+        # Concurrent callers all land on one sampling job; the rest queue here,
+        # where a request costs a coroutine rather than a slot.
+        self.semaphore = asyncio.Semaphore(max(1, int(max_concurrency)))
+        self.created = int(time.time())
+
+
+def _state(request: Request) -> _State:
+    state = getattr(request.app.state, "openai_compat", None)
+    if state is None:
+        raise OpenAIError(503, "The endpoint is still starting up.", err_type="server_error")
+    if state.api_key is not None:
+        scheme, _, token = (request.headers.get("authorization") or "").partition(" ")
+        if scheme.lower() != "bearer" or token.strip() != state.api_key:
+            raise OpenAIError(
+                401, "Incorrect API key provided.", err_type="authentication_error", code="invalid_api_key"
+            )
+    return state
+
+
+def _as_openai_error(exc: BaseException) -> OpenAIError:
+    """Map a backend failure onto the status clients act on.
+
+    Cortex answers 429 when the account is at capacity. Relayed as a 429 with
+    Retry-After, stock client retry policy absorbs it; relayed as a 500 it ends
+    the caller's run.
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status == 429:
+        retry_after = (getattr(response, "headers", None) or {}).get("Retry-After")
+        return OpenAIError(
+            429,
+            f"The sampling job is at capacity: {exc}",
+            err_type="rate_limit_error",
+            code="rate_limit_exceeded",
+            headers={"Retry-After": str(retry_after)} if retry_after else {},
+        )
+    if isinstance(status, int) and 400 <= status < 500:
+        return OpenAIError(status, f"The sampling job rejected the request: {exc}")
+    return OpenAIError(502, f"The sampling job failed: {type(exc).__name__}: {exc}", err_type="server_error")
+
+
+async def _generate(state: _State, prompt: str | list[int], params: dict[str, Any], n: int) -> list[dict]:
+    """Sample ``n`` completions for one prompt.
+
+    Issued as ``n`` copies rather than SamplingParams(n=n): the sampling worker
+    only surfaces the first sub-output, so asking the engine for n returns one.
+    The copies share a prefix, so the extra prompts cost roughly their KV.
+    """
+    prompts: list[Any] = [prompt] * max(1, n)
+    async with state.semaphore:
+        try:
+            generate = state.client.generate
+            if inspect.iscoroutinefunction(generate):
+                results = await generate(prompts, params)
+            else:
+                # Awaiting a blocking client on the event loop would stall every
+                # other in-flight request behind it.
+                results = await asyncio.to_thread(generate, prompts, params)
+        except OpenAIError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise _as_openai_error(exc) from exc
+
+    if len(results) < len(prompts):
+        raise OpenAIError(
+            502,
+            f"The sampling job returned {len(results)} result(s) for {len(prompts)} prompt(s).",
+            err_type="server_error",
+        )
+    return list(results[: len(prompts)])
+
+
+def _encode(tokenizer: Any, text: str) -> list[int]:
+    # add_special_tokens=False: the chat template already placed the specials,
+    # and a second BOS shifts every position.
+    return [int(t) for t in tokenizer.encode(text, add_special_tokens=False)]
+
+
+async def _body(request: Request) -> Any:
+    try:
+        return await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise OpenAIError(400, f"Request body is not valid JSON: {exc}") from exc
+
+
+def _card(state: _State) -> dict[str, Any]:
+    return {"id": state.model_name, "object": "model", "created": state.created, "owned_by": "arctic-platform"}
+
+
+@router.get("/models")
+async def list_models(request: Request) -> dict[str, Any]:
+    return {"object": "list", "data": [_card(_state(request))]}
+
+
+@router.get("/models/{model_id:path}")
+async def retrieve_model(model_id: str, request: Request) -> dict[str, Any]:
+    state = _state(request)
+    if model_id != state.model_name:
+        raise OpenAIError(
+            404,
+            f"The model {model_id!r} does not exist. This endpoint serves {state.model_name!r}.",
+            err_type="not_found_error",
+            param="model",
+            code="model_not_found",
+        )
+    return _card(state)
+
+
+@router.post("/chat/completions")
+async def chat_completions(request: Request) -> dict[str, Any]:
+    state = _state(request)
+    req = tr.parse_request(await _body(request), tr.ChatCompletionRequest)
+
+    prompt = tr.render_chat_prompt(state.tokenizer, req)
+    prompt_token_ids = _encode(state.tokenizer, prompt)
+    max_tokens = tr.resolve_max_tokens(
+        req.max_completion_tokens if req.max_completion_tokens is not None else req.max_tokens,
+        prompt_tokens=len(prompt_token_ids),
+        max_model_len=state.max_model_len,
+    )
+    want_logprobs = bool(req.logprobs)
+    params = tr.sampling_params(
+        req, max_tokens=max_tokens, logprobs_topk=(req.top_logprobs or 1) if want_logprobs else None
+    )
+
+    return tr.chat_completion(
+        await _generate(state, prompt, params, req.n),
+        # Echo what the caller asked for; clients match it against what they sent.
+        model=req.model,
+        prompt_token_ids=prompt_token_ids,
+        tokenizer=state.tokenizer,
+        want_logprobs=want_logprobs,
+        tools_offered=bool(req.tools) and req.tool_choice != "none",
+    )
+
+
+@router.post("/completions")
+async def completions(request: Request) -> dict[str, Any]:
+    state = _state(request)
+    req = tr.parse_request(await _body(request), tr.CompletionRequest)
+
+    raw = req.prompt
+    if isinstance(raw, str):
+        prompts: list[Any] = [raw]
+    elif isinstance(raw, list) and raw and all(isinstance(p, int) for p in raw):
+        prompts = [list(raw)]
+    else:
+        prompts = [p if isinstance(p, str) else list(p) for p in raw]
+
+    prompt_tokens, per_prompt = 0, []
+    for prompt in prompts:
+        token_ids = prompt if isinstance(prompt, list) else _encode(state.tokenizer, prompt)
+        prompt_tokens += len(token_ids)
+        params = tr.sampling_params(
+            req,
+            max_tokens=tr.resolve_max_tokens(
+                req.max_tokens, prompt_tokens=len(token_ids), max_model_len=state.max_model_len
+            ),
+            logprobs_topk=req.logprobs,
+        )
+        per_prompt.append(await _generate(state, prompt, params, req.n))
+
+    return tr.text_completion(
+        per_prompt,
+        model=req.model,
+        prompt_tokens=prompt_tokens,
+        tokenizer=state.tokenizer,
+        want_logprobs=req.logprobs is not None,
+    )
+
+
 def build_app(
     *,
-    backend: Any,
+    client: Any,
     tokenizer: Any,
     model_name: str,
     max_model_len: int,
     api_key: str | None = None,
-) -> Any:
-    """A FastAPI app serving ``/v1`` over ``backend``."""
-    require_any_dep_group("openai")
-    from fastapi import FastAPI
+    max_concurrency: int = 32,
+) -> FastAPI:
+    """An app serving ``/v1``.
 
+    ``client`` is anything with ``generate(prompts, sampling_params)``, sync or
+    async -- an ``ArcticClient``, an ``AsyncArcticClient``, or a stub.
+    """
+    require_any_dep_group("openai")
     app = FastAPI(title="arctic-platform OpenAI-compatible endpoint")
-    app.state.openai_compat = GatewayState(
-        backend=backend,
-        tokenizer=tokenizer,
-        model_name=model_name,
-        max_model_len=max_model_len,
-        api_key=api_key,
-    )
-    # Both handlers exist so that *every* failure leaves as OpenAI's envelope.
-    # FastAPI's defaults render `{"detail": ...}`, which the openai SDK reports
-    # as a bare status code with no message.
-    app.add_exception_handler(OpenAIError, openai_error_handler)
-    app.add_exception_handler(Exception, unhandled_error_handler)
+    app.state.openai_compat = _State(client, tokenizer, model_name, max_model_len, api_key, max_concurrency)
+
+    async def on_openai_error(_r: Request, exc: Exception) -> JSONResponse:
+        assert isinstance(exc, OpenAIError)
+        return JSONResponse(status_code=exc.status_code, content=exc.body(), headers=exc.headers)
+
+    async def on_unhandled(_r: Request, exc: Exception) -> JSONResponse:
+        # Otherwise FastAPI renders a body no OpenAI client can parse, turning a
+        # backend hiccup into "connection error" at the caller.
+        err = OpenAIError(500, f"{type(exc).__name__}: {exc}", err_type="server_error")
+        return JSONResponse(status_code=500, content=err.body())
+
+    app.add_exception_handler(OpenAIError, on_openai_error)
+    app.add_exception_handler(Exception, on_unhandled)
     app.include_router(router)
     return app
-
-
-def app_for_client(
-    client: Any,
-    *,
-    tokenizer: Any,
-    model_name: str,
-    max_model_len: int,
-    api_key: str | None = None,
-    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
-) -> Any:
-    return build_app(
-        backend=backend_for(client, max_concurrency=max_concurrency),
-        tokenizer=tokenizer,
-        model_name=model_name,
-        max_model_len=max_model_len,
-        api_key=api_key,
-    )
-
-
-def _pick_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def check_bind(host: str, api_key: str | None) -> None:
     """Refuse to expose an unauthenticated endpoint off-box.
 
-    Binding beyond loopback is what lets a container or another host reach the
-    gateway, and it is also what makes an open endpoint reachable. Requiring a
-    key at that point is cheap; discovering later that anyone on the network
-    could spend the job's GPUs is not.
+    Binding beyond loopback is what lets a container reach the gateway, and also
+    what lets anything else on the network spend the job's GPUs.
     """
-    if host in _LOOPBACK or api_key is not None:
-        return
-    raise ValueError(
-        f"Refusing to bind {host} without an API key: the endpoint would accept unauthenticated requests from"
-        " anywhere that can route to this host. Pass an api_key, or bind 127.0.0.1."
-    )
-
-
-class OpenAIGateway:
-    """Run :func:`build_app` on a background thread for the life of a driver.
-
-    Owns the server, never the job: ``stop()`` shuts down uvicorn and leaves
-    the sampling job running. Tearing the job down here would cancel an
-    endpoint the caller may still be using -- and on Cortex, ``client.shutdown()``
-    cancels the whole parent job, GPUs included.
-    """
-
-    def __init__(
-        self,
-        *,
-        client: Any = None,
-        app: Any = None,
-        tokenizer: Any = None,
-        model_name: str = "",
-        max_model_len: int = 0,
-        host: str = "127.0.0.1",
-        port: int | None = None,
-        api_key: str | None = None,
-        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
-    ) -> None:
-        if app is None:
-            if client is None:
-                raise ValueError("OpenAIGateway needs either a built app or a client to build one from.")
-            app = app_for_client(
-                client,
-                tokenizer=tokenizer,
-                model_name=model_name,
-                max_model_len=max_model_len,
-                api_key=api_key,
-                max_concurrency=max_concurrency,
-            )
-        # The app owns auth. Reading the key back off it (rather than trusting
-        # the argument) means a pre-built app passed in with no key configured
-        # still fails the bind check instead of being served wide open.
-        check_bind(host, getattr(getattr(app.state, "openai_compat", None), "api_key", None))
-        self._app = app
-        self._host = host
-        self._port = port or _pick_free_port()
-        self._server: Any = None
-        self._thread: threading.Thread | None = None
-
-    @property
-    def base_url(self) -> str:
-        return f"http://{self._host}:{self._port}/v1"
-
-    def start(self, *, ready_timeout_s: float = 30.0) -> str:
-        import uvicorn
-
-        config = uvicorn.Config(self._app, host=self._host, port=self._port, log_level="warning", lifespan="on")
-        server = uvicorn.Server(config)
-        # uvicorn installs SIGINT/SIGTERM handlers, which only works on the main
-        # thread; the driver keeps signal handling.
-        server.install_signal_handlers = lambda: None
-        self._server = server
-        self._thread = threading.Thread(target=server.run, name="arctic-openai-compat", daemon=True)
-        self._thread.start()
-
-        deadline = time.monotonic() + ready_timeout_s
-        while time.monotonic() < deadline:
-            if getattr(server, "started", False):
-                return self.base_url
-            if not self._thread.is_alive():
-                raise RuntimeError(f"OpenAI-compatible endpoint died during startup on {self.base_url}")
-            time.sleep(0.02)
-        raise RuntimeError(f"OpenAI-compatible endpoint was not ready within {ready_timeout_s:.1f}s")
-
-    def stop(self, *, timeout_s: float = 10.0) -> None:
-        server, thread = self._server, self._thread
-        self._server = self._thread = None
-        if server is None:
-            return
-        server.should_exit = True
-        if thread is not None:
-            thread.join(timeout=timeout_s)
-
-    def __enter__(self) -> OpenAIGateway:
-        self.start()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        with contextlib.suppress(Exception):
-            self.stop()
-
-
-def _load_config(path: Path) -> dict[str, Any]:
-    text = path.read_text()
-    if path.suffix in (".yaml", ".yml"):
-        import yaml
-
-        return yaml.safe_load(text)
-    return json.loads(text)
+    if host not in _LOOPBACK and api_key is None:
+        raise ValueError(
+            f"Refusing to bind {host} without an API key: the endpoint would accept unauthenticated requests from"
+            " anywhere that can route to this host. Pass --api-key, or bind 127.0.0.1."
+        )
 
 
 def main(argv: list[str] | None = None) -> None:
     """Attach to an existing sampling job and serve ``/v1`` until interrupted."""
-    parser = argparse.ArgumentParser(
-        prog="python -m arctic_platform.openai_compat",
-        description="Serve an OpenAI-compatible endpoint over an Arctic sampling job.",
-    )
+    parser = argparse.ArgumentParser(prog="python -m arctic_platform.openai_compat")
     parser.add_argument("--config", required=True, type=Path, help="ArcticClientConfig JSON/YAML.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument(
-        "--api-key",
-        default=None,
-        help="Require this bearer token. Mandatory when --host is not loopback.",
-    )
-    parser.add_argument("--served-model-name", default=None, help="Name advertised at /v1/models.")
-    parser.add_argument("--max-concurrency", type=int, default=DEFAULT_MAX_CONCURRENCY)
+    parser.add_argument("--api-key", default=None, help="Required when --host is not loopback.")
+    parser.add_argument("--served-model-name", default=None)
+    parser.add_argument("--max-concurrency", type=int, default=32)
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     check_bind(args.host, args.api_key)
 
+    import uvicorn
     from transformers import AutoTokenizer
 
+    from arctic_platform.client.base import ArcticClient
     from arctic_platform.client.config import ArcticClientConfig
 
-    config = ArcticClientConfig.model_validate(_load_config(args.config))
+    text = args.config.read_text()
+    if args.config.suffix in (".yaml", ".yml"):
+        import yaml
+
+        raw = yaml.safe_load(text)
+    else:
+        raw = json.loads(text)
+
+    config = ArcticClientConfig.model_validate(raw)
     if config.sampling_job_id is None:
         raise SystemExit("--config must set sampling_job_id: this serves an endpoint, it does not create one.")
 
-    from arctic_platform.client.base import ArcticClient
-
-    client = ArcticClient(config)
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    app = app_for_client(
-        client,
-        tokenizer=tokenizer,
+    app = build_app(
+        client=ArcticClient(config),
+        tokenizer=AutoTokenizer.from_pretrained(config.model_name),
         model_name=args.served_model_name or config.model_name,
         max_model_len=config.max_seq_len,
         api_key=args.api_key,
         max_concurrency=args.max_concurrency,
     )
-
-    import uvicorn
-
     logger.info("Serving %s at http://%s:%s/v1", config.model_name, args.host, args.port)
-    logger.info("The sampling job stays up when this process exits; tear it down with the Cortex CLI.")
     # Deliberately no client.shutdown() on exit: on Cortex that cancels the
-    # parent job, which would take the endpoint (and its GPUs) down with the
-    # gateway.
+    # parent job, taking the endpoint and its GPUs down with the gateway.
+    logger.info("The sampling job stays up when this process exits.")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-
-
-if __name__ == "__main__":
-    main()
