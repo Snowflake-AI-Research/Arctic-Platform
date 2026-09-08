@@ -25,7 +25,7 @@ reachable by anything else that can route to the host:
 python -m arctic_platform.openai_compat --config client.json --host 0.0.0.0 --api-key "$TOKEN"
 ```
 
-## Two things that bite in practice
+## Three things that bite in practice
 
 **Pick a simple served model name.** Some clients validate the model string
 before it ever reaches us. LiteLLM's `hosted_vllm` provider — the path Harbor's
@@ -46,6 +46,22 @@ can be `0.0`.
 token-id array, but the on-prem sampling server validates `prompts` as
 `list[str]` and rejects them. Chat completions are unaffected — they always send
 a rendered string.
+
+**Reasoning models put their thinking in `content`.** Qwen3 has thinking on by
+default, so replies begin with a `<think>` block and it counts against
+`max_tokens` — a live Qwen3-0.6B run spent 485 completion tokens on a question
+worth about five. vLLM's own OpenAI server can split that into a separate
+`reasoning_content` field via a reasoning parser; this endpoint does not, so the
+block stays inline. Either budget for it (the `max_tokens` default already
+does), or turn it off:
+
+```python
+client.chat.completions.create(..., extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+```
+
+This matters more than it looks: a small `max_tokens` truncates *inside* the
+think block, and some harnesses (Harbor) raise on `finish_reason == "length"`
+rather than returning the partial text.
 
 ## Compatibility
 
