@@ -102,9 +102,7 @@ class ArcticSFTClient(ArcticClient):
         return getattr(self.config.backend, "protocol", None) == "cortex"
 
     def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
-        return super().fwd_bwd(
-            _sft_body(batch, processing, cortex=self._cortex()), router_replay=router_replay
-        )
+        return super().fwd_bwd(_sft_body(batch, processing, cortex=self._cortex()), router_replay=router_replay)
 
     def fwd_no_grad(self, batch: dict, processing: dict | None = None) -> dict:
         # Narrower than the base on purpose: `reference_model` routes to the log-prob
