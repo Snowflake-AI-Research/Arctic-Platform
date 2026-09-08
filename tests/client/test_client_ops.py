@@ -411,17 +411,16 @@ class TestWeightSyncStrategyInit:
 
 @pytest.fixture(autouse=True)
 def _isolate_arctic_env(monkeypatch):
-    """Clear Cortex auth env vars before each test.
+    """Clear ``ARCTIC_CORTEX_*`` before each test.
 
     ``CortexConfig`` is a ``BaseSettings``, so it reads the ambient environment
     at construction; a var leaked in from the developer's shell would otherwise
-    decide the outcome of these tests. ``CORTEX_PAT`` is an accepted alias of
-    ``ARCTIC_CORTEX_PAT``.
+    decide the outcome of these tests.
     """
     import os
 
     for k in list(os.environ):
-        if k.startswith("ARCTIC_CORTEX_") or k == "CORTEX_PAT":
+        if k.startswith("ARCTIC_CORTEX_"):
             monkeypatch.delenv(k, raising=False)
 
 
@@ -458,16 +457,6 @@ class TestCortexConfigReadsEnv:
 
         with pytest.raises(ValidationError, match="ARCTIC_CORTEX_PAT"):
             CortexConfig()
-
-    def test_cortex_pat_alias_hydrates_when_arctic_prefix_is_unset(self, monkeypatch):
-        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
-        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "db")
-        monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "sch")
-        monkeypatch.setenv("CORTEX_PAT", "legacy-pat")
-        from arctic_platform.client import CortexConfig
-
-        cfg = CortexConfig()
-        assert cfg.pat.get_secret_value() == "legacy-pat"
 
     def test_explicit_override_wins(self, monkeypatch):
         monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://env")

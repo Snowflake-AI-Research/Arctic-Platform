@@ -105,7 +105,7 @@ entrypoint the recipe names.
 |---|---|---|
 | `ARCTIC_CORTEX_HOST` | *(required for PAT auth)* | Snowflake host, e.g. `<account>.<region>.snowflakecomputing.com`. |
 | `ARCTIC_CORTEX_BASE_URL` | *(optional)* | Direct/mock GS URL for dev; bypasses PAT auth (mutually exclusive with `_HOST`). |
-| `ARCTIC_CORTEX_PAT` | *(required for PAT auth)* | Snowflake Programmatic Access Token. `CORTEX_PAT` is accepted as an alias. |
+| `ARCTIC_CORTEX_PAT` | *(required for PAT auth)* | Snowflake Programmatic Access Token. |
 | `ARCTIC_CORTEX_DATABASE` | *(required for PAT auth)* | Snowflake database. |
 | `ARCTIC_CORTEX_SCHEMA` | *(required for PAT auth)* | Snowflake schema. |
 | `ARCTIC_CORTEX_ENDPOINT` | `cortex-training` | SnowAPI endpoint name. |

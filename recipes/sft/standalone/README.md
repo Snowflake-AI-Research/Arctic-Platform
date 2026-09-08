@@ -23,7 +23,7 @@ uv pip install -r recipes/sft/standalone/requirements.txt
 ```
 
 Copy the connection template and fill in your Snowflake host and PAT. To keep the
-PAT out of the file, drop the `pat` key and export `CORTEX_PAT` instead.
+PAT out of the file, drop the `pat` key and export `ARCTIC_CORTEX_PAT` instead.
 
 ```bash
 cp recipes/config.json.template recipes/config.json
