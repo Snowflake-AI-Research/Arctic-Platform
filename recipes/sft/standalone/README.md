@@ -22,8 +22,19 @@ uv pip install -e '.[cortex]'
 uv pip install -r recipes/sft/standalone/requirements.txt
 ```
 
-Copy the connection template and fill in your Snowflake host and PAT. To keep the
-PAT out of the file, drop the `pat` key and export `ARCTIC_CORTEX_PAT` instead.
+Set Cortex auth. `CortexConfig` reads `ARCTIC_CORTEX_*` via pydantic-settings
+(constructor / JSON values still win). The PAT env var is `ARCTIC_CORTEX_PAT`.
+
+```bash
+export ARCTIC_CORTEX_HOST=<account>.<region>.snowflakecomputing.com
+export ARCTIC_CORTEX_DATABASE=<db>
+export ARCTIC_CORTEX_SCHEMA=<schema>
+export ARCTIC_CORTEX_PAT=<your PAT>
+```
+
+Copy the connection template and fill in host / database / schema if those are
+not already in the environment. Omit `pat` from the file so the token comes
+from `ARCTIC_CORTEX_PAT`.
 
 ```bash
 cp recipes/config.json.template recipes/config.json
