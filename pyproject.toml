@@ -60,6 +60,7 @@ all = [
     "arctic_platform[cortex]",
     "arctic_platform[onprem]",
     "arctic_platform[verl]",
+    "arctic_platform[openai]",
 ]
 
 dev = [
@@ -144,6 +145,17 @@ verl = [
     "arctic_platform[rl]",
     "codetiming",
     "omegaconf",
+]
+
+# The OpenAI-compatible endpoint (arctic_platform/openai_compat). Serving deps
+# only -- it drives a sampling job through the client, so it pulls no engine.
+# transformers is for the chat template, which is applied client-side because
+# the sampling job takes tokens rather than messages.
+openai = [
+    "arctic_platform[cortex]",
+    "fastapi",
+    "transformers",
+    "uvicorn",
 ]
 
 [tool.pytest.ini_options]
