@@ -79,7 +79,7 @@ def _split_value(val, num_chunks: int):
                 f"{num_chunks}. The client must send at least one sample per "
                 "DP worker."
             )
-        return list(torch.chunk(val, num_chunks, dim=0))
+        return list(torch.tensor_split(val, num_chunks, dim=0))
     if isinstance(val, list):
         if len(val) < num_chunks:
             raise ValueError(
