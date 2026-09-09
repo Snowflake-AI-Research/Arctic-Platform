@@ -63,9 +63,6 @@ from .microbatch import _is_multi_modal_key
 from .microbatch import _reorder_list
 from .microbatch import split_padded_tensor_dict_into_mb_list
 
-# On-policy distillation (import registers "on_policy_distill").
-from .on_policy_distill import on_policy_distill_loss
-
 # TRL async distillation gather (registers gather_logits_at_ids / weighted_gathered_logit_sum).
 from .gather_logits import gather_logits_at_ids_post
 from .gather_logits import weighted_gathered_logit_sum
@@ -122,7 +119,6 @@ __all__ = [
     "run_pipeline",
     "identity_post",
     "compute_entropy_and_logprobs_post",
-    "on_policy_distill_loss",
     "gather_logits_at_ids_post",
     "weighted_gathered_logit_sum",
     # packing

@@ -96,7 +96,7 @@ TRL surface is `DistillationTrainer(model, teacher_model, train_dataset, ...).tr
 
 ## Loss: why they are not the same
 
-Arctic ([`on_policy_distill.py`](../arctic_platform/rl/processors/on_policy_distill.py),
+Arctic ([`processor.py`](../arctic_platform/opd/processor.py),
 [`scoring.py`](../arctic_platform/opd/scoring.py)):
 
 - Default teacher scoring uses `prompt_logprobs=0` (sampled token only).
@@ -128,6 +128,7 @@ from arctic_platform.opd import (
     ArcticOPDClient,
     ArcticOPDClientConfig,
     create_arctic_opd_client,
+    on_policy_distill_loss,
     score_teacher,
     score_teacher_topk,
     DEFAULT_PROCESSING,
@@ -143,7 +144,7 @@ from arctic_platform.integrations.trl_distill import (
 - Teacher scoring: `arctic_platform.opd.scoring.score_teacher` / `score_teacher_topk`
 - TRL async adapters / CPU trainer: `arctic_platform.integrations.trl_distill`
 - GSM8K async-distill example: `arctic_platform.integrations.trl_distill.examples.run_async_distill_gsm8k`
-- Loss (server): `arctic_platform.rl.processors.on_policy_distill`
+- Loss (server): `arctic_platform.opd.processor` (`on_policy_distill_loss`)
 
 ## Quick start
 

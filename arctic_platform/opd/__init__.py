@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Arctic on-policy distillation client.
+"""Arctic on-policy distillation — client, config, scoring, and processors.
 
 Complementary to Hugging Face TRL DistillationTrainer, not a drop-in. See
 ``docs/opd.md``.
@@ -23,6 +23,9 @@ from arctic_platform.opd.client import DEFAULT_PROCESSING
 from arctic_platform.opd.client import ArcticOPDClient
 from arctic_platform.opd.client import create_arctic_opd_client
 from arctic_platform.opd.config import ArcticOPDClientConfig
+from arctic_platform.opd.processor import apply_opd_global_token_config
+from arctic_platform.opd.processor import count_opd_loss_tokens
+from arctic_platform.opd.processor import on_policy_distill_loss
 from arctic_platform.opd.scoring import score_teacher
 from arctic_platform.opd.scoring import score_teacher_topk
 
@@ -30,7 +33,10 @@ __all__ = [
     "ArcticOPDClient",
     "ArcticOPDClientConfig",
     "DEFAULT_PROCESSING",
+    "apply_opd_global_token_config",
+    "count_opd_loss_tokens",
     "create_arctic_opd_client",
+    "on_policy_distill_loss",
     "score_teacher",
     "score_teacher_topk",
 ]

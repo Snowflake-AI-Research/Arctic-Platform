@@ -459,8 +459,8 @@ class DeepSpeedWorker:
             return
         if loss_fn != "on_policy_distill":
             return
-        from arctic_platform.rl.processors.on_policy_distill import apply_opd_global_token_config
-        from arctic_platform.rl.processors.on_policy_distill import count_opd_loss_tokens
+        from arctic_platform.opd.processor import apply_opd_global_token_config
+        from arctic_platform.opd.processor import count_opd_loss_tokens
 
         local_tokens, local_seqs = count_opd_loss_tokens(batch_data)
         counts = torch.tensor([local_tokens, local_seqs], device=self._device, dtype=torch.long)
