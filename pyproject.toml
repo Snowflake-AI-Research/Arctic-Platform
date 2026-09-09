@@ -68,11 +68,11 @@ dev = [
     "arctic_platform[testing]",
 ]
 
-# Pulls [cortex] and [onprem] because the suite exercises every transport, and
-# because `dev` is defined as formatting + testing.
+# Pulls [cortex] so the transport tests can import the client. Not [onprem]: it
+# reaches [rl] -> arctic-inference[vllm], and vLLM's build needs CUDA_HOME, which
+# a CPU-only CI runner does not have. The on-prem tests skip without it.
 testing = [
     "arctic_platform[cortex]",
-    "arctic_platform[onprem]",
     "parameterized",
     "pytest-instafail",
     "pytest-flakefinder",
