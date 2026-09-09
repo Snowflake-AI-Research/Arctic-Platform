@@ -16,14 +16,17 @@
 from __future__ import annotations
 
 import math
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import torch
 
+from arctic_platform.opd.processor import _DEFAULT_DELTA_CLAMP
+from arctic_platform.opd.processor import _distill_kl_per_token
+from arctic_platform.opd.processor import on_policy_distill_loss
 from arctic_platform.rl.processors import LOSS_FNS
-from arctic_platform.rl.processors.on_policy_distill import _DEFAULT_DELTA_CLAMP
-from arctic_platform.rl.processors.on_policy_distill import _distill_kl_per_token
-from arctic_platform.rl.processors.on_policy_distill import on_policy_distill_loss
 
 
 def _make_call(
@@ -79,6 +82,62 @@ def test_k1_metric_is_masked_mean_logprob_gap():
 
 def test_loss_is_registered():
     assert LOSS_FNS["on_policy_distill"] is on_policy_distill_loss
+
+
+def _fresh(script: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, "-c", script], check=False, capture_output=True, text=True)
+
+
+def test_rl_processors_shim_module_is_gone():
+    script = (
+        "import importlib.util\n"
+        "assert importlib.util.find_spec('arctic_platform.rl.processors.on_policy_distill') is None, "
+        "'rl.processors.on_policy_distill shim must not exist'\n"
+    )
+    proc = _fresh(script)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_importing_rl_processors_does_not_register_opd_loss():
+    script = (
+        "from arctic_platform.common.registry import LOSS_FNS\n"
+        "import arctic_platform.rl.processors  # noqa: F401\n"
+        "assert 'on_policy_distill' not in LOSS_FNS, sorted(LOSS_FNS)\n"
+    )
+    proc = _fresh(script)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_importing_opd_processor_registers_loss_and_resolves():
+    script = (
+        "from arctic_platform.opd.processor import on_policy_distill_loss\n"
+        "from arctic_platform.common.registry import LOSS_FNS, resolve_fn\n"
+        "assert LOSS_FNS['on_policy_distill'] is on_policy_distill_loss\n"
+        "assert resolve_fn(LOSS_FNS, 'on_policy_distill') is on_policy_distill_loss\n"
+    )
+    proc = _fresh(script)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_importing_opd_package_registers_loss():
+    script = (
+        "import arctic_platform.opd as opd\n"
+        "from arctic_platform.common.registry import LOSS_FNS\n"
+        "assert LOSS_FNS['on_policy_distill'] is opd.on_policy_distill_loss\n"
+    )
+    proc = _fresh(script)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_worker_imports_opd_processor_before_pipeline():
+    worker = Path(__file__).resolve().parents[2] / "arctic_platform" / "common" / "deepspeed_worker.py"
+    src = worker.read_text()
+    assert "from arctic_platform.opd.processor import apply_opd_global_token_config" in src
+    assert "from arctic_platform.opd.processor import count_opd_loss_tokens" in src
+    assert "from arctic_platform.rl.processors.on_policy_distill" not in src
+    inject = src.index("def _inject_opd_global_token_config")
+    pipeline = src.index("from arctic_platform.rl.processors import run_pipeline")
+    assert inject < pipeline
 
 
 def test_masked_values_do_not_change_loss():
@@ -331,7 +390,7 @@ def test_logits_fallback_when_no_logprobs_post_processor():
 
 
 def test_count_opd_loss_tokens_dict_and_gas_list():
-    from arctic_platform.rl.processors.on_policy_distill import count_opd_loss_tokens
+    from arctic_platform.opd.processor import count_opd_loss_tokens
 
     mask = torch.tensor([[1, 1, 0], [1, 0, 0]])
     assert count_opd_loss_tokens({"loss_mask": mask}) == (3, 2)
@@ -340,7 +399,7 @@ def test_count_opd_loss_tokens_dict_and_gas_list():
 
 
 def test_count_opd_loss_tokens_packed_cu_seqlens():
-    from arctic_platform.rl.processors.on_policy_distill import count_opd_loss_tokens
+    from arctic_platform.opd.processor import count_opd_loss_tokens
 
     mask = torch.ones(1, 5, dtype=torch.long)
     cu = torch.tensor([0, 3, 5], dtype=torch.int32)
@@ -387,8 +446,8 @@ def test_meta_supplies_norm_when_config_omits_it():
 
 
 def test_apply_opd_global_token_config_writes_config_and_meta():
-    from arctic_platform.rl.processors.on_policy_distill import apply_opd_global_token_config
-    from arctic_platform.rl.processors.on_policy_distill import count_opd_loss_tokens
+    from arctic_platform.opd.processor import apply_opd_global_token_config
+    from arctic_platform.opd.processor import count_opd_loss_tokens
 
     mask = torch.tensor([[1, 1, 1, 0], [1, 0, 0, 0]])
     tokens, seqs = count_opd_loss_tokens({"loss_mask": mask})

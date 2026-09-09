@@ -49,10 +49,32 @@ def is_optional_frozen_vllm_param(name: str) -> bool:
     return ".mtp." in name
 
 
+_QKV_BIAS_SUFFIX = ".self_attn.qkv_proj.bias"
+
+
+def _unpacked_qkv_biases(qkv_bias_name: str) -> tuple[str, str, str]:
+    prefix = qkv_bias_name[: -len("qkv_proj.bias")]
+    return (f"{prefix}q_proj.bias", f"{prefix}k_proj.bias", f"{prefix}v_proj.bias")
+
+
 def expected_hf_names_for_text_sync(expected: set[str], sender_names: Iterable[str]) -> set[str]:
-    """Drop frozen vision/MTP names from *expected* unless the sender shipped them."""
+    """Drop frozen vision/MTP names from *expected* unless the sender shipped them.
+
+    vLLM fuses Qwen2 ``q/k/v_proj.bias`` into ``qkv_proj.bias``. The HF trainer
+    still ships the three unpacked biases; accept those in place of the fused
+    name so name-check matches the loader that already cats q/k/v.
+    """
     sender_set = set(sender_names)
-    return {n for n in expected if n in sender_set or not is_optional_frozen_vllm_param(n)}
+    kept = {n for n in expected if n in sender_set or not is_optional_frozen_vllm_param(n)}
+    rewritten: set[str] = set()
+    for name in kept:
+        if name.endswith(_QKV_BIAS_SUFFIX):
+            unpacked = _unpacked_qkv_biases(name)
+            if all(part in sender_set for part in unpacked):
+                rewritten.update(unpacked)
+                continue
+        rewritten.add(name)
+    return rewritten
 
 
 def pack_qwen35_gdn_layer(layer_sd: dict, prefix: str) -> dict:

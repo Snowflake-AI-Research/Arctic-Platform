@@ -43,8 +43,34 @@ Do not land distillation work on the GRPO `TrainingClientProtocol` draft
 ([Arctic-Platform PR #84](https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/84)).
 That adapter is GRPO-only and is out of scope here.
 
-A CPU-only Arctic training-client path for async distillation is a follow-up
-change; it is not part of this client.
+## TRL async distillation training client
+
+TRL `AsyncDistillationTrainer` still loads a local student and has no
+`training_client=`. Use
+[`ArcticAsyncDistillationTrainer`](../arctic_platform/integrations/trl_distill/README.md)
+for a CPU-only driver: generate, teacher score, gather/fwd-bwd, step, and
+weight sync stay on Arctic. That path is **non-colocated**: DeepSpeed train,
+student vLLM, and teacher vLLM on disjoint GPUs
+(`OnPremConfig.colocate=False`), matching TRL's three-server layout. Do not
+extend PR #84.
+
+| Adapter | Role |
+|---|---|
+| `ArcticAsyncDistillationTrainer` | CPU-only driver; no local student load |
+| `ArcticOPDRolloutWorker` | TRL `rollout_worker=` shape |
+| `ArcticOPDWeightTransfer` | TRL `weight_transfer=` shape |
+| `ArcticOPDTrainingClient` | `forward_samples` for the CPU trainer; `forward_backward` is the distillation `training_client=` hook |
+| `gather_logits_at_ids` / `weighted_gathered_logit_sum` | Server gather + first-order surrogate |
+
+```python
+from arctic_platform.integrations.trl_distill import (
+    ArcticAsyncDistillationConfig,
+    create_arctic_async_distillation_trainer,
+)
+
+trainer = create_arctic_async_distillation_trainer(client, train_prompts, args)
+trainer.train()
+```
 
 ## vs TRL
 
@@ -56,7 +82,8 @@ change; it is not part of this client.
 | Teacher signal | Logprob of the **sampled token only** (`prompt_logprobs: 0`), or top-k via `score_teacher_topk` | Full next-token distribution, chunked | Sparse **top-k** teacher distribution over HTTP |
 | Loss | Single-logit reverse KL, k3 / `low_var_kl` | Generalized JSD via `beta` | Same JSD, sparse support |
 | Optimizer / shard | DeepSpeed ZeRO-1 on the server | Accelerate / DeepSpeed / FSDP | FSDP2 only (no DeepSpeed ZeRO) |
-| Weight sync | `client.sync_weights()` student train → student sampler | In-process or vLLM NCCL | NCCL to student vLLM |
+| GPU layout | Native loop may `--colocate`; `ArcticAsyncDistillationTrainer` requires disjoint train / student-sample / teacher | Same process | 3 separate GPUs |
+| Weight sync | `client.sync_weights()` student train → student sampler (NCCL when not colocated) | In-process or vLLM NCCL | NCCL to student vLLM |
 
 Public Arctic surface is primitives, not a trainer:
 
@@ -69,7 +96,7 @@ TRL surface is `DistillationTrainer(model, teacher_model, train_dataset, ...).tr
 
 ## Loss: why they are not the same
 
-Arctic ([`on_policy_distill.py`](../arctic_platform/rl/processors/on_policy_distill.py),
+Arctic ([`processor.py`](../arctic_platform/opd/processor.py),
 [`scoring.py`](../arctic_platform/opd/scoring.py)):
 
 - Default teacher scoring uses `prompt_logprobs=0` (sampled token only).
@@ -101,16 +128,23 @@ from arctic_platform.opd import (
     ArcticOPDClient,
     ArcticOPDClientConfig,
     create_arctic_opd_client,
+    on_policy_distill_loss,
     score_teacher,
     score_teacher_topk,
     DEFAULT_PROCESSING,
+)
+from arctic_platform.integrations.trl_distill import (
+    ArcticAsyncDistillationTrainer,
+    create_arctic_async_distillation_trainer,
 )
 ```
 
 - Config: `arctic_platform.opd.config.ArcticOPDClientConfig`
 - Client: `arctic_platform.opd.client.ArcticOPDClient`
 - Teacher scoring: `arctic_platform.opd.scoring.score_teacher` / `score_teacher_topk`
-- Loss (server): `arctic_platform.rl.processors.on_policy_distill`
+- TRL async adapters / CPU trainer: `arctic_platform.integrations.trl_distill`
+- GSM8K async-distill example: `arctic_platform.integrations.trl_distill.examples.run_async_distill_gsm8k`
+- Loss (server): `arctic_platform.opd.processor` (`on_policy_distill_loss`)
 
 ## Quick start
 

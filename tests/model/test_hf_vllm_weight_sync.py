@@ -166,6 +166,28 @@ def test_expected_hf_names_drop_missing_visual_keep_shipped():
     assert "mtp.layers.0.weight" not in filtered_vlm
 
 
+def test_expected_names_accept_unpacked_qwen2_qkv_biases():
+    expected = {
+        "model.layers.0.self_attn.qkv_proj.bias",
+        "model.layers.0.self_attn.qkv_proj.weight",
+        "model.embed_tokens.weight",
+    }
+    sender = {
+        "model.layers.0.self_attn.q_proj.bias",
+        "model.layers.0.self_attn.k_proj.bias",
+        "model.layers.0.self_attn.v_proj.bias",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.embed_tokens.weight",
+    }
+    filtered = expected_hf_names_for_text_sync(expected, sender)
+    assert "model.layers.0.self_attn.qkv_proj.bias" not in filtered
+    assert "model.layers.0.self_attn.q_proj.bias" in filtered
+    assert "model.layers.0.self_attn.k_proj.bias" in filtered
+    assert "model.layers.0.self_attn.v_proj.bias" in filtered
+
+
 def test_text_only_extension_allows_missing_visual():
     from arctic_platform.common.weight_sync_extension import TextOnlyWeightSyncExtension
 

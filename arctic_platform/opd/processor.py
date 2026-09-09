@@ -13,17 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Single-logit on-policy distillation loss.
+"""OPD processors — registered into the shared ``LOSS_FNS`` registry.
 
-The student generates on-policy, a frozen teacher scores those exact same token
-ids, and the student minimises per-token reverse KL ``KL(pi_student || pi_teacher)``
-estimated from the sampled token alone.
+Single-logit on-policy distillation: the student generates on-policy, a frozen
+teacher scores those exact same token ids, and the student minimises per-token
+reverse KL ``KL(pi_student || pi_teacher)`` estimated from the sampled token alone.
 
 ``functional.kl_penalty(method="low_var_kl")`` computes the same k3 estimator but
 clamps its *output* to ``[-10, 10]``. That zeroes the gradient for
 ``|delta| ≳ 2.63`` — exactly where student and teacher disagree most. This module
 clamps only the *input* ``delta`` (to keep ``exp`` finite) and leaves the output
 cap opt-in via ``kl_clamp_max``.
+
+Importing this module registers ``on_policy_distill``.
 """
 
 from __future__ import annotations
@@ -32,8 +34,8 @@ from typing import Optional
 
 import torch
 
-from .functional import agg_loss
-from .pipeline import register_loss_fn
+from arctic_platform.common.registry import register_loss_fn
+from arctic_platform.rl.processors.functional import agg_loss
 
 _DEFAULT_DELTA_CLAMP = 20.0
 
