@@ -32,13 +32,7 @@ import torch  # noqa: E402
 from dss_client import wire  # noqa: E402
 from dss_client.neutrino_client import _operation_chunk_max_bytes  # noqa: E402
 
-from cortex_client_side_loss import (  # noqa: E402
-    RESPONSE_OPTIONS,
-    build_client,
-    default_job_body,
-    make_batch,
-    training_sub_job,
-)
+from cortex_client_side_loss import RESPONSE_OPTIONS, build_client, make_batch, training_sub_job  # noqa: E402
 
 CEILING_ENV = "DSS_FORWARD_OPERATION_MAX_JSON_BYTES"
 MIN_CEILING = 16 * 1024
@@ -56,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--job-id")
-    parser.add_argument("--job-body", default=default_job_body())
+    parser.add_argument("--job-body", default="/code/users/karthik/thong-client/examples/training-small-hf.json")
     parser.add_argument("--model-name", default="Qwen/Qwen3-8B")
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--keep-job", action="store_true")
