@@ -24,6 +24,9 @@ from typing import Any
 import torch
 from trl.experimental.api import ForwardBackwardOutput
 
+from arctic_platform.integrations.trl.loss import _CLIENT_LOSS_ENCODINGS
+from arctic_platform.integrations.trl.loss import _surrogate_payload
+
 
 def _meta_dict(
     *,
@@ -67,6 +70,11 @@ class ArcticTrainingClient:
             (perf + parity with verl/SkyRL). When ``False`` (default), keep the
             two-pass client-side surrogate path.
         server_loss_fn: Server GRPO loss name/dotted-path used when ``server_side_loss``.
+        client_loss_encoding: How the two-pass path expresses ``dL/dlogprobs`` to the
+            server. ``"weighted_logprob_sum"`` (default) names this package's own
+            surrogate, which the server must have registered. ``"grpo"`` encodes the
+            same quantity in the stock GRPO loss instead, so the path runs on a server
+            that ships nothing from this package -- see :func:`_surrogate_payload`.
     """
 
     def __init__(
@@ -83,6 +91,7 @@ class ArcticTrainingClient:
         logits_compute_in_fp32: bool = False,
         server_side_loss: bool = False,
         server_loss_fn: str = "arctic_platform.integrations.trl.loss.trl_grpo",
+        client_loss_encoding: str = "weighted_logprob_sum",
         zorro_train_enable: bool = False,
         response_len: int | None = None,
         zorro_load_balancer: bool = False,
@@ -99,6 +108,11 @@ class ArcticTrainingClient:
         self.logits_compute_in_fp32 = logits_compute_in_fp32
         self.server_side_loss = server_side_loss
         self.server_loss_fn = server_loss_fn
+        if client_loss_encoding not in _CLIENT_LOSS_ENCODINGS:
+            raise ValueError(
+                f"client_loss_encoding must be one of {sorted(_CLIENT_LOSS_ENCODINGS)}, got {client_loss_encoding!r}"
+            )
+        self.client_loss_encoding = client_loss_encoding
         self.zorro_train_enable = zorro_train_enable
         # Padded response width (== configured max_completion_length == server ds_worker_config.response_len).
         # Zorro emits verl-style structured [B, max_prompt_len + response_len] batches, so this must be set.
@@ -188,14 +202,20 @@ class ArcticTrainingClient:
         def send_backward(grad_loss: torch.Tensor) -> None:
             # Scale, unshift to [1, T], unpack to [B, S].
             weights = _unpack_to_padded(_unshift_from_trl(grad_log_probs * grad_loss), seq_lens)
+            back_batch, back_loss_fn, loss_config = _surrogate_payload(
+                self.client_loss_encoding, batch, weights, out["logprobs"], self.loss_fn
+            )
+            processing = {
+                "post": ["apply_temperature", "compute_entropy_and_logprobs"],
+                "loss_fn": back_loss_fn,
+            }
+            if loss_config:
+                processing["config"] = loss_config
             self.client.fwd_bwd(
                 {
-                    "batch": {**batch, "logprob_weights_shifted": weights},
+                    "batch": back_batch,
                     "meta": self._meta(calculate_entropy=False),
-                    "processing": {
-                        "post": ["apply_temperature", "compute_entropy_and_logprobs"],
-                        "loss_fn": self.loss_fn,
-                    },
+                    "processing": processing,
                 }
             )
 

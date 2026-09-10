@@ -65,3 +65,55 @@ def trl_grpo(
     loss = masked / batch_num_tokens * dp_size / grad_accum
 
     return loss, {"loss": loss.detach()}
+
+
+_CLIENT_LOSS_ENCODINGS = ("weighted_logprob_sum", "grpo")
+
+
+def _surrogate_payload(
+    encoding: str,
+    batch: dict,
+    weights: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    loss_fn: str,
+) -> tuple[dict, str, dict]:
+    """Express ``w = dL/dlogprobs`` as a batch the server can differentiate.
+
+    Both encodings ask for the same thing -- a loss whose gradient wrt log-probs is
+    exactly ``w`` -- and differ only in which registered loss carries it.
+
+    ``weighted_logprob_sum`` states it directly, but the server has to have this
+    package installed. ``grpo`` gets there with a loss every RL server already
+    ships: its gradient wrt log-probs is ``-advantages * ratio``, so pinning
+    ``old_log_probs_shifted`` to the log-probs the forward pass just returned makes
+    the ratio 1 and leaves ``-advantages``.
+
+    Scale follows from ``token-mean``, which is ``masked_sum / batch_num_tokens *
+    dp_size``. Setting both to 1 collapses it to a plain masked sum, leaving the
+    gradient unnormalized exactly as ``weighted_logprob_sum`` leaves it -- so the
+    two encodings behave identically under data parallelism, inheriting that
+    behaviour rather than redefining it.
+
+    What matches is the gradient, not the number. ``weighted_logprob_sum`` reports
+    ``sum(w * logprobs)`` while this reports ``sum(w)``, because at ratio 1 the
+    per-token GRPO term is ``-advantages``. Both differentiate to ``w``, which is
+    all the backward pass consumes; the client reports its own loss to TRL and
+    discards the server's, so the difference is confined to server-side metrics.
+
+    Clipping cannot engage: at ratio 1, ``min(r*A, clip(r)*A)`` is ``A`` for any
+    epsilon. The server recomputes log-probs in bf16, so the ratio lands at 1 only
+    to within forward nondeterminism, which perturbs the gradient by ~1e-5
+    relative -- far inside the clip band, but not bit-exact.
+    """
+    if encoding == "grpo":
+        return (
+            {
+                **batch,
+                "old_log_probs_shifted": old_log_probs,
+                "advantages": -weights,
+                "loss_mask": batch["attention_mask"].to(weights.dtype),
+            },
+            "grpo",
+            {"batch_num_tokens": 1, "dp_size": 1},
+        )
+    return {**batch, "logprob_weights_shifted": weights}, loss_fn, {}
