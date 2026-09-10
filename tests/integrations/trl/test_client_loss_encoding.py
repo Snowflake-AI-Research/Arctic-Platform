@@ -222,6 +222,44 @@ class TestPayloadAlignment:
         assert torch.equal(grpo_batch["advantages"] != 0, default_batch["logprob_weights_shifted"] != 0)
         assert torch.allclose(grpo_batch["advantages"], -default_batch["logprob_weights_shifted"])
 
+    def test_both_encodings_hand_the_server_the_same_gradient(self):
+        """Switching encodings must change nothing the server acts on.
+
+        The tests above compare payload tensors, and the equivalence test above
+        differentiates the two losses on tensors that were aligned by
+        construction. Neither would catch a divergence introduced inside
+        ``forward_backward`` itself. This runs the real client path under both
+        encodings and then differentiates the real server losses on whatever it
+        produced, which is the form of the claim a caller on the default
+        encoding actually depends on.
+        """
+        grpo_run = self._run("grpo")
+        default_run = self._run("weighted_logprob_sum")
+        assert torch.equal(grpo_run.logprobs, default_run.logprobs), "fixtures diverged; comparison is meaningless"
+
+        def _f64(batch: dict) -> dict:
+            # float32 leaves ~4e-6 of slack at these magnitudes, which is wider
+            # than a real disagreement would have to be to matter.
+            return {k: v.double() if torch.is_tensor(v) and v.is_floating_point() else v for k, v in batch.items()}
+
+        grpo_leaf = grpo_run.logprobs.double().requires_grad_(True)
+        grpo_value, _ = grpo_loss(
+            {"logprobs": grpo_leaf},
+            _f64(grpo_run.payload["batch"]),
+            grpo_run.payload["processing"].get("config", {}),
+            "cpu",
+        )
+        (grpo_grad,) = torch.autograd.grad(grpo_value, grpo_leaf)
+
+        default_leaf = default_run.logprobs.double().requires_grad_(True)
+        default_value, _ = weighted_logprob_sum(
+            {"logprobs": default_leaf}, _f64(default_run.payload["batch"]), {}, {}, "cpu"
+        )
+        (default_grad,) = torch.autograd.grad(default_value, default_leaf)
+
+        assert grpo_grad.abs().max() > 0, "a zero gradient would pass the comparison for the wrong reason"
+        assert torch.allclose(grpo_grad, default_grad, atol=1e-12)
+
 
 class TestDefaultEncoding:
     def test_default_is_unchanged(self):
