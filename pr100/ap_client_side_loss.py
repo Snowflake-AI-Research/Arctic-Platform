@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -38,6 +39,17 @@ TEXTS = [
     "Snowflake builds reliable data systems, and this batch checks one forward pass.",
     "A mixture of experts model routes tokens through sparse expert layers during training.",
 ]
+
+
+def default_trl_repo() -> str:
+    """The Arctic-Platform checkout that ``arctic_platform`` is imported from.
+
+    Derived so this follows PYTHONPATH instead of pinning one person's clone,
+    and so the loss under test always matches the transport under test.
+    """
+    import arctic_platform
+
+    return str(Path(arctic_platform.__file__).resolve().parent.parent)
 
 
 def load_trl_grpo(repo: str):
@@ -77,7 +89,9 @@ def build_transport(cfg: dict, job_id: str, training: str) -> CortexTransport:
 
 
 def make_batch(model_name: str, max_length: int) -> dict:
-    sys.path.insert(0, "/code/users/karthik/thong-client")
+    if os.environ.get("DSS_CLIENT_REPO"):
+        # Opt-in only, so PYTHONPATH decides which dss-client is exercised.
+        sys.path.insert(0, os.environ["DSS_CLIENT_REPO"])
     from dss_client.neutrino_client import build_forward_backward_kwargs
 
     return build_forward_backward_kwargs(
@@ -108,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--job-id", required=True)
-    parser.add_argument("--trl-repo", default="/code/users/karthik/trl-ap")
+    parser.add_argument("--trl-repo", default=None, help="defaults to the checkout arctic_platform is imported from")
     parser.add_argument("--model-name", default="Qwen/Qwen3-8B")
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--tolerance", type=float, default=1e-3)
@@ -156,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  grad_norm(direct) = {gn_direct}")
 
     print("\n[3/4] TRL's GRPO loss client-side -> grpo surrogate through CortexTransport")
-    trl_grpo = load_trl_grpo(args.trl_repo)
+    trl_grpo = load_trl_grpo(args.trl_repo or default_trl_repo())
     leaf = lp0.clone().requires_grad_(True)
     client_loss, _ = trl_grpo(
         {"logprobs": leaf},

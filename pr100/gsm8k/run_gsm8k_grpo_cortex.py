@@ -133,8 +133,10 @@ def build_config(args, cortex_cfg: dict, *, training_job_id=None, sampling_job_i
     )
 
 
-def create_job(cortex_cfg: dict, sub_job_configs: list, image_tag: str | None, client_repo: str) -> str:
-    sys.path.insert(0, client_repo)
+def create_job(cortex_cfg: dict, sub_job_configs: list, image_tag: str | None, client_repo: str | None) -> str:
+    if client_repo:
+        # Only when asked; otherwise PYTHONPATH picks the dss-client.
+        sys.path.insert(0, client_repo)
     from dss_client.neutrino_client import DEBUG_OPTIONS_ENV
     from dss_client.neutrino_client import NeutrinoClient
 
@@ -166,7 +168,7 @@ def create_job(cortex_cfg: dict, sub_job_configs: list, image_tag: str | None, c
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cortex-config", required=True)
-    ap.add_argument("--client-repo", default="/code/users/karthik/thong-client")
+    ap.add_argument("--client-repo", default=None, help="dss-client checkout to prepend; default uses PYTHONPATH")
     ap.add_argument("--debug-image-tag")
     ap.add_argument("--job-id", help="reuse an existing Cortex job instead of creating one")
     ap.add_argument("--model", default="Qwen/Qwen3-1.7B")

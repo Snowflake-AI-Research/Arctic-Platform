@@ -13,9 +13,17 @@ export PYTHONPATH=/code/users/karthik/ap-e2e:/code/users/karthik/thong-client:$D
 COMMON=(
   --cortex-config /code/users/karthik/qa6_dsa_config.json
   --client-repo /code/users/karthik/thong-client
-  # The default deployed image cannot decode the /operation payload_b64 that the
-  # forward path sends, so forward_only() fails to parse the frame server-side.
-  # Thong's chunk-assembly work is only in this debug build.
+  # HISTORICAL, and do not copy this into a new run. As of 2026-09-10 the pin is
+  # unnecessary: Thong's server-side envelope decode reached the default
+  # deployment, verified by pr100/ap_client_side_loss.py against the default
+  # image. Two notes for anyone reading this as a record of what was run:
+  #
+  #   - The reason the pin was needed on 2026-09-02 was envelope *decode* -- the
+  #     server handed base64 text to wire.loads. It was not chunk assembly, as an
+  #     earlier version of this comment claimed. The frame here is one rollout
+  #     group, a few hundred KB, well under the 12.58 MB that triggers a split.
+  #   - Reproducing the published three-seed numbers requires this exact tag.
+  #     A fresh run should simply drop the flag.
   --debug-image-tag dev_20260828_170144_40ee0a90875
   --model Qwen/Qwen3-1.7B
   --num-prompts 512
