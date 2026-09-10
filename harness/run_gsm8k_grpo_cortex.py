@@ -231,8 +231,11 @@ def main() -> int:
         client = ArcticRLClient(cfg)
         print(f"[cortex] client attached; jobs={client.jobs}", flush=True)
         # The TRL integration speaks the on-prem dialect; a Cortex zone does not.
-        # See cortex_trl_adapter for what this bridges and what it cannot.
-        from cortex_trl_adapter import CortexTRLAdapter
+        # This is PR #109; see its module docstring for what it bridges and what
+        # it cannot. Imported from the package on purpose -- a local copy here
+        # would shadow it under the PYTHONPATH this harness runs with, and the
+        # run would then say nothing about the code under review.
+        from arctic_platform.integrations.trl.cortex import CortexTRLAdapter
 
         engine = CortexTRLAdapter(client, temperature=1.0)
 
