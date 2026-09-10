@@ -1,0 +1,178 @@
+Created job c4e6854c-a1a6-4c64-a977-058398efa2e7 on the DEFAULT image; waiting for RUNNING ...
+Job c4e6854c-a1a6-4c64-a977-058398efa2e7 is RUNNING
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[A] grpo encoding, clean
+[neutrino fwd-bwd] phase=submit call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=12528 payload total bytes: 12528
+[neutrino fwd-bwd] phase=submit call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=12528 sending POST https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/forward-backward attempt=1/11
+[neutrino fwd-bwd] phase=submit call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=12528 successful response POST https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/forward-backward attempt=1/11 status=200 snowflake_request_id=ba7385cb-71ce-49ea-814d-450502c4adf4 body={"job_id": "c4e6854c-a1a6-4c64-a977-058398efa2e7", "request_id": "rr_t0.req_fb59c08583a9"}
+[neutrino fwd-bwd] phase=submit call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=12528 submitted request_id=rr_t0.req_fb59c08583a9 body={"job_id": "c4e6854c-a1a6-4c64-a977-058398efa2e7", "request_id": "rr_t0.req_fb59c08583a9"}
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 sending GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 successful response GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11 status=200 snowflake_request_id=8778eb55-6db6-4503-aa80-1327f7edd6ce body={"created_at": "2026-09-10T17:18:02.665378Z", "request_id": "rr_t0.req_fb59c08583a9", "status": "REQUEST_STATE_RUNNING", "updated_at": "2026-09-10T17:18:02.665766Z"}
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 sending GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 successful response GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11 status=200 snowflake_request_id=c5057939-62c2-4018-922d-9ed253edfaa0 body={"created_at": "2026-09-10T17:18:02.665378Z", "request_id": "rr_t0.req_fb59c08583a9", "status": "REQUEST_STATE_RUNNING", "updated_at": "2026-09-10T17:18:02.665766Z"}
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 sending GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 successful response GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11 status=200 snowflake_request_id=496976d2-bdd3-42b7-806b-c6f1b7193a02 body={"created_at": "2026-09-10T17:18:02.665378Z", "request_id": "rr_t0.req_fb59c08583a9", "status": "REQUEST_STATE_RUNNING", "updated_at": "2026-09-10T17:18:02.665766Z"}
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 sending GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 successful response GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11 status=200 snowflake_request_id=a190b6d6-52a6-445e-a3b5-59bef0802f75 body={"created_at": "2026-09-10T17:18:02.665378Z", "request_id": "rr_t0.req_fb59c08583a9", "status": "REQUEST_STATE_RUNNING", "updated_at": "2026-09-10T17:18:02.665766Z"}
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 sending GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 successful response GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11 status=200 snowflake_request_id=7ae4941f-ae8c-48e5-9065-2b8a2dc92b45 body={"created_at": "2026-09-10T17:18:02.665378Z", "request_id": "rr_t0.req_fb59c08583a9", "status": "REQUEST_STATE_RUNNING", "updated_at": "2026-09-10T17:18:02.665766Z"}
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 sending GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 successful response GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11 status=200 snowflake_request_id=cb286dcd-e9a9-4848-81f3-509530ef4caf body={"created_at": "2026-09-10T17:18:02.665378Z", "request_id": "rr_t0.req_fb59c08583a9", "status": "REQUEST_STATE_RUNNING", "updated_at": "2026-09-10T17:18:02.665766Z"}
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 sending GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_fb59c08583a9 attempt=1/11
+[neutrino fwd-bwd] phase=poll call=1 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_fb59c08583a9 payload_bytes=12528 completed state=done result={"avg_loss": 0.34213176369667053, "job_id": "c4e6854c-a1a6-4c64-a977-058398efa2e7:training:0", "metrics": {"approx_kl": -6.953267574310303, "clip_ratio": 0.5, "entropy": 6.953267574310303, "importance_weight": 0.045831043273210526, "rank": 0, "rl_model_calls": 1, "trainable_logprob_count_all": 27.0, "trainable_logprob_lowvar_all/max": 12.753929138183594, "trainable_logprob_lowvar_all/mean": 5.392905906394676, "trainable_logprob_lowvar_all/min": 0.024883165955543518}, "post_process_outputs": {"logprobs": [[-10.256202697753906, -10.33199691772461, -8.493093490600586, -1.1650564670562744, -3.488579511642456, -2.7682414054870605, -1.7670443058013916, -3.8757567405700684, -12.178869247436523, -13.753928184509277, -7.188684463500977, -12.656428337097168, -6.2486090660095215, -3.1732571125030518, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [-11.2294921875, -0.23169566690921783, -12.038406372070312, -3.1341350078582764, -12.061180114746094, -9.164752006530762, -4.162133693695068, -7.085322380065918, -1.8716039657592773, -0.6375287175178528, -7.303086280822754, -1.7710444927215576, -2.10191011428833, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,...<truncated 213 chars>
+  grad_norm(A) = 1.2140374183654785
+[A'] identical request, no failure in between -- measures that scatter
+[neutrino fwd-bwd] phase=submit call=2 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=12528 payload total bytes: 12528
+[neutrino fwd-bwd] phase=submit call=2 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=12528 sending POST https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/forward-backward attempt=1/11
+[neutrino fwd-bwd] phase=submit call=2 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=12528 successful response POST https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/forward-backward attempt=1/11 status=200 snowflake_request_id=9462491f-780c-4b1f-a4a0-e2727ba79efd body={"job_id": "c4e6854c-a1a6-4c64-a977-058398efa2e7", "request_id": "rr_t0.req_0a5354772582"}
+[neutrino fwd-bwd] phase=submit call=2 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=12528 submitted request_id=rr_t0.req_0a5354772582 body={"job_id": "c4e6854c-a1a6-4c64-a977-058398efa2e7", "request_id": "rr_t0.req_0a5354772582"}
+[neutrino fwd-bwd] phase=poll call=2 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_0a5354772582 payload_bytes=12528 sending GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_0a5354772582 attempt=1/11
+[neutrino fwd-bwd] phase=poll call=2 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_0a5354772582 payload_bytes=12528 successful response GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_0a5354772582 attempt=1/11 status=200 snowflake_request_id=28458e85-e4c8-480f-a6b2-14830ac45164 body={"created_at": "2026-09-10T17:18:18.184613Z", "request_id": "rr_t0.req_0a5354772582", "status": "REQUEST_STATE_RUNNING", "updated_at": "2026-09-10T17:18:18.184853Z"}
+[neutrino fwd-bwd] phase=poll call=2 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_0a5354772582 payload_bytes=12528 sending GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_0a5354772582 attempt=1/11
+[neutrino fwd-bwd] phase=poll call=2 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_0a5354772582 payload_bytes=12528 completed state=done result={"avg_loss": 0.34213176369667053, "job_id": "c4e6854c-a1a6-4c64-a977-058398efa2e7:training:0", "metrics": {"approx_kl": -6.953267574310303, "clip_ratio": 0.5, "entropy": 6.953267574310303, "importance_weight": 0.045831043273210526, "rank": 0, "rl_model_calls": 1, "trainable_logprob_count_all": 27.0, "trainable_logprob_lowvar_all/max": 12.753929138183594, "trainable_logprob_lowvar_all/mean": 5.392905906394676, "trainable_logprob_lowvar_all/min": 0.024883165955543518}, "post_process_outputs": {"logprobs": [[-10.256202697753906, -10.33199691772461, -8.493093490600586, -1.1650564670562744, -3.488579511642456, -2.7682414054870605, -1.7670443058013916, -3.8757567405700684, -12.178869247436523, -13.753928184509277, -7.188684463500977, -12.656428337097168, -6.2486090660095215, -3.1732571125030518, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [-11.2294921875, -0.23169566690921783, -12.038406372070312, -3.1341350078582764, -12.061180114746094, -9.164752006530762, -4.162133693695068, -7.085322380065918, -1.8716039657592773, -0.6375287175178528, -7.303086280822754, -1.7710444927215576, -2.10191011428833, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,...<truncated 213 chars>
+  grad_norm(A') = 1.2140908241271973
+
+[B1] ask for 'arctic_platform.rl.processors.weighted_logprob.weighted_logprob_sum' -- expected to fail
+[neutrino fwd-bwd] phase=submit call=3 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=10232 payload total bytes: 10232
+[neutrino fwd-bwd] phase=submit call=3 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=10232 sending POST https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/forward-backward attempt=1/11
+[neutrino fwd-bwd] phase=submit call=3 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=10232 successful response POST https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/forward-backward attempt=1/11 status=200 snowflake_request_id=49ce2ad2-c3e0-4156-9cf5-a759a7fe15a3 body={"job_id": "c4e6854c-a1a6-4c64-a977-058398efa2e7", "request_id": "rr_t0.req_5b42343c255c"}
+[neutrino fwd-bwd] phase=submit call=3 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=10232 submitted request_id=rr_t0.req_5b42343c255c body={"job_id": "c4e6854c-a1a6-4c64-a977-058398efa2e7", "request_id": "rr_t0.req_5b42343c255c"}
+[neutrino fwd-bwd] phase=poll call=3 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_5b42343c255c payload_bytes=10232 sending GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_5b42343c255c attempt=1/11
+[neutrino fwd-bwd] phase=poll call=3 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_5b42343c255c payload_bytes=10232 successful response GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_5b42343c255c attempt=1/11 status=200 snowflake_request_id=db6ad904-87b9-4e03-80e2-4ce932acb99d body={"created_at": "2026-09-10T17:18:19.948740Z", "error": "\u001b[36mray::GPUTrainingJob.fwd_bwd()\u001b[39m (pid=1399, ip=10.4.165.246, actor_id=a10008fe71525d38a976db4801000000, repr=<dss.ray_dss.jobs.gpu.training.GPUTrainingJob object at 0x7f3d7ced1670>)\n  File \"/usr/lib/python3.12/concurrent/futures/_base.py\", line 449, in result\n    return self.__get_result()\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/concurrent/futures/_base.py\", line 401, in __get_result\n    raise self._exception\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/dss/ray_dss/jobs/gpu/training.py\", line 2283, in fwd_bwd\n    return await self._fwd_bwd_requests.run(\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/neutrino/dss/ray_dss/jobs/fwd_bwd_requests.py\", line 494, in run\n    return await asyncio.shield(task)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/neutrino/dss/ray_dss/jobs/fwd_bwd_requests.py\", line 503, in _execute_and_record\n    result = await execute(payload)\n             ^^^^^^^^^^^^^^^^^^^^^^\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/dss/ray_dss/jobs/gpu/training.py\", line 2446, in _run_fwd_bwd\n    return await self._execute_prepared_fwd_bwd(token)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/dss/ray_dss/jobs/gpu/training.py\", line 2413, in _execute_prepared_fwd_bwd\n    results = await asyncio.gather(\n              ^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/asyncio/tasks.py\", line 684, in _wrap_awaitable\n    return await awaitable\n           ^^^^^^^^^^^^^^^\nray.exceptions.RayTaskError(ModuleNotFoundError): \u001b[36mray::_DeepSpeedWorker.fwd_bwd()\u001b[39m (pid=1150, ip=10.4.172.211, actor_id=b9237458d4440934513a0a2001000000, repr=<dss.ray_dss.jobs.gpu.training._DeepSpeedWorker object at 0x7f450...<truncated 1683 chars>
+[neutrino fwd-bwd] phase=poll call=3 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_5b42343c255c payload_bytes=10232 failed state=failed error=[36mray::GPUTrainingJob.fwd_bwd()[39m (pid=1399, ip=10.4.165.246, actor_id=a10008fe71525d38a976db4801000000, repr=<dss.ray_dss.jobs.gpu.training.GPUTrainingJob object at 0x7f3d7ced1670>)
+  File "/usr/lib/python3.12/concurrent/futures/_base.py", line 449, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/concurrent/futures/_base.py", line 401, in __get_result
+    raise self._exception
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/dss/ray_dss/jobs/gpu/training.py", line 2283, in fwd_bwd
+    return await self._fwd_bwd_requests.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/neutrino/dss/ray_dss/jobs/fwd_bwd_requests.py", line 494, in run
+    return await asyncio.shield(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/neutrino/dss/ray_dss/jobs/fwd_bwd_requests.py", line 503, in _execute_and_record
+    result = await execute(payload)
+             ^^^^^^^^^^^^^^^^^^^^^^
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/dss/ray_dss/jobs/gpu/training.py", line 2446, in _run_fwd_bwd
+    return await self._execute_prepared_fwd_bwd(token)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/dss/ray_dss/jobs/gpu/training.py", line 2413, in _execute_prepared_fwd_bwd
+    results = await asyncio.gather(
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/tasks.py", line 684, in _wrap_awaitable
+    return await awaitable
+           ^^^^^^^^^^^^^^^
+ray.exceptions.RayTaskError(ModuleNotFoundError): [36mray::_DeepSpeedWorker.fwd_bwd()[39m (pid=1150, ip=10.4.172.211, actor_id=b9237458d4440934513a0a2001000000, repr=<dss.ray_dss.jobs.gpu.training._DeepSpeedWorker object at 0x7f450f037b90>)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/neutrino/dss/ray_dss/jobs/gpu/training.py", line 3568, in fwd_bwd
+    result = self._rl_fwd_bwd(batch, processing)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/neutrino/dss/ray_dss/jobs/gpu/training.py", line 4041, in _rl_fwd_bwd
+    reduction = resolve_packed_loss_reduction(processing, packed_mbs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/arctic_training/arctic_rl/processors/pipeline.py", line 165, in resolve_packed_loss_reduction
+    fn = _resolve_fn(LOSS_FNS, loss_fn_name)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/arctic_training/arctic_rl/processors/pipeline.py", line 142, in _resolve_fn
+    fn = getattr(importlib.import_module(module_path), fn_name)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/importlib/__init__.py", line 90, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'arctic_platform.rl.processors.weighted_logprob' body={"created_at": "2026-09-10T17:18:19.948740Z", "error": "\u001b[36mray::GPUTrainingJob.fwd_bwd()\u001b[39m (pid=1399, ip=10.4.165.246, actor_id=a10008fe71525d38a976db4801000000, repr=<dss.ray_dss.jobs.gpu.training.GPUTrainingJob object at 0x7f3d7ced1670>)\n  File \"/usr/lib/python3.12/concurrent/futures/_base.py\", line 449, in result\n    return self.__get_result()\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/concurrent/futures/_base.py\", line 401, in __get_result\n    raise self._exception\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/dss/ray_dss/jobs/gpu/training.py\", line 2283, in fwd_bwd\n    return await self._fwd_bwd_requests.run(\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/neutrino/dss/ray_dss/jobs/fwd_bwd_requests.py\", line 494, in run\n    return await asyncio.shield(task)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/neutrino/dss/ray_dss/jobs/fwd_bwd_requests.py\", line 503, in _execute_and_record\n    result = await execute(payload)\n             ^^^^^^^^^^^^^^^^^^^^^^\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/dss/ray_dss/jobs/gpu/training.py\", line 2446, in _run_fwd_bwd\n    return await self._execute_prepared_fwd_bwd(token)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/dss/ray_dss/jobs/gpu/training.py\", line 2413, in _execute_prepared_fwd_bwd\n    results = await asyncio.gather(\n              ^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/asyncio/tasks.py\", line 684, in _wrap_awaitable\n    return await awaitable\n           ^^^^^^^^^^^^^^^\nray.exceptions.RayTaskError(ModuleNotFoundError): \u001b[36mray::_DeepSpeedWorker.fwd_bwd()\u001b[39m (pid=1150, ip=10.4.172.211, actor_id=b9237458d4440934513a0a2001000000, repr=<dss.ray_dss.jobs.gpu.training._DeepSpeedWorker object at 0x7f450...<truncated 1683 chars>
+  raised RuntimeError: Request rr_t0.req_5b42343c255c ended with state 'failed': [36mray::GPUTrainingJob.fwd_bwd()[39m (pid=1399, ip=10.4.165.246, actor_id=a10008fe71525d38a976db4801000000, repr=<dss.ray_dss.jobs.gpu.training.GPUTrainingJob object at 0x7f3d7ced1670>)
+  File "/usr/lib/python3.12/concurrent/futures/_base.py", line 449, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/concurrent/futures/_base.py", line 401, in __get_result
+    raise self._exception
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/dss/ra
+  --- traceback tail ---
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'arctic_platform.rl.processors.weighted_logprob'
+
+
+[B2] same grpo request as A, after the failure
+[neutrino fwd-bwd] phase=submit call=4 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=12528 payload total bytes: 12528
+[neutrino fwd-bwd] phase=submit call=4 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=12528 sending POST https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/forward-backward attempt=1/11
+[neutrino fwd-bwd] phase=submit call=4 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=12528 successful response POST https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/forward-backward attempt=1/11 status=200 snowflake_request_id=d63259d4-5d1c-46bb-ab68-4c49e993a815 body={"job_id": "c4e6854c-a1a6-4c64-a977-058398efa2e7", "request_id": "rr_t0.req_815e425e7a2b"}
+[neutrino fwd-bwd] phase=submit call=4 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 payload_bytes=12528 submitted request_id=rr_t0.req_815e425e7a2b body={"job_id": "c4e6854c-a1a6-4c64-a977-058398efa2e7", "request_id": "rr_t0.req_815e425e7a2b"}
+[neutrino fwd-bwd] phase=poll call=4 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_815e425e7a2b payload_bytes=12528 sending GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_815e425e7a2b attempt=1/11
+[neutrino fwd-bwd] phase=poll call=4 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_815e425e7a2b payload_bytes=12528 successful response GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_815e425e7a2b attempt=1/11 status=200 snowflake_request_id=5d1be2bf-019a-4764-965f-7a8af13a94e4 body={"created_at": "2026-09-10T17:18:20.258132Z", "request_id": "rr_t0.req_815e425e7a2b", "status": "REQUEST_STATE_RUNNING", "updated_at": "2026-09-10T17:18:20.258344Z"}
+[neutrino fwd-bwd] phase=poll call=4 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_815e425e7a2b payload_bytes=12528 sending GET https://dsa-test.qa6.us-west-2.aws.snowflakecomputing.com/api/v2/databases/NEUTRINO_DB/schemas/PUBLIC/cortex-training/c4e6854c-a1a6-4c64-a977-058398efa2e7/requests/rr_t0.req_815e425e7a2b attempt=1/11
+[neutrino fwd-bwd] phase=poll call=4 job_id=c4e6854c-a1a6-4c64-a977-058398efa2e7 request_id=rr_t0.req_815e425e7a2b payload_bytes=12528 completed state=done result={"avg_loss": 0.34213176369667053, "job_id": "c4e6854c-a1a6-4c64-a977-058398efa2e7:training:0", "metrics": {"approx_kl": -6.953267574310303, "clip_ratio": 0.5, "entropy": 6.953267574310303, "importance_weight": 0.045831043273210526, "rank": 0, "rl_model_calls": 1, "trainable_logprob_count_all": 27.0, "trainable_logprob_lowvar_all/max": 12.753929138183594, "trainable_logprob_lowvar_all/mean": 5.392905906394676, "trainable_logprob_lowvar_all/min": 0.024883165955543518}, "post_process_outputs": {"logprobs": [[-10.256202697753906, -10.33199691772461, -8.493093490600586, -1.1650564670562744, -3.488579511642456, -2.7682414054870605, -1.7670443058013916, -3.8757567405700684, -12.178869247436523, -13.753928184509277, -7.188684463500977, -12.656428337097168, -6.2486090660095215, -3.1732571125030518, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [-11.2294921875, -0.23169566690921783, -12.038406372070312, -3.1341350078582764, -12.061180114746094, -9.164752006530762, -4.162133693695068, -7.085322380065918, -1.8716039657592773, -0.6375287175178528, -7.303086280822754, -1.7710444927215576, -2.10191011428833, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,...<truncated 213 chars>
+  grad_norm(B) = 1.213842511177063
+
+=== verdict ===
+error_type = RuntimeError
+error_msg  = Request rr_t0.req_5b42343c255c ended with state 'failed': [36mray::GPUTrainingJob.fwd_bwd()[39m (pid=1399, ip=10.4.165.246, actor_id=a10008fe71525d38a976db4801000000, repr=<dss.ray_dss.jobs.gpu.training.GPUTrainingJob object at 0x7f3d7ced1670>)
+  File "/usr/lib/python3.12/concurrent/futures/_base.py", line 449, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/concurrent/futures/_base.py", line 401, in __get_result
+    raise self._exception
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/dss/ray_dss/jobs/gpu/training.py", line 2283, in fwd_bwd
+    return await self._fwd_bwd_requests.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/neutrino/dss/ray_dss/jobs/fwd_bwd_requests.py", line 494, in run
+    return await asyncio.shield(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/neutrino/dss/ray_dss/jobs/fwd_bwd_requests.py", line 503, in _execute_and_record
+    result = await execute(payload)
+             ^^^^^^^^^^^^^^^^^^^^^^
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/dss/ray_dss/jobs/gpu/training.py", line 2446, in _run_fwd_bwd
+    return await self._execute_prepared_fwd_bwd(token)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/dss/ray_dss/jobs/gpu/training.py", line 2413, in _execute_prepared_fwd_bwd
+    results = await asyncio.gather(
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/tasks.py", line 684, in _wrap_awaitable
+    return await awaitable
+           ^^^^^^^^^^^^^^^
+ray.exceptions.RayTaskError(ModuleNotFoundError): [36mray::_DeepSpeedWorker.fwd_bwd()[39m (pid=1150, ip=10.4.172.211, actor_id=b9237458d4440934513a0a2001000000, repr=<dss.ray_dss.jobs.gpu.training._DeepSpeedWorker object at 0x7f450f037b90>)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/neutrino/dss/ray_dss/jobs/gpu/training.py", line 3568, in fwd_bwd
+    result = self._rl_fwd_bwd(batch, processing)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/neutrino/dss/ray_dss/jobs/gpu/training.py", line 4041, in _rl_fwd_bwd
+    reduction = resolve_packed_loss_reduction(processing, packed_mbs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/arctic_training/arctic_rl/processors/pipeline.py", line 165, in resolve_packed_loss_reduction
+    fn = _resolve_fn(LOSS_FNS, loss_fn_name)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/arctic_training/arctic_rl/processors/pipeline.py", line 142, in _resolve_fn
+    fn = getattr(importlib.import_module(module_path), fn_name)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/importlib/__init__.py", line 90, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'arctic_platform.rl.processors.weighted_logprob'
+grad_norm A=1.2140374183654785 A'=1.2140908241271973 B=1.213842511177063
+  scatter between identical requests : 4.399e-05
+  shift after the failed attempt     : 2.045e-04
+  budget (max(1.0e-03, 3x scatter)) : 1.000e-03
+PASS: the shift is within run-to-run scatter, so the failed attempt
+      left no gradient behind and retry-after-failure is safe.
+Cancelled job c4e6854c-a1a6-4c64-a977-058398efa2e7

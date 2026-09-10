@@ -1,0 +1,23 @@
+JOB=13b0b162-89a4-47df-9bf8-9c19fbf3d04f (default image, RUNNING)
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Attached to job 13b0b162-89a4-47df-9bf8-9c19fbf3d04f (training=13b0b162-89a4-47df-9bf8-9c19fbf3d04f:training:0) via CortexTransport
+batch=(2, 128) supervised_positions=27
+
+[1/4] fwd_no_grad through CortexTransport -> /operation
+  logprobs=(2, 128) mean=-0.664602
+
+[2/4] direct grpo fwd_bwd through CortexTransport (reference)
+  avg_loss=0.20239201188087463
+  grad_norm(direct) = 99.02342224121094
+
+[3/4] TRL's GRPO loss client-side -> grpo surrogate through CortexTransport
+[2026-09-10 17:09:47,772] [WARNING] [real_accelerator.py:209:get_accelerator] Setting accelerator to CPU. If you have GPU or other accelerator, we were unable to detect it.
+  TRL client-side loss = 0.20239189
+  avg_loss=0.20239197462797165
+  grad_norm(surrogate) = 99.02857971191406
+
+[4/4] verdict
+  direct=99.02342224 surrogate=99.02857971 rel.diff=5.208e-05
+  PASS: TRL loss client-side, Arctic-Platform transport, Cortex backend
+ap_client_side_loss rc=0
+cancelled 13b0b162-89a4-47df-9bf8-9c19fbf3d04f
