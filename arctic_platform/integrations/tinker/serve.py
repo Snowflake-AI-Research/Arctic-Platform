@@ -55,6 +55,12 @@ class TinkerServeConfig:
     max_response_length: int = 512
     learning_rate: float = 1e-6
     lora_rank: int = 0
+    # DeepSpeed needs a batch size at provisioning time, but Tinker has no verb
+    # that declares one: the cookbook just posts however many datums it has.
+    # These only have to satisfy DeepSpeed's own invariant -- Cortex chunks each
+    # forward-backward to fit, so the request size is free to differ.
+    micro_batch_size: int = 1
+    gradient_accumulation_steps: int = 1
     dtype: str = "bfloat16"
     seed: int = 7
     # The Cortex image ships FA3 only; FA2 dies at model load.
@@ -90,8 +96,11 @@ def _client_config(cfg: TinkerServeConfig) -> Any:
         # that is still enough for DeepSpeed to instantiate CPUAdam, which then
         # asserts the params are on cuda.
         ds_config={
-            "train_micro_batch_size_per_gpu": 1,
-            "gradient_accumulation_steps": 1,
+            "train_batch_size": (
+                cfg.micro_batch_size * cfg.training_gpus * cfg.gradient_accumulation_steps
+            ),
+            "train_micro_batch_size_per_gpu": cfg.micro_batch_size,
+            "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
             "bf16": {"enabled": cfg.dtype == "bfloat16"},
             "zero_optimization": {"stage": cfg.zero_stage},
             "optimizer": {"type": "AdamW", "params": {"lr": cfg.learning_rate}},

@@ -189,6 +189,59 @@ class TestForwardBackwardWire:
         assert "old_log_probs" not in client.sent[0]["context"]
 
 
+class TestCortexResponseShapes:
+    """Cortex returns log-probs in a different place per verb.
+
+    Observed against a live QA6 job: ``forward`` replies
+    ``{job_id, logprobs: tensor[B, T]}`` while ``forward-backward`` replies
+    ``{avg_loss, job_id, metrics, post_process_outputs: {logprobs: [[...]]}}``.
+    Both are padded to full width. The published API spec says
+    ``post_process_outputs`` is always empty, so it is these shapes -- not the
+    document -- that the code has to match.
+    """
+
+    def _client_returning(self, response: dict):
+        class _Fixed:
+            def __init__(self):
+                self.sent = []
+
+            async def fwd_bwd(self, payload, processing=None, router_replay=None):
+                self.sent.append(payload)
+                return response
+
+            async def fwd_no_grad(self, payload, processing=None, reference_model=False):
+                self.sent.append(payload)
+                return response
+
+        return _Fixed()
+
+    def test_nested_lists_under_post_process_outputs(self):
+        batch = _router_batch()
+        ids = batch["batch"]["input_ids"]
+        order, valid = _align_plan(batch["batch"]["attention_mask"])
+        aligned = _align(batch["batch"], order, valid)["input_ids"]
+        client = self._client_returning(
+            {
+                "avg_loss": -0.5,
+                "metrics": {"approx_kl": 0.0},
+                "post_process_outputs": {"logprobs": aligned.to(torch.float32).tolist()},
+            }
+        )
+        out = asyncio.run(CortexTinkerBackend(client).fwd_bwd(batch))
+        mask = batch["batch"]["attention_mask"]
+        torch_assert_equal(out["batch"]["logprobs"].to(torch.long) * mask, ids * mask)
+
+    def test_top_level_tensor_from_forward(self):
+        batch = _router_batch()
+        ids = batch["batch"]["input_ids"]
+        order, valid = _align_plan(batch["batch"]["attention_mask"])
+        aligned = _align(batch["batch"], order, valid)["input_ids"]
+        client = self._client_returning({"job_id": "j", "logprobs": aligned.to(torch.float32)})
+        out = asyncio.run(CortexTinkerBackend(client).fwd_no_grad(batch))
+        mask = batch["batch"]["attention_mask"]
+        torch_assert_equal(out["batch"]["logprobs"].to(torch.long) * mask, ids * mask)
+
+
 class TestMissingLogprobsFailLoud:
     @pytest.mark.parametrize("response", ["no_batch", "empty_batch"])
     def test_absent_logprobs_raise_instead_of_defaulting(self, response):

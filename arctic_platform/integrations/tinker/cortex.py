@@ -132,26 +132,72 @@ def _forward_payload(batch: dict, order: torch.Tensor, valid: torch.Tensor) -> d
 
 
 def _require_logprobs(response: dict, op: str) -> torch.Tensor:
-    """The per-token log-probs, or a loud failure naming what is missing.
+    """The per-token log-probs as a ``[B, width]`` tensor in the aligned frame.
 
-    The router's fallback for an absent ``batch.logprobs`` is an empty
-    ``loss_fn_outputs`` entry, which surfaces in the cookbook as a bare
-    ``KeyError`` several frames away from the cause. Worse, those log-probs feed
-    ``compute_kl_sample_train`` -- the sampler-versus-trainer divergence check,
+    Cortex puts them in a different place per verb -- ``forward`` returns a
+    top-level tensor, ``forward-backward`` a nested list under
+    ``post_process_outputs`` -- and the on-prem server uses ``batch``. All three
+    are rectangular and padded to the full width, so only the lookup differs.
+
+    A missing value raises rather than defaulting. The router's fallback is an
+    empty ``loss_fn_outputs`` entry, which the cookbook hits as a bare
+    ``KeyError`` several frames away; and these log-probs feed
+    ``compute_kl_sample_train``, the sampler-versus-trainer divergence check,
     which is the alarm most likely to catch a new backend's first real bug.
-    Substituting zeros would silence exactly that alarm.
     """
-    body = response.get("batch") if isinstance(response, dict) else None
-    logprobs = body.get("logprobs") if isinstance(body, dict) else None
+    import torch
+
+    logprobs = None
+    if isinstance(response, dict):
+        for container in (response.get("post_process_outputs"), response.get("batch"), response):
+            if isinstance(container, dict) and container.get("logprobs") is not None:
+                logprobs = container["logprobs"]
+                break
+
     if logprobs is None:
         raise RuntimeError(
             f"cortex {op} returned no per-token log-probs. Requested post-processors: "
-            f"{_POST_PROCESSORS}; response keys: {sorted(response) if isinstance(response, dict) else type(response)}"
-            f"{', batch keys: ' + str(sorted(body)) if isinstance(body, dict) else ''}. "
+            f"{_POST_PROCESSORS}; response keys: "
+            f"{sorted(response) if isinstance(response, dict) else type(response).__name__}. "
             "Tinker's forward_backward contract requires them, so this cannot be "
             "defaulted -- they feed the sampler-vs-trainer KL check."
         )
-    return logprobs
+
+    if not torch.is_tensor(logprobs):
+        logprobs = torch.as_tensor(logprobs, dtype=torch.float32)
+    return logprobs.to(torch.float32)
+
+
+def _sampled_logprobs(result: dict) -> list[float] | None:
+    """Per-position log-prob of the token actually sampled.
+
+    vLLM returns a dict per position keyed by token id -- the sampled token plus
+    any extra top-k entries -- so the sampled token has to be looked up by id
+    rather than taken positionally. These become the RL loss's ``old_log_probs``:
+    a silently misaligned list would bias the importance ratio without ever
+    looking wrong, so a gap raises instead.
+    """
+    per_position = result.get("logprobs")
+    if not per_position:
+        return None
+    token_ids = list(result.get("token_ids") or [])
+    if len(per_position) != len(token_ids):
+        raise RuntimeError(
+            f"cortex returned {len(per_position)} log-prob positions for "
+            f"{len(token_ids)} sampled tokens; these become old_log_probs, so a "
+            "mismatched pairing would bias the importance ratio"
+        )
+
+    out: list[float] = []
+    for position, token_id in zip(per_position, token_ids):
+        entry = position.get(str(token_id), position.get(token_id))
+        if entry is None:
+            raise RuntimeError(
+                f"cortex omitted the log-prob of sampled token {token_id}; ask for "
+                "`logprobs` in sampling_params so the sampled token is always included"
+            )
+        out.append(float(entry["logprob"] if isinstance(entry, dict) else entry))
+    return out
 
 
 class CortexTinkerBackend:
@@ -205,8 +251,32 @@ class CortexTinkerBackend:
         return await self.client.sync_weights()
 
     async def generate(self, prompt_tokens: list[int], sampling_params: dict) -> dict:
-        results = await self.client.generate([prompt_tokens], sampling_params=sampling_params)
-        return {"results": results}
+        """``num_samples`` rollouts of one prompt.
+
+        Cortex takes no ``n``: it returns exactly one completion per prompt, so
+        N samples means sending the prompt N times -- the same trick the
+        standalone recipe uses.
+        """
+        params = dict(sampling_params)
+        num_samples = max(int(params.pop("n", 1) or 1), 1)
+        results = await self.client.generate(
+            [list(prompt_tokens)] * num_samples, sampling_params=params
+        )
+        if len(results) != num_samples:
+            raise RuntimeError(
+                f"asked cortex for {num_samples} rollouts and got {len(results)}; "
+                "sampling would silently return the wrong group size"
+            )
+        return {
+            "outputs": [
+                {
+                    "token_ids": list(result.get("token_ids") or []),
+                    "logprobs": _sampled_logprobs(result),
+                    "finish_reason": result.get("finish_reason"),
+                }
+                for result in results
+            ]
+        }
 
 
 def build_handlers(client: AsyncArcticRLClient) -> dict[str, Callable]:
