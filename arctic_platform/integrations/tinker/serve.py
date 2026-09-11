@@ -45,7 +45,9 @@ __all__ = ["TinkerServeConfig", "create_app", "main"]
 
 @dataclass
 class TinkerServeConfig:
-    config: str
+    # None reads the connection from ARCTIC_CORTEX_* instead, which is how the
+    # other Cortex integrations are configured.
+    config: str | None = None
     model: str = "Qwen/Qwen3-0.6B"
     training_gpus: int = 1
     sampling_gpus: int = 1
@@ -70,11 +72,12 @@ class TinkerServeConfig:
 
 
 def _client_config(cfg: TinkerServeConfig) -> Any:
+    from arctic_platform.client import CortexConfig
     from recipes.recipe_utils import client_config
     from recipes.recipe_utils import load_backend
 
     return client_config(
-        backend=load_backend(cfg.config),
+        backend=load_backend(cfg.config) if cfg.config else CortexConfig(),
         model_name=cfg.model,
         max_seq_len=cfg.max_seq_len,
         seed=cfg.seed,
@@ -147,8 +150,8 @@ def create_app(cfg: TinkerServeConfig):
 
 def _parse_args(argv: list[str] | None = None) -> TinkerServeConfig:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", required=True, help="Cortex connection JSON (host, pat, database, schema)")
-    defaults = TinkerServeConfig(config="")
+    p.add_argument("--config", default=None, help="Cortex connection JSON; default reads ARCTIC_CORTEX_*")
+    defaults = TinkerServeConfig()
     for name, value in vars(defaults).items():
         if name == "config":
             continue

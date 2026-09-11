@@ -53,9 +53,16 @@ from typing import Sequence
 from typing import Union
 
 import numpy as np
+
+from arctic_platform.integrations.tinker.proto_wire import PROTO_CONTENT_TYPE
+from arctic_platform.integrations.tinker.proto_wire import decode_forward_backward_request
+from arctic_platform.integrations.tinker.proto_wire import encode_forward_backward_output
+from arctic_platform.integrations.tinker.proto_wire import encode_sample_response
+from arctic_platform.integrations.tinker.proto_wire import wants_proto
 from fastapi import APIRouter
 from fastapi import HTTPException
 from fastapi import Request
+from fastapi import Response
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
@@ -727,15 +734,18 @@ class TinkerFutureStore:
 
     def __init__(self) -> None:
         self._counter = itertools.count()
-        self._store: dict[str, dict[str, Any]] = {}
+        self._store: dict[str, tuple[dict[str, Any], str | None]] = {}
 
     def new_request_id(self) -> str:
         return str(next(self._counter))
 
-    def put(self, request_id: str, payload: dict[str, Any]) -> None:
-        self._store[request_id] = payload
+    def put(self, request_id: str, payload: dict[str, Any], kind: str | None = None) -> None:
+        """Stash a terminal response. ``kind`` names the proto encoder that
+        ``retrieve_future`` must use, since current SDKs reject a JSON reply for
+        ``ForwardBackwardOutput`` and ``SampleResponse``."""
+        self._store[request_id] = (payload, kind)
 
-    def pop(self, request_id: str) -> dict[str, Any] | None:
+    def pop(self, request_id: str) -> tuple[dict[str, Any], str | None] | None:
         return self._store.pop(request_id, None)
 
 
@@ -744,6 +754,13 @@ class TinkerFutureStore:
 # =============================================================================
 
 router = APIRouter(prefix="/api/v1")
+
+_KIND_FWD_BWD = "forward_backward_output"
+_KIND_SAMPLE = "sample_response"
+_PROTO_ENCODERS: dict[str, Callable[[dict[str, Any]], bytes]] = {
+    _KIND_FWD_BWD: encode_forward_backward_output,
+    _KIND_SAMPLE: encode_sample_response,
+}
 
 _V1_SUPPORTED_LOSSES = frozenset({"ppo", "importance_sampling"})
 _V1_UNSUPPORTED_LOSSES = frozenset({"cispo", "dro", "cross_entropy"})
@@ -765,11 +782,12 @@ async def _submit_inline(
     runner: Callable[[], Awaitable[dict[str, Any]]],
     *,
     model_id: str | None = None,
+    kind: str | None = None,
 ) -> UntypedAPIFuture:
     store: TinkerFutureStore = _require_state(request.app.state, "tinker_futures")
     request_id = store.new_request_id()
     result = await runner()
-    store.put(request_id, result)
+    store.put(request_id, result, kind)
     return UntypedAPIFuture(request_id=request_id, model_id=model_id)
 
 
@@ -882,7 +900,35 @@ def _gate_loss_fn(loss_fn: str) -> None:
 
 
 @router.post("/forward_backward", response_model=UntypedAPIFuture)
-async def forward_backward(
+async def forward_backward(request: Request) -> UntypedAPIFuture:
+    """Accepts either encoding, and carries ``forward`` as well.
+
+    The body is read by hand rather than declared as a pydantic parameter
+    because current SDKs post protobuf here, and because upstream folded
+    ``forward`` into this endpoint behind a ``forward_only`` flag -- a JSON-only
+    signature would reject both.
+    """
+    body = await request.body()
+    if wants_proto(None, request.headers.get("content-type")):
+        req, forward_only = decode_forward_backward_request(body)
+    else:
+        req, forward_only = ForwardBackwardRequest.model_validate_json(body), False
+    if forward_only:
+        return await _run_forward(
+            ForwardRequest(
+                model_id=req.model_id,
+                seq_id=req.seq_id,
+                forward_input=ForwardInput(
+                    data=req.forward_backward_input.data,
+                    loss_fn=req.forward_backward_input.loss_fn,
+                ),
+            ),
+            request,
+        )
+    return await _run_forward_backward(req, request)
+
+
+async def _run_forward_backward(
     req: ForwardBackwardRequest, request: Request
 ) -> UntypedAPIFuture:
     fbi = req.forward_backward_input
@@ -921,11 +967,17 @@ async def forward_backward(
             metrics=arctic_metrics_to_tinker(r.get("metrics")),
         ).model_dump(mode="json")
 
-    return await _submit_inline(request, runner, model_id=req.model_id)
+    return await _submit_inline(
+        request, runner, model_id=req.model_id, kind=_KIND_FWD_BWD
+    )
 
 
 @router.post("/forward", response_model=UntypedAPIFuture)
 async def forward(req: ForwardRequest, request: Request) -> UntypedAPIFuture:
+    return await _run_forward(req, request)
+
+
+async def _run_forward(req: ForwardRequest, request: Request) -> UntypedAPIFuture:
     _gate_loss_fn(req.forward_input.loss_fn)
     handler = _require_state(request.app.state, "tinker_fwd_no_grad")
     max_prompt = _require_state(request.app.state, "tinker_max_prompt_length")
@@ -957,7 +1009,9 @@ async def forward(req: ForwardRequest, request: Request) -> UntypedAPIFuture:
             metrics=arctic_metrics_to_tinker(r.get("metrics")),
         ).model_dump(mode="json")
 
-    return await _submit_inline(request, runner, model_id=req.model_id)
+    return await _submit_inline(
+        request, runner, model_id=req.model_id, kind=_KIND_FWD_BWD
+    )
 
 
 @router.post("/optim_step", response_model=UntypedAPIFuture)
@@ -1057,7 +1111,7 @@ async def asample(req: SampleRequest, request: Request) -> UntypedAPIFuture:
         ]
         return SampleResponse(sequences=sequences).model_dump(mode="json")
 
-    return await _submit_inline(request, runner)
+    return await _submit_inline(request, runner, kind=_KIND_SAMPLE)
 
 
 # ---- futures ----------------------------------------------------------------
@@ -1066,9 +1120,15 @@ async def asample(req: SampleRequest, request: Request) -> UntypedAPIFuture:
 @router.post("/retrieve_future")
 async def retrieve_future(req: FutureRetrieveRequest, request: Request):
     store: TinkerFutureStore = _require_state(request.app.state, "tinker_futures")
-    payload = store.pop(req.request_id)
-    if payload is None:
+    entry = store.pop(req.request_id)
+    if entry is None:
         return TryAgainResponse().model_dump()
+    payload, kind = entry
+    encoder = _PROTO_ENCODERS.get(kind or "")
+    # The SDK signals a proto-only result type by asking for it. Returning JSON
+    # to such a caller is a hard error on its side, not a downgrade.
+    if encoder is not None and wants_proto(request.headers.get("accept")):
+        return Response(content=encoder(payload), media_type=PROTO_CONTENT_TYPE)
     return payload
 
 
