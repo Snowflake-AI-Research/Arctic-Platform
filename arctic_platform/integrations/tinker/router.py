@@ -536,9 +536,25 @@ def datum_list_to_arctic_batch(
             if td is not None:
                 candidates.append(_tensor_data_to_numpy(td).astype(np.float32))
 
+        # ``target_tokens[k]`` is the token *after* ``model_input[k]``, so the
+        # final target is one past the end of the input. Without it the last
+        # scored position has nothing to predict: its log-prob is meaningless
+        # and, because the advantage sitting there still multiplies it, so is
+        # its gradient. Appending rebuilds the full sequence -- the same thing
+        # tinker-cookbook's own metrics do (``model_input.append_int(
+        # target_tokens[-1])``). Left out of ``response_mask`` and
+        # ``advantages`` so it is scored against, never scored.
+        target_tokens = inputs.get("target_tokens")
+        scoring_tok = None
+        if target_tokens is not None and not forward_only:
+            target_arr = _tensor_data_to_numpy(target_tokens)
+            if len(target_arr):
+                scoring_tok = int(np.asarray(target_arr).reshape(-1)[-1])
+
         p_end = _split_prompt_response(toks, candidates) if not forward_only else len(toks)
         prompt_toks = toks[:p_end][-mpl:]
-        resp_toks = toks[p_end:][:mrl]
+        # Reserve the last response column for the scoring token.
+        resp_toks = toks[p_end:][: mrl - 1 if scoring_tok is not None else mrl]
         p_len, r_len = len(prompt_toks), len(resp_toks)
 
         prompts[i, mpl - p_len:] = np.asarray(prompt_toks, dtype=np.int64)
@@ -548,6 +564,9 @@ def datum_list_to_arctic_batch(
         input_ids[i, mpl - p_len: mpl] = np.asarray(prompt_toks, dtype=np.int64)
         input_ids[i, mpl: mpl + r_len] = np.asarray(resp_toks, dtype=np.int64)
         attention_mask[i, mpl - p_len: mpl + r_len] = 1
+        if scoring_tok is not None:
+            input_ids[i, mpl + r_len] = scoring_tok
+            attention_mask[i, mpl + r_len] = 1
         # (padded start, padded end, tinker-expected len). The third
         # element pins the on-wire length so ``_unpad_logprobs_to_loss_fn_outputs``
         # can pad/truncate deterministically when mpl/mrl truncation kicks in.
