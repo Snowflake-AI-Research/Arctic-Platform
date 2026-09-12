@@ -132,10 +132,9 @@ class TestDatumAdapter:
         assert out["batch"]["response_mask"][0].tolist() == [0, 0, 0, 0, 1, 1]
 
     def test_advantages_infer_response_boundary(self):
-        # SkyRL-tx's tinker_cookbook rl_loop.py doesn't set ``weights``; the
-        # prompt/response boundary is inferred from ``advantages`` (zero on
-        # prompt, non-zero on response). Cross-check tokens=[1, 2, 3] with
-        # advantages=[0, 0.5, 0.5] → prompt=[1], response=[2, 3].
+        # RL datums carry no ``weights``, so the boundary comes from
+        # ``advantages``: zero on the prompt, non-zero on the response.
+        # tokens=[1, 2, 3] with advantages=[0, 0.5, 0.5] → prompt=[1], response=[2, 3].
         inputs = {
             "advantages": TensorData(dtype="float32", data=[0.0, 0.5, 0.5]),
             "logprobs": TensorData(dtype="float32", data=[-1.0, -1.0, -1.0]),

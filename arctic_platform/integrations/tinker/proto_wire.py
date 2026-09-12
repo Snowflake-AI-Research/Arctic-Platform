@@ -23,13 +23,10 @@ JSON reply for ``ForwardBackwardOutput`` and ``SampleResponse``::
 So the codec is not optional, and it is not symmetric: ``sample`` *requests*
 are still JSON while its responses are proto.
 
-The schema comes from the SDK's own generated ``tinker_public_pb2`` rather than
-a vendored copy of the ``.proto``. Hand-maintaining either would reintroduce the
-drift this module exists to remove -- the wire moved to protobuf under a router
-whose schema tests all passed, because those tests compared the router against
-hard-coded copies of the SDK's types instead of the SDK. The import is local to
-this module, so a caller who never serves the proto verbs does not need
-``tinker`` installed.
+The schema is the SDK's own generated ``tinker_public_pb2``, not a vendored
+copy, so upstream changes surface as import or field errors instead of as
+wrong bytes. The import is local to this module, leaving ``tinker`` optional
+for anyone serving only the JSON verbs.
 """
 
 from __future__ import annotations
@@ -128,8 +125,7 @@ def decode_forward_backward_request(body: bytes) -> tuple[ForwardBackwardRequest
                     f"model input chunk {kind!r} is not supported; this layer handles "
                     "pre-tokenized text only"
                 )
-            # Tokens ride the wire as int32, narrower than the int64 the rest of
-            # the request uses.
+            # int32 here, unlike the int64 the rest of the request uses.
             tokens = np.frombuffer(chunk.encoded_text.tokens, dtype=np.int32).tolist()
             chunks.append(EncodedTextChunk(tokens=tokens))
         data.append(
@@ -192,9 +188,8 @@ def encode_forward_backward_output(payload: dict[str, Any]) -> bytes:
     type_tag = payload.get("loss_fn_output_type") or "TorchLossReturn"
 
     records = []
-    # Only fields present on *every* datum can be packed: a BatchedTensor's
-    # offsets must cover the whole batch, and a field missing from one datum
-    # would silently shift every later datum's slice.
+    # Only fields present on *every* datum: a BatchedTensor's offsets span the
+    # whole batch, so one missing field shifts every later datum's slice.
     shared = set(outputs[0]) if outputs else set()
     for datum in outputs[1:]:
         shared &= set(datum)

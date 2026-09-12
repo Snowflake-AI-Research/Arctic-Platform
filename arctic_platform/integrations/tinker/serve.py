@@ -20,10 +20,9 @@ recipe trains on Cortex::
     python -m arctic_platform.integrations.tinker.serve --config conn.json \\
         --model Qwen/Qwen3-0.6B --training-gpus 1 --sampling-gpus 1
 
-The provisioning half is deliberately not Tinker's problem. Tinker has no verb
-for "give me four GPUs with ZeRO-2 and FA3", so the job is created here from
-flags and the Tinker surface is bound onto it -- the same split the on-prem
-layer uses, where ``/initialize`` provisions and ``/tinker/bind`` adapts.
+Provisioning is not expressible in Tinker's protocol -- there is no verb for
+"give me four GPUs with ZeRO-2 and FA3" -- so the job is created here from
+flags and the Tinker surface is bound onto it.
 """
 
 from __future__ import annotations
@@ -55,10 +54,9 @@ class TinkerServeConfig:
     max_response_length: int = 512
     learning_rate: float = 1e-6
     lora_rank: int = 0
-    # DeepSpeed needs a batch size at provisioning time, but Tinker has no verb
-    # that declares one: the cookbook just posts however many datums it has.
-    # These only have to satisfy DeepSpeed's own invariant -- Cortex chunks each
-    # forward-backward to fit, so the request size is free to differ.
+    # DeepSpeed needs a batch size at provisioning time; Tinker has no verb that
+    # declares one. These only have to satisfy DeepSpeed's own invariant, since
+    # Cortex chunks each forward-backward to fit whatever actually arrives.
     micro_batch_size: int = 1
     gradient_accumulation_steps: int = 1
     dtype: str = "bfloat16"

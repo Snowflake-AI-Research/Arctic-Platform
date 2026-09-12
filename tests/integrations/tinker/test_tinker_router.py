@@ -102,8 +102,8 @@ async def test_create_model_lora_rank_positive_rejected(client):
     })
     assert r.status_code == 400
     detail = r.json()["detail"]
-    assert "LoraConfig(rank=0)" in detail
-    assert "SkyRL-tx" in detail
+    assert "rank=32" in detail
+    assert "lora_rank=0" in detail
 
 
 async def test_create_model_wrong_base_model_rejected(client):

@@ -13,30 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tinker HTTP layer for Arctic-Platform (v1).
+"""The upstream `tinker <https://github.com/thinking-machines-lab/tinker>`_
+HTTP protocol, as a backend-agnostic FastAPI router.
 
-Exposes Arctic's colocated RL server over the upstream
-`tinker <https://github.com/thinking-machines-lab/tinker>`_ HTTP protocol.
+:func:`init_tinker_state` injects five handlers (forward-backward, forward,
+optimizer step, weight sync, generate) and this module knows nothing else about
+the backend. :mod:`arctic_platform.integrations.tinker.cortex` builds them from
+the unified client; an on-prem handler set would drop in the same way.
 
-Scope (v1): RL only, colocated (``colocate=True``, CUDA-IPC weight sync),
-single global training run, no auth. Full-weight DeepSpeed training via the
-SkyRL-tx ``LoraConfig(rank=0)`` = FFT convention; ``rank>0`` returns 400.
+Scope (v1): RL only, one global training run, no auth. ``LoraConfig(rank=0)``
+means full fine-tuning; ``rank>0`` returns 400.
 
-Design:
-    - Every long-running Tinker verb (``forward``, ``forward_backward``,
-      ``optim_step``, ``save_weights_for_sampler``, ``asample``,
-      ``create_model``) is future-based on the wire. v1 runs the work
-      synchronously in the request handler and caches the terminal
-      response in an in-memory ``dict[request_id] -> response``; the
-      first ``retrieve_future`` poll returns the completed result.
-    - Wire schemas are Pydantic models pinned to
-      ``tinker.types.*`` (SDK at HEAD of ``main`` when this was
-      landed). Round-trip tests in ``tests/tinker_layer/`` guard against
-      upstream drift.
-    - The router lowers into existing Arctic HTTP handlers via in-process
-      calls, not a second HTTP hop. Adapters live in this file.
+Every long-running Tinker verb is future-based on the wire. v1 runs the work
+synchronously in the request handler and caches the terminal response, so the
+first ``retrieve_future`` poll already has a result.
 
-See ``arctic_platform/rl/TINKER_COMPAT.md`` for the full design.
+Wire schemas are Pydantic models mirroring ``tinker.types.*`` so that serving
+the JSON verbs needs no ``tinker`` install. The proto verbs do need it, and
+take their schema from the SDK directly -- see
+:mod:`arctic_platform.integrations.tinker.proto_wire`.
 """
 
 from __future__ import annotations
@@ -71,9 +66,8 @@ from pydantic import Field
 # Wire schemas — Pydantic mirrors of ``tinker.types.*``
 # =============================================================================
 #
-# We redefine the wire shape locally so the server has no runtime dependency on
-# the ``tinker`` SDK. ``tests/tinker_layer/test_wire_schema.py`` runs upstream
-# ``model_dump()`` payloads through these classes to guard against drift.
+# ``test_wire_schema.py`` feeds upstream ``model_dump()`` payloads through these
+# classes to catch drift.
 
 
 class TensorData(BaseModel):
@@ -192,7 +186,9 @@ class ClientConfigRequest(BaseModel):
 
 
 class ClientConfigResponse(BaseModel):
-    # Force JSON over proto in v1 — the server has no zstd/proto path.
+    # ``proto_compress_fwdbwd`` stays off: there is no zstd path here. Current
+    # SDKs no longer consult ``proto_write_fwdbwd`` and post proto regardless,
+    # which ``proto_wire`` handles.
     pjwt_auth_enabled: bool = False
     credential_default_source: str = "api_key"
     sample_dispatch_bytes_semaphore_size: int = 10 * 1024 * 1024
@@ -476,32 +472,17 @@ def datum_list_to_arctic_batch(
 ) -> tuple[dict, list[tuple[int, int, int]]]:
     """Pack a list of Tinker ``Datum`` into an Arctic ``fwd_bwd`` batch dict.
 
-    Layout mirrors ``arctic_platform/integrations/verl/adapter.py``:
-    left-pad prompt + right-pad response, split at ``max_prompt_length``.
+    Rows are laid out prompt-left-padded and response-right-padded, split at
+    ``max_prompt_length``, and always padded to ``max_prompt_length +
+    max_response_length`` rather than to the batch's own longest row -- ZoRRo
+    requires the config-max width. The prompt/response boundary is inferred
+    per-datum by :func:`_split_prompt_response`.
 
-    - ``batch``: input_ids, attention_mask, prompts, responses,
-      response_mask, advantages, old_log_probs. ``position_ids`` are
-      dropped; the server rebuilds them from ``attention_mask`` via
-      ``meta["drop_position_ids"]``.
-    - ``meta``: actor_config, max_prompt_len, max_response_len,
-      pad_token_id, forward_only, plus ``verl_grpo_loss``'s required
-      dp_size / batch_num_tokens / global_batch_size / temperature.
-    - ``processing``: {loss_fn: "verl_grpo"} — Arctic's registered
-      PPO-shaped loss; ``ppo`` / ``importance_sampling`` semantics are
-      threaded via ``actor_config`` in ``_loss_fn_config_to_actor_config``.
-
-    Returns ``(batch_dict, row_slices)`` where ``row_slices[i]`` is the
-    ``(start, end)`` index range that un-pads row ``i``'s per-position
-    tensors back to the original Datum's ``model_input`` length. Tinker's
-    contract is that returned ``logprobs`` line up with the Datum's tokens;
-    Arctic works in a padded layout, so the router uses these slices to
-    reverse the padding on the wire.
-
-    ZoRRo invariant: pad each row to ``max_prompt_length +
-    max_response_length`` (config-max), never batch-local. Prompt /
-    response boundary is inferred per-Datum from the first non-zero
-    position in ``weights`` / ``mask`` / ``advantages`` / ``target_tokens``
-    (see ``_split_prompt_response``).
+    Returns ``(batch_dict, row_slices)``. ``row_slices[i]`` is ``(start, end,
+    tinker_len)``: Tinker's contract is that returned log-probs line up with
+    the datum's own tokens, so the slices reverse this padded layout on the way
+    back out, and ``tinker_len`` pins the expected on-wire length so
+    truncation stays deterministic.
     """
     mpl = int(max_prompt_length)
     mrl = int(max_response_length)
@@ -512,12 +493,9 @@ def datum_list_to_arctic_batch(
     attention_mask = np.zeros((batch_size, total_len), dtype=np.int64)
     prompts = np.full((batch_size, mpl), pad_token_id, dtype=np.int64)
     responses = np.full((batch_size, mrl), pad_token_id, dtype=np.int64)
-    # response_mask / old_log_probs / advantages are left-padded with zeros
-    # up to the full sequence length so that (a) their shape matches
-    # ``attention_mask`` and the packing helper flattens them alongside it,
-    # and (b) after flattening they line up 1:1 with the packed ``logprobs``
-    # tensor produced by ``compute_entropy_and_logprobs``. Zeros in the
-    # prompt columns are inert (response_mask=0 there).
+    # Full sequence width, not response width, so these flatten alongside
+    # ``attention_mask`` and stay 1:1 with the returned log-probs. The prompt
+    # columns are inert: ``response_mask`` is 0 there.
     response_mask = np.zeros((batch_size, total_len), dtype=np.int64)
     advantages = np.zeros((batch_size, total_len), dtype=np.float32)
     old_log_probs = np.zeros((batch_size, total_len), dtype=np.float32)
@@ -527,23 +505,19 @@ def datum_list_to_arctic_batch(
         toks = _model_input_to_tokens(datum.model_input)
         inputs = datum.loss_fn_inputs
 
-        # SFT-style datums carry ``weights``; RL datums (SkyRL-tx cookbook
-        # rl_loop) carry ``advantages`` + ``target_tokens`` instead. Try
-        # both — prompt tokens are zero-masked in all three.
+        # SFT datums carry ``weights``, RL datums ``advantages`` +
+        # ``target_tokens``. Prompt tokens are zero-masked in all of them, so
+        # whichever is present locates the boundary.
         candidates: list[np.ndarray | None] = []
         for key in ("weights", "mask", "advantages", "target_tokens"):
             td = inputs.get(key)
             if td is not None:
                 candidates.append(_tensor_data_to_numpy(td).astype(np.float32))
 
-        # ``target_tokens[k]`` is the token *after* ``model_input[k]``, so the
-        # final target is one past the end of the input. Without it the last
-        # scored position has nothing to predict: its log-prob is meaningless
-        # and, because the advantage sitting there still multiplies it, so is
-        # its gradient. Appending rebuilds the full sequence -- the same thing
-        # tinker-cookbook's own metrics do (``model_input.append_int(
-        # target_tokens[-1])``). Left out of ``response_mask`` and
-        # ``advantages`` so it is scored against, never scored.
+        # ``target_tokens[k]`` is the token after ``model_input[k]``, so the
+        # last target sits one past the end of the input and has to be appended
+        # for the final position to have anything to predict. It stays out of
+        # ``response_mask`` and ``advantages``: scored against, never scored.
         target_tokens = inputs.get("target_tokens")
         scoring_tok = None
         if target_tokens is not None and not forward_only:
@@ -567,14 +541,10 @@ def datum_list_to_arctic_batch(
         if scoring_tok is not None:
             input_ids[i, mpl + r_len] = scoring_tok
             attention_mask[i, mpl + r_len] = 1
-        # (padded start, padded end, tinker-expected len). The third
-        # element pins the on-wire length so ``_unpad_logprobs_to_loss_fn_outputs``
-        # can pad/truncate deterministically when mpl/mrl truncation kicks in.
         row_slices.append((mpl - p_len, mpl + r_len, len(toks)))
 
-        # Advantages / logprobs on the Tinker wire are positional over the
-        # full ``toks`` array; slice out the response tail and place it in
-        # the response columns of the padded layout.
+        # These arrive positional over the whole of ``toks``, so the response
+        # tail has to be sliced out before it can go in the response columns.
         if "advantages" in inputs:
             arr = _tensor_data_to_numpy(inputs["advantages"]).astype(np.float32)
             resp_adv = arr[p_end: p_end + r_len]
@@ -592,9 +562,8 @@ def datum_list_to_arctic_batch(
         "batch": {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            # position_ids omitted intentionally: server reconstructs them
-            # from attention_mask via ``drop_position_ids=True`` in meta
-            # (matches how the verl adapter drives Arctic).
+            # position_ids omitted: rebuilt from attention_mask, via
+            # ``drop_position_ids`` in meta below.
             "prompts": prompts,
             "responses": responses,
             "response_mask": response_mask,
@@ -609,26 +578,21 @@ def datum_list_to_arctic_batch(
             "pad_token_id": int(pad_token_id),
             "drop_position_ids": True,
             "forward_only": bool(forward_only),
-            # Tinker's SDK chunks big fwd_bwd into ~5 MB HTTP calls
-            # (``MAX_CHUNK_BYTES_COUNT``); accumulate across chunks and let
-            # ``/optim_step`` apply. See ``deepspeed_worker._forward_maybe_backward``.
+            # The SDK splits a large fwd_bwd across ~5 MB HTTP calls, so
+            # gradients accumulate across chunks and only ``optim_step``
+            # applies them.
             "tinker_grad_accum": True,
-            # Populate ``ForwardBackwardOutput.loss_fn_outputs[i].logprobs`` (used
-            # by tinker-cookbook for KL / IS ratio); verl doesn't need it.
             "return_per_token_logprobs": not forward_only,
-            # verl_grpo_loss reads these three keys unconditionally. We're
-            # single-worker (training-gpus=1) at v1; multi-DP will need
-            # per-shard chunking on the Tinker adapter side.
+            # v1 is single-worker; multi-DP would need per-shard chunking here.
             "dp_size": 1,
             "batch_num_tokens": int(response_mask.sum()),
             "global_batch_size": batch_size,
             "rollout_is_weights": None,
             "temperature": 1.0,
         },
-        # Arctic's LOSS_FNS registry ships only ``verl_grpo`` as a short
-        # name; ``ppo`` / ``importance_sampling`` semantics are threaded via
-        # ``actor_config`` (clip thresholds, kl, entropy) — see
-        # ``_loss_fn_config_to_actor_config`` above.
+        # ``ppo`` and ``importance_sampling`` both lower to one PPO-shaped
+        # loss; their differences ride in ``actor_config``. A backend that
+        # registers different names overrides this -- the Cortex binder does.
         "processing": {
             "post": ["compute_entropy_and_logprobs"],
             "loss_fn": "verl_grpo" if not forward_only else None,
@@ -815,8 +779,8 @@ async def _submit_inline(
 
 @router.get("/healthz")
 async def healthz(request: Request) -> dict[str, Any]:
-    """Cheap liveness + bind check. ``bound=True`` once ``POST /tinker/bind``
-    has wired the router; SkyRL-tx tests hit ``/api/v1/healthz`` for readiness."""
+    """Liveness plus bind check: ``bound`` is True once
+    :func:`init_tinker_state` has supplied the handlers."""
     return {"status": "ok", "bound": getattr(request.app.state, "tinker_base_model", None) is not None}
 
 
@@ -869,9 +833,8 @@ async def create_model(req: CreateModelRequest, request: Request) -> UntypedAPIF
     if req.lora_config is not None and req.lora_config.rank != 0:
         raise HTTPException(
             400,
-            "Arctic v1 supports full-weight training only; pass "
-            "LoraConfig(rank=0) to opt into the SkyRL-tx FFT convention. "
-            "LoRA (rank>0) is captured as extension E1.",
+            f"got lora rank={req.lora_config.rank}, but this backend supports "
+            "full fine-tuning only. Pass lora_rank=0.",
         )
     models = _require_state(request.app.state, "tinker_models")
     model_id = "main"  # single-tenant in v1
@@ -970,12 +933,8 @@ async def _run_forward_backward(
 
     async def runner() -> dict[str, Any]:
         r = await handler(batch)
-        # Emit per-Datum ``logprobs`` when Arctic returns the packed batch
-        # (opted into via ``meta['return_per_token_logprobs']`` in
-        # ``datum_list_to_arctic_batch``). tinker-cookbook consumes these as
-        # training-time logprobs for GRPO / KL. Fall back to empty dicts so
-        # metric reduction weighting stays correct even if Arctic dropped
-        # the batch (e.g. an older server without the flag).
+        # Empty dicts rather than a short list when the backend returns no
+        # log-probs: the cookbook weights its metric reduction by datum count.
         logprobs_batch = r.get("batch", {}).get("logprobs") if r.get("batch") else None
         if logprobs_batch is not None:
             outputs = _unpad_logprobs_to_loss_fn_outputs(logprobs_batch, row_slices)
@@ -1014,9 +973,6 @@ async def _run_forward(req: ForwardRequest, request: Request) -> UntypedAPIFutur
 
     async def runner() -> dict[str, Any]:
         r = await handler(batch)
-        # ``fwd-no-grad`` returns per-token logprobs in ``batch['logprobs']``.
-        # Un-pad per Datum via ``row_slices`` so the SDK's LossFnOutput
-        # shape lines up 1:1 with each Datum's ``model_input``.
         logprobs_batch = r.get("batch", {}).get("logprobs")
         outputs = (
             _unpad_logprobs_to_loss_fn_outputs(logprobs_batch, row_slices)
@@ -1119,7 +1075,6 @@ async def asample(req: SampleRequest, request: Request) -> UntypedAPIFuture:
         vllm_params = sampling_params_tinker_to_vllm(req.sampling_params, req.num_samples)
         prompt_tokens = _model_input_to_tokens(req.prompt)
         r = await handler(prompt_tokens, vllm_params)
-        # Arctic /generate → Tinker SampleResponse: token_ids/logprobs/finish_reason per sample.
         sequences = [
             SampledSequence(
                 tokens=list(o.get("token_ids", [])),
@@ -1144,8 +1099,8 @@ async def retrieve_future(req: FutureRetrieveRequest, request: Request):
         return TryAgainResponse().model_dump()
     payload, kind = entry
     encoder = _PROTO_ENCODERS.get(kind or "")
-    # The SDK signals a proto-only result type by asking for it. Returning JSON
-    # to such a caller is a hard error on its side, not a downgrade.
+    # A proto-only result type is signalled by the Accept header; a JSON reply
+    # to such a caller raises on its side rather than degrading.
     if encoder is not None and wants_proto(request.headers.get("accept")):
         return Response(content=encoder(payload), media_type=PROTO_CONTENT_TYPE)
     return payload

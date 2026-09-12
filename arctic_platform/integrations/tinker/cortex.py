@@ -12,32 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Back the Tinker router's verbs with Cortex Training.
+"""Back the Tinker router's five verbs with Cortex Training.
 
-:mod:`arctic_platform.integrations.tinker.router` is a pure adapter: it speaks
-Tinker's HTTP protocol and calls five injected handlers. This module builds
-those five from :class:`~arctic_platform.client.AsyncArcticRLClient`, so the
-Tinker surface reaches Cortex without the on-prem server being involved.
-
-Two shape mismatches are handled here rather than in the router, which stays
+Two shape mismatches live here rather than in the router, which stays
 backend-agnostic:
 
 ``{batch, meta, processing}`` → ``{args, kwargs, context, processing}``
-    Cortex takes an RPC-style envelope and resolves loss names in
-    ArcticTraining-dss, which registers ``causal_cross_entropy``, ``grpo`` and
-    ``grpo_echo_v1`` -- not the ``verl_grpo`` the router asks for.
+    Cortex takes an RPC-style envelope, and its loss registry has
+    ``causal_cross_entropy``, ``grpo`` and ``grpo_echo_v1`` -- not the
+    ``verl_grpo`` the router asks for.
     :func:`~arctic_platform.integrations._cortex_shared.to_cortex_fwd_bwd_payload`
-    does the translation and pins ``grpo``, whose PPO shape is what ``ppo`` and
-    ``importance_sampling`` both lower to.
+    translates and pins ``grpo``.
 
 Row alignment
-    The router lays a row out as ``[pad… prompt][response pad…]``, real tokens
-    contiguous in the middle. Cortex's packer requires them in the *leading*
-    columns. Aligning is not enough on its own: the log-probs come back in the
-    aligned frame while the router's row slices index the original one, so this
-    module inverts the permutation on the way back. Aligning without inverting
-    shifts every row's log-probs by its own prompt padding -- no error, just a
-    wrong number that looks plausible.
+    The router lays a row out as ``[pad… prompt][response pad…]``; Cortex's
+    packer needs the real tokens in the *leading* columns. Aligning alone is
+    not enough, because the log-probs come back in the aligned frame while the
+    router's row slices index the original one -- so the permutation is
+    inverted on the way back. Skipping that shifts every row by its own prompt
+    padding, silently.
 """
 
 from __future__ import annotations
@@ -55,18 +48,17 @@ if TYPE_CHECKING:
 
 __all__ = ["CortexTinkerBackend", "build_handlers"]
 
-# Cortex zones register `identity` and `compute_logprobs`; the on-prem names the
-# router would otherwise ask for (`compute_entropy_and_logprobs`) do not exist
-# there and the zone refuses the request before any model call.
+# Cortex registers only `identity` and `compute_logprobs`. The router's default
+# (`compute_entropy_and_logprobs`) does not exist there, and the zone refuses
+# the request before any model call.
 _POST_PROCESSORS = ["compute_logprobs"]
 
 
 def _align_plan(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``(order, valid)`` moving each row's real tokens to its leading columns.
 
-    Same construction as ``_cortex_shared._left_align_batch``, returned rather
-    than applied so the caller can invert it. ``order`` is a full permutation of
-    the width, which is what makes the inverse an exact scatter.
+    Returned rather than applied so the caller can invert it. ``order`` is a
+    full permutation of the width, which makes the inverse an exact scatter.
     """
     import torch
 
@@ -81,8 +73,8 @@ def _align_plan(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
 def _align(batch: dict, order: torch.Tensor, valid: torch.Tensor) -> dict:
     """Gather every full-width 2-D tensor through ``order``.
 
-    Everything moves through the *same* index, so ``advantages`` and
-    ``response_mask`` stay on the tokens they scored.
+    One index for all of them, so ``advantages`` and ``response_mask`` stay on
+    the tokens they scored.
     """
     import torch
 
@@ -103,8 +95,8 @@ def _align(batch: dict, order: torch.Tensor, valid: torch.Tensor) -> dict:
 def _unalign_rows(aligned: torch.Tensor, order: torch.Tensor) -> torch.Tensor:
     """Invert :func:`_align_plan` for one ``[B, width]`` tensor.
 
-    ``aligned[i, j] == original[i, order[i, j]]``, so scattering along ``order``
-    puts every value back where the router expects to slice it.
+    ``aligned[i, j] == original[i, order[i, j]]``, so a scatter along ``order``
+    is the exact inverse.
     """
     import torch
 
@@ -134,16 +126,15 @@ def _forward_payload(batch: dict, order: torch.Tensor, valid: torch.Tensor) -> d
 def _require_logprobs(response: dict, op: str) -> torch.Tensor:
     """The per-token log-probs as a ``[B, width]`` tensor in the aligned frame.
 
-    Cortex puts them in a different place per verb -- ``forward`` returns a
-    top-level tensor, ``forward-backward`` a nested list under
-    ``post_process_outputs`` -- and the on-prem server uses ``batch``. All three
-    are rectangular and padded to the full width, so only the lookup differs.
+    The location differs per verb: ``forward`` returns a top-level tensor,
+    ``forward-backward`` a nested list under ``post_process_outputs``, and
+    on-prem uses ``batch``. All three are rectangular and padded to full width,
+    so only the lookup differs.
 
-    A missing value raises rather than defaulting. The router's fallback is an
-    empty ``loss_fn_outputs`` entry, which the cookbook hits as a bare
-    ``KeyError`` several frames away; and these log-probs feed
-    ``compute_kl_sample_train``, the sampler-versus-trainer divergence check,
-    which is the alarm most likely to catch a new backend's first real bug.
+    Missing log-probs raise instead of defaulting. They feed
+    ``compute_kl_sample_train``, so a silent empty ``loss_fn_outputs`` would
+    disable the sampler-versus-trainer check and surface much later as a bare
+    ``KeyError`` inside the cookbook.
     """
     import torch
 
@@ -171,11 +162,10 @@ def _require_logprobs(response: dict, op: str) -> torch.Tensor:
 def _sampled_logprobs(result: dict) -> list[float] | None:
     """Per-position log-prob of the token actually sampled.
 
-    vLLM returns a dict per position keyed by token id -- the sampled token plus
-    any extra top-k entries -- so the sampled token has to be looked up by id
-    rather than taken positionally. These become the RL loss's ``old_log_probs``:
-    a silently misaligned list would bias the importance ratio without ever
-    looking wrong, so a gap raises instead.
+    Each position is a dict keyed by token id -- the sampled token plus any
+    top-k extras -- so it has to be looked up by id, never positionally. These
+    become ``old_log_probs``, where a misaligned list would bias the importance
+    ratio without looking wrong, so a gap raises.
     """
     per_position = result.get("logprobs")
     if not per_position:
@@ -241,9 +231,9 @@ class CortexTinkerBackend:
         return {"batch": {"logprobs": logprobs}, "metrics": response.get("metrics") or {}}
 
     async def step(self, overrides: dict | None) -> dict:
-        # Tinker's AdamParams arrive as optimizer overrides; Cortex's `step`
-        # takes a learning rate and nothing else, so the rest is dropped rather
-        # than sent to a field that would ignore it silently.
+        # Cortex's `step` takes a learning rate and nothing else, so the rest of
+        # Tinker's AdamParams is dropped rather than sent somewhere it would be
+        # ignored silently.
         learning_rate = (overrides or {}).get("lr") or (overrides or {}).get("learning_rate")
         return await self.client.step(learning_rate=learning_rate)
 
@@ -253,9 +243,8 @@ class CortexTinkerBackend:
     async def generate(self, prompt_tokens: list[int], sampling_params: dict) -> dict:
         """``num_samples`` rollouts of one prompt.
 
-        Cortex takes no ``n``: it returns exactly one completion per prompt, so
-        N samples means sending the prompt N times -- the same trick the
-        standalone recipe uses.
+        Cortex takes no ``n`` and returns exactly one completion per prompt, so
+        N samples means sending the prompt N times.
         """
         params = dict(sampling_params)
         num_samples = max(int(params.pop("n", 1) or 1), 1)
