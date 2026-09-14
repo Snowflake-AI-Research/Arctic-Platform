@@ -32,6 +32,24 @@ once, `conda activate skyrl_arl`, and any recipe launches from bare `python`.
    ``nn.Module.named_non_persistent_buffers`` (not in any released PyTorch as
    of 2026-06) and break the FSDP path.
 
+   Still true as of 2026-09, and it rules out the obvious simplification.
+   ``integrations/arctic_rl/`` has since landed upstream in
+   ``NovaSky-AI/SkyRL``, so the fork looks redundant — it is not, for two
+   reasons. The pinned commit is **not reachable from any upstream ref**
+   (diverged from ``main``: 41 ahead, 325 behind), so a plain clone of upstream
+   cannot check it out; the GitHub API resolves the sha only because forks share
+   object storage. And the newest upstream tag, ``skyrl-v0.3.0``, still calls
+   ``named_non_persistent_buffers`` at
+   ``skyrl/backends/skyrl_train/workers/model_wrapper.py:145``, which is absent
+   from torch 2.10 and 2.13 alike — so it breaks these recipes exactly as the
+   paragraph above describes.
+
+   That breakage is confined to the FSDP / Megatron worker path.
+   ``integrations/arctic_rl/`` never imports ``model_wrapper``, so a
+   Cortex-dispatched recipe — which replaces the trainer and inference engine
+   and keeps no local model workers — is unaffected and can use the upstream
+   tag. See [`simple_gsm8k_cortex/`](./simple_gsm8k_cortex/README.md).
+
 2. **Install pinned Python deps** into a fresh conda env:
 
    ```bash
