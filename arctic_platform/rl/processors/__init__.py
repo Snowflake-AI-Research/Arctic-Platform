@@ -102,6 +102,9 @@ from .stats_tracker import scope
 from .stats_tracker import stat
 from .verl_grpo import verl_grpo_loss
 
+# Generic client-side surrogate (importing registers "weighted_logprob_sum")
+from .weighted_logprob import weighted_logprob_sum
+
 __all__ = [
     # pipeline
     "POST_PROCESSORS",
@@ -162,6 +165,7 @@ __all__ = [
     "PROX_APPROX_METHOD_ROLLOUT",
     "PROX_APPROX_METHODS_ALL",
     "grpo_loss",
+    "weighted_logprob_sum",
     "sft_loss",
     "sft_ce_loss",
     "LOGIT_LOSS_FNS",

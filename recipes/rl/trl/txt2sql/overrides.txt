@@ -1,0 +1,7 @@
+# uv override-dependencies for the TRL Text2SQL (BIRD) recipe.
+#
+# vLLM 0.26's metadata can backtrack `datasets` to a release that imports
+# removed pyarrow APIs. Pin a current datasets so the resolve stays
+# deterministic. Do not pin transformers here — the 0.26 stack needs 5.x
+# (the verl 0.18 recipes pin 4.57 in their own overrides).
+datasets==5.0.0
