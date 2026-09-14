@@ -319,8 +319,54 @@ on live hardware, which is the only way a per-row frame shift shows up.
 ## Tests
 
 ```bash
-pytest tests/integrations/tinker
+pytest tests/integrations/tinker          # 121 tests, no GPU, no Cortex account
 ```
 
-103 tests, no GPU and no Cortex account required. `test_proto_wire.py` skips
-without the `tinker` SDK installed.
+`test_proto_wire.py` skips without the `tinker` SDK installed.
+
+| file | n | what it guards |
+|---|---|---|
+| `test_tinker_router.py` | 31 | HTTP behaviour of all 17 endpoints: futures, session/weight generations, the 400s (LoRA rank, unknown loss, refused temperature), and both custom-loss passes. |
+| `test_adapters.py` | 23 | Datum → batch packing: config-max padding, prompt/response boundary inference, loss-config translation, sampling-param mapping. |
+| `test_wire_schema.py` | 21 | Pydantic mirrors fed from upstream `model_dump()` payloads, so drift in Tinker's own types fails here rather than at runtime. |
+| `test_cortex_binder.py` | 17 | Cortex lowering: envelope translation, row alignment *and its inverse*, the two divergent log-prob response shapes, loud failure when log-probs are absent. |
+| `test_proto_wire.py` | 15 | Protobuf codec round-tripped against the SDK's own `request_conv` / `response_conv` as oracle, both directions. |
+| `test_custom_loss.py` | 14 | `forward_backward_custom`: weight sign, surrogate encoding, scoring-token append on `forward`, and gradient equivalence. |
+
+The three verification mechanisms are deliberately independent: schema tests use
+upstream payloads, proto tests use the SDK's converters, and the binder tests
+use a stub client. A single bad assumption cannot satisfy all three.
+
+### Tests that are load-bearing rather than incidental
+
+These exist because the failure they catch is **silent** — no exception, no bad
+metric, just a worse model. Worth reading before changing the code they cover.
+
+| test | the silent failure |
+|---|---|
+| `TestGradientEquivalence::test_surrogate_reproduces_tinker_cross_entropy` | Asserts `dL/dlogprobs == -weights` through the whole pipeline. A sign error trains in the wrong direction and nothing downstream reads the loss value. |
+| `TestGradientEquivalence::test_a_dropped_negation_would_be_caught` | A control: the same pipeline without the negation must *disagree*, so the assertion above cannot pass vacuously. |
+| `TestGradientEquivalence::test_ratio_is_exactly_one_so_clipping_cannot_engage` | Re-runs with `eps_clip=1e-6`. If the ratio ever stopped being exactly 1, clipping would start biasing the gradient. |
+| `TestRowAlignment::test_skipping_the_inverse_would_shift_rows` | Aligning without inverting shifts every row by its own prompt padding. |
+| `TestMissingLogprobsFailLoud` | An empty `loss_fn_outputs` disables the sampler-vs-trainer KL check, and surfaces much later as a bare `KeyError` in the cookbook. |
+| `TestForwardAppendsScoringToken` | Without the appended final target, the last position scores a pad. Harmless for RL, corrupts a client-side gradient. |
+| `TestSurrogateIsScopedToCrossEntropy` | A ratio-loss datum carrying `weights` must not have its advantages rewritten. |
+
+### Live validation (manual, not in CI)
+
+These need a Cortex account and GPUs, so they live in `/tmp/tinker_e2e/` rather
+than the suite. What each one established:
+
+| probe | result |
+|---|---|
+| `probe_custom_loss.py` | `forward_backward_custom` end to end: client-side CE `2.2032 → 0.0000` over 8 steps, proving the server's gradient descends the *client's* objective. Also checks temperature 0.7 is refused and 1.0 is served. |
+| `probe_custom_loss_multirow.py` | Three rows of differing prompt and response length each descend independently. The only way a per-row frame shift shows up — a single-row probe cannot catch it, because with one row the permutation is effectively the identity. |
+| `probe_kl.py` | `kl_sample_train_v1` ≈ 0.0019, which is what caught the missing final target token (it read 0.35–0.49 before the fix). |
+| `probe_shapes.py`, `probe_generate.py` | The live response shapes in §7, against which the published spec is stale. |
+| Unmodified `tinker_cookbook.recipes.math_rl.train` | A 935-step GSM8K epoch, `correct` 0.631 → 0.740 (§8). |
+
+An incidental cross-check worth knowing about: on the custom-loss path the
+server's `entropy:mean` equals the client's CE exactly (2.2032 in the run above),
+because grpo reports `entropy = -logprobs.detach()`. That makes it a free
+confirmation that the log-probs the client differentiated are the ones the
+server scored — and also why it is not an entropy (§9).
