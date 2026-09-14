@@ -149,7 +149,9 @@ def split_padded_tensor_dict_into_mb_list(data: dict, mb_spec: MicroBatchSpec, g
     for key, value in data.items():
         if key in multimodal_keys:
             continue
-        if key == "position_ids" or (torch.is_tensor(value) and value.numel() == bs * max_seqlen):
+        # Split any tensor whose leading dim is the batch: [B, S, ...] token
+        # rows and length-[B] per-sequence vectors (sequence_loss_weights, ...).
+        if key == "position_ids" or (torch.is_tensor(value) and value.ndim >= 1 and value.shape[0] == bs):
             to_split[key] = value
         else:
             not_to_split[key] = value

@@ -48,6 +48,7 @@ from arctic_platform.common.utils import finalize_fwd_bwd_metrics
 from arctic_platform.common.utils import log_dp_shard_tokens
 from arctic_platform.common.utils import merge_dict_shards
 from arctic_platform.common.utils import ray_split_batch
+from arctic_platform.common.utils import sp_size_from_job_config
 from arctic_platform.common.utils import unpack_batch
 from arctic_platform.common.utils.batch import restore_batch_order
 from arctic_platform.common.utils.checkpoint import resolve_checkpoint_save_paths
@@ -504,6 +505,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
             "status": "RUNNING",
             "checkpoint_path": None,
             "sync_path": None,
+            "sp_size": sp_size_from_job_config(job_config),
         }
 
         if job_type == "log_prob":
@@ -653,7 +655,7 @@ class ArcticRLRayServer:
         # timers.stop_and_print_elapsed(tname)
 
         tname = timers.start("xyz fwd_bwd: ray_split_batch")
-        shards, _ = ray_split_batch(batch, len(workers))
+        shards, _ = ray_split_batch(batch, len(workers), sp_size=self.jobs[job_id].get("sp_size", 1))
         # The verl driver's ``update_actor`` only consumes ``metrics`` from the
         # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
         # ``batch`` (logprobs/entropy) is never read. Keep the worker output as
@@ -721,7 +723,7 @@ class ArcticRLRayServer:
         #     w.forward_no_grad.remote(s) for w, s in zip(workers, shards)
         # ])
 
-        shards, reorder_indices = ray_split_batch(batch, len(workers))
+        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=info.get("sp_size", 1))
         refs = [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
         results = ray.get(refs)
 
@@ -1182,7 +1184,7 @@ class ArcticRLRayServer:
             # shape fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no
             # ZoRRO/position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
             wrapper = dict(batch=dict(encoded), meta={}, processing={})
-            shards, _ = ray_split_batch(wrapper, len(workers))
+            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info.get("sp_size", 1))
             raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
             results = torch.cat([r.cpu() for r in raw], dim=0)
         else:
