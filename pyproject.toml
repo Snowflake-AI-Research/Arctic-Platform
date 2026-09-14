@@ -60,6 +60,7 @@ all = [
     "arctic_platform[testing]",
     "arctic_platform[cortex]",
     "arctic_platform[onprem]",
+    "arctic_platform[tinker]",
     "arctic_platform[verl]",
 ]
 
@@ -68,12 +69,15 @@ dev = [
     "arctic_platform[testing]",
 ]
 
-# Pulls [cortex] so the transport tests can import the client. Not [onprem]: it
-# reaches [rl] -> arctic-inference[vllm], and vLLM's build needs CUDA_HOME, which
-# a CPU-only CI runner does not have. The on-prem tests skip without it.
+# Pulls [tinker], itself a superset of [cortex], so the transport tests can
+# import the client and the Tinker tests can build the ASGI app. Not [onprem]:
+# it reaches [rl] -> arctic-inference[vllm], and vLLM's build needs CUDA_HOME,
+# which a CPU-only CI runner does not have. The on-prem tests skip without it.
 testing = [
-    "arctic_platform[cortex]",
+    "arctic_platform[tinker]",
+    "httpx",  # ASGITransport, for driving the Tinker router without a socket
     "parameterized",
+    "pytest-asyncio",
     "pytest-instafail",
     "pytest-flakefinder",
     "pytest-sugar",
@@ -112,6 +116,17 @@ cortex = [
     "arctic_platform[transport]",
     "tenacity",
     "urllib3",
+]
+
+# The Tinker protocol server (arctic_platform/integrations/tinker). [cortex]
+# plus the ASGI stack and the tokenizer serve.py imports. No GPU and no
+# training stack: Cortex owns those. The tinker SDK is user-supplied -- only
+# proto_wire needs it, and it imports the generated schema lazily.
+tinker = [
+    "arctic_platform[cortex]",
+    "fastapi",
+    "transformers",
+    "uvicorn",
 ]
 
 # A training-only on-prem server, plus the client that drives it. Deliberately
