@@ -88,7 +88,8 @@ TINKER_API_KEY=tml-dummy python -m tinker_cookbook.recipes.math_rl.train \
     renderer_name=qwen3_disable_thinking \
     lora_rank=0 \
     env=gsm8k group_size=8 groups_per_batch=8 \
-    max_tokens=384 temperature=1.0 learning_rate=2e-6
+    max_tokens=384 temperature=1.0 learning_rate=2e-6 \
+    save_every=0 eval_every=0
 ```
 
 Four of those arguments are not free choices, and each is a constraint from
@@ -111,6 +112,20 @@ you get them wrong; the first fails client-side before a request is even sent.
   provisioning. What is missing is that the adapter-sync path has never been
   exercised here. It matters because full fine-tuning is what makes the
   cookbook's default learning rate unsafe, below.
+
+`save_every=0` is not a constraint but a **warning**: `save_weights` is
+ack-only (§7). At the cookbook's default of 20 it returns a synthetic
+`tinker://` path every 20 steps and writes nothing, so a 935-step run records
+46 checkpoints that do not exist and cannot be resumed from. Setting it to 0 at
+least makes the absence obvious. `eval_every=0` is only for speed — `math_rl`
+registers no evaluators, so it is a no-op either way.
+
+Two sizing rules the server cannot enforce yet, both of which truncate
+**silently** (§7):
+
+* `max_tokens` must be `< --max-response-length`, since the last response
+  column is reserved for the scoring token (§6).
+* The rendered prompt must fit `--max-prompt-length`.
 
 ## 5. The protobuf wire
 
@@ -194,6 +209,17 @@ metric; it exists precisely to catch this class of error.
 | DeepSpeed requires `train_batch == micro × accum × dp` | `serve.py` derives it. `offload_optimizer` is omitted entirely rather than set to `{"device": "none"}` — the latter is still enough for DeepSpeed to instantiate CPUAdam, which then asserts its params are on cuda. |
 | A job's weights are **persistent, with no reset verb** | Every run against the same job inherits the previous run's weights. Recycle the job between runs or a baseline number is meaningless (§8). |
 
+Four gaps are ours rather than Cortex's, and three of them are silent. They are
+listed separately because a reviewer should not mistake them for backend
+limits:
+
+| Gap | Consequence |
+|---|---|
+| `save_weights` is **ack-only** | Returns a synthetic `tinker://main/state/N` path and persists nothing, so training state cannot be resumed and `load_checkpoint_path` has nothing to load. Cortex itself has full `save_checkpoint` / `load_checkpoint` APIs — this is unwired, not unavailable. Pass `save_every=0` until it is (§4). |
+| Over-long datums are **truncated silently** | The prompt is left-truncated to `--max-prompt-length` and the response right-truncated to `--max-response-length`, with log-probs zero-padded for the dropped positions. No warning. A run whose `max_tokens` exceeds the response budget trains on partial completions and reports nothing unusual — the dropped tail simply contributes no gradient. |
+| `AdamParams` beyond the learning rate are **dropped** | Cortex's `step` takes only `learning_rate`; `betas`, `eps`, and `weight_decay` are fixed at provisioning. A recipe that sets them gets no error and no effect. |
+| Multimodal chunks are **flattened to `input_ids`** | The SDK's `ModelInput` admits image chunks, but the Cortex forward API has no channel for pixel data, so only token chunks survive. Text-only recipes are unaffected. |
+
 `forward` returns log-probs as a top-level tensor while `forward-backward`
 returns them as nested lists under `post_process_outputs`. Both are rectangular
 and padded to full width, so only the lookup differs. The published Cortex API
@@ -226,8 +252,9 @@ Two properties of this backend are worth knowing before reading any curve:
 
 ### A healthy run
 
-One full epoch of GSM8K — 935 steps, `done_frac` 1.0, the §4 command verbatim
-on Qwen3-0.6B. Windowed means:
+One full epoch of GSM8K — 935 steps, `done_frac` 1.0, the §4 recipe command on
+Qwen3-0.6B. The server was narrower than §3: `--max-prompt-length 512
+--max-response-length 256`, everything else as shown. Windowed means:
 
 | steps | 0–115 | 116–231 | 232–347 | 348–463 | 464–579 | 580–695 | 696–811 | 812–927 |
 |---|---|---|---|---|---|---|---|---|
@@ -252,6 +279,15 @@ step against the ~0.05 threshold.
 
 Throughput is roughly 5–6 steps/min at this shape, so the epoch is about 90
 minutes, plus ~4 min of Cortex provisioning.
+
+One caveat on this run, since it is the headline result. `max_tokens=384`
+against `--max-response-length 256` violates the sizing rule in §4, so every
+completion longer than 255 tokens had its tail silently dropped from training.
+Mean length stayed at 174–245, so most rollouts were unaffected and the trend
+is real — but the gradient was truncated on the upper tail, and the mild
+shortening through step ~347 is not cleanly separable from that. §3's wider
+1024/512 has the headroom this run lacked; it is what a clean reproduction
+should use, and it is the reason the sizing rule is written down at all.
 
 ### An unhealthy one
 
@@ -337,6 +373,9 @@ on live hardware, which is the only way a per-row frame shift shows up.
 | Job sits in `PLACING` for 10–25 min | Shared-cluster GPU capacity, not a hang. `PLACING` is easy to miss when filtering for busy jobs, which makes GPUs look free when they are not. 1+1 GPUs places in ~3–4 min; 4+1 can take far longer. |
 | `429 … per-account GPU cap reached` | A previous job still holds GPUs. Releasing is not instant; leave a moment between a cancel and the next launch. |
 | Reward looks plausible but `kl_sample_train_v1` > 0.05 | A frame or alignment bug, not a hyperparameter. Start with §6. |
+| `checkpoints.jsonl` lists `tinker://…` paths that do not exist | `save_weights` is ack-only (§7). Nothing was written; the run cannot be resumed. Pass `save_every=0` so the gap is visible up front. |
+| Long completions look cut off, or accuracy caps below what the model can do | `max_tokens` exceeds `--max-response-length`, so responses are truncated silently (§7). The last response column is reserved for the scoring token, so the budget is `max_response_length - 1`. |
+| An `AdamParams` change has no effect | Only `learning_rate` reaches Cortex; the rest is fixed at provisioning (§7). |
 
 ## Tests
 
