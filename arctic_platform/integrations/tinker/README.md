@@ -380,10 +380,15 @@ on live hardware, which is the only way a per-row frame shift shows up.
 ## Tests
 
 ```bash
-pytest tests/integrations/tinker          # 121 tests, no GPU, no Cortex account
+pip install -e ".[testing]"
+pytest tests/integrations/tinker          # 121 passed, no GPU, no Cortex account
 ```
 
-`test_proto_wire.py` skips without the `tinker` SDK installed.
+No GPU and no Cortex account, but the count depends on the `tinker` SDK:
+**121 passed** with it, **106 passed + 1 skipped** without, since
+`test_proto_wire.py` needs its generated schema. Both numbers are from a clean
+venv, not a developer machine — the whole point of checking was that this
+suite used to require DeepSpeed to collect at all.
 
 | file | n | what it guards |
 |---|---|---|
