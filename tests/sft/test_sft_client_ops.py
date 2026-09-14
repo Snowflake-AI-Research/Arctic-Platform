@@ -24,6 +24,7 @@ from __future__ import annotations
 import pytest
 
 from arctic_platform.client import ArcticSFTClientConfig
+from arctic_platform.client import CortexConfig
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
@@ -108,6 +109,31 @@ class TestSFTOpMapping:
         """A batch that already carries `processing` is not overwritten by the sft default."""
         client.fwd_bwd({"batch": {}, "processing": {"loss_fn": "sft_ce"}})
         assert _last(client).body["processing"] == {"loss_fn": "sft_ce"}
+
+    def test_cortex_fwd_bwd_does_not_inject_onprem_sft_loss_fn(self, monkeypatch):
+        """Cortex has no short-name `sft` processor; injecting it is ValueError."""
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+        cfg = _config(training_gpus=1, backend=CortexConfig(base_url="http://mock"))
+        cortex_client = ArcticSFTClient(cfg)
+        cortex_client.fwd_bwd({"args": (), "kwargs": {"input_ids": [1]}})
+        body = _last(cortex_client).body
+        assert "processing" not in body
+
+    def test_cortex_fwd_bwd_strips_onprem_processing_left_in_the_batch(self, monkeypatch):
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+        cfg = _config(training_gpus=1, backend=CortexConfig(base_url="http://mock"))
+        cortex_client = ArcticSFTClient(cfg)
+        cortex_client.fwd_bwd({"batch": {}, "processing": {"loss_fn": "sft"}, "meta": None})
+        body = _last(cortex_client).body
+        assert "processing" not in body
+        assert "meta" not in body
+
+    def test_cortex_fwd_bwd_keeps_explicit_processing_override(self, monkeypatch):
+        monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+        cfg = _config(training_gpus=1, backend=CortexConfig(base_url="http://mock"))
+        cortex_client = ArcticSFTClient(cfg)
+        cortex_client.fwd_bwd({"args": ()}, processing={"loss_fn": "custom"})
+        assert _last(cortex_client).body["processing"] == {"loss_fn": "custom"}
 
     def test_fwd_no_grad_targets_training_binary(self, client):
         client.fwd_no_grad({"batch": {"input_ids": [1]}})

@@ -110,7 +110,7 @@ permissive because RL needs both exemptions.
 
 | Method | Meaning |
 |--------|---------|
-| `fwd_bwd(batch, processing=None)` | Forward + loss + backward. Defaults `processing` to `{"loss_fn": "sft"}`. Returns `metrics` from the loss pipeline (at least token-mean `loss`). |
+| `fwd_bwd(batch, processing=None)` | Forward + loss + backward. On-prem defaults `processing` to `{"loss_fn": "sft"}`. Cortex leaves `processing` unset (the zone has no short-name SFT processor; CE comes from `labels`). Returns `metrics` from the loss pipeline (at least token-mean `loss`). |
 | `fwd_no_grad(batch, processing=None)` | Forward + loss, no backward (eval). Same `metrics` shape as `fwd_bwd`. Narrower than the base, which also takes `reference_model` for the log-prob engine an SFT run never allocates. |
 | `step(learning_rate=None)` | One optimizer update. LR is normally server-authoritative (set at engine init from `ds_config` + scheduler); an unset value is omitted from the wire. Returns optimizer `metrics` (at least `grad_norm`). |
 | `train_step(batch, processing=None)` | `fwd_bwd` + `step` with one merged `metrics` dict (same contract as RL `update_actor`: step first, then fwd_bwd keys win). |
