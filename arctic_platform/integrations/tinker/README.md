@@ -57,6 +57,13 @@ export ARCTIC_CORTEX_PAT=<your PAT>
 `CortexConfig` is a `pydantic-settings` model, so these populate it directly.
 Pass `--config conn.json` instead to read the connection from a file.
 
+This is the one step that cannot be self-served, so it is worth stating what
+the account actually needs: a Snowflake PAT, a database and schema that
+already exist, and GPU quota for **two** sub-jobs — §3 asks for one training
+and one sampling GPU, and both are placed before the server answers. Without
+quota for both, the job sits in `PLACING` rather than failing. Everything up
+to here, including the full test suite, runs with no account at all.
+
 ## 3. Run the server
 
 ```bash
