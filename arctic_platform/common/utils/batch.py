@@ -22,6 +22,70 @@ import torch
 from arctic_platform import wire
 
 
+def resolve_parallelism_degree(value: Any, name: str) -> int:
+    """Unset → 1 (disabled); else must be an ``int >= 1`` (0/negative rejected)."""
+    parallelism_degree = 1 if value is None else int(value)
+    if parallelism_degree < 1:
+        raise ValueError(f"{name} must be an integer >= 1 (1 = disabled); got {value!r}")
+    return parallelism_degree
+
+
+def dp_sp_world_size(world_size: int, sp_size: int = 1) -> int:
+    """DP degree under SP: ``world_size // sp_size`` (each SP group is one DP replica)."""
+    sp_size = resolve_parallelism_degree(sp_size, "sp_size")
+    if world_size < 1:
+        raise ValueError(f"world_size must be >= 1; got {world_size!r}")
+    if world_size % sp_size != 0:
+        raise ValueError(f"world_size ({world_size}) must be divisible by sp_size ({sp_size})")
+    return world_size // sp_size
+
+
+def _record_sp_candidate(candidates: dict[str, int], label: str, container: Any, key: str) -> None:
+    if not isinstance(container, dict) or key not in container:
+        return
+    value = container[key]
+    if value is None:
+        return
+    candidates[label] = resolve_parallelism_degree(value, key)
+
+
+def sp_size_from_job_config(job_config: Any) -> int:
+    """SP degree from an AP job config. Unset → 1. Conflicting sources raise.
+
+    Live writers: VeRL ``ds_config.sequence_parallel_size`` (from
+    ``ulysses_sequence_parallel_size``); DSS-shaped ``training_config.sp_size``;
+    ``ds_worker_config`` / ``ModelSpec.parallelism.sequence_parallel`` when set.
+    """
+    if job_config is None:
+        return 1
+    if hasattr(job_config, "model_dump"):
+        job_config = job_config.model_dump()
+    if not isinstance(job_config, dict):
+        raise TypeError(f"job_config must be a dict or JobConfig; got {type(job_config).__name__}")
+
+    candidates: dict[str, int] = {}
+    _record_sp_candidate(candidates, "training_config.sp_size", job_config.get("training_config"), "sp_size")
+    _record_sp_candidate(
+        candidates, "ds_config.sequence_parallel_size", job_config.get("ds_config"), "sequence_parallel_size"
+    )
+    _record_sp_candidate(
+        candidates,
+        "log_prob_config.sequence_parallel_size",
+        job_config.get("log_prob_config"),
+        "sequence_parallel_size",
+    )
+    worker = job_config.get("ds_worker_config")
+    _record_sp_candidate(candidates, "ds_worker_config.sequence_parallel", worker, "sequence_parallel")
+    _record_sp_candidate(candidates, "ds_worker_config.sequence_parallel_size", worker, "sequence_parallel_size")
+    parallelism = worker.get("parallelism") if isinstance(worker, dict) else None
+    _record_sp_candidate(candidates, "ds_worker_config.parallelism.sequence_parallel", parallelism, "sequence_parallel")
+
+    values = set(candidates.values())
+    if len(values) > 1:
+        raise ValueError(f"conflicting sequence-parallel degrees: {candidates}")
+    return values.pop() if values else 1
+
+
 def shard_token_stats(batch_data: dict, meta_data: dict | None = None) -> dict[str, int]:
     """Summarize valid token counts for DP straggler diagnosis."""
     stats: dict[str, int] = {}
@@ -62,12 +126,68 @@ def log_dp_shard_tokens(rank: int, tag: str, batch_data: dict, meta_data: dict |
     print(f"[{rank}] [DP-shard] {tag}: {parts}", flush=True)
 
 
-def unpack_batch(batch: dict) -> tuple:
-    """Support both ``{"args": ..., "kwargs": ...}`` and flat-dict formats.
+# Cortex ``context`` / AP ``meta`` keys whose dim 0 is the batch. ``_split_batch``
+# shards ``batch`` and replicates ``meta``, so these must live in ``batch``.
+BATCH_DIM_CONTEXT_KEYS = frozenset(
+    {
+        "advantages",
+        "old_log_probs",
+        "old_log_probs_shifted",
+        "loss_mask",
+        "response_mask",
+        "ref_log_prob",
+        "ref_log_probs",
+        "ref_log_probs_shifted",
+        "prox_logp",
+        "prox_logp_shifted",
+        "labels",
+        "sft_mask",
+        "echo_observation_mask",
+        "versions",
+        "prompt_group_ids",
+        "prompt_token_counts",
+        "sequence_loss_weights",
+        "rollout_is_weights",
+    }
+)
 
-    Returns ``(args, kwargs, context, processing)``.
+
+def promote_batch_dim_to_batch(batch_data: dict, meta_data: dict) -> tuple[dict, dict]:
+    """Move batch-dim tensors from ``meta``/Cortex ``context`` into ``batch``.
+
+    No-op for keys already on ``batch`` (``batch`` wins; the ``meta`` copy is dropped).
     """
-    return {}, batch["batch"], batch["meta"], batch["processing"]
+    batch_data = dict(batch_data)
+    meta_data = dict(meta_data)
+    for key in BATCH_DIM_CONTEXT_KEYS:
+        if key in meta_data:
+            if key not in batch_data:
+                batch_data[key] = meta_data[key]
+            del meta_data[key]
+    return batch_data, meta_data
+
+
+def unpack_batch(batch: dict) -> tuple:
+    """Return ``(args, batch, meta, processing)``.
+
+    Accepts AP ``{"batch", "meta", "processing"}`` and Cortex
+    ``{"kwargs", "context", "processing"}``. Batch-dim keys in ``context`` /
+    ``meta`` are moved onto ``batch`` before DP split.
+    """
+    if "kwargs" in batch:
+        batch_data = dict(batch.get("kwargs") or {})
+        meta_data = dict(batch.get("context") or {})
+        processing = batch.get("processing") or {}
+    else:
+        batch_data = batch["batch"]
+        meta_data = dict(batch["meta"])
+        processing = batch["processing"]
+        if isinstance(batch_data, dict):
+            batch_data = dict(batch_data)
+
+    if isinstance(batch_data, dict):
+        batch_data, meta_data = promote_batch_dim_to_batch(batch_data, meta_data)
+    return {}, batch_data, meta_data, processing
 
 
 def _split_value(val, num_chunks: int):
@@ -119,8 +239,12 @@ def reconstruct_position_ids_(batch_data: dict) -> None:
     batch_data["position_ids"] = (attention_mask_long.cumsum(dim=-1) - 1).clamp_(min=0) * attention_mask_long
 
 
-def _split_batch(batch: dict, num_workers: int) -> list[dict]:
-    """Split a batch across DP workers.
+def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
+    """Split a batch across workers and stamp the DP loss scale.
+
+    ``dp_size`` is ``num_workers // sp_size``: DeepSpeed averages across DP
+    replicas, and each SP group is one replica. The payload is still cut into
+    ``num_workers`` shards so ``zip(workers, shards)`` stays 1:1.
 
     Supports two wire shapes for ``batch["batch"]``:
       * **dict** of tensors (legacy / demos): one concatenated mini-batch, later
@@ -133,7 +257,7 @@ def _split_batch(batch: dict, num_workers: int) -> list[dict]:
 
     reorder_indices = None
     meta_data = dict(meta_data)
-    meta_data.update(dp_size=num_workers)
+    meta_data.update(dp_size=dp_sp_world_size(num_workers, sp_size))
 
     if isinstance(batch_data, list):
         if not batch_data:
@@ -183,13 +307,13 @@ def _split_batch(batch: dict, num_workers: int) -> list[dict]:
 ray_split_batch = _split_batch
 
 
-def http_split_batch(batch_bytes: bytes, num_workers: int) -> list[bytes]:
+def http_split_batch(batch_bytes: bytes, num_workers: int, sp_size: int = 1) -> list[bytes]:
     """Deserialize a global batch, split across DP workers, re-serialize each shard."""
     # if num_workers <= 1:
     #     return [batch_bytes]
     batch = wire.loads(batch_bytes)
 
-    shards, reorder_indices = _split_batch(batch, num_workers)
+    shards, reorder_indices = _split_batch(batch, num_workers, sp_size=sp_size)
 
     # _, batch_data, meta_data, processing = unpack_batch(batch)
     # batch_data_shards = split_dict(batch_data, num_workers)

@@ -15,13 +15,17 @@
 
 from .batch import combine_metric_microbatches
 from .batch import combine_metric_shards
+from .batch import dp_sp_world_size
 from .batch import finalize_fwd_bwd_metrics
 from .batch import http_split_batch
 from .batch import log_dp_shard_tokens
 from .batch import merge_dict_shards
 from .batch import ray_split_batch
 from .batch import shard_token_stats
+from .batch import sp_size_from_job_config
 from .batch import split_dict
+from .batch import BATCH_DIM_CONTEXT_KEYS
+from .batch import promote_batch_dim_to_batch
 from .batch import unpack_batch
 from .cuda_ipc import merge_cuda_ipc_payloads
 from .debug import ProfilerContext
@@ -40,12 +44,16 @@ from .server_models import WeightSyncRequest
 from .server_models import build_model_config
 
 __all__ = [
+    "BATCH_DIM_CONTEXT_KEYS",
+    "promote_batch_dim_to_batch",
     "unpack_batch",
     "merge_dict_shards",
     "combine_metric_shards",
     "combine_metric_microbatches",
     "finalize_fwd_bwd_metrics",
     "split_dict",
+    "dp_sp_world_size",
+    "sp_size_from_job_config",
     "http_split_batch",
     "ray_split_batch",
     "shard_token_stats",
