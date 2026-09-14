@@ -25,12 +25,25 @@ flags and binds the Tinker surface onto the result.
 ## 1. Install
 
 ```bash
-pip install "arctic_platform[cortex]"
+pip install "arctic_platform[tinker]"
 pip install "tinker==0.25.0" "tinker-cookbook==0.5.5"
 ```
 
+`[tinker]` is `[cortex]` plus the ASGI stack and tokenizer `serve.py` imports.
+`[cortex]` alone installs the client but not the server, and `serve.py` then
+dies on `ModuleNotFoundError: fastapi`.
+
 The server needs `tinker` only for its generated protobuf schema (§5). It does
 not need a GPU — Cortex owns those.
+
+Until [#110](https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/110)
+merges, install from the branch rather than a release — it already contains
+[#95](https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/95), so one
+checkout is enough:
+
+```bash
+git checkout karthik/tinker-cortex && pip install -e ".[tinker]"
+```
 
 ## 2. Set Cortex env
 
@@ -78,11 +91,15 @@ TINKER_API_KEY=tml-dummy python -m tinker_cookbook.recipes.math_rl.train \
     max_tokens=384 temperature=1.0 learning_rate=2e-6
 ```
 
-Three of those arguments are not free choices, and each is a constraint from
-§7 rather than a tuning preference:
+Four of those arguments are not free choices, and each is a constraint from
+§7 rather than a tuning preference. Three of them are rejected with a 400 if
+you get them wrong; the first fails client-side before a request is even sent.
 
 * **`TINKER_API_KEY` must start with `tml-`.** The SDK validates the prefix
   client-side before any request. The value is otherwise unused here.
+* **`temperature=1.0`** — Cortex has no `apply_temperature` post-processor, so
+  the trainer always scores at 1.0. `sample` returns 400 for anything else
+  rather than letting the sampler and trainer silently disagree.
 * **`renderer_name` must be explicit** for models below 4B.
   `get_recommended_renderer_name` looks the model up in a hardcoded table that
   starts at 4B, so a 0.6B raises `KeyError` before any request is sent.
