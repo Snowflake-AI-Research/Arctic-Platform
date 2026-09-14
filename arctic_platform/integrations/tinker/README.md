@@ -164,8 +164,8 @@ metric; it exists precisely to catch this class of error.
 
 | Constraint | Consequence |
 |---|---|
-| Loss registry has `causal_cross_entropy`, `grpo`, `grpo_echo_v1` | The router asks for `verl_grpo`, which does not exist there. `cortex.py` pins `grpo`, whose PPO shape is what Tinker's `ppo` and `importance_sampling` both lower to. `cross_entropy` is gated off in v1. |
-| Post-processors are `identity` and `compute_logprobs` only | No `apply_temperature`, so **`temperature=1.0` only**. No `compute_entropy_and_logprobs` either; the zone refuses the request before any model call. |
+| Loss registry has `causal_cross_entropy`, `grpo`, `grpo_echo_v1` | The router asks for `verl_grpo`, which does not exist there. `cortex.py` pins `grpo`, whose PPO shape is what Tinker's `ppo` and `importance_sampling` both lower to. `cross_entropy` has no registered home either, so it rides in on `grpo` as a surrogate (§9). |
+| Post-processors are `identity` and `compute_logprobs` only | No `apply_temperature`, so **`temperature=1.0` only** — `sample` now returns 400 for anything else rather than letting the sampler and trainer diverge silently. No `compute_entropy_and_logprobs` either; the zone refuses the request before any model call. |
 | `generate` takes no `n` | N samples means sending the prompt N times. Per-position log-probs come back as dicts keyed by token-id *string*, so the sampled token is looked up by id, never positionally — these become `old_log_probs`, and a misaligned list would bias the importance ratio without looking wrong. Unknown sampling params are fatal. |
 | LoRA `rank > 0` returns 400 | Full fine-tuning only (§4), which changes the safe learning rate (§8). |
 | The image ships FA3 only | `attn_implementation=flash_attention_3`; FA2 dies at model load. |
@@ -265,6 +265,39 @@ Two smaller traps in the same family:
   ~95% on it at step 0 and saturates at 100%. It is a good correctness check
   and a useless demonstration of a curve.
 
+## 9. Custom losses
+
+`forward_backward_custom` lets a recipe define its own objective. It is
+entirely client-side: the SDK runs a `forward` to get log-probs, differentiates
+your loss locally under autograd, and sends `w = dC/dlogprobs` back as
+cross-entropy `weights`, relying on the backend's cross-entropy being
+`L = sum(-logprobs * weights)` so the chain rule reconstitutes your loss. The
+surrogate is hardcoded to `cross_entropy` and cannot be configured.
+
+Cortex registers no such loss, so the router names `weighted_logprob_sum` and
+`cortex.py` encodes it through stock `grpo`:
+
+* grpo's gradient wrt log-probs is `-advantages * ratio`, so `advantages = -w`
+  leaves exactly `w`.
+* Omitting `old_log_probs_shifted` makes grpo default π_old to
+  `logprobs.detach()` — the *same* forward's output, not a second one — so the
+  ratio is **exactly** 1.0 and clipping provably cannot engage.
+* `batch_num_tokens=1` cancels grpo's token-mean divisor, since Tinker's
+  cross-entropy is an unnormalized sum and the client has already scaled `w`.
+
+The reported loss is `sum(-advantages)`, not your loss. Only the gradient is
+meant to match; the SDK reports its own loss and discards the server's. Two
+consequences worth knowing: server-side loss metrics on this path are
+meaningless, and **any entropy metric is meaningless too**, because
+`entropy = -logprobs.detach()` in grpo rather than a real entropy.
+
+Nothing downstream reads the loss value, so a sign or frame error here is
+invisible end to end — it just trains the wrong way. That is why the check is a
+gradient check and not a smoke test: `TestGradientEquivalence` asserts
+`dL/dlogprobs == -weights` through the whole pipeline, and
+`probe_custom_loss_multirow.py` confirms rows of differing length each descend
+on live hardware, which is the only way a per-row frame shift shows up.
+
 ## Troubleshooting
 
 | what you see | what it means |
@@ -276,6 +309,8 @@ Two smaller traps in the same family:
 | `cortex … returned no per-token log-probs` | `_require_logprobs` could not find them in `post_process_outputs`, `batch`, or the top level. The listed response keys tell you which shape actually came back. |
 | `packing requires left-aligned rows` | A payload reached Cortex with padding at the head of a row, i.e. a path that bypassed the alignment in §6. |
 | `KeyError: 'mask'` building a `tinker.Datum` | `_KEY_TO_TYPE` has no `mask`; pass `TensorData.from_torch(...)`. |
+| `sampling temperature=… is not supported by this backend` | Cortex scores training log-probs at 1.0 and has no `apply_temperature` (§7). Set `temperature=1.0`. |
+| `loss_fn='weighted_logprob_sum' needs 'logprob_weights_shifted'` | A `cross_entropy` batch reached the binder without its weights, so the step would have been a no-op (§9). |
 | `training_config.train_batch_size must be > 0` | DeepSpeed's invariant is unsatisfiable. Set `--micro-batch-size` / `--gradient-accumulation-steps` (§7). |
 | Job sits in `PLACING` for 10–25 min | Shared-cluster GPU capacity, not a hang. `PLACING` is easy to miss when filtering for busy jobs, which makes GPUs look free when they are not. 1+1 GPUs places in ~3–4 min; 4+1 can take far longer. |
 | `429 … per-account GPU cap reached` | A previous job still holds GPUs. Releasing is not instant; leave a moment between a cancel and the next launch. |

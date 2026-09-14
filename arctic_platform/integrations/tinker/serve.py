@@ -138,6 +138,9 @@ def create_app(cfg: TinkerServeConfig):
             max_prompt_length=cfg.max_prompt_length,
             max_response_length=cfg.max_response_length,
             pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
+            # Cortex registers no `apply_temperature`, so the trainer always
+            # scores at 1.0 and `sample` refuses any other temperature.
+            supports_temperature_scaling=False,
             **build_handlers(client),
         )
         app.state.arctic_client = client

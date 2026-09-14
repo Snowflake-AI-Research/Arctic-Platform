@@ -95,9 +95,7 @@ def mock_backend() -> dict[str, Any]:
     )}
 
 
-@pytest.fixture
-def app(mock_backend):
-    """Build a FastAPI app with only the Tinker router mounted + backend wired."""
+def _build_app(mock_backend, **kwargs):
     from fastapi import FastAPI
 
     from arctic_platform.integrations.tinker.router import init_tinker_state
@@ -111,16 +109,39 @@ def app(mock_backend):
         max_prompt_length=16,
         max_response_length=8,
         pad_token_id=0,
+        **kwargs,
         **mock_backend["handlers"],
     )
     return app
 
 
-@pytest_asyncio.fixture
-async def client(app):
-    """Async httpx client rooted at the test app."""
+@pytest.fixture
+def app(mock_backend):
+    """Build a FastAPI app with only the Tinker router mounted + backend wired."""
+    return _build_app(mock_backend)
+
+
+@pytest.fixture
+def app_fixed_temperature(mock_backend):
+    """A backend that scores training log-probs at 1.0 only, as Cortex does."""
+    return _build_app(mock_backend, supports_temperature_scaling=False)
+
+
+def _asgi_client(app):
     import httpx
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    return httpx.AsyncClient(transport=transport, base_url="http://test")
+
+
+@pytest_asyncio.fixture
+async def client(app):
+    """Async httpx client rooted at the test app."""
+    async with _asgi_client(app) as c:
+        yield c
+
+
+@pytest_asyncio.fixture
+async def client_fixed_temperature(app_fixed_temperature):
+    async with _asgi_client(app_fixed_temperature) as c:
         yield c

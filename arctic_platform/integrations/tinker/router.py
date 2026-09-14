@@ -382,8 +382,14 @@ def _loss_fn_config_to_actor_config(
     (defaults 0.8 / 1.2, i.e. absolute ratio bounds); Arctic reads ``eps_clip``
     (symmetric epsilon around 1.0) and ``eps_clip_higher`` (asymmetric upper).
     ``importance_sampling`` = PPO with clipping disabled.
+
+    ``cross_entropy`` carries no ratio and no clipping: it lowers to
+    ``weighted_logprob_sum``, whose only input is the per-token weights packed
+    into the batch, so there is nothing to configure.
     """
     cfg = dict(loss_fn_config or {})
+    if loss_fn == "cross_entropy":
+        return {}
     if loss_fn == "ppo":
         low = cfg.get("clip_low_threshold", 0.8)
         high = cfg.get("clip_high_threshold", 1.2)
@@ -402,6 +408,18 @@ def _loss_fn_config_to_actor_config(
     if "entropy_coef" in cfg:
         actor_cfg["entropy_coeff"] = float(cfg["entropy_coef"])
     return actor_cfg
+
+
+# Tinker loss name -> the loss registered on an on-prem Arctic server. Both
+# ratio-based losses lower to one PPO-shaped loss and differ only in
+# ``actor_config``; ``cross_entropy`` is the surrogate the SDK's
+# ``forward_backward_custom`` builds on, and needs a loss whose gradient wrt
+# log-probs is exactly the per-token weights.
+_BACKEND_LOSS_FNS = {
+    "ppo": "verl_grpo",
+    "importance_sampling": "verl_grpo",
+    "cross_entropy": "weighted_logprob_sum",
+}
 
 
 def _model_input_to_tokens(model_input: ModelInput) -> list[int]:
@@ -499,6 +517,7 @@ def datum_list_to_arctic_batch(
     response_mask = np.zeros((batch_size, total_len), dtype=np.int64)
     advantages = np.zeros((batch_size, total_len), dtype=np.float32)
     old_log_probs = np.zeros((batch_size, total_len), dtype=np.float32)
+    logprob_weights = np.zeros((batch_size, total_len), dtype=np.float32)
     row_slices: list[tuple[int, int, int]] = []
 
     for i, datum in enumerate(data):
@@ -518,9 +537,12 @@ def datum_list_to_arctic_batch(
         # last target sits one past the end of the input and has to be appended
         # for the final position to have anything to predict. It stays out of
         # ``response_mask`` and ``advantages``: scored against, never scored.
+        # This applies to ``forward`` as much as to ``forward_backward`` --
+        # ``forward_backward_custom`` differentiates the log-probs a forward
+        # returned, so a garbage final position corrupts the client's gradient.
         target_tokens = inputs.get("target_tokens")
         scoring_tok = None
-        if target_tokens is not None and not forward_only:
+        if target_tokens is not None:
             target_arr = _tensor_data_to_numpy(target_tokens)
             if len(target_arr):
                 scoring_tok = int(np.asarray(target_arr).reshape(-1)[-1])
@@ -553,6 +575,14 @@ def datum_list_to_arctic_batch(
             arr = _tensor_data_to_numpy(inputs["logprobs"]).astype(np.float32)
             resp_lp = arr[p_end: p_end + r_len]
             old_log_probs[i, mpl: mpl + len(resp_lp)] = resp_lp
+        if "weights" in inputs:
+            arr = _tensor_data_to_numpy(inputs["weights"]).astype(np.float32)
+            resp_w = arr[p_end: p_end + r_len]
+            # Tinker's cross-entropy is ``L = sum(-logprobs * weights)`` while
+            # ``weighted_logprob_sum`` computes ``sum(logprobs * w)``, so the
+            # sign flips here. Positions before ``p_end`` are zero by
+            # construction -- that is how _split_prompt_response found p_end.
+            logprob_weights[i, mpl: mpl + len(resp_w)] = -resp_w
 
     actor_config: dict[str, Any] = {}
     if not forward_only:
@@ -569,6 +599,7 @@ def datum_list_to_arctic_batch(
             "response_mask": response_mask,
             "advantages": advantages,
             "old_log_probs": old_log_probs,
+            "logprob_weights_shifted": logprob_weights,
         },
         "meta": {
             "actor_config": actor_config,
@@ -595,7 +626,7 @@ def datum_list_to_arctic_batch(
         # registers different names overrides this -- the Cortex binder does.
         "processing": {
             "post": ["compute_entropy_and_logprobs"],
-            "loss_fn": "verl_grpo" if not forward_only else None,
+            "loss_fn": _BACKEND_LOSS_FNS[loss_fn] if not forward_only else None,
         },
     }
     return batch_dict, row_slices
@@ -745,8 +776,8 @@ _PROTO_ENCODERS: dict[str, Callable[[dict[str, Any]], bytes]] = {
     _KIND_SAMPLE: encode_sample_response,
 }
 
-_V1_SUPPORTED_LOSSES = frozenset({"ppo", "importance_sampling"})
-_V1_UNSUPPORTED_LOSSES = frozenset({"cispo", "dro", "cross_entropy"})
+_V1_SUPPORTED_LOSSES = frozenset({"ppo", "importance_sampling", "cross_entropy"})
+_V1_UNSUPPORTED_LOSSES = frozenset({"cispo", "dro"})
 
 
 def _require_state(app_state: Any, name: str) -> Any:
@@ -1042,6 +1073,29 @@ async def save_weights_for_sampler(
     return await _submit_inline(request, runner, model_id=req.model_id)
 
 
+def _gate_temperature(app_state: Any, temperature: float) -> None:
+    """Refuse a sampling temperature the trainer cannot reproduce.
+
+    A backend without a temperature post-processor scores every log-prob at
+    1.0. Sampling at anything else makes the sampler and the trainer two
+    different distributions: the importance ratio is then wrong by a factor
+    that no metric on this path reports, and
+    ``forward_backward_custom`` differentiates those same log-probs. Refusing
+    costs a recipe one config change; accepting costs a silently worse model.
+    """
+    if getattr(app_state, "tinker_supports_temperature_scaling", True):
+        return
+    if abs(float(temperature) - 1.0) > 1e-9:
+        raise HTTPException(
+            400,
+            f"sampling temperature={temperature!r} is not supported by this backend: "
+            "it scores training log-probs at temperature 1.0 and has no "
+            "temperature post-processor, so sampling at any other temperature "
+            "would silently mismatch the sampler and the trainer. "
+            "Set temperature=1.0 in your sampling params.",
+        )
+
+
 @router.post("/create_sampling_session", response_model=CreateSamplingSessionResponse)
 async def create_sampling_session(
     req: CreateSamplingSessionRequest, request: Request
@@ -1053,6 +1107,7 @@ async def create_sampling_session(
 @router.post("/asample", response_model=UntypedAPIFuture)
 async def asample(req: SampleRequest, request: Request) -> UntypedAPIFuture:
     handler = _require_state(request.app.state, "tinker_generate")
+    _gate_temperature(request.app.state, req.sampling_params.temperature)
     gen = None
     if req.sampling_session_id and req.sampling_session_id.startswith("ss@"):
         try:
@@ -1123,10 +1178,16 @@ def init_tinker_state(
     step_handler: Callable[[dict | None], Awaitable[dict]],
     sync_weights_handler: Callable[[], Awaitable[Any]],
     generate_handler: Callable[[list[int], dict], Awaitable[dict]],
+    supports_temperature_scaling: bool = True,
 ) -> None:
     """Wire the Tinker verbs onto ``app.state`` as async closures. Callers
     (real Arctic http_server, in-process tests with a mocked backend) inject
-    per-verb handlers so the router never reaches into ``app.state.jobs``."""
+    per-verb handlers so the router never reaches into ``app.state.jobs``.
+
+    ``supports_temperature_scaling=False`` declares that the backend scores
+    log-probs at temperature 1.0 regardless of what the sampler was asked for,
+    which makes any other sampling temperature a silent train/sample mismatch;
+    ``sample`` then refuses it. See :func:`asample`."""
     app.state.tinker_base_model = base_model
     app.state.tinker_max_prompt_length = int(max_prompt_length)
     app.state.tinker_max_response_length = int(max_response_length)
@@ -1140,3 +1201,4 @@ def init_tinker_state(
     app.state.tinker_step = step_handler
     app.state.tinker_sync_weights = sync_weights_handler
     app.state.tinker_generate = generate_handler
+    app.state.tinker_supports_temperature_scaling = bool(supports_temperature_scaling)

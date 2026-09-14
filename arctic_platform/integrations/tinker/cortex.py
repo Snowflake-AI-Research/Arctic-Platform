@@ -24,6 +24,11 @@ backend-agnostic:
     :func:`~arctic_platform.integrations._cortex_shared.to_cortex_fwd_bwd_payload`
     translates and pins ``grpo``.
 
+``weighted_logprob_sum`` → stock ``grpo``
+    The router asks for ``weighted_logprob_sum`` to carry Tinker's
+    ``cross_entropy``, and Cortex does not register it. :func:`_grpo_surrogate`
+    encodes the same gradient through a loss every RL server ships.
+
 Row alignment
     The router lays a row out as ``[pad… prompt][response pad…]``; Cortex's
     packer needs the real tokens in the *leading* columns. Aligning alone is
@@ -52,6 +57,39 @@ __all__ = ["CortexTinkerBackend", "build_handlers"]
 # (`compute_entropy_and_logprobs`) does not exist there, and the zone refuses
 # the request before any model call.
 _POST_PROCESSORS = ["compute_logprobs"]
+
+# The loss the router names for Tinker's ``cross_entropy``, and the batch key
+# carrying its per-token weights.
+_WEIGHTED_LOGPROB_SUM = "weighted_logprob_sum"
+_LOGPROB_WEIGHTS = "logprob_weights_shifted"
+
+
+def _grpo_surrogate(body: dict, meta: dict) -> tuple[dict, dict]:
+    """Express ``sum(w * logprobs)`` as stock ``grpo``.
+
+    grpo's gradient wrt log-probs is ``-advantages * ratio``. Omitting
+    ``old_log_probs_shifted`` makes grpo default π_old to ``logprobs.detach()``
+    -- the *same* forward's output, not a second one -- so the ratio is exactly
+    1.0 and clipping provably cannot engage. That leaves ``-advantages``, so
+    ``advantages = -w`` gives a gradient of exactly ``w``.
+
+    ``batch_num_tokens=1`` cancels grpo's token-mean divisor: the client has
+    already scaled the weights, and Tinker's cross-entropy is an unnormalized
+    sum.
+
+    The reported loss is ``sum(-advantages)`` rather than ``sum(w * logprobs)``,
+    because at ratio 1 the per-token term is ``-advantages``. Only the gradient
+    is meant to match; the SDK reports the client's own loss and discards this
+    one.
+    """
+    if _LOGPROB_WEIGHTS not in body:
+        raise ValueError(
+            f"loss_fn={_WEIGHTED_LOGPROB_SUM!r} needs {_LOGPROB_WEIGHTS!r} in the "
+            f"batch to encode as grpo; got keys {sorted(body)}. Without it the "
+            "advantages would carry no signal and the step would be a no-op."
+        )
+    weights = body.pop(_LOGPROB_WEIGHTS)
+    return {**body, "advantages": -weights}, {**meta, "batch_num_tokens": 1}
 
 
 def _align_plan(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -207,6 +245,12 @@ class CortexTinkerBackend:
             attention_mask = body.get("attention_mask")
         if attention_mask is None:
             raise ValueError("tinker fwd_bwd batch is missing 'attention_mask'")
+
+        processing = dict(batch.get("processing") or {})
+        if processing.get("loss_fn") == _WEIGHTED_LOGPROB_SUM:
+            body, meta = _grpo_surrogate(body, meta)
+        else:
+            body.pop(_LOGPROB_WEIGHTS, None)
 
         order, valid = _align_plan(attention_mask)
         payload = to_cortex_fwd_bwd_payload(

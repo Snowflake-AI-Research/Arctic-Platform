@@ -199,7 +199,7 @@ async def test_forward_backward_importance_sampling(client, mock_backend):
     assert call["meta"]["actor_config"]["eps_clip"] > 1e6
 
 
-@pytest.mark.parametrize("loss_fn", ["cross_entropy", "cispo", "dro"])
+@pytest.mark.parametrize("loss_fn", ["cispo", "dro"])
 async def test_forward_backward_unsupported_loss_400(client, loss_fn):
     r = await client.post("/api/v1/forward_backward", json={
         "forward_backward_input": {
@@ -381,6 +381,100 @@ async def test_future_store_pop_semantics(client):
     r2 = await client.post("/api/v1/retrieve_future",
                            json={"request_id": fut_id})
     assert r2.json() == {"type": "try_again"}
+
+
+# ---------------------------------------------------------------------------
+# Custom loss (forward_backward_custom's two passes)
+# ---------------------------------------------------------------------------
+
+
+def _mk_ce_datum_dict(tokens=(1, 2, 3), weights=(0.0, 1.0, 1.0)):
+    """The datum shape ``forward_backward_custom`` sends: targets + weights."""
+    return {
+        "model_input": {"chunks": [{"type": "encoded_text", "tokens": list(tokens)}]},
+        "loss_fn_inputs": {
+            "target_tokens": {"dtype": "int64",
+                              "data": list(tokens[1:]) + [tokens[-1] + 1],
+                              "shape": [len(tokens)]},
+            "weights": {"dtype": "float32", "data": list(weights),
+                        "shape": [len(weights)]},
+        },
+    }
+
+
+async def test_cross_entropy_accepted_on_forward_backward(client, mock_backend):
+    """Pass 2. Previously a 400, which killed forward_backward_custom outright."""
+    r = await client.post("/api/v1/forward_backward", json={
+        "forward_backward_input": {
+            "data": [_mk_ce_datum_dict()],
+            "loss_fn": "cross_entropy",
+        },
+        "model_id": "main",
+    })
+    assert r.status_code == 200, r.text
+    batch = mock_backend["calls"]["fwd_bwd"][-1]
+    assert batch["processing"]["loss_fn"] == "weighted_logprob_sum"
+    assert batch["batch"]["logprob_weights_shifted"].any()
+
+
+async def test_cross_entropy_accepted_on_forward(client, mock_backend):
+    """Pass 1: the no-grad forward whose log-probs the client differentiates."""
+    r = await client.post("/api/v1/forward", json={
+        "forward_input": {
+            "data": [_mk_ce_datum_dict(weights=(0.0, 0.0, 0.0))],
+            "loss_fn": "cross_entropy",
+        },
+        "model_id": "main",
+    })
+    assert r.status_code == 200, r.text
+    fut_id = r.json()["request_id"]
+    out = (await client.post("/api/v1/retrieve_future",
+                             json={"request_id": fut_id})).json()
+    # One log-prob per model_input token, which is what the SDK reshapes
+    # against its own tensors before calling the user's loss.
+    assert len(out["loss_fn_outputs"]) == 1
+    assert len(out["loss_fn_outputs"][0]["logprobs"]["data"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# Temperature
+# ---------------------------------------------------------------------------
+
+
+async def test_sample_refuses_temperature_a_backend_cannot_score(
+    client_fixed_temperature,
+):
+    """A backend with no temperature post-processor trains at 1.0 whatever the
+    sampler did, so anything else is a silent sampler/trainer mismatch."""
+    r = await client_fixed_temperature.post("/api/v1/asample", json={
+        "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1, 2]}]},
+        "num_samples": 2,
+        "sampling_params": {"temperature": 0.7, "max_tokens": 4},
+    })
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert "temperature=1.0" in detail
+
+
+async def test_sample_allows_unit_temperature_on_such_a_backend(
+    client_fixed_temperature,
+):
+    r = await client_fixed_temperature.post("/api/v1/asample", json={
+        "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1, 2]}]},
+        "num_samples": 1,
+        "sampling_params": {"temperature": 1.0, "max_tokens": 4},
+    })
+    assert r.status_code == 200, r.text
+
+
+async def test_sample_leaves_temperature_alone_when_supported(client):
+    """The default: a backend that can scale temperature is not second-guessed."""
+    r = await client.post("/api/v1/asample", json={
+        "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1, 2]}]},
+        "num_samples": 1,
+        "sampling_params": {"temperature": 0.7, "max_tokens": 4},
+    })
+    assert r.status_code == 200, r.text
 
 
 # ---------------------------------------------------------------------------
