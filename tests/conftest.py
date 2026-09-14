@@ -21,6 +21,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import psutil
+
 # Largest GPU count any single GPU test needs (test_train_engine / test_generate / test_sync_weights_nccl use 2). A
 # worker can only run the GPU suite if its slice is at least this big.
 _MAX_TEST_GPUS = 2
@@ -133,9 +135,12 @@ def _reap_orphan_ray_clusters() -> None:
     fully reparented to init rewrites its command line to a bare title (``VLLM::EngineCore``) and is no longer a
     descendant of anything we match; for that narrow case we additionally seed any process *titled* exactly
     ``VLLM::EngineCore`` whose inherited environment still references ``ray_arctic_*``. Crucially we only ever read
-    ``/proc/<pid>/environ`` for that tiny title-matched candidate set -- never for arbitrary processes -- so we
-    cannot kill an unrelated tree merely because it inherited a marker env var, and ``os.kill`` failing on procs we
-    don't own keeps this scoped to our own uid.
+    the environment for that tiny title-matched candidate set -- never for arbitrary processes -- so we cannot kill
+    an unrelated tree merely because it inherited a marker env var, and ``os.kill`` failing on procs we don't own
+    keeps this scoped to our own uid.
+
+    Uses ``psutil`` for all process introspection so the function works on Linux, macOS, and Windows without any
+    dependency on the Linux-specific ``/proc`` filesystem.
 
     Invoked once at session start in the xdist controller / serial main (never in an xdist worker), so it runs
     BEFORE any worker spins up a cluster and every match is necessarily an orphan from an earlier run. Cheap no-op
@@ -143,47 +148,38 @@ def _reap_orphan_ray_clusters() -> None:
     """
     cmd_markers = ("ray_arctic_", "arctic_platform.rl.http_server")
     engine_title = "VLLM::EngineCore"
-
-    def _read(pid: str, name: str) -> bytes:
-        try:
-            with open(f"/proc/{pid}/{name}", "rb") as fh:
-                return fh.read()
-        except OSError:
-            return b""
-
-    def _cmdline(pid: str) -> str:
-        return _read(pid, "cmdline").replace(b"\x00", b" ").decode("utf-8", "replace").strip()
-
-    def _ppid(pid: str) -> int | None:
-        # ppid is field 2 after the ``)`` that closes comm (comm itself may contain spaces / parens).
-        data = _read(pid, "stat")
-        rparen = data.rfind(b")")
-        if rparen == -1:
-            return None
-        fields = data[rparen + 2 :].split()
-        try:
-            return int(fields[1])
-        except (IndexError, ValueError):
-            return None
-
     my_pid = os.getpid()
-    pids = [e for e in os.listdir("/proc") if e.isdigit()]
-    children: dict[int, list[int]] = {}
-    for pid in pids:
-        parent = _ppid(pid)
-        if parent is not None:
-            children.setdefault(parent, []).append(int(pid))
 
+    # Build parent->children map and collect seeds in two passes over the live process list.
+    children: dict[int, list[int]] = {}
     seeds: set[int] = set()
-    for pid in pids:
-        ipid = int(pid)
-        if ipid == my_pid:
+
+    # Pass 1: build children map.
+    for proc in psutil.process_iter():
+        if proc.pid == my_pid:
             continue
-        cmdline = _cmdline(pid)
+        try:
+            children.setdefault(proc.ppid(), []).append(proc.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+
+    # Pass 2: find seeds by cmdline / environ.
+    for proc in psutil.process_iter():
+        if proc.pid == my_pid:
+            continue
+        try:
+            cmdline = " ".join(proc.cmdline())
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
         if any(m in cmdline for m in cmd_markers):
-            seeds.add(ipid)
-        elif cmdline.startswith(engine_title) and b"ray_arctic_" in _read(pid, "environ"):
-            seeds.add(ipid)
+            seeds.add(proc.pid)
+        elif cmdline.startswith(engine_title):
+            try:
+                env = proc.environ()
+                if any("ray_arctic_" in v for v in env.values()) or any("ray_arctic_" in k for k in env.keys()):
+                    seeds.add(proc.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
 
     # Expand seeds to their full descendant trees (catches a still-linked EngineCore under raylet/InferenceWorker).
     victims: set[int] = set()
