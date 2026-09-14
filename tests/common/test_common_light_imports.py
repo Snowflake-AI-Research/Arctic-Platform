@@ -20,8 +20,16 @@ import unittest
 
 
 class TestCommonLightImports(unittest.TestCase):
-    def test_common_registry_imports_do_not_require_training_extras(self):
+    def _reset_common_modules(self):
         import arctic_platform
+
+        for name in tuple(sys.modules):
+            if name == "arctic_platform.common" or name.startswith("arctic_platform.common."):
+                sys.modules.pop(name)
+        if hasattr(arctic_platform, "common"):
+            delattr(arctic_platform, "common")
+
+    def test_common_registry_imports_do_not_require_training_extras(self):
         import arctic_platform._dependency_groups as dependency_groups
 
         def fail_gate(*extras):
@@ -29,10 +37,7 @@ class TestCommonLightImports(unittest.TestCase):
 
         original_gate = dependency_groups.require_any_dep_group
         try:
-            sys.modules.pop("arctic_platform.common.registry", None)
-            sys.modules.pop("arctic_platform.common", None)
-            if hasattr(arctic_platform, "common"):
-                delattr(arctic_platform, "common")
+            self._reset_common_modules()
 
             dependency_groups.require_any_dep_group = fail_gate
 
@@ -47,5 +52,23 @@ class TestCommonLightImports(unittest.TestCase):
             self.assertIsInstance(POST_PROCESSORS, dict)
             self.assertTrue(callable(register_loss_fn))
             self.assertTrue(callable(register_post_processor))
+        finally:
+            dependency_groups.require_any_dep_group = original_gate
+
+    def test_lazy_deepspeed_worker_export_keeps_dependency_hint(self):
+        import arctic_platform._dependency_groups as dependency_groups
+
+        def raise_hint(*extras):
+            raise ImportError(f"missing optional deps; install {extras!r}")
+
+        original_gate = dependency_groups.require_any_dep_group
+        try:
+            self._reset_common_modules()
+            dependency_groups.require_any_dep_group = raise_hint
+
+            import arctic_platform.common as common
+
+            with self.assertRaisesRegex(ImportError, "sft.*rl"):
+                _ = common.DeepSpeedWorker
         finally:
             dependency_groups.require_any_dep_group = original_gate

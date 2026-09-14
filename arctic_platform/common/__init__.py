@@ -40,12 +40,19 @@ _LAZY = {
 }
 
 
+def _require_training_extras() -> None:
+    from arctic_platform._dependency_groups import require_any_dep_group
+
+    require_any_dep_group("sft", "rl")
+
+
 def __getattr__(name: str) -> Any:
     target = _LAZY.get(name)
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     import importlib
 
+    _require_training_extras()
     module = importlib.import_module(target[0])
     return getattr(module, target[1])
 
