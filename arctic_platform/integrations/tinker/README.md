@@ -87,8 +87,13 @@ Three of those arguments are not free choices, and each is a constraint from
   `get_recommended_renderer_name` looks the model up in a hardcoded table that
   starts at 4B, so a 0.6B raises `KeyError` before any request is sent.
   `math_rl` accepts the name directly, which short-circuits the table.
-* **`lora_rank=0`** — Cortex rejects `rank > 0` with a 400, so this path is
-  full fine-tuning only. That has a consequence for the learning rate, below.
+* **`lora_rank=0`** — the router rejects `rank > 0` with a 400, so this path is
+  full fine-tuning only. Note this is *our* gate, not a Cortex limit: Cortex
+  supports LoRA adapter sync (spec §7.3, `peft_config` on both sub-jobs plus
+  `weight_format="lora"`), and `serve.py` already threads `--lora-rank` into
+  provisioning. What is missing is that the adapter-sync path has never been
+  exercised here. It matters because full fine-tuning is what makes the
+  cookbook's default learning rate unsafe, below.
 
 ## 5. The protobuf wire
 
@@ -167,7 +172,7 @@ metric; it exists precisely to catch this class of error.
 | Loss registry has `causal_cross_entropy`, `grpo`, `grpo_echo_v1` | The router asks for `verl_grpo`, which does not exist there. `cortex.py` pins `grpo`, whose PPO shape is what Tinker's `ppo` and `importance_sampling` both lower to. `cross_entropy` has no registered home either, so it rides in on `grpo` as a surrogate (§9). |
 | Post-processors are `identity` and `compute_logprobs` only | No `apply_temperature`, so **`temperature=1.0` only** — `sample` now returns 400 for anything else rather than letting the sampler and trainer diverge silently. No `compute_entropy_and_logprobs` either; the zone refuses the request before any model call. |
 | `generate` takes no `n` | N samples means sending the prompt N times. Per-position log-probs come back as dicts keyed by token-id *string*, so the sampled token is looked up by id, never positionally — these become `old_log_probs`, and a misaligned list would bias the importance ratio without looking wrong. Unknown sampling params are fatal. |
-| LoRA `rank > 0` returns 400 | Full fine-tuning only (§4), which changes the safe learning rate (§8). |
+| LoRA `rank > 0` returns 400 | Our gate, listed here only because it looks like a Cortex constraint and is not: adapter sync is supported (spec §7.3) and `serve.py` threads `--lora-rank`, but the path is unexercised. Full fine-tuning changes the safe learning rate (§4, §8). |
 | The image ships FA3 only | `attn_implementation=flash_attention_3`; FA2 dies at model load. |
 | DeepSpeed requires `train_batch == micro × accum × dp` | `serve.py` derives it. `offload_optimizer` is omitted entirely rather than set to `{"device": "none"}` — the latter is still enough for DeepSpeed to instantiate CPUAdam, which then asserts its params are on cuda. |
 | A job's weights are **persistent, with no reset verb** | Every run against the same job inherits the previous run's weights. Recycle the job between runs or a baseline number is meaningless (§8). |
