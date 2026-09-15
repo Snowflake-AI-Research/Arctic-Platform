@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Functional math utilities for RL loss computation."""
 
 from __future__ import annotations
@@ -30,9 +45,7 @@ def canonicalize_loss_mask(
 ) -> torch.Tensor:
     """Validate a token mask and move it to the objective tensor's device."""
     if not torch.is_tensor(loss_mask):
-        raise ValueError(
-            f"{objective} loss_mask must be a tensor, got {type(loss_mask).__name__}"
-        )
+        raise ValueError(f"{objective} loss_mask must be a tensor, got {type(loss_mask).__name__}")
     if tuple(loss_mask.shape) != tuple(reference.shape):
         raise ValueError(
             f"{objective} loss_mask must match the objective shape, got "
@@ -71,11 +84,7 @@ def _packed_per_sequence_sums(
     Returns the ``[T]`` token→sequence index and one ``[B]`` sum per input
     tensor (``B = len(cu_seqlens) - 1``); each sum keeps its input's dtype.
     """
-    if (
-        cu_seqlens.ndim != 1
-        or cu_seqlens.numel() < 2
-        or cu_seqlens.dtype not in (torch.int32, torch.int64)
-    ):
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2 or cu_seqlens.dtype not in (torch.int32, torch.int64):
         raise ValueError(
             "cu_seqlens must be a 1-D integer tensor with at least two boundary entries, "
             f"got shape {tuple(cu_seqlens.shape)} dtype {cu_seqlens.dtype}."
@@ -98,10 +107,7 @@ def _packed_per_sequence_sums(
         torch.arange(num_sequences, device=device),
         (cu_seqlens[1:] - cu_seqlens[:-1]).long(),
     )
-    sums = [
-        value.new_zeros(num_sequences).scatter_add_(0, sequence_idx, value.reshape(-1))
-        for value in values
-    ]
+    sums = [value.new_zeros(num_sequences).scatter_add_(0, sequence_idx, value.reshape(-1)) for value in values]
     return sequence_idx, sums
 
 
@@ -121,9 +127,7 @@ def masked_normalization(
     if dim is None:
         dim = tuple(range(len(x.shape)))
     if mask is None:
-        factor = torch.tensor(
-            np.prod([x.shape[d] for d in dim]), dtype=dtype, device=x.device
-        )
+        factor = torch.tensor(np.prod([x.shape[d] for d in dim]), dtype=dtype, device=x.device)
     else:
         mask = mask.to(dtype)
         x = x * mask
@@ -271,17 +275,13 @@ def agg_loss(
             weights = sequence_loss_weights.to(loss_mat.device).to(seq_sum.dtype).reshape(-1)
             if weights.shape[0] != seq_sum.shape[0]:
                 raise ValueError(
-                    "sequence_loss_weights must have one value per sequence when "
-                    "loss_agg_mode='prompt-mean'."
+                    "sequence_loss_weights must have one value per sequence when loss_agg_mode='prompt-mean'."
                 )
             loss = (weights * seq_sum / seq_cnt.clamp(min=1.0)).sum()
             return loss
 
         if prompt_group_ids is None:
-            raise ValueError(
-                "prompt-mean requires prompt_group_ids (one int per sequence) "
-                "or sequence_loss_weights."
-            )
+            raise ValueError("prompt-mean requires prompt_group_ids (one int per sequence) or sequence_loss_weights.")
         _, ids = torch.unique(
             prompt_group_ids.to(loss_mat.device).long(),
             return_inverse=True,
@@ -348,8 +348,7 @@ def kl_penalty(
         kl = torch.clamp(kl, min=-20.0, max=20.0)
         return torch.clamp(kl.exp() - kl - 1, min=-10.0, max=10.0)
     raise ValueError(
-        f"Invalid kl_penalty method: '{method}'. "
-        "Expected one of: 'k1'/'kl', 'abs', 'k2'/'mse', 'k3'/'low_var_kl'."
+        f"Invalid kl_penalty method: '{method}'. Expected one of: 'k1'/'kl', 'abs', 'k2'/'mse', 'k3'/'low_var_kl'."
     )
 
 
@@ -452,9 +451,7 @@ def echo_env_prediction_loss_fn(
             f"global_num_echo_sequences must be an integer sequence count, got {global_num_echo_sequences!r}"
         )
     if global_num_echo_sequences < 1:
-        raise ValueError(
-            f"global_num_echo_sequences must be a positive count, got {global_num_echo_sequences}"
-        )
+        raise ValueError(f"global_num_echo_sequences must be a positive count, got {global_num_echo_sequences}")
     # Exact-shape requirement: broadcasting (e.g. a [1, S] mask against [B, S]
     # logprobs) would silently train the wrong sequences instead of failing.
     if not (sft_mask.shape == observation_mask.shape == loss_mask.shape):
@@ -471,10 +468,7 @@ def echo_env_prediction_loss_fn(
     # numel, or cu_seqlens alongside padded B > 1 rows — would reshape or
     # resegment into silently wrong per-sequence attribution.
     logprobs_match_masks = logprobs.shape == sft_mask.shape or (
-        logprobs.ndim == 2
-        and logprobs.shape[0] == 1
-        and sft_mask.ndim == 1
-        and logprobs.shape[1] == sft_mask.shape[0]
+        logprobs.ndim == 2 and logprobs.shape[0] == 1 and sft_mask.ndim == 1 and logprobs.shape[1] == sft_mask.shape[0]
     )
     if not logprobs_match_masks:
         raise ValueError(
@@ -524,9 +518,7 @@ def echo_env_prediction_loss_fn(
     # false-positive on row-padded batches).
     num_real_sequences = int(((seq_obs_count > 0) | (seq_policy_count > 0)).sum().item())
     local_matched_count = (
-        num_real_sequences
-        if batch_denominator is EchoBatchDenominator.ALL_SEQUENCES
-        else num_echo_bearing_sequences
+        num_real_sequences if batch_denominator is EchoBatchDenominator.ALL_SEQUENCES else num_echo_bearing_sequences
     )
     if global_num_echo_sequences < local_matched_count:
         raise ValueError(
@@ -562,13 +554,11 @@ def _compute_sequence_level_ratio_and_advantages(
     if log_ratio.ndim == 1:
         if cu_seqlens is None:
             raise ValueError("cu_seqlens is required for 1D tensors (packed format).")
-        sequence_idx, (log_ratio_sum_per_seq, advantages_sum_per_seq, valid_count_per_seq) = (
-            _packed_per_sequence_sums(
-                cu_seqlens,
-                torch.where(loss_mask, log_ratio, 0.0),
-                torch.where(loss_mask, advantages, 0.0),
-                loss_mask.int(),
-            )
+        sequence_idx, (log_ratio_sum_per_seq, advantages_sum_per_seq, valid_count_per_seq) = _packed_per_sequence_sums(
+            cu_seqlens,
+            torch.where(loss_mask, log_ratio, 0.0),
+            torch.where(loss_mask, advantages, 0.0),
+            loss_mask.int(),
         )
         valid_count_per_seq = valid_count_per_seq.clamp(min=1)
         log_ratio_mean_per_seq = log_ratio_sum_per_seq / valid_count_per_seq.to(log_ratio.dtype)
@@ -614,7 +604,9 @@ def ppo_actor_loss_fn(
         ratio = torch.where(loss_mask, torch.exp(logprobs - proximal_logprobs), 0)
     else:
         raise ValueError(f"Invalid importance_sampling_level: {importance_sampling_level}.")
-    clipped_ratio = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + (eps_clip if eps_clip_higher is None else eps_clip_higher))
+    clipped_ratio = torch.clamp(
+        ratio, 1.0 - eps_clip, 1.0 + (eps_clip if eps_clip_higher is None else eps_clip_higher)
+    )
     pg_loss1 = -advantages * ratio
     pg_loss2 = -advantages * clipped_ratio
     clip_mask = pg_loss1.detach() < pg_loss2.detach()
@@ -628,7 +620,11 @@ def ppo_actor_loss_fn(
         dual_clip_mask = torch.zeros_like(clip_mask)
     behav_kl = proximal_logprobs - old_logprobs
     behav_imp_weight = behav_kl.exp()
-    behav_mask = (behav_imp_weight <= behav_imp_weight_cap).logical_and(loss_mask) if behav_imp_weight_cap is not None else loss_mask
+    behav_mask = (
+        (behav_imp_weight <= behav_imp_weight_cap).logical_and(loss_mask)
+        if behav_imp_weight_cap is not None
+        else loss_mask
+    )
     behav_kl = torch.where(behav_mask, behav_kl, 0.0)
     behav_imp_weight = torch.where(behav_mask, behav_imp_weight, 0.0)
     pg_loss = pg_loss * behav_imp_weight
@@ -636,14 +632,26 @@ def ppo_actor_loss_fn(
         pg_loss = pg_loss * rollout_is_weights
     logging_loss = pg_loss.detach()
     pg_loss = agg_loss(
-        pg_loss, loss_mask, loss_agg_mode=loss_agg_mode,
-        dp_size=dp_size, batch_num_tokens=batch_num_tokens, global_batch_size=global_batch_size,
-        prompt_group_ids=prompt_group_ids, prompt_token_counts=prompt_token_counts,
-        sequence_loss_weights=sequence_loss_weights, cu_seqlens=cu_seqlens,
+        pg_loss,
+        loss_mask,
+        loss_agg_mode=loss_agg_mode,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+        prompt_group_ids=prompt_group_ids,
+        prompt_token_counts=prompt_token_counts,
+        sequence_loss_weights=sequence_loss_weights,
+        cu_seqlens=cu_seqlens,
     )
     clip_mask.logical_and_(loss_mask)
     dual_clip_mask.logical_and_(loss_mask)
-    stat = dict(loss=logging_loss, importance_weight=ratio.detach(), approx_kl=(logprobs - proximal_logprobs).detach(), clip_mask=clip_mask, dual_clip_mask=dual_clip_mask)
+    stat = dict(
+        loss=logging_loss,
+        importance_weight=ratio.detach(),
+        approx_kl=(logprobs - proximal_logprobs).detach(),
+        clip_mask=clip_mask,
+        dual_clip_mask=dual_clip_mask,
+    )
     if proximal_logprobs is not None:
         stat["behave_imp_weight"] = behav_imp_weight
         stat["behave_approx_kl"] = behav_kl
@@ -686,12 +694,27 @@ def sapo_loss_fn(
     pg_loss = -soft_gate * advantages
     logging_loss = pg_loss.detach()
     pg_loss = agg_loss(
-        pg_loss, loss_mask, loss_agg_mode=loss_agg_mode,
-        dp_size=dp_size, batch_num_tokens=batch_num_tokens, global_batch_size=global_batch_size,
-        prompt_group_ids=prompt_group_ids, prompt_token_counts=prompt_token_counts,
-        sequence_loss_weights=sequence_loss_weights, cu_seqlens=cu_seqlens,
+        pg_loss,
+        loss_mask,
+        loss_agg_mode=loss_agg_mode,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+        prompt_group_ids=prompt_group_ids,
+        prompt_token_counts=prompt_token_counts,
+        sequence_loss_weights=sequence_loss_weights,
+        cu_seqlens=cu_seqlens,
     )
-    stat = dict(loss=logging_loss, importance_weight=ratio.detach(), approx_kl=log_ratio.detach(), clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool), dual_clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool), sapo_soft_gate=soft_gate.detach(), sapo_scaled_gate_pos=scaled_gate_pos.detach(), sapo_scaled_gate_neg=scaled_gate_neg.detach())
+    stat = dict(
+        loss=logging_loss,
+        importance_weight=ratio.detach(),
+        approx_kl=log_ratio.detach(),
+        clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),
+        dual_clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),
+        sapo_soft_gate=soft_gate.detach(),
+        sapo_scaled_gate_pos=scaled_gate_pos.detach(),
+        sapo_scaled_gate_neg=scaled_gate_neg.detach(),
+    )
     return pg_loss, stat
 
 
@@ -756,7 +779,11 @@ def cispo_actor_loss_fn(
     # Behavioral IS correction (decoupled PPO). Identical plumbing to PPO.
     behav_kl = torch.where(loss_mask, proximal_logprobs - old_logprobs, torch.zeros_like(proximal_logprobs))
     behav_imp_weight = behav_kl.exp()
-    behav_mask = (behav_imp_weight <= behav_imp_weight_cap).logical_and(loss_mask) if behav_imp_weight_cap is not None else loss_mask
+    behav_mask = (
+        (behav_imp_weight <= behav_imp_weight_cap).logical_and(loss_mask)
+        if behav_imp_weight_cap is not None
+        else loss_mask
+    )
     behav_kl = torch.where(behav_mask, behav_kl, 0.0)
     behav_imp_weight = torch.where(behav_mask, behav_imp_weight, 0.0)
     pg_loss = pg_loss * behav_imp_weight
@@ -766,10 +793,16 @@ def cispo_actor_loss_fn(
 
     logging_loss = pg_loss.detach()
     pg_loss = agg_loss(
-        pg_loss, loss_mask, loss_agg_mode=loss_agg_mode,
-        dp_size=dp_size, batch_num_tokens=batch_num_tokens, global_batch_size=global_batch_size,
-        prompt_group_ids=prompt_group_ids, prompt_token_counts=prompt_token_counts,
-        sequence_loss_weights=sequence_loss_weights, cu_seqlens=cu_seqlens,
+        pg_loss,
+        loss_mask,
+        loss_agg_mode=loss_agg_mode,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+        prompt_group_ids=prompt_group_ids,
+        prompt_token_counts=prompt_token_counts,
+        sequence_loss_weights=sequence_loss_weights,
+        cu_seqlens=cu_seqlens,
     )
 
     stat = dict(
