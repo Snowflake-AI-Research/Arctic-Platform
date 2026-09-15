@@ -5,6 +5,7 @@ on top of [SkyRL](https://github.com/NovaSky-AI/SkyRL).
 
 Available recipes:
   * [Simple (GSM8K)](simple_gsm8k) — smallest end-to-end loop, one GPU, no Ray/hostfile
+  * [Simple (GSM8K) on Cortex](simple_gsm8k_cortex) — the same loop with training and sampling dispatched to Cortex Training sub-jobs; the driver needs no GPU
   * [Txt2SQL (BIRD)](txt2sql) — single-node 8B **+** 4-node 32B ARL, with an FSDP A/B baseline (the blog ~2.38× speedup run)
   * [Long-context QA (LoongRL)](long_context_qa) — single-node 8B **+** 4-node 32B ARL, with an FSDP A/B baseline (locally measured 2.17× speedup)
 
@@ -32,23 +33,24 @@ once, `conda activate skyrl_arl`, and any recipe launches from bare `python`.
    ``nn.Module.named_non_persistent_buffers`` (not in any released PyTorch as
    of 2026-06) and break the FSDP path.
 
-   Still true as of 2026-09, and it rules out the obvious simplification.
-   ``integrations/arctic_rl/`` has since landed upstream in
-   ``NovaSky-AI/SkyRL``, so the fork looks redundant — it is not, for two
-   reasons. The pinned commit is **not reachable from any upstream ref**
+   Still true as of 2026-09. ``integrations/arctic_rl/`` has since landed
+   upstream in ``NovaSky-AI/SkyRL``, which makes the fork look redundant. Keep
+   the pin anyway: the commit is **not reachable from any upstream ref**
    (diverged from ``main``: 41 ahead, 325 behind), so a plain clone of upstream
-   cannot check it out; the GitHub API resolves the sha only because forks share
-   object storage. And the newest upstream tag, ``skyrl-v0.3.0``, still calls
-   ``named_non_persistent_buffers`` at
-   ``skyrl/backends/skyrl_train/workers/model_wrapper.py:145``, which is absent
-   from torch 2.10 and 2.13 alike — so it breaks these recipes exactly as the
-   paragraph above describes.
+   cannot check it out — the GitHub API resolves the sha only because forks
+   share object storage — and it is the checkout these recipes were validated
+   against.
 
-   That breakage is confined to the FSDP / Megatron worker path.
-   ``integrations/arctic_rl/`` never imports ``model_wrapper``, so a
-   Cortex-dispatched recipe — which replaces the trainer and inference engine
-   and keeps no local model workers — is unaffected and can use the upstream
-   tag. See [`simple_gsm8k_cortex/`](./simple_gsm8k_cortex/README.md).
+   The ``skyrl-v0.3.0`` breakage is narrower than the paragraph above suggests,
+   checked at the tag. The ``named_non_persistent_buffers`` call sits in the
+   ``meta_init`` branch of
+   ``skyrl/backends/skyrl_train/workers/model_wrapper.py``, which only an FSDP
+   worker's model construction reaches, so it breaks the ``fsdp_*_entry.py``
+   A/B baselines and nothing else here. ``ArcticRLExp._setup_trainer`` replaces
+   trainer setup outright — ``ArcticPPOTrainer`` against an inference-engine
+   stub, GPU work delegated to the server — so neither the ARL nor the
+   Cortex-dispatched path constructs a local FSDP worker. See
+   [`simple_gsm8k_cortex/`](./simple_gsm8k_cortex/README.md).
 
 2. **Install pinned Python deps** into a fresh conda env:
 
