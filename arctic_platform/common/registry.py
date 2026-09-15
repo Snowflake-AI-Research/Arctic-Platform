@@ -85,9 +85,7 @@ def register_loss_fn(
         if packed_loss_reduction is not None:
             existing = getattr(fn, PACKED_LOSS_REDUCTION_ATTR, None)
             if existing is not None and existing is not packed_loss_reduction:
-                raise ValueError(
-                    f"refusing to replace packed_loss_reduction on registered {name!r}"
-                )
+                raise ValueError(f"refusing to replace packed_loss_reduction on registered {name!r}")
             setattr(fn, PACKED_LOSS_REDUCTION_ATTR, packed_loss_reduction)
         _bind_registry(LOSS_FNS, name, fn)
         return fn
@@ -99,6 +97,14 @@ def resolve_fn(registry: dict, name: str) -> Callable:
     """Look up *name* in registry; fall back to dotted-path import."""
     if name in registry:
         return registry[name]
+    if "." not in name:
+        known = sorted(key for key in registry if _is_public_registry_name(key) and "." not in key)
+        hint = ""
+        if name in {"grpo", "grpo_echo_v1"}:
+            hint = " (did you mean 'ap_grpo' / 'cortex_grpo'?)"
+        elif name == "compute_logprobs":
+            hint = " (did you mean 'ap_compute_logprobs' / 'cortex_compute_logprobs'?)"
+        raise ValueError(f"unknown registry name {name!r}{hint}; known: {known}")
     module_path, fn_name = name.rsplit(".", 1)
     fn = getattr(importlib.import_module(module_path), fn_name)
     _bind_registry(registry, name, fn)

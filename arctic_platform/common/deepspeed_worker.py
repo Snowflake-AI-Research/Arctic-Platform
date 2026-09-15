@@ -351,7 +351,8 @@ class DeepSpeedWorker:
     def _inject_sft_global_token_meta(self, loss_fn: str, batch_data, meta_data: dict) -> None:
         """All-reduce valid-target count into ``meta["global_num_tokens"]`` + ``dp_size``.
 
-        ``dp_size`` is ``world_size // sp_size`` so the scale matches the cutter.
+        ``dp_size`` is ``world_size`` while shards stay disjoint. ``sp_size`` is
+        still validated against ``world_size``.
         Opt-in via ``SFT_GLOBAL_TOKEN_LOSS_FNS``. No-op when labels are absent.
         """
         from arctic_platform.sft.processor import SFT_GLOBAL_TOKEN_LOSS_FNS
@@ -370,7 +371,8 @@ class DeepSpeedWorker:
             torch.distributed.all_reduce(tok, op=torch.distributed.ReduceOp.SUM)
             global_tokens = int(tok.item())
         meta_data["global_num_tokens"] = global_tokens
-        meta_data["dp_size"] = dp_sp_world_size(self.world_size, self.sp_size)
+        dp_sp_world_size(self.world_size, self.sp_size)
+        meta_data["dp_size"] = self.world_size
 
     def _forward_maybe_backward(self, batch: dict, backward: bool) -> dict:
         # torch.autograd.set_detect_anomaly(True)

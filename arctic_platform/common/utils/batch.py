@@ -78,7 +78,9 @@ def sp_size_from_job_config(job_config: Any) -> int:
     _record_sp_candidate(candidates, "ds_worker_config.sequence_parallel", worker, "sequence_parallel")
     _record_sp_candidate(candidates, "ds_worker_config.sequence_parallel_size", worker, "sequence_parallel_size")
     parallelism = worker.get("parallelism") if isinstance(worker, dict) else None
-    _record_sp_candidate(candidates, "ds_worker_config.parallelism.sequence_parallel", parallelism, "sequence_parallel")
+    _record_sp_candidate(
+        candidates, "ds_worker_config.parallelism.sequence_parallel", parallelism, "sequence_parallel"
+    )
 
     values = set(candidates.values())
     if len(values) > 1:
@@ -242,9 +244,10 @@ def reconstruct_position_ids_(batch_data: dict) -> None:
 def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
     """Split a batch across workers and stamp the DP loss scale.
 
-    ``dp_size`` is ``num_workers // sp_size``: DeepSpeed averages across DP
-    replicas, and each SP group is one replica. The payload is still cut into
-    ``num_workers`` shards so ``zip(workers, shards)`` stays 1:1.
+    The cutter produces ``num_workers`` disjoint shards, so ``dp_size`` is
+    ``num_workers`` until an SP data-plane replicates one shard across a group.
+    ``sp_size`` is still validated (must divide ``num_workers``).
+    ``zip(workers, shards)`` stays 1:1.
 
     Supports two wire shapes for ``batch["batch"]``:
       * **dict** of tensors (legacy / demos): one concatenated mini-batch, later
@@ -257,7 +260,8 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
 
     reorder_indices = None
     meta_data = dict(meta_data)
-    meta_data.update(dp_size=dp_sp_world_size(num_workers, sp_size))
+    dp_sp_world_size(num_workers, sp_size)
+    meta_data.update(dp_size=num_workers)
 
     if isinstance(batch_data, list):
         if not batch_data:
@@ -374,6 +378,21 @@ def merge_dict_shards(shards_list: list[dict]) -> dict:
 
 _METRIC_PAIR_SUM_SUFFIX = ".sum"
 _METRIC_PAIR_TOKENS_SUFFIX = ".tokens"
+_SUMMED_METRIC_PREFIXES = ("loss_term_",)
+_SUMMED_METRIC_SUFFIXES = ("_sum", "_count")
+
+
+def metric_is_summed(key: str) -> bool:
+    """Whether a scalar metric is additive across microbatches and DP ranks.
+
+    Objective-term contributions (``loss_term_*``) and token/sequence counts
+    (``*_count``, ``*_sum``) must be SUMMED. Averaging them misreports totals
+    whenever a call splits across packed microbatches, GAS, or DP ranks.
+
+    SFT pairing uses ``{name}.sum`` / ``{name}.tokens`` via the combiners below
+    and is not this helper.
+    """
+    return key.startswith(_SUMMED_METRIC_PREFIXES) or key.endswith(_SUMMED_METRIC_SUFFIXES)
 
 
 def combine_metric_shards(shards_list: list[dict]) -> dict:
@@ -450,6 +469,9 @@ def combine_metric_shards(shards_list: list[dict]) -> dict:
             if base in paired_bases:
                 continue
         if k in out:
+            continue
+        if metric_is_summed(k):
+            out[k] = total
             continue
         count = numeric_counts.get(k, 1)
         out[k] = total / count if count > 0 else total
@@ -528,7 +550,7 @@ def combine_metric_microbatches(per_microbatch_metric_dicts: list[dict]) -> dict
 
     out: dict = {}
     for k, total in numeric_totals.items():
-        if k in paired_keys:
+        if k in paired_keys or metric_is_summed(k):
             out[k] = total
         else:
             count = numeric_counts.get(k, 1)

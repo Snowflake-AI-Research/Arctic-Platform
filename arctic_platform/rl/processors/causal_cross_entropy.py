@@ -27,6 +27,7 @@ from arctic_platform.common.registry import register_loss_fn
 
 from .functional import _resolve_dp_size
 from .functional import canonicalize_loss_mask
+from .functional import resolve_global_loss_scale
 from .packed_reduction import PackedLossReduction
 from .packed_reduction import additive_packed_loss_reduction
 from .packed_reduction import local_mean_packed_loss_reduction
@@ -48,14 +49,19 @@ def _connected_zero(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _merge_distributed_config(config: dict, batch: dict, meta: dict) -> dict:
-    """Fill missing scale keys from meta/batch; config wins when set."""
+    """Cortex trio: context wins; both-present-and-unequal raises.
+
+    Stamped ``dp_size`` without ``batch_num_tokens`` is dropped so a server
+    stamp does not make every CCE call require a global denom.
+    """
+    context = {**meta, **batch}
+    scale = resolve_global_loss_scale(context, config)
     cfg = dict(config)
-    for key in ("dp_size", "batch_num_tokens"):
-        if cfg.get(key) is None:
-            if meta.get(key) is not None:
-                cfg[key] = meta[key]
-            elif batch.get(key) is not None:
-                cfg[key] = batch[key]
+    cfg.update(scale)
+    if cfg.get("batch_num_tokens") is None:
+        if config.get("dp_size") is not None:
+            raise ValueError("causal_cross_entropy config 'dp_size' requires 'batch_num_tokens'")
+        cfg.pop("dp_size", None)
     return cfg
 
 
@@ -84,9 +90,7 @@ def _validate_neutral_temperature(context: dict) -> None:
 def _validate_global_normalization(config: dict, local_weight_sum: float) -> tuple[float | None, int]:
     unknown_keys = set(config) - _ALLOWED_CONFIG_KEYS - _IGNORED_CONFIG_KEYS
     if unknown_keys:
-        raise ValueError(
-            f"Unknown config keys for loss_fn 'causal_cross_entropy': {sorted(unknown_keys)}"
-        )
+        raise ValueError(f"Unknown config keys for loss_fn 'causal_cross_entropy': {sorted(unknown_keys)}")
 
     global_weight_sum = config.get("batch_num_tokens")
     dp_size = config.get("dp_size")
@@ -114,8 +118,7 @@ def _validate_global_normalization(config: dict, local_weight_sum: float) -> tup
         or not float(dp_size).is_integer()
     ):
         raise ValueError(
-            "causal_cross_entropy config 'dp_size' must be a positive integer "
-            "when batch_num_tokens is supplied"
+            "causal_cross_entropy config 'dp_size' must be a positive integer when batch_num_tokens is supplied"
         )
     dp_size = int(dp_size)
 
@@ -152,9 +155,7 @@ def _validate_context_weights(context: dict, reference: torch.Tensor) -> torch.T
         if tuple(labels.shape) != tuple(weights.shape):
             raise ValueError("causal_cross_entropy labels must match loss_mask when labels are present")
         if ((labels.to(weights.device) == -100) & (weights > 0)).any().item():
-            raise ValueError(
-                "causal_cross_entropy loss_mask must be zero where labels use ignore_index=-100"
-            )
+            raise ValueError("causal_cross_entropy loss_mask must be zero where labels use ignore_index=-100")
     return weights
 
 
@@ -169,17 +170,13 @@ def _causal_cross_entropy_packed_reduction(
         reference = microbatch.get("input_ids")
         if not torch.is_tensor(reference):
             raise ValueError(
-                "causal_cross_entropy packed microbatch "
-                f"{index} requires tensor input_ids for preflight validation"
+                f"causal_cross_entropy packed microbatch {index} requires tensor input_ids for preflight validation"
             )
         loss_weights = _validate_context_weights(microbatch, reference)
         weights.append(float(loss_weights.sum(dtype=torch.float32).item()))
 
-    cfg = dict(config)
     first = microbatches[0] if microbatches else {}
-    for key in ("dp_size", "batch_num_tokens"):
-        if cfg.get(key) is None and first.get(key) is not None:
-            cfg[key] = first[key]
+    cfg = _merge_distributed_config(config, first, {})
     global_weight_sum, _ = _validate_global_normalization(cfg, sum(weights))
     if global_weight_sum is None:
         return local_mean_packed_loss_reduction(weights)
@@ -206,7 +203,7 @@ def causal_cross_entropy_loss(
     if logprobs is None:
         raise ValueError(
             "causal_cross_entropy requires model_outputs['logprobs']; configure "
-            "processing.post=['compute_logprobs']"
+            "processing.post=['cortex_compute_logprobs']"
         )
     if context.get("cu_seqlens") is not None:
         logprobs = _packed_singleton_to_1d(logprobs)

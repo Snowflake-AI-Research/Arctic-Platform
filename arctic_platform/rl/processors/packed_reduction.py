@@ -26,9 +26,8 @@ import torch
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import resolve_fn
+from arctic_platform.common.utils.batch import metric_is_summed
 
-_SUMMED_METRIC_PREFIXES = ("loss_term_",)
-_SUMMED_METRIC_SUFFIXES = ("_sum", "_count")
 _GLOBAL_SCALE_KEYS = ("dp_size", "batch_num_tokens", "global_batch_size")
 
 
@@ -45,20 +44,6 @@ class PackedLossReduction:
     loss_scales: tuple[float, ...]
     reporting_weights: tuple[float, ...]
     loss_is_additive: bool
-
-
-def metric_is_summed(key: str) -> bool:
-    """Whether a scalar metric is additive across packed microbatches.
-
-    Additive metrics — objective-term contributions (``loss_term_*``) and
-    token/sequence counts (``*_count``, ``*_sum``) — must be SUMMED when
-    microbatch results are combined. Averaging them would misreport totals
-    whenever a call splits into multiple microbatches.
-
-    SFT pairing uses a different convention (``{name}.sum`` / ``{name}.tokens``)
-    via ``combine_metric_microbatches`` and is not this helper.
-    """
-    return key.startswith(_SUMMED_METRIC_PREFIXES) or key.endswith(_SUMMED_METRIC_SUFFIXES)
 
 
 def _validated_packed_weights(weights: Sequence[float]) -> tuple[float, ...]:
@@ -119,11 +104,7 @@ def assert_aligned_global_loss_scales(microbatches: Sequence[dict]) -> None:
             have_other = _scale_value_present(microbatch, key)
             if not have_first and not have_other:
                 continue
-            if (
-                not have_first
-                or not have_other
-                or not _scale_values_equal(key, first[key], microbatch[key])
-            ):
+            if not have_first or not have_other or not _scale_values_equal(key, first[key], microbatch[key]):
                 raise ValueError(
                     f"packed microbatch {index} {key}={microbatch.get(key)!r} disagrees "
                     f"with microbatch 0 {key}={first.get(key)!r}"
@@ -149,6 +130,8 @@ def resolve_packed_loss_reduction(
     if n_mbs == 0:
         raise ValueError("packed loss reduction requires at least one microbatch")
 
+    # Packing replicates non-batch-dim keys, so this is a no-op on that path.
+    # It still catches hand-built or client-supplied microbatch lists.
     assert_aligned_global_loss_scales(microbatches)
 
     loss_fn_name = (processing or {}).get("loss_fn", "ap_grpo")
@@ -172,13 +155,9 @@ def resolve_packed_loss_reduction(
         loss_fn_name,
     )
     if not isinstance(reduction, PackedLossReduction):
-        raise TypeError(
-            f"loss_fn {loss_fn_name!r} packed reduction resolver must return PackedLossReduction"
-        )
+        raise TypeError(f"loss_fn {loss_fn_name!r} packed reduction resolver must return PackedLossReduction")
     if not (len(reduction.loss_scales) == len(reduction.reporting_weights) == n_mbs):
-        raise ValueError(
-            f"loss_fn {loss_fn_name!r} packed reduction metadata must contain {n_mbs} entries"
-        )
+        raise ValueError(f"loss_fn {loss_fn_name!r} packed reduction metadata must contain {n_mbs} entries")
     _validated_packed_weights(reduction.loss_scales)
     reporting_weights = _validated_packed_weights(reduction.reporting_weights)
     if sum(reporting_weights) == 0:
@@ -223,7 +202,7 @@ def combine_packed_metrics(
     if total_weight == 0:
         total_weight = float(n_metrics or 1)
         weights = (1.0,) * n_metrics
-    all_keys = {key for metrics in microbatch_metrics for key in (metrics or {})}
+    all_keys = {key for metrics in microbatch_metrics for key in metrics or {}}
     colliding = sorted(key for key in all_keys if f"{key}.sum" in all_keys)
     if colliding:
         raise ValueError(

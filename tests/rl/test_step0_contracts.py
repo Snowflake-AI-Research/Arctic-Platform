@@ -1,5 +1,17 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Step-0 contracts: arity, isolation, packed inner call, decorator storage."""
 
@@ -12,7 +24,6 @@ import torch
 
 import arctic_platform.rl.processors  # noqa: F401  # populate registries
 import arctic_platform.sft.processor  # noqa: F401
-
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import POST_PROCESSORS
@@ -249,7 +260,8 @@ class TestGrpoContracts(TestCasePlus):
     def test_cispo_cpu(self):
         loss, metrics = grpo_loss(self._out(), self._ctx(), {}, {"use_cispo_loss": True}, "cpu")
         self.assertTrue(torch.isfinite(loss))
-        self.assertIn("loss", metrics)
+        self.assertIn("clip_ratio", metrics)
+        self.assertNotIn("loss", metrics)
 
     def test_dp_size_from_meta_not_config(self):
         outputs = {"logprobs": torch.zeros(2, 3)}

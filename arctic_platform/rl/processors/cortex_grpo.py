@@ -41,6 +41,9 @@ def _cortex_distributed_config(config: dict, batch: dict, meta: dict) -> tuple[d
     scale = resolve_global_loss_scale(context, config)
     cfg = dict(config)
     cfg.update(scale)
+    has_global_denom = cfg.get("batch_num_tokens") is not None or cfg.get("global_batch_size") is not None
+    if not has_global_denom and config.get("dp_size") is None:
+        cfg.pop("dp_size", None)
     return cfg, context
 
 
@@ -75,12 +78,8 @@ def cortex_grpo_echo_v1_loss(
     config, context = _cortex_distributed_config(config, batch, meta)
     unknown_keys = set(config) - _GRPO_CONFIG_KEYS - _ECHO_CONFIG_KEYS
     if unknown_keys:
-        raise ValueError(
-            f"Unknown config keys for loss_fn 'cortex_grpo_echo_v1': {sorted(unknown_keys)}"
-        )
+        raise ValueError(f"Unknown config keys for loss_fn 'cortex_grpo_echo_v1': {sorted(unknown_keys)}")
     missing_keys = {key for key in _ECHO_REQUIRED_CONFIG_KEYS if config.get(key) is None}
     if missing_keys:
-        raise ValueError(
-            f"loss_fn 'cortex_grpo_echo_v1' requires non-None config keys {sorted(missing_keys)}"
-        )
+        raise ValueError(f"loss_fn 'cortex_grpo_echo_v1' requires non-None config keys {sorted(missing_keys)}")
     return _grpo_loss(model_outputs, context, config, device)

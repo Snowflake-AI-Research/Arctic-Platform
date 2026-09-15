@@ -26,6 +26,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from arctic_platform.common.utils.batch import BATCH_DIM_CONTEXT_KEYS
+
 DEFAULT_MAX_TOKENS_PER_MB = 10240
 
 
@@ -149,9 +151,14 @@ def split_padded_tensor_dict_into_mb_list(data: dict, mb_spec: MicroBatchSpec, g
     for key, value in data.items():
         if key in multimodal_keys:
             continue
-        # Split any tensor whose leading dim is the batch: [B, S, ...] token
-        # rows and length-[B] per-sequence vectors (sequence_loss_weights, ...).
-        if key == "position_ids" or (torch.is_tensor(value) and value.ndim >= 1 and value.shape[0] == bs):
+        # Token rows: [B, S, ...] with numel == B * max_seqlen. Per-sequence
+        # vectors: known length-[B] keys only (do not split every 1-D tensor
+        # whose length happens to equal B).
+        is_token_row = torch.is_tensor(value) and value.numel() == bs * max_seqlen
+        is_per_sequence = (
+            key in BATCH_DIM_CONTEXT_KEYS and torch.is_tensor(value) and value.ndim >= 1 and value.shape[0] == bs
+        )
+        if key == "position_ids" or is_token_row or is_per_sequence:
             to_split[key] = value
         else:
             not_to_split[key] = value
