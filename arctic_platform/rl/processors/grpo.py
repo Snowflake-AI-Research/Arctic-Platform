@@ -753,12 +753,12 @@ def _grpo_packed_loss_reduction(
         )
 
     if (
-        loss_fn_name == "grpo_echo_v1"
+        loss_fn_name.endswith("grpo_echo_v1")
         and len(microbatches) > 1
         and not reduction.loss_is_additive
     ):
         raise ValueError(
-            "loss_fn 'grpo_echo_v1' requires a globally normalized additive "
+            f"loss_fn {loss_fn_name!r} requires a globally normalized additive "
             "policy objective when split into multiple packed microbatches"
         )
     return reduction
@@ -787,7 +787,7 @@ def _grpo_context(batch: dict, meta: dict) -> dict:
     return context
 
 
-@register_loss_fn("grpo", packed_loss_reduction=_grpo_packed_loss_reduction)
+@register_loss_fn("ap_grpo", packed_loss_reduction=_grpo_packed_loss_reduction)
 def grpo_loss(
     model_outputs: dict,
     batch: dict,
@@ -807,15 +807,15 @@ def grpo_loss(
     echo_keys = _ECHO_CONFIG_KEYS & set(config)
     if echo_keys:
         raise ValueError(
-            f"loss_fn 'grpo' does not accept ECHO config keys {sorted(echo_keys)} — request "
-            "loss_fn 'grpo_echo_v1', whose strict schema fails loudly on typos and on servers "
+            f"loss_fn 'ap_grpo' does not accept ECHO config keys {sorted(echo_keys)} — request "
+            "loss_fn 'ap_grpo_echo_v1', whose strict schema fails loudly on typos and on servers "
             "without ECHO support."
         )
     return _grpo_loss(model_outputs, _grpo_context(batch, meta), config, device)
 
 
 @register_loss_fn(
-    "grpo_echo_v1",
+    "ap_grpo_echo_v1",
     packed_loss_reduction=_grpo_packed_loss_reduction,
 )
 def grpo_echo_v1_loss(
@@ -844,7 +844,7 @@ def grpo_echo_v1_loss(
     unknown_keys = set(config) - _GRPO_CONFIG_KEYS - _ECHO_CONFIG_KEYS
     if unknown_keys:
         raise ValueError(
-            f"Unknown config keys for loss_fn 'grpo_echo_v1': {sorted(unknown_keys)} — this "
+            f"Unknown config keys for loss_fn 'ap_grpo_echo_v1': {sorted(unknown_keys)} — this "
             "contract fails loudly on unrecognized keys so a typo cannot silently disable an "
             "objective."
         )
@@ -853,7 +853,7 @@ def grpo_echo_v1_loss(
     missing_keys = {key for key in _ECHO_REQUIRED_CONFIG_KEYS if config.get(key) is None}
     if missing_keys:
         raise ValueError(
-            f"loss_fn 'grpo_echo_v1' requires non-None config keys {sorted(missing_keys)} — "
-            "use plain 'grpo' for runs without the ECHO objective."
+            f"loss_fn 'ap_grpo_echo_v1' requires non-None config keys {sorted(missing_keys)} — "
+            "use plain 'ap_grpo' for runs without the ECHO objective."
         )
     return _grpo_loss(model_outputs, _grpo_context(batch, meta), config, device)

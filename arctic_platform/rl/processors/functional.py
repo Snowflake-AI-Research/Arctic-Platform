@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
 from enum import Enum
 from typing import Optional
 
 import numpy as np
 import torch
 import torch.distributed as dist
+
+_GLOBAL_LOSS_SCALE_KEYS = ("dp_size", "batch_num_tokens", "global_batch_size")
 
 
 def _masked_values(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -147,6 +150,41 @@ def _resolve_dp_size(dp_size: Optional[int], batch_num_tokens: Optional[float]) 
             "data-parallel factor."
         )
     return 1 if dp_size is None else dp_size
+
+
+def _scale_value_present(bag: dict | None, key: str) -> bool:
+    return bag is not None and key in bag and bag[key] is not None
+
+
+def _scale_values_equal(key: str, left, right) -> bool:
+    if key == "batch_num_tokens":
+        try:
+            return math.isclose(float(left), float(right), rel_tol=1e-6, abs_tol=1e-9)
+        except (TypeError, ValueError):
+            return left == right
+    return left == right
+
+
+def resolve_global_loss_scale(
+    context: Optional[dict],
+    config: Optional[dict],
+) -> dict:
+    """Cortex trio: context wins. Both present and unequal raises.
+
+    Missing keys are omitted so callers can tell a global denominator from a
+    local fallback. AP's ``_merge_distributed_config`` is the opposite (config wins).
+    """
+    out: dict = {}
+    for key in _GLOBAL_LOSS_SCALE_KEYS:
+        have_ctx = _scale_value_present(context, key)
+        have_cfg = _scale_value_present(config, key)
+        if have_ctx and have_cfg and not _scale_values_equal(key, context[key], config[key]):
+            raise ValueError(f"conflicting {key}: context={context[key]!r} config={config[key]!r}")
+        if have_ctx:
+            out[key] = context[key]
+        elif have_cfg:
+            out[key] = config[key]
+    return out
 
 
 def agg_loss(

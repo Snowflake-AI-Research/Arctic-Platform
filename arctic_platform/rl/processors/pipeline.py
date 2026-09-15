@@ -372,7 +372,7 @@ def run_pipeline(
     tname_e2e = timers.start(f"run_pipeline e2e {engine.global_rank}")
     see_memory_usage("before fwd", force=True)
     post_names = processing.get("post", [])
-    loss_fn_name = processing.get("loss_fn", "grpo")
+    loss_fn_name = processing.get("loss_fn", "ap_grpo")
     config = processing.get("config", {})
 
     # Skip entropy computation when it cannot affect the loss (entropy_coeff == 0).
@@ -776,7 +776,7 @@ def fast_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy):
     return logprobs, entropy
 
 
-@register_post_processor("compute_logprobs")
+@register_post_processor("ap_compute_logprobs")
 @register_post_processor("compute_entropy_and_logprobs")
 def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: dict, device: str) -> dict:
     """Compute per-token log-probs from logits using torch.roll convention.
@@ -855,10 +855,6 @@ def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: di
     # timers.stop_and_print_elapsed(tname_e2e)
 
     return processor_outputs
-
-
-# Zone name: same callable as compute_entropy_and_logprobs.
-compute_logprobs_post = compute_entropy_and_logprobs_post
 
 
 @register_post_processor("compute_entropy")

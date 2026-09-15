@@ -178,5 +178,5 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
         "args": (),
         "kwargs": kwargs_out,
         "context": {"input_ids": input_ids, "advantages": advantages, "loss_mask": loss_mask},
-        "processing": {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": proc_config},
+        "processing": {"post": ["cortex_compute_logprobs"], "loss_fn": "cortex_grpo", "config": proc_config},
     }

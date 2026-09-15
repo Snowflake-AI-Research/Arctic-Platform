@@ -67,7 +67,7 @@ class TestSplitDictRemainder(TestCasePlus):
                 "attention_mask": torch.ones(4, 2, dtype=torch.long),
             },
             "meta": {"rollout_is_weights": weights, "advantages": advantages, "dp_size": 2},
-            "processing": {"loss_fn": "grpo"},
+            "processing": {"loss_fn": "ap_grpo"},
         }
         shards, _ = _split_batch(envelope, num_workers=2)
         self.assertNotIn("rollout_is_weights", shards[0]["meta"])
@@ -91,7 +91,7 @@ class TestSplitDictRemainder(TestCasePlus):
                 "prompt_group_ids": torch.tensor([7, 7, 8, 8]),
                 "max_prompt_len": 3,
             },
-            "processing": {"loss_fn": "grpo"},
+            "processing": {"loss_fn": "ap_grpo"},
         }
         _, batch_data, meta_data, _ = unpack_batch(envelope)
         self.assertIn("advantages", batch_data)
@@ -112,7 +112,7 @@ class TestDpSizeDividesBySp(TestCasePlus):
                 "attention_mask": torch.ones(8, 2, dtype=torch.long),
             },
             "meta": {},
-            "processing": {"loss_fn": "grpo"},
+            "processing": {"loss_fn": "ap_grpo"},
         }
 
     def test_dp_sp_world_size(self):

@@ -151,7 +151,7 @@ def resolve_packed_loss_reduction(
 
     assert_aligned_global_loss_scales(microbatches)
 
-    loss_fn_name = (processing or {}).get("loss_fn", "grpo")
+    loss_fn_name = (processing or {}).get("loss_fn", "ap_grpo")
     if loss_fn_name is None:
         return local_mean_packed_loss_reduction((1.0,) * n_mbs)
 

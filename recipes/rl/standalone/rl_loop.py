@@ -291,7 +291,7 @@ def build_config(config: Config):
 
 def processing_block(config: Config, global_batch_size: int) -> dict:
     return dict(
-        loss_fn="grpo",
+        loss_fn="ap_grpo",
         config=dict(
             eps_clip=config.eps_clip,
             loss_agg_mode=config.loss_agg_mode,
