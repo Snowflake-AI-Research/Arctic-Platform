@@ -41,8 +41,10 @@ from deepspeed.accelerator import get_accelerator
 
 from arctic_platform.common.ray_cluster import primary_ip
 from arctic_platform.common.utils import combine_metric_microbatches
+from arctic_platform.common.utils import dp_sp_world_size
 from arctic_platform.common.utils import log_dp_shard_tokens
 from arctic_platform.common.utils import merge_dict_shards
+from arctic_platform.common.utils import sp_size_from_job_config
 from arctic_platform.common.utils import split_dict
 from arctic_platform.common.utils import unpack_batch
 from arctic_platform.common.utils.debug import enable_full_determinism
@@ -115,6 +117,7 @@ class DeepSpeedWorker:
         self.master_addr = primary_ip()
         self.master_port = master_port
         self.engine = None
+        self.sp_size = 1
         self._weight_sender = None
         self._on_gpu = True
 
@@ -163,6 +166,7 @@ class DeepSpeedWorker:
         ds_worker_config = job_config.get("ds_worker_config") or {}
         ds_worker_config["world_size"] = self.world_size
         self.ds_worker_config = ds_worker_config
+        self.sp_size = sp_size_from_job_config(job_config)
 
         # Build the DeepSpeed config per job type. Training engines get an
         # optimizer; the reference/log-prob engine is forward-only and is
@@ -347,6 +351,8 @@ class DeepSpeedWorker:
     def _inject_sft_global_token_meta(self, loss_fn: str, batch_data, meta_data: dict) -> None:
         """All-reduce valid-target count into ``meta["global_num_tokens"]`` + ``dp_size``.
 
+        ``dp_size`` is ``world_size`` while shards stay disjoint. ``sp_size`` is
+        still validated against ``world_size``.
         Opt-in via ``SFT_GLOBAL_TOKEN_LOSS_FNS``. No-op when labels are absent.
         """
         from arctic_platform.sft.processor import SFT_GLOBAL_TOKEN_LOSS_FNS
@@ -365,6 +371,7 @@ class DeepSpeedWorker:
             torch.distributed.all_reduce(tok, op=torch.distributed.ReduceOp.SUM)
             global_tokens = int(tok.item())
         meta_data["global_num_tokens"] = global_tokens
+        dp_sp_world_size(self.world_size, self.sp_size)
         meta_data["dp_size"] = self.world_size
 
     def _forward_maybe_backward(self, batch: dict, backward: bool) -> dict:

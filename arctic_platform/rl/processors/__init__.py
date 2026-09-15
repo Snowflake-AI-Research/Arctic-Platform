@@ -47,6 +47,9 @@ from .grpo import _internal_grpo_loss_fn
 from .grpo import _resolve_proximal_logp
 from .grpo import _tensor_scalar_stats
 from .grpo import compute_prox_logp_approximations
+from .cortex_grpo import cortex_grpo_echo_v1_loss
+from .cortex_grpo import cortex_grpo_loss
+from .grpo import grpo_echo_v1_loss
 from .grpo import grpo_loss
 
 # Micro-batch splitting
@@ -76,9 +79,21 @@ from .pipeline import POST_PROCESSORS
 from .pipeline import _resolve_fn
 from .pipeline import compute_entropy_and_logprobs_post
 from .pipeline import identity_post
+from .pipeline import metric_is_summed
 from .pipeline import register_loss_fn
 from .pipeline import register_post_processor
 from .pipeline import run_pipeline
+
+# Cortex compute_logprobs (importing registers the zone post; not an AP alias)
+from .compute_logprobs import compute_logprobs_post
+
+# Packed apply + CCE (importing registers causal_cross_entropy)
+from .causal_cross_entropy import causal_cross_entropy_loss
+from .packed_reduction import PackedLossReduction
+from .packed_reduction import apply_packed_loss_reduction
+from .packed_reduction import combine_packed_losses
+from .packed_reduction import combine_packed_metrics
+from .packed_reduction import resolve_packed_loss_reduction
 
 # SFT loss + pipeline (importing registers "sft" / "sft_ce" into LOSS_FNS)
 from .sft import LOGIT_LOSS_FNS
@@ -112,6 +127,14 @@ __all__ = [
     "run_pipeline",
     "identity_post",
     "compute_entropy_and_logprobs_post",
+    "compute_logprobs_post",
+    "metric_is_summed",
+    "PackedLossReduction",
+    "apply_packed_loss_reduction",
+    "combine_packed_losses",
+    "combine_packed_metrics",
+    "resolve_packed_loss_reduction",
+    "causal_cross_entropy_loss",
     # packing
     "N_TOKENS_PER_PAGE",
     "_align",
@@ -162,6 +185,9 @@ __all__ = [
     "PROX_APPROX_METHOD_ROLLOUT",
     "PROX_APPROX_METHODS_ALL",
     "grpo_loss",
+    "grpo_echo_v1_loss",
+    "cortex_grpo_loss",
+    "cortex_grpo_echo_v1_loss",
     "sft_loss",
     "sft_ce_loss",
     "LOGIT_LOSS_FNS",

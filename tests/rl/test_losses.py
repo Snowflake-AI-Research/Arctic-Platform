@@ -266,51 +266,52 @@ class TestGrpoLoss(TestCasePlus):
         return {"logprobs": torch.randn(batch_size, seq_len, generator=torch.Generator().manual_seed(1))}
 
     def test_default_config_returns_scalar_and_metrics(self):
-        loss, metrics = grpo_loss(self._outputs(), self._context(), {}, "cpu")
+        loss, metrics = grpo_loss(self._outputs(), self._context(), {}, {}, "cpu")
         self.assertEqual(loss.ndim, 0)
         self.assertTrue(torch.isfinite(loss))
-        for key in ("approx_kl", "importance_weight", "clip_ratio", "entropy", "loss"):
+        for key in ("approx_kl", "importance_weight", "clip_ratio", "entropy"):
             self.assertIn(key, metrics)
+        self.assertNotIn("loss", metrics)
 
     def test_all_loss_agg_modes(self):
         for mode in ("token-mean", "seq-mean-token-sum", "seq-mean-token-sum-norm", "seq-mean-token-mean"):
-            loss, _ = grpo_loss(self._outputs(), self._context(), {"loss_agg_mode": mode}, "cpu")
+            loss, _ = grpo_loss(self._outputs(), self._context(), {}, {"loss_agg_mode": mode}, "cpu")
             self.assertTrue(torch.isfinite(loss), mode)
 
     def test_entropy_bonus_changes_loss(self):
         outputs, context = self._outputs(), self._context()
-        base, _ = grpo_loss(outputs, context, {}, "cpu")
-        bonus, _ = grpo_loss(outputs, context, {"entropy_coeff": 0.1}, "cpu")
+        base, _ = grpo_loss(outputs, context, {}, {}, "cpu")
+        bonus, _ = grpo_loss(outputs, context, {}, {"entropy_coeff": 0.1}, "cpu")
         self.assertNotAlmostEqual(base.item(), bonus.item(), places=6)
 
     def test_kl_loss_branch(self):
         context = self._context(ref_log_probs_shifted=torch.randn(2, 3, generator=torch.Generator().manual_seed(2)))
-        loss, _ = grpo_loss(self._outputs(), context, {"use_kl_loss": True, "kl_loss_coef": 0.1}, "cpu")
+        loss, _ = grpo_loss(self._outputs(), context, {}, {"use_kl_loss": True, "kl_loss_coef": 0.1}, "cpu")
         self.assertTrue(torch.isfinite(loss))
 
     def test_kl_loss_without_reference_raises(self):
         with self.assertRaises(ValueError):
-            grpo_loss(self._outputs(), self._context(), {"use_kl_loss": True}, "cpu")
+            grpo_loss(self._outputs(), self._context(), {}, {"use_kl_loss": True}, "cpu")
 
     def test_sapo_branch(self):
-        loss, _ = grpo_loss(self._outputs(), self._context(), {"use_sapo_loss": True}, "cpu")
+        loss, _ = grpo_loss(self._outputs(), self._context(), {}, {"use_sapo_loss": True}, "cpu")
         self.assertTrue(torch.isfinite(loss))
 
     def test_sapo_with_decoupled_raises(self):
         with self.assertRaises(ValueError):
-            grpo_loss(self._outputs(), self._context(), {"use_sapo_loss": True, "use_decoupled_loss": True}, "cpu")
+            grpo_loss(self._outputs(), self._context(), {}, {"use_sapo_loss": True, "use_decoupled_loss": True}, "cpu")
 
     def test_dual_clip_and_behav_cap_config(self):
         config = {"c_clip": 3.0, "behav_imp_weight_cap": 2.0, "eps_clip_higher": 0.3}
-        loss, _ = grpo_loss(self._outputs(), self._context(), config, "cpu")
+        loss, _ = grpo_loss(self._outputs(), self._context(), {}, config, "cpu")
         self.assertTrue(torch.isfinite(loss))
 
     def test_sequence_importance_sampling_config(self):
-        loss, _ = grpo_loss(self._outputs(), self._context(), {"importance_sampling_level": "sequence"}, "cpu")
+        loss, _ = grpo_loss(self._outputs(), self._context(), {}, {"importance_sampling_level": "sequence"}, "cpu")
         self.assertTrue(torch.isfinite(loss))
 
     def test_m2po_masking_config(self):
-        loss, _ = grpo_loss(self._outputs(), self._context(), {"m2_threshold": 0.5}, "cpu")
+        loss, _ = grpo_loss(self._outputs(), self._context(), {}, {"m2_threshold": 0.5}, "cpu")
         self.assertTrue(torch.isfinite(loss))
 
     def test_logits_fallback_path(self):
@@ -318,5 +319,5 @@ class TestGrpoLoss(TestCasePlus):
         batch_size, seq_len, vocab = 2, 3, 7
         outputs = {"logits": torch.randn(batch_size, seq_len, vocab, generator=torch.Generator().manual_seed(3))}
         context = self._context(batch_size, seq_len, input_ids=torch.randint(0, vocab, (batch_size, seq_len)))
-        loss, _ = grpo_loss(outputs, context, {}, "cpu")
+        loss, _ = grpo_loss(outputs, context, {}, {}, "cpu")
         self.assertTrue(torch.isfinite(loss))
