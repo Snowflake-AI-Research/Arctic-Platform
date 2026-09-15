@@ -5,7 +5,7 @@
 # Pre-reqs (see README.md):
 #   1. SkyRL cloned at skyrl-v0.3.0 with SKYRL_HOME exported.
 #   2. ARCTIC_CORTEX_* env vars set (see README.md step 2).
-#   3. Data: `python download_data.py` -> $DATA_DIR/{train,validation}.parquet.
+#   3. Data: README.md step 3 -> $DATA_DIR/{train,validation}.parquet.
 #
 # Python deps resolve through `uv run --isolated` below, the same pattern
 # upstream's integrations/arctic_rl/examples/ launchers use. There is no conda
@@ -131,25 +131,22 @@ VAL_FILES="${DATA_DIR}/validation.parquet"
 
 if [[ ! -f "${TRAIN_FILES}" || ! -f "${VAL_FILES}" ]]; then
     echo "ERROR: SkyRL parquets not found under ${DATA_DIR}."
-    echo "       Run: python ../simple_gsm8k/download_data.py --output_dir ${DATA_DIR}"
+    echo "       Run: uv run --isolated --no-project --with datasets \\"
+    echo "              python ../simple_gsm8k/download_data.py --output_dir ${DATA_DIR}"
     exit 1
 fi
 
 # Pre-flight: refuse to launch on a verl-shaped parquet (missing reward_spec
 # or env_class) — SkyRL's env would silently score every rollout 0.0 with the
 # wrong field names.
-python - <<PY || exit 1
+#
+# Runs under uv for the same reason the training invocation does: there is no
+# environment to activate, so the ambient shell is not expected to import
+# pandas. pyarrow is the parquet engine and is not implied by pandas.
+uv run --isolated --no-project --with pandas --with pyarrow python - <<PY || exit 1
 import sys
 
-try:
-    import pandas as pd
-except ModuleNotFoundError:
-    # Bare \`python\` is also what launches the run below, so a shell that can't
-    # import pandas can't train either. Say that instead of raising here.
-    print("ERROR: this shell's \`python\` cannot import pandas, so it is not the")
-    print("       environment arctic-platform was installed into. Activate it;")
-    print("       see step 1 in README.md.")
-    sys.exit(1)
+import pandas as pd
 
 cols = set(pd.read_parquet("${TRAIN_FILES}").columns)
 missing = {"reward_spec", "env_class"} - cols
