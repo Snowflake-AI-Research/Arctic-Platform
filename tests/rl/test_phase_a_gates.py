@@ -23,6 +23,9 @@ from arctic_platform.common.registry import _is_public_registry_name
 from arctic_platform.common.registry import register_loss_fn
 from arctic_platform.common.registry import register_post_processor
 from arctic_platform.rl.processors.causal_cross_entropy import causal_cross_entropy_loss
+from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
+from arctic_platform.rl.processors.cortex_grpo import cortex_grpo_loss
+from arctic_platform.rl.processors.grpo import grpo_loss
 from arctic_platform.rl.processors.packed_reduction import apply_packed_loss_reduction
 from arctic_platform.rl.processors.packed_reduction import combine_packed_losses
 from arctic_platform.rl.processors.packed_reduction import combine_packed_metrics
@@ -41,29 +44,29 @@ class TestA1RegistryHygiene(TestCasePlus):
         self.assertEqual(public_posts, PUBLIC_POST_PROCESSORS)
 
     def test_same_fn_reregister_is_idempotent(self):
-        fn = LOSS_FNS["grpo"]
-        register_loss_fn("grpo")(fn)
-        self.assertIs(LOSS_FNS["grpo"], fn)
+        fn = LOSS_FNS["ap_grpo"]
+        register_loss_fn("ap_grpo")(fn)
+        self.assertIs(LOSS_FNS["ap_grpo"], fn)
 
     def test_same_fn_conflicting_packed_reduction_raises(self):
-        fn = LOSS_FNS["grpo"]
+        fn = LOSS_FNS["ap_grpo"]
 
         def other_reduction(microbatches, config, loss_fn_name):
             raise AssertionError("must not replace the GRPO resolver")
 
         with self.assertRaises(ValueError):
-            register_loss_fn("grpo", packed_loss_reduction=other_reduction)(fn)
-        self.assertIs(getattr(fn, PACKED_LOSS_REDUCTION_ATTR), getattr(LOSS_FNS["grpo"], PACKED_LOSS_REDUCTION_ATTR))
+            register_loss_fn("ap_grpo", packed_loss_reduction=other_reduction)(fn)
+        self.assertIs(getattr(fn, PACKED_LOSS_REDUCTION_ATTR), getattr(LOSS_FNS["ap_grpo"], PACKED_LOSS_REDUCTION_ATTR))
 
     def test_public_name_overwrite_raises(self):
-        original = LOSS_FNS["grpo"]
+        original = LOSS_FNS["ap_grpo"]
 
         def other(model_outputs, batch, meta, config, device):
             return model_outputs["logprobs"].sum(), {}
 
         with self.assertRaises(ValueError):
-            register_loss_fn("grpo")(other)
-        self.assertIs(LOSS_FNS["grpo"], original)
+            register_loss_fn("ap_grpo")(other)
+        self.assertIs(LOSS_FNS["ap_grpo"], original)
 
     def test_underscore_name_may_overwrite(self):
         @register_post_processor("_phase_a_tmp")
@@ -90,13 +93,13 @@ class TestA3PackedApply(TestCasePlus):
     def test_token_mean_local_and_additive(self):
         mbs = [self._mb(4, 4), self._mb(4, 2)]
         local = resolve_packed_loss_reduction(
-            {"loss_fn": "grpo", "config": {"loss_agg_mode": "token-mean"}},
+            {"loss_fn": "ap_grpo", "config": {"loss_agg_mode": "token-mean"}},
             mbs,
         )
         self.assertFalse(local.loss_is_additive)
         self.assertEqual(len(local.loss_scales), 2)
         additive = resolve_packed_loss_reduction(
-            {"loss_fn": "grpo", "config": {"loss_agg_mode": "token-mean", "batch_num_tokens": 6}},
+            {"loss_fn": "ap_grpo", "config": {"loss_agg_mode": "token-mean", "batch_num_tokens": 6}},
             mbs,
         )
         self.assertTrue(additive.loss_is_additive)
@@ -106,14 +109,14 @@ class TestA3PackedApply(TestCasePlus):
         mb = self._mb(4, 4)
         mb["batch_num_tokens"] = 4
         reduction = resolve_packed_loss_reduction(
-            {"loss_fn": "grpo", "config": {"loss_agg_mode": "token-mean"}},
+            {"loss_fn": "ap_grpo", "config": {"loss_agg_mode": "token-mean"}},
             [mb],
         )
         self.assertTrue(reduction.loss_is_additive)
 
     def test_sequence_mean_uses_active_counts(self):
         reduction = resolve_packed_loss_reduction(
-            {"loss_fn": "grpo", "config": {"loss_agg_mode": "seq-mean-token-mean"}},
+            {"loss_fn": "ap_grpo", "config": {"loss_agg_mode": "seq-mean-token-mean"}},
             [
                 {"input_ids": torch.ones(2, 2, dtype=torch.long), "loss_mask": torch.tensor([[1, 0], [1, 1]])},
                 {"input_ids": torch.ones(2, 2, dtype=torch.long), "loss_mask": torch.tensor([[0, 0], [1, 0]])},
@@ -125,7 +128,7 @@ class TestA3PackedApply(TestCasePlus):
     def test_prompt_mean_without_weights_rejects_split(self):
         with self.assertRaises(ValueError):
             resolve_packed_loss_reduction(
-                {"loss_fn": "grpo", "config": {"loss_agg_mode": "prompt-mean"}},
+                {"loss_fn": "ap_grpo", "config": {"loss_agg_mode": "prompt-mean"}},
                 [self._mb(2, 2), self._mb(2, 2)],
             )
 
@@ -135,7 +138,7 @@ class TestA3PackedApply(TestCasePlus):
         mb1 = self._mb(2, 2)
         mb1["sequence_loss_weights"] = torch.tensor([1.5])
         reduction = resolve_packed_loss_reduction(
-            {"loss_fn": "grpo", "config": {"loss_agg_mode": "prompt-mean"}},
+            {"loss_fn": "ap_grpo", "config": {"loss_agg_mode": "prompt-mean"}},
             [mb0, mb1],
         )
         self.assertTrue(reduction.loss_is_additive)
@@ -148,7 +151,7 @@ class TestA3PackedApply(TestCasePlus):
         mb1["batch_num_tokens"] = 8.0
         with self.assertRaises(ValueError):
             resolve_packed_loss_reduction(
-                {"loss_fn": "grpo", "config": {"loss_agg_mode": "token-mean"}},
+                {"loss_fn": "ap_grpo", "config": {"loss_agg_mode": "token-mean"}},
                 [mb0, mb1],
             )
 
@@ -244,10 +247,55 @@ class TestA4Metrics(TestCasePlus):
 
 
 class TestA5Compat(TestCasePlus):
-    def test_zone_names_resolve(self):
-        self.assertIn("compute_logprobs", POST_PROCESSORS)
-        self.assertIs(POST_PROCESSORS["compute_logprobs"], POST_PROCESSORS["compute_entropy_and_logprobs"])
+    def test_union_registry_prefixes_nonidentical_names(self):
+        self.assertNotIn("grpo", LOSS_FNS)
+        self.assertNotIn("compute_logprobs", POST_PROCESSORS)
+        self.assertIn("ap_grpo", LOSS_FNS)
+        self.assertIn("cortex_grpo", LOSS_FNS)
+        self.assertIsNot(LOSS_FNS["ap_grpo"], LOSS_FNS["cortex_grpo"])
+        self.assertIn("ap_compute_logprobs", POST_PROCESSORS)
+        self.assertIn("cortex_compute_logprobs", POST_PROCESSORS)
+        self.assertIs(POST_PROCESSORS["ap_compute_logprobs"], POST_PROCESSORS["compute_entropy_and_logprobs"])
+        self.assertIsNot(POST_PROCESSORS["cortex_compute_logprobs"], POST_PROCESSORS["ap_compute_logprobs"])
         self.assertIs(LOSS_FNS["causal_cross_entropy"], causal_cross_entropy_loss)
+
+    def test_cortex_compute_logprobs_prefers_labels_and_zeros_ignore_index(self):
+        logits = torch.tensor([[[2.0, 0.0, -1.0], [0.0, 2.0, -1.0], [-1.0, 0.0, 2.0]]])
+        input_ids = torch.tensor([[0, 0, 0]])
+        labels = torch.tensor([[1, 2, -100]])
+        out = compute_logprobs_post(
+            {"logits": logits},
+            {"input_ids": input_ids, "labels": labels},
+            {},
+            "cpu",
+        )
+        expected = (
+            torch.log_softmax(logits.float(), dim=-1)
+            .gather(-1, labels.masked_fill(labels == -100, 0).unsqueeze(-1))
+            .squeeze(-1)
+        )
+        expected[:, -1] = 0
+        self.assertTrue(torch.allclose(out["logprobs"], expected))
+
+    def test_cortex_compute_logprobs_passes_through_precomputed(self):
+        precomputed = torch.randn(2, 4)
+        out = compute_logprobs_post({"logprobs": precomputed}, {"input_ids": torch.arange(8).view(2, 4)}, {}, "cpu")
+        self.assertEqual(out, {})
+
+    def test_ap_config_wins_cortex_context_conflict_raises(self):
+        logprobs = torch.tensor([[-1.0, -2.0]], requires_grad=True)
+        batch = {
+            "input_ids": torch.tensor([[1, 2]]),
+            "old_log_probs_shifted": logprobs.detach(),
+            "advantages": torch.ones(1, 2),
+            "loss_mask": torch.ones(1, 2, dtype=torch.bool),
+        }
+        meta = {"dp_size": 2, "batch_num_tokens": 4.0}
+        config = {"dp_size": 1, "batch_num_tokens": 4.0}
+        ap_loss, _ = grpo_loss({"logprobs": logprobs}, batch, meta, config, "cpu")
+        self.assertTrue(torch.isfinite(ap_loss))
+        with self.assertRaises(ValueError):
+            cortex_grpo_loss({"logprobs": logprobs}, batch, meta, config, "cpu")
 
     def test_causal_cross_entropy_is_five_arg(self):
         import inspect

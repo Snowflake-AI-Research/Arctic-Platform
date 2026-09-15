@@ -47,6 +47,8 @@ from .grpo import _internal_grpo_loss_fn
 from .grpo import _resolve_proximal_logp
 from .grpo import _tensor_scalar_stats
 from .grpo import compute_prox_logp_approximations
+from .cortex_grpo import cortex_grpo_echo_v1_loss
+from .cortex_grpo import cortex_grpo_loss
 from .grpo import grpo_echo_v1_loss
 from .grpo import grpo_loss
 
@@ -76,12 +78,14 @@ from .pipeline import LOSS_FNS
 from .pipeline import POST_PROCESSORS
 from .pipeline import _resolve_fn
 from .pipeline import compute_entropy_and_logprobs_post
-from .pipeline import compute_logprobs_post
 from .pipeline import identity_post
 from .pipeline import metric_is_summed
 from .pipeline import register_loss_fn
 from .pipeline import register_post_processor
 from .pipeline import run_pipeline
+
+# Cortex compute_logprobs (importing registers the zone post; not an AP alias)
+from .compute_logprobs import compute_logprobs_post
 
 # Packed apply + CCE (importing registers causal_cross_entropy)
 from .causal_cross_entropy import causal_cross_entropy_loss
@@ -182,6 +186,8 @@ __all__ = [
     "PROX_APPROX_METHODS_ALL",
     "grpo_loss",
     "grpo_echo_v1_loss",
+    "cortex_grpo_loss",
+    "cortex_grpo_echo_v1_loss",
     "sft_loss",
     "sft_ce_loss",
     "LOGIT_LOSS_FNS",

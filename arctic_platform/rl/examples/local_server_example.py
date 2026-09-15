@@ -91,8 +91,8 @@ def _build_training_batch(rollout, tokenizer):
     loss_mask[:, -1] = False
     adv = torch.randn(b, s) * loss_mask.float() * 0.01
     proc = {
-        "post": ["compute_logprobs"],
-        "loss_fn": "grpo",
+        "post": ["ap_compute_logprobs"],
+        "loss_fn": "ap_grpo",
         "config": {"eps_clip": 0.2, "prox_logp_method": "recompute"},
     }
     return {

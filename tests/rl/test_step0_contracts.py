@@ -66,21 +66,23 @@ class TestArityGuard(TestCasePlus):
             params = inspect.signature(fn).parameters
             self.assertFalse(any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values()), name)
             self.assertEqual(len(params), 4, name)
-        self.assertIn("grpo", LOSS_FNS)
-        self.assertIn("grpo_echo_v1", LOSS_FNS)
+        self.assertIn("ap_grpo", LOSS_FNS)
+        self.assertIn("ap_grpo_echo_v1", LOSS_FNS)
+        self.assertIn("cortex_grpo", LOSS_FNS)
+        self.assertIn("cortex_grpo_echo_v1", LOSS_FNS)
         self.assertEqual(_positional_count(POST_PROCESSORS["identity"]), 4)
 
 
 class TestPackedReductionResolverShape(TestCasePlus):
     def test_attribute_and_resolver_shape(self):
-        fn = LOSS_FNS["grpo"]
+        fn = LOSS_FNS["ap_grpo"]
         resolver = getattr(fn, PACKED_LOSS_REDUCTION_ATTR)
         mb = {
             "input_ids": torch.arange(4).view(1, 4),
             "loss_mask": torch.ones(1, 4, dtype=torch.bool),
         }
-        one = resolver([mb], {}, "grpo")
-        two = resolver([mb, mb], {}, "grpo")
+        one = resolver([mb], {}, "ap_grpo")
+        two = resolver([mb, mb], {}, "ap_grpo")
         self.assertIsInstance(one, PackedLossReduction)
         self.assertEqual(len(one.loss_scales), 1)
         self.assertEqual(len(two.loss_scales), 2)
@@ -187,7 +189,7 @@ class TestIsolation(TestCasePlus):
             (),
             batch,
             meta,
-            {"loss_fn": "grpo", "post": [], "config": {}},
+            {"loss_fn": "ap_grpo", "post": [], "config": {}},
             "cpu",
             backward=True,
             pack=False,
@@ -211,7 +213,7 @@ class TestPackedInnerCall(TestCasePlus):
             (),
             batch,
             meta,
-            {"loss_fn": "grpo", "post": [], "config": {}},
+            {"loss_fn": "ap_grpo", "post": [], "config": {}},
             "cpu",
             backward=True,
             pack=True,

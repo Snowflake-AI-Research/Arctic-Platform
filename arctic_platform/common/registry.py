@@ -30,8 +30,10 @@ PACKED_LOSS_REDUCTION_ATTR = "_arctic_packed_loss_reduction"
 # may overwrite.
 PUBLIC_LOSS_FNS = frozenset(
     {
-        "grpo",
-        "grpo_echo_v1",
+        "ap_grpo",
+        "ap_grpo_echo_v1",
+        "cortex_grpo",
+        "cortex_grpo_echo_v1",
         "sft",
         "sft_ce",
         "verl_grpo",
@@ -42,7 +44,8 @@ PUBLIC_POST_PROCESSORS = frozenset(
     {
         "identity",
         "compute_entropy_and_logprobs",
-        "compute_logprobs",
+        "ap_compute_logprobs",
+        "cortex_compute_logprobs",
         "compute_entropy",
         "apply_temperature",
     }
