@@ -18,6 +18,12 @@ Each recipe is a standalone folder with its own `requirements.txt`, `overrides.t
 `download_data.py`, launchers, and README. Same env across all three — build it
 once, `conda activate skyrl_arl`, and any recipe launches from bare `python`.
 
+[Simple (GSM8K) on Cortex](simple_gsm8k_cortex) is the exception: none of this
+section applies to it. Its launcher resolves dependencies itself through
+`uv run --isolated`, and it runs on upstream `skyrl-v0.3.0`, so it needs neither
+the conda env nor the fork pin below. Follow
+[its own README](simple_gsm8k_cortex/README.md) instead.
+
 1. **Clone SkyRL at the pinned commit** on the ``arctic-rl-public`` branch. The
    launchers dispatch from `$SKYRL_HOME/integrations/arctic_rl/`, which is not
    shipped in the pip-installed `skyrl` package — a checkout is required.
