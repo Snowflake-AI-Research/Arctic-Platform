@@ -24,10 +24,31 @@ which cannot satisfy DeepSpeed's `micro × accum × n_gpus == train_batch` acros
 
 ## 1. Install
 
-`pip install arctic-platform[cortex]` on the driver — no local GPU deps.
-SkyRL still needs to be cloned at the pinned commit (see
-[`../README.md`](../README.md)) with `SKYRL_HOME` exported. The Arctic RL
-× SkyRL integration code lives under `$SKYRL_HOME/integrations/arctic_rl/`.
+One clone and `uv`. There is no conda env and no requirements file: the
+launcher resolves its own dependencies through `uv run --isolated`, the same
+pattern upstream's `integrations/arctic_rl/examples/` launchers use.
+
+```bash
+pip install uv
+
+git clone https://github.com/NovaSky-AI/SkyRL
+git -C SkyRL checkout skyrl-v0.3.0
+export SKYRL_HOME=$PWD/SkyRL
+```
+
+The Arctic RL × SkyRL integration code lives under
+`$SKYRL_HOME/integrations/arctic_rl/`, which is why a checkout is needed rather
+than the `skyrl` wheel. `skyrl` itself is built from `$SKYRL_HOME`, so the
+installed package cannot drift from that integration code.
+
+Arctic Platform is installed from this checkout, since the released wheel
+(0.1.3) does not yet ship `arctic_platform/integrations/`. Once one does, set
+`ARCTIC_PLATFORM_SPEC='arctic-platform[rl,cortex]'` to use it instead.
+
+**On the tag.** This recipe runs on upstream `skyrl-v0.3.0`, not the fork pin
+that [`../README.md`](../README.md) prescribes for the FSDP recipes. It never
+constructs an FSDP worker, so the `named_non_persistent_buffers` breakage that
+keeps those recipes on the fork does not reach this path.
 
 ## 2. Set Cortex env
 
@@ -66,9 +87,14 @@ verl's `~/data/gsm8k`, which uses a different schema). Override with
 ./run_qwen3_0.6b_gsm8k_grpo_cortex.sh
 ```
 
-The launcher uses `python -m arctic_platform.integrations.skyrl` instead
-of `python -m skyrl.train.entrypoints.main_base` so the driver-side
-`peer_access_supported` shim is installed before SkyRL's Ray probe runs.
+First launch spends a couple of minutes resolving and downloading wheels; after
+that `uv` serves them from cache in well under a second.
+
+The launcher runs `python -m skyrl.train.entrypoints.main_base` under
+`uv run --isolated` and selects Cortex with
+`trainer.override_entrypoint=arctic_platform.integrations.skyrl.entrypoint`.
+That entrypoint wraps upstream's, installing the driver-side
+`peer_access_supported` shim before SkyRL's Ray probe runs.
 
 ### Stopping it, and getting the GPUs back
 
@@ -178,7 +204,9 @@ Two consequences for scaling up:
 | `429 ... gRPC message exceeds maximum size 134217728` | The step's response exceeded Cortex's 128 MiB cap. The launcher preflights this, so you should only reach it by overriding `TRAIN_BSZ`, `N_SAMPLES` or `RESPONSE_LEN` past the printed ceiling. |
 | `packing requires left-aligned rows` | The batch reached Cortex with padding at the head of a row. The shim left-aligns before sending, so this indicates a payload path that bypassed `to_cortex_fwd_bwd_payload`. |
 | `WireError: ... invalid DSSST1 safetensors header length`, usually after `Connection lost: SSL shutdown timed out` | A large result came back truncated. Seen reproducibly from step 2 onward at `TRAIN_BSZ=1024` (~108 MiB per response); see section 6. Reduce `TRAIN_BSZ` / `RESPONSE_LEN`. |
-| `num_engines should be equal to the number of remote_urls` | `NUM_ENGINES` was changed without the matching placeholder URL list. The launcher derives them together; setting `generator.inference_engine.*` by hand breaks that. |
+| `run_engines_locally=false requires external_proxy_url or external_server_urls` | The placeholder URL list didn't reach the config. The launcher derives it from `NUM_ENGINES`; setting `generator.inference_engine.*` by hand breaks that. |
+| `remote_urls is no longer supported` | You are on a launcher older than `skyrl-v0.3.0` support. Current launchers pass only `external_server_urls`. |
+| `Failed to spawn: --python` from `(raylet)` | `RAY_ENABLE_UV_RUN_RUNTIME_ENV` was re-enabled. Ray then replays the driver's `uv run --isolated` line per worker, which spawns a broken command. The launcher sets it to `0`. |
 | `cortex: set base_url (direct URL) or host (PAT auth)` | The `ARCTIC_CORTEX_*` environment isn't set in this shell. See step 2. |
 
 ## Notes
