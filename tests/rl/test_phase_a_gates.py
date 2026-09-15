@@ -1,5 +1,17 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Phase A gates: registry hygiene, packed apply, metric pairing, zone names."""
 
@@ -13,18 +25,21 @@ import torch
 
 import arctic_platform.rl.processors  # noqa: F401
 import arctic_platform.sft.processor  # noqa: F401
-
 from arctic_platform.common.registry import LOSS_FNS
+from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import POST_PROCESSORS
 from arctic_platform.common.registry import PUBLIC_LOSS_FNS
 from arctic_platform.common.registry import PUBLIC_POST_PROCESSORS
-from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import _is_public_registry_name
 from arctic_platform.common.registry import register_loss_fn
 from arctic_platform.common.registry import register_post_processor
+from arctic_platform.common.registry import resolve_fn
+from arctic_platform.common.utils.batch import combine_metric_microbatches
+from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.rl.processors.causal_cross_entropy import causal_cross_entropy_loss
 from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
 from arctic_platform.rl.processors.cortex_grpo import cortex_grpo_loss
+from arctic_platform.rl.processors.grpo import grpo_echo_v1_loss
 from arctic_platform.rl.processors.grpo import grpo_loss
 from arctic_platform.rl.processors.packed_reduction import apply_packed_loss_reduction
 from arctic_platform.rl.processors.packed_reduction import combine_packed_losses
@@ -56,7 +71,9 @@ class TestA1RegistryHygiene(TestCasePlus):
 
         with self.assertRaises(ValueError):
             register_loss_fn("ap_grpo", packed_loss_reduction=other_reduction)(fn)
-        self.assertIs(getattr(fn, PACKED_LOSS_REDUCTION_ATTR), getattr(LOSS_FNS["ap_grpo"], PACKED_LOSS_REDUCTION_ATTR))
+        self.assertIs(
+            getattr(fn, PACKED_LOSS_REDUCTION_ATTR), getattr(LOSS_FNS["ap_grpo"], PACKED_LOSS_REDUCTION_ATTR)
+        )
 
     def test_public_name_overwrite_raises(self):
         original = LOSS_FNS["ap_grpo"]
@@ -81,6 +98,15 @@ class TestA1RegistryHygiene(TestCasePlus):
             self.assertIs(POST_PROCESSORS["_phase_a_tmp"], second)
         finally:
             POST_PROCESSORS.pop("_phase_a_tmp", None)
+
+    def test_removed_bare_names_suggest_prefixes(self):
+        with self.assertRaises(ValueError) as ctx:
+            resolve_fn(LOSS_FNS, "grpo")
+        self.assertIn("ap_grpo", str(ctx.exception))
+        self.assertIn("cortex_grpo", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            resolve_fn(POST_PROCESSORS, "compute_logprobs")
+        self.assertIn("cortex_compute_logprobs", str(ctx.exception))
 
 
 class TestA3PackedApply(TestCasePlus):
@@ -245,6 +271,27 @@ class TestA4Metrics(TestCasePlus):
         with self.assertRaises(ValueError):
             combine_packed_metrics([{"loss": 1.0, "loss.sum": 2.0}], (1.0,))
 
+    def test_gas_and_dp_sum_additive_metrics(self):
+        gas = combine_metric_microbatches(
+            [
+                {"loss_term_rl": 1.0, "entropy": 2.0, "echo_real_sequence_count": 1.0},
+                {"loss_term_rl": 3.0, "entropy": 4.0, "echo_real_sequence_count": 2.0},
+            ]
+        )
+        self.assertEqual(gas["loss_term_rl"], 4.0)
+        self.assertEqual(gas["echo_real_sequence_count"], 3.0)
+        self.assertAlmostEqual(gas["entropy"], 3.0)
+
+        dp = combine_metric_shards(
+            [
+                {"loss_term_rl": 1.0, "echo_environment_loss_sum": 0.5, "entropy": 1.0},
+                {"loss_term_rl": 3.0, "echo_environment_loss_sum": 1.5, "entropy": 3.0},
+            ]
+        )
+        self.assertEqual(dp["loss_term_rl"], 4.0)
+        self.assertEqual(dp["echo_environment_loss_sum"], 2.0)
+        self.assertAlmostEqual(dp["entropy"], 2.0)
+
 
 class TestA5Compat(TestCasePlus):
     def test_union_registry_prefixes_nonidentical_names(self):
@@ -258,6 +305,60 @@ class TestA5Compat(TestCasePlus):
         self.assertIs(POST_PROCESSORS["ap_compute_logprobs"], POST_PROCESSORS["compute_entropy_and_logprobs"])
         self.assertIsNot(POST_PROCESSORS["cortex_compute_logprobs"], POST_PROCESSORS["ap_compute_logprobs"])
         self.assertIs(LOSS_FNS["causal_cross_entropy"], causal_cross_entropy_loss)
+
+    def test_stamp_only_dp_size_does_not_scale_token_mean(self):
+        logprobs = torch.zeros(2, 3)
+        batch = {
+            "old_log_probs_shifted": torch.zeros(2, 3),
+            "advantages": torch.ones(2, 3),
+            "loss_mask": torch.ones(2, 3, dtype=torch.bool),
+        }
+        loss_local, _ = grpo_loss({"logprobs": logprobs}, batch, {}, {}, "cpu")
+        loss_stamp, _ = grpo_loss({"logprobs": logprobs}, batch, {"dp_size": 8}, {}, "cpu")
+        self.assertAlmostEqual(loss_local.item(), loss_stamp.item(), places=6)
+
+    def test_stamped_dp_scales_sequence_mean_when_global_batch_size_present(self):
+        logprobs = torch.zeros(2, 3)
+        batch = {
+            "old_log_probs_shifted": torch.zeros(2, 3),
+            "advantages": torch.ones(2, 3),
+            "loss_mask": torch.ones(2, 3, dtype=torch.bool),
+        }
+        config = {"loss_agg_mode": "seq-mean-token-mean"}
+        loss_local, _ = grpo_loss({"logprobs": logprobs}, batch, {}, config, "cpu")
+        loss_dp, _ = grpo_loss(
+            {"logprobs": logprobs},
+            batch,
+            {"dp_size": 4, "global_batch_size": 2},
+            config,
+            "cpu",
+        )
+        self.assertAlmostEqual(loss_dp.item(), 4.0 * loss_local.item(), places=6)
+
+    def test_cce_context_config_conflict_raises(self):
+        with self.assertRaises(ValueError):
+            causal_cross_entropy_loss(
+                {"logprobs": torch.tensor([-1.0], requires_grad=True)},
+                {"loss_mask": torch.ones(1)},
+                {"batch_num_tokens": 3.0, "dp_size": 2},
+                {"batch_num_tokens": 4.0, "dp_size": 2},
+                "cpu",
+            )
+
+    def test_empty_policy_shard_still_runs_echo(self):
+        batch = {
+            "old_log_probs_shifted": torch.zeros(1, 3),
+            "advantages": torch.ones(1, 3),
+            "loss_mask": torch.zeros(1, 3, dtype=torch.bool),
+            "sft_mask": torch.tensor([[0, 1, 0]], dtype=torch.bool),
+            "echo_observation_mask": torch.tensor([[0, 1, 1]], dtype=torch.bool),
+        }
+        outputs = {"logprobs": torch.zeros(1, 3, requires_grad=True)}
+        config = {"aux_ce_weight": 0.5, "echo_global_num_sequences": 1}
+        loss, metrics = grpo_echo_v1_loss(outputs, batch, {}, config, "cpu")
+        self.assertTrue(loss.requires_grad)
+        self.assertIn("loss_term_aux", metrics)
+        self.assertGreater(metrics["echo_environment_prediction_token_count"], 0.0)
 
     def test_cortex_compute_logprobs_prefers_labels_and_zeros_ignore_index(self):
         logits = torch.tensor([[[2.0, 0.0, -1.0], [0.0, 2.0, -1.0], [-1.0, 0.0, 2.0]]])

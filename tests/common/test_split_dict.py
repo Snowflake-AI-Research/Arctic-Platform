@@ -121,11 +121,15 @@ class TestDpSizeDividesBySp(TestCasePlus):
         with self.assertRaises(ValueError):
             dp_sp_world_size(8, 3)
 
-    def test_split_stamps_world_over_sp(self):
+    def test_split_stamps_num_workers_not_world_over_sp(self):
         shards, _ = _split_batch(self._envelope(), num_workers=8, sp_size=2)
         self.assertEqual(len(shards), 8)
-        self.assertEqual(shards[0]["meta"]["dp_size"], 4)
-        self.assertEqual(shards[7]["meta"]["dp_size"], 4)
+        self.assertEqual(shards[0]["meta"]["dp_size"], 8)
+        self.assertEqual(shards[7]["meta"]["dp_size"], 8)
+
+    def test_split_rejects_sp_that_does_not_divide_workers(self):
+        with self.assertRaises(ValueError):
+            _split_batch(self._envelope(), num_workers=8, sp_size=3)
 
     def test_split_default_sp_is_world(self):
         shards, _ = _split_batch(self._envelope(), num_workers=8)

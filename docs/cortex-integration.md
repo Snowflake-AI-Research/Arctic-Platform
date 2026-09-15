@@ -44,7 +44,7 @@ constrains what runs correctly here:
 
 * **8 GPUs per account.** The GSM8K recipe asks for 4 training + 4 sampling,
   which is exactly the cap, so two runs cannot coexist.
-* **A response is capped at 128 MiB.** `post=["compute_logprobs"]` returns a
+* **A response is capped at 128 MiB.** `post=["cortex_compute_logprobs"]` returns a
   logprob and an entropy per token, ~18 B/token, so a step is limited to
   roughly 4900 sequences. The recipe preflights this.
 * **Large responses are not reliably delivered well below that cap.** At

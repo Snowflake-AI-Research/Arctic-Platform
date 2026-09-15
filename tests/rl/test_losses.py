@@ -269,8 +269,9 @@ class TestGrpoLoss(TestCasePlus):
         loss, metrics = grpo_loss(self._outputs(), self._context(), {}, {}, "cpu")
         self.assertEqual(loss.ndim, 0)
         self.assertTrue(torch.isfinite(loss))
-        for key in ("approx_kl", "importance_weight", "clip_ratio", "entropy", "loss"):
+        for key in ("approx_kl", "importance_weight", "clip_ratio", "entropy"):
             self.assertIn(key, metrics)
+        self.assertNotIn("loss", metrics)
 
     def test_all_loss_agg_modes(self):
         for mode in ("token-mean", "seq-mean-token-sum", "seq-mean-token-sum-norm", "seq-mean-token-mean"):

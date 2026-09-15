@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """GRPO loss function and proximal logp utilities."""
 
 from __future__ import annotations
@@ -10,20 +25,18 @@ from typing import Tuple
 
 import torch
 
-from .functional import (
-    EchoBatchDenominator,
-    _resolve_dp_size,
-    agg_loss,
-    canonicalize_loss_mask,
-    cispo_actor_loss_fn,
-    dp_loss_multiplier,
-    echo_env_prediction_loss_fn,
-    kl_penalty,
-    ppo_actor_loss_fn,
-    sapo_loss_fn,
-)
 from arctic_platform.common.registry import register_loss_fn
 
+from .functional import EchoBatchDenominator
+from .functional import _resolve_dp_size
+from .functional import agg_loss
+from .functional import canonicalize_loss_mask
+from .functional import cispo_actor_loss_fn
+from .functional import dp_loss_multiplier
+from .functional import echo_env_prediction_loss_fn
+from .functional import kl_penalty
+from .functional import ppo_actor_loss_fn
+from .functional import sapo_loss_fn
 from .packed_reduction import PackedLossReduction
 from .packed_reduction import additive_packed_loss_reduction
 from .packed_reduction import local_mean_packed_loss_reduction
@@ -105,7 +118,9 @@ def compute_prox_logp_approximations(
     generated_tokens_mask = versions >= 0
     version_diff = v_theta - v_behave
     version_gap = v_proximal - v_behave
-    alpha = torch.where((version_diff > 0) & generated_tokens_mask, version_gap / version_diff, torch.zeros_like(v_behave))
+    alpha = torch.where(
+        (version_diff > 0) & generated_tokens_mask, version_gap / version_diff, torch.zeros_like(v_behave)
+    )
     alpha = torch.clamp(alpha, 0.0, 1.0)
     approximations = {}
     methods_to_compute = [method] if method else PROX_APPROX_METHODS_ALL
@@ -138,11 +153,19 @@ def _resolve_proximal_logp(
         if not ProxLogpMethod(prox_logp_method).skips_forward_pass():
             raise ValueError(f"prox_logp is None but prox_logp_method='{prox_logp_method}'.")
         if versions is None:
-            raise ValueError(f"prox_logp is None with prox_logp_method='{prox_logp_method}' but versions not available.")
+            raise ValueError(
+                f"prox_logp is None with prox_logp_method='{prox_logp_method}' but versions not available."
+            )
     prox_logp = prox_logp_gt
     if prox_logp_method == PROX_LOGP_METHOD_LOGLINEAR:
         if prox_logp_is_none and versions is not None and current_version is not None:
-            approximations = compute_prox_logp_approximations(old_logp=old_logp, logprobs=logprobs, versions=versions, current_version=current_version, method=PROX_APPROX_METHOD_LOGLINEAR)
+            approximations = compute_prox_logp_approximations(
+                old_logp=old_logp,
+                logprobs=logprobs,
+                versions=versions,
+                current_version=current_version,
+                method=PROX_APPROX_METHOD_LOGLINEAR,
+            )
             prox_logp = approximations[PROX_APPROX_METHOD_LOGLINEAR]
     if prox_logp is None:
         raise RuntimeError(f"prox_logp is None after handling prox_logp_method='{prox_logp_method}'.")
@@ -230,13 +253,9 @@ def _internal_grpo_loss_fn(
     if torch.is_tensor(labels):
         labels = labels.to(loss_mask.device)
         if tuple(labels.shape) != tuple(loss_mask.shape):
-            raise ValueError(
-                "grpo labels must match loss_mask when labels are present"
-            )
+            raise ValueError("grpo labels must match loss_mask when labels are present")
         if ((labels == -100) & loss_mask).any().item():
-            raise ValueError(
-                "grpo loss_mask must be zero where labels use ignore_index=-100"
-            )
+            raise ValueError("grpo loss_mask must be zero where labels use ignore_index=-100")
     # ECHO disjointness is validated against the client's policy mask, not the
     # (possibly M2PO-shrunk) mask used for the policy loss below.
     policy_loss_mask = loss_mask
@@ -252,7 +271,12 @@ def _internal_grpo_loss_fn(
     # (via logprobs) so DeepSpeed's cross-rank gradient all-reduce stays in lockstep
     # and this empty shard contributes nothing. nan_to_num keeps the forward value
     # finite even if the shard produced non-finite logits; the * 0.0 zeroes the grad.
-    if not loss_mask.any():
+    #
+    # When ECHO is configured, skip the early return so sft_mask /
+    # echo_observation_mask can still contribute. AT-dss still returns before
+    # ECHO (snowflake-eng/ArcticTraining-dss#167); this AP path does not.
+    empty_policy_shard = not loss_mask.any()
+    if empty_policy_shard and aux_ce_weight is None:
         zero_loss = torch.nan_to_num(logprobs).sum() * 0.0
         metrics = {
             "approx_kl": 0.0,
@@ -285,51 +309,125 @@ def _internal_grpo_loss_fn(
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
-    if use_sapo_loss and use_cispo_loss:
-        raise ValueError("use_sapo_loss and use_cispo_loss are mutually exclusive.")
-    if use_cispo_loss and c_clip is not None:
-        raise ValueError("c_clip is not supported with use_cispo_loss=True.")
-
-    if use_sapo_loss:
-        if use_decoupled_loss:
-            raise ValueError("SAPO is not compatible with use_decoupled_loss=True.")
-        loss, stat = sapo_loss_fn(logprobs=logprobs, old_logprobs=old_logp, advantages=advantages, tau_pos=sapo_tau_pos, tau_neg=sapo_tau_neg, loss_mask=loss_mask, importance_sampling_level=importance_sampling_level, cu_seqlens=input_data.get("cu_seqlens"), loss_agg_mode=loss_agg_mode, dp_size=dp_size, batch_num_tokens=batch_num_tokens, global_batch_size=global_batch_size, prompt_group_ids=prompt_group_ids, prompt_token_counts=prompt_token_counts, sequence_loss_weights=sequence_loss_weights)
-    elif use_cispo_loss:
-        loss, stat = cispo_actor_loss_fn(logprobs=logprobs, proximal_logprobs=prox_logp, old_logprobs=old_logp, advantages=advantages, eps_clip=eps_clip, eps_clip_higher=eps_clip_higher, is_weight_clip_max=is_weight_clip_max, loss_mask=loss_mask, behav_imp_weight_cap=behav_imp_weight_cap, importance_sampling_level=importance_sampling_level, cu_seqlens=input_data.get("cu_seqlens"), loss_agg_mode=loss_agg_mode, rollout_is_weights=rollout_is_weights, dp_size=dp_size, batch_num_tokens=batch_num_tokens, global_batch_size=global_batch_size, prompt_group_ids=prompt_group_ids, prompt_token_counts=prompt_token_counts, sequence_loss_weights=sequence_loss_weights)
+    if empty_policy_shard:
+        loss = torch.nan_to_num(logprobs).sum() * 0.0
+        metrics = {
+            "approx_kl": 0.0,
+            "importance_weight": 0.0,
+            "clip_ratio": 0.0,
+            "entropy": 0.0,
+        }
     else:
-        loss, stat = ppo_actor_loss_fn(logprobs=logprobs, old_logprobs=old_logp, advantages=advantages, eps_clip=eps_clip, eps_clip_higher=eps_clip_higher, loss_mask=loss_mask, c_clip=c_clip, proximal_logprobs=prox_logp, behav_imp_weight_cap=behav_imp_weight_cap, importance_sampling_level=importance_sampling_level, cu_seqlens=input_data.get("cu_seqlens"), loss_agg_mode=loss_agg_mode, rollout_is_weights=rollout_is_weights, dp_size=dp_size, batch_num_tokens=batch_num_tokens, global_batch_size=global_batch_size, prompt_group_ids=prompt_group_ids, prompt_token_counts=prompt_token_counts, sequence_loss_weights=sequence_loss_weights)
+        if use_sapo_loss and use_cispo_loss:
+            raise ValueError("use_sapo_loss and use_cispo_loss are mutually exclusive.")
+        if use_cispo_loss and c_clip is not None:
+            raise ValueError("c_clip is not supported with use_cispo_loss=True.")
 
-    # Optional entropy bonus: subtract entropy_coeff * mean_entropy from loss
-    if entropy_coeff != 0.0:
-        entropy_loss = agg_loss(
-            -entropy.float(), loss_mask, loss_agg_mode=loss_agg_mode,
-            dp_size=dp_size, batch_num_tokens=batch_num_tokens, global_batch_size=global_batch_size,
-            prompt_group_ids=prompt_group_ids, prompt_token_counts=prompt_token_counts,
-            sequence_loss_weights=sequence_loss_weights, cu_seqlens=input_data.get("cu_seqlens"),
-        )
-        loss = loss + entropy_coeff * entropy_loss
+        if use_sapo_loss:
+            if use_decoupled_loss:
+                raise ValueError("SAPO is not compatible with use_decoupled_loss=True.")
+            loss, stat = sapo_loss_fn(
+                logprobs=logprobs,
+                old_logprobs=old_logp,
+                advantages=advantages,
+                tau_pos=sapo_tau_pos,
+                tau_neg=sapo_tau_neg,
+                loss_mask=loss_mask,
+                importance_sampling_level=importance_sampling_level,
+                cu_seqlens=input_data.get("cu_seqlens"),
+                loss_agg_mode=loss_agg_mode,
+                dp_size=dp_size,
+                batch_num_tokens=batch_num_tokens,
+                global_batch_size=global_batch_size,
+                prompt_group_ids=prompt_group_ids,
+                prompt_token_counts=prompt_token_counts,
+                sequence_loss_weights=sequence_loss_weights,
+            )
+        elif use_cispo_loss:
+            loss, stat = cispo_actor_loss_fn(
+                logprobs=logprobs,
+                proximal_logprobs=prox_logp,
+                old_logprobs=old_logp,
+                advantages=advantages,
+                eps_clip=eps_clip,
+                eps_clip_higher=eps_clip_higher,
+                is_weight_clip_max=is_weight_clip_max,
+                loss_mask=loss_mask,
+                behav_imp_weight_cap=behav_imp_weight_cap,
+                importance_sampling_level=importance_sampling_level,
+                cu_seqlens=input_data.get("cu_seqlens"),
+                loss_agg_mode=loss_agg_mode,
+                rollout_is_weights=rollout_is_weights,
+                dp_size=dp_size,
+                batch_num_tokens=batch_num_tokens,
+                global_batch_size=global_batch_size,
+                prompt_group_ids=prompt_group_ids,
+                prompt_token_counts=prompt_token_counts,
+                sequence_loss_weights=sequence_loss_weights,
+            )
+        else:
+            loss, stat = ppo_actor_loss_fn(
+                logprobs=logprobs,
+                old_logprobs=old_logp,
+                advantages=advantages,
+                eps_clip=eps_clip,
+                eps_clip_higher=eps_clip_higher,
+                loss_mask=loss_mask,
+                c_clip=c_clip,
+                proximal_logprobs=prox_logp,
+                behav_imp_weight_cap=behav_imp_weight_cap,
+                importance_sampling_level=importance_sampling_level,
+                cu_seqlens=input_data.get("cu_seqlens"),
+                loss_agg_mode=loss_agg_mode,
+                rollout_is_weights=rollout_is_weights,
+                dp_size=dp_size,
+                batch_num_tokens=batch_num_tokens,
+                global_batch_size=global_batch_size,
+                prompt_group_ids=prompt_group_ids,
+                prompt_token_counts=prompt_token_counts,
+                sequence_loss_weights=sequence_loss_weights,
+            )
 
-    # Optional KL penalty against a reference policy (e.g. SFT model)
-    if use_kl_loss:
-        ref_logprobs = input_data.get("ref_log_probs")
-        if ref_logprobs is None:
-            raise ValueError("use_kl_loss=True but 'ref_log_probs' not found in context.")
-        kl = kl_penalty(logprob=logprobs, ref_logprob=ref_logprobs.to(logprobs.device), method=kl_loss_type)
-        kl_loss = agg_loss(
-            kl, loss_mask, loss_agg_mode=loss_agg_mode,
-            dp_size=dp_size, batch_num_tokens=batch_num_tokens, global_batch_size=global_batch_size,
-            prompt_group_ids=prompt_group_ids, prompt_token_counts=prompt_token_counts,
-            sequence_loss_weights=sequence_loss_weights, cu_seqlens=input_data.get("cu_seqlens"),
-        )
-        loss = loss + kl_loss_coef * kl_loss
+        if entropy_coeff != 0.0:
+            entropy_loss = agg_loss(
+                -entropy.float(),
+                loss_mask,
+                loss_agg_mode=loss_agg_mode,
+                dp_size=dp_size,
+                batch_num_tokens=batch_num_tokens,
+                global_batch_size=global_batch_size,
+                prompt_group_ids=prompt_group_ids,
+                prompt_token_counts=prompt_token_counts,
+                sequence_loss_weights=sequence_loss_weights,
+                cu_seqlens=input_data.get("cu_seqlens"),
+            )
+            loss = loss + entropy_coeff * entropy_loss
 
-    metrics = {
-        "approx_kl":         _masked_mean_float(stat["approx_kl"].detach(), loss_mask),
-        "importance_weight": _masked_mean_float(stat["importance_weight"].detach(), loss_mask),
-        "clip_ratio":        _masked_mean_float(stat["clip_mask"].float(), loss_mask),
-        "entropy":           _masked_mean_float(entropy.float(), loss_mask),
-        "loss":              float(loss.detach().cpu().item()),
-    }
+        if use_kl_loss:
+            ref_logprobs = input_data.get("ref_log_probs")
+            if ref_logprobs is None:
+                raise ValueError("use_kl_loss=True but 'ref_log_probs' not found in context.")
+            kl = kl_penalty(logprob=logprobs, ref_logprob=ref_logprobs.to(logprobs.device), method=kl_loss_type)
+            kl_loss = agg_loss(
+                kl,
+                loss_mask,
+                loss_agg_mode=loss_agg_mode,
+                dp_size=dp_size,
+                batch_num_tokens=batch_num_tokens,
+                global_batch_size=global_batch_size,
+                prompt_group_ids=prompt_group_ids,
+                prompt_token_counts=prompt_token_counts,
+                sequence_loss_weights=sequence_loss_weights,
+                cu_seqlens=input_data.get("cu_seqlens"),
+            )
+            loss = loss + kl_loss_coef * kl_loss
+
+        metrics = {
+            "approx_kl": _masked_mean_float(stat["approx_kl"].detach(), loss_mask),
+            "importance_weight": _masked_mean_float(stat["importance_weight"].detach(), loss_mask),
+            "clip_ratio": _masked_mean_float(stat["clip_mask"].float(), loss_mask),
+            "entropy": _masked_mean_float(entropy.float(), loss_mask),
+        }
 
     # ECHO auxiliary Environment-Prediction objective (arXiv 2605.24517):
     # total = rl_loss + aux_ce_weight * mean-of-per-sequence env CE.
@@ -349,9 +447,7 @@ def _internal_grpo_loss_fn(
             or not math.isfinite(aux_ce_weight)
             or aux_ce_weight < 0.0
         ):
-            raise ValueError(
-                f"aux_ce_weight must be a finite non-negative number, got {aux_ce_weight!r}"
-            )
+            raise ValueError(f"aux_ce_weight must be a finite non-negative number, got {aux_ce_weight!r}")
         aux_ce_weight = float(aux_ce_weight)
         sft_mask = input_data.get("sft_mask")
         observation_mask = input_data.get("echo_observation_mask")
@@ -383,35 +479,37 @@ def _internal_grpo_loss_fn(
             dp_size=echo_dp_multiplier,
         )
         aux_loss = aux_ce_weight * env_loss
-        metrics.update({
-            # Additive contributions and counts — named loss_term_* / *_sum /
-            # *_count so microbatch and DP-worker reduction SUMS them (see
-            # pipeline.metric_is_summed); means and fractions are exactly
-            # derivable from the sums. The real/bearing sequence counts let a
-            # client reconcile its declared step-global denominator against
-            # the step's accumulated response totals before calling /step.
-            "loss_term_rl": float(loss.detach()),
-            "loss_term_aux": float(aux_loss.detach()),
-            # The unweighted environment objective that λ multiplies. With the
-            # constant labels below, the paper-unit coefficient is PROVABLE
-            # from the response at any reduction level:
-            # loss_term_aux == echo_aux_ce_weight * echo_environment_loss_sum.
-            "echo_environment_loss_sum": float(env_loss.detach()),
-            "echo_environment_prediction_nll_sum": float(env_stat["prediction_nll_sum"]),
-            "echo_environment_prediction_token_count": float(env_stat["prediction_token_count"]),
-            "echo_environment_observation_token_count": float(env_stat["observation_token_count"]),
-            "echo_real_sequence_count": float(env_stat["num_real_sequences"]),
-            "echo_observation_bearing_sequence_count": float(env_stat["num_echo_bearing_sequences"]),
-            # Constant labels — identical in every microbatch, so the
-            # weighted-mean reduction reproduces them exactly.
-            "echo_contract_version": 1.0,
-            "echo_aux_ce_weight": float(aux_ce_weight),
-            "echo_dp_loss_multiplier": float(echo_dp_multiplier),
-            "echo_global_num_sequences": float(echo_global_num_sequences),
-            "echo_batch_denominator_is_echo_bearing": float(
-                env_stat["batch_denominator"] is EchoBatchDenominator.ECHO_BEARING_SEQUENCES
-            ),
-        })
+        metrics.update(
+            {
+                # Additive contributions and counts — named loss_term_* / *_sum /
+                # *_count so microbatch and DP-worker reduction SUMS them (see
+                # pipeline.metric_is_summed); means and fractions are exactly
+                # derivable from the sums. The real/bearing sequence counts let a
+                # client reconcile its declared step-global denominator against
+                # the step's accumulated response totals before calling /step.
+                "loss_term_rl": float(loss.detach()),
+                "loss_term_aux": float(aux_loss.detach()),
+                # The unweighted environment objective that λ multiplies. With the
+                # constant labels below, the paper-unit coefficient is PROVABLE
+                # from the response at any reduction level:
+                # loss_term_aux == echo_aux_ce_weight * echo_environment_loss_sum.
+                "echo_environment_loss_sum": float(env_loss.detach()),
+                "echo_environment_prediction_nll_sum": float(env_stat["prediction_nll_sum"]),
+                "echo_environment_prediction_token_count": float(env_stat["prediction_token_count"]),
+                "echo_environment_observation_token_count": float(env_stat["observation_token_count"]),
+                "echo_real_sequence_count": float(env_stat["num_real_sequences"]),
+                "echo_observation_bearing_sequence_count": float(env_stat["num_echo_bearing_sequences"]),
+                # Constant labels — identical in every microbatch, so the
+                # weighted-mean reduction reproduces them exactly.
+                "echo_contract_version": 1.0,
+                "echo_aux_ce_weight": float(aux_ce_weight),
+                "echo_dp_loss_multiplier": float(echo_dp_multiplier),
+                "echo_global_num_sequences": float(echo_global_num_sequences),
+                "echo_batch_denominator_is_echo_bearing": float(
+                    env_stat["batch_denominator"] is EchoBatchDenominator.ECHO_BEARING_SEQUENCES
+                ),
+            }
+        )
         if aux_ce_weight > 0.0:
             loss = loss + aux_loss
 
@@ -613,37 +711,37 @@ def _grpo_loss(
         sequence_loss_weights=sequence_loss_weights,
         aux_ce_weight=config.get("aux_ce_weight"),
         echo_global_num_sequences=config.get("echo_global_num_sequences"),
-        echo_batch_denominator=config.get(
-            "echo_batch_denominator", EchoBatchDenominator.ALL_SEQUENCES.value
-        ),
+        echo_batch_denominator=config.get("echo_batch_denominator", EchoBatchDenominator.ALL_SEQUENCES.value),
     )
     return loss, metrics
 
 
-_GRPO_CONFIG_KEYS = frozenset({
-    "eps_clip",
-    "eps_clip_higher",
-    "c_clip",
-    "behav_imp_weight_cap",
-    "m2_threshold",
-    "importance_sampling_level",
-    "current_version",
-    "prox_logp_method",
-    "use_sapo_loss",
-    "sapo_tau_pos",
-    "sapo_tau_neg",
-    "use_decoupled_loss",
-    "use_cispo_loss",
-    "is_weight_clip_max",
-    "loss_agg_mode",
-    "dp_size",
-    "batch_num_tokens",
-    "global_batch_size",
-    "entropy_coeff",
-    "use_kl_loss",
-    "kl_loss_coef",
-    "kl_loss_type",
-})
+_GRPO_CONFIG_KEYS = frozenset(
+    {
+        "eps_clip",
+        "eps_clip_higher",
+        "c_clip",
+        "behav_imp_weight_cap",
+        "m2_threshold",
+        "importance_sampling_level",
+        "current_version",
+        "prox_logp_method",
+        "use_sapo_loss",
+        "sapo_tau_pos",
+        "sapo_tau_neg",
+        "use_decoupled_loss",
+        "use_cispo_loss",
+        "is_weight_clip_max",
+        "loss_agg_mode",
+        "dp_size",
+        "batch_num_tokens",
+        "global_batch_size",
+        "entropy_coeff",
+        "use_kl_loss",
+        "kl_loss_coef",
+        "kl_loss_type",
+    }
+)
 _ECHO_REQUIRED_CONFIG_KEYS = frozenset({"aux_ce_weight", "echo_global_num_sequences"})
 _ECHO_CONFIG_KEYS = _ECHO_REQUIRED_CONFIG_KEYS | {"echo_batch_denominator"}
 
@@ -651,9 +749,7 @@ _ECHO_CONFIG_KEYS = _ECHO_REQUIRED_CONFIG_KEYS | {"echo_batch_denominator"}
 def _grpo_preflight_mask(microbatch: dict) -> torch.Tensor:
     reference = microbatch.get("input_ids")
     if not torch.is_tensor(reference):
-        raise ValueError(
-            "grpo packed microbatches require tensor input_ids for preflight validation"
-        )
+        raise ValueError("grpo packed microbatches require tensor input_ids for preflight validation")
     loss_mask = microbatch.get("loss_mask")
     if loss_mask is None:
         raise ValueError("grpo requires context['loss_mask']")
@@ -668,9 +764,7 @@ def _grpo_preflight_mask(microbatch: dict) -> torch.Tensor:
         if tuple(labels.shape) != tuple(mask.shape):
             raise ValueError("grpo labels must match loss_mask when labels are present")
         if ((labels.to(mask.device) == -100) & mask).any().item():
-            raise ValueError(
-                "grpo loss_mask must be zero where labels use ignore_index=-100"
-            )
+            raise ValueError("grpo loss_mask must be zero where labels use ignore_index=-100")
     return mask
 
 
@@ -679,12 +773,7 @@ def _active_sequence_count(microbatch: dict, loss_mask: torch.Tensor) -> float:
     if torch.is_tensor(cu_seqlens):
         flat_mask = loss_mask.reshape(-1)
         boundaries = cu_seqlens.detach().cpu().tolist()
-        return float(
-            sum(
-                bool(flat_mask[start:end].any().item())
-                for start, end in pairwise(boundaries)
-            )
-        )
+        return float(sum(bool(flat_mask[start:end].any().item()) for start, end in pairwise(boundaries)))
     if loss_mask.ndim >= 2:
         return float(loss_mask.reshape(loss_mask.shape[0], -1).any(dim=1).sum().item())
     return float(bool(loss_mask.any().item()))
@@ -706,10 +795,7 @@ def _grpo_packed_loss_reduction(
             else local_mean_packed_loss_reduction(weights)
         )
     elif mode in ("seq-mean-token-sum", "seq-mean-token-mean"):
-        weights = [
-            _active_sequence_count(microbatch, mask)
-            for microbatch, mask in zip(microbatches, masks)
-        ]
+        weights = [_active_sequence_count(microbatch, mask) for microbatch, mask in zip(microbatches, masks)]
         reduction = (
             additive_packed_loss_reduction(weights)
             if config.get("global_batch_size") is not None
@@ -729,14 +815,10 @@ def _grpo_packed_loss_reduction(
         )
     elif mode == "prompt-mean":
         has_sequence_weights = all(
-            torch.is_tensor(microbatch.get("sequence_loss_weights"))
-            for microbatch in microbatches
+            torch.is_tensor(microbatch.get("sequence_loss_weights")) for microbatch in microbatches
         )
         if has_sequence_weights:
-            weights = [
-                float(microbatch["sequence_loss_weights"].abs().sum().item())
-                for microbatch in microbatches
-            ]
+            weights = [float(microbatch["sequence_loss_weights"].abs().sum().item()) for microbatch in microbatches]
             reduction = additive_packed_loss_reduction(weights)
         elif len(microbatches) > 1:
             raise ValueError(
@@ -752,11 +834,7 @@ def _grpo_packed_loss_reduction(
             "available only for registered GRPO aggregation modes"
         )
 
-    if (
-        loss_fn_name.endswith("grpo_echo_v1")
-        and len(microbatches) > 1
-        and not reduction.loss_is_additive
-    ):
+    if loss_fn_name.endswith("grpo_echo_v1") and len(microbatches) > 1 and not reduction.loss_is_additive:
         raise ValueError(
             f"loss_fn {loss_fn_name!r} requires a globally normalized additive "
             "policy objective when split into multiple packed microbatches"
@@ -765,26 +843,31 @@ def _grpo_packed_loss_reduction(
 
 
 def _merge_distributed_config(config: dict, batch: dict, meta: dict) -> dict:
-    """AP puts dp_size / batch_num_tokens / global_batch_size on meta; Cortex reads config."""
+    """Fill missing scale keys from meta/batch; config wins when set.
+
+    Stamped ``dp_size`` is routing metadata. It becomes a loss scale only when
+    a global denominator is also present (``batch_num_tokens`` for token-mean,
+    ``global_batch_size`` for sequence-mean).
+    """
     cfg = dict(config)
-    for key in ("dp_size", "batch_num_tokens", "global_batch_size"):
+    for key in ("batch_num_tokens", "global_batch_size"):
         if cfg.get(key) is None:
             if meta.get(key) is not None:
                 cfg[key] = meta[key]
             elif batch.get(key) is not None:
                 cfg[key] = batch[key]
+    has_global_denom = cfg.get("batch_num_tokens") is not None or cfg.get("global_batch_size") is not None
+    if cfg.get("dp_size") is None and has_global_denom:
+        if meta.get("dp_size") is not None:
+            cfg["dp_size"] = meta["dp_size"]
+        elif batch.get("dp_size") is not None:
+            cfg["dp_size"] = batch["dp_size"]
     return cfg
 
 
 def _grpo_context(batch: dict, meta: dict) -> dict:
-    """Merge bags, but take ``rollout_is_weights`` from ``batch`` only.
-
-    That tensor is batch-dim; ``meta`` is DP-replicated, so a copy there is
-    the wrong length after ``_split_batch``.
-    """
-    context = {**batch, **meta}
-    context["rollout_is_weights"] = batch.get("rollout_is_weights")
-    return context
+    """Merge bags with batch winning (sharded tensors over replicated meta)."""
+    return {**meta, **batch}
 
 
 @register_loss_fn("ap_grpo", packed_loss_reduction=_grpo_packed_loss_reduction)

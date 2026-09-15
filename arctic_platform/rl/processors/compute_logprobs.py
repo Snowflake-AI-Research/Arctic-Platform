@@ -40,13 +40,17 @@ def _eager_log_softmax_gather(logits_chunk: torch.Tensor, labels_chunk: torch.Te
     return lp.gather(-1, labels_chunk.unsqueeze(-1)).squeeze(-1)
 
 
+_compiled_log_softmax_gather = None
+
+
 def _log_softmax_gather(logits_chunk: torch.Tensor, labels_chunk: torch.Tensor) -> torch.Tensor:
     """Eager on CPU; Cortex ``torch.compile`` fuse when CUDA is available."""
-    impl = _eager_log_softmax_gather
+    global _compiled_log_softmax_gather
     if os.environ.get("DSS_LOGPROB_COMPILE", "1") != "0" and torch.cuda.is_available():
-        impl = torch.compile(_eager_log_softmax_gather)
-        globals()["_log_softmax_gather"] = impl
-    return impl(logits_chunk, labels_chunk)
+        if _compiled_log_softmax_gather is None:
+            _compiled_log_softmax_gather = torch.compile(_eager_log_softmax_gather)
+        return _compiled_log_softmax_gather(logits_chunk, labels_chunk)
+    return _eager_log_softmax_gather(logits_chunk, labels_chunk)
 
 
 @register_post_processor("cortex_compute_logprobs")
@@ -64,9 +68,7 @@ def compute_logprobs_post(model_outputs: dict, batch: dict, meta: dict, device: 
 
     logits = model_outputs.get("logits")
     if logits is None:
-        raise ValueError(
-            "cortex_compute_logprobs requires model outputs containing either 'logprobs' or 'logits'"
-        )
+        raise ValueError("cortex_compute_logprobs requires model outputs containing either 'logprobs' or 'logits'")
 
     context = {**meta, **batch}
     labels = context.get("labels")

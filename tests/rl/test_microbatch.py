@@ -89,3 +89,12 @@ class TestSplitPaddedTensorDictIntoMbList(TestCasePlus):
         self.assertTrue(torch.equal(reconstructed[backward], weights))
         self.assertGreater(len(mb_list.mbs), 1)
         self.assertTrue(all(mb["sequence_loss_weights"].numel() == mb["input_ids"].shape[0] for mb in mb_list.mbs))
+
+    def test_does_not_split_unrelated_length_b_vector(self):
+        data = _make_padded_dict()
+        noise = torch.arange(len(real_token_counts), dtype=torch.float32)
+        data["unrelated_b"] = noise
+        mb_list = split_padded_tensor_dict_into_mb_list(data, MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb))
+        self.assertGreater(len(mb_list.mbs), 1)
+        for mb in mb_list.mbs:
+            self.assertTrue(torch.equal(mb["unrelated_b"], noise))
