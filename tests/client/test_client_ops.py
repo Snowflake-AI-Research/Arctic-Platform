@@ -643,7 +643,7 @@ class TestCortexSharedHelper:
         assert torch.equal(out["context"]["input_ids"], ids)
         assert "advantages" in out["context"]
         assert "loss_mask" in out["context"]
-        assert out["processing"]["loss_fn"] == "cortex_grpo"
+        assert out["processing"]["loss_fn"] == "grpo"
         assert "old_log_probs" not in out["kwargs"]
         assert "old_log_probs_shifted" not in out["context"]
 
@@ -765,7 +765,7 @@ class TestCortexSharedHelper:
         assert cfg["eps_clip"] == 0.3
         assert cfg["loss_agg_mode"] == "seq-mean-token-sum"
         assert cfg["entropy_coeff"] == 0.01
-        assert out["processing"]["loss_fn"] == "cortex_grpo"
+        assert out["processing"]["loss_fn"] == "grpo"
         assert cfg["global_batch_size"] == 128  # meta fallback still applied
 
     def test_missing_response_mask_fails_loud(self):

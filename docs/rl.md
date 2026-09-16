@@ -162,8 +162,8 @@ Unlike SFT's flat labels batch, RL `fwd_bwd` typically carries:
         ...
     },
     "processing": {
-        "loss_fn": "ap_grpo",          # or "cortex_grpo" / dotted path
-        "post": ["ap_compute_logprobs", ...],
+        "loss_fn": "ap_grpo",          # or "grpo" / dotted path
+        "post": ["ap_compute_logprobs", ...],  # Cortex post is "compute_logprobs"
         "config": {"eps_clip": 0.2, ...},
     },
 }

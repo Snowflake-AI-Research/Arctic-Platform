@@ -79,8 +79,8 @@ class TestArityGuard(TestCasePlus):
             self.assertEqual(len(params), 4, name)
         self.assertIn("ap_grpo", LOSS_FNS)
         self.assertIn("ap_grpo_echo_v1", LOSS_FNS)
-        self.assertIn("cortex_grpo", LOSS_FNS)
-        self.assertIn("cortex_grpo_echo_v1", LOSS_FNS)
+        self.assertIn("grpo", LOSS_FNS)
+        self.assertIn("grpo_echo_v1", LOSS_FNS)
         self.assertEqual(_positional_count(POST_PROCESSORS["identity"]), 4)
 
 

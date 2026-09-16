@@ -99,14 +99,13 @@ class TestA1RegistryHygiene(TestCasePlus):
         finally:
             POST_PROCESSORS.pop("_phase_a_tmp", None)
 
-    def test_removed_bare_names_suggest_prefixes(self):
+    def test_removed_prefixed_cortex_names_suggest_zone_names(self):
         with self.assertRaises(ValueError) as ctx:
-            resolve_fn(LOSS_FNS, "grpo")
-        self.assertIn("ap_grpo", str(ctx.exception))
-        self.assertIn("cortex_grpo", str(ctx.exception))
+            resolve_fn(LOSS_FNS, "cortex_grpo")
+        self.assertIn("grpo", str(ctx.exception))
         with self.assertRaises(ValueError) as ctx:
-            resolve_fn(POST_PROCESSORS, "compute_logprobs")
-        self.assertIn("cortex_compute_logprobs", str(ctx.exception))
+            resolve_fn(POST_PROCESSORS, "cortex_compute_logprobs")
+        self.assertIn("compute_logprobs", str(ctx.exception))
 
 
 class TestA3PackedApply(TestCasePlus):
@@ -295,16 +294,16 @@ class TestA4Metrics(TestCasePlus):
 
 class TestA5Compat(TestCasePlus):
     def test_union_registry_prefixes_nonidentical_names(self):
-        self.assertNotIn("grpo", LOSS_FNS)
-        self.assertNotIn("compute_logprobs", POST_PROCESSORS)
+        self.assertIn("grpo", LOSS_FNS)
+        self.assertIn("compute_logprobs", POST_PROCESSORS)
         self.assertIn("ap_grpo", LOSS_FNS)
-        self.assertIn("cortex_grpo", LOSS_FNS)
-        self.assertIsNot(LOSS_FNS["ap_grpo"], LOSS_FNS["cortex_grpo"])
+        self.assertIsNot(LOSS_FNS["ap_grpo"], LOSS_FNS["grpo"])
         self.assertIn("ap_compute_logprobs", POST_PROCESSORS)
-        self.assertIn("cortex_compute_logprobs", POST_PROCESSORS)
         self.assertIs(POST_PROCESSORS["ap_compute_logprobs"], POST_PROCESSORS["compute_entropy_and_logprobs"])
-        self.assertIsNot(POST_PROCESSORS["cortex_compute_logprobs"], POST_PROCESSORS["ap_compute_logprobs"])
+        self.assertIsNot(POST_PROCESSORS["compute_logprobs"], POST_PROCESSORS["ap_compute_logprobs"])
         self.assertIs(LOSS_FNS["causal_cross_entropy"], causal_cross_entropy_loss)
+        self.assertNotIn("cortex_grpo", LOSS_FNS)
+        self.assertNotIn("cortex_compute_logprobs", POST_PROCESSORS)
 
     def test_stamp_only_dp_size_does_not_scale_token_mean(self):
         logprobs = torch.zeros(2, 3)

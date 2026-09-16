@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cortex GRPO entrypoints: context-wins trio, registered as ``cortex_grpo*``.
+"""Cortex GRPO entrypoints: context-wins trio, registered as ``grpo`` / ``grpo_echo_v1``.
 
 Inner PPO/ECHO math is shared with ``ap_grpo``. The contracts differ: AP fills
 missing trio keys from meta/batch with config winning; Cortex
@@ -47,7 +47,7 @@ def _cortex_distributed_config(config: dict, batch: dict, meta: dict) -> tuple[d
     return cfg, context
 
 
-@register_loss_fn("cortex_grpo", packed_loss_reduction=_grpo_packed_loss_reduction)
+@register_loss_fn("grpo", packed_loss_reduction=_grpo_packed_loss_reduction)
 def cortex_grpo_loss(
     model_outputs: dict,
     batch: dict,
@@ -60,13 +60,12 @@ def cortex_grpo_loss(
     echo_keys = _ECHO_CONFIG_KEYS & set(config)
     if echo_keys:
         raise ValueError(
-            f"loss_fn 'cortex_grpo' does not accept ECHO config keys {sorted(echo_keys)} — "
-            "request 'cortex_grpo_echo_v1'"
+            f"loss_fn 'grpo' does not accept ECHO config keys {sorted(echo_keys)} — request 'grpo_echo_v1'"
         )
     return _grpo_loss(model_outputs, context, config, device)
 
 
-@register_loss_fn("cortex_grpo_echo_v1", packed_loss_reduction=_grpo_packed_loss_reduction)
+@register_loss_fn("grpo_echo_v1", packed_loss_reduction=_grpo_packed_loss_reduction)
 def cortex_grpo_echo_v1_loss(
     model_outputs: dict,
     batch: dict,
@@ -78,8 +77,8 @@ def cortex_grpo_echo_v1_loss(
     config, context = _cortex_distributed_config(config, batch, meta)
     unknown_keys = set(config) - _GRPO_CONFIG_KEYS - _ECHO_CONFIG_KEYS
     if unknown_keys:
-        raise ValueError(f"Unknown config keys for loss_fn 'cortex_grpo_echo_v1': {sorted(unknown_keys)}")
+        raise ValueError(f"Unknown config keys for loss_fn 'grpo_echo_v1': {sorted(unknown_keys)}")
     missing_keys = {key for key in _ECHO_REQUIRED_CONFIG_KEYS if config.get(key) is None}
     if missing_keys:
-        raise ValueError(f"loss_fn 'cortex_grpo_echo_v1' requires non-None config keys {sorted(missing_keys)}")
+        raise ValueError(f"loss_fn 'grpo_echo_v1' requires non-None config keys {sorted(missing_keys)}")
     return _grpo_loss(model_outputs, context, config, device)

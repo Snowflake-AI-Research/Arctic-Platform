@@ -15,7 +15,7 @@
 
 """Cortex ``compute_logprobs`` post: chunked log-softmax + gather.
 
-Registered as ``cortex_compute_logprobs``. AP's tiled / FlashAttn + entropy
+Registered as ``compute_logprobs``. AP's tiled / FlashAttn + entropy
 path stays ``compute_entropy_and_logprobs`` / ``ap_compute_logprobs``.
 """
 
@@ -53,7 +53,7 @@ def _log_softmax_gather(logits_chunk: torch.Tensor, labels_chunk: torch.Tensor) 
     return _eager_log_softmax_gather(logits_chunk, labels_chunk)
 
 
-@register_post_processor("cortex_compute_logprobs")
+@register_post_processor("compute_logprobs")
 def compute_logprobs_post(model_outputs: dict, batch: dict, meta: dict, device: str) -> dict:
     """Compute per-token log-probs from logits using the Cortex kernel.
 
@@ -68,7 +68,7 @@ def compute_logprobs_post(model_outputs: dict, batch: dict, meta: dict, device: 
 
     logits = model_outputs.get("logits")
     if logits is None:
-        raise ValueError("cortex_compute_logprobs requires model outputs containing either 'logprobs' or 'logits'")
+        raise ValueError("compute_logprobs requires model outputs containing either 'logprobs' or 'logits'")
 
     context = {**meta, **batch}
     labels = context.get("labels")

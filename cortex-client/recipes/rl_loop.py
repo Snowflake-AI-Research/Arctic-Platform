@@ -346,7 +346,7 @@ def job_body(config: Config) -> dict:
 
 def processing_block(config: Config, global_batch_size: int) -> dict:
     return dict(
-        loss_fn="cortex_grpo",
+        loss_fn="grpo",
         config=dict(
             eps_clip=config.eps_clip,
             loss_agg_mode=config.loss_agg_mode,

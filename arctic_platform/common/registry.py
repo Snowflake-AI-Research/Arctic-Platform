@@ -32,8 +32,8 @@ PUBLIC_LOSS_FNS = frozenset(
     {
         "ap_grpo",
         "ap_grpo_echo_v1",
-        "cortex_grpo",
-        "cortex_grpo_echo_v1",
+        "grpo",
+        "grpo_echo_v1",
         "sft",
         "sft_ce",
         "verl_grpo",
@@ -45,7 +45,7 @@ PUBLIC_POST_PROCESSORS = frozenset(
         "identity",
         "compute_entropy_and_logprobs",
         "ap_compute_logprobs",
-        "cortex_compute_logprobs",
+        "compute_logprobs",
         "compute_entropy",
         "apply_temperature",
     }
@@ -100,10 +100,10 @@ def resolve_fn(registry: dict, name: str) -> Callable:
     if "." not in name:
         known = sorted(key for key in registry if _is_public_registry_name(key) and "." not in key)
         hint = ""
-        if name in {"grpo", "grpo_echo_v1"}:
-            hint = " (did you mean 'ap_grpo' / 'cortex_grpo'?)"
-        elif name == "compute_logprobs":
-            hint = " (did you mean 'ap_compute_logprobs' / 'cortex_compute_logprobs'?)"
+        if name in {"cortex_grpo", "cortex_grpo_echo_v1"}:
+            hint = " (did you mean 'grpo' / 'grpo_echo_v1'? AP variants are 'ap_grpo' / 'ap_grpo_echo_v1')"
+        elif name == "cortex_compute_logprobs":
+            hint = " (did you mean 'compute_logprobs'? AP variant is 'ap_compute_logprobs')"
         raise ValueError(f"unknown registry name {name!r}{hint}; known: {known}")
     module_path, fn_name = name.rsplit(".", 1)
     fn = getattr(importlib.import_module(module_path), fn_name)

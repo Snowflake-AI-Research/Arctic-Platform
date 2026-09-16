@@ -202,8 +202,7 @@ def causal_cross_entropy_loss(
     logprobs = model_outputs.get("logprobs")
     if logprobs is None:
         raise ValueError(
-            "causal_cross_entropy requires model_outputs['logprobs']; configure "
-            "processing.post=['cortex_compute_logprobs']"
+            "causal_cross_entropy requires model_outputs['logprobs']; configure processing.post=['compute_logprobs']"
         )
     if context.get("cu_seqlens") is not None:
         logprobs = _packed_singleton_to_1d(logprobs)
