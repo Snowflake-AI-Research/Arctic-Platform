@@ -15,4 +15,5 @@
 """Built-in loaders. Importing this package registers them."""
 
 from arctic_platform.model.loaders import huggingface  # noqa: F401
+from arctic_platform.model.loaders import qwen35_hf  # noqa: F401
 from arctic_platform.model.loaders import qwen3_5_moe  # noqa: F401

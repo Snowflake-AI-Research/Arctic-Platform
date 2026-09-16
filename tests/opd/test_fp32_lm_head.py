@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
+from arctic_platform.model.implementations.qwen35.hf_training_patches import import_inject_prime_lm_head
 from arctic_platform.rl.processors.pipeline import _maybe_add_chunked_lm_head_kwargs
 from arctic_platform.rl.processors.pipeline import collect_model_outputs
 from arctic_platform.rl.processors.pipeline import uses_chunked_fp32_lm_head
@@ -28,7 +28,7 @@ class _FakeModel(nn.Module):
 
 
 def test_import_inject_prime_lm_head_avoids_models_package():
-    inject = DeepSpeedWorker._import_inject_prime_lm_head()
+    inject = import_inject_prime_lm_head()
     assert callable(inject)
 
 

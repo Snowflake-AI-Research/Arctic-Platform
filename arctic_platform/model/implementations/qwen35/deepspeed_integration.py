@@ -37,7 +37,7 @@ from .model_builder import (
     get_model,
     load_dcp_from_hf,
 )
-from .models.layers.lm_head import inject_prime_lm_head
+from .hf_training_patches import apply_lm_head_from_config
 from .models.layers.moe import FeedForward, LatentMoE, MoE
 from .parallel_dims import ParallelDims
 from .hf_vllm_weight_sync import pack_qwen35_gdn_layer
@@ -376,15 +376,13 @@ def _setup_model_local_no_train(
     model = get_model(config, device=torch.device("meta"), dtype=DTYPE_MAP[config.optimization_dtype])
     configure_moe_ep_backend(model, config)
 
-    lm_head_chunk_size: int | None = None
-    if isinstance(config.fused_lm_head_token_chunk_size, int):
-        lm_head_chunk_size = config.fused_lm_head_token_chunk_size
-
-    inject_prime_lm_head(
+    apply_lm_head_from_config(
         model,
-        chunk_size=lm_head_chunk_size,
-        fused_cross_entropy=fused_cross_entropy,
-        fp32_lm_head=config.fp32_lm_head,
+        {
+            "fused_lm_head_token_chunk_size": config.fused_lm_head_token_chunk_size,
+            "fused_cross_entropy": fused_cross_entropy,
+            "fp32_lm_head": config.fp32_lm_head,
+        },
     )
 
     if parallel_dims.ep_enabled:

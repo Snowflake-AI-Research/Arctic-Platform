@@ -111,17 +111,29 @@ class ModelSpec(BaseModel):
             )
             zorro_train_patch = ZorroTrainPatch(**{k: cfg[k] for k in zorro_keys if k in cfg})
 
+        loader_keys = (
+            "fp32_lm_head",
+            "fused_lm_head_token_chunk_size",
+            "fused_cross_entropy",
+        )
+        loader_options = {k: cfg[k] for k in loader_keys if k in cfg}
+
         # Worker bridge defaults GC on (historical DeepSpeedWorker behavior). Generic
         # ``Patches.gradient_checkpointing`` stays False for direct ModelSpec users.
         return cls(
             model_path_or_name=model_name,
             dtype="bfloat16",
             attn_implementation=cfg["attn_implementation"],
+            parallelism=ParallelismConfig(
+                expert_parallel=int(cfg.get("expert_parallel", cfg.get("ep_size", 1))),
+                sequence_parallel=int(cfg.get("sequence_parallel", cfg.get("sp_size", 1))),
+            ),
             patches=Patches(
                 liger=cfg.get("use_liger", False),
                 zorro_train=zorro_train_patch,
                 gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
             ),
+            loader_options=loader_options,
         )
 
     @field_validator("dtype")

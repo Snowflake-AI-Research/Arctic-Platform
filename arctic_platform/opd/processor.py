@@ -102,6 +102,10 @@ def _positive_int(value) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+# Opt-in: worker injects all-reduced token counts before the loss runs.
+OPD_GLOBAL_TOKEN_LOSS_FNS = frozenset({"on_policy_distill"})
+
+
 def apply_opd_global_token_config(
     processing: dict,
     meta_data: dict,
@@ -120,6 +124,32 @@ def apply_opd_global_token_config(
     meta_data["batch_num_tokens"] = int(batch_num_tokens)
     meta_data["global_num_tokens"] = int(batch_num_tokens)
     meta_data["global_batch_size"] = int(global_batch_size)
+
+
+def inject_opd_global_token_meta(
+    batch_data,
+    meta_data: dict,
+    processing: dict,
+    *,
+    device,
+    world_size: int,
+) -> None:
+    """Count local ``loss_mask`` tokens, all-reduce, write OPD norm keys.
+
+    Importing this module also registers ``on_policy_distill`` so the worker
+    lookup in ``run_pipeline`` succeeds.
+    """
+    local_tokens, local_seqs = count_opd_loss_tokens(batch_data)
+    counts = torch.tensor([local_tokens, local_seqs], device=device, dtype=torch.long)
+    if torch.distributed.is_available() and torch.distributed.is_initialized() and world_size > 1:
+        torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+    apply_opd_global_token_config(
+        processing,
+        meta_data,
+        dp_size=int(world_size),
+        batch_num_tokens=max(int(counts[0].item()), 1),
+        global_batch_size=max(int(counts[1].item()), 1),
+    )
 
 
 def _resolve_distill_norm(config: dict, meta: dict) -> tuple[int, Optional[int], Optional[int]]:

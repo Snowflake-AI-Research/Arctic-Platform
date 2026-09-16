@@ -189,7 +189,7 @@ def test_expected_names_accept_unpacked_qwen2_qkv_biases():
 
 
 def test_text_only_extension_allows_missing_visual():
-    from arctic_platform.common.weight_sync_extension import TextOnlyWeightSyncExtension
+    from arctic_inference.server.weight_sync import TextOnlyWeightSyncExtension
 
     ext = TextOnlyWeightSyncExtension()
     expected = {
@@ -213,7 +213,7 @@ def test_text_only_extension_allows_missing_visual():
 
 
 def test_text_only_extension_still_rejects_unexpected_lm_name():
-    from arctic_platform.common.weight_sync_extension import TextOnlyWeightSyncExtension
+    from arctic_inference.server.weight_sync import TextOnlyWeightSyncExtension
 
     ext = TextOnlyWeightSyncExtension()
     import arctic_inference.server.weight_sync.utils as ws_utils
@@ -237,11 +237,22 @@ def test_text_only_extension_still_rejects_unexpected_lm_name():
         ws_utils.compute_expected_hf_param_names = orig
 
 
-def test_build_model_config_registers_enginecore_extension():
+def test_build_model_config_does_not_hardcode_platform_extension():
     from arctic_platform.common.utils.server_models import build_model_config
-    from arctic_platform.common.weight_sync_extension import WORKER_EXTENSION_CLS
 
     cfg = build_model_config("Qwen/Qwen3.5-2B", {})
-    assert cfg.extra_engine_kwargs["worker_extension_cls"] == WORKER_EXTENSION_CLS
-    kwargs = cfg.to_engine_kwargs()
-    assert kwargs["worker_extension_cls"] == WORKER_EXTENSION_CLS
+    extra = getattr(cfg, "extra_engine_kwargs", None) or {}
+    worker_cls = extra.get("worker_extension_cls") or getattr(cfg, "worker_extension_cls", None)
+    assert worker_cls != "arctic_platform.common.weight_sync_extension.TextOnlyWeightSyncExtension"
+
+
+def test_servers_do_not_install_qwen35_weight_patch():
+    from pathlib import Path
+
+    for rel in (
+        "arctic_platform/common/ray_server.py",
+        "arctic_platform/common/http_server.py",
+    ):
+        src = (Path(__file__).resolve().parents[2] / rel).read_text()
+        assert "install_optional_frozen_weight_sync_patch" not in src
+        assert "hf_vllm_weight_sync" not in src

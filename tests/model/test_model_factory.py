@@ -269,6 +269,21 @@ class TestFromDsWorkerConfig:
         assert z.logits_compute_from_fp32_inputs == defaults.logits_compute_from_fp32_inputs
         assert z.logits_compute_in_fp32 == defaults.logits_compute_in_fp32
 
+    def test_lm_head_knobs_map_to_loader_options(self):
+        spec = ModelSpec.from_ds_worker_config(
+            "x",
+            {
+                "attn_implementation": "flash_attention_2",
+                "fp32_lm_head": True,
+                "fused_lm_head_token_chunk_size": 2048,
+                "fused_cross_entropy": False,
+            },
+        )
+        assert spec.loader_options["fp32_lm_head"] is True
+        assert spec.loader_options["fused_lm_head_token_chunk_size"] == 2048
+        assert spec.loader_options["fused_cross_entropy"] is False
+        assert spec.parallelism.expert_parallel == 1
+
 
 class TestZorroAndGcPatches:
     def test_gradient_checkpointing_patch_calls_enable(self):

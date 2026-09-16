@@ -132,8 +132,8 @@ def test_importing_opd_package_registers_loss():
 def test_worker_imports_opd_processor_before_pipeline():
     worker = Path(__file__).resolve().parents[2] / "arctic_platform" / "common" / "deepspeed_worker.py"
     src = worker.read_text()
-    assert "from arctic_platform.opd.processor import apply_opd_global_token_config" in src
-    assert "from arctic_platform.opd.processor import count_opd_loss_tokens" in src
+    assert "from arctic_platform.opd.processor import inject_opd_global_token_meta" in src
+    assert "from arctic_platform.opd.processor import OPD_GLOBAL_TOKEN_LOSS_FNS" in src
     assert "from arctic_platform.rl.processors.on_policy_distill" not in src
     inject = src.index("def _inject_opd_global_token_config")
     pipeline = src.index("from arctic_platform.rl.processors import run_pipeline")
@@ -461,3 +461,21 @@ def test_apply_opd_global_token_config_writes_config_and_meta():
     assert processing["config"]["global_batch_size"] == 2
     assert meta["batch_num_tokens"] == 4
     assert meta["dp_size"] == 8
+
+
+def test_inject_opd_global_token_meta_counts_without_dist():
+    from arctic_platform.opd.processor import inject_opd_global_token_meta
+
+    mask = torch.tensor([[1, 1, 1, 0], [1, 0, 0, 0]])
+    processing = {"config": {}}
+    meta: dict = {}
+    inject_opd_global_token_meta(
+        {"loss_mask": mask},
+        meta,
+        processing,
+        device="cpu",
+        world_size=1,
+    )
+    assert processing["config"]["batch_num_tokens"] == 4
+    assert processing["config"]["dp_size"] == 1
+    assert meta["global_num_tokens"] == 4

@@ -23,8 +23,10 @@ from arctic_platform.opd.client import DEFAULT_PROCESSING
 from arctic_platform.opd.client import ArcticOPDClient
 from arctic_platform.opd.client import create_arctic_opd_client
 from arctic_platform.opd.config import ArcticOPDClientConfig
+from arctic_platform.opd.processor import OPD_GLOBAL_TOKEN_LOSS_FNS
 from arctic_platform.opd.processor import apply_opd_global_token_config
 from arctic_platform.opd.processor import count_opd_loss_tokens
+from arctic_platform.opd.processor import inject_opd_global_token_meta
 from arctic_platform.opd.processor import on_policy_distill_loss
 from arctic_platform.opd.scoring import score_teacher
 from arctic_platform.opd.scoring import score_teacher_topk
@@ -33,9 +35,11 @@ __all__ = [
     "ArcticOPDClient",
     "ArcticOPDClientConfig",
     "DEFAULT_PROCESSING",
+    "OPD_GLOBAL_TOKEN_LOSS_FNS",
     "apply_opd_global_token_config",
     "count_opd_loss_tokens",
     "create_arctic_opd_client",
+    "inject_opd_global_token_meta",
     "on_policy_distill_loss",
     "score_teacher",
     "score_teacher_topk",

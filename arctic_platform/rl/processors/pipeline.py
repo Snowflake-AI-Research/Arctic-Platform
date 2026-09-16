@@ -610,6 +610,7 @@ def _run_pipeline_with_packing(
     mb_spec = MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb)
     mb_list = split_padded_tensor_dict_into_mb_list(all_input, mb_spec)
     n_mbs = len(mb_list.mbs)
+    pr0(f"pack n_mbs={n_mbs} max_tokens_per_mb={max_tokens_per_mb}")
 
     captured_losses: list[float] = []
     captured_metrics: list[dict] = []
@@ -630,8 +631,9 @@ def _run_pipeline_with_packing(
         }
         mb_kwargs.update(derive_varlen_model_kwargs(packed))
 
-        if backward is True and hasattr(engine, "set_gradient_accumulation_boundary"):
-            engine.set_gradient_accumulation_boundary(i == n_mbs - 1)
+        # Unmanaged GAS: backward() only accumulates; engine.step() in
+        # DeepSpeedWorker.step() is the optimizer boundary. Do not call
+        # set_gradient_accumulation_boundary (managed-mode API).
 
         result = run_pipeline(
             engine,
@@ -679,12 +681,13 @@ def _run_pipeline_with_packing(
         # kl/per_token to Sum(S*c)/Sum(c^2) instead of Sum(S)/Sum(c).
         avg_loss = sum(captured_losses)
         combined_metrics = combine_metric_microbatches(captured_metrics) if captured_metrics else {}
+        combined_metrics["pack_n_mbs"] = float(n_mbs)
         result = {"avg_loss": avg_loss, "metrics": combined_metrics}
         if batch_out:
             result["batch"] = detensorize(batch_out)
         return result
 
-    return {"batch": detensorize(batch_out), "metrics": {}}
+    return {"batch": detensorize(batch_out), "metrics": {"pack_n_mbs": float(n_mbs)}}
 
 
 # ---------------------------------------------------------------------------

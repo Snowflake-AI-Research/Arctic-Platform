@@ -169,5 +169,12 @@ One training step is:
 1. `client.generate` — student vLLM completions + sampler logprobs
 2. `score_teacher` — teacher `prompt_logprobs` on the same token ids
 3. `client.fwd_bwd` — DeepSpeed forward + `on_policy_distill` + backward
-4. `client.step` — optimizer
+4. `client.step()` — DeepSpeed optimizer + LR scheduler (do not pass a client LR)
 5. `client.sync_weights` — student train → student sampler only
+
+Packed token-budget runs set ``managed_gradient_accumulation: false`` so the
+variable inner microbatch count accumulates grads and a single ``engine.step()``
+is the optimizer boundary. Qwen3.5 LM-head / vision patches live in
+``model/implementations`` + the ``qwen35_hf`` loader. Weight-name remaps live
+in Arctic-Inference (``weight_sync.adapters``); the HTTP/Ray servers do not
+patch models.
