@@ -38,7 +38,8 @@ AP_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 ARCTIC_PLATFORM_SPEC="${ARCTIC_PLATFORM_SPEC:-${AP_ROOT}[rl,cortex]}"
 
 if ! command -v uv >/dev/null 2>&1; then
-    echo "ERROR: uv not found. Install it with: pip install uv"
+    echo "ERROR: uv not found. Install it with:"
+    echo "         curl -LsSf https://astral.sh/uv/install.sh | sh"
     exit 1
 fi
 

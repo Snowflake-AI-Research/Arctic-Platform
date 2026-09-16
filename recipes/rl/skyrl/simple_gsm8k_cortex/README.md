@@ -29,7 +29,8 @@ launcher resolves its own dependencies through `uv run --isolated`, the same
 pattern upstream's `integrations/arctic_rl/examples/` launchers use.
 
 ```bash
-pip install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env   # if uv is not already on your PATH
 
 git clone https://github.com/NovaSky-AI/SkyRL
 git -C SkyRL checkout skyrl-v0.3.0
