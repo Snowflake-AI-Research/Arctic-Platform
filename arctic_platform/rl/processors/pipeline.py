@@ -62,6 +62,7 @@ from arctic_platform.common.registry import _resolve_fn
 from arctic_platform.common.registry import register_loss_fn  # noqa: F401  # re-exported
 from arctic_platform.common.registry import register_post_processor
 from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
+from arctic_platform.common.utils.tiled_logits import memory_logprobs_entropy_from_hidden
 from arctic_platform.rl.utils.batch import detensorize
 from arctic_platform.rl.utils.batch import log_dp_shard_tokens
 from arctic_platform.rl.utils.debug import ProfilerContext
@@ -201,6 +202,34 @@ def compute_packing_info_for_batch(tensor_dict):
     tensor_dict["response_lens"] = attention_mask[:, prompt_ids.shape[1] :].sum(dim=1)
 
     return tensor_dict
+
+
+def _causal_lm_from_engine(engine):
+    return getattr(engine, "module", engine)
+
+
+def _text_backbone(causal_lm):
+    model = getattr(causal_lm, "model", None)
+    if model is None:
+        return None
+    return getattr(model, "language_model", model)
+
+
+def _register_last_hidden_hook(backbone):
+    """Capture only the backbone's last hidden state (not every layer)."""
+    captured: dict[str, Any] = {}
+
+    def _hook(_module, _inp, out):
+        if hasattr(out, "last_hidden_state"):
+            captured["hidden"] = out.last_hidden_state
+        elif isinstance(out, (tuple, list)):
+            captured["hidden"] = out[0]
+        else:
+            captured["hidden"] = out
+        return out
+
+    handle = backbone.register_forward_hook(_hook)
+    return captured, handle
 
 
 def dump_dict_payload(payload: dict, tag: str):
@@ -374,18 +403,43 @@ def run_pipeline(
     )
 
     pr0(f"effective {batch['input_ids'].shape=}")
+    logits_opt = meta.get("logits_optimization", "none")
+    # No-ZoRRo + memory: skip full [T, V] logits; tile from last_hidden_state instead.
+    tile_lm_head = (not zorro_train_enable) and logits_opt == "memory"
+    fwd_kwargs = {**batch, **meta}
+    if tile_lm_head:
+        # HF: logits_to_keep=0 means all tokens; 1 keeps a 1-token stub we discard.
+        fwd_kwargs["logits_to_keep"] = 1
+
+    captured: dict[str, Any] = {}
+    handle = None
+    if tile_lm_head:
+        causal_lm = _causal_lm_from_engine(engine)
+        backbone = _text_backbone(causal_lm)
+        if backbone is None:
+            raise RuntimeError(
+                "logits_optimization=memory on the no-zorro path requires a HuggingFace "
+                "CausalLM with a .model (or .model.language_model) backbone so last_hidden_state "
+                "can be captured without materializing [T, V] logits."
+            )
+        captured, handle = _register_last_hidden_hook(backbone)
+
     prof_fwd = ProfilerContext(type=PROFILER_TYPE, name="FWD")
     tname = timers.start(f"pipe fwd {engine.global_rank}")
-    with prof_fwd():
-        # passing **meta to the model since optimizations like zorro living in the model need to receive flags like calculate_entropy from the client
-        if backward is False:
-            engine.eval()
-            with torch.no_grad():
-                outputs = engine(*args, **batch, **meta)
-        else:
-            engine.train()
-            # backward=True or backward="loss_only": train mode, grads enabled
-            outputs = engine(*args, **batch, **meta)
+    try:
+        with prof_fwd():
+            # passing **meta to the model since optimizations like zorro living in the model need to receive flags like calculate_entropy from the client
+            if backward is False:
+                engine.eval()
+                with torch.no_grad():
+                    outputs = engine(*args, **fwd_kwargs)
+            else:
+                engine.train()
+                # backward=True or backward="loss_only": train mode, grads enabled
+                outputs = engine(*args, **fwd_kwargs)
+    finally:
+        if handle is not None:
+            handle.remove()
 
     timers.stop_and_print_elapsed(tname)
 
@@ -393,14 +447,52 @@ def run_pipeline(
     prof_fwd.report()
 
     model_outputs: dict[str, Any] = {}
-    if hasattr(outputs, "logits"):
-        model_outputs["logits"] = outputs.logits
-    if hasattr(outputs, "logprobs"):
-        model_outputs["logprobs"] = outputs.logprobs
-    if hasattr(outputs, "entropy"):
-        model_outputs["entropy"] = outputs.entropy
-    if hasattr(outputs, "loss") and outputs.loss is not None:
-        model_outputs["loss"] = outputs.loss
+    if tile_lm_head:
+        hidden = captured.get("hidden")
+        if hidden is None:
+            raise RuntimeError("logits_optimization=memory: backbone hook did not capture last_hidden_state")
+        if hasattr(outputs, "logits") and outputs.logits is not None and outputs.logits.ndim >= 2:
+            if outputs.logits.shape[-2] != 1:
+                raise RuntimeError(
+                    "logits_optimization=memory set logits_to_keep=1 but the LM head still "
+                    f"projected sequence dim {outputs.logits.shape[-2]} (shape "
+                    f"{tuple(outputs.logits.shape)}). Full [T, V] logits were materialized."
+                )
+        causal_lm = _causal_lm_from_engine(engine)
+        input_ids = batch.get("input_ids")
+        if input_ids is None:
+            raise RuntimeError("logits_optimization=memory requires batch['input_ids']")
+        input_ids = input_ids.to(hidden.device)
+        if input_ids.shape != hidden.shape[:-1]:
+            input_ids = input_ids.view(hidden.shape[:-1])
+        labels = torch.roll(input_ids, shifts=-1, dims=-1)
+        tiled_kwargs = dict(
+            temperature=meta["temperature"],
+            calculate_entropy=bool(meta.get("calculate_entropy")),
+            peak_mem_gib=float(meta.get("logits_optimization_peak_mem_size_in_gib", 4) or 4),
+            logits_compute_from_fp32_inputs=bool(meta.get("logits_compute_from_fp32_inputs", False)),
+            logits_compute_in_fp32=bool(meta.get("logits_compute_in_fp32", False)),
+            device=hidden.device,
+        )
+        if backward is False:
+            with torch.no_grad():
+                logprobs, entropy = memory_logprobs_entropy_from_hidden(causal_lm, hidden, labels, **tiled_kwargs)
+        else:
+            logprobs, entropy = memory_logprobs_entropy_from_hidden(causal_lm, hidden, labels, **tiled_kwargs)
+        model_outputs["logprobs"] = logprobs
+        if entropy is not None:
+            model_outputs["entropy"] = entropy
+        if hasattr(outputs, "loss") and outputs.loss is not None:
+            model_outputs["loss"] = outputs.loss
+    else:
+        if hasattr(outputs, "logits"):
+            model_outputs["logits"] = outputs.logits
+        if hasattr(outputs, "logprobs"):
+            model_outputs["logprobs"] = outputs.logprobs
+        if hasattr(outputs, "entropy"):
+            model_outputs["entropy"] = outputs.entropy
+        if hasattr(outputs, "loss") and outputs.loss is not None:
+            model_outputs["loss"] = outputs.loss
 
     # --- post-forward ---
     prof_post_fwd = ProfilerContext(type=PROFILER_TYPE, name="POST-FWD")
@@ -732,12 +824,8 @@ def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: di
         if meta.get("logits_compute_in_fp32", False):
             logits = logits.float()
 
-        # arctic_rl.train.logits.optimization picks the logprob/entropy compute strategy ("memory" (tiling ) is not available unless zorro is used because the non-zorro path already has full logits manifested):
-        #   none    -> single fused call over the full logits (fastest; manifests
-        #              the full-size follow-up intermediates, i.e. logits memory
-        #              more than once).
-        #   compute -> manifest the full logits once, but run the follow-up in
-        #              chunks so the full-size intermediates are never materialized.
+        # none: fused full-logits. compute: chunked follow-up. memory: tiles in
+        # run_pipeline (no-zorro) or the patched CausalLM (zorro); logprobs only.
         logits_optimization = meta.get("logits_optimization", "none")
         peak_mem_gib = meta.get("logits_optimization_peak_mem_size_in_gib", 4)
         if logits_optimization == "compute":
@@ -747,7 +835,12 @@ def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: di
         elif logits_optimization == "none":
             logprobs, entropy = fast_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy)
         elif logits_optimization == "memory":
-            raise ValueError("arctic_rl.train.logits.optimization=memory requires zorro enabled")
+            raise ValueError(
+                "arctic_rl.train.logits.optimization=memory must not receive full logits; "
+                "the no-zorro path tiles from last_hidden_state in run_pipeline, and the "
+                "zorro path tiles inside the patched CausalLM. Seeing logits here means "
+                "the full [T, V] tensor was materialized."
+            )
         else:
             raise ValueError(
                 f"Unknown arctic_rl.train.logits.optimization={logits_optimization!r}; "
@@ -769,11 +862,16 @@ def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: di
         model_outputs.pop("logits")
 
     elif "logprobs" in model_outputs:
-        # zorro already computes these in CausalLM returning it as model_outputs["logprobs"] and model_outputs["entropy"]
         processor_outputs["logprobs"] = model_outputs["logprobs"]
         entropy = model_outputs.get("entropy")
         if entropy is not None:
             processor_outputs["entropy"] = entropy
+    elif meta.get("logits_optimization") == "memory":
+        raise ValueError(
+            "arctic_rl.train.logits.optimization=memory requires logprobs from run_pipeline "
+            "(no-zorro last_hidden_state tile) or the patched ZoRRo CausalLM; neither logits "
+            "nor logprobs were present."
+        )
 
     # timers.stop_and_print_elapsed(tname_e2e)
 
@@ -846,7 +944,6 @@ def apply_temperature_post(model_outputs: dict, batch: dict, meta: dict, device:
             logits.div_(temperature.clamp(min=1e-8).unsqueeze(-1).to(logits.dtype))
         model_outputs["logits"] = logits
     elif "logprobs" in model_outputs:
-        # zorro computes this already in patched CausalLM and we don't want to pass a huge logits tensor around
         pass
 
     see_memory_usage("apply_temperature_post end", force=True)

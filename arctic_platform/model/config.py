@@ -87,11 +87,13 @@ class ModelSpec(BaseModel):
         """
         cfg = ds_worker_config or {}
 
-        # Require an explicit attention backend. ZoRRo Train needs a flash-attention
-        # implementation; do not invent a second default here (ModelSpec leaves it None).
+        # Require an explicit attention backend. Packed varlen / ZoRRo Train need
+        # some flash-attention implementation (FA2 / FA3 / FA4); do not invent a
+        # default here (ModelSpec leaves it None).
         if "attn_implementation" not in cfg or cfg["attn_implementation"] is None:
             raise ValueError(
-                "from_ds_worker_config requires attn_implementation (ZoRRo Train needs a flash-attention backend)."
+                "from_ds_worker_config requires attn_implementation "
+                "(flash_attention_2 / flash_attention_3 / flash_attention_4)."
             )
 
         zorro_train_patch = None
