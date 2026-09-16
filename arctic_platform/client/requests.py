@@ -32,7 +32,11 @@ from arctic_platform.client.transport import Request
 
 
 def fwd_bwd_request(
-    jobs: JobHandles, batch: dict, processing: dict | None = None, router_replay: Any = None
+    jobs: JobHandles,
+    batch: dict,
+    *,
+    processing: dict | None = None,
+    router_replay: Any = None,
 ) -> Request:
     # NOTE: the call *signature* is unified across backends, but `batch`'s
     # *content* is not: Cortex expects an RPC-style
@@ -40,10 +44,9 @@ def fwd_bwd_request(
     # expects a pre-tokenized verl-GRPO {"batch", "meta", "processing"}. The
     # client forwards `batch` verbatim, so today the caller must still match
     # the target backend's data contract.
-    # TODO(unify-backends): converge the server-side fwd_bwd on ONE batch
-    # contract (ideally Cortex's) so this frontend is truly backend-agnostic
-    # and callers stop branching on backend. Until then `processing` is folded
-    # into the body here, which is why callers can leave it inside `batch`.
+    # TODO(unify-backends): converge the server-side fwd_bwd request and response
+    # contracts. Until then the Cortex transport normalizes its response, while
+    # callers still provide a backend-compatible batch body.
     body = dict(batch)
     body.update({k: v for k, v in (("processing", processing), ("router_replay", router_replay)) if v is not None})
     return Request("forward-backward", jobs.require("training"), body, binary=True)

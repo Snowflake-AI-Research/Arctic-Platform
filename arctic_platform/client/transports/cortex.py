@@ -17,11 +17,11 @@
 SnowAPI is async: every op submits and returns a ``request_id`` that is polled to
 completion. So an op is just submit + poll -> final result dict, the same
 contract the on-prem transports expose. `call` runs it over ``requests``; `acall`
-runs the identical flow over ``aiohttp`` for the async client. The only Cortex
-specifics live in `_submit`, because SnowAPI is not uniform: forward-backward and
-generate carry DSSST1 octet bodies (byte-chunked), while step/save/operation post
-their JSON body as-is (the client assembles the full `/operation` envelope, incl.
-sub-job routing). Unsupported ops (`forward`, `log-probs`) raise NotImplementedError.
+runs the identical flow over ``aiohttp`` for the async client. Cortex-specific
+request and response shapes are lowered here until the servers share one API.
+Forward-backward and generate carry DSSST1 octet bodies (byte-chunked), while
+step/save/operation post JSON. Unsupported ops (`forward`, `log-probs`) raise
+NotImplementedError.
 """
 
 from __future__ import annotations
@@ -91,6 +91,26 @@ _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
 # JobHandles role -> Cortex sub-job job_type name.
 _SUB_JOB_KEY = {"training": "training", "sampling": "sampling", "log_prob": "log_probability"}
+
+
+def _canonical_result(op: str, result: dict) -> dict:
+    if op == "generate":
+        return _to_python(result)
+    if op != "forward-backward" or "post_process_outputs" not in result:
+        return result
+    if "batch" in result:
+        raise ValueError("Cortex fwd-bwd returned both 'batch' and 'post_process_outputs'")
+
+    import torch
+
+    batch = dict(result["post_process_outputs"] or {})
+    for key in ("logprobs", "entropy"):
+        if key in batch and batch[key] is not None:
+            batch[key] = torch.as_tensor(batch[key])
+    canonical = dict(result)
+    canonical.pop("post_process_outputs")
+    canonical["batch"] = batch
+    return canonical
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -308,15 +328,13 @@ class CortexTransport(Transport):
         if request.op in _NOOP_OPS:
             return {}
         result = self._poll(self._submit(request))
-        # generate returns token ids as DSSST1 tensors; on-prem returns plain
-        # lists, so match that contract.
-        return _to_python(result) if request.op == "generate" else result
+        return _canonical_result(request.op, result)
 
     async def acall(self, request: Request) -> dict:
         if request.op in _NOOP_OPS:
             return {}
         result = await self._apoll(await self._asubmit(request))
-        return _to_python(result) if request.op == "generate" else result
+        return _canonical_result(request.op, result)
 
     def _op_target(self, request: Request) -> tuple[str, dict]:
         """The url + JSON body for one op (None-valued keys dropped)."""
