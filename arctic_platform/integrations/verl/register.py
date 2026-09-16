@@ -65,6 +65,11 @@ from verl.workers.rollout.replica import RolloutReplicaRegistry  # noqa: E402
 # time. Everything below is lazy.
 from arctic_platform.integrations.verl import adapter as _adapter  # noqa: E402,F401
 
+if os.environ.get("ARCTIC_BACKEND", "").strip().lower() == "cortex":
+    from arctic_platform.integrations.verl.cortex_generate import install_cortex_string_chat_template
+
+    install_cortex_string_chat_template()
+
 
 def _load_arctic_actor_rollout_worker() -> type:
     from arctic_platform.integrations.verl.worker import ArcticRLActorRolloutRefWorker

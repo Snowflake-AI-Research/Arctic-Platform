@@ -121,7 +121,14 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
     if "position_ids" in forwarded:
         kwargs_out["position_ids"] = forwarded["position_ids"]
     caller = dict((processing_in or {}).get("config") or {})
-    proc_config = {"eps_clip": 0.2, "loss_agg_mode": "token-mean", "entropy_coeff": 0.0, **caller}
+    proc_config = {
+        "eps_clip": 0.2,
+        "eps_clip_higher": 0.2,
+        "c_clip": 3.0,
+        "loss_agg_mode": "token-mean",
+        "entropy_coeff": 0.0,
+        **caller,
+    }
     for k in ("global_batch_size", "batch_num_tokens"):
         if k not in proc_config and k in meta:
             proc_config[k] = int(meta[k])

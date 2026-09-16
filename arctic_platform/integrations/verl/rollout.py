@@ -96,7 +96,14 @@ class ArcticLLMEngine:
             sampling_params=sampling_params,
         )
 
-        raw_prompt = self.tokenizer.decode(prompt_token_ids)
+        if getattr(self.arctic_rl_client, "_use_cortex", False) or getattr(
+            self.arctic_rl_client, "_is_cortex_backend", lambda: False
+        )():
+            from arctic_platform.integrations.verl.cortex_generate import prompt_text_from_ids
+
+            raw_prompt = prompt_text_from_ids(self.tokenizer, prompt_token_ids)
+        else:
+            raw_prompt = self.tokenizer.decode(prompt_token_ids)
         completed_outputs = []
         for i, output in enumerate(gen_batch_output):
             completed_outputs.append(

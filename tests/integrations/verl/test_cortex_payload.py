@@ -224,3 +224,26 @@ def test_drop_env_omits_old_log_probs(monkeypatch):
 
     assert "old_log_probs_shifted" not in out["context"]
     assert out["processing"]["loss_fn"] == "grpo"
+
+
+def test_zone_grpo_config_matches_verl_dual_clip():
+    """AP cannot register verl_grpo on the zone; it can send dual-clip knobs."""
+    out = to_cortex_fwd_bwd_payload(
+        {
+            "batch": {
+                "input_ids": torch.tensor([[10, 11, 30, 31]]),
+                "attention_mask": torch.ones(1, 4, dtype=torch.long),
+                "old_log_probs": torch.tensor([[0.0, 0.0, -1.0, -2.0]]),
+                "advantages": torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
+                "response_mask": torch.tensor([[0, 0, 1, 1]]),
+            }
+        }
+    )
+    cfg = out["processing"]["config"]
+    assert cfg["eps_clip"] == 0.2
+    assert cfg["eps_clip_higher"] == 0.2
+    assert cfg["c_clip"] == 3.0
+    assert cfg["loss_agg_mode"] == "token-mean"
+    assert cfg["entropy_coeff"] == 0.0
+    assert "dp_size" not in cfg
+

@@ -125,8 +125,10 @@ def _patch_cortex_transport_if_needed() -> bool:
     use_cortex = os.environ.get("ARCTIC_BACKEND", "").strip().lower() == "cortex"
     if use_cortex:
         from arctic_platform.client.transports.cortex_forward import patch_cortex_transport
+        from arctic_platform.integrations.verl.cortex_generate import install_cortex_string_chat_template
 
         patch_cortex_transport()
+        install_cortex_string_chat_template()
     return use_cortex
 
 
@@ -764,7 +766,12 @@ class ArcticRLClientWrapper(RemoteBackend):
 
     async def generate(self, prompt_ids, sampling_params, routing_key=None) -> list:
         # `routing_key` kept for caller-API compat; arctic_platform.rl handles routing internally.
-        prompts = [self.tokenizer.decode(prompt_ids)]
+        if self._is_cortex_backend():
+            from arctic_platform.integrations.verl.cortex_generate import prompt_text_from_ids
+
+            prompts = [prompt_text_from_ids(self.tokenizer, prompt_ids)]
+        else:
+            prompts = [self.tokenizer.decode(prompt_ids)]
         merged_params = {**self._default_sampling_params, **sampling_params}
         return await self._client.generate(
             prompts=prompts,
