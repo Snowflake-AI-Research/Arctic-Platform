@@ -4,9 +4,40 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
+
+
+def _drop_old_log_probs() -> bool:
+    """Omit ``old_log_probs_shifted`` so the zone defaults π_old ≡ π_new.
+
+    ``grpo_loss`` falls back to ``logprobs.detach()`` when the key is absent,
+    which pins the importance ratio at exactly 1 -- the same on-policy shape TRL
+    and SkyRL send. Kept as an A/B control that isolates the IS term.
+    """
+    return os.environ.get("CORTEX_VERL_DROP_OLD_LOGPROBS", "0") not in ("0", "", "false", "False")
+
+
+def _to_predict_next(t):
+    """Response-aligned ``[B, S]`` -> the zone's predict-next layout.
+
+    ``compute_logprobs`` scores ``labels = roll(input_ids, -1)``, so slot ``i``
+    of the zone's ``logprobs`` holds ``log P(input_ids[i + 1])``. verl keeps
+    ``old_log_probs`` / ``advantages`` / ``response_mask`` aligned to the token
+    they belong to, so each per-token tensor moves one slot left before the zone
+    can compare it against those logprobs. Without this the ratio becomes
+    ``exp(log P(tok i+1) - log P(tok i))`` and the importance weight explodes.
+
+    Same contract as verl's ``shift_nested_response_aligned_to_predict_next``.
+    A slice copy rather than ``torch.roll`` so no value wraps across the row.
+    """
+    if not torch.is_tensor(t) or t.dim() < 1 or t.shape[-1] < 2:
+        return t
+    out = torch.zeros_like(t)
+    out[..., :-1] = t[..., 1:]
+    return out
 
 
 def _left_align(tensors: dict, attention_mask, extra: dict):
@@ -81,11 +112,11 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
     input_ids = forwarded["input_ids"]
     context: dict[str, Any] = {
         "input_ids": input_ids,
-        "advantages": scored["advantages"],
-        "loss_mask": scored["loss_mask"],
+        "advantages": _to_predict_next(scored["advantages"]),
+        "loss_mask": _to_predict_next(scored["loss_mask"]),
     }
-    if "old_log_probs" in scored:
-        context["old_log_probs_shifted"] = scored["old_log_probs"]
+    if "old_log_probs" in scored and not _drop_old_log_probs():
+        context["old_log_probs_shifted"] = _to_predict_next(scored["old_log_probs"])
     kwargs_out: dict[str, Any] = {"input_ids": input_ids, "attention_mask": attention_mask}
     if "position_ids" in forwarded:
         kwargs_out["position_ids"] = forwarded["position_ids"]

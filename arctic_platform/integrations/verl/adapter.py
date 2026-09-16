@@ -92,6 +92,29 @@ def _merge_cortex_update_metrics(fwd_bwd_response: dict, step_response: dict) ->
     return metrics
 
 
+def _cortex_response_logprobs(response: dict):
+    """Locate the fresh logprobs in a Cortex ``fwd_bwd`` reply.
+
+    On-prem puts them under ``batch.logprobs``; Cortex returns the pipeline's
+    ``post_process_outputs`` instead. Without this the driver never computes
+    ``actor/ppo_kl`` or ``actor/max_abs_ratio_minus_1``, which are exactly the
+    metrics that reveal an importance-ratio problem.
+    """
+    if not isinstance(response, dict):
+        return None
+    for container in (
+        response.get("batch"),
+        response.get("post_process_outputs"),
+        response,
+    ):
+        if not isinstance(container, dict):
+            continue
+        for key in ("logprobs", "log_probs"):
+            if container.get(key) is not None:
+                return container[key]
+    return None
+
+
 def _patch_cortex_transport_if_needed() -> bool:
     """Install the process-local Cortex forward patch when Cortex is selected.
 
@@ -834,20 +857,20 @@ class ArcticRLClientWrapper(RemoteBackend):
                         pad = torch.zeros(*t.shape[:-1], pad_len, dtype=t.dtype, device=t.device)
                         payload["batch"][name] = torch.cat([pad, t], dim=-1)
             payload["batch"]["loss_mask"] = payload["batch"]["response_mask"]
+            from arctic_platform.integrations.verl.cortex_payload import _drop_old_log_probs
+
             cx = to_cortex_fwd_bwd_payload(payload)
-            if "old_log_probs_shifted" not in cx["context"]:
+            old_lp_shifted = cx["context"].get("old_log_probs_shifted")
+            if old_lp_shifted is None and not _drop_old_log_probs():
                 raise RuntimeError("cortex fwd_bwd dropped old_log_probs_shifted")
             fwd_bwd_response = await self._client.fwd_bwd(cx)
             step_response = await self._client.step()
             metrics = _merge_cortex_update_metrics(fwd_bwd_response, step_response)
-            body = fwd_bwd_response.get("batch") if isinstance(fwd_bwd_response.get("batch"), dict) else {}
-            new_lp = body.get("logprobs", body.get("log_probs"))
-            if new_lp is None:
-                new_lp = fwd_bwd_response.get("logprobs", fwd_bwd_response.get("log_probs"))
-            if new_lp is not None:
+            new_lp = _cortex_response_logprobs(fwd_bwd_response)
+            if new_lp is not None and old_lp_shifted is not None:
                 metrics.update(
                     actor_policy_metrics(
-                        cx["context"]["old_log_probs_shifted"],
+                        old_lp_shifted,
                         new_lp,
                         cx["context"]["loss_mask"],
                     )
