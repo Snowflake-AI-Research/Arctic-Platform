@@ -41,6 +41,7 @@ from verl.remote_backend.base import RemoteBackendRegistry
 
 from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import AsyncArcticRLClient
+from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
@@ -55,6 +56,55 @@ _ARCTIC_METRIC_REDUCTION_FN = {
     "kl_coef": np.mean,
     "kl_loss": np.mean,
 }
+
+
+def _strip_cortex_zero_offload(ds_config: dict) -> dict:
+    """Drop offload keys. Cortex CPUAdam treats even ``device: none`` as offload."""
+    zero = ds_config.get("zero_optimization")
+    if isinstance(zero, dict):
+        zero.pop("offload_optimizer", None)
+        zero.pop("offload_param", None)
+    return ds_config
+
+
+def _merge_cortex_update_metrics(fwd_bwd_response: dict, step_response: dict) -> dict:
+    """Cortex ``step`` often returns a bare scalar/avg_loss, not ``metrics.loss``."""
+    metrics: dict = {}
+    for blob in (fwd_bwd_response, step_response):
+        if not isinstance(blob, dict):
+            continue
+        nested = blob.get("metrics")
+        if isinstance(nested, dict):
+            metrics.update(nested)
+        for key in ("loss", "avg_loss", "grad_norm"):
+            if key in blob and blob[key] is not None and key not in metrics:
+                metrics[key] = blob[key]
+    if "loss" not in metrics and "avg_loss" in metrics:
+        metrics["loss"] = metrics["avg_loss"]
+    if "loss" not in metrics:
+        print(
+            "[parity] cortex update missing loss; "
+            f"fwd_bwd={list(fwd_bwd_response) if isinstance(fwd_bwd_response, dict) else type(fwd_bwd_response)} "
+            f"step={list(step_response) if isinstance(step_response, dict) else type(step_response)}",
+            flush=True,
+        )
+        metrics["loss"] = 0.0
+    return metrics
+
+
+def _patch_cortex_transport_if_needed() -> bool:
+    """Install the process-local Cortex forward patch when Cortex is selected.
+
+    Ray workers are separate Python processes and do not inherit monkeypatches
+    installed by the TaskRunner.  Run this before constructing either a fresh
+    client or a reconnecting client in every process.
+    """
+    use_cortex = os.environ.get("ARCTIC_BACKEND", "").strip().lower() == "cortex"
+    if use_cortex:
+        from arctic_platform.client.transports.cortex_forward import patch_cortex_transport
+
+        patch_cortex_transport()
+    return use_cortex
 
 
 def _no_padding_2_padding_prompt_response(tensor: torch.Tensor, data, pad_token_id):
@@ -144,6 +194,10 @@ class ArcticRLClientWrapper(RemoteBackend):
         reconnect_job_config: dict = None,
         rl_server_state: ArcticRLRayServerState = None,
     ):
+        # Must happen in this process before AsyncArcticRLClient creates its
+        # transport.  In particular, WorkerDict actors use the reconnect path
+        # and do not inherit the TaskRunner's monkeypatch.
+        self._use_cortex = _patch_cortex_transport_if_needed()
         self.config = config
         # Per-backend yaml is loaded flat at `config.remote_backend`; the file
         # name (arctic.yaml) names the backend, so no extra nesting is needed.
@@ -425,7 +479,31 @@ class ArcticRLClientWrapper(RemoteBackend):
         if not training:
             ds_config.pop("data_types", None)
 
+        if getattr(self, "_use_cortex", False):
+            _strip_cortex_zero_offload(ds_config)
+
         return ds_config
+
+    def _arctic_inference_config_or_none(self) -> dict[str, Any] | None:
+        """C2 TRL leaves ``arctic_inference_config`` unset (plugin off).
+
+        Only forward the yaml block when FCA or speculative decoding is on.
+        A disabled ``remote_backend.rollout`` dict is still truthy and would
+        set ``ARCTIC_INFERENCE_ENABLED`` on the colocated HTTP path.
+        """
+        rollout_inference_cfg = self._backend_config.get("rollout", None)
+        if rollout_inference_cfg is None:
+            return None
+        cfg = OmegaConf.to_container(rollout_inference_cfg, resolve=True)
+        if not isinstance(cfg, dict):
+            return None
+        zorro = cfg.get("zorro_inference") or {}
+        spec = cfg.get("speculative_decoding") or {}
+        spec_model = (spec.get("model") or "").strip() if isinstance(spec, dict) else ""
+        zorro_on = isinstance(zorro, dict) and bool(zorro.get("enable"))
+        if zorro_on or spec_model:
+            return cfg
+        return None
 
     def reconnect_config(self):
         return self._client.reconnect_config()
@@ -484,6 +562,14 @@ class ArcticRLClientWrapper(RemoteBackend):
         n_log_prob_gpus = self._backend_config.get("log_prob_gpus", self.config.trainer.n_gpus_per_node)
         colocate = self._backend_config.get("colocate", True)
         attn_implementation = self.config.actor_rollout_ref.model.override_config.get("attn_implementation", "eager")
+        if self._use_cortex:
+            colocate = False
+            n_log_prob_gpus = 0
+            attn_implementation = "sdpa"
+            self.cuda_ipc_weight_sync = False
+            self.load_balancer = False
+            self.zorro_train_enable = False
+            self._validate_cortex_compat()
 
         actor_cfg = self.config.actor_rollout_ref.actor
         optim_cfg = actor_cfg.optim
@@ -515,27 +601,19 @@ class ArcticRLClientWrapper(RemoteBackend):
         )
 
         rollout_cfg = self.config.actor_rollout_ref.rollout
+        # C2 TRL SamplingConfig: TP, GPU util, eager, prefix-cache only.
+        # A non-empty yaml `remote_backend.rollout` block is not "plugin on".
+        gpu_mem = float(os.environ.get("GPU_MEM_UTIL", rollout_cfg.gpu_memory_utilization))
         vllm_config = {
             "tensor_parallel_size": self._backend_config.sampling_tp_size,
-            "gpu_memory_utilization": rollout_cfg.gpu_memory_utilization,
-            "max_model_len": rollout_cfg.get("max_model_len") or max_length,
-            "max_num_seqs": rollout_cfg.max_num_seqs,
-            "enforce_eager": rollout_cfg.enforce_eager,
-            "enable_chunked_prefill": rollout_cfg.enable_chunked_prefill,
+            "gpu_memory_utilization": gpu_mem,
+            "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "0") not in ("0", "false", "False"),
+            "enable_prefix_caching": os.environ.get("VLLM_PREFIX_CACHING", "1") not in ("0", "false", "False"),
         }
         if rollout_cfg.get("quantization"):
             vllm_config["quantization"] = rollout_cfg.quantization
 
-        # Arctic inference signals (FCA / speculative decoding) are NOT vLLM
-        # engine args: the server (arctic_platform.rl) expands this block via
-        # `parse_arctic_inference_rollout` and treats None/empty as "Arctic
-        # inference off". Pass the whole `remote_backend.rollout` sub-config
-        # through; the server keys on `zorro_inference.enable` /
-        # `speculative_decoding.model`.
-        rollout_inference_cfg = self._backend_config.get("rollout", None)
-        arctic_inference_config = (
-            OmegaConf.to_container(rollout_inference_cfg, resolve=True) if rollout_inference_cfg is not None else None
-        )
+        arctic_inference_config = self._arctic_inference_config_or_none()
 
         # Forward grad_clip to the DeepSpeed engine so it clips global grad-norm
         # to the same threshold verl applies in the FSDP path (otherwise DS
@@ -595,6 +673,22 @@ class ArcticRLClientWrapper(RemoteBackend):
             onprem_kwargs["port"] = 7000
             onprem_kwargs["launch_local_server"] = True
 
+        if self._use_cortex:
+            if not os.environ.get("ARCTIC_CORTEX_PAT") and os.environ.get("CORTEX_PAT"):
+                os.environ["ARCTIC_CORTEX_PAT"] = os.environ["CORTEX_PAT"]
+            if not os.environ.get("CORTEX_PAT") and os.environ.get("ARCTIC_CORTEX_PAT"):
+                os.environ["CORTEX_PAT"] = os.environ["ARCTIC_CORTEX_PAT"]
+            pat = os.environ.get("ARCTIC_CORTEX_PAT") or os.environ.get("CORTEX_PAT")
+            backend = CortexConfig(
+                host=os.environ["ARCTIC_CORTEX_HOST"],
+                database=os.environ["ARCTIC_CORTEX_DATABASE"],
+                schema=os.environ["ARCTIC_CORTEX_SCHEMA"],
+                endpoint=os.environ.get("ARCTIC_CORTEX_ENDPOINT", "cortex-training"),
+                pat=pat,
+            )
+        else:
+            backend = OnPremConfig(**onprem_kwargs)
+
         # attn_implementation also lives on ds_worker_config; keep it there for
         # the DeepSpeed worker (matches recipe/rl-correctness).
         ds_worker_config = self._create_ds_worker_config()
@@ -607,7 +701,8 @@ class ArcticRLClientWrapper(RemoteBackend):
             training_gpus=n_training_gpus,
             sampling_gpus=n_sampling_gpus,
             log_prob_gpus=n_log_prob_gpus,
-            backend=OnPremConfig(**onprem_kwargs),
+            job_ready_timeout=float(os.environ.get("ARCTIC_JOB_READY_TIMEOUT", "3600")),
+            backend=backend,
             training=TrainingConfig(
                 full_determinism=self._backend_config.train.determinism.get("full", False),
                 checkpoint_path=self.config.trainer.default_local_dir,
@@ -626,11 +721,14 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         # AsyncArcticRLClient is constructed as a ray remote actor with num_gpus=0,
         # which causes CUDA_VISIBLE_DEVICES to be empty.
-        if colocate:
-            num_visible = n_training_gpus + n_sampling_gpus + n_log_prob_gpus
+        if self._use_cortex:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
         else:
-            num_visible = rl_config.training_gpus + rl_config.sampling_gpus + rl_config.log_prob_gpus
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_visible))
+            if colocate:
+                num_visible = n_training_gpus + n_sampling_gpus + n_log_prob_gpus
+            else:
+                num_visible = rl_config.training_gpus + rl_config.sampling_gpus + rl_config.log_prob_gpus
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_visible))
 
         return AsyncArcticRLClient(rl_config)
 
@@ -657,7 +755,34 @@ class ArcticRLClientWrapper(RemoteBackend):
     # backends are free to pick their own wire format; verl never calls
     # these directly.
 
+    def _is_cortex_backend(self) -> bool:
+        return bool(getattr(self, "_use_cortex", False)) or isinstance(
+            getattr(getattr(self._client, "config", None), "backend", None), CortexConfig
+        )
+
+    def _validate_cortex_compat(self) -> None:
+        actor = self.config.actor_rollout_ref.actor
+        algo = getattr(self.config, "algorithm", None)
+        rollout = self.config.actor_rollout_ref.rollout
+        unsupported: list[str] = []
+        if getattr(actor, "use_kl_loss", False):
+            unsupported.append("actor.use_kl_loss=True")
+        if getattr(algo, "use_kl_in_reward", False):
+            unsupported.append("algorithm.use_kl_in_reward=True")
+        if int(getattr(actor, "ppo_epochs", 1)) > 1:
+            unsupported.append(f"actor.ppo_epochs={actor.ppo_epochs}")
+        adv = getattr(algo, "adv_estimator", "grpo") if algo is not None else "grpo"
+        if adv != "grpo":
+            unsupported.append(f"algorithm.adv_estimator={adv!r}")
+        multi_turn = getattr(rollout, "multi_turn", None)
+        if multi_turn is not None and getattr(multi_turn, "enable", False):
+            unsupported.append("rollout.multi_turn.enable=True")
+        if unsupported:
+            raise NotImplementedError("cortex backend does not support:\n  - " + "\n  - ".join(unsupported))
+
     async def _send_compute_ref_log_prob(self, payload: dict):
+        if self._is_cortex_backend():
+            raise NotImplementedError("cortex backend cannot serve reference-model log-probs; disable KL")
         payload["processing"] = {
             "post": ["compute_entropy_and_logprobs"],
             "loss_fn": None,
@@ -667,6 +792,26 @@ class ArcticRLClientWrapper(RemoteBackend):
         return response
 
     async def _send_compute_log_prob(self, payload: dict):
+        if self._is_cortex_backend():
+            from arctic_platform.client.transports.cortex_forward import normalize_forward_result
+            from arctic_platform.client.transports.cortex_forward import to_cortex_fwd_payload
+
+            cx = to_cortex_fwd_payload(payload)
+            print("[parity] operation_type=forward", flush=True)
+            response = normalize_forward_result(await self._client.fwd_no_grad(cx, reference_model=False))
+            lp = response["batch"].get("logprobs", response["batch"].get("log_probs"))
+            if lp is None:
+                raise RuntimeError(f"cortex fwd_no_grad returned no logprobs; keys={list(response.get('batch', {}))}")
+            from arctic_platform.integrations.verl.cortex_payload import _restore_from_left_align
+
+            attn = payload.get("batch", payload).get("attention_mask") if isinstance(payload, dict) else None
+            if attn is not None:
+                lp = _restore_from_left_align(lp, attn)
+            if torch.is_tensor(lp) and float(lp.abs().sum().item()) == 0.0:
+                raise RuntimeError("cortex compute_log_prob returned all-zero logprobs")
+            response["batch"]["log_probs"] = lp
+            response["batch"]["logprobs"] = lp
+            return response
         payload["processing"] = {
             "post": ["compute_entropy_and_logprobs"],
             "loss_fn": None,
@@ -676,6 +821,40 @@ class ArcticRLClientWrapper(RemoteBackend):
         return response
 
     async def _send_update_actor(self, payload: dict):
+        if self._is_cortex_backend():
+            from arctic_platform.integrations.verl.cortex_payload import actor_policy_metrics
+            from arctic_platform.integrations.verl.cortex_payload import to_cortex_fwd_bwd_payload
+
+            seq_len = payload["batch"]["input_ids"].shape[-1]
+            for name in ["old_log_probs", "advantages", "response_mask", "ref_log_prob"]:
+                if name in payload["batch"]:
+                    t = payload["batch"][name]
+                    pad_len = seq_len - t.shape[-1]
+                    if pad_len > 0:
+                        pad = torch.zeros(*t.shape[:-1], pad_len, dtype=t.dtype, device=t.device)
+                        payload["batch"][name] = torch.cat([pad, t], dim=-1)
+            payload["batch"]["loss_mask"] = payload["batch"]["response_mask"]
+            cx = to_cortex_fwd_bwd_payload(payload)
+            if "old_log_probs_shifted" not in cx["context"]:
+                raise RuntimeError("cortex fwd_bwd dropped old_log_probs_shifted")
+            fwd_bwd_response = await self._client.fwd_bwd(cx)
+            step_response = await self._client.step()
+            metrics = _merge_cortex_update_metrics(fwd_bwd_response, step_response)
+            body = fwd_bwd_response.get("batch") if isinstance(fwd_bwd_response.get("batch"), dict) else {}
+            new_lp = body.get("logprobs", body.get("log_probs"))
+            if new_lp is None:
+                new_lp = fwd_bwd_response.get("logprobs", fwd_bwd_response.get("log_probs"))
+            if new_lp is not None:
+                metrics.update(
+                    actor_policy_metrics(
+                        cx["context"]["old_log_probs_shifted"],
+                        new_lp,
+                        cx["context"]["loss_mask"],
+                    )
+                )
+            print(f"[parity] cortex update metric keys={sorted(metrics)}", flush=True)
+            return {"metrics": metrics}
+
         payload["processing"] = {
             "post": ["apply_temperature", "compute_entropy_and_logprobs"],
             "loss_fn": "verl_grpo",
@@ -697,7 +876,20 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         fwd_bwd_response = await self._client.fwd_bwd(payload)
         step_response = await self._client.step()
-        step_response["metrics"].update(**fwd_bwd_response["metrics"])
+        metrics = dict(fwd_bwd_response.get("metrics") or {})
+        body = fwd_bwd_response.get("batch") if isinstance(fwd_bwd_response.get("batch"), dict) else {}
+        new_lp = body.get("logprobs", body.get("log_probs"))
+        if new_lp is not None and "old_log_probs" in payload["batch"]:
+            from arctic_platform.integrations.verl.cortex_payload import actor_policy_metrics
+
+            metrics.update(
+                actor_policy_metrics(
+                    payload["batch"]["old_log_probs"],
+                    new_lp,
+                    payload["batch"]["loss_mask"],
+                )
+            )
+        step_response["metrics"].update(**metrics)
         return step_response
 
     async def save_checkpoint(self):

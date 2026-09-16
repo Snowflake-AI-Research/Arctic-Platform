@@ -39,14 +39,23 @@ the name ``"arctic"``:
 3. Rollout replica -- registered lazily with
    :class:`verl.workers.rollout.replica.RolloutReplicaRegistry` so
    ``actor_rollout_ref.rollout.name=arctic`` resolves to
-   :class:`ArcticReplica` without eagerly importing vLLM.
+   :class:`ArcticReplica` without importing vLLM (the driver is CPU-only
+   for both on-prem and Cortex; GPUs live on Arctic workers).
 """
 
 from __future__ import annotations
 
+import os
+
 from arctic_platform._dependency_groups import require_any_dep_group
 
-require_any_dep_group("verl")
+# [verl] includes [rl] → arctic-inference for on-prem local vLLM. Cortex
+# sampling is remote (`http://cortex-managed`); the plugin must not demand
+# that extra. Gate on the Cortex transport extra instead.
+if os.environ.get("ARCTIC_BACKEND", "").strip().lower() == "cortex":
+    require_any_dep_group("cortex")
+else:
+    require_any_dep_group("verl")
 
 from verl.remote_backend.base import RemoteBackendRegistry  # noqa: E402
 from verl.workers.rollout.replica import RolloutReplicaRegistry  # noqa: E402
