@@ -143,8 +143,21 @@ class ArcticClient(_ArcticClientCore):
         return out
 
     # ── training ─────────────────────────────────────────────────────────
-    def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
-        return self._call(fwd_bwd_request(self.jobs, batch, processing, router_replay))
+    def fwd_bwd(
+        self,
+        batch: dict,
+        *,
+        processing: dict | None = None,
+        router_replay: Any = None,
+    ) -> dict:
+        return self._call(
+            fwd_bwd_request(
+                self.jobs,
+                batch,
+                processing=processing,
+                router_replay=router_replay,
+            )
+        )
 
     def fwd_no_grad(self, batch: dict, processing: dict | None = None, reference_model: bool = False) -> dict:
         return self._call(fwd_no_grad_request(self.jobs, batch, processing, reference_model))
@@ -239,8 +252,21 @@ class AsyncArcticClient(_ArcticClientCore):
         return out
 
     # ── training ─────────────────────────────────────────────────────────
-    async def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
-        return await self._acall(fwd_bwd_request(self.jobs, batch, processing, router_replay))
+    async def fwd_bwd(
+        self,
+        batch: dict,
+        *,
+        processing: dict | None = None,
+        router_replay: Any = None,
+    ) -> dict:
+        return await self._acall(
+            fwd_bwd_request(
+                self.jobs,
+                batch,
+                processing=processing,
+                router_replay=router_replay,
+            )
+        )
 
     async def fwd_no_grad(self, batch: dict, processing: dict | None = None, reference_model: bool = False) -> dict:
         return await self._acall(fwd_no_grad_request(self.jobs, batch, processing, reference_model))
