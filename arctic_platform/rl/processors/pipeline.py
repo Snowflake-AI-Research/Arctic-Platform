@@ -92,8 +92,21 @@ _ENGINE_FWD_KEYS = frozenset(
         "attention_mask",
         "use_cache",
         "labels",
+        "inputs_embeds",
+        "past_key_values",
+        "logits_to_keep",
+        "temperature",
+        "action_masks",
+        "routed_experts",
+        "pixel_values",
+        "image_grid_thw",
         "dss_compute_logprobs",
         "calculate_entropy",
+        # Packed/varlen flash-attn aliases (``cu_seqlens`` itself stays blocked).
+        "cu_seq_lens_q",
+        "cu_seq_lens_k",
+        "max_length_q",
+        "max_length_k",
     }
 )
 # Blocked even if listed in ``fwd_meta_keys``. ``labels`` stays on the allowlist
@@ -103,7 +116,6 @@ _ENGINE_FWD_BLOCKED_KEYS = (
     BATCH_DIM_CONTEXT_KEYS
     | {
         "actor_config",
-        "temperature",
         "dp_size",
         "batch_num_tokens",
         "global_batch_size",

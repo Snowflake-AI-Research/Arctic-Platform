@@ -120,14 +120,34 @@ class TestIsolation(TestCasePlus):
         self.assertIn("input_ids", kwargs)
         self.assertIn("attention_mask", kwargs)
         self.assertIn("calculate_entropy", kwargs)
+        self.assertIn("temperature", kwargs)
         self.assertNotIn("advantages", kwargs)
         self.assertNotIn("loss_mask", kwargs)
         self.assertNotIn("actor_config", kwargs)
-        self.assertNotIn("temperature", kwargs)
         self.assertNotIn("dp_size", kwargs)
 
+    def test_engine_kwargs_keep_model_inputs(self):
+        batch = {
+            "input_ids": torch.arange(4).view(1, 4),
+            "attention_mask": torch.ones(1, 4, dtype=torch.long),
+            "action_masks": torch.ones(1, 4, dtype=torch.bool),
+            "pixel_values": torch.zeros(1, 3, 2, 2),
+            "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            "routed_experts": torch.zeros(1, 4, 1, 1, dtype=torch.long),
+            "advantages": torch.ones(1, 4),
+        }
+        meta = {"temperature": 0.7, "cu_seq_lens_q": torch.tensor([0, 4], dtype=torch.int32)}
+        kwargs = _engine_forward_kwargs(batch, meta)
+        self.assertIn("action_masks", kwargs)
+        self.assertIn("pixel_values", kwargs)
+        self.assertIn("image_grid_thw", kwargs)
+        self.assertIn("routed_experts", kwargs)
+        self.assertIn("temperature", kwargs)
+        self.assertIn("cu_seq_lens_q", kwargs)
+        self.assertNotIn("advantages", kwargs)
+
     def test_fwd_meta_keys_can_add_but_not_blocked_keys(self):
-        blocked = ("advantages", "loss_mask", "actor_config", "temperature", "dp_size")
+        blocked = ("advantages", "loss_mask", "actor_config", "dp_size")
         batch = {
             "input_ids": torch.arange(4).view(1, 4),
             "advantages": torch.ones(1, 4),
@@ -144,6 +164,7 @@ class TestIsolation(TestCasePlus):
         kwargs = _engine_forward_kwargs(batch, meta)
         self.assertIn("input_ids", kwargs)
         self.assertIn("use_cache", kwargs)
+        self.assertIn("temperature", kwargs)
         self.assertNotIn("fwd_meta_keys", kwargs)
         for key in blocked:
             self.assertNotIn(key, kwargs)
