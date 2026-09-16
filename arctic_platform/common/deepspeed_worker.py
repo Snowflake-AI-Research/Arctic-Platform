@@ -50,9 +50,6 @@ from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
-from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import apply_qwen35_sync_op
-from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import plan_qwen35_vllm_sync
-from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import to_vllm_sync_weights
 
 logger = logging.getLogger(__name__)
 
@@ -185,25 +182,9 @@ class DeepSpeedWorker:
 
         pr0(f"ds_worker[after_modify]: {self.job_type=} {ds_config=} {ds_worker_config=}")
 
-        # HF load + patches via ModelSpec (world_size already injected above).
+        # HF load + model-family patches (LM head, unused vision) via ModelSpec.
         spec = ModelSpec.from_ds_worker_config(model_name, ds_worker_config)
-        loaded = build_model(spec)
-        model = loaded.model
-        self._maybe_inject_fp32_lm_head(model, ds_worker_config)
-
-        # Qwen3.5 instantiates a ViT even on text-only jobs. Unused trainable
-        # params produce no grads and stall ZeRO-3 reduction; freeze them
-        # before DeepSpeed registers the param set.
-        from arctic_platform.model.implementations.qwen35.vlm import freeze_unused_vision_tower
-
-        frozen = freeze_unused_vision_tower(model, self.rank)
-        if frozen:
-            logger.info(
-                "rank=%d froze %d vision-tower params (text-only job; unused params "
-                "produce no grads and stall ZeRO-3 reduction)",
-                self.rank,
-                frozen,
-            )
+        model = build_model(spec).model
 
         zorro_train_enable = ds_worker_config.get("zorro_train_enable", False)
         self.dedup_actor_model_once_patcher = getattr(model, "_arctic_zorro_once_patcher", None)
@@ -213,6 +194,7 @@ class DeepSpeedWorker:
             # Forward-only (log-prob) engines are initialized without an
             # optimizer so DeepSpeed allocates no optimizer state.
             init_kwargs["model_parameters"] = model.parameters()
+        self._has_ds_scheduler = bool(ds_config.get("scheduler"))
         self.engine, _, _, _ = deepspeed.initialize(**init_kwargs)
         self._device = get_accelerator().device_name(self.engine.local_rank)
 
@@ -320,6 +302,12 @@ class DeepSpeedWorker:
         ds_config.setdefault("communication_data_type", "fp32")
         ds_config.setdefault("data_types", {"grad_accum_dtype": "fp32"})
 
+        # Token-budget packing uses a variable inner MB count. DeepSpeed
+        # unmanaged GAS lets backward() accumulate and engine.step() update.
+        if ds_worker_config.get("max_tokens_per_mb"):
+            ds_config.setdefault("gradient_accumulation_steps", 1)
+            ds_config["managed_gradient_accumulation"] = False
+
         return ds_config
 
     def ds_inference_config(self, log_prob_config: dict, ds_worker_config: dict) -> dict:
@@ -390,85 +378,22 @@ class DeepSpeedWorker:
         meta_data["global_num_tokens"] = global_tokens
         meta_data["dp_size"] = self.world_size
 
-    @staticmethod
-    def _import_inject_prime_lm_head():
-        """Load ``inject_prime_lm_head`` without importing ``models`` (flash-attn cute)."""
-        import importlib.util
-        import sys
-        import types
-        from pathlib import Path
-
-        name = "arctic_platform.model.implementations.qwen35.models.layers.lm_head"
-        cached = sys.modules.get(name)
-        if cached is not None and hasattr(cached, "inject_prime_lm_head"):
-            return cached.inject_prime_lm_head
-        qwen35 = Path(__file__).resolve().parents[1] / "model" / "implementations" / "qwen35"
-        models_pkg = "arctic_platform.model.implementations.qwen35.models"
-        layers_pkg = f"{models_pkg}.layers"
-        if models_pkg not in sys.modules:
-            models = types.ModuleType(models_pkg)
-            models.__path__ = [str(qwen35 / "models")]
-            models.__package__ = models_pkg
-            sys.modules[models_pkg] = models
-        if layers_pkg not in sys.modules:
-            layers = types.ModuleType(layers_pkg)
-            layers.__path__ = [str(qwen35 / "models" / "layers")]
-            layers.__package__ = layers_pkg
-            sys.modules[layers_pkg] = layers
-        spec = importlib.util.spec_from_file_location(name, qwen35 / "models" / "layers" / "lm_head.py")
-        if spec is None or spec.loader is None:
-            raise ImportError(f"cannot load {name} from {qwen35}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-        return module.inject_prime_lm_head
-
-    def _maybe_inject_fp32_lm_head(self, model, ds_worker_config: dict) -> None:
-        """Chunked fp32 LM head so train logprobs match xyu (bf16 head error ~1e-2)."""
-        want_fp32 = bool(ds_worker_config.get("fp32_lm_head", False))
-        chunk = ds_worker_config.get("fused_lm_head_token_chunk_size")
-        chunk_size = chunk if isinstance(chunk, int) else None
-        if not want_fp32 and chunk_size is None:
-            return
-        inject_prime_lm_head = self._import_inject_prime_lm_head()
-
-        fused_ce = ds_worker_config.get("fused_cross_entropy", False)
-        inject_prime_lm_head(
-            model,
-            chunk_size=chunk_size,
-            fused_cross_entropy=fused_ce,
-            fp32_lm_head=want_fp32,
-        )
-        logger.info(
-            "rank=%d injected lm_head fp32=%s chunk_size=%s fused_cross_entropy=%s",
-            self.rank,
-            want_fp32,
-            chunk_size,
-            fused_ce,
-        )
-
     def _inject_opd_global_token_config(self, loss_fn: str, batch_data, meta_data: dict, processing: dict) -> None:
-        """All-reduce ``loss_mask`` counts into OPD ``config`` + ``meta`` (like SFT).
-
-        Each microbatch then does ``sum(kl) / T_global * dp_size``. Without this,
-        ``agg_loss`` falls back to the local microbatch token count and a 29-token
-        rollout weighs the same as a 16k-token one.
-        """
-        if loss_fn != "on_policy_distill":
+        """Dispatch OPD / TRL global-token meta. Loss modules own the counts."""
+        if loss_fn == "weighted_gathered_logit_sum":
+            meta_data["dp_size"] = int(self.world_size)
             return
-        from arctic_platform.rl.processors.on_policy_distill import apply_opd_global_token_config
-        from arctic_platform.rl.processors.on_policy_distill import count_opd_loss_tokens
+        from arctic_platform.opd.processor import OPD_GLOBAL_TOKEN_LOSS_FNS
+        from arctic_platform.opd.processor import inject_opd_global_token_meta
 
-        local_tokens, local_seqs = count_opd_loss_tokens(batch_data)
-        counts = torch.tensor([local_tokens, local_seqs], device=self._device, dtype=torch.long)
-        if torch.distributed.is_available() and torch.distributed.is_initialized() and self.world_size > 1:
-            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
-        apply_opd_global_token_config(
-            processing,
+        if loss_fn not in OPD_GLOBAL_TOKEN_LOSS_FNS:
+            return
+        inject_opd_global_token_meta(
+            batch_data,
             meta_data,
-            dp_size=int(self.world_size),
-            batch_num_tokens=max(int(counts[0].item()), 1),
-            global_batch_size=max(int(counts[1].item()), 1),
+            processing,
+            device=self._device,
+            world_size=self.world_size,
         )
 
     def _forward_maybe_backward(self, batch: dict, backward: bool) -> dict:
@@ -608,8 +533,10 @@ class DeepSpeedWorker:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {micro_batch_output.keys()=}")
             pipeline_micro_batch_outputs.append(micro_batch_output)
 
-            # DS requires matching steps for backward pass
-            if backward and i < num_micro_batches - 1:
+            # Managed GAS: DeepSpeed expects a step() between outer microbatches.
+            # Unmanaged token-budget packing accumulates all inner MBs and steps
+            # once in DeepSpeedWorker.step().
+            if backward and i < num_micro_batches - 1 and not pack_by_token_budget:
                 self.engine.step()
 
         pipeline_outputs = dict()
@@ -683,7 +610,13 @@ class DeepSpeedWorker:
         from arctic_platform.common.utils import sft_profile
 
         if learning_rate is not None:
-            self._apply_learning_rate(float(learning_rate))
+            if getattr(self, "_has_ds_scheduler", False):
+                logger.warning(
+                    "ignoring step(learning_rate=%s); DeepSpeed scheduler owns the LR",
+                    learning_rate,
+                )
+            else:
+                self._apply_learning_rate(float(learning_rate))
         with sft_profile.timed("step"):
             self.engine.step()
             if sft_profile.enabled() and torch.cuda.is_available():
@@ -801,14 +734,16 @@ class DeepSpeedWorker:
         )
         return True
 
-    def _qwen35_sync_ops(self):
+    def _sync_ops(self):
+        from arctic_inference.server.weight_sync.adapters import plan_sync
+
         names = [n for n, _ in self.engine.module.named_parameters()]
-        cached = getattr(self, "_qwen35_sync_plan", None)
+        cached = getattr(self, "_sync_plan", None)
         key = tuple(names)
         if cached is not None and cached[0] == key:
             return cached[1]
-        ops = plan_qwen35_vllm_sync(names)
-        self._qwen35_sync_plan = (key, ops)
+        ops = plan_sync(names)
+        self._sync_plan = (key, ops)
         return ops
 
     def _gather_named_weights(self) -> list[tuple[str, torch.Tensor]]:
@@ -822,7 +757,9 @@ class DeepSpeedWorker:
         return weights
 
     def get_weights(self) -> list[tuple[str, torch.Tensor]]:
-        return to_vllm_sync_weights(self._gather_named_weights())
+        from arctic_inference.server.weight_sync.adapters import convert_weights
+
+        return convert_weights(self._gather_named_weights())
 
     def weight_norm(self) -> dict:
         """Global L2 norm of the model's parameters (sum of squares + count).
@@ -855,7 +792,9 @@ class DeepSpeedWorker:
         """Save weights to shared memory for colocated (same-GPU) transfer."""
         from arctic_inference.server.weight_sync.ipc_engine import save_weights_to_shm
 
-        weights = to_vllm_sync_weights([(n, p.data) for n, p in self.engine.module.named_parameters()])
+        from arctic_inference.server.weight_sync.adapters import convert_weights
+
+        weights = convert_weights([(n, p.data) for n, p in self.engine.module.named_parameters()])
         return save_weights_to_shm(weights, group_id)
 
     def get_cuda_ipc_handles(self) -> dict:
@@ -878,8 +817,10 @@ class DeepSpeedWorker:
         handles = []
         self._ipc_tensor_refs = []
 
+        from arctic_inference.server.weight_sync.adapters import convert_weights
+
         raw = [(name, p.data.detach().contiguous()) for name, p in self.engine.module.named_parameters()]
-        for name, weight in to_vllm_sync_weights(raw):
+        for name, weight in convert_weights(raw):
             weight = weight.detach().contiguous()
             self._ipc_tensor_refs.append(weight)
             handle = reduce_tensor(weight)
@@ -937,7 +878,9 @@ class DeepSpeedWorker:
             else:
                 raw.append((name, p.data.detach().contiguous()))
 
-        for name, weight in to_vllm_sync_weights(raw):
+        from arctic_inference.server.weight_sync.adapters import convert_weights
+
+        for name, weight in convert_weights(raw):
             weight = weight.detach().contiguous()
             self._ipc_tensor_refs.append(weight)
             handle = reduce_tensor(weight)
@@ -979,7 +922,7 @@ class DeepSpeedWorker:
         on each rank inside ``get_cuda_ipc_handle`` so ZeRO-3 ``ds_id`` / live
         storage is preserved.
         """
-        ops = self._qwen35_sync_ops()
+        ops = self._sync_ops()
         if ops is None:
             return [name for name, _ in self.engine.module.named_parameters()]
         return [op.dest for op in ops]
@@ -1011,7 +954,9 @@ class DeepSpeedWorker:
 
         gpu_uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
 
-        ops = self._qwen35_sync_ops()
+        from arctic_inference.server.weight_sync.adapters import apply_sync_op
+
+        ops = self._sync_ops()
         op = None
         if ops is not None:
             op = next((candidate for candidate in ops if candidate.dest == name), None)
@@ -1031,7 +976,7 @@ class DeepSpeedWorker:
                         src_tensors.append(p.data.detach().clone().contiguous())
                 else:
                     src_tensors.append(p.data.detach().contiguous())
-            weight = apply_qwen35_sync_op(op, src_tensors).detach().contiguous()
+            weight = apply_sync_op(op, src_tensors).detach().contiguous()
 
         # Hold exactly one source tensor alive until release_ipc_handles().
         self._ipc_tensor_refs = [weight]
@@ -1090,6 +1035,9 @@ class DeepSpeedWorker:
                 if self.rank == 0:
                     weights.append((n, p.data.cpu()))
         if self.rank == 0:
+            from arctic_inference.server.weight_sync.adapters import convert_weights
+
+            weights = convert_weights(weights)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             torch.save(weights, path)
         num_params = len(weights)

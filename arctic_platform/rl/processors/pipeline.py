@@ -104,33 +104,32 @@ def padded_tensor_2d_to_unpadded_tensor_1d(tensor_2d, attention_mask_2d_bool):
 
 
 def padded_tensor_2d_dict_to_unpadded_tensor_1d_dict(tensor_dict, attention_mask_2d_bool):
+    mask_leading = tuple(attention_mask_2d_bool.shape)
     for key, value in tensor_dict.items():
-        if torch.is_tensor(value) and value.shape == attention_mask_2d_bool.shape:
+        if torch.is_tensor(value) and value.ndim >= 2 and tuple(value.shape[:2]) == mask_leading:
             new_value = padded_tensor_2d_to_unpadded_tensor_1d(value, attention_mask_2d_bool)
             pr0(f"2d->1d {key=} {value.shape=} -> {new_value.shape=} {value.sum()=} -> {new_value.sum()=}")
-            # pr0(f"2d->1d: {value=}")
-            # pr0(f"2d->1d: {new_value=}")
-
             tensor_dict[key] = new_value
-
-        # else:
-        #     pr0(f"2d->1d {key=} skipped")
 
     return tensor_dict
 
 
 def unpadded_tensor_1d_to_padded_tensor_2d(tensor_1d, attention_mask_2d_bool, pad_value):
-
-    if tensor_1d.shape != attention_mask_2d_bool.shape:
-        ValueError(f"{tensor_1d.shape=} != {attention_mask_2d_bool.shape}")
-
+    packed = tensor_1d.squeeze(0) if tensor_1d.ndim >= 2 and tensor_1d.shape[0] == 1 else tensor_1d
+    extra = packed.shape[1:]
+    n_valid = int(attention_mask_2d_bool.sum().item())
+    if packed.shape[0] != n_valid:
+        raise ValueError(
+            f"packed leading length {packed.shape[0]} != valid tokens {n_valid} "
+            f"for tensor {tuple(tensor_1d.shape)} vs mask {tuple(attention_mask_2d_bool.shape)}"
+        )
     tensor_2d = torch.full(
-        attention_mask_2d_bool.shape,
+        attention_mask_2d_bool.shape + extra,
         fill_value=pad_value,
         dtype=tensor_1d.dtype,
         device=tensor_1d.device,
     )
-    tensor_2d[attention_mask_2d_bool] = tensor_1d.view(-1)
+    tensor_2d[attention_mask_2d_bool] = packed
     return tensor_2d
 
 
@@ -611,6 +610,7 @@ def _run_pipeline_with_packing(
     mb_spec = MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb)
     mb_list = split_padded_tensor_dict_into_mb_list(all_input, mb_spec)
     n_mbs = len(mb_list.mbs)
+    pr0(f"pack n_mbs={n_mbs} max_tokens_per_mb={max_tokens_per_mb}")
 
     captured_losses: list[float] = []
     captured_metrics: list[dict] = []
@@ -631,8 +631,9 @@ def _run_pipeline_with_packing(
         }
         mb_kwargs.update(derive_varlen_model_kwargs(packed))
 
-        if backward is True and hasattr(engine, "set_gradient_accumulation_boundary"):
-            engine.set_gradient_accumulation_boundary(i == n_mbs - 1)
+        # Unmanaged GAS: backward() only accumulates; engine.step() in
+        # DeepSpeedWorker.step() is the optimizer boundary. Do not call
+        # set_gradient_accumulation_boundary (managed-mode API).
 
         result = run_pipeline(
             engine,
@@ -680,12 +681,13 @@ def _run_pipeline_with_packing(
         # kl/per_token to Sum(S*c)/Sum(c^2) instead of Sum(S)/Sum(c).
         avg_loss = sum(captured_losses)
         combined_metrics = combine_metric_microbatches(captured_metrics) if captured_metrics else {}
+        combined_metrics["pack_n_mbs"] = float(n_mbs)
         result = {"avg_loss": avg_loss, "metrics": combined_metrics}
         if batch_out:
             result["batch"] = detensorize(batch_out)
         return result
 
-    return {"batch": detensorize(batch_out), "metrics": {}}
+    return {"batch": detensorize(batch_out), "metrics": {"pack_n_mbs": float(n_mbs)}}
 
 
 # ---------------------------------------------------------------------------

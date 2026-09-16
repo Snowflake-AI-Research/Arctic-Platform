@@ -48,18 +48,19 @@ GPUs). Neutrino / ``--image-tag`` are omitted::
       --wandb-run-name opd3n_qwen35_4b_27b_lr2e-5 \\
       --attn flash_attention_3
 
-1-node 8-GPU pack (train 2 + student-infer 2 + teacher-infer 4), used when
-only one box is available::
+1-node 8-GPU pack scaled from the 3-node v14/v16 recipe (4 train + 2
+student-infer on Qwen3.5-0.8B, 2 teacher-infer on Qwen3.5-4B, teacher
+TP=1). Same thinking-ON, batch 16, seq lengths, and lr as v16::
 
     python -m arctic_platform.opd.examples.run_on_policy_distill \\
       --live \\
-      --student-model Qwen/Qwen3.5-4B \\
-      --teacher-model Qwen/Qwen3.6-27B \\
-      --training-gpus 2 --sampling-gpus 2 --teacher-sampling-gpus 4 \\
-      --student-tp 1 --teacher-tp 2 \\
+      --student-model Qwen/Qwen3.5-0.8B \\
+      --teacher-model Qwen/Qwen3.5-4B \\
+      --training-gpus 4 --sampling-gpus 2 --teacher-sampling-gpus 2 \\
+      --student-tp 1 --teacher-tp 1 \\
       --no-colocate \\
-      --server-cuda-visible-devices 0,1,2,3 \\
-      --teacher-server-cuda-visible-devices 4,5,6,7 \\
+      --server-cuda-visible-devices 0,1,2,3,4,5 \\
+      --teacher-server-cuda-visible-devices 6,7 \\
       --steps 152 --batch-size 16 \\
       --max-prompt-len 30144 --max-new-tokens 16384 --seq-len 46592 \\
       --prompts-file /data/xyu/important/opd_prompts_30720.jsonl \\
@@ -68,10 +69,11 @@ only one box is available::
       --max-num-batched-tokens 2048 --max-tokens-per-mb 46592 \\
       --gpu-memory-utilization 0.85 \\
       --shuffle --seed 0 \\
-      --save-every 25 --checkpoint-dir /data-fast/truwase/opd_qwen35_4b27b_1node_ckpt \\
-      --metrics-jsonl opd_qwen35_4b27b_1node_metrics.jsonl \\
+      --save-every 25 --checkpoint-dir /data-fast/truwase/opd_qwen35_0p8b_4b_1node_ckpt \\
+      --metrics-jsonl opd_qwen35_0p8b_4b_1node_metrics.jsonl \\
       --wandb-project arctic-opd-1node \\
-      --wandb-run-name opd3n_20260812_194823_lr2e-5-1node \\
+      --wandb-run-name opd1n_qwen35_0p8b_4b_lr2e-5 \\
+      --enable-thinking \\
       --attn flash_attention_3
 
 1+1+1 debug pack (one node, three GPUs; teacher TP=1)::
@@ -338,6 +340,9 @@ def build_batch(rollouts: list[dict[str, Any]], pad_token_id: int, max_seq_len: 
     }
 
 
+COS_MIN_RATIO = 0.1
+
+
 def lr_at(
     step: int,
     peak_lr: float,
@@ -346,14 +351,14 @@ def lr_at(
     schedule: str = "linear",
     total_steps: int | None = None,
 ) -> float:
-    """xyu ``lr_at``: warmup then cosine floored at 10% of peak. Applied via ``step(lr)``."""
+    """Reference curve: warmup then cosine floored at 10% of peak (``COS_MIN_RATIO``)."""
     if warmup_steps > 0 and step < warmup_steps:
         return peak_lr * (step + 1) / warmup_steps
     if schedule != "cosine":
         return peak_lr
     span = max(1, (total_steps or 0) - max(warmup_steps, 0))
     frac = min(1.0, max(0.0, float(step - warmup_steps) / float(span)))
-    return peak_lr * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * frac)))
+    return peak_lr * (COS_MIN_RATIO + (1.0 - COS_MIN_RATIO) * 0.5 * (1.0 + math.cos(math.pi * frac)))
 
 
 def prompt_content_from_record(record: dict[str, Any]) -> str | list[dict[str, Any]]:
@@ -583,7 +588,7 @@ def train_step(
     prompt_ids: list[list[int]],
     pad_token_id: int,
     max_seq_len: int,
-    learning_rate: float,
+    learning_rate: float | None = None,
     *,
     max_tokens: int = 32,
     processing: dict[str, Any] | None = None,
@@ -618,7 +623,7 @@ def train_step(
     )
     fwdbwd_s = time.monotonic() - t_phase
     t_phase = time.monotonic()
-    step_result = client.step(learning_rate)
+    step_result = client.step(learning_rate) if learning_rate is not None else client.step()
     sync_result = client.sync_weights()
     step_sync_s = time.monotonic() - t_phase
     tokens_scored = sum(len(row["completion_ids"]) for row in scored)
@@ -724,6 +729,7 @@ def build_step_record(
         ("sampler_train_kl_sum", "sampler_train_kl_sum"),
         ("distill_batch_num_tokens", "distill_batch_num_tokens"),
         ("distill_dp_size", "distill_dp_size"),
+        ("pack_n_mbs", "pack_n_mbs"),
         ("distill_kl.sum", "distill_kl.sum"),
         ("distill_kl.tokens", "distill_kl.tokens"),
         ("loss.sum", "loss.sum"),
@@ -796,9 +802,40 @@ def _ds_config(args: argparse.Namespace) -> dict[str, Any]:
         ds_config["train_micro_batch_size_per_gpu"] = per_gpu
         ds_config["gradient_accumulation_steps"] = 1
         ds_config["train_batch_size"] = per_gpu * args.training_gpus
-    # LR schedule is applied per step via ``step(lr)`` (xyu ``lr_at``), not a
-    # DeepSpeed scheduler that would overwrite the client LR.
+        ds_config["managed_gradient_accumulation"] = False
+    scheduler = _ds_scheduler(args)
+    if scheduler is not None:
+        ds_config["scheduler"] = scheduler
     return ds_config
+
+
+def _ds_scheduler(args: argparse.Namespace) -> dict[str, Any] | None:
+    """DeepSpeed scheduler matching ``lr_at`` (linear warmup, cosine floor 10%)."""
+    warmup_steps = int(getattr(args, "warmup_steps", 0) or 0)
+    total_steps = int(getattr(args, "steps", 0) or 0)
+    schedule = getattr(args, "lr_schedule", "linear")
+    if schedule == "cosine" and total_steps > 0:
+        return {
+            "type": "WarmupCosineLR",
+            "params": {
+                "total_num_steps": total_steps,
+                "warmup_num_steps": warmup_steps,
+                "warmup_min_ratio": 0.0,
+                "cos_min_ratio": COS_MIN_RATIO,
+                "warmup_type": "linear",
+            },
+        }
+    if warmup_steps > 0:
+        return {
+            "type": "WarmupLR",
+            "params": {
+                "warmup_min_lr": 0.0,
+                "warmup_max_lr": args.lr,
+                "warmup_num_steps": warmup_steps,
+                "warmup_type": "linear",
+            },
+        }
+    return None
 
 
 def build_live_client(args: argparse.Namespace):
@@ -901,7 +938,10 @@ def build_live_client(args: argparse.Namespace):
         teacher_sampling_gpus=args.teacher_sampling_gpus,
         training=TrainingConfig(
             checkpoint_path=checkpoint_path,
-            cuda_ipc=True,
+            # CUDA IPC needs the sampler GPU UUIDs in the trainer's visible set
+            # (colocated or 1+1+1). 4T+2S on one box uses disjoint devices, so
+            # --no-colocate must NCCL-sync instead.
+            cuda_ipc=bool(args.colocate),
             ds_config=_ds_config(args),
             ds_worker_config={
                 "attn_implementation": train_attn,
@@ -931,6 +971,8 @@ def build_live_client(args: argparse.Namespace):
             server_extra_env={
                 "FLA_TILELANG": "0",
                 "FLA_DISABLE_BACKEND_DISPATCH": "1",
+                # vLLM 0.26 may pull flashinfer-python 0.6.14 while cubin stays 0.6.12.
+                "FLASHINFER_DISABLE_VERSION_CHECK": "1",
                 **(
                     {"VLLM_FLASH_ATTN_VERSION": str(args.vllm_flash_attn_version)}
                     if args.vllm_flash_attn_version is not None
@@ -995,23 +1037,17 @@ def live_main(args: argparse.Namespace) -> None:
     tokens_cumulative = 0
     try:
         for step, batch_prompts in enumerate(batches):
-            learning_rate = lr_at(
-                step,
-                args.lr,
-                args.warmup_steps,
-                schedule=args.lr_schedule,
-                total_steps=args.steps,
-            )
             result = train_step(
                 client,
                 batch_prompts,
                 pad_token_id,
                 args.max_seq_len,
-                learning_rate,
                 max_tokens=args.max_tokens,
                 processing=processing,
             )
             tokens_cumulative += int(result.get("tokens_scored") or 0)
+            raw_lr = _maybe_metric(((result.get("step") or {}).get("metrics") or {}).get("last_lr"))
+            learning_rate = args.lr if raw_lr is None else raw_lr
             record = build_step_record(
                 step=step + 1,
                 learning_rate=learning_rate,
@@ -1053,6 +1089,8 @@ def live_main(args: argparse.Namespace) -> None:
                 line += f" sampler_train_abs_delta_max={_metric(record['sampler_train_abs_delta_max']):.4g}"
             if record.get("grad_norm") is not None:
                 line += f" grad_norm={_metric(record['grad_norm']):.4g}"
+            if record.get("pack_n_mbs") is not None:
+                line += f" pack_n_mbs={int(record['pack_n_mbs'])}"
             print(line, flush=True)
             if args.save_every and (step + 1) % args.save_every == 0:
                 save_result = client.save_checkpoint(step=step + 1, path=checkpoint_path)

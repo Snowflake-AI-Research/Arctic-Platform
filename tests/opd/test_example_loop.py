@@ -21,7 +21,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from arctic_platform.opd.examples.run_on_policy_distill import _SYNC_ZERO_RUN
+from arctic_platform.opd.examples.run_on_policy_distill import COS_MIN_RATIO
 from arctic_platform.opd.examples.run_on_policy_distill import _ds_config
+from arctic_platform.opd.examples.run_on_policy_distill import _ds_scheduler
 from arctic_platform.opd.examples.run_on_policy_distill import _student_gpu_memory_utilization
 from arctic_platform.opd.examples.run_on_policy_distill import build_parser
 from arctic_platform.opd.examples.run_on_policy_distill import build_step_record
@@ -210,7 +212,11 @@ def test_ds_config_cosine_and_gas():
     assert ds["train_micro_batch_size_per_gpu"] == 1
     assert ds["gradient_accumulation_steps"] == 4
     assert ds["zero_optimization"]["stage"] == 1
-    assert "scheduler" not in ds
+    sched = ds["scheduler"]
+    assert sched["type"] == "WarmupCosineLR"
+    assert sched["params"]["cos_min_ratio"] == COS_MIN_RATIO
+    assert sched["params"]["warmup_num_steps"] == 8
+    assert sched["params"]["total_num_steps"] == 152
     packed = _ds_config(
         SimpleNamespace(
             batch_size=8,
@@ -223,8 +229,18 @@ def test_ds_config_cosine_and_gas():
         )
     )
     assert packed["gradient_accumulation_steps"] == 1
+    assert packed["managed_gradient_accumulation"] is False
     assert packed["train_micro_batch_size_per_gpu"] == 4
     assert packed["train_batch_size"] == 8
+
+
+def test_ds_scheduler_matches_lr_at_floor():
+    args = SimpleNamespace(lr=2e-5, lr_schedule="cosine", steps=152, warmup_steps=8)
+    sched = _ds_scheduler(args)
+    assert sched is not None
+    assert sched["params"]["cos_min_ratio"] == COS_MIN_RATIO
+    last = lr_at(151, 2e-5, 8, schedule="cosine", total_steps=152)
+    assert last > COS_MIN_RATIO * 2e-5 * 0.99
 
 
 def test_student_util_defaults_and_xyu_aliases():
