@@ -29,6 +29,9 @@ servers accept this canonical shape directly.
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from typing import Any
 from typing import Literal
 
@@ -67,6 +70,47 @@ class OnPremConfig(BaseModel):
     startup_timeout: float = Field(
         600.0, description="onprem: seconds to wait for a launched server to become healthy."
     )
+
+
+def _cortex_training_connection() -> dict[str, Any]:
+    """Read the ``cortex-training`` CLI's connection file, or return ``{}``.
+
+    That CLI stores the *path* to a connection JSON rather than its contents,
+    so a logged-in user's credentials take two hops to reach: the login state,
+    then the file it names. ``CORTEX_TRAINING_CONFIG`` names one directly.
+
+    An unreadable or malformed file reads as absent. This is a fallback for a
+    connection nobody supplied, and ``_check`` still refuses an empty one — so
+    failing here would replace a message about the missing connection with one
+    about the file, which is rarely the user's actual problem.
+    """
+    path = os.environ.get("CORTEX_TRAINING_CONFIG")
+    if not path:
+        config_home = os.environ.get("XDG_CONFIG_HOME")
+        base = Path(config_home) if config_home else Path.home() / ".config"
+        try:
+            state = json.loads((base / "cortex-training" / "login.json").read_text(encoding="utf-8"))
+            path = state.get("config_path") if isinstance(state, dict) else None
+        except (OSError, json.JSONDecodeError):
+            return {}
+    if not path:
+        return {}
+    try:
+        conn = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(conn, dict):
+        return {}
+
+    # host and base_url are mutually exclusive, so emit one: a file carrying
+    # both would otherwise land on the base_url branch and quietly skip auth.
+    values = {"host": conn.get("host")} if conn.get("host") else {"base_url": conn.get("base_url")}
+    values["database"] = conn.get("database")
+    values["schema_"] = conn.get("schema")
+    values["endpoint"] = conn.get("endpoint")
+    # The CLI supports keeping the PAT out of the file and in the environment.
+    values["pat"] = conn.get("pat") or os.environ.get("CORTEX_TRAINING_PAT")
+    return {key: value for key, value in values.items() if value}
 
 
 class CortexConfig(BaseSettings):
@@ -116,6 +160,28 @@ class CortexConfig(BaseSettings):
     )
     endpoint: str = Field("cortex-training", description="cortex: SnowAPI endpoint name.")
     max_retries: int = Field(10, ge=0, description="cortex: transient-failure retries per HTTP request (tenacity).")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fall_back_to_cli_connection(cls, data: Any) -> Any:
+        """Adopt the ``cortex-training`` CLI's connection when given none.
+
+        Without this, every caller has to export ``ARCTIC_CORTEX_*`` even
+        though `cortex-training login` already put the same four values on
+        disk. Runs only when no connection arrived from the constructor or the
+        environment, so a supplied one is never blended with the file's.
+        """
+        if not isinstance(data, dict) or data.get("host") or data.get("base_url"):
+            return data
+        conn = _cortex_training_connection()
+        if not conn:
+            return data
+        # `schema` is the env/alias spelling of the `schema_` field; keeping
+        # both would leave the alias resolution deciding which one lands.
+        if "schema" in data:
+            conn.pop("schema_", None)
+        conn.update({key: value for key, value in data.items() if value is not None})
+        return conn
 
     @model_validator(mode="after")
     def _check(self) -> Self:

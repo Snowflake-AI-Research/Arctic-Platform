@@ -410,18 +410,25 @@ class TestWeightSyncStrategyInit:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_arctic_env(monkeypatch):
+def _isolate_arctic_env(monkeypatch, tmp_path):
     """Clear ``ARCTIC_CORTEX_*`` before each test.
 
     ``CortexConfig`` is a ``BaseSettings``, so it reads the ambient environment
     at construction; a var leaked in from the developer's shell would otherwise
     decide the outcome of these tests.
+
+    It also falls back to the ``cortex-training`` CLI's connection file, so
+    point the lookup at an empty directory: on a developer's machine a real
+    login would otherwise satisfy configs these tests expect to be incomplete.
     """
     import os
 
     for k in list(os.environ):
         if k.startswith("ARCTIC_CORTEX_"):
             monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv("CORTEX_TRAINING_CONFIG", raising=False)
+    monkeypatch.delenv("CORTEX_TRAINING_PAT", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty-config-home"))
 
 
 class TestCortexConfigReadsEnv:
@@ -496,6 +503,166 @@ class TestCortexConfigReadsEnv:
         from arctic_platform.client import CortexConfig
 
         assert CortexConfig().endpoint == "cortex-training"
+
+
+class TestCortexConfigFallsBackToCliConnection:
+    """With no connection supplied, ``CortexConfig`` reads the connection file
+    the ``cortex-training`` CLI points at.
+
+    Recipes run the trainer in an isolated interpreter that inherits only the
+    environment, so without this every user exports the same four values that
+    `cortex-training login` already recorded on disk.
+    """
+
+    @staticmethod
+    def _write_conn(tmp_path, **overrides):
+        import json
+
+        conn = {
+            "host": "file.snowflakecomputing.com",
+            "pat": "pat-from-file",
+            "database": "FILE_DB",
+            "schema": "FILE_SCHEMA",
+        }
+        conn.update(overrides)
+        path = tmp_path / "connection.json"
+        path.write_text(json.dumps({k: v for k, v in conn.items() if v is not None}), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _write_login_state(tmp_path, config_path):
+        """Mimic `cortex-training login`, which records the path, not the config."""
+        import json
+
+        state_dir = tmp_path / "config-home" / "cortex-training"
+        state_dir.mkdir(parents=True)
+        (state_dir / "login.json").write_text(json.dumps({"config_path": str(config_path)}), encoding="utf-8")
+        return tmp_path / "config-home"
+
+    def test_config_env_supplies_the_connection(self, monkeypatch, tmp_path):
+        from arctic_platform.client import CortexConfig
+
+        monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(self._write_conn(tmp_path)))
+
+        cfg = CortexConfig()
+        assert cfg.host == "file.snowflakecomputing.com"
+        assert cfg.database == "FILE_DB"
+        assert cfg.schema_ == "FILE_SCHEMA"
+        assert cfg.pat.get_secret_value() == "pat-from-file"
+
+    def test_login_state_supplies_the_connection(self, monkeypatch, tmp_path):
+        from arctic_platform.client import CortexConfig
+
+        conn = self._write_conn(tmp_path)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(self._write_login_state(tmp_path, conn)))
+
+        assert CortexConfig().host == "file.snowflakecomputing.com"
+
+    def test_environment_wins_over_the_file(self, monkeypatch, tmp_path):
+        """A shell that names a host owns the whole connection.
+
+        Mixing the two would let the file's fields attach to a different
+        account than the one the caller asked for.
+        """
+        from arctic_platform.client import CortexConfig
+
+        monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(self._write_conn(tmp_path)))
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "env.snowflakecomputing.com")
+        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "ENV_DB")
+        monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "ENV_SCHEMA")
+        monkeypatch.setenv("ARCTIC_CORTEX_PAT", "pat-from-env")
+
+        cfg = CortexConfig()
+        assert cfg.host == "env.snowflakecomputing.com"
+        assert cfg.database == "ENV_DB"
+        assert cfg.schema_ == "ENV_SCHEMA"
+        assert cfg.pat.get_secret_value() == "pat-from-env"
+
+    def test_a_base_url_file_does_not_hijack_an_exported_host(self, monkeypatch, tmp_path):
+        """`base_url` bypasses PAT auth, so it must not sneak in beside a host."""
+        from arctic_platform.client import CortexConfig
+
+        conn = self._write_conn(tmp_path, host=None, base_url="http://from-file")
+        monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(conn))
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "env.snowflakecomputing.com")
+        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "ENV_DB")
+        monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "ENV_SCHEMA")
+        monkeypatch.setenv("ARCTIC_CORTEX_PAT", "pat-from-env")
+
+        cfg = CortexConfig()
+        assert cfg.base_url is None
+        assert cfg.host == "env.snowflakecomputing.com"
+
+    def test_explicit_values_win_over_the_file(self, monkeypatch, tmp_path):
+        from arctic_platform.client import CortexConfig
+
+        monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(self._write_conn(tmp_path)))
+
+        cfg = CortexConfig(host="explicit.snowflakecomputing.com", database="D", schema_="S", pat="p")
+        assert cfg.host == "explicit.snowflakecomputing.com"
+        assert cfg.schema_ == "S"
+
+    def test_pat_may_live_in_the_environment_instead(self, monkeypatch, tmp_path):
+        """The CLI documents omitting `pat` from the file and exporting it."""
+        from arctic_platform.client import CortexConfig
+
+        monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(self._write_conn(tmp_path, pat=None)))
+        monkeypatch.setenv("CORTEX_TRAINING_PAT", "pat-from-cli-env")
+
+        assert CortexConfig().pat.get_secret_value() == "pat-from-cli-env"
+
+    @pytest.mark.parametrize(
+        "contents",
+        ["not json at all", '["a", "list"]'],
+        ids=["corrupt", "not_an_object"],
+    )
+    def test_unusable_file_reads_as_no_connection(self, monkeypatch, tmp_path, contents):
+        """The fallback stays quiet so the error names the missing connection,
+        which is what the user has to fix, rather than the file."""
+        from arctic_platform.client import CortexConfig
+
+        path = tmp_path / "connection.json"
+        path.write_text(contents, encoding="utf-8")
+        monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(path))
+
+        with pytest.raises(ValidationError, match="set base_url"):
+            CortexConfig()
+
+    def test_login_state_pointing_at_a_moved_file(self, monkeypatch, tmp_path):
+        from arctic_platform.client import CortexConfig
+
+        state = self._write_login_state(tmp_path, tmp_path / "moved-away.json")
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(state))
+
+        with pytest.raises(ValidationError, match="set base_url"):
+            CortexConfig()
+
+    def test_no_login_and_no_file_is_unchanged(self, monkeypatch, tmp_path):
+        from arctic_platform.client import CortexConfig
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "nothing-here"))
+
+        with pytest.raises(ValidationError, match="set base_url"):
+            CortexConfig()
+
+    def test_file_pat_is_still_masked(self, monkeypatch, tmp_path):
+        """Hydrating from disk must not weaken the SecretStr guarantee."""
+        from arctic_platform.client import CortexConfig
+
+        monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(self._write_conn(tmp_path, pat="SUPERSECRET456")))
+
+        cfg = CortexConfig()
+        assert "SUPERSECRET456" not in repr(cfg)
+        assert "SUPERSECRET456" not in cfg.model_dump_json()
+        assert cfg.pat.get_secret_value() == "SUPERSECRET456"
+
+    def test_onprem_backend_ignores_the_file(self, monkeypatch, tmp_path):
+        """A login is not a request to run on Cortex."""
+        monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(self._write_conn(tmp_path)))
+
+        cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(), training_gpus=1)
+        assert cfg.backend.type == "onprem"
+        assert not hasattr(cfg.backend, "pat")
 
 
 class TestUnifiedConfigDoesNotReadEnv:

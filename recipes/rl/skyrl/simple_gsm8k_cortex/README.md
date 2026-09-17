@@ -51,7 +51,17 @@ that [`../README.md`](../README.md) prescribes for the FSDP recipes. It never
 constructs an FSDP worker, so the `named_non_persistent_buffers` breakage that
 keeps those recipes on the fork does not reach this path.
 
-## 2. Set Cortex env
+## 2. Point at a Cortex account
+
+If you use the `cortex-training` CLI, logging in is enough:
+
+```bash
+cortex-training login ~/cortex-training-config.json
+```
+
+`CortexConfig` reads that connection file, so there is nothing to export.
+`CORTEX_TRAINING_CONFIG=<path>` names a connection file without logging in. To
+skip the file entirely, export the values instead:
 
 ```bash
 export ARCTIC_CORTEX_HOST=<account>.<region>.snowflakecomputing.com
@@ -61,7 +71,10 @@ export ARCTIC_CORTEX_PAT=<your PAT>
 ```
 
 `CortexConfig` is a `pydantic-settings` model, so these populate it directly
-and explicit constructor or YAML values still win.
+and explicit constructor or YAML values still win. A connection in the
+environment is used whole rather than merged with the file's, so the two cannot
+combine into an account you did not ask for. The launcher prints which account
+it resolved, and stops with an error naming both options if it finds neither.
 
 There is no variable that selects the backend. The launcher passes
 `trainer.override_entrypoint=arctic_platform.integrations.skyrl.entrypoint`,
@@ -214,7 +227,8 @@ Two consequences for scaling up:
 | `run_engines_locally=false requires external_proxy_url or external_server_urls` | The placeholder URL list didn't reach the config. The launcher derives it from `NUM_ENGINES`; setting `generator.inference_engine.*` by hand breaks that. |
 | `remote_urls is no longer supported` | You are on a launcher older than `skyrl-v0.3.0` support. Current launchers pass only `external_server_urls`. |
 | `Failed to spawn: --python` from `(raylet)` | `RAY_ENABLE_UV_RUN_RUNTIME_ENV` was re-enabled. Ray then replays the driver's `uv run --isolated` line per worker, which spawns a broken command. The launcher sets it to `0`. |
-| `cortex: set base_url (direct URL) or host (PAT auth)` | The `ARCTIC_CORTEX_*` environment isn't set in this shell. See step 2. |
+| `no Cortex connection` | Neither a `cortex-training` login nor `ARCTIC_CORTEX_*` resolved. A login pointing at a file that moved or no longer parses reads as absent, so log in again if you expected one. See step 2. |
+| `cortex: database + schema required for host/PAT auth` | A connection resolved but is incomplete, usually a file carrying `host` without `database` or `schema`. See step 2. |
 
 ## Notes
 

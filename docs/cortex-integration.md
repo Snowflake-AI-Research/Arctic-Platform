@@ -109,3 +109,13 @@ entrypoint the recipe names.
 | `ARCTIC_CORTEX_DATABASE` | *(required for PAT auth)* | Snowflake database. |
 | `ARCTIC_CORTEX_SCHEMA` | *(required for PAT auth)* | Snowflake schema. |
 | `ARCTIC_CORTEX_ENDPOINT` | `cortex-training` | SnowAPI endpoint name. |
+
+With none of `_HOST` or `_BASE_URL` set, `CortexConfig` falls back to the
+`cortex-training` CLI's connection file — named by `CORTEX_TRAINING_CONFIG`, or
+recorded by `cortex-training login` — and takes `host`, `base_url`, `database`,
+`schema`, `endpoint`, and `pat` from it, with `CORTEX_TRAINING_PAT` covering a
+file that omits the token. A connection given explicitly or in the environment
+is used whole rather than merged with the file's, so the two cannot combine
+into an account nobody asked for. An unreadable or malformed file reads as
+absent, leaving the usual "set base_url or host" error to name the real
+problem.

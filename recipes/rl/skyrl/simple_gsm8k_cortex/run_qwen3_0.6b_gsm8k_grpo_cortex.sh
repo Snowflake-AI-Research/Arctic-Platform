@@ -4,7 +4,8 @@
 #
 # Pre-reqs (see README.md):
 #   1. SkyRL cloned at skyrl-v0.3.0 with SKYRL_HOME exported.
-#   2. ARCTIC_CORTEX_* env vars set (see README.md step 2).
+#   2. A Cortex account, via `cortex-training login` or ARCTIC_CORTEX_* env
+#      vars (see README.md step 2).
 #   3. Data: README.md step 3 -> $DATA_DIR/{train,validation}.parquet.
 #
 # Python deps resolve through `uv run --isolated` below, the same pattern
@@ -47,6 +48,34 @@ if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; th
     echo "ERROR: SKYRL_HOME is unset or doesn't contain integrations/arctic_rl/."
     exit 1
 fi
+
+# The client takes its connection from ARCTIC_CORTEX_*, falling back to the
+# connection file `cortex-training login` records, so either is enough. Resolve
+# it up front and say which account won: everything downstream that touches the
+# connection keeps its errors non-fatal, which would otherwise defer a bad one
+# to a Hydra traceback several minutes into the run.
+if ! _CORTEX_TARGET="$(uv run --isolated --no-project --with "${AP_ROOT}[cortex]" \
+    -- python - <<'PY'
+import sys
+
+from pydantic import ValidationError
+
+from arctic_platform.client import CortexConfig
+
+try:
+    cfg = CortexConfig()
+except ValidationError:
+    sys.exit(
+        "ERROR: no Cortex connection. Either run\n"
+        "         cortex-training login <config.json>\n"
+        "       or export ARCTIC_CORTEX_HOST, _DATABASE, _SCHEMA, and _PAT."
+    )
+print(cfg.base_url or f"{cfg.host} {cfg.database}.{cfg.schema_}")
+PY
+)"; then
+    exit 1
+fi
+echo "Cortex target: ${_CORTEX_TARGET}"
 export PYTHONPATH="${SKYRL_HOME}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
