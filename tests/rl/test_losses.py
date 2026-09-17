@@ -31,6 +31,7 @@ from __future__ import annotations
 import torch
 
 from arctic_platform.rl.processors.functional import _compute_sequence_level_ratio_and_advantages
+from arctic_platform.rl.processors.functional import _resolve_dp_size
 from arctic_platform.rl.processors.functional import agg_loss
 from arctic_platform.rl.processors.functional import kl_penalty
 from arctic_platform.rl.processors.functional import masked_normalization
@@ -54,8 +55,16 @@ class TestAggLoss(TestCasePlus):
         loss_mat = torch.ones(2, 4)
         mask = torch.ones(2, 4, dtype=torch.bool)
         self.assertAlmostEqual(agg_loss(loss_mat, mask).item(), 1.0, places=5)
+        self.assertAlmostEqual(agg_loss(loss_mat, mask, dp_size=1).item(), 1.0, places=5)
         # token-mean multiplies by dp_size (the caller divides by the global token count fed as batch_num_tokens).
         self.assertAlmostEqual(agg_loss(loss_mat, mask, dp_size=2).item(), 2.0, places=5)
+
+    def test_dp_size_rejects_non_positive(self):
+        self.assertEqual(_resolve_dp_size(None, None), 1)
+        with self.assertRaises(ValueError):
+            _resolve_dp_size(0, None)
+        with self.assertRaises(ValueError):
+            _resolve_dp_size(None, batch_num_tokens=8)
 
     def test_token_mean_respects_mask(self):
         loss_mat = torch.tensor([[2.0, 4.0, 100.0, 100.0]])

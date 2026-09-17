@@ -224,7 +224,7 @@ def _internal_grpo_loss_fn(
     is_weight_clip_max: float | None = None,
     # --- VeRL-compatible aggregation and auxiliary loss knobs ---
     loss_agg_mode: str = "token-mean",
-    dp_size: int | None = None,
+    dp_size: int = 1,
     batch_num_tokens: int | None = None,
     global_batch_size: int | None = None,
     rollout_is_weights: torch.Tensor | None = None,

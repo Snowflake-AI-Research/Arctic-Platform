@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 from enum import Enum
+from numbers import Integral
 from typing import Optional
 
 import numpy as np
@@ -147,13 +148,18 @@ def masked_normalization(
 
 
 def _resolve_dp_size(dp_size: Optional[int], batch_num_tokens: Optional[float]) -> int:
+    """Map omitted ``dp_size`` to 1 (single rank). A global token denom still needs an explicit factor."""
     if batch_num_tokens is not None and dp_size is None:
         raise ValueError(
             "batch_num_tokens requires an explicit dp_size: it is a step-global token "
             "denominator, and defaulting dp_size to 1 attenuates gradients by the "
             "data-parallel factor."
         )
-    return 1 if dp_size is None else dp_size
+    if dp_size is None:
+        return 1
+    if isinstance(dp_size, bool) or not isinstance(dp_size, Integral) or int(dp_size) < 1:
+        raise ValueError(f"dp_size must be an integer >= 1, got {dp_size!r}")
+    return int(dp_size)
 
 
 def _scale_value_present(bag: dict | None, key: str) -> bool:
@@ -195,7 +201,7 @@ def agg_loss(
     loss_mat: torch.Tensor,
     loss_mask: torch.Tensor,
     loss_agg_mode: str = "token-mean",
-    dp_size: Optional[int] = None,
+    dp_size: int = 1,
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
     loss_scale_factor: Optional[int] = None,
@@ -222,9 +228,11 @@ def agg_loss(
 
     ``dp_size``, ``batch_num_tokens``, and ``global_batch_size`` support
     distributed normalisation when the global batch is split across DP ranks.
-    They default to local-only values when omitted (dp_size=1). ``prompt-mean``
-    intentionally does not multiply by ``dp_size`` so DeepSpeed's DP gradient
-    averaging matches native POC prompt-average weighting.
+    ``dp_size`` is the data-parallel width and defaults to 1; it is never a
+    missing/None scale. ``batch_num_tokens`` / ``global_batch_size`` still
+    default to local counts when omitted. ``prompt-mean`` intentionally does
+    not multiply by ``dp_size`` so DeepSpeed's DP gradient averaging matches
+    native POC prompt-average weighting.
     """
     dp_size = _resolve_dp_size(dp_size, batch_num_tokens)
     if loss_agg_mode == "token-mean":
@@ -590,7 +598,7 @@ def ppo_actor_loss_fn(
     cu_seqlens: torch.Tensor | None = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: torch.Tensor | None = None,
-    dp_size: Optional[int] = None,
+    dp_size: int = 1,
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
     prompt_group_ids: Optional[torch.Tensor] = None,
@@ -669,7 +677,7 @@ def sapo_loss_fn(
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
     loss_agg_mode: str = "token-mean",
-    dp_size: Optional[int] = None,
+    dp_size: int = 1,
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
     prompt_group_ids: Optional[torch.Tensor] = None,
@@ -732,7 +740,7 @@ def cispo_actor_loss_fn(
     cu_seqlens: torch.Tensor | None = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: torch.Tensor | None = None,
-    dp_size: Optional[int] = None,
+    dp_size: int = 1,
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
     prompt_group_ids: Optional[torch.Tensor] = None,
