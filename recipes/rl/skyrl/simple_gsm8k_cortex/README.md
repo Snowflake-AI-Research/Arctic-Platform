@@ -29,7 +29,8 @@ launcher resolves its own dependencies through `uv run --isolated`, the same
 pattern upstream's `integrations/arctic_rl/examples/` launchers use.
 
 ```bash
-pip install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env   # if uv is not already on your PATH
 
 git clone https://github.com/NovaSky-AI/SkyRL
 git -C SkyRL checkout skyrl-v0.3.0
@@ -68,9 +69,15 @@ and naming that entrypoint is what routes training and sampling to Cortex.
 
 ## 3. Prepare the dataset
 
+Run from this directory:
+
 ```bash
-python ../simple_gsm8k/download_data.py --output_dir ${HOME}/data/gsm8k-skyrl
+uv run --isolated --no-project --with datasets \
+  python ../simple_gsm8k/download_data.py --output_dir ${HOME}/data/gsm8k-skyrl
 ```
+
+Under `uv` because step 1 left no environment to activate, so the ambient
+`python` has no `datasets`.
 
 The parquet must have SkyRL's schema (`reward_spec`, `env_class`), **not**
 verl's (`reward_model`). The launcher does a pre-flight check and refuses
