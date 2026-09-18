@@ -36,6 +36,7 @@ Design notes:
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from typing import Any
@@ -69,11 +70,15 @@ class ChatMessage(_AllowExtra):
     content: str | list[dict[str, Any]] | None = None
     name: str | None = None
     tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    reasoning_content: str | None = None
 
 
 class ChatCompletionRequest(_AllowExtra):
     model: str
     messages: list[ChatMessage]
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
     temperature: float | None = None
@@ -206,15 +211,43 @@ def _to_sampling_params(
         params["frequency_penalty"] = float(frequency_penalty)
     if seed is not None:
         params["seed"] = int(seed)
-    if logprobs_topk is not None and logprobs_topk > 0:
+    # ``>= 0``, not ``> 0``: zero is meaningful to vLLM and to OpenAI alike —
+    # return the log-prob of each sampled token and no alternatives. Rejecting
+    # it made ``logprobs: true`` without ``top_logprobs`` a silent no-op, so
+    # callers who only want the sampled token's log-prob (RL drivers replaying
+    # a batch off-policy, say) got a response with no log-probs and no error.
+    if logprobs_topk is not None and logprobs_topk >= 0:
         params["logprobs"] = int(logprobs_topk)
     return params
+
+
+def _tool_call_for_template(tc: dict[str, Any]) -> dict[str, Any]:
+    """Re-shape one OpenAI tool call for a Jinja chat template.
+
+    On the wire ``function.arguments`` is a JSON *string*, but Qwen's template
+    iterates it with ``.items()`` — handing the string straight through raises
+    "Can only get item pairs from a mapping" mid-render.
+    """
+    fn = tc.get("function")
+    if not isinstance(fn, dict):
+        return tc
+    args = fn.get("arguments")
+    if not isinstance(args, str):
+        return tc
+    try:
+        parsed = json.loads(args)
+    except (json.JSONDecodeError, ValueError):
+        return tc
+    if not isinstance(parsed, dict):
+        return tc
+    return {**tc, "function": {**fn, "arguments": parsed}}
 
 
 def _render_chat_prompt(
     tokenizer: Any,
     messages: list[ChatMessage],
     template_kwargs: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> str:
     """Apply the tokenizer's chat template.
 
@@ -243,34 +276,138 @@ def _render_chat_prompt(
                 "a chat_template."
             ),
         )
-    payload = [
-        {"role": m.role, "content": m.content if isinstance(m.content, str) else json.dumps(m.content)}
-        for m in messages
-    ]
+    payload = []
+    for m in messages:
+        entry: dict[str, Any] = {
+            "role": m.role,
+            "content": m.content if isinstance(m.content, str) else json.dumps(m.content),
+        }
+        # Tool-call round-trip. A tool-using agent replays its own prior
+        # assistant turns back to us, so dropping these fields would render
+        # a prompt in which the model appears to have called nothing and the
+        # ``tool`` replies answer no one — the template then either errors or
+        # silently produces a transcript the model was never trained on.
+        if m.tool_calls:
+            entry["tool_calls"] = [_tool_call_for_template(tc) for tc in m.tool_calls]
+        if m.tool_call_id:
+            entry["tool_call_id"] = m.tool_call_id
+        if m.name:
+            entry["name"] = m.name
+        if m.reasoning_content:
+            entry["reasoning_content"] = m.reasoning_content
+        payload.append(entry)
     kwargs: dict[str, Any] = {
         "tokenize": False,
         "add_generation_prompt": True,
         "enable_thinking": False,
     }
+    if tools:
+        kwargs["tools"] = tools
     if template_kwargs:
         kwargs.update(template_kwargs)
-    try:
-        return tokenizer.apply_chat_template(payload, **kwargs)
-    except TypeError:
-        # Older tokenizers reject unknown kwargs — retry without them.
-        kwargs.pop("enable_thinking", None)
+    # Older tokenizers reject kwargs they don't know. Shed them one at a time,
+    # most-optional first, so a tokenizer that *does* support tools never has
+    # them silently dropped — a dropped tool list yields a model that answers
+    # in prose while the harness waits for a call it can dispatch. Only an
+    # *unexpected-kwarg* TypeError is retryable; a TypeError raised inside the
+    # template is a real bug in the payload and must surface, not be masked by
+    # falling back to a tool-less prompt.
+    for drop in (None, "enable_thinking", "tools"):
+        if drop is not None:
+            if drop not in kwargs:
+                continue
+            kwargs.pop(drop)
         try:
             return tokenizer.apply_chat_template(payload, **kwargs)
-        except Exception as exc:  # noqa: BLE001
+        except TypeError as exc:
+            if "unexpected keyword argument" in str(exc):
+                continue
+            raise HTTPException(
+                status_code=400,
+                detail=f"Chat template failed to render: TypeError: {exc}",
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 — surface template rendering errors
             raise HTTPException(
                 status_code=400,
                 detail=f"Chat template failed to render: {type(exc).__name__}: {exc}",
             ) from exc
-    except Exception as exc:  # noqa: BLE001 — surface template rendering errors
-        raise HTTPException(
-            status_code=400,
-            detail=f"Chat template failed to render: {type(exc).__name__}: {exc}",
-        ) from exc
+    raise HTTPException(
+        status_code=400,
+        detail="Chat template rejected every supported kwarg combination.",
+    )
+
+
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+_FUNCTION_RE = re.compile(r"<function=([^>\s]+)\s*>\s*(.*?)\s*</function>", re.DOTALL)
+_PARAMETER_RE = re.compile(r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>", re.DOTALL)
+_THINK_CLOSE_RE = re.compile(r"^(.*?)</think>", re.DOTALL)
+_THINK_PAIR_RE = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL)
+
+
+def _split_reasoning(text: str, think_open: bool = False) -> tuple[str, str | None]:
+    """Peel Qwen3's thinking scratchpad off the visible answer.
+
+    Qwen3.5's generation prompt *opens* ``<think>`` itself, so a completion
+    typically carries only the closing tag; handling the paired form alone
+    would leave the entire scratchpad sitting in ``content``. Harnesses that
+    score format correctness want the analysis as ``reasoning_content``, and
+    an answer polluted with reasoning reads to them as a protocol violation.
+
+    ``think_open`` says the prompt left a ``<think>`` block open. If the model
+    then never closes it, every token it produced is inside that block, so the
+    whole completion is reasoning and there is no visible answer. Reading it as
+    ``content`` instead is what makes a well-formed tool call look like a
+    format violation: the model follows the template's own instruction to
+    "provide optional reasoning ... BEFORE the function call", and the prose it
+    was invited to write lands in the field the harness requires to be empty.
+    """
+    if _THINK_PAIR_RE.search(text):
+        blocks = _THINK_PAIR_RE.findall(text)
+        return _THINK_PAIR_RE.sub("", text).strip(), "\n".join(blocks).strip()
+    m = _THINK_CLOSE_RE.match(text)
+    if m:
+        return text[m.end():].strip(), m.group(1).strip()
+    if think_open and text.strip():
+        return "", text.strip()
+    return text, None
+
+
+def _parse_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Convert Qwen3.5 tool-call spans into OpenAI ``tool_calls``.
+
+    Qwen3.5's template specifies a nested XML envelope, not JSON::
+
+        <tool_call><function=execute_bash><parameter=cmd>
+        ls -la
+        </parameter></function></tool_call>
+
+    Values are untyped text, so JSON scalars are recovered where they parse
+    and everything else stays a string — the tool schema, not this parser, is
+    what a harness validates against. A malformed span is deliberately left in
+    ``content`` rather than raised: a model that emits a broken call should be
+    scored as a format failure by the harness, not 500 the gateway.
+    """
+    calls: list[dict[str, Any]] = []
+    for raw in _TOOL_CALL_RE.findall(text):
+        fn = _FUNCTION_RE.search(raw)
+        if fn is None:
+            continue
+        name, body = fn.group(1), fn.group(2)
+        args: dict[str, Any] = {}
+        for key, value in _PARAMETER_RE.findall(body):
+            try:
+                args[key] = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                args[key] = value
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "index": len(calls),
+            "function": {"name": name, "arguments": json.dumps(args)},
+        })
+    if not calls:
+        return text, []
+    return _TOOL_CALL_RE.sub("", text).strip(), calls
 
 
 def _finish_reason_to_openai(reason: str | None) -> str:
@@ -372,12 +509,17 @@ async def chat_completions(request: Request) -> Any:
     # Optional per-request chat-template override for tokenizers that
     # take extra kwargs (e.g. Qwen3's ``enable_thinking``).
     template_kwargs: dict[str, Any] = {}
-    extra_body = payload.get("extra_body")
-    if isinstance(extra_body, dict):
-        ct = extra_body.get("chat_template_kwargs")
-        if isinstance(ct, dict):
-            template_kwargs.update(ct)
-    prompt_text = _render_chat_prompt(tokenizer, req.messages, template_kwargs=template_kwargs)
+    # vLLM's OpenAI server accepts ``chat_template_kwargs`` at the top level;
+    # the ``extra_body`` nesting is how the OpenAI *SDK* smuggles it there.
+    # Accept both, so a caller that already works against vLLM works here.
+    for container in (payload, payload.get("extra_body")):
+        if isinstance(container, dict):
+            ct = container.get("chat_template_kwargs")
+            if isinstance(ct, dict):
+                template_kwargs.update(ct)
+    prompt_text = _render_chat_prompt(
+        tokenizer, req.messages, template_kwargs=template_kwargs, tools=req.tools
+    )
 
     # OpenAI renamed ``max_tokens`` to ``max_completion_tokens`` — accept
     # both, prefer the newer field if both are set.
@@ -393,7 +535,11 @@ async def chat_completions(request: Request) -> Any:
         presence_penalty=req.presence_penalty,
         frequency_penalty=req.frequency_penalty,
         seed=req.seed,
-        logprobs_topk=req.top_logprobs if req.logprobs else None,
+        # In the chat schema these are two separate switches: ``logprobs`` asks
+        # for the sampled tokens' log-probs, ``top_logprobs`` additionally asks
+        # for K alternatives. Defaulting the count to 0 keeps the first usable
+        # on its own instead of depending on the second.
+        logprobs_topk=(req.top_logprobs or 0) if req.logprobs else None,
     )
 
     results = await _generate_n(pool, prompt_text, sampling_params)
@@ -422,12 +568,36 @@ async def chat_completions(request: Request) -> Any:
             media_type="text/event-stream",
         )
 
+    # Whether the rendered prompt left a ``<think>`` block open decides how an
+    # unclosed completion is read, so it has to be measured on the prompt the
+    # template actually produced rather than assumed from the model name.
+    think_open = prompt_text.rstrip().endswith("<think>")
+
     choices = []
     for idx, r in enumerate(results):
+        text = r.get("text", "")
+        text, reasoning = _split_reasoning(text, think_open=think_open)
+        # Tool calls are extracted from whichever side they landed on. Inside an
+        # unclosed think block there is no visible answer to scan, but the
+        # template invites a call there, so the reasoning is what carries it.
+        if req.tools and reasoning and not text:
+            reasoning, tool_calls = _parse_tool_calls(reasoning)
+        else:
+            text, tool_calls = _parse_tool_calls(text) if req.tools else (text, [])
+        message: dict[str, Any] = {"role": "assistant", "content": text or None}
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         choice: dict[str, Any] = {
             "index": idx,
-            "message": {"role": "assistant", "content": r.get("text", "")},
-            "finish_reason": _finish_reason_to_openai(r.get("finish_reason")),
+            "message": message,
+            # A parsed call outranks the raw stop reason: the model stopped on
+            # the tool-call end token, which OpenAI clients expect to see
+            # reported as ``tool_calls`` so they dispatch instead of finishing.
+            "finish_reason": (
+                "tool_calls" if tool_calls else _finish_reason_to_openai(r.get("finish_reason"))
+            ),
             # vLLM-compat: completion token ids alongside the message so
             # Harbor / any RL client can build a batch without a second
             # tokenize pass.

@@ -53,11 +53,29 @@ class PostTrainingConfig(BaseModel):
     algorithm: Literal["grpo"] = "grpo"
     base_model: str
     learning_rate: float = 1e-6
+    # Remaining AdamW settings. Defaults are torch's, not the recipe's: SWE-RL
+    # recipes commonly run beta2 well below 0.999 and eps far below 1e-8,
+    # because rewards are sparse and the second-moment estimate otherwise
+    # adapts too slowly to be useful over a few hundred steps.
+    adam_betas: tuple[float, float] = (0.9, 0.999)
+    adam_eps: float = 1e-8
+    weight_decay: float = 0.0
     n_samples_per_prompt: int = Field(4, ge=2)  # GRPO needs a group
     train_gpus: int = 1
     sample_gpus: int = 1
     max_seq_len: int = 1024
     eps_clip: float = 0.2
+    # Divide group-relative advantages by the group's reward std. On a binary
+    # pass/fail reward this rescales by 1/std, which is largest exactly for the
+    # groups with the least signal (one success in eight), so it amplifies the
+    # noisiest gradients. Recipes tuned on SWE tasks commonly turn it off and
+    # mean-center only.
+    std_normalization: bool = True
+    # Sequences per ``fwd_bwd`` call. A step's worth of long agent rollouts is
+    # far too large for one request; gradients accumulate across micro-batches
+    # and the optimizer steps once at the end, so this changes only memory and
+    # payload size, not the update.
+    micro_batch_size: int = 8
     # Cortex/SnowAPI target.
     cortex_host: str | None = None
     cortex_database: str = "NEUTRINO_DB"

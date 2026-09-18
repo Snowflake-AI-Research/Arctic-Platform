@@ -17,12 +17,15 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from typing import Any
 
-from arctic_inference.server.config import ModelConfig
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+
+if TYPE_CHECKING:
+    from arctic_inference.server.config import ModelConfig
 
 
 class JobConfig(BaseModel):
@@ -128,7 +131,14 @@ def build_model_config(
     spec_model) that are not vLLM engine args: they are recorded on the
     ModelConfig, which expands them into real engine kwargs in
     ``ModelConfig.to_engine_kwargs()``.
+
+    Imported here rather than at module scope: only the GPU-side servers
+    (``http_server``, ``ray_server``) build engine configs, so a CPU-only
+    driver importing ``arctic_platform.rl`` for the client must not be forced
+    to install arctic_inference -> ray -> vllm.
     """
+    from arctic_inference.server.config import ModelConfig
+
     cfg = dict(vllm_config or {})
     cfg["model"] = model_name
     known_fields = set(ModelConfig.model_fields.keys())

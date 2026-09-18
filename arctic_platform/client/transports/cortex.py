@@ -32,6 +32,7 @@ import time
 from typing import Any
 
 import requests
+from requests.exceptions import HTTPError
 from tenacity import Retrying
 from tenacity import retry_if_exception
 from tenacity import stop_after_attempt
@@ -221,7 +222,18 @@ class CortexTransport(Transport):
         # are retried with exponential-jitter backoff (the neutrino client's policy).
         def attempt() -> dict:
             resp = self.session.request(method, url, timeout=self.request_timeout, **kwargs)
-            resp.raise_for_status()
+            if not resp.ok:
+                # ``raise_for_status`` reports only the status line, and SnowAPI
+                # puts the actionable part (which tensor, which limit) in the
+                # body. On a tensor upload that difference is the whole
+                # diagnosis: "400 Bad Request" alone says nothing about what
+                # the server rejected.
+                detail = (resp.text or "").strip()[:2000]
+                raise HTTPError(
+                    f"{resp.status_code} {resp.reason} for {method} {url}"
+                    + (f"\nresponse body: {detail}" if detail else ""),
+                    response=resp,
+                )
             return resp.json()
 
         retryer = Retrying(

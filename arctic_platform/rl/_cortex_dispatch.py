@@ -155,11 +155,15 @@ class _CortexClientShim:
 
     async def fwd_bwd(self, batch: dict, **legacy_kwargs: Any) -> dict:
         # Normalize SkyRL / verl fwd_bwd payloads onto Cortex's canonical
-        # ``{args, kwargs, context, processing}`` shape. We deliberately do NOT
-        # populate ``context.old_log_probs_shifted``: Cortex's server-side grpo
-        # loss defaults ``old_log_probs = logprobs.detach()`` when absent,
-        # which is the correct π_old for the single-epoch on-policy regime
-        # SkyRL / verl / the ``rl_loop.py`` reference recipe all run.
+        # ``{args, kwargs, context, processing}`` shape.
+        #
+        # ``context.old_log_probs_shifted`` is populated only when the caller
+        # actually supplies sampler log-probs. Absent them, Cortex's server-side
+        # grpo loss defaults ``old_log_probs = logprobs.detach()``, making
+        # π_old ≡ π_new — correct for the single-epoch on-policy regime SkyRL /
+        # verl / ``rl_loop.py`` run, and wrong the moment a batch is reused
+        # across policy versions, where the ratio silently collapses to 1 and
+        # the off-policy correction disappears without any error.
         import torch
 
         payload = dict(batch)
@@ -189,7 +193,22 @@ class _CortexClientShim:
         advantages = tensors.pop("advantages", None)
         if advantages is None:
             raise ValueError("cortex fwd_bwd requires 'advantages' [B, S]")
-        tensors.pop("old_log_probs", None)
+        # Accept either convention and normalize here, so the roll lives in
+        # exactly one place: ``old_log_probs`` is aligned to ``input_ids``
+        # (entry i is the log-prob of token i), while the server's
+        # ``_shifted`` contract wants entry i to be the log-prob of token
+        # i+1 — the same labels = roll(input_ids, -1) alignment it uses to
+        # compute current log-probs. Off-by-one here would train against a
+        # ratio that is wrong by one token everywhere, which shows up as
+        # plausible-but-degrading loss rather than a crash.
+        old_logp = tensors.pop("old_log_probs_shifted", None)
+        if old_logp is None:
+            unshifted = tensors.pop("old_log_probs", None)
+            if torch.is_tensor(unshifted):
+                old_logp = torch.roll(unshifted, shifts=-1, dims=-1)
+                old_logp[..., -1] = 0.0
+        else:
+            tensors.pop("old_log_probs", None)
 
         kwargs_out: dict[str, Any] = {"input_ids": input_ids, "attention_mask": attention_mask}
         for k in ("position_ids", "labels"):
@@ -204,20 +223,30 @@ class _CortexClientShim:
             if k not in proc_config and k in meta:
                 proc_config[k] = int(meta[k])
 
+        context: dict[str, Any] = {
+            "input_ids": input_ids,
+            "advantages": advantages,
+            "loss_mask": loss_mask,
+        }
+        if old_logp is not None:
+            context["old_log_probs_shifted"] = old_logp
+
         return _normalize(self._client.fwd_bwd({
             "args": (),
             "kwargs": kwargs_out,
-            "context": {"input_ids": input_ids, "advantages": advantages, "loss_mask": loss_mask},
+            "context": context,
             "processing": {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": proc_config},
         }))
 
     async def fwd_no_grad(self, batch: dict, **legacy_kwargs: Any) -> dict:
-        # Cortex has no ``/forward`` endpoint. ``fwd_bwd`` above drops
-        # ``old_log_probs_shifted`` so the server grpo loss defaults to
-        # ``logprobs.detach()`` — so π_old ≡ π_new and zero placeholders are
-        # correct. Shape ``[B, T_full]`` matches the on-prem ``/forward``
-        # layout, so both SkyRL's response-only rebuild and verl's
-        # ``make_njt`` slice into a valid tensor.
+        # Cortex has no ``/forward`` endpoint, so there is nothing to recompute
+        # π_old with: zero placeholders stand in. Callers that need a real
+        # π_old must carry the sampler's own log-probs into ``fwd_bwd``, which
+        # forwards them as ``old_log_probs_shifted``; without that the server
+        # grpo loss falls back to ``logprobs.detach()`` and π_old ≡ π_new.
+        # Shape ``[B, T_full]`` matches the on-prem ``/forward`` layout, so
+        # both SkyRL's response-only rebuild and verl's ``make_njt`` slice into
+        # a valid tensor.
         import torch
 
         b_data = batch.get("batch") if isinstance(batch, dict) else None

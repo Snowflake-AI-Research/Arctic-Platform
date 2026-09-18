@@ -65,17 +65,22 @@ class _ClientBackedPool:
         coroutine. We detect which we got and drive it accordingly so
         both call paths behave the same from Harbor's point of view.
         """
-        result = self._client.generate(
-            prompts=list(prompts),
-            sampling_params=dict(sampling_params or {}),
+        if asyncio.iscoroutinefunction(self._client.generate):
+            return await self._client.generate(
+                prompts=list(prompts),
+                sampling_params=dict(sampling_params or {}),
+            )
+        # The sync transport blocks while it polls SnowAPI. Run it inline and
+        # it stalls uvicorn's loop, so every other in-flight request waits and
+        # N concurrent agents sample strictly one at a time regardless of how
+        # many replicas the sampling job has. A worker thread lets them
+        # overlap; the GIL is not a factor because the call is I/O-bound.
+        return await asyncio.to_thread(
+            lambda: self._client.generate(
+                prompts=list(prompts),
+                sampling_params=dict(sampling_params or {}),
+            )
         )
-        if asyncio.iscoroutine(result):
-            return await result
-        # Sync ``.generate`` blocks the current thread; that's fine here
-        # because uvicorn already runs on its own loop, but concurrent
-        # trials serialize through it. If concurrency ever matters,
-        # hoist the sync path into ``asyncio.to_thread``.
-        return result
 
 
 def _pick_free_port() -> int:

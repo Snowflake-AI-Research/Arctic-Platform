@@ -21,6 +21,26 @@ Everything used by that run is in this PR: `agent.py`, `env.py`,
 adjacent `arctic_platform/rl/_cortex_dispatch.py` shim (from an earlier
 PR).
 
+**Black-box SWE agent, R2E-Gym, Cortex Training, end-to-end.**
+
+* Config: `Qwen/Qwen3.5-4B`, R2E-Gym tasks, Boyi's `mini-swe-agent-plus`
+  harness staged verbatim, one k3s container per rollout, 100 turns,
+  32 k tokens/turn. His hyper-parameters throughout; GRPO instead of his
+  CISPO.
+* 3 GRPO steps, 96 rollouts. The loop closes: sandboxed rollouts →
+  R2E-graded reward → advantages → Cortex `fwd_bwd` → weight sync.
+* Pass rate **41.7 %** (40/96). Effective reward after prime-rl's
+  terminal-invalid override **18.8 %**, because **74 %** of traces trip
+  a protocol detector versus 10–23 % on his reference run. That gap, not
+  the transport or the loss, is what currently blocks a learning curve.
+* Full breakdown, including which detectors fire and which two are our
+  bugs rather than the model's: [R2E_SWE_RUN.md](./R2E_SWE_RUN.md).
+* Driver: [examples/r2e_swe/](./examples/r2e_swe/).
+
+This is the run that puts the OpenAI-compat gateway on real GPUs with a
+real agent — multi-turn, native tool calling — rather than the fake
+`ReplicaPool` the tests use.
+
 ## Shipped as code, not exercised on real GPUs
 
 `arctic_platform/openai_compat.py`

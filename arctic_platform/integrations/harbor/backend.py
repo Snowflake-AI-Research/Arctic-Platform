@@ -12,6 +12,8 @@ next eval reads the improved model from the same endpoint.
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 import uuid
 
 import torch
@@ -23,12 +25,73 @@ from arctic_platform.integrations.harbor.models import (
     TrainingRun,
 )
 
+_log = logging.getLogger(__name__)
 
-def _grpo_advantages(rewards: list[float], group_ids: list[str]) -> list[float]:
-    """Group-relative advantage: z-score rewards within each shared-prompt group.
+# Trainable-token count reported per fwd_bwd; doubles as the averaging weight.
+_WEIGHT_KEY = "trainable_logprob_count_all"
+
+
+def _merge_fwd_bwd_metrics(per_micro: list[dict]) -> dict:
+    """Collapse one metrics dict per micro-batch into one dict for the step.
+
+    Keeping only the last call's metrics would describe a single slice, and
+    because slices are ordered longest-first that slice is the shortest
+    rollouts of the step — the least representative sample available. Counts
+    sum, extremes take the extreme, and everything else is averaged weighted
+    by trainable tokens so a 2-token slice cannot outvote a 30k-token one.
+    """
+    dicts = [m for m in per_micro if m]
+    if not dicts:
+        return {}
+
+    weights = [float(m.get(_WEIGHT_KEY) or 0.0) for m in dicts]
+    if sum(weights) <= 0:  # nothing reported a count; fall back to a plain mean
+        weights = [1.0] * len(dicts)
+
+    out: dict = {}
+    for key in {k for m in dicts for k in m}:
+        pairs = [
+            (m[key], w)
+            for m, w in zip(dicts, weights)
+            if isinstance(m.get(key), (int, float)) and not isinstance(m.get(key), bool)
+        ]
+        if not pairs:
+            out[key] = next(m[key] for m in dicts if key in m)
+            continue
+        vals = [v for v, _ in pairs]
+        if key.endswith("_count_all") or key == "rl_model_calls":
+            out[key] = sum(vals)
+        elif key.endswith("/max") or "_max_" in key or key.endswith("_max"):
+            out[key] = max(vals)
+        elif key.endswith("/min") or key.endswith("_min"):
+            out[key] = min(vals)
+        elif key == "rank":
+            out[key] = vals[0]
+        else:
+            total = sum(w for _, w in pairs)
+            out[key] = (
+                sum(v * w for v, w in pairs) / total
+                if total > 0
+                else sum(vals) / len(vals)
+            )
+    return out
+
+
+def _grpo_advantages(
+    rewards: list[float],
+    group_ids: list[str],
+    std_normalization: bool = True,
+) -> list[float]:
+    """Group-relative advantage: centre rewards within each shared-prompt group.
 
     This is the whole of GRPO's credit assignment — no learned critic. A group
     where every sample scored the same yields zero advantage (nothing to learn).
+
+    ``std_normalization`` additionally divides by the group's standard
+    deviation. With a binary pass/fail reward that factor is 1/std, which peaks
+    on the groups carrying the weakest evidence — one success in eight — so it
+    scales up the noisiest gradients. Turning it off keeps advantages
+    proportional to how far a rollout beat its group.
     """
     from collections import defaultdict
 
@@ -40,10 +103,12 @@ def _grpo_advantages(rewards: list[float], group_ids: list[str]) -> list[float]:
     for idxs in groups.values():
         vals = [rewards[i] for i in idxs]
         mean = sum(vals) / len(vals)
-        var = sum((v - mean) ** 2 for v in vals) / len(vals)
-        std = var**0.5
+        scale = 1.0
+        if std_normalization:
+            var = sum((v - mean) ** 2 for v in vals) / len(vals)
+            scale = var**0.5 + 1e-6
         for i in idxs:
-            adv[i] = (rewards[i] - mean) / (std + 1e-6)
+            adv[i] = (rewards[i] - mean) / scale
     return adv
 
 
@@ -81,7 +146,18 @@ class ArcticCortexBackend:
             job_ready_timeout=c.job_ready_timeout,
             training_config={
                 "train_batch_size": 1,
-                "optimizer": {"lr": c.learning_rate},
+                "optimizer": {
+                    "lr": c.learning_rate,
+                    # Cortex's optimizer schema takes beta1/beta2 as scalars; a
+                    # ``betas`` pair is accepted by the client filter but ignored
+                    # server-side, which silently leaves beta2 at its 0.999
+                    # default. Send both spellings so the value actually lands.
+                    "betas": list(c.adam_betas),
+                    "beta1": c.adam_betas[0],
+                    "beta2": c.adam_betas[1],
+                    "eps": c.adam_eps,
+                    "weight_decay": c.weight_decay,
+                },
             },
             vllm_config={"gpu_memory_utilization": 0.6, "enable_prefix_caching": True},
         )
@@ -98,11 +174,61 @@ class ArcticCortexBackend:
     # ── the RFC's train() — one GRPO step on the collected rollouts ────────
     async def train(self, rollouts: RolloutDataset, step: int = 0) -> dict:
         assert self._client is not None, "call connect() first"
+
+        # Advantages are computed once over the whole step, before splitting:
+        # they are group-relative, so a group must be scored against its own
+        # members. Slicing first and normalising per slice would compare a
+        # rollout against whatever else happened to land beside it.
         batch = self._build_grpo_batch(rollouts)
-        fb = await self._client.fwd_bwd(batch)
+        micro = max(1, self.config.micro_batch_size)
+        n = batch["input_ids"].shape[0]
+
+        # Group length-similar sequences together. Padding is per micro-batch,
+        # so mixing a 200-token turn with a 100k one pays the 100k width on
+        # both; sorting makes each micro-batch about as wide as its own
+        # longest member. Advantages are already fixed, so reordering is safe.
+        import torch
+
+        lengths = batch["attention_mask"].sum(dim=1)
+        order = torch.argsort(lengths, descending=True)
+
+        per_micro: list[dict] = []
+        n_micro = (n + micro - 1) // micro
+        t0 = time.monotonic()
+        _log.info(
+            "step %d: %d rollouts -> %d fwd_bwd calls (micro=%d, longest=%d tokens)",
+            step,
+            n,
+            n_micro,
+            micro,
+            int(lengths.max().item()),
+        )
+        for i, lo in enumerate(range(0, n, micro), start=1):
+            idx = order[lo : lo + micro]
+            width = int(lengths[idx].max().item())
+            # Trim the columns that are padding for every row in this slice.
+            fb = await self._client.fwd_bwd(
+                {k: v[idx][:, :width] for k, v in batch.items()}
+            )
+            per_micro.append(fb.get("metrics") or {})
+            # A step is many minutes of round trips; without this the caller
+            # cannot tell a slow step from a hung one.
+            elapsed = time.monotonic() - t0
+            _log.info(
+                "step %d: fwd_bwd %d/%d width=%d %.1fs elapsed, ~%.0fs left",
+                step,
+                i,
+                n_micro,
+                width,
+                elapsed,
+                elapsed / i * (n_micro - i),
+            )
+        # One optimizer step per training step, after the gradients from every
+        # micro-batch have accumulated.
+        _log.info("step %d: all fwd_bwd done in %.1fs, optimizer step", step, time.monotonic() - t0)
         st = await self._client.step()
         await self._client.sync_weights()  # push trainer -> sampler
-        metrics = {**(st.get("metrics") or {}), **(fb.get("metrics") or {})}
+        metrics = {**(st.get("metrics") or {}), **_merge_fwd_bwd_metrics(per_micro)}
         return metrics
 
     def deploy_inference(self) -> InferenceEndpoint:
@@ -127,7 +253,9 @@ class ArcticCortexBackend:
         loss_mask} tensors the Cortex shim's fwd_bwd expects."""
         rewards = [r.reward for r in ds.rollouts]
         groups = [r.group_id or "g0" for r in ds.rollouts]
-        advs = _grpo_advantages(rewards, groups)
+        advs = _grpo_advantages(
+            rewards, groups, std_normalization=self.config.std_normalization
+        )
 
         seqs, prompt_lens = [], []
         for r in ds.rollouts:
@@ -140,20 +268,52 @@ class ArcticCortexBackend:
         attention_mask = torch.zeros((B, max_len), dtype=torch.long)
         loss_mask = torch.zeros((B, max_len), dtype=torch.long)
         advantages = torch.zeros((B, max_len), dtype=torch.float32)
+        # Sampler log-probs, aligned to input_ids. Only meaningful once every
+        # rollout carries them: a partially-filled tensor would read as π_old=1
+        # (log-prob 0) on the missing rows, silently inflating their importance
+        # ratio rather than falling back to the on-policy default.
+        old_log_probs = torch.zeros((B, max_len), dtype=torch.float32)
+        have_logprobs = all(r.logprobs is not None for r in ds.rollouts)
 
         for i, (seq, plen) in enumerate(zip(seqs, prompt_lens)):
             seq = seq[:max_len]
             n = len(seq)
             input_ids[i, :n] = torch.tensor(seq, dtype=torch.long)
             attention_mask[i, :n] = 1
-            # response tokens only (mask out the prompt) get gradient + advantage
-            resp_start = min(plen, n)
-            loss_mask[i, resp_start:n] = 1
-            advantages[i, resp_start:n] = advs[i]
+            # Prefer the rollout's own mask: for a multi-turn agent the flattened
+            # prompt interleaves earlier assistant turns (trainable) with tool
+            # output (not), so prompt-vs-completion alone would drop gradient on
+            # every turn but the last.
+            turn_mask = ds.rollouts[i].loss_mask
+            if turn_mask is not None:
+                mask = torch.tensor(turn_mask[:n], dtype=torch.long)
+                loss_mask[i, : len(mask)] = mask
+                advantages[i, : len(mask)] = mask.to(torch.float32) * advs[i]
+            else:
+                # response tokens only (mask out the prompt) get gradient + advantage
+                resp_start = min(plen, n)
+                loss_mask[i, resp_start:n] = 1
+                advantages[i, resp_start:n] = advs[i]
 
-        return {
+            if have_logprobs:
+                # The sampler only scores what it generated, so the rollout's
+                # log-probs cover the completion and are laid down starting at
+                # the prompt boundary.
+                lp = ds.rollouts[i].logprobs or []
+                start = min(plen, n)
+                room = max(n - start, 0)
+                if room and lp:
+                    take = min(room, len(lp))
+                    old_log_probs[i, start:start + take] = torch.tensor(
+                        lp[:take], dtype=torch.float32
+                    )
+
+        batch = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "loss_mask": loss_mask,
             "advantages": advantages,
         }
+        if have_logprobs:
+            batch["old_log_probs"] = old_log_probs
+        return batch
