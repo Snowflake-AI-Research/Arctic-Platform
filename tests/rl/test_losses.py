@@ -57,7 +57,7 @@ class TestAggLoss(TestCasePlus):
         self.assertAlmostEqual(agg_loss(loss_mat, mask).item(), 1.0, places=5)
         self.assertAlmostEqual(agg_loss(loss_mat, mask, dp_size=1).item(), 1.0, places=5)
         # token-mean multiplies by dp_size (the caller divides by the global token count fed as batch_num_tokens).
-        self.assertAlmostEqual(agg_loss(loss_mat, mask, dp_size=2).item(), 2.0, places=5)
+        self.assertAlmostEqual(agg_loss(loss_mat, mask, dp_size=2, batch_num_tokens=8).item(), 2.0, places=5)
 
     def test_dp_size_rejects_non_positive(self):
         self.assertEqual(_resolve_dp_size(None, None), 1)
@@ -65,6 +65,55 @@ class TestAggLoss(TestCasePlus):
             _resolve_dp_size(0, None)
         with self.assertRaises(ValueError):
             _resolve_dp_size(None, batch_num_tokens=8)
+
+    def test_dp_size_above_one_requires_a_global_denominator(self):
+        # dp_size cancels DeepSpeed's DP averaging, so against a rank-local
+        # denominator it scales the gradient up by the DP factor instead of
+        # reproducing the global mean.
+        with self.assertRaises(ValueError):
+            _resolve_dp_size(4, None, None, "token-mean")
+        with self.assertRaises(ValueError):
+            _resolve_dp_size(4, None, None, "seq-mean-token-mean")
+        # Satisfied by the denominator each mode actually divides by.
+        self.assertEqual(_resolve_dp_size(4, 128, None, "token-mean"), 4)
+        self.assertEqual(_resolve_dp_size(4, None, 32, "seq-mean-token-mean"), 4)
+        # Single rank needs no global denominator, and prompt-mean never
+        # multiplies by dp_size.
+        self.assertEqual(_resolve_dp_size(1, None, None, "token-mean"), 1)
+        self.assertEqual(_resolve_dp_size(4, None, None, "prompt-mean"), 4)
+
+    def test_token_mean_is_dp_split_invariant(self):
+        torch.manual_seed(0)
+        loss_mat = torch.randn(8, 5)
+        # Deliberately uneven token counts per row so the shards below do not
+        # carry equal denominators.
+        mask = torch.tensor(
+            [
+                [1, 1, 1, 1, 1],
+                [1, 1, 1, 0, 0],
+                [1, 1, 0, 0, 0],
+                [1, 1, 1, 1, 0],
+                [1, 1, 1, 0, 0],
+                [1, 0, 0, 0, 0],
+                [1, 1, 1, 1, 1],
+                [1, 1, 0, 0, 0],
+            ],
+            dtype=torch.bool,
+        )
+        n_global = int(mask.sum())
+        reference = agg_loss(loss_mat, mask, batch_num_tokens=n_global, dp_size=1)
+
+        dp_size = 4
+        shards = [(loss_mat[i::dp_size], mask[i::dp_size]) for i in range(dp_size)]
+
+        # DeepSpeed averages across DP ranks; the dp_size multiplier cancels it.
+        averaged = sum(agg_loss(m, k, batch_num_tokens=n_global, dp_size=dp_size) for m, k in shards) / dp_size
+        torch_assert_close(averaged, reference)
+
+        # Shipping the denominator but not dp_size keeps the direction and loses
+        # the magnitude: exactly 1/dp_size of the global token-mean.
+        under_scaled = sum(agg_loss(m, k, batch_num_tokens=n_global, dp_size=1) for m, k in shards) / dp_size
+        torch_assert_close(under_scaled * dp_size, reference)
 
     def test_token_mean_respects_mask(self):
         loss_mat = torch.tensor([[2.0, 4.0, 100.0, 100.0]])

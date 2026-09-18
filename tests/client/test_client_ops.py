@@ -647,6 +647,50 @@ class TestCortexSharedHelper:
         assert "old_log_probs" not in out["kwargs"]
         assert "old_log_probs_shifted" not in out["context"]
 
+    def test_forwards_the_whole_global_loss_scale_trio(self):
+        """``dp_size`` cancels DeepSpeed's DP averaging, so dropping it while
+        forwarding the denominators trains at ``1/dp_size`` of the global mean."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((2, 10)),
+                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                },
+                "meta": {"dp_size": 4, "batch_num_tokens": 128, "global_batch_size": 32},
+            },
+        )
+        config = out["processing"]["config"]
+        assert config["dp_size"] == 4
+        assert config["batch_num_tokens"] == 128
+        assert config["global_batch_size"] == 32
+
+    def test_caller_config_still_wins_over_meta_for_the_scale_trio(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((2, 10)),
+                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                },
+                "meta": {"dp_size": 4},
+            },
+            processing={"config": {"dp_size": 1}},
+        )
+        assert out["processing"]["config"]["dp_size"] == 1
+
     def test_left_pads_are_rewritten_to_trailing_pads(self):
         """SkyRL left-pads to the batch's longest sequence; Cortex's packer
         rejects that outright ("packing requires left-aligned rows")."""

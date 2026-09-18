@@ -147,7 +147,23 @@ def masked_normalization(
     return ((x - mean) / (var.sqrt() + eps)).float()
 
 
-def _resolve_dp_size(dp_size: Optional[int], batch_num_tokens: Optional[float]) -> int:
+# ``dp_size`` cancels DeepSpeed's DP gradient averaging, so it is only meaningful
+# against a step-global denominator. ``prompt-mean`` is absent on purpose: it does
+# not multiply by ``dp_size`` at all.
+_GLOBAL_DENOM_FOR_AGG_MODE = {
+    "token-mean": "batch_num_tokens",
+    "seq-mean-token-sum": "global_batch_size",
+    "seq-mean-token-sum-norm": "global_batch_size",
+    "seq-mean-token-mean": "global_batch_size",
+}
+
+
+def _resolve_dp_size(
+    dp_size: Optional[int],
+    batch_num_tokens: Optional[float],
+    global_batch_size: Optional[float] = None,
+    loss_agg_mode: str = "token-mean",
+) -> int:
     """Map omitted ``dp_size`` to 1 (single rank). A global token denom still needs an explicit factor."""
     if batch_num_tokens is not None and dp_size is None:
         raise ValueError(
@@ -159,7 +175,18 @@ def _resolve_dp_size(dp_size: Optional[int], batch_num_tokens: Optional[float]) 
         return 1
     if isinstance(dp_size, bool) or not isinstance(dp_size, Integral) or int(dp_size) < 1:
         raise ValueError(f"dp_size must be an integer >= 1, got {dp_size!r}")
-    return int(dp_size)
+    resolved = int(dp_size)
+    denom_key = _GLOBAL_DENOM_FOR_AGG_MODE.get(loss_agg_mode)
+    if resolved > 1 and denom_key is not None:
+        denom = batch_num_tokens if denom_key == "batch_num_tokens" else global_batch_size
+        if denom is None:
+            raise ValueError(
+                f"dp_size={resolved} requires {denom_key} for loss_agg_mode={loss_agg_mode!r}: "
+                "dp_size cancels DeepSpeed's DP gradient averaging, so multiplying a "
+                "rank-local denominator by it scales the gradient up by the data-parallel "
+                "factor instead of reproducing the global mean."
+            )
+    return resolved
 
 
 def _scale_value_present(bag: dict | None, key: str) -> bool:
@@ -234,7 +261,7 @@ def agg_loss(
     not multiply by ``dp_size`` so DeepSpeed's DP gradient averaging matches
     native POC prompt-average weighting.
     """
-    dp_size = _resolve_dp_size(dp_size, batch_num_tokens)
+    dp_size = _resolve_dp_size(dp_size, batch_num_tokens, global_batch_size, loss_agg_mode)
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             batch_num_tokens = loss_mask.count_nonzero() or 1
