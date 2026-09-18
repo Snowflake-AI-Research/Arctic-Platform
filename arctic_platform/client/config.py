@@ -30,6 +30,7 @@ servers accept this canonical shape directly.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,8 @@ from pydantic import model_validator
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
+
+logger = logging.getLogger(__name__)
 
 JobId = int | str
 
@@ -79,27 +82,34 @@ def _cortex_training_connection() -> dict[str, Any]:
     so a logged-in user's credentials take two hops to reach: the login state,
     then the file it names. ``CORTEX_TRAINING_CONFIG`` names one directly.
 
-    An unreadable or malformed file reads as absent. This is a fallback for a
-    connection nobody supplied, and ``_check`` still refuses an empty one — so
-    failing here would replace a message about the missing connection with one
-    about the file, which is rarely the user's actual problem.
+    An unreadable or malformed file reads as absent, because ``_check`` still
+    refuses an empty connection: raising here would replace a message about
+    the missing connection with one about a file the caller may not know is
+    involved. It warns instead, so a login that has gone stale is visible
+    without being fatal.
     """
     path = os.environ.get("CORTEX_TRAINING_CONFIG")
     if not path:
         config_home = os.environ.get("XDG_CONFIG_HOME")
         base = Path(config_home) if config_home else Path.home() / ".config"
+        state_path = base / "cortex-training" / "login.json"
+        if not state_path.is_file():
+            return {}
         try:
-            state = json.loads((base / "cortex-training" / "login.json").read_text(encoding="utf-8"))
+            state = json.loads(state_path.read_text(encoding="utf-8"))
             path = state.get("config_path") if isinstance(state, dict) else None
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("cortex: ignoring unreadable login state %s: %s", state_path, exc)
             return {}
     if not path:
         return {}
     try:
         conn = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("cortex: ignoring unreadable connection file %s: %s", path, exc)
         return {}
     if not isinstance(conn, dict):
+        logger.warning("cortex: ignoring connection file %s: expected a JSON object", path)
         return {}
 
     # host and base_url are mutually exclusive, so emit one: a file carrying
@@ -168,8 +178,14 @@ class CortexConfig(BaseSettings):
 
         Without this, every caller has to export ``ARCTIC_CORTEX_*`` even
         though `cortex-training login` already put the same four values on
-        disk. Runs only when no connection arrived from the constructor or the
-        environment, so a supplied one is never blended with the file's.
+        disk.
+
+        Gated on ``host``/``base_url`` specifically, not on the presence of
+        any field: those two select the account and are mutually exclusive, so
+        a file's ``base_url`` reaching a caller who named a ``host`` would
+        bypass PAT auth against a different target. The remaining fields are
+        safe to fill in individually, and a caller who sets one of those still
+        overrides the file's copy.
         """
         if not isinstance(data, dict) or data.get("host") or data.get("base_url"):
             return data

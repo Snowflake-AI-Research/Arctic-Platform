@@ -71,10 +71,10 @@ export ARCTIC_CORTEX_PAT=<your PAT>
 ```
 
 `CortexConfig` is a `pydantic-settings` model, so these populate it directly
-and explicit constructor or YAML values still win. A connection in the
-environment is used whole rather than merged with the file's, so the two cannot
-combine into an account you did not ask for. The launcher prints which account
-it resolved, and stops with an error naming both options if it finds neither.
+and explicit constructor or YAML values still win. Exporting `_HOST` stops the
+connection file being read at all, so the two cannot combine into an account
+you did not ask for. The launcher prints which account it resolved, and stops
+with an error naming both options if it finds neither.
 
 There is no variable that selects the backend. The launcher passes
 `trainer.override_entrypoint=arctic_platform.integrations.skyrl.entrypoint`,

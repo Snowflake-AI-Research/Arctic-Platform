@@ -611,22 +611,41 @@ class TestCortexConfigFallsBackToCliConnection:
 
         assert CortexConfig().pat.get_secret_value() == "pat-from-cli-env"
 
+    def test_a_lone_field_overrides_without_disabling_the_file(self, monkeypatch, tmp_path):
+        """Only `host`/`base_url` gate the fallback; the rest fill in.
+
+        Those two pick the account, so mixing them is what has to be refused.
+        Overriding just the database against the file's account is a use, not
+        an accident.
+        """
+        from arctic_platform.client import CortexConfig
+
+        monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(self._write_conn(tmp_path)))
+        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "OVERRIDE_DB")
+
+        cfg = CortexConfig()
+        assert cfg.host == "file.snowflakecomputing.com"
+        assert cfg.database == "OVERRIDE_DB"
+        assert cfg.schema_ == "FILE_SCHEMA"
+
     @pytest.mark.parametrize(
         "contents",
         ["not json at all", '["a", "list"]'],
         ids=["corrupt", "not_an_object"],
     )
-    def test_unusable_file_reads_as_no_connection(self, monkeypatch, tmp_path, contents):
-        """The fallback stays quiet so the error names the missing connection,
-        which is what the user has to fix, rather than the file."""
+    def test_unusable_file_reads_as_no_connection(self, monkeypatch, tmp_path, contents, caplog):
+        """The connection error still names what the user has to fix, with the
+        unusable file demoted to a warning so it is not invisible either."""
         from arctic_platform.client import CortexConfig
 
         path = tmp_path / "connection.json"
         path.write_text(contents, encoding="utf-8")
         monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(path))
 
-        with pytest.raises(ValidationError, match="set base_url"):
-            CortexConfig()
+        with caplog.at_level("WARNING"):
+            with pytest.raises(ValidationError, match="set base_url"):
+                CortexConfig()
+        assert str(path) in caplog.text
 
     def test_login_state_pointing_at_a_moved_file(self, monkeypatch, tmp_path):
         from arctic_platform.client import CortexConfig
