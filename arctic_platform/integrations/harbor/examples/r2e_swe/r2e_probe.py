@@ -10,20 +10,17 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 import time
 
-sys.path.insert(0, "/modeling-code/karthik/abstract-remote-exps/poc")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sandbox import Sandbox  # noqa: E402
 
-DATASET = (
-    "/data/fshu/important/swe_data/r2e_family/"
-    "R2E-Gym-Subset_validgold_unique_baseline/train.jsonl"
-)
 
 
 def load_instance(instance_id: str | None, row: int) -> dict:
-    with open(DATASET) as fh:
+    with open(reference_paths.r2e_dataset()) as fh:
         for i, line in enumerate(fh):
             rec = json.loads(line)
             if instance_id and rec["instance_id"] == instance_id:

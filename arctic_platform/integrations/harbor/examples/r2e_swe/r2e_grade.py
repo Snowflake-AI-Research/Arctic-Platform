@@ -12,15 +12,13 @@ from __future__ import annotations
 import json
 import re
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "/modeling-code/karthik/abstract-remote-exps/poc")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sandbox import Sandbox  # noqa: E402
 
-DATASET = (
-    "/data/fshu/important/swe_data/r2e_family/"
-    "R2E-Gym-Subset_validgold_unique_baseline/train.jsonl"
-)
+
 REPO = "/testbed"
 
 
@@ -73,7 +71,7 @@ def run_tests(sb: Sandbox) -> str:
 def main() -> None:
     row = int(sys.argv[1]) if len(sys.argv) > 1 else 0
     name = sys.argv[2] if len(sys.argv) > 2 else f"r2e-{row}"
-    with open(DATASET) as fh:
+    with open(reference_paths.r2e_dataset()) as fh:
         for i, line in enumerate(fh):
             if i == row:
                 rec = json.loads(line)

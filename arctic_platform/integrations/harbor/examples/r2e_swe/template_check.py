@@ -11,15 +11,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/modeling-code/karthik/abstract-remote-exps/ap-harbor")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import reference_paths  # noqa: E402
 from arctic_platform.openai_compat import ChatMessage  # noqa: E402
 from arctic_platform.openai_compat import _render_chat_prompt  # noqa: E402
-
-TEMPLATE = (
-    "/modeling-code/boyiliu/prime-rl/prime_snowrl/configs/"
-    "chat_templates/qwen35_preserve_all_thinking.jinja"
-)
 
 TOOLS = [{
     "type": "function",
@@ -65,7 +61,7 @@ def main() -> int:
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
-    tok.chat_template = Path(TEMPLATE).read_text()
+    tok.chat_template = reference_paths.chat_template().read_text()
     msgs = [ChatMessage.model_validate(m) for m in TRANSCRIPT]
 
     failures = []

@@ -32,24 +32,36 @@ without patching it.
 
 ## Prerequisites (why this won't run elsewhere)
 
-* **An in-pod k3s sandbox host** with the agent-sandbox controller, set
-  up by our `local-sandbox-setup/single-node/setup-local-sandbox.sh`.
-  Expects `/data-fast/k3s/kubeconfig.yaml` and the bridge at
-  `10.42.0.1`. Needs a privileged pod (full capabilities, seccomp
-  Unconfined).
-* **The prime-rl checkout** at
-  `/modeling-code/boyiliu/prime-rl/deps/verifiers/...`, from which
-  `mini_swe_plus.py` stages the `mini-swe-agent-plus` harness verbatim
-  rather than reimplementing it.
+* **An in-pod k3s sandbox host** with the agent-sandbox controller and a
+  privileged pod (full capabilities, seccomp Unconfined). The bridge
+  address the sandboxes reach the gateway on is `10.42.0.1`.
+* **A prime-rl checkout**, from which `mini_swe_plus.py` stages the
+  `mini-swe-agent-plus` harness verbatim rather than reimplementing it,
+  and which also supplies the chat template.
+* **The R2E-Gym instance table**, a site-local export of the public
+  dataset.
 * **Cortex credentials** in the environment (`ARCTIC_CORTEX_HOST`,
   `CORTEX_PAT`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`).
-* **The reference chat template**, `qwen35_preserve_all_thinking.jinja`. The stock
-  Qwen template drops prior turns' `<think>` blocks, which would
-  condition the policy on a transcript it never produced.
+
+Everything site-specific is resolved from the environment rather than
+hard-coded, so nothing here assumes our filesystem layout:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `PRIME_RL_ROOT` | prime-rl checkout: harness + chat template | required |
+| `R2E_DATASET` | R2E-Gym instance table (`train.jsonl`) | required |
+| `K3S_DIR` | k3s binary and kubeconfig | `/data-fast/k3s` |
+
+The chat template matters more than it looks: the stock Qwen template
+drops prior turns' `<think>` blocks, which would condition the policy on
+a transcript it never produced.
 
 ## Running
 
 ```bash
+export PRIME_RL_ROOT=/path/to/prime-rl
+export R2E_DATASET=/path/to/R2E-Gym-Subset_validgold_unique_baseline/train.jsonl
+
 python r2e_driver.py --steps 3 --prompts-per-step 4 --group 8 \
   --concurrency 32 --micro-batch 2 \
   --curriculum ./curriculum.json --out ./run

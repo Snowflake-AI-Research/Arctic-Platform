@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from collections import Counter
 
-sys.path.insert(0, "/modeling-code/karthik/abstract-remote-exps/ap-harbor")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from arctic_platform.openai_compat import _parse_tool_calls  # noqa: E402
 from arctic_platform.openai_compat import _split_reasoning  # noqa: E402

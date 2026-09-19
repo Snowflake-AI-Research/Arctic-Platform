@@ -5,7 +5,7 @@ handful of instances that produce any gradient at all; evicting too slowly
 spends whole steps on groups whose advantages are identically zero. Neither
 shows up as an error — both look like a flat reward curve.
 
-    /data-fast/ap-venv/bin/python -m pytest test_curriculum.py -q
+    pytest test_curriculum.py -q
 """
 
 from __future__ import annotations

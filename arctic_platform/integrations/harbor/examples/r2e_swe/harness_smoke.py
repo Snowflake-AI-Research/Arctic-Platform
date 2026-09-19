@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 import threading
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 
-sys.path.insert(0, "/modeling-code/karthik/abstract-remote-exps/poc")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mini_swe_plus  # noqa: E402
 from sandbox import Sandbox  # noqa: E402

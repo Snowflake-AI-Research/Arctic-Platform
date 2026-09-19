@@ -9,11 +9,17 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 import uuid
+from pathlib import Path
 
-KUBECTL = ["/data-fast/k3s/bin/k3s", "kubectl"]
-KUBECONFIG = "/data-fast/k3s/kubeconfig.yaml"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import reference_paths  # noqa: E402
+
+KUBECTL = [str(reference_paths.k3s_dir() / "bin" / "k3s"), "kubectl"]
+KUBECONFIG = str(reference_paths.k3s_dir() / "kubeconfig.yaml")
 NAMESPACE = "default"
 
 # The bridge address, not loopback: a sandbox pod has no route to the driver's

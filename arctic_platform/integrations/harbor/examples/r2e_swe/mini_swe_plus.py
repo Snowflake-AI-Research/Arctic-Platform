@@ -15,13 +15,9 @@ from __future__ import annotations
 
 import json
 import shlex
-from pathlib import Path
 from typing import Any
 
-VERIFIERS = Path(
-    "/modeling-code/boyiliu/prime-rl/deps/verifiers/verifiers/v1"
-)
-HARNESS_DIR = VERIFIERS / "harnesses" / "mini_swe_agent_plus"
+import reference_paths
 
 PROGRAM_PATH = "/tmp/verifiers/mini-swe-agent-plus.py"
 LAUNCHER_PATH = "/tmp/verifiers/mini-swe-agent-plus-launcher"
@@ -41,9 +37,9 @@ PROGRAM_ENV = {
     "TQDM_DISABLE": "1",
 }
 
-# The reference run's grading block, read straight off the wandb config of
-# 20260908coco-abl1-...-official so the reward we compute is the one he trained
-# on rather than a plausible-looking approximation.
+# The reference run's grading block, copied from that run's own logged config
+# so the reward we compute is the one it trained on rather than a
+# plausible-looking approximation.
 GRADING_POLICY: dict[str, Any] = {
     "enabled": True,
     "format": {
@@ -107,14 +103,16 @@ def terminal_stop_conditions(policy: dict[str, Any] | None = None) -> frozenset[
 
 def _sources() -> dict[str, str]:
     """Map sandbox path -> file contents, mirroring ``Harness.setup``."""
+    verifiers = reference_paths.verifiers_v1()
+    harness = reference_paths.harness_dir()
     return {
-        PROGRAM_PATH: (HARNESS_DIR / "program.py").read_text(),
-        GRADING_PATH: (HARNESS_DIR / "grading.py").read_text(),
+        PROGRAM_PATH: (harness / "program.py").read_text(),
+        GRADING_PATH: (harness / "grading.py").read_text(),
         # grading.py imports the detector cores as a flat sibling in-sandbox,
         # so they ship from gates/ under a different name than they have here.
-        GATES_CORES_PATH: (VERIFIERS / "gates" / "cores.py").read_text(),
-        EDITOR_PATH: (HARNESS_DIR / "edit_via_str_replace.py").read_text(),
-        PROTOCOL_PATH: (HARNESS_DIR / "protocol.py").read_text(),
+        GATES_CORES_PATH: (verifiers / "gates" / "cores.py").read_text(),
+        EDITOR_PATH: (harness / "edit_via_str_replace.py").read_text(),
+        PROTOCOL_PATH: (harness / "protocol.py").read_text(),
     }
 
 

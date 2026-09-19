@@ -21,7 +21,7 @@ ALLOWED = {"execute_bash", "edit_via_str_replace"}
 
 
 def main() -> int:
-    root = sys.argv[1] if len(sys.argv) > 1 else "/data-fast/poc/r2e-grpo/transcripts"
+    root = sys.argv[1] if len(sys.argv) > 1 else "./run/transcripts"
     paths = sorted(glob.glob(f"{root}/*"))
     print(f"[diag] {len(paths)} transcripts under {root}")
 

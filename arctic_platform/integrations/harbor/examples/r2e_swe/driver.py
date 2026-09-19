@@ -36,7 +36,7 @@ from tasks import TASKS, Task  # noqa: E402
 
 AGENT_PATH_IN_SANDBOX = "/tmp/sandbox_agent.py"
 INSTRUCTION_PATH_IN_SANDBOX = "/tmp/instruction.txt"
-TRANSCRIPT_DIR = "/data-fast/poc/transcripts"
+TRANSCRIPT_DIR = "./transcripts"
 
 
 def run_rollout(
@@ -105,7 +105,7 @@ def main() -> int:
     ap.add_argument("--image", default="python:3.11-slim")
     ap.add_argument("--train-gpus", type=int, default=1)
     ap.add_argument("--sample-gpus", type=int, default=1)
-    ap.add_argument("--out", default="/data-fast/poc/run")
+    ap.add_argument("--out", default="./run")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 

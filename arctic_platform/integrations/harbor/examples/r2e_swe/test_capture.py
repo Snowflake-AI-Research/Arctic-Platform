@@ -5,7 +5,7 @@ like a model that always truncates, a dropped logprob list looks like an
 on-policy run, and a misaligned one looks like a converging run that is
 actually optimising the wrong ratio. None of them raise.
 
-    /data-fast/ap-venv/bin/python -m pytest poc/test_capture.py -q
+    pytest test_capture.py -q
 """
 
 from __future__ import annotations

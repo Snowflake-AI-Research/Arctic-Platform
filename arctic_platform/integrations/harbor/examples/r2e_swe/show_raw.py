@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sys
 
-path = sys.argv[1] if len(sys.argv) > 1 else "/data-fast/poc/r2e-raw/raw_completions.jsonl"
+path = sys.argv[1] if len(sys.argv) > 1 else "./run/raw_completions.jsonl"
 limit = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 
 rows = [json.loads(line) for line in open(path)]

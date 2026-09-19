@@ -6,7 +6,7 @@ metrics: every rollout must still reach the trainer exactly once, and each
 rollout must keep the advantage it was assigned by its *own* group rather than
 one recomputed over whatever slice it landed in.
 
-    /data-fast/ap-venv/bin/python -m pytest tests/test_micro_batching.py -q
+    pytest tests/test_micro_batching.py -q
 """
 
 from __future__ import annotations

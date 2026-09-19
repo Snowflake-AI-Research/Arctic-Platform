@@ -34,16 +34,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mini_swe_plus  # noqa: E402
+import reference_paths  # noqa: E402
 from curriculum import Curriculum  # noqa: E402
 from r2e_grade import reward as grade_reward  # noqa: E402
 from r2e_grade import run_tests  # noqa: E402
 from sandbox import BRIDGE_HOST  # noqa: E402
 from sandbox import Sandbox  # noqa: E402
 
-DATASET = (
-    "/data/fshu/important/swe_data/r2e_family/"
-    "R2E-Gym-Subset_validgold_unique_baseline/train.jsonl"
-)
 
 # The reference instance prompt. The agent is told the tests exist but not shown them;
 # `hide_tests_from_agent` is emulated by leaving /r2e_tests out of the repo
@@ -85,7 +82,7 @@ def _fixed_set(instances: list[dict], args) -> list[dict] | None:
 
 def load_instances(limit: int | None, seed: int) -> list[dict]:
     rows = []
-    with open(DATASET) as fh:
+    with open(reference_paths.r2e_dataset()) as fh:
         for line in fh:
             rows.append(json.loads(line))
     random.Random(seed).shuffle(rows)
@@ -206,19 +203,19 @@ def main() -> int:
     ap.add_argument("--train-gpus", type=int, default=2, help="reference num_train_gpus")
     ap.add_argument("--sample-gpus", type=int, default=2,
                     help="he uses 6; we have fewer to spend")
-    ap.add_argument("--out", default="/data-fast/poc/r2e")
+    ap.add_argument("--out", default="./run")
     ap.add_argument(
         "--log-mirror",
-        default="/modeling-code/karthik/abstract-remote-exps/poc_state/run.log",
+        default=None,
         help="copy of the run log on shared storage, readable while the run "
              "holds the pod's serial command channel",
     )
     ap.add_argument("--seed", type=int, default=42, help="reference buffer seed")
     ap.add_argument(
         "--chat-template",
-        default="/modeling-code/boyiliu/prime-rl/prime_snowrl/configs/"
-                "chat_templates/qwen35_preserve_all_thinking.jinja",
-        help="reference [tokenizer] chat_template; pass empty to use the stock one",
+        default=reference_paths.default_chat_template(),
+        help="reference [tokenizer] chat_template, resolved under "
+             f"${reference_paths.ENV_VAR}; pass empty to use the stock one",
     )
     ap.add_argument("--curriculum", default=None,
                     help="path to the persistent difficulty tally "
@@ -239,7 +236,7 @@ def main() -> int:
     (out_dir / "transcripts").mkdir(parents=True, exist_ok=True)
     sinks = [(out_dir / "run.log").open("a")]
     if args.log_mirror:
-        # ``out`` lives on node-local /data-fast, which is invisible from
+        # ``out`` may live on node-local disk, invisible from
         # outside the pod, and the pod's command channel is serial — it is
         # blocked by the very run we want to watch. A copy on shared storage is
         # the only way to follow a step while it is in progress.

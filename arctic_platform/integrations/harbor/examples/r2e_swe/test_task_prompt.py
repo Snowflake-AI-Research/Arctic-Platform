@@ -9,20 +9,19 @@ instructions, it competes with them.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 import pytest
 
+import reference_paths
 from r2e_driver import task_prompt
-
-HARNESS = Path(
-    "/modeling-code/boyiliu/prime-rl/deps/verifiers/verifiers/v1"
-    "/harnesses/mini_swe_agent_plus/program.py"
-)
 
 
 def _instance_template() -> str:
-    src = HARNESS.read_text()
+    # The contract under test lives in the reference harness, not here, so
+    # without that checkout there is nothing to assert against.
+    if reference_paths.root() is None:
+        pytest.skip(f"{reference_paths.ENV_VAR} is not set")
+    src = (reference_paths.harness_dir() / "program.py").read_text()
     m = re.search(r'INSTANCE_TEMPLATE = """(.*?)"""', src, re.DOTALL)
     assert m, "the reference INSTANCE_TEMPLATE moved; re-check the harness contract"
     return m.group(1)

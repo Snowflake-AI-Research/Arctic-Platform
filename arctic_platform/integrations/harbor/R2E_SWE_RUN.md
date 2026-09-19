@@ -118,11 +118,10 @@ and ~30 steps.
 
 ## A note on the reference run
 
-The run originally cited as the target
-(`1874376d6a5848bc8c1276c61d1933e4`) is a **coco** run, not
-`mini-swe-agent-plus`. The correct comparison for this recipe is
-`3d5232b450ba4653b9b861768e772ed3` (`20260901main`): reward 0.652,
-eviction-adjusted 0.835 at step 500, 743 s/step. Two settings differ
-between those two runs, and the mini-swe one is what we match:
+The run originally cited as the target turned out to use the **coco**
+harness, not `mini-swe-agent-plus`, so it is the wrong baseline for this
+recipe. The right comparison reaches reward 0.652, eviction-adjusted
+0.835, at step 500 and 743 s/step. Two settings differ between those two
+runs, and the `mini-swe-agent-plus` one is what we match:
 `std_normalization` is true, and a linear length penalty is present.
 Both are still outstanding on our side.

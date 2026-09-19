@@ -84,7 +84,7 @@ def main() -> None:
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print(f"[dry] mock model on http://{BRIDGE}:{PORT}", flush=True)
 
-    out = Path("/data-fast/poc/r2e-dry/transcripts")
+    out = Path("./run/transcripts")
     out.mkdir(parents=True, exist_ok=True)
 
     instances = load_instances(n, seed=42)
