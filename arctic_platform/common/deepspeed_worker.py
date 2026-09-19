@@ -734,17 +734,54 @@ class DeepSpeedWorker:
         )
         return True
 
+    def _tie_word_embeddings(self) -> bool:
+        cfg = getattr(self.engine.module, "config", None)
+        return bool(getattr(cfg, "tie_word_embeddings", False))
+
+    def _convert_named_weights(self, weights):
+        from arctic_inference.server.weight_sync.adapters import convert_weights
+
+        return convert_weights(weights, tie_word_embeddings=self._tie_word_embeddings())
+
     def _sync_ops(self):
         from arctic_inference.server.weight_sync.adapters import plan_sync
 
         names = [n for n, _ in self.engine.module.named_parameters()]
+        tied = self._tie_word_embeddings()
         cached = getattr(self, "_sync_plan", None)
-        key = tuple(names)
+        key = (tuple(names), tied)
         if cached is not None and cached[0] == key:
             return cached[1]
-        ops = plan_sync(names)
+        ops = plan_sync(names, tie_word_embeddings=tied)
         self._sync_plan = (key, ops)
         return ops
+
+    def weight_sync_dest_specs(self) -> dict:
+        """Trainer dest contract: names, logical shapes, dtypes after plan_sync.
+
+        ZeRO-3 uses ``ds_shape`` so descriptors are full-tensor, not partitions.
+        """
+        from arctic_inference.server.weight_sync.adapters import dest_sync_descriptors
+
+        names: list[str] = []
+        shapes: dict[str, tuple[int, ...]] = {}
+        dtypes: dict[str, str] = {}
+        for name, param in self.engine.module.named_parameters():
+            names.append(name)
+            if hasattr(param, "ds_shape"):
+                shapes[name] = tuple(int(x) for x in param.ds_shape)
+            else:
+                shapes[name] = tuple(int(x) for x in param.shape)
+            dtypes[name] = str(param.dtype).replace("torch.", "")
+        tied = self._tie_word_embeddings()
+        descriptors = dest_sync_descriptors(
+            names, shapes, dtypes, tie_word_embeddings=tied,
+        )
+        return {
+            "descriptors": descriptors,
+            "tie_word_embeddings": tied,
+            "count": len(descriptors),
+        }
 
     def _gather_named_weights(self) -> list[tuple[str, torch.Tensor]]:
         weights = []
@@ -757,9 +794,7 @@ class DeepSpeedWorker:
         return weights
 
     def get_weights(self) -> list[tuple[str, torch.Tensor]]:
-        from arctic_inference.server.weight_sync.adapters import convert_weights
-
-        return convert_weights(self._gather_named_weights())
+        return self._convert_named_weights(self._gather_named_weights())
 
     def weight_norm(self) -> dict:
         """Global L2 norm of the model's parameters (sum of squares + count).
@@ -792,9 +827,9 @@ class DeepSpeedWorker:
         """Save weights to shared memory for colocated (same-GPU) transfer."""
         from arctic_inference.server.weight_sync.ipc_engine import save_weights_to_shm
 
-        from arctic_inference.server.weight_sync.adapters import convert_weights
-
-        weights = convert_weights([(n, p.data) for n, p in self.engine.module.named_parameters()])
+        weights = self._convert_named_weights(
+            [(n, p.data) for n, p in self.engine.module.named_parameters()]
+        )
         return save_weights_to_shm(weights, group_id)
 
     def get_cuda_ipc_handles(self) -> dict:
@@ -817,10 +852,8 @@ class DeepSpeedWorker:
         handles = []
         self._ipc_tensor_refs = []
 
-        from arctic_inference.server.weight_sync.adapters import convert_weights
-
         raw = [(name, p.data.detach().contiguous()) for name, p in self.engine.module.named_parameters()]
-        for name, weight in convert_weights(raw):
+        for name, weight in self._convert_named_weights(raw):
             weight = weight.detach().contiguous()
             self._ipc_tensor_refs.append(weight)
             handle = reduce_tensor(weight)
@@ -878,9 +911,7 @@ class DeepSpeedWorker:
             else:
                 raw.append((name, p.data.detach().contiguous()))
 
-        from arctic_inference.server.weight_sync.adapters import convert_weights
-
-        for name, weight in convert_weights(raw):
+        for name, weight in self._convert_named_weights(raw):
             weight = weight.detach().contiguous()
             self._ipc_tensor_refs.append(weight)
             handle = reduce_tensor(weight)
