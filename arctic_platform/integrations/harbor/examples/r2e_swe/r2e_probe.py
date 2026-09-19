@@ -1,8 +1,8 @@
 """Probe one real R2E-Gym instance end-to-end in the in-pod k3s sandbox.
 
-Answers the questions that decide whether Boyi's task path is reproducible here:
+Answers the questions that decide whether the reference task path is reproducible here:
 pulls the instance's Docker Hub image, confirms the /testbed layout and the
-interpreter his config pins, applies the gold patch, and runs the graded tests
+interpreter the reference config pins, applies the gold patch, and runs the graded tests
 both before and after so we can see the reward signal actually move.
 """
 

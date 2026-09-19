@@ -28,7 +28,7 @@ def _instances(n: int) -> list[dict]:
 
 class TestEviction:
     def test_no_verdict_before_min_attempts(self):
-        """One unlucky group is not evidence. His hard_window is 3 groups."""
+        """One unlucky group is not evidence. The reference hard_window is 3 groups."""
         c = Curriculum(path=None, min_attempts=8)  # type: ignore[arg-type]
         c.observe("i0", [0.0] * 4)
         assert c.is_live("i0")

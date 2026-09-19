@@ -1,7 +1,7 @@
-"""Run Boyi's mini-swe-agent-plus harness against a mock that mimics our gateway.
+"""Run the mini-swe-agent-plus harness against a mock that mimics our gateway.
 
 The question this answers is narrow and worth isolating: does the response shape
-our ``openai_compat`` router now emits survive his protocol validator? His
+our ``openai_compat`` router now emits survive the reference protocol validator? The reference
 validator rejects visible content, missing reasoning, more than one call per
 turn, unknown tools, and bad ids — any of which zeroes a rollout silently. A
 mock costs no GPU time and no Cortex job, so failures here are cheap.
@@ -29,7 +29,7 @@ PORT = 19301
 SUBMIT = "echo MINI_SWE_AGENT_FINAL_OUTPUT"
 
 # One scripted trajectory: look around, make an edit, then submit with the
-# exact command his submission policy requires.
+# exact command the reference submission policy requires.
 SCRIPT = [
     ("execute_bash", {"command": "ls /testbed | head -5"}),
     ("edit_via_str_replace", {

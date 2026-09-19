@@ -1,20 +1,20 @@
-"""Boyi's recipe on Cortex Training: R2E-Gym tasks, his harness, his model.
+"""The reference recipe on Cortex Training: R2E-Gym tasks, its harness, its model.
 
 Mirrors the rollout side of
 ``20260908coco-abl1-...-qwen35-4b-r2ebase-cispo-...-official``:
 
-  * tasks       R2E-Gym-Subset_validgold_unique_baseline (his exact parquet)
+  * tasks       R2E-Gym-Subset_validgold_unique_baseline (the exact reference parquet)
   * sandbox     one agent-sandbox CR per rollout, from the instance's own image
-  * agent       mini-swe-agent-plus, staged verbatim from his verifiers tree
+  * agent       mini-swe-agent-plus, staged verbatim from the reference verifiers tree
   * interception  the only route out of a sandbox is our gateway on cni0
   * reward      run_tests.sh parsed against expected_output_json, exact match
   * training    GRPO advantages -> Cortex fwd_bwd, with sampler logprobs so a
                 batch can be replayed off-policy
 
-Deviations from his run, deliberate and logged: Cortex's server-side loss is
+Deviations from the reference run, deliberate and logged: Cortex's server-side loss is
 PPO-clip GRPO rather than CISPO (a Cortex-side registration is needed for the
 exact objective), and the agent is mini-swe-agent-plus rather than coco, whose
-binary is node-local to his training pod.
+binary is node-local to the reference training pod.
 """
 
 from __future__ import annotations
@@ -45,14 +45,14 @@ DATASET = (
     "R2E-Gym-Subset_validgold_unique_baseline/train.jsonl"
 )
 
-# His instance prompt. The agent is told the tests exist but not shown them;
+# The reference instance prompt. The agent is told the tests exist but not shown them;
 # `hide_tests_from_agent` is emulated by leaving /r2e_tests out of the repo
 # until scoring.
-# His R2EGymTaskSet.get_instruction returns the bare problem statement, and the
+# The reference R2EGymTaskSet.get_instruction returns the bare problem statement, and the
 # harness's own INSTANCE_TEMPLATE supplies every piece of scaffolding around it:
 # the working directory, "do not modify tests", one-native-tool-call-per-turn, and
 # the exact submission command. Wrapping the statement ourselves nested a second
-# prompt inside his {{task}} slot, and the word "submit" in it competed with the
+# prompt inside the harness's {{task}} slot, and the word "submit" in it competed with the
 # harness's `echo MINI_SWE_AGENT_FINAL_OUTPUT` — there is no submit tool, so every
 # model that took our wording at face value ended the rollout on unknown_tool.
 def task_prompt(rec: dict) -> str:
@@ -124,7 +124,7 @@ def run_one_rollout(
 
         # Park the graded tests outside the repo for the duration of the
         # rollout; an agent that can read them can pass without fixing
-        # anything, which is a reward-hacking path his setup closes too.
+        # anything, which is a reward-hacking path the reference setup closes too.
         sb.exec("mv /r2e_tests /tmp/r2e_tests_hidden 2>/dev/null || true", timeout=120)
 
         mini_swe_plus.stage(sb, python_command="/testbed/.venv/bin/python")
@@ -172,38 +172,38 @@ def run_one_rollout(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    # Defaults are his, read off
+    # Defaults follow the reference config, read off
     # configs/train/main/20260904main_qwen35_4b_r2ebase_cispo_mops8_.../rl.toml.
     # Only the loss differs: Cortex's server-side objective is PPO-clip GRPO,
-    # his is cispo_ref_kl_loss. His *advantages* are already GRPO
+    # the reference is cispo_ref_kl_loss. The reference *advantages* are already GRPO
     # ([orchestrator.algo] type = "grpo"), so that is the sole delta.
     ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
     ap.add_argument("--steps", type=int, default=2)
     ap.add_argument("--prompts-per-step", type=int, default=16,
-                    help="his batch_size 128 / group_size 8")
-    ap.add_argument("--group", type=int, default=8, help="his group_size")
+                    help="reference batch_size 128 / group_size 8")
+    ap.add_argument("--group", type=int, default=8, help="reference group_size")
     ap.add_argument("--concurrency", type=int, default=32,
-                    help="his max_inflight_rollouts is 252; ours is bounded by "
+                    help="reference max_inflight_rollouts is 252; ours is bounded by "
                          "sampler throughput on 2 GPUs, not by the node")
-    ap.add_argument("--max-turns", type=int, default=100, help="his agent.max_turns")
+    ap.add_argument("--max-turns", type=int, default=100, help="reference agent.max_turns")
     ap.add_argument("--command-timeout", type=int, default=60)
-    ap.add_argument("--rollout-timeout", type=int, default=5400, help="his timeout.rollout")
-    ap.add_argument("--setup-timeout", type=int, default=1800, help="his timeout.setup")
-    ap.add_argument("--max-seq-len", type=int, default=131072, help="his seq_len")
+    ap.add_argument("--rollout-timeout", type=int, default=5400, help="reference timeout.rollout")
+    ap.add_argument("--setup-timeout", type=int, default=1800, help="reference timeout.setup")
+    ap.add_argument("--max-seq-len", type=int, default=131072, help="reference seq_len")
     ap.add_argument("--max-tokens-per-turn", type=int, default=32768,
-                    help="his max_completion_tokens")
+                    help="reference max_completion_tokens")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--lr", type=float, default=1e-6)
-    ap.add_argument("--adam-eps", type=float, default=1e-15, help="his optim.eps")
-    ap.add_argument("--adam-beta2", type=float, default=0.95, help="his betas2")
-    ap.add_argument("--weight-decay", type=float, default=0.0, help="his weight_decay")
+    ap.add_argument("--adam-eps", type=float, default=1e-15, help="reference optim.eps")
+    ap.add_argument("--adam-beta2", type=float, default=0.95, help="reference betas2")
+    ap.add_argument("--weight-decay", type=float, default=0.0, help="reference weight_decay")
     ap.add_argument("--micro-batch", type=int, default=4,
                     help="sequences per fwd_bwd; a whole step will not fit in one")
     ap.add_argument("--std-norm", action="store_true",
-                    help="his std_normalization is false, so off by default")
+                    help="reference std_normalization is false, so off by default")
     ap.add_argument("--port", type=int, default=19914)
-    ap.add_argument("--train-gpus", type=int, default=2, help="his num_train_gpus")
+    ap.add_argument("--train-gpus", type=int, default=2, help="reference num_train_gpus")
     ap.add_argument("--sample-gpus", type=int, default=2,
                     help="he uses 6; we have fewer to spend")
     ap.add_argument("--out", default="/data-fast/poc/r2e")
@@ -213,12 +213,12 @@ def main() -> int:
         help="copy of the run log on shared storage, readable while the run "
              "holds the pod's serial command channel",
     )
-    ap.add_argument("--seed", type=int, default=42, help="his buffer seed")
+    ap.add_argument("--seed", type=int, default=42, help="reference buffer seed")
     ap.add_argument(
         "--chat-template",
         default="/modeling-code/boyiliu/prime-rl/prime_snowrl/configs/"
                 "chat_templates/qwen35_preserve_all_thinking.jinja",
-        help="his [tokenizer] chat_template; pass empty to use the stock one",
+        help="reference [tokenizer] chat_template; pass empty to use the stock one",
     )
     ap.add_argument("--curriculum", default=None,
                     help="path to the persistent difficulty tally "
@@ -266,7 +266,7 @@ def main() -> int:
     instances = load_instances(None, args.seed)
     curriculum = Curriculum.load(
         args.curriculum or (out_dir / "curriculum.json"),
-        # His hard_window is 3: three failed groups before an instance is
+        # The reference hard_window is 3: three failed groups before an instance is
         # written off, so one unlucky group does not evict it.
         min_attempts=3 * args.group,
     )
@@ -285,11 +285,11 @@ def main() -> int:
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if args.chat_template:
-        # His [tokenizer] chat_template, with thinking_retention = "all". The
+        # The reference [tokenizer] chat_template, with thinking_retention = "all". The
         # stock Qwen template drops prior turns' <think> blocks, so the policy
         # would be conditioned on a transcript it never produced — and every
         # turn after the first would be sampled from a different distribution
-        # than the one his run trains on.
+        # than the one the reference run trains on.
         tokenizer.chat_template = Path(args.chat_template).read_text()
         log(f"[r2e] chat template: {args.chat_template}")
 
@@ -422,8 +422,8 @@ def main() -> int:
 
             if fixed is None:
                 # Eviction observes the post-override reward, not the earned one:
-                # his swe_terminal_invalid filter sits in pre_batch_filters, so the
-                # difficulty signal his buffer evicts on is already zeroed. A task
+                # the reference swe_terminal_invalid filter sits in pre_batch_filters, so the
+                # difficulty signal the reference buffer evicts on is already zeroed. A task
                 # the agent can solve but keeps fumbling the protocol on is, to this
                 # loop, genuinely unlearnable until the formatting improves.
                 for inst, rs in by_instance.items():

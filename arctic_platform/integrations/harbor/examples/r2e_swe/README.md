@@ -15,7 +15,7 @@ prerequisites.
 ```
 r2e_driver.py
   ├── sandbox.py        one k3s Sandbox CR per rollout
-  ├── mini_swe_plus.py  stages Boyi's harness into the sandbox and runs it
+  ├── mini_swe_plus.py  stages the harness into the sandbox and runs it
   ├── capture.py        DriverOpenAIGateway + per-rollout token capture
   ├── r2e_grade.py      R2E's own test command, before/after, for reward
   └── curriculum.py     difficulty filtering (evict too-easy / too-hard)
@@ -37,13 +37,13 @@ without patching it.
   Expects `/data-fast/k3s/kubeconfig.yaml` and the bridge at
   `10.42.0.1`. Needs a privileged pod (full capabilities, seccomp
   Unconfined).
-* **Boyi's prime-rl checkout** at
+* **The prime-rl checkout** at
   `/modeling-code/boyiliu/prime-rl/deps/verifiers/...`, from which
   `mini_swe_plus.py` stages the `mini-swe-agent-plus` harness verbatim
   rather than reimplementing it.
 * **Cortex credentials** in the environment (`ARCTIC_CORTEX_HOST`,
   `CORTEX_PAT`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`).
-* **His chat template**, `qwen35_preserve_all_thinking.jinja`. The stock
+* **The reference chat template**, `qwen35_preserve_all_thinking.jinja`. The stock
   Qwen template drops prior turns' `<think>` blocks, which would
   condition the policy on a transcript it never produced.
 
@@ -68,7 +68,7 @@ judged without curriculum drift.
 `smoke.py` stands a fake OpenAI server on the bridge and runs the real
 agent in a real sandbox against it, exercising sandbox lifecycle,
 routing, the agent loop, token capture and reward scoring — everything
-except Cortex. `harness_smoke.py` does the same for his harness's
+except Cortex. `harness_smoke.py` does the same for the harness's
 protocol validation, `gateway_check.py` proves the gateway's sampling
 defaults against a stub client, and `diag_stops.py` tabulates rollout
 outcomes by detector from a run log.

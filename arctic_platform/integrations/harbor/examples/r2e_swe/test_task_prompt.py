@@ -1,8 +1,8 @@
-"""The instruction we hand the harness must be the one his taskset hands it.
+"""The instruction we hand the harness must be the one the reference taskset hands it.
 
-His ``R2EGymTaskSet.get_instruction`` returns ``info["problem_statement"]`` and
+The reference ``R2EGymTaskSet.get_instruction`` returns ``info["problem_statement"]`` and
 nothing else; the harness's ``INSTANCE_TEMPLATE`` supplies all scaffolding. Any
-wrapper we add lands *inside* his ``{{task}}`` slot, so it does not replace his
+wrapper we add lands *inside* the reference ``{{task}}`` slot, so it does not replace the reference
 instructions, it competes with them.
 """
 
@@ -24,7 +24,7 @@ HARNESS = Path(
 def _instance_template() -> str:
     src = HARNESS.read_text()
     m = re.search(r'INSTANCE_TEMPLATE = """(.*?)"""', src, re.DOTALL)
-    assert m, "his INSTANCE_TEMPLATE moved; re-check the harness contract"
+    assert m, "the reference INSTANCE_TEMPLATE moved; re-check the harness contract"
     return m.group(1)
 
 
@@ -54,7 +54,7 @@ def test_submission_command_survives_exactly_once() -> None:
 
 
 def test_no_nested_prompt_wrapper() -> None:
-    """His template already opens <pr_description>; ours must not add a second
+    """The reference template already opens <pr_description>; ours must not add a second
     framing inside it."""
     rendered = _render("Title: thing is broken")
     assert "<issue>" not in rendered
@@ -78,5 +78,5 @@ def test_statement_is_passed_through_verbatim() -> None:
 ])
 def test_his_template_still_covers_what_our_wrapper_used_to_say(phrase: str) -> None:
     """Guards the removal: each instruction our wrapper duplicated is present in
-    his template, so dropping the wrapper loses nothing."""
+    the reference template, so dropping the wrapper loses nothing."""
     assert phrase in _render("Title: thing is broken")

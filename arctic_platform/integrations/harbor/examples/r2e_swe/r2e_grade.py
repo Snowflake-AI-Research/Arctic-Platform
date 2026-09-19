@@ -1,6 +1,6 @@
 """Reproduce R2E-Gym's reward on a live sandbox, before and after the gold patch.
 
-Mirrors ``R2EGymTaskSet._run_tests`` / ``_calculate_reward`` from Boyi's
+Mirrors ``R2EGymTaskSet._run_tests`` / ``_calculate_reward`` from the
 verifiers checkout: stage ``/r2e_tests`` into the repo, run ``run_tests.sh``,
 parse the pytest summary, and require an exact match against
 ``expected_output_json``. Broken repo must score 0 and the gold patch must

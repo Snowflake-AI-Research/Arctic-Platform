@@ -1,13 +1,13 @@
-"""Run Boyi's ``mini-swe-agent-plus`` harness inside our k3s sandbox.
+"""Run the ``mini-swe-agent-plus`` harness inside our k3s sandbox.
 
-His harness is a verifiers ``Harness`` object, but its sandbox-side contract is
+That harness is a verifiers ``Harness`` object, but its sandbox-side contract is
 narrow: stage five stdlib-only modules plus a launcher, then exec the launcher
 with connection flags and a grading policy. Reimplementing that contract here
-lets us run his exact agent code — same protocol validation, same grading,
+lets us run the exact reference agent code — same protocol validation, same grading,
 same submission command — without pulling the verifiers orchestrator, which
 expects its own runtime, trace, and taskset objects.
 
-Sourced from the checkout so the agent stays byte-identical to his:
+Sourced from the checkout so the agent stays byte-identical to the reference:
     deps/verifiers/verifiers/v1/harnesses/mini_swe_agent_plus/
 """
 
@@ -41,7 +41,7 @@ PROGRAM_ENV = {
     "TQDM_DISABLE": "1",
 }
 
-# His run's grading block, read straight off the wandb config of
+# The reference run's grading block, read straight off the wandb config of
 # 20260908coco-abl1-...-official so the reward we compute is the one he trained
 # on rather than a plausible-looking approximation.
 GRADING_POLICY: dict[str, Any] = {
@@ -121,7 +121,7 @@ def _sources() -> dict[str, str]:
 def stage(sandbox, python_command: str = "/testbed/.venv/bin/python") -> None:
     """Write the harness into the sandbox and make it executable.
 
-    ``argv[0]`` must remain a real interpreter path. His harness carries a long
+    ``argv[0]`` must remain a real interpreter path. The reference harness carries a long
     comment about this: aliasing it costs CPython ``sys.executable`` and its
     virtualenv, and on the R2E images the fallback prefix has no stdlib, so the
     interpreter aborts with SIGABRT before the agent ever starts.

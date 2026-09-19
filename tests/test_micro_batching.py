@@ -138,7 +138,7 @@ async def test_one_optimizer_step_per_train_call():
 
 
 def test_std_normalization_off_keeps_advantages_proportional():
-    """Mean-centred only: his std_normalization = false."""
+    """Mean-centred only: the reference std_normalization = false."""
     adv = _grpo_advantages([1.0, 0.0, 0.0, 0.0], ["g"] * 4, std_normalization=False)
     assert adv == pytest.approx([0.75, -0.25, -0.25, -0.25])
 

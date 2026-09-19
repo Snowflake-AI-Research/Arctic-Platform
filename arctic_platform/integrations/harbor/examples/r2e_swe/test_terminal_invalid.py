@@ -1,4 +1,4 @@
-"""Terminal-invalid reward override: the part of his recipe Boyi flagged.
+"""Terminal-invalid reward override: the part of the reference recipe most easily missed.
 
 prime-rl auto-injects a ``swe_terminal_invalid`` StopConditionFilter with
 ``retain=True, reward_override=0.0`` over every stop condition its enabled
@@ -15,7 +15,7 @@ from mini_swe_plus import GRADING_POLICY, terminal_stop_conditions
 
 
 def test_matches_his_enabled_detectors() -> None:
-    """His policy: format on, duplicate_tool_call on, truncation all on."""
+    """The reference policy: format on, duplicate_tool_call on, truncation all on."""
     assert terminal_stop_conditions() == frozenset({
         "format_invalid",
         "repetition",
@@ -112,7 +112,7 @@ def test_derived_set_is_not_hardcoded() -> None:
 
 
 def test_policy_still_matches_his_toml() -> None:
-    """If this fails, our detectors drifted from his rl.toml [reward.swe]."""
+    """If this fails, our detectors drifted from the reference rl.toml [reward.swe]."""
     assert GRADING_POLICY["format"] == {
         "enabled": True,
         "require_reasoning": True,

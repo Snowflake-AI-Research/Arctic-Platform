@@ -241,7 +241,7 @@ class CapturingGateway(DriverOpenAIGateway):
                     # ``finish_reason="length"`` is the signal the harness
                     # already handles: with truncation grading on it records a
                     # response_length stop and exits, which is the same
-                    # terminal class his max_turns cap produces.
+                    # terminal class the reference max_turns cap produces.
                     return Response(
                         content=json.dumps(_length_stop_payload()),
                         status_code=200,

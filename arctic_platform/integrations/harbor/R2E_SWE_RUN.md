@@ -7,16 +7,16 @@ a *real* black-box SWE agent — multi-turn, native tool calling, 100-turn
 trajectories, a container per rollout — rather than a single-turn
 arithmetic task?
 
-The reference is Boyi's prime-rl run of the same recipe, so every
-hyper-parameter below was matched to his on purpose and the deviations
+The reference is the prime-rl run of the same recipe, so every
+hyper-parameter below was matched to it on purpose and the deviations
 are listed explicitly.
 
 ## Setup
 
-| | Ours | His reference run |
+| | Ours | Reference run |
 |---|---|---|
 | Model | `Qwen/Qwen3.5-4B` | same |
-| Harness | `mini-swe-agent-plus` (his, staged verbatim) | same |
+| Harness | `mini-swe-agent-plus` (staged verbatim) | same |
 | Tasks | R2E-Gym subset, 3606 instances | same |
 | Sampling | temp 1.0, top_p 1.0, 32768 tok/turn, 100 turns | same |
 | Optimiser | lr 1e-6, Adam β2 0.95, eps 1e-15, wd 0 | same |
@@ -26,7 +26,7 @@ are listed explicitly.
 
 The loss is the one deliberate deviation: CISPO needs a Cortex-side
 registration, and the immediate question was whether the *recipe and
-architecture* transfer, not whether we can match his final number.
+architecture* transfer, not whether we can match its final number.
 
 Sandboxes are in-pod k3s (agent-sandbox), one container per rollout, on
 a 48-CPU CPU-only pod. No GPU is used on our side at all — sampling and
@@ -55,7 +55,7 @@ terminal-invalid            71/96   74.0%
 effective reward after override   18/96   18.8%
 ```
 
-His comparable run sits at 10–23 % terminal-invalid. At 74 % the reward
+The comparable run sits at 10–23 % terminal-invalid. At 74 % the reward
 signal is nearly gone: with group size 8, most groups end up with
 near-zero variance and therefore near-zero advantage, which is why this
 is the blocker rather than anything in the loss or the transport.
@@ -77,8 +77,8 @@ Two of these are ours, not the model's:
   agent to "submit", but `mini-swe-agent-plus` has no `submit` tool —
   submission is `echo MINI_SWE_AGENT_FINAL_OUTPUT` through
   `execute_bash`. The model dutifully called a tool that does not
-  exist. Fixed by passing the bare problem statement, mirroring his
-  `get_instruction`; not yet re-measured.
+  exist. Fixed by passing the bare problem statement, mirroring the
+  taskset's own `get_instruction`; not yet re-measured.
 * **The 12 "truncations"** all ended at exactly turn 100, which is our
   `max_turns`. They are the gateway's turn budget, not the model running
   past its output-token limit. Same terminal class either way, but it
@@ -111,7 +111,7 @@ first-exchange breakage.
 
 ## Not done
 
-No convergence run. His curve moves 0.28 → 0.71 by step 91 of a planned
+No convergence run. The reference curve moves 0.28 → 0.71 by step 91 of a planned
 500; we have 3 steps, which says the loop closes, not that it learns.
 Getting there needs the terminal-invalid rate down first, then batch 128
 and ~30 steps.

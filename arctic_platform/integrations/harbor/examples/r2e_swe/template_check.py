@@ -1,9 +1,9 @@
-"""Check his chat template round-trips a multi-turn tool-using transcript.
+"""Check the reference chat template round-trips a multi-turn tool-using transcript.
 
-His template is custom (thinking_retention = "all"), and our renderer feeds it
+The reference template is custom (thinking_retention = "all"), and our renderer feeds it
 fields the stock one ignores. If it rejects a replayed assistant turn or drops
 the prior reasoning, every turn after the first is sampled from a different
-distribution than his run — silently, since the request still succeeds.
+distribution than the reference run — silently, since the request still succeeds.
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ def main() -> int:
         ("first tool result", "setup.py"),
         ("second tool call", "cat setup.py"),
         ("second tool result", "from setuptools import setup"),
-        # The whole point of his template: earlier turns keep their thinking.
+        # The whole point of the reference template: earlier turns keep their thinking.
         ("turn-1 reasoning retained", "FIRST_TURN_REASONING"),
         ("turn-2 reasoning retained", "SECOND_TURN_REASONING"),
     ]:
@@ -105,7 +105,7 @@ def main() -> int:
     print(f"[template] PASS: {len(rendered)} chars, tools + both turns + "
           f"both reasoning blocks retained, <think> left open")
     print(f"[template] stock template retains turn-1 reasoning: {retained_by_stock} "
-          f"(this is the difference his template makes)")
+          f"(this is the difference the reference template makes)")
     return 0
 
 

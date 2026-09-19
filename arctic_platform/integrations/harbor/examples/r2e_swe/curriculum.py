@@ -43,7 +43,7 @@ class Record:
 class Curriculum:
     path: Path
     # How many attempts before a verdict. One group of 4 all failing is weak
-    # evidence; his setup re-samples before giving up on an instance.
+    # evidence; the reference setup re-samples before giving up on an instance.
     min_attempts: int = 8
     records: dict[str, Record] = field(default_factory=dict)
 

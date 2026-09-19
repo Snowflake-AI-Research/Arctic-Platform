@@ -47,7 +47,7 @@ spec:
           image: {image}
           command: ["sleep", "infinity"]
           resources:
-            # His ratios: a rollout is idle most of its life (waiting on the
+            # The reference ratios: a rollout is idle most of its life (waiting on the
             # model), so requests are tiny and limits are generous. That
             # overcommit is what lets one node hold ~250 concurrent sandboxes
             # instead of ~15.
