@@ -127,7 +127,7 @@ sft = [
 # [sft] plus sampling. arctic-inference[vllm] owns the validated vLLM pin.
 rl = [
     "arctic_platform[sft]",
-    "arctic-inference[server,vllm] @ git+https://github.com/snowflakedb/ArcticInference.git@sfc-gh-truwase/qwen35-weight-sync",
+    "arctic-inference[server,vllm] @ git+https://github.com/snowflakedb/ArcticInference.git@sfc-gh-truwase/weight-sync-init-contract",
     "tensordict",
 ]
 

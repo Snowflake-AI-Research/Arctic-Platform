@@ -372,6 +372,10 @@ async def destroy(job_id: int, job_type: str = Body(..., embed=True)):
         else:
             await app.state.log_prob_pool.shutdown()
 
+    if info["job_type"] in ("training", "sampling"):
+        from arctic_platform.common.utils.weight_sync import reset_weight_sync_contract
+
+        reset_weight_sync_contract(app.state, app.state.sampling_pool)
     return {"job_id": job_id}
 
 
@@ -745,6 +749,9 @@ async def weight_sync(job_id: int, request: WeightSyncRequest = Body(...)):
     low_memory = request.low_memory if request.low_memory is not None else training_job_info.get("low_memory", False)
 
     lp_pool = app.state.log_prob_pool if colocate else None
+    from arctic_platform.common.utils.weight_sync import ensure_weight_sync_contract
+
+    await ensure_weight_sync_contract(workers, pool, app.state)
     if cuda_ipc:
         if low_memory:
             print("colo _sync_weights_cuda_ipc_low_mem")
@@ -1073,6 +1080,7 @@ def main():
     app.state.jobs = {}
     app.state.next_job_id = 1
     app.state.weight_sync_ready = False
+    app.state.weight_sync_contract = None
     app.state.weight_sync_bucket_size = _WEIGHT_SYNC_BUCKET_SIZE
 
     uvicorn.run(

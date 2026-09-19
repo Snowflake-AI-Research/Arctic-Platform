@@ -204,6 +204,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
         self.jobs = {}
         self.next_job_id = 1
         self.weight_sync_ready = False
+        self.weight_sync_contract = None
         self.weight_sync_bucket_size = _WEIGHT_SYNC_BUCKET_SIZE
 
         pr0("[ArcticRLRayServerState] initialized")
@@ -545,6 +546,10 @@ class ArcticRLRayServerState(ArcticRLServerState):
                 await self.log_prob_pool.shutdown()
                 # asyncio.run(self.log_prob_pool.shutdown())
 
+        if info["job_type"] in ("training", "sampling"):
+            from arctic_platform.common.utils.weight_sync import reset_weight_sync_contract
+
+            reset_weight_sync_contract(self, self.sampling_pool)
         return {"job_id": job_id}
 
 
@@ -960,6 +965,9 @@ class ArcticRLRayServer:
         )
 
         lp_pool = self.log_prob_pool if colocate else None
+        from arctic_platform.common.utils.weight_sync import ensure_weight_sync_contract
+
+        await ensure_weight_sync_contract(workers, pool, self)
         if cuda_ipc:
             if low_memory:
                 results = await self._sync_weights_cuda_ipc_low_mem(workers, pool, lp_pool)
