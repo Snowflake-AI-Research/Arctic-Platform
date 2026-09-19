@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import torch
 
+from arctic_platform.common.utils.batch import _split_batch
+from arctic_platform.common.utils.batch import dp_sp_world_size
+from arctic_platform.common.utils.batch import sp_size_from_job_config
 from arctic_platform.common.utils.batch import split_dict
+from arctic_platform.common.utils.batch import unpack_batch
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import torch_assert_equal
 
@@ -38,3 +42,133 @@ class TestSplitDictRemainder(TestCasePlus):
         ids = torch.arange(6).view(3, 2)
         with self.assertRaises(ValueError):
             split_dict({"input_ids": ids}, 4)
+
+    def test_rollout_is_weights_in_batch_is_dp_sharded(self):
+        weights = torch.arange(4, dtype=torch.float32)
+        envelope = {
+            "batch": {
+                "input_ids": torch.arange(8).view(4, 2),
+                "attention_mask": torch.ones(4, 2, dtype=torch.long),
+                "rollout_is_weights": weights,
+            },
+            "meta": {},
+            "processing": {"loss_fn": "verl_grpo"},
+        }
+        shards, _ = _split_batch(envelope, num_workers=2)
+        self.assertEqual(shards[0]["batch"]["rollout_is_weights"].tolist(), [0.0, 1.0])
+        self.assertEqual(shards[1]["batch"]["rollout_is_weights"].tolist(), [2.0, 3.0])
+
+    def test_batch_dim_keys_in_meta_are_promoted_and_sharded(self):
+        weights = torch.arange(4, dtype=torch.float32)
+        advantages = torch.arange(8, dtype=torch.float32).view(4, 2)
+        envelope = {
+            "batch": {
+                "input_ids": torch.arange(8).view(4, 2),
+                "attention_mask": torch.ones(4, 2, dtype=torch.long),
+            },
+            "meta": {"rollout_is_weights": weights, "advantages": advantages, "dp_size": 2},
+            "processing": {"loss_fn": "ap_grpo"},
+        }
+        shards, _ = _split_batch(envelope, num_workers=2)
+        self.assertNotIn("rollout_is_weights", shards[0]["meta"])
+        self.assertNotIn("advantages", shards[0]["meta"])
+        self.assertEqual(shards[0]["meta"]["dp_size"], 2)
+        self.assertEqual(shards[0]["batch"]["rollout_is_weights"].tolist(), [0.0, 1.0])
+        self.assertEqual(shards[1]["batch"]["rollout_is_weights"].tolist(), [2.0, 3.0])
+        self.assertEqual(shards[0]["batch"]["advantages"].tolist(), [[0.0, 1.0], [2.0, 3.0]])
+
+    def test_none_rollout_is_weights_stays_in_meta(self):
+        """SkyRL overlay sends rollout_is_weights=None; promoting it 500s the worker."""
+        envelope = {
+            "batch": {
+                "input_ids": torch.arange(8).view(4, 2),
+                "attention_mask": torch.ones(4, 2, dtype=torch.long),
+            },
+            "meta": {"rollout_is_weights": None, "dp_size": 1, "temperature": 1.0},
+            "processing": {"post": ["compute_logprobs"], "loss_fn": None},
+        }
+        _, batch_data, meta_data, _ = unpack_batch(envelope)
+        self.assertNotIn("rollout_is_weights", batch_data)
+        self.assertIsNone(meta_data["rollout_is_weights"])
+        shards, _ = _split_batch(envelope, num_workers=2)
+        self.assertNotIn("rollout_is_weights", shards[0]["batch"])
+        self.assertIsNone(shards[0]["meta"]["rollout_is_weights"])
+        for k, v in shards[0]["batch"].items():
+            getattr(v, "shape")
+
+    def test_cortex_context_batch_dim_keys_land_in_batch(self):
+        advantages = torch.arange(8, dtype=torch.float32).view(4, 2)
+        loss_mask = torch.ones(4, 2, dtype=torch.bool)
+        envelope = {
+            "kwargs": {
+                "input_ids": torch.arange(8).view(4, 2),
+                "attention_mask": torch.ones(4, 2, dtype=torch.long),
+            },
+            "context": {
+                "advantages": advantages,
+                "loss_mask": loss_mask,
+                "prompt_group_ids": torch.tensor([7, 7, 8, 8]),
+                "max_prompt_len": 3,
+            },
+            "processing": {"loss_fn": "ap_grpo"},
+        }
+        _, batch_data, meta_data, _ = unpack_batch(envelope)
+        self.assertIn("advantages", batch_data)
+        self.assertIn("loss_mask", batch_data)
+        self.assertIn("prompt_group_ids", batch_data)
+        self.assertEqual(meta_data, {"max_prompt_len": 3})
+        shards, _ = _split_batch(envelope, num_workers=2)
+        self.assertEqual(shards[0]["batch"]["prompt_group_ids"].tolist(), [7, 7])
+        self.assertEqual(shards[1]["batch"]["prompt_group_ids"].tolist(), [8, 8])
+        self.assertEqual(shards[0]["meta"], {"max_prompt_len": 3, "dp_size": 2})
+
+
+class TestDpSizeDividesBySp(TestCasePlus):
+    def _envelope(self):
+        return {
+            "batch": {
+                "input_ids": torch.arange(16).view(8, 2),
+                "attention_mask": torch.ones(8, 2, dtype=torch.long),
+            },
+            "meta": {},
+            "processing": {"loss_fn": "ap_grpo"},
+        }
+
+    def test_dp_sp_world_size(self):
+        self.assertEqual(dp_sp_world_size(8, 1), 8)
+        self.assertEqual(dp_sp_world_size(8, 2), 4)
+        with self.assertRaises(ValueError):
+            dp_sp_world_size(8, 3)
+
+    def test_split_stamps_num_workers_not_world_over_sp(self):
+        shards, _ = _split_batch(self._envelope(), num_workers=8, sp_size=2)
+        self.assertEqual(len(shards), 8)
+        self.assertEqual(shards[0]["meta"]["dp_size"], 8)
+        self.assertEqual(shards[7]["meta"]["dp_size"], 8)
+
+    def test_split_rejects_sp_that_does_not_divide_workers(self):
+        with self.assertRaises(ValueError):
+            _split_batch(self._envelope(), num_workers=8, sp_size=3)
+
+    def test_split_default_sp_is_world(self):
+        shards, _ = _split_batch(self._envelope(), num_workers=8)
+        self.assertEqual(shards[0]["meta"]["dp_size"], 8)
+
+    def test_sp_size_from_verl_ds_config(self):
+        self.assertEqual(sp_size_from_job_config({"ds_config": {"sequence_parallel_size": 2}}), 2)
+
+    def test_sp_size_from_training_config(self):
+        self.assertEqual(sp_size_from_job_config({"training_config": {"sp_size": 4}}), 4)
+
+    def test_sp_size_unset_is_one(self):
+        self.assertEqual(sp_size_from_job_config({}), 1)
+        self.assertEqual(sp_size_from_job_config(None), 1)
+
+    def test_sp_size_conflict_raises(self):
+        with self.assertRaises(ValueError):
+            sp_size_from_job_config(
+                {
+                    "training_config": {"sp_size": 2},
+                    "ds_config": {"sequence_parallel_size": 4},
+                }
+            )
