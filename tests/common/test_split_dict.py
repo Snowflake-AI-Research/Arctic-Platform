@@ -77,6 +77,25 @@ class TestSplitDictRemainder(TestCasePlus):
         self.assertEqual(shards[1]["batch"]["rollout_is_weights"].tolist(), [2.0, 3.0])
         self.assertEqual(shards[0]["batch"]["advantages"].tolist(), [[0.0, 1.0], [2.0, 3.0]])
 
+    def test_none_rollout_is_weights_stays_in_meta(self):
+        """SkyRL overlay sends rollout_is_weights=None; promoting it 500s the worker."""
+        envelope = {
+            "batch": {
+                "input_ids": torch.arange(8).view(4, 2),
+                "attention_mask": torch.ones(4, 2, dtype=torch.long),
+            },
+            "meta": {"rollout_is_weights": None, "dp_size": 1, "temperature": 1.0},
+            "processing": {"post": ["compute_logprobs"], "loss_fn": None},
+        }
+        _, batch_data, meta_data, _ = unpack_batch(envelope)
+        self.assertNotIn("rollout_is_weights", batch_data)
+        self.assertIsNone(meta_data["rollout_is_weights"])
+        shards, _ = _split_batch(envelope, num_workers=2)
+        self.assertNotIn("rollout_is_weights", shards[0]["batch"])
+        self.assertIsNone(shards[0]["meta"]["rollout_is_weights"])
+        for k, v in shards[0]["batch"].items():
+            getattr(v, "shape")
+
     def test_cortex_context_batch_dim_keys_land_in_batch(self):
         advantages = torch.arange(8, dtype=torch.float32).view(4, 2)
         loss_mask = torch.ones(4, 2, dtype=torch.bool)

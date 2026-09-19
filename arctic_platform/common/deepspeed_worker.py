@@ -406,7 +406,7 @@ class DeepSpeedWorker:
             log_dp_shard_tokens(self.rank, f"{tag} shard", batch_data, meta_data)
             pr0(f"[DeepSpeedWorker] {tag}: {batch_data.keys()=} {meta_data.keys()=} {processing.keys()=}")
             for k, v in batch_data.items():
-                pr0(f"[DeepSpeedWorker] {tag}: {k=}: {v.shape=}")
+                pr0(f"[DeepSpeedWorker] {tag}: {k=}: shape={getattr(v, 'shape', type(v).__name__)}")
 
         grad_accum_steps = self.engine.gradient_accumulation_steps()
         # H3: list-of-microbatches from the client skips concat→split_dict.

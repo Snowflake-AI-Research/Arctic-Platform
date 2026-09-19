@@ -158,14 +158,20 @@ def promote_batch_dim_to_batch(batch_data: dict, meta_data: dict) -> tuple[dict,
     """Move batch-dim tensors from ``meta``/Cortex ``context`` into ``batch``.
 
     No-op for keys already on ``batch`` (``batch`` wins; the ``meta`` copy is dropped).
+    Non-tensor values (e.g. SkyRL ``rollout_is_weights: None``) stay on ``meta``
+    so later ``v.shape`` debug loops and DP split do not see a None batch field.
     """
     batch_data = dict(batch_data)
     meta_data = dict(meta_data)
     for key in BATCH_DIM_CONTEXT_KEYS:
-        if key in meta_data:
-            if key not in batch_data:
-                batch_data[key] = meta_data[key]
-            del meta_data[key]
+        if key not in meta_data:
+            continue
+        value = meta_data[key]
+        if not torch.is_tensor(value):
+            continue
+        if key not in batch_data:
+            batch_data[key] = value
+        del meta_data[key]
     return batch_data, meta_data
 
 
