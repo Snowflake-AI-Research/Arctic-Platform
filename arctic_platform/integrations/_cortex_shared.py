@@ -16,9 +16,12 @@
 ``{args, kwargs, context, processing}`` wire format.
 
 The processing block matches ``cortex-client/recipes/rl_loop.py``
-(Jae's cookbook). ``dp_size`` is deliberately NOT sent: the server treats it
-as a loss divisor, which scales the effective LR down by that factor at
-multi-GPU DP.
+(Jae's cookbook). The whole ``(dp_size, batch_num_tokens, global_batch_size)``
+trio is forwarded: ``dp_size`` is a multiplier that cancels DeepSpeed's DP
+gradient averaging, not a divisor. Sending only the denominators leaves the
+server at ``dp_size=1``, which makes the gradient ``1/dp_size`` of the global
+token-mean -- the same direction, so it reads as a 4x smaller LR at 4-GPU DP
+rather than as a failure.
 """
 
 from __future__ import annotations
@@ -170,7 +173,7 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
 
     caller_config = dict((processing_in or {}).get("config") or {})
     proc_config: dict[str, Any] = {**_DEFAULT_PROC_CONFIG, **caller_config}
-    for k in ("global_batch_size", "batch_num_tokens"):
+    for k in ("global_batch_size", "batch_num_tokens", "dp_size"):
         if k not in proc_config and k in meta:
             proc_config[k] = int(meta[k])
 

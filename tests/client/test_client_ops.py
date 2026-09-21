@@ -647,6 +647,88 @@ class TestCortexSharedHelper:
         assert "old_log_probs" not in out["kwargs"]
         assert "old_log_probs_shifted" not in out["context"]
 
+    def test_forwards_the_whole_global_loss_scale_trio(self):
+        """``dp_size`` cancels DeepSpeed's DP averaging, so dropping it while
+        forwarding the denominators trains at ``1/dp_size`` of the global mean."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((2, 10)),
+                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                },
+                "meta": {"dp_size": 4, "batch_num_tokens": 128, "global_batch_size": 32},
+            },
+        )
+        config = out["processing"]["config"]
+        assert config["dp_size"] == 4
+        assert config["batch_num_tokens"] == 128
+        assert config["global_batch_size"] == 32
+
+    def test_wire_config_satisfies_the_loss_side_dp_size_contract(self):
+        """The shim's own output must be accepted by the loss it targets.
+
+        On-prem gets ``dp_size`` from ``_split_batch``, which stamps
+        ``meta["dp_size"] = len(workers)`` server-side. The Cortex dispatch
+        never reaches that stamp and the wire format has no meta bag, so
+        ``processing.config`` is the only route. Stripping it there shipped a
+        step-global ``batch_num_tokens`` with no factor, which the loss rejects.
+        """
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+        from arctic_platform.rl.processors.functional import _resolve_dp_size
+        from arctic_platform.rl.processors.functional import resolve_global_loss_scale
+
+        response_mask = torch.ones((8, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": torch.zeros((8, 10), dtype=torch.int64),
+                    "attention_mask": torch.ones((8, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((8, 10)),
+                    "response_mask": response_mask,
+                },
+                "meta": {
+                    "dp_size": 4,
+                    "batch_num_tokens": int(response_mask.sum().item()),
+                    "global_batch_size": 8,
+                },
+            },
+        )
+
+        wire_config = out["processing"]["config"]
+        # The zone's batch/meta carry no scale keys, so config is the only source.
+        scale = resolve_global_loss_scale(out["context"], wire_config)
+        cfg = {**wire_config, **scale}
+        assert _resolve_dp_size(cfg.get("dp_size"), cfg.get("batch_num_tokens")) == 4
+
+    def test_caller_config_still_wins_over_meta_for_the_scale_trio(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((2, 10)),
+                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                },
+                "meta": {"dp_size": 4},
+            },
+            processing={"config": {"dp_size": 1}},
+        )
+        assert out["processing"]["config"]["dp_size"] == 1
+
     def test_left_pads_are_rewritten_to_trailing_pads(self):
         """SkyRL left-pads to the batch's longest sequence; Cortex's packer
         rejects that outright ("packing requires left-aligned rows")."""

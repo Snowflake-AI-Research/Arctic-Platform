@@ -240,7 +240,7 @@ def _internal_grpo_loss_fn(
     echo_batch_denominator: str = EchoBatchDenominator.ALL_SEQUENCES.value,
 ) -> torch.Tensor:
     """Internal GRPO loss — same interface as dss/loss_fns/grpo.py."""
-    dp_size = _resolve_dp_size(dp_size, batch_num_tokens)
+    dp_size = _resolve_dp_size(dp_size, batch_num_tokens, global_batch_size, loss_agg_mode)
     old_logp = input_data["old_log_probs"]
     advantages = input_data["advantages"]
     loss_mask = canonicalize_loss_mask(
@@ -588,7 +588,12 @@ def _grpo_loss(
     global prompts is inferred via allreduce.
     """
     batch_num_tokens = config.get("batch_num_tokens")
-    dp_size = _resolve_dp_size(config.get("dp_size"), batch_num_tokens)
+    dp_size = _resolve_dp_size(
+        config.get("dp_size"),
+        batch_num_tokens,
+        config.get("global_batch_size"),
+        config.get("loss_agg_mode", "token-mean"),
+    )
 
     logprobs = model_outputs.get("logprobs")
     if logprobs is None:
@@ -712,6 +717,18 @@ def _grpo_loss(
         aux_ce_weight=config.get("aux_ce_weight"),
         echo_global_num_sequences=config.get("echo_global_num_sequences"),
         echo_batch_denominator=config.get("echo_batch_denominator", EchoBatchDenominator.ALL_SEQUENCES.value),
+    )
+    # Report the scale actually applied. A payload that ships denominators but no
+    # dp_size trains at 1/dp_size of the global mean, which is indistinguishable
+    # from a smaller LR in every other logged signal.
+    metrics.update(
+        {
+            "loss_scale/dp_size": float(dp_size),
+            "loss_scale/batch_num_tokens": -1.0 if batch_num_tokens is None else float(batch_num_tokens),
+            "loss_scale/global_batch_size": (
+                -1.0 if config.get("global_batch_size") is None else float(config["global_batch_size"])
+            ),
+        }
     )
     return loss, metrics
 
