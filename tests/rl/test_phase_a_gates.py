@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,12 +26,15 @@ import torch
 
 import arctic_platform.rl.processors  # noqa: F401
 import arctic_platform.sft.processor  # noqa: F401
+from arctic_platform.common.registry import DECLARED_SUMMED_METRICS
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import POST_PROCESSORS
 from arctic_platform.common.registry import PUBLIC_LOSS_FNS
 from arctic_platform.common.registry import PUBLIC_POST_PROCESSORS
+from arctic_platform.common.registry import SUMMED_METRICS_ATTR
 from arctic_platform.common.registry import _is_public_registry_name
+from arctic_platform.common.registry import is_declared_summed_metric
 from arctic_platform.common.registry import register_loss_fn
 from arctic_platform.common.registry import register_post_processor
 from arctic_platform.common.registry import resolve_fn
@@ -39,6 +43,14 @@ from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.rl.processors.causal_cross_entropy import causal_cross_entropy_loss
 from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
 from arctic_platform.rl.processors.cortex_grpo import cortex_grpo_loss
+from arctic_platform.rl.processors.grpo import _ECHO_CONFIG_DEFAULTS
+from arctic_platform.rl.processors.grpo import _ECHO_CONFIG_KEYS
+from arctic_platform.rl.processors.grpo import _ECHO_REQUIRED_CONFIG_KEYS
+from arctic_platform.rl.processors.grpo import _GRPO_CONFIG_DEFAULTS
+from arctic_platform.rl.processors.grpo import _GRPO_CONFIG_KEYS
+from arctic_platform.rl.processors.grpo import ECHO_SUMMED_METRICS
+from arctic_platform.rl.processors.grpo import _grpo_config_values
+from arctic_platform.rl.processors.grpo import _internal_grpo_loss_fn
 from arctic_platform.rl.processors.grpo import grpo_echo_v1_loss
 from arctic_platform.rl.processors.grpo import grpo_loss
 from arctic_platform.rl.processors.packed_reduction import apply_packed_loss_reduction
@@ -255,6 +267,49 @@ class TestA4Metrics(TestCasePlus):
         self.assertFalse(metric_is_summed("entropy"))
         self.assertIs(pipeline_metric_is_summed, metric_is_summed)
 
+    def test_echo_metrics_are_declared_at_registration(self):
+        # The declaration is the contract; the naming convention must still
+        # classify every declared name the same way, so removing a declaration
+        # cannot silently turn a summed metric into a mean.
+        self.assertEqual(
+            getattr(LOSS_FNS["ap_grpo_echo_v1"], SUMMED_METRICS_ATTR),
+            ECHO_SUMMED_METRICS,
+        )
+        self.assertEqual(
+            getattr(LOSS_FNS["grpo_echo_v1"], SUMMED_METRICS_ATTR),
+            ECHO_SUMMED_METRICS,
+        )
+        for key in ECHO_SUMMED_METRICS:
+            self.assertTrue(is_declared_summed_metric(key), msg=key)
+            self.assertTrue(metric_is_summed(key), msg=key)
+            self.assertTrue(
+                key.startswith("loss_term_") or key.endswith(("_sum", "_count")),
+                msg=f"{key} is declared but no longer matches the fallback naming rule",
+            )
+
+    def test_declared_metric_is_summed_without_a_naming_hint(self):
+        name = "_phase_a_declared_total"
+        self.assertFalse(metric_is_summed(name))
+
+        @register_loss_fn("_phase_a_declared", summed_metrics={name})
+        def _declared_loss(model_outputs, batch, meta, config, device):
+            return model_outputs["logprobs"].sum(), {name: 1.0}
+
+        try:
+            self.assertTrue(metric_is_summed(name))
+            self.assertEqual(combine_packed_metrics([{name: 1.0}, {name: 3.0}], (1.0, 3.0))[name], 4.0)
+            self.assertEqual(combine_metric_microbatches([{name: 1.0}, {name: 3.0}])[name], 4.0)
+            self.assertEqual(combine_metric_shards([{name: 1.0}, {name: 3.0}])[name], 4.0)
+        finally:
+            DECLARED_SUMMED_METRICS.discard(name)
+            LOSS_FNS.pop("_phase_a_declared", None)
+        self.assertFalse(metric_is_summed(name))
+
+    def test_naming_rule_still_applies_to_undeclared_keys(self):
+        for key in ("loss_term_unregistered", "some_new_sum", "some_new_count"):
+            self.assertFalse(is_declared_summed_metric(key), msg=key)
+            self.assertTrue(metric_is_summed(key), msg=key)
+
     def test_combine_does_not_average_summed_keys(self):
         metrics = combine_packed_metrics(
             [
@@ -290,6 +345,107 @@ class TestA4Metrics(TestCasePlus):
         self.assertEqual(dp["loss_term_rl"], 4.0)
         self.assertEqual(dp["echo_environment_loss_sum"], 2.0)
         self.assertAlmostEqual(dp["entropy"], 2.0)
+
+
+class TestGrpoConfigContract(TestCasePlus):
+    """The declared tables are the single source of the GRPO key schema and defaults."""
+
+    # Arguments of _internal_grpo_loss_fn that come from tensors, not from config.
+    NON_CONFIG_ARGS = frozenset(
+        {
+            "logprobs",
+            "entropy",
+            "input_data",
+            "rollout_is_weights",
+            "prompt_group_ids",
+            "prompt_token_counts",
+            "sequence_loss_weights",
+        }
+    )
+
+    def test_tables_cover_every_config_argument(self):
+        # A new knob on the loss must be declared in a table, or _grpo_loss
+        # would never forward it and the *_echo_v1 schema would reject it.
+        params = set(inspect.signature(_internal_grpo_loss_fn).parameters)
+        declared = set(_GRPO_CONFIG_DEFAULTS) | set(_ECHO_CONFIG_DEFAULTS)
+        self.assertEqual(params - declared, self.NON_CONFIG_ARGS)
+        self.assertLessEqual(declared, params)
+
+    def test_declared_defaults_match_the_loss_signature(self):
+        params = inspect.signature(_internal_grpo_loss_fn).parameters
+        declared = {**_GRPO_CONFIG_DEFAULTS, **_ECHO_CONFIG_DEFAULTS}
+        for key, default in declared.items():
+            signature_default = params[key].default
+            # dp_size: None means "not supplied" and _resolve_dp_size maps it to
+            # the signature default of 1. The eps/clip knobs have no signature
+            # default at all, so the table is their only source.
+            if key == "dp_size" or signature_default is inspect.Parameter.empty:
+                continue
+            self.assertEqual(default, signature_default, msg=key)
+
+    def test_key_schema_is_derived_from_the_tables(self):
+        self.assertEqual(_GRPO_CONFIG_KEYS, frozenset(_GRPO_CONFIG_DEFAULTS))
+        self.assertEqual(_ECHO_CONFIG_KEYS, frozenset(_ECHO_CONFIG_DEFAULTS))
+        self.assertLess(_ECHO_REQUIRED_CONFIG_KEYS, _ECHO_CONFIG_KEYS)
+        self.assertFalse(_GRPO_CONFIG_KEYS & _ECHO_CONFIG_KEYS)
+
+    def test_explicit_null_is_not_replaced_by_the_default(self):
+        # Clients send explicit nulls over the wire; the math reads None as
+        # "feature off", which is what config.get(key, default) did.
+        self.assertEqual(_grpo_config_values({})["eps_clip"], 0.2)
+        self.assertIsNone(_grpo_config_values({"eps_clip": None})["eps_clip"])
+        self.assertNotIn("unknown", _grpo_config_values({"unknown": 1}))
+
+
+class TestTrioPrecedenceIsPerLossName(TestCasePlus):
+    """``grpo`` keeps the Cortex trio contract; ``ap_grpo`` keeps the AP one.
+
+    The two disagree on purpose: Cortex lets the context win and raises on a
+    conflict, AP fills missing keys from meta/batch and lets the config win.
+    They are reachable only under different registered names, so a client that
+    keeps sending ``grpo`` gets identical behavior on either backend. Pinning
+    both here makes any future unification a deliberate, visible change.
+    """
+
+    def _call(self, loss_fn, config, meta):
+        logprobs = torch.zeros(2, 3)
+        batch = {
+            "old_log_probs_shifted": torch.zeros(2, 3),
+            "advantages": torch.ones(2, 3),
+            "loss_mask": torch.ones(2, 3, dtype=torch.bool),
+        }
+        loss, _ = loss_fn({"logprobs": logprobs}, batch, dict(meta), dict(config), "cpu")
+        return loss.item()
+
+    def test_cortex_name_raises_on_a_context_config_conflict(self):
+        with self.assertRaises(ValueError):
+            self._call(
+                cortex_grpo_loss,
+                {"batch_num_tokens": 6, "dp_size": 2},
+                {"batch_num_tokens": 12, "dp_size": 2},
+            )
+
+    def test_ap_name_lets_the_config_win(self):
+        conflicting = self._call(
+            grpo_loss,
+            {"batch_num_tokens": 6, "dp_size": 2},
+            {"batch_num_tokens": 12, "dp_size": 2},
+        )
+        config_only = self._call(grpo_loss, {"batch_num_tokens": 6, "dp_size": 2}, {})
+        self.assertAlmostEqual(conflicting, config_only, places=6)
+
+    def test_names_agree_when_only_one_side_supplies_the_trio(self):
+        config = {"batch_num_tokens": 6, "dp_size": 2}
+        self.assertAlmostEqual(
+            self._call(grpo_loss, config, {}),
+            self._call(cortex_grpo_loss, config, {}),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            self._call(grpo_loss, {}, config),
+            self._call(cortex_grpo_loss, {}, config),
+            places=6,
+        )
 
 
 class TestA5Compat(TestCasePlus):

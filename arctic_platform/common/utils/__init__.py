@@ -25,7 +25,6 @@ from .batch import metric_is_summed
 from .batch import promote_batch_dim_to_batch
 from .batch import ray_split_batch
 from .batch import shard_token_stats
-from .batch import sp_size_from_job_config
 from .batch import split_dict
 from .batch import unpack_batch
 from .cuda_ipc import merge_cuda_ipc_payloads
@@ -43,6 +42,9 @@ from .server_models import StepRequest
 from .server_models import WeightNormRequest
 from .server_models import WeightSyncRequest
 from .server_models import build_model_config
+from .server_models import resolve_parallelism_degree
+from .server_models import resolve_sp_size
+from .server_models import sp_size_from_job_config
 
 __all__ = [
     "BATCH_DIM_CONTEXT_KEYS",
@@ -55,6 +57,8 @@ __all__ = [
     "metric_is_summed",
     "split_dict",
     "dp_sp_world_size",
+    "resolve_parallelism_degree",
+    "resolve_sp_size",
     "sp_size_from_job_config",
     "http_split_batch",
     "ray_split_batch",

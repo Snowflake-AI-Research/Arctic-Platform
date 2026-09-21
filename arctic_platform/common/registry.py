@@ -20,10 +20,21 @@ from __future__ import annotations
 import importlib
 from typing import Callable
 from typing import Dict
+from typing import Iterable
+from typing import Set
 
 POST_PROCESSORS: Dict[str, Callable] = {}
 LOSS_FNS: Dict[str, Callable] = {}
 PACKED_LOSS_REDUCTION_ATTR = "_arctic_packed_loss_reduction"
+SUMMED_METRICS_ATTR = "_arctic_summed_metrics"
+
+# Metric names a loss fn declared additive via ``register_loss_fn(...,
+# summed_metrics=...)``. Flat union rather than per-loss-fn: the reducers in
+# ``common.utils.batch`` run on metric dicts that have already been merged
+# across microbatches, gradient accumulation, and DP ranks, so no loss-fn
+# context survives to the reduction. Names must therefore stay globally unique,
+# which the loss-fn prefixes already enforce.
+DECLARED_SUMMED_METRICS: Set[str] = set()
 
 # Built-in public names. ``register_*`` may add more; colliding a public name
 # with a *different* callable raises. ``_``-prefixed names are test-only and
@@ -74,12 +85,27 @@ def register_post_processor(name: str):
     return decorator
 
 
+def is_declared_summed_metric(name: str) -> bool:
+    """Whether some registered loss fn declared *name* as an additive metric."""
+    return name in DECLARED_SUMMED_METRICS
+
+
 def register_loss_fn(
     name: str,
     *,
     packed_loss_reduction: Callable | None = None,
+    summed_metrics: Iterable[str] = (),
 ):
-    """Register a loss function and its optional packed-microbatch contract."""
+    """Register a loss function and its optional packed-microbatch contract.
+
+    ``summed_metrics`` names the metrics this loss fn emits that are additive
+    across packed microbatches, gradient accumulation, and DP ranks, so the
+    reducers sum them instead of averaging. Declaring a metric here is the
+    explicit alternative to relying on the ``loss_term_*`` / ``*_sum`` /
+    ``*_count`` naming convention, which stays in force for undeclared keys
+    (see ``common.utils.batch.metric_is_summed``).
+    """
+    declared = frozenset(summed_metrics)
 
     def decorator(fn: Callable) -> Callable:
         if packed_loss_reduction is not None:
@@ -87,6 +113,9 @@ def register_loss_fn(
             if existing is not None and existing is not packed_loss_reduction:
                 raise ValueError(f"refusing to replace packed_loss_reduction on registered {name!r}")
             setattr(fn, PACKED_LOSS_REDUCTION_ATTR, packed_loss_reduction)
+        if declared:
+            setattr(fn, SUMMED_METRICS_ATTR, declared | getattr(fn, SUMMED_METRICS_ATTR, frozenset()))
+            DECLARED_SUMMED_METRICS.update(declared)
         _bind_registry(LOSS_FNS, name, fn)
         return fn
 

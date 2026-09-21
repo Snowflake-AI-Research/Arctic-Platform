@@ -20,14 +20,9 @@ from typing import Any
 import torch
 
 from arctic_platform import wire
+from arctic_platform.common.registry import is_declared_summed_metric
 
-
-def resolve_parallelism_degree(value: Any, name: str) -> int:
-    """Unset → 1 (disabled); else must be an ``int >= 1`` (0/negative rejected)."""
-    parallelism_degree = 1 if value is None else int(value)
-    if parallelism_degree < 1:
-        raise ValueError(f"{name} must be an integer >= 1 (1 = disabled); got {value!r}")
-    return parallelism_degree
+from .server_models import resolve_parallelism_degree
 
 
 def dp_sp_world_size(world_size: int, sp_size: int = 1) -> int:
@@ -38,54 +33,6 @@ def dp_sp_world_size(world_size: int, sp_size: int = 1) -> int:
     if world_size % sp_size != 0:
         raise ValueError(f"world_size ({world_size}) must be divisible by sp_size ({sp_size})")
     return world_size // sp_size
-
-
-def _record_sp_candidate(candidates: dict[str, int], label: str, container: Any, key: str) -> None:
-    if not isinstance(container, dict) or key not in container:
-        return
-    value = container[key]
-    if value is None:
-        return
-    candidates[label] = resolve_parallelism_degree(value, key)
-
-
-def sp_size_from_job_config(job_config: Any) -> int:
-    """SP degree from an AP job config. Unset → 1. Conflicting sources raise.
-
-    Live writers: VeRL ``ds_config.sequence_parallel_size`` (from
-    ``ulysses_sequence_parallel_size``); DSS-shaped ``training_config.sp_size``;
-    ``ds_worker_config`` / ``ModelSpec.parallelism.sequence_parallel`` when set.
-    """
-    if job_config is None:
-        return 1
-    if hasattr(job_config, "model_dump"):
-        job_config = job_config.model_dump()
-    if not isinstance(job_config, dict):
-        raise TypeError(f"job_config must be a dict or JobConfig; got {type(job_config).__name__}")
-
-    candidates: dict[str, int] = {}
-    _record_sp_candidate(candidates, "training_config.sp_size", job_config.get("training_config"), "sp_size")
-    _record_sp_candidate(
-        candidates, "ds_config.sequence_parallel_size", job_config.get("ds_config"), "sequence_parallel_size"
-    )
-    _record_sp_candidate(
-        candidates,
-        "log_prob_config.sequence_parallel_size",
-        job_config.get("log_prob_config"),
-        "sequence_parallel_size",
-    )
-    worker = job_config.get("ds_worker_config")
-    _record_sp_candidate(candidates, "ds_worker_config.sequence_parallel", worker, "sequence_parallel")
-    _record_sp_candidate(candidates, "ds_worker_config.sequence_parallel_size", worker, "sequence_parallel_size")
-    parallelism = worker.get("parallelism") if isinstance(worker, dict) else None
-    _record_sp_candidate(
-        candidates, "ds_worker_config.parallelism.sequence_parallel", parallelism, "sequence_parallel"
-    )
-
-    values = set(candidates.values())
-    if len(values) > 1:
-        raise ValueError(f"conflicting sequence-parallel degrees: {candidates}")
-    return values.pop() if values else 1
 
 
 def shard_token_stats(batch_data: dict, meta_data: dict | None = None) -> dict[str, int]:
@@ -391,13 +338,18 @@ _SUMMED_METRIC_SUFFIXES = ("_sum", "_count")
 def metric_is_summed(key: str) -> bool:
     """Whether a scalar metric is additive across microbatches and DP ranks.
 
-    Objective-term contributions (``loss_term_*``) and token/sequence counts
-    (``*_count``, ``*_sum``) must be SUMMED. Averaging them misreports totals
-    whenever a call splits across packed microbatches, GAS, or DP ranks.
+    A loss fn declares its additive metrics at registration
+    (``register_loss_fn(..., summed_metrics=...)``). Undeclared keys fall back
+    to the naming convention: objective-term contributions (``loss_term_*``)
+    and token/sequence counts (``*_count``, ``*_sum``) are SUMMED. Averaging
+    them misreports totals whenever a call splits across packed microbatches,
+    GAS, or DP ranks.
 
     SFT pairing uses ``{name}.sum`` / ``{name}.tokens`` via the combiners below
     and is not this helper.
     """
+    if is_declared_summed_metric(key):
+        return True
     return key.startswith(_SUMMED_METRIC_PREFIXES) or key.endswith(_SUMMED_METRIC_SUFFIXES)
 
 

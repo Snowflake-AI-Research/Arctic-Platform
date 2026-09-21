@@ -20,9 +20,10 @@ import torch
 
 from arctic_platform.common.utils.batch import _split_batch
 from arctic_platform.common.utils.batch import dp_sp_world_size
-from arctic_platform.common.utils.batch import sp_size_from_job_config
 from arctic_platform.common.utils.batch import split_dict
 from arctic_platform.common.utils.batch import unpack_batch
+from arctic_platform.common.utils.server_models import JobConfig
+from arctic_platform.common.utils.server_models import sp_size_from_job_config
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import torch_assert_equal
 
@@ -172,3 +173,25 @@ class TestDpSizeDividesBySp(TestCasePlus):
                     "ds_config": {"sequence_parallel_size": 4},
                 }
             )
+
+    def test_job_config_exposes_sp_size(self):
+        job_config = JobConfig(model_name="m", ds_config={"sequence_parallel_size": 2})
+        self.assertEqual(job_config.sp_size, 2)
+        self.assertEqual(sp_size_from_job_config(job_config), 2)
+        self.assertEqual(JobConfig(model_name="m").sp_size, 1)
+
+    def test_job_config_validates_sp_size_at_construction(self):
+        with self.assertRaises(ValueError):
+            JobConfig(model_name="m", training_config={"sp_size": 0})
+        with self.assertRaises(ValueError):
+            JobConfig(
+                model_name="m",
+                training_config={"sp_size": 2},
+                ds_config={"sequence_parallel_size": 4},
+            )
+
+    def test_job_config_dump_keeps_client_wire_shape(self):
+        # model_dump() is forwarded verbatim to workers; sp_size is derived, not a field.
+        dumped = JobConfig(model_name="m", ds_config={"sequence_parallel_size": 2}).model_dump()
+        self.assertNotIn("sp_size", dumped)
+        self.assertEqual(sp_size_from_job_config(dumped), 2)

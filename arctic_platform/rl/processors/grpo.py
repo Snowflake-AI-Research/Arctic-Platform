@@ -21,6 +21,7 @@ import math
 from collections.abc import Sequence
 from enum import Enum
 from itertools import pairwise
+from typing import Any
 from typing import Tuple
 
 import torch
@@ -516,6 +517,59 @@ def _internal_grpo_loss_fn(
     return loss, metrics
 
 
+# ---------------------------------------------------------------------------
+# GRPO config contract
+# ---------------------------------------------------------------------------
+# One table per contract, ``key -> default``. Both the kwargs handed to
+# :func:`_internal_grpo_loss_fn` and the strict ``*_echo_v1`` key schema are
+# derived from these tables, so the accepted keys and their defaults cannot
+# drift apart. Processor configs arrive as free-form dicts from external
+# clients (verl, SkyRL, TRL, the Cortex zone), and a key present with an
+# explicit ``null`` keeps ``None`` rather than falling back to the default —
+# the math reads ``None`` as "feature off", and changing that would alter
+# validated runs.
+_GRPO_CONFIG_DEFAULTS: dict[str, Any] = {
+    "eps_clip": 0.2,
+    "eps_clip_higher": None,
+    "c_clip": None,
+    "behav_imp_weight_cap": None,
+    "m2_threshold": None,
+    "importance_sampling_level": "token",
+    "current_version": None,
+    "prox_logp_method": PROX_LOGP_METHOD_RECOMPUTE,
+    "use_sapo_loss": False,
+    "sapo_tau_pos": 1.0,
+    "sapo_tau_neg": 1.05,
+    "use_decoupled_loss": False,
+    "use_cispo_loss": False,
+    "is_weight_clip_max": None,
+    "loss_agg_mode": "token-mean",
+    # Unset dp_size means "not supplied"; _resolve_dp_size maps it to 1.
+    "dp_size": None,
+    "batch_num_tokens": None,
+    "global_batch_size": None,
+    "entropy_coeff": 0.0,
+    "use_kl_loss": False,
+    "kl_loss_coef": 0.001,
+    "kl_loss_type": "low_var_kl",
+}
+_ECHO_CONFIG_DEFAULTS: dict[str, Any] = {
+    "aux_ce_weight": None,
+    "echo_global_num_sequences": None,
+    "echo_batch_denominator": EchoBatchDenominator.ALL_SEQUENCES.value,
+}
+_GRPO_CONFIG_KEYS = frozenset(_GRPO_CONFIG_DEFAULTS)
+_ECHO_REQUIRED_CONFIG_KEYS = frozenset({"aux_ce_weight", "echo_global_num_sequences"})
+_ECHO_CONFIG_KEYS = frozenset(_ECHO_CONFIG_DEFAULTS)
+
+
+def _grpo_config_values(config: dict) -> dict:
+    """Declared defaults overlaid with the recognized keys this call supplied."""
+    values = {**_GRPO_CONFIG_DEFAULTS, **_ECHO_CONFIG_DEFAULTS}
+    values.update((key, config[key]) for key in values.keys() & config.keys())
+    return values
+
+
 def _grpo_loss(
     model_outputs: dict,
     context: dict,
@@ -587,8 +641,8 @@ def _grpo_loss(
     identical for all responses to the same prompt. Under DP, the number of
     global prompts is inferred via allreduce.
     """
-    batch_num_tokens = config.get("batch_num_tokens")
-    dp_size = _resolve_dp_size(config.get("dp_size"), batch_num_tokens)
+    values = _grpo_config_values(config)
+    values["dp_size"] = _resolve_dp_size(values["dp_size"], values["batch_num_tokens"])
 
     logprobs = model_outputs.get("logprobs")
     if logprobs is None:
@@ -679,71 +733,37 @@ def _grpo_loss(
     if sequence_loss_weights is not None:
         sequence_loss_weights = sequence_loss_weights.to(logprobs.device)
 
+    # Every key of the config tables is a keyword of _internal_grpo_loss_fn
+    # under the same name; the tensors below are the only non-config arguments.
     loss, metrics = _internal_grpo_loss_fn(
         logprobs=logprobs,
         entropy=entropy,
         input_data=input_data,
-        eps_clip=config.get("eps_clip", 0.2),
-        eps_clip_higher=config.get("eps_clip_higher"),
-        c_clip=config.get("c_clip"),
-        behav_imp_weight_cap=config.get("behav_imp_weight_cap"),
-        m2_threshold=config.get("m2_threshold"),
-        importance_sampling_level=config.get("importance_sampling_level", "token"),
-        current_version=config.get("current_version"),
-        prox_logp_method=config.get("prox_logp_method", PROX_LOGP_METHOD_RECOMPUTE),
-        use_sapo_loss=config.get("use_sapo_loss", False),
-        sapo_tau_pos=config.get("sapo_tau_pos", 1.0),
-        sapo_tau_neg=config.get("sapo_tau_neg", 1.05),
-        use_decoupled_loss=config.get("use_decoupled_loss", False),
-        use_cispo_loss=config.get("use_cispo_loss", False),
-        is_weight_clip_max=config.get("is_weight_clip_max"),
-        loss_agg_mode=config.get("loss_agg_mode", "token-mean"),
-        dp_size=dp_size,
-        batch_num_tokens=batch_num_tokens,
-        global_batch_size=config.get("global_batch_size"),
         rollout_is_weights=rollout_is_weights,
-        entropy_coeff=config.get("entropy_coeff", 0.0),
-        use_kl_loss=config.get("use_kl_loss", False),
-        kl_loss_coef=config.get("kl_loss_coef", 0.001),
-        kl_loss_type=config.get("kl_loss_type", "low_var_kl"),
         prompt_group_ids=prompt_group_ids,
         prompt_token_counts=prompt_token_counts,
         sequence_loss_weights=sequence_loss_weights,
-        aux_ce_weight=config.get("aux_ce_weight"),
-        echo_global_num_sequences=config.get("echo_global_num_sequences"),
-        echo_batch_denominator=config.get("echo_batch_denominator", EchoBatchDenominator.ALL_SEQUENCES.value),
+        **values,
     )
     return loss, metrics
 
 
-_GRPO_CONFIG_KEYS = frozenset(
+# Objective-term contributions and token/sequence counts the ECHO path emits.
+# They are additive across packed microbatches, gradient accumulation, and DP
+# ranks, so the reducers must sum them rather than average them. Declared here
+# so the contract is a property of the registration, not of the metric name.
+ECHO_SUMMED_METRICS = frozenset(
     {
-        "eps_clip",
-        "eps_clip_higher",
-        "c_clip",
-        "behav_imp_weight_cap",
-        "m2_threshold",
-        "importance_sampling_level",
-        "current_version",
-        "prox_logp_method",
-        "use_sapo_loss",
-        "sapo_tau_pos",
-        "sapo_tau_neg",
-        "use_decoupled_loss",
-        "use_cispo_loss",
-        "is_weight_clip_max",
-        "loss_agg_mode",
-        "dp_size",
-        "batch_num_tokens",
-        "global_batch_size",
-        "entropy_coeff",
-        "use_kl_loss",
-        "kl_loss_coef",
-        "kl_loss_type",
+        "loss_term_rl",
+        "loss_term_aux",
+        "echo_environment_loss_sum",
+        "echo_environment_prediction_nll_sum",
+        "echo_environment_prediction_token_count",
+        "echo_environment_observation_token_count",
+        "echo_real_sequence_count",
+        "echo_observation_bearing_sequence_count",
     }
 )
-_ECHO_REQUIRED_CONFIG_KEYS = frozenset({"aux_ce_weight", "echo_global_num_sequences"})
-_ECHO_CONFIG_KEYS = _ECHO_REQUIRED_CONFIG_KEYS | {"echo_batch_denominator"}
 
 
 def _grpo_preflight_mask(microbatch: dict) -> torch.Tensor:
@@ -785,7 +805,7 @@ def _grpo_packed_loss_reduction(
     loss_fn_name: str,
 ) -> PackedLossReduction:
     masks = [_grpo_preflight_mask(microbatch) for microbatch in microbatches]
-    mode = config.get("loss_agg_mode", "token-mean")
+    mode = _grpo_config_values(config)["loss_agg_mode"]
 
     if mode == "token-mean":
         weights = [float(mask.sum().item()) for mask in masks]
@@ -900,6 +920,7 @@ def grpo_loss(
 @register_loss_fn(
     "ap_grpo_echo_v1",
     packed_loss_reduction=_grpo_packed_loss_reduction,
+    summed_metrics=ECHO_SUMMED_METRICS,
 )
 def grpo_echo_v1_loss(
     model_outputs: dict,

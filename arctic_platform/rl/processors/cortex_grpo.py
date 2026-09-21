@@ -15,9 +15,18 @@
 
 """Cortex GRPO entrypoints: context-wins trio, registered as ``grpo`` / ``grpo_echo_v1``.
 
-Inner PPO/ECHO math is shared with ``ap_grpo``. The contracts differ: AP fills
-missing trio keys from meta/batch with config winning; Cortex
-``resolve_global_loss_scale`` lets context win and raises on a conflict.
+Inner PPO/ECHO math is shared with ``ap_grpo``. Only the global-loss-scale trio
+(``dp_size`` / ``batch_num_tokens`` / ``global_batch_size``) resolves
+differently: here ``resolve_global_loss_scale`` lets the context win and raises
+on a conflict, matching what the Cortex zone already does, while ``ap_grpo``
+fills missing keys from meta/batch and lets the config win.
+
+The precedence is a property of the requested loss-fn NAME, not of the backend:
+``grpo`` is the Cortex contract and ``ap_grpo`` is the AP one on every backend.
+A client that keeps sending ``grpo`` therefore gets identical scaling whether it
+runs against the Cortex zone or this training kernel; only a client that also
+renames its loss fn changes contracts. See
+``tests/rl/test_phase_a_gates.py::TestTrioPrecedenceIsPerLossName``.
 """
 
 from __future__ import annotations
@@ -31,6 +40,7 @@ from arctic_platform.rl.processors.functional import resolve_global_loss_scale
 from arctic_platform.rl.processors.grpo import _ECHO_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import _ECHO_REQUIRED_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import _GRPO_CONFIG_KEYS
+from arctic_platform.rl.processors.grpo import ECHO_SUMMED_METRICS
 from arctic_platform.rl.processors.grpo import _grpo_context
 from arctic_platform.rl.processors.grpo import _grpo_loss
 from arctic_platform.rl.processors.grpo import _grpo_packed_loss_reduction
@@ -65,7 +75,11 @@ def cortex_grpo_loss(
     return _grpo_loss(model_outputs, context, config, device)
 
 
-@register_loss_fn("grpo_echo_v1", packed_loss_reduction=_grpo_packed_loss_reduction)
+@register_loss_fn(
+    "grpo_echo_v1",
+    packed_loss_reduction=_grpo_packed_loss_reduction,
+    summed_metrics=ECHO_SUMMED_METRICS,
+)
 def cortex_grpo_echo_v1_loss(
     model_outputs: dict,
     batch: dict,

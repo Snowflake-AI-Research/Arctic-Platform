@@ -48,7 +48,6 @@ from arctic_platform.common.utils import finalize_fwd_bwd_metrics
 from arctic_platform.common.utils import log_dp_shard_tokens
 from arctic_platform.common.utils import merge_dict_shards
 from arctic_platform.common.utils import ray_split_batch
-from arctic_platform.common.utils import sp_size_from_job_config
 from arctic_platform.common.utils import unpack_batch
 from arctic_platform.common.utils.batch import restore_batch_order
 from arctic_platform.common.utils.checkpoint import resolve_checkpoint_save_paths
@@ -505,7 +504,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
             "status": "RUNNING",
             "checkpoint_path": None,
             "sync_path": None,
-            "sp_size": sp_size_from_job_config(job_config),
+            "sp_size": job_config.sp_size,
         }
 
         if job_type == "log_prob":

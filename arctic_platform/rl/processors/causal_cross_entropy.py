@@ -109,18 +109,8 @@ def _validate_global_normalization(config: dict, local_weight_sum: float) -> tup
             "causal_cross_entropy batch_num_tokens must be a finite non-negative "
             f"global loss-weight sum, got {global_weight_sum!r}"
         )
+    # _resolve_dp_size returns an int >= 1 or raises; no second check needed.
     dp_size = _resolve_dp_size(dp_size, global_weight_sum)
-    if (
-        isinstance(dp_size, bool)
-        or not isinstance(dp_size, Real)
-        or not math.isfinite(float(dp_size))
-        or float(dp_size) <= 0
-        or not float(dp_size).is_integer()
-    ):
-        raise ValueError(
-            "causal_cross_entropy config 'dp_size' must be a positive integer when batch_num_tokens is supplied"
-        )
-    dp_size = int(dp_size)
 
     global_weight_sum = float(global_weight_sum)
     if local_weight_sum > global_weight_sum and not math.isclose(

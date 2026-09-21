@@ -53,7 +53,6 @@ from arctic_platform.common.ray_cluster import init_ray_cluster
 from arctic_platform.common.server import ArcticRLServerState
 from arctic_platform.common.utils import http_split_batch
 from arctic_platform.common.utils import merge_dict_shards
-from arctic_platform.common.utils import sp_size_from_job_config
 from arctic_platform.common.utils.batch import finalize_fwd_bwd_metrics
 from arctic_platform.common.utils.batch import restore_batch_order
 from arctic_platform.common.utils.checkpoint import resolve_checkpoint_save_paths
@@ -338,7 +337,7 @@ async def initialize(job_config: JobConfig = Body(...)):
         "status": "RUNNING",
         "checkpoint_path": None,
         "sync_path": None,
-        "sp_size": sp_size_from_job_config(job_config),
+        "sp_size": job_config.sp_size,
     }
     if job_type == "log_prob":
         job_info["engine"] = engine
