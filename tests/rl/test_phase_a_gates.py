@@ -89,13 +89,15 @@ class TestA1RegistryHygiene(TestCasePlus):
 
     def test_public_name_overwrite_raises(self):
         original = LOSS_FNS["ap_grpo"]
+        leaked = "_phase_a_overwrite_should_not_sum"
 
         def other(model_outputs, batch, meta, config, device):
             return model_outputs["logprobs"].sum(), {}
 
         with self.assertRaises(ValueError):
-            register_loss_fn("ap_grpo")(other)
+            register_loss_fn("ap_grpo", summed_metrics={leaked})(other)
         self.assertIs(LOSS_FNS["ap_grpo"], original)
+        self.assertFalse(is_declared_summed_metric(leaked))
 
     def test_underscore_name_may_overwrite(self):
         @register_post_processor("_phase_a_tmp")
@@ -321,6 +323,16 @@ class TestA4Metrics(TestCasePlus):
         self.assertEqual(metrics["loss_term_rl"], 4.0)
         self.assertAlmostEqual(metrics["entropy"], (2.0 * 1.0 + 4.0 * 3.0) / 4.0)
 
+    def test_combine_packed_rate_uses_emitting_microbatch_weights(self):
+        metrics = combine_packed_metrics(
+            [
+                {"entropy": 10.0},
+                {},
+            ],
+            (1.0, 9.0),
+        )
+        self.assertAlmostEqual(metrics["entropy"], 10.0)
+
     def test_combine_rejects_name_and_name_sum(self):
         with self.assertRaises(ValueError):
             combine_packed_metrics([{"loss": 1.0, "loss.sum": 2.0}], (1.0,))
@@ -538,6 +550,13 @@ class TestA5Compat(TestCasePlus):
         out = compute_logprobs_post({"logprobs": precomputed}, {"input_ids": torch.arange(8).view(2, 4)}, {}, "cpu")
         self.assertEqual(out, {})
 
+    def test_cortex_compute_logprobs_requires_labels_or_input_ids(self):
+        logits = torch.zeros(1, 2, 3)
+        with self.assertRaises(ValueError) as ctx:
+            compute_logprobs_post({"logits": logits}, {}, {}, "cpu")
+        self.assertIn("labels", str(ctx.exception))
+        self.assertIn("input_ids", str(ctx.exception))
+
     def test_ap_config_wins_cortex_context_conflict_raises(self):
         logprobs = torch.tensor([[-1.0, -2.0]], requires_grad=True)
         batch = {
@@ -724,7 +743,7 @@ class TestA5Compat(TestCasePlus):
 
 class TestA2FromPr111(TestCasePlus):
     def test_common_init_keeps_111_lazy_gate(self):
-        """A2 landed in #111. This change set must not restore the import-time gate."""
+        """``common/__init__.py`` must not call ``require_any_dep_group`` at import time."""
         src = (Path(__file__).resolve().parents[2] / "arctic_platform" / "common" / "__init__.py").read_text()
         tree = ast.parse(src)
         module_calls = [

@@ -291,7 +291,7 @@ def build_config(config: Config):
 
 def processing_block(config: Config, global_batch_size: int) -> dict:
     return dict(
-        loss_fn="ap_grpo",
+        loss_fn="grpo",
         config=dict(
             eps_clip=config.eps_clip,
             loss_agg_mode=config.loss_agg_mode,
@@ -427,7 +427,7 @@ def _train(config: Config, ml_logger: Any) -> None:
                     continue
 
                 for result, advantage in zip(group, advantages_G):
-                    sampled_tokens = [int(token) for token in (result.get("token_ids") or [])]
+                    sampled_tokens = [int(token) for token in result.get("token_ids") or []]
                     if len(sampled_tokens) == 0:
                         continue
                     datums_D.append(sequence_from_rollout(prompt_tokens, sampled_tokens, advantage=advantage))

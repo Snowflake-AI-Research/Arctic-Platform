@@ -31,6 +31,7 @@ import numbers
 import os
 import socket
 import time
+import traceback
 from typing import Any
 
 import deepspeed
@@ -559,18 +560,35 @@ class DeepSpeedWorker:
         timers.stop_and_print_elapsed(tname)
         return results
 
+    def _is_bf16_zero_norm_assert(self, exc: BaseException) -> bool:
+        """True only for BF16_Optimizer's bare ``assert all_groups_norm > 0.``."""
+        optimizer = getattr(self.engine, "optimizer", None)
+        gn = getattr(optimizer, "_global_grad_norm", None)
+        if gn is None:
+            return False
+        try:
+            if float(gn) != 0.0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        for frame in traceback.extract_tb(exc.__traceback__):
+            filename = str(frame.filename).replace("\\", "/")
+            if filename.endswith("/bf16_optimizer.py") and frame.name == "step":
+                return True
+        return False
+
     def _engine_step(self) -> None:
         """``engine.step()`` with a skip for DeepSpeed BF16_Optimizer's zero-norm assert.
 
         ZeRO-1/2 use ``BF16_Optimizer``, which asserts ``all_groups_norm > 0``.
         GRPO can produce an all-zero grad batch (identical group rewards). ZeRO-3
         does not assert; skip the optimizer update instead of crashing.
+        Only that BF16 assert is skipped; every other ``AssertionError`` re-raises.
         """
         try:
             self.engine.step()
-        except AssertionError:
-            gn = getattr(getattr(self.engine, "optimizer", None), "_global_grad_norm", None)
-            if gn is not None and float(gn) == 0.0:
+        except AssertionError as err:
+            if self._is_bf16_zero_norm_assert(err):
                 pr0("[DeepSpeedWorker] skip optimizer.step: global grad norm is 0")
                 return
             raise

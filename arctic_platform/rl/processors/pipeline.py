@@ -304,7 +304,7 @@ def run_pipeline(
     processing: dict,
     device: str,
     *,
-    backward: bool = True,
+    backward: bool | str = True,
     pack: bool = True,
     max_tokens_per_mb: int = DEFAULT_MAX_TOKENS_PER_MB,
     return_tensors: bool = False,
@@ -590,7 +590,7 @@ def _run_pipeline_with_packing(
     processing: dict,
     device: str,
     *,
-    backward: bool,
+    backward: bool | str,
     max_tokens_per_mb: int,
 ) -> dict:
     """Run the pipeline with automatic sequence packing/unpacking.

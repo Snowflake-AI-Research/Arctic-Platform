@@ -141,15 +141,27 @@ class TestDpSizeDividesBySp(TestCasePlus):
         with self.assertRaises(ValueError):
             dp_sp_world_size(8, 3)
 
-    def test_split_stamps_num_workers_not_world_over_sp(self):
-        shards, _ = _split_batch(self._envelope(), num_workers=8, sp_size=2)
-        self.assertEqual(len(shards), 8)
-        self.assertEqual(shards[0]["meta"]["dp_size"], 8)
-        self.assertEqual(shards[7]["meta"]["dp_size"], 8)
+    def test_split_rejects_sp_greater_than_one(self):
+        with self.assertRaises(ValueError) as ctx:
+            _split_batch(self._envelope(), num_workers=8, sp_size=2)
+        self.assertIn("sequence-parallel data-plane is not implemented", str(ctx.exception))
 
     def test_split_rejects_sp_that_does_not_divide_workers(self):
         with self.assertRaises(ValueError):
             _split_batch(self._envelope(), num_workers=8, sp_size=3)
+
+    def test_cortex_context_return_fwd_batch_lands_on_shard_meta(self):
+        envelope = {
+            "kwargs": {
+                "input_ids": torch.arange(8).view(4, 2),
+                "attention_mask": torch.ones(4, 2, dtype=torch.long),
+            },
+            "context": {"return_fwd_batch": True},
+            "processing": {"loss_fn": "grpo"},
+        }
+        shards, _ = _split_batch(envelope, num_workers=2)
+        self.assertTrue(shards[0]["meta"].get("return_fwd_batch"))
+        self.assertTrue(shards[1]["meta"].get("return_fwd_batch"))
 
     def test_split_default_sp_is_world(self):
         shards, _ = _split_batch(self._envelope(), num_workers=8)
@@ -195,3 +207,40 @@ class TestDpSizeDividesBySp(TestCasePlus):
         dumped = JobConfig(model_name="m", ds_config={"sequence_parallel_size": 2}).model_dump()
         self.assertNotIn("sp_size", dumped)
         self.assertEqual(sp_size_from_job_config(dumped), 2)
+
+    def test_log_prob_job_ignores_training_ds_config_when_log_prob_declares_sp(self):
+        job_config = JobConfig(
+            model_name="m",
+            job_type="log_prob",
+            ds_config={"sequence_parallel_size": 2},
+            log_prob_config={"sequence_parallel_size": 1},
+        )
+        self.assertEqual(job_config.sp_size, 1)
+
+    def test_log_prob_job_falls_back_to_ds_config_when_log_prob_omits_sp(self):
+        job_config = JobConfig(
+            model_name="m",
+            job_type="log_prob",
+            ds_config={"sequence_parallel_size": 2},
+        )
+        self.assertEqual(job_config.sp_size, 2)
+
+    def test_training_job_ignores_log_prob_config_sp(self):
+        job_config = JobConfig(
+            model_name="m",
+            job_type="training",
+            ds_config={"sequence_parallel_size": 2},
+            log_prob_config={"sequence_parallel_size": 4},
+        )
+        self.assertEqual(job_config.sp_size, 2)
+
+    def test_parallelism_degree_rejects_bool_and_float(self):
+        from arctic_platform.common.utils.server_models import resolve_parallelism_degree
+
+        with self.assertRaises(ValueError):
+            resolve_parallelism_degree(True, "sp_size")
+        with self.assertRaises(ValueError):
+            resolve_parallelism_degree(1.5, "sp_size")
+        with self.assertRaises(ValueError):
+            resolve_parallelism_degree("2", "sp_size")
+        self.assertEqual(resolve_parallelism_degree(2, "sp_size"), 2)

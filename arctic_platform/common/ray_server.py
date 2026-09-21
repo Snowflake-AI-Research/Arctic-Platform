@@ -663,7 +663,7 @@ class ArcticRLRayServer:
         # passed back through the Ray object store. The TRL server-side-loss path
         # opts in via ``meta["return_fwd_batch"]`` (it needs logprobs/entropy for
         # its metrics block).
-        return_fwd_batch = bool(batch.get("meta", {}).get("return_fwd_batch", False))
+        return_fwd_batch = bool(shards[0]["meta"].get("return_fwd_batch", False))
         shards[0]["meta"]["worker_return_tensors"] = True
         timers.stop_and_print_elapsed(tname)
         for shard_rank, shard in enumerate(shards):

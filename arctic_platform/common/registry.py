@@ -112,11 +112,14 @@ def register_loss_fn(
             existing = getattr(fn, PACKED_LOSS_REDUCTION_ATTR, None)
             if existing is not None and existing is not packed_loss_reduction:
                 raise ValueError(f"refusing to replace packed_loss_reduction on registered {name!r}")
+        # Bind first so a refused public-name overwrite cannot leak
+        # ``summed_metrics`` into the process-global union.
+        _bind_registry(LOSS_FNS, name, fn)
+        if packed_loss_reduction is not None:
             setattr(fn, PACKED_LOSS_REDUCTION_ATTR, packed_loss_reduction)
         if declared:
             setattr(fn, SUMMED_METRICS_ATTR, declared | getattr(fn, SUMMED_METRICS_ATTR, frozenset()))
             DECLARED_SUMMED_METRICS.update(declared)
-        _bind_registry(LOSS_FNS, name, fn)
         return fn
 
     return decorator

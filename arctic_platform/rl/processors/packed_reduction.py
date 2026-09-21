@@ -211,6 +211,7 @@ def combine_packed_metrics(
         )
     summed: dict[str, float] = {}
     averaged: dict[str, float] = {}
+    averaged_weight: dict[str, float] = {}
     for metrics, weight in zip(microbatch_metrics, weights):
         for key, value in (metrics or {}).items():
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -220,6 +221,10 @@ def combine_packed_metrics(
                 summed[key] = summed.get(key, 0.0) + number
             else:
                 averaged[key] = averaged.get(key, 0.0) + number * weight
-    out = {key: value / total_weight for key, value in averaged.items()}
+                averaged_weight[key] = averaged_weight.get(key, 0.0) + weight
+    out = {
+        key: value / (averaged_weight[key] if averaged_weight[key] else total_weight)
+        for key, value in averaged.items()
+    }
     out.update(summed)
     return out

@@ -75,7 +75,9 @@ def compute_logprobs_post(model_outputs: dict, batch: dict, meta: dict, device: 
     if labels is None:
         input_ids = context.get("input_ids")
         if input_ids is None:
-            return {}
+            raise ValueError(
+                "compute_logprobs requires 'labels' or 'input_ids' in batch/meta when model outputs contain logits"
+            )
         input_ids = input_ids.to(logits.device)
         if input_ids.ndim < logits.ndim:
             input_ids = input_ids.view(logits.shape[:-1])

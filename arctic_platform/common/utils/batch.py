@@ -197,9 +197,10 @@ def reconstruct_position_ids_(batch_data: dict) -> None:
 def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
     """Split a batch across workers and stamp the DP loss scale.
 
-    The cutter produces ``num_workers`` disjoint shards, so ``dp_size`` is
-    ``num_workers`` until an SP data-plane replicates one shard across a group.
-    ``sp_size`` is still validated (must divide ``num_workers``).
+    The cutter produces ``num_workers`` disjoint row shards and stamps
+    ``dp_size=num_workers``. Sequence-parallel replication (one logical DP
+    shard copied across an SP group, then token-sharded) is not implemented,
+    so ``sp_size > 1`` is rejected rather than silently mixing samples.
     ``zip(workers, shards)`` stays 1:1.
 
     Supports two wire shapes for ``batch["batch"]``:
@@ -213,6 +214,13 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
 
     reorder_indices = None
     meta_data = dict(meta_data)
+    sp_size = resolve_parallelism_degree(sp_size, "sp_size")
+    if sp_size > 1:
+        raise ValueError(
+            "sequence-parallel data-plane is not implemented: _split_batch still "
+            "cuts one disjoint shard per worker. Refuse sp_size>1 until shards "
+            f"are replicated across an SP group. Got sp_size={sp_size}."
+        )
     dp_sp_world_size(num_workers, sp_size)
     meta_data.update(dp_size=num_workers)
 

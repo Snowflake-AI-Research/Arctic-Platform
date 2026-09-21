@@ -239,7 +239,7 @@ def _internal_grpo_loss_fn(
     aux_ce_weight: float | None = None,
     echo_global_num_sequences: int | None = None,
     echo_batch_denominator: str = EchoBatchDenominator.ALL_SEQUENCES.value,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, dict]:
     """Internal GRPO loss — same interface as dss/loss_fns/grpo.py."""
     dp_size = _resolve_dp_size(dp_size, batch_num_tokens)
     old_logp = input_data["old_log_probs"]
@@ -274,8 +274,8 @@ def _internal_grpo_loss_fn(
     # finite even if the shard produced non-finite logits; the * 0.0 zeroes the grad.
     #
     # When ECHO is configured, skip the early return so sft_mask /
-    # echo_observation_mask can still contribute. AT-dss still returns before
-    # ECHO (snowflake-eng/ArcticTraining-dss#167); this AP path does not.
+    # echo_observation_mask can still contribute. Empty-policy shards still
+    # run the ECHO terms on this path.
     empty_policy_shard = not loss_mask.any()
     if empty_policy_shard and aux_ce_weight is None:
         zero_loss = torch.nan_to_num(logprobs).sum() * 0.0
