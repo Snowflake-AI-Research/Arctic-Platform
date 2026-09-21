@@ -406,7 +406,7 @@ class DeepSpeedWorker:
             log_dp_shard_tokens(self.rank, f"{tag} shard", batch_data, meta_data)
             pr0(f"[DeepSpeedWorker] {tag}: {batch_data.keys()=} {meta_data.keys()=} {processing.keys()=}")
             for k, v in batch_data.items():
-                pr0(f"[DeepSpeedWorker] {tag}: {k=}: {v.shape=}")
+                pr0(f"[DeepSpeedWorker] {tag}: {k=}: shape={getattr(v, 'shape', type(v).__name__)}")
 
         grad_accum_steps = self.engine.gradient_accumulation_steps()
         # H3: list-of-microbatches from the client skips concat→split_dict.
@@ -502,7 +502,7 @@ class DeepSpeedWorker:
 
             # DS requires matching steps for backward pass
             if backward and i < num_micro_batches - 1:
-                self.engine.step()
+                self._engine_step()
 
         pipeline_outputs = dict()
         for k, v in pipeline_micro_batch_outputs[0].items():
@@ -559,11 +559,27 @@ class DeepSpeedWorker:
         timers.stop_and_print_elapsed(tname)
         return results
 
+    def _engine_step(self) -> None:
+        """``engine.step()`` with a skip for DeepSpeed BF16_Optimizer's zero-norm assert.
+
+        ZeRO-1/2 use ``BF16_Optimizer``, which asserts ``all_groups_norm > 0``.
+        GRPO can produce an all-zero grad batch (identical group rewards). ZeRO-3
+        does not assert; skip the optimizer update instead of crashing.
+        """
+        try:
+            self.engine.step()
+        except AssertionError:
+            gn = getattr(getattr(self.engine, "optimizer", None), "_global_grad_norm", None)
+            if gn is not None and float(gn) == 0.0:
+                pr0("[DeepSpeedWorker] skip optimizer.step: global grad norm is 0")
+                return
+            raise
+
     def step(self) -> dict:
         from arctic_platform import sft_profile
 
         with sft_profile.timed("step"):
-            self.engine.step()
+            self._engine_step()
             if sft_profile.enabled() and torch.cuda.is_available():
                 torch.cuda.synchronize()
         # Pull grad_norm out of DeepSpeed so it can be logged by the trainer.
