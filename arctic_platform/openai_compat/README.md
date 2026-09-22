@@ -5,6 +5,7 @@ OpenAI client at it — the `openai` SDK, LiteLLM, an eval harness, curl — and
 change nothing but `base_url`.
 
 ```bash
+pip install "arctic-platform[openai]"
 python -m arctic_platform.openai_compat --config client.json --port 8000
 ```
 

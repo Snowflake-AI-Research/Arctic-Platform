@@ -69,6 +69,12 @@ dev = [
 ]
 
 testing = [
+    # tests/openai_compat serves the real app and drives it with the real openai
+    # SDK; without these the conformance suite importorskips itself and CI goes
+    # green having checked nothing. The server side (fastapi/uvicorn/transformers)
+    # already arrives with [sft], which is what CI installs alongside this.
+    "httpx",  # fastapi.testclient
+    "openai",
     "parameterized",
     "pytest-instafail",
     "pytest-flakefinder",
