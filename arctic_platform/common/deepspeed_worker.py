@@ -31,7 +31,6 @@ import numbers
 import os
 import socket
 import time
-import traceback
 from typing import Any
 
 import deepspeed
@@ -48,6 +47,7 @@ from arctic_platform.common.utils import merge_dict_shards
 from arctic_platform.common.utils import sp_size_from_job_config
 from arctic_platform.common.utils import split_dict
 from arctic_platform.common.utils import unpack_batch
+from arctic_platform.common.utils.bf16_zero_norm import is_bf16_zero_norm_assert
 from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
@@ -562,20 +562,7 @@ class DeepSpeedWorker:
 
     def _is_bf16_zero_norm_assert(self, exc: BaseException) -> bool:
         """True only for BF16_Optimizer's bare ``assert all_groups_norm > 0.``."""
-        optimizer = getattr(self.engine, "optimizer", None)
-        gn = getattr(optimizer, "_global_grad_norm", None)
-        if gn is None:
-            return False
-        try:
-            if float(gn) != 0.0:
-                return False
-        except (TypeError, ValueError):
-            return False
-        for frame in traceback.extract_tb(exc.__traceback__):
-            filename = str(frame.filename).replace("\\", "/")
-            if filename.endswith("/bf16_optimizer.py") and frame.name == "step":
-                return True
-        return False
+        return is_bf16_zero_norm_assert(exc, getattr(self.engine, "optimizer", None))
 
     def _engine_step(self) -> None:
         """``engine.step()`` with a skip for DeepSpeed BF16_Optimizer's zero-norm assert.
