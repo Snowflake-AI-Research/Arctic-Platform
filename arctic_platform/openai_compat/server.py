@@ -18,21 +18,30 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import inspect
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
-
-from fastapi import APIRouter
-from fastapi import FastAPI
-from fastapi import Request
-from fastapi.responses import JSONResponse
 
 from arctic_platform._dependency_groups import require_any_dep_group
 from arctic_platform.openai_compat import translation as tr
 from arctic_platform.openai_compat.translation import OpenAIError
+
+try:
+    from fastapi import APIRouter
+    from fastapi import FastAPI
+    from fastapi import Request
+    from fastapi.responses import JSONResponse
+except ModuleNotFoundError:
+    # The routes are declared with decorators, so fastapi is needed at import
+    # time. Without this, a missing extra surfaces as a bare "No module named
+    # 'fastapi'" and never reaches the check in build_app that names the fix.
+    require_any_dep_group("openai")
+    raise
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["openai-compat"])
@@ -57,7 +66,18 @@ class _State:
         self.api_key = api_key
         # Concurrent callers all land on one sampling job; the rest queue here,
         # where a request costs a coroutine rather than a slot.
-        self.semaphore = asyncio.Semaphore(max(1, int(max_concurrency)))
+        self.max_concurrency = max(1, int(max_concurrency))
+        self.semaphore = asyncio.Semaphore(self.max_concurrency)
+        # A blocking client occupies a thread for the whole generation, polling
+        # included. asyncio.to_thread() would put those on the default executor,
+        # which caps at min(32, cpu_count + 4) -- so raising max_concurrency past
+        # 32 would raise the semaphore and nothing else. Own the pool instead, so
+        # the number means what it says. Async clients never touch it.
+        self.executor = (
+            None
+            if inspect.iscoroutinefunction(getattr(client, "generate", None))
+            else ThreadPoolExecutor(max_workers=self.max_concurrency, thread_name_prefix="openai-compat")
+        )
         self.created = int(time.time())
 
 
@@ -81,10 +101,16 @@ def _as_openai_error(exc: BaseException) -> OpenAIError:
     Retry-After, stock client retry policy absorbs it; relayed as a 500 it ends
     the caller's run.
     """
+    # requests carries status on .response; aiohttp's ClientResponseError carries
+    # it on the exception itself. Reading only the first shape turns the async
+    # client's 429 into a 502 and drops Retry-After, so the caller stops retrying.
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    headers = getattr(response, "headers", None) or getattr(exc, "headers", None) or {}
     if status == 429:
-        retry_after = (getattr(response, "headers", None) or {}).get("Retry-After")
+        retry_after = headers.get("Retry-After")
         return OpenAIError(
             429,
             f"The sampling job is at capacity: {exc}",
@@ -113,7 +139,9 @@ async def _generate(state: _State, prompt: str | list[int], params: dict[str, An
             else:
                 # Awaiting a blocking client on the event loop would stall every
                 # other in-flight request behind it.
-                results = await asyncio.to_thread(generate, prompts, params)
+                results = await asyncio.get_running_loop().run_in_executor(
+                    state.executor, functools.partial(generate, prompts, params)
+                )
         except OpenAIError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -189,6 +217,7 @@ async def chat_completions(request: Request) -> dict[str, Any]:
         tokenizer=state.tokenizer,
         want_logprobs=want_logprobs,
         tools_offered=bool(req.tools) and req.tool_choice != "none",
+        top_logprobs=req.top_logprobs or 0,
     )
 
 
@@ -205,7 +234,7 @@ async def completions(request: Request) -> dict[str, Any]:
     else:
         prompts = [p if isinstance(p, str) else list(p) for p in raw]
 
-    prompt_tokens, per_prompt = 0, []
+    prompt_tokens, pending = 0, []
     for prompt in prompts:
         token_ids = prompt if isinstance(prompt, list) else _encode(state.tokenizer, prompt)
         prompt_tokens += len(token_ids)
@@ -216,7 +245,17 @@ async def completions(request: Request) -> dict[str, Any]:
             ),
             logprobs_topk=req.logprobs,
         )
-        per_prompt.append(await _generate(state, prompt, params, req.n))
+        pending.append(_generate(state, prompt, params, req.n))
+
+    # Awaiting each prompt before submitting the next serializes a batch that the
+    # sampler could have run together. gather keeps response order; the semaphore
+    # still bounds what is in flight. return_exceptions so a failure doesn't leave
+    # the surviving prompts running as orphans.
+    settled = await asyncio.gather(*pending, return_exceptions=True)
+    for outcome in settled:
+        if isinstance(outcome, BaseException):
+            raise outcome
+    per_prompt = list(settled)
 
     return tr.text_completion(
         per_prompt,
@@ -224,6 +263,7 @@ async def completions(request: Request) -> dict[str, Any]:
         prompt_tokens=prompt_tokens,
         tokenizer=state.tokenizer,
         want_logprobs=req.logprobs is not None,
+        top_logprobs=req.logprobs or 0,
     )
 
 
@@ -277,7 +317,7 @@ def check_bind(host: str, api_key: str | None) -> None:
 def main(argv: list[str] | None = None) -> None:
     """Attach to an existing sampling job and serve ``/v1`` until interrupted."""
     parser = argparse.ArgumentParser(prog="python -m arctic_platform.openai_compat")
-    parser.add_argument("--config", required=True, type=Path, help="ArcticClientConfig JSON/YAML.")
+    parser.add_argument("--config", required=True, type=Path, help="ArcticClientConfig as JSON.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--api-key", default=None, help="Required when --host is not loopback.")
@@ -286,28 +326,26 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    check_bind(args.host, args.api_key)
+    try:
+        check_bind(args.host, args.api_key)
+    except ValueError as exc:
+        # A traceback here is noise: the message is the whole point.
+        raise SystemExit(str(exc)) from None
 
     import uvicorn
     from transformers import AutoTokenizer
 
-    from arctic_platform.client.base import ArcticClient
+    from arctic_platform.client.base import AsyncArcticClient
     from arctic_platform.client.config import ArcticClientConfig
 
-    text = args.config.read_text()
-    if args.config.suffix in (".yaml", ".yml"):
-        import yaml
-
-        raw = yaml.safe_load(text)
-    else:
-        raw = json.loads(text)
-
-    config = ArcticClientConfig.model_validate(raw)
+    config = ArcticClientConfig.model_validate(json.loads(args.config.read_text()))
     if config.sampling_job_id is None:
         raise SystemExit("--config must set sampling_job_id: this serves an endpoint, it does not create one.")
 
     app = build_app(
-        client=ArcticClient(config),
+        # Async so a concurrent eval costs coroutines rather than one pooled
+        # thread per in-flight request.
+        client=AsyncArcticClient(config),
         tokenizer=AutoTokenizer.from_pretrained(config.model_name),
         model_name=args.served_model_name or config.model_name,
         max_model_len=config.max_seq_len,

@@ -340,3 +340,77 @@ class TestConcurrency:
         with serve(make_app(stub, tokenizer, max_concurrency=2)) as sdk:
             self._hammer(sdk, 6)
         assert stub.max_in_flight <= 2
+
+    def test_blocking_client_scales_past_the_default_executor(self, tokenizer):
+        # asyncio.to_thread() caps at min(32, cpu_count + 4), so a semaphore
+        # raised past that would report a concurrency the backend never reaches.
+        ceiling, count = 48, 64
+        blocking = BlockingClient(delay_s=0.4)
+        with serve(make_app(blocking, tokenizer, max_concurrency=ceiling)) as sdk:
+            self._hammer(sdk, count)
+        assert blocking.calls == count
+        assert blocking.max_in_flight > 32, f"peaked at {blocking.max_in_flight}, the default-executor ceiling"
+        assert blocking.max_in_flight <= ceiling
+
+    def test_prompt_arrays_are_not_dispatched_one_at_a_time(self, tokenizer):
+        # A prompt array is the one request shape where the sampler could batch;
+        # awaiting each in turn throws that away.
+        stub = StubClient(delay_s=0.2)
+        with http_client(make_app(stub, tokenizer, max_concurrency=8)) as http:
+            body = {"model": MODEL, "prompt": [f"p{i}" for i in range(8)], "max_tokens": 4}
+            out = http.post("/v1/completions", json=body).json()
+        assert len(out["choices"]) == 8
+        assert stub.max_in_flight > 1, "prompts were dispatched serially"
+
+    def test_async_backend_429_keeps_its_status_and_retry_after(self, tokenizer):
+        # aiohttp puts status/headers on the exception, not on a .response --
+        # the shape the async client actually raises.
+        class AiohttpStyle(Exception):
+            status = 429
+            headers = {"Retry-After": "7"}
+
+        with serve(make_app(StubClient(raises=AiohttpStyle("at capacity")), tokenizer)) as sdk:
+            with pytest.raises(openai.RateLimitError) as excinfo:
+                sdk.chat.completions.create(model=MODEL, messages=MESSAGES, max_tokens=4)
+        assert excinfo.value.response.headers.get("Retry-After") == "7"
+
+
+class TestLogprobs:
+    # Two candidates per sampled token, deliberately not in rank order. One entry
+    # per token_id the stub returns, or the position lookup drops the whole block.
+    CANDIDATES: Any = [
+        {1000: -0.1, 2000: -1.5},
+        {1001: -0.2, 2001: -0.9},
+        {1002: -0.3, 2002: -1.1},
+        {1003: -0.4, 2003: -1.7},
+    ]
+
+    def test_requested_alternatives_are_returned(self, tokenizer):
+        stub = StubClient(logprobs=self.CANDIDATES)
+        with serve(make_app(stub, tokenizer)) as sdk:
+            out = sdk.chat.completions.create(
+                model=MODEL, messages=MESSAGES, max_tokens=4, logprobs=True, top_logprobs=2
+            )
+        content = out.choices[0].logprobs.content
+        assert [len(entry.top_logprobs) for entry in content[:2]] == [2, 2]
+        # Most likely first, and the sampled token is among the alternatives.
+        first = content[0].top_logprobs
+        assert first[0].logprob >= first[1].logprob
+        assert content[0].logprob == pytest.approx(-0.1)
+
+    def test_alternatives_are_truncated_to_the_requested_count(self, tokenizer):
+        stub = StubClient(logprobs=self.CANDIDATES)
+        with serve(make_app(stub, tokenizer)) as sdk:
+            out = sdk.chat.completions.create(
+                model=MODEL, messages=MESSAGES, max_tokens=4, logprobs=True, top_logprobs=1
+            )
+        assert all(len(entry.top_logprobs) == 1 for entry in out.choices[0].logprobs.content[:2])
+
+    def test_legacy_completions_emit_token_to_logprob_maps(self, tokenizer):
+        stub = StubClient(logprobs=self.CANDIDATES)
+        with http_client(make_app(stub, tokenizer)) as http:
+            body = {"model": MODEL, "prompt": "hi", "max_tokens": 4, "logprobs": 2}
+            out = http.post("/v1/completions", json=body).json()
+        top = out["choices"][0]["logprobs"]["top_logprobs"]
+        assert isinstance(top, list) and isinstance(top[0], dict)
+        assert len(top[0]) == 2

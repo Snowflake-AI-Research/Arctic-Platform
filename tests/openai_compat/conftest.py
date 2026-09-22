@@ -44,11 +44,13 @@ class StubClient:
         finish_reason: str = "stop",
         delay_s: float = 0.0,
         raises: BaseException | None = None,
+        logprobs: Any = None,
     ) -> None:
         self.text = text
         self.finish_reason = finish_reason
         self.delay_s = delay_s
         self.raises = raises
+        self.logprobs = [-0.1, -0.2, -0.3, -0.4] if logprobs is None else logprobs
         self.calls: list[dict[str, Any]] = []
         self.max_in_flight = 0
         self._in_flight = 0
@@ -74,7 +76,7 @@ class StubClient:
                 {
                     "text": self.text,
                     "token_ids": [1000, 1001, 1002, 1003],
-                    "logprobs": [-0.1, -0.2, -0.3, -0.4],
+                    "logprobs": self.logprobs,
                     "finish_reason": self.finish_reason,
                 }
                 for _ in prompts
@@ -89,11 +91,21 @@ class BlockingClient:
     def __init__(self, delay_s: float) -> None:
         self.delay_s = delay_s
         self.calls = 0
+        self.max_in_flight = 0
+        self._in_flight = 0
+        self._lock = threading.Lock()
 
     def generate(self, prompts: list[Any], sampling_params: dict[str, Any]) -> list[dict[str, Any]]:
-        self.calls += 1
-        time.sleep(self.delay_s)
-        return [{"text": "ok", "token_ids": [1], "finish_reason": "stop"} for _ in prompts]
+        with self._lock:
+            self.calls += 1
+            self._in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self._in_flight)
+        try:
+            time.sleep(self.delay_s)
+            return [{"text": "ok", "token_ids": [1], "finish_reason": "stop"} for _ in prompts]
+        finally:
+            with self._lock:
+                self._in_flight -= 1
 
 
 def make_app(client: Any, tokenizer: Any, *, api_key: str | None = None, max_concurrency: int = 32) -> Any:
@@ -144,10 +156,15 @@ def serve(app: Any, *, api_key: str | None = None):
 @pytest.fixture(scope="session")
 def tokenizer() -> Any:
     transformers = pytest.importorskip("transformers")
-    try:
-        return transformers.AutoTokenizer.from_pretrained(MODEL, local_files_only=True)
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"{MODEL} tokenizer is not in the local HF cache: {exc}")
+    # Prefer the cache so the suite stays offline and fast, but fall back to a
+    # download: on a cold CI runner the cache-only path would skip every test
+    # that needs a chat template, which is most of the interesting ones.
+    for kwargs in ({"local_files_only": True}, {}):
+        try:
+            return transformers.AutoTokenizer.from_pretrained(MODEL, **kwargs)
+        except Exception:  # noqa: BLE001
+            continue
+    pytest.skip(f"{MODEL} tokenizer is unavailable offline and could not be downloaded")
 
 
 @pytest.fixture

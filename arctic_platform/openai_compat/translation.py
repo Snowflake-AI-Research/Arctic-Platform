@@ -322,7 +322,42 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
     return calls or None
 
 
-def _logprobs(token_ids: list[int], raw: Any, tokenizer: Any) -> dict[str, Any] | None:
+def _token_entry(token_id: int, logprob: float, tokenizer: Any) -> dict[str, Any]:
+    try:
+        piece = tokenizer.decode([int(token_id)])
+    except Exception:  # noqa: BLE001
+        piece = ""
+    return {"token": piece, "logprob": float(logprob), "bytes": list(piece.encode())}
+
+
+def _entry_logprob(entry: Any) -> float | None:
+    value = entry.get("logprob") if isinstance(entry, dict) else entry
+    return None if value is None else float(value)
+
+
+def _alternatives(position: dict[Any, Any], tokenizer: Any, top_k: int) -> list[dict[str, Any]]:
+    """The candidates the sampler scored at this position, most likely first.
+
+    Asking for top_logprobs already widens the sampler's logprobs request, so the
+    candidates are on the wire either way; dropping them returns a 200 that is
+    missing exactly what was asked for.
+    """
+    scored: list[tuple[int, float]] = []
+    for key, entry in position.items():
+        if key == "logprob":  # the sampled-token form, not a candidate map
+            continue
+        try:
+            token_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        logprob = _entry_logprob(entry)
+        if logprob is not None:
+            scored.append((token_id, logprob))
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return [_token_entry(token_id, logprob, tokenizer) for token_id, logprob in scored[:top_k]]
+
+
+def _logprobs(token_ids: list[int], raw: Any, tokenizer: Any, top_k: int = 0) -> dict[str, Any] | None:
     """Build OpenAI's logprobs.content.
 
     The schema wants the token string and its bytes; the sampler reports ids, so
@@ -334,20 +369,19 @@ def _logprobs(token_ids: list[int], raw: Any, tokenizer: Any) -> dict[str, Any] 
     for i, token_id in enumerate(token_ids):
         position = raw[i] if i < len(raw) else None
         # A position is either a bare float or a dict keyed by token id.
+        alternatives: list[dict[str, Any]] = []
         if isinstance(position, (int, float)):
             logprob = float(position)
         elif isinstance(position, dict):
             entry = position.get(token_id, position.get(str(token_id), position.get("logprob")))
-            logprob = float(entry["logprob"]) if isinstance(entry, dict) else entry
+            logprob = _entry_logprob(entry)
+            if top_k:
+                alternatives = _alternatives(position, tokenizer, top_k)
         else:
             return None
         if logprob is None:
             return None
-        try:
-            piece = tokenizer.decode([int(token_id)])
-        except Exception:  # noqa: BLE001
-            piece = ""
-        content.append({"token": piece, "logprob": float(logprob), "bytes": list(piece.encode()), "top_logprobs": []})
+        content.append({**_token_entry(token_id, logprob, tokenizer), "top_logprobs": alternatives})
     return {"content": content}
 
 
@@ -383,6 +417,7 @@ def chat_completion(
     tokenizer: Any,
     want_logprobs: bool,
     tools_offered: bool,
+    top_logprobs: int = 0,
 ) -> dict[str, Any]:
     choices = []
     for index, result in enumerate(results):
@@ -397,7 +432,9 @@ def chat_completion(
             "index": index,
             "message": message,
             "finish_reason": _finish(result.get("finish_reason"), tool_calls=bool(calls)),
-            "logprobs": _logprobs(token_ids, result.get("logprobs"), tokenizer) if want_logprobs else None,
+            "logprobs": (
+                _logprobs(token_ids, result.get("logprobs"), tokenizer, top_logprobs) if want_logprobs else None
+            ),
         }
         # vLLM's OpenAI-server extension: RL harnesses read these to turn an eval
         # transcript into rollouts. Clients that don't know the field ignore it.
@@ -420,12 +457,18 @@ def text_completion(
     prompt_tokens: int,
     tokenizer: Any,
     want_logprobs: bool,
+    top_logprobs: int = 0,
 ) -> dict[str, Any]:
     choices, flat = [], []
     for results in results_per_prompt:
         for result in results:
             built = (
-                _logprobs([int(t) for t in result.get("token_ids") or []], result.get("logprobs"), tokenizer)
+                _logprobs(
+                    [int(t) for t in result.get("token_ids") or []],
+                    result.get("logprobs"),
+                    tokenizer,
+                    top_logprobs,
+                )
                 if want_logprobs
                 else None
             )
@@ -440,7 +483,13 @@ def text_completion(
                         and {
                             "tokens": [e["token"] for e in built["content"]],
                             "token_logprobs": [e["logprob"] for e in built["content"]],
-                            "top_logprobs": None,
+                            # The legacy schema wants token -> logprob maps, not
+                            # the chat schema's list of entries.
+                            "top_logprobs": (
+                                [{a["token"]: a["logprob"] for a in e["top_logprobs"]} for e in built["content"]]
+                                if top_logprobs
+                                else None
+                            ),
                             "text_offset": [],
                         }
                     ),
