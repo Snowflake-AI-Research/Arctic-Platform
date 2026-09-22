@@ -265,17 +265,21 @@ def encode_byte_chunks(
     operation: str | None = None,
     max_bytes: int = 0,
     chunk_group_id: str | None = None,
+    force_chunk: bool = False,
 ) -> list[bytes]:
     """Split a DSSST1 frame into byte-range DSSST1 chunk frames.
 
     Returns ``[frame]`` when no chunking is needed. When chunking is needed,
     every returned frame contains a 1-D uint8 ``payload`` tensor plus metadata
     under ``request_chunk`` or ``result_chunk``.
+
+    ``force_chunk`` emits the envelope even for a frame that fits, for callers whose
+    protocol requires it rather than treating it as a size-driven optimization.
     """
     if not isinstance(frame, (bytes, bytearray, memoryview)):
         raise WireError("encode_byte_chunks expects frame bytes")
     frame = bytes(frame)
-    if max_bytes <= 0 or len(frame) <= max_bytes:
+    if not force_chunk and (max_bytes <= 0 or len(frame) <= max_bytes):
         return [frame]
 
     group_id = chunk_group_id if kind == "request" else None
@@ -283,6 +287,20 @@ def encode_byte_chunks(
         import uuid
 
         group_id = str(uuid.uuid4())
+
+    if max_bytes <= 0:
+        return [
+            _make_byte_chunk_frame(
+                frame,
+                kind=kind,
+                operation=operation,
+                group_id=group_id,
+                chunk_idx=0,
+                total_chunks=1,
+                start=0,
+                end=len(frame),
+            )
+        ]
 
     payload_size = max(1, max_bytes - _DEFAULT_CHUNK_OVERHEAD_BYTES)
     while True:

@@ -28,8 +28,10 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
+from arctic_platform.client import ArcticSFTClientConfig
+from arctic_platform.client import OnPremConfig
+from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
-from arctic_platform.sft import ArcticSFTClientConfig
 from arctic_platform.sft.examples.run_sft_http_demo import ATTN
 from arctic_platform.sft.examples.run_sft_http_demo import LR
 from arctic_platform.sft.examples.run_sft_http_demo import MODEL
@@ -50,14 +52,12 @@ def _eval_loss(client: ArcticSFTClient, batch: dict) -> float:
 
 def _train_steps(client: ArcticSFTClient, batch: dict, n: int, label: str) -> None:
     for i in range(n):
-        out = client.fwd_bwd(batch)
-        step_out = client.step()
+        out = client.train_step(batch)
         metrics = out.get("metrics") or {}
         loss = metrics.get("loss", out.get("avg_loss"))
         line = f"{label} step {i + 1}/{n} loss={_metric(loss):.6g}"
-        gn = (step_out or {}).get("metrics", {}).get("grad_norm")
-        if gn is not None:
-            line += f" grad_norm={_metric(gn):.6g}"
+        if "grad_norm" in metrics:
+            line += f" grad_norm={_metric(metrics['grad_norm']):.6g}"
         print(line)
 
 
@@ -91,36 +91,38 @@ def main() -> None:
     batch = _build_batch(tokenizer, texts, prompt_lens, pad_token_id, loss_fn="sft")
 
     config = ArcticSFTClientConfig(
-        backend="onprem",
-        comm_protocol="http",
         model_name=args.model,
         seed=SEED,
         training_gpus=args.training_gpus,
-        host=args.host,
-        port=args.port,
-        launch_local_server=args.launch_local_server,
-        server_cuda_visible_devices=args.server_cuda_visible_devices,
-        checkpoint_path=str(ckpt_root),
         job_ready_timeout=600.0,
-        ds_config={
-            "train_micro_batch_size_per_gpu": 1,
-            "train_batch_size": args.training_gpus,
-            "gradient_accumulation_steps": 1,
-            "zero_optimization": {
-                "stage": 2,
-                "offload_optimizer": {"device": "none"},
-                "offload_param": {"device": "none"},
+        backend=OnPremConfig(
+            host=args.host,
+            port=args.port,
+            launch_local_server=args.launch_local_server,
+            server_cuda_visible_devices=args.server_cuda_visible_devices,
+        ),
+        training=TrainingConfig(
+            checkpoint_path=str(ckpt_root),
+            ds_config={
+                "train_micro_batch_size_per_gpu": 1,
+                "train_batch_size": args.training_gpus,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                    "stage": 2,
+                    "offload_optimizer": {"device": "none"},
+                    "offload_param": {"device": "none"},
+                },
+                "optimizer": {
+                    "type": "AdamW",
+                    "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+                },
             },
-            "optimizer": {
-                "type": "AdamW",
-                "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+            ds_worker_config={
+                "attn_implementation": ATTN,
+                "enable_gradient_checkpointing": False,
+                "zorro_train_enable": False,
             },
-        },
-        ds_worker_config={
-            "attn_implementation": ATTN,
-            "enable_gradient_checkpointing": False,
-            "zorro_train_enable": False,
-        },
+        ),
     )
 
     client = ArcticSFTClient(config)

@@ -15,9 +15,8 @@
 """The pluggable seam: a transport is just "how do we deliver an op here".
 
 The op *surface* (names, args, canonical body, which job each op targets,
-response contract) is defined once in the client. A transport owns only job
-identity + wire mechanics: given a `Request`, deliver it to its deployment and
-return a canonical response dict. It never redefines the API.
+response contract) is defined once in the client. A transport owns job identity,
+wire mechanics, and temporary normalization of deployment-specific responses.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
 
-from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import JobId
 
 JOB_TYPES = ("training", "sampling", "log_prob")
@@ -92,7 +91,7 @@ class JobHandles:
     log_prob: JobId | None = None
 
     @classmethod
-    def from_config(cls, config: ArcticRLClientConfig) -> JobHandles:
+    def from_config(cls, config: ArcticClientConfig) -> JobHandles:
         return cls(config.training_job_id, config.sampling_job_id, config.log_prob_job_id)
 
     @property
@@ -114,9 +113,8 @@ class Request:
     """A canonical op call, built by the client.
 
     The client owns job identity (it holds `JobHandles` after `initialize`), so it
-    resolves and sets `job_id` here directly; `body` carries everything else. This
-    keeps transports as pure forwarders: on-prem hands `(job_id, body)` straight to
-    the server, `binary` just picks the body codec (octet tensors vs JSON).
+    resolves and sets `job_id` here directly; `body` carries everything else.
+    Transports may normalize deployment-specific responses into the canonical API.
     """
 
     op: str  # canonical op name, e.g. "forward-backward"

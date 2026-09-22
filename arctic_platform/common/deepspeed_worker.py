@@ -482,7 +482,7 @@ class DeepSpeedWorker:
             torch.cuda.memory._record_memory_history(max_entries=int(1e12))
         see_memory_usage("_forward_maybe_backward start", force=True)
 
-        from arctic_platform.common.utils import sft_profile
+        from arctic_platform import sft_profile
 
         args, batch_data, meta_data, processing = unpack_batch(batch)
         with sft_profile.timed("h2d"):
@@ -644,7 +644,7 @@ class DeepSpeedWorker:
             exit()
 
         pr0(f"[DeepSpeedWorker] {tag}: {pipeline_outputs.keys()=}")
-        from arctic_platform.common.utils import sft_profile
+        from arctic_platform import sft_profile
 
         if sft_profile.enabled():
             metrics = pipeline_outputs.get("metrics")
@@ -680,7 +680,7 @@ class DeepSpeedWorker:
             opt = getattr(opt, "optimizer", None)
 
     def step(self, learning_rate: float | None = None) -> dict:
-        from arctic_platform.common.utils import sft_profile
+        from arctic_platform import sft_profile
 
         if learning_rate is not None:
             self._apply_learning_rate(float(learning_rate))

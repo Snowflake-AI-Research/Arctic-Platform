@@ -308,7 +308,7 @@ def run_sft_pipeline(
     can run varlen attention instead of a dense padded rectangle. No GRPO
     packing/unpad pipeline — SFT stays on the plain HF causal-LM surface.
     """
-    from arctic_platform.common.utils import sft_profile
+    from arctic_platform import sft_profile
 
     see_memory_usage("run_sft_pipeline start", force=True)
     loss_fn_name = processing.get("loss_fn", "sft")
