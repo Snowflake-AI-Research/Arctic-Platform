@@ -237,6 +237,14 @@ def test_text_only_extension_still_rejects_unexpected_lm_name():
         ws_utils.compute_expected_hf_param_names = orig
 
 
+def test_weight_sync_policy_defaults_to_text_only_on_base_extension():
+    from arctic_platform.common.weight_sync_extension import WEIGHT_SYNC_POLICY
+    from arctic_platform.common.weight_sync_extension import WORKER_EXTENSION_CLS
+
+    assert WEIGHT_SYNC_POLICY == "text_only"
+    assert WORKER_EXTENSION_CLS == "arctic_inference.server.weight_sync.WeightSyncExtension"
+
+
 def test_build_model_config_does_not_hardcode_platform_extension():
     from arctic_platform.common.utils.server_models import build_model_config
 

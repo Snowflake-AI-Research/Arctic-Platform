@@ -185,3 +185,31 @@ async def sync_weights_cpu_file(
         num_params,
     )
     return {"status": "ok"}
+
+
+async def ensure_weight_sync_contract(workers, pool, holder) -> dict[str, Any]:
+    """Publish trainer dest names and bind them on the sampler before any payload.
+
+    *holder* is ``app.state`` or a Ray server instance. Specs are cached there
+    so later syncs only re-bind (cheap, and covers replica restart).
+    """
+    from arctic_platform.common.weight_sync_extension import WEIGHT_SYNC_POLICY
+
+    specs = getattr(holder, "weight_sync_contract", None)
+    if specs is None:
+        specs = await workers[0].weight_sync_dest_specs.remote()
+        holder.weight_sync_contract = specs
+    await pool.bind_weight_sync_contract(
+        specs["descriptors"],
+        WEIGHT_SYNC_POLICY,
+        "base",
+        tie_word_embeddings=specs.get("tie_word_embeddings"),
+    )
+    return specs
+
+
+def reset_weight_sync_contract(holder, pool=None) -> None:
+    holder.weight_sync_ready = False
+    holder.weight_sync_contract = None
+    if pool is not None and hasattr(pool, "clear_weight_sync_contract"):
+        pool.clear_weight_sync_contract()

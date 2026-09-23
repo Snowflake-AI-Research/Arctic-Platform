@@ -18,7 +18,14 @@
 from __future__ import annotations
 
 from arctic_inference.server.weight_sync.receiver import TextOnlyWeightSyncExtension
+from arctic_inference.server.weight_sync.receiver import WeightSyncExtension
 
-WORKER_EXTENSION_CLS = "arctic_inference.server.weight_sync.TextOnlyWeightSyncExtension"
+WORKER_EXTENSION_CLS = "arctic_inference.server.weight_sync.WeightSyncExtension"
+WEIGHT_SYNC_POLICY = "text_only"
 
-__all__ = ["TextOnlyWeightSyncExtension", "WORKER_EXTENSION_CLS"]
+__all__ = [
+    "TextOnlyWeightSyncExtension",
+    "WeightSyncExtension",
+    "WORKER_EXTENSION_CLS",
+    "WEIGHT_SYNC_POLICY",
+]
