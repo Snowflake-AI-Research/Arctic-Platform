@@ -84,7 +84,6 @@ _maybe_partition_gpus()
 
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
-from deepspeed.comm import init_distributed  # noqa: E402
 
 # allow having multiple repository checkouts and not needing to remember to rerun
 # 'pip install -e .[dev]' when switching between checkouts and running tests.
@@ -246,6 +245,14 @@ def pytest_unconfigure(config):
 
 
 def _setup_dist():
+    # Imported here, and skipped entirely when absent, so an install without the
+    # training stack can still run the CPU-only suites. Anything that needs the
+    # dist group is already gated behind require_deepspeed / require_torch_gpu.
+    try:
+        from deepspeed.comm import init_distributed
+    except ModuleNotFoundError:
+        return
+
     os.environ["DS_ACCELERATOR"] = "cuda" if torch.cuda.is_available() else "cpu"
     os.environ["LOCAL_RANK"] = "0"
     os.environ["RANK"] = "0"

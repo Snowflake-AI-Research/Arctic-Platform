@@ -43,6 +43,7 @@ The base install carries config models only; pick the extra for your backend:
 pip install "arctic-platform[cortex]"   # drive Cortex training
 pip install "arctic-platform[sft]"      # local training-only server
 pip install "arctic-platform[rl]"       # ...plus the sampling stack
+pip install "arctic-platform[openai]"   # serve an OpenAI-compatible endpoint
 # or from a checkout:
 pip install -e ".[rl]"
 ```

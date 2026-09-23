@@ -109,6 +109,7 @@ pip install "arctic-platform[cortex]"   # drive Cortex training over SnowAPI
 pip install "arctic-platform[sft]"      # run a local training-only server
 pip install "arctic-platform[rl]"       # ...plus the sampling stack (arctic-inference, vLLM)
 pip install "arctic-platform[verl]"     # the verl adapter
+pip install "arctic-platform[openai]"   # serve an OpenAI-compatible endpoint over a Cortex job
 ```
 
 `[cortex]` is by far the lightest: it skips DeepSpeed, transformers, Ray and vLLM entirely. Importing on-prem code without the matching extra raises an error naming the one to install.
