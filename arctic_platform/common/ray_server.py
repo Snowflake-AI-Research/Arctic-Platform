@@ -504,6 +504,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
             "status": "RUNNING",
             "checkpoint_path": None,
             "sync_path": None,
+            "sp_size": job_config.sp_size,
         }
 
         if job_type == "log_prob":
@@ -653,13 +654,16 @@ class ArcticRLRayServer:
         # timers.stop_and_print_elapsed(tname)
 
         tname = timers.start("xyz fwd_bwd: ray_split_batch")
-        shards, _ = ray_split_batch(batch, len(workers))
+        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=self.jobs[job_id].get("sp_size", 1))
         # The verl driver's ``update_actor`` only consumes ``metrics`` from the
         # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
         # ``batch`` (logprobs/entropy) is never read. Keep the worker output as
         # tensors so ``run_pipeline`` skips the per-microbatch detensorize()
         # ``.tolist()``, and omit ``batch`` from the response so it is never
-        # passed back through the Ray object store.
+        # passed back through the Ray object store. The TRL server-side-loss path
+        # opts in via ``meta["return_fwd_batch"]`` (it needs logprobs/entropy for
+        # its metrics block).
+        return_fwd_batch = bool(shards[0]["meta"].get("return_fwd_batch", False))
         shards[0]["meta"]["worker_return_tensors"] = True
         timers.stop_and_print_elapsed(tname)
         for shard_rank, shard in enumerate(shards):
@@ -682,12 +686,18 @@ class ArcticRLRayServer:
 
         tname = timers.start("xyz fwd_bwd: epilogue")
         metrics, avg_loss = finalize_fwd_bwd_metrics(results)
-        # ``batch`` is intentionally omitted -- the driver does not consume it.
+        # ``batch`` is omitted by default (the verl driver does not consume it);
+        # opt in via ``return_fwd_batch`` for the TRL server-side-loss path.
         merged = dict(
             job_id=job_id,
             metrics=metrics,
             avg_loss=avg_loss,
         )
+        if return_fwd_batch:
+            fwd_batch = merge_dict_shards([r["batch"] for r in results])
+            if reorder_indices is not None:
+                fwd_batch = restore_batch_order(fwd_batch, reorder_indices)
+            merged["batch"] = fwd_batch
         timers.stop_and_print_elapsed(tname)
 
         timers.stop_and_print_elapsed(tname_e2e)
@@ -721,7 +731,7 @@ class ArcticRLRayServer:
         #     w.forward_no_grad.remote(s) for w, s in zip(workers, shards)
         # ])
 
-        shards, reorder_indices = ray_split_batch(batch, len(workers))
+        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=info.get("sp_size", 1))
         refs = [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
         results = ray.get(refs)
 
@@ -1182,7 +1192,7 @@ class ArcticRLRayServer:
             # shape fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no
             # ZoRRO/position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
             wrapper = dict(batch=dict(encoded), meta={}, processing={})
-            shards, _ = ray_split_batch(wrapper, len(workers))
+            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info.get("sp_size", 1))
             raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
             results = torch.cat([r.cpu() for r in raw], dim=0)
         else:

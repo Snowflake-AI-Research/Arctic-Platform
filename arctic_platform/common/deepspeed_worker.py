@@ -41,10 +41,13 @@ from deepspeed.accelerator import get_accelerator
 
 from arctic_platform.common.ray_cluster import primary_ip
 from arctic_platform.common.utils import combine_metric_microbatches
+from arctic_platform.common.utils import dp_sp_world_size
 from arctic_platform.common.utils import log_dp_shard_tokens
 from arctic_platform.common.utils import merge_dict_shards
+from arctic_platform.common.utils import sp_size_from_job_config
 from arctic_platform.common.utils import split_dict
 from arctic_platform.common.utils import unpack_batch
+from arctic_platform.common.utils.bf16_zero_norm import is_bf16_zero_norm_assert
 from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
@@ -115,6 +118,7 @@ class DeepSpeedWorker:
         self.master_addr = primary_ip()
         self.master_port = master_port
         self.engine = None
+        self.sp_size = 1
         self._weight_sender = None
         self._on_gpu = True
 
@@ -163,6 +167,7 @@ class DeepSpeedWorker:
         ds_worker_config = job_config.get("ds_worker_config") or {}
         ds_worker_config["world_size"] = self.world_size
         self.ds_worker_config = ds_worker_config
+        self.sp_size = sp_size_from_job_config(job_config)
 
         # Build the DeepSpeed config per job type. Training engines get an
         # optimizer; the reference/log-prob engine is forward-only and is
@@ -347,6 +352,8 @@ class DeepSpeedWorker:
     def _inject_sft_global_token_meta(self, loss_fn: str, batch_data, meta_data: dict) -> None:
         """All-reduce valid-target count into ``meta["global_num_tokens"]`` + ``dp_size``.
 
+        ``dp_size`` is ``world_size`` while shards stay disjoint. ``sp_size`` is
+        still validated against ``world_size``.
         Opt-in via ``SFT_GLOBAL_TOKEN_LOSS_FNS``. No-op when labels are absent.
         """
         from arctic_platform.sft.processor import SFT_GLOBAL_TOKEN_LOSS_FNS
@@ -365,6 +372,7 @@ class DeepSpeedWorker:
             torch.distributed.all_reduce(tok, op=torch.distributed.ReduceOp.SUM)
             global_tokens = int(tok.item())
         meta_data["global_num_tokens"] = global_tokens
+        dp_sp_world_size(self.world_size, self.sp_size)
         meta_data["dp_size"] = self.world_size
 
     def _forward_maybe_backward(self, batch: dict, backward: bool) -> dict:
@@ -399,7 +407,7 @@ class DeepSpeedWorker:
             log_dp_shard_tokens(self.rank, f"{tag} shard", batch_data, meta_data)
             pr0(f"[DeepSpeedWorker] {tag}: {batch_data.keys()=} {meta_data.keys()=} {processing.keys()=}")
             for k, v in batch_data.items():
-                pr0(f"[DeepSpeedWorker] {tag}: {k=}: {v.shape=}")
+                pr0(f"[DeepSpeedWorker] {tag}: {k=}: shape={getattr(v, 'shape', type(v).__name__)}")
 
         grad_accum_steps = self.engine.gradient_accumulation_steps()
         # H3: list-of-microbatches from the client skips concat→split_dict.
@@ -495,7 +503,7 @@ class DeepSpeedWorker:
 
             # DS requires matching steps for backward pass
             if backward and i < num_micro_batches - 1:
-                self.engine.step()
+                self._engine_step()
 
         pipeline_outputs = dict()
         for k, v in pipeline_micro_batch_outputs[0].items():
@@ -552,11 +560,31 @@ class DeepSpeedWorker:
         timers.stop_and_print_elapsed(tname)
         return results
 
+    def _is_bf16_zero_norm_assert(self, exc: BaseException) -> bool:
+        """True only for BF16_Optimizer's bare ``assert all_groups_norm > 0.``."""
+        return is_bf16_zero_norm_assert(exc, getattr(self.engine, "optimizer", None))
+
+    def _engine_step(self) -> None:
+        """``engine.step()`` with a skip for DeepSpeed BF16_Optimizer's zero-norm assert.
+
+        ZeRO-1/2 use ``BF16_Optimizer``, which asserts ``all_groups_norm > 0``.
+        GRPO can produce an all-zero grad batch (identical group rewards). ZeRO-3
+        does not assert; skip the optimizer update instead of crashing.
+        Only that BF16 assert is skipped; every other ``AssertionError`` re-raises.
+        """
+        try:
+            self.engine.step()
+        except AssertionError as err:
+            if self._is_bf16_zero_norm_assert(err):
+                pr0("[DeepSpeedWorker] skip optimizer.step: global grad norm is 0")
+                return
+            raise
+
     def step(self) -> dict:
         from arctic_platform import sft_profile
 
         with sft_profile.timed("step"):
-            self.engine.step()
+            self._engine_step()
             if sft_profile.enabled() and torch.cuda.is_available():
                 torch.cuda.synchronize()
         # Pull grad_norm out of DeepSpeed so it can be logged by the trainer.

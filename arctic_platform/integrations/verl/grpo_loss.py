@@ -436,7 +436,7 @@ def verl_grpo_loss(model_outputs: dict, batch: dict, meta: dict, config: dict, d
     # compute policy loss
     old_log_probs = batch["old_log_probs"]
     advantages = batch["advantages"]
-    rollout_is_weights = meta.get("rollout_is_weights", None)
+    rollout_is_weights = batch.get("rollout_is_weights")
 
     loss_agg_mode = verl_policy_config.loss_agg_mode
 
