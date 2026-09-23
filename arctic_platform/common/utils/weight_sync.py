@@ -203,6 +203,7 @@ async def ensure_weight_sync_contract(workers, pool, holder) -> dict[str, Any]:
         specs["descriptors"],
         WEIGHT_SYNC_POLICY,
         "base",
+        tie_word_embeddings=specs.get("tie_word_embeddings"),
     )
     return specs
 
