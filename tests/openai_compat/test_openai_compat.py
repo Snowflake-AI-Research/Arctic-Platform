@@ -342,8 +342,7 @@ class TestConcurrency:
         assert stub.max_in_flight <= 2
 
     def test_blocking_client_scales_past_the_default_executor(self, tokenizer):
-        # asyncio.to_thread() caps at min(32, cpu_count + 4), so a semaphore
-        # raised past that would report a concurrency the backend never reaches.
+        # 32 below is asyncio.to_thread()'s ceiling: min(32, cpu_count + 4).
         ceiling, count = 48, 64
         blocking = BlockingClient(delay_s=0.4)
         with serve(make_app(blocking, tokenizer, max_concurrency=ceiling)) as sdk:
@@ -352,9 +351,7 @@ class TestConcurrency:
         assert blocking.max_in_flight > 32, f"peaked at {blocking.max_in_flight}, the default-executor ceiling"
         assert blocking.max_in_flight <= ceiling
 
-    def test_prompt_arrays_are_not_dispatched_one_at_a_time(self, tokenizer):
-        # A prompt array is the one request shape where the sampler could batch;
-        # awaiting each in turn throws that away.
+    def test_prompt_arrays_dispatch_concurrently(self, tokenizer):
         stub = StubClient(delay_s=0.2)
         with http_client(make_app(stub, tokenizer, max_concurrency=8)) as http:
             body = {"model": MODEL, "prompt": [f"p{i}" for i in range(8)], "max_tokens": 4}
@@ -363,8 +360,7 @@ class TestConcurrency:
         assert stub.max_in_flight > 1, "prompts were dispatched serially"
 
     def test_async_backend_429_keeps_its_status_and_retry_after(self, tokenizer):
-        # aiohttp puts status/headers on the exception, not on a .response --
-        # the shape the async client actually raises.
+        # aiohttp's shape: status and headers on the exception, no .response.
         class AiohttpStyle(Exception):
             status = 429
             headers = {"Retry-After": "7"}
@@ -376,35 +372,27 @@ class TestConcurrency:
 
 
 class TestLogprobs:
-    # Two candidates per sampled token, deliberately not in rank order. One entry
-    # per token_id the stub returns, or the position lookup drops the whole block.
+    # Worst candidate first, so ranking is required rather than incidental, and
+    # one entry per token_id the stub returns or the lookup drops the block.
     CANDIDATES: Any = [
-        {1000: -0.1, 2000: -1.5},
-        {1001: -0.2, 2001: -0.9},
-        {1002: -0.3, 2002: -1.1},
-        {1003: -0.4, 2003: -1.7},
+        {2000: -1.5, 1000: -0.1},
+        {2001: -0.9, 1001: -0.2},
+        {2002: -1.1, 1002: -0.3},
+        {2003: -1.7, 1003: -0.4},
     ]
 
-    def test_requested_alternatives_are_returned(self, tokenizer):
+    @pytest.mark.parametrize("k", [1, 2])
+    def test_alternatives_are_ranked_and_truncated(self, tokenizer, k):
         stub = StubClient(logprobs=self.CANDIDATES)
         with serve(make_app(stub, tokenizer)) as sdk:
             out = sdk.chat.completions.create(
-                model=MODEL, messages=MESSAGES, max_tokens=4, logprobs=True, top_logprobs=2
+                model=MODEL, messages=MESSAGES, max_tokens=4, logprobs=True, top_logprobs=k
             )
         content = out.choices[0].logprobs.content
-        assert [len(entry.top_logprobs) for entry in content[:2]] == [2, 2]
-        # Most likely first, and the sampled token is among the alternatives.
-        first = content[0].top_logprobs
-        assert first[0].logprob >= first[1].logprob
-        assert content[0].logprob == pytest.approx(-0.1)
-
-    def test_alternatives_are_truncated_to_the_requested_count(self, tokenizer):
-        stub = StubClient(logprobs=self.CANDIDATES)
-        with serve(make_app(stub, tokenizer)) as sdk:
-            out = sdk.chat.completions.create(
-                model=MODEL, messages=MESSAGES, max_tokens=4, logprobs=True, top_logprobs=1
-            )
-        assert all(len(entry.top_logprobs) == 1 for entry in out.choices[0].logprobs.content[:2])
+        assert all(len(entry.top_logprobs) == k for entry in content)
+        # At k=1 that is the better candidate, not the one reported first.
+        assert [alt.logprob for alt in content[0].top_logprobs] == [-0.1, -1.5][:k]
+        assert content[0].logprob == pytest.approx(-0.1), "alternatives clobbered the sampled token"
 
     def test_legacy_completions_emit_token_to_logprob_maps(self, tokenizer):
         stub = StubClient(logprobs=self.CANDIDATES)

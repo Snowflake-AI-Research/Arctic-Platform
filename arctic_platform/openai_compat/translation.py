@@ -336,12 +336,7 @@ def _entry_logprob(entry: Any) -> float | None:
 
 
 def _alternatives(position: dict[Any, Any], tokenizer: Any, top_k: int) -> list[dict[str, Any]]:
-    """The candidates the sampler scored at this position, most likely first.
-
-    Asking for top_logprobs already widens the sampler's logprobs request, so the
-    candidates are on the wire either way; dropping them returns a 200 that is
-    missing exactly what was asked for.
-    """
+    """The candidates the sampler scored at this position, most likely first."""
     scored: list[tuple[int, float]] = []
     for key, entry in position.items():
         if key == "logprob":  # the sampled-token form, not a candidate map

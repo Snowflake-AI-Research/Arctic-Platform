@@ -66,17 +66,14 @@ class _State:
         self.api_key = api_key
         # Concurrent callers all land on one sampling job; the rest queue here,
         # where a request costs a coroutine rather than a slot.
-        self.max_concurrency = max(1, int(max_concurrency))
-        self.semaphore = asyncio.Semaphore(self.max_concurrency)
-        # A blocking client occupies a thread for the whole generation, polling
-        # included. asyncio.to_thread() would put those on the default executor,
-        # which caps at min(32, cpu_count + 4) -- so raising max_concurrency past
-        # 32 would raise the semaphore and nothing else. Own the pool instead, so
-        # the number means what it says. Async clients never touch it.
+        concurrency = max(1, int(max_concurrency))
+        self.semaphore = asyncio.Semaphore(concurrency)
+        self.is_async = inspect.iscoroutinefunction(getattr(client, "generate", None))
+        # A blocking generate holds its thread until the job answers, and the
+        # default executor asyncio.to_thread() would use caps at
+        # min(32, cpu_count + 4) regardless of the semaphore.
         self.executor = (
-            None
-            if inspect.iscoroutinefunction(getattr(client, "generate", None))
-            else ThreadPoolExecutor(max_workers=self.max_concurrency, thread_name_prefix="openai-compat")
+            None if self.is_async else ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="openai-compat")
         )
         self.created = int(time.time())
 
@@ -101,13 +98,9 @@ def _as_openai_error(exc: BaseException) -> OpenAIError:
     Retry-After, stock client retry policy absorbs it; relayed as a 500 it ends
     the caller's run.
     """
-    # requests carries status on .response; aiohttp's ClientResponseError carries
-    # it on the exception itself. Reading only the first shape turns the async
-    # client's 429 into a 502 and drops Retry-After, so the caller stops retrying.
+    # requests puts the status on .response; aiohttp puts it on the exception.
     response = getattr(exc, "response", None)
-    status = getattr(response, "status_code", None)
-    if status is None:
-        status = getattr(exc, "status", None)
+    status = getattr(response, "status_code", None) or getattr(exc, "status", None)
     headers = getattr(response, "headers", None) or getattr(exc, "headers", None) or {}
     if status == 429:
         retry_after = headers.get("Retry-After")
@@ -134,7 +127,7 @@ async def _generate(state: _State, prompt: str | list[int], params: dict[str, An
     async with state.semaphore:
         try:
             generate = state.client.generate
-            if inspect.iscoroutinefunction(generate):
+            if state.is_async:
                 results = await generate(prompts, params)
             else:
                 # Awaiting a blocking client on the event loop would stall every
@@ -247,10 +240,8 @@ async def completions(request: Request) -> dict[str, Any]:
         )
         pending.append(_generate(state, prompt, params, req.n))
 
-    # Awaiting each prompt before submitting the next serializes a batch that the
-    # sampler could have run together. gather keeps response order; the semaphore
-    # still bounds what is in flight. return_exceptions so a failure doesn't leave
-    # the surviving prompts running as orphans.
+    # gather keeps response order; the semaphore still bounds what is in flight.
+    # return_exceptions so one failure doesn't leave the rest running as orphans.
     settled = await asyncio.gather(*pending, return_exceptions=True)
     for outcome in settled:
         if isinstance(outcome, BaseException):
@@ -343,8 +334,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--config must set sampling_job_id: this serves an endpoint, it does not create one.")
 
     app = build_app(
-        # Async so a concurrent eval costs coroutines rather than one pooled
-        # thread per in-flight request.
+        # Async so an in-flight request costs a coroutine, not a pooled thread.
         client=AsyncArcticClient(config),
         tokenizer=AutoTokenizer.from_pretrained(config.model_name),
         model_name=args.served_model_name or config.model_name,
