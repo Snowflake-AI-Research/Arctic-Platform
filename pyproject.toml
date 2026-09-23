@@ -119,6 +119,7 @@ sft = [
     "fastapi",
     "liger-kernel>=0.8.0",
     "nvidia-ml-py",
+    "peft>=0.18,<0.20",
     "psutil",
     "ray",
     "tensordict",

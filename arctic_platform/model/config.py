@@ -76,6 +76,9 @@ class ModelSpec(BaseModel):
     )
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
     loader_options: dict = Field(default_factory=dict, description="JSON-only loader-specific extras.")
+    peft_config: dict | None = Field(
+        None, description="PEFT config applied after model patches, before the optimizer."
+    )
 
     @classmethod
     def from_ds_worker_config(cls, model_name: str, ds_worker_config: dict) -> "ModelSpec":
@@ -117,6 +120,7 @@ class ModelSpec(BaseModel):
             model_path_or_name=model_name,
             dtype="bfloat16",
             attn_implementation=cfg["attn_implementation"],
+            peft_config=cfg.get("peft_config"),
             patches=Patches(
                 liger=cfg.get("use_liger", False),
                 zorro_train=zorro_train_patch,
@@ -148,4 +152,6 @@ class ModelSpec(BaseModel):
         options_model = get_loader_options_model(self.loader)
         if options_model is not None:
             self.loader_options = options_model.model_validate(self.loader_options).model_dump()
+        if self.peft_config and self.loader == "qwen3_5_moe":
+            raise ValueError("qwen3_5_moe PEFT requires expert adapter integration, which is not yet supported")
         return self
