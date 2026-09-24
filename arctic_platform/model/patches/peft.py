@@ -12,22 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Build a torch model from a ModelSpec."""
+"""PEFT wrapping after model patches and before optimizer construction."""
 
 from __future__ import annotations
 
-from typing import Any
+import torch
+from torch import nn
 
-from arctic_platform.model.config import ModelSpec
-from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
-from arctic_platform.model.loader import select_loader
-from arctic_platform.model.patch import apply_patches
+from arctic_platform.model.patch import register_patch
+from arctic_platform.peft import apply_peft
 
 
-def build_model(spec: ModelSpec, parallel_groups: Any | None = None) -> LoadedModel:
-    """Run the spec's resolved loader, apply its patches, and return the result."""
-    ctx = LoaderContext(spec=spec, parallel_groups=parallel_groups)
-    loaded = select_loader(ctx)(ctx)
-    apply_patches(loaded, ctx)
-    return loaded
+@register_patch("peft")
+def apply_peft_patch(model: nn.Module, ctx: LoaderContext) -> nn.Module:
+    dtype = torch.bfloat16 if ctx.spec.dtype == "auto" else getattr(torch, ctx.spec.dtype)
+    return apply_peft(model, ctx.spec.patches.peft, optimization_dtype=dtype)

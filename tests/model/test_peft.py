@@ -29,8 +29,10 @@ from transformers import AutoModelForCausalLM
 from transformers import Qwen3Config
 from transformers import Qwen3ForCausalLM
 
+from arctic_platform.model import LoaderContext
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import Patches
+from arctic_platform.model import apply_patches
 from arctic_platform.model import apply_peft
 from arctic_platform.model import build_model
 from arctic_platform.peft import cast_lora_adapters_off_fp8
@@ -98,8 +100,7 @@ print('PEFT helpers imported without training dependencies')
             loader="huggingface",
             dtype=str(dtype).removeprefix("torch."),
             attn_implementation="eager",
-            patches=Patches(gradient_checkpointing=True),
-            peft_config=config,
+            patches=Patches(gradient_checkpointing=True, peft=config),
         )
         self.assertEqual(ModelSpec.model_validate_json(spec.model_dump_json()), spec)
 
@@ -130,7 +131,10 @@ print('PEFT helpers imported without training dependencies')
         expected = train(reference)
         set_seed(42)
         loaded = build_model(spec)
-        self.assertEqual(loaded.applied_patches, frozenset({"gradient_checkpointing"}))
+        self.assertEqual(loaded.applied_patches, frozenset({"gradient_checkpointing", "peft"}))
+        wrapped = loaded.model
+        apply_patches(loaded, LoaderContext(spec=spec))
+        self.assertIs(loaded.model, wrapped)
         actual = loaded.model.to(device)
         observed = train(actual)
         for (loss, norm), (expected_loss, expected_norm) in zip(observed, expected, strict=True):
@@ -205,9 +209,9 @@ def test_invalid_peft_type(config):
 def test_worker_bridge_forwards_peft():
     config = {"peft_type": "Lora", "target_modules": ["q_proj"]}
     spec = ModelSpec.from_ds_worker_config("unused", {"attn_implementation": "eager", "peft_config": config})
-    assert spec.peft_config == config
+    assert spec.patches.peft == config
 
 
 def test_custom_moe_peft_requires_expert_integration():
     with pytest.raises(ValueError, match="expert adapter integration"):
-        ModelSpec(model_path_or_name="unused", loader="qwen3_5_moe", peft_config={"peft_type": "Lora"})
+        ModelSpec(model_path_or_name="unused", loader="qwen3_5_moe", patches=Patches(peft={"peft_type": "Lora"}))

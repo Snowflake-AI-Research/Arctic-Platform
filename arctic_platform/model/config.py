@@ -56,6 +56,7 @@ class Patches(BaseModel):
     liger: bool = Field(False, description="Apply Liger kernels.")
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
     gradient_checkpointing: bool = Field(False, description="HF gradient checkpointing.")
+    peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
 
 
 class ModelSpec(BaseModel):
@@ -76,9 +77,6 @@ class ModelSpec(BaseModel):
     )
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
     loader_options: dict = Field(default_factory=dict, description="JSON-only loader-specific extras.")
-    peft_config: dict | None = Field(
-        None, description="PEFT config applied after model patches, before the optimizer."
-    )
 
     @classmethod
     def from_ds_worker_config(cls, model_name: str, ds_worker_config: dict) -> "ModelSpec":
@@ -120,11 +118,11 @@ class ModelSpec(BaseModel):
             model_path_or_name=model_name,
             dtype="bfloat16",
             attn_implementation=cfg["attn_implementation"],
-            peft_config=cfg.get("peft_config"),
             patches=Patches(
                 liger=cfg.get("use_liger", False),
                 zorro_train=zorro_train_patch,
                 gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
+                peft=cfg.get("peft_config"),
             ),
         )
 
@@ -152,6 +150,6 @@ class ModelSpec(BaseModel):
         options_model = get_loader_options_model(self.loader)
         if options_model is not None:
             self.loader_options = options_model.model_validate(self.loader_options).model_dump()
-        if self.peft_config and self.loader == "qwen3_5_moe":
+        if self.patches.peft and self.loader == "qwen3_5_moe":
             raise ValueError("qwen3_5_moe PEFT requires expert adapter integration, which is not yet supported")
         return self
