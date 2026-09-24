@@ -23,6 +23,8 @@ from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
 
+from arctic_platform.peft import validate_peft_config
+
 
 class ParallelismConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
@@ -57,6 +59,8 @@ class Patches(BaseModel):
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
     gradient_checkpointing: bool = Field(False, description="HF gradient checkpointing.")
     peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
+
+    _validate_peft = field_validator("peft")(validate_peft_config)
 
 
 class ModelSpec(BaseModel):

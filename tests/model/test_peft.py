@@ -21,6 +21,7 @@ import sys
 
 import pytest
 import torch
+from peft import IA3Config
 from peft import LoraConfig
 from peft import PeftModel
 from peft import get_peft_model
@@ -36,6 +37,7 @@ from arctic_platform.model import apply_patches
 from arctic_platform.model import apply_peft
 from arctic_platform.model import build_model
 from arctic_platform.peft import cast_lora_adapters_off_fp8
+from arctic_platform.peft import cast_trainable_params_off_fp8
 from arctic_platform.peft import is_peft_lora_param
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
@@ -88,7 +90,7 @@ print('PEFT helpers imported without training dependencies')
         set_seed(41)
         _tiny_qwen().to(dtype=dtype).save_pretrained(base_dir)
         config = {
-            "peft_type": "Lora",
+            "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
             "r": 4,
             "lora_alpha": 8,
@@ -191,7 +193,59 @@ print('PEFT helpers imported without training dependencies')
     def test_disabled_peft_preserves_model(self):
         model = nn.Linear(2, 2)
         self.assertIs(apply_peft(model, None), model)
-        self.assertIs(apply_peft(model, {}), model)
+
+    def test_serialized_lora_config(self):
+        config = LoraConfig(target_modules=["q_proj", "v_proj"], r=4).to_dict()
+        expected = copy.deepcopy(config)
+        model = apply_peft(_tiny_qwen(), config)
+        self.assertIsInstance(model.peft_config["default"], LoraConfig)
+        self.assertEqual(config, expected)
+        self.assertTrue(any("lora_A" in name for name, _ in model.named_parameters()))
+
+    def test_fp8_casts_all_trainables_and_preserves_aliases(self):
+        model = nn.Module()
+        model.proj = nn.Linear(16, 16)
+        model.head = nn.Linear(16, 16)
+        model.requires_grad_(False)
+        model.to(dtype=torch.float8_e4m3fn)
+        base = model.proj.weight
+        original = base.detach().view(torch.uint8).clone()
+        model = apply_peft(
+            model,
+            {"peft_type": "LORA", "target_modules": ["proj"], "modules_to_save": ["head"], "bias": "all"},
+        )
+        trainables = {name: param for name, param in model.named_parameters() if param.requires_grad}
+        self.assertTrue(any("modules_to_save" in n for n in trainables))
+        self.assertTrue(any("base_layer.bias" in n for n in trainables))
+        for param in trainables.values():
+            self.assertEqual(param.dtype, torch.bfloat16)
+        self.assertFalse(base.requires_grad)
+        self.assertEqual(base.dtype, torch.float8_e4m3fn)
+        torch_assert_equal(base.view(torch.uint8), original)
+        optimizer = torch.optim.AdamW(trainables.values(), lr=0.01)
+        sum(param.float().sum() for param in trainables.values()).backward()
+        optimizer.step()
+        torch_assert_equal(base.view(torch.uint8), original)
+
+        tied = nn.Module()
+        tied.left = nn.Linear(2, 2, bias=False)
+        tied.right = nn.Linear(2, 2, bias=False)
+        tied.left.weight = nn.Parameter(tied.left.weight.to(torch.float8_e4m3fn))
+        tied.right.weight = tied.left.weight
+        parameter = tied.left.weight
+        self.assertEqual(cast_trainable_params_off_fp8(tied), 1)
+        self.assertIs(tied.left.weight, parameter)
+        self.assertIs(tied.right.weight, parameter)
+
+    def test_fp8_ia3_trainables(self):
+        model = nn.Module()
+        model.proj = nn.Linear(16, 16, bias=False)
+        model.requires_grad_(False)
+        model.to(dtype=torch.float8_e4m3fn)
+        model = apply_peft(model, IA3Config(target_modules=["proj"], feedforward_modules=["proj"]).to_dict())
+        trainables = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        self.assertTrue(trainables)
+        self.assertTrue(all("ia3_" in n and p.dtype == torch.bfloat16 for n, p in trainables))
 
     def test_peft_does_not_mutate_config(self):
         config = {"peft_type": "Lora", "target_modules": ["q_proj"], "r": 4}
@@ -200,10 +254,15 @@ print('PEFT helpers imported without training dependencies')
         self.assertEqual(config, expected)
 
 
-@pytest.mark.parametrize("config", [{"r": 4}, {"peft_type": "Missing"}, {"peft_type": 5}])
+@pytest.mark.parametrize("config", [{}, {"r": 4}, {"peft_type": "Missing"}, {"peft_type": 5}])
 def test_invalid_peft_type(config):
     with pytest.raises(ValueError, match="PEFT type|peft_type"):
         apply_peft(nn.Linear(2, 2), config)
+
+
+def test_empty_patch_cannot_enable_dense_training():
+    with pytest.raises(ValueError, match="peft_type"):
+        Patches(peft={})
 
 
 def test_worker_bridge_forwards_peft():

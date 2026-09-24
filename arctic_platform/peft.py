@@ -39,29 +39,44 @@ def is_peft_lora_param(name: str, param: Any) -> bool:
     return bool(getattr(param, "requires_grad", False)) and (".lora_A." in name or ".lora_B." in name)
 
 
-def cast_lora_adapters_off_fp8(model: nn.Module, dtype: torch.dtype | None = None) -> int:
-    """Keep LoRA A/B in the optimization dtype while preserving frozen FP8 weights."""
+def cast_trainable_params_off_fp8(model: nn.Module, dtype: torch.dtype | None = None) -> int:
+    """Cast trainables before optimizer construction, preserving frozen FP8 weights and parameter ties."""
     import torch
-    from torch import nn
 
     dtype = torch.bfloat16 if dtype is None else dtype
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("FP8 PEFT optimization_dtype must be float16, bfloat16, or float32")
     count = 0
-    for name, param in list(model.named_parameters()):
-        if not is_peft_lora_param(name, param) or param.dtype == dtype:
+    for _, param in model.named_parameters():
+        if not param.requires_grad or param.dtype == dtype:
             continue
-        parts = name.split(".")
-        module = model
-        for part in parts[:-1]:
-            module = getattr(module, part)
-        setattr(module, parts[-1], nn.Parameter(param.detach().to(dtype=dtype), requires_grad=param.requires_grad))
+        param.data = param.data.to(dtype=dtype)
         count += 1
     return count
 
 
+def cast_lora_adapters_off_fp8(model: nn.Module, dtype: torch.dtype | None = None) -> int:
+    """Compatibility entry point; includes trainable biases, modules_to_save and other adapter types."""
+    return cast_trainable_params_off_fp8(model, dtype)
+
+
+def validate_peft_config(peft_config: dict[str, Any] | None) -> dict[str, Any] | None:
+    """None disables PEFT; a supplied config must name its adapter type."""
+    if peft_config is not None:
+        if not isinstance(peft_config, dict):
+            raise ValueError("peft_config must be a dict or None")
+        peft_type = peft_config.get("peft_type")
+        if not isinstance(peft_type, str) or not peft_type.strip():
+            raise ValueError("peft_config.peft_type must be a non-empty string; use None to disable PEFT")
+    return peft_config
+
+
 def _resolve_peft_config_class(peft_module: Any, peft_config: dict[str, Any]) -> Any:
+    validate_peft_config(peft_config)
     peft_type = peft_config.get("peft_type")
-    if not isinstance(peft_type, str) or not peft_type:
-        raise ValueError("peft_config.peft_type must be a non-empty string")
+    registry = getattr(peft_module, "PEFT_TYPE_TO_CONFIG_MAPPING", {})
+    if peft_type in registry:
+        return registry[peft_type]
     config_class_name = f"{peft_type}Config"
     if not hasattr(peft_module, config_class_name):
         raise ValueError(f"Unsupported PEFT type {peft_type!r}: peft.{config_class_name} is not available")
@@ -76,12 +91,13 @@ def apply_peft(
 ) -> nn.Module:
     """Wrap a model with PEFT and enable backward through frozen input embeddings.
 
-    ``peft_type`` names a PEFT config class without the ``Config`` suffix (e.g.
-    ``Lora``). FP8 bases disable PEFT's adapter autocast and cast trainable A/B
+    ``peft_type`` accepts PEFT's canonical registry names (e.g. ``LORA``) and
+    legacy config-class names (e.g. ``Lora``). FP8 bases disable PEFT's adapter autocast and cast all trainable
     tensors to ``optimization_dtype`` (default bf16) before optimizer flat buffers are built.
     Model-specific expert tagging and tiled-forward hooks belong to the caller.
     """
-    if not peft_config:
+    validate_peft_config(peft_config)
+    if peft_config is None:
         return model
 
     import peft
@@ -89,7 +105,7 @@ def apply_peft(
     config = _resolve_peft_config_class(peft, peft_config)(**peft_config)
     if model_has_fp8_weights(model):
         model = peft.get_peft_model(model, config, autocast_adapter_dtype=False)
-        cast_lora_adapters_off_fp8(model, optimization_dtype)
+        cast_trainable_params_off_fp8(model, optimization_dtype)
     else:
         model = peft.get_peft_model(model, config)
     if hasattr(model, "enable_input_require_grads"):
