@@ -23,7 +23,7 @@ from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
 
-from arctic_platform._peft_config import validate_peft_config
+from arctic_platform.common.config import validate_peft_config
 
 
 class ParallelismConfig(BaseModel):

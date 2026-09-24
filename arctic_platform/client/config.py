@@ -43,7 +43,7 @@ from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
-from arctic_platform._peft_config import validate_peft_config
+from arctic_platform.common.config import validate_peft_config
 
 JobId = int | str
 

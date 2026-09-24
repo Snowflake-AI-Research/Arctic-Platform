@@ -21,7 +21,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from arctic_platform._peft_config import validate_peft_config
+from arctic_platform.common.config import validate_peft_config
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patch import register_patch
 

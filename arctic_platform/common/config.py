@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PEFT config validation shared by clients and model patches."""
+"""Shared configuration validation for clients and model code."""
 
 from __future__ import annotations
 
