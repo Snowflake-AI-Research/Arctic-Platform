@@ -28,11 +28,14 @@ cap opt-in via ``kl_clamp_max``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Optional
 
 import torch
 
 from .functional import agg_loss
+from .packed_reduction import PackedLossReduction
+from .packed_reduction import additive_packed_loss_reduction
 from .pipeline import register_loss_fn
 
 _DEFAULT_DELTA_CLAMP = 20.0
@@ -120,19 +123,47 @@ def apply_opd_global_token_config(
     meta_data["global_batch_size"] = int(global_batch_size)
 
 
-def _resolve_distill_norm(config: dict, meta: dict) -> tuple[int, Optional[int], Optional[int]]:
-    """``(dp_size, batch_num_tokens, global_batch_size)`` from config, then meta."""
+def _resolve_distill_norm(config: dict, meta: dict) -> tuple[int, int, Optional[int]]:
+    """``(dp_size, batch_num_tokens, global_batch_size)`` from config, then meta.
+
+    Missing global-token fields used to default to a local mean. Packed
+    additive reduction would then scale the step loss by the microbatch count.
+    """
     meta = meta if isinstance(meta, dict) else {}
-    dp_size = int(config.get("dp_size") or meta.get("dp_size") or 1)
+    dp_size = _positive_int(config.get("dp_size")) or _positive_int(meta.get("dp_size"))
+    if dp_size is None:
+        raise ValueError("on_policy_distill requires dp_size on processing['config'] or meta")
     batch_num_tokens = _positive_int(config.get("batch_num_tokens"))
     if batch_num_tokens is None:
         batch_num_tokens = _positive_int(meta.get("batch_num_tokens"))
     if batch_num_tokens is None:
         batch_num_tokens = _positive_int(meta.get("global_num_tokens"))
+    if batch_num_tokens is None:
+        raise ValueError(
+            "on_policy_distill requires batch_num_tokens (or global_num_tokens) on processing['config'] or meta"
+        )
     global_batch_size = _positive_int(config.get("global_batch_size"))
     if global_batch_size is None:
         global_batch_size = _positive_int(meta.get("global_batch_size"))
     return dp_size, batch_num_tokens, global_batch_size
+
+
+def _opd_packed_loss_reduction(
+    microbatches: Sequence[dict],
+    config: dict,
+    loss_fn_name: str,
+) -> PackedLossReduction:
+    """OPD losses are already ``sum(kl)/T_global * dp_size``; sum packed mbs."""
+    del loss_fn_name
+    weights = []
+    for index, microbatch in enumerate(microbatches):
+        mask = microbatch.get("loss_mask")
+        if not torch.is_tensor(mask):
+            raise ValueError(f"on_policy_distill packed microbatch {index} requires tensor loss_mask")
+        weights.append(float(mask.count_nonzero().item()))
+    if config.get("batch_num_tokens") is None or config.get("dp_size") is None:
+        raise ValueError("on_policy_distill packed reduction requires global token scales")
+    return additive_packed_loss_reduction(weights)
 
 
 def _distill_kl_per_token(
@@ -216,7 +247,30 @@ def _student_logprobs(model_outputs: dict, batch: dict) -> torch.Tensor:
     return torch.log_softmax(logits.float(), dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
 
 
-@register_loss_fn("on_policy_distill")
+_OPD_SUMMED_METRICS = (
+    "loss.sum",
+    "loss.tokens",
+    "distill_kl.sum",
+    "distill_kl.tokens",
+    "distill_kl_sum",
+    "distill_kl_count",
+    "distill_k1_sum",
+    "distill_abs_delta_sum",
+    "teacher_logprob_sum",
+    "student_logprob_sum",
+    "sampler_train_kl_sum",
+    "sampler_train_abs_delta_sum",
+    "distill_delta_clamped_count",
+    "distill_kl_output_clamped_count",
+    "loss_term_distill",
+)
+
+
+@register_loss_fn(
+    "on_policy_distill",
+    packed_loss_reduction=_opd_packed_loss_reduction,
+    summed_metrics=_OPD_SUMMED_METRICS,
+)
 def on_policy_distill_loss(
     model_outputs: dict,
     batch: dict,
@@ -239,7 +293,7 @@ def on_policy_distill_loss(
 
     logprobs = _student_logprobs(model_outputs, batch)
     if not torch.isfinite(logprobs).all():
-        logprobs = torch.nan_to_num(logprobs, nan=0.0, posinf=0.0, neginf=0.0)
+        raise ValueError("on_policy_distill student logprobs contain non-finite values")
 
     teacher_logprobs = _require_batch_tensor(
         batch,
@@ -302,18 +356,17 @@ def on_policy_distill_loss(
     loss = kl_coef * loss
 
     mask_count = float(loss_mask.count_nonzero().item())
-    masked_kl_mean = _masked_sum(per_token_kl, loss_mask) / max(mask_count, 1.0)
     masked_k1_mean = _masked_sum(-delta, loss_mask) / max(mask_count, 1.0)
     kl_sum = _masked_sum(per_token_kl, loss_mask)
+    # Packed combiner forbids a rate key alongside ``{name}.sum``. Keep the
+    # paired accumulators and suffix-sum diagnostics; drop colliding means.
     metrics = {
-        "loss": float(loss.detach().cpu()),
         "loss.sum": kl_coef * kl_sum,
         "loss.tokens": mask_count,
-        "distill_kl": masked_kl_mean,
         "distill_kl.sum": kl_sum,
         "distill_kl.tokens": mask_count,
         "distill_k1": masked_k1_mean,
-        "distill_kl_sum": _masked_sum(per_token_kl, loss_mask),
+        "distill_kl_sum": kl_sum,
         "distill_kl_count": mask_count,
         "distill_k1_sum": _masked_sum(-delta, loss_mask),
         "distill_abs_delta_sum": _masked_sum(delta.abs(), loss_mask),
@@ -331,7 +384,7 @@ def on_policy_distill_loss(
         "distill_delta_clamp": delta_clamp,
         "distill_estimator_is_k3": float(estimator in _ESTIMATORS_K3),
         "distill_dp_size": float(dp_size),
-        "distill_batch_num_tokens": float(batch_num_tokens if batch_num_tokens is not None else mask_count),
+        "distill_batch_num_tokens": float(batch_num_tokens),
     }
 
     sampler_logprobs = batch.get("old_log_probs_shifted")
@@ -347,9 +400,5 @@ def on_policy_distill_loss(
             )
             metrics["sampler_train_abs_delta_sum"] = _masked_sum(sampler_delta.abs(), loss_mask)
             metrics["sampler_train_abs_delta_max"] = _masked_max(sampler_delta.abs(), loss_mask)
-            abs_delta = sampler_delta.abs()[loss_mask.bool()]
-            metrics["sampler_train_abs_delta_mean"] = (
-                float(abs_delta.mean().item()) if abs_delta.numel() else 0.0
-            )
 
     return loss, metrics

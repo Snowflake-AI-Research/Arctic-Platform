@@ -42,7 +42,10 @@ def _make_call(
     }
     if extra_batch:
         batch.update(extra_batch)
-    return {"logprobs": student}, batch, {}, dict(config or {})
+    config = dict(config or {})
+    config.setdefault("dp_size", 1)
+    config.setdefault("batch_num_tokens", int(loss_mask.count_nonzero().item()))
+    return {"logprobs": student}, batch, {}, config
 
 
 def _run(**kwargs):
@@ -63,6 +66,7 @@ def test_equal_logprobs_have_zero_loss():
     logprobs = torch.tensor([[-1.0, -2.0]], requires_grad=True)
     loss, metrics = _loss(logprobs, logprobs.detach().clone(), torch.ones_like(logprobs, dtype=torch.bool))
     assert loss.item() == 0.0
+    assert metrics["distill_kl.tokens"] == 2.0
     assert metrics["distill_kl_count"] == 2.0
     assert metrics["distill_k1"] == 0.0
     assert metrics["distill_kl_max"] == 0.0
@@ -78,7 +82,10 @@ def test_k1_metric_is_masked_mean_logprob_gap():
 
 
 def test_loss_is_registered():
+    from arctic_platform.common.registry import PUBLIC_LOSS_FNS
+
     assert LOSS_FNS["on_policy_distill"] is on_policy_distill_loss
+    assert "on_policy_distill" in PUBLIC_LOSS_FNS
 
 
 def test_masked_values_do_not_change_loss():
@@ -112,7 +119,7 @@ def test_kl_coefficient_scales_loss():
         {"logprobs": student},
         {"teacher_log_probs_shifted": teacher, "loss_mask": mask},
         {},
-        {"distill_estimator": "low_var_kl", "kl_coef": 2.0},
+        {"distill_estimator": "low_var_kl", "kl_coef": 2.0, "dp_size": 1, "batch_num_tokens": 1},
         "cpu",
     )
     torch.testing.assert_close(doubled, 2 * base)
@@ -129,9 +136,7 @@ def test_shape_mismatch_and_empty_mask_fail():
 def test_k3_is_non_negative_over_a_wide_delta_range():
     delta = torch.linspace(-15.0, 15.0, 601)
     student = torch.zeros_like(delta)
-    per_token, _ = _distill_kl_per_token(
-        student, delta, estimator="low_var_kl", delta_clamp=_DEFAULT_DELTA_CLAMP
-    )
+    per_token, _ = _distill_kl_per_token(student, delta, estimator="low_var_kl", delta_clamp=_DEFAULT_DELTA_CLAMP)
     assert bool((per_token >= 0.0).all())
 
 
@@ -324,7 +329,7 @@ def test_logits_fallback_when_no_logprobs_post_processor():
             "loss_mask": torch.ones(B, S, dtype=torch.bool),
         },
         {},
-        {},
+        {"dp_size": 1, "batch_num_tokens": B * S},
         "cpu",
     )
     assert loss.item() == pytest.approx(0.0, abs=1e-6)
@@ -376,13 +381,9 @@ def test_global_token_norm_downweights_short_microbatch():
 def test_meta_supplies_norm_when_config_omits_it():
     student = torch.full((1, 2), -2.0, requires_grad=True)
     teacher = torch.full((1, 2), -1.0)
-    model_outputs, batch, _, config = _make_call(student=student, teacher=teacher)
-    via_config, _ = on_policy_distill_loss(
-        model_outputs, batch, {}, {**config, "dp_size": 4, "batch_num_tokens": 20}, "cpu"
-    )
-    via_meta, _ = on_policy_distill_loss(
-        model_outputs, batch, {"dp_size": 4, "batch_num_tokens": 20}, config, "cpu"
-    )
+    model_outputs, batch, _, _ = _make_call(student=student, teacher=teacher)
+    via_config, _ = on_policy_distill_loss(model_outputs, batch, {}, {"dp_size": 4, "batch_num_tokens": 20}, "cpu")
+    via_meta, _ = on_policy_distill_loss(model_outputs, batch, {"dp_size": 4, "batch_num_tokens": 20}, {}, "cpu")
     assert via_meta.item() == pytest.approx(via_config.item(), rel=1e-9)
 
 
@@ -394,11 +395,51 @@ def test_apply_opd_global_token_config_writes_config_and_meta():
     tokens, seqs = count_opd_loss_tokens({"loss_mask": mask})
     processing = {"config": {"distill_estimator": "low_var_kl"}}
     meta: dict = {}
-    apply_opd_global_token_config(
-        processing, meta, dp_size=8, batch_num_tokens=tokens, global_batch_size=seqs
-    )
+    apply_opd_global_token_config(processing, meta, dp_size=8, batch_num_tokens=tokens, global_batch_size=seqs)
     assert processing["config"]["dp_size"] == 8
     assert processing["config"]["batch_num_tokens"] == 4
     assert processing["config"]["global_batch_size"] == 2
     assert meta["batch_num_tokens"] == 4
     assert meta["dp_size"] == 8
+
+
+def test_missing_global_token_norm_raises():
+    student = torch.full((1, 2), -2.0)
+    teacher = torch.full((1, 2), -1.0)
+    with pytest.raises(ValueError, match="batch_num_tokens"):
+        on_policy_distill_loss(
+            {"logprobs": student},
+            {"teacher_log_probs_shifted": teacher, "loss_mask": torch.ones(1, 2, dtype=torch.bool)},
+            {},
+            {"dp_size": 1},
+            "cpu",
+        )
+
+
+def test_nonfinite_student_logprobs_raise():
+    student = torch.tensor([[-1.0, float("nan")]])
+    teacher = torch.tensor([[-1.0, -2.0]])
+    with pytest.raises(ValueError, match="non-finite"):
+        _run(student=student, teacher=teacher)
+
+
+def test_opd_declares_packed_reduction():
+    from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
+    from arctic_platform.rl.processors.packed_reduction import PackedLossReduction
+
+    resolver = getattr(on_policy_distill_loss, PACKED_LOSS_REDUCTION_ATTR)
+    reduction = resolver(
+        [{"loss_mask": torch.ones(1, 3), "batch_num_tokens": 3, "dp_size": 1}],
+        {"batch_num_tokens": 3, "dp_size": 1},
+        "on_policy_distill",
+    )
+    assert isinstance(reduction, PackedLossReduction)
+    assert reduction.loss_is_additive is True
+
+
+def test_opd_packed_reduction_requires_global_scales():
+    from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
+
+    resolver = getattr(on_policy_distill_loss, PACKED_LOSS_REDUCTION_ATTR)
+    with pytest.raises(ValueError, match="global token scales"):
+        resolver([{"loss_mask": torch.ones(1, 3)}], {}, "on_policy_distill")

@@ -20,11 +20,11 @@ and looked up at runtime from the ``processing`` dict embedded in each batch.
 
 Phases
 ------
-- **Post-forward** ``(model_outputs, meta, device) -> dict``
+- **Post-forward** ``(model_outputs, batch, meta, device) -> dict``
   Return a dict of *new* keys to add to model_outputs (e.g. logprobs from logits).
   Do NOT return the full model_outputs — only what the processor computed.
   This keeps the wire response compact (no raw logits sent over HTTP).
-- **Loss function** ``(model_outputs, meta, device) -> (loss, metrics)``
+- **Loss function** ``(model_outputs, batch, meta, config, device) -> (loss, metrics)``
   Compute a scalar loss and an arbitrary metrics dict.
 
 Batch layout
@@ -62,6 +62,7 @@ from arctic_platform.common.registry import POST_PROCESSORS
 from arctic_platform.common.registry import _resolve_fn
 from arctic_platform.common.registry import register_loss_fn  # noqa: F401  # re-exported
 from arctic_platform.common.registry import register_post_processor
+from arctic_platform.common.utils.batch import BATCH_DIM_CONTEXT_KEYS
 from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
 from arctic_platform.rl.utils.batch import detensorize
 from arctic_platform.rl.utils.batch import log_dp_shard_tokens
@@ -70,6 +71,11 @@ from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.debug import see_memory_usage
 
 from .microbatch import DEFAULT_MAX_TOKENS_PER_MB
+from .packed_reduction import apply_packed_loss_reduction
+from .packed_reduction import combine_packed_losses
+from .packed_reduction import combine_packed_metrics
+from .packed_reduction import metric_is_summed  # noqa: F401  # re-exported
+from .packed_reduction import resolve_packed_loss_reduction
 from .packing import derive_varlen_model_kwargs
 from .packing import model_reads_varlen_kwargs
 from .packing import packing_boundaries_from_attention_mask
@@ -80,6 +86,78 @@ try:
     FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = True
 except ImportError:
     FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
+
+# Model-forward keys only. Loss tensors live in batch/meta and must not reach engine().
+# Posts and losses still receive the full batch/meta dicts.
+_ENGINE_FWD_KEYS = frozenset(
+    {
+        "input_ids",
+        "position_ids",
+        "attention_mask",
+        "use_cache",
+        "labels",
+        "inputs_embeds",
+        "past_key_values",
+        "logits_to_keep",
+        "temperature",
+        "action_masks",
+        "routed_experts",
+        "pixel_values",
+        "image_grid_thw",
+        "dss_compute_logprobs",
+        "calculate_entropy",
+        # Packed/varlen flash-attn aliases (``cu_seqlens`` itself stays blocked).
+        "cu_seq_lens_q",
+        "cu_seq_lens_k",
+        "max_length_q",
+        "max_length_k",
+        "seq_idx",
+    }
+)
+# Blocked even if listed in ``fwd_meta_keys``. ``labels`` stays on the allowlist
+# because the model may consume it. ``cu_seqlens`` cannot be re-enabled this way;
+# varlen forwards use the packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` aliases.
+_ENGINE_FWD_BLOCKED_KEYS = (
+    BATCH_DIM_CONTEXT_KEYS
+    | {
+        "actor_config",
+        "dp_size",
+        "batch_num_tokens",
+        "global_batch_size",
+        "fwd_meta_keys",
+        "pad_token_id",
+        "max_prompt_len",
+        "cu_seqlens",
+        "sequence_offsets",
+        "response_lens",
+        "prompts",
+        "processing",
+    }
+) - _ENGINE_FWD_KEYS
+
+
+def _engine_forward_kwargs(batch: dict, meta: dict) -> dict:
+    """Cortex-style isolation: engine sees model inputs, not advantages / masks.
+
+    Default allowlist is ``_ENGINE_FWD_KEYS``. ``meta['fwd_meta_keys']`` may add
+    extra keys; blocked loss / scale keys never reach ``engine()``.
+    """
+    extra = meta.get("fwd_meta_keys")
+    if extra is None:
+        extra = ()
+    elif isinstance(extra, str):
+        extra = (extra,)
+    allowed = set(_ENGINE_FWD_KEYS)
+    allowed.update(extra)
+    allowed -= _ENGINE_FWD_BLOCKED_KEYS
+    kwargs = {}
+    for key in allowed:
+        if key in batch:
+            kwargs[key] = batch[key]
+        elif key in meta:
+            kwargs[key] = meta[key]
+    return kwargs
+
 
 # PROFILER_TYPE = "c"
 # PROFILER_TYPE = "torch"
@@ -234,17 +312,6 @@ def _merge_varlen_model_kwargs(engine, batch: dict) -> dict:
     return batch
 
 
-# Hugging Face Qwen3.5 GDN remaps ``cu_seq_lens_q`` → ``cu_seqlens=`` for
-# ``torch_chunk_gated_delta_rule``. Passing both raises TypeError.
-_ENGINE_FWD_SKIP = frozenset({"cu_seqlens"})
-
-
-def _engine_forward_kwargs(batch: dict, meta: dict) -> dict:
-    """Kwargs for ``engine()``: same merge as ``**batch, **meta``, minus loss-only keys."""
-    merged = {**batch, **meta}
-    return {k: v for k, v in merged.items() if k not in _ENGINE_FWD_SKIP}
-
-
 def _unwrap_engine_module(engine) -> Any:
     module = getattr(engine, "module", engine)
     return getattr(module, "module", module)
@@ -308,7 +375,7 @@ def run_pipeline(
     processing: dict,
     device: str,
     *,
-    backward: bool = True,
+    backward: bool | str = True,
     pack: bool = True,
     max_tokens_per_mb: int = DEFAULT_MAX_TOKENS_PER_MB,
     return_tensors: bool = False,
@@ -388,7 +455,7 @@ def run_pipeline(
     tname_e2e = timers.start(f"run_pipeline e2e {engine.global_rank}")
     see_memory_usage("before fwd", force=True)
     post_names = processing.get("post", [])
-    loss_fn_name = processing.get("loss_fn", "grpo")
+    loss_fn_name = processing.get("loss_fn", "ap_grpo")
     config = processing.get("config", {})
 
     # Skip entropy computation when it cannot affect the loss (entropy_coeff == 0).
@@ -412,24 +479,29 @@ def run_pipeline(
                 meta = {**meta, "calculate_entropy": False}
 
     # --- forward ---
-    # this is a future feature to avoid conflicts between `meta_data` and` model's `kwargs`, where the client could specify which meta_data keys to pass to the ending
-    # if 'fwd_meta_keys' in meta_data:
-    #     fwd_meta_data = {k:v for k,v in meta_data if k in fwd_meta_keys}
-    # else:
-    #     fwd_meta_data = meta_data
-    # outputs = engine(*args, **kwargs, **fwd_meta_data)
+    # Isolation: ``_engine_forward_kwargs`` allowlists model inputs. Optional
+    # ``meta['fwd_meta_keys']`` may add keys; blocked loss tensors never pass.
 
     pack_with_unpad = True  # XXX: make configurable?
-
-    # XXX: could the zorro parts be folded back into the model? this will also change when we start packing on the client side
-    zorro_train_enable = meta.get("zorro_train_enable", False)
+    # Inner packing / pack_for_dss already flattened sequences. Unpad expects
+    # attention_mask / prompts that those packed batches omit.
     already_packed = batch.get("cu_seqlens") is not None or (
         isinstance(meta, dict) and meta.get("cu_seqlens") is not None
     )
+    if already_packed:
+        pack_with_unpad = False
+
+    # XXX: could the zorro parts be folded back into the model? this will also change when we start packing on the client side
+    zorro_train_enable = meta.get("zorro_train_enable", False)
     did_unpad = False
     # pr0(f"{zorro_train_enable=}")
 
-    if not already_packed and (pack_with_unpad or zorro_train_enable):
+    if (
+        not already_packed
+        and (pack_with_unpad or zorro_train_enable)
+        and "attention_mask" in batch
+        and "prompts" in batch
+    ):
         batch = compute_packing_info_for_batch(batch)
 
     if zorro_train_enable:
@@ -468,7 +540,9 @@ def run_pipeline(
     prof_fwd = ProfilerContext(type=PROFILER_TYPE, name="FWD")
     tname = timers.start(f"pipe fwd {engine.global_rank}")
     with prof_fwd():
-        # passing **meta to the model since optimizations like zorro living in the model need to receive flags like calculate_entropy from the client
+        # Isolation: only model-bound keys reach engine(). Zorro reads
+        # calculate_entropy; loss tensors stay on batch/meta for posts/losses.
+        # Chunked/fp32 LM head still needs labels + temperature when present.
         fwd_kwargs = _maybe_add_chunked_lm_head_kwargs(engine, _engine_forward_kwargs(batch, meta))
         if backward is False:
             engine.eval()
@@ -490,16 +564,20 @@ def run_pipeline(
     prof_post_fwd = ProfilerContext(type=PROFILER_TYPE, name="POST-FWD")
     tname = timers.start(f"pipe post-fwd {engine.global_rank}")
     post_process_outputs = dict()
+    # Later posts in this call may read earlier posts' outputs. Copy so the
+    # worker's shared GAS ``meta`` is not mutated.
+    post_meta = {**meta}
     with prof_post_fwd():
         for name in post_names:
             # tname_post = timers.start(f"pipe post-fwd [{name}]")
             fn = _resolve_fn(POST_PROCESSORS, name)
-            post_process_outputs.update(**fn(model_outputs, batch, meta, device))
+            step_outputs = fn(model_outputs, batch, post_meta, device)
+            post_process_outputs.update(**step_outputs)
+            post_meta.update(**step_outputs)
+            model_outputs.update(**step_outputs)
             # timers.stop_and_print_elapsed(tname_post)
     timers.stop_and_print_elapsed(tname)
     prof_post_fwd.report()
-
-    model_outputs.update(**post_process_outputs)
 
     pipeline_outputs = dict(
         batch=post_process_outputs,
@@ -514,8 +592,7 @@ def run_pipeline(
         prof_loss = ProfilerContext(type=PROFILER_TYPE, name="LOSS")
         with prof_loss():
             fn = _resolve_fn(LOSS_FNS, loss_fn_name)
-            meta.update(**post_process_outputs)
-            loss, metrics = fn(model_outputs, batch, meta, config, device)
+            loss, metrics = fn(model_outputs, batch, post_meta, config, device)
         timers.stop_and_print_elapsed(tname)
         prof_loss.report()
 
@@ -591,7 +668,7 @@ def _run_pipeline_with_packing(
     processing: dict,
     device: str,
     *,
-    backward: bool,
+    backward: bool | str,
     max_tokens_per_mb: int,
 ) -> dict:
     """Run the pipeline with automatic sequence packing/unpacking.
@@ -599,8 +676,6 @@ def _run_pipeline_with_packing(
     Splits batch into microbatches, packs each to [1, T] for flash
     attention, runs the pipeline on each, then unpacks and concatenates.
     """
-    from arctic_platform.common.utils import combine_metric_microbatches
-
     from .microbatch import MicroBatchSpec
     from .microbatch import split_padded_tensor_dict_into_mb_list
     from .packing import pack_sequences
@@ -612,7 +687,9 @@ def _run_pipeline_with_packing(
     mb_list = split_padded_tensor_dict_into_mb_list(all_input, mb_spec)
     n_mbs = len(mb_list.mbs)
 
+    reduction = resolve_packed_loss_reduction(processing, mb_list.mbs)
     captured_losses: list[float] = []
+    captured_loss_tensors: list[torch.Tensor] = []
     captured_metrics: list[dict] = []
     collected_batch: dict[str, list[torch.Tensor]] = {}
 
@@ -620,37 +697,52 @@ def _run_pipeline_with_packing(
         packed = pack_sequences(mb)
         pack_meta = packed.pop("_pack_meta")
 
+        # 1D meta: packed tensors have shape [1, T] — squeeze for loss fns
+        mb_1d = {
+            k: v.squeeze(0) if torch.is_tensor(v) and v.ndim == 2 and v.shape[0] == 1 else v for k, v in packed.items()
+        }
+
         # Packed [1, T] plus sequence boundaries so Qwen3.5 GDN/conv1d reset
         # recurrent state per rollout instead of leaking across the concat.
         mb_kwargs = {
             "input_ids": packed["input_ids"],
             "position_ids": packed["position_ids"],
             "use_cache": False,
-            "cu_seqlens": packed["cu_seqlens"],
-            **{k: packed[k] for k in packed if k not in ("input_ids", "position_ids", "cu_seqlens")},
         }
+        for optional_key in ("labels", "dss_compute_logprobs", "rollout_is_weights"):
+            if optional_key in packed:
+                mb_kwargs[optional_key] = packed[optional_key]
         mb_kwargs.update(derive_varlen_model_kwargs(packed))
 
         if backward is True and hasattr(engine, "set_gradient_accumulation_boundary"):
             engine.set_gradient_accumulation_boundary(i == n_mbs - 1)
 
+        inner_backward = "loss_only" if backward is True else backward
         result = run_pipeline(
             engine,
             args,
             mb_kwargs,
-            meta,
+            mb_1d,
             processing,
             device,
-            backward=backward,
+            backward=inner_backward,
             pack=False,
             return_tensors=True,
         )
 
         if "avg_loss" in result:
             captured_losses.append(result["avg_loss"])
-        mb_metrics = result.get("metrics")
-        if mb_metrics:
-            captured_metrics.append(mb_metrics)
+            loss_tensor = result.pop("loss_tensor", None)
+            if loss_tensor is not None:
+                scaled = apply_packed_loss_reduction(
+                    engine,
+                    loss_tensor,
+                    reduction.loss_scales[i],
+                    backward=backward,
+                )
+                if scaled is not None:
+                    captured_loss_tensors.append(scaled)
+            captured_metrics.append(result.get("metrics") or {})
 
         for k, v in result.get("batch", {}).items():
             if torch.is_tensor(v):
@@ -670,19 +762,13 @@ def _run_pipeline_with_packing(
     batch_out = {k: _concat(v) for k, v in collected_batch.items()}
 
     if captured_losses:
-        # Each microbatch loss is already normalized by the GLOBAL token count
-        # (sum_pg_mb / T_global * dp_size), so the whole-batch value is their
-        # SUM -- exactly what a single unpacked forward would report. Metrics
-        # use the same paired-key convention as the GAS microbatch path
-        # (deepspeed_worker via combine_metric_microbatches): {name}.sum /
-        # {name}.tokens are summed and folded to a global token mean, other
-        # keys are averaged. A token-weighted mean here would bias
-        # kl/per_token to Sum(S*c)/Sum(c^2) instead of Sum(S)/Sum(c).
-        avg_loss = sum(captured_losses)
-        combined_metrics = combine_metric_microbatches(captured_metrics) if captured_metrics else {}
-        result = {"avg_loss": avg_loss, "metrics": combined_metrics}
+        avg_loss = combine_packed_losses(captured_losses, reduction)
+        averaged_metrics = combine_packed_metrics(captured_metrics, reduction.reporting_weights)
+        result = {"avg_loss": avg_loss, "metrics": averaged_metrics}
         if batch_out:
             result["batch"] = detensorize(batch_out)
+        if backward == "loss_only" and captured_loss_tensors:
+            result["loss_tensor"] = sum(captured_loss_tensors)
         return result
 
     return {"batch": detensorize(batch_out), "metrics": {}}
@@ -694,7 +780,7 @@ def _run_pipeline_with_packing(
 
 
 @register_post_processor("identity")
-def identity_post(model_outputs: dict, meta: dict, device: str) -> dict:
+def identity_post(model_outputs: dict, batch: dict, meta: dict, device: str) -> dict:
     """Pass-through — returns empty dict (nothing added)."""
     return {}
 
@@ -782,6 +868,7 @@ def fast_logprobs_and_entropy_from_logits(logits, labels, calculate_entropy):
     return logprobs, entropy
 
 
+@register_post_processor("ap_compute_logprobs")
 @register_post_processor("compute_entropy_and_logprobs")
 def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: dict, device: str) -> dict:
     """Compute per-token log-probs from logits using torch.roll convention.
@@ -860,43 +947,6 @@ def compute_entropy_and_logprobs_post(model_outputs: dict, batch: dict, meta: di
     # timers.stop_and_print_elapsed(tname_e2e)
 
     return processor_outputs
-
-
-# switch to compute_entropy_and_logprobs_post
-# @register_post_processor("compute_logprobs")
-# def compute_logprobs_post(model_outputs: dict, batch: dict, meta: dict, device: str) -> dict:
-#     """Compute per-token log-probs from logits using torch.roll convention.
-
-#     Processes logits in chunks along the token dimension to avoid OOM on
-#     large vocabularies (e.g. 150k+ tokens).  Returns only logprobs — raw
-#     logits are never included in the wire response.
-#     """
-#     logits = model_outputs["logits"]  # [B, S, V] or [1, T, V] packed
-#     input_ids = batch.get("input_ids")
-#     if input_ids is None:
-#         return {}
-
-#     if 1:
-#         input_ids = input_ids.to(logits.device)
-#         # Align input_ids shape with logits if they differ (e.g. 1D packed meta)
-#         if input_ids.ndim < logits.ndim:
-#             input_ids = input_ids.view(logits.shape[:-1])
-#         labels = torch.roll(input_ids, shifts=-1, dims=-1)
-
-#         # Flatten to 2D for uniform chunked processing: [N, V] where N = B*S or T
-#         logits_2d = logits.reshape(-1, logits.shape[-1])   # [N, V]
-#         labels_1d = labels.reshape(-1)                      # [N]
-
-#         chunk_size = 1024
-#         chunks = []
-#         for start in range(0, logits_2d.shape[0], chunk_size):
-#             end = min(start + chunk_size, logits_2d.shape[0])
-#             lp = torch.log_softmax(logits_2d[start:end].float(), dim=-1)
-#             chunks.append(lp.gather(-1, labels_1d[start:end].unsqueeze(-1)).squeeze(-1))
-
-#         logprobs = torch.cat(chunks).view_as(labels)   # restore original shape
-#         # pr0(f"compute_logprobs_post: {logprobs.shape=} {logprobs=}")
-#     return {"logprobs": logprobs}
 
 
 @register_post_processor("compute_entropy")

@@ -144,10 +144,11 @@ class TestEngineForwardKwargs(TestCasePlus):
 
         cu = torch.tensor([0, 3], dtype=torch.int32)
         batch = {"input_ids": torch.ones(1, 3, dtype=torch.long)}
-        meta = {"cu_seqlens": cu, "pad_token_id": 0}
+        meta = {"cu_seqlens": cu, "pad_token_id": 0, "temperature": 1.0}
         fwd = _engine_forward_kwargs(batch, meta)
         self.assertNotIn("cu_seqlens", fwd)
-        self.assertEqual(fwd["pad_token_id"], 0)
+        self.assertNotIn("pad_token_id", fwd)
+        self.assertEqual(fwd["temperature"], 1.0)
         self.assertTrue(torch.equal(fwd["input_ids"], batch["input_ids"]))
 
     def test_collect_model_outputs_accepts_prime_dict(self):
@@ -203,8 +204,8 @@ class TestPackedMetricAggregation(TestCasePlus):
                 object(),
                 (),
                 batch,
-                {},
-                {},
+                {"dp_size": 1, "batch_num_tokens": 12},
+                {"loss_fn": "on_policy_distill", "config": {"dp_size": 1, "batch_num_tokens": 12}},
                 "cpu",
                 backward=False,
                 max_tokens_per_mb=6,
