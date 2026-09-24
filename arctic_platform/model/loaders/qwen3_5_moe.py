@@ -40,13 +40,16 @@ class ActivationOffloadOptions(BaseModel):
     keep_last_n: int = Field(1, description="Boundaries to leave resident on GPU.")
     use_streams: bool = Field(True, description="Overlap offload copies on side streams.")
     tensor_size_threshold: int | None = Field(None, description="Min bytes to offload; None uses the default.")
+    pin_memory_enabled: bool = True
+    pin_memory_max_size_gib: float | Literal["auto"] = "auto"
+    pin_memory_bucket_size_mib: int = Field(64, gt=0)
 
 
 class ActivationCheckpointOptions(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     mode: Literal["full", "selective"] = Field("full", description="Recompute whole blocks or selected targets.")
-    freq: int = Field(1, description="Checkpoint every Nth block.")
+    freq: int = Field(1, gt=0, description="Checkpoint every Nth block.")
     targets: list[str] = Field(default_factory=lambda: ["norm"], description="Submodules to checkpoint (selective).")
     # Matches the internal ActivationCheckpointConfig default_factory (an offload config with enabled=False),
     # not None: apply_ac reads ``offload_config.enabled`` unconditionally.
@@ -56,14 +59,25 @@ class ActivationCheckpointOptions(BaseModel):
     router_replay_recompute: bool = Field(True, description="Deterministic MoE routing across recompute.")
 
 
+class DebugModelOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    random_init: bool = False
+    num_layers: int | None = Field(None, gt=0)
+    gradient_sample_max_numel: int = Field(0, ge=0)
+    full_determinism: bool = False
+
+
 class Qwen3_5MoeOptions(BaseModel):
     """Validated ``loader_options`` for the qwen3_5_moe loader (passed through as prl_config)."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    seq_len: int = Field(4096, description="Training sequence length.")
+    seq_len: int = Field(4096, gt=0, description="Training sequence length.")
+    trust_remote_code: bool = False
     attn: str = Field("flash_attention_3", description="Attention implementation.")
-    ep_comm_backend: Literal["deepep"] = Field("deepep", description="Expert-parallel comm backend.")
+    ep_comm_backend: Literal["deepep", "uccl"] = Field("deepep", description="Expert-parallel comm backend.")
+    deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     optimization_dtype: Literal["bfloat16", "float32"] = Field("bfloat16", description="Compute/param dtype.")
     reduce_dtype: Literal["bfloat16", "float32"] = Field("float32", description="Gradient reduction dtype.")
     moe_use_grouped_mm: bool = Field(True, description="Use grouped matmul for experts.")
@@ -72,14 +86,14 @@ class Qwen3_5MoeOptions(BaseModel):
         "disabled", description="Chunked LM-head logprobs token size."
     )
     fp32_lm_head: bool = Field(False, description="Compute the LM head in fp32.")
-    tiled_mlp_token_chunk_size: int | None = Field(None, description="ALST tiled shared-expert MLP token chunk.")
-    deepep_token_chunk_size: int | None = Field(None, description="DeepEP dispatch token chunk size.")
+    tiled_mlp_token_chunk_size: int | None = Field(None, gt=0, description="ALST tiled shared-expert MLP token chunk.")
+    deepep_token_chunk_size: int | None = Field(None, gt=0, description="DeepEP dispatch token chunk size.")
     # Mirrors ModelConfig.weight_conversion_cache_dir (the implementation's effective default).
-    weight_conversion_cache_dir: str = Field(
-        "/data-fast/prime-rl-weight-cache", description="Dir for the one-time HF<->Prime weight-conversion cache."
+    weight_conversion_cache_dir: str | None = Field(
+        None, description="Dir for the one-time HF<->Prime weight-conversion cache."
     )
     ac_config: ActivationCheckpointOptions | None = Field(None, description="Activation checkpointing config.")
-    debug: dict | None = Field(None, description="Test-only tiny-model overrides.")
+    debug: DebugModelOptions | None = Field(None, description="Test-only tiny-model overrides.")
 
     @model_validator(mode="after")
     def _check_lm_head(self) -> Self:
@@ -94,7 +108,10 @@ def _matches(ctx: LoaderContext) -> bool:
     if ctx.spec.parallelism.expert_parallel <= 1:
         return False
     model_type = getattr(ctx.hf_config, "model_type", "") or ""
-    return model_type == "qwen3_5_moe_text"
+    text_config = getattr(ctx.hf_config, "text_config", None)
+    return model_type in ("qwen3_5_moe", "qwen3_5_moe_text") or (
+        getattr(text_config, "model_type", None) == "qwen3_5_moe_text"
+    )
 
 
 @register_loader("qwen3_5_moe", matches=_matches, options=Qwen3_5MoeOptions)
@@ -109,15 +126,25 @@ def load_qwen3_5_moe(ctx: LoaderContext) -> LoadedModel:
             'use loader_options={"fused_cross_entropy": "liger"} for the LM head instead'
         )
 
-    from arctic_platform.model.implementations.qwen35 import load_moe_model_for_dss
+    if ctx.spec.patches.gradient_checkpointing or ctx.spec.patches.zorro_train:
+        raise ValueError("qwen3_5_moe uses loader_options.ac_config and does not support generic forward patches")
 
     parallelism = ctx.spec.parallelism
     groups = ctx.parallel_groups or {}
+    if groups.get("ep_group") is None:
+        raise ValueError("qwen3_5_moe requires parallel_groups['ep_group'] from the runtime")
+    if parallelism.sequence_parallel > 1 and groups.get("sp_group") is None:
+        raise ValueError("qwen3_5_moe requires parallel_groups['sp_group'] when sequence_parallel > 1")
+
+    from arctic_platform.model.implementations.qwen35 import load_moe_model_for_dss
+
     model = load_moe_model_for_dss(
         model_name=ctx.spec.model_path_or_name,
         ep_size=parallelism.expert_parallel,
         sp_size=parallelism.sequence_parallel,
         sp_group=groups.get("sp_group"),
+        ep_group=groups["ep_group"],
         prl_config=ctx.spec.loader_options,
+        tiled_mlp_token_chunk_size=ctx.spec.loader_options["tiled_mlp_token_chunk_size"],
     )
     return LoadedModel(model=model)

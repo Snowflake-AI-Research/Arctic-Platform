@@ -1,0 +1,3 @@
+Portions of the MoE and Qwen3.5 implementations derive from Prime Intellect prime-rl, Meta torchtitan, vLLM, and UCCL under Apache-2.0. Original attribution is retained in source and qwen35/NOTICE.
+
+The shared MoE, FP8, and model math helpers were adapted from DSS b7c9b720f6c2bc428f8d7c5feac6a4fc3d195eff. Imports and operator namespaces were changed for standalone Arctic-Platform use.

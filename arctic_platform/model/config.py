@@ -29,8 +29,8 @@ from arctic_platform.common.config import validate_peft_config
 class ParallelismConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    expert_parallel: int = Field(1, description="Expert-parallel degree.")
-    sequence_parallel: int = Field(1, description="Ulysses sequence-parallel degree.")
+    expert_parallel: int = Field(1, ge=1, description="Expert-parallel degree.")
+    sequence_parallel: int = Field(1, ge=1, description="Ulysses sequence-parallel degree.")
 
 
 class ZorroTrainPatch(BaseModel):
@@ -156,4 +156,9 @@ class ModelSpec(BaseModel):
             self.loader_options = options_model.model_validate(self.loader_options).model_dump()
         if self.patches.peft and self.loader == "qwen3_5_moe":
             raise ValueError("qwen3_5_moe PEFT requires expert adapter integration, which is not yet supported")
+        if self.loader == "qwen3_5_moe":
+            if self.attn_implementation is not None and self.attn_implementation != self.loader_options["attn"]:
+                raise ValueError("attn_implementation must match qwen3_5_moe loader_options.attn")
+            if self.dtype != self.loader_options["optimization_dtype"]:
+                raise ValueError("dtype must match qwen3_5_moe loader_options.optimization_dtype")
         return self

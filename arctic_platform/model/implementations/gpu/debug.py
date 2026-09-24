@@ -1,3 +1,17 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Opt-in ad-hoc debug instrumentation (enabled via DSS_* env vars); not used in normal training."""
 
 from __future__ import annotations
@@ -38,11 +52,15 @@ def maybe_log_moe_imbalance(rank: int) -> None:
 
     stats = dict(_recv_token_stats)
     _recv_token_stats.update(max_chunk=0, total=0, n_dispatch=0)
-    peak_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
-    peak_reserved = torch.cuda.max_memory_reserved() / (1024 ** 3)
+    peak_alloc = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_reserved = torch.cuda.max_memory_reserved() / (1024**3)
     logger.info(
         "MOE_IMBALANCE rank=%d max_chunk_recv=%d total_recv=%d n_dispatch=%d "
         "peak_alloc_GiB=%.2f peak_reserved_GiB=%.2f",
-        rank, stats["max_chunk"], stats["total"], stats["n_dispatch"],
-        peak_alloc, peak_reserved,
+        rank,
+        stats["max_chunk"],
+        stats["total"],
+        stats["n_dispatch"],
+        peak_alloc,
+        peak_reserved,
     )

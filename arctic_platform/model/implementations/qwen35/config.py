@@ -1,9 +1,23 @@
-"""Lightweight, dependency-free config dataclasses for the carved-out Qwen3.5
-loading path.
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Lightweight config dataclasses for the carved-out Qwen3.5 loading path.
 
-These replace prime-rl's pydantic / pydantic-config ``ModelConfig`` and
-``ActivationCheckpointConfig`` with plain dataclasses, carrying only the fields
-that are actually read on the DSS (DeepSpeed + EP + DeepEP) load path.
+These replace prime-rl's pydantic / pydantic-config ``ModelConfig`` and ``ActivationCheckpointConfig`` with
+plain dataclasses, carrying only the fields that are actually read on the DSS (DeepSpeed + EP + DeepEP) load path.
+Pin-memory validation lives in ``activation_offload_settings.py`` (torch-free); offload runtime wiring imports
+that module only through ``offload_settings()``.
 """
 
 from __future__ import annotations
@@ -11,9 +25,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-# Only the DeepEP expert-parallel comm backend is supported in this carve-out
-# (the torchtitan-based "torch" backend was dropped along with the dependency).
-EPCommBackend = Literal["deepep"]
+from arctic_platform.model.implementations.gpu.activation_offload_settings import (
+    ActivationOffloadSettings,
+    validate_pin_memory_bucket_size_mib,
+    validate_pin_memory_max_size_gib,
+)
+from arctic_platform.model.implementations.moe.config import DISPATCH_EP_BACKENDS, EPCommBackend
 
 
 @dataclass
@@ -29,6 +46,19 @@ class ActivationOffloadConfig:
     # Minimum saved-tensor size in bytes to offload; smaller tensors stay on GPU. None uses the
     # offload manager default (1 MiB).
     tensor_size_threshold: int | None = None
+    pin_memory_enabled: bool = True
+    # "auto" sizes the retained pinned-memory cache from the observed completed-step footprint. A numeric
+    # value is a hard retained-cache cap in GiB; 0 evicts returned pinned buffers immediately.
+    pin_memory_max_size_gib: float | Literal["auto"] = "auto"
+    # Contiguous pinned buffers are rounded up to this MiB boundary for variable-sequence-length reuse.
+    pin_memory_bucket_size_mib: int = 64
+
+    def __post_init__(self) -> None:
+        self.pin_memory_max_size_gib = validate_pin_memory_max_size_gib(self.pin_memory_max_size_gib)
+        self.pin_memory_bucket_size_mib = validate_pin_memory_bucket_size_mib(self.pin_memory_bucket_size_mib)
+
+    def offload_settings(self) -> ActivationOffloadSettings:
+        return ActivationOffloadSettings.from_offload_config(self)
 
 
 @dataclass
@@ -56,7 +86,7 @@ class DebugModelConfig:
     random_init: bool = False
     num_layers: int | None = None
     gradient_sample_max_numel: int = 0
-    deterministic_algorithms: bool = False
+    full_determinism: bool = False
 
 
 @dataclass
@@ -66,12 +96,11 @@ class ModelConfig:
     # ``vlm`` is always None on the DSS text-only path; kept for API parity.
     vlm: object | None = None
 
-    # Where to write the one-time HF<->Prime weight-conversion cache. Defaults to
-    # a writable scratch dir so the conversion never tries to write next to the
-    # (often read-only) source weights. Override per-run via the ``prime_rl``
-    # config or the ``DSS_WEIGHT_CONVERSION_CACHE_DIR`` env var. Set to an empty
-    # string to restore the legacy in-place ``<name>/<fmt>`` behaviour.
-    weight_conversion_cache_dir: str = "/data-fast/prime-rl-weight-cache"
+    # Optional explicit override for the one-time HF<->Prime conversion cache.
+    # A ready sibling ``<checkpoint>/prime`` is preferred; otherwise resolution
+    # falls back to ``DSS_WEIGHT_CONVERSION_CACHE_DIR`` and then /data-fast.
+    # Empty string restores write-to-sibling when no pre-baked cache exists.
+    weight_conversion_cache_dir: str | None = None
 
     seq_len: int = 2048
     attn: str = "flash_attention_2"
