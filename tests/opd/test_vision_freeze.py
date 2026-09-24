@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import torch
 import torch.nn as nn
 
 from arctic_platform.model.implementations.qwen35.vlm import freeze_unused_vision_tower
