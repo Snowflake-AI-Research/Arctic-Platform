@@ -47,7 +47,7 @@ if _TRANSPORT != "ray":
 import torch  # noqa: E402
 
 SERVER_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_server_e2e.log")
-MAX_TOKEN_LEN_PER_GPU = 4096
+MAX_TOKEN_LEN_PER_GPU = int(os.environ.get("MAX_TOKEN_LEN_PER_GPU", "4096"))
 
 
 # --------------------------------------------------------------------------------------------------------------- #
@@ -111,6 +111,8 @@ def build_client(
     seed: int = 42,
     colocate: bool = True,
     zorro_train_enable: bool = False,
+    gpu_mem_util: float = 0.7,
+    grad_accum_steps: int = 1,
 ):
     from arctic_platform.client import ArcticClientConfig
     from arctic_platform.client import ArcticRLClient
@@ -118,15 +120,17 @@ def build_client(
     from arctic_platform.client import SamplingConfig
     from arctic_platform.client import TrainingConfig
 
+    zero_stage = int(os.environ.get("ARCTIC_ZERO_STAGE", "1"))
     ds_config = {
         # DeepSpeed asserts train_batch_size == micro_bsz * grad_accum * world_size, and world_size is the
         # number of training GPUs. The server drives fwd/bwd with client-shaped batches, so these are just
         # DeepSpeed bookkeeping -- keep micro/grad_accum at 1 and scale the global batch by training_gpus.
         "train_micro_batch_size_per_gpu": 1,
-        "train_batch_size": training_gpus,
-        "gradient_accumulation_steps": 1,
+        "train_batch_size": training_gpus * grad_accum_steps,
+        "gradient_accumulation_steps": grad_accum_steps,
         "zero_optimization": {
-            "stage": 3,
+            # 1 = optimizer-sharded DDP (bf16 + fp32 master grads). 1.7B does not need ZeRO-3.
+            "stage": zero_stage,
             "offload_optimizer": {"device": "none"},
             "offload_param": {"device": "none"},
         },
@@ -169,9 +173,10 @@ def build_client(
             vllm={
                 # TP=1 => `sampling_gpus` data-parallel replicas; the ReplicaPool spreads generate() across them.
                 "tensor_parallel_size": tensor_parallel_size,
-                "gpu_memory_utilization": 0.3,
-                "enforce_eager": True,
-                "enable_prefix_caching": False,
+                "gpu_memory_utilization": gpu_mem_util,
+                "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "0") not in ("0", "false", "False"),
+                "enable_prefix_caching": os.environ.get("VLLM_PREFIX_CACHING", "1")
+                not in ("0", "false", "False"),
             }
         ),
         backend=OnPremConfig(
@@ -321,6 +326,9 @@ def main() -> None:
     # Single knob for variance control: seeds the Arctic sampler (ArcticClientConfig) AND the trainer
     # (AsyncGRPOConfig) so matched-seed baseline/arctic runs are comparable.
     ap.add_argument("--seed", type=int, default=int(os.environ.get("SEED", "42")))
+    ap.add_argument("--gpu-mem-util", type=float, default=float(os.environ.get("GPU_MEM_UTIL", "0.7")))
+    ap.add_argument("--max-staleness", type=int, default=int(os.environ.get("MAX_STALENESS", "0")))
+    ap.add_argument("--max-inflight-tasks", type=int, default=int(os.environ.get("MAX_INFLIGHT_TASKS", "-1")))
     args = ap.parse_args()
     if args.transport != _TRANSPORT:
         raise SystemExit(
@@ -405,6 +413,8 @@ def main() -> None:
             seed=args.seed,
             colocate=args.colocate,
             zorro_train_enable=args.zorro,
+            gpu_mem_util=args.gpu_mem_util,
+            grad_accum_steps=args.grad_accum,
         )
         print(f"[e2e] client ready; jobs={client.jobs}", flush=True)
 
@@ -418,6 +428,19 @@ def main() -> None:
         print(f"[e2e] dataset ready: {len(dataset)} prompts (split={split})", flush=True)
 
         install_stub_model_loader()
+
+        world = int(os.environ.get("WORLD_SIZE", "1"))
+        max_inflight = args.max_inflight_tasks
+        if max_inflight < 0:
+            # max_staleness=0 would otherwise infer inflight=0 and stall generate.
+            horizon = max(args.max_staleness, 1)
+            max_inflight = horizon * args.per_device_bsz * args.grad_accum * world
+        print(
+            f"[e2e] max_staleness={args.max_staleness} max_inflight_tasks={max_inflight} "
+            f"world={world} gpu_mem_util={args.gpu_mem_util} "
+            f"zero_stage={os.environ.get('ARCTIC_ZERO_STAGE', '1')}",
+            flush=True,
+        )
 
         config = AsyncGRPOConfig(
             output_dir=out_dir,
@@ -438,6 +461,8 @@ def main() -> None:
             max_steps=args.max_steps,
             num_train_epochs=args.num_train_epochs,
             weight_sync_steps=1,
+            max_staleness=args.max_staleness,
+            max_inflight_tasks=max_inflight,
             token_budget=0,  # FixedCountBatcher: avoids needing a real vLLM URL for max_model_len
             logging_steps=1,
             report_to="none",
@@ -469,9 +494,18 @@ def main() -> None:
             logits_optimization_peak_mem_size_in_gib=int(os.environ.get("ARCTIC_LOGITS_OPT_PEAK_GIB", "4")),
             logits_compute_in_fp32=os.environ.get("ARCTIC_LOGITS_COMPUTE_FP32", "0") not in ("0", "false", "False"),
         )
+        prefix_cache = os.environ.get("VLLM_PREFIX_CACHING", "1") not in ("0", "false", "False")
+        raw_group_batch = int(os.environ.get("ROLLOUT_GROUP_BATCH", "0"))
+        max_seqs = int(os.environ.get("VLLM_MAX_NUM_SEQS", "256"))
+        generate_group_batch = (
+            raw_group_batch if raw_group_batch >= 1 else max(1, max_seqs // max(1, args.num_generations))
+        )
         print(
             f"[e2e] loss_placement={args.loss_placement} zorro={args.zorro} "
-            f"zorro_load_balancer={args.zorro_load_balancer}",
+            f"zorro_load_balancer={args.zorro_load_balancer} "
+            f"prefix_cache={prefix_cache} generate_group_batch={generate_group_batch} "
+            f"enforce_eager={os.environ.get('VLLM_ENFORCE_EAGER', '0')} "
+            f"max_token_len_per_gpu={MAX_TOKEN_LEN_PER_GPU}",
             flush=True,
         )
         rollout_worker = ArcticRolloutWorker(
@@ -489,6 +523,7 @@ def main() -> None:
             old_logprobs_source=args.old_logprobs_source,
             pad_token_id=tokenizer.pad_token_id or 0,
             max_token_len_per_gpu=MAX_TOKEN_LEN_PER_GPU,
+            generate_group_batch=generate_group_batch,
             logits_optimization=os.environ.get("ARCTIC_LOGITS_OPT", "none"),
             logits_optimization_peak_mem_size_in_gib=int(os.environ.get("ARCTIC_LOGITS_OPT_PEAK_GIB", "4")),
             logits_compute_in_fp32=os.environ.get("ARCTIC_LOGITS_COMPUTE_FP32", "0") not in ("0", "false", "False"),
