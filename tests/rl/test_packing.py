@@ -151,6 +151,19 @@ class TestEngineForwardKwargs(TestCasePlus):
         self.assertEqual(fwd["temperature"], 1.0)
         self.assertTrue(torch.equal(fwd["input_ids"], batch["input_ids"]))
 
+    def test_strips_teacher_logprobs_from_engine_kwargs(self):
+        from arctic_platform.rl.processors.pipeline import _engine_forward_kwargs
+
+        batch = {
+            "input_ids": torch.ones(1, 3, dtype=torch.long),
+            "teacher_log_probs_shifted": torch.zeros(1, 3),
+            "loss_mask": torch.ones(1, 3, dtype=torch.bool),
+        }
+        fwd = _engine_forward_kwargs(batch, {})
+        self.assertNotIn("teacher_log_probs_shifted", fwd)
+        self.assertNotIn("loss_mask", fwd)
+        self.assertTrue(torch.equal(fwd["input_ids"], batch["input_ids"]))
+
     def test_collect_model_outputs_accepts_prime_dict(self):
         from arctic_platform.rl.processors.pipeline import collect_model_outputs
 
@@ -220,3 +233,44 @@ class TestPackedMetricAggregation(TestCasePlus):
         self.assertAlmostEqual(out["metrics"]["distill_kl_max"], 3.0)
         # Globally-normalized per-mb losses sum to the whole-batch loss.
         self.assertAlmostEqual(out["avg_loss"], 2.0 * n)
+
+    def test_packing_keeps_opd_teacher_logprobs_on_inner_batch(self):
+        from unittest import mock
+
+        from arctic_platform.rl.processors import pipeline
+
+        attn = torch.zeros(3, seq_len, dtype=torch.long)
+        for row, count in enumerate(real_token_counts):
+            attn[row, :count] = 1
+        input_ids = torch.randint(1, 100, (3, seq_len)) * attn
+        teacher = torch.randn(3, seq_len)
+        batch = {
+            "input_ids": input_ids,
+            "attention_mask": attn,
+            "loss_mask": attn.clone().bool(),
+            "teacher_log_probs_shifted": teacher,
+        }
+        seen_batches: list[dict] = []
+
+        def _fake_run_pipeline(engine, args, inner_batch, inner_meta, *rest, **kwargs):
+            seen_batches.append(inner_batch)
+            return {"avg_loss": 1.0, "metrics": {}, "batch": {}}
+
+        with mock.patch.object(pipeline, "run_pipeline", side_effect=_fake_run_pipeline):
+            pipeline._run_pipeline_with_packing(
+                object(),
+                (),
+                batch,
+                {"dp_size": 1, "batch_num_tokens": 12},
+                {"loss_fn": "on_policy_distill", "config": {"dp_size": 1, "batch_num_tokens": 12}},
+                "cpu",
+                backward=False,
+                max_tokens_per_mb=6,
+            )
+
+        self.assertGreaterEqual(len(seen_batches), 2)
+        for inner in seen_batches:
+            self.assertIn("teacher_log_probs_shifted", inner)
+            self.assertIn("loss_mask", inner)
+            self.assertEqual(inner["teacher_log_probs_shifted"].shape[0], 1)
+            self.assertNotIn("attention_mask", inner)

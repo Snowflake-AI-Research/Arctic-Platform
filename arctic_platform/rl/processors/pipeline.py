@@ -698,21 +698,17 @@ def _run_pipeline_with_packing(
         pack_meta = packed.pop("_pack_meta")
 
         # 1D meta: packed tensors have shape [1, T] — squeeze for loss fns
+        # that read squeezed copies. The inner ``batch`` must still be the
+        # full packed dict so OPD ``teacher_log_probs_shifted`` / ``loss_mask``
+        # (and GRPO advantages) stay on the batch the loss sees. Isolation
+        # in ``_engine_forward_kwargs`` keeps those keys off ``engine()``.
         mb_1d = {
             k: v.squeeze(0) if torch.is_tensor(v) and v.ndim == 2 and v.shape[0] == 1 else v for k, v in packed.items()
         }
 
-        # Packed [1, T] plus sequence boundaries so Qwen3.5 GDN/conv1d reset
-        # recurrent state per rollout instead of leaking across the concat.
-        mb_kwargs = {
-            "input_ids": packed["input_ids"],
-            "position_ids": packed["position_ids"],
-            "use_cache": False,
-        }
-        for optional_key in ("labels", "dss_compute_logprobs", "rollout_is_weights"):
-            if optional_key in packed:
-                mb_kwargs[optional_key] = packed[optional_key]
-        mb_kwargs.update(derive_varlen_model_kwargs(packed))
+        packed_batch = dict(packed)
+        packed_batch["use_cache"] = False
+        packed_batch.update(derive_varlen_model_kwargs(packed))
 
         if backward is True and hasattr(engine, "set_gradient_accumulation_boundary"):
             engine.set_gradient_accumulation_boundary(i == n_mbs - 1)
@@ -721,7 +717,7 @@ def _run_pipeline_with_packing(
         result = run_pipeline(
             engine,
             args,
-            mb_kwargs,
+            packed_batch,
             mb_1d,
             processing,
             device,
