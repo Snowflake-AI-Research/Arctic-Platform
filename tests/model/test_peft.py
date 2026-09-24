@@ -36,9 +36,9 @@ from arctic_platform.model import Patches
 from arctic_platform.model import apply_patches
 from arctic_platform.model import apply_peft
 from arctic_platform.model import build_model
-from arctic_platform.peft import cast_lora_adapters_off_fp8
-from arctic_platform.peft import cast_trainable_params_off_fp8
-from arctic_platform.peft import is_peft_lora_param
+from arctic_platform.model.patches.peft import cast_lora_adapters_off_fp8
+from arctic_platform.model.patches.peft import cast_trainable_params_off_fp8
+from arctic_platform.model.patches.peft import is_peft_lora_param
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
 from arctic_platform.testing_utils import require_torch_gpu
@@ -64,23 +64,28 @@ def _tiny_qwen():
 
 
 class TestPeft(TestCasePlus):
-    def test_helpers_import_without_training_dependencies(self):
+    def test_client_config_imports_without_training_dependencies(self):
         code = """
 import importlib.abc
 import sys
 
 class BlockTrainingImports(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.')[0] in {'torch', 'peft', 'transformers', 'deepspeed'}:
+        if fullname == 'arctic_platform.model' or fullname.split('.')[0] in {'torch', 'peft', 'transformers', 'deepspeed'}:
             raise AssertionError(f'unexpected training import: {fullname}')
 
 sys.meta_path.insert(0, BlockTrainingImports())
-from arctic_platform.peft import apply_peft, is_peft_lora_param
-from types import SimpleNamespace
-assert is_peft_lora_param('model.lora_A.default.weight', SimpleNamespace(requires_grad=True))
-model = object()
-assert apply_peft(model, None) is model
-print('PEFT helpers imported without training dependencies')
+from arctic_platform.client.config import TrainingConfig
+from pydantic import ValidationError
+assert TrainingConfig().peft is None
+assert TrainingConfig(peft={'peft_type': 'LORA'}).peft == {'peft_type': 'LORA'}
+try:
+    TrainingConfig(peft={})
+except ValidationError:
+    pass
+else:
+    raise AssertionError('empty PEFT config accepted')
+print('PEFT client config validated without training dependencies')
 """
         execute_subprocess_async([sys.executable, "-c", code], env=self.get_env(), timeout=30)
 
