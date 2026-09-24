@@ -866,6 +866,13 @@ class ArcticRLClientWrapper(RemoteBackend):
             payload["batch"]["loss_mask"] = payload["batch"]["response_mask"]
             from arctic_platform.integrations.verl.cortex_payload import _drop_old_log_probs
 
+            n_dp = int(self._backend_config.get("training_gpus", 4))
+            processing = dict(payload.get("processing") or {})
+            proc_cfg = dict(processing.get("config") or {})
+            proc_cfg["dp_size"] = n_dp
+            processing["config"] = proc_cfg
+            payload["processing"] = processing
+            print(f"[parity] cortex fwd_bwd dp_size={n_dp}", flush=True)
             cx = to_cortex_fwd_bwd_payload(payload)
             old_lp_shifted = cx["context"].get("old_log_probs_shifted")
             if old_lp_shifted is None and not _drop_old_log_probs():

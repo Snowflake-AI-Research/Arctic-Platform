@@ -129,7 +129,7 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
         "entropy_coeff": 0.0,
         **caller,
     }
-    for k in ("global_batch_size", "batch_num_tokens"):
+    for k in ("global_batch_size", "batch_num_tokens", "dp_size"):
         if k not in proc_config and k in meta:
             proc_config[k] = int(meta[k])
     return {

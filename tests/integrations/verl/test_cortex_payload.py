@@ -247,3 +247,20 @@ def test_zone_grpo_config_matches_verl_dual_clip():
     assert cfg["entropy_coeff"] == 0.0
     assert "dp_size" not in cfg
 
+
+def test_dp_size_from_processing_config_reaches_zone_grpo():
+    """Zone grpo reads processing.config.dp_size (default 1); on-prem verl_grpo uses meta dp_size=world."""
+    out = to_cortex_fwd_bwd_payload(
+        {
+            "batch": {
+                "input_ids": torch.tensor([[10, 11, 30, 31]]),
+                "attention_mask": torch.ones(1, 4, dtype=torch.long),
+                "old_log_probs": torch.tensor([[0.0, 0.0, -1.0, -2.0]]),
+                "advantages": torch.tensor([[0.0, 0.0, 1.0, 1.0]]),
+                "response_mask": torch.tensor([[0, 0, 1, 1]]),
+            },
+            "processing": {"config": {"dp_size": 4}},
+        }
+    )
+    assert out["processing"]["config"]["dp_size"] == 4
+
