@@ -98,9 +98,7 @@ def packing_boundaries_from_attention_mask(attention_mask: torch.Tensor) -> tupl
     """``cu_seqlens`` and reset-per-sequence ``position_ids`` from a padded ``[B, S]`` mask."""
     lens = attention_mask.long().sum(dim=1)
     cu_seqlens = F.pad(torch.cumsum(lens.to(torch.int32), dim=0), (1, 0), value=0)
-    position_ids = torch.cat(
-        [torch.arange(int(n), device=attention_mask.device) for n in lens.tolist()]
-    ).unsqueeze(0)
+    position_ids = torch.cat([torch.arange(int(n), device=attention_mask.device) for n in lens.tolist()]).unsqueeze(0)
     return cu_seqlens, position_ids
 
 

@@ -13,14 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""On-policy distillation as two ``SyncArcticRLClient``s: student + frozen teacher."""
+"""On-policy distillation as two ``ArcticRLClient``s: student + frozen teacher."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from arctic_platform.client.client import SyncArcticRLClient
 from arctic_platform.client.config import CortexConfig
+from arctic_platform.client.rl import ArcticRLClient
 from arctic_platform.client.transport import Request
 from arctic_platform.opd.config import ArcticOPDClientConfig
 
@@ -57,7 +57,7 @@ def _fwd_bwd_body(
 
 
 class ArcticOPDClient:
-    """Student train+sample plus a sampling-only teacher, each a ``SyncArcticRLClient``.
+    """Student train+sample plus a sampling-only teacher, each an ``ArcticRLClient``.
 
     The teacher has ``training_gpus=0``; only ``generate`` is used. Weight sync
     runs on the student (train → student sampler) and never targets the teacher.
@@ -69,9 +69,9 @@ class ArcticOPDClient:
 
     def __init__(self, config: ArcticOPDClientConfig) -> None:
         self.config = config
-        self.student = SyncArcticRLClient(config.student_transport_config())
+        self.student = ArcticRLClient(config.student_transport_config())
         try:
-            self.teacher = SyncArcticRLClient(config.teacher_transport_config())
+            self.teacher = ArcticRLClient(config.teacher_transport_config())
         except Exception:
             self.student.shutdown()
             raise

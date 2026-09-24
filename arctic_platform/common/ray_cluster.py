@@ -233,7 +233,7 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
         if result.returncode != 0:
             raise RuntimeError(
                 f"pdsh ray start on {peers} failed with exit code {result.returncode} "
-                f"(missing remote env/python is a common cause)"
+                "(missing remote env/python is a common cause)"
             )
 
     _spawned_cluster = True
@@ -251,8 +251,7 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
     )
     if peers and n_gpu <= 0:
         raise RuntimeError(
-            f"Ray peers {peers} produced a cluster with 0 GPUs; "
-            "refusing to schedule workers that would block forever"
+            f"Ray peers {peers} produced a cluster with 0 GPUs; refusing to schedule workers that would block forever"
         )
 
 

@@ -5,7 +5,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,15 +20,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import (
-    expected_hf_names_for_text_sync,
-)
-from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import (
-    pack_qwen35_gdn_layer,
-)
-from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import (
-    to_vllm_sync_weights,
-)
+from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import expected_hf_names_for_text_sync
+from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import pack_qwen35_gdn_layer
+from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import to_vllm_sync_weights
 
 
 def _qwen35_2b_like_layer(layer: int) -> list[tuple[str, torch.Tensor]]:

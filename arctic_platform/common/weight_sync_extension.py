@@ -5,7 +5,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,13 +23,10 @@ so the optional vision/MTP filter runs where names are validated.
 from __future__ import annotations
 
 from arctic_inference.server.weight_sync.receiver import WeightSyncExtension
-from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import (
-    expected_hf_names_for_text_sync,
-)
 
-WORKER_EXTENSION_CLS = (
-    "arctic_platform.common.weight_sync_extension.TextOnlyWeightSyncExtension"
-)
+from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import expected_hf_names_for_text_sync
+
+WORKER_EXTENSION_CLS = "arctic_platform.common.weight_sync_extension.TextOnlyWeightSyncExtension"
 
 
 class TextOnlyWeightSyncExtension(WeightSyncExtension):

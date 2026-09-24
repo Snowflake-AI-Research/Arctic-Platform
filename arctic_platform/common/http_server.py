@@ -80,6 +80,7 @@ def _replica_pool_cls():
     """Lazy import — training-only servers do not need arctic_inference / vLLM."""
     require_any_dep_group("rl")
     from arctic_inference.server.replica_pool import ReplicaPool
+
     from arctic_platform.model.implementations.qwen35.hf_vllm_weight_sync import (
         install_optional_frozen_weight_sync_patch,
     )

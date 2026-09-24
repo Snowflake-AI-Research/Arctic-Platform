@@ -24,7 +24,7 @@ from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import model_validator
 
-from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import CortexConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.config import OnPremConfig
@@ -138,7 +138,7 @@ class ArcticOPDClientConfig(BaseModel):
             "request_timeout": self.request_timeout,
         }
 
-    def student_transport_config(self) -> ArcticRLClientConfig:
+    def student_transport_config(self) -> ArcticClientConfig:
         """Internal adapter for the shared transport; not an ArcticRLClient."""
         backend = self.backend
         if isinstance(backend, OnPremConfig) and backend.launch_local_server:
@@ -146,7 +146,7 @@ class ArcticOPDClientConfig(BaseModel):
             if self.student_ray_hostfile:
                 extra_env["ARL_RAY_HOSTFILE"] = self.student_ray_hostfile
             backend = backend.model_copy(update={"server_extra_env": extra_env})
-        return ArcticRLClientConfig(
+        return ArcticClientConfig(
             model_name=self.student_model,
             training_gpus=self.training_gpus,
             sampling_gpus=self.sampling_gpus,
@@ -159,7 +159,7 @@ class ArcticOPDClientConfig(BaseModel):
             **self._base_kwargs(),
         )
 
-    def teacher_transport_config(self) -> ArcticRLClientConfig:
+    def teacher_transport_config(self) -> ArcticClientConfig:
         """Internal sampling-only transport config for the fixed teacher."""
         backend = self.backend
         if isinstance(backend, OnPremConfig):
@@ -181,7 +181,7 @@ class ArcticOPDClientConfig(BaseModel):
                     "server_extra_env": extra_env,
                 }
             )
-        return ArcticRLClientConfig(
+        return ArcticClientConfig(
             model_name=self.teacher_model,
             training_gpus=0,
             sampling_gpus=self.teacher_sampling_gpus,

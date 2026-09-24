@@ -115,11 +115,10 @@ from transformers import AutoTokenizer
 from arctic_platform.client.config import OnPremConfig
 from arctic_platform.client.config import SamplingConfig
 from arctic_platform.client.config import TrainingConfig
+from arctic_platform.opd import DEFAULT_PROCESSING
 from arctic_platform.opd import ArcticOPDClient
 from arctic_platform.opd import ArcticOPDClientConfig
-from arctic_platform.opd import DEFAULT_PROCESSING
 from arctic_platform.opd import score_teacher
-
 
 logger = logging.getLogger(__name__)
 
@@ -190,9 +189,9 @@ def check_sync_result(result: Any) -> tuple[list[str], str]:
             warnings.append(
                 f"weight sync has changed nothing on all {len(before)} inference "
                 f"worker(s) for {_SYNC_ZERO_RUN[0]} consecutive steps (model_l2_sq "
-                f"identical before and after every time). An isolated zero is normal "
-                f"at small lr -- a run this long is not, so the tensors are likely "
-                f"being received and dropped and the sampler is serving stale weights"
+                "identical before and after every time). An isolated zero is normal "
+                "at small lr -- a run this long is not, so the tensors are likely "
+                "being received and dropped and the sampler is serving stale weights"
             )
         deltas = [a - b for b, a in zip(before, after)]
         zero_note = f" [zero-delta run {_SYNC_ZERO_RUN[0]}]" if _SYNC_ZERO_RUN[0] else ""
@@ -216,8 +215,7 @@ def check_metrics(metrics: dict[str, Any], step: int) -> list[str]:
     for key in ("distill_kl_coef", "distill_estimator_is_k3"):
         if key not in metrics:
             warnings.append(
-                f"expected metric {key} missing: is processing.loss_fn actually "
-                "resolving to the distillation loss?"
+                f"expected metric {key} missing: is processing.loss_fn actually resolving to the distillation loss?"
             )
 
     clamped = float(metrics.get("distill_delta_clamped_count", 0.0) or 0.0)
@@ -257,8 +255,10 @@ def check_metrics(metrics: dict[str, Any], step: int) -> list[str]:
                     "Before any update these must match; bf16 lm-head noise or a "
                     "loss-mask / prompt-completion split bug."
                     if step == 0
-                    else "Weights are synced every step, so a growing max gap points "
-                    "at sampler/trainer precision drift or /sync-weights not landing."
+                    else (
+                        "Weights are synced every step, so a growing max gap points "
+                        "at sampler/trainer precision drift or /sync-weights not landing."
+                    )
                 )
             )
         if gap > threshold:
@@ -267,11 +267,9 @@ def check_metrics(metrics: dict[str, Any], step: int) -> list[str]:
                 f"{threshold} (mean_lowvar={mean_lowvar:.6g}, "
                 f"abs_delta_max={abs_max}, n={n}). "
                 + (
-                    "Before any update these must match; check the loss-mask "
-                    "shift and the prompt/completion split."
+                    "Before any update these must match; check the loss-mask shift and the prompt/completion split."
                     if step == 0
-                    else "Weights are synced every step, so a growing gap points "
-                    "at /sync-weights not landing."
+                    else "Weights are synced every step, so a growing gap points at /sync-weights not landing."
                 )
             )
         elif not (abs_max is not None and float(abs_max) > abs_threshold):
@@ -772,9 +770,7 @@ def resolve_train_attn(requested: str) -> str:
 
 def _ds_config(args: argparse.Namespace) -> dict[str, Any]:
     if args.batch_size % args.training_gpus != 0:
-        raise SystemExit(
-            f"--batch-size {args.batch_size} must be divisible by --training-gpus {args.training_gpus}"
-        )
+        raise SystemExit(f"--batch-size {args.batch_size} must be divisible by --training-gpus {args.training_gpus}")
     gas = args.batch_size // args.training_gpus
     ds_config: dict[str, Any] = {
         "train_micro_batch_size_per_gpu": 1,
@@ -819,9 +815,7 @@ def build_live_client(args: argparse.Namespace):
         raw_prompts = list(DEFAULT_TRIVIA_PROMPTS)
     enable_thinking = bool(getattr(args, "enable_thinking", False))
     print(f"enable_thinking={enable_thinking}")
-    prompt_ids = tokenize_and_filter(
-        tokenizer, raw_prompts, args.max_prompt_len, enable_thinking=enable_thinking
-    )
+    prompt_ids = tokenize_and_filter(tokenizer, raw_prompts, args.max_prompt_len, enable_thinking=enable_thinking)
     batches = iter_batches(
         prompt_ids,
         args.batch_size,
@@ -911,11 +905,7 @@ def build_live_client(args: argparse.Namespace):
                 "fused_cross_entropy": False,
                 "fla_tilelang": False,
                 **({"fused_lm_head_token_chunk_size": 2048} if args.train_fp32_lm_head else {}),
-                **(
-                    {"max_tokens_per_mb": args.max_tokens_per_mb}
-                    if args.max_tokens_per_mb
-                    else {}
-                ),
+                **({"max_tokens_per_mb": args.max_tokens_per_mb} if args.max_tokens_per_mb else {}),
             },
         ),
         sampling=SamplingConfig(vllm=student_vllm),
@@ -1091,8 +1081,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-tokens-per-mb",
         type=int,
         default=None,
-        help="Token budget per packed train microbatch (xyu mb_spec). "
-        "When set, the worker packs instead of splitting by DeepSpeed GAS.",
+        help=(
+            "Token budget per packed train microbatch (xyu mb_spec). "
+            "When set, the worker packs instead of splitting by DeepSpeed GAS."
+        ),
     )
     parser.add_argument("--training-gpus", "--train-gpus", dest="training_gpus", type=int, default=1)
     parser.add_argument("--sampling-gpus", "--student-infer-gpus", dest="sampling_gpus", type=int, default=1)
@@ -1109,8 +1101,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--student-ray-hostfile",
         default=None,
-        help="Hostfile for the student Ray cluster (ARL_RAY_HOSTFILE). "
-        "Use with --teacher-ray-hostfile to pin 8+8+8 roles onto disjoint nodes.",
+        help=(
+            "Hostfile for the student Ray cluster (ARL_RAY_HOSTFILE). "
+            "Use with --teacher-ray-hostfile to pin 8+8+8 roles onto disjoint nodes."
+        ),
     )
     parser.add_argument(
         "--teacher-ray-hostfile",
@@ -1124,16 +1118,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-thinking",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Student chat template thinking block. Default off (pinned "
-        "non-thinking). --enable-thinking matches xyu's omit-the-kwarg default "
-        "on transformers 5.16 (thinking ON); used by the Phase-1 thinking smoke.",
+        help=(
+            "Student chat template thinking block. Default off (pinned "
+            "non-thinking). --enable-thinking matches xyu's omit-the-kwarg default "
+            "on transformers 5.16 (thinking ON); used by the Phase-1 thinking smoke."
+        ),
     )
     parser.add_argument(
         "--enforce-eager",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="vLLM enforce_eager. Default off so CUDA graphs can run (v6). "
-        "v5 used --enforce-eager and paid ~2x generate vs xyu.",
+        help=(
+            "vLLM enforce_eager. Default off so CUDA graphs can run (v6). "
+            "v5 used --enforce-eager and paid ~2x generate vs xyu."
+        ),
     )
     parser.add_argument(
         "--vllm-flash-attn-version",
@@ -1146,8 +1144,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--vllm-fp32-lm-head",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Send stock vLLM head_dtype=float32 (or Neutrino fp32_lm_head). "
-        "Use --no-vllm-fp32-lm-head to isolate bf16 infer head vs v9.",
+        help=(
+            "Send stock vLLM head_dtype=float32 (or Neutrino fp32_lm_head). "
+            "Use --no-vllm-fp32-lm-head to isolate bf16 infer head vs v9."
+        ),
     )
     parser.add_argument(
         "--train-fp32-lm-head",

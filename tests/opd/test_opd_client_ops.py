@@ -19,12 +19,12 @@ from pathlib import Path
 
 import pytest
 
+from arctic_platform.client import ArcticRLClient
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
-from arctic_platform.client import SyncArcticRLClient
-from arctic_platform.client import client as rl_client_module
+from arctic_platform.client import base as rl_client_module
 from arctic_platform.opd import DEFAULT_PROCESSING
 from arctic_platform.opd import ArcticOPDClient
 from arctic_platform.opd import ArcticOPDClientConfig
@@ -81,8 +81,8 @@ def client(monkeypatch):
 
 def test_composes_two_sync_rl_clients(client):
     opd, transports = client
-    assert isinstance(opd.student, SyncArcticRLClient)
-    assert isinstance(opd.teacher, SyncArcticRLClient)
+    assert isinstance(opd.student, ArcticRLClient)
+    assert isinstance(opd.teacher, ArcticRLClient)
     assert opd.student.config.training_gpus == 2
     assert opd.student.config.sampling_gpus == 2
     assert opd.teacher.config.training_gpus == 0

@@ -31,8 +31,8 @@ from arctic_platform.opd.examples.run_on_policy_distill import iter_batches
 from arctic_platform.opd.examples.run_on_policy_distill import kl_per_token_len_adj
 from arctic_platform.opd.examples.run_on_policy_distill import load_prompt_records
 from arctic_platform.opd.examples.run_on_policy_distill import lr_at
-from arctic_platform.opd.examples.run_on_policy_distill import resolve_train_attn
 from arctic_platform.opd.examples.run_on_policy_distill import prompt_content_from_record
+from arctic_platform.opd.examples.run_on_policy_distill import resolve_train_attn
 from arctic_platform.opd.examples.run_on_policy_distill import student_sampling_params
 from arctic_platform.opd.examples.run_on_policy_distill import tokenize_and_filter
 from arctic_platform.opd.examples.run_on_policy_distill import tokenize_prompt
