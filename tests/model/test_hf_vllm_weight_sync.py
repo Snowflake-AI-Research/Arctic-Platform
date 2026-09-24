@@ -161,6 +161,7 @@ def test_expected_hf_names_drop_missing_visual_keep_shipped():
 
 
 def test_text_only_extension_allows_missing_visual():
+    pytest.importorskip("arctic_inference")
     from arctic_platform.common.weight_sync_extension import TextOnlyWeightSyncExtension
 
     ext = TextOnlyWeightSyncExtension()
@@ -185,6 +186,7 @@ def test_text_only_extension_allows_missing_visual():
 
 
 def test_text_only_extension_still_rejects_unexpected_lm_name():
+    pytest.importorskip("arctic_inference")
     from arctic_platform.common.weight_sync_extension import TextOnlyWeightSyncExtension
 
     ext = TextOnlyWeightSyncExtension()
@@ -210,6 +212,7 @@ def test_text_only_extension_still_rejects_unexpected_lm_name():
 
 
 def test_build_model_config_registers_enginecore_extension():
+    pytest.importorskip("arctic_inference")
     from arctic_platform.common.utils.server_models import build_model_config
     from arctic_platform.common.weight_sync_extension import WORKER_EXTENSION_CLS
 

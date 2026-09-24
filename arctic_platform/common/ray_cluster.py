@@ -113,9 +113,10 @@ def hostfile_hosts(path: str | None = None) -> list[str]:
     return [ln.split()[0] for ln in lines if ln.strip() and not ln.strip().startswith("#")]
 
 
-def _peer_hosts() -> list[str]:
+def _peer_hosts(head: str | None = None) -> list[str]:
     """Return remote host entries from the active hostfile, excluding this machine."""
-    head = primary_ip()
+    if head is None:
+        head = primary_ip()
     return [h for h in hostfile_hosts() if h != head]
 
 

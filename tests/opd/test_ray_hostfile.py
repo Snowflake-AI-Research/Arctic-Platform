@@ -28,5 +28,4 @@ def test_hostfile_path_and_peers_honor_arl_ray_hostfile(tmp_path: Path, monkeypa
     monkeypatch.setenv("ARL_RAY_HOSTFILE", str(path))
     assert hostfile_path() == str(path)
     assert hostfile_hosts() == ["10.0.0.1", "10.0.0.2"]
-    monkeypatch.setattr("arctic_platform.common.ray_cluster.primary_ip", lambda: "10.0.0.1")
-    assert _peer_hosts() == ["10.0.0.2"]
+    assert _peer_hosts(head="10.0.0.1") == ["10.0.0.2"]
