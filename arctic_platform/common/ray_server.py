@@ -504,6 +504,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
             "status": "RUNNING",
             "checkpoint_path": None,
             "sync_path": None,
+            "sp_size": job_config.sp_size,
         }
 
         if job_type == "log_prob":
@@ -653,7 +654,7 @@ class ArcticRLRayServer:
         # timers.stop_and_print_elapsed(tname)
 
         tname = timers.start("xyz fwd_bwd: ray_split_batch")
-        shards, reorder_indices = ray_split_batch(batch, len(workers))
+        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=self.jobs[job_id].get("sp_size", 1))
         # The verl driver's ``update_actor`` only consumes ``metrics`` from the
         # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
         # ``batch`` (logprobs/entropy) is never read. Keep the worker output as
@@ -662,7 +663,7 @@ class ArcticRLRayServer:
         # passed back through the Ray object store. The TRL server-side-loss path
         # opts in via ``meta["return_fwd_batch"]`` (it needs logprobs/entropy for
         # its metrics block).
-        return_fwd_batch = bool(batch.get("meta", {}).get("return_fwd_batch", False))
+        return_fwd_batch = bool(shards[0]["meta"].get("return_fwd_batch", False))
         shards[0]["meta"]["worker_return_tensors"] = True
         timers.stop_and_print_elapsed(tname)
         for shard_rank, shard in enumerate(shards):
@@ -730,7 +731,7 @@ class ArcticRLRayServer:
         #     w.forward_no_grad.remote(s) for w, s in zip(workers, shards)
         # ])
 
-        shards, reorder_indices = ray_split_batch(batch, len(workers))
+        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=info.get("sp_size", 1))
         refs = [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
         results = ray.get(refs)
 
@@ -1191,7 +1192,7 @@ class ArcticRLRayServer:
             # shape fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no
             # ZoRRO/position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
             wrapper = dict(batch=dict(encoded), meta={}, processing={})
-            shards, _ = ray_split_batch(wrapper, len(workers))
+            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info.get("sp_size", 1))
             raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
             results = torch.cat([r.cpu() for r in raw], dim=0)
         else:

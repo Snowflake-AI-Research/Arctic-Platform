@@ -29,15 +29,21 @@ servers accept this canonical shape directly.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 from typing import Literal
 
+from pydantic import AliasChoices
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import SecretStr
+from pydantic import field_validator
 from pydantic import model_validator
+from pydantic_settings import BaseSettings
+from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
+
+from arctic_platform.common.config import validate_peft_config
 
 JobId = int | str
 
@@ -66,29 +72,53 @@ class OnPremConfig(BaseModel):
     )
 
 
-class CortexConfig(BaseModel):
+class CortexConfig(BaseSettings):
     """Cortex protocol settings for the remote backend.
 
-    Provide `base_url` for a direct/mock URL (no auth), or `host` + a PAT in the
-    env var for Snowflake programmatic-access auth.
+    Provide `base_url` for a direct/mock URL (no auth), or `host` + `pat` for
+    Snowflake programmatic-access auth.
+
+    Every field also reads from an ``ARCTIC_CORTEX_``-prefixed env var
+    (``ARCTIC_CORTEX_HOST``, ``ARCTIC_CORTEX_PAT``, ``ARCTIC_CORTEX_DATABASE``,
+    ``ARCTIC_CORTEX_SCHEMA``, ...), so `CortexConfig()` with no arguments is a
+    complete config on a configured shell. Constructor and YAML values win over
+    the environment.
     """
 
-    model_config = ConfigDict(extra="forbid", validate_default=True)
+    model_config = SettingsConfigDict(
+        extra="forbid",
+        validate_default=True,
+        env_prefix="ARCTIC_CORTEX_",
+        # An exported-but-empty var is how a shell says "unset"; without this it
+        # would beat the default and fail validation as a present empty string.
+        env_ignore_empty=True,
+        populate_by_name=True,
+    )
 
     type: Literal["remote"] = "remote"
     protocol: Literal["cortex"] = Field("cortex", description="remote transport protocol.")
+    # Present so callers can read `backend.colocate` uniformly across backends.
+    # Cortex always splits training and sampling into separate SnowAPI sub-jobs,
+    # so it can only ever be False.
+    colocate: Literal[False] = Field(False, description="cortex: colocation not supported.")
     base_url: str | None = Field(None, description="cortex: direct/mock GS URL; bypasses PAT auth.")
     host: str | None = Field(None, description="cortex: Snowflake host for PAT auth.")
-    pat: str | None = Field(None, description="cortex: PAT value passed directly; overrides pat_env_var when set.")
-    pat_env_var: str = Field("CORTEX_PAT", description="cortex: env var holding the PAT when `pat` is unset.")
+    # SecretStr so the token cannot ride along into a log line or a serialized
+    # config: repr and model_dump render it as `**********`, and reading it
+    # takes an explicit `.get_secret_value()`.
+    pat: SecretStr | None = Field(None, description="cortex: PAT; also read from ARCTIC_CORTEX_PAT.")
     database: str = Field("", description="cortex: Snowflake database.")
-    schema_: str = Field("", alias="schema", description="cortex: Snowflake schema.")
+    # `schema` shadows a BaseModel attribute, hence the trailing underscore. An
+    # explicit alias opts the field out of `env_prefix`, so the env name has to
+    # be spelled out or ARCTIC_CORTEX_SCHEMA is silently ignored.
+    schema_: str = Field(
+        "",
+        validation_alias=AliasChoices("schema", "schema_", "ARCTIC_CORTEX_SCHEMA"),
+        serialization_alias="schema",
+        description="cortex: Snowflake schema.",
+    )
     endpoint: str = Field("cortex-training", description="cortex: SnowAPI endpoint name.")
     max_retries: int = Field(10, ge=0, description="cortex: transient-failure retries per HTTP request (tenacity).")
-
-    def resolve_pat(self) -> str | None:
-        """The PAT for host/PAT auth: explicit `pat`, else the `pat_env_var` value."""
-        return self.pat if self.pat is not None else os.environ.get(self.pat_env_var)
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -97,8 +127,8 @@ class CortexConfig(BaseModel):
         if self.host and not self.base_url:
             if not (self.database and self.schema_):
                 raise ValueError("cortex: database + schema required for host/PAT auth.")
-            if not self.resolve_pat():
-                raise ValueError(f"cortex: no PAT — set `pat` or the '{self.pat_env_var}' env var for host auth.")
+            if not (self.pat and self.pat.get_secret_value()):
+                raise ValueError("cortex: no PAT — set `pat` or ARCTIC_CORTEX_PAT for host auth.")
         return self
 
 
@@ -163,8 +193,8 @@ class TrainingConfig(BaseModel):
         None,
         description=(
             "PEFT adapter config (peft_type, r, lora_alpha, lora_dropout, bias, target_modules). "
-            "None = dense fine-tuning. Applied to the training job and, when sampling is allocated, "
-            "to the sampling engine so it can serve the adapter."
+            "None = dense fine-tuning; an empty config is invalid. On-prem supports training; "
+            "Cortex also configures the sampling engine to serve the adapter."
         ),
     )
     cuda_ipc: bool = Field(
@@ -182,6 +212,18 @@ class TrainingConfig(BaseModel):
             "instead of the whole model. Optional override on sync_weights()."
         ),
     )
+
+    _validate_peft = field_validator("peft")(validate_peft_config)
+
+    @model_validator(mode="after")
+    def _resolve_worker_peft(self) -> Self:
+        worker_peft = (self.ds_worker_config or {}).get("peft_config")
+        validate_peft_config(worker_peft)
+        if worker_peft is not None:
+            if self.peft is not None and self.peft != worker_peft:
+                raise ValueError("training.peft conflicts with training.ds_worker_config.peft_config")
+            self.peft = worker_peft
+        return self
 
 
 class ArcticClientConfig(BaseModel):
@@ -219,14 +261,14 @@ class ArcticClientConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_backend_supports_peft(self) -> Self:
-        # The on-prem server has no PEFT path, and to_onprem() has nowhere to put an
-        # adapter config. Silently training dense after asking for LoRA burns a run,
-        # so refuse the combination before any job or GPU is claimed.
-        if self.training.peft and self.backend.type == "onprem":
+        if (
+            self.training.peft is not None
+            and self.backend.type == "onprem"
+            and (self.sampling_gpus > 0 or self.sampling_job_id is not None)
+        ):
             raise ValueError(
-                "training.peft is only supported by the remote Cortex backend; "
-                "the on-prem server trains dense only. Drop training.peft, or "
-                "switch backend to CortexConfig."
+                "On-prem PEFT supports training only; adapter sync to sampling is not implemented. "
+                "Use sampling_gpus=0 without a sampling_job_id, or switch to CortexConfig."
             )
         return self
 
@@ -250,8 +292,12 @@ class ArcticClientConfig(BaseModel):
             payload["full_determinism"] = tc.full_determinism
             if tc.ds_config:
                 payload["ds_config"] = tc.ds_config
-            if tc.ds_worker_config:
-                payload["ds_worker_config"] = tc.ds_worker_config
+            worker = dict(tc.ds_worker_config or {})
+            worker.pop("peft_config", None)
+            if job_type == "training" and tc.peft is not None:
+                worker["peft_config"] = dict(tc.peft)
+            if worker:
+                payload["ds_worker_config"] = worker
             if job_type == "training":
                 if tc.checkpoint_path:
                     payload["checkpoint_path"] = tc.checkpoint_path
@@ -308,7 +354,7 @@ class ArcticClientConfig(BaseModel):
             if key in worker:
                 training[key] = worker[key]
         if ds:
-            training["ds_config"] = ds
+            training["ds_config"] = _without_noop_offload(ds)
         if self.training.peft:
             training["peft_config"] = self.training.peft
         return self._cortex_sub_job("training", {"training_config": training})
@@ -341,3 +387,32 @@ def _neutrino_optimizer(ds_optimizer: Any) -> dict[str, Any] | None:
         return None
     params = ds_optimizer.get("params") or {}
     return {"name": ds_optimizer.get("type", "AdamW"), **params}
+
+
+def _without_noop_offload(ds_config: dict[str, Any]) -> dict[str, Any]:
+    """Drop ``offload_optimizer/offload_param: {device: none}`` from a ds_config.
+
+    To DeepSpeed, ``device: none`` and an absent key mean the same thing; to
+    Cortex they don't. It builds the optimizer from the typed ``optimizer``
+    field lifted above and settles on ``DeepSpeedCPUAdam``, so forwarding an
+    explicit no-op offload block moves only the parameters onto the GPU and the
+    first ``step()`` dies with::
+
+        AssertionError: CPUAdam param is on cuda:0 and must be 'cpu'
+
+    SkyRL's arctic_rl config spells the no-op out while the standalone recipes
+    omit it, which is why only the framework path hits this. A real
+    ``device: cpu`` request is left alone.
+    """
+    zero = ds_config.get("zero_optimization")
+    if not isinstance(zero, dict):
+        return ds_config
+    kept = {
+        key: value
+        for key, value in zero.items()
+        if key not in ("offload_optimizer", "offload_param")
+        or not (isinstance(value, dict) and str(value.get("device", "none")).lower() == "none")
+    }
+    if len(kept) == len(zero):
+        return ds_config
+    return {**ds_config, "zero_optimization": kept}

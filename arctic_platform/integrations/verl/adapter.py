@@ -298,6 +298,10 @@ class ArcticRLClientWrapper(RemoteBackend):
             batch["position_ids"] = position_ids
         if actor_config.use_kl_loss:
             batch["ref_log_prob"] = data["ref_log_prob"]
+        # Batch-dim: must live in ``batch`` so ``_split_batch`` shards it with
+        # advantages / logprobs. In ``meta`` it is replicated to every DP rank.
+        if data.get("rollout_is_weights") is not None:
+            batch["rollout_is_weights"] = data["rollout_is_weights"]
 
         per_step_global_bsz = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * rollout_n
         meta = dict(
@@ -341,7 +345,6 @@ class ArcticRLClientWrapper(RemoteBackend):
             f"actor.ppo_mini_batch_size={self.config.actor_rollout_ref.actor.ppo_mini_batch_size})"
         )
         chunk_rows = total_rows // num_minibatches
-        rollout_is_weights_full = data.get("rollout_is_weights", None)
 
         agg_metrics: dict = {}
         loss_list: list = []
@@ -356,14 +359,6 @@ class ArcticRLClientWrapper(RemoteBackend):
                 meta_chunk = dict(meta)
                 meta_chunk["global_batch_size"] = per_step_global_bsz
                 meta_chunk["batch_num_tokens"] = batch_chunk["response_mask"].sum()
-                if rollout_is_weights_full is not None:
-                    meta_chunk["rollout_is_weights"] = (
-                        rollout_is_weights_full[lo:hi]
-                        if isinstance(rollout_is_weights_full, torch.Tensor)
-                        else rollout_is_weights_full
-                    )
-                else:
-                    meta_chunk["rollout_is_weights"] = None
 
                 payload = dict(batch=batch_chunk, meta=meta_chunk)
                 response = await self._send_update_actor(payload)

@@ -20,6 +20,19 @@ from typing import Any
 import torch
 
 from arctic_platform import wire
+from arctic_platform.common.registry import is_declared_summed_metric
+
+from .server_models import resolve_parallelism_degree
+
+
+def dp_sp_world_size(world_size: int, sp_size: int = 1) -> int:
+    """DP degree under SP: ``world_size // sp_size`` (each SP group is one DP replica)."""
+    sp_size = resolve_parallelism_degree(sp_size, "sp_size")
+    if world_size < 1:
+        raise ValueError(f"world_size must be >= 1; got {world_size!r}")
+    if world_size % sp_size != 0:
+        raise ValueError(f"world_size ({world_size}) must be divisible by sp_size ({sp_size})")
+    return world_size // sp_size
 
 
 def shard_token_stats(batch_data: dict, meta_data: dict | None = None) -> dict[str, int]:
@@ -62,12 +75,74 @@ def log_dp_shard_tokens(rank: int, tag: str, batch_data: dict, meta_data: dict |
     print(f"[{rank}] [DP-shard] {tag}: {parts}", flush=True)
 
 
-def unpack_batch(batch: dict) -> tuple:
-    """Support both ``{"args": ..., "kwargs": ...}`` and flat-dict formats.
+# Cortex ``context`` / AP ``meta`` keys whose dim 0 is the batch. ``_split_batch``
+# shards ``batch`` and replicates ``meta``, so these must live in ``batch``.
+BATCH_DIM_CONTEXT_KEYS = frozenset(
+    {
+        "advantages",
+        "old_log_probs",
+        "old_log_probs_shifted",
+        "loss_mask",
+        "response_mask",
+        "ref_log_prob",
+        "ref_log_probs",
+        "ref_log_probs_shifted",
+        "prox_logp",
+        "prox_logp_shifted",
+        "labels",
+        "sft_mask",
+        "echo_observation_mask",
+        "versions",
+        "prompt_group_ids",
+        "prompt_token_counts",
+        "sequence_loss_weights",
+        "rollout_is_weights",
+    }
+)
 
-    Returns ``(args, kwargs, context, processing)``.
+
+def promote_batch_dim_to_batch(batch_data: dict, meta_data: dict) -> tuple[dict, dict]:
+    """Move batch-dim tensors from ``meta``/Cortex ``context`` into ``batch``.
+
+    No-op for keys already on ``batch`` (``batch`` wins; the ``meta`` copy is dropped).
+    Non-tensor values (e.g. SkyRL ``rollout_is_weights: None``) stay on ``meta``
+    so later ``v.shape`` debug loops and DP split do not see a None batch field.
     """
-    return {}, batch["batch"], batch["meta"], batch["processing"]
+    batch_data = dict(batch_data)
+    meta_data = dict(meta_data)
+    for key in BATCH_DIM_CONTEXT_KEYS:
+        if key not in meta_data:
+            continue
+        value = meta_data[key]
+        if not torch.is_tensor(value):
+            continue
+        if key not in batch_data:
+            batch_data[key] = value
+        del meta_data[key]
+    return batch_data, meta_data
+
+
+def unpack_batch(batch: dict) -> tuple:
+    """Return ``(args, batch, meta, processing)``.
+
+    Accepts AP ``{"batch", "meta", "processing"}`` and Cortex
+    ``{"kwargs", "context", "processing"}``. Batch-dim keys in ``context`` /
+    ``meta`` are moved onto ``batch`` before DP split.
+    """
+    if "kwargs" in batch:
+        batch_data = dict(batch.get("kwargs") or {})
+        meta_data = dict(batch.get("context") or {})
+        processing = batch.get("processing") or {}
+    else:
+        batch_data = batch["batch"]
+        meta_data = dict(batch["meta"])
+        processing = batch["processing"]
+        if isinstance(batch_data, dict):
+            batch_data = dict(batch_data)
+
+    if isinstance(batch_data, dict):
+        batch_data, meta_data = promote_batch_dim_to_batch(batch_data, meta_data)
+    return {}, batch_data, meta_data, processing
 
 
 def _split_value(val, num_chunks: int):
@@ -79,7 +154,7 @@ def _split_value(val, num_chunks: int):
                 f"{num_chunks}. The client must send at least one sample per "
                 "DP worker."
             )
-        return list(torch.chunk(val, num_chunks, dim=0))
+        return list(torch.tensor_split(val, num_chunks, dim=0))
     if isinstance(val, list):
         if len(val) < num_chunks:
             raise ValueError(
@@ -119,8 +194,14 @@ def reconstruct_position_ids_(batch_data: dict) -> None:
     batch_data["position_ids"] = (attention_mask_long.cumsum(dim=-1) - 1).clamp_(min=0) * attention_mask_long
 
 
-def _split_batch(batch: dict, num_workers: int) -> list[dict]:
-    """Split a batch across DP workers.
+def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
+    """Split a batch across workers and stamp the DP loss scale.
+
+    The cutter produces ``num_workers`` disjoint row shards and stamps
+    ``dp_size=num_workers``. Sequence-parallel replication (one logical DP
+    shard copied across an SP group, then token-sharded) is not implemented,
+    so ``sp_size > 1`` is rejected rather than silently mixing samples.
+    ``zip(workers, shards)`` stays 1:1.
 
     Supports two wire shapes for ``batch["batch"]``:
       * **dict** of tensors (legacy / demos): one concatenated mini-batch, later
@@ -133,6 +214,14 @@ def _split_batch(batch: dict, num_workers: int) -> list[dict]:
 
     reorder_indices = None
     meta_data = dict(meta_data)
+    sp_size = resolve_parallelism_degree(sp_size, "sp_size")
+    if sp_size > 1:
+        raise ValueError(
+            "sequence-parallel data-plane is not implemented: _split_batch still "
+            "cuts one disjoint shard per worker. Refuse sp_size>1 until shards "
+            f"are replicated across an SP group. Got sp_size={sp_size}."
+        )
+    dp_sp_world_size(num_workers, sp_size)
     meta_data.update(dp_size=num_workers)
 
     if isinstance(batch_data, list):
@@ -183,13 +272,13 @@ def _split_batch(batch: dict, num_workers: int) -> list[dict]:
 ray_split_batch = _split_batch
 
 
-def http_split_batch(batch_bytes: bytes, num_workers: int) -> list[bytes]:
+def http_split_batch(batch_bytes: bytes, num_workers: int, sp_size: int = 1) -> list[bytes]:
     """Deserialize a global batch, split across DP workers, re-serialize each shard."""
     # if num_workers <= 1:
     #     return [batch_bytes]
     batch = wire.loads(batch_bytes)
 
-    shards, reorder_indices = _split_batch(batch, num_workers)
+    shards, reorder_indices = _split_batch(batch, num_workers, sp_size=sp_size)
 
     # _, batch_data, meta_data, processing = unpack_batch(batch)
     # batch_data_shards = split_dict(batch_data, num_workers)
@@ -250,6 +339,26 @@ def merge_dict_shards(shards_list: list[dict]) -> dict:
 
 _METRIC_PAIR_SUM_SUFFIX = ".sum"
 _METRIC_PAIR_TOKENS_SUFFIX = ".tokens"
+_SUMMED_METRIC_PREFIXES = ("loss_term_",)
+_SUMMED_METRIC_SUFFIXES = ("_sum", "_count")
+
+
+def metric_is_summed(key: str) -> bool:
+    """Whether a scalar metric is additive across microbatches and DP ranks.
+
+    A loss fn declares its additive metrics at registration
+    (``register_loss_fn(..., summed_metrics=...)``). Undeclared keys fall back
+    to the naming convention: objective-term contributions (``loss_term_*``)
+    and token/sequence counts (``*_count``, ``*_sum``) are SUMMED. Averaging
+    them misreports totals whenever a call splits across packed microbatches,
+    GAS, or DP ranks.
+
+    SFT pairing uses ``{name}.sum`` / ``{name}.tokens`` via the combiners below
+    and is not this helper.
+    """
+    if is_declared_summed_metric(key):
+        return True
+    return key.startswith(_SUMMED_METRIC_PREFIXES) or key.endswith(_SUMMED_METRIC_SUFFIXES)
 
 
 def combine_metric_shards(shards_list: list[dict]) -> dict:
@@ -326,6 +435,9 @@ def combine_metric_shards(shards_list: list[dict]) -> dict:
             if base in paired_bases:
                 continue
         if k in out:
+            continue
+        if metric_is_summed(k):
+            out[k] = total
             continue
         count = numeric_counts.get(k, 1)
         out[k] = total / count if count > 0 else total
@@ -404,7 +516,7 @@ def combine_metric_microbatches(per_microbatch_metric_dicts: list[dict]) -> dict
 
     out: dict = {}
     for k, total in numeric_totals.items():
-        if k in paired_keys:
+        if k in paired_keys or metric_is_summed(k):
             out[k] = total
         else:
             count = numeric_counts.get(k, 1)

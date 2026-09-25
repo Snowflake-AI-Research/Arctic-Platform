@@ -80,8 +80,17 @@ def _sft_body(batch: dict, processing: dict | None = None) -> dict:
 class ArcticSFTClient(ArcticClient):
     """SFT frontend: forward bodies default to the ``sft`` loss unless the caller overrides."""
 
-    def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
-        return super().fwd_bwd(_sft_body(batch, processing), router_replay=router_replay)
+    def fwd_bwd(
+        self,
+        batch: dict,
+        *,
+        processing: dict | None = None,
+        router_replay: Any = None,
+    ) -> dict:
+        return super().fwd_bwd(
+            _sft_body(batch, processing),
+            router_replay=router_replay,
+        )
 
     def fwd_no_grad(self, batch: dict, processing: dict | None = None) -> dict:
         # Narrower than the base on purpose: `reference_model` routes to the log-prob
@@ -91,7 +100,7 @@ class ArcticSFTClient(ArcticClient):
 
     def train_step(self, batch: dict, processing: dict | None = None) -> dict:
         """``fwd_bwd`` + ``step`` with a single merged ``metrics`` dict (RL ``update_actor``)."""
-        fwd = self.fwd_bwd(batch, processing)
+        fwd = self.fwd_bwd(batch, processing=processing)
         step = self.step()
         out = dict(fwd)
         out["metrics"] = merge_sft_step_metrics(fwd, step)

@@ -337,6 +337,7 @@ async def initialize(job_config: JobConfig = Body(...)):
         "status": "RUNNING",
         "checkpoint_path": None,
         "sync_path": None,
+        "sp_size": job_config.sp_size,
     }
     if job_type == "log_prob":
         job_info["engine"] = engine
@@ -393,7 +394,7 @@ async def forward_backward(
     # timers.stop_and_print_elapsed(tname)
 
     tname = timers.start("xyz fwd_bwd: split_batch")
-    shards, reorder_indices = http_split_batch(body, len(workers))
+    shards, reorder_indices = http_split_batch(body, len(workers), sp_size=app.state.jobs[job_id].get("sp_size", 1))
     # The verl driver's ``update_actor`` only consumes ``metrics`` from the
     # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
     # ``batch`` (logprobs/entropy) is never read. Keep the worker output as
@@ -446,7 +447,7 @@ async def forward(
     if not workers:
         raise HTTPException(400, f"Job {job_id} ({job_type}) has no DeepSpeed workers")
 
-    shards, reorder_indices = http_split_batch(body, len(workers))
+    shards, reorder_indices = http_split_batch(body, len(workers), sp_size=info.get("sp_size", 1))
     shards[0]["meta"]["worker_return_tensors"] = True
     results = await asyncio.gather(*[w.forward_no_grad.remote(s) for w, s in zip(workers, shards)])
     pr0(f"[DeepSpeedWorker] fwd_no_grad: {len(results)=}")
@@ -947,7 +948,7 @@ async def log_probs(job_id: int, request: LogProbsRequest = Body(...)):
         # fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no ZoRRO/
         # position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
         batch_bytes = wire.dumps(dict(batch=dict(encoded), meta={}, processing={}))
-        shards, _ = http_split_batch(batch_bytes, len(workers))
+        shards, _ = http_split_batch(batch_bytes, len(workers), sp_size=info.get("sp_size", 1))
         raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
         results = torch.cat([r.cpu() for r in raw], dim=0)
     else:

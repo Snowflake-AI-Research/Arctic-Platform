@@ -80,6 +80,8 @@ def _check_weight_format(config: ArcticClientConfig, weight_format: str | None) 
     On-prem's ``WeightSyncRequest`` ignores unknown fields, so an unsupported
     format would silently full-sync dense weights instead of the adapter.
     """
+    if config.training.peft is not None and config.backend.type == "onprem":
+        raise ValueError("On-prem PEFT adapter sync to sampling is not implemented")
     if weight_format is not None and config.backend.type == "onprem":
         raise ValueError(
             f"weight_format={weight_format!r} is only supported by the remote Cortex backend; "
@@ -143,8 +145,21 @@ class ArcticClient(_ArcticClientCore):
         return out
 
     # ── training ─────────────────────────────────────────────────────────
-    def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
-        return self._call(fwd_bwd_request(self.jobs, batch, processing, router_replay))
+    def fwd_bwd(
+        self,
+        batch: dict,
+        *,
+        processing: dict | None = None,
+        router_replay: Any = None,
+    ) -> dict:
+        return self._call(
+            fwd_bwd_request(
+                self.jobs,
+                batch,
+                processing=processing,
+                router_replay=router_replay,
+            )
+        )
 
     def fwd_no_grad(self, batch: dict, processing: dict | None = None, reference_model: bool = False) -> dict:
         return self._call(fwd_no_grad_request(self.jobs, batch, processing, reference_model))
@@ -239,8 +254,21 @@ class AsyncArcticClient(_ArcticClientCore):
         return out
 
     # ── training ─────────────────────────────────────────────────────────
-    async def fwd_bwd(self, batch: dict, processing: dict | None = None, router_replay: Any = None) -> dict:
-        return await self._acall(fwd_bwd_request(self.jobs, batch, processing, router_replay))
+    async def fwd_bwd(
+        self,
+        batch: dict,
+        *,
+        processing: dict | None = None,
+        router_replay: Any = None,
+    ) -> dict:
+        return await self._acall(
+            fwd_bwd_request(
+                self.jobs,
+                batch,
+                processing=processing,
+                router_replay=router_replay,
+            )
+        )
 
     async def fwd_no_grad(self, batch: dict, processing: dict | None = None, reference_model: bool = False) -> dict:
         return await self._acall(fwd_no_grad_request(self.jobs, batch, processing, reference_model))

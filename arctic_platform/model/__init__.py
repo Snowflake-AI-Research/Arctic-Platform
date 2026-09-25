@@ -29,6 +29,7 @@ from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import select_loader
 from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.patch import register_patch
+from arctic_platform.model.patches.peft import apply_peft
 
 # Import built-in loaders and patches for their registration side effects.
 from arctic_platform.model import loaders  # noqa: F401  # isort: skip
@@ -42,6 +43,7 @@ __all__ = [
     "Patches",
     "ZorroTrainPatch",
     "apply_patches",
+    "apply_peft",
     "build_model",
     "register_loader",
     "register_patch",

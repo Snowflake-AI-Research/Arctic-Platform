@@ -136,6 +136,23 @@ class TestLoaderSelection:
 
 
 class TestPatchPipeline:
+    def test_replacement_is_passed_to_later_patches(self, monkeypatch):
+        monkeypatch.setattr(patch_mod, "PATCH_ORDER", ("wrap", "after"))
+        original = nn.Identity()
+        wrapped = nn.Sequential(original)
+        seen = []
+        patch_mod._PATCHES["wrap"] = lambda model, ctx: wrapped
+        patch_mod._PATCHES["after"] = lambda model, ctx: seen.append(model)
+        loaded = LoadedModel(model=original)
+        ctx = _ctx(wrap=True, after=True)
+
+        apply_patches(loaded, ctx)
+        apply_patches(loaded, ctx)
+
+        assert loaded.model is wrapped
+        assert seen == [wrapped]
+        assert loaded.applied_patches == frozenset({"wrap", "after"})
+
     def test_registry_matches_config_and_order(self):
         """Built-in patches line up: PATCH_ORDER == Patches fields == registered patches."""
         from arctic_platform.model.config import Patches
