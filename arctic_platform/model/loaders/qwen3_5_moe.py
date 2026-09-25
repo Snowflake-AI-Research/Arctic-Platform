@@ -24,6 +24,7 @@ from pydantic import Field
 from pydantic import model_validator
 from typing_extensions import Self
 
+from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
@@ -97,10 +98,7 @@ class Qwen3_5MoeOptions(BaseModel):
 
     @model_validator(mode="after")
     def _check_lm_head(self) -> Self:
-        if self.fused_cross_entropy and (self.fp32_lm_head or isinstance(self.fused_lm_head_token_chunk_size, int)):
-            raise ValueError(
-                "cannot combine fused_cross_entropy with fp32_lm_head or an integer fused_lm_head_token_chunk_size"
-            )
+        validate_lm_head_fused_ce_config(self.model_dump())
         return self
 
 

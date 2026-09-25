@@ -83,12 +83,18 @@ def test_loader_preserves_options_and_process_groups(monkeypatch, backend):
         {"debug": {"unknown": True}},
         {"tiled_mlp_token_chunk_size": 0},
         {"ac_config": {"freq": 0}},
-        {"fused_cross_entropy": "liger", "fp32_lm_head": True},
+        {"fused_cross_entropy": "liger", "fused_lm_head_token_chunk_size": 128},
     ],
 )
 def test_unsupported_options_are_rejected(options):
     with pytest.raises(ValueError):
         Qwen3_5MoeOptions(**options)
+
+
+def test_liger_fused_cross_entropy_allows_fp32_lm_head():
+    options = Qwen3_5MoeOptions(fused_cross_entropy="liger", fp32_lm_head=True)
+    assert options.fused_cross_entropy == "liger"
+    assert options.fp32_lm_head is True
 
 
 @pytest.mark.parametrize(
