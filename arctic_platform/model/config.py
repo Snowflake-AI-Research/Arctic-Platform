@@ -16,21 +16,87 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import PositiveInt
 from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
 
 from arctic_platform.common.config import validate_peft_config
 
+PinMemoryMaxSize = float | Literal["auto"]
+
+
+class ActivationOffloadConfig(BaseModel):
+    """Serializable activation CPU-offload configuration."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    keep_last_n: int = Field(1, ge=0)
+    use_streams: bool = True
+    tensor_size_threshold: int | None = Field(None, ge=0)
+    pin_memory_enabled: bool = True
+    pin_memory_max_size_gib: PinMemoryMaxSize = "auto"
+    pin_memory_bucket_size_mib: PositiveInt = 64
+
+    @field_validator("pin_memory_max_size_gib")
+    @classmethod
+    def _validate_pin_memory_max_size_gib(cls, value: PinMemoryMaxSize) -> PinMemoryMaxSize:
+        if value == "auto":
+            return value
+        if value < 0:
+            raise ValueError("pin_memory_max_size_gib must be 'auto' or non-negative")
+        return value
+
+    @property
+    def pin_memory_bucket_size_bytes(self) -> int:
+        return self.pin_memory_bucket_size_mib * (1 << 20)
+
+    @property
+    def pin_memory_hard_max_size_bytes(self) -> int | None:
+        if self.pin_memory_max_size_gib == "auto":
+            return None
+        return int(self.pin_memory_max_size_gib * (1 << 30))
+
+
+class ActivationCheckpointConfig(BaseModel):
+    """MoE activation checkpointing and optional CPU offload."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    mode: Literal["full", "selective"] = Field("full", description="Recompute whole blocks or selected targets.")
+    freq: PositiveInt = Field(1, description="Checkpoint every Nth block.")
+    targets: list[str] = Field(default_factory=lambda: ["norm"], description="Submodules to checkpoint (selective).")
+    offload_config: ActivationOffloadConfig | None = Field(
+        None, description="CPU offload of checkpointed boundaries; None disables it."
+    )
+    router_replay_recompute: bool = Field(True, description="Deterministic MoE routing across recompute.")
+
+    @field_validator("offload_config", mode="before")
+    @classmethod
+    def _normalize_legacy_offload_config(cls, value):
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        enabled = value.pop("enabled", True)
+        return value if enabled else None
+
+    @model_validator(mode="after")
+    def _validate_offload_mode(self) -> Self:
+        if self.offload_config is not None and self.mode != "full":
+            raise ValueError("activation offload requires activation checkpointing mode='full'")
+        return self
+
 
 class ParallelismConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    expert_parallel: int = Field(1, description="Expert-parallel degree.")
-    sequence_parallel: int = Field(1, description="Ulysses sequence-parallel degree.")
+    expert_parallel: int = Field(1, ge=1, description="Expert-parallel degree.")
+    sequence_parallel: int = Field(1, ge=1, description="Ulysses sequence-parallel degree.")
 
 
 class ZorroTrainPatch(BaseModel):
@@ -154,6 +220,7 @@ class ModelSpec(BaseModel):
         options_model = get_loader_options_model(self.loader)
         if options_model is not None:
             self.loader_options = options_model.model_validate(self.loader_options).model_dump()
-        if self.patches.peft and self.loader == "qwen3_5_moe":
-            raise ValueError("qwen3_5_moe PEFT requires expert adapter integration, which is not yet supported")
+        from arctic_platform.model.loader import validate_loader_spec
+
+        validate_loader_spec(self.loader, self)
         return self

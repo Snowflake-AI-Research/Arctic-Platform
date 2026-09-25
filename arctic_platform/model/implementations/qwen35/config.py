@@ -1,9 +1,8 @@
-"""Lightweight, dependency-free config dataclasses for the carved-out Qwen3.5
-loading path.
+"""Lightweight config dataclasses for the carved-out Qwen3.5 loading path.
 
-These replace prime-rl's pydantic / pydantic-config ``ModelConfig`` and
-``ActivationCheckpointConfig`` with plain dataclasses, carrying only the fields
-that are actually read on the DSS (DeepSpeed + EP + DeepEP) load path.
+The runtime-only ``ModelConfig`` retains the fields consumed by the Qwen
+implementation. User-controlled checkpoint and offload settings use the
+validated Pydantic models from :mod:`arctic_platform.model.config`.
 """
 
 from __future__ import annotations
@@ -11,44 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-# Only the DeepEP expert-parallel comm backend is supported in this carve-out
-# (the torchtitan-based "torch" backend was dropped along with the dependency).
-EPCommBackend = Literal["deepep"]
-
-
-@dataclass
-class ActivationOffloadConfig:
-    """Whether/how to stream checkpointed block-boundary activations to CPU (``full`` mode only).
-
-    Only consulted when ``enabled`` is True; see activation_offload.py.
-    """
-
-    enabled: bool = False  # stream saved block boundaries to CPU to reclaim GPU memory
-    keep_last_n: int = 1  # boundaries to leave resident (needed first in backward)
-    use_streams: bool = True
-    # Minimum saved-tensor size in bytes to offload; smaller tensors stay on GPU. None uses the
-    # offload manager default (1 MiB).
-    tensor_size_threshold: int | None = None
-
-
-@dataclass
-class ActivationCheckpointConfig:
-    # What the backward pass recomputes per transformer block: "full" recheckpoints each whole block
-    # (one saved boundary per block); "selective" checkpoints only the chosen submodules in `targets`.
-    mode: Literal["full", "selective"] = "full"
-    freq: int = 1
-    targets: list[str] = field(default_factory=lambda: ["norm"])
-    # CPU-offload of the checkpointed block boundaries; off by default. See activation_offload.py.
-    offload_config: ActivationOffloadConfig = field(default_factory=ActivationOffloadConfig)
-    # Deterministic MoE routing across whole-block recompute; see router_replay_recompute.py. Required for
-    # full-mode AC (+offload) at sp>=4, harmless otherwise, no-op under sampler router-replay.
-    router_replay_recompute: bool = True
-
-    def __post_init__(self) -> None:
-        # The wire schema passes ac_config as a plain dict (``ActivationCheckpointConfig(**ac_cfg)``),
-        # so a nested ``offload_config`` arrives as a dict; coerce it into the dataclass.
-        if isinstance(self.offload_config, dict):
-            self.offload_config = ActivationOffloadConfig(**self.offload_config)
+from arctic_platform.model.config import ActivationCheckpointConfig
+from arctic_platform.model.implementations.moe.config import DISPATCH_EP_BACKENDS, EPCommBackend
 
 
 @dataclass
@@ -56,7 +19,7 @@ class DebugModelConfig:
     random_init: bool = False
     num_layers: int | None = None
     gradient_sample_max_numel: int = 0
-    deterministic_algorithms: bool = False
+    full_determinism: bool = False
 
 
 @dataclass
@@ -66,12 +29,11 @@ class ModelConfig:
     # ``vlm`` is always None on the DSS text-only path; kept for API parity.
     vlm: object | None = None
 
-    # Where to write the one-time HF<->Prime weight-conversion cache. Defaults to
-    # a writable scratch dir so the conversion never tries to write next to the
-    # (often read-only) source weights. Override per-run via the ``prime_rl``
-    # config or the ``DSS_WEIGHT_CONVERSION_CACHE_DIR`` env var. Set to an empty
-    # string to restore the legacy in-place ``<name>/<fmt>`` behaviour.
-    weight_conversion_cache_dir: str = "/data-fast/prime-rl-weight-cache"
+    # Optional explicit override for the one-time HF<->Prime conversion cache.
+    # A ready sibling ``<checkpoint>/prime`` is preferred; otherwise resolution
+    # falls back to ``DSS_WEIGHT_CONVERSION_CACHE_DIR`` and then /data-fast.
+    # Empty string restores write-to-sibling when no pre-baked cache exists.
+    weight_conversion_cache_dir: str | None = None
 
     seq_len: int = 2048
     attn: str = "flash_attention_2"

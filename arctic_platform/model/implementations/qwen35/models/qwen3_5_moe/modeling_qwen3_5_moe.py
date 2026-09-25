@@ -13,9 +13,17 @@ from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, logging
 
+from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
+from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
+from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
+
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import (
+    head_parallel_gated_delta_net,
+)
+
 from ..base import PreTrainedModelPrimeRL
-from ..layers.lm_head import PrimeLmOutput
-from ..layers.moe import FeedForward, MoE, MoEArgs
+from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
+from arctic_platform.model.implementations.moe.layers.moe import FeedForward, MoE, MoEArgs
 from ..layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig, apply_rotary_pos_emb
 
 from .configuration_qwen3_5_moe import Qwen3_5MoeConfig
@@ -54,13 +62,10 @@ except ImportError:
 
 try:
     from fla.modules import FusedRMSNormGated
-    from fla.ops.cp import FLACPContext, build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 except ImportError:
     chunk_gated_delta_rule = None  # type: ignore
     FusedRMSNormGated = None  # type: ignore
-    FLACPContext = None  # type: ignore
-    build_cp_context = None  # type: ignore
 
 logger = logging.get_logger(__name__)
 
@@ -244,20 +249,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self._causal_conv1d_fn = causal_conv1d_fn
         self._chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
 
-    def _build_cp_context(self, local_seq_len: int, device: torch.device) -> "FLACPContext | None":
-        """Build fla CP context from the local (sharded) sequence length."""
-        cp_group = getattr(self, "cp_group", None)
-        if cp_group is None or build_cp_context is None:
-            return None
-        # Reconstruct global cu_seqlens: single contiguous sequence across all CP ranks
-        global_seq_len = local_seq_len * self.cp_world_size
-        global_cu_seqlens = torch.tensor([0, global_seq_len], dtype=torch.int32, device=device)
-        return build_cp_context(
-            cu_seqlens=global_cu_seqlens,
-            group=cp_group,
-            conv1d_kernel_size=self.conv_kernel_size,
-        )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -265,69 +256,100 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        mixed_qkv = self.in_proj_qkv(hidden_states)
         z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
+        query, key, value = torch.split(
+            mixed_qkv,
+            [self.key_dim, self.key_dim, self.value_dim],
+            dim=-1,
+        )
+        query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-        # Causal conv1d — must reset at sequence boundaries for packed batches,
-        # otherwise the kernel-1 left pad leaks state across sequences.
-        if self._causal_conv1d_fn is not None:
-            seq_idx = None
-            if cu_seqlens is not None:
-                seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-                seq_idx = torch.repeat_interleave(
-                    torch.arange(seg_lens.numel(), dtype=torch.int32, device=hidden_states.device),
-                    seg_lens,
-                ).unsqueeze(0)
-            mixed_qkv = self._causal_conv1d_fn(
-                x=mixed_qkv,
-                weight=self.conv1d.weight.squeeze(1),
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                seq_idx=seq_idx,
-            )
-        elif cu_seqlens is not None:
-            cu = cu_seqlens.tolist()
-            conv_outs = []
-            for i in range(len(cu) - 1):
-                s, e = cu[i], cu[i + 1]
-                if s == e:
-                    continue
-                conv_outs.append(self.conv1d(mixed_qkv[:, :, s:e])[:, :, : e - s])
-            mixed_qkv = F.silu(torch.cat(conv_outs, dim=-1))
-        else:
-            mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
-
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-        query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        # Use fla's native CP when available, otherwise fall back to PyTorch kernel
-        cp_context = self._build_cp_context(seq_len, hidden_states.device)
-        if cp_context is not None:
-            cu_seqlens = cp_context.cu_seqlens
-            core_attn_out, _ = self._chunk_gated_delta_rule(
+        if getattr(self, "cp_group", None) is not None:
+            global_cu_seqlens = getattr(self, "_dss_sp_global_cu_seqlens", None)
+            if not torch.is_tensor(global_cu_seqlens):
+                raise RuntimeError(
+                    "head-parallel GatedDeltaNet requires global packed cu_seqlens"
+                )
+            core_attn_out, _ = head_parallel_gated_delta_net(
+                self._causal_conv1d_fn,
+                self._chunk_gated_delta_rule,
                 query,
                 key,
                 value,
-                g=g,
-                beta=beta,
+                b,
+                a,
+                convolution_weight=self.conv1d.weight.squeeze(1),
+                convolution_bias=self.conv1d.bias,
+                convolution_activation=self.activation,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                process_group=self.cp_group,
+                global_cu_seqlens=global_cu_seqlens,
+                num_key_heads=self.num_k_heads,
+                num_value_heads=self.num_v_heads,
+                initial_state=None,
+                output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-                cp_context=cp_context,
             )
         else:
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+            if self._causal_conv1d_fn is not None:
+                seq_idx = None
+                if cu_seqlens is not None:
+                    seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+                    seq_idx = torch.repeat_interleave(
+                        torch.arange(
+                            seg_lens.numel(),
+                            dtype=torch.int32,
+                            device=hidden_states.device,
+                        ),
+                        seg_lens,
+                    ).unsqueeze(0)
+                mixed_qkv = self._causal_conv1d_fn(
+                    x=mixed_qkv,
+                    weight=self.conv1d.weight.squeeze(1),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    seq_idx=seq_idx,
+                )
+            elif cu_seqlens is not None:
+                cu = cu_seqlens.tolist()
+                conv_outs = []
+                for start, stop in zip(cu[:-1], cu[1:], strict=True):
+                    if start == stop:
+                        continue
+                    conv_outs.append(
+                        self.conv1d(mixed_qkv[:, :, start:stop])[:, :, : stop - start]
+                    )
+                mixed_qkv = F.silu(torch.cat(conv_outs, dim=-1))
+            else:
+                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+            query, key, value = torch.split(
+                mixed_qkv,
+                [self.key_dim, self.key_dim, self.value_dim],
+                dim=-1,
+            )
+            query = query.reshape(
+                batch_size, seq_len, self.num_k_heads, self.head_k_dim
+            )
+            key = key.reshape(
+                batch_size, seq_len, self.num_k_heads, self.head_k_dim
+            )
+            value = value.reshape(
+                batch_size, seq_len, self.num_v_heads, self.head_v_dim
+            )
+            beta = b.sigmoid()
+            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+            if self.num_v_heads // self.num_k_heads > 1:
+                replication = self.num_v_heads // self.num_k_heads
+                query = query.repeat_interleave(replication, dim=2)
+                key = key.repeat_interleave(replication, dim=2)
             core_attn_out, _ = self._chunk_gated_delta_rule(
                 query,
                 key,
@@ -484,14 +506,26 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
                 f"v4 -> flash_attn.cute)."
             )
         self._flash_attn_call = self.func
+        # This model calls the varlen entry point directly rather than through the attention integration that
+        # consumes FLASH_ATTENTION_DETERMINISTIC, so a determinism request has no reader on this path unless it is
+        # read here. Resolving it at construction means a request the installed kernel cannot honour at this head
+        # dimension refuses before any training runs.
+        self._deterministic = resolve_flash_attention_determinism(
+            self.func, config.head_dim, f"flash_attention_{flash_attn_version}"
+        )
 
     def _compute_attention(self, q, k, v, cu_seqlens, max_seqlen):
         # Keyword args work for all FA versions; positional differs (FA4 inserts `qv` at arg 4).
+        # `deterministic` is passed only when it was asked for, so a job that did not ask calls the entry point
+        # with the arguments it always did, and a build whose signature lacks the keyword is reached only by a
+        # request that has already been checked against it.
+        deterministic = {"deterministic": True} if self._deterministic else {}
         out = self._flash_attn_call(
             q, k, v,
             cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
             causal=True,
+            **deterministic,
         )
         if isinstance(out, tuple):
             out = out[0]
@@ -590,6 +624,24 @@ def _get_gated_attention(config: Qwen3_5MoeConfig) -> nn.Module:
     return QWEN35MOE_ATTN_IMPL2CLASS[attn_impl](attn_config)
 
 
+def _shared_expert_gate(
+    hidden_states: torch.Tensor,
+    gate: nn.Linear,
+) -> torch.Tensor:
+    """Compute the scalar shared-expert gate without BF16 GEMM-shape rounding.
+
+    Sequence parallelism changes the token dimension of this ``D -> 1``
+    projection. cuBLAS can select a different BF16 kernel for the sharded
+    matrix, and a one-ULP gate change is amplified by later residual layers.
+    Keeping the reduction and sigmoid in FP32 makes the token-local result
+    stable without gathering sequence shards.
+    """
+    bias = gate.bias.float() if gate.bias is not None else None
+    with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+        logits = F.linear(hidden_states.float(), gate.weight.float(), bias)
+        return torch.sigmoid(logits).to(dtype=hidden_states.dtype)
+
+
 class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3_5MoeConfig, layer_idx: int):
         super().__init__()
@@ -659,7 +711,10 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
         bs, slen, dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, dim)
         shared_output = self.shared_expert(hidden_flat)
-        shared_output = F.sigmoid(self.shared_expert_gate(hidden_flat)) * shared_output
+        shared_output = _shared_expert_gate(
+            hidden_flat,
+            self.shared_expert_gate,
+        ) * shared_output
         shared_output = shared_output.view(bs, slen, dim)
 
         hidden_states = residual + routed_output + shared_output
@@ -1046,11 +1101,24 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             )
 
         hidden_states = outputs.last_hidden_state
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # Action-mask positions index the full sequence, so they have to move into the kept columns' space
+        # before the hidden states, labels and temperatures are narrowed to it.
+        action_masks = slice_action_masks_for_logits_to_keep(
+            action_masks,
+            batch_size=int(hidden_states.shape[0]),
+            original_seq_len=int(hidden_states.shape[1]),
+            logits_to_keep=logits_to_keep,
+        )
+        if isinstance(logits_to_keep, int):
+            slice_indices = slice(-logits_to_keep, None) if logits_to_keep > 0 else slice(None)
+        else:
+            slice_indices = logits_to_keep
         return self.lm_head(
             hidden_states[:, slice_indices, :],
-            labels[:, slice_indices] if labels is not None else None,
-            temperature=temperature,
+            inherit_lm_head_target_validation(labels, labels[:, slice_indices])
+            if labels is not None
+            else None,
+            temperature=temperature[:, slice_indices] if temperature is not None else None,
             action_masks=action_masks,
         )
 
