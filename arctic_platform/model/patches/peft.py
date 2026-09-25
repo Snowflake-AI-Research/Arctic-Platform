@@ -81,7 +81,7 @@ def apply_peft(
     ``peft_type`` accepts PEFT's canonical registry names (e.g. ``LORA``) and
     legacy config-class names (e.g. ``Lora``). FP8 bases disable PEFT's adapter autocast and cast all trainable
     tensors to ``optimization_dtype`` (default bf16) before optimizer flat buffers are built.
-    Model-specific expert tagging and tiled-forward hooks belong to the caller.
+    Model-specific expert tagging belongs to the caller.
     """
     validate_peft_config(peft_config)
     if peft_config is None:
@@ -97,6 +97,9 @@ def apply_peft(
         model = peft.get_peft_model(model, config)
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
+    from arctic_platform.model.patches._tiled_mlp import register_tiled_mlp_peft_parameter_wrappers
+
+    register_tiled_mlp_peft_parameter_wrappers(model)
     return model
 
 

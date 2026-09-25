@@ -16,3 +16,4 @@
 
 from arctic_platform.model.loaders import huggingface  # noqa: F401
 from arctic_platform.model.loaders import qwen3_5_moe  # noqa: F401
+from arctic_platform.model.loaders import qwen_dense  # noqa: F401
