@@ -29,6 +29,7 @@ Reward scheme (matching V6b non-semantic-model behavior):
 import json
 import re
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 
@@ -175,22 +176,35 @@ def _execute_sql(db_path: str, sql: str, timeout: float = SQL_TIMEOUT) -> frozen
         return e
 
 
-def _execute_with_timeout(db_path: str, sql: str, timeout: float = SQL_TIMEOUT) -> frozenset | Exception:
-    """Execute SQL with a timeout using a thread pool.
+# Shared pool: a fresh executor per query leaked threads into the SQL timeout.
+_SQL_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="bird-sql")
+_GOLD_LOCK = threading.Lock()
+_GOLD_RESULTS: dict[tuple[str, str], frozenset | Exception] = {}
 
-    Uses shutdown(wait=False) to avoid blocking if the SQLite thread is stuck.
-    The SQLite progress handler provides cooperative cancellation.
-    """
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_execute_sql, db_path, sql, timeout)
+
+def _execute_with_timeout(db_path: str, sql: str, timeout: float = SQL_TIMEOUT) -> frozenset | Exception:
+    """Execute SQL with a timeout on the shared pool."""
+    future = _SQL_POOL.submit(_execute_sql, db_path, sql, timeout)
     try:
         return future.result(timeout=timeout + 2)
     except FuturesTimeoutError:
         return TimeoutError(f"SQL execution exceeded {timeout}s")
     except Exception as e:
         return e
-    finally:
-        executor.shutdown(wait=False)
+
+
+def _cached_gold_result(db_path: str, gold_sql: str, timeout: float) -> frozenset | Exception:
+    """Gold SQL is identical across a GRPO group; execute it once per (db, sql)."""
+    limited = _add_limit_to_query(gold_sql)
+    key = (db_path, limited)
+    with _GOLD_LOCK:
+        hit = _GOLD_RESULTS.get(key)
+        if hit is not None:
+            return hit
+    result = _execute_with_timeout(db_path, limited, timeout)
+    with _GOLD_LOCK:
+        _GOLD_RESULTS[key] = result
+    return result
 
 
 def _compare_results(
@@ -206,7 +220,7 @@ def _compare_results(
         - 0.1 if pred executes but doesn't match any gold
         - 0.0 if pred fails to execute
 
-    Caches gold results within this call to avoid re-execution.
+    Gold results are cached process-wide so a GRPO group does not re-run gold.
     """
     pred_sql_limited = _add_limit_to_query(pred_sql)
     pred_result = _execute_with_timeout(db_path, pred_sql_limited, timeout)
@@ -214,13 +228,9 @@ def _compare_results(
     if isinstance(pred_result, Exception):
         return 0.0, False
 
-    gold_cache: dict[str, frozenset | Exception] = {}
     scores = []
     for gold_sql in gold_sqls:
-        if gold_sql not in gold_cache:
-            gold_sql_limited = _add_limit_to_query(gold_sql)
-            gold_cache[gold_sql] = _execute_with_timeout(db_path, gold_sql_limited, timeout)
-        gold_result = gold_cache[gold_sql]
+        gold_result = _cached_gold_result(db_path, gold_sql, timeout)
 
         if isinstance(gold_result, Exception):
             scores.append(0.0)

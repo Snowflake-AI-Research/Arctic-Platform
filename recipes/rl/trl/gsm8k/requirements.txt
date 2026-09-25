@@ -1,0 +1,12 @@
+# Simple GSM8K TRL recipe — pinned Python dependencies.
+#
+# Assumes CUDA 13.0 / torch 2.11 (installed separately against the PyTorch
+# cu130 index). `flash-attn` is also installed separately (`--no-build-isolation`).
+# Same env as the sibling txt2sql recipe.
+
+accelerate
+arctic-platform[rl]
+datasets
+kernels>=0.16.0,<0.17.0
+openai>=2.54.0
+wandb
