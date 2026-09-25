@@ -37,10 +37,13 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import SecretStr
+from pydantic import field_validator
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
+
+from arctic_platform.common.config import validate_peft_config
 
 JobId = int | str
 
@@ -190,8 +193,8 @@ class TrainingConfig(BaseModel):
         None,
         description=(
             "PEFT adapter config (peft_type, r, lora_alpha, lora_dropout, bias, target_modules). "
-            "None = dense fine-tuning. Applied to the training job and, when sampling is allocated, "
-            "to the sampling engine so it can serve the adapter."
+            "None = dense fine-tuning; an empty config is invalid. On-prem supports training; "
+            "Cortex also configures the sampling engine to serve the adapter."
         ),
     )
     cuda_ipc: bool = Field(
@@ -209,6 +212,18 @@ class TrainingConfig(BaseModel):
             "instead of the whole model. Optional override on sync_weights()."
         ),
     )
+
+    _validate_peft = field_validator("peft")(validate_peft_config)
+
+    @model_validator(mode="after")
+    def _resolve_worker_peft(self) -> Self:
+        worker_peft = (self.ds_worker_config or {}).get("peft_config")
+        validate_peft_config(worker_peft)
+        if worker_peft is not None:
+            if self.peft is not None and self.peft != worker_peft:
+                raise ValueError("training.peft conflicts with training.ds_worker_config.peft_config")
+            self.peft = worker_peft
+        return self
 
 
 class ArcticClientConfig(BaseModel):
@@ -246,14 +261,14 @@ class ArcticClientConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_backend_supports_peft(self) -> Self:
-        # The on-prem server has no PEFT path, and to_onprem() has nowhere to put an
-        # adapter config. Silently training dense after asking for LoRA burns a run,
-        # so refuse the combination before any job or GPU is claimed.
-        if self.training.peft and self.backend.type == "onprem":
+        if (
+            self.training.peft is not None
+            and self.backend.type == "onprem"
+            and (self.sampling_gpus > 0 or self.sampling_job_id is not None)
+        ):
             raise ValueError(
-                "training.peft is only supported by the remote Cortex backend; "
-                "the on-prem server trains dense only. Drop training.peft, or "
-                "switch backend to CortexConfig."
+                "On-prem PEFT supports training only; adapter sync to sampling is not implemented. "
+                "Use sampling_gpus=0 without a sampling_job_id, or switch to CortexConfig."
             )
         return self
 
@@ -277,8 +292,12 @@ class ArcticClientConfig(BaseModel):
             payload["full_determinism"] = tc.full_determinism
             if tc.ds_config:
                 payload["ds_config"] = tc.ds_config
-            if tc.ds_worker_config:
-                payload["ds_worker_config"] = tc.ds_worker_config
+            worker = dict(tc.ds_worker_config or {})
+            worker.pop("peft_config", None)
+            if job_type == "training" and tc.peft is not None:
+                worker["peft_config"] = dict(tc.peft)
+            if worker:
+                payload["ds_worker_config"] = worker
             if job_type == "training":
                 if tc.checkpoint_path:
                     payload["checkpoint_path"] = tc.checkpoint_path

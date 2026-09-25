@@ -23,16 +23,16 @@ import torch.nn as nn
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 
-# Mutates the model in place. A patch reads its own settings (and any sibling
+# Mutates in place or returns a replacement. Reads its settings (and any sibling
 # patches it cares about) off ctx.spec.patches.
-Patch = Callable[[nn.Module, LoaderContext], None]
+Patch = Callable[[nn.Module, LoaderContext], nn.Module | None]
 
 
 # Canonical order (every registered patch must appear here).
-# liger → zorro_train (replaces forward) → gradient_checkpointing (before DS wrap).
+# liger → zorro_train (replaces forward) → gradient_checkpointing → peft (before DS wrap).
 # Note: ZoRRo's patched forward does not call `_gradient_checkpointing_func`, so GC
 # under ZoRRo is a no-op for activation savings (same as the old inline worker path).
-PATCH_ORDER: tuple[str, ...] = ("liger", "zorro_train", "gradient_checkpointing")
+PATCH_ORDER: tuple[str, ...] = ("liger", "zorro_train", "gradient_checkpointing", "peft")
 
 _PATCHES: dict[str, Patch] = {}
 
@@ -60,6 +60,8 @@ def apply_patches(loaded: LoadedModel, ctx: LoaderContext) -> None:
             continue
         if not getattr(ctx.spec.patches, name, None):
             continue
-        _PATCHES[name](loaded.model, ctx)
+        replacement = _PATCHES[name](loaded.model, ctx)
+        if replacement is not None:
+            loaded.model = replacement
         applied.add(name)
     loaded.applied_patches = frozenset(applied)

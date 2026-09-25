@@ -15,6 +15,14 @@ concurrency:
 jobs:
   unit-tests:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - transformers: '5.12.1'
+            peft: '0.19.1'
+          - transformers: '5.15.0'
+            peft: '0.19.1'
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
@@ -31,7 +39,7 @@ jobs:
       - name: Restore cached virtualenv
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
         with:
-          key: venv-${{ runner.os }}-${{ steps.setup_python.outputs.python-version }}-${{ steps.get_latest_versions.outputs.versions }}-${{ hashFiles('pyproject.toml') }}
+          key: venv-${{ runner.os }}-${{ steps.setup_python.outputs.python-version }}-${{ steps.get_latest_versions.outputs.versions }}-transformers-${{ matrix.transformers }}-peft-${{ matrix.peft }}-${{ hashFiles('pyproject.toml') }}
           path: .venv
       - name: Restore cached torch extensions
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
@@ -53,7 +61,7 @@ jobs:
           echo "$VIRTUAL_ENV/bin" >> $GITHUB_PATH
           echo "VIRTUAL_ENV=$VIRTUAL_ENV" >> $GITHUB_ENV
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-          uv pip install ".[sft,testing]"
+          uv pip install ".[sft,testing]" "transformers==${{ matrix.transformers }}" "peft==${{ matrix.peft }}"
       - name: Environment print
         run: |
           uv pip list

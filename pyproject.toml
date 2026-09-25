@@ -119,10 +119,12 @@ sft = [
     "fastapi",
     "liger-kernel>=0.8.0",
     "nvidia-ml-py",
+    "peft>=0.18,<0.20",
     "psutil",
     "ray",
     "tensordict",
-    "transformers",
+    # PEFT 0.19 adapter reload imports EmbeddingParallel, removed in Transformers 5.16.
+    "transformers>=5.12.1,<5.16",
     "uvicorn",
 ]
 

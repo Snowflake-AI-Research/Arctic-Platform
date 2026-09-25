@@ -80,6 +80,8 @@ def _check_weight_format(config: ArcticClientConfig, weight_format: str | None) 
     On-prem's ``WeightSyncRequest`` ignores unknown fields, so an unsupported
     format would silently full-sync dense weights instead of the adapter.
     """
+    if config.training.peft is not None and config.backend.type == "onprem":
+        raise ValueError("On-prem PEFT adapter sync to sampling is not implemented")
     if weight_format is not None and config.backend.type == "onprem":
         raise ValueError(
             f"weight_format={weight_format!r} is only supported by the remote Cortex backend; "

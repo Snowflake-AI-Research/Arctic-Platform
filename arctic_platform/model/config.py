@@ -23,6 +23,8 @@ from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
 
+from arctic_platform.common.config import validate_peft_config
+
 
 class ParallelismConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
@@ -56,6 +58,9 @@ class Patches(BaseModel):
     liger: bool = Field(False, description="Apply Liger kernels.")
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
     gradient_checkpointing: bool = Field(False, description="HF gradient checkpointing.")
+    peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
+
+    _validate_peft = field_validator("peft")(validate_peft_config)
 
 
 class ModelSpec(BaseModel):
@@ -121,6 +126,7 @@ class ModelSpec(BaseModel):
                 liger=cfg.get("use_liger", False),
                 zorro_train=zorro_train_patch,
                 gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
+                peft=cfg.get("peft_config"),
             ),
         )
 
@@ -148,4 +154,6 @@ class ModelSpec(BaseModel):
         options_model = get_loader_options_model(self.loader)
         if options_model is not None:
             self.loader_options = options_model.model_validate(self.loader_options).model_dump()
+        if self.patches.peft and self.loader == "qwen3_5_moe":
+            raise ValueError("qwen3_5_moe PEFT requires expert adapter integration, which is not yet supported")
         return self
