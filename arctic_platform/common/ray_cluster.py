@@ -258,7 +258,10 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
                 "workers that would block forever"
             )
     except Exception:
-        _shutdown()
+        try:
+            _shutdown()
+        except Exception:
+            logger.exception("failed to tear down Ray head after init_ray_cluster error")
         raise
 
 
@@ -299,10 +302,16 @@ def _shutdown() -> None:
     # appears on each daemon's command line (raylet/gcs_server/dashboard/...).
     basename = os.path.basename(_spawned_temp_dir)
     kill_cmd = ["pkill", "-9", "-f", basename]
-    subprocess.run(kill_cmd, check=False, timeout=120)
-    peers = _peer_hosts()
-    if peers:
-        _pdsh(peers, kill_cmd, check=False, timeout=180, capture_output=True)
+    try:
+        subprocess.run(kill_cmd, check=False, timeout=120)
+    except Exception:
+        logger.exception("failed to pkill Ray head for temp dir %s", basename)
+    try:
+        peers = _peer_hosts()
+        if peers:
+            _pdsh(peers, kill_cmd, check=False, timeout=180, capture_output=True)
+    except Exception:
+        logger.exception("failed to pdsh-kill Ray workers after head teardown")
     shutil.rmtree(_spawned_temp_dir, ignore_errors=True)
     _spawned_temp_dir = None
     _reset_cached_ray_address()

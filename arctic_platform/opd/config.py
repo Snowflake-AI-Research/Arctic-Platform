@@ -51,8 +51,11 @@ _CLUSTER_PORT_KEYS = (
 def _hostfile_hosts(path: str | None) -> set[str]:
     if not path:
         return set()
-    with open(path, encoding="utf-8") as handle:
-        lines = handle.readlines()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError as exc:
+        raise ValueError(f"could not read Ray hostfile {path}: {exc}") from exc
     return {ln.split()[0] for ln in lines if ln.strip() and not ln.strip().startswith("#")}
 
 
@@ -81,11 +84,16 @@ def _local_cluster_env(http_port: int) -> dict[str, str]:
 
 
 def _occupied_cluster_ports(env: dict[str, str]) -> set[int]:
-    ports = {int(env[key]) for key in _CLUSTER_PORT_KEYS}
-    lo = int(env["ARL_RAY_MIN_WORKER_PORT"])
-    hi = int(env["ARL_RAY_MAX_WORKER_PORT"])
-    ports.update(range(lo, hi + 1))
+    ports = {int(env[key]) for key in _CLUSTER_PORT_KEYS if key in env}
+    if "ARL_RAY_MIN_WORKER_PORT" in env and "ARL_RAY_MAX_WORKER_PORT" in env:
+        lo = int(env["ARL_RAY_MIN_WORKER_PORT"])
+        hi = int(env["ARL_RAY_MAX_WORKER_PORT"])
+        ports.update(range(lo, hi + 1))
     return ports
+
+
+def _effective_cluster_env(http_port: int, extra_env: dict[str, str]) -> dict[str, str]:
+    return {**_local_cluster_env(http_port), **extra_env}
 
 
 class ArcticOPDClientConfig(BaseModel):
@@ -136,15 +144,22 @@ class ArcticOPDClientConfig(BaseModel):
             teacher_port = self.teacher_port or self.backend.port + 1
             if teacher_port == self.backend.port:
                 raise ValueError("teacher_port must differ from the student server port")
-            student_ports = _occupied_cluster_ports(_local_cluster_env(self.backend.port))
-            teacher_ports = _occupied_cluster_ports(_local_cluster_env(teacher_port))
-            overlap = student_ports & teacher_ports
+            extra_env = dict(self.backend.server_extra_env)
+            student_env = _effective_cluster_env(self.backend.port, extra_env)
+            teacher_env = _effective_cluster_env(teacher_port, extra_env)
+            student_ports = _occupied_cluster_ports(student_env)
+            teacher_ports = _occupied_cluster_ports(teacher_env)
+            if self.backend.port in student_ports:
+                raise ValueError(f"student HTTP port {self.backend.port} collides with its Ray/DeepSpeed ports")
+            if teacher_port in teacher_ports:
+                raise ValueError(f"teacher HTTP port {teacher_port} collides with its Ray/DeepSpeed ports")
+            overlap = (student_ports | {self.backend.port}) & (teacher_ports | {teacher_port})
             if overlap:
                 raise ValueError(
                     "student and teacher HTTP ports map to overlapping Ray/DeepSpeed ports "
                     f"(student={self.backend.port}, teacher={teacher_port}, "
                     f"shared={sorted(overlap)[:8]}); pick ports that differ modulo "
-                    f"{_CLUSTER_SLOT_MOD}"
+                    f"{_CLUSTER_SLOT_MOD} and do not override server_extra_env onto a shared port"
                 )
             student_devices = self.backend.server_cuda_visible_devices
             teacher_devices = self.teacher_server_cuda_visible_devices

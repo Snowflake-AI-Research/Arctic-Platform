@@ -136,8 +136,10 @@ def test_cortex_fwd_bwd_puts_teacher_logprobs_on_batch_path():
         },
         None,
     )
-    assert "teacher_log_probs_shifted" in body["kwargs"]
-    assert "loss_mask" in body["kwargs"]
+    assert "teacher_log_probs_shifted" not in body["kwargs"]
+    assert "loss_mask" not in body["kwargs"]
+    assert "teacher_log_probs_shifted" in body["context"]
+    assert "loss_mask" in body["context"]
     _, batch_data, _, _ = unpack_batch(body)
     assert "teacher_log_probs_shifted" in batch_data
     assert "loss_mask" in batch_data
@@ -340,7 +342,7 @@ def test_local_launch_rejects_http_ports_that_share_a_cluster_slot():
 
 
 def test_missing_ray_hostfile_raises():
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ValueError, match="could not read Ray hostfile"):
         ArcticOPDClientConfig(
             student_model="student",
             teacher_model="teacher",
@@ -352,6 +354,43 @@ def test_missing_ray_hostfile_raises():
             teacher_ray_hostfile="/no/such/teacher.hosts",
             backend=OnPremConfig(
                 launch_local_server=True,
+                server_cuda_visible_devices="0",
+            ),
+        )
+
+
+def test_local_launch_rejects_server_extra_env_that_shares_a_ray_port():
+    with pytest.raises(ValueError, match="overlapping Ray/DeepSpeed ports"):
+        ArcticOPDClientConfig(
+            student_model="student",
+            teacher_model="teacher",
+            training_gpus=1,
+            sampling_gpus=1,
+            teacher_sampling_gpus=1,
+            teacher_port=18101,
+            teacher_server_cuda_visible_devices="1",
+            backend=OnPremConfig(
+                launch_local_server=True,
+                port=18100,
+                server_cuda_visible_devices="0",
+                server_extra_env={"RAY_PORT": "29999"},
+            ),
+        )
+
+
+def test_local_launch_rejects_http_port_that_equals_generated_ray_port():
+    with pytest.raises(ValueError, match="collides with its Ray/DeepSpeed ports"):
+        ArcticOPDClientConfig(
+            student_model="student",
+            teacher_model="teacher",
+            training_gpus=1,
+            sampling_gpus=1,
+            teacher_sampling_gpus=1,
+            teacher_port=25002,
+            teacher_server_cuda_visible_devices="1",
+            backend=OnPremConfig(
+                launch_local_server=True,
+                port=25000,
                 server_cuda_visible_devices="0",
             ),
         )

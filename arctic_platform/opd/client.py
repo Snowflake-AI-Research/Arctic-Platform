@@ -22,7 +22,6 @@ from typing import Any
 from arctic_platform.client.config import CortexConfig
 from arctic_platform.client.rl import ArcticRLClient
 from arctic_platform.client.transport import Request
-from arctic_platform.common.utils.batch import BATCH_DIM_CONTEXT_KEYS
 from arctic_platform.opd.config import ArcticOPDClientConfig
 
 DEFAULT_PROCESSING = {
@@ -46,8 +45,10 @@ def _fwd_bwd_body(
     descriptor = processing or DEFAULT_PROCESSING
     meta_payload = {"zorro_train_enable": False, **(meta or {})}
     if isinstance(config.backend, CortexConfig):
+        # Model-forward keys only. Loss tensors stay in ``context`` and are
+        # promoted onto ``batch`` via ``BATCH_DIM_CONTEXT_KEYS`` (same split as GRPO).
         model_keys = {"input_ids", "attention_mask", "position_ids", "use_cache"}
-        kwargs = {key: value for key, value in batch.items() if key in model_keys or key in BATCH_DIM_CONTEXT_KEYS}
+        kwargs = {key: value for key, value in batch.items() if key in model_keys}
         return {
             "args": (),
             "kwargs": kwargs,
