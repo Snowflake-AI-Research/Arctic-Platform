@@ -51,6 +51,7 @@ first use.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -75,6 +76,9 @@ from .packed_reduction import combine_packed_losses
 from .packed_reduction import combine_packed_metrics
 from .packed_reduction import metric_is_summed  # noqa: F401  # re-exported
 from .packed_reduction import resolve_packed_loss_reduction
+from .packing import derive_varlen_model_kwargs
+from .packing import model_reads_varlen_kwargs
+from .packing import packing_boundaries_from_attention_mask
 
 try:
     from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
@@ -107,6 +111,7 @@ _ENGINE_FWD_KEYS = frozenset(
         "cu_seq_lens_k",
         "max_length_q",
         "max_length_k",
+        "seq_idx",
     }
 )
 # Blocked even if listed in ``fwd_meta_keys``. ``labels`` stays on the allowlist
@@ -296,6 +301,72 @@ def dump_dict_payload(payload: dict, tag: str):
 c = 0
 
 
+def _merge_varlen_model_kwargs(engine, batch: dict) -> dict:
+    """Forward packing boundaries to linear-attention models (Qwen3.5 GDN/conv1d)."""
+    model = getattr(engine, "module", engine)
+    if not model_reads_varlen_kwargs(model):
+        return batch
+    extra = derive_varlen_model_kwargs(batch)
+    if extra:
+        batch = {**batch, **extra}
+    return batch
+
+
+def _unwrap_engine_module(engine) -> Any:
+    module = getattr(engine, "module", engine)
+    return getattr(module, "module", module)
+
+
+def uses_chunked_fp32_lm_head(engine) -> bool:
+    """True when ``inject_prime_lm_head`` replaced the HF ``lm_head``."""
+    head = getattr(_unwrap_engine_module(engine), "lm_head", None)
+    return bool(getattr(head, "chunk_size", None) or getattr(head, "fp32_lm_head", False))
+
+
+def _maybe_add_chunked_lm_head_kwargs(engine, fwd_kwargs: dict) -> dict:
+    """FusedOutputLinear requires ``labels`` + per-token ``temperature``.
+
+    Only inject when the student actually has the chunked/fp32 head so a
+    vanilla HF forward is not asked to run causal LM CE from our roll labels.
+    """
+    if not uses_chunked_fp32_lm_head(engine):
+        return fwd_kwargs
+    input_ids = fwd_kwargs.get("input_ids")
+    if not torch.is_tensor(input_ids):
+        return fwd_kwargs
+    ids = input_ids.unsqueeze(0) if input_ids.ndim == 1 else input_ids
+    out = dict(fwd_kwargs)
+    out["input_ids"] = ids
+    position_ids = out.get("position_ids")
+    if torch.is_tensor(position_ids) and position_ids.ndim == 1:
+        out["position_ids"] = position_ids.unsqueeze(0)
+    if "labels" not in out or out["labels"] is None:
+        out["labels"] = torch.roll(ids, shifts=-1, dims=-1)
+    if "temperature" not in out or out["temperature"] is None:
+        out["temperature"] = torch.ones(ids.shape, dtype=torch.float32, device=ids.device)
+    return out
+
+
+def collect_model_outputs(outputs) -> dict[str, Any]:
+    """Accept HF ModelOutput objects or ``PrimeLmOutput`` dicts from the chunked head."""
+    model_outputs: dict[str, Any] = {}
+    if isinstance(outputs, Mapping):
+        for key in ("logits", "logprobs", "entropy", "loss"):
+            value = outputs.get(key)
+            if value is not None:
+                model_outputs[key] = value
+        return model_outputs
+    if hasattr(outputs, "logits") and outputs.logits is not None:
+        model_outputs["logits"] = outputs.logits
+    if hasattr(outputs, "logprobs") and outputs.logprobs is not None:
+        model_outputs["logprobs"] = outputs.logprobs
+    if hasattr(outputs, "entropy") and outputs.entropy is not None:
+        model_outputs["entropy"] = outputs.entropy
+    if hasattr(outputs, "loss") and outputs.loss is not None:
+        model_outputs["loss"] = outputs.loss
+    return model_outputs
+
+
 def run_pipeline(
     engine,
     args: tuple,
@@ -412,17 +483,25 @@ def run_pipeline(
     # ``meta['fwd_meta_keys']`` may add keys; blocked loss tensors never pass.
 
     pack_with_unpad = True  # XXX: make configurable?
-    already_packed = "cu_seqlens" in batch or "cu_seqlens" in meta
+    # Inner packing / pack_for_dss already flattened sequences. Unpad expects
+    # attention_mask / prompts that those packed batches omit.
+    already_packed = batch.get("cu_seqlens") is not None or (
+        isinstance(meta, dict) and meta.get("cu_seqlens") is not None
+    )
     if already_packed:
-        # Inner packing call and pack_for_dss already flattened sequences.
-        # Unpad expects attention_mask / prompts that packed mb_kwargs omit.
         pack_with_unpad = False
 
     # XXX: could the zorro parts be folded back into the model? this will also change when we start packing on the client side
     zorro_train_enable = meta.get("zorro_train_enable", False)
+    did_unpad = False
     # pr0(f"{zorro_train_enable=}")
 
-    if (pack_with_unpad or zorro_train_enable) and "attention_mask" in batch and "prompts" in batch:
+    if (
+        not already_packed
+        and (pack_with_unpad or zorro_train_enable)
+        and "attention_mask" in batch
+        and "prompts" in batch
+    ):
         batch = compute_packing_info_for_batch(batch)
 
     if zorro_train_enable:
@@ -439,10 +518,16 @@ def run_pipeline(
 
     # pr0(f"{pack_with_unpad=}")
 
-    if pack_with_unpad:
+    if pack_with_unpad and not already_packed:
         pad_token = meta["pad_token_id"]
         attention_mask_2d_bool = batch["attention_mask"].bool()
+        cu_seqlens, packed_position_ids = packing_boundaries_from_attention_mask(attention_mask_2d_bool)
         batch = padded_tensor_2d_dict_to_unpadded_tensor_1d_dict(batch, attention_mask_2d_bool)
+        batch["cu_seqlens"] = cu_seqlens.to(batch["input_ids"].device)
+        batch["position_ids"] = packed_position_ids.to(batch["input_ids"].device)
+        did_unpad = True
+
+    batch = _merge_varlen_model_kwargs(engine, batch)
 
     log_dp_shard_tokens(
         engine.global_rank,
@@ -457,7 +542,8 @@ def run_pipeline(
     with prof_fwd():
         # Isolation: only model-bound keys reach engine(). Zorro reads
         # calculate_entropy; loss tensors stay on batch/meta for posts/losses.
-        fwd_kwargs = _engine_forward_kwargs(batch, meta)
+        # Chunked/fp32 LM head still needs labels + temperature when present.
+        fwd_kwargs = _maybe_add_chunked_lm_head_kwargs(engine, _engine_forward_kwargs(batch, meta))
         if backward is False:
             engine.eval()
             with torch.no_grad():
@@ -472,15 +558,7 @@ def run_pipeline(
     see_memory_usage("after fwd", force=True)
     prof_fwd.report()
 
-    model_outputs: dict[str, Any] = {}
-    if hasattr(outputs, "logits"):
-        model_outputs["logits"] = outputs.logits
-    if hasattr(outputs, "logprobs"):
-        model_outputs["logprobs"] = outputs.logprobs
-    if hasattr(outputs, "entropy"):
-        model_outputs["entropy"] = outputs.entropy
-    if hasattr(outputs, "loss") and outputs.loss is not None:
-        model_outputs["loss"] = outputs.loss
+    model_outputs = collect_model_outputs(outputs)
 
     # --- post-forward ---
     prof_post_fwd = ProfilerContext(type=PROFILER_TYPE, name="POST-FWD")
@@ -562,7 +640,7 @@ def run_pipeline(
         )
         dump_dict_payload(pipeline_outputs["batch"], "zorro: post-fwd[after unpad_2_pad]")
 
-    if pack_with_unpad:
+    if did_unpad:
         dump_dict_payload(pipeline_outputs["batch"], "post-fwd[before unpad_2_pad]")
         pipeline_outputs["batch"] = unpadded_tensor_1d_dict_to_padded_tensor_2d_dict(
             pipeline_outputs["batch"], attention_mask_2d_bool, pad_token
@@ -620,19 +698,17 @@ def _run_pipeline_with_packing(
         pack_meta = packed.pop("_pack_meta")
 
         # 1D meta: packed tensors have shape [1, T] — squeeze for loss fns
+        # that read squeezed copies. The inner ``batch`` must still be the
+        # full packed dict so OPD ``teacher_log_probs_shifted`` / ``loss_mask``
+        # (and GRPO advantages) stay on the batch the loss sees. Isolation
+        # in ``_engine_forward_kwargs`` keeps those keys off ``engine()``.
         mb_1d = {
             k: v.squeeze(0) if torch.is_tensor(v) and v.ndim == 2 and v.shape[0] == 1 else v for k, v in packed.items()
         }
 
-        # Model always receives packed [1, T] input_ids + position_ids
-        mb_kwargs = {
-            "input_ids": packed["input_ids"],
-            "position_ids": packed["position_ids"],
-            "use_cache": False,
-        }
-        for optional_key in ("labels", "dss_compute_logprobs", "rollout_is_weights"):
-            if optional_key in packed:
-                mb_kwargs[optional_key] = packed[optional_key]
+        packed_batch = dict(packed)
+        packed_batch["use_cache"] = False
+        packed_batch.update(derive_varlen_model_kwargs(packed))
 
         if backward is True and hasattr(engine, "set_gradient_accumulation_boundary"):
             engine.set_gradient_accumulation_boundary(i == n_mbs - 1)
@@ -641,7 +717,7 @@ def _run_pipeline_with_packing(
         result = run_pipeline(
             engine,
             args,
-            mb_kwargs,
+            packed_batch,
             mb_1d,
             processing,
             device,

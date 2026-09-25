@@ -20,8 +20,9 @@
 
 Behaviour:
 1. If a Ray cluster is already running, attach to it.
-2. Otherwise start a head node locally and, if ``/job/hostfile`` lists remote
-   hosts, fan out ``ray start`` via ``pdsh``.
+2. Otherwise start a head node locally and, if the active hostfile
+   (``ARL_RAY_HOSTFILE`` or ``/job/hostfile``) lists remote hosts, fan out
+   ``ray start`` via ``pdsh``.
 3. On exit, only tear down a cluster this process started.
 """
 
@@ -44,7 +45,7 @@ from arctic_platform.common.utils.debug import pr0
 
 logger = logging.getLogger(__name__)
 
-_HOSTFILE = "/job/hostfile"
+_DEFAULT_HOSTFILE = "/job/hostfile"
 _DEFAULT_RAY_PORT = 6379
 _DEFAULT_RAY_DASHBOARD_PORT = 8265
 
@@ -97,16 +98,26 @@ def primary_ip() -> str:
         s.close()
 
 
-def _peer_hosts() -> list[str]:
-    """Return remote host entries from ``/job/hostfile``, excluding this machine."""
+def hostfile_path() -> str:
+    """Hostfile used to fan out ``ray start``. Override with ``ARL_RAY_HOSTFILE``."""
+    return os.environ.get("ARL_RAY_HOSTFILE", _DEFAULT_HOSTFILE)
+
+
+def hostfile_hosts(path: str | None = None) -> list[str]:
+    """Return host entries from a hostfile, ignoring comments and blank lines."""
     try:
-        with open(_HOSTFILE, encoding="utf-8") as f:
+        with open(path or hostfile_path(), encoding="utf-8") as f:
             lines = f.readlines()
     except OSError:
         return []
-    head = primary_ip()
-    hosts = [ln.split()[0] for ln in lines if ln.strip() and not ln.strip().startswith("#")]
-    return [h for h in hosts if h != head]
+    return [ln.split()[0] for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+
+
+def _peer_hosts(head: str | None = None) -> list[str]:
+    """Return remote host entries from the active hostfile, excluding this machine."""
+    if head is None:
+        head = primary_ip()
+    return [h for h in hostfile_hosts() if h != head]
 
 
 def _pdsh(hosts: list[str], cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -183,41 +194,75 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
     max_worker_port = os.environ.get("ARL_RAY_MAX_WORKER_PORT")
     if min_worker_port and max_worker_port:
         start_cmd += [f"--min-worker-port={min_worker_port}", f"--max-worker-port={max_worker_port}"]
+    client_server_port = os.environ.get("RAY_CLIENT_SERVER_PORT")
+    if client_server_port:
+        start_cmd += [f"--ray-client-server-port={client_server_port}"]
+    dashboard_agent_port = os.environ.get("RAY_DASHBOARD_AGENT_LISTEN_PORT")
+    if dashboard_agent_port:
+        start_cmd += [f"--dashboard-agent-listen-port={dashboard_agent_port}"]
     subprocess.run(
         start_cmd,
         check=True,
         timeout=300,
         env=os.environ,
     )
+    # Own the head immediately so a later pdsh / init failure still tears it down.
+    _spawned_cluster = True
     pr0(f"[init_ray_cluster] ray started with port {ray_port} and dashboard port {dashboard_port}")
 
-    # 3. Start workers on peer nodes (if any).
-    peers = _peer_hosts()
-    pr0(f"[init_ray_cluster] peers: {peers}")
-    gcs = read_ray_address(_spawned_temp_dir)
-    if peers:
-        logger.info("Starting Ray workers on %s (address=%s)", peers, gcs)
-        result = _pdsh(
-            peers,
-            [r, "start", f"--address={gcs}", f"--temp-dir={_spawned_temp_dir}", "--disable-usage-stats"],
-            check=False,
-            timeout=600,
-        )
-        if result.returncode != 0:
-            logger.warning("pdsh ray start returned exit code %d", result.returncode)
+    try:
+        # 3. Start workers on peer nodes (if any). Unset CUDA_VISIBLE_DEVICES on the
+        # remote so a head that is hiding local GPUs (OPD teacher on a disjoint
+        # hostfile) does not hide GPUs on the worker node if ssh forwards the env.
+        peers = _peer_hosts()
+        pr0(f"[init_ray_cluster] hostfile={hostfile_path()} peers={peers}")
+        gcs = read_ray_address(_spawned_temp_dir)
+        if peers:
+            logger.info("Starting Ray workers on %s (address=%s)", peers, gcs)
+            result = _pdsh(
+                peers,
+                [
+                    "env",
+                    "-u",
+                    "CUDA_VISIBLE_DEVICES",
+                    r,
+                    "start",
+                    f"--address={gcs}",
+                    f"--temp-dir={_spawned_temp_dir}",
+                    "--disable-usage-stats",
+                ],
+                check=False,
+                timeout=600,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"pdsh ray start on {peers} failed with exit code {result.returncode} "
+                    "(missing remote env/python is a common cause)"
+                )
 
-    _spawned_cluster = True
-    # Use the explicit GCS address instead of ``auto`` so we don't accidentally
-    # reconnect to a different Ray cluster running on this host.
-    ray.init(address=gcs, ignore_reinit_error=True, log_to_driver=True)
-    pr0(f"[init_ray_cluster] ray initialized with address {gcs}")
-    resources = ray.available_resources()
-    logger.info(
-        "Ray cluster: %.0f GPU(s), %.0f CPU(s), %d node(s)",
-        resources.get("GPU", 0),
-        resources.get("CPU", 0),
-        sum(1 for k in resources if k.startswith("node:")),
-    )
+        # Use the explicit GCS address instead of ``auto`` so we don't accidentally
+        # reconnect to a different Ray cluster running on this host.
+        ray.init(address=gcs, ignore_reinit_error=True, log_to_driver=True)
+        pr0(f"[init_ray_cluster] ray initialized with address {gcs}")
+        resources = ray.available_resources()
+        n_gpu = float(resources.get("GPU", 0))
+        logger.info(
+            "Ray cluster: %.0f GPU(s), %.0f CPU(s), %d node(s)",
+            n_gpu,
+            resources.get("CPU", 0),
+            sum(1 for k in resources if k.startswith("node:")),
+        )
+        if peers and n_gpu <= 0:
+            raise RuntimeError(
+                f"Ray peers {peers} produced a cluster with 0 GPUs; refusing to schedule "
+                "workers that would block forever"
+            )
+    except Exception:
+        try:
+            _shutdown()
+        except Exception:
+            logger.exception("failed to tear down Ray head after init_ray_cluster error")
+        raise
 
 
 def _reset_cached_ray_address() -> None:
@@ -257,10 +302,16 @@ def _shutdown() -> None:
     # appears on each daemon's command line (raylet/gcs_server/dashboard/...).
     basename = os.path.basename(_spawned_temp_dir)
     kill_cmd = ["pkill", "-9", "-f", basename]
-    subprocess.run(kill_cmd, check=False, timeout=120)
-    peers = _peer_hosts()
-    if peers:
-        _pdsh(peers, kill_cmd, check=False, timeout=180, capture_output=True)
+    try:
+        subprocess.run(kill_cmd, check=False, timeout=120)
+    except Exception:
+        logger.exception("failed to pkill Ray head for temp dir %s", basename)
+    try:
+        peers = _peer_hosts()
+        if peers:
+            _pdsh(peers, kill_cmd, check=False, timeout=180, capture_output=True)
+    except Exception:
+        logger.exception("failed to pdsh-kill Ray workers after head teardown")
     shutil.rmtree(_spawned_temp_dir, ignore_errors=True)
     _spawned_temp_dir = None
     _reset_cached_ray_address()

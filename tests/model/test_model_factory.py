@@ -200,6 +200,7 @@ class TestFromDsWorkerConfig:
         assert spec.patches.liger is False
         assert spec.patches.gradient_checkpointing is True  # bridge default
         assert spec.patches.zorro_train is None  # None disables (empty patch would be truthy)
+        assert spec.patches.freeze_unused_vision_tower is False
 
     def test_requires_attn_implementation(self):
         with pytest.raises(ValueError, match="requires attn_implementation"):
@@ -209,6 +210,7 @@ class TestFromDsWorkerConfig:
         from arctic_platform.model.config import Patches
 
         assert Patches().gradient_checkpointing is False
+        assert Patches().freeze_unused_vision_tower is False
         assert ModelSpec(model_path_or_name="x").attn_implementation is None
 
     def test_liger_and_gc_flags_map(self):
@@ -220,6 +222,13 @@ class TestFromDsWorkerConfig:
         assert spec.patches.gradient_checkpointing is False
         assert spec.attn_implementation == "sdpa"
         assert spec.patches.zorro_train is None
+
+    def test_freeze_unused_vision_tower_maps(self):
+        spec = ModelSpec.from_ds_worker_config(
+            "x",
+            {"attn_implementation": "sdpa", "freeze_unused_vision_tower": True},
+        )
+        assert spec.patches.freeze_unused_vision_tower is True
 
     def test_zorro_enabled_maps_fields(self):
         spec = ModelSpec.from_ds_worker_config(

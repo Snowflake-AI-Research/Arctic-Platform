@@ -177,11 +177,16 @@ class HttpTransport(OnPremTransport):
         ]
         if bc.colocate:
             cmd.append("--colocate")
+        # A launched server owns its cluster. Attaching to another head on the
+        # host (default auto_attach) would share GPUs with a sibling OPD server.
+        cmd.append("--no-ray-auto-attach")
         env = os.environ.copy()
         if bc.server_cuda_visible_devices is not None:
             # Client may run with CUDA_VISIBLE_DEVICES= (empty); give the
             # server subprocess an explicit GPU list so Ray workers see devices.
             env["CUDA_VISIBLE_DEVICES"] = bc.server_cuda_visible_devices
+        extra_env = getattr(bc, "server_extra_env", None) or {}
+        env.update({str(key): str(value) for key, value in extra_env.items()})
         self.proc = subprocess.Popen(cmd, env=env)
         try:
             self._wait_server_healthy(bc.startup_timeout)

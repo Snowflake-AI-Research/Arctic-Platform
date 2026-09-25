@@ -156,7 +156,9 @@ def sp_size_from_job_config(job_config: Any) -> int:
 
 
 class GenerateRequest(BaseModel):
-    prompts: list[str]
+    # Token-id prompts are required for exact teacher scoring in on-policy
+    # distillation; accepting text only would retokenize sampled completions.
+    prompts: list[str | list[int]]
     sampling_params: dict[str, Any] | None = None
     routing_key: Any = None
     strict: bool = False
@@ -202,6 +204,7 @@ class WeightSyncRequest(BaseModel):
     # cuda_ipc / low_memory: None uses the training job's JobConfig values.
     source_sub_job_id: int
     target_sub_job_ids: list[int]
+    weight_format: str | None = None
     cuda_ipc: bool | None = None
     low_memory: bool | None = None
 
@@ -257,6 +260,10 @@ def build_model_config(
     from arctic_inference.server.config import ModelConfig
 
     cfg = dict(vllm_config or {})
+    cfg.setdefault(
+        "worker_extension_cls",
+        "arctic_platform.common.weight_sync_extension.TextOnlyWeightSyncExtension",
+    )
     cfg["model"] = model_name
     known_fields = set(ModelConfig.model_fields.keys())
     cfg.update(parse_arctic_inference_rollout(arctic_inference_config, known_fields))

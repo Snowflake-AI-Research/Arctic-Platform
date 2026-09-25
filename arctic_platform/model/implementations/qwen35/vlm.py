@@ -87,6 +87,27 @@ def get_layer_prefix(model_config: PretrainedConfig, override: str | None = None
     return DEFAULT_LAYER_PREFIX
 
 
+def freeze_unused_vision_tower(model: nn.Module, rank: int = 0) -> int:
+    """Freeze a VLM vision tower that a text-only job will never activate.
+
+    Qwen3.5 checkpoints ship a composite config, so ``AutoModelForCausalLM``
+    instantiates language model plus ViT even for pure-text distillation.
+    Those vision params produce no gradients; ZeRO-3 waits on every trainable
+    param at the accumulation boundary and can stall. Returns the number of
+    parameters frozen (0 when there is no vision tower).
+    """
+    vision_encoder = get_vision_encoder(model)
+    if vision_encoder is None:
+        return 0
+
+    frozen = 0
+    for param in vision_encoder.parameters():
+        if param.requires_grad:
+            param.requires_grad_(False)
+            frozen += 1
+    return frozen
+
+
 def _get_model_info(model: nn.Module) -> VLMModelInfo | None:
     model_type = getattr(getattr(model, "config", None), "model_type", None)
     return VLM_REGISTRY.get(model_type) if model_type else None

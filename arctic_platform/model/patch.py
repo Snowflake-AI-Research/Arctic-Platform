@@ -29,10 +29,11 @@ Patch = Callable[[nn.Module, LoaderContext], None]
 
 
 # Canonical order (every registered patch must appear here).
-# liger → zorro_train (replaces forward) → gradient_checkpointing (before DS wrap).
+# liger → zorro_train (replaces forward) → freeze unused ViT (text-only) →
+# gradient_checkpointing (before DS wrap).
 # Note: ZoRRo's patched forward does not call `_gradient_checkpointing_func`, so GC
 # under ZoRRo is a no-op for activation savings (same as the old inline worker path).
-PATCH_ORDER: tuple[str, ...] = ("liger", "zorro_train", "gradient_checkpointing")
+PATCH_ORDER: tuple[str, ...] = ("liger", "zorro_train", "freeze_unused_vision_tower", "gradient_checkpointing")
 
 _PATCHES: dict[str, Patch] = {}
 

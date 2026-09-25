@@ -8,7 +8,7 @@ live in the [project README](../README.md).
 ```
 ┌──────────────────────────────────────────────┐
 │  Framework / script (CPU or GPU driver)      │
-│  SFT client  ·  RL client (verl / SkyRL)     │
+│  SFT · RL (verl / SkyRL) · OPD client        │
 └──────────────────────┬───────────────────────┘
                        │ HTTP or Ray
                        ▼
@@ -25,11 +25,13 @@ live in the [project README](../README.md).
 |-----|----------|
 | [**SFT**](sft.md) | Supervised fine-tuning — CPU client, wire batch, `sft` vs `sft_ce`, config |
 | [**RL**](rl.md) | Reinforcement learning — engines, client API, ZoRRo Train / Inference, integrations |
+| [**OPD**](opd.md) | On-policy distillation — `ArcticOPDClient`, single-logit reverse KL, vs TRL DistillationTrainer |
 | [**Common**](common.md) | Shared server infra — HTTP CLI, jobs/endpoints, DeepSpeed worker, metrics, env |
 
 ## Quick paths
 
 - **SFT smoke (colocated):** see [sft.md § Quick start](sft.md#quick-start)
+- **OPD vs TRL DistillationTrainer:** [opd.md § Stance vs TRL DistillationTrainer](opd.md#stance-vs-trl-distillationtrainer)
 - **RL starter recipe:** [`recipes/rl/verl/simple/`](../recipes/rl/verl/)
 - **SkyRL recipes:** [`recipes/rl/skyrl/`](../recipes/rl/skyrl/)
 - **verl plugin:** [`arctic_platform/integrations/verl/`](../arctic_platform/integrations/verl/)

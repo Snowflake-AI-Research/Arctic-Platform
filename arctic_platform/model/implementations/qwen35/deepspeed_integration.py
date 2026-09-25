@@ -40,6 +40,7 @@ from .model_builder import (
 from .models.layers.lm_head import inject_prime_lm_head
 from .models.layers.moe import FeedForward, LatentMoE, MoE
 from .parallel_dims import ParallelDims
+from .hf_vllm_weight_sync import pack_qwen35_gdn_layer
 from .vlm import get_language_model
 
 
@@ -172,19 +173,7 @@ def _convert_qwen3_5_moe_layer_to_vllm(
         if old in layer_sd:
             layer_sd[new] = layer_sd.pop(old)
 
-    qkv_key = f"{prefix}.linear_attn.in_proj_qkv.weight"
-    z_key = f"{prefix}.linear_attn.in_proj_z.weight"
-    if qkv_key in layer_sd and z_key in layer_sd:
-        qkv = layer_sd.pop(qkv_key)
-        z = layer_sd.pop(z_key)
-        layer_sd[f"{prefix}.linear_attn.in_proj_qkvz.weight"] = torch.cat([qkv, z], dim=0)
-
-    b_key = f"{prefix}.linear_attn.in_proj_b.weight"
-    a_key = f"{prefix}.linear_attn.in_proj_a.weight"
-    if b_key in layer_sd and a_key in layer_sd:
-        b = layer_sd.pop(b_key)
-        a = layer_sd.pop(a_key)
-        layer_sd[f"{prefix}.linear_attn.in_proj_ba.weight"] = torch.cat([b, a], dim=0)
+    pack_qwen35_gdn_layer(layer_sd, prefix)
 
     for buf_key in (f"{prefix}.mlp.expert_bias", f"{prefix}.mlp.tokens_per_expert"):
         layer_sd.pop(buf_key, None)

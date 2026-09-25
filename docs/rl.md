@@ -4,6 +4,8 @@ Reinforcement-learning backend: a thin client drives three GPU engines on a
 remote (or colocated) Arctic server. The RL framework keeps the training loop,
 rewards, and advantage estimation; Arctic owns the heavy compute.
 
+Docs index: [index.md](index.md) · Shared server: [common.md](common.md) · SFT: [sft.md](sft.md) · OPD: [opd.md](opd.md)
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  RL framework (verl / SkyRL / custom loop)                  │

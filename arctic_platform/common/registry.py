@@ -49,6 +49,7 @@ PUBLIC_LOSS_FNS = frozenset(
         "sft_ce",
         "verl_grpo",
         "causal_cross_entropy",
+        "on_policy_distill",
     }
 )
 PUBLIC_POST_PROCESSORS = frozenset(

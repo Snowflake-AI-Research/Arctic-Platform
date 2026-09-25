@@ -71,6 +71,9 @@ from .microbatch import _flat2d_mb
 from .microbatch import _is_multi_modal_key
 from .microbatch import _reorder_list
 from .microbatch import split_padded_tensor_dict_into_mb_list
+
+# On-policy distillation (import registers "on_policy_distill").
+from .on_policy_distill import on_policy_distill_loss
 from .packed_reduction import PackedLossReduction
 from .packed_reduction import apply_packed_loss_reduction
 from .packed_reduction import combine_packed_losses
@@ -80,7 +83,10 @@ from .packed_reduction import resolve_packed_loss_reduction
 # Packing utilities
 from .packing import N_TOKENS_PER_PAGE
 from .packing import _align
+from .packing import derive_varlen_model_kwargs
+from .packing import model_reads_varlen_kwargs
 from .packing import pack_sequences
+from .packing import packing_boundaries_from_attention_mask
 from .packing import pad_packed_for_model
 from .packing import unpack_sequences
 
@@ -127,6 +133,7 @@ __all__ = [
     "run_pipeline",
     "identity_post",
     "compute_entropy_and_logprobs_post",
+    "on_policy_distill_loss",
     "compute_logprobs_post",
     "metric_is_summed",
     "PackedLossReduction",
@@ -141,6 +148,9 @@ __all__ = [
     "pack_sequences",
     "unpack_sequences",
     "pad_packed_for_model",
+    "derive_varlen_model_kwargs",
+    "model_reads_varlen_kwargs",
+    "packing_boundaries_from_attention_mask",
     # microbatch
     "DEFAULT_MAX_TOKENS_PER_MB",
     "MicroBatchSpec",

@@ -1,0 +1,396 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import torch
+
+from arctic_platform.client import ArcticRLClient
+from arctic_platform.client import CortexConfig
+from arctic_platform.client import JobHandles
+from arctic_platform.client import OnPremConfig
+from arctic_platform.client import Request
+from arctic_platform.client import base as rl_client_module
+from arctic_platform.opd import DEFAULT_PROCESSING
+from arctic_platform.opd import ArcticOPDClient
+from arctic_platform.opd import ArcticOPDClientConfig
+from arctic_platform.opd.client import _fwd_bwd_body
+
+
+class FakeTransport:
+    def __init__(self, config, server_state=None):
+        self.config = config
+        self.server_state = server_state
+        self.jobs = JobHandles()
+        self.calls: list[Request] = []
+        self.stopped = False
+
+    def initialize(self):
+        if self.config.training_gpus:
+            self.jobs = JobHandles(training=11, sampling=12)
+        else:
+            self.jobs = JobHandles(sampling=21)
+        return self.jobs
+
+    def call(self, request):
+        self.calls.append(request)
+        return {"results": [{"ok": True}], "metrics": {}}
+
+    def shutdown(self):
+        self.stopped = True
+
+
+def config(**updates):
+    base = ArcticOPDClientConfig(
+        student_model="student",
+        teacher_model="teacher",
+        training_gpus=2,
+        sampling_gpus=2,
+        teacher_sampling_gpus=4,
+        backend=CortexConfig(base_url="http://example"),
+    )
+    return base.model_copy(update=updates)
+
+
+@pytest.fixture
+def client(monkeypatch):
+    transports = []
+
+    def make_transport(cfg, server_state=None):
+        transport = FakeTransport(cfg, server_state=server_state)
+        transports.append(transport)
+        return transport
+
+    monkeypatch.setattr(rl_client_module, "make_transport", make_transport)
+    return ArcticOPDClient(config()), transports
+
+
+def test_composes_two_sync_rl_clients(client):
+    opd, transports = client
+    assert isinstance(opd.student, ArcticRLClient)
+    assert isinstance(opd.teacher, ArcticRLClient)
+    assert opd.student.config.training_gpus == 2
+    assert opd.student.config.sampling_gpus == 2
+    assert opd.teacher.config.training_gpus == 0
+    assert opd.teacher.config.sampling_gpus == 4
+    assert opd.teacher.config.model_name == "teacher"
+    assert opd.student.transport is transports[0]
+    assert opd.teacher.transport is transports[1]
+
+
+def test_routes_student_and_teacher_generate(client):
+    opd, transports = client
+    assert opd.generate([[1, 2]]) == [{"ok": True}]
+    assert transports[0].calls[-1].op == "generate"
+    assert transports[0].calls[-1].job_id == 12
+    assert opd.generate_teacher([[1, 2, 3]]) == [{"ok": True}]
+    assert transports[1].calls[-1].op == "generate"
+    assert transports[1].calls[-1].job_id == 21
+
+
+def test_fwd_bwd_defaults_distill_processing(client):
+    opd, transports = client
+    opd.fwd_bwd({"input_ids": [1]})
+    request = transports[0].calls[-1]
+    assert request.job_id == 11
+    assert request.binary is True
+    assert request.body["processing"] == DEFAULT_PROCESSING
+    assert request.body["kwargs"] == {"input_ids": [1]}
+    assert request.body["context"] == {"input_ids": [1]}
+
+
+def test_cortex_fwd_bwd_puts_teacher_logprobs_on_batch_path():
+    from arctic_platform.common.utils.batch import unpack_batch
+
+    cfg = ArcticOPDClientConfig(
+        student_model="student",
+        teacher_model="teacher",
+        training_gpus=1,
+        sampling_gpus=1,
+        teacher_sampling_gpus=1,
+        backend=CortexConfig(base_url="http://example"),
+    )
+    teacher = torch.zeros(2, 3)
+    loss_mask = torch.ones(2, 3, dtype=torch.bool)
+    body = _fwd_bwd_body(
+        cfg,
+        {
+            "input_ids": torch.ones(2, 4, dtype=torch.long),
+            "teacher_log_probs_shifted": teacher,
+            "loss_mask": loss_mask,
+        },
+        None,
+    )
+    assert "teacher_log_probs_shifted" not in body["kwargs"]
+    assert "loss_mask" not in body["kwargs"]
+    assert "teacher_log_probs_shifted" in body["context"]
+    assert "loss_mask" in body["context"]
+    _, batch_data, _, _ = unpack_batch(body)
+    assert "teacher_log_probs_shifted" in batch_data
+    assert "loss_mask" in batch_data
+
+
+def test_fwd_no_grad_uses_same_envelope(client):
+    opd, transports = client
+    opd.fwd_no_grad({"input_ids": [1]})
+    request = transports[0].calls[-1]
+    assert request.op == "forward"
+    assert request.job_id == 11
+    assert request.body["processing"] == DEFAULT_PROCESSING
+
+
+def test_onprem_fwd_bwd_uses_structured_batch_envelope():
+    cfg = ArcticOPDClientConfig(
+        student_model="student",
+        teacher_model="teacher",
+        training_gpus=1,
+        sampling_gpus=1,
+        teacher_sampling_gpus=1,
+    )
+    body = _fwd_bwd_body(cfg, {"input_ids": [1], "loss_mask": [True]}, None)
+    assert body == {
+        "batch": {"input_ids": [1], "loss_mask": [True]},
+        "meta": {"zorro_train_enable": False},
+        "processing": DEFAULT_PROCESSING,
+    }
+
+
+def test_cortex_sync_is_hf_and_never_targets_teacher(client):
+    opd, transports = client
+    opd.sync_weights()
+    # Cortex has no wake-inference: sync then reset cache, student only.
+    assert [request.op for request in transports[0].calls] == ["operation", "operation"]
+    sync_request = transports[0].calls[-2]
+    assert sync_request.body["payload"]["source_sub_job_id"] == 11
+    assert sync_request.body["payload"]["target_sub_job_ids"] == [12]
+    assert sync_request.body["payload"]["weight_format"] == "hf"
+    assert 21 not in sync_request.body["payload"]["target_sub_job_ids"]
+    assert transports[1].calls == []
+
+
+def test_onprem_sync_weights_delegates_to_student(monkeypatch):
+    transports = []
+
+    def make_transport(cfg, server_state=None):
+        transport = FakeTransport(cfg, server_state=server_state)
+        transports.append(transport)
+        return transport
+
+    monkeypatch.setattr(rl_client_module, "make_transport", make_transport)
+    opd = ArcticOPDClient(
+        ArcticOPDClientConfig(
+            student_model="student",
+            teacher_model="teacher",
+            training_gpus=1,
+            sampling_gpus=1,
+            teacher_sampling_gpus=1,
+        )
+    )
+    opd.sync_weights()
+    assert [request.op for request in transports[0].calls] == [
+        "wake-inference",
+        "operation",
+        "wake-inference",
+        "operation",
+    ]
+    sync_request = transports[0].calls[-3]
+    assert sync_request.body["operation_type"] == "weight-sync"
+    assert sync_request.body["payload"]["source_sub_job_id"] == 11
+    assert sync_request.body["payload"]["target_sub_job_ids"] == [12]
+    assert transports[1].calls == []
+
+
+def test_reconnect_config_contains_all_three_ids(client):
+    opd, _ = client
+    reconnect = opd.reconnect_config()
+    assert (reconnect.training_job_id, reconnect.sampling_job_id, reconnect.teacher_job_id) == (11, 12, 21)
+
+
+def test_teacher_init_failure_cleans_up_student(monkeypatch):
+    student = FakeTransport(config().student_transport_config())
+    calls = 0
+
+    def make_transport(_cfg, server_state=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return student
+        raise RuntimeError("teacher failed")
+
+    monkeypatch.setattr(rl_client_module, "make_transport", make_transport)
+    with pytest.raises(RuntimeError, match="teacher failed"):
+        ArcticOPDClient(config())
+    assert student.stopped
+
+
+def test_partial_reconnect_ids_rejected():
+    with pytest.raises(ValueError, match="requires training_job_id"):
+        ArcticOPDClientConfig(
+            student_model="student",
+            teacher_model="teacher",
+            training_gpus=1,
+            sampling_gpus=1,
+            teacher_sampling_gpus=1,
+            training_job_id=1,
+        )
+
+
+def test_local_launch_allows_overlapping_devices_with_disjoint_hostfiles(tmp_path: Path):
+    student_hf = tmp_path / "student.hosts"
+    teacher_hf = tmp_path / "teacher.hosts"
+    student_hf.write_text("10.0.0.1 slots=8\n10.0.0.2 slots=8\n", encoding="utf-8")
+    teacher_hf.write_text("10.0.0.3 slots=8\n", encoding="utf-8")
+    cfg = ArcticOPDClientConfig(
+        student_model="student",
+        teacher_model="teacher",
+        training_gpus=8,
+        sampling_gpus=8,
+        teacher_sampling_gpus=8,
+        teacher_server_cuda_visible_devices="",
+        student_ray_hostfile=str(student_hf),
+        teacher_ray_hostfile=str(teacher_hf),
+        backend=OnPremConfig(
+            launch_local_server=True,
+            server_cuda_visible_devices="0,1,2,3,4,5,6,7",
+        ),
+    )
+    student_env = cfg.student_transport_config().backend.server_extra_env
+    teacher_env = cfg.teacher_transport_config().backend.server_extra_env
+    assert student_env["ARL_RAY_HOSTFILE"] == str(student_hf)
+    assert teacher_env["ARL_RAY_HOSTFILE"] == str(teacher_hf)
+    assert cfg.teacher_transport_config().backend.server_cuda_visible_devices == ""
+
+
+def test_local_launch_overlapping_devices_still_rejected_without_hostfiles():
+    with pytest.raises(ValueError, match="must be disjoint"):
+        ArcticOPDClientConfig(
+            student_model="student",
+            teacher_model="teacher",
+            training_gpus=1,
+            sampling_gpus=1,
+            teacher_sampling_gpus=1,
+            teacher_server_cuda_visible_devices="0,1",
+            backend=OnPremConfig(
+                launch_local_server=True,
+                server_cuda_visible_devices="0,1",
+            ),
+        )
+
+
+def test_local_launch_isolates_student_and_teacher_ray_ports():
+    cfg = ArcticOPDClientConfig(
+        student_model="student",
+        teacher_model="teacher",
+        training_gpus=1,
+        sampling_gpus=1,
+        teacher_sampling_gpus=1,
+        teacher_port=18110,
+        teacher_server_cuda_visible_devices="1",
+        backend=OnPremConfig(
+            launch_local_server=True,
+            port=18100,
+            server_cuda_visible_devices="0",
+        ),
+    )
+    student_env = cfg.student_transport_config().backend.server_extra_env
+    teacher_env = cfg.teacher_transport_config().backend.server_extra_env
+    for key in (
+        "RAY_PORT",
+        "RAY_DASHBOARD_PORT",
+        "MASTER_PORT",
+        "ARL_WEIGHT_SYNC_PORT",
+        "ARL_RAY_MIN_WORKER_PORT",
+        "ARL_RAY_MAX_WORKER_PORT",
+    ):
+        assert student_env[key] != teacher_env[key], key
+        assert int(student_env["ARL_RAY_MAX_WORKER_PORT"]) < int(teacher_env["ARL_RAY_MIN_WORKER_PORT"]) or int(
+            teacher_env["ARL_RAY_MAX_WORKER_PORT"]
+        ) < int(student_env["ARL_RAY_MIN_WORKER_PORT"])
+
+
+def test_local_launch_rejects_http_ports_that_share_a_cluster_slot():
+    with pytest.raises(ValueError, match="overlapping Ray/DeepSpeed ports"):
+        ArcticOPDClientConfig(
+            student_model="student",
+            teacher_model="teacher",
+            training_gpus=1,
+            sampling_gpus=1,
+            teacher_sampling_gpus=1,
+            teacher_port=18120,
+            teacher_server_cuda_visible_devices="1",
+            backend=OnPremConfig(
+                launch_local_server=True,
+                port=18100,
+                server_cuda_visible_devices="0",
+            ),
+        )
+
+
+def test_missing_ray_hostfile_raises():
+    with pytest.raises(ValueError, match="could not read Ray hostfile"):
+        ArcticOPDClientConfig(
+            student_model="student",
+            teacher_model="teacher",
+            training_gpus=1,
+            sampling_gpus=1,
+            teacher_sampling_gpus=1,
+            teacher_server_cuda_visible_devices="1",
+            student_ray_hostfile="/no/such/student.hosts",
+            teacher_ray_hostfile="/no/such/teacher.hosts",
+            backend=OnPremConfig(
+                launch_local_server=True,
+                server_cuda_visible_devices="0",
+            ),
+        )
+
+
+def test_local_launch_rejects_server_extra_env_that_shares_a_ray_port():
+    with pytest.raises(ValueError, match="overlapping Ray/DeepSpeed ports"):
+        ArcticOPDClientConfig(
+            student_model="student",
+            teacher_model="teacher",
+            training_gpus=1,
+            sampling_gpus=1,
+            teacher_sampling_gpus=1,
+            teacher_port=18101,
+            teacher_server_cuda_visible_devices="1",
+            backend=OnPremConfig(
+                launch_local_server=True,
+                port=18100,
+                server_cuda_visible_devices="0",
+                server_extra_env={"RAY_PORT": "29999"},
+            ),
+        )
+
+
+def test_local_launch_rejects_http_port_that_equals_generated_ray_port():
+    with pytest.raises(ValueError, match="collides with its Ray/DeepSpeed ports"):
+        ArcticOPDClientConfig(
+            student_model="student",
+            teacher_model="teacher",
+            training_gpus=1,
+            sampling_gpus=1,
+            teacher_sampling_gpus=1,
+            teacher_port=25002,
+            teacher_server_cuda_visible_devices="1",
+            backend=OnPremConfig(
+                launch_local_server=True,
+                port=25000,
+                server_cuda_visible_devices="0",
+            ),
+        )

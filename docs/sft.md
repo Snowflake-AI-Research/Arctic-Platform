@@ -5,7 +5,7 @@ a remote DeepSpeed training server over HTTP (default) or Ray. The client owns
 the data loop; the server owns model weights, forward/backward, and the
 optimizer.
 
-Docs index: [index.md](index.md) · Shared server: [common.md](common.md) · RL: [rl.md](rl.md)
+Docs index: [index.md](index.md) · Shared server: [common.md](common.md) · RL: [rl.md](rl.md) · OPD: [opd.md](opd.md)
 
 ```
 ┌──────────────────────────────────────────────┐
