@@ -18,6 +18,9 @@ from __future__ import annotations
 import torch.nn as nn
 
 from arctic_platform.model.implementations.qwen35.vlm import freeze_unused_vision_tower
+from arctic_platform.model.loader import LoadedModel
+from arctic_platform.model.loader import LoaderContext
+from arctic_platform.model.patch import apply_patches
 
 
 class _TinyVision(nn.Module):
@@ -54,3 +57,22 @@ def test_freeze_unused_vision_tower_is_noop_without_visual():
     model.config = type("C", (), {"model_type": "llama"})()
     assert freeze_unused_vision_tower(model, rank=0) == 0
     assert all(p.requires_grad for p in model.parameters())
+
+
+def test_vision_freeze_patch_is_opt_in():
+    import types
+
+    from arctic_platform.model.patches import freeze_unused_vision_tower as _freeze_patch  # noqa: F401
+
+    model = _TinyVLM()
+    apply_patches(
+        LoadedModel(model=model),
+        LoaderContext(spec=types.SimpleNamespace(patches=types.SimpleNamespace(freeze_unused_vision_tower=False))),
+    )
+    assert all(p.requires_grad for p in model.model.visual.parameters())
+
+    apply_patches(
+        LoadedModel(model=model),
+        LoaderContext(spec=types.SimpleNamespace(patches=types.SimpleNamespace(freeze_unused_vision_tower=True))),
+    )
+    assert all(not p.requires_grad for p in model.model.visual.parameters())

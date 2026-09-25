@@ -123,6 +123,28 @@ class TestSplitDictRemainder(TestCasePlus):
         self.assertEqual(shards[1]["batch"]["prompt_group_ids"].tolist(), [8, 8])
         self.assertEqual(shards[0]["meta"], {"max_prompt_len": 3, "dp_size": 2})
 
+    def test_cortex_context_promotes_teacher_log_probs(self):
+        teacher = torch.arange(8, dtype=torch.float32).view(4, 2)
+        envelope = {
+            "kwargs": {
+                "input_ids": torch.arange(8).view(4, 2),
+                "attention_mask": torch.ones(4, 2, dtype=torch.long),
+            },
+            "context": {
+                "teacher_log_probs_shifted": teacher,
+                "loss_mask": torch.ones(4, 2, dtype=torch.bool),
+                "max_prompt_len": 3,
+            },
+            "processing": {"loss_fn": "on_policy_distill"},
+        }
+        _, batch_data, meta_data, _ = unpack_batch(envelope)
+        self.assertIn("teacher_log_probs_shifted", batch_data)
+        self.assertIn("loss_mask", batch_data)
+        self.assertEqual(meta_data, {"max_prompt_len": 3})
+        shards, _ = _split_batch(envelope, num_workers=2)
+        self.assertEqual(shards[0]["batch"]["teacher_log_probs_shifted"].tolist(), [[0.0, 1.0], [2.0, 3.0]])
+        self.assertNotIn("teacher_log_probs_shifted", shards[0]["meta"])
+
 
 class TestDpSizeDividesBySp(TestCasePlus):
     def _envelope(self):

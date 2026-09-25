@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import torch
 
 from arctic_platform.client import ArcticRLClient
 from arctic_platform.client import CortexConfig
@@ -111,6 +112,35 @@ def test_fwd_bwd_defaults_distill_processing(client):
     assert request.body["processing"] == DEFAULT_PROCESSING
     assert request.body["kwargs"] == {"input_ids": [1]}
     assert request.body["context"] == {"input_ids": [1]}
+
+
+def test_cortex_fwd_bwd_puts_teacher_logprobs_on_batch_path():
+    from arctic_platform.common.utils.batch import unpack_batch
+
+    cfg = ArcticOPDClientConfig(
+        student_model="student",
+        teacher_model="teacher",
+        training_gpus=1,
+        sampling_gpus=1,
+        teacher_sampling_gpus=1,
+        backend=CortexConfig(base_url="http://example"),
+    )
+    teacher = torch.zeros(2, 3)
+    loss_mask = torch.ones(2, 3, dtype=torch.bool)
+    body = _fwd_bwd_body(
+        cfg,
+        {
+            "input_ids": torch.ones(2, 4, dtype=torch.long),
+            "teacher_log_probs_shifted": teacher,
+            "loss_mask": loss_mask,
+        },
+        None,
+    )
+    assert "teacher_log_probs_shifted" in body["kwargs"]
+    assert "loss_mask" in body["kwargs"]
+    _, batch_data, _, _ = unpack_batch(body)
+    assert "teacher_log_probs_shifted" in batch_data
+    assert "loss_mask" in batch_data
 
 
 def test_fwd_no_grad_uses_same_envelope(client):
@@ -267,7 +297,7 @@ def test_local_launch_isolates_student_and_teacher_ray_ports():
         training_gpus=1,
         sampling_gpus=1,
         teacher_sampling_gpus=1,
-        teacher_port=18101,
+        teacher_port=18110,
         teacher_server_cuda_visible_devices="1",
         backend=OnPremConfig(
             launch_local_server=True,
@@ -289,3 +319,39 @@ def test_local_launch_isolates_student_and_teacher_ray_ports():
         assert int(student_env["ARL_RAY_MAX_WORKER_PORT"]) < int(teacher_env["ARL_RAY_MIN_WORKER_PORT"]) or int(
             teacher_env["ARL_RAY_MAX_WORKER_PORT"]
         ) < int(student_env["ARL_RAY_MIN_WORKER_PORT"])
+
+
+def test_local_launch_rejects_http_ports_that_share_a_cluster_slot():
+    with pytest.raises(ValueError, match="overlapping Ray/DeepSpeed ports"):
+        ArcticOPDClientConfig(
+            student_model="student",
+            teacher_model="teacher",
+            training_gpus=1,
+            sampling_gpus=1,
+            teacher_sampling_gpus=1,
+            teacher_port=18120,
+            teacher_server_cuda_visible_devices="1",
+            backend=OnPremConfig(
+                launch_local_server=True,
+                port=18100,
+                server_cuda_visible_devices="0",
+            ),
+        )
+
+
+def test_missing_ray_hostfile_raises():
+    with pytest.raises(FileNotFoundError):
+        ArcticOPDClientConfig(
+            student_model="student",
+            teacher_model="teacher",
+            training_gpus=1,
+            sampling_gpus=1,
+            teacher_sampling_gpus=1,
+            teacher_server_cuda_visible_devices="1",
+            student_ray_hostfile="/no/such/student.hosts",
+            teacher_ray_hostfile="/no/such/teacher.hosts",
+            backend=OnPremConfig(
+                launch_local_server=True,
+                server_cuda_visible_devices="0",
+            ),
+        )

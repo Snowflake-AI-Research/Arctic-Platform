@@ -206,54 +206,60 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
         timeout=300,
         env=os.environ,
     )
+    # Own the head immediately so a later pdsh / init failure still tears it down.
+    _spawned_cluster = True
     pr0(f"[init_ray_cluster] ray started with port {ray_port} and dashboard port {dashboard_port}")
 
-    # 3. Start workers on peer nodes (if any). Unset CUDA_VISIBLE_DEVICES on the
-    # remote so a head that is hiding local GPUs (OPD teacher on a disjoint
-    # hostfile) does not hide GPUs on the worker node if ssh forwards the env.
-    peers = _peer_hosts()
-    pr0(f"[init_ray_cluster] hostfile={hostfile_path()} peers={peers}")
-    gcs = read_ray_address(_spawned_temp_dir)
-    if peers:
-        logger.info("Starting Ray workers on %s (address=%s)", peers, gcs)
-        result = _pdsh(
-            peers,
-            [
-                "env",
-                "-u",
-                "CUDA_VISIBLE_DEVICES",
-                r,
-                "start",
-                f"--address={gcs}",
-                f"--temp-dir={_spawned_temp_dir}",
-                "--disable-usage-stats",
-            ],
-            check=False,
-            timeout=600,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"pdsh ray start on {peers} failed with exit code {result.returncode} "
-                "(missing remote env/python is a common cause)"
+    try:
+        # 3. Start workers on peer nodes (if any). Unset CUDA_VISIBLE_DEVICES on the
+        # remote so a head that is hiding local GPUs (OPD teacher on a disjoint
+        # hostfile) does not hide GPUs on the worker node if ssh forwards the env.
+        peers = _peer_hosts()
+        pr0(f"[init_ray_cluster] hostfile={hostfile_path()} peers={peers}")
+        gcs = read_ray_address(_spawned_temp_dir)
+        if peers:
+            logger.info("Starting Ray workers on %s (address=%s)", peers, gcs)
+            result = _pdsh(
+                peers,
+                [
+                    "env",
+                    "-u",
+                    "CUDA_VISIBLE_DEVICES",
+                    r,
+                    "start",
+                    f"--address={gcs}",
+                    f"--temp-dir={_spawned_temp_dir}",
+                    "--disable-usage-stats",
+                ],
+                check=False,
+                timeout=600,
             )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"pdsh ray start on {peers} failed with exit code {result.returncode} "
+                    "(missing remote env/python is a common cause)"
+                )
 
-    _spawned_cluster = True
-    # Use the explicit GCS address instead of ``auto`` so we don't accidentally
-    # reconnect to a different Ray cluster running on this host.
-    ray.init(address=gcs, ignore_reinit_error=True, log_to_driver=True)
-    pr0(f"[init_ray_cluster] ray initialized with address {gcs}")
-    resources = ray.available_resources()
-    n_gpu = float(resources.get("GPU", 0))
-    logger.info(
-        "Ray cluster: %.0f GPU(s), %.0f CPU(s), %d node(s)",
-        n_gpu,
-        resources.get("CPU", 0),
-        sum(1 for k in resources if k.startswith("node:")),
-    )
-    if peers and n_gpu <= 0:
-        raise RuntimeError(
-            f"Ray peers {peers} produced a cluster with 0 GPUs; refusing to schedule workers that would block forever"
+        # Use the explicit GCS address instead of ``auto`` so we don't accidentally
+        # reconnect to a different Ray cluster running on this host.
+        ray.init(address=gcs, ignore_reinit_error=True, log_to_driver=True)
+        pr0(f"[init_ray_cluster] ray initialized with address {gcs}")
+        resources = ray.available_resources()
+        n_gpu = float(resources.get("GPU", 0))
+        logger.info(
+            "Ray cluster: %.0f GPU(s), %.0f CPU(s), %d node(s)",
+            n_gpu,
+            resources.get("CPU", 0),
+            sum(1 for k in resources if k.startswith("node:")),
         )
+        if peers and n_gpu <= 0:
+            raise RuntimeError(
+                f"Ray peers {peers} produced a cluster with 0 GPUs; refusing to schedule "
+                "workers that would block forever"
+            )
+    except Exception:
+        _shutdown()
+        raise
 
 
 def _reset_cached_ray_address() -> None:

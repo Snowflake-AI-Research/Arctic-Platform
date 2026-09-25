@@ -673,9 +673,10 @@ def build_step_record(
     tokens_scored = int(result.get("tokens_scored") or 0)
     tokens_per_rollout = tokens_scored / n_rollouts if n_rollouts else 0.0
     loss = _metric(metrics.get("loss", float("nan")))
-    # Only the paired ``.tokens`` key is a token count. ``distill_kl_count`` survives
-    # the combiner as a per-rollout average, so dividing a global sum by it reports a
-    # batch-size-times-too-large KL -- the rank-scope mismatch that corrupted xyu's runs.
+    # Prefer the paired ``distill_kl.tokens`` accumulator. ``distill_kl_count`` is
+    # also a token count (``*_count`` keys are summed), but this logger still
+    # requires the paired keys so a missing ``.tokens`` cannot silently fall back
+    # to a stale or shard-local count.
     kl_tokens = _maybe_metric(metrics.get("distill_kl.tokens"))
     paired_kl_sum = _maybe_metric(metrics.get("distill_kl.sum"))
     if paired_kl_sum is not None and kl_tokens:
@@ -904,6 +905,7 @@ def build_live_client(args: argparse.Namespace):
                 "fp32_lm_head": args.train_fp32_lm_head,
                 "fused_cross_entropy": False,
                 "fla_tilelang": False,
+                "freeze_unused_vision_tower": True,
                 **({"fused_lm_head_token_chunk_size": 2048} if args.train_fp32_lm_head else {}),
                 **({"max_tokens_per_mb": args.max_tokens_per_mb} if args.max_tokens_per_mb else {}),
             },

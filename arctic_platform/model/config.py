@@ -55,6 +55,13 @@ class Patches(BaseModel):
 
     liger: bool = Field(False, description="Apply Liger kernels.")
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
+    freeze_unused_vision_tower: bool = Field(
+        False,
+        description=(
+            "Freeze a Qwen3.5 ViT that a text-only job never uses. Off by default so "
+            "VLM training keeps vision grads. OPD sets this in ds_worker_config."
+        ),
+    )
     gradient_checkpointing: bool = Field(False, description="HF gradient checkpointing.")
 
 
@@ -120,6 +127,7 @@ class ModelSpec(BaseModel):
             patches=Patches(
                 liger=cfg.get("use_liger", False),
                 zorro_train=zorro_train_patch,
+                freeze_unused_vision_tower=cfg.get("freeze_unused_vision_tower", False),
                 gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
             ),
         )

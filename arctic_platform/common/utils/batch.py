@@ -87,6 +87,7 @@ BATCH_DIM_CONTEXT_KEYS = frozenset(
         "ref_log_prob",
         "ref_log_probs",
         "ref_log_probs_shifted",
+        "teacher_log_probs_shifted",
         "prox_logp",
         "prox_logp_shifted",
         "labels",

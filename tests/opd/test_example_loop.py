@@ -322,8 +322,8 @@ def _record_from_fwd_metrics(fwd_metrics: dict[str, float]) -> dict[str, Any]:
 
 
 def test_paired_kl_sum_uses_token_count_not_per_rollout_average():
-    # distill_kl_count is a per-rollout average (scored/16), never a token count.
-    # Pairing a global sum with it would report a batch-size-times-too-large KL.
+    # Prefer paired ``.tokens``. ``distill_kl_count`` is a token count after combine,
+    # but build_step_record still requires the paired keys for the logged rate.
     record = _record_from_fwd_metrics({"loss": 0.1, "distill_kl.sum": 3200.0, "distill_kl.tokens": 26624.0})
     assert math.isclose(record["kl/per_token"], 3200.0 / 26624.0, rel_tol=1e-12)
 

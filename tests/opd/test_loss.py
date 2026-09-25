@@ -193,6 +193,13 @@ def test_output_clamp_when_explicitly_requested():
     assert bool((student.grad == 0).all())
 
 
+def test_negative_kl_clamp_max_is_rejected():
+    student = torch.full((1, 2), -1.0)
+    teacher = torch.full((1, 2), -2.0)
+    with pytest.raises(ValueError, match="kl_clamp_max must be a positive finite cap"):
+        _run(student=student, teacher=teacher, config={"kl_clamp_max": -1})
+
+
 def test_k1_is_rejected_as_an_objective():
     student = torch.full((1, 4), -2.0, requires_grad=True)
     teacher = torch.full((1, 4), -1.0)

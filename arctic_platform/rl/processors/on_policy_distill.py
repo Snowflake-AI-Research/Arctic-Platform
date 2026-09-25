@@ -28,6 +28,7 @@ cap opt-in via ``kl_clamp_max``.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import Optional
 
@@ -290,6 +291,11 @@ def on_policy_distill_loss(
             "contract fails loudly on unrecognized keys so a typo cannot silently change the "
             f"objective. Known keys: {sorted(_DISTILL_CONFIG_KEYS)}"
         )
+    kl_clamp_max = config.get("kl_clamp_max")
+    if kl_clamp_max is not None:
+        cap = float(kl_clamp_max)
+        if not math.isfinite(cap) or cap <= 0:
+            raise ValueError(f"kl_clamp_max must be a positive finite cap when set; got {kl_clamp_max!r}")
 
     logprobs = _student_logprobs(model_outputs, batch)
     if not torch.isfinite(logprobs).all():

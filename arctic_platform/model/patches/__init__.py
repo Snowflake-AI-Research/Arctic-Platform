@@ -14,6 +14,7 @@
 # limitations under the License.
 """Built-in patches. Importing this package registers them."""
 
+from arctic_platform.model.patches import freeze_unused_vision_tower  # noqa: F401
 from arctic_platform.model.patches import gradient_checkpointing  # noqa: F401
 from arctic_platform.model.patches import liger  # noqa: F401
 from arctic_platform.model.patches import zorro_train  # noqa: F401

@@ -22,6 +22,7 @@ from typing import Any
 from arctic_platform.client.config import CortexConfig
 from arctic_platform.client.rl import ArcticRLClient
 from arctic_platform.client.transport import Request
+from arctic_platform.common.utils.batch import BATCH_DIM_CONTEXT_KEYS
 from arctic_platform.opd.config import ArcticOPDClientConfig
 
 DEFAULT_PROCESSING = {
@@ -46,7 +47,7 @@ def _fwd_bwd_body(
     meta_payload = {"zorro_train_enable": False, **(meta or {})}
     if isinstance(config.backend, CortexConfig):
         model_keys = {"input_ids", "attention_mask", "position_ids", "use_cache"}
-        kwargs = {key: value for key, value in batch.items() if key in model_keys}
+        kwargs = {key: value for key, value in batch.items() if key in model_keys or key in BATCH_DIM_CONTEXT_KEYS}
         return {
             "args": (),
             "kwargs": kwargs,

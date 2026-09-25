@@ -36,14 +36,23 @@ def _cuda_ids(spec: str) -> set[str]:
     return {part.strip() for part in spec.split(",") if part.strip()}
 
 
+_CLUSTER_SLOT_MOD = 20
+_CLUSTER_WORKER_RANGE = 1000
+_CLUSTER_PORT_KEYS = (
+    "RAY_PORT",
+    "RAY_DASHBOARD_PORT",
+    "RAY_CLIENT_SERVER_PORT",
+    "RAY_DASHBOARD_AGENT_LISTEN_PORT",
+    "MASTER_PORT",
+    "ARL_WEIGHT_SYNC_PORT",
+)
+
+
 def _hostfile_hosts(path: str | None) -> set[str]:
     if not path:
         return set()
-    try:
-        with open(path, encoding="utf-8") as handle:
-            lines = handle.readlines()
-    except OSError:
-        return set()
+    with open(path, encoding="utf-8") as handle:
+        lines = handle.readlines()
     return {ln.split()[0] for ln in lines if ln.strip() and not ln.strip().startswith("#")}
 
 
@@ -51,10 +60,13 @@ def _local_cluster_env(http_port: int) -> dict[str, str]:
     """Disjoint Ray / DeepSpeed ports derived from the HTTP listen port.
 
     Two HTTP servers on one host cannot share Ray GCS, worker-port ranges, or
-    the DeepSpeed rendezvous port.
+    the DeepSpeed rendezvous port. Slot is ``http_port % 20`` so consecutive
+    ports (default ``port`` / ``port+1``) and last-digit twins (``18100`` /
+    ``18110``) stay disjoint. Occupied slots are also checked at config
+    validation time.
     """
-    slot = http_port % 10
-    worker_base = 40000 + slot * 10000
+    slot = http_port % _CLUSTER_SLOT_MOD
+    worker_base = 40000 + slot * _CLUSTER_WORKER_RANGE
     return {
         "PYTHONUNBUFFERED": "1",
         "RAY_PORT": str(25000 + slot),
@@ -64,8 +76,16 @@ def _local_cluster_env(http_port: int) -> dict[str, str]:
         "MASTER_PORT": str(27000 + slot),
         "ARL_WEIGHT_SYNC_PORT": str(28000 + slot),
         "ARL_RAY_MIN_WORKER_PORT": str(worker_base),
-        "ARL_RAY_MAX_WORKER_PORT": str(worker_base + 9999),
+        "ARL_RAY_MAX_WORKER_PORT": str(worker_base + _CLUSTER_WORKER_RANGE - 1),
     }
+
+
+def _occupied_cluster_ports(env: dict[str, str]) -> set[int]:
+    ports = {int(env[key]) for key in _CLUSTER_PORT_KEYS}
+    lo = int(env["ARL_RAY_MIN_WORKER_PORT"])
+    hi = int(env["ARL_RAY_MAX_WORKER_PORT"])
+    ports.update(range(lo, hi + 1))
+    return ports
 
 
 class ArcticOPDClientConfig(BaseModel):
@@ -116,6 +136,16 @@ class ArcticOPDClientConfig(BaseModel):
             teacher_port = self.teacher_port or self.backend.port + 1
             if teacher_port == self.backend.port:
                 raise ValueError("teacher_port must differ from the student server port")
+            student_ports = _occupied_cluster_ports(_local_cluster_env(self.backend.port))
+            teacher_ports = _occupied_cluster_ports(_local_cluster_env(teacher_port))
+            overlap = student_ports & teacher_ports
+            if overlap:
+                raise ValueError(
+                    "student and teacher HTTP ports map to overlapping Ray/DeepSpeed ports "
+                    f"(student={self.backend.port}, teacher={teacher_port}, "
+                    f"shared={sorted(overlap)[:8]}); pick ports that differ modulo "
+                    f"{_CLUSTER_SLOT_MOD}"
+                )
             student_devices = self.backend.server_cuda_visible_devices
             teacher_devices = self.teacher_server_cuda_visible_devices
             if student_devices is None or teacher_devices is None:

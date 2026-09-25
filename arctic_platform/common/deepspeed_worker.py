@@ -196,20 +196,6 @@ class DeepSpeedWorker:
         model = loaded.model
         self._maybe_inject_fp32_lm_head(model, ds_worker_config)
 
-        # Qwen3.5 instantiates a ViT even on text-only jobs. Unused trainable
-        # params produce no grads and stall ZeRO-3 reduction; freeze them
-        # before DeepSpeed registers the param set.
-        from arctic_platform.model.implementations.qwen35.vlm import freeze_unused_vision_tower
-
-        frozen = freeze_unused_vision_tower(model, self.rank)
-        if frozen:
-            logger.info(
-                "rank=%d froze %d vision-tower params (text-only job; unused params "
-                "produce no grads and stall ZeRO-3 reduction)",
-                self.rank,
-                frozen,
-            )
-
         zorro_train_enable = ds_worker_config.get("zorro_train_enable", False)
         self.dedup_actor_model_once_patcher = getattr(model, "_arctic_zorro_once_patcher", None)
 
