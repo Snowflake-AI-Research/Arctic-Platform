@@ -18,6 +18,8 @@ from arctic_platform._dependency_groups import require_any_dep_group
 
 require_any_dep_group("sft", "rl")
 
+from arctic_platform.model.config import ActivationCheckpointConfig
+from arctic_platform.model.config import ActivationOffloadConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
@@ -36,6 +38,8 @@ from arctic_platform.model import loaders  # noqa: F401  # isort: skip
 from arctic_platform.model import patches  # noqa: F401  # isort: skip
 
 __all__ = [
+    "ActivationCheckpointConfig",
+    "ActivationOffloadConfig",
     "LoadedModel",
     "LoaderContext",
     "ModelSpec",

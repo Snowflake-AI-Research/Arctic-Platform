@@ -3,10 +3,8 @@
 Builds a Prime-RL-style MoE model with expert parallelism but without FSDP,
 with local-tensor parameters that DeepSpeed ZeRO can manage.
 
-Public API:
-  ``patch_deepspeed_moe_detection``  -- make DeepSpeed recognize the MoE layers.
-  ``load_moe_model_for_deepspeed``   -- build a model ready for ``deepspeed.initialize``.
-  ``load_moe_model_for_dss``         -- dss-platform entry (model_name + ep_size).
+The public AP loader calls :func:`load_qwen3_5_moe_model`; lower-level
+DeepSpeed helpers remain internal to this implementation.
 
 Caller owns ``deepspeed.init_distributed``, ``torch.cuda.set_device``,
 ``deepspeed.utils.groups._create_expert_and_data_parallel(ep_size)``, optimizer
@@ -20,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 
-from .config import ActivationCheckpointConfig, DebugModelConfig, ModelConfig
+from .config import DebugModelConfig, ModelConfig
 from .sequence_parallel import apply_sequence_parallelism
 from .model_builder import (
     DTYPE_MAP,
@@ -35,20 +33,18 @@ from arctic_platform.model.implementations.moe.deepspeed_integration import (
     apply_ep_with_mesh as _apply_ep_with_mesh,
     build_iter_full_hf_weights as _build_iter_full_hf_weights,
     convert_dtensors_to_local as _convert_dtensors_to_local,
+    load_moe_model as _load_moe_model,
     load_moe_model_for_deepspeed as _load_moe_model_for_deepspeed,
-    load_moe_model_for_dss as _load_moe_model_for_dss,
     patch_deepspeed_moe_detection,
     setup_model_local_no_train,
     tag_expert_lora_adapters_for_deepspeed,
     tag_expert_params_for_deepspeed as _tag_expert_params_for_deepspeed,
 )
-from arctic_platform.model.implementations.moe.config_validation import (
-    validate_lm_head_fused_ce_config,
-)
 from arctic_platform.model.implementations.moe.layers.lm_head import inject_prime_lm_head
 from arctic_platform.model.implementations.moe.layers.moe import FeedForward
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.debug.row_invariant_projection import maybe_apply_row_invariant_projections
+from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
 
 def shared_expert_mlp_forward(
@@ -225,9 +221,6 @@ def _build_iter_full_vllm_weights(model: nn.Module):
     return _iter
 
 
-_validate_lm_head_fused_ce_config = validate_lm_head_fused_ce_config
-
-
 def _configure_family_backend(_config: ModelConfig) -> None:
     pass
 
@@ -237,43 +230,34 @@ def _apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> Non
         apply_sequence_parallelism(model, sp_size, sp_group)
 
 
-def _normalize_config(config: dict) -> dict:
-    return config
-
-
 def _build_model_config(
-    model_name: str, ep_size: int, dp_replicate: int, config: dict
+    model_name: str,
+    ep_size: int,
+    dp_replicate: int,
+    optimization_dtype: str,
+    attn_implementation: str,
+    options: Qwen3_5MoeOptions,
 ) -> ModelConfig:
-    ac_config = config.get("ac_config")
-    debug_kwargs = (
-        {"debug": DebugModelConfig(**config["debug"])} if config.get("debug") else {}
-    )
     return ModelConfig(
         name=model_name,
-        weight_conversion_cache_dir=config.get(
-            "weight_conversion_cache_dir", ModelConfig.weight_conversion_cache_dir
-        ),
-        trust_remote_code=config.get(
-            "trust_remote_code", ModelConfig.trust_remote_code
-        ),
-        seq_len=config.get("seq_len", 4096),
-        attn=config.get("attn", "flash_attention_3"),
+        weight_conversion_cache_dir=options.weight_conversion_cache_dir,
+        trust_remote_code=options.trust_remote_code,
+        seq_len=options.seq_len,
+        attn=attn_implementation,
         ep=ep_size,
-        ep_comm_backend=config.get("ep_comm_backend", "deepep"),
-        deepep_num_sms=config.get("deepep_num_sms", ModelConfig.deepep_num_sms),
-        deepep_token_chunk_size=config.get("deepep_token_chunk_size"),
+        ep_comm_backend=options.ep_comm_backend,
+        deepep_num_sms=options.deepep_num_sms,
+        deepep_token_chunk_size=options.deepep_token_chunk_size,
         dp_replicate=dp_replicate,
         cp=1,
         impl="custom",
-        optimization_dtype=config.get("optimization_dtype", "bfloat16"),
-        reduce_dtype=config.get("reduce_dtype", "float32"),
-        moe_use_grouped_mm=config.get("moe_use_grouped_mm", True),
-        ac=ActivationCheckpointConfig(**ac_config) if ac_config else None,
-        fused_lm_head_token_chunk_size=config.get(
-            "fused_lm_head_token_chunk_size", "disabled"
-        ),
-        fp32_lm_head=config.get("fp32_lm_head", False),
-        **debug_kwargs,
+        optimization_dtype=optimization_dtype,
+        reduce_dtype=options.reduce_dtype,
+        moe_use_grouped_mm=options.moe_use_grouped_mm,
+        ac=options.ac_config,
+        fused_lm_head_token_chunk_size=options.fused_lm_head_token_chunk_size,
+        fp32_lm_head=options.fp32_lm_head,
+        debug=DebugModelConfig(**options.debug.model_dump()) if options.debug is not None else DebugModelConfig(),
     )
 
 
@@ -291,7 +275,6 @@ def _adapter() -> MoEDeepSpeedAdapter:
         shared_expert_type=FeedForward,
         shared_expert_forward=shared_expert_mlp_forward,
         build_model_config=_build_model_config,
-        normalize_config=_normalize_config,
         extra_weight_iterators=(
             ("_iter_full_vllm_weights", _build_iter_full_vllm_weights),
         ),
@@ -344,30 +327,32 @@ def load_moe_model_for_deepspeed(
     )
 
 
-def load_moe_model_for_dss(
+def load_qwen3_5_moe_model(
     *,
     model_name: str,
+    optimization_dtype: str,
+    attn_implementation: str,
     ep_size: int,
     sp_size: int = 1,
     sp_group=None,
     ep_group=None,
-    prl_config: dict | None = None,
-    tiled_mlp_token_chunk_size: int | None = None,
+    options: Qwen3_5MoeOptions,
 ) -> nn.Module:
-    model = _load_moe_model_for_dss(
+    model = _load_moe_model(
         _adapter(),
         load_moe_model_for_deepspeed,
         model_name=model_name,
+        optimization_dtype=optimization_dtype,
+        attn_implementation=attn_implementation,
         ep_size=ep_size,
         sp_size=sp_size,
         sp_group=sp_group,
         ep_group=ep_group,
-        prl_config=prl_config,
-        tiled_mlp_token_chunk_size=tiled_mlp_token_chunk_size,
+        options=options,
         patch_moe_detection=patch_deepspeed_moe_detection,
         device_mesh_type=DeviceMesh,
     )
 
-    maybe_apply_row_invariant_projections(model, prl_config or {})
+    maybe_apply_row_invariant_projections(model, options.model_dump())
 
     return model

@@ -1,9 +1,8 @@
 """Lightweight config dataclasses for the carved-out Qwen3.5 loading path.
 
-These replace prime-rl's pydantic / pydantic-config ``ModelConfig`` and ``ActivationCheckpointConfig`` with
-plain dataclasses, carrying only the fields that are actually read on the DSS (DeepSpeed + EP + DeepEP) load path.
-Pin-memory validation lives in ``activation_offload_settings.py`` (torch-free); offload runtime wiring imports
-that module only through ``offload_settings()``.
+The runtime-only ``ModelConfig`` retains the fields consumed by the Qwen
+implementation. User-controlled checkpoint and offload settings use the
+validated Pydantic models from :mod:`arctic_platform.model.config`.
 """
 
 from __future__ import annotations
@@ -11,60 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from arctic_platform.model.implementations.gpu.activation_offload_settings import (
-    ActivationOffloadSettings,
-    validate_pin_memory_bucket_size_mib,
-    validate_pin_memory_max_size_gib,
-)
+from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.implementations.moe.config import DISPATCH_EP_BACKENDS, EPCommBackend
-
-
-@dataclass
-class ActivationOffloadConfig:
-    """Whether/how to stream checkpointed block-boundary activations to CPU (``full`` mode only).
-
-    Only consulted when ``enabled`` is True; see activation_offload.py.
-    """
-
-    enabled: bool = False  # stream saved block boundaries to CPU to reclaim GPU memory
-    keep_last_n: int = 1  # boundaries to leave resident (needed first in backward)
-    use_streams: bool = True
-    # Minimum saved-tensor size in bytes to offload; smaller tensors stay on GPU. None uses the
-    # offload manager default (1 MiB).
-    tensor_size_threshold: int | None = None
-    pin_memory_enabled: bool = True
-    # "auto" sizes the retained pinned-memory cache from the observed completed-step footprint. A numeric
-    # value is a hard retained-cache cap in GiB; 0 evicts returned pinned buffers immediately.
-    pin_memory_max_size_gib: float | Literal["auto"] = "auto"
-    # Contiguous pinned buffers are rounded up to this MiB boundary for variable-sequence-length reuse.
-    pin_memory_bucket_size_mib: int = 64
-
-    def __post_init__(self) -> None:
-        self.pin_memory_max_size_gib = validate_pin_memory_max_size_gib(self.pin_memory_max_size_gib)
-        self.pin_memory_bucket_size_mib = validate_pin_memory_bucket_size_mib(self.pin_memory_bucket_size_mib)
-
-    def offload_settings(self) -> ActivationOffloadSettings:
-        return ActivationOffloadSettings.from_offload_config(self)
-
-
-@dataclass
-class ActivationCheckpointConfig:
-    # What the backward pass recomputes per transformer block: "full" recheckpoints each whole block
-    # (one saved boundary per block); "selective" checkpoints only the chosen submodules in `targets`.
-    mode: Literal["full", "selective"] = "full"
-    freq: int = 1
-    targets: list[str] = field(default_factory=lambda: ["norm"])
-    # CPU-offload of the checkpointed block boundaries; off by default. See activation_offload.py.
-    offload_config: ActivationOffloadConfig = field(default_factory=ActivationOffloadConfig)
-    # Deterministic MoE routing across whole-block recompute; see router_replay_recompute.py. Required for
-    # full-mode AC (+offload) at sp>=4, harmless otherwise, no-op under sampler router-replay.
-    router_replay_recompute: bool = True
-
-    def __post_init__(self) -> None:
-        # The wire schema passes ac_config as a plain dict (``ActivationCheckpointConfig(**ac_cfg)``),
-        # so a nested ``offload_config`` arrives as a dict; coerce it into the dataclass.
-        if isinstance(self.offload_config, dict):
-            self.offload_config = ActivationOffloadConfig(**self.offload_config)
 
 
 @dataclass

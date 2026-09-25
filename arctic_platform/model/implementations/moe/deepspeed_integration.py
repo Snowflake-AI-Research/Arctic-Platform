@@ -17,7 +17,6 @@ from arctic_platform.model.implementations.debug.token_combine import maybe_use_
 from arctic_platform.model.implementations.fp8 import carry_keep_fp32
 from arctic_platform.model.implementations.gpu.tiled_mlp import enable_tiled_mlp
 
-from .config_validation import validate_lm_head_fused_ce_config
 from .distributed.ep_backend import uses_dispatch_ep
 from .distributed.expert_parallel import DeepEPExpertParallel
 from .layers.moe import LatentMoE
@@ -40,8 +39,7 @@ class MoEDeepSpeedAdapter:
     reset_runtime_moe_buffers: Callable[[nn.Module], None]
     shared_expert_type: type[nn.Module]
     shared_expert_forward: Callable[[nn.Module, torch.Tensor], torch.Tensor]
-    build_model_config: Callable[[str, int, int, dict], Any]
-    normalize_config: Callable[[dict], dict]
+    build_model_config: Callable[[str, int, int, str, str, Any], Any]
     extra_weight_iterators: tuple[tuple[str, Callable[[nn.Module], Callable]], ...] = ()
 
 
@@ -265,25 +263,24 @@ def load_moe_model_for_deepspeed(
     return model
 
 
-def load_moe_model_for_dss(
+def load_moe_model(
     adapter: MoEDeepSpeedAdapter,
     family_loader: Callable,
     *,
     model_name: str,
+    optimization_dtype: str,
+    attn_implementation: str,
     ep_size: int,
     sp_size: int = 1,
     sp_group=None,
     ep_group=None,
-    prl_config: dict | None = None,
-    tiled_mlp_token_chunk_size: int | None = None,
+    options: Any,
     patch_moe_detection: Callable[[], None] = patch_deepspeed_moe_detection,
     device_mesh_type=DeviceMesh,
 ) -> nn.Module:
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
 
-    config = adapter.normalize_config(dict(prl_config or {}))
-    validate_lm_head_fused_ce_config(config)
     world_size = dist.get_world_size()
     if world_size % ep_size:
         raise ValueError(f"world_size={world_size} must be divisible by ep_size={ep_size}")
@@ -301,12 +298,19 @@ def load_moe_model_for_dss(
         device_type="cuda",
         mesh_dim_names=("ep",),
     )
-    ep_backend = config.get("ep_comm_backend", "deepep")
+    ep_backend = options.ep_comm_backend
     if not uses_dispatch_ep(ep_backend):
         raise NotImplementedError(f"EP comm backend must be one of ('deepep', 'uccl'), got {ep_backend!r}.")
 
     dp_replicate = world_size // ep_size
-    model_config = adapter.build_model_config(model_name, ep_size, dp_replicate, config)
+    model_config = adapter.build_model_config(
+        model_name,
+        ep_size,
+        dp_replicate,
+        optimization_dtype,
+        attn_implementation,
+        options,
+    )
     parallel_dims = ParallelDims(
         dp_replicate=dp_replicate,
         dp_shard=-1,
@@ -320,10 +324,10 @@ def load_moe_model_for_dss(
         parallel_dims,
         ep_mesh,
         ep_group_name,
-        fused_cross_entropy=config.get("fused_cross_entropy", "liger"),
-        tiled_mlp_token_chunk_size=tiled_mlp_token_chunk_size,
+        fused_cross_entropy=options.fused_cross_entropy,
+        tiled_mlp_token_chunk_size=options.tiled_mlp_token_chunk_size,
         sp_size=sp_size,
         sp_group=sp_group,
     )
-    maybe_use_fixed_order_row_sum(model, config)
+    maybe_use_fixed_order_row_sum(model, options.model_dump())
     return model

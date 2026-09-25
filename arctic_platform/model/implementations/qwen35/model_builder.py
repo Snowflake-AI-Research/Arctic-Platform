@@ -36,13 +36,14 @@ from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.tensor import DTensor, distribute_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, PretrainedConfig
 
+from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.router_replay_recompute import install_self_router_replay
 from arctic_platform.model.implementations.debug.determinism import CHECKPOINT_PRESERVE_RNG_STATE
 from arctic_platform.model.implementations.moe.weights import hf_export_param_name
 
-from .config import ActivationCheckpointConfig, ModelConfig
+from .config import ModelConfig
 from arctic_platform.model.implementations.moe.distributed.ep_backend import get_ep_comm_module, uses_dispatch_ep
 from arctic_platform.model.implementations.moe.conversion_cache import (
     WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
@@ -653,18 +654,8 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
     fallback_layer_types: set[str] = set()
     model_supported_targets: set[str] = set()
 
-    if ac_config.offload_config.enabled:
-        if ac_config.mode == "selective":
-            raise ValueError(
-                f"Activation-checkpoint CPU offload (ac_config.offload_config.enabled=True) requires "
-                f"ac_config.mode='full', but the active mode is '{ac_config.mode}'. "
-                f"mode selects what the backward pass recomputes: 'full' recheckpoints each whole "
-                f"transformer block, so the only saved activation is the block input -- a single boundary "
-                f"that can be streamed to CPU; 'selective' keeps chosen intermediate activations on GPU and "
-                f"has no such offloadable boundary. Both live in the job's training_config.ac_config -- set "
-                f"mode='full', or set offload_config.enabled=False to keep mode='{ac_config.mode}'."
-            )
-        install_activation_offload(model, settings=ac_config.offload_config.offload_settings())
+    if ac_config.offload_config is not None:
+        install_activation_offload(model, config=ac_config.offload_config)
         logger.info(
             "Activation CPU offload enabled (saved-tensor hooks, "
             f"keep_last_n={ac_config.offload_config.keep_last_n}, "

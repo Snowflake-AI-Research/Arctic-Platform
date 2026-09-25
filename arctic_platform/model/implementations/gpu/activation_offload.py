@@ -43,11 +43,9 @@ from typing import Tuple
 
 import torch
 
+from arctic_platform.model.config import ActivationOffloadConfig
+from arctic_platform.model.config import PinMemoryMaxSize
 from arctic_platform.model.implementations.debug.activation_offload import maybe_log_activation_offload_slot
-from arctic_platform.model.implementations.gpu.activation_offload_settings import ActivationOffloadSettings
-from arctic_platform.model.implementations.gpu.activation_offload_settings import PinMemoryMaxSize
-from arctic_platform.model.implementations.gpu.activation_offload_settings import validate_pin_memory_bucket_size_mib
-from arctic_platform.model.implementations.gpu.activation_offload_settings import validate_pin_memory_max_size_gib
 from arctic_platform.model.implementations.gpu.pinned_staging_cache import PoolKey
 from arctic_platform.model.implementations.gpu.pinned_staging_cache import _PinnedCacheStats
 from arctic_platform.model.implementations.gpu.pinned_staging_cache import _PinnedEntry
@@ -210,9 +208,9 @@ class ActivationOffloadManager:
         pin_memory_enabled: bool = True,
         pin_memory_max_size_gib: PinMemoryMaxSize = "auto",
         pin_memory_bucket_size_mib: int = _DEFAULT_PIN_MEMORY_BUCKET_SIZE_MIB,
-        settings: Optional[ActivationOffloadSettings] = None,
+        config: Optional[ActivationOffloadConfig] = None,
     ) -> None:
-        resolved = settings or ActivationOffloadSettings(
+        resolved = config or ActivationOffloadConfig(
             keep_last_n=keep_last_n,
             use_streams=use_streams,
             tensor_size_threshold=tensor_size_threshold,
@@ -220,25 +218,25 @@ class ActivationOffloadManager:
             pin_memory_max_size_gib=pin_memory_max_size_gib,
             pin_memory_bucket_size_mib=pin_memory_bucket_size_mib,
         )
-        self._apply_settings(resolved)
+        self._apply_config(resolved)
 
-    def _apply_settings(self, settings: ActivationOffloadSettings) -> None:
+    def _apply_config(self, config: ActivationOffloadConfig) -> None:
         self.enabled = True
-        self.keep_last_n = settings.keep_last_n
-        self.use_streams = settings.use_streams
-        self.pin_memory_enabled = settings.pin_memory_enabled
-        self.pin_memory_bucket_size_bytes = settings.pin_memory_bucket_size_bytes
-        self.pin_memory_max_size_gib = settings.pin_memory_max_size_gib
-        self._pin_memory_hard_max_size_bytes = settings.pin_memory_hard_max_size_bytes
+        self.keep_last_n = config.keep_last_n
+        self.use_streams = config.use_streams
+        self.pin_memory_enabled = config.pin_memory_enabled
+        self.pin_memory_bucket_size_bytes = config.pin_memory_bucket_size_bytes
+        self.pin_memory_max_size_gib = config.pin_memory_max_size_gib
+        self._pin_memory_hard_max_size_bytes = config.pin_memory_hard_max_size_bytes
         self.tensor_size_threshold = (
-            int(settings.tensor_size_threshold)
-            if settings.tensor_size_threshold is not None
+            int(config.tensor_size_threshold)
+            if config.tensor_size_threshold is not None
             else _DEFAULT_TENSOR_SIZE_THRESHOLD
         )
         self.pinned_cache.configure(
-            enabled=settings.pin_memory_enabled,
-            bucket_size_bytes=settings.pin_memory_bucket_size_bytes,
-            hard_max_size_bytes=settings.pin_memory_hard_max_size_bytes,
+            enabled=config.pin_memory_enabled,
+            bucket_size_bytes=config.pin_memory_bucket_size_bytes,
+            hard_max_size_bytes=config.pin_memory_hard_max_size_bytes,
         )
         self.sync_pinned_stats()
 
@@ -501,7 +499,7 @@ def install_activation_offload(
     pin_memory_enabled: bool = True,
     pin_memory_max_size_gib: PinMemoryMaxSize = "auto",
     pin_memory_bucket_size_mib: int = _DEFAULT_PIN_MEMORY_BUCKET_SIZE_MIB,
-    settings: Optional[ActivationOffloadSettings] = None,
+    config: Optional[ActivationOffloadConfig] = None,
     manager: Optional[ActivationOffloadManager] = None,
 ) -> ActivationOffloadManager:
     """Wrap ``model.forward`` so saved activations stream to CPU, and return the model's offload manager.
@@ -512,7 +510,7 @@ def install_activation_offload(
     Pass ``manager`` to wrap a second module with an existing manager. Two modules in one stack must share a
     manager: separate managers keep separate slot books, which interleave and break backward's LIFO unpacking.
     """
-    resolved = settings or ActivationOffloadSettings(
+    resolved = config or ActivationOffloadConfig(
         keep_last_n=keep_last_n,
         use_streams=use_streams,
         tensor_size_threshold=tensor_size_threshold,
@@ -529,7 +527,7 @@ def install_activation_offload(
     if manager is None:
         manager = attached_manager or ActivationOffloadManager()
     setattr(model, _MANAGER_ATTR, manager)
-    manager.configure(settings=resolved)
+    manager.configure(config=resolved)
     if getattr(model, _INSTALLED_ATTR, False):
         return manager
     original_forward = model.forward
@@ -553,13 +551,11 @@ def activation_offload_stats(model: torch.nn.Module) -> Optional[str]:
 
 
 __all__ = [
+    "ActivationOffloadConfig",
     "ActivationOffloadManager",
-    "ActivationOffloadSettings",
     "PoolKey",
     "PinMemoryMaxSize",
     "activation_offload_stats",
     "host_pin_reserved_bytes",
     "install_activation_offload",
-    "validate_pin_memory_bucket_size_mib",
-    "validate_pin_memory_max_size_gib",
 ]

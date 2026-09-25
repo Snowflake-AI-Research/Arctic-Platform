@@ -51,7 +51,7 @@ def test_loader_preserves_options_and_process_groups(monkeypatch, backend):
         seen.update(kwargs)
         return model
 
-    monkeypatch.setattr(qwen, "load_moe_model_for_dss", load)
+    monkeypatch.setattr(qwen, "load_qwen3_5_moe_model", load)
     ep_group, sp_group = object(), object()
     spec = ModelSpec(
         model_path_or_name="local-checkpoint",
@@ -70,8 +70,11 @@ def test_loader_preserves_options_and_process_groups(monkeypatch, backend):
     assert result.model is model
     assert seen["ep_group"] is ep_group and seen["sp_group"] is sp_group
     assert seen["ep_size"] == seen["sp_size"] == 2
-    assert seen["prl_config"] == spec.loader_options
-    assert seen["tiled_mlp_token_chunk_size"] == 32
+    assert seen["optimization_dtype"] == "bfloat16"
+    assert seen["attn_implementation"] == "flash_attention_3"
+    assert seen["options"] == Qwen3_5MoeOptions.model_validate(spec.loader_options)
+    assert seen["options"].tiled_mlp_token_chunk_size == 32
+    assert seen["options"].ac_config.offload_config.pin_memory_enabled is False
     assert ModelSpec.model_validate_json(spec.model_dump_json()) == spec
 
 
@@ -83,6 +86,8 @@ def test_loader_preserves_options_and_process_groups(monkeypatch, backend):
         {"debug": {"unknown": True}},
         {"tiled_mlp_token_chunk_size": 0},
         {"ac_config": {"freq": 0}},
+        {"ac_config": {"offload_config": {"pin_memory_max_size_gib": -1}}},
+        {"ac_config": {"mode": "selective", "offload_config": {}}},
         {"fused_cross_entropy": "liger", "fused_lm_head_token_chunk_size": 128},
     ],
 )
@@ -100,8 +105,7 @@ def test_liger_fused_cross_entropy_allows_fp32_lm_head():
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"dtype": "float32"},
-        {"attn_implementation": "sdpa"},
+        {"dtype": "float16"},
         {"patches": Patches(peft={"peft_type": "Lora"})},
     ],
 )
@@ -128,9 +132,47 @@ def test_sequence_parallel_group_is_required():
 
 @pytest.mark.parametrize("patches", [Patches(gradient_checkpointing=True), Patches(zorro_train={})])
 def test_generic_forward_patches_are_rejected(patches):
-    spec = ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", patches=patches)
     with pytest.raises(ValueError, match="generic forward patches"):
-        build_model(spec, parallel_groups={"ep_group": object()})
+        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", patches=patches)
+
+
+def test_legacy_disabled_offload_normalizes_to_none():
+    options = Qwen3_5MoeOptions(ac_config={"offload_config": {"enabled": False}})
+    assert options.ac_config is not None
+    assert options.ac_config.offload_config is None
+
+
+def test_runtime_config_is_derived_from_validated_options():
+    from arctic_platform.model.implementations.qwen35.deepspeed_integration import _build_model_config
+
+    options = Qwen3_5MoeOptions(
+        seq_len=1024,
+        ep_comm_backend="uccl",
+        ac_config={
+            "freq": 2,
+            "offload_config": {
+                "keep_last_n": 3,
+                "pin_memory_max_size_gib": 0,
+            },
+        },
+    )
+    config = _build_model_config(
+        "local",
+        4,
+        2,
+        "float32",
+        "sdpa",
+        options,
+    )
+
+    assert config.seq_len == 1024
+    assert config.ep == 4
+    assert config.dp_replicate == 2
+    assert config.optimization_dtype == "float32"
+    assert config.attn == "sdpa"
+    assert config.ep_comm_backend == "uccl"
+    assert config.ac is options.ac_config
+    assert config.ac.offload_config.keep_last_n == 3
 
 
 def test_legacy_qwen_types_are_shared():
