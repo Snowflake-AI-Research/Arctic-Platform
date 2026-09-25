@@ -97,6 +97,10 @@ BATCH_DIM_CONTEXT_KEYS = frozenset(
         "prompt_token_counts",
         "sequence_loss_weights",
         "rollout_is_weights",
+        "teacher_token_ids",
+        "teacher_log_probs",
+        "teacher_tail_log_prob",
+        "kd_mask",
     }
 )
 

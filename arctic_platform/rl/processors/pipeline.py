@@ -56,7 +56,7 @@ from typing import Any
 import torch
 
 # Shared registries live in arctic_platform.common.registry (used by RL + SFT).
-from arctic_platform.common.registry import LOSS_FNS
+from arctic_platform.common.registry import LOSS_FNS  # noqa: F401  # re-exported
 from arctic_platform.common.registry import POST_PROCESSORS
 from arctic_platform.common.registry import _resolve_fn
 from arctic_platform.common.registry import register_loss_fn  # noqa: F401  # re-exported
@@ -69,6 +69,7 @@ from arctic_platform.rl.utils.debug import ProfilerContext
 from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.debug import see_memory_usage
 
+from .base_loss import resolve_loss
 from .microbatch import DEFAULT_MAX_TOKENS_PER_MB
 from .packed_reduction import apply_packed_loss_reduction
 from .packed_reduction import combine_packed_losses
@@ -386,6 +387,7 @@ def run_pipeline(
     post_names = processing.get("post", [])
     loss_fn_name = processing.get("loss_fn", "ap_grpo")
     config = processing.get("config", {})
+    loss_object = resolve_loss(loss_fn_name) if loss_fn_name is not None else None
 
     # Skip entropy computation when it cannot affect the loss (entropy_coeff == 0).
     # Entropy is expensive: it requires a full-vocab softmax. In the non-zorro path
@@ -458,6 +460,11 @@ def run_pipeline(
         # Isolation: only model-bound keys reach engine(). Zorro reads
         # calculate_entropy; loss tensors stay on batch/meta for posts/losses.
         fwd_kwargs = _engine_forward_kwargs(batch, meta)
+        output_keys = ["logits", "logprobs", "entropy", "loss"]
+        if loss_object is not None:
+            context = {**meta, **batch}
+            loss_object.validation_callback(context, config)
+            loss_object.model_forward_callback(fwd_kwargs, context, config, output_keys)
         if backward is False:
             engine.eval()
             with torch.no_grad():
@@ -473,14 +480,10 @@ def run_pipeline(
     prof_fwd.report()
 
     model_outputs: dict[str, Any] = {}
-    if hasattr(outputs, "logits"):
-        model_outputs["logits"] = outputs.logits
-    if hasattr(outputs, "logprobs"):
-        model_outputs["logprobs"] = outputs.logprobs
-    if hasattr(outputs, "entropy"):
-        model_outputs["entropy"] = outputs.entropy
-    if hasattr(outputs, "loss") and outputs.loss is not None:
-        model_outputs["loss"] = outputs.loss
+    for key in output_keys:
+        value = outputs.get(key) if isinstance(outputs, dict) else getattr(outputs, key, None)
+        if value is not None:
+            model_outputs[key] = value
 
     # --- post-forward ---
     prof_post_fwd = ProfilerContext(type=PROFILER_TYPE, name="POST-FWD")
@@ -513,13 +516,12 @@ def run_pipeline(
 
         prof_loss = ProfilerContext(type=PROFILER_TYPE, name="LOSS")
         with prof_loss():
-            fn = _resolve_fn(LOSS_FNS, loss_fn_name)
-            loss, metrics = fn(model_outputs, batch, post_meta, config, device)
+            loss, metrics = loss_object.loss(model_outputs, batch, post_meta, config, device)
         timers.stop_and_print_elapsed(tname)
         prof_loss.report()
 
-        # Exclude raw logits from response — large ([B,S,V]), no caller reads them.
-        batch = {k: v for k, v in model_outputs.items() if k != "logits"}
+        loss_object.output_callback(model_outputs)
+        batch = dict(model_outputs)
 
         if backward is True:
 
