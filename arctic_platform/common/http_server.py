@@ -381,6 +381,9 @@ async def forward_backward(
     job_id: int,
     body: bytes = Body(..., media_type="application/octet-stream"),
 ):
+    from arctic_platform.rl.processors import prepare_request_loss
+    from arctic_platform.rl.processors.base_loss import _attach_loss_object_to_shards
+
     tname_e2e = timers.start("xyz fwd_bwd e2e")
 
     tname = timers.start("xyz fwd_bwd: _verify_job")
@@ -393,8 +396,15 @@ async def forward_backward(
     # body = zlib.decompress(body)
     # timers.stop_and_print_elapsed(tname)
 
+    request = wire.loads(body)
+    loss_object = prepare_request_loss(request)
     tname = timers.start("xyz fwd_bwd: split_batch")
-    shards, reorder_indices = http_split_batch(body, len(workers), sp_size=app.state.jobs[job_id].get("sp_size", 1))
+    shards, reorder_indices = http_split_batch(
+        request,
+        len(workers),
+        sp_size=app.state.jobs[job_id].get("sp_size", 1),
+    )
+    _attach_loss_object_to_shards(shards, loss_object)
     # The verl driver's ``update_actor`` only consumes ``metrics`` from the
     # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
     # ``batch`` (logprobs/entropy) is never read. Keep the worker output as
@@ -413,6 +423,10 @@ async def forward_backward(
 
     tname = timers.start("xyz fwd_bwd: epilogue")
     metrics, avg_loss = finalize_fwd_bwd_metrics(results)
+    if loss_object is not None:
+        worker_metrics = [result.get("metrics") or {} for result in results]
+        avg_loss = loss_object.reporting_callback(worker_metrics, metrics, avg_loss)
+        loss_object.metrics_callback(worker_metrics, metrics)
     # ``batch`` is omitted by default (the verl driver does not consume it);
     # opt in via ``return_fwd_batch`` for the TRL server-side-loss path.
     merged = dict(
@@ -437,6 +451,9 @@ async def forward(
     job_id: int,
     body: bytes = Body(..., media_type="application/octet-stream"),
 ):
+    from arctic_platform.rl.processors import prepare_request_loss
+    from arctic_platform.rl.processors.base_loss import _attach_loss_object_to_shards
+
     info = app.state.jobs[job_id]
     _verify_job(job_id, ["training", "log_prob"])
     job_type = info["job_type"]
@@ -447,7 +464,10 @@ async def forward(
     if not workers:
         raise HTTPException(400, f"Job {job_id} ({job_type}) has no DeepSpeed workers")
 
-    shards, reorder_indices = http_split_batch(body, len(workers), sp_size=info.get("sp_size", 1))
+    request = wire.loads(body)
+    loss_object = prepare_request_loss(request)
+    shards, reorder_indices = http_split_batch(request, len(workers), sp_size=info.get("sp_size", 1))
+    _attach_loss_object_to_shards(shards, loss_object)
     shards[0]["meta"]["worker_return_tensors"] = True
     results = await asyncio.gather(*[w.forward_no_grad.remote(s) for w, s in zip(workers, shards)])
     pr0(f"[DeepSpeedWorker] fwd_no_grad: {len(results)=}")
@@ -457,6 +477,10 @@ async def forward(
         batch = restore_batch_order(batch, reorder_indices)
 
     metrics, avg_loss = finalize_fwd_bwd_metrics(results)
+    if loss_object is not None:
+        worker_metrics = [result.get("metrics") or {} for result in results]
+        avg_loss = loss_object.reporting_callback(worker_metrics, metrics, avg_loss)
+        loss_object.metrics_callback(worker_metrics, metrics)
     merged = dict(
         job_id=job_id,
         batch=batch,

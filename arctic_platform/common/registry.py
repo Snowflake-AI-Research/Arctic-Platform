@@ -27,6 +27,7 @@ POST_PROCESSORS: Dict[str, Callable] = {}
 LOSS_FNS: Dict[str, Callable] = {}
 PACKED_LOSS_REDUCTION_ATTR = "_arctic_packed_loss_reduction"
 SUMMED_METRICS_ATTR = "_arctic_summed_metrics"
+LOSS_CAPABILITIES_ATTR = "_arctic_loss_capabilities"
 
 # Metric names a loss fn declared additive via ``register_loss_fn(...,
 # summed_metrics=...)``. Flat union rather than per-loss-fn: the reducers in
@@ -104,6 +105,7 @@ def register_loss_fn(
     explicit alternative to relying on the ``loss_term_*`` / ``*_sum`` /
     ``*_count`` naming convention, which stays in force for undeclared keys
     (see ``common.utils.batch.metric_is_summed``).
+
     """
     declared = frozenset(summed_metrics)
 
@@ -120,6 +122,21 @@ def register_loss_fn(
         if declared:
             setattr(fn, SUMMED_METRICS_ATTR, declared | getattr(fn, SUMMED_METRICS_ATTR, frozenset()))
             DECLARED_SUMMED_METRICS.update(declared)
+        return fn
+
+    return decorator
+
+
+def declare_loss_capabilities(*capabilities: str):
+    """Attach execution capabilities without changing function registration."""
+    declared = frozenset(capabilities)
+
+    def decorator(fn: Callable) -> Callable:
+        setattr(
+            fn,
+            LOSS_CAPABILITIES_ATTR,
+            declared | getattr(fn, LOSS_CAPABILITIES_ATTR, frozenset()),
+        )
         return fn
 
     return decorator
