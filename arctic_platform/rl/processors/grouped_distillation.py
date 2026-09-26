@@ -378,11 +378,16 @@ def resolve_kd_term(config: dict) -> KDTerm | None:
     )
 
 
-def _kd_term(model_outputs: dict, context: dict, kd: KDTerm) -> tuple[torch.Tensor, dict]:
+def _kd_term(
+    model_outputs: dict,
+    context: dict,
+    kd: KDTerm,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, dict]:
     kd_sum, metrics = grouped_divergence(
         model_outputs,
         context,
-        context["kd_mask"],
+        weights,
         kd.divergence,
         kd.beta,
     )
@@ -668,7 +673,13 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
             kd_mask = request.get("kd_mask")
         if not torch.is_tensor(kd_mask):
             raise ValueError("kd_coef > 0 requires tensor context['kd_mask']")
-        config["kd_batch_num_tokens"] = float(kd_mask.sum(dtype=torch.float64).item())
+        weights = canonicalize_loss_mask(
+            kd_mask,
+            kd_mask,
+            objective="grpo kd_mask",
+            binary=False,
+        )
+        config["kd_batch_num_tokens"] = float(weights.sum(dtype=torch.float64).item())
 
     def validation_callback(self, context: dict, config: dict) -> None:
         kd = resolve_kd_term(config)
@@ -712,6 +723,6 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         kd = resolve_kd_term(config)
         if kd is None:
             return loss, metrics
-        context = _context(batch, meta)
-        kd_loss, kd_metrics = _kd_term(model_outputs, context, kd)
+        context = _validation_context(_context(batch, meta))
+        kd_loss, kd_metrics = _kd_term(model_outputs, context, kd, self._weights(context))
         return loss + kd_loss.to(loss.dtype), {**metrics, **kd_metrics}

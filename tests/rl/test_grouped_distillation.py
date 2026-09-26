@@ -353,6 +353,66 @@ def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
     assert set(outputs) == {"logprobs"}
 
 
+def test_grpo_batching_and_objective_share_canonical_underflowed_weights():
+    frame = _frame()
+    kd_mask = torch.zeros_like(frame["kd_mask"], dtype=torch.float64)
+    kd_mask[0, 0] = 1e-50
+    config = _grpo_config(frame, kd_coef=0.5)
+    request = {
+        "processing": {"loss_fn": "grpo", "config": config},
+        "context": {"kd_mask": kd_mask},
+    }
+    loss_object = resolve_loss("grpo")
+    loss_object.batching_callback(request)
+
+    assert config["kd_batch_num_tokens"] == 0.0
+    context = {key: kd_mask if key == "kd_mask" else frame[key] for key in _CONTEXT} | {
+        "input_ids": frame["input_ids"]
+    }
+    loss_object.validation_callback(context, config)
+
+    class_logprobs = torch.randn(_B, _S, requires_grad=True)
+    legacy_logprobs = class_logprobs.detach().clone().requires_grad_(True)
+    logits = torch.randn(_B, _S, _V)
+    class_loss, metrics = loss_object.loss(
+        {"logprobs": class_logprobs, "logits": logits},
+        {},
+        context,
+        config,
+        "cpu",
+    )
+    legacy_loss, _ = LOSS_FNS["grpo"](
+        {"logprobs": legacy_logprobs},
+        {},
+        context,
+        config,
+        "cpu",
+    )
+    class_loss.backward()
+    legacy_loss.backward()
+
+    assert torch.equal(class_loss, legacy_loss)
+    assert torch.equal(class_logprobs.grad, legacy_logprobs.grad)
+    assert metrics["kd_weight_sum"] == 0.0
+    assert metrics["kd_sum"] == 0.0
+    assert metrics["loss_term_kd"] == 0.0
+
+
+def test_grpo_batching_rejects_weights_that_overflow_float32():
+    request = {
+        "processing": {"loss_fn": "grpo", "config": {"kd_coef": 0.5}},
+        "context": {
+            "kd_mask": torch.tensor(
+                [[torch.finfo(torch.float64).max]],
+                dtype=torch.float64,
+            )
+        },
+    }
+
+    with pytest.raises(ValueError, match="representable as finite float32"):
+        resolve_loss("grpo").batching_callback(request)
+
+
 @pytest.mark.parametrize(
     ("temperature", "match"),
     [
