@@ -500,6 +500,100 @@ def _request_kd_masks(request: dict) -> tuple[torch.Tensor, ...]:
     return ()
 
 
+def _request_containers(request: dict) -> list[dict]:
+    containers = [request]
+    containers.extend(
+        value for name in ("kwargs", "batch", "context", "meta") if isinstance((value := request.get(name)), dict)
+    )
+    return containers
+
+
+def _request_tensor(request: dict, name: str) -> torch.Tensor | None:
+    return next(
+        (container[name] for container in _request_containers(request) if torch.is_tensor(container.get(name))),
+        None,
+    )
+
+
+def _request_token_validity(request: dict, input_ids: torch.Tensor) -> torch.Tensor:
+    attention_mask = _request_tensor(request, "attention_mask")
+    if attention_mask is not None and tuple(attention_mask.shape) == tuple(input_ids.shape):
+        return attention_mask.bool()
+    return torch.ones_like(input_ids, dtype=torch.bool)
+
+
+def _prediction_target_mask(request: dict, input_ids: torch.Tensor) -> torch.Tensor:
+    valid = _request_token_validity(request, input_ids)
+    next_valid = torch.roll(valid, shifts=-1, dims=-1)
+    targets = valid & next_valid
+
+    position_ids = _request_tensor(request, "position_ids")
+    if position_ids is not None and tuple(position_ids.shape) == tuple(input_ids.shape):
+        next_position = torch.roll(position_ids, shifts=-1, dims=-1)
+        targets &= next_position.eq(position_ids + 1).to(targets.device)
+
+    if targets.shape[-1] > 0:
+        targets[..., -1] = False
+
+    cu_seqlens = _request_tensor(request, "cu_seqlens")
+    if cu_seqlens is not None and cu_seqlens.numel() > 1:
+        sequence_ends = cu_seqlens.flatten()[1:].to(device=targets.device, dtype=torch.long) - 1
+        flat_targets = targets.reshape(-1)
+        if bool(((sequence_ends < 0) | (sequence_ends >= flat_targets.numel())).any().item()):
+            raise ValueError("cu_seqlens contains a sequence boundary outside input_ids")
+        flat_targets[sequence_ends] = False
+    return targets
+
+
+def _synthesize_request_labels(request: dict) -> None:
+    batch = request.get("batch")
+    if isinstance(batch, list):
+        for microbatch in batch:
+            if isinstance(microbatch, dict):
+                _synthesize_request_labels(microbatch)
+        return
+
+    containers = _request_containers(request)
+    if any(torch.is_tensor(container.get("labels")) for container in containers):
+        return
+    input_container = next(
+        (container for container in containers if torch.is_tensor(container.get("input_ids"))),
+        None,
+    )
+    if input_container is None:
+        return
+
+    input_ids = input_container["input_ids"]
+    labels = torch.roll(input_ids, shifts=-1, dims=-1)
+    if labels.shape[-1] == 0:
+        input_container["labels"] = labels
+        return
+    labels = labels.masked_fill(~_prediction_target_mask(request, input_ids), -100)
+    input_container["labels"] = labels
+
+
+def _validate_request_target_weights(request: dict, *, objective: str) -> None:
+    batch = request.get("batch")
+    if isinstance(batch, list):
+        for microbatch in batch:
+            if isinstance(microbatch, dict):
+                _validate_request_target_weights(microbatch, objective=objective)
+        return
+
+    input_ids = _request_tensor(request, "input_ids")
+    kd_mask = _request_tensor(request, "kd_mask")
+    if input_ids is None or kd_mask is None:
+        return
+    weights = canonicalize_loss_mask(
+        kd_mask,
+        input_ids,
+        objective=f"{objective} kd_mask",
+        binary=False,
+    )
+    if bool(((~_prediction_target_mask(request, input_ids).to(weights.device)) & (weights > 0)).any().item()):
+        raise ValueError(f"{objective} kd_mask must be zero where no next-token target exists")
+
+
 def _set_request_kd_weight_sum(request: dict, config: dict, *, objective: str) -> None:
     masks = _request_kd_masks(request)
     if not masks or any(not torch.is_tensor(mask) for mask in masks):
@@ -556,6 +650,18 @@ def _sum_metrics(worker_metrics: Sequence[dict], metrics: dict, names: Sequence[
             metrics[name] = sum(float(worker.get(name, 0.0)) for worker in worker_metrics)
 
 
+def _validate_target_weights(context: dict, weights: torch.Tensor) -> None:
+    labels = context.get("labels")
+    if labels is None:
+        return
+    if not torch.is_tensor(labels):
+        raise ValueError("grouped distillation labels must be a tensor")
+    if tuple(labels.shape) != tuple(weights.shape):
+        raise ValueError("grouped distillation labels must match kd_mask")
+    if bool(((labels.to(weights.device) == -100) & (weights > 0)).any().item()):
+        raise ValueError("grouped distillation kd_mask must be zero where labels use IGNORE_INDEX (-100)")
+
+
 class _GroupedLossCallbacks:
     """Callbacks shared by standalone and policy-plus-distillation losses."""
 
@@ -573,6 +679,7 @@ class _GroupedLossCallbacks:
         context = _validation_context(context)
         _validate_neutral_temperature(context)
         weights = self._weights(context)
+        _validate_target_weights(context, weights)
         _validate_teacher_context(context, weights)
 
     def model_forward_callback(
@@ -654,6 +761,11 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         if not isinstance(config, dict):
             raise ValueError("processing.config must be a dictionary")
         _grouped_distillation_config(config)
+        _synthesize_request_labels(request)
+        _validate_request_target_weights(
+            request,
+            objective="grouped_distillation",
+        )
         config.setdefault("dp_size", None)
         _set_request_kd_weight_sum(
             request,
@@ -665,12 +777,7 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         context = _validation_context(context)
         kd_coef, _, _, normalization = _grouped_distillation_config(config)
         weights = self._weights(context)
-        labels = context.get("labels")
-        if torch.is_tensor(labels):
-            if tuple(labels.shape) != tuple(weights.shape):
-                raise ValueError("grouped_distillation labels must match kd_mask when labels are present")
-            if bool(((labels.to(weights.device) == -100) & (weights > 0)).any().item()):
-                raise ValueError("grouped_distillation kd_mask must be zero where labels use IGNORE_INDEX (-100)")
+        _validate_target_weights(context, weights)
         scale = resolve_global_loss_scale(context, normalization)
         _validate_global_normalization(scale, float(weights.sum(dtype=torch.float32).item()))
         _validate_neutral_temperature(context)
@@ -772,6 +879,9 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
     capabilities = frozenset({REQUIRES_ALIGNED_TOKEN_LOGPROBS})
     metric_names = _GRPO_DISTILLATION_METRICS
 
+    def requires_loss_mask_normalization(self) -> bool:
+        return True
+
     def _distillation_enabled(self, config: dict) -> bool:
         return _kd_coefficient(config) > 0
 
@@ -799,6 +909,11 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
             raise ValueError("processing.config must be a dictionary")
         if not self._distillation_enabled(config):
             return
+        _synthesize_request_labels(request)
+        _validate_request_target_weights(
+            request,
+            objective="grpo grouped distillation",
+        )
         config.setdefault("dp_size", None)
         _set_request_kd_weight_sum(
             request,

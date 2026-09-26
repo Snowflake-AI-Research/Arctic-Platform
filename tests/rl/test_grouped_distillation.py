@@ -363,6 +363,7 @@ def test_grpo_kd_off_bypasses_other_kd_only_validation_and_delegates(monkeypatch
     request = {"processing": {"loss_fn": "grpo", "config": config}}
 
     loss_object.batching_callback(request)
+    assert "labels" not in request
     loss_object.validation_callback({}, config)
     model_kwargs = {}
     output_keys = []
@@ -387,12 +388,15 @@ def test_grpo_kd_off_bypasses_other_kd_only_validation_and_delegates(monkeypatch
 def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
     frame = _frame()
     request = {
+        "input_ids": frame["input_ids"],
+        "attention_mask": frame["attention_mask"],
         "processing": {"loss_fn": "grpo", "config": {"kd_coef": 0.5, "dp_size": 1}},
         "context": {"kd_mask": frame["kd_mask"]},
     }
     loss_object = resolve_loss("grpo")
     loss_object.batching_callback(request)
     assert request["processing"]["config"]["kd_batch_num_tokens"] == pytest.approx(float(frame["kd_mask"].sum()))
+    assert request["labels"][..., -1].tolist() == [-100, -100]
 
     kwargs = {"dss_compute_logprobs": True}
     output_keys = ["logprobs"]
@@ -429,6 +433,8 @@ def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
 def test_standalone_callbacks_use_public_kd_names():
     frame = _frame()
     request = {
+        "input_ids": frame["input_ids"],
+        "attention_mask": frame["attention_mask"],
         "processing": {
             "loss_fn": "grouped_distillation",
             "config": {
@@ -445,6 +451,7 @@ def test_standalone_callbacks_use_public_kd_names():
     config = request["processing"]["config"]
 
     assert config["kd_batch_num_tokens"] == pytest.approx(float(frame["kd_mask"].sum()))
+    assert request["labels"][..., -1].tolist() == [-100, -100]
     context = {key: frame[key] for key in _CONTEXT} | {"input_ids": frame["input_ids"]}
     loss_object.validation_callback(context, config)
 
@@ -455,6 +462,102 @@ def test_standalone_callbacks_use_public_kd_names():
             {key: value for key, value in context.items() if key != "kd_mask"},
             config,
         )
+
+
+def test_enabled_grpo_rejects_positive_kd_weight_at_ignored_target():
+    frame = _frame()
+    context = {key: frame[key] for key in _CONTEXT} | {"input_ids": frame["input_ids"]}
+    context["labels"] = context["labels"].clone()
+    context["labels"][0, 0] = -100
+    context["kd_mask"] = context["kd_mask"].clone()
+    context["kd_mask"][0, 0] = 1
+
+    with pytest.raises(ValueError, match="kd_mask must be zero"):
+        resolve_loss("grpo").validation_callback(
+            context,
+            _grpo_config(frame, **_kd_config(frame)),
+        )
+
+
+def test_grouped_validation_does_not_require_labels_after_request_batching():
+    frame = _frame()
+    context = {key: frame[key] for key in _CONTEXT if key != "labels"} | {"input_ids": frame["input_ids"]}
+
+    resolve_loss("grouped_distillation").validation_callback(
+        context,
+        {
+            "kd_batch_num_tokens": float(frame["kd_mask"].sum()),
+            "dp_size": 1,
+        },
+    )
+    assert "labels" not in context
+
+
+@pytest.mark.parametrize(
+    ("loss_fn", "config"),
+    [
+        ("grouped_distillation", {}),
+        ("grpo", {"kd_coef": 0.5}),
+    ],
+)
+def test_grouped_batching_synthesizes_only_real_next_token_targets(loss_fn, config):
+    request = {
+        "input_ids": torch.tensor([[10, 11, 12, 0]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+        "processing": {"loss_fn": loss_fn, "config": config},
+        "context": {"kd_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]])},
+    }
+
+    resolve_loss(loss_fn).batching_callback(request)
+
+    assert request["labels"].tolist() == [[11, 12, -100, -100]]
+
+
+@pytest.mark.parametrize(
+    "boundary_fields",
+    [
+        {
+            "attention_mask": torch.ones(1, 5, dtype=torch.long),
+            "position_ids": torch.tensor([[0, 1, 2, 0, 1]]),
+        },
+        {"cu_seqlens": torch.tensor([0, 3, 5], dtype=torch.int32)},
+    ],
+)
+def test_grouped_batching_synthesizes_targets_for_each_packed_sequence(boundary_fields):
+    request = {
+        "input_ids": torch.tensor([[10, 11, 12, 20, 21]]),
+        **boundary_fields,
+        "processing": {
+            "loss_fn": "grouped_distillation",
+            "config": {},
+        },
+        "context": {
+            "kd_mask": torch.tensor([[1.0, 1.0, 0.0, 1.0, 0.0]]),
+        },
+    }
+
+    resolve_loss("grouped_distillation").batching_callback(request)
+
+    assert request["labels"].tolist() == [[11, 12, -100, 21, -100]]
+
+
+@pytest.mark.parametrize(
+    ("loss_fn", "config"),
+    [
+        ("grouped_distillation", {}),
+        ("grpo", {"kd_coef": 0.5}),
+    ],
+)
+def test_grouped_batching_rejects_positive_weight_without_next_token(loss_fn, config):
+    request = {
+        "input_ids": torch.tensor([[10, 11, 12]]),
+        "labels": torch.tensor([[11, 12, 10]]),
+        "processing": {"loss_fn": loss_fn, "config": config},
+        "context": {"kd_mask": torch.ones(1, 3)},
+    }
+
+    with pytest.raises(ValueError, match="kd_mask must be zero where no next-token target exists"):
+        resolve_loss(loss_fn).batching_callback(request)
 
 
 def test_grpo_batching_and_objective_share_canonical_underflowed_weights():

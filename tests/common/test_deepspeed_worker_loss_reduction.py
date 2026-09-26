@@ -251,16 +251,16 @@ def test_native_worker_sums_globally_normalized_gas_losses_without_rescaling_gra
     request = {
         "batch": [
             {
-                "input_ids": torch.ones(1, 1, dtype=torch.long),
-                "attention_mask": torch.ones(1, 1, dtype=torch.long),
-                "labels": torch.ones(1, 1, dtype=torch.long),
-                "kd_mask": torch.ones(1, 1),
+                "input_ids": torch.ones(1, 2, dtype=torch.long),
+                "attention_mask": torch.ones(1, 2, dtype=torch.long),
+                "labels": torch.tensor([[1, -100]], dtype=torch.long),
+                "kd_mask": torch.tensor([[1.0, 0.0]]),
             },
             {
-                "input_ids": torch.ones(1, 1, dtype=torch.long),
-                "attention_mask": torch.ones(1, 1, dtype=torch.long),
-                "labels": torch.ones(1, 1, dtype=torch.long),
-                "kd_mask": torch.ones(1, 1),
+                "input_ids": torch.ones(1, 2, dtype=torch.long),
+                "attention_mask": torch.ones(1, 2, dtype=torch.long),
+                "labels": torch.tensor([[1, -100]], dtype=torch.long),
+                "kd_mask": torch.tensor([[1.0, 0.0]]),
             },
         ],
         "meta": {"pad_token_id": 0},

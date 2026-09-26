@@ -68,7 +68,8 @@ class BaseLoss(ABC, metaclass=RegistryMeta):
 
     Callback arguments are ordinary dictionaries, sequences, and tensors so
     this contract can be used by AP directly or by an external DSS runtime.
-    Mutating callbacks default to no-ops.
+    Lifecycle callbacks default to no-ops; response filtering drops raw logits
+    unless a subclass explicitly retains them.
     """
 
     name: str
@@ -88,6 +89,10 @@ class BaseLoss(ABC, metaclass=RegistryMeta):
 
     def is_legacy_adapter_for(self, loss_fn: Callable) -> bool:
         """Whether this object wraps exactly *loss_fn* from the function registry."""
+        return False
+
+    def requires_loss_mask_normalization(self) -> bool:
+        """Whether DSS should derive global normalization from ``loss_mask``."""
         return False
 
     def validation_callback(self, context: dict, config: dict) -> None:
@@ -124,11 +129,8 @@ class BaseLoss(ABC, metaclass=RegistryMeta):
         return avg_loss
 
     def output_callback(self, model_outputs: dict) -> None:
-        """Remove objective-only model outputs before response assembly.
-
-        The default is a no-op. Class losses that do not want raw logits or
-        other model outputs returned must remove them here.
-        """
+        """Remove raw logits before response assembly by default."""
+        model_outputs.pop("logits", None)
 
     @abstractmethod
     def loss(
@@ -157,6 +159,9 @@ class _LegacyLossAdapter(BaseLoss):
 
     def is_legacy_adapter_for(self, loss_fn: Callable) -> bool:
         return self._loss_fn is loss_fn
+
+    def requires_loss_mask_normalization(self) -> bool:
+        return True
 
     def packed_reduction_callback(
         self,

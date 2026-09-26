@@ -33,7 +33,7 @@ def _request() -> dict:
             "input_ids": torch.arange(8).reshape(4, 2),
             "attention_mask": torch.ones(4, 2, dtype=torch.long),
         },
-        "context": {"kd_mask": torch.ones(4, 2)},
+        "context": {"kd_mask": torch.tensor([[1.0, 0.0]]).expand(4, -1).clone()},
         "processing": {
             "loss_fn": "grpo",
             "config": {"kd_coef": 0.5},
@@ -117,7 +117,7 @@ def _worker_result(index, shard):
 
 def _assert_shard(shard, index, events):
     events.append(f"worker-{index}")
-    assert shard["processing"]["config"]["kd_batch_num_tokens"] == 8.0
+    assert shard["processing"]["config"]["kd_batch_num_tokens"] == 4.0
     assert shard["batch"]["kd_mask"].shape == (2, 2)
     return _worker_result(index, shard)
 
@@ -311,12 +311,14 @@ def _native_grpo_kd_request():
         ],
         dtype=torch.long,
     )
+    target_mask = attention_mask.bool() & torch.roll(attention_mask.bool(), shifts=-1, dims=-1)
+    target_mask[..., -1] = False
     return {
         "kwargs": {
             "input_ids": torch.ones(rows, sequence_length, dtype=torch.long),
             "attention_mask": attention_mask,
             "labels": torch.where(
-                attention_mask.bool(),
+                target_mask,
                 torch.ones_like(attention_mask),
                 torch.full_like(attention_mask, -100),
             ),
@@ -326,8 +328,8 @@ def _native_grpo_kd_request():
             "pad_token_id": 0,
             "old_log_probs_shifted": torch.zeros(rows, sequence_length),
             "advantages": torch.ones(rows, sequence_length),
-            "loss_mask": attention_mask.bool(),
-            "kd_mask": attention_mask.float(),
+            "loss_mask": target_mask,
+            "kd_mask": target_mask.float(),
             "teacher_token_ids": torch.arange(width).expand(rows, sequence_length, width),
             "teacher_log_probs": torch.full(
                 (rows, sequence_length, width),
@@ -467,10 +469,10 @@ def test_ray_grpo_kd_unpads_teacher_groups_for_multiple_rows_per_worker(monkeypa
     base_response = asyncio.run(server.forward_backward(1, base_request))
 
     assert received[0]["processing"]["config"]["dp_size"] is None
-    assert received[0]["processing"]["config"]["kd_batch_num_tokens"] == 8.0
+    assert received[0]["processing"]["config"]["kd_batch_num_tokens"] == 4.0
     assert [shard["meta"]["dp_size"] for shard in received[:2]] == [2, 2]
     assert [worker.engine.group_shapes for worker in workers] == [[(1, 5, 2)], [(1, 3, 2)]]
-    assert response["metrics"]["kd_weight_sum"] == 8.0
+    assert response["metrics"]["kd_weight_sum"] == 4.0
     assert response["avg_loss"] - base_response["avg_loss"] == pytest.approx(response["metrics"]["loss_term_kd"])
     assert "_avg_loss_correction_sum" not in response["metrics"]
     assert all(torch.isfinite(worker.engine.parameter.grad) for worker in workers)
@@ -506,7 +508,7 @@ def test_ray_grouped_distillation_reports_global_objective_without_dp_gradient_s
     assert response["avg_loss"] == pytest.approx(objective.item())
     assert "_avg_loss_correction_sum" not in response["metrics"]
     assert [worker.engine.parameter.grad.item() for worker in workers] == pytest.approx(
-        [2 * 5 / 8 * objective_grad.item(), 2 * 3 / 8 * objective_grad.item()]
+        [2 * 3 / 4 * objective_grad.item(), 2 * 1 / 4 * objective_grad.item()]
     )
 
 
@@ -542,10 +544,10 @@ def test_http_forward_grpo_kd_unpads_teacher_groups_for_multiple_rows_per_worker
     decoded = wire.loads(response.body)
 
     assert received[0]["processing"]["config"]["dp_size"] is None
-    assert received[0]["processing"]["config"]["kd_batch_num_tokens"] == 8.0
+    assert received[0]["processing"]["config"]["kd_batch_num_tokens"] == 4.0
     assert [shard["meta"]["dp_size"] for shard in received] == [2, 2]
     assert [worker.engine.group_shapes for worker in workers] == [[(1, 5, 2)], [(1, 3, 2)]]
-    assert decoded["metrics"]["kd_weight_sum"] == 8.0
+    assert decoded["metrics"]["kd_weight_sum"] == 4.0
     assert torch.isfinite(torch.tensor(decoded["avg_loss"]))
 
 

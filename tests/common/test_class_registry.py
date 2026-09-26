@@ -237,7 +237,7 @@ def test_registered_class_precedes_same_named_function_without_replacing_it(monk
     assert resolved.loss({}, {}, {}, {}, "cpu")[1] == {"class": True}
 
 
-def test_base_loss_callbacks_are_no_ops_by_default():
+def test_base_loss_callbacks_are_safe_defaults():
     class NoOpLoss(BaseLoss):
         name = "_no_op_callbacks"
 
@@ -256,6 +256,7 @@ def test_base_loss_callbacks_are_no_ops_by_default():
     assert loss_object.batching_callback(request) is None
     assert loss_object.has_capability("missing") is False
     assert loss_object.is_legacy_adapter_for(lambda: None) is False
+    assert loss_object.requires_loss_mask_normalization() is False
     assert loss_object.validation_callback(context, config) is None
     assert loss_object.model_forward_callback(kwargs, context, config, output_keys) is None
     assert loss_object.packed_reduction_callback([context], config, loss_object.name) is None
@@ -265,7 +266,13 @@ def test_base_loss_callbacks_are_no_ops_by_default():
     assert request == {"value": 1}
     assert kwargs == {"value": 4}
     assert output_keys == ["logits"]
-    assert set(outputs) == {"logits"}
+    assert outputs == {}
+
+
+def test_loss_mask_normalization_is_objective_owned():
+    assert resolve_loss("grouped_distillation").requires_loss_mask_normalization() is False
+    assert resolve_loss("grpo").requires_loss_mask_normalization() is True
+    assert resolve_loss("ap_grpo").requires_loss_mask_normalization() is True
 
 
 def test_pipeline_invokes_class_callbacks_in_execution_order():
