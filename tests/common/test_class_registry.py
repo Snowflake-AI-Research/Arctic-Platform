@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from abc import ABC
 from abc import abstractmethod
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -30,7 +31,9 @@ from arctic_platform.registry import RegistryMeta
 from arctic_platform.registry import RegistryValidationError
 from arctic_platform.registry import get_registered_class
 from arctic_platform.rl.processors import BaseLoss
+from arctic_platform.rl.processors import PackedLossReduction
 from arctic_platform.rl.processors import resolve_loss
+from arctic_platform.rl.processors import resolve_packed_loss_reduction
 from arctic_platform.rl.processors.pipeline import run_pipeline
 
 
@@ -126,6 +129,71 @@ def test_loss_resolver_preserves_legacy_fallback_metadata(monkeypatch):
     assert loss_object.is_legacy_adapter_for(function_loss)
     loss_object.output_callback(outputs)
     assert set(outputs) == {"logprobs"}
+
+
+def test_legacy_adapter_canonicalizes_structurally_compatible_foreign_reduction(monkeypatch):
+    @dataclass(frozen=True)
+    class ForeignPackedLossReduction:
+        loss_scales: tuple[float, ...]
+        reporting_weights: tuple[float, ...]
+        loss_is_additive: bool
+
+    foreign = ForeignPackedLossReduction(
+        loss_scales=(0.25, 0.75),
+        reporting_weights=(1.0, 3.0),
+        loss_is_additive=False,
+    )
+
+    def function_loss(model_outputs, batch, meta, config, device):
+        return torch.tensor(0.0), {}
+
+    def reduction_callback(microbatches, config, loss_name):
+        assert len(microbatches) == 2
+        assert loss_name == "_foreign_legacy_reduction"
+        return foreign
+
+    setattr(function_loss, PACKED_LOSS_REDUCTION_ATTR, reduction_callback)
+    monkeypatch.setitem(LOSS_FNS, "_foreign_legacy_reduction", function_loss)
+
+    reduction = resolve_packed_loss_reduction(
+        {"loss_fn": "_foreign_legacy_reduction", "config": {}},
+        [{}, {}],
+    )
+
+    assert type(reduction) is PackedLossReduction
+    assert reduction == PackedLossReduction(
+        loss_scales=(0.25, 0.75),
+        reporting_weights=(1.0, 3.0),
+        loss_is_additive=False,
+    )
+
+
+def test_native_loss_rejects_structurally_compatible_foreign_reduction():
+    @dataclass(frozen=True)
+    class ForeignPackedLossReduction:
+        loss_scales: tuple[float, ...]
+        reporting_weights: tuple[float, ...]
+        loss_is_additive: bool
+
+    class NativeLoss(BaseLoss):
+        name = "_native_foreign_reduction"
+
+        def packed_reduction_callback(self, microbatches, config, loss_fn_name):
+            return ForeignPackedLossReduction(
+                loss_scales=(1.0,),
+                reporting_weights=(1.0,),
+                loss_is_additive=False,
+            )
+
+        def loss(self, model_outputs, batch, meta, config, device):
+            return torch.tensor(0.0), {}
+
+    with pytest.raises(TypeError, match="must return PackedLossReduction"):
+        resolve_packed_loss_reduction(
+            {"loss_fn": NativeLoss.name, "config": {}},
+            [{}],
+            loss_object=NativeLoss(),
+        )
 
 
 def test_registered_class_precedes_same_named_function_without_replacing_it(monkeypatch):

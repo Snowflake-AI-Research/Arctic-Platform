@@ -131,7 +131,28 @@ class _LegacyLossAdapter(BaseLoss):
         resolver = getattr(self._loss_fn, PACKED_LOSS_REDUCTION_ATTR, None)
         if resolver is None:
             return None
-        return resolver(microbatches, config, loss_fn_name)
+        reduction = resolver(microbatches, config, loss_fn_name)
+        if reduction is None:
+            return None
+
+        # Dotted legacy losses may return the equivalent type from their own
+        # package. Canonicalize it here while native BaseLoss callbacks remain
+        # subject to the strict AP type check.
+        from .packed_reduction import PackedLossReduction
+
+        if isinstance(reduction, PackedLossReduction):
+            return reduction
+        try:
+            loss_scales = reduction.loss_scales
+            reporting_weights = reduction.reporting_weights
+            loss_is_additive = reduction.loss_is_additive
+        except AttributeError:
+            return reduction
+        return PackedLossReduction(
+            loss_scales=tuple(loss_scales),
+            reporting_weights=tuple(reporting_weights),
+            loss_is_additive=loss_is_additive,
+        )
 
     def output_callback(self, model_outputs: dict) -> None:
         model_outputs.pop("logits", None)
