@@ -25,6 +25,7 @@ import torch
 
 from arctic_platform.common.utils.batch import metric_is_summed
 
+from .base_loss import BaseLoss
 from .base_loss import resolve_loss
 
 _GLOBAL_SCALE_KEYS = ("dp_size", "batch_num_tokens", "global_batch_size")
@@ -125,6 +126,7 @@ def resolve_packed_loss_reduction(
     microbatches: Sequence[dict],
     *,
     require_declared: bool = True,
+    loss_object: BaseLoss | None = None,
 ) -> PackedLossReduction | None:
     """Resolve an objective's packed-microbatch reduction and preflight it."""
     n_mbs = len(microbatches)
@@ -139,7 +141,8 @@ def resolve_packed_loss_reduction(
     if loss_fn_name is None:
         return local_mean_packed_loss_reduction((1.0,) * n_mbs)
 
-    loss_object = resolve_loss(loss_fn_name)
+    if loss_object is None:
+        loss_object = resolve_loss(loss_fn_name)
     reduction = loss_object.packed_reduction_callback(
         microbatches,
         _config_with_microbatch_scales(processing, microbatches),

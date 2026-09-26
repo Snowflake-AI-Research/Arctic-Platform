@@ -231,3 +231,101 @@ def test_pipeline_invokes_class_callbacks_in_execution_order():
         "backward",
     ]
     assert result == {"batch": {}, "metrics": {}, "avg_loss": 1.0}
+
+
+def test_packed_pipeline_reuses_one_stateful_loss_for_reduction_and_callbacks():
+    from arctic_platform.rl.processors.packed_reduction import local_mean_packed_loss_reduction
+
+    events = []
+    instances = []
+
+    class StatefulPackedLoss(BaseLoss):
+        name = "_stateful_packed_callbacks"
+
+        def __init__(self):
+            instances.append(self)
+            self.ready = False
+
+        def packed_reduction_callback(self, microbatches, config, loss_fn_name):
+            assert loss_fn_name == self.name
+            self.ready = True
+            events.append("reduction")
+            return local_mean_packed_loss_reduction(
+                [float(microbatch["loss_mask"].sum()) for microbatch in microbatches]
+            )
+
+        def validation_callback(self, context, config):
+            assert self.ready
+            events.append("validation")
+
+        def model_forward_callback(self, model_kwargs, context, config, output_keys):
+            assert self.ready
+            events.append("model_callback")
+            output_keys.append("objective_output")
+
+        def loss(self, model_outputs, batch, meta, config, device):
+            assert self.ready
+            events.append("loss")
+            return -model_outputs["objective_output"].mean(), {}
+
+        def output_callback(self, model_outputs):
+            assert self.ready
+            events.append("output")
+            model_outputs.pop("objective_output")
+
+    class Engine:
+        global_rank = 0
+
+        def __init__(self):
+            self.parameter = torch.tensor(-2.0, requires_grad=True)
+
+        def set_gradient_accumulation_boundary(self, _boundary):
+            pass
+
+        def train(self):
+            pass
+
+        def __call__(self, input_ids, **_kwargs):
+            events.append("model")
+            return {"objective_output": self.parameter.expand_as(input_ids)}
+
+        def backward(self, loss, scale_wrt_gas=False):
+            assert scale_wrt_gas is False
+            events.append("backward")
+            loss.backward()
+
+    engine = Engine()
+    result = run_pipeline(
+        engine,
+        (),
+        {
+            "input_ids": torch.tensor([[1, 2], [3, 4]]),
+            "attention_mask": torch.ones(2, 2, dtype=torch.long),
+            "loss_mask": torch.ones(2, 2),
+        },
+        {"pad_token_id": 0},
+        {"loss_fn": StatefulPackedLoss.name, "post": [], "config": {}},
+        "cpu",
+        backward=True,
+        pack=True,
+        max_tokens_per_mb=2,
+    )
+
+    assert len(instances) == 1
+    assert result["avg_loss"] == 2.0
+    assert engine.parameter.grad.item() == -1.0
+    assert events == [
+        "reduction",
+        "validation",
+        "model_callback",
+        "model",
+        "loss",
+        "output",
+        "backward",
+        "validation",
+        "model_callback",
+        "model",
+        "loss",
+        "output",
+        "backward",
+    ]

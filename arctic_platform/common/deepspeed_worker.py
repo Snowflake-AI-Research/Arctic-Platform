@@ -438,13 +438,18 @@ class DeepSpeedWorker:
             self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
 
         loss_reduction = None
+        loss_object = None
         if not use_sft_pipeline:
+            from arctic_platform.rl.processors import resolve_loss
             from arctic_platform.rl.processors import resolve_packed_loss_reduction
 
+            if loss_fn is not None:
+                loss_object = resolve_loss(loss_fn)
             loss_reduction = resolve_packed_loss_reduction(
                 processing,
                 [{**meta_data, **micro_batch} for micro_batch in micro_batch_data],
                 require_declared=False,
+                loss_object=loss_object,
             )
 
         pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
@@ -493,8 +498,10 @@ class DeepSpeedWorker:
                     backward=backward,
                 )
             else:
+                from arctic_platform.rl.processors import apply_packed_loss_reduction
                 from arctic_platform.rl.processors import run_pipeline
 
+                pipeline_backward = "loss_only" if backward and loss_reduction is not None else backward
                 micro_batch_output = run_pipeline(
                     self.engine,
                     args,
@@ -502,10 +509,18 @@ class DeepSpeedWorker:
                     meta_data,
                     processing,
                     device=self._device,
-                    backward=backward,
+                    backward=pipeline_backward,
                     pack=False,
                     return_tensors=return_tensors,
+                    loss_object=loss_object,
                 )
+                if backward and loss_reduction is not None:
+                    apply_packed_loss_reduction(
+                        self.engine,
+                        micro_batch_output.pop("loss_tensor"),
+                        loss_reduction.loss_scales[i],
+                        backward=True,
+                    )
 
             if i == 0:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {micro_batch_output.keys()=}")

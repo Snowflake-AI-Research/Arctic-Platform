@@ -69,6 +69,7 @@ from arctic_platform.rl.utils.debug import ProfilerContext
 from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.debug import see_memory_usage
 
+from .base_loss import BaseLoss
 from .base_loss import resolve_loss
 from .microbatch import DEFAULT_MAX_TOKENS_PER_MB
 from .packed_reduction import apply_packed_loss_reduction
@@ -179,9 +180,9 @@ def padded_tensor_2d_to_unpadded_tensor_1d(tensor_2d, attention_mask_2d_bool):
 
 def padded_tensor_2d_dict_to_unpadded_tensor_1d_dict(tensor_dict, attention_mask_2d_bool):
     for key, value in tensor_dict.items():
-        if torch.is_tensor(value) and value.shape == attention_mask_2d_bool.shape:
+        if torch.is_tensor(value) and value.ndim >= 2 and value.shape[:2] == attention_mask_2d_bool.shape:
             new_value = padded_tensor_2d_to_unpadded_tensor_1d(value, attention_mask_2d_bool)
-            pr0(f"2d->1d {key=} {value.shape=} -> {new_value.shape=} {value.sum()=} -> {new_value.sum()=}")
+            pr0(f"padded->unpadded {key=} {value.shape=} -> {new_value.shape=} {value.sum()=} -> {new_value.sum()=}")
             # pr0(f"2d->1d: {value=}")
             # pr0(f"2d->1d: {new_value=}")
 
@@ -310,6 +311,7 @@ def run_pipeline(
     max_tokens_per_mb: int = DEFAULT_MAX_TOKENS_PER_MB,
     return_tensors: bool = False,
     validate_loss_callback: bool = True,
+    loss_object: BaseLoss | None = None,
 ) -> dict:
     global c
     """Execute forward, post-processors, and optionally loss + backward.
@@ -355,6 +357,9 @@ def run_pipeline(
         Invoke the selected loss's public validation callback before model
         execution. Callers that repeat an already validated packed window
         solely to keep a distributed schedule aligned may set this to false.
+    loss_object
+        Optional pre-resolved objective shared with packed reduction and every
+        callback in this worker execution. The pipeline resolves it when omitted.
 
     Returns
     -------
@@ -369,6 +374,10 @@ def run_pipeline(
         When ``backward="loss_only"``: same as loss path but also includes
         ``"loss_tensor"`` (undetached, caller handles backward).
     """
+    loss_fn_name = processing.get("loss_fn", "ap_grpo")
+    if loss_object is None and loss_fn_name is not None:
+        loss_object = resolve_loss(loss_fn_name)
+
     if pack:
         # Auto-detect already-packed input: pack_for_dss adds cu_seqlens as the
         # definitive signal that packing already happened — skip to avoid
@@ -386,14 +395,13 @@ def run_pipeline(
                 backward=backward,
                 max_tokens_per_mb=max_tokens_per_mb,
                 validate_loss_callback=validate_loss_callback,
+                loss_object=loss_object,
             )
 
     tname_e2e = timers.start(f"run_pipeline e2e {engine.global_rank}")
     see_memory_usage("before fwd", force=True)
     post_names = processing.get("post", [])
-    loss_fn_name = processing.get("loss_fn", "ap_grpo")
     config = processing.get("config", {})
-    loss_object = resolve_loss(loss_fn_name) if loss_fn_name is not None else None
 
     # Skip entropy computation when it cannot affect the loss (entropy_coeff == 0).
     # Entropy is expensive: it requires a full-vocab softmax. In the non-zorro path
@@ -602,6 +610,7 @@ def _run_pipeline_with_packing(
     backward: bool | str,
     max_tokens_per_mb: int,
     validate_loss_callback: bool,
+    loss_object: BaseLoss | None,
 ) -> dict:
     """Run the pipeline with automatic sequence packing/unpacking.
 
@@ -619,7 +628,11 @@ def _run_pipeline_with_packing(
     mb_list = split_padded_tensor_dict_into_mb_list(all_input, mb_spec)
     n_mbs = len(mb_list.mbs)
 
-    reduction = resolve_packed_loss_reduction(processing, mb_list.mbs)
+    reduction = resolve_packed_loss_reduction(
+        processing,
+        mb_list.mbs,
+        loss_object=loss_object,
+    )
     captured_losses: list[float] = []
     captured_loss_tensors: list[torch.Tensor] = []
     captured_metrics: list[dict] = []
@@ -659,6 +672,7 @@ def _run_pipeline_with_packing(
             pack=False,
             return_tensors=True,
             validate_loss_callback=validate_loss_callback,
+            loss_object=loss_object,
         )
 
         if "avg_loss" in result:

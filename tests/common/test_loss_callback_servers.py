@@ -205,6 +205,7 @@ class _GroupedPolicyEngine:
 
     def __init__(self):
         self.parameter = torch.tensor(0.0, requires_grad=True)
+        self.group_shapes = []
 
     def gradient_accumulation_steps(self):
         return 1
@@ -217,13 +218,19 @@ class _GroupedPolicyEngine:
 
     def __call__(self, input_ids, group_token_ids=None, **_kwargs):
         assert group_token_ids is not None
+        self.group_shapes.append(tuple(group_token_ids.shape))
         logprobs = self.parameter.expand_as(input_ids)
-        candidate = torch.nn.functional.logsigmoid(self.parameter)
-        tail = torch.nn.functional.logsigmoid(-self.parameter)
-        group_log_probs = torch.stack((candidate, tail)).expand(*input_ids.shape, 2)
+        width = group_token_ids.shape[-1]
+        group_logits = torch.cat(
+            (
+                self.parameter.expand(*input_ids.shape, width),
+                self.parameter.new_zeros(*input_ids.shape, 1),
+            ),
+            dim=-1,
+        )
         return {
             "logprobs": logprobs,
-            "group_log_probs": group_log_probs,
+            "group_log_probs": group_logits.log_softmax(-1),
         }
 
     def backward(self, loss, scale_wrt_gas=False):
@@ -246,22 +253,38 @@ def _cpu_worker(engine):
 
 
 def _native_grpo_kd_request():
-    rows, sequence_length = 2, 2
+    rows, sequence_length, width = 4, 3, 2
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1],
+            [1, 1, 0],
+            [1, 1, 0],
+            [1, 0, 0],
+        ],
+        dtype=torch.long,
+    )
     return {
         "kwargs": {
             "input_ids": torch.ones(rows, sequence_length, dtype=torch.long),
-            "attention_mask": torch.ones(rows, sequence_length, dtype=torch.long),
-            "labels": torch.ones(rows, sequence_length, dtype=torch.long),
+            "attention_mask": attention_mask,
+            "labels": torch.where(
+                attention_mask.bool(),
+                torch.ones_like(attention_mask),
+                torch.full_like(attention_mask, -100),
+            ),
             "dss_compute_logprobs": True,
         },
         "context": {
             "pad_token_id": 0,
             "old_log_probs_shifted": torch.zeros(rows, sequence_length),
             "advantages": torch.ones(rows, sequence_length),
-            "loss_mask": torch.ones(rows, sequence_length, dtype=torch.bool),
-            "kd_mask": torch.ones(rows, sequence_length),
-            "teacher_token_ids": torch.zeros(rows, sequence_length, 1, dtype=torch.long),
-            "teacher_log_probs": torch.full((rows, sequence_length, 1), torch.log(torch.tensor(0.4))),
+            "loss_mask": attention_mask.bool(),
+            "kd_mask": attention_mask.float(),
+            "teacher_token_ids": torch.arange(width).expand(rows, sequence_length, width),
+            "teacher_log_probs": torch.full(
+                (rows, sequence_length, width),
+                torch.log(torch.tensor(0.2)),
+            ),
             "teacher_tail_log_prob": torch.full((rows, sequence_length), torch.log(torch.tensor(0.6))),
         },
         "processing": {
@@ -275,7 +298,7 @@ def _native_grpo_kd_request():
     }
 
 
-def test_ray_grpo_kd_uses_native_split_dp_size_in_real_worker(monkeypatch):
+def test_ray_grpo_kd_unpads_teacher_groups_for_multiple_rows_per_worker(monkeypatch):
     import arctic_platform.common.ray_server as ray_server
 
     request = _native_grpo_kd_request()
@@ -297,9 +320,49 @@ def test_ray_grpo_kd_uses_native_split_dp_size_in_real_worker(monkeypatch):
 
     response = asyncio.run(server.forward_backward(1, request))
 
-    assert request["processing"]["config"]["dp_size"] is None
-    assert request["processing"]["config"]["kd_batch_num_tokens"] == 4.0
+    assert received[0]["processing"]["config"]["dp_size"] is None
+    assert received[0]["processing"]["config"]["kd_batch_num_tokens"] == 8.0
     assert [shard["meta"]["dp_size"] for shard in received] == [2, 2]
-    assert response["metrics"]["kd_weight_sum"] == 4.0
+    assert [worker.engine.group_shapes for worker in workers] == [[(1, 5, 2)], [(1, 3, 2)]]
+    assert response["metrics"]["kd_weight_sum"] == 8.0
     assert torch.isfinite(torch.tensor(response["avg_loss"]))
     assert all(torch.isfinite(worker.engine.parameter.grad) for worker in workers)
+
+
+def test_http_forward_grpo_kd_unpads_teacher_groups_for_multiple_rows_per_worker():
+    import arctic_platform.common.http_server as http_server
+
+    request = _native_grpo_kd_request()
+    workers = [_cpu_worker(_GroupedPolicyEngine()) for _ in range(2)]
+    received = []
+
+    class Remote:
+        def __init__(self, worker):
+            self.worker = worker
+
+        async def _call(self, shard):
+            received.append(shard)
+            return self.worker.forward_no_grad(shard)
+
+        def remote(self, shard):
+            return self._call(shard)
+
+    http_server.app.state.jobs = {1: {"job_type": "training", "sp_size": 1}}
+    http_server.app.state.training_workers = [
+        type("Worker", (), {"forward_no_grad": Remote(worker)})() for worker in workers
+    ]
+
+    response = asyncio.run(
+        http_server.forward(
+            job_id=1,
+            body=wire.dumps(request),
+        )
+    )
+    decoded = wire.loads(response.body)
+
+    assert received[0]["processing"]["config"]["dp_size"] is None
+    assert received[0]["processing"]["config"]["kd_batch_num_tokens"] == 8.0
+    assert [shard["meta"]["dp_size"] for shard in received] == [2, 2]
+    assert [worker.engine.group_shapes for worker in workers] == [[(1, 5, 2)], [(1, 3, 2)]]
+    assert decoded["metrics"]["kd_weight_sum"] == 8.0
+    assert torch.isfinite(torch.tensor(decoded["avg_loss"]))
