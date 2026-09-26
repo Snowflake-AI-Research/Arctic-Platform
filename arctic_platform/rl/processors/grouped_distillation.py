@@ -46,6 +46,7 @@ _GROUPED_DISTILLATION_METRICS = (*_DISTILLATION_METRICS, "sft_nll_sum")
 _GRPO_DISTILLATION_METRICS = (*_DISTILLATION_METRICS, "loss_term_kd")
 _GROUPED_DISTILLATION_CONFIG_KEYS = frozenset({"lambda_kd", "divergence", "beta", "batch_num_tokens", "dp_size"})
 _GRPO_DISTILLATION_CONFIG_KEYS = frozenset({"kd_coef", "kd_divergence", "kd_beta", "kd_batch_num_tokens"})
+_TEACHER_LOG_PROB_DTYPES = frozenset({torch.float16, torch.bfloat16, torch.float32, torch.float64})
 
 
 class Divergence(str, Enum):
@@ -199,6 +200,17 @@ def _validate_teacher_context(context: dict, weights: torch.Tensor) -> None:
         raise ValueError(f"teacher_token_ids must contain integer ids (int32 recommended), got {token_ids.dtype}")
     if token_ids.ndim == 0:
         raise ValueError("teacher_token_ids must have a final candidate dimension")
+    if token_ids.shape[-1] < 1:
+        raise ValueError("teacher_token_ids candidate dimension M must be at least 1")
+    for name, values in (
+        ("teacher_log_probs", teacher_log_probs),
+        ("teacher_tail_log_prob", teacher_tail_log_prob),
+    ):
+        if values.dtype not in _TEACHER_LOG_PROB_DTYPES:
+            raise ValueError(
+                f"{name} must use a real floating-point dtype "
+                f"(float16, bfloat16, float32, or float64), got {values.dtype}"
+            )
 
     if tuple(token_ids.shape[:-1]) != tuple(weights.shape):
         raise ValueError(

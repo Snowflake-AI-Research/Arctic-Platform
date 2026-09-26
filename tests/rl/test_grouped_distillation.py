@@ -452,6 +452,60 @@ def test_teacher_tensor_leading_shapes_must_match_exactly():
 
 
 @pytest.mark.parametrize(
+    ("loss_fn", "weight_name", "config"),
+    [
+        (
+            "grouped_distillation",
+            "loss_mask",
+            {"batch_num_tokens": 2.0, "dp_size": 1},
+        ),
+        (
+            "grpo",
+            "kd_mask",
+            {
+                **_POLICY,
+                "kd_coef": 0.5,
+                "kd_batch_num_tokens": 2.0,
+            },
+        ),
+    ],
+)
+def test_teacher_candidate_dimension_must_be_at_least_one(loss_fn, weight_name, config):
+    context = {
+        "input_ids": torch.zeros(1, 2, dtype=torch.long),
+        weight_name: torch.ones(1, 2),
+        "teacher_token_ids": torch.empty(1, 2, 0, dtype=torch.int32),
+        "teacher_log_probs": torch.empty(1, 2, 0),
+        "teacher_tail_log_prob": torch.zeros(1, 2),
+    }
+
+    with pytest.raises(ValueError, match="candidate dimension M must be at least 1"):
+        resolve_loss(loss_fn).validation_callback(context, config)
+
+
+@pytest.mark.parametrize("name", ["teacher_log_probs", "teacher_tail_log_prob"])
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.int64])
+def test_teacher_log_probabilities_require_real_floating_point_dtype(name, dtype):
+    context = {
+        "input_ids": torch.zeros(1, 2, dtype=torch.long),
+        "loss_mask": torch.ones(1, 2),
+        "teacher_token_ids": torch.zeros(1, 2, 1, dtype=torch.int32),
+        "teacher_log_probs": torch.full((1, 2, 1), math.log(0.4)),
+        "teacher_tail_log_prob": torch.full((1, 2), math.log(0.6)),
+    }
+    invalid = context[name].to(dtype)
+    if invalid.is_complex():
+        invalid = invalid + 7j
+    context[name] = invalid
+
+    with pytest.raises(ValueError, match=rf"{name} must use a real floating-point dtype"):
+        resolve_loss("grouped_distillation").validation_callback(
+            context,
+            {"batch_num_tokens": 2.0, "dp_size": 1},
+        )
+
+
+@pytest.mark.parametrize(
     ("divergence", "beta"),
     [("kl", 1.0), ("jsd", 0.5)],
 )
