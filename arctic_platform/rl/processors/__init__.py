@@ -20,6 +20,8 @@ functions are registered in the global registries (POST_PROCESSORS,
 LOSS_FNS).
 """
 
+from .base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
+from .base_loss import REQUIRES_TOKEN_LOGPROBS
 from .base_loss import BaseLoss
 from .base_loss import prepare_request_loss
 from .base_loss import resolve_loss
@@ -132,6 +134,8 @@ __all__ = [
     "LOSS_FNS",
     "BaseLoss",
     "prepare_request_loss",
+    "REQUIRES_ALIGNED_TOKEN_LOGPROBS",
+    "REQUIRES_TOKEN_LOGPROBS",
     "resolve_loss",
     "register_post_processor",
     "register_loss_fn",

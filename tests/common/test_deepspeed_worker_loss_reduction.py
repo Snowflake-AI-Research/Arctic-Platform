@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import torch
 
+from arctic_platform.registry import RegistryMeta
 from arctic_platform.rl.processors import BaseLoss
 from arctic_platform.rl.processors import prepare_request_loss
 from arctic_platform.rl.processors.packed_reduction import local_mean_packed_loss_reduction
@@ -62,6 +63,34 @@ class _StatefulWeightedLoss(BaseLoss):
         model_outputs.pop("objective_score")
 
 
+class _DefaultStatefulWeightedLoss(_StatefulWeightedLoss):
+    name = "_w09_default_stateful_weighted"
+
+    def packed_reduction_callback(self, microbatches, config, loss_fn_name):
+        assert loss_fn_name == "ap_grpo"
+        assert config == {}
+        self.ready = True
+        self.events.append("reduction")
+        return local_mean_packed_loss_reduction(
+            [float(microbatch["reduction_weight"].item()) for microbatch in microbatches]
+        )
+
+
+class _ShadowSFTLoss(BaseLoss):
+    name = "_w09_shadow_sft"
+    calls = 0
+
+    def model_forward_callback(self, model_kwargs, context, config, output_keys):
+        output_keys.append("objective_score")
+
+    def loss(self, model_outputs, batch, meta, config, device):
+        type(self).calls += 1
+        return -model_outputs["objective_score"].mean(), {"shadow_sft": 1.0}
+
+    def output_callback(self, model_outputs):
+        model_outputs.pop("objective_score")
+
+
 class _Engine:
     global_rank = 0
 
@@ -89,6 +118,11 @@ class _Engine:
 class _ScoreEngine(_Engine):
     def __call__(self, input_ids, **_kwargs):
         return {"objective_score": self.parameter.expand_as(input_ids)}
+
+
+class _SingleGASScoreEngine(_ScoreEngine):
+    def gradient_accumulation_steps(self):
+        return 1
 
 
 def _worker(engine):
@@ -146,6 +180,71 @@ def test_native_worker_applies_local_mean_scales_with_one_stateful_loss_object()
         "loss",
         "output",
     ]
+
+
+def test_native_worker_reuses_implicit_default_loss_across_gas(monkeypatch):
+    _DefaultStatefulWeightedLoss.instances = 0
+    _DefaultStatefulWeightedLoss.events = []
+    monkeypatch.setitem(
+        RegistryMeta._registry["BaseLoss"],
+        "ap_grpo",
+        _DefaultStatefulWeightedLoss,
+    )
+    request = {
+        "batch": [
+            {
+                "input_ids": torch.ones(1, 1, dtype=torch.long),
+                "attention_mask": torch.ones(1, 1, dtype=torch.long),
+                "reduction_weight": torch.tensor(3.0),
+            },
+            {
+                "input_ids": torch.ones(1, 1, dtype=torch.long),
+                "attention_mask": torch.ones(1, 1, dtype=torch.long),
+                "reduction_weight": torch.tensor(1.0),
+            },
+        ],
+        "meta": {"pad_token_id": 0},
+        "processing": {"config": {}},
+    }
+    worker = _worker(_ScoreEngine())
+
+    response = worker.forward_backward(request)
+
+    assert response["avg_loss"] == 2.0
+    assert worker.engine.parameter.grad.item() == -1.0
+    assert _DefaultStatefulWeightedLoss.instances == 1
+    assert _DefaultStatefulWeightedLoss.events == [
+        "reduction",
+        "validation",
+        "model",
+        "loss",
+        "output",
+        "validation",
+        "model",
+        "loss",
+        "output",
+    ]
+
+
+def test_native_worker_honors_class_precedence_for_sft_name(monkeypatch):
+    _ShadowSFTLoss.calls = 0
+    monkeypatch.setitem(RegistryMeta._registry["BaseLoss"], "sft", _ShadowSFTLoss)
+    request = {
+        "batch": {
+            "input_ids": torch.ones(1, 1, dtype=torch.long),
+            "attention_mask": torch.ones(1, 1, dtype=torch.long),
+        },
+        "meta": {"pad_token_id": 0},
+        "processing": {"loss_fn": "sft", "config": {}},
+    }
+    worker = _worker(_SingleGASScoreEngine())
+
+    response = worker.forward_backward(request)
+
+    assert response["avg_loss"] == 2.0
+    assert response["metrics"] == {"shadow_sft": 1.0}
+    assert worker.engine.parameter.grad.item() == -1.0
+    assert _ShadowSFTLoss.calls == 1
 
 
 def test_native_worker_sums_globally_normalized_gas_losses_without_rescaling_gradients():

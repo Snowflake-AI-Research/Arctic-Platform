@@ -112,13 +112,11 @@ class TestMissingLabels(TestCasePlus):
 
 class TestDispatchDrift(TestCasePlus):
     def test_worker_dispatches_via_sft_loss_fns(self):
-        """deepspeed_worker resolves SFT vs GRPO against SFT_LOSS_FNS (no drift)."""
+        """SFT routing uses the canonical set after class-first loss resolution."""
         worker_path = Path(__file__).resolve().parents[2] / "arctic_platform" / "common" / "deepspeed_worker.py"
         src = worker_path.read_text()
-        # Fixed: dispatch resolves against the canonical registry set instead of
-        # an inline ``loss_fn in ("sft", "sft_ce")`` tuple, so new SFT losses
-        # route correctly without editing the worker.
-        self.assertIn("use_sft_pipeline = loss_fn in SFT_LOSS_FNS", src)
+        self.assertIn("loss_fn in SFT_LOSS_FNS", src)
+        self.assertIn("loss_object.is_legacy_adapter_for(legacy_sft_loss)", src)
         self.assertNotIn('loss_fn in ("sft", "sft_ce")', src)
         self.assertEqual(SFT_LOSS_FNS, {"sft", "sft_ce"})
 

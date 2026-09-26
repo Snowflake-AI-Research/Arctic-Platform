@@ -35,7 +35,9 @@ from typing import Tuple
 
 import torch
 
+from arctic_platform.common.registry import declare_loss_capabilities
 from arctic_platform.common.registry import register_loss_fn
+from arctic_platform.rl.processors.base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
 from arctic_platform.rl.processors.functional import resolve_global_loss_scale
 from arctic_platform.rl.processors.grpo import _ECHO_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import _ECHO_REQUIRED_CONFIG_KEYS
@@ -57,7 +59,11 @@ def _cortex_distributed_config(config: dict, batch: dict, meta: dict) -> tuple[d
     return cfg, context
 
 
-@register_loss_fn("grpo", packed_loss_reduction=_grpo_packed_loss_reduction)
+@register_loss_fn(
+    "grpo",
+    packed_loss_reduction=_grpo_packed_loss_reduction,
+)
+@declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
 def cortex_grpo_loss(
     model_outputs: dict,
     batch: dict,
@@ -80,6 +86,7 @@ def cortex_grpo_loss(
     packed_loss_reduction=_grpo_packed_loss_reduction,
     summed_metrics=ECHO_SUMMED_METRICS,
 )
+@declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
 def cortex_grpo_echo_v1_loss(
     model_outputs: dict,
     batch: dict,

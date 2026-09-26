@@ -424,27 +424,28 @@ class DeepSpeedWorker:
         pipeline_micro_batch_outputs = []
         return_tensors = meta_data.get("worker_return_tensors", False)
 
-        # Decide SFT vs GRPO once, up front. Resolve against SFT_LOSS_FNS (the
-        # canonical registry set) rather than a hardcoded ("sft", "sft_ce")
-        # tuple so new SFT losses dispatch correctly without touching the
-        # worker. Lazy-import keeps `common` free of an import-time SFT
-        # coupling; the module is cached after the first call.
-        loss_fn = processing.get("loss_fn")
+        # Resolve before selecting a specialized pipeline so class registry
+        # precedence applies equally to SFT and RL names.
+        loss_fn = processing.get("loss_fn", "ap_grpo")
+        from arctic_platform.common.registry import LOSS_FNS
+        from arctic_platform.rl.processors import resolve_loss
         from arctic_platform.sft.processor import SFT_LOSS_FNS
 
-        use_sft_pipeline = loss_fn in SFT_LOSS_FNS
+        loss_object = resolve_loss(loss_fn) if loss_fn is not None else None
+        legacy_sft_loss = LOSS_FNS.get(loss_fn) if loss_fn in SFT_LOSS_FNS else None
+        use_sft_pipeline = (
+            legacy_sft_loss is not None
+            and loss_object is not None
+            and loss_object.is_legacy_adapter_for(legacy_sft_loss)
+        )
 
         if use_sft_pipeline:
             self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
 
         loss_reduction = None
-        loss_object = None
         if not use_sft_pipeline:
-            from arctic_platform.rl.processors import resolve_loss
             from arctic_platform.rl.processors import resolve_packed_loss_reduction
 
-            if loss_fn is not None:
-                loss_object = resolve_loss(loss_fn)
             loss_reduction = resolve_packed_loss_reduction(
                 processing,
                 [{**meta_data, **micro_batch} for micro_batch in micro_batch_data],

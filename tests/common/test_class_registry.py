@@ -23,6 +23,7 @@ from abc import abstractmethod
 import pytest
 import torch
 
+from arctic_platform.common.registry import LOSS_CAPABILITIES_ATTR
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.registry import RegistryMeta
@@ -114,12 +115,15 @@ def test_loss_resolver_preserves_legacy_fallback_metadata(monkeypatch):
         return reduction
 
     setattr(function_loss, PACKED_LOSS_REDUCTION_ATTR, reduction_callback)
+    setattr(function_loss, LOSS_CAPABILITIES_ATTR, frozenset({"needs_test_output"}))
     monkeypatch.setitem(LOSS_FNS, "_legacy_test", function_loss)
 
     loss_object = resolve_loss("_legacy_test")
     outputs = {"logits": torch.ones(1), "logprobs": torch.zeros(1)}
     assert loss_object.loss(outputs, {"batch": 1}, {"meta": 2}, {"value": 3}, "cpu")[1] == {"legacy": 1}
     assert calls and loss_object.packed_reduction_callback([{}], {}, "_legacy_test") is reduction
+    assert loss_object.has_capability("needs_test_output")
+    assert loss_object.is_legacy_adapter_for(function_loss)
     loss_object.output_callback(outputs)
     assert set(outputs) == {"logprobs"}
 
@@ -159,6 +163,8 @@ def test_base_loss_callbacks_are_no_ops_by_default():
     outputs = {"logits": torch.ones(1)}
 
     assert loss_object.batching_callback(request) is None
+    assert loss_object.has_capability("missing") is False
+    assert loss_object.is_legacy_adapter_for(lambda: None) is False
     assert loss_object.validation_callback(context, config) is None
     assert loss_object.model_forward_callback(kwargs, context, config, output_keys) is None
     assert loss_object.packed_reduction_callback([context], config, loss_object.name) is None

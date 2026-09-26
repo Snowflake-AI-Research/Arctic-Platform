@@ -24,12 +24,16 @@ from collections.abc import Callable
 from collections.abc import Sequence
 from typing import Any
 
+from arctic_platform.common.registry import LOSS_CAPABILITIES_ATTR
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import resolve_fn
 from arctic_platform.registry import RegistryMeta
 from arctic_platform.registry import RegistryValidationError
 from arctic_platform.registry import get_registered_class
+
+REQUIRES_ALIGNED_TOKEN_LOGPROBS = "requires_aligned_token_logprobs"
+REQUIRES_TOKEN_LOGPROBS = "requires_token_logprobs"
 
 
 class BaseLoss(ABC, metaclass=RegistryMeta):
@@ -41,6 +45,7 @@ class BaseLoss(ABC, metaclass=RegistryMeta):
     """
 
     name: str
+    capabilities: frozenset[str] = frozenset()
 
     @classmethod
     def _validate_subclass(cls) -> None:
@@ -49,6 +54,14 @@ class BaseLoss(ABC, metaclass=RegistryMeta):
 
     def batching_callback(self, request: dict) -> None:
         """Amend one whole request before data/sequence-parallel sharding."""
+
+    def has_capability(self, capability: str) -> bool:
+        """Whether this objective declares an execution requirement."""
+        return capability in self.capabilities
+
+    def is_legacy_adapter_for(self, loss_fn: Callable) -> bool:
+        """Whether this object wraps exactly *loss_fn* from the function registry."""
+        return False
 
     def validation_callback(self, context: dict, config: dict) -> None:
         """Validate one request or packed model window before execution."""
@@ -99,6 +112,10 @@ class _LegacyLossAdapter(BaseLoss):
     def __init__(self, name: str, loss_fn: Callable) -> None:
         self.name = name
         self._loss_fn = loss_fn
+        self.capabilities = getattr(loss_fn, LOSS_CAPABILITIES_ATTR, frozenset())
+
+    def is_legacy_adapter_for(self, loss_fn: Callable) -> bool:
+        return self._loss_fn is loss_fn
 
     def packed_reduction_callback(
         self,

@@ -26,8 +26,10 @@ from typing import Tuple
 
 import torch
 
+from arctic_platform.common.registry import declare_loss_capabilities
 from arctic_platform.common.registry import register_loss_fn
 
+from .base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
 from .functional import EchoBatchDenominator
 from .functional import _resolve_dp_size
 from .functional import agg_loss
@@ -890,7 +892,11 @@ def _grpo_context(batch: dict, meta: dict) -> dict:
     return {**meta, **batch}
 
 
-@register_loss_fn("ap_grpo", packed_loss_reduction=_grpo_packed_loss_reduction)
+@register_loss_fn(
+    "ap_grpo",
+    packed_loss_reduction=_grpo_packed_loss_reduction,
+)
+@declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
 def grpo_loss(
     model_outputs: dict,
     batch: dict,
@@ -922,6 +928,7 @@ def grpo_loss(
     packed_loss_reduction=_grpo_packed_loss_reduction,
     summed_metrics=ECHO_SUMMED_METRICS,
 )
+@declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
 def grpo_echo_v1_loss(
     model_outputs: dict,
     batch: dict,

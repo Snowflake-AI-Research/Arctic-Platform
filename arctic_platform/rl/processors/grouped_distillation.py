@@ -28,6 +28,8 @@ from torch.utils.checkpoint import checkpoint
 
 from arctic_platform.common.registry import LOSS_FNS
 
+from .base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
+from .base_loss import REQUIRES_TOKEN_LOGPROBS
 from .base_loss import BaseLoss
 from .causal_cross_entropy import _connected_zero
 from .causal_cross_entropy import _validate_global_normalization
@@ -607,6 +609,7 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
     """Standalone weighted NLL mixed with grouped teacher divergence."""
 
     name = "grouped_distillation"
+    capabilities = frozenset({REQUIRES_TOKEN_LOGPROBS})
     metric_names = _GROUPED_DISTILLATION_METRICS
 
     def _distillation_enabled(self, config: dict) -> bool:
@@ -748,6 +751,7 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
     """Existing ``grpo`` policy behavior plus an optional grouped KD term."""
 
     name = "grpo"
+    capabilities = frozenset({REQUIRES_ALIGNED_TOKEN_LOGPROBS})
     metric_names = _GRPO_DISTILLATION_METRICS
 
     def _distillation_enabled(self, config: dict) -> bool:
