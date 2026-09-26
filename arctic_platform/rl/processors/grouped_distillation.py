@@ -45,13 +45,7 @@ _DISTILLATION_METRICS = (
     "student_tail_mass_sum",
 )
 _GROUPED_DISTILLATION_METRICS = (*_DISTILLATION_METRICS, "sft_nll_sum")
-_GRPO_DISTILLATION_METRICS = (
-    *_DISTILLATION_METRICS,
-    "loss_term_kd",
-    "teacher_term_token_count",
-    "teacher_log_ratio_sum",
-    "teacher_clipped_log_ratio_sum",
-)
+_GRPO_DISTILLATION_METRICS = (*_DISTILLATION_METRICS, "loss_term_kd")
 _GROUPED_DISTILLATION_CONFIG_KEYS = frozenset(
     {"kd_coef", "kd_divergence", "kd_beta", "kd_batch_num_tokens", "dp_size"}
 )
@@ -796,16 +790,9 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
 
     def validation_callback(self, context: dict, config: dict) -> None:
         context = _validation_context(context)
-        from .grpo import _resolve_teacher_tau
-
-        teacher_tau = _resolve_teacher_tau(config, context)
         kd = resolve_kd_term(config, context)
         if kd is None:
             return
-        if teacher_tau > 0:
-            raise ValueError(
-                "sampled-token OPD (teacher_tau > 0) and grouped KD (kd_coef > 0) cannot be enabled together"
-            )
         super().validation_callback(context, config)
         local_weight_sum = float(self._weights(context).sum(dtype=torch.float64).item())
         if local_weight_sum > kd.weight_sum and not math.isclose(
@@ -839,16 +826,9 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         config: dict,
         device: str,
     ) -> tuple[torch.Tensor, dict]:
+        loss, metrics = LOSS_FNS[self.name](model_outputs, batch, meta, config, device)
         context = _validation_context(_context(batch, meta))
         kd = resolve_kd_term(config, context)
-        if kd is not None:
-            from .grpo import _resolve_teacher_tau
-
-            if _resolve_teacher_tau(config, context) > 0:
-                raise ValueError(
-                    "sampled-token OPD (teacher_tau > 0) and grouped KD (kd_coef > 0) cannot be enabled together"
-                )
-        loss, metrics = LOSS_FNS[self.name](model_outputs, batch, meta, config, device)
         if kd is None:
             return loss, metrics
         kd_loss, kd_metrics = _kd_term(model_outputs, context, kd, self._weights(context))

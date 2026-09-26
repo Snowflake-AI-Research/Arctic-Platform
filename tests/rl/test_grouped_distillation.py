@@ -604,24 +604,6 @@ def test_grpo_kd_enabled_rejects_invalid_divergence_and_beta_ranges(config, matc
         )
 
 
-def test_grpo_rejects_simultaneous_sampled_and_grouped_teacher_modes():
-    frame = _frame()
-    context = {key: frame[key] for key in _CONTEXT} | {
-        "input_ids": frame["input_ids"],
-        "teacher_log_probs_shifted": torch.zeros_like(frame["old_log_probs_shifted"]),
-    }
-    with pytest.raises(ValueError, match="cannot be enabled together"):
-        resolve_loss("grpo").validation_callback(
-            context,
-            _grpo_config(frame)
-            | _kd_config(frame)
-            | {
-                "teacher_tau": 0.5,
-                "teacher_clip": 1.0,
-            },
-        )
-
-
 def test_teacher_tensor_leading_shapes_must_match_exactly():
     context = {
         "input_ids": torch.zeros(2, 3, dtype=torch.long),

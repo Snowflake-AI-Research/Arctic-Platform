@@ -25,26 +25,8 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.distributed.nn.functional as dist_autograd
 
 _GLOBAL_LOSS_SCALE_KEYS = ("dp_size", "batch_num_tokens", "global_batch_size")
-
-
-def _get_sequence_parallel_group():
-    if not dist.is_initialized():
-        return None
-    from deepspeed.utils import groups
-
-    if groups._get_sequence_parallel_world_size() > 1:
-        return groups._get_sequence_parallel_group()
-    return None
-
-
-def _sequence_parallel_sum(*totals: torch.Tensor, group) -> tuple[torch.Tensor, ...]:
-    """Autograd-aware sum of aligned per-sequence totals across SP windows."""
-    stacked = torch.stack([total.to(totals[0].dtype) for total in totals])
-    stacked = dist_autograd.all_reduce(stacked, group=group)
-    return tuple(stacked.unbind())
 
 
 def _masked_values(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -251,13 +233,9 @@ def agg_loss(
     distributed normalisation when the global batch is split across DP ranks.
     ``dp_size`` is the data-parallel width and defaults to 1; it is never a
     missing/None scale. ``batch_num_tokens`` / ``global_batch_size`` still
-    default to local counts when omitted. Every mode multiplies by ``dp_size``
-    to cancel DeepSpeed's DP gradient averaging.
-
-    Under sequence parallelism a packed caller holds one token window of the
-    frame. ``prompt-mean`` reduces per-sequence token counts over the SP group
-    before dividing, while leaving token-loss sums local because rank losses
-    are summed.
+    default to local counts when omitted. ``prompt-mean`` intentionally does
+    not multiply by ``dp_size`` so DeepSpeed's DP gradient averaging matches
+    native POC prompt-average weighting.
     """
     dp_size = _resolve_dp_size(dp_size, batch_num_tokens)
     if loss_agg_mode == "token-mean":
@@ -285,7 +263,6 @@ def agg_loss(
         loss = ((seq_losses * seq_mask).sum() / global_batch_size) * dp_size
 
     elif loss_agg_mode == "prompt-mean":
-        sp_group = _get_sequence_parallel_group()
         # When sequences are packed ([1, T] with cu_seqlens present), recover
         # per-rollout sums using cu_seqlens segment boundaries, then group.
         # In the non-packed [B, S] case, sum(dim=-1) gives one value per rollout.
@@ -305,16 +282,13 @@ def agg_loss(
             seq_sum = _masked_values(loss_mat, loss_mask).sum(dim=-1)
             seq_cnt = loss_mask.sum(dim=-1).to(seq_sum.dtype)
 
-        if sp_group is not None:
-            dist.all_reduce(seq_cnt, op=dist.ReduceOp.SUM, group=sp_group)
-
         if sequence_loss_weights is not None:
             weights = sequence_loss_weights.to(loss_mat.device).to(seq_sum.dtype).reshape(-1)
             if weights.shape[0] != seq_sum.shape[0]:
                 raise ValueError(
                     "sequence_loss_weights must have one value per sequence when loss_agg_mode='prompt-mean'."
                 )
-            loss = (weights * seq_sum / seq_cnt.clamp(min=1.0)).sum() * dp_size
+            loss = (weights * seq_sum / seq_cnt.clamp(min=1.0)).sum()
             return loss
 
         if prompt_group_ids is None:
@@ -331,8 +305,6 @@ def agg_loss(
             t = torch.tensor(local_P, device=loss_mat.device, dtype=torch.long)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
             global_num_prompts = int(t.item())
-            if sp_group is not None:
-                global_num_prompts //= dist.get_world_size(sp_group)
         else:
             global_num_prompts = local_P
 
@@ -400,11 +372,15 @@ def dp_loss_multiplier(
 
     Auxiliary terms that ADD to a policy loss must inherit the same
     distributed-reduction convention as the policy term, otherwise the
-    auxiliary-to-policy ratio changes with DP width. Every :func:`agg_loss`
-    path, including ``prompt-mean`` with ``sequence_loss_weights``, multiplies
-    by ``dp_size`` to cancel DeepSpeed's gradient averaging. Keep this in
-    lockstep with :func:`agg_loss` when conventions change.
+    auxiliary-to-policy ratio changes with DP width. This mirrors
+    :func:`agg_loss` exactly: ``prompt-mean`` with ``sequence_loss_weights``
+    relies on DP gradient averaging over globally normalized weights (no
+    multiplier); every other path multiplies by ``dp_size`` to cancel the
+    averaging. Keep this in lockstep with :func:`agg_loss` when conventions
+    change.
     """
+    if loss_agg_mode == "prompt-mean" and sequence_loss_weights is not None:
+        return 1
     return dp_size
 
 
@@ -426,24 +402,6 @@ class EchoBatchDenominator(str, Enum):
     ECHO_BEARING_SEQUENCES = "echo_bearing_sequences"
 
 
-def _full_observation_denominator(supplied: torch.Tensor, local: torch.Tensor) -> torch.Tensor:
-    """Validate caller-supplied full observation counts against this window."""
-    counts = supplied.to(device=local.device, dtype=local.dtype).reshape(-1)
-    if counts.shape != local.shape:
-        raise ValueError(
-            "observation_token_counts must have one full observation count per sequence in "
-            f"this call, got {tuple(counts.shape)} for {tuple(local.shape)} sequences."
-        )
-    if not torch.isfinite(counts).all().item():
-        raise ValueError("observation_token_counts values must be finite.")
-    if (counts < local).any().item():
-        raise ValueError(
-            "observation_token_counts holds a count below this call's own observation-token "
-            "count; a sequence's full count cannot be smaller than one window's share."
-        )
-    return counts
-
-
 def echo_env_prediction_loss_fn(
     logprobs: torch.Tensor,
     sft_mask: torch.Tensor,
@@ -453,7 +411,6 @@ def echo_env_prediction_loss_fn(
     batch_denominator: str = EchoBatchDenominator.ALL_SEQUENCES.value,
     cu_seqlens: torch.Tensor | None = None,
     dp_size: int = 1,
-    observation_token_counts: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """ECHO Environment-Prediction auxiliary loss (https://arxiv.org/abs/2605.24517).
 
@@ -474,15 +431,12 @@ def echo_env_prediction_loss_fn(
     losses, so only a constant global denominator keeps the auxiliary
     gradient mass invariant to how the batch was split).
 
-    Under sequence parallelism, observation and policy token counts are
-    reduced across the SP group so every window normalizes against each whole
-    sequence. ``observation_token_counts`` may supply those full counts
-    explicitly when no SP group is available.
-
-    ``dp_size`` must be the factor the policy aggregation applies, as returned
-    by :func:`dp_loss_multiplier`. All policy modes compensate for DeepSpeed's
-    DP gradient averaging, so the ECHO term applies the same raw DP width and
-    preserves the configured auxiliary-to-policy ratio.
+    ``dp_size`` must be the factor the POLICY aggregation applies, i.e.
+    :func:`dp_loss_multiplier` of the selected ``loss_agg_mode`` — NOT the
+    raw DP width. Passing the raw width when the policy path relies on DP
+    gradient averaging (``prompt-mean`` + ``sequence_loss_weights``) would
+    scale the auxiliary-to-policy ratio by DP width, silently multiplying
+    the configured λ.
 
     ``batch_denominator`` declares which count the client computed (see
     :class:`EchoBatchDenominator`). The division always uses the supplied
@@ -566,12 +520,6 @@ def echo_env_prediction_loss_fn(
     else:
         raise ValueError("cu_seqlens is required for packed 1D ECHO tensors.")
 
-    sp_group = _get_sequence_parallel_group()
-    if sp_group is not None:
-        group_counts = torch.stack((seq_obs_count, seq_policy_count))
-        dist.all_reduce(group_counts, op=dist.ReduceOp.SUM, group=sp_group)
-        seq_obs_count, seq_policy_count = group_counts.unbind()
-
     num_sequences = int(seq_obs_count.shape[0])
     num_echo_bearing_sequences = int((seq_obs_count > 0).sum().item())
     # A row carrying neither policy nor observation tokens contributes zero
@@ -590,13 +538,6 @@ def echo_env_prediction_loss_fn(
             "count can never be below one slice's count, so the declared echo_batch_denominator "
             "and the supplied count disagree."
         )
-
-    if sp_group is not None and dist.get_rank(group=sp_group) != 0:
-        num_echo_bearing_sequences = 0
-        num_real_sequences = 0
-
-    if observation_token_counts is not None:
-        seq_obs_count = _full_observation_denominator(observation_token_counts, seq_obs_count)
 
     per_sequence_env_loss = seq_nll_sum / seq_obs_count.clamp(min=1.0)
     loss = per_sequence_env_loss.sum() / global_num_echo_sequences * dp_size
@@ -621,8 +562,6 @@ def _compute_sequence_level_ratio_and_advantages(
     loss_mask: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute whole-sequence means when each SP rank holds one token window."""
-    sp_group = _get_sequence_parallel_group()
     if log_ratio.ndim == 1:
         if cu_seqlens is None:
             raise ValueError("cu_seqlens is required for 1D tensors (packed format).")
@@ -632,13 +571,6 @@ def _compute_sequence_level_ratio_and_advantages(
             torch.where(loss_mask, advantages, 0.0),
             loss_mask.int(),
         )
-        if sp_group is not None:
-            log_ratio_sum_per_seq, advantages_sum_per_seq, valid_count_per_seq = _sequence_parallel_sum(
-                log_ratio_sum_per_seq,
-                advantages_sum_per_seq,
-                valid_count_per_seq,
-                group=sp_group,
-            )
         valid_count_per_seq = valid_count_per_seq.clamp(min=1)
         log_ratio_mean_per_seq = log_ratio_sum_per_seq / valid_count_per_seq.to(log_ratio.dtype)
         adv_mean_per_seq = advantages_sum_per_seq / valid_count_per_seq.to(advantages.dtype)
@@ -647,21 +579,11 @@ def _compute_sequence_level_ratio_and_advantages(
         advantages = adv_mean_per_seq[sequence_idx]
         advantages = torch.where(loss_mask, advantages, 0.0)
     else:
-        log_ratio_sum_per_seq = torch.where(loss_mask, log_ratio, 0.0).sum(dim=1)
-        advantages_sum_per_seq = advantages.sum(dim=-1)
-        valid_count_per_seq = loss_mask.sum(dim=1)
-        if sp_group is not None:
-            log_ratio_sum_per_seq, advantages_sum_per_seq, valid_count_per_seq = _sequence_parallel_sum(
-                log_ratio_sum_per_seq,
-                advantages_sum_per_seq,
-                valid_count_per_seq,
-                group=sp_group,
-            )
-        valid_count_per_seq = valid_count_per_seq.clamp(min=1)
-        seq_log_ratio_mean = log_ratio_sum_per_seq / valid_count_per_seq
+        seq_log_ratio_mean = torch.where(loss_mask, log_ratio, 0.0).sum(dim=1) / loss_mask.sum(dim=1).clamp(min=1)
         ratio = torch.exp(seq_log_ratio_mean.unsqueeze(1).expand_as(log_ratio))
         ratio = torch.where(loss_mask, ratio, 0.0)
-        advantages = (advantages_sum_per_seq / valid_count_per_seq).unsqueeze(1).expand_as(log_ratio)
+        seq_lengths = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+        advantages = (advantages.sum(dim=-1, keepdim=True) / seq_lengths).expand_as(log_ratio)
     return ratio, advantages
 
 

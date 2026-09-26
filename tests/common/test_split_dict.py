@@ -62,33 +62,21 @@ class TestSplitDictRemainder(TestCasePlus):
     def test_batch_dim_keys_in_meta_are_promoted_and_sharded(self):
         weights = torch.arange(4, dtype=torch.float32)
         advantages = torch.arange(8, dtype=torch.float32).view(4, 2)
-        teacher = torch.arange(8, dtype=torch.float32).view(4, 2)
-        observation_counts = torch.arange(1, 5, dtype=torch.float32)
         envelope = {
             "batch": {
                 "input_ids": torch.arange(8).view(4, 2),
                 "attention_mask": torch.ones(4, 2, dtype=torch.long),
             },
-            "meta": {
-                "rollout_is_weights": weights,
-                "advantages": advantages,
-                "teacher_log_probs_shifted": teacher,
-                "echo_observation_token_counts": observation_counts,
-                "dp_size": 2,
-            },
+            "meta": {"rollout_is_weights": weights, "advantages": advantages, "dp_size": 2},
             "processing": {"loss_fn": "ap_grpo"},
         }
         shards, _ = _split_batch(envelope, num_workers=2)
         self.assertNotIn("rollout_is_weights", shards[0]["meta"])
         self.assertNotIn("advantages", shards[0]["meta"])
-        self.assertNotIn("teacher_log_probs_shifted", shards[0]["meta"])
-        self.assertNotIn("echo_observation_token_counts", shards[0]["meta"])
         self.assertEqual(shards[0]["meta"]["dp_size"], 2)
         self.assertEqual(shards[0]["batch"]["rollout_is_weights"].tolist(), [0.0, 1.0])
         self.assertEqual(shards[1]["batch"]["rollout_is_weights"].tolist(), [2.0, 3.0])
         self.assertEqual(shards[0]["batch"]["advantages"].tolist(), [[0.0, 1.0], [2.0, 3.0]])
-        self.assertEqual(shards[0]["batch"]["teacher_log_probs_shifted"].tolist(), [[0.0, 1.0], [2.0, 3.0]])
-        self.assertEqual(shards[1]["batch"]["echo_observation_token_counts"].tolist(), [3.0, 4.0])
 
     def test_none_rollout_is_weights_stays_in_meta(self):
         """SkyRL overlay sends rollout_is_weights=None; promoting it 500s the worker."""

@@ -31,7 +31,6 @@ from arctic_platform.common.registry import register_loss_fn
 
 from .base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
 from .functional import EchoBatchDenominator
-from .functional import _get_sequence_parallel_group
 from .functional import _resolve_dp_size
 from .functional import agg_loss
 from .functional import canonicalize_loss_mask
@@ -107,52 +106,6 @@ def _masked_mean_float(values: torch.Tensor, mask: torch.Tensor) -> float:
     mask = mask.bool()
     safe_values = torch.where(mask, values, torch.zeros_like(values))
     return float(safe_values.sum() / mask.sum().clamp(min=1))
-
-
-def _resolve_teacher_tau(config: dict, context: dict) -> float:
-    """Validate sampled-token OPD configuration and return its blend weight."""
-    teacher_tau = config.get("teacher_tau")
-    tau = 0.0 if teacher_tau is None else float(teacher_tau)
-    if tau == 0.0:
-        return 0.0
-    teacher_clip = config.get("teacher_clip")
-    teacher_clip_negative = config.get("teacher_clip_negative")
-    if isinstance(teacher_tau, bool) or not math.isfinite(tau) or tau < 0.0:
-        raise ValueError(f"teacher_tau must be a finite non-negative number, got {teacher_tau!r}")
-    if (
-        teacher_clip is None
-        or isinstance(teacher_clip, bool)
-        or not isinstance(teacher_clip, (int, float))
-        or not math.isfinite(teacher_clip)
-        or teacher_clip <= 0.0
-    ):
-        raise ValueError(f"teacher_tau={tau} requires a finite positive config 'teacher_clip', got {teacher_clip!r}")
-    if teacher_clip_negative is not None and (
-        isinstance(teacher_clip_negative, bool)
-        or not isinstance(teacher_clip_negative, (int, float))
-        or not math.isfinite(teacher_clip_negative)
-        or teacher_clip_negative < 0.0
-    ):
-        raise ValueError(
-            f"'teacher_clip_negative' must be a finite non-negative number when set, got {teacher_clip_negative!r}"
-        )
-    if context.get("teacher_log_probs_shifted") is None:
-        raise ValueError(
-            "teacher_tau > 0 requires context 'teacher_log_probs_shifted'; refusing to train "
-            "the plain policy objective under an on-policy-distillation config."
-        )
-    importance_sampling_level = config.get("importance_sampling_level", "token")
-    if importance_sampling_level != "token":
-        raise ValueError(
-            f"teacher_tau > 0 requires importance_sampling_level='token', got {importance_sampling_level!r}"
-        )
-    if config.get("loss_agg_mode", "token-mean") == "token-mean" and context.get("sequence_loss_weights") is not None:
-        raise ValueError(
-            "teacher_tau > 0 with loss_agg_mode='token-mean' and a 'sequence_loss_weights' "
-            "column is refused because token-mean cannot apply those row weights to the "
-            "teacher term; use loss_agg_mode='prompt-mean' or omit sequence_loss_weights."
-        )
-    return tau
 
 
 def compute_prox_logp_approximations(
@@ -272,9 +225,6 @@ def _internal_grpo_loss_fn(
     use_decoupled_loss: bool = False,
     use_cispo_loss: bool = False,
     is_weight_clip_max: float | None = None,
-    teacher_tau: float = 0.0,
-    teacher_clip: float | None = None,
-    teacher_clip_negative: float | None = None,
     # --- VeRL-compatible aggregation and auxiliary loss knobs ---
     loss_agg_mode: str = "token-mean",
     dp_size: int = 1,
@@ -315,17 +265,21 @@ def _internal_grpo_loss_fn(
     prox_logp_gt = input_data.get("prox_logp")
     entropy = entropy.detach()
 
+    # All-padded shard guard. Under Ulysses SP the batch is split into contiguous
+    # per-rank sequence shards; a short/padded batch can hand a rank a shard whose
+    # tokens are all prompt/padding (loss_mask all False). The PPO ratio + prompt/
+    # token normalization then divides by zero and poisons the autograd graph with
+    # NaN (surfacing as "rank=k loss contains non-finite values"). Mirror
+    # ArcticTraining's SFTTrainer: emit a finite zero that still carries grads
+    # (via logprobs) so DeepSpeed's cross-rank gradient all-reduce stays in lockstep
+    # and this empty shard contributes nothing. nan_to_num keeps the forward value
+    # finite even if the shard produced non-finite logits; the * 0.0 zeroes the grad.
+    #
+    # When ECHO is configured, skip the early return so sft_mask /
+    # echo_observation_mask can still contribute. Empty-policy shards still
+    # run the ECHO terms on this path.
     empty_policy_shard = not loss_mask.any()
-    has_full_echo_counts = aux_ce_weight is not None and input_data.get("echo_observation_token_counts") is not None
-    reduces_across_sequence_parallel = _get_sequence_parallel_group() is not None and (
-        loss_agg_mode == "prompt-mean" or importance_sampling_level == "sequence" or aux_ce_weight is not None
-    )
-    if (
-        empty_policy_shard
-        and aux_ce_weight is None
-        and not reduces_across_sequence_parallel
-        and not has_full_echo_counts
-    ):
+    if empty_policy_shard and aux_ce_weight is None:
         zero_loss = torch.nan_to_num(logprobs).sum() * 0.0
         metrics = {
             "approx_kl": 0.0,
@@ -333,13 +287,6 @@ def _internal_grpo_loss_fn(
             "clip_ratio": 0.0,
             "entropy": 0.0,
         }
-        if teacher_tau > 0.0:
-            metrics.update(
-                teacher_tau=teacher_tau,
-                teacher_term_token_count=0.0,
-                teacher_log_ratio_sum=0.0,
-                teacher_clipped_log_ratio_sum=0.0,
-            )
         return zero_loss, metrics
 
     # Degenerate-shard logprob sanitization. Under Ulysses SP a short/padded batch
@@ -365,27 +312,7 @@ def _internal_grpo_loss_fn(
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
-    teacher_metrics: dict[str, float] = {}
-    if teacher_tau > 0.0:
-        teacher_delta = input_data["teacher_log_probs"].detach() - logprobs.detach()
-        teacher_scored = loss_mask & input_data["teacher_policy_finite"] & torch.isfinite(teacher_delta)
-        teacher_term = torch.where(
-            teacher_scored,
-            teacher_delta.clamp(
-                -(teacher_clip if teacher_clip_negative is None else teacher_clip_negative),
-                teacher_clip,
-            ),
-            torch.zeros_like(teacher_delta),
-        )
-        advantages = advantages + teacher_tau * teacher_term
-        teacher_metrics = {
-            "teacher_tau": teacher_tau,
-            "teacher_term_token_count": float(teacher_scored.sum()),
-            "teacher_log_ratio_sum": float(torch.where(teacher_scored, teacher_delta.double(), 0.0).sum()),
-            "teacher_clipped_log_ratio_sum": float(teacher_term.double().sum()),
-        }
-
-    if empty_policy_shard and not reduces_across_sequence_parallel:
+    if empty_policy_shard:
         loss = torch.nan_to_num(logprobs).sum() * 0.0
         metrics = {
             "approx_kl": 0.0,
@@ -504,7 +431,6 @@ def _internal_grpo_loss_fn(
             "clip_ratio": _masked_mean_float(stat["clip_mask"].float(), loss_mask),
             "entropy": _masked_mean_float(entropy.float(), loss_mask),
         }
-    metrics.update(teacher_metrics)
 
     # ECHO auxiliary Environment-Prediction objective (arXiv 2605.24517):
     # total = rl_loss + aux_ce_weight * mean-of-per-sequence env CE.
@@ -539,8 +465,11 @@ def _internal_grpo_loss_fn(
                 "client must supply the step-global sequence count; a local fallback would rescale "
                 "the auxiliary gradient with microbatch/chunk boundaries."
             )
-        # Both terms compensate for DeepSpeed's DP gradient averaging so their
-        # ratio preserves the configured paper-unit coefficient.
+        # The aux term inherits the policy term's distributed-reduction
+        # convention so the echo-to-policy ratio equals the configured
+        # aux_ce_weight (paper λ) at every DP width — passing the raw
+        # dp_size would multiply the effective λ by DP width under
+        # prompt-mean + sequence_loss_weights.
         echo_dp_multiplier = dp_loss_multiplier(loss_agg_mode, sequence_loss_weights, dp_size)
         env_loss, env_stat = echo_env_prediction_loss_fn(
             logprobs=logprobs,
@@ -551,11 +480,8 @@ def _internal_grpo_loss_fn(
             batch_denominator=echo_batch_denominator,
             cu_seqlens=input_data.get("cu_seqlens"),
             dp_size=echo_dp_multiplier,
-            observation_token_counts=input_data.get("echo_observation_token_counts"),
         )
         aux_loss = aux_ce_weight * env_loss
-        if input_data.get("echo_observation_token_counts") is not None:
-            metrics["echo_full_observation_denominator"] = 1.0
         metrics.update(
             {
                 # Additive contributions and counts — named loss_term_* / *_sum /
@@ -619,9 +545,6 @@ _GRPO_CONFIG_DEFAULTS: dict[str, Any] = {
     "use_decoupled_loss": False,
     "use_cispo_loss": False,
     "is_weight_clip_max": None,
-    "teacher_tau": 0.0,
-    "teacher_clip": None,
-    "teacher_clip_negative": None,
     "loss_agg_mode": "token-mean",
     # Unset dp_size means "not supplied"; _resolve_dp_size maps it to 1.
     "dp_size": None,
@@ -667,17 +590,11 @@ def _grpo_loss(
     Expected ``context`` keys:
         Required: ``old_log_probs_shifted`` (behavioral policy log-probs), ``advantages``, ``loss_mask``
         Optional (async): ``prox_logp_shifted``, ``versions``
-        Optional (sampled-token on-policy distillation, required when
-        ``teacher_tau`` is positive): ``teacher_log_probs_shifted`` contains
-        the teacher log-probability of the sampled token.
         Optional (SAPO): ``cu_seqlens``
         Optional (ECHO, required when ``aux_ce_weight`` is set): ``sft_mask``
         (environment-prediction target tokens O') and ``echo_observation_mask``
         (full observation span O, a superset of O'), same shape and shifted
-        alignment as ``loss_mask`` and disjoint from it. Optional
-        ``echo_observation_token_counts`` contains one whole-sequence
-        observation-token count per row when a caller splits sequences without
-        an active sequence-parallel process group.
+        alignment as ``loss_mask`` and disjoint from it.
 
     Supported ``config`` keys (all optional):
         ``eps_clip`` (default 0.2), ``eps_clip_higher``, ``c_clip``,
@@ -690,10 +607,6 @@ def _grpo_loss(
         and with a non-None ``c_clip``. Paper recommends asymmetric
         ``eps_clip=0.2`` / ``eps_clip_higher=0.28``.),
         ``is_weight_clip_max`` (optional upper cap for CISPO importance weights),
-        ``teacher_tau`` (default 0.0; positive values add the clipped
-        ``teacher_log_probs_shifted - logprobs.detach()`` delta to the
-        per-token advantage), ``teacher_clip`` (required positive upper
-        magnitude), and ``teacher_clip_negative`` (optional lower magnitude),
         ``loss_agg_mode`` (default "token-mean"; also "seq-mean-token-sum",
         "seq-mean-token-sum-norm", "seq-mean-token-mean", "prompt-mean"),
         ``dp_size``, ``batch_num_tokens``, ``global_batch_size`` (distributed normalisation),
@@ -731,7 +644,6 @@ def _grpo_loss(
     global prompts is inferred via allreduce.
     """
     values = _grpo_config_values(config)
-    values["teacher_tau"] = _resolve_teacher_tau(config, context)
     values["dp_size"] = _resolve_dp_size(values["dp_size"], values["batch_num_tokens"])
 
     logprobs = model_outputs.get("logprobs")
@@ -750,8 +662,7 @@ def _grpo_loss(
     # metric ("result.metrics.entropy is non-finite"). Zero them here, before
     # entropy is derived, so downstream loss + metrics stay finite; nan_to_num
     # yields zero gradient at those positions. No-op at real training seqlens.
-    teacher_policy_finite = torch.isfinite(logprobs)
-    if not teacher_policy_finite.all():
+    if not torch.isfinite(logprobs).all():
         logprobs = torch.nan_to_num(logprobs, nan=0.0, posinf=0.0, neginf=0.0)
     cu_seqlens = context.get("cu_seqlens")
     if cu_seqlens is not None:
@@ -777,20 +688,13 @@ def _grpo_loss(
         "cu_seqlens": cu_seqlens,
         "ref_log_probs": context.get("ref_log_probs_shifted"),
         "sft_mask": context.get("sft_mask"),
-        "teacher_log_probs": context.get("teacher_log_probs_shifted"),
-        "teacher_policy_finite": teacher_policy_finite,
         "echo_observation_mask": context.get("echo_observation_mask"),
-        "echo_observation_token_counts": context.get("echo_observation_token_counts"),
         "labels": context.get("labels"),
     }
     if input_data["sft_mask"] is not None:
         input_data["sft_mask"] = input_data["sft_mask"].to(logprobs.device)
     if input_data["echo_observation_mask"] is not None:
         input_data["echo_observation_mask"] = input_data["echo_observation_mask"].to(logprobs.device)
-    if input_data["echo_observation_token_counts"] is not None:
-        input_data["echo_observation_token_counts"] = input_data["echo_observation_token_counts"].to(logprobs.device)
-    if input_data["teacher_log_probs"] is not None:
-        input_data["teacher_log_probs"] = input_data["teacher_log_probs"].to(logprobs.device)
     if input_data["prox_logp"] is not None:
         input_data["prox_logp"] = input_data["prox_logp"].to(logprobs.device)
     if input_data["versions"] is not None:
@@ -813,8 +717,6 @@ def _grpo_loss(
             "versions",
             "ref_log_probs",
             "sft_mask",
-            "teacher_log_probs",
-            "teacher_policy_finite",
             "echo_observation_mask",
             "labels",
         ):
@@ -847,16 +749,6 @@ def _grpo_loss(
     )
     return loss, metrics
 
-
-# Additive sampled-teacher statistics. ``teacher_tau`` is a constant label and
-# therefore remains under the ordinary weighted-mean metric policy.
-TEACHER_SUMMED_METRICS = frozenset(
-    {
-        "teacher_term_token_count",
-        "teacher_log_ratio_sum",
-        "teacher_clipped_log_ratio_sum",
-    }
-)
 
 # Objective-term contributions and token/sequence counts the ECHO path emits.
 # They are additive across packed microbatches, gradient accumulation, and DP
@@ -915,8 +807,6 @@ def _grpo_packed_loss_reduction(
     loss_fn_name: str,
 ) -> PackedLossReduction:
     masks = [_grpo_preflight_mask(microbatch) for microbatch in microbatches]
-    for microbatch in microbatches:
-        _resolve_teacher_tau(config, microbatch)
     mode = _grpo_config_values(config)["loss_agg_mode"]
 
     if mode == "token-mean":
@@ -1005,7 +895,6 @@ def _grpo_context(batch: dict, meta: dict) -> dict:
 @register_loss_fn(
     "ap_grpo",
     packed_loss_reduction=_grpo_packed_loss_reduction,
-    summed_metrics=TEACHER_SUMMED_METRICS,
 )
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
 def grpo_loss(
@@ -1037,7 +926,7 @@ def grpo_loss(
 @register_loss_fn(
     "ap_grpo_echo_v1",
     packed_loss_reduction=_grpo_packed_loss_reduction,
-    summed_metrics=ECHO_SUMMED_METRICS | TEACHER_SUMMED_METRICS,
+    summed_metrics=ECHO_SUMMED_METRICS,
 )
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
 def grpo_echo_v1_loss(
