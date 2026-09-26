@@ -519,6 +519,13 @@ def _request_token_validity(request: dict, input_ids: torch.Tensor) -> torch.Ten
     attention_mask = _request_tensor(request, "attention_mask")
     if attention_mask is not None and tuple(attention_mask.shape) == tuple(input_ids.shape):
         return attention_mask.bool()
+
+    cu_seqlens = _request_tensor(request, "cu_seqlens")
+    position_ids = _request_tensor(request, "position_ids")
+    if cu_seqlens is None and position_ids is not None and tuple(position_ids.shape) == tuple(input_ids.shape):
+        offsets = torch.arange(position_ids.shape[-1], device=position_ids.device)
+        expected = position_ids[..., :1] + offsets
+        return position_ids.eq(expected).to(dtype=torch.long).cumprod(dim=-1).bool()
     return torch.ones_like(input_ids, dtype=torch.bool)
 
 

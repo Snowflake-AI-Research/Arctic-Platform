@@ -541,6 +541,25 @@ def test_grouped_batching_synthesizes_targets_for_each_packed_sequence(boundary_
     assert request["labels"].tolist() == [[11, 12, -100, 21, -100]]
 
 
+def test_grouped_batching_does_not_revive_position_only_padding_after_reset():
+    request = {
+        "input_ids": torch.tensor([[10, 11, 12, 0, 0]]),
+        "position_ids": torch.tensor([[0, 1, 2, 0, 1]]),
+        "processing": {
+            "loss_fn": "grouped_distillation",
+            "config": {},
+        },
+        "context": {
+            "kd_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0, 0.0]]),
+        },
+    }
+
+    resolve_loss("grouped_distillation").batching_callback(request)
+
+    assert request["labels"].tolist() == [[11, 12, -100, -100, -100]]
+    assert request["processing"]["config"]["kd_batch_num_tokens"] == 2.0
+
+
 @pytest.mark.parametrize(
     ("loss_fn", "config"),
     [
