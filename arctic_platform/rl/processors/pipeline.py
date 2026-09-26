@@ -365,9 +365,10 @@ def run_pipeline(
     -------
     dict
         ``{"avg_loss": float, "metrics": dict}`` when a loss function ran.
-        ``{"avg_loss": ..., "metrics": ..., "batch": dict}`` also includes
-        post-processor outputs (e.g. logprobs) when both loss and post-
-        processors ran.
+        A loss path also includes ``"batch"`` when the class-controlled output
+        callback leaves model outputs to return. Those outputs can include raw
+        logits even when no post-processor ran; class losses must remove any
+        objective-only or unwanted model outputs in ``output_callback``.
         ``{"batch": dict, "metrics": {}}`` when no loss function (forward-
         only).  ``batch`` contains only what post-processors added — never
         raw logits.

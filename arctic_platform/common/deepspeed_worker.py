@@ -387,7 +387,9 @@ class DeepSpeedWorker:
         see_memory_usage("_forward_maybe_backward start", force=True)
 
         from arctic_platform import sft_profile
+        from arctic_platform.rl.processors.base_loss import _pop_loss_object
 
+        loss_object = _pop_loss_object(batch)
         args, batch_data, meta_data, processing = unpack_batch(batch)
         with sft_profile.timed("h2d"):
             if isinstance(batch_data, list):
@@ -431,7 +433,8 @@ class DeepSpeedWorker:
         from arctic_platform.rl.processors import resolve_loss
         from arctic_platform.sft.processor import SFT_LOSS_FNS
 
-        loss_object = resolve_loss(loss_fn) if loss_fn is not None else None
+        if loss_object is None and loss_fn is not None:
+            loss_object = resolve_loss(loss_fn)
         legacy_sft_loss = LOSS_FNS.get(loss_fn) if loss_fn in SFT_LOSS_FNS else None
         use_sft_pipeline = (
             legacy_sft_loss is not None

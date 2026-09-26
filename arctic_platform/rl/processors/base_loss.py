@@ -34,6 +34,7 @@ from arctic_platform.registry import get_registered_class
 
 REQUIRES_ALIGNED_TOKEN_LOGPROBS = "requires_aligned_token_logprobs"
 REQUIRES_TOKEN_LOGPROBS = "requires_token_logprobs"
+_LOSS_OBJECT_KEY = "_arctic_platform_loss_object"
 
 
 class BaseLoss(ABC, metaclass=RegistryMeta):
@@ -88,7 +89,11 @@ class BaseLoss(ABC, metaclass=RegistryMeta):
         """Combine or amend metrics after worker results are available."""
 
     def output_callback(self, model_outputs: dict) -> None:
-        """Remove objective-only model outputs before response assembly."""
+        """Remove objective-only model outputs before response assembly.
+
+        The default is a no-op. Class losses that do not want raw logits or
+        other model outputs returned must remove them here.
+        """
 
     @abstractmethod
     def loss(
@@ -162,3 +167,16 @@ def prepare_request_loss(request: dict) -> BaseLoss | None:
     loss_object = resolve_loss(loss_fn_name)
     loss_object.batching_callback(request)
     return loss_object
+
+
+def _attach_loss_object_to_shards(shards: Sequence[dict], loss_object: BaseLoss | None) -> None:
+    """Carry batching-established objective state over an internal worker RPC."""
+    if loss_object is None:
+        return
+    for shard in shards:
+        shard[_LOSS_OBJECT_KEY] = loss_object
+
+
+def _pop_loss_object(request: dict) -> BaseLoss | None:
+    """Consume the objective carried by a coordinator after request batching."""
+    return request.pop(_LOSS_OBJECT_KEY, None)

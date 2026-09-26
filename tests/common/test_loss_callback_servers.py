@@ -18,10 +18,12 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 
 import torch
 
 from arctic_platform import wire
+from arctic_platform.rl.processors import BaseLoss
 
 
 def _request() -> dict:
@@ -53,6 +55,42 @@ class _RecordingLoss:
         self.events.append("metrics")
         self.loss.metrics_callback(worker_metrics, metrics)
         metrics["callback_probe_sum"] = sum(worker["probe"] for worker in worker_metrics)
+
+
+class _BatchingStateLoss(BaseLoss):
+    name = "_w10_batching_state"
+    events: list[str] = []
+
+    def __init__(self):
+        self.ready = False
+
+    def batching_callback(self, request):
+        self.ready = True
+        self.events.append("batching")
+
+    def validation_callback(self, context, config):
+        assert self.ready
+        self.events.append("validation")
+
+    def model_forward_callback(self, model_kwargs, context, config, output_keys):
+        assert self.ready
+        self.events.append("model_forward")
+        output_keys.append("objective_score")
+
+    def loss(self, model_outputs, batch, meta, config, device):
+        assert self.ready
+        self.events.append("loss")
+        return -model_outputs["objective_score"].mean(), {"state_ready": 1.0}
+
+    def output_callback(self, model_outputs):
+        assert self.ready
+        self.events.append("output")
+        model_outputs.pop("objective_score")
+
+    def metrics_callback(self, worker_metrics, metrics):
+        assert self.ready
+        self.events.append("metrics")
+        metrics["state_ready"] = sum(result["state_ready"] for result in worker_metrics)
 
 
 def _patch_loss(monkeypatch, events):
@@ -238,6 +276,11 @@ class _GroupedPolicyEngine:
         loss.backward()
 
 
+class _StatefulLossEngine(_GroupedPolicyEngine):
+    def __call__(self, input_ids, **_kwargs):
+        return {"objective_score": self.parameter.expand_as(input_ids)}
+
+
 def _cpu_worker(engine):
     from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
 
@@ -296,6 +339,89 @@ def _native_grpo_kd_request():
             },
         },
     }
+
+
+def test_ray_preserves_batching_state_through_serialized_worker_execution(monkeypatch):
+    import arctic_platform.common.ray_server as ray_server
+
+    _BatchingStateLoss.events = []
+    worker = _cpu_worker(_StatefulLossEngine())
+
+    class Remote:
+        def remote(self, shard):
+            worker_shard = pickle.loads(pickle.dumps(shard))
+            return worker.forward_backward(worker_shard)
+
+    server = object.__new__(ray_server.ArcticRLRayServer)
+    server.jobs = {1: {"job_type": "training", "sp_size": 1}}
+    server.training_workers = [type("Worker", (), {"forward_backward": Remote()})()]
+    monkeypatch.setattr(ray_server.ray, "get", lambda refs: refs)
+    request = {
+        "batch": {
+            "input_ids": torch.ones(1, 2, dtype=torch.long),
+            "attention_mask": torch.ones(1, 2, dtype=torch.long),
+        },
+        "meta": {"pad_token_id": 0},
+        "processing": {"loss_fn": _BatchingStateLoss.name, "config": {}},
+    }
+
+    response = asyncio.run(server.forward_backward(1, request))
+
+    assert response["avg_loss"] == 0.0
+    assert response["metrics"]["state_ready"] == 1.0
+    assert _BatchingStateLoss.events == [
+        "batching",
+        "validation",
+        "model_forward",
+        "loss",
+        "output",
+        "metrics",
+    ]
+
+
+def test_http_preserves_batching_state_through_serialized_worker_execution():
+    import arctic_platform.common.http_server as http_server
+
+    _BatchingStateLoss.events = []
+    worker = _cpu_worker(_StatefulLossEngine())
+
+    class Remote:
+        async def _call(self, shard):
+            worker_shard = pickle.loads(pickle.dumps(shard))
+            return worker.forward_backward(worker_shard)
+
+        def remote(self, shard):
+            return self._call(shard)
+
+    http_server.app.state.jobs = {1: {"job_type": "training", "sp_size": 1}}
+    http_server.app.state.training_workers = [type("Worker", (), {"forward_backward": Remote()})()]
+    request = {
+        "batch": {
+            "input_ids": torch.ones(1, 2, dtype=torch.long),
+            "attention_mask": torch.ones(1, 2, dtype=torch.long),
+        },
+        "meta": {"pad_token_id": 0},
+        "processing": {"loss_fn": _BatchingStateLoss.name, "config": {}},
+    }
+
+    response = asyncio.run(
+        http_server.forward_backward(
+            job_id=1,
+            body=wire.dumps(request),
+        )
+    )
+    decoded = wire.loads(response.body)
+
+    assert decoded["avg_loss"] == 0.0
+    assert decoded["metrics"]["state_ready"] == 1.0
+    assert _BatchingStateLoss.events == [
+        "batching",
+        "validation",
+        "model_forward",
+        "loss",
+        "output",
+        "metrics",
+    ]
 
 
 def test_ray_grpo_kd_unpads_teacher_groups_for_multiple_rows_per_worker(monkeypatch):

@@ -642,6 +642,7 @@ class ArcticRLRayServer:
 
     async def forward_backward(self, job_id: int, batch: dict) -> dict[str, Any]:
         from arctic_platform.rl.processors import prepare_request_loss
+        from arctic_platform.rl.processors.base_loss import _attach_loss_object_to_shards
 
         tname_e2e = timers.start("xyz fwd_bwd e2e")
 
@@ -658,6 +659,7 @@ class ArcticRLRayServer:
         loss_object = prepare_request_loss(batch)
         tname = timers.start("xyz fwd_bwd: ray_split_batch")
         shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=self.jobs[job_id].get("sp_size", 1))
+        _attach_loss_object_to_shards(shards, loss_object)
         # The verl driver's ``update_actor`` only consumes ``metrics`` from the
         # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
         # ``batch`` (logprobs/entropy) is never read. Keep the worker output as
@@ -718,6 +720,7 @@ class ArcticRLRayServer:
 
     async def forward(self, job_id: int, batch: dict) -> dict[str, Any]:
         from arctic_platform.rl.processors import prepare_request_loss
+        from arctic_platform.rl.processors.base_loss import _attach_loss_object_to_shards
 
         info = self.jobs[job_id]
         self._verify_job(job_id, ["training", "log_prob"])
@@ -738,6 +741,7 @@ class ArcticRLRayServer:
 
         loss_object = prepare_request_loss(batch)
         shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=info.get("sp_size", 1))
+        _attach_loss_object_to_shards(shards, loss_object)
         shards[0]["meta"]["worker_return_tensors"] = True
         refs = [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
         results = ray.get(refs)
