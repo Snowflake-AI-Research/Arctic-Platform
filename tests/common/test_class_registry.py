@@ -144,8 +144,11 @@ def test_legacy_adapter_canonicalizes_structurally_compatible_foreign_reduction(
         loss_is_additive=False,
     )
 
-    def function_loss(model_outputs, batch, meta, config, device):
-        return torch.tensor(0.0), {}
+    calls = []
+
+    def function_loss(model_outputs, context, config, device):
+        calls.append((model_outputs, context, config, device))
+        return torch.tensor(2.0), {"four_arg": True}
 
     def reduction_callback(microbatches, config, loss_name):
         assert len(microbatches) == 2
@@ -155,9 +158,19 @@ def test_legacy_adapter_canonicalizes_structurally_compatible_foreign_reduction(
     setattr(function_loss, PACKED_LOSS_REDUCTION_ATTR, reduction_callback)
     monkeypatch.setitem(LOSS_FNS, "_foreign_legacy_reduction", function_loss)
 
+    loss_object = resolve_loss("_foreign_legacy_reduction")
     reduction = resolve_packed_loss_reduction(
         {"loss_fn": "_foreign_legacy_reduction", "config": {}},
         [{}, {}],
+        loss_object=loss_object,
+    )
+    outputs = {"logprobs": torch.zeros(1)}
+    loss, metrics = loss_object.loss(
+        outputs,
+        {"batch": 1, "shared": "batch"},
+        {"meta": 2, "shared": "meta"},
+        {"value": 3},
+        "cpu",
     )
 
     assert type(reduction) is PackedLossReduction
@@ -166,6 +179,16 @@ def test_legacy_adapter_canonicalizes_structurally_compatible_foreign_reduction(
         reporting_weights=(1.0, 3.0),
         loss_is_additive=False,
     )
+    assert loss.item() == 2.0
+    assert metrics == {"four_arg": True}
+    assert calls == [
+        (
+            outputs,
+            {"meta": 2, "shared": "batch", "batch": 1},
+            {"value": 3},
+            "cpu",
+        )
+    ]
 
 
 def test_native_loss_rejects_structurally_compatible_foreign_reduction():

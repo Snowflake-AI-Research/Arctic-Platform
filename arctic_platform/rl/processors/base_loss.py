@@ -37,6 +37,32 @@ REQUIRES_TOKEN_LOGPROBS = "requires_token_logprobs"
 _LOSS_OBJECT_KEY = "_arctic_platform_loss_object"
 
 
+def _uses_merged_context_abi(loss_fn: Callable) -> bool:
+    """Classify a legacy loss without invoking it or masking its own errors."""
+    try:
+        signature = inspect.signature(loss_fn)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"Cannot inspect legacy loss callable {loss_fn!r}") from exc
+
+    placeholders = (None,) * 5
+    try:
+        signature.bind(*placeholders)
+    except TypeError:
+        pass
+    else:
+        return False
+
+    try:
+        signature.bind(*placeholders[:4])
+    except TypeError as exc:
+        raise TypeError(
+            f"Legacy loss callable {loss_fn!r} must accept either "
+            "(model_outputs, batch, meta, config, device) or "
+            "(model_outputs, context, config, device)"
+        ) from exc
+    return True
+
+
 class BaseLoss(ABC, metaclass=RegistryMeta):
     """A processing loss plus callbacks for the boundaries it owns.
 
@@ -117,6 +143,7 @@ class _LegacyLossAdapter(BaseLoss):
     def __init__(self, name: str, loss_fn: Callable) -> None:
         self.name = name
         self._loss_fn = loss_fn
+        self._uses_merged_context = _uses_merged_context_abi(loss_fn)
         self.capabilities = getattr(loss_fn, LOSS_CAPABILITIES_ATTR, frozenset())
 
     def is_legacy_adapter_for(self, loss_fn: Callable) -> bool:
@@ -165,6 +192,8 @@ class _LegacyLossAdapter(BaseLoss):
         config: dict,
         device: str,
     ):
+        if self._uses_merged_context:
+            return self._loss_fn(model_outputs, {**meta, **batch}, config, device)
         return self._loss_fn(model_outputs, batch, meta, config, device)
 
 
