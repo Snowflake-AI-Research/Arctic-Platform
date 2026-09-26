@@ -505,6 +505,45 @@ def test_grpo_rejects_unknown_kd_config_even_when_kd_is_off(kd_coef):
         )
 
 
+@pytest.mark.parametrize("loss_fn", ["grpo", "grouped_distillation"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("kd_coef", True),
+        ("kd_coef", "0.5"),
+        ("kd_coef", None),
+        ("kd_coef", 0.5 + 0j),
+        ("kd_coef", math.inf),
+        ("kd_beta", True),
+        ("kd_beta", "0.5"),
+        ("kd_beta", None),
+        ("kd_beta", 0.5 + 0j),
+        ("kd_beta", math.nan),
+    ],
+)
+def test_kd_numeric_config_requires_finite_real_non_boolean_values(loss_fn, field, value):
+    config = {
+        **(_POLICY if loss_fn == "grpo" else {}),
+        "kd_coef": 0.5,
+        "kd_beta": 0.5,
+        "kd_batch_num_tokens": 1.0,
+        "dp_size": 1,
+        field: value,
+    }
+
+    with pytest.raises(ValueError, match=field):
+        resolve_loss(loss_fn).validation_callback({}, config)
+
+
+@pytest.mark.parametrize("value", [True, "0.5", None, 0.5 + 0j, math.nan])
+def test_grpo_kd_off_still_rejects_malformed_explicit_beta(value):
+    with pytest.raises(ValueError, match="kd_beta"):
+        resolve_loss("grpo").validation_callback(
+            {},
+            {**_POLICY, "kd_coef": 0.0, "kd_beta": value},
+        )
+
+
 def test_teacher_tensor_leading_shapes_must_match_exactly():
     context = {
         "input_ids": torch.zeros(2, 3, dtype=torch.long),
@@ -571,6 +610,78 @@ def test_teacher_log_probabilities_require_real_floating_point_dtype(name, dtype
         resolve_loss("grouped_distillation").validation_callback(
             context,
             {"kd_batch_num_tokens": 2.0, "dp_size": 1},
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.uint16, torch.uint32, torch.uint64])
+@pytest.mark.parametrize("grouped_head", [False, True])
+def test_unsigned_teacher_ids_are_signed_before_masking_and_loss(dtype, grouped_head):
+    inactive_id = torch.iinfo(dtype).max
+    context = {
+        "input_ids": torch.tensor([[0, 1]], dtype=torch.long),
+        "labels": torch.tensor([[1, 2]], dtype=torch.long),
+        "kd_mask": torch.tensor([[1.0, 0.0]]),
+        "teacher_token_ids": torch.tensor(
+            [[[1, 2], [inactive_id, inactive_id]]],
+            dtype=dtype,
+        ),
+        "teacher_log_probs": torch.tensor(
+            [[[math.log(0.25), math.log(0.25)], [math.nan, math.nan]]],
+        ),
+        "teacher_tail_log_prob": torch.tensor([[math.log(0.5), math.nan]]),
+    }
+    config = {
+        "kd_coef": 0.5,
+        "kd_batch_num_tokens": 1.0,
+        "dp_size": 1,
+    }
+    loss_object = resolve_loss("grouped_distillation")
+    loss_object.validation_callback(context, config)
+
+    model_kwargs = {"dss_compute_logprobs": True}
+    output_keys = ["logprobs"]
+    loss_object.model_forward_callback(model_kwargs, context, config, output_keys)
+    group_token_ids = model_kwargs["group_token_ids"]
+    assert group_token_ids.dtype == torch.int64
+    assert group_token_ids.tolist() == [[[1, 2], [-1, -1]]]
+
+    logits = torch.randn(1, 2, 5, requires_grad=True)
+    log_probs = logits.log_softmax(-1)
+    model_outputs = {
+        "logprobs": log_probs.gather(-1, context["labels"][..., None]).squeeze(-1),
+    }
+    if grouped_head:
+        in_group = (torch.arange(logits.shape[-1]) == group_token_ids[..., None]).any(-2)
+        head = log_probs.gather(-1, group_token_ids.clamp(min=0)).masked_fill(group_token_ids < 0, -math.inf)
+        tail = log_probs.masked_fill(in_group, -math.inf).logsumexp(-1, keepdim=True)
+        model_outputs["group_log_probs"] = torch.cat([head, tail], -1)
+    else:
+        model_outputs["logits"] = logits
+
+    loss, _ = loss_object.loss(model_outputs, {}, context, config, "cpu")
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_active_uint64_teacher_id_must_fit_signed_int64():
+    context = {
+        "input_ids": torch.zeros(1, 1, dtype=torch.long),
+        "kd_mask": torch.ones(1, 1),
+        "teacher_token_ids": torch.full(
+            (1, 1, 1),
+            torch.iinfo(torch.uint64).max,
+            dtype=torch.uint64,
+        ),
+        "teacher_log_probs": torch.full((1, 1, 1), math.log(0.5)),
+        "teacher_tail_log_prob": torch.full((1, 1), math.log(0.5)),
+    }
+
+    with pytest.raises(ValueError, match="must fit in signed int64"):
+        resolve_loss("grouped_distillation").validation_callback(
+            context,
+            {"kd_batch_num_tokens": 1.0, "dp_size": 1},
         )
 
 

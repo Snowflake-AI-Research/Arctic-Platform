@@ -48,12 +48,36 @@ _GROUPED_DISTILLATION_CONFIG_KEYS = frozenset(
     {"kd_coef", "kd_divergence", "kd_beta", "kd_batch_num_tokens", "dp_size"}
 )
 _GRPO_DISTILLATION_CONFIG_KEYS = frozenset({"kd_coef", "kd_divergence", "kd_beta", "kd_batch_num_tokens"})
+_TEACHER_TOKEN_ID_DTYPES = frozenset(
+    {
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+        torch.uint16,
+        torch.uint32,
+        torch.uint64,
+    }
+)
 _TEACHER_LOG_PROB_DTYPES = frozenset({torch.float16, torch.bfloat16, torch.float32, torch.float64})
 
 
 class Divergence(str, Enum):
     KL = "kl"
     JSD = "jsd"
+
+
+def _finite_real(value, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a finite real number, got {value!r}")
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite real number, got {value!r}") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be a finite real number, got {value!r}")
+    return result
 
 
 def _resolve_divergence(config: dict, prefix: str) -> tuple[Divergence, float]:
@@ -63,7 +87,7 @@ def _resolve_divergence(config: dict, prefix: str) -> tuple[Divergence, float]:
         raise ValueError(
             f"{prefix}divergence must be 'kl' or 'jsd', got {config.get(f'{prefix}divergence')!r}"
         ) from exc
-    beta = float(config.get(f"{prefix}beta", 1.0))
+    beta = _finite_real(config.get(f"{prefix}beta", 1.0), f"{prefix}beta")
     valid = 0 < beta < 1 if divergence is Divergence.JSD else 0 <= beta <= 1
     if not valid:
         interval = "(0, 1)" if divergence is Divergence.JSD else "[0, 1]"
@@ -168,6 +192,29 @@ def _require_tensor(context: dict, name: str) -> torch.Tensor:
     return value
 
 
+def _signed_teacher_token_ids(context: dict, weights: torch.Tensor) -> torch.Tensor:
+    token_ids = _require_tensor(context, "teacher_token_ids")
+    if token_ids.dtype not in _TEACHER_TOKEN_ID_DTYPES:
+        raise ValueError(f"teacher_token_ids must contain integer ids (int32 recommended), got {token_ids.dtype}")
+    if token_ids.ndim == 0:
+        raise ValueError("teacher_token_ids must have a final candidate dimension")
+    if token_ids.shape[-1] < 1:
+        raise ValueError("teacher_token_ids candidate dimension M must be at least 1")
+    if tuple(token_ids.shape[:-1]) != tuple(weights.shape):
+        raise ValueError(
+            f"teacher_token_ids leading shape {tuple(token_ids.shape[:-1])} must match "
+            f"grouped-distillation weights shape {tuple(weights.shape)}"
+        )
+
+    signed = token_ids.to(dtype=torch.int64)
+    if token_ids.dtype == torch.uint64:
+        active = weights.reshape(-1) > 0
+        active_ids = signed.reshape(active.numel(), signed.shape[-1])[active.to(signed.device)]
+        if bool((active_ids < 0).any().item()):
+            raise ValueError("active uint64 teacher_token_ids must fit in signed int64")
+    return signed
+
+
 def _validate_action_masked_labels(context: dict, weights: torch.Tensor) -> None:
     action_masks = context.get("action_masks")
     labels = context.get("labels")
@@ -195,15 +242,9 @@ def _validate_action_masked_labels(context: dict, weights: torch.Tensor) -> None
 
 
 def _validate_teacher_context(context: dict, weights: torch.Tensor) -> None:
-    token_ids = _require_tensor(context, "teacher_token_ids")
+    token_ids = _signed_teacher_token_ids(context, weights)
     teacher_log_probs = _require_tensor(context, "teacher_log_probs")
     teacher_tail_log_prob = _require_tensor(context, "teacher_tail_log_prob")
-    if token_ids.is_floating_point() or token_ids.is_complex() or token_ids.dtype == torch.bool:
-        raise ValueError(f"teacher_token_ids must contain integer ids (int32 recommended), got {token_ids.dtype}")
-    if token_ids.ndim == 0:
-        raise ValueError("teacher_token_ids must have a final candidate dimension")
-    if token_ids.shape[-1] < 1:
-        raise ValueError("teacher_token_ids candidate dimension M must be at least 1")
     for name, values in (
         ("teacher_log_probs", teacher_log_probs),
         ("teacher_tail_log_prob", teacher_tail_log_prob),
@@ -214,11 +255,6 @@ def _validate_teacher_context(context: dict, weights: torch.Tensor) -> None:
                 f"(float16, bfloat16, float32, or float64), got {values.dtype}"
             )
 
-    if tuple(token_ids.shape[:-1]) != tuple(weights.shape):
-        raise ValueError(
-            f"teacher_token_ids leading shape {tuple(token_ids.shape[:-1])} must match "
-            f"grouped-distillation weights shape {tuple(weights.shape)}"
-        )
     if tuple(teacher_log_probs.shape) != tuple(token_ids.shape):
         raise ValueError(
             f"teacher_log_probs shape {tuple(teacher_log_probs.shape)} must match teacher_token_ids "
@@ -276,7 +312,7 @@ def grouped_divergence(
             "group-capable head or retain full logits for the objective"
         )
 
-    token_ids = context["teacher_token_ids"]
+    token_ids = _signed_teacher_token_ids(context, weights)
     flat_weights = weights.reshape(-1).to(student.device, torch.float64)
     positions, width = flat_weights.numel(), token_ids.shape[-1]
     index = flat_weights.ne(0).nonzero().squeeze(-1)
@@ -357,19 +393,18 @@ def _kd_coefficient(config: dict) -> float:
     unknown = {key for key in config if key.startswith("kd_")} - _GRPO_DISTILLATION_CONFIG_KEYS
     if unknown:
         raise ValueError(f"Unknown KD config keys for loss_fn 'grpo': {sorted(unknown)}")
-    raw = config.get("kd_coef")
-    if raw is None:
+    if "kd_coef" not in config:
         return 0.0
-    if isinstance(raw, bool):
-        raise ValueError(f"kd_coef must be a finite non-negative number, got {raw!r}")
-    coefficient = float(raw)
-    if not math.isfinite(coefficient) or coefficient < 0:
+    raw = config["kd_coef"]
+    coefficient = _finite_real(raw, "kd_coef")
+    if coefficient < 0:
         raise ValueError(f"kd_coef must be a finite non-negative number, got {raw!r}")
     return coefficient
 
 
 def resolve_kd_term(config: dict) -> KDTerm | None:
     coefficient = _kd_coefficient(config)
+    divergence, beta = _resolve_divergence(config, "kd_")
     if coefficient == 0:
         return None
     weight_sum = config.get("kd_batch_num_tokens")
@@ -386,7 +421,8 @@ def resolve_kd_term(config: dict) -> KDTerm | None:
     weight_sum = float(weight_sum)
     return KDTerm(
         coefficient,
-        *_resolve_divergence(config, "kd_"),
+        divergence,
+        beta,
         weight_sum,
         _resolve_dp_size(config.get("dp_size"), weight_sum),
     )
@@ -422,10 +458,8 @@ def _grouped_distillation_config(config: dict) -> tuple[float, Divergence, float
     if unknown:
         raise ValueError(f"Unknown config keys for loss_fn 'grouped_distillation': {sorted(unknown)}")
     raw_coefficient = config.get("kd_coef", 0.25)
-    if isinstance(raw_coefficient, bool):
-        raise ValueError(f"kd_coef must be a finite number in [0, 1], got {raw_coefficient!r}")
-    coefficient = float(raw_coefficient)
-    if not math.isfinite(coefficient) or not 0 <= coefficient <= 1:
+    coefficient = _finite_real(raw_coefficient, "kd_coef")
+    if not 0 <= coefficient <= 1:
         raise ValueError(f"kd_coef must be a finite number in [0, 1], got {raw_coefficient!r}")
     divergence, beta = _resolve_divergence(config, "kd_")
     normalization = {}
@@ -544,7 +578,7 @@ class _GroupedLossCallbacks:
             return
         normalized = _validation_context(context)
         weights = self._weights(normalized)
-        token_ids = normalized["teacher_token_ids"]
+        token_ids = _signed_teacher_token_ids(normalized, weights)
         group_token_ids = torch.where(
             weights.to(token_ids.device)[..., None] > 0,
             token_ids,
