@@ -43,6 +43,7 @@ from arctic_platform.rl.processors.grpo import _ECHO_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import _ECHO_REQUIRED_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import _GRPO_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import ECHO_SUMMED_METRICS
+from arctic_platform.rl.processors.grpo import TEACHER_SUMMED_METRICS
 from arctic_platform.rl.processors.grpo import _grpo_context
 from arctic_platform.rl.processors.grpo import _grpo_loss
 from arctic_platform.rl.processors.grpo import _grpo_packed_loss_reduction
@@ -62,6 +63,7 @@ def _cortex_distributed_config(config: dict, batch: dict, meta: dict) -> tuple[d
 @register_loss_fn(
     "grpo",
     packed_loss_reduction=_grpo_packed_loss_reduction,
+    summed_metrics=TEACHER_SUMMED_METRICS,
 )
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
 def cortex_grpo_loss(
@@ -84,7 +86,7 @@ def cortex_grpo_loss(
 @register_loss_fn(
     "grpo_echo_v1",
     packed_loss_reduction=_grpo_packed_loss_reduction,
-    summed_metrics=ECHO_SUMMED_METRICS,
+    summed_metrics=ECHO_SUMMED_METRICS | TEACHER_SUMMED_METRICS,
 )
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
 def cortex_grpo_echo_v1_loss(

@@ -531,6 +531,19 @@ def test_temperature_refusal_reports_received_values(temperature, match):
         resolve_loss("grpo").validation_callback(context, _grpo_config(frame) | _kd_config(frame))
 
 
+def test_standalone_kd_off_still_rejects_non_unit_temperature():
+    context = {
+        "input_ids": torch.zeros(1, 2, dtype=torch.long),
+        "kd_mask": torch.ones(1, 2),
+        "temperature": 0.5,
+    }
+    with pytest.raises(ValueError, match=r"received \[0.5\]"):
+        resolve_loss("grouped_distillation").validation_callback(
+            context,
+            {"kd_coef": 0.0, "kd_batch_num_tokens": 2.0, "dp_size": 1},
+        )
+
+
 def test_grpo_rejects_unknown_kd_config_when_enabled():
     with pytest.raises(ValueError, match="kd_divergance"):
         resolve_loss("grpo").validation_callback(
@@ -587,6 +600,24 @@ def test_grpo_kd_enabled_rejects_invalid_divergence_and_beta_ranges(config, matc
                 "kd_coef": 0.5,
                 "kd_batch_num_tokens": 1.0,
                 **config,
+            },
+        )
+
+
+def test_grpo_rejects_simultaneous_sampled_and_grouped_teacher_modes():
+    frame = _frame()
+    context = {key: frame[key] for key in _CONTEXT} | {
+        "input_ids": frame["input_ids"],
+        "teacher_log_probs_shifted": torch.zeros_like(frame["old_log_probs_shifted"]),
+    }
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        resolve_loss("grpo").validation_callback(
+            context,
+            _grpo_config(frame)
+            | _kd_config(frame)
+            | {
+                "teacher_tau": 0.5,
+                "teacher_clip": 1.0,
             },
         )
 

@@ -92,6 +92,7 @@ BATCH_DIM_CONTEXT_KEYS = frozenset(
         "labels",
         "sft_mask",
         "echo_observation_mask",
+        "echo_observation_token_counts",
         "versions",
         "prompt_group_ids",
         "prompt_token_counts",
@@ -99,6 +100,7 @@ BATCH_DIM_CONTEXT_KEYS = frozenset(
         "rollout_is_weights",
         "teacher_token_ids",
         "teacher_log_probs",
+        "teacher_log_probs_shifted",
         "teacher_tail_log_prob",
         "kd_mask",
     }

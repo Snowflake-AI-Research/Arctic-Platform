@@ -49,6 +49,7 @@ from arctic_platform.rl.processors.grpo import _ECHO_REQUIRED_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import _GRPO_CONFIG_DEFAULTS
 from arctic_platform.rl.processors.grpo import _GRPO_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import ECHO_SUMMED_METRICS
+from arctic_platform.rl.processors.grpo import TEACHER_SUMMED_METRICS
 from arctic_platform.rl.processors.grpo import _grpo_config_values
 from arctic_platform.rl.processors.grpo import _internal_grpo_loss_fn
 from arctic_platform.rl.processors.grpo import grpo_echo_v1_loss
@@ -273,15 +274,16 @@ class TestA4Metrics(TestCasePlus):
         # The declaration is the contract; the naming convention must still
         # classify every declared name the same way, so removing a declaration
         # cannot silently turn a summed metric into a mean.
+        expected = ECHO_SUMMED_METRICS | TEACHER_SUMMED_METRICS
         self.assertEqual(
             getattr(LOSS_FNS["ap_grpo_echo_v1"], SUMMED_METRICS_ATTR),
-            ECHO_SUMMED_METRICS,
+            expected,
         )
         self.assertEqual(
             getattr(LOSS_FNS["grpo_echo_v1"], SUMMED_METRICS_ATTR),
-            ECHO_SUMMED_METRICS,
+            expected,
         )
-        for key in ECHO_SUMMED_METRICS:
+        for key in expected:
             self.assertTrue(is_declared_summed_metric(key), msg=key)
             self.assertTrue(metric_is_summed(key), msg=key)
             self.assertTrue(
