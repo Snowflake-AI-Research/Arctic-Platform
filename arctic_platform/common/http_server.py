@@ -381,6 +381,8 @@ async def forward_backward(
     job_id: int,
     body: bytes = Body(..., media_type="application/octet-stream"),
 ):
+    from arctic_platform.rl.processors import prepare_request_loss
+
     tname_e2e = timers.start("xyz fwd_bwd e2e")
 
     tname = timers.start("xyz fwd_bwd: _verify_job")
@@ -393,8 +395,14 @@ async def forward_backward(
     # body = zlib.decompress(body)
     # timers.stop_and_print_elapsed(tname)
 
+    request = wire.loads(body)
+    loss_object = prepare_request_loss(request)
     tname = timers.start("xyz fwd_bwd: split_batch")
-    shards, reorder_indices = http_split_batch(body, len(workers), sp_size=app.state.jobs[job_id].get("sp_size", 1))
+    shards, reorder_indices = http_split_batch(
+        request,
+        len(workers),
+        sp_size=app.state.jobs[job_id].get("sp_size", 1),
+    )
     # The verl driver's ``update_actor`` only consumes ``metrics`` from the
     # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
     # ``batch`` (logprobs/entropy) is never read. Keep the worker output as
@@ -413,6 +421,8 @@ async def forward_backward(
 
     tname = timers.start("xyz fwd_bwd: epilogue")
     metrics, avg_loss = finalize_fwd_bwd_metrics(results)
+    if loss_object is not None:
+        loss_object.metrics_callback([result.get("metrics") or {} for result in results], metrics)
     # ``batch`` is omitted by default (the verl driver does not consume it);
     # opt in via ``return_fwd_batch`` for the TRL server-side-loss path.
     merged = dict(

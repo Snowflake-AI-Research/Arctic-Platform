@@ -132,3 +132,16 @@ def resolve_loss(name: str) -> BaseLoss:
     except LookupError:
         return _LegacyLossAdapter(name, resolve_fn(LOSS_FNS, name))
     return loss_cls()
+
+
+def prepare_request_loss(request: dict) -> BaseLoss | None:
+    """Resolve and batch-amend one whole processing request before sharding."""
+    processing = request.get("processing")
+    if not isinstance(processing, dict):
+        return None
+    loss_fn_name = processing.get("loss_fn", "ap_grpo")
+    if loss_fn_name is None:
+        return None
+    loss_object = resolve_loss(loss_fn_name)
+    loss_object.batching_callback(request)
+    return loss_object

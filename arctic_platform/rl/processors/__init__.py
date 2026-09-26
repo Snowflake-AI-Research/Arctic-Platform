@@ -21,6 +21,7 @@ LOSS_FNS).
 """
 
 from .base_loss import BaseLoss
+from .base_loss import prepare_request_loss
 from .base_loss import resolve_loss
 
 # Packed apply + CCE (importing registers causal_cross_entropy)
@@ -130,6 +131,7 @@ __all__ = [
     "POST_PROCESSORS",
     "LOSS_FNS",
     "BaseLoss",
+    "prepare_request_loss",
     "resolve_loss",
     "register_post_processor",
     "register_loss_fn",

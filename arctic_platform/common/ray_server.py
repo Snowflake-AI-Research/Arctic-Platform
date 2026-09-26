@@ -641,6 +641,8 @@ class ArcticRLRayServer:
         return await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
 
     async def forward_backward(self, job_id: int, batch: dict) -> dict[str, Any]:
+        from arctic_platform.rl.processors import prepare_request_loss
+
         tname_e2e = timers.start("xyz fwd_bwd e2e")
 
         tname = timers.start("xyz fwd_bwd: _verify_job")
@@ -653,6 +655,7 @@ class ArcticRLRayServer:
         # body = zlib.decompress(body)
         # timers.stop_and_print_elapsed(tname)
 
+        loss_object = prepare_request_loss(batch)
         tname = timers.start("xyz fwd_bwd: ray_split_batch")
         shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=self.jobs[job_id].get("sp_size", 1))
         # The verl driver's ``update_actor`` only consumes ``metrics`` from the
@@ -686,6 +689,8 @@ class ArcticRLRayServer:
 
         tname = timers.start("xyz fwd_bwd: epilogue")
         metrics, avg_loss = finalize_fwd_bwd_metrics(results)
+        if loss_object is not None:
+            loss_object.metrics_callback([result.get("metrics") or {} for result in results], metrics)
         # ``batch`` is omitted by default (the verl driver does not consume it);
         # opt in via ``return_fwd_batch`` for the TRL server-side-loss path.
         merged = dict(

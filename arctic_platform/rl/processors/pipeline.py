@@ -309,6 +309,7 @@ def run_pipeline(
     pack: bool = True,
     max_tokens_per_mb: int = DEFAULT_MAX_TOKENS_PER_MB,
     return_tensors: bool = False,
+    validate_loss_callback: bool = True,
 ) -> dict:
     global c
     """Execute forward, post-processors, and optionally loss + backward.
@@ -350,6 +351,10 @@ def run_pipeline(
         Token budget per microbatch when ``pack=True``.  Sequences are
         grouped by a first-fit-decreasing algorithm so no microbatch
         exceeds this limit.
+    validate_loss_callback
+        Invoke the selected loss's public validation callback before model
+        execution. Callers that repeat an already validated packed window
+        solely to keep a distributed schedule aligned may set this to false.
 
     Returns
     -------
@@ -380,6 +385,7 @@ def run_pipeline(
                 device,
                 backward=backward,
                 max_tokens_per_mb=max_tokens_per_mb,
+                validate_loss_callback=validate_loss_callback,
             )
 
     tname_e2e = timers.start(f"run_pipeline e2e {engine.global_rank}")
@@ -463,7 +469,8 @@ def run_pipeline(
         output_keys = ["logits", "logprobs", "entropy", "loss"]
         if loss_object is not None:
             context = {**meta, **batch}
-            loss_object.validation_callback(context, config)
+            if validate_loss_callback:
+                loss_object.validation_callback(context, config)
             loss_object.model_forward_callback(fwd_kwargs, context, config, output_keys)
         if backward is False:
             engine.eval()
@@ -594,6 +601,7 @@ def _run_pipeline_with_packing(
     *,
     backward: bool | str,
     max_tokens_per_mb: int,
+    validate_loss_callback: bool,
 ) -> dict:
     """Run the pipeline with automatic sequence packing/unpacking.
 
@@ -650,6 +658,7 @@ def _run_pipeline_with_packing(
             backward=inner_backward,
             pack=False,
             return_tensors=True,
+            validate_loss_callback=validate_loss_callback,
         )
 
         if "avg_loss" in result:

@@ -276,11 +276,15 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
 ray_split_batch = _split_batch
 
 
-def http_split_batch(batch_bytes: bytes, num_workers: int, sp_size: int = 1) -> list[bytes]:
-    """Deserialize a global batch, split across DP workers, re-serialize each shard."""
+def http_split_batch(
+    batch_bytes: bytes | dict,
+    num_workers: int,
+    sp_size: int = 1,
+) -> tuple[list[dict], list[int] | None]:
+    """Deserialize a global batch when needed, then split it across DP workers."""
     # if num_workers <= 1:
     #     return [batch_bytes]
-    batch = wire.loads(batch_bytes)
+    batch = batch_bytes if isinstance(batch_bytes, dict) else wire.loads(batch_bytes)
 
     shards, reorder_indices = _split_batch(batch, num_workers, sp_size=sp_size)
 

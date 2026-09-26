@@ -236,6 +236,44 @@ def test_grouped_distillation_matches_float64_value_metrics_and_gradient(
     assert set(result["batch"]) == {"logprobs"}
 
 
+def test_native_packing_validates_each_final_window_once_before_model(monkeypatch):
+    import arctic_platform.rl.processors.grouped_distillation as grouped_module
+
+    frame = _frame()
+    events = []
+    original_validation = grouped_module.GroupedDistillationLoss.validation_callback
+
+    def record_validation(self, context, config):
+        assert context["input_ids"].shape == (1, 6)
+        assert context["cu_seqlens"].tolist() == [0, 6]
+        events.append("validation")
+        return original_validation(self, context, config)
+
+    class OrderedBigram(_Bigram):
+        def __call__(self, *args, **kwargs):
+            events.append("model")
+            return super().__call__(*args, **kwargs)
+
+    monkeypatch.setattr(
+        grouped_module.GroupedDistillationLoss,
+        "validation_callback",
+        record_validation,
+    )
+    engine, _ = _run(
+        frame,
+        {
+            "kd_batch_num_tokens": float(frame["kd_mask"].sum()),
+            "dp_size": 1,
+        },
+        loss_fn="grouped_distillation",
+        max_tokens_per_mb=6,
+        engine=OrderedBigram(frame["table"], grouped=True),
+    )
+
+    assert engine.forward_calls == 2
+    assert events == ["validation", "model", "validation", "model"]
+
+
 @pytest.mark.parametrize(
     ("divergence", "beta", "max_tokens_per_mb"),
     [

@@ -436,6 +436,44 @@ def _grouped_distillation_config(config: dict) -> tuple[float, Divergence, float
     return coefficient, divergence, beta, normalization
 
 
+def _request_kd_masks(request: dict) -> tuple[torch.Tensor, ...]:
+    batch = request.get("batch")
+    if isinstance(batch, list):
+        masks = tuple(microbatch.get("kd_mask") for microbatch in batch if isinstance(microbatch, dict))
+        if masks and all(torch.is_tensor(mask) for mask in masks):
+            return masks
+        if any(mask is not None for mask in masks):
+            raise ValueError("every grouped-distillation microbatch must contain tensor 'kd_mask'")
+
+    containers = []
+    for name in ("kwargs", "batch", "context", "meta"):
+        value = request.get(name)
+        if isinstance(value, dict):
+            containers.append(value)
+    containers.append(request)
+    for container in containers:
+        kd_mask = container.get("kd_mask")
+        if kd_mask is not None:
+            return (kd_mask,)
+    return ()
+
+
+def _set_request_kd_weight_sum(request: dict, config: dict, *, objective: str) -> None:
+    masks = _request_kd_masks(request)
+    if not masks or any(not torch.is_tensor(mask) for mask in masks):
+        raise ValueError(f"{objective} requires tensor context['kd_mask']")
+    total = 0.0
+    for kd_mask in masks:
+        weights = canonicalize_loss_mask(
+            kd_mask,
+            kd_mask,
+            objective=f"{objective} kd_mask",
+            binary=False,
+        )
+        total += float(weights.sum(dtype=torch.float64).item())
+    config["kd_batch_num_tokens"] = total
+
+
 def _context(batch: dict, meta: dict) -> dict:
     return {**meta, **batch}
 
@@ -562,19 +600,11 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         if not isinstance(config, dict):
             raise ValueError("processing.config must be a dictionary")
         _grouped_distillation_config(config)
-        context = request.get("context")
-        kd_mask = context.get("kd_mask") if isinstance(context, dict) else None
-        if kd_mask is None:
-            kd_mask = request.get("kd_mask")
-        if not torch.is_tensor(kd_mask):
-            raise ValueError("grouped_distillation requires tensor context['kd_mask']")
-        weights = canonicalize_loss_mask(
-            kd_mask,
-            kd_mask,
-            objective="grouped_distillation kd_mask",
-            binary=False,
+        _set_request_kd_weight_sum(
+            request,
+            config,
+            objective="grouped_distillation",
         )
-        config["kd_batch_num_tokens"] = float(weights.sum(dtype=torch.float64).item())
 
     def validation_callback(self, context: dict, config: dict) -> None:
         context = _validation_context(context)
@@ -604,7 +634,6 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         for microbatch in microbatches:
             weights = self._weights(microbatch)
             local_weights.append(float(weights.sum(dtype=torch.float32).item()))
-            self.validation_callback(microbatch, config)
         scale = resolve_global_loss_scale(microbatches[0], normalization)
         global_weight_sum, _ = _validate_global_normalization(scale, sum(local_weights))
         from .packed_reduction import additive_packed_loss_reduction
@@ -710,19 +739,11 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
             raise ValueError("processing.config must be a dictionary")
         if not self._distillation_enabled(config):
             return
-        context = request.get("context")
-        kd_mask = context.get("kd_mask") if isinstance(context, dict) else None
-        if kd_mask is None:
-            kd_mask = request.get("kd_mask")
-        if not torch.is_tensor(kd_mask):
-            raise ValueError("kd_coef > 0 requires tensor context['kd_mask']")
-        weights = canonicalize_loss_mask(
-            kd_mask,
-            kd_mask,
-            objective="grpo kd_mask",
-            binary=False,
+        _set_request_kd_weight_sum(
+            request,
+            config,
+            objective="kd_coef > 0",
         )
-        config["kd_batch_num_tokens"] = float(weights.sum(dtype=torch.float64).item())
 
     def validation_callback(self, context: dict, config: dict) -> None:
         kd = resolve_kd_term(config)
