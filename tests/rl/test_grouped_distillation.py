@@ -346,6 +346,44 @@ def test_grpo_kd_off_matches_legacy_function_exactly():
     assert torch.equal(first.grad, second.grad)
 
 
+@pytest.mark.parametrize(
+    "kd_config",
+    [
+        {"kd_coef": 0.0, "kd_beta": "bad"},
+        {"kd_beta": "bad"},
+        {"kd_coef": 0.0, "kd_divergence": "bogus"},
+        {"kd_divergence": "bogus"},
+        {"kd_coef": 0.0, "kd_divergance": "jsd"},
+        {"kd_typo": 1},
+    ],
+)
+def test_grpo_kd_off_bypasses_other_kd_only_validation_and_delegates(monkeypatch, kd_config):
+    config = {**_POLICY, **kd_config}
+    loss_object = resolve_loss("grpo")
+    request = {"processing": {"loss_fn": "grpo", "config": config}}
+
+    loss_object.batching_callback(request)
+    loss_object.validation_callback({}, config)
+    model_kwargs = {}
+    output_keys = []
+    loss_object.model_forward_callback(model_kwargs, {}, config, output_keys)
+
+    expected_loss = torch.tensor(3.0)
+    expected_metrics = {"legacy": 1.0}
+
+    def legacy_loss(model_outputs, batch, meta, received_config, device):
+        assert received_config is config
+        return expected_loss, expected_metrics
+
+    monkeypatch.setitem(LOSS_FNS, "grpo", legacy_loss)
+    loss, metrics = loss_object.loss({}, {}, {}, config, "cpu")
+
+    assert model_kwargs == {}
+    assert output_keys == []
+    assert loss is expected_loss
+    assert metrics is expected_metrics
+
+
 def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
     frame = _frame()
     request = {
@@ -493,12 +531,11 @@ def test_temperature_refusal_reports_received_values(temperature, match):
         resolve_loss("grpo").validation_callback(context, _grpo_config(frame) | _kd_config(frame))
 
 
-@pytest.mark.parametrize("kd_coef", [0.0, 0.5])
-def test_grpo_rejects_unknown_kd_config_even_when_kd_is_off(kd_coef):
+def test_grpo_rejects_unknown_kd_config_when_enabled():
     with pytest.raises(ValueError, match="kd_divergance"):
         resolve_loss("grpo").validation_callback(
             {},
-            {**_POLICY, "kd_coef": kd_coef, "kd_divergance": "jsd"},
+            {**_POLICY, "kd_coef": 0.5, "kd_divergance": "jsd"},
         )
 
 
@@ -507,6 +544,7 @@ def test_grpo_rejects_unknown_kd_config_even_when_kd_is_off(kd_coef):
     ("field", "value"),
     [
         ("kd_coef", True),
+        ("kd_coef", False),
         ("kd_coef", "0.5"),
         ("kd_coef", None),
         ("kd_coef", 0.5 + 0j),
@@ -532,12 +570,24 @@ def test_kd_numeric_config_requires_finite_real_non_boolean_values(loss_fn, fiel
         resolve_loss(loss_fn).validation_callback({}, config)
 
 
-@pytest.mark.parametrize("value", [True, "0.5", None, 0.5 + 0j, math.nan])
-def test_grpo_kd_off_still_rejects_malformed_explicit_beta(value):
-    with pytest.raises(ValueError, match="kd_beta"):
+@pytest.mark.parametrize(
+    ("config", "match"),
+    [
+        ({"kd_divergence": "bogus"}, "kd_divergence"),
+        ({"kd_beta": 1.1}, "kd_beta"),
+        ({"kd_divergence": "jsd", "kd_beta": 1.0}, "kd_beta"),
+    ],
+)
+def test_grpo_kd_enabled_rejects_invalid_divergence_and_beta_ranges(config, match):
+    with pytest.raises(ValueError, match=match):
         resolve_loss("grpo").validation_callback(
             {},
-            {**_POLICY, "kd_coef": 0.0, "kd_beta": value},
+            {
+                **_POLICY,
+                "kd_coef": 0.5,
+                "kd_batch_num_tokens": 1.0,
+                **config,
+            },
         )
 
 

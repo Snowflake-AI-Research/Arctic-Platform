@@ -392,9 +392,6 @@ class KDTerm:
 
 
 def _kd_coefficient(config: dict) -> float:
-    unknown = {key for key in config if key.startswith("kd_")} - _GRPO_DISTILLATION_CONFIG_KEYS
-    if unknown:
-        raise ValueError(f"Unknown KD config keys for loss_fn 'grpo': {sorted(unknown)}")
     if "kd_coef" not in config:
         return 0.0
     raw = config["kd_coef"]
@@ -406,9 +403,12 @@ def _kd_coefficient(config: dict) -> float:
 
 def resolve_kd_term(config: dict, context: dict | None = None) -> KDTerm | None:
     coefficient = _kd_coefficient(config)
-    divergence, beta = _resolve_divergence(config, "kd_")
     if coefficient == 0:
         return None
+    unknown = {key for key in config if key.startswith("kd_")} - _GRPO_DISTILLATION_CONFIG_KEYS
+    if unknown:
+        raise ValueError(f"Unknown KD config keys for loss_fn 'grpo': {sorted(unknown)}")
+    divergence, beta = _resolve_divergence(config, "kd_")
     weight_sum = config.get("kd_batch_num_tokens")
     if (
         isinstance(weight_sum, bool)
