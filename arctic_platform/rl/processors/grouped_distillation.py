@@ -46,6 +46,7 @@ _DISTILLATION_METRICS = (
 )
 _GROUPED_DISTILLATION_METRICS = (*_DISTILLATION_METRICS, "sft_nll_sum")
 _GRPO_DISTILLATION_METRICS = (*_DISTILLATION_METRICS, "loss_term_kd")
+_AVG_LOSS_CORRECTION_METRIC = "_avg_loss_correction_sum"
 _GROUPED_DISTILLATION_CONFIG_KEYS = frozenset(
     {"kd_coef", "kd_divergence", "kd_beta", "kd_batch_num_tokens", "dp_size"}
 )
@@ -451,9 +452,11 @@ def _kd_term(
             f"this worker's kd_mask sums to {metrics['kd_weight_sum']}, above kd_batch_num_tokens={kd.weight_sum}"
         )
     share = kd.coef / kd.weight_sum if kd.weight_sum else 0.0
+    reported_term = share * metrics["kd_sum"]
     return share * kd.dp_size * kd_sum, {
         "kd_coef": kd.coef,
-        "loss_term_kd": share * metrics["kd_sum"],
+        "loss_term_kd": reported_term,
+        _AVG_LOSS_CORRECTION_METRIC: (1 - kd.dp_size) * reported_term,
         **metrics,
     }
 
@@ -599,6 +602,17 @@ class _GroupedLossCallbacks:
 
     def metrics_callback(self, worker_metrics: Sequence[dict], metrics: dict) -> None:
         _sum_metrics(worker_metrics, metrics, self.metric_names)
+        metrics.pop(_AVG_LOSS_CORRECTION_METRIC, None)
+
+    def reporting_callback(
+        self,
+        worker_metrics: Sequence[dict],
+        metrics: dict,
+        avg_loss: float,
+    ) -> float:
+        del metrics
+        correction = sum(float(worker.get(_AVG_LOSS_CORRECTION_METRIC, 0.0)) for worker in worker_metrics)
+        return avg_loss + correction
 
     def output_callback(self, model_outputs: dict) -> None:
         model_outputs.pop("logits", None)
@@ -732,19 +746,23 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
             nll = _connected_zero(logprobs)
         else:
             nll = nll_sum * dp_size / global_weight_sum
+        metrics = {}
         if kd_coef == 0:
-            return nll, {}
-
-        kd_sum, metrics = grouped_divergence(model_outputs, context, weights, divergence, beta)
-        if global_weight_sum is None:
-            denominator = weights.sum(dtype=torch.float64)
-            kd = kd_sum / denominator.clamp_min(torch.finfo(torch.float64).tiny)
-        elif global_weight_sum == 0:
-            kd = kd_sum * 0
+            loss = nll
         else:
-            kd = kd_sum * dp_size / global_weight_sum
-        metrics["sft_nll_sum"] = float(nll_sum.detach())
-        return ((1 - kd_coef) * nll + kd_coef * kd).to(nll.dtype), metrics
+            kd_sum, metrics = grouped_divergence(model_outputs, context, weights, divergence, beta)
+            if global_weight_sum is None:
+                denominator = weights.sum(dtype=torch.float64)
+                kd = kd_sum / denominator.clamp_min(torch.finfo(torch.float64).tiny)
+            elif global_weight_sum == 0:
+                kd = kd_sum * 0
+            else:
+                kd = kd_sum * dp_size / global_weight_sum
+            metrics["sft_nll_sum"] = float(nll_sum.detach())
+            loss = ((1 - kd_coef) * nll + kd_coef * kd).to(nll.dtype)
+        if global_weight_sum is not None:
+            metrics[_AVG_LOSS_CORRECTION_METRIC] = float((loss.detach() / dp_size - loss.detach()).item())
+        return loss, metrics
 
 
 class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):

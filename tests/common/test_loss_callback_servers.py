@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import pickle
 
+import pytest
 import torch
 
 from arctic_platform import wire
@@ -55,6 +56,9 @@ class _RecordingLoss:
         self.events.append("metrics")
         self.loss.metrics_callback(worker_metrics, metrics)
         metrics["callback_probe_sum"] = sum(worker["probe"] for worker in worker_metrics)
+
+    def reporting_callback(self, worker_metrics, metrics, avg_loss):
+        return self.loss.reporting_callback(worker_metrics, metrics, avg_loss)
 
 
 class _BatchingStateLoss(BaseLoss):
@@ -241,8 +245,8 @@ def test_http_forward_runs_loss_callbacks_around_real_split(monkeypatch):
 class _GroupedPolicyEngine:
     global_rank = 0
 
-    def __init__(self):
-        self.parameter = torch.tensor(0.0, requires_grad=True)
+    def __init__(self, value=0.0):
+        self.parameter = torch.tensor(float(value), requires_grad=True)
         self.group_shapes = []
 
     def gradient_accumulation_steps(self):
@@ -255,9 +259,10 @@ class _GroupedPolicyEngine:
         pass
 
     def __call__(self, input_ids, group_token_ids=None, **_kwargs):
-        assert group_token_ids is not None
-        self.group_shapes.append(tuple(group_token_ids.shape))
         logprobs = self.parameter.expand_as(input_ids)
+        if group_token_ids is None:
+            return {"logprobs": logprobs}
+        self.group_shapes.append(tuple(group_token_ids.shape))
         width = group_token_ids.shape[-1]
         group_logits = torch.cat(
             (
@@ -339,6 +344,15 @@ def _native_grpo_kd_request():
             },
         },
     }
+
+
+def _native_grouped_distillation_request():
+    request = _native_grpo_kd_request()
+    request["processing"] = {
+        "loss_fn": "grouped_distillation",
+        "config": {"kd_coef": 0.25},
+    }
+    return request
 
 
 def test_ray_preserves_batching_state_through_serialized_worker_execution(monkeypatch):
@@ -446,13 +460,54 @@ def test_ray_grpo_kd_unpads_teacher_groups_for_multiple_rows_per_worker(monkeypa
 
     response = asyncio.run(server.forward_backward(1, request))
 
+    base_request = _native_grpo_kd_request()
+    base_request["processing"]["config"].pop("kd_coef")
+    base_workers = [_cpu_worker(_GroupedPolicyEngine()) for _ in range(2)]
+    server.training_workers = [type("Worker", (), {"forward_backward": Remote(worker)})() for worker in base_workers]
+    base_response = asyncio.run(server.forward_backward(1, base_request))
+
     assert received[0]["processing"]["config"]["dp_size"] is None
     assert received[0]["processing"]["config"]["kd_batch_num_tokens"] == 8.0
-    assert [shard["meta"]["dp_size"] for shard in received] == [2, 2]
+    assert [shard["meta"]["dp_size"] for shard in received[:2]] == [2, 2]
     assert [worker.engine.group_shapes for worker in workers] == [[(1, 5, 2)], [(1, 3, 2)]]
     assert response["metrics"]["kd_weight_sum"] == 8.0
-    assert torch.isfinite(torch.tensor(response["avg_loss"]))
+    assert response["avg_loss"] - base_response["avg_loss"] == pytest.approx(response["metrics"]["loss_term_kd"])
+    assert "_avg_loss_correction_sum" not in response["metrics"]
     assert all(torch.isfinite(worker.engine.parameter.grad) for worker in workers)
+
+
+def test_ray_grouped_distillation_reports_global_objective_without_dp_gradient_scale(monkeypatch):
+    import arctic_platform.common.ray_server as ray_server
+
+    request = _native_grouped_distillation_request()
+    workers = [_cpu_worker(_GroupedPolicyEngine(-2.0)) for _ in range(2)]
+
+    class Remote:
+        def __init__(self, worker):
+            self.worker = worker
+
+        def remote(self, shard):
+            return self.worker.forward_backward(shard)
+
+    server = object.__new__(ray_server.ArcticRLRayServer)
+    server.jobs = {1: {"job_type": "training", "sp_size": 1}}
+    server.training_workers = [type("Worker", (), {"forward_backward": Remote(worker)})() for worker in workers]
+    monkeypatch.setattr(ray_server.ray, "get", lambda refs: refs)
+
+    response = asyncio.run(server.forward_backward(1, request))
+
+    parameter = torch.tensor(-2.0, requires_grad=True)
+    teacher = torch.tensor([0.2, 0.2, 0.6])
+    student_log_probs = torch.stack((parameter, parameter, parameter.new_zeros(()))).log_softmax(0)
+    kd = (teacher * (teacher.log() - student_log_probs)).sum()
+    objective = 0.75 * -parameter + 0.25 * kd
+    (objective_grad,) = torch.autograd.grad(objective, parameter)
+
+    assert response["avg_loss"] == pytest.approx(objective.item())
+    assert "_avg_loss_correction_sum" not in response["metrics"]
+    assert [worker.engine.parameter.grad.item() for worker in workers] == pytest.approx(
+        [2 * 5 / 8 * objective_grad.item(), 2 * 3 / 8 * objective_grad.item()]
+    )
 
 
 def test_http_forward_grpo_kd_unpads_teacher_groups_for_multiple_rows_per_worker():
@@ -492,3 +547,36 @@ def test_http_forward_grpo_kd_unpads_teacher_groups_for_multiple_rows_per_worker
     assert [worker.engine.group_shapes for worker in workers] == [[(1, 5, 2)], [(1, 3, 2)]]
     assert decoded["metrics"]["kd_weight_sum"] == 8.0
     assert torch.isfinite(torch.tensor(decoded["avg_loss"]))
+
+
+def test_http_forward_grpo_kd_reports_unscaled_kd_delta():
+    import arctic_platform.common.http_server as http_server
+
+    async def run(request):
+        workers = [_cpu_worker(_GroupedPolicyEngine()) for _ in range(2)]
+
+        class Remote:
+            def __init__(self, worker):
+                self.worker = worker
+
+            async def _call(self, shard):
+                return self.worker.forward_no_grad(shard)
+
+            def remote(self, shard):
+                return self._call(shard)
+
+        http_server.app.state.jobs = {1: {"job_type": "training", "sp_size": 1}}
+        http_server.app.state.training_workers = [
+            type("Worker", (), {"forward_no_grad": Remote(worker)})() for worker in workers
+        ]
+        response = await http_server.forward(job_id=1, body=wire.dumps(request))
+        return wire.loads(response.body)
+
+    kd_request = _native_grpo_kd_request()
+    base_request = _native_grpo_kd_request()
+    base_request["processing"]["config"].pop("kd_coef")
+    with_kd = asyncio.run(run(kd_request))
+    base = asyncio.run(run(base_request))
+
+    assert with_kd["avg_loss"] - base["avg_loss"] == pytest.approx(with_kd["metrics"]["loss_term_kd"])
+    assert "_avg_loss_correction_sum" not in with_kd["metrics"]

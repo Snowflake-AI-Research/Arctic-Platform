@@ -424,7 +424,9 @@ async def forward_backward(
     tname = timers.start("xyz fwd_bwd: epilogue")
     metrics, avg_loss = finalize_fwd_bwd_metrics(results)
     if loss_object is not None:
-        loss_object.metrics_callback([result.get("metrics") or {} for result in results], metrics)
+        worker_metrics = [result.get("metrics") or {} for result in results]
+        avg_loss = loss_object.reporting_callback(worker_metrics, metrics, avg_loss)
+        loss_object.metrics_callback(worker_metrics, metrics)
     # ``batch`` is omitted by default (the verl driver does not consume it);
     # opt in via ``return_fwd_batch`` for the TRL server-side-loss path.
     merged = dict(
@@ -476,7 +478,9 @@ async def forward(
 
     metrics, avg_loss = finalize_fwd_bwd_metrics(results)
     if loss_object is not None:
-        loss_object.metrics_callback([result.get("metrics") or {} for result in results], metrics)
+        worker_metrics = [result.get("metrics") or {} for result in results]
+        avg_loss = loss_object.reporting_callback(worker_metrics, metrics, avg_loss)
+        loss_object.metrics_callback(worker_metrics, metrics)
     merged = dict(
         job_id=job_id,
         batch=batch,

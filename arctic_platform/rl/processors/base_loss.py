@@ -114,6 +114,15 @@ class BaseLoss(ABC, metaclass=RegistryMeta):
     def metrics_callback(self, worker_metrics: Sequence[dict], metrics: dict) -> None:
         """Combine or amend metrics after worker results are available."""
 
+    def reporting_callback(
+        self,
+        worker_metrics: Sequence[dict],
+        metrics: dict,
+        avg_loss: float,
+    ) -> float:
+        """Amend the native coordinator's reported loss without changing gradients."""
+        return avg_loss
+
     def output_callback(self, model_outputs: dict) -> None:
         """Remove objective-only model outputs before response assembly.
 

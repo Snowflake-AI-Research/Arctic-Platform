@@ -260,6 +260,7 @@ def test_base_loss_callbacks_are_no_ops_by_default():
     assert loss_object.model_forward_callback(kwargs, context, config, output_keys) is None
     assert loss_object.packed_reduction_callback([context], config, loss_object.name) is None
     assert loss_object.metrics_callback([metrics], metrics) is None
+    assert loss_object.reporting_callback([metrics], metrics, 6.0) == 6.0
     assert loss_object.output_callback(outputs) is None
     assert request == {"value": 1}
     assert kwargs == {"value": 4}
