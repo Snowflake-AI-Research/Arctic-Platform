@@ -195,17 +195,21 @@ def padded_tensor_2d_dict_to_unpadded_tensor_1d_dict(tensor_dict, attention_mask
 
 
 def unpadded_tensor_1d_to_padded_tensor_2d(tensor_1d, attention_mask_2d_bool, pad_value):
-
-    if tensor_1d.shape != attention_mask_2d_bool.shape:
-        ValueError(f"{tensor_1d.shape=} != {attention_mask_2d_bool.shape}")
+    num_tokens = int(attention_mask_2d_bool.sum().item())
+    if tensor_1d.ndim >= 2 and tensor_1d.shape[:2] == (1, num_tokens):
+        token_values = tensor_1d.squeeze(0)
+    elif tensor_1d.ndim >= 1 and tensor_1d.shape[0] == num_tokens:
+        token_values = tensor_1d
+    else:
+        raise ValueError(f"{tensor_1d.shape=} does not carry {num_tokens} unpadded token values")
 
     tensor_2d = torch.full(
-        attention_mask_2d_bool.shape,
+        (*attention_mask_2d_bool.shape, *token_values.shape[1:]),
         fill_value=pad_value,
         dtype=tensor_1d.dtype,
         device=tensor_1d.device,
     )
-    tensor_2d[attention_mask_2d_bool] = tensor_1d.view(-1)
+    tensor_2d[attention_mask_2d_bool] = token_values
     return tensor_2d
 
 
@@ -231,30 +235,26 @@ def padded_tensor_2d_full_to_unpadded_tensor_1d_response(tensor_2d, attention_ma
 
 
 def unpadded_tensor_1d_response_to_padded_tensor_2d_full(tensor_1d, attention_mask_2d_bool, max_prompt_len):
-
-    # pad_value should be 0 for the return post-process tensors since the padding is just a shape placeholder
-    pad_value = 0
-
-    if tensor_1d.shape != attention_mask_2d_bool.shape:
-        ValueError(f"{tensor_1d.shape=} != {attention_mask_2d_bool.shape}")
-
     pr0(f"{tensor_1d.shape=}")
-    pr0(f"{tensor_1d.view(-1).shape=}")
 
-    tensor_2d = torch.full(
-        attention_mask_2d_bool.shape,
-        fill_value=pad_value,
+    attention_mask_2d_bool_response = attention_mask_2d_bool[:, max_prompt_len:]
+    tensor_2d_response = unpadded_tensor_1d_to_padded_tensor_2d(
+        tensor_1d,
+        attention_mask_2d_bool_response,
+        pad_value=0,
+    )
+    tensor_2d = torch.zeros(
+        (
+            *attention_mask_2d_bool.shape,
+            *tensor_2d_response.shape[2:],
+        ),
         dtype=tensor_1d.dtype,
         device=tensor_1d.device,
     )
-
-    tensor_2d_response = tensor_2d[:, max_prompt_len:]
-    attention_mask_2d_bool_response = attention_mask_2d_bool[:, max_prompt_len:]
+    tensor_2d[:, max_prompt_len:] = tensor_2d_response
 
     pr0(f"{tensor_2d_response.shape=}")
     pr0(f"{attention_mask_2d_bool_response.shape=}")
-
-    tensor_2d_response[attention_mask_2d_bool_response] = tensor_1d.view(-1)
 
     return tensor_2d
 

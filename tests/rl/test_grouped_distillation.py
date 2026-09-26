@@ -932,3 +932,35 @@ def test_unpacked_batch_size_one_standalone_loss_preserves_tensor_ranks():
         abs=1e-7,
     )
     assert logits.grad is not None
+
+
+def test_native_unpad_round_trips_token_outputs_with_trailing_dimensions():
+    from arctic_platform.rl.processors.pipeline import padded_tensor_2d_to_unpadded_tensor_1d
+    from arctic_platform.rl.processors.pipeline import unpadded_tensor_1d_response_to_padded_tensor_2d_full
+    from arctic_platform.rl.processors.pipeline import unpadded_tensor_1d_to_padded_tensor_2d
+
+    attention_mask = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.bool)
+    padded = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+
+    unpadded = padded_tensor_2d_to_unpadded_tensor_1d(padded, attention_mask)
+    restored = unpadded_tensor_1d_to_padded_tensor_2d(
+        unpadded,
+        attention_mask,
+        pad_value=0,
+    )
+
+    expected = torch.zeros_like(padded)
+    expected[attention_mask] = padded[attention_mask]
+    assert torch.equal(unpadded, padded[attention_mask].unsqueeze(0))
+    assert torch.equal(restored, expected)
+
+    response_mask = attention_mask[:, 1:]
+    unpadded_response = padded[:, 1:][response_mask].unsqueeze(0)
+    restored_response = unpadded_tensor_1d_response_to_padded_tensor_2d_full(
+        unpadded_response,
+        attention_mask,
+        max_prompt_len=1,
+    )
+    expected_response = torch.zeros_like(padded)
+    expected_response[:, 1:][response_mask] = padded[:, 1:][response_mask]
+    assert torch.equal(restored_response, expected_response)
