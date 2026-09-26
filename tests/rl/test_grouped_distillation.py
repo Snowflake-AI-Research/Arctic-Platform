@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
-
 """Grouped class losses against full-vocabulary float64 references."""
 
 from __future__ import annotations

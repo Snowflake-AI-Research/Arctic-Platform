@@ -717,6 +717,8 @@ class ArcticRLRayServer:
     # return {"job_id": job_id, "avg_loss": avg_loss, "post_process_outputs": post_process_outputs}
 
     async def forward(self, job_id: int, batch: dict) -> dict[str, Any]:
+        from arctic_platform.rl.processors import prepare_request_loss
+
         info = self.jobs[job_id]
         self._verify_job(job_id, ["training", "log_prob"])
         job_type = info["job_type"]
@@ -726,8 +728,6 @@ class ArcticRLRayServer:
             workers = self.training_workers
         if not workers:
             raise ValueError(f"Job {job_id} ({job_type}) has no DeepSpeed workers")
-        batch["meta"]["worker_return_tensors"] = True
-
         # import zlib
         # body = zlib.decompress(body)
 
@@ -736,7 +736,9 @@ class ArcticRLRayServer:
         #     w.forward_no_grad.remote(s) for w, s in zip(workers, shards)
         # ])
 
+        loss_object = prepare_request_loss(batch)
         shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=info.get("sp_size", 1))
+        shards[0]["meta"]["worker_return_tensors"] = True
         refs = [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
         results = ray.get(refs)
 
@@ -747,6 +749,8 @@ class ArcticRLRayServer:
             batch = restore_batch_order(batch, reorder_indices)
 
         metrics, avg_loss = finalize_fwd_bwd_metrics(results)
+        if loss_object is not None:
+            loss_object.metrics_callback([result.get("metrics") or {} for result in results], metrics)
         merged = dict(
             job_id=job_id,
             batch=batch,

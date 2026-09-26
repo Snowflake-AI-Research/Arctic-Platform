@@ -447,6 +447,8 @@ async def forward(
     job_id: int,
     body: bytes = Body(..., media_type="application/octet-stream"),
 ):
+    from arctic_platform.rl.processors import prepare_request_loss
+
     info = app.state.jobs[job_id]
     _verify_job(job_id, ["training", "log_prob"])
     job_type = info["job_type"]
@@ -457,7 +459,9 @@ async def forward(
     if not workers:
         raise HTTPException(400, f"Job {job_id} ({job_type}) has no DeepSpeed workers")
 
-    shards, reorder_indices = http_split_batch(body, len(workers), sp_size=info.get("sp_size", 1))
+    request = wire.loads(body)
+    loss_object = prepare_request_loss(request)
+    shards, reorder_indices = http_split_batch(request, len(workers), sp_size=info.get("sp_size", 1))
     shards[0]["meta"]["worker_return_tensors"] = True
     results = await asyncio.gather(*[w.forward_no_grad.remote(s) for w, s in zip(workers, shards)])
     pr0(f"[DeepSpeedWorker] fwd_no_grad: {len(results)=}")
@@ -467,6 +471,8 @@ async def forward(
         batch = restore_batch_order(batch, reorder_indices)
 
     metrics, avg_loss = finalize_fwd_bwd_metrics(results)
+    if loss_object is not None:
+        loss_object.metrics_callback([result.get("metrics") or {} for result in results], metrics)
     merged = dict(
         job_id=job_id,
         batch=batch,

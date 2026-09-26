@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
-
 """Class-loss registration, fallback, and callback contract tests."""
 
 from __future__ import annotations

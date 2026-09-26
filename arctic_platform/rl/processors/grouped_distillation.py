@@ -402,7 +402,7 @@ def _kd_coefficient(config: dict) -> float:
     return coefficient
 
 
-def resolve_kd_term(config: dict) -> KDTerm | None:
+def resolve_kd_term(config: dict, context: dict | None = None) -> KDTerm | None:
     coefficient = _kd_coefficient(config)
     divergence, beta = _resolve_divergence(config, "kd_")
     if coefficient == 0:
@@ -424,7 +424,10 @@ def resolve_kd_term(config: dict) -> KDTerm | None:
         divergence,
         beta,
         weight_sum,
-        _resolve_dp_size(config.get("dp_size"), weight_sum),
+        _resolve_dp_size(
+            config.get("dp_size") if config.get("dp_size") is not None else (context or {}).get("dp_size"),
+            weight_sum,
+        ),
     )
 
 
@@ -634,6 +637,7 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         if not isinstance(config, dict):
             raise ValueError("processing.config must be a dictionary")
         _grouped_distillation_config(config)
+        config.setdefault("dp_size", None)
         _set_request_kd_weight_sum(
             request,
             config,
@@ -773,6 +777,7 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
             raise ValueError("processing.config must be a dictionary")
         if not self._distillation_enabled(config):
             return
+        config.setdefault("dp_size", None)
         _set_request_kd_weight_sum(
             request,
             config,
@@ -780,10 +785,10 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         )
 
     def validation_callback(self, context: dict, config: dict) -> None:
-        kd = resolve_kd_term(config)
+        context = _validation_context(context)
+        kd = resolve_kd_term(config, context)
         if kd is None:
             return
-        context = _validation_context(context)
         super().validation_callback(context, config)
         local_weight_sum = float(self._weights(context).sum(dtype=torch.float64).item())
         if local_weight_sum > kd.weight_sum and not math.isclose(
@@ -818,9 +823,9 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         device: str,
     ) -> tuple[torch.Tensor, dict]:
         loss, metrics = LOSS_FNS[self.name](model_outputs, batch, meta, config, device)
-        kd = resolve_kd_term(config)
+        context = _validation_context(_context(batch, meta))
+        kd = resolve_kd_term(config, context)
         if kd is None:
             return loss, metrics
-        context = _validation_context(_context(batch, meta))
         kd_loss, kd_metrics = _kd_term(model_outputs, context, kd, self._weights(context))
         return loss + kd_loss.to(loss.dtype), {**metrics, **kd_metrics}

@@ -123,7 +123,9 @@ def _config_with_microbatch_scales(processing: dict | None, microbatches: Sequen
 def resolve_packed_loss_reduction(
     processing: dict | None,
     microbatches: Sequence[dict],
-) -> PackedLossReduction:
+    *,
+    require_declared: bool = True,
+) -> PackedLossReduction | None:
     """Resolve an objective's packed-microbatch reduction and preflight it."""
     n_mbs = len(microbatches)
     if n_mbs == 0:
@@ -144,12 +146,14 @@ def resolve_packed_loss_reduction(
         loss_fn_name,
     )
     if reduction is None:
-        if n_mbs > 1:
+        if n_mbs > 1 and require_declared:
             raise ValueError(
                 f"loss_fn {loss_fn_name!r} does not declare packed-microbatch "
                 "reduction metadata; use one microbatch or register the loss with "
                 "packed_loss_reduction= or implement packed_reduction_callback"
             )
+        if n_mbs > 1:
+            return None
         return local_mean_packed_loss_reduction((1.0,))
 
     if not isinstance(reduction, PackedLossReduction):

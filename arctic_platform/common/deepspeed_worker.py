@@ -437,6 +437,16 @@ class DeepSpeedWorker:
         if use_sft_pipeline:
             self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
 
+        loss_reduction = None
+        if not use_sft_pipeline:
+            from arctic_platform.rl.processors import resolve_packed_loss_reduction
+
+            loss_reduction = resolve_packed_loss_reduction(
+                processing,
+                [{**meta_data, **micro_batch} for micro_batch in micro_batch_data],
+                require_declared=False,
+            )
+
         pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
 
         for i, micro_batch in enumerate(micro_batch_data):
@@ -508,21 +518,27 @@ class DeepSpeedWorker:
         pipeline_outputs = dict()
         for k, v in pipeline_micro_batch_outputs[0].items():
             if k == "metrics" and isinstance(v, dict):
-                # Per-microbatch loss-fn metrics are emitted as paired
-                # ``{name}.sum`` / ``{name}.tokens`` scalars (plus a few
-                # passthrough numerics like ``kl_coef``). Sum them across
-                # this rank's microbatches so each rank returns one scalar
-                # per metric; ``ray_server.forward_backward`` / ``http_server.forward_backward``
-                # then sums across DP ranks and collapses the paired keys
-                # into a single global token-mean per metric per mini-batch.
-                pipeline_outputs[k] = combine_metric_microbatches([r[k] for r in pipeline_micro_batch_outputs])
+                if loss_reduction is None:
+                    # Legacy losses without packed metadata retain the
+                    # historical GAS metric combiner.
+                    pipeline_outputs[k] = combine_metric_microbatches([r[k] for r in pipeline_micro_batch_outputs])
+                else:
+                    from arctic_platform.rl.processors import combine_packed_metrics
+
+                    pipeline_outputs[k] = combine_packed_metrics(
+                        [r[k] for r in pipeline_micro_batch_outputs],
+                        loss_reduction.reporting_weights,
+                    )
             elif isinstance(v, dict):
                 pipeline_outputs[k] = merge_dict_shards([r[k] for r in pipeline_micro_batch_outputs])
             elif isinstance(v, numbers.Number):
-                # TODO: weight average needs to be implemented
-                pipeline_outputs[k] = sum([r[k] for r in pipeline_micro_batch_outputs]) / len(
-                    pipeline_micro_batch_outputs
-                )
+                values = [r[k] for r in pipeline_micro_batch_outputs]
+                if k == "avg_loss" and loss_reduction is not None:
+                    from arctic_platform.rl.processors import combine_packed_losses
+
+                    pipeline_outputs[k] = combine_packed_losses(values, loss_reduction)
+                else:
+                    pipeline_outputs[k] = sum(values) / len(values)
 
         pipeline_outputs = self._move_batch_to_device(pipeline_outputs, self.cpu_device)
 
