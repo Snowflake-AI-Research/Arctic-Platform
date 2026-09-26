@@ -44,7 +44,9 @@ _DISTILLATION_METRICS = (
 )
 _GROUPED_DISTILLATION_METRICS = (*_DISTILLATION_METRICS, "sft_nll_sum")
 _GRPO_DISTILLATION_METRICS = (*_DISTILLATION_METRICS, "loss_term_kd")
-_GROUPED_DISTILLATION_CONFIG_KEYS = frozenset({"lambda_kd", "divergence", "beta", "batch_num_tokens", "dp_size"})
+_GROUPED_DISTILLATION_CONFIG_KEYS = frozenset(
+    {"kd_coef", "kd_divergence", "kd_beta", "kd_batch_num_tokens", "dp_size"}
+)
 _GRPO_DISTILLATION_CONFIG_KEYS = frozenset({"kd_coef", "kd_divergence", "kd_beta", "kd_batch_num_tokens"})
 _TEACHER_LOG_PROB_DTYPES = frozenset({torch.float16, torch.bfloat16, torch.float32, torch.float64})
 
@@ -419,15 +421,19 @@ def _grouped_distillation_config(config: dict) -> tuple[float, Divergence, float
     unknown = set(config) - _GROUPED_DISTILLATION_CONFIG_KEYS
     if unknown:
         raise ValueError(f"Unknown config keys for loss_fn 'grouped_distillation': {sorted(unknown)}")
-    raw_lambda = config.get("lambda_kd", 0.25)
-    if isinstance(raw_lambda, bool):
-        raise ValueError(f"lambda_kd must be a finite number in [0, 1], got {raw_lambda!r}")
-    lambda_kd = float(raw_lambda)
-    if not math.isfinite(lambda_kd) or not 0 <= lambda_kd <= 1:
-        raise ValueError(f"lambda_kd must be a finite number in [0, 1], got {raw_lambda!r}")
-    divergence, beta = _resolve_divergence(config, "")
-    normalization = {key: config[key] for key in ("batch_num_tokens", "dp_size") if key in config}
-    return lambda_kd, divergence, beta, normalization
+    raw_coefficient = config.get("kd_coef", 0.25)
+    if isinstance(raw_coefficient, bool):
+        raise ValueError(f"kd_coef must be a finite number in [0, 1], got {raw_coefficient!r}")
+    coefficient = float(raw_coefficient)
+    if not math.isfinite(coefficient) or not 0 <= coefficient <= 1:
+        raise ValueError(f"kd_coef must be a finite number in [0, 1], got {raw_coefficient!r}")
+    divergence, beta = _resolve_divergence(config, "kd_")
+    normalization = {}
+    if "kd_batch_num_tokens" in config:
+        normalization["batch_num_tokens"] = config["kd_batch_num_tokens"]
+    if "dp_size" in config:
+        normalization["dp_size"] = config["dp_size"]
+    return coefficient, divergence, beta, normalization
 
 
 def _context(batch: dict, meta: dict) -> dict:
@@ -535,29 +541,54 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         reference = context.get("input_ids")
         if not torch.is_tensor(reference):
             raise ValueError("grouped_distillation requires tensor context['input_ids']")
-        loss_mask = context.get("loss_mask")
-        if loss_mask is None:
-            raise ValueError("grouped_distillation requires context['loss_mask']")
+        kd_mask = context.get("kd_mask")
+        if kd_mask is None:
+            raise ValueError("grouped_distillation requires context['kd_mask']")
         return canonicalize_loss_mask(
-            loss_mask,
+            kd_mask,
             reference,
-            objective="grouped_distillation",
+            objective="grouped_distillation kd_mask",
             binary=False,
         )
 
+    def batching_callback(self, request: dict) -> None:
+        processing = request.get("processing")
+        if not isinstance(processing, dict):
+            return
+        config = processing.get("config")
+        if config is None:
+            config = {}
+            processing["config"] = config
+        if not isinstance(config, dict):
+            raise ValueError("processing.config must be a dictionary")
+        _grouped_distillation_config(config)
+        context = request.get("context")
+        kd_mask = context.get("kd_mask") if isinstance(context, dict) else None
+        if kd_mask is None:
+            kd_mask = request.get("kd_mask")
+        if not torch.is_tensor(kd_mask):
+            raise ValueError("grouped_distillation requires tensor context['kd_mask']")
+        weights = canonicalize_loss_mask(
+            kd_mask,
+            kd_mask,
+            objective="grouped_distillation kd_mask",
+            binary=False,
+        )
+        config["kd_batch_num_tokens"] = float(weights.sum(dtype=torch.float64).item())
+
     def validation_callback(self, context: dict, config: dict) -> None:
         context = _validation_context(context)
-        lambda_kd, _, _, normalization = _grouped_distillation_config(config)
+        kd_coef, _, _, normalization = _grouped_distillation_config(config)
         weights = self._weights(context)
         labels = context.get("labels")
         if torch.is_tensor(labels):
             if tuple(labels.shape) != tuple(weights.shape):
-                raise ValueError("grouped_distillation labels must match loss_mask when labels are present")
+                raise ValueError("grouped_distillation labels must match kd_mask when labels are present")
             if bool(((labels.to(weights.device) == -100) & (weights > 0)).any().item()):
-                raise ValueError("grouped_distillation loss_mask must be zero where labels use IGNORE_INDEX (-100)")
+                raise ValueError("grouped_distillation kd_mask must be zero where labels use IGNORE_INDEX (-100)")
         scale = resolve_global_loss_scale(context, normalization)
         _validate_global_normalization(scale, float(weights.sum(dtype=torch.float32).item()))
-        if lambda_kd > 0:
+        if kd_coef > 0:
             _validate_neutral_temperature(context)
             _validate_teacher_context(context, weights)
 
@@ -592,7 +623,7 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         device: str,
     ) -> tuple[torch.Tensor, dict]:
         del device
-        lambda_kd, divergence, beta, normalization = _grouped_distillation_config(config)
+        kd_coef, divergence, beta, normalization = _grouped_distillation_config(config)
         context = _context(batch, meta)
         if context.get("cu_seqlens") is not None:
             context = _validation_context(context)
@@ -611,9 +642,9 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
                 "configure processing.post=['compute_logprobs'] or a chunked logprob head"
             )
         weights = canonicalize_loss_mask(
-            context["loss_mask"],
+            context["kd_mask"],
             logprobs,
-            objective="grouped_distillation",
+            objective="grouped_distillation kd_mask",
             binary=False,
         )
         scale = resolve_global_loss_scale(context, normalization)
@@ -631,7 +662,7 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
             nll = _connected_zero(logprobs)
         else:
             nll = nll_sum * dp_size / global_weight_sum
-        if lambda_kd == 0:
+        if kd_coef == 0:
             return nll, {}
 
         kd_sum, metrics = grouped_divergence(model_outputs, context, weights, divergence, beta)
@@ -643,7 +674,7 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         else:
             kd = kd_sum * dp_size / global_weight_sum
         metrics["sft_nll_sum"] = float(nll_sum.detach())
-        return ((1 - lambda_kd) * nll + lambda_kd * kd).to(nll.dtype), metrics
+        return ((1 - kd_coef) * nll + kd_coef * kd).to(nll.dtype), metrics
 
 
 class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):

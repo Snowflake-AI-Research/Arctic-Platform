@@ -200,11 +200,11 @@ def test_grouped_distillation_matches_float64_value_metrics_and_gradient(
     kd_sum, teacher_tail, _ = _reference(logits, frame, weights, divergence, beta)
     nll = -(weights * logits.log_softmax(-1).gather(-1, frame["labels"][..., None]).squeeze(-1)).sum()
     config = dict(
-        batch_num_tokens=float(weights.sum()) + 1.5,
+        kd_batch_num_tokens=float(weights.sum()) + 1.5,
         dp_size=2,
-        **_family(divergence, beta, ""),
+        **_family(divergence, beta, "kd_"),
     )
-    expected = (0.75 * nll + 0.25 * kd_sum) * 2 / config["batch_num_tokens"]
+    expected = (0.75 * nll + 0.25 * kd_sum) * 2 / config["kd_batch_num_tokens"]
     (expected_grad,) = torch.autograd.grad(expected, table)
 
     engine, result = _run(
@@ -213,7 +213,7 @@ def test_grouped_distillation_matches_float64_value_metrics_and_gradient(
         loss_fn="grouped_distillation",
         max_tokens_per_mb=max_tokens_per_mb,
         context_extra={
-            "loss_mask": weights,
+            "kd_mask": weights,
             "teacher_token_ids": frame["teacher_token_ids"].long(),
         },
         engine=_Bigram(frame["table"], grouped=grouped_head),
@@ -353,6 +353,37 @@ def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
     assert set(outputs) == {"logprobs"}
 
 
+def test_standalone_callbacks_use_public_kd_names():
+    frame = _frame()
+    request = {
+        "processing": {
+            "loss_fn": "grouped_distillation",
+            "config": {
+                "kd_coef": 0.5,
+                "kd_divergence": "jsd",
+                "kd_beta": 0.4,
+                "dp_size": 1,
+            },
+        },
+        "context": {"kd_mask": frame["kd_mask"]},
+    }
+    loss_object = resolve_loss("grouped_distillation")
+    loss_object.batching_callback(request)
+    config = request["processing"]["config"]
+
+    assert config["kd_batch_num_tokens"] == pytest.approx(float(frame["kd_mask"].sum()))
+    context = {key: frame[key] for key in _CONTEXT} | {"input_ids": frame["input_ids"]}
+    loss_object.validation_callback(context, config)
+
+    with pytest.raises(ValueError, match="lambda_kd"):
+        loss_object.validation_callback(context, {**config, "lambda_kd": 0.5})
+    with pytest.raises(ValueError, match="kd_mask"):
+        loss_object.validation_callback(
+            {key: value for key, value in context.items() if key != "kd_mask"},
+            config,
+        )
+
+
 def test_grpo_batching_and_objective_share_canonical_underflowed_weights():
     frame = _frame()
     kd_mask = torch.zeros_like(frame["kd_mask"], dtype=torch.float64)
@@ -439,7 +470,7 @@ def test_grpo_rejects_unknown_kd_config_even_when_kd_is_off(kd_coef):
 def test_teacher_tensor_leading_shapes_must_match_exactly():
     context = {
         "input_ids": torch.zeros(2, 3, dtype=torch.long),
-        "loss_mask": torch.ones(2, 3),
+        "kd_mask": torch.ones(2, 3),
         "teacher_token_ids": torch.zeros(2, 3, 1, dtype=torch.int32),
         "teacher_log_probs": torch.full((3, 2, 1), math.log(0.4)),
         "teacher_tail_log_prob": torch.full((3, 2), math.log(0.6)),
@@ -447,7 +478,7 @@ def test_teacher_tensor_leading_shapes_must_match_exactly():
     with pytest.raises(ValueError, match="teacher_log_probs shape"):
         resolve_loss("grouped_distillation").validation_callback(
             context,
-            {"batch_num_tokens": 6.0, "dp_size": 1},
+            {"kd_batch_num_tokens": 6.0, "dp_size": 1},
         )
 
 
@@ -456,8 +487,8 @@ def test_teacher_tensor_leading_shapes_must_match_exactly():
     [
         (
             "grouped_distillation",
-            "loss_mask",
-            {"batch_num_tokens": 2.0, "dp_size": 1},
+            "kd_mask",
+            {"kd_batch_num_tokens": 2.0, "dp_size": 1},
         ),
         (
             "grpo",
@@ -488,7 +519,7 @@ def test_teacher_candidate_dimension_must_be_at_least_one(loss_fn, weight_name, 
 def test_teacher_log_probabilities_require_real_floating_point_dtype(name, dtype):
     context = {
         "input_ids": torch.zeros(1, 2, dtype=torch.long),
-        "loss_mask": torch.ones(1, 2),
+        "kd_mask": torch.ones(1, 2),
         "teacher_token_ids": torch.zeros(1, 2, 1, dtype=torch.int32),
         "teacher_log_probs": torch.full((1, 2, 1), math.log(0.4)),
         "teacher_tail_log_prob": torch.full((1, 2), math.log(0.6)),
@@ -501,7 +532,7 @@ def test_teacher_log_probabilities_require_real_floating_point_dtype(name, dtype
     with pytest.raises(ValueError, match=rf"{name} must use a real floating-point dtype"):
         resolve_loss("grouped_distillation").validation_callback(
             context,
-            {"batch_num_tokens": 2.0, "dp_size": 1},
+            {"kd_batch_num_tokens": 2.0, "dp_size": 1},
         )
 
 
@@ -514,16 +545,16 @@ def test_full_logits_reject_active_teacher_ids_outside_student_vocabulary(diverg
     context = {
         "input_ids": torch.zeros(1, 1, dtype=torch.long),
         "labels": torch.ones(1, 1, dtype=torch.long),
-        "loss_mask": torch.ones(1, 1),
+        "kd_mask": torch.ones(1, 1),
         "teacher_token_ids": torch.tensor([[[3]]], dtype=torch.int32),
         "teacher_log_probs": torch.full((1, 1, 1), math.log(0.4)),
         "teacher_tail_log_prob": torch.full((1, 1), math.log(0.6)),
     }
     config = {
-        "batch_num_tokens": 1.0,
+        "kd_batch_num_tokens": 1.0,
         "dp_size": 1,
-        "divergence": divergence,
-        "beta": beta,
+        "kd_divergence": divergence,
+        "kd_beta": beta,
     }
     loss_object = resolve_loss("grouped_distillation")
     loss_object.validation_callback(context, config)
@@ -545,7 +576,7 @@ def test_unpacked_batch_size_one_standalone_loss_preserves_tensor_ranks():
     context = {
         "input_ids": frame["input_ids"][:1],
         "labels": frame["labels"][:1],
-        "loss_mask": frame["kd_mask"][:1],
+        "kd_mask": frame["kd_mask"][:1],
         **{name: frame[name][:1] for name in _TEACHER},
     }
     logits = frame["table"][context["input_ids"]].requires_grad_()
@@ -554,7 +585,7 @@ def test_unpacked_batch_size_one_standalone_loss_preserves_tensor_ranks():
         "logprobs": logits.log_softmax(-1).gather(-1, context["labels"][..., None]).squeeze(-1),
     }
     config = {
-        "batch_num_tokens": float(context["loss_mask"].sum()),
+        "kd_batch_num_tokens": float(context["kd_mask"].sum()),
         "dp_size": 1,
     }
     loss_object = resolve_loss("grouped_distillation")
@@ -565,7 +596,7 @@ def test_unpacked_batch_size_one_standalone_loss_preserves_tensor_ranks():
     assert loss.ndim == 0
     assert torch.isfinite(loss)
     assert metrics["kd_weight_sum"] == pytest.approx(
-        float(context["loss_mask"].sum()),
+        float(context["kd_mask"].sum()),
         rel=0,
         abs=1e-7,
     )
