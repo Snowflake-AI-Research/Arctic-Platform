@@ -124,6 +124,8 @@ def _config_with_microbatch_scales(processing: dict | None, microbatches: Sequen
 def resolve_packed_loss_reduction(
     processing: dict | None,
     microbatches: Sequence[dict],
+    *,
+    backward: bool | str = True,
 ) -> PackedLossReduction:
     """Resolve an objective's packed-microbatch reduction and preflight it."""
     n_mbs = len(microbatches)
@@ -134,9 +136,17 @@ def resolve_packed_loss_reduction(
     # It still catches hand-built or client-supplied microbatch lists.
     assert_aligned_global_loss_scales(microbatches)
 
-    loss_fn_name = (processing or {}).get("loss_fn", "ap_grpo")
-    if loss_fn_name is None:
-        return local_mean_packed_loss_reduction((1.0,) * n_mbs)
+    processing = processing or {}
+    if backward is False:
+        loss_fn_name = processing.get("loss_fn")
+        if loss_fn_name is None:
+            return local_mean_packed_loss_reduction((1.0,) * n_mbs)
+    else:
+        if "loss_fn" not in processing:
+            raise ValueError("processing requires 'loss_fn' when backward is not False")
+        loss_fn_name = processing["loss_fn"]
+        if loss_fn_name is None:
+            raise ValueError("processing['loss_fn'] is None but backward is not False")
 
     fn = resolve_fn(LOSS_FNS, loss_fn_name)
     resolver = getattr(fn, PACKED_LOSS_REDUCTION_ATTR, None)

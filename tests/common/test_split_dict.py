@@ -94,7 +94,11 @@ class TestSplitDictRemainder(TestCasePlus):
         shards, _ = _split_batch(envelope, num_workers=2)
         self.assertNotIn("rollout_is_weights", shards[0]["batch"])
         self.assertIsNone(shards[0]["meta"]["rollout_is_weights"])
+        self.assertEqual(shards[0]["batch"]["temperature"], 1.0)
+        self.assertEqual(shards[0]["meta"]["temperature"], 1.0)
         for k, v in shards[0]["batch"].items():
+            if k in {"temperature", "calculate_entropy"}:
+                continue
             getattr(v, "shape")
 
     def test_cortex_context_batch_dim_keys_land_in_batch(self):
@@ -122,6 +126,51 @@ class TestSplitDictRemainder(TestCasePlus):
         self.assertEqual(shards[0]["batch"]["prompt_group_ids"].tolist(), [7, 7])
         self.assertEqual(shards[1]["batch"]["prompt_group_ids"].tolist(), [8, 8])
         self.assertEqual(shards[0]["meta"], {"max_prompt_len": 3, "dp_size": 2})
+
+    def test_zero_dim_temperature_replicates_across_dp(self):
+        envelope = {
+            "batch": {
+                "input_ids": torch.arange(8).view(4, 2),
+                "attention_mask": torch.ones(4, 2, dtype=torch.long),
+            },
+            "meta": {"temperature": torch.tensor(1.5), "calculate_entropy": True},
+            "processing": {"loss_fn": "verl_grpo"},
+        }
+        shards, _ = _split_batch(envelope, num_workers=2)
+        for shard in shards:
+            self.assertEqual(float(shard["batch"]["temperature"]), 1.5)
+            self.assertTrue(shard["batch"]["calculate_entropy"])
+            self.assertEqual(float(shard["meta"]["temperature"]), 1.5)
+
+    def test_list_batch_promotes_aligned_labels_and_copies_scalars(self):
+        envelope = {
+            "batch": [
+                {"input_ids": torch.arange(2).view(1, 2)},
+                {"input_ids": torch.arange(2, 4).view(1, 2)},
+            ],
+            "meta": {
+                "labels": [torch.tensor([[1, -100]]), torch.tensor([[3, -100]])],
+                "temperature": 0.7,
+            },
+            "processing": {"loss_fn": "ap_grpo"},
+        }
+        _, batch_data, meta_data, _ = unpack_batch(envelope)
+        self.assertNotIn("labels", meta_data)
+        self.assertEqual(batch_data[0]["temperature"], 0.7)
+        self.assertEqual(batch_data[0]["labels"].tolist(), [[1, -100]])
+
+    def test_list_batch_raises_on_shared_meta_labels_tensor(self):
+        envelope = {
+            "batch": [
+                {"input_ids": torch.arange(2).view(1, 2)},
+                {"input_ids": torch.arange(2, 4).view(1, 2)},
+            ],
+            "meta": {"labels": torch.arange(4).view(2, 2)},
+            "processing": {"loss_fn": "ap_grpo"},
+        }
+        with self.assertRaises(ValueError) as ctx:
+            unpack_batch(envelope)
+        self.assertIn("list-shaped batch", str(ctx.exception))
 
 
 class TestDpSizeDividesBySp(TestCasePlus):

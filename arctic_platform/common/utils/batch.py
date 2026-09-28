@@ -100,6 +100,20 @@ BATCH_DIM_CONTEXT_KEYS = frozenset(
     }
 )
 
+# Model scalars that must reach engine() from batch after C1, but stay on meta
+# for posts (``apply_temperature_post`` reads ``meta["temperature"]``). Copy,
+# do not move. Never ``tensor_split`` a 0-d tensor of these.
+SCALAR_FWD_COPY_KEYS = frozenset({"temperature", "calculate_entropy"})
+
+
+def _copy_scalar_fwd_keys(batch_data: dict, meta_data: dict) -> None:
+    """Copy temperature / calculate_entropy between bags; delete nothing."""
+    for key in SCALAR_FWD_COPY_KEYS:
+        if key in meta_data and key not in batch_data:
+            batch_data[key] = meta_data[key]
+        elif key in batch_data and key not in meta_data:
+            meta_data[key] = batch_data[key]
+
 
 def promote_batch_dim_to_batch(batch_data: dict, meta_data: dict) -> tuple[dict, dict]:
     """Move batch-dim tensors from ``meta``/Cortex ``context`` into ``batch``.
@@ -122,12 +136,45 @@ def promote_batch_dim_to_batch(batch_data: dict, meta_data: dict) -> tuple[dict,
     return batch_data, meta_data
 
 
+def _promote_list_batch(batch_list: list, meta_data: dict) -> tuple[list, dict]:
+    """Copy scalars onto every GAS microbatch; promote labels or raise."""
+    meta_data = dict(meta_data)
+    promoted: list[dict] = []
+    meta_labels = meta_data.get("labels") if "labels" in meta_data else None
+    for index, microbatch in enumerate(batch_list):
+        if not isinstance(microbatch, dict):
+            raise TypeError(f"gas microbatch must be a dict of tensors, got {type(microbatch).__name__}")
+        microbatch = dict(microbatch)
+        _copy_scalar_fwd_keys(microbatch, meta_data)
+        if "labels" not in microbatch:
+            if isinstance(meta_labels, list):
+                if index >= len(meta_labels):
+                    raise ValueError(
+                        f"meta labels list has {len(meta_labels)} entries but "
+                        f"batch has {len(batch_list)} microbatches"
+                    )
+                microbatch["labels"] = meta_labels[index]
+            elif "labels" in meta_data:
+                raise ValueError(
+                    "labels on meta cannot be applied to a list-shaped batch; "
+                    "put per-microbatch labels on each element"
+                )
+        promoted.append(microbatch)
+    if "labels" in meta_data:
+        if all("labels" in microbatch for microbatch in promoted):
+            del meta_data["labels"]
+        else:
+            raise ValueError("labels remain on meta for a list-shaped batch")
+    return promoted, meta_data
+
+
 def unpack_batch(batch: dict) -> tuple:
     """Return ``(args, batch, meta, processing)``.
 
     Accepts AP ``{"batch", "meta", "processing"}`` and Cortex
     ``{"kwargs", "context", "processing"}``. Batch-dim keys in ``context`` /
-    ``meta`` are moved onto ``batch`` before DP split.
+    ``meta`` are moved onto ``batch`` before DP split. Forward scalars are
+    copied onto ``batch`` without removing the meta copies.
     """
     if "kwargs" in batch:
         batch_data = dict(batch.get("kwargs") or {})
@@ -140,14 +187,19 @@ def unpack_batch(batch: dict) -> tuple:
         if isinstance(batch_data, dict):
             batch_data = dict(batch_data)
 
-    if isinstance(batch_data, dict):
+    if isinstance(batch_data, list):
+        batch_data, meta_data = _promote_list_batch(batch_data, meta_data)
+    elif isinstance(batch_data, dict):
         batch_data, meta_data = promote_batch_dim_to_batch(batch_data, meta_data)
+        _copy_scalar_fwd_keys(batch_data, meta_data)
     return {}, batch_data, meta_data, processing
 
 
 def _split_value(val, num_chunks: int):
     """Split a tensor or list along the batch (first) dimension."""
     if isinstance(val, torch.Tensor):
+        if val.ndim == 0:
+            return [val] * num_chunks
         if val.shape[0] < num_chunks:
             raise ValueError(
                 f"Batch dimension {val.shape[0]} is smaller than num_workers "
