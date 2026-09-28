@@ -36,12 +36,19 @@ class ActivationOffloadConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    keep_last_n: int = Field(1, ge=0)
-    use_streams: bool = True
-    tensor_size_threshold: int | None = Field(None, ge=0)
-    pin_memory_enabled: bool = True
-    pin_memory_max_size_gib: PinMemoryMaxSize = "auto"
-    pin_memory_bucket_size_mib: PositiveInt = 64
+    enabled: bool = Field(False, description="Stream checkpointed block boundaries to CPU.")
+    keep_last_n: int = Field(1, ge=0, description="Boundaries to leave resident on GPU.")
+    use_streams: bool = Field(True, description="Overlap offload copies on side streams.")
+    tensor_size_threshold: int = Field(
+        1 << 20, ge=0, description="Minimum saved-tensor size in bytes to offload."
+    )
+    pin_memory_enabled: bool = Field(True, description="Use pinned host memory for activation offload.")
+    pin_memory_max_size_gib: PinMemoryMaxSize = Field(
+        "auto", description='Retained pinned-memory cache cap in GiB; "auto" sizes it from observed usage.'
+    )
+    pin_memory_bucket_size_mib: PositiveInt = Field(
+        64, description="Pinned-buffer allocation bucket size in MiB for reuse across variable sequence lengths."
+    )
 
     @field_validator("pin_memory_max_size_gib")
     @classmethod
@@ -71,23 +78,14 @@ class ActivationCheckpointConfig(BaseModel):
     mode: Literal["full", "selective"] = Field("full", description="Recompute whole blocks or selected targets.")
     freq: PositiveInt = Field(1, description="Checkpoint every Nth block.")
     targets: list[str] = Field(default_factory=lambda: ["norm"], description="Submodules to checkpoint (selective).")
-    offload_config: ActivationOffloadConfig | None = Field(
-        None, description="CPU offload of checkpointed boundaries; None disables it."
+    offload_config: ActivationOffloadConfig = Field(
+        default_factory=ActivationOffloadConfig, description="CPU offload of checkpointed boundaries."
     )
     router_replay_recompute: bool = Field(True, description="Deterministic MoE routing across recompute.")
 
-    @field_validator("offload_config", mode="before")
-    @classmethod
-    def _normalize_legacy_offload_config(cls, value):
-        if not isinstance(value, dict):
-            return value
-        value = dict(value)
-        enabled = value.pop("enabled", True)
-        return value if enabled else None
-
     @model_validator(mode="after")
     def _validate_offload_mode(self) -> Self:
-        if self.offload_config is not None and self.mode != "full":
+        if self.offload_config.enabled and self.mode != "full":
             raise ValueError("activation offload requires activation checkpointing mode='full'")
         return self
 

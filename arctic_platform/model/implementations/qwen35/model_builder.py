@@ -654,7 +654,7 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
     fallback_layer_types: set[str] = set()
     model_supported_targets: set[str] = set()
 
-    if ac_config.offload_config is not None:
+    if ac_config.offload_config.enabled:
         install_activation_offload(model, config=ac_config.offload_config)
         logger.info(
             "Activation CPU offload enabled (saved-tensor hooks, "

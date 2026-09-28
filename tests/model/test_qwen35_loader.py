@@ -87,7 +87,7 @@ def test_loader_preserves_options_and_process_groups(monkeypatch, backend):
         {"tiled_mlp_token_chunk_size": 0},
         {"ac_config": {"freq": 0}},
         {"ac_config": {"offload_config": {"pin_memory_max_size_gib": -1}}},
-        {"ac_config": {"mode": "selective", "offload_config": {}}},
+        {"ac_config": {"mode": "selective", "offload_config": {"enabled": True}}},
         {"fused_cross_entropy": "liger", "fused_lm_head_token_chunk_size": 128},
     ],
 )
@@ -136,10 +136,11 @@ def test_generic_forward_patches_are_rejected(patches):
         ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", patches=patches)
 
 
-def test_legacy_disabled_offload_normalizes_to_none():
-    options = Qwen3_5MoeOptions(ac_config={"offload_config": {"enabled": False}})
+def test_activation_offload_defaults_to_disabled():
+    options = Qwen3_5MoeOptions(ac_config={"offload_config": {}})
     assert options.ac_config is not None
-    assert options.ac_config.offload_config is None
+    assert options.ac_config.offload_config.enabled is False
+    assert options.ac_config.offload_config.tensor_size_threshold == 1 << 20
 
 
 def test_runtime_config_is_derived_from_validated_options():
@@ -151,6 +152,7 @@ def test_runtime_config_is_derived_from_validated_options():
         ac_config={
             "freq": 2,
             "offload_config": {
+                "enabled": True,
                 "keep_last_n": 3,
                 "pin_memory_max_size_gib": 0,
             },
@@ -172,6 +174,7 @@ def test_runtime_config_is_derived_from_validated_options():
     assert config.attn == "sdpa"
     assert config.ep_comm_backend == "uccl"
     assert config.ac is options.ac_config
+    assert config.ac.offload_config.enabled is True
     assert config.ac.offload_config.keep_last_n == 3
 
 
