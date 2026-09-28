@@ -63,15 +63,9 @@ def _ulysses_attn_forward(self, hidden_states, position_embeddings, cu_seqlens=N
         value_states = value_states.repeat_interleave(kv_replication, dim=2)
 
     # [B, S_local, n_heads, hd] -> [B, S_full, n_heads/sp, hd]
-    query_states = sequence_head_all_to_all(
-        group, query_states, scatter_dim=2, gather_dim=1
-    )
-    key_states = sequence_head_all_to_all(
-        group, key_states, scatter_dim=2, gather_dim=1
-    )
-    value_states = sequence_head_all_to_all(
-        group, value_states, scatter_dim=2, gather_dim=1
-    )
+    query_states = sequence_head_all_to_all(group, query_states, scatter_dim=2, gather_dim=1)
+    key_states = sequence_head_all_to_all(group, key_states, scatter_dim=2, gather_dim=1)
+    value_states = sequence_head_all_to_all(group, value_states, scatter_dim=2, gather_dim=1)
 
     # Global boundaries stashed by the backbone wrapper; fall back to the passed-in locals.
     full_cu_seqlens = getattr(self, "_sp_cu_seqlens", None)
@@ -91,9 +85,7 @@ def _ulysses_attn_forward(self, hidden_states, position_embeddings, cu_seqlens=N
 
     # All-to-all back to [B=1, S_local, n_heads, hd], then drop batch for output_proj's 3-D path.
     attn_output = attn_output.unsqueeze(0)
-    attn_output = sequence_head_all_to_all(
-        group, attn_output, scatter_dim=1, gather_dim=2
-    )
+    attn_output = sequence_head_all_to_all(group, attn_output, scatter_dim=1, gather_dim=2)
     attn_output = attn_output.squeeze(0)
 
     return self.output_proj(attn_output, gate), None

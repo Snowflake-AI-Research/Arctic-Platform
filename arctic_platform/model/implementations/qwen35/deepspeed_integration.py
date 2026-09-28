@@ -47,13 +47,9 @@ from arctic_platform.model.implementations.debug.row_invariant_projection import
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
 
-def shared_expert_mlp_forward(
-    feed_forward: FeedForward, hidden_states: torch.Tensor
-) -> torch.Tensor:
+def shared_expert_mlp_forward(feed_forward: FeedForward, hidden_states: torch.Tensor) -> torch.Tensor:
     """Un-tiled dense shared-expert FFN compute (``w2(silu(w1 x) * w3 x)``), run per token shard by TiledMLP."""
-    return feed_forward.w2(
-        F.silu(feed_forward.w1(hidden_states)) * feed_forward.w3(hidden_states)
-    )
+    return feed_forward.w2(F.silu(feed_forward.w1(hidden_states)) * feed_forward.w3(hidden_states))
 
 
 def _convert_qwen3_5_moe_layer_to_vllm(
@@ -99,9 +95,7 @@ def _convert_qwen3_5_moe_layer_to_vllm(
     if qkv_key in layer_sd and z_key in layer_sd:
         qkv = layer_sd.pop(qkv_key)
         z = layer_sd.pop(z_key)
-        layer_sd[f"{prefix}.linear_attn.in_proj_qkvz.weight"] = torch.cat(
-            [qkv, z], dim=0
-        )
+        layer_sd[f"{prefix}.linear_attn.in_proj_qkvz.weight"] = torch.cat([qkv, z], dim=0)
 
     b_key = f"{prefix}.linear_attn.in_proj_b.weight"
     a_key = f"{prefix}.linear_attn.in_proj_a.weight"
@@ -119,11 +113,11 @@ def _convert_qwen3_5_moe_layer_to_vllm(
 def _to_vllm_vlm_name(name: str) -> str:
     """Rename a Prime-RL VLM parameter key to vLLM's VLM internal layout."""
     if name.startswith("model.visual."):
-        return "visual." + name[len("model.visual.") :]
+        return "visual." + name[len("model.visual."):]
     if name.startswith("model.language_model."):
-        return "language_model.model." + name[len("model.language_model.") :]
+        return "language_model.model." + name[len("model.language_model."):]
     if name.startswith("lm_head."):
-        return "language_model.lm_head." + name[len("lm_head.") :]
+        return "language_model.lm_head." + name[len("lm_head."):]
     raise RuntimeError(
         f"_to_vllm_vlm_name: no Prime-RL -> vLLM VLM rule for parameter "
         f"name {name!r}. Either Prime-RL grew a new top-level submodule "
@@ -145,9 +139,7 @@ def _build_iter_full_vllm_weights(model: nn.Module):
     import torch.distributed as dist
 
     is_vlm = bool(getattr(model, "_is_vlm", False))
-    layer_prefix_pattern = (
-        "model.language_model.layers.{i}" if is_vlm else "model.layers.{i}"
-    )
+    layer_prefix_pattern = "model.language_model.layers.{i}" if is_vlm else "model.layers.{i}"
 
     def _strip_ac_wrapper(name: str) -> str:
         return name.replace("._checkpoint_wrapped_module", "")
@@ -185,16 +177,10 @@ def _build_iter_full_vllm_weights(model: nn.Module):
         for layer_idx in ordered_layers:
             layer_sd: dict[str, torch.Tensor] = {}
             for name, param in by_layer[layer_idx]:
-                if (
-                    hasattr(param, "group_name")
-                    and getattr(param, "allreduce", True) is False
-                ):
+                if hasattr(param, "group_name") and getattr(param, "allreduce", True) is False:
                     ep_pg = ds_groups._get_expert_parallel_group(param.group_name)
                     local = param.data.contiguous()
-                    shards = [
-                        torch.empty_like(local)
-                        for _ in range(dist.get_world_size(group=ep_pg))
-                    ]
+                    shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_pg))]
                     dist.all_gather(shards, local, group=ep_pg)
                     if is_master:
                         layer_sd[name] = torch.cat(shards, dim=0)
@@ -209,9 +195,7 @@ def _build_iter_full_vllm_weights(model: nn.Module):
             _convert_qwen3_5_moe_layer_to_vllm(
                 layer_sd,
                 layer_idx,
-                layer_prefix=(
-                    layer_prefix_pattern.format(i=layer_idx) if layer_idx >= 0 else None
-                ),
+                layer_prefix=layer_prefix_pattern.format(i=layer_idx) if layer_idx >= 0 else None,
             )
 
             for name, tensor in layer_sd.items():

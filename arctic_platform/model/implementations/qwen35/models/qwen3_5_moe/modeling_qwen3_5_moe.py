@@ -16,10 +16,7 @@ from transformers.utils import TransformersKwargs, logging
 from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
 from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
-
-from arctic_platform.model.implementations.gpu.sp.gated_delta_net import (
-    head_parallel_gated_delta_net,
-)
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import head_parallel_gated_delta_net
 
 from ..base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
@@ -303,11 +300,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 if cu_seqlens is not None:
                     seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
                     seq_idx = torch.repeat_interleave(
-                        torch.arange(
-                            seg_lens.numel(),
-                            dtype=torch.int32,
-                            device=hidden_states.device,
-                        ),
+                        torch.arange(seg_lens.numel(), dtype=torch.int32, device=hidden_states.device),
                         seg_lens,
                     ).unsqueeze(0)
                 mixed_qkv = self._causal_conv1d_fn(
@@ -323,27 +316,15 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 for start, stop in zip(cu[:-1], cu[1:], strict=True):
                     if start == stop:
                         continue
-                    conv_outs.append(
-                        self.conv1d(mixed_qkv[:, :, start:stop])[:, :, : stop - start]
-                    )
+                    conv_outs.append(self.conv1d(mixed_qkv[:, :, start:stop])[:, :, : stop - start])
                 mixed_qkv = F.silu(torch.cat(conv_outs, dim=-1))
             else:
                 mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
             mixed_qkv = mixed_qkv.transpose(1, 2)
-            query, key, value = torch.split(
-                mixed_qkv,
-                [self.key_dim, self.key_dim, self.value_dim],
-                dim=-1,
-            )
-            query = query.reshape(
-                batch_size, seq_len, self.num_k_heads, self.head_k_dim
-            )
-            key = key.reshape(
-                batch_size, seq_len, self.num_k_heads, self.head_k_dim
-            )
-            value = value.reshape(
-                batch_size, seq_len, self.num_v_heads, self.head_v_dim
-            )
+            query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+            key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+            value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
             beta = b.sigmoid()
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
             if self.num_v_heads // self.num_k_heads > 1:
@@ -711,10 +692,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
         bs, slen, dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, dim)
         shared_output = self.shared_expert(hidden_flat)
-        shared_output = _shared_expert_gate(
-            hidden_flat,
-            self.shared_expert_gate,
-        ) * shared_output
+        shared_output = _shared_expert_gate(hidden_flat, self.shared_expert_gate) * shared_output
         shared_output = shared_output.view(bs, slen, dim)
 
         hidden_states = residual + routed_output + shared_output

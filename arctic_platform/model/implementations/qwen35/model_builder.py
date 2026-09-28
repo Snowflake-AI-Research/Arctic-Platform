@@ -681,9 +681,7 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
                 # Install before the checkpoint wrap so only checkpointed blocks capture; see
                 # router_replay_recompute.py.
                 replay_wrapped_routers += install_self_router_replay(transformer_block)
-            transformer_block = checkpoint_wrapper(
-                transformer_block, preserve_rng_state=CHECKPOINT_PRESERVE_RNG_STATE
-            )
+            transformer_block = checkpoint_wrapper(transformer_block, preserve_rng_state=CHECKPOINT_PRESERVE_RNG_STATE)
             full_layers += 1
 
         language_model.layers.register_module(layer_name, transformer_block)
