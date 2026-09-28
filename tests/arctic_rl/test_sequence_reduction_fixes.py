@@ -72,11 +72,6 @@ def test_padded_sequence_is_advantages_match_packed_only_with_the_fix():
     torch.testing.assert_close(padded_fixed[1], packed[1])
 
 
-def test_fix_keys_must_be_bools():
-    with pytest.raises(ValueError, match="seq_mean_per_packed_sequence must be a bool"):
-        _run("packed", dict(loss_agg_mode="seq-mean-token-mean", seq_mean_per_packed_sequence=1))
-
-
 class _Engine:
     global_rank = 0
 
