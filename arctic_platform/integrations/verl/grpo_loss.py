@@ -35,6 +35,8 @@ from typing import Optional
 
 import torch
 
+from arctic_platform.common.registry import declare_loss_capabilities
+from arctic_platform.rl.processors.base_loss import REQUIRES_TOKEN_LOGPROBS
 from arctic_platform.rl.processors.pipeline import register_loss_fn
 
 
@@ -413,6 +415,7 @@ class VerlPolicyConfig:
 
 
 @register_loss_fn("verl_grpo")
+@declare_loss_capabilities(REQUIRES_TOKEN_LOGPROBS)
 def verl_grpo_loss(model_outputs: dict, batch: dict, meta: dict, config: dict, device: str):
     actor_config = meta.get("actor_config", {})
     policy_loss_config = meta.get("policy_loss_config", {})
