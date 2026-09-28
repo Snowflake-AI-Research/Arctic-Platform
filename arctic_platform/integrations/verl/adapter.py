@@ -866,13 +866,11 @@ class ArcticRLClientWrapper(RemoteBackend):
             payload["batch"]["loss_mask"] = payload["batch"]["response_mask"]
             from arctic_platform.integrations.verl.cortex_payload import _drop_old_log_probs
 
-            n_dp = int(self._backend_config.get("training_gpus", 4))
-            processing = dict(payload.get("processing") or {})
-            proc_cfg = dict(processing.get("config") or {})
-            proc_cfg["dp_size"] = n_dp
-            processing["config"] = proc_cfg
-            payload["processing"] = processing
-            print(f"[parity] cortex fwd_bwd dp_size={n_dp}", flush=True)
+            # Client never sends dp_size: the zone defaults processing.config.dp_size
+            # to 1, and batch_num_tokens/global_batch_size (already in payload["meta"]
+            # from _update_actor's meta_chunk) are the correct normalizers regardless
+            # of DP width. Guessing dp_size from training_gpus was wrong whenever the
+            # zone's actual worker count differed from the client's configured GPU count.
             cx = to_cortex_fwd_bwd_payload(payload)
             old_lp_shifted = cx["context"].get("old_log_probs_shifted")
             if old_lp_shifted is None and not _drop_old_log_probs():
