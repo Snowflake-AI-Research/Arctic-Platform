@@ -39,9 +39,7 @@ class ActivationOffloadConfig(BaseModel):
     enabled: bool = Field(False, description="Stream checkpointed block boundaries to CPU.")
     keep_last_n: int = Field(1, ge=0, description="Boundaries to leave resident on GPU.")
     use_streams: bool = Field(True, description="Overlap offload copies on side streams.")
-    tensor_size_threshold: int = Field(
-        1 << 20, ge=0, description="Minimum saved-tensor size in bytes to offload."
-    )
+    tensor_size_threshold: int = Field(1 << 20, ge=0, description="Minimum saved-tensor size in bytes to offload.")
     pin_memory_enabled: bool = Field(True, description="Use pinned host memory for activation offload.")
     pin_memory_max_size_gib: PinMemoryMaxSize = Field(
         "auto", description='Retained pinned-memory cache cap in GiB; "auto" sizes it from observed usage.'
