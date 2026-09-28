@@ -51,7 +51,11 @@ def _sequence_parallel_sum(*totals: torch.Tensor, group) -> tuple[torch.Tensor, 
 
 
 def _masked_values(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    return torch.where(mask.bool(), values, 0.0)
+    return torch.where(mask.bool(), values, torch.zeros_like(values))
+
+
+def _safe_masked_operand(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return torch.where(mask.bool(), values, torch.zeros_like(values))
 
 
 def canonicalize_loss_mask(
@@ -127,7 +131,6 @@ def _packed_per_sequence_sums(
     sequence_idx = torch.repeat_interleave(
         torch.arange(num_sequences, device=device),
         (cu_seqlens[1:] - cu_seqlens[:-1]).long(),
-        output_size=total_tokens,
     )
     sums = [value.new_zeros(num_sequences).scatter_add_(0, sequence_idx, value.reshape(-1)) for value in values]
     return sequence_idx, sums
@@ -865,8 +868,8 @@ def cispo_actor_loss_fn(
         ratio = torch.where(loss_mask, torch.exp(log_ratio), torch.zeros_like(log_ratio))
     else:
         raise ValueError(f"Invalid importance_sampling_level: {importance_sampling_level}.")
-    advantages = _masked_values(advantages, loss_mask)
-    logprobs = _masked_values(logprobs, loss_mask)
+    advantages = _safe_masked_operand(advantages, loss_mask)
+    logprobs = _safe_masked_operand(logprobs, loss_mask)
 
     if is_weight_clip_max is not None:
         if is_weight_clip_max <= 0.0:
@@ -892,7 +895,7 @@ def cispo_actor_loss_fn(
     behav_imp_weight = torch.where(behav_mask, behav_imp_weight, 0.0)
     pg_loss = pg_loss * behav_imp_weight
     if rollout_is_weights is not None:
-        pg_loss = pg_loss * _masked_values(rollout_is_weights, loss_mask)
+        pg_loss = pg_loss * _safe_masked_operand(rollout_is_weights, loss_mask)
     pg_loss = _masked_values(pg_loss, loss_mask)
 
     logging_loss = pg_loss.detach()
