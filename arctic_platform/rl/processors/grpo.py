@@ -241,6 +241,8 @@ def _internal_grpo_loss_fn(
     aux_ce_weight: float | None = None,
     echo_global_num_sequences: int | None = None,
     echo_batch_denominator: str = EchoBatchDenominator.ALL_SEQUENCES.value,
+    seq_mean_per_packed_sequence: bool = False,
+    sequence_is_masked_advantages: bool = False,
 ) -> Tuple[torch.Tensor, dict]:
     """Internal GRPO loss — same interface as dss/loss_fns/grpo.py."""
     dp_size = _resolve_dp_size(dp_size, batch_num_tokens)
@@ -345,6 +347,8 @@ def _internal_grpo_loss_fn(
                 prompt_group_ids=prompt_group_ids,
                 prompt_token_counts=prompt_token_counts,
                 sequence_loss_weights=sequence_loss_weights,
+                seq_mean_per_packed_sequence=seq_mean_per_packed_sequence,
+                sequence_is_masked_advantages=sequence_is_masked_advantages,
             )
         elif use_cispo_loss:
             loss, stat = cispo_actor_loss_fn(
@@ -367,6 +371,8 @@ def _internal_grpo_loss_fn(
                 prompt_group_ids=prompt_group_ids,
                 prompt_token_counts=prompt_token_counts,
                 sequence_loss_weights=sequence_loss_weights,
+                seq_mean_per_packed_sequence=seq_mean_per_packed_sequence,
+                sequence_is_masked_advantages=sequence_is_masked_advantages,
             )
         else:
             loss, stat = ppo_actor_loss_fn(
@@ -389,6 +395,8 @@ def _internal_grpo_loss_fn(
                 prompt_group_ids=prompt_group_ids,
                 prompt_token_counts=prompt_token_counts,
                 sequence_loss_weights=sequence_loss_weights,
+                seq_mean_per_packed_sequence=seq_mean_per_packed_sequence,
+                sequence_is_masked_advantages=sequence_is_masked_advantages,
             )
 
         if entropy_coeff != 0.0:
@@ -403,6 +411,7 @@ def _internal_grpo_loss_fn(
                 prompt_token_counts=prompt_token_counts,
                 sequence_loss_weights=sequence_loss_weights,
                 cu_seqlens=input_data.get("cu_seqlens"),
+                seq_mean_per_packed_sequence=seq_mean_per_packed_sequence,
             )
             loss = loss + entropy_coeff * entropy_loss
 
@@ -422,6 +431,7 @@ def _internal_grpo_loss_fn(
                 prompt_token_counts=prompt_token_counts,
                 sequence_loss_weights=sequence_loss_weights,
                 cu_seqlens=input_data.get("cu_seqlens"),
+                seq_mean_per_packed_sequence=seq_mean_per_packed_sequence,
             )
             loss = loss + kl_loss_coef * kl_loss
 
@@ -554,6 +564,8 @@ _GRPO_CONFIG_DEFAULTS: dict[str, Any] = {
     "use_kl_loss": False,
     "kl_loss_coef": 0.001,
     "kl_loss_type": "low_var_kl",
+    "seq_mean_per_packed_sequence": False,
+    "sequence_is_masked_advantages": False,
 }
 _ECHO_CONFIG_DEFAULTS: dict[str, Any] = {
     "aux_ce_weight": None,
@@ -570,6 +582,14 @@ def _grpo_config_values(config: dict) -> dict:
     values = {**_GRPO_CONFIG_DEFAULTS, **_ECHO_CONFIG_DEFAULTS}
     values.update((key, config[key]) for key in values.keys() & config.keys())
     return values
+
+def _config_flag(config: dict, key: str) -> bool:
+    value = config.get(key, False)
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a bool, got {value!r}")
+    return value
+
+
 
 
 def _grpo_loss(
@@ -615,6 +635,10 @@ def _grpo_loss(
         ``entropy_coeff`` (default 0.0; subtract entropy bonus from loss),
         ``use_kl_loss`` (default False; add KL penalty vs ``ref_log_probs`` in context),
         ``kl_loss_coef`` (default 0.001), ``kl_loss_type`` (default "low_var_kl"),
+        ``seq_mean_per_packed_sequence`` (default False: the ``seq-mean-*`` modes reduce the last dimension,
+        so a packed ``[T]`` frame is one sequence; True reduces per ``cu_seqlens`` sequence),
+        ``sequence_is_masked_advantages`` (default False: padded sequence-level IS averages advantages over
+        every position; True averages over loss-mask positions, as the packed path does),
         ``aux_ce_weight`` (λ of the ECHO Environment-Prediction auxiliary
         loss, arXiv 2605.24517, IN PAPER UNITS: set it exactly as the paper's
         λ — the implementation compensates for the aggregation mode's
@@ -645,6 +669,8 @@ def _grpo_loss(
     """
     values = _grpo_config_values(config)
     values["dp_size"] = _resolve_dp_size(values["dp_size"], values["batch_num_tokens"])
+    values["seq_mean_per_packed_sequence"] = _config_flag(config, "seq_mean_per_packed_sequence")
+    values["sequence_is_masked_advantages"] = _config_flag(config, "sequence_is_masked_advantages")
 
     logprobs = model_outputs.get("logprobs")
     if logprobs is None:

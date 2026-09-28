@@ -25,8 +25,29 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_autograd
+from deepspeed.utils import groups
 
 _GLOBAL_LOSS_SCALE_KEYS = ("dp_size", "batch_num_tokens", "global_batch_size")
+
+
+def _get_sequence_parallel_group():
+    if dist.is_initialized() and groups._get_sequence_parallel_world_size() > 1:
+        return groups._get_sequence_parallel_group()
+    return None
+
+
+def _sequence_parallel_sum(*totals: torch.Tensor, group) -> tuple[torch.Tensor, ...]:
+    """Add up per-sequence totals over the group's token windows, in one collective.
+
+    The all-reduce is the autograd-aware one: every rank's loss reads the reduced total, so a
+    token's gradient owes a term to each rank that read it, and only a reduction in backward can
+    collect those terms. Reducing in forward alone leaves each window with its own share of that
+    gradient and drops the rest.
+    """
+    stacked = torch.stack([total.to(totals[0].dtype) for total in totals])
+    stacked = dist_autograd.all_reduce(stacked, group=group)
+    return tuple(stacked.unbind())
 
 
 def _masked_values(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -200,6 +221,28 @@ def resolve_global_loss_scale(
     return out
 
 
+def _explicit_zero_step_count(name: str, loss_mask: torch.Tensor) -> int:
+    """Validate that an explicit zero global count matches this call."""
+    if loss_mask.any():
+        raise ValueError(f"{name}=0 declares a step with no policy tokens, but this call has some.")
+    return 1
+
+
+def _per_sequence_sum_and_count(
+    loss_mat: torch.Tensor, loss_mask: torch.Tensor, cu_seqlens: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-sequence masked loss sums and token counts; ``[T]`` and ``[1, T]`` with ``cu_seqlens`` are packed."""
+    if cu_seqlens is not None and (loss_mat.ndim == 1 or loss_mat.shape[0] == 1):
+        flat_loss = loss_mat if loss_mat.ndim == 1 else loss_mat[0]  # [T]
+        flat_mask = loss_mask if loss_mask.ndim == 1 else loss_mask[0]  # [T]
+        _, (seq_sum, seq_cnt) = _packed_per_sequence_sums(
+            cu_seqlens, _masked_values(flat_loss, flat_mask), flat_mask.to(flat_loss.dtype)
+        )
+        return seq_sum, seq_cnt
+    seq_sum = _masked_values(loss_mat, loss_mask).sum(dim=-1)
+    return seq_sum, loss_mask.sum(dim=-1).to(seq_sum.dtype)
+
+
 def agg_loss(
     loss_mat: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -212,6 +255,7 @@ def agg_loss(
     prompt_token_counts: Optional[torch.Tensor] = None,
     sequence_loss_weights: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    seq_mean_per_packed_sequence: bool = False,
 ) -> torch.Tensor:
     """Aggregate a per-token loss matrix into a scalar.
 
@@ -236,12 +280,46 @@ def agg_loss(
     default to local counts when omitted. ``prompt-mean`` intentionally does
     not multiply by ``dp_size`` so DeepSpeed's DP gradient averaging matches
     native POC prompt-average weighting.
+
+    Under sequence parallelism a packed caller holds one token window of the
+    frame and passes the boundaries of that window: one segment per sequence,
+    covering the window exactly, so a sequence split across ranks has a
+    partial segment on each and a sequence a rank never reaches has an empty
+    one. ``prompt-mean`` reduces the per-sequence token counts over the
+    sequence-parallel group before dividing, and leaves the sums local
+    because the ranks' losses are summed.
+
+    The ``seq-mean-*`` modes reduce the last dimension, so a packed ``[T]``
+    frame counts as one sequence. ``seq_mean_per_packed_sequence=True`` makes
+    them reduce per ``cu_seqlens`` sequence instead, with the same
+    sequence-parallel count reduction as ``prompt-mean``; the default keeps the
+    row reduction unchanged.
     """
     dp_size = _resolve_dp_size(dp_size, batch_num_tokens)
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             batch_num_tokens = loss_mask.count_nonzero() or 1
         loss = (torch.where(loss_mask.bool(), loss_mat, 0.0).sum() / batch_num_tokens) * dp_size
+
+    elif seq_mean_per_packed_sequence and loss_agg_mode in (
+        "seq-mean-token-sum", "seq-mean-token-sum-norm", "seq-mean-token-mean"
+    ):
+        seq_sum, seq_cnt = _per_sequence_sum_and_count(loss_mat, loss_mask, cu_seqlens)
+        sp_group = _get_sequence_parallel_group()
+        if sp_group is not None:
+            # Local numerators over group-wide counts, as in prompt-mean: the ranks' losses are summed.
+            dist.all_reduce(seq_cnt, op=dist.ReduceOp.SUM, group=sp_group)
+        seq_mask = (seq_cnt > 0).to(seq_sum.dtype)
+        seq_losses = seq_sum / seq_cnt.clamp(min=1) if loss_agg_mode == "seq-mean-token-mean" else seq_sum
+        if global_batch_size is None:
+            global_batch_size = seq_mask.sum().clamp(min=1)
+        elif global_batch_size == 0:
+            global_batch_size = _explicit_zero_step_count(
+                "global_batch_size", loss_mask
+            )
+        loss = ((seq_losses * seq_mask).sum() / global_batch_size) * dp_size
+        if loss_agg_mode == "seq-mean-token-sum-norm":
+            loss = loss / (loss_mask.shape[-1] if loss_scale_factor is None else loss_scale_factor)
 
     elif loss_agg_mode in ("seq-mean-token-sum", "seq-mean-token-sum-norm"):
         seq_losses = (loss_mat * loss_mask).sum(dim=-1)
@@ -263,24 +341,15 @@ def agg_loss(
         loss = ((seq_losses * seq_mask).sum() / global_batch_size) * dp_size
 
     elif loss_agg_mode == "prompt-mean":
-        # When sequences are packed ([1, T] with cu_seqlens present), recover
-        # per-rollout sums using cu_seqlens segment boundaries, then group.
-        # In the non-packed [B, S] case, sum(dim=-1) gives one value per rollout.
-        # Packed input arrives as canonical 1-D [T] (the loss entry squeezes
-        # pack_sequences' singleton [1, T] form) or as [1, T] from direct
-        # callers — treat both as packed; only genuinely padded B > 1 rows
-        # take the per-row reduction below.
-        if cu_seqlens is not None and (loss_mat.ndim == 1 or loss_mat.shape[0] == 1):
-            flat_loss = loss_mat if loss_mat.ndim == 1 else loss_mat[0]  # [T]
-            flat_mask = loss_mask if loss_mask.ndim == 1 else loss_mask[0]  # [T]
-            _, (seq_sum, seq_cnt) = _packed_per_sequence_sums(
-                cu_seqlens,
-                _masked_values(flat_loss, flat_mask),
-                flat_mask.to(flat_loss.dtype),
-            )
-        else:
-            seq_sum = _masked_values(loss_mat, loss_mask).sum(dim=-1)
-            seq_cnt = loss_mask.sum(dim=-1).to(seq_sum.dtype)
+        sp_group = _get_sequence_parallel_group()
+        seq_sum, seq_cnt = _per_sequence_sum_and_count(loss_mat, loss_mask, cu_seqlens)
+        if sp_group is not None:
+            # A sequence split across windows has a partial count on every rank that holds
+            # part of it, so each rank would otherwise divide by a fraction of the
+            # sequence's length and the summed losses would count it once per window. The
+            # sums stay local: the ranks' losses are summed, so a local numerator over the
+            # group-wide count contributes each token exactly once.
+            dist.all_reduce(seq_cnt, op=dist.ReduceOp.SUM, group=sp_group)
 
         if sequence_loss_weights is not None:
             weights = sequence_loss_weights.to(loss_mat.device).to(seq_sum.dtype).reshape(-1)
@@ -305,6 +374,8 @@ def agg_loss(
             t = torch.tensor(local_P, device=loss_mat.device, dtype=torch.long)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
             global_num_prompts = int(t.item())
+            if sp_group is not None:
+                global_num_prompts //= dist.get_world_size(sp_group)
         else:
             global_num_prompts = local_P
 
@@ -561,7 +632,24 @@ def _compute_sequence_level_ratio_and_advantages(
     advantages: torch.Tensor,
     loss_mask: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
+    masked_advantages: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Give every token of a sequence that sequence's mean importance ratio and mean
+    advantage.
+
+    Under sequence parallelism a rank holds one token window of the frame, so each total
+    below covers only the part of a sequence inside that window. The mean has to be the
+    whole sequence's: the ratio is the exponential of it, and exp of a partial mean is not
+    a factor of the whole one, so numerators and denominators are both reduced over the
+    group before the division. Window boundaries carry one segment per row -- empty for a
+    row the window never reaches -- so the per-sequence vectors align elementwise across
+    ranks and reduce as they are.
+
+    The padded branch sums advantages over every position, masked ones included, while the
+    packed branch sums over loss-mask positions only; ``masked_advantages=True`` makes the
+    padded branch mask too.
+    """
+    sp_group = _get_sequence_parallel_group()
     if log_ratio.ndim == 1:
         if cu_seqlens is None:
             raise ValueError("cu_seqlens is required for 1D tensors (packed format).")
@@ -571,6 +659,12 @@ def _compute_sequence_level_ratio_and_advantages(
             torch.where(loss_mask, advantages, 0.0),
             loss_mask.int(),
         )
+        if sp_group is not None:
+            log_ratio_sum_per_seq, advantages_sum_per_seq, valid_count_per_seq = _sequence_parallel_sum(
+                log_ratio_sum_per_seq, advantages_sum_per_seq, valid_count_per_seq, group=sp_group
+            )
+        # Clamping before the reduction would turn each empty window into a token,
+        # inflating the divisor.
         valid_count_per_seq = valid_count_per_seq.clamp(min=1)
         log_ratio_mean_per_seq = log_ratio_sum_per_seq / valid_count_per_seq.to(log_ratio.dtype)
         adv_mean_per_seq = advantages_sum_per_seq / valid_count_per_seq.to(advantages.dtype)
@@ -579,11 +673,20 @@ def _compute_sequence_level_ratio_and_advantages(
         advantages = adv_mean_per_seq[sequence_idx]
         advantages = torch.where(loss_mask, advantages, 0.0)
     else:
-        seq_log_ratio_mean = torch.where(loss_mask, log_ratio, 0.0).sum(dim=1) / loss_mask.sum(dim=1).clamp(min=1)
+        log_ratio_sum_per_seq = torch.where(loss_mask, log_ratio, 0.0).sum(dim=1)
+        advantages_sum_per_seq = (
+            torch.where(loss_mask, advantages, 0.0) if masked_advantages else advantages
+        ).sum(dim=-1)
+        valid_count_per_seq = loss_mask.sum(dim=1)
+        if sp_group is not None:
+            log_ratio_sum_per_seq, advantages_sum_per_seq, valid_count_per_seq = _sequence_parallel_sum(
+                log_ratio_sum_per_seq, advantages_sum_per_seq, valid_count_per_seq, group=sp_group
+            )
+        valid_count_per_seq = valid_count_per_seq.clamp(min=1)
+        seq_log_ratio_mean = log_ratio_sum_per_seq / valid_count_per_seq
         ratio = torch.exp(seq_log_ratio_mean.unsqueeze(1).expand_as(log_ratio))
         ratio = torch.where(loss_mask, ratio, 0.0)
-        seq_lengths = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-        advantages = (advantages.sum(dim=-1, keepdim=True) / seq_lengths).expand_as(log_ratio)
+        advantages = (advantages_sum_per_seq / valid_count_per_seq).unsqueeze(1).expand_as(log_ratio)
     return ratio, advantages
 
 
@@ -607,10 +710,12 @@ def ppo_actor_loss_fn(
     prompt_group_ids: Optional[torch.Tensor] = None,
     prompt_token_counts: Optional[torch.Tensor] = None,
     sequence_loss_weights: Optional[torch.Tensor] = None,
+    seq_mean_per_packed_sequence: bool = False,
+    sequence_is_masked_advantages: bool = False,
 ) -> tuple[torch.Tensor, dict]:
     if importance_sampling_level == "sequence":
         log_ratio = logprobs - proximal_logprobs
-        ratio, advantages = _compute_sequence_level_ratio_and_advantages(log_ratio, advantages, loss_mask, cu_seqlens)
+        ratio, advantages = _compute_sequence_level_ratio_and_advantages(log_ratio, advantages, loss_mask, cu_seqlens, sequence_is_masked_advantages)
     elif importance_sampling_level == "token":
         ratio = torch.where(loss_mask, torch.exp(logprobs - proximal_logprobs), 0)
     else:
@@ -653,6 +758,7 @@ def ppo_actor_loss_fn(
         prompt_token_counts=prompt_token_counts,
         sequence_loss_weights=sequence_loss_weights,
         cu_seqlens=cu_seqlens,
+        seq_mean_per_packed_sequence=seq_mean_per_packed_sequence,
     )
     clip_mask.logical_and_(loss_mask)
     dual_clip_mask.logical_and_(loss_mask)
@@ -686,13 +792,15 @@ def sapo_loss_fn(
     prompt_group_ids: Optional[torch.Tensor] = None,
     prompt_token_counts: Optional[torch.Tensor] = None,
     sequence_loss_weights: Optional[torch.Tensor] = None,
+    seq_mean_per_packed_sequence: bool = False,
+    sequence_is_masked_advantages: bool = False,
 ) -> tuple[torch.Tensor, dict]:
     if tau_pos <= 0 or tau_neg <= 0:
         raise ValueError("SAPO temperatures must be positive.")
     advantages = advantages.detach()
     log_ratio = logprobs - old_logprobs
     if importance_sampling_level == "sequence":
-        ratio, advantages = _compute_sequence_level_ratio_and_advantages(log_ratio, advantages, loss_mask, cu_seqlens)
+        ratio, advantages = _compute_sequence_level_ratio_and_advantages(log_ratio, advantages, loss_mask, cu_seqlens, sequence_is_masked_advantages)
     elif importance_sampling_level == "token":
         ratio = torch.exp(log_ratio)
     else:
@@ -715,6 +823,7 @@ def sapo_loss_fn(
         prompt_token_counts=prompt_token_counts,
         sequence_loss_weights=sequence_loss_weights,
         cu_seqlens=cu_seqlens,
+        seq_mean_per_packed_sequence=seq_mean_per_packed_sequence,
     )
     stat = dict(
         loss=logging_loss,
@@ -749,6 +858,8 @@ def cispo_actor_loss_fn(
     prompt_group_ids: Optional[torch.Tensor] = None,
     prompt_token_counts: Optional[torch.Tensor] = None,
     sequence_loss_weights: Optional[torch.Tensor] = None,
+    seq_mean_per_packed_sequence: bool = False,
+    sequence_is_masked_advantages: bool = False,
 ) -> tuple[torch.Tensor, dict]:
     """CISPO policy loss (https://arxiv.org/abs/2506.13585).
 
@@ -765,7 +876,7 @@ def cispo_actor_loss_fn(
     if importance_sampling_level == "sequence":
         log_ratio = torch.where(loss_mask, logprobs - proximal_logprobs, torch.zeros_like(logprobs))
         log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
-        ratio, advantages = _compute_sequence_level_ratio_and_advantages(log_ratio, advantages, loss_mask, cu_seqlens)
+        ratio, advantages = _compute_sequence_level_ratio_and_advantages(log_ratio, advantages, loss_mask, cu_seqlens, sequence_is_masked_advantages)
     elif importance_sampling_level == "token":
         log_ratio = torch.where(loss_mask, logprobs - proximal_logprobs, torch.zeros_like(logprobs))
         log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
@@ -814,6 +925,7 @@ def cispo_actor_loss_fn(
         prompt_token_counts=prompt_token_counts,
         sequence_loss_weights=sequence_loss_weights,
         cu_seqlens=cu_seqlens,
+        seq_mean_per_packed_sequence=seq_mean_per_packed_sequence,
     )
 
     stat = dict(
