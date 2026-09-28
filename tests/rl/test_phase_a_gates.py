@@ -548,7 +548,7 @@ class TestA5Compat(TestCasePlus):
     def test_cortex_compute_logprobs_passes_through_precomputed(self):
         precomputed = torch.randn(2, 4)
         out = compute_logprobs_post({"logprobs": precomputed}, {"input_ids": torch.arange(8).view(2, 4)}, {}, "cpu")
-        self.assertEqual(out, {})
+        self.assertIs(out["logprobs"], precomputed)
 
     def test_cortex_compute_logprobs_requires_labels_or_input_ids(self):
         logits = torch.zeros(1, 2, 3)

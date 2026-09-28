@@ -86,6 +86,7 @@ from .packed_reduction import PackedLossReduction
 from .packed_reduction import apply_packed_loss_reduction
 from .packed_reduction import combine_packed_losses
 from .packed_reduction import combine_packed_metrics
+from .packed_reduction import local_mean_packed_loss_reduction
 from .packed_reduction import resolve_packed_loss_reduction
 
 # Packing utilities
@@ -150,6 +151,7 @@ __all__ = [
     "combine_packed_losses",
     "combine_packed_metrics",
     "resolve_packed_loss_reduction",
+    "local_mean_packed_loss_reduction",
     "causal_cross_entropy_loss",
     "GroupedDistillationLoss",
     "GRPOGroupedDistillationLoss",

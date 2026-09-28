@@ -107,13 +107,13 @@ class TestIsolation(TestCasePlus):
             "attention_mask": torch.ones(1, 4, dtype=torch.long),
             "advantages": torch.ones(1, 4),
             "old_log_probs": torch.zeros(1, 4),
+            "calculate_entropy": True,
+            "temperature": 1.0,
         }
         meta = {
-            "calculate_entropy": True,
             "loss_mask": torch.ones(1, 4, dtype=torch.bool),
             "old_log_probs_shifted": torch.zeros(1, 4),
             "actor_config": {"entropy_coeff": 0.0},
-            "temperature": 1.0,
             "dp_size": 2,
         }
         kwargs = _engine_forward_kwargs(batch, meta)
@@ -135,8 +135,11 @@ class TestIsolation(TestCasePlus):
             "image_grid_thw": torch.tensor([[1, 2, 2]]),
             "routed_experts": torch.zeros(1, 4, 1, 1, dtype=torch.long),
             "advantages": torch.ones(1, 4),
+            "temperature": 0.7,
+            "cu_seq_lens_q": torch.tensor([0, 4], dtype=torch.int32),
+            "seq_idx": torch.zeros(1, 4, dtype=torch.int32),
         }
-        meta = {"temperature": 0.7, "cu_seq_lens_q": torch.tensor([0, 4], dtype=torch.int32)}
+        meta = {}
         kwargs = _engine_forward_kwargs(batch, meta)
         self.assertIn("action_masks", kwargs)
         self.assertIn("pixel_values", kwargs)
@@ -144,30 +147,30 @@ class TestIsolation(TestCasePlus):
         self.assertIn("routed_experts", kwargs)
         self.assertIn("temperature", kwargs)
         self.assertIn("cu_seq_lens_q", kwargs)
+        self.assertIn("seq_idx", kwargs)
         self.assertNotIn("advantages", kwargs)
 
-    def test_fwd_meta_keys_can_add_but_not_blocked_keys(self):
-        blocked = ("advantages", "loss_mask", "actor_config", "dp_size")
-        batch = {
-            "input_ids": torch.arange(4).view(1, 4),
-            "advantages": torch.ones(1, 4),
-            "loss_mask": torch.ones(1, 4),
-        }
+    def test_engine_kwargs_ignore_meta_model_keys(self):
+        batch = {"input_ids": torch.arange(4).view(1, 4)}
+        meta = {"temperature": 0.7, "calculate_entropy": True, "cu_seq_lens_q": torch.tensor([0, 4])}
+        kwargs = _engine_forward_kwargs(batch, meta)
+        self.assertEqual(set(kwargs), {"input_ids"})
+
+    def test_fwd_meta_keys_raises_when_meta_would_be_dropped(self):
+        batch = {"input_ids": torch.arange(4).view(1, 4)}
+        meta = {"use_cache": False, "fwd_meta_keys": ("use_cache",)}
+        with self.assertRaises(ValueError) as ctx:
+            _engine_forward_kwargs(batch, meta)
+        self.assertIn("fwd_meta_keys", str(ctx.exception))
+
+    def test_fwd_meta_keys_blocked_keys_do_not_raise(self):
+        batch = {"input_ids": torch.arange(4).view(1, 4), "advantages": torch.ones(1, 4)}
         meta = {
-            "calculate_entropy": True,
-            "use_cache": False,
-            "actor_config": {"entropy_coeff": 0.1},
-            "temperature": 1.0,
-            "dp_size": 2,
-            "fwd_meta_keys": ("use_cache",) + blocked,
+            "advantages": torch.ones(1, 4),
+            "fwd_meta_keys": ("advantages",),
         }
         kwargs = _engine_forward_kwargs(batch, meta)
-        self.assertIn("input_ids", kwargs)
-        self.assertIn("use_cache", kwargs)
-        self.assertIn("temperature", kwargs)
-        self.assertNotIn("fwd_meta_keys", kwargs)
-        for key in blocked:
-            self.assertNotIn(key, kwargs)
+        self.assertNotIn("advantages", kwargs)
 
     def test_pack_false_forward_filters_batch_and_meta(self):
         engine = _StubEngine()
@@ -177,10 +180,10 @@ class TestIsolation(TestCasePlus):
             "position_ids": torch.arange(4).repeat(2, 1),
             "advantages": torch.ones(2, 4),
             "old_log_probs": torch.zeros(2, 4),
+            "calculate_entropy": True,
         }
         meta = {
             "cu_seqlens": torch.tensor([0, 4, 8], dtype=torch.int32),
-            "calculate_entropy": True,
             "loss_mask": torch.ones(2, 4, dtype=torch.bool),
             "old_log_probs_shifted": torch.zeros(2, 4),
             "pad_token_id": 0,
@@ -202,6 +205,103 @@ class TestIsolation(TestCasePlus):
         self.assertNotIn("actor_config", engine.last_kwargs)
         self.assertIn("input_ids", engine.last_kwargs)
         self.assertIn("calculate_entropy", engine.last_kwargs)
+
+    def test_cu_seqlens_on_batch_raises(self):
+        engine = _StubEngine()
+        batch = {
+            "input_ids": torch.arange(4).view(1, 4),
+            "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
+        }
+        meta = {"cu_seqlens": torch.tensor([0, 4], dtype=torch.int32)}
+        with self.assertRaises(ValueError) as ctx:
+            run_pipeline(
+                engine,
+                (),
+                batch,
+                meta,
+                {"loss_fn": None, "post": [], "config": {}},
+                "cpu",
+                backward=False,
+                pack=False,
+            )
+        self.assertIn("meta-only", str(ctx.exception))
+
+    def test_pack_false_without_cu_seqlens_requires_unpad_keys(self):
+        engine = _StubEngine()
+        batch = {
+            "input_ids": torch.arange(4).view(1, 4),
+            "attention_mask": torch.ones(1, 4, dtype=torch.long),
+        }
+        with self.assertRaises(ValueError) as ctx:
+            run_pipeline(
+                engine,
+                (),
+                batch,
+                {},
+                {"loss_fn": None, "post": [], "config": {}},
+                "cpu",
+                backward=False,
+                pack=False,
+            )
+        self.assertIn("attention_mask", str(ctx.exception))
+
+    def test_missing_loss_fn_raises_when_backward(self):
+        engine = _StubEngine()
+        batch = {
+            "input_ids": torch.arange(4).view(1, 4),
+            "attention_mask": torch.ones(1, 4),
+            "position_ids": torch.arange(4).view(1, 4),
+        }
+        meta = {"cu_seqlens": torch.tensor([0, 4], dtype=torch.int32)}
+        with self.assertRaises(ValueError):
+            run_pipeline(
+                engine,
+                (),
+                batch,
+                meta,
+                {"post": [], "config": {}},
+                "cpu",
+                backward=True,
+                pack=False,
+            )
+
+    def test_none_loss_fn_raises_when_backward(self):
+        from arctic_platform.rl.processors.pipeline import _require_loss_fn
+
+        with self.assertRaises(ValueError):
+            _require_loss_fn({"loss_fn": None}, backward=True)
+
+    def test_dict_model_outputs_and_skips_none(self):
+        class DictEngine(_StubEngine):
+            def __call__(self, *args, **kwargs):
+                self.last_kwargs = dict(kwargs)
+                ids = kwargs["input_ids"]
+                if ids.ndim == 1:
+                    ids = ids.unsqueeze(0)
+                b, s = ids.shape[:2]
+                return {"logits": torch.zeros(b, s, 8), "logprobs": None, "entropy": None}
+
+        engine = DictEngine()
+        batch = {
+            "input_ids": torch.arange(4).view(1, 4),
+            "attention_mask": torch.ones(1, 4),
+            "position_ids": torch.arange(4).view(1, 4),
+            "labels": torch.tensor([[1, 2, 3, -100]]),
+        }
+        meta = {"cu_seqlens": torch.tensor([0, 4], dtype=torch.int32)}
+        out = run_pipeline(
+            engine,
+            (),
+            batch,
+            meta,
+            {"loss_fn": None, "post": ["compute_logprobs"], "config": {}},
+            "cpu",
+            backward=False,
+            pack=False,
+            return_tensors=True,
+        )
+        self.assertIn("logprobs", out["batch"])
+        self.assertEqual(tuple(out["batch"]["logprobs"].shape), (1, 4))
 
     def test_scale_wrt_gas_still_false(self):
         engine = _StubEngine()
