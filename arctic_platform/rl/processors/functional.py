@@ -51,11 +51,7 @@ def _sequence_parallel_sum(*totals: torch.Tensor, group) -> tuple[torch.Tensor, 
 
 
 def _masked_values(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    return torch.where(mask.bool(), values, torch.zeros_like(values))
-
-
-def _safe_masked_operand(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    return torch.where(mask.bool(), values, torch.zeros_like(values))
+    return torch.where(mask.bool(), values, 0.0)
 
 
 def canonicalize_loss_mask(
@@ -131,6 +127,7 @@ def _packed_per_sequence_sums(
     sequence_idx = torch.repeat_interleave(
         torch.arange(num_sequences, device=device),
         (cu_seqlens[1:] - cu_seqlens[:-1]).long(),
+        output_size=total_tokens,
     )
     sums = [value.new_zeros(num_sequences).scatter_add_(0, sequence_idx, value.reshape(-1)) for value in values]
     return sequence_idx, sums
@@ -293,7 +290,9 @@ def agg_loss(
     frame counts as one sequence. ``seq_mean_per_packed_sequence=True`` makes
     them reduce per ``cu_seqlens`` sequence instead, with the same
     sequence-parallel count reduction as ``prompt-mean``; the default keeps the
-    row reduction unchanged.
+    row reduction unchanged. ``seq-mean-token-sum-norm`` still divides by the
+    local tensor width unless ``loss_scale_factor`` is supplied directly; its
+    scale is therefore layout- and SP-window-dependent even with the flag.
     """
     dp_size = _resolve_dp_size(dp_size, batch_num_tokens)
     if loss_agg_mode == "token-mean":
@@ -301,44 +300,27 @@ def agg_loss(
             batch_num_tokens = loss_mask.count_nonzero() or 1
         loss = (torch.where(loss_mask.bool(), loss_mat, 0.0).sum() / batch_num_tokens) * dp_size
 
-    elif seq_mean_per_packed_sequence and loss_agg_mode in (
-        "seq-mean-token-sum", "seq-mean-token-sum-norm", "seq-mean-token-mean"
-    ):
-        seq_sum, seq_cnt = _per_sequence_sum_and_count(loss_mat, loss_mask, cu_seqlens)
-        sp_group = _get_sequence_parallel_group()
-        if sp_group is not None:
-            # Local numerators over group-wide counts, as in prompt-mean: the ranks' losses are summed.
-            dist.all_reduce(seq_cnt, op=dist.ReduceOp.SUM, group=sp_group)
-        seq_mask = (seq_cnt > 0).to(seq_sum.dtype)
-        seq_losses = seq_sum / seq_cnt.clamp(min=1) if loss_agg_mode == "seq-mean-token-mean" else seq_sum
+    elif loss_agg_mode in ("seq-mean-token-sum", "seq-mean-token-sum-norm", "seq-mean-token-mean"):
+        if seq_mean_per_packed_sequence:
+            seq_sum, seq_cnt = _per_sequence_sum_and_count(loss_mat, loss_mask, cu_seqlens)
+            sp_group = _get_sequence_parallel_group()
+            if sp_group is not None:
+                # Local numerators over group-wide counts: the ranks' losses are summed.
+                dist.all_reduce(seq_cnt, op=dist.ReduceOp.SUM, group=sp_group)
+            seq_mask = (seq_cnt > 0).to(seq_sum.dtype)
+            seq_losses = seq_sum / seq_cnt.clamp(min=1) if loss_agg_mode == "seq-mean-token-mean" else seq_sum
+        else:
+            seq_losses = (loss_mat * loss_mask).sum(dim=-1)
+            if loss_agg_mode == "seq-mean-token-mean":
+                seq_losses = seq_losses / loss_mask.sum(dim=-1).clamp(min=1).float()
+            seq_mask = (loss_mask.sum(dim=-1) > 0).float()
         if global_batch_size is None:
             global_batch_size = seq_mask.sum().clamp(min=1)
         elif global_batch_size == 0:
-            global_batch_size = _explicit_zero_step_count(
-                "global_batch_size", loss_mask
-            )
+            global_batch_size = _explicit_zero_step_count("global_batch_size", loss_mask)
         loss = ((seq_losses * seq_mask).sum() / global_batch_size) * dp_size
         if loss_agg_mode == "seq-mean-token-sum-norm":
             loss = loss / (loss_mask.shape[-1] if loss_scale_factor is None else loss_scale_factor)
-
-    elif loss_agg_mode in ("seq-mean-token-sum", "seq-mean-token-sum-norm"):
-        seq_losses = (loss_mat * loss_mask).sum(dim=-1)
-        seq_mask = (loss_mask.sum(dim=-1) > 0).float()
-        if global_batch_size is None:
-            global_batch_size = seq_mask.sum().clamp(min=1)
-        loss = ((seq_losses * seq_mask).sum() / global_batch_size) * dp_size
-        if loss_agg_mode == "seq-mean-token-sum-norm":
-            if loss_scale_factor is None:
-                loss_scale_factor = loss_mask.shape[-1]
-            loss = loss / loss_scale_factor
-
-    elif loss_agg_mode == "seq-mean-token-mean":
-        seq_token_counts = loss_mask.sum(dim=-1).clamp(min=1).float()
-        seq_losses = (loss_mat * loss_mask).sum(dim=-1) / seq_token_counts
-        seq_mask = (loss_mask.sum(dim=-1) > 0).float()
-        if global_batch_size is None:
-            global_batch_size = seq_mask.sum().clamp(min=1)
-        loss = ((seq_losses * seq_mask).sum() / global_batch_size) * dp_size
 
     elif loss_agg_mode == "prompt-mean":
         sp_group = _get_sequence_parallel_group()
@@ -883,8 +865,8 @@ def cispo_actor_loss_fn(
         ratio = torch.where(loss_mask, torch.exp(log_ratio), torch.zeros_like(log_ratio))
     else:
         raise ValueError(f"Invalid importance_sampling_level: {importance_sampling_level}.")
-    advantages = _safe_masked_operand(advantages, loss_mask)
-    logprobs = _safe_masked_operand(logprobs, loss_mask)
+    advantages = _masked_values(advantages, loss_mask)
+    logprobs = _masked_values(logprobs, loss_mask)
 
     if is_weight_clip_max is not None:
         if is_weight_clip_max <= 0.0:
@@ -910,7 +892,7 @@ def cispo_actor_loss_fn(
     behav_imp_weight = torch.where(behav_mask, behav_imp_weight, 0.0)
     pg_loss = pg_loss * behav_imp_weight
     if rollout_is_weights is not None:
-        pg_loss = pg_loss * _safe_masked_operand(rollout_is_weights, loss_mask)
+        pg_loss = pg_loss * _masked_values(rollout_is_weights, loss_mask)
     pg_loss = _masked_values(pg_loss, loss_mask)
 
     logging_loss = pg_loss.detach()

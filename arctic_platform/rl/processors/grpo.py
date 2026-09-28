@@ -31,6 +31,7 @@ from arctic_platform.common.registry import register_loss_fn
 
 from .base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
 from .functional import EchoBatchDenominator
+from .functional import _get_sequence_parallel_group
 from .functional import _resolve_dp_size
 from .functional import agg_loss
 from .functional import canonicalize_loss_mask
@@ -280,7 +281,19 @@ def _internal_grpo_loss_fn(
     # When ECHO is configured, skip the early return so sft_mask /
     # echo_observation_mask can still contribute. Empty-policy shards still
     # run the ECHO terms on this path.
-    empty_policy_shard = not loss_mask.any()
+    #
+    # A shard that must join an SP collective (prompt-mean, sequence-level IS, or
+    # the per-packed-sequence seq-mean modes) never skips the loss math, or the
+    # other ranks of its group block on the reduction.
+    reduces_across_sequence_parallel = _get_sequence_parallel_group() is not None and (
+        loss_agg_mode == "prompt-mean"
+        or importance_sampling_level == "sequence"
+        or (
+            seq_mean_per_packed_sequence
+            and loss_agg_mode in ("seq-mean-token-sum", "seq-mean-token-sum-norm", "seq-mean-token-mean")
+        )
+    )
+    empty_policy_shard = not loss_mask.any() and not reduces_across_sequence_parallel
     if empty_policy_shard and aux_ce_weight is None:
         zero_loss = torch.nan_to_num(logprobs).sum() * 0.0
         metrics = {
@@ -636,9 +649,12 @@ def _grpo_loss(
         ``use_kl_loss`` (default False; add KL penalty vs ``ref_log_probs`` in context),
         ``kl_loss_coef`` (default 0.001), ``kl_loss_type`` (default "low_var_kl"),
         ``seq_mean_per_packed_sequence`` (default False: the ``seq-mean-*`` modes reduce the last dimension,
-        so a packed ``[T]`` frame is one sequence; True reduces per ``cu_seqlens`` sequence),
+        so a packed ``[T]`` frame is one sequence; True reduces per ``cu_seqlens`` sequence,
+        but ``seq-mean-token-sum-norm`` retains its layout-dependent width scaling),
         ``sequence_is_masked_advantages`` (default False: padded sequence-level IS averages advantages over
         every position; True averages over loss-mask positions, as the packed path does),
+        Explicitly supplied fix flags are echoed as constant metrics; check these before stepping
+        to detect servers that silently ignore unsupported keys.
         ``aux_ce_weight`` (λ of the ECHO Environment-Prediction auxiliary
         loss, arXiv 2605.24517, IN PAPER UNITS: set it exactly as the paper's
         λ — the implementation compensates for the aggregation mode's
@@ -773,6 +789,9 @@ def _grpo_loss(
         sequence_loss_weights=sequence_loss_weights,
         **values,
     )
+    for key in ("seq_mean_per_packed_sequence", "sequence_is_masked_advantages"):
+        if key in config:
+            metrics[key] = float(config[key])
     return loss, metrics
 
 
@@ -816,15 +835,22 @@ def _grpo_preflight_mask(microbatch: dict) -> torch.Tensor:
     return mask
 
 
-def _active_sequence_count(microbatch: dict, loss_mask: torch.Tensor) -> float:
+def _active_sequence_count(
+    microbatch: dict, loss_mask: torch.Tensor, sp_group: torch.distributed.ProcessGroup | None = None
+) -> float:
     cu_seqlens = microbatch.get("cu_seqlens")
     if torch.is_tensor(cu_seqlens):
         flat_mask = loss_mask.reshape(-1)
         boundaries = cu_seqlens.detach().cpu().tolist()
-        return float(sum(bool(flat_mask[start:end].any().item()) for start, end in pairwise(boundaries)))
-    if loss_mask.ndim >= 2:
-        return float(loss_mask.reshape(loss_mask.shape[0], -1).any(dim=1).sum().item())
-    return float(bool(loss_mask.any().item()))
+        active = torch.stack([flat_mask[start:end].any() for start, end in pairwise(boundaries)])
+    elif loss_mask.ndim >= 2:
+        active = loss_mask.reshape(loss_mask.shape[0], -1).any(dim=1)
+    else:
+        active = loss_mask.any().reshape(1)
+    if sp_group is not None:
+        active = active.int()
+        torch.distributed.all_reduce(active, op=torch.distributed.ReduceOp.MAX, group=sp_group)
+    return float(active.sum().item())
 
 
 def _grpo_packed_loss_reduction(
@@ -843,7 +869,11 @@ def _grpo_packed_loss_reduction(
             else local_mean_packed_loss_reduction(weights)
         )
     elif mode in ("seq-mean-token-sum", "seq-mean-token-mean"):
-        weights = [_active_sequence_count(microbatch, mask) for microbatch, mask in zip(microbatches, masks)]
+        sp_group = _get_sequence_parallel_group() if config.get("seq_mean_per_packed_sequence", False) else None
+        weights = [
+            _active_sequence_count(microbatch, mask, sp_group)
+            for microbatch, mask in zip(microbatches, masks)
+        ]
         reduction = (
             additive_packed_loss_reduction(weights)
             if config.get("global_batch_size") is not None
