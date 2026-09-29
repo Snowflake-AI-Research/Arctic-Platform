@@ -24,11 +24,13 @@ from arctic_platform.model.patch import register_patch
 
 @register_patch("lm_head")
 def apply_lm_head(model: nn.Module, ctx: LoaderContext) -> None:
+    settings = ctx.spec.patches.lm_head
+    if settings is None:
+        raise ValueError("lm_head patch requires patches.lm_head configuration")
+
     from arctic_platform.model.implementations.gpu.lm_head import enable_chunked_lm_head_logprobs
     from arctic_platform.model.implementations.gpu.lm_head import enable_fp32_lm_head
 
-    settings = ctx.spec.patches.lm_head
-    assert settings is not None
     if settings.fp32:
         enable_fp32_lm_head(model)
     if settings.token_chunk_size is not None:

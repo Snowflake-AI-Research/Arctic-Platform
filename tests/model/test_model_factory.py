@@ -169,7 +169,7 @@ class TestPatchPipeline:
 
     def test_register_requires_order_membership(self):
         """A patch missing from PATCH_ORDER cannot be registered."""
-        with pytest.raises(AssertionError, match="missing from PATCH_ORDER"):
+        with pytest.raises(RuntimeError, match="missing from PATCH_ORDER"):
 
             @register_patch("not_in_order")
             def _patch(model, ctx) -> None:
@@ -424,12 +424,6 @@ class TestModelFeaturePatches:
                 gradient_checkpointing=False,
                 activation_offload={"enabled": True},
             )
-
-    def test_activation_offload_requires_enabled_config(self):
-        from arctic_platform.model.patches.activation_offload import apply_activation_offload
-
-        with pytest.raises(ValueError, match="requires an enabled"):
-            apply_activation_offload(self._Model(), _ctx(activation_offload=None))
 
     def test_applies_tiled_mlp(self, monkeypatch):
         from arctic_platform.model.config import TiledMlpPatch

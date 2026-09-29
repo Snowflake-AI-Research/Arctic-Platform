@@ -50,8 +50,10 @@ def register_patch(name: str) -> Callable[[Patch], Patch]:
     """Register a patch by name (must match a ``Patches`` field and be in PATCH_ORDER)."""
 
     def decorator(fn: Patch) -> Patch:
-        assert name in PATCH_ORDER, f"patch {name!r} missing from PATCH_ORDER"
-        assert name not in _PATCHES, f"patch {name!r} already registered"
+        if name not in PATCH_ORDER:
+            raise RuntimeError(f"patch {name!r} missing from PATCH_ORDER")
+        if name in _PATCHES:
+            raise RuntimeError(f"patch {name!r} already registered")
         _PATCHES[name] = fn
         return fn
 

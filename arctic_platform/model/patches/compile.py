@@ -34,6 +34,7 @@ def _transformer_layers(model: nn.Module):
 @register_patch("compile")
 def apply_compile(model: nn.Module, ctx: LoaderContext) -> None:
     settings = ctx.spec.patches.compile
-    assert settings is not None
+    if settings is None:
+        raise ValueError("compile patch requires patches.compile configuration")
     for layer in _transformer_layers(model):
         layer.compile(fullgraph=settings.fullgraph)

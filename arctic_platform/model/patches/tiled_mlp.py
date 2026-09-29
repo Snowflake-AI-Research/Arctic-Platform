@@ -239,7 +239,8 @@ def apply_dense_tiled_mlp(
 @register_patch("tiled_mlp")
 def apply_tiled_mlp(model: torch.nn.Module, ctx: LoaderContext) -> None:
     settings = ctx.spec.patches.tiled_mlp
-    assert settings is not None
+    if settings is None:
+        raise ValueError("tiled_mlp patch requires patches.tiled_mlp configuration")
     apply_dense_tiled_mlp(
         model,
         token_chunk_size=settings.token_chunk_size,
