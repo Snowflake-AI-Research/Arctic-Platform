@@ -44,8 +44,8 @@ three loaders against the name `"arctic"`:
   &rarr; [`ArcticRLActorRolloutRefWorker`](./worker.py) (the CPU-only
   forwarder verl instantiates for the `ActorRollout(Ref)` role).
 - `RolloutReplicaRegistry("arctic")`
-  &rarr; [`ArcticReplica`](./rollout.py) (rollout replica hosting our own
-  vLLM engine, shared with the training backend).
+  &rarr; [`ArcticReplica`](./rollout.py) (CPU-driver replica; generate
+  is Arctic client RPC, not a local vLLM engine).
 
 All three are wired up as loader callables, not eager imports &mdash; a
 plain `import arctic_platform.integrations.verl.register` stays cheap
@@ -68,7 +68,7 @@ Reference scripts (matching Golden Runs 1 & 2 in
 |---|---|
 | `register.py` | Loaded by `VERL_USE_EXTERNAL_MODULES`; registers "arctic" on both verl registries via lazy loaders. |
 | `adapter.py` | `ArcticRLClientWrapper` &mdash; implements verl's `RemoteBackend` ABC on top of `arctic_platform.rl`. |
-| `rollout.py` | `ArcticReplica` / `ArcticLLMServer` &mdash; hosts Arctic's own vLLM engine as a verl `RolloutReplica`. |
+| `rollout.py` | `ArcticReplica` / `ArcticLLMServer` &mdash; CPU-driver `RolloutReplica`; sampling runs on Arctic/Cortex workers. |
 | `worker.py` | `ArcticRLActorRolloutRefWorker` &mdash; per-backend forwarder worker with verl dispatch decorators. |
 | `grpo_loss.py` | Server-side verl-shaped GRPO loss (registered as `"verl_grpo"` on `arctic_platform.rl.processors.LOSS_FNS`). |
 | `config/remote_backend/arctic.yaml` | Per-backend Hydra config block loaded into `config.remote_backend` when `remote_backend=arctic`. |

@@ -20,12 +20,16 @@
 # and is registered with verl's ``RolloutReplicaRegistry`` by
 # :mod:`arctic_platform.integrations.verl.register` via the
 # ``VERL_USE_EXTERNAL_MODULES`` plugin hook.
-"""Arctic rollout replica: a :class:`RolloutReplica` that hosts its own
-vLLM engine driven by the Arctic RL client.
+"""Arctic rollout replica for a CPU-only VeRL driver.
+
+Generate/sleep/wake go through :class:`ArcticRLClientWrapper` (on-prem HTTP/Ray
+or Cortex). This module must not import vLLM: the driver does not host an
+engine, and ``verl.third_party.vllm`` raises if the ``vllm`` package is absent.
 """
 
 import argparse
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from typing import Any
 from typing import Optional
 
@@ -40,16 +44,30 @@ from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.replica import RolloutReplica
 from verl.workers.rollout.replica import TokenOutput
 from verl.workers.rollout.utils import get_max_position_embeddings
-from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_INT_ID
-from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_NAME
-from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_PATH
-from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
-from vllm.inputs import TokensPrompt
-from vllm.lora.request import LoRARequest
-from vllm.outputs import CompletionOutput
-from vllm.outputs import RequestOutput
 
 from arctic_platform.integrations.verl.adapter import ArcticRLClientWrapper
+
+
+@dataclass
+class _CompletionOutput:
+    index: int
+    text: str
+    token_ids: list
+    finish_reason: str
+    cumulative_logprob: Any = None
+    logprobs: Any = None
+    routed_experts: Any = None
+    num_preempted: Any = None
+
+
+@dataclass
+class _RequestOutput:
+    request_id: str
+    outputs: list
+    prompt: str
+    prompt_token_ids: list
+    prompt_logprobs: Any = None
+    finished: bool = True
 
 
 class ArcticLLMEngine:
@@ -65,38 +83,43 @@ class ArcticLLMEngine:
 
     async def generate(
         self,
-        prompt: TokensPrompt,
+        prompt: dict[str, Any],
         sampling_params: dict[str, Any],
         request_id: str,
-        lora_request: Optional[LoRARequest] = None,
+        lora_request: Any = None,
         priority: int = 0,
-    ) -> AsyncGenerator[RequestOutput, None]:
+    ) -> AsyncGenerator[_RequestOutput, None]:
+        del lora_request, priority
+        prompt_token_ids = prompt["prompt_token_ids"]
         gen_batch_output = await self.arctic_rl_client.generate(
-            prompt_ids=prompt["prompt_token_ids"],
+            prompt_ids=prompt_token_ids,
             sampling_params=sampling_params,
         )
 
-        raw_prompt = self.tokenizer.decode(prompt["prompt_token_ids"])
+        if getattr(self.arctic_rl_client, "_use_cortex", False) or getattr(
+            self.arctic_rl_client, "_is_cortex_backend", lambda: False
+        )():
+            from arctic_platform.integrations.verl.cortex_generate import prompt_text_from_ids
+
+            raw_prompt = prompt_text_from_ids(self.tokenizer, prompt_token_ids)
+        else:
+            raw_prompt = self.tokenizer.decode(prompt_token_ids)
         completed_outputs = []
         for i, output in enumerate(gen_batch_output):
             completed_outputs.append(
-                CompletionOutput(
+                _CompletionOutput(
                     index=i,
                     text=output["text"],
                     token_ids=output["token_ids"],
                     finish_reason=output["finish_reason"],
-                    cumulative_logprob=None,
-                    logprobs=None,
                 )
             )
 
-        yield RequestOutput(
+        yield _RequestOutput(
             request_id=request_id,
             outputs=completed_outputs,
             prompt=raw_prompt,
-            prompt_logprobs=None,
-            prompt_token_ids=prompt["prompt_token_ids"],
-            # finished=completed_output.finish_reason == "stop",
+            prompt_token_ids=prompt_token_ids,
             finished=True,
         )
 
@@ -111,12 +134,8 @@ class ArcticLLMEngine:
         await self.arctic_rl_client.reset_prefix_cache()
 
 
-class ArcticLLMServer(vLLMHttpServer):
-    """vLLM http server in single node, this is equivalent to launch server with command line:
-    ```
-    vllm serve --tensor-parallel-size=8 ...
-    ```
-    """
+class ArcticLLMServer:
+    """CPU-driver generate adapter. Sampling runs on Arctic workers / Cortex, not vLLM here."""
 
     def __init__(
         self,
@@ -178,13 +197,6 @@ class ArcticLLMServer(vLLMHttpServer):
         # hub here; avoids a hardcoded model name and an extra download.
         self.engine = ArcticLLMEngine(replica_rank, arctic_rl_client, self.model_config.tokenizer)
 
-        # logger.info(
-        #     f"vLLMHttpServer, replica_rank: {self.replica_rank}, node_rank: {self.node_rank}, "
-        #     f"{get_visible_devices_keyword()}: {cuda_visible_devices}, "
-        #     f"master_address: {self._master_address}, master_port: {self._master_port}, "
-        #     f"data_parallel_rpc_port: {self._dp_rpc_port}, data_parallel_master_port: {self._dp_master_port}"
-        # )
-
     def get_master_address(self):
         pass
 
@@ -193,13 +205,24 @@ class ArcticLLMServer(vLLMHttpServer):
 
     @property
     def lora_as_adapter(self) -> bool:
+        return False
+
+    async def collective_rpc(self, **kwargs):
         pass
 
-    async def collective_rpc(
-        self,
-        **kwargs,
-    ):
-        pass
+    async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
+        del reset_prefix_cache
+        return {"aborted": True}
+
+    async def resume_generation(self):
+        return None
+
+    async def start_profile(self, **kwargs):
+        del kwargs
+        return None
+
+    async def stop_profile(self):
+        return None
 
     async def launch_server(
         self,
@@ -259,36 +282,18 @@ class ArcticLLMServer(vLLMHttpServer):
         if video_data is not None:
             multi_modal_data["video"] = video_data
         # import pdb; pdb.set_trace()
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
-
-        # Add lora request
-        lora_request = None
-        if self.lora_as_adapter:
-            # Make sure we also check that the lora is already loaded in the engine
-            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
-            if lora_loaded:
-                lora_request = LoRARequest(
-                    lora_name=VLLM_LORA_NAME,
-                    lora_int_id=VLLM_LORA_INT_ID,
-                    lora_path=VLLM_LORA_PATH,
-                )
-        # import pdb; pdb.set_trace()
-        # print(  # noqa: E501
-        #     f"[ArcticLLMServer] generate INPUT: {prompt=}, {sampling_params=}, "
-        #     f"{request_id=}, {lora_request=}, {priority=}"
-        # )
+        prompt = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
         generator = self.engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
             request_id=request_id,
-            lora_request=lora_request,
             priority=priority,
         )
 
         # print(f"arctic_async_server: {generator=}, {type(generator)=}")
 
         # Get final response
-        final_res: Optional[RequestOutput] = None
+        final_res: Optional[_RequestOutput] = None
         async for output in generator:
             final_res = output
         assert final_res is not None

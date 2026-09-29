@@ -94,6 +94,10 @@ class ArcticRLActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     def __init__(self, config: DictConfig, role: str, **kwargs):
         Worker.__init__(self)
+        # Ray workers are separate processes.  Install Cortex's /forward
+        # transport support here rather than relying on the TaskRunner's
+        # process-local monkeypatch.
+        adapter._patch_cortex_transport_if_needed()
         self.config = config
         self.role = role
         self._is_actor = self.role in ("actor", "actor_rollout", "actor_rollout_ref")

@@ -87,10 +87,9 @@ def test_register_defers_worker_and_rollout_imports(verl_stub) -> None:
 def test_registered_loaders_resolve_expected_class_paths(verl_stub) -> None:
     """The loaders under ``arctic`` must target the current worker/rollout classes.
 
-    We don't invoke the loaders here because that pulls in the full
-    tensordict / DeepSpeed / vLLM stack -- that path is covered by the
-    GPU smoke test. Static-checking the loader source is enough to
-    catch a copy-paste regression (e.g. someone points the ``arctic``
+    We don't invoke the loaders here because the worker path pulls in
+    tensordict / DeepSpeed. Static-checking the loader source is enough
+    to catch a copy-paste regression (e.g. someone points the ``arctic``
     worker loader at a stale ``arctic_verl`` symbol).
     """
     register = importlib.import_module("arctic_platform.integrations.verl.register")
@@ -105,6 +104,22 @@ def test_registered_loaders_resolve_expected_class_paths(verl_stub) -> None:
     assert "ArcticRLActorRolloutRefWorker" in worker_src
     assert "arctic_platform.integrations.verl.rollout" in replica_src
     assert "ArcticReplica" in replica_src
+
+
+def test_rollout_module_does_not_import_vllm() -> None:
+    """CPU driver must import ArcticReplica without a local vLLM install.
+
+    On-prem and Cortex both keep sampling GPUs on Arctic workers;
+    ``verl.third_party.vllm`` raises if this module imports vLLM types.
+    """
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[3] / "arctic_platform/integrations/verl/rollout.py"
+    text = src.read_text(encoding="utf-8")
+    assert "from vllm" not in text
+    assert "import vllm" not in text
+    assert "vllm_rollout" not in text
+    assert "vLLMHttpServer" not in text
 
 
 def test_backend_class_resolves_via_decorator(verl_stub) -> None:
