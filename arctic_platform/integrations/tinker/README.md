@@ -145,18 +145,8 @@ on this path do not represent the client's loss or model entropy.
 
 ## Validation
 
-Live validation covered:
-
-| Recipe | Mode | Result |
-|---|---|---|
-| `math_rl` / GSM8K | importance sampling | 7 fresh steps, 448 episodes, healthy sampler/trainer KL |
-| `math_rl` / arithmetic | PPO | 3 steps, 48 episodes, final KL 0.00332 |
-| `chat_sl` / No Robots | cross-entropy | 2 steps, 8 sequences, 3,259 tokens, finite NLL |
-| `rl_loop` / GSM8K | direct SDK importance sampling | 2 optimizer steps, 64 grouped samples, final save |
-
-`verifiers_rl` reverse-text was blocked before its first Cortex request by a
-`tinker-cookbook==0.5.5` callback error:
-`custom_do_group_rollout() got an unexpected keyword argument 'termination'`.
+Live validation covered `math_rl`, `chat_sl`, and `rl_loop` with importance
+sampling, PPO, and cross-entropy. Detailed results are recorded in the PR.
 
 For RL runs, `kl_sample_train_v1` checks agreement between sampler and trainer
 log-probs. Validated runs were approximately `0.0005` to `0.005`; values above
@@ -165,7 +155,7 @@ log-probs. Validated runs were approximately `0.0005` to `0.005`; values above
 ## Tests
 
 ```bash
-pip install -e ".[sft,testing]"
+pip install -e ".[testing]"
 pytest -q tests/integrations/tinker
 ```
 

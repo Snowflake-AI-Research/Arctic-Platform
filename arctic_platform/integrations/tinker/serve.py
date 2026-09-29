@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from arctic_platform.integrations.tinker.cortex import build_handlers
@@ -53,7 +55,6 @@ class TinkerServeConfig:
     max_prompt_length: int = 512
     max_response_length: int = 512
     learning_rate: float = 1e-6
-    lora_rank: int = 0
     # DeepSpeed needs a batch size at provisioning time; Tinker has no verb that
     # declares one. These only have to satisfy DeepSpeed's own invariant, since
     # Cortex chunks each forward-backward to fit whatever actually arrives.
@@ -76,37 +77,54 @@ class TinkerServeConfig:
 
 
 def _client_config(cfg: TinkerServeConfig) -> Any:
+    from arctic_platform.client import ArcticClientConfig
     from arctic_platform.client import CortexConfig
-    from recipes.recipe_utils import client_config
-    from recipes.recipe_utils import load_backend
+    from arctic_platform.client import SamplingConfig
+    from arctic_platform.client import TrainingConfig
 
-    return client_config(
-        backend=load_backend(cfg.config) if cfg.config else CortexConfig(),
+    if cfg.config:
+        parsed = json.loads(Path(cfg.config).expanduser().read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError(f"connection config {cfg.config} must be a JSON object")
+        connection = parsed.get("connection", parsed)
+        backend_keys = ("base_url", "host", "pat", "database", "schema", "endpoint", "max_retries")
+        backend = CortexConfig(**{key: connection[key] for key in backend_keys if key in connection})
+    else:
+        backend = CortexConfig()
+
+    job_ids = {}
+    if cfg.job_id is not None:
+        job_ids = {
+            "training_job_id": f"{cfg.job_id}:training:0",
+            "sampling_job_id": f"{cfg.job_id}:sampling:0",
+        }
+
+    return ArcticClientConfig(
+        backend=backend,
         model_name=cfg.model,
         max_seq_len=cfg.max_seq_len,
         seed=cfg.seed,
         dtype=cfg.dtype,
         training_gpus=cfg.training_gpus,
         sampling_gpus=cfg.sampling_gpus,
-        gpu_memory_utilization=cfg.gpu_memory_utilization,
-        lora_rank=cfg.lora_rank,
-        # `offload_optimizer` is omitted rather than set to `{"device": "none"}`:
-        # that is still enough for DeepSpeed to instantiate CPUAdam, which then
-        # asserts the params are on cuda.
-        ds_config={
-            "train_batch_size": cfg.micro_batch_size * cfg.training_gpus * cfg.gradient_accumulation_steps,
-            "train_micro_batch_size_per_gpu": cfg.micro_batch_size,
-            "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
-            "bf16": {"enabled": cfg.dtype == "bfloat16"},
-            "zero_optimization": {"stage": cfg.zero_stage},
-            "optimizer": {"type": "AdamW", "params": {"lr": cfg.learning_rate}},
-        },
-        ds_worker_config={
-            "attn_implementation": cfg.attn_implementation,
-            "model_provider": "huggingface",
-            "mb_spec": {"max_tokens_per_mb": cfg.max_tokens_per_mb},
-        },
-        job_id=cfg.job_id,
+        job_ready_timeout=3600.0,
+        training=TrainingConfig(
+            ds_config={
+                "train_batch_size": cfg.micro_batch_size * cfg.training_gpus * cfg.gradient_accumulation_steps,
+                "train_micro_batch_size_per_gpu": cfg.micro_batch_size,
+                "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+                "bf16": {"enabled": cfg.dtype == "bfloat16"},
+                "zero_optimization": {"stage": cfg.zero_stage},
+                "optimizer": {"type": "AdamW", "params": {"lr": cfg.learning_rate}},
+            },
+            ds_worker_config={
+                "attn_implementation": cfg.attn_implementation,
+                "model_provider": "huggingface",
+                "mb_spec": {"max_tokens_per_mb": cfg.max_tokens_per_mb},
+            },
+        ),
+        sampling=SamplingConfig(vllm={"gpu_memory_utilization": cfg.gpu_memory_utilization}),
+        **job_ids,
     )
 
 

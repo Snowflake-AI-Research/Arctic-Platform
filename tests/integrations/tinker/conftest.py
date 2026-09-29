@@ -118,6 +118,7 @@ def _build_app(mock_backend, **kwargs):
 
     app = FastAPI()
     app.include_router(tinker_router)
+    kwargs.setdefault("supports_temperature_scaling", False)
     init_tinker_state(
         app,
         base_model="Qwen/Qwen3-8B",
@@ -132,14 +133,8 @@ def _build_app(mock_backend, **kwargs):
 
 @pytest.fixture
 def app(mock_backend):
-    """Build a FastAPI app with only the Tinker router mounted + backend wired."""
+    """Build an app with the same temperature constraint as Cortex."""
     return _build_app(mock_backend)
-
-
-@pytest.fixture
-def app_fixed_temperature(mock_backend):
-    """A backend that scores training log-probs at 1.0 only, as Cortex does."""
-    return _build_app(mock_backend, supports_temperature_scaling=False)
 
 
 def _asgi_client(app):
@@ -153,10 +148,4 @@ def _asgi_client(app):
 async def client(app):
     """Async httpx client rooted at the test app."""
     async with _asgi_client(app) as c:
-        yield c
-
-
-@pytest_asyncio.fixture
-async def client_fixed_temperature(app_fixed_temperature):
-    async with _asgi_client(app_fixed_temperature) as c:
         yield c

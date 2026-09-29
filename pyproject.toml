@@ -84,6 +84,7 @@ testing = [
     "pytest-timeout",
     "pytest-xdist",
     "pytest",
+    "tinker==0.25.0",  # generated protobuf schema used by the Tinker wire tests
 ]
 
 formatting = [

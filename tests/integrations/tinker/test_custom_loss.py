@@ -45,7 +45,6 @@ def _pack(datums, **kw):
     return datum_list_to_arctic_batch(
         datums,
         "cross_entropy",
-        None,
         max_prompt_length=MPL,
         max_response_length=MRL,
         pad_token_id=0,
@@ -87,7 +86,6 @@ class TestRouterPacking:
         out, _ = datum_list_to_arctic_batch(
             [_ce_datum([1, 2, 3], [0.0, 1.0, 1.0])],
             "ppo",
-            None,
             max_prompt_length=MPL,
             max_response_length=MRL,
             pad_token_id=0,
@@ -160,7 +158,6 @@ class TestSurrogateIsScopedToCrossEntropy:
         batch, _ = datum_list_to_arctic_batch(
             [datum],
             loss_fn,
-            None,
             max_prompt_length=MPL,
             max_response_length=MRL,
             pad_token_id=0,

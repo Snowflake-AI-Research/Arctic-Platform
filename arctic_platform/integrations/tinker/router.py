@@ -117,19 +117,6 @@ class ForwardBackwardRequest(BaseModel):
     seq_id: int | None = None
 
 
-class ForwardInput(BaseModel):
-    data: list[Datum]
-    loss_fn: LossFnType
-
-
-class ForwardRequest(BaseModel):
-    model_config = ConfigDict(protected_namespaces=())
-
-    forward_input: ForwardInput
-    model_id: str
-    seq_id: int | None = None
-
-
 class ForwardBackwardOutput(BaseModel):
     loss_fn_output_type: str = "TorchLossReturn"
     loss_fn_outputs: list[dict[str, TensorData]] = Field(default_factory=list)
@@ -371,50 +358,9 @@ class FutureRetrieveRequest(BaseModel):
 # =============================================================================
 
 
-def _loss_fn_config_to_actor_config(
-    loss_fn: str,
-    loss_fn_config: dict[str, float] | None,
-) -> dict[str, Any]:
-    """Translate a Tinker ``loss_fn`` + ``loss_fn_config`` into Arctic's
-    ``actor_config`` (see arctic_platform/rl/processors/grpo.py).
-
-    Tinker's cookbook exposes PPO as ``clip_low_threshold`` / ``clip_high_threshold``
-    (defaults 0.8 / 1.2, i.e. absolute ratio bounds); Arctic reads ``eps_clip``
-    (symmetric epsilon around 1.0) and ``eps_clip_higher`` (asymmetric upper).
-    ``importance_sampling`` = PPO with clipping disabled.
-
-    ``cross_entropy`` carries no ratio and no clipping: it lowers to
-    ``weighted_logprob_sum``, whose only input is the per-token weights packed
-    into the batch, so there is nothing to configure.
-    """
-    cfg = dict(loss_fn_config or {})
-    if loss_fn == "cross_entropy":
-        return {}
-    if loss_fn == "ppo":
-        low = cfg.get("clip_low_threshold", 0.8)
-        high = cfg.get("clip_high_threshold", 1.2)
-        actor_cfg: dict[str, Any] = {
-            "eps_clip": max(0.0, 1.0 - float(low)),
-            "eps_clip_higher": max(0.0, float(high) - 1.0),
-        }
-    elif loss_fn == "importance_sampling":
-        actor_cfg = {"eps_clip": 1e9, "eps_clip_higher": 1e9}
-    else:  # pragma: no cover — gated by route
-        raise HTTPException(400, f"unsupported loss_fn={loss_fn!r}")
-
-    if "kl_coef" in cfg:
-        actor_cfg["kl_loss_coef"] = float(cfg["kl_coef"])
-        actor_cfg["use_kl_loss"] = float(cfg["kl_coef"]) > 0.0
-    if "entropy_coef" in cfg:
-        actor_cfg["entropy_coeff"] = float(cfg["entropy_coef"])
-    return actor_cfg
-
-
-# Tinker loss name -> the loss registered on an on-prem Arctic server. Both
-# ratio-based losses lower to one PPO-shaped loss and differ only in
-# ``actor_config``; ``cross_entropy`` is the surrogate the SDK's
-# ``forward_backward_custom`` builds on, and needs a loss whose gradient wrt
-# log-probs is exactly the per-token weights.
+# Tinker loss name -> the intermediate Arctic loss name. The Cortex binder
+# maps ratio losses to ``grpo`` and custom cross-entropy to its gradient
+# surrogate.
 _BACKEND_LOSS_FNS = {
     "ppo": "verl_grpo",
     "importance_sampling": "verl_grpo",
@@ -480,7 +426,6 @@ def _split_prompt_response(tokens: list[int], candidates: list[np.ndarray | None
 def datum_list_to_arctic_batch(
     data: list[Datum],
     loss_fn: str,
-    loss_fn_config: dict[str, float] | None,
     max_prompt_length: int,
     max_response_length: int,
     pad_token_id: int,
@@ -507,8 +452,6 @@ def datum_list_to_arctic_batch(
 
     input_ids = np.full((batch_size, total_len), pad_token_id, dtype=np.int64)
     attention_mask = np.zeros((batch_size, total_len), dtype=np.int64)
-    prompts = np.full((batch_size, mpl), pad_token_id, dtype=np.int64)
-    responses = np.full((batch_size, mrl), pad_token_id, dtype=np.int64)
     # Full sequence width, not response width, so these flatten alongside
     # ``attention_mask`` and stay 1:1 with the returned log-probs. The prompt
     # columns are inert: ``response_mask`` is 0 there.
@@ -546,8 +489,6 @@ def datum_list_to_arctic_batch(
         resp_toks = toks[p_end:][: mrl - 1 if scoring_tok is not None else mrl]
         p_len, r_len = len(prompt_toks), len(resp_toks)
 
-        prompts[i, mpl - p_len :] = np.asarray(prompt_toks, dtype=np.int64)
-        responses[i, :r_len] = np.asarray(resp_toks, dtype=np.int64)
         response_mask[i, mpl : mpl + r_len] = 1
 
         input_ids[i, mpl - p_len : mpl] = np.asarray(prompt_toks, dtype=np.int64)
@@ -577,46 +518,20 @@ def datum_list_to_arctic_batch(
             # construction -- that is how _split_prompt_response found p_end.
             logprob_weights[i, mpl : mpl + len(resp_w)] = -resp_w
 
-    actor_config: dict[str, Any] = {}
-    if not forward_only:
-        actor_config = _loss_fn_config_to_actor_config(loss_fn, loss_fn_config)
-
     batch_dict = {
         "batch": {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            # position_ids omitted: rebuilt from attention_mask, via
-            # ``drop_position_ids`` in meta below.
-            "prompts": prompts,
-            "responses": responses,
+            # Cortex rebuilds position ids from the attention mask.
             "response_mask": response_mask,
             "advantages": advantages,
             "old_log_probs": old_log_probs,
             "logprob_weights_shifted": logprob_weights,
         },
         "meta": {
-            "actor_config": actor_config,
-            "policy_loss_config": {},
-            "max_prompt_len": mpl,
-            "max_response_len": mrl,
-            "pad_token_id": int(pad_token_id),
-            "drop_position_ids": True,
-            "forward_only": bool(forward_only),
-            # The SDK splits a large fwd_bwd across ~5 MB HTTP calls, so
-            # gradients accumulate across chunks and only ``optim_step``
-            # applies them.
-            "tinker_grad_accum": True,
-            "return_per_token_logprobs": not forward_only,
-            # v1 is single-worker; multi-DP would need per-shard chunking here.
-            "dp_size": 1,
             "batch_num_tokens": int(response_mask.sum()),
             "global_batch_size": batch_size,
-            "rollout_is_weights": None,
-            "temperature": 1.0,
         },
-        # ``ppo`` and ``importance_sampling`` both lower to one PPO-shaped
-        # loss; their differences ride in ``actor_config``. A backend that
-        # registers different names overrides this -- the Cortex binder does.
         "processing": {
             "post": ["compute_entropy_and_logprobs"],
             "loss_fn": _BACKEND_LOSS_FNS[loss_fn] if not forward_only else None,
@@ -656,9 +571,6 @@ def _unpad_logprobs_to_loss_fn_outputs(
             {"logprobs": TensorData(dtype="float32", data=row.tolist(), shape=[int(expected_len)]).model_dump()}
         )
     return outputs
-
-
-_UNIQUE_REDUCTIONS = {"unique", "hash_unordered"}
 
 
 def _tinker_metric_name(name: str, default_reduction: str = "mean") -> str:
@@ -917,17 +829,7 @@ async def forward_backward(request: Request) -> UntypedAPIFuture:
     else:
         req, forward_only = ForwardBackwardRequest.model_validate_json(body), False
     if forward_only:
-        return await _run_forward(
-            ForwardRequest(
-                model_id=req.model_id,
-                seq_id=req.seq_id,
-                forward_input=ForwardInput(
-                    data=req.forward_backward_input.data,
-                    loss_fn=req.forward_backward_input.loss_fn,
-                ),
-            ),
-            request,
-        )
+        return await _run_forward(req, request)
     return await _run_forward_backward(req, request)
 
 
@@ -941,7 +843,6 @@ async def _run_forward_backward(req: ForwardBackwardRequest, request: Request) -
     batch, row_slices = datum_list_to_arctic_batch(
         fbi.data,
         fbi.loss_fn,
-        fbi.loss_fn_config,
         max_prompt,
         max_resp,
         pad_id,
@@ -967,21 +868,16 @@ async def _run_forward_backward(req: ForwardBackwardRequest, request: Request) -
     return await _submit_inline(request, runner, model_id=req.model_id, kind=_KIND_FWD_BWD)
 
 
-@router.post("/forward", response_model=UntypedAPIFuture)
-async def forward(req: ForwardRequest, request: Request) -> UntypedAPIFuture:
-    return await _run_forward(req, request)
-
-
-async def _run_forward(req: ForwardRequest, request: Request) -> UntypedAPIFuture:
-    _gate_loss_fn(req.forward_input.loss_fn)
+async def _run_forward(req: ForwardBackwardRequest, request: Request) -> UntypedAPIFuture:
+    fbi = req.forward_backward_input
+    _gate_loss_fn(fbi.loss_fn)
     handler = _require_state(request.app.state, "tinker_fwd_no_grad")
     max_prompt = _require_state(request.app.state, "tinker_max_prompt_length")
     max_resp = _require_state(request.app.state, "tinker_max_response_length")
     pad_id = _require_state(request.app.state, "tinker_pad_token_id")
     batch, row_slices = datum_list_to_arctic_batch(
-        req.forward_input.data,
-        req.forward_input.loss_fn,
-        None,
+        fbi.data,
+        fbi.loss_fn,
         max_prompt,
         max_resp,
         pad_id,

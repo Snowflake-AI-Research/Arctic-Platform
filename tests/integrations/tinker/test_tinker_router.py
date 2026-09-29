@@ -23,8 +23,38 @@ in-process, without Ray / DeepSpeed / vLLM.
 from __future__ import annotations
 
 import pytest
+import tinker
+from tinker.proto import request_conv
+from tinker.proto import response_conv
+
+from arctic_platform.integrations.tinker.proto_wire import PROTO_CONTENT_TYPE
 
 pytestmark = pytest.mark.asyncio
+
+
+def _proto_forward_request(loss_fn: str = "cross_entropy") -> bytes:
+    tokens = [1, 2, 3]
+    datum = tinker.Datum(
+        model_input=tinker.ModelInput.from_ints(tokens),
+        loss_fn_inputs={
+            "target_tokens": [2, 3, 4],
+            "weights": [0.0, 1.0, 1.0],
+            "advantages": [0.0, 0.5, 0.5],
+            "logprobs": [-1.0, -1.0, -1.0],
+        },
+    )
+    request = tinker.types.ForwardBackwardRequest(
+        model_id="main",
+        seq_id=1,
+        forward_backward_input=tinker.types.ForwardBackwardInput(
+            data=[datum],
+            loss_fn=loss_fn,
+            loss_fn_config={},
+        ),
+    )
+    message = request_conv.forward_backward_request_to_proto(request)
+    message.forward_only = True
+    return message.SerializeToString()
 
 
 # ---------------------------------------------------------------------------
@@ -200,10 +230,6 @@ async def test_forward_backward_happy_path(client, mock_backend):
     # Confirm the backend received a properly-mapped batch.
     call = mock_backend["calls"]["fwd_bwd"][-1]
     assert call["processing"]["loss_fn"] == "verl_grpo"
-    actor_cfg = call["meta"]["actor_config"]
-    assert actor_cfg["eps_clip"] == pytest.approx(0.1)
-    assert actor_cfg["kl_loss_coef"] == pytest.approx(0.01)
-    assert actor_cfg["use_kl_loss"] is True
 
 
 async def test_forward_backward_importance_sampling(client, mock_backend):
@@ -219,7 +245,7 @@ async def test_forward_backward_importance_sampling(client, mock_backend):
     )
     assert r.status_code == 200
     call = mock_backend["calls"]["fwd_bwd"][-1]
-    assert call["meta"]["actor_config"]["eps_clip"] > 1e6
+    assert call["processing"]["loss_fn"] == "verl_grpo"
 
 
 @pytest.mark.parametrize("loss_fn", ["cispo", "dro"])
@@ -240,32 +266,25 @@ async def test_forward_backward_unsupported_loss_400(client, loss_fn):
     assert "supported" in detail
 
 
-async def test_forward_only_returns_logprobs(client, mock_backend):
+async def test_proto_forward_only_returns_logprobs(client, mock_backend):
     r = await client.post(
-        "/api/v1/forward",
-        json={
-            "forward_input": {
-                "data": [_mk_datum_dict()],
-                "loss_fn": "ppo",
-            },
-            "model_id": "main",
-        },
+        "/api/v1/forward_backward",
+        content=_proto_forward_request(),
+        headers={"Content-Type": PROTO_CONTENT_TYPE},
     )
     assert r.status_code == 200
     fut = r.json()
-    r = await client.post("/api/v1/retrieve_future", json={"request_id": fut["request_id"]})
+    r = await client.post(
+        "/api/v1/retrieve_future",
+        json={"request_id": fut["request_id"]},
+        headers={"Accept": PROTO_CONTENT_TYPE},
+    )
     assert r.status_code == 200
-    body = r.json()
-    assert body["loss_fn_output_type"] == "ArrayRecord"
-    assert len(body["loss_fn_outputs"]) == 1
-    logprobs_td = body["loss_fn_outputs"][0]["logprobs"]
-    assert logprobs_td["dtype"] == "float32"
-    # Mock returns -1.5 everywhere.
-    assert logprobs_td["data"][0] == pytest.approx(-1.5)
-
-    # Confirm forward_only=True was threaded through.
-    call = mock_backend["calls"]["fwd_no_grad"][-1]
-    assert call["meta"]["forward_only"] is True
+    output = response_conv.deserialize_forward_backward_output(r.content)
+    assert output.loss_fn_output_type == "ArrayRecord"
+    assert len(output.loss_fn_outputs) == 1
+    assert output.loss_fn_outputs[0]["logprobs"].tolist() == pytest.approx([-1.5, -1.5, -1.5])
+    assert len(mock_backend["calls"]["fwd_no_grad"]) == 1
 
 
 async def test_optim_step_threads_overrides(client, mock_backend):
@@ -329,7 +348,7 @@ async def test_asample_serves_current_gen(client, mock_backend):
         "/api/v1/asample",
         json={
             "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
-            "sampling_params": {"max_tokens": 4, "temperature": 0.7, "top_p": 0.9},
+            "sampling_params": {"max_tokens": 4, "temperature": 1.0, "top_p": 0.9},
             "num_samples": 2,
             "sampling_session_id": "ss@0",
         },
@@ -349,7 +368,7 @@ async def test_asample_serves_current_gen(client, mock_backend):
     (prompt, sp) = mock_backend["calls"]["generate"][-1]
     assert prompt == [1, 2, 3]
     assert sp["n"] == 2
-    assert sp["temperature"] == pytest.approx(0.7)
+    assert sp["temperature"] == pytest.approx(1.0)
     # RL loops always want logprobs.
     assert sp["logprobs"] == 1
 
@@ -451,38 +470,15 @@ async def test_cross_entropy_accepted_on_forward_backward(client, mock_backend):
     assert batch["batch"]["logprob_weights_shifted"].any()
 
 
-async def test_cross_entropy_accepted_on_forward(client, mock_backend):
-    """Pass 1: the no-grad forward whose log-probs the client differentiates."""
-    r = await client.post(
-        "/api/v1/forward",
-        json={
-            "forward_input": {
-                "data": [_mk_ce_datum_dict(weights=(0.0, 0.0, 0.0))],
-                "loss_fn": "cross_entropy",
-            },
-            "model_id": "main",
-        },
-    )
-    assert r.status_code == 200, r.text
-    fut_id = r.json()["request_id"]
-    out = (await client.post("/api/v1/retrieve_future", json={"request_id": fut_id})).json()
-    # One log-prob per model_input token, which is what the SDK reshapes
-    # against its own tensors before calling the user's loss.
-    assert len(out["loss_fn_outputs"]) == 1
-    assert len(out["loss_fn_outputs"][0]["logprobs"]["data"]) == 3
-
-
 # ---------------------------------------------------------------------------
 # Temperature
 # ---------------------------------------------------------------------------
 
 
-async def test_sample_refuses_temperature_a_backend_cannot_score(
-    client_fixed_temperature,
-):
+async def test_sample_refuses_temperature_a_backend_cannot_score(client):
     """A backend with no temperature post-processor trains at 1.0 whatever the
     sampler did, so anything else is a silent sampler/trainer mismatch."""
-    r = await client_fixed_temperature.post(
+    r = await client.post(
         "/api/v1/asample",
         json={
             "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1, 2]}]},
@@ -495,28 +491,13 @@ async def test_sample_refuses_temperature_a_backend_cannot_score(
     assert "temperature=1.0" in detail
 
 
-async def test_sample_allows_unit_temperature_on_such_a_backend(
-    client_fixed_temperature,
-):
-    r = await client_fixed_temperature.post(
-        "/api/v1/asample",
-        json={
-            "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1, 2]}]},
-            "num_samples": 1,
-            "sampling_params": {"temperature": 1.0, "max_tokens": 4},
-        },
-    )
-    assert r.status_code == 200, r.text
-
-
-async def test_sample_leaves_temperature_alone_when_supported(client):
-    """The default: a backend that can scale temperature is not second-guessed."""
+async def test_sample_allows_unit_temperature(client):
     r = await client.post(
         "/api/v1/asample",
         json={
             "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1, 2]}]},
             "num_samples": 1,
-            "sampling_params": {"temperature": 0.7, "max_tokens": 4},
+            "sampling_params": {"temperature": 1.0, "max_tokens": 4},
         },
     )
     assert r.status_code == 200, r.text

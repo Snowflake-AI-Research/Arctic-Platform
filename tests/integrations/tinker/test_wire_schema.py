@@ -13,14 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Wire schema round-trip tests.
-
-These exist to catch upstream ``tinker.types.*`` drift: for every wire type
-we redefine locally in ``arctic_platform.integrations.tinker.router``, dump a valid
-example to JSON and ensure our Pydantic parser accepts it. When the
-upstream tinker SDK adds/removes fields, one of these will start failing
-and point at the exact spot to update.
-"""
+"""JSON request and response model tests for the Tinker router."""
 
 from __future__ import annotations
 
@@ -33,7 +26,6 @@ from arctic_platform.integrations.tinker.router import CreateModelRequest
 from arctic_platform.integrations.tinker.router import CreateSessionRequest
 from arctic_platform.integrations.tinker.router import ForwardBackwardOutput
 from arctic_platform.integrations.tinker.router import ForwardBackwardRequest
-from arctic_platform.integrations.tinker.router import ForwardRequest
 from arctic_platform.integrations.tinker.router import FutureRetrieveRequest
 from arctic_platform.integrations.tinker.router import ModelInput
 from arctic_platform.integrations.tinker.router import OptimStepRequest
@@ -97,19 +89,6 @@ class TestRequestParsing:
         req = ForwardBackwardRequest.model_validate(body)
         assert req.forward_backward_input.loss_fn == "ppo"
         assert len(req.forward_backward_input.data) == 1
-
-    def test_forward_request_no_config(self):
-        body = {
-            "forward_input": {
-                "data": [
-                    {"model_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]}, "loss_fn_inputs": {}},
-                ],
-                "loss_fn": "ppo",
-            },
-            "model_id": "main",
-        }
-        req = ForwardRequest.model_validate(body)
-        assert req.forward_input.loss_fn == "ppo"
 
     def test_optim_step_request(self):
         body = {

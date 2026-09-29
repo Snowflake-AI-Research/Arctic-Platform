@@ -13,8 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for tinker_router adapters (Datum→batch, AdamParams→overrides,
-SamplingParams→vLLM, loss_fn_config→actor_config)."""
+"""Unit tests for Tinker request adapters."""
 
 from __future__ import annotations
 
@@ -27,7 +26,6 @@ from arctic_platform.integrations.tinker.router import EncodedTextChunk
 from arctic_platform.integrations.tinker.router import ModelInput
 from arctic_platform.integrations.tinker.router import SamplingParams
 from arctic_platform.integrations.tinker.router import TensorData
-from arctic_platform.integrations.tinker.router import _loss_fn_config_to_actor_config
 from arctic_platform.integrations.tinker.router import adam_params_to_optim_overrides
 from arctic_platform.integrations.tinker.router import datum_list_to_arctic_batch
 from arctic_platform.integrations.tinker.router import sampling_params_tinker_to_vllm
@@ -56,7 +54,6 @@ class TestDatumAdapter:
         out, _ = datum_list_to_arctic_batch(
             [datum],
             "ppo",
-            None,
             max_prompt_length=8,
             max_response_length=4,
             pad_token_id=0,
@@ -74,7 +71,6 @@ class TestDatumAdapter:
         out, _ = datum_list_to_arctic_batch(
             [_mk_datum([7, 8], [0.0, 0.0], [-2.0, -2.0], mask=[0, 0])],
             "ppo",
-            None,
             max_prompt_length=4,
             max_response_length=2,
             pad_token_id=42,
@@ -91,7 +87,6 @@ class TestDatumAdapter:
         out, _ = datum_list_to_arctic_batch(
             [d1, d2],
             "ppo",
-            None,
             max_prompt_length=8,
             max_response_length=4,
             pad_token_id=0,
@@ -112,7 +107,6 @@ class TestDatumAdapter:
         out, _ = datum_list_to_arctic_batch(
             [d],
             "ppo",
-            None,
             max_prompt_length=8,
             max_response_length=4,
             pad_token_id=0,
@@ -129,19 +123,16 @@ class TestDatumAdapter:
         out, _ = datum_list_to_arctic_batch(
             [d],
             "ppo",
-            None,
             max_prompt_length=4,
             max_response_length=4,
             pad_token_id=0,
         )
         # Response span is columns [mpl=4, mpl+1=5]; everything else is 0.
         assert out["batch"]["response_mask"][0].tolist() == [0, 0, 0, 0, 1, 1, 0, 0]
-        assert out["batch"]["prompts"][0].tolist() == [0, 0, 0, 1]
-        assert out["batch"]["responses"][0].tolist() == [2, 3, 0, 0]
 
     def test_weights_key_also_maps(self):
-        # Datum spec uses ``weights`` but cookbook writes ``mask`` — both
-        # must trigger the response-split for prompts/responses layout.
+        # Datum spec uses ``weights`` but cookbook writes ``mask``; both locate
+        # the prompt/response boundary.
         inputs = {
             "advantages": TensorData(dtype="float32", data=[0.0, 0.5, 0.5]),
             "logprobs": TensorData(dtype="float32", data=[-1.0, -1.0, -1.0]),
@@ -154,14 +145,10 @@ class TestDatumAdapter:
         out, _ = datum_list_to_arctic_batch(
             [d],
             "ppo",
-            None,
             max_prompt_length=4,
             max_response_length=2,
             pad_token_id=0,
         )
-        # prompt=[1] left-padded to length 4, response=[2, 3] right-padded to 2.
-        assert out["batch"]["prompts"][0].tolist() == [0, 0, 0, 1]
-        assert out["batch"]["responses"][0].tolist() == [2, 3]
         # response_mask lives on the full [B, seq_len=6] tensor; response
         # columns [mpl=4, mpl+1=5] are ones.
         assert out["batch"]["response_mask"][0].tolist() == [0, 0, 0, 0, 1, 1]
@@ -181,83 +168,22 @@ class TestDatumAdapter:
         out, _ = datum_list_to_arctic_batch(
             [d],
             "importance_sampling",
-            None,
             max_prompt_length=4,
             max_response_length=2,
             pad_token_id=0,
         )
-        assert out["batch"]["prompts"][0].tolist() == [0, 0, 0, 1]
-        assert out["batch"]["responses"][0].tolist() == [2, 3]
         assert out["batch"]["response_mask"][0].tolist() == [0, 0, 0, 0, 1, 1]
 
     def test_processing_carries_loss_fn(self):
-        # Arctic's LOSS_FNS ships one PPO-shaped loss (``verl_grpo``); the
-        # Tinker adapter maps any RL loss_fn to it and threads ``ppo`` /
-        # ``importance_sampling`` semantics through ``actor_config``.
+        # Both ratio losses use the same intermediate loss name.
         out, _ = datum_list_to_arctic_batch(
             [_mk_datum([1], [0.1], [-1.0])],
             "importance_sampling",
-            None,
             max_prompt_length=4,
             max_response_length=2,
             pad_token_id=0,
         )
         assert out["processing"]["loss_fn"] == "verl_grpo"
-
-    def test_forward_only_flag_present(self):
-        out, _ = datum_list_to_arctic_batch(
-            [_mk_datum([1], [0.1], [-1.0])],
-            "ppo",
-            None,
-            max_prompt_length=4,
-            max_response_length=2,
-            pad_token_id=0,
-            forward_only=True,
-        )
-        assert out["meta"]["forward_only"] is True
-        # actor_config is empty on forward_only (no loss reduction on the server).
-        assert out["meta"]["actor_config"] == {}
-
-    def test_max_response_len_threaded(self):
-        out, _ = datum_list_to_arctic_batch(
-            [_mk_datum([1], [0.1], [-1.0])],
-            "ppo",
-            None,
-            max_prompt_length=4,
-            max_response_length=7,
-            pad_token_id=0,
-        )
-        assert out["meta"]["max_response_len"] == 7
-
-
-class TestLossFnConfigMapping:
-    def test_ppo_default_clip(self):
-        cfg = _loss_fn_config_to_actor_config("ppo", None)
-        assert cfg["eps_clip"] == pytest.approx(0.2)
-        assert cfg["eps_clip_higher"] == pytest.approx(0.2)
-
-    def test_ppo_tight_clip(self):
-        cfg = _loss_fn_config_to_actor_config("ppo", {"clip_low_threshold": 0.9, "clip_high_threshold": 1.1})
-        assert cfg["eps_clip"] == pytest.approx(0.1)
-        assert cfg["eps_clip_higher"] == pytest.approx(0.1)
-
-    def test_importance_sampling_disables_clip(self):
-        cfg = _loss_fn_config_to_actor_config("importance_sampling", None)
-        assert cfg["eps_clip"] > 1e6
-        assert cfg["eps_clip_higher"] > 1e6
-
-    def test_kl_coef_maps(self):
-        cfg = _loss_fn_config_to_actor_config("ppo", {"kl_coef": 0.05})
-        assert cfg["kl_loss_coef"] == pytest.approx(0.05)
-        assert cfg["use_kl_loss"] is True
-
-    def test_kl_coef_zero_disables_kl(self):
-        cfg = _loss_fn_config_to_actor_config("ppo", {"kl_coef": 0.0})
-        assert cfg["use_kl_loss"] is False
-
-    def test_entropy_coef_maps(self):
-        cfg = _loss_fn_config_to_actor_config("ppo", {"entropy_coef": 1e-3})
-        assert cfg["entropy_coeff"] == pytest.approx(1e-3)
 
 
 class TestAdamParams:
