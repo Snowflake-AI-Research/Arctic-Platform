@@ -66,6 +66,7 @@ class LoadedModel:
 
 Loader = Callable[[LoaderContext], LoadedModel]
 Matcher = Callable[[LoaderContext], bool]
+SpecValidator = Callable[[ModelSpec], None]
 
 
 @dataclass
@@ -73,6 +74,7 @@ class _LoaderEntry:
     fn: Loader
     matches: Matcher | None
     options: type[BaseModel] | None = None
+    validate_spec: SpecValidator | None = None
 
 
 _LOADERS: dict[str, _LoaderEntry] = {}
@@ -84,6 +86,7 @@ def register_loader(
     matches: Matcher | None = None,
     default: bool = False,
     options: type[BaseModel] | None = None,
+    validate_spec: SpecValidator | None = None,
 ) -> Callable[[Loader], Loader]:
     """Register a loader by name.
 
@@ -97,7 +100,12 @@ def register_loader(
         if default:
             assert _DEFAULT_LOADER is None, f"default loader already registered: {_DEFAULT_LOADER!r}"
             _DEFAULT_LOADER = name
-        _LOADERS[name] = _LoaderEntry(fn=fn, matches=matches, options=options)
+        _LOADERS[name] = _LoaderEntry(
+            fn=fn,
+            matches=matches,
+            options=options,
+            validate_spec=validate_spec,
+        )
         return fn
 
     return decorator
@@ -110,6 +118,12 @@ def is_registered_loader(name: str) -> bool:
 def get_loader_options_model(name: str) -> type[BaseModel] | None:
     """Return the pydantic options model registered for a loader, if any."""
     return _LOADERS[name].options
+
+
+def validate_loader_spec(name: str, spec: ModelSpec) -> None:
+    validator = _LOADERS[name].validate_spec
+    if validator is not None:
+        validator(spec)
 
 
 def resolve_loader_name(spec: ModelSpec) -> str:

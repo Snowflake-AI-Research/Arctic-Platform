@@ -631,7 +631,7 @@ def reorg_global_batch(
 
     # if there is only world size batches or less then we can't load balance anything - return immediately
     if batch_size <= world_size:
-        return batch
+        return batch, None
 
     # pr0(f"{batch_size=}")
     # pr0(f"{world_size=}")

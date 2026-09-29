@@ -221,16 +221,17 @@ class ArcticRLRayClient:
         Parameters
         ----------
         batch:
-            Dict with ``args`` and ``kwargs`` (model inputs). When using the
-            pluggable loss pattern, also include ``context`` (RL tensors) here
-            or let ``processing`` drive the dispatch.
+            AP ``{"batch", "meta", "processing"}``. Model inputs and batch-dim
+            RL tensors (``advantages``, ``loss_mask``, shifted log-probs, …)
+            live in ``batch`` so DP shards them. Scalars stay in ``meta``.
+            Cortex ``{"kwargs", "context"}`` is accepted and rewritten at unpack.
 
             **Log-prob convention (``_shifted`` suffix contract):**
-            All log-prob tensors in ``context`` must follow the roll(-1)
+            All log-prob tensors in ``batch`` must follow the roll(-1)
             convention — ``tensor[i]`` is the log-prob of *the next token*
             (``input_ids[i+1]``), matching how the server computes current
             log-probs (``labels = torch.roll(input_ids, shifts=-1)``).
-            The ``_shifted`` suffix in context key names encodes this:
+            The ``_shifted`` suffix encodes this:
 
             - ``old_log_probs_shifted`` — behavioral policy log-probs after roll
             - ``prox_logp_shifted``     — proximal log-probs after roll

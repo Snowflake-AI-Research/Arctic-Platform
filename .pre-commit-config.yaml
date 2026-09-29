@@ -1,7 +1,7 @@
 # TODO(qwen35): files vendored/copied from PrimeRL are skipped by ALL hooks while the
 # qwen3_5_moe loader is being integrated (attribution handled separately). RE-ENABLE by
-# removing this global exclude once the qwen35 implementation is refactored.
-exclude: ^(arctic_platform/model/implementations/qwen35/|cortex-client/)
+# removing this global exclude once the qwen35 and shared MoE implementations are refactored.
+exclude: ^(arctic_platform/model/implementations/(qwen35|moe)/|cortex-client/)
 
 repos:
   - repo: local

@@ -1,0 +1,246 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Loss-object contract and compatibility adapter for function losses."""
+
+from __future__ import annotations
+
+import inspect
+from abc import ABC
+from abc import abstractmethod
+from collections.abc import Callable
+from collections.abc import Sequence
+from typing import Any
+
+from arctic_platform.common.registry import LOSS_CAPABILITIES_ATTR
+from arctic_platform.common.registry import LOSS_FNS
+from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
+from arctic_platform.common.registry import resolve_fn
+from arctic_platform.registry import RegistryMeta
+from arctic_platform.registry import RegistryValidationError
+from arctic_platform.registry import get_registered_class
+
+REQUIRES_ALIGNED_TOKEN_LOGPROBS = "requires_aligned_token_logprobs"
+REQUIRES_TOKEN_LOGPROBS = "requires_token_logprobs"
+_LOSS_OBJECT_KEY = "_arctic_platform_loss_object"
+
+
+def _uses_merged_context_abi(loss_fn: Callable) -> bool:
+    """Classify a legacy loss without invoking it or masking its own errors."""
+    try:
+        signature = inspect.signature(loss_fn)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"Cannot inspect legacy loss callable {loss_fn!r}") from exc
+
+    placeholders = (None,) * 5
+    try:
+        signature.bind(*placeholders)
+    except TypeError:
+        pass
+    else:
+        return False
+
+    try:
+        signature.bind(*placeholders[:4])
+    except TypeError as exc:
+        raise TypeError(
+            f"Legacy loss callable {loss_fn!r} must accept either "
+            "(model_outputs, batch, meta, config, device) or "
+            "(model_outputs, context, config, device)"
+        ) from exc
+    return True
+
+
+class BaseLoss(ABC, metaclass=RegistryMeta):
+    """A processing loss plus callbacks for the boundaries it owns.
+
+    Callback arguments are ordinary dictionaries, sequences, and tensors so
+    this contract can be used by AP directly or by an external DSS runtime.
+    Lifecycle callbacks default to no-ops; response filtering drops raw logits
+    unless a subclass explicitly retains them.
+    """
+
+    name: str
+    capabilities: frozenset[str] = frozenset()
+
+    @classmethod
+    def _validate_subclass(cls) -> None:
+        if inspect.isabstract(cls):
+            raise RegistryValidationError(f"{cls.__name__} must implement the abstract loss method.")
+
+    def batching_callback(self, request: dict) -> None:
+        """Amend one whole request before data/sequence-parallel sharding."""
+
+    def has_capability(self, capability: str) -> bool:
+        """Whether this objective declares an execution requirement."""
+        return capability in self.capabilities
+
+    def is_legacy_adapter_for(self, loss_fn: Callable) -> bool:
+        """Whether this object wraps exactly *loss_fn* from the function registry."""
+        return False
+
+    def requires_loss_mask_normalization(self) -> bool:
+        """Whether DSS should derive global normalization from ``loss_mask``."""
+        return False
+
+    def validation_callback(self, context: dict, config: dict) -> None:
+        """Validate one request or packed model window before execution."""
+
+    def model_forward_callback(
+        self,
+        model_kwargs: dict,
+        context: dict,
+        config: dict,
+        output_keys: list[str],
+    ) -> None:
+        """Amend model kwargs and name objective-owned model outputs."""
+
+    def packed_reduction_callback(
+        self,
+        microbatches: Sequence[dict],
+        config: dict,
+        loss_fn_name: str,
+    ) -> Any | None:
+        """Return objective-owned packed reduction metadata, if any."""
+        return None
+
+    def metrics_callback(self, worker_metrics: Sequence[dict], metrics: dict) -> None:
+        """Combine or amend metrics after worker results are available."""
+
+    def reporting_callback(
+        self,
+        worker_metrics: Sequence[dict],
+        metrics: dict,
+        avg_loss: float,
+    ) -> float:
+        """Amend the native coordinator's reported loss without changing gradients."""
+        return avg_loss
+
+    def output_callback(self, model_outputs: dict) -> None:
+        """Remove raw logits before response assembly by default."""
+        model_outputs.pop("logits", None)
+
+    @abstractmethod
+    def loss(
+        self,
+        model_outputs: dict,
+        batch: dict,
+        meta: dict,
+        config: dict,
+        device: str,
+    ):
+        """Return ``(loss_tensor, metrics)`` on the legacy five-argument ABI."""
+        raise NotImplementedError
+
+
+class _LegacyLossAdapter(BaseLoss):
+    """Expose an existing function loss through the callback contract."""
+
+    _skip_registry_registration = True
+    name = "_legacy_loss_adapter"
+
+    def __init__(self, name: str, loss_fn: Callable) -> None:
+        self.name = name
+        self._loss_fn = loss_fn
+        self._uses_merged_context = _uses_merged_context_abi(loss_fn)
+        self.capabilities = getattr(loss_fn, LOSS_CAPABILITIES_ATTR, frozenset())
+
+    def is_legacy_adapter_for(self, loss_fn: Callable) -> bool:
+        return self._loss_fn is loss_fn
+
+    def requires_loss_mask_normalization(self) -> bool:
+        return True
+
+    def packed_reduction_callback(
+        self,
+        microbatches: Sequence[dict],
+        config: dict,
+        loss_fn_name: str,
+    ) -> Any | None:
+        resolver = getattr(self._loss_fn, PACKED_LOSS_REDUCTION_ATTR, None)
+        if resolver is None:
+            return None
+        reduction = resolver(microbatches, config, loss_fn_name)
+        if reduction is None:
+            return None
+
+        # Dotted legacy losses may return the equivalent type from their own
+        # package. Canonicalize it here while native BaseLoss callbacks remain
+        # subject to the strict AP type check.
+        from .packed_reduction import PackedLossReduction
+
+        if isinstance(reduction, PackedLossReduction):
+            return reduction
+        try:
+            loss_scales = reduction.loss_scales
+            reporting_weights = reduction.reporting_weights
+            loss_is_additive = reduction.loss_is_additive
+        except AttributeError:
+            return reduction
+        return PackedLossReduction(
+            loss_scales=tuple(loss_scales),
+            reporting_weights=tuple(reporting_weights),
+            loss_is_additive=loss_is_additive,
+        )
+
+    def output_callback(self, model_outputs: dict) -> None:
+        model_outputs.pop("logits", None)
+
+    def loss(
+        self,
+        model_outputs: dict,
+        batch: dict,
+        meta: dict,
+        config: dict,
+        device: str,
+    ):
+        if self._uses_merged_context:
+            return self._loss_fn(model_outputs, {**meta, **batch}, config, device)
+        return self._loss_fn(model_outputs, batch, meta, config, device)
+
+
+def resolve_loss(name: str) -> BaseLoss:
+    """Prefer a registered loss class, then adapt the legacy function registry."""
+    try:
+        loss_cls = get_registered_class(BaseLoss.__name__, name)
+    except LookupError:
+        return _LegacyLossAdapter(name, resolve_fn(LOSS_FNS, name))
+    return loss_cls()
+
+
+def prepare_request_loss(request: dict) -> BaseLoss | None:
+    """Resolve and batch-amend one whole processing request before sharding."""
+    processing = request.get("processing")
+    if not isinstance(processing, dict):
+        return None
+    loss_fn_name = processing.get("loss_fn", "ap_grpo")
+    if loss_fn_name is None:
+        return None
+    loss_object = resolve_loss(loss_fn_name)
+    loss_object.batching_callback(request)
+    return loss_object
+
+
+def _attach_loss_object_to_shards(shards: Sequence[dict], loss_object: BaseLoss | None) -> None:
+    """Carry batching-established objective state over an internal worker RPC."""
+    if loss_object is None:
+        return
+    for shard in shards:
+        shard[_LOSS_OBJECT_KEY] = loss_object
+
+
+def _pop_loss_object(request: dict) -> BaseLoss | None:
+    """Consume the objective carried by a coordinator after request batching."""
+    return request.pop(_LOSS_OBJECT_KEY, None)

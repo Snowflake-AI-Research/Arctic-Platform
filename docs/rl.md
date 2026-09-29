@@ -162,8 +162,8 @@ Unlike SFT's flat labels batch, RL `fwd_bwd` typically carries:
         ...
     },
     "processing": {
-        "loss_fn": "grpo",            # or dotted path
-        "post": ["compute_logprobs", ...],
+        "loss_fn": "ap_grpo",          # or "grpo" / dotted path
+        "post": ["ap_compute_logprobs", ...],  # Cortex post is "compute_logprobs"
         "config": {"eps_clip": 0.2, ...},
     },
 }
@@ -172,6 +172,10 @@ Unlike SFT's flat labels batch, RL `fwd_bwd` typically carries:
 Log-prob tensors often use a `_shifted` suffix convention (see
 `arctic_platform.rl.http_client`). Batch shapes still differ slightly across
 backends — treat unification as WIP.
+
+`fwd_bwd` omits the per-token result `batch` by default (VeRL only reads
+`metrics`). Set `meta.return_fwd_batch` (or Cortex `context.return_fwd_batch`)
+to include the merged `batch` in the response (TRL server-side-loss).
 
 Metrics use the shared `{name}.sum` / `{name}.tokens` pairing; see
 [`common.md`](common.md#metric-aggregation).

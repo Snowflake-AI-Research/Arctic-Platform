@@ -275,7 +275,7 @@ vLLM settings on `sampling`.
 | `training.checkpoint_path` | **required** for new jobs | Server-side checkpoint dir |
 | `training.ds_config` | `null` | DeepSpeed config (optimizer, scheduler, micro-batch, ZeRO, bf16, …) |
 | `training.ds_worker_config` | `null` | e.g. `attn_implementation`, `enable_gradient_checkpointing` |
-| `training.peft` | `null` | LoRA adapter config. **Cortex only** — rejected at config construction against an `OnPremConfig` backend, which trains dense |
+| `training.peft` | `null` | PEFT adapter config; `null` selects dense training, `{}` is invalid. On-prem supports training; Cortex also supports adapter sampling/sync |
 | `training.cuda_ipc` / `training.low_memory` | `false` / `false` | Colocated weight-sync strategy (only with `sampling_gpus > 0`), set on the training job at init; `sync_weights(cuda_ipc=…, low_memory=…)` overrides one call |
 | `sampling_gpus` / `sampling.vllm` | `0` / `{}` | Optional vLLM sampling job for `generate` / `sync_weights` |
 | `training_job_id` / `sampling_job_id` | `null` | Reattach to existing jobs |
@@ -286,6 +286,36 @@ inside `ds_config`. Set it to the real step budget, not epoch count.
 
 Because the config is shared, `ArcticSFTClient` also accepts a `CortexConfig`
 backend and a log-prob job; neither is used by a plain SFT run.
+
+For on-prem LoRA training, set `training.peft` in the typed config:
+
+```python
+from arctic_platform.client import TrainingConfig
+
+training = TrainingConfig(
+    checkpoint_path="/data-fast/checkpoints/qwen-lora",
+    ds_worker_config={"attn_implementation": "flash_attention_3"},
+    peft={
+        "peft_type": "LORA",
+        "task_type": "CAUSAL_LM",
+        "r": 8,
+        "lora_alpha": 16,
+        "target_modules": ["q_proj", "v_proj"],
+    },
+)
+```
+
+Pass this `training` to `ArcticSFTClientConfig` with an `OnPremConfig` backend,
+`training_gpus=1` and `sampling_gpus=0`. The client forwards the adapter config
+to the model's PEFT patch, which runs before DeepSpeed and optimizer creation.
+Canonical PEFT type names such as `LORA` and legacy names such as `Lora` are
+accepted. An omitted config or `None` disables PEFT; a supplied config must
+include `peft_type`.
+
+On-prem adapter sync to a sampler is not implemented yet, so combining PEFT
+with a sampling allocation or sampling job ID is rejected. A separate log-prob
+job uses the unadapted base model. The custom Qwen3.5 MoE loader also rejects
+this PEFT patch pending its expert-adapter integration.
 
 ## CPU-only client requirement
 
