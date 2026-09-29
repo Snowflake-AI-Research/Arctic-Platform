@@ -23,7 +23,9 @@ from numbers import Real
 
 import torch
 
+from arctic_platform.common.registry import declare_loss_capabilities
 from arctic_platform.common.registry import register_loss_fn
+from arctic_platform.rl.processors.base_loss import REQUIRES_TOKEN_LOGPROBS
 
 from .functional import _resolve_dp_size
 from .functional import canonicalize_loss_mask
@@ -177,6 +179,7 @@ def _causal_cross_entropy_packed_reduction(
     "causal_cross_entropy",
     packed_loss_reduction=_causal_cross_entropy_packed_reduction,
 )
+@declare_loss_capabilities(REQUIRES_TOKEN_LOGPROBS)
 def causal_cross_entropy_loss(
     model_outputs: dict,
     batch: dict,

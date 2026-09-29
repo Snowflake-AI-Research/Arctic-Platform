@@ -66,7 +66,10 @@ def canonicalize_loss_mask(
                 "loss_fn='causal_cross_entropy' for fractional token weights"
             )
         return loss_mask.to(device=reference.device, dtype=torch.bool)
-    return loss_mask.to(device=reference.device, dtype=torch.float32)
+    canonical = loss_mask.to(device=reference.device, dtype=torch.float32)
+    if not torch.isfinite(canonical).all().item():
+        raise ValueError(f"{objective} loss_mask values must be representable as finite float32 values")
+    return canonical
 
 
 def _packed_per_sequence_sums(

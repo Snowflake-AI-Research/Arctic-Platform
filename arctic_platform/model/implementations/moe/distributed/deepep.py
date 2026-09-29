@@ -6,8 +6,6 @@ from deep_ep.utils import EventHandle
 from deep_ep.utils import EventOverlap
 from torch.distributed import ProcessGroup
 
-from arctic_platform.model.implementations.gpu import debug
-
 from .token_permute import permute_tokens
 from .token_permute import unpermute_tokens
 
@@ -280,7 +278,6 @@ def finalize_dispatch_tokens(
 
     hidden_states = pending_state.hidden_states
     num_recv_tokens = hidden_states.shape[0]
-    debug.maybe_record_recv_tokens(num_recv_tokens)
     hidden_states, permuted_scores, permuted_indices, num_tokens_per_expert = permute_tokens(
         hidden_states,
         pending_state.dispatched_indices,

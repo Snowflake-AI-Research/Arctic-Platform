@@ -5,8 +5,6 @@ from dataclasses import dataclass
 import torch
 from torch.distributed import ProcessGroup
 
-from arctic_platform.model.implementations.gpu import debug
-
 from ..token_combine import sum_rows_by_token
 from .uccl_ep import Buffer
 from .uccl_ep import EventOverlap
@@ -309,7 +307,6 @@ def finalize_dispatch_tokens(
 
     hidden_states = pending_state.hidden_states
     num_recv_tokens = hidden_states.shape[0]
-    debug.maybe_record_recv_tokens(num_recv_tokens)
     hidden_states, permuted_scores, permuted_indices = _permute_tokens(
         hidden_states,
         pending_state.dispatched_indices,

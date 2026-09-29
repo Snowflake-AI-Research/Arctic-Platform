@@ -45,7 +45,6 @@ import torch
 
 from arctic_platform.model.config import ActivationOffloadConfig
 from arctic_platform.model.config import PinMemoryMaxSize
-from arctic_platform.model.implementations.debug.activation_offload import maybe_log_activation_offload_slot
 from arctic_platform.model.implementations.gpu.pinned_staging_cache import PoolKey
 from arctic_platform.model.implementations.gpu.pinned_staging_cache import _PinnedCacheStats
 from arctic_platform.model.implementations.gpu.pinned_staging_cache import _PinnedEntry
@@ -353,12 +352,10 @@ class ActivationOffloadManager:
 
     def pack(self, tensor: torch.Tensor):
         if not self._eligible(tensor):
-            maybe_log_activation_offload_slot(tensor, staged=False)
             return (False, tensor)
         self._ensure_streams(tensor.device)
         slot_id = self._next_id
         self._next_id += 1
-        maybe_log_activation_offload_slot(tensor, staged=True, slot_id=slot_id)
         self._slots[slot_id] = _Slot(slot_id, tensor)
         self._append_order(slot_id)
         offload_index = len(self._order) - 1 - self.keep_last_n

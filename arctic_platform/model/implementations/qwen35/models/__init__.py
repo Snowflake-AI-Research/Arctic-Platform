@@ -16,7 +16,7 @@ from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutp
 
 logger = logging.getLogger(__name__)
 
-# Make custom config discoverable by AutoConfig.
+# Make custom config discoverable by AutoConfig
 AutoConfig.register("qwen3_5_moe", HFQwen3_5MoeConfig, exist_ok=True)
 
 _CUSTOM_CAUSAL_LM_MAPPING = _LazyAutoMapping(CONFIG_MAPPING_NAMES, OrderedDict())

@@ -20,6 +20,12 @@ functions are registered in the global registries (POST_PROCESSORS,
 LOSS_FNS).
 """
 
+from .base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
+from .base_loss import REQUIRES_TOKEN_LOGPROBS
+from .base_loss import BaseLoss
+from .base_loss import prepare_request_loss
+from .base_loss import resolve_loss
+
 # Packed apply + CCE (importing registers causal_cross_entropy)
 from .causal_cross_entropy import causal_cross_entropy_loss
 
@@ -35,6 +41,11 @@ from .functional import kl_penalty
 from .functional import masked_normalization
 from .functional import ppo_actor_loss_fn
 from .functional import sapo_loss_fn
+
+# The class registry is separate and does not replace same-named legacy functions.
+from .grouped_distillation import GroupedDistillationLoss
+from .grouped_distillation import GRPOGroupedDistillationLoss
+from .grouped_distillation import grouped_divergence
 
 # GRPO loss (importing this module registers grpo_loss into LOSS_FNS)
 from .grpo import _EPSILON
@@ -121,6 +132,11 @@ __all__ = [
     # pipeline
     "POST_PROCESSORS",
     "LOSS_FNS",
+    "BaseLoss",
+    "prepare_request_loss",
+    "REQUIRES_ALIGNED_TOKEN_LOGPROBS",
+    "REQUIRES_TOKEN_LOGPROBS",
+    "resolve_loss",
     "register_post_processor",
     "register_loss_fn",
     "_resolve_fn",
@@ -135,6 +151,9 @@ __all__ = [
     "combine_packed_metrics",
     "resolve_packed_loss_reduction",
     "causal_cross_entropy_loss",
+    "GroupedDistillationLoss",
+    "GRPOGroupedDistillationLoss",
+    "grouped_divergence",
     # packing
     "N_TOKENS_PER_PAGE",
     "_align",
