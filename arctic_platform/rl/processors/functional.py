@@ -659,9 +659,9 @@ def _compute_sequence_level_ratio_and_advantages(
         advantages = torch.where(loss_mask, advantages, 0.0)
     else:
         log_ratio_sum_per_seq = torch.where(loss_mask, log_ratio, 0.0).sum(dim=1)
-        advantages_sum_per_seq = (
-            torch.where(loss_mask, advantages, 0.0) if masked_advantages else advantages
-        ).sum(dim=-1)
+        advantages_sum_per_seq = (torch.where(loss_mask, advantages, 0.0) if masked_advantages else advantages).sum(
+            dim=-1
+        )
         valid_count_per_seq = loss_mask.sum(dim=1)
         if sp_group is not None:
             log_ratio_sum_per_seq, advantages_sum_per_seq, valid_count_per_seq = _sequence_parallel_sum(
@@ -700,7 +700,9 @@ def ppo_actor_loss_fn(
 ) -> tuple[torch.Tensor, dict]:
     if importance_sampling_level == "sequence":
         log_ratio = logprobs - proximal_logprobs
-        ratio, advantages = _compute_sequence_level_ratio_and_advantages(log_ratio, advantages, loss_mask, cu_seqlens, sequence_is_masked_advantages)
+        ratio, advantages = _compute_sequence_level_ratio_and_advantages(
+            log_ratio, advantages, loss_mask, cu_seqlens, sequence_is_masked_advantages
+        )
     elif importance_sampling_level == "token":
         ratio = torch.where(loss_mask, torch.exp(logprobs - proximal_logprobs), 0)
     else:
@@ -785,7 +787,9 @@ def sapo_loss_fn(
     advantages = advantages.detach()
     log_ratio = logprobs - old_logprobs
     if importance_sampling_level == "sequence":
-        ratio, advantages = _compute_sequence_level_ratio_and_advantages(log_ratio, advantages, loss_mask, cu_seqlens, sequence_is_masked_advantages)
+        ratio, advantages = _compute_sequence_level_ratio_and_advantages(
+            log_ratio, advantages, loss_mask, cu_seqlens, sequence_is_masked_advantages
+        )
     elif importance_sampling_level == "token":
         ratio = torch.exp(log_ratio)
     else:
@@ -861,7 +865,9 @@ def cispo_actor_loss_fn(
     if importance_sampling_level == "sequence":
         log_ratio = torch.where(loss_mask, logprobs - proximal_logprobs, torch.zeros_like(logprobs))
         log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
-        ratio, advantages = _compute_sequence_level_ratio_and_advantages(log_ratio, advantages, loss_mask, cu_seqlens, sequence_is_masked_advantages)
+        ratio, advantages = _compute_sequence_level_ratio_and_advantages(
+            log_ratio, advantages, loss_mask, cu_seqlens, sequence_is_masked_advantages
+        )
     elif importance_sampling_level == "token":
         log_ratio = torch.where(loss_mask, logprobs - proximal_logprobs, torch.zeros_like(logprobs))
         log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)

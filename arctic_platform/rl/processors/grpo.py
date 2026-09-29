@@ -596,13 +596,12 @@ def _grpo_config_values(config: dict) -> dict:
     values.update((key, config[key]) for key in values.keys() & config.keys())
     return values
 
+
 def _config_flag(config: dict, key: str) -> bool:
     value = config.get(key, False)
     if not isinstance(value, bool):
         raise ValueError(f"{key} must be a bool, got {value!r}")
     return value
-
-
 
 
 def _grpo_loss(
@@ -870,10 +869,7 @@ def _grpo_packed_loss_reduction(
         )
     elif mode in ("seq-mean-token-sum", "seq-mean-token-mean"):
         sp_group = _get_sequence_parallel_group() if config.get("seq_mean_per_packed_sequence", False) else None
-        weights = [
-            _active_sequence_count(microbatch, mask, sp_group)
-            for microbatch, mask in zip(microbatches, masks)
-        ]
+        weights = [_active_sequence_count(microbatch, mask, sp_group) for microbatch, mask in zip(microbatches, masks)]
         reduction = (
             additive_packed_loss_reduction(weights)
             if config.get("global_batch_size") is not None

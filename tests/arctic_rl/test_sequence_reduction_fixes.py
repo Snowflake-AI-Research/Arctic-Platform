@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Layout-independent sequence means and masked IS; norm mode retains local-width scaling."""
 
 from __future__ import annotations
@@ -29,16 +44,25 @@ def _run(layout, config, *, loss_mask=None, advantages=ADVANTAGES):
     if layout == "packed":
         leaf = LOGPROBS.clone().requires_grad_(True)
         model = dict(logprobs=leaf)
-        context = dict(old_log_probs_shifted=OLD, advantages=advantages, loss_mask=mask,
-                       cu_seqlens=torch.tensor([0, 1, 4], dtype=torch.int32))
+        context = dict(
+            old_log_probs_shifted=OLD,
+            advantages=advantages,
+            loss_mask=mask,
+            cu_seqlens=torch.tensor([0, 1, 4], dtype=torch.int32),
+        )
     else:
         index = torch.tensor([[0, -1, -1], [1, 2, 3]])
         valid = index >= 0
-        pad = lambda t, fill: torch.where(valid, t[index.clamp(min=0)], torch.full_like(t[index.clamp(min=0)], fill))
+
+        def pad(t, fill):
+            gathered = t[index.clamp(min=0)]
+            return torch.where(valid, gathered, torch.full_like(gathered, fill))
+
         leaf = LOGPROBS.clone().requires_grad_(True)
         model = dict(logprobs=pad(leaf, 0.0))
-        context = dict(old_log_probs_shifted=pad(OLD, 0.0), advantages=pad(advantages, 9.0),
-                       loss_mask=pad(mask, False) & valid)
+        context = dict(
+            old_log_probs_shifted=pad(OLD, 0.0), advantages=pad(advantages, 9.0), loss_mask=pad(mask, False) & valid
+        )
     loss, _ = grpo_loss(model, context, {}, dict(use_cispo_loss=True, is_weight_clip_max=5.0, **config), "cpu")
     (grad,) = torch.autograd.grad(loss, leaf)
     return loss.detach(), grad
@@ -95,18 +119,35 @@ def test_fix_flags_through_packing_and_dp_merge(contract, mode):
     mask = torch.tensor([[True, False, False], [True, True, True]])
     context = dict(old_log_probs_shifted=OLD[ids], advantages=ADVANTAGES[ids], loss_mask=mask)
     flags = dict(seq_mean_per_packed_sequence=True, sequence_is_masked_advantages=True)
-    config = dict(flags, use_cispo_loss=True, is_weight_clip_max=5.0, loss_agg_mode=mode,
-                  importance_sampling_level="sequence", global_batch_size=2)
+    config = dict(
+        flags,
+        use_cispo_loss=True,
+        is_weight_clip_max=5.0,
+        loss_agg_mode=mode,
+        importance_sampling_level="sequence",
+        global_batch_size=2,
+    )
     if contract == "grpo_echo_v1":
         config.update(aux_ce_weight=0.0, echo_global_num_sequences=2)
-        context.update(sft_mask=torch.zeros_like(mask), echo_observation_mask=torch.zeros_like(mask),
-                       echo_observation_token_counts=torch.zeros(2))
+        context.update(
+            sft_mask=torch.zeros_like(mask),
+            echo_observation_mask=torch.zeros_like(mask),
+            echo_observation_token_counts=torch.zeros(2),
+        )
     results = []
     for width in (4, 3):
         engine = _Engine()
-        result = run_pipeline(engine, (), dict(input_ids=ids, attention_mask=mask), context,
-                              dict(loss_fn=contract, config=config), "cpu", backward="loss_only",
-                              max_tokens_per_mb=width, return_tensors=True)
+        result = run_pipeline(
+            engine,
+            (),
+            dict(input_ids=ids, attention_mask=mask),
+            context,
+            dict(loss_fn=contract, config=config),
+            "cpu",
+            backward="loss_only",
+            max_tokens_per_mb=width,
+            return_tensors=True,
+        )
         (grad,) = torch.autograd.grad(result["loss_tensor"], engine.logprobs)
         results.append((result["loss_tensor"].detach(), grad, result["metrics"]))
     torch.testing.assert_close(results[0][:2], results[1][:2])
@@ -131,14 +172,28 @@ def _sp_frame():
 
 
 def _sp_loss(logprobs, old, advantages, masks, cu_seqlens):
-    contexts = [dict(input_ids=torch.zeros_like(mask, dtype=torch.long), old_log_probs_shifted=old,
-                     advantages=advantages, loss_mask=mask, cu_seqlens=cu_seqlens)
-                for mask in masks]
-    config = dict(use_cispo_loss=True, is_weight_clip_max=5.0, loss_agg_mode="seq-mean-token-mean",
-                  seq_mean_per_packed_sequence=True, dp_size=1)
+    contexts = [
+        dict(
+            input_ids=torch.zeros_like(mask, dtype=torch.long),
+            old_log_probs_shifted=old,
+            advantages=advantages,
+            loss_mask=mask,
+            cu_seqlens=cu_seqlens,
+        )
+        for mask in masks
+    ]
+    config = dict(
+        use_cispo_loss=True,
+        is_weight_clip_max=5.0,
+        loss_agg_mode="seq-mean-token-mean",
+        seq_mean_per_packed_sequence=True,
+        dp_size=1,
+    )
     reduction = resolve_packed_loss_reduction(dict(loss_fn="grpo", config=config), contexts)
-    return sum(grpo_loss(dict(logprobs=logprobs), context, {}, config, "cpu")[0] * scale
-               for context, scale in zip(contexts, reduction.loss_scales))
+    return sum(
+        grpo_loss(dict(logprobs=logprobs), context, {}, config, "cpu")[0] * scale
+        for context, scale in zip(contexts, reduction.loss_scales)
+    )
 
 
 def _sp_worker(rank, world_size, init_method, case):
