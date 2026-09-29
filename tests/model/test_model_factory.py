@@ -238,6 +238,23 @@ class TestQwenDenseLoader:
         with pytest.raises(ValueError, match="requires sp_group"):
             load_qwen_dense(LoaderContext(spec=spec))
 
+    def test_loader_applies_required_sequence_parallel_setup(self, monkeypatch):
+        from arctic_platform.model import ParallelismConfig
+        from arctic_platform.model.loaders.qwen_dense import load_qwen_dense
+
+        model = nn.Module()
+        model.config = types.SimpleNamespace(model_type="qwen3", use_cache=True)
+        monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
+        spec = ModelSpec(
+            model_path_or_name="qwen",
+            loader="qwen_dense",
+            parallelism=ParallelismConfig(sequence_parallel=2),
+        )
+
+        load_qwen_dense(LoaderContext(spec=spec, parallel_groups={"sp_group": object()}))
+
+        assert model.config.use_cache is False
+
 
 class TestFromDsWorkerConfig:
     def test_defaults_preserve_worker_behavior(self):
@@ -342,7 +359,7 @@ class TestLigerPatch:
         }
 
 
-class TestQwenDensePatch:
+class TestModelFeaturePatches:
     class _Layer(nn.Module):
         def __init__(self):
             super().__init__()
@@ -352,11 +369,11 @@ class TestQwenDensePatch:
             self.fullgraph = fullgraph
 
     class _Model(nn.Module):
-        def __init__(self, model_type="qwen3"):
+        def __init__(self):
             super().__init__()
-            self.config = types.SimpleNamespace(model_type=model_type, use_cache=True)
+            self.config = types.SimpleNamespace(model_type="qwen3", use_cache=True)
             self.model = nn.Module()
-            self.model.layers = nn.ModuleList([TestQwenDensePatch._Layer(), TestQwenDensePatch._Layer()])
+            self.model.layers = nn.ModuleList([TestModelFeaturePatches._Layer(), TestModelFeaturePatches._Layer()])
             self.gradient_checkpointing_kwargs = None
             self.input_grads_enabled = False
 
@@ -366,9 +383,44 @@ class TestQwenDensePatch:
         def enable_input_require_grads(self):
             self.input_grads_enabled = True
 
-    def test_applies_checkpointing_compile_and_tiling(self, monkeypatch):
-        from arctic_platform.model.config import QwenDensePatch
-        from arctic_platform.model.patches.qwen_dense import apply_qwen_dense
+    def test_checkpointing_and_compile_are_independent(self):
+        from arctic_platform.model.config import CompilePatch
+        from arctic_platform.model.patches.compile import apply_compile
+        from arctic_platform.model.patches.gradient_checkpointing import apply_gradient_checkpointing
+
+        model = self._Model()
+        apply_gradient_checkpointing(model, _ctx(gradient_checkpointing=True))
+        apply_compile(model, _ctx(compile=CompilePatch(fullgraph=True)))
+
+        assert model.config.use_cache is False
+        assert model.gradient_checkpointing_kwargs == {"use_reentrant": False}
+        assert model.input_grads_enabled is True
+        assert [layer.fullgraph for layer in model.model.layers] == [True, True]
+
+    def test_rejects_fullgraph_with_tiling(self):
+        from arctic_platform.model.config import Patches
+
+        with pytest.raises(
+            ValueError,
+            match="fullgraph cannot be combined",
+        ):
+            Patches(
+                compile={"fullgraph": True},
+                tiled_mlp={"token_chunk_size": 32},
+            )
+
+    def test_rejects_offload_without_checkpointing(self):
+        from arctic_platform.model.config import Patches
+
+        with pytest.raises(ValueError, match="activation_offload requires"):
+            Patches(
+                gradient_checkpointing=False,
+                activation_offload={"enabled": True},
+            )
+
+    def test_applies_tiled_mlp(self, monkeypatch):
+        from arctic_platform.model.config import TiledMlpPatch
+        from arctic_platform.model.patches.tiled_mlp import apply_tiled_mlp
 
         tiled = {}
         monkeypatch.setattr(
@@ -379,50 +431,16 @@ class TestQwenDensePatch:
             ),
         )
         model = self._Model()
-        settings = QwenDensePatch(
-            activation_checkpointing=True,
-            compile={"fullgraph": True},
-            tiled_mlp_token_chunk_size=None,
-        )
-        apply_qwen_dense(model, _ctx(qwen_dense=settings))
 
-        assert model.config.use_cache is False
-        assert model.gradient_checkpointing_kwargs == {"use_reentrant": False}
-        assert model.input_grads_enabled is True
-        assert [layer.fullgraph for layer in model.model.layers] == [True, True]
-        assert tiled == {}
+        apply_tiled_mlp(model, _ctx(tiled_mlp=TiledMlpPatch(token_chunk_size=32)))
 
-        settings = QwenDensePatch(
-            activation_checkpointing=False,
-            tiled_mlp_token_chunk_size=32,
-        )
-        apply_qwen_dense(model, _ctx(qwen_dense=settings))
         assert tiled == {"model": model, "token_chunk_size": 32}
 
-    def test_rejects_fullgraph_with_tiling(self):
-        from arctic_platform.model.config import QwenDensePatch
-
-        with pytest.raises(
-            ValueError,
-            match="fullgraph cannot be combined",
-        ):
-            QwenDensePatch(
-                compile={"fullgraph": True},
-                tiled_mlp_token_chunk_size=32,
-            )
-
-    def test_rejects_offload_without_checkpointing(self):
-        from arctic_platform.model.config import QwenDensePatch
-
-        with pytest.raises(ValueError, match="activation_offload requires"):
-            QwenDensePatch(
-                activation_checkpointing=False,
-                activation_offload={},
-            )
-
     def test_applies_offload_and_lm_head_settings(self, monkeypatch):
-        from arctic_platform.model.config import QwenDensePatch
-        from arctic_platform.model.patches.qwen_dense import apply_qwen_dense
+        from arctic_platform.model.config import ActivationOffloadPatch
+        from arctic_platform.model.config import LmHeadPatch
+        from arctic_platform.model.patches.activation_offload import apply_activation_offload
+        from arctic_platform.model.patches.lm_head import apply_lm_head
 
         calls = []
         manager = object()
@@ -441,14 +459,17 @@ class TestQwenDensePatch:
 
         model = self._Model()
         model.base_model = model.model
-        settings = QwenDensePatch(
-            activation_checkpointing=True,
-            activation_offload={"keep_last_n": 2, "use_streams": False},
-            fp32_lm_head=True,
-            fused_lm_head_token_chunk_size=128,
-            fused_lm_head_vocab_chunk_size=4096,
+        offload = ActivationOffloadPatch(
+            keep_last_n=2,
+            use_streams=False,
         )
-        apply_qwen_dense(model, _ctx(qwen_dense=settings))
+        lm_head = LmHeadPatch(
+            fp32=True,
+            token_chunk_size=128,
+            vocab_chunk_size=4096,
+        )
+        apply_activation_offload(model, _ctx(activation_offload=offload))
+        apply_lm_head(model, _ctx(lm_head=lm_head))
 
         assert calls[0][0:2] == ("offload", model)
         assert calls[0][2]["config"].keep_last_n == 2
@@ -469,15 +490,11 @@ class TestQwenDensePatch:
             },
         )
 
-    def test_rejects_non_qwen_model(self):
-        from arctic_platform.model.config import QwenDensePatch
-        from arctic_platform.model.patches.qwen_dense import apply_qwen_dense
+    def test_lm_head_patch_requires_a_feature(self):
+        from arctic_platform.model.config import LmHeadPatch
 
-        with pytest.raises(ValueError, match="model_type='qwen3'"):
-            apply_qwen_dense(
-                self._Model(model_type="llama"),
-                _ctx(qwen_dense=QwenDensePatch()),
-            )
+        with pytest.raises(ValueError, match="requires fp32 or token_chunk_size"):
+            LmHeadPatch()
 
 
 class TestZorroAndGcPatches:

@@ -29,14 +29,17 @@ Patch = Callable[[nn.Module, LoaderContext], nn.Module | None]
 
 
 # Canonical order (every registered patch must appear here).
-# liger → Qwen setup → zorro_train (replaces forward) → generic GC → peft.
+# Kernel swaps run first, model features before forward replacement, and PEFT wraps last.
 # Note: ZoRRo's patched forward does not call `_gradient_checkpointing_func`, so GC
 # under ZoRRo is a no-op for activation savings (same as the old inline worker path).
 PATCH_ORDER: tuple[str, ...] = (
     "liger",
-    "qwen_dense",
-    "zorro_train",
     "gradient_checkpointing",
+    "activation_offload",
+    "compile",
+    "tiled_mlp",
+    "lm_head",
+    "zorro_train",
     "peft",
 )
 

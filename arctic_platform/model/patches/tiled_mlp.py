@@ -12,13 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Built-in patches. Importing this package registers them."""
+"""Dense MLP tiling patch."""
 
-from arctic_platform.model.patches import activation_offload  # noqa: F401
-from arctic_platform.model.patches import compile  # noqa: F401
-from arctic_platform.model.patches import gradient_checkpointing  # noqa: F401
-from arctic_platform.model.patches import liger  # noqa: F401
-from arctic_platform.model.patches import lm_head  # noqa: F401
-from arctic_platform.model.patches import peft  # noqa: F401
-from arctic_platform.model.patches import tiled_mlp  # noqa: F401
-from arctic_platform.model.patches import zorro_train  # noqa: F401
+from __future__ import annotations
+
+import torch.nn as nn
+
+from arctic_platform.model.loader import LoaderContext
+from arctic_platform.model.patch import register_patch
+
+
+@register_patch("tiled_mlp")
+def apply_tiled_mlp(model: nn.Module, ctx: LoaderContext) -> None:
+    from arctic_platform.model.patches._tiled_mlp import apply_dense_tiled_mlp
+
+    settings = ctx.spec.patches.tiled_mlp
+    assert settings is not None
+    apply_dense_tiled_mlp(
+        model,
+        token_chunk_size=settings.token_chunk_size,
+    )

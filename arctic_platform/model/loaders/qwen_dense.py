@@ -52,4 +52,10 @@ def load_qwen_dense(ctx: LoaderContext) -> LoadedModel:
         attn_implementation=ctx.spec.attn_implementation,
         dtype=ctx.spec.dtype,
     )
+    if parallelism.sequence_parallel > 1:
+        config = getattr(model, "config", None)
+        get_text_config = getattr(config, "get_text_config", None)
+        text_config = get_text_config() if callable(get_text_config) else config
+        if text_config is not None and hasattr(text_config, "use_cache"):
+            text_config.use_cache = False
     return LoadedModel(model=model)

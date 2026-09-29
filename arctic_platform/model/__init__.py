@@ -20,11 +20,13 @@ require_any_dep_group("sft", "rl")
 
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ActivationOffloadConfig
+from arctic_platform.model.config import ActivationOffloadPatch
 from arctic_platform.model.config import CompilePatch
+from arctic_platform.model.config import LmHeadPatch
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
-from arctic_platform.model.config import QwenDensePatch
+from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.loader import LoadedModel
@@ -42,13 +44,15 @@ from arctic_platform.model import patches  # noqa: F401  # isort: skip
 __all__ = [
     "ActivationCheckpointConfig",
     "ActivationOffloadConfig",
+    "ActivationOffloadPatch",
     "LoadedModel",
     "LoaderContext",
+    "LmHeadPatch",
     "CompilePatch",
     "ModelSpec",
     "ParallelismConfig",
     "Patches",
-    "QwenDensePatch",
+    "TiledMlpPatch",
     "ZorroTrainPatch",
     "apply_patches",
     "apply_peft",

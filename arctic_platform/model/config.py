@@ -69,6 +69,12 @@ class ActivationOffloadConfig(BaseModel):
         return int(self.pin_memory_max_size_gib * (1 << 30))
 
 
+class ActivationOffloadPatch(ActivationOffloadConfig):
+    """Activation offload settings whose presence enables the patch."""
+
+    enabled: Literal[True] = Field(True, description="Activation offload patches are always enabled.")
+
+
 class ActivationCheckpointConfig(BaseModel):
     """MoE activation checkpointing and optional CPU offload."""
 
@@ -119,41 +125,32 @@ class CompilePatch(BaseModel):
     fullgraph: bool = Field(False, description="Require each transformer layer to compile as a full graph.")
 
 
-class QwenDensePatch(BaseModel):
-    """Qwen dense setup that must run before PEFT and DeepSpeed wrapping."""
+class LmHeadPatch(BaseModel):
+    """Optional precision and chunking changes to a causal LM head."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    activation_checkpointing: StrictBool | PositiveInt = Field(
-        True,
-        description="False disables; True checkpoints every layer; an integer checkpoints every Nth layer.",
+    fp32: bool = Field(False, description="Compute the LM-head projection in fp32.")
+    token_chunk_size: PositiveInt | None = Field(
+        None, description="Token tile size for chunked per-token logprob projection."
     )
-    compile: CompilePatch | None = Field(None, description="Per-transformer-layer torch.compile settings.")
-    activation_offload: ActivationOffloadConfig | None = Field(
-        None,
-        description="CPU offload for activations saved by checkpointed layers.",
-    )
-    fp32_lm_head: bool = Field(False, description="Compute the LM-head projection in fp32.")
-    fused_lm_head_token_chunk_size: PositiveInt | None = Field(
-        None,
-        description="Token tile size for chunked per-token logprob projection.",
-    )
-    fused_lm_head_vocab_chunk_size: PositiveInt = Field(
-        8192,
-        description="Vocabulary tile size for chunked per-token logprob projection.",
-    )
-    tiled_mlp_token_chunk_size: PositiveInt | None = Field(
-        None,
-        description="Maximum tokens per recomputed dense-MLP tile.",
+    vocab_chunk_size: PositiveInt = Field(
+        8192, description="Vocabulary tile size for chunked per-token logprob projection."
     )
 
     @model_validator(mode="after")
-    def _reject_fullgraph_with_tiled_mlp(self) -> Self:
-        if self.activation_offload is not None and self.activation_checkpointing is False:
-            raise ValueError("activation_offload requires activation_checkpointing")
-        if self.tiled_mlp_token_chunk_size is not None and self.compile is not None and self.compile.fullgraph:
-            raise ValueError("compile.fullgraph cannot be combined with tiled_mlp_token_chunk_size")
+    def _require_enabled_feature(self) -> Self:
+        if not self.fp32 and self.token_chunk_size is None:
+            raise ValueError("lm_head patch requires fp32 or token_chunk_size")
         return self
+
+
+class TiledMlpPatch(BaseModel):
+    """Recompute dense MLPs in token tiles."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    token_chunk_size: PositiveInt = Field(..., description="Maximum tokens per recomputed dense-MLP tile.")
 
 
 class Patches(BaseModel):
@@ -162,12 +159,29 @@ class Patches(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     liger: bool = Field(False, description="Apply Liger kernels.")
-    qwen_dense: QwenDensePatch | None = Field(None, description="Qwen dense model setup.")
+    gradient_checkpointing: StrictBool | PositiveInt = Field(
+        False,
+        description="False disables; True checkpoints every layer; an integer checkpoints every Nth layer.",
+    )
+    activation_offload: ActivationOffloadPatch | None = Field(
+        None, description="CPU offload for activations saved by checkpointed layers."
+    )
+    compile: CompilePatch | None = Field(None, description="Per-transformer-layer torch.compile settings.")
+    tiled_mlp: TiledMlpPatch | None = Field(None, description="Recompute dense MLPs in token tiles.")
+    lm_head: LmHeadPatch | None = Field(None, description="LM-head precision and chunking.")
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
-    gradient_checkpointing: bool = Field(False, description="HF gradient checkpointing.")
     peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
 
     _validate_peft = field_validator("peft")(validate_peft_config)
+
+    @model_validator(mode="after")
+    def _validate_patch_combinations(self) -> Self:
+        if self.activation_offload is not None:
+            if self.gradient_checkpointing is False:
+                raise ValueError("activation_offload requires gradient_checkpointing")
+        if self.tiled_mlp is not None and self.compile is not None and self.compile.fullgraph:
+            raise ValueError("compile.fullgraph cannot be combined with tiled_mlp")
+        return self
 
 
 class ModelSpec(BaseModel):

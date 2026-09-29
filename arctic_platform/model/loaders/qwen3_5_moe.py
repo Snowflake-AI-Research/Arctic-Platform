@@ -96,7 +96,14 @@ def _validate_spec(spec: ModelSpec) -> None:
             "the qwen3_5_moe loader does not support the liger patch; "
             'use loader_options={"fused_cross_entropy": "liger"} for the LM head instead'
         )
-    if spec.patches.gradient_checkpointing or spec.patches.zorro_train:
+    if (
+        spec.patches.gradient_checkpointing
+        or spec.patches.activation_offload
+        or spec.patches.compile
+        or spec.patches.tiled_mlp
+        or spec.patches.lm_head
+        or spec.patches.zorro_train
+    ):
         raise ValueError("qwen3_5_moe uses loader_options.ac_config and does not support generic forward patches")
 
 
