@@ -20,21 +20,13 @@ import torch.nn as nn
 
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patch import register_patch
+from arctic_platform.model.patches.utils import transformer_layers
 
 
 def _text_config(model: nn.Module):
     config = getattr(model, "config", None)
     get_text_config = getattr(config, "get_text_config", None)
     return get_text_config() if callable(get_text_config) else config
-
-
-def _transformer_layers(model: nn.Module):
-    target = model
-    for part in ("model", "layers"):
-        target = getattr(target, part, None)
-        if target is None:
-            raise ValueError("periodic gradient checkpointing requires model.model.layers")
-    return target
 
 
 @register_patch("gradient_checkpointing")
@@ -56,7 +48,7 @@ def apply_gradient_checkpointing(model: nn.Module, ctx: LoaderContext) -> None:
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 
-        layers = _transformer_layers(model)
+        layers = transformer_layers(model, patch_name="periodic gradient checkpointing")
         for layer_index, layer_name in enumerate(list(layers._modules)):
             if layer_index % frequency == 0:
                 layers._modules[layer_name] = checkpoint_wrapper(
