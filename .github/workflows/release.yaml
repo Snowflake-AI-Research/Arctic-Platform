@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Release type, worked out from the version on main. Leave as none to use an explicit version.'
+        type: choice
+        default: none
+        options: [none, rc, patch, minor, major]
+      version:
+        description: 'Explicit release tag: vX.Y.Z or vX.Y.ZrcN. Leave empty when using bump.'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    env:
+      BUMP: ${{ inputs.bump }}
+      VERSION_INPUT: ${{ inputs.version }}
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Resolve release tag
+        run: |
+          if [[ "$BUMP" != none && -n "$VERSION_INPUT" ]] || [[ "$BUMP" == none && -z "$VERSION_INPUT" ]]; then
+            echo "::error::Set exactly one of bump or version"
+            exit 1
+          fi
+          BASE=$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+).*"/\1/p' pyproject.toml)
+          IFS=. read -r MAJOR MINOR PATCH <<< "$BASE"
+          case "$BUMP" in
+            none)  TAG="$VERSION_INPUT" ;;
+            rc)    LAST=$(git tag -l "v${BASE}rc*" | sed "s/^v${BASE}rc//" | sort -n | tail -1)
+                   TAG="v${BASE}rc$(( ${LAST:-0} + 1 ))" ;;
+            patch) TAG="v$BASE" ;;
+            minor) TAG="v$MAJOR.$((MINOR + 1)).0" ;;
+            major) TAG="v$((MAJOR + 1)).0.0" ;;
+          esac
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+      - name: Validate and parse version
+        id: version
+        run: |
+          if [[ ! "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(rc[0-9]+)?$ ]]; then
+            echo "::error::Version must be vX.Y.Z or vX.Y.ZrcN (got '$TAG')"
+            exit 1
+          fi
+          MAJOR=${BASH_REMATCH[1]} MINOR=${BASH_REMATCH[2]} PATCH=${BASH_REMATCH[3]}
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          if [[ -n "${BASH_REMATCH[4]}" ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "PREV_TAG=$(git describe --tags --abbrev=0 --match 'v*' --exclude '*rc*' --exclude '*dev*')" >> "$GITHUB_ENV"
+            echo "NEXT_DEV=$MAJOR.$MINOR.$((PATCH + 1)).dev0" >> "$GITHUB_ENV"
+          fi
+      - name: Set version and build
+        run: |
+          sed -i -E "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
+          pip install build
+          python -m build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.version.outputs.prerelease == 'false'
+        with:
+          name: dist
+          path: dist/
+      - name: Commit and tag release
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release $TAG"
+          git tag -a "$TAG" -m "Release $TAG"
+      - name: Push release candidate tag
+        if: steps.version.outputs.prerelease == 'true'
+        run: git push origin "$TAG"
+      - name: Push release to main
+        if: steps.version.outputs.prerelease == 'false'
+        run: git push --atomic origin main "$TAG"
+      - name: Create GitHub release
+        if: steps.version.outputs.prerelease == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh release create "$TAG" dist/* --verify-tag --title "Arctic-Platform $TAG" --generate-notes --notes-start-tag "$PREV_TAG"
+      - name: Bump to next dev version
+        if: steps.version.outputs.prerelease == 'false'
+        run: |
+          sed -i -E "s/^version = \".*\"/version = \"$NEXT_DEV\"/" pyproject.toml
+          git commit -am "Bump version to $NEXT_DEV"
+          git push origin main
+
+  publish:
+    needs: release
+    if: needs.release.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
