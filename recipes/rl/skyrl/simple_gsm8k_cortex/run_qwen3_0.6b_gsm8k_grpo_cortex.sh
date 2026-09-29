@@ -3,10 +3,14 @@
 # Cortex sub-jobs own training + sampling; the SkyRL driver is CPU-only.
 #
 # Pre-reqs (see README.md):
-#   1. pip install arctic-platform[cortex]
-#   2. SkyRL cloned at the pinned commit with SKYRL_HOME exported.
-#   3. ARCTIC_CORTEX_* env vars set (see README.md step 2).
-#   4. Data: `python download_data.py` -> $DATA_DIR/{train,validation}.parquet.
+#   1. SkyRL cloned at skyrl-v0.3.0 with SKYRL_HOME exported.
+#   2. ARCTIC_CORTEX_* env vars set (see README.md step 2).
+#   3. Data: README.md step 3 -> $DATA_DIR/{train,validation}.parquet.
+#
+# Python deps resolve through `uv run --isolated` below, the same pattern
+# upstream's integrations/arctic_rl/examples/ launchers use. There is no conda
+# env or requirements.txt to maintain, and `skyrl` is built from $SKYRL_HOME
+# itself, so the installed package cannot drift from the code on PYTHONPATH.
 #
 # Every learning hyperparameter below is the on-prem sibling recipe's
 # (../simple_gsm8k) unchanged. The only Hydra flags that differ are plumbing for
@@ -14,7 +18,7 @@
 #
 #   trainer.arctic_rl.attn_implementation=sdpa
 #     Cortex image ships without FA2.
-#   generator.inference_engine.remote_urls=[http://cortex-managed, ...]
+#   generator.inference_engine.external_server_urls=[http://cortex-managed, ...]
 #     Required by SkyRL's validate_generator_cfg under run_engines_locally=false,
 #     which asserts one URL per engine. The URLs are placeholders -- generation
 #     is served by the shim, which never dials them.
@@ -27,6 +31,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# This launcher ships inside the Arctic Platform checkout, so it can locate the
+# repo root rather than being told. Point ARCTIC_PLATFORM_SPEC at a released
+# version instead once one ships arctic_platform/integrations/ (0.1.3 does not).
+AP_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+ARCTIC_PLATFORM_SPEC="${ARCTIC_PLATFORM_SPEC:-${AP_ROOT}[rl,cortex]}"
+
+if ! command -v uv >/dev/null 2>&1; then
+    echo "ERROR: uv not found. Install it with:"
+    echo "         curl -LsSf https://astral.sh/uv/install.sh | sh"
+    exit 1
+fi
+
 if [[ -z "${SKYRL_HOME:-}" || ! -d "${SKYRL_HOME}/integrations/arctic_rl" ]]; then
     echo "ERROR: SKYRL_HOME is unset or doesn't contain integrations/arctic_rl/."
     exit 1
@@ -35,6 +51,11 @@ export PYTHONPATH="${SKYRL_HOME}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
+# Ray otherwise replays the driver's `uv run` line on every worker to rebuild
+# its environment. Under `--isolated` that replay spawns a broken command
+# (`Failed to spawn: --python`), and it buys nothing here: Cortex owns the GPUs,
+# so the only Ray actors are driver-local and can share the driver interpreter.
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 
 # Cortex owns the GPUs; the driver has none. SkyRL's colocated placement
@@ -88,9 +109,11 @@ if (( _EST > _CAP_BYTES )); then
     exit 1
 fi
 
-# SkyRL's validate_generator_cfg asserts num_engines == len(remote_urls). The
-# URL itself is a placeholder -- the real endpoint lives inside the Cortex shim
-# -- but the count has to track NUM_ENGINES or the driver dies before launch.
+# run_engines_locally=false requires external_server_urls to be non-empty, so
+# pass placeholders: the real endpoint lives inside the Cortex shim, which never
+# dials these. skyrl-v0.3.0 dropped the old one-URL-per-engine assertion, but
+# keep the count tracking NUM_ENGINES anyway -- it costs nothing and the router
+# is built over this list.
 ENGINE_URLS="$(printf 'http://cortex-managed,%.0s' $(seq "${NUM_ENGINES}"))"
 ENGINE_URLS="[${ENGINE_URLS%,}]"
 
@@ -109,25 +132,22 @@ VAL_FILES="${DATA_DIR}/validation.parquet"
 
 if [[ ! -f "${TRAIN_FILES}" || ! -f "${VAL_FILES}" ]]; then
     echo "ERROR: SkyRL parquets not found under ${DATA_DIR}."
-    echo "       Run: python ../simple_gsm8k/download_data.py --output_dir ${DATA_DIR}"
+    echo "       Run: uv run --isolated --no-project --with datasets \\"
+    echo "              python ../simple_gsm8k/download_data.py --output_dir ${DATA_DIR}"
     exit 1
 fi
 
 # Pre-flight: refuse to launch on a verl-shaped parquet (missing reward_spec
 # or env_class) — SkyRL's env would silently score every rollout 0.0 with the
 # wrong field names.
-python - <<PY || exit 1
+#
+# Runs under uv for the same reason the training invocation does: there is no
+# environment to activate, so the ambient shell is not expected to import
+# pandas. pyarrow is the parquet engine and is not implied by pandas.
+uv run --isolated --no-project --with pandas --with pyarrow python - <<PY || exit 1
 import sys
 
-try:
-    import pandas as pd
-except ModuleNotFoundError:
-    # Bare \`python\` is also what launches the run below, so a shell that can't
-    # import pandas can't train either. Say that instead of raising here.
-    print("ERROR: this shell's \`python\` cannot import pandas, so it is not the")
-    print("       environment arctic-platform was installed into. Activate it;")
-    print("       see step 1 in README.md.")
-    sys.exit(1)
+import pandas as pd
 
 cols = set(pd.read_parquet("${TRAIN_FILES}").columns)
 missing = {"reward_spec", "env_class"} - cols
@@ -162,7 +182,11 @@ mkdir -p "${CKPT_DIR}"
 # onto the unified client is issue #101 -- once that lands, call it here instead.
 cortex_jobs() {
     local mode="$1"; shift
-    python - "${mode}" "$@" <<'PY'
+    # Deps come from uv, not the ambient interpreter: this runs before the
+    # training invocation below, so there is no environment to inherit. Only
+    # the client is needed, hence --no-project and the [cortex] extra alone.
+    uv run --isolated --no-project --with "${AP_ROOT}[cortex]" \
+        -- python - "${mode}" "$@" <<'PY'
 import sys
 
 from arctic_platform.client import ArcticClientConfig
@@ -246,7 +270,14 @@ trap release_our_jobs EXIT
 # Upstream's own entrypoint is `integrations.arctic_rl.entrypoint`; naming ours
 # instead is what selects Cortex, and it installs the driver-side
 # peer_access_supported shim before SkyRL's Ray probe runs.
-python -m skyrl.train.entrypoints.main_base \
+# Ray's uv runtime-env hook requires the uv project to live inside the working
+# directory, so run from $SKYRL_HOME instead of pointing --project at it. Every
+# path passed below is absolute, so the cd is safe.
+cd "${SKYRL_HOME}"
+uv run --isolated --extra skyrl-train \
+    --with "${ARCTIC_PLATFORM_SPEC}" \
+    --with 'transformers==4.57.6' \
+    -- python -m skyrl.train.entrypoints.main_base \
     trainer.override_entrypoint=arctic_platform.integrations.skyrl.entrypoint \
     trainer.arctic_rl.colocate=false \
     trainer.arctic_rl.attn_implementation=sdpa \
@@ -261,7 +292,6 @@ python -m skyrl.train.entrypoints.main_base \
     generator.inference_engine.num_engines=${NUM_ENGINES} \
     generator.inference_engine.tensor_parallel_size=${TP_SIZE} \
     generator.inference_engine.run_engines_locally=false \
-    "generator.inference_engine.remote_urls=${ENGINE_URLS}" \
     "generator.inference_engine.external_server_urls=${ENGINE_URLS}" \
     "generator.sampling_params.logprobs=null" \
     generator.inference_engine.weight_sync_backend=nccl \

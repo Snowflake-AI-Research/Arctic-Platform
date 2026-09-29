@@ -18,6 +18,8 @@ from arctic_platform._dependency_groups import require_any_dep_group
 
 require_any_dep_group("sft", "rl")
 
+from arctic_platform.model.config import ActivationCheckpointConfig
+from arctic_platform.model.config import ActivationOffloadConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
@@ -29,12 +31,15 @@ from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import select_loader
 from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.patch import register_patch
+from arctic_platform.model.patches.peft import apply_peft
 
 # Import built-in loaders and patches for their registration side effects.
 from arctic_platform.model import loaders  # noqa: F401  # isort: skip
 from arctic_platform.model import patches  # noqa: F401  # isort: skip
 
 __all__ = [
+    "ActivationCheckpointConfig",
+    "ActivationOffloadConfig",
     "LoadedModel",
     "LoaderContext",
     "ModelSpec",
@@ -42,6 +47,7 @@ __all__ = [
     "Patches",
     "ZorroTrainPatch",
     "apply_patches",
+    "apply_peft",
     "build_model",
     "register_loader",
     "register_patch",

@@ -16,4 +16,5 @@
 
 from arctic_platform.model.patches import gradient_checkpointing  # noqa: F401
 from arctic_platform.model.patches import liger  # noqa: F401
+from arctic_platform.model.patches import peft  # noqa: F401
 from arctic_platform.model.patches import zorro_train  # noqa: F401

@@ -16,19 +16,83 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import PositiveInt
 from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
+
+from arctic_platform.common.config import validate_peft_config
+
+PinMemoryMaxSize = float | Literal["auto"]
+
+
+class ActivationOffloadConfig(BaseModel):
+    """Serializable activation CPU-offload configuration."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    enabled: bool = Field(False, description="Stream checkpointed block boundaries to CPU.")
+    keep_last_n: int = Field(1, ge=0, description="Boundaries to leave resident on GPU.")
+    use_streams: bool = Field(True, description="Overlap offload copies on side streams.")
+    tensor_size_threshold: int = Field(1 << 20, ge=0, description="Minimum saved-tensor size in bytes to offload.")
+    pin_memory_enabled: bool = Field(True, description="Use pinned host memory for activation offload.")
+    pin_memory_max_size_gib: PinMemoryMaxSize = Field(
+        "auto", description='Retained pinned-memory cache cap in GiB; "auto" sizes it from observed usage.'
+    )
+    pin_memory_bucket_size_mib: PositiveInt = Field(
+        64, description="Pinned-buffer allocation bucket size in MiB for reuse across variable sequence lengths."
+    )
+
+    @field_validator("pin_memory_max_size_gib")
+    @classmethod
+    def _validate_pin_memory_max_size_gib(cls, value: PinMemoryMaxSize) -> PinMemoryMaxSize:
+        if value == "auto":
+            return value
+        if value < 0:
+            raise ValueError("pin_memory_max_size_gib must be 'auto' or non-negative")
+        return value
+
+    @property
+    def pin_memory_bucket_size_bytes(self) -> int:
+        return self.pin_memory_bucket_size_mib * (1 << 20)
+
+    @property
+    def pin_memory_hard_max_size_bytes(self) -> int | None:
+        if self.pin_memory_max_size_gib == "auto":
+            return None
+        return int(self.pin_memory_max_size_gib * (1 << 30))
+
+
+class ActivationCheckpointConfig(BaseModel):
+    """MoE activation checkpointing and optional CPU offload."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    mode: Literal["full", "selective"] = Field("full", description="Recompute whole blocks or selected targets.")
+    freq: PositiveInt = Field(1, description="Checkpoint every Nth block.")
+    targets: list[str] = Field(default_factory=lambda: ["norm"], description="Submodules to checkpoint (selective).")
+    offload_config: ActivationOffloadConfig = Field(
+        default_factory=ActivationOffloadConfig, description="CPU offload of checkpointed boundaries."
+    )
+    router_replay_recompute: bool = Field(True, description="Deterministic MoE routing across recompute.")
+
+    @model_validator(mode="after")
+    def _validate_offload_mode(self) -> Self:
+        if self.offload_config.enabled and self.mode != "full":
+            raise ValueError("activation offload requires activation checkpointing mode='full'")
+        return self
 
 
 class ParallelismConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    expert_parallel: int = Field(1, description="Expert-parallel degree.")
-    sequence_parallel: int = Field(1, description="Ulysses sequence-parallel degree.")
+    expert_parallel: int = Field(1, ge=1, description="Expert-parallel degree.")
+    sequence_parallel: int = Field(1, ge=1, description="Ulysses sequence-parallel degree.")
 
 
 class ZorroTrainPatch(BaseModel):
@@ -56,6 +120,9 @@ class Patches(BaseModel):
     liger: bool = Field(False, description="Apply Liger kernels.")
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
     gradient_checkpointing: bool = Field(False, description="HF gradient checkpointing.")
+    peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
+
+    _validate_peft = field_validator("peft")(validate_peft_config)
 
 
 class ModelSpec(BaseModel):
@@ -121,6 +188,7 @@ class ModelSpec(BaseModel):
                 liger=cfg.get("use_liger", False),
                 zorro_train=zorro_train_patch,
                 gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
+                peft=cfg.get("peft_config"),
             ),
         )
 
@@ -148,4 +216,7 @@ class ModelSpec(BaseModel):
         options_model = get_loader_options_model(self.loader)
         if options_model is not None:
             self.loader_options = options_model.model_validate(self.loader_options).model_dump()
+        from arctic_platform.model.loader import validate_loader_spec
+
+        validate_loader_spec(self.loader, self)
         return self

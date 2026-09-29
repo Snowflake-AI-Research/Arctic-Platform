@@ -78,3 +78,23 @@ class TestSplitPaddedTensorDictIntoMbList(TestCasePlus):
         # Non-tensor fields ride along unsplit in every microbatch.
         for mb in mb_list.mbs:
             self.assertEqual(mb["row_id"], data["row_id"], "non-tensor field was altered")
+
+    def test_splits_per_sequence_vectors(self):
+        data = _make_padded_dict()
+        weights = torch.arange(1, len(real_token_counts) + 1, dtype=torch.float32)
+        data["sequence_loss_weights"] = weights
+        mb_list = split_padded_tensor_dict_into_mb_list(data, MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb))
+        reconstructed = torch.cat([mb["sequence_loss_weights"] for mb in mb_list.mbs], dim=0)
+        backward = torch.tensor(mb_list.backward_indices)
+        self.assertTrue(torch.equal(reconstructed[backward], weights))
+        self.assertGreater(len(mb_list.mbs), 1)
+        self.assertTrue(all(mb["sequence_loss_weights"].numel() == mb["input_ids"].shape[0] for mb in mb_list.mbs))
+
+    def test_does_not_split_unrelated_length_b_vector(self):
+        data = _make_padded_dict()
+        noise = torch.arange(len(real_token_counts), dtype=torch.float32)
+        data["unrelated_b"] = noise
+        mb_list = split_padded_tensor_dict_into_mb_list(data, MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb))
+        self.assertGreater(len(mb_list.mbs), 1)
+        for mb in mb_list.mbs:
+            self.assertTrue(torch.equal(mb["unrelated_b"], noise))

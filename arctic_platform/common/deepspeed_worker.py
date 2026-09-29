@@ -41,10 +41,13 @@ from deepspeed.accelerator import get_accelerator
 
 from arctic_platform.common.ray_cluster import primary_ip
 from arctic_platform.common.utils import combine_metric_microbatches
+from arctic_platform.common.utils import dp_sp_world_size
 from arctic_platform.common.utils import log_dp_shard_tokens
 from arctic_platform.common.utils import merge_dict_shards
+from arctic_platform.common.utils import sp_size_from_job_config
 from arctic_platform.common.utils import split_dict
 from arctic_platform.common.utils import unpack_batch
+from arctic_platform.common.utils.bf16_zero_norm import is_bf16_zero_norm_assert
 from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
@@ -115,6 +118,7 @@ class DeepSpeedWorker:
         self.master_addr = primary_ip()
         self.master_port = master_port
         self.engine = None
+        self.sp_size = 1
         self._weight_sender = None
         self._on_gpu = True
 
@@ -163,6 +167,7 @@ class DeepSpeedWorker:
         ds_worker_config = job_config.get("ds_worker_config") or {}
         ds_worker_config["world_size"] = self.world_size
         self.ds_worker_config = ds_worker_config
+        self.sp_size = sp_size_from_job_config(job_config)
 
         # Build the DeepSpeed config per job type. Training engines get an
         # optimizer; the reference/log-prob engine is forward-only and is
@@ -347,6 +352,8 @@ class DeepSpeedWorker:
     def _inject_sft_global_token_meta(self, loss_fn: str, batch_data, meta_data: dict) -> None:
         """All-reduce valid-target count into ``meta["global_num_tokens"]`` + ``dp_size``.
 
+        ``dp_size`` is ``world_size`` while shards stay disjoint. ``sp_size`` is
+        still validated against ``world_size``.
         Opt-in via ``SFT_GLOBAL_TOKEN_LOSS_FNS``. No-op when labels are absent.
         """
         from arctic_platform.sft.processor import SFT_GLOBAL_TOKEN_LOSS_FNS
@@ -365,6 +372,7 @@ class DeepSpeedWorker:
             torch.distributed.all_reduce(tok, op=torch.distributed.ReduceOp.SUM)
             global_tokens = int(tok.item())
         meta_data["global_num_tokens"] = global_tokens
+        dp_sp_world_size(self.world_size, self.sp_size)
         meta_data["dp_size"] = self.world_size
 
     def _forward_maybe_backward(self, batch: dict, backward: bool) -> dict:
@@ -379,7 +387,9 @@ class DeepSpeedWorker:
         see_memory_usage("_forward_maybe_backward start", force=True)
 
         from arctic_platform import sft_profile
+        from arctic_platform.rl.processors.base_loss import _pop_loss_object
 
+        loss_object = _pop_loss_object(batch)
         args, batch_data, meta_data, processing = unpack_batch(batch)
         with sft_profile.timed("h2d"):
             if isinstance(batch_data, list):
@@ -399,7 +409,7 @@ class DeepSpeedWorker:
             log_dp_shard_tokens(self.rank, f"{tag} shard", batch_data, meta_data)
             pr0(f"[DeepSpeedWorker] {tag}: {batch_data.keys()=} {meta_data.keys()=} {processing.keys()=}")
             for k, v in batch_data.items():
-                pr0(f"[DeepSpeedWorker] {tag}: {k=}: {v.shape=}")
+                pr0(f"[DeepSpeedWorker] {tag}: {k=}: shape={getattr(v, 'shape', type(v).__name__)}")
 
         grad_accum_steps = self.engine.gradient_accumulation_steps()
         # H3: list-of-microbatches from the client skips concat→split_dict.
@@ -416,18 +426,35 @@ class DeepSpeedWorker:
         pipeline_micro_batch_outputs = []
         return_tensors = meta_data.get("worker_return_tensors", False)
 
-        # Decide SFT vs GRPO once, up front. Resolve against SFT_LOSS_FNS (the
-        # canonical registry set) rather than a hardcoded ("sft", "sft_ce")
-        # tuple so new SFT losses dispatch correctly without touching the
-        # worker. Lazy-import keeps `common` free of an import-time SFT
-        # coupling; the module is cached after the first call.
-        loss_fn = processing.get("loss_fn")
+        # Resolve before selecting a specialized pipeline so class registry
+        # precedence applies equally to SFT and RL names.
+        loss_fn = processing.get("loss_fn", "ap_grpo")
+        from arctic_platform.common.registry import LOSS_FNS
+        from arctic_platform.rl.processors import resolve_loss
         from arctic_platform.sft.processor import SFT_LOSS_FNS
 
-        use_sft_pipeline = loss_fn in SFT_LOSS_FNS
+        if loss_object is None and loss_fn is not None:
+            loss_object = resolve_loss(loss_fn)
+        legacy_sft_loss = LOSS_FNS.get(loss_fn) if loss_fn in SFT_LOSS_FNS else None
+        use_sft_pipeline = (
+            legacy_sft_loss is not None
+            and loss_object is not None
+            and loss_object.is_legacy_adapter_for(legacy_sft_loss)
+        )
 
         if use_sft_pipeline:
             self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
+
+        loss_reduction = None
+        if not use_sft_pipeline:
+            from arctic_platform.rl.processors import resolve_packed_loss_reduction
+
+            loss_reduction = resolve_packed_loss_reduction(
+                processing,
+                [{**meta_data, **micro_batch} for micro_batch in micro_batch_data],
+                require_declared=False,
+                loss_object=loss_object,
+            )
 
         pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
 
@@ -475,8 +502,10 @@ class DeepSpeedWorker:
                     backward=backward,
                 )
             else:
+                from arctic_platform.rl.processors import apply_packed_loss_reduction
                 from arctic_platform.rl.processors import run_pipeline
 
+                pipeline_backward = "loss_only" if backward and loss_reduction is not None else backward
                 micro_batch_output = run_pipeline(
                     self.engine,
                     args,
@@ -484,10 +513,18 @@ class DeepSpeedWorker:
                     meta_data,
                     processing,
                     device=self._device,
-                    backward=backward,
+                    backward=pipeline_backward,
                     pack=False,
                     return_tensors=return_tensors,
+                    loss_object=loss_object,
                 )
+                if backward and loss_reduction is not None:
+                    apply_packed_loss_reduction(
+                        self.engine,
+                        micro_batch_output.pop("loss_tensor"),
+                        loss_reduction.loss_scales[i],
+                        backward=True,
+                    )
 
             if i == 0:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {micro_batch_output.keys()=}")
@@ -495,26 +532,32 @@ class DeepSpeedWorker:
 
             # DS requires matching steps for backward pass
             if backward and i < num_micro_batches - 1:
-                self.engine.step()
+                self._engine_step()
 
         pipeline_outputs = dict()
         for k, v in pipeline_micro_batch_outputs[0].items():
             if k == "metrics" and isinstance(v, dict):
-                # Per-microbatch loss-fn metrics are emitted as paired
-                # ``{name}.sum`` / ``{name}.tokens`` scalars (plus a few
-                # passthrough numerics like ``kl_coef``). Sum them across
-                # this rank's microbatches so each rank returns one scalar
-                # per metric; ``ray_server.forward_backward`` / ``http_server.forward_backward``
-                # then sums across DP ranks and collapses the paired keys
-                # into a single global token-mean per metric per mini-batch.
-                pipeline_outputs[k] = combine_metric_microbatches([r[k] for r in pipeline_micro_batch_outputs])
+                if loss_reduction is None:
+                    # Legacy losses without packed metadata retain the
+                    # historical GAS metric combiner.
+                    pipeline_outputs[k] = combine_metric_microbatches([r[k] for r in pipeline_micro_batch_outputs])
+                else:
+                    from arctic_platform.rl.processors import combine_packed_metrics
+
+                    pipeline_outputs[k] = combine_packed_metrics(
+                        [r[k] for r in pipeline_micro_batch_outputs],
+                        loss_reduction.reporting_weights,
+                    )
             elif isinstance(v, dict):
                 pipeline_outputs[k] = merge_dict_shards([r[k] for r in pipeline_micro_batch_outputs])
             elif isinstance(v, numbers.Number):
-                # TODO: weight average needs to be implemented
-                pipeline_outputs[k] = sum([r[k] for r in pipeline_micro_batch_outputs]) / len(
-                    pipeline_micro_batch_outputs
-                )
+                values = [r[k] for r in pipeline_micro_batch_outputs]
+                if k == "avg_loss" and loss_reduction is not None:
+                    from arctic_platform.rl.processors import combine_packed_losses
+
+                    pipeline_outputs[k] = combine_packed_losses(values, loss_reduction)
+                else:
+                    pipeline_outputs[k] = sum(values) / len(values)
 
         pipeline_outputs = self._move_batch_to_device(pipeline_outputs, self.cpu_device)
 
@@ -552,11 +595,31 @@ class DeepSpeedWorker:
         timers.stop_and_print_elapsed(tname)
         return results
 
+    def _is_bf16_zero_norm_assert(self, exc: BaseException) -> bool:
+        """True only for BF16_Optimizer's bare ``assert all_groups_norm > 0.``."""
+        return is_bf16_zero_norm_assert(exc, getattr(self.engine, "optimizer", None))
+
+    def _engine_step(self) -> None:
+        """``engine.step()`` with a skip for DeepSpeed BF16_Optimizer's zero-norm assert.
+
+        ZeRO-1/2 use ``BF16_Optimizer``, which asserts ``all_groups_norm > 0``.
+        GRPO can produce an all-zero grad batch (identical group rewards). ZeRO-3
+        does not assert; skip the optimizer update instead of crashing.
+        Only that BF16 assert is skipped; every other ``AssertionError`` re-raises.
+        """
+        try:
+            self.engine.step()
+        except AssertionError as err:
+            if self._is_bf16_zero_norm_assert(err):
+                pr0("[DeepSpeedWorker] skip optimizer.step: global grad norm is 0")
+                return
+            raise
+
     def step(self) -> dict:
         from arctic_platform import sft_profile
 
         with sft_profile.timed("step"):
-            self.engine.step()
+            self._engine_step()
             if sft_profile.enabled() and torch.cuda.is_available():
                 torch.cuda.synchronize()
         # Pull grad_norm out of DeepSpeed so it can be logged by the trainer.
