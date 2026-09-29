@@ -24,10 +24,12 @@ from arctic_platform.model.patch import register_patch
 
 @register_patch("activation_offload")
 def apply_activation_offload(model: nn.Module, ctx: LoaderContext) -> None:
+    config = ctx.spec.patches.activation_offload
+    if config is None or not config.enabled:
+        raise ValueError("activation_offload patch requires an enabled patches.activation_offload config")
+
     from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
 
-    config = ctx.spec.patches.activation_offload
-    assert config is not None and config.enabled
     manager = install_activation_offload(model, config=config)
     backbone = getattr(model, "base_model", None)
     if backbone is not None and backbone is not model:

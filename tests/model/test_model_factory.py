@@ -425,6 +425,12 @@ class TestModelFeaturePatches:
                 activation_offload={"enabled": True},
             )
 
+    def test_activation_offload_requires_enabled_config(self):
+        from arctic_platform.model.patches.activation_offload import apply_activation_offload
+
+        with pytest.raises(ValueError, match="requires an enabled"):
+            apply_activation_offload(self._Model(), _ctx(activation_offload=None))
+
     def test_applies_tiled_mlp(self, monkeypatch):
         from arctic_platform.model.config import TiledMlpPatch
         from arctic_platform.model.patches.tiled_mlp import apply_tiled_mlp
