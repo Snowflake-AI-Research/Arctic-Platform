@@ -213,8 +213,8 @@ class TestPatchPipeline:
         assert calls == ["a"]
 
 
-class TestQwenDenseLoader:
-    def test_qwen3_resolves_to_owned_loader(self, monkeypatch):
+class TestHuggingFaceLoader:
+    def test_qwen3_resolves_to_default_loader(self, monkeypatch):
         fake_config = types.SimpleNamespace(model_type="qwen3")
         monkeypatch.setattr(
             "transformers.AutoConfig.from_pretrained",
@@ -224,36 +224,43 @@ class TestQwenDenseLoader:
 
         spec = ModelSpec(model_path_or_name="qwen")
 
-        assert spec.loader == "qwen_dense"
+        assert spec.loader == "huggingface"
 
     def test_sequence_parallel_requires_runtime_group(self):
         from arctic_platform.model import ParallelismConfig
-        from arctic_platform.model.loaders.qwen_dense import load_qwen_dense
+        from arctic_platform.model.loaders.huggingface import load_huggingface
 
         spec = ModelSpec(
             model_path_or_name="qwen",
-            loader="qwen_dense",
+            loader="huggingface",
             parallelism=ParallelismConfig(sequence_parallel=2),
         )
-        with pytest.raises(ValueError, match="requires sp_group"):
-            load_qwen_dense(LoaderContext(spec=spec))
+        with pytest.raises(ValueError, match="requires parallel_groups"):
+            load_huggingface(LoaderContext(spec=spec))
 
     def test_loader_applies_required_sequence_parallel_setup(self, monkeypatch):
         from arctic_platform.model import ParallelismConfig
-        from arctic_platform.model.loaders.qwen_dense import load_qwen_dense
+        from arctic_platform.model.loaders.huggingface import load_huggingface
 
         model = nn.Module()
         model.config = types.SimpleNamespace(model_type="qwen3", use_cache=True)
+        configured = []
         monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
+        monkeypatch.setattr(
+            "arctic_platform.model.implementations.gpu.sp.transformers.apply_gated_delta_net_sequence_parallelism",
+            lambda configured_model, group: configured.append((configured_model, group)) or 0,
+        )
         spec = ModelSpec(
             model_path_or_name="qwen",
-            loader="qwen_dense",
+            loader="huggingface",
             parallelism=ParallelismConfig(sequence_parallel=2),
         )
+        group = object()
 
-        load_qwen_dense(LoaderContext(spec=spec, parallel_groups={"sp_group": object()}))
+        load_huggingface(LoaderContext(spec=spec, parallel_groups={"sp_group": group}))
 
         assert model.config.use_cache is False
+        assert configured == [(model, group)]
 
 
 class TestFromDsWorkerConfig:
