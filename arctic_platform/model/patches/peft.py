@@ -97,7 +97,7 @@ def apply_peft(
         model = peft.get_peft_model(model, config)
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
-    from arctic_platform.model.patches._tiled_mlp import register_tiled_mlp_peft_parameter_wrappers
+    from arctic_platform.model.patches.tiled_mlp import register_tiled_mlp_peft_parameter_wrappers
 
     register_tiled_mlp_peft_parameter_wrappers(model)
     return model

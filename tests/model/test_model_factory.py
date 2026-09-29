@@ -424,7 +424,7 @@ class TestModelFeaturePatches:
 
         tiled = {}
         monkeypatch.setattr(
-            "arctic_platform.model.patches._tiled_mlp.apply_dense_tiled_mlp",
+            "arctic_platform.model.patches.tiled_mlp.apply_dense_tiled_mlp",
             lambda model, *, token_chunk_size: tiled.update(
                 model=model,
                 token_chunk_size=token_chunk_size,
