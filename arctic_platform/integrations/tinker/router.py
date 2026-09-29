@@ -48,12 +48,6 @@ from typing import Sequence
 from typing import Union
 
 import numpy as np
-
-from arctic_platform.integrations.tinker.proto_wire import PROTO_CONTENT_TYPE
-from arctic_platform.integrations.tinker.proto_wire import decode_forward_backward_request
-from arctic_platform.integrations.tinker.proto_wire import encode_forward_backward_output
-from arctic_platform.integrations.tinker.proto_wire import encode_sample_response
-from arctic_platform.integrations.tinker.proto_wire import wants_proto
 from fastapi import APIRouter
 from fastapi import HTTPException
 from fastapi import Request
@@ -61,6 +55,12 @@ from fastapi import Response
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+
+from arctic_platform.integrations.tinker.proto_wire import PROTO_CONTENT_TYPE
+from arctic_platform.integrations.tinker.proto_wire import decode_forward_backward_request
+from arctic_platform.integrations.tinker.proto_wire import encode_forward_backward_output
+from arctic_platform.integrations.tinker.proto_wire import encode_sample_response
+from arctic_platform.integrations.tinker.proto_wire import wants_proto
 
 # =============================================================================
 # Wire schemas — Pydantic mirrors of ``tinker.types.*``
@@ -458,9 +458,7 @@ def _tensor_data_to_numpy(td: TensorData) -> np.ndarray:
     return arr
 
 
-def _split_prompt_response(
-    tokens: list[int], candidates: list[np.ndarray | None]
-) -> int:
+def _split_prompt_response(tokens: list[int], candidates: list[np.ndarray | None]) -> int:
     """Return the prompt / response boundary index for one ``Datum``.
 
     Convention (matches ``tinker-cookbook`` SFT + RL examples): prompt
@@ -533,13 +531,8 @@ def datum_list_to_arctic_batch(
             if td is not None:
                 candidates.append(_tensor_data_to_numpy(td).astype(np.float32))
 
-        # ``target_tokens[k]`` is the token after ``model_input[k]``, so the
-        # last target sits one past the end of the input and has to be appended
-        # for the final position to have anything to predict. It stays out of
-        # ``response_mask`` and ``advantages``: scored against, never scored.
-        # This applies to ``forward`` as much as to ``forward_backward`` --
-        # ``forward_backward_custom`` differentiates the log-probs a forward
-        # returned, so a garbage final position corrupts the client's gradient.
+        # Append the final target as a scoring token. It stays out of
+        # ``response_mask`` and ``advantages``.
         target_tokens = inputs.get("target_tokens")
         scoring_tok = None
         if target_tokens is not None:
@@ -553,13 +546,13 @@ def datum_list_to_arctic_batch(
         resp_toks = toks[p_end:][: mrl - 1 if scoring_tok is not None else mrl]
         p_len, r_len = len(prompt_toks), len(resp_toks)
 
-        prompts[i, mpl - p_len:] = np.asarray(prompt_toks, dtype=np.int64)
+        prompts[i, mpl - p_len :] = np.asarray(prompt_toks, dtype=np.int64)
         responses[i, :r_len] = np.asarray(resp_toks, dtype=np.int64)
-        response_mask[i, mpl: mpl + r_len] = 1
+        response_mask[i, mpl : mpl + r_len] = 1
 
-        input_ids[i, mpl - p_len: mpl] = np.asarray(prompt_toks, dtype=np.int64)
-        input_ids[i, mpl: mpl + r_len] = np.asarray(resp_toks, dtype=np.int64)
-        attention_mask[i, mpl - p_len: mpl + r_len] = 1
+        input_ids[i, mpl - p_len : mpl] = np.asarray(prompt_toks, dtype=np.int64)
+        input_ids[i, mpl : mpl + r_len] = np.asarray(resp_toks, dtype=np.int64)
+        attention_mask[i, mpl - p_len : mpl + r_len] = 1
         if scoring_tok is not None:
             input_ids[i, mpl + r_len] = scoring_tok
             attention_mask[i, mpl + r_len] = 1
@@ -569,20 +562,20 @@ def datum_list_to_arctic_batch(
         # tail has to be sliced out before it can go in the response columns.
         if "advantages" in inputs:
             arr = _tensor_data_to_numpy(inputs["advantages"]).astype(np.float32)
-            resp_adv = arr[p_end: p_end + r_len]
-            advantages[i, mpl: mpl + len(resp_adv)] = resp_adv
+            resp_adv = arr[p_end : p_end + r_len]
+            advantages[i, mpl : mpl + len(resp_adv)] = resp_adv
         if "logprobs" in inputs:
             arr = _tensor_data_to_numpy(inputs["logprobs"]).astype(np.float32)
-            resp_lp = arr[p_end: p_end + r_len]
-            old_log_probs[i, mpl: mpl + len(resp_lp)] = resp_lp
+            resp_lp = arr[p_end : p_end + r_len]
+            old_log_probs[i, mpl : mpl + len(resp_lp)] = resp_lp
         if "weights" in inputs:
             arr = _tensor_data_to_numpy(inputs["weights"]).astype(np.float32)
-            resp_w = arr[p_end: p_end + r_len]
+            resp_w = arr[p_end : p_end + r_len]
             # Tinker's cross-entropy is ``L = sum(-logprobs * weights)`` while
             # ``weighted_logprob_sum`` computes ``sum(logprobs * w)``, so the
             # sign flips here. Positions before ``p_end`` are zero by
             # construction -- that is how _split_prompt_response found p_end.
-            logprob_weights[i, mpl: mpl + len(resp_w)] = -resp_w
+            logprob_weights[i, mpl : mpl + len(resp_w)] = -resp_w
 
     actor_config: dict[str, Any] = {}
     if not forward_only:
@@ -653,16 +646,15 @@ def _unpad_logprobs_to_loss_fn_outputs(
             row = arr[i, start:end]
         else:
             take = end - start
-            row = arr.reshape(-1)[flat_offset: flat_offset + take]
+            row = arr.reshape(-1)[flat_offset : flat_offset + take]
             flat_offset += take
         if row.shape[0] < expected_len:
             row = np.pad(row, (0, expected_len - row.shape[0]))
         elif row.shape[0] > expected_len:
             row = row[:expected_len]
-        outputs.append({
-            "logprobs": TensorData(dtype="float32", data=row.tolist(),
-                                   shape=[int(expected_len)]).model_dump()
-        })
+        outputs.append(
+            {"logprobs": TensorData(dtype="float32", data=row.tolist(), shape=[int(expected_len)]).model_dump()}
+        )
     return outputs
 
 
@@ -785,8 +777,8 @@ def _require_state(app_state: Any, name: str) -> Any:
         raise HTTPException(
             500,
             f"Tinker layer misconfigured: app.state.{name} is unset. "
-            "Call POST /tinker/bind or arctic_platform.rl.tinker_router."
-            "init_tinker_state() at startup.",
+            "Call init_tinker_state() before starting "
+            "arctic_platform.integrations.tinker.serve.",
         )
     return getattr(app_state, name)
 
@@ -858,8 +850,7 @@ async def create_model(req: CreateModelRequest, request: Request) -> UntypedAPIF
     if req.base_model != base_model:
         raise HTTPException(
             400,
-            f"server was started with base_model={base_model!r}, "
-            f"got base_model={req.base_model!r}",
+            f"server was started with base_model={base_model!r}, got base_model={req.base_model!r}",
         )
     if req.lora_config is not None and req.lora_config.rank != 0:
         raise HTTPException(
@@ -905,8 +896,7 @@ def _gate_loss_fn(loss_fn: str) -> None:
     if loss_fn in _V1_UNSUPPORTED_LOSSES:
         raise HTTPException(
             400,
-            f"loss_fn={loss_fn!r} not supported in v1; "
-            f"supported: {sorted(_V1_SUPPORTED_LOSSES)}",
+            f"loss_fn={loss_fn!r} not supported in v1; supported: {sorted(_V1_SUPPORTED_LOSSES)}",
         )
     if loss_fn not in _V1_SUPPORTED_LOSSES:
         raise HTTPException(400, f"unknown loss_fn={loss_fn!r}")
@@ -941,9 +931,7 @@ async def forward_backward(request: Request) -> UntypedAPIFuture:
     return await _run_forward_backward(req, request)
 
 
-async def _run_forward_backward(
-    req: ForwardBackwardRequest, request: Request
-) -> UntypedAPIFuture:
+async def _run_forward_backward(req: ForwardBackwardRequest, request: Request) -> UntypedAPIFuture:
     fbi = req.forward_backward_input
     _gate_loss_fn(fbi.loss_fn)
     handler = _require_state(request.app.state, "tinker_fwd_bwd")
@@ -976,9 +964,7 @@ async def _run_forward_backward(
             metrics=arctic_metrics_to_tinker(r.get("metrics")),
         ).model_dump(mode="json")
 
-    return await _submit_inline(
-        request, runner, model_id=req.model_id, kind=_KIND_FWD_BWD
-    )
+    return await _submit_inline(request, runner, model_id=req.model_id, kind=_KIND_FWD_BWD)
 
 
 @router.post("/forward", response_model=UntypedAPIFuture)
@@ -1005,19 +991,14 @@ async def _run_forward(req: ForwardRequest, request: Request) -> UntypedAPIFutur
     async def runner() -> dict[str, Any]:
         r = await handler(batch)
         logprobs_batch = r.get("batch", {}).get("logprobs")
-        outputs = (
-            _unpad_logprobs_to_loss_fn_outputs(logprobs_batch, row_slices)
-            if logprobs_batch is not None else []
-        )
+        outputs = _unpad_logprobs_to_loss_fn_outputs(logprobs_batch, row_slices) if logprobs_batch is not None else []
         return ForwardBackwardOutput(
             loss_fn_output_type="ArrayRecord",
             loss_fn_outputs=outputs,
             metrics=arctic_metrics_to_tinker(r.get("metrics")),
         ).model_dump(mode="json")
 
-    return await _submit_inline(
-        request, runner, model_id=req.model_id, kind=_KIND_FWD_BWD
-    )
+    return await _submit_inline(request, runner, model_id=req.model_id, kind=_KIND_FWD_BWD)
 
 
 @router.post("/optim_step", response_model=UntypedAPIFuture)
@@ -1038,9 +1019,7 @@ async def optim_step(req: OptimStepRequest, request: Request) -> UntypedAPIFutur
 
 
 @router.post("/save_weights", response_model=UntypedAPIFuture)
-async def save_weights(
-    req: SaveWeightsRequest, request: Request
-) -> UntypedAPIFuture:
+async def save_weights(req: SaveWeightsRequest, request: Request) -> UntypedAPIFuture:
     """Ack-only state save so cookbook recipes ending in ``save_state`` don't
     crash. On-disk persistence is extension E2."""
 
@@ -1054,15 +1033,11 @@ async def save_weights(
 
 
 @router.post("/save_weights_for_sampler", response_model=UntypedAPIFuture)
-async def save_weights_for_sampler(
-    req: SaveWeightsForSamplerRequest, request: Request
-) -> UntypedAPIFuture:
+async def save_weights_for_sampler(req: SaveWeightsForSamplerRequest, request: Request) -> UntypedAPIFuture:
     handler = _require_state(request.app.state, "tinker_sync_weights")
 
     async def runner() -> dict[str, Any]:
-        request.app.state.tinker_weight_gen = getattr(
-            request.app.state, "tinker_weight_gen", 0
-        ) + 1
+        request.app.state.tinker_weight_gen = getattr(request.app.state, "tinker_weight_gen", 0) + 1
         gen = request.app.state.tinker_weight_gen
         await handler()
         return SaveWeightsForSamplerResponse(
@@ -1113,9 +1088,7 @@ async def asample(req: SampleRequest, request: Request) -> UntypedAPIFuture:
         try:
             gen = int(req.sampling_session_id.split("@", 1)[1])
         except ValueError:
-            raise HTTPException(
-                400, f"malformed sampling_session_id={req.sampling_session_id!r}"
-            )
+            raise HTTPException(400, f"malformed sampling_session_id={req.sampling_session_id!r}")
 
     current_gen = getattr(request.app.state, "tinker_weight_gen", 0)
 

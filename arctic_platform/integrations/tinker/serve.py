@@ -94,9 +94,7 @@ def _client_config(cfg: TinkerServeConfig) -> Any:
         # that is still enough for DeepSpeed to instantiate CPUAdam, which then
         # asserts the params are on cuda.
         ds_config={
-            "train_batch_size": (
-                cfg.micro_batch_size * cfg.training_gpus * cfg.gradient_accumulation_steps
-            ),
+            "train_batch_size": cfg.micro_batch_size * cfg.training_gpus * cfg.gradient_accumulation_steps,
             "train_micro_batch_size_per_gpu": cfg.micro_batch_size,
             "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
             "bf16": {"enabled": cfg.dtype == "bfloat16"},

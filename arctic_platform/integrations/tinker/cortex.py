@@ -12,30 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Back the Tinker router's five verbs with Cortex Training.
+"""Cortex backend for the Tinker API adapter.
 
-Two shape mismatches live here rather than in the router, which stays
-backend-agnostic:
-
-``{batch, meta, processing}`` → ``{args, kwargs, context, processing}``
-    Cortex takes an RPC-style envelope, and its loss registry has
-    ``causal_cross_entropy``, ``grpo`` and ``grpo_echo_v1`` -- not the
-    ``verl_grpo`` the router asks for.
-    :func:`~arctic_platform.integrations._cortex_shared.to_cortex_fwd_bwd_payload`
-    translates and pins ``grpo``.
-
-``weighted_logprob_sum`` → stock ``grpo``
-    The router asks for ``weighted_logprob_sum`` to carry Tinker's
-    ``cross_entropy``, and Cortex does not register it. :func:`_grpo_surrogate`
-    encodes the same gradient through a loss every RL server ships.
-
-Row alignment
-    The router lays a row out as ``[pad… prompt][response pad…]``; Cortex's
-    packer needs the real tokens in the *leading* columns. Aligning alone is
-    not enough, because the log-probs come back in the aligned frame while the
-    router's row slices index the original one -- so the permutation is
-    inverted on the way back. Skipping that shifts every row by its own prompt
-    padding, silently.
+This module translates request envelopes and loss names, aligns padded rows for
+Cortex, and restores returned log-probs to Tinker's row layout.
 """
 
 from __future__ import annotations
@@ -65,23 +45,7 @@ _LOGPROB_WEIGHTS = "logprob_weights_shifted"
 
 
 def _grpo_surrogate(body: dict, meta: dict) -> tuple[dict, dict]:
-    """Express ``sum(w * logprobs)`` as stock ``grpo``.
-
-    grpo's gradient wrt log-probs is ``-advantages * ratio``. Omitting
-    ``old_log_probs_shifted`` makes grpo default π_old to ``logprobs.detach()``
-    -- the *same* forward's output, not a second one -- so the ratio is exactly
-    1.0 and clipping provably cannot engage. That leaves ``-advantages``, so
-    ``advantages = -w`` gives a gradient of exactly ``w``.
-
-    ``batch_num_tokens=1`` cancels grpo's token-mean divisor: the client has
-    already scaled the weights, and Tinker's cross-entropy is an unnormalized
-    sum.
-
-    The reported loss is ``sum(-advantages)`` rather than ``sum(w * logprobs)``,
-    because at ratio 1 the per-token term is ``-advantages``. Only the gradient
-    is meant to match; the SDK reports the client's own loss and discards this
-    one.
-    """
+    """Encode Tinker's weighted log-prob gradient with stock ``grpo``."""
     if _LOGPROB_WEIGHTS not in body:
         raise ValueError(
             f"loss_fn={_WEIGHTED_LOGPROB_SUM!r} needs {_LOGPROB_WEIGHTS!r} in the "
@@ -162,18 +126,7 @@ def _forward_payload(batch: dict, order: torch.Tensor, valid: torch.Tensor) -> d
 
 
 def _require_logprobs(response: dict, op: str) -> torch.Tensor:
-    """The per-token log-probs as a ``[B, width]`` tensor in the aligned frame.
-
-    The location differs per verb: ``forward`` returns a top-level tensor,
-    ``forward-backward`` a nested list under ``post_process_outputs``, and
-    on-prem uses ``batch``. All three are rectangular and padded to full width,
-    so only the lookup differs.
-
-    Missing log-probs raise instead of defaulting. They feed
-    ``compute_kl_sample_train``, so a silent empty ``loss_fn_outputs`` would
-    disable the sampler-versus-trainer check and surface much later as a bare
-    ``KeyError`` inside the cookbook.
-    """
+    """Return aligned per-token log-probs or fail if the response omitted them."""
     import torch
 
     logprobs = None
@@ -241,7 +194,7 @@ class CortexTinkerBackend:
         meta = dict(batch.get("meta") or {})
         attention_mask = body.get("attention_mask")
         if not torch.is_tensor(attention_mask):
-            body = {k: (torch.as_tensor(v) if not torch.is_tensor(v) else v) for k, v in body.items()}
+            body = {k: torch.as_tensor(v) if not torch.is_tensor(v) else v for k, v in body.items()}
             attention_mask = body.get("attention_mask")
         if attention_mask is None:
             raise ValueError("tinker fwd_bwd batch is missing 'attention_mask'")
@@ -267,7 +220,7 @@ class CortexTinkerBackend:
         body = dict(batch.get("batch") or batch)
         attention_mask = body.get("attention_mask")
         if not torch.is_tensor(attention_mask):
-            body = {k: (torch.as_tensor(v) if not torch.is_tensor(v) else v) for k, v in body.items()}
+            body = {k: torch.as_tensor(v) if not torch.is_tensor(v) else v for k, v in body.items()}
             attention_mask = body.get("attention_mask")
         order, valid = _align_plan(attention_mask)
         response = await self.client.fwd_no_grad(_forward_payload({"batch": body}, order, valid))
@@ -292,9 +245,7 @@ class CortexTinkerBackend:
         """
         params = dict(sampling_params)
         num_samples = max(int(params.pop("n", 1) or 1), 1)
-        results = await self.client.generate(
-            [list(prompt_tokens)] * num_samples, sampling_params=params
-        )
+        results = await self.client.generate([list(prompt_tokens)] * num_samples, sampling_params=params)
         if len(results) != num_samples:
             raise RuntimeError(
                 f"asked cortex for {num_samples} rollouts and got {len(results)}; "

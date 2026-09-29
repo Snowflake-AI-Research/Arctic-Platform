@@ -12,14 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Protobuf codec round-trips, with the installed SDK as the oracle.
-
-``test_wire_schema.py`` checks the router's models against hard-coded copies of
-the SDK's types. That is what let the wire move to protobuf while every schema
-test still passed, so these tests deliberately do the opposite: they call the
-SDK's own serializer to build requests and its own deserializer to read
-responses. A drift that matters now fails here.
-"""
+"""Protobuf round-trip tests using the installed Tinker SDK."""
 
 from __future__ import annotations
 
@@ -121,9 +114,7 @@ class TestForwardBackwardOutputEncode:
 
     def test_sdk_reads_back_what_we_wrote(self):
         payload = self._payload()
-        output = response_conv.deserialize_forward_backward_output(
-            encode_forward_backward_output(payload)
-        )
+        output = response_conv.deserialize_forward_backward_output(encode_forward_backward_output(payload))
         assert output.metrics == {"loss:mean": pytest.approx(0.5), "grad_norm:mean": pytest.approx(1.25)}
         assert len(output.loss_fn_outputs) == 2
         for expected, actual in zip(payload["loss_fn_outputs"], output.loss_fn_outputs):
@@ -154,14 +145,14 @@ class TestForwardBackwardOutputEncode:
         payload = {
             "metrics": {},
             "loss_fn_outputs": [
-                {"logprobs": {"dtype": "float32", "data": [-1.0, -2.0], "shape": [2]},
-                 "extra": {"dtype": "float32", "data": [1.0, 2.0], "shape": [2]}},
+                {
+                    "logprobs": {"dtype": "float32", "data": [-1.0, -2.0], "shape": [2]},
+                    "extra": {"dtype": "float32", "data": [1.0, 2.0], "shape": [2]},
+                },
                 {"logprobs": {"dtype": "float32", "data": [-3.0], "shape": [1]}},
             ],
         }
-        output = response_conv.deserialize_forward_backward_output(
-            encode_forward_backward_output(payload)
-        )
+        output = response_conv.deserialize_forward_backward_output(encode_forward_backward_output(payload))
         assert [sorted(d) for d in output.loss_fn_outputs] == [["logprobs"], ["logprobs"]]
         np.testing.assert_allclose(np.asarray(output.loss_fn_outputs[1]["logprobs"].data), [-3.0])
 

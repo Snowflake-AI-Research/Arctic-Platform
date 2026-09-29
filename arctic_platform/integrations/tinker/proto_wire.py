@@ -12,21 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Protobuf codec for the two Tinker verbs that no longer speak JSON.
+"""Tinker protobuf request and response codec.
 
-Modern SDKs post ``forward_backward`` as ``application/x-protobuf`` and refuse a
-JSON reply for ``ForwardBackwardOutput`` and ``SampleResponse``::
-
-    Server returned a JSON payload for {self.model_cls=}, which this SDK version
-    only supports as proto. The server predates proto response serialization.
-
-So the codec is not optional, and it is not symmetric: ``sample`` *requests*
-are still JSON while its responses are proto.
-
-The schema is the SDK's own generated ``tinker_public_pb2``, not a vendored
-copy, so upstream changes surface as import or field errors instead of as
-wrong bytes. The import is local to this module, leaving ``tinker`` optional
-for anyone serving only the JSON verbs.
+The codec uses the SDK's generated ``tinker_public_pb2`` schema. The import is
+lazy so JSON-only routes remain available without the Tinker package.
 """
 
 from __future__ import annotations
@@ -122,8 +111,7 @@ def decode_forward_backward_request(body: bytes) -> tuple[ForwardBackwardRequest
             kind = chunk.WhichOneof("chunk")
             if kind != "encoded_text":
                 raise ValueError(
-                    f"model input chunk {kind!r} is not supported; this layer handles "
-                    "pre-tokenized text only"
+                    f"model input chunk {kind!r} is not supported; this layer handles pre-tokenized text only"
                 )
             # int32 here, unlike the int64 the rest of the request uses.
             tokens = np.frombuffer(chunk.encoded_text.tokens, dtype=np.int32).tolist()
@@ -132,8 +120,7 @@ def decode_forward_backward_request(body: bytes) -> tuple[ForwardBackwardRequest
             Datum(
                 model_input=ModelInput(chunks=chunks),
                 loss_fn_inputs={
-                    name: TensorData(**_tensor_to_lists(tensor))
-                    for name, tensor in datum.loss_fn_inputs.items()
+                    name: TensorData(**_tensor_to_lists(tensor)) for name, tensor in datum.loss_fn_inputs.items()
                 },
             )
         )
@@ -224,9 +211,7 @@ def encode_sample_response(payload: dict[str, Any]) -> bytes:
             pb.SampledSequence(
                 # Tokens are int32 on the wire; log-probs float32.
                 tokens=np.asarray(seq.get("tokens") or [], dtype=np.int32).tobytes(),
-                logprobs=(
-                    np.asarray(logprobs, dtype=np.float32).tobytes() if logprobs is not None else b""
-                ),
+                logprobs=(np.asarray(logprobs, dtype=np.float32).tobytes() if logprobs is not None else b""),
                 stop_reason=stop_reasons[reason],
             )
         )

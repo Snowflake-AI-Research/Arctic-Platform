@@ -32,7 +32,6 @@ from arctic_platform.integrations.tinker.cortex import _unalign_rows
 from arctic_platform.integrations.tinker.cortex import build_handlers
 from arctic_platform.testing_utils import torch_assert_equal
 
-
 _ECHO_INPUT_IDS = object()  # distinct from None, which means "omit log-probs"
 
 

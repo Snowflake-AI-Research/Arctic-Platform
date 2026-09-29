@@ -1,6 +1,19 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#
 # Shared fixtures for the Tinker HTTP layer tests. Every fixture wires the
 # router against a mocked backend so the entire test module can run
 # CPU-only, in-process, with no dependency on Ray / DeepSpeed / vLLM.
@@ -61,8 +74,7 @@ def mock_backend() -> dict[str, Any]:
         calls["step"].append(overrides)
         return {
             "job_id": 1,
-            "metrics": {"last_lr": overrides["lr"] if overrides else 1e-4,
-                        "grad_norm": 0.9},
+            "metrics": {"last_lr": overrides["lr"] if overrides else 1e-4, "grad_norm": 0.9},
             "batch": {},
         }
 
@@ -86,13 +98,16 @@ def mock_backend() -> dict[str, Any]:
             ]
         }
 
-    return {"calls": calls, "handlers": dict(
-        fwd_bwd_handler=fwd_bwd_handler,
-        fwd_no_grad_handler=fwd_no_grad_handler,
-        step_handler=step_handler,
-        sync_weights_handler=sync_weights_handler,
-        generate_handler=generate_handler,
-    )}
+    return {
+        "calls": calls,
+        "handlers": dict(
+            fwd_bwd_handler=fwd_bwd_handler,
+            fwd_no_grad_handler=fwd_no_grad_handler,
+            step_handler=step_handler,
+            sync_weights_handler=sync_weights_handler,
+            generate_handler=generate_handler,
+        ),
+    }
 
 
 def _build_app(mock_backend, **kwargs):

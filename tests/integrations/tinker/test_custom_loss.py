@@ -12,14 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tinker's ``forward_backward_custom``, lowered onto Cortex.
-
-The SDK computes a user loss locally and ships ``w = dC/dlogprobs`` as
-cross-entropy ``weights``, relying on the backend's cross-entropy being
-``L = sum(-logprobs * weights)`` so the chain rule reconstitutes ``C``. Nothing
-downstream reads the loss *value*, so a sign or frame error here is invisible
-end to end -- it just trains the wrong way. These tests pin the gradient.
-"""
+"""Gradient-equivalence tests for Tinker's ``forward_backward_custom``."""
 
 from __future__ import annotations
 
@@ -42,9 +35,7 @@ def _ce_datum(tokens, weights):
     return Datum(
         model_input=ModelInput(chunks=[EncodedTextChunk(tokens=tokens)]),
         loss_fn_inputs={
-            "target_tokens": TensorData(
-                dtype="int64", data=tokens[1:] + [tokens[-1] + 1], shape=[len(tokens)]
-            ),
+            "target_tokens": TensorData(dtype="int64", data=tokens[1:] + [tokens[-1] + 1], shape=[len(tokens)]),
             "weights": TensorData(dtype="float32", data=weights, shape=[len(weights)]),
         },
     )
@@ -52,8 +43,13 @@ def _ce_datum(tokens, weights):
 
 def _pack(datums, **kw):
     return datum_list_to_arctic_batch(
-        datums, "cross_entropy", None,
-        max_prompt_length=MPL, max_response_length=MRL, pad_token_id=0, **kw,
+        datums,
+        "cross_entropy",
+        None,
+        max_prompt_length=MPL,
+        max_response_length=MRL,
+        pad_token_id=0,
+        **kw,
     )
 
 
@@ -89,8 +85,12 @@ class TestRouterPacking:
 
     def test_ratio_losses_keep_their_own_loss_name(self):
         out, _ = datum_list_to_arctic_batch(
-            [_ce_datum([1, 2, 3], [0.0, 1.0, 1.0])], "ppo", None,
-            max_prompt_length=MPL, max_response_length=MRL, pad_token_id=0,
+            [_ce_datum([1, 2, 3], [0.0, 1.0, 1.0])],
+            "ppo",
+            None,
+            max_prompt_length=MPL,
+            max_response_length=MRL,
+            pad_token_id=0,
         )
         assert out["processing"]["loss_fn"] == "verl_grpo"
 
@@ -123,9 +123,7 @@ class TestGrpoSurrogate:
         """Tinker's CE is an unnormalized sum and the client has already scaled
         the weights, so grpo's ``masked_sum / batch_num_tokens`` must not
         rescale the gradient."""
-        _, meta = _grpo_surrogate(
-            {"logprob_weights_shifted": torch.zeros(1, 2)}, {"batch_num_tokens": 9}
-        )
+        _, meta = _grpo_surrogate({"logprob_weights_shifted": torch.zeros(1, 2)}, {"batch_num_tokens": 9})
         assert meta["batch_num_tokens"] == 1
 
     def test_missing_weights_raises(self):
@@ -145,9 +143,7 @@ class TestSurrogateIsScopedToCrossEntropy:
             self.sent.append(payload)
             return {"batch": {"logprobs": payload["kwargs"]["input_ids"].to(torch.float32)}}
 
-    @pytest.mark.parametrize(
-        "loss_fn,backend_loss", [("ppo", "verl_grpo"), ("importance_sampling", "verl_grpo")]
-    )
+    @pytest.mark.parametrize("loss_fn,backend_loss", [("ppo", "verl_grpo"), ("importance_sampling", "verl_grpo")])
     def test_ratio_loss_advantages_survive(self, loss_fn, backend_loss):
         import asyncio
 
@@ -162,8 +158,12 @@ class TestSurrogateIsScopedToCrossEntropy:
             },
         )
         batch, _ = datum_list_to_arctic_batch(
-            [datum], loss_fn, None,
-            max_prompt_length=MPL, max_response_length=MRL, pad_token_id=0,
+            [datum],
+            loss_fn,
+            None,
+            max_prompt_length=MPL,
+            max_response_length=MRL,
+            pad_token_id=0,
         )
         assert batch["processing"]["loss_fn"] == backend_loss
 
@@ -184,16 +184,14 @@ class TestGradientEquivalence:
     @pytest.mark.parametrize(
         "tokens,weights",
         [
-            ([1, 2, 3, 4, 5], [0.0, 0.0, 0.5, -1.5, 2.0]),   # mixed signs
-            ([1, 2, 3], [0.0, 1.0, 1.0]),                      # plain SFT weights
-            ([1, 2, 3, 4], [0.0, -0.25, -0.5, -0.75]),         # all negative
+            ([1, 2, 3, 4, 5], [0.0, 0.0, 0.5, -1.5, 2.0]),  # mixed signs
+            ([1, 2, 3], [0.0, 1.0, 1.0]),  # plain SFT weights
+            ([1, 2, 3, 4], [0.0, -0.25, -0.5, -0.75]),  # all negative
         ],
     )
     def test_surrogate_reproduces_tinker_cross_entropy(self, tokens, weights):
         out, slices = _pack([_ce_datum(tokens, weights)])
-        body, meta = _grpo_surrogate(
-            {k: torch.as_tensor(v) for k, v in out["batch"].items()}, out["meta"]
-        )
+        body, meta = _grpo_surrogate({k: torch.as_tensor(v) for k, v in out["batch"].items()}, out["meta"])
 
         logprobs = torch.zeros(body["advantages"].shape, dtype=torch.float32)
         logprobs.requires_grad_(True)
@@ -217,14 +215,15 @@ class TestGradientEquivalence:
         π_old to this same forward's log-probs, so it is exact rather than
         approximate -- a tiny eps_clip must still not bite."""
         out, slices = _pack([_ce_datum([1, 2, 3, 4], [0.0, 3.0, -3.0, 3.0])])
-        body, meta = _grpo_surrogate(
-            {k: torch.as_tensor(v) for k, v in out["batch"].items()}, out["meta"]
-        )
+        body, meta = _grpo_surrogate({k: torch.as_tensor(v) for k, v in out["batch"].items()}, out["meta"])
         logprobs = torch.randn(body["advantages"].shape, dtype=torch.float32)
         logprobs.requires_grad_(True)
         _grpo_loss(
-            logprobs, body["advantages"].to(torch.float32),
-            body["response_mask"], meta["batch_num_tokens"], eps_clip=1e-6,
+            logprobs,
+            body["advantages"].to(torch.float32),
+            body["response_mask"],
+            meta["batch_num_tokens"],
+            eps_clip=1e-6,
         ).backward()
 
         start, end, _ = slices[0]

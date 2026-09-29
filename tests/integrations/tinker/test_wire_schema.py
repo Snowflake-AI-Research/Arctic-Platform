@@ -1,5 +1,18 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Wire schema round-trip tests.
 
 These exist to catch upstream ``tinker.types.*`` drift: for every wire type
@@ -15,27 +28,19 @@ import json
 
 import pytest
 
-from arctic_platform.integrations.tinker.router import AdamParams
 from arctic_platform.integrations.tinker.router import ClientConfigResponse
 from arctic_platform.integrations.tinker.router import CreateModelRequest
-from arctic_platform.integrations.tinker.router import CreateModelResponse
 from arctic_platform.integrations.tinker.router import CreateSessionRequest
-from arctic_platform.integrations.tinker.router import Datum
-from arctic_platform.integrations.tinker.router import EncodedTextChunk
-from arctic_platform.integrations.tinker.router import ForwardBackwardInput
 from arctic_platform.integrations.tinker.router import ForwardBackwardOutput
 from arctic_platform.integrations.tinker.router import ForwardBackwardRequest
-from arctic_platform.integrations.tinker.router import ForwardInput
 from arctic_platform.integrations.tinker.router import ForwardRequest
 from arctic_platform.integrations.tinker.router import FutureRetrieveRequest
-from arctic_platform.integrations.tinker.router import LoraConfig
 from arctic_platform.integrations.tinker.router import ModelInput
 from arctic_platform.integrations.tinker.router import OptimStepRequest
 from arctic_platform.integrations.tinker.router import OptimStepResponse
+from arctic_platform.integrations.tinker.router import SampledSequence
 from arctic_platform.integrations.tinker.router import SampleRequest
 from arctic_platform.integrations.tinker.router import SampleResponse
-from arctic_platform.integrations.tinker.router import SampledSequence
-from arctic_platform.integrations.tinker.router import SamplingParams
 from arctic_platform.integrations.tinker.router import SaveWeightsForSamplerRequest
 from arctic_platform.integrations.tinker.router import SaveWeightsForSamplerResponse
 from arctic_platform.integrations.tinker.router import StopReason
@@ -46,8 +51,7 @@ from arctic_platform.integrations.tinker.router import UntypedAPIFuture
 
 class TestRequestParsing:
     def test_create_session_request(self):
-        body = {"tags": ["rl", "smoke"], "user_metadata": {"user": "k"},
-                "sdk_version": "0.42.0"}
+        body = {"tags": ["rl", "smoke"], "user_metadata": {"user": "k"}, "sdk_version": "0.42.0"}
         req = CreateSessionRequest.model_validate(body)
         assert req.tags == ["rl", "smoke"]
         assert req.user_metadata == {"user": "k"}
@@ -57,8 +61,7 @@ class TestRequestParsing:
             "session_id": "sess-abc",
             "model_seq_id": 0,
             "base_model": "Qwen/Qwen3-8B",
-            "lora_config": {"rank": 0, "seed": 42, "train_mlp": True,
-                            "train_attn": True, "train_unembed": True},
+            "lora_config": {"rank": 0, "seed": 42, "train_mlp": True, "train_attn": True, "train_unembed": True},
         }
         req = CreateModelRequest.model_validate(body)
         assert req.lora_config.rank == 0
@@ -78,22 +81,15 @@ class TestRequestParsing:
             "forward_backward_input": {
                 "data": [
                     {
-                        "model_input": {"chunks": [
-                            {"type": "encoded_text", "tokens": [1, 2, 3]}
-                        ]},
+                        "model_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
                         "loss_fn_inputs": {
-                            "advantages": {"dtype": "float32",
-                                           "data": [0.1, 0.2, 0.3],
-                                           "shape": [3]},
-                            "logprobs": {"dtype": "float32",
-                                         "data": [-1.0, -1.1, -1.2],
-                                         "shape": [3]},
+                            "advantages": {"dtype": "float32", "data": [0.1, 0.2, 0.3], "shape": [3]},
+                            "logprobs": {"dtype": "float32", "data": [-1.0, -1.1, -1.2], "shape": [3]},
                         },
                     },
                 ],
                 "loss_fn": "ppo",
-                "loss_fn_config": {"clip_low_threshold": 0.8,
-                                   "clip_high_threshold": 1.2},
+                "loss_fn_config": {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2},
             },
             "model_id": "main",
             "seq_id": 7,
@@ -106,9 +102,7 @@ class TestRequestParsing:
         body = {
             "forward_input": {
                 "data": [
-                    {"model_input": {"chunks": [
-                        {"type": "encoded_text", "tokens": [1, 2, 3]}
-                    ]}, "loss_fn_inputs": {}},
+                    {"model_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]}, "loss_fn_inputs": {}},
                 ],
                 "loss_fn": "ppo",
             },
@@ -119,9 +113,14 @@ class TestRequestParsing:
 
     def test_optim_step_request(self):
         body = {
-            "adam_params": {"learning_rate": 5e-5, "beta1": 0.9, "beta2": 0.999,
-                            "eps": 1e-8, "weight_decay": 0.01,
-                            "grad_clip_norm": 1.0},
+            "adam_params": {
+                "learning_rate": 5e-5,
+                "beta1": 0.9,
+                "beta2": 0.999,
+                "eps": 1e-8,
+                "weight_decay": 0.01,
+                "grad_clip_norm": 1.0,
+            },
             "model_id": "main",
         }
         req = OptimStepRequest.model_validate(body)
@@ -131,8 +130,7 @@ class TestRequestParsing:
     def test_sample_request_with_sampling_session(self):
         body = {
             "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
-            "sampling_params": {"max_tokens": 32, "temperature": 0.7,
-                                "top_p": 0.9, "stop": ["END"]},
+            "sampling_params": {"max_tokens": 32, "temperature": 0.7, "top_p": 0.9, "stop": ["END"]},
             "num_samples": 16,
             "sampling_session_id": "ss@3",
             "seq_id": 42,
@@ -160,8 +158,7 @@ class TestRequestParsing:
         assert req.ttl_seconds == 60
 
     def test_future_retrieve_request(self):
-        req = FutureRetrieveRequest.model_validate({"request_id": "42",
-                                                    "allow_metadata_only": True})
+        req = FutureRetrieveRequest.model_validate({"request_id": "42", "allow_metadata_only": True})
         assert req.request_id == "42"
         assert req.allow_metadata_only is True
 
@@ -200,12 +197,12 @@ class TestResponseSerialization:
         assert d["path"] == "tinker://main/sampler_weights/5"
 
     def test_sample_response_serialization(self):
-        r = SampleResponse(sequences=[
-            SampledSequence(tokens=[1, 2, 3], logprobs=[-0.1, -0.2, -0.3],
-                            stop_reason=StopReason.STOP),
-            SampledSequence(tokens=[4, 5], logprobs=None,
-                            stop_reason=StopReason.LENGTH),
-        ])
+        r = SampleResponse(
+            sequences=[
+                SampledSequence(tokens=[1, 2, 3], logprobs=[-0.1, -0.2, -0.3], stop_reason=StopReason.STOP),
+                SampledSequence(tokens=[4, 5], logprobs=None, stop_reason=StopReason.LENGTH),
+            ]
+        )
         d = r.model_dump()
         assert d["type"] == "sample"
         assert d["sequences"][0]["stop_reason"] == "stop"
@@ -244,15 +241,11 @@ class TestTensorData:
 
 class TestModelInputChunks:
     def test_encoded_text_only(self):
-        mi = ModelInput.model_validate(
-            {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]}
-        )
+        mi = ModelInput.model_validate({"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]})
         assert mi.chunks[0].tokens == [1, 2, 3]
 
     def test_rejects_non_text_chunk(self):
         # v1 supports text only. Pydantic will fail with a discriminator error
         # because we don't include an ImageChunk in the union.
         with pytest.raises(Exception):
-            ModelInput.model_validate(
-                {"chunks": [{"type": "image", "url": "http://x"}]}
-            )
+            ModelInput.model_validate({"chunks": [{"type": "image", "url": "http://x"}]})
