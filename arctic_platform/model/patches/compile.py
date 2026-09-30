@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Liger kernel patch."""
+"""Per-transformer-layer compilation patch."""
 
 from __future__ import annotations
 
@@ -20,18 +20,13 @@ import torch.nn as nn
 
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patch import register_patch
+from arctic_platform.model.patches.utils import transformer_layers
 
 
-@register_patch("liger")
-def apply_liger(model: nn.Module, ctx: LoaderContext) -> None:
-    from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
-
-    # Let each architecture choose its rotary implementation. Qwen3.5's Liger
-    # patcher rejects an explicit fused-rope request instead of falling back.
-    _apply_liger_kernel_to_instance(
-        model=model,
-        cross_entropy=False,
-        fused_linear_cross_entropy=True,
-        rms_norm=True,
-        swiglu=True,
-    )
+@register_patch("compile")
+def apply_compile(model: nn.Module, ctx: LoaderContext) -> None:
+    settings = ctx.spec.patches.compile
+    if settings is None:
+        raise ValueError("compile patch requires patches.compile configuration")
+    for layer in transformer_layers(model, patch_name="compile"):
+        layer.compile(fullgraph=settings.fullgraph)

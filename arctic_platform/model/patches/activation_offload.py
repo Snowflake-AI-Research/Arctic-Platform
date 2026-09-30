@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Liger kernel patch."""
+"""Activation offload patch."""
 
 from __future__ import annotations
 
@@ -22,16 +22,19 @@ from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patch import register_patch
 
 
-@register_patch("liger")
-def apply_liger(model: nn.Module, ctx: LoaderContext) -> None:
-    from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+@register_patch("activation_offload")
+def apply_activation_offload(model: nn.Module, ctx: LoaderContext) -> None:
+    config = ctx.spec.patches.activation_offload
+    if config is None or not config.enabled:
+        raise ValueError("activation_offload patch requires an enabled patches.activation_offload config")
 
-    # Let each architecture choose its rotary implementation. Qwen3.5's Liger
-    # patcher rejects an explicit fused-rope request instead of falling back.
-    _apply_liger_kernel_to_instance(
-        model=model,
-        cross_entropy=False,
-        fused_linear_cross_entropy=True,
-        rms_norm=True,
-        swiglu=True,
-    )
+    from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
+
+    manager = install_activation_offload(model, config=config)
+    backbone = getattr(model, "base_model", None)
+    if backbone is not None and backbone is not model:
+        install_activation_offload(
+            backbone,
+            config=config,
+            manager=manager,
+        )

@@ -12,13 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Built-in patches. Importing this package registers them."""
+"""Utilities shared by model patches."""
 
-from arctic_platform.model.patches import activation_offload  # noqa: F401
-from arctic_platform.model.patches import compile  # noqa: F401
-from arctic_platform.model.patches import gradient_checkpointing  # noqa: F401
-from arctic_platform.model.patches import liger  # noqa: F401
-from arctic_platform.model.patches import lm_head  # noqa: F401
-from arctic_platform.model.patches import peft  # noqa: F401
-from arctic_platform.model.patches import tiled_mlp  # noqa: F401
-from arctic_platform.model.patches import zorro_train  # noqa: F401
+from __future__ import annotations
+
+import torch.nn as nn
+
+
+def transformer_layers(model: nn.Module, *, patch_name: str):
+    target = model
+    for part in ("model", "layers"):
+        target = getattr(target, part, None)
+        if target is None:
+            raise ValueError(f"{patch_name} patch requires model.model.layers")
+    return target
