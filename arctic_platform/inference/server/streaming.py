@@ -207,8 +207,15 @@ class EventBuffer:
         self.ready = asyncio.Event()
         self.error = None
         self.done = False
+        # Newest undelivered delta per choice, which later text may join. With
+        # merging, a stream that falls behind needs at most one slot per choice
+        # for text, but its end needs 2n + 2 (finish events never merge), so
+        # max_buffer_events must be at least that.
+        self._open_deltas = {}
 
     def put(self, event):
+        if event.get("type") == "delta" and self._merge(event):
+            return
         size = event_size(event)
         if size > self.limits.max_event_bytes:
             raise StreamError("event_too_large")
@@ -217,11 +224,48 @@ class EventBuffer:
             or self.bytes + size > self.limits.max_buffer_bytes
         ):
             raise StreamError("buffer_overflow")
-        self.events.append((event, size))
+        entry = [event, size]
+        self.events.append(entry)
+        if event.get("type") == "delta":
+            self._open_deltas[event["choice_index"]] = entry
+        elif "choice_index" in event:
+            self._open_deltas.pop(event["choice_index"], None)
+        else:
+            self._open_deltas.clear()
         self.bytes += size
         self.peak_bytes = max(self.peak_bytes, self.bytes)
         self.peak_events = max(self.peak_events, len(self.events))
         self.ready.set()
+
+    def _merge(self, event):
+        """Append a delta's text to its choice's undelivered delta, if any.
+
+        Tokens that arrive while the reader is behind then share one event
+        instead of each taking a buffer slot, so a slow reader sees fewer,
+        larger deltas rather than an overflow. A reader that keeps up takes
+        each delta before the next arrives, so nothing merges.
+        """
+        entry = self._open_deltas.get(event["choice_index"])
+        if entry is None:
+            return False
+        merged = {**entry[0], "text": entry[0]["text"] + event["text"]}
+        size = event_size(merged)
+        if size > self.limits.max_event_bytes:
+            return False
+        if self.bytes - entry[1] + size > self.limits.max_buffer_bytes:
+            raise StreamError("buffer_overflow")
+        self.bytes += size - entry[1]
+        entry[0], entry[1] = merged, size
+        self.peak_bytes = max(self.peak_bytes, self.bytes)
+        return True
+
+    def _pop(self):
+        entry = self.events.popleft()
+        event, size = entry
+        self.bytes -= size
+        if self._open_deltas.get(event.get("choice_index")) is entry:
+            del self._open_deltas[event["choice_index"]]
+        return event
 
     def fail(self, code, *, context_limit_source=None):
         if self.error is None:
@@ -229,6 +273,7 @@ class EventBuffer:
                 code, context_limit_source=context_limit_source
             )
         self.events.clear()
+        self._open_deltas.clear()
         self.bytes = 0
         self.ready.set()
 
@@ -236,9 +281,7 @@ class EventBuffer:
         """Remove and return every event already buffered, without waiting."""
         drained = []
         while self.events and self.error is None:
-            event, size = self.events.popleft()
-            self.bytes -= size
-            drained.append(event)
+            drained.append(self._pop())
         return drained
 
     async def get(self):
@@ -246,9 +289,7 @@ class EventBuffer:
             if self.error:
                 raise self.error
             if self.events:
-                event, size = self.events.popleft()
-                self.bytes -= size
-                return event
+                return self._pop()
             if self.done:
                 raise StopAsyncIteration
             self.ready.clear()
