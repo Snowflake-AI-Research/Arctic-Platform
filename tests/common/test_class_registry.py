@@ -275,6 +275,50 @@ def test_loss_mask_normalization_is_objective_owned():
     assert resolve_loss("ap_grpo").requires_loss_mask_normalization() is True
 
 
+def test_legacy_adapter_aggregates_loss_totals_without_replacing_coordinator_metrics(monkeypatch):
+    def function_loss(model_outputs, batch, meta, config, device):
+        return torch.tensor(0.0), {}
+
+    monkeypatch.setitem(LOSS_FNS, "_legacy_metrics", function_loss)
+    worker_metrics = [
+        {
+            "grpo_stats_token_count": 1.0,
+            "grpo_importance_weight_sum": 2.0,
+            "grpo_log_ratio_sum": 3.0,
+            "grpo_clipped_token_count": 0.0,
+            "grpo_entropy_sum": 4.0,
+            "nll_trainable_token_count": 1.0,
+            "coordinator_metric": 10.0,
+        },
+        {
+            "grpo_stats_token_count": 3.0,
+            "grpo_importance_weight_sum": 6.0,
+            "grpo_log_ratio_sum": 9.0,
+            "grpo_clipped_token_count": 2.0,
+            "grpo_entropy_sum": 12.0,
+            "nll_trainable_token_count": 2.0,
+            "coordinator_metric": 20.0,
+        },
+    ]
+    metrics = {"coordinator_metric": 99.0}
+
+    resolve_loss("_legacy_metrics").metrics_callback(worker_metrics, metrics)
+
+    assert metrics == {
+        "coordinator_metric": 99.0,
+        "grpo_stats_token_count": 4.0,
+        "grpo_importance_weight_sum": 8.0,
+        "grpo_log_ratio_sum": 12.0,
+        "grpo_clipped_token_count": 2.0,
+        "grpo_entropy_sum": 16.0,
+        "nll_trainable_token_count": 3.0,
+        "importance_weight": 2.0,
+        "approx_kl": 3.0,
+        "clip_ratio": 0.5,
+        "entropy": 4.0,
+    }
+
+
 def test_pipeline_invokes_class_callbacks_in_execution_order():
     events = []
 

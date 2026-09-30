@@ -40,9 +40,11 @@ from arctic_platform.common.registry import register_post_processor
 from arctic_platform.common.registry import resolve_fn
 from arctic_platform.common.utils.batch import combine_metric_microbatches
 from arctic_platform.common.utils.batch import combine_metric_shards
+from arctic_platform.rl.processors import grpo_mixed_v1_loss
 from arctic_platform.rl.processors.causal_cross_entropy import causal_cross_entropy_loss
 from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
 from arctic_platform.rl.processors.cortex_grpo import cortex_grpo_loss
+from arctic_platform.rl.processors.cortex_grpo import cortex_grpo_mixed_v1_loss
 from arctic_platform.rl.processors.grpo import _ECHO_CONFIG_DEFAULTS
 from arctic_platform.rl.processors.grpo import _ECHO_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import _ECHO_REQUIRED_CONFIG_KEYS
@@ -371,6 +373,7 @@ class TestGrpoConfigContract(TestCasePlus):
             "rollout_is_weights",
             "prompt_group_ids",
             "prompt_token_counts",
+            "ratio_masks",
             "sequence_loss_weights",
         }
     )
@@ -419,13 +422,16 @@ class TestTrioPrecedenceIsPerLossName(TestCasePlus):
     both here makes any future unification a deliberate, visible change.
     """
 
-    def _call(self, loss_fn, config, meta):
+    def _call(self, loss_fn, config, meta, *, mixed=False):
         logprobs = torch.zeros(2, 3)
         batch = {
             "old_log_probs_shifted": torch.zeros(2, 3),
             "advantages": torch.ones(2, 3),
             "loss_mask": torch.ones(2, 3, dtype=torch.bool),
         }
+        if mixed:
+            batch["nll_mask"] = torch.tensor([[False, False, True], [False, False, True]])
+            config = {"use_cispo_loss": True, "is_weight_clip_max": 5.0, **config}
         loss, _ = loss_fn({"logprobs": logprobs}, batch, dict(meta), dict(config), "cpu")
         return loss.item()
 
@@ -444,6 +450,15 @@ class TestTrioPrecedenceIsPerLossName(TestCasePlus):
             {"batch_num_tokens": 12, "dp_size": 2},
         )
         config_only = self._call(grpo_loss, {"batch_num_tokens": 6, "dp_size": 2}, {})
+        self.assertAlmostEqual(conflicting, config_only, places=6)
+
+    def test_mixed_names_preserve_the_same_precedence_split(self):
+        config = {"batch_num_tokens": 6, "dp_size": 2}
+        context = {"batch_num_tokens": 12, "dp_size": 2}
+        with self.assertRaises(ValueError):
+            self._call(cortex_grpo_mixed_v1_loss, config, context, mixed=True)
+        conflicting = self._call(grpo_mixed_v1_loss, config, context, mixed=True)
+        config_only = self._call(grpo_mixed_v1_loss, config, {}, mixed=True)
         self.assertAlmostEqual(conflicting, config_only, places=6)
 
     def test_names_agree_when_only_one_side_supplies_the_trio(self):
@@ -466,6 +481,8 @@ class TestA5Compat(TestCasePlus):
         self.assertIn("compute_logprobs", POST_PROCESSORS)
         self.assertIn("ap_grpo", LOSS_FNS)
         self.assertIsNot(LOSS_FNS["ap_grpo"], LOSS_FNS["grpo"])
+        self.assertIs(LOSS_FNS["grpo_mixed_v1"], cortex_grpo_mixed_v1_loss)
+        self.assertIs(LOSS_FNS["ap_grpo_mixed_v1"], grpo_mixed_v1_loss)
         self.assertIn("ap_compute_logprobs", POST_PROCESSORS)
         self.assertIs(POST_PROCESSORS["ap_compute_logprobs"], POST_PROCESSORS["compute_entropy_and_logprobs"])
         self.assertIsNot(POST_PROCESSORS["compute_logprobs"], POST_PROCESSORS["ap_compute_logprobs"])

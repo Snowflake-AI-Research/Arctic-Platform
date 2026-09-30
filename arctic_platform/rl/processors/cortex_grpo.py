@@ -38,6 +38,7 @@ import torch
 from arctic_platform.common.registry import declare_loss_capabilities
 from arctic_platform.common.registry import register_loss_fn
 from arctic_platform.rl.processors.base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
+from arctic_platform.rl.processors.functional import RATIO_MASK_CONFIG_KEYS
 from arctic_platform.rl.processors.functional import resolve_global_loss_scale
 from arctic_platform.rl.processors.grpo import _ECHO_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import _ECHO_REQUIRED_CONFIG_KEYS
@@ -46,6 +47,7 @@ from arctic_platform.rl.processors.grpo import ECHO_SUMMED_METRICS
 from arctic_platform.rl.processors.grpo import _grpo_context
 from arctic_platform.rl.processors.grpo import _grpo_loss
 from arctic_platform.rl.processors.grpo import _grpo_packed_loss_reduction
+from arctic_platform.rl.processors.grpo import _validate_mixed_config
 
 
 def _cortex_distributed_config(config: dict, batch: dict, meta: dict) -> tuple[dict, dict]:
@@ -73,11 +75,31 @@ def cortex_grpo_loss(
 ) -> Tuple[torch.Tensor, dict]:
     """Cortex ``grpo`` contract on the AP 5-arg ABI."""
     config, context = _cortex_distributed_config(config, batch, meta)
+    if "nll_mask" in context:
+        raise ValueError("nll_mask requires loss_fn='grpo_mixed_v1'")
     echo_keys = _ECHO_CONFIG_KEYS & set(config)
     if echo_keys:
         raise ValueError(
             f"loss_fn 'grpo' does not accept ECHO config keys {sorted(echo_keys)} — request 'grpo_echo_v1'"
         )
+    return _grpo_loss(model_outputs, context, config, device)
+
+
+@register_loss_fn(
+    "grpo_mixed_v1",
+    packed_loss_reduction=_grpo_packed_loss_reduction,
+)
+@declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
+def cortex_grpo_mixed_v1_loss(
+    model_outputs: dict,
+    batch: dict,
+    meta: dict,
+    config: dict,
+    device: str,
+) -> Tuple[torch.Tensor, dict]:
+    """Cortex ``grpo_mixed_v1`` contract on the AP 5-arg ABI."""
+    config, context = _cortex_distributed_config(config, batch, meta)
+    _validate_mixed_config(context, config)
     return _grpo_loss(model_outputs, context, config, device)
 
 
@@ -96,7 +118,9 @@ def cortex_grpo_echo_v1_loss(
 ) -> Tuple[torch.Tensor, dict]:
     """Cortex ``grpo_echo_v1`` contract on the AP 5-arg ABI."""
     config, context = _cortex_distributed_config(config, batch, meta)
-    unknown_keys = set(config) - _GRPO_CONFIG_KEYS - _ECHO_CONFIG_KEYS
+    if "nll_mask" in context:
+        raise ValueError("nll_mask requires loss_fn='grpo_mixed_v1'")
+    unknown_keys = set(config) - _GRPO_CONFIG_KEYS - _ECHO_CONFIG_KEYS - RATIO_MASK_CONFIG_KEYS
     if unknown_keys:
         raise ValueError(f"Unknown config keys for loss_fn 'grpo_echo_v1': {sorted(unknown_keys)}")
     missing_keys = {key for key in _ECHO_REQUIRED_CONFIG_KEYS if config.get(key) is None}

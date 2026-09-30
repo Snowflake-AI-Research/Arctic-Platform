@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import torch
 
 from arctic_platform.common.utils.batch import metric_is_summed
+from arctic_platform.common.utils.batch import pooled_mixed_metrics
 
 from .base_loss import BaseLoss
 from .base_loss import resolve_loss
@@ -232,4 +233,5 @@ def combine_packed_metrics(
         for key, value in averaged.items()
     }
     out.update(summed)
+    out.update(pooled_mixed_metrics(out))
     return out

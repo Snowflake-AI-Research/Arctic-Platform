@@ -44,8 +44,10 @@ PUBLIC_LOSS_FNS = frozenset(
     {
         "ap_grpo",
         "ap_grpo_echo_v1",
+        "ap_grpo_mixed_v1",
         "grpo",
         "grpo_echo_v1",
+        "grpo_mixed_v1",
         "sft",
         "sft_ce",
         "verl_grpo",

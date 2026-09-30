@@ -28,6 +28,9 @@ from arctic_platform.common.registry import LOSS_CAPABILITIES_ATTR
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import resolve_fn
+from arctic_platform.common.utils.batch import combine_metric_shards
+from arctic_platform.common.utils.batch import metric_is_summed
+from arctic_platform.common.utils.batch import pooled_mixed_metrics
 from arctic_platform.registry import RegistryMeta
 from arctic_platform.registry import RegistryValidationError
 from arctic_platform.registry import get_registered_class
@@ -162,6 +165,11 @@ class _LegacyLossAdapter(BaseLoss):
 
     def requires_loss_mask_normalization(self) -> bool:
         return True
+
+    def metrics_callback(self, worker_metrics: Sequence[dict], metrics: dict) -> None:
+        combined = combine_metric_shards(list(worker_metrics))
+        metrics.update({name: value for name, value in combined.items() if metric_is_summed(name)})
+        metrics.update(pooled_mixed_metrics(combined))
 
     def packed_reduction_callback(
         self,
