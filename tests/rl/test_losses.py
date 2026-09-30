@@ -52,6 +52,7 @@ from arctic_platform.rl.processors.grpo import PROX_APPROX_METHOD_ROLLOUT
 from arctic_platform.rl.processors.grpo import PROX_LOGP_METHOD_METRICS
 from arctic_platform.rl.processors.grpo import PROX_LOGP_METHOD_RECOMPUTE
 from arctic_platform.rl.processors.grpo import _apply_m2po_masking
+from arctic_platform.rl.processors.grpo import _grpo_packed_loss_reduction
 from arctic_platform.rl.processors.grpo import _resolve_proximal_logp
 from arctic_platform.rl.processors.grpo import compute_prox_logp_approximations
 from arctic_platform.rl.processors.grpo import grpo_loss
@@ -587,6 +588,14 @@ class TestMigratedGrpo(TestCasePlus):
             agg_loss(values, mask, dp_size=1, batch_num_tokens=0)
         with self.assertRaisesRegex(ValueError, "global_batch_size=0"):
             agg_loss(values, mask, loss_agg_mode="seq-mean-token-sum", dp_size=1, global_batch_size=0)
+        with self.assertRaisesRegex(ValueError, "global_batch_size=0"):
+            agg_loss(
+                values,
+                mask,
+                loss_agg_mode="prompt-mean",
+                prompt_group_ids=torch.tensor([0]),
+                global_batch_size=0,
+            )
 
     def test_echo_uses_explicit_full_observation_denominator(self):
         values = torch.tensor([[-1.0, -2.0]], requires_grad=True)
@@ -633,6 +642,31 @@ class TestMigratedGrpo(TestCasePlus):
         self.assertEqual(metrics["teacher_clipped_log_ratio_sum"], 1.0)
         loss.backward()
         torch_assert_close(values.grad, torch.tensor([[-0.5, 0.0]]))
+
+    def test_teacher_term_rejects_broadcastable_or_non_floating_inputs(self):
+        values = torch.full((2, 2), -1.0)
+        base_context = {
+            "old_log_probs_shifted": values,
+            "advantages": torch.zeros_like(values),
+            "loss_mask": torch.ones_like(values, dtype=torch.bool),
+        }
+        config = {"teacher_tau": 1.0, "teacher_clip": 2.0}
+        with self.assertRaisesRegex(ValueError, "exactly match"):
+            grpo_loss(
+                {"logprobs": values},
+                {**base_context, "teacher_log_probs_shifted": torch.zeros((1, 2))},
+                {},
+                config,
+                "cpu",
+            )
+        with self.assertRaisesRegex(ValueError, "floating-point tensor"):
+            grpo_loss(
+                {"logprobs": values},
+                {**base_context, "teacher_log_probs_shifted": torch.zeros((2, 2), dtype=torch.int64)},
+                {},
+                config,
+                "cpu",
+            )
 
     def test_empty_teacher_shard_preserves_metric_contract(self):
         values = torch.tensor([[-1.0]], requires_grad=True)
@@ -682,6 +716,7 @@ class TestMigratedGrpo(TestCasePlus):
 
     def test_mixed_rejects_non_subset_and_plain_loss_refuses_nll(self):
         context = {
+            "input_ids": torch.ones((1, 2), dtype=torch.long),
             "old_log_probs_shifted": torch.tensor([[-1.0, -1.0]]),
             "advantages": torch.ones((1, 2)),
             "loss_mask": torch.tensor([[True, False]]),
@@ -696,6 +731,39 @@ class TestMigratedGrpo(TestCasePlus):
             grpo_loss(outputs, context, {}, {}, "cpu")
         with self.assertRaisesRegex(ValueError, "nll_mask requires"):
             LOSS_FNS["grpo"](outputs, context, {}, {}, "cpu")
+        with self.assertRaisesRegex(ValueError, "loss_fn='grpo_mixed_v1'"):
+            _grpo_packed_loss_reduction([context], {}, "grpo")
+
+    def test_mixed_rejects_behavioral_importance_sampling_inputs(self):
+        values = torch.tensor([[-1.0, -1.0]])
+        context = {
+            "old_log_probs_shifted": values,
+            "advantages": torch.ones_like(values),
+            "loss_mask": torch.ones_like(values, dtype=torch.bool),
+            "nll_mask": torch.tensor([[False, True]]),
+        }
+        config = {"use_cispo_loss": True, "is_weight_clip_max": 5.0}
+        for key, value in (
+            ("behav_imp_weight_cap", 1.5),
+            ("current_version", 2),
+            ("prox_logp_method", "loglinear"),
+        ):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "decoupled"):
+                LOSS_FNS["ap_grpo_mixed_v1"](
+                    {"logprobs": values},
+                    context,
+                    {},
+                    {**config, key: value},
+                    "cpu",
+                )
+        with self.assertRaisesRegex(ValueError, "decoupled"):
+            LOSS_FNS["ap_grpo_mixed_v1"](
+                {"logprobs": values},
+                {**context, "prox_logp_shifted": values + 1.0},
+                {},
+                config,
+                "cpu",
+            )
 
     def test_unprefixed_echo_accepts_ratio_telemetry(self):
         values = torch.tensor([[-1.0, -1.0]])

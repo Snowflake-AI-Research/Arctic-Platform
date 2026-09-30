@@ -290,6 +290,8 @@ def agg_loss(
         loss = ((seq_losses * seq_mask).sum() / global_batch_size) * dp_size
 
     elif loss_agg_mode == "prompt-mean":
+        if global_batch_size == 0:
+            global_batch_size = _explicit_zero_step_count("global_batch_size", loss_mask)
         sp_group = _get_sequence_parallel_group()
         # When sequences are packed ([1, T] with cu_seqlens present), recover
         # per-rollout sums using cu_seqlens segment boundaries, then group.

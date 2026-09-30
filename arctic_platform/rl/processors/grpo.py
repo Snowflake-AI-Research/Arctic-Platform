@@ -855,6 +855,8 @@ def _grpo_loss(
     if input_data["ref_log_probs"] is not None:
         input_data["ref_log_probs"] = input_data["ref_log_probs"].to(logprobs.device)
     if input_data["teacher_log_probs"] is not None:
+        if not torch.is_tensor(input_data["teacher_log_probs"]):
+            raise ValueError("teacher_log_probs_shifted must be a floating-point tensor")
         input_data["teacher_log_probs"] = input_data["teacher_log_probs"].to(logprobs.device)
 
     rollout_is_weights = context.get("rollout_is_weights")
@@ -880,6 +882,16 @@ def _grpo_loss(
         ):
             input_data[key] = _packed_singleton_to_1d(input_data[key])
         rollout_is_weights = _packed_singleton_to_1d(rollout_is_weights)
+
+    if values["teacher_tau"] > 0.0:
+        teacher_log_probs = input_data["teacher_log_probs"]
+        if not torch.is_tensor(teacher_log_probs) or not teacher_log_probs.is_floating_point():
+            raise ValueError("teacher_log_probs_shifted must be a floating-point tensor")
+        if teacher_log_probs.shape != logprobs.shape:
+            raise ValueError(
+                "teacher_log_probs_shifted must exactly match prediction-aligned logprobs shape, "
+                f"got {tuple(teacher_log_probs.shape)} and {tuple(logprobs.shape)}"
+            )
 
     prompt_group_ids = context.get("prompt_group_ids")
     if prompt_group_ids is not None:
@@ -973,7 +985,8 @@ def _grpo_packed_loss_reduction(
             _validate_mixed_config(microbatch, config)
             _validate_nll_mask(microbatch["nll_mask"], mask)
         elif "nll_mask" in microbatch:
-            raise ValueError("nll_mask requires loss_fn='ap_grpo_mixed_v1'")
+            mixed_name = "grpo_mixed_v1" if loss_fn_name.startswith("grpo") else "ap_grpo_mixed_v1"
+            raise ValueError(f"nll_mask requires loss_fn='{mixed_name}'")
         _resolve_teacher_tau(config, microbatch)
     mode = _grpo_config_values(config)["loss_agg_mode"]
 
@@ -1112,6 +1125,10 @@ def _validate_mixed_config(context: dict, config: dict) -> None:
         any(config.get(key) for key in unsupported)
         or config.get("m2_threshold") is not None
         or config.get("c_clip") is not None
+        or config.get("behav_imp_weight_cap") is not None
+        or config.get("current_version") is not None
+        or config.get("prox_logp_method", PROX_LOGP_METHOD_RECOMPUTE) != PROX_LOGP_METHOD_RECOMPUTE
+        or context.get("prox_logp_shifted") is not None
         or context.get("rollout_is_weights") is not None
     ):
         raise ValueError("grpo_mixed_v1 does not support SAPO, decoupled/M2PO/RIS, reference KL or entropy")
