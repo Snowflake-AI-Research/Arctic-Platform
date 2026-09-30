@@ -448,6 +448,8 @@ def _internal_grpo_loss_fn(
             raise ValueError("ratio-mask keys act on the CISPO policy term; they need use_cispo_loss=True.")
         ratio_m2_keep = None
         if ratio_masks is not None and ratio_masks.m2_threshold is not None:
+            if _get_sequence_parallel_group() is not None:
+                raise ValueError("ratio_m2_threshold does not support sequence parallelism")
             ratio_m2_keep = _apply_m2po_masking(old_logp, logprobs.detach(), loss_mask, ratio_masks.m2_threshold)
         if use_cispo_loss and c_clip is not None:
             raise ValueError("c_clip is not supported with use_cispo_loss=True.")
@@ -980,6 +982,8 @@ def _grpo_packed_loss_reduction(
     ratio_masks = RatioMasks.from_config(config)
     if ratio_masks is not None and not config.get("use_cispo_loss"):
         raise ValueError("ratio-mask keys act on the CISPO policy term; they need use_cispo_loss=True.")
+    if ratio_masks is not None and ratio_masks.m2_threshold is not None and len(microbatches) > 1:
+        raise ValueError("ratio_m2_threshold requires a single packed model call per worker")
     for microbatch, mask in zip(microbatches, masks):
         if loss_fn_name.endswith("grpo_mixed_v1"):
             _validate_mixed_config(microbatch, config)

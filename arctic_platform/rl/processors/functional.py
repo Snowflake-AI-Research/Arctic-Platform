@@ -476,12 +476,10 @@ def echo_env_prediction_loss_fn(
     losses, so only a constant global denominator keeps the auxiliary
     gradient mass invariant to how the batch was split).
 
-    ``dp_size`` must be the factor the POLICY aggregation applies, i.e.
-    :func:`dp_loss_multiplier` of the selected ``loss_agg_mode`` — NOT the
-    raw DP width. Passing the raw width when the policy path relies on DP
-    gradient averaging (``prompt-mean`` + ``sequence_loss_weights``) would
-    scale the auxiliary-to-policy ratio by DP width, silently multiplying
-    the configured λ.
+    ``dp_size`` must match the raw data-parallel width used by the policy
+    aggregation. :func:`dp_loss_multiplier` returns that width for every
+    supported aggregation mode so both policy and auxiliary terms compensate
+    for data-parallel gradient averaging identically.
 
     ``batch_denominator`` declares which count the client computed (see
     :class:`EchoBatchDenominator`). The division always uses the supplied

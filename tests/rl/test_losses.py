@@ -538,6 +538,17 @@ class TestMigratedGrpo(TestCasePlus):
                 grpo_loss(outputs, context, {}, {"use_cispo_loss": True, "ratio_mask_bounds_pos": invalid}, "cpu")
         with self.assertRaisesRegex(ValueError, "use_cispo_loss"):
             grpo_loss(outputs, context, {}, {"ratio_stats": True}, "cpu")
+        with (
+            patch("arctic_platform.rl.processors.grpo._get_sequence_parallel_group", return_value=object()),
+            self.assertRaisesRegex(ValueError, "does not support sequence parallelism"),
+        ):
+            grpo_loss(
+                outputs,
+                context,
+                {},
+                {"use_cispo_loss": True, "is_weight_clip_max": 2.0, "ratio_m2_threshold": 0.1},
+                "cpu",
+            )
         with self.assertRaisesRegex(ValueError, "ratio-mask keys"):
             LOSS_FNS["ap_grpo_mixed_v1"](
                 outputs,
@@ -553,6 +564,16 @@ class TestMigratedGrpo(TestCasePlus):
                 {},
                 {"use_cispo_loss": True, "is_weight_clip_max": True},
                 "cpu",
+            )
+        packed = {
+            "input_ids": torch.ones((1, 1), dtype=torch.long),
+            "loss_mask": torch.ones((1, 1), dtype=torch.bool),
+        }
+        with self.assertRaisesRegex(ValueError, "single packed model call"):
+            _grpo_packed_loss_reduction(
+                [packed, packed],
+                {"use_cispo_loss": True, "is_weight_clip_max": 2.0, "ratio_m2_threshold": 0.1},
+                "ap_grpo",
             )
 
     def test_new_columns_move_from_meta_to_shardable_batch(self):
