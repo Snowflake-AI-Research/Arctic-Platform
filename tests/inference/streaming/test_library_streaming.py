@@ -1,6 +1,7 @@
 """Actual Driver/Pool/Scheduler/Worker stream path; only model output is fake."""
 
 import asyncio
+from dataclasses import asdict
 import os
 from types import SimpleNamespace
 
@@ -116,6 +117,7 @@ class FakeEngineWorker:
         self.legacy_calls = 0
         self.registration_remaining_s = None
         self.abort_calls = 0
+        self.ack_delay_s = 0
 
     def fail_first_abort(self):
         async def abort(request_id):
@@ -156,8 +158,13 @@ class FakeEngineWorker:
         async for event in self.worker.stream_events(attempt_id):
             yield event
 
-    def acknowledge_stream(self, *args):
+    async def acknowledge_stream(self, *args):
+        if self.ack_delay_s:
+            await asyncio.sleep(self.ack_delay_s)
         return self.worker.acknowledge_stream(*args)
+
+    def set_ack_delay(self, seconds):
+        self.ack_delay_s = seconds
 
     async def abort_stream(self, *args):
         return await self.worker.abort_stream(*args)
@@ -403,6 +410,64 @@ def test_parameter_rejection(params):
         validate_request("prompt", params)
 
 
+def test_backlog_is_delivered_in_one_batch():
+    async def check():
+        worker = FakeEngineWorker.__ray_metadata__.modified_class()
+        limits = StreamLimits()
+        worker.worker.start_stream("attempt", [1, 2], {"max_tokens": 20}, 20, asdict(limits))
+        session = worker.worker._engine_streams["attempt"]
+        await asyncio.wait_for(session.pump, 5)  # engine done before anyone reads
+        events = worker.worker.stream_events("attempt")
+        batch = await anext(events)
+        # 20 deltas, choice_finished, usage, completed: one hand-over, not 23.
+        assert [event["sequence"] for event in batch] == list(range(23))
+        assert batch[-1]["type"] == "completed"
+        await events.aclose()
+
+    asyncio.run(check())
+
+
+def test_batch_is_acknowledged_by_its_last_sequence():
+    async def check():
+        worker = FakeEngineWorker.__ray_metadata__.modified_class()
+        worker.worker.start_stream(
+            "attempt", [1, 2], {"max_tokens": 4}, 20, asdict(StreamLimits())
+        )
+        session = worker.worker._engine_streams["attempt"]
+        while len(session.buffer.events) < 3:
+            await asyncio.sleep(0.001)
+        events = worker.worker.stream_events("attempt")
+        batch = await anext(events)
+        assert len(batch) >= 3
+        with pytest.raises(ValueError, match="Unexpected stream acknowledgement"):
+            worker.worker.acknowledge_stream("attempt", batch[0]["sequence"])
+        assert worker.worker.acknowledge_stream("attempt", batch[-1]["sequence"])
+        await events.aclose()
+
+    asyncio.run(check())
+
+
+def test_slow_round_trips_do_not_overflow_a_small_buffer():
+    # The engine makes a token every 2 ms and each acknowledgement takes 6 ms.
+    # Delivered one event per round trip, a 16-event buffer overflows within
+    # ~25 tokens; delivered in batches, each round trip takes the backlog.
+    async def check(driver, pool, actor):
+        await actor.set_ack_delay.remote(0.006)
+        limits = StreamLimits(max_buffer_events=16)
+        events = [
+            event
+            async for event in driver.stream_generate(
+                "model", "slow-consumer", [1, 2], {"max_tokens": 100}, limits=limits
+            )
+        ]
+        assert events[-1]["type"] == "completed", events[-1]
+        assert events[-2]["completion_tokens"] == 100
+        assert [event["sequence"] for event in events] == list(range(len(events)))
+        await actor.set_ack_delay.remote(0)
+
+    asyncio.run(exercise(check))
+
+
 def test_bounded_buffer():
     async def check():
         limits = StreamLimits(
@@ -562,9 +627,9 @@ def test_engine_parameters_and_adapter_are_preserved():
             "attempt", [1, 2], params, 20, asdict(StreamLimits())
         )
         events = worker.stream_events("attempt")
-        async for event in events:
-            if event["type"] != "completed":
-                worker.acknowledge_stream("attempt", event["sequence"])
+        async for batch in events:
+            if batch[-1]["type"] != "completed":
+                worker.acknowledge_stream("attempt", batch[-1]["sequence"])
         prepared, received, kwargs = worker.llm.calls[0]
         assert prepared == {"prompt_token_ids": [1, 2]}
         assert received == params

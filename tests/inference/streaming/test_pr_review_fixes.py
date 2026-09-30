@@ -425,10 +425,10 @@ def test_completed_but_undelivered_abort_reports_already_terminal():
         events = worker.stream_events(stream.attempt_id)
         try:
             while True:
-                event = await anext(events)
-                if event["type"] == "completed":
+                batch = await anext(events)
+                if batch[-1]["type"] == "completed":
                     break
-                worker.acknowledge_stream(stream.attempt_id, event["sequence"])
+                worker.acknowledge_stream(stream.attempt_id, batch[-1]["sequence"])
             assert "public" in scheduler._streams
             assert stream.attempt_id not in worker._engine_streams
             assert (await scheduler.abort("public"))["status"] == "already_terminal"

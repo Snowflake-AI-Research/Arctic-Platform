@@ -232,6 +232,15 @@ class EventBuffer:
         self.bytes = 0
         self.ready.set()
 
+    def drain(self):
+        """Remove and return every event already buffered, without waiting."""
+        drained = []
+        while self.events and self.error is None:
+            event, size = self.events.popleft()
+            self.bytes -= size
+            drained.append(event)
+        return drained
+
     async def get(self):
         while True:
             if self.error:
@@ -481,6 +490,13 @@ class StreamingWorkerMixin:
         return {"status": "registered"}
 
     async def stream_events(self, attempt_id):
+        """Yield buffered events in batches, one acknowledgement per batch.
+
+        Each batch holds the next event plus everything already buffered behind
+        it. With no backlog a batch is one event, as before. When the engine
+        outruns the consumer, the backlog is handed over in one round trip
+        instead of one per event, so the buffer drains instead of overflowing.
+        """
         session = self._engine_streams[attempt_id]
         if session.reader_started:
             raise ValueError("Stream already has a reader")
@@ -490,7 +506,7 @@ class StreamingWorkerMixin:
         try:
             while True:
                 try:
-                    event = await session.buffer.get()
+                    events = [await session.buffer.get()]
                 except StreamError as exc:
                     event = {
                         "type": "terminal_error",
@@ -500,22 +516,28 @@ class StreamingWorkerMixin:
                     }
                     if exc.context_limit_source is not None:
                         event["context_limit_source"] = exc.context_limit_source
-                    yield event
+                    yield [event]
                     return
                 except StopAsyncIteration:
                     return
+                events.extend(session.buffer.drain())
+                batch = []
+                for event in events:
+                    batch.append({**event, "sequence": sequence, "version": 1})
+                    sequence += 1
+                    if event["type"] == "completed":
+                        completed = True
+                        break
                 session.ack.clear()
-                session.pending_sequence = sequence
+                session.pending_sequence = batch[-1]["sequence"]
                 session.last_progress = time.monotonic()
-                if event["type"] == "completed":
-                    completed = True
+                if completed:
                     session.watchdog.cancel()
                     self._engine_streams.pop(attempt_id, None)
-                yield {**event, "sequence": sequence, "version": 1}
-                if event["type"] == "completed":
+                yield batch
+                if completed:
                     return
                 await session.ack.wait()
-                sequence += 1
         finally:
             if not completed:
                 await session.stop(session.buffer.error or "cancelled")
@@ -596,6 +618,8 @@ class ClientStream(AsyncIterator):
         self.first_delta_time = None
         self.finished_choices = set()
         self.next_sequence = 0
+        # Events received in the current batch, not yet handed to the reader.
+        self.pending_events = deque()
         self.watchdog = asyncio.create_task(self.watch())
 
     def __aiter__(self):
@@ -652,6 +676,12 @@ class ClientStream(AsyncIterator):
             self.last_read = time.monotonic()
 
     async def read_event(self):
+        if not self.pending_events:
+            await self._fetch_batch()
+        event = self.pending_events.popleft()
+        return await self._accept_event(event)
+
+    async def _fetch_batch(self):
         if self.worker is None:
             while self.worker is None:
                 if self.error:
@@ -697,12 +727,21 @@ class ClientStream(AsyncIterator):
             )
         try:
             reference = await self.remote_stream.__anext__()
-            event = await reference
+            batch = await reference
         except StopAsyncIteration:
             raise StreamError("incomplete_stream") from None
+        if not isinstance(batch, list) or not batch:
+            raise StreamError("invalid_event_sequence")
+        self.pending_events.extend(batch)
+
+    async def _accept_event(self, event):
         if self.error:
             raise StreamError(self.error)
-        if event.get("version") != 1 or event.get("sequence") != self.next_sequence:
+        if (
+            not isinstance(event, dict)
+            or event.get("version") != 1
+            or event.get("sequence") != self.next_sequence
+        ):
             raise StreamError("invalid_event_sequence")
         self.next_sequence += 1
         self.previous_sequence = event["sequence"]
