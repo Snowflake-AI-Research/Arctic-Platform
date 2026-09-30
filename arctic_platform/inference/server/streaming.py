@@ -675,6 +675,38 @@ class ClientStream(AsyncIterator):
             self.reading = False
             self.last_read = time.monotonic()
 
+    async def read_buffered(self, limit):
+        """Return up to ``limit`` more events already received, with no round trip.
+
+        For callers that relay events onward in batches: after a normal read,
+        this hands over the rest of the batch that read fetched. Returns an
+        empty list when nothing is buffered. A bad event aborts the stream as a
+        normal read would; events accepted before it are still returned, and
+        the next read raises the error.
+        """
+        if self.reading:
+            raise RuntimeError("Concurrent stream reads are not supported")
+        events = []
+        self.reading = True
+        try:
+            while (
+                self.pending_events
+                and len(events) < limit
+                and not (self.closed or self.error or self.error_delivered)
+            ):
+                events.append(await self._accept_event(self.pending_events.popleft()))
+        except StreamError as exc:
+            await self.abort(exc.code)
+            if not events:
+                raise
+        except BaseException:
+            await self.abort("stream_interrupted")
+            raise
+        finally:
+            self.reading = False
+            self.last_read = time.monotonic()
+        return events
+
     async def read_event(self):
         if not self.pending_events:
             await self._fetch_batch()

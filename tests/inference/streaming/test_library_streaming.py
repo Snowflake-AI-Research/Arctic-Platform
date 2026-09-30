@@ -118,6 +118,7 @@ class FakeEngineWorker:
         self.registration_remaining_s = None
         self.abort_calls = 0
         self.ack_delay_s = 0
+        self.ack_count = 0
 
     def fail_first_abort(self):
         async def abort(request_id):
@@ -159,12 +160,16 @@ class FakeEngineWorker:
             yield event
 
     async def acknowledge_stream(self, *args):
+        self.ack_count += 1
         if self.ack_delay_s:
             await asyncio.sleep(self.ack_delay_s)
         return self.worker.acknowledge_stream(*args)
 
     def set_ack_delay(self, seconds):
         self.ack_delay_s = seconds
+
+    def acks(self):
+        return self.ack_count
 
     async def abort_stream(self, *args):
         return await self.worker.abort_stream(*args)
@@ -463,6 +468,47 @@ def test_slow_round_trips_do_not_overflow_a_small_buffer():
         assert events[-1]["type"] == "completed", events[-1]
         assert events[-2]["completion_tokens"] == 100
         assert [event["sequence"] for event in events] == list(range(len(events)))
+        await actor.set_ack_delay.remote(0)
+
+    asyncio.run(exercise(check))
+
+
+def test_read_buffered_hands_over_the_rest_of_a_batch_without_a_round_trip():
+    async def check(driver, pool, actor):
+        await actor.set_ack_delay.remote(0.006)  # let a backlog form
+        stream = driver.stream_generate("model", "batched-reader", [1, 2], {"max_tokens": 60})
+        events = [await anext(stream)]
+        saw_batch = False
+        while events[-1]["type"] != "completed":
+            acks = await actor.acks.remote()
+            more = await stream.read_buffered(1000)
+            assert await actor.acks.remote() == acks  # no round trip
+            saw_batch = saw_batch or bool(more)
+            events.extend(more)
+            if events[-1]["type"] != "completed":
+                events.append(await anext(stream))
+        assert saw_batch
+        assert [event["sequence"] for event in events] == list(range(len(events)))
+        assert events[-2]["completion_tokens"] == 60
+        assert await stream.read_buffered(10) == []
+        await actor.set_ack_delay.remote(0)
+
+    asyncio.run(exercise(check))
+
+
+def test_read_buffered_respects_its_limit():
+    async def check(driver, pool, actor):
+        await actor.set_ack_delay.remote(0.006)
+        stream = driver.stream_generate("model", "limited-reader", [1, 2], {"max_tokens": 60})
+        await anext(stream)
+        while True:
+            more = await stream.read_buffered(2)
+            assert len(more) <= 2
+            if more and more[-1]["type"] == "completed":
+                break
+            if not more:
+                if (await anext(stream))["type"] == "completed":
+                    break
         await actor.set_ack_delay.remote(0)
 
     asyncio.run(exercise(check))
