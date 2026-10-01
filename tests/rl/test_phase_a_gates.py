@@ -692,6 +692,34 @@ class TestA5Compat(TestCasePlus):
         self.assertNotIn("loss_mask", engine.last_kwargs)
         self.assertIn("input_ids", engine.last_kwargs)
 
+    def test_ratio_m2_rejects_split_packing_before_forward(self):
+        class Engine:
+            def __init__(self):
+                self.global_rank = 0
+
+            def __call__(self, *args, **kwargs):
+                raise AssertionError("split ratio_m2_threshold request must fail before forward")
+
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
+            "advantages": torch.ones(2, 4),
+            "loss_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
+            "old_log_probs_shifted": torch.zeros(2, 4),
+        }
+        with self.assertRaisesRegex(ValueError, "requires one packed model call"):
+            run_pipeline(
+                Engine(),
+                (),
+                batch,
+                {"pad_token_id": 0},
+                {"loss_fn": "ap_grpo", "post": [], "config": {"ratio_m2_threshold": 0.1}},
+                "cpu",
+                backward=True,
+                pack=True,
+                max_tokens_per_mb=3,
+            )
+
     def test_cce_packed_resolve_accepts_global_batch_size(self):
         mb0 = {
             "input_ids": torch.ones(1, 2, dtype=torch.long),
