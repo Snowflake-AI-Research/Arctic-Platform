@@ -159,3 +159,21 @@ class TestExtraNamesResolve:
                 if dep.startswith("arctic_platform["):
                     ref = dep.split("[")[1].rstrip("]")
                     assert ref in optional, f"[{extra}] references undefined [{ref}]"
+
+    def test_in_tree_inference_stays_out_of_the_client_install(self):
+        """The copied inference tree is not part of the wheel or the client extras.
+
+        [rl] may still depend on the published arctic-inference wheel. A path
+        dependency on inference/ would be built for every consumer of that extra.
+        """
+        with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
+            project = tomllib.load(f)
+        include = project["tool"]["hatch"]["build"]["include"]
+        assert all(not str(item).startswith("inference") for item in include)
+        client_extras = ("cortex", "sft", "rl", "onprem", "verl", "all")
+        for extra in client_extras:
+            for dep in project["project"]["optional-dependencies"][extra]:
+                assert "{root:uri}/inference" not in dep
+                if dep.startswith("arctic_platform["):
+                    ref = dep.split("[", 1)[1].rstrip("]")
+                    assert ref != "inference"

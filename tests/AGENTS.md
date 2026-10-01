@@ -17,6 +17,26 @@ harness so CPU, GPU, and pytest-xdist runs stay consistent.
 Prefer importing helpers from `arctic_platform.testing_utils`. Do not reinvent skips,
 port picking, or tensor asserts in the test file.
 
+## In-tree inference tests
+
+`tests/inference` is the copied Arctic Inference suite. It lives next to the
+`inference/` package and is not part of the platform harness above. Default
+`pytest` and the `[sft,testing]` CI job skip it. `[cortex]`, `[sft]`, `[rl]`,
+and `[all]` do not build this tree. `[rl]` still installs the published
+`arctic-inference` wheel.
+
+Install and run the in-tree package on its own:
+
+```text
+pip install -e "./inference[server,vllm]"
+pytest tests/inference
+```
+
+That build compiles the CPU suffix-decoding extension and installs
+`cortex-training`, Ray, and vLLM. `tests/inference/conftest.py` also puts
+`inference/` on `sys.path`. Do not pull these tests into the default suite;
+collecting them imports vLLM. Sampling and NCCL tests need a GPU.
+
 ## Base style
 
 1. **Prefer `TestCasePlus`** (`unittest.TestCase` subclass) for anything that needs
@@ -134,6 +154,7 @@ usually need `@require_torch_gpu` only — not `gpu_serial`.
 | SFT CUDA kernels / local HTTP demo | `tests/sft/` | `@require_torch_gpu`; e2e → `gpu_serial` |
 | RL engine / generate / e2e | `tests/rl/` | Use `rl_harness` session helpers |
 | ZoRRO / model patchers | `tests/zorro_train/` | GPU when kernels matter |
+| Arctic Inference package | `tests/inference/` | Skipped by default `pytest`. Not the platform harness |
 
 ## Checklist for a new test
 
