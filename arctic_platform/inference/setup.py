@@ -36,7 +36,7 @@ PLAT_TO_CMAKE = {
 
 
 _SETUP_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _SETUP_DIR.parent
+_REPO_ROOT = _SETUP_DIR.parents[1]
 
 
 class CMakeExtension(Extension):

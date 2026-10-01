@@ -26,6 +26,7 @@ not pull vLLM. `[rl]` does.
 
 ```text
 pip install -e ".[inference]"
+python arctic_platform/inference/setup.py build_ext
 pytest tests/inference
 ```
 

@@ -10,7 +10,7 @@ class SwiftKVOpsBuilder(CUDAOpBuilder):
 
     def get_prefix(self):
         # borrowed from moe_op. refactor later
-        ai_path = self._src_path("../../inference")
+        ai_path = self._src_path("")
         return ai_path if os.path.isdir(os.path.join(ai_path, "csrc")) else ".."
 
     def sources(self):
