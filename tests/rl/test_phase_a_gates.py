@@ -406,6 +406,7 @@ class TestGrpoConfigContract(TestCasePlus):
             "prompt_token_counts",
             "ratio_masks",
             "sequence_loss_weights",
+            "loss_scale_factor",
         }
     )
 
