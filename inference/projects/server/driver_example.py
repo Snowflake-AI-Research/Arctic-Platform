@@ -10,8 +10,8 @@
 
 import asyncio
 
-from arctic_inference.server import ModelConfig
-from arctic_inference.server.multi_model import Driver
+from arctic_platform.inference.server import ModelConfig
+from arctic_platform.inference.server.multi_model import Driver
 
 CONFIG = ModelConfig(
     model="Qwen/Qwen3-30B-A3B",

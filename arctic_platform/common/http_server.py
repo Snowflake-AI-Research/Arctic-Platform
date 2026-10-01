@@ -73,20 +73,20 @@ from arctic_platform.common.utils.server_models import WeightSyncRequest
 from arctic_platform.common.utils.server_models import build_model_config
 
 if TYPE_CHECKING:
-    from arctic_inference.server.replica_pool import ReplicaPool
+    from arctic_platform.inference.server.replica_pool import ReplicaPool
 
 
 def _replica_pool_cls():
     """Lazy import — training-only servers do not need arctic_inference / vLLM."""
     require_any_dep_group("rl")
-    from arctic_inference.server.replica_pool import ReplicaPool
+    from arctic_platform.inference.server.replica_pool import ReplicaPool
 
     return ReplicaPool
 
 
 def _transfer_schedule_cls():
     require_any_dep_group("rl")
-    from arctic_inference.server.weight_sync.schedule import TransferSchedule
+    from arctic_platform.inference.server.weight_sync.schedule import TransferSchedule
 
     return TransferSchedule
 

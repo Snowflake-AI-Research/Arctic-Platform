@@ -53,18 +53,18 @@ except ModuleNotFoundError:
     sys.modules["vllm.v1.metrics.loggers"] = vllm_loggers
     sys.modules["vllm.v1.metrics.stats"] = vllm_stats
 
-import arctic_inference
+import arctic_platform.inference
 
-if runtime_stubbed and "arctic_inference.server" not in sys.modules:
-    server_package = types.ModuleType("arctic_inference.server")
+if runtime_stubbed and "arctic_platform.inference.server" not in sys.modules:
+    server_package = types.ModuleType("arctic_platform.inference.server")
     server_package.__path__ = [
-        str(Path(arctic_inference.__file__).parent / "server")
+        str(Path(arctic_platform.inference.__file__).parent / "server")
     ]
-    sys.modules["arctic_inference.server"] = server_package
-    arctic_inference.server = server_package
+    sys.modules["arctic_platform.inference.server"] = server_package
+    arctic_platform.inference.server = server_package
 
-from arctic_inference.server.replica_pool import ReplicaPool
-from arctic_inference.server.scheduler import Scheduler
+from arctic_platform.inference.server.replica_pool import ReplicaPool
+from arctic_platform.inference.server.scheduler import Scheduler
 
 
 class _RemoteMethod:

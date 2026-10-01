@@ -1,7 +1,7 @@
 import os
 
-from arctic_inference.server.router_replay import shm
-from arctic_inference.server.worker import InferenceWorker, WorkerLifecycleState
+from arctic_platform.inference.server.router_replay import shm
+from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
 
 def _configure_tmp_dirs(monkeypatch, tmp_path):

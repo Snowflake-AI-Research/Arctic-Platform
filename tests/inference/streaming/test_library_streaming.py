@@ -16,16 +16,16 @@ if os.environ.get("ARCTIC_RUN_GPU_TESTS") == "1":
     )
 
 load_library()
-from arctic_inference.server.multi_model import Driver
-from arctic_inference.server.replica_pool import ReplicaPool
-from arctic_inference.server.scheduler import Scheduler
-from arctic_inference.server.streaming import (
+from arctic_platform.inference.server.multi_model import Driver
+from arctic_platform.inference.server.replica_pool import ReplicaPool
+from arctic_platform.inference.server.scheduler import Scheduler
+from arctic_platform.inference.server.streaming import (
     EventBuffer,
     StreamError,
     StreamLimits,
     validate_request,
 )
-from arctic_inference.server.worker import InferenceWorker
+from arctic_platform.inference.server.worker import InferenceWorker
 
 
 class FakeEngine:
@@ -102,7 +102,7 @@ class FakeEngine:
 class FakeEngineWorker:
     def __init__(self):
         load_library()
-        from arctic_inference.server.worker import InferenceWorker, WorkerLifecycleState
+        from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
         worker_type = InferenceWorker.__ray_metadata__.modified_class
         self.worker = worker_type()
@@ -539,7 +539,7 @@ def test_independent_choice_finishes():
 
 def test_engine_parameters_and_adapter_are_preserved():
     async def check():
-        from arctic_inference.server.worker import WorkerLifecycleState
+        from arctic_platform.inference.server.worker import WorkerLifecycleState
 
         worker = InferenceWorker.__ray_metadata__.modified_class()
         worker.state = WorkerLifecycleState.READY
@@ -589,7 +589,7 @@ def test_legacy_worker_still_returns_final_output():
 def test_lifecycle_mutation_blocks_new_stream_registration():
     async def check():
         from dataclasses import asdict
-        from arctic_inference.server.worker import WorkerLifecycleState
+        from arctic_platform.inference.server.worker import WorkerLifecycleState
 
         worker = InferenceWorker.__ray_metadata__.modified_class()
         worker.state = WorkerLifecycleState.READY
@@ -619,7 +619,7 @@ def test_lifecycle_mutation_blocks_new_stream_registration():
 def test_failed_abort_quarantines_worker():
     async def check():
         from dataclasses import asdict
-        from arctic_inference.server.worker import WorkerLifecycleState
+        from arctic_platform.inference.server.worker import WorkerLifecycleState
 
         worker = InferenceWorker.__ray_metadata__.modified_class()
         worker.state = WorkerLifecycleState.READY

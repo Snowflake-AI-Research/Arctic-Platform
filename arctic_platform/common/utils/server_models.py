@@ -254,7 +254,7 @@ def build_model_config(
     ModelConfig, which expands them into real engine kwargs in
     ``ModelConfig.to_engine_kwargs()``.
     """
-    from arctic_inference.server.config import ModelConfig
+    from arctic_platform.inference.server.config import ModelConfig
 
     cfg = dict(vllm_config or {})
     cfg["model"] = model_name

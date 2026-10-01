@@ -57,16 +57,16 @@ if "vllm" not in sys.modules:
     sys.modules["vllm.v1.metrics.loggers"] = loggers_module
     sys.modules["vllm.v1.metrics.stats"] = stats_module
 
-if "arctic_inference.server" not in sys.modules:
-    package_root = Path(__file__).parents[3] / "inference" / "arctic_inference" / "server"
-    server_module = types.ModuleType("arctic_inference.server")
+if "arctic_platform.inference.server" not in sys.modules:
+    package_root = Path(__file__).parents[3] / "arctic_platform" / "inference" / "server"
+    server_module = types.ModuleType("arctic_platform.inference.server")
     server_module.__path__ = [str(package_root)]
-    weight_sync_module = types.ModuleType("arctic_inference.server.weight_sync")
+    weight_sync_module = types.ModuleType("arctic_platform.inference.server.weight_sync")
     weight_sync_module.__path__ = [str(package_root / "weight_sync")]
-    sys.modules["arctic_inference.server"] = server_module
-    sys.modules["arctic_inference.server.weight_sync"] = weight_sync_module
+    sys.modules["arctic_platform.inference.server"] = server_module
+    sys.modules["arctic_platform.inference.server.weight_sync"] = weight_sync_module
 
-from arctic_inference.server.weight_sync.engine import NCCLEngine
+from arctic_platform.inference.server.weight_sync.engine import NCCLEngine
 
 
 class _FakeStream:

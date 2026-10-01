@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from arctic_inference.server.scheduler import (
+from arctic_platform.inference.server.scheduler import (
     Scheduler,
     WorkerState,
     _Request,
@@ -255,14 +255,14 @@ def _capture_requests(sch: Scheduler) -> list:
 
 class TestSchedulerRoutingKey:
     def test_replica_pool_defaults_to_static_concurrency_128(self):
-        from arctic_inference.server.replica_pool import ReplicaPool
+        from arctic_platform.inference.server.replica_pool import ReplicaPool
 
         pool = ReplicaPool()
         scheduler = pool._make_scheduler([MagicMock(), MagicMock()])
         assert [ws.concurrency_limit for ws in scheduler._workers] == [128, 128]
 
     def test_replica_pool_uses_configured_initial_concurrency(self, monkeypatch):
-        from arctic_inference.server.replica_pool import ReplicaPool
+        from arctic_platform.inference.server.replica_pool import ReplicaPool
 
         monkeypatch.setenv("ARCTIC_WORKER_CONCURRENCY_LIMIT", "32")
         pool = ReplicaPool()

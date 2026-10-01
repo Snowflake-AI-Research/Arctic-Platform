@@ -2,7 +2,7 @@
 
 import asyncio
 
-from arctic_inference.server import ModelConfig, Pipeline, ReplicaPool, ensure_ray
+from arctic_platform.inference.server import ModelConfig, Pipeline, ReplicaPool, ensure_ray
 
 CONFIG = ModelConfig(
     model="Qwen/Qwen3-30B-A3B",

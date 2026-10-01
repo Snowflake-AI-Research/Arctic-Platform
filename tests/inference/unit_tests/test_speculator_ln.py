@@ -3,7 +3,7 @@ import torch.nn as nn
 import random
 import math
 
-from arctic_inference.py_custom_ops import (try_load_torch_library,
+from arctic_platform.inference.py_custom_ops import (try_load_torch_library,
                                             speculator_ln)
 
 

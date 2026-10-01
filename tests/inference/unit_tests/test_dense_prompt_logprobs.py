@@ -20,7 +20,7 @@ from typing import NamedTuple
 import pytest
 import torch
 
-from arctic_inference.vllm.dense_prompt_logprobs import (
+from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     DENSE,
     FORMAT_KEY,
     RESULT_KEY,
@@ -319,7 +319,7 @@ def patched(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
 
     original = (_StubProcessor.from_new_request, _StubProcessor._update_prompt_logprobs)
-    from arctic_inference.vllm.dense_prompt_logprobs import (
+    from arctic_platform.inference.vllm.dense_prompt_logprobs import (
         ensure_dense_prompt_logprobs_patch,
     )
 
@@ -368,7 +368,7 @@ def test_patch_refuses_a_second_chunk_instead_of_overwriting(patched):
 
 
 def test_patch_is_idempotent(patched):
-    from arctic_inference.vllm.dense_prompt_logprobs import (
+    from arctic_platform.inference.vllm.dense_prompt_logprobs import (
         ensure_dense_prompt_logprobs_patch,
     )
 

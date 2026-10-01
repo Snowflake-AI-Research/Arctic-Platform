@@ -22,7 +22,7 @@ LLM and is GPU-only; it is not run in this package's CPU CI.
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from arctic_inference.vllm.patches import WorkerPatch
+from arctic_platform.inference.vllm.patches import WorkerPatch
 
 
 def _worker(*, enable_nccl_comm_suspend: bool, level2: bool = False):

@@ -53,6 +53,12 @@ dependencies = [
     "typing-extensions",  # Self, per the pydantic model_validator convention
 ]
 
+[project.scripts]
+arctic_inference_server = "arctic_platform.inference.server.cli:main"
+
+[project.entry-points."vllm.general_plugins"]
+arctic_inference = "arctic_platform.inference.vllm.plugin:arctic_inference_plugin"
+
 # Optional dependency groups
 [project.optional-dependencies]
 all = [
@@ -128,12 +134,25 @@ sft = [
     "uvicorn",
 ]
 
-# [sft] plus sampling. arctic-inference[vllm] pulls vLLM and applies that extra's
-# pin; [rl] does not declare vLLM. 0.3.0 is the first release of that extra
-# contract.
+# Sampling stack that lives in arctic_platform.inference. Not referenced by
+# [cortex] or [sft]. vLLM stays on this extra.
+inference = [
+    "cortex-training",
+    "exceptiongroup>=1.0; python_version < '3.11'",
+    "fastapi",
+    "kvcached==0.1.4",
+    "pydantic>=2.0",
+    "ray",
+    "tqdm",
+    "uvicorn",
+    "vllm==0.30.0",
+    "xgrammar==0.2.6",
+]
+
+# [sft] plus the in-tree sampling package.
 rl = [
     "arctic_platform[sft]",
-    "arctic-inference[server,vllm]>=0.3.0",
+    "arctic_platform[inference]",
 ]
 
 onprem = [

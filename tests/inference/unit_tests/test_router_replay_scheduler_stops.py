@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from vllm.v1.request import RequestStatus
 
-from arctic_inference.vllm import patches
+from arctic_platform.inference.vllm import patches
 
 
 class _SamplingParams:

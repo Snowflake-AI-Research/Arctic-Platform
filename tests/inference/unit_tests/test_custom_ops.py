@@ -66,7 +66,7 @@ def test_reshape_and_cache_flash_bulk(
     num_heads: int,
     head_size: int,
 ) -> None:
-    from arctic_inference.py_custom_ops import (try_load_torch_library,
+    from arctic_platform.inference.py_custom_ops import (try_load_torch_library,
                                                 reshape_and_cache_flash_bulk)
     if not try_load_torch_library():
         pytest.skip("Custom ops not available, skipping test.")

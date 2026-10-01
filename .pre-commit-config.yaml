@@ -1,9 +1,10 @@
 # TODO(qwen35): files vendored/copied from PrimeRL are skipped by ALL hooks while the
 # qwen3_5_moe loader is being integrated (attribution handled separately). RE-ENABLE by
 # removing this global exclude once the qwen35 and shared MoE implementations are refactored.
-# inference/ is the copied Arctic Inference tree. It keeps its own formatting until a
-# later change wires it into the platform install.
-exclude: ^(arctic_platform/model/implementations/(qwen35|moe)/|cortex-client/|inference/|tests/inference/)
+# arctic_platform/inference is the copied Arctic Inference tree. Keep its original
+# formatting so the import can be traced to snowflake-eng/arcticinference-internal.
+# Format it in a follow-up change.
+exclude: ^(arctic_platform/model/implementations/(qwen35|moe)/|cortex-client/|arctic_platform/inference/|inference/|tests/inference/)
 
 repos:
   - repo: local

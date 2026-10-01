@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from arctic_inference.server.router_replay import RouterReplayCacheTX
-from arctic_inference.server.worker import (
+from arctic_platform.inference.server.router_replay import RouterReplayCacheTX
+from arctic_platform.inference.server.worker import (
     _has_string_stop,
     _normalize_stop_token_sequences,
     _result_from_output,

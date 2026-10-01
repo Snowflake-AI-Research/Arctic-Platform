@@ -6,7 +6,7 @@ import pytest
 
 
 def _model_config_cls():
-    path = Path(__file__).parents[3] / "inference" / "arctic_inference" / "server" / "config.py"
+    path = Path(__file__).parents[3] / "arctic_platform" / "inference" / "server" / "config.py"
     spec = importlib.util.spec_from_file_location("_test_arctic_server_config", path)
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None

@@ -80,7 +80,7 @@ def _install_kvcached_mock():
 
 _manager_store = _install_kvcached_mock()
 
-from arctic_inference.vllm.kvcached.prefix_block_pool import (
+from arctic_platform.inference.vllm.kvcached.prefix_block_pool import (
     PrefixCacheableElasticBlockPool,
 )
 from vllm.v1.core.kv_cache_utils import (

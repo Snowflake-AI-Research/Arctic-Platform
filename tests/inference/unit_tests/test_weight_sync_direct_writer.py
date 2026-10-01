@@ -73,7 +73,7 @@ if "vllm" not in sys.modules:
     sys.modules["vllm.v1.metrics.loggers"] = loggers_module
     sys.modules["vllm.v1.metrics.stats"] = stats_module
 
-from arctic_inference.server.weight_sync.receiver import (
+from arctic_platform.inference.server.weight_sync.receiver import (
     WeightSyncExtension,
     _loaded_destination_names,
     _model_parameter_l2,
@@ -105,7 +105,7 @@ def test_direct_zero_copy_keeps_non_contiguous_parameter_views(monkeypatch):
             self.param_views = param_views
             return {"params_loaded": 1}
 
-    import arctic_inference.server.weight_sync.utils as utils
+    import arctic_platform.inference.server.weight_sync.utils as utils
 
     monkeypatch.setattr(utils, "_DirectParamWriter", FakeWriter)
 
@@ -135,7 +135,7 @@ def test_direct_zero_copy_rejects_orphan_sources(monkeypatch):
         def receive_weights_direct(self, param_views):
             return {"params_loaded": 1, "orphan": 1}
 
-    import arctic_inference.server.weight_sync.utils as utils
+    import arctic_platform.inference.server.weight_sync.utils as utils
 
     monkeypatch.setattr(utils, "_DirectParamWriter", FakeWriter)
 
@@ -198,7 +198,7 @@ def test_direct_param_writer_maps_checkpoint_wrapped_layer_keys(monkeypatch):
             self.model = nn.Module()
             self.model.layers = nn.ModuleList([Layer()])
 
-    from arctic_inference.server.weight_sync.utils import _DirectParamWriter
+    from arctic_platform.inference.server.weight_sync.utils import _DirectParamWriter
 
     writer = _DirectParamWriter(Model(), torch.device("cpu"))
 
@@ -281,7 +281,7 @@ def test_load_direct_tracks_canonical_destinations_and_fusion(monkeypatch):
         def get_destination(self, name):
             return "qkv.weight" if name in self._views else None
 
-    import arctic_inference.server.weight_sync.utils as utils
+    import arctic_platform.inference.server.weight_sync.utils as utils
 
     monkeypatch.setattr(utils, "_DirectParamWriter", FakeWriter)
     (
@@ -465,7 +465,7 @@ def test_load_direct_still_rejects_orphan_sources(monkeypatch):
         def get_destination(self, name):
             return None
 
-    import arctic_inference.server.weight_sync.utils as utils
+    import arctic_platform.inference.server.weight_sync.utils as utils
 
     monkeypatch.setattr(utils, "_DirectParamWriter", FakeWriter)
 
@@ -487,7 +487,7 @@ def test_load_fp8_tracks_all_received_bytes(monkeypatch):
         def feed(self, name, tensor):
             self.names.append(name)
 
-    import arctic_inference.server.weight_sync.utils as utils
+    import arctic_platform.inference.server.weight_sync.utils as utils
 
     monkeypatch.setattr(utils, "_FP8InplaceUpdater", FakeUpdater)
     loaded, recv_l2_sq = WeightSyncExtension._load_fp8(
@@ -534,7 +534,7 @@ def test_fused_writer_reports_canonical_moe_destination():
             self.model = nn.Module()
             self.model.layers = nn.ModuleList([Layer()])
 
-    from arctic_inference.server.weight_sync.utils import _ShardAwareFusedWriter
+    from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
 
     writer = _ShardAwareFusedWriter(Model(), torch.device("cpu"))
 
@@ -663,7 +663,7 @@ async def _noop_abort_all_streams():
 
 
 def test_worker_gathers_full_and_loaded_parameter_traces(monkeypatch):
-    from arctic_inference.server.worker import InferenceWorker
+    from arctic_platform.inference.server.worker import InferenceWorker
 
     class FakeLLM:
         async def collective_rpc(self, *args, **kwargs):

@@ -36,7 +36,7 @@ from types import SimpleNamespace
 import torch
 import torch.multiprocessing as mp
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "inference"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 NUM_EXPERTS = 8
 HIDDEN = 128
@@ -173,7 +173,7 @@ def _worker(rank: int, tp_size: int, port: int, ret: dict):
                 ("model.layers.0.mlp.experts.w2_weight", full_w2),
             ])
 
-            from arctic_inference.server.weight_sync.receiver import (
+            from arctic_platform.inference.server.weight_sync.receiver import (
                 WeightSyncExtension,
             )
 

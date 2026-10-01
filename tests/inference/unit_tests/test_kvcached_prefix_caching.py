@@ -80,7 +80,7 @@ def start_server():
     proc = subprocess.Popen(
         [
             sys.executable, "-m", "uvicorn",
-            "arctic_inference.server.multi_model:app",
+            "arctic_platform.inference.server.multi_model:app",
             "--host", "0.0.0.0",
             "--port", str(SERVER_PORT),
         ],

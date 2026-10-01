@@ -25,8 +25,8 @@ def model_directory():
 
 
 async def with_driver(check):
-    from arctic_inference.server.config import ModelConfig
-    from arctic_inference.server.multi_model import Driver
+    from arctic_platform.inference.server.config import ModelConfig
+    from arctic_platform.inference.server.multi_model import Driver
     import ray
     import torch
 
@@ -72,7 +72,7 @@ def test_legacy_driver_generate():
 
 @pytest.mark.parametrize("choice_count", [1, 2])
 def test_driver_stream_contract(choice_count):
-    from arctic_inference.server.multi_model import Driver
+    from arctic_platform.inference.server.multi_model import Driver
 
     assert callable(getattr(Driver, "stream_generate", None)), (
         "Streaming API not implemented"
@@ -164,7 +164,7 @@ def test_driver_abort_reclaims_engine_requests():
 
 def test_slow_consumer_is_bounded_and_reclaimed():
     async def check(driver):
-        from arctic_inference.server.streaming import StreamError, StreamLimits
+        from arctic_platform.inference.server.streaming import StreamError, StreamLimits
 
         limits = StreamLimits(stall_timeout_s=1, max_buffer_events=4)
         stream = driver.stream_generate(

@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "inference"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 NUM_EXPERTS = 8
 HIDDEN = 128
@@ -141,12 +141,12 @@ def main() -> int:
                          torch.randn(rows, HIDDEN, dtype=DTYPE, device=device)))
 
     # (1) writer must not claim any HF name.
-    from arctic_inference.server.weight_sync.utils import _ShardAwareFusedWriter
+    from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
     probe = _ShardAwareFusedWriter(model, device)
     intercepted = [n for n, _ in hf_items if n in probe._handlers]
 
     # (2) drive the real seam; every HF item must be forwarded verbatim.
-    from arctic_inference.server.weight_sync.receiver import WeightSyncExtension
+    from arctic_platform.inference.server.weight_sync.receiver import WeightSyncExtension
     ext = SimpleNamespace(device=device)
     WeightSyncExtension._load_batched(ext, model, _FakeEngine(hf_items))
 

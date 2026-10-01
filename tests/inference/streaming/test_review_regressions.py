@@ -10,11 +10,11 @@ import pytest
 import ray
 
 from test_library_streaming import FakeEngine, FakeEngineWorker, runtime as runtime
-from arctic_inference.server.multi_model import BaseExceptionGroup, Driver
-from arctic_inference.server.replica_pool import ReplicaPool
-from arctic_inference.server.scheduler import Scheduler
-from arctic_inference.server.streaming import MAX_WORKER_STREAMS, StreamError, StreamLimits
-from arctic_inference.server.worker import InferenceWorker, WorkerLifecycleState
+from arctic_platform.inference.server.multi_model import BaseExceptionGroup, Driver
+from arctic_platform.inference.server.replica_pool import ReplicaPool
+from arctic_platform.inference.server.scheduler import Scheduler
+from arctic_platform.inference.server.streaming import MAX_WORKER_STREAMS, StreamError, StreamLimits
+from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
 
 def local_worker():
@@ -28,7 +28,7 @@ def local_worker():
 @pytest.mark.parametrize("clock_offset", [-3600, 3600])
 def test_worker_deadline_uses_local_monotonic_clock(monkeypatch, clock_offset):
     async def scenario():
-        import arctic_inference.server.streaming as streaming
+        import arctic_platform.inference.server.streaming as streaming
 
         worker = local_worker()
         limits = StreamLimits(timeout_s=0.2, stall_timeout_s=10)
@@ -95,7 +95,7 @@ def test_driver_shutdown_clears_failed_pools_and_attempts_all(model_id):
 @pytest.mark.parametrize("clock_offset", [-3600, 3600])
 def test_client_clock_skew_and_queue_time_budget(monkeypatch, clock_offset):
     async def scenario():
-        import arctic_inference.server.streaming as streaming
+        import arctic_platform.inference.server.streaming as streaming
 
         actor = FakeEngineWorker.remote()
         await actor.stats.remote()

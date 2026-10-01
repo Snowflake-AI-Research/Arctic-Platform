@@ -146,7 +146,7 @@ class _FakeXgrammar:
 
 
 def _install_fake_replay(monkeypatch):
-    import arctic_inference.server.action_mask_replay as replay
+    import arctic_platform.inference.server.action_mask_replay as replay
 
     replay._TOKENIZER_CONTEXTS.clear()
     replay._COMPILED_GRAMMARS.clear()
@@ -245,8 +245,8 @@ def test_action_mask_cache_stats_reach_scheduler_metrics(monkeypatch):
     replay = _install_fake_replay(monkeypatch)
     expected = replay.action_mask_replay_cache_stats()
 
-    import arctic_inference.server.worker as worker_module
-    from arctic_inference.server.scheduler import Scheduler
+    import arctic_platform.inference.server.worker as worker_module
+    from arctic_platform.inference.server.scheduler import Scheduler
 
     collector = SimpleNamespace(drain_snapshots=lambda: [{"timestamp": 1.0}])
     monkeypatch.setattr(worker_module, "get_collector", lambda: collector)
@@ -298,7 +298,7 @@ def test_vllm_qwen_parser_natively_ends_reasoning_at_tool_call():
 
 
 def test_disabled_arctic_plugin_applies_required_runtime_patches(monkeypatch):
-    from arctic_inference.vllm import (
+    from arctic_platform.inference.vllm import (
         fp32_lm_head,
         plugin,
         router_replay,
@@ -333,7 +333,7 @@ def test_worker_coerces_openai_structured_outputs_for_vllm():
     from vllm import SamplingParams
     from vllm.sampling_params import StructuredOutputsParams
 
-    from arctic_inference.server.worker import _coerce_structured_outputs_params
+    from arctic_platform.inference.server.worker import _coerce_structured_outputs_params
 
     params = {
         "max_tokens": 4,
@@ -349,7 +349,7 @@ def test_worker_coerces_openai_structured_outputs_for_vllm():
 def test_worker_coerces_guided_json_for_vllm():
     from vllm import SamplingParams
 
-    from arctic_inference.server.worker import _coerce_structured_outputs_params
+    from arctic_platform.inference.server.worker import _coerce_structured_outputs_params
 
     params = {
         "max_tokens": 4,
@@ -363,7 +363,7 @@ def test_worker_coerces_guided_json_for_vllm():
 
 
 def test_worker_prefills_think_for_thinking_request():
-    from arctic_inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
     captured = {}
@@ -406,7 +406,7 @@ def test_worker_prefills_think_for_thinking_request():
 
 
 def test_worker_prefills_think_without_structured_outputs():
-    from arctic_inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
     captured = {}
@@ -435,7 +435,7 @@ def test_worker_prefills_think_without_structured_outputs():
 
 
 def test_worker_preserves_renderer_prefilled_think_for_thinking_request():
-    from arctic_inference.server.worker import InferenceWorker
+    from arctic_platform.inference.server.worker import InferenceWorker
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
     worker_instance = _new_worker(WorkerClass)
@@ -456,7 +456,7 @@ def test_worker_preserves_renderer_prefilled_think_for_thinking_request():
 
 
 def test_worker_disables_reasoning_for_structured_nothink_request():
-    from arctic_inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
     captured = {}
@@ -494,7 +494,7 @@ def test_worker_disables_reasoning_for_structured_nothink_request():
 
 
 def test_worker_uses_parser_without_returning_reasoning_or_masks():
-    from arctic_inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
 
@@ -526,8 +526,8 @@ def test_worker_uses_parser_without_returning_reasoning_or_masks():
 
 
 def test_worker_replays_action_masks_with_raw_completion_token_ids(monkeypatch):
-    from arctic_inference.server import action_mask_replay
-    from arctic_inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server import action_mask_replay
+    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
     captured = {}
@@ -1063,7 +1063,7 @@ def test_replay_fails_without_parser_ids_or_reasoning_boundary(monkeypatch):
 def test_action_mask_normalizer_accepts_integral_floats_and_rejects_fractional():
     import pytest
 
-    from arctic_inference.server.action_masks import normalize_action_masks
+    from arctic_platform.inference.server.action_masks import normalize_action_masks
 
     masks = normalize_action_masks(
         {
@@ -1086,7 +1086,7 @@ def test_action_mask_normalizer_accepts_integral_floats_and_rejects_fractional()
 
 
 def test_worker_returns_action_masks_from_server_replay(monkeypatch):
-    from arctic_inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
     _install_fake_replay(monkeypatch)
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
@@ -1138,7 +1138,7 @@ def test_worker_returns_action_masks_from_server_replay(monkeypatch):
 
 
 def test_worker_can_return_reasoning_fields_when_enabled():
-    from arctic_inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
 
@@ -1169,7 +1169,7 @@ def test_worker_can_return_reasoning_fields_when_enabled():
 
 
 def test_worker_returns_reasoning_and_content_token_ids_when_enabled():
-    from arctic_inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
 
@@ -1199,7 +1199,7 @@ def test_worker_returns_reasoning_and_content_token_ids_when_enabled():
 
 
 def test_reasoning_parser_empty_result_treats_text_as_content():
-    from arctic_inference.server.worker import _extract_reasoning_content
+    from arctic_platform.inference.server.worker import _extract_reasoning_content
 
     reasoning, content = _extract_reasoning_content(
         SimpleNamespace(extract_reasoning=lambda _text, _request: (None, None)),
@@ -1211,7 +1211,7 @@ def test_reasoning_parser_empty_result_treats_text_as_content():
 
 
 def test_reasoning_ended_forces_text_content_when_parser_returns_reasoning():
-    from arctic_inference.server.worker import _extract_reasoning_content
+    from arctic_platform.inference.server.worker import _extract_reasoning_content
 
     reasoning, content = _extract_reasoning_content(
         SimpleNamespace(extract_reasoning=lambda _text, _request: ('{"kind":"final_answer"}', None)),
@@ -1224,7 +1224,7 @@ def test_reasoning_ended_forces_text_content_when_parser_returns_reasoning():
 
 
 def test_reasoning_parser_reaches_vllm_structured_outputs_config():
-    from arctic_inference.server.worker import _create_async_engine_args
+    from arctic_platform.inference.server.worker import _create_async_engine_args
 
     args = _create_async_engine_args(
         {
@@ -1245,7 +1245,7 @@ def test_reasoning_parser_reaches_vllm_structured_outputs_config():
 
 
 def test_worker_does_not_inject_resolve_reasoning_parser_plugin(monkeypatch):
-    from arctic_inference.server.worker import InferenceWorker
+    from arctic_platform.inference.server.worker import InferenceWorker
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
     worker_instance = _new_worker(WorkerClass)
@@ -1277,7 +1277,7 @@ def test_worker_does_not_inject_resolve_reasoning_parser_plugin(monkeypatch):
         def from_vllm_config(cls, *_args, **_kwargs):
             return object()
 
-    monkeypatch.setattr("arctic_inference.server.worker._create_async_engine_args", fake_create_async_engine_args)
+    monkeypatch.setattr("arctic_platform.inference.server.worker._create_async_engine_args", fake_create_async_engine_args)
     monkeypatch.setattr("vllm.v1.engine.async_llm.AsyncLLM", FakeAsyncLLM)
 
     import asyncio

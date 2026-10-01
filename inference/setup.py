@@ -35,18 +35,23 @@ PLAT_TO_CMAKE = {
 }
 
 
+_SETUP_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SETUP_DIR.parent
+
+
 class CMakeExtension(Extension):
 
     def __init__(self, name: str, sourcedir: str = "") -> None:
         super().__init__(name, sources=[])
-        self.sourcedir = os.fspath(Path(sourcedir).resolve())
+        self.sourcedir = os.fspath((_SETUP_DIR / sourcedir).resolve())
 
 
 class CMakeBuild(build_ext):
 
     def build_extension(self, ext: CMakeExtension) -> None:
         # Must be in this form due to bug in .resolve() only fixed in Python 3.10+
-        ext_fullpath = Path.cwd() / self.get_ext_fullpath(ext.name)
+        ext_rel = Path(self.get_ext_fullpath(ext.name))
+        ext_fullpath = ext_rel if ext_rel.is_absolute() else _REPO_ROOT / ext_rel
         extdir = ext_fullpath.parent.resolve()
 
         # Using this requires trailing slash for auto-detection & inclusion of
@@ -159,8 +164,8 @@ class CompileGrpc(_build_py):
     def run(self):
         import os
         import sys
-        sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-        from arctic_inference.embedding.generate_proto import generate_grpc_code
+        sys.path.append(str(_REPO_ROOT))
+        from arctic_platform.inference.embedding.generate_proto import generate_grpc_code
         generate_grpc_code()
         # Run the original build_py command
         _build_py.run(self)
@@ -170,15 +175,17 @@ ext_modules=[]
 
 if os.environ.get("ARCTIC_INFERENCE_PRECOMPILED_OPS", "").lower() in ("1", "true", "on"):
     ext_modules.append(
-        CMakeExtension("arctic_inference.custom_ops", "csrc/custom_ops"),
+        CMakeExtension("arctic_platform.inference.custom_ops", "csrc/custom_ops"),
     )
 
 ext_modules.append(
-     CMakeExtension("arctic_inference.suffix_decoding._C",
+     CMakeExtension("arctic_platform.inference.suffix_decoding._C",
                    "csrc/suffix_decoding"),
 )
 
 setup(
+    name="arctic-platform-inference-extensions",
+    packages=[],
     ext_modules=ext_modules,
     cmdclass={
         "build_ext": CMakeBuild,

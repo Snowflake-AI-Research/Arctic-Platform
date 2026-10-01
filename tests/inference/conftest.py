@@ -13,11 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Make the in-tree Arctic Inference package importable for this suite."""
-
-import sys
-from pathlib import Path
-
-_INFERENCE_ROOT = Path(__file__).resolve().parents[2] / "inference"
-if str(_INFERENCE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_INFERENCE_ROOT))
+"""The suite imports arctic_platform.inference from the repository root."""

@@ -28,7 +28,7 @@ from types import SimpleNamespace
 import torch
 import torch.multiprocessing as mp
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "inference"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 HIDDEN = 2048
 # Qwen3.5-MoE GDN geometry: qkvz = [key_dim, key_dim, value_dim, value_dim];
@@ -149,7 +149,7 @@ def _worker(rank: int, tp_size: int, port: int, ret: dict):
                 2 * NUM_V_HEADS, HIDDEN, generator=g,
                 dtype=torch.float32).to(DTYPE).to(device)
 
-            from arctic_inference.server.weight_sync.utils import (
+            from arctic_platform.inference.server.weight_sync.utils import (
                 _ShardAwareFusedWriter,
             )
             writer = _ShardAwareFusedWriter(model, device)

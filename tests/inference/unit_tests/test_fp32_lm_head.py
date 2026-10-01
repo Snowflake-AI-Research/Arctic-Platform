@@ -34,11 +34,11 @@ import torch
 
 
 def _load_worker_module(monkeypatch):
-    repo_root = Path(__file__).parents[3] / "inference"
-    server_pkg = types.ModuleType("arctic_inference.server")
-    server_pkg.__path__ = [str(repo_root / "arctic_inference" / "server")]
+    repo_root = Path(__file__).parents[3] / "arctic_platform" / "inference"
+    server_pkg = types.ModuleType("arctic_platform.inference.server")
+    server_pkg.__path__ = [str(repo_root / "server")]
 
-    metrics_mod = types.ModuleType("arctic_inference.server.metrics")
+    metrics_mod = types.ModuleType("arctic_platform.inference.server.metrics")
 
     class RingStatLogger:
         pass
@@ -48,14 +48,14 @@ def _load_worker_module(monkeypatch):
 
     metrics_mod.RingStatLogger = RingStatLogger
     metrics_mod.get_collector = get_collector
-    monkeypatch.setitem(sys.modules, "arctic_inference.server", server_pkg)
+    monkeypatch.setitem(sys.modules, "arctic_platform.inference.server", server_pkg)
     monkeypatch.setitem(
-        sys.modules, "arctic_inference.server.metrics", metrics_mod
+        sys.modules, "arctic_platform.inference.server.metrics", metrics_mod
     )
 
-    module_path = repo_root / "arctic_inference" / "server" / "worker.py"
+    module_path = repo_root / "server" / "worker.py"
     spec = importlib.util.spec_from_file_location(
-        "arctic_inference.server.worker", module_path
+        "arctic_platform.inference.server.worker", module_path
     )
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
@@ -112,7 +112,7 @@ def test_create_async_engine_args_accepts_fp32_lm_head_without_arctic(monkeypatc
         enable_arctic_patches=False,
     )
 
-    from arctic_inference.vllm.fp32_lm_head import (
+    from arctic_platform.inference.vllm.fp32_lm_head import (
         is_fp32_lm_head_enabled,
         set_fp32_lm_head_enabled,
     )
@@ -138,7 +138,7 @@ def test_create_async_engine_args_accepts_fp32_lm_head_false_without_arctic(monk
         enable_arctic_patches=False,
     )
 
-    from arctic_inference.vllm.fp32_lm_head import is_fp32_lm_head_enabled
+    from arctic_platform.inference.vllm.fp32_lm_head import is_fp32_lm_head_enabled
 
     assert args.fp32_lm_head is False
     assert "ARCTIC_FP32_LM_HEAD" not in os.environ
@@ -206,7 +206,7 @@ def patches_installed(distributed):
     same target attribute, so we tolerate that to allow multiple test
     modules to coexist in the same Python process.
     """
-    from arctic_inference.vllm.fp32_lm_head import (
+    from arctic_platform.inference.vllm.fp32_lm_head import (
         apply_fp32_lm_head_patches)
     try:
         apply_fp32_lm_head_patches()
@@ -218,7 +218,7 @@ def patches_installed(distributed):
 @pytest.fixture
 def fp32_enabled(patches_installed):
     """Flip the toggle on for the duration of one test."""
-    from arctic_inference.vllm.fp32_lm_head import set_fp32_lm_head_enabled
+    from arctic_platform.inference.vllm.fp32_lm_head import set_fp32_lm_head_enabled
     set_fp32_lm_head_enabled(True)
     try:
         yield
@@ -321,7 +321,7 @@ def test_fp32_logits_handles_already_fp32_inputs(fp32_enabled, vllm_cfg):
 
 def test_no_op_when_disabled(patches_installed, vllm_cfg):
     """With the toggle off, ``_get_logits`` runs the original bf16 path."""
-    from arctic_inference.vllm.fp32_lm_head import set_fp32_lm_head_enabled
+    from arctic_platform.inference.vllm.fp32_lm_head import set_fp32_lm_head_enabled
     set_fp32_lm_head_enabled(False)
 
     from vllm.model_executor.layers.logits_processor import LogitsProcessor

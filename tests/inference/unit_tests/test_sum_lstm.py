@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 import pytest
 import torch
 
-from arctic_inference.py_custom_ops import try_load_torch_library
+from arctic_platform.inference.py_custom_ops import try_load_torch_library
 
 if not try_load_torch_library():
     pytest.skip(
@@ -15,7 +15,7 @@ if not try_load_torch_library():
         allow_module_level=True,
     )
 
-from arctic_inference.py_custom_ops import sum_lstm
+from arctic_platform.inference.py_custom_ops import sum_lstm
 
 
 def rms_norm(x: torch.Tensor, eps: float, weight: Optional[torch.Tensor],

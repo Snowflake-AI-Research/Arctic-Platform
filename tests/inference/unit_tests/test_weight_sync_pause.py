@@ -52,7 +52,7 @@ sys.modules.setdefault("vllm.v1.metrics", vllm_metrics)
 sys.modules.setdefault("vllm.v1.metrics.loggers", vllm_loggers)
 sys.modules.setdefault("vllm.v1.metrics.stats", vllm_stats)
 
-from arctic_inference.server.replica_pool import ReplicaPool
+from arctic_platform.inference.server.replica_pool import ReplicaPool
 
 
 class _RemoteMethod:

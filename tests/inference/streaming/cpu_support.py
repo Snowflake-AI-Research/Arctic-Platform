@@ -23,11 +23,11 @@ class VLLMValidationError(Exception):
 
 
 def load_library():
-    import arctic_inference
+    import arctic_platform.inference
 
-    if "arctic_inference.server" not in sys.modules:
-        package = types.ModuleType("arctic_inference.server")
-        package.__path__ = [str(Path(arctic_inference.__file__).parent / "server")]
+    if "arctic_platform.inference.server" not in sys.modules:
+        package = types.ModuleType("arctic_platform.inference.server")
+        package.__path__ = [str(Path(arctic_platform.inference.__file__).parent / "server")]
         sys.modules[package.__name__] = package
     for name in (
         "vllm",
@@ -46,7 +46,7 @@ def load_library():
         setattr(sys.modules["vllm.v1.metrics.stats"], name, object)
     sys.modules.setdefault("torch", types.ModuleType("torch"))
     sys.modules.setdefault(
-        "arctic_inference.server.api", types.ModuleType("arctic_inference.server.api")
+        "arctic_platform.inference.server.api", types.ModuleType("arctic_platform.inference.server.api")
     )
-    sys.modules["arctic_inference.server.api"].app = None
-    return importlib.import_module("arctic_inference.server.multi_model")
+    sys.modules["arctic_platform.inference.server.api"].app = None
+    return importlib.import_module("arctic_platform.inference.server.multi_model")

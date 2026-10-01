@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from arctic_inference.server import multi_model as multi_model_mod
-from arctic_inference.server.multi_model import Driver
+from arctic_platform.inference.server import multi_model as multi_model_mod
+from arctic_platform.inference.server.multi_model import Driver
 
 
 class _FakePool:

@@ -7,12 +7,12 @@ Uses the new NCCLEngine with bucket-packed, double-buffered NCCL broadcast.
 Sender provides full (name, tensor) pairs — no TP assumption on the sender.
 
 Usage (small model, single-node test):
-    # Node B (receiver): CUDA_VISIBLE_DEVICES=0 python -m arctic_inference.server.cli --port 8100
+    # Node B (receiver): CUDA_VISIBLE_DEVICES=0 python -m arctic_platform.inference.server.cli --port 8100
     # Node A (sender):   python benchmark_weight_sync.py \
     #     --server-url http://<B>:8100 --sender-gpu 0 --master-addr <A_IP>
 
 Usage (Qwen3-32B, two-node):
-    # Node B (receiver): python -m arctic_inference.server.cli --port 8100
+    # Node B (receiver): python -m arctic_platform.inference.server.cli --port 8100
     # Node A (sender):   python benchmark_weight_sync.py --preset qwen3-32b \
     #     --server-url http://<B>:8100 --sender-gpu 0 --master-addr <A_IP>
 """
@@ -343,7 +343,7 @@ class WeightSyncBenchmark:
                 num_replicas = next(iter(models.values()))["num_replicas"] if models else 1
             else:
                 num_replicas = status.get("num_replicas", 1)
-            from arctic_inference.server.weight_sync import TransferSchedule
+            from arctic_platform.inference.server.weight_sync import TransferSchedule
             self._schedule = TransferSchedule.build(
                 training_sharding=cfg.training_sharding,
                 training_gpus=len(sender_gpus),
@@ -405,7 +405,7 @@ class WeightSyncBenchmark:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(self.cfg.server_gpu)
         port = self.cfg.server_url.rsplit(":", 1)[-1]
-        cmd = [sys.executable, "-m", "arctic_inference.server.cli",
+        cmd = [sys.executable, "-m", "arctic_platform.inference.server.cli",
                "--port", port]
         print(f"[setup] Starting server on GPU {self.cfg.server_gpu}...")
         self.server_proc = subprocess.Popen(
@@ -458,7 +458,7 @@ class WeightSyncBenchmark:
     def _load_weights(self):
         cfg = self.cfg
         from huggingface_hub import snapshot_download
-        from arctic_inference.server.weight_sync import WeightInfo
+        from arctic_platform.inference.server.weight_sync import WeightInfo
 
         print(f"[setup] Resolving model checkpoint: {cfg.model}")
         model_path = snapshot_download(cfg.model)
@@ -615,7 +615,7 @@ class WeightSyncBenchmark:
 
     def _create_senders(self, gpu_params, weights_info):
         """Create WeightSenders, connect, and do the first weight sync."""
-        from arctic_inference.server.weight_sync import WeightSender
+        from arctic_platform.inference.server.weight_sync import WeightSender
 
         cfg = self.cfg
         schedule = self._schedule

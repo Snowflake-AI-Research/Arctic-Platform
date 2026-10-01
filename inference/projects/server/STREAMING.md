@@ -11,7 +11,7 @@ Use unique request IDs and close early exits explicitly:
 
 ```python
 from uuid import uuid4
-from arctic_inference.server.streaming import StreamLimits
+from arctic_platform.inference.server.streaming import StreamLimits
 
 async with driver.stream_generate(
     model_id="loaded-model",

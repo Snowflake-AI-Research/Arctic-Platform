@@ -4,7 +4,7 @@ import pytest
 
 
 def _pack_fused_expert_loras():
-    from arctic_inference.server.weight_sync.receiver import (
+    from arctic_platform.inference.server.weight_sync.receiver import (
         _pack_fused_expert_loras,
     )
 

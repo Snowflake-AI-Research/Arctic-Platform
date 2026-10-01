@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from arctic_inference.server import replica_pool as replica_pool_mod
-from arctic_inference.server.replica_pool import ReplicaPool
+from arctic_platform.inference.server import replica_pool as replica_pool_mod
+from arctic_platform.inference.server.replica_pool import ReplicaPool
 
 
 class _RemoteMethod:
@@ -199,7 +199,7 @@ def test_shutdown_times_out_hung_workers_and_kills_all(monkeypatch, caplog):
         "kill",
         lambda actor: killed.append(actor.index),
     )
-    caplog.set_level(logging.WARNING, logger="arctic_inference.server")
+    caplog.set_level(logging.WARNING, logger="arctic_platform.inference.server")
 
     asyncio.run(run())
 

@@ -145,7 +145,7 @@ def parity_check_fp4_vs_fp16(
                                                    slot_mapping, "auto",
                                                    k_scale, v_scale)
 
-    from arctic_inference.py_custom_ops import (try_load_torch_library,
+    from arctic_platform.inference.py_custom_ops import (try_load_torch_library,
                                                 reshape_and_cache_flash_fp4)
     if not try_load_torch_library():
         raise RuntimeError(

@@ -6,11 +6,11 @@ from collections import OrderedDict
 import pytest
 import torch
 
-from arctic_inference.server.router_replay import (
+from arctic_platform.inference.server.router_replay import (
     RouterReplayCacheTX,
     RouterReplayDuplicateError,
 )
-from arctic_inference.server.router_replay.all2all import (
+from arctic_platform.inference.server.router_replay.all2all import (
     _compute_plan,
     _PerRankManifest,
 )
@@ -48,7 +48,7 @@ def test_tx_cache_logs_lru_eviction(monkeypatch, caplog):
     monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_EVICT_MIN_AGE_S", "0")
     one = _tensor(seq_len=4)
     cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=one.numel())
-    caplog.set_level(logging.WARNING, logger="arctic_inference.server.router_replay.cache")
+    caplog.set_level(logging.WARNING, logger="arctic_platform.inference.server.router_replay.cache")
 
     cache.put("sid-1", one)
     cache.put("sid-2", one)
@@ -65,7 +65,7 @@ def test_tx_cache_logs_ttl_eviction(monkeypatch, caplog):
     monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_TTL_S", "0.001")
     one = _tensor(seq_len=4)
     cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
-    caplog.set_level(logging.WARNING, logger="arctic_inference.server.router_replay.cache")
+    caplog.set_level(logging.WARNING, logger="arctic_platform.inference.server.router_replay.cache")
 
     cache.put("sid-old", one)
     time.sleep(0.01)
@@ -309,7 +309,7 @@ def test_tx_cache_exact_tombstone_expires_with_cache_ttl(monkeypatch):
     now = [100.0]
     monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_TTL_S", "10")
     monkeypatch.setattr(
-        "arctic_inference.server.router_replay.cache.time.monotonic",
+        "arctic_platform.inference.server.router_replay.cache.time.monotonic",
         lambda: now[0],
     )
     cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
@@ -325,7 +325,7 @@ def test_tx_cache_repeated_discard_refreshes_tombstone_ttl(monkeypatch):
     now = [100.0]
     monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_TTL_S", "10")
     monkeypatch.setattr(
-        "arctic_inference.server.router_replay.cache.time.monotonic",
+        "arctic_platform.inference.server.router_replay.cache.time.monotonic",
         lambda: now[0],
     )
     cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
@@ -357,7 +357,7 @@ def test_tx_cache_tombstone_expiry_work_is_bounded_by_expired_prefix(monkeypatch
     now = [100.0]
     monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_TTL_S", "10")
     monkeypatch.setattr(
-        "arctic_inference.server.router_replay.cache.time.monotonic",
+        "arctic_platform.inference.server.router_replay.cache.time.monotonic",
         lambda: now[0],
     )
     cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
@@ -422,7 +422,7 @@ def test_all2all_rejects_duplicate_exact_id_across_senders():
 
 
 def test_all2all_legacy_duplicate_uses_lowest_rank_with_warning(caplog):
-    caplog.set_level(logging.WARNING, logger="arctic_inference.server.router_replay.all2all")
+    caplog.set_level(logging.WARNING, logger="arctic_platform.inference.server.router_replay.all2all")
     manifests = [
         _PerRankManifest(
             role="sender",

@@ -71,7 +71,7 @@ def sender_main(
     gpu_id: int,
     master_addr: str = "127.0.0.1",
 ):
-    from arctic_inference.server.weight_sync import send_spec_weights
+    from arctic_platform.inference.server.weight_sync import send_spec_weights
 
     device = torch.device("cuda", gpu_id)
     print(f"[sender tp{tp_rank}] sending {model_path}", flush=True)
@@ -159,7 +159,7 @@ def _launch_senders_remote(spec_path: str, sender_host: str) -> list[subprocess.
     python_bin = os.environ.get("REMOTE_PYTHON", sys.executable)
     test_script = os.path.abspath(__file__)
     platform_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(test_script))))
-    repo_root = os.path.join(platform_root, "inference")
+    repo_root = platform_root
 
     hf_cache = os.environ.get("HF_HUB_CACHE", "")
     hf_cache_env = f"HF_HUB_CACHE={hf_cache} " if hf_cache else ""
@@ -215,7 +215,7 @@ def main() -> int:
 
     from huggingface_hub import snapshot_download
     spec_path = snapshot_download(SPEC_MODEL)
-    from arctic_inference.server.weight_sync import spec_bucket_size
+    from arctic_platform.inference.server.weight_sync import spec_bucket_size
     bucket_size = spec_bucket_size(spec_path)
     print("[test] spec bucket_size=%d MB" % (bucket_size // (1024 * 1024)))
 
@@ -225,7 +225,7 @@ def main() -> int:
         quantization="fp8",
         tensor_parallel_size=TP_SIZE,
         speculative_config=SPEC_CONFIG,
-        worker_extension_cls="arctic_inference.server.weight_sync.WeightSyncExtension",
+        worker_extension_cls="arctic_platform.inference.server.weight_sync.WeightSyncExtension",
         max_model_len=16384,
         disable_log_stats=False,
         seed=0,

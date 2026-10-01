@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from arctic_inference.server import replica_pool as replica_pool_mod
-from arctic_inference.server.replica_pool import ReplicaPool
+from arctic_platform.inference.server import replica_pool as replica_pool_mod
+from arctic_platform.inference.server.replica_pool import ReplicaPool
 
 
 class _RemoteMethod:

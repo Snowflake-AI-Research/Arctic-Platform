@@ -4,7 +4,7 @@ import torch
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from arctic_inference.vllm.dflash2_nan_fix import (
+from arctic_platform.inference.vllm.dflash2_nan_fix import (
     KVBlockZeroerPatch,
     MambaManagerPatch,
     SingleTypeKVCacheManagerPatch,

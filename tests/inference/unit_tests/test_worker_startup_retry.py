@@ -2,8 +2,8 @@ import asyncio
 import sys
 import types
 
-from arctic_inference.server import worker as worker_mod
-from arctic_inference.server.worker import InferenceWorker, WorkerLifecycleState
+from arctic_platform.inference.server import worker as worker_mod
+from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
 
 def _install_fake_vllm(monkeypatch, async_llm_cls):

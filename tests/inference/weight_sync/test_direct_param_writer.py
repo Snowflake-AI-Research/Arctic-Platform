@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "inference"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
 def _init_distributed():
@@ -39,7 +39,7 @@ def test():
     from vllm.model_executor.layers.linear import (
         QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear,
     )
-    from arctic_inference.server.weight_sync import _DirectParamWriter
+    from arctic_platform.inference.server.weight_sync import _DirectParamWriter
 
     H, NH, NKH, HD, I = 256, 4, 2, 64, 512
 

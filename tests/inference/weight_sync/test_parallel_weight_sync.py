@@ -2,7 +2,7 @@
 import os, sys, time, socket
 import torch, torch.multiprocessing as mp
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "inference"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 MASTER_ADDR = "127.0.0.1"
 NUM_WEIGHTS = 20
@@ -18,7 +18,7 @@ def find_free_port():
 
 
 def _sender_fn(port, ref_tensors, world_size):
-    from arctic_inference.server.weight_sync import NCCLEngine
+    from arctic_platform.inference.server.weight_sync import NCCLEngine
 
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
@@ -41,7 +41,7 @@ def _sender_fn(port, ref_tensors, world_size):
 
 
 def _receiver_fn(rank, port, ref_tensors, world_size, results_dict):
-    from arctic_inference.server.weight_sync import NCCLEngine
+    from arctic_platform.inference.server.weight_sync import NCCLEngine
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)

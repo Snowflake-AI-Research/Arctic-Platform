@@ -8,15 +8,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from test_review_regressions import local_worker
-from arctic_inference.server.config import ModelConfig
-from arctic_inference.server.replica_pool import ReplicaPool
-from arctic_inference.server.scheduler import (
+from arctic_platform.inference.server.config import ModelConfig
+from arctic_platform.inference.server.replica_pool import ReplicaPool
+from arctic_platform.inference.server.scheduler import (
     Scheduler,
     least_loaded_routing,
     prefix_affinity_routing,
     strict_affinity_routing,
 )
-from arctic_inference.server.streaming import StreamLimits
+from arctic_platform.inference.server.streaming import StreamLimits
 
 
 WEIGHT_METHODS = (

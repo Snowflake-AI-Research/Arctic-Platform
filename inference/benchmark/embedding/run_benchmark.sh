@@ -30,7 +30,7 @@ function run_benchmark_vllm() {
 function run_benchmark_arctic() {
     echo "Running arctic_inference benchmark for $MODEL"
     pkill -f replica.py
-    python -m arctic_inference.embedding.replica_manager --model $MODEL --num-replicas $NUM_REPLICAS --port 50050 > arctic.log &
+    python -m arctic_platform.inference.embedding.replica_manager --model $MODEL --num-replicas $NUM_REPLICAS --port 50050 > arctic.log &
     pid=$!
     sleep 20
     python ${FILE_DIR}/benchmark.py --model $MODEL \

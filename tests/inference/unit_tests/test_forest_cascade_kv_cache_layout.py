@@ -21,7 +21,7 @@ from unittest.mock import patch
 import pytest
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
-from arctic_inference.vllm.attention.flash_attn_forest_cascade import (
+from arctic_platform.inference.vllm.attention.flash_attn_forest_cascade import (
     FlashAttentionBackend,
     get_kv_cache_layout,
 )
@@ -60,7 +60,7 @@ def _vllm_config_with_layout(layout: KVCacheLayout | None):
 def test_get_kv_cache_layout_follows_resolved_layout(layout, expected, monkeypatch):
     monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     with patch(
-        "arctic_inference.vllm.attention.flash_attn_forest_cascade.get_current_vllm_config",
+        "arctic_platform.inference.vllm.attention.flash_attn_forest_cascade.get_current_vllm_config",
         return_value=_vllm_config_with_layout(layout),
     ):
         assert get_kv_cache_layout() == expected
@@ -69,7 +69,7 @@ def test_get_kv_cache_layout_follows_resolved_layout(layout, expected, monkeypat
 def test_stride_order_follows_resolved_bhlnc_not_env_default(monkeypatch):
     monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     with patch(
-        "arctic_inference.vllm.attention.flash_attn_forest_cascade.get_current_vllm_config",
+        "arctic_platform.inference.vllm.attention.flash_attn_forest_cascade.get_current_vllm_config",
         return_value=_vllm_config_with_layout(KVCacheLayout.BHLNC),
     ):
         assert FlashAttentionBackend.get_kv_cache_stride_order() == HND_STRIDE
@@ -78,7 +78,7 @@ def test_stride_order_follows_resolved_bhlnc_not_env_default(monkeypatch):
 def test_resolved_layout_wins_over_env_override(monkeypatch):
     monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
     with patch(
-        "arctic_inference.vllm.attention.flash_attn_forest_cascade.get_current_vllm_config",
+        "arctic_platform.inference.vllm.attention.flash_attn_forest_cascade.get_current_vllm_config",
         return_value=_vllm_config_with_layout(KVCacheLayout.LBNHC),
     ):
         assert get_kv_cache_layout() == "NHD"
@@ -88,7 +88,7 @@ def test_resolved_layout_wins_over_env_override(monkeypatch):
 def test_unresolved_layout_raises(monkeypatch):
     monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     with patch(
-        "arctic_inference.vllm.attention.flash_attn_forest_cascade.get_current_vllm_config",
+        "arctic_platform.inference.vllm.attention.flash_attn_forest_cascade.get_current_vllm_config",
         return_value=_vllm_config_with_layout(None),
     ):
         with pytest.raises(ValueError, match="has not been resolved"):
@@ -98,7 +98,7 @@ def test_unresolved_layout_raises(monkeypatch):
 def test_unmapped_layout_raises(monkeypatch):
     monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
     with patch(
-        "arctic_inference.vllm.attention.flash_attn_forest_cascade.get_current_vllm_config",
+        "arctic_platform.inference.vllm.attention.flash_attn_forest_cascade.get_current_vllm_config",
         return_value=_vllm_config_with_layout(KVCacheLayout.LHBNC),
     ):
         with pytest.raises(ValueError, match="no NHD/HND mapping"):

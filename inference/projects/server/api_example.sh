@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Simple single-model HTTP API example for arctic_inference.server
+# Simple single-model HTTP API example for arctic_platform.inference.server
 #
 # Start the server first:
 #   arctic_inference_server --port 8000

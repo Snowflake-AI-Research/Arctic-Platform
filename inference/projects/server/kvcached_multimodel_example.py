@@ -173,8 +173,8 @@ class DriverBackend(Backend):
 
     def __init__(self):
         import threading
-        from arctic_inference.server import ModelConfig
-        from arctic_inference.server.multi_model import Driver
+        from arctic_platform.inference.server import ModelConfig
+        from arctic_platform.inference.server.multi_model import Driver
         self._ModelConfig = ModelConfig
         self._driver = Driver()
         self._loop = asyncio.new_event_loop()
@@ -447,7 +447,7 @@ def start_server():
     proc = subprocess.Popen(
         [
             sys.executable, "-m", "uvicorn",
-            "arctic_inference.server.multi_model:app",
+            "arctic_platform.inference.server.multi_model:app",
             "--host", "0.0.0.0",
             "--port", str(SERVER_PORT),
         ],

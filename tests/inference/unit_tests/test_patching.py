@@ -15,7 +15,7 @@
 
 import pytest
 
-from arctic_inference.patching import ArcticPatch
+from arctic_platform.inference.patching import ArcticPatch
 
 
 class TestArcticPatch:

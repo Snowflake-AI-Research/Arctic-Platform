@@ -6,7 +6,7 @@ import torch
 
 
 def _install_fix(monkeypatch, *, stop_accepted):
-    import arctic_inference.vllm.xgrammar_stop_mask as stop_mask
+    import arctic_platform.inference.vllm.xgrammar_stop_mask as stop_mask
     from vllm.v1.structured_output.backend_xgrammar import XgrammarGrammar
 
     base_calls = []
@@ -84,7 +84,7 @@ def test_xgrammar_stop_mask_install_is_idempotent(monkeypatch):
 
 
 def test_xgrammar_stop_mask_checks_vllm_version(monkeypatch):
-    import arctic_inference.vllm.xgrammar_stop_mask as stop_mask
+    import arctic_platform.inference.vllm.xgrammar_stop_mask as stop_mask
     from vllm.v1.structured_output.backend_xgrammar import XgrammarGrammar
 
     original = XgrammarGrammar.fill_bitmask

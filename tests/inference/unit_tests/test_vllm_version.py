@@ -1,6 +1,6 @@
 import pytest
 
-from arctic_inference.utils import require_supported_vllm_version
+from arctic_platform.inference.utils import require_supported_vllm_version
 
 
 def test_require_supported_vllm_version_accepts_validated_versions():
