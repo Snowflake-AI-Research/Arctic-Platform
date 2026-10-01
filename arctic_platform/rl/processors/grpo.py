@@ -596,7 +596,10 @@ def _internal_grpo_loss_fn(
         if use_kl_loss:
             ref_logprobs = input_data.get("ref_log_probs")
             if ref_logprobs is None:
-                raise ValueError("use_kl_loss=True but 'ref_log_probs' not found in context.")
+                raise ValueError(
+                    "use_kl_loss=True but 'ref_log_probs_shifted' not found in context "
+                    "(internal input_data key 'ref_log_probs')."
+                )
             kl = kl_penalty(logprob=logprobs, ref_logprob=ref_logprobs.to(logprobs.device), method=kl_loss_type)
             kl_loss = agg_loss(
                 kl,
@@ -782,25 +785,47 @@ def _grpo_loss(
     config: dict,
     device: str,
 ) -> Tuple[torch.Tensor, dict]:
-    """Canonical GRPO/PPO loss (shared implementation of ``grpo`` and ``grpo_echo_v1``).
+    """Canonical GRPO/PPO loss shared by every plain, ``*_echo_v1`` and ``*_mixed_v1`` GRPO name.
 
     Supports the full AReaL feature set (M2PO, SAPO, prox logp methods,
     version staleness).  All async/off-policy fields in ``context`` are optional
     -- VERL or simpler clients can omit them.
 
+    The accepted ``config`` keys are the keys of :data:`_GRPO_CONFIG_DEFAULTS`
+    (plus :data:`_ECHO_CONFIG_DEFAULTS` for ``*_echo_v1``) and
+    :data:`functional.RATIO_MASK_CONFIG_KEYS` for the CISPO ratio controls; each
+    registered name validates its own subset before this runs. ``docs/rl.md``
+    documents the per-variant contracts. The lists below describe semantics and
+    are not the schema.
+
     Expected ``model_outputs`` keys (after compute_logprobs post-processor):
         ``logprobs`` -- per-token log-probs ``[batch, seq]``
 
     Expected ``context`` keys:
-        Required: ``old_log_probs_shifted`` (behavioral policy log-probs), ``advantages``, ``loss_mask``
-        Optional (async): ``prox_logp_shifted``, ``versions``
-        Optional (SAPO): ``cu_seqlens``
+        Required: ``advantages``, ``loss_mask``; ``input_ids`` when
+        ``model_outputs`` carries ``logits`` instead of ``logprobs``
+        Optional: ``old_log_probs_shifted`` (behavioral policy log-probs; when
+        omitted, the detached current-policy log-probs are used)
+        Optional (async): ``prox_logp_shifted``, ``versions``,
+        ``rollout_is_weights`` (off-policy correction tensor; send on ``batch``
+        so DP shards it with advantages — ``meta`` is replicated); ``*_mixed_v1``
+        rejects ``prox_logp_shifted`` and ``rollout_is_weights``
+        Optional (SAPO and packed inputs): ``cu_seqlens``,
+        ``packed_loss_scale_factor`` (set by the packing pipeline)
+        Optional (reference KL, required when ``use_kl_loss``): ``ref_log_probs_shifted``
+        Optional (teacher term, required when ``teacher_tau > 0``):
+        ``teacher_log_probs_shifted``
+        Mixed CISPO/NLL: ``nll_mask``, required for ``*_mixed_v1`` and rejected
+        by the other names
         Optional (ECHO, required when ``aux_ce_weight`` is set): ``sft_mask``
         (environment-prediction target tokens O') and ``echo_observation_mask``
         (full observation span O, a superset of O'), same shape and shifted
-        alignment as ``loss_mask`` and disjoint from it.
+        alignment as ``loss_mask`` and disjoint from it; plus
+        ``echo_observation_token_counts`` (full per-sequence observation counts
+        when sequence parallelism splits observations)
 
-    Supported ``config`` keys (all optional):
+    Supported ``config`` keys (optional unless noted; ``*_mixed_v1`` also
+    requires ``use_cispo_loss`` and ``is_weight_clip_max``, see ``docs/rl.md``):
         ``eps_clip`` (default 0.2), ``eps_clip_higher``, ``c_clip``,
         ``behav_imp_weight_cap``, ``m2_threshold``,
         ``importance_sampling_level`` (default "token"),
@@ -814,10 +839,17 @@ def _grpo_loss(
         ``loss_agg_mode`` (default "token-mean"; also "seq-mean-token-sum",
         "seq-mean-token-sum-norm", "seq-mean-token-mean", "prompt-mean"),
         ``dp_size``, ``batch_num_tokens``, ``global_batch_size`` (distributed normalisation),
-        ``rollout_is_weights`` (off-policy correction tensor; send on ``batch``
-        so DP shards it with advantages — ``meta`` is replicated),
+        ``teacher_tau`` (default 0.0; weight of the clipped teacher log-ratio
+        added to the advantage), ``teacher_clip`` (finite positive upper clip, required
+        when ``teacher_tau > 0``), ``teacher_clip_negative`` (optional lower-clip
+        magnitude; defaults to ``teacher_clip``),
+        the ratio-control keys in :data:`functional.RATIO_MASK_CONFIG_KEYS`
+        (ratio, probability-difference and sequence masks, the
+        ``ratio_m2_threshold`` M2PO filter, the
+        ``log_ratio_sq_coef`` penalty and ``ratio_stats`` telemetry; all
+        require ``use_cispo_loss``),
         ``entropy_coeff`` (default 0.0; subtract entropy bonus from loss),
-        ``use_kl_loss`` (default False; add KL penalty vs ``ref_log_probs`` in context),
+        ``use_kl_loss`` (default False; add KL penalty vs ``ref_log_probs_shifted`` in context),
         ``kl_loss_coef`` (default 0.001), ``kl_loss_type`` (default "low_var_kl"),
         ``aux_ce_weight`` (λ of the ECHO Environment-Prediction auxiliary
         loss, arXiv 2605.24517, IN PAPER UNITS: set it exactly as the paper's
@@ -830,8 +862,8 @@ def _grpo_loss(
         term. The KEY'S PRESENCE enables the ECHO contract — omitted means
         bit-for-bit the pre-ECHO objective; an explicit 0.0 is a control run:
         no aux term, but masks/count validated and ECHO metrics emitted as
-        proof the server honored the config. Reachable only through
-        ``loss_fn="grpo_echo_v1"``, which enforces the strict key schema),
+        proof the server honored the config. Reachable only through the
+        ``*_echo_v1`` names, which require it),
         ``echo_global_num_sequences`` (required with ``aux_ce_weight``: the
         client-computed step-global sequence count the auxiliary term is
         averaged over — the server cannot derive it from one call's slice),
@@ -842,9 +874,10 @@ def _grpo_loss(
         the client computed ``echo_global_num_sequences``; the count is
         validated against this call's slice and labeled in the metrics)
 
-    Optional ``context`` key ``prompt_group_ids`` (Tensor[B] of ints) is
-    required when ``loss_agg_mode="prompt-mean"``; one id per sequence,
-    identical for all responses to the same prompt. Under DP, the number of
+    With ``loss_agg_mode="prompt-mean"``, ``context`` must carry either
+    ``sequence_loss_weights`` (one weight per sequence) or ``prompt_group_ids``
+    (Tensor[B] of ints, one id per sequence, identical for all responses to the
+    same prompt; optional ``prompt_token_counts``). Under DP, the number of
     global prompts is inferred via allreduce.
     """
     values = _grpo_config_values(config)
@@ -1384,7 +1417,7 @@ def grpo_loss(
     config: dict,
     device: str,
 ) -> Tuple[torch.Tensor, dict]:
-    """Plain GRPO/PPO contract — see :func:`_grpo_loss` for the full key set.
+    """Plain GRPO/PPO contract — see :func:`_grpo_loss` for the key semantics and schema sources.
 
     Only the baseline GRPO and ratio-control keys are accepted: an unknown or
     misspelled key fails instead of silently training without its term. ECHO

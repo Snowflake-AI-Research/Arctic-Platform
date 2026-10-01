@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cortex GRPO entrypoints: context-wins trio, registered as ``grpo`` / ``grpo_echo_v1``.
+"""Cortex GRPO entrypoints: context-wins trio, as ``grpo`` / ``grpo_echo_v1`` / ``grpo_mixed_v1``.
 
-Inner PPO/ECHO math is shared with ``ap_grpo``. Only the global-loss-scale trio
+Inner PPO/ECHO/mixed math and the accepted config keys are shared with the
+``ap_`` names. Only the global-loss-scale trio
 (``dp_size`` / ``batch_num_tokens`` / ``global_batch_size``) resolves
 differently: here ``resolve_global_loss_scale`` lets the context win and raises
 on a conflict, matching what the Cortex zone already does, while ``ap_grpo``
