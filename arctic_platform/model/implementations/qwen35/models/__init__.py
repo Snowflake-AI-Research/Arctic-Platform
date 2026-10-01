@@ -1,6 +1,6 @@
 ## Copies AutoModelForCausalLM from transformers but uses our own custom model.
-## Slimmed to register ONLY the qwen3_5_moe family (the other prime-rl model
-## families are intentionally not carved out).
+## Qwen3.5-MoE stays optional because its kernels may be absent. The generic
+## PrimeRL MoE families register unconditionally.
 
 from collections import OrderedDict
 import logging
@@ -11,8 +11,18 @@ from transformers.models.auto.auto_factory import _BaseAutoModelClass, _LazyAuto
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig as HFQwen3_5MoeConfig
 
+from arctic_platform.model.implementations.afmoe.configuration_afmoe import AfmoeConfig
+from arctic_platform.model.implementations.afmoe.modeling_afmoe import AfmoeForCausalLM
+from arctic_platform.model.implementations.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
+from arctic_platform.model.implementations.glm4_moe.modeling_glm4_moe import Glm4MoeForCausalLM
+from arctic_platform.model.implementations.minimax_m2.configuration_minimax_m2 import MiniMaxM2Config
+from arctic_platform.model.implementations.minimax_m2.modeling_minimax_m2 import MiniMaxM2ForCausalLM
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput, cast_float_and_contiguous
+from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import NemotronHConfig
+from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
+from arctic_platform.model.implementations.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from arctic_platform.model.implementations.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +53,21 @@ else:
     _CUSTOM_VLM_MAPPING["qwen3_5_moe"] = Qwen3_5MoeForCausalLM
 
 
+def _register_causal_lm(config_cls: type, model_cls: type, model_type: str) -> None:
+    AutoConfig.register(model_type, config_cls, exist_ok=True)
+    _CUSTOM_CAUSAL_LM_MAPPING.register(config_cls, model_cls, exist_ok=True)
+
+
+for _config_cls, _model_cls, _model_type in (
+    (Qwen3MoeConfig, Qwen3MoeForCausalLM, "qwen3_moe"),
+    (Glm4MoeConfig, Glm4MoeForCausalLM, "glm4_moe"),
+    (MiniMaxM2Config, MiniMaxM2ForCausalLM, "minimax_m2"),
+    (AfmoeConfig, AfmoeForCausalLM, "afmoe"),
+    (NemotronHConfig, NemotronHForCausalLM, "nemotron_h"),
+):
+    _register_causal_lm(_config_cls, _model_cls, _model_type)
+
+
 class AutoModelForCausalLMPrimeRL(_BaseAutoModelClass):
     _model_mapping = _CUSTOM_CAUSAL_LM_MAPPING
 
@@ -52,9 +77,7 @@ AutoModelForCausalLMPrimeRL = auto_class_update(AutoModelForCausalLMPrimeRL, hea
 
 def supports_custom_impl(model_config: PretrainedConfig) -> bool:
     """Check if the model configuration supports the custom PrimeRL implementation."""
-    if _QWEN3_5_CUSTOM_IMPL_AVAILABLE:
-        return type(model_config) in _CUSTOM_CAUSAL_LM_MAPPING
-    return False
+    return type(model_config) in _CUSTOM_CAUSAL_LM_MAPPING
 
 
 def get_custom_vlm_cls(model_config: PretrainedConfig) -> type | None:

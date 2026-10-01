@@ -14,6 +14,7 @@
 # limitations under the License.
 """Built-in loaders. Importing this package registers them."""
 
+from arctic_platform.model.loaders import generic_moe  # noqa: F401
 from arctic_platform.model.loaders import glm_moe_dsa  # noqa: F401
 from arctic_platform.model.loaders import huggingface  # noqa: F401
 from arctic_platform.model.loaders import qwen3_5_moe  # noqa: F401
