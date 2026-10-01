@@ -58,7 +58,7 @@ class GlmMoeDsaOptions(BaseModel):
     deepep_token_chunk_size: int | None = Field(None, gt=0)
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     moe_use_grouped_mm: bool = False
-    fused_cross_entropy: bool | Literal["liger", "quack"] = False
+    fused_cross_entropy: bool | Literal["liger", "quack"] = "liger"
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"
     fp32_lm_head: bool = False
     tiled_mlp_token_chunk_size: int | None = Field(None, gt=0)

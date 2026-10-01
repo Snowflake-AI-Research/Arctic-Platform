@@ -100,6 +100,19 @@ def test_unsupported_options_are_rejected(options):
         GlmMoeDsaOptions(**options)
 
 
+def test_omitted_fused_cross_entropy_defaults_to_liger(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm_moe_dsa"}))
+    spec = ModelSpec(model_path_or_name=str(tmp_path), parallelism=ParallelismConfig(expert_parallel=2))
+    assert spec.loader_options["fused_cross_entropy"] == "liger"
+
+    explicit = ModelSpec(
+        model_path_or_name=str(tmp_path),
+        parallelism=ParallelismConfig(expert_parallel=2),
+        loader_options={"fused_cross_entropy": False},
+    )
+    assert explicit.loader_options["fused_cross_entropy"] is False
+
+
 def test_chunked_lm_head_disables_fused_cross_entropy():
     options = GlmMoeDsaOptions(
         fused_cross_entropy="liger",
