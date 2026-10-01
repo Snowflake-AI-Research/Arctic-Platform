@@ -152,8 +152,8 @@ sft = [
     "psutil",
     "ray",
     "tensordict",
-    # PEFT 0.19 adapter reload imports EmbeddingParallel, removed in Transformers 5.16.
-    "transformers>=5.12.1,<5.16",
+    # GLM-5.3-Flash and Qwen3.8-Flash-Next need the Transformers 5.17 model modules.
+    "transformers>=5.17,<5.18",
     "uvicorn",
 ]
 
