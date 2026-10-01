@@ -649,6 +649,7 @@ def _run_pipeline_with_packing(
         mb_1d = {
             k: v.squeeze(0) if torch.is_tensor(v) and v.ndim == 2 and v.shape[0] == 1 else v for k, v in packed.items()
         }
+        mb_1d["packed_loss_scale_factor"] = pack_meta["S"]
 
         # Model always receives packed [1, T] input_ids + position_ids
         mb_kwargs = {

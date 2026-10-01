@@ -578,6 +578,24 @@ def _sp_loss_worker(rank: int, init_file: str):
                 assert "teacher_log_probs shape" in str(error) or "another sequence-parallel rank" in str(error)
             else:
                 raise AssertionError("every SP rank must reject shard-local grouped teacher validation failures")
+
+            teacher_context = {
+                "input_ids": torch.ones((1, 1), dtype=torch.long),
+                "loss_mask": torch.ones((1, 1), dtype=torch.bool),
+                "advantages": torch.ones((1, 1)),
+                "teacher_log_probs_shifted": torch.zeros((1, 1, 1)) if rank == 0 else torch.zeros((1, 1)),
+            }
+            try:
+                resolve_loss("ap_grpo").validation_callback(
+                    teacher_context,
+                    {"teacher_tau": 0.5, "teacher_clip": 2.0},
+                )
+            except ValueError as error:
+                assert "teacher_log_probs_shifted must exactly match" in str(
+                    error
+                ) or "another sequence-parallel rank" in str(error)
+            else:
+                raise AssertionError("every SP rank must reject shard-local GRPO teacher validation failures")
     finally:
         dist.destroy_process_group()
 
@@ -609,6 +627,17 @@ class TestMigratedGrpo(TestCasePlus):
         }
         with self.assertRaisesRegex(ValueError, "echo_observation_mask overlaps loss_mask"):
             resolve_loss("ap_grpo_echo_v1").batching_callback(request)
+
+        request["processing"] = {
+            "loss_fn": "ap_grpo",
+            "config": {"teacher_tau": 0.5, "teacher_clip": 2.0},
+        }
+        request["context"] = {
+            "loss_mask": torch.tensor([[True, False]]),
+            "teacher_log_probs_shifted": torch.zeros((1, 1)),
+        }
+        with self.assertRaisesRegex(ValueError, "teacher_log_probs_shifted must exactly match"):
+            resolve_loss("ap_grpo").batching_callback(request)
 
     def test_ratio_masks_keep_original_normalizer_and_penalty_gradient(self):
         values = torch.tensor([[-1.0, -1.0, -1.0]], requires_grad=True)
@@ -679,6 +708,16 @@ class TestMigratedGrpo(TestCasePlus):
             with self.subTest(mode=mode):
                 loss = agg_loss(values, mask, loss_agg_mode=mode, cu_seqlens=cu_seqlens)
                 self.assertEqual(loss.item(), expected_loss)
+        self.assertEqual(
+            agg_loss(
+                values,
+                mask,
+                loss_agg_mode="seq-mean-token-sum-norm",
+                cu_seqlens=cu_seqlens,
+                loss_scale_factor=4,
+            ).item(),
+            1.625,
+        )
 
     def test_ratio_stats_only_keeps_baseline_loss_and_empty_metric_keys(self):
         context = {

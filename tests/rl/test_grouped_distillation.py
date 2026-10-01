@@ -243,6 +243,7 @@ def test_native_packing_validates_each_final_window_once_before_model(monkeypatc
     def record_validation(self, context, config):
         assert context["input_ids"].shape == (1, 6)
         assert context["cu_seqlens"].tolist() == [0, 6]
+        assert context["packed_loss_scale_factor"] == 6
         events.append("validation")
         return original_validation(self, context, config)
 
@@ -391,7 +392,7 @@ def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
         "input_ids": frame["input_ids"],
         "attention_mask": frame["attention_mask"],
         "processing": {"loss_fn": "grpo", "config": {"kd_coef": 0.5, "dp_size": 1}},
-        "context": {"kd_mask": frame["kd_mask"]},
+        "context": {"kd_mask": frame["kd_mask"], "loss_mask": frame["loss_mask"]},
     }
     loss_object = resolve_loss("grpo")
     loss_object.batching_callback(request)
@@ -480,6 +481,16 @@ def test_grpo_grouped_batching_delegates_structured_request_preflight(request_pa
         resolve_loss("grpo").batching_callback(request_payload)
 
 
+def test_grpo_grouped_batching_rejects_structured_request_without_policy_mask():
+    request = {
+        "batch": {"input_ids": torch.ones((1, 2), dtype=torch.long)},
+        "meta": {},
+        "processing": {"loss_fn": "grpo", "config": {"kd_coef": 0.0}},
+    }
+    with pytest.raises(ValueError, match=r"requires context\['loss_mask'\]"):
+        resolve_loss("grpo").batching_callback(request)
+
+
 def test_standalone_callbacks_use_public_kd_names():
     frame = _frame()
     request = {
@@ -555,7 +566,10 @@ def test_grouped_batching_synthesizes_only_real_next_token_targets(loss_fn, conf
         "input_ids": torch.tensor([[10, 11, 12, 0]]),
         "attention_mask": torch.tensor([[1, 1, 1, 0]]),
         "processing": {"loss_fn": loss_fn, "config": config},
-        "context": {"kd_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]])},
+        "context": {
+            "kd_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+            "loss_mask": torch.tensor([[True, True, False, False]]),
+        },
     }
 
     resolve_loss(loss_fn).batching_callback(request)
@@ -622,7 +636,10 @@ def test_grouped_batching_rejects_positive_weight_without_next_token(loss_fn, co
         "input_ids": torch.tensor([[10, 11, 12]]),
         "labels": torch.tensor([[11, 12, 10]]),
         "processing": {"loss_fn": loss_fn, "config": config},
-        "context": {"kd_mask": torch.ones(1, 3)},
+        "context": {
+            "kd_mask": torch.ones(1, 3),
+            "loss_mask": torch.tensor([[True, True, False]]),
+        },
     }
 
     with pytest.raises(ValueError, match="kd_mask must be zero where no next-token target exists"):

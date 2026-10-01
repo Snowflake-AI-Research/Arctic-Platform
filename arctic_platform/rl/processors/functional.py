@@ -297,6 +297,10 @@ def agg_loss(
     segment boundaries must cover each token window with one segment per row.
     """
     _validate_loss_denominators(batch_num_tokens, global_batch_size)
+    if loss_scale_factor is not None and (
+        isinstance(loss_scale_factor, bool) or not isinstance(loss_scale_factor, Integral) or loss_scale_factor < 1
+    ):
+        raise ValueError(f"loss_scale_factor must be a positive integer, got {loss_scale_factor!r}")
     dp_size = _resolve_dp_size(dp_size, batch_num_tokens)
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
@@ -722,6 +726,7 @@ def ppo_actor_loss_fn(
     dp_size: int = 1,
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
+    loss_scale_factor: Optional[int] = None,
     prompt_group_ids: Optional[torch.Tensor] = None,
     prompt_token_counts: Optional[torch.Tensor] = None,
     sequence_loss_weights: Optional[torch.Tensor] = None,
@@ -767,6 +772,7 @@ def ppo_actor_loss_fn(
         dp_size=dp_size,
         batch_num_tokens=batch_num_tokens,
         global_batch_size=global_batch_size,
+        loss_scale_factor=loss_scale_factor,
         prompt_group_ids=prompt_group_ids,
         prompt_token_counts=prompt_token_counts,
         sequence_loss_weights=sequence_loss_weights,
@@ -801,6 +807,7 @@ def sapo_loss_fn(
     dp_size: int = 1,
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
+    loss_scale_factor: Optional[int] = None,
     prompt_group_ids: Optional[torch.Tensor] = None,
     prompt_token_counts: Optional[torch.Tensor] = None,
     sequence_loss_weights: Optional[torch.Tensor] = None,
@@ -829,6 +836,7 @@ def sapo_loss_fn(
         dp_size=dp_size,
         batch_num_tokens=batch_num_tokens,
         global_batch_size=global_batch_size,
+        loss_scale_factor=loss_scale_factor,
         prompt_group_ids=prompt_group_ids,
         prompt_token_counts=prompt_token_counts,
         sequence_loss_weights=sequence_loss_weights,
@@ -1099,6 +1107,7 @@ def cispo_actor_loss_fn(
     dp_size: int = 1,
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
+    loss_scale_factor: Optional[int] = None,
     prompt_group_ids: Optional[torch.Tensor] = None,
     prompt_token_counts: Optional[torch.Tensor] = None,
     sequence_loss_weights: Optional[torch.Tensor] = None,
@@ -1188,6 +1197,7 @@ def cispo_actor_loss_fn(
         dp_size=dp_size,
         batch_num_tokens=batch_num_tokens,
         global_batch_size=global_batch_size,
+        loss_scale_factor=loss_scale_factor,
         prompt_group_ids=prompt_group_ids,
         prompt_token_counts=prompt_token_counts,
         sequence_loss_weights=sequence_loss_weights,

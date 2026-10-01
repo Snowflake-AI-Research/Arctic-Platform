@@ -921,10 +921,7 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
     def batching_callback(self, request: dict) -> None:
         callback = getattr(LOSS_FNS[self.name], BATCHING_CALLBACK_ATTR, None)
         request_contexts = _request_grpo_contexts(request)
-        has_policy_request = any(
-            torch.is_tensor(context.get("input_ids")) and context.get("loss_mask") is not None
-            for context in request_contexts
-        )
+        has_policy_request = any(torch.is_tensor(context.get("input_ids")) for context in request_contexts)
         if callback is not None and has_policy_request:
             callback(request)
         processing = request.get("processing")
@@ -964,7 +961,7 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
 
     def validation_callback(self, context: dict, config: dict) -> None:
         context = _validation_context(context)
-        has_policy_request = torch.is_tensor(context.get("input_ids")) and context.get("loss_mask") is not None
+        has_policy_request = torch.is_tensor(context.get("input_ids"))
         error = None
         kd = None
         try:

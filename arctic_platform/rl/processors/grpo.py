@@ -327,6 +327,7 @@ def _internal_grpo_loss_fn(
     dp_size: int = 1,
     batch_num_tokens: int | None = None,
     global_batch_size: int | None = None,
+    loss_scale_factor: int | None = None,
     rollout_is_weights: torch.Tensor | None = None,
     entropy_coeff: float = 0.0,
     use_kl_loss: bool = False,
@@ -520,6 +521,7 @@ def _internal_grpo_loss_fn(
                 dp_size=dp_size,
                 batch_num_tokens=batch_num_tokens,
                 global_batch_size=global_batch_size,
+                loss_scale_factor=loss_scale_factor,
                 prompt_group_ids=prompt_group_ids,
                 prompt_token_counts=prompt_token_counts,
                 sequence_loss_weights=sequence_loss_weights,
@@ -542,6 +544,7 @@ def _internal_grpo_loss_fn(
                 dp_size=dp_size,
                 batch_num_tokens=batch_num_tokens,
                 global_batch_size=global_batch_size,
+                loss_scale_factor=loss_scale_factor,
                 prompt_group_ids=prompt_group_ids,
                 prompt_token_counts=prompt_token_counts,
                 sequence_loss_weights=sequence_loss_weights,
@@ -567,6 +570,7 @@ def _internal_grpo_loss_fn(
                 dp_size=dp_size,
                 batch_num_tokens=batch_num_tokens,
                 global_batch_size=global_batch_size,
+                loss_scale_factor=loss_scale_factor,
                 prompt_group_ids=prompt_group_ids,
                 prompt_token_counts=prompt_token_counts,
                 sequence_loss_weights=sequence_loss_weights,
@@ -580,6 +584,7 @@ def _internal_grpo_loss_fn(
                 dp_size=dp_size,
                 batch_num_tokens=batch_num_tokens,
                 global_batch_size=global_batch_size,
+                loss_scale_factor=loss_scale_factor,
                 prompt_group_ids=prompt_group_ids,
                 prompt_token_counts=prompt_token_counts,
                 sequence_loss_weights=sequence_loss_weights,
@@ -599,6 +604,7 @@ def _internal_grpo_loss_fn(
                 dp_size=dp_size,
                 batch_num_tokens=batch_num_tokens,
                 global_batch_size=global_batch_size,
+                loss_scale_factor=loss_scale_factor,
                 prompt_group_ids=prompt_group_ids,
                 prompt_token_counts=prompt_token_counts,
                 sequence_loss_weights=sequence_loss_weights,
@@ -981,6 +987,7 @@ def _grpo_loss(
         prompt_group_ids=prompt_group_ids,
         prompt_token_counts=prompt_token_counts,
         sequence_loss_weights=sequence_loss_weights,
+        loss_scale_factor=context.get("packed_loss_scale_factor"),
         **values,
     )
     return loss, metrics
@@ -1257,7 +1264,16 @@ def _request_grpo_config(request: dict) -> dict:
 def _validate_grpo_context(context: dict, config: dict) -> torch.Tensor:
     _validate_loss_denominators(config.get("batch_num_tokens"), config.get("global_batch_size"))
     mask = _grpo_preflight_mask(context)
-    _resolve_teacher_tau(config, context)
+    teacher_tau = _resolve_teacher_tau(config, context)
+    if teacher_tau > 0:
+        teacher_log_probs = context["teacher_log_probs_shifted"]
+        if not torch.is_tensor(teacher_log_probs) or not teacher_log_probs.is_floating_point():
+            raise ValueError("teacher_log_probs_shifted must be a floating-point tensor")
+        if teacher_log_probs.shape != mask.shape:
+            raise ValueError(
+                "teacher_log_probs_shifted must exactly match prediction-aligned loss_mask shape, "
+                f"got {tuple(teacher_log_probs.shape)} and {tuple(mask.shape)}"
+            )
     RatioMasks.from_config(config)
     return mask
 
