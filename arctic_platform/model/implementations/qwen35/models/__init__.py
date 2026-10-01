@@ -68,6 +68,30 @@ for _config_cls, _model_cls, _model_type in (
     _register_causal_lm(_config_cls, _model_cls, _model_type)
 
 
+def _register_flash_vlm(module: str, class_name: str, model_type: str) -> None:
+    """Register a transformers-backed VLM when that upstream module is installed."""
+    import importlib
+
+    try:
+        model_cls = getattr(importlib.import_module(module), class_name)
+    except ImportError as exc:
+        logger.warning("%s custom implementation unavailable: %r", model_type, exc)
+        return
+    _CUSTOM_VLM_MAPPING[model_type] = model_cls
+
+
+_register_flash_vlm(
+    "arctic_platform.model.implementations.glm53.modeling_glm5_next",
+    "Glm5NextForConditionalGenerationPrimeRL",
+    "glm5_next",
+)
+_register_flash_vlm(
+    "arctic_platform.model.implementations.qwen38.modeling_qwen4_exp",
+    "Qwen4ExpForConditionalGenerationPrimeRL",
+    "qwen4_exp",
+)
+
+
 class AutoModelForCausalLMPrimeRL(_BaseAutoModelClass):
     _model_mapping = _CUSTOM_CAUSAL_LM_MAPPING
 

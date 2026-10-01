@@ -6,6 +6,13 @@ import torch
 import torch.nn as nn
 
 
+def named_weight_sync_tensors(model: nn.Module):
+    yield from model.named_parameters()
+    yield from (
+        (name, buffer) for name, buffer in model.named_buffers() if name.endswith(".expert_bias")
+    )
+
+
 def raise_unmapped_mlp_keys(packer: str, leftover: list[str]) -> None:
     if leftover:
         raise RuntimeError(
@@ -101,6 +108,12 @@ def to_vllm_vlm_name(name: str) -> str:
 
 def vllm_layer_converter(model: nn.Module):
     cls_name = type(model).__name__
+    if cls_name.startswith("Glm5Next"):
+        from arctic_platform.model.implementations.glm53.vllm_weights import (
+            convert_glm5_next_layer_to_vllm,
+        )
+
+        return convert_glm5_next_layer_to_vllm
     if cls_name.startswith("Qwen3_5Moe"):
         raise RuntimeError(
             "Qwen3.5-MoE vLLM packing stays on the qwen3_5_moe path"
@@ -156,9 +169,9 @@ def build_iter_full_vllm_weights(model: nn.Module):
 
     def _iter():
         is_master = dist.get_rank() == 0
-        by_layer: dict[int, list[tuple[str, nn.Parameter]]] = {}
-        for name, param in model.named_parameters():
-            by_layer.setdefault(_layer_idx(name), []).append((name, param))
+        by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
+        for name, tensor in named_weight_sync_tensors(model):
+            by_layer.setdefault(_layer_idx(name), []).append((name, tensor))
 
         ordered_layers: list[int] = []
         if -1 in by_layer:
@@ -167,13 +180,13 @@ def build_iter_full_vllm_weights(model: nn.Module):
 
         for layer_idx in ordered_layers:
             layer_sd: dict[str, torch.Tensor] = {}
-            for name, param in by_layer[layer_idx]:
+            for name, tensor in by_layer[layer_idx]:
                 if (
-                    hasattr(param, "group_name")
-                    and getattr(param, "allreduce", True) is False
+                    hasattr(tensor, "group_name")
+                    and getattr(tensor, "allreduce", True) is False
                 ):
-                    ep_pg = ds_groups._get_expert_parallel_group(param.group_name)
-                    local = param.data.contiguous()
+                    ep_pg = ds_groups._get_expert_parallel_group(tensor.group_name)
+                    local = tensor.data.contiguous()
                     shards = [
                         torch.empty_like(local)
                         for _ in range(dist.get_world_size(group=ep_pg))
@@ -182,7 +195,7 @@ def build_iter_full_vllm_weights(model: nn.Module):
                     if is_master:
                         layer_sd[name] = torch.cat(shards, dim=0)
                 elif is_master:
-                    layer_sd[name] = param.data
+                    layer_sd[name] = tensor.data
 
             if not is_master:
                 continue
