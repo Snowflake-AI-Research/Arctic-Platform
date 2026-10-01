@@ -162,10 +162,12 @@ inference = [
     "xgrammar==0.2.6",
 ]
 
-# [sft] plus the in-tree sampling package.
+# [sft] plus the published sampling package. On-prem still imports
+# arctic_inference; that package's Ray path is not the in-tree one.
+# arctic-inference[vllm] pulls vLLM. [rl] does not declare vLLM itself.
 rl = [
     "arctic_platform[sft]",
-    "arctic_platform[inference]",
+    "arctic-inference[server,vllm]>=0.3.0",
 ]
 
 onprem = [

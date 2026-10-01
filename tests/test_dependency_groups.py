@@ -161,13 +161,14 @@ class TestExtraNamesResolve:
                     assert ref in optional, f"[{extra}] references undefined [{ref}]"
 
     def test_cortex_install_does_not_pull_the_inference_extra(self):
-        """Inference code ships inside arctic_platform, but vLLM stays on [inference]."""
+        """[cortex] and [sft] do not select [inference]. [rl] keeps published arctic-inference."""
         with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
             project = tomllib.load(f)
         include = project["tool"]["hatch"]["build"]["include"]
         assert "arctic_platform" in include
         optional = project["project"]["optional-dependencies"]
-        assert "arctic_platform[inference]" in optional["rl"]
+        assert "arctic-inference[server,vllm]>=0.3.0" in optional["rl"]
+        assert "arctic_platform[inference]" not in optional["rl"]
         for extra in ("cortex", "sft"):
             for dep in optional[extra]:
                 assert "arctic_platform[inference]" not in dep

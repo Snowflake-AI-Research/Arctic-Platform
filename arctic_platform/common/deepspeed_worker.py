@@ -723,7 +723,7 @@ class DeepSpeedWorker:
         return max_bytes
 
     def init_weight_sender(self, group, schedule, master_addr, base_port, bucket_size) -> bool:
-        from arctic_platform.inference.server.weight_sync.sender import WeightSender
+        from arctic_inference.server.weight_sync.sender import WeightSender
 
         self._weight_sender = WeightSender(
             group=group,
@@ -774,7 +774,7 @@ class DeepSpeedWorker:
 
     def send_weights_ipc(self, group_id: int) -> dict:
         """Save weights to shared memory for colocated (same-GPU) transfer."""
-        from arctic_platform.inference.server.weight_sync.ipc_engine import save_weights_to_shm
+        from arctic_inference.server.weight_sync.ipc_engine import save_weights_to_shm
 
         weights = [(n, p.data) for n, p in self.engine.module.named_parameters()]
         return save_weights_to_shm(weights, group_id)

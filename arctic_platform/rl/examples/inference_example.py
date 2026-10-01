@@ -19,9 +19,9 @@
 
 Prerequisites
 -------------
-1. Install arctic-platform with the inference extra:
+1. Install arctic_inference with server extras:
 
-       pip install -e ".[inference]"
+       cd ArcticInference-internal && pip install -e ".[server]"
 
 2. Start the server (on a GPU node):
 
