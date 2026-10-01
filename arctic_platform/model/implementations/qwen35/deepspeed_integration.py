@@ -236,7 +236,6 @@ def _build_model_config(
         cp=1,
         impl="custom",
         optimization_dtype=optimization_dtype,
-        reduce_dtype=options.reduce_dtype,
         moe_use_grouped_mm=options.moe_use_grouped_mm,
         ac=options.ac_config,
         fused_lm_head_token_chunk_size=options.fused_lm_head_token_chunk_size,
