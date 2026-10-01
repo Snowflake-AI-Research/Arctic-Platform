@@ -25,6 +25,8 @@ from typing import Set
 
 POST_PROCESSORS: Dict[str, Callable] = {}
 LOSS_FNS: Dict[str, Callable] = {}
+BATCHING_CALLBACK_ATTR = "_arctic_batching_callback"
+VALIDATION_CALLBACK_ATTR = "_arctic_validation_callback"
 PACKED_LOSS_REDUCTION_ATTR = "_arctic_packed_loss_reduction"
 MODEL_CALL_COUNT_CALLBACK_ATTR = "_arctic_model_call_count_callback"
 METRICS_CALLBACK_ATTR = "_arctic_metrics_callback"
@@ -98,6 +100,8 @@ def is_declared_summed_metric(name: str) -> bool:
 def register_loss_fn(
     name: str,
     *,
+    batching_callback: Callable | None = None,
+    validation_callback: Callable | None = None,
     packed_loss_reduction: Callable | None = None,
     model_call_count_callback: Callable | None = None,
     metrics_callback: Callable | None = None,
@@ -122,6 +126,14 @@ def register_loss_fn(
     declared = frozenset(summed_metrics)
 
     def decorator(fn: Callable) -> Callable:
+        if batching_callback is not None:
+            existing = getattr(fn, BATCHING_CALLBACK_ATTR, None)
+            if existing is not None and existing is not batching_callback:
+                raise ValueError(f"refusing to replace batching_callback on registered {name!r}")
+        if validation_callback is not None:
+            existing = getattr(fn, VALIDATION_CALLBACK_ATTR, None)
+            if existing is not None and existing is not validation_callback:
+                raise ValueError(f"refusing to replace validation_callback on registered {name!r}")
         if packed_loss_reduction is not None:
             existing = getattr(fn, PACKED_LOSS_REDUCTION_ATTR, None)
             if existing is not None and existing is not packed_loss_reduction:
@@ -137,6 +149,10 @@ def register_loss_fn(
         # Bind first so a refused public-name overwrite cannot leak
         # ``summed_metrics`` into the process-global union.
         _bind_registry(LOSS_FNS, name, fn)
+        if batching_callback is not None:
+            setattr(fn, BATCHING_CALLBACK_ATTR, batching_callback)
+        if validation_callback is not None:
+            setattr(fn, VALIDATION_CALLBACK_ATTR, validation_callback)
         if packed_loss_reduction is not None:
             setattr(fn, PACKED_LOSS_REDUCTION_ATTR, packed_loss_reduction)
         if model_call_count_callback is not None:

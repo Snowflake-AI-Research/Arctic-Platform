@@ -26,9 +26,11 @@ from numbers import Real
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from arctic_platform.common.registry import BATCHING_CALLBACK_ATTR
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import METRICS_CALLBACK_ATTR
 from arctic_platform.common.registry import MODEL_CALL_COUNT_CALLBACK_ATTR
+from arctic_platform.common.registry import VALIDATION_CALLBACK_ATTR
 from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.common.utils.batch import metric_is_summed
 
@@ -915,6 +917,13 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         )
 
     def batching_callback(self, request: dict) -> None:
+        callback = getattr(LOSS_FNS[self.name], BATCHING_CALLBACK_ATTR, None)
+        request_context = request.get("context")
+        has_policy_mask = (
+            isinstance(request_context, dict) and request_context.get("loss_mask") is not None
+        ) or request.get("loss_mask") is not None
+        if callback is not None and torch.is_tensor(request.get("input_ids")) and has_policy_mask:
+            callback(request)
         processing = request.get("processing")
         if not isinstance(processing, dict):
             return
@@ -953,16 +962,18 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
     def validation_callback(self, context: dict, config: dict) -> None:
         context = _validation_context(context)
         kd = resolve_kd_term(config, context)
-        if kd is None:
-            return
-        super().validation_callback(context, config)
-        local_weight_sum = float(self._weights(context).sum(dtype=torch.float64).item())
-        if local_weight_sum > kd.weight_sum and not math.isclose(
-            local_weight_sum, kd.weight_sum, rel_tol=1e-6, abs_tol=1e-9
-        ):
-            raise ValueError(
-                f"this worker's kd_mask sum {local_weight_sum} exceeds kd_batch_num_tokens={kd.weight_sum}"
-            )
+        if kd is not None:
+            super().validation_callback(context, config)
+            local_weight_sum = float(self._weights(context).sum(dtype=torch.float64).item())
+            if local_weight_sum > kd.weight_sum and not math.isclose(
+                local_weight_sum, kd.weight_sum, rel_tol=1e-6, abs_tol=1e-9
+            ):
+                raise ValueError(
+                    f"this worker's kd_mask sum {local_weight_sum} exceeds kd_batch_num_tokens={kd.weight_sum}"
+                )
+        callback = getattr(LOSS_FNS[self.name], VALIDATION_CALLBACK_ATTR, None)
+        if callback is not None and torch.is_tensor(context.get("input_ids")) and context.get("loss_mask") is not None:
+            callback(context, config)
 
     def packed_reduction_callback(
         self,

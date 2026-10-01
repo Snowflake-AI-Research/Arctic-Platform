@@ -24,11 +24,13 @@ from collections.abc import Callable
 from collections.abc import Sequence
 from typing import Any
 
+from arctic_platform.common.registry import BATCHING_CALLBACK_ATTR
 from arctic_platform.common.registry import LOSS_CAPABILITIES_ATTR
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import METRICS_CALLBACK_ATTR
 from arctic_platform.common.registry import MODEL_CALL_COUNT_CALLBACK_ATTR
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
+from arctic_platform.common.registry import VALIDATION_CALLBACK_ATTR
 from arctic_platform.common.registry import resolve_fn
 from arctic_platform.registry import RegistryMeta
 from arctic_platform.registry import RegistryValidationError
@@ -172,6 +174,16 @@ class _LegacyLossAdapter(BaseLoss):
 
     def requires_loss_mask_normalization(self) -> bool:
         return True
+
+    def batching_callback(self, request: dict) -> None:
+        callback = getattr(self._loss_fn, BATCHING_CALLBACK_ATTR, None)
+        if callback is not None:
+            callback(request)
+
+    def validation_callback(self, context: dict, config: dict) -> None:
+        callback = getattr(self._loss_fn, VALIDATION_CALLBACK_ATTR, None)
+        if callback is not None:
+            callback(context, config)
 
     def model_call_count_callback(self, model_call_counts: Sequence[int | None], config: dict) -> None:
         callback = getattr(self._loss_fn, MODEL_CALL_COUNT_CALLBACK_ATTR, None)

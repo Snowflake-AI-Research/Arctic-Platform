@@ -70,6 +70,28 @@ class TestAggLoss(TestCasePlus):
         # token-mean multiplies by dp_size (the caller divides by the global token count fed as batch_num_tokens).
         self.assertAlmostEqual(agg_loss(loss_mat, mask, dp_size=2).item(), 2.0, places=5)
 
+    def test_explicit_denominators_must_be_safe_numeric_counts(self):
+        values = torch.ones((1, 1))
+        mask = torch.ones_like(values, dtype=torch.bool)
+        for invalid in (True, -1, float("inf"), float("nan"), "1"):
+            with (
+                self.subTest(batch_num_tokens=invalid),
+                self.assertRaisesRegex(ValueError, "batch_num_tokens must be a finite non-negative number"),
+            ):
+                agg_loss(values, mask, batch_num_tokens=invalid, dp_size=1)
+        for invalid in (True, -1, 1.5, float("inf"), "1"):
+            with (
+                self.subTest(global_batch_size=invalid),
+                self.assertRaisesRegex(ValueError, "global_batch_size must be a non-negative integer"),
+            ):
+                agg_loss(
+                    values,
+                    mask,
+                    loss_agg_mode="seq-mean-token-sum",
+                    global_batch_size=invalid,
+                    dp_size=1,
+                )
+
     def test_dp_size_rejects_non_positive(self):
         self.assertEqual(_resolve_dp_size(None, None), 1)
         with self.assertRaises(ValueError):
@@ -419,6 +441,18 @@ def _sp_loss_worker(rank: int, init_file: str):
                 sequence_loss_weights=torch.tensor([0.5]),
             )
             prompt_loss.backward()
+            sequence_values = torch.tensor(
+                [[1.0, 10.0] if rank == 0 else [3.0, 6.0]],
+                requires_grad=True,
+            )
+            sequence_mask = torch.tensor([[True, False] if rank == 0 else [True, True]])
+            sequence_loss = agg_loss(
+                sequence_values,
+                sequence_mask,
+                loss_agg_mode="seq-mean-token-mean",
+                cu_seqlens=torch.tensor([0, 1, 2], dtype=torch.int32),
+            )
+            sequence_loss.backward()
             ppo_values = torch.tensor([[-0.95 if rank == 0 else -1.05]], requires_grad=True)
             ppo_loss, _ = grpo_loss(
                 {"logprobs": ppo_values},
@@ -446,6 +480,13 @@ def _sp_loss_worker(rank: int, init_file: str):
         assert echo_loss.item() == (0.25 if rank == 0 else 0.0)
         torch_assert_close(prompt_values.grad, torch.tensor([[0.25]]), rtol=0, atol=1e-6)
         assert prompt_loss.item() == (0.25 if rank == 0 else 0.75)
+        torch_assert_close(
+            sequence_values.grad,
+            torch.tensor([[0.25, 0.0] if rank == 0 else [0.25, 0.5]]),
+            rtol=0,
+            atol=1e-6,
+        )
+        assert sequence_loss.item() == (0.25 if rank == 0 else 3.75)
         torch_assert_close(ppo_values.grad, torch.tensor([[-0.5]]), rtol=0, atol=1e-6)
 
         try:
@@ -458,11 +499,92 @@ def _sp_loss_worker(rank: int, init_file: str):
             assert "batch_num_tokens=0" in str(error)
         else:
             raise AssertionError("every rank must reject a zero denominator when any rank has policy tokens")
+
+        zero_values = torch.zeros((1, 1), requires_grad=True)
+        zero_context = {
+            "input_ids": torch.ones((1, 1), dtype=torch.long),
+            "old_log_probs_shifted": torch.zeros_like(zero_values),
+            "advantages": torch.ones_like(zero_values),
+            "loss_mask": torch.tensor([[rank == 1]]),
+        }
+        with patch("arctic_platform.rl.processors.grpo._get_sequence_parallel_group", return_value=None):
+            try:
+                grpo_loss(
+                    {"logprobs": zero_values},
+                    zero_context,
+                    {},
+                    {"batch_num_tokens": 0, "dp_size": 1},
+                    "cpu",
+                )
+            except ValueError as error:
+                assert "batch_num_tokens=0" in str(error)
+            else:
+                raise AssertionError("empty GRPO shards must join zero-denominator validation")
+
+        mixed_microbatch = {
+            **zero_context,
+            "loss_mask": torch.ones((1, 1), dtype=torch.bool) if rank == 0 else torch.zeros((1, 1), dtype=torch.bool),
+            "nll_mask": torch.ones((1, 1), dtype=torch.bool),
+        }
+        with patch("arctic_platform.rl.processors.grpo._get_sequence_parallel_group", return_value=dist.group.WORLD):
+            try:
+                resolve_loss("ap_grpo_mixed_v1").packed_reduction_callback(
+                    [mixed_microbatch],
+                    {"use_cispo_loss": True, "is_weight_clip_max": 2.0},
+                    "ap_grpo_mixed_v1",
+                )
+            except ValueError as error:
+                assert "nll_mask must be a subset" in str(error) or "another sequence-parallel rank" in str(error)
+            else:
+                raise AssertionError("every SP rank must reject shard-local mixed validation failures")
+
+            echo_context = {
+                "input_ids": torch.ones((1, 1), dtype=torch.long),
+                "loss_mask": torch.tensor([[rank == 1]]),
+                "sft_mask": torch.zeros((1, 1), dtype=torch.bool),
+                "echo_observation_mask": torch.ones((1, 1), dtype=torch.bool),
+            }
+            try:
+                resolve_loss("ap_grpo_echo_v1").validation_callback(
+                    echo_context,
+                    {"aux_ce_weight": 0.5, "echo_global_num_sequences": 1},
+                )
+            except ValueError as error:
+                assert "echo_observation_mask overlaps" in str(error) or "another sequence-parallel rank" in str(error)
+            else:
+                raise AssertionError("every SP rank must reject shard-local ECHO validation failures")
     finally:
         dist.destroy_process_group()
 
 
 class TestMigratedGrpo(TestCasePlus):
+    def test_whole_request_callbacks_reject_cross_window_contract_errors(self):
+        request = {
+            "input_ids": torch.ones((1, 2), dtype=torch.long),
+            "processing": {
+                "loss_fn": "ap_grpo_mixed_v1",
+                "config": {"use_cispo_loss": True, "is_weight_clip_max": 2.0},
+            },
+            "context": {
+                "loss_mask": torch.tensor([[True, False]]),
+                "nll_mask": torch.tensor([[False, True]]),
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "nll_mask must be a subset"):
+            resolve_loss("ap_grpo_mixed_v1").batching_callback(request)
+
+        request["processing"] = {
+            "loss_fn": "ap_grpo_echo_v1",
+            "config": {"aux_ce_weight": 0.5, "echo_global_num_sequences": 1},
+        }
+        request["context"] = {
+            "loss_mask": torch.tensor([[True, False]]),
+            "sft_mask": torch.tensor([[False, True]]),
+            "echo_observation_mask": torch.tensor([[True, True]]),
+        }
+        with self.assertRaisesRegex(ValueError, "echo_observation_mask overlaps loss_mask"):
+            resolve_loss("ap_grpo_echo_v1").batching_callback(request)
+
     def test_ratio_masks_keep_original_normalizer_and_penalty_gradient(self):
         values = torch.tensor([[-1.0, -1.0, -1.0]], requires_grad=True)
         context = {
@@ -518,6 +640,20 @@ class TestMigratedGrpo(TestCasePlus):
         self.assertAlmostEqual(loss.item(), 1 / 3, places=6)
         loss.backward()
         torch_assert_close(values.grad, torch.tensor([0.0, 0.0, -1 / 3]), rtol=0, atol=1e-6)
+
+    def test_packed_sequence_aggregation_uses_sequence_boundaries(self):
+        values = torch.tensor([[1.0, 3.0, 9.0]])
+        mask = torch.ones_like(values, dtype=torch.bool)
+        cu_seqlens = torch.tensor([0, 2, 3], dtype=torch.int32)
+        expected = {
+            "seq-mean-token-sum": 6.5,
+            "seq-mean-token-sum-norm": 3.25,
+            "seq-mean-token-mean": 5.5,
+        }
+        for mode, expected_loss in expected.items():
+            with self.subTest(mode=mode):
+                loss = agg_loss(values, mask, loss_agg_mode=mode, cu_seqlens=cu_seqlens)
+                self.assertEqual(loss.item(), expected_loss)
 
     def test_ratio_stats_only_keeps_baseline_loss_and_empty_metric_keys(self):
         context = {

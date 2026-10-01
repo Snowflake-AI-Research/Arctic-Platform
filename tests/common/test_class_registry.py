@@ -24,11 +24,13 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from arctic_platform.common.registry import BATCHING_CALLBACK_ATTR
 from arctic_platform.common.registry import LOSS_CAPABILITIES_ATTR
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import METRICS_CALLBACK_ATTR
 from arctic_platform.common.registry import MODEL_CALL_COUNT_CALLBACK_ATTR
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
+from arctic_platform.common.registry import VALIDATION_CALLBACK_ATTR
 from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.registry import RegistryMeta
 from arctic_platform.registry import RegistryValidationError
@@ -121,10 +123,17 @@ def test_loss_resolver_preserves_legacy_fallback_metadata(monkeypatch):
         return reduction
 
     model_call_counts = []
+    lifecycle_calls = []
 
     def model_call_count_callback(counts, config):
         model_call_counts.append((tuple(counts), config))
 
+    setattr(function_loss, BATCHING_CALLBACK_ATTR, lambda request: lifecycle_calls.append(("batch", request)))
+    setattr(
+        function_loss,
+        VALIDATION_CALLBACK_ATTR,
+        lambda context, config: lifecycle_calls.append(("validate", context, config)),
+    )
     setattr(function_loss, PACKED_LOSS_REDUCTION_ATTR, reduction_callback)
     setattr(function_loss, MODEL_CALL_COUNT_CALLBACK_ATTR, model_call_count_callback)
     setattr(function_loss, LOSS_CAPABILITIES_ATTR, frozenset({"needs_test_output"}))
@@ -134,6 +143,12 @@ def test_loss_resolver_preserves_legacy_fallback_metadata(monkeypatch):
     outputs = {"logits": torch.ones(1), "logprobs": torch.zeros(1)}
     assert loss_object.loss(outputs, {"batch": 1}, {"meta": 2}, {"value": 3}, "cpu")[1] == {"legacy": 1}
     assert calls and loss_object.packed_reduction_callback([{}], {}, "_legacy_test") is reduction
+    assert loss_object.batching_callback({"request": 1}) is None
+    assert loss_object.validation_callback({"context": 2}, {"config": 3}) is None
+    assert lifecycle_calls == [
+        ("batch", {"request": 1}),
+        ("validate", {"context": 2}, {"config": 3}),
+    ]
     assert loss_object.model_call_count_callback([1, 1], {"value": 4}) is None
     assert model_call_counts == [((1, 1), {"value": 4})]
     assert loss_object.has_capability("needs_test_output")

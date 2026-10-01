@@ -39,19 +39,23 @@ from arctic_platform.common.registry import declare_loss_capabilities
 from arctic_platform.common.registry import register_loss_fn
 from arctic_platform.rl.processors.base_loss import PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG
 from arctic_platform.rl.processors.base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
-from arctic_platform.rl.processors.functional import RATIO_MASK_CONFIG_KEYS
 from arctic_platform.rl.processors.functional import resolve_global_loss_scale
 from arctic_platform.rl.processors.grpo import _ECHO_CONFIG_KEYS
-from arctic_platform.rl.processors.grpo import _ECHO_REQUIRED_CONFIG_KEYS
-from arctic_platform.rl.processors.grpo import _GRPO_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import ECHO_SUMMED_METRICS
+from arctic_platform.rl.processors.grpo import _grpo_batching_callback
 from arctic_platform.rl.processors.grpo import _grpo_context
+from arctic_platform.rl.processors.grpo import _grpo_echo_batching_callback
 from arctic_platform.rl.processors.grpo import _grpo_echo_packed_loss_reduction
+from arctic_platform.rl.processors.grpo import _grpo_echo_validation_callback
 from arctic_platform.rl.processors.grpo import _grpo_loss
 from arctic_platform.rl.processors.grpo import _grpo_metrics_callback
+from arctic_platform.rl.processors.grpo import _grpo_mixed_batching_callback
 from arctic_platform.rl.processors.grpo import _grpo_mixed_packed_loss_reduction
+from arctic_platform.rl.processors.grpo import _grpo_mixed_validation_callback
 from arctic_platform.rl.processors.grpo import _grpo_model_call_count_callback
 from arctic_platform.rl.processors.grpo import _grpo_packed_loss_reduction
+from arctic_platform.rl.processors.grpo import _grpo_validation_callback
+from arctic_platform.rl.processors.grpo import _validate_echo_config
 from arctic_platform.rl.processors.grpo import _validate_mixed_config
 
 
@@ -75,6 +79,8 @@ def _cortex_distributed_config(config: dict, batch: dict, meta: dict) -> tuple[d
 
 @register_loss_fn(
     "grpo",
+    batching_callback=_grpo_batching_callback,
+    validation_callback=_grpo_validation_callback,
     packed_loss_reduction=_grpo_packed_loss_reduction,
     model_call_count_callback=_grpo_model_call_count_callback,
     metrics_callback=_grpo_metrics_callback,
@@ -101,6 +107,8 @@ def cortex_grpo_loss(
 
 @register_loss_fn(
     "grpo_mixed_v1",
+    batching_callback=_grpo_mixed_batching_callback,
+    validation_callback=_grpo_mixed_validation_callback,
     packed_loss_reduction=_grpo_mixed_packed_loss_reduction,
     model_call_count_callback=_grpo_model_call_count_callback,
     metrics_callback=_grpo_metrics_callback,
@@ -121,6 +129,8 @@ def cortex_grpo_mixed_v1_loss(
 
 @register_loss_fn(
     "grpo_echo_v1",
+    batching_callback=_grpo_echo_batching_callback,
+    validation_callback=_grpo_echo_validation_callback,
     packed_loss_reduction=_grpo_echo_packed_loss_reduction,
     model_call_count_callback=_grpo_model_call_count_callback,
     metrics_callback=_grpo_metrics_callback,
@@ -138,10 +148,5 @@ def cortex_grpo_echo_v1_loss(
     config, context = _cortex_distributed_config(config, batch, meta)
     if "nll_mask" in context:
         raise ValueError("nll_mask requires loss_fn='grpo_mixed_v1'")
-    unknown_keys = set(config) - _GRPO_CONFIG_KEYS - _ECHO_CONFIG_KEYS - RATIO_MASK_CONFIG_KEYS
-    if unknown_keys:
-        raise ValueError(f"Unknown config keys for loss_fn 'grpo_echo_v1': {sorted(unknown_keys)}")
-    missing_keys = {key for key in _ECHO_REQUIRED_CONFIG_KEYS if config.get(key) is None}
-    if missing_keys:
-        raise ValueError(f"loss_fn 'grpo_echo_v1' requires non-None config keys {sorted(missing_keys)}")
+    _validate_echo_config(config, "grpo_echo_v1")
     return _grpo_loss(model_outputs, context, config, device)

@@ -21,6 +21,7 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 from numbers import Integral
+from numbers import Real
 from typing import Optional
 
 import numpy as np
@@ -224,6 +225,40 @@ def _explicit_zero_step_count(name: str, loss_mask: torch.Tensor) -> int:
     return 1
 
 
+def _validate_loss_denominators(
+    batch_num_tokens: int | float | None,
+    global_batch_size: int | None,
+) -> None:
+    if batch_num_tokens is not None and (
+        isinstance(batch_num_tokens, bool)
+        or not isinstance(batch_num_tokens, Real)
+        or not math.isfinite(float(batch_num_tokens))
+        or batch_num_tokens < 0
+    ):
+        raise ValueError(f"batch_num_tokens must be a finite non-negative number, got {batch_num_tokens!r}")
+    if global_batch_size is not None and (
+        isinstance(global_batch_size, bool) or not isinstance(global_batch_size, Integral) or global_batch_size < 0
+    ):
+        raise ValueError(f"global_batch_size must be a non-negative integer, got {global_batch_size!r}")
+
+
+def _per_sequence_loss_totals(
+    loss_mat: torch.Tensor,
+    loss_mask: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if cu_seqlens is not None and (loss_mat.ndim == 1 or loss_mat.shape[0] == 1):
+        flat_loss = loss_mat if loss_mat.ndim == 1 else loss_mat[0]
+        flat_mask = loss_mask if loss_mask.ndim == 1 else loss_mask[0]
+        _, (sequence_sums, sequence_counts) = _packed_per_sequence_sums(
+            cu_seqlens,
+            _masked_values(flat_loss, flat_mask),
+            flat_mask.to(flat_loss.dtype),
+        )
+        return sequence_sums, sequence_counts
+    return _masked_values(loss_mat, loss_mask).sum(dim=-1), loss_mask.sum(dim=-1).to(loss_mat.dtype)
+
+
 def agg_loss(
     loss_mat: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -261,6 +296,7 @@ def agg_loss(
     DeepSpeed's DP gradient averaging. Under sequence parallelism, packed
     segment boundaries must cover each token window with one segment per row.
     """
+    _validate_loss_denominators(batch_num_tokens, global_batch_size)
     dp_size = _resolve_dp_size(dp_size, batch_num_tokens)
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
@@ -270,8 +306,11 @@ def agg_loss(
         loss = (torch.where(loss_mask.bool(), loss_mat, 0.0).sum() / batch_num_tokens) * dp_size
 
     elif loss_agg_mode in ("seq-mean-token-sum", "seq-mean-token-sum-norm"):
-        seq_losses = (loss_mat * loss_mask).sum(dim=-1)
-        seq_mask = (loss_mask.sum(dim=-1) > 0).float()
+        seq_losses, seq_token_counts = _per_sequence_loss_totals(loss_mat, loss_mask, cu_seqlens)
+        sp_group = _get_sequence_parallel_group()
+        if sp_group is not None:
+            dist.all_reduce(seq_token_counts, op=dist.ReduceOp.SUM, group=sp_group)
+        seq_mask = (seq_token_counts > 0).float()
         if global_batch_size is None:
             global_batch_size = seq_mask.sum().clamp(min=1)
         elif global_batch_size == 0:
@@ -279,13 +318,22 @@ def agg_loss(
         loss = ((seq_losses * seq_mask).sum() / global_batch_size) * dp_size
         if loss_agg_mode == "seq-mean-token-sum-norm":
             if loss_scale_factor is None:
-                loss_scale_factor = loss_mask.shape[-1]
+                if cu_seqlens is not None and (loss_mat.ndim == 1 or loss_mat.shape[0] == 1):
+                    sequence_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(loss_mat.device)
+                    if sp_group is not None:
+                        dist.all_reduce(sequence_lengths, op=dist.ReduceOp.SUM, group=sp_group)
+                    loss_scale_factor = int(sequence_lengths.max().clamp(min=1).item())
+                else:
+                    loss_scale_factor = loss_mask.shape[-1]
             loss = loss / loss_scale_factor
 
     elif loss_agg_mode == "seq-mean-token-mean":
-        seq_token_counts = loss_mask.sum(dim=-1).clamp(min=1).float()
-        seq_losses = (loss_mat * loss_mask).sum(dim=-1) / seq_token_counts
-        seq_mask = (loss_mask.sum(dim=-1) > 0).float()
+        seq_loss_sums, seq_token_counts = _per_sequence_loss_totals(loss_mat, loss_mask, cu_seqlens)
+        sp_group = _get_sequence_parallel_group()
+        if sp_group is not None:
+            dist.all_reduce(seq_token_counts, op=dist.ReduceOp.SUM, group=sp_group)
+        seq_mask = (seq_token_counts > 0).float()
+        seq_losses = seq_loss_sums / seq_token_counts.clamp(min=1)
         if global_batch_size is None:
             global_batch_size = seq_mask.sum().clamp(min=1)
         elif global_batch_size == 0:
@@ -303,17 +351,7 @@ def agg_loss(
         # pack_sequences' singleton [1, T] form) or as [1, T] from direct
         # callers — treat both as packed; only genuinely padded B > 1 rows
         # take the per-row reduction below.
-        if cu_seqlens is not None and (loss_mat.ndim == 1 or loss_mat.shape[0] == 1):
-            flat_loss = loss_mat if loss_mat.ndim == 1 else loss_mat[0]  # [T]
-            flat_mask = loss_mask if loss_mask.ndim == 1 else loss_mask[0]  # [T]
-            _, (seq_sum, seq_cnt) = _packed_per_sequence_sums(
-                cu_seqlens,
-                _masked_values(flat_loss, flat_mask),
-                flat_mask.to(flat_loss.dtype),
-            )
-        else:
-            seq_sum = _masked_values(loss_mat, loss_mask).sum(dim=-1)
-            seq_cnt = loss_mask.sum(dim=-1).to(seq_sum.dtype)
+        seq_sum, seq_cnt = _per_sequence_loss_totals(loss_mat, loss_mask, cu_seqlens)
 
         if sp_group is not None:
             dist.all_reduce(seq_cnt, op=dist.ReduceOp.SUM, group=sp_group)

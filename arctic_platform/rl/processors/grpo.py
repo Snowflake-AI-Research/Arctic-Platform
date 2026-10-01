@@ -36,6 +36,7 @@ from .functional import EchoBatchDenominator
 from .functional import RatioMasks
 from .functional import _get_sequence_parallel_group
 from .functional import _resolve_dp_size
+from .functional import _validate_loss_denominators
 from .functional import agg_loss
 from .functional import canonicalize_loss_mask
 from .functional import cispo_actor_loss_fn
@@ -384,10 +385,19 @@ def _internal_grpo_loss_fn(
     # echo_observation_mask can still contribute. Empty-policy shards still
     # run the ECHO terms on this path.
     empty_policy_shard = not loss_mask.any()
+    validates_zero_denominator = batch_num_tokens == 0 or global_batch_size == 0
     reduces_across_sequence_parallel = _get_sequence_parallel_group() is not None and (
-        loss_agg_mode == "prompt-mean" or importance_sampling_level == "sequence"
+        loss_agg_mode.startswith("seq-mean-")
+        or loss_agg_mode == "prompt-mean"
+        or importance_sampling_level == "sequence"
     )
-    if empty_policy_shard and aux_ce_weight is None and ratio_masks is None and not reduces_across_sequence_parallel:
+    if (
+        empty_policy_shard
+        and aux_ce_weight is None
+        and ratio_masks is None
+        and not reduces_across_sequence_parallel
+        and not validates_zero_denominator
+    ):
         zero_loss = torch.nan_to_num(logprobs).sum() * 0.0
         metrics = {
             "approx_kl": 0.0,
@@ -458,7 +468,12 @@ def _internal_grpo_loss_fn(
             "teacher_clipped_log_ratio_sum": float(teacher_term.double().sum()),
         }
 
-    if empty_policy_shard and ratio_masks is None and not reduces_across_sequence_parallel:
+    if (
+        empty_policy_shard
+        and ratio_masks is None
+        and not reduces_across_sequence_parallel
+        and not validates_zero_denominator
+    ):
         loss = torch.nan_to_num(logprobs).sum() * 0.0
         metrics = {
             "approx_kl": 0.0,
@@ -822,6 +837,7 @@ def _grpo_loss(
     global prompts is inferred via allreduce.
     """
     values = _grpo_config_values(config)
+    _validate_loss_denominators(values["batch_num_tokens"], values["global_batch_size"])
     values["teacher_tau"] = _resolve_teacher_tau(config, context)
     values["ratio_masks"] = RatioMasks.from_config(config)
     values["dp_size"] = _resolve_dp_size(values["dp_size"], values["batch_num_tokens"])
@@ -1027,7 +1043,7 @@ def _active_sequence_count(microbatch: dict, loss_mask: torch.Tensor) -> float:
     return float(bool(loss_mask.any().item()))
 
 
-def _grpo_packed_loss_reduction(
+def _local_grpo_packed_loss_reduction(
     microbatches: Sequence[dict],
     config: dict,
     loss_fn_name: str,
@@ -1106,6 +1122,50 @@ def _grpo_packed_loss_reduction(
     return reduction
 
 
+def _raise_synchronized_validation_error(error: Exception | None, reference: torch.Tensor) -> None:
+    group = _get_sequence_parallel_group()
+    if group is not None and torch.distributed.is_initialized():
+        failed = torch.tensor(error is not None, dtype=torch.int32, device=reference.device)
+        torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX, group=group)
+        if failed.item() and error is None:
+            raise ValueError("GRPO validation failed on another sequence-parallel rank")
+    if error is not None:
+        raise error
+
+
+def _grpo_packed_loss_reduction(
+    microbatches: Sequence[dict],
+    config: dict,
+    loss_fn_name: str,
+    *,
+    mixed: bool = False,
+    echo: bool = False,
+) -> PackedLossReduction:
+    error = None
+    reduction = None
+    try:
+        reduction = _local_grpo_packed_loss_reduction(
+            microbatches,
+            config,
+            loss_fn_name,
+            mixed=mixed,
+            echo=echo,
+        )
+    except ValueError as caught:
+        error = caught
+    reference = next(
+        (microbatch["input_ids"] for microbatch in microbatches if torch.is_tensor(microbatch.get("input_ids"))),
+        None,
+    )
+    if reference is None:
+        if error is not None:
+            raise error
+        raise ValueError("grpo packed microbatches require tensor input_ids for synchronized validation")
+    _raise_synchronized_validation_error(error, reference)
+    assert reduction is not None
+    return reduction
+
+
 def _grpo_mixed_packed_loss_reduction(
     microbatches: Sequence[dict],
     config: dict,
@@ -1168,8 +1228,75 @@ def _grpo_context(batch: dict, meta: dict) -> dict:
     return {**meta, **batch}
 
 
+def _request_grpo_contexts(request: dict) -> list[dict]:
+    if "kwargs" in request:
+        return [{**(request.get("context") or {}), **(request.get("kwargs") or {})}]
+    if "batch" in request:
+        meta = request.get("meta") or {}
+        batch = request["batch"]
+        if isinstance(batch, list):
+            return [{**meta, **microbatch} for microbatch in batch]
+        return [{**meta, **batch}]
+    context = {key: value for key, value in request.items() if key not in {"context", "processing"}}
+    context.update(request.get("context") or {})
+    return [context]
+
+
+def _request_grpo_config(request: dict) -> dict:
+    processing = request.get("processing")
+    if not isinstance(processing, dict):
+        raise ValueError("GRPO requests require a processing object")
+    config = processing.get("config", {})
+    if not isinstance(config, dict):
+        raise ValueError("GRPO processing.config must be an object")
+    return config
+
+
+def _validate_grpo_context(context: dict, config: dict) -> torch.Tensor:
+    _validate_loss_denominators(config.get("batch_num_tokens"), config.get("global_batch_size"))
+    mask = _grpo_preflight_mask(context)
+    _resolve_teacher_tau(config, context)
+    RatioMasks.from_config(config)
+    return mask
+
+
+def _validate_plain_grpo_context(context: dict, config: dict) -> None:
+    _validate_grpo_context(context, config)
+    if "nll_mask" in context:
+        raise ValueError("nll_mask requires a mixed GRPO loss")
+    echo_keys = _ECHO_CONFIG_KEYS & set(config)
+    if echo_keys:
+        raise ValueError(f"plain GRPO does not accept ECHO config keys {sorted(echo_keys)}")
+
+
+def _run_synchronized_grpo_validation(context: dict, config: dict, validator) -> None:
+    error = None
+    try:
+        validator(context, config)
+    except ValueError as caught:
+        error = caught
+    reference = context.get("input_ids")
+    if not torch.is_tensor(reference):
+        if error is not None:
+            raise error
+        raise ValueError("GRPO validation requires tensor input_ids")
+    _raise_synchronized_validation_error(error, reference)
+
+
+def _grpo_batching_callback(request: dict) -> None:
+    config = _request_grpo_config(request)
+    for context in _request_grpo_contexts(request):
+        _validate_plain_grpo_context(context, config)
+
+
+def _grpo_validation_callback(context: dict, config: dict) -> None:
+    _run_synchronized_grpo_validation(context, config, _validate_plain_grpo_context)
+
+
 @register_loss_fn(
     "ap_grpo",
+    batching_callback=_grpo_batching_callback,
+    validation_callback=_grpo_validation_callback,
     packed_loss_reduction=_grpo_packed_loss_reduction,
     model_call_count_callback=_grpo_model_call_count_callback,
     metrics_callback=_grpo_metrics_callback,
@@ -1247,8 +1374,84 @@ def _validate_mixed_config(context: dict, config: dict) -> None:
         raise ValueError("grpo_mixed_v1 does not support SAPO, decoupled/M2PO/RIS, reference KL or entropy")
 
 
+def _validate_mixed_grpo_context(context: dict, config: dict) -> None:
+    loss_mask = _validate_grpo_context(context, config)
+    _validate_mixed_config(context, config)
+    _validate_nll_mask(context["nll_mask"], loss_mask)
+
+
+def _grpo_mixed_batching_callback(request: dict) -> None:
+    config = _request_grpo_config(request)
+    for context in _request_grpo_contexts(request):
+        _validate_mixed_grpo_context(context, config)
+
+
+def _grpo_mixed_validation_callback(context: dict, config: dict) -> None:
+    _run_synchronized_grpo_validation(context, config, _validate_mixed_grpo_context)
+
+
+def _validate_echo_config(config: dict, loss_fn_name: str) -> None:
+    unknown_keys = set(config) - _GRPO_CONFIG_KEYS - _ECHO_CONFIG_KEYS - RATIO_MASK_CONFIG_KEYS
+    if unknown_keys:
+        raise ValueError(f"Unknown config keys for loss_fn {loss_fn_name!r}: {sorted(unknown_keys)}")
+    missing_keys = {key for key in _ECHO_REQUIRED_CONFIG_KEYS if config.get(key) is None}
+    if missing_keys:
+        raise ValueError(f"loss_fn {loss_fn_name!r} requires non-None config keys {sorted(missing_keys)}")
+    aux_ce_weight = config["aux_ce_weight"]
+    if (
+        isinstance(aux_ce_weight, bool)
+        or not isinstance(aux_ce_weight, (int, float))
+        or not math.isfinite(aux_ce_weight)
+        or aux_ce_weight < 0
+    ):
+        raise ValueError(f"aux_ce_weight must be a finite non-negative number, got {aux_ce_weight!r}")
+    global_num_sequences = config["echo_global_num_sequences"]
+    if isinstance(global_num_sequences, bool) or not isinstance(global_num_sequences, int) or global_num_sequences < 1:
+        raise ValueError(f"echo_global_num_sequences must be a positive integer, got {global_num_sequences!r}")
+    try:
+        EchoBatchDenominator(config.get("echo_batch_denominator", EchoBatchDenominator.ALL_SEQUENCES.value))
+    except ValueError:
+        raise ValueError(f"Invalid echo_batch_denominator: {config.get('echo_batch_denominator')!r}") from None
+
+
+def _validate_echo_grpo_context(context: dict, config: dict) -> None:
+    loss_mask = _validate_grpo_context(context, config)
+    _validate_echo_config(config, "grpo_echo_v1")
+    if "nll_mask" in context:
+        raise ValueError("nll_mask requires a mixed GRPO loss")
+    sft_mask = context.get("sft_mask")
+    observation_mask = context.get("echo_observation_mask")
+    if sft_mask is None or observation_mask is None:
+        raise ValueError("ECHO requires sft_mask and echo_observation_mask")
+    sft_mask = canonicalize_loss_mask(sft_mask, loss_mask, objective="sft_mask", binary=True)
+    observation_mask = canonicalize_loss_mask(
+        observation_mask,
+        loss_mask,
+        objective="echo_observation_mask",
+        binary=True,
+    )
+    if (sft_mask & ~observation_mask).any().item():
+        raise ValueError("sft_mask must be a subset of echo_observation_mask")
+    if (sft_mask & loss_mask).any().item():
+        raise ValueError("sft_mask overlaps loss_mask")
+    if (observation_mask & loss_mask).any().item():
+        raise ValueError("echo_observation_mask overlaps loss_mask")
+
+
+def _grpo_echo_batching_callback(request: dict) -> None:
+    config = _request_grpo_config(request)
+    for context in _request_grpo_contexts(request):
+        _validate_echo_grpo_context(context, config)
+
+
+def _grpo_echo_validation_callback(context: dict, config: dict) -> None:
+    _run_synchronized_grpo_validation(context, config, _validate_echo_grpo_context)
+
+
 @register_loss_fn(
     "ap_grpo_mixed_v1",
+    batching_callback=_grpo_mixed_batching_callback,
+    validation_callback=_grpo_mixed_validation_callback,
     packed_loss_reduction=_grpo_mixed_packed_loss_reduction,
     model_call_count_callback=_grpo_model_call_count_callback,
     metrics_callback=_grpo_metrics_callback,
@@ -1270,6 +1473,8 @@ def grpo_mixed_v1_loss(
 
 @register_loss_fn(
     "ap_grpo_echo_v1",
+    batching_callback=_grpo_echo_batching_callback,
+    validation_callback=_grpo_echo_validation_callback,
     packed_loss_reduction=_grpo_echo_packed_loss_reduction,
     model_call_count_callback=_grpo_model_call_count_callback,
     metrics_callback=_grpo_metrics_callback,
@@ -1299,21 +1504,8 @@ def grpo_echo_v1_loss(
     full validation, full ECHO metrics.
     """
     config = _merge_distributed_config(config, batch, meta)
-    if "nll_mask" in _grpo_context(batch, meta):
+    context = _grpo_context(batch, meta)
+    if "nll_mask" in context:
         raise ValueError("nll_mask requires loss_fn='ap_grpo_mixed_v1'")
-    unknown_keys = set(config) - _GRPO_CONFIG_KEYS - _ECHO_CONFIG_KEYS - RATIO_MASK_CONFIG_KEYS
-    if unknown_keys:
-        raise ValueError(
-            f"Unknown config keys for loss_fn 'ap_grpo_echo_v1': {sorted(unknown_keys)} — this "
-            "contract fails loudly on unrecognized keys so a typo cannot silently disable an "
-            "objective."
-        )
-    # get() folds present-but-None into "missing": None would pass a
-    # key-presence check and silently train baseline GRPO downstream.
-    missing_keys = {key for key in _ECHO_REQUIRED_CONFIG_KEYS if config.get(key) is None}
-    if missing_keys:
-        raise ValueError(
-            f"loss_fn 'ap_grpo_echo_v1' requires non-None config keys {sorted(missing_keys)} — "
-            "use plain 'ap_grpo' for runs without the ECHO objective."
-        )
-    return _grpo_loss(model_outputs, _grpo_context(batch, meta), config, device)
+    _validate_echo_config(config, "ap_grpo_echo_v1")
+    return _grpo_loss(model_outputs, context, config, device)
