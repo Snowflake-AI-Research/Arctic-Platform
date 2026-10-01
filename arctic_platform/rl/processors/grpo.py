@@ -1261,7 +1261,35 @@ def _request_grpo_config(request: dict) -> dict:
     return config
 
 
-def _validate_grpo_context(context: dict, config: dict) -> torch.Tensor:
+def _packed_grpo_validation_context(context: dict) -> dict:
+    cu_seqlens = context.get("cu_seqlens")
+    input_ids = context.get("input_ids")
+    if (
+        not torch.is_tensor(cu_seqlens)
+        or not torch.is_tensor(input_ids)
+        or input_ids.ndim < 2
+        or input_ids.shape[0] != 1
+    ):
+        return context
+    token_width = input_ids.shape[1]
+    normalized = dict(context)
+    for name in (
+        "input_ids",
+        "labels",
+        "loss_mask",
+        "nll_mask",
+        "teacher_log_probs_shifted",
+        "sft_mask",
+        "echo_observation_mask",
+    ):
+        value = normalized.get(name)
+        if torch.is_tensor(value) and value.ndim >= 2 and value.shape[:2] == (1, token_width):
+            normalized[name] = value.squeeze(0)
+    return normalized
+
+
+def _validate_grpo_context(context: dict, config: dict) -> tuple[dict, torch.Tensor]:
+    context = _packed_grpo_validation_context(context)
     _validate_loss_denominators(config.get("batch_num_tokens"), config.get("global_batch_size"))
     mask = _grpo_preflight_mask(context)
     teacher_tau = _resolve_teacher_tau(config, context)
@@ -1275,11 +1303,11 @@ def _validate_grpo_context(context: dict, config: dict) -> torch.Tensor:
                 f"got {tuple(teacher_log_probs.shape)} and {tuple(mask.shape)}"
             )
     RatioMasks.from_config(config)
-    return mask
+    return context, mask
 
 
 def _validate_plain_grpo_context(context: dict, config: dict) -> None:
-    _validate_grpo_context(context, config)
+    context, _ = _validate_grpo_context(context, config)
     if "nll_mask" in context:
         raise ValueError("nll_mask requires a mixed GRPO loss")
     echo_keys = _ECHO_CONFIG_KEYS & set(config)
@@ -1393,7 +1421,7 @@ def _validate_mixed_config(context: dict, config: dict) -> None:
 
 
 def _validate_mixed_grpo_context(context: dict, config: dict) -> None:
-    loss_mask = _validate_grpo_context(context, config)
+    context, loss_mask = _validate_grpo_context(context, config)
     _validate_mixed_config(context, config)
     _validate_nll_mask(context["nll_mask"], loss_mask)
 
@@ -1433,7 +1461,7 @@ def _validate_echo_config(config: dict, loss_fn_name: str) -> None:
 
 
 def _validate_echo_grpo_context(context: dict, config: dict) -> None:
-    loss_mask = _validate_grpo_context(context, config)
+    context, loss_mask = _validate_grpo_context(context, config)
     _validate_echo_config(config, "grpo_echo_v1")
     if "nll_mask" in context:
         raise ValueError("nll_mask requires a mixed GRPO loss")

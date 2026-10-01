@@ -601,6 +601,16 @@ def _sp_loss_worker(rank: int, init_file: str):
 
 
 class TestMigratedGrpo(TestCasePlus):
+    def test_packed_validation_accepts_model_and_loss_tensor_layouts(self):
+        resolve_loss("ap_grpo").validation_callback(
+            {
+                "input_ids": torch.ones((1, 3), dtype=torch.long),
+                "loss_mask": torch.ones(3, dtype=torch.bool),
+                "cu_seqlens": torch.tensor([0, 2, 3], dtype=torch.int32),
+            },
+            {},
+        )
+
     def test_whole_request_callbacks_reject_cross_window_contract_errors(self):
         request = {
             "input_ids": torch.ones((1, 2), dtype=torch.long),
