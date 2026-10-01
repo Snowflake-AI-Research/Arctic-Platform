@@ -249,6 +249,10 @@ class EventBuffer:
         if entry is None:
             return False
         merged = {**entry[0], "text": entry[0]["text"] + event["text"]}
+        if "token_ids" in entry[0] or "token_ids" in event:
+            merged["token_ids"] = [
+                *entry[0].get("token_ids", ()), *event.get("token_ids", ())
+            ]
         size = event_size(merged)
         if size > self.limits.max_event_bytes:
             return False

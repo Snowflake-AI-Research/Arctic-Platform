@@ -538,6 +538,16 @@ def test_waiting_deltas_of_one_choice_merge():
     assert buffer.bytes == 0
 
 
+def test_merged_deltas_keep_every_token_id():
+    # Usage counts tokens, so a merge that kept only the text would under-report them.
+    buffer = EventBuffer(StreamLimits())
+    for text, token_ids in (("The", [791]), (" cat", [8415]), (" sat", [7731, 13])):
+        buffer.put({**_delta(0, text), "token_ids": token_ids})
+    [event] = buffer.drain()
+    assert event["text"] == "The cat sat"
+    assert event["token_ids"] == [791, 8415, 7731, 13]
+
+
 def test_choices_never_merge_with_each_other():
     buffer = EventBuffer(StreamLimits())
     for text in ("a", "b"):
