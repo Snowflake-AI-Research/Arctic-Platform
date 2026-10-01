@@ -628,11 +628,6 @@ def _run_pipeline_with_packing(
     mb_spec = MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb)
     mb_list = split_padded_tensor_dict_into_mb_list(all_input, mb_spec)
     n_mbs = len(mb_list.mbs)
-    if processing.get("config", {}).get("ratio_m2_threshold") is not None and n_mbs > 1:
-        raise ValueError(
-            "ratio_m2_threshold requires one packed model call; increase max_tokens_per_mb "
-            "so the request fits in one microbatch"
-        )
 
     reduction = resolve_packed_loss_reduction(
         processing,

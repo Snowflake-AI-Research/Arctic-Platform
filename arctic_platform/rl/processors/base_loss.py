@@ -26,6 +26,7 @@ from typing import Any
 
 from arctic_platform.common.registry import LOSS_CAPABILITIES_ATTR
 from arctic_platform.common.registry import LOSS_FNS
+from arctic_platform.common.registry import MODEL_CALL_COUNT_CALLBACK_ATTR
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import resolve_fn
 from arctic_platform.common.utils.batch import combine_metric_shards
@@ -119,6 +120,9 @@ class BaseLoss(ABC, metaclass=RegistryMeta):
         """Return objective-owned packed reduction metadata, if any."""
         return None
 
+    def model_call_count_callback(self, model_call_counts: Sequence[int | None], config: dict) -> None:
+        """Validate coordinator-visible model-call counts before execution."""
+
     def metrics_callback(self, worker_metrics: Sequence[dict], metrics: dict) -> None:
         """Combine or amend metrics after worker results are available."""
 
@@ -165,6 +169,11 @@ class _LegacyLossAdapter(BaseLoss):
 
     def requires_loss_mask_normalization(self) -> bool:
         return True
+
+    def model_call_count_callback(self, model_call_counts: Sequence[int | None], config: dict) -> None:
+        callback = getattr(self._loss_fn, MODEL_CALL_COUNT_CALLBACK_ATTR, None)
+        if callback is not None:
+            callback(model_call_counts, config)
 
     def metrics_callback(self, worker_metrics: Sequence[dict], metrics: dict) -> None:
         combined = combine_metric_shards(list(worker_metrics))

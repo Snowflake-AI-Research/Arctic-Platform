@@ -46,6 +46,7 @@ from arctic_platform.rl.processors.grpo import _GRPO_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import ECHO_SUMMED_METRICS
 from arctic_platform.rl.processors.grpo import _grpo_context
 from arctic_platform.rl.processors.grpo import _grpo_loss
+from arctic_platform.rl.processors.grpo import _grpo_model_call_count_callback
 from arctic_platform.rl.processors.grpo import _grpo_packed_loss_reduction
 from arctic_platform.rl.processors.grpo import _validate_mixed_config
 
@@ -64,6 +65,7 @@ def _cortex_distributed_config(config: dict, batch: dict, meta: dict) -> tuple[d
 @register_loss_fn(
     "grpo",
     packed_loss_reduction=_grpo_packed_loss_reduction,
+    model_call_count_callback=_grpo_model_call_count_callback,
 )
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
 def cortex_grpo_loss(
@@ -88,6 +90,7 @@ def cortex_grpo_loss(
 @register_loss_fn(
     "grpo_mixed_v1",
     packed_loss_reduction=_grpo_packed_loss_reduction,
+    model_call_count_callback=_grpo_model_call_count_callback,
 )
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
 def cortex_grpo_mixed_v1_loss(
@@ -106,6 +109,7 @@ def cortex_grpo_mixed_v1_loss(
 @register_loss_fn(
     "grpo_echo_v1",
     packed_loss_reduction=_grpo_packed_loss_reduction,
+    model_call_count_callback=_grpo_model_call_count_callback,
     summed_metrics=ECHO_SUMMED_METRICS,
 )
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)

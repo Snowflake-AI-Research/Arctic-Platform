@@ -566,6 +566,27 @@ class TestMigratedGrpo(TestCasePlus):
                     {"use_cispo_loss": True, "is_weight_clip_max": invalid_clip},
                     "cpu",
                 )
+        for invalid_entropy in (None, False, "0", float("nan"), 0.1):
+            with self.subTest(invalid_entropy=invalid_entropy), self.assertRaisesRegex(ValueError, "does not support"):
+                LOSS_FNS["ap_grpo_mixed_v1"](
+                    outputs,
+                    {**context, "nll_mask": context["loss_mask"]},
+                    {},
+                    {
+                        "use_cispo_loss": True,
+                        "is_weight_clip_max": 2.0,
+                        "entropy_coeff": invalid_entropy,
+                    },
+                    "cpu",
+                )
+        with self.assertRaisesRegex(ValueError, "requires CISPO"):
+            LOSS_FNS["ap_grpo_mixed_v1"](
+                outputs,
+                {**context, "nll_mask": context["loss_mask"]},
+                {},
+                {"use_cispo_loss": "true", "is_weight_clip_max": 2.0},
+                "cpu",
+            )
 
     def test_new_columns_move_from_meta_to_shardable_batch(self):
         meta = {

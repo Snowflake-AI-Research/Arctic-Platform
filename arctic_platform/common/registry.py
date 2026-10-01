@@ -26,6 +26,7 @@ from typing import Set
 POST_PROCESSORS: Dict[str, Callable] = {}
 LOSS_FNS: Dict[str, Callable] = {}
 PACKED_LOSS_REDUCTION_ATTR = "_arctic_packed_loss_reduction"
+MODEL_CALL_COUNT_CALLBACK_ATTR = "_arctic_model_call_count_callback"
 SUMMED_METRICS_ATTR = "_arctic_summed_metrics"
 LOSS_CAPABILITIES_ATTR = "_arctic_loss_capabilities"
 
@@ -97,9 +98,13 @@ def register_loss_fn(
     name: str,
     *,
     packed_loss_reduction: Callable | None = None,
+    model_call_count_callback: Callable | None = None,
     summed_metrics: Iterable[str] = (),
 ):
-    """Register a loss function and its optional packed-microbatch contract.
+    """Register a loss function and its optional execution contracts.
+
+    ``model_call_count_callback`` validates coordinator-visible model-call
+    counts before execution without exposing objective config to dispatchers.
 
     ``summed_metrics`` names the metrics this loss fn emits that are additive
     across packed microbatches, gradient accumulation, and DP ranks, so the
@@ -116,11 +121,17 @@ def register_loss_fn(
             existing = getattr(fn, PACKED_LOSS_REDUCTION_ATTR, None)
             if existing is not None and existing is not packed_loss_reduction:
                 raise ValueError(f"refusing to replace packed_loss_reduction on registered {name!r}")
+        if model_call_count_callback is not None:
+            existing = getattr(fn, MODEL_CALL_COUNT_CALLBACK_ATTR, None)
+            if existing is not None and existing is not model_call_count_callback:
+                raise ValueError(f"refusing to replace model_call_count_callback on registered {name!r}")
         # Bind first so a refused public-name overwrite cannot leak
         # ``summed_metrics`` into the process-global union.
         _bind_registry(LOSS_FNS, name, fn)
         if packed_loss_reduction is not None:
             setattr(fn, PACKED_LOSS_REDUCTION_ATTR, packed_loss_reduction)
+        if model_call_count_callback is not None:
+            setattr(fn, MODEL_CALL_COUNT_CALLBACK_ATTR, model_call_count_callback)
         if declared:
             setattr(fn, SUMMED_METRICS_ATTR, declared | getattr(fn, SUMMED_METRICS_ATTR, frozenset()))
             DECLARED_SUMMED_METRICS.update(declared)

@@ -707,7 +707,7 @@ class TestA5Compat(TestCasePlus):
             "loss_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
             "old_log_probs_shifted": torch.zeros(2, 4),
         }
-        with self.assertRaisesRegex(ValueError, "requires one packed model call"):
+        with self.assertRaisesRegex(ValueError, "requires exactly one synchronized model call"):
             run_pipeline(
                 Engine(),
                 (),

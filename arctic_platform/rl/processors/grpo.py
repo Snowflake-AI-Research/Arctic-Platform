@@ -945,6 +945,14 @@ ECHO_SUMMED_METRICS = frozenset(
 )
 
 
+def _grpo_model_call_count_callback(model_call_counts: Sequence[int | None], config: dict) -> None:
+    if config.get("ratio_m2_threshold") is None:
+        return
+    counts = tuple(model_call_counts)
+    if set(counts) != {1}:
+        raise ValueError(f"ratio_m2_threshold requires exactly one synchronized model call per worker, got {counts!r}")
+
+
 def _grpo_preflight_mask(microbatch: dict) -> torch.Tensor:
     reference = microbatch.get("input_ids")
     if not torch.is_tensor(reference):
@@ -983,6 +991,7 @@ def _grpo_packed_loss_reduction(
     config: dict,
     loss_fn_name: str,
 ) -> PackedLossReduction:
+    _grpo_model_call_count_callback((len(microbatches),), config)
     masks = [_grpo_preflight_mask(microbatch) for microbatch in microbatches]
     ratio_masks = RatioMasks.from_config(config)
     if ratio_masks is not None and not config.get("use_cispo_loss"):
@@ -1083,6 +1092,7 @@ def _grpo_context(batch: dict, meta: dict) -> dict:
 @register_loss_fn(
     "ap_grpo",
     packed_loss_reduction=_grpo_packed_loss_reduction,
+    model_call_count_callback=_grpo_model_call_count_callback,
 )
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
 def grpo_loss(
@@ -1124,7 +1134,7 @@ def _validate_mixed_config(context: dict, config: dict) -> None:
         raise ValueError("grpo_mixed_v1 requires nll_mask")
     cap = config.get("is_weight_clip_max")
     if (
-        not config.get("use_cispo_loss")
+        config.get("use_cispo_loss") is not True
         or cap is None
         or isinstance(cap, bool)
         or not isinstance(cap, (int, float))
@@ -1134,9 +1144,18 @@ def _validate_mixed_config(context: dict, config: dict) -> None:
         raise ValueError("grpo_mixed_v1 requires CISPO and a finite positive is_weight_clip_max")
     if config.get("importance_sampling_level", "token") != "token":
         raise ValueError("grpo_mixed_v1 requires token importance sampling")
-    unsupported = ("use_sapo_loss", "use_decoupled_loss", "use_kl_loss", "entropy_coeff")
+    entropy_coeff = config.get("entropy_coeff", 0.0)
+    invalid_entropy_coeff = (
+        entropy_coeff is None
+        or isinstance(entropy_coeff, bool)
+        or not isinstance(entropy_coeff, (int, float))
+        or not math.isfinite(entropy_coeff)
+        or entropy_coeff != 0.0
+    )
+    unsupported = ("use_sapo_loss", "use_decoupled_loss", "use_kl_loss")
     if (
         any(config.get(key) for key in unsupported)
+        or invalid_entropy_coeff
         or config.get("m2_threshold") is not None
         or config.get("c_clip") is not None
         or config.get("behav_imp_weight_cap") is not None
@@ -1148,7 +1167,11 @@ def _validate_mixed_config(context: dict, config: dict) -> None:
         raise ValueError("grpo_mixed_v1 does not support SAPO, decoupled/M2PO/RIS, reference KL or entropy")
 
 
-@register_loss_fn("ap_grpo_mixed_v1", packed_loss_reduction=_grpo_packed_loss_reduction)
+@register_loss_fn(
+    "ap_grpo_mixed_v1",
+    packed_loss_reduction=_grpo_packed_loss_reduction,
+    model_call_count_callback=_grpo_model_call_count_callback,
+)
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
 def grpo_mixed_v1_loss(
     model_outputs: dict,
@@ -1167,6 +1190,7 @@ def grpo_mixed_v1_loss(
 @register_loss_fn(
     "ap_grpo_echo_v1",
     packed_loss_reduction=_grpo_packed_loss_reduction,
+    model_call_count_callback=_grpo_model_call_count_callback,
     summed_metrics=ECHO_SUMMED_METRICS,
 )
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
