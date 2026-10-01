@@ -172,3 +172,32 @@ class TestExtraNamesResolve:
             for dep in optional[extra]:
                 assert "arctic_platform[inference]" not in dep
                 assert "vllm" not in dep
+
+    def test_inference_docs_and_benchmarks_are_excluded_from_the_wheel(self):
+        """The copied docs tree sits in the package directory and stays out of the wheel."""
+        with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
+            project = tomllib.load(f)
+        exclude = project["tool"]["hatch"]["build"]["exclude"]
+        excluded_dirs = (
+            "arctic_platform/inference/benchmark/",
+            "arctic_platform/inference/docs/",
+            "arctic_platform/inference/projects/",
+            "arctic_platform/inference/scripts/",
+        )
+        excluded_files = (
+            "arctic_platform/inference/README.md",
+            "arctic_platform/inference/LICENSE",
+            "arctic_platform/inference/.gitignore",
+            "arctic_platform/inference/.readthedocs.yaml",
+        )
+        for path in excluded_dirs + excluded_files:
+            assert path in exclude
+            assert (_REPO_ROOT / path.rstrip("/")).exists()
+        for path in (
+            "arctic_platform/inference/csrc",
+            "arctic_platform/inference/setup.py",
+            "arctic_platform/inference/semi_persistence/scripts",
+        ):
+            assert (_REPO_ROOT / path).exists()
+            assert path not in exclude
+            assert f"{path}/" not in exclude

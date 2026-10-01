@@ -16,6 +16,19 @@ include = [
   "arctic_platform/integrations/verl/examples/*.sh",
   "arctic_platform/integrations/verl/README.md",
 ]
+# Kept beside the inference package and left out of the wheel. Trailing
+# slashes make hatchling skip the directories. csrc/, setup.py, and
+# semi_persistence/scripts stay in the wheel.
+exclude = [
+  "arctic_platform/inference/benchmark/",
+  "arctic_platform/inference/docs/",
+  "arctic_platform/inference/projects/",
+  "arctic_platform/inference/scripts/",
+  "arctic_platform/inference/README.md",
+  "arctic_platform/inference/LICENSE",
+  "arctic_platform/inference/.gitignore",
+  "arctic_platform/inference/.readthedocs.yaml",
+]
 
 [project.urls]
 Homepage = "https://github.com/Snowflake-AI-Research/Arctic-Platform"

@@ -30,6 +30,9 @@ python arctic_platform/inference/setup.py build_ext
 pytest tests/inference
 ```
 
+Docs, benchmarks, projects, and scripts live in `arctic_platform/inference/`
+and are excluded from the wheel. `csrc/` and `setup.py` are not.
+
 Do not pull these tests into the default suite; collecting them imports vLLM.
 Sampling and NCCL tests need a GPU.
 

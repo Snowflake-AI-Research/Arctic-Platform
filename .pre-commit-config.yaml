@@ -4,7 +4,7 @@
 # arctic_platform/inference is the copied Arctic Inference tree. Keep its original
 # formatting so the import can be traced to snowflake-eng/arcticinference-internal.
 # Format it in a follow-up change.
-exclude: ^(arctic_platform/model/implementations/(qwen35|moe)/|cortex-client/|arctic_platform/inference/|inference/|tests/inference/)
+exclude: ^(arctic_platform/model/implementations/(qwen35|moe)/|cortex-client/|arctic_platform/inference/|tests/inference/)
 
 repos:
   - repo: local
