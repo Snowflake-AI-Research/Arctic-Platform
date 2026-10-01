@@ -78,9 +78,7 @@ class GlmMoeDsaOptions(BaseModel):
 def _matches(ctx: LoaderContext) -> bool:
     if ctx.spec.parallelism.expert_parallel <= 1:
         return False
-    model_type = getattr(ctx.hf_config, "model_type", "") or ""
-    text_config = getattr(ctx.hf_config, "text_config", None)
-    return model_type == "glm_moe_dsa" or getattr(text_config, "model_type", None) == "glm_moe_dsa"
+    return ctx.hf_model_type == "glm_moe_dsa" or ctx.hf_text_model_type == "glm_moe_dsa"
 
 
 def _validate_spec(spec: ModelSpec) -> None:

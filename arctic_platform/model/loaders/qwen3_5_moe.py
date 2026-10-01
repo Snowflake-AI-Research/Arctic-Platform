@@ -77,11 +77,7 @@ class Qwen3_5MoeOptions(BaseModel):
 def _matches(ctx: LoaderContext) -> bool:
     if ctx.spec.parallelism.expert_parallel <= 1:
         return False
-    model_type = getattr(ctx.hf_config, "model_type", "") or ""
-    text_config = getattr(ctx.hf_config, "text_config", None)
-    return model_type in ("qwen3_5_moe", "qwen3_5_moe_text") or (
-        getattr(text_config, "model_type", None) == "qwen3_5_moe_text"
-    )
+    return ctx.hf_model_type in ("qwen3_5_moe", "qwen3_5_moe_text") or ctx.hf_text_model_type == "qwen3_5_moe_text"
 
 
 def _validate_spec(spec: ModelSpec) -> None:

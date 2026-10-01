@@ -15,8 +15,8 @@
 
 """GLM MoE DSA loader configuration and ownership boundaries."""
 
+import json
 import sys
-from types import SimpleNamespace
 
 import pytest
 from torch import nn
@@ -25,18 +25,21 @@ from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
 from arctic_platform.model import build_model
-from arctic_platform.model import loader
 from arctic_platform.model.loaders.glm_moe_dsa import GlmMoeDsaOptions
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
 
 
 @pytest.mark.parametrize("composite", [False, True])
-def test_selection_uses_model_type(monkeypatch, composite):
-    text = SimpleNamespace(model_type="glm_moe_dsa")
-    config = SimpleNamespace(model_type="glm_vlm", text_config=text) if composite else text
-    monkeypatch.setattr(loader, "_load_hf_config", lambda _: config)
-    spec = ModelSpec(model_path_or_name="renamed-checkpoint", parallelism=ParallelismConfig(expert_parallel=2))
+def test_selection_uses_model_type(tmp_path, composite):
+    config = {"model_type": "glm_moe_dsa"}
+    if composite:
+        config = {
+            "model_type": "glm_vlm",
+            "text_config": config,
+        }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    spec = ModelSpec(model_path_or_name=str(tmp_path), parallelism=ParallelismConfig(expert_parallel=2))
     assert spec.loader == "glm_moe_dsa"
 
 
