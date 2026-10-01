@@ -41,6 +41,7 @@ from arctic_platform.common.registry import resolve_fn
 from arctic_platform.common.utils.batch import combine_metric_microbatches
 from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.rl.processors import grpo_mixed_v1_loss
+from arctic_platform.rl.processors import resolve_loss
 from arctic_platform.rl.processors.causal_cross_entropy import causal_cross_entropy_loss
 from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
 from arctic_platform.rl.processors.cortex_grpo import cortex_grpo_loss
@@ -492,6 +493,29 @@ class TestTrioPrecedenceIsPerLossName(TestCasePlus):
         conflicting = self._call(grpo_mixed_v1_loss, config, context, mixed=True)
         config_only = self._call(grpo_mixed_v1_loss, config, {}, mixed=True)
         self.assertAlmostEqual(conflicting, config_only, places=6)
+
+    def test_cortex_conflict_fails_preflight_before_the_forward(self):
+        context = {
+            "input_ids": torch.ones(1, 2, dtype=torch.long),
+            "old_log_probs_shifted": torch.zeros(1, 2),
+            "advantages": torch.ones(1, 2),
+            "loss_mask": torch.ones(1, 2, dtype=torch.bool),
+            "batch_num_tokens": 4.0,
+            "dp_size": 1,
+        }
+        config = {"batch_num_tokens": 60.0}
+        conflict = r"conflicting batch_num_tokens: context=4.0 config=60.0"
+        for name in ("grpo", "grpo_echo_v1", "grpo_mixed_v1"):
+            loss = resolve_loss(name)
+            reduction = getattr(LOSS_FNS[name], PACKED_LOSS_REDUCTION_ATTR)
+            request = {"kwargs": dict(context), "processing": {"loss_fn": name, "config": dict(config)}}
+            with self.subTest(name=name, stage="batching"), self.assertRaisesRegex(ValueError, conflict):
+                loss.batching_callback(request)
+            with self.subTest(name=name, stage="validation"), self.assertRaisesRegex(ValueError, conflict):
+                loss.validation_callback(dict(context), dict(config))
+            with self.subTest(name=name, stage="packed_reduction"), self.assertRaisesRegex(ValueError, conflict):
+                reduction([dict(context)], dict(config), name)
+        resolve_loss("ap_grpo").validation_callback(dict(context), dict(config))
 
     def test_names_agree_when_only_one_side_supplies_the_trio(self):
         config = {"batch_num_tokens": 6, "dp_size": 2}

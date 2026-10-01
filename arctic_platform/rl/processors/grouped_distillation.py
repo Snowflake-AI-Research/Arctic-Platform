@@ -43,6 +43,7 @@ from .compute_logprobs import _LOGPROB_SLICE_BYTES
 from .functional import _resolve_dp_size
 from .functional import canonicalize_loss_mask
 from .functional import resolve_global_loss_scale
+from .grpo import _CORTEX_GRPO_VARIANT
 from .grpo import _raise_synchronized_validation_error
 from .grpo import _request_grpo_contexts
 from .grpo import _validate_plain_grpo_context
@@ -893,10 +894,23 @@ class GroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         return loss, metrics
 
 
+def _policy_config(config: dict) -> dict:
+    """The config the plain ``grpo`` policy loss sees: this class owns the KD keys."""
+    return {key: value for key, value in config.items() if key not in _GRPO_DISTILLATION_CONFIG_KEYS}
+
+
+def _policy_request(request: dict) -> dict:
+    processing = request.get("processing")
+    if not isinstance(processing, dict) or not isinstance(processing.get("config"), dict):
+        return request
+    return {**request, "processing": {**processing, "config": _policy_config(processing["config"])}}
+
+
 class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
     """Existing ``grpo`` policy behavior plus an optional grouped KD term."""
 
     name = "grpo"
+    grpo_variant = _CORTEX_GRPO_VARIANT
     capabilities = frozenset({REQUIRES_ALIGNED_TOKEN_LOGPROBS, PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG})
     metric_names = _GRPO_DISTILLATION_METRICS
 
@@ -923,7 +937,7 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         request_contexts = _request_grpo_contexts(request)
         has_policy_request = any(torch.is_tensor(context.get("input_ids")) for context in request_contexts)
         if callback is not None and has_policy_request:
-            callback(request)
+            callback(_policy_request(request))
         processing = request.get("processing")
         if not isinstance(processing, dict):
             return
@@ -976,7 +990,7 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
                         f"this worker's kd_mask sum {local_weight_sum} exceeds kd_batch_num_tokens={kd.weight_sum}"
                     )
             if has_policy_request:
-                _validate_plain_grpo_context(context, config)
+                _validate_plain_grpo_context(context, _policy_config(config), self.grpo_variant)
         except ValueError as caught:
             error = caught
         reference = context.get("input_ids")
@@ -993,7 +1007,7 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
     ):
         legacy = LOSS_FNS[self.name]
         resolver = getattr(legacy, "_arctic_packed_loss_reduction")
-        reduction = resolver(microbatches, config, loss_fn_name)
+        reduction = resolver(microbatches, _policy_config(config), loss_fn_name)
         if len(microbatches) > 1 and not reduction.loss_is_additive and resolve_kd_term(config) is not None:
             raise ValueError(
                 "kd_coef > 0 across multiple packed microbatches requires an additive policy reduction "
@@ -1009,7 +1023,7 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         config: dict,
         device: str,
     ) -> tuple[torch.Tensor, dict]:
-        loss, metrics = LOSS_FNS[self.name](model_outputs, batch, meta, config, device)
+        loss, metrics = LOSS_FNS[self.name](model_outputs, batch, meta, _policy_config(config), device)
         context = _validation_context(_context(batch, meta))
         kd = resolve_kd_term(config, context)
         if kd is None:

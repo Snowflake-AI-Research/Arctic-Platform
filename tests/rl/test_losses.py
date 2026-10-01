@@ -36,6 +36,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from arctic_platform.common.registry import LOSS_FNS
+from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.common.utils.batch import promote_batch_dim_to_batch
 from arctic_platform.rl.processors import resolve_loss
@@ -47,6 +48,7 @@ from arctic_platform.rl.processors.functional import kl_penalty
 from arctic_platform.rl.processors.functional import masked_normalization
 from arctic_platform.rl.processors.functional import ppo_actor_loss_fn
 from arctic_platform.rl.processors.functional import sapo_loss_fn
+from arctic_platform.rl.processors.grpo import _AP_GRPO_VARIANT
 from arctic_platform.rl.processors.grpo import PROX_APPROX_METHOD_LINEAR
 from arctic_platform.rl.processors.grpo import PROX_APPROX_METHOD_LOGLINEAR
 from arctic_platform.rl.processors.grpo import PROX_APPROX_METHOD_ROLLOUT
@@ -797,7 +799,10 @@ class TestMigratedGrpo(TestCasePlus):
                     "cpu",
                 )
         for invalid_entropy in (None, False, "0", float("nan"), 0.1):
-            with self.subTest(invalid_entropy=invalid_entropy), self.assertRaisesRegex(ValueError, "does not support"):
+            with (
+                self.subTest(invalid_entropy=invalid_entropy),
+                self.assertRaisesRegex(ValueError, "does not support config entropy_coeff="),
+            ):
                 LOSS_FNS["ap_grpo_mixed_v1"](
                     outputs,
                     {**context, "nll_mask": context["loss_mask"]},
@@ -809,12 +814,20 @@ class TestMigratedGrpo(TestCasePlus):
                     },
                     "cpu",
                 )
-        with self.assertRaisesRegex(ValueError, "requires CISPO"):
+        with self.assertRaisesRegex(ValueError, "got use_cispo_loss='true' is_weight_clip_max=2.0"):
             LOSS_FNS["ap_grpo_mixed_v1"](
                 outputs,
                 {**context, "nll_mask": context["loss_mask"]},
                 {},
                 {"use_cispo_loss": "true", "is_weight_clip_max": 2.0},
+                "cpu",
+            )
+        with self.assertRaisesRegex(ValueError, "importance_sampling_level='token', got 'sequence'"):
+            LOSS_FNS["ap_grpo_mixed_v1"](
+                outputs,
+                {**context, "nll_mask": context["loss_mask"]},
+                {},
+                {"use_cispo_loss": True, "is_weight_clip_max": 2.0, "importance_sampling_level": "sequence"},
                 "cpu",
             )
 
@@ -827,8 +840,101 @@ class TestMigratedGrpo(TestCasePlus):
             [microbatch, microbatch],
             {"use_cispo_loss": True, "ratio_m2_threshold": 0.1},
             "ap_grpo",
+            variant=_AP_GRPO_VARIANT,
         )
         self.assertEqual(len(reduction.loss_scales), 2)
+
+    def test_plain_grpo_rejects_unknown_config_keys_by_name(self):
+        values = torch.tensor([[-1.0, -1.0]])
+        context = {
+            "input_ids": torch.ones((1, 2), dtype=torch.long),
+            "old_log_probs_shifted": values,
+            "advantages": torch.ones_like(values),
+            "loss_mask": torch.ones_like(values, dtype=torch.bool),
+        }
+        for name in ("ap_grpo", "grpo"):
+            loss = resolve_loss(name)
+            for key in ("teacher_tao", "kd_typo", "metric_loss_count"):
+                config = {"eps_clip": 0.2, key: 1.0}
+                match = rf"Unknown config keys for loss_fn '{name}': \['{key}'\]"
+                request = {"kwargs": dict(context), "processing": {"loss_fn": name, "config": dict(config)}}
+                with self.subTest(name=name, key=key, stage="batching"), self.assertRaisesRegex(ValueError, match):
+                    loss.batching_callback(request)
+                with self.subTest(name=name, key=key, stage="validation"), self.assertRaisesRegex(ValueError, match):
+                    loss.validation_callback(dict(context), dict(config))
+                with self.subTest(name=name, key=key, stage="loss"), self.assertRaisesRegex(ValueError, match):
+                    loss.loss({"logprobs": values}, dict(context), {}, dict(config), "cpu")
+        # kd_coef belongs to the grouped ``grpo`` contract only.
+        with self.assertRaisesRegex(ValueError, r"Unknown config keys for loss_fn 'ap_grpo': \['kd_coef'\]"):
+            resolve_loss("ap_grpo").validation_callback(dict(context), {"kd_coef": 0.1})
+
+    def test_plain_grpo_accepts_every_client_sent_config(self):
+        values = torch.tensor([[-1.0, -1.0]])
+        context = {
+            "input_ids": torch.ones((1, 2), dtype=torch.long),
+            "old_log_probs_shifted": values,
+            "advantages": torch.ones_like(values),
+            "loss_mask": torch.ones_like(values, dtype=torch.bool),
+            "teacher_log_probs_shifted": values,
+        }
+        common = {"prox_logp_method": "recompute", "importance_sampling_level": "token", "current_version": 3}
+        teacher = {"teacher_tau": 0.5, "teacher_clip": 1.0, "teacher_clip_negative": 0.25}
+        client_configs = {
+            # PrimeRL build_grpo_loss_config: CISPO and PPO, each with and without the teacher term.
+            "primerl_cispo": {
+                "use_cispo_loss": True,
+                "eps_clip": 0.2,
+                "is_weight_clip_max": 5.0,
+                "loss_agg_mode": "prompt-mean",
+                **common,
+            },
+            "primerl_ppo": {"eps_clip": 0.2, "loss_agg_mode": "token-mean", **common},
+            # DSS coordinator stamping of the global loss scale.
+            "dss_scale": {"batch_num_tokens": 2.0, "global_batch_size": 1, "dp_size": 1},
+            # cortex-training / Arctic Platform recipes and the cortex adapter defaults.
+            "recipes": {"eps_clip": 0.2, "loss_agg_mode": "token-mean", "entropy_coeff": 0.0, "global_batch_size": 1},
+            "ratio_controls": {"use_cispo_loss": True, "is_weight_clip_max": 5.0, "ratio_stats": True},
+        }
+        client_configs["primerl_cispo_teacher"] = {**client_configs["primerl_cispo"], **teacher}
+        client_configs["primerl_ppo_teacher"] = {**client_configs["primerl_ppo"], **teacher}
+        for name in ("ap_grpo", "grpo"):
+            for client, config in client_configs.items():
+                with self.subTest(name=name, client=client):
+                    resolve_loss(name).validation_callback(dict(context), dict(config))
+
+    def test_ratio_m2_under_sequence_parallelism_fails_preflight(self):
+        context = {
+            "input_ids": torch.ones((1, 2), dtype=torch.long),
+            "old_log_probs_shifted": torch.zeros((1, 2)),
+            "advantages": torch.ones((1, 2)),
+            "loss_mask": torch.ones((1, 2), dtype=torch.bool),
+        }
+        config = {"use_cispo_loss": True, "is_weight_clip_max": 2.0, "ratio_m2_threshold": 0.1}
+
+        def raise_local_error(error, _reference):
+            if error is not None:
+                raise error
+
+        # The fake SP group only feeds the local check; the cross-rank error sync is stubbed out.
+        with (
+            patch("arctic_platform.rl.processors.grpo._get_sequence_parallel_group", return_value=object()),
+            patch("arctic_platform.rl.processors.grpo._raise_synchronized_validation_error", raise_local_error),
+            patch(
+                "arctic_platform.rl.processors.grouped_distillation._raise_synchronized_validation_error",
+                raise_local_error,
+            ),
+        ):
+            for name in ("ap_grpo", "grpo", "ap_grpo_echo_v1", "grpo_echo_v1"):
+                reduction = getattr(LOSS_FNS[name], PACKED_LOSS_REDUCTION_ATTR)
+                for stage, check in (
+                    ("validation", lambda: resolve_loss(name).validation_callback(dict(context), dict(config))),
+                    ("packed_reduction", lambda: reduction([dict(context)], dict(config), name)),
+                ):
+                    with (
+                        self.subTest(name=name, stage=stage),
+                        self.assertRaisesRegex(ValueError, "does not support sequence parallelism"),
+                    ):
+                        check()
 
     def test_new_columns_move_from_meta_to_shardable_batch(self):
         meta = {
@@ -989,6 +1095,42 @@ class TestMigratedGrpo(TestCasePlus):
         loss.backward()
         torch_assert_close(values.grad, torch.tensor([[-0.5, 0.0]]))
 
+    def test_teacher_clip_negative_sets_an_asymmetric_lower_clip(self):
+        # Teacher-minus-policy log ratios 3.0, -1.0 and 0.25 against teacher_clip=2.0.
+        context = {
+            "input_ids": torch.ones((1, 3), dtype=torch.long),
+            "old_log_probs_shifted": torch.full((1, 3), -1.0),
+            "advantages": torch.zeros((1, 3)),
+            "loss_mask": torch.ones((1, 3), dtype=torch.bool),
+            "teacher_log_probs_shifted": torch.tensor([[2.0, -2.0, -0.75]]),
+        }
+        for clip_negative, clipped_terms in ((0.5, [2.0, -0.5, 0.25]), (None, [2.0, -1.0, 0.25])):
+            config = {"teacher_tau": 1.0, "teacher_clip": 2.0}
+            if clip_negative is not None:
+                config["teacher_clip_negative"] = clip_negative
+            values = torch.full((1, 3), -1.0, requires_grad=True)
+            with self.subTest(teacher_clip_negative=clip_negative):
+                loss, metrics = grpo_loss({"logprobs": values}, dict(context), {}, config, "cpu")
+                # Unit ratios, so the token-mean PPO loss is minus the mean clipped teacher term.
+                self.assertAlmostEqual(loss.item(), -sum(clipped_terms) / 3, places=6)
+                self.assertAlmostEqual(metrics["teacher_log_ratio_sum"], 2.25, places=6)
+                self.assertAlmostEqual(metrics["teacher_clipped_log_ratio_sum"], sum(clipped_terms), places=6)
+                loss.backward()
+                torch_assert_close(values.grad, -torch.tensor([clipped_terms]) / 3)
+
+        validation_callback = resolve_loss("ap_grpo").validation_callback
+        for invalid in (-0.5, float("nan"), float("inf"), True, "0.5"):
+            config = {"teacher_tau": 1.0, "teacher_clip": 2.0, "teacher_clip_negative": invalid}
+            for stage, check in (
+                ("validation", lambda: validation_callback(dict(context), dict(config))),
+                ("loss", lambda: grpo_loss({"logprobs": torch.full((1, 3), -1.0)}, dict(context), {}, config, "cpu")),
+            ):
+                with (
+                    self.subTest(teacher_clip_negative=invalid, stage=stage),
+                    self.assertRaisesRegex(ValueError, "teacher_clip_negative must be a finite non-negative number"),
+                ):
+                    check()
+
     def test_teacher_term_rejects_broadcastable_or_non_floating_inputs(self):
         values = torch.full((2, 2), -1.0)
         base_context = {
@@ -1104,8 +1246,11 @@ class TestMigratedGrpo(TestCasePlus):
             grpo_loss(outputs, context, {}, {}, "cpu")
         with self.assertRaisesRegex(ValueError, "nll_mask requires"):
             LOSS_FNS["grpo"](outputs, context, {}, {}, "cpu")
-        with self.assertRaisesRegex(ValueError, "loss_fn='grpo_mixed_v1'"):
-            _grpo_packed_loss_reduction([context], {}, "grpo")
+        # The hint comes from the registration, not from the requested name, so aliases get the right one.
+        for registered, mixed_name in (("grpo", "grpo_mixed_v1"), ("ap_grpo", "ap_grpo_mixed_v1")):
+            reduction = getattr(LOSS_FNS[registered], PACKED_LOSS_REDUCTION_ATTR)
+            with self.subTest(registered=registered), self.assertRaisesRegex(ValueError, f"loss_fn='{mixed_name}'"):
+                reduction([context], {}, "some.dotted.alias")
 
     def test_mixed_rejects_behavioral_importance_sampling_inputs(self):
         values = torch.tensor([[-1.0, -1.0]])
@@ -1117,11 +1262,19 @@ class TestMigratedGrpo(TestCasePlus):
         }
         config = {"use_cispo_loss": True, "is_weight_clip_max": 5.0}
         for key, value in (
+            ("use_sapo_loss", True),
+            ("use_decoupled_loss", True),
+            ("use_kl_loss", True),
+            ("m2_threshold", 0.1),
+            ("c_clip", 3.0),
             ("behav_imp_weight_cap", 1.5),
             ("current_version", 2),
             ("prox_logp_method", "loglinear"),
         ):
-            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "decoupled"):
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(ValueError, f"does not support config {key}={value!r}"),
+            ):
                 LOSS_FNS["ap_grpo_mixed_v1"](
                     {"logprobs": values},
                     context,
@@ -1129,14 +1282,20 @@ class TestMigratedGrpo(TestCasePlus):
                     {**config, key: value},
                     "cpu",
                 )
-        with self.assertRaisesRegex(ValueError, "decoupled"):
-            LOSS_FNS["ap_grpo_mixed_v1"](
-                {"logprobs": values},
-                {**context, "prox_logp_shifted": values + 1.0},
-                {},
-                config,
-                "cpu",
-            )
+        for key in ("prox_logp_shifted", "rollout_is_weights"):
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(
+                    ValueError, rf"does not support context column {key}, got tensor of shape \(1, 2\)"
+                ),
+            ):
+                LOSS_FNS["ap_grpo_mixed_v1"](
+                    {"logprobs": values},
+                    {**context, key: values + 1.0},
+                    {},
+                    config,
+                    "cpu",
+                )
 
     def test_unprefixed_echo_accepts_ratio_telemetry(self):
         values = torch.tensor([[-1.0, -1.0]])

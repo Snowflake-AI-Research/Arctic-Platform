@@ -180,8 +180,28 @@ to include the merged `batch` in the response (TRL server-side-loss).
 Metrics use the shared `{name}.sum` / `{name}.tokens` pairing; see
 [`common.md`](common.md#metric-aggregation).
 
+With `sequence_loss_weights`, `loss_agg_mode="prompt-mean"` computes
+`dp_size * sum(sequence_weight * sequence_loss_sum / sequence_token_count)`,
+offsetting DeepSpeed's DP gradient averaging as the other modes do. Earlier
+releases omitted `dp_size` on this weighted path, so with `dp_size > 1` its
+gradient scale is now `dp_size` times larger; the unweighted
+`prompt_group_ids` path already applied it. In this repository's integrations
+(verl, SkyRL, the Cortex adapter) and recipes, nothing sends
+`sequence_loss_weights`; the PrimeRL Arctic adapter does, for prompt-mean
+only.
+
 The registered `ap_grpo` loss accepts `teacher_tau` with a positive `teacher_clip`
 and prediction-aligned `teacher_log_probs_shifted` for the GRPO teacher term.
+The term clamps the teacher-minus-policy log ratio to
+`[-teacher_clip_negative, teacher_clip]`; `teacher_clip_negative` is an
+optional finite non-negative lower-clip magnitude that defaults to
+`teacher_clip`. `ap_grpo` accepts only the baseline GRPO config keys
+(`_GRPO_CONFIG_DEFAULTS` in `grpo.py`) and the ratio-control keys below; the
+unprefixed `grpo` additionally accepts its grouped-distillation `kd_coef`,
+`kd_divergence`, `kd_beta`, and `kd_batch_num_tokens` keys. Any other key is
+rejected by name in the batching and validation callbacks and again in the
+loss, so a misspelled key such as `teacher_tao` fails instead of training
+without its term.
 `ap_grpo_echo_v1` requires `aux_ce_weight` and `echo_global_num_sequences`;
 its `echo_observation_token_counts` batch column supplies the full observation
 denominator when sequence parallelism splits observation tokens, and the
@@ -193,9 +213,18 @@ support CISPO-only ratio gates (`ratio_mask_bounds_pos` / `_neg`,
 objective. `ratio_m2_threshold` requires one packed model call per worker and
 must be positive; it does not support sequence parallelism because M2PO
 ranking needs one complete token set. `ap_grpo_mixed_v1` requires CISPO,
-`is_weight_clip_max`, and the
+`is_weight_clip_max`, token-level `importance_sampling_level`, and the
 prediction-aligned `nll_mask` column; it intentionally rejects ratio-mask
-options to avoid applying policy-only penalties to NLL tokens.
+options to avoid applying policy-only penalties to NLL tokens. It accepts only
+the baseline GRPO config keys (`_GRPO_CONFIG_DEFAULTS` in `grpo.py`), so ECHO
+keys and any unrecognized key are rejected. It also rejects `use_sapo_loss`,
+`use_decoupled_loss`, `use_kl_loss`, an `entropy_coeff` other than `0.0`
+(including `null`; omit it instead), any non-null `m2_threshold`, `c_clip`,
+`behav_imp_weight_cap` or `current_version`, `prox_logp_method` other than
+`recompute`, and the `prox_logp_shifted` and `rollout_is_weights` context
+columns. Each rejection names the offending key and the received value; the
+CISPO and importance-sampling requirements also report what was received. The
+unprefixed `grpo_mixed_v1` applies the same rules.
 
 ## ZoRRo Train
 

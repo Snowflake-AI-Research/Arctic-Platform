@@ -338,7 +338,9 @@ def test_grpo_kd_off_matches_legacy_function_exactly():
     second = first.detach().clone().requires_grad_(True)
 
     class_loss, class_metrics = resolve_loss("grpo").loss({"logprobs": first}, {}, context, config, "cpu")
-    legacy_loss, legacy_metrics = LOSS_FNS["grpo"]({"logprobs": second}, {}, context, config, "cpu")
+    # The registered policy function owns no KD keys; the grouped class strips them before delegating.
+    policy_config = {key: value for key, value in config.items() if key != "kd_coef"}
+    legacy_loss, legacy_metrics = LOSS_FNS["grpo"]({"logprobs": second}, {}, context, policy_config, "cpu")
     class_loss.backward()
     legacy_loss.backward()
 
@@ -354,8 +356,6 @@ def test_grpo_kd_off_matches_legacy_function_exactly():
         {"kd_beta": "bad"},
         {"kd_coef": 0.0, "kd_divergence": "bogus"},
         {"kd_divergence": "bogus"},
-        {"kd_coef": 0.0, "kd_divergance": "jsd"},
-        {"kd_typo": 1},
     ],
 )
 def test_grpo_kd_off_bypasses_other_kd_only_validation_and_delegates(monkeypatch, kd_config):
@@ -374,7 +374,7 @@ def test_grpo_kd_off_bypasses_other_kd_only_validation_and_delegates(monkeypatch
     expected_metrics = {"legacy": 1.0}
 
     def legacy_loss(model_outputs, batch, meta, received_config, device):
-        assert received_config is config
+        assert received_config == _POLICY
         return expected_loss, expected_metrics
 
     monkeypatch.setitem(LOSS_FNS, "grpo", legacy_loss)
@@ -384,6 +384,15 @@ def test_grpo_kd_off_bypasses_other_kd_only_validation_and_delegates(monkeypatch
     assert output_keys == []
     assert loss is expected_loss
     assert metrics is expected_metrics
+
+
+@pytest.mark.parametrize("kd_config", [{"kd_coef": 0.0, "kd_divergance": "jsd"}, {"kd_typo": 1}])
+def test_grpo_rejects_misspelled_kd_keys_even_with_kd_off(kd_config):
+    frame = _frame()
+    context = {key: frame[key] for key in ("input_ids", "loss_mask")}
+    typo = next(key for key in kd_config if key != "kd_coef")
+    with pytest.raises(ValueError, match=rf"Unknown config keys for loss_fn 'grpo': \['{typo}'\]"):
+        resolve_loss("grpo").validation_callback(context, {**_POLICY, **kd_config})
 
 
 def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
@@ -477,7 +486,7 @@ def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
     ],
 )
 def test_grpo_grouped_batching_delegates_structured_request_preflight(request_payload):
-    with pytest.raises(ValueError, match="nll_mask requires a mixed GRPO loss"):
+    with pytest.raises(ValueError, match="nll_mask requires loss_fn='grpo_mixed_v1'"):
         resolve_loss("grpo").batching_callback(request_payload)
 
 
@@ -678,7 +687,7 @@ def test_grpo_batching_and_objective_share_canonical_underflowed_weights():
         {"logprobs": legacy_logprobs},
         {},
         context,
-        config,
+        {key: value for key, value in config.items() if not key.startswith("kd_")},
         "cpu",
     )
     class_loss.backward()

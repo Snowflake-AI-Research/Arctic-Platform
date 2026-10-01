@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from enum import Enum
+from functools import partial
 from itertools import pairwise
 from typing import Any
 from typing import Tuple
@@ -42,10 +44,10 @@ from .functional import _validate_loss_denominators
 from .functional import agg_loss
 from .functional import canonicalize_loss_mask
 from .functional import cispo_actor_loss_fn
-from .functional import dp_loss_multiplier
 from .functional import echo_env_prediction_loss_fn
 from .functional import kl_penalty
 from .functional import ppo_actor_loss_fn
+from .functional import resolve_global_loss_scale
 from .functional import sapo_loss_fn
 from .packed_reduction import PackedLossReduction
 from .packed_reduction import additive_packed_loss_reduction
@@ -499,8 +501,7 @@ def _internal_grpo_loss_fn(
             raise ValueError("ratio-mask keys act on the CISPO policy term; they need use_cispo_loss=True.")
         ratio_m2_keep = None
         if ratio_masks is not None and ratio_masks.m2_threshold is not None:
-            if _get_sequence_parallel_group() is not None:
-                raise ValueError("ratio_m2_threshold does not support sequence parallelism")
+            _reject_sequence_parallel_m2po(ratio_masks)
             ratio_m2_keep = _apply_m2po_masking(old_logp, logprobs.detach(), loss_mask, ratio_masks.m2_threshold)
         if use_cispo_loss and c_clip is not None:
             raise ValueError("c_clip is not supported with use_cispo_loss=True.")
@@ -665,7 +666,7 @@ def _internal_grpo_loss_fn(
             )
         # The aux term uses the same DP compensation as the policy term so
         # the echo-to-policy ratio equals the configured aux_ce_weight.
-        echo_dp_multiplier = dp_loss_multiplier(loss_agg_mode, sequence_loss_weights, dp_size)
+        echo_dp_multiplier = dp_size
         env_loss, env_stat = echo_env_prediction_loss_fn(
             logprobs=logprobs,
             sft_mask=sft_mask,
@@ -720,11 +721,13 @@ def _internal_grpo_loss_fn(
 # ---------------------------------------------------------------------------
 # GRPO config contract
 # ---------------------------------------------------------------------------
-# One table per contract, ``key -> default``. Both the kwargs handed to
-# :func:`_internal_grpo_loss_fn` and the strict ``*_echo_v1`` key schema are
-# derived from these tables, so the accepted keys and their defaults cannot
-# drift apart. Processor configs arrive as free-form dicts from external
-# clients (verl, SkyRL, TRL, the Cortex zone), and a key present with an
+# One table per contract, ``key -> default``. The kwargs handed to
+# :func:`_internal_grpo_loss_fn` and the accepted-key schemas of every GRPO
+# loss are derived from these tables: the plain ``ap_grpo`` / ``grpo`` losses
+# (with the ratio-control keys), ``*_echo_v1`` and ``*_mixed_v1`` all reject
+# keys outside them, so the accepted keys and their defaults cannot drift
+# apart. Processor configs arrive as free-form dicts from external clients
+# (verl, SkyRL, TRL, the Cortex zone), and a key present with an
 # explicit ``null`` keeps ``None`` rather than falling back to the default —
 # the math reads ``None`` as "feature off", and changing that would alter
 # validated runs.
@@ -1011,6 +1014,11 @@ ECHO_SUMMED_METRICS = frozenset(
 )
 
 
+def _reject_sequence_parallel_m2po(ratio_masks: RatioMasks | None) -> None:
+    if ratio_masks is not None and ratio_masks.m2_threshold is not None and _get_sequence_parallel_group() is not None:
+        raise ValueError("ratio_m2_threshold does not support sequence parallelism")
+
+
 def _grpo_model_call_count_callback(model_call_counts: Sequence[int | None], config: dict) -> None:
     if config.get("ratio_m2_threshold") is None:
         return
@@ -1052,11 +1060,42 @@ def _active_sequence_count(microbatch: dict, loss_mask: torch.Tensor) -> float:
     return float(bool(loss_mask.any().item()))
 
 
+@dataclass(frozen=True)
+class _GrpoVariant:
+    """Contract of one GRPO loss family, bound into each registration.
+
+    ``plain_name``, ``echo_name`` and ``mixed_name`` are the family's registered
+    names used in validation errors. ``context_scale_wins`` selects the Cortex contract, where
+    a request-context ``dp_size`` / ``batch_num_tokens`` / ``global_batch_size``
+    wins and a different explicit config value fails preflight validation.
+    """
+
+    plain_name: str
+    echo_name: str
+    mixed_name: str
+    context_scale_wins: bool
+
+
+_AP_GRPO_VARIANT = _GrpoVariant("ap_grpo", "ap_grpo_echo_v1", "ap_grpo_mixed_v1", context_scale_wins=False)
+_CORTEX_GRPO_VARIANT = _GrpoVariant("grpo", "grpo_echo_v1", "grpo_mixed_v1", context_scale_wins=True)
+
+
+def _reject_nll_mask(context: dict, variant: _GrpoVariant) -> None:
+    if "nll_mask" in context:
+        raise ValueError(f"nll_mask requires loss_fn='{variant.mixed_name}'")
+
+
+def _validate_grpo_scale(context: dict, config: dict, variant: _GrpoVariant) -> None:
+    if variant.context_scale_wins:
+        resolve_global_loss_scale(context, config)
+
+
 def _local_grpo_packed_loss_reduction(
     microbatches: Sequence[dict],
     config: dict,
     loss_fn_name: str,
     *,
+    variant: _GrpoVariant,
     mixed: bool = False,
     echo: bool = False,
 ) -> PackedLossReduction:
@@ -1064,15 +1103,14 @@ def _local_grpo_packed_loss_reduction(
     ratio_masks = RatioMasks.from_config(config)
     if ratio_masks is not None and not config.get("use_cispo_loss"):
         raise ValueError("ratio-mask keys act on the CISPO policy term; they need use_cispo_loss=True.")
+    _reject_sequence_parallel_m2po(ratio_masks)
     for microbatch, mask in zip(microbatches, masks):
+        _validate_grpo_scale(microbatch, config, variant)
         if mixed:
-            _validate_mixed_config(microbatch, config)
+            _validate_mixed_config(microbatch, config, variant)
             _validate_nll_mask(microbatch["nll_mask"], mask)
-        elif "nll_mask" in microbatch:
-            leaf_name = loss_fn_name.rsplit(".", 1)[-1]
-            is_cortex = loss_fn_name.startswith("grpo") or leaf_name.startswith("cortex_grpo")
-            mixed_name = "grpo_mixed_v1" if is_cortex else "ap_grpo_mixed_v1"
-            raise ValueError(f"nll_mask requires loss_fn='{mixed_name}'")
+        else:
+            _reject_nll_mask(microbatch, variant)
         _resolve_teacher_tau(config, microbatch)
     mode = _grpo_config_values(config)["loss_agg_mode"]
 
@@ -1147,6 +1185,7 @@ def _grpo_packed_loss_reduction(
     config: dict,
     loss_fn_name: str,
     *,
+    variant: _GrpoVariant,
     mixed: bool = False,
     echo: bool = False,
 ) -> PackedLossReduction:
@@ -1157,6 +1196,7 @@ def _grpo_packed_loss_reduction(
             microbatches,
             config,
             loss_fn_name,
+            variant=variant,
             mixed=mixed,
             echo=echo,
         )
@@ -1173,32 +1213,6 @@ def _grpo_packed_loss_reduction(
     _raise_synchronized_validation_error(error, reference)
     assert reduction is not None
     return reduction
-
-
-def _grpo_mixed_packed_loss_reduction(
-    microbatches: Sequence[dict],
-    config: dict,
-    loss_fn_name: str,
-) -> PackedLossReduction:
-    return _grpo_packed_loss_reduction(
-        microbatches,
-        config,
-        loss_fn_name,
-        mixed=True,
-    )
-
-
-def _grpo_echo_packed_loss_reduction(
-    microbatches: Sequence[dict],
-    config: dict,
-    loss_fn_name: str,
-) -> PackedLossReduction:
-    return _grpo_packed_loss_reduction(
-        microbatches,
-        config,
-        loss_fn_name,
-        echo=True,
-    )
 
 
 def _merge_distributed_config(config: dict, batch: dict, meta: dict) -> dict:
@@ -1288,8 +1302,9 @@ def _packed_grpo_validation_context(context: dict) -> dict:
     return normalized
 
 
-def _validate_grpo_context(context: dict, config: dict) -> tuple[dict, torch.Tensor]:
+def _validate_grpo_context(context: dict, config: dict, variant: _GrpoVariant) -> tuple[dict, torch.Tensor]:
     context = _packed_grpo_validation_context(context)
+    _validate_grpo_scale(context, config, variant)
     _validate_loss_denominators(config.get("batch_num_tokens"), config.get("global_batch_size"))
     mask = _grpo_preflight_mask(context)
     teacher_tau = _resolve_teacher_tau(config, context)
@@ -1302,17 +1317,27 @@ def _validate_grpo_context(context: dict, config: dict) -> tuple[dict, torch.Ten
                 "teacher_log_probs_shifted must exactly match prediction-aligned loss_mask shape, "
                 f"got {tuple(teacher_log_probs.shape)} and {tuple(mask.shape)}"
             )
-    RatioMasks.from_config(config)
+    _reject_sequence_parallel_m2po(RatioMasks.from_config(config))
     return context, mask
 
 
-def _validate_plain_grpo_context(context: dict, config: dict) -> None:
-    context, _ = _validate_grpo_context(context, config)
-    if "nll_mask" in context:
-        raise ValueError("nll_mask requires a mixed GRPO loss")
+def _validate_plain_config(config: dict, variant: _GrpoVariant) -> None:
+    """Reject config keys the plain objective would otherwise train without."""
     echo_keys = _ECHO_CONFIG_KEYS & set(config)
     if echo_keys:
-        raise ValueError(f"plain GRPO does not accept ECHO config keys {sorted(echo_keys)}")
+        raise ValueError(
+            f"loss_fn {variant.plain_name!r} does not accept ECHO config keys {sorted(echo_keys)} — request "
+            f"loss_fn {variant.echo_name!r}"
+        )
+    unknown_keys = set(config) - _GRPO_CONFIG_KEYS - RATIO_MASK_CONFIG_KEYS
+    if unknown_keys:
+        raise ValueError(f"Unknown config keys for loss_fn {variant.plain_name!r}: {sorted(unknown_keys)}")
+
+
+def _validate_plain_grpo_context(context: dict, config: dict, variant: _GrpoVariant) -> None:
+    context, _ = _validate_grpo_context(context, config, variant)
+    _reject_nll_mask(context, variant)
+    _validate_plain_config(config, variant)
 
 
 def _run_synchronized_grpo_validation(context: dict, config: dict, validator) -> None:
@@ -1329,24 +1354,28 @@ def _run_synchronized_grpo_validation(context: dict, config: dict, validator) ->
     _raise_synchronized_validation_error(error, reference)
 
 
-def _grpo_batching_callback(request: dict) -> None:
+def _grpo_batching_callback(request: dict, *, validator, variant: _GrpoVariant) -> None:
     config = _request_grpo_config(request)
     for context in _request_grpo_contexts(request):
-        _validate_plain_grpo_context(context, config)
+        validator(context, config, variant)
 
 
-def _grpo_validation_callback(context: dict, config: dict) -> None:
-    _run_synchronized_grpo_validation(context, config, _validate_plain_grpo_context)
+def _grpo_validation_callback(context: dict, config: dict, *, validator, variant: _GrpoVariant) -> None:
+    _run_synchronized_grpo_validation(context, config, partial(validator, variant=variant))
 
 
-@register_loss_fn(
-    "ap_grpo",
-    batching_callback=_grpo_batching_callback,
-    validation_callback=_grpo_validation_callback,
-    packed_loss_reduction=_grpo_packed_loss_reduction,
-    model_call_count_callback=_grpo_model_call_count_callback,
-    metrics_callback=_grpo_metrics_callback,
-)
+def _grpo_registration(variant: _GrpoVariant, validator, *, mixed: bool = False, echo: bool = False) -> dict:
+    """``register_loss_fn`` callbacks for one GRPO loss, with its variant bound rather than read from its name."""
+    return {
+        "batching_callback": partial(_grpo_batching_callback, validator=validator, variant=variant),
+        "validation_callback": partial(_grpo_validation_callback, validator=validator, variant=variant),
+        "packed_loss_reduction": partial(_grpo_packed_loss_reduction, variant=variant, mixed=mixed, echo=echo),
+        "model_call_count_callback": _grpo_model_call_count_callback,
+        "metrics_callback": _grpo_metrics_callback,
+    }
+
+
+@register_loss_fn("ap_grpo", **_grpo_registration(_AP_GRPO_VARIANT, _validate_plain_grpo_context))
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS, PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG)
 def grpo_loss(
     model_outputs: dict,
@@ -1357,46 +1386,49 @@ def grpo_loss(
 ) -> Tuple[torch.Tensor, dict]:
     """Plain GRPO/PPO contract — see :func:`_grpo_loss` for the full key set.
 
-    ECHO keys are rejected here on purpose: ``grpo`` keeps its historical
-    permissive config parsing (unknown keys ignored), under which a
-    misspelled ECHO key or an ECHO-unaware server would silently train the
-    baseline objective. ECHO therefore only activates through the strict,
-    versioned ``grpo_echo_v1`` contract below.
+    Only the baseline GRPO and ratio-control keys are accepted: an unknown or
+    misspelled key fails instead of silently training without its term. ECHO
+    keys get a pointer to the versioned ``ap_grpo_echo_v1`` contract.
     """
     config = _merge_distributed_config(config, batch, meta)
-    if "nll_mask" in _grpo_context(batch, meta):
-        raise ValueError("nll_mask requires loss_fn='ap_grpo_mixed_v1'")
-    echo_keys = _ECHO_CONFIG_KEYS & set(config)
-    if echo_keys:
-        raise ValueError(
-            f"loss_fn 'ap_grpo' does not accept ECHO config keys {sorted(echo_keys)} — request "
-            "loss_fn 'ap_grpo_echo_v1', whose strict schema fails loudly on typos and on servers "
-            "without ECHO support."
-        )
+    _reject_nll_mask(_grpo_context(batch, meta), _AP_GRPO_VARIANT)
+    _validate_plain_config(config, _AP_GRPO_VARIANT)
     return _grpo_loss(model_outputs, _grpo_context(batch, meta), config, device)
 
 
-def _validate_mixed_config(context: dict, config: dict) -> None:
+def _describe_context_value(value) -> str:
+    if torch.is_tensor(value):
+        return f"tensor of shape {tuple(value.shape)}"
+    return repr(value)
+
+
+def _validate_mixed_config(context: dict, config: dict, variant: _GrpoVariant) -> None:
+    name = variant.mixed_name
     ratio_keys = RATIO_MASK_CONFIG_KEYS & config.keys()
     if ratio_keys:
-        raise ValueError(f"grpo_mixed_v1 does not support ratio-mask keys: {sorted(ratio_keys)}")
+        raise ValueError(f"{name} does not support ratio-mask keys: {sorted(ratio_keys)}")
     unknown = set(config) - _GRPO_CONFIG_KEYS
     if unknown:
-        raise ValueError(f"Unknown config keys for grpo_mixed_v1: {sorted(unknown)}")
+        raise ValueError(f"Unknown config keys for {name}: {sorted(unknown)}")
     if context.get("nll_mask") is None:
-        raise ValueError("grpo_mixed_v1 requires nll_mask")
+        raise ValueError(f"{name} requires nll_mask")
+    use_cispo_loss = config.get("use_cispo_loss")
     cap = config.get("is_weight_clip_max")
     if (
-        config.get("use_cispo_loss") is not True
+        use_cispo_loss is not True
         or cap is None
         or isinstance(cap, bool)
         or not isinstance(cap, (int, float))
         or not math.isfinite(cap)
         or cap <= 0
     ):
-        raise ValueError("grpo_mixed_v1 requires CISPO and a finite positive is_weight_clip_max")
-    if config.get("importance_sampling_level", "token") != "token":
-        raise ValueError("grpo_mixed_v1 requires token importance sampling")
+        raise ValueError(
+            f"{name} requires use_cispo_loss=True and a finite positive is_weight_clip_max, "
+            f"got use_cispo_loss={use_cispo_loss!r} is_weight_clip_max={cap!r}"
+        )
+    importance_sampling_level = config.get("importance_sampling_level", "token")
+    if importance_sampling_level != "token":
+        raise ValueError(f"{name} requires importance_sampling_level='token', got {importance_sampling_level!r}")
     entropy_coeff = config.get("entropy_coeff", 0.0)
     invalid_entropy_coeff = (
         entropy_coeff is None
@@ -1405,35 +1437,31 @@ def _validate_mixed_config(context: dict, config: dict) -> None:
         or not math.isfinite(entropy_coeff)
         or entropy_coeff != 0.0
     )
-    unsupported = ("use_sapo_loss", "use_decoupled_loss", "use_kl_loss")
-    if (
-        any(config.get(key) for key in unsupported)
-        or invalid_entropy_coeff
-        or config.get("m2_threshold") is not None
-        or config.get("c_clip") is not None
-        or config.get("behav_imp_weight_cap") is not None
-        or config.get("current_version") is not None
-        or config.get("prox_logp_method", PROX_LOGP_METHOD_RECOMPUTE) != PROX_LOGP_METHOD_RECOMPUTE
-        or context.get("prox_logp_shifted") is not None
-        or context.get("rollout_is_weights") is not None
-    ):
-        raise ValueError("grpo_mixed_v1 does not support SAPO, decoupled/M2PO/RIS, reference KL or entropy")
+    if invalid_entropy_coeff:
+        raise ValueError(f"{name} does not support config entropy_coeff={entropy_coeff!r}; it must be 0.0 or omitted")
+    prox_logp_method = config.get("prox_logp_method", PROX_LOGP_METHOD_RECOMPUTE)
+    if prox_logp_method != PROX_LOGP_METHOD_RECOMPUTE:
+        raise ValueError(
+            f"{name} does not support config prox_logp_method={prox_logp_method!r}; "
+            f"it must be {PROX_LOGP_METHOD_RECOMPUTE!r}"
+        )
+    for key in ("use_sapo_loss", "use_decoupled_loss", "use_kl_loss"):
+        if config.get(key):
+            raise ValueError(f"{name} does not support config {key}={config[key]!r}")
+    for key in ("m2_threshold", "c_clip", "behav_imp_weight_cap", "current_version"):
+        if config.get(key) is not None:
+            raise ValueError(f"{name} does not support config {key}={config[key]!r}; omit it or send null")
+    for key in ("prox_logp_shifted", "rollout_is_weights"):
+        if context.get(key) is not None:
+            raise ValueError(
+                f"{name} does not support context column {key}, got {_describe_context_value(context[key])}"
+            )
 
 
-def _validate_mixed_grpo_context(context: dict, config: dict) -> None:
-    context, loss_mask = _validate_grpo_context(context, config)
-    _validate_mixed_config(context, config)
+def _validate_mixed_grpo_context(context: dict, config: dict, variant: _GrpoVariant) -> None:
+    context, loss_mask = _validate_grpo_context(context, config, variant)
+    _validate_mixed_config(context, config, variant)
     _validate_nll_mask(context["nll_mask"], loss_mask)
-
-
-def _grpo_mixed_batching_callback(request: dict) -> None:
-    config = _request_grpo_config(request)
-    for context in _request_grpo_contexts(request):
-        _validate_mixed_grpo_context(context, config)
-
-
-def _grpo_mixed_validation_callback(context: dict, config: dict) -> None:
-    _run_synchronized_grpo_validation(context, config, _validate_mixed_grpo_context)
 
 
 def _validate_echo_config(config: dict, loss_fn_name: str) -> None:
@@ -1460,11 +1488,10 @@ def _validate_echo_config(config: dict, loss_fn_name: str) -> None:
         raise ValueError(f"Invalid echo_batch_denominator: {config.get('echo_batch_denominator')!r}") from None
 
 
-def _validate_echo_grpo_context(context: dict, config: dict) -> None:
-    context, loss_mask = _validate_grpo_context(context, config)
-    _validate_echo_config(config, "grpo_echo_v1")
-    if "nll_mask" in context:
-        raise ValueError("nll_mask requires a mixed GRPO loss")
+def _validate_echo_grpo_context(context: dict, config: dict, variant: _GrpoVariant) -> None:
+    context, loss_mask = _validate_grpo_context(context, config, variant)
+    _validate_echo_config(config, variant.echo_name)
+    _reject_nll_mask(context, variant)
     sft_mask = context.get("sft_mask")
     observation_mask = context.get("echo_observation_mask")
     if sft_mask is None or observation_mask is None:
@@ -1500,24 +1527,7 @@ def _validate_echo_grpo_context(context: dict, config: dict) -> None:
         _full_observation_denominator(observation_token_counts, visible_observation_counts)
 
 
-def _grpo_echo_batching_callback(request: dict) -> None:
-    config = _request_grpo_config(request)
-    for context in _request_grpo_contexts(request):
-        _validate_echo_grpo_context(context, config)
-
-
-def _grpo_echo_validation_callback(context: dict, config: dict) -> None:
-    _run_synchronized_grpo_validation(context, config, _validate_echo_grpo_context)
-
-
-@register_loss_fn(
-    "ap_grpo_mixed_v1",
-    batching_callback=_grpo_mixed_batching_callback,
-    validation_callback=_grpo_mixed_validation_callback,
-    packed_loss_reduction=_grpo_mixed_packed_loss_reduction,
-    model_call_count_callback=_grpo_model_call_count_callback,
-    metrics_callback=_grpo_metrics_callback,
-)
+@register_loss_fn("ap_grpo_mixed_v1", **_grpo_registration(_AP_GRPO_VARIANT, _validate_mixed_grpo_context, mixed=True))
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS, PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG)
 def grpo_mixed_v1_loss(
     model_outputs: dict,
@@ -1529,17 +1539,13 @@ def grpo_mixed_v1_loss(
     """CISPO on policy tokens and literal NLL on prediction-aligned ``nll_mask`` tokens."""
     config = _merge_distributed_config(config, batch, meta)
     context = _grpo_context(batch, meta)
-    _validate_mixed_config(context, config)
+    _validate_mixed_config(context, config, _AP_GRPO_VARIANT)
     return _grpo_loss(model_outputs, context, config, device)
 
 
 @register_loss_fn(
     "ap_grpo_echo_v1",
-    batching_callback=_grpo_echo_batching_callback,
-    validation_callback=_grpo_echo_validation_callback,
-    packed_loss_reduction=_grpo_echo_packed_loss_reduction,
-    model_call_count_callback=_grpo_model_call_count_callback,
-    metrics_callback=_grpo_metrics_callback,
+    **_grpo_registration(_AP_GRPO_VARIANT, _validate_echo_grpo_context, echo=True),
     summed_metrics=ECHO_SUMMED_METRICS,
 )
 @declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS, PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG)
@@ -1552,10 +1558,10 @@ def grpo_echo_v1_loss(
 ) -> Tuple[torch.Tensor, dict]:
     """Versioned GRPO + ECHO contract with a strict config schema.
 
-    Unlike ``grpo`` (permissive by history), every config key must be known
-    and the ECHO keys must be present and non-None — a typo like
-    ``aux_ce_weigth``, a missing count, or an explicit ``null`` fails before
-    any backward pass instead of silently training the baseline objective
+    Like the plain losses, every config key must be known, and the ECHO keys
+    must be present and non-None — a typo like ``aux_ce_weigth``, a missing
+    count, or an explicit ``null`` fails before any backward pass instead of
+    silently training the baseline objective
     (the shared implementation treats ``aux_ce_weight=None`` as "ECHO not
     configured", so ``None`` must never survive this schema). Requesting
     this loss name on a server
@@ -1567,7 +1573,6 @@ def grpo_echo_v1_loss(
     """
     config = _merge_distributed_config(config, batch, meta)
     context = _grpo_context(batch, meta)
-    if "nll_mask" in context:
-        raise ValueError("nll_mask requires loss_fn='ap_grpo_mixed_v1'")
-    _validate_echo_config(config, "ap_grpo_echo_v1")
+    _reject_nll_mask(context, _AP_GRPO_VARIANT)
+    _validate_echo_config(config, _AP_GRPO_VARIANT.echo_name)
     return _grpo_loss(model_outputs, context, config, device)

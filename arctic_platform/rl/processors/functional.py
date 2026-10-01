@@ -443,22 +443,6 @@ def kl_penalty(
     )
 
 
-def dp_loss_multiplier(
-    loss_agg_mode: str,
-    sequence_loss_weights: Optional[torch.Tensor],
-    dp_size: int,
-) -> int:
-    """DP factor :func:`agg_loss` applies for the given aggregation mode.
-
-    Auxiliary terms that ADD to a policy loss must inherit the same
-    distributed-reduction convention as the policy term, otherwise the
-    auxiliary-to-policy ratio changes with DP width. This mirrors
-    :func:`agg_loss` exactly: every mode multiplies by ``dp_size`` to cancel
-    the averaging. Keep this in lockstep with :func:`agg_loss`.
-    """
-    return dp_size
-
-
 class EchoBatchDenominator(str, Enum):
     """Which step-global sequence count ``global_num_echo_sequences`` declares.
 
@@ -530,9 +514,9 @@ def echo_env_prediction_loss_fn(
     gradient mass invariant to how the batch was split).
 
     ``dp_size`` must match the raw data-parallel width used by the policy
-    aggregation. :func:`dp_loss_multiplier` returns that width for every
-    supported aggregation mode so both policy and auxiliary terms compensate
-    for data-parallel gradient averaging identically.
+    aggregation. :func:`agg_loss` multiplies by that width for every
+    aggregation mode, so callers scale the auxiliary term by ``dp_size`` too
+    and both terms compensate for data-parallel gradient averaging identically.
 
     ``batch_denominator`` declares which count the client computed (see
     :class:`EchoBatchDenominator`). The division always uses the supplied
