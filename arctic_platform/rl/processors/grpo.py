@@ -628,6 +628,8 @@ def _internal_grpo_loss_fn(
             observation_token_counts=input_data.get("echo_observation_token_counts"),
         )
         aux_loss = aux_ce_weight * env_loss
+        if input_data.get("echo_observation_token_counts") is not None:
+            metrics["echo_full_observation_denominator"] = 1.0
         metrics.update(
             {
                 # Additive contributions and counts — named loss_term_* / *_sum /

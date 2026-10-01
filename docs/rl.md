@@ -184,7 +184,8 @@ The registered `ap_grpo` loss accepts `teacher_tau` with a positive `teacher_cli
 and prediction-aligned `teacher_log_probs_shifted` for the GRPO teacher term.
 `ap_grpo_echo_v1` requires `aux_ce_weight` and `echo_global_num_sequences`;
 its `echo_observation_token_counts` batch column supplies the full observation
-denominator when sequence parallelism splits observation tokens. Both losses
+denominator when sequence parallelism splits observation tokens, and the
+response then carries `echo_full_observation_denominator=1`. Both losses
 support CISPO-only ratio gates (`ratio_mask_bounds_pos` / `_neg`,
 `prob_diff_mask_max_pos` / `_neg`, `seq_mask_stat`, `seq_mask_bounds_pos` /
 `_neg`, `ratio_m2_threshold`) and the independent `log_ratio_sq_coef` penalty;

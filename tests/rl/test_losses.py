@@ -625,6 +625,26 @@ class TestMigratedGrpo(TestCasePlus):
         self.assertEqual(metrics["observation_token_count"].item(), 2)
         loss.backward()
         torch_assert_close(values.grad, torch.tensor([[-0.25, 0.0]]))
+
+        context = {
+            "old_log_probs_shifted": values.detach(),
+            "advantages": torch.zeros_like(values),
+            "loss_mask": torch.zeros_like(mask),
+            "sft_mask": mask,
+            "echo_observation_mask": observations,
+        }
+        config = {"aux_ce_weight": 1.0, "echo_global_num_sequences": 1}
+        _, local_metrics = LOSS_FNS["ap_grpo_echo_v1"]({"logprobs": values.detach()}, context, {}, config, "cpu")
+        _, full_metrics = LOSS_FNS["ap_grpo_echo_v1"](
+            {"logprobs": values.detach()},
+            {**context, "echo_observation_token_counts": torch.tensor([4])},
+            {},
+            config,
+            "cpu",
+        )
+        self.assertNotIn("echo_full_observation_denominator", local_metrics)
+        self.assertEqual(full_metrics["echo_full_observation_denominator"], 1.0)
+
         with self.assertRaisesRegex(ValueError, "observation_token_counts"):
             echo_env_prediction_loss_fn(
                 values,
