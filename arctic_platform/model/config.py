@@ -16,21 +16,90 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import PositiveInt
+from pydantic import StrictBool
 from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
 
 from arctic_platform.common.config import validate_peft_config
 
+PinMemoryMaxSize = float | Literal["auto"]
+
+
+class ActivationOffloadConfig(BaseModel):
+    """Serializable activation CPU-offload configuration."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    enabled: bool = Field(False, description="Stream checkpointed block boundaries to CPU.")
+    keep_last_n: int = Field(1, ge=0, description="Boundaries to leave resident on GPU.")
+    use_streams: bool = Field(True, description="Overlap offload copies on side streams.")
+    tensor_size_threshold: int = Field(1 << 20, ge=0, description="Minimum saved-tensor size in bytes to offload.")
+    pin_memory_enabled: bool = Field(True, description="Use pinned host memory for activation offload.")
+    pin_memory_max_size_gib: PinMemoryMaxSize = Field(
+        "auto", description='Retained pinned-memory cache cap in GiB; "auto" sizes it from observed usage.'
+    )
+    pin_memory_bucket_size_mib: PositiveInt = Field(
+        64, description="Pinned-buffer allocation bucket size in MiB for reuse across variable sequence lengths."
+    )
+
+    @field_validator("pin_memory_max_size_gib")
+    @classmethod
+    def _validate_pin_memory_max_size_gib(cls, value: PinMemoryMaxSize) -> PinMemoryMaxSize:
+        if value == "auto":
+            return value
+        if value < 0:
+            raise ValueError("pin_memory_max_size_gib must be 'auto' or non-negative")
+        return value
+
+    @property
+    def pin_memory_bucket_size_bytes(self) -> int:
+        return self.pin_memory_bucket_size_mib * (1 << 20)
+
+    @property
+    def pin_memory_hard_max_size_bytes(self) -> int | None:
+        if self.pin_memory_max_size_gib == "auto":
+            return None
+        return int(self.pin_memory_max_size_gib * (1 << 30))
+
+
+class ActivationOffloadPatch(ActivationOffloadConfig):
+    """Activation offload settings whose presence enables the patch."""
+
+    enabled: Literal[True] = Field(True, description="Activation offload patches are always enabled.")
+
+
+class ActivationCheckpointConfig(BaseModel):
+    """MoE activation checkpointing and optional CPU offload."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    mode: Literal["full", "selective"] = Field("full", description="Recompute whole blocks or selected targets.")
+    freq: PositiveInt = Field(1, description="Checkpoint every Nth block.")
+    targets: list[str] = Field(default_factory=lambda: ["norm"], description="Submodules to checkpoint (selective).")
+    offload_config: ActivationOffloadConfig = Field(
+        default_factory=ActivationOffloadConfig, description="CPU offload of checkpointed boundaries."
+    )
+    router_replay_recompute: bool = Field(True, description="Deterministic MoE routing across recompute.")
+
+    @model_validator(mode="after")
+    def _validate_offload_mode(self) -> Self:
+        if self.offload_config.enabled and self.mode != "full":
+            raise ValueError("activation offload requires activation checkpointing mode='full'")
+        return self
+
 
 class ParallelismConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    expert_parallel: int = Field(1, description="Expert-parallel degree.")
-    sequence_parallel: int = Field(1, description="Ulysses sequence-parallel degree.")
+    expert_parallel: int = Field(1, ge=1, description="Expert-parallel degree.")
+    sequence_parallel: int = Field(1, ge=1, description="Ulysses sequence-parallel degree.")
 
 
 class ZorroTrainPatch(BaseModel):
@@ -50,17 +119,69 @@ class ZorroTrainPatch(BaseModel):
     logits_compute_in_fp32: bool = Field(False, description="Compute logits in fp32.")
 
 
+class CompilePatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    fullgraph: bool = Field(False, description="Require each transformer layer to compile as a full graph.")
+
+
+class LmHeadPatch(BaseModel):
+    """Optional precision and chunking changes to a causal LM head."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    fp32: bool = Field(False, description="Compute the LM-head projection in fp32.")
+    token_chunk_size: PositiveInt | None = Field(
+        None, description="Token tile size for chunked per-token logprob projection."
+    )
+    vocab_chunk_size: PositiveInt = Field(
+        8192, description="Vocabulary tile size for chunked per-token logprob projection."
+    )
+
+    @model_validator(mode="after")
+    def _require_enabled_feature(self) -> Self:
+        if not self.fp32 and self.token_chunk_size is None:
+            raise ValueError("lm_head patch requires fp32 or token_chunk_size")
+        return self
+
+
+class TiledMlpPatch(BaseModel):
+    """Recompute dense MLPs in token tiles."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    token_chunk_size: PositiveInt = Field(..., description="Maximum tokens per recomputed dense-MLP tile.")
+
+
 class Patches(BaseModel):
     """Optional features applied to the model after it is loaded."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     liger: bool = Field(False, description="Apply Liger kernels.")
+    gradient_checkpointing: StrictBool | PositiveInt = Field(
+        False,
+        description="False disables; True checkpoints every layer; an integer checkpoints every Nth layer.",
+    )
+    activation_offload: ActivationOffloadPatch | None = Field(
+        None, description="CPU offload for activations saved by checkpointed layers."
+    )
+    compile: CompilePatch | None = Field(None, description="Per-transformer-layer torch.compile settings.")
+    tiled_mlp: TiledMlpPatch | None = Field(None, description="Recompute dense MLPs in token tiles.")
+    lm_head: LmHeadPatch | None = Field(None, description="LM-head precision and chunking.")
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
-    gradient_checkpointing: bool = Field(False, description="HF gradient checkpointing.")
     peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
 
     _validate_peft = field_validator("peft")(validate_peft_config)
+
+    @model_validator(mode="after")
+    def _validate_patch_combinations(self) -> Self:
+        if self.activation_offload is not None:
+            if self.gradient_checkpointing is False:
+                raise ValueError("activation_offload requires gradient_checkpointing")
+        if self.tiled_mlp is not None and self.compile is not None and self.compile.fullgraph:
+            raise ValueError("compile.fullgraph cannot be combined with tiled_mlp")
+        return self
 
 
 class ModelSpec(BaseModel):
@@ -154,6 +275,7 @@ class ModelSpec(BaseModel):
         options_model = get_loader_options_model(self.loader)
         if options_model is not None:
             self.loader_options = options_model.model_validate(self.loader_options).model_dump()
-        if self.patches.peft and self.loader == "qwen3_5_moe":
-            raise ValueError("qwen3_5_moe PEFT requires expert adapter integration, which is not yet supported")
+        from arctic_platform.model.loader import validate_loader_spec
+
+        validate_loader_spec(self.loader, self)
         return self

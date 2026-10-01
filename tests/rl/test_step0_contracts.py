@@ -266,10 +266,10 @@ class TestIsolation(TestCasePlus):
             )
 
     def test_none_loss_fn_raises_when_backward(self):
-        from arctic_platform.rl.processors.packed_reduction import resolve_packed_loss_reduction
+        from arctic_platform.rl.processors.pipeline import _require_loss_fn
 
         with self.assertRaises(ValueError):
-            resolve_packed_loss_reduction({"loss_fn": None}, [{"input_ids": torch.zeros(1, 2)}], backward=True)
+            _require_loss_fn({"loss_fn": None}, backward=True)
 
     def test_dict_model_outputs_and_skips_none(self):
         class DictEngine(_StubEngine):

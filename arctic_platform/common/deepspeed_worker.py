@@ -387,7 +387,9 @@ class DeepSpeedWorker:
         see_memory_usage("_forward_maybe_backward start", force=True)
 
         from arctic_platform import sft_profile
+        from arctic_platform.rl.processors.base_loss import _pop_loss_object
 
+        loss_object = _pop_loss_object(batch)
         args, batch_data, meta_data, processing = unpack_batch(batch)
         with sft_profile.timed("h2d"):
             if isinstance(batch_data, list):
@@ -424,18 +426,35 @@ class DeepSpeedWorker:
         pipeline_micro_batch_outputs = []
         return_tensors = meta_data.get("worker_return_tensors", False)
 
-        # Decide SFT vs GRPO once, up front. Resolve against SFT_LOSS_FNS (the
-        # canonical registry set) rather than a hardcoded ("sft", "sft_ce")
-        # tuple so new SFT losses dispatch correctly without touching the
-        # worker. Lazy-import keeps `common` free of an import-time SFT
-        # coupling; the module is cached after the first call.
-        loss_fn = processing.get("loss_fn")
+        # Resolve before selecting a specialized pipeline so class registry
+        # precedence applies equally to SFT and RL names.
+        loss_fn = processing.get("loss_fn", "ap_grpo")
+        from arctic_platform.common.registry import LOSS_FNS
+        from arctic_platform.rl.processors import resolve_loss
         from arctic_platform.sft.processor import SFT_LOSS_FNS
 
-        use_sft_pipeline = loss_fn in SFT_LOSS_FNS
+        if loss_object is None and loss_fn is not None:
+            loss_object = resolve_loss(loss_fn)
+        legacy_sft_loss = LOSS_FNS.get(loss_fn) if loss_fn in SFT_LOSS_FNS else None
+        use_sft_pipeline = (
+            legacy_sft_loss is not None
+            and loss_object is not None
+            and loss_object.is_legacy_adapter_for(legacy_sft_loss)
+        )
 
         if use_sft_pipeline:
             self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
+
+        loss_reduction = None
+        if not use_sft_pipeline:
+            from arctic_platform.rl.processors import resolve_packed_loss_reduction
+
+            loss_reduction = resolve_packed_loss_reduction(
+                processing,
+                [{**meta_data, **micro_batch} for micro_batch in micro_batch_data],
+                require_declared=False,
+                loss_object=loss_object,
+            )
 
         pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
 
@@ -483,8 +502,10 @@ class DeepSpeedWorker:
                     backward=backward,
                 )
             else:
+                from arctic_platform.rl.processors import apply_packed_loss_reduction
                 from arctic_platform.rl.processors import run_pipeline
 
+                pipeline_backward = "loss_only" if backward and loss_reduction is not None else backward
                 micro_batch_output = run_pipeline(
                     self.engine,
                     args,
@@ -492,10 +513,18 @@ class DeepSpeedWorker:
                     meta_data,
                     processing,
                     device=self._device,
-                    backward=backward,
+                    backward=pipeline_backward,
                     pack=False,
                     return_tensors=return_tensors,
+                    loss_object=loss_object,
                 )
+                if backward and loss_reduction is not None:
+                    apply_packed_loss_reduction(
+                        self.engine,
+                        micro_batch_output.pop("loss_tensor"),
+                        loss_reduction.loss_scales[i],
+                        backward=True,
+                    )
 
             if i == 0:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {micro_batch_output.keys()=}")
@@ -508,21 +537,27 @@ class DeepSpeedWorker:
         pipeline_outputs = dict()
         for k, v in pipeline_micro_batch_outputs[0].items():
             if k == "metrics" and isinstance(v, dict):
-                # Per-microbatch loss-fn metrics are emitted as paired
-                # ``{name}.sum`` / ``{name}.tokens`` scalars (plus a few
-                # passthrough numerics like ``kl_coef``). Sum them across
-                # this rank's microbatches so each rank returns one scalar
-                # per metric; ``ray_server.forward_backward`` / ``http_server.forward_backward``
-                # then sums across DP ranks and collapses the paired keys
-                # into a single global token-mean per metric per mini-batch.
-                pipeline_outputs[k] = combine_metric_microbatches([r[k] for r in pipeline_micro_batch_outputs])
+                if loss_reduction is None:
+                    # Legacy losses without packed metadata retain the
+                    # historical GAS metric combiner.
+                    pipeline_outputs[k] = combine_metric_microbatches([r[k] for r in pipeline_micro_batch_outputs])
+                else:
+                    from arctic_platform.rl.processors import combine_packed_metrics
+
+                    pipeline_outputs[k] = combine_packed_metrics(
+                        [r[k] for r in pipeline_micro_batch_outputs],
+                        loss_reduction.reporting_weights,
+                    )
             elif isinstance(v, dict):
                 pipeline_outputs[k] = merge_dict_shards([r[k] for r in pipeline_micro_batch_outputs])
             elif isinstance(v, numbers.Number):
-                # TODO: weight average needs to be implemented
-                pipeline_outputs[k] = sum([r[k] for r in pipeline_micro_batch_outputs]) / len(
-                    pipeline_micro_batch_outputs
-                )
+                values = [r[k] for r in pipeline_micro_batch_outputs]
+                if k == "avg_loss" and loss_reduction is not None:
+                    from arctic_platform.rl.processors import combine_packed_losses
+
+                    pipeline_outputs[k] = combine_packed_losses(values, loss_reduction)
+                else:
+                    pipeline_outputs[k] = sum(values) / len(values)
 
         pipeline_outputs = self._move_batch_to_device(pipeline_outputs, self.cpu_device)
 

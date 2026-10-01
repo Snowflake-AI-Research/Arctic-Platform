@@ -56,7 +56,7 @@ from typing import Any
 import torch
 
 # Shared registries live in arctic_platform.common.registry (used by RL + SFT).
-from arctic_platform.common.registry import LOSS_FNS
+from arctic_platform.common.registry import LOSS_FNS  # noqa: F401  # re-exported
 from arctic_platform.common.registry import POST_PROCESSORS
 from arctic_platform.common.registry import _resolve_fn
 from arctic_platform.common.registry import register_loss_fn  # noqa: F401  # re-exported
@@ -70,6 +70,8 @@ from arctic_platform.rl.utils.debug import ProfilerContext
 from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.debug import see_memory_usage
 
+from .base_loss import BaseLoss
+from .base_loss import resolve_loss
 from .microbatch import DEFAULT_MAX_TOKENS_PER_MB
 from .packed_reduction import apply_packed_loss_reduction
 from .packed_reduction import combine_packed_losses
@@ -170,19 +172,6 @@ def _require_loss_fn(processing: dict, *, backward: bool | str) -> str | None:
     return loss_fn_name
 
 
-def _extract_model_outputs(outputs: Any) -> dict[str, Any]:
-    """Read logits/logprobs/entropy/loss from a dict or attribute object; skip None."""
-    model_outputs: dict[str, Any] = {}
-    for key in ("logits", "logprobs", "entropy", "loss"):
-        if isinstance(outputs, dict):
-            value = outputs.get(key)
-        else:
-            value = getattr(outputs, key, None)
-        if value is not None:
-            model_outputs[key] = value
-    return model_outputs
-
-
 def _engine_rank(engine) -> Any:
     return getattr(engine, "global_rank", 0)
 
@@ -211,9 +200,9 @@ def padded_tensor_2d_to_unpadded_tensor_1d(tensor_2d, attention_mask_2d_bool):
 
 def padded_tensor_2d_dict_to_unpadded_tensor_1d_dict(tensor_dict, attention_mask_2d_bool):
     for key, value in tensor_dict.items():
-        if torch.is_tensor(value) and value.shape == attention_mask_2d_bool.shape:
+        if torch.is_tensor(value) and value.ndim >= 2 and value.shape[:2] == attention_mask_2d_bool.shape:
             new_value = padded_tensor_2d_to_unpadded_tensor_1d(value, attention_mask_2d_bool)
-            pr0(f"2d->1d {key=} {value.shape=} -> {new_value.shape=} {value.sum()=} -> {new_value.sum()=}")
+            pr0(f"padded->unpadded {key=} {value.shape=} -> {new_value.shape=} {value.sum()=} -> {new_value.sum()=}")
             # pr0(f"2d->1d: {value=}")
             # pr0(f"2d->1d: {new_value=}")
 
@@ -226,17 +215,21 @@ def padded_tensor_2d_dict_to_unpadded_tensor_1d_dict(tensor_dict, attention_mask
 
 
 def unpadded_tensor_1d_to_padded_tensor_2d(tensor_1d, attention_mask_2d_bool, pad_value):
-
-    if tensor_1d.shape != attention_mask_2d_bool.shape:
-        ValueError(f"{tensor_1d.shape=} != {attention_mask_2d_bool.shape}")
+    num_tokens = int(attention_mask_2d_bool.sum().item())
+    if tensor_1d.ndim >= 2 and tensor_1d.shape[:2] == (1, num_tokens):
+        token_values = tensor_1d.squeeze(0)
+    elif tensor_1d.ndim >= 1 and tensor_1d.shape[0] == num_tokens:
+        token_values = tensor_1d
+    else:
+        raise ValueError(f"{tensor_1d.shape=} does not carry {num_tokens} unpadded token values")
 
     tensor_2d = torch.full(
-        attention_mask_2d_bool.shape,
+        (*attention_mask_2d_bool.shape, *token_values.shape[1:]),
         fill_value=pad_value,
         dtype=tensor_1d.dtype,
         device=tensor_1d.device,
     )
-    tensor_2d[attention_mask_2d_bool] = tensor_1d.view(-1)
+    tensor_2d[attention_mask_2d_bool] = token_values
     return tensor_2d
 
 
@@ -262,30 +255,26 @@ def padded_tensor_2d_full_to_unpadded_tensor_1d_response(tensor_2d, attention_ma
 
 
 def unpadded_tensor_1d_response_to_padded_tensor_2d_full(tensor_1d, attention_mask_2d_bool, max_prompt_len):
-
-    # pad_value should be 0 for the return post-process tensors since the padding is just a shape placeholder
-    pad_value = 0
-
-    if tensor_1d.shape != attention_mask_2d_bool.shape:
-        ValueError(f"{tensor_1d.shape=} != {attention_mask_2d_bool.shape}")
-
     pr0(f"{tensor_1d.shape=}")
-    pr0(f"{tensor_1d.view(-1).shape=}")
 
-    tensor_2d = torch.full(
-        attention_mask_2d_bool.shape,
-        fill_value=pad_value,
+    attention_mask_2d_bool_response = attention_mask_2d_bool[:, max_prompt_len:]
+    tensor_2d_response = unpadded_tensor_1d_to_padded_tensor_2d(
+        tensor_1d,
+        attention_mask_2d_bool_response,
+        pad_value=0,
+    )
+    tensor_2d = torch.zeros(
+        (
+            *attention_mask_2d_bool.shape,
+            *tensor_2d_response.shape[2:],
+        ),
         dtype=tensor_1d.dtype,
         device=tensor_1d.device,
     )
-
-    tensor_2d_response = tensor_2d[:, max_prompt_len:]
-    attention_mask_2d_bool_response = attention_mask_2d_bool[:, max_prompt_len:]
+    tensor_2d[:, max_prompt_len:] = tensor_2d_response
 
     pr0(f"{tensor_2d_response.shape=}")
     pr0(f"{attention_mask_2d_bool_response.shape=}")
-
-    tensor_2d_response[attention_mask_2d_bool_response] = tensor_1d.view(-1)
 
     return tensor_2d
 
@@ -341,6 +330,8 @@ def run_pipeline(
     pack: bool = True,
     max_tokens_per_mb: int = DEFAULT_MAX_TOKENS_PER_MB,
     return_tensors: bool = False,
+    validate_loss_callback: bool = True,
+    loss_object: BaseLoss | None = None,
 ) -> dict:
     global c
     """Execute forward, post-processors, and optionally loss + backward.
@@ -382,14 +373,22 @@ def run_pipeline(
         Token budget per microbatch when ``pack=True``.  Sequences are
         grouped by a first-fit-decreasing algorithm so no microbatch
         exceeds this limit.
+    validate_loss_callback
+        Invoke the selected loss's public validation callback before model
+        execution. Callers that repeat an already validated packed window
+        solely to keep a distributed schedule aligned may set this to false.
+    loss_object
+        Optional pre-resolved objective shared with packed reduction and every
+        callback in this worker execution. The pipeline resolves it when omitted.
 
     Returns
     -------
     dict
         ``{"avg_loss": float, "metrics": dict}`` when a loss function ran.
-        ``{"avg_loss": ..., "metrics": ..., "batch": dict}`` also includes
-        post-processor outputs (e.g. logprobs) when both loss and post-
-        processors ran.
+        A loss path also includes ``"batch"`` when the class-controlled output
+        callback leaves model outputs to return. The base callback removes raw
+        logits; class losses may additionally remove objective-only outputs or
+        explicitly override that default when logits are part of their API.
         ``{"batch": dict, "metrics": {}}`` when no loss function (forward-
         only).  ``batch`` contains only what post-processors added — never
         raw logits.
@@ -407,6 +406,10 @@ def run_pipeline(
         elif key in batch and key not in meta:
             meta[key] = batch[key]
 
+    loss_fn_name = _require_loss_fn(processing, backward=backward)
+    if loss_object is None and loss_fn_name is not None:
+        loss_object = resolve_loss(loss_fn_name)
+
     if pack:
         # Auto-detect already-packed input: pack_for_dss adds cu_seqlens as the
         # definitive signal that packing already happened — skip to avoid
@@ -422,13 +425,14 @@ def run_pipeline(
                 device,
                 backward=backward,
                 max_tokens_per_mb=max_tokens_per_mb,
+                validate_loss_callback=validate_loss_callback,
+                loss_object=loss_object,
             )
 
     rank = _engine_rank(engine)
     tname_e2e = timers.start(f"run_pipeline e2e {rank}")
     see_memory_usage("before fwd", force=True)
     post_names = processing.get("post", [])
-    loss_fn_name = _require_loss_fn(processing, backward=backward)
     config = processing.get("config", {})
 
     # Skip entropy computation when it cannot affect the loss (entropy_coeff == 0).
@@ -509,6 +513,12 @@ def run_pipeline(
         # Isolation: only model-bound keys reach engine(). Zorro reads
         # calculate_entropy; loss tensors stay on batch/meta for posts/losses.
         fwd_kwargs = _engine_forward_kwargs(batch, meta)
+        output_keys = ["logits", "logprobs", "entropy", "loss"]
+        if loss_object is not None:
+            context = {**meta, **batch}
+            if validate_loss_callback:
+                loss_object.validation_callback(context, config)
+            loss_object.model_forward_callback(fwd_kwargs, context, config, output_keys)
         if backward is False:
             engine.eval()
             with torch.no_grad():
@@ -523,7 +533,11 @@ def run_pipeline(
     see_memory_usage("after fwd", force=True)
     prof_fwd.report()
 
-    model_outputs = _extract_model_outputs(outputs)
+    model_outputs: dict[str, Any] = {}
+    for key in output_keys:
+        value = outputs.get(key) if isinstance(outputs, dict) else getattr(outputs, key, None)
+        if value is not None:
+            model_outputs[key] = value
 
     # --- post-forward ---
     prof_post_fwd = ProfilerContext(type=PROFILER_TYPE, name="POST-FWD")
@@ -556,13 +570,12 @@ def run_pipeline(
 
         prof_loss = ProfilerContext(type=PROFILER_TYPE, name="LOSS")
         with prof_loss():
-            fn = _resolve_fn(LOSS_FNS, loss_fn_name)
-            loss, metrics = fn(model_outputs, batch, post_meta, config, device)
+            loss, metrics = loss_object.loss(model_outputs, batch, post_meta, config, device)
         timers.stop_and_print_elapsed(tname)
         prof_loss.report()
 
-        # Exclude raw logits from response — large ([B,S,V]), no caller reads them.
-        batch = {k: v for k, v in model_outputs.items() if k != "logits"}
+        loss_object.output_callback(model_outputs)
+        batch = dict(model_outputs)
 
         if backward is True:
 
@@ -635,6 +648,8 @@ def _run_pipeline_with_packing(
     *,
     backward: bool | str,
     max_tokens_per_mb: int,
+    validate_loss_callback: bool,
+    loss_object: BaseLoss | None,
 ) -> dict:
     """Run the pipeline with automatic sequence packing/unpacking.
 
@@ -652,7 +667,11 @@ def _run_pipeline_with_packing(
     mb_list = split_padded_tensor_dict_into_mb_list(all_input, mb_spec)
     n_mbs = len(mb_list.mbs)
 
-    reduction = resolve_packed_loss_reduction(processing, mb_list.mbs, backward=backward)
+    reduction = resolve_packed_loss_reduction(
+        processing,
+        mb_list.mbs,
+        loss_object=loss_object,
+    )
     captured_losses: list[float] = []
     captured_loss_tensors: list[torch.Tensor] = []
     captured_metrics: list[dict] = []
@@ -687,6 +706,8 @@ def _run_pipeline_with_packing(
             backward=inner_backward,
             pack=False,
             return_tensors=True,
+            validate_loss_callback=validate_loss_callback,
+            loss_object=loss_object,
         )
 
         if "avg_loss" in result:

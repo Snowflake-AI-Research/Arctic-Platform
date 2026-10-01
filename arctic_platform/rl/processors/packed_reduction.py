@@ -23,10 +23,10 @@ from dataclasses import dataclass
 
 import torch
 
-from arctic_platform.common.registry import LOSS_FNS
-from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
-from arctic_platform.common.registry import resolve_fn
 from arctic_platform.common.utils.batch import metric_is_summed
+
+from .base_loss import BaseLoss
+from .base_loss import resolve_loss
 
 _GLOBAL_SCALE_KEYS = ("dp_size", "batch_num_tokens", "global_batch_size")
 
@@ -125,8 +125,9 @@ def resolve_packed_loss_reduction(
     processing: dict | None,
     microbatches: Sequence[dict],
     *,
-    backward: bool | str = True,
-) -> PackedLossReduction:
+    require_declared: bool = True,
+    loss_object: BaseLoss | None = None,
+) -> PackedLossReduction | None:
     """Resolve an objective's packed-microbatch reduction and preflight it."""
     n_mbs = len(microbatches)
     if n_mbs == 0:
@@ -136,36 +137,30 @@ def resolve_packed_loss_reduction(
     # It still catches hand-built or client-supplied microbatch lists.
     assert_aligned_global_loss_scales(microbatches)
 
-    processing = processing or {}
-    if backward is False:
-        loss_fn_name = processing.get("loss_fn")
-        if loss_fn_name is None:
-            return local_mean_packed_loss_reduction((1.0,) * n_mbs)
-    else:
-        if "loss_fn" not in processing:
-            raise ValueError("processing requires 'loss_fn' when backward is not False")
-        loss_fn_name = processing["loss_fn"]
-        if loss_fn_name is None:
-            raise ValueError("processing['loss_fn'] is None but backward is not False")
+    loss_fn_name = (processing or {}).get("loss_fn", "ap_grpo")
+    if loss_fn_name is None:
+        return local_mean_packed_loss_reduction((1.0,) * n_mbs)
 
-    fn = resolve_fn(LOSS_FNS, loss_fn_name)
-    resolver = getattr(fn, PACKED_LOSS_REDUCTION_ATTR, None)
-    if resolver is None:
-        if n_mbs > 1:
-            raise ValueError(
-                f"loss_fn {loss_fn_name!r} does not declare packed-microbatch "
-                "reduction metadata; use one microbatch or register the loss with "
-                "packed_loss_reduction="
-            )
-        return local_mean_packed_loss_reduction((1.0,))
-
-    reduction = resolver(
+    if loss_object is None:
+        loss_object = resolve_loss(loss_fn_name)
+    reduction = loss_object.packed_reduction_callback(
         microbatches,
         _config_with_microbatch_scales(processing, microbatches),
         loss_fn_name,
     )
+    if reduction is None:
+        if n_mbs > 1 and require_declared:
+            raise ValueError(
+                f"loss_fn {loss_fn_name!r} does not declare packed-microbatch "
+                "reduction metadata; use one microbatch or register the loss with "
+                "packed_loss_reduction= or implement packed_reduction_callback"
+            )
+        if n_mbs > 1:
+            return None
+        return local_mean_packed_loss_reduction((1.0,))
+
     if not isinstance(reduction, PackedLossReduction):
-        raise TypeError(f"loss_fn {loss_fn_name!r} packed reduction resolver must return PackedLossReduction")
+        raise TypeError(f"loss_fn {loss_fn_name!r} packed reduction callback must return PackedLossReduction")
     if not (len(reduction.loss_scales) == len(reduction.reporting_weights) == n_mbs):
         raise ValueError(f"loss_fn {loss_fn_name!r} packed reduction metadata must contain {n_mbs} entries")
     _validated_packed_weights(reduction.loss_scales)
