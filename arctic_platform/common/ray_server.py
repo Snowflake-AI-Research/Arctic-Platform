@@ -26,6 +26,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import time
@@ -639,7 +640,14 @@ class ArcticRLRayServer:
             lock = asyncio.Lock()
             self._training_op_lock = lock
         async with lock:
-            return await asyncio.gather(*submit_refs())
+            # Production ``.remote()`` returns an awaitable ObjectRef. Unit tests
+            # that still stub ``ray.get`` return the worker result directly.
+            async def _resolve(ref):
+                if inspect.isawaitable(ref):
+                    return await ref
+                return ref
+
+            return await asyncio.gather(*(_resolve(ref) for ref in submit_refs()))
 
     def _verify_job(self, job_id: int, expected_types: Union[str, list[str]]) -> None:
         info = self.jobs.get(job_id)
