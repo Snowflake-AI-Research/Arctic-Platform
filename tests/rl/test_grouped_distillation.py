@@ -453,6 +453,33 @@ def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
     assert set(outputs) == {"logprobs"}
 
 
+@pytest.mark.parametrize(
+    "request_payload",
+    [
+        {
+            "batch": {
+                "input_ids": torch.ones((1, 2), dtype=torch.long),
+                "loss_mask": torch.tensor([[True, False]]),
+                "nll_mask": torch.tensor([[False, True]]),
+            },
+            "meta": {},
+            "processing": {"loss_fn": "grpo", "config": {"kd_coef": 0.0}},
+        },
+        {
+            "kwargs": {"input_ids": torch.ones((1, 2), dtype=torch.long)},
+            "context": {
+                "loss_mask": torch.tensor([[True, False]]),
+                "nll_mask": torch.tensor([[False, True]]),
+            },
+            "processing": {"loss_fn": "grpo", "config": {"kd_coef": 0.0}},
+        },
+    ],
+)
+def test_grpo_grouped_batching_delegates_structured_request_preflight(request_payload):
+    with pytest.raises(ValueError, match="nll_mask requires a mixed GRPO loss"):
+        resolve_loss("grpo").batching_callback(request_payload)
+
+
 def test_standalone_callbacks_use_public_kd_names():
     frame = _frame()
     request = {

@@ -553,6 +553,31 @@ def _sp_loss_worker(rank: int, init_file: str):
                 assert "echo_observation_mask overlaps" in str(error) or "another sequence-parallel rank" in str(error)
             else:
                 raise AssertionError("every SP rank must reject shard-local ECHO validation failures")
+
+            grouped_context = {
+                "input_ids": torch.ones((1, 1), dtype=torch.long),
+                "loss_mask": torch.ones((1, 1), dtype=torch.bool),
+                "advantages": torch.ones((1, 1)),
+                "kd_mask": torch.ones((1, 1)),
+                "teacher_token_ids": torch.zeros((1, 1, 1), dtype=torch.long),
+                "teacher_log_probs": torch.zeros((1, 1)) if rank == 0 else torch.full((1, 1, 1), math.log(0.5)),
+                "teacher_tail_log_prob": torch.full((1, 1), math.log(0.5)),
+            }
+            try:
+                resolve_loss("grpo").validation_callback(
+                    grouped_context,
+                    {
+                        "use_cispo_loss": True,
+                        "is_weight_clip_max": 2.0,
+                        "kd_coef": 0.5,
+                        "kd_batch_num_tokens": 2.0,
+                        "dp_size": 1,
+                    },
+                )
+            except ValueError as error:
+                assert "teacher_log_probs shape" in str(error) or "another sequence-parallel rank" in str(error)
+            else:
+                raise AssertionError("every SP rank must reject shard-local grouped teacher validation failures")
     finally:
         dist.destroy_process_group()
 
@@ -861,6 +886,24 @@ class TestMigratedGrpo(TestCasePlus):
                 global_num_echo_sequences=1,
                 observation_token_counts=torch.tensor([[4]]),
             )
+
+    def test_echo_whole_request_rejects_invalid_full_observation_counts(self):
+        request = {
+            "batch": {
+                "input_ids": torch.ones((2, 2), dtype=torch.long),
+                "loss_mask": torch.zeros((2, 2), dtype=torch.bool),
+                "sft_mask": torch.tensor([[True, False], [False, True]]),
+                "echo_observation_mask": torch.tensor([[True, True], [False, True]]),
+                "echo_observation_token_counts": torch.tensor([1, 1]),
+            },
+            "meta": {},
+            "processing": {
+                "loss_fn": "ap_grpo_echo_v1",
+                "config": {"aux_ce_weight": 0.5, "echo_global_num_sequences": 2},
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "below this call's own observation-token count"):
+            resolve_loss("ap_grpo_echo_v1").batching_callback(request)
 
     def test_echo_bfloat16_keeps_257_token_denominator_in_float32(self):
         values = torch.full((1, 257), -1.0, dtype=torch.bfloat16, requires_grad=True)

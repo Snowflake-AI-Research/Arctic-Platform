@@ -34,7 +34,9 @@ from .base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
 from .functional import RATIO_MASK_CONFIG_KEYS
 from .functional import EchoBatchDenominator
 from .functional import RatioMasks
+from .functional import _full_observation_denominator
 from .functional import _get_sequence_parallel_group
+from .functional import _packed_per_sequence_sums
 from .functional import _resolve_dp_size
 from .functional import _validate_loss_denominators
 from .functional import agg_loss
@@ -1436,6 +1438,22 @@ def _validate_echo_grpo_context(context: dict, config: dict) -> None:
         raise ValueError("sft_mask overlaps loss_mask")
     if (observation_mask & loss_mask).any().item():
         raise ValueError("echo_observation_mask overlaps loss_mask")
+    observation_token_counts = context.get("echo_observation_token_counts")
+    if observation_token_counts is not None:
+        cu_seqlens = context.get("cu_seqlens")
+        if cu_seqlens is not None:
+            _, (visible_observation_counts,) = _packed_per_sequence_sums(
+                cu_seqlens,
+                observation_mask.reshape(-1).to(torch.float32),
+            )
+        elif observation_mask.ndim == 1:
+            visible_observation_counts = observation_mask.sum(dtype=torch.float32).reshape(1)
+        else:
+            visible_observation_counts = observation_mask.reshape(observation_mask.shape[0], -1).sum(
+                dim=1,
+                dtype=torch.float32,
+            )
+        _full_observation_denominator(observation_token_counts, visible_observation_counts)
 
 
 def _grpo_echo_batching_callback(request: dict) -> None:

@@ -30,7 +30,6 @@ from arctic_platform.common.registry import BATCHING_CALLBACK_ATTR
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import METRICS_CALLBACK_ATTR
 from arctic_platform.common.registry import MODEL_CALL_COUNT_CALLBACK_ATTR
-from arctic_platform.common.registry import VALIDATION_CALLBACK_ATTR
 from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.common.utils.batch import metric_is_summed
 
@@ -44,6 +43,9 @@ from .compute_logprobs import _LOGPROB_SLICE_BYTES
 from .functional import _resolve_dp_size
 from .functional import canonicalize_loss_mask
 from .functional import resolve_global_loss_scale
+from .grpo import _raise_synchronized_validation_error
+from .grpo import _request_grpo_contexts
+from .grpo import _validate_plain_grpo_context
 
 _DISTILLATION_METRICS = (
     "kd_weight_sum",
@@ -918,11 +920,12 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
 
     def batching_callback(self, request: dict) -> None:
         callback = getattr(LOSS_FNS[self.name], BATCHING_CALLBACK_ATTR, None)
-        request_context = request.get("context")
-        has_policy_mask = (
-            isinstance(request_context, dict) and request_context.get("loss_mask") is not None
-        ) or request.get("loss_mask") is not None
-        if callback is not None and torch.is_tensor(request.get("input_ids")) and has_policy_mask:
+        request_contexts = _request_grpo_contexts(request)
+        has_policy_request = any(
+            torch.is_tensor(context.get("input_ids")) and context.get("loss_mask") is not None
+            for context in request_contexts
+        )
+        if callback is not None and has_policy_request:
             callback(request)
         processing = request.get("processing")
         if not isinstance(processing, dict):
@@ -961,19 +964,29 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
 
     def validation_callback(self, context: dict, config: dict) -> None:
         context = _validation_context(context)
-        kd = resolve_kd_term(config, context)
-        if kd is not None:
-            super().validation_callback(context, config)
-            local_weight_sum = float(self._weights(context).sum(dtype=torch.float64).item())
-            if local_weight_sum > kd.weight_sum and not math.isclose(
-                local_weight_sum, kd.weight_sum, rel_tol=1e-6, abs_tol=1e-9
-            ):
-                raise ValueError(
-                    f"this worker's kd_mask sum {local_weight_sum} exceeds kd_batch_num_tokens={kd.weight_sum}"
-                )
-        callback = getattr(LOSS_FNS[self.name], VALIDATION_CALLBACK_ATTR, None)
-        if callback is not None and torch.is_tensor(context.get("input_ids")) and context.get("loss_mask") is not None:
-            callback(context, config)
+        has_policy_request = torch.is_tensor(context.get("input_ids")) and context.get("loss_mask") is not None
+        error = None
+        kd = None
+        try:
+            kd = resolve_kd_term(config, context)
+            if kd is not None:
+                super().validation_callback(context, config)
+                local_weight_sum = float(self._weights(context).sum(dtype=torch.float64).item())
+                if local_weight_sum > kd.weight_sum and not math.isclose(
+                    local_weight_sum, kd.weight_sum, rel_tol=1e-6, abs_tol=1e-9
+                ):
+                    raise ValueError(
+                        f"this worker's kd_mask sum {local_weight_sum} exceeds kd_batch_num_tokens={kd.weight_sum}"
+                    )
+            if has_policy_request:
+                _validate_plain_grpo_context(context, config)
+        except ValueError as caught:
+            error = caught
+        reference = context.get("input_ids")
+        if torch.is_tensor(reference) and (kd is not None or has_policy_request):
+            _raise_synchronized_validation_error(error, reference)
+        elif error is not None:
+            raise error
 
     def packed_reduction_callback(
         self,

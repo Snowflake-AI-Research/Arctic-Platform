@@ -474,6 +474,8 @@ class EchoBatchDenominator(str, Enum):
 
 
 def _full_observation_denominator(supplied: torch.Tensor, local: torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(supplied):
+        raise ValueError("observation_token_counts must be a tensor.")
     if supplied.ndim != 1 or supplied.shape != local.shape:
         raise ValueError(
             "observation_token_counts must have one full observation count per sequence in "
@@ -486,6 +488,8 @@ def _full_observation_denominator(supplied: torch.Tensor, local: torch.Tensor) -
         raise ValueError("observation_token_counts values must be finite.")
     if (counts != counts.round()).any().item():
         raise ValueError("observation_token_counts values must be integer counts.")
+    if (counts < 0).any().item():
+        raise ValueError("observation_token_counts values must be non-negative.")
     if (counts < local).any().item():
         raise ValueError("observation_token_counts holds a count below this call's own observation-token count.")
     return counts
