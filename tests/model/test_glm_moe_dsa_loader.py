@@ -113,12 +113,18 @@ def test_omitted_fused_cross_entropy_defaults_to_liger(tmp_path):
     assert explicit.loader_options["fused_cross_entropy"] is False
 
 
-def test_chunked_lm_head_disables_fused_cross_entropy():
+def test_chunked_lm_head_rejects_fused_cross_entropy():
+    with pytest.raises(ValueError, match="cannot combine fused_cross_entropy"):
+        GlmMoeDsaOptions(
+            fused_cross_entropy="liger",
+            fused_lm_head_token_chunk_size=128,
+        )
     options = GlmMoeDsaOptions(
-        fused_cross_entropy="liger",
+        fused_cross_entropy=False,
         fused_lm_head_token_chunk_size=128,
     )
     assert options.fused_cross_entropy is False
+    assert options.fused_lm_head_token_chunk_size == 128
 
 
 def test_quack_fused_cross_entropy_is_supported():
