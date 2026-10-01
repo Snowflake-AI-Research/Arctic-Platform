@@ -148,7 +148,8 @@ sft = [
     "fastapi",
     "liger-kernel>=0.8.0",
     "nvidia-ml-py",
-    "peft>=0.18,<0.20",
+    # 0.20+ imports EmbeddingParallel only when a tensor-parallel LoRA module is present.
+    "peft>=0.21.2,<0.22",
     "psutil",
     "ray",
     "tensordict",

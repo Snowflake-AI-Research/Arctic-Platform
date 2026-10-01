@@ -20,7 +20,7 @@ jobs:
       matrix:
         include:
           - transformers: '5.17.0'
-            peft: '0.19.1'
+            peft: '0.21.2'
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
