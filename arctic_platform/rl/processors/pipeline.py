@@ -628,6 +628,8 @@ def _run_pipeline_with_packing(
     mb_spec = MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb)
     mb_list = split_padded_tensor_dict_into_mb_list(all_input, mb_spec)
     n_mbs = len(mb_list.mbs)
+    if loss_object is not None:
+        loss_object.model_call_count_callback([n_mbs], processing.get("config") or {})
 
     reduction = resolve_packed_loss_reduction(
         processing,

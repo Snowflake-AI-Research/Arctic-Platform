@@ -216,7 +216,10 @@ def resolve_global_loss_scale(
 
 
 def _explicit_zero_step_count(name: str, loss_mask: torch.Tensor) -> int:
-    if loss_mask.any():
+    has_policy_tokens = loss_mask.any().to(dtype=torch.int8)
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(has_policy_tokens, op=dist.ReduceOp.MAX)
+    if has_policy_tokens.item():
         raise ValueError(f"{name}=0 declares a step with no policy tokens, but this call has some.")
     return 1
 
@@ -433,14 +436,18 @@ class EchoBatchDenominator(str, Enum):
 
 
 def _full_observation_denominator(supplied: torch.Tensor, local: torch.Tensor) -> torch.Tensor:
-    counts = supplied.to(device=local.device, dtype=local.dtype).reshape(-1)
-    if counts.shape != local.shape:
+    if supplied.ndim != 1 or supplied.shape != local.shape:
         raise ValueError(
             "observation_token_counts must have one full observation count per sequence in "
-            f"this call, got {tuple(counts.shape)} for {tuple(local.shape)} sequences."
+            f"this call, got {tuple(supplied.shape)} for {tuple(local.shape)} sequences."
         )
+    if supplied.dtype == torch.bool or torch.is_complex(supplied):
+        raise ValueError("observation_token_counts values must be real integer counts.")
+    counts = supplied.to(device=local.device, dtype=local.dtype)
     if not torch.isfinite(counts).all().item():
         raise ValueError("observation_token_counts values must be finite.")
+    if (counts != counts.round()).any().item():
+        raise ValueError("observation_token_counts values must be integer counts.")
     if (counts < local).any().item():
         raise ValueError("observation_token_counts holds a count below this call's own observation-token count.")
     return counts
@@ -547,19 +554,20 @@ def echo_env_prediction_loss_fn(
     if (observation_mask & loss_mask).any():
         raise ValueError("echo_observation_mask overlaps loss_mask — observations cannot be policy targets.")
 
-    nll = _masked_values(-logprobs.reshape(sft_mask.shape), sft_mask)
+    reduction_dtype = torch.float64 if logprobs.dtype == torch.float64 else torch.float32
+    nll = _masked_values(-logprobs.reshape(sft_mask.shape), sft_mask).to(reduction_dtype)
     if cu_seqlens is not None:
         flat_nll = nll.reshape(-1)
         _, (seq_nll_sum, seq_obs_count, seq_policy_count) = _packed_per_sequence_sums(
             cu_seqlens,
             flat_nll,
-            observation_mask.reshape(-1).to(flat_nll.dtype),
-            loss_mask.reshape(-1).to(flat_nll.dtype),
+            observation_mask.reshape(-1).to(reduction_dtype),
+            loss_mask.reshape(-1).to(reduction_dtype),
         )
     elif nll.ndim == 2:
         seq_nll_sum = nll.sum(dim=-1)
-        seq_obs_count = observation_mask.sum(dim=-1).to(seq_nll_sum.dtype)
-        seq_policy_count = loss_mask.sum(dim=-1).to(seq_nll_sum.dtype)
+        seq_obs_count = observation_mask.sum(dim=-1).to(reduction_dtype)
+        seq_policy_count = loss_mask.sum(dim=-1).to(reduction_dtype)
     else:
         raise ValueError("cu_seqlens is required for packed 1D ECHO tensors.")
 
@@ -871,6 +879,13 @@ def _config_nonnegative(config: dict, key: str) -> float | None:
     return float(value)
 
 
+def _config_positive(config: dict, key: str) -> float | None:
+    value = _config_nonnegative(config, key)
+    if value == 0.0:
+        raise ValueError(f"{key} must be a finite positive number, got {config[key]!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class RatioMasks:
     ratio_bounds_pos: tuple[float, float] | None = None
@@ -903,7 +918,7 @@ class RatioMasks:
             seq_bounds_pos=seq_bounds_pos,
             seq_bounds_neg=seq_bounds_neg,
             log_ratio_sq_coef=_config_nonnegative(config, "log_ratio_sq_coef") or 0.0,
-            m2_threshold=_config_nonnegative(config, "ratio_m2_threshold"),
+            m2_threshold=_config_positive(config, "ratio_m2_threshold"),
         )
 
     def echo(self) -> dict[str, float]:

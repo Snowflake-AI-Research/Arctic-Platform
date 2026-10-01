@@ -29,6 +29,7 @@ import torch
 from arctic_platform.common.registry import declare_loss_capabilities
 from arctic_platform.common.registry import register_loss_fn
 
+from .base_loss import PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG
 from .base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
 from .functional import RATIO_MASK_CONFIG_KEYS
 from .functional import EchoBatchDenominator
@@ -138,6 +139,30 @@ def _source_statistics(stat: dict, mask: torch.Tensor) -> dict[str, float]:
             cispo_lower_tail_token_count=total(stat["lower_tail_mask"]),
         )
     return metrics
+
+
+def _grpo_metrics_callback(_worker_metrics: Sequence[dict], metrics: dict) -> None:
+    totals = {
+        "grpo_stats_token_count",
+        "grpo_importance_weight_sum",
+        "grpo_log_ratio_sum",
+        "grpo_clipped_token_count",
+        "grpo_entropy_sum",
+    }
+    if not totals.issubset(metrics):
+        return
+    count = max(float(metrics["grpo_stats_token_count"]), 1.0)
+    metrics.update(
+        {
+            name: float(metrics[total]) / count
+            for name, total in (
+                ("importance_weight", "grpo_importance_weight_sum"),
+                ("approx_kl", "grpo_log_ratio_sum"),
+                ("clip_ratio", "grpo_clipped_token_count"),
+                ("entropy", "grpo_entropy_sum"),
+            )
+        }
+    )
 
 
 def _resolve_teacher_tau(config: dict, context: dict) -> float:
@@ -375,8 +400,9 @@ def _internal_grpo_loss_fn(
         if use_cispo_loss and is_weight_clip_max is not None:
             stat.update(clipped_is_weight=zeros, lower_tail_mask=zeros)
         metrics.update(_source_statistics(stat, loss_mask))
+        metrics["grpo_entropy_sum"] = 0.0
         if nll_mask is not None:
-            metrics.update(nll_trainable_token_count=0.0, nll_sum=0.0, grpo_entropy_sum=0.0)
+            metrics.update(nll_trainable_token_count=0.0, nll_sum=0.0)
         if teacher_tau > 0.0:
             metrics.update(
                 teacher_tau=teacher_tau,
@@ -445,8 +471,9 @@ def _internal_grpo_loss_fn(
         if use_cispo_loss and is_weight_clip_max is not None:
             stat.update(clipped_is_weight=zeros, lower_tail_mask=zeros)
         metrics.update(_source_statistics(stat, loss_mask))
+        metrics["grpo_entropy_sum"] = 0.0
         if nll_mask is not None:
-            metrics.update(nll_trainable_token_count=0.0, nll_sum=0.0, grpo_entropy_sum=0.0)
+            metrics.update(nll_trainable_token_count=0.0, nll_sum=0.0)
     else:
         if use_sapo_loss and use_cispo_loss:
             raise ValueError("use_sapo_loss and use_cispo_loss are mutually exclusive.")
@@ -570,10 +597,10 @@ def _internal_grpo_loss_fn(
             "entropy": _masked_mean_float(entropy.float(), stats_mask),
         }
         metrics.update(_source_statistics(stat, stats_mask))
+        metrics["grpo_entropy_sum"] = float(torch.where(stats_mask, entropy.double(), 0.0).sum())
         metrics.update(stat.get("ratio_mask_metrics", {}))
         if nll_mask is not None:
             metrics.update(
-                grpo_entropy_sum=float(torch.where(stats_mask, entropy.double(), 0.0).sum()),
                 nll_trainable_token_count=float(nll_mask.sum()),
                 nll_sum=float(torch.where(nll_mask, -logprobs.detach().double(), 0.0).sum()),
             )
@@ -808,16 +835,6 @@ def _grpo_loss(
         labels = torch.roll(input_ids, shifts=-1, dims=-1)
         logprobs = torch.log_softmax(logits.float(), dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
 
-    # Degenerate-shard logprob sanitization (see _internal_grpo_loss_fn). Under
-    # Ulysses SP a short/padded batch can hand a rank a tail shard whose "valid"
-    # positions have no attendable keys, so attention emits non-finite logits ->
-    # non-finite logprobs. A single NaN poisons both the loss and the entropy
-    # metric ("result.metrics.entropy is non-finite"). Zero them here, before
-    # entropy is derived, so downstream loss + metrics stay finite; nan_to_num
-    # yields zero gradient at those positions. No-op at real training seqlens.
-    teacher_policy_finite = torch.isfinite(logprobs)
-    if not teacher_policy_finite.all():
-        logprobs = torch.nan_to_num(logprobs, nan=0.0, posinf=0.0, neginf=0.0)
     cu_seqlens = context.get("cu_seqlens")
     if cu_seqlens is not None:
         # Canonicalize the packed layout ONCE at the loss entry. pack_sequences
@@ -830,6 +847,30 @@ def _grpo_loss(
         # packed representation — 1-D [T] — may exist past this point.
         logprobs = _packed_singleton_to_1d(logprobs)
 
+    # Degenerate-shard logprob sanitization (see _internal_grpo_loss_fn). Under
+    # Ulysses SP a short/padded batch can hand a rank a tail shard whose "valid"
+    # positions have no attendable keys, so attention emits non-finite logits ->
+    # non-finite logprobs. A single NaN poisons both the loss and the entropy
+    # metric ("result.metrics.entropy is non-finite"). Zero them here, before
+    # entropy is derived, so downstream loss + metrics stay finite; nan_to_num
+    # yields zero gradient at those positions. No-op at real training seqlens.
+    teacher_policy_finite = torch.isfinite(logprobs)
+    nll_mask = context.get("nll_mask")
+    if nll_mask is not None:
+        nll_mask = nll_mask.to(logprobs.device)
+        if cu_seqlens is not None:
+            nll_mask = _packed_singleton_to_1d(nll_mask)
+        active_nll_mask = canonicalize_loss_mask(
+            nll_mask,
+            logprobs,
+            objective="nll_mask",
+            binary=True,
+        )
+        if ((~teacher_policy_finite) & active_nll_mask).any().item():
+            raise ValueError("logprobs must be finite at every active nll_mask position")
+    if not teacher_policy_finite.all():
+        logprobs = torch.nan_to_num(logprobs, nan=0.0, posinf=0.0, neginf=0.0)
+
     entropy = -logprobs.detach()
 
     old_log_probs_ctx = context.get("old_log_probs_shifted")
@@ -841,7 +882,7 @@ def _grpo_loss(
         "versions": context.get("versions"),
         "cu_seqlens": cu_seqlens,
         "ref_log_probs": context.get("ref_log_probs_shifted"),
-        "nll_mask": context.get("nll_mask"),
+        "nll_mask": nll_mask,
         "teacher_log_probs": context.get("teacher_log_probs_shifted"),
         "teacher_policy_finite": teacher_policy_finite,
         "sft_mask": context.get("sft_mask"),
@@ -990,18 +1031,22 @@ def _grpo_packed_loss_reduction(
     microbatches: Sequence[dict],
     config: dict,
     loss_fn_name: str,
+    *,
+    mixed: bool = False,
+    echo: bool = False,
 ) -> PackedLossReduction:
-    _grpo_model_call_count_callback((len(microbatches),), config)
     masks = [_grpo_preflight_mask(microbatch) for microbatch in microbatches]
     ratio_masks = RatioMasks.from_config(config)
     if ratio_masks is not None and not config.get("use_cispo_loss"):
         raise ValueError("ratio-mask keys act on the CISPO policy term; they need use_cispo_loss=True.")
     for microbatch, mask in zip(microbatches, masks):
-        if loss_fn_name.endswith("grpo_mixed_v1"):
+        if mixed:
             _validate_mixed_config(microbatch, config)
             _validate_nll_mask(microbatch["nll_mask"], mask)
         elif "nll_mask" in microbatch:
-            mixed_name = "grpo_mixed_v1" if loss_fn_name.startswith("grpo") else "ap_grpo_mixed_v1"
+            leaf_name = loss_fn_name.rsplit(".", 1)[-1]
+            is_cortex = loss_fn_name.startswith("grpo") or leaf_name.startswith("cortex_grpo")
+            mixed_name = "grpo_mixed_v1" if is_cortex else "ap_grpo_mixed_v1"
             raise ValueError(f"nll_mask requires loss_fn='{mixed_name}'")
         _resolve_teacher_tau(config, microbatch)
     mode = _grpo_config_values(config)["loss_agg_mode"]
@@ -1053,12 +1098,38 @@ def _grpo_packed_loss_reduction(
             "available only for registered GRPO aggregation modes"
         )
 
-    if loss_fn_name.endswith("grpo_echo_v1") and len(microbatches) > 1 and not reduction.loss_is_additive:
+    if echo and len(microbatches) > 1 and not reduction.loss_is_additive:
         raise ValueError(
             f"loss_fn {loss_fn_name!r} requires a globally normalized additive "
             "policy objective when split into multiple packed microbatches"
         )
     return reduction
+
+
+def _grpo_mixed_packed_loss_reduction(
+    microbatches: Sequence[dict],
+    config: dict,
+    loss_fn_name: str,
+) -> PackedLossReduction:
+    return _grpo_packed_loss_reduction(
+        microbatches,
+        config,
+        loss_fn_name,
+        mixed=True,
+    )
+
+
+def _grpo_echo_packed_loss_reduction(
+    microbatches: Sequence[dict],
+    config: dict,
+    loss_fn_name: str,
+) -> PackedLossReduction:
+    return _grpo_packed_loss_reduction(
+        microbatches,
+        config,
+        loss_fn_name,
+        echo=True,
+    )
 
 
 def _merge_distributed_config(config: dict, batch: dict, meta: dict) -> dict:
@@ -1075,8 +1146,16 @@ def _merge_distributed_config(config: dict, batch: dict, meta: dict) -> dict:
                 cfg[key] = meta[key]
             elif batch.get(key) is not None:
                 cfg[key] = batch[key]
-    has_global_denom = cfg.get("batch_num_tokens") is not None or cfg.get("global_batch_size") is not None
-    if cfg.get("dp_size") is None and has_global_denom:
+    uses_weighted_prompt_mean = (
+        cfg.get("loss_agg_mode") == "prompt-mean"
+        and _grpo_context(batch, meta).get("sequence_loss_weights") is not None
+    )
+    has_global_scale = (
+        cfg.get("batch_num_tokens") is not None
+        or cfg.get("global_batch_size") is not None
+        or uses_weighted_prompt_mean
+    )
+    if cfg.get("dp_size") is None and has_global_scale:
         if meta.get("dp_size") is not None:
             cfg["dp_size"] = meta["dp_size"]
         elif batch.get("dp_size") is not None:
@@ -1093,8 +1172,9 @@ def _grpo_context(batch: dict, meta: dict) -> dict:
     "ap_grpo",
     packed_loss_reduction=_grpo_packed_loss_reduction,
     model_call_count_callback=_grpo_model_call_count_callback,
+    metrics_callback=_grpo_metrics_callback,
 )
-@declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
+@declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS, PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG)
 def grpo_loss(
     model_outputs: dict,
     batch: dict,
@@ -1169,10 +1249,11 @@ def _validate_mixed_config(context: dict, config: dict) -> None:
 
 @register_loss_fn(
     "ap_grpo_mixed_v1",
-    packed_loss_reduction=_grpo_packed_loss_reduction,
+    packed_loss_reduction=_grpo_mixed_packed_loss_reduction,
     model_call_count_callback=_grpo_model_call_count_callback,
+    metrics_callback=_grpo_metrics_callback,
 )
-@declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
+@declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS, PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG)
 def grpo_mixed_v1_loss(
     model_outputs: dict,
     batch: dict,
@@ -1189,11 +1270,12 @@ def grpo_mixed_v1_loss(
 
 @register_loss_fn(
     "ap_grpo_echo_v1",
-    packed_loss_reduction=_grpo_packed_loss_reduction,
+    packed_loss_reduction=_grpo_echo_packed_loss_reduction,
     model_call_count_callback=_grpo_model_call_count_callback,
+    metrics_callback=_grpo_metrics_callback,
     summed_metrics=ECHO_SUMMED_METRICS,
 )
-@declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS)
+@declare_loss_capabilities(REQUIRES_ALIGNED_TOKEN_LOGPROBS, PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG)
 def grpo_echo_v1_loss(
     model_outputs: dict,
     batch: dict,

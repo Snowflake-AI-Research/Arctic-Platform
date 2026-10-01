@@ -372,22 +372,6 @@ def metric_is_summed(key: str) -> bool:
     return key.startswith(_SUMMED_METRIC_PREFIXES) or key.endswith(_SUMMED_METRIC_SUFFIXES)
 
 
-def pooled_mixed_metrics(metrics: dict) -> dict[str, float]:
-    """Reconstruct mixed-loss RL means from additive totals after aggregation."""
-    if "nll_trainable_token_count" not in metrics:
-        return {}
-    count = max(metrics["grpo_stats_token_count"], 1.0)
-    return {
-        name: metrics[total] / count
-        for name, total in (
-            ("importance_weight", "grpo_importance_weight_sum"),
-            ("approx_kl", "grpo_log_ratio_sum"),
-            ("clip_ratio", "grpo_clipped_token_count"),
-            ("entropy", "grpo_entropy_sum"),
-        )
-    }
-
-
 def combine_metric_shards(shards_list: list[dict]) -> dict:
     """Combine per-shard metric dicts into a single scalar-per-key dict.
 
@@ -474,7 +458,6 @@ def combine_metric_shards(shards_list: list[dict]) -> dict:
     for k, v in passthrough.items():
         out.setdefault(k, v)
 
-    out.update(pooled_mixed_metrics(out))
     return out
 
 
@@ -552,7 +535,6 @@ def combine_metric_microbatches(per_microbatch_metric_dicts: list[dict]) -> dict
 
     for k, v in passthrough.items():
         out.setdefault(k, v)
-    out.update(pooled_mixed_metrics(out))
     return out
 
 

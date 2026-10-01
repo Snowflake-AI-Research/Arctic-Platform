@@ -38,6 +38,7 @@ import torch.multiprocessing as mp
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.common.utils.batch import promote_batch_dim_to_batch
+from arctic_platform.rl.processors import resolve_loss
 from arctic_platform.rl.processors.functional import _compute_sequence_level_ratio_and_advantages
 from arctic_platform.rl.processors.functional import _resolve_dp_size
 from arctic_platform.rl.processors.functional import agg_loss
@@ -446,6 +447,17 @@ def _sp_loss_worker(rank: int, init_file: str):
         torch_assert_close(prompt_values.grad, torch.tensor([[0.25]]), rtol=0, atol=1e-6)
         assert prompt_loss.item() == (0.25 if rank == 0 else 0.75)
         torch_assert_close(ppo_values.grad, torch.tensor([[-0.5]]), rtol=0, atol=1e-6)
+
+        try:
+            agg_loss(
+                torch.ones((1, 1)),
+                torch.tensor([[rank == 1]]),
+                batch_num_tokens=0,
+            )
+        except ValueError as error:
+            assert "batch_num_tokens=0" in str(error)
+        else:
+            raise AssertionError("every rank must reject a zero denominator when any rank has policy tokens")
     finally:
         dist.destroy_process_group()
 
@@ -538,6 +550,14 @@ class TestMigratedGrpo(TestCasePlus):
                 grpo_loss(outputs, context, {}, {"use_cispo_loss": True, "ratio_mask_bounds_pos": invalid}, "cpu")
         with self.assertRaisesRegex(ValueError, "use_cispo_loss"):
             grpo_loss(outputs, context, {}, {"ratio_stats": True}, "cpu")
+        with self.assertRaisesRegex(ValueError, "finite positive"):
+            grpo_loss(
+                outputs,
+                context,
+                {},
+                {"use_cispo_loss": True, "is_weight_clip_max": 2.0, "ratio_m2_threshold": 0.0},
+                "cpu",
+            )
         with (
             patch("arctic_platform.rl.processors.grpo._get_sequence_parallel_group", return_value=object()),
             self.assertRaisesRegex(ValueError, "does not support sequence parallelism"),
@@ -587,6 +607,18 @@ class TestMigratedGrpo(TestCasePlus):
                 {"use_cispo_loss": "true", "is_weight_clip_max": 2.0},
                 "cpu",
             )
+
+    def test_packed_reduction_leaves_model_call_validation_to_request_boundaries(self):
+        microbatch = {
+            "input_ids": torch.ones((1, 2), dtype=torch.long),
+            "loss_mask": torch.ones((1, 2), dtype=torch.bool),
+        }
+        reduction = _grpo_packed_loss_reduction(
+            [microbatch, microbatch],
+            {"use_cispo_loss": True, "ratio_m2_threshold": 0.1},
+            "ap_grpo",
+        )
+        self.assertEqual(len(reduction.loss_scales), 2)
 
     def test_new_columns_move_from_meta_to_shardable_batch(self):
         meta = {
@@ -675,6 +707,39 @@ class TestMigratedGrpo(TestCasePlus):
                 global_num_echo_sequences=1,
                 observation_token_counts=torch.tensor([1]),
             )
+        with self.assertRaisesRegex(ValueError, "integer counts"):
+            echo_env_prediction_loss_fn(
+                values,
+                mask,
+                observations,
+                torch.zeros_like(mask),
+                global_num_echo_sequences=1,
+                observation_token_counts=torch.tensor([2.5]),
+            )
+        with self.assertRaisesRegex(ValueError, "one full observation count per sequence"):
+            echo_env_prediction_loss_fn(
+                values,
+                mask,
+                observations,
+                torch.zeros_like(mask),
+                global_num_echo_sequences=1,
+                observation_token_counts=torch.tensor([[4]]),
+            )
+
+    def test_echo_bfloat16_keeps_257_token_denominator_in_float32(self):
+        values = torch.full((1, 257), -1.0, dtype=torch.bfloat16, requires_grad=True)
+        mask = torch.ones_like(values, dtype=torch.bool)
+        loss, _ = echo_env_prediction_loss_fn(
+            values,
+            mask,
+            mask,
+            torch.zeros_like(mask),
+            global_num_echo_sequences=1,
+        )
+        self.assertEqual(loss.dtype, torch.float32)
+        self.assertEqual(loss.item(), 1.0)
+        loss.backward()
+        torch_assert_close(values.grad, torch.full_like(values, -1 / 257), rtol=0, atol=1e-5)
 
     def test_teacher_term_changes_only_scored_policy_tokens(self):
         values = torch.tensor([[-1.0, -1.0]], requires_grad=True)
@@ -774,7 +839,25 @@ class TestMigratedGrpo(TestCasePlus):
         loss.backward()
         torch_assert_close(values.grad, torch.tensor([[-0.5, -0.5]]))
         merged = combine_metric_shards([metrics, {**metrics, "grpo_importance_weight_sum": 3.0}])
+        resolve_loss("ap_grpo_mixed_v1").metrics_callback([], merged)
         self.assertEqual(merged["importance_weight"], 2.0)
+
+    def test_mixed_rejects_nonfinite_logprobs_on_nll_tokens(self):
+        values = torch.tensor([[-2.0, float("nan")]], requires_grad=True)
+        context = {
+            "old_log_probs_shifted": torch.tensor([[-2.0, -3.0]]),
+            "advantages": torch.ones_like(values),
+            "loss_mask": torch.ones_like(values, dtype=torch.bool),
+            "nll_mask": torch.tensor([[False, True]]),
+        }
+        with self.assertRaisesRegex(ValueError, "finite at every active nll_mask"):
+            LOSS_FNS["ap_grpo_mixed_v1"](
+                {"logprobs": values},
+                context,
+                {},
+                {"use_cispo_loss": True, "is_weight_clip_max": 5.0},
+                "cpu",
+            )
 
     def test_mixed_rejects_non_subset_and_plain_loss_refuses_nll(self):
         context = {

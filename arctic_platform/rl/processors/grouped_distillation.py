@@ -27,7 +27,12 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from arctic_platform.common.registry import LOSS_FNS
+from arctic_platform.common.registry import METRICS_CALLBACK_ATTR
+from arctic_platform.common.registry import MODEL_CALL_COUNT_CALLBACK_ATTR
+from arctic_platform.common.utils.batch import combine_metric_shards
+from arctic_platform.common.utils.batch import metric_is_summed
 
+from .base_loss import PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG
 from .base_loss import REQUIRES_ALIGNED_TOKEN_LOGPROBS
 from .base_loss import REQUIRES_TOKEN_LOGPROBS
 from .base_loss import BaseLoss
@@ -64,6 +69,11 @@ _TEACHER_TOKEN_ID_DTYPES = frozenset(
     }
 )
 _TEACHER_LOG_PROB_DTYPES = frozenset({torch.float16, torch.bfloat16, torch.float32, torch.float64})
+
+
+def _aggregate_distillation_metrics(worker_metrics: Sequence[dict], metrics: dict) -> None:
+    combined = combine_metric_shards(list(worker_metrics))
+    metrics.update({name: value for name, value in combined.items() if metric_is_summed(name)})
 
 
 class Divergence(str, Enum):
@@ -883,7 +893,7 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
     """Existing ``grpo`` policy behavior plus an optional grouped KD term."""
 
     name = "grpo"
-    capabilities = frozenset({REQUIRES_ALIGNED_TOKEN_LOGPROBS})
+    capabilities = frozenset({REQUIRES_ALIGNED_TOKEN_LOGPROBS, PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG})
     metric_names = _GRPO_DISTILLATION_METRICS
 
     def requires_loss_mask_normalization(self) -> bool:
@@ -927,6 +937,18 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
             config,
             objective="kd_coef > 0",
         )
+
+    def model_call_count_callback(self, model_call_counts: Sequence[int | None], config: dict) -> None:
+        callback = getattr(LOSS_FNS[self.name], MODEL_CALL_COUNT_CALLBACK_ATTR, None)
+        if callback is not None:
+            callback(model_call_counts, config)
+
+    def metrics_callback(self, worker_metrics: Sequence[dict], metrics: dict) -> None:
+        _aggregate_distillation_metrics(worker_metrics, metrics)
+        callback = getattr(LOSS_FNS[self.name], METRICS_CALLBACK_ATTR, None)
+        if callback is not None:
+            callback(worker_metrics, metrics)
+        super().metrics_callback(worker_metrics, metrics)
 
     def validation_callback(self, context: dict, config: dict) -> None:
         context = _validation_context(context)

@@ -185,6 +185,37 @@ class TestA3PackedApply(TestCasePlus):
         self.assertTrue(reduction.loss_is_additive)
         self.assertEqual(reduction.reporting_weights, (0.5, 1.5))
 
+    def test_dotted_mixed_losses_use_mixed_reduction(self):
+        microbatch = self._mb(2, 2)
+        microbatch["nll_mask"] = torch.tensor([[False, True]])
+        config = {
+            "loss_agg_mode": "token-mean",
+            "use_cispo_loss": True,
+            "is_weight_clip_max": 2.0,
+        }
+
+        for loss_fn in (
+            "arctic_platform.rl.processors.grpo.grpo_mixed_v1_loss",
+            "arctic_platform.rl.processors.cortex_grpo.cortex_grpo_mixed_v1_loss",
+        ):
+            reduction = resolve_packed_loss_reduction(
+                {"loss_fn": loss_fn, "config": config},
+                [microbatch],
+            )
+            self.assertFalse(reduction.loss_is_additive)
+
+    def test_dotted_echo_losses_require_additive_split_reduction(self):
+        microbatches = [self._mb(2, 2), self._mb(2, 2)]
+        for loss_fn in (
+            "arctic_platform.rl.processors.grpo.grpo_echo_v1_loss",
+            "arctic_platform.rl.processors.cortex_grpo.cortex_grpo_echo_v1_loss",
+        ):
+            with self.assertRaisesRegex(ValueError, "globally normalized additive"):
+                resolve_packed_loss_reduction(
+                    {"loss_fn": loss_fn, "config": {"loss_agg_mode": "token-mean"}},
+                    microbatches,
+                )
+
     def test_trio_mismatch_across_microbatches_raises(self):
         mb0 = self._mb(2, 2)
         mb0["batch_num_tokens"] = 4.0
@@ -518,6 +549,26 @@ class TestA5Compat(TestCasePlus):
             "cpu",
         )
         self.assertAlmostEqual(loss_dp.item(), 4.0 * loss_local.item(), places=6)
+
+    def test_stamped_dp_scales_weighted_prompt_mean(self):
+        logprobs = torch.zeros(2, 3)
+        batch = {
+            "old_log_probs_shifted": torch.zeros(2, 3),
+            "advantages": torch.ones(2, 3),
+            "loss_mask": torch.ones(2, 3, dtype=torch.bool),
+            "sequence_loss_weights": torch.tensor([0.25, 0.75]),
+        }
+        config = {"loss_agg_mode": "prompt-mean"}
+        for loss_fn in (grpo_loss, cortex_grpo_loss):
+            loss_local, _ = loss_fn({"logprobs": logprobs}, batch, {}, config, "cpu")
+            loss_dp, _ = loss_fn(
+                {"logprobs": logprobs},
+                batch,
+                {"dp_size": 4},
+                config,
+                "cpu",
+            )
+            self.assertAlmostEqual(loss_dp.item(), 4.0 * loss_local.item(), places=6)
 
     def test_cce_context_config_conflict_raises(self):
         with self.assertRaises(ValueError):

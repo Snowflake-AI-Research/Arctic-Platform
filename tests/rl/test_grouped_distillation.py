@@ -397,6 +397,9 @@ def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
     loss_object.batching_callback(request)
     assert request["processing"]["config"]["kd_batch_num_tokens"] == pytest.approx(float(frame["kd_mask"].sum()))
     assert request["labels"][..., -1].tolist() == [-100, -100]
+    loss_object.model_call_count_callback([1], {"ratio_m2_threshold": 0.1})
+    with pytest.raises(ValueError, match="requires exactly one synchronized model call"):
+        loss_object.model_call_count_callback([2], {"ratio_m2_threshold": 0.1})
 
     kwargs = {"dss_compute_logprobs": True}
     output_keys = ["logprobs"]
@@ -412,15 +415,35 @@ def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
     assert torch.equal(kwargs["group_token_ids"], expected_ids)
     assert output_keys == ["logprobs", "group_log_probs"]
 
-    metrics = {"kd_sum": 1.0, "loss_term_kd": 2.0}
+    metrics = {
+        "kd_sum": 1.0,
+        "loss_term_kd": 2.0,
+        "grpo_stats_token_count": 1.0,
+        "grpo_importance_weight_sum": 2.0,
+    }
     loss_object.metrics_callback(
         [
-            {"kd_sum": 1.0, "loss_term_kd": 2.0},
-            {"kd_sum": 3.0, "loss_term_kd": 4.0},
+            {
+                "kd_sum": 1.0,
+                "loss_term_kd": 2.0,
+                "grpo_stats_token_count": 1.0,
+                "grpo_importance_weight_sum": 2.0,
+            },
+            {
+                "kd_sum": 3.0,
+                "loss_term_kd": 4.0,
+                "grpo_stats_token_count": 3.0,
+                "grpo_importance_weight_sum": 6.0,
+            },
         ],
         metrics,
     )
-    assert metrics == {"kd_sum": 4.0, "loss_term_kd": 6.0}
+    assert metrics == {
+        "kd_sum": 4.0,
+        "loss_term_kd": 6.0,
+        "grpo_stats_token_count": 4.0,
+        "grpo_importance_weight_sum": 8.0,
+    }
     outputs = {
         "logits": torch.ones(1),
         "group_log_probs": torch.ones(1),

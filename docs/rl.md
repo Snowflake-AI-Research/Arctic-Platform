@@ -191,8 +191,9 @@ support CISPO-only ratio gates (`ratio_mask_bounds_pos` / `_neg`,
 `_neg`, `ratio_m2_threshold`) and the independent `log_ratio_sq_coef` penalty;
 `ratio_stats=True` enables additive per-bin telemetry without changing the
 objective. `ratio_m2_threshold` requires one packed model call per worker and
-does not support sequence parallelism because M2PO ranking needs one complete
-token set. `ap_grpo_mixed_v1` requires CISPO, `is_weight_clip_max`, and the
+must be positive; it does not support sequence parallelism because M2PO
+ranking needs one complete token set. `ap_grpo_mixed_v1` requires CISPO,
+`is_weight_clip_max`, and the
 prediction-aligned `nll_mask` column; it intentionally rejects ratio-mask
 options to avoid applying policy-only penalties to NLL tokens.
 

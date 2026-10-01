@@ -26,18 +26,17 @@ from typing import Any
 
 from arctic_platform.common.registry import LOSS_CAPABILITIES_ATTR
 from arctic_platform.common.registry import LOSS_FNS
+from arctic_platform.common.registry import METRICS_CALLBACK_ATTR
 from arctic_platform.common.registry import MODEL_CALL_COUNT_CALLBACK_ATTR
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import resolve_fn
-from arctic_platform.common.utils.batch import combine_metric_shards
-from arctic_platform.common.utils.batch import metric_is_summed
-from arctic_platform.common.utils.batch import pooled_mixed_metrics
 from arctic_platform.registry import RegistryMeta
 from arctic_platform.registry import RegistryValidationError
 from arctic_platform.registry import get_registered_class
 
 REQUIRES_ALIGNED_TOKEN_LOGPROBS = "requires_aligned_token_logprobs"
 REQUIRES_TOKEN_LOGPROBS = "requires_token_logprobs"
+PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG = "preserves_explicit_loss_scale_config"
 _LOSS_OBJECT_KEY = "_arctic_platform_loss_object"
 
 
@@ -99,6 +98,10 @@ class BaseLoss(ABC, metaclass=RegistryMeta):
         """Whether DSS should derive global normalization from ``loss_mask``."""
         return False
 
+    def preserves_explicit_loss_scale_config(self) -> bool:
+        """Whether DSS should expose derived scale through context without replacing config."""
+        return self.has_capability(PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG)
+
     def validation_callback(self, context: dict, config: dict) -> None:
         """Validate one request or packed model window before execution."""
 
@@ -121,7 +124,7 @@ class BaseLoss(ABC, metaclass=RegistryMeta):
         return None
 
     def model_call_count_callback(self, model_call_counts: Sequence[int | None], config: dict) -> None:
-        """Validate coordinator-visible model-call counts before execution."""
+        """Validate known model-call counts before execution."""
 
     def metrics_callback(self, worker_metrics: Sequence[dict], metrics: dict) -> None:
         """Combine or amend metrics after worker results are available."""
@@ -176,9 +179,9 @@ class _LegacyLossAdapter(BaseLoss):
             callback(model_call_counts, config)
 
     def metrics_callback(self, worker_metrics: Sequence[dict], metrics: dict) -> None:
-        combined = combine_metric_shards(list(worker_metrics))
-        metrics.update({name: value for name, value in combined.items() if metric_is_summed(name)})
-        metrics.update(pooled_mixed_metrics(combined))
+        callback = getattr(self._loss_fn, METRICS_CALLBACK_ATTR, None)
+        if callback is not None:
+            callback(worker_metrics, metrics)
 
     def packed_reduction_callback(
         self,
