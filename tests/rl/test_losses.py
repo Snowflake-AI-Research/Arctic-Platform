@@ -565,16 +565,6 @@ class TestMigratedGrpo(TestCasePlus):
                 {"use_cispo_loss": True, "is_weight_clip_max": True},
                 "cpu",
             )
-        packed = {
-            "input_ids": torch.ones((1, 1), dtype=torch.long),
-            "loss_mask": torch.ones((1, 1), dtype=torch.bool),
-        }
-        with self.assertRaisesRegex(ValueError, "single packed model call"):
-            _grpo_packed_loss_reduction(
-                [packed, packed],
-                {"use_cispo_loss": True, "is_weight_clip_max": 2.0, "ratio_m2_threshold": 0.1},
-                "ap_grpo",
-            )
 
     def test_new_columns_move_from_meta_to_shardable_batch(self):
         meta = {
@@ -680,6 +670,15 @@ class TestMigratedGrpo(TestCasePlus):
                 config,
                 "cpu",
             )
+        for invalid_tau in (False, "0", "1"):
+            with self.subTest(teacher_tau=invalid_tau), self.assertRaisesRegex(ValueError, "teacher_tau"):
+                grpo_loss(
+                    {"logprobs": values},
+                    {**base_context, "teacher_log_probs_shifted": torch.zeros_like(values)},
+                    {},
+                    {"teacher_tau": invalid_tau, "teacher_clip": 2.0},
+                    "cpu",
+                )
         with self.assertRaisesRegex(ValueError, "floating-point tensor"):
             grpo_loss(
                 {"logprobs": values},

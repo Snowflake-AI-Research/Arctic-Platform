@@ -144,20 +144,26 @@ def _resolve_teacher_tau(config: dict, context: dict) -> float:
     teacher_tau = config.get("teacher_tau")
     teacher_clip = config.get("teacher_clip")
     teacher_clip_negative = config.get("teacher_clip_negative")
-    tau = 0.0 if teacher_tau is None else float(teacher_tau)
+    if teacher_tau is None:
+        return 0.0
+    if isinstance(teacher_tau, bool) or not isinstance(teacher_tau, (int, float)):
+        raise ValueError(f"teacher_tau must be a finite non-negative number, got {teacher_tau!r}")
+    tau = float(teacher_tau)
+    if not math.isfinite(tau) or tau < 0.0:
+        raise ValueError(f"teacher_tau must be a finite non-negative number, got {teacher_tau!r}")
     if tau == 0.0:
         return 0.0
-    if isinstance(teacher_tau, bool) or not math.isfinite(tau) or tau < 0.0:
-        raise ValueError(f"teacher_tau must be a finite non-negative number, got {teacher_tau!r}")
     if (
         teacher_clip is None
         or isinstance(teacher_clip, bool)
+        or not isinstance(teacher_clip, (int, float))
         or not math.isfinite(teacher_clip)
         or teacher_clip <= 0.0
     ):
         raise ValueError(f"teacher_tau={tau} requires a finite positive config 'teacher_clip', got {teacher_clip!r}")
     if teacher_clip_negative is not None and (
         isinstance(teacher_clip_negative, bool)
+        or not isinstance(teacher_clip_negative, (int, float))
         or not math.isfinite(teacher_clip_negative)
         or teacher_clip_negative < 0.0
     ):
@@ -607,11 +613,8 @@ def _internal_grpo_loss_fn(
                 "client must supply the step-global sequence count; a local fallback would rescale "
                 "the auxiliary gradient with microbatch/chunk boundaries."
             )
-        # The aux term inherits the policy term's distributed-reduction
-        # convention so the echo-to-policy ratio equals the configured
-        # aux_ce_weight (paper λ) at every DP width — passing the raw
-        # dp_size would multiply the effective λ by DP width under
-        # prompt-mean + sequence_loss_weights.
+        # The aux term uses the same DP compensation as the policy term so
+        # the echo-to-policy ratio equals the configured aux_ce_weight.
         echo_dp_multiplier = dp_loss_multiplier(loss_agg_mode, sequence_loss_weights, dp_size)
         env_loss, env_stat = echo_env_prediction_loss_fn(
             logprobs=logprobs,
@@ -982,8 +985,6 @@ def _grpo_packed_loss_reduction(
     ratio_masks = RatioMasks.from_config(config)
     if ratio_masks is not None and not config.get("use_cispo_loss"):
         raise ValueError("ratio-mask keys act on the CISPO policy term; they need use_cispo_loss=True.")
-    if ratio_masks is not None and ratio_masks.m2_threshold is not None and len(microbatches) > 1:
-        raise ValueError("ratio_m2_threshold requires a single packed model call per worker")
     for microbatch, mask in zip(microbatches, masks):
         if loss_fn_name.endswith("grpo_mixed_v1"):
             _validate_mixed_config(microbatch, config)
