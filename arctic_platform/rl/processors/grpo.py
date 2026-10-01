@@ -1121,7 +1121,14 @@ def _validate_mixed_config(context: dict, config: dict) -> None:
     if context.get("nll_mask") is None:
         raise ValueError("grpo_mixed_v1 requires nll_mask")
     cap = config.get("is_weight_clip_max")
-    if not config.get("use_cispo_loss") or cap is None or isinstance(cap, bool) or not math.isfinite(cap) or cap <= 0:
+    if (
+        not config.get("use_cispo_loss")
+        or cap is None
+        or isinstance(cap, bool)
+        or not isinstance(cap, (int, float))
+        or not math.isfinite(cap)
+        or cap <= 0
+    ):
         raise ValueError("grpo_mixed_v1 requires CISPO and a finite positive is_weight_clip_max")
     if config.get("importance_sampling_level", "token") != "token":
         raise ValueError("grpo_mixed_v1 requires token importance sampling")

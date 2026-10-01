@@ -557,14 +557,15 @@ class TestMigratedGrpo(TestCasePlus):
                 {"use_cispo_loss": True, "is_weight_clip_max": 2.0, "log_ratio_sq_coef": 0.1},
                 "cpu",
             )
-        with self.assertRaisesRegex(ValueError, "finite positive"):
-            LOSS_FNS["ap_grpo_mixed_v1"](
-                outputs,
-                {**context, "nll_mask": context["loss_mask"]},
-                {},
-                {"use_cispo_loss": True, "is_weight_clip_max": True},
-                "cpu",
-            )
+        for invalid_clip in (True, "2"):
+            with self.subTest(invalid_clip=invalid_clip), self.assertRaisesRegex(ValueError, "finite positive"):
+                LOSS_FNS["ap_grpo_mixed_v1"](
+                    outputs,
+                    {**context, "nll_mask": context["loss_mask"]},
+                    {},
+                    {"use_cispo_loss": True, "is_weight_clip_max": invalid_clip},
+                    "cpu",
+                )
 
     def test_new_columns_move_from_meta_to_shardable_batch(self):
         meta = {
