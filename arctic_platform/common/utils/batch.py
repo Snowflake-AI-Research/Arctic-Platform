@@ -154,8 +154,7 @@ def _promote_list_batch(batch_list: list, meta_data: dict) -> tuple[list, dict]:
             if isinstance(meta_labels, list):
                 if index >= len(meta_labels):
                     raise ValueError(
-                        f"meta labels list has {len(meta_labels)} entries but "
-                        f"batch has {len(batch_list)} microbatches"
+                        f"meta labels list has {len(meta_labels)} entries but batch has {len(batch_list)} microbatches"
                     )
                 microbatch["labels"] = meta_labels[index]
             elif "labels" in meta_data:

@@ -147,15 +147,10 @@ def _engine_forward_kwargs(batch: dict, meta: dict) -> dict:
         extra = ()
     elif isinstance(extra, str):
         extra = (extra,)
-    dropped = [
-        key
-        for key in extra
-        if key not in _ENGINE_FWD_BLOCKED_KEYS and key in meta and key not in batch
-    ]
+    dropped = [key for key in extra if key not in _ENGINE_FWD_BLOCKED_KEYS and key in meta and key not in batch]
     if dropped:
         raise ValueError(
-            f"fwd_meta_keys {dropped!r} are present on meta but not on batch; "
-            "engine kwargs are batch-only"
+            f"fwd_meta_keys {dropped!r} are present on meta but not on batch; engine kwargs are batch-only"
         )
     return {key: batch[key] for key in _ENGINE_FWD_KEYS if key in batch}
 
