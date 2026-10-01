@@ -34,19 +34,27 @@ if TYPE_CHECKING:
 
 @functools.lru_cache(maxsize=None)
 def _load_hf_config(model_path_or_name: str) -> PretrainedConfig | None:
-    """Load (and memoize) the HuggingFace config, or None if the name/path isn't an HF model."""
+    """Load the HuggingFace config, or None when no config file exists.
+
+    An unrecognized ``model_type`` still returns the raw config so a family matcher
+    can select a loader. A config file that cannot be parsed raises. Treating that
+    as a missing model would select the default loader with an empty model type.
+    """
     from transformers import AutoConfig
     from transformers import PretrainedConfig
 
     try:
         return AutoConfig.from_pretrained(model_path_or_name)
     except ValueError:
-        try:
-            config, _ = PretrainedConfig.get_config_dict(model_path_or_name)
-            return PretrainedConfig.from_dict(config)
-        except (OSError, ValueError):
+        config, _ = PretrainedConfig.get_config_dict(model_path_or_name)
+        if not isinstance(config, dict) or not config.get("model_type"):
             return None
+        return PretrainedConfig.from_dict(config)
     except OSError:
+        from pathlib import Path
+
+        if Path(model_path_or_name, "config.json").is_file():
+            raise
         return None
 
 
