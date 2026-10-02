@@ -129,7 +129,7 @@ Current Tinker SDKs use protobuf for:
 Sample requests remain JSON. The codec uses the SDK's generated
 `tinker_public_pb2` schema.
 
-The adapter also handles two tensor conventions:
+The adapter also handles three tensor conventions:
 
 - Tinker rows contain left prompt padding; Cortex expects valid tokens in
   leading columns. The Cortex binder aligns rows before the request and restores
