@@ -10,6 +10,4 @@ def validate_lm_head_fused_ce_config(options: Mapping[str, Any]) -> None:
     """
     fused_cross_entropy = options.get("fused_cross_entropy", "liger")
     if fused_cross_entropy and isinstance(options.get("fused_lm_head_token_chunk_size"), int):
-        raise ValueError(
-            "qwen3_5_moe cannot combine fused_cross_entropy with fused_lm_head_token_chunk_size."
-        )
+        raise ValueError("cannot combine fused_cross_entropy with fused_lm_head_token_chunk_size")
