@@ -20,6 +20,7 @@ Cortex, and restores returned log-probs to Tinker's row layout.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -43,6 +44,24 @@ _POST_PROCESSORS = ["compute_logprobs"]
 _WEIGHTED_LOGPROB_SUM = "weighted_logprob_sum"
 _LOGPROB_WEIGHTS = "logprob_weights_shifted"
 
+_SAMPLER_LOGPROBS = "old_log_probs_shifted"
+
+
+def _clip_config(ratio_clip: tuple[float, float]) -> dict[str, float]:
+    """Lower Tinker's ``(low, high)`` ratio bounds onto ``grpo``'s clip range.
+
+    ``grpo`` always clamps the ratio to ``[1 - eps_clip, 1 + eps_clip_higher]``
+    and its config travels as JSON, which has no infinity, so an unbounded side
+    becomes float32's max: no finite ratio reaches it.
+    """
+    import torch
+
+    low, high = ratio_clip
+    return {
+        "eps_clip": 1.0 - low,
+        "eps_clip_higher": high - 1.0 if math.isfinite(high) else float(torch.finfo(torch.float32).max),
+    }
+
 
 def _grpo_surrogate(body: dict, meta: dict) -> tuple[dict, dict]:
     """Encode Tinker's weighted log-prob gradient with stock ``grpo``."""
@@ -54,6 +73,32 @@ def _grpo_surrogate(body: dict, meta: dict) -> tuple[dict, dict]:
         )
     weights = body.pop(_LOGPROB_WEIGHTS)
     return {**body, "advantages": -weights}, {**meta, "batch_num_tokens": 1}
+
+
+def _pad_rows(body: dict, min_rows: int) -> dict:
+    """Append copies of row 0's tokens until the batch has ``min_rows`` rows.
+
+    Cortex shards rows across its training ranks and refuses a batch with fewer
+    rows than ranks, which RL hits once most groups have equal rewards and are
+    dropped. Only the model inputs are copied; every other tensor is zero on the
+    added rows, so they carry no loss and leave ``batch_num_tokens`` unchanged.
+    """
+    import torch
+
+    rows = body["attention_mask"].shape[0]
+    if rows >= min_rows:
+        return body
+    extra = min_rows - rows
+
+    def pad(name: str, t: Any) -> Any:
+        if not torch.is_tensor(t) or t.dim() == 0 or t.shape[0] != rows:
+            return t
+        filler = t[:1].expand(extra, *t.shape[1:])
+        if name not in ("input_ids", "attention_mask", "position_ids"):
+            filler = torch.full_like(filler, -100 if name == "labels" else 0)
+        return torch.cat([t, filler])
+
+    return {k: pad(k, v) for k, v in body.items()}
 
 
 def _align_plan(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -184,8 +229,9 @@ def _sampled_logprobs(result: dict) -> list[float] | None:
 class CortexTinkerBackend:
     """The five Tinker verbs, lowered onto a Cortex-backed unified client."""
 
-    def __init__(self, client: AsyncArcticRLClient) -> None:
+    def __init__(self, client: AsyncArcticRLClient, min_rows: int = 1) -> None:
         self.client = client
+        self.min_rows = min_rows
 
     async def fwd_bwd(self, batch: dict) -> dict:
         import torch
@@ -205,13 +251,27 @@ class CortexTinkerBackend:
         else:
             body.pop(_LOGPROB_WEIGHTS, None)
 
-        order, valid = _align_plan(attention_mask)
+        # Tinker's ratio is against the sampler's log-probs. Without them Cortex
+        # uses the trainer's own, so the ratio is 1 and any sampler/trainer
+        # mismatch goes uncorrected.
+        ratio_clip = processing.pop("ratio_clip", None)
+        if ratio_clip is not None:
+            if _SAMPLER_LOGPROBS not in body:
+                raise ValueError(f"a ratio loss needs the sampler's log-probs as {_SAMPLER_LOGPROBS!r}")
+            processing["config"] = {**(processing.get("config") or {}), **_clip_config(ratio_clip)}
+
+        rows = attention_mask.shape[0]
+        body = _pad_rows(body, self.min_rows)
+        order, valid = _align_plan(body["attention_mask"])
+        aligned = _align(body, order, valid)
+        sampler_logprobs = aligned.pop(_SAMPLER_LOGPROBS, None)
         payload = to_cortex_fwd_bwd_payload(
-            {"batch": _align(body, order, valid), "meta": meta},
-            processing=batch.get("processing"),
+            {"batch": aligned, "meta": meta},
+            processing=processing,
+            old_log_probs_shifted=sampler_logprobs if ratio_clip is not None else None,
         )
         response = await self.client.fwd_bwd(payload)
-        logprobs = _unalign_rows(_require_logprobs(response, "forward-backward"), order)
+        logprobs = _unalign_rows(_require_logprobs(response, "forward-backward"), order)[:rows]
         return {"batch": {"logprobs": logprobs}, "metrics": response.get("metrics") or {}}
 
     async def fwd_no_grad(self, batch: dict) -> dict:
@@ -222,9 +282,11 @@ class CortexTinkerBackend:
         if not torch.is_tensor(attention_mask):
             body = {k: torch.as_tensor(v) if not torch.is_tensor(v) else v for k, v in body.items()}
             attention_mask = body.get("attention_mask")
-        order, valid = _align_plan(attention_mask)
+        rows = attention_mask.shape[0]
+        body = _pad_rows(body, self.min_rows)
+        order, valid = _align_plan(body["attention_mask"])
         response = await self.client.fwd_no_grad(_forward_payload({"batch": body}, order, valid))
-        logprobs = _unalign_rows(_require_logprobs(response, "forward"), order)
+        logprobs = _unalign_rows(_require_logprobs(response, "forward"), order)[:rows]
         return {"batch": {"logprobs": logprobs}, "metrics": response.get("metrics") or {}}
 
     async def step(self, overrides: dict | None) -> dict:
@@ -265,7 +327,7 @@ class CortexTinkerBackend:
 
 def build_handlers(client: AsyncArcticRLClient) -> dict[str, Callable]:
     """Handler kwargs for ``router.init_tinker_state``."""
-    backend = CortexTinkerBackend(client)
+    backend = CortexTinkerBackend(client, min_rows=max(int(client.config.training_gpus), 1))
     return {
         "fwd_bwd_handler": backend.fwd_bwd,
         "fwd_no_grad_handler": backend.fwd_no_grad,

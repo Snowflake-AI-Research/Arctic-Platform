@@ -17,8 +17,11 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
+from fastapi import HTTPException
 
 from arctic_platform.integrations.tinker.router import AdamParams
 from arctic_platform.integrations.tinker.router import Datum
@@ -62,7 +65,7 @@ class TestDatumAdapter:
         assert out["batch"]["attention_mask"].shape == (1, 12)
         assert out["batch"]["response_mask"].shape == (1, 12)
         assert out["batch"]["advantages"].shape == (1, 12)
-        assert out["batch"]["old_log_probs"].shape == (1, 12)
+        assert out["batch"]["old_log_probs_shifted"].shape == (1, 12)
 
     def test_pad_token_id_used(self):
         # Explicit prompt-only mask (all zeros) → all tokens treated as
@@ -184,6 +187,115 @@ class TestDatumAdapter:
             pad_token_id=0,
         )
         assert out["processing"]["loss_fn"] == "verl_grpo"
+
+
+def _rl_datum(n_prompt, n_response, advantage=0.5):
+    """A cookbook RL datum: ``model_input`` is the sequence minus its last token,
+    and every per-token input is indexed by target, so the first scored entry is
+    the last prompt token's (it predicts the first response token)."""
+    tokens = list(range(1, n_prompt + n_response + 1))
+    n = len(tokens) - 1
+    first = n_prompt - 1
+    advantages = [0.0] * first + [advantage] * (n - first)
+    logprobs = [0.0] * first + [-0.25] * (n - first)
+    return Datum(
+        model_input=ModelInput(chunks=[EncodedTextChunk(tokens=tokens[:-1])]),
+        loss_fn_inputs={
+            "target_tokens": TensorData(dtype="int64", data=tokens[1:], shape=[n]),
+            "advantages": TensorData(dtype="float32", data=advantages, shape=[n]),
+            "logprobs": TensorData(dtype="float32", data=logprobs, shape=[n]),
+        },
+    )
+
+
+def _pack(data, max_prompt_length, max_response_length, **kwargs):
+    return datum_list_to_arctic_batch(
+        data, "importance_sampling", max_prompt_length, max_response_length, pad_token_id=0, **kwargs
+    )
+
+
+class TestSequenceLimits:
+    """A row that fits the full width is never cut; one that does not is refused.
+
+    Cutting the prompt changes what the trainer conditions on, so its log-probs
+    stop matching the sampler's; cutting the response drops scored tokens.
+    """
+
+    @pytest.mark.parametrize(("n_prompt", "n_response"), [(6, 4), (11, 4), (2, 9)])
+    def test_rows_that_fit_keep_every_token(self, n_prompt, n_response):
+        datum = _rl_datum(n_prompt, n_response)
+        out, ((start, end, tinker_len),) = _pack([datum], max_prompt_length=8, max_response_length=8)
+        row = out["batch"]["input_ids"][0]
+        sequence = list(range(1, n_prompt + n_response + 1))
+        assert row[start : start + len(sequence)].tolist() == sequence
+        assert out["batch"]["attention_mask"][0].sum() == len(sequence)
+        assert (end - start, tinker_len) == (len(sequence) - 1, len(sequence) - 1)
+        # Every scored entry lands on its own token: n_response of them.
+        np.testing.assert_allclose(out["batch"]["advantages"][0][out["batch"]["response_mask"][0] == 1], 0.5)
+        assert out["batch"]["response_mask"][0].sum() == n_response
+        np.testing.assert_allclose(
+            out["batch"]["old_log_probs_shifted"][0][out["batch"]["response_mask"][0] == 1], -0.25
+        )
+
+    def test_boundary_stays_at_max_prompt_length_when_it_can(self):
+        out, _ = _pack([_rl_datum(6, 4)], max_prompt_length=8, max_response_length=8)
+        assert out["batch"]["response_mask"][0].tolist().index(1) == 8
+
+    def test_row_wider_than_the_limits_is_refused(self):
+        with pytest.raises(HTTPException) as exc:
+            _pack([_rl_datum(10, 8)], max_prompt_length=8, max_response_length=8)
+        assert exc.value.status_code == 400
+        assert "max_prompt_length + max_response_length" in exc.value.detail
+
+    def test_per_token_input_of_the_wrong_length_is_refused(self):
+        datum = _rl_datum(3, 3)
+        datum.loss_fn_inputs["advantages"] = TensorData(dtype="float32", data=[0.5], shape=[1])
+        with pytest.raises(HTTPException) as exc:
+            _pack([datum], max_prompt_length=8, max_response_length=8)
+        assert exc.value.status_code == 400
+
+    def test_zero_advantage_datum_keeps_its_prompt_out_of_the_response(self):
+        """Equal-reward groups give all-zero advantages, and the cookbook strips
+        ``mask``; the sampler's log-probs still mark where the response starts."""
+        out, _ = _pack([_rl_datum(6, 4, advantage=0.0)], max_prompt_length=8, max_response_length=8)
+        assert out["batch"]["response_mask"][0].sum() == 4
+        assert out["meta"]["batch_num_tokens"] == 4
+
+
+class TestRatioClip:
+    def test_importance_sampling_is_unclipped(self):
+        out, _ = _pack([_rl_datum(3, 3)], 8, 8)
+        assert out["processing"]["ratio_clip"] == (0.0, math.inf)
+
+    def test_ppo_defaults_match_tinker(self):
+        out, _ = datum_list_to_arctic_batch([_rl_datum(3, 3)], "ppo", 8, 8, pad_token_id=0)
+        assert out["processing"]["ratio_clip"] == (0.8, 1.2)
+
+    def test_ppo_takes_thresholds_from_loss_fn_config(self):
+        out, _ = datum_list_to_arctic_batch(
+            [_rl_datum(3, 3)], "ppo", 8, 8, pad_token_id=0, loss_fn_config={"clip_high_threshold": 1.5}
+        )
+        assert out["processing"]["ratio_clip"] == (0.8, 1.5)
+
+    @pytest.mark.parametrize("loss_fn", ["importance_sampling", "ppo"])
+    def test_ratio_loss_without_sampler_logprobs_is_refused(self, loss_fn):
+        datum = _rl_datum(3, 3)
+        del datum.loss_fn_inputs["logprobs"]
+        with pytest.raises(HTTPException) as exc:
+            datum_list_to_arctic_batch([datum], loss_fn, 8, 8, pad_token_id=0)
+        assert exc.value.status_code == 400
+
+    def test_cross_entropy_has_no_ratio(self):
+        datum = Datum(
+            model_input=ModelInput(chunks=[EncodedTextChunk(tokens=[1, 2, 3])]),
+            loss_fn_inputs={"weights": TensorData(dtype="float32", data=[0.0, 1.0, 1.0], shape=[3])},
+        )
+        out, _ = datum_list_to_arctic_batch([datum], "cross_entropy", 8, 8, pad_token_id=0)
+        assert "ratio_clip" not in out["processing"]
+
+    def test_forward_has_no_ratio(self):
+        out, _ = _pack([_rl_datum(3, 3)], 8, 8, forward_only=True)
+        assert "ratio_clip" not in out["processing"]
 
 
 class TestAdamParams:

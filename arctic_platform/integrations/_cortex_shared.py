@@ -108,11 +108,20 @@ def _left_align_batch(tensors: dict, attention_mask, extra: dict) -> tuple[dict,
     )
 
 
-def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) -> dict:
+def to_cortex_fwd_bwd_payload(
+    batch: dict,
+    *,
+    processing: dict | None = None,
+    old_log_probs_shifted: torch.Tensor | None = None,
+) -> dict:
     """Reshape a SkyRL fwd_bwd payload into Cortex's wire shape.
 
-    ``old_log_probs_shifted`` is dropped: server-side GRPO defaults it to
-    ``logprobs.detach()`` (π_old ≡ π_new), correct for single-epoch on-policy.
+    Any ``old_log_probs`` in the batch are dropped: server-side GRPO defaults
+    π_old to ``logprobs.detach()`` (π_old ≡ π_new), correct for single-epoch
+    on-policy. A caller whose ratio is against another policy, such as the
+    sampler's, passes ``old_log_probs_shifted`` -- ``[B, S]`` in the frame
+    Cortex scores in, entry ``i`` being the log-prob of token ``i + 1`` -- and
+    it is sent as π_old.
 
     Requires ``loss_mask`` or ``response_mask``; falling back to
     ``attention_mask`` would train on prompt tokens.
@@ -157,11 +166,12 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
     for k in ("position_ids", "labels"):
         if k in tensors:
             forwarded[k] = tensors[k]
-    forwarded, scored, attention_mask = _left_align_batch(
-        forwarded, attention_mask, {"advantages": advantages, "loss_mask": loss_mask}
-    )
+    scored = {"advantages": advantages, "loss_mask": loss_mask}
+    if old_log_probs_shifted is not None:
+        scored["old_log_probs_shifted"] = old_log_probs_shifted.to(torch.float32)
+    forwarded, scored, attention_mask = _left_align_batch(forwarded, attention_mask, scored)
     input_ids = forwarded["input_ids"]
-    advantages, loss_mask = scored["advantages"], scored["loss_mask"]
+    context: dict[str, Any] = {"input_ids": input_ids, **scored}
 
     kwargs_out: dict[str, Any] = {"input_ids": input_ids, "attention_mask": attention_mask}
     for k in ("position_ids", "labels"):
@@ -177,6 +187,6 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
     return {
         "args": (),
         "kwargs": kwargs_out,
-        "context": {"input_ids": input_ids, "advantages": advantages, "loss_mask": loss_mask},
+        "context": context,
         "processing": {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": proc_config},
     }

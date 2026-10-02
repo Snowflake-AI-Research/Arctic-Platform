@@ -22,6 +22,8 @@ in-process, without Ray / DeepSpeed / vLLM.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import tinker
 from tinker.proto import request_conv
@@ -212,7 +214,7 @@ async def test_forward_backward_happy_path(client, mock_backend):
             "forward_backward_input": {
                 "data": [_mk_datum_dict()],
                 "loss_fn": "ppo",
-                "loss_fn_config": {"clip_low_threshold": 0.9, "clip_high_threshold": 1.1, "kl_coef": 0.01},
+                "loss_fn_config": {"clip_low_threshold": 0.9, "clip_high_threshold": 1.1},
             },
             "model_id": "main",
         },
@@ -230,6 +232,7 @@ async def test_forward_backward_happy_path(client, mock_backend):
     # Confirm the backend received a properly-mapped batch.
     call = mock_backend["calls"]["fwd_bwd"][-1]
     assert call["processing"]["loss_fn"] == "verl_grpo"
+    assert call["processing"]["ratio_clip"] == (0.9, 1.1)
 
 
 async def test_forward_backward_importance_sampling(client, mock_backend):
@@ -246,6 +249,32 @@ async def test_forward_backward_importance_sampling(client, mock_backend):
     assert r.status_code == 200
     call = mock_backend["calls"]["fwd_bwd"][-1]
     assert call["processing"]["loss_fn"] == "verl_grpo"
+    assert call["processing"]["ratio_clip"] == (0.0, math.inf)
+    assert call["batch"]["old_log_probs_shifted"].any()
+
+
+@pytest.mark.parametrize(
+    ("loss_fn", "loss_fn_config"),
+    [
+        ("ppo", {"kl_coef": 0.01}),
+        ("ppo", {"clip_low_threshold": 1.1}),
+        ("importance_sampling", {"clip_low_threshold": 0.9}),
+    ],
+)
+async def test_forward_backward_refuses_loss_fn_config_it_cannot_apply(client, mock_backend, loss_fn, loss_fn_config):
+    r = await client.post(
+        "/api/v1/forward_backward",
+        json={
+            "forward_backward_input": {
+                "data": [_mk_datum_dict()],
+                "loss_fn": loss_fn,
+                "loss_fn_config": loss_fn_config,
+            },
+            "model_id": "main",
+        },
+    )
+    assert r.status_code == 400, r.text
+    assert not mock_backend["calls"]["fwd_bwd"]
 
 
 @pytest.mark.parametrize("loss_fn", ["cispo", "dro"])

@@ -21,6 +21,8 @@ the wire shape and the frame arithmetic without a Cortex job.
 from __future__ import annotations
 
 import asyncio
+import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -42,7 +44,8 @@ class _StubClient:
     visible: the value at a position names the token it belongs to.
     """
 
-    def __init__(self, logprobs=_ECHO_INPUT_IDS, batch_key="batch", metrics=None):
+    def __init__(self, logprobs=_ECHO_INPUT_IDS, batch_key="batch", metrics=None, training_gpus=1):
+        self.config = SimpleNamespace(training_gpus=training_gpus)
         self.sent: list[dict] = []
         self.stepped: list[float | None] = []
         self._logprobs = logprobs
@@ -86,10 +89,16 @@ def _router_batch():
             "attention_mask": attention_mask,
             "response_mask": response_mask,
             "advantages": advantages,
-            "old_log_probs": torch.zeros(3, 8),
+            "old_log_probs_shifted": -0.01 * input_ids.to(torch.float32) * response_mask,
         },
         "meta": {"global_batch_size": 3},
     }
+
+
+def _ratio_loss_batch(ratio_clip=(0.8, 1.2)):
+    batch = _router_batch()
+    batch["processing"] = {"loss_fn": "verl_grpo", "ratio_clip": ratio_clip}
+    return batch
 
 
 class TestRowAlignment:
@@ -180,12 +189,97 @@ class TestForwardBackwardWire:
             batch["batch"]["input_ids"] * mask,
         )
 
-    def test_old_log_probs_are_not_sent(self):
-        """The server re-derives pi_old; shipping ours would be dead weight."""
+    def test_old_log_probs_are_not_sent_without_a_ratio_loss(self):
         client = _StubClient()
         asyncio.run(CortexTinkerBackend(client).fwd_bwd(_router_batch()))
         assert "old_log_probs" not in client.sent[0]["kwargs"]
-        assert "old_log_probs" not in client.sent[0]["context"]
+        assert "old_log_probs_shifted" not in client.sent[0]["context"]
+
+
+class TestRatioLosses:
+    """Tinker's ``importance_sampling`` and ``ppo`` divide by the sampler's log-probs.
+
+    If Cortex falls back to the trainer's own log-probs the ratio is always 1,
+    and a sampler/trainer mismatch goes uncorrected until training collapses.
+    """
+
+    def test_sampler_log_probs_reach_cortex_in_the_sent_frame(self):
+        batch = _ratio_loss_batch()
+        client = _StubClient()
+        asyncio.run(CortexTinkerBackend(client).fwd_bwd(batch))
+        (payload,) = client.sent
+        order, valid = _align_plan(batch["batch"]["attention_mask"])
+        expected = _align(batch["batch"], order, valid)["old_log_probs_shifted"]
+        torch_assert_equal(payload["context"]["old_log_probs_shifted"], expected)
+        assert payload["context"]["old_log_probs_shifted"].dtype == torch.float32
+
+    def test_ppo_bounds_become_grpo_clip_range(self):
+        client = _StubClient()
+        asyncio.run(CortexTinkerBackend(client).fwd_bwd(_ratio_loss_batch((0.9, 1.3))))
+        config = client.sent[0]["processing"]["config"]
+        assert config["eps_clip"] == pytest.approx(0.1)
+        assert config["eps_clip_higher"] == pytest.approx(0.3)
+
+    def test_unbounded_ratio_is_never_clamped(self):
+        """``importance_sampling``: ``grpo`` clamps to ``[1 - eps, 1 + eps_higher]``,
+        so the bounds must contain every positive finite ratio."""
+        client = _StubClient()
+        asyncio.run(CortexTinkerBackend(client).fwd_bwd(_ratio_loss_batch((0.0, math.inf))))
+        config = client.sent[0]["processing"]["config"]
+        assert 1.0 - config["eps_clip"] == 0.0
+        assert 1.0 + config["eps_clip_higher"] == torch.finfo(torch.float32).max
+        assert math.isfinite(config["eps_clip_higher"]), "the config travels as JSON"
+        ratio = torch.tensor([1e-30, 0.5, 1.0, 7.0, 1e30])
+        clamped = torch.clamp(ratio, 1.0 - config["eps_clip"], 1.0 + config["eps_clip_higher"])
+        torch_assert_equal(clamped, ratio)
+
+    def test_ratio_clip_is_not_forwarded(self):
+        client = _StubClient()
+        asyncio.run(CortexTinkerBackend(client).fwd_bwd(_ratio_loss_batch()))
+        assert "ratio_clip" not in client.sent[0]["processing"]
+
+    def test_missing_sampler_log_probs_raise(self):
+        batch = _ratio_loss_batch()
+        del batch["batch"]["old_log_probs_shifted"]
+        with pytest.raises(ValueError, match="old_log_probs_shifted"):
+            asyncio.run(CortexTinkerBackend(_StubClient()).fwd_bwd(batch))
+
+
+class TestRowPadding:
+    """Cortex refuses a batch with fewer rows than training ranks."""
+
+    def test_short_batch_is_padded_without_loss_signal(self):
+        batch = _ratio_loss_batch()
+        client = _StubClient()
+        out = asyncio.run(CortexTinkerBackend(client, min_rows=5).fwd_bwd(batch))
+        (payload,) = client.sent
+        assert payload["kwargs"]["input_ids"].shape[0] == 5
+        torch_assert_equal(
+            payload["kwargs"]["attention_mask"][3:], payload["kwargs"]["attention_mask"][:1].expand(2, -1)
+        )
+        assert not payload["context"]["loss_mask"][3:].any()
+        assert not payload["context"]["advantages"][3:].any()
+        assert not payload["context"]["old_log_probs_shifted"][3:].any()
+        assert out["batch"]["logprobs"].shape[0] == 3
+        mask = batch["batch"]["attention_mask"]
+        torch_assert_equal(out["batch"]["logprobs"].to(torch.long) * mask, batch["batch"]["input_ids"] * mask)
+
+    def test_forward_is_padded_and_trimmed(self):
+        batch = _router_batch()
+        client = _StubClient()
+        out = asyncio.run(CortexTinkerBackend(client, min_rows=4).fwd_no_grad(batch))
+        assert client.sent[0]["kwargs"]["input_ids"].shape[0] == 4
+        assert out["batch"]["logprobs"].shape[0] == 3
+
+    def test_full_batch_is_untouched(self):
+        client = _StubClient()
+        asyncio.run(CortexTinkerBackend(client, min_rows=3).fwd_bwd(_router_batch()))
+        assert client.sent[0]["kwargs"]["input_ids"].shape[0] == 3
+
+    def test_build_handlers_pads_to_the_jobs_training_gpus(self):
+        client = _StubClient(training_gpus=4)
+        asyncio.run(build_handlers(client)["fwd_bwd_handler"](_router_batch()))
+        assert client.sent[0]["kwargs"]["input_ids"].shape[0] == 4
 
 
 class TestCortexResponseShapes:

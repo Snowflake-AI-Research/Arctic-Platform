@@ -83,6 +83,10 @@ Required settings:
 - Ensure rendered prompts fit `--max-prompt-length`.
 - Use `save_every=0` unless acknowledgment-only saves are acceptable.
 
+Training rows are never truncated. A prompt or response longer than its limit
+is accepted as long as the whole datum fits
+`--max-prompt-length + --max-response-length`; a longer datum returns 400.
+
 The cookbook's default learning rate is intended for LoRA. Full fine-tuning
 may require a lower learning rate.
 
@@ -91,7 +95,9 @@ may require a lower learning rate.
 Supported:
 
 - text-only full fine-tuning
-- `ppo`, `importance_sampling`, and `cross_entropy`
+- `ppo`, `importance_sampling`, and `cross_entropy`, with the importance
+  ratio taken against the sampler's log-probs; `ppo` accepts
+  `clip_low_threshold` and `clip_high_threshold` in `loss_fn_config`
 - sampling, forward, forward-backward, optimizer step, and sampler weight sync
 - client-defined custom losses through `forward_backward_custom`
 
@@ -102,10 +108,10 @@ Current limitations:
 | LoRA | `lora_rank > 0` returns 400. |
 | Temperature | Sampling temperatures other than `1.0` return 400. |
 | Checkpoints | `save_weights` returns an acknowledgment path; load and resume are not implemented. |
-| Sequence limits | Over-long prompts and responses are truncated. |
+| Sequence limits | A datum longer than `--max-prompt-length + --max-response-length` returns 400. |
+| Loss config | `loss_fn_config` keys other than PPO's two clip thresholds return 400. |
 | Optimizer overrides | Only the learning rate is applied at step time. |
 | Multimodal input | Only encoded text tokens are passed to Cortex. |
-| Data parallelism | The adapter currently assumes `dp_size=1`. |
 | Authentication | The local Tinker server does not authenticate requests. |
 
 Recipes that require audio, images, LoRA, checkpoint resume, reference-model
@@ -130,6 +136,9 @@ The adapter also handles two tensor conventions:
   the original order in returned log-probs.
 - The final `target_tokens` item is appended as a scoring token. It is excluded
   from the response mask and advantages.
+- Cortex refuses a batch with fewer rows than training GPUs. Short batches are
+  padded with copies of a row that carry no loss, and the copies are dropped
+  from the returned log-probs.
 
 ## Custom losses
 

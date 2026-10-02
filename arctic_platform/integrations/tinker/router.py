@@ -37,6 +37,7 @@ take their schema from the SDK directly -- see
 from __future__ import annotations
 
 import itertools
+import math
 import time
 import uuid
 from enum import Enum
@@ -367,6 +368,38 @@ _BACKEND_LOSS_FNS = {
     "cross_entropy": "weighted_logprob_sum",
 }
 
+# The intermediate name is the same for both ratio losses, so the bounds Tinker
+# puts on the ratio p/q travel separately as ``processing["ratio_clip"]``.
+_PPO_CLIP_DEFAULTS = {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2}
+
+
+def _ratio_clip(loss_fn: str, loss_fn_config: dict[str, float] | None) -> tuple[float, float] | None:
+    """Tinker's ``(low, high)`` bounds on p/q, or ``None`` for a loss without a ratio.
+
+    ``importance_sampling`` is unclipped. ``ppo`` takes its thresholds from
+    ``loss_fn_config``. A key this adapter does not implement is refused, since
+    ignoring it would train with a different loss than the caller asked for.
+    """
+    config = dict(loss_fn_config or {})
+    if loss_fn == "ppo":
+        unknown = sorted(set(config) - set(_PPO_CLIP_DEFAULTS))
+        if unknown:
+            raise HTTPException(
+                400, f"loss_fn='ppo' supports loss_fn_config keys {sorted(_PPO_CLIP_DEFAULTS)}; got {unknown}"
+            )
+        bounds = {**_PPO_CLIP_DEFAULTS, **config}
+        low, high = float(bounds["clip_low_threshold"]), float(bounds["clip_high_threshold"])
+        if not 0.0 <= low <= 1.0 <= high:
+            raise HTTPException(
+                400, f"ppo needs 0 <= clip_low_threshold <= 1 <= clip_high_threshold; got {low}, {high}"
+            )
+        return low, high
+    if config:
+        raise HTTPException(400, f"loss_fn={loss_fn!r} takes no loss_fn_config; got {sorted(config)}")
+    if loss_fn == "importance_sampling":
+        return 0.0, math.inf
+    return None
+
 
 def _model_input_to_tokens(model_input: ModelInput) -> list[int]:
     """Flatten a ``ModelInput`` (v1: text-only) into a token list. Raises 400
@@ -423,6 +456,16 @@ def _split_prompt_response(tokens: list[int], candidates: list[np.ndarray | None
     return len(tokens)
 
 
+def _per_token(inputs: dict[str, TensorData], key: str, index: int, n_tokens: int) -> np.ndarray:
+    """``loss_fn_inputs[key]`` as float32, one entry per ``model_input`` token."""
+    arr = _tensor_data_to_numpy(inputs[key]).astype(np.float32).reshape(-1)
+    if arr.shape[0] != n_tokens:
+        raise HTTPException(
+            400, f"datum {index}: loss_fn_inputs[{key!r}] has {arr.shape[0]} entries for {n_tokens} model_input tokens"
+        )
+    return arr
+
+
 def datum_list_to_arctic_batch(
     data: list[Datum],
     loss_fn: str,
@@ -430,21 +473,30 @@ def datum_list_to_arctic_batch(
     max_response_length: int,
     pad_token_id: int,
     forward_only: bool = False,
+    loss_fn_config: dict[str, float] | None = None,
 ) -> tuple[dict, list[tuple[int, int, int]]]:
     """Pack a list of Tinker ``Datum`` into an Arctic ``fwd_bwd`` batch dict.
 
-    Rows are laid out prompt-left-padded and response-right-padded, split at
-    ``max_prompt_length``, and always padded to ``max_prompt_length +
-    max_response_length`` rather than to the batch's own longest row -- ZoRRo
-    requires the config-max width. The prompt/response boundary is inferred
-    per-datum by :func:`_split_prompt_response`.
+    Rows are padded to ``max_prompt_length + max_response_length`` rather than
+    to the batch's own longest row -- ZoRRo requires the config-max width. The
+    prompt/response boundary, inferred per-datum by
+    :func:`_split_prompt_response`, sits at column ``max_prompt_length`` when
+    the row allows it; a longer prompt or response shifts the whole row
+    instead of being cut, because a cut prompt changes what the trainer
+    conditions on and a cut response drops scored tokens. A row longer than
+    the full width is refused.
+
+    Per-token inputs stay on the column of the ``model_input`` token they are
+    indexed by. Tinker indexes them by target, ``target_tokens[j] ==
+    model_input[j + 1]``, which is the frame Cortex scores in, hence the
+    ``_shifted`` names.
 
     Returns ``(batch_dict, row_slices)``. ``row_slices[i]`` is ``(start, end,
     tinker_len)``: Tinker's contract is that returned log-probs line up with
     the datum's own tokens, so the slices reverse this padded layout on the way
-    back out, and ``tinker_len`` pins the expected on-wire length so
-    truncation stays deterministic.
+    back out.
     """
+    ratio_clip = None if forward_only else _ratio_clip(loss_fn, loss_fn_config)
     mpl = int(max_prompt_length)
     mrl = int(max_response_length)
     total_len = mpl + mrl
@@ -464,15 +516,20 @@ def datum_list_to_arctic_batch(
     for i, datum in enumerate(data):
         toks = _model_input_to_tokens(datum.model_input)
         inputs = datum.loss_fn_inputs
+        if ratio_clip is not None and "logprobs" not in inputs:
+            # Zeros in their place would make the ratio exp(logp) instead of p/q.
+            raise HTTPException(400, f"loss_fn={loss_fn!r} needs the sampler's 'logprobs' in datum {i}")
 
         # SFT datums carry ``weights``, RL datums ``advantages`` +
         # ``target_tokens``. Prompt tokens are zero-masked in all of them, so
-        # whichever is present locates the boundary.
-        candidates: list[np.ndarray | None] = []
-        for key in ("weights", "mask", "advantages", "target_tokens"):
-            td = inputs.get(key)
-            if td is not None:
-                candidates.append(_tensor_data_to_numpy(td).astype(np.float32))
+        # an explicit ``weights`` or ``mask`` locates the boundary, and failing
+        # that the first marker that has one does. An RL datum from a group
+        # with equal rewards has all-zero advantages, and the cookbook strips
+        # ``mask`` before sending, so the sampler's ``logprobs`` -- zero on
+        # observation tokens -- come next.
+        explicit = [key for key in ("weights", "mask") if key in inputs]
+        markers = explicit[:1] or [key for key in ("advantages", "logprobs", "target_tokens") if key in inputs]
+        candidates = [_tensor_data_to_numpy(inputs[key]).astype(np.float32) for key in markers]
 
         # Append the final target as a scoring token. It stays out of
         # ``response_mask`` and ``advantages``.
@@ -483,41 +540,43 @@ def datum_list_to_arctic_batch(
             if len(target_arr):
                 scoring_tok = int(np.asarray(target_arr).reshape(-1)[-1])
 
-        p_end = _split_prompt_response(toks, candidates) if not forward_only else len(toks)
-        prompt_toks = toks[:p_end][-mpl:]
-        # Reserve the last response column for the scoring token.
-        resp_toks = toks[p_end:][: mrl - 1 if scoring_tok is not None else mrl]
-        p_len, r_len = len(prompt_toks), len(resp_toks)
+        n = len(toks)
+        width = n + int(scoring_tok is not None)
+        if width > total_len:
+            raise HTTPException(
+                400,
+                f"datum {i} needs {width} positions (model_input plus the final target) but the "
+                f"server was started with max_prompt_length + max_response_length = {total_len}; "
+                "restart it with larger limits",
+            )
+        p_end = _split_prompt_response(toks, candidates) if not forward_only else n
+        start = min(max(mpl - p_end, 0), total_len - width)
+        resp = slice(start + p_end, start + n)
 
-        response_mask[i, mpl : mpl + r_len] = 1
-
-        input_ids[i, mpl - p_len : mpl] = np.asarray(prompt_toks, dtype=np.int64)
-        input_ids[i, mpl : mpl + r_len] = np.asarray(resp_toks, dtype=np.int64)
-        attention_mask[i, mpl - p_len : mpl + r_len] = 1
+        input_ids[i, start : start + n] = np.asarray(toks, dtype=np.int64)
+        attention_mask[i, start : start + width] = 1
         if scoring_tok is not None:
-            input_ids[i, mpl + r_len] = scoring_tok
-            attention_mask[i, mpl + r_len] = 1
-        row_slices.append((mpl - p_len, mpl + r_len, len(toks)))
+            input_ids[i, start + n] = scoring_tok
+        response_mask[i, resp] = 1
+        row_slices.append((start, start + n, n))
 
-        # These arrive positional over the whole of ``toks``, so the response
-        # tail has to be sliced out before it can go in the response columns.
         if "advantages" in inputs:
-            arr = _tensor_data_to_numpy(inputs["advantages"]).astype(np.float32)
-            resp_adv = arr[p_end : p_end + r_len]
-            advantages[i, mpl : mpl + len(resp_adv)] = resp_adv
+            advantages[i, resp] = _per_token(inputs, "advantages", i, n)[p_end:]
         if "logprobs" in inputs:
-            arr = _tensor_data_to_numpy(inputs["logprobs"]).astype(np.float32)
-            resp_lp = arr[p_end : p_end + r_len]
-            old_log_probs[i, mpl : mpl + len(resp_lp)] = resp_lp
+            old_log_probs[i, resp] = _per_token(inputs, "logprobs", i, n)[p_end:]
         if "weights" in inputs:
-            arr = _tensor_data_to_numpy(inputs["weights"]).astype(np.float32)
-            resp_w = arr[p_end : p_end + r_len]
             # Tinker's cross-entropy is ``L = sum(-logprobs * weights)`` while
             # ``weighted_logprob_sum`` computes ``sum(logprobs * w)``, so the
             # sign flips here. Positions before ``p_end`` are zero by
             # construction -- that is how _split_prompt_response found p_end.
-            logprob_weights[i, mpl : mpl + len(resp_w)] = -resp_w
+            logprob_weights[i, resp] = -_per_token(inputs, "weights", i, n)[p_end:]
 
+    processing: dict[str, Any] = {
+        "post": ["compute_entropy_and_logprobs"],
+        "loss_fn": _BACKEND_LOSS_FNS[loss_fn] if not forward_only else None,
+    }
+    if ratio_clip is not None:
+        processing["ratio_clip"] = ratio_clip
     batch_dict = {
         "batch": {
             "input_ids": input_ids,
@@ -525,17 +584,14 @@ def datum_list_to_arctic_batch(
             # Cortex rebuilds position ids from the attention mask.
             "response_mask": response_mask,
             "advantages": advantages,
-            "old_log_probs": old_log_probs,
+            "old_log_probs_shifted": old_log_probs,
             "logprob_weights_shifted": logprob_weights,
         },
         "meta": {
             "batch_num_tokens": int(response_mask.sum()),
             "global_batch_size": batch_size,
         },
-        "processing": {
-            "post": ["compute_entropy_and_logprobs"],
-            "loss_fn": _BACKEND_LOSS_FNS[loss_fn] if not forward_only else None,
-        },
+        "processing": processing,
     }
     return batch_dict, row_slices
 
@@ -847,6 +903,7 @@ async def _run_forward_backward(req: ForwardBackwardRequest, request: Request) -
         max_resp,
         pad_id,
         forward_only=False,
+        loss_fn_config=fbi.loss_fn_config,
     )
 
     n_data = len(fbi.data)

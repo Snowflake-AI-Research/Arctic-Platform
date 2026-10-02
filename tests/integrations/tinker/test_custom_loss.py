@@ -83,8 +83,10 @@ class TestRouterPacking:
         assert got == pytest.approx([0.0, 0.0, -0.5, 1.5, -2.0])
 
     def test_ratio_losses_keep_their_own_loss_name(self):
+        datum = _ce_datum([1, 2, 3], [0.0, 1.0, 1.0])
+        datum.loss_fn_inputs["logprobs"] = TensorData(dtype="float32", data=[0.0, -1.0, -1.0], shape=[3])
         out, _ = datum_list_to_arctic_batch(
-            [_ce_datum([1, 2, 3], [0.0, 1.0, 1.0])],
+            [datum],
             "ppo",
             max_prompt_length=MPL,
             max_response_length=MRL,
