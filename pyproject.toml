@@ -24,9 +24,6 @@ exclude = [
   "arctic_platform/inference/docs/",
   "arctic_platform/inference/projects/",
   "arctic_platform/inference/README.md",
-  "arctic_platform/inference/LICENSE",
-  "arctic_platform/inference/.gitignore",
-  "arctic_platform/inference/.readthedocs.yaml",
 ]
 
 # Compile csrc only when ARCTIC_INFERENCE_PRECOMPILED_OPS is set. Hatchling
