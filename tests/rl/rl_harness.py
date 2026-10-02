@@ -755,6 +755,6 @@ def skip_if_unsupported(training_gpus: int, sampling_gpus: int, log_prob_gpus: i
     if torch.cuda.device_count() < required:
         pytest.skip(f"need >= {required} GPU(s); have {torch.cuda.device_count()}")
     pytest.importorskip("ray")
-    pytest.importorskip("arctic_inference")
+    pytest.importorskip("arctic_platform.inference")
     pytest.importorskip("vllm")
     pytest.importorskip("deepspeed")
