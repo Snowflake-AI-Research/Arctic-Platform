@@ -134,6 +134,21 @@ def _is_transient_async(exc: BaseException) -> bool:
     return False
 
 
+def _is_poll_transient(exc: BaseException) -> bool:
+    """`_is_transient`, plus a response body cut off mid-read: a status poll is a
+    read, so it is safe to repeat after either."""
+    if isinstance(exc, (requests.exceptions.ChunkedEncodingError, requests.exceptions.ContentDecodingError)):
+        return True
+    return _is_transient(exc)
+
+
+def _is_poll_transient_async(exc: BaseException) -> bool:
+    """`_is_poll_transient` for the aiohttp path."""
+    import aiohttp
+
+    return isinstance(exc, aiohttp.ClientPayloadError) or _is_transient_async(exc)
+
+
 def _is_connect_error(exc: BaseException) -> bool:
     """Only failures proving the request never reached the server (safe for mutating POSTs)."""
     if isinstance(exc, requests.exceptions.ConnectTimeout):
@@ -448,17 +463,28 @@ class CortexTransport(Transport):
         delay = self.poll_interval
         chunks: list[bytes] = []
         cursor: str | None = None
+        last_error: BaseException | None = None
         while time.monotonic() < deadline:
             url, params = self._request_url(request_id, cursor)
-            action, value = _poll_progress(self._send("GET", url, params=params), chunks, request_id)
-            if action == "done":
-                return value
-            if action == "drain":
-                cursor = value  # more result chunks queued; re-poll without backing off
-                continue
+            # The request keeps running while its status is unreachable. Giving up
+            # before the deadline makes callers resubmit it, and a resubmitted
+            # forward-backward accumulates its gradient twice.
+            try:
+                status = self._send("GET", url, retry_on=_is_poll_transient, params=params)
+            except Exception as exc:
+                if not _is_poll_transient(exc):
+                    raise
+                last_error = exc
+            else:
+                action, value = _poll_progress(status, chunks, request_id)
+                if action == "done":
+                    return value
+                if action == "drain":
+                    cursor = value  # more result chunks queued; re-poll without backing off
+                    continue
             time.sleep(delay)
             delay = _next_delay(delay)
-        raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s")
+        raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s") from last_error
 
     async def _apoll(self, submitted: str | dict) -> dict:
         if isinstance(submitted, dict):
@@ -468,17 +494,25 @@ class CortexTransport(Transport):
         delay = self.poll_interval
         chunks: list[bytes] = []
         cursor: str | None = None
+        last_error: BaseException | None = None
         while time.monotonic() < deadline:
             url, params = self._request_url(request_id, cursor)
-            action, value = _poll_progress(await self._asend("GET", url, params=params), chunks, request_id)
-            if action == "done":
-                return value
-            if action == "drain":
-                cursor = value
-                continue
+            try:
+                status = await self._asend("GET", url, retry_on=_is_poll_transient_async, params=params)
+            except Exception as exc:
+                if not _is_poll_transient_async(exc):
+                    raise
+                last_error = exc  # see _poll
+            else:
+                action, value = _poll_progress(status, chunks, request_id)
+                if action == "done":
+                    return value
+                if action == "drain":
+                    cursor = value
+                    continue
             await asyncio.sleep(delay)
             delay = _next_delay(delay)
-        raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s")
+        raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s") from last_error
 
     def _wait_running(self) -> None:
         deadline = time.monotonic() + self.poll_timeout
