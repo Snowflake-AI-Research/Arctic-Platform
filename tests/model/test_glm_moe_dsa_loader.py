@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen loader configuration and runtime ownership boundaries."""
+"""GLM MoE DSA loader configuration and ownership boundaries."""
 
 import json
 import sys
@@ -25,27 +25,27 @@ from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
 from arctic_platform.model import build_model
-from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+from arctic_platform.model.loaders.glm_moe_dsa import GlmMoeDsaOptions
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
 
 
 @pytest.mark.parametrize("composite", [False, True])
-def test_selection_uses_text_config_not_checkpoint_name(tmp_path, composite):
-    config = {"model_type": "qwen3_5_moe_text"}
+def test_selection_uses_model_type(tmp_path, composite):
+    config = {"model_type": "glm_moe_dsa"}
     if composite:
         config = {
-            "model_type": "qwen3_5_moe",
+            "model_type": "glm_vlm",
             "text_config": config,
         }
     (tmp_path / "config.json").write_text(json.dumps(config))
     spec = ModelSpec(model_path_or_name=str(tmp_path), parallelism=ParallelismConfig(expert_parallel=2))
-    assert spec.loader == "qwen3_5_moe"
+    assert spec.loader == "glm_moe_dsa"
 
 
 @pytest.mark.parametrize("backend", ["deepep", "uccl"])
-def test_loader_preserves_options_and_process_groups(monkeypatch, backend):
-    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+def test_loader_preserves_options_and_process_group(monkeypatch, backend):
+    from arctic_platform.model.implementations.glm52 import deepspeed_integration as glm
 
     seen = {}
     model = nn.Identity()
@@ -54,29 +54,31 @@ def test_loader_preserves_options_and_process_groups(monkeypatch, backend):
         seen.update(kwargs)
         return model
 
-    monkeypatch.setattr(qwen, "load_qwen3_5_moe_model", load)
-    ep_group, sp_group = object(), object()
+    monkeypatch.setattr(glm, "load_glm_moe_dsa_model", load)
+    ep_group = object()
     spec = ModelSpec(
         model_path_or_name="local-checkpoint",
-        loader="qwen3_5_moe",
-        parallelism=ParallelismConfig(expert_parallel=2, sequence_parallel=2),
+        loader="glm_moe_dsa",
+        parallelism=ParallelismConfig(expert_parallel=2),
         loader_options={
             "ep_comm_backend": backend,
+            "sparse_mla_backend": "dense",
             "deepep_num_sms": 24,
             "tiled_mlp_token_chunk_size": 32,
             "weight_conversion_cache_dir": "",
-            "trust_remote_code": True,
+            "trust_remote_code": False,
             "ac_config": {"offload_config": {"pin_memory_enabled": False, "pin_memory_max_size_gib": 0}},
         },
     )
-    result = build_model(spec, parallel_groups={"ep_group": ep_group, "sp_group": sp_group})
+    result = build_model(spec, parallel_groups={"ep_group": ep_group})
     assert result.model is model
-    assert seen["ep_group"] is ep_group and seen["sp_group"] is sp_group
-    assert seen["ep_size"] == seen["sp_size"] == 2
+    assert seen["ep_group"] is ep_group
+    assert seen["ep_size"] == 2
+    assert seen["sp_size"] == 1
     assert seen["optimization_dtype"] == "bfloat16"
-    assert seen["attn_implementation"] == "flash_attention_3"
-    assert seen["options"] == Qwen3_5MoeOptions.model_validate(spec.loader_options)
-    assert seen["options"].tiled_mlp_token_chunk_size == 32
+    assert seen["attn_implementation"] == "flash_attention_2"
+    assert seen["options"] == GlmMoeDsaOptions.model_validate(spec.loader_options)
+    assert seen["options"].sparse_mla_backend == "dense"
     assert seen["options"].ac_config.offload_config.pin_memory_enabled is False
     assert ModelSpec.model_validate_json(spec.model_dump_json()) == spec
 
@@ -85,81 +87,81 @@ def test_loader_preserves_options_and_process_groups(monkeypatch, backend):
     "options",
     [
         {"ep_comm_backend": "unknown"},
+        {"sparse_mla_backend": "unknown"},
         {"unsupported_option": True},
         {"debug": {"unknown": True}},
         {"tiled_mlp_token_chunk_size": 0},
+        {"deepep_num_sms": 21},
         {"ac_config": {"freq": 0}},
-        {"ac_config": {"offload_config": {"pin_memory_max_size_gib": -1}}},
-        {"ac_config": {"mode": "selective", "offload_config": {"enabled": True}}},
-        {"fused_cross_entropy": "liger", "fused_lm_head_token_chunk_size": 128},
     ],
 )
 def test_unsupported_options_are_rejected(options):
     with pytest.raises(ValueError):
-        Qwen3_5MoeOptions(**options)
+        GlmMoeDsaOptions(**options)
 
 
-def test_liger_fused_cross_entropy_allows_fp32_lm_head():
-    options = Qwen3_5MoeOptions(fused_cross_entropy="liger", fp32_lm_head=True)
-    assert options.fused_cross_entropy == "liger"
-    assert options.fp32_lm_head is True
+def test_omitted_fused_cross_entropy_defaults_to_liger(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm_moe_dsa"}))
+    spec = ModelSpec(model_path_or_name=str(tmp_path), parallelism=ParallelismConfig(expert_parallel=2))
+    assert spec.loader_options["fused_cross_entropy"] == "liger"
+
+    explicit = ModelSpec(
+        model_path_or_name=str(tmp_path),
+        parallelism=ParallelismConfig(expert_parallel=2),
+        loader_options={"fused_cross_entropy": False},
+    )
+    assert explicit.loader_options["fused_cross_entropy"] is False
+
+
+def test_chunked_lm_head_rejects_fused_cross_entropy():
+    with pytest.raises(ValueError, match="cannot combine fused_cross_entropy"):
+        GlmMoeDsaOptions(
+            fused_cross_entropy="liger",
+            fused_lm_head_token_chunk_size=128,
+        )
+    options = GlmMoeDsaOptions(
+        fused_cross_entropy=False,
+        fused_lm_head_token_chunk_size=128,
+    )
+    assert options.fused_cross_entropy is False
+    assert options.fused_lm_head_token_chunk_size == 128
+
+
+def test_quack_fused_cross_entropy_is_supported():
+    assert GlmMoeDsaOptions(fused_cross_entropy="quack").fused_cross_entropy == "quack"
+    with pytest.raises(ValueError, match="fp32_lm_head"):
+        GlmMoeDsaOptions(fused_cross_entropy="quack", fp32_lm_head=True)
 
 
 @pytest.mark.parametrize(
     "kwargs",
     [
         {"dtype": "float16"},
+        {"parallelism": ParallelismConfig(expert_parallel=2, sequence_parallel=2)},
         {"patches": Patches(peft={"peft_type": "Lora"})},
     ],
 )
 def test_spec_cannot_silently_ignore_settings(kwargs):
     with pytest.raises(ValueError):
-        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", **kwargs)
+        ModelSpec(model_path_or_name="local", loader="glm_moe_dsa", **kwargs)
 
 
-def test_runtime_groups_are_required():
-    spec = ModelSpec(model_path_or_name="local", loader="qwen3_5_moe")
+def test_runtime_group_is_required():
+    spec = ModelSpec(model_path_or_name="local", loader="glm_moe_dsa")
     with pytest.raises(ValueError, match="ep_group"):
         build_model(spec)
 
 
-def test_sequence_parallel_group_is_required():
-    spec = ModelSpec(
-        model_path_or_name="local",
-        loader="qwen3_5_moe",
-        parallelism=ParallelismConfig(expert_parallel=2, sequence_parallel=2),
-    )
-    with pytest.raises(ValueError, match="sp_group"):
-        build_model(spec, parallel_groups={"ep_group": object()})
-
-
-@pytest.mark.parametrize("patches", [Patches(gradient_checkpointing=True), Patches(zorro_train={})])
-def test_generic_forward_patches_are_rejected(patches):
-    with pytest.raises(ValueError, match="generic forward patches"):
-        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", patches=patches)
-
-
-def test_activation_offload_defaults_to_disabled():
-    options = Qwen3_5MoeOptions(ac_config={"offload_config": {}})
-    assert options.ac_config is not None
-    assert options.ac_config.offload_config.enabled is False
-    assert options.ac_config.offload_config.tensor_size_threshold == 1 << 20
-
-
 def test_runtime_config_is_derived_from_validated_options():
-    from arctic_platform.model.implementations.qwen35.deepspeed_integration import _build_model_config
+    from arctic_platform.model.implementations.glm52.deepspeed_integration import _build_model_config
 
-    options = Qwen3_5MoeOptions(
+    options = GlmMoeDsaOptions(
         seq_len=1024,
+        trust_remote_code=False,
         ep_comm_backend="uccl",
-        ac_config={
-            "freq": 2,
-            "offload_config": {
-                "enabled": True,
-                "keep_last_n": 3,
-                "pin_memory_max_size_gib": 0,
-            },
-        },
+        sparse_mla_backend="flashmla",
+        ac_config={"freq": 2},
+        debug={"num_layers": 6, "random_init": True},
     )
     config = _build_model_config(
         "local",
@@ -176,16 +178,10 @@ def test_runtime_config_is_derived_from_validated_options():
     assert config.optimization_dtype == "float32"
     assert config.attn == "sdpa"
     assert config.ep_comm_backend == "uccl"
+    assert config.sparse_mla_backend == "flashmla"
     assert config.ac is options.ac_config
-    assert config.ac.offload_config.enabled is True
-    assert config.ac.offload_config.keep_last_n == 3
-
-
-def test_legacy_qwen_types_are_shared():
-    from arctic_platform.model.implementations.moe.layers.moe import MoE
-    from arctic_platform.model.implementations.qwen35.models.layers.moe import MoE as LegacyMoE
-
-    assert LegacyMoE is MoE
+    assert config.debug.num_layers == 6
+    assert config.debug.random_init is True
 
 
 class TestStandaloneImports(TestCasePlus):
@@ -198,8 +194,7 @@ class BlockService(importlib.abc.MetaPathFinder):
         if fullname.split('.')[0] in ('dss', 'dss_client'):
             raise AssertionError(f'service import: {fullname}')
 sys.meta_path.insert(0, BlockService())
-from arctic_platform.model.implementations.qwen35 import deepspeed_integration
-from arctic_platform.model.implementations import fp8
-print('Standalone MoE and FP8 imports passed')
+from arctic_platform.model.implementations.glm52 import deepspeed_integration
+print('Standalone GLM MoE import passed')
 """
         execute_subprocess_async([sys.executable, "-c", code], env=self.get_env(), timeout=60)
