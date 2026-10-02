@@ -669,7 +669,6 @@ def _internal_grpo_loss_fn(
             )
         # The aux term uses the same DP compensation as the policy term so
         # the echo-to-policy ratio equals the configured aux_ce_weight.
-        echo_dp_multiplier = dp_size
         env_loss, env_stat = echo_env_prediction_loss_fn(
             logprobs=logprobs,
             sft_mask=sft_mask,
@@ -678,7 +677,7 @@ def _internal_grpo_loss_fn(
             global_num_echo_sequences=echo_global_num_sequences,
             batch_denominator=echo_batch_denominator,
             cu_seqlens=input_data.get("cu_seqlens"),
-            dp_size=echo_dp_multiplier,
+            dp_size=dp_size,
             observation_token_counts=input_data.get("echo_observation_token_counts"),
         )
         aux_loss = aux_ce_weight * env_loss
@@ -708,7 +707,7 @@ def _internal_grpo_loss_fn(
                 # weighted-mean reduction reproduces them exactly.
                 "echo_contract_version": 1.0,
                 "echo_aux_ce_weight": float(aux_ce_weight),
-                "echo_dp_loss_multiplier": float(echo_dp_multiplier),
+                "echo_dp_loss_multiplier": float(dp_size),
                 "echo_global_num_sequences": float(echo_global_num_sequences),
                 "echo_batch_denominator_is_echo_bearing": float(
                     env_stat["batch_denominator"] is EchoBatchDenominator.ECHO_BEARING_SEQUENCES

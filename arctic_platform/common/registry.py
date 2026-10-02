@@ -109,8 +109,12 @@ def register_loss_fn(
 ):
     """Register a loss function and its optional execution contracts.
 
-    ``model_call_count_callback`` validates coordinator-visible model-call
-    counts before execution without exposing objective config to dispatchers.
+    ``model_call_count_callback`` validates a list of model-call counts before
+    execution without exposing objective config to dispatchers. DSS's
+    coordinator passes every worker shard's count. The native DeepSpeed worker
+    passes ``[gradient_accumulation_steps()]``, the same on every rank, so its
+    check agrees across ranks. ``run_pipeline(pack=True)`` passes only its local
+    token-budget microbatch count, which depends on that rank's data.
 
     ``metrics_callback`` derives objective-owned response metrics after generic
     worker aggregation.

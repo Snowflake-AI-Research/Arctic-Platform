@@ -221,7 +221,9 @@ def _explicit_zero_step_count(name: str, loss_mask: torch.Tensor) -> int:
     if dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(has_policy_tokens, op=dist.ReduceOp.MAX)
     if has_policy_tokens.item():
-        raise ValueError(f"{name}=0 declares a step with no policy tokens, but this call has some.")
+        raise ValueError(
+            f"{name}=0 declares a step with no policy tokens, but this call has policy tokens on at least one rank."
+        )
     return 1
 
 
@@ -279,7 +281,12 @@ def agg_loss(
       Equivalent to the existing ``/ loss_mask_count`` behaviour.
     - ``"seq-mean-token-sum"``: sum tokens per sequence, then mean across sequences.
     - ``"seq-mean-token-sum-norm"``: same as above, additionally divided by
-      ``loss_scale_factor`` (defaults to ``loss_mask.shape[-1]``).
+      ``loss_scale_factor``. When it is omitted: for packed input
+      (``cu_seqlens`` with a 1-D or single-row loss) the longest packed segment
+      after summing each segment's length over sequence-parallel ranks;
+      otherwise ``loss_mask.shape[-1]``,
+      which under sequence parallelism is this rank's shard width. GRPO callers
+      pass the packing pipeline's ``packed_loss_scale_factor`` when present.
     - ``"seq-mean-token-mean"``: mean tokens per sequence, then mean across sequences.
     - ``"prompt-mean"`` (ScaleRL): for each prompt, token-mean across all its
       responses; then mean across prompts. When ``sequence_loss_weights`` is
@@ -914,10 +921,12 @@ def _config_nonnegative(config: dict, key: str) -> float | None:
 
 
 def _config_positive(config: dict, key: str) -> float | None:
-    value = _config_nonnegative(config, key)
-    if value == 0.0:
-        raise ValueError(f"{key} must be a finite positive number, got {config[key]!r}")
-    return value
+    if key not in config:
+        return None
+    value = config[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{key} must be a finite positive number, got {value!r}")
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -990,6 +999,7 @@ def _ratio_mask_keep(
     m2_keep: torch.Tensor | None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     log_ratio = torch.where(loss_mask, logprobs.detach() - old_logprobs, torch.zeros_like(old_logprobs))
+    # ``advantages`` is token-level here; a zero advantage counts as positive for every sign-split gate below.
     sides = {"pos": loss_mask & (advantages >= 0), "neg": loss_mask & (advantages < 0)}
     drops: dict[str, torch.Tensor] = {}
     for sign, bounds in (("pos", masks.ratio_bounds_pos), ("neg", masks.ratio_bounds_neg)):
@@ -1032,6 +1042,7 @@ def _ratio_mask_keep(
             counts[f"seq_mask_{sign}_sequence_count"] = hit.sum()
             token_hit = hit[sequence_idx].reshape_as(loss_mask) if packed else hit.unsqueeze(-1)
             drops[f"seq_mask_{sign}_drop"] = sides[sign] & token_hit
+    # Always bins the mean log ratio, also when ``seq_mask_stat="mean_k3"`` gates on another statistic.
     counts["seq_stat_bin"] = torch.zeros(
         len(SEQ_STAT_BIN_EDGES) + 1, dtype=torch.int64, device=log_ratio.device
     ).scatter_add_(
@@ -1118,6 +1129,7 @@ def cispo_actor_loss_fn(
         loss_mask = loss_mask & ~nll_mask
         proximal_logprobs = _safe_masked_operand(proximal_logprobs, loss_mask)
         old_logprobs = _safe_masked_operand(old_logprobs, loss_mask)
+    # Gates split on the token-level advantage, before sequence-level IS replaces it below.
     mask_advantages = advantages
     if importance_sampling_level == "sequence":
         log_ratio = torch.where(loss_mask, logprobs - proximal_logprobs, torch.zeros_like(logprobs))

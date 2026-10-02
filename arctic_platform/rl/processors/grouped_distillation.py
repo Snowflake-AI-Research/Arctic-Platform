@@ -993,9 +993,8 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
                 _validate_plain_grpo_context(context, _policy_config(config), self.grpo_variant)
         except ValueError as caught:
             error = caught
-        reference = context.get("input_ids")
-        if torch.is_tensor(reference) and (kd is not None or has_policy_request):
-            _raise_synchronized_validation_error(error, reference)
+        if has_policy_request:
+            _raise_synchronized_validation_error(error, context["input_ids"])
         elif error is not None:
             raise error
 

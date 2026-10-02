@@ -40,6 +40,7 @@ from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.common.utils.batch import promote_batch_dim_to_batch
 from arctic_platform.rl.processors import resolve_loss
+from arctic_platform.rl.processors.functional import RATIO_MASK_CONFIG_KEYS
 from arctic_platform.rl.processors.functional import _compute_sequence_level_ratio_and_advantages
 from arctic_platform.rl.processors.functional import _resolve_dp_size
 from arctic_platform.rl.processors.functional import agg_loss
@@ -762,14 +763,22 @@ class TestMigratedGrpo(TestCasePlus):
                 grpo_loss(outputs, context, {}, {"use_cispo_loss": True, "ratio_mask_bounds_pos": invalid}, "cpu")
         with self.assertRaisesRegex(ValueError, "use_cispo_loss"):
             grpo_loss(outputs, context, {}, {"ratio_stats": True}, "cpu")
-        with self.assertRaisesRegex(ValueError, "finite positive"):
-            grpo_loss(
-                outputs,
-                context,
-                {},
-                {"use_cispo_loss": True, "is_weight_clip_max": 2.0, "ratio_m2_threshold": 0.0},
-                "cpu",
-            )
+        for invalid in (0.0, -0.1, None, True, float("inf")):
+            with (
+                self.subTest(ratio_m2_threshold=invalid),
+                self.assertRaisesRegex(ValueError, "ratio_m2_threshold must be a finite positive number"),
+            ):
+                grpo_loss(
+                    outputs,
+                    context,
+                    {},
+                    {"use_cispo_loss": True, "is_weight_clip_max": 2.0, "ratio_m2_threshold": invalid},
+                    "cpu",
+                )
+        # Unlike the baseline keys, an explicit null is rejected for every ratio-control key.
+        for key in sorted(RATIO_MASK_CONFIG_KEYS):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                grpo_loss(outputs, context, {}, {"use_cispo_loss": True, "is_weight_clip_max": 2.0, key: None}, "cpu")
         with (
             patch("arctic_platform.rl.processors.grpo._get_sequence_parallel_group", return_value=object()),
             self.assertRaisesRegex(ValueError, "does not support sequence parallelism"),
@@ -868,7 +877,15 @@ class TestMigratedGrpo(TestCasePlus):
         with self.assertRaisesRegex(ValueError, r"Unknown config keys for loss_fn 'ap_grpo': \['kd_coef'\]"):
             resolve_loss("ap_grpo").validation_callback(dict(context), {"kd_coef": 0.1})
 
-    def test_plain_grpo_accepts_every_client_sent_config(self):
+    def test_plain_grpo_accepts_representative_client_config_shapes(self):
+        """Hand-written config shapes modelled on current clients are accepted; not an exhaustive client list.
+
+        The PrimeRL shapes are copied by hand from PrimeRL's ``build_grpo_loss_config`` and may drift from it;
+        nothing in this repository checks them against PrimeRL.
+
+        ``metric_loss_count`` and ``apply_behavioral_is_correction`` are deliberately absent: older PrimeRL builds
+        sent them, no GRPO loss reads them, and the plain losses reject them as unknown keys.
+        """
         values = torch.tensor([[-1.0, -1.0]])
         context = {
             "input_ids": torch.ones((1, 2), dtype=torch.long),
@@ -960,7 +977,7 @@ class TestMigratedGrpo(TestCasePlus):
         )
         self.assertEqual(result.item(), 8.0)
         result.backward()
-        torch_assert_close(values.grad, torch.full_like(values, 4.0))
+        torch_assert_close(values.grad, torch.full_like(values, 4.0), rtol=0, atol=0)
 
     def test_explicit_zero_global_denominator_rejects_policy_tokens(self):
         values = torch.tensor([[1.0]])
@@ -993,7 +1010,7 @@ class TestMigratedGrpo(TestCasePlus):
         self.assertEqual(loss.item(), 0.25)
         self.assertEqual(metrics["observation_token_count"].item(), 2)
         loss.backward()
-        torch_assert_close(values.grad, torch.tensor([[-0.25, 0.0]]))
+        torch_assert_close(values.grad, torch.tensor([[-0.25, 0.0]]), rtol=0, atol=0)
 
         context = {
             "old_log_probs_shifted": values.detach(),
@@ -1093,7 +1110,7 @@ class TestMigratedGrpo(TestCasePlus):
         self.assertEqual(metrics["teacher_term_token_count"], 1.0)
         self.assertEqual(metrics["teacher_clipped_log_ratio_sum"], 1.0)
         loss.backward()
-        torch_assert_close(values.grad, torch.tensor([[-0.5, 0.0]]))
+        torch_assert_close(values.grad, torch.tensor([[-0.5, 0.0]]), rtol=0, atol=0)
 
     def test_teacher_clip_negative_sets_an_asymmetric_lower_clip(self):
         # Teacher-minus-policy log ratios 3.0, -1.0 and 0.25 against teacher_clip=2.0.
@@ -1116,7 +1133,7 @@ class TestMigratedGrpo(TestCasePlus):
                 self.assertAlmostEqual(metrics["teacher_log_ratio_sum"], 2.25, places=6)
                 self.assertAlmostEqual(metrics["teacher_clipped_log_ratio_sum"], sum(clipped_terms), places=6)
                 loss.backward()
-                torch_assert_close(values.grad, -torch.tensor([clipped_terms]) / 3)
+                torch_assert_close(values.grad, -torch.tensor([clipped_terms]) / 3, rtol=0, atol=0)
 
         validation_callback = resolve_loss("ap_grpo").validation_callback
         for invalid in (-0.5, float("nan"), float("inf"), True, "0.5"):
@@ -1186,7 +1203,7 @@ class TestMigratedGrpo(TestCasePlus):
         self.assertEqual(metrics["teacher_log_ratio_sum"], 0.0)
         self.assertEqual(metrics["teacher_clipped_log_ratio_sum"], 0.0)
         loss.backward()
-        torch_assert_close(values.grad, torch.zeros_like(values))
+        torch_assert_close(values.grad, torch.zeros_like(values), rtol=0, atol=0)
 
     def test_mixed_loss_and_worker_metrics_exclude_nll_from_rl_means(self):
         values = torch.tensor([[-2.0, -3.0]], requires_grad=True)
@@ -1207,7 +1224,7 @@ class TestMigratedGrpo(TestCasePlus):
         self.assertEqual(metrics["nll_sum"], 3.0)
         self.assertEqual(metrics["grpo_stats_token_count"], 1.0)
         loss.backward()
-        torch_assert_close(values.grad, torch.tensor([[-0.5, -0.5]]))
+        torch_assert_close(values.grad, torch.tensor([[-0.5, -0.5]]), rtol=0, atol=0)
         merged = combine_metric_shards([metrics, {**metrics, "grpo_importance_weight_sum": 3.0}])
         resolve_loss("ap_grpo_mixed_v1").metrics_callback([], merged)
         self.assertEqual(merged["importance_weight"], 2.0)

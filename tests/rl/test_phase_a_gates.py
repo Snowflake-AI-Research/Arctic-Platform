@@ -90,6 +90,32 @@ class TestA1RegistryHygiene(TestCasePlus):
             getattr(fn, PACKED_LOSS_REDUCTION_ATTR), getattr(LOSS_FNS["ap_grpo"], PACKED_LOSS_REDUCTION_ATTR)
         )
 
+    def test_same_fn_conflicting_callbacks_raise(self):
+        from arctic_platform.common.registry import BATCHING_CALLBACK_ATTR
+        from arctic_platform.common.registry import METRICS_CALLBACK_ATTR
+        from arctic_platform.common.registry import MODEL_CALL_COUNT_CALLBACK_ATTR
+        from arctic_platform.common.registry import VALIDATION_CALLBACK_ATTR
+
+        fn = LOSS_FNS["ap_grpo"]
+
+        def other_callback(*_args):
+            raise AssertionError("must not replace a registered GRPO callback")
+
+        for keyword, attr in (
+            ("batching_callback", BATCHING_CALLBACK_ATTR),
+            ("validation_callback", VALIDATION_CALLBACK_ATTR),
+            ("model_call_count_callback", MODEL_CALL_COUNT_CALLBACK_ATTR),
+            ("metrics_callback", METRICS_CALLBACK_ATTR),
+        ):
+            original = getattr(fn, attr)
+            with (
+                self.subTest(keyword=keyword),
+                self.assertRaisesRegex(ValueError, f"refusing to replace {keyword} on registered 'ap_grpo'"),
+            ):
+                register_loss_fn("ap_grpo", **{keyword: other_callback})(fn)
+            self.assertIs(getattr(fn, attr), original)
+            self.assertIs(LOSS_FNS["ap_grpo"], fn)
+
     def test_public_name_overwrite_raises(self):
         original = LOSS_FNS["ap_grpo"]
         leaked = "_phase_a_overwrite_should_not_sum"
