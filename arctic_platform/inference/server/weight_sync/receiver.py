@@ -102,6 +102,37 @@ def _model_parameter_l2(
     )
 
 
+def _canonicalize_fused_moe_destination(name: str, param_names: set[str]) -> str:
+    """Map FusedMoE wire / load_weights names onto runtime Parameter names.
+
+    vLLM MiniMax (and Qwen MoE) store experts at ``experts.routed_experts.w13_weight``,
+    but ``model.load_weights`` reports ``experts.w13_weight``. Destination
+    validation compares against ``named_parameters()`` and would otherwise fail.
+    """
+    if name in param_names:
+        return name
+    for short, long in (
+        (".experts.w13_weight", ".experts.routed_experts.w13_weight"),
+        (".experts.w2_weight", ".experts.routed_experts.w2_weight"),
+    ):
+        if short in name:
+            alt = name.replace(short, long, 1)
+            if alt in param_names:
+                return alt
+    return name
+
+
+def _canonicalize_destinations(
+    destinations: list[str], param_names: set[str]
+) -> list[str]:
+    return sorted(
+        {
+            _canonicalize_fused_moe_destination(name, param_names)
+            for name in destinations
+        }
+    )
+
+
 def _loaded_destination_names(
     source_to_destinations: dict[str, list[str]],
 ) -> set[str]:
@@ -582,6 +613,7 @@ class WeightSyncExtension:
         loaded = 0
         source_to_destinations: dict[str, list[str]] = {}
         skipped_source_names: list[str] = []
+        param_names = {pname for pname, _ in model.named_parameters()}
         recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
         applied_source_l2_sq = torch.zeros(
             (), dtype=torch.float64, device=self.device
@@ -599,6 +631,7 @@ class WeightSyncExtension:
                     destinations = [loaded_names]
                 else:
                     destinations = sorted(set(loaded_names or ()))
+            destinations = _canonicalize_destinations(destinations, param_names)
             if destinations:
                 source_to_destinations[name] = destinations
                 applied_source_l2_sq.add_(source_l2_sq)
