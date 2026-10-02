@@ -98,7 +98,7 @@ Supported:
 - `ppo`, `importance_sampling`, and `cross_entropy`, with the importance
   ratio taken against the sampler's log-probs; `ppo` accepts
   `clip_low_threshold` and `clip_high_threshold` in `loss_fn_config`
-- sampling, forward, forward-backward, optimizer step, and sampler weight sync
+- sampling, forward-backward, optimizer step, and sampler weight sync
 - client-defined custom losses through `forward_backward_custom`
 
 Current limitations:
@@ -110,6 +110,7 @@ Current limitations:
 | Checkpoints | `save_weights` returns an acknowledgment path; load and resume are not implemented. |
 | Sequence limits | A datum longer than `--max-prompt-length + --max-response-length` returns 400. |
 | Loss config | `loss_fn_config` keys other than PPO's two clip thresholds return 400. |
+| Forward | `forward` (log-probs without gradients) is routed to Cortex, which currently fails it with `KeyError: 'pad_token_id'` in its training pipeline. The cookbook's NLL evaluator uses it, so run `chat_sl` with `eval_every=0`. |
 | Optimizer overrides | Only the learning rate is applied at step time. |
 | Multimodal input | Only encoded text tokens are passed to Cortex. |
 | Authentication | The local Tinker server does not authenticate requests. |
