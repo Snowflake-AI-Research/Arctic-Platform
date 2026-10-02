@@ -42,6 +42,25 @@ def test_is_address_in_use_error_walks_exception_chain():
     assert not worker_mod._is_address_in_use_error(RuntimeError("CUDA out of memory"))
 
 
+def test_arctic_patch_fallback_uses_plugin_entrypoint(monkeypatch):
+    from arctic_platform.inference.vllm import plugin
+
+    arg_utils_mod = types.ModuleType("vllm.engine.arg_utils")
+    arg_utils_mod.AsyncEngineArgs = type("AsyncEngineArgs", (), {})
+    monkeypatch.setitem(sys.modules, "vllm.engine.arg_utils", arg_utils_mod)
+
+    calls = []
+    monkeypatch.setattr(
+        plugin,
+        "arctic_inference_plugin",
+        lambda: calls.append("plugin"),
+    )
+
+    worker_mod._ensure_arctic_vllm_patches()
+
+    assert calls == ["plugin"]
+
+
 def test_initialize_retries_vllm_engine_startup_on_address_in_use(monkeypatch):
     calls = []
 
