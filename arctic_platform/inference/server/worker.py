@@ -172,18 +172,17 @@ def _is_address_in_use_error(exc: BaseException) -> bool:
 
 
 def _ensure_arctic_vllm_patches() -> None:
-    if os.getenv("ARCTIC_INFERENCE_SKIP_VERSION_CHECK", "0") != "1":
-        require_supported_vllm_version("InferenceWorker")
-
     from vllm.engine.arg_utils import AsyncEngineArgs
 
     if "__new__" in getattr(AsyncEngineArgs, "_arctic_patches", {}):
         return
 
-    from arctic_platform.inference.vllm.patches import apply_arctic_patches
+    from arctic_platform.inference.vllm.plugin import arctic_inference_plugin
 
     try:
-        apply_arctic_patches()
+        # Use the same entrypoint as installed-package discovery so required
+        # correctness fixes and optional Arctic patches cannot drift apart.
+        arctic_inference_plugin()
     except ValueError as exc:
         if "is already patched by" not in str(exc):
             raise
