@@ -25,6 +25,7 @@ Pure metadata + AST checks: no install, no network, no GPUs.
 from __future__ import annotations
 
 import ast
+import sys
 import tomllib
 from pathlib import Path
 
@@ -169,10 +170,25 @@ class TestExtraNamesResolve:
         optional = project["project"]["optional-dependencies"]
         assert "arctic-inference[server,vllm]>=0.3.0" in optional["rl"]
         assert "arctic_platform[inference]" not in optional["rl"]
+        hook = project["tool"]["hatch"]["build"]["hooks"]["custom"]
+        assert hook["path"] == "hatch_build.py"
         for extra in ("cortex", "sft"):
             for dep in optional[extra]:
                 assert "arctic_platform[inference]" not in dep
                 assert "vllm" not in dep
+
+    def test_precompiled_ops_are_opt_in(self, monkeypatch):
+        """Native extensions compile only when ARCTIC_INFERENCE_PRECOMPILED_OPS is set."""
+        sys.path.insert(0, str(_REPO_ROOT))
+        from hatch_build import precompiled_ops_requested
+
+        monkeypatch.delenv("ARCTIC_INFERENCE_PRECOMPILED_OPS", raising=False)
+        assert not precompiled_ops_requested()
+        for value in ("1", "true", "on"):
+            monkeypatch.setenv("ARCTIC_INFERENCE_PRECOMPILED_OPS", value)
+            assert precompiled_ops_requested()
+        monkeypatch.setenv("ARCTIC_INFERENCE_PRECOMPILED_OPS", "0")
+        assert not precompiled_ops_requested()
 
     def test_inference_docs_and_benchmarks_are_excluded_from_the_wheel(self):
         """The copied docs tree sits in the package directory and stays out of the wheel."""

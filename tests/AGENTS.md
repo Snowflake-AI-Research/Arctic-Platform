@@ -21,14 +21,17 @@ port picking, or tensor asserts in the test file.
 
 `tests/inference` covers `arctic_platform.inference`. It is not part of the
 platform harness above. Default `pytest` and the `[sft,testing]` CI job skip
-it. `[cortex]` and `[sft]` do not install the `[inference]` extra, so they do
-not pull vLLM. `[rl]` does.
+it. `[cortex]`, `[sft]`, and `[rl]` do not install the `[inference]` extra.
+`[rl]` installs the published `arctic-inference` package.
 
 ```text
 pip install -e ".[inference]"
-python arctic_platform/inference/setup.py build_ext
+ARCTIC_INFERENCE_PRECOMPILED_OPS=1 pip install --no-build-isolation -e ".[inference]"
 pytest tests/inference
 ```
+
+The second install is what compiles `csrc/`. Without
+`ARCTIC_INFERENCE_PRECOMPILED_OPS`, hatchling does not run `setup.py`.
 
 Docs, benchmarks, projects, and scripts live in `arctic_platform/inference/`
 and are excluded from the wheel. `csrc/` and `setup.py` are not.

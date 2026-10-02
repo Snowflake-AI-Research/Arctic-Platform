@@ -30,6 +30,16 @@ exclude = [
   "arctic_platform/inference/.readthedocs.yaml",
 ]
 
+# Compile csrc only when ARCTIC_INFERENCE_PRECOMPILED_OPS is set. Hatchling
+# does not run setup.py otherwise, so a cortex or inference install stays
+# source-only unless that variable is set. Torch has to already be installed;
+# use --no-build-isolation so the build can import it.
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.sdist.force-include]
+"hatch_build.py" = "hatch_build.py"
+
 [project.urls]
 Homepage = "https://github.com/Snowflake-AI-Research/Arctic-Platform"
 Repository = "https://github.com/Snowflake-AI-Research/Arctic-Platform"
