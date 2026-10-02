@@ -620,16 +620,19 @@ class TestCortexPollSurvivesTransientErrors:
     _DONE = {"status": "REQUEST_STATE_DONE", "result": {"loss": 1.5}}
 
     @staticmethod
-    def _transport(monkeypatch, max_retries=0):
+    def _cortex():
+        # The transport imports tenacity, which lives in the `cortex` extra.
         pytest.importorskip("tenacity")
+        from arctic_platform.client.transports import cortex
+
+        return cortex
+
+    def _transport(self, monkeypatch):
         monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
         from arctic_platform.client import CortexConfig
-        from arctic_platform.client.transports.cortex import CortexTransport
 
-        cfg = ArcticClientConfig(
-            model_name="m", backend=CortexConfig(max_retries=max_retries), training_gpus=1, sampling_gpus=1
-        )
-        t = CortexTransport(cfg)
+        cfg = ArcticClientConfig(model_name="m", backend=CortexConfig(max_retries=0), training_gpus=1, sampling_gpus=1)
+        t = self._cortex().CortexTransport(cfg)
         t.job_id, t.poll_interval = "job-1", 0.0
         return t
 
@@ -655,6 +658,19 @@ class TestCortexPollSurvivesTransientErrors:
 
         monkeypatch.setattr(t.session, "request", _request)
         return calls
+
+    def _aserve(self, monkeypatch, t, outcomes):
+        retry_policies = []
+
+        async def _asend(method, url, *, retry_on=None, **kwargs):
+            retry_policies.append(retry_on)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(t, "_asend", _asend)
+        return retry_policies
 
     def test_poll_outlasts_retry_budget_and_truncated_bodies(self, monkeypatch):
         import requests
@@ -706,59 +722,39 @@ class TestCortexPollSurvivesTransientErrors:
         assert isinstance(info.value.__cause__, requests.exceptions.HTTPError)
 
     def test_async_poll_outlasts_unreachable_status(self, monkeypatch):
-        aiohttp = pytest.importorskip("aiohttp")
-        from arctic_platform.client.transports import cortex as cortex_module
-
         t = self._transport(monkeypatch)
+        aiohttp = pytest.importorskip("aiohttp")
         outcomes = [
             aiohttp.ClientResponseError(None, (), status=503),
             aiohttp.ClientPayloadError("Response payload is not completed"),
             self._DONE,
         ]
-        retry_policies = []
-
-        async def _asend(method, url, *, retry_on=None, **kwargs):
-            retry_policies.append(retry_on)
-            outcome = outcomes.pop(0)
-            if isinstance(outcome, BaseException):
-                raise outcome
-            return outcome
-
-        monkeypatch.setattr(t, "_asend", _asend)
+        retry_policies = self._aserve(monkeypatch, t, outcomes)
 
         assert asyncio.run(t._apoll("r1")) == {"loss": 1.5}
-        assert retry_policies == [cortex_module._is_poll_transient_async] * 3
+        assert retry_policies == [self._cortex()._is_poll_transient_async] * 3
 
     def test_async_poll_still_raises_a_client_error(self, monkeypatch):
-        aiohttp = pytest.importorskip("aiohttp")
-
         t = self._transport(monkeypatch)
+        aiohttp = pytest.importorskip("aiohttp")
         outcomes = [aiohttp.ClientResponseError(None, (), status=400), self._DONE]
-
-        async def _asend(method, url, *, retry_on=None, **kwargs):
-            outcome = outcomes.pop(0)
-            if isinstance(outcome, BaseException):
-                raise outcome
-            return outcome
-
-        monkeypatch.setattr(t, "_asend", _asend)
+        self._aserve(monkeypatch, t, outcomes)
 
         with pytest.raises(aiohttp.ClientResponseError):
             asyncio.run(t._apoll("r1"))
         assert len(outcomes) == 1
 
     def test_truncated_bodies_are_transient_only_for_polls(self):
+        cortex = self._cortex()
         aiohttp = pytest.importorskip("aiohttp")
         import requests
 
-        from arctic_platform.client.transports import cortex as cortex_module
-
         truncated = aiohttp.ClientPayloadError("Response payload is not completed")
-        assert cortex_module._is_poll_transient_async(truncated)
-        assert not cortex_module._is_transient_async(truncated)
+        assert cortex._is_poll_transient_async(truncated)
+        assert not cortex._is_transient_async(truncated)
         chunked = requests.exceptions.ChunkedEncodingError("cut off")
-        assert cortex_module._is_poll_transient(chunked)
-        assert not cortex_module._is_transient(chunked)
+        assert cortex._is_poll_transient(chunked)
+        assert not cortex._is_transient(chunked)
 
 
 class TestCortexSharedHelper:
