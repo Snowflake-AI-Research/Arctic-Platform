@@ -144,6 +144,7 @@ cortex = [
 # this install can serve training without vLLM.
 sft = [
     "arctic_platform[transport]",
+    "cortex-training",
     "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
     "fastapi",
     "liger-kernel>=0.8.0",
