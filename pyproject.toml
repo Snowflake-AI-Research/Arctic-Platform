@@ -160,7 +160,6 @@ sft = [
 # Sampling stack that lives in arctic_platform.inference. Not referenced by
 # [cortex] or [sft]. vLLM stays on this extra.
 inference = [
-    "cortex-training",
     "exceptiongroup>=1.0; python_version < '3.11'",
     "fastapi",
     "kvcached==0.1.4",

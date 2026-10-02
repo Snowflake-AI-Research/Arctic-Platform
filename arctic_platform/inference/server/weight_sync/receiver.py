@@ -25,9 +25,9 @@ from __future__ import annotations
 import logging
 import time
 
-from cortex_training.peft import normalize_lora_peft_config
 import torch
 
+from arctic_platform.common.peft import normalize_lora_peft_config
 from arctic_platform.inference.utils import require_supported_vllm_version
 
 logger = logging.getLogger(__name__)
