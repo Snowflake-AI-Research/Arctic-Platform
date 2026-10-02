@@ -12,10 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Built-in loaders. Importing this package registers them."""
+"""GLM-5.3-Flash PrimeRL integration."""
 
-from arctic_platform.model.loaders import flash_moe  # noqa: F401
-from arctic_platform.model.loaders import generic_moe  # noqa: F401
-from arctic_platform.model.loaders import glm_moe_dsa  # noqa: F401
-from arctic_platform.model.loaders import huggingface  # noqa: F401
-from arctic_platform.model.loaders import qwen3_5_moe  # noqa: F401
+
+def __getattr__(name: str):
+    if name == "Glm5NextForConditionalGenerationPrimeRL":
+        from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
+            Glm5NextForConditionalGenerationPrimeRL,
+        )
+
+        return Glm5NextForConditionalGenerationPrimeRL
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

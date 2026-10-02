@@ -556,23 +556,34 @@ class _ShardAwareFusedWriter:
             return True
 
         if family == "moe_w13":
-            # Fused vLLM w13 is [w1(gate) | w3(up)] on the intermediate dim.
-            # Feed each per-expert 2-D shard through the expert loader, which
-            # maps the (global) expert id to local and TP-narrows intermediate.
+            # Gated FusedMoE w13 is [w1(gate) | w3(up)] on the intermediate dim.
+            # Non-gated MoE (Nemotron-H) stores only w1 in w13_weight; splitting
+            # in half then loading shard_id=w3 does expert_data.narrow(shard_size)
+            # past the TP-local intermediate (e.g. 672/672 on Super TP=4).
             # NOTE: RoutedExperts.weight_loader routes by *substring* of
             # ``weight_name``; the model-weight copy branch only runs when it
             # contains "weight" (and none of scale/zero/offset/g_idx/shape), so
             # we pass the param's own name ("w13_weight") like vLLM's oracle.
-            inter = tensor.shape[1] // 2
+            moe_config = getattr(module, "moe_config", None)
+            gated = True if moe_config is None else bool(
+                getattr(moe_config, "is_act_and_mul", True)
+            )
             for expert_id in range(tensor.shape[0]):
-                module.weight_loader(
-                    param, tensor[expert_id, :inter, :],
-                    "w13_weight", "w1", expert_id, return_success=True,
-                )
-                module.weight_loader(
-                    param, tensor[expert_id, inter:, :],
-                    "w13_weight", "w3", expert_id, return_success=True,
-                )
+                if gated:
+                    inter = tensor.shape[1] // 2
+                    module.weight_loader(
+                        param, tensor[expert_id, :inter, :],
+                        "w13_weight", "w1", expert_id, return_success=True,
+                    )
+                    module.weight_loader(
+                        param, tensor[expert_id, inter:, :],
+                        "w13_weight", "w3", expert_id, return_success=True,
+                    )
+                else:
+                    module.weight_loader(
+                        param, tensor[expert_id],
+                        "w13_weight", "w1", expert_id, return_success=True,
+                    )
             return True
 
         if family == "moe_w2":
