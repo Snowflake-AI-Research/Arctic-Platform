@@ -1,8 +1,6 @@
 import pytest
 
-from arctic_platform.inference.server.weight_sync.peft import (
-    normalize_lora_peft_config,
-)
+from arctic_platform.common.peft import normalize_lora_peft_config
 
 
 def test_normalize_lora_peft_config_fills_defaults():
