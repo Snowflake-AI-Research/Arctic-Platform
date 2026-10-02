@@ -158,8 +158,11 @@ Live validation covered `math_rl`, `chat_sl`, and `rl_loop` with importance
 sampling, PPO, and cross-entropy. Detailed results are recorded in the PR.
 
 For RL runs, `kl_sample_train_v1` checks agreement between sampler and trainer
-log-probs. Validated runs were approximately `0.0005` to `0.005`; values above
-`0.05` indicate a likely request-shape or alignment problem.
+log-probs. Its level depends on the model. With Qwen3.5-9B and full
+fine-tuning it stayed between `0.03` and `0.045` on GSM8K. On MATH it rose from
+`0.02` to a peak of `0.084` while accuracy climbed fastest, then settled near
+`0.04`. A value far above the model's usual level from the first step, or one
+that keeps rising, points to a request-shape or alignment problem.
 
 ## Tests
 
