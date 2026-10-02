@@ -435,6 +435,11 @@ class DeepSpeedWorker:
 
         if loss_object is None and loss_fn is not None:
             loss_object = resolve_loss(loss_fn)
+        if loss_object is not None:
+            loss_object.model_call_count_callback(
+                [num_micro_batches],
+                processing.get("config") or {},
+            )
         legacy_sft_loss = LOSS_FNS.get(loss_fn) if loss_fn in SFT_LOSS_FNS else None
         use_sft_pipeline = (
             legacy_sft_loss is not None

@@ -33,6 +33,7 @@ from .causal_cross_entropy import causal_cross_entropy_loss
 from .compute_logprobs import compute_logprobs_post
 from .cortex_grpo import cortex_grpo_echo_v1_loss
 from .cortex_grpo import cortex_grpo_loss
+from .cortex_grpo import cortex_grpo_mixed_v1_loss
 
 # Functional math
 from .functional import _compute_sequence_level_ratio_and_advantages
@@ -68,6 +69,7 @@ from .grpo import _tensor_scalar_stats
 from .grpo import compute_prox_logp_approximations
 from .grpo import grpo_echo_v1_loss
 from .grpo import grpo_loss
+from .grpo import grpo_mixed_v1_loss
 
 # Micro-batch splitting
 from .microbatch import DEFAULT_MAX_TOKENS_PER_MB
@@ -204,8 +206,10 @@ __all__ = [
     "PROX_APPROX_METHOD_ROLLOUT",
     "PROX_APPROX_METHODS_ALL",
     "grpo_loss",
+    "grpo_mixed_v1_loss",
     "grpo_echo_v1_loss",
     "cortex_grpo_loss",
+    "cortex_grpo_mixed_v1_loss",
     "cortex_grpo_echo_v1_loss",
     "sft_loss",
     "sft_ce_loss",
