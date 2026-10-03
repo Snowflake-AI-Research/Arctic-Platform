@@ -62,6 +62,7 @@ from arctic_platform.common.registry import _resolve_fn
 from arctic_platform.common.registry import register_loss_fn  # noqa: F401  # re-exported
 from arctic_platform.common.registry import register_post_processor
 from arctic_platform.common.utils.batch import BATCH_DIM_CONTEXT_KEYS
+from arctic_platform.common.utils.batch import _copy_scalar_fwd_keys
 from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
 from arctic_platform.rl.utils.batch import detensorize
 from arctic_platform.rl.utils.batch import log_dp_shard_tokens
@@ -109,6 +110,7 @@ _ENGINE_FWD_KEYS = frozenset(
         "cu_seq_lens_k",
         "max_length_q",
         "max_length_k",
+        "seq_idx",
     }
 )
 # Blocked even if listed in ``fwd_meta_keys``. ``labels`` stays on the allowlist
@@ -133,27 +135,45 @@ _ENGINE_FWD_BLOCKED_KEYS = (
 ) - _ENGINE_FWD_KEYS
 
 
-def _engine_forward_kwargs(batch: dict, meta: dict) -> dict:
-    """Cortex-style isolation: engine sees model inputs, not advantages / masks.
+def _fwd_meta_key_missing_from_batch(key: str, batch: dict, meta: dict) -> bool:
+    """True when ``fwd_meta_keys`` names a model input that is not on ``batch``."""
+    return key not in _ENGINE_FWD_BLOCKED_KEYS and key in meta and key not in batch
 
-    Default allowlist is ``_ENGINE_FWD_KEYS``. ``meta['fwd_meta_keys']`` may add
-    extra keys; blocked loss / scale keys never reach ``engine()``.
+
+def _engine_forward_kwargs(batch: dict, meta: dict) -> dict:
+    """Return allowlisted model inputs from ``batch``.
+
+    ``meta['fwd_meta_keys']`` cannot add engine kwargs. If it names a
+    non-blocked key that is present on ``meta`` and absent from ``batch``,
+    raise — that request would otherwise be silently dropped.
     """
     extra = meta.get("fwd_meta_keys")
     if extra is None:
         extra = ()
     elif isinstance(extra, str):
         extra = (extra,)
-    allowed = set(_ENGINE_FWD_KEYS)
-    allowed.update(extra)
-    allowed -= _ENGINE_FWD_BLOCKED_KEYS
-    kwargs = {}
-    for key in allowed:
-        if key in batch:
-            kwargs[key] = batch[key]
-        elif key in meta:
-            kwargs[key] = meta[key]
-    return kwargs
+    dropped = [key for key in extra if _fwd_meta_key_missing_from_batch(key, batch, meta)]
+    if dropped:
+        raise ValueError(
+            f"fwd_meta_keys {dropped!r} are present on meta but not on batch; engine kwargs are batch-only"
+        )
+    return {key: batch[key] for key in _ENGINE_FWD_KEYS if key in batch}
+
+
+def _require_loss_fn(processing: dict, *, backward: bool | str) -> str | None:
+    """Require an explicit loss name whenever this call will compute a loss."""
+    if "loss_fn" not in processing:
+        if backward is False:
+            return None
+        raise ValueError("processing requires 'loss_fn' when backward is not False")
+    loss_fn_name = processing["loss_fn"]
+    if loss_fn_name is None and backward is not False:
+        raise ValueError("processing['loss_fn'] is None but backward is not False")
+    return loss_fn_name
+
+
+def _engine_rank(engine) -> Any:
+    return getattr(engine, "global_rank", 0)
 
 
 # PROFILER_TYPE = "c"
@@ -375,7 +395,14 @@ def run_pipeline(
         When ``backward="loss_only"``: same as loss path but also includes
         ``"loss_tensor"`` (undetached, caller handles backward).
     """
-    loss_fn_name = processing.get("loss_fn", "ap_grpo")
+    if "cu_seqlens" in batch:
+        raise ValueError("cu_seqlens is meta-only; do not put it on batch")
+
+    batch = dict(batch)
+    meta = dict(meta)
+    _copy_scalar_fwd_keys(batch, meta)
+
+    loss_fn_name = _require_loss_fn(processing, backward=backward)
     if loss_object is None and loss_fn_name is not None:
         loss_object = resolve_loss(loss_fn_name)
 
@@ -384,8 +411,7 @@ def run_pipeline(
         # definitive signal that packing already happened — skip to avoid
         # double-packing. Any other case (including missing attention_mask) falls
         # through to packing, which will fail fast with a clear assertion error.
-        all_input = {**batch, **meta}
-        if "cu_seqlens" not in all_input:
+        if "cu_seqlens" not in meta:
             return _run_pipeline_with_packing(
                 engine,
                 args,
@@ -399,7 +425,8 @@ def run_pipeline(
                 loss_object=loss_object,
             )
 
-    tname_e2e = timers.start(f"run_pipeline e2e {engine.global_rank}")
+    rank = _engine_rank(engine)
+    tname_e2e = timers.start(f"run_pipeline e2e {rank}")
     see_memory_usage("before fwd", force=True)
     post_names = processing.get("post", [])
     config = processing.get("config", {})
@@ -408,13 +435,14 @@ def run_pipeline(
     # Entropy is expensive: it requires a full-vocab softmax. In the non-zorro path
     # it is built by ``compute_entropy_and_logprobs_post``; in the zorro path it is
     # computed inside the model forward, which reads ``calculate_entropy`` from
-    # ``**meta`` below. Gating ``meta["calculate_entropy"]`` here -- before the
+    # engine kwargs. Gating ``batch["calculate_entropy"]`` here -- before the
     # forward -- covers both. Only override when ``actor_config`` explicitly carries
     # an ``entropy_coeff`` (i.e. the update_actor / loss path); the fwd-no-grad
     # ``compute_log_prob`` passes intentionally request entropy for logging and do
-    # not send ``actor_config``, so they are left untouched. A fresh dict is used so
-    # the shared per-call ``meta`` is not mutated.
-    if meta.get("calculate_entropy"):
+    # not send ``actor_config``, so they are left untouched. Fresh dicts so the
+    # shared per-call bags are not mutated.
+    entropy_flag = batch.get("calculate_entropy", meta.get("calculate_entropy"))
+    if entropy_flag:
         actor_config = meta.get("actor_config")
         if isinstance(actor_config, dict) and "entropy_coeff" in actor_config:
             try:
@@ -422,14 +450,12 @@ def run_pipeline(
             except (TypeError, ValueError):
                 entropy_used = bool(actor_config["entropy_coeff"])
             if not entropy_used:
+                batch = {**batch, "calculate_entropy": False}
                 meta = {**meta, "calculate_entropy": False}
 
     # --- forward ---
-    # Isolation: ``_engine_forward_kwargs`` allowlists model inputs. Optional
-    # ``meta['fwd_meta_keys']`` may add keys; blocked loss tensors never pass.
-
     pack_with_unpad = True  # XXX: make configurable?
-    already_packed = "cu_seqlens" in batch or "cu_seqlens" in meta
+    already_packed = "cu_seqlens" in meta
     if already_packed:
         # Inner packing call and pack_for_dss already flattened sequences.
         # Unpad expects attention_mask / prompts that packed mb_kwargs omit.
@@ -457,12 +483,18 @@ def run_pipeline(
     # pr0(f"{pack_with_unpad=}")
 
     if pack_with_unpad:
+        if "attention_mask" not in batch or "pad_token_id" not in meta:
+            raise ValueError(
+                "pack=False without cu_seqlens requires attention_mask in batch and "
+                "pad_token_id in meta so the 2D batch can be unpadded; send cu_seqlens "
+                "on meta if the input is already packed"
+            )
         pad_token = meta["pad_token_id"]
         attention_mask_2d_bool = batch["attention_mask"].bool()
         batch = padded_tensor_2d_dict_to_unpadded_tensor_1d_dict(batch, attention_mask_2d_bool)
 
     log_dp_shard_tokens(
-        engine.global_rank,
+        rank,
         "run_pipeline after_unpad",
         batch,
         meta,
@@ -470,10 +502,10 @@ def run_pipeline(
 
     pr0(f"effective {batch['input_ids'].shape=}")
     prof_fwd = ProfilerContext(type=PROFILER_TYPE, name="FWD")
-    tname = timers.start(f"pipe fwd {engine.global_rank}")
+    tname = timers.start(f"pipe fwd {rank}")
     with prof_fwd():
-        # Isolation: only model-bound keys reach engine(). Zorro reads
-        # calculate_entropy; loss tensors stay on batch/meta for posts/losses.
+        # Zorro reads calculate_entropy from engine kwargs. Loss tensors stay
+        # on batch and meta for posts and losses.
         fwd_kwargs = _engine_forward_kwargs(batch, meta)
         output_keys = ["logits", "logprobs", "entropy", "loss"]
         if loss_object is not None:
@@ -503,7 +535,7 @@ def run_pipeline(
 
     # --- post-forward ---
     prof_post_fwd = ProfilerContext(type=PROFILER_TYPE, name="POST-FWD")
-    tname = timers.start(f"pipe post-fwd {engine.global_rank}")
+    tname = timers.start(f"pipe post-fwd {rank}")
     post_process_outputs = dict()
     # Later posts in this call may read earlier posts' outputs. Copy so the
     # worker's shared GAS ``meta`` is not mutated.
@@ -528,7 +560,7 @@ def run_pipeline(
 
     # --- loss + backward ---
     if loss_fn_name is not None:
-        tname = timers.start(f"pipe loss {engine.global_rank}")
+        tname = timers.start(f"pipe loss {rank}")
 
         prof_loss = ProfilerContext(type=PROFILER_TYPE, name="LOSS")
         with prof_loss():
@@ -542,7 +574,7 @@ def run_pipeline(
         if backward is True:
 
             prof_bwd = ProfilerContext(type=PROFILER_TYPE, name="BWD")
-            tname = timers.start(f"pipe bwd {engine.global_rank}")
+            tname = timers.start(f"pipe bwd {rank}")
             with prof_bwd():
 
                 # GRAD-FIX: Arctic's user-side loss is already normalized as
@@ -651,15 +683,11 @@ def _run_pipeline_with_packing(
         }
         mb_1d["packed_loss_scale_factor"] = pack_meta["S"]
 
-        # Model always receives packed [1, T] input_ids + position_ids
-        mb_kwargs = {
-            "input_ids": packed["input_ids"],
-            "position_ids": packed["position_ids"],
-            "use_cache": False,
-        }
-        for optional_key in ("labels", "dss_compute_logprobs", "rollout_is_weights"):
-            if optional_key in packed:
-                mb_kwargs[optional_key] = packed[optional_key]
+        # Model receives packed [1, T] allowlisted keys. Loss tensors stay on mb_1d.
+        mb_kwargs = {"use_cache": packed.get("use_cache", False)}
+        for key in _ENGINE_FWD_KEYS:
+            if key in packed:
+                mb_kwargs[key] = packed[key]
 
         if backward is True and hasattr(engine, "set_gradient_accumulation_boundary"):
             engine.set_gradient_accumulation_boundary(i == n_mbs - 1)
