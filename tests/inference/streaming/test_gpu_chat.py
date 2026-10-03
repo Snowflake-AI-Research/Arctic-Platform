@@ -124,6 +124,8 @@ def test_prompt_matches_the_official_template_and_reasoning_is_split():
                 expected = tokenizer.apply_chat_template(
                     messages, add_generation_prompt=True, tokenize=True, enable_thinking=thinking
                 )
+                # Transformers 5 returns an encoding rather than a bare ID list.
+                expected = expected["input_ids"] if hasattr(expected, "keys") else expected
                 assert usage(events)["prompt_tokens"] == len(expected), (messages, effort)
                 assert "<think>" not in content(events) and "</think>" not in content(events)
                 assert not any("text" in e for e in events if e["type"] == "reasoning_delta")
