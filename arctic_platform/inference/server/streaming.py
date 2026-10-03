@@ -14,6 +14,21 @@ from uuid import uuid4
 
 MAX_WORKER_STREAMS = 128
 CONTEXT_LIMIT_SOURCES = frozenset({"prompt", "completion_budget"})
+# Prefixes of vLLM 0.30's structured-output validation errors. With the
+# default "auto" backend a schema xgrammar rejects falls back to guidance, then
+# outlines, so the error the caller sees can come from any of the three.
+STRUCTURED_OUTPUT_ERRORS = (
+    "Failed to transform json schema into a grammar: ",
+    "The provided JSON schema contains features not supported by xgrammar.",
+    "Invalid JSON grammar specification.",
+    "Invalid grammar specification",
+    "Grammar error: ",
+    "Error serializing structured outputs jsonschema: ",
+    "Failed to transform json schema into a regex: ",
+    "Error parsing regex: ",
+    "Regex uses unsupported feature for structured outputs: ",
+    "Regex does not have a anchored universal start state",
+)
 
 
 class StreamError(RuntimeError):
@@ -52,6 +67,8 @@ def classify_engine_error(exc):
         "with speculative decoding."
     ):
         return "invalid_sampling_params", None
+    if message.startswith(STRUCTURED_OUTPUT_ERRORS):
+        return "invalid_structured_output", None
     if (
         message.startswith("This model's maximum context length is ")
         and "your prompt contains" in message
@@ -153,6 +170,7 @@ def validate_request(prompt, sampling_params):
         "n",
         "seed",
         "logit_bias",
+        "structured_output",
     }
     if unsupported:
         raise ValueError(f"Unsupported streaming parameters: {sorted(unsupported)}")
@@ -225,6 +243,33 @@ def validate_request(prompt, sampling_params):
                 )
             biases[token] = float(bias)
         params["logit_bias"] = biases
+    structured_output = params.get("structured_output")
+    if structured_output is not None:
+        if not isinstance(structured_output, dict) or not (
+            (
+                structured_output.keys() == {"json"}
+                and isinstance(structured_output["json"], dict)
+            )
+            or (
+                structured_output.keys() == {"json_object"}
+                and structured_output["json_object"] is True
+            )
+        ):
+            raise ValueError(
+                'structured_output must be {"json": <schema object>} '
+                'or {"json_object": true}'
+            )
+        if "json" in structured_output:
+            try:
+                schema = json.dumps(
+                    structured_output["json"],
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError, RecursionError):
+                raise ValueError("structured_output schema must be JSON") from None
+            if len(schema.encode("utf-8")) > 64 * 1024:
+                raise ValueError("structured_output schema exceeds 65536 bytes")
     return prompt, params
 
 
@@ -533,7 +578,17 @@ class StreamingWorkerMixin:
 
     def _stream_sampling_params(self, params):
         from vllm import SamplingParams
-        from vllm.sampling_params import RequestOutputKind
+        from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
+
+        # Requests carry plain JSON across Ray; the vLLM type is built here.
+        params = dict(params)
+        structured_output = params.pop("structured_output", None)
+        if structured_output is not None:
+            params["structured_outputs"] = (
+                StructuredOutputsParams(json=structured_output["json"])
+                if "json" in structured_output
+                else StructuredOutputsParams(json_object=True)
+            )
 
         return SamplingParams(
             **params,

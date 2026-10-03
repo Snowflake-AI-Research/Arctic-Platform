@@ -1,6 +1,7 @@
 """Opt-in real-engine Driver streaming acceptance tests."""
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -196,6 +197,47 @@ def test_driver_abort_reclaims_engine_requests():
             )
         ]
         assert followup[-1]["type"] == "completed"
+
+    asyncio.run(with_driver(check))
+
+
+def test_structured_output_always_matches_the_schema():
+    schema = {
+        "type": "object",
+        "properties": {
+            "city": {"type": "string"},
+            "population": {"type": "integer"},
+        },
+        "required": ["city", "population"],
+        "additionalProperties": False,
+    }
+
+    async def check(driver):
+        runs = await asyncio.gather(
+            *(
+                collect(
+                    driver,
+                    "Describe a city as JSON:",
+                    {
+                        "temperature": 0.7,
+                        "max_tokens": 256,
+                        "seed": seed,
+                        "structured_output": {"json": schema},
+                    },
+                )
+                for seed in range(20)
+            )
+        )
+        for events in runs:
+            assert events[-1]["type"] == "completed", events[-1]
+            finish = next(e for e in events if e["type"] == "choice_finished")
+            assert finish["finish_reason"] == "stop"
+            value = json.loads(
+                "".join(e["text"] for e in events if e["type"] == "delta")
+            )
+            assert value.keys() == {"city", "population"}
+            assert isinstance(value["city"], str)
+            assert type(value["population"]) is int
 
     asyncio.run(with_driver(check))
 

@@ -102,3 +102,82 @@ def test_logit_bias_reaches_the_engine(engine_params):
 )
 def test_logit_bias_engine_rejection_is_typed(error):
     assert classify_engine_error(error) == ("invalid_sampling_params", None)
+
+
+SCHEMA = {"type": "object", "properties": {"city": {"type": "string"}}}
+
+
+@pytest.mark.parametrize(
+    "structured_output", [{"json": SCHEMA}, {"json": {}}, {"json_object": True}]
+)
+def test_structured_output_shapes(structured_output):
+    _, params = validate_request("prompt", {"structured_output": structured_output})
+    assert params["structured_output"] == structured_output
+
+
+def test_structured_output_schema_size_boundary():
+    # {"description":"..."} is 18 bytes of framing around the padding.
+    at_limit = {"description": "x" * (64 * 1024 - 18)}
+    validate_request("prompt", {"structured_output": {"json": at_limit}})
+    over = {"description": "x" * (64 * 1024 - 17)}
+    with pytest.raises(ValueError, match="65536"):
+        validate_request("prompt", {"structured_output": {"json": over}})
+
+
+@pytest.mark.parametrize(
+    "structured_output",
+    [
+        {},
+        {"json": SCHEMA, "json_object": True},
+        {"json": '{"type": "object"}'},
+        {"json": None},
+        {"json_object": False},
+        {"json_object": 1},
+        {"regex": "a+"},
+        {"json": {"maximum": float("nan")}},
+        {"json": {"enum": {1, 2}}},
+        "json_object",
+        ["json_object"],
+    ],
+)
+def test_structured_output_rejection(structured_output):
+    with pytest.raises(ValueError, match="structured_output"):
+        validate_request("prompt", {"structured_output": structured_output})
+
+
+def test_structured_output_becomes_the_vllm_type(engine_params):
+    kwargs = engine_params({"structured_output": {"json": SCHEMA}})
+    assert "structured_output" not in kwargs
+    assert kwargs["structured_outputs"].kwargs == {"json": SCHEMA}
+    kwargs = engine_params({"structured_output": {"json_object": True}})
+    assert kwargs["structured_outputs"].kwargs == {"json_object": True}
+    assert "structured_outputs" not in engine_params({})
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to transform json schema into a grammar: unsupported keyword",
+        "The provided JSON schema contains features not supported by xgrammar.",
+        "Grammar error: unsatisfiable schema",
+        "Invalid grammar specification: bad key",
+        "Failed to transform json schema into a regex: unsupported",
+        "Regex uses unsupported feature for structured outputs: lookaround. "
+        "Only basic matching constructs are supported",
+    ],
+)
+def test_structured_output_engine_rejection_is_typed(message):
+    assert classify_engine_error(VLLMValidationError(message)) == (
+        "invalid_structured_output",
+        None,
+    )
+
+
+def test_unrelated_validation_errors_stay_engine_errors():
+    assert classify_engine_error(VLLMValidationError("something else")) == (
+        "engine_error",
+        None,
+    )
+    assert classify_engine_error(
+        RuntimeError("Grammar error: not a validation error")
+    ) == ("engine_error", None)

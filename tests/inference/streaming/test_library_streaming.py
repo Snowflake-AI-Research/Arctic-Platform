@@ -46,6 +46,7 @@ class FakeEngine:
                 "legacy-context-error",
                 "validation-error",
                 "logit-bias-error",
+                "grammar-error",
             }:
                 from vllm.exceptions import VLLMValidationError
 
@@ -70,6 +71,10 @@ class FakeEngine:
                         "token ids. Vocabulary size: 8",
                         parameter="logit_bias",
                         value=[9],
+                    )
+                if prompt == "grammar-error":
+                    raise VLLMValidationError(
+                        "Grammar error: sensitive schema details"
                     )
                 raise VLLMValidationError(
                     "sensitive unsupported sampling parameter"
@@ -310,6 +315,7 @@ def test_cancel_before_dispatch():
         ("legacy-context-error", "context_length_exceeded", "prompt"),
         ("validation-error", "engine_error", None),
         ("logit-bias-error", "invalid_sampling_params", None),
+        ("grammar-error", "invalid_structured_output", None),
     ],
 )
 def test_engine_errors_are_terminal_and_sanitized(
