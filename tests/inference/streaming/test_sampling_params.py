@@ -181,3 +181,32 @@ def test_unrelated_validation_errors_stay_engine_errors():
     assert classify_engine_error(
         RuntimeError("Grammar error: not a validation error")
     ) == ("engine_error", None)
+
+
+@pytest.mark.parametrize("budget", [1, 64])
+def test_thinking_token_budget_accepts_one_to_max_tokens(budget, engine_params):
+    sampling_params = {"max_tokens": 64, "thinking_token_budget": budget}
+    assert engine_params(sampling_params)["thinking_token_budget"] == budget
+
+
+@pytest.mark.parametrize("budget", [0, -1, 65, 1.0, True, "8"])
+def test_thinking_token_budget_rejection(budget):
+    with pytest.raises(ValueError, match="thinking_token_budget"):
+        validate_request(
+            "prompt", {"max_tokens": 64, "thinking_token_budget": budget}
+        )
+
+
+def test_thinking_token_budget_is_bounded_by_the_default_max_tokens():
+    validate_request("prompt", {"thinking_token_budget": 4096})
+    with pytest.raises(ValueError, match="thinking_token_budget"):
+        validate_request("prompt", {"thinking_token_budget": 4097})
+
+
+def test_thinking_budget_without_a_reasoning_parser_is_typed():
+    error = VLLMValidationError(
+        "thinking_token_budget is set but reasoning_config is not configured. "
+        "Please set --reasoning-parser and/or --reasoning-config to use "
+        "thinking_token_budget."
+    )
+    assert classify_engine_error(error) == ("invalid_sampling_params", None)

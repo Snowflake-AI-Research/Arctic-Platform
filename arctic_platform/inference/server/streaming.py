@@ -67,6 +67,10 @@ def classify_engine_error(exc):
         "with speculative decoding."
     ):
         return "invalid_sampling_params", None
+    if message.startswith(
+        "thinking_token_budget is set but reasoning_config is not configured."
+    ):
+        return "invalid_sampling_params", None
     if message.startswith(STRUCTURED_OUTPUT_ERRORS):
         return "invalid_structured_output", None
     if (
@@ -171,6 +175,7 @@ def validate_request(prompt, sampling_params):
         "seed",
         "logit_bias",
         "structured_output",
+        "thinking_token_budget",
     }
     if unsupported:
         raise ValueError(f"Unsupported streaming parameters: {sorted(unsupported)}")
@@ -270,6 +275,11 @@ def validate_request(prompt, sampling_params):
                 raise ValueError("structured_output schema must be JSON") from None
             if len(schema.encode("utf-8")) > 64 * 1024:
                 raise ValueError("structured_output schema exceeds 65536 bytes")
+    budget = params.get("thinking_token_budget")
+    if budget is not None and (
+        type(budget) is not int or not 1 <= budget <= params["max_tokens"]
+    ):
+        raise ValueError("thinking_token_budget must be an integer in [1, max_tokens]")
     return prompt, params
 
 
