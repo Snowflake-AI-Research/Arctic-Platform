@@ -12,10 +12,16 @@ from dataclasses import asdict, dataclass
 from typing import AsyncIterator
 from uuid import uuid4
 
+from arctic_platform.inference.server.chat import (
+    DEFAULT_CHAT_MAX_TOKENS,
+    ChatInputError,
+    ChatOutput,
+    ChatPrompt,
+    validate_chat_prompt,
+)
+
 MAX_WORKER_STREAMS = 128
 CONTEXT_LIMIT_SOURCES = frozenset({"prompt", "completion_budget"})
-# Features callers can check before relying on them, like ``read_buffered``.
-STREAM_CAPABILITIES = frozenset({"sampling_params"})
 # Prefixes of vLLM 0.30's structured-output validation errors. With the
 # default "auto" backend a schema xgrammar rejects falls back to guidance, then
 # outlines, so the error the caller sees can come from any of the three.
@@ -31,10 +37,24 @@ STRUCTURED_OUTPUT_ERRORS = (
     "Regex uses unsupported feature for structured outputs: ",
     "Regex does not have a anchored universal start state",
 )
+# Chat input errors that name the offending request field in ``param``.
+PARAM_ERROR_CODES = frozenset({"invalid_message_content", "invalid_chat_request"})
+# Text prompts emit "delta"; chat prompts emit the output already split by kind.
+DELTA_TYPES = frozenset({"delta", "content_delta", "reasoning_delta", "tool_call_delta"})
+FINISH_REASONS = frozenset({"stop", "length", "tool_calls"})
+# Features callers can check before relying on them, like ``read_buffered``.
+STREAM_CAPABILITIES = frozenset({"sampling_params", "chat_prompt"})
 
 
 class StreamError(RuntimeError):
-    def __init__(self, code: str, *, context_limit_source=None):
+    def __init__(self, code: str, *, context_limit_source=None, param=None):
+        if param is not None and (
+            code not in PARAM_ERROR_CODES
+            or not isinstance(param, str)
+            or not 0 < len(param) <= 64
+        ):
+            raise ValueError("param is valid only for chat input errors")
+        self.param = param
         if code == "context_length_exceeded":
             if (
                 not isinstance(context_limit_source, str)
@@ -163,8 +183,12 @@ def validate_request(prompt, sampling_params):
         ):
             raise ValueError("Prompt must contain 1..131072 nonnegative token IDs")
         prompt = list(prompt)
+    elif isinstance(prompt, ChatPrompt):
+        prompt = validate_chat_prompt(prompt)
     else:
-        raise ValueError("Expected one prepared text prompt or token-ID list")
+        raise ValueError(
+            "Expected one prepared text prompt, token-ID list or ChatPrompt"
+        )
     params = dict(sampling_params or {})
     unsupported = params.keys() - {
         "temperature",
@@ -182,9 +206,14 @@ def validate_request(prompt, sampling_params):
     }
     if unsupported:
         raise ValueError(f"Unsupported streaming parameters: {sorted(unsupported)}")
-    params.setdefault("max_tokens", 4096)
+    if not isinstance(prompt, ChatPrompt):
+        # A chat prompt's default budget depends on its rendered length, so
+        # the worker sets it after rendering.
+        params.setdefault("max_tokens", 4096)
     params.setdefault("n", 1)
     for name, ceiling in (("max_tokens", 131072), ("n", 8)):
+        if name not in params:
+            continue
         if type(params[name]) is not int or not 1 <= params[name] <= ceiling:
             raise ValueError(f"{name} must be an integer in [1, {ceiling}]")
     for name, default, lower, upper in (
@@ -280,7 +309,9 @@ def validate_request(prompt, sampling_params):
                 raise ValueError("structured_output schema exceeds 65536 bytes")
     budget = params.get("thinking_token_budget")
     if budget is not None and (
-        type(budget) is not int or not 1 <= budget <= params["max_tokens"]
+        type(budget) is not int
+        # A chat prompt's budget is set after rendering, and checked again there.
+        or not 1 <= budget <= params.get("max_tokens", 131072)
     ):
         raise ValueError("thinking_token_budget must be an integer in [1, max_tokens]")
     logprobs = params.get("logprobs")
@@ -356,6 +387,29 @@ def valid_delta_logprobs(event):
     )
 
 
+def _valid_delta_fields(event, chat):
+    """Check one choice event's fields; chat and text prompts emit different kinds."""
+    kind = event["type"]
+    if kind == "choice_finished":
+        return chat or event.get("finish_reason") != "tool_calls"
+    if (kind == "delta") == chat:
+        return False
+    if kind == "content_delta":
+        return isinstance(event.get("text"), str)
+    if kind == "reasoning_delta":
+        return type(event.get("token_count")) is int and event["token_count"] >= 0
+    if kind == "tool_call_delta":
+        return (
+            type(event.get("index")) is int
+            and event["index"] >= 0
+            and isinstance(event.get("arguments"), str)
+            and all(
+                isinstance(event[key], str) for key in ("id", "name") if key in event
+            )
+        )
+    return True
+
+
 def event_size(event):
     return len(
         json.dumps(event, ensure_ascii=True, separators=(",", ":")).encode("ascii")
@@ -379,7 +433,8 @@ class EventBuffer:
         self._open_deltas = {}
 
     def put(self, event):
-        if event.get("type") == "delta" and self._merge(event):
+        mergeable = event.get("type") in DELTA_TYPES
+        if mergeable and self._merge(event):
             return
         size = event_size(event)
         if size > self.limits.max_event_bytes:
@@ -391,7 +446,7 @@ class EventBuffer:
             raise StreamError("buffer_overflow")
         entry = [event, size]
         self.events.append(entry)
-        if event.get("type") == "delta":
+        if mergeable:
             self._open_deltas[event["choice_index"]] = entry
         elif "choice_index" in event:
             self._open_deltas.pop(event["choice_index"], None)
@@ -411,9 +466,25 @@ class EventBuffer:
         each delta before the next arrives, so nothing merges.
         """
         entry = self._open_deltas.get(event["choice_index"])
-        if entry is None:
+        if entry is None or entry[0]["type"] != event["type"]:
             return False
-        merged = {**entry[0], "text": entry[0]["text"] + event["text"]}
+        kind = event["type"]
+        if kind == "reasoning_delta":
+            merged = {
+                **entry[0],
+                "token_count": entry[0]["token_count"] + event["token_count"],
+            }
+        elif kind == "tool_call_delta":
+            # Only argument text continuing the same call joins it; a new id or
+            # name starts a call of its own.
+            if entry[0]["index"] != event["index"] or "id" in event or "name" in event:
+                return False
+            merged = {
+                **entry[0],
+                "arguments": entry[0]["arguments"] + event["arguments"],
+            }
+        else:
+            merged = {**entry[0], "text": entry[0]["text"] + event["text"]}
         if "token_ids" in entry[0] or "token_ids" in event:
             merged["token_ids"] = [
                 *entry[0].get("token_ids", ()), *event.get("token_ids", ())
@@ -440,10 +511,10 @@ class EventBuffer:
             del self._open_deltas[event["choice_index"]]
         return event
 
-    def fail(self, code, *, context_limit_source=None):
+    def fail(self, code, *, context_limit_source=None, param=None):
         if self.error is None:
             self.error = StreamError(
-                code, context_limit_source=context_limit_source
+                code, context_limit_source=context_limit_source, param=param
             )
         self.events.clear()
         self._open_deltas.clear()
@@ -493,14 +564,23 @@ class EngineStream:
         finished = set()
         prompt_tokens = None
         outputs = None
+        chat = None
         try:
-            params = self.owner._stream_sampling_params(self.params)
-            prepared = (
-                {"prompt_token_ids": self.prompt}
-                if isinstance(self.prompt, list)
-                else self.prompt
-            )
             kwargs = {"request_id": self.attempt_id}
+            if isinstance(self.prompt, ChatPrompt):
+                chat, prepared = await self._render_chat(kwargs)
+                params = self.owner._stream_sampling_params(
+                    {**self.params, "structured_outputs": chat.rendered.structured_outputs}
+                    if chat.rendered.structured_outputs is not None
+                    else self.params
+                )
+            else:
+                params = self.owner._stream_sampling_params(self.params)
+                prepared = (
+                    {"prompt_token_ids": self.prompt}
+                    if isinstance(self.prompt, list)
+                    else self.prompt
+                )
             adapter = self.owner._active_lora_request()
             if adapter is not None:
                 kwargs["lora_request"] = adapter
@@ -521,29 +601,48 @@ class EngineStream:
                     counts[index] += len(choice.token_ids)
                     if counts[index] > self.params["max_tokens"]:
                         raise StreamError("invalid_engine_output")
-                    if choice.text or choice.token_ids:
+                    if (
+                        choice.finish_reason is not None
+                        and choice.finish_reason not in {"stop", "length"}
+                    ):
+                        raise StreamError("engine_aborted")
+                    logprobs = (
+                        delta_logprobs(
+                            list(choice.token_ids), choice.logprobs, self.params["logprobs"]
+                        )
+                        if self.params.get("logprobs") is not None
+                        else None
+                    )
+                    if chat is not None:
+                        for event in chat.events(
+                            index,
+                            choice.text,
+                            list(choice.token_ids),
+                            choice.finish_reason is not None,
+                            logprobs,
+                        ):
+                            self.buffer.put(event)
+                    elif choice.text or choice.token_ids:
                         delta = {
                             "type": "delta",
                             "choice_index": index,
                             "text": choice.text,
                             "token_ids": list(choice.token_ids),
                         }
-                        if self.params.get("logprobs") is not None:
-                            delta["logprobs"] = delta_logprobs(
-                                delta["token_ids"],
-                                choice.logprobs,
-                                self.params["logprobs"],
-                            )
+                        if logprobs is not None:
+                            delta["logprobs"] = logprobs
                         self.buffer.put(delta)
                     if choice.finish_reason is not None:
-                        if choice.finish_reason not in {"stop", "length"}:
-                            raise StreamError("engine_aborted")
                         finished.add(index)
                         self.buffer.put(
                             {
                                 "type": "choice_finished",
                                 "choice_index": index,
-                                "finish_reason": choice.finish_reason,
+                                "finish_reason": chat.finish_reason(
+                                    index, choice.finish_reason
+                                )
+                                if chat is not None
+                                else choice.finish_reason,
                             }
                         )
             if len(finished) != len(counts) or prompt_tokens is None:
@@ -557,27 +656,30 @@ class EngineStream:
                 raise StreamError("cleanup_unconfirmed") from None
             if self.buffer.error:
                 raise self.buffer.error
-            self.buffer.put(
-                {
-                    "type": "usage",
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": sum(counts),
-                    "total_tokens": prompt_tokens + sum(counts),
-                }
-            )
+            usage = {
+                "type": "usage",
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": sum(counts),
+                "total_tokens": prompt_tokens + sum(counts),
+            }
+            if chat is not None:
+                usage["reasoning_tokens"] = min(chat.reasoning_tokens(), sum(counts))
+            self.buffer.put(usage)
             self.buffer.put({"type": "completed"})
             self.buffer.done = True
             self.buffer.ready.set()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            param = None
             if isinstance(exc, StreamError):
                 code = exc.code
                 context_limit_source = exc.context_limit_source
+                param = exc.param
             else:
                 code, context_limit_source = classify_engine_error(exc)
             self.buffer.fail(
-                code, context_limit_source=context_limit_source
+                code, context_limit_source=context_limit_source, param=param
             )
             self.ack.set()
         finally:
@@ -591,6 +693,32 @@ class EngineStream:
                     self.buffer.fail("cleanup_unconfirmed")
             if self.buffer.error:
                 await self.abort_engine()
+
+    async def _render_chat(self, generate_kwargs):
+        """Render the chat prompt and fix the output budget from its length."""
+        try:
+            rendered = await self.owner._chat_engine().render(self.prompt)
+        except ChatInputError as exc:
+            if exc.code == "context_length_exceeded":
+                raise StreamError(
+                    "context_length_exceeded", context_limit_source="prompt"
+                ) from None
+            raise StreamError(exc.code, param=exc.param) from None
+        room = self.owner.llm.model_config.max_model_len - rendered.prompt_tokens
+        if room <= 0:
+            raise StreamError("context_length_exceeded", context_limit_source="prompt")
+        if "max_tokens" not in self.params:
+            self.params["max_tokens"] = min(room, DEFAULT_CHAT_MAX_TOKENS)
+            if self.params.get("thinking_token_budget", 0) > self.params["max_tokens"]:
+                raise StreamError("invalid_sampling_params")
+        if (
+            rendered.structured_outputs is not None
+            and "structured_output" in self.params
+        ):
+            # Tool calls need their own grammar; vLLM applies one per request.
+            raise StreamError("invalid_chat_request", param="structured_output")
+        generate_kwargs.update(rendered.generate_kwargs)
+        return ChatOutput(rendered, self.params["n"]), rendered.engine_input
 
     async def abort_engine(self):
         if self.engine_cleanup_task is None:
@@ -688,6 +816,23 @@ class StreamingWorkerMixin:
             include_stop_str_in_output=False,
         )
 
+    def _chat_engine(self):
+        engine = getattr(self, "_stream_chat_engine", None)
+        if engine is None:
+            from arctic_platform.inference.server.chat import ChatEngine
+
+            try:
+                engine = ChatEngine(
+                    self.llm,
+                    tool_call_parser=getattr(self, "_tool_call_parser", None),
+                    reasoning_parser=getattr(self, "_reasoning_parser_name", None),
+                )
+            except Exception:
+                # E.g. skip_tokenizer_init, or a model with no chat template.
+                raise StreamError("chat_unsupported") from None
+            self._stream_chat_engine = engine
+        return engine
+
     def start_stream(self, attempt_id, prompt, sampling_params, remaining_s, limits):
         if (
             getattr(self.state, "value", self.state) != "ready"
@@ -745,6 +890,8 @@ class StreamingWorkerMixin:
                     }
                     if exc.context_limit_source is not None:
                         event["context_limit_source"] = exc.context_limit_source
+                    if exc.param is not None:
+                        event["param"] = exc.param
                     yield [event]
                     return
                 except StopAsyncIteration:
@@ -1019,27 +1166,33 @@ class ClientStream(AsyncIterator):
                     raise StreamError("invalid_terminal_error")
             elif context_limit_source_present:
                 raise StreamError("invalid_terminal_error")
+            if "param" in event and (
+                event.get("code") not in PARAM_ERROR_CODES
+                or not isinstance(event["param"], str)
+            ):
+                raise StreamError("invalid_terminal_error")
             await self.abort(event["code"])
             self.error_delivered = True
-        elif kind in {"delta", "choice_finished"}:
+        elif kind in DELTA_TYPES or kind == "choice_finished":
             index = event.get("choice_index")
             if (
                 type(index) is not int
                 or not 0 <= index < self.params["n"]
                 or index in self.finished_choices
                 or self.usage is not None
+                or not _valid_delta_fields(event, isinstance(self.request.prompt, ChatPrompt))
             ):
                 raise StreamError("invalid_choice_event")
             if (
-                kind == "delta"
+                kind in ("delta", "content_delta")
                 and "logprobs" in event
                 and not valid_delta_logprobs(event)
             ):
                 raise StreamError("invalid_choice_event")
-            if kind == "delta" and self.first_delta_time is None:
+            if kind != "choice_finished" and self.first_delta_time is None:
                 self.first_delta_time = time.time()
             if kind == "choice_finished":
-                if event.get("finish_reason") not in {"stop", "length"}:
+                if event.get("finish_reason") not in FINISH_REASONS:
                     raise StreamError("invalid_finish_reason")
                 self.finished_choices.add(index)
         elif kind == "usage":
@@ -1052,6 +1205,13 @@ class ClientStream(AsyncIterator):
                 )
                 or event["total_tokens"]
                 != event["prompt_tokens"] + event["completion_tokens"]
+                or (
+                    "reasoning_tokens" in event
+                    and (
+                        type(event["reasoning_tokens"]) is not int
+                        or not 0 <= event["reasoning_tokens"] <= event["completion_tokens"]
+                    )
+                )
             ):
                 raise StreamError("invalid_usage_event")
             self.usage = event

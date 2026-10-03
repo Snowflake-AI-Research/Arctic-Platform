@@ -55,7 +55,7 @@ to `context_length_exceeded`; other unexpected engine exceptions map to
 `engine_error`. Transport failures and local cancellation can raise instead of
 delivering an event. EOF without completed is an error.
 
-Inputs are one prepared text prompt or token-ID list. Supported sampling parameters:
+Inputs are one prepared text prompt, token-ID list or chat prompt (below). Supported sampling parameters:
 temperature, top_p, frequency_penalty, presence_penalty, max_tokens, stop, n,
 optional seed, logit_bias, structured_output, thinking_token_budget and logprobs. Unknown options are rejected. Defaults: temperature=1, top_p=1,
 frequency_penalty=0, presence_penalty=0, max_tokens=4096, n=1. Penalties must
@@ -75,9 +75,47 @@ schema that no vLLM structured-output backend accepts ends the stream with
 [1, max_tokens]; vLLM rejects it with `invalid_sampling_params` unless the
 model was loaded with a reasoning parser. `logprobs` is an integer in [0, 20],
 the number of alternatives reported per token. `"sampling_params" in
-STREAM_CAPABILITIES` tells callers these four parameters are accepted. Active LoRA selection is forwarded. No chat rendering, participant
-name handling, HTTP, SSE, or training-specific prompt mutation occurs here.
-For nonstream responses DSS can collect the same events into a complete response.
+STREAM_CAPABILITIES` tells callers these four parameters are accepted. Active LoRA selection is forwarded. No HTTP, SSE, or
+training-specific prompt mutation occurs here. For nonstream responses DSS can
+collect the same events into a complete response.
+
+## Chat Prompts
+
+`prompt` may also be a `ChatPrompt` (`arctic_platform.inference.server.chat`):
+OpenAI-style `messages`, optional `tools`, `tool_choice`, `parallel_tool_calls`
+and `reasoning_effort`. `"chat_prompt" in STREAM_CAPABILITIES` tells callers the
+installed version supports it. The worker renders it with vLLM's own chat front
+end on the loaded engine, so the model's template applies (including DeepSeek-V4
+and gpt-oss Harmony), and splits output with vLLM's reasoning and tool parsers.
+Which parsers apply is engine configuration: `reasoning_parser`,
+`tool_call_parser` (popped by the worker, like vllm serve's flag) and, for
+DeepSeek-V4, `tokenizer_mode`. `reasoning_effort` is passed to the template as
+is; callers map OpenAI values to the model family's own.
+
+- Before rendering, any string in messages, tools or a named `tool_choice` that
+  contains one of the tokenizer's special or added tokens fails the stream with
+  `invalid_message_content` and `param` (for example `messages[1]`). Input the
+  template or vLLM rejects fails with `invalid_chat_request`, with `param` when
+  vLLM names one. Neither carries message text.
+- If `max_tokens` is omitted, the budget is `min(context left after the
+  rendered prompt, 4096)`. A prompt that leaves no room fails with
+  `context_length_exceeded` and `context_limit_source="prompt"`.
+- Instead of `delta`, a chat stream emits `content_delta` (`text`),
+  `reasoning_delta` (`token_count` only; reasoning text is never emitted) and
+  `tool_call_delta` (`index`, `arguments`, plus `id` and `name` on a call's first
+  event). Markup the parser is still matching emits nothing until it resolves.
+  `parallel_tool_calls=false` keeps only the first call.
+- `choice_finished` reports `tool_calls` when a choice that called a tool stops.
+  `usage` adds `reasoning_tokens`, counted by the reasoning parser across choices.
+- Undelivered events merge only with the same kind of the same choice; tool-call
+  arguments merge only within one call.
+- With `logprobs`, each `content_delta` carries the `token_ids` and `logprobs`
+  of the engine output that produced it; reasoning and tool-call tokens carry
+  none, as OpenAI reports logprobs for the answer only.
+- `structured_output` cannot be combined with a chat prompt whose tools need a
+  grammar of their own (`invalid_chat_request`, `param="structured_output"`):
+  vLLM applies one grammar per request. Without `max_tokens`,
+  `thinking_token_budget` is checked against the budget after rendering.
 
 ## Flow Control and Lifecycle
 

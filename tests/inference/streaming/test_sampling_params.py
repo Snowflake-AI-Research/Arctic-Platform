@@ -298,7 +298,7 @@ def test_client_stream_validates_delta_logprobs(logprobs, valid):
         stream = ClientStream(
             types.SimpleNamespace(),
             "request",
-            types.SimpleNamespace(),
+            types.SimpleNamespace(prompt="text"),
             {"n": 1},
             StreamLimits(),
         )

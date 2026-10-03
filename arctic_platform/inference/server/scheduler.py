@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
 import time
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 import ray
@@ -98,11 +99,14 @@ RoutingFn = Callable[[_Request, list[WorkerState]], int]
 ConcurrencyFn = Callable[[list[WorkerState]], list[int]]
 
 
-def _compute_prefix_hash(prompt: str | list[int]) -> int:
+def _compute_prefix_hash(prompt) -> int:
     """Hash the full prompt for affinity routing."""
     if isinstance(prompt, str):
         return hash(prompt)
-    return hash(tuple(prompt))
+    if isinstance(prompt, list):
+        return hash(tuple(prompt))
+    # A chat prompt, already validated as plain JSON.
+    return hash(json.dumps(asdict(prompt), sort_keys=True))
 
 
 def least_loaded_routing(request: _Request, workers: list[WorkerState]) -> int:
