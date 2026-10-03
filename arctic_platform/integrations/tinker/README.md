@@ -54,6 +54,22 @@ curl -s http://127.0.0.1:8112/api/v1/get_server_capabilities
 Use `--job-id <id>` to attach to an existing Cortex job. The server releases
 jobs it creates when it shuts down; attached jobs remain running.
 
+On-policy distillation samples a teacher with
+`create_sampling_client(base_model=...)` and scores the student's rollouts with
+`compute_logprobs`. Start the server with the teacher as well:
+
+```bash
+python -m arctic_platform.integrations.tinker.serve \
+    --model Qwen/Qwen3.5-9B-Base \
+    --teacher-model Qwen/Qwen3.5-9B \
+    --teacher-sampling-gpus 2 \
+    ...
+```
+
+The teacher runs from its base weights as a sampling-only Cortex job of its
+own, created and released with the server. A sampler for a model that is
+neither the trained model nor the teacher returns 400.
+
 ## Run a cookbook recipe
 
 ```bash
@@ -100,6 +116,7 @@ Supported:
   `clip_low_threshold` and `clip_high_threshold` in `loss_fn_config`
 - sampling, forward-backward, optimizer step, and sampler weight sync
 - client-defined custom losses through `forward_backward_custom`
+- on-policy distillation from one teacher, including `compute_logprobs`
 
 Current limitations:
 
@@ -111,6 +128,8 @@ Current limitations:
 | Sequence limits | A datum longer than `--max-prompt-length + --max-response-length` returns 400. |
 | Loss config | `loss_fn_config` keys other than PPO's two clip thresholds return 400. |
 | Forward | `forward` (log-probs without gradients) is routed to Cortex, which currently fails it with `KeyError: 'pad_token_id'` in its training pipeline. The cookbook's NLL evaluator uses it, so run `chat_sl` with `eval_every=0`. |
+| Teacher | One teacher, from its base weights. A teacher checkpoint (the distillation recipe's `teacher_checkpoint`) and `topk_prompt_logprobs` return 400. |
+| Base-model samplers | `create_sampling_client(base_model=...)` for the trained model reads its untrained weights, which the sampler holds only until the first weight sync; after that it returns 409. |
 | Optimizer overrides | Only the learning rate is applied at step time. |
 | Multimodal input | Only encoded text tokens are passed to Cortex. |
 | Authentication | The local Tinker server does not authenticate requests. |
