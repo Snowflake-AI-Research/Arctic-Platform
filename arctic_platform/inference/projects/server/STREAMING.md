@@ -39,7 +39,12 @@ of the still-registered public request returns `already_terminal`, not `not_foun
 
 Version 1 events are dictionaries with `version`, zero-based contiguous `sequence`,
 `request_id`, and `type`. `delta` carries `choice_index`, incremental `text`, and
-incremental `token_ids`. `choice_finished` carries the index and `finish_reason`
+incremental `token_ids`. When `logprobs` was requested, a delta also carries
+`logprobs`, one entry per token ID in order:
+`{"token_id", "token", "logprob", "top": [{"token_id", "token", "logprob"}]}`.
+`top` holds the requested number of most likely tokens by rank; the chosen
+token keeps its own entry even when it is not among them. A `-inf` logprob is
+sent as `-9999.0`. Without `logprobs` the key is absent. `choice_finished` carries the index and `finish_reason`
 (`stop` or `length`). `usage` carries `prompt_tokens`, `completion_tokens`, and
 `total_tokens`. Prompt usage is counted once, completion usage across all choices.
 `completed` follows final usage, after the engine output iterator is closed
@@ -52,7 +57,7 @@ delivering an event. EOF without completed is an error.
 
 Inputs are one prepared text prompt or token-ID list. Supported sampling parameters:
 temperature, top_p, frequency_penalty, presence_penalty, max_tokens, stop, n,
-optional seed, logit_bias, structured_output and thinking_token_budget. Unknown options are rejected. Defaults: temperature=1, top_p=1,
+optional seed, logit_bias, structured_output, thinking_token_budget and logprobs. Unknown options are rejected. Defaults: temperature=1, top_p=1,
 frequency_penalty=0, presence_penalty=0, max_tokens=4096, n=1. Penalties must
 be in [-2,2]. Limits: n<=8,
 max_tokens<=131072, 1 MiB text input or 131072 input token IDs. After vLLM
@@ -68,7 +73,8 @@ deployment, end the stream with `invalid_sampling_params`. `structured_output` i
 schema that no vLLM structured-output backend accepts ends the stream with
 `invalid_structured_output`. `thinking_token_budget` is an integer in
 [1, max_tokens]; vLLM rejects it with `invalid_sampling_params` unless the
-model was loaded with a reasoning parser. Active LoRA selection is forwarded. No chat rendering, participant
+model was loaded with a reasoning parser. `logprobs` is an integer in [0, 20],
+the number of alternatives reported per token. Active LoRA selection is forwarded. No chat rendering, participant
 name handling, HTTP, SSE, or training-specific prompt mutation occurs here.
 For nonstream responses DSS can collect the same events into a complete response.
 

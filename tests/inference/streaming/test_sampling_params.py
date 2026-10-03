@@ -1,5 +1,6 @@
 """Stream sampling parameters: request validation, engine arguments, error codes."""
 
+import asyncio
 import sys
 import types
 
@@ -9,8 +10,12 @@ from cpu_support import VLLMValidationError, load_library
 
 load_library()
 from arctic_platform.inference.server.streaming import (
+    ClientStream,
+    StreamError,
     StreamingWorkerMixin,
+    StreamLimits,
     classify_engine_error,
+    delta_logprobs,
     validate_request,
 )
 
@@ -210,3 +215,108 @@ def test_thinking_budget_without_a_reasoning_parser_is_typed():
         "thinking_token_budget."
     )
     assert classify_engine_error(error) == ("invalid_sampling_params", None)
+
+
+@pytest.mark.parametrize("logprobs", [0, 20])
+def test_logprobs_accepts_zero_to_twenty(logprobs, engine_params):
+    assert engine_params({"logprobs": logprobs})["logprobs"] == logprobs
+
+
+@pytest.mark.parametrize("logprobs", [-1, 21, True, 2.0, "2"])
+def test_logprobs_rejection(logprobs):
+    with pytest.raises(ValueError, match="logprobs"):
+        validate_request("prompt", {"logprobs": logprobs})
+
+
+def _logprob(logprob, rank, token):
+    return types.SimpleNamespace(logprob=logprob, rank=rank, decoded_token=token)
+
+
+def test_delta_logprobs_keep_the_chosen_token_out_of_a_top_k_it_missed():
+    position = {
+        7: _logprob(-6.0, 3, " Nice"),  # chosen, ranked third
+        5: _logprob(-0.01, 1, " Paris"),
+        9: _logprob(-5.2, 2, " Lyon"),
+    }
+    [entry] = delta_logprobs([7], [position], 2)
+    assert entry == {
+        "token_id": 7,
+        "token": " Nice",
+        "logprob": -6.0,
+        "top": [
+            {"token_id": 5, "token": " Paris", "logprob": -0.01},
+            {"token_id": 9, "token": " Lyon", "logprob": -5.2},
+        ],
+    }
+
+
+def test_delta_logprobs_encode_negative_infinity_and_zero_alternatives():
+    [entry] = delta_logprobs([3], [{3: _logprob(float("-inf"), 4, None)}], 0)
+    assert entry == {"token_id": 3, "token": "", "logprob": -9999.0, "top": []}
+
+
+@pytest.mark.parametrize(
+    "token_ids,positions",
+    [
+        ([1, 2], [{1: _logprob(-1.0, 1, "a")}]),
+        ([1], None),
+        ([1], [{2: _logprob(-1.0, 1, "a")}]),
+    ],
+)
+def test_delta_logprobs_reject_misaligned_engine_output(token_ids, positions):
+    with pytest.raises(StreamError, match="invalid_engine_output"):
+        delta_logprobs(token_ids, positions, 1)
+
+
+def _entry(token_id, top=()):
+    return {"token_id": token_id, "token": "t", "logprob": -1.0, "top": list(top)}
+
+
+def _alternative(token_id):
+    return {"token_id": token_id, "token": "t", "logprob": -2.0}
+
+
+@pytest.mark.parametrize(
+    "logprobs,valid",
+    [
+        ([_entry(1, [_alternative(1), _alternative(4)]), _entry(2)], True),
+        ([_entry(1)], False),  # one entry for two token IDs
+        ([_entry(1), _entry(2), _entry(3)], False),
+        ([_entry(2), _entry(1)], False),
+        ([_entry(1, [_alternative(n) for n in range(21)]), _entry(2)], False),
+        ([{**_entry(1), "logprob": float("nan")}, _entry(2)], False),
+        ([{**_entry(1), "token": None}, _entry(2)], False),
+        ([{**_entry(1), "token_id": True}, _entry(2)], False),
+        ([{k: v for k, v in _entry(1).items() if k != "top"}, _entry(2)], False),
+        ([_entry(1, [{"token_id": 4, "token": "t"}]), _entry(2)], False),
+        ("logprobs", False),
+    ],
+)
+def test_client_stream_validates_delta_logprobs(logprobs, valid):
+    async def check():
+        stream = ClientStream(
+            types.SimpleNamespace(),
+            "request",
+            types.SimpleNamespace(),
+            {"n": 1},
+            StreamLimits(),
+        )
+        event = {
+            "type": "delta",
+            "choice_index": 0,
+            "text": "ab",
+            "token_ids": [1, 2],
+            "logprobs": logprobs,
+            "sequence": 0,
+            "version": 1,
+        }
+        try:
+            if valid:
+                assert (await stream._accept_event(event))["logprobs"] == logprobs
+            else:
+                with pytest.raises(StreamError, match="invalid_choice_event"):
+                    await stream._accept_event(event)
+        finally:
+            stream.watchdog.cancel()
+
+    asyncio.run(check())

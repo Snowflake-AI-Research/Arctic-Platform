@@ -29,6 +29,17 @@ from arctic_platform.inference.server.streaming import (
 from arctic_platform.inference.server.worker import InferenceWorker
 
 
+def fake_logprobs(token_id, top_k):
+    # Shaped like vLLM's per-token dict of token ID to Logprob; the chosen
+    # token ranks first, with alternatives behind it.
+    position = {token_id: SimpleNamespace(logprob=-0.5, rank=1, decoded_token="x")}
+    for rank in range(2, top_k + 1):
+        position[1000 + rank] = SimpleNamespace(
+            logprob=-float(rank), rank=rank, decoded_token=f"alt{rank}"
+        )
+    return position
+
+
 class FakeEngine:
     def __init__(self):
         self.active = set()
@@ -92,6 +103,9 @@ class FakeEngine:
                         index=index,
                         text="x",
                         token_ids=[step],
+                        logprobs=None
+                        if params.get("logprobs") is None
+                        else [fake_logprobs(step, params["logprobs"])],
                         finish_reason="length"
                         if step
                         == (
@@ -424,7 +438,7 @@ def test_cleanup_paths(mode):
         {"stop": ["a"] * 5},
         {"stop": ""},
         {"messages": []},
-        {"logprobs": 2},
+        {"logprobs": 21},
     ],
 )
 def test_parameter_rejection(params):
@@ -496,6 +510,46 @@ def test_slow_round_trips_do_not_overflow_a_small_buffer():
     asyncio.run(exercise(check))
 
 
+@pytest.mark.parametrize("top_k", [0, 2])
+def test_logprobs_cover_every_token_behind_a_slow_reader(top_k):
+    async def check(driver, pool, actor):
+        await actor.set_ack_delay.remote(0.006)  # let deltas merge
+        events = [
+            event
+            async for event in driver.stream_generate(
+                "model",
+                "logprobs",
+                [1, 2],
+                {"max_tokens": 60, "n": 2, "logprobs": top_k},
+            )
+        ]
+        await actor.set_ack_delay.remote(0)
+        assert events[-1]["type"] == "completed"
+        deltas = [event for event in events if event["type"] == "delta"]
+        assert len(deltas) < 120  # some merged
+        entries = [entry for event in deltas for entry in event["logprobs"]]
+        assert len(entries) == events[-2]["completion_tokens"] == 120
+        for event in deltas:
+            assert [entry["token_id"] for entry in event["logprobs"]] == event["token_ids"]
+        assert all(len(entry["top"]) == top_k for entry in entries)
+
+    asyncio.run(exercise(check))
+
+
+def test_deltas_omit_logprobs_unless_requested():
+    async def check(driver, pool, actor):
+        events = [
+            event
+            async for event in driver.stream_generate(
+                "model", "no-logprobs", [1, 2], {"max_tokens": 3}
+            )
+        ]
+        assert events[-1]["type"] == "completed"
+        assert not any("logprobs" in event for event in events)
+
+    asyncio.run(exercise(check))
+
+
 def test_read_buffered_hands_over_the_rest_of_a_batch_without_a_round_trip():
     async def check(driver, pool, actor):
         await actor.set_ack_delay.remote(0.006)  # let a backlog form
@@ -560,6 +614,24 @@ def test_merged_deltas_keep_every_token_id():
         buffer.put({**_delta(0, text), "token_ids": token_ids})
     [event] = buffer.drain()
     assert event["text"] == "The cat sat"
+    assert event["token_ids"] == [791, 8415, 7731, 13]
+
+
+def test_merged_deltas_keep_every_logprob():
+    def logprob(token_id):
+        return {"token_id": token_id, "token": "t", "logprob": -1.0, "top": []}
+
+    buffer = EventBuffer(StreamLimits())
+    for text, token_ids in (("The", [791]), (" cat", [8415]), (" sat", [7731, 13])):
+        buffer.put(
+            {
+                **_delta(0, text),
+                "token_ids": token_ids,
+                "logprobs": [logprob(token_id) for token_id in token_ids],
+            }
+        )
+    [event] = buffer.drain()
+    assert [entry["token_id"] for entry in event["logprobs"]] == [791, 8415, 7731, 13]
     assert event["token_ids"] == [791, 8415, 7731, 13]
 
 

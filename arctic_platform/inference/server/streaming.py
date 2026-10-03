@@ -176,6 +176,7 @@ def validate_request(prompt, sampling_params):
         "logit_bias",
         "structured_output",
         "thinking_token_budget",
+        "logprobs",
     }
     if unsupported:
         raise ValueError(f"Unsupported streaming parameters: {sorted(unsupported)}")
@@ -280,7 +281,77 @@ def validate_request(prompt, sampling_params):
         type(budget) is not int or not 1 <= budget <= params["max_tokens"]
     ):
         raise ValueError("thinking_token_budget must be an integer in [1, max_tokens]")
+    logprobs = params.get("logprobs")
+    if logprobs is not None and (type(logprobs) is not int or not 0 <= logprobs <= 20):
+        raise ValueError("logprobs must be an integer in [0, 20]")
     return prompt, params
+
+
+def _logprob_entry(token_id, logprob):
+    value = float(logprob.logprob)
+    return {
+        "token_id": token_id,
+        "token": logprob.decoded_token or "",
+        # JSON has no -inf; OpenAI reports it as -9999.0.
+        "logprob": -9999.0 if value == -math.inf else value,
+    }
+
+
+def delta_logprobs(token_ids, positions, top_k):
+    """One entry per token: the chosen token and the ``top_k`` best by rank.
+
+    vLLM also reports the chosen token when it ranks below ``top_k``; it keeps
+    its own entry but is left out of ``top``.
+    """
+    if positions is None or len(positions) != len(token_ids):
+        raise StreamError("invalid_engine_output")
+    entries = []
+    for token_id, position in zip(token_ids, positions):
+        if token_id not in position:
+            raise StreamError("invalid_engine_output")
+        top = sorted(
+            (
+                item
+                for item in position.items()
+                if item[1].rank is not None and item[1].rank <= top_k
+            ),
+            key=lambda item: item[1].rank,
+        )
+        entries.append(
+            {
+                **_logprob_entry(token_id, position[token_id]),
+                "top": [_logprob_entry(*item) for item in top],
+            }
+        )
+    return entries
+
+
+def _valid_logprob_entry(entry):
+    return (
+        isinstance(entry, dict)
+        and type(entry.get("token_id")) is int
+        and isinstance(entry.get("token"), str)
+        and type(entry.get("logprob")) in (int, float)
+        and math.isfinite(entry["logprob"])
+    )
+
+
+def valid_delta_logprobs(event):
+    logprobs = event["logprobs"]
+    token_ids = event.get("token_ids")
+    return (
+        isinstance(logprobs, list)
+        and isinstance(token_ids, list)
+        and len(logprobs) == len(token_ids)
+        and all(
+            _valid_logprob_entry(entry)
+            and entry["token_id"] == token_id
+            and isinstance(entry.get("top"), list)
+            and len(entry["top"]) <= 20
+            and all(_valid_logprob_entry(item) for item in entry["top"])
+            for entry, token_id in zip(logprobs, token_ids)
+        )
+    )
 
 
 def event_size(event):
@@ -344,6 +415,10 @@ class EventBuffer:
         if "token_ids" in entry[0] or "token_ids" in event:
             merged["token_ids"] = [
                 *entry[0].get("token_ids", ()), *event.get("token_ids", ())
+            ]
+        if "logprobs" in entry[0] or "logprobs" in event:
+            merged["logprobs"] = [
+                *entry[0].get("logprobs", ()), *event.get("logprobs", ())
             ]
         size = event_size(merged)
         if size > self.limits.max_event_bytes:
@@ -445,14 +520,19 @@ class EngineStream:
                     if counts[index] > self.params["max_tokens"]:
                         raise StreamError("invalid_engine_output")
                     if choice.text or choice.token_ids:
-                        self.buffer.put(
-                            {
-                                "type": "delta",
-                                "choice_index": index,
-                                "text": choice.text,
-                                "token_ids": list(choice.token_ids),
-                            }
-                        )
+                        delta = {
+                            "type": "delta",
+                            "choice_index": index,
+                            "text": choice.text,
+                            "token_ids": list(choice.token_ids),
+                        }
+                        if self.params.get("logprobs") is not None:
+                            delta["logprobs"] = delta_logprobs(
+                                delta["token_ids"],
+                                choice.logprobs,
+                                self.params["logprobs"],
+                            )
+                        self.buffer.put(delta)
                     if choice.finish_reason is not None:
                         if choice.finish_reason not in {"stop", "length"}:
                             raise StreamError("engine_aborted")
@@ -946,6 +1026,12 @@ class ClientStream(AsyncIterator):
                 or not 0 <= index < self.params["n"]
                 or index in self.finished_choices
                 or self.usage is not None
+            ):
+                raise StreamError("invalid_choice_event")
+            if (
+                kind == "delta"
+                and "logprobs" in event
+                and not valid_delta_logprobs(event)
             ):
                 raise StreamError("invalid_choice_event")
             if kind == "delta" and self.first_delta_time is None:

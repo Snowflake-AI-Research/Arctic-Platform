@@ -336,3 +336,27 @@ def test_context_limit_errors_are_classified():
         assert followup[-1]["type"] == "completed"
 
     asyncio.run(with_driver(check))
+
+
+def test_logprobs_cover_every_completion_token():
+    async def check(driver):
+        events = await collect(
+            driver,
+            "The capital of France is",
+            {"temperature": 0.0, "max_tokens": 32, "logprobs": 2},
+        )
+        assert events[-1]["type"] == "completed"
+        entries = [
+            entry
+            for event in events
+            if event["type"] == "delta"
+            for entry in event["logprobs"]
+        ]
+        assert len(entries) == events[-2]["completion_tokens"]
+        for entry in entries:
+            assert len(entry["top"]) == 2
+            # Greedy decoding always picks the most likely token.
+            assert entry["top"][0]["token_id"] == entry["token_id"]
+            assert entry["logprob"] <= 0
+
+    asyncio.run(with_driver(check))
