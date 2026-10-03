@@ -226,6 +226,34 @@ def _sampled_logprobs(result: dict) -> list[float] | None:
     return out
 
 
+def _prompt_logprobs(result: dict, prompt_tokens: list[int]) -> list[float | None]:
+    """Per-position log-prob of each prompt token, ``None`` for the first.
+
+    Same layout as the sampled ones -- a dict per position keyed by token id --
+    and the same rule: on-policy distillation subtracts these from the
+    student's log-probs position by position, so a gap raises.
+    """
+    per_position = result.get("prompt_logprobs")
+    if per_position is None or len(per_position) != len(prompt_tokens):
+        raise RuntimeError(
+            f"cortex returned {None if per_position is None else len(per_position)} prompt log-prob "
+            f"positions for {len(prompt_tokens)} prompt tokens"
+        )
+
+    out: list[float | None] = []
+    for index, (position, token_id) in enumerate(zip(per_position, prompt_tokens)):
+        if position is None:
+            if index != 0:
+                raise RuntimeError(f"cortex omitted the prompt log-prob at position {index}")
+            out.append(None)
+            continue
+        entry = position.get(str(token_id), position.get(token_id))
+        if entry is None:
+            raise RuntimeError(f"cortex omitted the log-prob of prompt token {token_id} at position {index}")
+        out.append(float(entry["logprob"] if isinstance(entry, dict) else entry))
+    return out
+
+
 class CortexTinkerBackend:
     """The five Tinker verbs, lowered onto a Cortex-backed unified client."""
 
@@ -313,7 +341,7 @@ class CortexTinkerBackend:
                 f"asked cortex for {num_samples} rollouts and got {len(results)}; "
                 "sampling would silently return the wrong group size"
             )
-        return {
+        out: dict[str, Any] = {
             "outputs": [
                 {
                     "token_ids": list(result.get("token_ids") or []),
@@ -323,6 +351,9 @@ class CortexTinkerBackend:
                 for result in results
             ]
         }
+        if params.get("prompt_logprobs") is not None:
+            out["prompt_logprobs"] = _prompt_logprobs(results[0], list(prompt_tokens))
+        return out
 
 
 def build_handlers(client: AsyncArcticRLClient) -> dict[str, Callable]:

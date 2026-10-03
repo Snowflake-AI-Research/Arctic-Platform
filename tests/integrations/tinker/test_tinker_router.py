@@ -366,10 +366,34 @@ async def test_create_sampling_session_reflects_current_gen(client, app):
     app.state.tinker_weight_gen = 3
     r = await client.post(
         "/api/v1/create_sampling_session",
-        json={"session_id": "sess-1", "sampling_session_seq_id": 0, "base_model": "Qwen/Qwen3-8B"},
+        json={"session_id": "sess-1", "sampling_session_seq_id": 0, "model_path": "tinker://main/sampler_weights/3"},
     )
     assert r.status_code == 200
     assert r.json()["sampling_session_id"] == "ss@3"
+
+
+async def test_base_model_session_is_the_untrained_weights(client, app):
+    """The sampler holds the base weights only until the first sync, so a
+    base-model session must not quietly follow training."""
+    app.state.tinker_weight_gen = 3
+    r = await client.post(
+        "/api/v1/create_sampling_session",
+        json={"session_id": "sess-1", "sampling_session_seq_id": 0, "base_model": "Qwen/Qwen3-8B"},
+    )
+    assert r.status_code == 200
+    session_id = r.json()["sampling_session_id"]
+    assert session_id == "ss@0"
+
+    for target in ({"sampling_session_id": session_id}, {"base_model": "Qwen/Qwen3-8B"}):
+        r = await client.post(
+            "/api/v1/asample",
+            json={
+                "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1]}]},
+                "sampling_params": {"max_tokens": 4},
+                **target,
+            },
+        )
+        assert r.status_code == 409, target
 
 
 async def test_asample_serves_current_gen(client, mock_backend):
@@ -434,6 +458,117 @@ async def test_asample_without_session_id_serves(client):
         },
     )
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Teacher sampling (on-policy distillation)
+# ---------------------------------------------------------------------------
+
+
+async def _teacher_session(client, teacher_model: str) -> str:
+    r = await client.post(
+        "/api/v1/create_sampling_session",
+        json={"session_id": "sess-1", "sampling_session_seq_id": 1, "base_model": teacher_model},
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["sampling_session_id"]
+
+
+def _logprobs_request(session_id: str, tokens: list[int]) -> dict:
+    """What `SamplingClient.compute_logprobs` sends."""
+    return {
+        "prompt": {"chunks": [{"type": "encoded_text", "tokens": tokens}]},
+        "sampling_params": {"max_tokens": 1},
+        "num_samples": 1,
+        "sampling_session_id": session_id,
+        "prompt_logprobs": True,
+    }
+
+
+async def test_teacher_session_scores_on_the_teacher(
+    teacher_client, teacher_app, teacher_model, mock_backend, teacher_calls
+):
+    # The teacher keeps its base weights however far the student has trained.
+    teacher_app.state.tinker_weight_gen = 5
+    session_id = await _teacher_session(teacher_client, teacher_model)
+
+    r = await teacher_client.post("/api/v1/asample", json=_logprobs_request(session_id, [10, 20, 30]))
+    assert r.status_code == 200, r.text
+    r = await teacher_client.post("/api/v1/retrieve_future", json={"request_id": r.json()["request_id"]})
+    assert r.json()["prompt_logprobs"] == pytest.approx([None, -2.0, -3.0])
+
+    assert mock_backend["calls"]["generate"] == []
+    ((prompt, params),) = teacher_calls
+    assert prompt == [10, 20, 30]
+    assert params["prompt_logprobs"] == 0
+
+
+async def test_teacher_prompt_logprobs_survive_the_proto_reply(teacher_client, teacher_model):
+    session_id = await _teacher_session(teacher_client, teacher_model)
+    r = await teacher_client.post("/api/v1/asample", json=_logprobs_request(session_id, [10, 20]))
+    r = await teacher_client.post(
+        "/api/v1/retrieve_future",
+        json={"request_id": r.json()["request_id"]},
+        headers={"Accept": PROTO_CONTENT_TYPE},
+    )
+    assert r.status_code == 200
+    reply = response_conv.deserialize_sample_response(r.content)
+    assert reply.prompt_logprobs[0] is None
+    assert reply.prompt_logprobs[1:] == pytest.approx([-2.0])
+
+
+async def test_sampler_for_an_unserved_model_is_refused(teacher_client, teacher_model):
+    """Answering it from the trained model would score the student against itself."""
+    r = await teacher_client.post(
+        "/api/v1/create_sampling_session",
+        json={"session_id": "sess-1", "sampling_session_seq_id": 1, "base_model": "Qwen/Qwen3-4B"},
+    )
+    assert r.status_code == 400
+    assert teacher_model in r.json()["detail"]
+
+    r = await teacher_client.post(
+        "/api/v1/asample",
+        json={
+            "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1]}]},
+            "sampling_params": {"max_tokens": 1},
+            "base_model": "Qwen/Qwen3-4B",
+        },
+    )
+    assert r.status_code == 400
+
+
+async def test_teacher_checkpoint_is_refused(teacher_client, teacher_model):
+    r = await teacher_client.post(
+        "/api/v1/create_sampling_session",
+        json={
+            "session_id": "sess-1",
+            "sampling_session_seq_id": 1,
+            "base_model": teacher_model,
+            "model_path": "tinker://elsewhere/sampler_weights/final",
+        },
+    )
+    assert r.status_code == 400
+    assert "model_path" in r.json()["detail"]
+
+
+async def test_capabilities_list_the_teacher(teacher_client, teacher_model):
+    r = await teacher_client.get("/api/v1/get_server_capabilities")
+    assert [m["model_name"] for m in r.json()["supported_models"]] == ["Qwen/Qwen3-8B", teacher_model]
+
+
+async def test_topk_prompt_logprobs_refused(teacher_client, teacher_model):
+    session_id = await _teacher_session(teacher_client, teacher_model)
+    r = await teacher_client.post(
+        "/api/v1/asample", json={**_logprobs_request(session_id, [1, 2]), "topk_prompt_logprobs": 5}
+    )
+    assert r.status_code == 400
+    assert "topk_prompt_logprobs" in r.json()["detail"]
+
+
+async def test_prompt_logprobs_the_sampler_did_not_return_fail_loud(client):
+    r = await client.post("/api/v1/asample", json=_logprobs_request("ss@0", [1, 2, 3]))
+    assert r.status_code == 502
+    assert "prompt log-probs" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

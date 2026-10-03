@@ -45,6 +45,7 @@ from typing import Any
 from typing import Awaitable
 from typing import Callable
 from typing import Literal
+from typing import Mapping
 from typing import Sequence
 from typing import Union
 
@@ -333,7 +334,7 @@ class SampledSequence(BaseModel):
 
 class SampleResponse(BaseModel):
     sequences: list[SampledSequence]
-    prompt_logprobs: list[float] | None = None
+    prompt_logprobs: list[float | None] | None = None
     type: Literal["sample"] = "sample"
 
 
@@ -806,7 +807,10 @@ async def telemetry(req: dict) -> TelemetryResponse:
 @router.get("/get_server_capabilities", response_model=GetServerCapabilitiesResponse)
 async def get_server_capabilities(request: Request) -> GetServerCapabilitiesResponse:
     base_model = _require_state(request.app.state, "tinker_base_model")
-    return GetServerCapabilitiesResponse(supported_models=[SupportedModel(model_name=base_model)])
+    teachers = getattr(request.app.state, "tinker_teacher_generate", None) or {}
+    return GetServerCapabilitiesResponse(
+        supported_models=[SupportedModel(model_name=name) for name in [base_model, *teachers]]
+    )
 
 
 # ---- model lifecycle --------------------------------------------------------
@@ -1024,24 +1028,88 @@ def _gate_temperature(app_state: Any, temperature: float) -> None:
         )
 
 
+_TEACHER_SESSION_PREFIX = "teacher@"
+
+
+def _teacher_for(app_state: Any, base_model: str | None, model_path: str | None) -> str | None:
+    """The teacher a sampler for ``base_model`` reads from, or None for the trained model.
+
+    The server samples only the model it trains and the teachers it was started
+    with. Any other model would otherwise be answered by the trained model's
+    sampler -- a distillation run would then score the student against itself.
+    """
+    served = _require_state(app_state, "tinker_base_model")
+    teachers = getattr(app_state, "tinker_teacher_generate", None) or {}
+    if base_model in teachers and model_path is None:
+        return base_model
+    if base_model is None or base_model == served:
+        return None
+    if base_model not in teachers:
+        raise HTTPException(
+            400,
+            f"no sampler for base_model={base_model!r}: this server trains {served!r} and serves "
+            f"teachers {sorted(teachers)}. Start it with --teacher-model {base_model} to sample it.",
+        )
+    if model_path is not None:
+        raise HTTPException(
+            400,
+            f"teacher {base_model!r} is served from its base weights; loading model_path={model_path!r} "
+            "into it is not supported",
+        )
+    return base_model
+
+
 @router.post("/create_sampling_session", response_model=CreateSamplingSessionResponse)
 async def create_sampling_session(
     req: CreateSamplingSessionRequest, request: Request
 ) -> CreateSamplingSessionResponse:
-    gen = getattr(request.app.state, "tinker_weight_gen", 0)
+    teacher = _teacher_for(request.app.state, req.base_model, req.model_path)
+    if teacher is not None:
+        return CreateSamplingSessionResponse(sampling_session_id=f"{_TEACHER_SESSION_PREFIX}{teacher}")
+    # A base-model session means the untrained weights, which the sampler holds
+    # only until the first sync; pinning it to generation 0 makes later use 409.
+    gen = 0 if req.model_path is None else getattr(request.app.state, "tinker_weight_gen", 0)
     return CreateSamplingSessionResponse(sampling_session_id=f"ss@{gen}")
+
+
+def _sampler_for(
+    app_state: Any, req: SampleRequest
+) -> tuple[Callable[[list[int], dict], Awaitable[dict]], int | None]:
+    """The generate handler a sample request reads from, and the weight generation
+    it was issued for (None when it is not tied to one)."""
+    session_id = req.sampling_session_id
+    if session_id and session_id.startswith(_TEACHER_SESSION_PREFIX):
+        teachers = getattr(app_state, "tinker_teacher_generate", None) or {}
+        teacher = session_id[len(_TEACHER_SESSION_PREFIX) :]
+        if teacher not in teachers:
+            raise HTTPException(400, f"unknown sampling_session_id={session_id!r}")
+        return teachers[teacher], None
+    if not session_id:
+        teacher = _teacher_for(app_state, req.base_model, req.model_path)
+        if teacher is not None:
+            return app_state.tinker_teacher_generate[teacher], None
+
+    handler = _require_state(app_state, "tinker_generate")
+    if session_id and session_id.startswith("ss@"):
+        try:
+            return handler, int(session_id.split("@", 1)[1])
+        except ValueError:
+            raise HTTPException(400, f"malformed sampling_session_id={session_id!r}")
+    if not session_id and req.base_model is not None and req.model_path is None:
+        return handler, 0  # see create_sampling_session
+    return handler, None
 
 
 @router.post("/asample", response_model=UntypedAPIFuture)
 async def asample(req: SampleRequest, request: Request) -> UntypedAPIFuture:
-    handler = _require_state(request.app.state, "tinker_generate")
+    handler, gen = _sampler_for(request.app.state, req)
     _gate_temperature(request.app.state, req.sampling_params.temperature)
-    gen = None
-    if req.sampling_session_id and req.sampling_session_id.startswith("ss@"):
-        try:
-            gen = int(req.sampling_session_id.split("@", 1)[1])
-        except ValueError:
-            raise HTTPException(400, f"malformed sampling_session_id={req.sampling_session_id!r}")
+    if req.topk_prompt_logprobs:
+        raise HTTPException(
+            400,
+            f"topk_prompt_logprobs={req.topk_prompt_logprobs} is not supported; "
+            "prompt_logprobs returns the log-prob of each prompt token only",
+        )
 
     current_gen = getattr(request.app.state, "tinker_weight_gen", 0)
 
@@ -1054,6 +1122,9 @@ async def asample(req: SampleRequest, request: Request) -> UntypedAPIFuture:
                 "usage (multi-snapshot async-RL is extension E1).",
             )
         vllm_params = sampling_params_tinker_to_vllm(req.sampling_params, req.num_samples)
+        if req.prompt_logprobs:
+            # vLLM's 0 means "only the prompt token itself, no top-k extras".
+            vllm_params["prompt_logprobs"] = 0
         prompt_tokens = _model_input_to_tokens(req.prompt)
         r = await handler(prompt_tokens, vllm_params)
         sequences = [
@@ -1064,7 +1135,16 @@ async def asample(req: SampleRequest, request: Request) -> UntypedAPIFuture:
             )
             for o in (r.get("outputs") or [])
         ]
-        return SampleResponse(sequences=sequences).model_dump(mode="json")
+        prompt_logprobs = None
+        if req.prompt_logprobs:
+            prompt_logprobs = r.get("prompt_logprobs")
+            if prompt_logprobs is None or len(prompt_logprobs) != len(prompt_tokens):
+                raise HTTPException(
+                    502,
+                    f"asked for prompt log-probs of {len(prompt_tokens)} tokens and the sampler returned "
+                    f"{None if prompt_logprobs is None else len(prompt_logprobs)}",
+                )
+        return SampleResponse(sequences=sequences, prompt_logprobs=prompt_logprobs).model_dump(mode="json")
 
     return await _submit_inline(request, runner, kind=_KIND_SAMPLE)
 
@@ -1105,6 +1185,7 @@ def init_tinker_state(
     sync_weights_handler: Callable[[], Awaitable[Any]],
     generate_handler: Callable[[list[int], dict], Awaitable[dict]],
     supports_temperature_scaling: bool = True,
+    teacher_generate_handlers: Mapping[str, Callable[[list[int], dict], Awaitable[dict]]] | None = None,
 ) -> None:
     """Wire the Tinker verbs onto ``app.state`` as async closures. Callers
     (real Arctic http_server, in-process tests with a mocked backend) inject
@@ -1113,7 +1194,11 @@ def init_tinker_state(
     ``supports_temperature_scaling=False`` declares that the backend scores
     log-probs at temperature 1.0 regardless of what the sampler was asked for,
     which makes any other sampling temperature a silent train/sample mismatch;
-    ``sample`` then refuses it. See :func:`asample`."""
+    ``sample`` then refuses it. See :func:`asample`.
+
+    ``teacher_generate_handlers`` maps a model name to the sampler serving its
+    base weights, for ``create_sampling_client(base_model=...)`` on a model
+    other than the one being trained (on-policy distillation's teacher)."""
     app.state.tinker_base_model = base_model
     app.state.tinker_max_prompt_length = int(max_prompt_length)
     app.state.tinker_max_response_length = int(max_response_length)
@@ -1127,4 +1212,5 @@ def init_tinker_state(
     app.state.tinker_step = step_handler
     app.state.tinker_sync_weights = sync_weights_handler
     app.state.tinker_generate = generate_handler
+    app.state.tinker_teacher_generate = dict(teacher_generate_handlers or {})
     app.state.tinker_supports_temperature_scaling = bool(supports_temperature_scaling)

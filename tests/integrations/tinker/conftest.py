@@ -149,3 +149,36 @@ async def client(app):
     """Async httpx client rooted at the test app."""
     async with _asgi_client(app) as c:
         yield c
+
+
+@pytest.fixture
+def teacher_model():
+    return "Qwen/Qwen3-32B"
+
+
+@pytest.fixture
+def teacher_calls():
+    return []
+
+
+@pytest.fixture
+def teacher_app(mock_backend, teacher_model, teacher_calls):
+    """An app that trains Qwen3-8B and serves ``teacher_model`` from a sampler of its own.
+
+    The teacher scores prompt token ``t`` at ``-t / 10`` so tests can check
+    which values came back from where."""
+
+    async def teacher_generate(prompt_tokens, sampling_params):
+        teacher_calls.append((list(prompt_tokens), dict(sampling_params)))
+        out = {"outputs": [{"token_ids": [7], "logprobs": [-0.1], "finish_reason": "length"}]}
+        if sampling_params.get("prompt_logprobs") is not None:
+            out["prompt_logprobs"] = [None] + [-t / 10 for t in prompt_tokens[1:]]
+        return out
+
+    return _build_app(mock_backend, teacher_generate_handlers={teacher_model: teacher_generate})
+
+
+@pytest_asyncio.fixture
+async def teacher_client(teacher_app):
+    async with _asgi_client(teacher_app) as c:
+        yield c

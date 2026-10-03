@@ -19,6 +19,7 @@ import json
 
 from arctic_platform.integrations.tinker.serve import TinkerServeConfig
 from arctic_platform.integrations.tinker.serve import _client_config
+from arctic_platform.integrations.tinker.serve import _teacher_config
 
 
 def test_client_config_uses_packaged_types(monkeypatch):
@@ -40,3 +41,23 @@ def test_client_config_file_and_existing_job(tmp_path):
 
     assert config.training_job_id == "job-1:training:0"
     assert config.sampling_job_id == "job-1:sampling:0"
+
+
+def test_teacher_is_a_sampling_only_job_of_its_own(monkeypatch):
+    monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://cortex.test")
+    cfg = TinkerServeConfig(
+        model="Qwen/Qwen3-0.6B",
+        teacher_model="Qwen/Qwen3-8B",
+        teacher_sampling_gpus=2,
+        max_prompt_length=512,
+        max_response_length=1024,
+        job_id="student-job",
+    )
+
+    config = _teacher_config(cfg)
+
+    assert config.model_name == "Qwen/Qwen3-8B"
+    assert (config.training_gpus, config.sampling_gpus) == (0, 2)
+    # It scores a full student sequence, then samples one token past it.
+    assert config.max_seq_len == cfg.max_seq_len + 1
+    assert config.training_job_id is None and config.sampling_job_id is None

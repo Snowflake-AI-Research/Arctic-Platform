@@ -32,9 +32,11 @@ import contextlib
 import json
 import logging
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from arctic_platform.integrations.tinker.cortex import CortexTinkerBackend
 from arctic_platform.integrations.tinker.cortex import build_handlers
 from arctic_platform.integrations.tinker.router import init_tinker_state
 from arctic_platform.integrations.tinker.router import router as tinker_router
@@ -68,6 +70,10 @@ class TinkerServeConfig:
     gpu_memory_utilization: float = 0.8
     zero_stage: int = 2
     job_id: str | None = None
+    # On-policy distillation's teacher: served from its base weights by a
+    # sampling-only job of its own, created and released with this server.
+    teacher_model: str | None = None
+    teacher_sampling_gpus: int = 1
     host: str = "127.0.0.1"
     port: int = 8000
 
@@ -128,6 +134,21 @@ def _client_config(cfg: TinkerServeConfig) -> Any:
     )
 
 
+def _teacher_config(cfg: TinkerServeConfig) -> Any:
+    # The teacher scores a whole student sequence and then has to sample one
+    # token to do it, so it needs one position more than the student.
+    return _client_config(
+        replace(
+            cfg,
+            model=cfg.teacher_model,
+            training_gpus=0,
+            sampling_gpus=cfg.teacher_sampling_gpus,
+            max_response_length=cfg.max_response_length + 1,
+            job_id=None,
+        )
+    )
+
+
 def create_app(cfg: TinkerServeConfig):
     """A FastAPI app serving Tinker's protocol, bound to a Cortex job.
 
@@ -146,23 +167,33 @@ def create_app(cfg: TinkerServeConfig):
         attached = client_cfg.training_job_id is not None
         client = AsyncArcticRLClient(client_cfg)
         logger.info("training job %s is running", client.jobs.training)
-
-        tokenizer = AutoTokenizer.from_pretrained(cfg.model)
-        init_tinker_state(
-            app,
-            base_model=cfg.model,
-            max_prompt_length=cfg.max_prompt_length,
-            max_response_length=cfg.max_response_length,
-            pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
-            # Cortex registers no `apply_temperature`, so the trainer always
-            # scores at 1.0 and `sample` refuses any other temperature.
-            supports_temperature_scaling=False,
-            **build_handlers(client),
-        )
-        app.state.arctic_client = client
+        teacher = None
         try:
+            teacher_handlers = {}
+            if cfg.teacher_model:
+                teacher = AsyncArcticRLClient(_teacher_config(cfg))
+                logger.info("teacher %s is running as job %s", cfg.teacher_model, teacher.jobs.sampling)
+                teacher_handlers[cfg.teacher_model] = CortexTinkerBackend(teacher).generate
+
+            tokenizer = AutoTokenizer.from_pretrained(cfg.model)
+            init_tinker_state(
+                app,
+                base_model=cfg.model,
+                max_prompt_length=cfg.max_prompt_length,
+                max_response_length=cfg.max_response_length,
+                pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
+                # Cortex registers no `apply_temperature`, so the trainer always
+                # scores at 1.0 and `sample` refuses any other temperature.
+                supports_temperature_scaling=False,
+                teacher_generate_handlers=teacher_handlers,
+                **build_handlers(client),
+            )
+            app.state.arctic_client = client
             yield
         finally:
+            if teacher is not None:
+                logger.info("releasing teacher job %s", teacher.jobs.sampling)
+                await teacher.shutdown()
             if attached:
                 logger.info("leaving pre-existing job %s running", client.jobs.training)
             else:

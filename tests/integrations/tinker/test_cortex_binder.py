@@ -386,3 +386,56 @@ class TestForwardVerb:
             out["batch"]["logprobs"].to(torch.long) * mask,
             batch["batch"]["input_ids"] * mask,
         )
+
+
+class TestPromptLogprobs:
+    """`compute_logprobs` (the distillation teacher's verb) reads these.
+
+    The shape is what a live Cortex sampler returned for ``prompt_logprobs``:
+    one entry per prompt position, ``None`` first, then a dict keyed by token
+    id that may hold top-k extras besides the prompt token.
+    """
+
+    class _Sampler:
+        def __init__(self, prompt_logprobs):
+            self.prompt_logprobs = prompt_logprobs
+            self.params = []
+
+        async def generate(self, prompts, sampling_params=None):
+            self.params.append(sampling_params)
+            result = {"token_ids": [9], "logprobs": [{"9": {"logprob": -0.2, "rank": 1}}], "finish_reason": "length"}
+            if self.prompt_logprobs is not None:
+                result["prompt_logprobs"] = self.prompt_logprobs
+            return [result for _ in prompts]
+
+    def _generate(self, sampler, prompt, **params):
+        return asyncio.run(CortexTinkerBackend(sampler).generate(prompt, {"n": 1, "max_tokens": 1, **params}))
+
+    def test_each_prompt_token_is_read_by_id(self):
+        sampler = self._Sampler(
+            [
+                None,
+                {"5": {"logprob": -9.0, "rank": 40}, "11": {"logprob": -0.1, "rank": 1}},
+                {"6": {"logprob": -0.5, "rank": 1}},
+            ]
+        )
+        out = self._generate(sampler, [4, 5, 6], prompt_logprobs=0)
+        assert out["prompt_logprobs"] == [None, -9.0, -0.5]
+        assert sampler.params[0]["prompt_logprobs"] == 0
+
+    def test_not_asked_not_returned(self):
+        out = self._generate(self._Sampler([None, {"5": -1.0}]), [4, 5])
+        assert "prompt_logprobs" not in out
+
+    @pytest.mark.parametrize(
+        "prompt_logprobs, match",
+        [
+            (None, "prompt log-prob positions"),
+            ([None, {"5": -1.0}], "prompt log-prob positions"),
+            ([None, {"7": -1.0}, {"6": -1.0}], "prompt token 5"),
+            ([None, None, {"6": -1.0}], "position 1"),
+        ],
+    )
+    def test_a_gap_raises(self, prompt_logprobs, match):
+        with pytest.raises(RuntimeError, match=match):
+            self._generate(self._Sampler(prompt_logprobs), [4, 5, 6], prompt_logprobs=0)
