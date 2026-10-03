@@ -62,7 +62,7 @@ from arctic_platform.common.registry import _resolve_fn
 from arctic_platform.common.registry import register_loss_fn  # noqa: F401  # re-exported
 from arctic_platform.common.registry import register_post_processor
 from arctic_platform.common.utils.batch import BATCH_DIM_CONTEXT_KEYS
-from arctic_platform.common.utils.batch import SCALAR_FWD_COPY_KEYS
+from arctic_platform.common.utils.batch import _copy_scalar_fwd_keys
 from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
 from arctic_platform.rl.utils.batch import detensorize
 from arctic_platform.rl.utils.batch import log_dp_shard_tokens
@@ -135,10 +135,15 @@ _ENGINE_FWD_BLOCKED_KEYS = (
 ) - _ENGINE_FWD_KEYS
 
 
-def _engine_forward_kwargs(batch: dict, meta: dict) -> dict:
-    """Cortex-style isolation: engine sees allowlisted keys from ``batch`` only.
+def _fwd_meta_key_missing_from_batch(key: str, batch: dict, meta: dict) -> bool:
+    """True when ``fwd_meta_keys`` names a model input that is not on ``batch``."""
+    return key not in _ENGINE_FWD_BLOCKED_KEYS and key in meta and key not in batch
 
-    ``meta['fwd_meta_keys']`` is not an engine escape hatch. If it names a
+
+def _engine_forward_kwargs(batch: dict, meta: dict) -> dict:
+    """Return allowlisted model inputs from ``batch``.
+
+    ``meta['fwd_meta_keys']`` cannot add engine kwargs. If it names a
     non-blocked key that is present on ``meta`` and absent from ``batch``,
     raise — that request would otherwise be silently dropped.
     """
@@ -147,7 +152,7 @@ def _engine_forward_kwargs(batch: dict, meta: dict) -> dict:
         extra = ()
     elif isinstance(extra, str):
         extra = (extra,)
-    dropped = [key for key in extra if key not in _ENGINE_FWD_BLOCKED_KEYS and key in meta and key not in batch]
+    dropped = [key for key in extra if _fwd_meta_key_missing_from_batch(key, batch, meta)]
     if dropped:
         raise ValueError(
             f"fwd_meta_keys {dropped!r} are present on meta but not on batch; engine kwargs are batch-only"
@@ -395,11 +400,7 @@ def run_pipeline(
 
     batch = dict(batch)
     meta = dict(meta)
-    for key in SCALAR_FWD_COPY_KEYS:
-        if key in meta and key not in batch:
-            batch[key] = meta[key]
-        elif key in batch and key not in meta:
-            meta[key] = batch[key]
+    _copy_scalar_fwd_keys(batch, meta)
 
     loss_fn_name = _require_loss_fn(processing, backward=backward)
     if loss_object is None and loss_fn_name is not None:
@@ -453,8 +454,6 @@ def run_pipeline(
                 meta = {**meta, "calculate_entropy": False}
 
     # --- forward ---
-    # Isolation: ``_engine_forward_kwargs`` allowlists model inputs from batch.
-
     pack_with_unpad = True  # XXX: make configurable?
     already_packed = "cu_seqlens" in meta
     if already_packed:
@@ -505,8 +504,8 @@ def run_pipeline(
     prof_fwd = ProfilerContext(type=PROFILER_TYPE, name="FWD")
     tname = timers.start(f"pipe fwd {rank}")
     with prof_fwd():
-        # Isolation: only model-bound keys reach engine(). Zorro reads
-        # calculate_entropy; loss tensors stay on batch/meta for posts/losses.
+        # Zorro reads calculate_entropy from engine kwargs. Loss tensors stay
+        # on batch and meta for posts and losses.
         fwd_kwargs = _engine_forward_kwargs(batch, meta)
         output_keys = ["logits", "logprobs", "entropy", "loss"]
         if loss_object is not None:

@@ -104,9 +104,10 @@ BATCH_DIM_CONTEXT_KEYS = frozenset(
     }
 )
 
-# Model scalars that must reach engine() from batch after C1, but stay on meta
-# for posts (``apply_temperature_post`` reads ``meta["temperature"]``). Copy,
-# do not move. Never ``tensor_split`` a 0-d tensor of these.
+# Engine forward reads these from ``batch``. Posts read them from ``meta``
+# (``apply_temperature_post`` uses ``meta["temperature"]``). A value supplied
+# on either bag is copied onto the other, and the source is kept. A 0-d
+# tensor of these must not be ``tensor_split``.
 SCALAR_FWD_COPY_KEYS = frozenset({"temperature", "calculate_entropy"})
 
 
