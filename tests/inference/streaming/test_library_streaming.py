@@ -45,6 +45,7 @@ class FakeEngine:
                 "context-error",
                 "legacy-context-error",
                 "validation-error",
+                "logit-bias-error",
             }:
                 from vllm.exceptions import VLLMValidationError
 
@@ -62,6 +63,13 @@ class FakeEngine:
                     raise VLLMValidationError(
                         "The decoder prompt (length 9) is longer than the maximum "
                         "model length of 8."
+                    )
+                if prompt == "logit-bias-error":
+                    raise VLLMValidationError(
+                        "token_id(s) [9] in logit_bias contain out-of-vocab "
+                        "token ids. Vocabulary size: 8",
+                        parameter="logit_bias",
+                        value=[9],
                     )
                 raise VLLMValidationError(
                     "sensitive unsupported sampling parameter"
@@ -301,6 +309,7 @@ def test_cancel_before_dispatch():
         ("context-error", "context_length_exceeded", "prompt"),
         ("legacy-context-error", "context_length_exceeded", "prompt"),
         ("validation-error", "engine_error", None),
+        ("logit-bias-error", "invalid_sampling_params", None),
     ],
 )
 def test_engine_errors_are_terminal_and_sanitized(

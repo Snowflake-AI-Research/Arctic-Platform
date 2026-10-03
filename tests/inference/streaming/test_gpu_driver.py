@@ -70,6 +70,44 @@ def test_legacy_driver_generate():
     asyncio.run(with_driver(check))
 
 
+async def collect(driver, prompt, params):
+    return [
+        event
+        async for event in driver.stream_generate(
+            "stream-test", uuid4().hex, prompt, params
+        )
+    ]
+
+
+def test_logit_bias_forces_and_bans_a_token():
+    async def check(driver):
+        prompt = "The capital of France is"
+        greedy = {"temperature": 0.0, "max_tokens": 1}
+
+        def first_token(events):
+            assert events[-1]["type"] == "completed", events[-1]
+            return next(e for e in events if e["type"] == "delta")["token_ids"][0]
+
+        baseline = first_token(await collect(driver, prompt, greedy))
+        other = first_token(await collect(driver, "Hello", greedy))
+        if other == baseline:
+            other = first_token(await collect(driver, "1, 2, 3,", greedy))
+        assert other != baseline
+        forced = await collect(
+            driver, prompt, {**greedy, "logit_bias": {str(other): 100}}
+        )
+        assert first_token(forced) == other
+        banned = await collect(driver, prompt, {**greedy, "logit_bias": {baseline: -100}})
+        assert first_token(banned) != baseline
+        out_of_vocab = await collect(
+            driver, prompt, {**greedy, "logit_bias": {2**31 - 1: 1}}
+        )
+        assert out_of_vocab[-1]["type"] == "terminal_error"
+        assert out_of_vocab[-1]["code"] == "invalid_sampling_params"
+
+    asyncio.run(with_driver(check))
+
+
 @pytest.mark.parametrize("choice_count", [1, 2])
 def test_driver_stream_contract(choice_count):
     from arctic_platform.inference.server.multi_model import Driver

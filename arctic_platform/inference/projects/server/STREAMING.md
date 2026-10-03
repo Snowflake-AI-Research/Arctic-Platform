@@ -52,14 +52,17 @@ delivering an event. EOF without completed is an error.
 
 Inputs are one prepared text prompt or token-ID list. Supported sampling parameters:
 temperature, top_p, frequency_penalty, presence_penalty, max_tokens, stop, n,
-optional seed. Unknown options are rejected. Defaults: temperature=1, top_p=1,
+optional seed and logit_bias. Unknown options are rejected. Defaults: temperature=1, top_p=1,
 frequency_penalty=0, presence_penalty=0, max_tokens=4096, n=1. Penalties must
 be in [-2,2]. Limits: n<=8,
 max_tokens<=131072, 1 MiB text input or 131072 input token IDs. After vLLM
 tokenizes a text prompt, the stream rejects `prompt_tokens + max_tokens` above
 the loaded model's context limit. Stop accepts one string or up to four nonempty
 strings, each <=4096 UTF-8 bytes. Stop holdback/detokenization remain
-engine-owned. Active LoRA selection is forwarded. No chat rendering, participant
+engine-owned. `logit_bias` maps at most 300 token IDs (integers or
+decimal strings) to biases in [-100,100]. vLLM checks the IDs against the loaded
+vocabulary; out-of-vocabulary IDs, or logit_bias on a speculative-decoding
+deployment, end the stream with `invalid_sampling_params`. Active LoRA selection is forwarded. No chat rendering, participant
 name handling, HTTP, SSE, or training-specific prompt mutation occurs here.
 For nonstream responses DSS can collect the same events into a complete response.
 

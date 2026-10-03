@@ -44,7 +44,14 @@ def classify_engine_error(exc):
         return "engine_error", None
     if getattr(exc, "parameter", None) == "input_tokens":
         return "context_length_exceeded", "prompt"
+    if getattr(exc, "parameter", None) == "logit_bias":
+        return "invalid_sampling_params", None
     message = str(exc)
+    if message.startswith(
+        "The min_p and logit_bias sampling parameters are not yet supported "
+        "with speculative decoding."
+    ):
+        return "invalid_sampling_params", None
     if (
         message.startswith("This model's maximum context length is ")
         and "your prompt contains" in message
@@ -145,6 +152,7 @@ def validate_request(prompt, sampling_params):
         "stop",
         "n",
         "seed",
+        "logit_bias",
     }
     if unsupported:
         raise ValueError(f"Unsupported streaming parameters: {sorted(unsupported)}")
@@ -188,6 +196,35 @@ def validate_request(prompt, sampling_params):
                 "stop must be a string or 1..4 nonempty strings of at most 4096 bytes"
             )
         params["stop"] = list(stops)
+    logit_bias = params.get("logit_bias")
+    if logit_bias is not None:
+        if not isinstance(logit_bias, dict) or len(logit_bias) > 300:
+            raise ValueError("logit_bias must map at most 300 token IDs to biases")
+        biases = {}
+        for token, bias in logit_bias.items():
+            # OpenAI clients send token IDs as JSON object keys, so strings.
+            if (
+                isinstance(token, str)
+                and 0 < len(token) <= 10
+                and token.isascii()
+                and token.isdigit()
+            ):
+                token = int(token)
+            if (
+                type(token) is not int
+                or not 0 <= token < 2**31
+                or token in biases
+                or isinstance(bias, bool)
+                or not isinstance(bias, (int, float))
+                or not math.isfinite(bias)
+                or not -100 <= bias <= 100
+            ):
+                raise ValueError(
+                    "logit_bias keys must be distinct token IDs in [0, 2**31) "
+                    "and values numbers in [-100, 100]"
+                )
+            biases[token] = float(bias)
+        params["logit_bias"] = biases
     return prompt, params
 
 
