@@ -44,10 +44,11 @@ class _StubClient:
     visible: the value at a position names the token it belongs to.
     """
 
-    def __init__(self, logprobs=_ECHO_INPUT_IDS, batch_key="batch", metrics=None, training_gpus=1):
-        self.config = SimpleNamespace(training_gpus=training_gpus)
+    def __init__(self, logprobs=_ECHO_INPUT_IDS, batch_key="batch", metrics=None, training_gpus=1, peft=None):
+        self.config = SimpleNamespace(training_gpus=training_gpus, training=SimpleNamespace(peft=peft))
         self.sent: list[dict] = []
         self.stepped: list[float | None] = []
+        self.synced: list[str | None] = []
         self._logprobs = logprobs
         self._batch_key = batch_key
         self._metrics = metrics or {"loss": 1.0}
@@ -68,6 +69,10 @@ class _StubClient:
 
     async def step(self, learning_rate=None):
         self.stepped.append(learning_rate)
+        return {"ok": True}
+
+    async def sync_weights(self, weight_format=None):
+        self.synced.append(weight_format)
         return {"ok": True}
 
 
@@ -264,13 +269,6 @@ class TestRowPadding:
         mask = batch["batch"]["attention_mask"]
         torch_assert_equal(out["batch"]["logprobs"].to(torch.long) * mask, batch["batch"]["input_ids"] * mask)
 
-    def test_forward_is_padded_and_trimmed(self):
-        batch = _router_batch()
-        client = _StubClient()
-        out = asyncio.run(CortexTinkerBackend(client, min_rows=4).fwd_no_grad(batch))
-        assert client.sent[0]["kwargs"]["input_ids"].shape[0] == 4
-        assert out["batch"]["logprobs"].shape[0] == 3
-
     def test_full_batch_is_untouched(self):
         client = _StubClient()
         asyncio.run(CortexTinkerBackend(client, min_rows=3).fwd_bwd(_router_batch()))
@@ -280,6 +278,50 @@ class TestRowPadding:
         client = _StubClient(training_gpus=4)
         asyncio.run(build_handlers(client)["fwd_bwd_handler"](_router_batch()))
         assert client.sent[0]["kwargs"]["input_ids"].shape[0] == 4
+
+
+class TestIsolatedSequences:
+    """Rows lengthened past half a micro-batch, so Cortex never packs two together."""
+
+    CAPACITY = 8  # the router frame's width, as serve provisions it
+
+    def _run(self, min_rows=1):
+        batch = _ratio_loss_batch()
+        client = _StubClient()
+        backend = CortexTinkerBackend(client, min_rows=min_rows, isolate_capacity=self.CAPACITY)
+        out = asyncio.run(backend.fwd_bwd(batch))
+        (payload,) = client.sent
+        return batch, payload, out
+
+    def test_no_two_rows_fit_one_micro_batch(self):
+        from arctic_platform.rl.processors.microbatch import _ffd_allocate
+
+        _, payload, _ = self._run()
+        lengths = payload["kwargs"]["attention_mask"].sum(dim=1).tolist()
+        assert min(lengths) == self.CAPACITY // 2 + 1
+        groups = _ffd_allocate(lengths, self.CAPACITY, min_groups=1)
+        assert sorted(len(g) for g in groups) == [1, 1, 1]
+
+    def test_filler_follows_the_real_tokens_and_carries_no_loss(self):
+        batch, payload, _ = self._run()
+        real = batch["batch"]["attention_mask"].sum(dim=1).tolist()
+        sent_mask = payload["kwargs"]["attention_mask"]
+        for row, n in enumerate(real):
+            assert sent_mask[row, :n].all()
+            assert not payload["context"]["loss_mask"][row, n:].any()
+            assert not payload["context"]["advantages"][row, n:].any()
+            assert not payload["context"]["old_log_probs_shifted"][row, n:].any()
+
+    def test_logprobs_return_in_the_routers_frame(self):
+        batch, _, out = self._run(min_rows=4)
+        mask = batch["batch"]["attention_mask"]
+        assert out["batch"]["logprobs"].shape == mask.shape
+        torch_assert_equal(out["batch"]["logprobs"].to(torch.long) * mask, batch["batch"]["input_ids"] * mask)
+
+    def test_rows_wider_than_the_frame_refused(self):
+        backend = CortexTinkerBackend(_StubClient(), isolate_capacity=64)
+        with pytest.raises(ValueError, match="cannot extend rows of width 8 to 33"):
+            asyncio.run(backend.fwd_bwd(_router_batch()))
 
 
 class TestCortexResponseShapes:
@@ -324,13 +366,13 @@ class TestCortexResponseShapes:
         mask = batch["batch"]["attention_mask"]
         torch_assert_equal(out["batch"]["logprobs"].to(torch.long) * mask, ids * mask)
 
-    def test_top_level_tensor_from_forward(self):
+    def test_top_level_tensor(self):
         batch = _router_batch()
         ids = batch["batch"]["input_ids"]
         order, valid = _align_plan(batch["batch"]["attention_mask"])
         aligned = _align(batch["batch"], order, valid)["input_ids"]
         client = self._client_returning({"job_id": "j", "logprobs": aligned.to(torch.float32)})
-        out = asyncio.run(CortexTinkerBackend(client).fwd_no_grad(batch))
+        out = asyncio.run(CortexTinkerBackend(client).fwd_bwd(batch))
         mask = batch["batch"]["attention_mask"]
         torch_assert_equal(out["batch"]["logprobs"].to(torch.long) * mask, ids * mask)
 
@@ -357,6 +399,12 @@ class TestStepAndHandlers:
         asyncio.run(CortexTinkerBackend(client).step(None))
         assert client.stepped == [None]
 
+    @pytest.mark.parametrize(("peft", "weight_format"), [(None, None), ({"peft_type": "Lora", "r": 8}, "lora")])
+    def test_lora_runs_sync_only_the_adapter(self, peft, weight_format):
+        client = _StubClient(peft=peft)
+        asyncio.run(CortexTinkerBackend(client).sync_weights())
+        assert client.synced == [weight_format]
+
     def test_build_handlers_matches_init_tinker_state(self):
         import inspect
 
@@ -367,25 +415,6 @@ class TestStepAndHandlers:
         assert set(handlers) <= set(params), "handler kwargs must be accepted by the router"
         required = {n for n, p in params.items() if p.default is inspect.Parameter.empty and n.endswith("_handler")}
         assert required <= set(handlers)
-
-
-class TestForwardVerb:
-    def test_forward_sends_no_loss_and_no_context(self):
-        client = _StubClient()
-        asyncio.run(CortexTinkerBackend(client).fwd_no_grad(_router_batch()))
-        (payload,) = client.sent
-        assert "context" not in payload
-        assert "loss_fn" not in payload["processing"]
-        assert payload["processing"]["post"] == ["compute_logprobs"]
-
-    def test_forward_logprobs_return_in_the_routers_frame(self):
-        batch = _router_batch()
-        out = asyncio.run(CortexTinkerBackend(_StubClient()).fwd_no_grad(batch))
-        mask = batch["batch"]["attention_mask"]
-        torch_assert_equal(
-            out["batch"]["logprobs"].to(torch.long) * mask,
-            batch["batch"]["input_ids"] * mask,
-        )
 
 
 class TestPromptLogprobs:

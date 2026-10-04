@@ -23,7 +23,6 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Callable
 
 from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
 
@@ -157,19 +156,6 @@ def _unalign_rows(aligned: torch.Tensor, order: torch.Tensor) -> torch.Tensor:
     return out.scatter(1, order, aligned)
 
 
-def _forward_payload(batch: dict, order: torch.Tensor, valid: torch.Tensor) -> dict:
-    """Cortex ``forward`` envelope: model kwargs only, no loss and no context."""
-    tensors = _align(dict(batch.get("batch") or batch), order, valid)
-    kwargs: dict[str, Any] = {
-        "input_ids": tensors["input_ids"],
-        "attention_mask": tensors["attention_mask"],
-    }
-    for key in ("position_ids", "labels"):
-        if key in tensors:
-            kwargs[key] = tensors[key]
-    return {"args": (), "kwargs": kwargs, "processing": {"post": _POST_PROCESSORS}}
-
-
 def _require_logprobs(response: dict, op: str) -> torch.Tensor:
     """Return aligned per-token log-probs or fail if the response omitted them."""
     import torch
@@ -254,12 +240,40 @@ def _prompt_logprobs(result: dict, prompt_tokens: list[int]) -> list[float | Non
     return out
 
 
-class CortexTinkerBackend:
-    """The five Tinker verbs, lowered onto a Cortex-backed unified client."""
+def _extend_rows(aligned: dict, min_len: int) -> dict:
+    """Lengthen every left-aligned row to at least ``min_len`` attended tokens.
 
-    def __init__(self, client: AsyncArcticRLClient, min_rows: int = 1) -> None:
+    The filler follows the row's last real token, so a causal model scores the
+    real tokens exactly as before; every loss input is already zero there.
+    """
+    import torch
+
+    mask = aligned["attention_mask"]
+    if mask.shape[-1] < min_len:
+        raise ValueError(f"cannot extend rows of width {mask.shape[-1]} to {min_len} tokens")
+    filler = torch.arange(mask.shape[-1], device=mask.device).unsqueeze(0) < min_len
+    filler = filler & ~mask.to(torch.bool)
+    out = dict(aligned)
+    out["attention_mask"] = torch.where(filler, torch.ones_like(mask), mask)
+    out["input_ids"] = torch.where(filler, aligned["input_ids"][:, :1].expand_as(mask), aligned["input_ids"])
+    return out
+
+
+class CortexTinkerBackend:
+    """Tinker's verbs, lowered onto a Cortex-backed unified client.
+
+    ``isolate_capacity`` keeps Cortex from packing two sequences into one
+    micro-batch. Cortex's Hugging Face model path does not reset
+    linear-attention state (Qwen3.5's GatedDeltaNet) at packed boundaries, so
+    every sequence after the first in a pack is scored with its predecessor's
+    state. The job is provisioned with ``max_tokens_per_mb = isolate_capacity``
+    and every row is lengthened past half of it, so no two rows fit together.
+    """
+
+    def __init__(self, client: AsyncArcticRLClient, min_rows: int = 1, isolate_capacity: int | None = None) -> None:
         self.client = client
         self.min_rows = min_rows
+        self.isolate_capacity = isolate_capacity
 
     async def fwd_bwd(self, batch: dict) -> dict:
         import torch
@@ -292,6 +306,8 @@ class CortexTinkerBackend:
         body = _pad_rows(body, self.min_rows)
         order, valid = _align_plan(body["attention_mask"])
         aligned = _align(body, order, valid)
+        if self.isolate_capacity is not None:
+            aligned = _extend_rows(aligned, self.isolate_capacity // 2 + 1)
         sampler_logprobs = aligned.pop(_SAMPLER_LOGPROBS, None)
         payload = to_cortex_fwd_bwd_payload(
             {"batch": aligned, "meta": meta},
@@ -302,29 +318,18 @@ class CortexTinkerBackend:
         logprobs = _unalign_rows(_require_logprobs(response, "forward-backward"), order)[:rows]
         return {"batch": {"logprobs": logprobs}, "metrics": response.get("metrics") or {}}
 
-    async def fwd_no_grad(self, batch: dict) -> dict:
-        import torch
-
-        body = dict(batch.get("batch") or batch)
-        attention_mask = body.get("attention_mask")
-        if not torch.is_tensor(attention_mask):
-            body = {k: torch.as_tensor(v) if not torch.is_tensor(v) else v for k, v in body.items()}
-            attention_mask = body.get("attention_mask")
-        rows = attention_mask.shape[0]
-        body = _pad_rows(body, self.min_rows)
-        order, valid = _align_plan(body["attention_mask"])
-        response = await self.client.fwd_no_grad(_forward_payload({"batch": body}, order, valid))
-        logprobs = _unalign_rows(_require_logprobs(response, "forward"), order)[:rows]
-        return {"batch": {"logprobs": logprobs}, "metrics": response.get("metrics") or {}}
-
     async def step(self, overrides: dict | None) -> dict:
-        # Cortex's `step` takes a learning rate and nothing else, so the rest of
-        # Tinker's AdamParams is dropped rather than sent somewhere it would be
-        # ignored silently.
+        # Cortex's `step` takes a learning rate and nothing else. The rest of
+        # Tinker's AdamParams is fixed at provisioning, and the router refuses
+        # values that differ from it (`fixed_adam` in init_tinker_state).
         learning_rate = (overrides or {}).get("lr") or (overrides or {}).get("learning_rate")
         return await self.client.step(learning_rate=learning_rate)
 
     async def sync_weights(self) -> Any:
+        # A LoRA run's sampler holds the base weights plus an adapter, so only
+        # the adapter is broadcast.
+        if self.client.config.training.peft:
+            return await self.client.sync_weights(weight_format="lora")
         return await self.client.sync_weights()
 
     async def generate(self, prompt_tokens: list[int], sampling_params: dict) -> dict:
@@ -356,13 +361,23 @@ class CortexTinkerBackend:
         return out
 
 
-def build_handlers(client: AsyncArcticRLClient) -> dict[str, Callable]:
-    """Handler kwargs for ``router.init_tinker_state``."""
-    backend = CortexTinkerBackend(client, min_rows=max(int(client.config.training_gpus), 1))
+def build_handlers(client: AsyncArcticRLClient, isolate_capacity: int | None = None) -> dict[str, Any]:
+    """Handler kwargs for ``router.init_tinker_state``.
+
+    No ``forward``: Cortex's forward route rejected every payload shape tried
+    live (``KeyError: 'pad_token_id'``, then ``'attention_mask'``), so the
+    router refuses it instead of failing server-side.
+
+    ``accumulates_gradients=False``: measured live, a Cortex ``step`` after two
+    forward-backward calls applied the second call's gradient alone.
+    """
+    backend = CortexTinkerBackend(
+        client, min_rows=max(int(client.config.training_gpus), 1), isolate_capacity=isolate_capacity
+    )
     return {
         "fwd_bwd_handler": backend.fwd_bwd,
-        "fwd_no_grad_handler": backend.fwd_no_grad,
         "step_handler": backend.step,
         "sync_weights_handler": backend.sync_weights,
         "generate_handler": backend.generate,
+        "accumulates_gradients": False,
     }

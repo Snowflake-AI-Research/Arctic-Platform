@@ -22,13 +22,16 @@ in-process, without Ray / DeepSpeed / vLLM.
 
 from __future__ import annotations
 
+import asyncio
 import math
 
 import pytest
 import tinker
+from fastapi import HTTPException
 from tinker.proto import request_conv
 from tinker.proto import response_conv
 
+from arctic_platform.integrations.tinker import router as router_mod
 from arctic_platform.integrations.tinker.proto_wire import PROTO_CONTENT_TYPE
 
 pytestmark = pytest.mark.asyncio
@@ -86,6 +89,35 @@ async def test_client_config_forces_json_path(client):
     assert body["proto_compress_fwdbwd"] is False
 
 
+def _sdk_chunks(config: dict, n_datums: int, tokens: int) -> list[int]:
+    from types import SimpleNamespace
+
+    from tinker.lib.public_interfaces.training_client import TrainingClient
+
+    datum = tinker.Datum(
+        model_input=tinker.ModelInput.from_ints(list(range(tokens))),
+        loss_fn_inputs={
+            "target_tokens": tinker.TensorData(data=list(range(tokens)), dtype="int64", shape=[tokens]),
+            "logprobs": tinker.TensorData(data=[0.0] * tokens, dtype="float32", shape=[tokens]),
+            "advantages": tinker.TensorData(data=[0.0] * tokens, dtype="float32", shape=[tokens]),
+        },
+    )
+    fake = SimpleNamespace(holder=SimpleNamespace(_client_config=tinker.types.ClientConfigResponse(**config)))
+    return [len(chunk) for chunk, _ in TrainingClient._chunked_requests_generator(fake, [datum] * n_datums)]
+
+
+async def test_client_config_sends_a_cookbook_batch_as_one_request_without_accumulation(make_client):
+    # MATH's 64 groups x 16 at ~700 tokens is ~14 MB, three SDK chunks by default.
+    async with make_client(accumulates_gradients=False) as c:
+        config = (await c.post("/api/v1/client/config", json={"sdk_version": "0.42.0"})).json()
+    assert _sdk_chunks(config, 1024, 700) == [1024]
+
+
+async def test_client_config_keeps_sdk_chunking_with_accumulation(client):
+    config = (await client.post("/api/v1/client/config", json={"sdk_version": "0.42.0"})).json()
+    assert len(_sdk_chunks(config, 1024, 700)) > 1
+
+
 async def test_auth_token_returns_dummy_jwt(client):
     r = await client.post("/api/v1/auth/token", json={})
     assert r.status_code == 200
@@ -139,20 +171,39 @@ async def test_create_model_no_lora_config_accepted(client):
     assert r.status_code == 200, r.text
 
 
-async def test_create_model_lora_rank_positive_rejected(client):
-    r = await client.post(
-        "/api/v1/create_model",
-        json={
-            "session_id": "sess-1",
-            "model_seq_id": 0,
-            "base_model": "Qwen/Qwen3-8B",
-            "lora_config": {"rank": 32},
-        },
-    )
+def _create_model(lora_config):
+    return {"session_id": "sess-1", "model_seq_id": 0, "base_model": "Qwen/Qwen3-8B", "lora_config": lora_config}
+
+
+async def test_create_model_lora_on_a_full_fine_tuning_server_rejected(client):
+    r = await client.post("/api/v1/create_model", json=_create_model({"rank": 32}))
     assert r.status_code == 400
     detail = r.json()["detail"]
-    assert "rank=32" in detail
-    assert "lora_rank=0" in detail
+    assert "full fine-tuning" in detail
+    assert "--lora-rank" in detail
+
+
+async def test_create_model_matching_lora_accepted(make_client):
+    from arctic_platform.integrations.tinker.router import LoraConfig
+
+    async with make_client(lora=LoraConfig(rank=32)) as c:
+        # `seed` only picks the adapter's initialization, so it is not compared.
+        r = await c.post("/api/v1/create_model", json=_create_model({"rank": 32, "seed": 3}))
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize(
+    "lora_config",
+    [{"rank": 0}, None, {"rank": 16}, {"rank": 32, "train_unembed": False}],
+    ids=["full-ft", "no-config", "other-rank", "other-modules"],
+)
+async def test_create_model_lora_mismatch_rejected(make_client, lora_config):
+    from arctic_platform.integrations.tinker.router import LoraConfig
+
+    async with make_client(lora=LoraConfig(rank=32)) as c:
+        r = await c.post("/api/v1/create_model", json=_create_model(lora_config))
+    assert r.status_code == 400
+    assert "'rank': 32" in r.json()["detail"]
 
 
 async def test_create_model_wrong_base_model_rejected(client):
@@ -316,6 +367,121 @@ async def test_proto_forward_only_returns_logprobs(client, mock_backend):
     assert len(mock_backend["calls"]["fwd_no_grad"]) == 1
 
 
+async def test_forward_without_a_backend_handler_refused(make_client):
+    # 400, not 5xx: the SDK retries server errors indefinitely.
+    async with make_client(fwd_no_grad_handler=None) as c:
+        r = await c.post(
+            "/api/v1/forward_backward",
+            content=_proto_forward_request(),
+            headers={"Content-Type": PROTO_CONTENT_TYPE},
+        )
+    assert r.status_code == 400
+    assert "forward_backward returns the same log-probs" in r.json()["detail"]
+
+
+_IS_BODY = {
+    "forward_backward_input": {"data": [_mk_datum_dict()], "loss_fn": "importance_sampling"},
+    "model_id": "main",
+}
+_STEP_BODY = {"adam_params": {"learning_rate": 1e-5}, "model_id": "main"}
+
+
+async def test_one_forward_backward_per_step_without_accumulation(make_client, mock_backend):
+    async with make_client(accumulates_gradients=False) as c:
+        codes = [
+            (await c.post("/api/v1/forward_backward", json=_IS_BODY)).status_code,
+            (await c.post("/api/v1/optim_step", json=_STEP_BODY)).status_code,
+            (await c.post("/api/v1/forward_backward", json=_IS_BODY)).status_code,
+            (await c.post("/api/v1/optim_step", json=_STEP_BODY)).status_code,
+        ]
+    assert codes == [200, 200, 200, 200]
+    assert len(mock_backend["calls"]["fwd_bwd"]) == 2
+
+
+async def test_second_forward_backward_before_step_refused_without_accumulation(make_client, mock_backend):
+    async with make_client(accumulates_gradients=False) as c:
+        assert (await c.post("/api/v1/forward_backward", json=_IS_BODY)).status_code == 200
+        r = await c.post("/api/v1/forward_backward", json=_IS_BODY)
+    assert r.status_code == 400
+    assert "num_minibatches=1" in r.json()["detail"]
+    assert len(mock_backend["calls"]["fwd_bwd"]) == 1
+
+
+async def test_failed_forward_backward_leaves_the_step_free(make_client):
+    async def fails(batch):
+        raise RuntimeError("backend down")
+
+    async with make_client(accumulates_gradients=False, fwd_bwd_handler=fails) as c:
+        for _ in range(2):
+            # The retry reaches the backend again rather than being refused as a second call.
+            with pytest.raises(RuntimeError, match="backend down"):
+                await c.post("/api/v1/forward_backward", json=_IS_BODY)
+
+
+async def _retrieve(c, fut, attempts=50):
+    for _ in range(attempts):
+        r = await c.post("/api/v1/retrieve_future", json={"request_id": fut["request_id"]})
+        if r.json().get("type") != "try_again":
+            return r.json()
+    raise AssertionError("future never finished")
+
+
+async def test_slow_work_answers_with_its_future_before_the_sdk_times_out(make_client, mock_backend, monkeypatch):
+    # The SDK resends a request after 60 s; a resent step would be applied twice.
+    monkeypatch.setattr(router_mod, "_INLINE_BUDGET_S", 0.01)
+    monkeypatch.setattr(router_mod, "_RETRIEVE_WAIT_S", 0.05)
+    order = []
+
+    async def slow_fwd_bwd(batch):
+        order.append("fwd_bwd start")
+        await asyncio.sleep(0.2)
+        order.append("fwd_bwd end")
+        return await mock_backend["handlers"]["fwd_bwd_handler"](batch)
+
+    async def step(overrides):
+        order.append("step")
+        return await mock_backend["handlers"]["step_handler"](overrides)
+
+    async with make_client(fwd_bwd_handler=slow_fwd_bwd, step_handler=step) as c:
+        fb = await c.post("/api/v1/forward_backward", json=_IS_BODY)
+        opt = await c.post("/api/v1/optim_step", json=_STEP_BODY)
+        assert (fb.status_code, opt.status_code) == (200, 200)
+        assert order == ["fwd_bwd start"]
+        assert (await c.post("/api/v1/retrieve_future", json={"request_id": fb.json()["request_id"]})).json() == {
+            "type": "try_again"
+        }
+        assert (await _retrieve(c, fb.json()))["metrics"]["loss:mean"] == 0.5
+        assert "last_lr:mean" in (await _retrieve(c, opt.json()))["metrics"]
+    # The step waits for the forward-backward queued before it.
+    assert order == ["fwd_bwd start", "fwd_bwd end", "step"]
+
+
+@pytest.mark.parametrize(
+    ("error", "category", "message"),
+    [
+        (HTTPException(400, "bad rows"), "user", "bad rows"),
+        (RuntimeError("cortex lost the job"), "server", "RuntimeError: cortex lost the job"),
+    ],
+)
+async def test_slow_failure_reaches_retrieve_future(make_client, monkeypatch, error, category, message):
+    monkeypatch.setattr(router_mod, "_INLINE_BUDGET_S", 0.01)
+
+    async def fails_late(batch):
+        await asyncio.sleep(0.05)
+        raise error
+
+    async with make_client(fwd_bwd_handler=fails_late) as c:
+        fb = await c.post("/api/v1/forward_backward", json=_IS_BODY)
+        assert fb.status_code == 200
+        assert await _retrieve(c, fb.json()) == {"error": message, "category": category}
+
+
+async def test_accumulating_backend_takes_several_forward_backwards_per_step(client, mock_backend):
+    for _ in range(2):
+        assert (await client.post("/api/v1/forward_backward", json=_IS_BODY)).status_code == 200
+    assert len(mock_backend["calls"]["fwd_bwd"]) == 2
+
+
 async def test_optim_step_threads_overrides(client, mock_backend):
     r = await client.post(
         "/api/v1/optim_step",
@@ -334,6 +500,33 @@ async def test_optim_step_threads_overrides(client, mock_backend):
     assert call["lr"] == pytest.approx(5e-5)
     assert call["betas"] == (0.85, 0.99)
     assert call["weight_decay"] == pytest.approx(0.01)
+
+
+_COOKBOOK_ADAM = {"beta1": 0.9, "beta2": 0.95, "eps": 1e-8, "weight_decay": 0.0, "grad_clip_norm": 0.0}
+
+
+async def test_optim_step_with_the_provisioned_adam_accepted(make_client, mock_backend):
+    async with make_client(fixed_adam=_COOKBOOK_ADAM) as c:
+        r = await c.post(
+            "/api/v1/optim_step",
+            json={"adam_params": {"learning_rate": 3e-4, **_COOKBOOK_ADAM}, "model_id": "main"},
+        )
+    assert r.status_code == 200, r.text
+    assert mock_backend["calls"]["step"][-1]["lr"] == pytest.approx(3e-4)
+
+
+async def test_optim_step_adam_the_backend_cannot_apply_rejected(make_client, mock_backend):
+    async with make_client(fixed_adam=_COOKBOOK_ADAM) as c:
+        # Tinker's own AdamParams default eps is 1e-12, not the cookbook's 1e-8.
+        r = await c.post(
+            "/api/v1/optim_step",
+            json={"adam_params": {"learning_rate": 3e-4, "beta2": 0.999}, "model_id": "main"},
+        )
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "beta2=0.999 (served 0.95)" in detail
+    assert "eps=1e-12 (served 1e-08)" in detail
+    assert mock_backend["calls"]["step"] == []
 
 
 # ---------------------------------------------------------------------------

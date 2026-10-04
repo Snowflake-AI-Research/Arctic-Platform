@@ -66,6 +66,11 @@ class TinkerServeConfig:
     seed: int = 7
     # The Cortex image ships FA3 only; FA2 dies at model load.
     attn_implementation: str = "flash_attention_3"
+    # auto | on | off. Keep Cortex from packing two sequences into one
+    # micro-batch; `auto` turns it on for models with linear-attention layers,
+    # whose state Cortex leaks across a pack (see CortexTinkerBackend). It
+    # provisions max_tokens_per_mb = max_seq_len, overriding the flag below.
+    isolate_sequences: str = "auto"
     max_tokens_per_mb: int = 8192
     gpu_memory_utilization: float = 0.8
     zero_stage: int = 2
@@ -74,12 +79,111 @@ class TinkerServeConfig:
     # sampling-only job of its own, created and released with this server.
     teacher_model: str | None = None
     teacher_sampling_gpus: int = 1
+    # 0 is full fine-tuning. Otherwise a LoRA adapter shaped like Tinker's:
+    # alpha 32 scaled by alpha/rank, on the comma-separated module groups of
+    # `_LORA_MODULE_GROUPS` -- Tinker's train_mlp / train_attn / train_unembed.
+    lora_rank: int = 0
+    lora_alpha: int = 32
+    lora_modules: str = "mlp,attn,unembed"
+    # Adam is provisioned once; only the learning rate varies per step. The
+    # defaults are what the cookbook's RL and SL loops send.
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    adam_eps: float = 1e-8
+    weight_decay: float = 0.0
+    # 0 disables clipping, as in Tinker's AdamParams.
+    grad_clip_norm: float = 0.0
     host: str = "127.0.0.1"
     port: int = 8000
 
     @property
     def max_seq_len(self) -> int:
         return self.max_prompt_length + self.max_response_length
+
+    @property
+    def fixed_adam(self) -> dict[str, float]:
+        return {
+            "beta1": self.adam_beta1,
+            "beta2": self.adam_beta2,
+            "eps": self.adam_eps,
+            "weight_decay": self.weight_decay,
+            "grad_clip_norm": self.grad_clip_norm,
+        }
+
+
+# Module names per Tinker LoRA group, covering Qwen3 / Qwen3.5 (including its
+# linear-attention layers) and Llama. PEFT matches each by name suffix.
+_LORA_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
+    "mlp": ("gate_proj", "up_proj", "down_proj"),
+    "attn": (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_a",
+        "in_proj_b",
+        "out_proj",
+    ),
+    "unembed": ("lm_head",),
+}
+
+
+def _lora_groups(cfg: TinkerServeConfig) -> list[str]:
+    groups = [g.strip() for g in cfg.lora_modules.split(",") if g.strip()]
+    unknown = sorted(set(groups) - set(_LORA_MODULE_GROUPS))
+    if unknown or not groups:
+        raise ValueError(f"--lora-modules must name some of {sorted(_LORA_MODULE_GROUPS)}, got {cfg.lora_modules!r}")
+    return groups
+
+
+def _peft_config(cfg: TinkerServeConfig) -> dict[str, Any] | None:
+    if cfg.lora_rank <= 0:
+        return None
+    return {
+        "peft_type": "Lora",
+        "r": cfg.lora_rank,
+        "lora_alpha": cfg.lora_alpha,
+        "lora_dropout": 0.0,
+        "bias": "none",
+        "target_modules": [m for g in _lora_groups(cfg) for m in _LORA_MODULE_GROUPS[g]],
+    }
+
+
+def _served_lora(cfg: TinkerServeConfig) -> Any:
+    from arctic_platform.integrations.tinker.router import LoraConfig
+
+    if cfg.lora_rank <= 0:
+        return None
+    groups = set(_lora_groups(cfg))
+    return LoraConfig(
+        rank=cfg.lora_rank,
+        train_mlp="mlp" in groups,
+        train_attn="attn" in groups,
+        train_unembed="unembed" in groups,
+    )
+
+
+def _has_linear_attention(model_config: Any) -> bool:
+    text_config = getattr(model_config, "text_config", None) or model_config
+    return "linear_attention" in (getattr(text_config, "layer_types", None) or [])
+
+
+def _isolation(cfg: TinkerServeConfig, model_config: Any) -> tuple[TinkerServeConfig, int | None]:
+    """The config to provision and the backend's ``isolate_capacity``.
+
+    Isolating caps a micro-batch at one full-length sequence, so any two rows
+    lengthened past half of it cannot share one.
+    """
+    if cfg.isolate_sequences not in ("auto", "on", "off"):
+        raise ValueError(f"--isolate-sequences must be auto, on or off, got {cfg.isolate_sequences!r}")
+    isolate = cfg.isolate_sequences == "on" or (
+        cfg.isolate_sequences == "auto" and _has_linear_attention(model_config)
+    )
+    if not isolate:
+        return cfg, None
+    return replace(cfg, max_tokens_per_mb=cfg.max_seq_len), cfg.max_seq_len
 
 
 def _client_config(cfg: TinkerServeConfig) -> Any:
@@ -121,13 +225,23 @@ def _client_config(cfg: TinkerServeConfig) -> Any:
                 "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
                 "bf16": {"enabled": cfg.dtype == "bfloat16"},
                 "zero_optimization": {"stage": cfg.zero_stage},
-                "optimizer": {"type": "AdamW", "params": {"lr": cfg.learning_rate}},
+                "optimizer": {
+                    "type": "AdamW",
+                    "params": {
+                        "lr": cfg.learning_rate,
+                        "betas": [cfg.adam_beta1, cfg.adam_beta2],
+                        "eps": cfg.adam_eps,
+                        "weight_decay": cfg.weight_decay,
+                    },
+                },
+                "gradient_clipping": cfg.grad_clip_norm,
             },
             ds_worker_config={
                 "attn_implementation": cfg.attn_implementation,
                 "model_provider": "huggingface",
                 "mb_spec": {"max_tokens_per_mb": cfg.max_tokens_per_mb},
             },
+            peft=_peft_config(cfg),
         ),
         sampling=SamplingConfig(vllm={"gpu_memory_utilization": cfg.gpu_memory_utilization}),
         **job_ids,
@@ -145,6 +259,7 @@ def _teacher_config(cfg: TinkerServeConfig) -> Any:
             sampling_gpus=cfg.teacher_sampling_gpus,
             max_response_length=cfg.max_response_length + 1,
             job_id=None,
+            lora_rank=0,
         )
     )
 
@@ -161,9 +276,13 @@ def create_app(cfg: TinkerServeConfig):
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
+        from transformers import AutoConfig
         from transformers import AutoTokenizer
 
-        client_cfg = _client_config(cfg)
+        job_cfg, isolate_capacity = _isolation(cfg, AutoConfig.from_pretrained(cfg.model))
+        if isolate_capacity is not None:
+            logger.info("one sequence per micro-batch of %d tokens (linear attention)", isolate_capacity)
+        client_cfg = _client_config(job_cfg)
         attached = client_cfg.training_job_id is not None
         client = AsyncArcticRLClient(client_cfg)
         logger.info("training job %s is running", client.jobs.training)
@@ -186,7 +305,9 @@ def create_app(cfg: TinkerServeConfig):
                 # scores at 1.0 and `sample` refuses any other temperature.
                 supports_temperature_scaling=False,
                 teacher_generate_handlers=teacher_handlers,
-                **build_handlers(client),
+                lora=_served_lora(cfg),
+                fixed_adam=cfg.fixed_adam,
+                **build_handlers(client, isolate_capacity=isolate_capacity),
             )
             app.state.arctic_client = client
             yield

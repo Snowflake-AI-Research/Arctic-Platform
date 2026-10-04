@@ -125,8 +125,7 @@ def _build_app(mock_backend, **kwargs):
         max_prompt_length=16,
         max_response_length=8,
         pad_token_id=0,
-        **kwargs,
-        **mock_backend["handlers"],
+        **{**mock_backend["handlers"], **kwargs},
     )
     return app
 
@@ -149,6 +148,12 @@ async def client(app):
     """Async httpx client rooted at the test app."""
     async with _asgi_client(app) as c:
         yield c
+
+
+@pytest.fixture
+def make_client(mock_backend):
+    """``make_client(**init_tinker_state_kwargs)``: a client for an app provisioned differently."""
+    return lambda **kwargs: _asgi_client(_build_app(mock_backend, **kwargs))
 
 
 @pytest.fixture

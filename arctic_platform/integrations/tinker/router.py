@@ -16,17 +16,19 @@
 """The upstream `tinker <https://github.com/thinking-machines-lab/tinker>`_
 HTTP protocol, as a backend-agnostic FastAPI router.
 
-:func:`init_tinker_state` injects five handlers (forward-backward, forward,
-optimizer step, weight sync, generate) and this module knows nothing else about
-the backend. :mod:`arctic_platform.integrations.tinker.cortex` builds them from
+:func:`init_tinker_state` injects the handlers (forward-backward, optimizer step,
+weight sync, generate, and optionally forward) and this module knows nothing
+else about the backend. :mod:`arctic_platform.integrations.tinker.cortex` builds them from
 the unified client; an on-prem handler set would drop in the same way.
 
-Scope (v1): RL only, one global training run, no auth. ``LoraConfig(rank=0)``
-means full fine-tuning; ``rank>0`` returns 400.
+Scope (v1): one global training run, no auth. The run is full fine-tuning or a
+LoRA adapter, fixed when the backend is provisioned; ``create_model`` refuses a
+``LoraConfig`` that differs from it, since the trained adapter could not change.
 
-Every long-running Tinker verb is future-based on the wire. v1 runs the work
-synchronously in the request handler and caches the terminal response, so the
-first ``retrieve_future`` poll already has a result.
+Every long-running Tinker verb is future-based on the wire. Each request runs as
+a task; one that finishes within :data:`_INLINE_BUDGET_S` is answered after it
+completes, and a slower one is answered with its future, so the SDK never
+resends work that is still running.
 
 Wire schemas are Pydantic models mirroring ``tinker.types.*`` so that serving
 the JSON verbs needs no ``tinker`` install. The proto verbs do need it, and
@@ -36,7 +38,9 @@ take their schema from the SDK directly -- see
 
 from __future__ import annotations
 
+import asyncio
 import itertools
+import logging
 import math
 import time
 import uuid
@@ -63,6 +67,8 @@ from arctic_platform.integrations.tinker.proto_wire import decode_forward_backwa
 from arctic_platform.integrations.tinker.proto_wire import encode_forward_backward_output
 from arctic_platform.integrations.tinker.proto_wire import encode_sample_response
 from arctic_platform.integrations.tinker.proto_wire import wants_proto
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Wire schemas — Pydantic mirrors of ``tinker.types.*``
@@ -191,6 +197,10 @@ class ClientConfigResponse(BaseModel):
     sample_enable_stuck_detection: bool = True
     sample_max_concurrent_requests: int = 2000
     use_pyqwest_transport: bool = False
+    # The SDK splits a forward_backward into requests of at most this many
+    # datums and estimated bytes (its defaults).
+    fwdbwd_max_chunk_len: int = 1024
+    fwdbwd_max_chunk_bytes_count: int = 5_000_000
 
 
 class AuthTokenResponse(BaseModel):
@@ -344,6 +354,11 @@ class UntypedAPIFuture(BaseModel):
     request_id: str
     model_id: str | None = None
     type: Literal["future"] = "future"
+
+
+class RequestFailedResponse(BaseModel):
+    error: str
+    category: Literal["unknown", "server", "user"]
 
 
 class TryAgainResponse(BaseModel):
@@ -701,27 +716,52 @@ def sampling_params_tinker_to_vllm(p: SamplingParams, num_samples: int) -> dict[
 
 
 class TinkerFutureStore:
-    """v1 executes work inline; the terminal response is stashed by
-    ``request_id`` and popped on the first ``retrieve_future`` call.
-    Extension E-async swaps this for an ``asyncio.Task``-per-future model
-    that returns ``TryAgainResponse`` until the task completes; the wire
-    surface does not change."""
+    """One ``asyncio.Task`` per future; ``retrieve_future`` answers
+    ``try_again`` until it finishes.
+
+    Work on the trained model (forward-backward, optimizer step, weight saves)
+    runs one request at a time in arrival order, as Tinker orders a model's
+    requests; sampling runs concurrently. ``asyncio.Lock`` wakes waiters in
+    the order they queued, and tasks start in the order they were created.
+    """
 
     def __init__(self) -> None:
         self._counter = itertools.count()
-        self._store: dict[str, tuple[dict[str, Any], str | None]] = {}
+        self._tasks: dict[str, tuple[asyncio.Task, str | None]] = {}
+        self._serial = asyncio.Lock()
 
     def new_request_id(self) -> str:
         return str(next(self._counter))
 
-    def put(self, request_id: str, payload: dict[str, Any], kind: str | None = None) -> None:
-        """Stash a terminal response. ``kind`` names the proto encoder that
+    def submit(
+        self, runner: Callable[[], Awaitable[dict[str, Any]]], kind: str | None = None, *, serial: bool = False
+    ) -> tuple[str, asyncio.Task]:
+        """Start ``runner``. ``kind`` names the proto encoder that
         ``retrieve_future`` must use, since current SDKs reject a JSON reply for
         ``ForwardBackwardOutput`` and ``SampleResponse``."""
-        self._store[request_id] = (payload, kind)
 
-    def pop(self, request_id: str) -> tuple[dict[str, Any], str | None] | None:
-        return self._store.pop(request_id, None)
+        async def run() -> dict[str, Any]:
+            if not serial:
+                return await runner()
+            async with self._serial:
+                return await runner()
+
+        request_id = self.new_request_id()
+        task = asyncio.create_task(run())
+        self._tasks[request_id] = (task, kind)
+        return request_id, task
+
+    async def pop(self, request_id: str, wait: float) -> tuple[asyncio.Task, str | None] | None:
+        """The finished task, waiting up to ``wait`` seconds; ``None`` while it runs or for an unknown id."""
+        entry = self._tasks.get(request_id)
+        if entry is None:
+            return None
+        task, kind = entry
+        await asyncio.wait({task}, timeout=wait)
+        if not task.done():
+            return None
+        del self._tasks[request_id]
+        return task, kind
 
 
 # =============================================================================
@@ -752,17 +792,32 @@ def _require_state(app_state: Any, name: str) -> Any:
     return getattr(app_state, name)
 
 
-async def _submit_inline(
+# The SDK times a request out after 60 s and sends it again, which would run a
+# forward-backward or an optimizer step twice. Work that outlasts this budget is
+# answered with its future and finished in the background.
+_INLINE_BUDGET_S = 30.0
+_RETRIEVE_WAIT_S = 30.0
+
+
+async def _submit(
     request: Request,
     runner: Callable[[], Awaitable[dict[str, Any]]],
     *,
     model_id: str | None = None,
     kind: str | None = None,
+    serial: bool = False,
 ) -> UntypedAPIFuture:
+    """Run ``runner`` as a future, inline while it fits the budget.
+
+    A runner that fails within the budget fails the request itself, as a 400
+    for an ``HTTPException``; a later failure reaches ``retrieve_future``.
+    """
     store: TinkerFutureStore = _require_state(request.app.state, "tinker_futures")
-    request_id = store.new_request_id()
-    result = await runner()
-    store.put(request_id, result, kind)
+    request_id, task = store.submit(runner, kind, serial=serial)
+    await asyncio.wait({task}, timeout=_INLINE_BUDGET_S)
+    if task.done() and task.exception() is not None:
+        await store.pop(request_id, 0)
+        raise task.exception()
     return UntypedAPIFuture(request_id=request_id, model_id=model_id)
 
 
@@ -790,8 +845,13 @@ async def session_heartbeat(req: SessionHeartbeatRequest) -> dict[str, Any]:
 
 
 @router.post("/client/config", response_model=ClientConfigResponse)
-async def client_config(req: ClientConfigRequest) -> ClientConfigResponse:
-    return ClientConfigResponse()
+async def client_config(req: ClientConfigRequest, request: Request) -> ClientConfigResponse:
+    if getattr(request.app.state, "tinker_accumulates_gradients", True):
+        return ClientConfigResponse()
+    # A backend that steps on the last forward_backward alone must receive a
+    # cookbook batch (512+ datums) as one request, not the SDK's 5 MB chunks.
+    unbounded = 2**62
+    return ClientConfigResponse(fwdbwd_max_chunk_len=unbounded, fwdbwd_max_chunk_bytes_count=unbounded)
 
 
 @router.post("/auth/token", response_model=AuthTokenResponse)
@@ -816,6 +876,58 @@ async def get_server_capabilities(request: Request) -> GetServerCapabilitiesResp
 # ---- model lifecycle --------------------------------------------------------
 
 
+_LORA_TARGETS = ("rank", "train_mlp", "train_attn", "train_unembed")
+
+
+def _check_lora(served: LoraConfig | None, requested: LoraConfig | None) -> None:
+    """Refuse a model whose adapter differs from the one the backend trains.
+
+    ``None`` or rank 0 is full fine-tuning on both sides. ``seed`` is not
+    compared: it only picks the adapter's random initialization.
+    """
+    served_rank = served.rank if served is not None else 0
+    requested_rank = requested.rank if requested is not None else 0
+    if served_rank == 0 and requested_rank == 0:
+        return
+    if served_rank != 0 and requested_rank != 0:
+        mismatched = [f for f in _LORA_TARGETS if getattr(served, f) != getattr(requested, f)]
+        if not mismatched:
+            return
+    describe = "full fine-tuning" if served_rank == 0 else f"LoRA {served.model_dump(include=set(_LORA_TARGETS))}"
+    raise HTTPException(
+        400,
+        f"this server trains {describe}, got lora_config={requested.model_dump() if requested else None}. "
+        "The adapter is fixed when the job is provisioned; restart the server with matching "
+        "--lora-rank / --lora-modules, or pass the served configuration.",
+    )
+
+
+_ADAM_FIELDS = ("beta1", "beta2", "eps", "weight_decay", "grad_clip_norm")
+
+
+def _check_adam(served: Mapping[str, float] | None, requested: AdamParams) -> None:
+    """Refuse Adam hyperparameters the backend cannot apply at step time.
+
+    ``served`` is ``None`` when the backend applies every field per step;
+    otherwise only the learning rate may vary.
+    """
+    if served is None:
+        return
+    mismatched = {
+        f: (getattr(requested, f), served[f])
+        for f in _ADAM_FIELDS
+        if not math.isclose(getattr(requested, f), served[f], rel_tol=1e-9, abs_tol=0.0)
+    }
+    if mismatched:
+        detail = ", ".join(f"{f}={got} (served {want})" for f, (got, want) in mismatched.items())
+        raise HTTPException(
+            400,
+            "this backend fixes Adam's hyperparameters when the job is provisioned and "
+            f"changes only the learning rate per step; got {detail}. Restart the server "
+            "with matching --adam-beta1 / --adam-beta2 / --adam-eps / --weight-decay / --grad-clip-norm.",
+        )
+
+
 @router.post("/create_model", response_model=UntypedAPIFuture)
 async def create_model(req: CreateModelRequest, request: Request) -> UntypedAPIFuture:
     base_model = _require_state(request.app.state, "tinker_base_model")
@@ -824,12 +936,7 @@ async def create_model(req: CreateModelRequest, request: Request) -> UntypedAPIF
             400,
             f"server was started with base_model={base_model!r}, got base_model={req.base_model!r}",
         )
-    if req.lora_config is not None and req.lora_config.rank != 0:
-        raise HTTPException(
-            400,
-            f"got lora rank={req.lora_config.rank}, but this backend supports "
-            "full fine-tuning only. Pass lora_rank=0.",
-        )
+    _check_lora(getattr(request.app.state, "tinker_lora", None), req.lora_config)
     models = _require_state(request.app.state, "tinker_models")
     model_id = "main"  # single-tenant in v1
     models[model_id] = {"base_model": req.base_model, "lora_config": req.lora_config}
@@ -841,7 +948,7 @@ async def create_model(req: CreateModelRequest, request: Request) -> UntypedAPIF
             lora_config=req.lora_config,
         ).model_dump(mode="json")
 
-    return await _submit_inline(request, runner, model_id=model_id)
+    return await _submit(request, runner, model_id=model_id)
 
 
 @router.post("/get_info", response_model=ModelInfoResponse)
@@ -911,9 +1018,14 @@ async def _run_forward_backward(req: ForwardBackwardRequest, request: Request) -
     )
 
     n_data = len(fbi.data)
+    _claim_gradient(request.app.state, req.model_id)
 
     async def runner() -> dict[str, Any]:
-        r = await handler(batch)
+        try:
+            r = await handler(batch)
+        except BaseException:
+            request.app.state.tinker_pending_gradients.discard(req.model_id)
+            raise
         # Empty dicts rather than a short list when the backend returns no
         # log-probs: the cookbook weights its metric reduction by datum count.
         logprobs_batch = r.get("batch", {}).get("logprobs") if r.get("batch") else None
@@ -926,13 +1038,40 @@ async def _run_forward_backward(req: ForwardBackwardRequest, request: Request) -
             metrics=arctic_metrics_to_tinker(r.get("metrics")),
         ).model_dump(mode="json")
 
-    return await _submit_inline(request, runner, model_id=req.model_id, kind=_KIND_FWD_BWD)
+    return await _submit(request, runner, model_id=req.model_id, kind=_KIND_FWD_BWD, serial=True)
+
+
+def _claim_gradient(app_state: Any, model_id: str | None) -> None:
+    """Refuse a second ``forward_backward`` before ``optim_step`` on a backend that keeps only the last one's gradient.
+
+    Tinker sums the gradients of every ``forward_backward`` since the last
+    ``optim_step``. Cortex steps on the last call's gradient alone, so the
+    earlier calls' data would go untrained without any error.
+    """
+    if getattr(app_state, "tinker_accumulates_gradients", True):
+        return
+    pending = app_state.tinker_pending_gradients
+    if model_id in pending:
+        raise HTTPException(
+            400,
+            "this backend steps on the gradient of the last forward_backward only and cannot accumulate "
+            "several: a second forward_backward before optim_step would leave the first one's data untrained. "
+            "Send each step's batch in one forward_backward call (in tinker-cookbook, leave "
+            "stream_minibatch_config unset or set num_minibatches=1).",
+        )
+    pending.add(model_id)
 
 
 async def _run_forward(req: ForwardBackwardRequest, request: Request) -> UntypedAPIFuture:
     fbi = req.forward_backward_input
     _gate_loss_fn(fbi.loss_fn)
-    handler = _require_state(request.app.state, "tinker_fwd_no_grad")
+    handler = getattr(request.app.state, "tinker_fwd_no_grad", None)
+    if handler is None:
+        raise HTTPException(
+            400,
+            "forward (log-probs without a gradient) is not supported by this backend; "
+            "forward_backward returns the same log-probs alongside its gradient.",
+        )
     max_prompt = _require_state(request.app.state, "tinker_max_prompt_length")
     max_resp = _require_state(request.app.state, "tinker_max_response_length")
     pad_id = _require_state(request.app.state, "tinker_pad_token_id")
@@ -955,13 +1094,15 @@ async def _run_forward(req: ForwardBackwardRequest, request: Request) -> Untyped
             metrics=arctic_metrics_to_tinker(r.get("metrics")),
         ).model_dump(mode="json")
 
-    return await _submit_inline(request, runner, model_id=req.model_id, kind=_KIND_FWD_BWD)
+    return await _submit(request, runner, model_id=req.model_id, kind=_KIND_FWD_BWD, serial=True)
 
 
 @router.post("/optim_step", response_model=UntypedAPIFuture)
 async def optim_step(req: OptimStepRequest, request: Request) -> UntypedAPIFuture:
     handler = _require_state(request.app.state, "tinker_step")
+    _check_adam(getattr(request.app.state, "tinker_fixed_adam", None), req.adam_params)
     overrides = adam_params_to_optim_overrides(req.adam_params)
+    request.app.state.tinker_pending_gradients.discard(req.model_id)
 
     async def runner() -> dict[str, Any]:
         r = await handler(overrides)
@@ -969,7 +1110,7 @@ async def optim_step(req: OptimStepRequest, request: Request) -> UntypedAPIFutur
             metrics=arctic_metrics_to_tinker(r.get("metrics")),
         ).model_dump(mode="json")
 
-    return await _submit_inline(request, runner, model_id=req.model_id)
+    return await _submit(request, runner, model_id=req.model_id, serial=True)
 
 
 # ---- weight sync / sampling -------------------------------------------------
@@ -986,7 +1127,7 @@ async def save_weights(req: SaveWeightsRequest, request: Request) -> UntypedAPIF
         path = req.path or f"tinker://main/state/{gen}"
         return SaveWeightsResponse(path=path).model_dump(mode="json")
 
-    return await _submit_inline(request, runner, model_id=req.model_id)
+    return await _submit(request, runner, model_id=req.model_id, serial=True)
 
 
 @router.post("/save_weights_for_sampler", response_model=UntypedAPIFuture)
@@ -1002,7 +1143,7 @@ async def save_weights_for_sampler(req: SaveWeightsForSamplerRequest, request: R
             sampling_session_id=f"ss@{gen}",
         ).model_dump(mode="json")
 
-    return await _submit_inline(request, runner, model_id=req.model_id)
+    return await _submit(request, runner, model_id=req.model_id, serial=True)
 
 
 def _gate_temperature(app_state: Any, temperature: float) -> None:
@@ -1146,7 +1287,7 @@ async def asample(req: SampleRequest, request: Request) -> UntypedAPIFuture:
                 )
         return SampleResponse(sequences=sequences, prompt_logprobs=prompt_logprobs).model_dump(mode="json")
 
-    return await _submit_inline(request, runner, kind=_KIND_SAMPLE)
+    return await _submit(request, runner, kind=_KIND_SAMPLE)
 
 
 # ---- futures ----------------------------------------------------------------
@@ -1155,10 +1296,17 @@ async def asample(req: SampleRequest, request: Request) -> UntypedAPIFuture:
 @router.post("/retrieve_future")
 async def retrieve_future(req: FutureRetrieveRequest, request: Request):
     store: TinkerFutureStore = _require_state(request.app.state, "tinker_futures")
-    entry = store.pop(req.request_id)
+    entry = await store.pop(req.request_id, _RETRIEVE_WAIT_S)
     if entry is None:
         return TryAgainResponse().model_dump()
-    payload, kind = entry
+    task, kind = entry
+    err = task.exception()
+    if err is not None:
+        if isinstance(err, HTTPException) and err.status_code < 500:
+            return RequestFailedResponse(error=str(err.detail), category="user").model_dump()
+        logger.error("tinker request %s failed", req.request_id, exc_info=err)
+        return RequestFailedResponse(error=f"{type(err).__name__}: {err}", category="server").model_dump()
+    payload = task.result()
     encoder = _PROTO_ENCODERS.get(kind or "")
     # A proto-only result type is signalled by the Accept header; a JSON reply
     # to such a caller raises on its side rather than degrading.
@@ -1180,12 +1328,15 @@ def init_tinker_state(
     max_response_length: int,
     pad_token_id: int,
     fwd_bwd_handler: Callable[[dict], Awaitable[dict]],
-    fwd_no_grad_handler: Callable[[dict], Awaitable[dict]],
     step_handler: Callable[[dict | None], Awaitable[dict]],
     sync_weights_handler: Callable[[], Awaitable[Any]],
     generate_handler: Callable[[list[int], dict], Awaitable[dict]],
+    fwd_no_grad_handler: Callable[[dict], Awaitable[dict]] | None = None,
     supports_temperature_scaling: bool = True,
     teacher_generate_handlers: Mapping[str, Callable[[list[int], dict], Awaitable[dict]]] | None = None,
+    lora: LoraConfig | None = None,
+    fixed_adam: Mapping[str, float] | None = None,
+    accumulates_gradients: bool = True,
 ) -> None:
     """Wire the Tinker verbs onto ``app.state`` as async closures. Callers
     (real Arctic http_server, in-process tests with a mocked backend) inject
@@ -1196,9 +1347,21 @@ def init_tinker_state(
     which makes any other sampling temperature a silent train/sample mismatch;
     ``sample`` then refuses it. See :func:`asample`.
 
+    Without ``fwd_no_grad_handler``, ``forward`` returns 400.
+
     ``teacher_generate_handlers`` maps a model name to the sampler serving its
     base weights, for ``create_sampling_client(base_model=...)`` on a model
-    other than the one being trained (on-policy distillation's teacher)."""
+    other than the one being trained (on-policy distillation's teacher).
+
+    ``lora`` is the adapter the backend trains, ``None`` for full fine-tuning.
+    ``fixed_adam`` holds the ``beta1`` / ``beta2`` / ``eps`` / ``weight_decay`` /
+    ``grad_clip_norm`` a backend provisioned and cannot change per step;
+    ``optim_step`` refuses any other values. ``None`` means the step handler
+    applies them all.
+
+    ``accumulates_gradients=False`` declares that ``step`` applies only a
+    single ``forward_backward``'s gradient; a second call before ``optim_step``
+    then returns 400. See :func:`_claim_gradient`."""
     app.state.tinker_base_model = base_model
     app.state.tinker_max_prompt_length = int(max_prompt_length)
     app.state.tinker_max_response_length = int(max_response_length)
@@ -1213,4 +1376,8 @@ def init_tinker_state(
     app.state.tinker_sync_weights = sync_weights_handler
     app.state.tinker_generate = generate_handler
     app.state.tinker_teacher_generate = dict(teacher_generate_handlers or {})
+    app.state.tinker_lora = lora
+    app.state.tinker_fixed_adam = None if fixed_adam is None else {f: float(fixed_adam[f]) for f in _ADAM_FIELDS}
     app.state.tinker_supports_temperature_scaling = bool(supports_temperature_scaling)
+    app.state.tinker_accumulates_gradients = bool(accumulates_gradients)
+    app.state.tinker_pending_gradients = set()

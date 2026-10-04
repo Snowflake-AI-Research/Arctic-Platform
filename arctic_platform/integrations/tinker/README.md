@@ -93,7 +93,7 @@ Required settings:
 - `TINKER_API_KEY` must start with `tml-`; the value is otherwise unused.
 - Set `renderer_name` explicitly for models absent from the cookbook's
   recommendation table.
-- Use `lora_rank=0`.
+- Use the recipe's `lora_rank` as the server's `--lora-rank` (see below).
 - Use `temperature=1.0`.
 - Keep `max_tokens < --max-response-length`.
 - Ensure rendered prompts fit `--max-prompt-length`.
@@ -103,6 +103,22 @@ Training rows are never truncated. A prompt or response longer than its limit
 is accepted as long as the whole datum fits
 `--max-prompt-length + --max-response-length`; a longer datum returns 400.
 
+### LoRA and the optimizer
+
+The adapter and the optimizer are part of the Cortex job, so the server fixes
+them at start-up:
+
+- `--lora-rank N` trains a LoRA adapter of rank `N` with `--lora-alpha`
+  (default `32`, Tinker's) on `--lora-modules` (default `mlp,attn,unembed`,
+  Tinker's default `train_mlp`, `train_attn`, and `train_unembed`). Weight sync
+  sends only the adapter. `--lora-rank 0` (the default) is full fine-tuning.
+- Adam uses `--adam-beta1 0.9 --adam-beta2 0.95 --adam-eps 1e-8
+  --weight-decay 0 --grad-clip-norm 0`, the values the cookbook sends.
+
+A training client whose LoRA rank or modules differ from the server's, or an
+`optim_step` whose Adam settings differ, returns 400 naming the flag to change.
+The learning rate is applied per step.
+
 The cookbook's default learning rate is intended for LoRA. Full fine-tuning
 may require a lower learning rate.
 
@@ -110,31 +126,33 @@ may require a lower learning rate.
 
 Supported:
 
-- text-only full fine-tuning
+- text-only full fine-tuning and LoRA
 - `ppo`, `importance_sampling`, and `cross_entropy`, with the importance
   ratio taken against the sampler's log-probs; `ppo` accepts
   `clip_low_threshold` and `clip_high_threshold` in `loss_fn_config`
 - sampling, forward-backward, optimizer step, and sampler weight sync
-- client-defined custom losses through `forward_backward_custom`
+- client-defined custom losses through `forward_backward_custom`, on backends
+  that serve `forward` (not Cortex; see below)
 - on-policy distillation from one teacher, including `compute_logprobs`
 
 Current limitations:
 
 | Limitation | Behavior |
 |---|---|
-| LoRA | `lora_rank > 0` returns 400. |
+| LoRA | One rank and module set per server, fixed at start-up; others return 400. |
 | Temperature | Sampling temperatures other than `1.0` return 400. |
 | Checkpoints | `save_weights` returns an acknowledgment path; load and resume are not implemented. |
 | Sequence limits | A datum longer than `--max-prompt-length + --max-response-length` returns 400. |
 | Loss config | `loss_fn_config` keys other than PPO's two clip thresholds return 400. |
-| Forward | `forward` (log-probs without gradients) is routed to Cortex, which currently fails it with `KeyError: 'pad_token_id'` in its training pipeline. The cookbook's NLL evaluator uses it, so run `chat_sl` with `eval_every=0`. |
+| Forward | `forward` (log-probs without gradients) returns 400: Cortex's no-gradient pipeline rejects this request shape. `forward_backward` returns the same log-probs. The cookbook's NLL evaluator uses `forward`, so run `chat_sl` with `eval_every=0`. `forward_backward_custom` calls `forward` first, so custom losses (DPO, SDFT) are unavailable on Cortex. |
+| Gradient accumulation | Cortex steps on the last `forward_backward`'s gradient and drops earlier ones, where Tinker sums them. A second `forward_backward` before `optim_step` therefore returns 400. In the cookbook, leave `stream_minibatch_config` unset or use `num_minibatches=1`; `num_substeps` is unaffected. |
 | Teacher | One teacher, from its base weights. A teacher checkpoint (the distillation recipe's `teacher_checkpoint`) and `topk_prompt_logprobs` return 400. |
 | Base-model samplers | `create_sampling_client(base_model=...)` for the trained model reads its untrained weights, which the sampler holds only until the first weight sync; after that it returns 409. |
-| Optimizer overrides | Only the learning rate is applied at step time. |
+| Optimizer overrides | Only the learning rate varies per step; other Adam settings are fixed at start-up. |
 | Multimodal input | Only encoded text tokens are passed to Cortex. |
 | Authentication | The local Tinker server does not authenticate requests. |
 
-Recipes that require audio, images, LoRA, checkpoint resume, reference-model
+Recipes that require audio, images, checkpoint resume, reference-model
 workers, external tools, or external graders are not covered by this
 integration.
 
@@ -160,6 +178,24 @@ The adapter also handles three tensor conventions:
   padded with copies of a row that carry no loss, and the copies are dropped
   from the returned log-probs.
 
+It also works around three SDK and Cortex behaviors:
+
+- The SDK resends any request that takes over 60 seconds. Work still running
+  after 30 seconds is answered with its future and finishes in the background,
+  so a slow forward-backward or optimizer step is never run twice. Work on the
+  trained model runs one request at a time, in arrival order.
+- The SDK splits a large `forward_backward` into 5 MB requests, and Cortex keeps
+  only the last one's gradient. The server's client config raises the SDK's
+  chunk limits so each batch arrives as one request.
+- Cortex packs several sequences into one micro-batch. Models with linear
+  attention layers (Qwen3.5's Gated DeltaNet) carry state across sequence
+  boundaries in Cortex's Hugging Face provider, which corrupts every sequence
+  after the first in a pack. For these models (`--isolate-sequences auto`, the
+  default) the server provisions micro-batches of one full-length datum and
+  extends each row with loss-free tokens past half that length, so no two rows
+  share a micro-batch. This costs throughput on short rows. Remove it once
+  Cortex resets linear-attention state at packed boundaries.
+
 ## Custom losses
 
 `forward_backward_custom` computes a loss in the SDK and sends
@@ -177,12 +213,23 @@ on this path do not represent the client's loss or model entropy.
 Live validation covered `math_rl`, `chat_sl`, and `rl_loop` with importance
 sampling, PPO, and cross-entropy. Detailed results are recorded in the PR.
 
+Trainer parity with Tinker was measured by sampling rollouts on Tinker once and
+replaying the same datums on Tinker and on this adapter for five steps, both
+training the same LoRA with the cookbook's Adam settings:
+
+| Recipe | Model | Per-token log-prob gap | Loss, step 0 → 4 (Tinker / Cortex) |
+|---|---|---|---|
+| `math_rl` GSM8K, rank 32, lr `1e-5` | Qwen3.5-4B | `0.004` mean | `0.01025 → 0.00889` / `0.01029 → 0.00891` |
+| On-policy distillation, rank 128, lr `1e-4` | Qwen3.5-4B, teacher Qwen3.5-9B | `0.008` → `0.015` mean | `0.0733 → -0.3395` / `0.0728 → -0.3517` |
+
+The teacher's `compute_logprobs` on the same 9,068 tokens differed from
+Tinker's by `0.0096` on average.
+
 For RL runs, `kl_sample_train_v1` checks agreement between sampler and trainer
-log-probs. Its level depends on the model. With Qwen3.5-9B and full
-fine-tuning it stayed between `0.03` and `0.045` on GSM8K. On MATH it rose from
-`0.02` to a peak of `0.084` while accuracy climbed fastest, then settled near
-`0.04`. A value far above the model's usual level from the first step, or one
-that keeps rising, points to a request-shape or alignment problem.
+log-probs. In the parity runs it started at `0.0002`–`0.0004` on both
+backends. A value far above that from the first step, or one that keeps
+rising without learning, points to a request-shape, alignment, or packing
+problem.
 
 ## Tests
 
