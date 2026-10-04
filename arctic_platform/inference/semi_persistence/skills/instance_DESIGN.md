@@ -83,8 +83,8 @@ inst = Instance({"model": "...", "tensor_parallel_size": 2}, model_dir)
 inst.init(gpus=[2, 3])
 ```
 
-Four additional primitives (`destroy_nccl`, `reinit_nccl`, `cleargraph`,
-`recapture_graphs`) bracket the checkpoint and restore; all are no-ops at
+Three additional primitives (`destroy_nccl`, `reinit_nccl`,
+`rebind_graphs`) bracket the checkpoint and restore; all are no-ops at
 TP=1.  See [tp_DESIGN.md](tp_DESIGN.md).
 
 ## Process Hierarchy
@@ -844,10 +844,6 @@ PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:$PKG_CONFIG_PATH" make 
 sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-criu PREFIX=/usr
 sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-lib PREFIX=/usr
 sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-crit PREFIX=/usr
-
-# Empty plugin directory (used by --libdir during dump; the dump creates
-# it if missing, so this is optional)
-sudo mkdir -p /usr/lib/criu/empty
 ```
 
 ### Verify
@@ -855,7 +851,6 @@ sudo mkdir -p /usr/lib/criu/empty
 ```
 criu --version          # Version: 4.2
 which crit              # /usr/local/bin/crit
-ls -d /usr/lib/criu/empty
 ```
 
 ## File Structure

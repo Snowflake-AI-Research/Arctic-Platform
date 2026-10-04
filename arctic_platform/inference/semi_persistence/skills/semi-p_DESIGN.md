@@ -48,6 +48,14 @@ deterministic, colocated with the weights, human-readable, needs no
 hashing, and gives CRIU a stable absolute path for the recorded JIT
 mappings.
 
+The serving adapter takes a stricter line, and for a reason worth knowing
+before you copy the convention above: a path that is merely *stable* still
+lets two different configurations share a directory.  `restore_and_wrap`
+therefore derives `model_dir` from a hash of the config and of the
+environment (`$SEMIP_IMAGE_CACHE/<cfg>_<env>`), which makes the directory
+name the cache key rather than a label attached to one.  See
+[`IMAGE_CACHE.md`](IMAGE_CACHE.md) Section 6.
+
 **One image and one weights set per `model_dir`.** There are no
 per-config subdirectories and no path encoding of TP size, dtype, or
 `max_model_len`.  Binding an image to a specific `vllm_config` in the
@@ -65,8 +73,11 @@ Verified behavior, and the three parts differ:
 | `weights/` | Fully overwritten (cleared and rewritten). Shard counts vary with model size, so a partial overwrite would leave a mix the manifest cannot detect. |
 | `compilation/` | **Reused, never cleared.** It is a content-keyed cache, so re-dumping into the same directory skips recompilation. |
 
-The `rm -rf` paths fall back to `sudo rm -rf` because an aborted run can
-leave root-owned files behind.
+The `rm -rf` paths raise a named `RuntimeError` if they hit a
+`PermissionError`, which means the directory holds files from a run under a
+different uid.  Dump and restore must share one uid (enforced by
+`Instance.criu_restore`), so such leftovers are cleared by hand as their owner
+rather than by elevating.
 
 ---
 
@@ -91,6 +102,40 @@ mismatch is rejected by name.
 `pipe_resource`, `nvidia_fds`), the placement and hardware identity
 (`rank`, `gpus`, `gpu_uuids`), and the budget inputs (`total_gpu_bytes`,
 `pinned_cpu_bytes`, `n_gpus`, `max_pinned_bytes_per_worker`).
+
+### An image also has a warmth, and nothing records it
+
+Two images can match on every field above and still behave differently,
+because an image captures a process *mid-life*: whatever that process had
+lazily built by the moment of the checkpoint is in the image, and whatever
+it had not, is not. Nothing in `meta.json` describes this.
+
+It is not a curiosity. At TP>1 it was the cause of the 302 s post-restore
+hang: `keep_graph=True` stops torch instantiating CUDA graphs at capture,
+so an unwarmed image carries execs only for the batch shapes its dump-time
+job happened to run, and the restore builds the rest — on every rank, in a
+freshly restored context, alongside the JIT compiles for kernels no shape
+had yet dispatched to. Warming the dump is unconditional since 2026-09-24,
+so an unwarmed image should no longer be producible; `tp_DESIGN.md` §5 has
+the mechanism and the fix.
+
+Two things follow for anything built on this stack.
+
+**Prefer paying at dump time.** The dump runs once, in one healthy
+process. The restore runs on every wake, on all ranks, in a context that
+was just reconstructed. Work moved from the second to the first is paid
+once and amortised over every restore — measured here as ~11 s added to a
+353 s dump to remove 4.35 s from each restore, which breaks even after
+three wakes. Latency on the restore path is the product's whole value
+proposition; latency on the dump path is nearly free.
+
+**Assert warmth rather than assuming it.** Laziness is invisible by
+construction: a cold image restores, serves, and looks correct right up
+until it doesn't. The counterpart is a cheap dump-side census with a
+hard gate, so a key is never published from an image that failed to warm.
+Whenever you add a lazily-initialised resource to the restore path, ask
+what forces it to exist before the checkpoint, and what would tell you if
+that ever stopped working.
 
 ---
 
@@ -146,11 +191,16 @@ appears after an offline re-dump with the updated code.  Keep dump-time
 code and runtime code the same checkout.  This is a common source of
 "my fix did nothing" confusion.
 
-**Root is required.** CUDA checkpoint/restore uses the libcuda driver API
-when `geteuid() == 0` and otherwise falls back to `sudo
-cuda-checkpoint`; CRIU dump and restore always shell out via `sudo`.
-`Instance` spawns its worker and vLLM child with `mp.spawn`, which
-inherits the uid, so the whole process tree must run as root.
+**Root is not required.** CUDA checkpoint/restore always uses the libcuda
+driver API, which needs ptrace permission over the target -- something a
+parent holds over its own same-uid child -- not root.  CRIU dump and the
+low-cap restore both invoke `criu` at the worker's own uid with no `sudo`;
+an unprivileged node needs only `SEMIP_UNPRIVILEGED=1` plus the capabilities
+set on the binary (see `INSTALL.md`).  `Instance` spawns its worker and vLLM
+child with `mp.spawn`, which inherits the uid, so the whole tree runs as
+whoever launched it -- and dump and restore must be that same uid.  Only the
+default PID-namespace restore path still needs `sudo`, for
+`unshare(CLONE_NEWPID)`.
 
 **Modules import their siblings by bare name.** `import semip_logging`,
 `from instance import Instance`, and so on, so the package directory must

@@ -71,7 +71,7 @@ def run_one(label, model_id, tp, util, gpus, extra):
     t1 = time.perf_counter()
     times["sleep"] = t1 - t0
 
-    # cuda_checkpoint already does cleargraph + destroy_nccl when tp>1.
+    # cuda_checkpoint already does destroy_nccl when tp>1.
     t0 = time.perf_counter()
     inst.cuda_checkpoint().wait()
     t1 = time.perf_counter()
@@ -118,9 +118,9 @@ def run_one(label, model_id, tp, util, gpus, extra):
     times["wake_up_kv_cache"] = t1 - t0
 
     t0 = time.perf_counter()
-    inst.recapture_graphs().wait()
+    inst.rebind_graphs().wait()
     t1 = time.perf_counter()
-    times["recapture_graphs"] = t1 - t0
+    times["rebind_graphs"] = t1 - t0
 
     inst.generate([PROMPT], SAMPLING).wait()
     print(f"  answer after saved: {str(inst.last_generate_result)[:80]!r}",

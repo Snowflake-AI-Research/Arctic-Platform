@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from enum import Enum
@@ -520,11 +521,64 @@ class WorkerLifecycleState(str, Enum):
     SLEEPING = "sleeping"
 
 
+_ACTOR_LOG_HANDLER_MARK = "_arctic_actor_handler"
+
+
+def _ensure_actor_logging(level: int = logging.INFO) -> str:
+    """Give the ``arctic_platform.inference`` logger somewhere to go inside this actor.
+
+    DSS installs its structured root pipeline in zone and driver processes, but
+    ``InferenceWorker`` is a plain ``@ray.remote`` actor and nothing configures
+    logging there.  The root logger keeps its default state, so
+    ``logging.lastResort`` takes over: WARNING and above, unformatted, and
+    everything at INFO discarded.  That is why no ``logger.info`` from
+    ``semip_engine`` has ever appeared in a collected log, including the
+    materialize timing it has emitted since that feature shipped.
+
+    **The level matters as much as the handler.**  ``arctic_platform.inference`` sits at
+    ``NOTSET``, so its effective level is inherited from root's ``WARNING`` and
+    INFO records are dropped before any handler is consulted.  Attaching a
+    handler alone changes nothing.
+
+    Returns a short description of what it did, for the caller to log.  Never
+    raises: losing the log costs evidence, not correctness, and this runs in
+    ``__init__`` where an exception would kill actor construction.
+    """
+    try:
+        if logging.getLogger().handlers:
+            # Something already configured the root pipeline (DSS's own
+            # setup_logging in a driver-hosted actor, or a prior call here), so
+            # propagation already reaches a sink.  Only the level may need help.
+            pkg = logging.getLogger("arctic_platform.inference")
+            if pkg.level == logging.NOTSET:
+                pkg.setLevel(level)
+            return "root already configured; level ensured"
+        pkg = logging.getLogger("arctic_platform.inference")
+        for h in pkg.handlers:
+            if getattr(h, _ACTOR_LOG_HANDLER_MARK, False):
+                return "already attached"
+        handler = logging.StreamHandler(sys.stdout)
+        setattr(handler, _ACTOR_LOG_HANDLER_MARK, True)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s "
+            "%(filename)s:%(lineno)d %(message)s"))
+        pkg.addHandler(handler)
+        pkg.setLevel(level)
+        return "attached stdout handler to arctic_platform.inference"
+    except Exception as exc:  # noqa: BLE001
+        return f"failed: {exc!r}"
+
+
 @ray.remote
 class InferenceWorker(StreamingWorkerMixin):
     """Ray actor that hosts an in-process vLLM AsyncLLM engine."""
 
     def __init__(self) -> None:
+        # First, so that everything below is loggable.  Reported rather than
+        # assumed: a StreamHandler here reaches Ray's worker log, which is not
+        # the file most semi-p debugging reads, so this line is how you find out
+        # whether the records land anywhere you collect.
+        logger.info("InferenceWorker logging: %s", _ensure_actor_logging())
         self.llm = None
         self.state = WorkerLifecycleState.UNINITIALIZED
         self._reasoning_parser: Any = None
@@ -608,6 +662,26 @@ class InferenceWorker(StreamingWorkerMixin):
         reasoning_parser_name = engine_kwargs.get("reasoning_parser")
         self._return_reasoning_content = bool(engine_kwargs.pop("return_reasoning_content", False))
         lora_adapter_path = engine_kwargs.pop("lora_adapter_path", None)
+
+        # Semi-persistence: restore a pre-warmed CRIU image instead of a cold
+        # vLLM load. Pop the flags before AsyncEngineArgs (which rejects unknown
+        # kwargs); if set, build the Instance-backed adapter and return early.
+        semi_p = bool(engine_kwargs.pop("semi_p", False))
+        # Popped unconditionally even though it is no longer a config field: a
+        # dss that predates the derived image cache still sends it, and
+        # BaseConfig's extra="allow" would carry it into AsyncEngineArgs.
+        engine_kwargs.pop("semi_p_model_dir", None)
+        if semi_p:
+            from arctic_platform.inference.server.semip_engine import restore_and_wrap
+            self.llm = await asyncio.to_thread(
+                restore_and_wrap, engine_kwargs)
+            self.state = WorkerLifecycleState.READY
+            self._maybe_init_reasoning_parser(reasoning_parser_name)
+            logger.info(
+                "Worker %d initialized via semi_p restore: model=%s",
+                os.getpid(), engine_kwargs.get("model"),
+            )
+            return
 
         # Force-load vLLM general_plugins before constructing AsyncEngineArgs.
         # vLLM normally calls load_general_plugins() in
@@ -1030,6 +1104,10 @@ class InferenceWorker(StreamingWorkerMixin):
     def pid(self) -> int:
         return os.getpid()
 
+    def get_node_id(self) -> str:
+        """The Ray node this actor runs on, which ReplicaPool numbers slots by."""
+        return ray.get_runtime_context().get_node_id()
+
     async def init_router_replay(
         self,
         master_addr: str,
@@ -1333,6 +1411,10 @@ class InferenceWorker(StreamingWorkerMixin):
     def shutdown(self) -> None:
         self._cleanup_registered_router_replay_shm()
         if self.llm is not None:
+            # semi_p engine holds an out-of-process Instance; tear it down.
+            close = getattr(self.llm, "close", None)
+            if callable(close):
+                close()
             del self.llm
             self.llm = None
         self.state = WorkerLifecycleState.UNINITIALIZED

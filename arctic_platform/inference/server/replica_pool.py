@@ -87,6 +87,46 @@ async def _await_maybe(value: Any) -> Any:
     return value
 
 
+def _node_slots(node_ids: list[Any]) -> list[tuple[int, int]]:
+    """``(slot, replicas on that node)`` for each worker, in worker order.
+
+    Slots number the replicas *within* a node, in worker order, so on a single
+    node they equal the worker indices. They are what a replica's semi-p image
+    directory and VLLM_PORT range are keyed on: both are per pod, and Ray does
+    not place actors in index order across nodes, so a global index taken
+    modulo the per-node count could put two replicas of one pod on one slot.
+    """
+    counts: dict[Any, int] = {}
+    slots = []
+    for node in node_ids:
+        slots.append(counts.get(node, 0))
+        counts[node] = counts.get(node, 0) + 1
+    return [(slot, counts[node]) for slot, node in zip(slots, node_ids)]
+
+
+def _free_slot(taken: set[int], preferred: int | None = None) -> int:
+    """``preferred`` if it is not ``taken``, else the lowest free slot."""
+    if preferred is not None and preferred not in taken:
+        return preferred
+    slot = 0
+    while slot in taken:
+        slot += 1
+    return slot
+
+
+async def _worker_node_id(worker: Any) -> Any:
+    """The Ray node a worker actor landed on, or ``None`` if it cannot say."""
+    getter = getattr(worker, "get_node_id", None)
+    if getter is None:
+        return None
+    try:
+        return await _await_maybe(getter.remote())
+    except Exception:
+        logger.warning("could not read a worker's Ray node id; numbering it as "
+                       "if it shared a node with the others", exc_info=True)
+        return None
+
+
 def ensure_ray() -> int:
     """Initialize Ray and return the total number of GPUs in the cluster."""
     ray.init(ignore_reinit_error=True, log_to_driver=True)
@@ -135,6 +175,9 @@ class ReplicaPool:
         self._config: ModelConfig | None = None
         self._model_id: str | None = None
         self._workers: list[ray.actor.ActorHandle] = []
+        # ``(node_id, slot)`` per worker, parallel to ``_workers``. See
+        # ``_node_slots``.
+        self._slots: list[tuple[Any, int]] = []
         self._scheduler: Scheduler | None = None
         self._lock = asyncio.Lock()
         self._stream_admission_blocked = False
@@ -352,6 +395,7 @@ class ReplicaPool:
 
     def _reset_lifecycle_state(self) -> None:
         self._workers.clear()
+        self._slots.clear()
         # The engine PG is owned by the caller (dss-platform); we only drop our
         # reference to it here and never remove it.
         self._engine_pg = None
@@ -451,6 +495,51 @@ class ReplicaPool:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
 
+    def _worker_env(
+        self,
+        slot: int,
+        count: int,
+        extra_env: dict[str, str] | None,
+    ) -> dict[str, str]:
+        """The env one worker initializes with, for its node-local ``slot``.
+
+        ``SEMIP_REPLICA_ID`` and ``SEMIP_NUM_REPLICAS`` tell a semi-p engine
+        which per-pod image directory is its own; harmless otherwise.
+        """
+        worker_env = dict(extra_env or {})
+        # The per-replica VLLM_PORT pin only exists to keep multiple single-node
+        # replicas on one host from colliding, so it keys on the node-local
+        # slot. A node-spanning engine has a single replica whose vLLM Ray
+        # executor derives its torch.distributed rendezvous port from
+        # VLLM_PORT; pinning it collides with the co-located EngineCore
+        # (EADDRINUSE). Let vLLM pick free ports instead.
+        if not self._is_multi_node():
+            port_base = _env_int("ARCTIC_VLLM_PORT_BASE", 8000, minimum=1)
+            port_stride = _env_int("ARCTIC_VLLM_PORT_STRIDE", 100, minimum=1)
+            worker_env["VLLM_PORT"] = str(port_base + slot * port_stride)
+        worker_env["SEMIP_REPLICA_ID"] = str(slot)
+        worker_env["SEMIP_NUM_REPLICAS"] = str(count)
+        return worker_env
+
+    async def _place_new_worker(
+        self,
+        worker: ray.actor.ActorHandle,
+        preferred: int | None = None,
+        replacing: int | None = None,
+    ) -> tuple[Any, int, int]:
+        """``(node, slot, count)`` for a worker joining an initialized pool.
+
+        ``replacing`` is the index whose slot is being handed over (a restart);
+        its old slot is ``preferred`` when the new actor lands on the same node.
+        """
+        node = None if self._is_multi_node() else await _worker_node_id(worker)
+        taken = {
+            slot for i, (other, slot) in enumerate(self._slots)
+            if other == node and i != replacing
+        }
+        slot = _free_slot(taken, preferred)
+        return node, slot, len(taken) + 1
+
     async def _initialize_workers(
         self,
         engine_kwargs: dict[str, Any],
@@ -468,24 +557,23 @@ class ReplicaPool:
                 stagger_s,
             )
 
-        port_base = _env_int("ARCTIC_VLLM_PORT_BASE", 8000, minimum=1)
-        port_stride = _env_int("ARCTIC_VLLM_PORT_STRIDE", 100, minimum=1)
-        # The per-replica VLLM_PORT pin only exists to keep multiple single-node
-        # replicas on one host from colliding. A node-spanning engine has a
-        # single replica whose vLLM Ray executor derives its torch.distributed
-        # rendezvous port from VLLM_PORT; pinning it collides with the
-        # co-located EngineCore (EADDRINUSE). Let vLLM pick free ports instead.
-        pin_vllm_port = not self._is_multi_node()
+        if self._is_multi_node():
+            node_ids: list[Any] = [None] * n
+        else:
+            node_ids = list(await asyncio.gather(
+                *[_worker_node_id(w) for w in self._workers]))
+        slots = _node_slots(node_ids)
+        self._slots = [(node, slot) for node, (slot, _) in zip(node_ids, slots)]
 
         for start in range(0, n, concurrency):
             batch = self._workers[start : start + concurrency]
             refs = []
             for offset, worker in enumerate(batch):
                 worker_idx = start + offset
-                logger.info("Initializing worker %d/%d", worker_idx + 1, n)
-                worker_env = dict(extra_env or {})
-                if pin_vllm_port:
-                    worker_env["VLLM_PORT"] = str(port_base + worker_idx * port_stride)
+                slot, count = slots[worker_idx]
+                logger.info("Initializing worker %d/%d (slot %d of %d on its "
+                            "node)", worker_idx + 1, n, slot, count)
+                worker_env = self._worker_env(slot, count, extra_env)
                 refs.append(worker.initialize.remote(engine_kwargs, worker_env, self._model_id))
                 if stagger_s > 0 and offset + 1 < len(batch):
                     await asyncio.sleep(stagger_s)
@@ -752,6 +840,8 @@ class ReplicaPool:
                     await self._scheduler.drain_worker(idx)
                 finally:
                     worker = self._workers.pop()
+                    if len(self._slots) > len(self._workers):
+                        self._slots.pop()
                     try:
                         ray.kill(worker)
                     except Exception:
@@ -780,7 +870,12 @@ class ReplicaPool:
             while len(self._workers) < target_count:
                 worker = self._make_worker()
                 try:
-                    await worker.initialize.remote(engine_kwargs, extra_env, self._model_id)
+                    node, slot, count = await self._place_new_worker(worker)
+                    await worker.initialize.remote(
+                        engine_kwargs,
+                        self._worker_env(slot, count, extra_env),
+                        self._model_id,
+                    )
                 except asyncio.CancelledError:
                     try:
                         ray.kill(worker)
@@ -808,6 +903,7 @@ class ReplicaPool:
                     return
 
                 self._workers.append(worker)
+                self._slots.append((node, slot))
                 self._scheduler.add_worker(
                     worker,
                     concurrency_limit=self._worker_concurrency_limit(),
@@ -1763,6 +1859,10 @@ class ReplicaPool:
         engine_kwargs = self._engine_kwargs()
         extra_env = self._config.extra_env or None
 
+        # The old slot, so a semi-p replica restores its own image again. The
+        # old tree is killed first, so the ids that image records are free.
+        preferred = self._slots[idx][1] if idx < len(self._slots) else idx
+        node = None
         if not self._is_multi_node():
             try:
                 ray.kill(old)
@@ -1770,9 +1870,11 @@ class ReplicaPool:
                 pass
             new_worker = self._make_worker()
             try:
+                node, slot, count = await self._place_new_worker(
+                    new_worker, preferred=preferred, replacing=idx)
                 await new_worker.initialize.remote(
                     engine_kwargs,
-                    extra_env,
+                    self._worker_env(slot, count, extra_env),
                     self._model_id,
                 )
             except BaseException:
@@ -1786,12 +1888,15 @@ class ReplicaPool:
             # Ask the coordinator to shut down first, then retry creation until
             # the placement-group restart deadline expires.
             await self._shutdown_workers([old])
+            slot = 0
             new_worker = await self._restart_placement_worker(
                 engine_kwargs,
-                extra_env,
+                self._worker_env(slot, 1, extra_env),
             )
 
         self._workers[idx] = new_worker
+        if idx < len(self._slots):
+            self._slots[idx] = (node, slot)
 
         if self._scheduler is not None:
             self._scheduler.update_worker_handle(idx, new_worker)

@@ -49,6 +49,102 @@ checker and does **not** block restore: `clone3(set_tid)` at the recorded PIDs
 is authorized by `CAP_CHECKPOINT_RESTORE`.  See Complication 11 in
 [`CRIU_PLUMBING.md`](CRIU_PLUMBING.md).
 
+### Check which capabilities the node actually grants
+
+Several of them decide whether a dump and a restore are possible at all, and
+none is implied by `criu check --unprivileged` passing.  Read the **bounding**
+set rather than the effective one: `CapBnd` is the ceiling on what a `setcap`
+can ever raise, so a capability missing there cannot be granted by any means
+short of changing the pod spec.
+
+```bash
+grep -E 'CapEff|CapBnd' /proc/self/status   # CapBnd == what can ever be acquired
+capsh --decode=$(grep CapBnd /proc/self/status | awk '{print $2}')
+```
+
+`cap_checkpoint_restore` is the floor.  Beyond it, what you need depends on
+whether the dumped tree will run as root:
+
+- **Dumping under `sudo`** (tree is `uid 0`): nothing further.  Both the ptrace
+  seize and the rlimit read are same-uid operations.
+- **Dumping as an unprivileged user**: `cap_sys_ptrace` *and* `cap_sys_resource`
+  become cross-uid operations.  `cap_sys_resource` is typically absent from
+  `CapBnd` on cap-prod pods, so it cannot be acquired at all — the way through
+  is to run `criu` at the target's own uid instead, which is what
+  `_worker_criu_save` and `_worker_criu_load_lowcap` now do (neither shells out
+  through `sudo`).  Both then need their capabilities from the binary:
+
+  ```bash
+  sudo setcap cap_sys_ptrace,cap_checkpoint_restore,cap_setpcap,cap_setgid+eip \
+      /usr/sbin/criu
+  getcap /usr/sbin/criu
+  ```
+
+  Keep the `+e`, or a real-uid-0 `execve` lands with an empty effective set and
+  a root-run `criu` breaks.  File capabilities are node-local and do not
+  survive the pod.  Full reasoning in Complication 11.
+
+  **Grant only what the pod's bounding set contains.**  The four above are
+  right for a cap-prod pod; on a `drop: ["ALL"]` pod that adds exactly
+  `CHECKPOINT_RESTORE` and `SYS_PTRACE`, use only those two:
+
+  ```bash
+  sudo setcap cap_sys_ptrace,cap_checkpoint_restore+eip /usr/sbin/criu
+  ```
+
+  This is not a matter of taste, and getting it wrong does not fail soft.  A
+  capability outside `CapBnd` is **not** silently dropped at `execve`:
+  `bprm_caps_from_vfs_caps()` computes `pP' = (pB & fP) | (pI & fI)` and
+  returns `EPERM` if any file-permitted bit did not survive, whenever the
+  file's effective bit is set — which the `+e` above sets.  So a
+  four-capability `criu` on a two-capability pod fails to `execve` at all.
+  Check the bounding set first:
+
+  ```bash
+  capsh --decode=$(grep CapBnd /proc/self/status | awk '{print $2}')
+  ```
+
+  **The last two are for the restore, not the dump.**  A dump needs only the
+  first two, so it is easy to stop there and then lose an expensive restore to
+  a hang.  `restore_creds()` runs privileged syscalls that a root restore
+  satisfied for free:
+
+  | syscall | capability | when it fires |
+  |---|---|---|
+  | `PR_CAPBSET_DROP` (`restorer.c:317`) | `cap_setpcap` | criu drops every capability *absent* from the image's recorded `cap_bnd`, without checking whether it is already absent, and the kernel tests `CAP_SETPCAP` first.  So it fires for every gap — ~25 on a cap-prod pod, ~39 on a two-capability one — **unless the image records `no_new_privs`**, which demotes the `EPERM` to a warning.  That flag is how the two-capability pod works at all; see Complication 14. |
+  | `setgroups` | `cap_setgid` | Only when the group lists differ.  criu 4.2 compares `getgroups()` against the recorded list and skips the call when they match, so a dump and restore in the same pod spec never needs it. |
+
+  On a cap-prod pod both are inside the bounding set, so `setcap` can grant
+  them — unlike `cap_sys_resource`.  On a two-capability pod neither is, and
+  neither is needed: `no_new_privs` covers the first and the group lists match
+  for the second.
+
+  Getting this wrong does not produce a clean failure.  criu logs
+  `Unable to drop capability 2: -1` once per task, then `BUG at
+  criu/pie/restorer.c:820`, and **deadlocks** — the log stops mid-stream with
+  no `Restoring FAILED`, criu eventually exits, and the restored tasks are left
+  stranded at their recorded PIDs, which then have to be killed by hand before
+  the next attempt.
+
+### If the gateway will run as root
+
+The Ray dashboard agent needs three packages the image omits, and a
+`pip install --user` as an unprivileged account is invisible to root, so the
+worker raylet aborts in `WaitForDashboardAgentPorts` and no zone becomes
+healthy.  The default index is an internal mirror that fails SSL verification
+and does not carry them, and PEP 668 marks this environment externally
+managed:
+
+```bash
+sudo python3 -m pip install --break-system-packages --index-url https://pypi.org/simple \
+    aiohttp-cors opencensus opentelemetry-exporter-prometheus
+sudo python3 -c "import ray.dashboard.http_server_agent, \
+    ray.dashboard.modules.reporter.reporter_agent; print('ok')"
+```
+
+Install them for the unprivileged account too if anything will run the gateway
+that way; the two installs are independent.
+
 ### Also qualify the interpreter for `SEMIP_UNPRIVILEGED=1`
 
 `criu check` says nothing about the *other* precondition of unprivileged
@@ -90,17 +186,11 @@ TP>1 restore will **hang silently** in `reinit_nccl` (Complication 11).
 Fix it before dumping: images are otherwise fine, but you will not find
 out until a later restore.
 
-The dump also needs the empty plugin directory it passes to `--libdir`,
-which no CRIU package creates.  `_worker_criu_save` now creates it (via
-`sudo` when the worker is not root), so this is only needed if you want
-it in place ahead of the first dump:
-
-```bash
-sudo mkdir -p /usr/lib/criu/empty
-```
-
-See *Complication 7* in [`CRIU_PLUMBING.md`](./CRIU_PLUMBING.md) for why
-the directory exists at all.
+Nothing further is needed for the `--libdir` plugin directory the dump
+passes.  `_worker_criu_save` mints a private empty one per dump with
+`tempfile.mkdtemp` and removes it afterwards, so there is no directory to
+pre-create and no root step.  See *Complication 7* in
+[`CRIU_PLUMBING.md`](./CRIU_PLUMBING.md) for why it is passed at all.
 
 ### Alternative: build from source (when apt mirrors are unreachable)
 
@@ -158,9 +248,6 @@ PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:$PKG_CONFIG_PATH" \
 sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-criu PREFIX=/usr
 sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-lib  PREFIX=/usr
 sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-crit PREFIX=/usr
-
-# D. Plugin dir (same as PPA path)
-sudo mkdir -p /usr/lib/criu/empty
 ```
 
 Verify:
@@ -168,7 +255,6 @@ Verify:
 ```bash
 criu --version          # Version: 4.2,  GitID: v4.2
 which crit              # /usr/local/bin/crit  (note: not /usr/bin/crit)
-ls -d /usr/lib/criu/empty
 ```
 
 Notes:
@@ -196,24 +282,24 @@ models, all expected under `/data-fast/`:
 - `/data-fast/qwen3-32b-bird-4096-3head`
 - `/data-fast/qwen3-32b-longcontext-4096-3head`
 
-Sync them from S3 (requires AWS credentials with read access to the
-`ml-dev-sfc-or-dev-misc1-k8s` bucket):
+Sync them from wherever your speculator checkpoints live (`$SPECULATOR_S3`
+below stands for that S3 prefix; you need read access to it):
 
 ```bash
 aws s3 sync \
-    s3://ml-dev-sfc-or-dev-misc1-k8s/snowflake_research/checkpoint/speculator/llama-3.3-70b/jaeseong/spec-decode-qwen3-8b-search_r1 \
+    $SPECULATOR_S3/spec-decode-qwen3-8b-search_r1 \
     /data-fast/spec-decode-qwen3-8b-search_r1
 
 aws s3 sync \
-    s3://ml-dev-sfc-or-dev-misc1-k8s/snowflake_research/checkpoint/speculator/llama-3.3-70b/jaeseong/spec-decode-qwen3-30b-search_r1 \
+    $SPECULATOR_S3/spec-decode-qwen3-30b-search_r1 \
     /data-fast/spec-decode-qwen3-30b-search_r1
 
 aws s3 sync \
-    s3://ml-dev-sfc-or-dev-misc1-k8s/snowflake_research/checkpoint/speculator/qwen3-32b-bird-4096-3head \
+    $SPECULATOR_S3/qwen3-32b-bird-4096-3head \
     /data-fast/qwen3-32b-bird-4096-3head
 
 aws s3 sync \
-    s3://ml-dev-sfc-or-dev-misc1-k8s/snowflake_research/checkpoint/speculator/qwen3-32b-longcontext-4096-3head \
+    $SPECULATOR_S3/qwen3-32b-longcontext-4096-3head \
     /data-fast/qwen3-32b-longcontext-4096-3head
 ```
 
