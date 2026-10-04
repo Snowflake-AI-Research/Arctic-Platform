@@ -202,13 +202,15 @@ def test_driver_abort_reclaims_engine_requests():
 
 
 def test_structured_output_always_matches_the_schema():
+    # Bounded fields only: a free integer lets a small model emit digits until
+    # max_tokens, which is valid JSON so far but never finishes.
     schema = {
         "type": "object",
         "properties": {
-            "city": {"type": "string"},
-            "population": {"type": "integer"},
+            "country": {"enum": ["France", "Japan", "Kenya", "Peru"]},
+            "is_capital": {"type": "boolean"},
         },
-        "required": ["city", "population"],
+        "required": ["country", "is_capital"],
         "additionalProperties": False,
     }
 
@@ -235,9 +237,9 @@ def test_structured_output_always_matches_the_schema():
             value = json.loads(
                 "".join(e["text"] for e in events if e["type"] == "delta")
             )
-            assert value.keys() == {"city", "population"}
-            assert isinstance(value["city"], str)
-            assert type(value["population"]) is int
+            assert value.keys() == {"country", "is_capital"}
+            assert value["country"] in schema["properties"]["country"]["enum"]
+            assert type(value["is_capital"]) is bool
 
     asyncio.run(with_driver(check))
 
@@ -355,8 +357,9 @@ def test_logprobs_cover_every_completion_token():
         assert len(entries) == events[-2]["completion_tokens"]
         for entry in entries:
             assert len(entry["top"]) == 2
-            # Greedy decoding always picks the most likely token.
-            assert entry["top"][0]["token_id"] == entry["token_id"]
+            # Greedy picks a most likely token; on an exact tie vLLM may rank
+            # the other one first, so compare values, not IDs.
+            assert entry["logprob"] == entry["top"][0]["logprob"]
             assert entry["logprob"] <= 0
 
     asyncio.run(with_driver(check))
