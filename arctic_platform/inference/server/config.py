@@ -72,6 +72,17 @@ class ModelConfig(BaseModel):
     # does not error).
     forest_cascade_attn_configs: str | None = "{}"
 
+    # Semi-persistence: restore a pre-warmed CRIU image via
+    # semi_persistence.Instance instead of a cold vLLM load. Popped by
+    # InferenceWorker.initialize before AsyncEngineArgs is built.
+    # The image directory is not a job field: it is derived from a hash of this
+    # config and of the container image, under a cache root semip_engine
+    # defaults (SEMIP_IMAGE_CACHE in ``extra_env`` still overrides it). That is
+    # what lets a dump and a later restore agree on a path, and it is why a job
+    # that names its own directory would be naming a cache key it cannot
+    # compute.
+    semi_p: bool = False
+
     extra_engine_kwargs: dict[str, Any] = Field(default_factory=dict, exclude=True)
     extra_env: dict[str, str] = Field(default_factory=dict, exclude=True)
     ray_num_gpus: float | None = Field(default=None, exclude=True)

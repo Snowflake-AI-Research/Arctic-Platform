@@ -42,6 +42,24 @@ from worker import worker_loop
 
 _spawn_ctx = mp.get_context("spawn")
 
+# The flat layout an Instance derives from ``model_dir``. Named here because
+# this class is what creates it: pass ``model_dir`` at init and every path below
+# follows from these, with no caller ever composing one.
+#
+# Three other files have to agree, and none of them can import this one -- the
+# vLLM child is spawned into a deliberately clean address space,
+# ``server/semip_engine.py`` is what imports *us*, and
+# ``scripts/semip_publish.py`` is copied into a pod on its own and run with a
+# bare ``python3``. So the spellings are duplicated there and held to these by
+# ``tests/test_layout_names.py``, which reads them out of the source.
+#
+# ``weight`` is singular, and matches the published tree exactly. It was
+# ``weights`` until the two were unified; nothing here depended on the plural,
+# but the publisher folds this prefix into its weight hash, so every weight
+# directory published under the old name has a hash no dump produces again.
+_IMAGE_DIR = "image"
+_WEIGHT_DIR = "weight"
+
 _next_instance_id = 0
 _id_lock = threading.Lock()
 
@@ -82,20 +100,15 @@ class Instance:
         self.instance_id = _alloc_instance_id()
         Instance._all[self.instance_id] = self
         self.log = semip_logging.instance(self.instance_id, self.gpu)
-        # Per-instance file gets a fresh start at construction time so
-        # any later instance.N / worker.N / child.N records land in a
-        # clean file.  Worker subprocesses do NOT re-truncate (they'd
-        # erase parent-side records that arrived before they spawned).
-        _log_path = semip_logging.truncate_instance_file(self.instance_id)
-        semip_logging.attach_instance_file(self.instance_id)
-        # Breadcrumb on the terminal (via the orch logger so it isn't
-        # swallowed by the per-instance file route) so users know where
-        # to tail.
+        # The worker and child write to the pod log themselves; this sends the
+        # parent-side instance.N records there too, so one stream carries all
+        # three processes.
+        semip_logging.attach_pod_log(["semip.inst"])
         semip_logging.orch().info(
             "instance %d created  model=%s  log=%s",
             self.instance_id,
             vllm_config.get("model", "?"),
-            _log_path,
+            semip_logging.pod_log_target(),
         )
 
         self.pid = None
@@ -215,12 +228,12 @@ class Instance:
         if filename is not None:
             return filename
         if self.model_dir is not None:
-            return os.path.join(self.model_dir, "image")
+            return os.path.join(self.model_dir, _IMAGE_DIR)
         return self._image_dir
 
     def _resolve_weights_dir(self, weights_dir=None):
         """Pick the weights directory: explicit arg, then model_dir, then
-        a ``weights`` sibling of the image directory.
+        a ``weight`` sibling of the image directory.
 
         The sibling fallback keeps ``save_weights`` usable for callers that
         pass explicit image paths (the orchestrator) rather than a model_dir.
@@ -228,10 +241,10 @@ class Instance:
         if weights_dir is not None:
             return weights_dir
         if self.model_dir is not None:
-            return os.path.join(self.model_dir, "weights")
+            return os.path.join(self.model_dir, _WEIGHT_DIR)
         if self._image_dir is not None:
             return os.path.join(os.path.dirname(self._image_dir.rstrip("/")),
-                                "weights")
+                                _WEIGHT_DIR)
         return None
 
     @property
@@ -401,14 +414,13 @@ class Instance:
 
     def cuda_checkpoint(self):
         self._log("cuda_checkpoint")
-        # TP>1: drop/preserve graphs then tear down NCCL (CRIU cannot restore
-        # live communicators / CustomAllreduce IPC) before the CUDA checkpoint.
-        # graph_mode="reuse" preserves the captured graphs; destroy_nccl uses
-        # the graph-preserving unilateral-abort teardown.  Both are no-ops at
-        # TP=1, but the gate keeps the single-GPU path free of extra commands.
+        # TP>1: tear down NCCL (CRIU cannot restore live communicators /
+        # CustomAllreduce IPC) before the CUDA checkpoint, using the
+        # graph-preserving unilateral-abort teardown so the captured graphs
+        # survive into the image.  A no-op at TP=1, but the gate keeps the
+        # single-GPU path free of extra commands.
         if self.n_gpus > 1:
-            self._send("cleargraph", graph_mode="reuse")
-            self._send("destroy_nccl", graph_mode="reuse")
+            self._send("destroy_nccl")
         return self._send("cuda_checkpoint")
 
     def reinit_nccl(self):
@@ -420,25 +432,35 @@ class Instance:
         self._log("reinit_nccl")
         return self._send("reinit_nccl")
 
-    def destroy_nccl(self, graph_mode="reuse"):
-        """Tear down NCCL and CustomAllreduce IPC.  No-op at TP=1."""
-        self._log(f"destroy_nccl(graph_mode={graph_mode})")
-        return self._send("destroy_nccl", graph_mode=graph_mode)
+    def destroy_nccl(self):
+        """Tear down NCCL and CustomAllreduce IPC.  No-op at TP=1.
 
-    def cleargraph(self, graph_mode="reuse"):
-        """Drop CUDA-graph exec handles.  ``reuse`` preserves them."""
-        self._log(f"cleargraph(graph_mode={graph_mode})")
-        return self._send("cleargraph", graph_mode=graph_mode)
+        Always the graph-preserving unilateral-abort teardown: the captured
+        graphs go into the image and are rebound after restore.
+        """
+        self._log("destroy_nccl")
+        return self._send("destroy_nccl")
 
-    def recapture_graphs(self, graph_mode="reuse"):
-        """Rebind (``reuse``) or recapture (``full``) the decode graphs.
+    def rebind_graphs(self):
+        """Rebind the preserved decode graphs against the restored runtime.
 
         Run after ``wake_up_kv_cache``.  No-op at TP=1.
-        """
-        self._log(f"recapture_graphs(graph_mode={graph_mode})")
-        return self._send("recapture_graphs", graph_mode=graph_mode)
 
-    def criu_dump(self, filename: str | None = None):
+        ``destroy_nccl`` -> ``reinit_nccl`` moves the CustomAllreduce meta and
+        buffer allocations, so the addresses baked into the preserved graph
+        nodes go stale and are rewritten in place by ``ca_graph_rebind``.
+
+        Called ``recapture_graphs`` until 2026-09-24, which was wrong twice
+        over: the ``full`` mode that actually recaptured (``capture_model()``)
+        was retired, and a warm image carries its ``cudaGraphExec_t`` handles
+        through CRIU intact, so there is nothing to instantiate either.  The
+        work is address rewriting and always was, once the image is warm.
+        """
+        self._log("rebind_graphs")
+        return self._send("rebind_graphs")
+
+    def criu_dump(self, filename: str | None = None,
+                  meta_extra: dict | None = None):
         """CRIU-dump the child process tree to disk (destructive).
 
         Must be called after cuda_checkpoint() (GPU resources released).
@@ -446,6 +468,12 @@ class Instance:
         on-disk image is later restored via criu_restore().
 
         If filename is None, uses ``<model_dir>/image``.
+
+        ``meta_extra`` merges caller-supplied fields over the ones recorded
+        below, so a layer above can record what only it knows -- the serving
+        adapter puts the container image digest and driver version there,
+        which is what its image cache keys on.  Keys collide with the built-in
+        ones at the caller's own risk; nothing here reserves a namespace.
         """
         filename = self._resolve_image_dir(filename)
         if filename is None:
@@ -453,15 +481,16 @@ class Instance:
                 "criu_dump() requires a filename or a model_dir")
         self._log(f"criu_dump({filename})")
         self._image_dir = filename
-        return self._send(
-            "criu_dump", filename=filename,
-            meta_extra={"vllm_config":      self.vllm_config,
-                        "model_dir":        self.model_dir,
-                        "total_gpu_bytes":  self.total_gpu_bytes,
-                        "pinned_cpu_bytes": self.pinned_cpu_bytes,
-                        "n_gpus":           self.n_gpus,
-                        "max_pinned_bytes_per_worker":
-                            self.max_pinned_bytes_per_worker})
+        meta = {"vllm_config":      self.vllm_config,
+                "model_dir":        self.model_dir,
+                "total_gpu_bytes":  self.total_gpu_bytes,
+                "pinned_cpu_bytes": self.pinned_cpu_bytes,
+                "n_gpus":           self.n_gpus,
+                "max_pinned_bytes_per_worker":
+                    self.max_pinned_bytes_per_worker}
+        if meta_extra:
+            meta.update(meta_extra)
+        return self._send("criu_dump", filename=filename, meta_extra=meta)
 
     def criu_restore(self, filename: str | None = None):
         """Restore a live process from a CRIU image on disk.
@@ -498,6 +527,28 @@ class Instance:
                     f"image at {filename} was dumped with {saved_model_dir}; "
                     f"the image bakes absolute compile-cache paths, so it "
                     f"must be restored under the same model_dir")
+            # Dump and restore must run as the same user.  The restored child
+            # keeps the uid recorded in the image (SEMIP_UNPRIVILEGED drops
+            # capabilities without changing uid), while this parent runs as
+            # whoever launched it.  Mixing the two puts both identities on the
+            # same files with neither able to write the other's:
+            # rebind_graphs() writes <model_dir>/compilation, and a restore
+            # writes into image/.  No file mode resolves it -- CRIU
+            # re-validates the recorded mode of every path it re-maps -- and
+            # the failure otherwise lands late, as a bare PermissionError at
+            # the end of an expensive restore.  root->root and
+            # unprivileged->unprivileged are both supported; only the mix is
+            # rejected.  Images dumped before ``uid`` was recorded carry no
+            # value and are let through.
+            saved_uid = meta.get("uid")
+            if saved_uid is not None and saved_uid != os.getuid():
+                raise RuntimeError(
+                    f"uid mismatch: image at {filename} was dumped by uid "
+                    f"{saved_uid} but this process is uid {os.getuid()}; the "
+                    f"restored child would keep uid {saved_uid} and collide "
+                    f"with this parent over {self.model_dir}/compilation "
+                    f"and {filename}. Restore as uid "
+                    f"{saved_uid}, or re-dump the image as uid {os.getuid()}")
             # Hydrate budget inputs from meta.json; the child holds the
             # real pinned buffer that survived CRIU.  Old images without
             # ``total_gpu_bytes`` degrade to single-chunk behavior in
@@ -588,6 +639,14 @@ class Instance:
             allotment = self.total_gpu_bytes * gpu_memory_utilization
             budget    = min(self.pinned_cpu_bytes,
                             allotment - self.pinned_cpu_bytes)
+
+        This is an outer bound only.  The formula is a prediction -- it
+        asserts that everything inside the allotment which is not weights
+        is free, which ignores graph pools, the per-rank CUDA contexts
+        mapped on every GPU, and activations -- so the worker clamps it
+        against the free VRAM its own device reports (see
+        ``_STAGING_FREE_FRACTION``).  Passing ``max_buffer_bytes``
+        explicitly raises the bound; it does not defeat that clamp.
 
         The formula is self-validating: if ``budget`` ends up smaller
         than the largest single parameter, the child's plan walk raises
