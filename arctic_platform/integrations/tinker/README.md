@@ -215,15 +215,19 @@ sampling, PPO, and cross-entropy. Detailed results are recorded in the PR.
 
 Trainer parity with Tinker was measured by sampling rollouts on Tinker once and
 replaying the same datums on Tinker and on this adapter for five steps, both
-training the same LoRA with the cookbook's Adam settings:
+training the same LoRA with the cookbook's Adam settings. The convergence
+recipes were re-run for ten steps against runs made before the packing,
+chunking, and resend fixes:
 
-| Recipe | Model | Per-token log-prob gap | Loss, step 0 → 4 (Tinker / Cortex) |
+| Recipe | Model | Setup | Result |
 |---|---|---|---|
-| `math_rl` GSM8K, rank 32, lr `1e-5` | Qwen3.5-4B | `0.004` mean | `0.01025 → 0.00889` / `0.01029 → 0.00891` |
-| On-policy distillation, rank 128, lr `1e-4` | Qwen3.5-4B, teacher Qwen3.5-9B | `0.008` → `0.015` mean | `0.0733 → -0.3395` / `0.0728 → -0.3517` |
+| `math_rl` GSM8K, parity | Qwen3.5-4B | LoRA rank 32, lr `1e-5`, 5 steps, same datums on both | Loss `0.01025 → 0.00889` (Tinker) and `0.01029 → 0.00891` (Cortex); per-token log-prob gap `0.004` |
+| On-policy distillation, parity | Qwen3.5-4B, teacher Qwen3.5-9B | LoRA rank 128, lr `1e-4`, 5 steps, same datums on both | Loss `0.0733 → -0.3395` (Tinker) and `0.0728 → -0.3517` (Cortex); teacher log-prob gap `0.0096` |
+| `math_rl` GSM8K, convergence | Qwen3.5-9B | Full fine-tuning, lr `2e-6`, 64 groups of 8, 10 steps | Accuracy at step 9 `0.926` before the fixes, `0.951` after; `kl_sample_train_v1` `0.023`–`0.040` before, `0.0001`–`0.0003` after |
+| `math_rl` MATH, convergence | Qwen3.5-9B | Full fine-tuning, lr `1e-6`, 64 groups of 16, 10 steps | Accuracy at step 9 `0.098` before the fixes, `0.307` after; `kl_sample_train_v1` about `0.019` before, `0.0002` after |
 
-The teacher's `compute_logprobs` on the same 9,068 tokens differed from
-Tinker's by `0.0096` on average.
+Keeping one sequence per micro-batch on Qwen3.5 makes a step slower: about
+125 s instead of 75 s for GSM8K, and 252 s instead of 100 s for MATH.
 
 For RL runs, `kl_sample_train_v1` checks agreement between sampler and trainer
 log-probs. In the parity runs it started at `0.0002`–`0.0004` on both
