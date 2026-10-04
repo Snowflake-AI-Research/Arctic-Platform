@@ -13,6 +13,7 @@ arctic_platform/common/
 ├── ray_cluster.py        # Ray bootstrap (attach or spawn)
 ├── server.py             # Minimal ArcticRLServerState base
 ├── registry.py           # LOSS_FNS / POST_PROCESSORS
+├── packing/              # token-budget packer (library copy; DSS still calls its own)
 └── utils/
     ├── batch.py          # shard, merge, metric aggregation
     ├── server_models.py  # JobConfig, request models
@@ -24,6 +25,13 @@ arctic_platform/common/
 
 Prefer `arctic_platform.common.*` imports. Back-compat shims still exist under
 `arctic_platform.rl.{http_server,ray_server,deepspeed_worker}`.
+
+`packing/` is the token-budget layout library (`pack_microbatch`, `token_shard`,
+`window_row_pieces`). It is not wired into `run_pipeline`. DSS dispatch still
+imports `dss.ray_dss.jobs.gpu.packing`. `rl/processors/packing.py`
+(`pack_sequences`) is a separate on-prem layout and is unchanged.
+`model/implementations/gpu/packing.py` re-exports `IGNORE_INDEX` and
+`cu_seqlens_from_position_ids` from this package.
 
 ## Launch the HTTP server
 
