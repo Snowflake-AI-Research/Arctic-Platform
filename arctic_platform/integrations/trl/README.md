@@ -76,7 +76,9 @@ when the module is importable in the server process. Two questions for the Arcti
   (pointing back at `client`) if they drift.
 
 `trl_grpo` (in `loss.py`) reproduces TRL's exact clipped surrogate (no dual-clip/KL/ref) and
-normalizes as `masked_sum / batch_num_tokens * dp_size / grad_accum_steps`. The `* dp_size`
+normalizes as `masked_sum / batch_num_tokens * dp_size`. `batch_num_tokens` is the whole
+forward's completion-token count; DeepSpeed microbatches share that denominator, so the
+loss is not also divided by engine GAS. The `* dp_size`
 factor makes the gradient correct after DeepSpeed's cross-DP averaging — identical to verl's
 `agg_loss` token-mean. Contract: the TRL trainer is single-process
 (`accelerator.num_processes == 1`), so `tokens_per_rank` is the global completion-token count
