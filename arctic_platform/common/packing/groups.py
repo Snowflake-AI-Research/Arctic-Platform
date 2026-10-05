@@ -46,7 +46,7 @@ def batch_tensor(batch: Dict[str, Any], key: str, *, min_dims: int) -> Optional[
     if isinstance(context, dict):
         candidates.append(context.get(key))
     for value in candidates:
-        if torch.is_tensor(value) and value.ndim >= min_dims:
+        if value is not None and torch.is_tensor(value) and value.ndim >= min_dims:
             return value
     return None
 
@@ -91,7 +91,7 @@ def token_validity_mask(batch: Dict[str, Any]) -> torch.Tensor:
         return attention_mask
 
     position_ids = batch_position_ids(batch)
-    if torch.is_tensor(position_ids):
+    if position_ids is not None and torch.is_tensor(position_ids):
         seq_positions = torch.arange(position_ids.shape[1], device=position_ids.device).unsqueeze(0)
         expected_positions = position_ids[:, :1] + seq_positions
         advances_by_one = position_ids.eq(expected_positions).to(dtype=torch.long)

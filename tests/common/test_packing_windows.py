@@ -250,24 +250,34 @@ def test_window_cu_seqlens_cover_every_window_exactly():
 
 
 def test_window_row_pieces_agree_with_the_window_boundaries():
-    """The token pieces handed back to the head must be the segments the loss reduced over."""
-    packed_call, metadata = _packed([4, 2], pad_to=2)
-    input_ids = packed_call["input_ids"]
+    """The token pieces handed back to the head must be the segments the loss reduced over.
 
+    Lengths 4 and 2 pack to 6 tokens. Padding to a multiple of 4 makes 8, so the last
+    shard's window includes a real pad tail and the adjustment below has to run.
+    """
+    packed_call, metadata = _packed([4, 2], pad_to=4)
+    input_ids = packed_call["input_ids"]
+    assert metadata.padded_tokens == 8
+
+    saw_pad_tail = False
     for shard_index in range(2):
         window_start, window_end = token_window(metadata.padded_tokens, 2, shard_index)
         window = input_ids[:, window_start:window_end]
         pieces = window_row_pieces(window, metadata, 2, shard_index)
         boundaries = window_cu_seqlens(metadata, 2, shard_index).tolist()
 
-        # The last row's segment absorbs the pad tail, so subtract the pad this window happens to hold.
+        # window_cu_seqlens folds the pad tail into the last row. window_row_pieces
+        # stops at the real row end, so that tail has to be subtracted back out.
         real_tokens = int(metadata.cu_seqlens[-1])
         pad_in_window = max(0, window_end - max(window_start, real_tokens))
+        if pad_in_window:
+            saw_pad_tail = True
         for row, piece in enumerate(pieces):
             segment = boundaries[row + 1] - boundaries[row]
             if row == metadata.batch_size - 1:
                 segment -= pad_in_window
             assert piece.numel() == segment
+    assert saw_pad_tail
 
 
 def test_window_row_pieces_reject_a_value_with_no_token_axis():
@@ -283,7 +293,7 @@ def test_window_row_pieces_reject_a_value_with_no_token_axis():
     with pytest.raises(ValueError, match="token axis"):
         window_row_pieces(torch.tensor(0.5), metadata, 2, 0)
 
-    # A window that does have a token axis is unaffected: one token per shard here, and both are real rows.
+    # Shard 0 of this padded call owns three tokens, all of them in the first row.
     assert [piece.numel() for piece in window_row_pieces(torch.zeros(3), metadata, 2, 0)] == [3, 0]
 
 

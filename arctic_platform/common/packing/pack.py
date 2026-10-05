@@ -92,10 +92,15 @@ def pack_microbatch(data: Dict[str, Any]) -> tuple[Dict[str, Any], PackMetadata]
     position_ids = batch_position_ids(data)
     if attention_mask is None or attention_mask.ndim != 2:
         raise ValueError("packing requires a 2D attention_mask")
-    if not torch.is_tensor(position_ids) or tuple(position_ids.shape[:2]) != tuple(attention_mask.shape):
+    if position_ids is None or not torch.is_tensor(position_ids):
         raise ValueError(
             "packing requires position_ids with the same first two dimensions as attention_mask, "
             f"got position_ids={getattr(position_ids, 'shape', None)} attention_mask={attention_mask.shape}"
+        )
+    if tuple(position_ids.shape[:2]) != tuple(attention_mask.shape):
+        raise ValueError(
+            "packing requires position_ids with the same first two dimensions as attention_mask, "
+            f"got position_ids={tuple(position_ids.shape)} attention_mask={attention_mask.shape}"
         )
 
     batch_size, sequence_length = attention_mask.shape
