@@ -6,6 +6,39 @@ This integration serves Tinker's HTTP API over Cortex Training. Compatible
 
 Validated with `tinker==0.25.0` and `tinker-cookbook==0.5.5`.
 
+## Request path
+
+`serve.py` creates the Cortex jobs and registers handlers on `router.py`. The router speaks Tinker's HTTP API and does not import Cortex. `cortex.py` is the only file that does.
+
+```mermaid
+flowchart LR
+  cookbook["tinker-cookbook"] --> sdk["tinker SDK"]
+  sdk -->|"HTTP, JSON or protobuf"| router["router.py"]
+  router --> proto["proto_wire.py"]
+  router --> cortex["cortex.py"]
+  cortex -->|"forward_backward, optim_step, weight sync"| train["Cortex training job"]
+  cortex -->|"sample"| sample["Cortex sampling job"]
+  cortex -->|"teacher compute_logprobs"| teacher["Cortex teacher job"]
+```
+
+`forward` has no handler, so the router returns 400 before any Cortex call. A training request that is still running after 30 seconds is answered as a future; the SDK polls `retrieve_future` instead of sending the work again.
+
+One optimizer step:
+
+```mermaid
+flowchart TD
+  A["forward_backward"] --> B["router: decode protobuf, check the loss and the datum"]
+  B --> C["router: accept one gradient, refuse a second"]
+  C --> D["cortex: left-align rows, isolate linear-attention sequences"]
+  D --> E["cortex: lower the loss onto Cortex grpo"]
+  E --> F["training job runs fwd_bwd"]
+  F --> G["log-probs restored to the datum's own order"]
+  G --> H["optim_step carries the learning rate only"]
+  H --> I["training job steps"]
+```
+
+Sampling and distillation take the other jobs. `sample` is checked for temperature 1.0, then generated on the sampling job. A teacher named at startup is a second sampling job; `compute_logprobs` reads its prompt log-probs and does not generate.
+
 ## Install
 
 ```bash
