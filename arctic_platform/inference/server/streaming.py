@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import json
 import time
+import traceback
 from functools import wraps
 from collections import deque
 from dataclasses import asdict, dataclass
@@ -19,6 +21,8 @@ from arctic_platform.inference.server.chat import (
     ChatPrompt,
     validate_chat_prompt,
 )
+
+logger = logging.getLogger(__name__)
 
 MAX_WORKER_STREAMS = 128
 CONTEXT_LIMIT_SOURCES = frozenset({"prompt", "completion_budget"})
@@ -704,6 +708,17 @@ class EngineStream:
                     "context_length_exceeded", context_limit_source="prompt"
                 ) from None
             raise StreamError(exc.code, param=exc.param) from None
+        except StreamError:
+            raise
+        except Exception as exc:
+            # Not the client's input: a bug or a vLLM API change. The message can
+            # quote message content, so only the type and stack are logged.
+            logger.error(
+                "Chat render failed with %s\n%s",
+                type(exc).__name__,
+                "".join(traceback.format_tb(exc.__traceback__)),
+            )
+            raise
         room = self.owner.llm.model_config.max_model_len - rendered.prompt_tokens
         if room <= 0:
             raise StreamError("context_length_exceeded", context_limit_source="prompt")
@@ -831,9 +846,14 @@ class StreamingWorkerMixin:
                     reasoning_parser=getattr(self, "_reasoning_parser_name", None),
                 )
             except Exception:
-                # E.g. skip_tokenizer_init, or a model with no chat template.
-                raise StreamError("chat_unsupported") from None
+                # E.g. skip_tokenizer_init, a model with no chat template, or a
+                # vLLM API change. Logged and remembered once; the engine
+                # doesn't change, so rebuilding on every request can't succeed.
+                logger.exception("Chat mode is unavailable on this worker")
+                engine = False
             self._stream_chat_engine = engine
+        if engine is False:
+            raise StreamError("chat_unsupported")
         return engine
 
     def start_stream(self, attempt_id, prompt, sampling_params, remaining_s, limits):

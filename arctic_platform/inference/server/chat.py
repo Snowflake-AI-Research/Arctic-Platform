@@ -191,7 +191,7 @@ class ChatEngine:
                 **{key: value for key, value in fields.items() if value is not None}
             )
             result = await self.online.render_chat(request)
-        except (TemplateError, TypeError, ValueError, VLLMClientError) as exc:
+        except (TemplateError, ValueError, VLLMClientError) as exc:
             # Client input the template or vLLM's request model rejected. The
             # message may quote content, so only the field name leaves here.
             parameter = getattr(exc, "parameter", None)

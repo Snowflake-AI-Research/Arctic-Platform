@@ -537,3 +537,90 @@ def test_client_surfaces_the_param_of_a_chat_input_error(runtime):
     events = through_driver(THINK_THEN_ANSWER, chat("<|im_start|>"), {})
     assert events[-1]["code"] == "invalid_message_content"
     assert events[-1]["param"] == "messages[0]"
+
+
+def test_engine_that_cannot_chat_is_logged_once_and_not_rebuilt(monkeypatch, caplog):
+    from arctic_platform.inference.server import chat as chat_module
+
+    builds = []
+
+    def broken(*args, **kwargs):
+        builds.append(1)
+        raise RuntimeError("renderer missing")
+
+    monkeypatch.setattr(chat_module, "ChatEngine", broken)
+    worker = make_worker()
+    del worker._stream_chat_engine
+    with caplog.at_level("ERROR"):
+        for _ in range(3):
+            with pytest.raises(StreamError, match="chat_unsupported"):
+                worker._chat_engine()
+    assert builds == [1]
+    [record] = [r for r in caplog.records if "chat" in r.getMessage().lower()]
+    assert record.exc_info is not None
+
+
+def _stub_vllm_chat_modules(monkeypatch):
+    import sys
+    import types
+
+    class VLLMClientError(Exception):
+        pass
+
+    modules = {
+        "vllm.entrypoints": {},
+        "vllm.entrypoints.openai": {},
+        "vllm.entrypoints.openai.chat_completion": {},
+        "vllm.entrypoints.openai.chat_completion.protocol": {
+            "ChatCompletionRequest": lambda **fields: SimpleNamespace(**fields)
+        },
+        "vllm.entrypoints.serve": {},
+        "vllm.entrypoints.serve.engine": {},
+        "vllm.entrypoints.serve.engine.protocol": {"ErrorResponse": type("ErrorResponse", (), {})},
+        "vllm.renderers": {},
+        "vllm.renderers.inputs": {},
+        "vllm.renderers.inputs.preprocess": {"extract_prompt_len": lambda config, engine_input: 3},
+    }
+    for name, attributes in modules.items():
+        module = types.ModuleType(name)
+        for key, value in attributes.items():
+            setattr(module, key, value)
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(sys.modules["vllm.exceptions"], "VLLMClientError", VLLMClientError, raising=False)
+
+
+def _engine_whose_renderer_raises(error):
+    from arctic_platform.inference.server.chat import ChatEngine
+
+    async def render_chat(request):
+        raise error
+
+    engine = object.__new__(ChatEngine)
+    engine.guard = SpecialTokenGuard([])
+    engine.model_config = SimpleNamespace(model="m")
+    engine.online = SimpleNamespace(render_chat=render_chat)
+    return engine
+
+
+def test_renderer_type_error_is_not_reported_as_bad_input(monkeypatch):
+    _stub_vllm_chat_modules(monkeypatch)
+    engine = _engine_whose_renderer_raises(TypeError("unexpected keyword argument"))
+    with pytest.raises(TypeError):
+        asyncio.run(engine.render(chat("hi")))
+
+
+def test_renderer_value_error_is_still_bad_input(monkeypatch):
+    _stub_vllm_chat_modules(monkeypatch)
+    engine = _engine_whose_renderer_raises(ValueError("two system messages"))
+    with pytest.raises(ChatInputError) as raised:
+        asyncio.run(engine.render(chat("hi")))
+    assert raised.value.code == "invalid_chat_request"
+
+
+def test_unexpected_render_failure_is_logged_without_its_message(caplog):
+    with caplog.at_level("ERROR"):
+        _, events = stream(chat("hi"), chat_engine=FakeChatEngine(error=TypeError("secret user text")))
+    assert events[-1]["code"] == "engine_error"
+    [record] = [r for r in caplog.records if "render" in r.getMessage().lower()]
+    assert "TypeError" in record.getMessage()
+    assert "secret user text" not in caplog.text
