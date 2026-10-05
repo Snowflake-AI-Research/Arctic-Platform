@@ -2179,6 +2179,19 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
                 info["inet_census"] = _census
                 log.info("  inet sockets off loopback going into the image: "
                          "%d %s", len(_census), _census)
+                _vcfg = (kwargs.get("meta_extra") or {}).get("vllm_config") or {}
+                if int(_vcfg.get("nnodes", 1) or 1) > 1:
+                    # A connection needs TCP repair to restore and names the
+                    # dump pod's address, and so does a listener bound to a
+                    # specific one; only a wildcard listener restores anywhere.
+                    _bad = [r for r in _census
+                            if r["state"] != "LISTEN"
+                            or r["local"].rsplit(":", 1)[0] not in ("::",
+                                                                    "0.0.0.0")]
+                    if _bad:
+                        raise RuntimeError(
+                            f"{len(_bad)} inet socket(s) would go into a "
+                            f"multi-node image: {_bad}")
 
                 meta = _worker_criu_save(
                     child_pid, image_dir, child_pipe_fd, pipe_resource, gpus,
