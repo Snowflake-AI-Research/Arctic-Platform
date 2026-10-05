@@ -916,6 +916,20 @@ def _is_arctic_parallel_worker(worker):
     return False
 
 
+def _iface_ip(ifname):
+    """IPv4 address of *ifname*, read live from the kernel."""
+    import fcntl
+    import socket as _sock
+    import struct
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+    try:
+        packed = fcntl.ioctl(s.fileno(), 0x8915,  # SIOCGIFADDR
+                             struct.pack("256s", ifname[:15].encode()))
+    finally:
+        s.close()
+    return _sock.inet_ntoa(packed[20:24])
+
+
 def _clear_fd_backed_nccl_env():
     """Drop restored NCCL/OFI env that points at process-local fds (closed
     before CRIU save), so the next NCCL init regenerates them."""
@@ -1075,6 +1089,17 @@ def _mark_inet_sockets_rst(where):
 # driver -- which keeps relying on its own ``destroyed_pg``.  It also stays False
 # at TP1, where ``_destroy_nccl`` returns before the abort.  See Complication 15.
 _PG_ABORTED = False
+
+# Set by ``arm_mq_park``: the rendezvous directory ``prepare_criu_dump`` parks
+# the executor's message queues into, as its last collective step.  The park
+# cannot be a command of its own before ``cuda_checkpoint``, because
+# ``destroy_nccl`` and ``prepare_criu_dump`` still need the queues after it.
+_MQ_PARK = {}
+
+# A follower node's headless executor, and the leader's new broadcast writer
+# between mq_begin_unpark and mq_finish_unpark.
+_FOLLOWER = {}
+_UNPARK = {}
 
 
 def _communicator_checkpoint_targets(ps):
@@ -1675,6 +1700,19 @@ def _destroy_nccl(worker):
             ca.close()
             comm.ca_comm = None
 
+    if os.environ.get("SEMIP_EXP_MULTINODE_IFNAME"):
+        # Across nodes a group's broadcaster holds TCP sockets bound to the pod
+        # address, and MessageQueue has no close of its own.
+        import mq_plane
+        seen_mq = set()
+        for name, ref in list(getattr(ps, "_groups", {}).items()):
+            group = ref() if callable(ref) else ref
+            mq = getattr(group, "mq_broadcaster", None) if group else None
+            if mq is not None and id(mq) not in seen_mq:
+                seen_mq.add(id(mq))
+                mq_plane.close_queue(mq)
+                group.mq_broadcaster = None
+
     if abort_targets:
         _nccl_abort_comms_concurrent(abort_targets)
         for pynccl in abort_pynccls:
@@ -1858,7 +1896,7 @@ def _collective_rpc_with_timeout(llm, fn, args, timeout_s=None, log=None):
     return box["result"]
 
 
-def _reinit_nccl(worker, port):
+def _reinit_nccl(worker, port, master_addr=None):
     """Re-initialize NCCL after restore on a fresh TCP port, then rebind the
     canonical tp:0/world:0 (+ ep:0/dp:0 for MoE) group slots the captured graphs
     look up."""
@@ -1870,6 +1908,17 @@ def _reinit_nccl(worker, port):
     try:
         _clear_fd_backed_nccl_env()
         _force_dist_uninitialized_for_restore()
+        _net_reset = None
+        _reinit_ifname = os.environ.get("SEMIP_EXP_REINIT_IFNAME")
+        if _reinit_ifname:
+            # The cold start ran on NCCL_NET=Socket so the image holds no
+            # initialized EFA state; this is the first EFA bring-up.
+            import nccl_bootstrap
+            os.environ.pop("NCCL_NET", None)
+            os.environ["NCCL_SOCKET_IFNAME"] = _reinit_ifname
+            _net_reset = nccl_bootstrap.reset()
+            print(f"[semip-exp] rank {getattr(worker, 'rank', '?')} "
+                  f"nccl_bootstrap.reset -> {_net_reset}", flush=True)
         # NVLS / SymmMem exchange fds that do not survive CRIU -> keep them off.
         # FlashInfer allreduce is off for a different reason -- the captured
         # graphs must hold `cross_device_reduce` nodes for the rebind to have
@@ -1878,6 +1927,21 @@ def _reinit_nccl(worker, port):
         os.environ["NCCL_NVLS_ENABLE"] = "0"
         os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
         os.environ["VLLM_ALLREDUCE_USE_FLASHINFER"] = "0"
+        _multinode_ifname = os.environ.get("SEMIP_EXP_MULTINODE_IFNAME")
+        if _multinode_ifname:
+            # The restored environ carries the dump pod's address, and the
+            # rebuilt groups' broadcasters bind to get_ip().
+            import vllm.envs as _envs
+            os.environ["VLLM_HOST_IP"] = _iface_ip(_multinode_ifname)
+            _envs.disable_envs_cache()
+            _envs.enable_envs_cache()
+        _host = master_addr or "127.0.0.1"
+        _pc = worker.vllm_config.parallel_config
+        if int(getattr(_pc, "nnodes", 1) or 1) > 1:
+            # init_distributed_environment reads the rendezvous from here, not
+            # from distributed_init_method, once nnodes > 1.
+            _pc.master_addr = _host
+            _pc.master_port = port
         _rd_keep = getattr(worker, "_semip_rank_data_keep", None)
         with set_current_vllm_config(worker.vllm_config):
             # Reuse the preserved cold-start rank_data tensor (same VA) so the
@@ -1890,7 +1954,7 @@ def _reinit_nccl(worker, port):
                 init_worker_distributed_environment(
                     worker.vllm_config,
                     worker.rank,
-                    distributed_init_method=f"tcp://127.0.0.1:{port}",
+                    distributed_init_method=f"tcp://{_host}:{port}",
                     local_rank=worker.local_rank,
                     backend="nccl",
                 )
@@ -1925,7 +1989,16 @@ def _reinit_nccl(worker, port):
         # After the hook's loop, never inside it: every rank has to clear the
         # barriers in there before any rank is allowed to fail.
         _assert_checkpoint_state_restored(worker, _rekey, _restored)
-        return {"ok": True, "rank": getattr(worker, "rank", "?")}
+        out = {"ok": True, "rank": getattr(worker, "rank", "?")}
+        if _net_reset is not None:
+            import nccl_bootstrap
+            out["net_reset"] = _net_reset
+            out["bootstrap_after"] = nccl_bootstrap.bootstrap_state()
+            out["ib_fds"] = sum(
+                1 for fd in os.listdir("/proc/self/fd")
+                if os.path.realpath(f"/proc/self/fd/{fd}").startswith(
+                    "/dev/infiniband/"))
+        return out
     except BaseException as e:  # noqa: BLE001
         return {"ok": False, "rank": getattr(worker, "rank", "?"),
                 "error": f"{type(e).__name__}: {e}",
@@ -2448,7 +2521,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
     # listening socket's bound address; restoring on a different node then
     # fails at bind() with EADDRNOTAVAIL.  127.0.0.1 exists identically on
     # every node, so loopback makes images node-portable.
-    os.environ["VLLM_HOST_IP"] = "127.0.0.1"
+    _multinode_ifname = os.environ.get("SEMIP_EXP_MULTINODE_IFNAME")
+    os.environ["VLLM_HOST_IP"] = (_iface_ip(_multinode_ifname)
+                                  if _multinode_ifname else "127.0.0.1")
     # VLLM_HOST_IP only steers vLLM's own rendezvous.  The collective
     # libraries pick their transport interface independently and default to
     # the routable NIC: gloo keeps a persistent listening socket for the life
@@ -2458,8 +2533,10 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
     # single-node even at TP>1 -- the TP group's ranks are local, so their
     # NCCL bootstrap reaches across loopback fine and the data path rides
     # NVLink/P2P rather than these sockets.
-    os.environ["NCCL_SOCKET_IFNAME"] = "lo"
-    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    # A multi-node group cannot rendezvous over loopback; every socket bound
+    # to the pod address has to be closed before the dump instead.
+    os.environ["NCCL_SOCKET_IFNAME"] = _multinode_ifname or "lo"
+    os.environ["GLOO_SOCKET_IFNAME"] = _multinode_ifname or "lo"
 
     # JIT/compile caches (Triton, vLLM torch.compile, torch inductor,
     # FlashInfer) all produce .so's that get dlopen()'d into the process.
@@ -3102,6 +3179,32 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 # `from vllm.plugins import ...` form.
                 from vllm.plugins import load_general_plugins
                 load_general_plugins()
+                if int(vllm_config.get("node_rank", 0) or 0) > 0:
+                    # Follower node: only this node's ranks, driven by the
+                    # leader's executor. No LLM and no engine here, so every
+                    # collective command must come from the leader.
+                    from vllm.config import CompilationConfig
+                    from vllm.engine.arg_utils import EngineArgs
+                    from vllm.usage.usage_lib import UsageContext
+                    from vllm.v1.executor.multiproc_executor import (
+                        MultiprocExecutor)
+                    _fkw = dict(vllm_config)
+                    _fkw.setdefault("seed", 0)
+                    _fkw.setdefault("disable_log_stats", True)
+                    if isinstance(_fkw.get("compilation_config"), dict):
+                        _fkw["compilation_config"] = CompilationConfig(
+                            **_fkw["compilation_config"])
+                    # The usage context picks scheduler defaults such as
+                    # max_num_batched_tokens; it has to be the leader's
+                    # (LLM_CLASS) or the two halves profile different shapes
+                    # and deadlock in their first mismatched collective.
+                    _fvc = EngineArgs(**_fkw).create_engine_config(
+                        usage_context=UsageContext.LLM_CLASS, headless=True)
+                    _FOLLOWER["executor"] = MultiprocExecutor(
+                        _fvc, monitor_workers=False)
+                    info["pid"] = os.getpid()
+                    info["follower"] = True
+                    return error, info
                 from vllm import LLM
                 llm = LLM(**vllm_config)
                 engine = llm.llm_engine
@@ -3505,6 +3608,26 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                         log.warning(
                             "  prepare_criu_dump: worker dump prep error: %s", _e)
 
+                if llm is not None and len(gpus) > 1 and _MQ_PARK:
+                    import mq_plane
+                    try:
+                        parked = mq_plane.park(
+                            llm, _MQ_PARK["dir"],
+                            lambda fn, args: _collective_rpc_with_timeout(
+                                llm, fn, args, log=log),
+                            ranks=_MQ_PARK.get("ranks"))
+                        info["mq_park"] = {"ok": True,
+                                           "dir": _MQ_PARK["dir"],
+                                           "parked": parked["parked"]}
+                        log.info("  prepare_criu_dump: message queues parked "
+                                 "in %s for ranks %s", _MQ_PARK["dir"],
+                                 parked["parked"])
+                    except Exception as _e:  # noqa: BLE001
+                        info["mq_park"] = {"ok": False,
+                                           "error": f"{type(_e).__name__}: {_e}"}
+                        log.error("  prepare_criu_dump: message-queue park "
+                                  "failed: %s", _e)
+
                 closed_fds = []
                 unmapped = []
                 destroyed_pg = False
@@ -3688,6 +3811,88 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 else:
                     log.info("  NCCL destroyed across %d workers", len(results))
 
+            elif cmd == "arm_mq_park":
+                _MQ_PARK.clear()
+                _MQ_PARK.update(dir=kwargs["unpark_dir"],
+                                ranks=kwargs.get("ranks"))
+                info["mq_park"] = dict(_MQ_PARK)
+
+            elif cmd == "park_mq":
+                if llm is None:
+                    raise RuntimeError("park_mq requires init first")
+                import mq_plane
+                parked = mq_plane.park(
+                    llm, kwargs["unpark_dir"],
+                    lambda fn, args: _collective_rpc_with_timeout(
+                        llm, fn, args, kwargs.get("timeout_s"), log),
+                    ranks=kwargs.get("ranks"))
+                info["parked"] = parked["parked"]
+                log.info("  message queues parked for ranks %s",
+                         parked["parked"])
+
+            elif cmd == "unpark_mq":
+                if llm is None:
+                    raise RuntimeError("unpark_mq requires init first")
+                import mq_plane
+                _t_unpark = time.perf_counter()
+                result = mq_plane.unpark(
+                    llm, kwargs["unpark_dir"],
+                    remote_ranks=kwargs.get("remote_ranks") or (),
+                    connect_ip=kwargs.get("connect_ip"),
+                    timeout_s=kwargs.get("timeout_s") or 120.0)
+                _MQ_PARK.clear()
+                info.update(result)
+                log.info("  message queues rebuilt in %.3fs: world=%d, "
+                         "remote ranks=%s", time.perf_counter() - _t_unpark,
+                         result["world"], result["remote"])
+
+            elif cmd == "mq_begin_unpark":
+                if llm is None:
+                    raise RuntimeError("mq_begin_unpark requires init first")
+                import base64
+                import pickle
+                import mq_plane
+                writer, handle = mq_plane.begin_unpark(
+                    llm, kwargs["remote_ranks"], kwargs["connect_ip"])
+                _UNPARK["writer"] = writer
+                mq_plane.write_orders(kwargs["unpark_dir"], handle,
+                                      kwargs["local_ranks"])
+                info["handle"] = base64.b64encode(
+                    pickle.dumps(handle)).decode()
+
+            elif cmd == "mq_follower_unpark":
+                import base64
+                import pickle
+                import mq_plane
+                handle = pickle.loads(base64.b64decode(kwargs["handle"]))
+                ranks = kwargs["ranks"]
+                mq_plane.write_orders(kwargs["unpark_dir"], handle, ranks,
+                                      remote_ranks=ranks,
+                                      connect_ip=kwargs["connect_ip"])
+                handles = mq_plane.collect_handles(kwargs["unpark_dir"], ranks)
+                info["handles"] = base64.b64encode(
+                    pickle.dumps(handles)).decode()
+
+            elif cmd == "mq_finish_unpark":
+                if llm is None:
+                    raise RuntimeError("mq_finish_unpark requires init first")
+                import base64
+                import pickle
+                import mq_plane
+                _t_unpark = time.perf_counter()
+                handles = mq_plane.collect_handles(kwargs["unpark_dir"],
+                                                   kwargs["local_ranks"])
+                handles.update(pickle.loads(
+                    base64.b64decode(kwargs["remote_handles"])))
+                result = mq_plane.finish_unpark(llm, _UNPARK.pop("writer"),
+                                                handles)
+                _MQ_PARK.clear()
+                info.update(result)
+                log.info("  message queues rebuilt across nodes in %.3fs: "
+                         "world=%d, remote ranks=%s",
+                         time.perf_counter() - _t_unpark, result["world"],
+                         result["remote"])
+
             elif cmd == "reinit_nccl":
                 if llm is None:
                     raise RuntimeError("reinit_nccl requires init first")
@@ -3717,7 +3922,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                     log.warning("  cuda probe failed", exc_info=True)
                 port = get_open_port()
                 results = _collective_rpc_with_timeout(
-                    llm, _reinit_nccl, (port,),
+                    llm, _reinit_nccl, (port, kwargs.get("master_addr")),
                     timeout_s=kwargs.get("timeout_s"), log=log)
                 failures = [r for r in results
                             if isinstance(r, dict) and not r.get("ok", True)]
@@ -3735,6 +3940,11 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                     raise RuntimeError(f"NCCL reinit failed on workers: {failures}")
                 log.info("  NCCL re-initialized on port %d across %d workers",
                          port, len(results))
+                for _r in results:
+                    if isinstance(_r, dict) and "net_reset" in _r:
+                        log.info("    [semip-exp] reinit rank=%s bootstrap=%s "
+                                 "ib_fds=%s", _r.get("rank"),
+                                 _r.get("bootstrap_after"), _r.get("ib_fds"))
 
             elif cmd == "rebind_graphs":
                 if llm is None:

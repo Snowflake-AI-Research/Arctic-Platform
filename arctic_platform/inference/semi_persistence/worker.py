@@ -175,6 +175,64 @@ def _get_descendant_pids(pid):
     return filtered
 
 
+_TCP_STATES = {"01": "ESTABLISHED", "06": "TIME_WAIT", "08": "CLOSE_WAIT",
+               "0A": "LISTEN"}
+
+
+def _inet_census(pids):
+    """Every TCP socket in *pids* whose local address is not loopback.
+
+    Loopback exists identically in every pod; anything else names the dump
+    pod's address, which a restore elsewhere cannot re-bind.
+    """
+    import socket as _sock
+    import struct as _struct
+
+    def _addr(hexaddr):
+        ip_hex, port_hex = hexaddr.split(":")
+        raw = bytes.fromhex(ip_hex)
+        if len(raw) == 4:
+            ip = _sock.inet_ntop(_sock.AF_INET, _struct.pack("<I", int(ip_hex, 16)))
+        else:
+            words = _struct.unpack("<4I", raw)
+            ip = _sock.inet_ntop(_sock.AF_INET6, _struct.pack(">4I", *words))
+        return ip, int(port_hex, 16)
+
+    by_inode = {}
+    for table in ("tcp", "tcp6"):
+        try:
+            with open(f"/proc/net/{table}") as f:
+                next(f)
+                for line in f:
+                    parts = line.split()
+                    by_inode[parts[9]] = (_addr(parts[1]), _addr(parts[2]),
+                                          _TCP_STATES.get(parts[3], parts[3]))
+        except OSError:
+            continue
+    rows = []
+    for pid in pids:
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if not link.startswith("socket:["):
+                continue
+            entry = by_inode.get(link[8:-1])
+            if entry is None:
+                continue
+            (lip, lport), (rip, rport), state = entry
+            if lip.startswith("127.") or lip in ("::1", "::ffff:127.0.0.1"):
+                continue
+            rows.append({"pid": pid, "fd": int(fd), "state": state,
+                         "local": f"{lip}:{lport}", "remote": f"{rip}:{rport}"})
+    return rows
+
+
 def _kill_process_tree(pid):
     """SIGKILL a process and all its descendants (leaves first)."""
     import signal as _sig
@@ -2108,7 +2166,19 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
                                 "EBADF spin. See CRIU_PLUMBING.md "
                                 "Complication 15.", _eph)
 
+                _park = pr_info.get("mq_park") if _pr_error is None else None
+                if _park is not None and not _park.get("ok"):
+                    raise RuntimeError(
+                        "message-queue park failed, so the tree still holds "
+                        f"live queue sockets: {_park.get('error')}")
+
                 pipe_resource = _resolve_fd_resource(child_pid, child_pipe_fd)
+
+                _census = _inet_census(
+                    [child_pid] + _get_descendant_pids(child_pid))
+                info["inet_census"] = _census
+                log.info("  inet sockets off loopback going into the image: "
+                         "%d %s", len(_census), _census)
 
                 meta = _worker_criu_save(
                     child_pid, image_dir, child_pipe_fd, pipe_resource, gpus,
