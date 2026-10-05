@@ -16,9 +16,12 @@ MAX_WORKER_STREAMS = 128
 CONTEXT_LIMIT_SOURCES = frozenset({"prompt", "completion_budget"})
 # Features callers can check before relying on them, like ``read_buffered``.
 STREAM_CAPABILITIES = frozenset({"sampling_params"})
-# Prefixes of vLLM 0.30's structured-output validation errors. With the
-# default "auto" backend a schema xgrammar rejects falls back to guidance, then
-# outlines, so the error the caller sees can come from any of the three.
+# Prefixes of vLLM 0.30.0's structured-output validation errors, from
+# vllm/v1/structured_output/backend_{xgrammar,guidance,outlines}.py. vLLM raises
+# a bare VLLMValidationError with no parameter for these, so only the message
+# identifies them. With the default "auto" backend a schema xgrammar rejects
+# falls back to guidance, then outlines, so the error can come from any of the
+# three. test_gpu_driver.py triggers real ones; recheck on every vLLM upgrade.
 STRUCTURED_OUTPUT_ERRORS = (
     "Failed to transform json schema into a grammar: ",
     "The provided JSON schema contains features not supported by xgrammar.",
@@ -338,18 +341,20 @@ def _valid_logprob_entry(entry):
     )
 
 
-def valid_delta_logprobs(event):
+def valid_delta_logprobs(event, top_k):
+    """Check a delta's logprobs against the ``top_k`` alternatives requested."""
     logprobs = event["logprobs"]
     token_ids = event.get("token_ids")
     return (
-        isinstance(logprobs, list)
+        type(top_k) is int
+        and isinstance(logprobs, list)
         and isinstance(token_ids, list)
         and len(logprobs) == len(token_ids)
         and all(
             _valid_logprob_entry(entry)
             and entry["token_id"] == token_id
             and isinstance(entry.get("top"), list)
-            and len(entry["top"]) <= 20
+            and len(entry["top"]) <= top_k
             and all(_valid_logprob_entry(item) for item in entry["top"])
             for entry, token_id in zip(logprobs, token_ids)
         )
@@ -1036,7 +1041,7 @@ class ClientStream(AsyncIterator):
             if (
                 kind == "delta"
                 and "logprobs" in event
-                and not valid_delta_logprobs(event)
+                and not valid_delta_logprobs(event, self.params.get("logprobs"))
             ):
                 raise StreamError("invalid_choice_event")
             if kind == "delta" and self.first_delta_time is None:

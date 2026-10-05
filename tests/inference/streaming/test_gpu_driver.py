@@ -363,3 +363,37 @@ def test_logprobs_cover_every_completion_token():
             assert entry["logprob"] <= 0
 
     asyncio.run(with_driver(check))
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "object", "properties": {"a": {"type": "string", "pattern": "("}}},
+        {"type": "nonsense"},
+    ],
+)
+def test_real_structured_output_errors_are_classified(schema):
+    # classify_engine_error matches vLLM's message text, which has no structured
+    # field for these errors. Real errors from the pinned vLLM catch rewording.
+    async def check(driver):
+        events = await collect(
+            driver,
+            "Describe a city as JSON:",
+            {"max_tokens": 16, "structured_output": {"json": schema}},
+        )
+        assert events[-1]["type"] == "terminal_error", events[-1]
+        assert events[-1]["code"] == "invalid_structured_output"
+
+    asyncio.run(with_driver(check))
+
+
+def test_real_thinking_budget_error_is_classified():
+    # The test engine has no reasoning parser, so vLLM rejects the budget.
+    async def check(driver):
+        events = await collect(
+            driver, "The capital of France is", {"max_tokens": 16, "thinking_token_budget": 8}
+        )
+        assert events[-1]["type"] == "terminal_error", events[-1]
+        assert events[-1]["code"] == "invalid_sampling_params"
+
+    asyncio.run(with_driver(check))
