@@ -568,6 +568,7 @@ def _stub_vllm_chat_modules(monkeypatch):
         pass
 
     modules = {
+        "jinja2": {"TemplateError": type("TemplateError", (Exception,), {})},
         "vllm.entrypoints": {},
         "vllm.entrypoints.openai": {},
         "vllm.entrypoints.openai.chat_completion": {},
