@@ -223,6 +223,9 @@ chunking, and resend fixes:
 |---|---|---|---|
 | `math_rl` GSM8K, parity | Qwen3.5-4B | LoRA rank 32, lr `1e-5`, 5 steps, same datums on both | Loss `0.01025 → 0.00889` (Tinker) and `0.01029 → 0.00891` (Cortex); per-token log-prob gap `0.004` |
 | On-policy distillation, parity | Qwen3.5-4B, teacher Qwen3.5-9B | LoRA rank 128, lr `1e-4`, 5 steps, same datums on both | Loss `0.0733 → -0.3395` (Tinker) and `0.0728 → -0.3517` (Cortex); teacher log-prob gap `0.0096` |
+| On-policy distillation, parity | Qwen3.5-4B, teacher Qwen3.6-35B-A3B | LoRA rank 32, lr `1e-4`, 16 rollouts, 4,096 tokens, 5 steps, same datums on both. Both models are in the Cortex training catalog. The teacher scored the sample on Tinker | Loss `0.211 → -2.973` (Tinker) and `0.211 → -3.095` (Cortex); per-token log-prob gap `0.018`; drift `-0.241` / `-0.238` |
+| On-policy distillation, GSM8K | Qwen3.5-4B, teacher Qwen3.6-35B-A3B | LoRA rank 32, lr `1e-4`, 16 rollouts, 3,915 tokens, 5 steps | Tinker loss `0.132 → -0.158`. Cortex did not train: the 1-GPU job failed `placement_timeout` twice |
+| On-policy distillation, MATH | Qwen3.5-4B, teacher Qwen3.6-35B-A3B | LoRA rank 32, lr `1e-4`, 16 rollouts, 4,096 tokens, 5 steps | Tinker loss `0.165 → -0.714`. Cortex did not train: same `placement_timeout` |
 | `math_rl` GSM8K, convergence | Qwen3.5-9B | Full fine-tuning, lr `2e-6`, 64 groups of 8, 10 steps | Accuracy at step 9 `0.926` before the fixes, `0.951` after; `kl_sample_train_v1` `0.023`–`0.040` before, `0.0001`–`0.0003` after |
 | `math_rl` MATH, convergence | Qwen3.5-9B | Full fine-tuning, lr `1e-6`, 64 groups of 16, 10 steps | Accuracy at step 9 `0.098` before the fixes, `0.307` after; `kl_sample_train_v1` about `0.019` before, `0.0002` after |
 
