@@ -24,9 +24,14 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from arctic_platform.common.registry import BATCHING_CALLBACK_ATTR
 from arctic_platform.common.registry import LOSS_CAPABILITIES_ATTR
 from arctic_platform.common.registry import LOSS_FNS
+from arctic_platform.common.registry import METRICS_CALLBACK_ATTR
+from arctic_platform.common.registry import MODEL_CALL_COUNT_CALLBACK_ATTR
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
+from arctic_platform.common.registry import VALIDATION_CALLBACK_ATTR
+from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.registry import RegistryMeta
 from arctic_platform.registry import RegistryValidationError
 from arctic_platform.registry import get_registered_class
@@ -117,7 +122,20 @@ def test_loss_resolver_preserves_legacy_fallback_metadata(monkeypatch):
         assert loss_name == "_legacy_test"
         return reduction
 
+    model_call_counts = []
+    lifecycle_calls = []
+
+    def model_call_count_callback(counts, config):
+        model_call_counts.append((tuple(counts), config))
+
+    setattr(function_loss, BATCHING_CALLBACK_ATTR, lambda request: lifecycle_calls.append(("batch", request)))
+    setattr(
+        function_loss,
+        VALIDATION_CALLBACK_ATTR,
+        lambda context, config: lifecycle_calls.append(("validate", context, config)),
+    )
     setattr(function_loss, PACKED_LOSS_REDUCTION_ATTR, reduction_callback)
+    setattr(function_loss, MODEL_CALL_COUNT_CALLBACK_ATTR, model_call_count_callback)
     setattr(function_loss, LOSS_CAPABILITIES_ATTR, frozenset({"needs_test_output"}))
     monkeypatch.setitem(LOSS_FNS, "_legacy_test", function_loss)
 
@@ -125,6 +143,14 @@ def test_loss_resolver_preserves_legacy_fallback_metadata(monkeypatch):
     outputs = {"logits": torch.ones(1), "logprobs": torch.zeros(1)}
     assert loss_object.loss(outputs, {"batch": 1}, {"meta": 2}, {"value": 3}, "cpu")[1] == {"legacy": 1}
     assert calls and loss_object.packed_reduction_callback([{}], {}, "_legacy_test") is reduction
+    assert loss_object.batching_callback({"request": 1}) is None
+    assert loss_object.validation_callback({"context": 2}, {"config": 3}) is None
+    assert lifecycle_calls == [
+        ("batch", {"request": 1}),
+        ("validate", {"context": 2}, {"config": 3}),
+    ]
+    assert loss_object.model_call_count_callback([1, 1], {"value": 4}) is None
+    assert model_call_counts == [((1, 1), {"value": 4})]
     assert loss_object.has_capability("needs_test_output")
     assert loss_object.is_legacy_adapter_for(function_loss)
     loss_object.output_callback(outputs)
@@ -247,7 +273,7 @@ def test_base_loss_callbacks_are_safe_defaults():
     loss_object = NoOpLoss()
     request = {"value": 1}
     context = {"value": 2}
-    config = {"value": 3}
+    config = {"value": 3, "ratio_m2_threshold": 0.1}
     kwargs = {"value": 4}
     output_keys = ["logits"]
     metrics = {"value": 5}
@@ -260,6 +286,7 @@ def test_base_loss_callbacks_are_safe_defaults():
     assert loss_object.validation_callback(context, config) is None
     assert loss_object.model_forward_callback(kwargs, context, config, output_keys) is None
     assert loss_object.packed_reduction_callback([context], config, loss_object.name) is None
+    assert loss_object.model_call_count_callback([1], config) is None
     assert loss_object.metrics_callback([metrics], metrics) is None
     assert loss_object.reporting_callback([metrics], metrics, 6.0) == 6.0
     assert loss_object.output_callback(outputs) is None
@@ -273,6 +300,52 @@ def test_loss_mask_normalization_is_objective_owned():
     assert resolve_loss("grouped_distillation").requires_loss_mask_normalization() is False
     assert resolve_loss("grpo").requires_loss_mask_normalization() is True
     assert resolve_loss("ap_grpo").requires_loss_mask_normalization() is True
+
+
+def test_loss_scale_config_precedence_is_objective_owned():
+    assert resolve_loss("ap_grpo").preserves_explicit_loss_scale_config() is True
+    assert resolve_loss("grpo").preserves_explicit_loss_scale_config() is True
+    assert resolve_loss("causal_cross_entropy").preserves_explicit_loss_scale_config() is False
+
+
+def test_grpo_metric_pooling_is_objective_owned():
+    worker_metrics = [
+        {
+            "grpo_stats_token_count": 1.0,
+            "grpo_importance_weight_sum": 2.0,
+            "grpo_log_ratio_sum": 3.0,
+            "grpo_clipped_token_count": 0.0,
+            "grpo_entropy_sum": 4.0,
+            "coordinator_metric": 10.0,
+        },
+        {
+            "grpo_stats_token_count": 3.0,
+            "grpo_importance_weight_sum": 6.0,
+            "grpo_log_ratio_sum": 9.0,
+            "grpo_clipped_token_count": 2.0,
+            "grpo_entropy_sum": 12.0,
+            "coordinator_metric": 20.0,
+        },
+    ]
+    metrics = combine_metric_shards(worker_metrics)
+    metrics["coordinator_metric"] = 99.0
+
+    assert getattr(LOSS_FNS["ap_grpo"], METRICS_CALLBACK_ATTR) is not None
+    assert getattr(LOSS_FNS["ap_grpo_mixed_v1"], METRICS_CALLBACK_ATTR) is not None
+    resolve_loss("ap_grpo").metrics_callback(worker_metrics, metrics)
+
+    assert metrics == {
+        "coordinator_metric": 99.0,
+        "grpo_stats_token_count": 4.0,
+        "grpo_importance_weight_sum": 8.0,
+        "grpo_log_ratio_sum": 12.0,
+        "grpo_clipped_token_count": 2.0,
+        "grpo_entropy_sum": 16.0,
+        "importance_weight": 2.0,
+        "approx_kl": 3.0,
+        "clip_ratio": 0.5,
+        "entropy": 4.0,
+    }
 
 
 def test_pipeline_invokes_class_callbacks_in_execution_order():

@@ -26,15 +26,12 @@ from arctic_platform.model.patch import register_patch
 def apply_liger(model: nn.Module, ctx: LoaderContext) -> None:
     from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
 
-    # fused_linear_cross_entropy binds Liger's ``<arch>_lce_forward`` to this instance --
-    # the same forward ``AutoLigerKernelForCausalLM`` rebinds at class level. It only
-    # fuses when labels/shift_labels reach forward; callers that need logits omit
-    # labels and get the ordinary lm_head projection.
+    # Let each architecture choose its rotary implementation. Qwen3.5's Liger
+    # patcher rejects an explicit fused-rope request instead of falling back.
     _apply_liger_kernel_to_instance(
         model=model,
         cross_entropy=False,
         fused_linear_cross_entropy=True,
-        rope=True,
         rms_norm=True,
         swiglu=True,
     )

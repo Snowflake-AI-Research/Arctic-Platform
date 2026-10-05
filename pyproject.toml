@@ -16,6 +16,25 @@ include = [
   "arctic_platform/integrations/verl/examples/*.sh",
   "arctic_platform/integrations/verl/README.md",
 ]
+# Kept beside the inference package and left out of the wheel. Trailing
+# slashes make hatchling skip the directories. csrc/, setup.py, and
+# semi_persistence/scripts stay in the wheel.
+exclude = [
+  "arctic_platform/inference/benchmark/",
+  "arctic_platform/inference/docs/",
+  "arctic_platform/inference/projects/",
+  "arctic_platform/inference/README.md",
+]
+
+# Compile csrc only when ARCTIC_INFERENCE_PRECOMPILED_OPS is set. Hatchling
+# does not run setup.py otherwise, so a cortex or inference install stays
+# source-only unless that variable is set. Torch has to already be installed;
+# use --no-build-isolation so the build can import it.
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.sdist.force-include]
+"hatch_build.py" = "hatch_build.py"
 
 [project.urls]
 Homepage = "https://github.com/Snowflake-AI-Research/Arctic-Platform"
@@ -52,6 +71,12 @@ dependencies = [
     "pydantic-settings>=2.0",  # CortexConfig reads ARCTIC_CORTEX_* via BaseSettings
     "typing-extensions",  # Self, per the pydantic model_validator convention
 ]
+
+[project.scripts]
+arctic_inference_server = "arctic_platform.inference.server.cli:main"
+
+[project.entry-points."vllm.general_plugins"]
+arctic_inference = "arctic_platform.inference.vllm.plugin:arctic_inference_plugin"
 
 # Optional dependency groups
 [project.optional-dependencies]
@@ -148,9 +173,23 @@ sft = [
     "uvicorn",
 ]
 
-# [sft] plus sampling. arctic-inference[vllm] pulls vLLM and applies that extra's
-# pin; [rl] does not declare vLLM. 0.3.0 is the first release of that extra
-# contract.
+# Sampling stack that lives in arctic_platform.inference. Not referenced by
+# [cortex] or [sft]. vLLM stays on this extra.
+inference = [
+    "exceptiongroup>=1.0; python_version < '3.11'",
+    "fastapi",
+    "kvcached==0.1.4",
+    "pydantic>=2.0",
+    "ray",
+    "tqdm",
+    "uvicorn",
+    "vllm==0.30.0",
+    "xgrammar==0.2.6",
+]
+
+# [sft] plus the published sampling package. On-prem still imports
+# arctic_inference; that package's Ray path is not the in-tree one.
+# arctic-inference[vllm] pulls vLLM. [rl] does not declare vLLM itself.
 rl = [
     "arctic_platform[sft]",
     "arctic-inference[server,vllm]>=0.3.0",
