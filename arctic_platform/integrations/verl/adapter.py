@@ -203,10 +203,9 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         Ray transport shares an in-process ``server_state`` actor handle.
         """
-        get_state = getattr(self._client.transport, "get_server_state", None)
         return {
             "rl_client_reconnect_config": self.reconnect_config(),
-            "rl_server_state": get_state() if get_state is not None else None,
+            "rl_server_state": self._client.get_server_state(),
         }
 
     # Parallelism contract --------------------------------------------- #
@@ -592,7 +591,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             training_gpus=n_training_gpus,
             sampling_gpus=n_sampling_gpus,
             log_prob_gpus=n_log_prob_gpus,
-            backend=OnPremConfig(protocol=self._backend_config.comms.protocol, colocate=colocate),
+            backend=OnPremConfig(colocate=colocate),
             training=TrainingConfig(
                 full_determinism=self._backend_config.train.determinism.get("full", False),
                 checkpoint_path=self.config.trainer.default_local_dir,

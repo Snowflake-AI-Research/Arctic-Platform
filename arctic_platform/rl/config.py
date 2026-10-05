@@ -26,8 +26,6 @@ from pydantic import model_validator
 
 
 class ArcticRLClientConfig(BaseModel):
-    backend: Literal["local"] = "local"
-    comm_protocol: Literal["ray"] = "ray"
     checkpoint_path: Optional[str] = None
 
     model_name: str = Field(description="Model name or HuggingFace ID to load on all engines.")
@@ -100,7 +98,7 @@ class ArcticRLClientConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_local_gpu_counts(self) -> "ArcticRLClientConfig":
-        if self.backend != "local" or self.training_job_id is not None:
+        if self.training_job_id is not None:
             return self  # skip validation in reconnect mode
         # Any individual engine may be 0 (e.g. a sampling-only generate test or a
         # training-only forward test); require only that at least one job exists.
