@@ -326,3 +326,9 @@ def test_client_stream_validates_delta_logprobs(logprobs, valid):
 def test_capability_is_advertised():
     # DSS enables these fields only when the installed version lists it.
     assert "sampling_params" in STREAM_CAPABILITIES
+
+
+def test_streams_without_structured_output_never_import_it(engine_params):
+    # A vLLM build without StructuredOutputsParams must still serve plain streams.
+    del sys.modules["vllm.sampling_params"].StructuredOutputsParams
+    assert engine_params({"max_tokens": 4})["max_tokens"] == 4
