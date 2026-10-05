@@ -13,6 +13,7 @@ from arctic_platform.inference.server.streaming import (
     ClientStream,
     StreamError,
     StreamingWorkerMixin,
+    STREAM_CAPABILITIES,
     StreamLimits,
     classify_engine_error,
     delta_logprobs,
@@ -320,3 +321,8 @@ def test_client_stream_validates_delta_logprobs(logprobs, valid):
             stream.watchdog.cancel()
 
     asyncio.run(check())
+
+
+def test_capability_is_advertised():
+    # DSS enables these fields only when the installed version lists it.
+    assert "sampling_params" in STREAM_CAPABILITIES

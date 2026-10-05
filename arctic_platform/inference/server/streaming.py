@@ -14,6 +14,8 @@ from uuid import uuid4
 
 MAX_WORKER_STREAMS = 128
 CONTEXT_LIMIT_SOURCES = frozenset({"prompt", "completion_budget"})
+# Features callers can check before relying on them, like ``read_buffered``.
+STREAM_CAPABILITIES = frozenset({"sampling_params"})
 # Prefixes of vLLM 0.30's structured-output validation errors. With the
 # default "auto" backend a schema xgrammar rejects falls back to guidance, then
 # outlines, so the error the caller sees can come from any of the three.
