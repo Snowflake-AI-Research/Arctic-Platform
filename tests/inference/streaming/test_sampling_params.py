@@ -285,6 +285,8 @@ def _alternative(token_id):
         ([_entry(1), _entry(2), _entry(3)], False),
         ([_entry(2), _entry(1)], False),
         ([_entry(1, [_alternative(n) for n in range(21)]), _entry(2)], False),
+        # More alternatives than the 2 requested.
+        ([_entry(1, [_alternative(n) for n in range(3)]), _entry(2)], False),
         ([{**_entry(1), "logprob": float("nan")}, _entry(2)], False),
         ([{**_entry(1), "token": None}, _entry(2)], False),
         ([{**_entry(1), "token_id": True}, _entry(2)], False),
@@ -293,13 +295,13 @@ def _alternative(token_id):
         ("logprobs", False),
     ],
 )
-def test_client_stream_validates_delta_logprobs(logprobs, valid):
+def test_client_stream_validates_delta_logprobs(logprobs, valid, requested=2):
     async def check():
         stream = ClientStream(
             types.SimpleNamespace(),
             "request",
             types.SimpleNamespace(prompt="text"),
-            {"n": 1},
+            {"n": 1} if requested is None else {"n": 1, "logprobs": requested},
             StreamLimits(),
         )
         event = {
@@ -332,3 +334,7 @@ def test_streams_without_structured_output_never_import_it(engine_params):
     # A vLLM build without StructuredOutputsParams must still serve plain streams.
     del sys.modules["vllm.sampling_params"].StructuredOutputsParams
     assert engine_params({"max_tokens": 4})["max_tokens"] == 4
+
+
+def test_client_stream_rejects_logprobs_nobody_requested():
+    test_client_stream_validates_delta_logprobs([_entry(1), _entry(2)], False, requested=None)
