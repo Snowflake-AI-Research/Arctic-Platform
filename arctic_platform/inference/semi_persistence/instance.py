@@ -36,6 +36,7 @@ import weakref
 import pynvml
 import torch.multiprocessing as mp
 
+import mq_plane
 import semip_logging
 from demuxer import Demuxer
 from worker import worker_loop
@@ -69,6 +70,16 @@ def _alloc_instance_id():
     with _id_lock:
         _next_instance_id += 1
         return _next_instance_id - 1
+
+
+def _local_gpu_count(vllm_config):
+    """GPUs this node's Instance drives: the TP group split over ``nnodes``."""
+    tp = int(vllm_config.get("tensor_parallel_size", 1) or 1)
+    nnodes = int(vllm_config.get("nnodes", 1) or 1)
+    if tp % nnodes:
+        raise ValueError(f"tensor_parallel_size={tp} is not divisible by "
+                         f"nnodes={nnodes}")
+    return tp // nnodes
 
 
 def _truncate_for_display(value, limit=200):
@@ -126,7 +137,9 @@ class Instance:
         # TP>1, where the aggregate ``pinned_cpu_bytes`` overstates the per-GPU
         # budget).
         self.gpus = None
-        self.n_gpus = int(vllm_config.get("tensor_parallel_size", 1) or 1)
+        self.n_gpus = _local_gpu_count(vllm_config)
+        self.node_rank = int(vllm_config.get("node_rank", 0) or 0)
+        self.last_info = {}
         self.max_pinned_bytes_per_worker = 0
 
         self._cmd_queue = None
@@ -419,18 +432,49 @@ class Instance:
         # graph-preserving unilateral-abort teardown so the captured graphs
         # survive into the image.  A no-op at TP=1, but the gate keeps the
         # single-GPU path free of extra commands.
-        if self.n_gpus > 1:
+        # A follower node holds no executor-side queues; the leader's
+        # destroy_nccl reaches its ranks.
+        if self.n_gpus > 1 and self.node_rank == 0:
             self._send("destroy_nccl")
         return self._send("cuda_checkpoint")
 
-    def reinit_nccl(self):
+    def reinit_nccl(self, master_addr=None):
         """Rebuild NCCL / the torch process group after a CRIU restore.
 
         Must run immediately after ``cuda_restore`` and before any
         collective (attach, weight restore, graph replay).  No-op at TP=1.
+        ``master_addr`` is the leader's address in a multi-node group;
+        loopback otherwise.
         """
         self._log("reinit_nccl")
-        return self._send("reinit_nccl")
+        return self._send("reinit_nccl", master_addr=master_addr)
+
+    def mq_begin_unpark(self, remote_ranks, connect_ip, local_ranks):
+        """Leader: bind the new broadcast writer, order the local ranks.
+
+        The handle for the follower lands in ``last_info``.
+        """
+        self._log("mq_begin_unpark")
+        return self._send("mq_begin_unpark", unpark_dir=self._unpark_dir(),
+                          remote_ranks=list(remote_ranks),
+                          connect_ip=connect_ip, local_ranks=list(local_ranks))
+
+    def mq_follower_unpark(self, handle, ranks, connect_ip):
+        """Follower: order this node's ranks onto the leader's writer.
+
+        Their response handles land in ``last_info``.
+        """
+        self._log("mq_follower_unpark")
+        return self._send("mq_follower_unpark", unpark_dir=self._unpark_dir(),
+                          handle=handle, ranks=list(ranks),
+                          connect_ip=connect_ip)
+
+    def mq_finish_unpark(self, remote_handles, local_ranks):
+        """Leader: connect to every rank's response writer and swap in."""
+        self._log("mq_finish_unpark")
+        return self._send("mq_finish_unpark", unpark_dir=self._unpark_dir(),
+                          remote_handles=remote_handles,
+                          local_ranks=list(local_ranks))
 
     def destroy_nccl(self):
         """Tear down NCCL and CustomAllreduce IPC.  No-op at TP=1.
@@ -440,6 +484,42 @@ class Instance:
         """
         self._log("destroy_nccl")
         return self._send("destroy_nccl")
+
+    def _unpark_dir(self):
+        if self.model_dir is None:
+            raise RuntimeError("message-queue park requires a model_dir")
+        return mq_plane.unpark_dir_for(
+            os.path.basename(os.path.normpath(self.model_dir)))
+
+    def arm_mq_park(self, ranks=None):
+        """Park the executor's message queues as the dump's last collective.
+
+        The park itself runs inside ``criu_dump`` (its ``prepare_criu_dump``
+        step), after the collectives the dump still needs. Every queue socket
+        is closed, so the image carries none of them; ``unpark_mq`` must
+        follow ``criu_restore`` before any collective. ``ranks`` are the ones
+        on this node; all of them when ``None``. No-op at TP=1.
+        """
+        self._log("arm_mq_park")
+        return self._send("arm_mq_park", unpark_dir=self._unpark_dir(),
+                          ranks=ranks)
+
+    def park_mq(self, ranks=None):
+        """Park the message queues now (no dump); pairs with ``unpark_mq``."""
+        self._log("park_mq")
+        return self._send("park_mq", unpark_dir=self._unpark_dir(),
+                          ranks=ranks)
+
+    def unpark_mq(self, remote_ranks=None, connect_ip=None):
+        """Build a fresh message-queue plane and swap it in.
+
+        ``remote_ranks`` talk to the executor over TCP via ``connect_ip``
+        rather than through shared memory.
+        """
+        self._log("unpark_mq")
+        return self._send("unpark_mq", unpark_dir=self._unpark_dir(),
+                          remote_ranks=list(remote_ranks or ()),
+                          connect_ip=connect_ip)
 
     def rebind_graphs(self):
         """Rebind the preserved decode graphs against the restored runtime.
@@ -562,9 +642,9 @@ class Instance:
             # meta["n_gpus"] is only a fallback for images predating
             # config-wired TP.  Placement and the per-worker budget are
             # hydrated from the image, with a legacy rank -> [rank] shim.
-            self.n_gpus = int(
-                self.vllm_config.get("tensor_parallel_size",
-                                     meta.get("n_gpus", 1)) or 1)
+            self.n_gpus = (_local_gpu_count(self.vllm_config)
+                           if "tensor_parallel_size" in self.vllm_config
+                           else int(meta.get("n_gpus", 1) or 1))
             self.max_pinned_bytes_per_worker = int(
                 meta.get("max_pinned_bytes_per_worker", 0))
             _meta_gpus = meta.get("gpus") or (
@@ -757,6 +837,7 @@ class Instance:
 
     def _apply_result(self, cmd: str, info: dict) -> None:
         """Update local state after a successful command completion."""
+        self.last_info[cmd] = info
         if cmd == "init":
             self.pid = info.get("pid")
             self.state = "alive"
