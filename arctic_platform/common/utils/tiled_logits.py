@@ -28,7 +28,8 @@ peak memory of the vocab-projection follow-up. They back the three
   * ``memory``  -> the logits are never fully manifested; hidden states are
     tiled, projected per tile under ``no_grad``, and replayed in backward
     (:class:`TiledLogProbEntropy`). Requires a DeepSpeed engine for the tied
-    lm-head / embedding weight grad bookkeeping.
+    lm-head / embedding weight grad bookkeeping. Used by ZoRRo and the no-ZoRRo
+    GRPO pipeline (``run_pipeline`` + :func:`memory_logprobs_entropy_from_hidden`).
 
 Originally lived in ``rl/zorro_train/qwen_model_patcher.py``; extracted here so
 SFT (``sft_ce``) can reuse the exact same math. RL imports these back under its
@@ -36,6 +37,8 @@ historical names.
 """
 
 from __future__ import annotations
+
+from functools import partial
 
 import torch
 
@@ -376,3 +379,91 @@ class TiledLogProbEntropy(torch.autograd.Function):
             None,
             None,
         )
+
+
+_LOGITS_OPT_META_KEYS = (
+    "logits_optimization",
+    "logits_optimization_peak_mem_size_in_gib",
+    "logits_compute_from_fp32_inputs",
+    "logits_compute_in_fp32",
+)
+
+
+def fill_logits_opt_from_worker_config(meta: dict, ds_worker_config: dict | None) -> dict:
+    """Copy worker-init logits knobs into per-call meta when the client left them at ``none``."""
+    worker = ds_worker_config or {}
+    worker_opt = worker.get("logits_optimization") or "none"
+    meta_opt = meta.get("logits_optimization") or "none"
+    if meta_opt != "none" or worker_opt == "none":
+        return meta
+    filled = dict(meta)
+    for key in _LOGITS_OPT_META_KEYS:
+        if key in worker:
+            filled[key] = worker[key]
+    return filled
+
+
+def sync_logits_num_shards(num_shards: int, device) -> int:
+    """MAX-reduce tile count across DP so ranks with different packed lengths stay in lockstep."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return num_shards
+    if torch.distributed.get_world_size() <= 1:
+        return num_shards
+    t = torch.tensor(num_shards, dtype=torch.long, device=device)
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+    return int(t.item())
+
+
+def memory_logprobs_entropy_from_hidden(
+    model,
+    hidden_states,
+    labels,
+    *,
+    temperature=1.0,
+    calculate_entropy=True,
+    peak_mem_gib=4.0,
+    logits_compute_from_fp32_inputs=False,
+    logits_compute_in_fp32=False,
+    device=None,
+):
+    """Tile ``hidden_states`` through the LM head; never materializes full ``[N, V]`` logits.
+
+    ``labels`` must already be next-token targets (``torch.roll(input_ids, -1)``).
+    """
+    batch_dim = labels.shape
+    hidden_size = hidden_states.shape[-1]
+    flat_hidden = hidden_states.reshape(-1, hidden_size)
+    flat_labels = labels.reshape(-1)
+    if flat_hidden.shape[0] != flat_labels.shape[0]:
+        raise ValueError(f"memory logits: hidden rows {flat_hidden.shape[0]} != labels {flat_labels.shape[0]}")
+    tied = getattr(getattr(model, "config", None), "tie_word_embeddings", None)
+    if tied is False:
+        raise ValueError(
+            "logits_optimization=memory requires tie_word_embeddings=True so DeepSpeed reduces "
+            "lm_head.weight with embed_tokens.weight (TiledLogProbEntropy sets ds_grad_is_ready=False)."
+        )
+    vocab_size = model.config.vocab_size
+    chunk_rows = logits_chunk_rows(vocab_size, peak_mem_gib)
+    num_shards = max(1, -(-flat_hidden.shape[0] // chunk_rows))
+    if device is None:
+        device = flat_hidden.device
+    num_shards = sync_logits_num_shards(num_shards, device)
+    tiled_fn = partial(
+        tiled_logprobs_entropy_from_hidden,
+        logits_compute_from_fp32_inputs=logits_compute_from_fp32_inputs,
+        logits_compute_in_fp32=logits_compute_in_fp32,
+    )
+    logprobs, entropy = TiledLogProbEntropy.apply(
+        tiled_fn,
+        model,
+        flat_hidden,
+        flat_labels,
+        temperature,
+        calculate_entropy,
+        num_shards,
+        [model.lm_head.weight],
+    )
+    logprobs = logprobs.view(*batch_dim)
+    if entropy is not None:
+        entropy = entropy.view(*batch_dim)
+    return logprobs, entropy
