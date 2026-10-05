@@ -1,13 +1,14 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from torch import nn
+from transformers import PreTrainedConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 
 
 def _compute_default_rope_parameters(
-    config: Optional["PreTrainedConfig"] = None,
+    config: "PreTrainedConfig",
     device: Optional["torch.device"] = None,
     seq_len: int | None = None,
     layer_type: str | None = None,
@@ -33,7 +34,7 @@ if "default" not in ROPE_INIT_FUNCTIONS:
 class RotaryEmbeddingConfig:
     max_position_embeddings: int
     rope_type: str
-    model_config: any
+    model_config: Any
 
 
 class RotaryEmbedding(nn.Module):

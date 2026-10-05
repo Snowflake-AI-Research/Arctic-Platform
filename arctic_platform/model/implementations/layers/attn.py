@@ -1,4 +1,5 @@
 import functools
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -279,7 +280,7 @@ class SDPAAttention(nn.Module):
         return attn_output, None
 
 
-ATTN_IMPL2CLASS = {
+ATTN_IMPL2CLASS: dict[str, Callable[[AttentionConfig], nn.Module]] = {
     "flash_attention_2": functools.partial(FlashAttention, flash_attn_version=2),
     "sdpa": SDPAAttention,
     "flash_attention_3": functools.partial(FlashAttention, flash_attn_version=3),

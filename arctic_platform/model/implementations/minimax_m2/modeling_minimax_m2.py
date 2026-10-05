@@ -246,6 +246,7 @@ class MiniMaxM2ForCausalLM(MiniMaxM2PreTrainedModel, GenerationMixin):
             if inputs_embeds is not None:
                 position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
             else:
+                assert input_ids is not None
                 position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
 
         outputs: BaseModelOutputWithPast = self.model(
