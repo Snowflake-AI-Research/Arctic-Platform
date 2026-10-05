@@ -44,7 +44,10 @@ installed package cannot drift from that integration code.
 
 Arctic Platform is installed from this checkout, since the released wheel
 (0.1.3) does not yet ship `arctic_platform/integrations/`. Once one does, set
-`ARCTIC_PLATFORM_SPEC='arctic-platform[rl,cortex]'` to use it instead.
+`ARCTIC_PLATFORM_SPEC='arctic-platform[sft,cortex]'` to use it instead. The
+driver needs `[sft]` for the RL client's imports, not `[rl]`: `[rl]` adds
+`arctic-inference`, which compiles from source and is unused when Cortex
+serves sampling.
 
 **On the tag.** This recipe runs on upstream `skyrl-v0.3.0`, not the fork pin
 that [`../README.md`](../README.md) prescribes for the FSDP recipes. It never

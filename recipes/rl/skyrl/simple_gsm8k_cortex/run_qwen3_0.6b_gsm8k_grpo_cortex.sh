@@ -26,6 +26,9 @@
 #     Sampling goes through the shim, which has no vLLM logprob channel to read.
 #     Costs nothing: the Arctic generator hardcodes rollout_logprobs=None either
 #     way, so SkyRL's default of 1 would be discarded unused.
+#   generator.inference_engine.enable_ray_prometheus_stats=false
+#     vLLM runs inside Cortex, so the driver's metrics scraper has nothing to
+#     scrape, and on some machines it crashes the driver on a bad port.
 
 set -euo pipefail
 
@@ -34,8 +37,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # This launcher ships inside the Arctic Platform checkout, so it can locate the
 # repo root rather than being told. Point ARCTIC_PLATFORM_SPEC at a released
 # version instead once one ships arctic_platform/integrations/ (0.1.3 does not).
+# [sft] carries the RL client's DeepSpeed/liger imports; [rl] would add
+# arctic-inference, which builds from source and is dead weight on a CPU driver.
 AP_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
-ARCTIC_PLATFORM_SPEC="${ARCTIC_PLATFORM_SPEC:-${AP_ROOT}[rl,cortex]}"
+ARCTIC_PLATFORM_SPEC="${ARCTIC_PLATFORM_SPEC:-${AP_ROOT}[sft,cortex]}"
 
 if ! command -v uv >/dev/null 2>&1; then
     echo "ERROR: uv not found. Install it with:"
@@ -276,7 +281,6 @@ trap release_our_jobs EXIT
 cd "${SKYRL_HOME}"
 uv run --isolated --extra skyrl-train \
     --with "${ARCTIC_PLATFORM_SPEC}" \
-    --with 'transformers==4.57.6' \
     -- python -m skyrl.train.entrypoints.main_base \
     trainer.override_entrypoint=arctic_platform.integrations.skyrl.entrypoint \
     trainer.arctic_rl.colocate=false \
@@ -294,6 +298,7 @@ uv run --isolated --extra skyrl-train \
     generator.inference_engine.run_engines_locally=false \
     "generator.inference_engine.external_server_urls=${ENGINE_URLS}" \
     "generator.sampling_params.logprobs=null" \
+    generator.inference_engine.enable_ray_prometheus_stats=false \
     generator.inference_engine.weight_sync_backend=nccl \
     generator.inference_engine.async_engine=true \
     generator.batched=true \
