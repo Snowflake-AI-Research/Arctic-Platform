@@ -596,7 +596,7 @@ class CortexTransport(Transport):
 
     async def aclose(self) -> None:
         # Only the loop that owns the session can close it; on any other loop just
-        # drop the reference (matches the on-prem HTTP transport).
+        # drop the reference.
         if self._asession is not None:
             if not self._asession.closed and self._asession_loop is asyncio.get_running_loop():
                 await self._asession.close()
