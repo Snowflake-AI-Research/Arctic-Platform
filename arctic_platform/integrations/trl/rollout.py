@@ -113,6 +113,8 @@ class ArcticRolloutWorker:
             self._sampling_params["min_p"] = min_p
 
         self.rollout_buffer: queue.Queue = queue.Queue(maxsize=queue_maxsize)
+        # Rebased AsyncGRPOTrainer.log drains this. Arctic logs rewards on the sample.
+        self.metrics_queue: queue.Queue = queue.Queue()
         self._score_q: queue.Queue = queue.Queue(maxsize=1)  # generate(k+1) overlaps score(k)
 
         self._model_version = 0

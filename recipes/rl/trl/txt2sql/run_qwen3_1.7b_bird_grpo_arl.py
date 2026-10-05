@@ -206,7 +206,7 @@ def make_trainer(
             self._arctic_client = arctic_client
             super().__init__(*a, **kw)
 
-        def create_optimizer(self):
+        def create_optimizer(self, *args, **kwargs):
             if self.optimizer is None:
                 self.optimizer = ArcticOptimizer(
                     self._arctic_client, self.model.parameters(), lr=self.args.learning_rate
@@ -468,7 +468,6 @@ def main() -> None:
             zorro_train_enable=args.zorro,
             response_len=args.max_completion_length,
             zorro_load_balancer=args.zorro_load_balancer,
-            grad_accum_steps=args.grad_accum,
             **_logits_opt_from_env(),
         )
         prefix_cache = os.environ.get("VLLM_PREFIX_CACHING", "1") not in ("0", "false", "False")

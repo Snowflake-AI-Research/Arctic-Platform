@@ -235,7 +235,7 @@ def make_trainer(
             self._arctic_client = arctic_client
             super().__init__(*a, **kw)
 
-        def create_optimizer(self):
+        def create_optimizer(self, *args, **kwargs):
             # Called by transformers at train start, once the (stub) model exists. ArcticOptimizer.step()
             # drives client.step(); the params are only a handle for accelerate + the scheduler.
             if self.optimizer is None:

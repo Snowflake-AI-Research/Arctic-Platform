@@ -22,7 +22,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytest.importorskip("trl.experimental.api")
+pytest.importorskip("trl.experimental.async_grpo.training_client")
 
 from arctic_platform.integrations.trl.client import ArcticTrainingClient  # noqa: E402
 from arctic_platform.integrations.trl.client import _extract_grpo_ingredients  # noqa: E402
@@ -78,7 +78,6 @@ def test_extract_recovers_closure_values():
     assert ing["tokens_per_rank"] is tokens
     assert ing["epsilon_low"] == pytest.approx(0.2)
     assert ing["epsilon_high"] == pytest.approx(0.3)
-    assert ing["grad_accum_steps"] == 2
 
 
 def test_extract_raises_on_plain_callable():
@@ -171,7 +170,7 @@ def test_forward_backward_server_branch_wiring():
     assert meta["epsilon_low"] == pytest.approx(0.2)
     assert meta["epsilon_high"] == pytest.approx(0.3)
     assert meta["batch_num_tokens"] == 4
-    assert meta["grad_accum_steps"] == 2
+    assert "grad_accum_steps" not in meta
     assert meta["return_fwd_batch"] is True
     assert meta["temperature"] == 0.7
     # Fused single-pass server loss.
