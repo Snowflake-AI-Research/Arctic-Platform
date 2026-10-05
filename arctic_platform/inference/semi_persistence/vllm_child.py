@@ -1623,6 +1623,127 @@ def _assert_checkpoint_state_restored(worker, rekey, restored):
                            "restored: " + "; ".join(problems))
 
 
+# Model attributes that held a ProcessGroup when the dump detached them, as
+# ``(module, attr, group_prefix, "device_group" | "cpu_group")``.  Process
+# memory, so it rides through CRIU to the restore that re-points them.
+_DETACHED_PG_ATTRS = []
+
+
+def _worker_model(worker):
+    try:
+        return worker.get_model()
+    except Exception:  # noqa: BLE001
+        return getattr(getattr(worker, "model_runner", None), "model", None)
+
+
+def _detach_model_process_groups(worker, ps):
+    """Drop every ProcessGroup a model module holds as a plain attribute.
+
+    MoE layers keep ``self.ep_group = get_ep_group().device_group``, so the
+    model outlives vLLM's teardown still referencing the old group, and the
+    group keeps its rendezvous store.  Across nodes that store is a TCPStore:
+    every rank keeps an established connection to rank 0, and the image has
+    to carry them.
+    """
+    import torch
+    from torch.distributed import ProcessGroup
+    owners = {}
+    for name, ref in list(getattr(ps, "_groups", {}).items()):
+        group = ref() if callable(ref) else ref
+        if group is None:
+            continue
+        for kind in ("device_group", "cpu_group"):
+            pg = getattr(group, kind, None)
+            if pg is not None:
+                owners[id(pg)] = (name.split(":")[0], kind)
+    model = _worker_model(worker)
+    if not isinstance(model, torch.nn.Module):
+        return []
+    detached = []
+    for mod in model.modules():
+        for attr, val in list(vars(mod).items()):
+            if isinstance(val, ProcessGroup):
+                prefix, kind = owners.get(id(val), (None, None))
+                detached.append((mod, attr, prefix, kind))
+                setattr(mod, attr, None)
+    return detached
+
+
+def _reattach_model_process_groups(ps):
+    """Point the attributes ``_detach_model_process_groups`` cleared at the
+    rebuilt groups.  Returns ``(reattached, unowned)`` counts."""
+    reattached = unowned = 0
+    for mod, attr, prefix, kind in _DETACHED_PG_ATTRS:
+        getter = getattr(ps, f"get_{prefix}_group", None) if prefix else None
+        group = getter() if getter is not None else None
+        pg = getattr(group, kind, None) if group is not None else None
+        if pg is None:
+            unowned += 1
+            continue
+        setattr(mod, attr, pg)
+        reattached += 1
+    return reattached, unowned
+
+
+def _own_store_connections(port):
+    """This process's ESTABLISHED TCP sockets with *port* at either end."""
+    inodes = set()
+    for fd_name in os.listdir("/proc/self/fd"):
+        try:
+            link = os.readlink(f"/proc/self/fd/{fd_name}")
+        except OSError:
+            continue
+        if link.startswith("socket:["):
+            inodes.add(link[8:-1])
+    found = []
+    for table in ("tcp", "tcp6"):
+        try:
+            with open(f"/proc/self/net/{table}") as f:
+                next(f)
+                for line in f:
+                    parts = line.split()
+                    if parts[3] != "01" or parts[9] not in inodes:
+                        continue
+                    lport = int(parts[1].rsplit(":", 1)[1], 16)
+                    rport = int(parts[2].rsplit(":", 1)[1], 16)
+                    if port in (lport, rport):
+                        found.append((lport, rport))
+        except OSError:
+            continue
+    return found
+
+
+def _process_group_holders(limit=12):
+    """Python containers that still reference a ProcessGroup or Store.
+
+    pybind objects are not GC-tracked themselves, so this finds them through
+    the containers that hold them, and names a dict by the object it is the
+    ``__dict__`` of.
+    """
+    import gc
+    from torch.distributed import ProcessGroup, Store
+    found = []
+    for obj in gc.get_objects():
+        try:
+            refs = gc.get_referents(obj)
+        except Exception:  # noqa: BLE001
+            continue
+        hits = [r for r in refs if isinstance(r, (ProcessGroup, Store))]
+        if not hits:
+            continue
+        where = f"{type(obj).__module__}.{type(obj).__qualname__}"
+        if isinstance(obj, dict):
+            keys = [k for k, v in obj.items() if any(v is h for h in hits)]
+            owners = [f"{type(o).__module__}.{type(o).__qualname__}"
+                      for o in gc.get_referrers(obj)
+                      if getattr(o, "__dict__", None) is obj][:2]
+            where = f"dict{keys[:3]} of {owners or '?'}"
+        found.append(f"{where} -> {[type(h).__name__ for h in hits]}")
+        if len(found) >= limit:
+            break
+    return found
+
+
 def _destroy_nccl(worker):
     """Tear down NCCL process groups before checkpoint.  No-op at TP1.
 
@@ -1700,7 +1821,13 @@ def _destroy_nccl(worker):
             ca.close()
             comm.ca_comm = None
 
-    if os.environ.get("SEMIP_EXP_MULTINODE_IFNAME"):
+    _multinode = bool(os.environ.get("SEMIP_EXP_MULTINODE_IFNAME"))
+    if _multinode:
+        _DETACHED_PG_ATTRS[:] = _detach_model_process_groups(worker, ps)
+        print(f"[semip-exp] rank {getattr(worker, 'rank', '?')} detached "
+              f"{len(_DETACHED_PG_ATTRS)} model process-group attr(s): "
+              f"{sorted({(a, p, k) for _, a, p, k in _DETACHED_PG_ATTRS})}",
+              flush=True)
         # Across nodes a group's broadcaster holds TCP sockets bound to the pod
         # address, and MessageQueue has no close of its own.
         import mq_plane
@@ -1741,6 +1868,17 @@ def _destroy_nccl(worker):
         # rather than a failure to report.
         pass
     _clear_fd_backed_nccl_env()
+    if _multinode:
+        import gc
+        gc.collect()
+        _port = int(getattr(worker.vllm_config.parallel_config,
+                            "master_port", 0) or 0)
+        _left = _own_store_connections(_port) if _port else []
+        if _left:
+            print(f"[semip-exp] rank {getattr(worker, 'rank', '?')} still "
+                  f"holds {len(_left)} rendezvous connection(s) on :{_port} "
+                  f"after teardown; holders: {_process_group_holders()}",
+                  flush=True)
     return {}
 
 
@@ -1980,6 +2118,11 @@ def _reinit_nccl(worker, port, master_addr=None):
                     _grp = None
                 if _grp is not None:
                     ps._groups[_grp_name] = weakref.ref(_grp)
+        if _DETACHED_PG_ATTRS:
+            _reattached, _unowned = _reattach_model_process_groups(ps)
+            print(f"[semip-exp] rank {getattr(worker, 'rank', '?')} "
+                  f"reattached {_reattached} model process-group attr(s), "
+                  f"{_unowned} left None", flush=True)
         # Re-attach the physical backing that checkpoint_prepare detached on the
         # dump side. Last, because the hook barriers over the rebuilt cpu_group
         # and reads the canonical slots written just above.
