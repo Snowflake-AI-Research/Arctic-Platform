@@ -119,11 +119,25 @@ is; callers map OpenAI values to the model family's own.
 
 ## Flow Control and Lifecycle
 
-Native Ray async generators are eager. Each delivered event therefore requires a
-sequence acknowledgement before the worker yields another; ClientStream performs
-this automatically on the next read. No ObjectRefGenerator crosses an actor boundary.
+Native Ray async generators are eager, so the worker waits for an
+acknowledgement before it hands over more events. Each round trip delivers a
+batch: the next event plus everything already buffered behind it. The reader
+acknowledges the batch once, by its last sequence number; ClientStream does this
+automatically before fetching the next batch. A reader that keeps up gets
+one-event batches, as before. No ObjectRefGenerator crosses an actor boundary.
+ClientStream reads still return one event at a time. `read_buffered(limit)`
+returns up to `limit` more events from the current batch without a round trip,
+for callers that relay events onward in groups.
+
 The engine pump never waits for the client; it drains into a bounded queue and
 aborts on overflow rather than silently dropping output or pausing the shared engine.
+While the reader is behind, a new delta joins its choice's newest undelivered
+delta (text and `token_ids` concatenated), so one delivered delta can carry
+several engine steps. A slow reader then needs one queue slot per choice instead
+of one per token. Deltas never merge across choices, past a later event of the
+same choice, or past `usage`; finish events never merge, so the end of a stream
+needs up to 2n + 2 slots. A merge that would exceed the per-event byte limit
+starts a new event instead.
 
 Defaults: 128 queued events, 1 MiB queued serialized payload, 256 KiB per event,
 and 128 sessions per worker. Streaming and legacy
@@ -183,7 +197,7 @@ physical termination still requires runtime verification.
 Individual and bulk cancellation release worker sessions and cancel watchdogs,
 even if no reader was ever created. Bulk cancellation attempts every session
 before reporting cleanup failure, including on an already-unhealthy worker.
-Existing completed-result APIs remain unchanged. Tests are in `tests/streaming/`.
+Existing completed-result APIs remain unchanged. Tests are in `tests/inference/streaming/`.
 
 Sleep and every weight-update strategy abort all scheduler-owned streams, including
 unread and queued requests, before draining legacy work or mutating the engine.
