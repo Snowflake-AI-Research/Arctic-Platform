@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from arctic_platform.registry import RegistryMeta
@@ -125,6 +126,11 @@ class _SingleGASScoreEngine(_ScoreEngine):
         return 1
 
 
+class _NeverForwardEngine(_Engine):
+    def __call__(self, input_ids, **_kwargs):
+        raise AssertionError("M2PO with GAS > 1 must fail before model forward")
+
+
 def _worker(engine):
     from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
 
@@ -224,6 +230,30 @@ def test_native_worker_reuses_implicit_default_loss_across_gas(monkeypatch):
         "loss",
         "output",
     ]
+
+
+def test_native_worker_rejects_split_m2po_before_forward():
+    request = {
+        "batch": [
+            {
+                "input_ids": torch.ones(1, 1, dtype=torch.long),
+                "attention_mask": torch.ones(1, 1, dtype=torch.long),
+            },
+            {
+                "input_ids": torch.ones(1, 1, dtype=torch.long),
+                "attention_mask": torch.ones(1, 1, dtype=torch.long),
+            },
+        ],
+        "meta": {"pad_token_id": 0},
+        "processing": {
+            "loss_fn": "ap_grpo",
+            "config": {"ratio_m2_threshold": 0.1},
+        },
+    }
+    worker = _worker(_NeverForwardEngine())
+
+    with pytest.raises(ValueError, match="requires exactly one synchronized model call"):
+        worker.forward_backward(request)
 
 
 def test_native_worker_honors_class_precedence_for_sft_name(monkeypatch):

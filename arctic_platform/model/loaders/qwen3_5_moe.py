@@ -77,11 +77,7 @@ class Qwen3_5MoeOptions(BaseModel):
 def _matches(ctx: LoaderContext) -> bool:
     if ctx.spec.parallelism.expert_parallel <= 1:
         return False
-    model_type = getattr(ctx.hf_config, "model_type", "") or ""
-    text_config = getattr(ctx.hf_config, "text_config", None)
-    return model_type in ("qwen3_5_moe", "qwen3_5_moe_text") or (
-        getattr(text_config, "model_type", None) == "qwen3_5_moe_text"
-    )
+    return ctx.hf_model_type in ("qwen3_5_moe", "qwen3_5_moe_text") or ctx.hf_text_model_type == "qwen3_5_moe_text"
 
 
 def _validate_spec(spec: ModelSpec) -> None:
@@ -96,7 +92,14 @@ def _validate_spec(spec: ModelSpec) -> None:
             "the qwen3_5_moe loader does not support the liger patch; "
             'use loader_options={"fused_cross_entropy": "liger"} for the LM head instead'
         )
-    if spec.patches.gradient_checkpointing or spec.patches.zorro_train:
+    if (
+        spec.patches.gradient_checkpointing
+        or spec.patches.activation_offload
+        or spec.patches.compile
+        or spec.patches.tiled_mlp
+        or spec.patches.lm_head
+        or spec.patches.zorro_train
+    ):
         raise ValueError("qwen3_5_moe uses loader_options.ac_config and does not support generic forward patches")
 
 

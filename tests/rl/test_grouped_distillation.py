@@ -243,6 +243,7 @@ def test_native_packing_validates_each_final_window_once_before_model(monkeypatc
     def record_validation(self, context, config):
         assert context["input_ids"].shape == (1, 6)
         assert context["cu_seqlens"].tolist() == [0, 6]
+        assert context["packed_loss_scale_factor"] == 6
         events.append("validation")
         return original_validation(self, context, config)
 
@@ -337,7 +338,9 @@ def test_grpo_kd_off_matches_legacy_function_exactly():
     second = first.detach().clone().requires_grad_(True)
 
     class_loss, class_metrics = resolve_loss("grpo").loss({"logprobs": first}, {}, context, config, "cpu")
-    legacy_loss, legacy_metrics = LOSS_FNS["grpo"]({"logprobs": second}, {}, context, config, "cpu")
+    # The registered policy function owns no KD keys; the grouped class strips them before delegating.
+    policy_config = {key: value for key, value in config.items() if key != "kd_coef"}
+    legacy_loss, legacy_metrics = LOSS_FNS["grpo"]({"logprobs": second}, {}, context, policy_config, "cpu")
     class_loss.backward()
     legacy_loss.backward()
 
@@ -353,8 +356,6 @@ def test_grpo_kd_off_matches_legacy_function_exactly():
         {"kd_beta": "bad"},
         {"kd_coef": 0.0, "kd_divergence": "bogus"},
         {"kd_divergence": "bogus"},
-        {"kd_coef": 0.0, "kd_divergance": "jsd"},
-        {"kd_typo": 1},
     ],
 )
 def test_grpo_kd_off_bypasses_other_kd_only_validation_and_delegates(monkeypatch, kd_config):
@@ -373,7 +374,7 @@ def test_grpo_kd_off_bypasses_other_kd_only_validation_and_delegates(monkeypatch
     expected_metrics = {"legacy": 1.0}
 
     def legacy_loss(model_outputs, batch, meta, received_config, device):
-        assert received_config is config
+        assert received_config == _POLICY
         return expected_loss, expected_metrics
 
     monkeypatch.setitem(LOSS_FNS, "grpo", legacy_loss)
@@ -385,18 +386,30 @@ def test_grpo_kd_off_bypasses_other_kd_only_validation_and_delegates(monkeypatch
     assert metrics is expected_metrics
 
 
+@pytest.mark.parametrize("kd_config", [{"kd_coef": 0.0, "kd_divergance": "jsd"}, {"kd_typo": 1}])
+def test_grpo_rejects_misspelled_kd_keys_even_with_kd_off(kd_config):
+    frame = _frame()
+    context = {key: frame[key] for key in ("input_ids", "loss_mask")}
+    typo = next(key for key in kd_config if key != "kd_coef")
+    with pytest.raises(ValueError, match=rf"Unknown config keys for loss_fn 'grpo': \['{typo}'\]"):
+        resolve_loss("grpo").validation_callback(context, {**_POLICY, **kd_config})
+
+
 def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
     frame = _frame()
     request = {
         "input_ids": frame["input_ids"],
         "attention_mask": frame["attention_mask"],
         "processing": {"loss_fn": "grpo", "config": {"kd_coef": 0.5, "dp_size": 1}},
-        "context": {"kd_mask": frame["kd_mask"]},
+        "context": {"kd_mask": frame["kd_mask"], "loss_mask": frame["loss_mask"]},
     }
     loss_object = resolve_loss("grpo")
     loss_object.batching_callback(request)
     assert request["processing"]["config"]["kd_batch_num_tokens"] == pytest.approx(float(frame["kd_mask"].sum()))
     assert request["labels"][..., -1].tolist() == [-100, -100]
+    loss_object.model_call_count_callback([1], {"ratio_m2_threshold": 0.1})
+    with pytest.raises(ValueError, match="requires exactly one synchronized model call"):
+        loss_object.model_call_count_callback([2], {"ratio_m2_threshold": 0.1})
 
     kwargs = {"dss_compute_logprobs": True}
     output_keys = ["logprobs"]
@@ -412,15 +425,35 @@ def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
     assert torch.equal(kwargs["group_token_ids"], expected_ids)
     assert output_keys == ["logprobs", "group_log_probs"]
 
-    metrics = {"kd_sum": 1.0, "loss_term_kd": 2.0}
+    metrics = {
+        "kd_sum": 1.0,
+        "loss_term_kd": 2.0,
+        "grpo_stats_token_count": 1.0,
+        "grpo_importance_weight_sum": 2.0,
+    }
     loss_object.metrics_callback(
         [
-            {"kd_sum": 1.0, "loss_term_kd": 2.0},
-            {"kd_sum": 3.0, "loss_term_kd": 4.0},
+            {
+                "kd_sum": 1.0,
+                "loss_term_kd": 2.0,
+                "grpo_stats_token_count": 1.0,
+                "grpo_importance_weight_sum": 2.0,
+            },
+            {
+                "kd_sum": 3.0,
+                "loss_term_kd": 4.0,
+                "grpo_stats_token_count": 3.0,
+                "grpo_importance_weight_sum": 6.0,
+            },
         ],
         metrics,
     )
-    assert metrics == {"kd_sum": 4.0, "loss_term_kd": 6.0}
+    assert metrics == {
+        "kd_sum": 4.0,
+        "loss_term_kd": 6.0,
+        "grpo_stats_token_count": 4.0,
+        "grpo_importance_weight_sum": 8.0,
+    }
     outputs = {
         "logits": torch.ones(1),
         "group_log_probs": torch.ones(1),
@@ -428,6 +461,43 @@ def test_grpo_callbacks_overwrite_global_count_map_head_names_and_sum_metrics():
     }
     loss_object.output_callback(outputs)
     assert set(outputs) == {"logprobs"}
+
+
+@pytest.mark.parametrize(
+    "request_payload",
+    [
+        {
+            "batch": {
+                "input_ids": torch.ones((1, 2), dtype=torch.long),
+                "loss_mask": torch.tensor([[True, False]]),
+                "nll_mask": torch.tensor([[False, True]]),
+            },
+            "meta": {},
+            "processing": {"loss_fn": "grpo", "config": {"kd_coef": 0.0}},
+        },
+        {
+            "kwargs": {"input_ids": torch.ones((1, 2), dtype=torch.long)},
+            "context": {
+                "loss_mask": torch.tensor([[True, False]]),
+                "nll_mask": torch.tensor([[False, True]]),
+            },
+            "processing": {"loss_fn": "grpo", "config": {"kd_coef": 0.0}},
+        },
+    ],
+)
+def test_grpo_grouped_batching_delegates_structured_request_preflight(request_payload):
+    with pytest.raises(ValueError, match="nll_mask requires loss_fn='grpo_mixed_v1'"):
+        resolve_loss("grpo").batching_callback(request_payload)
+
+
+def test_grpo_grouped_batching_rejects_structured_request_without_policy_mask():
+    request = {
+        "batch": {"input_ids": torch.ones((1, 2), dtype=torch.long)},
+        "meta": {},
+        "processing": {"loss_fn": "grpo", "config": {"kd_coef": 0.0}},
+    }
+    with pytest.raises(ValueError, match=r"requires context\['loss_mask'\]"):
+        resolve_loss("grpo").batching_callback(request)
 
 
 def test_standalone_callbacks_use_public_kd_names():
@@ -505,7 +575,10 @@ def test_grouped_batching_synthesizes_only_real_next_token_targets(loss_fn, conf
         "input_ids": torch.tensor([[10, 11, 12, 0]]),
         "attention_mask": torch.tensor([[1, 1, 1, 0]]),
         "processing": {"loss_fn": loss_fn, "config": config},
-        "context": {"kd_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]])},
+        "context": {
+            "kd_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+            "loss_mask": torch.tensor([[True, True, False, False]]),
+        },
     }
 
     resolve_loss(loss_fn).batching_callback(request)
@@ -572,7 +645,10 @@ def test_grouped_batching_rejects_positive_weight_without_next_token(loss_fn, co
         "input_ids": torch.tensor([[10, 11, 12]]),
         "labels": torch.tensor([[11, 12, 10]]),
         "processing": {"loss_fn": loss_fn, "config": config},
-        "context": {"kd_mask": torch.ones(1, 3)},
+        "context": {
+            "kd_mask": torch.ones(1, 3),
+            "loss_mask": torch.tensor([[True, True, False]]),
+        },
     }
 
     with pytest.raises(ValueError, match="kd_mask must be zero where no next-token target exists"):
@@ -611,7 +687,7 @@ def test_grpo_batching_and_objective_share_canonical_underflowed_weights():
         {"logprobs": legacy_logprobs},
         {},
         context,
-        config,
+        {key: value for key, value in config.items() if not key.startswith("kd_")},
         "cpu",
     )
     class_loss.backward()

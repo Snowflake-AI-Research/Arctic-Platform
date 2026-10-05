@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Layout-independent sequence means and masked IS; norm mode retains local-width scaling."""
+"""Sequence means and sequence-level IS agree between the packed and padded layouts, with and without SP."""
 
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from deepspeed.utils import groups
 
-from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.rl.processors.grpo import grpo_loss
 from arctic_platform.rl.processors.packed_reduction import resolve_packed_loss_reduction
 from arctic_platform.rl.processors.pipeline import run_pipeline
@@ -69,31 +68,22 @@ def _run(layout, config, *, loss_mask=None, advantages=ADVANTAGES):
 
 
 @pytest.mark.parametrize("mode", ["seq-mean-token-mean", "seq-mean-token-sum", "seq-mean-token-sum-norm"])
-def test_packed_seq_mean_matches_padded_only_with_the_fix(mode):
+def test_packed_seq_mean_matches_padded(mode):
+    # The padded width equals the longest sequence, so the norm mode's scale is the same in both layouts.
     padded = _run("padded", dict(loss_agg_mode=mode))
-    packed_default = _run("packed", dict(loss_agg_mode=mode))
-    packed_fixed = _run("packed", dict(loss_agg_mode=mode, seq_mean_per_packed_sequence=True))
-    if mode == "seq-mean-token-sum-norm":
-        packed_fixed = tuple(value * sum(LENGTHS) / max(LENGTHS) for value in packed_fixed)
-    # The default treats the pack as one sequence; that is the behaviour this key opts out of.
-    assert not torch.allclose(packed_default[0], padded[0])
-    torch.testing.assert_close(packed_fixed[0], padded[0])
-    torch.testing.assert_close(packed_fixed[1], padded[1])
-    # The key does not touch the padded layout, whose reduction is already per row.
-    padded_fixed = _run("padded", dict(loss_agg_mode=mode, seq_mean_per_packed_sequence=True))
-    torch.testing.assert_close(padded_fixed[0], padded[0], rtol=0, atol=0)
+    packed = _run("packed", dict(loss_agg_mode=mode))
+    torch.testing.assert_close(packed[0], padded[0])
+    torch.testing.assert_close(packed[1], padded[1])
 
 
-def test_padded_sequence_is_advantages_match_packed_only_with_the_fix():
+def test_padded_sequence_is_advantages_match_packed():
     # The last token is masked out; its advantage must not enter its sequence's mean.
     mask = torch.tensor([True, True, True, False])
     config = dict(importance_sampling_level="sequence", loss_agg_mode="token-mean")
     packed = _run("packed", config, loss_mask=mask)
-    padded_default = _run("padded", config, loss_mask=mask)
-    padded_fixed = _run("padded", dict(config, sequence_is_masked_advantages=True), loss_mask=mask)
-    assert not torch.allclose(padded_default[1], packed[1])
-    torch.testing.assert_close(padded_fixed[0], packed[0])
-    torch.testing.assert_close(padded_fixed[1], packed[1])
+    padded = _run("padded", config, loss_mask=mask)
+    torch.testing.assert_close(padded[0], packed[0])
+    torch.testing.assert_close(padded[1], packed[1])
 
 
 class _Engine:
@@ -114,13 +104,11 @@ class _Engine:
 
 @pytest.mark.parametrize("contract", ["grpo", "grpo_echo_v1"])
 @pytest.mark.parametrize("mode", ["seq-mean-token-mean", "seq-mean-token-sum"])
-def test_fix_flags_through_packing_and_dp_merge(contract, mode):
+def test_packing_width_does_not_change_the_loss(contract, mode):
     ids = torch.tensor([[0, 0, 0], [1, 2, 3]])
     mask = torch.tensor([[True, False, False], [True, True, True]])
     context = dict(old_log_probs_shifted=OLD[ids], advantages=ADVANTAGES[ids], loss_mask=mask)
-    flags = dict(seq_mean_per_packed_sequence=True, sequence_is_masked_advantages=True)
     config = dict(
-        flags,
         use_cispo_loss=True,
         is_weight_clip_max=5.0,
         loss_agg_mode=mode,
@@ -149,13 +137,11 @@ def test_fix_flags_through_packing_and_dp_merge(contract, mode):
             return_tensors=True,
         )
         (grad,) = torch.autograd.grad(result["loss_tensor"], engine.logprobs)
-        results.append((result["loss_tensor"].detach(), grad, result["metrics"]))
-    torch.testing.assert_close(results[0][:2], results[1][:2])
-    merged = combine_metric_shards([result[2] for result in results])
-    assert {key: merged[key] for key in flags} == flags
+        results.append((result["loss_tensor"].detach(), grad))
+    torch.testing.assert_close(results[0], results[1])
 
 
-# --- sequence parallelism: the fixed packed seq-mean is a whole-sequence mean across windows ------------------
+# --- sequence parallelism: the packed seq-mean is a whole-sequence mean across windows ------------------
 
 SP_CU_SEQLENS = torch.tensor([0, 5, 12, 16], dtype=torch.int32)
 SP_TOKENS = 16
@@ -186,7 +172,6 @@ def _sp_loss(logprobs, old, advantages, masks, cu_seqlens):
         use_cispo_loss=True,
         is_weight_clip_max=5.0,
         loss_agg_mode="seq-mean-token-mean",
-        seq_mean_per_packed_sequence=True,
         dp_size=1,
     )
     reduction = resolve_packed_loss_reduction(dict(loss_fn="grpo", config=config), contexts)
@@ -232,5 +217,5 @@ def _sp_worker(rank, world_size, init_method, case):
 
 
 @pytest.mark.parametrize("case", ["full", "empty", "microbatches"])
-def test_packed_seq_mean_fix_under_sequence_parallelism(tmp_path, case):
+def test_packed_seq_mean_under_sequence_parallelism(tmp_path, case):
     mp.spawn(_sp_worker, args=(2, (tmp_path / "gloo").as_uri(), case), nprocs=2, join=True)
