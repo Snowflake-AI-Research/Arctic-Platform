@@ -22,7 +22,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytest.importorskip("trl.experimental.api")
+pytest.importorskip("trl.experimental.async_grpo.training_client")
 
 from arctic_platform.integrations.trl.client import ArcticTrainingClient  # noqa: E402
 from arctic_platform.integrations.trl.client import _place_response_window  # noqa: E402

@@ -24,12 +24,16 @@ trl_loss = pytest.importorskip("arctic_platform.integrations.trl.loss")
 trl_grpo = trl_loss.trl_grpo
 
 
-def _ref_trl_loss(logprobs, old, adv, mask, eps_low, eps_high, batch_num_tokens, dp_size, grad_accum):
-    """Direct reimpl of TRL's compute_loss.loss_fn math, plus the server ``* dp_size``."""
+def _ref_trl_loss(logprobs, old, adv, mask, eps_low, eps_high, batch_num_tokens, dp_size):
+    """Clipped surrogate over the whole forward, plus the server ``* dp_size``.
+
+    No GAS divisor: ``batch_num_tokens`` is already the full forward, and DeepSpeed
+    microbatches share it.
+    """
     ratio = torch.exp(logprobs - old)
     per_token = -torch.minimum(ratio * adv, torch.clamp(ratio, 1 - eps_low, 1 + eps_high) * adv)
     loss = (per_token * mask).sum() / batch_num_tokens
-    return loss / grad_accum * dp_size
+    return loss * dp_size
 
 
 def _call(logprobs, old, adv, mask, *, eps_low=0.2, eps_high=0.2, batch_num_tokens=None, dp_size=1, grad_accum=1):
@@ -61,7 +65,7 @@ def test_matches_trl_math_dp1_gas1():
     tokens = int(mask.sum().item())
 
     loss, metrics = _call(logprobs, old, adv, mask, batch_num_tokens=tokens)
-    ref = _ref_trl_loss(logprobs, old, adv, mask, 0.2, 0.2, tokens, 1, 1)
+    ref = _ref_trl_loss(logprobs, old, adv, mask, 0.2, 0.2, tokens, 1)
 
     assert loss.item() == pytest.approx(ref.item(), abs=1e-6)
     assert metrics["loss"].item() == pytest.approx(ref.item(), abs=1e-6)
@@ -97,8 +101,9 @@ def test_normalization_scales_with_dp_gas_and_tokens():
     dp4, _ = _call(logprobs, old, adv, mask, batch_num_tokens=tokens, dp_size=4, grad_accum=1)
     assert dp4.item() == pytest.approx(base.item() * 4, abs=1e-6)
 
+    # A stale grad_accum_steps in meta must not scale the loss.
     gas2, _ = _call(logprobs, old, adv, mask, batch_num_tokens=tokens, dp_size=1, grad_accum=2)
-    assert gas2.item() == pytest.approx(base.item() / 2, abs=1e-6)
+    assert gas2.item() == pytest.approx(base.item(), abs=1e-6)
 
     tok2, _ = _call(logprobs, old, adv, mask, batch_num_tokens=tokens * 2, dp_size=1, grad_accum=1)
     assert tok2.item() == pytest.approx(base.item() / 2, abs=1e-6)

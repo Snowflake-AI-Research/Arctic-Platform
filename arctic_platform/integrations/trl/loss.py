@@ -38,9 +38,12 @@ def trl_grpo(
     ``old_log_probs``/``advantages``/``loss_mask`` into the server's roll(-1)
     logprob frame, so no response-window reshift is done here.
 
-    Normalization mirrors TRL's ``loss / tokens_per_rank / grad_accum`` and adds
-    ``* dp_size`` so the gradient is correct after DeepSpeed's cross-DP averaging
-    (identical to verl ``agg_loss`` token-mean).
+    Normalization is ``masked_sum / batch_num_tokens * dp_size``. ``batch_num_tokens``
+    is the completion-token count of the whole forward TRL sent (the optimizer step,
+    since TRL accumulation stays 1). DeepSpeed splits that forward into engine
+    microbatches that share this denominator, so the piece sums add back to the token
+    mean. Dividing by engine GAS as well would shrink the update by that factor.
+    ``* dp_size`` corrects DeepSpeed's cross-DP average (verl ``agg_loss`` token-mean).
     """
     logprobs = model_outputs["logprobs"]
     old_log_probs = batch["old_log_probs"].to(logprobs.dtype)
@@ -61,7 +64,6 @@ def trl_grpo(
 
     batch_num_tokens = float(meta["batch_num_tokens"])
     dp_size = float(meta.get("dp_size", 1))
-    grad_accum = float(meta.get("grad_accum_steps", 1))
-    loss = masked / batch_num_tokens * dp_size / grad_accum
+    loss = masked / batch_num_tokens * dp_size
 
     return loss, {"loss": loss.detach()}

@@ -21,7 +21,7 @@ import pytest
 import torch
 
 # client.py imports `trl.experimental.api` at module load; skip cleanly on a minimal image.
-pytest.importorskip("trl.experimental.api")
+pytest.importorskip("trl.experimental.async_grpo.training_client")
 
 from arctic_platform.integrations.trl import client as C  # noqa: E402
 from arctic_platform.testing_utils import torch_assert_equal  # noqa: E402

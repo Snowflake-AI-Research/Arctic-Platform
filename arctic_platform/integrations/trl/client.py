@@ -22,7 +22,7 @@ model, this adapter unpacks packed rows and evaluates ``loss_fn`` on returned lo
 from typing import Any
 
 import torch
-from trl.experimental.api import ForwardBackwardOutput
+from trl.experimental.async_grpo.training_client import ForwardBackwardOutput
 
 
 def _meta_dict(
@@ -86,7 +86,6 @@ class ArcticTrainingClient:
         zorro_train_enable: bool = False,
         response_len: int | None = None,
         zorro_load_balancer: bool = False,
-        grad_accum_steps: int | None = None,
     ) -> None:
         self.client = client
         self.temperature = temperature
@@ -109,8 +108,6 @@ class ArcticTrainingClient:
         # divides evenly into world_size bins with fittable prompt groups; TRL's per-forward_backward microbatch
         # does not guarantee that, so it raises "shouldn't reach here". Opt in only for compatible batch shapes.
         self.zorro_load_balancer = zorro_load_balancer
-        # DeepSpeed engine GAS. None → TRL's ``current_gradient_accumulation_steps``.
-        self.grad_accum_steps = grad_accum_steps
         if zorro_train_enable:
             if not server_side_loss:
                 raise ValueError(
@@ -137,19 +134,23 @@ class ArcticTrainingClient:
             zorro_train_enable=self.zorro_train_enable,
         )
 
-    def _grad_accum_meta(self, ing: dict) -> int:
-        return self.grad_accum_steps if self.grad_accum_steps is not None else ing["grad_accum_steps"]
-
     def forward_backward(
         self,
         model: torch.nn.Module,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         completion_mask: torch.Tensor,
-        loss_fn: Any,
+        loss: Any = None,
+        loss_fn: Any = None,
         aux_loss_coef: float = 0.0,
     ) -> ForwardBackwardOutput:
         del model  # trainer-local; Arctic owns the weights
+        # Rebased TRL passes a GRPOLoss as ``loss``. Older callers pass ``loss_fn``.
+        if loss is None:
+            loss = loss_fn
+        if loss is None:
+            raise TypeError("forward_backward requires loss")
+        loss_fn = loss
         seq_lens = _segment_lengths(position_ids)
 
         if self.zorro_train_enable:
@@ -239,7 +240,6 @@ class ArcticTrainingClient:
             "epsilon_low": ing["epsilon_low"],
             "epsilon_high": ing["epsilon_high"],
             "batch_num_tokens": batch_num_tokens,
-            "grad_accum_steps": self._grad_accum_meta(ing),
             "return_fwd_batch": True,  # server omits fwd_bwd batch by default
         }
 
@@ -322,7 +322,6 @@ class ArcticTrainingClient:
             "epsilon_low": ing["epsilon_low"],
             "epsilon_high": ing["epsilon_high"],
             "batch_num_tokens": batch_num_tokens,
-            "grad_accum_steps": self._grad_accum_meta(ing),
             "return_fwd_batch": True,
         }
 
@@ -357,6 +356,12 @@ class ArcticTrainingClient:
             entropy=entropy,
             aux_loss=None,
         )
+
+    def save(self, output_dir: str) -> None:
+        del output_dir  # weights stay on the Arctic engine
+
+    def load(self, checkpoint_dir: str) -> None:
+        del checkpoint_dir
 
 
 class ArcticOptimizer(torch.optim.Optimizer):
@@ -611,13 +616,21 @@ _TRL_LOSS_FREEVARS = ("shifted_old_log_probs", "shifted_advantages", "shifted_co
 
 
 def _extract_grpo_ingredients(loss_fn: Any) -> dict:
-    """Recover GRPO tensors/scalars from TRL's ``loss_fn`` closure.
+    """Recover GRPO tensors/scalars from a ``GRPOLoss`` or TRL's old ``loss_fn`` closure.
 
-    TRL only hands the adapter ``forward_backward(..., loss_fn)``; the
-    advantages/old_log_probs/mask/epsilons live inside ``loss_fn``'s closure.
-    We read them by ``__code__.co_freevars`` + ``__closure__`` and fail loudly
-    (pointing at ``loss_placement=client``) if TRL's variable names drift.
+    Rebased TRL passes a ``GRPOLoss`` dataclass (fields, also callable). Older TRL
+    handed a closure; advantages/old_log_probs/mask/epsilons lived in its freevars.
     """
+    if hasattr(loss_fn, "num_tokens_per_rank") and hasattr(loss_fn, "old_log_probs"):
+        return {
+            "old_log_probs": loss_fn.old_log_probs,
+            "advantages": loss_fn.advantages,
+            "completion_mask": loss_fn.completion_mask,
+            "tokens_per_rank": loss_fn.num_tokens_per_rank,
+            "epsilon_low": float(loss_fn.epsilon_low),
+            "epsilon_high": float(loss_fn.epsilon_high),
+        }
+
     code = getattr(loss_fn, "__code__", None)
     closure = getattr(loss_fn, "__closure__", None)
     if code is None or closure is None:
@@ -650,7 +663,6 @@ def _extract_grpo_ingredients(loss_fn: Any) -> dict:
         "tokens_per_rank": cells["tokens_per_rank"],
         "epsilon_low": float(trainer.epsilon_low),
         "epsilon_high": float(trainer.epsilon_high),
-        "grad_accum_steps": int(trainer.current_gradient_accumulation_steps),
     }
 
 
