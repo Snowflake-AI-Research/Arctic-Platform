@@ -207,3 +207,22 @@ def test_chat_input_errors_are_typed():
         assert too_long[-1]["context_limit_source"] == "prompt"
 
     asyncio.run(with_driver(check))
+
+
+def test_chat_logprobs_cover_the_answer_tokens():
+    from arctic_platform.inference.server.chat import ChatPrompt
+
+    async def check(driver):
+        events = await collect(
+            driver,
+            ChatPrompt([{"role": "user", "content": "Name a colour."}], reasoning_effort="none"),
+            {"temperature": 0.0, "max_tokens": 32, "logprobs": 2},
+        )
+        contents = [e for e in events if e["type"] == "content_delta"]
+        entries = [entry for e in contents for entry in e["logprobs"]]
+        # Thinking off: every completion token is answer text, so each has an entry.
+        assert len(entries) == usage(events)["completion_tokens"]
+        assert all(entry["top"] and entry["top"][0]["token_id"] == entry["token_id"] for entry in entries)
+        assert not any("logprobs" in e for e in events if e["type"] != "content_delta")
+
+    asyncio.run(with_driver(check))
