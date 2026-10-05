@@ -33,7 +33,10 @@ def _request() -> dict:
             "input_ids": torch.arange(8).reshape(4, 2),
             "attention_mask": torch.ones(4, 2, dtype=torch.long),
         },
-        "context": {"kd_mask": torch.tensor([[1.0, 0.0]]).expand(4, -1).clone()},
+        "context": {
+            "kd_mask": torch.tensor([[1.0, 0.0]]).expand(4, -1).clone(),
+            "loss_mask": torch.tensor([[True, False]]).expand(4, -1).clone(),
+        },
         "processing": {
             "loss_fn": "grpo",
             "config": {"kd_coef": 0.5},

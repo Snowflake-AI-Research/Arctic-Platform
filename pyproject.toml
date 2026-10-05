@@ -23,11 +23,7 @@ exclude = [
   "arctic_platform/inference/benchmark/",
   "arctic_platform/inference/docs/",
   "arctic_platform/inference/projects/",
-  "arctic_platform/inference/scripts/",
   "arctic_platform/inference/README.md",
-  "arctic_platform/inference/LICENSE",
-  "arctic_platform/inference/.gitignore",
-  "arctic_platform/inference/.readthedocs.yaml",
 ]
 
 # Compile csrc only when ARCTIC_INFERENCE_PRECOMPILED_OPS is set. Hatchling
@@ -161,7 +157,6 @@ sft = [
 # Sampling stack that lives in arctic_platform.inference. Not referenced by
 # [cortex] or [sft]. vLLM stays on this extra.
 inference = [
-    "cortex-training",
     "exceptiongroup>=1.0; python_version < '3.11'",
     "fastapi",
     "kvcached==0.1.4",

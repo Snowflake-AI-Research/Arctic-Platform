@@ -199,15 +199,8 @@ class TestExtraNamesResolve:
             "arctic_platform/inference/benchmark/",
             "arctic_platform/inference/docs/",
             "arctic_platform/inference/projects/",
-            "arctic_platform/inference/scripts/",
         )
-        excluded_files = (
-            "arctic_platform/inference/README.md",
-            "arctic_platform/inference/LICENSE",
-            "arctic_platform/inference/.gitignore",
-            "arctic_platform/inference/.readthedocs.yaml",
-        )
-        for path in excluded_dirs + excluded_files:
+        for path in excluded_dirs + ("arctic_platform/inference/README.md",):
             assert path in exclude
             assert (_REPO_ROOT / path.rstrip("/")).exists()
         for path in (
