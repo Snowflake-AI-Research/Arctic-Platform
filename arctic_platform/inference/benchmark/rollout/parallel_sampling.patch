@@ -1,0 +1,29 @@
+--- /tmp/rebase_rollout/orig/parallel_sampling.py	2026-05-29 02:14:16.691095091 +0000
++++ /tmp/rebase_rollout/new/parallel_sampling.py	2026-05-29 02:14:51.591043130 +0000
+@@ -66,16 +66,22 @@
+           Child `sampling_params` instance.
+         """
+         seed = self.sampling_params.seed
+-        if self.cached_child_sampling_params:
++        max_tokens_n = self.sampling_params.max_tokens_n
++        if self.cached_child_sampling_params and max_tokens_n is None:
+             # Reuse child sampling_params data structure
+             return self.cached_child_sampling_params
+         # Build child sampling_params
+         child_sampling_params = copy(self.sampling_params)
+         child_sampling_params.n = 1
+-        if seed is None:
+-            # Cache child sampling_params for later reuse
++        if max_tokens_n is not None:
++            # Per-child max_tokens override (rollout-replay).
++            child_sampling_params.max_tokens = max_tokens_n[index]
++        if seed is None and max_tokens_n is None:
++            # Cache child sampling_params for later reuse. We can't cache
++            # when max_tokens_n is set because each child has a different
++            # max_tokens value.
+             self.cached_child_sampling_params = child_sampling_params
+-        else:
++        elif seed is not None:
+             # Each child gets a clone with a unique seed
+             child_sampling_params.seed = seed + index
+         return child_sampling_params

@@ -17,6 +17,28 @@ harness so CPU, GPU, and pytest-xdist runs stay consistent.
 Prefer importing helpers from `arctic_platform.testing_utils`. Do not reinvent skips,
 port picking, or tensor asserts in the test file.
 
+## In-tree inference tests
+
+`tests/inference` covers `arctic_platform.inference`. It is not part of the
+platform harness above. Default `pytest` and the `[sft,testing]` CI job skip
+it. `[cortex]`, `[sft]`, and `[rl]` do not install the `[inference]` extra.
+`[rl]` installs the published `arctic-inference` package.
+
+```text
+pip install -e ".[inference]"
+ARCTIC_INFERENCE_PRECOMPILED_OPS=1 pip install --no-build-isolation -e ".[inference]"
+pytest tests/inference
+```
+
+The second install is what compiles `csrc/`. Without
+`ARCTIC_INFERENCE_PRECOMPILED_OPS`, hatchling does not run `setup.py`.
+
+Docs, benchmarks, projects, and scripts live in `arctic_platform/inference/`
+and are excluded from the wheel. `csrc/` and `setup.py` are not.
+
+Do not pull these tests into the default suite; collecting them imports vLLM.
+Sampling and NCCL tests need a GPU.
+
 ## Base style
 
 1. **Prefer `TestCasePlus`** (`unittest.TestCase` subclass) for anything that needs
@@ -134,6 +156,7 @@ usually need `@require_torch_gpu` only — not `gpu_serial`.
 | SFT CUDA kernels / local HTTP demo | `tests/sft/` | `@require_torch_gpu`; e2e → `gpu_serial` |
 | RL engine / generate / e2e | `tests/rl/` | Use `rl_harness` session helpers |
 | ZoRRO / model patchers | `tests/zorro_train/` | GPU when kernels matter |
+| Arctic Inference package | `tests/inference/` | Skipped by default `pytest`. Not the platform harness |
 
 ## Checklist for a new test
 

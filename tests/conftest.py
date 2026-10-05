@@ -21,6 +21,41 @@ import subprocess
 import sys
 from pathlib import Path
 
+# tests/inference is the copied Arctic Inference suite. It imports vLLM and
+# arctic_inference at collection time, which the [sft,testing] job does not
+# install. Skip it unless the invocation names that directory or a path inside it.
+_INFERENCE_TESTS = Path(__file__).resolve().parent / "inference"
+
+
+def _targets_inference_tree(config) -> bool:
+    for arg in config.args:
+        if not arg or str(arg).startswith("-"):
+            continue
+        candidate = Path(arg)
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        try:
+            candidate = candidate.resolve()
+        except OSError:
+            continue
+        if candidate == _INFERENCE_TESTS or _INFERENCE_TESTS in candidate.parents:
+            return True
+    return False
+
+
+def pytest_ignore_collect(collection_path, config):
+    path = Path(str(collection_path))
+    try:
+        path = path.resolve()
+    except OSError:
+        return None
+    if path != _INFERENCE_TESTS and _INFERENCE_TESTS not in path.parents:
+        return None
+    if _targets_inference_tree(config):
+        return False
+    return True
+
+
 # Largest GPU count any single GPU test needs (test_train_engine / test_generate / test_sync_weights_nccl use 2). A
 # worker can only run the GPU suite if its slice is at least this big.
 _MAX_TEST_GPUS = 2

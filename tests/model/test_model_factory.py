@@ -226,6 +226,16 @@ class TestHuggingFaceLoader:
 
         assert spec.loader == "huggingface"
 
+    def test_unreadable_config_is_not_treated_as_a_missing_model(self, tmp_path):
+        loader_mod._load_hf_config.cache_clear()
+        (tmp_path / "config.json").write_text("{")
+        with pytest.raises(OSError, match="not a valid JSON file"):
+            loader_mod._load_hf_config(str(tmp_path))
+
+    def test_directory_without_config_is_not_an_hf_model(self, tmp_path):
+        loader_mod._load_hf_config.cache_clear()
+        assert loader_mod._load_hf_config(str(tmp_path)) is None
+
     def test_sequence_parallel_requires_runtime_group(self):
         from arctic_platform.model import ParallelismConfig
         from arctic_platform.model.loaders.huggingface import load_huggingface

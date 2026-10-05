@@ -25,6 +25,7 @@ Pure metadata + AST checks: no install, no network, no GPUs.
 from __future__ import annotations
 
 import ast
+import sys
 import tomllib
 from pathlib import Path
 
@@ -159,3 +160,54 @@ class TestExtraNamesResolve:
                 if dep.startswith("arctic_platform["):
                     ref = dep.split("[")[1].rstrip("]")
                     assert ref in optional, f"[{extra}] references undefined [{ref}]"
+
+    def test_cortex_install_does_not_pull_the_inference_extra(self):
+        """[cortex] and [sft] do not select [inference]. [rl] keeps published arctic-inference."""
+        with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
+            project = tomllib.load(f)
+        include = project["tool"]["hatch"]["build"]["include"]
+        assert "arctic_platform" in include
+        optional = project["project"]["optional-dependencies"]
+        assert "arctic-inference[server,vllm]>=0.3.0" in optional["rl"]
+        assert "arctic_platform[inference]" not in optional["rl"]
+        hook = project["tool"]["hatch"]["build"]["hooks"]["custom"]
+        assert hook["path"] == "hatch_build.py"
+        for extra in ("cortex", "sft"):
+            for dep in optional[extra]:
+                assert "arctic_platform[inference]" not in dep
+                assert "vllm" not in dep
+
+    def test_precompiled_ops_are_opt_in(self, monkeypatch):
+        """Native extensions compile only when ARCTIC_INFERENCE_PRECOMPILED_OPS is set."""
+        sys.path.insert(0, str(_REPO_ROOT))
+        from hatch_build import precompiled_ops_requested
+
+        monkeypatch.delenv("ARCTIC_INFERENCE_PRECOMPILED_OPS", raising=False)
+        assert not precompiled_ops_requested()
+        for value in ("1", "true", "on"):
+            monkeypatch.setenv("ARCTIC_INFERENCE_PRECOMPILED_OPS", value)
+            assert precompiled_ops_requested()
+        monkeypatch.setenv("ARCTIC_INFERENCE_PRECOMPILED_OPS", "0")
+        assert not precompiled_ops_requested()
+
+    def test_inference_docs_and_benchmarks_are_excluded_from_the_wheel(self):
+        """The copied docs tree sits in the package directory and stays out of the wheel."""
+        with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
+            project = tomllib.load(f)
+        exclude = project["tool"]["hatch"]["build"]["exclude"]
+        excluded_dirs = (
+            "arctic_platform/inference/benchmark/",
+            "arctic_platform/inference/docs/",
+            "arctic_platform/inference/projects/",
+        )
+        for path in excluded_dirs + ("arctic_platform/inference/README.md",):
+            assert path in exclude
+            assert (_REPO_ROOT / path.rstrip("/")).exists()
+        for path in (
+            "arctic_platform/inference/csrc",
+            "arctic_platform/inference/setup.py",
+            "arctic_platform/inference/semi_persistence/scripts",
+        ):
+            assert (_REPO_ROOT / path).exists()
+            assert path not in exclude
+            assert f"{path}/" not in exclude
