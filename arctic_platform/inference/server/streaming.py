@@ -89,7 +89,7 @@ def classify_engine_error(exc):
         return "engine_error", None
     if getattr(exc, "parameter", None) == "input_tokens":
         return "context_length_exceeded", "prompt"
-    if getattr(exc, "parameter", None) == "logit_bias":
+    if getattr(exc, "parameter", None) in {"logit_bias", "logprobs"}:
         return "invalid_sampling_params", None
     message = str(exc)
     if message.startswith(
@@ -833,6 +833,8 @@ class StreamingWorkerMixin:
         from vllm.sampling_params import RequestOutputKind
 
         # Requests carry plain JSON across Ray; the vLLM type is built here.
+        # The stream key "structured_output" is that JSON form of vLLM's
+        # StructuredOutputsParams ("structured_outputs").
         params = dict(params)
         structured_output = params.pop("structured_output", None)
         if structured_output is not None:
