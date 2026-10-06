@@ -180,7 +180,7 @@ def validate_request(prompt, sampling_params):
         "n",
         "seed",
         "logit_bias",
-        "structured_output",
+        "structured_outputs",
         "thinking_token_budget",
         "logprobs",
     }
@@ -257,33 +257,33 @@ def validate_request(prompt, sampling_params):
                 )
             biases[token] = float(bias)
         params["logit_bias"] = biases
-    structured_output = params.get("structured_output")
-    if structured_output is not None:
-        if not isinstance(structured_output, dict) or not (
+    structured_outputs = params.get("structured_outputs")
+    if structured_outputs is not None:
+        if not isinstance(structured_outputs, dict) or not (
             (
-                structured_output.keys() == {"json"}
-                and isinstance(structured_output["json"], dict)
+                structured_outputs.keys() == {"json"}
+                and isinstance(structured_outputs["json"], dict)
             )
             or (
-                structured_output.keys() == {"json_object"}
-                and structured_output["json_object"] is True
+                structured_outputs.keys() == {"json_object"}
+                and structured_outputs["json_object"] is True
             )
         ):
             raise ValueError(
-                'structured_output must be {"json": <schema object>} '
+                'structured_outputs must be {"json": <schema object>} '
                 'or {"json_object": true}'
             )
-        if "json" in structured_output:
+        if "json" in structured_outputs:
             try:
                 schema = json.dumps(
-                    structured_output["json"],
+                    structured_outputs["json"],
                     allow_nan=False,
                     separators=(",", ":"),
                 )
             except (TypeError, ValueError, RecursionError):
-                raise ValueError("structured_output schema must be JSON") from None
+                raise ValueError("structured_outputs schema must be JSON") from None
             if len(schema.encode("utf-8")) > 64 * 1024:
-                raise ValueError("structured_output schema exceeds 65536 bytes")
+                raise ValueError("structured_outputs schema exceeds 65536 bytes")
     budget = params.get("thinking_token_budget")
     if budget is not None and (
         type(budget) is not int
@@ -688,17 +688,15 @@ class StreamingWorkerMixin:
         from vllm.sampling_params import RequestOutputKind
 
         # Requests carry plain JSON across Ray; the vLLM type is built here.
-        # The stream key "structured_output" is that JSON form of vLLM's
-        # StructuredOutputsParams ("structured_outputs").
         params = dict(params)
-        structured_output = params.pop("structured_output", None)
-        if structured_output is not None:
+        structured_outputs = params.get("structured_outputs")
+        if structured_outputs is not None:
             # Imported only when used, so plain streams don't depend on it.
             from vllm.sampling_params import StructuredOutputsParams
 
             params["structured_outputs"] = (
-                StructuredOutputsParams(json=structured_output["json"])
-                if "json" in structured_output
+                StructuredOutputsParams(json=structured_outputs["json"])
+                if "json" in structured_outputs
                 else StructuredOutputsParams(json_object=True)
             )
 

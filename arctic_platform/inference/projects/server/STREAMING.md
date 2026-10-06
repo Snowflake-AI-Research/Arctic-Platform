@@ -61,7 +61,7 @@ and local cancellation can raise instead of delivering an event. EOF without com
 
 Inputs are one prepared text prompt or token-ID list. Supported sampling parameters:
 temperature, top_p, frequency_penalty, presence_penalty, max_tokens, stop, n,
-optional seed, logit_bias, structured_output, thinking_token_budget and logprobs. Unknown options are rejected. Defaults: temperature=1, top_p=1,
+optional seed, logit_bias, structured_outputs, thinking_token_budget and logprobs. Unknown options are rejected. Defaults: temperature=1, top_p=1,
 frequency_penalty=0, presence_penalty=0, max_tokens=4096, n=1. Penalties must
 be in [-2,2]. Limits: n<=8,
 max_tokens<=131072, 1 MiB text input or 131072 input token IDs. After vLLM
@@ -73,9 +73,9 @@ strings, each <=4096 UTF-8 bytes. Stop holdback/detokenization remain
 engine-owned. `logit_bias` maps at most 300 token IDs (integers or
 decimal strings) to biases in [-100,100]. vLLM checks the IDs against the loaded
 vocabulary; out-of-vocabulary IDs, or logit_bias on a speculative-decoding
-deployment, end the stream with `invalid_sampling_params`. `structured_output` is
+deployment, end the stream with `invalid_sampling_params`. `structured_outputs` is
 `{"json": <JSON schema object>}` (serialized schema <=64 KiB) or
-`{"json_object": true}`; the worker turns it into vLLM structured outputs. A
+`{"json_object": true}`; the worker turns it into vLLM's `StructuredOutputsParams`. A
 schema that no vLLM structured-output backend accepts ends the stream with
 `invalid_structured_output`. `thinking_token_budget` is an integer in
 [1, max_tokens]; vLLM rejects it with `invalid_sampling_params` unless the

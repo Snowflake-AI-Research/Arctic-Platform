@@ -114,24 +114,24 @@ SCHEMA = {"type": "object", "properties": {"city": {"type": "string"}}}
 
 
 @pytest.mark.parametrize(
-    "structured_output", [{"json": SCHEMA}, {"json": {}}, {"json_object": True}]
+    "structured_outputs", [{"json": SCHEMA}, {"json": {}}, {"json_object": True}]
 )
-def test_structured_output_shapes(structured_output):
-    _, params = validate_request("prompt", {"structured_output": structured_output})
-    assert params["structured_output"] == structured_output
+def test_structured_output_shapes(structured_outputs):
+    _, params = validate_request("prompt", {"structured_outputs": structured_outputs})
+    assert params["structured_outputs"] == structured_outputs
 
 
 def test_structured_output_schema_size_boundary():
     # {"description":"..."} is 18 bytes of framing around the padding.
     at_limit = {"description": "x" * (64 * 1024 - 18)}
-    validate_request("prompt", {"structured_output": {"json": at_limit}})
+    validate_request("prompt", {"structured_outputs": {"json": at_limit}})
     over = {"description": "x" * (64 * 1024 - 17)}
     with pytest.raises(ValueError, match="65536"):
-        validate_request("prompt", {"structured_output": {"json": over}})
+        validate_request("prompt", {"structured_outputs": {"json": over}})
 
 
 @pytest.mark.parametrize(
-    "structured_output",
+    "structured_outputs",
     [
         {},
         {"json": SCHEMA, "json_object": True},
@@ -146,18 +146,23 @@ def test_structured_output_schema_size_boundary():
         ["json_object"],
     ],
 )
-def test_structured_output_rejection(structured_output):
-    with pytest.raises(ValueError, match="structured_output"):
-        validate_request("prompt", {"structured_output": structured_output})
+def test_structured_output_rejection(structured_outputs):
+    with pytest.raises(ValueError, match="structured_outputs"):
+        validate_request("prompt", {"structured_outputs": structured_outputs})
 
 
 def test_structured_output_becomes_the_vllm_type(engine_params):
-    kwargs = engine_params({"structured_output": {"json": SCHEMA}})
-    assert "structured_output" not in kwargs
+    kwargs = engine_params({"structured_outputs": {"json": SCHEMA}})
     assert kwargs["structured_outputs"].kwargs == {"json": SCHEMA}
-    kwargs = engine_params({"structured_output": {"json_object": True}})
+    kwargs = engine_params({"structured_outputs": {"json_object": True}})
     assert kwargs["structured_outputs"].kwargs == {"json_object": True}
     assert "structured_outputs" not in engine_params({})
+
+
+def test_the_singular_structured_output_key_is_unknown():
+    # The stream key is vLLM's name for it, structured_outputs.
+    with pytest.raises(ValueError, match="Unsupported streaming parameters"):
+        validate_request("prompt", {"structured_output": {"json_object": True}})
 
 
 @pytest.mark.parametrize(
