@@ -185,8 +185,6 @@ def _ensure_arctic_vllm_patches() -> None:
         apply_required_vllm_patches,
     )
 
-    # Preserve the fallback's flag-independent full-stack behavior while
-    # installing the same required patches as the plugin entrypoint.
     apply_required_vllm_patches()
     try:
         apply_arctic_patches()

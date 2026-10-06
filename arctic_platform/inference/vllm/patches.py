@@ -472,7 +472,6 @@ def apply_arctic_patches():
     ModelRegistry.register_model("MLPVariantSpeculatorPreTrainedModel",
                                  ArcticLSTMSpeculator)
 
-    # Patch worker initialization before applying worker-local patches later.
     WorkerBasePatch.apply_patch()
 
     # Async scheduler patches for spec decode (disable_by_batch_size
