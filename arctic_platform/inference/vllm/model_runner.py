@@ -1331,8 +1331,20 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        sample_metadata = spec_decode_metadata
+        if grammar_output is not None and spec_decode_metadata is not None:
+            from arctic_platform.inference.vllm.spec_decode_grammar import (
+                reject_unvalidated_drafts,
+            )
+
+            sample_metadata = reject_unvalidated_drafts(
+                grammar_output,
+                self.input_batch.req_ids,
+                spec_decode_metadata,
+            )
+
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(logits, sample_metadata)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output)
