@@ -42,6 +42,32 @@ def test_is_address_in_use_error_walks_exception_chain():
     assert not worker_mod._is_address_in_use_error(RuntimeError("CUDA out of memory"))
 
 
+def test_arctic_patch_fallback_stays_flag_independent(monkeypatch):
+    from arctic_platform.inference.vllm import patches, required_patches
+
+    arg_utils_mod = types.ModuleType("vllm.engine.arg_utils")
+    arg_utils_mod.AsyncEngineArgs = type("AsyncEngineArgs", (), {})
+    monkeypatch.setitem(sys.modules, "vllm.engine.arg_utils", arg_utils_mod)
+    monkeypatch.setenv("ARCTIC_INFERENCE_ENABLED", "0")
+    monkeypatch.setenv("ARCTIC_INFERENCE_SKIP_VERSION_CHECK", "1")
+
+    calls = []
+    monkeypatch.setattr(
+        required_patches,
+        "apply_required_vllm_patches",
+        lambda: calls.append("required"),
+    )
+    monkeypatch.setattr(
+        patches,
+        "apply_arctic_patches",
+        lambda: calls.append("arctic"),
+    )
+
+    worker_mod._ensure_arctic_vllm_patches()
+
+    assert calls == ["required", "arctic"]
+
+
 def test_initialize_retries_vllm_engine_startup_on_address_in_use(monkeypatch):
     calls = []
 
