@@ -202,8 +202,6 @@ class ArcticRLClientWrapper(RemoteBackend):
         to this same backend instance.
 
         Ray transport shares an in-process ``server_state`` actor handle.
-        HTTP reconnects via job ids in ``reconnect_config`` only
-        (``rl_server_state=None``).
         """
         get_state = getattr(self._client.transport, "get_server_state", None)
         return {
@@ -582,19 +580,6 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         log_prob_ds_config = None if n_log_prob_gpus == 0 else self._create_ds_config(n_log_prob_gpus)
 
-        protocol = self._backend_config.comms.protocol
-        onprem_kwargs: dict[str, Any] = {
-            "protocol": protocol,
-            "colocate": colocate,
-        }
-        # host/port only matter for the HTTP transport; the in-process Ray path
-        # never dials them. Auto-spawn the local HTTP server when using HTTP so
-        # recipes do not need a separately started arctic_platform.rl.http_server.
-        if protocol != "ray":
-            onprem_kwargs["host"] = "localhost"
-            onprem_kwargs["port"] = 7000
-            onprem_kwargs["launch_local_server"] = True
-
         # attn_implementation also lives on ds_worker_config; keep it there for
         # the DeepSpeed worker (matches recipe/rl-correctness).
         ds_worker_config = self._create_ds_worker_config()
@@ -607,7 +592,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             training_gpus=n_training_gpus,
             sampling_gpus=n_sampling_gpus,
             log_prob_gpus=n_log_prob_gpus,
-            backend=OnPremConfig(**onprem_kwargs),
+            backend=OnPremConfig(protocol=self._backend_config.comms.protocol, colocate=colocate),
             training=TrainingConfig(
                 full_determinism=self._backend_config.train.determinism.get("full", False),
                 checkpoint_path=self.config.trainer.default_local_dir,

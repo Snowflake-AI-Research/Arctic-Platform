@@ -31,15 +31,13 @@ reset_prefix_cache, sleep_training (all / non_lp / lp_params modes) / wake_train
 sleep/wake_log_prob (graceful no-ops -- no log-prob job here), save_checkpoint, weight_norm (after the final sync,
 asserting the training and sampling engines hold identical weights and produce agreeing log-probs), reconnect_config
 / get_server_state (a second client re-attaches to the live jobs without re-initializing), save_weights (raises
-``NotImplementedError`` on the ray client; a graceful warn-on-error disk-reload stub on the http client),
-shutdown (via the session). Not exercised: ``log_probs``
+``NotImplementedError`` on the ray client), shutdown (via the session). Not exercised: ``log_probs``
 (needs a log-prob engine; this 2-GPU training+sampling topology has none -- covered by test_log_prob_engine).
 ``test_sync_weights_nccl``
 additionally proves a weight update actually propagates to the sampler over the NCCL path. Real prompts go through
 generate; the update uses fake ``advantages`` but real ``old_log_probs`` (recomputed from the policy each step via
-fwd_no_grad), so the clipped ratio starts at 1.0 and every step makes a real gradient step. Covers each transport
-once (``ray``/``http``); the forward path is numerically certified elsewhere, so this trades the full 4-cell
-matrix for a 2-cell diagonal. Heavyweight GPU test; shared infra lives in ``rl_harness``::
+fwd_no_grad), so the clipped ratio starts at 1.0 and every step makes a real gradient step. Runs one ZoRRO
+cell; the forward path is numerically certified elsewhere. Heavyweight GPU test; shared infra lives in ``rl_harness``::
 
     pytest tests/rl/test_e2e.py -s
 
@@ -102,10 +100,8 @@ e2e_lr = 1e-2
 # equal-norms check has teeth. Comfortably above the norm-equality rtol (1e-3); the observed move at e2e_lr is ~1e-2.
 weight_movement_min_rel = 5e-3
 
-# This is integration coverage; the ZoRRO/non-ZoRRO forward is numerically certified by test_train_engine over the
-# full matrix. What differs at the e2e level is the transport (separate ray_server / http_server lifecycle code), so
-# cover each transport once, paired diagonally with one forward path.
-e2e_params = [("ray", True), ("http", False)]
+# This is integration coverage; the ZoRRO/non-ZoRRO forward is numerically certified by test_train_engine.
+e2e_params = [("ray", True)]
 
 # Real prompts for the sampling engine; small max_tokens keeps the rollout within the tiny max_model_len
 # (prompt_len + response_len).
@@ -296,14 +292,10 @@ class TestE2E(TestCasePlus):
             # Disk-based weight reload is deliberately unimplemented on the ray client.
             with self.assertRaises(NotImplementedError):
                 await client.save_weights("/tmp/unused")
-        else:
-            # The http client implements disk-based save_weights as a graceful warn-on-error stub (server-side
-            # reload is not fully implemented), so it posts to /weight-sync and must return without raising.
-            await client.save_weights("/tmp/arl_unused_ckpt")
 
     @parameterized.expand(e2e_params, name_func=parameterized_custom_name_func)
     def test_e2e(self, comm_protocol, zorro_enable):
-        """Run the full GRPO loop for 2 steps over one live client (one case per transport)."""
+        """Run the full GRPO loop for 2 steps over one live client."""
         skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus, colocate)
         self._run_e2e(comm_protocol, zorro_enable)
 
