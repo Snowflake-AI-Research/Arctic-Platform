@@ -224,7 +224,7 @@ def test_structured_output_always_matches_the_schema():
                         "temperature": 0.7,
                         "max_tokens": 256,
                         "seed": seed,
-                        "structured_output": {"json": schema},
+                        "structured_outputs": {"json": schema},
                     },
                 )
                 for seed in range(20)
@@ -398,7 +398,7 @@ def test_real_structured_output_errors_are_classified(schema):
         events = await collect(
             driver,
             "Describe a city as JSON:",
-            {"max_tokens": 16, "structured_output": {"json": schema}},
+            {"max_tokens": 16, "structured_outputs": {"json": schema}},
         )
         assert events[-1]["type"] == "terminal_error", events[-1]
         assert events[-1]["code"] == "invalid_structured_output"
