@@ -103,7 +103,9 @@ is; callers map OpenAI values to the model family's own.
   contains one of the tokenizer's special or added tokens fails the stream with
   `invalid_message_content` and `param` (for example `messages[1]`). Input the
   template or vLLM rejects fails with `invalid_chat_request`, with `param` when
-  vLLM names one. Neither carries message text.
+  vLLM names one. Neither carries message text. A worker that cannot render
+  chat at all (for example, its engine has no tokenizer) or a model with no chat
+  template fails with `chat_unsupported`, logged once per worker.
 - If `max_tokens` is omitted, the budget is `min(context left after the
   rendered prompt, 4096)`. A prompt that leaves no room fails with
   `context_length_exceeded` and `context_limit_source="prompt"`.
@@ -115,7 +117,8 @@ is; callers map OpenAI values to the model family's own.
 - The engine detokenizes as the parsers ask: `skip_special_tokens` and
   `spaces_between_special_tokens` come from the request after the parsers'
   `adjust_request`, as in vllm serve, so tool and reasoning markup made of
-  special tokens reaches the parser.
+  special tokens reaches the parser. A parser failure mid-stream ends it with
+  `engine_error` and is logged by type and stack only.
 - `choice_finished` reports `tool_calls` when a choice that called a tool stops.
   `usage` adds `reasoning_tokens`, counted by the reasoning parser across choices.
 - Undelivered events merge only with the same kind of the same choice; tool-call

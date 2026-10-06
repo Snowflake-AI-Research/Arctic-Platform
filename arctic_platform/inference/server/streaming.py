@@ -80,6 +80,16 @@ class StreamError(RuntimeError):
         self.context_limit_source = context_limit_source
 
 
+def _log_chat_failure(stage, exc):
+    # The message can quote message content, so only the type and stack are logged.
+    logger.error(
+        "Chat %s failed with %s\n%s",
+        stage,
+        type(exc).__name__,
+        "".join(traceback.format_tb(exc.__traceback__)),
+    )
+
+
 def classify_engine_error(exc):
     try:
         from vllm.exceptions import VLLMValidationError
@@ -634,13 +644,18 @@ class EngineStream:
                         else None
                     )
                     if chat is not None:
-                        for event in chat.events(
-                            index,
-                            choice.text,
-                            list(choice.token_ids),
-                            choice.finish_reason is not None,
-                            logprobs,
-                        ):
+                        try:
+                            chat_events = chat.events(
+                                index,
+                                choice.text,
+                                list(choice.token_ids),
+                                choice.finish_reason is not None,
+                                logprobs,
+                            )
+                        except Exception as exc:
+                            _log_chat_failure("parsing", exc)
+                            raise
+                        for event in chat_events:
                             self.buffer.put(event)
                     elif choice.text or choice.token_ids:
                         delta = {
@@ -683,7 +698,12 @@ class EngineStream:
                 "total_tokens": prompt_tokens + sum(counts),
             }
             if chat is not None:
-                usage["reasoning_tokens"] = min(chat.reasoning_tokens(), sum(counts))
+                try:
+                    reasoning_tokens = chat.reasoning_tokens()
+                except Exception as exc:
+                    _log_chat_failure("parsing", exc)
+                    raise
+                usage["reasoning_tokens"] = min(reasoning_tokens, sum(counts))
             self.buffer.put(usage)
             self.buffer.put({"type": "completed"})
             self.buffer.done = True
@@ -723,17 +743,19 @@ class EngineStream:
                 raise StreamError(
                     "context_length_exceeded", context_limit_source="prompt"
                 ) from None
+            if exc.code == "chat_unsupported" and not getattr(
+                self.owner, "_stream_chat_template_logged", False
+            ):
+                # Not cached like a failed ChatEngine: a template can exist
+                # only for requests with tools.
+                self.owner._stream_chat_template_logged = True
+                logger.error("Chat mode is unavailable: the model has no chat template")
             raise StreamError(exc.code, param=exc.param) from None
         except StreamError:
             raise
         except Exception as exc:
-            # Not the client's input: a bug or a vLLM API change. The message can
-            # quote message content, so only the type and stack are logged.
-            logger.error(
-                "Chat render failed with %s\n%s",
-                type(exc).__name__,
-                "".join(traceback.format_tb(exc.__traceback__)),
-            )
+            # Not the client's input: a bug or a vLLM API change.
+            _log_chat_failure("render", exc)
             raise
         room = self.owner.llm.model_config.max_model_len - rendered.prompt_tokens
         if room <= 0:
@@ -864,9 +886,9 @@ class StreamingWorkerMixin:
                     reasoning_parser=getattr(self, "_reasoning_parser_name", None),
                 )
             except Exception:
-                # E.g. skip_tokenizer_init, a model with no chat template, or a
-                # vLLM API change. Logged and remembered once; the engine
-                # doesn't change, so rebuilding on every request can't succeed.
+                # E.g. skip_tokenizer_init or a vLLM API change (a missing chat
+                # template only shows at render). Logged and remembered once;
+                # the engine doesn't change, so rebuilding can't succeed.
                 logger.exception("Chat mode is unavailable on this worker")
                 engine = False
             self._stream_chat_engine = engine

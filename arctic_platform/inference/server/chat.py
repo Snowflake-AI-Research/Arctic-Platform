@@ -176,6 +176,7 @@ class ChatEngine:
 
     async def render(self, prompt):
         from jinja2 import TemplateError
+        from vllm.entrypoints.chat_utils import ChatTemplateResolutionError
         from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
         from vllm.entrypoints.serve.engine.protocol import ErrorResponse
         from vllm.exceptions import VLLMClientError
@@ -195,6 +196,9 @@ class ChatEngine:
                 **{key: value for key, value in fields.items() if value is not None}
             )
             result = await self.online.render_chat(request)
+        except ChatTemplateResolutionError:
+            # The model has no chat template (for these tools): not the client's fault.
+            raise ChatInputError("chat_unsupported") from None
         except (TemplateError, ValueError, VLLMClientError) as exc:
             # Client input the template or vLLM's request model rejected. The
             # message may quote content, so only the field name leaves here.

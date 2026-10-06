@@ -571,6 +571,9 @@ def _stub_vllm_chat_modules(monkeypatch):
     modules = {
         "jinja2": {"TemplateError": type("TemplateError", (Exception,), {})},
         "vllm.entrypoints": {},
+        "vllm.entrypoints.chat_utils": {
+            "ChatTemplateResolutionError": type("ChatTemplateResolutionError", (ValueError,), {})
+        },
         "vllm.entrypoints.openai": {},
         "vllm.entrypoints.openai.chat_completion": {},
         "vllm.entrypoints.openai.chat_completion.protocol": {
@@ -687,3 +690,52 @@ def test_engine_detokenizes_as_the_parser_asked(monkeypatch, adjust_request, ski
     assert params["skip_special_tokens"] is skip
     assert params["spaces_between_special_tokens"] is spaces
 
+
+class _FailingParser(ScriptParser):
+    def __init__(self, fail_in):
+        super().__init__()
+        self.fail_in = fail_in
+        # Built here, not in the raise line: the logged stack quotes source lines.
+        self.secret = " ".join(["secret", "user", "text"])
+
+    def parse_delta(self, *args, **kwargs):
+        if self.fail_in == "parse_delta":
+            raise RuntimeError(self.secret)
+        return super().parse_delta(*args, **kwargs)
+
+    def count_reasoning_tokens(self, token_ids):
+        if self.fail_in == "count_reasoning_tokens":
+            raise RuntimeError(self.secret)
+        return super().count_reasoning_tokens(token_ids)
+
+
+@pytest.mark.parametrize("fail_in", ["parse_delta", "count_reasoning_tokens"])
+def test_parser_failure_mid_stream_is_logged_without_its_message(caplog, fail_in):
+    engine = FakeChatEngine(parser=lambda: _FailingParser(fail_in))
+    with caplog.at_level("ERROR"):
+        _, events = stream(chat("hi"), chat_engine=engine)
+    assert events[-1]["code"] == "engine_error"
+    [record] = [r for r in caplog.records if "pars" in r.getMessage().lower()]
+    assert "RuntimeError" in record.getMessage()
+    assert "secret user text" not in caplog.text
+
+
+def test_model_without_a_chat_template_is_chat_unsupported(monkeypatch, caplog):
+    import sys
+
+    _stub_vllm_chat_modules(monkeypatch)
+    error = sys.modules["vllm.entrypoints.chat_utils"].ChatTemplateResolutionError
+    engine = _engine_whose_renderer_raises(error("you must provide a chat template"))
+
+    async def run_twice():
+        worker = make_worker(chat_engine=engine)
+        return [await run_stream(worker, chat("hi")) for _ in range(2)]
+
+    with caplog.at_level("ERROR"):
+        results = asyncio.run(run_twice())
+    for events in results:
+        assert kinds(events) == ["terminal_error"]
+        assert events[0]["code"] == "chat_unsupported"
+        assert "param" not in events[0]
+    [record] = [r for r in caplog.records if "chat template" in r.getMessage().lower()]
+    assert record.levelname == "ERROR"
