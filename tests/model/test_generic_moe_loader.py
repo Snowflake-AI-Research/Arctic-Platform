@@ -67,9 +67,7 @@ def test_legacy_minimax_config_uses_custom_impl(tmp_path):
     assert config.pad_token_id is None
     assert config.rope_scaling is None
     assert config.use_grouped_mm is True
-    assert config.partial_rotary_factor == pytest.approx(
-        config.rotary_dim / config.head_dim
-    )
+    assert config.partial_rotary_factor == pytest.approx(config.rotary_dim / config.head_dim)
     assert config.rope_parameters["partial_rotary_factor"] == pytest.approx(0.5)
 
 
