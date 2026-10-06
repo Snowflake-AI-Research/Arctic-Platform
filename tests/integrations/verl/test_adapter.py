@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import sys
+import types
 
 import pytest
 
@@ -70,6 +72,52 @@ def test_requires_single_forwarder_returns_true(verl_stub) -> None:
 
     wrapper = adapter.ArcticRLClientWrapper.__new__(adapter.ArcticRLClientWrapper)
     assert wrapper.requires_single_forwarder() is True
+
+
+def test_cortex_patch_is_installed_in_each_calling_process(verl_stub, monkeypatch) -> None:
+    """Cortex selection must install /forward support in the current process.
+
+    Ray WorkerDict actors do not inherit the TaskRunner's class monkeypatch.
+    """
+    adapter = _adapter(verl_stub)
+    calls = []
+    fake = types.ModuleType("arctic_platform.client.transports.cortex_forward")
+    fake.patch_cortex_transport = lambda: calls.append("patched")
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+
+    monkeypatch.setenv("ARCTIC_BACKEND", "cortex")
+    assert adapter._patch_cortex_transport_if_needed() is True
+    assert calls == ["patched"]
+
+    monkeypatch.setenv("ARCTIC_BACKEND", "onprem")
+    assert adapter._patch_cortex_transport_if_needed() is False
+    assert calls == ["patched"]
+
+
+def test_cortex_ds_config_drops_offload_keys(verl_stub) -> None:
+    """``offload_optimizer: {device: none}`` still constructs CPUAdam on Cortex."""
+    adapter = _adapter(verl_stub)
+    ds = {
+        "zero_optimization": {
+            "stage": 2,
+            "offload_optimizer": {"device": "none"},
+            "offload_param": {"device": "none"},
+        }
+    }
+    adapter._strip_cortex_zero_offload(ds)
+    zero = ds["zero_optimization"]
+    assert "offload_optimizer" not in zero
+    assert "offload_param" not in zero
+    assert zero["stage"] == 2
+
+
+def test_merge_cortex_update_metrics_reads_top_level_loss(verl_stub) -> None:
+    adapter = _adapter(verl_stub)
+    merged = adapter._merge_cortex_update_metrics({"batch": {}}, {"loss": 1.25, "grad_norm": 0.4})
+    assert merged["loss"] == 1.25
+    assert merged["grad_norm"] == 0.4
+    merged = adapter._merge_cortex_update_metrics({"metrics": {"avg_loss": 0.5}}, {})
+    assert merged["loss"] == 0.5
 
 
 def test_destroy_is_idempotent(verl_stub) -> None:
