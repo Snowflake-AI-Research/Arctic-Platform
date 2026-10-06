@@ -175,6 +175,9 @@ class ReplicaPool:
         self._config: ModelConfig | None = None
         self._model_id: str | None = None
         self._workers: list[ray.actor.ActorHandle] = []
+        # The non-leader halves of a semi-p engine that spans pods. Empty in
+        # every other configuration, including single-node semi-p.
+        self._semip_agents: list[ray.actor.ActorHandle] = []
         # ``(node_id, slot)`` per worker, parallel to ``_workers``. See
         # ``_node_slots``.
         self._slots: list[tuple[Any, int]] = []
@@ -255,6 +258,67 @@ class ReplicaPool:
         """
         return self._engine_pg is not None
 
+    def _is_semip_per_node(self) -> bool:
+        """Whether this pool is one semi-p engine spread over whole pods.
+
+        Two conditions, and both matter. ``semi_p`` because only a restored
+        engine works this way -- a cold vLLM engine across nodes uses the Ray
+        executor and the 0-GPU coordinator above. A bundle count below the
+        world size because that is what distinguishes a per-node placement
+        group (``nnodes`` bundles of 8 GPUs) from the per-rank one
+        (``world_size`` bundles of 1).
+        """
+        if self._engine_pg is None:
+            return False
+        if not bool(getattr(self._config, "semi_p", False)):
+            return False
+        bundles = getattr(self._engine_pg, "bundle_specs", None) or []
+        return 0 < len(bundles) < self.world_size
+
+    def _nnodes(self) -> int:
+        bundles = getattr(self._engine_pg, "bundle_specs", None) or []
+        return len(bundles)
+
+    def _local_gpus(self) -> int:
+        """GPUs one node of a per-node placement holds."""
+        return self.world_size // max(self._nnodes(), 1)
+
+    def _node_bundle_options(self, bundle_index: int,
+                             num_gpus: int) -> dict[str, Any]:
+        """Actor options pinning a half to its own node's bundle.
+
+        ``capture_child_tasks`` is deliberately absent: this actor's children
+        are the semi-p worker and the vLLM child, which are plain processes on
+        this pod rather than Ray tasks, and capturing would scope them to a
+        bundle they do not draw resources from.
+        """
+        options: dict[str, Any] = dict(
+            num_gpus=num_gpus,
+            max_concurrency=2048,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=self._engine_pg,
+                placement_group_bundle_index=bundle_index,
+            ),
+        )
+        worker_env = {
+            k: str(v) for k, v in (self._config.extra_env or {}).items()
+        }
+        if worker_env:
+            options["runtime_env"] = {"env_vars": worker_env}
+        return options
+
+    def _make_semip_agents(self) -> list[ray.actor.ActorHandle]:
+        """One agent per non-leader node, each owning that pod's GPUs."""
+        from arctic_platform.inference.server.semip_agent import SemipNodeAgent
+
+        local = self._local_gpus()
+        return [
+            SemipNodeAgent.options(
+                **self._node_bundle_options(k, local)
+            ).remote()
+            for k in range(1, self._nnodes())
+        ]
+
     def _make_worker(self) -> ray.actor.ActorHandle:
         """Create one inference-worker actor.
 
@@ -262,7 +326,18 @@ class ReplicaPool:
         vLLM engine (unchanged). Multi-node: the actor is a 0-GPU coordinator
         pinned into a cross-node PG; vLLM inherits that PG via
         ``get_current_placement_group()`` and schedules one rank per bundle.
+
+        Semi-p multi-node is neither. Its engine is restored from a CRIU image
+        rather than constructed, so there is no vLLM Ray executor to inherit a
+        PG and no per-rank actor to schedule: the leader owns a real
+        ``Instance`` driving this pod's whole GPU set, and a ``SemipNodeAgent``
+        owns the other pod's. So the leader reserves ``world_size / nnodes``
+        GPUs in bundle 0 and keeps the mp backend.
         """
+        if self._is_semip_per_node():
+            return self._worker_cls.options(
+                **self._node_bundle_options(0, self._local_gpus())
+            ).remote()
         if self._is_multi_node():
             options: dict[str, Any] = dict(
                 num_gpus=0,
@@ -317,6 +392,30 @@ class ReplicaPool:
             raise ValueError(
                 "caller-provided placement group must expose bundle_specs"
             )
+        total_gpus = sum(float(b.get("GPU", 0)) for b in bundle_specs)
+        per_node = (bool(getattr(config, "semi_p", False))
+                    and len(bundle_specs) != expected
+                    and total_gpus == expected)
+        if per_node:
+            # Semi-p across nodes places whole pods, not ranks: `nnodes`
+            # bundles whose GPUs sum to the world size. The engine is restored
+            # from an image rather than built by vLLM's Ray executor, so there
+            # is no per-rank actor for a per-rank bundle to hold.
+            if expected % len(bundle_specs):
+                raise ValueError(
+                    f"semi_p placement group has {len(bundle_specs)} bundles "
+                    f"for a world size of {expected}, which does not divide "
+                    f"evenly; the halves would hold different rank counts and "
+                    f"deadlock in their first collective"
+                )
+            sizes = {float(b.get("GPU", 0)) for b in bundle_specs}
+            if len(sizes) != 1:
+                raise ValueError(
+                    f"semi_p placement group bundles hold different GPU "
+                    f"counts ({sorted(sizes)}); every node of one engine must "
+                    f"hold the same number of ranks"
+                )
+            return
         if len(bundle_specs) != expected:
             raise ValueError(
                 "caller-provided placement group has "
@@ -337,6 +436,16 @@ class ReplicaPool:
     ) -> dict[str, Any]:
         """Build engine kwargs and enforce the multi-node Ray executor."""
         kwargs = config.to_engine_kwargs()
+        if multi_node and bool(getattr(config, "semi_p", False)):
+            # A semi-p engine is restored, not constructed, so there is no Ray
+            # executor to place: each half runs its own mp-backed executor over
+            # its pod's GPUs, and the leader's spans both once NCCL is
+            # re-initialized. Forcing "ray" here would hand vLLM a backend it
+            # never gets to use and override the mp backend the image was
+            # dumped with -- which has to match, because criu_restore compares
+            # the config byte for byte.
+            kwargs.setdefault("distributed_executor_backend", "mp")
+            return kwargs
         if multi_node:
             backend = kwargs.get("distributed_executor_backend")
             if backend not in (None, "ray"):
@@ -565,6 +674,14 @@ class ReplicaPool:
         slots = _node_slots(node_ids)
         self._slots = [(node, slot) for node, (slot, _) in zip(node_ids, slots)]
 
+        if self._semip_agents:
+            # The leader drives the other halves from inside restore_and_wrap,
+            # so the handles have to reach it. They travel in engine_kwargs
+            # beside the semi_p flag itself, and InferenceWorker.initialize
+            # pops both before AsyncEngineArgs ever sees them.
+            engine_kwargs = {**engine_kwargs,
+                             "semi_p_agents": list(self._semip_agents)}
+
         for start in range(0, n, concurrency):
             batch = self._workers[start : start + concurrency]
             refs = []
@@ -640,15 +757,27 @@ class ReplicaPool:
 
         n = num_replicas
         multi_node = self._is_multi_node()
+        per_node = self._is_semip_per_node()
+        if per_node:
+            shape = (f"semi_p across {self._nnodes()} nodes: leader + "
+                     f"{self._nnodes() - 1} agent(s), "
+                     f"{self._local_gpus()} GPUs each")
+        elif multi_node:
+            shape = "multi-node: 0-GPU coordinator + cross-node PG"
+        else:
+            shape = "single-node"
         logger.info(
             f"Creating {n} workers (TP={self.tp_size}, PP={self.pp_size}, "
-            f"world_size={self.world_size}, "
-            f"{'multi-node: 0-GPU coordinator + cross-node PG' if multi_node else 'single-node'})"
+            f"world_size={self.world_size}, {shape})"
         )
 
         extra_env = self._config.extra_env or None
         try:
             self._workers = []
+            if per_node:
+                # Created before the leader initializes: its restore_and_wrap
+                # drives them, so they have to exist by the time it runs.
+                self._semip_agents = self._make_semip_agents()
             for _ in range(n):
                 self._workers.append(self._make_worker())
             await self._initialize_workers(engine_kwargs, extra_env)

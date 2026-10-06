@@ -678,10 +678,14 @@ class InferenceWorker(StreamingWorkerMixin):
         # dss that predates the derived image cache still sends it, and
         # BaseConfig's extra="allow" would carry it into AsyncEngineArgs.
         engine_kwargs.pop("semi_p_model_dir", None)
+        # The other halves of an engine whose TP group spans pods. Popped the
+        # same way and for the same reason: AsyncEngineArgs rejects what it
+        # does not know, and Ray actor handles are certainly that.
+        semi_p_agents = engine_kwargs.pop("semi_p_agents", None)
         if semi_p:
             from arctic_platform.inference.server.semip_engine import restore_and_wrap
             self.llm = await asyncio.to_thread(
-                restore_and_wrap, engine_kwargs)
+                restore_and_wrap, engine_kwargs, semi_p_agents)
             self.state = WorkerLifecycleState.READY
             self._maybe_init_reasoning_parser(reasoning_parser_name)
             logger.info(
