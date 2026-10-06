@@ -34,6 +34,8 @@ ordinary availability restoration after weight sync. Replacing the worker clears
 the scheduler quarantine; an unhealthy worker also rejects direct generation.
 If worker completion precedes delivery of `completed` to the caller, cancellation
 of the still-registered public request returns `already_terminal`, not `not_found`.
+A request whose cleanup was unconfirmed keeps answering `cleanup_unconfirmed`,
+after retirement and on every repeated abort, rather than `already_terminal`.
 
 ## Contract
 
@@ -52,8 +54,10 @@ successfully. A `terminal_error` contains a sanitized `code`, never successful
 completion. The pinned vLLM context-window validation error, identified by its
 structured `input_tokens` parameter with a narrow legacy-message fallback, maps
 to `context_length_exceeded`; other unexpected engine exceptions map to
-`engine_error`. Transport failures and local cancellation can raise instead of
-delivering an event. EOF without completed is an error.
+`engine_error`. If the stream's cleanup after that error is unconfirmed, the
+delivered `code` is `cleanup_unconfirmed` instead and `context_limit_source` is
+omitted, because the engine may still be running the request. Transport failures
+and local cancellation can raise instead of delivering an event. EOF without completed is an error.
 
 Inputs are one prepared text prompt or token-ID list. Supported sampling parameters:
 temperature, top_p, frequency_penalty, presence_penalty, max_tokens, stop, n,
