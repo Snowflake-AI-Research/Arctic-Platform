@@ -53,9 +53,8 @@ that clears that bar today.
 
 ## Design in place (this package)
 - `Transport` ABC + `JobHandles` + `Request` (single op vocabulary in `requests.py`).
-- `OnPremTransport` base: job creation, ordering, payload building. Concrete
-  transports implement only the delivery primitives (`_start`, `call`, `_destroy`,
-  `_wait_running`); `call` posts/dispatches the op against its target job.
+- `OnPremTransport`: job creation, ordering, payload building, and in-process Ray
+  delivery; `call` dispatches the op against its target job.
 - `JOB_CREATE_ORDER` + `ArcticClientConfig.gpus_for()` centralize GPU-gating and
   creation order so transports no longer hand-roll them.
 
@@ -102,8 +101,8 @@ wires:
 (and call `build_model(ModelSpec)`) directly — do not grow new translation
 logic here; change the server instead.
 
-## On-prem Ray transport
-`RayTransport` makes in-process Ray actor calls — no HTTP, no serialization. The
+## On-prem transport
+`OnPremTransport` makes in-process Ray actor calls. The
 server splits into a `state` actor (job creation) and an `ArcticRLRayServer`
 wrapper (typed async ops) that snapshots workers at construction, so the wrapper
 is built lazily after jobs are initialized. `call` resolves `op -> method` and

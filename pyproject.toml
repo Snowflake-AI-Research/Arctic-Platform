@@ -118,40 +118,32 @@ gdn = [
     "causal-conv1d",
 ]
 
-# Shared DSSST1 tensor wire format.
-wire = [
-    "numpy",
-    "safetensors",
-    "torch",
-]
-
-# HTTP clients shared by Cortex and on-prem transports.
-transport = [
-    "arctic_platform[wire]",
-    "aiohttp",
-    "requests",
-]
-
-# The client, talking to Cortex over SnowAPI.
+# The client, talking to Cortex over SnowAPI (DSSST1 tensor wire format).
 cortex = [
-    "arctic_platform[transport]",
+    "aiohttp",
+    "numpy",
+    "requests",
+    "safetensors",
     "tenacity",
+    "torch",
     "urllib3",
 ]
 
 # A training-only on-prem server, plus the client that drives it. Deliberately
-# excludes the sampling stack: both servers import arctic_inference lazily so
+# excludes the sampling stack: the server imports arctic_inference lazily so
 # this install can serve training without vLLM.
 sft = [
-    "arctic_platform[transport]",
     "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
     "liger-kernel>=0.8.0",
+    "numpy",
     "nvidia-ml-py",
     # 0.20+ imports EmbeddingParallel only when a tensor-parallel LoRA module is present.
     "peft>=0.21.2,<0.22",
     "psutil",
     "ray",
+    "safetensors",
     "tensordict",
+    "torch",
     # GLM-5.3-Flash and Qwen3.8-Flash-Next need the Transformers 5.17 model modules.
     "transformers>=5.17,<5.18",
 ]
