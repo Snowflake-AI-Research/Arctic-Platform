@@ -32,6 +32,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 from types import SimpleNamespace
 from typing import Any, NamedTuple
 
@@ -140,6 +141,39 @@ _WEIGHT_DIR = "weight"
 _REPLICA_DIR_PREFIX = "replica"
 _REPLICA_ID_ENV = "SEMIP_REPLICA_ID"
 _NUM_REPLICAS_ENV = "SEMIP_NUM_REPLICAS"
+
+# One engine spanning N pods puts each half under <key>/node<k>/. This is a
+# different axis from replica<K> and the two do not nest in practice: a
+# node-spanning engine is a single replica by construction (its placement group
+# holds the whole world_size), so a key carries node<k>/ or replica<K>/ and
+# never both.
+#
+# Weights stay at the key level, not under node<k>/: the shards are named by
+# global rank across the whole group (rank0..rank15), and a restore onto a
+# different pod pair has to find all of them in one place. The publisher holds
+# a pinned copy of this spelling, like _REPLICA_DIR_PREFIX.
+_NODE_DIR_PREFIX = "node"
+
+# The interface a node-spanning group rendezvouses and runs NCCL on. dss pins
+# NCCL_SOCKET_IFNAME=^lo into a multi-node job's extra_env, which names no
+# interface; semi-p needs one it can bind, account for in the socket census and
+# close before the dump.
+_MULTINODE_IFNAME_ENV = "SEMIP_IFNAME"
+_DEFAULT_MULTINODE_IFNAME = "eth0"
+
+# A multi-node cold start has to outlast its slowest half's weight load. On a
+# pod whose page cache is cold that was 25 minutes for GLM-5.3, and gloo's own
+# rendezvous timeout is 1800 s -- so a shorter wait here would fail jobs that
+# were about to succeed, and one no longer than gloo's would race it.
+_MULTINODE_INIT_TIMEOUT_S = 3600.0
+
+# Everything else a half does is local work on an image that already exists.
+_MULTINODE_STEP_TIMEOUT_S = 900.0
+
+
+def _multinode_ifname() -> str:
+    return (os.environ.get(_MULTINODE_IFNAME_ENV)
+            or _DEFAULT_MULTINODE_IFNAME).strip() or _DEFAULT_MULTINODE_IFNAME
 
 # Stamped by the neutrino-model-cache DaemonSet once it has verified every file
 # in a directory against the per-file SHA-256 in that directory's bucket
@@ -496,7 +530,7 @@ def _vllm_config_from_engine_kwargs(
 
 
 def _check_tp_matches_gpus(vllm_config: dict[str, Any],
-                           gpus: list[int]) -> None:
+                           gpus: list[int], nnodes: int = 1) -> None:
     """Reject a job whose TP degree disagrees with its GPU assignment.
 
     TP size comes from the config and the GPU list is placement only, so a
@@ -510,11 +544,26 @@ def _check_tp_matches_gpus(vllm_config: dict[str, Any],
     matching ``meta.json`` byte for byte for ``criu_restore``. So an image is
     indeed found only by a job that landed on the same devices -- deliberately,
     because it is restorable only there.
+
+    At ``nnodes > 1`` the TP group is split across pods, so what this node
+    holds is ``tp / nnodes`` GPUs. The split has to be exact: a TP group whose
+    halves have different rank counts deadlocks in its first collective rather
+    than failing, which is the kind of error worth catching before the zone is
+    even up.
     """
     tp = int(vllm_config.get("tensor_parallel_size", 1) or 1)
-    if tp != len(gpus):
+    nnodes = int(nnodes or 1)
+    if nnodes > 1 and tp % nnodes:
         raise RuntimeError(
-            f"semi_p: vllm_config.tensor_parallel_size={tp} but Ray assigned "
+            f"semi_p: vllm_config.tensor_parallel_size={tp} does not divide "
+            f"evenly over {nnodes} nodes, so the halves would hold different "
+            f"numbers of ranks and deadlock in their first collective")
+    expected = tp // nnodes
+    if expected != len(gpus):
+        where = (f" on this node (tensor_parallel_size={tp} over {nnodes} "
+                 f"nodes)" if nnodes > 1 else "")
+        raise RuntimeError(
+            f"semi_p: expected {expected} GPU(s){where} but Ray assigned "
             f"this replica {len(gpus)} GPU(s) ({gpus}). Each replica gets "
             f"exactly tensor_parallel_size GPUs, so inference_config.n_gpus "
             f"must be a multiple of inference_config.vllm_config."
@@ -799,6 +848,10 @@ class _ImagePaths(NamedTuple):
     ``replica_slot`` / ``replica_count`` are this replica's place in its pod
     (see ``_replica_slot``); with a count above 1 ``model_dir`` ends in
     ``replica<slot>``.
+
+    ``key_dir`` is ``model_dir`` without any ``replica<K>`` / ``node<k>``
+    level. A node-spanning engine needs it because its two halves share one
+    weight directory there, named by global rank rather than by node.
     """
     model_dir: str
     key_prefix: str
@@ -808,6 +861,9 @@ class _ImagePaths(NamedTuple):
     driver_version: str
     replica_slot: int = 0
     replica_count: int = 1
+    key_dir: str = ""
+    nnodes: int = 1
+    node_rank: int = 0
 
 
 def _replica_slot() -> tuple[int, int]:
@@ -833,7 +889,8 @@ def _replica_slot() -> tuple[int, int]:
     return slot, count
 
 
-def _resolve_model_dir(vllm_config: dict[str, Any]) -> _ImagePaths:
+def _resolve_model_dir(vllm_config: dict[str, Any],
+                       node_rank: int = 0) -> _ImagePaths:
     """Derive the image directory from the config and the environment.
 
     ``model_dir`` is derived rather than supplied, which is what lets a dump
@@ -858,9 +915,20 @@ def _resolve_model_dir(vllm_config: dict[str, Any]) -> _ImagePaths:
     cfg_hash = _config_hash(vllm_config, device_nodes)
     env_hash, image_ref, driver = _env_hash()
     key = f"{cfg_hash}_{env_hash}"
-    model_dir = os.path.join(root, key)
+    key_dir = os.path.join(root, key)
+    model_dir = key_dir
     if count > 1:
         model_dir = os.path.join(model_dir, f"{_REPLICA_DIR_PREFIX}{slot}")
+    # A node-spanning engine puts each half under ``node<k>/`` of one shared
+    # key. The key is identical on both pods -- ``nnodes`` is in the config and
+    # node identity deliberately is not, and both pods expose the same device
+    # set (nvidia0-7, uverbs0-15) -- so this level is what keeps two halves of
+    # one image from writing over each other. Their weights stay at the key
+    # level, because the shards are per rank across the whole group rather than
+    # per node.
+    nnodes = int((vllm_config or {}).get("nnodes", 1) or 1)
+    if nnodes > 1:
+        model_dir = os.path.join(model_dir, f"{_NODE_DIR_PREFIX}{node_rank}")
 
     raw_source = os.environ.get(_IMAGE_SOURCE_ENV)
     if raw_source is None:
@@ -895,13 +963,16 @@ def _resolve_model_dir(vllm_config: dict[str, Any]) -> _ImagePaths:
 
     logger.info(
         "semi_p: resolved model_dir=%s (config=%s over %s, env=%s from image "
-        "%s driver %s, replica slot %d of %d); published skeletons %s",
+        "%s driver %s, replica slot %d of %d%s); published skeletons %s",
         model_dir, cfg_hash,
         f"devices {','.join(device_nodes)}" if device_nodes
         else "no device binding (TP=1)", env_hash, image_ref, driver,
-        slot, count, skeleton_root or "not configured")
+        slot, count,
+        f", node {node_rank} of {nnodes}" if nnodes > 1 else "",
+        skeleton_root or "not configured")
     return _ImagePaths(model_dir, key, skeleton_root, weight_root,
-                       image_ref, driver, slot, count)
+                       image_ref, driver, slot, count, key_dir, nnodes,
+                       node_rank)
 
 
 def _model_slug(model: Any) -> str:
@@ -2297,6 +2368,348 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
                         model=baked.get("model"))
 
 
+# ---------------------------------------------------------------------------
+# Multi-node: one engine whose TP group spans pods
+# ---------------------------------------------------------------------------
+#
+# The leader owns ranks 0..local-1 and serves; each agent owns the next block
+# and never serves. Every collective is the leader's, because its executor
+# spans both halves -- so these functions only sequence the steps the leader
+# cannot reach into the other pod to do: that pod's CRIU image, its CUDA state,
+# and its end of the message-queue plane.
+#
+# Joint or nothing. A half that cold-starts while the other restores would
+# rendezvous with a group that does not exist, and the failure mode is a
+# deadlock in the first collective rather than an error. So a hit requires
+# every half to hold an image from the *same* dump, which is what ``dump_id``
+# identifies; anything else makes both halves cold-start and dump together.
+
+
+def _leader_ip() -> str:
+    """This pod's address on the network the other half will reach it on."""
+    import ray
+    return ray.util.get_node_ip_address()
+
+
+def _node_ranks(node_rank: int, local: int) -> list[int]:
+    """The global ranks node *node_rank* owns."""
+    return list(range(node_rank * local, (node_rank + 1) * local))
+
+
+def _joint_weights_dir(paths: _ImagePaths) -> str:
+    """Where both halves put their shards.
+
+    At the key level rather than under ``node<k>/``: the shards are named by
+    global rank (rank0..rank15), and a restore onto a different pod pair has to
+    find all of them in one place.
+    """
+    return os.path.join(paths.key_dir or paths.model_dir, _WEIGHT_DIR)
+
+
+def _check_digests(agents: list[Any], vllm_config: dict[str, Any]) -> None:
+    """Refuse to cold-start halves that would build different engines.
+
+    The halves profile their shapes independently and then meet in a
+    collective. A disagreement there does not raise -- it deadlocks, for the
+    full gloo timeout, with nothing in either log that names the field. This
+    costs one Ray round trip to turn that into an error.
+    """
+    import ray
+    mine = _config_hash(vllm_config)
+    theirs = ray.get([a.config_digest.remote(vllm_config) for a in agents])
+    bad = [(k + 1, d) for k, d in enumerate(theirs) if d != mine]
+    if bad:
+        raise RuntimeError(
+            f"semi_p: the halves of this engine disagree about its config: "
+            f"leader={mine}, " + ", ".join(f"node{k}={d}" for k, d in bad) +
+            ". Both halves must build the same engine or they deadlock in "
+            "their first collective.")
+
+
+def _prefetch_weights(weights_dir: str, ranks: list[int]) -> Any:
+    """Warm the page cache for this node's shards, in the background.
+
+    A pod that did not dump reads its shards from disk cold, and that read is
+    the whole difference between a same-pod restore and a swapped one (33 s
+    against 8 s, measured). The CRIU, CUDA and NCCL steps that come first do
+    not touch the disk, so the read is free if it happens under them.
+
+    Best effort by construction: a failure here costs the speedup and nothing
+    else, because ``load_weights`` reads the same files itself afterwards.
+    """
+    import threading
+
+    def _read():
+        for rank in ranks:
+            rank_dir = os.path.join(weights_dir, f"rank{rank}")
+            try:
+                names = sorted(os.listdir(rank_dir))
+            except OSError:
+                continue
+            for name in names:
+                try:
+                    with open(os.path.join(rank_dir, name), "rb") as handle:
+                        while handle.read(8 << 20):
+                            pass
+                except OSError:
+                    break
+
+    thread = threading.Thread(target=_read, name="semip-prefetch", daemon=True)
+    thread.start()
+    return thread
+
+
+def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
+                    gpus: list[int], agents: list[Any], *,
+                    master_port: int, ifname: str,
+                    image_ref: str, driver_version: str) -> None:
+    """Cold-start every half together and dump them as one image.
+
+    The ordering is the experiment's, and each step is where it is for a
+    reason:
+
+    * both halves ``init`` concurrently, because they rendezvous inside vLLM
+      and neither returns until both have arrived;
+    * the leader alone generates and stages, since its executor covers every
+      rank;
+    * the leader checkpoints CUDA first -- that is what drops the graphs and
+      tears NCCL down across *all* ranks -- and the agents follow;
+    * the leader's ``criu_dump`` parks every rank's message queue as its last
+      collective step, so each agent waits for its own ranks to be parked
+      before dumping. Their calls are issued first and queue on the actor, so
+      the wait overlaps the leader's dump rather than following it.
+    """
+    import ray
+    from arctic_platform.inference.semi_persistence import Instance, MultiNode
+
+    nnodes = paths.nnodes
+    local = len(gpus)
+    dump_id = uuid.uuid4().hex
+    dump_ip = _leader_ip()
+    weights_dir = _joint_weights_dir(paths)
+    model_dir = paths.model_dir
+
+    _check_digests(agents, vllm_config)
+
+    t0 = time.perf_counter()
+    pid_floor = _raise_pid_floor()
+
+    def _meta(node_rank: int) -> dict[str, Any]:
+        return {"image_ref": image_ref, "driver_version": driver_version,
+                "pid_floor": pid_floor, "unprivileged": _unprivileged_mode(),
+                "nnodes": nnodes, "node_rank": node_rank,
+                "dump_id": dump_id, "dump_ip": dump_ip}
+
+    os.makedirs(model_dir, exist_ok=True)
+    inst = Instance(vllm_config, model_dir,
+                    multinode=MultiNode(node_rank=0, master_addr=dump_ip,
+                                        master_port=int(master_port),
+                                        ifname=ifname))
+    logger.info("semi_p: multi-node cold start, %d nodes, dump_id=%s, "
+                "rendezvous %s:%d on %s", nnodes, dump_id, dump_ip,
+                master_port, ifname)
+    started = [
+        agent.init.remote(
+            vllm_config,
+            os.path.join(paths.key_dir, f"{_NODE_DIR_PREFIX}{k + 1}"),
+            _agent_gpus(local), k + 1, nnodes, dump_ip, int(master_port),
+            ifname)
+        for k, agent in enumerate(agents)]
+    try:
+        inst.init(gpus=gpus)
+        # Both halves load weights from disk here, and on fresh nodes that read
+        # dominates: 25 min for GLM-5.3 on a cold page cache. gloo's own
+        # rendezvous timeout is 1800 s, so this wait has to be longer than the
+        # thing it is waiting for or it fails the job for being slow.
+        ray.get(started, timeout=_MULTINODE_INIT_TIMEOUT_S)
+        inst.wait()
+        inst.generate([_DUMP_PROMPT], _DUMP_SAMPLING)
+        inst.attach()
+        inst.stage()
+        inst.save_weights(weights_dir=weights_dir)
+        inst.detach()
+        inst.sleep()
+        inst.arm_mq_park(ranks=list(range(local)))
+        # Drops the graphs and tears NCCL down across every rank, including the
+        # agents'. Theirs must follow, not lead.
+        inst.cuda_checkpoint()
+        inst.wait()
+        ray.get([agent.cuda_checkpoint.remote() for agent in agents])
+        # Issued before the leader's dump so the wait inside them overlaps it.
+        dumping = []
+        for k, agent in enumerate(agents):
+            agent.wait_parked.remote()
+            dumping.append(agent.criu_dump.remote(_meta(k + 1)))
+        inst.criu_dump(meta_extra=_meta(0))
+        inst.wait()
+        ray.get(dumping)
+    except BaseException:
+        try:
+            inst.teardown()
+        except Exception:  # noqa: BLE001
+            logger.warning("semi_p: leader teardown after a failed multi-node "
+                           "dump also failed", exc_info=True)
+        for agent in agents:
+            try:
+                ray.get(agent.teardown.remote(), timeout=120)
+            except Exception:  # noqa: BLE001
+                logger.warning("semi_p: agent teardown after a failed "
+                               "multi-node dump also failed", exc_info=True)
+        raise
+    time.sleep(2)
+    _record_env_files(model_dir)
+    logger.info("semi_p: multi-node dump complete in %.1fs, dump_id=%s",
+                time.perf_counter() - t0, dump_id)
+
+
+def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
+                       gpus: list[int], agents: list[Any], *,
+                       weights_dir: str | None, requested: dict[str, Any],
+                       after: str) -> "_SemiPEngine":
+    """Restore every half of one image and return the leader's engine."""
+    import ray
+    from arctic_platform.inference.semi_persistence import Instance
+
+    model_dir = paths.model_dir
+    local = len(gpus)
+    nnodes = paths.nnodes
+    meta_path = os.path.join(model_dir, _IMAGE_DIR, "meta.json")
+    with open(meta_path) as handle:
+        meta = json.load(handle)
+    baked = meta.get("vllm_config") or {}
+    if not baked:
+        raise ValueError(
+            f"semi_p: image meta.json at {meta_path} has no vllm_config")
+    _log_config_divergence(baked, engine_kwargs, model_dir, requested)
+    tokenizer_path = engine_kwargs.get("model") or baked.get("model")
+    mismatch = _unprivileged_mismatch(meta)
+    if mismatch:
+        raise RuntimeError(f"semi_p: {model_dir}: {mismatch}")
+    _check_device_visibility(meta, model_dir)
+
+    leader_ip = _leader_ip()
+    remote_ranks = [r for k in range(1, nnodes) for r in _node_ranks(k, local)]
+    local_ranks = list(range(local))
+    logger.info("semi_p: multi-node restore of %s (%s), dump_id=%s, leader %s",
+                model_dir, after, meta.get("dump_id"), leader_ip)
+
+    prefetch = None
+    if weights_dir:
+        prefetch = _prefetch_weights(weights_dir, local_ranks)
+
+    inst = Instance(baked, model_dir)
+    restoring = [
+        agent.criu_restore.remote(
+            baked, os.path.join(paths.key_dir, f"{_NODE_DIR_PREFIX}{k + 1}"),
+            _agent_gpus(local), k + 1)
+        for k, agent in enumerate(agents)]
+    try:
+        inst.criu_restore().wait()
+        ray.get(restoring, timeout=_MULTINODE_STEP_TIMEOUT_S)
+
+        # The message-queue plane, rebuilt across pods. Every queue socket was
+        # closed before the dump, so nothing here survived the image and the
+        # two halves have to agree on a new one before any collective runs.
+        inst.mq_begin_unpark(remote_ranks, leader_ip, local_ranks).wait()
+        handle = inst.last_info["mq_begin_unpark"]["handle"]
+        handles: list[Any] = []
+        for k, agent in enumerate(agents):
+            reply = ray.get(
+                agent.mq_follower_unpark.remote(
+                    handle, _node_ranks(k + 1, local), leader_ip),
+                timeout=_MULTINODE_STEP_TIMEOUT_S)
+            handles.extend(reply["handles"])
+        inst.mq_finish_unpark(handles, local_ranks).wait()
+
+        cuda = [agent.cuda_restore.remote() for agent in agents]
+        inst.cuda_restore(gpus=gpus).wait()
+        ray.get(cuda, timeout=_MULTINODE_STEP_TIMEOUT_S)
+
+        if prefetch is not None:
+            prefetch.join(timeout=0)
+
+        # From here the leader's executor spans every rank again, so the rest
+        # is ordinary single-engine work. reinit_nccl is the first time EFA
+        # comes up: the cold start ran on sockets so that no EFA state would
+        # have to survive CRIU.
+        inst.reinit_nccl(master_addr=leader_ip,
+                         ifname=_multinode_ifname()).wait()
+        inst.attach().load_weights(weights_dir=weights_dir).wait()
+        inst.wake_up_weights().wait()
+        _check_staging_budget(inst, model_dir)
+        inst.repin().plan_restore_weights().wait()
+        inst.restore_weights().wait()
+        inst.wake_up_kv_cache().wait()
+        # Not rebind_graphs: the dump destroyed the graphs so that
+        # ncclCommAbort could return, and these are captured fresh.
+        inst.recapture_graphs().wait()
+    except BaseException:
+        try:
+            inst.teardown()
+        except Exception:  # noqa: BLE001
+            logger.warning("semi_p: leader teardown after a failed multi-node "
+                           "restore also failed", exc_info=True)
+        for agent in agents:
+            try:
+                ray.get(agent.teardown.remote(), timeout=120)
+            except Exception:  # noqa: BLE001
+                logger.warning("semi_p: agent teardown after a failed "
+                               "multi-node restore also failed", exc_info=True)
+        raise
+    logger.info("semi_p: multi-node restore complete model_dir=%s gpus=%s",
+                model_dir, gpus)
+    return _SemiPEngine(inst, tokenizer_path=tokenizer_path,
+                        model=baked.get("model"), agents=agents)
+
+
+def _agent_gpus(local: int) -> list[int]:
+    """The physical GPUs an agent drives.
+
+    Every pod in a zone exposes the same device set, and each half takes the
+    whole pod, so this is the identity list. It is a function rather than a
+    literal because the agent resolves nothing itself -- the leader is the only
+    place that knows the group's shape.
+    """
+    return list(range(local))
+
+
+def _joint_hit(agents: list[Any], paths: _ImagePaths,
+               local: int) -> tuple[bool, str | None]:
+    """Whether every half holds an image from the same dump.
+
+    Returns ``(hit, dump_id)``. Two halves each holding *an* image prove
+    nothing: they could be from different dumps, and restoring mismatched
+    halves deadlocks rather than failing.
+    """
+    import ray
+    meta_path = os.path.join(paths.model_dir, _IMAGE_DIR, "meta.json")
+    try:
+        with open(meta_path) as handle:
+            mine = json.load(handle)
+    except (OSError, ValueError):
+        return False, None
+    my_id = mine.get("dump_id")
+    probes = ray.get([
+        agent.probe.remote(
+            os.path.join(paths.key_dir, f"{_NODE_DIR_PREFIX}{k + 1}"))
+        for k, agent in enumerate(agents)])
+    missing = [k + 1 for k, p in enumerate(probes) if not p.get("hit")]
+    if missing:
+        logger.info("semi_p: node(s) %s hold no image for this key; every half "
+                    "will cold-start and dump together", missing)
+        return False, None
+    mismatched = [(k + 1, p.get("dump_id")) for k, p in enumerate(probes)
+                  if p.get("dump_id") != my_id]
+    if mismatched:
+        logger.warning(
+            "semi_p: the halves hold images from different dumps "
+            "(leader=%s, %s); cold-starting rather than restoring a pair that "
+            "would deadlock in its first collective", my_id,
+            ", ".join(f"node{k}={d}" for k, d in mismatched))
+        return False, None
+    return True, my_id
+
+
 def _is_address_in_use(exc: BaseException) -> bool:
     """Whether ``exc`` is CRIU failing to rebind a port still in ``TIME_WAIT``.
 
@@ -2366,10 +2779,17 @@ def _restore_with_port_retry(model_dir: str, engine_kwargs: dict[str, Any],
             time.sleep(_RESTORE_RETRY_SLEEP_S)
 
 
-def restore_and_wrap(engine_kwargs: dict[str, Any]) -> "_SemiPEngine":
+def restore_and_wrap(engine_kwargs: dict[str, Any],
+                     agents: list[Any] | None = None) -> "_SemiPEngine":
     """Bring a semi-p engine up and return a ``_SemiPEngine`` (blocking).
 
     Intended to be called via ``asyncio.to_thread`` from the worker.
+
+    ``agents`` are the ``SemipNodeAgent`` handles for the other nodes when this
+    engine's TP group spans pods; ``None`` or empty is the single-node case,
+    which is every TP <= 8 deployment and takes exactly the path it always
+    did. With agents, the hit decision, the dump and the restore all become
+    joint: see ``_joint_hit``, ``_dump_multinode`` and ``_restore_multinode``.
 
     On a cache hit this restores the image and serves from it. On a **miss**
     it first tries to materialize the image from the read-only published
@@ -2404,6 +2824,17 @@ def restore_and_wrap(engine_kwargs: dict[str, Any]) -> "_SemiPEngine":
     semip_logging.attach_pod_log([logger.name])
 
     vllm_config = _vllm_config_from_engine_kwargs(engine_kwargs)
+
+    # Topology goes in the key, node identity does not. ``nnodes`` changes the
+    # image -- a half of a TP=16 group is not a TP=8 engine -- so it is hashed;
+    # node_rank, the rendezvous address and the interface travel outside the
+    # config so that both halves derive the same key and a restored pair is
+    # free to meet somewhere new.
+    agents = list(agents or ())
+    if agents:
+        vllm_config = dict(vllm_config)
+        vllm_config["nnodes"] = len(agents) + 1
+
     paths = _resolve_model_dir(vllm_config)
     model_dir = paths.model_dir
 
@@ -2411,7 +2842,11 @@ def restore_and_wrap(engine_kwargs: dict[str, Any]) -> "_SemiPEngine":
     # second call would find it empty and fall back to [0]. The dump and the
     # restore both take the list resolved here.
     gpus = _resolve_physical_gpus()
-    _check_tp_matches_gpus(vllm_config, gpus)
+    _check_tp_matches_gpus(vllm_config, gpus, paths.nnodes)
+
+    if agents:
+        return _multinode_restore_and_wrap(
+            engine_kwargs, vllm_config, paths, gpus, agents)
 
     # Resolved before the lock and re-used after it: the published tree is
     # read-only, so listing it twice could only produce the same answer at extra
@@ -2456,16 +2891,147 @@ def restore_and_wrap(engine_kwargs: dict[str, Any]) -> "_SemiPEngine":
         requested=vllm_config)
 
 
+def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
+                                vllm_config: dict[str, Any],
+                                paths: _ImagePaths, gpus: list[int],
+                                agents: list[Any]) -> "_SemiPEngine":
+    """``restore_and_wrap`` for an engine whose TP group spans pods.
+
+    Same shape as the single-node path -- hit, else materialize, else dump,
+    then restore -- with every decision made for the group rather than for this
+    pod. The dump lock is taken on the shared key directory, not on this node's
+    half, because the halves dump together and two leaders dumping one key at
+    once would interleave their images.
+    """
+    local = len(gpus)
+    key_dir = paths.key_dir or paths.model_dir
+    hit, dump_id = _joint_hit(agents, paths, local)
+    after = "previous run's teardown"
+
+    if not hit:
+        os.makedirs(paths.model_dir, exist_ok=True)
+        with _dump_lock(key_dir):
+            # Re-probe under the lock: another job may have dumped this key
+            # while we waited, and dumping again would throw its work away.
+            hit, dump_id = _joint_hit(agents, paths, local)
+            if hit:
+                logger.info(
+                    "semi_p: another job dumped %s while we waited; restoring "
+                    "its image instead of dumping again", key_dir)
+            else:
+                materialized = _multinode_materialize(agents, paths)
+                if materialized:
+                    after = "copy from the image source"
+                else:
+                    _dump_multinode(
+                        vllm_config, paths, gpus, agents,
+                        master_port=_pick_master_port(),
+                        ifname=_multinode_ifname(),
+                        image_ref=paths.image_ref,
+                        driver_version=paths.driver_version)
+                    after = "dump we just took"
+                hit, dump_id = _joint_hit(agents, paths, local)
+                if not hit:
+                    raise RuntimeError(
+                        "semi_p: after a multi-node dump the halves still do "
+                        "not agree on a dump_id; refusing to restore a pair "
+                        "that would deadlock in its first collective")
+
+    skeleton_dir, weight_hash = _resolve_published_skeleton(paths)
+    weights_dir = _weights_dir_for_restore(
+        key_dir, paths.weight_root, weight_hash)
+    if weights_dir is None:
+        weights_dir = _joint_weights_dir(paths)
+
+    deadline = time.monotonic() + _TIME_WAIT_S + 15.0
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return _restore_multinode(
+                engine_kwargs, paths, gpus, agents,
+                weights_dir=weights_dir, requested=vllm_config, after=after)
+        except Exception as exc:
+            if not _is_address_in_use(exc) or time.monotonic() >= deadline:
+                raise
+            # Both halves retry together: the ports CRIU rebinds are recorded
+            # per image, so a collision on either side means neither half's
+            # restore completed. See _restore_with_port_retry.
+            logger.warning(
+                "semi_p: multi-node restore hit a port still in TIME_WAIT "
+                "from the %s (attempt %d); retrying in %.0fs",
+                after, attempt, _RESTORE_RETRY_SLEEP_S)
+            time.sleep(_RESTORE_RETRY_SLEEP_S)
+
+
+def _pick_master_port() -> int:
+    """One rendezvous port for the whole group, chosen by the leader.
+
+    Both halves have to name the same port, and only the leader is in a
+    position to choose: a port that is free on the follower says nothing about
+    this node, which is the one that binds it.
+    """
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", 0))
+        return int(sock.getsockname()[1])
+
+
+def _multinode_materialize(agents: list[Any], paths: _ImagePaths) -> bool:
+    """Copy every half of a published skeleton into place, or none of them.
+
+    A pod that materializes while its partner cold-starts is the mismatched
+    pair this whole protocol exists to avoid, so a partial result is treated as
+    a miss and both halves cold-start.
+    """
+    import ray
+
+    skeleton_dir, weight_hash = _resolve_published_skeleton(paths)
+    if not skeleton_dir:
+        return False
+    key_dir = paths.key_dir or paths.model_dir
+    mine = _materialize_from_source(
+        _node_source(skeleton_dir, 0), paths.model_dir,
+        paths.weight_root, weight_hash, verified_dir=skeleton_dir, strict=True)
+    if not mine:
+        return False
+    theirs = ray.get([
+        agent.materialize.remote(
+            _node_source(skeleton_dir, k + 1),
+            os.path.join(key_dir, f"{_NODE_DIR_PREFIX}{k + 1}"),
+            paths.weight_root, weight_hash, skeleton_dir)
+        for k, agent in enumerate(agents)])
+    if all(theirs):
+        return True
+    logger.warning(
+        "semi_p: only some halves could be materialized from the published "
+        "skeleton (%s); cold-starting every half instead",
+        [True] + list(theirs))
+    return False
+
+
+def _node_source(skeleton_dir: str | None, node_rank: int) -> str | None:
+    """A published skeleton's ``node<k>/`` half, beside ``_replica_source``."""
+    if not skeleton_dir:
+        return None
+    return os.path.join(skeleton_dir, f"{_NODE_DIR_PREFIX}{node_rank}")
+
+
 class _SemiPEngine:
     """Stands in for ``self.llm`` (a vLLM ``AsyncLLM``) over a semi-p Instance."""
 
     def __init__(self, inst: Any, *, tokenizer_path: str | None,
-                 model: str | None):
+                 model: str | None, agents: list[Any] | None = None):
         self._inst = inst
         self._tokenizer_path = tokenizer_path
         self._model = model
         self._tokenizer: Any = None
         self._lock = asyncio.Lock()
+        # The other halves of a node-spanning engine. They hold GPUs and a
+        # restored process tree, so they have to come down with this engine;
+        # nothing else owns them.
+        self._agents = list(agents or ())
 
     # -- generate -----------------------------------------------------------
 
@@ -2633,6 +3199,19 @@ class _SemiPEngine:
             except Exception:  # pragma: no cover - best effort
                 logger.warning("semi_p: teardown failed", exc_info=True)
             self._inst = None
+        # Fan out to the other halves. After the leader is down they hold a
+        # process tree that can never be driven again -- its executor was the
+        # leader's -- so leaving them alive would pin a pod's GPUs until the
+        # job ended.
+        agents, self._agents = list(getattr(self, "_agents", ())), []
+        if agents:
+            import ray
+            for agent in agents:
+                try:
+                    ray.get(agent.teardown.remote(), timeout=120)
+                except Exception:  # pragma: no cover - best effort
+                    logger.warning("semi_p: agent teardown failed",
+                                   exc_info=True)
 
     def __del__(self):  # pragma: no cover - GC path
         try:
