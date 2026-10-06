@@ -43,7 +43,7 @@ def test_is_address_in_use_error_walks_exception_chain():
 
 
 def test_arctic_patch_fallback_stays_flag_independent(monkeypatch):
-    from arctic_platform.inference.vllm import dflash2_nan_fix, patches
+    from arctic_platform.inference.vllm import patches, required_patches
 
     arg_utils_mod = types.ModuleType("vllm.engine.arg_utils")
     arg_utils_mod.AsyncEngineArgs = type("AsyncEngineArgs", (), {})
@@ -53,9 +53,9 @@ def test_arctic_patch_fallback_stays_flag_independent(monkeypatch):
 
     calls = []
     monkeypatch.setattr(
-        dflash2_nan_fix,
-        "apply_dflash2_nan_fixes",
-        lambda: calls.append("dflash2"),
+        required_patches,
+        "apply_required_vllm_patches",
+        lambda: calls.append("required"),
     )
     monkeypatch.setattr(
         patches,
@@ -65,7 +65,7 @@ def test_arctic_patch_fallback_stays_flag_independent(monkeypatch):
 
     worker_mod._ensure_arctic_vllm_patches()
 
-    assert calls == ["dflash2", "arctic"]
+    assert calls == ["required", "arctic"]
 
 
 def test_initialize_retries_vllm_engine_startup_on_address_in_use(monkeypatch):

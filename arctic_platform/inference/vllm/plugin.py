@@ -25,28 +25,11 @@ def arctic_inference_plugin():
     if not envs.ARCTIC_INFERENCE_SKIP_VERSION_CHECK:
         require_supported_vllm_version("Arctic Inference plugin")
 
-    from arctic_platform.inference.vllm.dense_prompt_logprobs import (
-        ensure_dense_prompt_logprobs_patch,
-    )
-    from arctic_platform.inference.vllm.dflash2_nan_fix import (
-        apply_dflash2_nan_fixes,
-    )
-    from arctic_platform.inference.vllm.router_replay import (
-        ensure_router_replay_vllm_patches,
-    )
-    from arctic_platform.inference.vllm.xgrammar_stop_mask import (
-        ensure_xgrammar_stop_mask_fix,
+    from arctic_platform.inference.vllm.required_patches import (
+        apply_required_vllm_patches,
     )
 
-    ensure_router_replay_vllm_patches()
-    ensure_xgrammar_stop_mask_fix()
-    # Applied before the ARCTIC_INFERENCE_ENABLED branch: a scoring request must
-    # be able to opt into dense prompt logprobs whether or not the rest of the
-    # Arctic stack is on.
-    ensure_dense_prompt_logprobs_patch()
-    # These are vLLM correctness fixes for DFlash2 with GDN-backed models, not
-    # Arctic optimizations. Apply them for the vanilla vLLM path as well.
-    apply_dflash2_nan_fixes()
+    apply_required_vllm_patches()
 
     if not envs.ARCTIC_INFERENCE_ENABLED:
         from arctic_platform.inference.vllm.fp32_lm_head import (

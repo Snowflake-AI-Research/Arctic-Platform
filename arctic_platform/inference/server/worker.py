@@ -180,14 +180,14 @@ def _ensure_arctic_vllm_patches() -> None:
     if "__new__" in getattr(AsyncEngineArgs, "_arctic_patches", {}):
         return
 
-    from arctic_platform.inference.vllm.dflash2_nan_fix import (
-        apply_dflash2_nan_fixes,
-    )
     from arctic_platform.inference.vllm.patches import apply_arctic_patches
+    from arctic_platform.inference.vllm.required_patches import (
+        apply_required_vllm_patches,
+    )
 
     # Preserve the fallback's flag-independent full-stack behavior while
-    # installing required correctness fixes through their dedicated helper.
-    apply_dflash2_nan_fixes()
+    # installing the same required patches as the plugin entrypoint.
+    apply_required_vllm_patches()
     try:
         apply_arctic_patches()
     except ValueError as exc:

@@ -299,40 +299,27 @@ def test_vllm_qwen_parser_natively_ends_reasoning_at_tool_call():
 
 def test_disabled_arctic_plugin_applies_required_runtime_patches(monkeypatch):
     from arctic_platform.inference.vllm import (
-        dflash2_nan_fix,
         fp32_lm_head,
         plugin,
-        router_replay,
-        xgrammar_stop_mask,
+        required_patches,
     )
 
     calls = []
     monkeypatch.setattr(plugin.envs, "ARCTIC_INFERENCE_SKIP_VERSION_CHECK", True)
     monkeypatch.setattr(plugin.envs, "ARCTIC_INFERENCE_ENABLED", False)
     monkeypatch.setattr(
-        router_replay,
-        "ensure_router_replay_vllm_patches",
-        lambda: calls.append("router"),
+        required_patches,
+        "apply_required_vllm_patches",
+        lambda: calls.append("required"),
     )
     monkeypatch.setattr(
         fp32_lm_head,
         "ensure_fp32_lm_head_vllm_patches",
         lambda: calls.append("fp32"),
     )
-    monkeypatch.setattr(
-        xgrammar_stop_mask,
-        "ensure_xgrammar_stop_mask_fix",
-        lambda: calls.append("xgrammar"),
-    )
-    monkeypatch.setattr(
-        dflash2_nan_fix,
-        "apply_dflash2_nan_fixes",
-        lambda: calls.append("dflash2"),
-    )
-
     plugin.arctic_inference_plugin()
 
-    assert calls == ["router", "xgrammar", "dflash2", "fp32"]
+    assert calls == ["required", "fp32"]
 
 
 def test_worker_coerces_openai_structured_outputs_for_vllm():
