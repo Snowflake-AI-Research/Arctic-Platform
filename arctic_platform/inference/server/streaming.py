@@ -207,8 +207,15 @@ class EventBuffer:
         self.ready = asyncio.Event()
         self.error = None
         self.done = False
+        # Newest undelivered delta per choice, which later text may join. With
+        # merging, a stream that falls behind needs at most one slot per choice
+        # for text, but its end needs 2n + 2 (finish events never merge), so
+        # max_buffer_events must be at least that.
+        self._open_deltas = {}
 
     def put(self, event):
+        if event.get("type") == "delta" and self._merge(event):
+            return
         size = event_size(event)
         if size > self.limits.max_event_bytes:
             raise StreamError("event_too_large")
@@ -217,11 +224,52 @@ class EventBuffer:
             or self.bytes + size > self.limits.max_buffer_bytes
         ):
             raise StreamError("buffer_overflow")
-        self.events.append((event, size))
+        entry = [event, size]
+        self.events.append(entry)
+        if event.get("type") == "delta":
+            self._open_deltas[event["choice_index"]] = entry
+        elif "choice_index" in event:
+            self._open_deltas.pop(event["choice_index"], None)
+        else:
+            self._open_deltas.clear()
         self.bytes += size
         self.peak_bytes = max(self.peak_bytes, self.bytes)
         self.peak_events = max(self.peak_events, len(self.events))
         self.ready.set()
+
+    def _merge(self, event):
+        """Append a delta's text to its choice's undelivered delta, if any.
+
+        Tokens that arrive while the reader is behind then share one event
+        instead of each taking a buffer slot, so a slow reader sees fewer,
+        larger deltas rather than an overflow. A reader that keeps up takes
+        each delta before the next arrives, so nothing merges.
+        """
+        entry = self._open_deltas.get(event["choice_index"])
+        if entry is None:
+            return False
+        merged = {**entry[0], "text": entry[0]["text"] + event["text"]}
+        if "token_ids" in entry[0] or "token_ids" in event:
+            merged["token_ids"] = [
+                *entry[0].get("token_ids", ()), *event.get("token_ids", ())
+            ]
+        size = event_size(merged)
+        if size > self.limits.max_event_bytes:
+            return False
+        if self.bytes - entry[1] + size > self.limits.max_buffer_bytes:
+            raise StreamError("buffer_overflow")
+        self.bytes += size - entry[1]
+        entry[0], entry[1] = merged, size
+        self.peak_bytes = max(self.peak_bytes, self.bytes)
+        return True
+
+    def _pop(self):
+        entry = self.events.popleft()
+        event, size = entry
+        self.bytes -= size
+        if self._open_deltas.get(event.get("choice_index")) is entry:
+            del self._open_deltas[event["choice_index"]]
+        return event
 
     def fail(self, code, *, context_limit_source=None):
         if self.error is None:
@@ -229,17 +277,23 @@ class EventBuffer:
                 code, context_limit_source=context_limit_source
             )
         self.events.clear()
+        self._open_deltas.clear()
         self.bytes = 0
         self.ready.set()
+
+    def drain(self):
+        """Remove and return every event already buffered, without waiting."""
+        drained = []
+        while self.events and self.error is None:
+            drained.append(self._pop())
+        return drained
 
     async def get(self):
         while True:
             if self.error:
                 raise self.error
             if self.events:
-                event, size = self.events.popleft()
-                self.bytes -= size
-                return event
+                return self._pop()
             if self.done:
                 raise StopAsyncIteration
             self.ready.clear()
@@ -481,6 +535,13 @@ class StreamingWorkerMixin:
         return {"status": "registered"}
 
     async def stream_events(self, attempt_id):
+        """Yield buffered events in batches, one acknowledgement per batch.
+
+        Each batch holds the next event plus everything already buffered behind
+        it. With no backlog a batch is one event, as before. When the engine
+        outruns the consumer, the backlog is handed over in one round trip
+        instead of one per event, so the buffer drains instead of overflowing.
+        """
         session = self._engine_streams[attempt_id]
         if session.reader_started:
             raise ValueError("Stream already has a reader")
@@ -490,7 +551,7 @@ class StreamingWorkerMixin:
         try:
             while True:
                 try:
-                    event = await session.buffer.get()
+                    events = [await session.buffer.get()]
                 except StreamError as exc:
                     event = {
                         "type": "terminal_error",
@@ -500,22 +561,28 @@ class StreamingWorkerMixin:
                     }
                     if exc.context_limit_source is not None:
                         event["context_limit_source"] = exc.context_limit_source
-                    yield event
+                    yield [event]
                     return
                 except StopAsyncIteration:
                     return
+                events.extend(session.buffer.drain())
+                batch = []
+                for event in events:
+                    batch.append({**event, "sequence": sequence, "version": 1})
+                    sequence += 1
+                    if event["type"] == "completed":
+                        completed = True
+                        break
                 session.ack.clear()
-                session.pending_sequence = sequence
+                session.pending_sequence = batch[-1]["sequence"]
                 session.last_progress = time.monotonic()
-                if event["type"] == "completed":
-                    completed = True
+                if completed:
                     session.watchdog.cancel()
                     self._engine_streams.pop(attempt_id, None)
-                yield {**event, "sequence": sequence, "version": 1}
-                if event["type"] == "completed":
+                yield batch
+                if completed:
                     return
                 await session.ack.wait()
-                sequence += 1
         finally:
             if not completed:
                 await session.stop(session.buffer.error or "cancelled")
@@ -591,11 +658,14 @@ class ClientStream(AsyncIterator):
         self.closed = False
         self.error = None
         self.cleanup = None
+        self.cleanup_unconfirmed = False
         self.error_delivered = False
         self.usage = None
         self.first_delta_time = None
         self.finished_choices = set()
         self.next_sequence = 0
+        # Events received in the current batch, not yet handed to the reader.
+        self.pending_events = deque()
         self.watchdog = asyncio.create_task(self.watch())
 
     def __aiter__(self):
@@ -651,7 +721,45 @@ class ClientStream(AsyncIterator):
             self.reading = False
             self.last_read = time.monotonic()
 
+    async def read_buffered(self, limit):
+        """Return up to ``limit`` more events already received, with no round trip.
+
+        For callers that relay events onward in batches: after a normal read,
+        this hands over the rest of the batch that read fetched. Returns an
+        empty list when nothing is buffered. A bad event aborts the stream as a
+        normal read would; events accepted before it are still returned, and
+        the next read raises the error.
+        """
+        if self.reading:
+            raise RuntimeError("Concurrent stream reads are not supported")
+        events = []
+        self.reading = True
+        try:
+            while (
+                self.pending_events
+                and len(events) < limit
+                and not (self.closed or self.error or self.error_delivered)
+            ):
+                events.append(await self._accept_event(self.pending_events.popleft()))
+        except StreamError as exc:
+            await self.abort(exc.code)
+            if not events:
+                raise
+        except BaseException:
+            await self.abort("stream_interrupted")
+            raise
+        finally:
+            self.reading = False
+            self.last_read = time.monotonic()
+        return events
+
     async def read_event(self):
+        if not self.pending_events:
+            await self._fetch_batch()
+        event = self.pending_events.popleft()
+        return await self._accept_event(event)
+
+    async def _fetch_batch(self):
         if self.worker is None:
             while self.worker is None:
                 if self.error:
@@ -697,12 +805,21 @@ class ClientStream(AsyncIterator):
             )
         try:
             reference = await self.remote_stream.__anext__()
-            event = await reference
+            batch = await reference
         except StopAsyncIteration:
             raise StreamError("incomplete_stream") from None
+        if not isinstance(batch, list) or not batch:
+            raise StreamError("invalid_event_sequence")
+        self.pending_events.extend(batch)
+
+    async def _accept_event(self, event):
         if self.error:
             raise StreamError(self.error)
-        if event.get("version") != 1 or event.get("sequence") != self.next_sequence:
+        if (
+            not isinstance(event, dict)
+            or event.get("version") != 1
+            or event.get("sequence") != self.next_sequence
+        ):
             raise StreamError("invalid_event_sequence")
         self.next_sequence += 1
         self.previous_sequence = event["sequence"]
@@ -719,8 +836,16 @@ class ClientStream(AsyncIterator):
                     raise StreamError("invalid_terminal_error")
             elif context_limit_source_present:
                 raise StreamError("invalid_terminal_error")
-            await self.abort(event["code"])
+            result = await self.abort(event["code"])
             self.error_delivered = True
+            if result["status"] == "cleanup_unconfirmed":
+                # The engine may still be running this request, so the caller
+                # must not treat it as a clean request error.
+                event = {
+                    key: value for key, value in event.items()
+                    if key != "context_limit_source"
+                }
+                event["code"] = "cleanup_unconfirmed"
         elif kind in {"delta", "choice_finished"}:
             index = event.get("choice_index")
             if (
@@ -759,6 +884,8 @@ class ClientStream(AsyncIterator):
 
     async def abort(self, code="cancelled"):
         if self.closed:
+            if self.cleanup_unconfirmed:
+                return {"status": "cleanup_unconfirmed"}
             return {"status": "already_terminal"}
         if self.cleanup is None:
             self.error = code
@@ -799,8 +926,10 @@ class ClientStream(AsyncIterator):
                 ray.cancel(self.remote_stream)
             except Exception:
                 status = "cleanup_unconfirmed"
-        if status == "cleanup_unconfirmed" and self.worker is not None:
-            self.worker.quarantine()
+        if status == "cleanup_unconfirmed":
+            self.cleanup_unconfirmed = True
+            if self.worker is not None:
+                self.worker.quarantine()
         await self.finish()
         return {"status": status}
 
@@ -829,7 +958,9 @@ class ClientStream(AsyncIterator):
                 )
             )
         self.scheduler._streams.pop(self.request_id, None)
-        self.scheduler._retire_stream(self.request_id)
+        self.scheduler._retire_stream(
+            self.request_id, cleanup_unconfirmed=self.cleanup_unconfirmed
+        )
         if asyncio.current_task() is not self.watchdog:
             self.watchdog.cancel()
 
