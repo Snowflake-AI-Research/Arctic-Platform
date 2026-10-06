@@ -65,8 +65,10 @@ optional seed, logit_bias, structured_output, thinking_token_budget and logprobs
 frequency_penalty=0, presence_penalty=0, max_tokens=4096, n=1. Penalties must
 be in [-2,2]. Limits: n<=8,
 max_tokens<=131072, 1 MiB text input or 131072 input token IDs. After vLLM
-tokenizes a text prompt, the stream rejects `prompt_tokens + max_tokens` above
-the loaded model's context limit. Stop accepts one string or up to four nonempty
+tokenizes a text prompt, the stream rejects an explicit `max_tokens` when
+`prompt_tokens + max_tokens` is above the loaded model's context limit. The
+default `max_tokens` is never rejected this way: generation stops at the context
+limit with finish reason `length`. Stop accepts one string or up to four nonempty
 strings, each <=4096 UTF-8 bytes. Stop holdback/detokenization remain
 engine-owned. `logit_bias` maps at most 300 token IDs (integers or
 decimal strings) to biases in [-100,100]. vLLM checks the IDs against the loaded

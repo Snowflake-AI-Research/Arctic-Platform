@@ -393,7 +393,8 @@ def test_chat_prompt_is_normalised_and_budget_left_open():
     assert prompt == chat("hi", reasoning_effort="xhigh")
     assert "max_tokens" not in params
     assert params["n"] == 2
-    assert validate_request("hi", {})[1]["max_tokens"] == 4096
+    # A text prompt's default is applied on the worker too.
+    assert "max_tokens" not in validate_request("hi", {})[1]
     with pytest.raises(ValueError):
         validate_request(chat("hi"), {"max_tokens": 0})
 

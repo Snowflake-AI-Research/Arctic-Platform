@@ -209,6 +209,15 @@ def test_thinking_token_budget_is_bounded_by_the_default_max_tokens():
         validate_request("prompt", {"thinking_token_budget": 4097})
 
 
+def test_omitted_max_tokens_stays_unset_for_the_worker():
+    # The worker applies the default and lets it shrink to the model context.
+    _, params = validate_request("prompt", {})
+    assert "max_tokens" not in params
+    _, params = validate_request("prompt", params)
+    assert "max_tokens" not in params
+    assert validate_request("prompt", {"max_tokens": 4096})[1]["max_tokens"] == 4096
+
+
 def test_thinking_budget_without_a_reasoning_parser_is_typed():
     error = VLLMValidationError(
         "thinking_token_budget is set but reasoning_config is not configured. "

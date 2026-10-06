@@ -90,7 +90,9 @@ class FakeEngine:
                 raise VLLMValidationError(
                     "sensitive unsupported sampling parameter"
                 )
-            for step in range(params["max_tokens"]):
+            # Like vLLM, generation also stops at the model context length.
+            limit = min(params["max_tokens"], self.model_config.max_model_len - 2)
+            for step in range(limit):
                 if step == 1 and prompt == "blocked":
                     await self.gate.wait()
                 if step == 1 and prompt == "failure":
@@ -111,7 +113,7 @@ class FakeEngine:
                         == (
                             index
                             if prompt == "different-lengths"
-                            else params["max_tokens"] - 1
+                            else limit - 1
                         )
                         else None,
                     )
@@ -191,6 +193,9 @@ class FakeEngineWorker:
         if self.ack_delay_s:
             await asyncio.sleep(self.ack_delay_s)
         return self.worker.acknowledge_stream(*args)
+
+    def set_max_model_len(self, value):
+        self.worker.llm.model_config.max_model_len = value
 
     def set_ack_delay(self, seconds):
         self.ack_delay_s = seconds
@@ -360,6 +365,27 @@ def test_requested_output_must_fit_model_context():
         assert events[-1]["code"] == "context_length_exceeded"
         assert events[-1]["context_limit_source"] == "completion_budget"
         assert not any(event["type"] == "delta" for event in events)
+
+    asyncio.run(exercise(check))
+
+
+def test_default_output_budget_stops_at_model_context():
+    async def check(driver, pool, actor):
+        await actor.set_max_model_len.remote(10)
+        explicit = [
+            event
+            async for event in driver.stream_generate(
+                "model", "explicit", "normal", {"max_tokens": 4096}
+            )
+        ]
+        assert explicit[-1]["context_limit_source"] == "completion_budget"
+        events = [
+            event async for event in driver.stream_generate("model", "default", "normal", {})
+        ]
+        assert events[-1]["type"] == "completed"
+        assert events[-2]["prompt_tokens"] + events[-2]["completion_tokens"] == 10
+        finished = next(event for event in events if event["type"] == "choice_finished")
+        assert finished["finish_reason"] == "length"
 
     asyncio.run(exercise(check))
 
