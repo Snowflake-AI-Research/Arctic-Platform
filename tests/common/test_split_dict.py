@@ -94,11 +94,9 @@ class TestSplitDictRemainder(TestCasePlus):
         shards, _ = _split_batch(envelope, num_workers=2)
         self.assertNotIn("rollout_is_weights", shards[0]["batch"])
         self.assertIsNone(shards[0]["meta"]["rollout_is_weights"])
-        self.assertEqual(shards[0]["batch"]["temperature"], 1.0)
+        self.assertNotIn("temperature", shards[0]["batch"])
         self.assertEqual(shards[0]["meta"]["temperature"], 1.0)
-        for k, v in shards[0]["batch"].items():
-            if k in {"temperature", "calculate_entropy"}:
-                continue
+        for _k, v in shards[0]["batch"].items():
             getattr(v, "shape")
 
     def test_cortex_context_batch_dim_keys_land_in_batch(self):
@@ -138,11 +136,12 @@ class TestSplitDictRemainder(TestCasePlus):
         }
         shards, _ = _split_batch(envelope, num_workers=2)
         for shard in shards:
-            self.assertEqual(float(shard["batch"]["temperature"]), 1.5)
-            self.assertTrue(shard["batch"]["calculate_entropy"])
+            self.assertNotIn("temperature", shard["batch"])
+            self.assertNotIn("calculate_entropy", shard["batch"])
             self.assertEqual(float(shard["meta"]["temperature"]), 1.5)
+            self.assertTrue(shard["meta"]["calculate_entropy"])
 
-    def test_list_batch_promotes_aligned_labels_and_copies_scalars(self):
+    def test_list_batch_promotes_aligned_labels_and_keeps_scalars_on_meta(self):
         envelope = {
             "batch": [
                 {"input_ids": torch.arange(2).view(1, 2)},
@@ -156,7 +155,8 @@ class TestSplitDictRemainder(TestCasePlus):
         }
         _, batch_data, meta_data, _ = unpack_batch(envelope)
         self.assertNotIn("labels", meta_data)
-        self.assertEqual(batch_data[0]["temperature"], 0.7)
+        self.assertNotIn("temperature", batch_data[0])
+        self.assertEqual(meta_data["temperature"], 0.7)
         self.assertEqual(batch_data[0]["labels"].tolist(), [[1, -100]])
 
     def test_list_batch_raises_on_shared_meta_labels_tensor(self):
@@ -293,3 +293,43 @@ class TestDpSizeDividesBySp(TestCasePlus):
         with self.assertRaises(ValueError):
             resolve_parallelism_degree("2", "sp_size")
         self.assertEqual(resolve_parallelism_degree(2, "sp_size"), 2)
+
+
+class TestBagIsolation(TestCasePlus):
+    def test_duplicate_key_on_batch_and_meta_raises(self):
+        ids = torch.tensor([[1, 2]])
+        with self.assertRaisesRegex(ValueError, "both batch and meta"):
+            unpack_batch({"batch": {"input_ids": ids}, "meta": {"input_ids": ids}, "processing": {}})
+
+    def test_scalar_on_batch_raises_at_any_shape(self):
+        with self.assertRaisesRegex(ValueError, "forward scalars"):
+            unpack_batch(
+                {
+                    "batch": {"input_ids": torch.tensor([[1, 2]]), "temperature": torch.ones(1, 2)},
+                    "meta": {},
+                    "processing": {},
+                }
+            )
+
+    def test_cortex_keeps_equal_model_input_on_kwargs_and_scalar_on_context(self):
+        ids = torch.tensor([[1, 2, 3]])
+        _, batch_data, meta_data, _ = unpack_batch(
+            {
+                "kwargs": {"input_ids": ids.clone(), "temperature": 0.7},
+                "context": {"input_ids": ids.clone(), "temperature": 0.7, "calculate_entropy": True},
+            }
+        )
+        self.assertTrue(torch.equal(batch_data["input_ids"], ids))
+        self.assertNotIn("input_ids", meta_data)
+        self.assertNotIn("temperature", batch_data)
+        self.assertEqual(meta_data["temperature"], 0.7)
+        self.assertTrue(meta_data["calculate_entropy"])
+
+    def test_cortex_disagreement_raises(self):
+        with self.assertRaisesRegex(ValueError, "disagree"):
+            unpack_batch(
+                {
+                    "kwargs": {"input_ids": torch.tensor([[1, 2]])},
+                    "context": {"input_ids": torch.tensor([[1, 3]])},
+                }
+            )

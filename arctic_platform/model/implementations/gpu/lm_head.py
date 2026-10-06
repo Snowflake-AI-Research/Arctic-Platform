@@ -353,6 +353,53 @@ def _get_sequence_chunked_logprob_fn():
     return SequenceChunkedLogProbFn
 
 
+def inv_temperature_for_tokens(temperature, batch_size: int, seq_len: int, device) -> torch.Tensor:
+    """Reciprocal temperature as float32 ``[B * S]``.
+
+    A missing value, a Python number, or a one-element tensor is broadcast.
+    A ``[B, S]`` or ``[B * S]`` tensor is kept so direct kernel tests can pass
+    a real per-token scale. Zero is treated as 1, matching the previous heads.
+    """
+    import torch
+
+    n_tokens = batch_size * seq_len
+
+    def broadcast(value: float) -> torch.Tensor:
+        if value == 0.0:
+            value = 1.0
+        return torch.full((n_tokens,), 1.0 / value, device=device, dtype=torch.float32)
+
+    if temperature is None:
+        return torch.ones(n_tokens, device=device, dtype=torch.float32)
+    if isinstance(temperature, bool):
+        raise ValueError("temperature must be a real scalar or a [B, S] tensor, not bool")
+    if not torch.is_tensor(temperature):
+        if isinstance(temperature, (int, float)):
+            return broadcast(float(temperature))
+        raise ValueError(f"temperature must be a real scalar or a [B, S] tensor; got {type(temperature).__name__}")
+    if temperature.numel() == 1:
+        return broadcast(float(temperature.detach().to(dtype=torch.float64).reshape(()).item()))
+    if temperature.shape == (batch_size, seq_len) or temperature.shape == (n_tokens,):
+        flat = temperature.to(device=device, dtype=torch.float32).reshape(n_tokens)
+        return flat.masked_fill(flat == 0, 1.0).reciprocal().contiguous()
+    raise ValueError(
+        f"temperature shape {tuple(temperature.shape)} is incompatible with "
+        f"hidden states shape [{batch_size}, {seq_len}, *]"
+    )
+
+
+def slice_temperature_for_logits_to_keep(temperature, slice_indices):
+    """Narrow a ``[B, S]`` temperature to the columns ``logits_to_keep`` scores.
+
+    A scalar has no sequence axis, so it is returned unchanged.
+    """
+    import torch
+
+    if torch.is_tensor(temperature) and temperature.ndim >= 2:
+        return temperature[:, slice_indices]
+    return temperature
+
+
 def _coerce_BS_shape(name: str, t, batch_size: int, seq_len: int):
     """Reshape ``t`` to ``[B, S]`` if its element count matches, else error."""
     if t.shape == (batch_size, seq_len):
@@ -399,13 +446,7 @@ def chunked_lm_head_logprobs(
         action_masks_to_lm_head(action_masks, device=hidden_states.device), ~ignore_mask
     )
 
-    if temperature is None:
-        inv_temperature = torch.ones(n_tokens, device=hidden_states.device, dtype=torch.float32)
-    else:
-        temperature = _coerce_BS_shape("temperature", temperature.to(hidden_states.device), batch_size, seq_len)
-        temperature_flat = temperature.reshape(n_tokens).to(torch.float32)
-        safe_temperature = temperature_flat.masked_fill(temperature_flat == 0, 1.0)
-        inv_temperature = safe_temperature.reciprocal().contiguous()
+    inv_temperature = inv_temperature_for_tokens(temperature, batch_size, seq_len, hidden_states.device)
 
     fn = _get_sequence_chunked_logprob_fn()
     logprobs = fn.apply(
@@ -527,7 +568,7 @@ def enable_chunked_lm_head_logprobs(
         hidden_states = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
         if labels.dim() != 2:
             labels = inherit_lm_head_target_validation(labels, labels.reshape(hidden_states.shape[:2]))
-        if temperature is not None and temperature.dim() != 2:
+        if torch.is_tensor(temperature) and temperature.numel() > 1 and temperature.dim() != 2:
             temperature = temperature.reshape(hidden_states.shape[:2])
 
         # ``logits_to_keep > 0`` is the HF convention for "only score the last
@@ -546,8 +587,7 @@ def enable_chunked_lm_head_logprobs(
             slice_indices = logits_to_keep
         hidden_states = hidden_states[:, slice_indices, :]
         labels = inherit_lm_head_target_validation(labels, labels[:, slice_indices])
-        if temperature is not None:
-            temperature = temperature[:, slice_indices]
+        temperature = slice_temperature_for_logits_to_keep(temperature, slice_indices)
 
         return {
             "logprobs": chunked_lm_head_logprobs(

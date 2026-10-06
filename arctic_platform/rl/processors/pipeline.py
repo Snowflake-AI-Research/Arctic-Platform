@@ -51,6 +51,8 @@ first use.
 
 from __future__ import annotations
 
+import math
+from numbers import Real
 from typing import Any
 
 import torch
@@ -62,7 +64,8 @@ from arctic_platform.common.registry import _resolve_fn
 from arctic_platform.common.registry import register_loss_fn  # noqa: F401  # re-exported
 from arctic_platform.common.registry import register_post_processor
 from arctic_platform.common.utils.batch import BATCH_DIM_CONTEXT_KEYS
-from arctic_platform.common.utils.batch import _copy_scalar_fwd_keys
+from arctic_platform.common.utils.batch import META_FWD_SCALAR_KEYS
+from arctic_platform.common.utils.batch import _reject_meta_fwd_scalars_on_batch
 from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
 from arctic_platform.rl.utils.batch import detensorize
 from arctic_platform.rl.utils.batch import log_dp_shard_tokens
@@ -98,13 +101,11 @@ _ENGINE_FWD_KEYS = frozenset(
         "inputs_embeds",
         "past_key_values",
         "logits_to_keep",
-        "temperature",
         "action_masks",
         "routed_experts",
         "pixel_values",
         "image_grid_thw",
         "dss_compute_logprobs",
-        "calculate_entropy",
         # Packed/varlen flash-attn aliases (``cu_seqlens`` itself stays blocked).
         "cu_seq_lens_q",
         "cu_seq_lens_k",
@@ -136,16 +137,70 @@ _ENGINE_FWD_BLOCKED_KEYS = (
 
 
 def _fwd_meta_key_missing_from_batch(key: str, batch: dict, meta: dict) -> bool:
-    """True when ``fwd_meta_keys`` names a model input that is not on ``batch``."""
-    return key not in _ENGINE_FWD_BLOCKED_KEYS and key in meta and key not in batch
+    """True when ``fwd_meta_keys`` names a model input that is not on ``batch``.
+
+    ``temperature`` and ``calculate_entropy`` are forwarded from ``meta`` by
+    ``_engine_forward_kwargs``, so naming them here is not a drop.
+    """
+    return key not in _ENGINE_FWD_BLOCKED_KEYS and key not in META_FWD_SCALAR_KEYS and key in meta and key not in batch
+
+
+def _as_temperature_scalar(value) -> float:
+    """One finite real temperature. Rejects bools and per-token tensors."""
+    if isinstance(value, bool):
+        raise ValueError("meta['temperature'] must be a real scalar, not bool")
+    if torch.is_tensor(value):
+        if value.dtype == torch.bool or torch.is_complex(value) or value.numel() != 1:
+            raise ValueError(
+                "meta['temperature'] must be one scalar; got "
+                f"dtype {value.dtype} shape {tuple(value.shape)}. "
+                "Per-token temperature is not supported at the batch/meta boundary"
+            )
+        number = float(value.detach().to(dtype=torch.float64).reshape(()).item())
+    elif isinstance(value, Real):
+        number = float(value)
+    else:
+        raise ValueError(f"meta['temperature'] must be one scalar; got {type(value).__name__}")
+    if not math.isfinite(number):
+        raise ValueError("meta['temperature'] must be finite")
+    return number
+
+
+def _as_entropy_flag(value) -> bool:
+    """``calculate_entropy`` is a bool. A 1-element 0/1 tensor is accepted."""
+    if isinstance(value, bool):
+        return value
+    if torch.is_tensor(value) and value.numel() == 1 and (value.dtype == torch.bool or not value.is_floating_point()):
+        item = value.detach().reshape(()).item()
+        if item in (0, 1, False, True):
+            return bool(item)
+    raise ValueError(f"meta['calculate_entropy'] must be a bool; got {type(value).__name__}")
+
+
+def _normalize_meta_fwd_scalars(batch: dict, meta: dict) -> dict:
+    """Reject forward scalars on ``batch`` and store one Python value on ``meta``."""
+    _reject_meta_fwd_scalars_on_batch(batch, "run_pipeline")
+    meta = dict(meta)
+    if "temperature" in meta:
+        if meta["temperature"] is None:
+            del meta["temperature"]
+        else:
+            meta["temperature"] = _as_temperature_scalar(meta["temperature"])
+    if "calculate_entropy" in meta:
+        if meta["calculate_entropy"] is None:
+            del meta["calculate_entropy"]
+        else:
+            meta["calculate_entropy"] = _as_entropy_flag(meta["calculate_entropy"])
+    return meta
 
 
 def _engine_forward_kwargs(batch: dict, meta: dict) -> dict:
-    """Return allowlisted model inputs from ``batch``.
+    """Return allowlisted model inputs from ``batch``, plus the two meta scalars.
 
-    ``meta['fwd_meta_keys']`` cannot add engine kwargs. If it names a
-    non-blocked key that is present on ``meta`` and absent from ``batch``,
-    raise — that request would otherwise be silently dropped.
+    ``meta['fwd_meta_keys']`` cannot add engine kwargs. A general fallback over
+    every allowlisted key would forward an unsharded per-token tensor that
+    ``meta`` replicated to every rank. Only ``META_FWD_SCALAR_KEYS`` are read
+    from ``meta``, and ``run_pipeline`` has already required each to be one value.
     """
     extra = meta.get("fwd_meta_keys")
     if extra is None:
@@ -157,7 +212,9 @@ def _engine_forward_kwargs(batch: dict, meta: dict) -> dict:
         raise ValueError(
             f"fwd_meta_keys {dropped!r} are present on meta but not on batch; engine kwargs are batch-only"
         )
-    return {key: batch[key] for key in _ENGINE_FWD_KEYS if key in batch}
+    kwargs = {key: batch[key] for key in _ENGINE_FWD_KEYS if key in batch}
+    kwargs.update({key: meta[key] for key in META_FWD_SCALAR_KEYS if key in meta})
+    return kwargs
 
 
 def _require_loss_fn(processing: dict, *, backward: bool | str) -> str | None:
@@ -399,8 +456,9 @@ def run_pipeline(
         raise ValueError("cu_seqlens is meta-only; do not put it on batch")
 
     batch = dict(batch)
-    meta = dict(meta)
-    _copy_scalar_fwd_keys(batch, meta)
+    # Normalize before packing. A 0-d temperature whose numel equals B*S is
+    # otherwise treated as a token row and packed into a tensor.
+    meta = _normalize_meta_fwd_scalars(batch, meta)
 
     loss_fn_name = _require_loss_fn(processing, backward=backward)
     if loss_object is None and loss_fn_name is not None:
@@ -435,13 +493,12 @@ def run_pipeline(
     # Entropy is expensive: it requires a full-vocab softmax. In the non-zorro path
     # it is built by ``compute_entropy_and_logprobs_post``; in the zorro path it is
     # computed inside the model forward, which reads ``calculate_entropy`` from
-    # engine kwargs. Gating ``batch["calculate_entropy"]`` here -- before the
-    # forward -- covers both. Only override when ``actor_config`` explicitly carries
-    # an ``entropy_coeff`` (i.e. the update_actor / loss path); the fwd-no-grad
+    # engine kwargs. Only override when ``actor_config`` explicitly carries an
+    # ``entropy_coeff`` (i.e. the update_actor / loss path); the fwd-no-grad
     # ``compute_log_prob`` passes intentionally request entropy for logging and do
-    # not send ``actor_config``, so they are left untouched. Fresh dicts so the
-    # shared per-call bags are not mutated.
-    entropy_flag = batch.get("calculate_entropy", meta.get("calculate_entropy"))
+    # not send ``actor_config``, so they are left untouched. A fresh dict so the
+    # shared per-call meta is not mutated across GAS microbatches.
+    entropy_flag = meta.get("calculate_entropy")
     if entropy_flag:
         actor_config = meta.get("actor_config")
         if isinstance(actor_config, dict) and "entropy_coeff" in actor_config:
@@ -450,7 +507,6 @@ def run_pipeline(
             except (TypeError, ValueError):
                 entropy_used = bool(actor_config["entropy_coeff"])
             if not entropy_used:
-                batch = {**batch, "calculate_entropy": False}
                 meta = {**meta, "calculate_entropy": False}
 
     # --- forward ---
@@ -680,11 +736,20 @@ def _run_pipeline_with_packing(
             k: v.squeeze(0) if torch.is_tensor(v) and v.ndim == 2 and v.shape[0] == 1 else v for k, v in packed.items()
         }
 
-        # Model receives packed [1, T] allowlisted keys. Loss tensors stay on mb_1d.
-        mb_kwargs = {"use_cache": packed.get("use_cache", False)}
+        # Model receives packed [1, T] keys that were on the original batch.
+        # A model input that exists only on meta must not reach the engine:
+        # meta is replicated, so that tensor would be the unsharded full batch.
+        # position_ids are regenerated by pack_sequences. use_cache defaults
+        # off unless the caller put it on batch.
+        if "use_cache" in batch and "use_cache" in packed:
+            mb_kwargs = {"use_cache": packed["use_cache"]}
+        else:
+            mb_kwargs = {"use_cache": False}
         for key in _ENGINE_FWD_KEYS:
-            if key in packed:
+            if key in packed and key in batch:
                 mb_kwargs[key] = packed[key]
+        if "position_ids" in packed:
+            mb_kwargs["position_ids"] = packed["position_ids"]
 
         if backward is True and hasattr(engine, "set_gradient_accumulation_boundary"):
             engine.set_gradient_accumulation_boundary(i == n_mbs - 1)
@@ -944,9 +1009,8 @@ def apply_temperature_post(model_outputs: dict, batch: dict, meta: dict, device:
     """Apply temperature to logits."""
     see_memory_usage("apply_temperature_post start", force=True)
     if "logits" in model_outputs:
-        temperature = meta["temperature"]
+        temperature = meta.get("temperature", 1.0)
         logits = model_outputs["logits"]
-        temperature = meta["temperature"]
         if temperature != 1.0:
             temperature = torch.tensor(temperature, device=logits.device)
             logits.div_(temperature.clamp(min=1e-8).unsqueeze(-1).to(logits.dtype))

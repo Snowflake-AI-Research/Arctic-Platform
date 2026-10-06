@@ -177,6 +177,11 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
     return {
         "args": (),
         "kwargs": kwargs_out,
-        "context": {"input_ids": input_ids, "advantages": advantages, "loss_mask": loss_mask},
+        "context": {
+            "input_ids": input_ids,
+            "advantages": advantages,
+            "loss_mask": loss_mask,
+            **{key: meta[key] for key in ("temperature", "calculate_entropy") if key in meta},
+        },
         "processing": {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": proc_config},
     }

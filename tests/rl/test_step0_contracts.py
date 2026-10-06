@@ -107,14 +107,14 @@ class TestIsolation(TestCasePlus):
             "attention_mask": torch.ones(1, 4, dtype=torch.long),
             "advantages": torch.ones(1, 4),
             "old_log_probs": torch.zeros(1, 4),
-            "calculate_entropy": True,
-            "temperature": 1.0,
         }
         meta = {
             "loss_mask": torch.ones(1, 4, dtype=torch.bool),
             "old_log_probs_shifted": torch.zeros(1, 4),
             "actor_config": {"entropy_coeff": 0.0},
             "dp_size": 2,
+            "calculate_entropy": True,
+            "temperature": 1.0,
         }
         kwargs = _engine_forward_kwargs(batch, meta)
         self.assertIn("input_ids", kwargs)
@@ -135,11 +135,10 @@ class TestIsolation(TestCasePlus):
             "image_grid_thw": torch.tensor([[1, 2, 2]]),
             "routed_experts": torch.zeros(1, 4, 1, 1, dtype=torch.long),
             "advantages": torch.ones(1, 4),
-            "temperature": 0.7,
             "cu_seq_lens_q": torch.tensor([0, 4], dtype=torch.int32),
             "seq_idx": torch.zeros(1, 4, dtype=torch.int32),
         }
-        meta = {}
+        meta = {"temperature": 0.7}
         kwargs = _engine_forward_kwargs(batch, meta)
         self.assertIn("action_masks", kwargs)
         self.assertIn("pixel_values", kwargs)
@@ -154,7 +153,7 @@ class TestIsolation(TestCasePlus):
         batch = {"input_ids": torch.arange(4).view(1, 4)}
         meta = {"temperature": 0.7, "calculate_entropy": True, "cu_seq_lens_q": torch.tensor([0, 4])}
         kwargs = _engine_forward_kwargs(batch, meta)
-        self.assertEqual(set(kwargs), {"input_ids"})
+        self.assertEqual(set(kwargs), {"input_ids", "temperature", "calculate_entropy"})
 
     def test_fwd_meta_keys_raises_when_meta_would_be_dropped(self):
         batch = {"input_ids": torch.arange(4).view(1, 4)}
@@ -180,9 +179,9 @@ class TestIsolation(TestCasePlus):
             "position_ids": torch.arange(4).repeat(2, 1),
             "advantages": torch.ones(2, 4),
             "old_log_probs": torch.zeros(2, 4),
-            "calculate_entropy": True,
         }
         meta = {
+            "calculate_entropy": True,
             "cu_seqlens": torch.tensor([0, 4, 8], dtype=torch.int32),
             "loss_mask": torch.ones(2, 4, dtype=torch.bool),
             "old_log_probs_shifted": torch.zeros(2, 4),
@@ -357,6 +356,37 @@ class TestPackedInnerCall(TestCasePlus):
         self.assertIn("input_ids", engine.last_kwargs)
         self.assertIn("position_ids", engine.last_kwargs)
         self.assertIn("use_cache", engine.last_kwargs)
+        self.assertIs(engine.last_kwargs["calculate_entropy"], False)
+
+    def test_pack_forwards_meta_scalar_and_drops_meta_only_model_input(self):
+        engine = _StubEngine()
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
+            "advantages": torch.ones(2, 4),
+            "loss_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
+            "old_log_probs_shifted": torch.zeros(2, 4),
+        }
+        meta = {
+            "pad_token_id": 0,
+            "temperature": 0.5,
+            "calculate_entropy": True,
+            "pixel_values": torch.ones(2, 4, 3),
+        }
+        run_pipeline(
+            engine,
+            (),
+            batch,
+            meta,
+            {"loss_fn": "ap_grpo", "post": [], "config": {}},
+            "cpu",
+            backward=True,
+            pack=True,
+            max_tokens_per_mb=3,
+        )
+        self.assertEqual(engine.last_kwargs["temperature"], 0.5)
+        self.assertTrue(engine.last_kwargs["calculate_entropy"])
+        self.assertNotIn("pixel_values", engine.last_kwargs)
 
 
 class TestGrpoContracts(TestCasePlus):
@@ -440,3 +470,68 @@ class TestPostChainWithinCall(TestCasePlus):
         finally:
             POST_PROCESSORS.pop("_step0_write_flag", None)
             POST_PROCESSORS.pop("_step0_read_flag", None)
+
+
+class TestMetaForwardScalars(TestCasePlus):
+    def test_run_pipeline_rejects_temperature_on_batch(self):
+        engine = _StubEngine()
+        with self.assertRaisesRegex(ValueError, "forward scalars"):
+            run_pipeline(
+                engine,
+                (),
+                {"input_ids": torch.tensor([[1, 2]]), "temperature": 0.7},
+                {},
+                {"loss_fn": None, "post": [], "config": {}},
+                "cpu",
+                backward=False,
+                pack=False,
+            )
+
+    def test_one_element_temperature_becomes_a_float_and_bool_is_rejected(self):
+        engine = _StubEngine()
+        run_pipeline(
+            engine,
+            (),
+            {"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.ones(1, 2, dtype=torch.long)},
+            {
+                "temperature": torch.tensor(0.7),
+                "calculate_entropy": torch.tensor(1),
+                "pad_token_id": 0,
+            },
+            {"loss_fn": None, "post": [], "config": {}},
+            "cpu",
+            backward=False,
+            pack=False,
+        )
+        self.assertAlmostEqual(engine.last_kwargs["temperature"], 0.7)
+        self.assertIs(engine.last_kwargs["calculate_entropy"], True)
+        with self.assertRaisesRegex(ValueError, "not bool"):
+            run_pipeline(
+                engine,
+                (),
+                {"input_ids": torch.tensor([[1, 2]])},
+                {"temperature": True},
+                {"loss_fn": None, "post": [], "config": {}},
+                "cpu",
+                backward=False,
+                pack=False,
+            )
+
+    def test_inv_temperature_broadcasts_a_scalar_and_slices_a_row(self):
+        from arctic_platform.model.implementations.gpu.lm_head import inv_temperature_for_tokens
+        from arctic_platform.model.implementations.gpu.lm_head import slice_temperature_for_logits_to_keep
+
+        inv = inv_temperature_for_tokens(0.5, 2, 3, torch.device("cpu"))
+        self.assertEqual(tuple(inv.shape), (6,))
+        self.assertTrue(torch.equal(inv, torch.full((6,), 2.0)))
+        row = torch.arange(6, dtype=torch.float32).view(2, 3)
+        sliced = slice_temperature_for_logits_to_keep(row, slice(-2, None))
+        self.assertEqual(tuple(sliced.shape), (2, 2))
+        self.assertIs(slice_temperature_for_logits_to_keep(0.5, slice(-2, None)), 0.5)
+
+    def test_fwd_meta_keys_may_name_temperature(self):
+        kwargs = _engine_forward_kwargs(
+            {"input_ids": torch.tensor([[1]])},
+            {"temperature": 0.5, "fwd_meta_keys": ("temperature",)},
+        )
+        self.assertEqual(kwargs["temperature"], 0.5)
