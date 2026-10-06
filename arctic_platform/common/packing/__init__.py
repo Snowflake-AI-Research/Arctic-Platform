@@ -19,8 +19,8 @@ Every training path that packs rows has to agree on where a row begins and ends,
 here. Entry points are pure functions of their arguments -- no process group, no rank lookups, no config
 objects -- which is what lets dispatch and a worker call the same code from opposite sides of the wire.
 
-This is a library copy of ``dss.ray_dss.jobs.gpu.packing``. DSS dispatch and the zone worker still import
-that package. Nothing in ``run_pipeline`` calls this one. ``arctic_platform.rl.processors.packing``
+DSS dispatch and the zone worker import this package and keep no copy of their own. Nothing in
+``run_pipeline`` calls it. The written contract is ``docs/packing.md``. ``arctic_platform.rl.processors.packing``
 (``pack_sequences``) is a different layout: it page-aligns, rewrites ``position_ids``, and does not walk a
 nested ``context``. ``arctic_platform.model.implementations.gpu.packing`` re-exports ``IGNORE_INDEX`` and
 ``cu_seqlens_from_position_ids`` from here so the model stack and this package share one definition.
