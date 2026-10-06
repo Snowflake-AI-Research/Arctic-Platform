@@ -2481,6 +2481,10 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
     TP=1; a bare int is still accepted).  ``model_dir`` is threaded to the
     vLLM child so it can point its compile cache at
     ``<model_dir>/compilation``.
+
+    Node identity for a multi-node TP group arrives as the ``init`` command's
+    ``multinode`` kwarg and is handed to the child at spawn; see the ``init``
+    branch below.
     """
     if isinstance(gpus, int):
         gpus = [gpus]
@@ -2532,8 +2536,14 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
             spawn_ctx = mp.get_context("spawn")
             child_proc = spawn_ctx.Process(
                 target=vllm_child_loop,
-                args=(pipe_child, instance_id, list(gpus), model_dir),
+                args=(pipe_child, instance_id, list(gpus), model_dir,
+                      kwargs.get("multinode")),
             )
+            # ``multinode`` is a spawn argument rather than an ``init`` kwarg
+            # alone because the child pins its NCCL/gloo interface, VLLM_HOST_IP
+            # and the pinned aws-ofi-nccl values before it imports vLLM -- which
+            # happens at module scope in the child, long before the ``init``
+            # command is read off the pipe.
             # In unprivileged mode (SEMIP_UNPRIVILEGED=1), ask ONLY the spawned
             # child to drop its Linux capabilities (at its module import,
             # before torch) so the CRIU image records an empty cap set and
