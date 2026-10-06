@@ -194,8 +194,28 @@ leader    generate, attach, stage, save_weights, detach, sleep, arm_mq_park
 leader    cuda_checkpoint   -> drop_graphs + destroy_nccl across ALL ranks
 agents    cuda_checkpoint   (must follow: the leader's tears down their ranks too)
 leader    criu_dump         -> parks every rank's queue as its last collective
-agents    wait_parked, then criu_dump
+agents    criu_dump         -> waits for its own ranks' .parked markers first
 ```
+
+The agent's wait lives *inside* its `criu_dump`. The actor runs with
+`max_concurrency=2048`, so a separate `wait_parked` call orders nothing, and
+the first production job (`d2f1b141`) dumped node 1 10 ms before its ranks
+parked. The agent's `init` clears its ranks' old markers, because the leader's
+park clears the directory on the leader's pod only.
+
+**One unpark directory per key, on every pod.** The leader's park hands its
+path to all ranks, and each parked reader carries it into its node's image.
+So `Instance._unpark_dir` names a `node<k>` half after its key directory,
+`/dev/shm/semip-unpark-<key>`, and never after `node<k>`. If the halves used
+their own names, the follower would wait for markers, and later write unpark
+orders, in a directory its ranks never read.
+
+**`SEMIP_UNPRIVILEGED` has to match across halves.** The engine defaults it to
+`1` in the leader's process, and `SemipNodeAgent.__init__` sets the same
+default, since it decides the capability level the child records at `init`.
+Without it, the agent's CRIU ran without `--unprivileged` on a uid-1000 pod and
+refused in `check_caps`. CRIU prints that refusal on stdout and only its run id
+on stderr, which is why the dump error now reports both.
 
 Restore:
 
