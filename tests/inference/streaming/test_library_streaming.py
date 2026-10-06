@@ -1,6 +1,7 @@
 """Actual Driver/Pool/Scheduler/Worker stream path; only model output is fake."""
 
 import asyncio
+from dataclasses import asdict
 import os
 from types import SimpleNamespace
 
@@ -116,6 +117,8 @@ class FakeEngineWorker:
         self.legacy_calls = 0
         self.registration_remaining_s = None
         self.abort_calls = 0
+        self.ack_delay_s = 0
+        self.ack_count = 0
 
     def fail_first_abort(self):
         async def abort(request_id):
@@ -156,8 +159,17 @@ class FakeEngineWorker:
         async for event in self.worker.stream_events(attempt_id):
             yield event
 
-    def acknowledge_stream(self, *args):
+    async def acknowledge_stream(self, *args):
+        self.ack_count += 1
+        if self.ack_delay_s:
+            await asyncio.sleep(self.ack_delay_s)
         return self.worker.acknowledge_stream(*args)
+
+    def set_ack_delay(self, seconds):
+        self.ack_delay_s = seconds
+
+    def acks(self):
+        return self.ack_count
 
     async def abort_stream(self, *args):
         return await self.worker.abort_stream(*args)
@@ -346,11 +358,13 @@ def test_cleanup_paths(mode):
             stall_timeout_s=0.7 if mode == "stall" else 10,
             max_buffer_events=4 if mode == "overflow" else 128,
         )
+        # Deltas from one choice merge while the reader is behind, so overflow
+        # needs more open choices than buffer slots.
         stream = driver.stream_generate(
             "model",
             mode,
             "normal" if mode == "overflow" else "blocked",
-            {"max_tokens": 64},
+            {"max_tokens": 64, "n": 8 if mode == "overflow" else 1},
             limits=limits,
         )
         await anext(stream)
@@ -401,6 +415,227 @@ def test_cleanup_paths(mode):
 def test_parameter_rejection(params):
     with pytest.raises(ValueError):
         validate_request("prompt", params)
+
+
+def test_backlog_is_delivered_in_one_batch():
+    async def check():
+        worker = FakeEngineWorker.__ray_metadata__.modified_class()
+        limits = StreamLimits()
+        worker.worker.start_stream("attempt", [1, 2], {"max_tokens": 20}, 20, asdict(limits))
+        session = worker.worker._engine_streams["attempt"]
+        await asyncio.wait_for(session.pump, 5)  # engine done before anyone reads
+        events = worker.worker.stream_events("attempt")
+        batch = await anext(events)
+        # One hand-over. The 20 undelivered deltas merged into one event.
+        assert [event["type"] for event in batch] == [
+            "delta", "choice_finished", "usage", "completed"
+        ]
+        assert batch[0]["text"] == "x" * 20
+        assert [event["sequence"] for event in batch] == [0, 1, 2, 3]
+        await events.aclose()
+
+    asyncio.run(check())
+
+
+def test_batch_is_acknowledged_by_its_last_sequence():
+    async def check():
+        worker = FakeEngineWorker.__ray_metadata__.modified_class()
+        # Three choices, engine paused after the first token: three separate
+        # deltas (choices never merge) and a stream that is still open.
+        worker.worker.start_stream(
+            "attempt", "blocked", {"max_tokens": 4, "n": 3}, 20, asdict(StreamLimits())
+        )
+        session = worker.worker._engine_streams["attempt"]
+        while len(session.buffer.events) < 3:
+            await asyncio.sleep(0.001)
+        events = worker.worker.stream_events("attempt")
+        batch = await anext(events)
+        assert [event["choice_index"] for event in batch] == [0, 1, 2]
+        with pytest.raises(ValueError, match="Unexpected stream acknowledgement"):
+            worker.worker.acknowledge_stream("attempt", batch[0]["sequence"])
+        assert worker.worker.acknowledge_stream("attempt", batch[-1]["sequence"])
+        worker.worker.llm.gate.set()
+        await events.aclose()
+
+    asyncio.run(check())
+
+
+def test_slow_round_trips_do_not_overflow_a_small_buffer():
+    # The engine makes a token every 2 ms and each acknowledgement takes 6 ms.
+    # Delivered one event per round trip, a 16-event buffer overflows within
+    # ~25 tokens; delivered in batches, each round trip takes the backlog.
+    async def check(driver, pool, actor):
+        await actor.set_ack_delay.remote(0.006)
+        limits = StreamLimits(max_buffer_events=16)
+        events = [
+            event
+            async for event in driver.stream_generate(
+                "model", "slow-consumer", [1, 2], {"max_tokens": 100}, limits=limits
+            )
+        ]
+        assert events[-1]["type"] == "completed", events[-1]
+        assert events[-2]["completion_tokens"] == 100
+        assert [event["sequence"] for event in events] == list(range(len(events)))
+        await actor.set_ack_delay.remote(0)
+
+    asyncio.run(exercise(check))
+
+
+def test_read_buffered_hands_over_the_rest_of_a_batch_without_a_round_trip():
+    async def check(driver, pool, actor):
+        await actor.set_ack_delay.remote(0.006)  # let a backlog form
+        stream = driver.stream_generate("model", "batched-reader", [1, 2], {"max_tokens": 60})
+        events = [await anext(stream)]
+        saw_batch = False
+        while events[-1]["type"] != "completed":
+            acks = await actor.acks.remote()
+            more = await stream.read_buffered(1000)
+            assert await actor.acks.remote() == acks  # no round trip
+            saw_batch = saw_batch or bool(more)
+            events.extend(more)
+            if events[-1]["type"] != "completed":
+                events.append(await anext(stream))
+        assert saw_batch
+        assert [event["sequence"] for event in events] == list(range(len(events)))
+        assert events[-2]["completion_tokens"] == 60
+        assert await stream.read_buffered(10) == []
+        await actor.set_ack_delay.remote(0)
+
+    asyncio.run(exercise(check))
+
+
+def test_read_buffered_respects_its_limit():
+    async def check(driver, pool, actor):
+        await actor.set_ack_delay.remote(0.006)
+        stream = driver.stream_generate("model", "limited-reader", [1, 2], {"max_tokens": 60})
+        await anext(stream)
+        while True:
+            more = await stream.read_buffered(2)
+            assert len(more) <= 2
+            if more and more[-1]["type"] == "completed":
+                break
+            if not more:
+                if (await anext(stream))["type"] == "completed":
+                    break
+        await actor.set_ack_delay.remote(0)
+
+    asyncio.run(exercise(check))
+
+
+def _delta(index, text):
+    return {"type": "delta", "choice_index": index, "text": text}
+
+
+def _drain_texts(buffer):
+    return [(e["type"], e.get("choice_index"), e.get("text")) for e in buffer.drain()]
+
+
+def test_waiting_deltas_of_one_choice_merge():
+    buffer = EventBuffer(StreamLimits())
+    for text in ("The", " cat", " sat"):
+        buffer.put(_delta(0, text))
+    assert _drain_texts(buffer) == [("delta", 0, "The cat sat")]
+    assert buffer.bytes == 0
+
+
+def test_merged_deltas_keep_every_token_id():
+    # Usage counts tokens, so a merge that kept only the text would under-report them.
+    buffer = EventBuffer(StreamLimits())
+    for text, token_ids in (("The", [791]), (" cat", [8415]), (" sat", [7731, 13])):
+        buffer.put({**_delta(0, text), "token_ids": token_ids})
+    [event] = buffer.drain()
+    assert event["text"] == "The cat sat"
+    assert event["token_ids"] == [791, 8415, 7731, 13]
+
+
+def test_choices_never_merge_with_each_other():
+    buffer = EventBuffer(StreamLimits())
+    for text in ("a", "b"):
+        buffer.put(_delta(0, text))
+        buffer.put(_delta(1, text.upper()))
+    assert _drain_texts(buffer) == [("delta", 0, "ab"), ("delta", 1, "AB")]
+
+
+def test_delivered_delta_is_not_reopened():
+    buffer = EventBuffer(StreamLimits())
+    buffer.put(_delta(0, "The"))
+    assert _drain_texts(buffer) == [("delta", 0, "The")]
+    buffer.put(_delta(0, " cat"))
+    assert _drain_texts(buffer) == [("delta", 0, " cat")]
+
+
+def test_merging_never_crosses_a_later_event():
+    buffer = EventBuffer(StreamLimits())
+    buffer.put(_delta(0, "a"))
+    buffer.put({"type": "choice_finished", "choice_index": 0, "finish_reason": "stop"})
+    buffer.put(_delta(0, "b"))
+    buffer.put(_delta(1, "c"))
+    buffer.put({"type": "usage", "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3})
+    buffer.put(_delta(1, "d"))
+    assert [(t, i, x) for t, i, x in _drain_texts(buffer)] == [
+        ("delta", 0, "a"),
+        ("choice_finished", 0, None),
+        ("delta", 0, "b"),
+        ("delta", 1, "c"),
+        ("usage", None, None),
+        ("delta", 1, "d"),
+    ]
+
+
+def test_merge_that_would_exceed_event_limit_starts_a_new_event():
+    limits = StreamLimits(max_event_bytes=120, max_buffer_bytes=4096)
+    buffer = EventBuffer(limits)
+    buffer.put(_delta(0, "x" * 40))
+    buffer.put(_delta(0, "y" * 40))
+    events = buffer.drain()
+    assert [e["text"] for e in events] == ["x" * 40, "y" * 40]
+
+
+def test_buffer_bytes_track_merged_sizes():
+    from arctic_platform.inference.server.streaming import event_size
+
+    buffer = EventBuffer(StreamLimits())
+    for text in ("The", " cat", " sat"):
+        buffer.put(_delta(0, text))
+    buffer.put(_delta(1, "hi"))
+    assert buffer.bytes == event_size(_delta(0, "The cat sat")) + event_size(_delta(1, "hi"))
+
+
+def test_slow_reader_no_longer_overflows_on_a_long_answer():
+    # Before merging, 1,000 undelivered tokens needed 1,000 slots.
+    buffer = EventBuffer(StreamLimits(max_buffer_events=2))
+    for _ in range(1000):
+        buffer.put(_delta(0, "x"))
+    assert _drain_texts(buffer) == [("delta", 0, "x" * 1000)]
+
+
+def test_many_choices_behind_a_slow_reader_complete():
+    # 8 choices x 200 tokens is 1,600 deltas; with slow acks a 20-event buffer
+    # overflowed. Merged, each choice needs one slot while behind; the end of
+    # the stream needs 2n + 2 = 18 (finish events never merge).
+    async def check(driver, pool, actor):
+        await actor.set_ack_delay.remote(0.006)
+        events = [
+            event
+            async for event in driver.stream_generate(
+                "model",
+                "many-choices",
+                [1, 2],
+                {"max_tokens": 200, "n": 8},
+                limits=StreamLimits(max_buffer_events=20),
+            )
+        ]
+        assert events[-1]["type"] == "completed", events[-1]
+        assert events[-2]["completion_tokens"] == 1600
+        text = {}
+        for event in events:
+            if event["type"] == "delta":
+                text[event["choice_index"]] = text.get(event["choice_index"], "") + event["text"]
+        assert text == {index: "x" * 200 for index in range(8)}
+        assert [event["sequence"] for event in events] == list(range(len(events)))
+        await actor.set_ack_delay.remote(0)
+
+    asyncio.run(exercise(check))
 
 
 def test_bounded_buffer():
@@ -562,9 +797,9 @@ def test_engine_parameters_and_adapter_are_preserved():
             "attempt", [1, 2], params, 20, asdict(StreamLimits())
         )
         events = worker.stream_events("attempt")
-        async for event in events:
-            if event["type"] != "completed":
-                worker.acknowledge_stream("attempt", event["sequence"])
+        async for batch in events:
+            if batch[-1]["type"] != "completed":
+                worker.acknowledge_stream("attempt", batch[-1]["sequence"])
         prepared, received, kwargs = worker.llm.calls[0]
         assert prepared == {"prompt_token_ids": [1, 2]}
         assert received == params
