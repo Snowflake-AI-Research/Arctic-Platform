@@ -46,6 +46,10 @@ from __future__ import annotations
 import functools
 import sys
 import types
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 from arctic_platform.model.implementations.gpu.action_masks import action_masks_to_lm_head
 from arctic_platform.model.implementations.gpu.action_masks import apply_lm_head_action_masks_
@@ -514,6 +518,8 @@ def enable_chunked_lm_head_logprobs(
         dss_compute_logprobs: bool = False,
         **kwargs,
     ):
+        import torch
+
         if not dss_compute_logprobs:
             # ``logits_to_keep`` is either an int count of trailing positions or a tensor of column indices,
             # so it cannot be put in a truth test: a multi-element tensor raises, and a one-element one answers
