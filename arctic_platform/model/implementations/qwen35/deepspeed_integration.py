@@ -342,9 +342,13 @@ def load_qwen3_5_moe_model(
     return model
 
 
-def _reject_sequence_parallelism(_model: nn.Module, sp_size: int, _sp_group) -> None:
+def _apply_generic_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None:
     if sp_size > 1:
-        raise ValueError("generic MoE families do not support sequence parallelism")
+        from arctic_platform.model.implementations.moe.sequence_parallel import (
+            apply_sequence_parallelism,
+        )
+
+        apply_sequence_parallelism(model, sp_size, sp_group)
 
 
 def _generic_adapter() -> MoEDeepSpeedAdapter:
@@ -354,7 +358,7 @@ def _generic_adapter() -> MoEDeepSpeedAdapter:
 
     return replace(
         _adapter(),
-        apply_sequence_parallelism=_reject_sequence_parallelism,
+        apply_sequence_parallelism=_apply_generic_sequence_parallelism,
         extra_weight_iterators=(("_iter_full_vllm_weights", build_iter_full_vllm_weights),),
     )
 
@@ -394,13 +398,7 @@ def load_generic_moe_model(
     ep_group=None,
     options: Qwen3_5MoeOptions,
 ) -> nn.Module:
-    """Load Qwen3 MoE, GLM-4.5, MiniMax M2, AFMoE, or Nemotron H.
-
-    These families share the Qwen3.5 DeepSpeed lifecycle. Sequence parallelism
-    is rejected rather than routed through the Qwen3.5 Ulysses wrapper.
-    """
-    if sp_size > 1:
-        raise ValueError("generic MoE families do not support sequence parallelism")
+    """Load Qwen3 MoE, GLM-4.5, MiniMax M2, AFMoE, or Nemotron H."""
     model = _load_moe_model(
         _generic_adapter(),
         load_generic_moe_model_for_deepspeed,

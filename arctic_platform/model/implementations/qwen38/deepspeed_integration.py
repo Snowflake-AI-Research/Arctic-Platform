@@ -18,16 +18,25 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-import torch.nn as nn
+from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
-from arctic_platform.model.implementations.moe.deepspeed_integration import MoEDeepSpeedAdapter
+from arctic_platform.model.implementations.moe.deepspeed_integration import (
+    MoEDeepSpeedAdapter,
+)
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
-from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
+from arctic_platform.model.implementations.qwen35 import (
+    deepspeed_integration as qwen_ds,
+)
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
+from arctic_platform.model.implementations.qwen38.qsa_flex import (
+    apply_qsa_flex,
+    register_qsa_flex_backend,
+)
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
 QWEN38_NUM_EXPERTS = 512
+QWEN38_ATTN_BACKEND = "qsa_flex"
 
 
 def _build_model_config(
@@ -38,7 +47,12 @@ def _build_model_config(
     attn_implementation: str,
     options: Qwen3_5MoeOptions,
 ) -> ModelConfig:
-    del attn_implementation
+    if attn_implementation not in (QWEN38_ATTN_BACKEND, "flex_attention"):
+        raise ValueError(
+            "Qwen3.8-Flash-Next training requires the non-SDPA QSA FlexAttention backend; "
+            f"got {attn_implementation!r}"
+        )
+    register_qsa_flex_backend()
     if QWEN38_NUM_EXPERTS % ep_size:
         raise ValueError(
             f"Qwen3.8-Flash-Next has {QWEN38_NUM_EXPERTS} experts, "
@@ -49,10 +63,10 @@ def _build_model_config(
         ep_size,
         dp_replicate,
         optimization_dtype,
-        "sdpa",
+        QWEN38_ATTN_BACKEND,
         options,
     )
-    model_config.attn = "sdpa"
+    model_config.attn = QWEN38_ATTN_BACKEND
     return model_config
 
 
@@ -88,7 +102,7 @@ def load_qwen4_exp_model_for_deepspeed(
     sp_size: int = 1,
     sp_group=None,
 ) -> nn.Module:
-    return qwen_ds._load_moe_model_for_deepspeed(
+    model = qwen_ds._load_moe_model_for_deepspeed(
         _adapter(),
         model_config,
         parallel_dims,
@@ -99,6 +113,8 @@ def load_qwen4_exp_model_for_deepspeed(
         sp_size=sp_size,
         sp_group=sp_group,
     )
+    apply_qsa_flex(model)
+    return model
 
 
 def load_qwen4_exp_model(

@@ -19,27 +19,37 @@ import json
 import pytest
 import torch
 
-from arctic_platform.model import ModelSpec
-from arctic_platform.model import ParallelismConfig
-from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_hf_to_prime
-from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_prime_to_hf
+from arctic_platform.model import ModelSpec, ParallelismConfig
+from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import (
+    convert_hf_to_prime,
+    convert_prime_to_hf,
+)
 
 
 def _require():
     pytest.importorskip("transformers.models.qwen4_exp")
     global Qwen4ExpConfig, Qwen4ExpTextConfig, Qwen4ExpTextSparseMoeBlock
-    global EPShardedEmbedding, Qwen4ExpForConditionalGenerationPrimeRL, Qwen4ExpSparseMoePrimeRL
+    global \
+        EPShardedEmbedding, \
+        Qwen4ExpForConditionalGenerationPrimeRL, \
+        Qwen4ExpSparseMoePrimeRL
     global get_custom_vlm_cls, get_model, ModelConfig
-    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
-    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
-    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import (
+        Qwen4ExpConfig,
+        Qwen4ExpTextConfig,
+    )
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+        Qwen4ExpTextSparseMoeBlock,
+    )
 
     from arctic_platform.model.implementations.qwen35.config import ModelConfig
     from arctic_platform.model.implementations.qwen35.model_builder import get_model
     from arctic_platform.model.implementations.qwen35.models import get_custom_vlm_cls
-    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import EPShardedEmbedding
-    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpForConditionalGenerationPrimeRL
-    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpSparseMoePrimeRL
+    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import (
+        EPShardedEmbedding,
+        Qwen4ExpForConditionalGenerationPrimeRL,
+        Qwen4ExpSparseMoePrimeRL,
+    )
 
 
 def _tiny_config():
@@ -126,7 +136,9 @@ def test_qwen38_family_dispatch_and_custom_vlm_registration(tmp_path):
         model_path_or_name=_checkpoint(tmp_path, "qwen3_5_moe"),
         parallelism=ParallelismConfig(expert_parallel=2),
     )
-    from arctic_platform.model.implementations.qwen38.deepspeed_integration import _adapter
+    from arctic_platform.model.implementations.qwen38.deepspeed_integration import (
+        _adapter,
+    )
 
     assert qwen.loader == "qwen4_exp"
     assert qwen35.loader == "qwen3_5_moe"
@@ -146,7 +158,10 @@ def test_qwen38_replaces_moe_and_shards_ple_embedding():
     language_model = get_language_model(model)
 
     assert model._requires_hf_weight_sync
-    assert all(isinstance(layer.mlp, Qwen4ExpSparseMoePrimeRL) for layer in language_model.layers)
+    assert all(
+        isinstance(layer.mlp, Qwen4ExpSparseMoePrimeRL)
+        for layer in language_model.layers
+    )
     embedding = language_model.layers[0].ple.ple_embedding.ngram_embedding
     assert isinstance(embedding, EPShardedEmbedding)
     assert embedding._dss_shard_on_ep
@@ -244,10 +259,13 @@ def test_qwen38_moe_matches_transformers():
         for parameter in hf_moe.parameters():
             parameter.normal_(mean=0.0, std=0.02)
     state = {
-        f"model.language_model.layers.0.mlp.{name}": tensor.clone() for name, tensor in hf_moe.state_dict().items()
+        f"model.language_model.layers.0.mlp.{name}": tensor.clone()
+        for name, tensor in hf_moe.state_dict().items()
     }
     convert_hf_to_prime(state)
-    prime_moe.load_state_dict({name.split(".mlp.", 1)[1]: tensor for name, tensor in state.items()})
+    prime_moe.load_state_dict(
+        {name.split(".mlp.", 1)[1]: tensor for name, tensor in state.items()}
+    )
     prime_moe.ep_comm_backend = "local"
     prime_moe.experts.forward = prime_moe.experts._forward_deepep
 
@@ -268,23 +286,43 @@ def test_qwen38_moe_matches_transformers():
 )
 def test_qwen38_full_forward_backward():
     _require()
-    from arctic_platform.model.implementations.moe.layers.lm_head import inject_prime_lm_head
+    from arctic_platform.model.implementations.moe.layers.lm_head import (
+        inject_prime_lm_head,
+    )
+    from arctic_platform.model.implementations.qwen38.qsa_flex import (
+        apply_qsa_flex,
+        register_qsa_flex_backend,
+    )
 
-    model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
+    config = _tiny_config()
+    config.text_config.head_dim = 16
+    config.text_config.indexer_head_dim = 8
+    config.use_cache = False
+    config.text_config.use_cache = False
+    register_qsa_flex_backend()
+    config._attn_implementation = "qsa_flex"
+    config.text_config._attn_implementation = "qsa_flex"
+    model = Qwen4ExpForConditionalGenerationPrimeRL(config)
+    apply_qsa_flex(model)
     for layer in model.model.language_model.layers:
         layer.mlp.ep_comm_backend = "local"
         layer.mlp.experts.forward = layer.mlp.experts._forward_deepep
     inject_prime_lm_head(model, fused_cross_entropy=False)
-    model.cuda().train()
+    model.bfloat16().cuda().train()
 
     input_ids = torch.tensor([[2, 3, 4, 5]], device="cuda")
     output = model(input_ids=input_ids, labels=input_ids)
     assert output["logits"].shape == (1, 4, 32)
     output["logits"].sum().backward()
 
-    ple_weight = model.model.language_model.layers[0].ple.ple_embedding.ngram_embedding.weight
+    ple_weight = model.model.language_model.layers[
+        0
+    ].ple.ple_embedding.ngram_embedding.weight
     assert ple_weight.grad is None
     assert model.model.language_model.layers[0].mlp.experts.w1.grad is not None
+    attention = model.model.language_model.layers[1].self_attn
+    assert attention.q_proj.weight.grad is not None
+    assert attention.indexer.index_qk_proj.weight.grad is None
 
 
 def test_qwen38_initializes_meta_buffers():
@@ -307,7 +345,9 @@ def test_qwen38_initializes_meta_buffers():
 def test_qwen38_ep_embedding_masks_nonlocal_rows(monkeypatch):
     _require()
     embedding = EPShardedEmbedding(7, 2)
-    embedding.weight = torch.nn.Parameter(torch.tensor([[4.0, 40.0], [5.0, 50.0], [6.0, 60.0]]))
+    embedding.weight = torch.nn.Parameter(
+        torch.tensor([[4.0, 40.0], [5.0, 50.0], [6.0, 60.0]])
+    )
     embedding._ep_rank = 1
     embedding._ep_world_size = 2
     embedding._ep_group = object()
@@ -325,7 +365,9 @@ def test_qwen38_ep_embedding_masks_nonlocal_rows(monkeypatch):
 
 def test_qwen38_hf_sync_excludes_frozen_ple_table(monkeypatch):
     _require()
-    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+    from arctic_platform.model.implementations.moe.deepspeed_integration import (
+        build_iter_full_hf_weights,
+    )
 
     model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
@@ -337,9 +379,11 @@ def test_qwen38_hf_sync_excludes_frozen_ple_table(monkeypatch):
     assert "model.language_model.layers.0.mlp.experts.gate_up_proj" in names
 
 
-def test_qwen38_adapter_uses_sdpa_and_rejects_sequence_parallelism():
-    from arctic_platform.model.implementations.qwen38.deepspeed_integration import _build_model_config
-    from arctic_platform.model.implementations.qwen38.deepspeed_integration import _validate_parallelism
+def test_qwen38_adapter_uses_qsa_flex_and_rejects_sequence_parallelism():
+    from arctic_platform.model.implementations.qwen38.deepspeed_integration import (
+        _build_model_config,
+        _validate_parallelism,
+    )
     from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
     options = Qwen3_5MoeOptions()
@@ -348,22 +392,55 @@ def test_qwen38_adapter_uses_sdpa_and_rejects_sequence_parallelism():
         8,
         1,
         "bfloat16",
-        "flash_attention_3",
+        "flex_attention",
         options,
     )
-    assert model_config.attn == "sdpa"
+    assert model_config.attn == "qsa_flex"
+    with pytest.raises(ValueError, match="non-SDPA"):
+        _build_model_config(
+            "Qwen/Qwen3.8-Flash-Next",
+            8,
+            1,
+            "bfloat16",
+            "sdpa",
+            options,
+        )
     with pytest.raises(ValueError, match="must divide 512"):
         _build_model_config(
             "Qwen/Qwen3.8-Flash-Next",
             3,
             1,
             "bfloat16",
-            "sdpa",
+            "qsa_flex",
             options,
         )
     _validate_parallelism(1)
     with pytest.raises(NotImplementedError, match="Sequence parallelism"):
         _validate_parallelism(2)
+
+
+def test_qwen38_qsa_route_selection_is_causal():
+    from arctic_platform.model.implementations.qwen38.qsa_flex import (
+        select_qsa_token_ids,
+    )
+
+    queries = torch.ones(1, 12, 1, 2)
+    keys = torch.ones(1, 6, 1, 2)
+    routes = select_qsa_token_ids(
+        queries,
+        keys,
+        torch.tensor([12]),
+        token_budget=4,
+        compress_ratio=2,
+    )
+
+    for position, selected in enumerate(routes[0]):
+        valid = selected[selected >= 0]
+        if position < 5:
+            assert valid.numel() == position + 1
+        else:
+            assert 4 <= valid.numel() <= 5
+        assert torch.all(valid <= position)
 
 
 def test_qwen38_rejects_native_fp8_training():

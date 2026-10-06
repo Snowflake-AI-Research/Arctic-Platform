@@ -12,12 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Loader for generic PrimeRL MoE families ported from DSS #496.
-
-Covers Qwen3 MoE, GLM-4.5, MiniMax M2, AFMoE, and Nemotron H. Expert parallel
-uses the shared DeepSpeed path. Sequence parallelism above one is rejected
-until a family-specific parity case exists.
-"""
+"""Loader for generic PrimeRL MoE families ported from DSS #496."""
 
 from __future__ import annotations
 
@@ -78,8 +73,6 @@ def _validate_spec(spec: ModelSpec) -> None:
         spec.attn_implementation = "flash_attention_3"
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError("generic MoE dtype must be 'bfloat16' or 'float32'")
-    if spec.parallelism.sequence_parallel > 1:
-        raise ValueError("generic MoE families do not support sequence parallelism")
     if spec.patches.peft is not None:
         raise ValueError("generic MoE PEFT requires expert adapter integration, which is not yet supported")
     if spec.patches.liger:
@@ -111,6 +104,8 @@ def load_generic_moe(ctx: LoaderContext) -> LoadedModel:
     groups = ctx.parallel_groups or {}
     if groups.get("ep_group") is None:
         raise ValueError("generic MoE requires parallel_groups['ep_group'] from the runtime")
+    if parallelism.sequence_parallel > 1 and groups.get("sp_group") is None:
+        raise ValueError("generic MoE requires parallel_groups['sp_group'] when sequence_parallel > 1")
 
     from arctic_platform.model.implementations.qwen35.deepspeed_integration import load_generic_moe_model
 
