@@ -2475,9 +2475,9 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
     * the leader checkpoints CUDA first -- that is what drops the graphs and
       tears NCCL down across *all* ranks -- and the agents follow;
     * the leader's ``criu_dump`` parks every rank's message queue as its last
-      collective step, so each agent waits for its own ranks to be parked
-      before dumping. Their calls are issued first and queue on the actor, so
-      the wait overlaps the leader's dump rather than following it.
+      collective step, so each agent's ``criu_dump`` waits for its own ranks
+      to be parked before dumping. Those calls are issued first, so the wait
+      overlaps the leader's dump rather than following it.
     """
     import ray
     from arctic_platform.inference.semi_persistence import Instance, MultiNode
@@ -2536,10 +2536,8 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
         inst.wait()
         ray.get([agent.cuda_checkpoint.remote() for agent in agents])
         # Issued before the leader's dump so the wait inside them overlaps it.
-        dumping = []
-        for k, agent in enumerate(agents):
-            agent.wait_parked.remote()
-            dumping.append(agent.criu_dump.remote(_meta(k + 1)))
+        dumping = [agent.criu_dump.remote(_meta(k + 1))
+                   for k, agent in enumerate(agents)]
         inst.criu_dump(meta_extra=_meta(0))
         inst.wait()
         ray.get(dumping)
