@@ -93,7 +93,11 @@ dev = [
     "arctic_platform[testing]",
 ]
 
+# Pulls [cortex] so the transport tests can import the client. Not [onprem]: it
+# reaches [rl] -> arctic-inference[vllm], and vLLM's build needs CUDA_HOME, which
+# a CPU-only CI runner does not have. The on-prem tests skip without it.
 testing = [
+    "arctic_platform[cortex]",
     "parameterized",
     "pytest-instafail",
     "pytest-flakefinder",
@@ -114,43 +118,33 @@ gdn = [
     "causal-conv1d",
 ]
 
-# Shared DSSST1 tensor wire format.
-wire = [
-    "numpy",
-    "safetensors",
-    "torch",
-]
-
-# HTTP clients shared by Cortex and on-prem transports.
-transport = [
-    "arctic_platform[wire]",
-    "aiohttp",
-    "requests",
-]
-
-# The client, talking to Cortex over SnowAPI.
+# The client, talking to Cortex over SnowAPI (DSSST1 tensor wire format).
 cortex = [
-    "arctic_platform[transport]",
+    "aiohttp",
+    "numpy",
+    "requests",
+    "safetensors",
     "tenacity",
+    "torch",
     "urllib3",
 ]
 
 # A training-only on-prem server, plus the client that drives it. Deliberately
-# excludes the sampling stack: both servers import arctic_inference lazily so
+# excludes the sampling stack: the server imports arctic_inference lazily so
 # this install can serve training without vLLM.
 sft = [
-    "arctic_platform[transport]",
     "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
-    "fastapi",
     "liger-kernel>=0.8.0",
+    "numpy",
     "nvidia-ml-py",
     "peft>=0.18,<0.20",
     "psutil",
     "ray",
+    "safetensors",
     "tensordict",
+    "torch",
     # PEFT 0.19 adapter reload imports EmbeddingParallel, removed in Transformers 5.16.
     "transformers>=5.12.1,<5.16",
-    "uvicorn",
 ]
 
 # Sampling stack that lives in arctic_platform.inference. Not referenced by

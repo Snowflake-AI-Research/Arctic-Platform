@@ -389,6 +389,10 @@ def _internal_grpo_loss_fn(
     # When ECHO is configured, skip the early return so sft_mask /
     # echo_observation_mask can still contribute. Empty-policy shards still
     # run the ECHO terms on this path.
+    #
+    # A shard that must join an SP collective (the seq-mean modes, prompt-mean, or
+    # sequence-level IS) never skips the loss math, or the other ranks of its group
+    # block on the reduction.
     empty_policy_shard = not loss_mask.any()
     validates_zero_denominator = batch_num_tokens == 0 or global_batch_size == 0
     reduces_across_sequence_parallel = _get_sequence_parallel_group() is not None and (
@@ -1081,15 +1085,23 @@ def _grpo_preflight_mask(microbatch: dict) -> torch.Tensor:
     return mask
 
 
-def _active_sequence_count(microbatch: dict, loss_mask: torch.Tensor) -> float:
+def _active_sequence_count(
+    microbatch: dict, loss_mask: torch.Tensor, sp_group: torch.distributed.ProcessGroup | None = None
+) -> float:
     cu_seqlens = microbatch.get("cu_seqlens")
     if torch.is_tensor(cu_seqlens):
         flat_mask = loss_mask.reshape(-1)
         boundaries = cu_seqlens.detach().cpu().tolist()
-        return float(sum(bool(flat_mask[start:end].any().item()) for start, end in pairwise(boundaries)))
-    if loss_mask.ndim >= 2:
-        return float(loss_mask.reshape(loss_mask.shape[0], -1).any(dim=1).sum().item())
-    return float(bool(loss_mask.any().item()))
+        segments = [flat_mask[start:end].any() for start, end in pairwise(boundaries)]
+        active = torch.stack(segments) if segments else flat_mask.new_zeros(0, dtype=torch.bool)
+    elif loss_mask.ndim >= 2:
+        active = loss_mask.reshape(loss_mask.shape[0], -1).any(dim=1)
+    else:
+        active = loss_mask.any().reshape(1)
+    if sp_group is not None:
+        active = active.int()
+        torch.distributed.all_reduce(active, op=torch.distributed.ReduceOp.MAX, group=sp_group)
+    return float(active.sum().item())
 
 
 @dataclass(frozen=True)
@@ -1154,7 +1166,8 @@ def _local_grpo_packed_loss_reduction(
             else local_mean_packed_loss_reduction(weights)
         )
     elif mode in ("seq-mean-token-sum", "seq-mean-token-mean"):
-        weights = [_active_sequence_count(microbatch, mask) for microbatch, mask in zip(microbatches, masks)]
+        sp_group = _get_sequence_parallel_group()
+        weights = [_active_sequence_count(microbatch, mask, sp_group) for microbatch, mask in zip(microbatches, masks)]
         reduction = (
             additive_packed_loss_reduction(weights)
             if config.get("global_batch_size") is not None
