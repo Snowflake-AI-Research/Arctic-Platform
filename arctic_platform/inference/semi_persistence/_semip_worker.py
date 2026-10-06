@@ -34,6 +34,16 @@ import sys
 from vllm.v1.worker.gpu_worker import Worker
 
 
+def _multinode():
+    """True when this TP group spans machines, read from the environment.
+
+    ``vllm_child`` exports ``SEMIP_NNODES`` before vLLM spawns these worker
+    processes, which is the only channel available: a worker imports this
+    module fresh and never sees the child's state.
+    """
+    return int(os.environ.get("SEMIP_NNODES", "1") or 1) > 1
+
+
 class SemipGPUWorker(Worker):
     def init_device(self):
         # fd 1/2 are the pod-log pipe the child handed down, which Python
@@ -165,7 +175,21 @@ class SemipGPUWorker(Worker):
             return super().compile_or_warm_up_model()
         self._semip_release_profile_register_guard()
         self._semip_install_force_copy("warmup")
-        ca_graph_rebind.install_keepgraph_patch()
+        # G3: the keep-graph machinery exists to serve the rebind path, and a
+        # multi-node dump has no rebind -- it destroys the graphs before the
+        # NCCL teardown and captures new ones after the restore.  So across
+        # nodes the retained topology is never read, and the instantiate pass
+        # below would build execs for graphs that `drop_graphs` destroys
+        # minutes later.  Skipping it makes the multi-node cold-start capture
+        # plain vLLM capture, which is exactly what the recapture already is.
+        #
+        # The force-copy patch is NOT gated: it steers the CustomAllreduce copy
+        # path, which is about what the capture records, not about preserving
+        # it -- and vLLM turns custom all-reduce off across nodes anyway, so it
+        # has nothing to do there.  Same for the FlashInfer probe.
+        keep_graphs = not _multinode()
+        if keep_graphs:
+            ca_graph_rebind.install_keepgraph_patch()
         # Normally a no-op that reports the state `init_device` established --
         # but it is not redundant. This is the only install if `init_device`
         # ran before this class was in place, and it is where the state gets
@@ -175,8 +199,14 @@ class SemipGPUWorker(Worker):
             result = super().compile_or_warm_up_model()
         finally:
             ca_graph_rebind.restore_force_copy_patch()
-            ca_graph_rebind.restore_keepgraph_patch()
+            if keep_graphs:
+                ca_graph_rebind.restore_keepgraph_patch()
             ca_graph_rebind.restore_fi_ar_workspace_probe()
+        if not keep_graphs:
+            print("[semip] multi-node: keep-graph patch, instantiate pass and "
+                  "census skipped; graphs are dropped at dump and recaptured "
+                  "after restore", flush=True)
+            return result
         # keep_graph=True is what lets ca_graph_rebind read the captured
         # topology, but torch's capture_end() instantiates only when
         # keep_graph is false, so the patch above also leaves every graph

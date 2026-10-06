@@ -100,9 +100,18 @@ class Instance:
 
     _all: weakref.WeakValueDictionary[int, "Instance"] = weakref.WeakValueDictionary()
 
-    def __init__(self, vllm_config: dict, model_dir: str | None = None):
+    def __init__(self, vllm_config: dict, model_dir: str | None = None,
+                 multinode=None):
         self.gpu = None
         self.vllm_config = vllm_config
+        # Node identity for a TP group that spans machines; None is
+        # single-node, which is every TP <= 8 deployment.  It never enters
+        # ``vllm_config``: that dict is hashed into the image cache key and
+        # compared at restore, so a node_rank or a master address in it would
+        # make the two halves of one job disagree and a restore onto a
+        # different pod pair impossible.  ``nnodes`` is the exception and does
+        # live in the config, because the split changes the image.
+        self.multinode = multinode
         # Optional per-model directory.  When set, the image lives at
         # ``<model_dir>/image`` and ``criu_dump`` / ``criu_restore`` can be
         # called without a filename.  When unset, callers pass explicit
@@ -138,7 +147,22 @@ class Instance:
         # budget).
         self.gpus = None
         self.n_gpus = _local_gpu_count(vllm_config)
-        self.node_rank = int(vllm_config.get("node_rank", 0) or 0)
+        self.nnodes = int(vllm_config.get("nnodes", 1) or 1)
+        # ``node_rank`` still falls back to the config for the experiment
+        # driver, which predates ``MultiNode``.  Production passes the
+        # parameter, and the two must not disagree.
+        if multinode is not None:
+            if self.nnodes < 2:
+                raise ValueError(
+                    "multinode= requires nnodes > 1 in vllm_config; got "
+                    f"nnodes={self.nnodes}")
+            if not 0 <= multinode.node_rank < self.nnodes:
+                raise ValueError(
+                    f"node_rank={multinode.node_rank} out of range for "
+                    f"nnodes={self.nnodes}")
+            self.node_rank = multinode.node_rank
+        else:
+            self.node_rank = int(vllm_config.get("node_rank", 0) or 0)
         self.last_info = {}
         self.max_pinned_bytes_per_worker = 0
 
@@ -360,7 +384,13 @@ class Instance:
         vllm_config = dict(self.vllm_config)
         if tp > 1:
             vllm_config.setdefault("worker_cls", "_semip_worker.SemipGPUWorker")
-        return self._send("init", vllm_config=vllm_config)
+        if self.multinode is None:
+            return self._send("init", vllm_config=vllm_config)
+        # Node identity travels beside the config, never inside it: the child
+        # merges it into its own private copy so the dict that gets hashed and
+        # written to meta.json stays identical on both halves.
+        return self._send("init", vllm_config=vllm_config,
+                          multinode=self.multinode.as_init_kwargs())
 
     def attach(self):
         self._log("attach")
@@ -435,19 +465,41 @@ class Instance:
         # A follower node holds no executor-side queues; the leader's
         # destroy_nccl reaches its ranks.
         if self.n_gpus > 1 and self.node_rank == 0:
+            # G1: across nodes the graphs cannot survive the teardown and must
+            # go first.  vLLM turns custom all-reduce off when ranks span
+            # machines, so every all-reduce a graph captured is an NCCL kernel,
+            # and NCCL will not release a communicator a live graph captured:
+            # commDestroySync spins on `while (comm->localPersistentRefs != 0)`
+            # until the graphs referencing it are destroyed.  Ordering this
+            # before destroy_nccl is what turns that hang into a 2-3 s drop.
+            # The restore pairs it with recapture_graphs.
+            if self.nnodes > 1:
+                self._send("drop_graphs")
             self._send("destroy_nccl")
         return self._send("cuda_checkpoint")
 
-    def reinit_nccl(self, master_addr=None):
+    def reinit_nccl(self, master_addr=None, port=None, ifname=None):
         """Rebuild NCCL / the torch process group after a CRIU restore.
 
         Must run immediately after ``cuda_restore`` and before any
         collective (attach, weight restore, graph replay).  No-op at TP=1.
-        ``master_addr`` is the leader's address in a multi-node group;
-        loopback otherwise.
+
+        Every argument is a kwarg and none of them is read from the
+        environment, because the child is a restored process: its ``environ``
+        is the dump's, so nothing the restoring job sets would be visible
+        there.  ``master_addr`` is the leader's address in a multi-node group
+        and loopback otherwise; ``port`` lets the engine pin one rendezvous
+        for both halves and retry jointly; ``ifname`` is the interface EFA
+        comes up on.  All three default to what this node can work out alone,
+        which is the single-node case.
         """
         self._log("reinit_nccl")
-        return self._send("reinit_nccl", master_addr=master_addr)
+        if ifname is None and self.multinode is not None:
+            ifname = self.multinode.ifname
+        if master_addr is None and self.multinode is not None:
+            master_addr = self.multinode.master_addr
+        return self._send("reinit_nccl", master_addr=master_addr, port=port,
+                          ifname=ifname)
 
     def mq_begin_unpark(self, remote_ranks, connect_ip, local_ranks):
         """Leader: bind the new broadcast writer, order the local ranks.
@@ -535,7 +587,19 @@ class Instance:
         was retired, and a warm image carries its ``cudaGraphExec_t`` handles
         through CRIU intact, so there is nothing to instantiate either.  The
         work is address rewriting and always was, once the image is warm.
+
+        Single-node only.  Across nodes there is nothing to rebind: vLLM turns
+        custom all-reduce off, so the graphs held NCCL kernels, so the dump had
+        to destroy them for ``ncclCommAbort`` to return.  Use
+        ``recapture_graphs``.  Raising rather than quietly doing nothing keeps
+        a mis-ordered restore from reporting success and then wedging on the
+        first replay of a graph that no longer exists.
         """
+        if self.nnodes > 1:
+            raise RuntimeError(
+                "rebind_graphs is single-node only: a multi-node dump drops "
+                "its graphs before destroy_nccl, so there is nothing to "
+                "rebind. Call recapture_graphs() after wake_up_kv_cache().")
         self._log("rebind_graphs")
         return self._send("rebind_graphs")
 

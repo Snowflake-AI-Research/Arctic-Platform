@@ -1101,6 +1101,43 @@ _MQ_PARK = {}
 _FOLLOWER = {}
 _UNPARK = {}
 
+# Node identity when this child is one half of a TP group that spans machines:
+# ``MultiNode.as_init_kwargs()``, set once at spawn.  ``None`` means
+# single-node, which is every TP <= 8 deployment and the path that keeps its
+# graphs through the dump and rebinds them.
+#
+# This is the one source of truth inside the child.  It gates the broadcaster
+# close, the model process-group detach, the graph drop and ``_reinit_nccl``,
+# so a stale second copy would split those decisions.  The experiment driver's
+# ``SEMIP_EXP_MULTINODE_IFNAME`` seeds it at startup rather than being consulted
+# separately.
+_MULTINODE = None
+
+
+# Both helpers below have to answer in two kinds of process.  ``_MULTINODE`` is
+# set in the child, but ``_destroy_nccl`` and ``_reinit_nccl`` are
+# ``collective_rpc`` targets that run in the vLLM worker processes, which import
+# this module fresh and never see the child's globals.  What the workers do
+# inherit is the environment, so the child exports the same two facts there
+# before vLLM spawns them -- and a restored worker carries the dump's environ,
+# which is where ``_reinit_nccl`` reads them from.
+
+
+def _multinode_ifname():
+    """The interface a multi-node group rendezvouses and runs NCCL on.
+
+    ``None`` when single-node, which is what every caller branches on.
+    """
+    return ((_MULTINODE or {}).get("ifname")
+            or os.environ.get("SEMIP_MULTINODE_IFNAME") or None)
+
+
+def _is_multinode():
+    """True when this process belongs to a TP group that spans machines."""
+    if _MULTINODE is not None:
+        return True
+    return int(os.environ.get("SEMIP_NNODES", "1") or 1) > 1
+
 
 def _communicator_checkpoint_targets(ps):
     """Every distinct device communicator, in an order all ranks agree on.
@@ -1821,7 +1858,7 @@ def _destroy_nccl(worker):
             ca.close()
             comm.ca_comm = None
 
-    _multinode = bool(os.environ.get("SEMIP_EXP_MULTINODE_IFNAME"))
+    _multinode = _is_multinode()
     if _multinode:
         _DETACHED_PG_ATTRS[:] = _detach_model_process_groups(worker, ps)
         print(f"[semip-exp] rank {getattr(worker, 'rank', '?')} detached "
@@ -2034,10 +2071,16 @@ def _collective_rpc_with_timeout(llm, fn, args, timeout_s=None, log=None):
     return box["result"]
 
 
-def _reinit_nccl(worker, port, master_addr=None):
+def _reinit_nccl(worker, port, master_addr=None, ifname=None):
     """Re-initialize NCCL after restore on a fresh TCP port, then rebind the
     canonical tp:0/world:0 (+ ep:0/dp:0 for MoE) group slots the captured graphs
-    look up."""
+    look up.
+
+    ``ifname`` is the multi-node interface, passed as a kwarg rather than read
+    from the environment: this process is restored, so its ``environ`` is the
+    dump's and nothing the restoring job sets would be visible here.  It falls
+    back to the inherited value so a single-node restore is unchanged.
+    """
     import traceback
     import weakref
     from vllm.config import set_current_vllm_config
@@ -2047,7 +2090,8 @@ def _reinit_nccl(worker, port, master_addr=None):
         _clear_fd_backed_nccl_env()
         _force_dist_uninitialized_for_restore()
         _net_reset = None
-        _reinit_ifname = os.environ.get("SEMIP_EXP_REINIT_IFNAME")
+        _reinit_ifname = (ifname or os.environ.get("SEMIP_EXP_REINIT_IFNAME")
+                          or _multinode_ifname())
         if _reinit_ifname:
             # The cold start ran on NCCL_NET=Socket so the image holds no
             # initialized EFA state; this is the first EFA bring-up.
@@ -2065,12 +2109,12 @@ def _reinit_nccl(worker, port, master_addr=None):
         os.environ["NCCL_NVLS_ENABLE"] = "0"
         os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
         os.environ["VLLM_ALLREDUCE_USE_FLASHINFER"] = "0"
-        _multinode_ifname = os.environ.get("SEMIP_EXP_MULTINODE_IFNAME")
-        if _multinode_ifname:
+        _mn_ifname = ifname or _multinode_ifname()
+        if _mn_ifname:
             # The restored environ carries the dump pod's address, and the
             # rebuilt groups' broadcasters bind to get_ip().
             import vllm.envs as _envs
-            os.environ["VLLM_HOST_IP"] = _iface_ip(_multinode_ifname)
+            os.environ["VLLM_HOST_IP"] = _iface_ip(_mn_ifname)
             _envs.disable_envs_cache()
             _envs.enable_envs_cache()
         _host = master_addr or "127.0.0.1"
@@ -2080,7 +2124,12 @@ def _reinit_nccl(worker, port, master_addr=None):
             # from distributed_init_method, once nnodes > 1.
             _pc.master_addr = _host
             _pc.master_port = port
-        _rd_keep = getattr(worker, "_semip_rank_data_keep", None)
+        # G3: the rank_data reuse patch keeps the preserved graphs' baked
+        # CustomAllreduce `_dp` pointers valid across the rebuild.  Across
+        # nodes there are no preserved graphs and no CustomAllreduce, so
+        # reusing a dump-era tensor would only pin memory the recapture needs.
+        _rd_keep = (None if _is_multinode()
+                    else getattr(worker, "_semip_rank_data_keep", None))
         with set_current_vllm_config(worker.vllm_config):
             # Reuse the preserved cold-start rank_data tensor (same VA) so the
             # kept-graph CA _dp pointers stay valid.
@@ -2133,6 +2182,22 @@ def _reinit_nccl(worker, port, master_addr=None):
         # barriers in there before any rank is allowed to fail.
         _assert_checkpoint_state_restored(worker, _rekey, _restored)
         out = {"ok": True, "rank": getattr(worker, "rank", "?")}
+        # L3: aws-ofi-nccl exports its EFA defaults ("Adding X to environment")
+        # when it initializes, which on this path is right here.  The cold start
+        # pinned those same values so that a restored engine computes
+        # bit-identically to an EFA cold start -- so a plugin upgrade that
+        # changes a default silently breaks that property.  Report the drift
+        # rather than assert: a mismatch is a correctness warning for the next
+        # dump, not a reason to fail a restore that is otherwise healthy.
+        try:
+            from multinode import PINNED_OFI_ENV
+            drift = {k: (v, os.environ.get(k))
+                     for k, v in PINNED_OFI_ENV.items()
+                     if os.environ.get(k) not in (None, v)}
+            if drift:
+                out["ofi_drift"] = drift
+        except Exception:  # noqa: BLE001
+            pass
         if _net_reset is not None:
             import nccl_bootstrap
             out["net_reset"] = _net_reset
@@ -2730,13 +2795,28 @@ def _semip_recapture_graphs(worker):
     free_after = torch.cuda.mem_get_info()[0]
     census = (ca_graph_rebind.graph_exec_census(worker)
               if _CA_REBIND_AVAILABLE and ca_graph_rebind is not None else {})
-    return {"ok": bool(census.get("n_exec_ok")), "rank": rank,
+    n_graphs = census.get("n_graphs") or 0
+    n_exec_ok = census.get("n_exec_ok") or 0
+    # G5: the cold start subtracted this from the KV budget
+    # (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS), so it is the number the
+    # recapture is supposed to fit inside.  Reported rather than enforced --
+    # the estimate is an estimate, and an over-run that still fits in free
+    # memory is not a failure -- but a recapture creeping past it is how the
+    # restore's staging budget starts colliding with the capture.
+    used_mib = (free_before - free_after) >> 20
+    estimate = getattr(worker, "cudagraph_memory_estimate", None)
+    # Every captured graph must come back instantiated.  `n_exec_ok > 0` would
+    # pass on a recapture that built one graph of four thousand, which is the
+    # failure this is here to catch: `capture_model()` silently returns 0 when
+    # the manager thinks it has nothing to capture.
+    return {"ok": n_graphs > 0 and n_exec_ok == n_graphs, "rank": rank,
             "seconds": round(seconds, 2),
             "unlocked_workspace": unlocked,
-            "used_mib": (free_before - free_after) >> 20,
+            "used_mib": used_mib,
+            "estimate_mib": (int(estimate) >> 20) if estimate else None,
             "free_after_mib": free_after >> 20,
-            "n_graphs": census.get("n_graphs"),
-            "n_exec_ok": census.get("n_exec_ok")}
+            "n_graphs": n_graphs,
+            "n_exec_ok": n_exec_ok}
 
 
 def _semip_graph_census(worker):
@@ -2777,11 +2857,19 @@ def _log_graph_census(llm, log, when):
     return census
 
 
-def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
+def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
+                    multinode=None):
     """Runs in a spawned child process: owns CUDA and vLLM.
 
     ``gpus`` is the physical GPU list for this instance (a single-element
-    list at TP=1).  The main loop has two modes:
+    list at TP=1).  ``multinode`` is ``MultiNode.as_init_kwargs()`` when this
+    node is one half of a TP group that spans machines, and ``None`` -- the
+    single-node case -- otherwise.  It arrives at spawn rather than with the
+    ``init`` command because the environment it decides (the NCCL/gloo
+    interface, ``VLLM_HOST_IP`` and the pinned aws-ofi-nccl values) has to be
+    in place before vLLM is imported.
+
+    The main loop has two modes:
     - **Idle**: blocks on pipe_conn.recv() (zero CPU).
     - **Active** (engine has unfinished requests): alternates between
       engine.step() and non-blocking pipe_conn.poll() so new generate
@@ -2791,6 +2879,16 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
         gpus = [gpus]
     gpus = list(gpus)
     rank = gpus[0]
+    global _MULTINODE
+    if multinode:
+        _MULTINODE = dict(multinode)
+    elif os.environ.get("SEMIP_EXP_MULTINODE_IFNAME"):
+        # The experiment driver predates the MultiNode parameter and sets the
+        # interface in the environment.  Fold it into the same state rather
+        # than leaving two sources of truth for the gates below.
+        _MULTINODE = {"ifname": os.environ["SEMIP_EXP_MULTINODE_IFNAME"],
+                      "node_rank": None, "master_addr": None,
+                      "master_port": None}
     if len(gpus) > 1:
         # TP>1: keep ALL GPUs visible so tensor parallelism can span the
         # group; each vLLM worker is placed on its physical GPU by
@@ -2813,9 +2911,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
     # listening socket's bound address; restoring on a different node then
     # fails at bind() with EADDRNOTAVAIL.  127.0.0.1 exists identically on
     # every node, so loopback makes images node-portable.
-    _multinode_ifname = os.environ.get("SEMIP_EXP_MULTINODE_IFNAME")
-    os.environ["VLLM_HOST_IP"] = (_iface_ip(_multinode_ifname)
-                                  if _multinode_ifname else "127.0.0.1")
+    _mn_ifname = _multinode_ifname()
+    os.environ["VLLM_HOST_IP"] = (_iface_ip(_mn_ifname)
+                                  if _mn_ifname else "127.0.0.1")
     # VLLM_HOST_IP only steers vLLM's own rendezvous.  The collective
     # libraries pick their transport interface independently and default to
     # the routable NIC: gloo keeps a persistent listening socket for the life
@@ -2827,8 +2925,29 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
     # NVLink/P2P rather than these sockets.
     # A multi-node group cannot rendezvous over loopback; every socket bound
     # to the pod address has to be closed before the dump instead.
-    os.environ["NCCL_SOCKET_IFNAME"] = _multinode_ifname or "lo"
-    os.environ["GLOO_SOCKET_IFNAME"] = _multinode_ifname or "lo"
+    # Assignment, not setdefault: dss pins NCCL_SOCKET_IFNAME=^lo into the
+    # job's extra_env for multi-node jobs, which the child inherits, and a
+    # semi-p cold start has to bind sockets its dump can account for and close.
+    os.environ["NCCL_SOCKET_IFNAME"] = _mn_ifname or "lo"
+    os.environ["GLOO_SOCKET_IFNAME"] = _mn_ifname or "lo"
+
+    if _is_multinode():
+        # L2: the multi-node cold-start environment, before vLLM is imported.
+        #
+        # NCCL_NET=Socket keeps EFA out of the image -- its state does not
+        # survive CRIU, and the restore's re-init is the first EFA bring-up.
+        # The pinned aws-ofi-nccl values are what make a restored engine
+        # compute bit-identically to an EFA cold start: NCCL caches its
+        # parameters at the first init in a process, so a socket cold start
+        # would otherwise cache socket-era defaults and the plugin's EFA
+        # values would arrive at the re-init, too late to take effect.
+        from multinode import MULTINODE_COLD_START_ENV, PINNED_OFI_ENV
+        for _k, _v in {**MULTINODE_COLD_START_ENV, **PINNED_OFI_ENV}.items():
+            os.environ[_k] = _v
+        # Readable by the vLLM worker processes, which see the environment but
+        # not this module's globals.  SEMIP_NNODES joins it at ``init``, where
+        # the config is known.
+        os.environ["SEMIP_MULTINODE_IFNAME"] = _mn_ifname
 
     # JIT/compile caches (Triton, vLLM torch.compile, torch inductor,
     # FlashInfer) all produce .so's that get dlopen()'d into the process.
@@ -3471,6 +3590,28 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 # `from vllm.plugins import ...` form.
                 from vllm.plugins import load_general_plugins
                 load_general_plugins()
+                if _is_multinode():
+                    # L1: node identity reaches the engine only here, on this
+                    # private copy.  The caller's dict -- the one hashed into
+                    # the image cache key and written to meta.json -- keeps
+                    # only ``nnodes``, so both halves derive the same key and a
+                    # restored pair can rendezvous somewhere new.
+                    vllm_config["node_rank"] = _MULTINODE["node_rank"]
+                    vllm_config["master_addr"] = _MULTINODE["master_addr"]
+                    vllm_config["master_port"] = _MULTINODE["master_port"]
+                    vllm_config.setdefault("distributed_executor_backend", "mp")
+                    # G3: the keep-graph machinery runs in the worker
+                    # processes vLLM is about to spawn, which cannot see this
+                    # module's globals.  It only serves the rebind path, so at
+                    # nnodes > 1 it builds execs for graphs the dump is about
+                    # to destroy; the gate travels in the environment.
+                    os.environ["SEMIP_NNODES"] = str(
+                        int(vllm_config.get("nnodes", 2) or 2))
+                    log.info(
+                        "  multi-node: node_rank=%s master=%s:%s ifname=%s "
+                        "nnodes=%s", _MULTINODE["node_rank"],
+                        _MULTINODE["master_addr"], _MULTINODE["master_port"],
+                        _MULTINODE["ifname"], os.environ["SEMIP_NNODES"])
                 if int(vllm_config.get("node_rank", 0) or 0) > 0:
                     # Follower node: only this node's ranks, driven by the
                     # leader's executor. No LLM and no engine here, so every
@@ -3538,7 +3679,19 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
 
                 # Record the cold-start CustomAllreduce snapshot that the
                 # post-reinit graph rebind rewrites against (TP>=2, reuse).
-                if _tp >= 2:
+                #
+                # G3: none of this block survives contact with a multi-node
+                # dump.  The snapshot records CustomAllreduce state, which vLLM
+                # does not even build across nodes; the warm pass builds execs
+                # for graphs that `drop_graphs` destroys a few steps later; and
+                # the COLD IMAGE census asks whether the restored engine will
+                # replay or rebuild, when it is going to capture from scratch.
+                if _tp >= 2 and _is_multinode():
+                    log.info(
+                        "  multi-node: graph reuse snapshot, warm pass and "
+                        "COLD IMAGE census skipped -- the graphs are dropped "
+                        "before destroy_nccl and recaptured after the restore")
+                elif _tp >= 2:
                     # The return value used to be dropped. It carries this
                     # rank's meta_ptrs and the cold-start graph inventory --
                     # the only dump-side view of what goes into the image, and
@@ -4212,9 +4365,14 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                         log.info("  cuda probe: %s", _p)
                 except Exception:
                     log.warning("  cuda probe failed", exc_info=True)
-                port = get_open_port()
+                # The leader picks the port unless the caller pinned one.  A
+                # multi-node group rendezvouses on it, so at nnodes > 1 the
+                # engine chooses it for both halves and retries jointly (E6);
+                # a free port here would only be free on this node.
+                port = int(kwargs.get("port") or 0) or get_open_port()
                 results = _collective_rpc_with_timeout(
-                    llm, _reinit_nccl, (port, kwargs.get("master_addr")),
+                    llm, _reinit_nccl,
+                    (port, kwargs.get("master_addr"), kwargs.get("ifname")),
                     timeout_s=kwargs.get("timeout_s"), log=log)
                 failures = [r for r in results
                             if isinstance(r, dict) and not r.get("ok", True)]
@@ -4232,6 +4390,16 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                     raise RuntimeError(f"NCCL reinit failed on workers: {failures}")
                 log.info("  NCCL re-initialized on port %d across %d workers",
                          port, len(results))
+                _drift = {r.get("rank"): r["ofi_drift"] for r in results
+                          if isinstance(r, dict) and r.get("ofi_drift")}
+                if _drift:
+                    log.warning(
+                        "  aws-ofi-nccl exports differ from the pinned set on "
+                        "%d rank(s): %s. The cold start pinned these so a "
+                        "restore matches an EFA cold start bit for bit; a "
+                        "plugin upgrade changing them means the next dump "
+                        "needs the new values pinned instead.",
+                        len(_drift), _drift)
                 for _r in results:
                     if isinstance(_r, dict) and "net_reset" in _r:
                         log.info("    [semip-exp] reinit rank=%s bootstrap=%s "
@@ -4293,6 +4461,26 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                             if not (isinstance(r, dict) and r.get("ok"))]
                 if failures:
                     raise RuntimeError(f"semip {cmd} failed: {failures}")
+                if cmd == "recapture_graphs":
+                    # G5: what the capture cost against what the cold start
+                    # reserved for it, and what is left.  One line, because the
+                    # ranks differ only in the low tens of MiB and the useful
+                    # signal is the worst of them.
+                    _ok = [r for r in results if isinstance(r, dict)]
+                    if _ok:
+                        _est = next((r.get("estimate_mib") for r in _ok
+                                     if r.get("estimate_mib")), None)
+                        log.info(
+                            "  recapture: %d graphs/rank in %.1f-%.1fs, "
+                            "%d-%d MiB used (cold-start estimate %s MiB), "
+                            "%d MiB free on the tightest rank",
+                            max(r.get("n_graphs") or 0 for r in _ok),
+                            min(r.get("seconds") or 0 for r in _ok),
+                            max(r.get("seconds") or 0 for r in _ok),
+                            min(r.get("used_mib") or 0 for r in _ok),
+                            max(r.get("used_mib") or 0 for r in _ok),
+                            _est if _est is not None else "?",
+                            min(r.get("free_after_mib") or 0 for r in _ok))
                 info[cmd] = results
 
             elif cmd == "save_weights":
