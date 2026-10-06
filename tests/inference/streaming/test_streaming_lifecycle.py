@@ -442,12 +442,14 @@ def test_completed_but_undelivered_abort_reports_already_terminal():
 
 
 class _OneEvent:
+    """A worker stream that delivers one batch holding one event."""
+
     def __init__(self, event):
         self.event = event
 
     async def __anext__(self):
         async def ref():
-            return self.event
+            return [self.event]
         return ref()
 
 
