@@ -13,34 +13,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TEMPORARY HTTP SFT smoke driver (not part of the public API).
+"""TEMPORARY SFT smoke driver (not part of the public API).
 
-Runs with ``CUDA_VISIBLE_DEVICES=`` (empty) on the client — all GPU work is
-on the server. When colocating the server via ``--launch-local-server``, pass
-``--server-cuda-visible-devices 0,1`` so the server child still sees GPUs.
+Runs over the in-process Ray transport; GPU work happens in Ray actors, but the
+batch is built on CPU. Example::
 
-Example (colocated, CPU-blanked client)::
-
-    CUDA_VISIBLE_DEVICES= python -m arctic_platform.sft.examples.run_sft_http_demo \\
-        --launch-local-server --server-cuda-visible-devices 0,1 --training-gpus 2
-
-Example (decoupled — server already running on host:port)::
-
-    CUDA_VISIBLE_DEVICES= python -m arctic_platform.sft.examples.run_sft_http_demo \\
-        --host localhost --port 8765 --training-gpus 2
+    CUDA_VISIBLE_DEVICES=0,1 python -m arctic_platform.sft.examples.run_sft_demo --training-gpus 2
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import tempfile
 
-import torch
 from transformers import AutoTokenizer
 
 from arctic_platform.client import ArcticSFTClientConfig
-from arctic_platform.client import OnPremConfig
 from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
 
@@ -131,14 +119,6 @@ def _load_examples(tokenizer, n: int) -> tuple[list[str], list[int]]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--host", default="localhost")
-    ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument(
-        "--comm-protocol",
-        choices=["http", "ray"],
-        default="http",
-        help="Transport: http (phase 1) or ray (in-process actors, phase 2).",
-    )
     ap.add_argument(
         "--loss-fn",
         choices=["sft", "sft_ce"],
@@ -159,19 +139,8 @@ def main() -> None:
     )
     ap.add_argument("--training-gpus", type=int, default=2)
     ap.add_argument("--steps", type=int, default=STEPS)
-    ap.add_argument("--launch-local-server", action="store_true")
-    ap.add_argument(
-        "--server-cuda-visible-devices",
-        default=None,
-        help="GPUs for the local server subprocess (e.g. '0,1'). Client may keep CUDA_VISIBLE_DEVICES empty.",
-    )
     ap.add_argument("--checkpoint-dir", default=None)
     args = ap.parse_args()
-
-    print(f"client CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')!r}")
-    print(f"client torch.cuda.is_available()={torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print("WARNING: client can see CUDA; for a strict CPU-only check set CUDA_VISIBLE_DEVICES=")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
@@ -199,13 +168,6 @@ def main() -> None:
         seed=SEED,
         training_gpus=args.training_gpus,
         job_ready_timeout=600.0,
-        backend=OnPremConfig(
-            protocol=args.comm_protocol,
-            host=args.host,
-            port=args.port,
-            launch_local_server=args.launch_local_server,
-            server_cuda_visible_devices=args.server_cuda_visible_devices,
-        ),
         training=TrainingConfig(
             checkpoint_path=ckpt,
             ds_config={
