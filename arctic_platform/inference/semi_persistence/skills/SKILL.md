@@ -440,6 +440,7 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
 | [`CROSS_NODE_RESTORE.md`](CROSS_NODE_RESTORE.md) | Runbook for dumping on node A and restoring on a low-capability node B |
 | [`TEARDOWN_SCOPING.md`](TEARDOWN_SCOPING.md) | Why the no-namespace teardown killed the pod, and the bounded kill that replaced it |
 | [`tp_DESIGN.md`](tp_DESIGN.md) | Tensor parallelism: the three TP primitives, NCCL teardown/rebuild, graph reuse, and **image warmth** (§5) — why `keep_graph=True` leaves the graphs uninstantiated and why warming the dump is now unconditional |
+| [`MULTINODE_TP16.md`](MULTINODE_TP16.md) | `nnodes > 1`: one engine across two pods. Why NCCL will not let a captured graph's communicator go (so the dump **drops** its graphs and the restore recaptures), the `MultiNode` parameter that keeps node identity out of the cache key, the pinned aws-ofi-nccl values that make a restore bit-identical, the joint `dump_id` protocol, and the measured numbers |
 | [`semi-p_DESIGN.md`](semi-p_DESIGN.md) | The `model_dir` layout, what a re-dump touches, what binds an image — and why an image also has a warmth that nothing records |
 | [`async_generate_DETAILS.md`](async_generate_DETAILS.md) | Async generate, IPC protocol, drain points |
 | [`dss_integration.md`](dss_integration.md) | Restoring an image from a DSS sampling job: the cross-repo config contract, the worker hook, the adapter |

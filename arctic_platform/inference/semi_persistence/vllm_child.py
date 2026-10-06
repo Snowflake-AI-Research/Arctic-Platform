@@ -3576,6 +3576,17 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                         log.warning(
                             "ignoring reserved env key in _env: %s", k)
                         continue
+                    if v == "":
+                        # An empty value means *unset*, not "set to empty".
+                        # Without this there is no way for a caller to take a
+                        # variable back off that something else put on -- and
+                        # for a few of them, NCCL_NET among them, "absent" and
+                        # "empty" are different answers: absent lets NCCL pick
+                        # its plugin, which is how an EFA cold start differs
+                        # from the socket one a multi-node dump needs.
+                        os.environ.pop(k, None)
+                        log.info("  _env unset %s", k)
+                        continue
                     os.environ[k] = str(v)
 
                 # Force vLLM plugins (e.g. arctic_inference) to load

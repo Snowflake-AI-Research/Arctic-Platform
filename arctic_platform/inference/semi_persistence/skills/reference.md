@@ -29,9 +29,12 @@ inst.criu_dump("/data-fast/image-cache/foo").wait()
 | `remove()` | Deregister from `Instance._all`; non-blocking, non-destructive | Main |
 | `wait()` | Block until pending commands complete | Main |
 
-`Instance(vllm_config, model_dir=None)`. With a `model_dir`, the dump and
-restore paths default to `<model_dir>/image` and the compile cache moves
-under `<model_dir>/compilation`; see [semi-p_DESIGN.md](semi-p_DESIGN.md).
+`Instance(vllm_config, model_dir=None, multinode=None)`. With a `model_dir`,
+the dump and restore paths default to `<model_dir>/image` and the compile cache
+moves under `<model_dir>/compilation`; see
+[semi-p_DESIGN.md](semi-p_DESIGN.md). `multinode` is for a TP group that spans
+pods and is `None` everywhere else; see
+[MULTINODE_TP16.md](MULTINODE_TP16.md).
 
 ### GPU residency
 
@@ -53,7 +56,27 @@ placement only and must have exactly that many entries. See
 |---|---|
 | `destroy_nccl()` | Tear down NCCL and CustomAllreduce IPC before a checkpoint, always via the graph-preserving unilateral abort. Also marks the worker's inet TCP sockets `SO_LINGER(1,0)` so their ports skip `TIME_WAIT` when the dump kills the tree (Complication 12) |
 | `reinit_nccl()` | Rebuild NCCL on a fresh port. Must run after `cuda_restore` and before the model runs or a captured graph replays; `attach`/`load_weights` are CPU-only and unconstrained by it |
-| `rebind_graphs()` | Rewrite the preserved decode graphs' stale CustomAllreduce addresses, after `wake_up_kv_cache`. Takes no argument. Was `recapture_graphs(graph_mode=...)` until 2026-09-24; `cleargraph` was retired with it |
+| `rebind_graphs()` | Rewrite the preserved decode graphs' stale CustomAllreduce addresses, after `wake_up_kv_cache`. Takes no argument. **Raises at `nnodes > 1`** — there is nothing to rebind there. Was `recapture_graphs(graph_mode=...)` until 2026-09-24; `cleargraph` was retired with it |
+
+### Multi-node (`nnodes > 1` only)
+
+One engine whose ranks span pods. The gate is the node boundary, not TP: two
+TP=8 replicas across two nodes are two single-node engines and use none of
+this. See [MULTINODE_TP16.md](MULTINODE_TP16.md).
+
+| Primitive | Effect |
+|---|---|
+| `drop_graphs()` | Destroy every captured CUDA graph and empty the containers holding them, then refresh the shared graph pool. Auto-inserted by `cuda_checkpoint` ahead of `destroy_nccl`: across nodes the graphs hold NCCL kernels, and `commDestroySync` polls `while (comm->localPersistentRefs != 0)` until they are gone |
+| `recapture_graphs()` | `model_runner.capture_model()` on every rank, after `reinit_nccl` and `wake_up_kv_cache`. Unlocks the workspace first, since `capture_model()` leaves it locked. Replaces `rebind_graphs` on this path |
+
+`Instance(vllm_config, model_dir, multinode=MultiNode(node_rank, master_addr,
+master_port, ifname))`. `nnodes` goes in `vllm_config` and is hashed into the
+cache key; everything in `MultiNode` is deliberately not, so both halves derive
+the same key and a restored pair can rendezvous somewhere new.
+
+`reinit_nccl(master_addr=, port=, ifname=)` takes kwargs only on this path: the
+child is a restored process, so its `environ` is the dump's and nothing the
+restoring job sets is visible there.
 
 ### CPU buffer and weight transfer
 

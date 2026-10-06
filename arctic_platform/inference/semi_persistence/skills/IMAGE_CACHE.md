@@ -78,6 +78,15 @@ A multi-replica dump is published with `semip_publish.py <root>/<cfg12>_<env12>`
 The publisher requires a contiguous `replica0..N-1`, each recording its own
 `model_dir`, all agreeing on config, image, driver and uid; it hashes every
 replica's `weight/`, refuses unless the hashes are equal, and uploads one copy.
+
+> **A node-spanning dump (`node<k>/`) cannot be published yet.** The publisher
+> knows the flat and `replica<K>` layouts only. It also cannot simply learn the
+> new level: each pod holds just its own half, so there is nothing for one
+> invocation to walk. It needs a two-pod rendezvous -- per-node rows under
+> `_staging/<key>/<dump_id>/node<k>.json`, a `wt12` over the union, each node
+> uploading its own `rank*` and its `node<k>/`, and node 0 writing the sentinel
+> last so the DaemonSet still sees one model directory. See
+> [MULTINODE_TP16.md](MULTINODE_TP16.md) §10.
 The skeleton carries **one** sentinel over every `replica<K>/`, so a node
 verifies all replicas at once -- and the engine treats a pod that cannot
 materialize every replica as a failed job rather than mix restores with cold
@@ -319,14 +328,29 @@ field; `restore_and_wrap` computes the path before it knows whether an image
 exists:
 
 ```
-$SEMIP_IMAGE_CACHE/<cfg12>_<env12>[/replica<K>]
+$SEMIP_IMAGE_CACHE/<cfg12>_<env12>[/replica<K> | /node<k>]
 
 cfg12 = sha256(vllm_config, sorted keys, values verbatim
                + NUL + sorted device nodes, at TP>1 or with several
                  replicas per pod)[:12]
 env12 = sha256(container image digest + nvidia driver version)[:12]
 K     = node-local replica slot, present only with several replicas per pod
+k     = node rank, present only when one engine spans pods (nnodes > 1)
 ```
+
+`replica<K>` and `node<k>` are different axes and do not nest in practice: a
+node-spanning engine is a single replica by construction, since its placement
+group holds the whole `world_size`. So a key carries one or the other.
+
+**`nnodes` is in `cfg12`; the rest of a node's identity is deliberately not.**
+The split changes the image -- half of a TP=16 group is not a TP=8 engine -- so
+it is hashed. `node_rank`, `master_addr`, `master_port` and the interface travel
+in the `MultiNode` parameter instead, because they change on every restore: with
+them in `vllm_config` the two halves of one job hash differently and no restored
+pair can match its own image. Weights also stay at the key level rather than
+under `node<k>/`, since the shards are named by *global* rank
+(`weight/rank{0..15}`) and a restore onto a different pod pair has to find all
+of them in one place. See [MULTINODE_TP16.md](MULTINODE_TP16.md).
 
 **The third term is discovered, not derived.** A published skeleton is named
 `<cfg12>_<env12>_<wt12>`, where `wt12` is a content hash of the staged weight
