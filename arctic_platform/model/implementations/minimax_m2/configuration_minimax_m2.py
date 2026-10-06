@@ -148,3 +148,25 @@ class MiniMaxM2Config(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+
+class MiniMaxM2LegacyConfig(MiniMaxM2Config):
+    model_type = "minimax"
+    attention_bias = False
+    head_dim = 128
+    pad_token_id = None
+    rotary_dim = 64
+    rope_theta = 5000000
+    rope_scaling = None
+    use_grouped_mm = True
+
+    def _restore_legacy_rope_params(self) -> None:
+        self.partial_rotary_factor = self.rotary_dim / self.head_dim
+        self.standardize_rope_params()
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        result = super().from_dict(config_dict, **kwargs)
+        config = result[0] if isinstance(result, tuple) else result
+        config._restore_legacy_rope_params()
+        return result

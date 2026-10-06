@@ -451,6 +451,7 @@ class _ShardAwareFusedWriter:
         self._handlers: dict[str, dict] = {}
 
         self._register_gdn(modules)
+        self._register_sparse_indexer(modules)
         self._register_moe(modules)
 
     # -- registration ------------------------------------------------------
@@ -480,6 +481,31 @@ class _ShardAwareFusedWriter:
             parent_path = mod_path.rsplit(".", 1)[0] if "." in mod_path else ""
             parent = modules.get(parent_path)
             if parent is None or not isinstance(parent, GatedDeltaNetAttention):
+                continue
+            wname = f"{mod_path}.weight"
+            param = self._params.get(wname)
+            if param is None:
+                continue
+            self._handlers[wname] = {
+                "family": "gdn_merged",
+                "module": mod,
+                "param": param,
+                "destination": wname,
+            }
+
+    def _register_sparse_indexer(self, modules: dict[str, nn.Module]) -> None:
+        try:
+            from vllm.model_executor.layers.linear import (
+                MergedColumnParallelLinear,
+            )
+        except Exception:
+            return
+
+        for mod_path, mod in modules.items():
+            if not (
+                isinstance(mod, MergedColumnParallelLinear)
+                and mod_path.endswith(".indexer.wk_weights_proj")
+            ):
                 continue
             wname = f"{mod_path}.weight"
             param = self._params.get(wname)
@@ -548,6 +574,22 @@ class _ShardAwareFusedWriter:
         module = handler["module"]
 
         if family == "gdn_merged":
+            replicated_shard_ids = getattr(module, "replicated_shard_ids", None)
+            if replicated_shard_ids:
+                output_dim = getattr(param, "output_dim", 0)
+                offset = 0
+                for shard_id, output_size in enumerate(module.output_sizes):
+                    if shard_id in replicated_shard_ids:
+                        output_size //= module.tp_size
+                    loaded_shard = tensor.narrow(output_dim, offset, output_size)
+                    module.weight_loader(param, loaded_shard, shard_id)
+                    offset += output_size
+                if offset != tensor.shape[output_dim]:
+                    raise ValueError(
+                        f"Fused GDN tensor has {tensor.shape[output_dim]} rows, "
+                        f"but registered shards consume {offset}"
+                    )
+                return True
             # MergedColumnParallelLinear.weight_loader(param, full_weight,
             # loaded_shard_id=None) splits the full fused tensor by
             # ``output_sizes`` ([q,k,v,z] / [b,a]) and TP-narrows each shard

@@ -56,6 +56,23 @@ def test_expert_parallel_one_does_not_select_generic_loader(tmp_path, model_type
     assert spec.loader == "huggingface"
 
 
+def test_legacy_minimax_config_uses_custom_impl(tmp_path):
+    from transformers import AutoConfig
+
+    from arctic_platform.model.implementations.qwen35.models import supports_custom_impl
+
+    config = AutoConfig.from_pretrained(_checkpoint(tmp_path, "minimax"))
+    assert supports_custom_impl(config)
+    assert config.attention_bias is False
+    assert config.pad_token_id is None
+    assert config.rope_scaling is None
+    assert config.use_grouped_mm is True
+    assert config.partial_rotary_factor == pytest.approx(
+        config.rotary_dim / config.head_dim
+    )
+    assert config.rope_parameters["partial_rotary_factor"] == pytest.approx(0.5)
+
+
 def test_sequence_parallel_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="generic MoE families do not support sequence parallelism"):
         ModelSpec(

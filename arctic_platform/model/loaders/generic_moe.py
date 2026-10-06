@@ -38,7 +38,9 @@ from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loaders.qwen3_5_moe import DebugModelOptions
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
-GENERIC_MOE_MODEL_TYPES = frozenset({"qwen3_moe", "glm4_moe", "minimax_m2", "afmoe", "nemotron_h"})
+GENERIC_MOE_MODEL_TYPES = frozenset(
+    {"qwen3_moe", "glm4_moe", "minimax", "minimax_m2", "afmoe", "nemotron_h"}
+)
 
 
 class GenericMoeOptions(BaseModel):

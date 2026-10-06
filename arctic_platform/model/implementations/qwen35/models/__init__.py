@@ -16,6 +16,7 @@ from arctic_platform.model.implementations.afmoe.modeling_afmoe import AfmoeForC
 from arctic_platform.model.implementations.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 from arctic_platform.model.implementations.glm4_moe.modeling_glm4_moe import Glm4MoeForCausalLM
 from arctic_platform.model.implementations.minimax_m2.configuration_minimax_m2 import MiniMaxM2Config
+from arctic_platform.model.implementations.minimax_m2.configuration_minimax_m2 import MiniMaxM2LegacyConfig
 from arctic_platform.model.implementations.minimax_m2.modeling_minimax_m2 import MiniMaxM2ForCausalLM
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput, cast_float_and_contiguous
@@ -61,6 +62,7 @@ def _register_causal_lm(config_cls: type, model_cls: type, model_type: str) -> N
 for _config_cls, _model_cls, _model_type in (
     (Qwen3MoeConfig, Qwen3MoeForCausalLM, "qwen3_moe"),
     (Glm4MoeConfig, Glm4MoeForCausalLM, "glm4_moe"),
+    (MiniMaxM2LegacyConfig, MiniMaxM2ForCausalLM, "minimax"),
     (MiniMaxM2Config, MiniMaxM2ForCausalLM, "minimax_m2"),
     (AfmoeConfig, AfmoeForCausalLM, "afmoe"),
     (NemotronHConfig, NemotronHForCausalLM, "nemotron_h"),
