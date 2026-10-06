@@ -14,6 +14,7 @@ from uuid import uuid4
 
 MAX_WORKER_STREAMS = 128
 CONTEXT_LIMIT_SOURCES = frozenset({"prompt", "completion_budget"})
+DEFAULT_MAX_TOKENS = 4096
 # Features callers can check before relying on them, like ``read_buffered``.
 STREAM_CAPABILITIES = frozenset({"sampling_params"})
 # Prefixes of vLLM 0.30.0's structured-output validation errors, from
@@ -185,9 +186,11 @@ def validate_request(prompt, sampling_params):
     }
     if unsupported:
         raise ValueError(f"Unsupported streaming parameters: {sorted(unsupported)}")
-    params.setdefault("max_tokens", 4096)
+    # An omitted max_tokens stays unset: the worker defaults it, capped by the context.
     params.setdefault("n", 1)
     for name, ceiling in (("max_tokens", 131072), ("n", 8)):
+        if name not in params:
+            continue
         if type(params[name]) is not int or not 1 <= params[name] <= ceiling:
             raise ValueError(f"{name} must be an integer in [1, {ceiling}]")
     for name, default, lower, upper in (
@@ -283,7 +286,8 @@ def validate_request(prompt, sampling_params):
                 raise ValueError("structured_output schema exceeds 65536 bytes")
     budget = params.get("thinking_token_budget")
     if budget is not None and (
-        type(budget) is not int or not 1 <= budget <= params["max_tokens"]
+        type(budget) is not int
+        or not 1 <= budget <= params.get("max_tokens", DEFAULT_MAX_TOKENS)
     ):
         raise ValueError("thinking_token_budget must be an integer in [1, max_tokens]")
     logprobs = params.get("logprobs")
@@ -479,7 +483,10 @@ class EngineStream:
         self.owner = owner
         self.attempt_id = attempt_id
         self.prompt = prompt
-        self.params = params
+        # A defaulted budget may run past the context; vLLM then stops at the
+        # context length instead, as OpenAI does for an omitted max_tokens.
+        self.default_budget = "max_tokens" not in params
+        self.params = {"max_tokens": DEFAULT_MAX_TOKENS, **params}
         self.expires_at = expires_at
         self.limits = limits
         self.buffer = EventBuffer(limits)
@@ -514,7 +521,10 @@ class EngineStream:
                 if output.prompt_token_ids is not None:
                     prompt_tokens = len(output.prompt_token_ids)
                     max_model_len = self.owner.llm.model_config.max_model_len
-                    if prompt_tokens + self.params["max_tokens"] > max_model_len:
+                    if (
+                        not self.default_budget
+                        and prompt_tokens + self.params["max_tokens"] > max_model_len
+                    ):
                         raise StreamError(
                             "context_length_exceeded",
                             context_limit_source="completion_budget",

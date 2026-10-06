@@ -340,6 +340,25 @@ def test_context_limit_errors_are_classified():
     asyncio.run(with_driver(check))
 
 
+def test_default_output_budget_stops_at_model_context():
+    # 500 prompt tokens leave 12 of the 512-token context; the 4096 default must not fail.
+    async def check(driver):
+        events = [
+            event
+            async for event in driver.stream_generate(
+                "stream-test", uuid4().hex, [1] * 500, {"temperature": 0.0}
+            )
+        ]
+        assert events[-1]["type"] == "completed"
+        usage = events[-2]
+        assert usage["prompt_tokens"] == 500
+        assert 0 < usage["completion_tokens"] <= 12
+        finished = next(event for event in events if event["type"] == "choice_finished")
+        assert finished["finish_reason"] in {"length", "stop"}
+
+    asyncio.run(with_driver(check))
+
+
 def test_logprobs_cover_every_completion_token():
     async def check(driver):
         events = await collect(
