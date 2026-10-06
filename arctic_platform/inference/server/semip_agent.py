@@ -16,7 +16,8 @@ ordering below is that protocol, and it is not arbitrary:
             leader checkpoints CUDA and the follower does the same. The
             leader's ``criu_dump`` parks every rank's message queue as its
             last collective step, so the follower can only dump once its own
-            ranks are parked -- hence ``wait_parked`` between the two.
+            ranks are parked -- hence ``criu_dump`` starts in
+            ``wait_parked``.
 
   Restore   both ``criu_restore``; the leader binds a new broadcast writer and
             hands out a handle; the follower orders its ranks onto it and
@@ -51,6 +52,13 @@ class SemipNodeAgent:
     """
 
     def __init__(self) -> None:
+        from arctic_platform.inference.server.semip_engine import (
+            _UNPRIVILEGED_ENV)
+        # The leader sets this default in its own process only, and the mode
+        # has to match across halves: it decides the capability level each
+        # half's child records at init and the flags its CRIU runs with. As
+        # there, a job's extra_env (this actor's runtime_env) overrides it.
+        os.environ.setdefault(_UNPRIVILEGED_ENV, "1")
         self._inst = None
         self._model_dir: str | None = None
         self._node_rank: int | None = None
@@ -124,6 +132,14 @@ class SemipNodeAgent:
             vllm_config, model_dir,
             multinode=MultiNode(node_rank=node_rank, master_addr=master_addr,
                                 master_port=int(master_port), ifname=ifname))
+        # The leader's park clears the directory on its own pod only, and a
+        # marker left here by an earlier dump of this key would satisfy
+        # wait_parked before this dump's ranks have parked.
+        for path in self._parked_markers().values():
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
         self._inst.init(gpus=list(gpus)).wait()
         return {"ok": True, "node_rank": node_rank, "pid": self._inst.pid}
 
@@ -149,16 +165,13 @@ class SemipNodeAgent:
         contain.
         """
         import time
-        inst = self._require()
-        unpark_dir = inst._unpark_dir()
-        local = int(getattr(inst, "n_gpus", 0) or 0)
-        ranks = range(self._node_rank * local, (self._node_rank + 1) * local)
+        markers = self._parked_markers()
         deadline = time.monotonic() + float(timeout_s)
         while True:
-            missing = [r for r in ranks if not os.path.exists(
-                os.path.join(unpark_dir, f"rank{r}.parked"))]
+            missing = [r for r, path in markers.items()
+                       if not os.path.exists(path)]
             if not missing:
-                return {"ok": True, "ranks": list(ranks)}
+                return {"ok": True, "ranks": list(markers)}
             if time.monotonic() > deadline:
                 raise TimeoutError(
                     f"semi_p agent node{self._node_rank}: ranks {missing} "
@@ -168,7 +181,14 @@ class SemipNodeAgent:
             time.sleep(0.2)
 
     def criu_dump(self, meta_extra: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Dump this half. Destructive: the child is gone afterwards."""
+        """Dump this half once its ranks are parked. Destructive: the child is
+        gone afterwards.
+
+        The wait is in here rather than a separate call because the actor runs
+        calls concurrently, so nothing would order a separate call before this
+        one.
+        """
+        self.wait_parked()
         inst = self._require()
         inst.criu_dump(meta_extra=dict(meta_extra or {})).wait()
         info = (inst.last_info.get("criu_dump") or {})
@@ -245,3 +265,13 @@ class SemipNodeAgent:
                 "semi_p agent: no Instance on this node yet; init() or "
                 "criu_restore() has to run first")
         return self._inst
+
+    def _parked_markers(self) -> dict[int, str]:
+        """``rank -> path`` of the marker each of this node's ranks writes
+        once its message queues are parked."""
+        inst = self._require()
+        unpark_dir = inst._unpark_dir()
+        local = int(inst.n_gpus)
+        first = self._node_rank * local
+        return {r: os.path.join(unpark_dir, f"rank{r}.parked")
+                for r in range(first, first + local)}

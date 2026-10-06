@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import weakref
@@ -540,8 +541,15 @@ class Instance:
     def _unpark_dir(self):
         if self.model_dir is None:
             raise RuntimeError("message-queue park requires a model_dir")
-        return mq_plane.unpark_dir_for(
-            os.path.basename(os.path.normpath(self.model_dir)))
+        model_dir = os.path.normpath(self.model_dir)
+        key = os.path.basename(model_dir)
+        # A half of a multi-node image lives at <key>/node<k>. Every half has
+        # to name the same directory: the leader's park hands its path to all
+        # ranks, each parked reader carries it into its node's image, and the
+        # follower's unpark has to write where those readers poll.
+        if self.nnodes > 1 and re.fullmatch(r"node\d+", key):
+            key = os.path.basename(os.path.dirname(model_dir))
+        return mq_plane.unpark_dir_for(key)
 
     def arm_mq_park(self, ranks=None):
         """Park the executor's message queues as the dump's last collective.

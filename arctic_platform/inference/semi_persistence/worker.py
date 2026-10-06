@@ -785,7 +785,11 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
     finally:
         shutil.rmtree(empty_libdir, ignore_errors=True)
     if result.returncode != 0:
-        detail = result.stderr or result.stdout or "(no output)"
+        # Both streams: criu's pre-log refusals (check_caps among them) go to
+        # stdout via pr_msg, while stderr carries only its run id.
+        detail = "\n".join(
+            s.strip() for s in (result.stderr, result.stdout)
+            if s and s.strip()) or "(no output)"
         log_path = os.path.join(image_dir, "dump.log")
         if os.path.exists(log_path):
             with open(log_path) as f:

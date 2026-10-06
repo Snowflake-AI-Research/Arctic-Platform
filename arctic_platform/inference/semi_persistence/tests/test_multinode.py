@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import sys
+import types
 
 import pytest
 
@@ -41,6 +43,10 @@ _PKG = os.path.dirname(_HERE)                      # .../semi_persistence
 _CHILD = os.path.join(_PKG, "vllm_child.py")
 _INSTANCE = os.path.join(_PKG, "instance.py")
 _WORKER = os.path.join(_PKG, "_semip_worker.py")
+_CRIU_WORKER = os.path.join(_PKG, "worker.py")
+_SERVER = os.path.join(os.path.dirname(_PKG), "server")
+_AGENT = os.path.join(_SERVER, "semip_agent.py")
+_ENGINE = os.path.join(_SERVER, "semip_engine.py")
 
 if _PKG not in sys.path:
     sys.path.insert(0, _PKG)
@@ -364,4 +370,90 @@ def test_the_recapture_requires_every_graph_back():
         src, _function(_tree(_CHILD), "_semip_recapture_graphs"))
     assert "n_exec_ok == n_graphs" in seg, (
         "the recapture must verify the full count, not merely a nonzero one")
+
+
+# ---------------------------------------------------------------------------
+# E: the agent's half of the dump (first production job, 2026-10-06)
+# ---------------------------------------------------------------------------
+
+def _unpark_dir_fn():
+    """``Instance._unpark_dir``, compiled on its own with a stub ``mq_plane``."""
+    fn = _function(_tree(_INSTANCE), "_unpark_dir", cls="Instance")
+    mq_plane = type("mq_plane", (), {"unpark_dir_for": staticmethod(
+        lambda key: os.path.join("/dev/shm", f"semip-unpark-{key}"))})
+    namespace = {"os": os, "re": re, "mq_plane": mq_plane}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), _INSTANCE, "exec"),
+         namespace)
+    return namespace["_unpark_dir"]
+
+
+def _unpark_dir(model_dir, nnodes):
+    return _unpark_dir_fn()(types.SimpleNamespace(model_dir=model_dir,
+                                                  nnodes=nnodes))
+
+
+def test_both_halves_rendezvous_in_one_unpark_directory():
+    """The leader's park hands its directory to every rank, so the parked
+    readers on node 1 poll the leader's path. Named after each half's own
+    ``node<k>``, the follower waited in, and would have unparked into, a
+    directory its ranks never look at."""
+    key = "/data-fast/image-cache_neutrino/79c172ce4f58_42387c11e280"
+    leader = _unpark_dir(f"{key}/node0", 2)
+    assert leader == "/dev/shm/semip-unpark-79c172ce4f58_42387c11e280"
+    assert _unpark_dir(f"{key}/node1/", 2) == leader
+
+
+@pytest.mark.parametrize("model_dir,nnodes,name", [
+    ("/cache/abc_def", 1, "abc_def"),              # every TP<=8 image
+    ("/cache/abc_def/replica1", 1, "replica1"),    # per-replica layout
+    ("/cache/node0", 1, "node0"),                  # not a half: nnodes is 1
+    ("/data-fast/exp2", 2, "exp2"),                # the experiment driver
+])
+def test_the_unpark_directory_is_unchanged_off_the_node_layout(
+        model_dir, nnodes, name):
+    assert _unpark_dir(model_dir, nnodes) == f"/dev/shm/semip-unpark-{name}"
+
+
+def test_the_agent_defaults_unprivileged_mode_like_the_leader():
+    """The leader's default is set in its own process. Without the same one
+    the agent's CRIU ran without --unprivileged and refused at check_caps."""
+    src = open(_AGENT).read()
+    seg = ast.get_source_segment(
+        src, _function(_tree(_AGENT), "__init__", cls="SemipNodeAgent"))
+    assert "os.environ.setdefault(_UNPRIVILEGED_ENV, \"1\")" in seg
+
+
+def test_the_agent_dump_waits_for_its_ranks_to_park():
+    """The actor runs calls concurrently, so a separate ``wait_parked`` call
+    from the leader did not hold the dump back: node 1 dumped 10 ms before
+    its ranks parked."""
+    dump = _function(_tree(_AGENT), "criu_dump", cls="SemipNodeAgent")
+    wait = _call_lineno(dump, "wait_parked")
+    send = _call_lineno(dump, "criu_dump")
+    assert wait is not None and send is not None
+    assert wait < send, "wait_parked must precede the Instance's criu_dump"
+    engine = _function(_tree(_ENGINE), "_dump_multinode")
+    assert _call_lineno(engine, "wait_parked") is None, (
+        "the leader must not issue a fire-and-forget wait_parked")
+
+
+def test_the_agent_init_clears_stale_park_markers():
+    """The leader's park clears its own pod's directory only; a marker left
+    on the follower's pod would satisfy wait_parked immediately."""
+    init = _function(_tree(_AGENT), "init", cls="SemipNodeAgent")
+    clear = _call_lineno(init, "unlink")
+    start = next(sub.lineno for sub in ast.walk(init)
+                 if isinstance(sub, ast.Call)
+                 and getattr(sub.func, "attr", None) == "init")
+    assert clear is not None and clear < start
+
+
+def test_a_failed_dump_reports_both_criu_streams():
+    """check_caps refuses on stdout while stderr holds the run id, so
+    preferring one stream dropped the only line that named the problem."""
+    src = open(_CRIU_WORKER).read()
+    seg = ast.get_source_segment(
+        src, _function(_tree(_CRIU_WORKER), "_worker_criu_save"))
+    assert "result.stderr or result.stdout" not in seg
+    assert "(result.stderr, result.stdout)" in seg
 
