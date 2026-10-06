@@ -307,9 +307,9 @@ def test_no_logprobs_key_unless_requested():
 
 
 def test_json_output_with_a_tool_grammar_is_rejected():
-    worker, events = stream(chat("Weather?"), {"structured_output": {"json_object": True}})
+    worker, events = stream(chat("Weather?"), {"structured_outputs": {"json_object": True}})
     assert events[-1]["code"] == "invalid_chat_request"
-    assert events[-1]["param"] == "structured_output"
+    assert events[-1]["param"] == "structured_outputs"
     assert worker.llm.calls == []
 
 
@@ -321,10 +321,10 @@ def test_json_output_without_a_tool_grammar_is_kept():
             return rendered
 
     worker, events = stream(
-        chat("JSON please"), {"structured_output": {"json_object": True}}, chat_engine=NoGrammar()
+        chat("JSON please"), {"structured_outputs": {"json_object": True}}, chat_engine=NoGrammar()
     )
     assert events[-1]["type"] == "completed"
-    assert worker.llm.calls[0][1]["structured_output"] == {"json_object": True}
+    assert worker.llm.calls[0][1]["structured_outputs"] == {"json_object": True}
 
 
 def test_thinking_budget_is_checked_against_the_chat_budget():

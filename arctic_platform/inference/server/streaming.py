@@ -766,10 +766,10 @@ class EngineStream:
                 raise StreamError("invalid_sampling_params")
         if (
             rendered.structured_outputs is not None
-            and "structured_output" in self.params
+            and "structured_outputs" in self.params
         ):
             # Tool calls need their own grammar; vLLM applies one per request.
-            raise StreamError("invalid_chat_request", param="structured_output")
+            raise StreamError("invalid_chat_request", param="structured_outputs")
         generate_kwargs.update(rendered.generate_kwargs)
         return ChatOutput(rendered, self.params["n"]), rendered.engine_input
 
@@ -856,7 +856,8 @@ class StreamingWorkerMixin:
         # Requests carry plain JSON across Ray; the vLLM type is built here.
         params = dict(params)
         structured_outputs = params.get("structured_outputs")
-        if structured_outputs is not None:
+        # A chat prompt's tool grammar arrives already built.
+        if isinstance(structured_outputs, dict):
             # Imported only when used, so plain streams don't depend on it.
             from vllm.sampling_params import StructuredOutputsParams
 

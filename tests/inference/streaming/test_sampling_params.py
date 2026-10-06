@@ -159,6 +159,15 @@ def test_structured_output_becomes_the_vllm_type(engine_params):
     assert "structured_outputs" not in engine_params({})
 
 
+def test_a_built_chat_grammar_passes_through(engine_params):
+    # A chat prompt's tool grammar arrives as vLLM's type, already built.
+    grammar = object()
+    kwargs = StreamingWorkerMixin()._stream_sampling_params(
+        {"n": 1, "structured_outputs": grammar}
+    ).kwargs
+    assert kwargs["structured_outputs"] is grammar
+
+
 def test_the_singular_structured_output_key_is_unknown():
     # The stream key is vLLM's name for it, structured_outputs.
     with pytest.raises(ValueError, match="Unsupported streaming parameters"):

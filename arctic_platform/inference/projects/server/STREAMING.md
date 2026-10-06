@@ -131,8 +131,8 @@ is; callers map OpenAI values to the model family's own.
   token deltas, so when the parser holds text back and releases it later, or
   splits one delta into several kinds, they may not line up one-to-one with
   the content text.
-- `structured_output` cannot be combined with a chat prompt whose tools need a
-  grammar of their own (`invalid_chat_request`, `param="structured_output"`):
+- `structured_outputs` cannot be combined with a chat prompt whose tools need a
+  grammar of their own (`invalid_chat_request`, `param="structured_outputs"`):
   vLLM applies one grammar per request. Without `max_tokens`,
   `thinking_token_budget` is checked against the budget after rendering.
 
