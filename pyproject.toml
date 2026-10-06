@@ -145,7 +145,6 @@ cortex = [
 sft = [
     "arctic_platform[transport]",
     "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
-    "fastapi",
     "liger-kernel>=0.8.0",
     "nvidia-ml-py",
     # 0.20+ imports EmbeddingParallel only when a tensor-parallel LoRA module is present.
@@ -155,7 +154,6 @@ sft = [
     "tensordict",
     # GLM-5.3-Flash and Qwen3.8-Flash-Next need the Transformers 5.17 model modules.
     "transformers>=5.17,<5.18",
-    "uvicorn",
 ]
 
 # Sampling stack that lives in arctic_platform.inference. Not referenced by

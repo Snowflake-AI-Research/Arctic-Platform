@@ -15,10 +15,8 @@
 
 """Arctic RL package.
 
-Heavy imports (HTTP client/server, weight sync) are lazy so
-``python -m arctic_platform.common.http_server`` (or the back-compat
-``python -m arctic_platform.rl.http_server``) can start a training-only
-server without pulling arctic_inference / vLLM at package import time.
+Heavy imports (client/server, weight sync) are lazy so a training-only
+server can start without pulling arctic_inference / vLLM at package import time.
 
 SFT symbols remain lazily re-exported for back-compat; prefer
 ``arctic_platform.sft``.

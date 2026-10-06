@@ -137,6 +137,9 @@ def test_glm53_tiled_shared_expert_bypasses_wrapped_forward():
     from arctic_platform.model.implementations.moe.layers.moe import BCFeedForward
 
     feed_forward = BCFeedForward(dim=4, hidden_dim=8)
+    with torch.no_grad():
+        for parameter in feed_forward.parameters():
+            parameter.normal_(std=0.1)
     hidden_states = torch.randn(3, 4)
     expected = BCFeedForward.forward(feed_forward, hidden_states)
 

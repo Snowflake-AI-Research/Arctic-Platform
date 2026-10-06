@@ -64,14 +64,9 @@ def make_transport(config: ArcticClientConfig, server_state: Any = None) -> Tran
         return CortexTransport(config)
 
     require_any_dep_group("sft", "rl")
-    from arctic_platform.client.transports.onprem_http import HttpTransport
     from arctic_platform.client.transports.onprem_ray import RayTransport
 
-    if protocol == "ray":
-        return RayTransport(config, server_state=server_state)
-    if server_state is not None:
-        raise ValueError("server_state reconnect is only supported by the in-process Ray transport.")
-    return HttpTransport(config)
+    return RayTransport(config, server_state=server_state)
 
 
 def _check_weight_format(config: ArcticClientConfig, weight_format: str | None) -> None:
