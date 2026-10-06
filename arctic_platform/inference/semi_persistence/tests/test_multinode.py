@@ -448,6 +448,45 @@ def test_the_agent_init_clears_stale_park_markers():
     assert clear is not None and clear < start
 
 
+def test_the_agent_raises_its_own_pid_floor_before_its_instance():
+    """The floor is per PID namespace, so the leader's left node 1's image at
+    ids in the 3000s, where a fresh pod's Ray worker can sit at restore."""
+    init = _function(_tree(_AGENT), "init", cls="SemipNodeAgent")
+    floor = _call_lineno(init, "_raise_pid_floor")
+    inst = _call_lineno(init, "Instance")
+    assert floor is not None and inst is not None and floor < inst
+    src = open(_ENGINE).read()
+    seg = ast.get_source_segment(src, _function(_tree(_ENGINE),
+                                                "_dump_multinode"))
+    assert '"pid_floor": reply.get("pid_floor")' in seg, (
+        "each agent's meta must carry the floor its own pod reached")
+
+
+def test_the_follower_binds_its_response_queues_to_its_own_address():
+    """The leader passed its own IP, and every restored rank on node 1 failed
+    to bind ``tcp://<leader ip>:0`` (EADDRNOTAVAIL) in the dry run."""
+    fn = _function(_tree(_AGENT), "mq_follower_unpark", cls="SemipNodeAgent")
+    assert [a.arg for a in fn.args.args] == ["self", "handle", "ranks"]
+    assert _call_lineno(fn, "_leader_ip") is not None
+    restore = _function(_tree(_ENGINE), "_restore_multinode")
+    calls = [sub for sub in ast.walk(restore)
+             if isinstance(sub, ast.Call)
+             and getattr(sub.func, "attr", None) == "remote"
+             and getattr(sub.func.value, "attr", None) == "mq_follower_unpark"]
+    assert len(calls) == 1 and len(calls[0].args) == 2
+
+
+def test_the_leader_merges_one_handle_blob_per_follower():
+    """Each follower returns one base64 blob. ``extend`` split it into
+    characters, and mq_finish_unpark failed to decode the list."""
+    restore = _function(_tree(_ENGINE), "_restore_multinode")
+    assert _call_lineno(restore, "extend") is None
+    assert _call_lineno(restore, "append") is not None
+    src = open(_CHILD).read()
+    assert ("for blob in [remote] if isinstance(remote, str) else remote:"
+            in src), "the child must accept one blob or a list of them"
+
+
 def test_a_failed_dump_reports_both_criu_streams():
     """check_caps refuses on stdout while stderr holds the run id, so
     preferring one stream dropped the only line that named the problem."""

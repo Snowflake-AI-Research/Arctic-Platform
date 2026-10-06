@@ -4338,8 +4338,10 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 _t_unpark = time.perf_counter()
                 handles = mq_plane.collect_handles(kwargs["unpark_dir"],
                                                    kwargs["local_ranks"])
-                handles.update(pickle.loads(
-                    base64.b64decode(kwargs["remote_handles"])))
+                # One blob per follower node, as mq_follower_unpark returns it.
+                remote = kwargs["remote_handles"]
+                for blob in [remote] if isinstance(remote, str) else remote:
+                    handles.update(pickle.loads(base64.b64decode(blob)))
                 result = mq_plane.finish_unpark(llm, _UNPARK.pop("writer"),
                                                 handles)
                 _MQ_PARK.clear()
