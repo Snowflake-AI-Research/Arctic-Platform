@@ -37,13 +37,17 @@ def _matches(model_type: str):
 
 
 def _validate_common(
-    spec: ModelSpec, family: str, *, default_attention: str = "sdpa"
+    spec: ModelSpec,
+    family: str,
+    *,
+    default_attention: str = "sdpa",
+    allow_sequence_parallel: bool = False,
 ) -> None:
     if spec.attn_implementation is None:
         spec.attn_implementation = default_attention
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError(f"{family} dtype must be 'bfloat16' or 'float32'")
-    if spec.parallelism.sequence_parallel > 1:
+    if spec.parallelism.sequence_parallel > 1 and not allow_sequence_parallel:
         raise NotImplementedError(
             f"Sequence parallelism is not implemented for {family}."
         )
@@ -70,7 +74,21 @@ def _validate_common(
 
 
 def _validate_glm5_next(spec: ModelSpec) -> None:
-    _validate_common(spec, "GLM-5.3-Flash")
+    from arctic_platform.model.implementations.glm53.deepspeed_integration import (
+        GLM53_ATTN_BACKEND,
+    )
+
+    _validate_common(
+        spec,
+        "GLM-5.3-Flash",
+        default_attention=GLM53_ATTN_BACKEND,
+        allow_sequence_parallel=True,
+    )
+    if spec.attn_implementation not in (GLM53_ATTN_BACKEND, "flashmla"):
+        raise ValueError(
+            "GLM-5.3-Flash training requires sparse MLA; "
+            f"got attn_implementation={spec.attn_implementation!r}"
+        )
 
 
 def _validate_qwen4_exp(spec: ModelSpec) -> None:
@@ -98,6 +116,10 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
     if groups.get("ep_group") is None:
         raise ValueError(
             "flash MoE requires parallel_groups['ep_group'] from the runtime"
+        )
+    if ctx.spec.parallelism.sequence_parallel > 1 and groups.get("sp_group") is None:
+        raise ValueError(
+            "flash MoE requires parallel_groups['sp_group'] when sequence_parallel > 1"
         )
     options = Qwen3_5MoeOptions.model_validate(ctx.spec.loader_options)
     assert ctx.spec.attn_implementation is not None

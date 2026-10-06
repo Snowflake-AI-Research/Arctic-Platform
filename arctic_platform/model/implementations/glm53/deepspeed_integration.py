@@ -19,15 +19,23 @@ from __future__ import annotations
 from dataclasses import replace
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
-from arctic_platform.model.implementations.moe.deepspeed_integration import MoEDeepSpeedAdapter
+from arctic_platform.model.implementations.moe.deepspeed_integration import (
+    MoEDeepSpeedAdapter,
+)
 from arctic_platform.model.implementations.moe.layers.moe import BCFeedForward
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
-from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
+from arctic_platform.model.implementations.qwen35 import (
+    deepspeed_integration as qwen_ds,
+)
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+
+from .context_parallel import apply_context_parallelism
+
+GLM53_ATTN_BACKEND = "sparse_mla"
 
 
 def _build_model_config(
@@ -38,32 +46,30 @@ def _build_model_config(
     attn_implementation: str,
     options: Qwen3_5MoeOptions,
 ) -> ModelConfig:
-    del attn_implementation
+    if attn_implementation not in (GLM53_ATTN_BACKEND, "flashmla"):
+        raise ValueError(
+            "GLM-5.3-Flash training requires the non-SDPA sparse-MLA backend; "
+            f"got {attn_implementation!r}"
+        )
     model_config = qwen_ds._build_model_config(
         model_name,
         ep_size,
         dp_replicate,
         optimization_dtype,
-        "sdpa",
+        "eager",
         options,
     )
-    model_config.attn = "sdpa"
+    model_config.attn = "eager"
     return model_config
 
 
-def _validate_parallelism(sp_size: int, _sp_group=None) -> None:
-    if sp_size > 1:
-        raise NotImplementedError(
-            "Sequence parallelism is not implemented for GLM-5.3-Flash. "
-            f"Got sp_size={sp_size}; set training_config.sp_size=1 or omit it."
-        )
+def _apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None:
+    apply_context_parallelism(model, sp_size, sp_group)
 
 
-def _apply_sequence_parallelism(_model: nn.Module, sp_size: int, _sp_group) -> None:
-    _validate_parallelism(sp_size)
-
-
-def _shared_expert_forward(feed_forward: BCFeedForward, hidden_states: torch.Tensor) -> torch.Tensor:
+def _shared_expert_forward(
+    feed_forward: BCFeedForward, hidden_states: torch.Tensor
+) -> torch.Tensor:
     return feed_forward(hidden_states)
 
 
@@ -112,8 +118,7 @@ def load_glm5_next_model(
     ep_group=None,
     options: Qwen3_5MoeOptions,
 ) -> nn.Module:
-    """Load GLM-5.3-Flash on the shared DeepSpeed MoE path with SDPA attention."""
-    _validate_parallelism(sp_size)
+    """Load GLM-5.3-Flash with sparse MLA and context-parallel KDA."""
     model = qwen_ds._load_moe_model(
         _adapter(),
         load_glm5_next_model_for_deepspeed,
