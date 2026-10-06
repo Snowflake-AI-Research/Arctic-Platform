@@ -210,6 +210,12 @@ So `Instance._unpark_dir` names a `node<k>` half after its key directory,
 their own names, the follower would wait for markers, and later write unpark
 orders, in a directory its ranks never read.
 
+**Per-pod values come from each pod.** The ranks on node `k` bind their new
+response writers to *that* pod's address, so the agent resolves `connect_ip`
+itself; given the leader's, every rank failed with EADDRNOTAVAIL. Likewise each
+agent raises its own PID floor at `init`, because the counter is per PID
+namespace, and reports it with its unprivileged mode for its own `meta.json`.
+
 **`SEMIP_UNPRIVILEGED` has to match across halves.** The engine defaults it to
 `1` in the leader's process, and `SemipNodeAgent.__init__` sets the same
 default, since it decides the capability level the child records at `init`.
@@ -222,8 +228,8 @@ Restore:
 ```
 both      criu_restore
 leader    mq_begin_unpark -> handle
-agents    mq_follower_unpark(handle) -> response handles
-leader    mq_finish_unpark(handles)
+agents    mq_follower_unpark(handle) -> one blob of response handles each
+leader    mq_finish_unpark([blob, ...])
 both      cuda_restore
 leader    reinit_nccl (first EFA bring-up), attach, load_weights,
           wake_up_weights, repin, plan/restore_weights, wake_up_kv_cache,

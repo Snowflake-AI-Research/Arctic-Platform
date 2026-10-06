@@ -2492,11 +2492,14 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
     _check_digests(agents, vllm_config)
 
     t0 = time.perf_counter()
-    pid_floor = _raise_pid_floor()
+    # Each half records its own pod's values: the floor is per PID namespace
+    # and the mode is per process, so the leader's say nothing about an agent.
+    per_node = {0: {"pid_floor": _raise_pid_floor(),
+                    "unprivileged": _unprivileged_mode()}}
 
     def _meta(node_rank: int) -> dict[str, Any]:
         return {"image_ref": image_ref, "driver_version": driver_version,
-                "pid_floor": pid_floor, "unprivileged": _unprivileged_mode(),
+                **per_node[node_rank],
                 "nnodes": nnodes, "node_rank": node_rank,
                 "dump_id": dump_id, "dump_ip": dump_ip}
 
@@ -2521,8 +2524,17 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
         # dominates: 25 min for GLM-5.3 on a cold page cache. gloo's own
         # rendezvous timeout is 1800 s, so this wait has to be longer than the
         # thing it is waiting for or it fails the job for being slow.
-        ray.get(started, timeout=_MULTINODE_INIT_TIMEOUT_S)
+        for k, reply in enumerate(
+                ray.get(started, timeout=_MULTINODE_INIT_TIMEOUT_S)):
+            per_node[k + 1] = {"pid_floor": reply.get("pid_floor"),
+                               "unprivileged": reply.get("unprivileged")}
         inst.wait()
+        modes = {k: v["unprivileged"] for k, v in per_node.items()}
+        if len(set(modes.values())) > 1:
+            raise RuntimeError(
+                f"semi_p: the halves run different {_UNPRIVILEGED_ENV} modes "
+                f"({modes}); each fixes the capability level its image "
+                "records, so the pair could never restore under one mode")
         inst.generate([_DUMP_PROMPT], _DUMP_SAMPLING)
         inst.attach()
         inst.stage()
@@ -2610,13 +2622,15 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
         # two halves have to agree on a new one before any collective runs.
         inst.mq_begin_unpark(remote_ranks, leader_ip, local_ranks).wait()
         handle = inst.last_info["mq_begin_unpark"]["handle"]
-        handles: list[Any] = []
+        # One opaque blob per agent, each encoding its ranks' handles; the
+        # leader's child decodes and merges them.
+        handles: list[str] = []
         for k, agent in enumerate(agents):
             reply = ray.get(
                 agent.mq_follower_unpark.remote(
-                    handle, _node_ranks(k + 1, local), leader_ip),
+                    handle, _node_ranks(k + 1, local)),
                 timeout=_MULTINODE_STEP_TIMEOUT_S)
-            handles.extend(reply["handles"])
+            handles.append(reply["handles"])
         inst.mq_finish_unpark(handles, local_ranks).wait()
 
         cuda = [agent.cuda_restore.remote() for agent in agents]
