@@ -112,6 +112,10 @@ is; callers map OpenAI values to the model family's own.
   `tool_call_delta` (`index`, `arguments`, plus `id` and `name` on a call's first
   event). Markup the parser is still matching emits nothing until it resolves.
   `parallel_tool_calls=false` keeps only the first call.
+- The engine detokenizes as the parsers ask: `skip_special_tokens` and
+  `spaces_between_special_tokens` come from the request after the parsers'
+  `adjust_request`, as in vllm serve, so tool and reasoning markup made of
+  special tokens reaches the parser.
 - `choice_finished` reports `tool_calls` when a choice that called a tool stops.
   `usage` adds `reasoning_tokens`, counted by the reasoning parser across choices.
 - Undelivered events merge only with the same kind of the same choice; tool-call

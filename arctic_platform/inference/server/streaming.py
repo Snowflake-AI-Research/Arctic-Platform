@@ -587,11 +587,10 @@ class EngineStream:
             kwargs = {"request_id": self.attempt_id}
             if isinstance(self.prompt, ChatPrompt):
                 chat, prepared = await self._render_chat(kwargs)
-                params = self.owner._stream_sampling_params(
-                    {**self.params, "structured_outputs": chat.rendered.structured_outputs}
-                    if chat.rendered.structured_outputs is not None
-                    else self.params
-                )
+                params = {**self.params, **chat.rendered.detokenize_params}
+                if chat.rendered.structured_outputs is not None:
+                    params["structured_outputs"] = chat.rendered.structured_outputs
+                params = self.owner._stream_sampling_params(params)
             else:
                 params = self.owner._stream_sampling_params(self.params)
                 prepared = (

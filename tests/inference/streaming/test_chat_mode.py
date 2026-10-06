@@ -626,3 +626,64 @@ def test_unexpected_render_failure_is_logged_without_its_message(caplog):
     [record] = [r for r in caplog.records if "render" in r.getMessage().lower()]
     assert "TypeError" in record.getMessage()
     assert "secret user text" not in caplog.text
+
+
+class _ChatRequest(SimpleNamespace):
+    """Stands in for vLLM's ChatCompletionRequest, with its detokenizer defaults."""
+
+    def __init__(self, **fields):
+        super().__init__(skip_special_tokens=True, spaces_between_special_tokens=True, **fields)
+
+    def extract_structured_outputs(self):
+        return None
+
+
+def _engine_whose_parser_adjusts(monkeypatch, adjust_request):
+    """A real ChatEngine whose renderer runs the parser's adjust_request, as vLLM's does."""
+    import sys
+
+    _stub_vllm_chat_modules(monkeypatch)
+    monkeypatch.setattr(
+        sys.modules["vllm.entrypoints.openai.chat_completion.protocol"],
+        "ChatCompletionRequest",
+        _ChatRequest,
+    )
+    engine = _engine_whose_renderer_raises(None)
+
+    async def render_chat(request):
+        adjust_request(request)
+        return [], [{"prompt_token_ids": [1, 2, 3]}]
+
+    engine.online = SimpleNamespace(render_chat=render_chat)
+    engine.parser_cls = None
+    return engine
+
+
+def _keep_special_tokens(request):
+    # vLLM's parser-engine adapters (GLM-5, DeepSeek-V4) and hermes with tools.
+    request.skip_special_tokens = False
+
+
+def _keep_special_tokens_unspaced(request):
+    # Kimi K3: control-token markup must arrive as contiguous text.
+    request.skip_special_tokens = False
+    request.spaces_between_special_tokens = False
+
+
+@pytest.mark.parametrize(
+    "adjust_request,skip,spaces",
+    [
+        (lambda request: None, True, True),
+        (_keep_special_tokens, False, True),
+        (_keep_special_tokens_unspaced, False, False),
+    ],
+)
+def test_engine_detokenizes_as_the_parser_asked(monkeypatch, adjust_request, skip, spaces):
+    # Tool and reasoning markers can be special tokens; skipped, the parser never sees them.
+    engine = _engine_whose_parser_adjusts(monkeypatch, adjust_request)
+    worker, events = stream(chat("Weather?"), chat_engine=engine)
+    assert events[-1]["type"] == "completed"
+    params = worker.llm.calls[0][1]
+    assert params["skip_special_tokens"] is skip
+    assert params["spaces_between_special_tokens"] is spaces
+

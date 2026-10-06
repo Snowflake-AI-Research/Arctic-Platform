@@ -138,6 +138,10 @@ class RenderedChat:
     request: Any
     new_parser: Callable[[], Any]
     structured_outputs: Any = None
+    # Detokenizer flags the parsers' adjust_request set on the request. Tool
+    # and reasoning markers can be special tokens, which the default
+    # skip_special_tokens=True strips before the parser sees them.
+    detokenize_params: dict = field(default_factory=dict)
     generate_kwargs: dict = field(default_factory=dict)
     parallel_tool_calls: bool | None = None
 
@@ -242,6 +246,10 @@ class ChatEngine:
             request=request,
             new_parser=new_parser,
             structured_outputs=request.extract_structured_outputs(),
+            detokenize_params={
+                "skip_special_tokens": request.skip_special_tokens,
+                "spaces_between_special_tokens": request.spaces_between_special_tokens,
+            },
             generate_kwargs=generate_kwargs,
             parallel_tool_calls=prompt.parallel_tool_calls,
         )
