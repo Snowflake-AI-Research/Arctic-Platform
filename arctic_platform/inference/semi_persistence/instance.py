@@ -539,6 +539,22 @@ class Instance:
         self._log("rebind_graphs")
         return self._send("rebind_graphs")
 
+    def drop_graphs(self):
+        """Destroy every captured CUDA graph, before ``cuda_checkpoint``.
+
+        Across nodes the graphs hold NCCL kernels, and ``ncclCommAbort`` does
+        not return while they are alive. Pair with ``recapture_graphs`` on
+        the restore side.
+        """
+        self._log("drop_graphs")
+        return self._send("drop_graphs")
+
+    def recapture_graphs(self):
+        """Capture the CUDA graphs again after a restore whose dump dropped
+        them. Run after ``reinit_nccl`` and ``wake_up_kv_cache``."""
+        self._log("recapture_graphs")
+        return self._send("recapture_graphs")
+
     def criu_dump(self, filename: str | None = None,
                   meta_extra: dict | None = None):
         """CRIU-dump the child process tree to disk (destructive).
