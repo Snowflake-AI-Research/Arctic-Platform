@@ -22,14 +22,10 @@ import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
-from arctic_platform.model.implementations.moe.deepspeed_integration import (
-    MoEDeepSpeedAdapter,
-)
+from arctic_platform.model.implementations.moe.deepspeed_integration import MoEDeepSpeedAdapter
 from arctic_platform.model.implementations.moe.layers.moe import BCFeedForward
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
-from arctic_platform.model.implementations.qwen35 import (
-    deepspeed_integration as qwen_ds,
-)
+from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
@@ -48,8 +44,7 @@ def _build_model_config(
 ) -> ModelConfig:
     if attn_implementation not in (GLM53_ATTN_BACKEND, "flashmla"):
         raise ValueError(
-            "GLM-5.3-Flash training requires the non-SDPA sparse-MLA backend; "
-            f"got {attn_implementation!r}"
+            f"GLM-5.3-Flash training requires the non-SDPA sparse-MLA backend; got {attn_implementation!r}"
         )
     model_config = qwen_ds._build_model_config(
         model_name,
@@ -67,9 +62,7 @@ def _apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> Non
     apply_context_parallelism(model, sp_size, sp_group)
 
 
-def _shared_expert_forward(
-    feed_forward: BCFeedForward, hidden_states: torch.Tensor
-) -> torch.Tensor:
+def _shared_expert_forward(feed_forward: BCFeedForward, hidden_states: torch.Tensor) -> torch.Tensor:
     return BCFeedForward.forward(feed_forward, hidden_states)
 
 

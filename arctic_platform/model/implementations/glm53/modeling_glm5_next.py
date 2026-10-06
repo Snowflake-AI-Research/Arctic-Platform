@@ -16,25 +16,21 @@
 from __future__ import annotations
 
 import torch
-from torch import Tensor, nn
-from transformers.models.glm5_next.modeling_glm5_next import (
-    Glm5NextForConditionalGeneration,
-    Glm5NextTextMoE,
-)
+from torch import Tensor
+from torch import nn
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextForConditionalGeneration
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextMoE
 
-from arctic_platform.model.implementations.fp8 import (
-    BlockFp8Linear,
-    fp8_weight_block_size,
-)
+from arctic_platform.model.implementations.fp8 import BlockFp8Linear
+from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
-from arctic_platform.model.implementations.moe.layers.moe import MoE, MoEArgs
+from arctic_platform.model.implementations.moe.layers.moe import MoE
+from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 
-from .converting_glm5_next import (
-    convert_hf_layer_to_prime,
-    convert_hf_to_prime,
-    convert_prime_layer_to_hf,
-    convert_prime_to_hf,
-)
+from .converting_glm5_next import convert_hf_layer_to_prime
+from .converting_glm5_next import convert_hf_to_prime
+from .converting_glm5_next import convert_prime_layer_to_hf
+from .converting_glm5_next import convert_prime_to_hf
 
 
 def _fp8_modules_to_skip(config) -> set[str]:
@@ -61,14 +57,11 @@ def _replace_native_fp8_linears(model: nn.Module, config, block_size: int) -> No
             ".self_attn.f_b_proj",
         )
         if checkpoint_name.endswith(".mlp.gate") or any(
-            checkpoint_name == prefix or checkpoint_name.startswith(f"{prefix}.")
-            for prefix in skipped
+            checkpoint_name == prefix or checkpoint_name.startswith(f"{prefix}.") for prefix in skipped
         ):
             continue
         if module.bias is not None:
-            raise NotImplementedError(
-                f"GLM-5.3 native FP8 linear {checkpoint_name!r} has a bias"
-            )
+            raise NotImplementedError(f"GLM-5.3 native FP8 linear {checkpoint_name!r} has a bias")
         parent_name, _, child_name = name.rpartition(".")
         parent = language_model.get_submodule(parent_name) if parent_name else language_model
         setattr(
@@ -90,9 +83,7 @@ class Glm5NextForConditionalGenerationPrimeRL(
     def __init__(self, config, **_kwargs):
         fp8_block_size = fp8_weight_block_size(config)
         if getattr(config, "quantization_config", None) and fp8_block_size is None:
-            raise NotImplementedError(
-                "GLM-5.3 training only supports BF16 or fine-grained FP8 checkpoints"
-            )
+            raise NotImplementedError("GLM-5.3 training only supports BF16 or fine-grained FP8 checkpoints")
         super().__init__(config)
         text_config = config.text_config
         for layer in self.model.language_model.layers:

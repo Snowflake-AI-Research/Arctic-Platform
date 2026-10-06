@@ -22,7 +22,9 @@ Sequence parallelism above one is rejected. Qwen3.8 expert parallel must divide
 from __future__ import annotations
 
 from arctic_platform.model.config import ModelSpec
-from arctic_platform.model.loader import LoadedModel, LoaderContext, register_loader
+from arctic_platform.model.loader import LoadedModel
+from arctic_platform.model.loader import LoaderContext
+from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
@@ -48,13 +50,9 @@ def _validate_common(
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError(f"{family} dtype must be 'bfloat16' or 'float32'")
     if spec.parallelism.sequence_parallel > 1 and not allow_sequence_parallel:
-        raise NotImplementedError(
-            f"Sequence parallelism is not implemented for {family}."
-        )
+        raise NotImplementedError(f"Sequence parallelism is not implemented for {family}.")
     if spec.patches.peft is not None:
-        raise ValueError(
-            f"{family} PEFT requires expert adapter integration, which is not yet supported"
-        )
+        raise ValueError(f"{family} PEFT requires expert adapter integration, which is not yet supported")
     if spec.patches.liger:
         raise ValueError(
             f"the {family} loader does not support the liger patch; "
@@ -68,15 +66,11 @@ def _validate_common(
         or spec.patches.lm_head
         or spec.patches.zorro_train
     ):
-        raise ValueError(
-            f"{family} uses loader_options.ac_config and does not support generic forward patches"
-        )
+        raise ValueError(f"{family} uses loader_options.ac_config and does not support generic forward patches")
 
 
 def _validate_glm5_next(spec: ModelSpec) -> None:
-    from arctic_platform.model.implementations.glm53.deepspeed_integration import (
-        GLM53_ATTN_BACKEND,
-    )
+    from arctic_platform.model.implementations.glm53.deepspeed_integration import GLM53_ATTN_BACKEND
 
     _validate_common(
         spec,
@@ -86,16 +80,13 @@ def _validate_glm5_next(spec: ModelSpec) -> None:
     )
     if spec.attn_implementation not in (GLM53_ATTN_BACKEND, "flashmla"):
         raise ValueError(
-            "GLM-5.3-Flash training requires sparse MLA; "
-            f"got attn_implementation={spec.attn_implementation!r}"
+            f"GLM-5.3-Flash training requires sparse MLA; got attn_implementation={spec.attn_implementation!r}"
         )
 
 
 def _validate_qwen4_exp(spec: ModelSpec) -> None:
-    from arctic_platform.model.implementations.qwen38.deepspeed_integration import (
-        QWEN38_ATTN_BACKEND,
-        QWEN38_NUM_EXPERTS,
-    )
+    from arctic_platform.model.implementations.qwen38.deepspeed_integration import QWEN38_ATTN_BACKEND
+    from arctic_platform.model.implementations.qwen38.deepspeed_integration import QWEN38_NUM_EXPERTS
 
     _validate_common(spec, "Qwen3.8-Flash-Next", default_attention=QWEN38_ATTN_BACKEND)
     if spec.attn_implementation not in (QWEN38_ATTN_BACKEND, "flex_attention"):
@@ -114,13 +105,9 @@ def _validate_qwen4_exp(spec: ModelSpec) -> None:
 def _load(ctx: LoaderContext, load_model) -> LoadedModel:
     groups = ctx.parallel_groups or {}
     if groups.get("ep_group") is None:
-        raise ValueError(
-            "flash MoE requires parallel_groups['ep_group'] from the runtime"
-        )
+        raise ValueError("flash MoE requires parallel_groups['ep_group'] from the runtime")
     if ctx.spec.parallelism.sequence_parallel > 1 and groups.get("sp_group") is None:
-        raise ValueError(
-            "flash MoE requires parallel_groups['sp_group'] when sequence_parallel > 1"
-        )
+        raise ValueError("flash MoE requires parallel_groups['sp_group'] when sequence_parallel > 1")
     options = Qwen3_5MoeOptions.model_validate(ctx.spec.loader_options)
     assert ctx.spec.attn_implementation is not None
     model = load_model(
@@ -143,9 +130,7 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
     validate_spec=_validate_glm5_next,
 )
 def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
-    from arctic_platform.model.implementations.glm53.deepspeed_integration import (
-        load_glm5_next_model,
-    )
+    from arctic_platform.model.implementations.glm53.deepspeed_integration import load_glm5_next_model
 
     return _load(ctx, load_glm5_next_model)
 
@@ -157,8 +142,6 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     validate_spec=_validate_qwen4_exp,
 )
 def load_qwen4_exp(ctx: LoaderContext) -> LoadedModel:
-    from arctic_platform.model.implementations.qwen38.deepspeed_integration import (
-        load_qwen4_exp_model,
-    )
+    from arctic_platform.model.implementations.qwen38.deepspeed_integration import load_qwen4_exp_model
 
     return _load(ctx, load_qwen4_exp_model)

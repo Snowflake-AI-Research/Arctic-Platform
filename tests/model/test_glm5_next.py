@@ -17,14 +17,11 @@ import json
 import pytest
 import torch
 
-from arctic_platform.model import ModelSpec, ParallelismConfig
-from arctic_platform.model.implementations.glm53.converting_glm5_next import (
-    convert_hf_layer_to_prime,
-    convert_prime_layer_to_hf,
-)
-from arctic_platform.model.implementations.glm53.vllm_weights import (
-    convert_glm5_next_layer_to_vllm,
-)
+from arctic_platform.model import ModelSpec
+from arctic_platform.model import ParallelismConfig
+from arctic_platform.model.implementations.glm53.converting_glm5_next import convert_hf_layer_to_prime
+from arctic_platform.model.implementations.glm53.converting_glm5_next import convert_prime_layer_to_hf
+from arctic_platform.model.implementations.glm53.vllm_weights import convert_glm5_next_layer_to_vllm
 
 
 def _checkpoint(tmp_path, model_type: str) -> str:
@@ -36,11 +33,9 @@ def _checkpoint(tmp_path, model_type: str) -> str:
 
 def _tiny_config():
     pytest.importorskip("transformers.models.glm5_next")
-    from transformers.models.glm5_next.configuration_glm5_next import (
-        Glm5NextConfig,
-        Glm5NextTextConfig,
-        Glm5NextVisionConfig,
-    )
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextConfig
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextVisionConfig
 
     text = Glm5NextTextConfig(
         vocab_size=32,
@@ -112,9 +107,7 @@ def test_glm53_flash_family_dispatch_uses_model_type(tmp_path):
 
 
 def test_glm53_custom_model_replaces_only_sparse_moe():
-    from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
-        Glm5NextForConditionalGenerationPrimeRL,
-    )
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
     from arctic_platform.model.implementations.moe.layers.moe import MoE
 
     config = _tiny_config()
@@ -131,9 +124,7 @@ def test_glm53_custom_model_replaces_only_sparse_moe():
 
 
 def test_glm53_tiled_shared_expert_bypasses_wrapped_forward():
-    from arctic_platform.model.implementations.glm53.deepspeed_integration import (
-        _shared_expert_forward,
-    )
+    from arctic_platform.model.implementations.glm53.deepspeed_integration import _shared_expert_forward
     from arctic_platform.model.implementations.moe.layers.moe import BCFeedForward
 
     feed_forward = BCFeedForward(dim=4, hidden_dim=8)
@@ -154,13 +145,9 @@ def test_glm53_tiled_shared_expert_bypasses_wrapped_forward():
 
 
 def test_glm53_vlm_registry_selects_custom_model_and_language_stack():
-    from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
-        Glm5NextForConditionalGenerationPrimeRL,
-    )
-    from arctic_platform.model.implementations.moe.vlm import (
-        get_language_model,
-        is_vlm_architecture,
-    )
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+    from arctic_platform.model.implementations.moe.vlm import get_language_model
+    from arctic_platform.model.implementations.moe.vlm import is_vlm_architecture
 
     config = _tiny_config()
     assert is_vlm_architecture(config)
@@ -171,9 +158,7 @@ def test_glm53_vlm_registry_selects_custom_model_and_language_stack():
 
 
 def test_glm53_reinitializes_vision_rotary_buffer_after_meta_load():
-    from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
-        Glm5NextForConditionalGenerationPrimeRL,
-    )
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
 
     with torch.device("meta"):
         model = Glm5NextForConditionalGenerationPrimeRL(_tiny_config())
@@ -188,20 +173,13 @@ def test_glm53_reinitializes_vision_rotary_buffer_after_meta_load():
         )
         torch.testing.assert_close(rotary.original_inv_freq, expected)
     else:
-        expected = 1.0 / (
-            rotary.theta
-            ** (torch.arange(0, rotary.dim, 2, dtype=torch.float32) / rotary.dim)
-        )
+        expected = 1.0 / (rotary.theta ** (torch.arange(0, rotary.dim, 2, dtype=torch.float32) / rotary.dim))
     torch.testing.assert_close(rotary.inv_freq, expected)
 
 
 def test_glm53_weight_sync_includes_router_bias_buffer():
-    from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
-        Glm5NextForConditionalGenerationPrimeRL,
-    )
-    from arctic_platform.model.implementations.moe.vllm_weights import (
-        named_weight_sync_tensors,
-    )
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+    from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
 
     with torch.device("meta"):
         model = Glm5NextForConditionalGenerationPrimeRL(_tiny_config())
@@ -311,17 +289,13 @@ def test_glm53_vllm_packer_fuses_sparse_mla_and_moe():
 
 def test_glm53_native_fp8_training_builds_quantized_modules():
     from arctic_platform.model.implementations.fp8 import BlockFp8Linear
-    from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
-        Glm5NextForConditionalGenerationPrimeRL,
-    )
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
 
     config = _tiny_config()
     config.quantization_config = {
         "quant_method": "fp8",
         "weight_block_size": [128, 128],
-        "modules_to_not_convert": [
-            f"model.layers.{layer_idx}.self_attn" for layer_idx in range(4)
-        ],
+        "modules_to_not_convert": [f"model.layers.{layer_idx}.self_attn" for layer_idx in range(4)],
     }
     with torch.device("meta"):
         model = Glm5NextForConditionalGenerationPrimeRL(config)
@@ -346,9 +320,7 @@ def test_glm53_defaults_to_sparse_mla_and_allows_context_parallelism(tmp_path):
 
 
 def test_glm53_sparse_reference_supports_rectangular_context_parallelism():
-    from arctic_platform.model.implementations.glm53.context_parallel import (
-        _reference_sparse_mla,
-    )
+    from arctic_platform.model.implementations.glm53.context_parallel import _reference_sparse_mla
 
     torch.manual_seed(0)
     query = torch.randn(1, 2, 2, 4, requires_grad=True)
@@ -370,9 +342,7 @@ def test_glm53_sparse_reference_supports_rectangular_context_parallelism():
 
 
 def test_glm53_sparse_indices_are_padded_for_flashmla():
-    from arctic_platform.model.implementations.glm53.context_parallel import (
-        _pad_sparse_indices,
-    )
+    from arctic_platform.model.implementations.glm53.context_parallel import _pad_sparse_indices
 
     indices = torch.arange(2051, dtype=torch.int32).view(1, 1, -1)
     padded = _pad_sparse_indices(indices)
@@ -383,12 +353,8 @@ def test_glm53_sparse_indices_are_padded_for_flashmla():
 
 
 def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
-    from arctic_platform.model.implementations.glm53.context_parallel import (
-        apply_context_parallelism,
-    )
-    from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
-        Glm5NextForConditionalGenerationPrimeRL,
-    )
+    from arctic_platform.model.implementations.glm53.context_parallel import apply_context_parallelism
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
 
     config = _tiny_config()
     config.use_cache = False

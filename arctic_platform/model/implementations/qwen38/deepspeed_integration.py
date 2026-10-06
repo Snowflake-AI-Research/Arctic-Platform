@@ -21,18 +21,12 @@ from dataclasses import replace
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
-from arctic_platform.model.implementations.moe.deepspeed_integration import (
-    MoEDeepSpeedAdapter,
-)
+from arctic_platform.model.implementations.moe.deepspeed_integration import MoEDeepSpeedAdapter
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
-from arctic_platform.model.implementations.qwen35 import (
-    deepspeed_integration as qwen_ds,
-)
+from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
-from arctic_platform.model.implementations.qwen38.qsa_flex import (
-    apply_qsa_flex,
-    register_qsa_flex_backend,
-)
+from arctic_platform.model.implementations.qwen38.qsa_flex import apply_qsa_flex
+from arctic_platform.model.implementations.qwen38.qsa_flex import register_qsa_flex_backend
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
 QWEN38_NUM_EXPERTS = 512
@@ -49,8 +43,7 @@ def _build_model_config(
 ) -> ModelConfig:
     if attn_implementation not in (QWEN38_ATTN_BACKEND, "flex_attention"):
         raise ValueError(
-            "Qwen3.8-Flash-Next training requires the non-SDPA QSA FlexAttention backend; "
-            f"got {attn_implementation!r}"
+            f"Qwen3.8-Flash-Next training requires the non-SDPA QSA FlexAttention backend; got {attn_implementation!r}"
         )
     register_qsa_flex_backend()
     if QWEN38_NUM_EXPERTS % ep_size:

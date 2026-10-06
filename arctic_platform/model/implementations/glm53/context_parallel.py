@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Sparse-MLA and head-parallel KDA training path for GLM-5.3-Flash."""
 
 from __future__ import annotations
@@ -11,20 +26,12 @@ import torch.distributed.nn as dist_nn
 import torch.nn.functional as F
 from torch import nn
 
-from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import (
-    sparse_mla_flashmla_apply,
-)
-from arctic_platform.model.implementations.gpu.packing import (
-    cu_seqlens_from_position_ids,
-)
-from arctic_platform.model.implementations.gpu.sp.collectives import (
-    sequence_head_all_to_all,
-)
-from arctic_platform.model.implementations.gpu.sp.gated_delta_net import (
-    _fallback_depthwise_causal_convolution,
-    _pack_and_exchange_head_tensors,
-    _shard_convolution_parameter,
-)
+from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import sparse_mla_flashmla_apply
+from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
+from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _pack_and_exchange_head_tensors
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _shard_convolution_parameter
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from arctic_platform.model.implementations.moe.vlm import get_language_model
 
@@ -71,24 +78,16 @@ def _select_sparse_indices(
     valid_keys = packed_states[..., -1].bool()
     global_length = packed_states.shape[1]
 
-    query_positions = cp_rank * local_length + torch.arange(
-        local_length, device=hidden_states.device
-    )
+    query_positions = cp_rank * local_length + torch.arange(local_length, device=hidden_states.device)
     key_positions = torch.arange(global_length, device=hidden_states.device)
-    visible_tokens = (
-        key_positions[None, None, :] <= query_positions[None, :, None]
-    ) & valid_keys[:, None, :]
+    visible_tokens = (key_positions[None, None, :] <= query_positions[None, :, None]) & valid_keys[:, None, :]
 
-    pool_keys, pool_indices, pool_valid = indexer.get_pooled_states(
-        packed_states=packed_states
-    )
-    scores = torch.matmul(
-        query.float(), pool_keys.transpose(-1, -2).float().unsqueeze(1)
-    )
+    pool_keys, pool_indices, pool_valid = indexer.get_pooled_states(packed_states=packed_states)
+    scores = torch.matmul(query.float(), pool_keys.transpose(-1, -2).float().unsqueeze(1))
     scores = F.relu(scores * indexer.softmax_scale)
-    weights = indexer.weights_proj(
-        hidden_states.to(indexer.weights_proj.weight.dtype)
-    ).float() * (indexer.n_heads**-0.5)
+    weights = indexer.weights_proj(hidden_states.to(indexer.weights_proj.weight.dtype)).float() * (
+        indexer.n_heads**-0.5
+    )
     index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
 
     pool_end = pool_indices[..., -1].clamp(0, global_length - 1)
@@ -115,9 +114,7 @@ def _select_sparse_indices(
 
     output_width = indexer.index_topk
     if indexer.index_kpool_always_select_tail:
-        topk_indices = indexer.append_visible_tail(
-            topk_indices, visible_tokens, valid_keys
-        )
+        topk_indices = indexer.append_visible_tail(topk_indices, visible_tokens, valid_keys)
         output_width += indexer.index_kpool - 1
     topk_indices = F.pad(
         topk_indices,
@@ -171,13 +168,9 @@ def _sparse_attention_forward(
     **_kwargs,
 ):
     if past_key_values is not None:
-        raise NotImplementedError(
-            "GLM-5.3 sparse-MLA training does not support KV-cache decoding"
-        )
+        raise NotImplementedError("GLM-5.3 sparse-MLA training does not support KV-cache decoding")
     if hidden_states.shape[0] != 1:
-        raise NotImplementedError(
-            "GLM-5.3 context parallelism currently requires one packed row"
-        )
+        raise NotImplementedError("GLM-5.3 context parallelism currently requires one packed row")
     if attention_mask is None:
         attention_mask = torch.ones(
             hidden_states.shape[:2],
@@ -214,9 +207,7 @@ def _sparse_attention_forward(
             cp_world_size=self._cp_world_size,
         )
     elif prev_topk_indices is None:
-        raise ValueError(
-            "Shared DSA layers require top-k indices from a previous full indexer layer."
-        )
+        raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
     else:
         topk_indices = prev_topk_indices
 
@@ -274,13 +265,9 @@ def _linear_attention_forward(
     if cache_params is not None:
         raise NotImplementedError("GLM-5.3 head-parallel KDA is a training-only path")
     if hidden_states.shape[0] != 1:
-        raise NotImplementedError(
-            "GLM-5.3 head-parallel KDA currently requires one packed row"
-        )
+        raise NotImplementedError("GLM-5.3 head-parallel KDA currently requires one packed row")
     if attention_mask is not None:
-        hidden_states = hidden_states * attention_mask[..., None].to(
-            hidden_states.dtype
-        )
+        hidden_states = hidden_states * attention_mask[..., None].to(hidden_states.dtype)
 
     batch_size, local_length = hidden_states.shape[:2]
     shape = (batch_size, local_length, self.num_heads, self.head_dim)
@@ -337,9 +324,7 @@ def _linear_attention_forward(
     key = key.view(batch_size, global_length, local_heads, self.head_dim)
     value = value.view(batch_size, global_length, local_heads, self.head_dim)
 
-    from transformers.models.glm5_next.modeling_glm5_next import (
-        chunk_kimi_delta_attention,
-    )
+    from transformers.models.glm5_next.modeling_glm5_next import chunk_kimi_delta_attention
 
     output, final_state = chunk_kimi_delta_attention(
         query,
@@ -371,9 +356,7 @@ def _wrap_backbone_forward(backbone: nn.Module, parallel_modules: list[nn.Module
     def forward(self, *args, **kwargs):
         position_ids = kwargs.get("position_ids")
         if not torch.is_tensor(position_ids):
-            raise ValueError(
-                "GLM-5.3 context parallelism requires position_ids for packed boundaries"
-            )
+            raise ValueError("GLM-5.3 context parallelism requires position_ids for packed boundaries")
         global_position_ids = _gather_sequence_no_grad(
             position_ids,
             self._cp_group,
@@ -395,10 +378,7 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
         cp_world_size = dist.get_world_size(cp_group)
         cp_rank = dist.get_rank(cp_group)
         if cp_world_size != cp_size:
-            raise ValueError(
-                f"GLM-5.3 CP group size ({cp_world_size}) does not match "
-                f"configured size ({cp_size})"
-            )
+            raise ValueError(f"GLM-5.3 CP group size ({cp_world_size}) does not match configured size ({cp_size})")
     else:
         cp_world_size = 1
         cp_rank = 0
@@ -423,8 +403,7 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
         elif cp_size > 1 and layer.block_type == "linear_attention":
             if attention.num_heads % cp_world_size:
                 raise ValueError(
-                    f"GLM-5.3 KDA heads ({attention.num_heads}) must be divisible "
-                    f"by CP size ({cp_world_size})"
+                    f"GLM-5.3 KDA heads ({attention.num_heads}) must be divisible by CP size ({cp_world_size})"
                 )
             attention.forward = types.MethodType(
                 _linear_attention_forward,
@@ -438,8 +417,7 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
     if cp_size > 1:
         _wrap_backbone_forward(backbone, parallel_modules)
     get_logger().info(
-        "Applied GLM-5.3 sparse MLA and context parallelism "
-        "(cp_size=%d, sparse_layers=%d, KDA_layers=%d)",
+        "Applied GLM-5.3 sparse MLA and context parallelism (cp_size=%d, sparse_layers=%d, KDA_layers=%d)",
         cp_world_size,
         sparse_layers,
         linear_layers,

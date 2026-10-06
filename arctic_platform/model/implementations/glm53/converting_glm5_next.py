@@ -129,9 +129,7 @@ def convert_hf_layer_to_prime(
             state_dict[f"{prefix}.mlp.experts.{prime_name}"] = torch.stack(weights)
             if weights[0].dtype == torch.float8_e4m3fn or scales:
                 if len(scales) != len(expert_ids):
-                    raise ValueError(
-                        f"GLM-5.3 layer {layer_idx} has incomplete FP8 {hf_name} scales"
-                    )
+                    raise ValueError(f"GLM-5.3 layer {layer_idx} has incomplete FP8 {hf_name} scales")
                 state_dict[f"{prefix}.mlp.experts.{prime_name}_scale_inv"] = torch.stack(scales)
 
         _rename(
@@ -201,11 +199,9 @@ def convert_prime_layer_to_hf(
         w1_scale = state_dict.pop(f"{prefix}.mlp.experts.w1_scale_inv", None)
         w2_scale = state_dict.pop(f"{prefix}.mlp.experts.w2_scale_inv", None)
         w3_scale = state_dict.pop(f"{prefix}.mlp.experts.w3_scale_inv", None)
-        if (w1.dtype == torch.float8_e4m3fn or any(
-            scale is not None for scale in (w1_scale, w2_scale, w3_scale)
-        )) and any(
-            scale is None for scale in (w1_scale, w2_scale, w3_scale)
-        ):
+        if (
+            w1.dtype == torch.float8_e4m3fn or any(scale is not None for scale in (w1_scale, w2_scale, w3_scale))
+        ) and any(scale is None for scale in (w1_scale, w2_scale, w3_scale)):
             raise ValueError(f"GLM-5.3 layer {layer_idx} has incomplete FP8 expert scales")
         for expert_idx in range(w1.shape[0]):
             state_dict[f"{prefix}.mlp.experts.{expert_idx}.gate_proj.weight"] = w1[expert_idx]
