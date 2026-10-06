@@ -70,7 +70,7 @@ def _apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> Non
 def _shared_expert_forward(
     feed_forward: BCFeedForward, hidden_states: torch.Tensor
 ) -> torch.Tensor:
-    return feed_forward(hidden_states)
+    return BCFeedForward.forward(feed_forward, hidden_states)
 
 
 def _adapter() -> MoEDeepSpeedAdapter:

@@ -130,6 +130,26 @@ def test_glm53_custom_model_replaces_only_sparse_moe():
     assert model._is_vlm is True
 
 
+def test_glm53_tiled_shared_expert_bypasses_wrapped_forward():
+    from arctic_platform.model.implementations.glm53.deepspeed_integration import (
+        _shared_expert_forward,
+    )
+    from arctic_platform.model.implementations.moe.layers.moe import BCFeedForward
+
+    feed_forward = BCFeedForward(dim=4, hidden_dim=8)
+    hidden_states = torch.randn(3, 4)
+    expected = BCFeedForward.forward(feed_forward, hidden_states)
+
+    def wrapped_forward(_hidden_states):
+        raise RecursionError
+
+    feed_forward.forward = wrapped_forward
+    torch.testing.assert_close(
+        _shared_expert_forward(feed_forward, hidden_states),
+        expected,
+    )
+
+
 def test_glm53_vlm_registry_selects_custom_model_and_language_stack():
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
         Glm5NextForConditionalGenerationPrimeRL,
@@ -201,17 +221,24 @@ def test_glm53_hf_prime_conversion_round_trip():
         f"{prefix}.mlp.gate.weight": torch.randn(2, 4),
         f"{prefix}.mlp.gate.e_score_correction_bias": torch.randn(2),
         f"{prefix}.mlp.shared_experts.gate_proj.weight": torch.randn(3, 4),
+        f"{prefix}.mlp.shared_experts.gate_proj.weight_scale_inv": torch.rand(1, 1),
         f"{prefix}.mlp.shared_experts.down_proj.weight": torch.randn(4, 3),
+        f"{prefix}.mlp.shared_experts.down_proj.weight_scale_inv": torch.rand(1, 1),
         f"{prefix}.mlp.shared_experts.up_proj.weight": torch.randn(3, 4),
+        f"{prefix}.mlp.shared_experts.up_proj.weight_scale_inv": torch.rand(1, 1),
     }
     for expert_idx in range(2):
         state[f"{prefix}.mlp.experts.{expert_idx}.gate_proj.weight"] = torch.randn(3, 4)
+        state[f"{prefix}.mlp.experts.{expert_idx}.gate_proj.weight_scale_inv"] = torch.rand(1, 1)
         state[f"{prefix}.mlp.experts.{expert_idx}.down_proj.weight"] = torch.randn(4, 3)
+        state[f"{prefix}.mlp.experts.{expert_idx}.down_proj.weight_scale_inv"] = torch.rand(1, 1)
         state[f"{prefix}.mlp.experts.{expert_idx}.up_proj.weight"] = torch.randn(3, 4)
+        state[f"{prefix}.mlp.experts.{expert_idx}.up_proj.weight_scale_inv"] = torch.rand(1, 1)
     expected = {name: tensor.clone() for name, tensor in state.items()}
 
     convert_hf_layer_to_prime(state, 3)
     assert f"{prefix}.mlp.experts.w1" in state
+    assert f"{prefix}.mlp.experts.w1_scale_inv" in state
     assert f"{prefix}.attn_hc.fn" in state
     convert_prime_layer_to_hf(state, 3)
 
@@ -279,7 +306,8 @@ def test_glm53_vllm_packer_fuses_sparse_mla_and_moe():
     assert f"{prefix}.mlp.gate.e_score_correction_bias" in state
 
 
-def test_glm53_native_fp8_training_has_actionable_error():
+def test_glm53_native_fp8_training_builds_quantized_modules():
+    from arctic_platform.model.implementations.fp8 import BlockFp8Linear
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
         Glm5NextForConditionalGenerationPrimeRL,
     )
@@ -288,9 +316,20 @@ def test_glm53_native_fp8_training_has_actionable_error():
     config.quantization_config = {
         "quant_method": "fp8",
         "weight_block_size": [128, 128],
+        "modules_to_not_convert": [
+            f"model.layers.{layer_idx}.self_attn" for layer_idx in range(4)
+        ],
     }
-    with pytest.raises(NotImplementedError, match="GLM-5.3-Flash-BF16"):
-        Glm5NextForConditionalGenerationPrimeRL(config)
+    with torch.device("meta"):
+        model = Glm5NextForConditionalGenerationPrimeRL(config)
+
+    layers = model.model.language_model.layers
+    assert isinstance(layers[0].mlp.gate_proj, BlockFp8Linear)
+    assert layers[3].mlp.experts.w1.dtype == torch.float8_e4m3fn
+    assert layers[3].mlp.experts.w1_scale_inv.dtype == torch.float32
+    assert layers[3].mlp.experts.w1_scale_inv._dss_keep_fp32
+    assert isinstance(layers[3].mlp.router.gate, torch.nn.Linear)
+    assert not isinstance(layers[3].mlp.router.gate, BlockFp8Linear)
 
 
 def test_glm53_defaults_to_sparse_mla_and_allows_context_parallelism(tmp_path):

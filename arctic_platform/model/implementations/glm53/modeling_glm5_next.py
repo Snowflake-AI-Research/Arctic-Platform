@@ -16,18 +16,71 @@
 from __future__ import annotations
 
 import torch
-from torch import Tensor
-from transformers.models.glm5_next.modeling_glm5_next import Glm5NextForConditionalGeneration
-from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextMoE
+from torch import Tensor, nn
+from transformers.models.glm5_next.modeling_glm5_next import (
+    Glm5NextForConditionalGeneration,
+    Glm5NextTextMoE,
+)
 
+from arctic_platform.model.implementations.fp8 import (
+    BlockFp8Linear,
+    fp8_weight_block_size,
+)
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
-from arctic_platform.model.implementations.moe.layers.moe import MoE
-from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
+from arctic_platform.model.implementations.moe.layers.moe import MoE, MoEArgs
 
-from .converting_glm5_next import convert_hf_layer_to_prime
-from .converting_glm5_next import convert_hf_to_prime
-from .converting_glm5_next import convert_prime_layer_to_hf
-from .converting_glm5_next import convert_prime_to_hf
+from .converting_glm5_next import (
+    convert_hf_layer_to_prime,
+    convert_hf_to_prime,
+    convert_prime_layer_to_hf,
+    convert_prime_to_hf,
+)
+
+
+def _fp8_modules_to_skip(config) -> set[str]:
+    quantization_config = getattr(config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        return set(quantization_config.get("modules_to_not_convert") or ())
+    return set(getattr(quantization_config, "modules_to_not_convert", None) or ())
+
+
+def _replace_native_fp8_linears(model: nn.Module, config, block_size: int) -> None:
+    skipped = _fp8_modules_to_skip(config)
+    language_model = model.model.language_model
+    for name, module in list(language_model.named_modules()):
+        if not isinstance(module, nn.Linear) or isinstance(module, BlockFp8Linear):
+            continue
+        full_name = f"model.language_model.{name}"
+        checkpoint_name = full_name.replace("model.language_model.", "model.", 1)
+        checkpoint_name = checkpoint_name.replace(".mlp.router.gate", ".mlp.gate")
+        checkpoint_name = checkpoint_name.replace(
+            ".self_attn.forget_gate.f_a_proj",
+            ".self_attn.f_a_proj",
+        ).replace(
+            ".self_attn.forget_gate.f_b_proj",
+            ".self_attn.f_b_proj",
+        )
+        if checkpoint_name.endswith(".mlp.gate") or any(
+            checkpoint_name == prefix or checkpoint_name.startswith(f"{prefix}.")
+            for prefix in skipped
+        ):
+            continue
+        if module.bias is not None:
+            raise NotImplementedError(
+                f"GLM-5.3 native FP8 linear {checkpoint_name!r} has a bias"
+            )
+        parent_name, _, child_name = name.rpartition(".")
+        parent = language_model.get_submodule(parent_name) if parent_name else language_model
+        setattr(
+            parent,
+            child_name,
+            BlockFp8Linear(
+                module.in_features,
+                module.out_features,
+                block_size=block_size,
+                device=module.weight.device,
+            ),
+        )
 
 
 class Glm5NextForConditionalGenerationPrimeRL(
@@ -35,11 +88,10 @@ class Glm5NextForConditionalGenerationPrimeRL(
     PreTrainedModelPrimeRL,
 ):
     def __init__(self, config, **_kwargs):
-        if getattr(config, "quantization_config", None):
+        fp8_block_size = fp8_weight_block_size(config)
+        if getattr(config, "quantization_config", None) and fp8_block_size is None:
             raise NotImplementedError(
-                "Training currently supports the BF16 GLM-5.3-Flash checkpoint. "
-                "Use zai-org/GLM-5.3-Flash-BF16; native-FP8 training support is not "
-                "implemented yet."
+                "GLM-5.3 training only supports BF16 or fine-grained FP8 checkpoints"
             )
         super().__init__(config)
         text_config = config.text_config
@@ -61,11 +113,14 @@ class Glm5NextForConditionalGenerationPrimeRL(
                         1e-3,
                     ),
                     use_grouped_mm=getattr(config, "use_grouped_mm", True),
+                    fp8_block_size=fp8_block_size,
                     swiglu_limit=text_config.swiglu_limit,
                 ),
                 dim=text_config.hidden_size,
                 hidden_dim=text_config.moe_intermediate_size,
             )
+        if fp8_block_size is not None:
+            _replace_native_fp8_linears(self, config, fp8_block_size)
         self._is_vlm = True
 
     @classmethod
