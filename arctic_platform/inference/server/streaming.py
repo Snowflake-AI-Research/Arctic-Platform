@@ -1017,6 +1017,7 @@ class ClientStream(AsyncIterator):
         self.closed = False
         self.error = None
         self.cleanup = None
+        self.cleanup_unconfirmed = False
         self.error_delivered = False
         self.usage = None
         self.first_delta_time = None
@@ -1199,8 +1200,16 @@ class ClientStream(AsyncIterator):
                 or not isinstance(event["param"], str)
             ):
                 raise StreamError("invalid_terminal_error")
-            await self.abort(event["code"])
+            result = await self.abort(event["code"])
             self.error_delivered = True
+            if result["status"] == "cleanup_unconfirmed":
+                # The engine may still be running this request, so the caller
+                # must not treat it as a clean request error.
+                event = {
+                    key: value for key, value in event.items()
+                    if key not in ("context_limit_source", "param")
+                }
+                event["code"] = "cleanup_unconfirmed"
         elif kind in DELTA_TYPES or kind == "choice_finished":
             index = event.get("choice_index")
             if (
@@ -1253,6 +1262,8 @@ class ClientStream(AsyncIterator):
 
     async def abort(self, code="cancelled"):
         if self.closed:
+            if self.cleanup_unconfirmed:
+                return {"status": "cleanup_unconfirmed"}
             return {"status": "already_terminal"}
         if self.cleanup is None:
             self.error = code
@@ -1293,8 +1304,10 @@ class ClientStream(AsyncIterator):
                 ray.cancel(self.remote_stream)
             except Exception:
                 status = "cleanup_unconfirmed"
-        if status == "cleanup_unconfirmed" and self.worker is not None:
-            self.worker.quarantine()
+        if status == "cleanup_unconfirmed":
+            self.cleanup_unconfirmed = True
+            if self.worker is not None:
+                self.worker.quarantine()
         await self.finish()
         return {"status": status}
 
@@ -1323,7 +1336,9 @@ class ClientStream(AsyncIterator):
                 )
             )
         self.scheduler._streams.pop(self.request_id, None)
-        self.scheduler._retire_stream(self.request_id)
+        self.scheduler._retire_stream(
+            self.request_id, cleanup_unconfirmed=self.cleanup_unconfirmed
+        )
         if asyncio.current_task() is not self.watchdog:
             self.watchdog.cancel()
 

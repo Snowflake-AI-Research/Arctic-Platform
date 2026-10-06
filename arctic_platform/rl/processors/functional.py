@@ -40,6 +40,13 @@ def _get_sequence_parallel_group():
 
 
 def _sequence_parallel_sum(*totals: torch.Tensor, group) -> tuple[torch.Tensor, ...]:
+    """Add up per-sequence totals over the group's token windows, in one collective.
+
+    The all-reduce is the autograd-aware one: every rank's loss reads the reduced total, so a
+    token's gradient owes a term to each rank that read it, and only a reduction in backward can
+    collect those terms. Reducing in forward alone leaves each window with its own share of that
+    gradient and drops the rest.
+    """
     stacked = torch.stack([total.to(totals[0].dtype) for total in totals])
     stacked = dist_autograd.all_reduce(stacked, group=group)
     return tuple(stacked.unbind())
@@ -663,6 +670,17 @@ def _compute_sequence_level_ratio_and_advantages(
     loss_mask: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Give every token of a sequence that sequence's mean importance ratio and mean
+    advantage.
+
+    Under sequence parallelism a rank holds one token window of the frame, so each total
+    below covers only the part of a sequence inside that window. The mean has to be the
+    whole sequence's: the ratio is the exponential of it, and exp of a partial mean is not
+    a factor of the whole one, so numerators and denominators are both reduced over the
+    group before the division. Window boundaries carry one segment per row -- empty for a
+    row the window never reaches -- so the per-sequence vectors align elementwise across
+    ranks and reduce as they are.
+    """
     sp_group = _get_sequence_parallel_group()
     if log_ratio.ndim == 1:
         if cu_seqlens is None:
@@ -677,6 +695,8 @@ def _compute_sequence_level_ratio_and_advantages(
             log_ratio_sum_per_seq, advantages_sum_per_seq, valid_count_per_seq = _sequence_parallel_sum(
                 log_ratio_sum_per_seq, advantages_sum_per_seq, valid_count_per_seq, group=sp_group
             )
+        # Clamping before the reduction would turn each empty window into a token,
+        # inflating the divisor.
         valid_count_per_seq = valid_count_per_seq.clamp(min=1)
         log_ratio_mean_per_seq = log_ratio_sum_per_seq / valid_count_per_seq.to(log_ratio.dtype)
         adv_mean_per_seq = advantages_sum_per_seq / valid_count_per_seq.to(advantages.dtype)

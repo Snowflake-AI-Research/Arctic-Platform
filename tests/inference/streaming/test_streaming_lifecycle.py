@@ -1,6 +1,7 @@
 """Regression coverage for streaming cleanup, admission, and lifecycle safety."""
 
 import asyncio
+import time
 from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -435,6 +436,87 @@ def test_completed_but_undelivered_abort_reports_already_terminal():
             assert (await scheduler.abort("unknown"))["status"] == "not_found"
         finally:
             await events.aclose()
+            await scheduler.shutdown()
+
+    asyncio.run(scenario())
+
+
+class _OneEvent:
+    """A worker stream that delivers one batch holding one event."""
+
+    def __init__(self, event):
+        self.event = event
+
+    async def __anext__(self):
+        async def ref():
+            return [self.event]
+        return ref()
+
+
+def _stream_with_terminal_error(scheduler, request_id):
+    stream = scheduler.stream_generate(request_id, "prompt")
+    stream.worker = scheduler._workers[0]
+    stream.worker.active_requests = stream.worker.streaming_requests = 1
+    stream.remote_stream = _OneEvent({
+        "type": "terminal_error", "code": "context_length_exceeded",
+        "context_limit_source": "prompt", "sequence": 0, "version": 1,
+    })
+    return stream
+
+
+def test_unconfirmed_cleanup_overrides_terminal_error_and_survives_retirement(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr("ray.cancel", MagicMock())
+        pool, handle = make_pool()
+        handle.abort_stream.remote.return_value = {"status": "cleanup_unconfirmed"}
+        scheduler = pool._scheduler
+        stream = _stream_with_terminal_error(scheduler, "ctx")
+        try:
+            event = await anext(stream)
+            assert event["type"] == "terminal_error"
+            assert event["code"] == "cleanup_unconfirmed"
+            assert "context_limit_source" not in event
+            assert "ctx" not in scheduler._streams
+            # The retired record must not turn "unconfirmed" into "already_terminal".
+            for _ in range(2):
+                assert (await scheduler.abort("ctx"))["status"] == "cleanup_unconfirmed"
+                assert (await stream.abort())["status"] == "cleanup_unconfirmed"
+            scheduler.mark_worker_available(0)
+            assert not scheduler.is_worker_available(0)
+        finally:
+            await scheduler.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_confirmed_cleanup_keeps_terminal_error(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr("ray.cancel", MagicMock())
+        pool, _ = make_pool()
+        scheduler = pool._scheduler
+        stream = _stream_with_terminal_error(scheduler, "ctx")
+        try:
+            event = await anext(stream)
+            assert event["code"] == "context_length_exceeded"
+            assert event["context_limit_source"] == "prompt"
+            assert (await scheduler.abort("ctx"))["status"] == "already_terminal"
+            assert (await stream.abort())["status"] == "already_terminal"
+        finally:
+            await scheduler.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_unconfirmed_retirement_is_pruned_with_its_record():
+    async def scenario():
+        pool, _ = make_pool()
+        scheduler = pool._scheduler
+        scheduler._retire_stream("old", cleanup_unconfirmed=True)
+        scheduler._stream_retired["old"] = time.monotonic() - 3601
+        try:
+            assert (await scheduler.abort("old"))["status"] == "not_found"
+            assert "old" not in scheduler._stream_retired_unconfirmed
+        finally:
             await scheduler.shutdown()
 
     asyncio.run(scenario())

@@ -257,6 +257,8 @@ class Scheduler:
         self._next_id = 0
         self._streams = {}
         self._stream_retired = OrderedDict()
+        # Retired streams whose engine cleanup never confirmed; pruned with _stream_retired.
+        self._stream_retired_unconfirmed = set()
         self._paused = False
         self._pause_event = asyncio.Event()
         self._pause_event.set()
@@ -383,10 +385,13 @@ class Scheduler:
             oldest = next(iter(self._stream_retired.values()))
             if oldest > cutoff and len(self._stream_retired) <= 100000:
                 break
-            self._stream_retired.popitem(last=False)
+            request_id, _ = self._stream_retired.popitem(last=False)
+            self._stream_retired_unconfirmed.discard(request_id)
 
-    def _retire_stream(self, request_id):
+    def _retire_stream(self, request_id, cleanup_unconfirmed=False):
         self._stream_retired[request_id] = time.monotonic()
+        if cleanup_unconfirmed:
+            self._stream_retired_unconfirmed.add(request_id)
         self._stream_retired.move_to_end(request_id)
         self._prune_retired_streams()
 
@@ -395,6 +400,8 @@ class Scheduler:
         stream = self._streams.get(request_id)
         if stream is not None:
             return await stream.abort()
+        if request_id in self._stream_retired_unconfirmed:
+            return {"status": "cleanup_unconfirmed"}
         return {"status": "already_terminal" if request_id in self._stream_retired else "not_found"}
 
     async def abort_streams(self, worker_idx=None):
