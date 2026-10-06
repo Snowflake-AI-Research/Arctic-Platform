@@ -53,7 +53,6 @@ class TestArcticSFTClientConfig(TestCasePlus):
     def test_accepts_a_complete_config(self):
         cfg = ArcticSFTClientConfig(model_name="m", training_gpus=2, training=_CKPT)
         self.assertEqual(cfg.training.checkpoint_path, "/tmp/c")
-        self.assertEqual(cfg.backend.protocol, "ray")
         self.assertEqual(cfg.backend.type, "onprem")
 
     def test_extra_fields_forbidden(self):

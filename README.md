@@ -49,7 +49,6 @@ from arctic_platform.rl import ArcticRLClientConfig, create_arctic_rl_client
 
 config = ArcticRLClientConfig(
     model_name="Qwen/Qwen3-4B",
-    comm_protocol="ray",
     training_gpus=8,            #
     sampling_gpus=8,
     log_prob_gpus=0,

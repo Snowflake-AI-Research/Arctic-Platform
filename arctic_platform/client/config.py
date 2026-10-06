@@ -54,7 +54,6 @@ class OnPremConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     type: Literal["onprem"] = "onprem"
-    protocol: Literal["ray"] = Field("ray", description="onprem transport: in-process Ray.")
     colocate: bool = Field(False, description="onprem: colocate job types on shared GPUs.")
 
 

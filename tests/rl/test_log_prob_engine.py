@@ -69,14 +69,12 @@ log_prob_gpus = 1
 # nats, so this absorbs bf16 jitter yet rejects garbage.
 LOGPROB_ATOL = 0.25
 
-log_prob_params = [("ray", True), ("ray", False)]
+log_prob_params = [(True,), (False,)]
 
 # Short prompt+completion texts for the log_probs API; the combined token count stays well under the engine's
 # max_length (prompt_len + response_len). The server tokenizes these, so geometry above doesn't constrain them.
 text_prompts = ["The capital of France is", "2 + 2 ="]
 text_completions = [" Paris", " 4"]
-
-text_log_prob_params = [("ray",)]
 
 
 @require_torch_gpu
@@ -92,16 +90,15 @@ class TestLogProbEngine(TestCasePlus):
         return response
 
     @parameterized.expand(log_prob_params, name_func=parameterized_custom_name_func)
-    def test_reference_log_prob(self, comm_protocol, zorro_enable):
+    def test_reference_log_prob(self, zorro_enable):
         """Reference-engine fwd_no_grad(reference_model=True) log-probs match the independent HF reference."""
         skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus)
         batch, _, response_lens, ref, valid = cached_padded_batch_and_reference(
             model_name, attn_implementation, num_unique_prompts, rollout_n, prompt_len, response_len
         )
         cl_payload = build_compute_log_prob_payload(batch, zorro_enable, rollout_n, prompt_len, response_len)
-        tag = cell_tag(comm_protocol, zorro_enable)
+        tag = cell_tag(zorro_enable)
         with arctic_rl_client_session(
-            comm_protocol,
             zorro_enable,
             model_name,
             attn_implementation,
@@ -127,12 +124,10 @@ class TestLogProbEngine(TestCasePlus):
         await client.sleep_log_prob()
         return response
 
-    @parameterized.expand(text_log_prob_params, name_func=parameterized_custom_name_func)
-    def test_text_log_probs(self, comm_protocol):
+    def test_text_log_probs(self):
         """client.log_probs(prompts, completions) scores text through the DeepSpeed engine."""
         skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus)
         with arctic_rl_client_session(
-            comm_protocol,
             False,
             model_name,
             attn_implementation,
@@ -145,10 +140,10 @@ class TestLogProbEngine(TestCasePlus):
         ) as client:
             response = asyncio.run(self._drive_text_log_probs(client))
 
-        self.assertIn("results", response, f"[{comm_protocol}] log_probs response missing 'results': {list(response)}")
+        self.assertIn("results", response, f"log_probs response missing 'results': {list(response)}")
         results = response["results"]
-        self.assertTrue(torch.is_tensor(results), f"[{comm_protocol}] expected results tensor, got {type(results)}")
-        self.assertEqual(results.ndim, 2, f"[{comm_protocol}] expected [B, S-1] results, got {tuple(results.shape)}")
-        self.assertEqual(results.shape[0], len(text_prompts), f"[{comm_protocol}] results batch dim mismatch")
-        self.assertTrue(torch.isfinite(results).all(), f"[{comm_protocol}] log_probs contain non-finite values")
-        print(f"[log-prob-engine] text log_probs {comm_protocol}: results shape={tuple(results.shape)}")
+        self.assertTrue(torch.is_tensor(results), f"expected results tensor, got {type(results)}")
+        self.assertEqual(results.ndim, 2, f"expected [B, S-1] results, got {tuple(results.shape)}")
+        self.assertEqual(results.shape[0], len(text_prompts), "results batch dim mismatch")
+        self.assertTrue(torch.isfinite(results).all(), "log_probs contain non-finite values")
+        print(f"[log-prob-engine] text log_probs: results shape={tuple(results.shape)}")

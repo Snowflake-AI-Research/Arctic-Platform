@@ -74,7 +74,7 @@ log_prob_gpus = 0
 # nats, so this absorbs bf16 jitter yet rejects garbage.
 LOGPROB_ATOL = 0.25
 
-train_engine_params = [("ray", True), ("ray", False)]
+train_engine_params = [(True,), (False,)]
 
 
 @require_torch_multi_gpu
@@ -96,7 +96,7 @@ class TestTrainEngine(TestCasePlus):
         return fwd_bwd_response, step_response
 
     @parameterized.expand(train_engine_params, name_func=parameterized_custom_name_func)
-    def test_train_engine(self, comm_protocol, zorro_enable):
+    def test_train_engine(self, zorro_enable):
         """One client per cell: log-probs match the reference, then update actor flows gradients."""
         skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus)
         batch, _, response_lens, ref, valid = cached_padded_batch_and_reference(
@@ -104,9 +104,8 @@ class TestTrainEngine(TestCasePlus):
         )
         cl_payload = build_compute_log_prob_payload(batch, zorro_enable, rollout_n, prompt_len, response_len)
         ua_payload = build_update_actor_payload(batch, zorro_enable, rollout_n, prompt_len, response_len)
-        tag = cell_tag(comm_protocol, zorro_enable)
+        tag = cell_tag(zorro_enable)
         with arctic_rl_client_session(
-            comm_protocol,
             zorro_enable,
             model_name,
             attn_implementation,
@@ -151,7 +150,6 @@ class TestTrainEngine(TestCasePlus):
         batch, _, _ = make_fake_batch(model_name, 4, rollout_n, prompt_len, response_len)
         ua_payload = build_update_actor_payload(batch, True, rollout_n, prompt_len, response_len)
         with arctic_rl_client_session(
-            "ray",
             True,
             model_name,
             attn_implementation,
