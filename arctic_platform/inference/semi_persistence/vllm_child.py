@@ -2590,6 +2590,155 @@ def _semip_rebind_graphs(worker):
             "rank": getattr(worker, "rank", "?")}
 
 
+def _graph_wrappers():
+    """Every live CUDAGraphWrapper and BreakableCUDAGraphWrapper."""
+    wrappers = []
+    for mod, name in (("vllm.compilation.cuda_graph", "CUDAGraphWrapper"),
+                      ("vllm.compilation.breakable_cudagraph",
+                       "BreakableCUDAGraphWrapper")):
+        try:
+            cls = getattr(__import__(mod, fromlist=[name]), name)
+            wrappers += list(getattr(cls, "_all_instances", ()) or ())
+        except Exception:  # noqa: BLE001
+            pass
+    return wrappers
+
+
+def _semip_drop_graphs(worker):
+    """Destroy every captured CUDA graph and empty the containers holding them.
+
+    Across nodes vLLM has no custom all-reduce, so every all-reduce a graph
+    captured is an NCCL kernel, and ``ncclCommAbort`` does not return while a
+    graph that captured the communicator is alive. A multi-node dump therefore
+    drops the graphs before ``destroy_nccl``, and the restore captures them
+    again with ``capture_model()``.
+
+    On vLLM 0.30 the graphs sit in three places: the wrapper entries, the V2
+    runner's manager, and piecewise segments reachable only through bound
+    ``replay`` methods. ``_collect_graph_entries`` finds all three, so every
+    graph is reset explicitly rather than left to garbage collection.
+    """
+    import gc
+    rank = getattr(worker, "rank", "?")
+    if not _CA_REBIND_AVAILABLE or ca_graph_rebind is None:
+        return {"ok": False, "error": "ca_graph_rebind unavailable",
+                "rank": rank}
+    torch.cuda.synchronize()
+    free_before = torch.cuda.mem_get_info()[0]
+    entries, diag = ca_graph_rebind._collect_graph_entries(worker)
+    n_found = len(entries)
+    n_reset = 0
+    reset_errors = []
+    for _key, graph in entries:
+        try:
+            graph.reset()
+            n_reset += 1
+        except Exception as e:  # noqa: BLE001
+            if len(reset_errors) < 3:
+                reset_errors.append(f"{type(e).__name__}: {e}")
+    del entries
+
+    # Empty the containers too, or capture_model() finds the entries and
+    # replays the reset graphs instead of capturing.
+    wrappers = _graph_wrappers()
+    n_cleared = 0
+    for w in wrappers:
+        for attr in ("concrete_cudagraph_entries", "entries"):
+            m = getattr(w, attr, None)
+            if isinstance(m, dict):
+                n_cleared += len(m)
+                m.clear()
+    managers, _why = ca_graph_rebind._graph_manager_holders(worker)
+    for mgr in managers:
+        graphs = getattr(mgr, "graphs", None)
+        if isinstance(graphs, dict):
+            n_cleared += len(graphs)
+            graphs.clear()
+        if hasattr(mgr, "_graphs_captured"):
+            mgr._graphs_captured = False
+
+    # A fresh shared pool: recapturing into the old one leaves its blocks
+    # pinned, and without a shared pool each size gets a private one.
+    pool_refreshed = False
+    try:
+        from vllm.platforms import current_platform
+        type(current_platform)._global_graph_pool = None
+        fresh = current_platform.get_global_graph_pool()
+        for w in wrappers:
+            if hasattr(w, "graph_pool"):
+                w.graph_pool = fresh
+        for mgr in managers:
+            if getattr(mgr, "pool", None) is not None:
+                mgr.pool = fresh
+        pool_refreshed = True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import vllm.utils.torch_utils as _vtu
+        if getattr(_vtu, "_aux_stream", None) is not None:
+            _vtu._aux_stream = None
+    except Exception:  # noqa: BLE001
+        pass
+
+    gc.unfreeze()
+    try:
+        gc.collect()
+    finally:
+        gc.freeze()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    free_after = torch.cuda.mem_get_info()[0]
+    census = ca_graph_rebind.graph_exec_census(worker)
+    return {"ok": n_found > 0 and not census.get("n_exec_ok"),
+            "rank": rank, "n_found": n_found, "n_reset": n_reset,
+            "n_cleared": n_cleared, "pool_refreshed": pool_refreshed,
+            "freed_mib": (free_after - free_before) >> 20,
+            "exec_ok_after": census.get("n_exec_ok"),
+            "discovery": {k: diag.get(k) for k in (
+                "n_wrapper_graphs", "n_manager_graphs",
+                "n_gc_fallback_graphs", "complete")},
+            "reset_errors": reset_errors}
+
+
+def _semip_recapture_graphs(worker):
+    """Capture the CUDA graphs again after a restore whose dump dropped them.
+
+    Calls ``capture_model()`` directly rather than ``compile_or_warm_up_model``,
+    which also redoes one-time warmup. Outside that method the keep-graph patch
+    is not installed, so this is stock capture and every graph is
+    instantiated.
+
+    ``capture_model()`` ends with ``lock_workspace()``, so by the time a dump
+    happens the workspace refuses any allocation bigger than the current one.
+    Unlocking first puts the recapture back in the state the cold-start capture
+    ran in; ``capture_model()`` locks it again on the way out.
+    """
+    rank = getattr(worker, "rank", "?")
+    torch.cuda.synchronize()
+    free_before = torch.cuda.mem_get_info()[0]
+    unlocked = False
+    try:
+        from vllm.v1.worker.workspace import unlock_workspace
+        unlock_workspace()
+        unlocked = True
+    except Exception:  # noqa: BLE001
+        pass
+    t0 = time.monotonic()
+    worker.model_runner.capture_model()
+    torch.cuda.synchronize()
+    seconds = time.monotonic() - t0
+    free_after = torch.cuda.mem_get_info()[0]
+    census = (ca_graph_rebind.graph_exec_census(worker)
+              if _CA_REBIND_AVAILABLE and ca_graph_rebind is not None else {})
+    return {"ok": bool(census.get("n_exec_ok")), "rank": rank,
+            "seconds": round(seconds, 2),
+            "unlocked_workspace": unlocked,
+            "used_mib": (free_before - free_after) >> 20,
+            "free_after_mib": free_after >> 20,
+            "n_graphs": census.get("n_graphs"),
+            "n_exec_ok": census.get("n_exec_ok")}
+
+
 def _semip_graph_census(worker):
     """Per-rank count of captured graphs that currently hold a cudaGraphExec_t.
 
@@ -4131,6 +4280,20 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 _drive_warmup_ladder("verify",
                                      _ladder_plan(_REBIND_VERIFY_SIZES))
                 _log_graph_census(llm, log, "restore:post-verify")
+
+            elif cmd in ("drop_graphs", "recapture_graphs"):
+                if llm is None:
+                    raise RuntimeError(f"{cmd} requires init/load first")
+                fn = (_semip_drop_graphs if cmd == "drop_graphs"
+                      else _semip_recapture_graphs)
+                results = llm.collective_rpc(fn)
+                for _r in results:
+                    log.info("  %s %s", cmd, _r)
+                failures = [r for r in results
+                            if not (isinstance(r, dict) and r.get("ok"))]
+                if failures:
+                    raise RuntimeError(f"semip {cmd} failed: {failures}")
+                info[cmd] = results
 
             elif cmd == "save_weights":
                 if llm is None:
