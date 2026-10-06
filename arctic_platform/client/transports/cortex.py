@@ -14,14 +14,11 @@
 # limitations under the License.
 """Cortex (cortex-training) transport over SnowAPI.
 
-SnowAPI is async: every op submits and returns a ``request_id`` that is polled to
-completion. So an op is just submit + poll -> final result dict, the same
-contract the on-prem transports expose. `call` runs it over ``requests``; `acall`
-runs the identical flow over ``aiohttp`` for the async client. Cortex-specific
-request and response shapes are lowered here until the servers share one API.
-Forward-backward and generate carry DSSST1 octet bodies (byte-chunked), while
-step/save/operation post JSON. Unsupported ops (`forward`, `log-probs`) raise
-NotImplementedError.
+SnowAPI operations submit a request and poll it to completion. Cortex-specific
+request and response shapes are translated here until the servers share one API.
+Forward-backward and generate use DSSST1 octet bodies. Forward uses a base64
+DSSST1 frame in an ``/operation`` request. Step, save, and other operations use
+JSON. Log-probs is unsupported.
 """
 
 from __future__ import annotations
@@ -34,6 +31,7 @@ import json
 import time
 from typing import Any
 from typing import Iterator
+from urllib.parse import urlencode
 
 import requests
 from tenacity import AsyncRetrying
@@ -61,15 +59,32 @@ _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
 _OCTET_OPS = {"forward-backward", "generate"}
 _OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
 # The chunk envelope's operation label is the wire's own name, not our canonical op name.
-_WIRE_OPERATION = {"forward-backward": "fwd-bwd", "generate": "generate"}
+_WIRE_OPERATION = {"forward-backward": "fwd-bwd", "forward": "forward", "generate": "generate"}
+# `forward` has no octet endpoint on SnowAPI, so it travels as an /operation RPC
+# whose payload is the base64'd DSSST1 frame. The control plane's REST surface
+# marshals that RPC as JSON, so the frame inflates 4/3 on the way in and the
+# budget below is a JSON-body budget, not a frame budget. These mirror
+# dss_client's constants so both clients split at the same boundary.
+_OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
+# Room for the envelope's keys, the operation type and the sub-job token.
+_OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
 # forward-backward always carries a chunk envelope, even when the frame would fit in one
 # request: its chunk_group_id is the server's idempotency key, so a bare frame is off
-# contract. generate posts the bare frame when it fits.
+# contract. generate posts the bare frame when it fits and splits when it does not.
 _FORCE_CHUNK_OPS = {"forward-backward"}
 # Ops whose chunked frame can be re-posted from scratch on a chunk-group error.
 # forward-backward carries the large gradient frame; a mid-stream chunk-group
 # desync (GS restart) is recoverable only by re-posting the whole group.
 _GROUP_RESTART_OPS = {"forward-backward"}
+# Direct octet endpoints carry no routing envelope, so the control plane infers the
+# target sub-job from the op itself: forward-backward is training, generate is
+# sampling. `forward` still sends the caller's token because a session can hold more
+# than one training zone, and because reference_model=True aims at the log_prob
+# sub-job: Cortex answers that with Unimplemented (its zone serves forward on
+# training only), which is the error we want the caller to see rather than
+# current-policy numbers silently standing in for reference ones. It rides the
+# /operation envelope, so that token is a body field rather than a query param.
+_SUB_JOB_ROUTED_OPS: set[str] = set()
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
 # Neutrino never colocates training and sampling on the same GPUs, so it exposes no
@@ -96,6 +111,8 @@ _SUB_JOB_KEY = {"training": "training", "sampling": "sampling", "log_prob": "log
 def _canonical_result(op: str, result: dict) -> dict:
     if op == "generate":
         return _to_python(result)
+    if op == "forward":
+        return _unwrap_forward_payload(result)
     if op != "forward-backward" or "post_process_outputs" not in result:
         return result
     if "batch" in result:
@@ -214,6 +231,22 @@ def _submitted(op: str, body: dict, response: dict) -> str | dict:
     if operation_type in _INLINE_OPERATION_TYPES:
         return response
     raise RuntimeError(f"cortex {operation_type or op} response carried no request_id: {response}")
+
+
+def _forward_request_id(final: dict, posted: int) -> str:
+    """The request_id from the last forward chunk, or a legible failure.
+
+    Only the final chunk starts execution, so a missing request_id means the zone
+    treated our last POST as one more chunk to stage -- usually a chunk-sizing or
+    ordering disagreement, which would otherwise surface much later as a request
+    that never completes.
+    """
+    request_id = final.get("request_id")
+    if request_id is None:
+        raise RuntimeError(
+            f"cortex forward staged {posted} chunk(s) but the last response carried no request_id: {final}"
+        )
+    return str(request_id)
 
 
 def _raise_for_status(resp: requests.Response) -> None:
@@ -337,18 +370,20 @@ class CortexTransport(Transport):
         return _canonical_result(request.op, result)
 
     def _op_target(self, request: Request) -> tuple[str, dict]:
-        """The url + JSON body for one op (None-valued keys dropped)."""
-        return (
-            f"{self._prefix}/{self.job_id}/{request.op}",
-            {k: v for k, v in request.body.items() if v is not None},
-        )
+        """The url (+ sub-job hint where the op needs one) and body (None-valued keys dropped)."""
+        url = f"{self._prefix}/{self.job_id}/{request.op}"
+        if request.op in _SUB_JOB_ROUTED_OPS and request.job_id is not None:
+            url = f"{url}?{urlencode({'target_sub_job_id': str(request.job_id)})}"
+        return url, {k: v for k, v in request.body.items() if v is not None}
 
     def _submit(self, request: Request) -> str | dict:
         # Same shape as on-prem's call: build the url, then pick the wire. Octet ops
-        # (forward-backward, generate) go DSSST1; the rest post JSON as-is. The client
-        # assembles the full /operation envelope (incl. sub-job routing hints), so
-        # `operation` is just another JSON post. `forward`/`log-probs` don't exist here.
+        # (forward-backward, forward, generate) go DSSST1; the rest post JSON as-is. The
+        # client assembles the full /operation envelope (incl. sub-job routing hints), so
+        # `operation` is just another JSON post. `log-probs` doesn't exist here.
         op = request.op
+        if op == "forward":
+            return self._submit_forward(request)
         url, body = self._op_target(request)
         if op in _OCTET_OPS:
             return self._submit_octet(url, op, body)
@@ -367,6 +402,53 @@ class CortexTransport(Transport):
                 force_chunk=op in _FORCE_CHUNK_OPS,
             )
         )
+
+    def _forward_operation_bodies(self, request: Request) -> tuple[str, list[dict]]:
+        """The /operation url and one envelope per chunk of the forward frame.
+
+        Unlike the octet routes, chunking here happens *inside* the envelope: each
+        POST is a complete, valid `/operation` call whose payload is one chunk of
+        the frame, and the zone stages them until the last one arrives. Only that
+        final POST answers with a request_id -- the earlier ones report the chunk
+        was cached -- so callers must post them in order and keep the last reply.
+        """
+        url = f"{self._prefix}/{self.job_id}/operation"
+        body = {k: v for k, v in request.body.items() if v is not None}
+        # The budget is on the JSON body, and base64 costs 4 bytes per 3, so the
+        # frame slice has to be the smaller 3/4 share of what is left.
+        max_payload = max(1, (_OPERATION_MAX_JSON_BYTES - _OPERATION_ENVELOPE_OVERHEAD_BYTES) * 3 // 4)
+        chunks = self._octet_chunks(body, "forward")
+        if len(chunks) > 1:  # pragma: no cover - _FORCE_CHUNK_OPS excludes forward
+            raise AssertionError("forward frames are not pre-chunked at the octet layer")
+        frame = chunks[0]
+        slices = [frame[at : at + max_payload] for at in range(0, len(frame), max_payload)] or [b""]
+        envelopes = []
+        for part in slices:
+            envelope: dict[str, Any] = {
+                "operation_type": "forward",
+                "payload": {
+                    "content_type": "application/octet-stream",
+                    "payload_b64": base64.b64encode(part).decode("ascii"),
+                },
+            }
+            if request.job_id is not None:
+                envelope["sub_job_id"] = str(request.job_id)
+            envelopes.append(envelope)
+        return url, envelopes
+
+    def _submit_forward(self, request: Request) -> str:
+        url, envelopes = self._forward_operation_bodies(request)
+        final: dict = {}
+        for envelope in envelopes:
+            final = self._send("POST", url, json=envelope)
+        return _forward_request_id(final, len(envelopes))
+
+    async def _asubmit_forward(self, request: Request) -> str:
+        url, envelopes = self._forward_operation_bodies(request)
+        final: dict = {}
+        for envelope in envelopes:
+            final = await self._asend("POST", url, json=envelope)
+        return _forward_request_id(final, len(envelopes))
 
     def _submit_octet(self, url: str, op: str, body: dict) -> str:
         # Post the frame chunk-by-chunk. Transient blips retry per-chunk; a
@@ -390,6 +472,8 @@ class CortexTransport(Transport):
 
     async def _asubmit(self, request: Request) -> str | dict:
         op = request.op
+        if op == "forward":
+            return await self._asubmit_forward(request)
         url, body = self._op_target(request)
         if op in _OCTET_OPS:
             return await self._asubmit_octet(url, op, body)
@@ -648,6 +732,21 @@ def _decode_result(result: dict) -> dict:
     if isinstance(result, dict) and result.get("wire_format") == wire.WIRE_FORMAT_VERSION:
         return wire.loads(base64.b64decode(result["payload_b64"]))
     return result
+
+
+def _unwrap_forward_payload(result: dict) -> dict:
+    """Unwrap forward's DSSST1 frame from the JSON result envelope.
+
+    The zone base64s `wire.dumps({job_id, logprobs})` into `payload_b64`, but
+    without the `wire_format` marker `_decode_result` keys off, so the generic
+    path passes the envelope through and the caller gets a base64 string where
+    the tensors should be. Nothing between here and the zone unwraps it: the
+    only code that does is the standalone dev gateway, which the Cortex path
+    does not go through.
+    """
+    if not isinstance(result, dict) or not isinstance(result.get("payload_b64"), str):
+        return result
+    return wire.loads(base64.b64decode(result["payload_b64"]))
 
 
 def _to_python(obj: Any) -> Any:
