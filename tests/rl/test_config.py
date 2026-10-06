@@ -16,7 +16,7 @@
 """``ArcticRLClientConfig`` validation -- pure CPU, no GPU / Ray cluster / model load.
 
 Guards the cheap-but-load-bearing config contract the heavyweight GPU tests rely on: the local-backend
-"at least one engine" rule, the reconnect-mode bypass, comm-protocol host/port derivation, and literal enums.
+"at least one engine" rule, the reconnect-mode bypass, and literal enums.
 """
 
 from __future__ import annotations
@@ -46,26 +46,6 @@ class TestArcticRLClientConfig(TestCasePlus):
         config = ArcticRLClientConfig(backend="local", model_name="dummy", training_job_id=7)
         self.assertEqual(config.training_job_id, 7)
         self.assertEqual(config.training_gpus + config.sampling_gpus + config.log_prob_gpus, 0)
-
-    def test_ray_protocol_derives_no_host_port(self):
-        """ray comms are in-process actors -- host/port stay None."""
-        config = ArcticRLClientConfig(model_name="dummy", comm_protocol="ray", training_gpus=1)
-        self.assertIsNone(config.host)
-        self.assertIsNone(config.port)
-
-    def test_http_protocol_derives_host_and_port(self):
-        """http binds the server on the node's routable IP at the default port 7000."""
-        config = ArcticRLClientConfig(model_name="dummy", comm_protocol="http", training_gpus=1)
-        self.assertIsNotNone(config.host)
-        self.assertEqual(config.port, 7000)
-
-    def test_explicit_host_port_preserved(self):
-        """An explicitly supplied host/port is never overridden by derivation."""
-        config = ArcticRLClientConfig(
-            model_name="dummy", comm_protocol="http", host="1.2.3.4", port=9999, training_gpus=1
-        )
-        self.assertEqual(config.host, "1.2.3.4")
-        self.assertEqual(config.port, 9999)
 
     def test_invalid_comm_protocol_rejected(self):
         with self.assertRaises(ValidationError):

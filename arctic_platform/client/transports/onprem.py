@@ -14,14 +14,11 @@
 # limitations under the License.
 """On-prem transport base for the Arctic-Platform server.
 
-HTTP and in-process Ray share one control plane (`OnPremTransport`:
-job creation + ordering); they differ only in the delivery
-primitives (`_start`, `call`, `_destroy`, `_wait_running`). The client already
-resolved the job id onto each Request, so `call` just delivers it against the
-server's uniform `op(job_id, body) -> dict` surface.
-
-Concrete transports live alongside this base: `HttpTransport` in
-`onprem_http.py` and `RayTransport` in `onprem_ray.py`.
+`OnPremTransport` owns the control plane (job creation + ordering); a concrete
+transport supplies only the delivery primitives (`_start`, `call`, `_destroy`,
+`_wait_running`). The client already resolved the job id onto each Request, so
+`call` just delivers it against the server's uniform `op(job_id, body) -> dict`
+surface. The concrete transport is `RayTransport` in `onprem_ray.py`.
 """
 
 from __future__ import annotations
@@ -57,7 +54,7 @@ class OnPremTransport(Transport):
                     self.jobs.set(job_type, self._start(cfg.to_onprem(job_type)))
             self._wait_running()
         except Exception:
-            # Tear down partial jobs / launched server so GPUs and the port are not orphaned.
+            # Tear down partial jobs so GPUs are not orphaned.
             try:
                 self.shutdown()
             except Exception:

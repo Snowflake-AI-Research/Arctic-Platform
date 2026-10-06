@@ -40,7 +40,7 @@ Arctic RL is designed to **integrate into existing RL frameworks** rather than r
 * **Log-prob / reference engine** — a forward-only DeepSpeed engine for reference / old log-prob computation.
 * **Sampling engine** — a vLLM engine with ArcticInference for fast rollouts.
 
-These engines are orchestrated over [Ray](https://www.ray.io/), can be **colocated** on shared GPUs (via fractional Ray resources) or split across separate GPUs, and keep the sampler in sync with the trainer through NCCL or CUDA-IPC weight transfer. The RL framework interacts with the compute engines over Ray or HTTP. ArcticInference extends the core optimizations with multi-replica scheduling, load-balancing, weight-sync, and router-replay.
+These engines are orchestrated over [Ray](https://www.ray.io/), can be **colocated** on shared GPUs (via fractional Ray resources) or split across separate GPUs, and keep the sampler in sync with the trainer through NCCL or CUDA-IPC weight transfer. The RL framework interacts with the compute engines over Ray. ArcticInference extends the core optimizations with multi-replica scheduling, load-balancing, weight-sync, and router-replay.
 
 An RL framework integrates this module by constructing a client and driving the standard operations (generate, forward/backward, optimizer step, sync_weights, and wake/sleep for memory management). For example, on a single 8-GPU node one could do:
 
@@ -49,7 +49,7 @@ from arctic_platform.rl import ArcticRLClientConfig, create_arctic_rl_client
 
 config = ArcticRLClientConfig(
     model_name="Qwen/Qwen3-4B",
-    comm_protocol="ray",        # or "http"
+    comm_protocol="ray",
     training_gpus=8,            #
     sampling_gpus=8,
     log_prob_gpus=0,

@@ -17,9 +17,7 @@
 
 Companion to ``test_train_engine.py``, which exercises the training engine on fake data; this one drives the
 sampling engine: ``client.generate`` on a standalone sampling-only topology (``sampling_gpus=2``, no training job).
-It runs the ``ray`` transport only -- the http generate-serialization path is already covered by ``test_e2e``'s
-http cell, so a second vLLM spin-up here would be pure plumbing. Asserts each prompt round-trips to a non-empty text
-completion. Heavyweight GPU test; shared infra lives in ``rl_harness``.
+Asserts each prompt round-trips to a non-empty text completion. Heavyweight GPU test; shared infra lives in ``rl_harness``.
 
 Tagged ``@pytest.mark.vllm`` + ``xdist_group("arctic_rl_vllm")``: under ``--dist loadgroup`` it shares a worker
 with the other vLLM tests (never scheduled against them); ``-m "not vllm"`` drops it from a parallel pool.
@@ -50,7 +48,6 @@ prompt_len = 64
 response_len = 64
 rollout_n = 1
 
-# ray only: this is the standalone sampling-only smoke; the http generate-serialization path is covered by test_e2e.
 comm_params = [("ray",)]
 
 prompts = ["The capital of France is", "2 + 2 ="]

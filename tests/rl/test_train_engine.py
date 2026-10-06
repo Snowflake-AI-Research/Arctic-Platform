@@ -27,8 +27,7 @@ position-id reconstruction are exercised. Per cell:
      gradients the optimizer stepped on). The clipped-ratio loss keeps any finite ``old_log_probs`` / ``advantages``
      safe, so no prior real log-prob run is needed.
 
-Matrix (see ``train_engine_params``): ``ray`` runs both ZoRRO on/off; ``http`` runs once (its transport is just
-serialization, independent of the forward path). Shared infra (config, fake data, lifecycle, ports, skip guard,
+Matrix (see ``train_engine_params``): ZoRRO on/off. Shared infra (config, fake data, lifecycle, ports, skip guard,
 GPU lock) lives in ``rl_harness``; does not depend on ``arctic-verl``. Heavyweight GPU test::
 
     pytest tests/rl/test_train_engine.py -s
@@ -75,10 +74,7 @@ log_prob_gpus = 0
 # nats, so this absorbs bf16 jitter yet rejects garbage.
 LOGPROB_ATOL = 0.25
 
-# Trimmed matrix (vs the full 2x2): for a training-only forward, http vs ray is just serialization plumbing and is
-# independent of the ZoRRO axis, so ray covers both forward paths and http needs the serialization path checked
-# only once. e2e exercises both transports end-to-end anyway.
-train_engine_params = [("ray", True), ("ray", False), ("http", True)]
+train_engine_params = [("ray", True), ("ray", False)]
 
 
 @require_torch_multi_gpu

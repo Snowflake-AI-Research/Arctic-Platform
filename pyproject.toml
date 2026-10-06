@@ -93,7 +93,11 @@ dev = [
     "arctic_platform[testing]",
 ]
 
+# Pulls [cortex] so the transport tests can import the client. Not [onprem]: it
+# reaches [rl] -> arctic-inference[vllm], and vLLM's build needs CUDA_HOME, which
+# a CPU-only CI runner does not have. The on-prem tests skip without it.
 testing = [
+    "arctic_platform[cortex]",
     "parameterized",
     "pytest-instafail",
     "pytest-flakefinder",
@@ -141,7 +145,6 @@ cortex = [
 sft = [
     "arctic_platform[transport]",
     "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
-    "fastapi",
     "liger-kernel>=0.8.0",
     "nvidia-ml-py",
     "peft>=0.18,<0.20",
@@ -150,7 +153,6 @@ sft = [
     "tensordict",
     # PEFT 0.19 adapter reload imports EmbeddingParallel, removed in Transformers 5.16.
     "transformers>=5.12.1,<5.16",
-    "uvicorn",
 ]
 
 # Sampling stack that lives in arctic_platform.inference. Not referenced by
