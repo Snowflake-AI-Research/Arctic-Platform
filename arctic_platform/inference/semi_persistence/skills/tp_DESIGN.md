@@ -559,3 +559,17 @@ lives on the workers (`worker._semip_*`) for both TP sizes, because a
 child-side buffer cannot be written by workers at TP>1.
 
 Nothing is removed from the TP=1 path; TP>1 is a strict superset.
+
+## 8. When the TP group spans pods
+
+Everything above assumes one engine on one pod, which is every TP <= 8
+deployment. A TP group that crosses a node boundary inverts the central choice
+of §5: it **cannot** keep its graphs, because vLLM turns custom all-reduce off
+across nodes, so the captured graphs hold NCCL kernels and NCCL will not
+release a communicator a live graph captured. So `nnodes > 1` drops the graphs
+before `destroy_nccl` and recaptures after the restore, and the whole
+keep-graph/warmth apparatus in §5 is skipped there.
+
+The gate is `nnodes`, not TP: two TP=8 replicas on two nodes are two
+single-node engines and behave exactly as this document describes. See
+[MULTINODE_TP16.md](MULTINODE_TP16.md).

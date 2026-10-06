@@ -655,6 +655,38 @@ do not treat the widened budget as load-bearing without re-measuring.
 
 ---
 
+## 7a. A job whose engine spans nodes (`tensor_parallel_size` > GPUs per pod)
+
+Supported as of 2026-10-06, and it changes the placement contract rather than
+the config surface. A spec asks for it the ordinary way -- `semi_p: true`,
+`n_gpus: 16`, `tensor_parallel_size: 16` -- and three things differ:
+
+- **dss builds a different placement group.** `build_inference_pg(...,
+  per_node=cfg.inference_config.semi_p)` produces `nnodes` whole-node bundles
+  with `STRICT_SPREAD` instead of `world_size` single-GPU bundles with PACK.
+  Semi-p places *pods*, not ranks: each half is a CRIU image restored on its
+  own pod driving that pod's whole GPU set, so there is no per-rank actor for a
+  per-rank bundle to hold -- and PACK could satisfy the group on one node,
+  where the halves would contend for the same GPUs and the second node would
+  never appear.
+- **`ReplicaPool` creates a leader plus agents.** The leader
+  `InferenceWorker` takes bundle 0 with `world_size / nnodes` real GPUs (not
+  the 0-GPU coordinator the Ray-executor path uses) and each
+  `SemipNodeAgent` takes its own bundle. `distributed_executor_backend` stays
+  `"mp"`: a semi-p engine is restored rather than constructed, so forcing
+  `"ray"` would hand vLLM a backend it never uses *and* change the config
+  `criu_restore` compares byte for byte.
+- **The dump and restore are joint**, keyed on a `dump_id` both halves carry.
+  Any disagreement makes both halves cold-start together rather than restore a
+  mismatched pair, which would deadlock in its first collective.
+
+`NCCL_SOCKET_IFNAME=^lo`, which dss puts in `extra_env` for multi-node jobs,
+names no interface; the semi-p child overrides it with a real one, because it
+has to bind sockets its dump can account for and close. See
+[MULTINODE_TP16.md](MULTINODE_TP16.md).
+
+**Publishing such a dump is not supported yet** (`node<k>/`; IMAGE_CACHE §1).
+
 ## 8. Not supported
 
 - **Shared weight pool.** The prototype could restore weights from a pinned
