@@ -28,6 +28,10 @@ constrains what runs correctly here:
   from, so `use_kl_loss` / `use_kl_in_reward` must be off. Asking for them
   raises from `_CortexClientShim.fwd_no_grad` rather than substituting zeros,
   which would reduce the KL to a function of the current policy alone.
+* **No ZoRRo `fwd_no_grad`.** Cortex has no forward sub-job, so the model
+  that would serve it is never patched. A policy-snapshot request whose
+  `meta["zorro_train_enable"]` is set raises `ValueError` instead of returning
+  zeros, which are not the ZoRRo log-prob layout.
 * **Clipping is inert, and `approx_kl` reads 0.0.** π_old is re-derived per
   `fwd_bwd` rather than snapshotted. With one optimizer step per collected
   batch — which is what SkyRL's Arctic trainer does, `policy_mini_batch_size`
