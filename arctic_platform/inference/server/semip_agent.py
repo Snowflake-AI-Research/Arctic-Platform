@@ -124,6 +124,11 @@ class SemipNodeAgent:
         """
         from arctic_platform.inference.semi_persistence import (
             Instance, MultiNode)
+        from arctic_platform.inference.server.semip_engine import (
+            _raise_pid_floor, _unprivileged_mode)
+        # Per pod: the counter is this PID namespace's, and the leader's floor
+        # does nothing for the ids this half's image records.
+        pid_floor = _raise_pid_floor()
         self._model_dir = model_dir
         self._node_rank = node_rank
         self._gpus = list(gpus)
@@ -141,7 +146,8 @@ class SemipNodeAgent:
             except FileNotFoundError:
                 pass
         self._inst.init(gpus=list(gpus)).wait()
-        return {"ok": True, "node_rank": node_rank, "pid": self._inst.pid}
+        return {"ok": True, "node_rank": node_rank, "pid": self._inst.pid,
+                "pid_floor": pid_floor, "unprivileged": _unprivileged_mode()}
 
     # -- dump --------------------------------------------------------------
 
@@ -215,16 +221,20 @@ class SemipNodeAgent:
         self._inst.criu_restore().wait()
         return {"ok": True}
 
-    def mq_follower_unpark(self, handle: Any, ranks: list[int],
-                           connect_ip: str) -> dict[str, Any]:
+    def mq_follower_unpark(self, handle: Any,
+                           ranks: list[int]) -> dict[str, Any]:
         """Order this node's ranks onto the leader's new broadcast writer.
 
         Returns their response handles, which the leader connects to in
         ``mq_finish_unpark``. The plane is only whole once both directions
         exist, so the leader cannot proceed on its own.
+
+        The ranks bind their response writers to this pod's address, which
+        only this pod can name.
         """
+        from arctic_platform.inference.server.semip_engine import _leader_ip
         inst = self._require()
-        inst.mq_follower_unpark(handle, list(ranks), connect_ip).wait()
+        inst.mq_follower_unpark(handle, list(ranks), _leader_ip()).wait()
         return {"handles": inst.last_info["mq_follower_unpark"]["handles"]}
 
     def cuda_restore(self) -> dict[str, Any]:
