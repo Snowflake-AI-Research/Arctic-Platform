@@ -59,8 +59,6 @@ class ArcticRLRayClient:
     def __init__(self, config: ArcticRLClientConfig, rl_server_state: ArcticRLRayServerState) -> None:
         self.config = config
 
-        assert config.backend == "local", "ArcticRLRayClient only supports local backend"
-
         pr0(f"[ArcticRLRayClient] entry: config: {config=} {rl_server_state=}")
 
         if config.training_job_id is not None:
@@ -108,12 +106,10 @@ class ArcticRLRayClient:
             actor_client = ArcticRLClient(rc)   # reconnects, no /initialize
         """
         return ArcticRLClientConfig(
-            backend="local",
             model_name=self.config.model_name,
             training_job_id=self._training_job_id,
             sampling_job_id=self._sampling_job_id,
             log_prob_job_id=self._log_prob_job_id,
-            comm_protocol="ray",
         )
 
     def get_server_state(self) -> ArcticRLRayServerState:

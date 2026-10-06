@@ -261,9 +261,9 @@ def finite_metric(x) -> float:
     return x
 
 
-def cell_tag(comm_protocol: str, zorro_enable: bool) -> str:
-    """Human-readable label for a (transport, forward-path) matrix cell, e.g. ``ray/zorro``."""
-    return f"{comm_protocol}/{'zorro' if zorro_enable else 'nonzorro'}"
+def cell_tag(zorro_enable: bool) -> str:
+    """Human-readable label for a forward-path matrix cell."""
+    return "zorro" if zorro_enable else "nonzorro"
 
 
 def assert_generations(results, expected_count: int, tag: str = "") -> list[str]:
@@ -482,7 +482,6 @@ def logprob_kl(training_logprobs: torch.Tensor, inference_logprobs: list[list[fl
 
 
 def build_config(
-    comm_protocol: str,
     checkpoint_path: str,
     zorro_enable: bool,
     model_name: str,
@@ -500,7 +499,7 @@ def build_config(
 ):
     """Minimal hand-rolled ``ArcticRLClientConfig`` (what the verl wrapper builds).
 
-    ``comm_protocol`` / ``zorro_enable`` / ``colocate`` are the knobs that vary. A
+    ``zorro_enable`` / ``colocate`` are the knobs that vary. A
     sampling (vLLM) job is created only when ``sampling_gpus > 0``; ``vllm_overrides`` then merges into its config
     (e.g. ``enable_sleep_mode`` so the e2e test can exercise sleep/wake_inference). ``colocate`` packs training and
     sampling onto shared GPUs via fractional Ray resources (the server forces ``enable_sleep_mode`` in that mode).
@@ -566,8 +565,6 @@ def build_config(
             vllm_config.update(vllm_overrides)
 
     return ArcticRLClientConfig(
-        comm_protocol=comm_protocol,
-        backend="local",
         training_gpus=training_gpus,
         sampling_gpus=sampling_gpus,
         log_prob_gpus=log_prob_gpus,
@@ -603,7 +600,6 @@ def force_stop_spawned_ray_cluster() -> None:
 
 @contextlib.contextmanager
 def arctic_rl_client_session(
-    comm_protocol: str,
     zorro_enable: bool,
     model_name: str,
     attn_implementation: str,
@@ -662,7 +658,6 @@ def arctic_rl_client_session(
             # xdist or workers attach to each other.
             ray_cluster.init_ray_cluster(auto_attach=False)
             config = build_config(
-                comm_protocol,
                 ckpt_dir,
                 zorro_enable=zorro_enable,
                 model_name=model_name,
