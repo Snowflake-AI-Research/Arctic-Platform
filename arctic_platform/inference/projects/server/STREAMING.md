@@ -51,12 +51,14 @@ sent as `-9999.0`. Without `logprobs` the key is absent. `choice_finished` carri
 `total_tokens`. Prompt usage is counted once, completion usage across all choices.
 `completed` follows final usage, after the engine output iterator is closed
 successfully. A `terminal_error` contains a sanitized `code`, never successful
-completion. The pinned vLLM context-window validation error, identified by its
+completion. Only the chat input errors `invalid_message_content` and
+`invalid_chat_request` may add `param`, the name of the offending request field
+(never its content). The pinned vLLM context-window validation error, identified by its
 structured `input_tokens` parameter with a narrow legacy-message fallback, maps
 to `context_length_exceeded`; other unexpected engine exceptions map to
 `engine_error`. If the stream's cleanup after that error is unconfirmed, the
-delivered `code` is `cleanup_unconfirmed` instead and `context_limit_source` is
-omitted, because the engine may still be running the request. Transport failures
+delivered `code` is `cleanup_unconfirmed` instead and `context_limit_source` and
+`param` are omitted, because the engine may still be running the request. Transport failures
 and local cancellation can raise instead of delivering an event. EOF without completed is an error.
 
 Inputs are one prepared text prompt, token-ID list or chat prompt (below). Supported sampling parameters:
@@ -125,7 +127,10 @@ is; callers map OpenAI values to the model family's own.
   arguments merge only within one call.
 - With `logprobs`, each `content_delta` carries the `token_ids` and `logprobs`
   of the engine output that produced it; reasoning and tool-call tokens carry
-  none, as OpenAI reports logprobs for the answer only.
+  none, as OpenAI reports logprobs for the answer only. Logprobs follow engine
+  token deltas, so when the parser holds text back and releases it later, or
+  splits one delta into several kinds, they may not line up one-to-one with
+  the content text.
 - `structured_output` cannot be combined with a chat prompt whose tools need a
   grammar of their own (`invalid_chat_request`, `param="structured_output"`):
   vLLM applies one grammar per request. Without `max_tokens`,
