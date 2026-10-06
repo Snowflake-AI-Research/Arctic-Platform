@@ -32,12 +32,13 @@ from typing import Any
 from typing import Iterable
 
 import torch
-from arctic_inference.server.weight_sync.schedule import TransferSchedule
-from arctic_inference.server.weight_sync.sender import WeightSender
 
 from arctic_platform.rl.config import WeightSyncConfig
 
 if TYPE_CHECKING:
+    from arctic_inference.server.weight_sync.schedule import TransferSchedule
+    from arctic_inference.server.weight_sync.sender import WeightSender
+
     from arctic_platform.rl.client import ArcticRLClient
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,12 @@ class WeightSyncCoordinator:
     """
 
     def __init__(self, config: WeightSyncConfig) -> None:
+        # Imported in-function because ``arctic_platform.rl`` re-exports this
+        # module: an eager import would pull arctic_inference's GPU stack into
+        # every HTTP-only driver, and weight sync is the one thing here that
+        # genuinely needs local devices.
+        from arctic_inference.server.weight_sync.schedule import TransferSchedule
+
         self.config = config
         self.schedule = TransferSchedule.build(
             training_sharding=config.training_sharding,
@@ -102,6 +109,8 @@ class WeightSyncCoordinator:
         reverse: bool = False,
     ) -> WeightSender:
         """Get or lazily create a :class:`WeightSender` for *rank*."""
+        from arctic_inference.server.weight_sync.sender import WeightSender
+
         if rank not in self._senders:
             group = self.schedule.groups[rank]
             self._senders[rank] = WeightSender(

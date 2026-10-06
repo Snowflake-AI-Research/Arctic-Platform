@@ -32,6 +32,7 @@ import time
 from typing import Any
 
 import requests
+from requests.exceptions import HTTPError
 from tenacity import Retrying
 from tenacity import retry_if_exception
 from tenacity import stop_after_attempt
@@ -91,6 +92,9 @@ class CortexTransport(Transport):
         self.max_retries = config.backend_config.max_retries
         self.poll_interval = 0.5
         self.poll_timeout = config.job_ready_timeout
+        # Sized for the agent fan-out a driver puts through one transport, not
+        # for a single-threaded caller. See ``_build_session``.
+        self.pool_maxsize = getattr(config, "http_pool_maxsize", 0) or 256
         self.session = self._build_session()
 
     # ── lifecycle ──────────────────────────────────────────────────────────
@@ -103,7 +107,13 @@ class CortexTransport(Transport):
         else:
             # A mutating create: only retry when the request provably never landed,
             # so we can't spawn duplicate jobs (matches the neutrino client).
-            created = self._send("POST", self._prefix, retry_on=_is_connect_error, json={"sub_job_configs": self._sub_job_configs()})
+            body: dict[str, Any] = {"sub_job_configs": self._sub_job_configs()}
+            # Every job in a shared schema reports ``submitted_by=ADMIN``, so
+            # the comment is the only field that can say whose a job is.
+            comment = os.environ.get("CORTEX_JOB_COMMENT")
+            if comment:
+                body["comment"] = comment
+            created = self._send("POST", self._prefix, retry_on=_is_connect_error, json=body)
             self.job_id = created["job_id"]
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
@@ -207,6 +217,18 @@ class CortexTransport(Transport):
 
     def _build_session(self) -> requests.Session:
         session = requests.Session()
+        # The default adapter pools ten connections, but this session is shared
+        # by every thread driving a generate. Beyond ten concurrent polls
+        # urllib3 opens a connection per request and discards it, so a TLS
+        # handshake to a remote host -- not generation -- dominates. Blocking
+        # rather than overflowing bounds the pool to reused connections.
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=self.pool_maxsize,
+            pool_maxsize=self.pool_maxsize,
+            pool_block=True,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
         cx = self.config.backend_config
         if cx.base_url is None:  # PAT auth against a real Snowflake host
             session.headers["Authorization"] = f"Bearer {os.environ[cx.pat_env_var]}"
@@ -221,7 +243,16 @@ class CortexTransport(Transport):
         # are retried with exponential-jitter backoff (the neutrino client's policy).
         def attempt() -> dict:
             resp = self.session.request(method, url, timeout=self.request_timeout, **kwargs)
-            resp.raise_for_status()
+            if not resp.ok:
+                # ``raise_for_status`` reports only the status line, but
+                # SnowAPI puts which tensor and which limit in the body, so a
+                # bare "400 Bad Request" says nothing about what was rejected.
+                detail = (resp.text or "").strip()[:2000]
+                raise HTTPError(
+                    f"{resp.status_code} {resp.reason} for {method} {url}"
+                    + (f"\nresponse body: {detail}" if detail else ""),
+                    response=resp,
+                )
             return resp.json()
 
         retryer = Retrying(

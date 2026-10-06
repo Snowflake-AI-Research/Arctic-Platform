@@ -53,11 +53,36 @@ class PostTrainingConfig(BaseModel):
     algorithm: Literal["grpo"] = "grpo"
     base_model: str
     learning_rate: float = 1e-6
+    adam_betas: tuple[float, float] = (0.9, 0.999)
+    adam_eps: float = 1e-8
+    weight_decay: float = 0.0
     n_samples_per_prompt: int = Field(4, ge=2)  # GRPO needs a group
     train_gpus: int = 1
     sample_gpus: int = 1
     max_seq_len: int = 1024
+    # Cannot go to the limit: weight sync broadcasts into a staging buffer on
+    # every sampler GPU, so the engine must leave that much unallocated. 0.95
+    # left under 400 MiB against a 2.37 GiB allocation and killed the run at
+    # the first sync, a step after collection had already been paid for.
+    gpu_memory_utilization: float = 0.85
+    max_num_seqs: int = 56
+    # Shard width for one sampling engine, not a GPU count. A 4B model fits on
+    # one GPU, so 1 spends the sub-job's GPUs on independent replicas; any
+    # wider is a single scheduler whose throughput ignores added concurrency.
+    tensor_parallel_size: int = 1
     eps_clip: float = 0.2
+    # Optimizer steps per collection. At 1, π_old is π_new, the ratio is 1 and
+    # the clip never binds. Above 1 the later steps are genuinely off-policy,
+    # which both engages the clip and amortises an hours-long collection.
+    max_off_policy_steps: int = 1
+    # Divide group-relative advantages by the group's reward std. On a binary
+    # reward that is 1/std, which is largest for the groups carrying the least
+    # signal (one success in eight), so it scales up the noisiest gradients.
+    std_normalization: bool = True
+    # Sequences per ``fwd_bwd`` call. Gradients accumulate across micro-batches
+    # and the optimizer steps once at the end, so this changes memory and
+    # payload size, not the update.
+    micro_batch_size: int = 8
     # Cortex/SnowAPI target.
     cortex_host: str | None = None
     cortex_database: str = "NEUTRINO_DB"

@@ -35,7 +35,9 @@ Design notes:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 import time
 import uuid
 from typing import Any
@@ -69,11 +71,15 @@ class ChatMessage(_AllowExtra):
     content: str | list[dict[str, Any]] | None = None
     name: str | None = None
     tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    reasoning_content: str | None = None
 
 
 class ChatCompletionRequest(_AllowExtra):
     model: str
     messages: list[ChatMessage]
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
     temperature: float | None = None
@@ -206,15 +212,42 @@ def _to_sampling_params(
         params["frequency_penalty"] = float(frequency_penalty)
     if seed is not None:
         params["seed"] = int(seed)
-    if logprobs_topk is not None and logprobs_topk > 0:
+    # ``>= 0``, not ``> 0``: zero means "the sampled token's log-prob, no
+    # alternatives", which is exactly what an RL driver replaying a batch
+    # off-policy needs. Rejecting it made ``logprobs: true`` without
+    # ``top_logprobs`` return no log-probs and no error.
+    if logprobs_topk is not None and logprobs_topk >= 0:
         params["logprobs"] = int(logprobs_topk)
     return params
+
+
+def _tool_call_for_template(tc: dict[str, Any]) -> dict[str, Any]:
+    """Re-shape one OpenAI tool call for a Jinja chat template.
+
+    On the wire ``function.arguments`` is a JSON *string*, but Qwen's template
+    iterates it with ``.items()`` — handing the string straight through raises
+    "Can only get item pairs from a mapping" mid-render.
+    """
+    fn = tc.get("function")
+    if not isinstance(fn, dict):
+        return tc
+    args = fn.get("arguments")
+    if not isinstance(args, str):
+        return tc
+    try:
+        parsed = json.loads(args)
+    except (json.JSONDecodeError, ValueError):
+        return tc
+    if not isinstance(parsed, dict):
+        return tc
+    return {**tc, "function": {**fn, "arguments": parsed}}
 
 
 def _render_chat_prompt(
     tokenizer: Any,
     messages: list[ChatMessage],
     template_kwargs: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> str:
     """Apply the tokenizer's chat template.
 
@@ -243,34 +276,206 @@ def _render_chat_prompt(
                 "a chat_template."
             ),
         )
-    payload = [
-        {"role": m.role, "content": m.content if isinstance(m.content, str) else json.dumps(m.content)}
-        for m in messages
-    ]
+    payload = []
+    for m in messages:
+        entry: dict[str, Any] = {
+            "role": m.role,
+            "content": m.content if isinstance(m.content, str) else json.dumps(m.content),
+        }
+        # A tool-using agent replays its own prior assistant turns, so dropping
+        # these fields renders a prompt where the model called nothing and the
+        # ``tool`` replies answer no one.
+        if m.tool_calls:
+            entry["tool_calls"] = [_tool_call_for_template(tc) for tc in m.tool_calls]
+        if m.tool_call_id:
+            entry["tool_call_id"] = m.tool_call_id
+        if m.name:
+            entry["name"] = m.name
+        if m.reasoning_content:
+            entry["reasoning_content"] = m.reasoning_content
+        payload.append(entry)
     kwargs: dict[str, Any] = {
         "tokenize": False,
         "add_generation_prompt": True,
         "enable_thinking": False,
     }
+    if tools:
+        kwargs["tools"] = tools
     if template_kwargs:
         kwargs.update(template_kwargs)
-    try:
-        return tokenizer.apply_chat_template(payload, **kwargs)
-    except TypeError:
-        # Older tokenizers reject unknown kwargs — retry without them.
-        kwargs.pop("enable_thinking", None)
+    # Older tokenizers reject kwargs they don't know. Shed them one at a time,
+    # most-optional last, so a tokenizer that does support tools never has
+    # them dropped. Only an unexpected-kwarg TypeError is retryable: one raised
+    # inside the template is a payload bug and must not be masked by falling
+    # back to a tool-less prompt.
+    for drop in (None, "enable_thinking", "tools"):
+        if drop is not None:
+            if drop not in kwargs:
+                continue
+            kwargs.pop(drop)
         try:
             return tokenizer.apply_chat_template(payload, **kwargs)
-        except Exception as exc:  # noqa: BLE001
+        except TypeError as exc:
+            if "unexpected keyword argument" in str(exc):
+                continue
+            raise HTTPException(
+                status_code=400,
+                detail=f"Chat template failed to render: TypeError: {exc}",
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 — surface template rendering errors
             raise HTTPException(
                 status_code=400,
                 detail=f"Chat template failed to render: {type(exc).__name__}: {exc}",
             ) from exc
-    except Exception as exc:  # noqa: BLE001 — surface template rendering errors
-        raise HTTPException(
-            status_code=400,
-            detail=f"Chat template failed to render: {type(exc).__name__}: {exc}",
-        ) from exc
+    raise HTTPException(
+        status_code=400,
+        detail="Chat template rejected every supported kwarg combination.",
+    )
+
+
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+# Name and body are split on the first ``>`` rather than by the regex, so that
+# no whitespace belonging to the first parameter is consumed as a delimiter.
+_FUNCTION_RE = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
+# Captures name and value together and stops at whichever terminator comes
+# first, so a call that omits a closing tag still yields its parameters. The
+# value is deliberately *not* trimmed here: see ``_parameter_value``.
+_PARAMETER_RE = re.compile(
+    r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", re.DOTALL
+)
+_THINK_CLOSE_RE = re.compile(r"^(.*?)</think>", re.DOTALL)
+_THINK_PAIR_RE = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL)
+
+
+def _split_reasoning(text: str, think_open: bool = False) -> tuple[str, str | None]:
+    """Peel Qwen3's thinking scratchpad off the visible answer.
+
+    Qwen3.5's generation prompt *opens* ``<think>`` itself, so a completion
+    usually carries only the closing tag; handling the paired form alone
+    leaves the whole scratchpad in ``content``, which a harness scoring format
+    correctness reads as a protocol violation.
+
+    ``think_open`` says the prompt left a ``<think>`` block open. If the model
+    never closes it, every token it produced is inside that block, so the
+    completion is all reasoning with no visible answer.
+    """
+    if _THINK_PAIR_RE.search(text):
+        blocks = _THINK_PAIR_RE.findall(text)
+        return _THINK_PAIR_RE.sub("", text).strip(), "\n".join(blocks).strip()
+    m = _THINK_CLOSE_RE.match(text)
+    if m:
+        return text[m.end():].strip(), m.group(1).strip()
+    if think_open and text.strip():
+        return "", text.strip()
+    return text, None
+
+
+def _parameter_value(raw: str) -> str:
+    """Strip only the newlines the XML envelope itself contributes.
+
+    The template writes a value as ``<parameter=x>\\nVALUE\\n</parameter>``, so
+    exactly one newline each side is framing and the rest belongs to the value.
+    Trimming with ``\\s*`` eats the value's leading indentation, which for a
+    tool like ``edit_via_str_replace`` decides whether ``old_str`` matches the
+    file at all, and makes the replayed turn differ from the sampled one.
+    """
+    if raw.startswith("\n"):
+        raw = raw[1:]
+    if raw.endswith("\n"):
+        raw = raw[:-1]
+    return raw
+
+
+def _convert_param_value(value: str, name: str, schema: dict[str, Any]) -> Any:
+    """Coerce a parameter to the type its tool declares, defaulting to string.
+
+    The wire format is untyped text, so the schema is the only thing that says
+    whether ``123`` is an integer or a string that happens to look like one.
+    Guessing with ``json.loads`` instead turns a shell command of ``null`` into
+    ``None`` and a commit message of ``true`` into a boolean.
+    """
+    if value.lower() == "null":
+        return None
+    spec = schema.get(name)
+    ptype = "string"
+    if isinstance(spec, dict) and "type" in spec:
+        ptype = str(spec["type"]).strip().lower()
+    if ptype in ("string", "str", "text", "varchar", "char", "enum"):
+        return value
+    if ptype.startswith(("int", "uint", "long", "short", "unsigned")):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+    if ptype.startswith(("num", "float")):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return value
+    if ptype in ("boolean", "bool", "binary"):
+        return value.lower() == "true"
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return value
+
+
+def _arguments_schema(name: str, tools: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """The declared properties for one tool, or empty when it is not declared."""
+    for tool in tools or ():
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(fn, dict) and fn.get("name") == name:
+            params = fn.get("parameters")
+            if isinstance(params, dict):
+                props = params.get("properties")
+                if isinstance(props, dict):
+                    return props
+            return {}
+    return {}
+
+
+def _parse_tool_calls(
+    text: str, tools: list[dict[str, Any]] | None = None
+) -> tuple[str, list[dict[str, Any]]]:
+    """Convert Qwen3.5 tool-call spans into OpenAI ``tool_calls``.
+
+    Qwen3.5's template specifies a nested XML envelope, not JSON::
+
+        <tool_call><function=execute_bash><parameter=cmd>
+        ls -la
+        </parameter></function></tool_call>
+
+    Parsing mirrors vLLM's ``qwen3_coder`` parser, which is what the reference
+    setup serves this model behind: one newline of framing off each value, and
+    types taken from the tool schema. A malformed span is deliberately left in
+    ``content`` rather than raised: a model that emits a broken call should be
+    scored as a format failure by the harness, not 500 the gateway.
+    """
+    calls: list[dict[str, Any]] = []
+    for raw in _TOOL_CALL_RE.findall(text):
+        fn = _FUNCTION_RE.search(raw)
+        if fn is None:
+            continue
+        span = fn.group(1) if fn.group(1) is not None else fn.group(2)
+        if ">" not in span:
+            continue
+        name, _, body = span.partition(">")
+        schema = _arguments_schema(name, tools)
+        args: dict[str, Any] = {}
+        for match in _PARAMETER_RE.findall(body):
+            if ">" not in match:
+                continue
+            key, _, value = match.partition(">")
+            args[key] = _convert_param_value(_parameter_value(value), key, schema)
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "index": len(calls),
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+    if not calls:
+        return text, []
+    return _TOOL_CALL_RE.sub("", text).strip(), calls
 
 
 def _finish_reason_to_openai(reason: str | None) -> str:
@@ -360,6 +565,24 @@ async def list_models(request: Request) -> dict[str, Any]:
     return {"object": "list", "data": data}
 
 
+def _prepare_chat_prompt(
+    tokenizer: Any,
+    messages: list[ChatMessage],
+    template_kwargs: dict[str, Any] | None,
+    tools: list[dict[str, Any]] | None,
+) -> tuple[str, list[int]]:
+    """Render the chat template and tokenize the result, in one pass.
+
+    Paired so the caller can move both off the event loop in a single hop, and
+    so the returned ids are by construction exactly the returned text — the
+    property the RL client relies on when it rebuilds a batch.
+    """
+    text = _render_chat_prompt(
+        tokenizer, messages, template_kwargs=template_kwargs, tools=tools
+    )
+    return text, _tokenize_for_return_ids(tokenizer, text)
+
+
 @router.post("/chat/completions")
 async def chat_completions(request: Request) -> Any:
     payload = await request.json()
@@ -372,12 +595,22 @@ async def chat_completions(request: Request) -> Any:
     # Optional per-request chat-template override for tokenizers that
     # take extra kwargs (e.g. Qwen3's ``enable_thinking``).
     template_kwargs: dict[str, Any] = {}
-    extra_body = payload.get("extra_body")
-    if isinstance(extra_body, dict):
-        ct = extra_body.get("chat_template_kwargs")
-        if isinstance(ct, dict):
-            template_kwargs.update(ct)
-    prompt_text = _render_chat_prompt(tokenizer, req.messages, template_kwargs=template_kwargs)
+    # vLLM's OpenAI server accepts ``chat_template_kwargs`` at the top level;
+    # the ``extra_body`` nesting is how the OpenAI *SDK* smuggles it there.
+    # Accept both, so a caller that already works against vLLM works here.
+    for container in (payload, payload.get("extra_body")):
+        if isinstance(container, dict):
+            ct = container.get("chat_template_kwargs")
+            if isinstance(ct, dict):
+                template_kwargs.update(ct)
+    # Rendering and tokenization are the only CPU-bound work here and both
+    # scale with conversation length. On the event loop they serialise every
+    # request through uvicorn's single thread, making the gateway the
+    # throughput ceiling instead of the GPUs. Fast tokenizers release the GIL,
+    # so a worker thread genuinely overlaps them.
+    prompt_text, prompt_token_ids = await asyncio.to_thread(
+        _prepare_chat_prompt, tokenizer, req.messages, template_kwargs, req.tools
+    )
 
     # OpenAI renamed ``max_tokens`` to ``max_completion_tokens`` — accept
     # both, prefer the newer field if both are set.
@@ -393,7 +626,11 @@ async def chat_completions(request: Request) -> Any:
         presence_penalty=req.presence_penalty,
         frequency_penalty=req.frequency_penalty,
         seed=req.seed,
-        logprobs_topk=req.top_logprobs if req.logprobs else None,
+        # In the chat schema these are two separate switches: ``logprobs`` asks
+        # for the sampled tokens' log-probs, ``top_logprobs`` additionally asks
+        # for K alternatives. Defaulting the count to 0 keeps the first usable
+        # on its own instead of depending on the second.
+        logprobs_topk=(req.top_logprobs or 0) if req.logprobs else None,
     )
 
     results = await _generate_n(pool, prompt_text, sampling_params)
@@ -406,8 +643,7 @@ async def chat_completions(request: Request) -> Any:
     # is set (see ``harbor.llms.lite_llm.LiteLLM._extract_token_ids``).
     # Emitted unconditionally: clients that don't consume the fields
     # (plain OpenAI SDK) ignore them, per the OpenAI spec's
-    # forward-compatibility rule.
-    prompt_token_ids = _tokenize_for_return_ids(tokenizer, prompt_text)
+    # forward-compatibility rule. Computed alongside the render above.
 
     if req.stream:
         return StreamingResponse(
@@ -422,12 +658,38 @@ async def chat_completions(request: Request) -> Any:
             media_type="text/event-stream",
         )
 
+    # Whether the rendered prompt left a ``<think>`` block open decides how an
+    # unclosed completion is read, so it has to be measured on the prompt the
+    # template actually produced rather than assumed from the model name.
+    think_open = prompt_text.rstrip().endswith("<think>")
+
     choices = []
     for idx, r in enumerate(results):
+        text = r.get("text", "")
+        text, reasoning = _split_reasoning(text, think_open=think_open)
+        # Tool calls are extracted from whichever side they landed on. Inside an
+        # unclosed think block there is no visible answer to scan, but the
+        # template invites a call there, so the reasoning is what carries it.
+        if req.tools and reasoning and not text:
+            reasoning, tool_calls = _parse_tool_calls(reasoning, req.tools)
+        else:
+            text, tool_calls = (
+                _parse_tool_calls(text, req.tools) if req.tools else (text, [])
+            )
+        message: dict[str, Any] = {"role": "assistant", "content": text or None}
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         choice: dict[str, Any] = {
             "index": idx,
-            "message": {"role": "assistant", "content": r.get("text", "")},
-            "finish_reason": _finish_reason_to_openai(r.get("finish_reason")),
+            "message": message,
+            # A parsed call outranks the raw stop reason: the model stopped on
+            # the tool-call end token, which OpenAI clients expect to see
+            # reported as ``tool_calls`` so they dispatch instead of finishing.
+            "finish_reason": (
+                "tool_calls" if tool_calls else _finish_reason_to_openai(r.get("finish_reason"))
+            ),
             # vLLM-compat: completion token ids alongside the message so
             # Harbor / any RL client can build a batch without a second
             # tokenize pass.

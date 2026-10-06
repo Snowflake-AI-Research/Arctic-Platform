@@ -29,6 +29,7 @@ import contextlib
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from arctic_platform.openai_compat import router as openai_router
@@ -45,17 +46,27 @@ class _ClientBackedPool:
     payloads through ``ArcticRLClient``.
     """
 
-    def __init__(self, client: Any) -> None:
+    def __init__(self, client: Any, max_inflight: int = 256) -> None:
         self._client = client
         # ``openai_compat._get_pool_and_tokenizer`` treats a ``None``
         # ``_config`` as "still warming" and returns 503. Any non-None
         # value works — we use ``self`` to keep it obvious in a repl.
         self._config = self
+        # A dedicated pool, not ``asyncio.to_thread``: that helper uses the
+        # loop's default executor, capped at ``min(32, cpu + 4)`` and shared
+        # with every other offloaded call. A generate holds its thread for the
+        # whole sampling latency, so the cap becomes a hard concurrency limit
+        # regardless of how many replicas the job has. The threads park on a
+        # socket, so sizing to the agent concurrency costs only stacks.
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_inflight, thread_name_prefix="ap-generate"
+        )
 
     async def generate(
         self,
         prompts: list[Any],
         sampling_params: dict[str, Any],
+        routing_key: Any = None,
     ) -> list[dict[str, Any]]:
         """Delegate to ``ArcticRLClient.generate``.
 
@@ -64,18 +75,32 @@ class _ClientBackedPool:
         transport). The legacy dispatch shim's ``generate`` is a
         coroutine. We detect which we got and drive it accordingly so
         both call paths behave the same from Harbor's point of view.
+
+        ``routing_key`` identifies the conversation so the sampling job lands a
+        rollout's turns on the replica that already holds its prefix. Without
+        it each turn goes to an arbitrary replica, leaving the prefix cache
+        enabled but useless and re-prefilling the conversation every turn. It
+        is optional because the legacy shim does not accept it.
         """
-        result = self._client.generate(
-            prompts=list(prompts),
-            sampling_params=dict(sampling_params or {}),
+        extra = {"routing_key": routing_key} if routing_key is not None else {}
+        if asyncio.iscoroutinefunction(self._client.generate):
+            return await self._client.generate(
+                prompts=list(prompts),
+                sampling_params=dict(sampling_params or {}),
+                **extra,
+            )
+        # The sync transport blocks while it polls SnowAPI. Run inline it
+        # stalls uvicorn's loop, serialising every concurrent agent onto one
+        # sample at a time. The call is I/O-bound, so a worker thread is enough
+        # to let them overlap.
+        return await asyncio.get_running_loop().run_in_executor(
+            self._executor,
+            lambda: self._client.generate(
+                prompts=list(prompts),
+                sampling_params=dict(sampling_params or {}),
+                **extra,
+            ),
         )
-        if asyncio.iscoroutine(result):
-            return await result
-        # Sync ``.generate`` blocks the current thread; that's fine here
-        # because uvicorn already runs on its own loop, but concurrent
-        # trials serialize through it. If concurrency ever matters,
-        # hoist the sync path into ``asyncio.to_thread``.
-        return result
 
 
 def _pick_free_port() -> int:
@@ -106,12 +131,16 @@ class DriverOpenAIGateway:
         model_name: str,
         host: str = "127.0.0.1",
         port: int | None = None,
+        max_inflight: int = 256,
     ) -> None:
         self._client = client
         self._tokenizer = tokenizer
         self._model_name = model_name
         self._host = host
         self._port = port or _pick_free_port()
+        # Should be at least the number of agents sampling at once; below that
+        # it silently becomes the loop's concurrency limit.
+        self._max_inflight = max_inflight
         self._server: Any | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
@@ -127,7 +156,9 @@ class DriverOpenAIGateway:
         from fastapi import FastAPI
 
         app = FastAPI(title="arctic-platform openai-compat gateway")
-        app.state.sampling_pool = _ClientBackedPool(self._client)
+        app.state.sampling_pool = _ClientBackedPool(
+            self._client, max_inflight=self._max_inflight
+        )
         app.state.sampling_tokenizer = self._tokenizer
         app.state.sampling_model_name = self._model_name
         app.state.sampling_created = int(time.time())

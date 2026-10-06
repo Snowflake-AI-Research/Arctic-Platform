@@ -363,7 +363,10 @@ class ArcticRLClientConfig(BaseModel):
         # flattening them onto inference_config is silently ignored (extra="allow").
         vllm = dict(self.sampling.vllm)
         vllm.pop("max_model_len", None)  # owned by top-level max_seq_len
-        vllm.pop("tensor_parallel_size", None)  # owned by n_gpus on this wire
+        # tensor_parallel_size is deliberately NOT stripped: n_gpus is the
+        # sub-job's GPU count, not the shard width. Left unset the server
+        # shards one engine across all of them, giving a single scheduler whose
+        # throughput ignores added concurrency; 1 gives independent replicas.
         inference: dict[str, Any] = {"max_seq_len": self.max_seq_len, "n_gpus": n_gpus}
         if vllm:
             inference["vllm_config"] = vllm
