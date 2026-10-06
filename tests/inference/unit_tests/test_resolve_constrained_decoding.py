@@ -302,6 +302,7 @@ def test_disabled_arctic_plugin_applies_required_runtime_patches(monkeypatch):
         fp32_lm_head,
         plugin,
         router_replay,
+        spec_decode_grammar,
         xgrammar_stop_mask,
     )
 
@@ -323,10 +324,15 @@ def test_disabled_arctic_plugin_applies_required_runtime_patches(monkeypatch):
         "ensure_xgrammar_stop_mask_fix",
         lambda: calls.append("xgrammar"),
     )
+    monkeypatch.setattr(
+        spec_decode_grammar,
+        "ensure_spec_decode_grammar_fix",
+        lambda: calls.append("grammar"),
+    )
 
     plugin.arctic_inference_plugin()
 
-    assert calls == ["router", "xgrammar", "fp32"]
+    assert calls == ["router", "xgrammar", "grammar", "fp32"]
 
 
 def test_worker_coerces_openai_structured_outputs_for_vllm():
