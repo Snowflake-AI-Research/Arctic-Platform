@@ -65,7 +65,7 @@ def classify_engine_error(exc):
         return "engine_error", None
     if getattr(exc, "parameter", None) == "input_tokens":
         return "context_length_exceeded", "prompt"
-    if getattr(exc, "parameter", None) == "logit_bias":
+    if getattr(exc, "parameter", None) in {"logit_bias", "logprobs"}:
         return "invalid_sampling_params", None
     message = str(exc)
     if message.startswith(

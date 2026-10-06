@@ -347,3 +347,13 @@ def test_streams_without_structured_output_never_import_it(engine_params):
 
 def test_client_stream_rejects_logprobs_nobody_requested():
     test_client_stream_validates_delta_logprobs([_entry(1), _entry(2)], False, requested=None)
+
+
+def test_logprobs_above_the_engine_maximum_are_typed():
+    error = VLLMValidationError(
+        "Requested sample logprobs of 21, which is greater than max allowed: 20",
+        parameter="logprobs",
+        value=21,
+    )
+    assert classify_engine_error(error) == ("invalid_sampling_params", None)
+

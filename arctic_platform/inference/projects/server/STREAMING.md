@@ -80,7 +80,8 @@ schema that no vLLM structured-output backend accepts ends the stream with
 `invalid_structured_output`. `thinking_token_budget` is an integer in
 [1, max_tokens]; vLLM rejects it with `invalid_sampling_params` unless the
 model was loaded with a reasoning parser. `logprobs` is an integer in [0, 20],
-the number of alternatives reported per token. `"sampling_params" in
+the number of alternatives reported per token; a value above the loaded model's
+`max_logprobs` ends the stream with `invalid_sampling_params`. `"sampling_params" in
 STREAM_CAPABILITIES` tells callers these four parameters are accepted. Active LoRA selection is forwarded. No chat rendering, participant
 name handling, HTTP, SSE, or training-specific prompt mutation occurs here.
 For nonstream responses DSS can collect the same events into a complete response.
