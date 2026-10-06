@@ -109,7 +109,12 @@ needs up to 2n + 2 slots. A merge that would exceed the per-event byte limit
 starts a new event instead.
 
 Defaults: 128 queued events, 1 MiB queued serialized payload, 256 KiB per event,
-and 128 sessions per worker. Streaming and legacy
+and 128 sessions per worker. Logprobs make each token's payload much larger:
+with `logprobs=20` a token serializes to about 1.5 KB, roughly 20 times a
+one-token delta without them, so a reader that falls about 700 tokens behind
+overflows the default buffer. Callers that request logprobs should raise
+`max_buffer_bytes` (ceiling 16 MiB, about 11,000 undelivered tokens at
+`logprobs=20`). Streaming and legacy
 `generate()` requests share each worker's `active_requests` / `concurrency_limit`
 budget. Each dispatched stream consumes one shared slot and is additionally counted
 against the per-worker `MAX_WORKER_STREAMS` cap (128); this is an extra ceiling,

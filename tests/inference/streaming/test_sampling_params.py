@@ -357,3 +357,45 @@ def test_logprobs_above_the_engine_maximum_are_typed():
     )
     assert classify_engine_error(error) == ("invalid_sampling_params", None)
 
+
+def _logprob_delta(token_id):
+    # A chosen token plus 20 alternatives, with full-precision float logprobs.
+    position = {
+        rank * 100_000 + token_id: _logprob(-rank / 7, rank, f" word{rank}")
+        for rank in range(2, 21)
+    }
+    position[token_id] = _logprob(-0.123456789, 1, f" word{token_id}")
+    return {
+        "type": "delta",
+        "choice_index": 0,
+        "text": f" word{token_id}",
+        "token_ids": [token_id],
+        "logprobs": delta_logprobs([token_id], [position], 20),
+    }
+
+
+def _fill(buffer, tokens):
+    for token_id in range(tokens):
+        buffer.put(_logprob_delta(10_000 + token_id))
+
+
+def test_logprob_stream_behind_a_slow_reader_overflows_the_default_buffer():
+    # Each token with logprobs=20 serializes to over 1 KiB, so the default
+    # 1 MiB buffer holds well under a thousand undelivered tokens.
+    from arctic_platform.inference.server.streaming import EventBuffer, event_size
+
+    assert event_size(_logprob_delta(10_000)) > 1024
+    with pytest.raises(StreamError, match="buffer_overflow"):
+        _fill(EventBuffer(StreamLimits()), 3000)
+
+
+def test_logprob_stream_behind_a_slow_reader_fits_a_raised_buffer():
+    from arctic_platform.inference.server.streaming import EventBuffer
+
+    buffer = EventBuffer(StreamLimits(max_buffer_bytes=16 * 1024 * 1024))
+    _fill(buffer, 3000)
+    events = buffer.drain()
+    assert [
+        entry["token_id"] for event in events for entry in event["logprobs"]
+    ] == list(range(10_000, 13_000))
+    assert all(len(entry["top"]) == 20 for e in events for entry in e["logprobs"])
