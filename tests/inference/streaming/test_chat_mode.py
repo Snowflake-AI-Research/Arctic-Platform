@@ -447,6 +447,42 @@ def test_tool_call_arguments_merge_only_within_one_call():
     ]
 
 
+def test_merged_chat_event_sizes_match_their_serialized_sizes():
+    # Merges size only the appended part, so each kind's growth must be
+    # counted: reasoning counts gain digits, tool arguments gain escaped text.
+    from arctic_platform.inference.server.streaming import event_size
+
+    def call(arguments, **ids):
+        return {"type": "tool_call_delta", "choice_index": 0, "index": 0, "arguments": arguments, **ids}
+
+    def reasoning(count):
+        return {"type": "reasoning_delta", "choice_index": 0, "token_count": count}
+
+    def content(text):
+        return {
+            "type": "content_delta",
+            "choice_index": 0,
+            "text": text,
+            "token_ids": [7],
+            "logprobs": [{"token_id": 7, "token": text, "logprob": -0.5, "top": []}],
+        }
+
+    streams = [
+        [reasoning(count) for count in (1, 8, 1, 90, 900, 9000)],
+        [call("", id="call_0", name="f")] + [call('{"城": "\\n"}') for _ in range(50)],
+        [content(text) for text in ("猫", "😀", '"', "a") * 20],
+    ]
+    for events in streams:
+        buffer = EventBuffer(StreamLimits())
+        for event in events:
+            buffer.put(event)
+            assert [size for _, size in buffer.events] == [
+                event_size(event) for event, _ in buffer.events
+            ]
+        assert len(buffer.events) == 1
+        assert buffer.bytes == event_size(buffer.events[0][0])
+
+
 def test_slow_reader_gets_merged_chat_events():
     async def check():
         worker = make_worker(script=["<think>"] + ["r"] * 300 + ["</think>"] + ["a"] * 300)

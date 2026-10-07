@@ -430,10 +430,32 @@ def _valid_delta_fields(event, chat):
     return True
 
 
+def _compact(value):
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
 def event_size(event):
-    return len(
-        json.dumps(event, ensure_ascii=True, separators=(",", ":")).encode("ascii")
-    )
+    # ASCII-escaped, so characters and bytes count the same.
+    return len(_compact(event))
+
+
+def _appended_size(old, added, key):
+    """Bytes that appending ``added[key]`` to ``old[key]`` adds to ``old``.
+
+    Serializes only the appended part. Escaping is per character and list
+    items serialize independently, so a joined string or list grows by the
+    added part without its quotes or brackets, plus a comma between items.
+    """
+    if key not in added:
+        return 0
+    part = _compact(added[key])
+    if key not in old:
+        return len(f',"{key}":') + len(part)
+    if isinstance(added[key], str):
+        return len(part) - 2
+    if not added[key]:
+        return 0
+    return len(part) - 2 + (1 if old[key] else 0)
 
 
 class EventBuffer:
@@ -489,11 +511,14 @@ class EventBuffer:
         if entry is None or entry[0]["type"] != event["type"]:
             return False
         kind = event["type"]
+        size = entry[1]
         if kind == "reasoning_delta":
             merged = {
                 **entry[0],
                 "token_count": entry[0]["token_count"] + event["token_count"],
             }
+            size += len(str(merged["token_count"])) - len(str(entry[0]["token_count"]))
+            joined = ()
         elif kind == "tool_call_delta":
             # Only argument text continuing the same call joins it; a new id or
             # name starts a call of its own.
@@ -503,8 +528,10 @@ class EventBuffer:
                 **entry[0],
                 "arguments": entry[0]["arguments"] + event["arguments"],
             }
+            joined = ("arguments",)
         else:
             merged = {**entry[0], "text": entry[0]["text"] + event["text"]}
+            joined = ("text",)
         if "token_ids" in entry[0] or "token_ids" in event:
             merged["token_ids"] = [
                 *entry[0].get("token_ids", ()), *event.get("token_ids", ())
@@ -513,7 +540,10 @@ class EventBuffer:
             merged["logprobs"] = [
                 *entry[0].get("logprobs", ()), *event.get("logprobs", ())
             ]
-        size = event_size(merged)
+        size += sum(
+            _appended_size(entry[0], event, key)
+            for key in (*joined, "token_ids", "logprobs")
+        )
         if size > self.limits.max_event_bytes:
             return False
         if self.bytes - entry[1] + size > self.limits.max_buffer_bytes:
