@@ -216,7 +216,10 @@ with original denominators and without DP gradient compensation. These are
 normalized units (token-mean: sum of absolute advantages / request tokens;
 weighted prompt-mean: sum of row weight × absolute advantages / row tokens).
 SP shards sum once and only the SP leader emits; microbatches and DP workers
-sum their contributions. No advantage scaling is applied. Ratio-control keys without `use_cispo_loss=True` pass the batching
+sum their contributions. No advantage scaling is applied. `ratio_mask_kept_k3_sum` sums
+k3 = exp(Δ) − 1 − Δ (Δ = policy minus behavior log-probability) over the tokens ratio masking keeps, with the
+same summation; the kept-token mean k3 is that sum divided by
+`ratio_trainable_token_count − ratio_mask_dropped_token_count`. Ratio-control keys without `use_cispo_loss=True` pass the batching
 and validation callbacks; they are rejected when the packed loss reduction is
 resolved (DSS and the native worker do this before any forward), and otherwise
 by the loss. An explicit `null` is rejected for every ratio-control key (omit

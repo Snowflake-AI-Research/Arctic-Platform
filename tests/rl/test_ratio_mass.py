@@ -15,6 +15,8 @@
 
 """Request-global CISPO signed mass, including the single-call preflight."""
 
+import math
+
 import torch
 
 from arctic_platform.common.utils.batch import combine_metric_microbatches, combine_metric_shards
@@ -70,6 +72,9 @@ class TestRatioMass(TestCasePlus):
                         key = f"ratio_mask_{sign}_{stage}_mass_sum"
                         self.assertAlmostEqual(whole[key], expected)
                         self.assertAlmostEqual(merged[key], expected)
+                expected_k3 = 2 * (math.e - 2) if "ratio_stats" in masks else 0.0  # the two delta=1 tokens drop at 1.1
+                self.assertAlmostEqual(whole["ratio_mask_kept_k3_sum"], expected_k3, places=6)
+                self.assertAlmostEqual(merged["ratio_mask_kept_k3_sum"], expected_k3, places=6)
                 if "ratio_stats" in masks:
                     base = self.run_loss(
                         advantages, delta, {k: v for k, v in config.items() if k != "ratio_stats"}, **context
