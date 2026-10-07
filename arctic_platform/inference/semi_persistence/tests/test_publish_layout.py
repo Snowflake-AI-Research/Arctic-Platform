@@ -112,6 +112,22 @@ class _Bucket:
         self.removed: list[str] = []
         self.sentinels: set[str] = set()
         self.manifests: dict[str, dict] = {}
+        self.staged: dict[str, dict[str, dict]] = {}
+        self.cleared: list[str] = []
+
+    def stage_put(self, bucket, key, name, obj, scratch):
+        self.staged.setdefault(key, {})[name] = json.loads(json.dumps(obj))
+
+    def stage_list(self, bucket, key):
+        return dict(self.staged.get(key, {}))
+
+    def stage_clear(self, bucket, key):
+        self.cleared.append(key)
+        self.staged.pop(key, None)
+
+    def node_count(self, bucket: str, key: str):
+        manifest = self.manifests.get(f"s3://{bucket}/{key}")
+        return None if manifest is None else manifest.get("nodes", 1)
 
     def aws(self, *args: str) -> None:
         self.copies.append(args)
@@ -142,17 +158,26 @@ def _with_bucket(body):
     """Run *body(bucket)* with the AWS seams replaced."""
     bucket = _Bucket()
     originals = (sp._aws, sp._published, sp._skeleton_referrers, sp.image_digest,
-                 sp._published_replica_count)
+                 sp._published_replica_count, sp._published_node_count,
+                 sp._stage_put, sp._stage_list, sp._stage_clear,
+                 sp._RENDEZVOUS_POLL_S)
     sp._aws = bucket.aws
     sp._published = bucket.published
     sp._skeleton_referrers = lambda *a, **k: []
     sp.image_digest = lambda: ("abc", "dss@sha256:abc")
     sp._published_replica_count = bucket.replica_count
+    sp._published_node_count = bucket.node_count
+    sp._stage_put = bucket.stage_put
+    sp._stage_list = bucket.stage_list
+    sp._stage_clear = bucket.stage_clear
+    sp._RENDEZVOUS_POLL_S = 0.01
     try:
         return body(bucket)
     finally:
         (sp._aws, sp._published, sp._skeleton_referrers,
-         sp.image_digest, sp._published_replica_count) = originals
+         sp.image_digest, sp._published_replica_count,
+         sp._published_node_count, sp._stage_put, sp._stage_list,
+         sp._stage_clear, sp._RENDEZVOUS_POLL_S) = originals
 
 
 # --------------------------------------------------------------------------
@@ -720,6 +745,199 @@ def test_a_flat_dump_is_unchanged_by_the_replica_layout():
         md = sp.Path(_model_dir(tmp, ENV_A))
         key, _, replicas = sp.load_layout(md)
         assert key == f"{CFG}_{ENV_A}" and replicas == []
+    _in_tmp(body)
+
+
+# --------------------------------------------------------------------------
+# One engine over several pods: each pod holds only its node<k>/ half
+# --------------------------------------------------------------------------
+
+DUMP_ID = "4cc6c196ea1c4c59b59df9842c2ea85e"
+
+
+def _node_pod(tmp, pod, k, *, nnodes=2, tp=4, dump_id=DUMP_ID,
+              weights_text="shard-bytes", ranks=None):
+    """One pod's ``<key>/node<k>/`` plus the ``weight/`` ranks it saved."""
+    key = f"{CFG}_{ENV_A}"
+    root = os.path.join(tmp, pod, "cache", key)
+    ndir = os.path.join(root, f"{sp.NODE_DIR_PREFIX}{k}")
+    meta = {
+        # What a restore materializes into, which is the same on every pod.
+        "model_dir": os.path.join("/data-fast/image-cache_neutrino", key,
+                                  f"{sp.NODE_DIR_PREFIX}{k}"),
+        "uid": os.getuid(),
+        "vllm_config": {"model": SLUG, "tensor_parallel_size": tp,
+                        "nnodes": nnodes},
+        "image_ref": "dss@sha256:abc",
+        "driver_version": "580.159.03",
+        "nnodes": nnodes, "node_rank": k, "dump_id": dump_id,
+    }
+    _write(os.path.join(ndir, "image", "meta.json"), json.dumps(meta))
+    _write(os.path.join(ndir, "image", "core-1.img"), f"tree-{k}")
+    _write(os.path.join(ndir, "compilation", "triton", "k.json"), "{}")
+    local = tp // nnodes
+    for rank in (range(k * local, (k + 1) * local) if ranks is None else ranks):
+        base = os.path.join(root, sp.WEIGHT_DIR, f"rank{rank}")
+        _write(os.path.join(base, "weights_meta.json"), "{}")
+        _write(os.path.join(base, "shard_0000.bin"), f"{weights_text}-r{rank}")
+    return root
+
+
+def _publish_pods(roots, **kw):
+    """Publish every pod's half concurrently, as the operator does."""
+    import threading
+    results, errors = {}, {}
+
+    def run(i, root):
+        try:
+            results[i] = sp.publish(sp.Path(root), "bkt", "image-cache", **kw)
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            errors[i] = exc
+    threads = [threading.Thread(target=run, args=(i, r))
+               for i, r in enumerate(roots)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    return results, errors
+
+
+def test_two_pods_publish_one_skeleton_and_one_weight_directory():
+    def body(tmp):
+        def run(bucket):
+            roots = [_node_pod(tmp, "pod-a", 0), _node_pod(tmp, "pod-b", 1)]
+            results, errors = _publish_pods(roots)
+            assert not errors, errors
+            assert results[0] == results[1]
+            key = results[0]
+            skel = f"s3://bkt/image-cache/{SLUG}/{sp.SKELETON_DIR}/{key}"
+            manifest = bucket.manifests[skel]
+            assert manifest["nodes"] == 2 and manifest["dump_id"] == DUMP_ID
+            assert {r["path"].split("/", 1)[0] for r in manifest["files"]} == {
+                "node0", "node1"}
+            assert not any(f"/{sp.WEIGHT_DIR}/" in r["path"]
+                           for r in manifest["files"])
+            wt_dest = [d for d in bucket.manifests if f"/{sp.WEIGHT_DIR}/" in d]
+            assert len(wt_dest) == 1
+            ranks = {r["path"].split("/", 1)[0]
+                     for r in bucket.manifests[wt_dest[0]]["files"]}
+            assert ranks == {f"rank{r}" for r in range(4)}
+            # Each pod uploads its own shards into the one directory.
+            assert [d for d in bucket.uploaded_dirs()
+                    if f"/{sp.WEIGHT_DIR}/" in d] == wt_dest * 2
+            assert sorted(d for d in bucket.uploaded_dirs()
+                          if d.startswith(skel)) == sorted(
+                f"{skel}/node{k}/{sub}" for k in range(2)
+                for sub in sp.SKELETON_DIRS)
+            assert bucket.cleared and not bucket.staged
+        _with_bucket(run)
+    _in_tmp(body)
+
+
+def test_the_sentinels_follow_every_pods_uploads():
+    """Node 0 writes them, after the other pod's done marker, weights first."""
+    def body(tmp):
+        def run(bucket):
+            roots = [_node_pod(tmp, "pod-a", 0), _node_pod(tmp, "pod-b", 1)]
+            _, errors = _publish_pods(roots)
+            assert not errors, errors
+            dests = [a[-1] for a in bucket.copies]
+            sentinels = [i for i, a in enumerate(bucket.copies)
+                         if a[:2] == ("s3", "cp")
+                         and a[-1].endswith(sp.MANIFEST_FILENAME)]
+            uploads = [i for i, a in enumerate(bucket.copies)
+                       if "--recursive" in a]
+            assert len(sentinels) == 2
+            assert max(uploads) < min(sentinels)
+            assert f"/{sp.WEIGHT_DIR}/" in dests[sentinels[0]]
+            assert f"/{sp.SKELETON_DIR}/" in dests[sentinels[1]]
+        _with_bucket(run)
+    _in_tmp(body)
+
+
+def test_the_weight_hash_spans_every_pods_ranks():
+    """Each pod alone would hash only its ranks; the published hash is the
+    union's, which is what both pods must agree on."""
+    def body(tmp):
+        def run(bucket):
+            roots = [_node_pod(tmp, "pod-a", 0), _node_pod(tmp, "pod-b", 1)]
+            results, _ = _publish_pods(roots)
+            wt = results[0].rsplit("_", 1)[1]
+            alone = sp.weights_hash(sp.build_manifest(
+                sp.Path(roots[0]), [sp.WEIGHT_DIR])["files"])
+            assert wt != alone
+        _with_bucket(run)
+    _in_tmp(body)
+
+
+def test_missing_ranks_refuse_before_anything_is_uploaded():
+    def body(tmp):
+        def run(bucket):
+            roots = [_node_pod(tmp, "pod-a", 0),
+                     _node_pod(tmp, "pod-b", 1, ranks=[2])]
+            _, errors = _publish_pods(roots)
+            assert set(errors) == {0, 1}
+            assert all(isinstance(e, SystemExit) for e in errors.values())
+            assert not bucket.uploaded_dirs() and not bucket.sentinels
+        _with_bucket(run)
+    _in_tmp(body)
+
+
+def test_halves_of_different_configs_refuse():
+    def body(tmp):
+        def run(bucket):
+            a = _node_pod(tmp, "pod-a", 0)
+            b = _node_pod(tmp, "pod-b", 1)
+            path = os.path.join(b, "node1", "image", "meta.json")
+            meta = json.load(open(path))
+            meta["image_ref"] = "dss@sha256:other"
+            _write(path, json.dumps(meta))
+            _, errors = _publish_pods([a, b])
+            assert errors and not bucket.sentinels
+        _with_bucket(run)
+    _in_tmp(body)
+
+
+def test_a_lone_half_times_out_rather_than_publishing():
+    def body(tmp):
+        def run(bucket):
+            root = sp.Path(_node_pod(tmp, "pod-a", 0))
+            _expect_exit(lambda: sp.publish_nodes(
+                root, "bkt", "image-cache", rendezvous_timeout=0.05))
+            assert not bucket.sentinels and not bucket.uploaded_dirs()
+        _with_bucket(run)
+    _in_tmp(body)
+
+
+def test_a_half_recorded_under_another_rank_refuses():
+    def body(tmp):
+        root = _node_pod(tmp, "pod-a", 1)
+        path = os.path.join(root, "node1", "image", "meta.json")
+        meta = json.load(open(path))
+        meta["node_rank"] = 0
+        _write(path, json.dumps(meta))
+        _expect_exit(lambda: sp.load_node_layout(sp.Path(root)))
+    _in_tmp(body)
+
+
+def test_a_half_moved_after_its_dump_refuses():
+    def body(tmp):
+        root = _node_pod(tmp, "pod-a", 1)
+        path = os.path.join(root, "node1", "image", "meta.json")
+        meta = json.load(open(path))
+        meta["model_dir"] = "/data-fast/image-cache_neutrino/other_key/node1"
+        _write(path, json.dumps(meta))
+        _expect_exit(lambda: sp.load_node_layout(sp.Path(root)))
+    _in_tmp(body)
+
+
+def test_a_node_half_still_answers_the_key_and_model():
+    """unpublish_skeleton and --status need only these two."""
+    def body(tmp):
+        root = sp.Path(_node_pod(tmp, "pod-a", 1))
+        key, meta, replicas = sp.load_layout(root)
+        assert key == f"{CFG}_{ENV_A}" and replicas == []
+        assert sp.model_slug(meta) == SLUG and sp._has_image(root)
     _in_tmp(body)
 
 

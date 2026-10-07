@@ -67,6 +67,10 @@ Usage, from inside a device-manager pod after a dump::
     python3 semip_publish.py <model_dir>            # skeleton + weights if new
     python3 semip_publish.py <model_dir> --skeleton-only
 
+A node-spanning dump (``<model_dir>/node<k>/`` on each pod) is published by
+running the same command on **every** pod that holds a half, concurrently;
+see ``publish_nodes``.
+
     python3 semip_publish.py <model_dir> --unpublish-skeleton
     python3 semip_publish.py --model <org/model> --unpublish-weights <wt12>
 """
@@ -145,6 +149,21 @@ _SKELETON_KEY_RE = re.compile(r"([0-9a-f]{12}_[0-9a-f]{12})_([0-9a-f]{12})$")
 # at once.  Pinned to ``semip_engine._REPLICA_DIR_PREFIX`` by test_layout_names.
 REPLICA_DIR_PREFIX = "replica"
 _REPLICA_DIR_RE = re.compile(REPLICA_DIR_PREFIX + r"(\d+)")
+
+# A node-spanning engine (one TP group over several pods) dumps each half into
+# <key>/node<k>/ on its own pod, beside a <key>/weight/ that holds only that
+# pod's ranks. No pod holds the whole image, so a publish is a rendezvous: every
+# pod stages its file rows under _staging/, waits for the rest, derives the one
+# weight hash over the union, uploads its own files, and node 0 writes the
+# sentinels last. Pinned to ``semip_engine._NODE_DIR_PREFIX`` by
+# test_layout_names. _staging/ holds no sentinel, so the node cache never
+# mirrors it.
+NODE_DIR_PREFIX = "node"
+_NODE_DIR_RE = re.compile(NODE_DIR_PREFIX + r"(\d+)")
+STAGING_DIR = "_staging"
+_STAGE_DONE_SUFFIX = ".done"
+_RENDEZVOUS_POLL_S = 15.0
+_RENDEZVOUS_TIMEOUT_S = 3600.0
 
 
 def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
@@ -317,8 +336,80 @@ def replica_dirs(model_dir: Path) -> list[Path]:
     return [path for _, path in sorted(found)]
 
 
+def node_dirs(model_dir: Path) -> list[Path]:
+    """The ``node<k>`` halves of a node-spanning dump held here, in rank order."""
+    found = []
+    if model_dir.is_dir():
+        for child in model_dir.iterdir():
+            match = _NODE_DIR_RE.fullmatch(child.name)
+            if match and child.is_dir():
+                found.append((int(match.group(1)), child))
+    return [path for _, path in sorted(found)]
+
+
+def load_node_layout(model_dir: Path) -> tuple[str, dict[int, dict]]:
+    """``(key, {node_rank: meta})`` for the halves of a node-spanning dump here.
+
+    Usually one half: each pod dumps only its own. Every half present is checked
+    before anything is hashed, because a half that is foreign to the others --
+    another dump, another config -- is a pair that deadlocks in its first
+    collective at restore rather than failing:
+
+    * each ``node<k>`` has dumped, as rank ``k`` of a dump with ``nnodes > 1``;
+    * its recorded ``model_dir`` is ``<key>/node<k>``, since the baked paths have
+      to resolve where the engine materializes it;
+    * the halves agree on the dump, the config, image, driver and uid.
+    """
+    key = model_dir.name
+    if not _DERIVED_KEY_RE.fullmatch(key):
+        raise SystemExit(
+            f"{model_dir} holds {NODE_DIR_PREFIX}<k>/ directories but is not "
+            f"named like a derived key (<cfg12>_<env12>)")
+    if replica_dirs(model_dir):
+        raise SystemExit(
+            f"{model_dir} holds both {NODE_DIR_PREFIX}<k>/ and "
+            f"{REPLICA_DIR_PREFIX}<K>/ directories; no engine dumps that shape")
+    metas: dict[int, dict] = {}
+    for ndir in node_dirs(model_dir):
+        k = int(_NODE_DIR_RE.fullmatch(ndir.name).group(1))
+        meta_path = ndir / IMAGE_DIR / "meta.json"
+        if not meta_path.is_file():
+            raise SystemExit(
+                f"{ndir} has not dumped yet ({meta_path} missing)")
+        meta = json.loads(meta_path.read_text())
+        nnodes = int(meta.get("nnodes") or 1)
+        if nnodes < 2 or meta.get("node_rank") != k or not meta.get("dump_id"):
+            raise SystemExit(
+                f"{meta_path} records nnodes={meta.get('nnodes')!r}, "
+                f"node_rank={meta.get('node_rank')!r}, "
+                f"dump_id={meta.get('dump_id')!r}; a {ndir.name}/ half must be "
+                f"rank {k} of one multi-node dump")
+        recorded = meta.get("model_dir")
+        if recorded and (Path(recorded).name != ndir.name
+                         or Path(recorded).parent.name != key):
+            raise SystemExit(
+                f"{ndir} was dumped as {recorded}; image/ and compilation/ "
+                f"bake that path, so it cannot be published as {key}/{ndir.name}")
+        metas[k] = meta
+    first = metas[min(metas)]
+    for k, meta in metas.items():
+        for field in ("dump_id", "nnodes", "vllm_config", "image_ref",
+                      "driver_version", "uid"):
+            if meta.get(field) != first.get(field):
+                raise SystemExit(
+                    f"{NODE_DIR_PREFIX}{k} disagrees with "
+                    f"{NODE_DIR_PREFIX}{min(metas)} on {field} "
+                    f"({meta.get(field)!r} vs {first.get(field)!r}); these are "
+                    f"not halves of one dump")
+    return key, metas
+
+
 def load_layout(model_dir: Path) -> tuple[str, dict, list[Path]]:
     """``(key, meta, replicas)`` for a dumped directory, flat or per-replica.
+
+    A node-spanning dump answers with its lowest half's meta and no replicas;
+    only ``publish_nodes`` publishes one, so this is for the callers that need
+    just the key and the model.
 
     ``meta`` is replica 0's for a multi-replica dump.  Every replica is checked
     before anything is hashed, because a skeleton published with a replica
@@ -331,6 +422,9 @@ def load_layout(model_dir: Path) -> tuple[str, dict, list[Path]]:
       the baked paths have to resolve where the engine will put them;
     * all replicas agree on the config, image, driver and uid.
     """
+    if node_dirs(model_dir):
+        key, metas = load_node_layout(model_dir)
+        return key, metas[min(metas)], []
     replicas = replica_dirs(model_dir)
     if not replicas:
         meta = json.loads((model_dir / IMAGE_DIR / "meta.json").read_text())
@@ -374,7 +468,7 @@ def load_layout(model_dir: Path) -> tuple[str, dict, list[Path]]:
 def _has_image(model_dir: Path) -> bool:
     """Whether *model_dir* holds a dump in either layout."""
     return ((model_dir / IMAGE_DIR / "meta.json").is_file()
-            or bool(replica_dirs(model_dir)))
+            or bool(replica_dirs(model_dir)) or bool(node_dirs(model_dir)))
 
 
 def _payload_subdirs(replicas: list[Path]) -> list[str]:
@@ -679,6 +773,61 @@ def _published_replica_count(bucket: str, key: str) -> int | None:
         return None
 
 
+def _published_node_count(bucket: str, key: str) -> int | None:
+    """Nodes in the skeleton already published at *key*; ``None`` if none or unknown."""
+    if not _published(bucket, key):
+        return None
+    try:
+        rc, out = _aws_out("s3", "cp", f"s3://{bucket}/{key}/{MANIFEST_FILENAME}",
+                           "-")
+        if rc != 0:
+            return None
+        return int(json.loads(out).get("nodes", 1))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+# The rendezvous between the pods of one node-spanning dump. Plain objects under
+# _staging/<key>/<dump_id>/: node<k>.json holds a pod's file rows, and
+# node<k>.done says its uploads finished. These three are the seams the tests
+# replace, as _aws is for the uploads.
+
+def _stage_put(bucket: str, key: str, name: str, obj: dict,
+               scratch: Path) -> None:
+    local = scratch / f".stage.{name}"
+    local.write_text(json.dumps(obj))
+    try:
+        _aws("s3", "cp", "--only-show-errors", str(local),
+             f"s3://{bucket}/{key}/{name}")
+    finally:
+        local.unlink(missing_ok=True)
+
+
+def _stage_list(bucket: str, key: str) -> dict[str, dict]:
+    """Every staged object under *key*, by name; ``.done`` markers read as ``{}``."""
+    rc, out = _aws_out("s3", "ls", f"s3://{bucket}/{key}/")
+    if rc != 0:
+        return {}
+    found: dict[str, dict] = {}
+    for line in out.splitlines():
+        name = line.split()[-1] if line.split() else ""
+        if name.endswith(_STAGE_DONE_SUFFIX):
+            found[name] = {}
+        elif name.endswith(".json"):
+            rc, body = _aws_out("s3", "cp", f"s3://{bucket}/{key}/{name}", "-")
+            if rc == 0:
+                try:
+                    found[name] = json.loads(body)
+                except ValueError:
+                    pass
+    return found
+
+
+def _stage_clear(bucket: str, key: str) -> None:
+    _aws("s3", "rm", "--recursive", "--only-show-errors",
+         f"s3://{bucket}/{key}")
+
+
 def _aws(*args: str) -> None:
     result = subprocess.run(["aws", *args], capture_output=True, text=True)
     if result.returncode != 0:
@@ -753,8 +902,15 @@ def publish(model_dir: Path, bucket: str, prefix: str,
     Returns the published skeleton key.
 
     *model_dir* is the dumped ``<root>/<cfg12>_<env12>``, whether it holds one
-    flat image or ``replica<K>/`` directories; see ``load_layout``.
+    flat image or ``replica<K>/`` directories; see ``load_layout``. A pod's
+    ``node<k>/`` half of a node-spanning dump goes to ``publish_nodes``.
     """
+    if node_dirs(model_dir):
+        return publish_nodes(model_dir, bucket, prefix,
+                             skeleton_only=skeleton_only, dry_run=dry_run,
+                             force_weights=force_weights,
+                             hash_workers=hash_workers,
+                             wait_timeout=wait_timeout)
     key, meta, replicas = load_layout(model_dir)
     slug = model_slug(meta)
 
@@ -907,6 +1063,206 @@ def publish(model_dir: Path, bucket: str, prefix: str,
     return skel_key
 
 
+def _wait_staged(bucket: str, stage: str, nnodes: int, suffix: str,
+                 timeout: float) -> dict[str, dict]:
+    """Staged objects once every node's ``node<k><suffix>`` is present."""
+    want = {f"{NODE_DIR_PREFIX}{k}{suffix}" for k in range(nnodes)}
+    deadline = time.time() + timeout
+    while True:
+        staged = _stage_list(bucket, stage)
+        covered = set()
+        for name, doc in staged.items():
+            if suffix == ".json" and name.endswith(".json"):
+                covered.update(f"{NODE_DIR_PREFIX}{k}.json"
+                               for k in doc.get("nodes", ()))
+            elif name.endswith(suffix):
+                covered.add(name)
+        missing = sorted(want - covered)
+        if not missing:
+            return staged
+        if time.time() >= deadline:
+            raise SystemExit(
+                f"timed out after {timeout:.0f}s waiting for {', '.join(missing)} "
+                f"under s3://{bucket}/{stage}/. Every pod holding a half of this "
+                f"dump must run this script; run it on the missing one(s).")
+        print(f"  waiting for {', '.join(missing)} ...")
+        time.sleep(_RENDEZVOUS_POLL_S)
+
+
+def publish_nodes(model_dir: Path, bucket: str, prefix: str,
+                  skeleton_only: bool = False, dry_run: bool = False,
+                  force_weights: bool = False,
+                  hash_workers: int | None = None,
+                  wait_timeout: float | None = None,
+                  rendezvous_timeout: float = _RENDEZVOUS_TIMEOUT_S) -> str:
+    """Publish this pod's half of a node-spanning dump; node 0 completes it.
+
+    Run on **every** pod that holds a half, in any order. Published layout::
+
+      skeleton/<key>_<wt12>/node<k>/{image,compilation}/   one sentinel, by node 0
+      weight/<wt12>/rank<R>/                               every rank, one sentinel
+
+    The weight hash is over the union of every pod's ``weight/`` rows -- the
+    shards are named by global rank, so they form one directory -- which no pod
+    can compute alone. Hence the rendezvous: each pod stages its rows, waits for
+    all of them, and derives the same hash. Each then uploads only what it
+    holds, and node 0 writes the sentinels after every pod reports done, so the
+    node cache only ever discovers complete directories.
+
+    Returns the published skeleton key.
+    """
+    key, metas = load_node_layout(model_dir)
+    first = metas[min(metas)]
+    nnodes = int(first["nnodes"])
+    dump_id = first["dump_id"]
+    slug = model_slug(first)
+    local = sorted(metas)
+    if any(k >= nnodes for k in local):
+        raise SystemExit(f"{model_dir} holds {local} for a {nnodes}-node dump")
+
+    print(f"key prefix  : {key}   (the local directory's derived name)")
+    print(f"model       : {slug}")
+    print(f"dump        : {dump_id}, {nnodes} nodes; this pod holds "
+          f"{', '.join(f'{NODE_DIR_PREFIX}{k}' for k in local)}")
+    print(f"image_ref   : {first.get('image_ref')}")
+    print(f"driver      : {first.get('driver_version')}")
+
+    names = [f"{NODE_DIR_PREFIX}{k}" for k in local]
+    subdirs = [f"{n}/{sub}" for n in names for sub in SKELETON_DIRS]
+    print("hashing files ...")
+    mine = build_manifest(model_dir, subdirs + [WEIGHT_DIR],
+                          workers=hash_workers)
+    if weights_hash(mine["files"]) is None:
+        raise SystemExit(
+            f"{model_dir}/{WEIGHT_DIR}/ holds no files; every pod must have "
+            f"saved its ranks' weights for the image to be restorable")
+    identity = {f: first.get(f) for f in
+                ("vllm_config", "image_ref", "driver_version", "uid")}
+
+    if dry_run:
+        print(f"DRY RUN -- nothing staged or uploaded. This pod would stage "
+              f"{len(mine['files'])} rows ({mine['total_bytes'] / 1e9:.1f} GB) "
+              f"and wait for the other {nnodes - len(local)} node(s) before the "
+              f"weight hash exists.")
+        return key
+
+    stage = f"{prefix}/{slug}/{STAGING_DIR}/{key}/{dump_id}"
+    me = f"{NODE_DIR_PREFIX}{local[0]}"
+    _stage_put(bucket, stage, f"{me}.json",
+               {"nodes": local, "identity": identity, "files": mine["files"]},
+               model_dir)
+    print(f"staged {me}.json; waiting for the other pods ...")
+    staged = _wait_staged(bucket, stage, nnodes, ".json", rendezvous_timeout)
+
+    files: dict[str, dict] = {}
+    owner: dict[int, str] = {}
+    for name, doc in sorted(staged.items()):
+        if not name.endswith(".json"):
+            continue
+        if doc.get("identity") != identity:
+            raise SystemExit(
+                f"{name} under {stage}/ disagrees with this pod's half "
+                f"({doc.get('identity')} vs {identity}); not one dump")
+        for k in doc.get("nodes", ()):
+            if k in owner:
+                raise SystemExit(f"{NODE_DIR_PREFIX}{k} was staged twice "
+                                 f"({owner[k]} and {name})")
+            owner[k] = name
+        for row in doc.get("files", ()):
+            if row["path"] in files and files[row["path"]] != row:
+                raise SystemExit(f"{row['path']} was staged twice with "
+                                 f"different contents")
+            files[row["path"]] = row
+    union = [files[p] for p in sorted(files)]
+
+    tp = int((first.get("vllm_config") or {}).get("tensor_parallel_size") or 1)
+    ranks = {p.split("/")[1] for p in files
+             if p.startswith(WEIGHT_DIR + "/") and p.count("/") >= 2}
+    if ranks != {f"rank{r}" for r in range(tp)}:
+        raise SystemExit(
+            f"the staged weights cover {sorted(ranks)}, not rank0..rank{tp - 1}; "
+            f"a pod's {WEIGHT_DIR}/ is incomplete, so no node could load them")
+    wt_hash = weights_hash(union)
+    node_names = [f"{NODE_DIR_PREFIX}{k}" for k in range(nnodes)]
+    skel = _replica_skeleton_manifest(union, node_names)
+    skel["nodes"] = nnodes
+    skel["dump_id"] = dump_id
+    wts = _scoped_manifest(union, (WEIGHT_DIR,), strip=WEIGHT_DIR)
+
+    skel_key = f"{key}_{wt_hash}"
+    skel_rel = f"{prefix}/{slug}/{SKELETON_DIR}/{skel_key}"
+    skel_dest = f"s3://{bucket}/{skel_rel}"
+    wt_dest = f"s3://{bucket}/{prefix}/{slug}/{WEIGHT_DIR}/{wt_hash}"
+    for m, extra in ((skel, {"cache_key": skel_key}),
+                     (wts, {"weight_hash": wt_hash})):
+        m["model_dir"] = str(model_dir)
+        m["model"] = slug
+        m["weight_hash"] = wt_hash
+        m["image_ref"] = first.get("image_ref")
+        m["driver_version"] = first.get("driver_version")
+        m["published_at"] = time.time()
+        m.update(extra)
+    print(f"weight hash : {wt_hash}   ({len(wts['files'])} files, "
+          f"{wts['total_bytes'] / 1e9:.1f} GB across {nnodes} nodes)")
+    print(f"skeleton    : {skel_key}   ({len(skel['files'])} files, "
+          f"{skel['total_bytes'] / 1e9:.1f} GB across {nnodes} nodes)")
+
+    already = _published_node_count(bucket, skel_rel)
+    if already is not None and already != nnodes:
+        raise SystemExit(
+            f"{skel_rel} is already published with {already} node(s); this "
+            f"dump has {nnodes}. Unpublish it first if it is stale.")
+    weights_present = _published(bucket, f"{prefix}/{slug}/"
+                                f"{WEIGHT_DIR}/{wt_hash}")
+    skip_weights = skeleton_only or (weights_present and not force_weights)
+    if weights_present:
+        print("  = weights already published")
+
+    if skip_weights:
+        print("skipping weights upload")
+    else:
+        my_ranks = sorted({f["path"].split("/")[1] for f in mine["files"]
+                           if f["path"].startswith(WEIGHT_DIR + "/")})
+        _upload_dir(model_dir / WEIGHT_DIR, wt_dest,
+                    f"{WEIGHT_DIR}/ ({', '.join(my_ranks)})")
+    for name in names:
+        for sub in SKELETON_DIRS:
+            if (model_dir / name / sub).is_dir():
+                _upload_dir(model_dir / name / sub, f"{skel_dest}/{name}/{sub}",
+                            f"{name}/{sub}/")
+    _stage_put(bucket, stage, f"{me}{_STAGE_DONE_SUFFIX}", {}, model_dir)
+    print(f"uploads done; staged {me}{_STAGE_DONE_SUFFIX}")
+
+    if 0 not in local:
+        print(f"{NODE_DIR_PREFIX}0 writes the sentinels once every pod is done; "
+              f"waiting for the skeleton's ...")
+        deadline = time.time() + rendezvous_timeout
+        while not _published(bucket, skel_rel):
+            if time.time() >= deadline:
+                raise SystemExit(
+                    f"no sentinel at {skel_dest} after {rendezvous_timeout:.0f}s;"
+                    f" check the {NODE_DIR_PREFIX}0 pod's publish")
+            time.sleep(_RENDEZVOUS_POLL_S)
+        print(f"published by {NODE_DIR_PREFIX}0: {skel_dest}")
+        return skel_key
+
+    _wait_staged(bucket, stage, nnodes, _STAGE_DONE_SUFFIX, rendezvous_timeout)
+    # Weights first, as for a single pod: the skeleton is what a restore
+    # resolves, so it must never name weights that are not there yet.
+    if not skip_weights:
+        _write_sentinel(model_dir, wts, wt_dest, WEIGHT_DIR)
+    _write_sentinel(model_dir, skel, skel_dest, SKELETON_DIR)
+    _stage_clear(bucket, stage)
+    print(f"published. expect it on every node within 300 s at:\n"
+          f"  /mnt/neutrino/base-models/{prefix}/{slug}/"
+          f"{SKELETON_DIR}/{skel_key}/\n"
+          f"  /mnt/neutrino/base-models/{prefix}/{slug}/"
+          f"{WEIGHT_DIR}/{wt_hash}/")
+    if wait_timeout is not None:
+        wait_verified(bucket, prefix, slug, skel_key, wt_hash, wait_timeout)
+    return skel_key
+
+
 def unpublish_skeleton(model_dir: Path, bucket: str, prefix: str,
                        key: str | None = None) -> None:
     """Remove published skeletons for this config, and never their weights.
@@ -1020,6 +1376,10 @@ def main(argv: list[str] | None = None) -> int:
                              "weights directory")
     parser.add_argument("--dry-run", action="store_true",
                         help="hash and report the destinations without uploading")
+    parser.add_argument("--rendezvous-timeout", type=float,
+                        default=_RENDEZVOUS_TIMEOUT_S, metavar="SECS",
+                        help="for a node<k>/ half: how long to wait for the "
+                             "other pods of the dump to stage and finish")
     args = parser.parse_args(argv)
     if not args.bucket:
         parser.error(f"no bucket: pass --bucket or set {DEFAULT_BUCKET_ENV}")
@@ -1053,6 +1413,10 @@ def main(argv: list[str] | None = None) -> int:
             key, meta, replicas = load_layout(model_dir)
             slug = model_slug(meta)
             wt_hash = args.weight_hash
+            if not wt_hash and node_dirs(model_dir):
+                parser.error("this pod holds one half of a node-spanning dump, "
+                             "whose weight hash spans every pod's shards; pass "
+                             "--weight-hash (publish prints it)")
             if not wt_hash:
                 # One replica's weights name the hash for all of them; publish
                 # refuses a dump whose replicas disagree.
@@ -1088,6 +1452,14 @@ def main(argv: list[str] | None = None) -> int:
         unpublish_skeleton(model_dir, args.bucket, args.prefix, key=args.key)
         return 0
 
+    if node_dirs(model_dir):
+        publish_nodes(model_dir, args.bucket, args.prefix,
+                      skeleton_only=args.skeleton_only, dry_run=args.dry_run,
+                      force_weights=args.force_weights,
+                      hash_workers=args.hash_workers,
+                      wait_timeout=args.wait_verified,
+                      rendezvous_timeout=args.rendezvous_timeout)
+        return 0
     publish(model_dir, args.bucket, args.prefix,
             skeleton_only=args.skeleton_only, dry_run=args.dry_run,
             force_weights=args.force_weights,

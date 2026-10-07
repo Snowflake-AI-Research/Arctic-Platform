@@ -487,6 +487,15 @@ def test_the_leader_merges_one_handle_blob_per_follower():
             in src), "the child must accept one blob or a list of them"
 
 
+def test_the_agent_records_its_halfs_mapping_set():
+    """GLM job c5a24fdc's node 1 meta.json recorded 0 env_files beside node 0's
+    387, so its modes could not be restored after a copy from the mirror."""
+    dump = _function(_tree(_AGENT), "criu_dump", cls="SemipNodeAgent")
+    send = _call_lineno(dump, "criu_dump")
+    record = _call_lineno(dump, "_record_env_files")
+    assert record is not None and send is not None and send < record
+
+
 def test_a_failed_dump_reports_both_criu_streams():
     """check_caps refuses on stdout while stderr holds the run id, so
     preferring one stream dropped the only line that named the problem."""

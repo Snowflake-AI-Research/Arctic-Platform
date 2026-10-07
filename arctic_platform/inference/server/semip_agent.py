@@ -194,6 +194,8 @@ class SemipNodeAgent:
         calls concurrently, so nothing would order a separate call before this
         one.
         """
+        from arctic_platform.inference.server.semip_engine import (
+            _record_env_files)
         self.wait_parked()
         inst = self._require()
         inst.criu_dump(meta_extra=dict(meta_extra or {})).wait()
@@ -204,6 +206,10 @@ class SemipNodeAgent:
                 f"semi_p agent node{self._node_rank}: the image still holds "
                 f"{len(census)} inet socket(s) {census}; a restore on another "
                 "node would fail to rebind them")
+        # The leader records only its own half. Without this one, a copy of
+        # this half from the mirror comes back with every file at the sync's
+        # mode, and CRIU refuses the first executable mapping.
+        _record_env_files(self._model_dir)
         return {"ok": True, "inet_census": census}
 
     # -- restore -----------------------------------------------------------
