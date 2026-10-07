@@ -49,27 +49,12 @@ JobId = int | str
 
 
 class OnPremConfig(BaseModel):
-    """Backend-specific settings for the on-prem server (HTTP + in-process Ray)."""
+    """Backend-specific settings for the on-prem in-process Ray server."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     type: Literal["onprem"] = "onprem"
-    protocol: Literal["http", "ray"] = Field("http", description="onprem transport: HTTP or in-process Ray.")
-    host: str = Field("localhost", description="onprem: server host.")
-    port: int = Field(8000, description="onprem: server port.")
     colocate: bool = Field(False, description="onprem: colocate job types on shared GPUs.")
-    launch_local_server: bool = Field(False, description="onprem: spawn a local server before connecting.")
-    server_cuda_visible_devices: str | None = Field(
-        None,
-        description=(
-            "CUDA_VISIBLE_DEVICES for the local server subprocess when launch_local_server=True. "
-            "Use this when the client process itself has CUDA_VISIBLE_DEVICES= (empty) so the "
-            "server child still sees GPUs. None = inherit the client's environment."
-        ),
-    )
-    startup_timeout: float = Field(
-        600.0, description="onprem: seconds to wait for a launched server to become healthy."
-    )
 
 
 class CortexConfig(BaseSettings):
@@ -281,7 +266,7 @@ class ArcticClientConfig(BaseModel):
     # this nesting (training / sampling.vllm) directly.
 
     def to_onprem(self, job_type: str) -> dict[str, Any]:
-        """Translate into one on-prem ``/initialize`` payload (see ArcticRLHTTPClient)."""
+        """Translate into one on-prem ``initialize`` payload."""
         tc, sc = self.training, self.sampling
         payload: dict[str, Any] = {"model_name": self.model_name, "job_type": job_type}
         if self.seed is not None:
