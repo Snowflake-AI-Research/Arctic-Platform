@@ -298,12 +298,17 @@ publisher also does **not** understand `node<k>/` (see §10).
 
 ## 10. Known gaps
 
-- **`semip_publish.py` does not handle `node<k>/`.** It knows the flat and
-  `replica<K>` layouts only, so a two-node dump cannot be published yet. Each
-  pod holds just its own half, so this needs a two-pod staging rendezvous: per-
-  node rows under `_staging/<key>/<dump_id>/node<k>.json`, a `wt12` over the
-  union, each node uploading its own `rank*` and `node<k>/`, and node 0 writing
-  the sentinel last.
+- **Publishing is done; materializing from it has not run.** `semip_publish.py`
+  publishes a `node<k>/` half when run on every pod of the dump at once: each
+  stages its rows under `_staging/<key>/<dump_id>/node<k>.json`, all derive one
+  `wt12` over the union, each uploads its own `rank*` and `node<k>/`, and node 0
+  writes the weight sentinel and then the one skeleton sentinel after every
+  pod's `.done`. GLM-5.3 (job c5a24fdc) was the first. The engine's
+  `_multinode_materialize` path that consumes it is still unexercised.
+- **Dumps before `0fb5319`+1 recorded no `env_files` for node 1**, because only
+  the leader called `_record_env_files`. Record them on the pod before
+  publishing such a dump (`_record_env_files('<key>/node1')`), or a copy from
+  the mirror restores with the sync's file modes.
 - **L5-L11 robustness items are not done**: the subreaper (`PR_SET_CHILD_SUBREAPER`
   plus a `waitpid` sweep, which is what makes a second restore in one pod work),
   the `mq_plane` `ShmRingBuffer.__del__` double close, loud abort timeouts, and

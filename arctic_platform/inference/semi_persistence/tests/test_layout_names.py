@@ -271,6 +271,13 @@ def test_engine_and_publisher_spell_the_replica_level_alike():
             == _PUBLISH_CONSTS["REPLICA_DIR_PREFIX"] == "replica")
 
 
+def test_engine_and_publisher_spell_the_node_level_alike():
+    """Each pod of a node-spanning engine copies ``node<k>/`` out of the
+    skeleton the publisher wrote; ``_node_source`` names it from this prefix."""
+    assert (_ENGINE_CONSTS["_NODE_DIR_PREFIX"]
+            == _PUBLISH_CONSTS["NODE_DIR_PREFIX"] == "node")
+
+
 if __name__ == "__main__":
     fails = []
     for name, fn in sorted(globals().items()):
