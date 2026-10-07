@@ -86,13 +86,16 @@ def fake_vllm(monkeypatch):
             self.kwargs = kwargs
 
         def create_engine_config(self):
-            # vLLM copies reasoning_parser into structured_outputs_config
-            # (arg_utils.py:2586); gpt-oss sets one itself (models/config.py:406).
+            # vLLM copies reasoning_parser over structured_outputs_config's
+            # (arg_utils.py:2586); gpt-oss sets one itself when neither does
+            # (models/config.py:406).
+            structured = self.kwargs.get("structured_outputs_config") or {}
             config = SimpleNamespace(
                 parallel_config=SimpleNamespace(data_parallel_rank=0),
                 structured_outputs_config=SimpleNamespace(
                     enable_in_reasoning=False,
                     reasoning_parser=self.kwargs.get("reasoning_parser")
+                    or structured.get("reasoning_parser")
                     or built.get("engine_reasoner", ""),
                 ),
                 model_config=SimpleNamespace(skip_tokenizer_init=True),
@@ -289,10 +292,37 @@ def test_a_jobs_own_reasoning_parser_still_drives_generate(fake_vllm, monkeypatc
     assert masks[0]["reasoning_parser"] is worker._reasoning_parser
 
 
-def test_a_different_chat_parser_than_the_jobs_own_is_refused(fake_vllm):
-    # vLLM has one structured-output reasoner per engine; it would not match chat's.
-    with pytest.raises(ValueError, match="chat_reasoning_parser"):
-        start_worker(reasoning_parser="qwen3", chat_reasoning_parser="deepseek_r1")
+@pytest.mark.parametrize(
+    "engine_reasoner",
+    [
+        {"reasoning_parser": "qwen3"},
+        {"structured_outputs_config": {"reasoning_parser": "qwen3"}},
+        {"model_default": "qwen3"},
+    ],
+    ids=["reasoning_parser", "structured_outputs_config", "model_default"],
+)
+def test_a_different_chat_parser_than_the_engines_reasoner_is_refused(
+    fake_vllm, engine_reasoner
+):
+    # vLLM has one structured-output reasoner per engine; it would not match
+    # chat's, wherever the engine's came from.
+    if "model_default" in engine_reasoner:
+        fake_vllm["engine_reasoner"] = engine_reasoner.pop("model_default")
+    with pytest.raises(
+        ValueError,
+        match="chat_reasoning_parser='deepseek_r1' differs from reasoning_parser='qwen3'",
+    ):
+        start_worker(chat_reasoning_parser="deepseek_r1", **engine_reasoner)
+
+
+def test_a_chat_parser_matching_a_configured_reasoner_is_accepted(fake_vllm):
+    worker = start_worker(
+        chat_reasoning_parser="qwen3",
+        structured_outputs_config={"reasoning_parser": "qwen3"},
+    )
+
+    assert fake_vllm["reasoner_at_engine_start"] == "qwen3"
+    assert worker._chat_only_reasoner is False
 
 
 def test_an_engine_that_already_has_a_reasoner_keeps_it_and_generate_is_unchanged(fake_vllm):

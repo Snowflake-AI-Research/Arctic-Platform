@@ -111,8 +111,11 @@ replay), so setting it to enable chat would change RL rollouts; with only
 and vLLM does that only with an engine-wide structured-output reasoner, so the
 worker sets one when the engine has none and passes `reasoning_ended=True` with
 every `/generate` request and plain stream. vLLM then constrains those from the
-first token, exactly as with no reasoner. Setting both keys to different
-parsers fails engine start: there is one reasoner per engine.
+first token, exactly as with no reasoner. A `chat_reasoning_parser` that
+differs from the engine's reasoner fails engine start, since there is one per
+engine, wherever that reasoner came from: the job's `reasoning_parser`,
+`structured_outputs_config.reasoning_parser`, or the model's default (gpt-oss
+gets `openai_gptoss`).
 
 - Before rendering, any string in messages, tools or a named `tool_choice` that
   contains one of the tokenizer's special or added tokens fails the stream with

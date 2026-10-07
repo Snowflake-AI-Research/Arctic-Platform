@@ -103,7 +103,16 @@ def _add_chat_reasoner(vllm_config: Any, chat_reasoning_parser: str | None) -> b
     which vLLM treats exactly like having no reasoner.
     """
     config = vllm_config.structured_outputs_config
-    if not chat_reasoning_parser or config.reasoning_parser:
+    if not chat_reasoning_parser:
+        return False
+    if config.reasoning_parser:
+        # One reasoner per engine, from the reasoning_parser kwarg,
+        # structured_outputs_config or the model's own default (gpt-oss).
+        if config.reasoning_parser != chat_reasoning_parser:
+            raise ValueError(
+                f"chat_reasoning_parser={chat_reasoning_parser!r} differs from "
+                f"reasoning_parser={config.reasoning_parser!r}"
+            )
         return False
     config.reasoning_parser = chat_reasoning_parser
     return True
@@ -629,12 +638,6 @@ class InferenceWorker(StreamingWorkerMixin):
         # Chat-mode streams only, so enabling chat leaves /generate (think
         # prefill, reasoning split, action masks) on the job's own parser.
         chat_reasoning_parser = engine_kwargs.pop("chat_reasoning_parser", None)
-        if reasoning_parser_name and chat_reasoning_parser not in (None, reasoning_parser_name):
-            # vLLM's structured-output reasoner is one per engine.
-            raise ValueError(
-                f"chat_reasoning_parser={chat_reasoning_parser!r} differs from "
-                f"reasoning_parser={reasoning_parser_name!r}"
-            )
         self._chat_reasoning_parser_name = chat_reasoning_parser or reasoning_parser_name
         self._return_reasoning_content = bool(engine_kwargs.pop("return_reasoning_content", False))
         lora_adapter_path = engine_kwargs.pop("lora_adapter_path", None)
