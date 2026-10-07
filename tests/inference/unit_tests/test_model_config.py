@@ -98,3 +98,23 @@ def test_model_config_rejects_invalid_lora_sync_staging():
 
     with pytest.raises(ValueError, match="lora_sync_staging"):
         ModelConfig(model="m", lora_sync_staging="auto")
+
+
+def test_model_config_defaults_inductor_to_eager_precision_casts():
+    ModelConfig = _model_config_cls()
+
+    assert ModelConfig(model="m").to_engine_kwargs()["compilation_config"] == {
+        "inductor_compile_config": {"emulate_precision_casts": True},
+    }
+    caller = {"pass_config": {"enable_noop": True}, "inductor_compile_config": {"combo_kernels": True}}
+    assert ModelConfig(model="m", extra_engine_kwargs={"compilation_config": caller}).to_engine_kwargs()[
+        "compilation_config"
+    ] == {
+        "pass_config": {"enable_noop": True},
+        "inductor_compile_config": {"combo_kernels": True, "emulate_precision_casts": True},
+    }
+    assert caller["inductor_compile_config"] == {"combo_kernels": True}
+    opt_out = {"compilation_config": {"inductor_compile_config": {"emulate_precision_casts": False}}}
+    assert ModelConfig(model="m", extra_engine_kwargs=opt_out).to_engine_kwargs()["compilation_config"] == {
+        "inductor_compile_config": {"emulate_precision_casts": False},
+    }
