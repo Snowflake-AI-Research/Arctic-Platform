@@ -17,12 +17,15 @@
 from __future__ import annotations
 
 import functools
+from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import Mapping
 
+import torch
 import torch.nn as nn
 
 from arctic_platform.model.config import ModelSpec
@@ -30,6 +33,120 @@ from arctic_platform.model.config import ModelSpec
 if TYPE_CHECKING:
     from pydantic import BaseModel
     from transformers import PretrainedConfig
+
+
+@dataclass(frozen=True)
+class ModelParallelismMetadata:
+    """Model dimensions that constrain sequence/head parallel exchanges."""
+
+    num_attention_heads: int
+    num_key_value_heads: int | None
+    has_linear_attention: bool
+    linear_num_key_heads: int | None
+    linear_num_value_heads: int | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ModelParallelismMetadata:
+        return cls(
+            num_attention_heads=int(value["num_attention_heads"]),
+            num_key_value_heads=(
+                int(value["num_key_value_heads"]) if value.get("num_key_value_heads") is not None else None
+            ),
+            has_linear_attention=bool(value.get("has_linear_attention", False)),
+            linear_num_key_heads=(
+                int(value["linear_num_key_heads"]) if value.get("linear_num_key_heads") is not None else None
+            ),
+            linear_num_value_heads=(
+                int(value["linear_num_value_heads"]) if value.get("linear_num_value_heads") is not None else None
+            ),
+        )
+
+
+def model_parallelism_metadata_from_config(
+    config: Mapping[str, Any],
+    *,
+    source: str = "model config",
+) -> ModelParallelismMetadata:
+    """Extract parallelism-relevant dimensions from a text or composite model config."""
+    text_config = config.get("text_config")
+    if not isinstance(text_config, Mapping):
+        text_config = config
+
+    linear_attn_config = text_config.get("linear_attn_config")
+
+    def positive_int(
+        name: str,
+        *,
+        required: bool,
+        fallback: Any = None,
+    ) -> int | None:
+        value = text_config.get(name)
+        if value is None and text_config is not config:
+            value = config.get(name)
+        if value is None:
+            value = fallback
+        if value is None and not required:
+            return None
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            requirement = "a positive integer" if required else "a positive integer when set"
+            raise ValueError(f"{name} must be {requirement} in {source}; got {value!r}")
+        return value
+
+    layer_types = text_config.get("layer_types", config.get("layer_types", ()))
+    if layer_types is None:
+        layer_types = ()
+    if not isinstance(layer_types, (list, tuple)):
+        raise ValueError(f"layer_types must be a list in {source}; got {layer_types!r}")
+    has_linear_attention = (
+        "linear_attention" in layer_types
+        or "linear_num_key_heads" in text_config
+        or "linear_num_value_heads" in text_config
+    )
+    num_attention_heads = positive_int("num_attention_heads", required=True)
+    assert num_attention_heads is not None
+
+    return ModelParallelismMetadata(
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=positive_int("num_key_value_heads", required=False),
+        has_linear_attention=has_linear_attention,
+        linear_num_key_heads=positive_int(
+            "linear_num_key_heads",
+            required=has_linear_attention,
+            fallback=(linear_attn_config.get("num_heads") if isinstance(linear_attn_config, Mapping) else None),
+        ),
+        linear_num_value_heads=positive_int(
+            "linear_num_value_heads",
+            required=has_linear_attention,
+            fallback=(linear_attn_config.get("num_heads") if isinstance(linear_attn_config, Mapping) else None),
+        ),
+    )
+
+
+def canonical_parameter_name(name: str) -> str:
+    """Remove activation-checkpoint wrapper segments from a parameter name."""
+    return ".".join(segment for segment in name.split(".") if segment != "_checkpoint_wrapped_module")
+
+
+def _float8_dtypes() -> frozenset[torch.dtype]:
+    return frozenset(
+        dtype
+        for name in dir(torch)
+        if name.startswith("float8_") and isinstance((dtype := getattr(torch, name)), torch.dtype)
+    )
+
+
+def finalize_model_for_training(model: nn.Module) -> int:
+    """Freeze FP8 storage and inverse-scale parameters after model transformations."""
+    float8_dtypes = _float8_dtypes()
+    frozen = 0
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad and (parameter.dtype in float8_dtypes or name.endswith("_scale_inv")):
+            parameter.requires_grad_(False)
+            frozen += 1
+    return frozen
 
 
 @functools.lru_cache(maxsize=None)

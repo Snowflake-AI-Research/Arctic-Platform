@@ -127,18 +127,27 @@ class TestLoaderSelection:
     def test_build_model_runs_resolved_loader_then_patches(self, monkeypatch):
         """build_model builds via the resolved loader and hands the result to the patch pipeline."""
         built = nn.Linear(1, 1)
+        calls = []
 
         @register_loader("fake")
         def _fake(ctx: LoaderContext) -> LoadedModel:
             return LoadedModel(model=built)
 
-        patched = []
-        monkeypatch.setattr(factory_mod, "apply_patches", lambda loaded, ctx: patched.append(loaded))
+        monkeypatch.setattr(
+            factory_mod,
+            "apply_patches",
+            lambda loaded, ctx: calls.append(("patch", loaded)),
+        )
+        monkeypatch.setattr(
+            factory_mod,
+            "finalize_model_for_training",
+            lambda model: calls.append(("finalize", model)),
+        )
 
         loaded = build_model(ModelSpec(model_path_or_name="x", loader="fake"))
 
         assert loaded.model is built
-        assert patched == [loaded]
+        assert calls == [("patch", loaded), ("finalize", built)]
 
 
 class TestPatchPipeline:
