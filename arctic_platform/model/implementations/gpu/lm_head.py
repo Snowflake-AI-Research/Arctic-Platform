@@ -82,7 +82,7 @@ def safe_chunked_labels(labels):
     return torch.where(ignore_mask, substitute, labels).contiguous(), ignore_mask.contiguous()
 
 
-_VALIDATED_TARGETS_ATTR = "_dss_validated_lm_head_vocab_size"
+_VALIDATED_TARGETS_ATTR = "_ap_validated_lm_head_vocab_size"
 
 
 def mark_lm_head_targets_validated(labels, *, vocab_size: int):
