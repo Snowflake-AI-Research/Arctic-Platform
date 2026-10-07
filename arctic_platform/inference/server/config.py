@@ -77,6 +77,18 @@ class ModelConfig(BaseModel):
     ray_num_gpus: float | None = Field(default=None, exclude=True)
     lora_sync_staging: Literal["cpu", "gpu"] = Field(default="cpu", exclude=True)
 
+    @model_validator(mode="before")
+    @classmethod
+    def refuse_undeclared_keys(cls, data: Any) -> Any:
+        # Pydantic's default extra="ignore" would drop these and the engine would start without them.
+        undeclared = sorted(set(data) - set(cls.model_fields)) if isinstance(data, dict) else []
+        if undeclared:
+            raise ValueError(
+                f"ModelConfig does not declare {undeclared}; pass vLLM engine args in "
+                "extra_engine_kwargs and environment variables in extra_env"
+            )
+        return data
+
     @model_validator(mode="after")
     def validate_sequence_parallelism(self) -> ModelConfig:
         requested = {
