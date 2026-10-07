@@ -208,9 +208,7 @@ def _qsa_indexer_forward(
 
     batch_size, local_sequence_length, _ = hidden_states.shape
     cp_group, cp_rank, cp_world_size = _cp_info(self)
-    global_attention_mask = (
-        _gather_sequence_no_grad(attention_mask, cp_group) if attention_mask is not None else None
-    )
+    global_attention_mask = _gather_sequence_no_grad(attention_mask, cp_group) if attention_mask is not None else None
     global_sequence_length = local_sequence_length * cp_world_size
     lengths = _right_padded_lengths(
         global_attention_mask,
@@ -232,9 +230,7 @@ def _qsa_indexer_forward(
     )
 
     num_blocks = local_sequence_length // self.compress_ratio
-    grouped_key = raw_key[:, : num_blocks * self.compress_ratio].unflatten(
-        1, (num_blocks, self.compress_ratio)
-    )
+    grouped_key = raw_key[:, : num_blocks * self.compress_ratio].unflatten(1, (num_blocks, self.compress_ratio))
     compressed_key = grouped_key.float().mean(dim=2).to(raw_key.dtype)
     compressed_key = apply_rotary_pos_emb(
         self.k_layernorm(compressed_key),
@@ -307,9 +303,7 @@ def _sparse_gqa_from_selected(
     batch_size, query_length, num_query_heads, head_dim = query.shape
     num_kv_heads = selected_key.shape[3]
     if num_query_heads % num_kv_heads:
-        raise ValueError(
-            f"Qwen3.8 QSA query heads ({num_query_heads}) must be divisible by KV heads ({num_kv_heads})"
-        )
+        raise ValueError(f"Qwen3.8 QSA query heads ({num_query_heads}) must be divisible by KV heads ({num_kv_heads})")
 
     groups = num_query_heads // num_kv_heads
     grouped_query = query.view(batch_size, query_length, num_kv_heads, groups, head_dim)
