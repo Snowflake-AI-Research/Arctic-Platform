@@ -239,6 +239,15 @@ def save_hf_pretrained(model: nn.Module, output_dir: str) -> None:
     )
 
 
+def save_exported_state_dict(state_dict: dict[str, torch.Tensor], output_dir: str) -> None:
+    """Write an exported HF state dict using AP's sharded safetensors layout."""
+    from pathlib import Path
+
+    from arctic_platform.model.implementations.moe.weights import save_state_dict
+
+    save_state_dict(state_dict, Path(output_dir), save_sharded=True)
+
+
 def validate_lora_sync_trainable_parameters(model: nn.Module) -> None:
     from arctic_platform.model.patches.peft import is_peft_lora_param
 
