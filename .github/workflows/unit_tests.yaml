@@ -69,27 +69,13 @@ jobs:
         run: |
           cd tests
           python -m pytest -s -v --ignore=inference
-
-  # The unit-tests job ignores tests/inference, which needs a GPU stack. The
-  # streaming tests stub vLLM and torch, so they run here on CPU with only
-  # their own requirements.
-  inference-streaming:
-    runs-on: ubuntu-latest
-    # The suite takes about a minute; a hung Ray actor shouldn't hold a runner
-    # for GitHub's default 6 hours.
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
-        with:
-          python-version: '3.12'
-      - name: Setup environment
-        run: |
-          pip install uv
-          uv venv
-          echo "$PWD/.venv/bin" >> $GITHUB_PATH
-          uv pip install --python .venv/bin/python -r tests/inference/streaming/requirements-cpu.txt
-      - name: Streaming CPU tests
+      # tests/inference needs a GPU stack, except the streaming tests, which
+      # stub vLLM and torch. They run in their own pytest process: their stubs
+      # in sys.modules would otherwise make importorskip("vllm") pass elsewhere.
+      - name: Streaming Tests
+        # The suite takes about a minute; a hung Ray actor shouldn't hold a
+        # runner for GitHub's default 6 hours.
+        timeout-minutes: 10
         # The tests' own directory is on PYTHONPATH, not just sys.path via
         # conftest.py, because Ray actor processes import cpu_support too.
         run: |
