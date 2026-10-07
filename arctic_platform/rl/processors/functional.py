@@ -1045,9 +1045,10 @@ def _ratio_mask_keep(
         ):
             if limit is not None:
                 drops[f"prob_diff_mask_{sign}_drop"] = sides[sign] & (gap > limit)
+    k3 = log_ratio.expm1() - log_ratio
     values = [log_ratio, sides["pos"].float(), sides["neg"].float()]
     if masks.seq_stat == "mean_k3":
-        values.append(log_ratio.expm1() - log_ratio)
+        values.append(k3)
     packed = cu_seqlens is not None
     if packed:
         sequence_idx, totals = _packed_per_sequence_sums(cu_seqlens, *values)
@@ -1101,7 +1102,9 @@ def _ratio_mask_keep(
     counts["ratio_trainable_token_count"] = loss_mask.sum()
     counts.update({f"{name}_count": hit.sum() for name, hit in drops.items()})
     counts["ratio_mask_dropped_token_count"] = dropped.sum()
-    return loss_mask & ~dropped, counts
+    keep = loss_mask & ~dropped
+    counts["ratio_mask_kept_k3_sum"] = torch.where(keep, k3, 0.0).sum()
+    return keep, counts
 
 
 def _reduce_ratio_mask_counts(counts: dict[str, torch.Tensor]) -> dict[str, float]:

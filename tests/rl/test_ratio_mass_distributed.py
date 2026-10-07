@@ -57,7 +57,7 @@ def _loss(advantages, delta, mask, boundaries, weights, mode, dp_size):
 def _worker(rank, init_file):
     torch.set_num_threads(1)
     advantages = torch.tensor([1.0, 3.0, -2.0, -2.0, 2.0, -2.0, 0.0, 0.0])
-    delta = torch.tensor([0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    delta = torch.tensor([0.0, 1.0, 0.05, 0.0, 1.0, -0.05, 0.0, 0.0])  # +-0.05 kept: nonzero k3 on an SP non-leader
     mask = torch.arange(8) < 6
     weights = torch.tensor([0.25, 0.75])
     references = {
@@ -93,6 +93,7 @@ def _worker(rank, init_file):
             torch_assert_close(grad / 2, reference_grad[window], rtol=1e-6, atol=1e-7)
             assert torch.isfinite(grad).all()
             keys = [f"ratio_mask_{sign}_{stage}_mass_sum" for sign in ("pos", "neg") for stage in ("pre", "kept")]
+            keys.append("ratio_mask_kept_k3_sum")
             if rank % 2:
                 assert all(metrics[key] == 0 for key in keys)
             totals = torch.tensor([metrics[key] for key in keys], dtype=torch.float64)
