@@ -57,6 +57,25 @@ def _grammar_stop_token_ids(vllm_config: Any, tokenizer: Any) -> tuple[int, ...]
     replaces xgrammar's stop set rather than extending it.
     """
     eos = vllm_config.model_config.try_get_generation_config().get("eos_token_id")
+    return _stop_token_ids(eos, tokenizer)
+
+
+def _semip_grammar_stop_token_ids(model: str, tokenizer: Any) -> tuple[int, ...]:
+    """``_grammar_stop_token_ids`` for a restored engine, which has no vllm_config.
+
+    Reads the same generation config vLLM's default ``generation_config="auto"``
+    does.
+    """
+    from transformers import GenerationConfig
+
+    try:
+        eos = GenerationConfig.from_pretrained(model).eos_token_id
+    except OSError:
+        eos = None
+    return _stop_token_ids(eos, tokenizer)
+
+
+def _stop_token_ids(eos: Any, tokenizer: Any) -> tuple[int, ...]:
     stop = set()
     if isinstance(eos, int):
         stop.add(eos)
@@ -676,9 +695,23 @@ class InferenceWorker(StreamingWorkerMixin):
         # does not know, and Ray actor handles are certainly that.
         semi_p_agents = engine_kwargs.pop("semi_p_agents", None)
         if semi_p:
+            # A restored engine has neither, and serving without them returns
+            # plausible output that is wrong, so refuse before restoring.
+            if lora_adapter_path:
+                raise ValueError(
+                    f"semi_p cannot serve the LoRA adapter at {lora_adapter_path}: "
+                    "a restored engine serves the base weights it was dumped "
+                    "with. Disable semi_p for this job.")
+            if engine_kwargs.get("enable_return_routed_experts"):
+                raise ValueError(
+                    "semi_p does not capture routed experts, so router replay "
+                    "would get none. Disable semi_p for this job.")
             from arctic_platform.inference.server.semip_engine import restore_and_wrap
             self.llm = await asyncio.to_thread(
                 restore_and_wrap, engine_kwargs, semi_p_agents)
+            if not engine_kwargs.get("skip_tokenizer_init"):
+                self._grammar_stop_token_ids = _semip_grammar_stop_token_ids(
+                    engine_kwargs["model"], self.llm.get_tokenizer())
             self.state = WorkerLifecycleState.READY
             self._maybe_init_reasoning_parser(reasoning_parser_name)
             logger.info(
