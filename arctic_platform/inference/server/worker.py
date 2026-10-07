@@ -896,6 +896,8 @@ class InferenceWorker(StreamingWorkerMixin):
             sampling_params["extra_args"] = extra_args
         else:
             sampling_params.pop("extra_args", None)
+        # vLLM takes cache_salt on the prompt, not SamplingParams; it keys the first KV block's hash.
+        cache_salt = sampling_params.pop("cache_salt", None)
         sample_id = sampling_params.pop(_SAMPLE_ID_PARAM_KEY, None)
         if sample_id is not None and not isinstance(sample_id, str):
             sample_id = str(sample_id)
@@ -934,7 +936,9 @@ class InferenceWorker(StreamingWorkerMixin):
         if isinstance(effective_prompt, list):
             prompt_input: Any = {"prompt_token_ids": effective_prompt}
         else:
-            prompt_input = effective_prompt
+            prompt_input = {"prompt": effective_prompt}
+        if cache_salt is not None:
+            prompt_input["cache_salt"] = str(cache_salt)
 
         final_output = await self._generate_once(
             prompt_input,
