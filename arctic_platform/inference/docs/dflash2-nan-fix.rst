@@ -17,8 +17,9 @@ Two independent vLLM defects combine to produce the corruption:
   path, so a newly assigned page can retain recurrent state from its previous
   request.
 
-When ArcticInference is enabled, it applies both mitigations at plugin startup
-for its pinned vLLM 0.30.0 release. Stale GDN rows have their state slots
+ArcticInference applies both mitigations at plugin startup for its pinned
+vLLM 0.30.0 release, including when ``ARCTIC_INFERENCE_ENABLED=0``.
+Stale GDN rows have their state slots
 replaced with ``NULL_BLOCK_ID`` and their accepted count clamped to one,
 preventing state reads or writes for the discarded step. Newly allocated Mamba
 blocks are also recorded and all of their state tensors are included in block
