@@ -210,7 +210,13 @@ support CISPO-only ratio gates (`ratio_mask_bounds_pos` / `_neg`,
 `prob_diff_mask_max_pos` / `_neg`, `seq_mask_stat`, `seq_mask_bounds_pos` /
 `_neg`, `ratio_m2_threshold`) and the independent `log_ratio_sq_coef` penalty;
 `ratio_stats=True` enables additive per-bin telemetry without changing the
-objective. Ratio-control keys without `use_cispo_loss=True` pass the batching
+objective. Whenever ratio controls are active, `ratio_mask_{pos,neg}_{pre,kept}_mass_sum`
+reports additive absolute advantage mass through the policy loss aggregation,
+with original denominators and without DP gradient compensation. These are
+normalized units (token-mean: sum of absolute advantages / request tokens;
+weighted prompt-mean: sum of row weight × absolute advantages / row tokens).
+SP shards sum once and only the SP leader emits; microbatches and DP workers
+sum their contributions. No advantage scaling is applied. Ratio-control keys without `use_cispo_loss=True` pass the batching
 and validation callbacks; they are rejected when the packed loss reduction is
 resolved (DSS and the native worker do this before any forward), and otherwise
 by the loss. An explicit `null` is rejected for every ratio-control key (omit
