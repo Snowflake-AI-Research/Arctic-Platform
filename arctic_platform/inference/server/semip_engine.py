@@ -366,33 +366,24 @@ print(last)
 _TIME_WAIT_S = 60.0
 _RESTORE_RETRY_SLEEP_S = 10.0
 
-# vLLM SamplingParams fields we forward to the Instance's vLLM child (which
-# rebuilds SamplingParams(**dict)). Kept explicit to avoid passing internal /
-# non-constructor attributes.
-_SAMPLING_PARAM_KEYS = (
-    "n", "best_of", "temperature", "top_p", "top_k", "min_p",
-    "max_tokens", "min_tokens", "presence_penalty", "frequency_penalty",
-    "repetition_penalty", "seed", "stop", "stop_token_ids", "ignore_eos",
-    "logprobs", "prompt_logprobs", "skip_special_tokens",
-    "spaces_between_special_tokens",
-)
+# SamplingParams fields the Instance's vLLM child must not inherit: it reads
+# cumulative outputs once a request finishes, whatever the caller streams.
+_SAMPLING_PARAM_SKIP = frozenset({"output_kind", "stream_interval", "skip_clone"})
 
 
 def _sampling_params_to_dict(params: Any) -> dict[str, Any]:
-    """Convert a vLLM ``SamplingParams`` object into a constructor kwargs dict."""
+    """A vLLM ``SamplingParams`` as kwargs the child rebuilds it from.
+
+    Every field a caller can set (those ``from_optional`` takes) is copied,
+    ``None`` included: an explicit ``max_tokens=None`` means unbounded, where
+    an omitted one means vLLM's default of 16.
+    """
     if isinstance(params, dict):
         return dict(params)
-    out: dict[str, Any] = {}
-    for key in _SAMPLING_PARAM_KEYS:
-        if not hasattr(params, key):
-            continue
-        val = getattr(params, key)
-        if val is None:
-            continue
-        out[key] = val
-    # max_tokens is required for a bounded generation; default if absent.
-    out.setdefault("max_tokens", getattr(params, "max_tokens", None) or 128)
-    return out
+    import inspect
+    names = inspect.signature(type(params).from_optional).parameters
+    return {name: getattr(params, name) for name in names
+            if name not in _SAMPLING_PARAM_SKIP and hasattr(params, name)}
 
 
 def _log_config_divergence(baked: dict[str, Any],
@@ -3031,6 +3022,16 @@ def _node_source(skeleton_dir: str | None, node_rank: int) -> str | None:
     return os.path.join(skeleton_dir, f"{_NODE_DIR_PREFIX}{node_rank}")
 
 
+def _dense_from_numpy(prompt_logprobs: Any) -> Any:
+    """Dense prompt logprobs cross the child's pipe as numpy; the worker wants
+    the tensors the dense patch produced. Anything else passes through."""
+    if not isinstance(prompt_logprobs, dict):
+        return prompt_logprobs
+    import torch
+    return {key: torch.from_numpy(value) if hasattr(value, "dtype") else value
+            for key, value in prompt_logprobs.items()}
+
+
 class _SemiPEngine:
     """Stands in for ``self.llm`` (a vLLM ``AsyncLLM``) over a semi-p Instance.
 
@@ -3074,11 +3075,12 @@ class _SemiPEngine:
         future = loop.create_future()
         async with self._lock:
             with self._waiters_lock:
-                self._inst.generate([prompt_input], sp)
+                self._inst.generate([prompt_input], sp,
+                                    reasoning_ended=reasoning_ended)
                 self._waiters[self._inst.last_req_id] = (loop, future)
             self._inflight += 1
             self._drained.clear()
-        yield self._to_request_output(await future)
+        yield self._to_request_output(await future, sp)
 
     def _on_generate_done(self, cmd: str, elapsed: float,
                           error: object | None, info: Any) -> None:
@@ -3133,7 +3135,8 @@ class _SemiPEngine:
             return seq[i]
         return None
 
-    def _to_request_output(self, res: dict[str, Any]) -> SimpleNamespace:
+    def _to_request_output(self, res: dict[str, Any],
+                           sp: dict[str, Any] | None = None) -> SimpleNamespace:
         # outputs: [[text per sample] per prompt]; take prompt 0, sample 0.
         prompt_texts = self._first(res.get("outputs"))
         text = self._first(prompt_texts) or ""
@@ -3148,20 +3151,32 @@ class _SemiPEngine:
                 "semi_p: the restored engine reported no token ids for this "
                 f"request (result keys: {sorted(res)})")
 
+        logprobs = self._first(self._first(res.get("completion_logprobs")))
+        prompt_logprobs = _dense_from_numpy(
+            self._first(res.get("prompt_logprobs")))
+        sp = sp or {}
+        for name, value in (("logprobs", logprobs),
+                            ("prompt_logprobs", prompt_logprobs)):
+            if sp.get(name) is not None and value is None:
+                raise RuntimeError(
+                    f"semi_p: {name}={sp[name]} was requested but the "
+                    f"restored engine returned none")
+
         finish_reasons = res.get("finish_reasons") or []
         finish_reason = finish_reasons[0] if finish_reasons else "stop"
 
         choice = SimpleNamespace(
+            index=0,
             text=text,
             token_ids=token_ids,
             finish_reason=finish_reason,
-            logprobs=None,
+            logprobs=logprobs,
             cumulative_logprob=None,
         )
         return SimpleNamespace(
             outputs=[choice],
             prompt_token_ids=prompt_ids,
-            prompt_logprobs=None,
+            prompt_logprobs=prompt_logprobs,
             num_cached_tokens=res.get("num_cached_tokens"),
         )
 

@@ -3077,7 +3077,44 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
         _next_engine_id += 1
         return eid
 
-    def _submit_generate(req_id, prompts, sampling_params_dict):
+    def _add_request(eid, prompt, sp, reasoning_ended=None):
+        """``engine.add_request``, plus the ``reasoning_ended`` AsyncLLM takes.
+
+        LLMEngine has no such argument; AsyncLLM sets it on the processed
+        request, so do the same and hand the engine that request.
+        """
+        if reasoning_ended is None:
+            engine.add_request(eid, prompt, sp)
+            return
+        request = engine.input_processor.process_inputs(
+            eid, prompt, sp, supported_tasks=engine.get_supported_tasks())
+        request.reasoning_ended = reasoning_ended
+        engine.add_request(eid, request, sp)
+
+    def _portable_logprobs(logprobs):
+        """Sample or prompt logprobs in a form that pickles across the pipe.
+
+        Stock vLLM gives one ``{token_id: Logprob}`` per position (``None`` at
+        prompt position 0); the dense prompt-logprobs patch gives a dict of
+        tensors, sent as numpy arrays.
+        """
+        if logprobs is None:
+            return None
+        if isinstance(logprobs, dict):
+            return {key: value.cpu().numpy() if hasattr(value, "cpu") else value
+                    for key, value in logprobs.items()}
+        return [None if pos is None else dict(pos) for pos in logprobs]
+
+    def _join_logprobs(pre, new, pre_count):
+        """Pre-pause sample logprobs followed by the resumed ones."""
+        if new is None:
+            return None
+        if pre is None:
+            return new if pre_count == 0 else None
+        return list(pre) + list(new)
+
+    def _submit_generate(req_id, prompts, sampling_params_dict,
+                         reasoning_ended=None):
         if _dormant and not _paused:
             # Defense-in-depth fail-fast: the orchestrator should
             # never enqueue a generate cmd onto an engine that has
@@ -3137,9 +3174,12 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 "first_token_ts": None,
                 "prompts": list(prompts),
                 "sampling_params": dict(sampling_params_dict),
+                "reasoning_ended": reasoning_ended,
                 "eids": [{"prompt_token_ids": [],
                           "output_token_ids": [],
-                          "output_text": ""}
+                          "output_text": "",
+                          "output_logprobs": None,
+                          "prompt_logprobs": None}
                          for _ in prompts],
             })
             log.info("  submitted req_id=%s  prompts=%s  "
@@ -3152,7 +3192,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
         engine_ids = []
         for prompt in prompts:
             eid = _alloc_engine_id()
-            engine.add_request(eid, prompt, sp)
+            _add_request(eid, prompt, sp, reasoning_ended)
             _engine_to_req[eid] = req_id
             engine_ids.append(eid)
         # `per_eid` tracks the latest cumulative engine output per
@@ -3161,7 +3201,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
         # `_process_step_outputs` on every step.
         per_eid = {eid: {"prompt_token_ids": None,
                          "output_token_ids": [],
-                         "output_text": ""} for eid in engine_ids}
+                         "output_text": "",
+                         "logprobs": None,
+                         "prompt_logprobs": None} for eid in engine_ids}
         _active_reqs[req_id] = {
             "t0": time.perf_counter(),
             "engine_ids": engine_ids,
@@ -3169,6 +3211,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
             "prompts": list(prompts),
             "first_token_ts": None,
             "sampling_params": dict(sampling_params_dict),
+            "reasoning_ended": reasoning_ended,
             "per_eid": per_eid,
         }
         log.info("  submitted req_id=%s  prompts=%s",
@@ -3203,10 +3246,16 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                         and output.prompt_token_ids):
                     per_eid_state["prompt_token_ids"] = list(
                         output.prompt_token_ids)
+                if (per_eid_state["prompt_logprobs"] is None
+                        and output.prompt_logprobs is not None):
+                    per_eid_state["prompt_logprobs"] = output.prompt_logprobs
                 if output.outputs:
                     per_eid_state["output_token_ids"] = list(
                         output.outputs[0].token_ids)
                     per_eid_state["output_text"] = output.outputs[0].text
+                    # A reference, not a copy: cumulative, and only
+                    # converted if a pause snapshots it.
+                    per_eid_state["logprobs"] = output.outputs[0].logprobs
 
             if not output.finished:
                 continue
@@ -3231,8 +3280,16 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                         [pre_text[eid_index[r.request_id]] + o.text
                          for o in r.outputs]
                         for r in ordered]
+                    pre_lps = entry["pre_pause_logprobs"]
+                    orig_prompt_lps = entry["original_prompt_logprobs"]
                     completion_token_ids = [
                         [pre_ids[eid_index[r.request_id]] + list(o.token_ids)
+                         for o in r.outputs]
+                        for r in ordered]
+                    completion_logprobs = [
+                        [_join_logprobs(pre_lps[eid_index[r.request_id]],
+                                        _portable_logprobs(o.logprobs),
+                                        pre_completion[eid_index[r.request_id]])
                          for o in r.outputs]
                         for r in ordered]
                     # A request paused before its first step has no recorded
@@ -3241,6 +3298,11 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     prompt_token_ids = [
                         orig_prompt_ids[eid_index[r.request_id]]
                         or list(r.prompt_token_ids or [])
+                        for r in ordered]
+                    prompt_logprobs = [
+                        orig_prompt_lps[eid_index[r.request_id]]
+                        if orig_prompt_ids[eid_index[r.request_id]]
+                        else _portable_logprobs(r.prompt_logprobs)
                         for r in ordered]
                     completion_tokens = sum(
                         len(o.token_ids)
@@ -3252,8 +3314,14 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     completion_token_ids = [
                         [list(o.token_ids) for o in r.outputs]
                         for r in ordered]
+                    completion_logprobs = [
+                        [_portable_logprobs(o.logprobs) for o in r.outputs]
+                        for r in ordered]
                     prompt_token_ids = [
                         list(r.prompt_token_ids or []) for r in ordered]
+                    prompt_logprobs = [
+                        _portable_logprobs(r.prompt_logprobs)
+                        for r in ordered]
                     prompt_tokens = sum(
                         len(r.prompt_token_ids) for r in ordered)
                     completion_tokens = sum(
@@ -3271,6 +3339,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     # shaped like ``outputs``.
                     "prompt_token_ids": prompt_token_ids,
                     "completion_token_ids": completion_token_ids,
+                    # The same shapes; ``None`` where none were requested.
+                    "prompt_logprobs": prompt_logprobs,
+                    "completion_logprobs": completion_logprobs,
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "num_cached_tokens": cached_tokens,
@@ -3469,21 +3540,32 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
             # the same sequence and reports the whole completion.
             pre_ids = entry.get("pre_pause_token_ids")
             pre_text = entry.get("pre_pause_text")
+            pre_lps = entry.get("pre_pause_logprobs")
             orig_prompt_ids = entry.get("original_prompt_token_ids")
+            orig_prompt_lps = entry.get("original_prompt_logprobs")
             eids_data = []
             for i, eid in enumerate(entry["engine_ids"]):
                 per_eid_state = entry["per_eid"].get(eid, {})
                 prompt_ids = list(per_eid_state.get("prompt_token_ids") or [])
                 output_ids = list(per_eid_state.get("output_token_ids") or [])
                 output_text = per_eid_state.get("output_text", "")
+                output_lps = _portable_logprobs(per_eid_state.get("logprobs"))
+                prompt_lps = _portable_logprobs(
+                    per_eid_state.get("prompt_logprobs"))
                 if pre_ids is not None:
-                    prompt_ids = list(orig_prompt_ids[i]) or prompt_ids
+                    if orig_prompt_ids[i]:
+                        prompt_ids = list(orig_prompt_ids[i])
+                        prompt_lps = orig_prompt_lps[i]
+                    output_lps = _join_logprobs(
+                        pre_lps[i], output_lps, len(pre_ids[i]))
                     output_ids = list(pre_ids[i]) + output_ids
                     output_text = pre_text[i] + output_text
                 eids_data.append({
                     "prompt_token_ids": prompt_ids,
                     "output_token_ids": output_ids,
                     "output_text": output_text,
+                    "output_logprobs": output_lps,
+                    "prompt_logprobs": prompt_lps,
                 })
             saved.append({
                 "req_id": req_id,
@@ -3491,6 +3573,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 "first_token_ts": entry["first_token_ts"],
                 "prompts": list(entry.get("prompts") or []),
                 "sampling_params": dict(sp_dict),
+                "reasoning_ended": entry.get("reasoning_ended"),
                 "eids": eids_data,
             })
 
@@ -3681,6 +3764,16 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     info["pid"] = os.getpid()
                     info["follower"] = True
                     return error, info
+                # The patches InferenceWorker applies before a cold engine,
+                # which the vLLM plugin does not: without them extra_args'
+                # stop-token sequences are ignored and xgrammar can sample a
+                # stop token its grammar rejects.
+                from arctic_platform.inference.vllm.router_replay import (
+                    ensure_router_replay_vllm_patches)
+                from arctic_platform.inference.vllm.xgrammar_stop_mask import (
+                    ensure_xgrammar_stop_mask_fix)
+                ensure_router_replay_vllm_patches()
+                ensure_xgrammar_stop_mask_fix()
                 from vllm import LLM
                 llm = LLM(**vllm_config)
                 engine = llm.llm_engine
@@ -3970,7 +4063,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     pre_pause_completion = []
                     pre_pause_text = []
                     pre_pause_token_ids = []
+                    pre_pause_logprobs = []
                     original_prompt_token_ids = []
+                    original_prompt_logprobs = []
                     original_prompt_tokens = []
                     all_finished_outputs = []
 
@@ -4007,13 +4102,21 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                         sp = SamplingParams(**sp_kwargs)
 
                         new_eid = _alloc_engine_id()
-                        engine.add_request(new_eid, prompt_obj, sp)
+                        # Once tokens were generated the engine has to read
+                        # the reasoning state off the re-prefilled prompt.
+                        _add_request(new_eid, prompt_obj, sp,
+                                     None if output_tids
+                                     else record.get("reasoning_ended"))
                         _engine_to_req[new_eid] = req_id
                         new_engine_ids.append(new_eid)
                         pre_pause_completion.append(len(output_tids))
                         pre_pause_text.append(output_text)
                         pre_pause_token_ids.append(list(output_tids))
+                        pre_pause_logprobs.append(
+                            eid_data.get("output_logprobs"))
                         original_prompt_token_ids.append(list(prompt_tids))
+                        original_prompt_logprobs.append(
+                            eid_data.get("prompt_logprobs"))
 
                     if not new_engine_ids:
                         # Every branch was already finished pre-pause;
@@ -4030,6 +4133,10 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                             "completion_token_ids": [
                                 [list(d["output_token_ids"])]
                                 for d in eids_data],
+                            "prompt_logprobs": [
+                                d.get("prompt_logprobs") for d in eids_data],
+                            "completion_logprobs": [
+                                [d.get("output_logprobs")] for d in eids_data],
                             "prompt_tokens": prompt_tokens,
                             "completion_tokens": completion_tokens,
                             "num_cached_tokens": 0,
@@ -4049,7 +4156,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     new_per_eid = {
                         new_eid: {"prompt_token_ids": None,
                                    "output_token_ids": [],
-                                   "output_text": ""}
+                                   "output_text": "",
+                                   "logprobs": None,
+                                   "prompt_logprobs": None}
                         for new_eid in new_engine_ids
                     }
                     _active_reqs[req_id] = {
@@ -4059,11 +4168,14 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                         "prompts": list(prompts_orig),
                         "first_token_ts": record["first_token_ts"],
                         "sampling_params": dict(sp_dict),
+                        "reasoning_ended": record.get("reasoning_ended"),
                         "per_eid": new_per_eid,
                         "pre_pause_completion": pre_pause_completion,
                         "pre_pause_text": pre_pause_text,
                         "pre_pause_token_ids": pre_pause_token_ids,
+                        "pre_pause_logprobs": pre_pause_logprobs,
                         "original_prompt_token_ids": original_prompt_token_ids,
+                        "original_prompt_logprobs": original_prompt_logprobs,
                         "original_prompt_tokens": original_prompt_tokens,
                     }
                     restored += 1
@@ -4615,7 +4727,8 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     req_id = f"auto-{_next_engine_id}"
                 try:
                     _submit_generate(req_id, kwargs["prompts"],
-                                     kwargs["sampling_params"])
+                                     kwargs["sampling_params"],
+                                     kwargs.get("reasoning_ended"))
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
@@ -4634,7 +4747,8 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                                            f"auto-{_next_engine_id}")
                         try:
                             _submit_generate(rid2, kwargs2["prompts"],
-                                             kwargs2["sampling_params"])
+                                             kwargs2["sampling_params"],
+                                             kwargs2.get("reasoning_ended"))
                         except Exception as e2:
                             import traceback
                             traceback.print_exc()
