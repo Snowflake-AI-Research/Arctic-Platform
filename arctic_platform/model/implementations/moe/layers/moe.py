@@ -17,6 +17,11 @@ from ..config import EPCommBackend
 from ..distributed.ep_backend import get_ep_comm_module
 from ..distributed.ep_backend import uses_dispatch_ep
 
+# ``routed_experts`` value marking a token with no captured routing: a caller that tolerates missing captures
+# (such as a trainer replaying sampler routing) sets it, and an opted-in router selects that token's experts with
+# its own gate instead of gathering.
+ROUTER_REPLAY_FRESH = -1
+
 
 def _maybe_to_local(t: torch.Tensor) -> torch.Tensor:
     """Return the local shard if `t` is a DTensor, else `t` itself.
@@ -475,6 +480,12 @@ class TokenChoiceTopKRouter(nn.Module):
         self.score_func = score_func
         self.route_norm = route_norm
         self.route_scale = route_scale
+        # Off unless the caller opts in via enable_fresh_replay_routing(); otherwise replay stays gather-only.
+        self.fresh_replay_routing = False
+
+    def enable_fresh_replay_routing(self) -> None:
+        """Route ``ROUTER_REPLAY_FRESH`` tokens in ``routed_experts`` with this router's own gate."""
+        self.fresh_replay_routing = True
 
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor | None = None, routed_experts: torch.Tensor | None = None
@@ -497,7 +508,15 @@ class TokenChoiceTopKRouter(nn.Module):
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
 
-        if routed_experts is not None:
+        if routed_experts is not None and self.fresh_replay_routing:
+            # Replayed tokens gather their captured experts; ROUTER_REPLAY_FRESH tokens take the same topk the
+            # replay-off path below would pick. The gate's own choice is made off the autograd graph, so both
+            # kinds of token save the same tensors -- which the activation-checkpoint recompute relies on.
+            biased_scores = scores.detach() if expert_bias is None else scores.detach() + expert_bias
+            _, own_experts = torch.topk(biased_scores, k=self.top_k, dim=1)
+            selected_experts_indices = torch.where(routed_experts == ROUTER_REPLAY_FRESH, own_experts, routed_experts)
+            top_scores = scores.gather(dim=1, index=selected_experts_indices)
+        elif routed_experts is not None:
             top_scores = scores.gather(dim=1, index=routed_experts)
             selected_experts_indices = routed_experts
         elif expert_bias is not None:
@@ -742,6 +761,8 @@ class MoE(nn.Module):
         Args:
             x (torch.Tensor): Input tensor with shape ``(bs, slen, dim)``.
             routed_experts (torch.Tensor | None, optional): Optional tensor with shape ``(bs, slen, top_k)``.
+                Tokens set to ``ROUTER_REPLAY_FRESH`` are routed by the gate when the router opted into fresh
+                routing; the rest are replayed.
 
         Returns:
             out (torch.Tensor): Output tensor with shape ``(bs, slen, dim)``.
