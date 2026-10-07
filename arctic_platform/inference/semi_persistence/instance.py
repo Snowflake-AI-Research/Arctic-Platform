@@ -175,7 +175,7 @@ class Instance:
         self.last_generate_result = None
         self.last_prompt_tokens = None
         self.last_completion_tokens = None
-        self.generate_results = {}  # req_id -> {prompts, outputs, prompt_token_ids, completion_token_ids, prompt_tokens, completion_tokens, finish_reasons, num_cached_tokens, ttft_s, tpot_ms}
+        self.generate_results = {}  # req_id -> {prompts, outputs, prompt_token_ids, completion_token_ids, prompt_logprobs, completion_logprobs, prompt_tokens, completion_tokens, finish_reasons, num_cached_tokens, ttft_s, tpot_ms}
         self._pending_prompts = {}  # req_id -> prompts (popped on completion)
 
         # The demuxer is the sole consumer of ``_result_queue``; it is
@@ -896,14 +896,18 @@ class Instance:
         return self._send("load_weights", weights_dir=weights_dir,
                           io_workers=io_workers)
 
-    def generate(self, prompts, sampling_params):
+    def generate(self, prompts, sampling_params, reasoning_ended=None):
+        """``reasoning_ended`` is AsyncLLM.generate's argument of that name:
+        whether the prompt already closed its reasoning section, which decides
+        when a structured-output grammar starts to apply."""
         self._log(f"generate({len(prompts)} prompts)")
         req_id = f"inst{self.instance_id}-{self._next_req_id}"
         self._next_req_id += 1
         self.last_req_id = req_id
         self._pending_prompts[req_id] = prompts
         return self._send("generate", req_id=req_id, prompts=prompts,
-                           sampling_params=sampling_params)
+                           sampling_params=sampling_params,
+                           reasoning_ended=reasoning_ended)
 
     def teardown(self):
         self._log("teardown")
@@ -978,6 +982,8 @@ class Instance:
                     "outputs": info.get("outputs"),
                     "prompt_token_ids": info.get("prompt_token_ids"),
                     "completion_token_ids": info.get("completion_token_ids"),
+                    "prompt_logprobs": info.get("prompt_logprobs"),
+                    "completion_logprobs": info.get("completion_logprobs"),
                     "prompt_tokens": info.get("prompt_tokens"),
                     "completion_tokens": info.get("completion_tokens"),
                     "finish_reasons": info.get("finish_reasons"),

@@ -62,7 +62,8 @@ class _FakeInstance:
         assert cmd == "generate"
         self.listeners.append(callback)
 
-    def generate(self, prompts, sampling_params):
+    def generate(self, prompts, sampling_params, reasoning_ended=None):
+        self.reasoning_ended = reasoning_ended
         rid = f"inst0-{self._next}"
         self._next += 1
         self.last_req_id = rid
@@ -99,8 +100,9 @@ def _engine(inst):
     return se._SemiPEngine(inst, tokenizer_path=None, model=None)
 
 
-async def _one(engine, prompt):
-    async for out in engine.generate(prompt, {"max_tokens": 4}):
+async def _one(engine, prompt, reasoning_ended=None):
+    async for out in engine.generate(prompt, {"max_tokens": 4},
+                                     reasoning_ended=reasoning_ended):
         return out
 
 
@@ -149,6 +151,8 @@ def test_child_result_survives_instance_into_response():
         "completion_token_ids": [[[271, 57590, 248044]]],
         "prompt_tokens": 3,
         "completion_tokens": 3,
+        "prompt_logprobs": [[None, {2: "lp2"}, {3: "lp3"}]],
+        "completion_logprobs": [[[{271: "a"}, {57590: "b"}, {248044: "c"}]]],
         "num_cached_tokens": 2,
         "finish_reasons": ["length"],
     }
@@ -161,6 +165,77 @@ def test_child_result_survives_instance_into_response():
     assert out.outputs[0].text == "Paris"
     assert out.outputs[0].finish_reason == "length"
     assert out.num_cached_tokens == 2
+    assert out.outputs[0].logprobs == [{271: "a"}, {57590: "b"}, {248044: "c"}]
+    assert out.prompt_logprobs == [None, {2: "lp2"}, {3: "lp3"}]
+
+
+def test_reasoning_ended_reaches_the_instance():
+    async def main():
+        inst = _FakeInstance()
+        task = asyncio.create_task(_one(_engine(inst), "a", reasoning_ended=True))
+        await _until(lambda: inst.prompts)
+        assert inst.reasoning_ended is True
+        _from_thread(inst.finish, inst.last_req_id, [1], [2])
+        await task
+
+    asyncio.run(main())
+
+
+class _FakeSamplingParams:
+    """vLLM's SamplingParams as _sampling_params_to_dict sees it."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+    @classmethod
+    def from_optional(cls, n=1, temperature=None, max_tokens=16,
+                      logprobs=None, structured_outputs=None, extra_args=None,
+                      logit_bias=None, output_kind=None, stream_interval=None,
+                      skip_clone=None):
+        raise AssertionError("only its signature is read")
+
+
+def test_sampling_params_forward_every_caller_field():
+    guided = object()
+    params = _FakeSamplingParams(
+        n=1, temperature=0.0, max_tokens=None, logprobs=1,
+        structured_outputs=guided,
+        extra_args={"dss_stop_token_sequences": [[1, 2]]},
+        logit_bias={5: -1.0}, output_kind="DELTA", stream_interval=4,
+        skip_clone=True, _all_stop_token_ids={7})
+    sp = se._sampling_params_to_dict(params)
+    assert sp == {
+        "n": 1, "temperature": 0.0, "max_tokens": None, "logprobs": 1,
+        "structured_outputs": guided,
+        "extra_args": {"dss_stop_token_sequences": [[1, 2]]},
+        "logit_bias": {5: -1.0},
+    }
+
+
+def test_logprobs_reach_the_response():
+    sample = [{10: "lp10"}, {11: "lp11"}]
+    prompt = [None, {2: "lp2"}]
+    res = {"outputs": [["x"]], "prompt_token_ids": [[1, 2]],
+           "completion_token_ids": [[[10, 11]]],
+           "completion_logprobs": [[sample]], "prompt_logprobs": [prompt]}
+    out = _engine(_FakeInstance())._to_request_output(
+        res, {"logprobs": 1, "prompt_logprobs": 1})
+    assert out.outputs[0].logprobs == sample
+    assert out.prompt_logprobs == prompt
+
+
+def test_requested_logprobs_that_never_arrive_raise():
+    res = {"outputs": [["x"]], "prompt_token_ids": [[1]],
+           "completion_token_ids": [[[10]]]}
+    engine = _engine(_FakeInstance())
+    assert engine._to_request_output(res, {"logprobs": None}).outputs[0].logprobs is None
+    for name in ("logprobs", "prompt_logprobs"):
+        try:
+            engine._to_request_output(res, {name: 1})
+        except RuntimeError as exc:
+            assert name in str(exc)
+        else:
+            raise AssertionError(f"expected RuntimeError for {name}")
 
 
 def test_missing_token_ids_raise_instead_of_zeros():
