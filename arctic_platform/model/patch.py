@@ -71,8 +71,13 @@ def apply_patches(loaded: LoadedModel, ctx: LoaderContext) -> None:
             continue
         if not getattr(ctx.spec.patches, name, None):
             continue
-        replacement = _PATCHES[name](loaded.model, ctx)
+        previous = loaded.model
+        replacement = _PATCHES[name](previous, ctx)
         if replacement is not None:
             loaded.model = replacement
+            if replacement is not previous:
+                from arctic_platform.model.weight_export import transfer_weight_export
+
+                transfer_weight_export(previous, replacement)
         applied.add(name)
     loaded.applied_patches = frozenset(applied)
