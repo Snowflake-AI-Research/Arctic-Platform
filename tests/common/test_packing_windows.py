@@ -428,11 +428,12 @@ def test_unpacking_rejects_metadata_whose_boundaries_contradict_its_row_lengths(
 
 def test_model_packing_reexports_the_shared_definitions():
     """The model stack and this package must share one IGNORE_INDEX and one position decoder."""
-    from arctic_platform.common.packing import IGNORE_INDEX as shared_ignore
-    from arctic_platform.common.packing import cu_seqlens_from_position_ids as shared_cu
-    from arctic_platform.model.implementations.gpu.packing import IGNORE_INDEX as model_ignore
-    from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids as model_cu
+    import importlib
 
-    assert model_ignore is shared_ignore
-    assert model_cu is shared_cu
-    assert shared_ignore == -100
+    shared = importlib.import_module("arctic_platform.common.packing")
+    # Reload so the re-exports bind to the live ``common.packing``: a test that clears the
+    # lazy ``common`` cache leaves this module holding names from the previous copy.
+    model = importlib.reload(importlib.import_module("arctic_platform.model.implementations.gpu.packing"))
+
+    assert model.IGNORE_INDEX == shared.IGNORE_INDEX == -100
+    assert model.cu_seqlens_from_position_ids is shared.cu_seqlens_from_position_ids
