@@ -116,6 +116,13 @@ class ModelConfig(BaseModel):
     def to_engine_kwargs(self) -> dict[str, Any]:
         kwargs = {k: v for k, v in self.model_dump().items() if v is not None}
         kwargs.update(self.extra_engine_kwargs)
+        # Inductor otherwise keeps fp32 between fused bf16 ops where eager (and the RL trainer) rounds; callers may opt out.
+        compilation = dict(kwargs.get("compilation_config") or {})
+        compilation["inductor_compile_config"] = {
+            "emulate_precision_casts": True,
+            **compilation.get("inductor_compile_config", {}),
+        }
+        kwargs["compilation_config"] = compilation
         if not arctic_inference_effective_enabled(self.extra_env):
             kwargs.pop("forest_cascade_attn_configs", None)
         return kwargs
