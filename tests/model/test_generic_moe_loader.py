@@ -116,10 +116,11 @@ def test_sequence_parallel_requires_process_group(tmp_path):
         build_model(spec, parallel_groups={"ep_group": object()})
 
 
-def test_peft_patch_is_rejected(tmp_path):
-    with pytest.raises(ValueError, match="expert adapter integration"):
-        ModelSpec(
-            model_path_or_name=_checkpoint(tmp_path, "afmoe"),
-            parallelism=ParallelismConfig(expert_parallel=2),
-            patches=Patches(peft={"peft_type": "LORA"}),
-        )
+def test_peft_patch_is_accepted(tmp_path):
+    spec = ModelSpec(
+        model_path_or_name=_checkpoint(tmp_path, "afmoe"),
+        parallelism=ParallelismConfig(expert_parallel=2),
+        patches=Patches(peft={"peft_type": "LORA"}),
+    )
+    assert spec.loader == "generic_moe"
+    assert spec.patches.peft == {"peft_type": "LORA"}

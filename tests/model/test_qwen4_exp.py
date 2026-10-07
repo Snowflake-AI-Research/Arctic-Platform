@@ -130,7 +130,7 @@ def test_qwen38_family_dispatch_and_custom_vlm_registration(tmp_path):
 
     assert qwen.loader == "qwen4_exp"
     assert qwen35.loader == "qwen3_5_moe"
-    assert _adapter().extra_weight_iterators == ()
+    assert _adapter().vllm_weight_export is None
 
 
 def test_qwen38_custom_vlm_registration():

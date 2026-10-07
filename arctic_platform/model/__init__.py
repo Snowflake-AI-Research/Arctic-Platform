@@ -40,6 +40,20 @@ from arctic_platform.model.loader import select_loader
 from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.patch import register_patch
 from arctic_platform.model.patches.peft import apply_peft
+from arctic_platform.model.weight_export import PEFT_ADAPTER_DIRNAME
+from arctic_platform.model.weight_export import WeightExportContract
+from arctic_platform.model.weight_export import checkpoint_peft_adapter_dir
+from arctic_platform.model.weight_export import gather_peft_adapter_state_dict
+from arctic_platform.model.weight_export import hf_export_parameter_name
+from arctic_platform.model.weight_export import iter_lora_weights
+from arctic_platform.model.weight_export import iter_model_weights
+from arctic_platform.model.weight_export import pretrained_config_of
+from arctic_platform.model.weight_export import pretrained_module_for_hf_save
+from arctic_platform.model.weight_export import save_hf_pretrained
+from arctic_platform.model.weight_export import save_peft_adapters
+from arctic_platform.model.weight_export import supports_weight_format
+from arctic_platform.model.weight_export import validate_lora_sync_trainable_parameters
+from arctic_platform.model.weight_export import weight_export_contract
 
 # Import built-in loaders and patches for their registration side effects.
 from arctic_platform.model import loaders  # noqa: F401  # isort: skip
@@ -49,8 +63,15 @@ __all__ = [
     "ActivationCheckpointConfig",
     "ActivationOffloadConfig",
     "ActivationOffloadPatch",
+    "PEFT_ADAPTER_DIRNAME",
+    "WeightExportContract",
     "canonical_parameter_name",
+    "checkpoint_peft_adapter_dir",
     "finalize_model_for_training",
+    "gather_peft_adapter_state_dict",
+    "hf_export_parameter_name",
+    "iter_lora_weights",
+    "iter_model_weights",
     "LoadedModel",
     "LoaderContext",
     "LmHeadPatch",
@@ -60,6 +81,11 @@ __all__ = [
     "model_parallelism_metadata_from_config",
     "ParallelismConfig",
     "Patches",
+    "pretrained_config_of",
+    "pretrained_module_for_hf_save",
+    "save_hf_pretrained",
+    "save_peft_adapters",
+    "supports_weight_format",
     "TiledMlpPatch",
     "ZorroTrainPatch",
     "apply_patches",
@@ -68,4 +94,6 @@ __all__ = [
     "register_loader",
     "register_patch",
     "select_loader",
+    "validate_lora_sync_trainable_parameters",
+    "weight_export_contract",
 ]

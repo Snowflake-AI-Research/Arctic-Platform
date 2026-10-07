@@ -36,8 +36,10 @@ from arctic_platform.model import Patches
 from arctic_platform.model import apply_patches
 from arctic_platform.model import apply_peft
 from arctic_platform.model import build_model
+from arctic_platform.model.patches.peft import attach_unfused_expert_lora_factors
 from arctic_platform.model.patches.peft import cast_lora_adapters_off_fp8
 from arctic_platform.model.patches.peft import cast_trainable_params_off_fp8
+from arctic_platform.model.patches.peft import install_unfused_expert_lora_activation
 from arctic_platform.model.patches.peft import is_peft_lora_param
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
@@ -184,7 +186,11 @@ print('PEFT client config validated without training dependencies')
         for dtype in (torch.bfloat16, torch.float32):
             model = Projections()
             original = model.proj.weight
-            adapted = apply_peft(model, {"peft_type": "Lora", "target_modules": ["proj"]}, optimization_dtype=dtype)
+            adapted = apply_peft(
+                model,
+                {"peft_type": "Lora", "target_modules": ["proj"]},
+                optimization_dtype=dtype,
+            )
             self.assertIs(adapted.base_model.model.proj.base_layer.weight, original)
             self.assertEqual(original.dtype, torch.float8_e4m3fn)
             self.assertFalse(original.requires_grad)
@@ -217,7 +223,12 @@ print('PEFT client config validated without training dependencies')
         original = base.detach().view(torch.uint8).clone()
         model = apply_peft(
             model,
-            {"peft_type": "LORA", "target_modules": ["proj"], "modules_to_save": ["head"], "bias": "all"},
+            {
+                "peft_type": "LORA",
+                "target_modules": ["proj"],
+                "modules_to_save": ["head"],
+                "bias": "all",
+            },
         )
         trainables = {name: param for name, param in model.named_parameters() if param.requires_grad}
         self.assertTrue(any("modules_to_save" in n for n in trainables))
@@ -247,7 +258,10 @@ print('PEFT client config validated without training dependencies')
         model.proj = nn.Linear(16, 16, bias=False)
         model.requires_grad_(False)
         model.to(dtype=torch.float8_e4m3fn)
-        model = apply_peft(model, IA3Config(target_modules=["proj"], feedforward_modules=["proj"]).to_dict())
+        model = apply_peft(
+            model,
+            IA3Config(target_modules=["proj"], feedforward_modules=["proj"]).to_dict(),
+        )
         trainables = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
         self.assertTrue(trainables)
         self.assertTrue(all("ia3_" in n and p.dtype == torch.bfloat16 for n, p in trainables))
@@ -276,6 +290,52 @@ def test_worker_bridge_forwards_peft():
     assert spec.patches.peft == config
 
 
-def test_custom_moe_peft_requires_expert_integration():
-    with pytest.raises(ValueError, match="expert adapter integration"):
-        ModelSpec(model_path_or_name="unused", loader="qwen3_5_moe", patches=Patches(peft={"peft_type": "Lora"}))
+@pytest.mark.parametrize("loader", ["qwen3_5_moe", "glm_moe_dsa", "generic_moe", "glm5_next", "qwen4_exp"])
+def test_custom_moe_loaders_accept_peft(loader):
+    spec = ModelSpec(
+        model_path_or_name="unused",
+        loader=loader,
+        patches=Patches(peft={"peft_type": "Lora"}),
+    )
+    assert spec.patches.peft == {"peft_type": "Lora"}
+
+
+def test_unfused_expert_lora_uses_ap_owned_factor_store():
+    from peft.tuners.lora.layer import ParamWrapper
+
+    class GroupedExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w1 = nn.Parameter(torch.ones(2, 8, 6))
+            self.w2 = nn.Parameter(torch.ones(2, 6, 8))
+            self.w3 = nn.Parameter(torch.ones(2, 8, 6))
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = GroupedExperts()
+
+    model = get_peft_model(
+        Tiny(),
+        LoraConfig(
+            r=4,
+            lora_alpha=8,
+            target_modules=[],
+            target_parameters=["experts.w1", "experts.w2", "experts.w3"],
+        ),
+        autocast_adapter_dtype=False,
+    )
+    original = ParamWrapper._activate_lora
+    try:
+        assert install_unfused_expert_lora_activation() == 1
+        assert attach_unfused_expert_lora_factors(model) == 3
+        base = model.experts
+        while isinstance(base, ParamWrapper):
+            base = base.get_base_layer()
+        assert set(base._ap_lora_ab) == {"w1", "w2", "w3"}
+        assert not hasattr(base, "_dss_lora_ab")
+    finally:
+        ParamWrapper._activate_lora = original
+        for attr in ("_ap_activate_lora_original", "_ap_skip_fused_expert_delta"):
+            if hasattr(ParamWrapper, attr):
+                delattr(ParamWrapper, attr)

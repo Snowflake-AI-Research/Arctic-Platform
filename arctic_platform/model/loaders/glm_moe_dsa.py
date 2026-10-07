@@ -88,8 +88,6 @@ def _validate_spec(spec: ModelSpec) -> None:
         raise ValueError("glm_moe_dsa dtype must be 'bfloat16' or 'float32'")
     if spec.parallelism.sequence_parallel > 1:
         raise ValueError("glm_moe_dsa does not support sequence parallelism")
-    if spec.patches.peft is not None:
-        raise ValueError("glm_moe_dsa PEFT requires expert adapter integration, which is not yet supported")
     if spec.patches.liger:
         raise ValueError(
             "the glm_moe_dsa loader does not support the liger patch; "
