@@ -14,6 +14,8 @@ from arctic_platform.model.implementations.gpu.action_masks import filter_lm_hea
 from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.action_masks import slice_lm_head_action_masks
 from arctic_platform.model.implementations.gpu.action_masks import validate_action_mask_targets
+from arctic_platform.model.implementations.gpu.grouped_lm_head import GroupedLogProbAccumulator
+from arctic_platform.model.implementations.gpu.grouped_lm_head import prepare_group_temperature
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
 from arctic_platform.model.implementations.gpu.lm_head import safe_chunked_labels
 from arctic_platform.model.implementations.gpu.lm_head import validate_lm_head_targets
@@ -29,6 +31,7 @@ class PrimeLmOutput(TypedDict, total=False):
     logprobs: Tensor | None
     entropy: Tensor | None
     loss: Tensor | None
+    group_log_probs: Tensor | None
 
 
 def _zero_lm_head_loss(hidden_states: Tensor, weight: Tensor) -> Tensor:
@@ -48,6 +51,7 @@ def cast_float_and_contiguous(output: PrimeLmOutput) -> PrimeLmOutput:
         logprobs=_float_and_contiguous(output.get("logprobs")),
         entropy=_float_and_contiguous(output.get("entropy")),
         loss=output.get("loss"),
+        group_log_probs=_float_and_contiguous(output.get("group_log_probs")),
     )
 
 
@@ -64,6 +68,7 @@ class FusedOutputLinear(torch.nn.Linear):
         temperature: Tensor | None = None,
         action_masks: dict | None = None,
         dss_force_zero_loss: bool = False,
+        group_token_ids: Tensor | None = None,
     ) -> PrimeLmOutput:
         if dss_force_zero_loss:
             return PrimeLmOutput(loss=_zero_lm_head_loss(hidden_states, self.weight))
@@ -75,11 +80,17 @@ class FusedOutputLinear(torch.nn.Linear):
                 "whole row before it is split (ensure_next_token_labels in "
                 "dss/ray_dss/jobs/gpu/sp/data_plane.py)."
             )
-        if temperature is None:
+        b, s, h = hidden_states.shape
+        if group_token_ids is not None:
+            temperature = prepare_group_temperature(
+                temperature,
+                token_shape=(b, s),
+                device=hidden_states.device,
+            )
+        elif temperature is None:
             temperature = torch.ones_like(labels, dtype=torch.float32)
 
         validate_lm_head_targets(labels, vocab_size=int(self.weight.shape[0]))
-        b, s, h = hidden_states.shape
         hidden_states = hidden_states.reshape(b * s, h).contiguous()
         labels, ignore_mask = safe_chunked_labels(labels.reshape(b * s))
         temperature = temperature.reshape(b * s).contiguous()
@@ -89,7 +100,7 @@ class FusedOutputLinear(torch.nn.Linear):
             action_masks_to_lm_head(action_masks, device=hidden_states.device), ~ignore_mask
         )
 
-        logprobs, entropy = _SequenceChunkedLogProbEntropyFn.apply(
+        logprobs, entropy, *group_outputs = _SequenceChunkedLogProbEntropyFn.apply(
             hidden_states,
             self.weight,
             labels,
@@ -97,11 +108,15 @@ class FusedOutputLinear(torch.nn.Linear):
             self.chunk_size,
             self.fp32_lm_head,
             lm_head_action_masks,
+            group_token_ids,
         )
 
         logprobs = logprobs.reshape(b, s)
         entropy = entropy.reshape(b, s)
-        return PrimeLmOutput(logprobs=logprobs, entropy=entropy)
+        output = PrimeLmOutput(logprobs=logprobs, entropy=entropy)
+        if group_outputs:
+            output["group_log_probs"] = group_outputs[0].reshape(b, s, -1)
+        return output
 
 
 class VanillaOutputLinear(torch.nn.Linear):
@@ -239,7 +254,8 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         chunk_size: int,
         fp32_lm_head: bool,
         action_masks=None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        group_token_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
         """
         Returns per-token logprobs and entropy by chunking over flattened sequence tokens.
         """
@@ -256,6 +272,9 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         n = hidden.shape[0]
         vocab = weight.shape[0]
         vocab_chunk_size = min(vocab, 8192)
+        grouped = (
+            None if group_token_ids is None else GroupedLogProbAccumulator(group_token_ids, inv_temperature, vocab)
+        )
         logprobs = torch.empty((n,), device=device, dtype=torch.float32)
         entropy = torch.empty((n,), device=device, dtype=torch.float32)
         logz = torch.empty((n,), device=device, dtype=torch.float32)
@@ -295,6 +314,8 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                 if torch.any(mask):
                     idx = (labels_chunk[mask] - vocab_start).to(torch.long)
                     target_logits[mask] = scaled_logits[mask, idx]
+                if grouped is not None:
+                    grouped.accumulate_forward_tile(scaled_logits, start, vocab_start)
 
             logz_chunk = m + torch.log(s)
             validate_action_mask_targets(labels_chunk, token_masks, token_start=start, target_logits=target_logits)
@@ -306,11 +327,19 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         ctx.action_masks = action_masks
         ctx.chunk_size = chunk_size
         ctx.fp32_lm_head = fp32_lm_head
+        ctx.grouped = grouped
 
-        return logprobs, entropy
+        if grouped is None:
+            return logprobs, entropy
+        return logprobs, entropy, grouped.normalized_log_probs(logz)
 
     @staticmethod
-    def backward(ctx, grad_logprobs: torch.Tensor, grad_entropy: torch.Tensor | None):
+    def backward(
+        ctx,
+        grad_logprobs: torch.Tensor,
+        grad_entropy: torch.Tensor | None,
+        grad_group_log_probs: torch.Tensor | None = None,
+    ):
         assert grad_entropy is None or torch.all(
             grad_entropy == 0.0
         ), "Backward through entropy is not implemented in FusedOutputLinear"
@@ -319,6 +348,7 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         action_masks = ctx.action_masks
         chunk_size: int = ctx.chunk_size
         fp32_lm_head: bool = ctx.fp32_lm_head
+        grouped = ctx.grouped
 
         n, _ = hidden.shape
         vocab = weight.shape[0]
@@ -335,6 +365,14 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
             inv_t_chunk = inv_temperature[start:end].unsqueeze(-1)
             logz_chunk = logz[start:end]
             token_masks = slice_lm_head_action_masks(action_masks, token_start=start, token_end=end)
+            normalizer_gradients = grad_chunk
+            group_gradient_state = None
+            if grouped is not None:
+                if grad_group_log_probs is None:
+                    grad_group_log_probs = torch.zeros_like(grouped.groups)
+                normalizer_gradients, group_gradient_state = grouped.combine_output_gradients(
+                    grad_chunk, grad_group_log_probs, start, end
+                )
 
             for vocab_start in range(0, vocab, vocab_chunk_size):
                 vocab_end = min(vocab_start + vocab_chunk_size, vocab)
@@ -352,11 +390,18 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                 )
                 probs = torch.exp(scaled_logits - logz_chunk.unsqueeze(-1))
 
-                grad_logits = (-grad_chunk).unsqueeze(-1) * probs
+                grad_logits = (-normalizer_gradients).unsqueeze(-1) * probs
                 mask = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
                 if torch.any(mask):
                     idx = (labels_chunk[mask] - vocab_start).to(torch.long)
                     grad_logits[mask, idx] += grad_chunk[mask]
+                if grouped is not None:
+                    grouped.add_group_gradients_to_tile(
+                        grad_logits,
+                        scaled_logits,
+                        group_gradient_state,
+                        vocab_start,
+                    )
                 grad_logits = grad_logits * inv_t_chunk
 
                 grad_logits_for_hidden = grad_logits if fp32_lm_head else grad_logits.to(hidden.dtype)
@@ -364,7 +409,16 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                 grad_hidden[start:end].add_(grad_logits_for_hidden @ weight_for_logits)
                 grad_weight[vocab_start:vocab_end].add_(grad_logits_for_weight.t() @ hidden_for_logits)
 
-        return grad_hidden.to(hidden.dtype), grad_weight.to(weight.dtype), None, None, None, None, None
+        return (
+            grad_hidden.to(hidden.dtype),
+            grad_weight.to(weight.dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def inject_prime_lm_head(
@@ -483,6 +537,7 @@ def _patch_model_forward(model: nn.Module) -> None:
         dss_compute_logprobs: bool = False,
         dss_force_zero_loss: bool = False,
         use_cache: bool | None = None,
+        group_token_ids: torch.Tensor | None = None,
         **kwargs: object,
     ) -> PrimeLmOutput:
         if use_cache not in (None, False):
@@ -525,6 +580,20 @@ def _patch_model_forward(model: nn.Module) -> None:
         lm_head_kwargs = {}
         if action_masks is not None:
             lm_head_kwargs["action_masks"] = action_masks
+        if group_token_ids is not None and isinstance(self.lm_head, FusedOutputLinear):
+            temperature = prepare_group_temperature(
+                temperature,
+                token_shape=tuple(hidden_states.shape[:2]),
+                device=hidden_states.device,
+            )
+            positions = int(hidden_states.shape[0]) * int(hidden_states.shape[1])
+            if group_token_ids.ndim < 2 or positions == 0 or group_token_ids.numel() % positions:
+                raise ValueError(
+                    f"group_token_ids shape {tuple(group_token_ids.shape)} must provide "
+                    "the same candidate width at every model position"
+                )
+            group_token_ids = group_token_ids.reshape(int(hidden_states.shape[0]), int(hidden_states.shape[1]), -1)
+            lm_head_kwargs["group_token_ids"] = group_token_ids[:, slice_indices]
         return self.lm_head(
             hidden_states[:, slice_indices, :],
             inherit_lm_head_target_validation(labels, labels[:, slice_indices]) if labels is not None else None,
