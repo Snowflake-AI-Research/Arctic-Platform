@@ -305,7 +305,7 @@ publisher also does **not** understand `node<k>/` (see §10).
   writes the weight sentinel and then the one skeleton sentinel after every
   pod's `.done`. GLM-5.3 (job c5a24fdc) was the first. The engine's
   `_multinode_materialize` path that consumes it is still unexercised.
-- **Dumps before `0fb5319`+1 recorded no `env_files` for node 1**, because only
+- **Dumps before `134abd8` recorded no `env_files` for node 1**, because only
   the leader called `_record_env_files`. Record them on the pod before
   publishing such a dump (`_record_env_files('<key>/node1')`), or a copy from
   the mirror restores with the sync's file modes.
