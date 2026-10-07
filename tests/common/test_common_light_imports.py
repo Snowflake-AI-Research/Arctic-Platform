@@ -23,10 +23,27 @@ class TestCommonLightImports(unittest.TestCase):
     def _reset_common_modules(self):
         import arctic_platform
 
-        for name in tuple(sys.modules):
-            if name == "arctic_platform.common" or name.startswith("arctic_platform.common."):
-                sys.modules.pop(name)
-        if hasattr(arctic_platform, "common"):
+        popped = {
+            name: module
+            for name, module in tuple(sys.modules.items())
+            if name == "arctic_platform.common" or name.startswith("arctic_platform.common.")
+        }
+        original_attr = getattr(arctic_platform, "common", None)
+
+        # Modules cached elsewhere keep references into the popped copies, so put the
+        # originals back once the test is done rather than leaving a second set behind.
+        def restore():
+            sys.modules.update(popped)
+            if original_attr is not None:
+                arctic_platform.common = original_attr
+            elif hasattr(arctic_platform, "common"):
+                delattr(arctic_platform, "common")
+
+        self.addCleanup(restore)
+
+        for name in popped:
+            sys.modules.pop(name)
+        if original_attr is not None:
             delattr(arctic_platform, "common")
 
     def test_common_registry_imports_do_not_require_training_extras(self):
