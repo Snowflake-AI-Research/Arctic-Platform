@@ -1056,11 +1056,12 @@ def _reject_sequence_parallel_m2po(ratio_masks: RatioMasks | None) -> None:
 
 
 def _grpo_model_call_count_callback(model_call_counts: Sequence[int | None], config: dict) -> None:
-    if config.get("ratio_m2_threshold") is None:
-        return
+    required = [key for key in ("ratio_m2_threshold", "ratio_mask_rebalance") if config.get(key)]
     counts = tuple(model_call_counts)
-    if set(counts) != {1}:
-        raise ValueError(f"ratio_m2_threshold requires exactly one synchronized model call per worker, got {counts!r}")
+    if required and set(counts) != {1}:
+        raise ValueError(
+            f"{', '.join(required)} requires exactly one synchronized model call per worker, got {counts!r}"
+        )
 
 
 def _grpo_preflight_mask(microbatch: dict) -> torch.Tensor:

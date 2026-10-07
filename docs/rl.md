@@ -216,7 +216,7 @@ with original denominators and without DP gradient compensation. These are
 normalized units (token-mean: sum of absolute advantages / request tokens;
 weighted prompt-mean: sum of row weight × absolute advantages / row tokens).
 SP shards sum once and only the SP leader emits; microbatches and DP workers
-sum their contributions. No advantage scaling is applied. Ratio-control keys without `use_cispo_loss=True` pass the batching
+sum their contributions. These measurements precede optional advantage scaling. Ratio-control keys without `use_cispo_loss=True` pass the batching
 and validation callbacks; they are rejected when the packed loss reduction is
 resolved (DSS and the native worker do this before any forward), and otherwise
 by the loss. An explicit `null` is rejected for every ratio-control key (omit
@@ -228,7 +228,27 @@ zero-advantage token uses the `_pos` settings. The `seq_stat_bin_*` histogram
 always bins the sequence mean log ratio, even when `seq_mask_stat="mean_k3"`
 selects the gating statistic. `ratio_m2_threshold` requires one packed model call per worker and
 must be positive; it does not support sequence parallelism because M2PO
-ranking needs one complete token set. `ap_grpo_mixed_v1` requires CISPO, a
+ranking needs one complete token set.
+
+`ratio_mask_rebalance=True` (boolean, default false) restores each sign's
+pre-mask advantage mass after ratio gating: kept positives receive `P0/Pk`,
+kept negatives `N0/Nk`. Mass uses the original loss aggregation weights, excluding
+DP gradient compensation, and is summed across DP and SP ranks. Unbalanced
+inputs retain their original per-sign masses; no mask means an exact no-op.
+A sign with no surviving mass remains zero. The CISPO cap still clips ratios,
+independently of advantage scaling; this does not equalize ratio-weighted gradients.
+This version requires exactly one synchronized model call per worker, checked
+before forward. Multi-microbatch support requires a request-wide statistics
+prepass; it cannot be implemented by independently balancing each microbatch.
+The response echoes `ratio_mask_rebalance` and adds
+`ratio_rebalance_{pos,neg}_{post,unrestored}_mass_sum`, reusing the existing
+`ratio_mask_{pos,neg}_{pre,kept}_mass_sum` measurements. Pre and kept
+sums are the scale numerators and denominators; post is kept mass times the
+scale (before advantage-dtype rounding). Unrestored reports pre-mass whose
+sign was entirely dropped. All eight values are additive, emitted once per
+SP group from local contributions, so worker summation remains exact.
+
+`ap_grpo_mixed_v1` requires CISPO, a
 finite positive `is_weight_clip_max`, token-level `importance_sampling_level`, and the
 prediction-aligned `nll_mask` column; it intentionally rejects ratio-mask
 options to avoid applying policy-only penalties to NLL tokens. It accepts only

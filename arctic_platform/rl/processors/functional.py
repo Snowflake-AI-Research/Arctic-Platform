@@ -908,6 +908,7 @@ RATIO_MASK_CONFIG_KEYS = frozenset(
         "log_ratio_sq_coef",
         "ratio_m2_threshold",
         "ratio_stats",
+        "ratio_mask_rebalance",
     }
 )
 
@@ -962,12 +963,18 @@ class RatioMasks:
     seq_bounds_neg: tuple[float, float] | None = None
     log_ratio_sq_coef: float = 0.0
     m2_threshold: float | None = None
+    rebalance: bool = False
 
     @classmethod
     def from_config(cls, config: dict) -> RatioMasks | None:
-        if "ratio_stats" in config and not isinstance(config["ratio_stats"], bool):
-            raise ValueError(f"ratio_stats must be a bool, got {config['ratio_stats']!r}")
-        if not config.get("ratio_stats", False) and not (RATIO_MASK_CONFIG_KEYS - {"ratio_stats"}) & config.keys():
+        for key in ("ratio_stats", "ratio_mask_rebalance"):
+            if key in config and not isinstance(config[key], bool):
+                raise ValueError(f"{key} must be a bool, got {config[key]!r}")
+        if (
+            not config.get("ratio_stats", False)
+            and not config.get("ratio_mask_rebalance", False)
+            and not (RATIO_MASK_CONFIG_KEYS - {"ratio_stats", "ratio_mask_rebalance"}) & config.keys()
+        ):
             return None
         seq_stat = config.get("seq_mask_stat", "mean_log_ratio")
         if seq_stat not in ("mean_log_ratio", "mean_k3"):
@@ -984,10 +991,11 @@ class RatioMasks:
             seq_bounds_neg=seq_bounds_neg,
             log_ratio_sq_coef=_config_nonnegative(config, "log_ratio_sq_coef") or 0.0,
             m2_threshold=_config_positive(config, "ratio_m2_threshold"),
+            rebalance=config.get("ratio_mask_rebalance", False),
         )
 
     def echo(self) -> dict[str, float]:
-        result = {"ratio_masks_contract_version": 1.0}
+        result = {"ratio_masks_contract_version": 1.0, "ratio_mask_rebalance": float(self.rebalance)}
         for name, bounds in (
             ("ratio_mask_pos", self.ratio_bounds_pos),
             ("ratio_mask_neg", self.ratio_bounds_neg),
@@ -1127,6 +1135,24 @@ def _ratio_mask_mass(
     return local
 
 
+@torch.no_grad()
+def _rebalance_ratio_mask_mass(
+    advantages: torch.Tensor,
+    local: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    total = local.clone()
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+    kept = total[2:]
+    scales = torch.where(kept > 0, total[:2] / torch.where(kept > 0, kept, 1.0), 1.0)
+    stats = {}
+    for index, sign in enumerate(("pos", "neg")):
+        stats[f"ratio_rebalance_{sign}_post_mass_sum"] = local[index + 2] * scales[index]
+        stats[f"ratio_rebalance_{sign}_unrestored_mass_sum"] = torch.where(kept[index] > 0, 0.0, local[index])
+    scale = torch.where(advantages >= 0, scales[0], scales[1]).to(advantages.dtype)
+    return advantages * scale, stats
+
+
 def cispo_actor_loss_fn(
     logprobs: torch.Tensor,
     proximal_logprobs: torch.Tensor,
@@ -1216,6 +1242,9 @@ def cispo_actor_loss_fn(
                 )
             }
         )
+        if ratio_masks.rebalance:
+            advantages, mass_stats = _rebalance_ratio_mask_mass(advantages, mass)
+            ratio_mask_counts.update(mass_stats)
     logprobs = _safe_masked_operand(logprobs, loss_mask)
 
     if is_weight_clip_max is not None:
