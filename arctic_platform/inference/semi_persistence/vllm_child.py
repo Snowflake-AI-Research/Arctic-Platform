@@ -3225,9 +3225,22 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
 
                 if pre_completion is not None:
                     eid_index = {e: i for i, e in enumerate(entry["engine_ids"])}
+                    pre_ids = entry["pre_pause_token_ids"]
+                    orig_prompt_ids = entry["original_prompt_token_ids"]
                     outputs = [
                         [pre_text[eid_index[r.request_id]] + o.text
                          for o in r.outputs]
+                        for r in ordered]
+                    completion_token_ids = [
+                        [pre_ids[eid_index[r.request_id]] + list(o.token_ids)
+                         for o in r.outputs]
+                        for r in ordered]
+                    # A request paused before its first step has no recorded
+                    # prompt ids, and nothing generated either, so the prompt
+                    # the engine just ran is the original one.
+                    prompt_token_ids = [
+                        orig_prompt_ids[eid_index[r.request_id]]
+                        or list(r.prompt_token_ids or [])
                         for r in ordered]
                     completion_tokens = sum(
                         len(o.token_ids)
@@ -3236,6 +3249,11 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     prompt_tokens = sum(orig_prompt_tokens)
                 else:
                     outputs = [[o.text for o in r.outputs] for r in ordered]
+                    completion_token_ids = [
+                        [list(o.token_ids) for o in r.outputs]
+                        for r in ordered]
+                    prompt_token_ids = [
+                        list(r.prompt_token_ids or []) for r in ordered]
                     prompt_tokens = sum(
                         len(r.prompt_token_ids) for r in ordered)
                     completion_tokens = sum(
@@ -3249,6 +3267,10 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 info = {
                     "req_id": req_id,
                     "outputs": outputs,
+                    # [ids per prompt] and [[ids per sample] per prompt],
+                    # shaped like ``outputs``.
+                    "prompt_token_ids": prompt_token_ids,
+                    "completion_token_ids": completion_token_ids,
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "num_cached_tokens": cached_tokens,
@@ -3442,16 +3464,26 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 raise RuntimeError(
                     f"snapshot with n={n_branch} not supported "
                     "(n=1 only)")
+            # A request already resumed once runs on prompt + pre-pause
+            # output; fold that back apart so a second resume re-prefills
+            # the same sequence and reports the whole completion.
+            pre_ids = entry.get("pre_pause_token_ids")
+            pre_text = entry.get("pre_pause_text")
+            orig_prompt_ids = entry.get("original_prompt_token_ids")
             eids_data = []
-            for eid in entry["engine_ids"]:
+            for i, eid in enumerate(entry["engine_ids"]):
                 per_eid_state = entry["per_eid"].get(eid, {})
+                prompt_ids = list(per_eid_state.get("prompt_token_ids") or [])
+                output_ids = list(per_eid_state.get("output_token_ids") or [])
+                output_text = per_eid_state.get("output_text", "")
+                if pre_ids is not None:
+                    prompt_ids = list(orig_prompt_ids[i]) or prompt_ids
+                    output_ids = list(pre_ids[i]) + output_ids
+                    output_text = pre_text[i] + output_text
                 eids_data.append({
-                    "prompt_token_ids": list(
-                        per_eid_state.get("prompt_token_ids") or []),
-                    "output_token_ids": list(
-                        per_eid_state.get("output_token_ids") or []),
-                    "output_text":
-                        per_eid_state.get("output_text", ""),
+                    "prompt_token_ids": prompt_ids,
+                    "output_token_ids": output_ids,
+                    "output_text": output_text,
                 })
             saved.append({
                 "req_id": req_id,
@@ -3937,6 +3969,8 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     new_engine_ids = []
                     pre_pause_completion = []
                     pre_pause_text = []
+                    pre_pause_token_ids = []
+                    original_prompt_token_ids = []
                     original_prompt_tokens = []
                     all_finished_outputs = []
 
@@ -3978,6 +4012,8 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                         new_engine_ids.append(new_eid)
                         pre_pause_completion.append(len(output_tids))
                         pre_pause_text.append(output_text)
+                        pre_pause_token_ids.append(list(output_tids))
+                        original_prompt_token_ids.append(list(prompt_tids))
 
                     if not new_engine_ids:
                         # Every branch was already finished pre-pause;
@@ -3989,6 +4025,11 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                         synth_info = {
                             "req_id": req_id,
                             "outputs": [[t] for t in all_finished_outputs],
+                            "prompt_token_ids": [
+                                list(d["prompt_token_ids"]) for d in eids_data],
+                            "completion_token_ids": [
+                                [list(d["output_token_ids"])]
+                                for d in eids_data],
                             "prompt_tokens": prompt_tokens,
                             "completion_tokens": completion_tokens,
                             "num_cached_tokens": 0,
@@ -4021,6 +4062,8 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                         "per_eid": new_per_eid,
                         "pre_pause_completion": pre_pause_completion,
                         "pre_pause_text": pre_pause_text,
+                        "pre_pause_token_ids": pre_pause_token_ids,
+                        "original_prompt_token_ids": original_prompt_token_ids,
                         "original_prompt_tokens": original_prompt_tokens,
                     }
                     restored += 1
