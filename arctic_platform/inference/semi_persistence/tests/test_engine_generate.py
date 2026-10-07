@@ -16,14 +16,34 @@ Run from the package directory::
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import sys
 import threading
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from test_image_cache_key import se  # noqa: E402
+from test_image_cache_key import _PKG, se  # noqa: E402
+
+
+def _load_apply_result():
+    """``Instance._apply_result``, without importing torch and pynvml."""
+    path = os.path.join(_PKG, "instance.py")
+    with open(path) as handle:
+        tree = ast.parse(handle.read(), path)
+    cls = next(n for n in tree.body
+               if isinstance(n, ast.ClassDef) and n.name == "Instance")
+    fn = next(n for n in cls.body
+              if isinstance(n, ast.FunctionDef) and n.name == "_apply_result")
+    namespace = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), path, "exec"),
+         namespace)
+    return namespace["_apply_result"]
+
+
+_apply_result = _load_apply_result()
 
 
 class _FakeInstance:
@@ -71,6 +91,9 @@ class _FakeInstance:
     def sleep(self):
         self.cmds.append("sleep")
 
+    def teardown(self):
+        self.cmds.append("teardown")
+
 
 def _engine(inst):
     return se._SemiPEngine(inst, tokenizer_path=None, model=None)
@@ -115,6 +138,29 @@ def test_concurrent_generates_are_in_flight_together():
         assert inst.generate_results == {}
 
     asyncio.run(main())
+
+
+def test_child_result_survives_instance_into_response():
+    """What the child sends at completion reaches the response unchanged."""
+    child_info = {
+        "req_id": "inst0-0",
+        "outputs": [["Paris"]],
+        "prompt_token_ids": [[1, 2, 3]],
+        "completion_token_ids": [[[271, 57590, 248044]]],
+        "prompt_tokens": 3,
+        "completion_tokens": 3,
+        "num_cached_tokens": 2,
+        "finish_reasons": ["length"],
+    }
+    inst = types.SimpleNamespace(last_info={}, generate_results={})
+    _apply_result(inst, "generate", child_info)
+    out = _engine(_FakeInstance())._to_request_output(
+        inst.generate_results["inst0-0"])
+    assert out.prompt_token_ids == [1, 2, 3]
+    assert out.outputs[0].token_ids == [271, 57590, 248044]
+    assert out.outputs[0].text == "Paris"
+    assert out.outputs[0].finish_reason == "length"
+    assert out.num_cached_tokens == 2
 
 
 def test_missing_token_ids_raise_instead_of_zeros():
