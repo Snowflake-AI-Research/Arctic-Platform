@@ -472,8 +472,8 @@ def test_qwen38_qsa_route_selection_uses_global_query_offset():
 
 
 def test_qwen38_sparse_gqa_custom_backward_matches_autograd():
-    from arctic_platform.model.implementations.qwen38.qsa_flex import _SparseGQAAttention
     from arctic_platform.model.implementations.qwen38.qsa_flex import _sparse_gqa_chunk
+    from arctic_platform.model.implementations.qwen38.qsa_flex import _SparseGQAAttention
 
     torch.manual_seed(7)
     query = torch.randn(1, 3, 4, 2, dtype=torch.double, requires_grad=True)
