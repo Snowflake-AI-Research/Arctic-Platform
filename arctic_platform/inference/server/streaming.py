@@ -608,6 +608,9 @@ class EngineStream:
                     if isinstance(self.prompt, list)
                     else self.prompt
                 )
+                if getattr(self.owner, "_chat_only_reasoner", False):
+                    # Grammar from the first token, as without chat's reasoner.
+                    kwargs["reasoning_ended"] = True
             adapter = self.owner._active_lora_request()
             if adapter is not None:
                 kwargs["lora_request"] = adapter
@@ -882,7 +885,7 @@ class StreamingWorkerMixin:
                 engine = ChatEngine(
                     self.llm,
                     tool_call_parser=getattr(self, "_tool_call_parser", None),
-                    reasoning_parser=getattr(self, "_reasoning_parser_name", None),
+                    reasoning_parser=getattr(self, "_chat_reasoning_parser_name", None),
                 )
             except Exception:
                 # E.g. skip_tokenizer_init or a vLLM API change (a missing chat

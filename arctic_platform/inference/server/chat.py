@@ -3,8 +3,9 @@
 Rendering and parsing reuse vLLM's own chat front end (``OnlineRenderer`` and
 the unified ``Parser``) on the engine the worker already holds, so every model
 family vLLM supports works without per-family code here. Which parsers apply is
-engine configuration: ``reasoning_parser``, ``tool_call_parser`` and, for
-DeepSeek-V4, ``tokenizer_mode``.
+engine configuration: ``chat_reasoning_parser`` (else the job's own
+``reasoning_parser``), ``tool_call_parser`` and, for DeepSeek-V4,
+``tokenizer_mode``.
 """
 
 from __future__ import annotations

@@ -1,0 +1,307 @@
+"""chat_reasoning_parser: a reasoning parser for chat streams that leaves /generate as it was."""
+
+import asyncio
+from dataclasses import asdict
+import os
+import sys
+import types
+from types import SimpleNamespace
+
+import pytest
+
+from cpu_support import load_library
+
+if os.environ.get("ARCTIC_RUN_GPU_TESTS") == "1":
+    pytest.skip(
+        "CPU fake-engine harness must run separately from GPU tests",
+        allow_module_level=True,
+    )
+
+load_library()
+from arctic_platform.inference.server import worker as worker_module
+from arctic_platform.inference.server.streaming import StreamLimits
+
+THINK, END_THINK = 10, 11
+
+
+class FakeReasoningParser:
+    start_token = "<think>"
+    start_token_id = THINK
+    end_token_id = END_THINK
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def is_reasoning_end(self, token_ids):
+        return END_THINK in token_ids
+
+    def extract_reasoning(self, text, request=None):
+        return "r", text
+
+
+class FakeSamplingParams:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.all_stop_token_ids = set()
+
+
+class FakeEngine:
+    """Records what each request handed to vLLM; answers with one token."""
+
+    def __init__(self):
+        self.calls = []
+        self.model_config = SimpleNamespace(max_model_len=1024)
+
+    def get_tokenizer(self):
+        return object()
+
+    async def generate(self, prompt, params, **kwargs):
+        self.calls.append((prompt, params, kwargs))
+        token_ids = prompt["prompt_token_ids"] if isinstance(prompt, dict) else [1]
+        yield SimpleNamespace(
+            prompt_token_ids=token_ids,
+            prompt_logprobs=None,
+            num_cached_tokens=0,
+            outputs=[
+                SimpleNamespace(
+                    index=0, text="ok", token_ids=[7], finish_reason="stop", logprobs=None
+                )
+            ],
+        )
+
+    async def abort(self, request_id):
+        pass
+
+    def get_num_unfinished_requests(self):
+        return 0
+
+
+@pytest.fixture
+def fake_vllm(monkeypatch):
+    """Just enough of vLLM for InferenceWorker.initialize and generate on CPU."""
+    built = {}
+
+    class FakeEngineArgs:
+        def __init__(self, kwargs):
+            self.kwargs = kwargs
+
+        def create_engine_config(self):
+            # vLLM copies reasoning_parser into structured_outputs_config
+            # (arg_utils.py:2586); gpt-oss sets one itself (models/config.py:406).
+            config = SimpleNamespace(
+                parallel_config=SimpleNamespace(data_parallel_rank=0),
+                structured_outputs_config=SimpleNamespace(
+                    enable_in_reasoning=False,
+                    reasoning_parser=self.kwargs.get("reasoning_parser")
+                    or built.get("engine_reasoner", ""),
+                ),
+                model_config=SimpleNamespace(skip_tokenizer_init=True),
+            )
+            built["engine_kwargs"] = self.kwargs
+            built["vllm_config"] = config
+            return config
+
+    class FakeAsyncLLM:
+        @classmethod
+        def from_vllm_config(cls, vllm_config, **_kwargs):
+            built["reasoner_at_engine_start"] = vllm_config.structured_outputs_config.reasoning_parser
+            return FakeEngine()
+
+    modules = {
+        "vllm.plugins": {"load_general_plugins": lambda: None},
+        "vllm.v1.engine": {},
+        "vllm.v1.engine.async_llm": {"AsyncLLM": FakeAsyncLLM},
+        "vllm.reasoning": {
+            "ReasoningParserManager": SimpleNamespace(
+                get_reasoning_parser=lambda name: FakeReasoningParser
+            )
+        },
+        "vllm.sampling_params": {
+            "StructuredOutputsParams": lambda **kwargs: kwargs,
+            "RequestOutputKind": SimpleNamespace(DELTA="delta"),
+        },
+    }
+    for name, attributes in modules.items():
+        module = types.ModuleType(name)
+        for key, value in attributes.items():
+            setattr(module, key, value)
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(sys.modules["vllm"], "plugins", sys.modules["vllm.plugins"], raising=False)
+    monkeypatch.setattr(sys.modules["vllm"], "SamplingParams", FakeSamplingParams, raising=False)
+    monkeypatch.setattr(worker_module, "arctic_inference_effective_enabled", lambda *a: False)
+    monkeypatch.setattr(worker_module, "_ensure_router_replay_vllm_patches", lambda: None)
+    monkeypatch.setattr(worker_module, "ensure_xgrammar_stop_mask_fix", lambda: None)
+    monkeypatch.setattr(
+        worker_module,
+        "_create_async_engine_args",
+        lambda kwargs, **_ignored: FakeEngineArgs(dict(kwargs)),
+    )
+    return built
+
+
+def start_worker(**engine_kwargs):
+    worker = worker_module.InferenceWorker.__ray_metadata__.modified_class()
+    asyncio.run(worker.initialize({"model": "m", **engine_kwargs}))
+    return worker
+
+
+def replayed_masks(monkeypatch):
+    calls = []
+    module = types.ModuleType("arctic_platform.inference.server.action_mask_replay")
+    module.build_action_masks_for_output = lambda **kwargs: calls.append(kwargs) or "masks"
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return calls
+
+
+def generate(worker, prompt, **params):
+    return asyncio.run(
+        worker.generate(prompt, {"max_tokens": 4, "return_action_masks": True, **params})
+    )
+
+
+def test_chat_reasoning_parser_is_not_handed_to_vllm_as_an_engine_arg(fake_vllm):
+    start_worker(chat_reasoning_parser="qwen3", tool_call_parser="hermes")
+
+    assert "chat_reasoning_parser" not in fake_vllm["engine_kwargs"]
+    assert "reasoning_parser" not in fake_vllm["engine_kwargs"]
+
+
+def test_chat_reasoning_parser_gives_vllm_its_structured_output_reasoner(fake_vllm):
+    # Chat grammars (tool_choice=required, JSON answers) wait for the end of
+    # reasoning only if the engine has a reasoner (structured_output/__init__.py:88).
+    start_worker(chat_reasoning_parser="qwen3")
+
+    assert fake_vllm["reasoner_at_engine_start"] == "qwen3"
+
+
+def test_chat_reasoning_parser_leaves_generate_without_a_parser(fake_vllm):
+    worker = start_worker(chat_reasoning_parser="qwen3")
+
+    assert worker._reasoning_parser is None
+
+
+@pytest.mark.parametrize("enable_thinking", [None, True, False])
+@pytest.mark.parametrize("prompt", [[1, 2], "hi"])
+def test_generate_with_only_a_chat_parser_matches_a_worker_without_one(
+    fake_vllm, monkeypatch, enable_thinking, prompt
+):
+    params = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
+    plain = start_worker()
+    chat = start_worker(chat_reasoning_parser="qwen3")
+    chat._return_reasoning_content = plain._return_reasoning_content = True
+
+    plain_masks = replayed_masks(monkeypatch)
+    plain_result = generate(plain, prompt, **params)
+    chat_masks = replayed_masks(monkeypatch)
+    chat_result = generate(chat, prompt, **params)
+
+    [(plain_prompt, plain_params, plain_kwargs)] = plain.llm.calls
+    [(chat_prompt, chat_params, chat_kwargs)] = chat.llm.calls
+    # No <think> prefill and the same sampling parameters.
+    assert chat_prompt == plain_prompt
+    assert chat_params.kwargs == plain_params.kwargs
+    # No parsed reasoning in the result.
+    assert chat_result == plain_result
+    # Action masks are replayed from the same inputs.
+    for masks in (plain_masks, chat_masks):
+        for call in masks:
+            call.pop("tokenizer")
+            call.pop("sampling_params")
+    assert chat_masks == plain_masks
+    assert chat_masks[0]["reasoning_parser"] is None
+
+
+def test_generate_grammars_apply_from_the_first_token_despite_the_chat_reasoner(fake_vllm):
+    # reasoning_ended=True makes vLLM constrain from token 0, exactly as with no
+    # reasoner at all (structured_output/__init__.py:240 vs :243).
+    plain = start_worker()
+    chat = start_worker(chat_reasoning_parser="qwen3")
+
+    generate(plain, [1, 2])
+    generate(chat, [1, 2])
+
+    assert plain.llm.calls[0][2]["reasoning_ended"] is None
+    assert chat.llm.calls[0][2]["reasoning_ended"] is True
+
+
+async def run_plain_stream(worker, prompt):
+    worker.start_stream("attempt", prompt, {"n": 1}, 20, asdict(StreamLimits()))
+    reader = worker.stream_events("attempt")
+    async for batch in reader:
+        if batch[-1]["type"] in ("completed", "terminal_error"):
+            break
+        worker.acknowledge_stream("attempt", batch[-1]["sequence"])
+    await reader.aclose()
+
+
+@pytest.mark.parametrize(
+    ("engine_kwargs", "reasoning_ended"),
+    [
+        ({}, None),
+        ({"chat_reasoning_parser": "qwen3"}, True),
+        ({"reasoning_parser": "qwen3"}, None),
+    ],
+)
+def test_plain_streams_keep_their_grammar_timing(fake_vllm, engine_kwargs, reasoning_ended):
+    worker = start_worker(**engine_kwargs)
+    worker._stream_sampling_params = lambda params: params
+
+    asyncio.run(run_plain_stream(worker, [1, 2]))
+
+    [(_, _, kwargs)] = worker.llm.calls
+    assert kwargs.get("reasoning_ended") is reasoning_ended
+
+
+@pytest.mark.parametrize(
+    ("engine_kwargs", "chat_parser"),
+    [
+        ({"chat_reasoning_parser": "qwen3"}, "qwen3"),
+        ({"reasoning_parser": "qwen3"}, "qwen3"),
+        ({"reasoning_parser": "qwen3", "chat_reasoning_parser": "qwen3"}, "qwen3"),
+        ({}, None),
+    ],
+)
+def test_chat_streams_use_the_chat_parser_or_the_jobs_own(
+    fake_vllm, monkeypatch, engine_kwargs, chat_parser
+):
+    from arctic_platform.inference.server import chat as chat_module
+
+    built = []
+    monkeypatch.setattr(chat_module, "ChatEngine", lambda llm, **kwargs: built.append(kwargs))
+    worker = start_worker(tool_call_parser="hermes", **engine_kwargs)
+
+    worker._chat_engine()
+
+    assert built == [{"tool_call_parser": "hermes", "reasoning_parser": chat_parser}]
+
+
+def test_a_jobs_own_reasoning_parser_still_drives_generate(fake_vllm, monkeypatch):
+    worker = start_worker(reasoning_parser="qwen3", chat_reasoning_parser="qwen3")
+    masks = replayed_masks(monkeypatch)
+
+    generate(worker, [1, 2], enable_thinking=True)
+
+    assert fake_vllm["engine_kwargs"]["reasoning_parser"] == "qwen3"
+    assert isinstance(worker._reasoning_parser, FakeReasoningParser)
+    [(prompt, _, kwargs)] = worker.llm.calls
+    assert prompt == {"prompt_token_ids": [1, 2, THINK]}
+    assert kwargs["reasoning_ended"] is False
+    assert masks[0]["reasoning_parser"] is worker._reasoning_parser
+
+
+def test_a_different_chat_parser_than_the_jobs_own_is_refused(fake_vllm):
+    # vLLM has one structured-output reasoner per engine; it would not match chat's.
+    with pytest.raises(ValueError, match="chat_reasoning_parser"):
+        start_worker(reasoning_parser="qwen3", chat_reasoning_parser="deepseek_r1")
+
+
+def test_an_engine_that_already_has_a_reasoner_keeps_it_and_generate_is_unchanged(fake_vllm):
+    # gpt-oss gets openai_gptoss without asking (models/config.py:406), so
+    # /generate already waits for reasoning there; don't change that.
+    fake_vllm["engine_reasoner"] = "openai_gptoss"
+    worker = start_worker(chat_reasoning_parser="openai_gptoss")
+
+    generate(worker, [1, 2])
+
+    assert fake_vllm["reasoner_at_engine_start"] == "openai_gptoss"
+    assert worker.llm.calls[0][2]["reasoning_ended"] is None

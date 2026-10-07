@@ -96,10 +96,23 @@ and `reasoning_effort`. `"chat_prompt" in STREAM_CAPABILITIES` tells callers the
 installed version supports it. The worker renders it with vLLM's own chat front
 end on the loaded engine, so the model's template applies (including DeepSeek-V4
 and gpt-oss Harmony), and splits output with vLLM's reasoning and tool parsers.
-Which parsers apply is engine configuration: `reasoning_parser`,
-`tool_call_parser` (popped by the worker, like vllm serve's flag) and, for
-DeepSeek-V4, `tokenizer_mode`. `reasoning_effort` is passed to the template as
-is; callers map OpenAI values to the model family's own.
+Which parsers apply is engine configuration: `chat_reasoning_parser` (else the
+job's own `reasoning_parser`), `tool_call_parser` (both popped by the worker,
+like vllm serve's flags) and, for DeepSeek-V4, `tokenizer_mode`.
+`reasoning_effort` is passed to the template as is; callers map OpenAI values to
+the model family's own.
+
+`chat_reasoning_parser` turns on reasoning for chat streams only. The job's
+`reasoning_parser` also changes `/generate` (it prefills `<think>` for
+`enable_thinking`, splits reasoning out of the result and feeds action-mask
+replay), so setting it to enable chat would change RL rollouts; with only
+`chat_reasoning_parser`, `/generate` keeps no parser. Chat grammars
+(`tool_choice` `required` or named) must still wait for the end of reasoning,
+and vLLM does that only with an engine-wide structured-output reasoner, so the
+worker sets one when the engine has none and passes `reasoning_ended=True` with
+every `/generate` request and plain stream. vLLM then constrains those from the
+first token, exactly as with no reasoner. Setting both keys to different
+parsers fails engine start: there is one reasoner per engine.
 
 - Before rendering, any string in messages, tools or a named `tool_choice` that
   contains one of the tokenizer's special or added tokens fails the stream with

@@ -94,6 +94,21 @@ def _coerce_structured_outputs_config(engine_kwargs: dict[str, Any]) -> None:
         engine_kwargs["structured_outputs_config"] = StructuredOutputsConfig(**dict(raw_config))
 
 
+def _add_chat_reasoner(vllm_config: Any, chat_reasoning_parser: str | None) -> bool:
+    """Give the engine a structured-output reasoner for chat, if it has none.
+
+    Chat grammars (tool_choice, JSON answers) must wait for the end of
+    reasoning, which vLLM does only with an engine-wide reasoner. Returns True
+    when it was added here; other requests then pass ``reasoning_ended=True``,
+    which vLLM treats exactly like having no reasoner.
+    """
+    config = vllm_config.structured_outputs_config
+    if not chat_reasoning_parser or config.reasoning_parser:
+        return False
+    config.reasoning_parser = chat_reasoning_parser
+    return True
+
+
 def _optional_bool(value: Any, *, name: str) -> bool | None:
     if value is None:
         return None
@@ -528,6 +543,7 @@ class InferenceWorker(StreamingWorkerMixin):
         self.llm = None
         self.state = WorkerLifecycleState.UNINITIALIZED
         self._reasoning_parser: Any = None
+        self._chat_only_reasoner = False
         self._router_replay_tx: Any = None
         self._router_replay_group: Any = None
         self._replica_label: str | None = None
@@ -571,7 +587,8 @@ class InferenceWorker(StreamingWorkerMixin):
         final_output = None
         generate_kwargs: dict[str, Any] = {
             "request_id": request_id,
-            "reasoning_ended": reasoning_ended,
+            # A grammar applies from the first token, as on an engine without chat's reasoner.
+            "reasoning_ended": True if getattr(self, "_chat_only_reasoner", False) else reasoning_ended,
         }
         if lora_request is not None:
             generate_kwargs["lora_request"] = lora_request
@@ -609,6 +626,16 @@ class InferenceWorker(StreamingWorkerMixin):
         self._reasoning_parser_name = reasoning_parser_name
         # Chat-mode streams only; vllm serve's --tool-call-parser, not an engine arg.
         self._tool_call_parser = engine_kwargs.pop("tool_call_parser", None)
+        # Chat-mode streams only, so enabling chat leaves /generate (think
+        # prefill, reasoning split, action masks) on the job's own parser.
+        chat_reasoning_parser = engine_kwargs.pop("chat_reasoning_parser", None)
+        if reasoning_parser_name and chat_reasoning_parser not in (None, reasoning_parser_name):
+            # vLLM's structured-output reasoner is one per engine.
+            raise ValueError(
+                f"chat_reasoning_parser={chat_reasoning_parser!r} differs from "
+                f"reasoning_parser={reasoning_parser_name!r}"
+            )
+        self._chat_reasoning_parser_name = chat_reasoning_parser or reasoning_parser_name
         self._return_reasoning_content = bool(engine_kwargs.pop("return_reasoning_content", False))
         lora_adapter_path = engine_kwargs.pop("lora_adapter_path", None)
 
@@ -649,6 +676,7 @@ class InferenceWorker(StreamingWorkerMixin):
                     enable_arctic_patches=arctic_enabled,
                 )
                 vllm_config = engine_args.create_engine_config()
+                self._chat_only_reasoner = _add_chat_reasoner(vllm_config, chat_reasoning_parser)
                 self._structured_outputs_enabled_in_reasoning = bool(
                     vllm_config.structured_outputs_config.enable_in_reasoning
                 )

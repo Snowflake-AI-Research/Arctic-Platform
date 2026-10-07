@@ -1,7 +1,8 @@
 """Opt-in real-engine chat-prompt streams: vLLM's renderer and parsers on a Qwen3 model.
 
 ARCTIC_TEST_MODEL_PATH must point at a Qwen3 checkpoint (e.g. Qwen3-0.6B); the
-parsers configured here are Qwen3's (hermes tool calls, qwen3 reasoning).
+parsers configured here are Qwen3's (hermes tool calls, qwen3 reasoning), set the
+way DSS sets them: ``chat_reasoning_parser``, so /generate keeps no parser.
 """
 
 import asyncio
@@ -60,8 +61,7 @@ async def with_driver(check):
             max_num_seqs=4,
             gpu_memory_utilization=0.5,
             trust_remote_code=False,
-            reasoning_parser="qwen3",
-            extra_engine_kwargs={"tool_call_parser": "hermes"},
+            extra_engine_kwargs={"tool_call_parser": "hermes", "chat_reasoning_parser": "qwen3"},
         )
         await asyncio.wait_for(
             driver.initialize(config, model_id="chat-test", num_replicas=1),
@@ -170,6 +170,67 @@ def test_forced_tool_call_streams_a_valid_call(tool_choice):
             assert isinstance(arguments.get("city"), str)
             [finish] = [e for e in events if e["type"] == "choice_finished"]
             assert finish["finish_reason"] == "tool_calls"
+
+    asyncio.run(with_driver(check))
+
+
+def test_forced_tool_call_waits_for_the_end_of_reasoning():
+    # Needs the engine's structured-output reasoner, which chat_reasoning_parser adds.
+    from arctic_platform.inference.server.chat import ChatPrompt
+
+    async def check(driver):
+        for _ in range(3):
+            events = await collect(
+                driver,
+                ChatPrompt(
+                    [{"role": "user", "content": "What's the weather in Paris?"}],
+                    tools=[WEATHER_TOOL],
+                    tool_choice="required",
+                ),
+                {"temperature": 0.6},
+            )
+            assert usage(events)["reasoning_tokens"] > 0
+            calls = [e for e in events if e["type"] == "tool_call_delta"]
+            assert calls and calls[0]["name"] == "get_weather", events
+            [finish] = [e for e in events if e["type"] == "choice_finished"]
+            assert finish["finish_reason"] == "tool_calls"
+
+    asyncio.run(with_driver(check))
+
+
+def test_generate_on_a_chat_engine_is_constrained_from_the_first_token():
+    # As on an engine without a reasoning parser: no <think> prefill, no
+    # reasoning split, and the grammar applies from the first token.
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_directory())
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Give a JSON object with a city."}],
+        add_generation_prompt=True,
+        tokenize=False,
+        enable_thinking=True,
+    )
+    schema = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+        "additionalProperties": False,
+    }
+
+    async def check(driver):
+        [result] = await driver.generate(
+            [prompt],
+            {
+                "temperature": 0.0,
+                "max_tokens": 64,
+                "enable_thinking": True,
+                "structured_outputs": {"json": schema},
+            },
+            model_id="chat-test",
+        )
+        assert result["prompt_len"] == len(tokenizer(prompt)["input_ids"])
+        assert "reasoning" not in result
+        assert isinstance(json.loads(result["text"])["city"], str)
 
     asyncio.run(with_driver(check))
 
