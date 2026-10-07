@@ -29,11 +29,17 @@ from arctic_platform.model.config import Patches
 from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
 from arctic_platform.model.factory import build_model
+from arctic_platform.model.implementations.fp8 import keeps_fp32
+from arctic_platform.model.implementations.fp8 import mark_keep_fp32
+from arctic_platform.model.implementations.gpu.activation_offload import activation_offload_stats
+from arctic_platform.model.implementations.gpu.lm_head import mark_lm_head_targets_validated
+from arctic_platform.model.implementations.gpu.lm_head import validated_lm_head_targets_to
 from arctic_platform.model.implementations.moe.config_validation import effective_fused_cross_entropy
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.implementations.moe.conversion_cache import conversion_cache_is_node_local
 from arctic_platform.model.implementations.moe.conversion_cache import conversion_cache_ready
 from arctic_platform.model.implementations.moe.conversion_cache import resolve_conversion_cache_path
+from arctic_platform.model.implementations.moe.layers.moe import ROUTER_REPLAY_FRESH
 from arctic_platform.model.implementations.moe.vlm import get_language_model
 from arctic_platform.model.implementations.moe.vlm import get_vision_encoder
 from arctic_platform.model.loader import LoadedModel
@@ -71,6 +77,7 @@ __all__ = [
     "ActivationCheckpointConfig",
     "ActivationOffloadConfig",
     "ActivationOffloadPatch",
+    "activation_offload_stats",
     "PEFT_ADAPTER_DIRNAME",
     "WeightExportContract",
     "canonical_parameter_name",
@@ -85,9 +92,12 @@ __all__ = [
     "hf_export_parameter_name",
     "iter_lora_weights",
     "iter_model_weights",
+    "keeps_fp32",
     "LoadedModel",
     "LoaderContext",
     "LmHeadPatch",
+    "mark_keep_fp32",
+    "mark_lm_head_targets_validated",
     "CompilePatch",
     "ModelParallelismMetadata",
     "ModelSpec",
@@ -107,9 +117,11 @@ __all__ = [
     "register_loader",
     "register_patch",
     "resolve_conversion_cache_path",
+    "ROUTER_REPLAY_FRESH",
     "save_exported_state_dict",
     "select_loader",
     "validate_lora_sync_trainable_parameters",
     "validate_lm_head_fused_ce_config",
+    "validated_lm_head_targets_to",
     "weight_export_contract",
 ]
