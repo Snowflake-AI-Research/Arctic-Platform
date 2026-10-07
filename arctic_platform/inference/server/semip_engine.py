@@ -30,6 +30,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import uuid
@@ -3031,7 +3032,13 @@ def _node_source(skeleton_dir: str | None, node_rank: int) -> str | None:
 
 
 class _SemiPEngine:
-    """Stands in for ``self.llm`` (a vLLM ``AsyncLLM``) over a semi-p Instance."""
+    """Stands in for ``self.llm`` (a vLLM ``AsyncLLM``) over a semi-p Instance.
+
+    Generates run concurrently, as they do on ``AsyncLLM``: each is its own
+    ``generate`` command, and the child batches every request it holds into
+    one engine step. Everything else (sleep, wake, pause, resume) runs alone,
+    after the in-flight generates finish and before any new one starts.
+    """
 
     def __init__(self, inst: Any, *, tokenizer_path: str | None,
                  model: str | None, agents: list[Any] | None = None):
@@ -3039,7 +3046,18 @@ class _SemiPEngine:
         self._tokenizer_path = tokenizer_path
         self._model = model
         self._tokenizer: Any = None
+        # Held by control operations for their whole run, and by a generate
+        # only while it submits.
         self._lock = asyncio.Lock()
+        # req_id -> (loop, future) of each generate the child still holds.
+        # Written on the event loop, popped on the demuxer thread.
+        self._waiters: dict[str, tuple[asyncio.AbstractEventLoop,
+                                       asyncio.Future]] = {}
+        self._waiters_lock = threading.Lock()
+        self._inflight = 0
+        self._drained = asyncio.Event()
+        self._drained.set()
+        inst.add_cmd_listener("generate", self._on_generate_done)
         # The other halves of a node-spanning engine. They hold GPUs and a
         # restored process tree, so they have to come down with this engine;
         # nothing else owns them.
@@ -3052,15 +3070,62 @@ class _SemiPEngine:
                        reasoning_ended: bool | None = None):
         """Async generator yielding a single vLLM-``RequestOutput``-shaped final."""
         sp = _sampling_params_to_dict(params)
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
         async with self._lock:
-            result = await asyncio.to_thread(self._generate_blocking, prompt_input, sp)
-        yield self._to_request_output(result)
+            with self._waiters_lock:
+                self._inst.generate([prompt_input], sp)
+                self._waiters[self._inst.last_req_id] = (loop, future)
+            self._inflight += 1
+            self._drained.clear()
+        yield self._to_request_output(await future)
 
-    def _generate_blocking(self, prompt_input: Any, sp: dict[str, Any]) -> dict[str, Any]:
-        self._inst.generate([prompt_input], sp)
-        rid = self._inst.last_req_id
-        self._inst.wait()
-        return self._inst.generate_results.get(rid, {}) or {}
+    def _on_generate_done(self, cmd: str, elapsed: float,
+                          error: object | None, info: Any) -> None:
+        """Demuxer listener: hand each finished generate to its waiter."""
+        rid = info.get("req_id") if isinstance(info, dict) else None
+        with self._waiters_lock:
+            if rid is None:
+                # The worker reports a dead child without a req_id, and
+                # nothing the child held will ever finish.
+                done = list(self._waiters.items())
+                self._waiters.clear()
+            else:
+                waiter = self._waiters.pop(rid, None)
+                done = [(rid, waiter)] if waiter is not None else []
+        for done_rid, (loop, future) in done:
+            result = self._inst.generate_results.pop(done_rid, None) or {}
+            loop.call_soon_threadsafe(self._settle, future, result, error)
+
+    def _settle(self, future: asyncio.Future, result: dict[str, Any],
+                error: object | None) -> None:
+        # Counted here, not where the caller awaits: a caller that gives up
+        # leaves its request running in the child all the same.
+        self._inflight -= 1
+        if not self._inflight:
+            self._drained.set()
+        if future.done():
+            return
+        if error is not None:
+            future.set_exception(
+                RuntimeError(f"semi_p: generate failed: {error}"))
+        else:
+            future.set_result(result)
+
+    @contextlib.asynccontextmanager
+    async def _exclusive(self):
+        """Run a control operation with no generate in flight."""
+        async with self._lock:
+            await self._drained.wait()
+            # Every generate failure already reached its caller through
+            # _settle, but the demuxer also latches the first one, and the
+            # control operation's own wait() would raise it as its own.
+            try:
+                self._inst.wait()
+            except RuntimeError as exc:
+                logger.debug("semi_p: dropping a reported generate error: %s",
+                             exc)
+            yield
 
     @staticmethod
     def _first(seq, i=0):
@@ -3068,39 +3133,23 @@ class _SemiPEngine:
             return seq[i]
         return None
 
-    @staticmethod
-    def _ids_or_placeholder(ids: Any, count: Any) -> list[int]:
-        """Real token ids when available, else a zero list of the right length.
-
-        The Instance's generate result reports only *counts*
-        (``prompt_tokens`` / ``completion_tokens``); the id lists are not
-        surfaced across the queue. Downstream server code takes lengths off
-        these lists -- ``worker.py`` derives both ``generation_len`` and the
-        response's ``token_ids`` from them -- so returning an empty list would
-        report zero generated tokens for a request that produced text. Zeros of
-        the correct length keep every length correct; the id *values* are not
-        meaningful and nothing in the sampling path reads them.
-        """
-        if ids is not None:
-            return list(ids)
-        return [0] * int(count) if isinstance(count, int) else []
-
     def _to_request_output(self, res: dict[str, Any]) -> SimpleNamespace:
         # outputs: [[text per sample] per prompt]; take prompt 0, sample 0.
         prompt_texts = self._first(res.get("outputs"))
         text = self._first(prompt_texts) or ""
 
-        comp = self._first(res.get("completion_token_ids"))
-        token_ids = self._ids_or_placeholder(
-            self._first(comp) if comp is not None else None,
-            res.get("completion_tokens"))
+        # completion_token_ids: [[ids per sample] per prompt].
+        token_ids = self._first(self._first(res.get("completion_token_ids")))
+        prompt_ids = self._first(res.get("prompt_token_ids"))
+        if token_ids is None or prompt_ids is None:
+            # Callers train on these ids, so a stand-in would be silently
+            # wrong rather than merely missing.
+            raise RuntimeError(
+                "semi_p: the restored engine reported no token ids for this "
+                f"request (result keys: {sorted(res)})")
 
         finish_reasons = res.get("finish_reasons") or []
         finish_reason = finish_reasons[0] if finish_reasons else "stop"
-
-        prompt_ids = self._ids_or_placeholder(
-            self._first(res.get("prompt_token_ids")),
-            res.get("prompt_tokens"))
 
         choice = SimpleNamespace(
             text=text,
@@ -3131,11 +3180,11 @@ class _SemiPEngine:
     async def collective_rpc(self, method: str, args: tuple = (),
                              kwargs: dict | None = None):
         if method == "sleep":
-            async with self._lock:
+            async with self._exclusive():
                 await asyncio.to_thread(self._sleep_blocking)
             return [None]
         if method == "wake_up":
-            async with self._lock:
+            async with self._exclusive():
                 await asyncio.to_thread(self._wake_blocking)
             return [None]
         if method == "_arl_cuda_sync":
@@ -3164,7 +3213,7 @@ class _SemiPEngine:
         self._inst.wait()
 
     async def pause_generation(self, mode: str = "keep", clear_cache: bool = False):
-        async with self._lock:
+        async with self._exclusive():
             await asyncio.to_thread(self._pause_blocking)
 
     def _pause_blocking(self):
@@ -3172,6 +3221,8 @@ class _SemiPEngine:
         self._inst.wait()
 
     async def resume_generation(self):
+        # Not _exclusive: a generate submitted while paused is parked in the
+        # child until this resume, so waiting for it to drain would deadlock.
         async with self._lock:
             await asyncio.to_thread(self._resume_blocking)
 
@@ -3211,6 +3262,12 @@ class _SemiPEngine:
             except Exception:  # pragma: no cover - best effort
                 logger.warning("semi_p: teardown failed", exc_info=True)
             self._inst = None
+            with self._waiters_lock:
+                waiters = list(self._waiters.values())
+                self._waiters.clear()
+            for loop, future in waiters:
+                loop.call_soon_threadsafe(
+                    self._settle, future, {}, "engine closed")
         # Fan out to the other halves. After the leader is down they hold a
         # process tree that can never be driven again -- its executor was the
         # leader's -- so leaving them alive would pin a pod's GPUs until the

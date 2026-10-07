@@ -175,7 +175,7 @@ class Instance:
         self.last_generate_result = None
         self.last_prompt_tokens = None
         self.last_completion_tokens = None
-        self.generate_results = {}  # req_id -> {prompts, outputs, prompt_tokens, completion_tokens, ttft_s, tpot_ms}
+        self.generate_results = {}  # req_id -> {prompts, outputs, prompt_token_ids, completion_token_ids, prompt_tokens, completion_tokens, ttft_s, tpot_ms}
         self._pending_prompts = {}  # req_id -> prompts (popped on completion)
 
         # The demuxer is the sole consumer of ``_result_queue``; it is
@@ -976,6 +976,8 @@ class Instance:
                 self.generate_results[req_id] = {
                     "prompts": info.get("prompts"),
                     "outputs": info.get("outputs"),
+                    "prompt_token_ids": info.get("prompt_token_ids"),
+                    "completion_token_ids": info.get("completion_token_ids"),
                     "prompt_tokens": info.get("prompt_tokens"),
                     "completion_tokens": info.get("completion_tokens"),
                     "ttft_s": info.get("ttft_s"),
