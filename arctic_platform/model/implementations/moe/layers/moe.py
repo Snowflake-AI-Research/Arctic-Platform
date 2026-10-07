@@ -374,7 +374,7 @@ class GroupedExperts(nn.Module):
             s1 = _maybe_to_local(self.w1_scale_inv)
             s2 = _maybe_to_local(self.w2_scale_inv)
             s3 = _maybe_to_local(self.w3_scale_inv)
-            ab = getattr(self, "_dss_lora_ab", {})
+            ab = getattr(self, "_ap_lora_ab", getattr(self, "_dss_lora_ab", {}))
             if self.use_grouped_mm:
                 gate = grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size) + _packed_expert_linear(
                     x, d1, num_tokens_per_expert, ab.get("w1")

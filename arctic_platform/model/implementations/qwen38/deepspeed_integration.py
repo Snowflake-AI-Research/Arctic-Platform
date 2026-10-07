@@ -81,7 +81,7 @@ def _adapter() -> MoEDeepSpeedAdapter:
         qwen_ds._generic_adapter(),
         build_model_config=_build_model_config,
         apply_sequence_parallelism=_apply_sequence_parallelism,
-        extra_weight_iterators=(),
+        vllm_weight_export=None,
     )
 
 
