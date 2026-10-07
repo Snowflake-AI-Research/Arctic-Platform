@@ -98,3 +98,15 @@ def test_model_config_rejects_invalid_lora_sync_staging():
 
     with pytest.raises(ValueError, match="lora_sync_staging"):
         ModelConfig(model="m", lora_sync_staging="auto")
+
+
+def test_model_config_refuses_undeclared_keys_and_names_the_redirect():
+    ModelConfig = _model_config_cls()
+
+    with pytest.raises(
+        ValueError, match=r"\['mamba_ssm_cache_dtype', 'tool_call_parser'\].*extra_engine_kwargs.*extra_env"
+    ):
+        ModelConfig(model="m", tool_call_parser="hermes", mamba_ssm_cache_dtype="float32")
+
+    config = ModelConfig(model="m", extra_engine_kwargs={"mamba_ssm_cache_dtype": "float32"})
+    assert config.to_engine_kwargs()["mamba_ssm_cache_dtype"] == "float32"
