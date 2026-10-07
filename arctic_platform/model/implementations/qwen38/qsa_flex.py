@@ -30,12 +30,37 @@ import types
 from collections.abc import Callable
 
 import torch
+import torch.distributed as dist
+import torch.distributed.nn as dist_nn
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 from torch.nn.attention.flex_attention import flex_attention
 
 _BACKEND = "qsa_flex"
 _QSA_SCORE_BUDGET_BYTES = 256 * 1024 * 1024
+_QSA_ATTENTION_CHUNK_ROWS = 128
+
+
+def _cp_info(module) -> tuple[object | None, int, int]:
+    group = getattr(module, "_cp_group", None)
+    if group is None:
+        return None, 0, 1
+    return group, dist.get_rank(group), dist.get_world_size(group)
+
+
+def _gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:
+    if group is None or dist.get_world_size(group) == 1:
+        return tensor
+    return torch.cat(dist_nn.all_gather(tensor.contiguous(), group=group), dim=1)
+
+
+@torch.no_grad()
+def _gather_sequence_no_grad(tensor: torch.Tensor, group) -> torch.Tensor:
+    if group is None or dist.get_world_size(group) == 1:
+        return tensor
+    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(gathered, tensor.contiguous(), group=group)
+    return torch.cat(gathered, dim=1)
 
 
 def _compact_qsa_mask(*, attention_mask=None, **_kwargs):
@@ -91,6 +116,7 @@ def select_qsa_token_ids(
     *,
     token_budget: int,
     compress_ratio: int,
+    query_offset: int = 0,
 ) -> torch.Tensor:
     batch_size, sequence_length, num_heads, head_dim = index_queries.shape
     block_budget = token_budget // compress_ratio
@@ -108,7 +134,7 @@ def select_qsa_token_ids(
     for batch_idx, logical_length_tensor in enumerate(sequence_lengths):
         logical_length = int(logical_length_tensor)
         available_blocks = logical_length // compress_ratio
-        local_valid_length = min(logical_length, sequence_length)
+        local_valid_length = min(max(logical_length - query_offset, 0), sequence_length)
         if local_valid_length == 0:
             continue
         keys = compressed_keys[batch_idx, :available_blocks, 0].float()
@@ -121,7 +147,7 @@ def select_qsa_token_ids(
         for query_start in range(0, local_valid_length, chunk_rows):
             query_end = min(query_start + chunk_rows, local_valid_length)
             rows = query_end - query_start
-            query_positions = torch.arange(query_start, query_end, device=index_queries.device)
+            query_positions = query_offset + torch.arange(query_start, query_end, device=index_queries.device)
             visible_blocks = torch.div(query_positions + 1, compress_ratio, rounding_mode="floor")
             result = torch.full(
                 (rows, route_width),
@@ -134,7 +160,7 @@ def select_qsa_token_ids(
                 candidate_blocks = torch.arange(topk_width, device=index_queries.device)
                 top_blocks = candidate_blocks.unsqueeze(0).expand(rows, -1)
                 valid_blocks = candidate_blocks.unsqueeze(0) < visible_blocks.unsqueeze(1)
-                sparse_start = min(max(first_sparse_position - query_start, 0), rows)
+                sparse_start = min(max(first_sparse_position - query_offset - query_start, 0), rows)
                 if sparse_start < rows:
                     queries = index_queries[batch_idx, query_start + sparse_start : query_end].float()
                     scores = torch.einsum("qhd,pd->qhp", queries, keys)
@@ -180,14 +206,19 @@ def _qsa_indexer_forward(
         raise NotImplementedError("Qwen3.8 QSA FlexAttention cache decoding is handled by the inference backend")
     from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
 
-    batch_size, sequence_length, _ = hidden_states.shape
+    batch_size, local_sequence_length, _ = hidden_states.shape
+    cp_group, cp_rank, cp_world_size = _cp_info(self)
+    global_attention_mask = (
+        _gather_sequence_no_grad(attention_mask, cp_group) if attention_mask is not None else None
+    )
+    global_sequence_length = local_sequence_length * cp_world_size
     lengths = _right_padded_lengths(
-        attention_mask,
+        global_attention_mask,
         batch_size=batch_size,
-        sequence_length=sequence_length,
+        sequence_length=global_sequence_length,
         device=hidden_states.device,
     )
-    full_cos, full_sin = position_embeddings
+    local_cos, local_sin = position_embeddings
     projected = self.index_qk_proj(hidden_states)
     query_width = self.index_n_heads * self.index_head_dim
     raw_query, raw_key = torch.split(projected, [query_width, self.index_head_dim], dim=-1)
@@ -195,26 +226,30 @@ def _qsa_indexer_forward(
     raw_key = raw_key.unflatten(-1, (1, self.index_head_dim))
     query = apply_rotary_pos_emb(
         self.q_layernorm(query),
-        cos=full_cos[:, -sequence_length:],
-        sin=full_sin[:, -sequence_length:],
+        cos=local_cos[:, -local_sequence_length:],
+        sin=local_sin[:, -local_sequence_length:],
         unsqueeze_dim=2,
     )
 
-    num_blocks = sequence_length // self.compress_ratio
-    grouped_key = raw_key[:, : num_blocks * self.compress_ratio].unflatten(1, (num_blocks, self.compress_ratio))
+    num_blocks = local_sequence_length // self.compress_ratio
+    grouped_key = raw_key[:, : num_blocks * self.compress_ratio].unflatten(
+        1, (num_blocks, self.compress_ratio)
+    )
     compressed_key = grouped_key.float().mean(dim=2).to(raw_key.dtype)
     compressed_key = apply_rotary_pos_emb(
         self.k_layernorm(compressed_key),
-        cos=full_cos[:, : num_blocks * self.compress_ratio : self.compress_ratio],
-        sin=full_sin[:, : num_blocks * self.compress_ratio : self.compress_ratio],
+        cos=local_cos[:, : num_blocks * self.compress_ratio : self.compress_ratio],
+        sin=local_sin[:, : num_blocks * self.compress_ratio : self.compress_ratio],
         unsqueeze_dim=2,
     )
+    compressed_key = _gather_sequence_no_grad(compressed_key, cp_group)
     return select_qsa_token_ids(
         query,
         compressed_key,
         lengths,
         token_budget=self.token_budget,
         compress_ratio=self.compress_ratio,
+        query_offset=cp_rank * local_sequence_length,
     )
 
 
@@ -262,6 +297,135 @@ def _routes_to_block_mask(
     return block_mask, has_routes
 
 
+def _sparse_gqa_from_selected(
+    query: torch.Tensor,
+    selected_key: torch.Tensor,
+    selected_value: torch.Tensor,
+    valid: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    batch_size, query_length, num_query_heads, head_dim = query.shape
+    num_kv_heads = selected_key.shape[3]
+    if num_query_heads % num_kv_heads:
+        raise ValueError(
+            f"Qwen3.8 QSA query heads ({num_query_heads}) must be divisible by KV heads ({num_kv_heads})"
+        )
+
+    groups = num_query_heads // num_kv_heads
+    grouped_query = query.view(batch_size, query_length, num_kv_heads, groups, head_dim)
+    scores = torch.einsum(
+        "bqhgd,bqrhd->bqhgr",
+        grouped_query.float(),
+        selected_key.float(),
+    )
+    scores.mul_(softmax_scale)
+    scores.masked_fill_(~valid[:, :, None, None], -torch.inf)
+    empty = ~valid.any(dim=-1)
+    scores.masked_fill_(empty[:, :, None, None, None], 0)
+    probabilities = torch.softmax(scores, dim=-1).to(selected_value.dtype)
+    probabilities.masked_fill_(~valid[:, :, None, None], 0)
+    output = torch.einsum(
+        "bqhgr,bqrhd->bqhgd",
+        probabilities,
+        selected_value,
+    ).reshape(batch_size, query_length, num_query_heads, head_dim)
+    output.masked_fill_(empty[:, :, None, None], 0)
+    return output
+
+
+def _sparse_gqa_chunk(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    selected_token_ids: torch.Tensor,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    valid = (selected_token_ids >= 0) & (selected_token_ids < key.shape[1])
+    safe_ids = selected_token_ids.long().clamp(min=0, max=key.shape[1] - 1)
+    batch_indices = torch.arange(query.shape[0], device=query.device)[:, None, None]
+    selected_key = key[batch_indices, safe_ids]
+    selected_value = value[batch_indices, safe_ids]
+    output = _sparse_gqa_from_selected(
+        query,
+        selected_key,
+        selected_value,
+        valid,
+        softmax_scale,
+    )
+    return output, safe_ids, selected_key, selected_value
+
+
+class _SparseGQAAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query, key, value, selected_token_ids, softmax_scale, chunk_rows):
+        ctx.softmax_scale = float(softmax_scale)
+        ctx.chunk_rows = int(chunk_rows)
+        ctx.save_for_backward(query, key, value, selected_token_ids)
+        outputs = []
+        for start in range(0, query.shape[1], ctx.chunk_rows):
+            stop = min(start + ctx.chunk_rows, query.shape[1])
+            output, *_ = _sparse_gqa_chunk(
+                query[:, start:stop],
+                key,
+                value,
+                selected_token_ids[:, start:stop],
+                ctx.softmax_scale,
+            )
+            outputs.append(output)
+        return torch.cat(outputs, dim=1)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        query, key, value, selected_token_ids = ctx.saved_tensors
+        grad_query = torch.empty_like(query)
+        grad_key = torch.zeros_like(key)
+        grad_value = torch.zeros_like(value)
+        flattened_grad_key = grad_key.flatten(2)
+        flattened_grad_value = grad_value.flatten(2)
+        kv_width = flattened_grad_key.shape[-1]
+
+        for start in range(0, query.shape[1], ctx.chunk_rows):
+            stop = min(start + ctx.chunk_rows, query.shape[1])
+            routes = selected_token_ids[:, start:stop]
+            valid = (routes >= 0) & (routes < key.shape[1])
+            with torch.enable_grad():
+                local_query = query[:, start:stop].detach().requires_grad_(True)
+                safe_ids = routes.long().clamp(min=0, max=key.shape[1] - 1)
+                batch_indices = torch.arange(query.shape[0], device=query.device)[:, None, None]
+                selected_key = key.detach()[batch_indices, safe_ids]
+                selected_value = value.detach()[batch_indices, safe_ids]
+                selected_key = selected_key.detach().requires_grad_(True)
+                selected_value = selected_value.detach().requires_grad_(True)
+                output = _sparse_gqa_from_selected(
+                    local_query,
+                    selected_key,
+                    selected_value,
+                    valid,
+                    ctx.softmax_scale,
+                )
+                local_grad_query, local_grad_key, local_grad_value = torch.autograd.grad(
+                    output,
+                    (local_query, selected_key, selected_value),
+                    grad_output[:, start:stop],
+                )
+
+            grad_query[:, start:stop] = local_grad_query
+            scatter_indices = safe_ids.reshape(safe_ids.shape[0], -1, 1).expand(-1, -1, kv_width)
+            valid_values = valid[..., None, None]
+            flattened_grad_key.scatter_add_(
+                1,
+                scatter_indices,
+                (local_grad_key * valid_values).reshape(safe_ids.shape[0], -1, kv_width),
+            )
+            flattened_grad_value.scatter_add_(
+                1,
+                scatter_indices,
+                (local_grad_value * valid_values).reshape(safe_ids.shape[0], -1, kv_width),
+            )
+
+        return grad_query, grad_key, grad_value, None, None, None
+
+
 def flex_sparse_gqa_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -272,16 +436,14 @@ def flex_sparse_gqa_attention(
 ) -> torch.Tensor:
     if not query.is_cuda or any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
         raise RuntimeError("Qwen3.8 QSA FlexAttention requires CUDA BF16 Q/K/V tensors")
-    block_mask, has_routes = _routes_to_block_mask(selected_token_ids, key.shape[1])
-    output = _compiled_flex()(
-        query.permute(0, 2, 1, 3),
-        key.permute(0, 2, 1, 3),
-        value.permute(0, 2, 1, 3),
-        block_mask=block_mask,
-        scale=softmax_scale,
-        enable_gqa=True,
-    ).permute(0, 2, 1, 3)
-    return output.masked_fill(~has_routes[:, :, None, None], 0)
+    return _SparseGQAAttention.apply(
+        query,
+        key,
+        value,
+        selected_token_ids,
+        softmax_scale,
+        _QSA_ATTENTION_CHUNK_ROWS,
+    )
 
 
 def _qsa_attention_forward(
@@ -316,10 +478,13 @@ def _qsa_attention_forward(
     )
     if past_key_values is not None and past_key_values.get_seq_length() > 0:
         raise NotImplementedError("Qwen3.8 QSA FlexAttention cache decoding is handled by the inference backend")
+    cp_group, _, _ = _cp_info(self)
+    key_states = _gather_sequence(key_states.transpose(1, 2), cp_group)
+    value_states = _gather_sequence(value_states.transpose(1, 2), cp_group)
     attention_output = flex_sparse_gqa_attention(
         query_states.transpose(1, 2),
-        key_states.transpose(1, 2),
-        value_states.transpose(1, 2),
+        key_states,
+        value_states,
         selected_token_ids,
         softmax_scale=self.scaling,
     )

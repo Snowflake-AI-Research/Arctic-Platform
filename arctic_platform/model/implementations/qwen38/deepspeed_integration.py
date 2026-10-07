@@ -25,6 +25,7 @@ from arctic_platform.model.implementations.moe.deepspeed_integration import MoED
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
+from arctic_platform.model.implementations.qwen38.context_parallel import apply_context_parallelism
 from arctic_platform.model.implementations.qwen38.qsa_flex import apply_qsa_flex
 from arctic_platform.model.implementations.qwen38.qsa_flex import register_qsa_flex_backend
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
@@ -63,16 +64,16 @@ def _build_model_config(
     return model_config
 
 
-def _validate_parallelism(sp_size: int, _sp_group=None) -> None:
-    if sp_size > 1:
-        raise NotImplementedError(
-            "Sequence parallelism is not implemented for Qwen3.8-Flash-Next. "
-            f"Got sp_size={sp_size}; set training_config.sp_size=1 or omit it."
-        )
+def _validate_parallelism(sp_size: int, sp_group=None) -> None:
+    if sp_size < 1:
+        raise ValueError(f"Qwen3.8 context-parallel size must be positive, got {sp_size}")
+    if sp_size > 1 and sp_group is None:
+        raise ValueError("Qwen3.8 context parallelism requires an SP process group")
 
 
-def _apply_sequence_parallelism(_model: nn.Module, sp_size: int, _sp_group) -> None:
-    _validate_parallelism(sp_size)
+def _apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None:
+    _validate_parallelism(sp_size, sp_group)
+    apply_context_parallelism(model, sp_size, sp_group)
 
 
 def _adapter() -> MoEDeepSpeedAdapter:
@@ -122,7 +123,7 @@ def load_qwen4_exp_model(
     options: Qwen3_5MoeOptions,
 ) -> nn.Module:
     """Load Qwen3.8-Flash-Next. Weight sync stays on the Hugging Face iterator."""
-    _validate_parallelism(sp_size)
+    _validate_parallelism(sp_size, sp_group)
     model = qwen_ds._load_moe_model(
         _adapter(),
         load_qwen4_exp_model_for_deepspeed,

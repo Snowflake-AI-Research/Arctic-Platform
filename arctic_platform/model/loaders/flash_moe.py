@@ -15,8 +15,8 @@
 """Loaders for GLM-5.3-Flash and Qwen3.8-Flash-Next.
 
 These families use the shared DeepSpeed MoE lifecycle with their own adapters.
-Sequence parallelism above one is rejected. Qwen3.8 expert parallel must divide
-512, and its weight sync stays on the Hugging Face iterator.
+Qwen3.8 expert parallel must divide 512, and its weight sync stays on the
+Hugging Face iterator.
 """
 
 from __future__ import annotations
@@ -88,7 +88,12 @@ def _validate_qwen4_exp(spec: ModelSpec) -> None:
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import QWEN38_ATTN_BACKEND
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import QWEN38_NUM_EXPERTS
 
-    _validate_common(spec, "Qwen3.8-Flash-Next", default_attention=QWEN38_ATTN_BACKEND)
+    _validate_common(
+        spec,
+        "Qwen3.8-Flash-Next",
+        default_attention=QWEN38_ATTN_BACKEND,
+        allow_sequence_parallel=True,
+    )
     if spec.attn_implementation not in (QWEN38_ATTN_BACKEND, "flex_attention"):
         raise ValueError(
             "Qwen3.8-Flash-Next training requires QSA FlexAttention; "

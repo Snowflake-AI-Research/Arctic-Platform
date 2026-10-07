@@ -351,7 +351,7 @@ def test_qwen38_hf_sync_excludes_frozen_ple_table(monkeypatch):
     assert "model.language_model.layers.0.mlp.experts.gate_up_proj" in names
 
 
-def test_qwen38_adapter_uses_qsa_flex_and_rejects_sequence_parallelism():
+def test_qwen38_adapter_uses_qsa_flex_and_validates_context_parallelism():
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import _build_model_config
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import _validate_parallelism
     from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
@@ -385,8 +385,48 @@ def test_qwen38_adapter_uses_qsa_flex_and_rejects_sequence_parallelism():
             options,
         )
     _validate_parallelism(1)
-    with pytest.raises(NotImplementedError, match="Sequence parallelism"):
+    with pytest.raises(ValueError, match="process group"):
         _validate_parallelism(2)
+    _validate_parallelism(8, object())
+
+
+def test_qwen38_rank_zero_ple_halo_keeps_collective_backward(monkeypatch):
+    from arctic_platform.model.implementations.qwen38 import context_parallel
+
+    source = torch.arange(8.0, requires_grad=True)
+    hidden_states = source.view(1, 4, 2)
+    monkeypatch.setattr(
+        context_parallel.dist_nn,
+        "all_gather",
+        lambda tensor, group: (tensor * 2, tensor * 3),
+    )
+    monkeypatch.setattr(context_parallel.dist, "get_rank", lambda group: 0)
+
+    previous = context_parallel._previous_rank_context(
+        hidden_states,
+        2,
+        process_group=object(),
+        pad_value=0,
+        differentiable=True,
+    )
+    previous.sum().backward()
+
+    torch.testing.assert_close(previous, torch.zeros_like(previous))
+    torch.testing.assert_close(source.grad, torch.zeros_like(source))
+
+
+def test_qwen38_supports_selective_activation_checkpointing():
+    _require()
+    from arctic_platform.model.implementations.moe.layers.checkpointing import get_supported_targets
+    from arctic_platform.model.implementations.moe.layers.checkpointing import (
+        supports_selective_activation_checkpointing,
+    )
+
+    model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
+    linear_layer = model.model.language_model.layers[0]
+
+    assert supports_selective_activation_checkpointing(linear_layer)
+    assert {"linear_attn", "routed_experts"} <= get_supported_targets(linear_layer)
 
 
 def test_qwen38_qsa_route_selection_is_causal():
@@ -409,6 +449,49 @@ def test_qwen38_qsa_route_selection_is_causal():
         else:
             assert 4 <= valid.numel() <= 5
         assert torch.all(valid <= position)
+
+
+def test_qwen38_qsa_route_selection_uses_global_query_offset():
+    from arctic_platform.model.implementations.qwen38.qsa_flex import select_qsa_token_ids
+
+    queries = torch.ones(1, 4, 1, 2)
+    keys = torch.ones(1, 6, 1, 2)
+    routes = select_qsa_token_ids(
+        queries,
+        keys,
+        torch.tensor([12]),
+        token_budget=4,
+        compress_ratio=2,
+        query_offset=8,
+    )
+
+    for local_position, selected in enumerate(routes[0]):
+        valid = selected[selected >= 0]
+        assert torch.all(valid <= local_position + 8)
+        assert torch.any(valid > local_position)
+
+
+def test_qwen38_sparse_gqa_custom_backward_matches_autograd():
+    from arctic_platform.model.implementations.qwen38.qsa_flex import _SparseGQAAttention
+    from arctic_platform.model.implementations.qwen38.qsa_flex import _sparse_gqa_chunk
+
+    torch.manual_seed(7)
+    query = torch.randn(1, 3, 4, 2, dtype=torch.double, requires_grad=True)
+    key = torch.randn(1, 5, 2, 2, dtype=torch.double, requires_grad=True)
+    value = torch.randn(1, 5, 2, 2, dtype=torch.double, requires_grad=True)
+    routes = torch.tensor([[[0, 1, -1], [1, 2, 3], [0, 3, 4]]], dtype=torch.int32)
+
+    expected, *_ = _sparse_gqa_chunk(query, key, value, routes, 0.5)
+    expected.sum().backward()
+    expected_grads = tuple(tensor.grad.clone() for tensor in (query, key, value))
+
+    actual_inputs = tuple(tensor.detach().clone().requires_grad_(True) for tensor in (query, key, value))
+    actual = _SparseGQAAttention.apply(*actual_inputs, routes, 0.5, 2)
+    actual.sum().backward()
+
+    torch.testing.assert_close(actual, expected.detach(), rtol=0, atol=0)
+    for actual_input, expected_grad in zip(actual_inputs, expected_grads, strict=True):
+        torch.testing.assert_close(actual_input.grad, expected_grad, rtol=0, atol=1e-12)
 
 
 def test_qwen38_rejects_native_fp8_training():
