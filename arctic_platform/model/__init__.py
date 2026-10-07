@@ -31,6 +31,10 @@ from arctic_platform.model.config import ZorroTrainPatch
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
+from arctic_platform.model.loader import ModelParallelismMetadata
+from arctic_platform.model.loader import canonical_parameter_name
+from arctic_platform.model.loader import finalize_model_for_training
+from arctic_platform.model.loader import model_parallelism_metadata_from_config
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import select_loader
 from arctic_platform.model.patch import apply_patches
@@ -45,11 +49,15 @@ __all__ = [
     "ActivationCheckpointConfig",
     "ActivationOffloadConfig",
     "ActivationOffloadPatch",
+    "canonical_parameter_name",
+    "finalize_model_for_training",
     "LoadedModel",
     "LoaderContext",
     "LmHeadPatch",
     "CompilePatch",
+    "ModelParallelismMetadata",
     "ModelSpec",
+    "model_parallelism_metadata_from_config",
     "ParallelismConfig",
     "Patches",
     "TiledMlpPatch",
