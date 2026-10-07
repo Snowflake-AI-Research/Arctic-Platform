@@ -404,3 +404,93 @@ def test_logprob_stream_behind_a_slow_reader_fits_a_raised_buffer():
         entry["token_id"] for event in events for entry in event["logprobs"]
     ] == list(range(10_000, 13_000))
     assert all(len(entry["top"]) == 20 for e in events for entry in e["logprobs"])
+
+
+def _mixed_deltas(count):
+    # Logprob, CJK, emoji (a surrogate pair once escaped), quote/backslash and
+    # control-character deltas, some without token IDs, in one choice's stream.
+    texts = [" word", "猫が座った", "😀", '"\\', "\n\t\x01", "é"]
+    for step in range(count):
+        delta = _logprob_delta(10_000 + step)
+        delta["text"] = texts[step % len(texts)]
+        if step % 7 == 3:
+            del delta["token_ids"], delta["logprobs"]
+        elif step % 5 == 2:
+            delta["token_ids"] = []
+            delta["logprobs"] = []
+        yield delta
+
+
+def test_merged_delta_size_matches_its_serialized_size():
+    from arctic_platform.inference.server.streaming import EventBuffer, event_size
+
+    bare = {"type": "delta", "choice_index": 0, "text": ""}
+    for first in (bare, {**bare, "token_ids": [], "logprobs": []}, None):
+        buffer = EventBuffer(StreamLimits(max_buffer_bytes=16 * 1024 * 1024))
+        if first is not None:
+            buffer.put(first)
+        for delta in _mixed_deltas(500):
+            buffer.put(delta)
+            assert [size for _, size in buffer.events] == [
+                event_size(event) for event, _ in buffer.events
+            ]
+            assert buffer.bytes == sum(size for _, size in buffer.events)
+        assert len(buffer.events) > 1  # the 256 KiB event cap split the stream
+        assert all(
+            size <= buffer.limits.max_event_bytes for _, size in buffer.events
+        )
+
+
+def test_merge_fills_the_event_cap_exactly():
+    from arctic_platform.inference.server.streaming import EventBuffer, event_size
+
+    deltas = list(_mixed_deltas(12))
+    probe = EventBuffer(StreamLimits())
+    for delta in deltas[:-1]:
+        probe.put(delta)
+    [[merged, _]] = probe.events
+    cap = event_size(merged)
+
+    buffer = EventBuffer(StreamLimits(max_event_bytes=cap))
+    for delta in deltas:
+        buffer.put(delta)
+    assert [size for _, size in buffer.events] == [cap, event_size(deltas[-1])]
+
+    # Another choice's delta leaves the merge exactly the room it needs, or a
+    # byte less.
+    other = {**deltas[0], "choice_index": 1}
+    room = cap + event_size(other)
+    for budget, overflows in ((room, False), (room - 1, True)):
+        shared = EventBuffer(
+            StreamLimits(max_event_bytes=cap, max_buffer_bytes=budget)
+        )
+        shared.put(other)
+        try:
+            for delta in deltas[:-1]:
+                shared.put(delta)
+        except StreamError as error:
+            assert overflows and error.code == "buffer_overflow"
+        else:
+            assert not overflows and shared.bytes == budget
+
+
+def test_merge_cost_does_not_grow_with_the_merged_delta(monkeypatch):
+    # A reader that lags lets one delta grow toward the 256 KiB event cap;
+    # re-serializing all of it per token would cost a millisecond or more.
+    import json
+    from types import SimpleNamespace
+
+    from arctic_platform.inference.server import streaming
+
+    serialized = []
+
+    def dumps(*args, **kwargs):
+        text = json.dumps(*args, **kwargs)
+        serialized.append(len(text))
+        return text
+
+    monkeypatch.setattr(streaming, "json", SimpleNamespace(dumps=dumps))
+    buffer = streaming.EventBuffer(StreamLimits(max_buffer_bytes=16 * 1024 * 1024))
+    for token_id in range(200):
+        buffer.put(_logprob_delta(10_000 + token_id))
+    assert sum(serialized) < 2 * buffer.bytes

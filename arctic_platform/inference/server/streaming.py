@@ -365,10 +365,32 @@ def valid_delta_logprobs(event, top_k):
     )
 
 
+def _compact(value):
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
 def event_size(event):
-    return len(
-        json.dumps(event, ensure_ascii=True, separators=(",", ":")).encode("ascii")
-    )
+    # ASCII-escaped, so characters and bytes count the same.
+    return len(_compact(event))
+
+
+def _appended_size(old, added, key):
+    """Bytes that appending ``added[key]`` to ``old[key]`` adds to ``old``.
+
+    Serializes only the appended part. Escaping is per character and list
+    items serialize independently, so a joined string or list grows by the
+    added part without its quotes or brackets, plus a comma between items.
+    """
+    if key not in added:
+        return 0
+    part = _compact(added[key])
+    if key not in old:
+        return len(f',"{key}":') + len(part)
+    if isinstance(added[key], str):
+        return len(part) - 2
+    if not added[key]:
+        return 0
+    return len(part) - 2 + (1 if old[key] else 0)
 
 
 class EventBuffer:
@@ -431,7 +453,10 @@ class EventBuffer:
             merged["logprobs"] = [
                 *entry[0].get("logprobs", ()), *event.get("logprobs", ())
             ]
-        size = event_size(merged)
+        size = entry[1] + sum(
+            _appended_size(entry[0], event, key)
+            for key in ("text", "token_ids", "logprobs")
+        )
         if size > self.limits.max_event_bytes:
             return False
         if self.bytes - entry[1] + size > self.limits.max_buffer_bytes:
