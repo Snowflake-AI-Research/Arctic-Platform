@@ -28,6 +28,7 @@ def arctic_inference_plugin():
     from arctic_platform.inference.vllm.dense_prompt_logprobs import (
         ensure_dense_prompt_logprobs_patch,
     )
+    from arctic_platform.inference.vllm.dflash2_nan_fix import apply_dflash2_nan_fixes
     from arctic_platform.inference.vllm.router_replay import (
         ensure_router_replay_vllm_patches,
     )
@@ -37,6 +38,8 @@ def arctic_inference_plugin():
 
     ensure_router_replay_vllm_patches()
     ensure_xgrammar_stop_mask_fix()
+    # DSS runs with ARCTIC_INFERENCE_ENABLED=0, so the DFlash2 NaN fixes must not wait for the enabled branch.
+    apply_dflash2_nan_fixes()
     # Applied before the ARCTIC_INFERENCE_ENABLED branch: a scoring request must
     # be able to opt into dense prompt logprobs whether or not the rest of the
     # Arctic stack is on.

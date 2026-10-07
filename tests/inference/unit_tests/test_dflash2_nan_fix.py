@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import torch
@@ -11,6 +14,29 @@ from arctic_platform.inference.vllm.dflash2_nan_fix import (
     _sanitize_stale_gdn_metadata,
 )
 
+
+
+def test_disabled_plugin_applies_nan_fixes_idempotently():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+from arctic_platform.inference.vllm.plugin import arctic_inference_plugin
+from arctic_platform.inference.vllm import dflash2_nan_fix as fixes
+
+arctic_inference_plugin()
+arctic_inference_plugin()
+assert fixes.GDNAttentionMetadataBuilder.build is fixes.GDNAttentionMetadataBuilderPatch.build
+assert fixes.SingleTypeKVCacheManager.__init__ is fixes.SingleTypeKVCacheManagerPatch.__init__
+assert fixes.MambaManager.allocate_new_blocks is fixes.MambaManagerPatch.allocate_new_blocks
+assert fixes.KVBlockZeroer.__init__ is fixes.KVBlockZeroerPatch.__init__
+assert "arctic_platform.inference.vllm.patches" not in __import__("sys").modules
+""",
+        ],
+        env={**os.environ, "ARCTIC_INFERENCE_ENABLED": "0"},
+        check=True,
+    )
 
 def test_stale_gdn_rows_are_nulled_and_clamped():
     metadata = SimpleNamespace(
