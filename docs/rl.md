@@ -238,8 +238,10 @@ inputs retain their original per-sign masses; no mask means an exact no-op.
 A sign with no surviving mass remains zero. The CISPO cap still clips ratios,
 independently of advantage scaling; this does not equalize ratio-weighted gradients.
 This version requires exactly one synchronized model call per worker, checked
-before forward. Multi-microbatch support requires a request-wide statistics
-prepass; it cannot be implemented by independently balancing each microbatch.
+before forward. Exact multi-microbatch support requires a request-wide statistics
+prepass. Balancing each microbatch independently is a different objective: it
+restores the request's per-sign mass only when no microbatch loses a whole sign,
+and it concentrates each microbatch's removed mass on that microbatch's survivors.
 The response echoes `ratio_mask_rebalance` and adds
 `ratio_rebalance_{pos,neg}_{post,unrestored}_mass_sum`, reusing the existing
 `ratio_mask_{pos,neg}_{pre,kept}_mass_sum` measurements. Pre and kept
