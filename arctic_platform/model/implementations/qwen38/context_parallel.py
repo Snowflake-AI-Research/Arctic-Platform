@@ -174,7 +174,7 @@ def _adapt_ple_layer(module: nn.Module, process_group) -> None:
     embedding_forward = embedding.forward
     context_length = int(embedding.context_len)
 
-    def embedding_cp_forward(self, input_ids, past_key_values):
+    def embedding_cp_forward(self, input_ids, past_key_values, position_ids=None):
         if past_key_values is not None:
             raise RuntimeError("Qwen3.8 context-parallel PLE is a training-only path")
         previous = _previous_rank_context(
@@ -185,14 +185,20 @@ def _adapt_ple_layer(module: nn.Module, process_group) -> None:
             differentiable=False,
         )
         extended = torch.cat([previous, input_ids], dim=1)
-        return embedding_forward(extended, None)[:, context_length:]
+        if position_ids is not None:
+            previous_positions = _previous_rank_context(
+                position_ids, context_length, process_group=process_group,
+                pad_value=-1, differentiable=False,
+            )
+            position_ids = torch.cat([previous_positions, position_ids], dim=1)
+        return embedding_forward(extended, None, position_ids=position_ids)[:, context_length:]
 
     embedding.forward = types.MethodType(embedding_cp_forward, embedding)
 
     short_conv = module._short_conv
     conv_context_length = int(module.short_conv_state_len)
 
-    def short_conv_cp_forward(self, hidden_states, past_key_values):
+    def short_conv_cp_forward(self, hidden_states, past_key_values, position_ids=None):
         if past_key_values is not None:
             raise RuntimeError("Qwen3.8 context-parallel PLE is a training-only path")
         previous = _previous_rank_context(
@@ -203,7 +209,13 @@ def _adapt_ple_layer(module: nn.Module, process_group) -> None:
             differentiable=True,
         )
         extended = torch.cat([previous, hidden_states], dim=1)
-        return short_conv(extended, None)[:, conv_context_length:]
+        if position_ids is not None:
+            previous_positions = _previous_rank_context(
+                position_ids, conv_context_length, process_group=process_group,
+                pad_value=-1, differentiable=False,
+            )
+            position_ids = torch.cat([previous_positions, position_ids], dim=1)
+        return short_conv(extended, None, position_ids=position_ids)[:, conv_context_length:]
 
     module._short_conv = types.MethodType(short_conv_cp_forward, module)
 
