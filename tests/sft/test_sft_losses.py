@@ -284,6 +284,22 @@ class TestRunSFTPipeline(TestCasePlus):
         self.assertTrue(torch.isfinite(engine.backward_calls[-1][0]))
         self.assertEqual(engine.backward_calls[-1][0].item(), 0.0)
 
+    def test_sft_ce_accepts_mapping_model_output(self):
+        class MappingOutputEngine(_StubEngine):
+            def __call__(self, **kwargs):
+                outputs = super().__call__(**kwargs)
+                return {"loss": outputs.loss, "logits": outputs.logits}
+
+        out = run_sft_pipeline(
+            MappingOutputEngine(),
+            self._batch(),
+            meta={},
+            processing={"loss_fn": "sft_ce"},
+            device="cpu",
+            backward=False,
+        )
+        self.assertIn("loss.tokens", out["metrics"])
+
     def test_sft_ce_path_skips_labels_keeps_logits(self):
         engine = _StubEngine()
         out = run_sft_pipeline(

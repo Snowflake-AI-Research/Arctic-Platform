@@ -143,8 +143,8 @@ def test_ray_forward_backward_runs_loss_callbacks_around_real_split(monkeypatch)
         def __init__(self, index):
             self.index = index
 
-        def remote(self, shard):
-            return _assert_shard(shard, self.index, events)
+        def remote(self, *, batch):
+            return _assert_shard(batch, self.index, events)
 
     server = object.__new__(ray_server.ArcticRLRayServer)
     server.jobs = {1: {"job_type": "training", "sp_size": 1}}
@@ -302,9 +302,9 @@ def test_ray_preserves_batching_state_through_serialized_worker_execution(monkey
     worker = _cpu_worker(_StatefulLossEngine())
 
     class Remote:
-        def remote(self, shard):
-            worker_shard = pickle.loads(pickle.dumps(shard))
-            return worker.forward_backward(worker_shard)
+        def remote(self, *, batch):
+            worker_batch = pickle.loads(pickle.dumps(batch))
+            return worker.forward_backward(worker_batch)
 
     server = object.__new__(ray_server.ArcticRLRayServer)
     server.jobs = {1: {"job_type": "training", "sp_size": 1}}
@@ -344,9 +344,9 @@ def test_ray_grpo_kd_unpads_teacher_groups_for_multiple_rows_per_worker(monkeypa
         def __init__(self, worker):
             self.worker = worker
 
-        def remote(self, shard):
-            received.append(shard)
-            return self.worker.forward_backward(shard)
+        def remote(self, *, batch):
+            received.append(batch)
+            return self.worker.forward_backward(batch)
 
     server = object.__new__(ray_server.ArcticRLRayServer)
     server.jobs = {1: {"job_type": "training", "sp_size": 1}}
@@ -381,8 +381,8 @@ def test_ray_grouped_distillation_reports_global_objective_without_dp_gradient_s
         def __init__(self, worker):
             self.worker = worker
 
-        def remote(self, shard):
-            return self.worker.forward_backward(shard)
+        def remote(self, *, batch):
+            return self.worker.forward_backward(batch)
 
     server = object.__new__(ray_server.ArcticRLRayServer)
     server.jobs = {1: {"job_type": "training", "sp_size": 1}}
@@ -403,3 +403,60 @@ def test_ray_grouped_distillation_reports_global_objective_without_dp_gradient_s
     assert [worker.engine.parameter.grad.item() for worker in workers] == pytest.approx(
         [2 * 3 / 4 * objective_grad.item(), 2 * 1 / 4 * objective_grad.item()]
     )
+
+
+def test_ray_forward_packs_multirow_sequence_parallel_logprobs(monkeypatch):
+    import arctic_platform.common.ray_server as ray_server
+
+    shards = []
+
+    class Remote:
+        def remote(self, batch):
+            shards.append(batch)
+            return batch["batch"]["labels"].float()
+
+    server = object.__new__(ray_server.ArcticRLRayServer)
+    server.jobs = {1: {"job_type": "training", "sp_size": 2}}
+    server.training_workers = [type("Worker", (), {"compute_log_probs": Remote()})() for _ in range(2)]
+    monkeypatch.setattr(ray_server.ray, "get", lambda refs: refs)
+    labels = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
+    request = {
+        "batch": {
+            "input_ids": labels.clone(),
+            "position_ids": torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]),
+            "attention_mask": torch.ones_like(labels),
+            "labels": labels,
+        },
+        "meta": {"labels_are_shifted": True},
+        "processing": {"loss_fn": "sft", "return_logprobs": True},
+    }
+
+    response = asyncio.run(server.forward(1, request))
+
+    assert torch.equal(response["logprobs"], labels.float())
+    assert [tuple(shard["batch"]["labels"].shape) for shard in shards] == [(1, 4), (1, 4)]
+    assert torch.equal(
+        torch.cat([shard["batch"]["position_ids"] for shard in shards], dim=1),
+        request["batch"]["position_ids"].reshape(1, -1),
+    )
+
+
+def test_ray_step_forwards_client_learning_rate(monkeypatch):
+    import arctic_platform.common.ray_server as ray_server
+
+    calls = []
+
+    class Remote:
+        def remote(self, *, learning_rate):
+            calls.append(learning_rate)
+            return {"metrics": {"last_lr": learning_rate}, "batch": {}}
+
+    server = object.__new__(ray_server.ArcticRLRayServer)
+    server.jobs = {1: {"job_type": "training"}}
+    server.training_workers = [type("Worker", (), {"step": Remote()})()]
+    monkeypatch.setattr(ray_server.ray, "get", lambda refs: refs)
+
+    response = asyncio.run(server.step(1, {"learning_rate": 0.01}))
+
+    assert calls == [0.01]
+    assert response["last_lr"] == 0.01

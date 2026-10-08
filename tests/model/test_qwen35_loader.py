@@ -19,6 +19,7 @@ import json
 import sys
 
 import pytest
+import torch
 from torch import nn
 
 from arctic_platform.model import ModelSpec
@@ -105,16 +106,19 @@ def test_liger_fused_cross_entropy_allows_fp32_lm_head():
     assert options.fp32_lm_head is True
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"dtype": "float16"},
-        {"patches": Patches(peft={"peft_type": "Lora"})},
-    ],
-)
-def test_spec_cannot_silently_ignore_settings(kwargs):
+def test_spec_rejects_unsupported_dtype():
     with pytest.raises(ValueError):
-        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", **kwargs)
+        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", dtype="float16")
+
+
+def test_spec_accepts_peft_patch():
+    spec = ModelSpec(
+        model_path_or_name="local",
+        loader="qwen3_5_moe",
+        patches=Patches(peft={"peft_type": "Lora", "target_modules": ["q_proj"]}),
+    )
+
+    assert spec.patches.peft == {"peft_type": "Lora", "target_modules": ["q_proj"]}
 
 
 def test_runtime_groups_are_required():
@@ -181,6 +185,13 @@ def test_runtime_config_is_derived_from_validated_options():
     assert config.ac.offload_config.keep_last_n == 3
 
 
+def test_deepep_combine_casts_fp32_expert_output_to_bf16():
+    from arctic_platform.model.implementations.moe.distributed.deepep import _combine_wire_input
+
+    expert_output = torch.empty(2, 8, dtype=torch.float32)
+    assert _combine_wire_input(expert_output).dtype == torch.bfloat16
+
+
 def test_legacy_qwen_types_are_shared():
     from arctic_platform.model.implementations.moe.layers.moe import MoE
     from arctic_platform.model.implementations.qwen35.models.layers.moe import MoE as LegacyMoE
@@ -203,3 +214,32 @@ from arctic_platform.model.implementations import fp8
 print('Standalone MoE and FP8 imports passed')
 """
         execute_subprocess_async([sys.executable, "-c", code], env=self.get_env(), timeout=60)
+
+
+def test_packed_sequence_indices_preserve_batch_shape():
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _packed_sequence_indices,
+    )
+
+    indices = _packed_sequence_indices(
+        torch.tensor([0, 2, 4, 8], dtype=torch.int32),
+        batch_size=2,
+        seq_len=4,
+        device=torch.device("cpu"),
+    )
+
+    assert indices.tolist() == [[0, 0, 1, 1], [2, 2, 2, 2]]
+
+
+def test_packed_sequence_indices_reject_incomplete_boundaries():
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _packed_sequence_indices,
+    )
+
+    with pytest.raises(ValueError, match=r"describe 3 tokens.*contain 8"):
+        _packed_sequence_indices(
+            torch.tensor([0, 3], dtype=torch.int32),
+            batch_size=2,
+            seq_len=4,
+            device=torch.device("cpu"),
+        )

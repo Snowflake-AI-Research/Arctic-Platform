@@ -118,7 +118,7 @@ def _ray_bin() -> str:
     return str(Path(sys.executable).resolve().parent / "ray")
 
 
-def init_ray_cluster(auto_attach: bool = True) -> None:
+def init_ray_cluster(auto_attach: bool = True, *, include_peers: bool = True) -> None:
     """Attach to an existing Ray cluster or start one (with multinode support).
 
     Args:
@@ -128,6 +128,8 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
             started by an unrelated integration that also uses Ray) are ignored
             and a new cluster is started instead. Set to False to always start a
             fresh cluster.
+        include_peers: Start workers on remote hostfile entries. Disable this when a job fits on the local node so
+            node-local checkpoints remain attached to the workers that created them.
     """
     global _spawned_cluster, _spawned_temp_dir
 
@@ -192,7 +194,7 @@ def init_ray_cluster(auto_attach: bool = True) -> None:
     pr0(f"[init_ray_cluster] ray started with port {ray_port} and dashboard port {dashboard_port}")
 
     # 3. Start workers on peer nodes (if any).
-    peers = _peer_hosts()
+    peers = _peer_hosts() if include_peers else []
     pr0(f"[init_ray_cluster] peers: {peers}")
     gcs = read_ray_address(_spawned_temp_dir)
     if peers:

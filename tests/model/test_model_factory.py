@@ -352,6 +352,56 @@ class TestFromDsWorkerConfig:
         assert z.logits_compute_from_fp32_inputs == defaults.logits_compute_from_fp32_inputs
         assert z.logits_compute_in_fp32 == defaults.logits_compute_in_fp32
 
+    def test_correctness_dense_options_map_to_native_patches(self):
+        spec = ModelSpec.from_ds_worker_config(
+            "x",
+            {
+                "attn_implementation": "flash_attention_4",
+                "activation_checkpointing": True,
+                "sp_size": 4,
+                "fused_lm_head_token_chunk_size": 4096,
+                "fused_lm_head_vocab_chunk_size": 8192,
+                "peft_config": {"peft_type": "LORA", "r": 32},
+            },
+        )
+
+        assert spec.parallelism.sequence_parallel == 4
+        assert spec.patches.gradient_checkpointing is True
+        assert spec.patches.lm_head.token_chunk_size == 4096
+        assert spec.patches.lm_head.vocab_chunk_size == 8192
+        assert spec.patches.peft["r"] == 32
+
+    def test_correctness_moe_options_map_to_loader_and_parallelism(self):
+        spec = ModelSpec.from_ds_worker_config(
+            "x",
+            {
+                "attn_implementation": "flash_attention_3",
+                "ep_size": 8,
+                "sp_size": 4,
+                "peft_config": {"peft_type": "LORA", "r": 32, "target_modules": ["q_proj"]},
+                "ac_config": {"mode": "full", "freq": 1},
+                "prime_rl": {
+                    "fused_cross_entropy": False,
+                    "fused_lm_head_token_chunk_size": 8192,
+                },
+                "debug": {"gradient_norms_per_param": True, "full_determinism": True},
+            },
+        )
+
+        assert spec.loader == "qwen3_5_moe"
+        assert spec.parallelism.expert_parallel == 8
+        assert spec.parallelism.sequence_parallel == 4
+        assert spec.loader_options["fused_cross_entropy"] is False
+        assert spec.loader_options["fused_lm_head_token_chunk_size"] == 8192
+        assert spec.loader_options["ac_config"]["mode"] == "full"
+        assert spec.loader_options["debug"] == {
+            "random_init": False,
+            "num_layers": None,
+            "gradient_sample_max_numel": 0,
+            "full_determinism": True,
+        }
+        assert spec.patches.peft == {"peft_type": "LORA", "r": 32, "target_modules": ["q_proj"]}
+
 
 class TestLigerPatch:
     def test_architecture_owns_rotary_selection(self, monkeypatch):
@@ -588,3 +638,52 @@ class TestZorroAndGcPatches:
         model.config = types.SimpleNamespace(model_type="llama")
         with pytest.raises(ValueError, match="Unsupported model_type=llama"):
             apply_zorro_train(model, _ctx(zorro_train=ZorroTrainPatch(response_len=1024, rollout_n=8, world_size=1)))
+
+
+class TestFlashAttentionDeterminismPolicy:
+    def test_best_effort_withdraws_only_attention_backward(self, monkeypatch):
+        from arctic_platform.model.implementations.debug import determinism
+
+        monkeypatch.setattr(determinism, "flash_attention_determinism_requested", lambda: True)
+        monkeypatch.setattr(
+            determinism,
+            "flash_attention_deterministic_backward_refusal",
+            lambda _fn, _head_dim: "unsupported",
+        )
+
+        with pytest.warns(RuntimeWarning, match="best-effort determinism"):
+            assert not determinism.resolve_flash_attention_determinism(
+                object(), 256, "flash_attention_3", must_comply=False
+            )
+
+    def test_compliance_still_rejects_unsupported_backward(self, monkeypatch):
+        from arctic_platform.model.implementations.debug import determinism
+
+        monkeypatch.setattr(determinism, "flash_attention_determinism_requested", lambda: True)
+        monkeypatch.setattr(
+            determinism,
+            "flash_attention_deterministic_backward_refusal",
+            lambda _fn, _head_dim: "unsupported",
+        )
+
+        with pytest.raises(RuntimeError, match="refuses one at head_dim=256"):
+            determinism.resolve_flash_attention_determinism(object(), 256, "flash_attention_3")
+
+    def test_determinism_worker_env_propagates_best_effort_attention(self):
+        from arctic_platform.model.implementations.debug import determinism
+
+        env = determinism.determinism_worker_env(
+            {"debug": {"full_determinism": True, "full_determinism_must_comply": False}},
+            42,
+        )
+
+        assert env[determinism.FLASH_ATTENTION_DETERMINISTIC_ENV] == "1"
+        assert env[determinism.FLASH_ATTENTION_DETERMINISTIC_MUST_COMPLY_ENV] == "0"
+
+    def test_must_comply_defaults_true_and_accepts_explicit_false(self, monkeypatch):
+        from arctic_platform.model.implementations.debug import determinism
+
+        monkeypatch.delenv(determinism.FLASH_ATTENTION_DETERMINISTIC_MUST_COMPLY_ENV, raising=False)
+        assert determinism.flash_attention_determinism_must_comply()
+        monkeypatch.setenv(determinism.FLASH_ATTENTION_DETERMINISTIC_MUST_COMPLY_ENV, "0")
+        assert not determinism.flash_attention_determinism_must_comply()

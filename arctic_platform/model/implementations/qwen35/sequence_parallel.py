@@ -128,6 +128,7 @@ def _make_backbone_sp_forward(original_forward, sp_group, full_attn_modules, lin
     return forward
 
 
+
 def apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None:
     """Install Ulysses SP on ``model`` in place. Must run before activation-checkpoint wrapping (so
     ``self_attn`` and ``linear_attn`` submodules are still directly addressable)."""

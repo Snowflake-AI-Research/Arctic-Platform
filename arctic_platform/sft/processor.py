@@ -60,8 +60,8 @@ def _require_labels(batch: dict, who: str) -> torch.Tensor:
 def count_valid_target_tokens(batch: Any) -> int | None:
     """Valid next-token targets after HF's ``labels[:, 1:]`` / ``-100`` shift.
 
-    ``batch`` is one microbatch dict or a gas list of them. ``None`` means no
-    labels (skip global-token injection); ``0`` means all positions masked.
+    ``batch`` is one microbatch dict or a gas list of them. ``None`` means no labels (skip global-token injection);
+    ``0`` means all positions masked.
     """
     if isinstance(batch, list):
         mbs = [mb for mb in batch if isinstance(mb, dict) and mb.get("labels") is not None]
@@ -291,6 +291,13 @@ def _build_sft_model_kwargs(batch: dict, meta: dict, labels: torch.Tensor, need_
     return model_kwargs
 
 
+def _model_output_field(outputs: Any, name: str) -> Any:
+    """Read one output from either a Hugging Face result object or a model-owned mapping."""
+    if isinstance(outputs, dict):
+        return outputs.get(name)
+    return getattr(outputs, name, None)
+
+
 def run_sft_pipeline(
     engine,
     batch: dict,
@@ -324,7 +331,6 @@ def run_sft_pipeline(
         )
     peak_mem_gib = float(config.get("logits_optimization_peak_mem_size_in_gib", 4) or 4)
     hidden_ce = loss_fn_name == "sft_ce" and logits_opt in ("compute", "memory")
-
     # ``need_logits`` = keep the full logits tensor for the loss (only the classic
     # sft_ce path). ``omit_labels`` also drops HF's own CE when we compute it.
     need_logits = loss_fn_name in LOGIT_LOSS_FNS and not hidden_ce
@@ -362,7 +368,7 @@ def run_sft_pipeline(
         # Tiled / chunked CE straight from hidden states — the full logits are
         # never materialized (memory) or never fully softmaxed at once (compute).
         hf_model = getattr(engine, "module", engine)
-        hidden = outputs.hidden_states[-1]
+        hidden = _model_output_field(outputs, "hidden_states")[-1]
         with sft_profile.timed("loss"):
             ce_sum, n_valid = sft_ce_sum_from_hidden(
                 hf_model, hidden, labels.to(hidden.device), mode=logits_opt, peak_mem_gib=peak_mem_gib
@@ -371,11 +377,12 @@ def run_sft_pipeline(
         metrics = _paired_loss_metrics(float(ce_sum.detach().float().item()), n_valid)
     else:
         model_outputs: dict[str, Any] = {}
-        if hasattr(outputs, "loss") and outputs.loss is not None:
-            model_outputs["loss"] = outputs.loss
+        output_loss = _model_output_field(outputs, "loss")
+        if output_loss is not None:
+            model_outputs["loss"] = output_loss
         if need_logits:
             # Consumed locally by the loss_fn only; never placed on the wire response.
-            model_outputs["logits"] = outputs.logits
+            model_outputs["logits"] = _model_output_field(outputs, "logits")
 
         fn = _resolve_fn(LOSS_FNS, loss_fn_name)
         loss, metrics = fn(model_outputs, batch, meta, config, device)

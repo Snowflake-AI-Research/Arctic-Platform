@@ -13,6 +13,7 @@ from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, logging
 
+from arctic_platform.model.implementations.debug.determinism import flash_attention_determinism_must_comply
 from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
 from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
@@ -195,6 +196,24 @@ def torch_chunk_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+def _packed_sequence_indices(
+    cu_seqlens: torch.LongTensor, *, batch_size: int, seq_len: int, device: torch.device
+) -> torch.LongTensor:
+    """Expand packed boundaries into the batch-shaped segment indices required by causal-conv1d."""
+    segment_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    seq_idx = torch.repeat_interleave(
+        torch.arange(segment_lengths.numel(), dtype=torch.int32, device=device),
+        segment_lengths,
+    )
+    expected_tokens = batch_size * seq_len
+    if seq_idx.numel() != expected_tokens:
+        raise ValueError(
+            f"cu_seqlens describe {seq_idx.numel()} tokens, but hidden states contain {expected_tokens} "
+            f"({batch_size} x {seq_len})"
+        )
+    return seq_idx.reshape(batch_size, seq_len)
+
+
 class Qwen3_5MoeGatedDeltaNet(nn.Module):
     """GatedDeltaNet linear attention with Conv1d, beta/gamma gates, and chunk delta rule."""
 
@@ -251,6 +270,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.LongTensor | None = None,
     ) -> torch.Tensor:
+        output_batch_size, output_seq_len, hidden_size = hidden_states.shape
+        if cu_seqlens is not None and output_batch_size > 1 and getattr(self, "cp_group", None) is None:
+            hidden_states = hidden_states.reshape(1, output_batch_size * output_seq_len, hidden_size)
         batch_size, seq_len, _ = hidden_states.shape
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
@@ -298,11 +320,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             if self._causal_conv1d_fn is not None:
                 seq_idx = None
                 if cu_seqlens is not None:
-                    seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-                    seq_idx = torch.repeat_interleave(
-                        torch.arange(seg_lens.numel(), dtype=torch.int32, device=hidden_states.device),
-                        seg_lens,
-                    ).unsqueeze(0)
+                    seq_idx = _packed_sequence_indices(
+                        cu_seqlens, batch_size=batch_size, seq_len=seq_len, device=hidden_states.device
+                    )
                 mixed_qkv = self._causal_conv1d_fn(
                     x=mixed_qkv,
                     weight=self.conv1d.weight.squeeze(1),
@@ -349,7 +369,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
-        return self.out_proj(core_attn_out)
+        output = self.out_proj(core_attn_out)
+        return output.reshape(output_batch_size, output_seq_len, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +513,10 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
         # read here. Resolving it at construction means a request the installed kernel cannot honour at this head
         # dimension refuses before any training runs.
         self._deterministic = resolve_flash_attention_determinism(
-            self.func, config.head_dim, f"flash_attention_{flash_attn_version}"
+            self.func,
+            config.head_dim,
+            f"flash_attention_{flash_attn_version}",
+            must_comply=flash_attention_determinism_must_comply(),
         )
 
     def _compute_attention(self, q, k, v, cu_seqlens, max_seqlen):
@@ -796,6 +820,7 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        output_batch_size, output_seq_len = inputs_embeds.shape[:2]
         if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
             flat_position_ids = position_ids.view(-1)
             # Segment lengths from boundary indices (where position_ids resets to 0), not position values, so
@@ -814,6 +839,9 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
                 [segment_lengths.new_zeros(1), segment_lengths.cumsum(dim=0, dtype=torch.int32)]
             )
             torch._dynamo.mark_dynamic(cu_seqlens, 0)
+            if output_batch_size > 1:
+                inputs_embeds = inputs_embeds.reshape(1, output_batch_size * output_seq_len, -1)
+                position_ids = position_ids.reshape(1, output_batch_size * output_seq_len)
         else:
             max_seqlen = None
             cu_seqlens = None
@@ -832,6 +860,7 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             )
 
         hidden_states = self.norm(hidden_states)
+        hidden_states = hidden_states.reshape(output_batch_size, output_seq_len, -1)
         return MoeModelOutputWithPast(last_hidden_state=hidden_states)
 
 
@@ -989,7 +1018,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
     @classmethod
     def is_prime_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
-        return any("mlp.experts.w1" in name for name in state_dict)
+        prime_names = ("mlp.router.gate.weight", "mlp.experts.w1", ".shared_expert.w1.weight")
+        return any(any(prime_name in name for prime_name in prime_names) for name in state_dict)
 
     @classmethod
     def convert_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:

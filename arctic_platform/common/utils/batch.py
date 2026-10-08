@@ -151,6 +151,27 @@ def unpack_batch(batch: dict) -> tuple:
     return {}, batch_data, meta_data, processing
 
 
+def flatten_sequence_rows(batch: dict) -> tuple[dict, tuple[int, int]]:
+    """Flatten a padded row batch into the single packed row required by sequence parallelism."""
+    _, batch_data, meta_data, processing = unpack_batch(batch)
+    input_ids = batch_data.get("input_ids")
+    if not torch.is_tensor(input_ids) or input_ids.ndim != 2:
+        raise ValueError("sequence-row flattening requires 2D input_ids")
+    rows, sequence_length = (int(dim) for dim in input_ids.shape)
+    flattened = {}
+    for key, value in batch_data.items():
+        if torch.is_tensor(value) and value.ndim >= 2 and tuple(value.shape[:2]) == (rows, sequence_length):
+            flattened[key] = value.reshape(1, rows * sequence_length, *value.shape[2:])
+        elif torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == rows:
+            raise ValueError(
+                f"cannot flatten batch field {key!r} with shape {tuple(value.shape)} alongside "
+                f"{rows}x{sequence_length} input_ids"
+            )
+        else:
+            flattened[key] = value
+    return {"batch": flattened, "meta": meta_data, "processing": processing}, (rows, sequence_length)
+
+
 def _split_value(val, num_chunks: int):
     """Split a tensor or list along the batch (first) dimension."""
     if isinstance(val, torch.Tensor):
@@ -203,11 +224,10 @@ def reconstruct_position_ids_(batch_data: dict) -> None:
 def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
     """Split a batch across workers and stamp the DP loss scale.
 
-    The cutter produces ``num_workers`` disjoint row shards and stamps
-    ``dp_size=num_workers``. Sequence-parallel replication (one logical DP
-    shard copied across an SP group, then token-sharded) is not implemented,
-    so ``sp_size > 1`` is rejected rather than silently mixing samples.
-    ``zip(workers, shards)`` stays 1:1.
+    The cutter first produces ``num_workers / sp_size`` disjoint row shards,
+    then splits each row shard contiguously across the sequence dimension for
+    its SP ranks. ``zip(workers, shards)`` stays 1:1 and ``dp_size`` records
+    the number of logical data-parallel replicas.
 
     Supports two wire shapes for ``batch["batch"]``:
       * **dict** of tensors (legacy / demos): one concatenated mini-batch, later
@@ -221,14 +241,27 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
     reorder_indices = None
     meta_data = dict(meta_data)
     sp_size = resolve_parallelism_degree(sp_size, "sp_size")
-    if sp_size > 1:
-        raise ValueError(
-            "sequence-parallel data-plane is not implemented: _split_batch still "
-            "cuts one disjoint shard per worker. Refuse sp_size>1 until shards "
-            f"are replicated across an SP group. Got sp_size={sp_size}."
-        )
-    dp_sp_world_size(num_workers, sp_size)
-    meta_data.update(dp_size=num_workers)
+    dp_size = dp_sp_world_size(num_workers, sp_size)
+    meta_data.update(dp_size=dp_size)
+
+    def split_sequence_parallel(dp_shard: dict) -> list[dict]:
+        per_rank = [dict() for _ in range(sp_size)]
+        for key, value in dp_shard.items():
+            if torch.is_tensor(value) and value.ndim >= 2:
+                sequence_length = value.shape[1]
+                padded_length = ((sequence_length + sp_size - 1) // sp_size) * sp_size
+                if padded_length != sequence_length:
+                    pad_shape = list(value.shape)
+                    pad_shape[1] = padded_length - sequence_length
+                    pad_value = -100 if key == "labels" else 0
+                    padding = torch.full(pad_shape, pad_value, dtype=value.dtype, device=value.device)
+                    value = torch.cat((value, padding), dim=1)
+                pieces = torch.tensor_split(value, sp_size, dim=1)
+            else:
+                pieces = [value] * sp_size
+            for sp_rank, piece in enumerate(pieces):
+                per_rank[sp_rank][key] = piece
+        return per_rank
 
     if isinstance(batch_data, list):
         if not batch_data:
@@ -240,10 +273,10 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
             mb = dict(mb)  # shallow copy before optional in-place reconstruct
             if meta_data.get("drop_position_ids", False) and "position_ids" not in mb:
                 reconstruct_position_ids_(mb)
-            mb_shards = split_dict(mb, num_workers)
-            for i, shard in enumerate(mb_shards):
-                per_worker[i].append(shard)
-        shards = [dict(batch=per_worker[i], meta=meta_data, processing=processing) for i in range(num_workers)]
+            for dp_rank, dp_shard in enumerate(split_dict(mb, dp_size)):
+                for sp_rank, shard in enumerate(split_sequence_parallel(dp_shard)):
+                    per_worker[dp_rank * sp_size + sp_rank].append(shard)
+        shards = [dict(batch=per_worker[i], meta=dict(meta_data), processing=processing) for i in range(num_workers)]
         return shards, reorder_indices
 
     # --- legacy concatenated-tensor path ---
@@ -267,15 +300,35 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
             max_group_length_threshold=max_group_length_threshold,
         )
 
-    batch_data_shards = split_dict(batch_data, num_workers)
     shards = []
-    for i in range(num_workers):
-        shard = dict(batch=batch_data_shards[i], meta=meta_data, processing=processing)
-        shards.append(shard)
+    for dp_shard in split_dict(batch_data, dp_size):
+        for sp_shard in split_sequence_parallel(dp_shard):
+            shards.append(dict(batch=sp_shard, meta=dict(meta_data), processing=processing))
     return shards, reorder_indices
 
 
 ray_split_batch = _split_batch
+
+
+def merge_sp_dict_shards(shards_list: list[dict], sp_size: int) -> dict:
+    """Reassemble contiguous SP token shards, then concatenate DP row shards."""
+    sp_size = resolve_parallelism_degree(sp_size, "sp_size")
+    dp_size = dp_sp_world_size(len(shards_list), sp_size)
+    if sp_size == 1:
+        return merge_dict_shards(shards_list)
+
+    dp_shards = []
+    for dp_rank in range(dp_size):
+        group = shards_list[dp_rank * sp_size : (dp_rank + 1) * sp_size]
+        merged = {}
+        for key in group[0]:
+            values = [shard[key] for shard in group]
+            if all(torch.is_tensor(value) for value in values) and values[0].ndim >= 2:
+                merged[key] = torch.cat(values, dim=1)
+            else:
+                merged[key] = values[0]
+        dp_shards.append(merged)
+    return merge_dict_shards(dp_shards)
 
 
 def dump_dict_payload(payload: dict, tag: str):

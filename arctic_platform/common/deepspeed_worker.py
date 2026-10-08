@@ -48,6 +48,304 @@ from arctic_platform.model import build_model
 
 logger = logging.getLogger(__name__)
 
+_COMPOSITE_NAME_PREFIXES = (("model.", "model.language_model."), ("", "language_model."))
+_HF_CONFIG_FILES = ("config.json", "generation_config.json")
+_HF_INDEX_FILE = "model.safetensors.index.json"
+_DTYPE_BYTES = {
+    "F64": 8,
+    "I64": 8,
+    "U64": 8,
+    "F32": 4,
+    "I32": 4,
+    "U32": 4,
+    "F16": 2,
+    "BF16": 2,
+    "I16": 2,
+    "U16": 2,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "I8": 1,
+    "U8": 1,
+    "BOOL": 1,
+}
+
+
+def _safetensors_names(model_dir: str) -> dict[str, str]:
+    """Map tensor names to shard names for a model directory."""
+    from safetensors import safe_open
+
+    names: dict[str, str] = {}
+    for shard in sorted(os.listdir(model_dir)):
+        if shard.endswith(".safetensors"):
+            with safe_open(os.path.join(model_dir, shard), framework="pt") as handle:
+                names.update({name: shard for name in handle.keys()})
+    return names
+
+
+def _canonical_hf_export_name(name: str) -> str:
+    """Remove activation-checkpoint wrapper segments from a Hugging Face parameter name."""
+    return name.replace("._checkpoint_wrapped_module", "")
+
+
+def _composite_renames(names, checkpoint_names: set[str]) -> dict[str, str]:
+    """Map text-only trained names onto a composite source checkpoint."""
+    checkpoint_names = {_canonical_hf_export_name(name) for name in checkpoint_names}
+    renames: dict[str, str] = {}
+    unmapped: list[str] = []
+    for name in names:
+        if name in checkpoint_names:
+            continue
+        for old, new in _COMPOSITE_NAME_PREFIXES:
+            if name.startswith(old) and new + name[len(old) :] in checkpoint_names:
+                renames[name] = new + name[len(old) :]
+                break
+        else:
+            unmapped.append(name)
+    if not renames:
+        return {}
+    unmapped = [name for name in unmapped if name != "lm_head.weight"]
+    if unmapped:
+        examples = ", ".join(unmapped[:10])
+        raise RuntimeError(
+            f"checkpoint name translation mapped {len(renames)} name(s) but not {len(unmapped)} (e.g. {examples})"
+        )
+    return renames
+
+
+def _hf_config_class_name(model_type: object) -> str | None:
+    """Return the Hugging Face config class name registered for ``model_type``."""
+    if not isinstance(model_type, str) or not model_type:
+        return None
+    from transformers import AutoConfig
+
+    try:
+        return type(AutoConfig.for_model(model_type)).__name__
+    except (AttributeError, KeyError, OSError, ValueError):
+        return None
+
+
+def _read_hf_config(model_dir: str) -> dict | None:
+    import json
+
+    path = os.path.join(model_dir, _HF_CONFIG_FILES[0])
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def restore_source_weight_layout(source_model_dir: str, out_dir: str) -> bool:
+    """Complete a text-only weights export into its composite source checkpoint layout."""
+    import json
+
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    source_config = _read_hf_config(source_model_dir)
+    saved_config = _read_hf_config(out_dir)
+    if source_config is None or saved_config is None:
+        return False
+    if "text_config" not in source_config:
+        return False
+    source = _safetensors_names(source_model_dir)
+    saved = _safetensors_names(out_dir)
+    if not source or not saved:
+        return False
+    saved_architectures = saved_config.get("architectures") or []
+    saved_is_text_model = "text_config" not in saved_config or any(
+        str(architecture).endswith("ForCausalLM") for architecture in saved_architectures
+    )
+    source_class = _hf_config_class_name(source_config.get("model_type"))
+    saved_class = _hf_config_class_name(saved_config.get("model_type"))
+    nested_text = saved_config.get("text_config")
+    nested_class = _hf_config_class_name(nested_text.get("model_type")) if isinstance(nested_text, dict) else None
+    # vLLM Qwen3_5ProcessingInfo.get_hf_config accepts Qwen3_5Config and rejects Qwen3_5TextConfig.
+    engine_requires_qwen3_5_config = source_class == "Qwen3_5Config" and (
+        saved_class == "Qwen3_5TextConfig" or (saved_class == "Qwen3_5Config" and nested_class == "Qwen3_5TextConfig")
+    )
+    if engine_requires_qwen3_5_config:
+        saved_is_text_model = False
+    if saved_is_text_model:
+        source_layout: set[str] = set()
+        saved_layout = {name for name in saved if not name.startswith(("model.visual.", "visual."))}
+        renames = {}
+        for name in saved_layout:
+            if name.startswith("model.language_model."):
+                renames[name] = "model." + name.removeprefix("model.language_model.")
+            elif name.startswith("language_model."):
+                renames[name] = name.removeprefix("language_model.")
+    else:
+        source_layout = set(source)
+        saved_layout = {
+            name
+            for name in saved
+            if name in source_layout
+            or any(
+                name.startswith(old) and new + name[len(old) :] in source_layout
+                for old, new in _COMPOSITE_NAME_PREFIXES
+            )
+            or name == "lm_head.weight"
+        }
+        renames = _composite_renames(saved_layout, source_layout)
+    excluded = set(saved) - saved_layout
+    weight_map: dict[str, str] = {}
+    total_size = 0
+
+    def account(handle, keys, shard_name: str) -> None:
+        nonlocal total_size
+        for key in keys:
+            weight_map[renames.get(key, key)] = shard_name
+            sliced = handle.get_slice(key)
+            numel = 1
+            for dimension in sliced.get_shape():
+                numel *= dimension
+            total_size += numel * _DTYPE_BYTES[sliced.get_dtype()]
+
+    for shard in sorted(set(saved.values())):
+        path = os.path.join(out_dir, shard)
+        target = "model-00001-of-00001.safetensors" if shard == "model.safetensors" else shard
+        with safe_open(path, framework="pt") as handle:
+            keys = [key for key in handle.keys() if key not in excluded]
+            account(handle, keys, target)
+            tensors = (
+                {renames.get(key, key): handle.get_tensor(key) for key in keys}
+                if any(key in renames or key in excluded for key in handle.keys())
+                else None
+            )
+        if tensors is not None:
+            os.remove(path)
+            if tensors:
+                save_file(tensors, os.path.join(out_dir, target), metadata={"format": "pt"})
+        elif target != shard:
+            os.replace(path, os.path.join(out_dir, target))
+
+    source_only = sorted(
+        name for name in source_layout if name not in weight_map and _canonical_hf_export_name(name) not in weight_map
+    )
+    if source_only:
+        extra = "model-source-only.safetensors"
+        tensors = {}
+        by_shard: dict[str, list[str]] = {}
+        for name in source_only:
+            by_shard.setdefault(source[name], []).append(name)
+        for shard, names in sorted(by_shard.items()):
+            with safe_open(os.path.join(source_model_dir, shard), framework="pt") as handle:
+                tensors.update({name: handle.get_tensor(name) for name in names})
+                account(handle, names, extra)
+        save_file(tensors, os.path.join(out_dir, extra), metadata={"format": "pt"})
+    with open(os.path.join(out_dir, _HF_INDEX_FILE), "w", encoding="utf-8") as handle:
+        json.dump({"metadata": {"total_size": total_size}, "weight_map": dict(sorted(weight_map.items()))}, handle)
+    config_path = os.path.join(out_dir, _HF_CONFIG_FILES[0])
+    if saved_class == "Qwen3_5TextConfig" and source_class == "Qwen3_5Config":
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(source_config, handle)
+    elif saved_is_text_model and isinstance(nested_text, dict):
+        text_config = dict(nested_text)
+        text_config["architectures"] = saved_architectures
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(text_config, handle)
+    logger.info(
+        "weights-only save: completed source layout (%d renamed, %d excluded, %d copied from %s)",
+        len(renames),
+        len(excluded),
+        len(source_only),
+        source_model_dir,
+    )
+    return True
+
+
+def replace_exported_qwen3_5_text_config(source_model_dir: str | None, out_dir: str) -> bool:
+    """Rewrite an exported ``Qwen3_5TextConfig`` to ``Qwen3_5Config``.
+
+    ``AutoModelForCausalLM`` maps model type ``qwen3_5`` to ``Qwen3_5ForCausalLM``, and that class
+    serializes ``Qwen3_5TextConfig``. The serving engine resolves ``Qwen3_5ForCausalLM`` to
+    ``Qwen3_5ForConditionalGeneration`` and accepts only ``Qwen3_5Config``. The saved text fields stay the
+    exported text config; vision fields come from the source checkpoint when that checkpoint is ``qwen3_5``.
+    """
+    import json
+
+    from transformers import Qwen3_5Config
+
+    saved = _read_hf_config(out_dir)
+    if not isinstance(saved, dict) or saved.get("model_type") != "qwen3_5_text":
+        return False
+    source = _read_hf_config(source_model_dir) if source_model_dir else None
+    text_config = dict(saved)
+    architectures = text_config.pop("architectures", None)
+    kwargs: dict = {"text_config": text_config}
+    if isinstance(source, dict) and source.get("model_type") == "qwen3_5":
+        for key in (
+            "vision_config",
+            "image_token_id",
+            "video_token_id",
+            "vision_start_token_id",
+            "vision_end_token_id",
+            "tie_word_embeddings",
+        ):
+            if key in source:
+                kwargs[key] = source[key]
+    exported = Qwen3_5Config(**kwargs).to_dict()
+    if architectures:
+        exported["architectures"] = architectures
+    with open(os.path.join(out_dir, _HF_CONFIG_FILES[0]), "w", encoding="utf-8") as handle:
+        json.dump(exported, handle)
+    return True
+
+
+def _copy_source_sidecars(source_model_dir: str, out_dir: str) -> None:
+    """Copy non-weight source assets without replacing the exported model config."""
+    import shutil
+
+    for name in sorted(os.listdir(source_model_dir)):
+        source = os.path.join(source_model_dir, name)
+        target = os.path.join(out_dir, name)
+        if not os.path.isfile(source):
+            continue
+        lower = name.lower()
+        if lower.endswith((".safetensors", ".bin", ".pt", ".pth", ".index.json")):
+            continue
+        if name == "config.json" and os.path.isfile(target):
+            continue
+        shutil.copyfile(source, target)
+
+
+def _canonical_hf_export_state_dict(model, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Convert internal weights and remove activation-checkpoint wrappers before Hugging Face serialization."""
+    state_dict = {_canonical_hf_export_name(name): tensor for name, tensor in state_dict.items()}
+    is_prime_state_dict = getattr(model, "is_prime_state_dict", None)
+    if is_prime_state_dict is not None and is_prime_state_dict(state_dict):
+        state_dict = model.convert_to_hf(state_dict)
+    return state_dict
+
+
+def _gather_live_hf_export_state_dict(model, rank: int) -> dict[str, torch.Tensor] | None:
+    """Gather expert-parallel shards and return the complete live state on rank zero."""
+    import deepspeed.utils.groups as ds_groups
+
+    state_dict = {} if rank == 0 else None
+    for name, parameter in model.named_parameters():
+        group_name = getattr(parameter, "group_name", None)
+        if group_name is not None and getattr(parameter, "allreduce", True) is False:
+            group = ds_groups._get_expert_parallel_group(group_name)
+            local = parameter.detach().contiguous()
+            shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
+            dist.all_gather(shards, local, group=group)
+            if rank == 0:
+                state_dict[name] = torch.cat(shards, dim=0).cpu()
+        elif rank == 0:
+            state_dict[name] = parameter.detach().cpu()
+    return state_dict
+
+
+def _model_full_hf_export_state_dict(model, rank: int) -> dict[str, torch.Tensor] | None:
+    """Collect a model-provided full Hugging Face state dict on rank zero."""
+    iterator = getattr(model, "_iter_full_hf_weights", None)
+    if iterator is None:
+        return None
+    state_dict = dict(iterator())
+    return state_dict if rank == 0 else None
+
+
 # ---------------------------------------------------------------------------
 # Request / response models (mirrors dss-platform sftp_server)
 # ---------------------------------------------------------------------------
@@ -79,6 +377,124 @@ def make_model_gradient_checkpointing_compatible(model):
 # ---------------------------------------------------------------------------
 # DeepSpeed training actor
 # ---------------------------------------------------------------------------
+
+
+def _worker_debug_config(job_config: dict) -> dict:
+    """Resolve debug settings from native and legacy on-prem job payloads."""
+    training_debug = (job_config.get("training_config") or {}).get("debug") or {}
+    worker_debug = (job_config.get("ds_worker_config") or {}).get("debug") or {}
+    debug = {**training_debug, **worker_debug}
+    if "full_determinism" in job_config:
+        debug["full_determinism"] = job_config["full_determinism"]
+    return debug
+
+
+def _trainable_peft_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Materialize the trainable adapter state without traversing the frozen base model."""
+    return {name: parameter.detach().cpu() for name, parameter in model.named_parameters() if parameter.requires_grad}
+
+
+def _sync_initial_peft_adapter(
+    model: torch.nn.Module,
+    adapter_dir: str,
+    trainable_state: dict[str, torch.Tensor] | None = None,
+) -> bool:
+    """Restore a reviewed PEFT initialization, or serialize the live initialization when none exists."""
+    if not getattr(model, "peft_config", None):
+        return False
+    adapter_path = os.path.join(adapter_dir, "adapter_model.safetensors")
+    config_path = os.path.join(adapter_dir, "adapter_config.json")
+    if os.path.isfile(adapter_path) and os.path.isfile(config_path):
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file
+
+        set_peft_model_state_dict(model, load_file(adapter_path), adapter_name="default")
+        return True
+    state_dict = trainable_state if trainable_state is not None else _trainable_peft_state_dict(model)
+    model.save_pretrained(adapter_dir, safe_serialization=True, state_dict=state_dict)
+    if not os.path.isfile(adapter_path) or not os.path.isfile(config_path):
+        raise RuntimeError(f"live PEFT adapter export produced an incomplete pack at {adapter_dir}")
+    return True
+
+
+def _synchronize_initial_peft_adapter(model: torch.nn.Module, adapter_dir: str, rank: int) -> None:
+    """Materialize adapter tensors on every rank, then let rank zero serialize the reviewed pack."""
+    adapter_path = os.path.join(adapter_dir, "adapter_model.safetensors")
+    config_path = os.path.join(adapter_dir, "adapter_config.json")
+    adapter_exists = os.path.isfile(adapter_path) and os.path.isfile(config_path)
+    trainable_state = None if adapter_exists else _trainable_peft_state_dict(model)
+    if rank == 0:
+        _sync_initial_peft_adapter(model, adapter_dir, trainable_state)
+    dist.barrier()
+    if rank != 0:
+        _sync_initial_peft_adapter(model, adapter_dir)
+    dist.barrier()
+
+
+def _setup_model_parallel_groups(spec: ModelSpec) -> dict[str, Any]:
+    """Create the runtime process groups consumed by the native model loaders.
+
+    The correctness configs use either no sequence parallelism or full-world sequence parallelism. Expert groups
+    remain node-local contiguous blocks; ranks at the same position in each block form the expert-data-parallel
+    replica groups that DeepSpeed uses for gradient reduction and optimizer sharding.
+    """
+    import deepspeed.utils.groups as ds_groups
+    from deepspeed.runtime.sequence_parallel import parallel_state_sp as sp_mpu
+
+    ep_size = spec.parallelism.expert_parallel
+    sp_size = spec.parallelism.sequence_parallel
+    world_size = dist.get_world_size()
+    if world_size % ep_size:
+        raise ValueError(f"world_size={world_size} must be divisible by expert_parallel={ep_size}")
+
+    if sp_size == 1:
+        if ep_size > 1:
+            ds_groups._create_expert_and_data_parallel(ep_size)
+        return {
+            "ep_group": ds_groups._get_expert_parallel_group(f"ep_size_{ep_size}") if ep_size > 1 else None,
+            "sp_group": None,
+            "mpu": None,
+        }
+
+    if sp_size != world_size:
+        raise ValueError(
+            f"the native worker supports sequence_parallel=1 or the full world ({world_size}), got {sp_size}"
+        )
+    sp_mpu.initialize_sequence_parallel(sp_size)
+
+    ep_name = f"ep_size_{ep_size}"
+    rank = dist.get_rank()
+    if ep_size > 1:
+        for start in range(0, world_size, ep_size):
+            ranks = list(range(start, start + ep_size))
+            group = dist.new_group(ranks)
+            if rank in ranks:
+                ds_groups._EXPERT_PARALLEL_GROUP[ep_name] = group
+                ds_groups._EXPERT_PARALLEL_GROUP_RANKS[ep_name] = ranks
+        for offset in range(ep_size):
+            ranks = list(range(offset, world_size, ep_size))
+            group = dist.new_group(ranks)
+            if rank in ranks:
+                ds_groups._EXPERT_DATA_PARALLEL_GROUP[ep_name] = group
+                ds_groups._EXPERT_DATA_PARALLEL_GROUP_RANKS[ep_name] = ranks
+
+    ds_groups.mpu = sp_mpu
+    return {
+        "ep_group": ds_groups._get_expert_parallel_group(ep_name) if ep_size > 1 else None,
+        "sp_group": sp_mpu.get_sequence_parallel_group(),
+        "mpu": sp_mpu,
+    }
+
+
+def _deepspeed_init_kwargs(model, ds_config: dict, parallel_groups: dict[str, Any], has_optimizer: bool) -> dict:
+    """Build DeepSpeed initialization arguments with the runtime's model-parallel topology."""
+    kwargs = {"model": model, "config": ds_config}
+    mpu = parallel_groups.get("mpu")
+    if mpu is not None:
+        kwargs["mpu"] = mpu
+    if has_optimizer:
+        kwargs["model_parameters"] = model.parameters()
+    return kwargs
 
 
 async def spawn_and_initialize_workers(gpus, master_port, config_dict, actor_options):
@@ -113,6 +529,9 @@ class DeepSpeedWorker:
         self.sp_size = 1
         self._weight_sender = None
         self._on_gpu = True
+        self._gradient_norms_per_param = False
+        self._optimizer_state_output_dir: str | None = None
+        self._source_model_dir: str | None = None
 
     def get_ip(self) -> str:
         return self.my_addr
@@ -129,8 +548,18 @@ class DeepSpeedWorker:
             }
         )
 
-        if job_config.get("full_determinism", False):
-            enable_full_determinism(seed=job_config.get("seed", 42))
+        debug_config = _worker_debug_config(job_config)
+        determinism_config = {"debug": debug_config}
+        from arctic_platform.model.implementations.debug.determinism import configure_full_determinism
+        from arctic_platform.model.implementations.debug.determinism import determinism_worker_env
+        from arctic_platform.model.implementations.debug.determinism import full_determinism_enabled
+        from arctic_platform.model.implementations.debug.determinism import resolve_seed
+
+        seed = resolve_seed(job_config.get("seed"), determinism_config)
+        os.environ.update(determinism_worker_env(determinism_config, seed))
+        if full_determinism_enabled(determinism_config):
+            enable_full_determinism(seed=seed)
+            configure_full_determinism(determinism_config)
 
         # aws-ofi-nccl generates a per-process topology and hands it to NCCL by setting NCCL_TOPO_FILE to a
         # /proc/self/fd/<N> path (an in-memory fd). That handle is only valid in the process that created it: once
@@ -159,7 +588,26 @@ class DeepSpeedWorker:
         ds_worker_config = job_config.get("ds_worker_config") or {}
         ds_worker_config["world_size"] = self.world_size
         self.ds_worker_config = ds_worker_config
+        self._source_model_dir = model_name
         self.sp_size = sp_size_from_job_config(job_config)
+        gradient_norms_per_param = debug_config.get("gradient_norms_per_param", False)
+        if not isinstance(gradient_norms_per_param, bool):
+            raise TypeError(
+                "gradient_norms_per_param in the training debug config must be a bool, "
+                f"got {type(gradient_norms_per_param).__name__}"
+            )
+        self._gradient_norms_per_param = gradient_norms_per_param
+        optimizer_state_output_dir = debug_config.get("optimizer_state_output_dir")
+        if optimizer_state_output_dir is not None:
+            optimizer_state_output_dir = os.fspath(optimizer_state_output_dir)
+            if not os.path.isabs(optimizer_state_output_dir):
+                raise ValueError("debug.optimizer_state_output_dir must be an absolute path")
+        self._optimizer_state_output_dir = optimizer_state_output_dir
+        initial_peft_adapter_output_dir = debug_config.get("initial_peft_adapter_output_dir")
+        if initial_peft_adapter_output_dir is not None:
+            initial_peft_adapter_output_dir = os.fspath(initial_peft_adapter_output_dir)
+            if not os.path.isabs(initial_peft_adapter_output_dir):
+                raise ValueError("debug.initial_peft_adapter_output_dir must be an absolute path")
 
         # Build the DeepSpeed config per job type. Training engines get an
         # optimizer; the reference/log-prob engine is forward-only and is
@@ -176,17 +624,20 @@ class DeepSpeedWorker:
 
         # HF load + patches via ModelSpec (world_size already injected above).
         spec = ModelSpec.from_ds_worker_config(model_name, ds_worker_config)
-        loaded = build_model(spec)
+        from arctic_platform.model.implementations.debug.determinism import maybe_partial_determinism_support
+
+        maybe_partial_determinism_support(model_name, spec.attn_implementation, ds_worker_config)
+        parallel_groups = _setup_model_parallel_groups(spec)
+        loaded = build_model(spec, parallel_groups=parallel_groups)
         model = loaded.model
+        if initial_peft_adapter_output_dir is not None:
+            _synchronize_initial_peft_adapter(model, initial_peft_adapter_output_dir, self.rank)
 
         zorro_train_enable = ds_worker_config.get("zorro_train_enable", False)
         self.dedup_actor_model_once_patcher = getattr(model, "_arctic_zorro_once_patcher", None)
 
-        init_kwargs = dict(model=model, config=ds_config)
-        if self._has_optimizer:
-            # Forward-only (log-prob) engines are initialized without an
-            # optimizer so DeepSpeed allocates no optimizer state.
-            init_kwargs["model_parameters"] = model.parameters()
+        # Forward-only (log-prob) engines omit model parameters so DeepSpeed allocates no optimizer state.
+        init_kwargs = _deepspeed_init_kwargs(model, ds_config, parallel_groups, self._has_optimizer)
         self.engine, _, _, _ = deepspeed.initialize(**init_kwargs)
         self._device = get_accelerator().device_name(self.engine.local_rank)
 
@@ -344,8 +795,8 @@ class DeepSpeedWorker:
     def _inject_sft_global_token_meta(self, loss_fn: str, batch_data, meta_data: dict) -> None:
         """All-reduce valid-target count into ``meta["global_num_tokens"]`` + ``dp_size``.
 
-        ``dp_size`` is ``world_size`` while shards stay disjoint. ``sp_size`` is
-        still validated against ``world_size``.
+        The loss callback scales by the full execution group because DeepSpeed averages the replicated parameter
+        gradients over that group even when sequence parallelism leaves one logical data-parallel replica.
         Opt-in via ``SFT_GLOBAL_TOKEN_LOSS_FNS``. No-op when labels are absent.
         """
         from arctic_platform.sft.processor import SFT_GLOBAL_TOKEN_LOSS_FNS
@@ -592,6 +1043,248 @@ class DeepSpeedWorker:
         timers.stop_and_print_elapsed(tname)
         return results
 
+    def _globalize_expert_optimizer_tensor(self, param: Any, tensor: torch.Tensor) -> torch.Tensor:
+        """Reconstruct an expert-axis tensor from rank-local expert-parallel shards."""
+        group_name = getattr(param, "group_name", None)
+        if group_name is None or getattr(param, "allreduce", True) is not False or tensor.dim() < 2:
+            return tensor
+
+        import deepspeed.utils.groups as ds_groups
+
+        local = tensor.contiguous()
+        ep_group = ds_groups._get_expert_parallel_group(group_name)
+        shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
+        dist.all_gather(shards, local, group=ep_group)
+        return torch.cat(shards, dim=0)
+
+    def _optimizer_step_values(self) -> list[int]:
+        """Return the Adam step counters exposed by the wrapped optimizer state."""
+        values: set[int] = set()
+        optimizer = getattr(self.engine, "optimizer", None)
+        seen: set[int] = set()
+        while optimizer is not None and id(optimizer) not in seen:
+            seen.add(id(optimizer))
+            state = getattr(optimizer, "state", None)
+            if isinstance(state, dict):
+                for entry in state.values():
+                    if not isinstance(entry, dict) or "step" not in entry:
+                        continue
+                    step = entry["step"]
+                    values.add(int(step.item() if torch.is_tensor(step) else step))
+            optimizer = getattr(optimizer, "optimizer", None)
+        return sorted(values)
+
+    def _full_adam_moments(self, param: torch.nn.Parameter) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return full Adam moments for one parameter, including ZeRO optimizer fragments."""
+        from deepspeed.utils import safe_get_full_optimizer_state
+
+        if hasattr(param, "_hp_mapping"):
+            mapping = param._hp_mapping
+            fragments = getattr(mapping, "optim_fragment", None) or {}
+            initialized = torch.tensor(
+                int(mapping is not None and "exp_avg" in fragments and "exp_avg_sq" in fragments),
+                device=param.device,
+            )
+            dist.all_reduce(initialized, op=dist.ReduceOp.MAX, group=param._dp_group)
+            if not bool(initialized.item()):
+                return None, None
+            return safe_get_full_optimizer_state(param, "exp_avg"), safe_get_full_optimizer_state(param, "exp_avg_sq")
+        try:
+            return safe_get_full_optimizer_state(param, "exp_avg"), safe_get_full_optimizer_state(param, "exp_avg_sq")
+        except ValueError as error:
+            if "not found in optimizer state fragment" not in str(error):
+                raise
+            return None, None
+
+    def _snapshot_optimizer_state_parameters(self) -> None:
+        """Write pre-step LoRA parameters, FP32 masters, gradients, Adam moments, and counters."""
+        if self._optimizer_state_output_dir is None:
+            return
+
+        import json
+        import shutil
+        from pathlib import Path
+
+        from deepspeed.utils import safe_get_full_fp32_param
+        from deepspeed.utils import safe_get_full_grad
+
+        output_dir = Path(self._optimizer_state_output_dir)
+        before_dir = output_dir / "before"
+        optimizer = getattr(self.engine, "optimizer", None)
+        relink_optimizer_state = getattr(optimizer, "_lazy_init_hp_params_optimizer_state", None)
+        if callable(relink_optimizer_state):
+            optimizer._hp_optimizer_states_linked = False
+            relink_optimizer_state()
+        if self.rank == 0:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            before_dir.mkdir(parents=True)
+        dist.barrier()
+        model = self.engine.module if hasattr(self.engine, "module") else self.engine
+        for index, (name, param) in enumerate(sorted(model.named_parameters(), key=lambda item: item[0])):
+            if not param.requires_grad:
+                continue
+            full_parameter = safe_get_full_fp32_param(param)
+            if full_parameter is None:
+                raise RuntimeError(f"optimizer-state capture found no FP32 master for {name}")
+            full_parameter = self._globalize_expert_optimizer_tensor(param, full_parameter)
+            gradient = safe_get_full_grad(param)
+            if gradient is None:
+                raise RuntimeError(f"optimizer-state capture found no reduced gradient for {name}")
+            gradient = self._globalize_expert_optimizer_tensor(param, gradient)
+            exp_avg, exp_avg_sq = self._full_adam_moments(param)
+            if exp_avg is not None:
+                exp_avg = self._globalize_expert_optimizer_tensor(param, exp_avg)
+                exp_avg_sq = self._globalize_expert_optimizer_tensor(param, exp_avg_sq)
+            if self.rank == 0:
+                torch.save(
+                    {
+                        "name": name,
+                        "parameter": param.detach().cpu(),
+                        "fp32_master": full_parameter.detach().cpu(),
+                        "gradient": gradient.detach().cpu(),
+                        "exp_avg": None if exp_avg is None else exp_avg.detach().cpu(),
+                        "exp_avg_sq": None if exp_avg_sq is None else exp_avg_sq.detach().cpu(),
+                    },
+                    before_dir / f"{index:06d}.pt",
+                )
+        if self.rank == 0:
+            (before_dir / "state.json").write_text(
+                json.dumps(
+                    {
+                        "engine_global_step": int(self.engine.global_steps),
+                        "optimizer_steps": self._optimizer_step_values(),
+                        "learning_rates": [float(value) for value in self.engine.get_lr()],
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+
+    def _optimizer_state_artifact_metrics(self) -> dict[str, Any]:
+        """Write post-step updates and Adam moments without returning tensors through Ray."""
+        if self._optimizer_state_output_dir is None:
+            return {}
+
+        import json
+        from pathlib import Path
+
+        from deepspeed.utils import safe_get_full_fp32_param
+
+        output_dir = Path(self._optimizer_state_output_dir)
+        before_dir = output_dir / "before"
+        optimizer = getattr(self.engine, "optimizer", None)
+        relink_optimizer_state = getattr(optimizer, "_lazy_init_hp_params_optimizer_state", None)
+        if callable(relink_optimizer_state):
+            optimizer._hp_optimizer_states_linked = False
+            relink_optimizer_state()
+        model = self.engine.module if hasattr(self.engine, "module") else self.engine
+        entries = []
+        for index, (name, param) in enumerate(sorted(model.named_parameters(), key=lambda item: item[0])):
+            if not param.requires_grad:
+                continue
+            full_parameter = safe_get_full_fp32_param(param)
+            exp_avg, exp_avg_sq = self._full_adam_moments(param)
+            if exp_avg is None or exp_avg_sq is None:
+                if self.rank == 0:
+                    (before_dir / f"{index:06d}.pt").unlink(missing_ok=True)
+                continue
+            if full_parameter is None:
+                raise RuntimeError(f"optimizer-state capture found no post-step FP32 master for {name}")
+            full_parameter = self._globalize_expert_optimizer_tensor(param, full_parameter)
+            exp_avg = self._globalize_expert_optimizer_tensor(param, exp_avg)
+            exp_avg_sq = self._globalize_expert_optimizer_tensor(param, exp_avg_sq)
+            if self.rank == 0:
+                before = torch.load(before_dir / f"{index:06d}.pt", map_location="cpu", weights_only=True)
+                filename = f"{index:06d}.pt"
+                torch.save(
+                    {
+                        "parameter": before["parameter"],
+                        "fp32_master": before["fp32_master"],
+                        "gradient": before["gradient"],
+                        "exp_avg_before": before["exp_avg"],
+                        "exp_avg_sq_before": before["exp_avg_sq"],
+                        "parameter_update": full_parameter.detach().cpu() - before["fp32_master"],
+                        "exp_avg": exp_avg.detach().cpu(),
+                        "exp_avg_sq": exp_avg_sq.detach().cpu(),
+                    },
+                    output_dir / filename,
+                )
+                entries.append({"name": name, "file": filename, "shape": list(full_parameter.shape)})
+                (before_dir / f"{index:06d}.pt").unlink()
+        dist.barrier()
+        if self.rank != 0:
+            return {}
+        before_state = json.loads((before_dir / "state.json").read_text())
+        (before_dir / "state.json").unlink()
+        before_dir.rmdir()
+        manifest_path = output_dir / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "step": self.engine.global_steps,
+                    "before": before_state,
+                    "after": {
+                        "engine_global_step": int(self.engine.global_steps),
+                        "optimizer_steps": self._optimizer_step_values(),
+                        "learning_rates": [float(value) for value in self.engine.get_lr()],
+                    },
+                    "parameters": entries,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        return {"optimizer_state_manifest": str(manifest_path)}
+
+    def _per_parameter_gradient_norm_metrics(self) -> dict[str, Any]:
+        """Return one full-gradient norm per trainable parameter from rank zero."""
+        if not self._gradient_norms_per_param:
+            return {}
+
+        from deepspeed.utils import safe_get_full_grad
+
+        model = self.engine.module if hasattr(self.engine, "module") else self.engine
+        norms: dict[str, float] = {}
+        for name, param in sorted(model.named_parameters(), key=lambda item: item[0]):
+            if not param.requires_grad:
+                continue
+            full_grad = safe_get_full_grad(param)
+            if full_grad is None:
+                continue
+            norms[name] = float(torch.linalg.vector_norm(full_grad.detach().float()))
+        if self.rank != 0:
+            return {}
+        return {"gradient_norms_per_param": norms}
+
+    def _per_global_expert_gradient_norm_metrics(self) -> dict[str, Any]:
+        """Return norms indexed by global expert for expert-parallel parameters from rank zero."""
+        if not self._gradient_norms_per_param:
+            return {}
+
+        import deepspeed.utils.groups as ds_groups
+        from deepspeed.utils import safe_get_full_grad
+
+        model = self.engine.module if hasattr(self.engine, "module") else self.engine
+        norms: dict[str, list[float]] = {}
+        for name, param in sorted(model.named_parameters(), key=lambda item: item[0]):
+            if not param.requires_grad:
+                continue
+            group_name = getattr(param, "group_name", None)
+            if group_name is None or getattr(param, "allreduce", True) is not False:
+                continue
+            full_grad = safe_get_full_grad(param)
+            if full_grad is None or full_grad.dim() < 2:
+                continue
+            local = torch.linalg.vector_norm(full_grad.detach().float().flatten(1), dim=1).contiguous()
+            ep_group = ds_groups._get_expert_parallel_group(group_name)
+            shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
+            dist.all_gather(shards, local, group=ep_group)
+            if self.rank == 0:
+                norms[name] = [float(value) for value in torch.cat(shards)]
+        if self.rank != 0 or not norms:
+            return {}
+        return {"gradient_norms_per_expert": norms}
+
     def _is_bf16_zero_norm_assert(self, exc: BaseException) -> bool:
         """True only for BF16_Optimizer's bare ``assert all_groups_norm > 0.``."""
         return is_bf16_zero_norm_assert(exc, getattr(self.engine, "optimizer", None))
@@ -612,9 +1305,22 @@ class DeepSpeedWorker:
                 return
             raise
 
-    def step(self) -> dict:
+    def _set_optimizer_learning_rate(self, learning_rate: float | None) -> None:
+        if learning_rate is None:
+            return
+        optimizer = getattr(self.engine, "optimizer", None)
+        if optimizer is None:
+            return
+        for group in optimizer.param_groups:
+            group["lr"] = float(learning_rate)
+
+    def step(self, learning_rate: float | None = None) -> dict:
         from arctic_platform import sft_profile
 
+        self._set_optimizer_learning_rate(learning_rate)
+        gradient_norm_metrics = self._per_parameter_gradient_norm_metrics()
+        expert_gradient_norm_metrics = self._per_global_expert_gradient_norm_metrics()
+        self._snapshot_optimizer_state_parameters()
         with sft_profile.timed("step"):
             self._engine_step()
             if sft_profile.enabled() and torch.cuda.is_available():
@@ -626,7 +1332,11 @@ class DeepSpeedWorker:
         if isinstance(grad_norm, torch.Tensor):
             grad_norm = grad_norm.item()
         metrics = dict(
+            global_steps=self.engine.global_steps,
             last_lr=self.engine.get_lr()[0],
+            **gradient_norm_metrics,
+            **expert_gradient_norm_metrics,
+            **self._optimizer_state_artifact_metrics(),
         )
         if grad_norm is not None:
             metrics["grad_norm"] = grad_norm
@@ -647,6 +1357,24 @@ class DeepSpeedWorker:
             "global_step": int(self.engine.global_steps),
         }
 
+    def routable_ip(self) -> str:
+        """Return this worker's address on the allocation network."""
+        from arctic_platform.common.ray_cluster import primary_ip
+
+        return primary_ip()
+
+    def export_node_checkpoint(self, path: str, peers: list[str]) -> list[str]:
+        """Copy checkpoint files written on this node to ``peers`` and open them here."""
+        from arctic_platform.common.utils.checkpoint import publish_node_checkpoint
+
+        return publish_node_checkpoint(path, peers)
+
+    def require_checkpoint_files(self, path: str, relative_paths: list[str]) -> None:
+        """Open every checkpoint file in ``relative_paths`` under ``path``."""
+        from arctic_platform.common.utils.checkpoint import require_checkpoint_files
+
+        require_checkpoint_files(path, relative_paths)
+
     def load_checkpoint(self, path: str) -> int:
         """Restore DeepSpeed state. Returns restored ``global_steps``, or 0 if none found."""
         load_path, _ = self.engine.load_checkpoint(path)
@@ -663,18 +1391,15 @@ class DeepSpeedWorker:
         import os
 
         hf_dir = os.path.join(checkpoint_dir, "hf")
+        model = self.engine.module
+        full_state_dict = _model_full_hf_export_state_dict(model, self.rank)
+        if not hasattr(model, "_iter_full_hf_weights"):
+            full_state_dict = _gather_live_hf_export_state_dict(model, self.rank)
         if self.rank == 0:
             os.makedirs(hf_dir, exist_ok=True)
-            model = self.engine.module
-            state_dict = None
-            try:
-                from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
-
-                state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir)
-            except Exception:
-                logger.exception("zero_to_fp32 export failed; falling back to live gather")
-            if state_dict is None:
-                state_dict = {n: p.detach().cpu() for n, p in model.named_parameters()}
+            state_dict = full_state_dict
+            if not hasattr(model, "_iter_full_hf_weights"):
+                state_dict = _canonical_hf_export_state_dict(model, state_dict)
             try:
                 model.save_pretrained(hf_dir, state_dict=state_dict, safe_serialization=True)
             except TypeError:
@@ -683,9 +1408,12 @@ class DeepSpeedWorker:
                 if missing or unexpected:
                     logger.warning("HF export load_state_dict missing=%s unexpected=%s", missing, unexpected)
                 model.save_pretrained(hf_dir, safe_serialization=True)
+            if self._source_model_dir and restore_source_weight_layout(self._source_model_dir, hf_dir):
+                _copy_source_sidecars(self._source_model_dir, hf_dir)
+            replace_exported_qwen3_5_text_config(self._source_model_dir, hf_dir)
             logger.info("Exported HF checkpoint to %s", hf_dir)
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        # The Ray server waits for every worker result, including rank zero's complete export. A distributed
+        # barrier here only leaves nonzero ranks inside NCCL while rank zero reconstructs the full fp32 state.
         return hf_dir if self.rank == 0 else None
 
     @staticmethod
@@ -704,11 +1432,23 @@ class DeepSpeedWorker:
         """
         _, kwargs, _, _ = unpack_batch(batch)
         kwargs = {k: v.to(self._device) if torch.is_tensor(v) else v for k, v in kwargs.items()}
+        model = self.engine.module
         with torch.no_grad():
-            logits = self.engine(**kwargs).logits
-        log_probs = torch.log_softmax(logits, dim=-1)
-        shifted_ids = kwargs["input_ids"][:, 1:]
-        token_log_probs = log_probs[:, :-1].gather(-1, shifted_ids.unsqueeze(-1)).squeeze(-1)
+            if getattr(model, "_dss_chunked_lm_head_logprobs", False) or getattr(
+                model, "_dss_native_lm_head_logprobs", False
+            ):
+                outputs = self.engine(**kwargs, dss_compute_logprobs=True)
+                token_log_probs = outputs["logprobs"] if isinstance(outputs, dict) else outputs.logprobs
+            else:
+                outputs = self.engine(**kwargs)
+                if isinstance(outputs, dict) and outputs.get("logprobs") is not None:
+                    token_log_probs = outputs["logprobs"]
+                else:
+                    logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+                    shifted_ids = kwargs["input_ids"][:, 1:]
+                    token_log_probs = (
+                        torch.log_softmax(logits, dim=-1)[:, :-1].gather(-1, shifted_ids.unsqueeze(-1)).squeeze(-1)
+                    )
         return token_log_probs.cpu()
 
     def max_param_bytes(self) -> int:

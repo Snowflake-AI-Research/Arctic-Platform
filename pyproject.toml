@@ -15,6 +15,8 @@ include = [
   "arctic_platform/integrations/verl/config/**/*.yaml",
   "arctic_platform/integrations/verl/examples/*.sh",
   "arctic_platform/integrations/verl/README.md",
+  "arctic_platform/correctness/configs/**/*.config",
+  "arctic_platform/correctness/specs/*.json",
 ]
 # Kept beside the inference package and left out of the wheel. Trailing
 # slashes make hatchling skip the directories. csrc/, setup.py, and
@@ -116,6 +118,16 @@ formatting = [
 gdn = [
     "flash-linear-attention",
     "causal-conv1d",
+]
+
+# GPU training stack selected by the stas-dss-repro setup flow.
+gpu = [
+    "arctic_platform[sft]",
+    "arctic_platform[gdn]",
+    "arctic_platform[testing]",
+    "flash-linear-attention==0.5.2",
+    "tilelang==0.1.12",
+    "transformers==5.12.1",
 ]
 
 # Shared DSSST1 tensor wire format.

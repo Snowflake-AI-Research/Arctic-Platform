@@ -41,6 +41,8 @@ from arctic_platform.common.utils import log_dp_shard_tokens
 from arctic_platform.common.utils import merge_dict_shards
 from arctic_platform.common.utils import ray_split_batch
 from arctic_platform.common.utils import unpack_batch
+from arctic_platform.common.utils.batch import flatten_sequence_rows
+from arctic_platform.common.utils.batch import merge_sp_dict_shards
 from arctic_platform.common.utils.batch import restore_batch_order
 from arctic_platform.common.utils.checkpoint import resolve_checkpoint_save_paths
 from arctic_platform.common.utils.debug import ProfilerContext
@@ -74,6 +76,42 @@ def _transfer_schedule_cls():
 
 
 logger = logging.getLogger(__name__)
+
+
+def _publish_saved_checkpoint(workers, path: str) -> None:
+    """Copy node-local checkpoint files onto every node, then open them there.
+
+    Each rank writes its optimizer state on the node where that rank ran. The next job can schedule
+    the same rank on another node. When the checkpoint directory is not one shared tree, that rank's
+    file is missing at load.
+    """
+    if not workers:
+        return
+    hosts: list[str] = []
+    for node in ray.nodes():
+        if not node.get("Alive", False):
+            continue
+        ip = node.get("NodeManagerAddress")
+        if ip and ip not in hosts:
+            hosts.append(ip)
+    if len(hosts) < 2:
+        return
+    ips = ray.get([worker.routable_ip.remote() for worker in workers])
+    unknown = sorted({ip for ip in ips if ip not in hosts})
+    if unknown:
+        raise RuntimeError(f"worker addresses {unknown} are outside the Ray node addresses {hosts}")
+    reps = {}
+    for worker, ip in zip(workers, ips):
+        reps.setdefault(ip, worker)
+    listings = []
+    for ip, worker in reps.items():
+        peers = [host for host in hosts if host != ip]
+        listings.append(ray.get(worker.export_node_checkpoint.remote(path, peers)))
+    expected = sorted({name for listing in listings for name in listing})
+    if not expected:
+        raise FileNotFoundError(f"checkpoint {path} has no files after save")
+    ray.get([worker.require_checkpoint_files.remote(path, expected) for worker in reps.values()])
+
 
 # PROFILER_TYPE = "c"
 # PROFILER_TYPE = "torch"
@@ -111,7 +149,7 @@ def create_arctic_rl_ray_server_state(**kwargs):
         env_port = os.environ.get("MASTER_PORT")
         kwargs["ds_master_port"] = int(env_port) if env_port else None
     sched_pg = placement_group([{"GPU": 0, "CPU": 1}])
-    return ray.remote(
+    state = ray.remote(
         num_cpus=0,
         num_gpus=0,
         scheduling_strategy=PlacementGroupSchedulingStrategy(
@@ -121,9 +159,29 @@ def create_arctic_rl_ray_server_state(**kwargs):
             placement_group_capture_child_tasks=False,
         ),
     )(ArcticRLRayServerState).remote(**kwargs)
+    ray.get(state.__ray_ready__.remote())
+    return state
 
 
 # TODO: add remote decorator
+def _prompt_token_logprobs(token_ids: list[int], result: dict[str, Any]) -> dict[str, Any]:
+    """Convert ArcticInference prompt-logprob output to the Arctic Platform log-probs contract."""
+    positions = result.get("prompt_logprobs")
+    if positions is None or len(positions) != len(token_ids):
+        actual = 0 if positions is None else len(positions)
+        raise RuntimeError(f"prompt log-probs contain {actual} positions for {len(token_ids)} tokens")
+
+    logprobs = []
+    for token_id, position in zip(token_ids[1:], positions[1:]):
+        position = position or {}
+        entry = position.get(token_id, position.get(str(token_id)))
+        if entry is None:
+            raise RuntimeError(f"prompt log-probs contain no score for token {token_id}")
+        logprobs.append(float(entry["logprob"] if isinstance(entry, dict) else entry))
+
+    return {"token_ids": token_ids[1:], "logprobs": logprobs, "seq_len": len(logprobs)}
+
+
 class ArcticRLRayServerState(ArcticRLServerState):
     def __init__(
         self,
@@ -211,6 +269,36 @@ class ArcticRLRayServerState(ArcticRLServerState):
 
     async def get_log_prob_pool(self) -> ReplicaPool:
         return self.log_prob_pool
+
+    async def log_probs(self, job_id: int, request: dict[str, Any]) -> dict[str, Any]:
+        info = self.jobs.get(job_id)
+        if info is None or info["job_type"] != "log_prob":
+            raise ValueError(f"Job {job_id} is not a log_prob job")
+        parsed_request = LogProbsRequest(**request)
+
+        if parsed_request.completions is not None:
+            full_texts = [p + c for p, c in zip(parsed_request.prompts, parsed_request.completions)]
+        else:
+            full_texts = parsed_request.prompts
+
+        if info.get("engine") == "deepspeed":
+            encoded = self.log_prob_tokenizer(full_texts, return_tensors="pt", padding=True)
+            wrapper = dict(batch=dict(encoded), meta={}, processing={})
+            shards, _ = ray_split_batch(wrapper, len(self.log_prob_workers), sp_size=info.get("sp_size", 1))
+            raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(self.log_prob_workers, shards)])
+            results = torch.cat([r.cpu() for r in raw], dim=0)
+        else:
+            encoded = self.log_prob_tokenizer(full_texts, add_special_tokens=True)["input_ids"]
+            raw_results = await self.log_prob_pool.generate(
+                full_texts,
+                {"max_tokens": 1, "temperature": 0, "prompt_logprobs": parsed_request.top_k},
+            )
+            results = [
+                _prompt_token_logprobs([int(token_id) for token_id in token_ids], result)
+                for token_ids, result in zip(encoded, raw_results)
+            ]
+
+        return {"job_id": job_id, "results": results}
 
     async def get_log_prob_workers(self) -> list[DeepSpeedWorker]:
         return self.log_prob_workers
@@ -484,6 +572,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
                     )
                 else:
                     await pool.initialize(model_cfg, num_replicas=num_replicas)
+                self.log_prob_tokenizer = AutoTokenizer.from_pretrained(job_config.model_name)
                 engine = "vllm"
 
         else:
@@ -614,7 +703,8 @@ class ArcticRLRayServer:
         self.weight_sync_ready = ray.get(arctic_rl_ray_server_state.get_weight_sync_ready.remote())  # type: ignore
         self.weight_sync_bucket_size = ray.get(arctic_rl_ray_server_state.get_weight_sync_bucket_size.remote())  # type: ignore
         self.sampling_pool = ray.get(arctic_rl_ray_server_state.get_sampling_pool.remote())  # type: ignore
-        self.log_prob_pool = ray.get(arctic_rl_ray_server_state.get_log_prob_pool.remote())  # type: ignore
+        # ReplicaPool contains synchronization primitives and must remain inside the state actor.
+        self.log_prob_pool = None
         self.colocate = ray.get(arctic_rl_ray_server_state.get_colocate.remote())  # type: ignore
 
     def _verify_job(self, job_id: int, expected_types: Union[str, list[str]]) -> None:
@@ -674,7 +764,7 @@ class ArcticRLRayServer:
 
         prof = ProfilerContext(type=PROFILER_TYPE, name="GATHER")
         with prof():
-            refs = [w.forward_backward.remote(s) for w, s in zip(workers, shards)]
+            refs = [w.forward_backward.remote(batch=s) for w, s in zip(workers, shards)]
             results = ray.get(refs)
 
         timers.stop_and_print_elapsed(tname)
@@ -695,7 +785,7 @@ class ArcticRLRayServer:
             avg_loss=avg_loss,
         )
         if return_fwd_batch:
-            fwd_batch = merge_dict_shards([r["batch"] for r in results])
+            fwd_batch = merge_sp_dict_shards([r["batch"] for r in results], self.jobs[job_id].get("sp_size", 1))
             if reorder_indices is not None:
                 fwd_batch = restore_batch_order(fwd_batch, reorder_indices)
             merged["batch"] = fwd_batch
@@ -734,7 +824,30 @@ class ArcticRLRayServer:
         # ])
 
         loss_object = prepare_request_loss(batch)
-        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=info.get("sp_size", 1))
+        sp_size = info.get("sp_size", 1)
+        return_logprobs = (batch.get("processing") or {}).get("return_logprobs")
+        restore_logprob_shape = None
+        if return_logprobs:
+            _, request_batch, _, _ = unpack_batch(batch)
+            rows = request_batch["input_ids"].shape[0]
+            if sp_size > 1 and rows > 1:
+                if len(workers) != sp_size:
+                    raise NotImplementedError(
+                        "multi-row sequence-parallel log-probability requests require one logical DP replica"
+                    )
+                batch, restore_logprob_shape = flatten_sequence_rows(batch)
+        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=sp_size)
+        if return_logprobs:
+            _, request_batch, _, _ = unpack_batch(batch)
+            packed_sequence_length = request_batch["input_ids"].shape[1]
+            results = ray.get([w.compute_log_probs.remote(shard) for w, shard in zip(workers, shards)])
+            merged = merge_sp_dict_shards([{"logprobs": result} for result in results], sp_size)
+            merged["logprobs"] = merged["logprobs"][:, :packed_sequence_length]
+            if restore_logprob_shape is not None:
+                merged["logprobs"] = merged["logprobs"].reshape(*restore_logprob_shape)
+            if reorder_indices is not None:
+                merged = restore_batch_order(merged, reorder_indices)
+            return {"job_id": job_id, "logprobs": merged["logprobs"]}
         _attach_loss_object_to_shards(shards, loss_object)
         shards[0]["meta"]["worker_return_tensors"] = True
         refs = [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
@@ -742,7 +855,7 @@ class ArcticRLRayServer:
 
         pr0(f"[ArcticRLRayServer] fwd_no_grad: {len(results)=}")
 
-        batch = merge_dict_shards([r["batch"] for r in results])
+        batch = merge_sp_dict_shards([r["batch"] for r in results], info.get("sp_size", 1))
         if reorder_indices is not None:
             batch = restore_batch_order(batch, reorder_indices)
 
@@ -761,16 +874,16 @@ class ArcticRLRayServer:
         return merged
 
     async def step(self, job_id: int, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        # `body` is unused; accepted so the client can call with (job_id, body).
         self._verify_job(job_id, "training")
-        # results = await asyncio.gather(*[w.step.remote() for w in self.training_workers])
-        refs = [w.step.remote() for w in self.training_workers]
+        learning_rate = (body or {}).get("learning_rate")
+        refs = [w.step.remote(learning_rate=learning_rate) for w in self.training_workers]
         results = ray.get(refs)
         merged = dict(
             job_id=job_id,
             metrics=merge_dict_shards([r["metrics"] for r in results]),
             batch=merge_dict_shards([r["batch"] for r in results]),
         )
+        merged.update(results[0])
         return merged
 
     async def empty_training_cache(self, job_id: int):
@@ -794,13 +907,14 @@ class ArcticRLRayServer:
         path, prune_root = resolve_checkpoint_save_paths(root, step)
         os.makedirs(path, exist_ok=True)
         export_hf = bool(body.get("export_hf", False))
-        results = ray.get([w.save_checkpoint.remote(path, export_hf) for w in self.training_workers])
+        results = ray.get([w.save_checkpoint.remote(path=path, export_hf=export_hf) for w in self.training_workers])
         if step is not None:
             with open(os.path.join(prune_root, "latest"), "w", encoding="utf-8") as f:
                 f.write(str(int(step)))
         limit = body.get("save_total_limit")
         if limit is not None and int(limit) > 0 and self.training_workers:
             ray.get(self.training_workers[0].prune_checkpoint_dirs.remote(prune_root, int(limit)))
+        _publish_saved_checkpoint(self.training_workers, path)
         hf_path = results[0].get("hf_path") if results and isinstance(results[0], dict) else None
         global_step = results[0].get("global_step") if results and isinstance(results[0], dict) else None
         return {"job_id": job_id, "path": path, "hf_path": hf_path, "global_step": global_step}
@@ -822,7 +936,7 @@ class ArcticRLRayServer:
                         path = os.path.join(path, f"checkpoint-{int(f.read().strip())}")
                 except ValueError:
                     pass
-        steps = ray.get([w.load_checkpoint.remote(path) for w in self.training_workers])
+        steps = ray.get([w.load_checkpoint.remote(path=path) for w in self.training_workers])
         return {"job_id": job_id, "path": path, "global_step": int(steps[0]) if steps else 0}
 
     async def sleep_inference(self, job_id: int, body: dict[str, Any] | int | None = None):
@@ -1184,34 +1298,7 @@ class ArcticRLRayServer:
         return {"status": "ok"}
 
     async def log_probs(self, job_id: int, request: dict[str, Any]) -> dict[str, Any]:
-        self._verify_job(job_id, "log_prob")
-        request = LogProbsRequest(**request)
-        info = self.jobs[job_id]
-
-        if request.completions is not None:
-            full_texts = [p + c for p, c in zip(request.prompts, request.completions)]
-        else:
-            full_texts = request.prompts
-
-        if info.get("engine") == "deepspeed":
-            tokenizer = self.log_prob_tokenizer
-            encoded = tokenizer(full_texts, return_tensors="pt", padding=True)
-            workers = self.log_prob_workers
-            # Wrap the encoded batch as the {"batch","meta","processing"} payload unpack_batch expects (the same
-            # shape fwd_no_grad sends), split it across DP workers, and forward each dict shard. Empty meta -> no
-            # ZoRRO/position-id rewrites, so chunk order is preserved and a plain cat reassembles the global batch.
-            wrapper = dict(batch=dict(encoded), meta={}, processing={})
-            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info.get("sp_size", 1))
-            raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
-            results = torch.cat([r.cpu() for r in raw], dim=0)
-        else:
-            pool: ReplicaPool = self.log_prob_pool
-            results = await pool.generate(
-                full_texts,
-                {"max_tokens": 1, "temperature": 0, "prompt_logprobs": request.top_k},
-            )
-
-        return {"job_id": job_id, "results": results}
+        return await self.arctic_rl_ray_server_state.log_probs.remote(job_id, request)
 
     async def status(self):
         return {

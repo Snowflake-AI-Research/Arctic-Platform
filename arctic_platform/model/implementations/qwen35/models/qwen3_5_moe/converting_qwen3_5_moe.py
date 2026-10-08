@@ -76,18 +76,18 @@ def convert_tt_layer_to_hf(state_dict: dict[str, Tensor], layer_idx: int):
     """Convert a single layer from PrimeRL to HF format in-place."""
     i = layer_idx
 
-    # Router
+    # Router and experts can have different layouts after runtime module rewrites, so convert each independently.
     router_key = f"model.layers.{i}.mlp.router.gate.weight"
-    if router_key not in state_dict:
-        return
+    if router_key in state_dict:
+        state_dict[f"model.layers.{i}.mlp.gate.weight"] = state_dict.pop(router_key)
 
-    state_dict[f"model.layers.{i}.mlp.gate.weight"] = state_dict.pop(router_key)
-
-    w1 = state_dict.pop(f"model.layers.{i}.mlp.experts.w1")  # gate
-    w2 = state_dict.pop(f"model.layers.{i}.mlp.experts.w2")  # down
-    w3 = state_dict.pop(f"model.layers.{i}.mlp.experts.w3")  # up
-    state_dict[f"model.layers.{i}.mlp.experts.gate_up_proj"] = torch.cat([w1, w3], dim=1)
-    state_dict[f"model.layers.{i}.mlp.experts.down_proj"] = w2
+    w1_key = f"model.layers.{i}.mlp.experts.w1"
+    if w1_key in state_dict:
+        w1 = state_dict.pop(w1_key)  # gate
+        w2 = state_dict.pop(f"model.layers.{i}.mlp.experts.w2")  # down
+        w3 = state_dict.pop(f"model.layers.{i}.mlp.experts.w3")  # up
+        state_dict[f"model.layers.{i}.mlp.experts.gate_up_proj"] = torch.cat([w1, w3], dim=1)
+        state_dict[f"model.layers.{i}.mlp.experts.down_proj"] = w2
 
     # Shared expert: shared_expert.{w1,w2,w3} -> mlp.shared_expert.{gate,down,up}_proj
     se_w1_key = f"model.layers.{i}.shared_expert.w1.weight"

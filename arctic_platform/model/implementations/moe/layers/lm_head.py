@@ -147,11 +147,18 @@ class FusedCrossEntropyOutputLinear(torch.nn.Linear):
         # product through addmm(out_dtype=float32), in fp32, which makes the sum partition-independent. Requires
         # liger_kernel >= 0.8.1; earlier versions accept accum_dtype but round each product to bf16 first, which
         # does not fix it. See docs/lm_head_gradient_precision.md.
+        accum_dtype = torch.float32 if fp32_lm_head else None
         self.fused_ce = LigerFusedLinearCrossEntropyLoss(
             ignore_index=IGNORE_INDEX,
             reduction="mean",
             softcap=softcap,
-            accum_dtype=torch.float32 if fp32_lm_head else None,
+            accum_dtype=accum_dtype,
+        )
+        self.fused_logprobs = LigerFusedLinearCrossEntropyLoss(
+            ignore_index=IGNORE_INDEX,
+            reduction="none",
+            softcap=softcap,
+            accum_dtype=accum_dtype,
         )
 
     def forward(
@@ -160,6 +167,7 @@ class FusedCrossEntropyOutputLinear(torch.nn.Linear):
         labels: torch.Tensor | None = None,
         temperature: Tensor | None = None,
         dss_force_zero_loss: bool = False,
+        dss_compute_logprobs: bool = False,
     ) -> PrimeLmOutput:
         if dss_force_zero_loss:
             return PrimeLmOutput(loss=_zero_lm_head_loss(hidden_states, self.weight))
@@ -169,6 +177,9 @@ class FusedCrossEntropyOutputLinear(torch.nn.Linear):
         b, s, h = hidden_states.shape
         hidden_flat = hidden_states.reshape(b * s, h).contiguous()
         labels_flat = labels.reshape(b * s).contiguous()
+        if dss_compute_logprobs:
+            losses = self.fused_logprobs(self.weight, hidden_flat, labels_flat)
+            return PrimeLmOutput(logprobs=-losses.reshape(b, s))
         loss = self.fused_ce(self.weight, hidden_flat, labels_flat)
         return PrimeLmOutput(loss=loss)
 
@@ -525,6 +536,8 @@ def _patch_model_forward(model: nn.Module) -> None:
         lm_head_kwargs = {}
         if action_masks is not None:
             lm_head_kwargs["action_masks"] = action_masks
+        if dss_compute_logprobs and isinstance(self.lm_head, FusedCrossEntropyOutputLinear):
+            lm_head_kwargs["dss_compute_logprobs"] = True
         return self.lm_head(
             hidden_states[:, slice_indices, :],
             inherit_lm_head_target_validation(labels, labels[:, slice_indices]) if labels is not None else None,
@@ -535,3 +548,4 @@ def _patch_model_forward(model: nn.Module) -> None:
 
     # Bind the new forward to the model
     model.forward = types.MethodType(new_forward, model)
+    model._dss_native_lm_head_logprobs = True
