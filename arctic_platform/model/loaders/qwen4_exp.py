@@ -21,9 +21,9 @@ from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import resolve_spec_with_defaults
-from arctic_platform.model.loaders._flash_moe import load_flash_moe
-from arctic_platform.model.loaders._flash_moe import matches_model_type
-from arctic_platform.model.loaders._flash_moe import validate_flash_moe_spec
+from arctic_platform.model.loaders.flash_moe import load_flash_moe
+from arctic_platform.model.loaders.flash_moe import matches_model_type
+from arctic_platform.model.loaders.flash_moe import validate_flash_moe_spec
 from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
 
 
