@@ -29,6 +29,10 @@ CONTEXT_LIMIT_SOURCES = frozenset({"prompt", "completion_budget"})
 # finishes inside the stream timeout. A chat prompt's is also capped by the
 # context left after rendering.
 DEFAULT_MAX_TOKENS = 4096
+MAX_SCHEMA_BYTES = 64 * 1024
+# Bounds xgrammar compile work, which grows with nesting; real schemas nest a
+# handful of levels.
+MAX_SCHEMA_DEPTH = 64
 # Prefixes of vLLM 0.30.0's structured-output validation errors, from
 # vllm/v1/structured_output/backend_{xgrammar,guidance,outlines}.py. vLLM raises
 # a bare VLLMValidationError with no parameter for these, so only the message
@@ -195,6 +199,21 @@ class StreamLimits:
             raise ValueError("max_event_bytes must not exceed max_buffer_bytes")
 
 
+def schema_depth(value) -> int:
+    """Return how many JSON objects and arrays nest at the deepest point."""
+    deepest = 0
+    pending = [(value, 1)]
+    while pending and deepest <= MAX_SCHEMA_DEPTH:
+        value, depth = pending.pop()
+        if isinstance(value, dict):
+            value = value.values()
+        elif not isinstance(value, (list, tuple)):
+            continue
+        deepest = max(deepest, depth)
+        pending.extend((child, depth + 1) for child in value)
+    return deepest
+
+
 def validate_request(prompt, sampling_params):
     if isinstance(prompt, str):
         if not prompt or len(prompt.encode("utf-8")) > 1024 * 1024:
@@ -318,6 +337,13 @@ def validate_request(prompt, sampling_params):
                 'or {"json_object": true}'
             )
         if "json" in structured_outputs:
+            # Before json.dumps, which recurses and would report a very deep
+            # schema as not JSON.
+            if schema_depth(structured_outputs["json"]) > MAX_SCHEMA_DEPTH:
+                raise ValueError(
+                    "structured_outputs schema nests deeper than "
+                    f"{MAX_SCHEMA_DEPTH} levels"
+                )
             try:
                 schema = json.dumps(
                     structured_outputs["json"],
@@ -326,8 +352,10 @@ def validate_request(prompt, sampling_params):
                 )
             except (TypeError, ValueError, RecursionError):
                 raise ValueError("structured_outputs schema must be JSON") from None
-            if len(schema.encode("utf-8")) > 64 * 1024:
-                raise ValueError("structured_outputs schema exceeds 65536 bytes")
+            if len(schema.encode("utf-8")) > MAX_SCHEMA_BYTES:
+                raise ValueError(
+                    f"structured_outputs schema exceeds {MAX_SCHEMA_BYTES} bytes"
+                )
     budget = params.get("thinking_token_budget")
     # A chat prompt's budget is set after rendering, and checked again there.
     budget_ceiling = params.get(
