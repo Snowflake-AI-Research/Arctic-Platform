@@ -107,10 +107,10 @@ aborts on overflow rather than silently dropping output or pausing the shared en
 While the reader is behind, a new delta joins its choice's newest undelivered
 delta (text, `token_ids` and `logprobs` concatenated), so one delivered delta
 can carry several engine steps. A slow reader then needs one queue slot per
-choice instead of one per token. Deltas never merge across choices, past a later event of the
-same choice, or past `usage`; finish events never merge, so the end of a stream
-needs up to 2n + 2 slots. A merge that would exceed the per-event byte limit
-starts a new event instead.
+choice instead of one per token. Deltas never merge across choices, past a
+later event of the same choice, or past `usage`; finish events never merge, so
+the end of a stream needs up to 2n + 2 slots. A merge that would exceed the
+per-event byte limit starts a new event instead.
 
 Defaults: 128 queued events, 1 MiB queued serialized payload, 256 KiB per event,
 and 128 sessions per worker. Streaming and legacy
