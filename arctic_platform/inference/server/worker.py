@@ -184,7 +184,11 @@ def _ensure_arctic_vllm_patches() -> None:
         return
 
     from arctic_platform.inference.vllm.patches import apply_arctic_patches
+    from arctic_platform.inference.vllm.required_patches import (
+        apply_required_vllm_patches,
+    )
 
+    apply_required_vllm_patches()
     try:
         apply_arctic_patches()
     except ValueError as exc:
