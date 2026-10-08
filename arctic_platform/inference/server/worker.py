@@ -429,6 +429,10 @@ def _result_from_output(
         "prefix_cache_len": int(num_cached) if num_cached is not None else 0,
     }
 
+    spec = getattr(choice, "spec_decode_metrics", None)
+    if spec is not None:
+        result["spec_decode_metrics"] = spec.to_dict()
+
     if final_output.prompt_logprobs is not None:
         # The dense patch leaves tensors here instead of one dict per position;
         # everything else still gets the per-position dicts, unchanged.
@@ -1035,7 +1039,7 @@ class InferenceWorker(StreamingWorkerMixin):
         }
 
     def drain_metrics(self) -> dict[str, Any]:
-        """Return and clear the buffered per-step replica snapshots."""
+        """Drain snapshots and return lifetime counters without resetting them."""
         from arctic_platform.inference.server.action_mask_replay import (
             action_mask_replay_cache_stats,
         )
@@ -1043,6 +1047,7 @@ class InferenceWorker(StreamingWorkerMixin):
         return {
             "pid": os.getpid(),
             "snapshots": get_collector().drain_snapshots(),
+            "engine_totals": get_collector().totals(),
             "action_mask_replay_cache": action_mask_replay_cache_stats(),
         }
 
