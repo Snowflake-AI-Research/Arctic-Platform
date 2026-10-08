@@ -214,6 +214,19 @@ class TestPatchPipeline:
 
 
 class TestHuggingFaceLoader:
+    @pytest.mark.parametrize(
+        ("requested", "expected"),
+        [(None, "sdpa"), ("flash_attention_3", "flash_attention_3")],
+    )
+    def test_attention_is_resolved_before_model_load(self, requested, expected):
+        spec = ModelSpec(
+            model_path_or_name="qwen",
+            loader="huggingface",
+            attn_implementation=requested,
+        )
+
+        assert spec.attn_implementation == expected
+
     def test_qwen3_resolves_to_default_loader(self, monkeypatch):
         fake_config = types.SimpleNamespace(model_type="qwen3")
         monkeypatch.setattr(
@@ -292,7 +305,7 @@ class TestFromDsWorkerConfig:
         from arctic_platform.model.config import Patches
 
         assert Patches().gradient_checkpointing is False
-        assert ModelSpec(model_path_or_name="x").attn_implementation is None
+        assert ModelSpec(model_path_or_name="x").attn_implementation == "sdpa"
 
     def test_liger_and_gc_flags_map(self):
         spec = ModelSpec.from_ds_worker_config(

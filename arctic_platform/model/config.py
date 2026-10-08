@@ -195,7 +195,9 @@ class ModelSpec(BaseModel):
 
     model_path_or_name: str = Field(..., description="HF model path or hub name.")
     dtype: str = Field("bfloat16", description="Parameter dtype.")
-    attn_implementation: str | None = Field(None, description="Attention implementation to request from HF.")
+    attn_implementation: str | None = Field(
+        None, description="Attention implementation override; the resolved loader supplies its default when omitted."
+    )
     loader: str | None = Field(None, description="Loader name; auto-resolved at construction when not set.")
     parallelism: ParallelismConfig = Field(
         default_factory=ParallelismConfig, description="Loader-specific parallelism."
