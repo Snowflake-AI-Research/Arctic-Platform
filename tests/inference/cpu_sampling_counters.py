@@ -1,4 +1,4 @@
-"""CPU contract: real worker/collector/scheduler, no Ray service or model."""
+"""Standalone CPU contract; import stubs require an isolated interpreter."""
 import asyncio
 import importlib
 import json
@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 for name in ('vllm', 'vllm.config', 'vllm.v1', 'vllm.v1.metrics',
              'vllm.v1.metrics.loggers', 'vllm.v1.metrics.stats', 'ray'):
