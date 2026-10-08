@@ -170,7 +170,7 @@ def build_iter_full_hf_weights(model: nn.Module):
             return -1
         return int(index) if index.isdigit() else -1
 
-    def iterator():
+    def iterator(*, include_skipped: bool = False):
         is_master = dist.get_rank() == 0
         from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
 
@@ -182,7 +182,7 @@ def build_iter_full_hf_weights(model: nn.Module):
         }
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
         for name, tensor in named_weight_sync_tensors(model):
-            if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
+            if not include_skipped and (getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids):
                 continue
             hf_name = hf_export_param_name(name)
             if hf_name is not None:
