@@ -1,7 +1,7 @@
 """GPU-resident caches for router-replay tensors.
 
 TX (sampling side, overwrite-on-put) and RX (training side, pop-on-read)
-share a common base. Tensors are ``torch.uint8`` on the worker's device,
+share a common base. Tensors are ``torch.int32`` on the worker's device,
 shape ``[seq_len, num_layers, topk]``. Byte counts back ``max_bytes``
 backpressure (raises ``RouterReplayCacheFull``).
 """
@@ -21,7 +21,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-ROUTER_REPLAY_CACHE_DTYPE = torch.uint8
+ROUTER_REPLAY_CACHE_DTYPE = torch.int32
 EXACT_REPLAY_ID_PREFIX = "rr1:"
 _TOMBSTONE_ORDER_LOCK_STRIPES = 64
 
@@ -124,7 +124,7 @@ class _RouterReplayCacheBase:
     # ------------------------------------------------------------------
 
     def put(self, sample_id: str, value: torch.Tensor | np.ndarray) -> None:
-        """Insert or replace the entry; coerces to uint8 on self.device.
+        """Insert or replace the entry; coerces to int32 on self.device.
 
         Overwrite drops the prior tensor BEFORE the max_bytes check so a
         multi-turn rollout replacing its own prior turn does not double-count.

@@ -18,11 +18,14 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 from torch import nn
+from transformers.cache_utils import Cache
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextForConditionalGeneration
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextMoE
 
 from arctic_platform.model.implementations.fp8 import BlockFp8Linear
 from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
+
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
@@ -76,6 +79,65 @@ def _replace_native_fp8_linears(model: nn.Module, config, block_size: int) -> No
         )
 
 
+
+
+class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        prev_topk_indices: torch.Tensor | None = None,
+        routed_experts: Tensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        dtype = hidden_states.dtype
+
+        residual = hidden_states
+        post, comb, hidden_states = self.attn_hc(hidden_states)
+        # Self attn
+        hidden_states = self.input_layernorm(hidden_states)
+        topk_indices = None
+        if self.block_type == "linear_attention":
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                cache_params=past_key_values,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+        else:
+            hidden_states, _, topk_indices = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                position_embeddings=position_embeddings,
+                prev_topk_indices=prev_topk_indices,
+                **kwargs,
+            )
+        hidden_states = post.to(dtype).unsqueeze(-1) * hidden_states.unsqueeze(-2) + torch.matmul(
+            comb.to(dtype).transpose(-1, -2), residual
+        )
+
+        residual = hidden_states
+        post, comb, hidden_states = self.ffn_hc(hidden_states)
+        # Feed forward
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        if isinstance(self.mlp, MoE):
+            routes = routed_experts[:, :, self._replay_layer_idx, :] if routed_experts is not None else None
+            hidden_states = self.mlp(hidden_states, routed_experts=routes)
+        else:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states = post.to(dtype).unsqueeze(-1) * hidden_states.unsqueeze(-2) + torch.matmul(
+            comb.to(dtype).transpose(-1, -2), residual
+        )
+
+        return hidden_states, topk_indices
+
 class Glm5NextForConditionalGenerationPrimeRL(
     Glm5NextForConditionalGeneration,
     PreTrainedModelPrimeRL,
@@ -86,7 +148,9 @@ class Glm5NextForConditionalGenerationPrimeRL(
             raise NotImplementedError("GLM-5.3 training only supports BF16 or fine-grained FP8 checkpoints")
         super().__init__(config)
         text_config = config.text_config
-        for layer in self.model.language_model.layers:
+        for layer_idx, layer in enumerate(self.model.language_model.layers):
+            layer.__class__ = Glm5NextTextDecoderLayerPrimeRL
+            layer._replay_layer_idx = layer_idx
             if not isinstance(layer.mlp, Glm5NextTextMoE):
                 continue
             layer.mlp = MoE(

@@ -39,8 +39,8 @@ from arctic_platform.inference.server.router_replay.cache import (
 
 logger = logging.getLogger(__name__)
 
-# Dtype stored/transferred for routed_experts. Qwen3.6 MoE has 256 experts,
-# so ids are in [0, 255] and fit in uint8. Training widens to int64 at the
+# Dtype stored/transferred for routed_experts supports IDs above 255.
+# Use signed int32 for Gloo/NCCL collective support. Training widens to int64 at the
 # model boundary where torch gather/DeepEP dispatch require long indices.
 _ROUTED_EXPERTS_DTYPE = ROUTER_REPLAY_CACHE_DTYPE
 
