@@ -12,12 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Provision a Cortex job for the in-process Tinker client.
+"""Build the Cortex job a Tinker client trains and samples on.
 
-``python -m arctic_platform.tinker.run`` builds a :class:`TinkerServeConfig`
-from ``--training-gpus`` and ``--sampling-gpus`` and calls :func:`_client_config`.
-Tinker has no verb for GPU count, ZeRO, or attention implementation, so those
-are set here.
+Tinker has no verb for GPU count, ZeRO, LoRA targets, or sequence isolation.
+:class:`TinkerJobConfig` holds those choices. :func:`client_config` turns one
+into the Cortex client config. :func:`isolation` decides whether each
+micro-batch holds a single sequence.
 """
 
 from __future__ import annotations
@@ -28,11 +28,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-__all__ = ["TinkerServeConfig"]
+__all__ = ["TinkerJobConfig", "client_config", "isolation"]
 
 
 @dataclass
-class TinkerServeConfig:
+class TinkerJobConfig:
     # None reads the connection from ARCTIC_CORTEX_* instead, which is how the
     # other Cortex integrations are configured.
     config: str | None = None
@@ -108,7 +108,7 @@ _LORA_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _lora_groups(cfg: TinkerServeConfig) -> list[str]:
+def _lora_groups(cfg: TinkerJobConfig) -> list[str]:
     groups = [g.strip() for g in cfg.lora_modules.split(",") if g.strip()]
     unknown = sorted(set(groups) - set(_LORA_MODULE_GROUPS))
     if unknown or not groups:
@@ -116,7 +116,7 @@ def _lora_groups(cfg: TinkerServeConfig) -> list[str]:
     return groups
 
 
-def _peft_config(cfg: TinkerServeConfig) -> dict[str, Any] | None:
+def _peft_config(cfg: TinkerJobConfig) -> dict[str, Any] | None:
     if cfg.lora_rank <= 0:
         return None
     return {
@@ -134,7 +134,7 @@ def _has_linear_attention(model_config: Any) -> bool:
     return "linear_attention" in (getattr(text_config, "layer_types", None) or [])
 
 
-def _isolation(cfg: TinkerServeConfig, model_config: Any) -> tuple[TinkerServeConfig, int | None]:
+def isolation(cfg: TinkerJobConfig, model_config: Any) -> tuple[TinkerJobConfig, int | None]:
     """The config to provision and the backend's ``isolate_capacity``.
 
     Isolating caps a micro-batch at one full-length sequence, so any two rows
@@ -150,7 +150,7 @@ def _isolation(cfg: TinkerServeConfig, model_config: Any) -> tuple[TinkerServeCo
     return replace(cfg, max_tokens_per_mb=cfg.max_seq_len), cfg.max_seq_len
 
 
-def _client_config(cfg: TinkerServeConfig) -> Any:
+def client_config(cfg: TinkerJobConfig) -> Any:
     from arctic_platform.client import ArcticClientConfig
     from arctic_platform.client import CortexConfig
     from arctic_platform.client import SamplingConfig

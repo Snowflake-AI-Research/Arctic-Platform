@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The Tinker router's verbs, lowered onto Cortex.
+"""Tinker training calls, lowered onto Cortex.
 
 CPU only: the client is a stub that records what the binder sent, so these pin
 the wire shape and the frame arithmetic without a Cortex job.
@@ -76,8 +76,8 @@ class _StubClient:
         return {"ok": True}
 
 
-def _router_batch():
-    """A batch in the router's layout: ``[pad… prompt][response pad…]``."""
+def _packed_batch():
+    """A batch in the datum layout: ``[pad… prompt][response pad…]``."""
     attention_mask = torch.tensor(
         [[0, 0, 1, 1, 1, 1, 0, 0], [0, 0, 0, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1, 1]],
         dtype=torch.long,
@@ -101,14 +101,14 @@ def _router_batch():
 
 
 def _ratio_loss_batch(ratio_clip=(0.8, 1.2)):
-    batch = _router_batch()
+    batch = _packed_batch()
     batch["processing"] = {"loss_fn": "verl_grpo", "ratio_clip": ratio_clip}
     return batch
 
 
 class TestRowAlignment:
     def test_real_tokens_move_to_leading_columns(self):
-        batch = _router_batch()["batch"]
+        batch = _packed_batch()["batch"]
         order, valid = _align_plan(batch["attention_mask"])
         aligned = _align(batch, order, valid)
         # Cortex's packer requires exactly this: leading real tokens, tail pads.
@@ -119,7 +119,7 @@ class TestRowAlignment:
 
     def test_scoring_tensors_ride_the_same_permutation(self):
         """`advantages` must stay on the token it scored, not just get sorted."""
-        batch = _router_batch()["batch"]
+        batch = _packed_batch()["batch"]
         order, valid = _align_plan(batch["attention_mask"])
         aligned = _align(batch, order, valid)
         for row in range(batch["input_ids"].shape[0]):
@@ -138,7 +138,7 @@ class TestRowAlignment:
             assert before == after
 
     def test_unalign_restores_the_original_frame(self):
-        batch = _router_batch()["batch"]
+        batch = _packed_batch()["batch"]
         order, valid = _align_plan(batch["attention_mask"])
         aligned = _align(batch, order, valid)
         restored = _unalign_rows(aligned["input_ids"].to(torch.float32), order)
@@ -148,11 +148,11 @@ class TestRowAlignment:
     def test_skipping_the_inverse_would_shift_rows(self):
         """Discriminative: the un-align is load-bearing, not decorative.
 
-        Without it the log-probs stay in the aligned frame while the router
+        Without it the log-probs stay in the aligned frame while convert.py
         slices the original one, which is a silent per-row shift rather than an
         error. If this ever stops differing, the inverse has become untested.
         """
-        batch = _router_batch()["batch"]
+        batch = _packed_batch()["batch"]
         order, valid = _align_plan(batch["attention_mask"])
         aligned = _align(batch, order, valid)["input_ids"].to(torch.float32)
         mask = batch["attention_mask"]
@@ -165,10 +165,10 @@ class TestForwardBackwardWire:
     def test_payload_uses_a_loss_cortex_registers(self):
         client = _StubClient()
         backend = CortexTinkerBackend(client)
-        asyncio.run(backend.fwd_bwd(_router_batch()))
+        asyncio.run(backend.fwd_bwd(_packed_batch()))
         (payload,) = client.sent
         # ArcticTraining-dss registers causal_cross_entropy / grpo / grpo_echo_v1.
-        # The router asks for verl_grpo, which would not resolve there.
+        # convert.py asks for verl_grpo, which would not resolve there.
         assert payload["processing"]["loss_fn"] == "grpo"
         # Cortex zones register `compute_logprobs`; `compute_entropy_and_logprobs`
         # does not exist there and the zone refuses before any model call.
@@ -177,15 +177,15 @@ class TestForwardBackwardWire:
 
     def test_sends_left_aligned_rows(self):
         client = _StubClient()
-        asyncio.run(CortexTinkerBackend(client).fwd_bwd(_router_batch()))
+        asyncio.run(CortexTinkerBackend(client).fwd_bwd(_packed_batch()))
         mask = client.sent[0]["kwargs"]["attention_mask"]
         lengths = mask.sum(1)
         for row, n in enumerate(lengths.tolist()):
             assert mask[row, :n].all() and not mask[row, n:].any()
 
-    def test_logprobs_come_back_in_the_routers_frame(self):
-        """End to end through the binder: what the router reads must line up."""
-        batch = _router_batch()
+    def test_logprobs_come_back_in_the_datum_frame(self):
+        """End to end through the binder: what convert.py reads must line up."""
+        batch = _packed_batch()
         client = _StubClient()  # echoes input_ids as logprobs
         out = asyncio.run(CortexTinkerBackend(client).fwd_bwd(batch))
         mask = batch["batch"]["attention_mask"]
@@ -196,7 +196,7 @@ class TestForwardBackwardWire:
 
     def test_old_log_probs_are_not_sent_without_a_ratio_loss(self):
         client = _StubClient()
-        asyncio.run(CortexTinkerBackend(client).fwd_bwd(_router_batch()))
+        asyncio.run(CortexTinkerBackend(client).fwd_bwd(_packed_batch()))
         assert "old_log_probs" not in client.sent[0]["kwargs"]
         assert "old_log_probs_shifted" not in client.sent[0]["context"]
 
@@ -271,19 +271,19 @@ class TestRowPadding:
 
     def test_full_batch_is_untouched(self):
         client = _StubClient()
-        asyncio.run(CortexTinkerBackend(client, min_rows=3).fwd_bwd(_router_batch()))
+        asyncio.run(CortexTinkerBackend(client, min_rows=3).fwd_bwd(_packed_batch()))
         assert client.sent[0]["kwargs"]["input_ids"].shape[0] == 3
 
     def test_build_handlers_pads_to_the_jobs_training_gpus(self):
         client = _StubClient(training_gpus=4)
-        asyncio.run(build_handlers(client)["fwd_bwd_handler"](_router_batch()))
+        asyncio.run(build_handlers(client)["fwd_bwd_handler"](_packed_batch()))
         assert client.sent[0]["kwargs"]["input_ids"].shape[0] == 4
 
 
 class TestIsolatedSequences:
     """Rows lengthened past half a micro-batch, so Cortex never packs two together."""
 
-    CAPACITY = 8  # the router frame's width, as serve provisions it
+    CAPACITY = 8  # the datum frame's width, as job.py provisions it
 
     def _run(self, min_rows=1):
         batch = _ratio_loss_batch()
@@ -312,7 +312,7 @@ class TestIsolatedSequences:
             assert not payload["context"]["advantages"][row, n:].any()
             assert not payload["context"]["old_log_probs_shifted"][row, n:].any()
 
-    def test_logprobs_return_in_the_routers_frame(self):
+    def test_logprobs_return_in_the_datum_frame(self):
         batch, _, out = self._run(min_rows=4)
         mask = batch["batch"]["attention_mask"]
         assert out["batch"]["logprobs"].shape == mask.shape
@@ -321,7 +321,7 @@ class TestIsolatedSequences:
     def test_rows_wider_than_the_frame_refused(self):
         backend = CortexTinkerBackend(_StubClient(), isolate_capacity=64)
         with pytest.raises(ValueError, match="cannot extend rows of width 8 to 33"):
-            asyncio.run(backend.fwd_bwd(_router_batch()))
+            asyncio.run(backend.fwd_bwd(_packed_batch()))
 
 
 class TestCortexResponseShapes:
@@ -351,7 +351,7 @@ class TestCortexResponseShapes:
         return _Fixed()
 
     def test_nested_lists_under_post_process_outputs(self):
-        batch = _router_batch()
+        batch = _packed_batch()
         ids = batch["batch"]["input_ids"]
         order, valid = _align_plan(batch["batch"]["attention_mask"])
         aligned = _align(batch["batch"], order, valid)["input_ids"]
@@ -367,7 +367,7 @@ class TestCortexResponseShapes:
         torch_assert_equal(out["batch"]["logprobs"].to(torch.long) * mask, ids * mask)
 
     def test_top_level_tensor(self):
-        batch = _router_batch()
+        batch = _packed_batch()
         ids = batch["batch"]["input_ids"]
         order, valid = _align_plan(batch["batch"]["attention_mask"])
         aligned = _align(batch["batch"], order, valid)["input_ids"]
@@ -380,12 +380,12 @@ class TestCortexResponseShapes:
 class TestMissingLogprobsFailLoud:
     @pytest.mark.parametrize("response", ["no_batch", "empty_batch"])
     def test_absent_logprobs_raise_instead_of_defaulting(self, response):
-        """The router's fallback is an empty dict, which surfaces in the cookbook
+        """The client's fallback is an empty dict, which surfaces in the cookbook
         as a bare KeyError frames away. These log-probs also feed the
         sampler-vs-trainer KL check, so zeros would disable that alarm."""
         client = _StubClient(logprobs=None, batch_key="batch" if response == "empty_batch" else "other")
         with pytest.raises(RuntimeError, match="no per-token log-probs"):
-            asyncio.run(CortexTinkerBackend(client).fwd_bwd(_router_batch()))
+            asyncio.run(CortexTinkerBackend(client).fwd_bwd(_packed_batch()))
 
 
 class TestStepAndHandlers:

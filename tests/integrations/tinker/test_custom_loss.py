@@ -20,12 +20,12 @@ import numpy as np
 import pytest
 import torch
 
+from arctic_platform.integrations.tinker.convert import Datum
+from arctic_platform.integrations.tinker.convert import EncodedTextChunk
+from arctic_platform.integrations.tinker.convert import ModelInput
+from arctic_platform.integrations.tinker.convert import TensorData
+from arctic_platform.integrations.tinker.convert import datum_list_to_arctic_batch
 from arctic_platform.integrations.tinker.cortex import _grpo_surrogate
-from arctic_platform.integrations.tinker.router import Datum
-from arctic_platform.integrations.tinker.router import EncodedTextChunk
-from arctic_platform.integrations.tinker.router import ModelInput
-from arctic_platform.integrations.tinker.router import TensorData
-from arctic_platform.integrations.tinker.router import datum_list_to_arctic_batch
 
 MPL, MRL = 4, 4
 

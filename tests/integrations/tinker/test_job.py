@@ -20,15 +20,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from arctic_platform.integrations.tinker.serve import TinkerServeConfig
-from arctic_platform.integrations.tinker.serve import _client_config
-from arctic_platform.integrations.tinker.serve import _isolation
+from arctic_platform.integrations.tinker.job import TinkerJobConfig
+from arctic_platform.integrations.tinker.job import client_config
+from arctic_platform.integrations.tinker.job import isolation
 
 
 def test_client_config_uses_packaged_types(monkeypatch):
     monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://cortex.test")
 
-    config = _client_config(TinkerServeConfig())
+    config = client_config(TinkerJobConfig())
 
     assert config.backend.base_url == "http://cortex.test"
     assert config.training.peft is None
@@ -40,16 +40,16 @@ def test_client_config_reads_a_connection_file(tmp_path):
     path = tmp_path / "connection.json"
     path.write_text(json.dumps({"connection": {"base_url": "http://cortex.test"}}), encoding="utf-8")
 
-    config = _client_config(TinkerServeConfig(config=str(path)))
+    config = client_config(TinkerJobConfig(config=str(path)))
 
     assert config.backend.base_url == "http://cortex.test"
 
 
 def test_adam_is_provisioned_as_the_cookbook_sends_it(monkeypatch):
     monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://cortex.test")
-    cfg = TinkerServeConfig(training_gpus=1, sampling_gpus=0)
+    cfg = TinkerJobConfig(training_gpus=1, sampling_gpus=0)
 
-    training = _client_config(cfg).to_cortex()[0]["training_config"]
+    training = client_config(cfg).to_cortex()[0]["training_config"]
 
     assert training["optimizer"] == {
         "name": "AdamW",
@@ -79,9 +79,9 @@ def _model_config(layer_types, nested=True):
     ids=["qwen3.5", "dense", "no-layer-types", "on", "off"],
 )
 def test_sequences_are_isolated_for_linear_attention(setting, model_config, isolated):
-    cfg = TinkerServeConfig(isolate_sequences=setting, max_prompt_length=1024, max_response_length=512)
+    cfg = TinkerJobConfig(isolate_sequences=setting, max_prompt_length=1024, max_response_length=512)
 
-    job_cfg, capacity = _isolation(cfg, model_config)
+    job_cfg, capacity = isolation(cfg, model_config)
 
     if isolated:
         # One full-length sequence per micro-batch.
@@ -92,14 +92,14 @@ def test_sequences_are_isolated_for_linear_attention(setting, model_config, isol
 
 def test_unknown_isolation_setting_refused():
     with pytest.raises(ValueError, match="--isolate-sequences"):
-        _isolation(TinkerServeConfig(isolate_sequences="yes"), SimpleNamespace())
+        isolation(TinkerJobConfig(isolate_sequences="yes"), SimpleNamespace())
 
 
 def test_lora_matches_tinkers_module_groups(monkeypatch):
     monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://cortex.test")
-    cfg = TinkerServeConfig(lora_rank=32, lora_modules="mlp,unembed")
+    cfg = TinkerJobConfig(lora_rank=32, lora_modules="mlp,unembed")
 
-    peft = _client_config(cfg).training.peft
+    peft = client_config(cfg).training.peft
 
     assert peft == {
         "peft_type": "Lora",
@@ -114,4 +114,4 @@ def test_lora_matches_tinkers_module_groups(monkeypatch):
 def test_unknown_lora_module_group_refused(monkeypatch):
     monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://cortex.test")
     with pytest.raises(ValueError, match="--lora-modules"):
-        _client_config(TinkerServeConfig(lora_rank=8, lora_modules="mlp,embed"))
+        client_config(TinkerJobConfig(lora_rank=8, lora_modules="mlp,embed"))

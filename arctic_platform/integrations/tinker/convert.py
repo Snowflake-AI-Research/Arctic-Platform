@@ -15,8 +15,7 @@
 
 """Convert Tinker datums, losses, and sampling params into Cortex batch fields.
 
-The in-process client in :mod:`arctic_platform.tinker` calls these helpers.
-This module does not open a server and does not import Cortex.
+:mod:`arctic_platform.tinker` calls these helpers. This module does not import Cortex.
 """
 
 from __future__ import annotations
@@ -30,6 +29,22 @@ from typing import Union
 import numpy as np
 from pydantic import BaseModel
 from pydantic import Field
+
+__all__ = [
+    "AdamParams",
+    "Datum",
+    "EncodedTextChunk",
+    "ModelInput",
+    "SamplingParams",
+    "TensorData",
+    "adam_params_to_optim_overrides",
+    "arctic_metrics_to_tinker",
+    "check_fixed_adam",
+    "datum_list_to_arctic_batch",
+    "model_input_to_tokens",
+    "sampling_params_tinker_to_vllm",
+    "unpad_logprobs_to_loss_fn_outputs",
+]
 
 
 class TensorData(BaseModel):
@@ -73,9 +88,7 @@ class SamplingParams(BaseModel):
     top_p: float = 1.0
 
 
-# =============================================================================
-# Adapters — Tinker wire types → Arctic native shapes
-# =============================================================================
+# Tinker values → Cortex batch fields.
 
 # Tinker loss name -> the intermediate Arctic loss name. The Cortex binder
 # maps ratio losses to ``grpo`` and custom cross-entropy to its gradient
@@ -115,7 +128,7 @@ def _ratio_clip(loss_fn: str, loss_fn_config: dict[str, float] | None) -> tuple[
     return None
 
 
-def _model_input_to_tokens(model_input: ModelInput) -> list[int]:
+def model_input_to_tokens(model_input: ModelInput) -> list[int]:
     """Flatten a ``ModelInput`` into a token list."""
     out: list[int] = []
     for chunk in model_input.chunks:
@@ -226,7 +239,7 @@ def datum_list_to_arctic_batch(
     row_slices: list[tuple[int, int, int]] = []
 
     for i, datum in enumerate(data):
-        toks = _model_input_to_tokens(datum.model_input)
+        toks = model_input_to_tokens(datum.model_input)
         inputs = datum.loss_fn_inputs
         if ratio_clip is not None and "logprobs" not in inputs:
             # Zeros in their place would make the ratio exp(logp) instead of p/q.
@@ -306,7 +319,7 @@ def datum_list_to_arctic_batch(
     return batch_dict, row_slices
 
 
-def _unpad_logprobs_to_loss_fn_outputs(
+def unpad_logprobs_to_loss_fn_outputs(
     logprobs_batch: Any, row_slices: list[tuple[int, int, int]]
 ) -> list[dict[str, Any]]:
     """Un-pad Arctic's logprob tensor into per-Datum ``LossFnOutput`` dicts

@@ -22,16 +22,16 @@ import math
 import numpy as np
 import pytest
 
-from arctic_platform.integrations.tinker.router import AdamParams
-from arctic_platform.integrations.tinker.router import Datum
-from arctic_platform.integrations.tinker.router import EncodedTextChunk
-from arctic_platform.integrations.tinker.router import ModelInput
-from arctic_platform.integrations.tinker.router import SamplingParams
-from arctic_platform.integrations.tinker.router import TensorData
-from arctic_platform.integrations.tinker.router import adam_params_to_optim_overrides
-from arctic_platform.integrations.tinker.router import check_fixed_adam
-from arctic_platform.integrations.tinker.router import datum_list_to_arctic_batch
-from arctic_platform.integrations.tinker.router import sampling_params_tinker_to_vllm
+from arctic_platform.integrations.tinker.convert import AdamParams
+from arctic_platform.integrations.tinker.convert import Datum
+from arctic_platform.integrations.tinker.convert import EncodedTextChunk
+from arctic_platform.integrations.tinker.convert import ModelInput
+from arctic_platform.integrations.tinker.convert import SamplingParams
+from arctic_platform.integrations.tinker.convert import TensorData
+from arctic_platform.integrations.tinker.convert import adam_params_to_optim_overrides
+from arctic_platform.integrations.tinker.convert import check_fixed_adam
+from arctic_platform.integrations.tinker.convert import datum_list_to_arctic_batch
+from arctic_platform.integrations.tinker.convert import sampling_params_tinker_to_vllm
 
 
 def _mk_datum(tokens, advantages, logprobs, mask=None):

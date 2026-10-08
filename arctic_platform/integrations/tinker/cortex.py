@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Cortex backend for the Tinker API adapter.
+"""Run a Tinker forward-backward, optimizer step, or sample on a Cortex job.
 
-This module translates request envelopes and loss names, aligns padded rows for
-Cortex, and restores returned log-probs to Tinker's row layout.
+This module lowers loss names, aligns padded rows for Cortex, and restores
+returned log-probs to the datum layout from :mod:`arctic_platform.integrations.tinker.convert`.
 """
 
 from __future__ import annotations
@@ -33,12 +33,12 @@ if TYPE_CHECKING:
 
 __all__ = ["CortexTinkerBackend", "build_handlers"]
 
-# Cortex registers only `identity` and `compute_logprobs`. The router's default
+# Cortex registers only `identity` and `compute_logprobs`. convert.py's default
 # (`compute_entropy_and_logprobs`) does not exist there, and the zone refuses
 # the request before any model call.
 _POST_PROCESSORS = ["compute_logprobs"]
 
-# The loss the router names for Tinker's ``cross_entropy``, and the batch key
+# The loss convert.py names for Tinker's ``cross_entropy``, and the batch key
 # carrying its per-token weights.
 _WEIGHTED_LOGPROB_SUM = "weighted_logprob_sum"
 _LOGPROB_WEIGHTS = "logprob_weights_shifted"

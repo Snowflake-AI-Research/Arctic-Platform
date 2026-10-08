@@ -14,6 +14,12 @@ A recipe that constructs ``ServiceClient(base_url=...)`` itself still works
 when launched through ``python -m arctic_platform.tinker.run``, which sets
 those counts first. ``base_url`` is ignored. Connection settings stay in
 ``ARCTIC_CORTEX_*``.
+
+The classes in this file are the whole public client. They call three modules:
+
+- :mod:`arctic_platform.integrations.tinker.convert` turns datums and sampling params into batch fields.
+- :mod:`arctic_platform.integrations.tinker.job` chooses GPU count, LoRA, the optimizer, and sequence isolation.
+- :mod:`arctic_platform.integrations.tinker.cortex` runs forward-backward, the optimizer step, and sampling.
 """
 
 from __future__ import annotations
@@ -123,21 +129,21 @@ def _pick(explicit: int | None, key: str) -> int:
     return int(value)
 
 
-def _router_tensor(value: Any) -> Any:
-    from arctic_platform.integrations.tinker.router import TensorData
+def _as_tensor(value: Any) -> Any:
+    from arctic_platform.integrations.tinker.convert import TensorData
 
     array = np.asarray(value.to_numpy())
     dtype = "float32" if array.dtype.kind == "f" else "int64"
     return TensorData(dtype=dtype, data=array.reshape(-1).tolist(), shape=[int(n) for n in array.shape])
 
 
-def _router_datum(datum: Any) -> Any:
-    from arctic_platform.integrations.tinker.router import Datum
-    from arctic_platform.integrations.tinker.router import ModelInput
+def _as_datum(datum: Any) -> Any:
+    from arctic_platform.integrations.tinker.convert import Datum
+    from arctic_platform.integrations.tinker.convert import ModelInput
 
     return Datum(
         model_input=ModelInput.model_validate(datum.model_input.model_dump()),
-        loss_fn_inputs={key: _router_tensor(value) for key, value in datum.loss_fn_inputs.items()},
+        loss_fn_inputs={key: _as_tensor(value) for key, value in datum.loss_fn_inputs.items()},
     )
 
 
@@ -168,17 +174,17 @@ class SamplingClient:
         sampling_params: Any | None = None,
         **_: Any,
     ) -> Any:
-        from arctic_platform.integrations.tinker.router import ModelInput
-        from arctic_platform.integrations.tinker.router import SamplingParams
-        from arctic_platform.integrations.tinker.router import _model_input_to_tokens
-        from arctic_platform.integrations.tinker.router import sampling_params_tinker_to_vllm
+        from arctic_platform.integrations.tinker.convert import ModelInput
+        from arctic_platform.integrations.tinker.convert import SamplingParams
+        from arctic_platform.integrations.tinker.convert import model_input_to_tokens
+        from arctic_platform.integrations.tinker.convert import sampling_params_tinker_to_vllm
 
         if sampling_params is None:
             sampling_params = _sdk.SamplingParams()
         if abs(float(sampling_params.temperature) - 1.0) > 1e-9:
             raise RuntimeError("sampling temperature must be 1.0; Cortex scores training log-probs at temperature 1.0")
-        router_prompt = ModelInput.model_validate(prompt.model_dump())
-        tokens = _model_input_to_tokens(router_prompt)
+        converted = ModelInput.model_validate(prompt.model_dump())
+        tokens = model_input_to_tokens(converted)
         params = sampling_params_tinker_to_vllm(
             SamplingParams.model_validate(sampling_params.model_dump()),
             num_samples,
@@ -188,13 +194,13 @@ class SamplingClient:
 
     async def compute_logprobs_async(self, prompt: Any) -> list[float | None]:
         """Log-prob of each prompt token. The first entry is ``None``, matching Tinker."""
-        from arctic_platform.integrations.tinker.router import ModelInput
-        from arctic_platform.integrations.tinker.router import SamplingParams
-        from arctic_platform.integrations.tinker.router import _model_input_to_tokens
-        from arctic_platform.integrations.tinker.router import sampling_params_tinker_to_vllm
+        from arctic_platform.integrations.tinker.convert import ModelInput
+        from arctic_platform.integrations.tinker.convert import SamplingParams
+        from arctic_platform.integrations.tinker.convert import model_input_to_tokens
+        from arctic_platform.integrations.tinker.convert import sampling_params_tinker_to_vllm
 
-        router_prompt = ModelInput.model_validate(prompt.model_dump())
-        tokens = _model_input_to_tokens(router_prompt)
+        converted = ModelInput.model_validate(prompt.model_dump())
+        tokens = model_input_to_tokens(converted)
         params = sampling_params_tinker_to_vllm(SamplingParams(max_tokens=1, temperature=1.0), 1)
         params["prompt_logprobs"] = 0  # vLLM: 0 is the prompt token's own log-prob
         result = await self._session.generate(tokens, params)
@@ -256,9 +262,9 @@ class TrainingClient:
         return _Future(task)
 
     async def _forward_backward(self, data: list[Any], loss_fn: str, loss_fn_config: dict | None) -> Any:
-        from arctic_platform.integrations.tinker.router import _unpad_logprobs_to_loss_fn_outputs
-        from arctic_platform.integrations.tinker.router import arctic_metrics_to_tinker
-        from arctic_platform.integrations.tinker.router import datum_list_to_arctic_batch
+        from arctic_platform.integrations.tinker.convert import arctic_metrics_to_tinker
+        from arctic_platform.integrations.tinker.convert import datum_list_to_arctic_batch
+        from arctic_platform.integrations.tinker.convert import unpad_logprobs_to_loss_fn_outputs
 
         async with self._lock:
             if self._have_grad:
@@ -267,7 +273,7 @@ class TrainingClient:
                     "send the whole step in one call"
                 )
             batch, row_slices = datum_list_to_arctic_batch(
-                [_router_datum(datum) for datum in data],
+                [_as_datum(datum) for datum in data],
                 loss_fn,
                 self._max_prompt,
                 self._max_response,
@@ -283,7 +289,7 @@ class TrainingClient:
             self._have_grad = True
             logprobs = result.get("batch", {}).get("logprobs") if result.get("batch") else None
             if logprobs is not None:
-                outputs = _sdk_logprobs(_unpad_logprobs_to_loss_fn_outputs(logprobs, row_slices))
+                outputs = _sdk_logprobs(unpad_logprobs_to_loss_fn_outputs(logprobs, row_slices))
             else:
                 outputs = [{} for _ in data]
             return _sdk.ForwardBackwardOutput(
@@ -297,10 +303,10 @@ class TrainingClient:
         return _Future(task)
 
     async def _optim_step(self, adam_params: Any) -> Any:
-        from arctic_platform.integrations.tinker.router import AdamParams
-        from arctic_platform.integrations.tinker.router import adam_params_to_optim_overrides
-        from arctic_platform.integrations.tinker.router import arctic_metrics_to_tinker
-        from arctic_platform.integrations.tinker.router import check_fixed_adam
+        from arctic_platform.integrations.tinker.convert import AdamParams
+        from arctic_platform.integrations.tinker.convert import adam_params_to_optim_overrides
+        from arctic_platform.integrations.tinker.convert import arctic_metrics_to_tinker
+        from arctic_platform.integrations.tinker.convert import check_fixed_adam
 
         async with self._lock:
             if not self._have_grad:
@@ -451,12 +457,12 @@ class ServiceClient:
 
         from arctic_platform.client import AsyncArcticRLClient
         from arctic_platform.integrations.tinker.cortex import build_handlers
-        from arctic_platform.integrations.tinker.serve import TinkerServeConfig
-        from arctic_platform.integrations.tinker.serve import _client_config
-        from arctic_platform.integrations.tinker.serve import _isolation
+        from arctic_platform.integrations.tinker.job import TinkerJobConfig
+        from arctic_platform.integrations.tinker.job import client_config
+        from arctic_platform.integrations.tinker.job import isolation
 
         # Prompt cap fits a full student sequence. Response cap matches the student.
-        cfg = TinkerServeConfig(
+        cfg = TinkerJobConfig(
             model=model,
             training_gpus=0,
             sampling_gpus=self.teacher_sampling_gpus,
@@ -466,8 +472,8 @@ class ServiceClient:
             seed=7,
         )
         model_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
-        cfg, isolate = _isolation(cfg, model_config)
-        client = AsyncArcticRLClient(_client_config(cfg))
+        cfg, isolate = isolation(cfg, model_config)
+        client = AsyncArcticRLClient(client_config(cfg))
         _sessions.append(client)
         return TrainingClient(
             client,
@@ -484,11 +490,11 @@ class ServiceClient:
 
         from arctic_platform.client import AsyncArcticRLClient
         from arctic_platform.integrations.tinker.cortex import build_handlers
-        from arctic_platform.integrations.tinker.serve import TinkerServeConfig
-        from arctic_platform.integrations.tinker.serve import _client_config
-        from arctic_platform.integrations.tinker.serve import _isolation
+        from arctic_platform.integrations.tinker.job import TinkerJobConfig
+        from arctic_platform.integrations.tinker.job import client_config
+        from arctic_platform.integrations.tinker.job import isolation
 
-        cfg = TinkerServeConfig(
+        cfg = TinkerJobConfig(
             model=base_model,
             training_gpus=self.training_gpus,
             sampling_gpus=self.sampling_gpus,
@@ -499,8 +505,8 @@ class ServiceClient:
             seed=7 if seed is None else seed,
         )
         model_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
-        cfg, isolate = _isolation(cfg, model_config)
-        client = AsyncArcticRLClient(_client_config(cfg))
+        cfg, isolate = isolation(cfg, model_config)
+        client = AsyncArcticRLClient(client_config(cfg))
         _sessions.append(client)
         tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
         pad = tokenizer.pad_token_id

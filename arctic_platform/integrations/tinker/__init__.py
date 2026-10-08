@@ -12,8 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tinker datum conversion and Cortex job provisioning for the in-process client.
+"""Implementation behind :mod:`arctic_platform.tinker`.
 
-Nothing is imported here. Callers import :mod:`arctic_platform.tinker` or the
-helper modules directly.
+Nothing is imported here. Open the module that does the work:
+
+- :mod:`arctic_platform.integrations.tinker.convert` — datums, losses, sampling params
+- :mod:`arctic_platform.integrations.tinker.job` — GPU count, LoRA, optimizer, sequence isolation
+- :mod:`arctic_platform.integrations.tinker.cortex` — forward-backward, optimizer step, sampling
 """

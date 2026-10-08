@@ -18,15 +18,16 @@ Validated with `tinker==0.25.0` and `tinker-cookbook==0.5.5`.
 
 ## Request path
 
-`arctic_platform.tinker` opens the Cortex jobs and calls the handlers in
-`cortex.py` in-process. `router.py` converts datums, losses, and sampling
-params, and does not import Cortex. `cortex.py` is the only file that does.
+`arctic_platform.tinker` is the client a recipe imports. It calls three modules
+in `arctic_platform.integrations.tinker`: `convert.py` turns datums and sampling
+params into batch fields, `job.py` builds the Cortex job, and `cortex.py` runs
+that job. Only `cortex.py` imports Cortex.
 
 ```mermaid
 flowchart LR
   cookbook["tinker-cookbook"] --> client["arctic_platform.tinker"]
-  client --> router["router.py datum conversion"]
-  router --> cortex["cortex.py"]
+  client --> convert["convert.py datum conversion"]
+  convert --> cortex["cortex.py"]
   cortex -->|"forward_backward, optim_step, weight sync"| train["Cortex training job"]
   cortex -->|"sample"| sample["Cortex sampling job"]
 ```
@@ -37,7 +38,7 @@ One optimizer step:
 
 ```mermaid
 flowchart TD
-  A["forward_backward"] --> B["router: check the loss and the datum"]
+  A["forward_backward"] --> B["convert.py: check the loss and the datum"]
   B --> C["client: accept one gradient, refuse a second"]
   C --> D["cortex: left-align rows, isolate linear-attention sequences"]
   D --> E["cortex: lower the loss onto Cortex grpo"]
@@ -168,7 +169,7 @@ integration.
 
 ## Tensor layout
 
-The binder handles three tensor conventions:
+`cortex.py` handles three tensor conventions:
 
 - Tinker rows contain left prompt padding; Cortex expects valid tokens in
   leading columns. The Cortex binder aligns rows before the request and restores
@@ -234,7 +235,7 @@ handling. They do not require a Cortex account or GPU.
 |---|---|
 | `KeyError` from `get_recommended_renderer_name` | Pass `renderer_name` explicitly. |
 | `cortex ... returned no per-token log-probs` | Check the Cortex response shape and configured post-processor. |
-| `packing requires left-aligned rows` | Confirm requests pass through the Cortex binder. |
+| `packing requires left-aligned rows` | Confirm the batch went through `cortex.py`. |
 | Job remains in `PLACING` | Check account GPU capacity and quota. |
 | `429 ... GPU cap reached` | Release an existing job and retry after cancellation completes. |
 
@@ -242,7 +243,8 @@ handling. They do not require a Cortex account or GPU.
 
 | File | Role |
 |---|---|
-| `arctic_platform/tinker/` | In-process `tinker` module and recipe launcher |
-| `router.py` | Datum, loss, and sampling-param conversion |
-| `cortex.py` | Cortex request lowering and tensor alignment |
-| `serve.py` | Cortex job provisioning (`TinkerServeConfig`) |
+| `arctic_platform/tinker/__init__.py` | `ServiceClient`, `TrainingClient`, `SamplingClient` |
+| `arctic_platform/tinker/run.py` | `python -m arctic_platform.tinker.run` |
+| `arctic_platform/integrations/tinker/convert.py` | Datum, loss, and sampling-param conversion |
+| `arctic_platform/integrations/tinker/job.py` | Cortex job config (`TinkerJobConfig`) |
+| `arctic_platform/integrations/tinker/cortex.py` | Forward-backward, optimizer step, sampling |
