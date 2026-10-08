@@ -26,8 +26,10 @@ gradients, optimizer state, RNG state, or control flow. They may keep state,
 install read-only hooks (e.g. forward hooks), run collectives, and raise.
 Collectives a callback runs must be unconditional — every rank makes the same
 calls in the same order, never gated on rank or other rank-local state.
-Enablement comes from ``training_config``, identical on every rank, and
-callbacks run in registry order.
+``rank_zero_only`` callbacks are constructed only on rank 0, so they must not
+run collectives. A ``MetricsCallback`` with ``rank_zero_only`` may log only
+``Reduce.RANK0``. Enablement comes from ``training_config``, identical on every
+rank, and callbacks run in registry order.
 """
 
 from __future__ import annotations
@@ -90,7 +92,15 @@ class Callback:
 
     def post_fwd_bwd(self, trainer: Trainer, result: dict) -> None: ...
 
-    def pre_microbatch(self, trainer: Trainer, is_padding: bool) -> None: ...
+    def pre_fwd_bwd_microbatch(self, trainer: Trainer, is_padding: bool) -> None: ...
+
+    def post_fwd_bwd_microbatch(self, trainer: Trainer, is_padding: bool) -> None: ...
+
+    def pre_fwd_only(self, trainer: Trainer) -> None: ...
+
+    def post_fwd_only(self, trainer: Trainer, result: dict) -> None: ...
+
+    def pre_fwd_only_microbatch(self, trainer: Trainer, is_padding: bool) -> None: ...
 
     def pre_step(self, trainer: Trainer) -> None: ...
 
@@ -103,9 +113,14 @@ class MetricsCallback(Callback):
     """A ``Callback`` that reports metrics via ``self.log(...)``, flushed once per step."""
 
     def __init__(self, training_config: Mapping[str, Any]) -> None:
+        super().__init__(training_config)
         self.pending: Dict[str, Entry] = {}
 
     def log(self, name: str, value: Any, reduce: Reduce = Reduce.RANK0) -> None:
+        if self.rank_zero_only and reduce is not Reduce.RANK0:
+            raise ValueError(
+                f"{type(self).__name__} is rank_zero_only and can only log Reduce.RANK0, got {reduce.value}"
+            )
         if name in self.pending:
             raise ValueError(f"{type(self).__name__} logged {name!r} twice in one step")
         self.pending[name] = (reduce, value.tolist() if hasattr(value, "tolist") else value)
@@ -116,9 +131,7 @@ class CallbackRunner:
 
     def __init__(self, types: Sequence[Type[Callback]], training_config: Mapping[str, Any], rank: int) -> None:
         self.callbacks = [
-            t(training_config)
-            for t in types
-            if t.enabled(training_config) and (rank == 0 or not t.rank_zero_only)
+            t(training_config) for t in types if t.enabled(training_config) and (rank == 0 or not t.rank_zero_only)
         ]
         self._metrics = [cb for cb in self.callbacks if isinstance(cb, MetricsCallback)]
 
@@ -127,13 +140,15 @@ class CallbackRunner:
             getattr(cb, hook)(trainer, *args)
 
     def flush(self) -> Dict[str, Entry]:
-        merged: Dict[str, Entry] = {}
-        for cb in self._metrics:
-            if clash := merged.keys() & cb.pending.keys():
-                raise ValueError(f"metric names logged by more than one callback: {sorted(clash)}")
-            merged.update(cb.pending)
-        self._clear()
-        return merged
+        try:
+            merged: Dict[str, Entry] = {}
+            for cb in self._metrics:
+                if clash := merged.keys() & cb.pending.keys():
+                    raise ValueError(f"metric names logged by more than one callback: {sorted(clash)}")
+                merged.update(cb.pending)
+            return merged
+        finally:
+            self._clear()
 
     def on_error(self, trainer: Trainer, stage: str, exc: BaseException) -> None:
         self._clear()
@@ -161,6 +176,8 @@ _COMBINE = {
 
 def merge_metrics(per_rank: Sequence[Mapping[str, Entry]]) -> Dict[str, Any]:
     """Driver side: merge every rank's flushed metrics. ``per_rank`` is in rank order."""
+    if not per_rank:
+        raise ValueError("per_rank is empty")
     merged = {name: value for name, (op, value) in per_rank[0].items() if op is Reduce.RANK0}
     reduced = [{name: e for name, e in rank.items() if e[0] is not Reduce.RANK0} for rank in per_rank]
     ops = [{name: op for name, (op, _) in rank.items()} for rank in reduced]
@@ -172,11 +189,26 @@ def merge_metrics(per_rank: Sequence[Mapping[str, Entry]]) -> Dict[str, Any]:
     return merged
 
 
+def _value_kind(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return "mapping"
+    if isinstance(value, list):
+        return "list"
+    return "scalar"
+
+
 def _combine(op: Callable[[List[Any]], Any], values: List[Any]) -> Any:
-    if isinstance(values[0], Mapping):
-        if any(v.keys() != values[0].keys() for v in values):
+    if not values:
+        raise ValueError("no values to combine")
+    kind = _value_kind(values[0])
+    if any(_value_kind(value) != kind for value in values):
+        raise ValueError("ranks logged values of different types")
+    if kind == "mapping":
+        if any(value.keys() != values[0].keys() for value in values):
             raise ValueError("ranks logged dicts with different keys")
-        return {k: _combine(op, [v[k] for v in values]) for k in values[0]}
-    if isinstance(values[0], list):
+        return {key: _combine(op, [value[key] for value in values]) for key in values[0]}
+    if kind == "list":
+        if any(len(value) != len(values[0]) for value in values):
+            raise ValueError("ranks logged lists of different lengths")
         return [_combine(op, list(column)) for column in zip(*values, strict=True)]
     return op(values)
