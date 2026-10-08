@@ -36,6 +36,9 @@ HIDDEN = 2048
 KEY_DIM = 2048
 VALUE_DIM = 4096
 NUM_V_HEADS = 32
+GLM_OUTPUT_SIZES = [256, 256, 256, 8, 16, 16]
+GLM_REPLICATED_SHARDS = {4, 5}
+INDEXER_OUTPUT_SIZES = [256, 8]
 DTYPE = torch.bfloat16
 SEED = 4321
 
@@ -59,10 +62,29 @@ def _expected_local(full: torch.Tensor, output_sizes, tp_size, tp_rank):
     return torch.cat(pieces, dim=0).contiguous()
 
 
+def _expected_local_with_replicated(
+    full: torch.Tensor, output_sizes, replicated_shards, tp_size, tp_rank
+):
+    pieces = []
+    offset = 0
+    for shard_id, size in enumerate(output_sizes):
+        block = full[offset:offset + size, :]
+        if shard_id in replicated_shards:
+            pieces.append(block)
+        else:
+            local = size // tp_size
+            pieces.append(block[tp_rank * local:(tp_rank + 1) * local, :])
+        offset += size
+    return torch.cat(pieces, dim=0).contiguous()
+
+
 def _build_model(device):
     from torch import nn
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
     from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+    from vllm.models.glm5next.nvidia.kda import (
+        _Glm5NextMergedColumnParallelLinear,
+    )
 
     qkvz = MergedColumnParallelLinear(
         input_size=HIDDEN,
@@ -74,15 +96,30 @@ def _build_model(device):
         output_sizes=[NUM_V_HEADS, NUM_V_HEADS],
         bias=False, prefix="linear_attn.in_proj_ba",
     ).to(device)
+    glm = _Glm5NextMergedColumnParallelLinear(
+        input_size=HIDDEN,
+        output_sizes=GLM_OUTPUT_SIZES,
+        replicated_shard_ids=tuple(GLM_REPLICATED_SHARDS),
+        tp_size=torch.distributed.get_world_size(),
+        bias=False,
+        prefix="linear_attn.in_proj_qkvbfg_a",
+    ).to(device)
+    indexer = MergedColumnParallelLinear(
+        input_size=HIDDEN,
+        output_sizes=INDEXER_OUTPUT_SIZES,
+        bias=False,
+        prefix="self_attn.indexer.wk_weights_proj",
+    ).to(device)
 
     class FakeGDN(GatedDeltaNetAttention):
         # Bypass the heavy GatedDeltaNetAttention.__init__ (needs a full
         # config); we only need a real isinstance so the writer's parent-type
         # anchor recognises the linear-attn block.
-        def __init__(self, qkvz, ba):
+        def __init__(self, qkvz, ba, glm):
             nn.Module.__init__(self)
             self.in_proj_qkvz = qkvz
             self.in_proj_ba = ba
+            self.in_proj_qkvbfg_a = glm
 
         def get_state_shape(self):  # abstract in GatedDeltaNetAttention
             return ()
@@ -90,7 +127,10 @@ def _build_model(device):
     class Layer(nn.Module):
         def __init__(self):
             super().__init__()
-            self.linear_attn = FakeGDN(qkvz, ba)
+            self.linear_attn = FakeGDN(qkvz, ba, glm)
+            self.self_attn = nn.Module()
+            self.self_attn.indexer = nn.Module()
+            self.self_attn.indexer.wk_weights_proj = indexer
 
     class Inner(nn.Module):
         def __init__(self):
@@ -108,7 +148,7 @@ def _build_model(device):
                 f"families; got {[n for n, _ in weights]}"
             )
 
-    return Model(), qkvz, ba
+    return Model(), qkvz, ba, glm, indexer
 
 
 def _worker(rank: int, tp_size: int, port: int, ret: dict):
@@ -136,10 +176,12 @@ def _worker(rank: int, tp_size: int, port: int, ret: dict):
             initialize_model_parallel(tensor_model_parallel_size=tp_size)
             tp_rank = get_tensor_model_parallel_rank()
 
-            model, qkvz, ba = _build_model(device)
+            model, qkvz, ba, glm, indexer = _build_model(device)
             with torch.no_grad():
                 qkvz.weight.zero_()
                 ba.weight.zero_()
+                glm.weight.zero_()
+                indexer.weight.zero_()
 
             g = torch.Generator().manual_seed(SEED)
             full_qkvz = torch.randn(
@@ -147,6 +189,12 @@ def _worker(rank: int, tp_size: int, port: int, ret: dict):
                 dtype=torch.float32).to(DTYPE).to(device)
             full_ba = torch.randn(
                 2 * NUM_V_HEADS, HIDDEN, generator=g,
+                dtype=torch.float32).to(DTYPE).to(device)
+            full_glm = torch.randn(
+                sum(GLM_OUTPUT_SIZES), HIDDEN, generator=g,
+                dtype=torch.float32).to(DTYPE).to(device)
+            full_indexer = torch.randn(
+                sum(INDEXER_OUTPUT_SIZES), HIDDEN, generator=g,
                 dtype=torch.float32).to(DTYPE).to(device)
 
             from arctic_platform.inference.server.weight_sync.utils import (
@@ -157,21 +205,38 @@ def _worker(rank: int, tp_size: int, port: int, ret: dict):
                 "model.layers.0.linear_attn.in_proj_qkvz.weight", full_qkvz)
             h_ba = writer.feed(
                 "model.layers.0.linear_attn.in_proj_ba.weight", full_ba)
+            h_glm = writer.feed(
+                "model.layers.0.linear_attn.in_proj_qkvbfg_a.weight", full_glm)
+            h_indexer = writer.feed(
+                "model.layers.0.self_attn.indexer.wk_weights_proj.weight",
+                full_indexer,
+            )
 
             exp_qkvz = _expected_local(
                 full_qkvz, [KEY_DIM, KEY_DIM, VALUE_DIM, VALUE_DIM],
                 tp_size, tp_rank)
             exp_ba = _expected_local(
                 full_ba, [NUM_V_HEADS, NUM_V_HEADS], tp_size, tp_rank)
+            exp_glm = _expected_local_with_replicated(
+                full_glm, GLM_OUTPUT_SIZES, GLM_REPLICATED_SHARDS,
+                tp_size, tp_rank)
+            exp_indexer = _expected_local(
+                full_indexer, INDEXER_OUTPUT_SIZES, tp_size, tp_rank)
 
             ret[rank] = {
                 "tp_rank": tp_rank,
                 "err": None,
-                "handled": bool(h_qkvz and h_ba),
+                "handled": bool(h_qkvz and h_ba and h_glm and h_indexer),
                 "qkvz_match": bool(qkvz.weight.data.shape == exp_qkvz.shape
                                    and torch.equal(qkvz.weight.data, exp_qkvz)),
                 "ba_match": bool(ba.weight.data.shape == exp_ba.shape
                                  and torch.equal(ba.weight.data, exp_ba)),
+                "glm_match": bool(glm.weight.data.shape == exp_glm.shape
+                                  and torch.equal(glm.weight.data, exp_glm)),
+                "indexer_match": bool(
+                    indexer.weight.data.shape == exp_indexer.shape
+                    and torch.equal(indexer.weight.data, exp_indexer)
+                ),
                 "qkvz_stale_zero": bool(
                     torch.count_nonzero(qkvz.weight.data) == 0),
             }
@@ -179,6 +244,8 @@ def _worker(rank: int, tp_size: int, port: int, ret: dict):
         traceback.print_exc()
         ret[rank] = {"tp_rank": rank, "err": f"{type(e).__name__}: {e}",
                      "handled": False, "qkvz_match": False, "ba_match": False,
+                     "glm_match": False,
+                     "indexer_match": False,
                      "qkvz_stale_zero": None}
 
 
@@ -193,10 +260,15 @@ def _run_tp(tp_size: int) -> bool:
     for r in sorted(ret.keys()):
         d = ret[r]
         note = "  <-- NOT WRITTEN (still zero)" if d.get("qkvz_stale_zero") else ""
-        rank_ok = d["handled"] and d["qkvz_match"] and d["ba_match"]
+        rank_ok = (
+            d["handled"] and d["qkvz_match"] and d["ba_match"]
+            and d["glm_match"] and d["indexer_match"]
+        )
         print(f"  [rank {d['tp_rank']}] {'PASS' if rank_ok else 'FAIL'}  "
               f"handled={d['handled']} qkvz=={d['qkvz_match']} "
-              f"ba=={d['ba_match']} err={d['err']}{note}")
+              f"ba=={d['ba_match']} glm=={d['glm_match']} "
+              f"indexer=={d['indexer_match']} "
+              f"err={d['err']}{note}")
         if not rank_ok:
             ok = False
     print(f"  => TP={tp_size} {'PASS' if ok else 'FAIL'}")

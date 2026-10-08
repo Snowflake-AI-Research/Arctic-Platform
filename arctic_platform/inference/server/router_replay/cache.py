@@ -34,7 +34,8 @@ class RouterReplayMissingError(RuntimeError):
     """Training side requested sample_ids that no sampling rank holds.
 
     Raised identically on every rank (deterministic missing-set compute)
-    so the second collective never runs and no rank blocks. The training
+    so the second collective never runs and no rank blocks, unless
+    tolerated via ``allow_missing``. The training
     job actor catches it and returns HTTP 410 to the trainer, which drops
     the step.
     """

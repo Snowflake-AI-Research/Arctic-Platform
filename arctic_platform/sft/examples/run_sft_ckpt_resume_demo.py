@@ -15,30 +15,26 @@
 
 """TEMPORARY: save → eval → train-more → load → eval parity + HF export (A1/A2).
 
-Client stays CPU-blanked (``CUDA_VISIBLE_DEVICES=``); server uses
-``--server-cuda-visible-devices``. Prints machine-readable ``A1_OK ...`` on success.
+Prints machine-readable ``A1_OK ...`` on success.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 
-import torch
 from transformers import AutoTokenizer
 
 from arctic_platform.client import ArcticSFTClientConfig
-from arctic_platform.client import OnPremConfig
 from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
-from arctic_platform.sft.examples.run_sft_http_demo import ATTN
-from arctic_platform.sft.examples.run_sft_http_demo import LR
-from arctic_platform.sft.examples.run_sft_http_demo import MODEL
-from arctic_platform.sft.examples.run_sft_http_demo import SEED
-from arctic_platform.sft.examples.run_sft_http_demo import _build_batch
-from arctic_platform.sft.examples.run_sft_http_demo import _load_examples
-from arctic_platform.sft.examples.run_sft_http_demo import _metric
+from arctic_platform.sft.examples.run_sft_demo import ATTN
+from arctic_platform.sft.examples.run_sft_demo import LR
+from arctic_platform.sft.examples.run_sft_demo import MODEL
+from arctic_platform.sft.examples.run_sft_demo import SEED
+from arctic_platform.sft.examples.run_sft_demo import _build_batch
+from arctic_platform.sft.examples.run_sft_demo import _load_examples
+from arctic_platform.sft.examples.run_sft_demo import _metric
 
 
 def _eval_loss(client: ArcticSFTClient, batch: dict) -> float:
@@ -64,11 +60,7 @@ def _train_steps(client: ArcticSFTClient, batch: dict, n: int, label: str) -> No
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--host", default="localhost")
-    ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--training-gpus", type=int, default=1)
-    ap.add_argument("--launch-local-server", action="store_true")
-    ap.add_argument("--server-cuda-visible-devices", default="0")
     ap.add_argument("--checkpoint-dir", required=True)
     ap.add_argument("--pre-save-steps", type=int, default=2)
     ap.add_argument("--post-save-steps", type=int, default=2)
@@ -77,9 +69,6 @@ def main() -> None:
 
     ckpt_root = Path(args.checkpoint_dir)
     ckpt_root.mkdir(parents=True, exist_ok=True)
-
-    print(f"client CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')!r}")
-    print(f"client torch.cuda.is_available()={torch.cuda.is_available()}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
@@ -95,12 +84,6 @@ def main() -> None:
         seed=SEED,
         training_gpus=args.training_gpus,
         job_ready_timeout=600.0,
-        backend=OnPremConfig(
-            host=args.host,
-            port=args.port,
-            launch_local_server=args.launch_local_server,
-            server_cuda_visible_devices=args.server_cuda_visible_devices,
-        ),
         training=TrainingConfig(
             checkpoint_path=str(ckpt_root),
             ds_config={
