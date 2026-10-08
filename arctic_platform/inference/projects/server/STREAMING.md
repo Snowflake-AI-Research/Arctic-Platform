@@ -78,8 +78,9 @@ deployment, end the stream with `invalid_sampling_params`. `structured_outputs` 
 `{"json_object": true}`; the worker turns it into vLLM's `StructuredOutputsParams`. A
 schema that no vLLM structured-output backend accepts ends the stream with
 `invalid_structured_output`. `thinking_token_budget` is an integer in
-[1, max_tokens]; vLLM rejects it with `invalid_sampling_params` unless the
-model was loaded with a reasoning parser. `logprobs` is an integer in [0, 20],
+[1, max_tokens], where an omitted max_tokens counts as 4096; vLLM rejects it
+with `invalid_sampling_params` unless the model was loaded with a reasoning
+parser. `logprobs` is an integer in [0, 20],
 the number of alternatives reported per token; a value above the loaded model's
 `max_logprobs` ends the stream with `invalid_sampling_params`. `"sampling_params" in
 STREAM_CAPABILITIES` tells callers these four parameters are accepted. Active LoRA selection is forwarded. No chat rendering, participant

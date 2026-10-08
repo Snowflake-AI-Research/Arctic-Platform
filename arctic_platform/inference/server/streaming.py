@@ -21,8 +21,9 @@ STREAM_CAPABILITIES = frozenset({"sampling_params"})
 # vllm/v1/structured_output/backend_{xgrammar,guidance,outlines}.py. vLLM raises
 # a bare VLLMValidationError with no parameter for these, so only the message
 # identifies them. With the default "auto" backend a schema xgrammar rejects
-# falls back to guidance, then outlines, so the error can come from any of the
-# three. test_gpu_driver.py triggers real ones; recheck on every vLLM upgrade.
+# falls back to guidance, or to outlines when the schema uses features guidance
+# lacks, so the error can come from any of the three. test_gpu_driver.py
+# triggers real ones; recheck on every vLLM upgrade.
 STRUCTURED_OUTPUT_ERRORS = (
     "Failed to transform json schema into a grammar: ",
     "The provided JSON schema contains features not supported by xgrammar.",
@@ -374,6 +375,10 @@ def event_size(event):
     return len(_compact(event))
 
 
+# Delta fields a merge concatenates: the text and the per-token lists.
+MERGED_KEYS = ("text", "token_ids", "logprobs")
+
+
 def _appended_size(old, added, key):
     """Bytes that appending ``added[key]`` to ``old[key]`` adds to ``old``.
 
@@ -444,18 +449,13 @@ class EventBuffer:
         entry = self._open_deltas.get(event["choice_index"])
         if entry is None:
             return False
-        merged = {**entry[0], "text": entry[0]["text"] + event["text"]}
-        if "token_ids" in entry[0] or "token_ids" in event:
-            merged["token_ids"] = [
-                *entry[0].get("token_ids", ()), *event.get("token_ids", ())
-            ]
-        if "logprobs" in entry[0] or "logprobs" in event:
-            merged["logprobs"] = [
-                *entry[0].get("logprobs", ()), *event.get("logprobs", ())
-            ]
+        merged = dict(entry[0])
+        for key in MERGED_KEYS:
+            if key in entry[0] or key in event:
+                empty = "" if key == "text" else []
+                merged[key] = entry[0].get(key, empty) + event.get(key, empty)
         size = entry[1] + sum(
-            _appended_size(entry[0], event, key)
-            for key in ("text", "token_ids", "logprobs")
+            _appended_size(entry[0], event, key) for key in MERGED_KEYS
         )
         if size > self.limits.max_event_bytes:
             return False
@@ -508,8 +508,8 @@ class EngineStream:
         self.owner = owner
         self.attempt_id = attempt_id
         self.prompt = prompt
-        # A defaulted budget may run past the context; vLLM then stops at the
-        # context length instead, as OpenAI does for an omitted max_tokens.
+        # A defaulted budget may run past the context; generation then stops at
+        # the context limit instead of failing.
         self.default_budget = "max_tokens" not in params
         self.params = {"max_tokens": DEFAULT_MAX_TOKENS, **params}
         self.expires_at = expires_at
