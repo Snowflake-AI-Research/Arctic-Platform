@@ -186,6 +186,7 @@ def test_runtime_config_is_derived_from_validated_options():
 
 
 def test_deepep_combine_casts_fp32_expert_output_to_bf16():
+    pytest.importorskip("deep_ep")
     from arctic_platform.model.implementations.moe.distributed.deepep import _combine_wire_input
 
     expert_output = torch.empty(2, 8, dtype=torch.float32)

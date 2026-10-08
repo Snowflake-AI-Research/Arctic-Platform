@@ -795,8 +795,8 @@ class DeepSpeedWorker:
     def _inject_sft_global_token_meta(self, loss_fn: str, batch_data, meta_data: dict) -> None:
         """All-reduce valid-target count into ``meta["global_num_tokens"]`` + ``dp_size``.
 
-        The loss callback scales by the full execution group because DeepSpeed averages the replicated parameter
-        gradients over that group even when sequence parallelism leaves one logical data-parallel replica.
+        The loss callback scales by the logical data-parallel degree. Under sequence parallelism, the SP ranks are
+        one logical replica and their label shards are summed into the global token denominator.
         Opt-in via ``SFT_GLOBAL_TOKEN_LOSS_FNS``. No-op when labels are absent.
         """
         from arctic_platform.sft.processor import SFT_GLOBAL_TOKEN_LOSS_FNS
@@ -805,7 +805,7 @@ class DeepSpeedWorker:
         if loss_fn not in SFT_GLOBAL_TOKEN_LOSS_FNS:
             return
 
-        local_tokens = count_valid_target_tokens(batch_data)
+        local_tokens = count_valid_target_tokens(batch_data, meta_data)
         if local_tokens is None:
             return
 
@@ -815,8 +815,7 @@ class DeepSpeedWorker:
             torch.distributed.all_reduce(tok, op=torch.distributed.ReduceOp.SUM)
             global_tokens = int(tok.item())
         meta_data["global_num_tokens"] = global_tokens
-        dp_sp_world_size(self.world_size, self.sp_size)
-        meta_data["dp_size"] = self.world_size
+        meta_data["dp_size"] = dp_sp_world_size(self.world_size, self.sp_size)
 
     def _forward_maybe_backward(self, batch: dict, backward: bool) -> dict:
         # torch.autograd.set_detect_anomaly(True)

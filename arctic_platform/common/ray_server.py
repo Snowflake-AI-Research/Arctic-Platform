@@ -883,7 +883,6 @@ class ArcticRLRayServer:
             metrics=merge_dict_shards([r["metrics"] for r in results]),
             batch=merge_dict_shards([r["batch"] for r in results]),
         )
-        merged.update(results[0])
         return merged
 
     async def empty_training_cache(self, job_id: int):

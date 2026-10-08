@@ -197,7 +197,7 @@ def test_compute_log_probs_accepts_native_mapping_logprobs():
     torch.testing.assert_close(actual, labels.float().neg())
 
 
-def test_sft_global_token_meta_uses_execution_group_size_under_sequence_parallelism(monkeypatch):
+def test_sft_global_token_meta_uses_logical_dp_size_under_sequence_parallelism(monkeypatch):
     worker = _worker(_Engine())
     worker.world_size = 8
     worker.sp_size = 8
@@ -207,7 +207,20 @@ def test_sft_global_token_meta_uses_execution_group_size_under_sequence_parallel
 
     worker._inject_sft_global_token_meta("sft", batch, meta)
 
-    assert meta == {"global_num_tokens": 2, "dp_size": 8}
+    assert meta == {"global_num_tokens": 2, "dp_size": 1}
+
+
+def test_sft_global_token_meta_counts_preshifted_labels(monkeypatch):
+    worker = _worker(_Engine())
+    worker.world_size = 8
+    worker.sp_size = 8
+    meta = {"labels_are_shifted": True}
+    batch = {"labels": torch.tensor([[1, 2, -100, -100]])}
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
+
+    worker._inject_sft_global_token_meta("sft", batch, meta)
+
+    assert meta == {"labels_are_shifted": True, "global_num_tokens": 2, "dp_size": 1}
 
 
 def test_native_worker_applies_local_mean_scales_with_one_stateful_loss_object():

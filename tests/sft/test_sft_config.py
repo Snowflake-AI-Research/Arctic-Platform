@@ -55,6 +55,11 @@ class TestArcticSFTClientConfig(TestCasePlus):
         self.assertEqual(cfg.training.checkpoint_path, "/tmp/c")
         self.assertEqual(cfg.backend.type, "onprem")
 
+    def test_accepts_legacy_onprem_ray_protocol(self):
+        cfg = ArcticClientConfig(model_name="m", backend={"type": "onprem", "protocol": "ray"})
+        self.assertEqual(cfg.backend.type, "onprem")
+        self.assertEqual(cfg.backend.protocol, "ray")
+
     def test_extra_fields_forbidden(self):
         with self.assertRaises(ValidationError):
             ArcticSFTClientConfig(model_name="m", training_gpus=1, training=_CKPT, bogus=1)

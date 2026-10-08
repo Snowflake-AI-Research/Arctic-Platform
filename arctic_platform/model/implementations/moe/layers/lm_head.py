@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import types
+from typing import Any
 from typing import TypedDict
 
 import torch
@@ -533,7 +534,7 @@ def _patch_model_forward(model: nn.Module) -> None:
             slice_indices = logits_to_keep
 
         # action_masks is RL-only (chunked-logprob head); SFT/CE heads reject it, so forward only when set.
-        lm_head_kwargs = {}
+        lm_head_kwargs: dict[str, Any] = {}
         if action_masks is not None:
             lm_head_kwargs["action_masks"] = action_masks
         if dss_compute_logprobs and isinstance(self.lm_head, FusedCrossEntropyOutputLinear):

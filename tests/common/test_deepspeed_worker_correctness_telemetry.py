@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from arctic_platform.common import deepspeed_worker as deepspeed_worker_module
 from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
 from arctic_platform.common.deepspeed_worker import _deepspeed_init_kwargs
 from arctic_platform.common.deepspeed_worker import _sync_initial_peft_adapter
@@ -27,9 +28,10 @@ from arctic_platform.common.deepspeed_worker import _synchronize_initial_peft_ad
 from arctic_platform.common.deepspeed_worker import _worker_debug_config
 
 
-def _worker(model: torch.nn.Module, *, enabled: bool, rank: int = 0):
+def _worker(model: torch.nn.Module, *, enabled: bool, rank: int = 0, sp_size: int = 1):
     worker = object.__new__(DeepSpeedWorker.__ray_metadata__.modified_class)
     worker.rank = rank
+    worker.sp_size = sp_size
     worker.engine = SimpleNamespace(module=model)
     worker._gradient_norms_per_param = enabled
     return worker
@@ -107,19 +109,14 @@ def test_live_peft_export_passes_only_trainable_parameters_to_save_pretrained(tm
 def test_initial_peft_adapter_is_created_before_nonzero_ranks_restore(monkeypatch, rank, expected):
     events = []
     monkeypatch.setattr(
-        "arctic_platform.common.deepspeed_worker._trainable_peft_state_dict",
+        deepspeed_worker_module,
+        "_trainable_peft_state_dict",
         lambda model: events.append("snapshot") or {},
     )
-    monkeypatch.setattr(
-        "arctic_platform.common.deepspeed_worker._sync_initial_peft_adapter",
-        lambda *args: events.append("sync"),
-    )
-    monkeypatch.setattr(
-        "arctic_platform.common.deepspeed_worker.dist.barrier",
-        lambda: events.append("barrier"),
-    )
+    monkeypatch.setattr(deepspeed_worker_module, "_sync_initial_peft_adapter", lambda *args: events.append("sync"))
+    monkeypatch.setattr(deepspeed_worker_module.dist, "barrier", lambda: events.append("barrier"))
 
-    _synchronize_initial_peft_adapter(object(), "/adapter", rank)
+    _synchronize_initial_peft_adapter(torch.nn.Module(), "/adapter", rank)
 
     assert events == expected
 
@@ -166,6 +163,16 @@ def test_per_parameter_gradient_norms_report_trainable_parameters(monkeypatch):
         "0.weight": pytest.approx(2.0),
         "1.weight": pytest.approx(6.0),
     }
+
+
+def test_per_parameter_gradient_norms_do_not_apply_extra_sp_scale(monkeypatch):
+    model = torch.nn.Linear(2, 2, bias=False)
+    model.weight.grad = torch.full_like(model.weight, 4.0)
+    monkeypatch.setattr("deepspeed.utils.safe_get_full_grad", lambda param: param.grad)
+
+    metrics = _worker(model, enabled=True, sp_size=8)._per_parameter_gradient_norm_metrics()
+
+    assert metrics["gradient_norms_per_param"] == {"weight": pytest.approx(8.0)}
 
 
 def test_per_parameter_gradient_norms_are_returned_by_rank_zero_only(monkeypatch):

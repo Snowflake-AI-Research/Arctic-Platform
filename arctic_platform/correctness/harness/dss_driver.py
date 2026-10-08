@@ -393,6 +393,21 @@ def _rank_owned_mapping(value: Any) -> Dict[str, Any]:
     return {}
 
 
+def _rank_owned_path(value: Any) -> Optional[str]:
+    """Return a rank-owned path metric after Ray response merging."""
+    if value is None:
+        return None
+    if isinstance(value, (str, os.PathLike)):
+        return os.fspath(value)
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            path = _rank_owned_path(item)
+            if path is not None:
+                return path
+        return None
+    raise TypeError(f"rank-owned path metric must be a string or path-like object, got {type(value).__name__}")
+
+
 def _globalize_expert_norms(per_parameter: Dict[str, float], per_expert: Dict[str, list[float]]) -> Dict[str, float]:
     result = {key: float(value) for key, value in per_parameter.items()}
     for name, values in per_expert.items():
@@ -423,8 +438,9 @@ def fwd_bwd_step(session: GatewaySession, job: ArcticJob, body: dict, learning_r
         grad_norms=norms,
         model_calls=int(calls) if calls is not None else None,
         packed_rows=int(rows) if rows is not None else None,
-        optimizer_state_manifest=stepped.get("optimizer_state_manifest")
-        or step_metrics.get("optimizer_state_manifest"),
+        optimizer_state_manifest=_rank_owned_path(
+            stepped.get("optimizer_state_manifest") or step_metrics.get("optimizer_state_manifest")
+        ),
     )
 
 

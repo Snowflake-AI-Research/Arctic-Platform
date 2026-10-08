@@ -459,4 +459,4 @@ def test_ray_step_forwards_client_learning_rate(monkeypatch):
     response = asyncio.run(server.step(1, {"learning_rate": 0.01}))
 
     assert calls == [0.01]
-    assert response["last_lr"] == 0.01
+    assert response["metrics"]["last_lr"] == 0.01

@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -125,8 +126,9 @@ def test_hf_model_export_only_canonicalizes_checkpoint_wrapper_names() -> None:
 def test_qwen3_5_text_export_loads_as_qwen3_5_config(tmp_path: Path) -> None:
     from transformers import Qwen3_5Config
     from transformers import Qwen3_5TextConfig
-    from vllm.transformers_utils.config import get_config
-    from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config as VllmQwen3_5Config
+
+    vllm_config = pytest.importorskip("vllm.transformers_utils.config")
+    vllm_qwen3_5 = pytest.importorskip("vllm.transformers_utils.configs.qwen3_5")
 
     from arctic_platform.common.deepspeed_worker import replace_exported_qwen3_5_text_config
 
@@ -143,8 +145,8 @@ def test_qwen3_5_text_export_loads_as_qwen3_5_config(tmp_path: Path) -> None:
     (exported / "config.json").write_text(json.dumps(saved))
 
     assert replace_exported_qwen3_5_text_config(str(source), str(exported))
-    loaded = get_config(str(exported), trust_remote_code=False)
-    assert isinstance(loaded, VllmQwen3_5Config)
+    loaded = vllm_config.get_config(str(exported), trust_remote_code=False)
+    assert isinstance(loaded, vllm_qwen3_5.Qwen3_5Config)
     assert loaded.model_type == "qwen3_5"
     assert loaded.architectures == ["Qwen3_5ForCausalLM"]
     assert loaded.text_config.num_hidden_layers == 4
@@ -166,7 +168,8 @@ def test_qwen3_5_moe_text_export_is_not_rewritten(tmp_path: Path) -> None:
 def test_qwen3_5_export_keeps_engine_config_class(tmp_path: Path) -> None:
     from transformers import AutoConfig
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
-    from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config as EngineQwen3_5Config
+
+    vllm_qwen3_5 = pytest.importorskip("vllm.transformers_utils.configs.qwen3_5")
 
     parent = AutoConfig.for_model("qwen3_5").to_dict()
     parent["architectures"] = ["Qwen3_5ForConditionalGeneration"]
@@ -181,7 +184,7 @@ def test_qwen3_5_export_keeps_engine_config_class(tmp_path: Path) -> None:
     _write_model(saved_text, {"model.layer.weight": torch.ones(2)}, text)
     assert restore_source_weight_layout(str(source_text), str(saved_text))
     loaded_text = AutoConfig.from_pretrained(saved_text)
-    assert type(loaded_text) is EngineQwen3_5Config
+    assert type(loaded_text) is vllm_qwen3_5.Qwen3_5Config
     assert not isinstance(loaded_text, Qwen3_5TextConfig)
 
     saved_parent = tmp_path / "saved-parent"
@@ -192,5 +195,5 @@ def test_qwen3_5_export_keeps_engine_config_class(tmp_path: Path) -> None:
     _write_model(saved_parent, language, nested)
     assert restore_source_weight_layout(str(source_parent), str(saved_parent))
     loaded_parent = AutoConfig.from_pretrained(saved_parent)
-    assert type(loaded_parent) is EngineQwen3_5Config
+    assert type(loaded_parent) is vllm_qwen3_5.Qwen3_5Config
     assert not isinstance(loaded_parent, Qwen3_5TextConfig)

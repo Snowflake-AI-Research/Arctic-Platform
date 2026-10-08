@@ -15,11 +15,18 @@
 
 from __future__ import annotations
 
-from arctic_platform.common.utils.server_models import build_model_config
+import pytest
+
 from arctic_platform.correctness.harness.dss_driver import sampling_payload
 
 
 def test_sampling_job_selects_fla_gdn_prefill() -> None:
+    pytest.importorskip(
+        "arctic_inference.server.config",
+        reason="Arctic Inference is not installed with the [sft,testing] extras.",
+    )
+    from arctic_platform.common.utils.server_models import build_model_config
+
     payload = sampling_payload("/tmp/weights", 0, dtype="bfloat16", n_gpus=1, max_seq_len=10241)
     engine = build_model_config(payload["model_name"], payload["inference_config"]["vllm_config"])
 

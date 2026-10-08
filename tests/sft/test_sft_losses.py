@@ -41,8 +41,7 @@ class TestSFTRegistry(TestCasePlus):
         self.assertIn("sft_ce", LOSS_FNS)
         self.assertEqual(SFT_LOSS_FNS, {"sft", "sft_ce"})
         self.assertEqual(LOGIT_LOSS_FNS, {"sft_ce"})
-        # Only sft_ce needs global-token injection; sft uses HF's per-shard mean.
-        self.assertEqual(SFT_GLOBAL_TOKEN_LOSS_FNS, {"sft_ce"})
+        self.assertEqual(SFT_GLOBAL_TOKEN_LOSS_FNS, {"sft", "sft_ce"})
 
 
 class TestSFTLoss(TestCasePlus):
@@ -69,6 +68,19 @@ class TestSFTLoss(TestCasePlus):
                 {},
                 "cpu",
             )
+
+    def test_global_token_scaling_rescales_model_mean_loss(self):
+        labels = torch.tensor([[-100, 1, 2, -100]])  # 2 valid after shift
+        loss, metrics = sft_loss(
+            {"loss": torch.tensor(3.0, requires_grad=True)},
+            {"labels": labels},
+            {"global_num_tokens": 10, "dp_size": 2},
+            {},
+            "cpu",
+        )
+        self.assertAlmostEqual(loss.item(), 3.0 * 2.0 / 10.0 * 2.0, places=5)
+        self.assertAlmostEqual(metrics["loss.sum"], 6.0, places=5)
+        self.assertEqual(metrics["loss.tokens"], 2.0)
 
 
 class TestSFTCELoss(TestCasePlus):
@@ -155,6 +167,15 @@ class TestCountValidTargetTokens(TestCasePlus):
     def test_dict_shard_counts_shifted_valid_targets(self):
         labels = torch.tensor([[-100, 1, 2, -100]])  # 2 valid after [:, 1:] shift
         self.assertEqual(count_valid_target_tokens({"labels": labels}), 2)
+
+    def test_dict_shard_counts_preshifted_valid_targets(self):
+        labels = torch.tensor([[1, 2, -100, -100]])
+        self.assertEqual(count_valid_target_tokens({"labels": labels}, {"labels_are_shifted": True}), 2)
+
+    def test_unshifted_sp_shard_counts_position_ids_after_document_start(self):
+        labels = torch.tensor([[5, 6, -100, 8]])
+        position_ids = torch.tensor([[0, 1, 2, 3]])
+        self.assertEqual(count_valid_target_tokens({"labels": labels, "position_ids": position_ids}), 2)
 
     def test_list_shard_sums_across_microbatches(self):
         labels = torch.tensor([[-100, 1, 2, -100]])  # 2 valid each
@@ -334,10 +355,11 @@ class TestSftCeLogitsOptimizationRouting(TestCasePlus):
 
         calls = {}
 
-        def _stub(model, hidden, labels, *, mode, peak_mem_gib):
+        def _stub(model, hidden, labels, *, mode, peak_mem_gib, labels_are_shifted=False):
             calls["mode"] = mode
             calls["peak_mem_gib"] = peak_mem_gib
             calls["hidden_shape"] = tuple(hidden.shape)
+            calls["labels_are_shifted"] = labels_are_shifted
             n_valid = int((labels[:, 1:] != -100).sum().item())
             return torch.tensor(6.0, requires_grad=True), n_valid
 

@@ -68,6 +68,28 @@ def test_fwd_bwd_step_reads_rank_owned_norms_from_merged_list() -> None:
     assert result.grad_norms == {"layers.0.input_layernorm.weight": 2.0}
 
 
+def test_fwd_bwd_step_unwraps_rank_owned_optimizer_manifest() -> None:
+    from arctic_platform.correctness.harness.dss_driver import fwd_bwd_step
+
+    class Client:
+        def fwd_bwd(self, body):
+            return {"avg_loss": 1.25, "metrics": {}}
+
+        def step(self, learning_rate):
+            return {
+                "metrics": {
+                    "optimizer_state_manifest": ["/tmp/manifest.json"],
+                }
+            }
+
+    class Job:
+        client = Client()
+
+    result = fwd_bwd_step(None, Job(), {}, learning_rate=1e-3)
+
+    assert result.optimizer_state_manifest == "/tmp/manifest.json"
+
+
 def test_prime_rl_receives_prediction_aligned_labels() -> None:
     batch = Batch(
         name="one",
