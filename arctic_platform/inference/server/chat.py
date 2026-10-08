@@ -147,6 +147,11 @@ class RenderedChat:
     parallel_tool_calls: bool | None = None
     tool_choice: str | dict | None = None
 
+    @property
+    def reasons(self):
+        """Whether generation starts in reasoning: a reasoner is active and the prompt leaves it open."""
+        return self.generate_kwargs.get("reasoning_ended") is False
+
 
 class ChatEngine:
     """vLLM's chat front end bound to one worker's engine."""
@@ -302,9 +307,13 @@ class ChatOutput:
             for call in getattr(message, "tool_calls", None) or ()
             if self.rendered.parallel_tool_calls is not False or call.index == 0
         ]
-        if getattr(message, "reasoning", None) and not content and not tool_calls:
+        if getattr(message, "reasoning", None):
+            token_count = len(token_ids)
+            if content or tool_calls:
+                # The delta that ends reasoning; split it as vLLM's parser does.
+                token_count -= len(parser.extract_content_ids(list(token_ids)))
             events.append(
-                {"type": "reasoning_delta", "choice_index": index, "token_count": len(token_ids)}
+                {"type": "reasoning_delta", "choice_index": index, "token_count": token_count}
             )
         if content:
             events.append(self._content(index, content, token_ids, logprobs))

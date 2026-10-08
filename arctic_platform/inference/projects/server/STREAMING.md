@@ -143,11 +143,19 @@ gets `openai_gptoss`).
   `usage` adds `reasoning_tokens`, counted by the reasoning parser across choices.
 - Undelivered events merge only with the same kind of the same choice; tool-call
   arguments merge only within one call.
+- `logprobs` are refused when the model will reason: a reasoning parser is
+  active and the rendered prompt does not already end reasoning (for example
+  Qwen3 with thinking on). The stream fails before any token with
+  `invalid_chat_request` and `param="logprobs"`, because the engine delta that
+  ends reasoning can carry reasoning and answer tokens together, and their
+  logprobs would expose the reasoning. OpenAI's reasoning models do not take
+  logprobs either. With thinking off, or no reasoning parser, every generated
+  token is answer or tool-call text.
 - With `logprobs`, each `content_delta` carries the `token_ids` and `logprobs`
-  of the engine output that produced it; reasoning and tool-call tokens carry
-  none, as OpenAI reports logprobs for the answer only. Logprobs follow engine
-  token deltas, so when the parser holds text back and releases it later, or
-  splits one delta into several kinds, they may not line up one-to-one with
+  of the engine output that produced it; tool-call tokens carry none, as
+  OpenAI reports logprobs for the answer only. Logprobs follow engine token
+  deltas, so when the parser holds text back and releases it later, or splits
+  one delta into content and a tool call, they may not line up one-to-one with
   the content text.
 - `structured_outputs` cannot be combined with a chat prompt whose tools need a
   grammar of their own (`invalid_chat_request`, `param="structured_outputs"`):

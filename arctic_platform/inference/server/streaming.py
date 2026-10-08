@@ -788,6 +788,11 @@ class EngineStream:
             self.params["max_tokens"] = min(room, DEFAULT_CHAT_MAX_TOKENS)
             if (self.params.get("thinking_token_budget") or 0) > self.params["max_tokens"]:
                 raise StreamError("invalid_sampling_params")
+        if self.params.get("logprobs") is not None and rendered.reasons:
+            # A delta that ends reasoning carries reasoning and answer tokens
+            # together, so its logprobs would expose reasoning. OpenAI's
+            # reasoning models take no logprobs either.
+            raise StreamError("invalid_chat_request", param="logprobs")
         if (
             rendered.structured_outputs is not None
             and "structured_outputs" in self.params

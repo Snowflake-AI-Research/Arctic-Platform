@@ -35,6 +35,8 @@ from arctic_platform.inference.server.streaming import (
 )
 
 THINK_THEN_ANSWER = ["<think>", "Two", " plus two", "</think>", "It is", " 4."]
+ANSWER = ["It is", " 4."]
+END_OF_THINKING = 999
 TOOL_CALL = ["<think>", "Need weather", "</think>", "<tool:get_weather>", '{"city": ', '"Paris"}', "</tool>"]
 
 
@@ -53,6 +55,12 @@ class ScriptParser:
         self.reasoning_ids = set()
 
     def parse_delta(self, delta_text, delta_token_ids, request, prompt_token_ids=None, *, finished):
+        if "</think>" in delta_text and delta_text != "</think>":
+            # One engine delta that ends reasoning and starts the answer.
+            reasoning, content = delta_text.split("</think>")
+            self.mode = "content"
+            self.reasoning_ids.update(delta_token_ids[: delta_token_ids.index(END_OF_THINKING) + 1])
+            return self._message(reasoning=reasoning, content=content)
         if delta_text == "<think>":
             self.mode = "reasoning"
             self.reasoning_ids.update(delta_token_ids)
@@ -87,12 +95,26 @@ class ScriptParser:
     def count_reasoning_tokens(self, token_ids):
         return sum(1 for token in token_ids if token in self.reasoning_ids)
 
+    @staticmethod
+    def extract_content_ids(token_ids):
+        return token_ids[token_ids.index(END_OF_THINKING) + 1 :]
+
+
+class AlwaysThinkingParser(ScriptParser):
+    """A parser for templates that open reasoning in the prompt (no ``<think>`` generated)."""
+
+    def __init__(self):
+        super().__init__()
+        self.mode = "reasoning"
+
 
 class FakeChatEngine:
-    def __init__(self, prompt_tokens=5, error=None, parser=ScriptParser):
+    def __init__(self, prompt_tokens=5, error=None, parser=ScriptParser, reasoning_ended=False):
         self.prompt_tokens = prompt_tokens
         self.error = error
         self.parser = parser
+        # None: no reasoning parser, so render sets no reasoning_ended.
+        self.generate_kwargs = {} if reasoning_ended is None else {"reasoning_ended": reasoning_ended}
         self.guard = SpecialTokenGuard(["<|im_end|>", "<|im_start|>"])
         self.rendered = []
 
@@ -107,7 +129,7 @@ class FakeChatEngine:
             request=SimpleNamespace(),
             new_parser=self.parser,
             structured_outputs="structural-tag",
-            generate_kwargs={"reasoning_ended": False},
+            generate_kwargs=dict(self.generate_kwargs),
             parallel_tool_calls=prompt.parallel_tool_calls,
             tool_choice=prompt.tool_choice,
         )
@@ -126,6 +148,8 @@ class ScriptedEngine:
         steps = min(len(self.script), params["max_tokens"])
         for step in range(steps):
             await asyncio.sleep(0)
+            piece = self.script[step]
+            text, token_ids = piece if isinstance(piece, tuple) else (piece, [100 + step])
             reason = None
             if step == steps - 1:
                 reason = "stop" if steps == len(self.script) else "length"
@@ -134,15 +158,12 @@ class ScriptedEngine:
                 outputs=[
                     SimpleNamespace(
                         index=index,
-                        text=self.script[step],
-                        token_ids=[100 + step],
+                        text=text,
+                        token_ids=token_ids,
                         finish_reason=reason,
                         logprobs=[
-                            {
-                                100 + step: SimpleNamespace(
-                                    logprob=-0.5, rank=1, decoded_token=self.script[step]
-                                )
-                            }
+                            {token_id: SimpleNamespace(logprob=-0.5, rank=1, decoded_token=text)}
+                            for token_id in token_ids
                         ],
                     )
                     for index in range(params["n"])
@@ -292,14 +313,46 @@ def test_text_prompts_are_unchanged():
     assert worker._stream_chat_engine.rendered == []
 
 
-def test_logprobs_go_with_answer_tokens_only():
-    _, events = stream(chat("What is 2+2?"), {"logprobs": 1})
+@pytest.mark.parametrize("reasoning_ended", [True, None])
+def test_logprobs_cover_every_answer_token_when_nothing_reasons(reasoning_ended):
+    # Thinking off (the prompt ends reasoning) or no reasoning parser at all.
+    _, events = stream(
+        chat("What is 2+2?"),
+        {"logprobs": 1},
+        script=ANSWER,
+        chat_engine=FakeChatEngine(reasoning_ended=reasoning_ended),
+    )
     contents = [e for e in events if e["type"] == "content_delta"]
     assert "".join(e["text"] for e in contents) == "It is 4."
     entries = [entry for e in contents for entry in e["logprobs"]]
     assert [entry["token"] for entry in entries] == ["It is", " 4."]
     assert [t for e in contents for t in e["token_ids"]] == [entry["token_id"] for entry in entries]
     assert all("logprobs" not in e for e in events if e["type"] != "content_delta")
+    assert events[-1]["type"] == "completed"
+
+
+@pytest.mark.parametrize(
+    "parser,script",
+    [(ScriptParser, THINK_THEN_ANSWER), (AlwaysThinkingParser, ["Two", "</think>", "It is"])],
+)
+def test_logprobs_are_refused_before_any_token_when_the_model_will_reason(parser, script):
+    # A delta that ends reasoning can carry answer and reasoning tokens
+    # together, so their logprobs would expose reasoning.
+    worker, events = stream(
+        chat("What is 2+2?"), {"logprobs": 0}, script=script, chat_engine=FakeChatEngine(parser=parser)
+    )
+    assert kinds(events) == ["terminal_error"]
+    assert (events[0]["code"], events[0]["param"]) == ("invalid_chat_request", "logprobs")
+    assert worker.llm.calls == []
+
+
+def test_a_delta_that_ends_reasoning_counts_its_reasoning_tokens():
+    script = ["<think>", "Two", (" plus two</think>It is", [201, 202, END_OF_THINKING, 203]), " 4."]
+    _, events = stream(chat("What is 2+2?"), script=script)
+    assert kinds(events)[:3] == ["reasoning_delta", "reasoning_delta", "content_delta"]
+    # "Two", then " plus", " two" and the end marker from the mixed delta.
+    assert sum(e["token_count"] for e in events if e["type"] == "reasoning_delta") == 4
+    assert "".join(e["text"] for e in events if e["type"] == "content_delta") == "It is 4."
 
 
 def test_named_tool_choice_finishes_with_stop():

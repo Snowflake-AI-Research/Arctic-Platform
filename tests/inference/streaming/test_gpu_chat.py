@@ -288,4 +288,13 @@ def test_chat_logprobs_cover_the_answer_tokens():
         assert all(entry["top"] and entry["top"][0]["token_id"] == entry["token_id"] for entry in entries)
         assert not any("logprobs" in e for e in events if e["type"] != "content_delta")
 
+        # Thinking on: refused before any token, so no reasoning logprobs leak.
+        events = await collect(
+            driver,
+            ChatPrompt([{"role": "user", "content": "Name a colour."}]),
+            {"temperature": 0.0, "max_tokens": 32, "logprobs": 2},
+        )
+        assert [e["type"] for e in events] == ["terminal_error"]
+        assert (events[0]["code"], events[0]["param"]) == ("invalid_chat_request", "logprobs")
+
     asyncio.run(with_driver(check))
