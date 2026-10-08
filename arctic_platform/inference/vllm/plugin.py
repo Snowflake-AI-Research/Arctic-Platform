@@ -31,6 +31,9 @@ def arctic_inference_plugin():
     from arctic_platform.inference.vllm.router_replay import (
         ensure_router_replay_vllm_patches,
     )
+    from arctic_platform.inference.vllm.spec_decode_grammar import (
+        ensure_spec_decode_grammar_fix,
+    )
     from arctic_platform.inference.vllm.xgrammar_stop_mask import (
         ensure_xgrammar_stop_mask_fix,
     )
@@ -41,6 +44,9 @@ def arctic_inference_plugin():
     # be able to opt into dense prompt logprobs whether or not the rest of the
     # Arctic stack is on.
     ensure_dense_prompt_logprobs_patch()
+    # DFlash on DSS uses vanilla vLLM. Placeholder drafts must not be verified
+    # against unconstrained grammar rows after a weight-sync resume.
+    ensure_spec_decode_grammar_fix()
 
     if not envs.ARCTIC_INFERENCE_ENABLED:
         from arctic_platform.inference.vllm.fp32_lm_head import (
