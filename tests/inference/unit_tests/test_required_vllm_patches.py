@@ -3,6 +3,7 @@ from arctic_platform.inference.vllm import (
     dflash2_nan_fix,
     required_patches,
     router_replay,
+    spec_decode_grammar,
     xgrammar_stop_mask,
 )
 
@@ -25,6 +26,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("dense_prompt_logprobs"),
     )
     monkeypatch.setattr(
+        spec_decode_grammar,
+        "ensure_spec_decode_grammar_fix",
+        lambda: calls.append("spec_decode_grammar"),
+    )
+    monkeypatch.setattr(
         dflash2_nan_fix,
         "apply_dflash2_nan_fixes",
         lambda: calls.append("dflash2"),
@@ -36,5 +42,6 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "router",
         "xgrammar",
         "dense_prompt_logprobs",
+        "spec_decode_grammar",
         "dflash2",
     ]
