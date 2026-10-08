@@ -28,10 +28,8 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from parameterized import parameterized
 from rl_harness import arctic_rl_client_session
 from rl_harness import assert_generations
-from rl_harness import parameterized_custom_name_func
 from rl_harness import skip_if_unsupported
 
 from arctic_platform.testing_utils import TestCasePlus
@@ -48,8 +46,6 @@ prompt_len = 64
 response_len = 64
 rollout_n = 1
 
-comm_params = [("ray",)]
-
 prompts = ["The capital of France is", "2 + 2 ="]
 sampling_params = {"temperature": 0.0, "max_tokens": 16}
 
@@ -58,9 +54,8 @@ async def _send_generate(client, prompts: list[str], sampling_params: dict) -> l
     return await client.generate(prompts, sampling_params)
 
 
-def _run_generate(comm_protocol: str) -> list[dict]:
+def _run_generate() -> list[dict]:
     with arctic_rl_client_session(
-        comm_protocol,
         False,
         model_name,
         attn_implementation,
@@ -79,11 +74,10 @@ def _run_generate(comm_protocol: str) -> list[dict]:
 @pytest.mark.vllm
 @pytest.mark.xdist_group("arctic_rl_vllm")
 class TestGenerate(TestCasePlus):
-    @parameterized.expand(comm_params, name_func=parameterized_custom_name_func)
-    def test_generate(self, comm_protocol):
-        """Each transport round-trips prompts through the vLLM sampling engine."""
+    def test_generate(self):
+        """Prompts round-trip through the vLLM sampling engine."""
         skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus)
-        results = _run_generate(comm_protocol)
-        texts = assert_generations(results, len(prompts), comm_protocol)
+        results = _run_generate()
+        texts = assert_generations(results, len(prompts), "generate")
         for prompt, text in zip(prompts, texts):
-            print(f"[generate] {comm_protocol}: {prompt!r} -> {text[:80]!r}")
+            print(f"[generate] {prompt!r} -> {text[:80]!r}")

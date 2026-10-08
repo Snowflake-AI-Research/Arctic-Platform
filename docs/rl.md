@@ -62,9 +62,7 @@ import asyncio
 from arctic_platform.rl import ArcticRLClientConfig, create_arctic_rl_client
 
 config = ArcticRLClientConfig(
-    backend="local",
     model_name="Qwen/Qwen3-4B",
-    comm_protocol="ray",
     training_gpus=8,
     sampling_gpus=8,
     log_prob_gpus=0,              # 0 = disabled
@@ -91,8 +89,6 @@ client2 = create_arctic_rl_client(rc)
 
 | Field | Default | Notes |
 |-------|---------|-------|
-| `backend` | `"local"` | Only `"local"` |
-| `comm_protocol` | `"ray"` | Only `"ray"` |
 | `model_name` | **required** | HF id |
 | `training_gpus` / `sampling_gpus` / `log_prob_gpus` | `0` | Job created iff > 0 |
 | `log_prob_engine` | `"vllm"` | `"deepspeed"` or `"vllm"` |

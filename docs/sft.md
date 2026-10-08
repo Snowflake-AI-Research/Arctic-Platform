@@ -249,7 +249,6 @@ vLLM settings on `sampling`.
 | `model_name` | **required** | HF model id |
 | `training_gpus` | `0` | Server training GPUs (or set `training_job_id` to reconnect) |
 | `max_seq_len` | `8192` | Max sequence length (training + sampling) |
-| `backend.protocol` | `"ray"` | Only `"ray"` for `OnPremConfig` |
 | `backend.colocate` | `false` | Share GPUs between training and sampling |
 | `training.checkpoint_path` | **required** for new jobs | Server-side checkpoint dir |
 | `training.ds_config` | `null` | DeepSpeed config (optimizer, scheduler, micro-batch, ZeRO, bf16, …) |

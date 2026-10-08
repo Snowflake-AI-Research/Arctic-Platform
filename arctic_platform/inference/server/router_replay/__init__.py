@@ -5,7 +5,8 @@ Public API
 - :class:`RouterReplayCacheTX`     — sampling-side, overwrite-on-put
 - :class:`RouterReplayCacheRX`     — training-side, pop-on-read
 - :class:`RouterReplayMissingError` — raised identically on every rank when
-  the training side needs a sample_id no sampling rank holds
+  the training side needs a sample_id no sampling rank holds, unless every
+  receiver needing it opted into ``allow_missing``
 
 Layout mirrors :mod:`arctic_platform.inference.server.weight_sync`. Tensors live on
 GPU and never leave the worker over HTTP; the cross-zone transport is the
