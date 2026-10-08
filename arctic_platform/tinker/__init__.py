@@ -23,7 +23,9 @@ import atexit
 import importlib
 import logging
 import sys
+import threading
 from typing import Any
+from typing import NoReturn
 
 import numpy as np
 
@@ -82,22 +84,35 @@ def _release_sessions() -> None:
 atexit.register(_release_sessions)
 
 
-class _Future:
-    """What the cookbook awaits on ``forward_backward_async(...).result_async()``."""
-
+class _Future(_sdk.APIFuture[Any]):
     def __init__(self, task: asyncio.Task) -> None:
         self._task = task
 
-    async def result_async(self) -> Any:
-        return await self._task
+    async def result_async(self, timeout: float | None = None) -> Any:
+        if timeout is None:
+            return await self._task
+        return await asyncio.wait_for(asyncio.shield(self._task), timeout)
 
     def result(self, timeout: float | None = None) -> Any:
-        return self._task.result(timeout)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            loop = self._task.get_loop()
+            if loop.is_running():
+                return asyncio.run_coroutine_threadsafe(self.result_async(timeout), loop).result(timeout)
+            return loop.run_until_complete(self.result_async(timeout))
+        raise RuntimeError("call result_async() from a running event loop")
 
 
 class _Path:
     def __init__(self, path: str) -> None:
         self.path = path
+
+
+def _refuse_checkpoint(path: str) -> NoReturn:
+    raise RuntimeError(
+        f"cannot load {path}: this process does not store checkpoints, so a new process cannot resume"
+    )
 
 
 def _pick(explicit: int | None, key: str) -> int:
@@ -145,8 +160,6 @@ def _sdk_logprobs(outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 class SamplingClient:
-    """Cookbook sampling client. ``sample_async`` returns a ``SampleResponse``."""
-
     def __init__(self, session: TrainingClient) -> None:
         self._session = session
 
@@ -187,8 +200,7 @@ class SamplingClient:
         router_prompt = ModelInput.model_validate(prompt.model_dump())
         tokens = _model_input_to_tokens(router_prompt)
         params = sampling_params_tinker_to_vllm(SamplingParams(max_tokens=1, temperature=1.0), 1)
-        # vLLM's 0 means the prompt token itself, which is what distillation subtracts.
-        params["prompt_logprobs"] = 0
+        params["prompt_logprobs"] = 0  # vLLM: 0 is the prompt token's own log-prob
         result = await self._session.generate(tokens, params)
         prompt_logprobs = result.get("prompt_logprobs")
         if prompt_logprobs is None or len(prompt_logprobs) != len(tokens):
@@ -226,6 +238,8 @@ class TrainingClient:
         self._max_response = max_response
         self._lock = asyncio.Lock()
         self._have_grad = False
+        self._sampler_path: str | None = None
+        self._announced_checkpoint = False
 
     async def generate(self, tokens: list[int], params: dict) -> dict:
         return await self._handlers["generate_handler"](tokens, params)
@@ -294,7 +308,12 @@ class TrainingClient:
             await self._handlers["sync_weights_handler"]()
         return SamplingClient(self)
 
-    def create_sampling_client(self, *_: Any, **__: Any) -> SamplingClient:
+    def create_sampling_client(self, model_path: str, retry_config: Any = None) -> SamplingClient:
+        del retry_config
+        if model_path != self._sampler_path:
+            raise RuntimeError(
+                "a sampling client can only be opened from the sampler path just saved in this process"
+            )
         return SamplingClient(self)
 
     async def save_state_async(self, name: str, ttl_seconds: int | None = None) -> _Future:
@@ -304,11 +323,20 @@ class TrainingClient:
 
     async def save_weights_for_sampler_async(self, name: str, ttl_seconds: int | None = None) -> _Future:
         del ttl_seconds
-        task = asyncio.create_task(self._path(f"cortex://session/{name}/sampler"))
+        task = asyncio.create_task(self._sync_and_path(f"cortex://session/{name}/sampler"))
         return _Future(task)
 
     async def _path(self, path: str) -> _Path:
+        if not self._announced_checkpoint:
+            self._announced_checkpoint = True
+            logger.warning("checkpoint %s cannot be loaded in another process", path)
         return _Path(path)
+
+    async def _sync_and_path(self, path: str) -> _Path:
+        async with self._lock:
+            await self._handlers["sync_weights_handler"]()
+            self._sampler_path = path
+        return await self._path(path)
 
 
 class ServiceClient:
@@ -336,8 +364,9 @@ class ServiceClient:
         self.max_prompt_length = int(max_prompt_length or _settings["max_prompt_length"])
         self.max_response_length = int(max_response_length or _settings["max_response_length"])
         self._session: TrainingClient | None = None
-        self._student_model: str | None = None
+        self._student_spec: tuple[Any, ...] | None = None
         self._teachers: dict[str, TrainingClient] = {}
+        self._teacher_lock = threading.Lock()
 
     async def create_lora_training_client_async(
         self,
@@ -350,39 +379,63 @@ class ServiceClient:
         user_metadata: dict | None = None,
     ) -> TrainingClient:
         del user_metadata
+        spec = (base_model, rank, train_mlp, train_attn, train_unembed)
         if self._session is not None:
+            if spec != self._student_spec:
+                raise RuntimeError(
+                    "this service already opened a training client; a second model or LoRA rank needs its own process"
+                )
             return self._session
         groups = [name for name, enabled in (("mlp", train_mlp), ("attn", train_attn), ("unembed", train_unembed)) if enabled]
         if not groups:
             raise ValueError("at least one of train_mlp, train_attn, train_unembed must be set")
-        self._student_model = base_model
         self._session = await asyncio.to_thread(self._open, base_model, rank, seed, ",".join(groups))
+        self._student_spec = spec
         return self._session
 
-    def create_sampling_client(self, base_model: str | None = None, model_path: str | None = None, **_: Any) -> SamplingClient:
-        """A sampler for ``base_model``.
-
-        On-policy distillation calls this with the teacher. That model is a
-        sampling-only Cortex job on its base weights. The trained student is
-        the sampler from ``save_weights_and_get_sampling_client_async``.
-        """
+    def create_sampling_client(
+        self,
+        model_path: str | None = None,
+        base_model: str | None = None,
+        retry_config: Any = None,
+    ) -> SamplingClient:
+        del retry_config
         if model_path is not None:
-            raise RuntimeError("loading a sampler checkpoint is not supported; the teacher is its base weights")
-        if base_model is None or base_model == self._student_model:
-            if self._session is None:
-                raise RuntimeError("create a training client before sampling the student")
-            return SamplingClient(self._session)
-        if base_model not in self._teachers:
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                self._teachers[base_model] = self._open_teacher(base_model)
-            else:
-                import concurrent.futures
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    self._teachers[base_model] = pool.submit(self._open_teacher, base_model).result()
+            raise RuntimeError("loading a sampler checkpoint is not supported")
+        if base_model is None:
+            raise ValueError("pass base_model; checkpoint paths are not supported")
+        with self._teacher_lock:
+            if base_model not in self._teachers:
+                self._teachers[base_model] = self._open_teacher_from_caller(base_model)
         return SamplingClient(self._teachers[base_model])
+
+    def _open_teacher_from_caller(self, model: str) -> TrainingClient:
+        # Sync call from the cookbook's running loop. Open off-thread or the loop deadlocks.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self._open_teacher(model)
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(self._open_teacher, model).result()
+
+    def create_rest_client(self, *_: Any, **__: Any) -> Any:
+        raise ValueError("checkpoint metadata is not available")
+
+    def create_training_client_from_state(self, path: str, *_: Any, **__: Any) -> TrainingClient:
+        _refuse_checkpoint(path)
+
+    def create_training_client_from_state_with_optimizer(self, path: str, *_: Any, **__: Any) -> TrainingClient:
+        _refuse_checkpoint(path)
+
+    async def create_training_client_from_state_async(self, path: str, *_: Any, **__: Any) -> TrainingClient:
+        _refuse_checkpoint(path)
+
+    async def create_training_client_from_state_with_optimizer_async(
+        self, path: str, *_: Any, **__: Any
+    ) -> TrainingClient:
+        _refuse_checkpoint(path)
 
     def _open_teacher(self, model: str) -> TrainingClient:
         from transformers import AutoConfig
@@ -393,14 +446,13 @@ class ServiceClient:
         from arctic_platform.integrations.tinker.serve import _client_config
         from arctic_platform.integrations.tinker.serve import _isolation
 
-        # The teacher is given the whole student sequence as its prompt, then
-        # samples one token so vLLM will score that prompt.
+        # Prompt cap fits a full student sequence. Response cap matches the student.
         cfg = TinkerServeConfig(
             model=model,
             training_gpus=0,
             sampling_gpus=self.teacher_sampling_gpus,
             max_prompt_length=self.max_prompt_length + self.max_response_length,
-            max_response_length=1,
+            max_response_length=self.max_response_length,
             lora_rank=0,
             seed=7,
         )

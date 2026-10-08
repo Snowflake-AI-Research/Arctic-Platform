@@ -74,6 +74,120 @@ assert logprobs == [None, -0.4, -0.2], logprobs
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_sampler_save_syncs_the_live_weights() -> None:
+    script = """
+import asyncio
+import arctic_platform.tinker as tinker
+
+synced = {}
+
+async def sync():
+    synced["ok"] = True
+
+client = tinker.TrainingClient(None, {"sync_weights_handler": sync}, 0, 8, 8)
+
+async def main():
+    saved = await client.save_weights_for_sampler_async("step20")
+    return await saved.result_async()
+
+result = asyncio.run(main())
+assert synced.get("ok") is True
+assert result.path == "cortex://session/step20/sampler"
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
+def test_cookbook_client_contract() -> None:
+    script = """
+import asyncio
+import arctic_platform.tinker as tinker
+
+synced = {}
+
+async def sync():
+    synced["n"] = synced.get("n", 0) + 1
+
+client = tinker.TrainingClient(None, {"sync_weights_handler": sync}, 0, 8, 8)
+
+async def main():
+    saved = await client.save_weights_for_sampler_async("000020")
+    result = await saved
+    sampler = client.create_sampling_client(result.path)
+    assert sampler._session is client
+    try:
+        client.create_sampling_client("cortex://session/other/sampler")
+    except RuntimeError as exc:
+        assert "just saved" in str(exc)
+    else:
+        raise SystemExit("accepted a sampler path from another save")
+    return result.path
+
+path = asyncio.run(main())
+assert path == "cortex://session/000020/sampler"
+assert synced["n"] == 1
+
+service = tinker.ServiceClient(training_gpus=1, sampling_gpus=1)
+service._session = client
+service._student_spec = ("Qwen/Qwen3.5-4B", 32, True, True, True)
+sentinel = tinker.TrainingClient(None, {}, 0, 8, 8)
+service._open_teacher = lambda model: sentinel
+base = service.create_sampling_client(base_model="Qwen/Qwen3.5-4B")
+assert base._session is sentinel
+
+try:
+    service.create_sampling_client()
+except ValueError as exc:
+    assert "base_model" in str(exc)
+else:
+    raise SystemExit("create_sampling_client accepted no model")
+
+try:
+    service.create_sampling_client(model_path="tinker://run/sampler")
+except RuntimeError as exc:
+    assert "not supported" in str(exc)
+else:
+    raise SystemExit("checkpoint model_path was accepted")
+
+try:
+    asyncio.run(service.create_training_client_from_state_async(path))
+except RuntimeError as exc:
+    assert "cannot load" in str(exc)
+else:
+    raise SystemExit("resume was accepted")
+
+try:
+    service.create_rest_client()
+except ValueError as exc:
+    assert "not available" in str(exc)
+else:
+    raise SystemExit("rest client was created")
+
+try:
+    asyncio.run(service.create_lora_training_client_async("other/model"))
+except RuntimeError as exc:
+    assert "already opened" in str(exc)
+else:
+    raise SystemExit("a second model was accepted")
+
+class Session:
+    async def generate(self, tokens, params):
+        raise SystemExit("temperature should be refused before generate")
+
+prompt = tinker.types.ModelInput.from_ints([1])
+try:
+    asyncio.run(
+        tinker.SamplingClient(Session()).sample_async(
+            prompt, sampling_params=tinker.SamplingParams(temperature=0.0)
+        )
+    )
+except RuntimeError as exc:
+    assert "temperature" in str(exc)
+else:
+    raise SystemExit("temperature 0 was accepted")
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
 def test_launcher_requires_gpu_counts() -> None:
     completed = subprocess.run(
         [sys.executable, "-m", "arctic_platform.tinker.run", "tinker_cookbook.recipes.math_rl.train"],

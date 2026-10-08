@@ -81,20 +81,15 @@ A job can remain in `PLACING` while it waits for GPU capacity.
 python -m arctic_platform.tinker.run \
     --training-gpus 1 \
     --sampling-gpus 1 \
-    --max-prompt-length 1024 \
-    --max-response-length 512 \
+    --max-prompt-length 4096 \
+    --max-response-length 1024 \
     tinker_cookbook.recipes.math_rl.train \
-    model_name=Qwen/Qwen3-0.6B \
-    renderer_name=qwen3_disable_thinking \
-    lora_rank=32 \
     env=gsm8k \
-    group_size=8 \
-    groups_per_batch=8 \
-    max_tokens=384 \
-    temperature=1.0 \
-    learning_rate=2e-6 \
-    save_every=0 \
-    eval_every=0
+    model_name=Qwen/Qwen3.5-4B \
+    group_size=64 \
+    groups_per_batch=32 \
+    learning_rate=8e-5 \
+    max_tokens=1024
 ```
 
 `base_url` on the recipe is ignored. The process releases the Cortex job on
@@ -115,10 +110,9 @@ Required settings:
   recommendation table.
 - `lora_rank` on the recipe is the LoRA rank provisioned on the Cortex job.
 - Use `temperature=1.0`.
-- Keep `max_tokens` below `--max-response-length`.
+- Keep `max_tokens` within `--max-response-length`.
 - Ensure rendered prompts fit `--max-prompt-length`.
-- Use `save_every=0`. The final checkpoint call returns a local
-  `cortex://` path and does not upload weights.
+- Sampler saves sync weights for this process. Resume from a new process is refused.
 
 Training rows are never truncated. A prompt or response longer than its limit
 is accepted as long as the whole datum fits
@@ -155,22 +149,21 @@ Supported:
   that serve `forward` (not Cortex; see below)
 - on-policy distillation from one teacher, including `compute_logprobs`
 
-Current limitations:
+Current limitations. The in-process client raises `RuntimeError`. The HTTP adapter returns the status code in the table.
 
 | Limitation | Behavior |
 |---|---|
 | LoRA | One rank and module set per server, fixed at start-up; others return 400. |
-| Temperature | Sampling temperatures other than `1.0` return 400. |
-| Checkpoints | `save_weights` returns an acknowledgment path; load and resume are not implemented. |
+| Temperature | Temperatures other than `1.0` are refused. |
+| Checkpoints | A sampler save syncs weights. Only the path just saved can be opened, and only in this process. Resume raises. |
 | Sequence limits | A datum longer than `--max-prompt-length + --max-response-length` returns 400. |
 | Loss config | `loss_fn_config` keys other than PPO's two clip thresholds return 400. |
-| Forward | `forward` (log-probs without gradients) returns 400: Cortex's no-gradient pipeline rejects this request shape. `forward_backward` returns the same log-probs. The cookbook's NLL evaluator uses `forward`, so run `chat_sl` with `eval_every=0`. `forward_backward_custom` calls `forward` first, so custom losses (DPO, SDFT) are unavailable on Cortex. |
-| Gradient accumulation | Cortex steps on the last `forward_backward`'s gradient and drops earlier ones, where Tinker sums them. A second `forward_backward` before `optim_step` therefore returns 400. In the cookbook, leave `stream_minibatch_config` unset or use `num_minibatches=1`; `num_substeps` is unaffected. |
-| Teacher | One teacher, from its base weights. A teacher checkpoint (the distillation recipe's `teacher_checkpoint`) and `topk_prompt_logprobs` return 400. |
-| Base-model samplers | `create_sampling_client(base_model=...)` for the trained model reads its untrained weights, which the sampler holds only until the first weight sync; after that it returns 409. |
+| Forward | `forward` is refused. `forward_backward` returns the log-probs. NLL eval uses `forward`, so set `eval_every=0` for `chat_sl`. Custom losses (DPO, SDFT) call `forward` first and are unavailable. |
+| Gradient accumulation | A second `forward_backward` before `optim_step` is refused. Cortex keeps only the latest gradient. Leave `stream_minibatch_config` unset or use `num_minibatches=1`. |
+| Teacher | `base_model` opens that model's base weights, including the student. Prompt cap is student prompt + response. Response cap matches the student. `model_path` is refused. |
 | Optimizer overrides | Only the learning rate varies per step; other Adam settings are fixed at start-up. |
 | Multimodal input | Only encoded text tokens are passed to Cortex. |
-| Authentication | The local Tinker server does not authenticate requests. |
+| Authentication | Uses `ARCTIC_CORTEX_*`. `base_url` is ignored. |
 
 Recipes that require audio, images, checkpoint resume, reference-model
 workers, external tools, or external graders are not covered by this
