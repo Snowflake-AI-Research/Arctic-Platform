@@ -638,7 +638,6 @@ class InferenceWorker(StreamingWorkerMixin):
         # Chat-mode streams only, so enabling chat leaves /generate (think
         # prefill, reasoning split, action masks) on the job's own parser.
         chat_reasoning_parser = engine_kwargs.pop("chat_reasoning_parser", None)
-        self._chat_reasoning_parser_name = chat_reasoning_parser or reasoning_parser_name
         self._return_reasoning_content = bool(engine_kwargs.pop("return_reasoning_content", False))
         lora_adapter_path = engine_kwargs.pop("lora_adapter_path", None)
 
@@ -680,6 +679,12 @@ class InferenceWorker(StreamingWorkerMixin):
                 )
                 vllm_config = engine_args.create_engine_config()
                 self._chat_only_reasoner = _add_chat_reasoner(vllm_config, chat_reasoning_parser)
+                # Chat parses with the reasoner the engine gates grammars on,
+                # wherever it came from (chat_reasoning_parser, reasoning_parser,
+                # structured_outputs_config or the model's default).
+                self._chat_reasoning_parser_name = (
+                    vllm_config.structured_outputs_config.reasoning_parser or None
+                )
                 self._structured_outputs_enabled_in_reasoning = bool(
                     vllm_config.structured_outputs_config.enable_in_reasoning
                 )

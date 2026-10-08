@@ -261,6 +261,9 @@ def test_plain_streams_keep_their_grammar_timing(fake_vllm, engine_kwargs, reaso
         ({"chat_reasoning_parser": "qwen3"}, "qwen3"),
         ({"reasoning_parser": "qwen3"}, "qwen3"),
         ({"reasoning_parser": "qwen3", "chat_reasoning_parser": "qwen3"}, "qwen3"),
+        # The engine gates grammars on this reasoner, so chat must parse with it.
+        ({"structured_outputs_config": {"reasoning_parser": "qwen3"}}, "qwen3"),
+        ({"model_default": "openai_gptoss"}, "openai_gptoss"),
         ({}, None),
     ],
 )
@@ -271,6 +274,9 @@ def test_chat_streams_use_the_chat_parser_or_the_jobs_own(
 
     built = []
     monkeypatch.setattr(chat_module, "ChatEngine", lambda llm, **kwargs: built.append(kwargs))
+    engine_kwargs = dict(engine_kwargs)
+    if "model_default" in engine_kwargs:
+        fake_vllm["engine_reasoner"] = engine_kwargs.pop("model_default")
     worker = start_worker(tool_call_parser="hermes", **engine_kwargs)
 
     worker._chat_engine()
