@@ -28,7 +28,6 @@ import torch.nn as nn
 from pydantic import BaseModel
 
 from arctic_platform.model.config import ModelSpec
-from arctic_platform.model.config import ResolvedModelSpec
 from arctic_platform.model.platform import PlatformCapabilities
 
 if TYPE_CHECKING:
@@ -101,7 +100,7 @@ class LoadedModel:
 Loader = Callable[[LoaderContext], LoadedModel]
 Matcher = Callable[[LoaderContext], bool]
 SpecValidator = Callable[[ModelSpec], None]
-SpecResolver = Callable[[ModelSpec, PlatformCapabilities], ResolvedModelSpec]
+SpecResolver = Callable[[ModelSpec, PlatformCapabilities], ModelSpec]
 
 
 @dataclass
@@ -183,13 +182,12 @@ def resolve_spec_with_defaults(
     label_contract: Literal["causal_labels", "logit_aligned"] = "causal_labels",
     requires_weight_conversion: bool = False,
     model_forward_requires_labels: bool = False,
-) -> ResolvedModelSpec:
+) -> ModelSpec:
     if spec.loader is None:
         raise ValueError("ModelSpec.loader must be selected before platform-dependent fields are resolved")
     entry = _LOADERS[spec.loader]
 
-    resolved = spec.model_copy(deep=True)
-    resolved_attention = resolved.attn_implementation
+    resolved_attention = spec.attn_implementation
     if resolved_attention is None:
         resolved_attention = _platform_attention_default(platform) if attention == "platform" else attention
     if resolved_attention.startswith("flash_attention_") and resolved_attention not in platform.attention_backends:
@@ -198,9 +196,10 @@ def resolve_spec_with_defaults(
             f"but the backend is unavailable; available={sorted(platform.attention_backends)}"
         )
 
+    loader_options = dict(spec.loader_options)
     resolved_ep_comm_backend = None
-    if resolved.parallelism.expert_parallel > 1:
-        requested_backend = resolved.loader_options.get("ep_comm_backend")
+    if spec.parallelism.expert_parallel > 1:
+        requested_backend = loader_options.get("ep_comm_backend")
         resolved_ep_comm_backend = requested_backend or ep_comm_backend
         if resolved_ep_comm_backend is None:
             raise ValueError(f"loader {spec.loader!r} did not resolve an expert-parallel communication backend")
@@ -209,33 +208,30 @@ def resolve_spec_with_defaults(
                 f"{resolved_ep_comm_backend} is required by loader {spec.loader!r}, "
                 f"but the backend is unavailable; available={sorted(platform.ep_comm_backends)}"
             )
-        resolved.loader_options["ep_comm_backend"] = resolved_ep_comm_backend
+        loader_options["ep_comm_backend"] = resolved_ep_comm_backend
 
-    resolved.attn_implementation = resolved_attention
     if entry.options is not None:
-        resolved.loader_options = entry.options.model_validate(resolved.loader_options).model_dump()
+        loader_options = entry.options.model_validate(loader_options).model_dump()
 
-    fused_cross_entropy = resolved.loader_options.get("fused_cross_entropy")
-    if resolved.patches.liger:
+    fused_cross_entropy = loader_options.get("fused_cross_entropy")
+    if spec.patches.liger:
         fused_cross_entropy = "liger"
-    return ResolvedModelSpec(
-        **resolved.model_dump(),
-        ep_comm_backend=resolved_ep_comm_backend,
-        sp_strategy=sp_strategy,
-        sp_requires_head_divisibility=sp_requires_head_divisibility,
-        label_contract=label_contract,
-        requires_weight_conversion=requires_weight_conversion,
-        model_forward_requires_labels=model_forward_requires_labels,
-        fused_cross_entropy=fused_cross_entropy,
-    )
+    spec.attn_implementation = resolved_attention
+    spec.loader_options = loader_options
+    spec.ep_comm_backend = resolved_ep_comm_backend
+    spec.sp_strategy = sp_strategy
+    spec.sp_requires_head_divisibility = sp_requires_head_divisibility
+    spec.label_contract = label_contract
+    spec.requires_weight_conversion = requires_weight_conversion
+    spec.model_forward_requires_labels = model_forward_requires_labels
+    spec.fused_cross_entropy = fused_cross_entropy
+    return spec
 
 
 def resolve_model_spec(
     spec: ModelSpec,
     platform: PlatformCapabilities | None = None,
-) -> ResolvedModelSpec:
-    if isinstance(spec, ResolvedModelSpec):
-        return spec
+) -> ModelSpec:
     if spec.loader is None:
         raise ValueError("ModelSpec.loader must be selected before platform-dependent fields are resolved")
     return _LOADERS[spec.loader].resolve_spec(spec, platform or PlatformCapabilities.detect())

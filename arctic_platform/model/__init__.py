@@ -26,7 +26,6 @@ from arctic_platform.model.config import LmHeadPatch
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
-from arctic_platform.model.config import ResolvedModelSpec
 from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
 from arctic_platform.model.factory import build_model
@@ -53,7 +52,6 @@ __all__ = [
     "LmHeadPatch",
     "CompilePatch",
     "ModelSpec",
-    "ResolvedModelSpec",
     "ParallelismConfig",
     "Patches",
     "TiledMlpPatch",

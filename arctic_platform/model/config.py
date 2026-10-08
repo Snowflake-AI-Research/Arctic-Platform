@@ -204,6 +204,13 @@ class ModelSpec(BaseModel):
     )
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
     loader_options: dict = Field(default_factory=dict, description="JSON-only loader-specific extras.")
+    ep_comm_backend: Literal["deepep", "uccl"] | None = None
+    sp_strategy: Literal["transformers_ulysses", "native"] = "transformers_ulysses"
+    sp_requires_head_divisibility: bool = True
+    label_contract: Literal["causal_labels", "logit_aligned"] = "causal_labels"
+    requires_weight_conversion: bool = False
+    model_forward_requires_labels: bool = False
+    fused_cross_entropy: bool | str | None = None
 
     @classmethod
     def from_ds_worker_config(cls, model_name: str, ds_worker_config: dict) -> "ModelSpec":
@@ -281,17 +288,3 @@ class ModelSpec(BaseModel):
 
         validate_loader_spec(self.loader, self)
         return self
-
-
-class ResolvedModelSpec(ModelSpec):
-    """A model specification with platform-dependent loader decisions applied."""
-
-    attn_implementation: str
-    loader: str
-    ep_comm_backend: Literal["deepep", "uccl"] | None = None
-    sp_strategy: Literal["transformers_ulysses", "native"]
-    sp_requires_head_divisibility: bool = True
-    label_contract: Literal["causal_labels", "logit_aligned"]
-    requires_weight_conversion: bool
-    model_forward_requires_labels: bool
-    fused_cross_entropy: bool | str | None = None

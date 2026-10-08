@@ -19,7 +19,6 @@ from __future__ import annotations
 from typing import Any
 
 from arctic_platform.model.config import ModelSpec
-from arctic_platform.model.config import ResolvedModelSpec
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import resolve_model_spec
@@ -29,7 +28,7 @@ from arctic_platform.model.platform import PlatformCapabilities
 
 
 def build_model(
-    spec: ModelSpec | ResolvedModelSpec,
+    spec: ModelSpec,
     parallel_groups: Any | None = None,
     platform: PlatformCapabilities | None = None,
 ) -> LoadedModel:

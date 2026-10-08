@@ -251,8 +251,8 @@ class TestHuggingFaceLoader:
             PlatformCapabilities.for_accelerator(accelerator),
         )
 
+        assert resolved is spec
         assert resolved.attn_implementation == expected
-        assert spec.attn_implementation is None
 
     def test_explicit_attention_override_is_preserved(self):
         spec = ModelSpec(
