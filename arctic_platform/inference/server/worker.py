@@ -649,7 +649,23 @@ class InferenceWorker(StreamingWorkerMixin):
                     attempt_kwargs,
                     enable_arctic_patches=arctic_enabled,
                 )
-                vllm_config = engine_args.create_engine_config()
+                try:
+                    vllm_config = engine_args.create_engine_config()
+                except RuntimeError as exc:
+                    if "think start/end tokens" not in str(exc):
+                        raise
+                    dropped = attempt_kwargs.pop("reasoning_parser", None)
+                    engine_kwargs.pop("reasoning_parser", None)
+                    logger.warning(
+                        "Tokenizer lacks think tokens; dropping reasoning_parser=%r",
+                        dropped,
+                    )
+                    reasoning_parser_name = None
+                    engine_args = _create_async_engine_args(
+                        attempt_kwargs,
+                        enable_arctic_patches=arctic_enabled,
+                    )
+                    vllm_config = engine_args.create_engine_config()
                 self._structured_outputs_enabled_in_reasoning = bool(
                     vllm_config.structured_outputs_config.enable_in_reasoning
                 )

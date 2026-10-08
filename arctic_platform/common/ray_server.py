@@ -13,15 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Local RL server using Ray to manage DeepSpeed workers and ArcticInference ReplicaPools.
-
-Uses Ray to manage DeepSpeed workers and ArcticInference ReplicaPools.
-
-Usage::
-
-    python -m arctic_platform.common.http_server \\
-        --training-gpus 4 --sampling-gpus 2 --log-prob-gpus 2
-"""
+"""Local RL server using Ray to manage DeepSpeed workers and ArcticInference ReplicaPools."""
 
 from __future__ import annotations
 
@@ -1179,7 +1171,7 @@ class ArcticRLRayServer:
         # One sender rank per NCCL group (as assigned by TransferSchedule).
         # Broadcasting send_weights from every DP rank breaks the intended
         # topology and can hang / duplicate / corrupt transfers for
-        # non-colocated runs. Mirrors the HTTP server's sender-rank-only sends.
+        # non-colocated runs.
         send_tasks = [workers[g.sender_train_rank].send_weights.remote() for g in schedule.groups]
         receive_task = pool.sync_weights(
             groups=groups,
