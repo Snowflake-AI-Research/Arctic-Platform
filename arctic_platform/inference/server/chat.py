@@ -145,6 +145,7 @@ class RenderedChat:
     detokenize_params: dict = field(default_factory=dict)
     generate_kwargs: dict = field(default_factory=dict)
     parallel_tool_calls: bool | None = None
+    tool_choice: str | dict | None = None
 
 
 class ChatEngine:
@@ -257,6 +258,7 @@ class ChatEngine:
             },
             generate_kwargs=generate_kwargs,
             parallel_tool_calls=prompt.parallel_tool_calls,
+            tool_choice=prompt.tool_choice,
         )
 
 
@@ -327,7 +329,14 @@ class ChatOutput:
         return event
 
     def finish_reason(self, index, reason):
-        return "tool_calls" if reason == "stop" and self.called_tools[index] else reason
+        # As OpenAI and vllm serve do, a named tool_choice finishes with "stop".
+        if (
+            reason == "stop"
+            and self.called_tools[index]
+            and not isinstance(self.rendered.tool_choice, dict)
+        ):
+            return "tool_calls"
+        return reason
 
     def reasoning_tokens(self):
         return sum(

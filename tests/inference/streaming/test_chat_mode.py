@@ -109,6 +109,7 @@ class FakeChatEngine:
             structured_outputs="structural-tag",
             generate_kwargs={"reasoning_ended": False},
             parallel_tool_calls=prompt.parallel_tool_calls,
+            tool_choice=prompt.tool_choice,
         )
 
 
@@ -299,6 +300,15 @@ def test_logprobs_go_with_answer_tokens_only():
     assert [entry["token"] for entry in entries] == ["It is", " 4."]
     assert [t for e in contents for t in e["token_ids"]] == [entry["token_id"] for entry in entries]
     assert all("logprobs" not in e for e in events if e["type"] != "content_delta")
+
+
+def test_named_tool_choice_finishes_with_stop():
+    # As in OpenAI and vllm serve: tool_calls only for auto or required.
+    named = {"type": "function", "function": {"name": "get_weather"}}
+    _, events = stream(chat("Weather in Paris?", tool_choice=named), script=TOOL_CALL)
+    assert [e for e in events if e["type"] == "tool_call_delta"]
+    [finish] = [e for e in events if e["type"] == "choice_finished"]
+    assert finish["finish_reason"] == "stop"
 
 
 def test_no_logprobs_key_unless_requested():

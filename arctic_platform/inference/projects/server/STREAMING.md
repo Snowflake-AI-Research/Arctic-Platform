@@ -138,7 +138,8 @@ gets `openai_gptoss`).
   `adjust_request`, as in vllm serve, so tool and reasoning markup made of
   special tokens reaches the parser. A parser failure mid-stream ends it with
   `engine_error` and is logged by type and stack only.
-- `choice_finished` reports `tool_calls` when a choice that called a tool stops.
+- `choice_finished` reports `tool_calls` when a choice that called a tool stops,
+  except under a named `tool_choice`, which reports `stop` as OpenAI does.
   `usage` adds `reasoning_tokens`, counted by the reasoning parser across choices.
 - Undelivered events merge only with the same kind of the same choice; tool-call
   arguments merge only within one call.

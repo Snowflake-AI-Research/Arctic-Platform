@@ -169,7 +169,9 @@ def test_forced_tool_call_streams_a_valid_call(tool_choice):
             arguments = json.loads("".join(c["arguments"] for c in calls if c["index"] == 0))
             assert isinstance(arguments.get("city"), str)
             [finish] = [e for e in events if e["type"] == "choice_finished"]
-            assert finish["finish_reason"] == "tool_calls"
+            # A named tool_choice finishes with "stop", as in OpenAI and vllm serve.
+            expected = "stop" if isinstance(tool_choice, dict) else "tool_calls"
+            assert finish["finish_reason"] == expected
 
     asyncio.run(with_driver(check))
 
