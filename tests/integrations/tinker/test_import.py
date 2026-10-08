@@ -188,6 +188,48 @@ else:
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_optim_step_refuses_adam_the_job_cannot_apply() -> None:
+    script = """
+import asyncio
+import arctic_platform.tinker as tinker
+
+called = {}
+
+async def step(overrides):
+    called["overrides"] = overrides
+    return {"metrics": {}}
+
+client = tinker.TrainingClient(
+    None,
+    {"step_handler": step},
+    0,
+    8,
+    8,
+    fixed_adam={"beta1": 0.9, "beta2": 0.95, "eps": 1e-8, "weight_decay": 0.0, "grad_clip_norm": 0.0},
+)
+
+async def main():
+    client._have_grad = True
+    try:
+        await (await client.optim_step_async(tinker.AdamParams(learning_rate=1e-4, eps=1e-12))).result_async()
+    except ValueError as exc:
+        assert "learning rate" in str(exc)
+    else:
+        raise SystemExit("a different Adam eps was accepted")
+    assert "overrides" not in called
+    client._have_grad = True
+    await (
+        await client.optim_step_async(
+            tinker.AdamParams(learning_rate=1e-4, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.0, grad_clip_norm=0.0)
+        )
+    ).result_async()
+    assert called["overrides"]["lr"] == 1e-4
+
+asyncio.run(main())
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
 def test_launcher_requires_gpu_counts() -> None:
     completed = subprocess.run(
         [sys.executable, "-m", "arctic_platform.tinker.run", "tinker_cookbook.recipes.math_rl.train"],

@@ -14,35 +14,21 @@
 # limitations under the License.
 """Provision a Cortex job for the in-process Tinker client.
 
-Recipes enter through ``python -m arctic_platform.tinker.run``. That module
-builds a :class:`TinkerServeConfig` from ``--training-gpus`` and
-``--sampling-gpus`` and calls :func:`_client_config`. ``TINKER_BASE_URL`` is
-not part of that path.
-
-Provisioning is not expressible in Tinker's protocol -- there is no verb for
-"give me four GPUs with ZeRO-2 and FA3" -- so the job is created here from
-those counts and the Tinker calls are bound onto it.
+``python -m arctic_platform.tinker.run`` builds a :class:`TinkerServeConfig`
+from ``--training-gpus`` and ``--sampling-gpus`` and calls :func:`_client_config`.
+Tinker has no verb for GPU count, ZeRO, or attention implementation, so those
+are set here.
 """
 
 from __future__ import annotations
 
-import argparse
-import contextlib
 import json
-import logging
 from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from arctic_platform.integrations.tinker.cortex import CortexTinkerBackend
-from arctic_platform.integrations.tinker.cortex import build_handlers
-from arctic_platform.integrations.tinker.router import init_tinker_state
-from arctic_platform.integrations.tinker.router import router as tinker_router
-
-logger = logging.getLogger(__name__)
-
-__all__ = ["TinkerServeConfig", "create_app", "main"]
+__all__ = ["TinkerServeConfig"]
 
 
 @dataclass
@@ -73,11 +59,6 @@ class TinkerServeConfig:
     max_tokens_per_mb: int = 8192
     gpu_memory_utilization: float = 0.8
     zero_stage: int = 2
-    job_id: str | None = None
-    # On-policy distillation's teacher: served from its base weights by a
-    # sampling-only job of its own, created and released with this server.
-    teacher_model: str | None = None
-    teacher_sampling_gpus: int = 1
     # 0 is full fine-tuning. Otherwise a LoRA adapter shaped like Tinker's:
     # alpha 32 scaled by alpha/rank, on the comma-separated module groups of
     # `_LORA_MODULE_GROUPS` -- Tinker's train_mlp / train_attn / train_unembed.
@@ -92,8 +73,6 @@ class TinkerServeConfig:
     weight_decay: float = 0.0
     # 0 disables clipping, as in Tinker's AdamParams.
     grad_clip_norm: float = 0.0
-    host: str = "127.0.0.1"
-    port: int = 8000
 
     @property
     def max_seq_len(self) -> int:
@@ -150,20 +129,6 @@ def _peft_config(cfg: TinkerServeConfig) -> dict[str, Any] | None:
     }
 
 
-def _served_lora(cfg: TinkerServeConfig) -> Any:
-    from arctic_platform.integrations.tinker.router import LoraConfig
-
-    if cfg.lora_rank <= 0:
-        return None
-    groups = set(_lora_groups(cfg))
-    return LoraConfig(
-        rank=cfg.lora_rank,
-        train_mlp="mlp" in groups,
-        train_attn="attn" in groups,
-        train_unembed="unembed" in groups,
-    )
-
-
 def _has_linear_attention(model_config: Any) -> bool:
     text_config = getattr(model_config, "text_config", None) or model_config
     return "linear_attention" in (getattr(text_config, "layer_types", None) or [])
@@ -201,13 +166,6 @@ def _client_config(cfg: TinkerServeConfig) -> Any:
     else:
         backend = CortexConfig()
 
-    job_ids = {}
-    if cfg.job_id is not None:
-        job_ids = {
-            "training_job_id": f"{cfg.job_id}:training:0",
-            "sampling_job_id": f"{cfg.job_id}:sampling:0",
-        }
-
     return ArcticClientConfig(
         backend=backend,
         model_name=cfg.model,
@@ -243,110 +201,4 @@ def _client_config(cfg: TinkerServeConfig) -> Any:
             peft=_peft_config(cfg),
         ),
         sampling=SamplingConfig(vllm={"gpu_memory_utilization": cfg.gpu_memory_utilization}),
-        **job_ids,
     )
-
-
-def _teacher_config(cfg: TinkerServeConfig) -> Any:
-    # The teacher scores a whole student sequence and then has to sample one
-    # token to do it, so it needs one position more than the student.
-    return _client_config(
-        replace(
-            cfg,
-            model=cfg.teacher_model,
-            training_gpus=0,
-            sampling_gpus=cfg.teacher_sampling_gpus,
-            max_response_length=cfg.max_response_length + 1,
-            job_id=None,
-            lora_rank=0,
-        )
-    )
-
-
-def create_app(cfg: TinkerServeConfig):
-    """A FastAPI app serving Tinker's protocol, bound to a Cortex job.
-
-    The job is created on startup and released on shutdown unless ``job_id``
-    attached this server to someone else's, in which case it is left running.
-    """
-    from fastapi import FastAPI
-
-    from arctic_platform.client import AsyncArcticRLClient
-
-    @contextlib.asynccontextmanager
-    async def lifespan(app: FastAPI):
-        from transformers import AutoConfig
-        from transformers import AutoTokenizer
-
-        job_cfg, isolate_capacity = _isolation(cfg, AutoConfig.from_pretrained(cfg.model))
-        if isolate_capacity is not None:
-            logger.info("one sequence per micro-batch of %d tokens (linear attention)", isolate_capacity)
-        client_cfg = _client_config(job_cfg)
-        attached = client_cfg.training_job_id is not None
-        client = AsyncArcticRLClient(client_cfg)
-        logger.info("training job %s is running", client.jobs.training)
-        teacher = None
-        try:
-            teacher_handlers = {}
-            if cfg.teacher_model:
-                teacher = AsyncArcticRLClient(_teacher_config(cfg))
-                logger.info("teacher %s is running as job %s", cfg.teacher_model, teacher.jobs.sampling)
-                teacher_handlers[cfg.teacher_model] = CortexTinkerBackend(teacher).generate
-
-            tokenizer = AutoTokenizer.from_pretrained(cfg.model)
-            init_tinker_state(
-                app,
-                base_model=cfg.model,
-                max_prompt_length=cfg.max_prompt_length,
-                max_response_length=cfg.max_response_length,
-                pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
-                # Cortex registers no `apply_temperature`, so the trainer always
-                # scores at 1.0 and `sample` refuses any other temperature.
-                supports_temperature_scaling=False,
-                teacher_generate_handlers=teacher_handlers,
-                lora=_served_lora(cfg),
-                fixed_adam=cfg.fixed_adam,
-                **build_handlers(client, isolate_capacity=isolate_capacity),
-            )
-            app.state.arctic_client = client
-            yield
-        finally:
-            if teacher is not None:
-                logger.info("releasing teacher job %s", teacher.jobs.sampling)
-                await teacher.shutdown()
-            if attached:
-                logger.info("leaving pre-existing job %s running", client.jobs.training)
-            else:
-                logger.info("releasing job %s", client.jobs.training)
-                await client.shutdown()
-
-    app = FastAPI(title="Tinker over Cortex Training", lifespan=lifespan)
-    app.include_router(tinker_router)
-    return app
-
-
-def _parse_args(argv: list[str] | None = None) -> TinkerServeConfig:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", default=None, help="Cortex connection JSON; default reads ARCTIC_CORTEX_*")
-    defaults = TinkerServeConfig()
-    for name, value in vars(defaults).items():
-        if name == "config":
-            continue
-        flag = f"--{name.replace('_', '-')}"
-        if isinstance(value, bool):
-            p.add_argument(flag, action="store_true", default=value)
-        else:
-            p.add_argument(flag, type=type(value) if value is not None else str, default=value)
-    return TinkerServeConfig(**vars(p.parse_args(argv)))
-
-
-def main(argv: list[str] | None = None) -> None:
-    import uvicorn
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    cfg = _parse_args(argv)
-    uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port, log_level="info")
-
-
-if __name__ == "__main__":
-    main()

@@ -110,9 +110,7 @@ class _Path:
 
 
 def _refuse_checkpoint(path: str) -> NoReturn:
-    raise RuntimeError(
-        f"cannot load {path}: this process does not store checkpoints, so a new process cannot resume"
-    )
+    raise RuntimeError(f"cannot load {path}: this process does not store checkpoints, so a new process cannot resume")
 
 
 def _pick(explicit: int | None, key: str) -> int:
@@ -178,9 +176,7 @@ class SamplingClient:
         if sampling_params is None:
             sampling_params = _sdk.SamplingParams()
         if abs(float(sampling_params.temperature) - 1.0) > 1e-9:
-            raise RuntimeError(
-                "sampling temperature must be 1.0; Cortex scores training log-probs at temperature 1.0"
-            )
+            raise RuntimeError("sampling temperature must be 1.0; Cortex scores training log-probs at temperature 1.0")
         router_prompt = ModelInput.model_validate(prompt.model_dump())
         tokens = _model_input_to_tokens(router_prompt)
         params = sampling_params_tinker_to_vllm(
@@ -230,12 +226,21 @@ class SamplingClient:
 class TrainingClient:
     """In-process training client. Work on one model is serialized, sampling is not."""
 
-    def __init__(self, client: Any, handlers: dict[str, Any], pad_token_id: int, max_prompt: int, max_response: int) -> None:
+    def __init__(
+        self,
+        client: Any,
+        handlers: dict[str, Any],
+        pad_token_id: int,
+        max_prompt: int,
+        max_response: int,
+        fixed_adam: dict[str, float] | None = None,
+    ) -> None:
         self._client = client
         self._handlers = handlers
         self._pad_token_id = pad_token_id
         self._max_prompt = max_prompt
         self._max_response = max_response
+        self._fixed_adam = fixed_adam
         self._lock = asyncio.Lock()
         self._have_grad = False
         self._sampler_path: str | None = None
@@ -244,7 +249,9 @@ class TrainingClient:
     async def generate(self, tokens: list[int], params: dict) -> dict:
         return await self._handlers["generate_handler"](tokens, params)
 
-    async def forward_backward_async(self, data: list[Any], loss_fn: str = "cross_entropy", loss_fn_config: dict | None = None) -> _Future:
+    async def forward_backward_async(
+        self, data: list[Any], loss_fn: str = "cross_entropy", loss_fn_config: dict | None = None
+    ) -> _Future:
         task = asyncio.create_task(self._forward_backward(data, loss_fn, loss_fn_config))
         return _Future(task)
 
@@ -293,14 +300,16 @@ class TrainingClient:
         from arctic_platform.integrations.tinker.router import AdamParams
         from arctic_platform.integrations.tinker.router import adam_params_to_optim_overrides
         from arctic_platform.integrations.tinker.router import arctic_metrics_to_tinker
+        from arctic_platform.integrations.tinker.router import check_fixed_adam
 
         async with self._lock:
             if not self._have_grad:
                 raise RuntimeError("optim_step without a successful forward_backward")
+            requested = AdamParams.model_validate(adam_params.model_dump())
+            if self._fixed_adam is not None:
+                check_fixed_adam(self._fixed_adam, requested)
             self._have_grad = False
-            result = await self._handlers["step_handler"](
-                adam_params_to_optim_overrides(AdamParams.model_validate(adam_params.model_dump()))
-            )
+            result = await self._handlers["step_handler"](adam_params_to_optim_overrides(requested))
             return _sdk.OptimStepResponse(metrics=arctic_metrics_to_tinker(result.get("metrics")))
 
     async def save_weights_and_get_sampling_client_async(self, **_: Any) -> SamplingClient:
@@ -311,9 +320,7 @@ class TrainingClient:
     def create_sampling_client(self, model_path: str, retry_config: Any = None) -> SamplingClient:
         del retry_config
         if model_path != self._sampler_path:
-            raise RuntimeError(
-                "a sampling client can only be opened from the sampler path just saved in this process"
-            )
+            raise RuntimeError("a sampling client can only be opened from the sampler path just saved in this process")
         return SamplingClient(self)
 
     async def save_state_async(self, name: str, ttl_seconds: int | None = None) -> _Future:
@@ -386,7 +393,9 @@ class ServiceClient:
                     "this service already opened a training client; a second model or LoRA rank needs its own process"
                 )
             return self._session
-        groups = [name for name, enabled in (("mlp", train_mlp), ("attn", train_attn), ("unembed", train_unembed)) if enabled]
+        groups = [
+            name for name, enabled in (("mlp", train_mlp), ("attn", train_attn), ("unembed", train_unembed)) if enabled
+        ]
         if not groups:
             raise ValueError("at least one of train_mlp, train_attn, train_unembed must be set")
         self._session = await asyncio.to_thread(self._open, base_model, rank, seed, ",".join(groups))
@@ -460,7 +469,14 @@ class ServiceClient:
         cfg, isolate = _isolation(cfg, model_config)
         client = AsyncArcticRLClient(_client_config(cfg))
         _sessions.append(client)
-        return TrainingClient(client, build_handlers(client, isolate), 0, cfg.max_prompt_length, cfg.max_response_length)
+        return TrainingClient(
+            client,
+            build_handlers(client, isolate),
+            0,
+            cfg.max_prompt_length,
+            cfg.max_response_length,
+            fixed_adam=cfg.fixed_adam,
+        )
 
     def _open(self, base_model: str, rank: int, seed: int | None, lora_modules: str) -> TrainingClient:
         from transformers import AutoConfig
@@ -498,6 +514,7 @@ class ServiceClient:
             int(pad),
             cfg.max_prompt_length,
             cfg.max_response_length,
+            fixed_adam=cfg.fixed_adam,
         )
 
 

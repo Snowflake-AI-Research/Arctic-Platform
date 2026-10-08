@@ -20,12 +20,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from arctic_platform.integrations.tinker.router import LoraConfig
 from arctic_platform.integrations.tinker.serve import TinkerServeConfig
 from arctic_platform.integrations.tinker.serve import _client_config
 from arctic_platform.integrations.tinker.serve import _isolation
-from arctic_platform.integrations.tinker.serve import _served_lora
-from arctic_platform.integrations.tinker.serve import _teacher_config
 
 
 def test_client_config_uses_packaged_types(monkeypatch):
@@ -39,34 +36,13 @@ def test_client_config_uses_packaged_types(monkeypatch):
     assert config.sampling.vllm == {"gpu_memory_utilization": 0.8}
 
 
-def test_client_config_file_and_existing_job(tmp_path):
+def test_client_config_reads_a_connection_file(tmp_path):
     path = tmp_path / "connection.json"
     path.write_text(json.dumps({"connection": {"base_url": "http://cortex.test"}}), encoding="utf-8")
 
-    config = _client_config(TinkerServeConfig(config=str(path), job_id="job-1"))
+    config = _client_config(TinkerServeConfig(config=str(path)))
 
-    assert config.training_job_id == "job-1:training:0"
-    assert config.sampling_job_id == "job-1:sampling:0"
-
-
-def test_teacher_is_a_sampling_only_job_of_its_own(monkeypatch):
-    monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://cortex.test")
-    cfg = TinkerServeConfig(
-        model="Qwen/Qwen3-0.6B",
-        teacher_model="Qwen/Qwen3-8B",
-        teacher_sampling_gpus=2,
-        max_prompt_length=512,
-        max_response_length=1024,
-        job_id="student-job",
-    )
-
-    config = _teacher_config(cfg)
-
-    assert config.model_name == "Qwen/Qwen3-8B"
-    assert (config.training_gpus, config.sampling_gpus) == (0, 2)
-    # It scores a full student sequence, then samples one token past it.
-    assert config.max_seq_len == cfg.max_seq_len + 1
-    assert config.training_job_id is None and config.sampling_job_id is None
+    assert config.backend.base_url == "http://cortex.test"
 
 
 def test_adam_is_provisioned_as_the_cookbook_sends_it(monkeypatch):
@@ -121,7 +97,7 @@ def test_unknown_isolation_setting_refused():
 
 def test_lora_matches_tinkers_module_groups(monkeypatch):
     monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://cortex.test")
-    cfg = TinkerServeConfig(lora_rank=32, lora_modules="mlp,unembed", teacher_model="Qwen/Qwen3-8B")
+    cfg = TinkerServeConfig(lora_rank=32, lora_modules="mlp,unembed")
 
     peft = _client_config(cfg).training.peft
 
@@ -133,14 +109,6 @@ def test_lora_matches_tinkers_module_groups(monkeypatch):
         "bias": "none",
         "target_modules": ["gate_proj", "up_proj", "down_proj", "lm_head"],
     }
-    assert _served_lora(cfg) == LoraConfig(rank=32, train_mlp=True, train_attn=False, train_unembed=True)
-    # The teacher serves its base weights.
-    assert _teacher_config(cfg).training.peft is None
-
-
-def test_full_fine_tuning_serves_no_lora(monkeypatch):
-    monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://cortex.test")
-    assert _served_lora(TinkerServeConfig()) is None
 
 
 def test_unknown_lora_module_group_refused(monkeypatch):

@@ -21,7 +21,6 @@ import math
 
 import numpy as np
 import pytest
-from fastapi import HTTPException
 
 from arctic_platform.integrations.tinker.router import AdamParams
 from arctic_platform.integrations.tinker.router import Datum
@@ -30,6 +29,7 @@ from arctic_platform.integrations.tinker.router import ModelInput
 from arctic_platform.integrations.tinker.router import SamplingParams
 from arctic_platform.integrations.tinker.router import TensorData
 from arctic_platform.integrations.tinker.router import adam_params_to_optim_overrides
+from arctic_platform.integrations.tinker.router import check_fixed_adam
 from arctic_platform.integrations.tinker.router import datum_list_to_arctic_batch
 from arctic_platform.integrations.tinker.router import sampling_params_tinker_to_vllm
 
@@ -242,17 +242,14 @@ class TestSequenceLimits:
         assert out["batch"]["response_mask"][0].tolist().index(1) == 8
 
     def test_row_wider_than_the_limits_is_refused(self):
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(ValueError, match="max_prompt_length \\+ max_response_length"):
             _pack([_rl_datum(10, 8)], max_prompt_length=8, max_response_length=8)
-        assert exc.value.status_code == 400
-        assert "max_prompt_length + max_response_length" in exc.value.detail
 
     def test_per_token_input_of_the_wrong_length_is_refused(self):
         datum = _rl_datum(3, 3)
         datum.loss_fn_inputs["advantages"] = TensorData(dtype="float32", data=[0.5], shape=[1])
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(ValueError, match="loss_fn_inputs"):
             _pack([datum], max_prompt_length=8, max_response_length=8)
-        assert exc.value.status_code == 400
 
     def test_zero_advantage_datum_keeps_its_prompt_out_of_the_response(self):
         """Equal-reward groups give all-zero advantages, and the cookbook strips
@@ -281,9 +278,8 @@ class TestRatioClip:
     def test_ratio_loss_without_sampler_logprobs_is_refused(self, loss_fn):
         datum = _rl_datum(3, 3)
         del datum.loss_fn_inputs["logprobs"]
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(ValueError, match="logprobs"):
             datum_list_to_arctic_batch([datum], loss_fn, 8, 8, pad_token_id=0)
-        assert exc.value.status_code == 400
 
     def test_cross_entropy_has_no_ratio(self):
         datum = Datum(
@@ -314,6 +310,12 @@ class TestAdamParams:
         assert ov["betas"] == (0.85, 0.99)
         assert ov["eps"] == pytest.approx(1e-8)
         assert ov["weight_decay"] == pytest.approx(0.05)
+
+    def test_a_step_must_match_the_provisioned_adam(self):
+        served = {"beta1": 0.9, "beta2": 0.95, "eps": 1e-8, "weight_decay": 0.0, "grad_clip_norm": 0.0}
+        check_fixed_adam(served, AdamParams(learning_rate=8e-5, eps=1e-8))
+        with pytest.raises(ValueError, match="learning rate"):
+            check_fixed_adam(served, AdamParams(learning_rate=8e-5, eps=1e-12))
 
 
 class TestSamplingParams:

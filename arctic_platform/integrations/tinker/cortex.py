@@ -149,7 +149,7 @@ def _unalign_rows(aligned: torch.Tensor, order: torch.Tensor) -> torch.Tensor:
     if aligned.dim() != 2 or aligned.shape != order.shape:
         raise ValueError(
             f"cannot un-align log-probs of shape {tuple(aligned.shape)} against an "
-            f"alignment plan of shape {tuple(order.shape)}; the server returned a "
+            f"alignment plan of shape {tuple(order.shape)}; Cortex returned a "
             "frame that does not match the batch that was sent"
         )
     out = torch.zeros_like(aligned)
@@ -319,9 +319,7 @@ class CortexTinkerBackend:
         return {"batch": {"logprobs": logprobs}, "metrics": response.get("metrics") or {}}
 
     async def step(self, overrides: dict | None) -> dict:
-        # Cortex's `step` takes a learning rate and nothing else. The rest of
-        # Tinker's AdamParams is fixed at provisioning, and the router refuses
-        # values that differ from it (`fixed_adam` in init_tinker_state).
+        # Cortex step takes a learning rate. Other Adam settings stay as provisioned.
         learning_rate = (overrides or {}).get("lr") or (overrides or {}).get("learning_rate")
         return await self.client.step(learning_rate=learning_rate)
 
@@ -362,15 +360,7 @@ class CortexTinkerBackend:
 
 
 def build_handlers(client: AsyncArcticRLClient, isolate_capacity: int | None = None) -> dict[str, Any]:
-    """Handler kwargs for ``router.init_tinker_state``.
-
-    No ``forward``: Cortex's forward route rejected every payload shape tried
-    live (``KeyError: 'pad_token_id'``, then ``'attention_mask'``), so the
-    router refuses it instead of failing server-side.
-
-    ``accumulates_gradients=False``: measured live, a Cortex ``step`` after two
-    forward-backward calls applied the second call's gradient alone.
-    """
+    """Handlers the in-process client calls. There is no forward handler."""
     backend = CortexTinkerBackend(
         client, min_rows=max(int(client.config.training_gpus), 1), isolate_capacity=isolate_capacity
     )
@@ -379,5 +369,4 @@ def build_handlers(client: AsyncArcticRLClient, isolate_capacity: int | None = N
         "step_handler": backend.step,
         "sync_weights_handler": backend.sync_weights,
         "generate_handler": backend.generate,
-        "accumulates_gradients": False,
     }

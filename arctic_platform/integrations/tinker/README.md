@@ -31,14 +31,14 @@ flowchart LR
   cortex -->|"sample"| sample["Cortex sampling job"]
 ```
 
-`forward` has no handler, so the router returns 400 before any Cortex call. A training request that is still running after 30 seconds is answered as a future; the SDK polls `retrieve_future` instead of sending the work again.
+`forward` is not implemented. A second `forward_backward` before `optim_step` is refused, because Cortex keeps only the latest gradient.
 
 One optimizer step:
 
 ```mermaid
 flowchart TD
-  A["forward_backward"] --> B["router: decode protobuf, check the loss and the datum"]
-  B --> C["router: accept one gradient, refuse a second"]
+  A["forward_backward"] --> B["router: check the loss and the datum"]
+  B --> C["client: accept one gradient, refuse a second"]
   C --> D["cortex: left-align rows, isolate linear-attention sequences"]
   D --> E["cortex: lower the loss onto Cortex grpo"]
   E --> F["training job runs fwd_bwd"]
@@ -47,7 +47,7 @@ flowchart TD
   H --> I["training job steps"]
 ```
 
-Sampling and distillation take the other jobs. `sample` is checked for temperature 1.0, then generated on the sampling job. A teacher named at startup is a second sampling job; `compute_logprobs` reads its prompt log-probs and does not generate.
+Sampling and distillation take the other jobs. `sample` is checked for temperature 1.0, then generated on the sampling job. `create_sampling_client(base_model=...)` opens a second sampling job on that model's base weights. `compute_logprobs` reads its prompt log-probs and does not generate.
 
 ## Install
 
@@ -129,9 +129,8 @@ The adapter and the optimizer are part of the Cortex job, so
 - Adam uses `--adam-beta1 0.9 --adam-beta2 0.95 --adam-eps 1e-8
   --weight-decay 0 --grad-clip-norm 0`, the values the cookbook sends.
 
-A training client whose LoRA rank or modules differ from the server's, or an
-`optim_step` whose Adam settings differ, returns 400 naming the flag to change.
-The learning rate is applied per step.
+Adam betas, eps, weight decay, and grad clip are fixed when the job is created.
+Each `optim_step` sends only the learning rate.
 
 The cookbook's default learning rate is intended for LoRA. Full fine-tuning
 may require a lower learning rate.
@@ -145,19 +144,17 @@ Supported:
   ratio taken against the sampler's log-probs; `ppo` accepts
   `clip_low_threshold` and `clip_high_threshold` in `loss_fn_config`
 - sampling, forward-backward, optimizer step, and sampler weight sync
-- client-defined custom losses through `forward_backward_custom`, on backends
-  that serve `forward` (not Cortex; see below)
 - on-policy distillation from one teacher, including `compute_logprobs`
 
-Current limitations. The in-process client raises `RuntimeError`. The HTTP adapter returns the status code in the table.
+Current limitations. The client raises `RuntimeError` for a refusal. A Cortex rejection comes back as the underlying request error.
 
 | Limitation | Behavior |
 |---|---|
-| LoRA | One rank and module set per server, fixed at start-up; others return 400. |
+| LoRA | One rank and module set, fixed when the job is created. |
 | Temperature | Temperatures other than `1.0` are refused. |
 | Checkpoints | A sampler save syncs weights. Only the path just saved can be opened, and only in this process. Resume raises. |
-| Sequence limits | A datum longer than `--max-prompt-length + --max-response-length` returns 400. |
-| Loss config | `loss_fn_config` keys other than PPO's two clip thresholds return 400. |
+| Sequence limits | A datum longer than `--max-prompt-length + --max-response-length` is refused. |
+| Loss config | `loss_fn_config` keys other than PPO's two clip thresholds are refused. |
 | Forward | `forward` is refused. `forward_backward` returns the log-probs. NLL eval uses `forward`, so set `eval_every=0` for `chat_sl`. Custom losses (DPO, SDFT) call `forward` first and are unavailable. |
 | Gradient accumulation | A second `forward_backward` before `optim_step` is refused. Cortex keeps only the latest gradient. Leave `stream_minibatch_config` unset or use `num_minibatches=1`. |
 | Teacher | `base_model` opens that model's base weights, including the student. Prompt cap is student prompt + response. Response cap matches the student. `model_path` is refused. |
@@ -169,18 +166,9 @@ Recipes that require audio, images, checkpoint resume, reference-model
 workers, external tools, or external graders are not covered by this
 integration.
 
-## Protocol notes
+## Tensor layout
 
-Current Tinker SDKs use protobuf for:
-
-- `forward_backward` requests
-- `ForwardBackwardOutput` responses
-- `SampleResponse` responses
-
-Sample requests remain JSON. The codec uses the SDK's generated
-`tinker_public_pb2` schema.
-
-The adapter also handles three tensor conventions:
+The binder handles three tensor conventions:
 
 - Tinker rows contain left prompt padding; Cortex expects valid tokens in
   leading columns. The Cortex binder aligns rows before the request and restores
@@ -191,35 +179,14 @@ The adapter also handles three tensor conventions:
   padded with copies of a row that carry no loss, and the copies are dropped
   from the returned log-probs.
 
-It also works around three SDK and Cortex behaviors:
-
-- The SDK resends any request that takes over 60 seconds. Work still running
-  after 30 seconds is answered with its future and finishes in the background,
-  so a slow forward-backward or optimizer step is never run twice. Work on the
-  trained model runs one request at a time, in arrival order.
-- The SDK splits a large `forward_backward` into 5 MB requests, and Cortex keeps
-  only the last one's gradient. The server's client config raises the SDK's
-  chunk limits so each batch arrives as one request.
-- Cortex packs several sequences into one micro-batch. Models with linear
+Cortex packs several sequences into one micro-batch. Models with linear
   attention layers (Qwen3.5's Gated DeltaNet) carry state across sequence
   boundaries in Cortex's Hugging Face provider, which corrupts every sequence
   after the first in a pack. For these models (`--isolate-sequences auto`, the
-  default) the server provisions micro-batches of one full-length datum and
+  default) the job provisions micro-batches of one full-length datum and
   extends each row with loss-free tokens past half that length, so no two rows
   share a micro-batch. This costs throughput on short rows. Remove it once
   Cortex resets linear-attention state at packed boundaries.
-
-## Custom losses
-
-`forward_backward_custom` computes a loss in the SDK and sends
-`dC/dlogprobs` as per-token weights. The adapter maps this to Cortex `grpo` with:
-
-- `advantages = -weights`
-- no old log-probs, making the importance ratio `1`
-- `batch_num_tokens = 1`
-
-This preserves the client loss gradient. Server-side loss and entropy metrics
-on this path do not represent the client's loss or model entropy.
 
 ## Validation
 
@@ -258,17 +225,14 @@ pip install -e ".[testing]"
 pytest -q tests/integrations/tinker
 ```
 
-The tests cover API endpoints, request schemas, protobuf conversion, datum
-packing, Cortex lowering, row alignment, custom-loss gradients, and error
+The tests cover datum packing, Cortex lowering, row alignment, and error
 handling. They do not require a Cortex account or GPU.
 
 ## Troubleshooting
 
 | Error | Action |
 |---|---|
-| `The api_key must start with the 'tml-' prefix` | Set `TINKER_API_KEY=tml-dummy`. |
 | `KeyError` from `get_recommended_renderer_name` | Pass `renderer_name` explicitly. |
-| `Server returned a JSON payload ... only supports as proto` | Confirm the protobuf response path is installed and active. |
 | `cortex ... returned no per-token log-probs` | Check the Cortex response shape and configured post-processor. |
 | `packing requires left-aligned rows` | Confirm requests pass through the Cortex binder. |
 | Job remains in `PLACING` | Check account GPU capacity and quota. |
@@ -279,7 +243,6 @@ handling. They do not require a Cortex account or GPU.
 | File | Role |
 |---|---|
 | `arctic_platform/tinker/` | In-process `tinker` module and recipe launcher |
-| `router.py` | Datum conversion, loss checks, and the HTTP routes those functions share |
-| `proto_wire.py` | Tinker protobuf request and response codec |
+| `router.py` | Datum, loss, and sampling-param conversion |
 | `cortex.py` | Cortex request lowering and tensor alignment |
-| `serve.py` | Cortex job provisioning (`TinkerServeConfig`) used by the in-process client |
+| `serve.py` | Cortex job provisioning (`TinkerServeConfig`) |

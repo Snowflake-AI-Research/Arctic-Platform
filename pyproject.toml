@@ -144,15 +144,12 @@ cortex = [
     "urllib3",
 ]
 
-# The Tinker protocol server (arctic_platform/integrations/tinker). [cortex]
-# plus the ASGI stack and the tokenizer serve.py imports. No GPU and no
-# training stack: Cortex owns those. The tinker SDK is user-supplied -- only
-# proto_wire needs it, and it imports the generated schema lazily.
+# In-process Tinker client. [cortex] plus the tokenizer the job config loads.
+# No GPU and no training stack: Cortex owns those. The tinker SDK is
+# user-supplied.
 tinker = [
     "arctic_platform[cortex]",
-    "fastapi",
     "transformers",
-    "uvicorn",
 ]
 
 # A training-only on-prem server, plus the client that drives it. Deliberately

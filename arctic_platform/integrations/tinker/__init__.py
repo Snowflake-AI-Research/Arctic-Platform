@@ -12,11 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tinker compatibility: serve Tinker's HTTP protocol over Arctic backends.
+"""Tinker datum conversion and Cortex job provisioning for the in-process client.
 
-:mod:`~arctic_platform.integrations.tinker.router` is the protocol adapter and
-knows nothing about a backend; :mod:`~arctic_platform.integrations.tinker.cortex`
-binds its verbs to Cortex Training through the unified client. Nothing is
-imported here -- the router pulls in FastAPI, which a caller who only wants the
-adapter helpers should not pay for.
+Nothing is imported here. Callers import :mod:`arctic_platform.tinker` or the
+helper modules directly.
 """

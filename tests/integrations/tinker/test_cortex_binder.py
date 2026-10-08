@@ -405,17 +405,6 @@ class TestStepAndHandlers:
         asyncio.run(CortexTinkerBackend(client).sync_weights())
         assert client.synced == [weight_format]
 
-    def test_build_handlers_matches_init_tinker_state(self):
-        import inspect
-
-        from arctic_platform.integrations.tinker.router import init_tinker_state
-
-        handlers = build_handlers(_StubClient())
-        params = inspect.signature(init_tinker_state).parameters
-        assert set(handlers) <= set(params), "handler kwargs must be accepted by the router"
-        required = {n for n, p in params.items() if p.default is inspect.Parameter.empty and n.endswith("_handler")}
-        assert required <= set(handlers)
-
 
 class TestPromptLogprobs:
     """`compute_logprobs` (the distillation teacher's verb) reads these.
