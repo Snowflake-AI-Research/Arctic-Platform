@@ -30,9 +30,13 @@ from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.loader import LoadedModel
+from arctic_platform.model.loader import LoaderRuntimePolicy
 from arctic_platform.model.loader import LoaderContext
+from arctic_platform.model.loader import ModelRuntimeProfile
 from arctic_platform.model.loader import register_loader
+from arctic_platform.model.loader import resolve_model_profile
 from arctic_platform.model.loader import select_loader
+from arctic_platform.model.platform import PlatformCapabilities
 from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.patch import register_patch
 from arctic_platform.model.patches.peft import apply_peft
@@ -46,10 +50,12 @@ __all__ = [
     "ActivationOffloadConfig",
     "ActivationOffloadPatch",
     "LoadedModel",
+    "LoaderRuntimePolicy",
     "LoaderContext",
     "LmHeadPatch",
     "CompilePatch",
     "ModelSpec",
+    "ModelRuntimeProfile",
     "ParallelismConfig",
     "Patches",
     "TiledMlpPatch",
@@ -59,5 +65,7 @@ __all__ = [
     "build_model",
     "register_loader",
     "register_patch",
+    "resolve_model_profile",
     "select_loader",
+    "PlatformCapabilities",
 ]

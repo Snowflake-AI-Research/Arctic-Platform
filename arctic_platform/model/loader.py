@@ -22,13 +22,16 @@ from dataclasses import field
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import Literal
 
 import torch.nn as nn
+from pydantic import BaseModel
+from pydantic import ConfigDict
 
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.platform import PlatformCapabilities
 
 if TYPE_CHECKING:
-    from pydantic import BaseModel
     from transformers import PretrainedConfig
 
 
@@ -100,12 +103,36 @@ Matcher = Callable[[LoaderContext], bool]
 SpecValidator = Callable[[ModelSpec], None]
 
 
+@dataclass(frozen=True)
+class LoaderRuntimePolicy:
+    attention: Literal["platform"] | str = "platform"
+    ep_comm_backend: Literal["deepep", "uccl"] | None = None
+    sp_strategy: Literal["transformers_ulysses", "native"] = "transformers_ulysses"
+    label_contract: Literal["causal_labels", "logit_aligned"] = "causal_labels"
+    requires_weight_conversion: bool = False
+    model_forward_requires_labels: bool = False
+
+
+class ModelRuntimeProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    loader: str
+    attn_implementation: str
+    ep_comm_backend: Literal["deepep", "uccl"] | None = None
+    sp_strategy: Literal["transformers_ulysses", "native"]
+    label_contract: Literal["causal_labels", "logit_aligned"]
+    requires_weight_conversion: bool
+    model_forward_requires_labels: bool
+    fused_cross_entropy: bool | str | None = None
+
+
 @dataclass
 class _LoaderEntry:
     fn: Loader
     matches: Matcher | None
     options: type[BaseModel] | None = None
     validate_spec: SpecValidator | None = None
+    runtime_policy: LoaderRuntimePolicy = field(default_factory=LoaderRuntimePolicy)
 
 
 _LOADERS: dict[str, _LoaderEntry] = {}
@@ -118,6 +145,7 @@ def register_loader(
     default: bool = False,
     options: type[BaseModel] | None = None,
     validate_spec: SpecValidator | None = None,
+    runtime_policy: LoaderRuntimePolicy | None = None,
 ) -> Callable[[Loader], Loader]:
     """Register a loader by name.
 
@@ -136,6 +164,7 @@ def register_loader(
             matches=matches,
             options=options,
             validate_spec=validate_spec,
+            runtime_policy=runtime_policy or LoaderRuntimePolicy(),
         )
         return fn
 
@@ -155,6 +184,69 @@ def validate_loader_spec(name: str, spec: ModelSpec) -> None:
     validator = _LOADERS[name].validate_spec
     if validator is not None:
         validator(spec)
+
+
+def _platform_attention_default(platform: PlatformCapabilities) -> str:
+    return {
+        "blackwell": "flash_attention_4",
+        "hopper": "flash_attention_3",
+        "ampere": "sdpa",
+    }.get(platform.accelerator, "sdpa")
+
+
+def resolve_model_profile(
+    spec: ModelSpec,
+    platform: PlatformCapabilities | None = None,
+) -> ModelRuntimeProfile:
+    if spec.loader is None:
+        raise ValueError("ModelSpec.loader must be resolved before runtime defaults")
+    platform = platform or PlatformCapabilities.detect()
+    entry = _LOADERS[spec.loader]
+    policy = entry.runtime_policy
+
+    attention = spec.attn_implementation
+    if attention is None:
+        attention = (
+            _platform_attention_default(platform)
+            if policy.attention == "platform"
+            else policy.attention
+        )
+    if attention.startswith("flash_attention_") and attention not in platform.attention_backends:
+        raise ValueError(
+            f"{attention} is the default for loader {spec.loader!r} on {platform.accelerator}, "
+            f"but the backend is unavailable; available={sorted(platform.attention_backends)}"
+        )
+
+    ep_comm_backend = None
+    if spec.parallelism.expert_parallel > 1:
+        requested_backend = spec.loader_options.get("ep_comm_backend")
+        ep_comm_backend = requested_backend or policy.ep_comm_backend
+        if ep_comm_backend is None:
+            raise ValueError(f"loader {spec.loader!r} has no expert-parallel communication policy")
+        if ep_comm_backend not in platform.ep_comm_backends:
+            raise ValueError(
+                f"{ep_comm_backend} is required by loader {spec.loader!r}, "
+                f"but the backend is unavailable; available={sorted(platform.ep_comm_backends)}"
+            )
+        spec.loader_options["ep_comm_backend"] = ep_comm_backend
+
+    spec.attn_implementation = attention
+    if entry.options is not None:
+        spec.loader_options = entry.options.model_validate(spec.loader_options).model_dump()
+
+    fused_cross_entropy = spec.loader_options.get("fused_cross_entropy")
+    if spec.patches.liger:
+        fused_cross_entropy = "liger"
+    return ModelRuntimeProfile(
+        loader=spec.loader,
+        attn_implementation=attention,
+        ep_comm_backend=ep_comm_backend,
+        sp_strategy=policy.sp_strategy,
+        label_contract=policy.label_contract,
+        requires_weight_conversion=policy.requires_weight_conversion,
+        model_forward_requires_labels=policy.model_forward_requires_labels,
+        fused_cross_entropy=fused_cross_entropy,
+    )
 
 
 def resolve_loader_name(spec: ModelSpec) -> str:

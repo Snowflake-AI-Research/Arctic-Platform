@@ -29,6 +29,7 @@ from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
+from arctic_platform.model.loader import LoaderRuntimePolicy
 from arctic_platform.model.loader import register_loader
 
 # Declarative options owned by the qwen3_5_moe loader.
@@ -50,7 +51,7 @@ class Qwen3_5MoeOptions(BaseModel):
 
     seq_len: int = Field(4096, gt=0, description="Training sequence length.")
     trust_remote_code: bool = False
-    ep_comm_backend: Literal["deepep", "uccl"] = Field("deepep", description="Expert-parallel comm backend.")
+    ep_comm_backend: Literal["deepep", "uccl"] | None = Field(None, description="Expert-parallel comm backend.")
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     reduce_dtype: Literal["bfloat16", "float32"] = Field("float32", description="Gradient reduction dtype.")
     moe_use_grouped_mm: bool = Field(True, description="Use grouped matmul for experts.")
@@ -81,8 +82,6 @@ def _matches(ctx: LoaderContext) -> bool:
 
 
 def _validate_spec(spec: ModelSpec) -> None:
-    if spec.attn_implementation is None:
-        spec.attn_implementation = "flash_attention_3"
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError("qwen3_5_moe dtype must be 'bfloat16' or 'float32'")
     if spec.patches.peft is not None:
@@ -108,6 +107,13 @@ def _validate_spec(spec: ModelSpec) -> None:
     matches=_matches,
     options=Qwen3_5MoeOptions,
     validate_spec=_validate_spec,
+    runtime_policy=LoaderRuntimePolicy(
+        ep_comm_backend="deepep",
+        sp_strategy="native",
+        label_contract="logit_aligned",
+        requires_weight_conversion=True,
+        model_forward_requires_labels=True,
+    ),
 )
 def load_qwen3_5_moe(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism

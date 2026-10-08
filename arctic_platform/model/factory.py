@@ -21,12 +21,14 @@ from typing import Any
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
+from arctic_platform.model.loader import resolve_model_profile
 from arctic_platform.model.loader import select_loader
 from arctic_platform.model.patch import apply_patches
 
 
 def build_model(spec: ModelSpec, parallel_groups: Any | None = None) -> LoadedModel:
     """Run the spec's resolved loader, apply its patches, and return the result."""
+    resolve_model_profile(spec)
     ctx = LoaderContext(spec=spec, parallel_groups=parallel_groups)
     loaded = select_loader(ctx)(ctx)
     apply_patches(loaded, ctx)

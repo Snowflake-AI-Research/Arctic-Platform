@@ -27,6 +27,7 @@ from pydantic import ValidationError
 from arctic_platform.model import LoadedModel
 from arctic_platform.model import LoaderContext
 from arctic_platform.model import ModelSpec
+from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import apply_patches
 from arctic_platform.model import build_model
 from arctic_platform.model import factory as factory_mod
@@ -34,6 +35,7 @@ from arctic_platform.model import loader as loader_mod
 from arctic_platform.model import patch as patch_mod
 from arctic_platform.model import register_loader
 from arctic_platform.model import register_patch
+from arctic_platform.model import resolve_model_profile
 
 
 @pytest.fixture(autouse=True)
@@ -215,17 +217,60 @@ class TestPatchPipeline:
 
 class TestHuggingFaceLoader:
     @pytest.mark.parametrize(
-        ("requested", "expected"),
-        [(None, "sdpa"), ("flash_attention_3", "flash_attention_3")],
+        ("accelerator", "expected"),
+        [
+            ("ampere", "sdpa"),
+            ("hopper", "flash_attention_3"),
+            ("blackwell", "flash_attention_4"),
+        ],
     )
-    def test_attention_is_resolved_before_model_load(self, requested, expected):
+    def test_attention_is_resolved_before_model_load(self, accelerator, expected):
         spec = ModelSpec(
             model_path_or_name="qwen",
             loader="huggingface",
-            attn_implementation=requested,
+        )
+        profile = resolve_model_profile(
+            spec,
+            PlatformCapabilities.for_accelerator(accelerator),
         )
 
+        assert profile.attn_implementation == expected
         assert spec.attn_implementation == expected
+
+    def test_explicit_attention_override_is_preserved(self):
+        spec = ModelSpec(
+            model_path_or_name="qwen",
+            loader="huggingface",
+            attn_implementation="flash_attention_3",
+        )
+        profile = resolve_model_profile(
+            spec,
+            PlatformCapabilities.for_accelerator(
+                "blackwell",
+                attention_backends=frozenset({"flash_attention_3", "flash_attention_4"}),
+            ),
+        )
+
+        assert profile.attn_implementation == "flash_attention_3"
+
+    def test_unavailable_attention_backend_is_rejected(self):
+        spec = ModelSpec(model_path_or_name="qwen", loader="huggingface")
+        platform = PlatformCapabilities.for_accelerator(
+            "hopper",
+            attention_backends=frozenset({"sdpa"}),
+        )
+
+        with pytest.raises(ValueError, match="flash_attention_3.*unavailable"):
+            resolve_model_profile(spec, platform)
+
+    def test_runtime_profile_is_serializable(self):
+        spec = ModelSpec(model_path_or_name="qwen", loader="huggingface")
+        profile = resolve_model_profile(
+            spec,
+            PlatformCapabilities.for_accelerator("hopper"),
+        )
+
+        assert profile.model_validate_json(profile.model_dump_json()) == profile
 
     def test_qwen3_resolves_to_default_loader(self, monkeypatch):
         fake_config = types.SimpleNamespace(model_type="qwen3")
@@ -305,7 +350,7 @@ class TestFromDsWorkerConfig:
         from arctic_platform.model.config import Patches
 
         assert Patches().gradient_checkpointing is False
-        assert ModelSpec(model_path_or_name="x").attn_implementation == "sdpa"
+        assert ModelSpec(model_path_or_name="x").attn_implementation is None
 
     def test_liger_and_gc_flags_map(self):
         spec = ModelSpec.from_ds_worker_config(

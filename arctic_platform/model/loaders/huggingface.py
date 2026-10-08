@@ -18,18 +18,17 @@ from __future__ import annotations
 
 from transformers import AutoModelForCausalLM
 
-from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
+from arctic_platform.model.loader import LoaderRuntimePolicy
 from arctic_platform.model.loader import register_loader
 
 
-def _validate_spec(spec: ModelSpec) -> None:
-    if spec.attn_implementation is None:
-        spec.attn_implementation = "sdpa"
-
-
-@register_loader("huggingface", default=True, validate_spec=_validate_spec)
+@register_loader(
+    "huggingface",
+    default=True,
+    runtime_policy=LoaderRuntimePolicy(),
+)
 def load_huggingface(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism
     if parallelism.expert_parallel != 1:

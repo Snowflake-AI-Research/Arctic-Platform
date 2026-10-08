@@ -76,7 +76,7 @@ def test_loader_preserves_options_and_process_group(monkeypatch, backend):
     assert seen["ep_size"] == 2
     assert seen["sp_size"] == 1
     assert seen["optimization_dtype"] == "bfloat16"
-    assert seen["attn_implementation"] == "flash_attention_2"
+    assert seen["attn_implementation"] == "flash_attention_3"
     assert seen["options"] == GlmMoeDsaOptions.model_validate(spec.loader_options)
     assert seen["options"].sparse_mla_backend == "dense"
     assert seen["options"].ac_config.offload_config.pin_memory_enabled is False

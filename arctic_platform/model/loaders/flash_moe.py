@@ -24,6 +24,7 @@ from __future__ import annotations
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
+from arctic_platform.model.loader import LoaderRuntimePolicy
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
@@ -42,11 +43,8 @@ def _validate_common(
     spec: ModelSpec,
     family: str,
     *,
-    default_attention: str = "sdpa",
     allow_sequence_parallel: bool = False,
 ) -> None:
-    if spec.attn_implementation is None:
-        spec.attn_implementation = default_attention
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError(f"{family} dtype must be 'bfloat16' or 'float32'")
     if spec.parallelism.sequence_parallel > 1 and not allow_sequence_parallel:
@@ -75,10 +73,9 @@ def _validate_glm5_next(spec: ModelSpec) -> None:
     _validate_common(
         spec,
         "GLM-5.3-Flash",
-        default_attention=GLM53_ATTN_BACKEND,
         allow_sequence_parallel=True,
     )
-    if spec.attn_implementation not in (GLM53_ATTN_BACKEND, "flashmla"):
+    if spec.attn_implementation is not None and spec.attn_implementation not in (GLM53_ATTN_BACKEND, "flashmla"):
         raise ValueError(
             f"GLM-5.3-Flash training requires sparse MLA; got attn_implementation={spec.attn_implementation!r}"
         )
@@ -91,10 +88,9 @@ def _validate_qwen4_exp(spec: ModelSpec) -> None:
     _validate_common(
         spec,
         "Qwen3.8-Flash-Next",
-        default_attention=QWEN38_ATTN_BACKEND,
         allow_sequence_parallel=True,
     )
-    if spec.attn_implementation not in (QWEN38_ATTN_BACKEND, "flex_attention"):
+    if spec.attn_implementation is not None and spec.attn_implementation not in (QWEN38_ATTN_BACKEND, "flex_attention"):
         raise ValueError(
             "Qwen3.8-Flash-Next training requires QSA FlexAttention; "
             f"got attn_implementation={spec.attn_implementation!r}"
@@ -133,6 +129,14 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
     matches=_matches("glm5_next"),
     options=GenericMoeOptions,
     validate_spec=_validate_glm5_next,
+    runtime_policy=LoaderRuntimePolicy(
+        attention="sparse_mla",
+        ep_comm_backend="uccl",
+        sp_strategy="native",
+        label_contract="logit_aligned",
+        requires_weight_conversion=True,
+        model_forward_requires_labels=True,
+    ),
 )
 def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.glm53.deepspeed_integration import load_glm5_next_model
@@ -145,6 +149,14 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     matches=_matches("qwen4_exp"),
     options=GenericMoeOptions,
     validate_spec=_validate_qwen4_exp,
+    runtime_policy=LoaderRuntimePolicy(
+        attention="qsa_flex",
+        ep_comm_backend="uccl",
+        sp_strategy="native",
+        label_contract="logit_aligned",
+        requires_weight_conversion=True,
+        model_forward_requires_labels=True,
+    ),
 )
 def load_qwen4_exp(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import load_qwen4_exp_model

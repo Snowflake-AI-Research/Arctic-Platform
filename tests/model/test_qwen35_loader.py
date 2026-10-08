@@ -23,8 +23,10 @@ from torch import nn
 
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
+from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import Patches
 from arctic_platform.model import build_model
+from arctic_platform.model import resolve_model_profile
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
@@ -41,6 +43,24 @@ def test_selection_uses_text_config_not_checkpoint_name(tmp_path, composite):
     (tmp_path / "config.json").write_text(json.dumps(config))
     spec = ModelSpec(model_path_or_name=str(tmp_path), parallelism=ParallelismConfig(expert_parallel=2))
     assert spec.loader == "qwen3_5_moe"
+
+
+def test_runtime_profile_uses_platform_attention_and_deepep(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe"}))
+    spec = ModelSpec(
+        model_path_or_name=str(tmp_path),
+        parallelism=ParallelismConfig(expert_parallel=2),
+    )
+
+    profile = resolve_model_profile(
+        spec,
+        PlatformCapabilities.for_accelerator("hopper"),
+    )
+
+    assert profile.attn_implementation == "flash_attention_3"
+    assert profile.ep_comm_backend == "deepep"
+    assert profile.sp_strategy == "native"
+    assert profile.label_contract == "logit_aligned"
 
 
 @pytest.mark.parametrize("backend", ["deepep", "uccl"])
