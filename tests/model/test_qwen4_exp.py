@@ -471,6 +471,49 @@ def test_qwen38_qsa_route_selection_uses_global_query_offset():
         assert torch.any(valid > local_position)
 
 
+def test_qwen38_qsa_compresses_after_gather_for_unaligned_cp_shards(monkeypatch):
+    _require()
+    from arctic_platform.model.implementations.qwen38 import qsa_flex
+
+    class Indexer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.index_n_heads = 1
+            self.index_head_dim = 2
+            self.compress_ratio = 2
+            self.token_budget = 2
+            self.index_qk_proj = torch.nn.Linear(4, 4, bias=False)
+            self.q_layernorm = torch.nn.Identity()
+            self.k_layernorm = torch.nn.Identity()
+            self._cp_group = object()
+
+    indexer = Indexer()
+    monkeypatch.setattr(qsa_flex.dist, "get_rank", lambda group: 1)
+    monkeypatch.setattr(qsa_flex.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        qsa_flex,
+        "_gather_sequence_no_grad",
+        lambda tensor, group: torch.cat([tensor, tensor], dim=1),
+    )
+
+    def capture_keys(index_queries, compressed_keys, sequence_lengths, **kwargs):
+        assert compressed_keys.shape[1] == 3
+        return torch.zeros((*index_queries.shape[:2], 3), dtype=torch.int32)
+
+    monkeypatch.setattr(qsa_flex, "select_qsa_token_ids", capture_keys)
+    hidden_states = torch.ones(1, 3, 4)
+    position_embeddings = (torch.ones(1, 3, 2), torch.zeros(1, 3, 2))
+
+    routes = qsa_flex._qsa_indexer_forward(
+        indexer,
+        hidden_states,
+        position_embeddings,
+        torch.ones(1, 3, dtype=torch.bool),
+    )
+
+    assert routes.shape == (1, 3, 3)
+
+
 def test_qwen38_sparse_gqa_custom_backward_matches_autograd():
     from arctic_platform.model.implementations.qwen38.qsa_flex import _sparse_gqa_chunk
     from arctic_platform.model.implementations.qwen38.qsa_flex import _SparseGQAAttention
