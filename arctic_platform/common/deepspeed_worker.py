@@ -13,15 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Local RL server matching the dss-platform sftp_server HTTP API.
-
-Uses Ray to manage DeepSpeed workers and ArcticInference ReplicaPools.
-
-Usage::
-
-    python -m arctic_platform.common.http_server \\
-        --training-gpus 4 --sampling-gpus 2 --log-prob-gpus 2
-"""
+"""DeepSpeed Ray worker actor used by the on-prem RL server."""
 
 from __future__ import annotations
 
@@ -436,6 +428,11 @@ class DeepSpeedWorker:
 
         if loss_object is None and loss_fn is not None:
             loss_object = resolve_loss(loss_fn)
+        if loss_object is not None:
+            loss_object.model_call_count_callback(
+                [num_micro_batches],
+                processing.get("config") or {},
+            )
         legacy_sft_loss = LOSS_FNS.get(loss_fn) if loss_fn in SFT_LOSS_FNS else None
         use_sft_pipeline = (
             legacy_sft_loss is not None

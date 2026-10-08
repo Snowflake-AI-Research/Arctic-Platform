@@ -42,7 +42,7 @@ from arctic_platform.rl import ArcticRLClientConfig, create_arctic_rl_client
 
 - Config: `arctic_platform.rl.config.ArcticRLClientConfig`
 - Factory: `arctic_platform.rl.client.create_arctic_rl_client` → async
-  `ArcticRLHTTPClient` or `ArcticRLRayClient`
+  `ArcticRLRayClient`
 
 **Unified client (migration target; subset of ops).** The unqualified name blocks;
 the `Async` prefix awaits:
@@ -62,9 +62,7 @@ import asyncio
 from arctic_platform.rl import ArcticRLClientConfig, create_arctic_rl_client
 
 config = ArcticRLClientConfig(
-    backend="local",
     model_name="Qwen/Qwen3-4B",
-    comm_protocol="ray",          # or "http"
     training_gpus=8,
     sampling_gpus=8,
     log_prob_gpus=0,              # 0 = disabled
@@ -80,18 +78,6 @@ results = asyncio.run(client.generate(
 client.shutdown()
 ```
 
-With `backend="local"` + `comm_protocol="http"`, the client can launch a local
-server subprocess (`python -m arctic_platform.common.http_server` via the
-`rl.http_server` shim).
-
-Standalone server:
-
-```bash
-python -m arctic_platform.common.http_server \
-  --host 0.0.0.0 --port 7000 \
-  --training-gpus 4 --sampling-gpus 4 --colocate
-```
-
 Reconnect after a Ray handoff:
 
 ```python
@@ -103,15 +89,12 @@ client2 = create_arctic_rl_client(rc)
 
 | Field | Default | Notes |
 |-------|---------|-------|
-| `backend` | `"local"` | `"local"` or `"dss-platform"` |
-| `comm_protocol` | `"http"` | `"http"` or `"ray"` |
 | `model_name` | **required** | HF id |
 | `training_gpus` / `sampling_gpus` / `log_prob_gpus` | `0` | Job created iff > 0 |
 | `log_prob_engine` | `"vllm"` | `"deepspeed"` or `"vllm"` |
 | `colocate` | `False` | Fractional GPU sharing |
 | `cuda_ipc` | `False` | Colocated weight-sync strategy, baked onto the training job at init: CUDA-IPC vs CPU-file |
 | `low_memory` | `False` | With `cuda_ipc`, stream one param at a time (bounds peak GPU mem); sent at init |
-| `host` / `port` | derived | HTTP often routable IP + **7000** |
 | `ds_config` | `{}` | Training DeepSpeed config |
 | `training_config` | `None` | Optimizer / scheduler / `training_horizon` |
 | `log_prob_ds_config` | `None` | Log-prob DeepSpeed engine |
@@ -120,12 +103,12 @@ client2 = create_arctic_rl_client(rc)
 | `arctic_inference_config` | `None` | **`zorro_inference`**, speculative decoding |
 | `checkpoint_path` | `None` | Required for new training jobs |
 | `full_determinism` / `seed` | `False` / `42` | Reproducibility |
-| `startup_timeout` / `job_ready_timeout` | `300` / `600` | Seconds |
+| `job_ready_timeout` | `600` | Seconds |
 | `training_job_id` / `sampling_job_id` / `log_prob_job_id` | `None` | Reconnect mode |
 
 ## Client methods
 
-Async methods on the HTTP/Ray clients from `create_arctic_rl_client`:
+Async methods on the Ray client from `create_arctic_rl_client`:
 
 | Method | Job | Notes |
 |--------|-----|-------|
@@ -143,7 +126,7 @@ Async methods on the HTTP/Ray clients from `create_arctic_rl_client`:
 | `sleep_log_prob` / `wake_log_prob` | log_prob | |
 | `empty_training_cache()` | training | |
 | `reconnect_config()` | — | Serializable reconnect |
-| `shutdown()` | all | Destroy jobs + stop local server |
+| `shutdown()` | all | Destroy jobs |
 
 `save_weights(path)` is a stub on-prem (not implemented for disk reload yet).
 
@@ -170,7 +153,7 @@ Unlike SFT's flat labels batch, RL `fwd_bwd` typically carries:
 ```
 
 Log-prob tensors often use a `_shifted` suffix convention (see
-`arctic_platform.rl.http_client`). Batch shapes still differ slightly across
+`arctic_platform.rl.ray_client`). Batch shapes still differ slightly across
 backends — treat unification as WIP.
 
 `fwd_bwd` omits the per-token result `batch` by default (VeRL only reads
@@ -179,6 +162,81 @@ to include the merged `batch` in the response (TRL server-side-loss).
 
 Metrics use the shared `{name}.sum` / `{name}.tokens` pairing; see
 [`common.md`](common.md#metric-aggregation).
+
+On packed input (`cu_seqlens` with a 1-D or single-row loss), `agg_loss` now
+uses the packed sequence boundaries in `seq-mean-token-mean`,
+`seq-mean-token-sum`, and `seq-mean-token-sum-norm`; earlier releases treated
+the packed row as one sequence. `seq-mean-token-mean` therefore averages each
+sequence's tokens and then the sequences. `seq-mean-token-sum-norm` divides
+by the context's `packed_loss_scale_factor` when GRPO receives one, which is
+the padded row width `S`: DSS sets it from `pack_meta.sequence_length`, and
+this package's packing pipeline from `pack_meta["S"]`. When none is supplied,
+it divides by the longest packed segment, after summing each segment's length
+over sequence-parallel ranks. Earlier releases divided packed input by the
+packed row's token count. Without `global_batch_size`, all three divide by the
+number of sequences with policy tokens instead of by one. Unpacked `[B, S]`
+input is unchanged.
+
+With `sequence_loss_weights`, `loss_agg_mode="prompt-mean"` computes
+`dp_size * sum(sequence_weight * sequence_loss_sum / sequence_token_count)`,
+offsetting DeepSpeed's DP gradient averaging as the other modes do. Earlier
+releases omitted `dp_size` on this weighted path, so with `dp_size > 1` its
+gradient scale is now `dp_size` times larger; the unweighted
+`prompt_group_ids` path already applied it. In this repository's integrations
+(verl, SkyRL, the Cortex adapter) and recipes, nothing sends
+`sequence_loss_weights`. In the PrimeRL Arctic adapter, the context builders
+(`prime_rl/arctic/context.py`) attach them when every rollout's source
+microbatch carries a weight or, failing that, when every rollout carries an
+example ID, and the trainer step (`ArcticTrainerAdapter.run` via `_prepare_grpo_context`)
+strips them before sending unless `loss_agg_mode` is `prompt-mean`.
+
+The registered `ap_grpo` loss accepts `teacher_tau` with a positive `teacher_clip`
+and prediction-aligned `teacher_log_probs_shifted` for the GRPO teacher term.
+The term clamps the teacher-minus-policy log ratio to
+`[-teacher_clip_negative, teacher_clip]`; `teacher_clip_negative` is an
+optional finite non-negative lower-clip magnitude that defaults to
+`teacher_clip`. `ap_grpo` accepts only the baseline GRPO config keys
+(`_GRPO_CONFIG_DEFAULTS` in `grpo.py`) and the ratio-control keys below; the
+unprefixed `grpo` additionally accepts its grouped-distillation `kd_coef`,
+`kd_divergence`, `kd_beta`, and `kd_batch_num_tokens` keys. Any other key is
+rejected by name in the batching and validation callbacks and again in the
+loss, so a misspelled key such as `teacher_tao` fails instead of training
+without its term.
+`ap_grpo_echo_v1` requires `aux_ce_weight` and `echo_global_num_sequences`;
+its `echo_observation_token_counts` batch column supplies the full observation
+denominator when sequence parallelism splits observation tokens, and the
+response then carries `echo_full_observation_denominator=1`. Both losses
+support CISPO-only ratio gates (`ratio_mask_bounds_pos` / `_neg`,
+`prob_diff_mask_max_pos` / `_neg`, `seq_mask_stat`, `seq_mask_bounds_pos` /
+`_neg`, `ratio_m2_threshold`) and the independent `log_ratio_sq_coef` penalty;
+`ratio_stats=True` enables additive per-bin telemetry without changing the
+objective. Ratio-control keys without `use_cispo_loss=True` pass the batching
+and validation callbacks; they are rejected when the packed loss reduction is
+resolved (DSS and the native worker do this before any forward), and otherwise
+by the loss. An explicit `null` is rejected for every ratio-control key (omit
+the key instead), unlike most baseline keys where `null` turns the feature off;
+a `null` end inside a bounds pair still means unbounded. The `_pos` / `_neg` gates split tokens by the sign of the
+token-level advantage (before any sequence-level averaging; it includes the
+teacher term when enabled): `advantage >= 0` counts as positive, so a
+zero-advantage token uses the `_pos` settings. The `seq_stat_bin_*` histogram
+always bins the sequence mean log ratio, even when `seq_mask_stat="mean_k3"`
+selects the gating statistic. `ratio_m2_threshold` requires one packed model call per worker and
+must be positive; it does not support sequence parallelism because M2PO
+ranking needs one complete token set. `ap_grpo_mixed_v1` requires CISPO, a
+finite positive `is_weight_clip_max`, token-level `importance_sampling_level`, and the
+prediction-aligned `nll_mask` column; it intentionally rejects ratio-mask
+options to avoid applying policy-only penalties to NLL tokens. It accepts only
+the baseline GRPO config keys (`_GRPO_CONFIG_DEFAULTS` in `grpo.py`), so ECHO
+keys and any unrecognized key are rejected. It also rejects `use_sapo_loss`,
+`use_decoupled_loss`, `use_kl_loss`, an `entropy_coeff` other than `0.0`
+(including `null`; omit it instead), any non-null `m2_threshold`, `c_clip`,
+`behav_imp_weight_cap` or `current_version`, `prox_logp_method` other than
+`recompute`, and the `prox_logp_shifted` and `rollout_is_weights` context
+columns. The config-value rejections and the CISPO and importance-sampling
+requirements name the key and the received value; a rejected context column is
+named with its shape when it is a tensor, otherwise with its value. The ratio-mask and unknown-key rejections list the
+offending keys without values, and a missing `nll_mask` is reported by name.
+The unprefixed `grpo_mixed_v1` applies the same rules.
 
 ## ZoRRo Train
 

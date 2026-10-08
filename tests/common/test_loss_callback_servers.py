@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Loss callbacks at the real Ray and HTTP forward/backward boundaries."""
+"""Loss callbacks at the real Ray forward/backward boundaries."""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ import pickle
 import pytest
 import torch
 
-from arctic_platform import wire
 from arctic_platform.rl.processors import BaseLoss
 
 
@@ -33,7 +32,10 @@ def _request() -> dict:
             "input_ids": torch.arange(8).reshape(4, 2),
             "attention_mask": torch.ones(4, 2, dtype=torch.long),
         },
-        "context": {"kd_mask": torch.tensor([[1.0, 0.0]]).expand(4, -1).clone()},
+        "context": {
+            "kd_mask": torch.tensor([[1.0, 0.0]]).expand(4, -1).clone(),
+            "loss_mask": torch.tensor([[True, False]]).expand(4, -1).clone(),
+        },
         "processing": {
             "loss_fn": "grpo",
             "config": {"kd_coef": 0.5},
@@ -154,37 +156,6 @@ def test_ray_forward_backward_runs_loss_callbacks_around_real_split(monkeypatch)
     _assert_response(response, events)
 
 
-def test_http_forward_backward_runs_loss_callbacks_around_real_split(monkeypatch):
-    import arctic_platform.common.http_server as http_server
-
-    events = []
-    _patch_loss(monkeypatch, events)
-
-    class Remote:
-        def __init__(self, index):
-            self.index = index
-
-        async def _call(self, shard):
-            return _assert_shard(shard, self.index, events)
-
-        def remote(self, shard):
-            return self._call(shard)
-
-    http_server.app.state.jobs = {1: {"job_type": "training", "sp_size": 1}}
-    http_server.app.state.training_workers = [
-        type("Worker", (), {"forward_backward": Remote(index)})() for index in range(2)
-    ]
-
-    response = asyncio.run(
-        http_server.forward_backward(
-            job_id=1,
-            body=wire.dumps(_request()),
-        )
-    )
-
-    _assert_response(wire.loads(response.body), events)
-
-
 def test_ray_forward_runs_loss_callbacks_around_real_split(monkeypatch):
     import arctic_platform.common.ray_server as ray_server
 
@@ -207,39 +178,6 @@ def test_ray_forward_runs_loss_callbacks_around_real_split(monkeypatch):
 
     _assert_response(response, events)
     assert response["batch"]["output"].shape == (4, 2)
-
-
-def test_http_forward_runs_loss_callbacks_around_real_split(monkeypatch):
-    import arctic_platform.common.http_server as http_server
-
-    events = []
-    _patch_loss(monkeypatch, events)
-
-    class Remote:
-        def __init__(self, index):
-            self.index = index
-
-        async def _call(self, shard):
-            return _assert_shard(shard, self.index, events)
-
-        def remote(self, shard):
-            return self._call(shard)
-
-    http_server.app.state.jobs = {1: {"job_type": "training", "sp_size": 1}}
-    http_server.app.state.training_workers = [
-        type("Worker", (), {"forward_no_grad": Remote(index)})() for index in range(2)
-    ]
-
-    response = asyncio.run(
-        http_server.forward(
-            job_id=1,
-            body=wire.dumps(_request()),
-        )
-    )
-    decoded = wire.loads(response.body)
-
-    _assert_response(decoded, events)
-    assert decoded["batch"]["output"].shape == (4, 2)
 
 
 class _GroupedPolicyEngine:
@@ -395,51 +333,6 @@ def test_ray_preserves_batching_state_through_serialized_worker_execution(monkey
     ]
 
 
-def test_http_preserves_batching_state_through_serialized_worker_execution():
-    import arctic_platform.common.http_server as http_server
-
-    _BatchingStateLoss.events = []
-    worker = _cpu_worker(_StatefulLossEngine())
-
-    class Remote:
-        async def _call(self, shard):
-            worker_shard = pickle.loads(pickle.dumps(shard))
-            return worker.forward_backward(worker_shard)
-
-        def remote(self, shard):
-            return self._call(shard)
-
-    http_server.app.state.jobs = {1: {"job_type": "training", "sp_size": 1}}
-    http_server.app.state.training_workers = [type("Worker", (), {"forward_backward": Remote()})()]
-    request = {
-        "batch": {
-            "input_ids": torch.ones(1, 2, dtype=torch.long),
-            "attention_mask": torch.ones(1, 2, dtype=torch.long),
-        },
-        "meta": {"pad_token_id": 0},
-        "processing": {"loss_fn": _BatchingStateLoss.name, "config": {}},
-    }
-
-    response = asyncio.run(
-        http_server.forward_backward(
-            job_id=1,
-            body=wire.dumps(request),
-        )
-    )
-    decoded = wire.loads(response.body)
-
-    assert decoded["avg_loss"] == 0.0
-    assert decoded["metrics"]["state_ready"] == 1.0
-    assert _BatchingStateLoss.events == [
-        "batching",
-        "validation",
-        "model_forward",
-        "loss",
-        "output",
-        "metrics",
-    ]
-
-
 def test_ray_grpo_kd_unpads_teacher_groups_for_multiple_rows_per_worker(monkeypatch):
     import arctic_platform.common.ray_server as ray_server
 
@@ -510,75 +403,3 @@ def test_ray_grouped_distillation_reports_global_objective_without_dp_gradient_s
     assert [worker.engine.parameter.grad.item() for worker in workers] == pytest.approx(
         [2 * 3 / 4 * objective_grad.item(), 2 * 1 / 4 * objective_grad.item()]
     )
-
-
-def test_http_forward_grpo_kd_unpads_teacher_groups_for_multiple_rows_per_worker():
-    import arctic_platform.common.http_server as http_server
-
-    request = _native_grpo_kd_request()
-    workers = [_cpu_worker(_GroupedPolicyEngine()) for _ in range(2)]
-    received = []
-
-    class Remote:
-        def __init__(self, worker):
-            self.worker = worker
-
-        async def _call(self, shard):
-            received.append(shard)
-            return self.worker.forward_no_grad(shard)
-
-        def remote(self, shard):
-            return self._call(shard)
-
-    http_server.app.state.jobs = {1: {"job_type": "training", "sp_size": 1}}
-    http_server.app.state.training_workers = [
-        type("Worker", (), {"forward_no_grad": Remote(worker)})() for worker in workers
-    ]
-
-    response = asyncio.run(
-        http_server.forward(
-            job_id=1,
-            body=wire.dumps(request),
-        )
-    )
-    decoded = wire.loads(response.body)
-
-    assert received[0]["processing"]["config"]["dp_size"] is None
-    assert received[0]["processing"]["config"]["kd_batch_num_tokens"] == 4.0
-    assert [shard["meta"]["dp_size"] for shard in received] == [2, 2]
-    assert [worker.engine.group_shapes for worker in workers] == [[(1, 5, 2)], [(1, 3, 2)]]
-    assert decoded["metrics"]["kd_weight_sum"] == 4.0
-    assert torch.isfinite(torch.tensor(decoded["avg_loss"]))
-
-
-def test_http_forward_grpo_kd_reports_unscaled_kd_delta():
-    import arctic_platform.common.http_server as http_server
-
-    async def run(request):
-        workers = [_cpu_worker(_GroupedPolicyEngine()) for _ in range(2)]
-
-        class Remote:
-            def __init__(self, worker):
-                self.worker = worker
-
-            async def _call(self, shard):
-                return self.worker.forward_no_grad(shard)
-
-            def remote(self, shard):
-                return self._call(shard)
-
-        http_server.app.state.jobs = {1: {"job_type": "training", "sp_size": 1}}
-        http_server.app.state.training_workers = [
-            type("Worker", (), {"forward_no_grad": Remote(worker)})() for worker in workers
-        ]
-        response = await http_server.forward(job_id=1, body=wire.dumps(request))
-        return wire.loads(response.body)
-
-    kd_request = _native_grpo_kd_request()
-    base_request = _native_grpo_kd_request()
-    base_request["processing"]["config"].pop("kd_coef")
-    with_kd = asyncio.run(run(kd_request))
-    base = asyncio.run(run(base_request))
-
-    assert with_kd["avg_loss"] - base["avg_loss"] == pytest.approx(with_kd["metrics"]["loss_term_kd"])
-    assert "_avg_loss_correction_sum" not in with_kd["metrics"]

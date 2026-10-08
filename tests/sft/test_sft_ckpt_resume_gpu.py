@@ -34,26 +34,20 @@ _PORT_BASE = get_unique_port_number()
 
 @require_torch_gpu
 @pytest.mark.gpu_serial
-class TestSftCkptResumeHttpE2EGPU(TestCasePlus):
+class TestSftCkptResumeE2EGPU(TestCasePlus):
     def test_save_load_resume_eval_and_hf_export(self):
         ckpt = self.get_auto_remove_tmp_dir()
         env = self.get_env()
-        env["CUDA_VISIBLE_DEVICES"] = ""
+        env["CUDA_VISIBLE_DEVICES"] = "0"
         env["WANDB_DISABLED"] = "true"
         env.setdefault("HF_HOME", "/data-fast/huggingface")
-        http_port = reserve_free_port(_PORT_BASE + 1, span=3)
-        env["MASTER_PORT"] = str(reserve_free_port(_PORT_BASE + 4, span=4))
+        env["MASTER_PORT"] = str(reserve_free_port(_PORT_BASE + 1, span=7))
         cmd = [
             sys.executable,
             "-m",
             "arctic_platform.sft.examples.run_sft_ckpt_resume_demo",
-            "--launch-local-server",
-            "--server-cuda-visible-devices",
-            "0",
             "--training-gpus",
             "1",
-            "--port",
-            str(http_port),
             "--checkpoint-dir",
             str(ckpt),
             "--pre-save-steps",

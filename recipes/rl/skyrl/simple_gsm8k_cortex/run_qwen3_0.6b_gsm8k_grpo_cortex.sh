@@ -16,8 +16,8 @@
 # (../simple_gsm8k) unchanged. The only Hydra flags that differ are plumbing for
 # a remote backend, and none of them touch the optimization:
 #
-#   trainer.arctic_rl.attn_implementation=sdpa
-#     Cortex image ships without FA2.
+#   trainer.arctic_rl.attn_implementation=flash_attention_3
+#     SkyRL defaults to FA2, which the Cortex image does not ship; it ships FA3.
 #   generator.inference_engine.external_server_urls=[http://cortex-managed, ...]
 #     Required by SkyRL's validate_generator_cfg under run_engines_locally=false,
 #     which asserts one URL per engine. The URLs are placeholders -- generation
@@ -280,7 +280,7 @@ uv run --isolated --extra skyrl-train \
     -- python -m skyrl.train.entrypoints.main_base \
     trainer.override_entrypoint=arctic_platform.integrations.skyrl.entrypoint \
     trainer.arctic_rl.colocate=false \
-    trainer.arctic_rl.attn_implementation=sdpa \
+    trainer.arctic_rl.attn_implementation=flash_attention_3 \
     trainer.algorithm.advantage_estimator=grpo \
     trainer.policy.model.path="${MODEL}" \
     data.train_data="['${TRAIN_FILES}']" \

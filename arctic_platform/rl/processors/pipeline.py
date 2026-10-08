@@ -716,6 +716,8 @@ def _run_pipeline_with_packing(
     mb_spec = MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb)
     mb_list = split_padded_tensor_dict_into_mb_list(all_input, mb_spec)
     n_mbs = len(mb_list.mbs)
+    if loss_object is not None:
+        loss_object.model_call_count_callback([n_mbs], processing.get("config") or {})
 
     reduction = resolve_packed_loss_reduction(
         processing,
@@ -735,6 +737,7 @@ def _run_pipeline_with_packing(
         mb_1d = {
             k: v.squeeze(0) if torch.is_tensor(v) and v.ndim == 2 and v.shape[0] == 1 else v for k, v in packed.items()
         }
+        mb_1d["packed_loss_scale_factor"] = pack_meta["S"]
 
         # Model receives packed [1, T] keys that were on the original batch.
         # A model input that exists only on meta must not reach the engine:

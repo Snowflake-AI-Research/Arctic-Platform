@@ -40,9 +40,12 @@ from arctic_platform.common.registry import register_post_processor
 from arctic_platform.common.registry import resolve_fn
 from arctic_platform.common.utils.batch import combine_metric_microbatches
 from arctic_platform.common.utils.batch import combine_metric_shards
+from arctic_platform.rl.processors import grpo_mixed_v1_loss
+from arctic_platform.rl.processors import resolve_loss
 from arctic_platform.rl.processors.causal_cross_entropy import causal_cross_entropy_loss
 from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
 from arctic_platform.rl.processors.cortex_grpo import cortex_grpo_loss
+from arctic_platform.rl.processors.cortex_grpo import cortex_grpo_mixed_v1_loss
 from arctic_platform.rl.processors.grpo import _ECHO_CONFIG_DEFAULTS
 from arctic_platform.rl.processors.grpo import _ECHO_CONFIG_KEYS
 from arctic_platform.rl.processors.grpo import _ECHO_REQUIRED_CONFIG_KEYS
@@ -86,6 +89,32 @@ class TestA1RegistryHygiene(TestCasePlus):
         self.assertIs(
             getattr(fn, PACKED_LOSS_REDUCTION_ATTR), getattr(LOSS_FNS["ap_grpo"], PACKED_LOSS_REDUCTION_ATTR)
         )
+
+    def test_same_fn_conflicting_callbacks_raise(self):
+        from arctic_platform.common.registry import BATCHING_CALLBACK_ATTR
+        from arctic_platform.common.registry import METRICS_CALLBACK_ATTR
+        from arctic_platform.common.registry import MODEL_CALL_COUNT_CALLBACK_ATTR
+        from arctic_platform.common.registry import VALIDATION_CALLBACK_ATTR
+
+        fn = LOSS_FNS["ap_grpo"]
+
+        def other_callback(*_args):
+            raise AssertionError("must not replace a registered GRPO callback")
+
+        for keyword, attr in (
+            ("batching_callback", BATCHING_CALLBACK_ATTR),
+            ("validation_callback", VALIDATION_CALLBACK_ATTR),
+            ("model_call_count_callback", MODEL_CALL_COUNT_CALLBACK_ATTR),
+            ("metrics_callback", METRICS_CALLBACK_ATTR),
+        ):
+            original = getattr(fn, attr)
+            with (
+                self.subTest(keyword=keyword),
+                self.assertRaisesRegex(ValueError, f"refusing to replace {keyword} on registered 'ap_grpo'"),
+            ):
+                register_loss_fn("ap_grpo", **{keyword: other_callback})(fn)
+            self.assertIs(getattr(fn, attr), original)
+            self.assertIs(LOSS_FNS["ap_grpo"], fn)
 
     def test_public_name_overwrite_raises(self):
         original = LOSS_FNS["ap_grpo"]
@@ -182,6 +211,37 @@ class TestA3PackedApply(TestCasePlus):
         )
         self.assertTrue(reduction.loss_is_additive)
         self.assertEqual(reduction.reporting_weights, (0.5, 1.5))
+
+    def test_dotted_mixed_losses_use_mixed_reduction(self):
+        microbatch = self._mb(2, 2)
+        microbatch["nll_mask"] = torch.tensor([[False, True]])
+        config = {
+            "loss_agg_mode": "token-mean",
+            "use_cispo_loss": True,
+            "is_weight_clip_max": 2.0,
+        }
+
+        for loss_fn in (
+            "arctic_platform.rl.processors.grpo.grpo_mixed_v1_loss",
+            "arctic_platform.rl.processors.cortex_grpo.cortex_grpo_mixed_v1_loss",
+        ):
+            reduction = resolve_packed_loss_reduction(
+                {"loss_fn": loss_fn, "config": config},
+                [microbatch],
+            )
+            self.assertFalse(reduction.loss_is_additive)
+
+    def test_dotted_echo_losses_require_additive_split_reduction(self):
+        microbatches = [self._mb(2, 2), self._mb(2, 2)]
+        for loss_fn in (
+            "arctic_platform.rl.processors.grpo.grpo_echo_v1_loss",
+            "arctic_platform.rl.processors.cortex_grpo.cortex_grpo_echo_v1_loss",
+        ):
+            with self.assertRaisesRegex(ValueError, "globally normalized additive"):
+                resolve_packed_loss_reduction(
+                    {"loss_fn": loss_fn, "config": {"loss_agg_mode": "token-mean"}},
+                    microbatches,
+                )
 
     def test_trio_mismatch_across_microbatches_raises(self):
         mb0 = self._mb(2, 2)
@@ -371,7 +431,9 @@ class TestGrpoConfigContract(TestCasePlus):
             "rollout_is_weights",
             "prompt_group_ids",
             "prompt_token_counts",
+            "ratio_masks",
             "sequence_loss_weights",
+            "loss_scale_factor",
         }
     )
 
@@ -419,13 +481,16 @@ class TestTrioPrecedenceIsPerLossName(TestCasePlus):
     both here makes any future unification a deliberate, visible change.
     """
 
-    def _call(self, loss_fn, config, meta):
+    def _call(self, loss_fn, config, meta, *, mixed=False):
         logprobs = torch.zeros(2, 3)
         batch = {
             "old_log_probs_shifted": torch.zeros(2, 3),
             "advantages": torch.ones(2, 3),
             "loss_mask": torch.ones(2, 3, dtype=torch.bool),
         }
+        if mixed:
+            batch["nll_mask"] = torch.tensor([[False, False, True], [False, False, True]])
+            config = {"use_cispo_loss": True, "is_weight_clip_max": 5.0, **config}
         loss, _ = loss_fn({"logprobs": logprobs}, batch, dict(meta), dict(config), "cpu")
         return loss.item()
 
@@ -445,6 +510,38 @@ class TestTrioPrecedenceIsPerLossName(TestCasePlus):
         )
         config_only = self._call(grpo_loss, {"batch_num_tokens": 6, "dp_size": 2}, {})
         self.assertAlmostEqual(conflicting, config_only, places=6)
+
+    def test_mixed_names_preserve_the_same_precedence_split(self):
+        config = {"batch_num_tokens": 6, "dp_size": 2}
+        context = {"batch_num_tokens": 12, "dp_size": 2}
+        with self.assertRaises(ValueError):
+            self._call(cortex_grpo_mixed_v1_loss, config, context, mixed=True)
+        conflicting = self._call(grpo_mixed_v1_loss, config, context, mixed=True)
+        config_only = self._call(grpo_mixed_v1_loss, config, {}, mixed=True)
+        self.assertAlmostEqual(conflicting, config_only, places=6)
+
+    def test_cortex_conflict_fails_preflight_before_the_forward(self):
+        context = {
+            "input_ids": torch.ones(1, 2, dtype=torch.long),
+            "old_log_probs_shifted": torch.zeros(1, 2),
+            "advantages": torch.ones(1, 2),
+            "loss_mask": torch.ones(1, 2, dtype=torch.bool),
+            "batch_num_tokens": 4.0,
+            "dp_size": 1,
+        }
+        config = {"batch_num_tokens": 60.0}
+        conflict = r"conflicting batch_num_tokens: context=4.0 config=60.0"
+        for name in ("grpo", "grpo_echo_v1", "grpo_mixed_v1"):
+            loss = resolve_loss(name)
+            reduction = getattr(LOSS_FNS[name], PACKED_LOSS_REDUCTION_ATTR)
+            request = {"kwargs": dict(context), "processing": {"loss_fn": name, "config": dict(config)}}
+            with self.subTest(name=name, stage="batching"), self.assertRaisesRegex(ValueError, conflict):
+                loss.batching_callback(request)
+            with self.subTest(name=name, stage="validation"), self.assertRaisesRegex(ValueError, conflict):
+                loss.validation_callback(dict(context), dict(config))
+            with self.subTest(name=name, stage="packed_reduction"), self.assertRaisesRegex(ValueError, conflict):
+                reduction([dict(context)], dict(config), name)
+        resolve_loss("ap_grpo").validation_callback(dict(context), dict(config))
 
     def test_names_agree_when_only_one_side_supplies_the_trio(self):
         config = {"batch_num_tokens": 6, "dp_size": 2}
@@ -466,6 +563,8 @@ class TestA5Compat(TestCasePlus):
         self.assertIn("compute_logprobs", POST_PROCESSORS)
         self.assertIn("ap_grpo", LOSS_FNS)
         self.assertIsNot(LOSS_FNS["ap_grpo"], LOSS_FNS["grpo"])
+        self.assertIs(LOSS_FNS["grpo_mixed_v1"], cortex_grpo_mixed_v1_loss)
+        self.assertIs(LOSS_FNS["ap_grpo_mixed_v1"], grpo_mixed_v1_loss)
         self.assertIn("ap_compute_logprobs", POST_PROCESSORS)
         self.assertIs(POST_PROCESSORS["ap_compute_logprobs"], POST_PROCESSORS["compute_entropy_and_logprobs"])
         self.assertIsNot(POST_PROCESSORS["compute_logprobs"], POST_PROCESSORS["ap_compute_logprobs"])
@@ -501,6 +600,26 @@ class TestA5Compat(TestCasePlus):
             "cpu",
         )
         self.assertAlmostEqual(loss_dp.item(), 4.0 * loss_local.item(), places=6)
+
+    def test_stamped_dp_scales_weighted_prompt_mean(self):
+        logprobs = torch.zeros(2, 3)
+        batch = {
+            "old_log_probs_shifted": torch.zeros(2, 3),
+            "advantages": torch.ones(2, 3),
+            "loss_mask": torch.ones(2, 3, dtype=torch.bool),
+            "sequence_loss_weights": torch.tensor([0.25, 0.75]),
+        }
+        config = {"loss_agg_mode": "prompt-mean"}
+        for loss_fn in (grpo_loss, cortex_grpo_loss):
+            loss_local, _ = loss_fn({"logprobs": logprobs}, batch, {}, config, "cpu")
+            loss_dp, _ = loss_fn(
+                {"logprobs": logprobs},
+                batch,
+                {"dp_size": 4},
+                config,
+                "cpu",
+            )
+            self.assertAlmostEqual(loss_dp.item(), 4.0 * loss_local.item(), places=6)
 
     def test_cce_context_config_conflict_raises(self):
         with self.assertRaises(ValueError):
@@ -674,6 +793,34 @@ class TestA5Compat(TestCasePlus):
         self.assertTrue(all(scale is False for scale in engine.backward_scale))
         self.assertNotIn("loss_mask", engine.last_kwargs)
         self.assertIn("input_ids", engine.last_kwargs)
+
+    def test_ratio_m2_rejects_split_packing_before_forward(self):
+        class Engine:
+            def __init__(self):
+                self.global_rank = 0
+
+            def __call__(self, *args, **kwargs):
+                raise AssertionError("split ratio_m2_threshold request must fail before forward")
+
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
+            "advantages": torch.ones(2, 4),
+            "loss_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
+            "old_log_probs_shifted": torch.zeros(2, 4),
+        }
+        with self.assertRaisesRegex(ValueError, "requires exactly one synchronized model call"):
+            run_pipeline(
+                Engine(),
+                (),
+                batch,
+                {"pad_token_id": 0},
+                {"loss_fn": "ap_grpo", "post": [], "config": {"ratio_m2_threshold": 0.1}},
+                "cpu",
+                backward=True,
+                pack=True,
+                max_tokens_per_mb=3,
+            )
 
     def test_cce_packed_resolve_accepts_global_batch_size(self):
         mb0 = {

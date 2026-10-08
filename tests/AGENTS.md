@@ -17,6 +17,28 @@ harness so CPU, GPU, and pytest-xdist runs stay consistent.
 Prefer importing helpers from `arctic_platform.testing_utils`. Do not reinvent skips,
 port picking, or tensor asserts in the test file.
 
+## In-tree inference tests
+
+`tests/inference` covers `arctic_platform.inference`. It is not part of the
+platform harness above. Default `pytest` and the `[sft,testing]` CI job skip
+it. `[cortex]`, `[sft]`, and `[rl]` do not install the `[inference]` extra.
+`[rl]` installs the published `arctic-inference` package.
+
+```text
+pip install -e ".[inference]"
+ARCTIC_INFERENCE_PRECOMPILED_OPS=1 pip install --no-build-isolation -e ".[inference]"
+pytest tests/inference
+```
+
+The second install is what compiles `csrc/`. Without
+`ARCTIC_INFERENCE_PRECOMPILED_OPS`, hatchling does not run `setup.py`.
+
+Docs, benchmarks, projects, and scripts live in `arctic_platform/inference/`
+and are excluded from the wheel. `csrc/` and `setup.py` are not.
+
+Do not pull these tests into the default suite; collecting them imports vLLM.
+Sampling and NCCL tests need a GPU.
+
 ## Base style
 
 1. **Prefer `TestCasePlus`** (`unittest.TestCase` subclass) for anything that needs
@@ -40,8 +62,7 @@ port picking, or tensor asserts in the test file.
 ## Numeric parity (do not cheat)
 
 When a new path claims to implement the **same math** as a baseline (e.g.
-`logits_optimization=compute|memory` vs `none`, tiled CE vs full logits, HTTP vs
-Ray, AP/SFT vs native Axolotl under identical DeepSpeed config):
+`logits_optimization=compute|memory` vs `none`, tiled CE vs full logits, AP/SFT vs native Axolotl under identical DeepSpeed config):
 
 1. **Prefer exact match.** Use `self.assertEqual` on scalars / lists, or
    `torch_assert_equal` / `torch_assert_close(..., rtol=0, atol=<fp noise>)`.
@@ -61,20 +82,16 @@ Ray, AP/SFT vs native Axolotl under identical DeepSpeed config):
 Anti-patterns: widening `atol`/`rtol` until green; comparing only shapes; asserting
 `grad_norm > 0` when the claim is “same as baseline.”
 
-## CPU client vs GPU server
-
-Production SFT/RL often runs the **client with `CUDA_VISIBLE_DEVICES=` empty** and
-the **server with real GPUs**. Mirror that in tests:
+## CPU tests vs GPU tests
 
 - **Client / routing / wire-format tests** (CPU): stub kernels or use FakeTransport;
   never require CUDA. Example: `TestSftCeLogitsOptimizationRouting` in
   `tests/sft/test_sft_losses.py`.
-- **Kernel / numeric / HTTP e2e on CUDA**: mark with `@require_torch_gpu` and run via
+- **Kernel / numeric / on-prem e2e on CUDA**: mark with `@require_torch_gpu` and run via
   autorun on the GPU box. Do **not** “prove” GPU CE by forcing the torch fallback on
   a CPU client — that is not the production path.
-- HTTP e2e that blank the client: set `env["CUDA_VISIBLE_DEVICES"] = ""` for the
-  client subprocess and pass server GPUs via the demo/server flag (e.g.
-  `--server-cuda-visible-devices`).
+- On-prem e2e runs the Ray server in the client process, so the client subprocess
+  must see the GPUs (e.g. `env["CUDA_VISIBLE_DEVICES"] = "0"`).
 
 ## pytest-xdist: ports and GPUs
 
@@ -88,14 +105,14 @@ base = get_unique_port_number()  # DEFAULT_MASTER_PORT + 8 * worker_id
 ```
 
 - Root `tests/conftest.py` claims **`base`** for torch.distributed `MASTER_PORT`.
-- Extra listen ports (HTTP, secondary rendezvous, …) must come from **`base+1` …
+- Extra listen ports (secondary rendezvous, …) must come from **`base+1` …
   `base+7`**, probed with:
 
 ```python
 from arctic_platform.testing_utils import get_unique_port_number, reserve_free_port
 
 _PORT_BASE = get_unique_port_number()
-http_port = reserve_free_port(_PORT_BASE + 1, span=7)
+extra_port = reserve_free_port(_PORT_BASE + 1, span=7)
 ```
 
 **Do not** use `socket.bind(('', 0))` / `getsockname` for suite servers under xdist:
@@ -131,9 +148,10 @@ usually need `@require_torch_gpu` only — not `gpu_serial`.
 | --- | --- | --- |
 | Pure helpers / shared math | `tests/common/` | No network |
 | SFT losses, batch wire, client ops | `tests/sft/` | CPU by default |
-| SFT CUDA kernels / local HTTP demo | `tests/sft/` | `@require_torch_gpu`; e2e → `gpu_serial` |
+| SFT CUDA kernels / local demo | `tests/sft/` | `@require_torch_gpu`; e2e → `gpu_serial` |
 | RL engine / generate / e2e | `tests/rl/` | Use `rl_harness` session helpers |
 | ZoRRO / model patchers | `tests/zorro_train/` | GPU when kernels matter |
+| Arctic Inference package | `tests/inference/` | Skipped by default `pytest`. Not the platform harness |
 
 ## Checklist for a new test
 

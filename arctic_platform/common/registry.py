@@ -25,7 +25,11 @@ from typing import Set
 
 POST_PROCESSORS: Dict[str, Callable] = {}
 LOSS_FNS: Dict[str, Callable] = {}
+BATCHING_CALLBACK_ATTR = "_arctic_batching_callback"
+VALIDATION_CALLBACK_ATTR = "_arctic_validation_callback"
 PACKED_LOSS_REDUCTION_ATTR = "_arctic_packed_loss_reduction"
+MODEL_CALL_COUNT_CALLBACK_ATTR = "_arctic_model_call_count_callback"
+METRICS_CALLBACK_ATTR = "_arctic_metrics_callback"
 SUMMED_METRICS_ATTR = "_arctic_summed_metrics"
 LOSS_CAPABILITIES_ATTR = "_arctic_loss_capabilities"
 
@@ -44,8 +48,10 @@ PUBLIC_LOSS_FNS = frozenset(
     {
         "ap_grpo",
         "ap_grpo_echo_v1",
+        "ap_grpo_mixed_v1",
         "grpo",
         "grpo_echo_v1",
+        "grpo_mixed_v1",
         "sft",
         "sft_ce",
         "verl_grpo",
@@ -94,10 +100,24 @@ def is_declared_summed_metric(name: str) -> bool:
 def register_loss_fn(
     name: str,
     *,
+    batching_callback: Callable | None = None,
+    validation_callback: Callable | None = None,
     packed_loss_reduction: Callable | None = None,
+    model_call_count_callback: Callable | None = None,
+    metrics_callback: Callable | None = None,
     summed_metrics: Iterable[str] = (),
 ):
-    """Register a loss function and its optional packed-microbatch contract.
+    """Register a loss function and its optional execution contracts.
+
+    ``model_call_count_callback`` validates a list of model-call counts before
+    execution without exposing objective config to dispatchers. DSS's
+    coordinator passes every worker shard's count. The native DeepSpeed worker
+    passes ``[gradient_accumulation_steps()]``, the same on every rank, so its
+    check agrees across ranks. ``run_pipeline(pack=True)`` passes only its local
+    token-budget microbatch count, which depends on that rank's data.
+
+    ``metrics_callback`` derives objective-owned response metrics after generic
+    worker aggregation.
 
     ``summed_metrics`` names the metrics this loss fn emits that are additive
     across packed microbatches, gradient accumulation, and DP ranks, so the
@@ -110,15 +130,39 @@ def register_loss_fn(
     declared = frozenset(summed_metrics)
 
     def decorator(fn: Callable) -> Callable:
+        if batching_callback is not None:
+            existing = getattr(fn, BATCHING_CALLBACK_ATTR, None)
+            if existing is not None and existing is not batching_callback:
+                raise ValueError(f"refusing to replace batching_callback on registered {name!r}")
+        if validation_callback is not None:
+            existing = getattr(fn, VALIDATION_CALLBACK_ATTR, None)
+            if existing is not None and existing is not validation_callback:
+                raise ValueError(f"refusing to replace validation_callback on registered {name!r}")
         if packed_loss_reduction is not None:
             existing = getattr(fn, PACKED_LOSS_REDUCTION_ATTR, None)
             if existing is not None and existing is not packed_loss_reduction:
                 raise ValueError(f"refusing to replace packed_loss_reduction on registered {name!r}")
+        if model_call_count_callback is not None:
+            existing = getattr(fn, MODEL_CALL_COUNT_CALLBACK_ATTR, None)
+            if existing is not None and existing is not model_call_count_callback:
+                raise ValueError(f"refusing to replace model_call_count_callback on registered {name!r}")
+        if metrics_callback is not None:
+            existing = getattr(fn, METRICS_CALLBACK_ATTR, None)
+            if existing is not None and existing is not metrics_callback:
+                raise ValueError(f"refusing to replace metrics_callback on registered {name!r}")
         # Bind first so a refused public-name overwrite cannot leak
         # ``summed_metrics`` into the process-global union.
         _bind_registry(LOSS_FNS, name, fn)
+        if batching_callback is not None:
+            setattr(fn, BATCHING_CALLBACK_ATTR, batching_callback)
+        if validation_callback is not None:
+            setattr(fn, VALIDATION_CALLBACK_ATTR, validation_callback)
         if packed_loss_reduction is not None:
             setattr(fn, PACKED_LOSS_REDUCTION_ATTR, packed_loss_reduction)
+        if model_call_count_callback is not None:
+            setattr(fn, MODEL_CALL_COUNT_CALLBACK_ATTR, model_call_count_callback)
+        if metrics_callback is not None:
+            setattr(fn, METRICS_CALLBACK_ATTR, metrics_callback)
         if declared:
             setattr(fn, SUMMED_METRICS_ATTR, declared | getattr(fn, SUMMED_METRICS_ATTR, frozenset()))
             DECLARED_SUMMED_METRICS.update(declared)

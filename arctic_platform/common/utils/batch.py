@@ -19,7 +19,6 @@ from typing import Any
 # import itertools
 import torch
 
-from arctic_platform import wire
 from arctic_platform.common.registry import is_declared_summed_metric
 
 from .server_models import resolve_parallelism_degree
@@ -92,6 +91,9 @@ BATCH_DIM_CONTEXT_KEYS = frozenset(
         "labels",
         "sft_mask",
         "echo_observation_mask",
+        "echo_observation_token_counts",
+        "nll_mask",
+        "teacher_log_probs_shifted",
         "versions",
         "prompt_group_ids",
         "prompt_token_counts",
@@ -350,7 +352,7 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
         reconstruct_position_ids_(batch_data)
 
     # ZoRRO Load balancer. Import lazily: a top-level import of zorro_train pulls
-    # in rl/__init__.py → common.http_server → common.utils while this package is
+    # in rl/__init__.py → common.utils while this package is
     # still initializing (circular after the rl→common move).
     if meta_data.get("load_balancer", False):
         from arctic_platform.rl.zorro_train.seqlen_balancing import reorg_global_batch
@@ -373,42 +375,6 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
 
 
 ray_split_batch = _split_batch
-
-
-def http_split_batch(
-    batch_bytes: bytes | dict,
-    num_workers: int,
-    sp_size: int = 1,
-) -> tuple[list[dict], list[int] | None]:
-    """Deserialize a global batch when needed, then split it across DP workers."""
-    # if num_workers <= 1:
-    #     return [batch_bytes]
-    batch = batch_bytes if isinstance(batch_bytes, dict) else wire.loads(batch_bytes)
-
-    shards, reorder_indices = _split_batch(batch, num_workers, sp_size=sp_size)
-
-    # _, batch_data, meta_data, processing = unpack_batch(batch)
-    # batch_data_shards = split_dict(batch_data, num_workers)
-    # shards = []
-    # meta_data.update(**dict(dp_size=num_workers))
-    # for i in range(num_workers):
-    #     shard = dict(
-    #         batch=batch_data_shards[i],
-    #         meta=meta_data,
-    #         processing=processing,
-    #     )
-    #     buf = io.BytesIO()
-    #     torch.save(shard, buf)
-    #     shards.append(buf.getvalue())
-
-    # DO NOT DELETE:
-    # at the moment must not recode back to bytes since we use ray to continue within the http_server - but it could be different later with DSS
-    # for i in range(len(shards)):
-    #     buf = io.BytesIO()
-    #     torch.save(shards[i], buf)
-    #     shards[i] = buf.getvalue()
-
-    return shards, reorder_indices
 
 
 def dump_dict_payload(payload: dict, tag: str):
