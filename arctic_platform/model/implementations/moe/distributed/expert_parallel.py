@@ -32,7 +32,7 @@ class DeepEPExpertParallel(ParallelStyle):
     @staticmethod
     def _partition_fn(name: str, mod: nn.Module, device_mesh: DeviceMesh) -> None:
         for param_name, param in mod.named_parameters(recurse=False):
-            mod.register_parameter(param_name, nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)])))
+            mod.register_parameter(param_name, nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]), requires_grad=param.requires_grad))
         mod._ep_group = device_mesh.get_group()
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
