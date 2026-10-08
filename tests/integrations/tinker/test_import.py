@@ -48,6 +48,32 @@ else:
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_teacher_logprobs_use_the_prompt_tokens() -> None:
+    script = """
+import asyncio
+import arctic_platform.tinker as tinker
+
+seen = {}
+
+class Session:
+    async def generate(self, tokens, params):
+        seen["tokens"] = list(tokens)
+        seen["params"] = dict(params)
+        return {
+            "outputs": [{"token_ids": [7], "logprobs": [-0.1], "finish_reason": "length"}],
+            "prompt_logprobs": [None, -0.4, -0.2],
+        }
+
+prompt = tinker.types.ModelInput.from_ints([11, 12, 13])
+logprobs = asyncio.run(tinker.SamplingClient(Session()).compute_logprobs_async(prompt))
+assert seen["tokens"] == [11, 12, 13], seen
+assert seen["params"]["prompt_logprobs"] == 0, seen
+assert seen["params"]["max_tokens"] == 1, seen
+assert logprobs == [None, -0.4, -0.2], logprobs
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
 def test_launcher_requires_gpu_counts() -> None:
     completed = subprocess.run(
         [sys.executable, "-m", "arctic_platform.tinker.run", "tinker_cookbook.recipes.math_rl.train"],

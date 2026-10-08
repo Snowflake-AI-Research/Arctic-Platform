@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 _settings: dict[str, Any] = {
     "training_gpus": None,
     "sampling_gpus": None,
+    "teacher_sampling_gpus": 1,
     "max_prompt_length": 2048,
     "max_response_length": 512,
 }
@@ -52,14 +53,16 @@ def configure(
     *,
     training_gpus: int,
     sampling_gpus: int,
+    teacher_sampling_gpus: int = 1,
     max_prompt_length: int = 2048,
     max_response_length: int = 512,
 ) -> None:
     """Record the GPU counts a recipe's ``ServiceClient(base_url=...)`` should use."""
-    if training_gpus < 1 or sampling_gpus < 1:
-        raise ValueError("training_gpus and sampling_gpus must both be at least 1")
+    if training_gpus < 1 or sampling_gpus < 1 or teacher_sampling_gpus < 1:
+        raise ValueError("training_gpus, sampling_gpus, and teacher_sampling_gpus must all be at least 1")
     _settings["training_gpus"] = int(training_gpus)
     _settings["sampling_gpus"] = int(sampling_gpus)
+    _settings["teacher_sampling_gpus"] = int(teacher_sampling_gpus)
     _settings["max_prompt_length"] = int(max_prompt_length)
     _settings["max_response_length"] = int(max_response_length)
 
@@ -172,6 +175,30 @@ class SamplingClient:
             num_samples,
         )
         result = await self._session.generate(tokens, params)
+        return self._sample_response(result)
+
+    async def compute_logprobs_async(self, prompt: Any) -> list[float | None]:
+        """Log-prob of each prompt token. The first entry is ``None``, matching Tinker."""
+        from arctic_platform.integrations.tinker.router import ModelInput
+        from arctic_platform.integrations.tinker.router import SamplingParams
+        from arctic_platform.integrations.tinker.router import _model_input_to_tokens
+        from arctic_platform.integrations.tinker.router import sampling_params_tinker_to_vllm
+
+        router_prompt = ModelInput.model_validate(prompt.model_dump())
+        tokens = _model_input_to_tokens(router_prompt)
+        params = sampling_params_tinker_to_vllm(SamplingParams(max_tokens=1, temperature=1.0), 1)
+        # vLLM's 0 means the prompt token itself, which is what distillation subtracts.
+        params["prompt_logprobs"] = 0
+        result = await self._session.generate(tokens, params)
+        prompt_logprobs = result.get("prompt_logprobs")
+        if prompt_logprobs is None or len(prompt_logprobs) != len(tokens):
+            raise RuntimeError(
+                f"asked for prompt log-probs of {len(tokens)} tokens and the sampler returned "
+                f"{None if prompt_logprobs is None else len(prompt_logprobs)}"
+            )
+        return list(prompt_logprobs)
+
+    def _sample_response(self, result: dict) -> Any:
         sequences = []
         for output in result.get("outputs") or []:
             logprobs = output.get("logprobs")
@@ -293,6 +320,7 @@ class ServiceClient:
         user_metadata: dict | None = None,
         training_gpus: int | None = None,
         sampling_gpus: int | None = None,
+        teacher_sampling_gpus: int | None = None,
         max_prompt_length: int | None = None,
         max_response_length: int | None = None,
         **_: Any,
@@ -300,9 +328,16 @@ class ServiceClient:
         del base_url, user_metadata
         self.training_gpus = _pick(training_gpus, "training_gpus")
         self.sampling_gpus = _pick(sampling_gpus, "sampling_gpus")
+        self.teacher_sampling_gpus = int(
+            teacher_sampling_gpus if teacher_sampling_gpus is not None else _settings["teacher_sampling_gpus"]
+        )
+        if self.teacher_sampling_gpus < 1:
+            raise ValueError("teacher_sampling_gpus must be at least 1")
         self.max_prompt_length = int(max_prompt_length or _settings["max_prompt_length"])
         self.max_response_length = int(max_response_length or _settings["max_response_length"])
         self._session: TrainingClient | None = None
+        self._student_model: str | None = None
+        self._teachers: dict[str, TrainingClient] = {}
 
     async def create_lora_training_client_async(
         self,
@@ -320,8 +355,60 @@ class ServiceClient:
         groups = [name for name, enabled in (("mlp", train_mlp), ("attn", train_attn), ("unembed", train_unembed)) if enabled]
         if not groups:
             raise ValueError("at least one of train_mlp, train_attn, train_unembed must be set")
+        self._student_model = base_model
         self._session = await asyncio.to_thread(self._open, base_model, rank, seed, ",".join(groups))
         return self._session
+
+    def create_sampling_client(self, base_model: str | None = None, model_path: str | None = None, **_: Any) -> SamplingClient:
+        """A sampler for ``base_model``.
+
+        On-policy distillation calls this with the teacher. That model is a
+        sampling-only Cortex job on its base weights. The trained student is
+        the sampler from ``save_weights_and_get_sampling_client_async``.
+        """
+        if model_path is not None:
+            raise RuntimeError("loading a sampler checkpoint is not supported; the teacher is its base weights")
+        if base_model is None or base_model == self._student_model:
+            if self._session is None:
+                raise RuntimeError("create a training client before sampling the student")
+            return SamplingClient(self._session)
+        if base_model not in self._teachers:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                self._teachers[base_model] = self._open_teacher(base_model)
+            else:
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    self._teachers[base_model] = pool.submit(self._open_teacher, base_model).result()
+        return SamplingClient(self._teachers[base_model])
+
+    def _open_teacher(self, model: str) -> TrainingClient:
+        from transformers import AutoConfig
+
+        from arctic_platform.client import AsyncArcticRLClient
+        from arctic_platform.integrations.tinker.cortex import build_handlers
+        from arctic_platform.integrations.tinker.serve import TinkerServeConfig
+        from arctic_platform.integrations.tinker.serve import _client_config
+        from arctic_platform.integrations.tinker.serve import _isolation
+
+        # The teacher is given the whole student sequence as its prompt, then
+        # samples one token so vLLM will score that prompt.
+        cfg = TinkerServeConfig(
+            model=model,
+            training_gpus=0,
+            sampling_gpus=self.teacher_sampling_gpus,
+            max_prompt_length=self.max_prompt_length + self.max_response_length,
+            max_response_length=1,
+            lora_rank=0,
+            seed=7,
+        )
+        model_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+        cfg, isolate = _isolation(cfg, model_config)
+        client = AsyncArcticRLClient(_client_config(cfg))
+        _sessions.append(client)
+        return TrainingClient(client, build_handlers(client, isolate), 0, cfg.max_prompt_length, cfg.max_response_length)
 
     def _open(self, base_model: str, rank: int, seed: int | None, lora_modules: str) -> TrainingClient:
         from transformers import AutoConfig

@@ -14,6 +14,7 @@ import sys
 _FLAGS = {
     "--training-gpus": "training_gpus",
     "--sampling-gpus": "sampling_gpus",
+    "--teacher-sampling-gpus": "teacher_sampling_gpus",
     "--max-prompt-length": "max_prompt_length",
     "--max-response-length": "max_response_length",
 }
