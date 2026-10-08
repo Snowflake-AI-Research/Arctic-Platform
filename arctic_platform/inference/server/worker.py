@@ -597,7 +597,7 @@ class InferenceWorker(StreamingWorkerMixin):
         generate_kwargs: dict[str, Any] = {
             "request_id": request_id,
             # A grammar applies from the first token, as on an engine without chat's reasoner.
-            "reasoning_ended": True if getattr(self, "_chat_only_reasoner", False) else reasoning_ended,
+            "reasoning_ended": True if self._chat_only_reasoner else reasoning_ended,
         }
         if lora_request is not None:
             generate_kwargs["lora_request"] = lora_request
@@ -632,7 +632,6 @@ class InferenceWorker(StreamingWorkerMixin):
         # `reasoning_parser` is used by vLLM structured outputs to avoid
         # constraining reasoning tokens.
         reasoning_parser_name = engine_kwargs.get("reasoning_parser")
-        self._reasoning_parser_name = reasoning_parser_name
         # Chat-mode streams only; vllm serve's --tool-call-parser, not an engine arg.
         self._tool_call_parser = engine_kwargs.pop("tool_call_parser", None)
         # Chat-mode streams only, so enabling chat leaves /generate (think
