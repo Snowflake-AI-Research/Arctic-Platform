@@ -943,12 +943,14 @@ class ReplicaPool:
         pause_mode: str,
         clear_cache: bool,
     ) -> None:
+        await self._pause_workers(
+            "pause_generation", mode=pause_mode, clear_cache=clear_cache
+        )
+
+    async def _pause_workers(self, method: str, **kwargs: Any) -> None:
         pause_results = await asyncio.gather(
             *[
-                worker.pause_generation.remote(
-                    mode=pause_mode,
-                    clear_cache=clear_cache,
-                )
+                getattr(worker, method).remote(**kwargs)
                 for worker in self._workers
             ],
             return_exceptions=True,
@@ -1111,9 +1113,14 @@ class ReplicaPool:
 
             scheduler_was_paused = scheduler.paused
             scheduler.pause()
+            generation_frozen = False
             replay_send: asyncio.Future | None = None
             try:
-                await scheduler.drain()
+                # Hold in-flight requests in place (vLLM keep mode) rather than
+                # draining them: no engine step runs on the sampling GPUs during
+                # the send, and the send does not wait for the longest decode.
+                await self._pause_workers("freeze_generation")
+                generation_frozen = True
                 replay_send = asyncio.gather(
                     *[
                         worker.send_router_replay.remote()
@@ -1134,11 +1141,11 @@ class ReplicaPool:
                             continue
                     raise
             finally:
-                if (
-                    not scheduler_was_paused
-                    and (replay_send is None or replay_send.done())
-                ):
-                    scheduler.resume()
+                if replay_send is None or replay_send.done():
+                    if generation_frozen:
+                        await self._resume_generation_after_weight_sync()
+                    if not scheduler_was_paused:
+                        scheduler.resume()
 
         return {
             "n_replicas": len(self._workers),
