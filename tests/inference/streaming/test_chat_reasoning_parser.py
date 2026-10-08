@@ -19,6 +19,7 @@ if os.environ.get("ARCTIC_RUN_GPU_TESTS") == "1":
 
 load_library()
 from arctic_platform.inference.server import worker as worker_module
+from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import StreamLimits
 
 THINK, END_THINK = 10, 11
@@ -98,7 +99,10 @@ def fake_vllm(monkeypatch):
                     or structured.get("reasoning_parser")
                     or built.get("engine_reasoner", ""),
                 ),
-                model_config=SimpleNamespace(skip_tokenizer_init=True),
+                model_config=SimpleNamespace(
+                    skip_tokenizer_init=True,
+                    architecture=built.get("architecture", "MysteryForCausalLM"),
+                ),
             )
             built["engine_kwargs"] = self.kwargs
             built["vllm_config"] = config
@@ -108,7 +112,9 @@ def fake_vllm(monkeypatch):
         @classmethod
         def from_vllm_config(cls, vllm_config, **_kwargs):
             built["reasoner_at_engine_start"] = vllm_config.structured_outputs_config.reasoning_parser
-            return FakeEngine()
+            engine = FakeEngine()
+            engine.model_config.architecture = vllm_config.model_config.architecture
+            return engine
 
     modules = {
         "vllm.plugins": {"load_general_plugins": lambda: None},
@@ -255,6 +261,17 @@ def test_plain_streams_keep_their_grammar_timing(fake_vllm, engine_kwargs, reaso
     assert kwargs.get("reasoning_ended") is reasoning_ended
 
 
+def chat_parsers(monkeypatch, worker):
+    """The (reasoning, tool-call) parser names the worker's ChatEngine is built with."""
+    from arctic_platform.inference.server import chat as chat_module
+
+    built = []
+    monkeypatch.setattr(chat_module, "ChatEngine", lambda llm, model: built.append(model))
+    worker._chat_engine()
+    [model] = built
+    return model.reasoning_parser, model.tool_call_parser
+
+
 @pytest.mark.parametrize(
     ("engine_kwargs", "chat_parser"),
     [
@@ -270,18 +287,112 @@ def test_plain_streams_keep_their_grammar_timing(fake_vllm, engine_kwargs, reaso
 def test_chat_streams_use_the_chat_parser_or_the_jobs_own(
     fake_vllm, monkeypatch, engine_kwargs, chat_parser
 ):
-    from arctic_platform.inference.server import chat as chat_module
-
-    built = []
-    monkeypatch.setattr(chat_module, "ChatEngine", lambda llm, **kwargs: built.append(kwargs))
     engine_kwargs = dict(engine_kwargs)
     if "model_default" in engine_kwargs:
         fake_vllm["engine_reasoner"] = engine_kwargs.pop("model_default")
     worker = start_worker(tool_call_parser="hermes", **engine_kwargs)
 
-    worker._chat_engine()
+    assert chat_parsers(monkeypatch, worker) == (chat_parser, "hermes")
 
-    assert built == [{"tool_call_parser": "hermes", "reasoning_parser": chat_parser}]
+
+def test_a_known_architecture_gets_its_chat_parsers_without_engine_kwargs(
+    fake_vllm, monkeypatch
+):
+    fake_vllm["architecture"] = "Qwen3ForCausalLM"
+    worker = start_worker()
+
+    assert chat_parsers(monkeypatch, worker) == ("qwen3", "hermes")
+    # For chat streams only: /generate keeps no parser and its grammar timing.
+    assert fake_vllm["reasoner_at_engine_start"] == "qwen3"
+    assert "reasoning_parser" not in fake_vllm["engine_kwargs"]
+    assert "tokenizer_mode" not in fake_vllm["engine_kwargs"]
+    assert worker._reasoning_parser is None
+    generate(worker, [1, 2])
+    assert worker.llm.calls[0][2]["reasoning_ended"] is True
+
+
+def test_explicit_parsers_override_the_architectures(fake_vllm, monkeypatch):
+    fake_vllm["architecture"] = "Qwen3ForCausalLM"
+    worker = start_worker(chat_reasoning_parser="deepseek_r1", tool_call_parser="qwen3_xml")
+
+    assert chat_parsers(monkeypatch, worker) == ("deepseek_r1", "qwen3_xml")
+
+
+def test_a_jobs_own_reasoner_wins_over_the_architectures(fake_vllm, monkeypatch):
+    # One reasoner per engine: the job chose it for /generate, so chat follows it
+    # rather than failing a job that never asked for chat.
+    fake_vllm["architecture"] = "Qwen3ForCausalLM"
+    worker = start_worker(reasoning_parser="deepseek_r1")
+
+    assert chat_parsers(monkeypatch, worker) == ("deepseek_r1", "hermes")
+    assert worker._chat_only_reasoner is False
+
+
+@pytest.mark.parametrize(
+    ("architecture", "engine_kwargs", "support"),
+    [
+        ("Qwen3ForCausalLM", {}, {"chat_prompt": True, "thinking_optional": True}),
+        ("GptOssForCausalLM", {}, {"chat_prompt": True, "thinking_optional": False}),
+        ("MysteryForCausalLM", {}, {"chat_prompt": False, "thinking_optional": False}),
+        (
+            "MysteryForCausalLM",
+            {"tool_call_parser": "hermes"},
+            {"chat_prompt": True, "thinking_optional": False},
+        ),
+    ],
+)
+def test_chat_support_is_reported_per_model(
+    fake_vllm, monkeypatch, architecture, engine_kwargs, support
+):
+    from arctic_platform.inference.server import chat as chat_module
+
+    monkeypatch.setattr(chat_module, "ChatEngine", lambda llm, model: object())
+    fake_vllm["architecture"] = architecture
+    worker = start_worker(**engine_kwargs)
+
+    assert worker.get_chat_support() == support
+
+
+def test_chat_support_is_false_when_the_chat_front_end_cannot_be_built(
+    fake_vllm, monkeypatch
+):
+    from arctic_platform.inference.server import chat as chat_module
+
+    def broken(llm, model):
+        raise RuntimeError("no tokenizer")
+
+    monkeypatch.setattr(chat_module, "ChatEngine", broken)
+    fake_vllm["architecture"] = "Qwen3ForCausalLM"
+    worker = start_worker()
+
+    assert worker.get_chat_support() == {"chat_prompt": False, "thinking_optional": False}
+
+
+def test_unknown_architecture_chat_is_unsupported_and_logged_once(fake_vllm, caplog):
+    worker = start_worker()
+
+    async def run_twice():
+        events = []
+        for attempt in ("one", "two"):
+            worker.start_stream(
+                attempt,
+                ChatPrompt([{"role": "user", "content": "hi"}]),
+                {"n": 1},
+                20,
+                asdict(StreamLimits()),
+            )
+            reader = worker.stream_events(attempt)
+            async for batch in reader:
+                events.extend(batch)
+                break
+            await reader.aclose()
+        return events
+
+    with caplog.at_level("INFO"):
+        events = asyncio.run(run_twice())
+    assert [(e["type"], e["code"]) for e in events] == [("terminal_error", "chat_unsupported")] * 2
+    [record] = [r for r in caplog.records if "chat" in r.getMessage().lower()]
+    assert "MysteryForCausalLM" in record.getMessage()
 
 
 def test_a_jobs_own_reasoning_parser_still_drives_generate(fake_vllm, monkeypatch):

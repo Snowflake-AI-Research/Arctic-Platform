@@ -15,7 +15,6 @@ from typing import AsyncIterator
 from uuid import uuid4
 
 from arctic_platform.inference.server.chat import (
-    DEFAULT_CHAT_MAX_TOKENS,
     ChatInputError,
     ChatOutput,
     ChatPrompt,
@@ -26,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 MAX_WORKER_STREAMS = 128
 CONTEXT_LIMIT_SOURCES = frozenset({"prompt", "completion_budget"})
+# Output budget when the client omits max_tokens, capped so a default request
+# finishes inside the stream timeout. A chat prompt's is also capped by the
+# context left after rendering.
 DEFAULT_MAX_TOKENS = 4096
 # Prefixes of vLLM 0.30.0's structured-output validation errors, from
 # vllm/v1/structured_output/backend_{xgrammar,guidance,outlines}.py. vLLM raises
@@ -630,7 +632,7 @@ class EngineStream:
                     if isinstance(self.prompt, list)
                     else self.prompt
                 )
-                if getattr(self.owner, "_chat_only_reasoner", False):
+                if self.owner._chat_only_reasoner:
                     # Grammar from the first token, as without chat's reasoner.
                     kwargs["reasoning_ended"] = True
             adapter = self.owner._active_lora_request()
@@ -786,10 +788,10 @@ class EngineStream:
         if room <= 0:
             raise StreamError("context_length_exceeded", context_limit_source="prompt")
         if "max_tokens" not in self.params:
-            self.params["max_tokens"] = min(room, DEFAULT_CHAT_MAX_TOKENS)
+            self.params["max_tokens"] = min(room, DEFAULT_MAX_TOKENS)
             if (self.params.get("thinking_token_budget") or 0) > self.params["max_tokens"]:
                 raise StreamError("invalid_sampling_params")
-        if self.params.get("logprobs") is not None and rendered.reasons:
+        if self.params.get("logprobs") is not None and rendered.starts_in_reasoning:
             # A delta that ends reasoning carries reasoning and answer tokens
             # together, so its logprobs would expose reasoning. OpenAI's
             # reasoning models take no logprobs either.
@@ -903,24 +905,37 @@ class StreamingWorkerMixin:
     def _chat_engine(self):
         engine = getattr(self, "_stream_chat_engine", None)
         if engine is None:
-            from arctic_platform.inference.server.chat import ChatEngine
-
-            try:
-                engine = ChatEngine(
-                    self.llm,
-                    tool_call_parser=getattr(self, "_tool_call_parser", None),
-                    reasoning_parser=getattr(self, "_chat_reasoning_parser_name", None),
+            # Logged and remembered once: the engine doesn't change, so
+            # rebuilding can't succeed.
+            if self._chat_model is None:
+                logger.info(
+                    "Chat mode is unavailable: no chat parsers are known for "
+                    "architecture %s and none were configured",
+                    self.llm.model_config.architecture,
                 )
-            except Exception:
-                # E.g. skip_tokenizer_init or a vLLM API change (a missing chat
-                # template only shows at render). Logged and remembered once;
-                # the engine doesn't change, so rebuilding can't succeed.
-                logger.exception("Chat mode is unavailable on this worker")
                 engine = False
+            else:
+                from arctic_platform.inference.server.chat import ChatEngine
+
+                try:
+                    engine = ChatEngine(self.llm, self._chat_model)
+                except Exception:
+                    # E.g. skip_tokenizer_init or a vLLM API change (a missing
+                    # chat template only shows at render).
+                    logger.exception("Chat mode is unavailable on this worker")
+                    engine = False
             self._stream_chat_engine = engine
         if engine is False:
             raise StreamError("chat_unsupported")
         return engine
+
+    def get_chat_support(self):
+        """Whether this model takes chat prompts, and whether its thinking can be turned off."""
+        try:
+            self._chat_engine()
+        except StreamError:
+            return {"chat_prompt": False, "thinking_optional": False}
+        return {"chat_prompt": True, "thinking_optional": self._chat_model.thinking_optional}
 
     def start_stream(self, attempt_id, prompt, sampling_params, remaining_s, limits):
         if (

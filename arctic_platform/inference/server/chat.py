@@ -1,28 +1,102 @@
 """Chat prompts for streams: rendered with the model's own template, output split by kind.
 
 Rendering and parsing reuse vLLM's own chat front end (``OnlineRenderer`` and
-the unified ``Parser``) on the engine the worker already holds, so every model
-family vLLM supports works without per-family code here. Which parsers apply is
-engine configuration: ``chat_reasoning_parser`` (else the job's own
-``reasoning_parser``), ``tool_call_parser`` and, for DeepSeek-V4,
-``tokenizer_mode``.
+the unified ``Parser``) on the engine the worker already holds. Which parsers
+apply comes from ``CHAT_MODELS``, keyed by the architecture vLLM resolved for
+the checkpoint; the ``chat_reasoning_parser`` and ``tool_call_parser`` engine
+kwargs override it. Chat parses with the engine's reasoner when it has one.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
 MAX_CHAT_BYTES = 8 * 1024 * 1024
 MAX_CHAT_MESSAGES = 2048
 MAX_CHAT_TOOLS = 128
-# Output budget when the client omits max_tokens: whatever fits after the
-# prompt, capped so a default request finishes inside the stream timeout.
-DEFAULT_CHAT_MAX_TOKENS = 4096
 CHAT_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
 REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+
+
+@dataclass(frozen=True)
+class ChatModel:
+    """How chat mode renders and parses one model architecture.
+
+    ``reasoning_efforts`` maps a requested ``reasoning_effort`` to the level the
+    family's template names; values it does not list reach the template as is.
+    """
+
+    reasoning_parser: str | None
+    tool_call_parser: str | None
+    # Whether reasoning_effort="none" turns thinking off (vLLM passes the
+    # template enable_thinking=False).
+    thinking_optional: bool = False
+    reasoning_efforts: Mapping[str, str] = MappingProxyType({})
+
+    def template_reasoning_effort(self, effort):
+        return self.reasoning_efforts.get(effort, effort)
+
+
+_QWEN3 = ChatModel("qwen3", "hermes", thinking_optional=True)
+# Qwen3.8's template takes low, medium and xhigh and refuses "high"; Qwen3.5's
+# and 3.6's, on the same architectures, ignore the value.
+_QWEN3_5 = ChatModel(
+    "qwen3",
+    "qwen3_coder",
+    thinking_optional=True,
+    reasoning_efforts=MappingProxyType({"high": "xhigh"}),
+)
+_DEEPSEEK_V4 = ChatModel("deepseek_v4", "deepseek_v4", thinking_optional=True)
+# Names as vLLM resolves them (``model_config.architecture``). Parser names are
+# vLLM's registered ones. tokenizer_mode is left to vLLM, which picks
+# deepseek_v4 for DeepSeek-V4 by architecture. vLLM's DeepSeek-V4 tokenizer and
+# gpt-oss's Harmony renderer map reasoning_effort themselves; Harmony refuses
+# "none", since gpt-oss always reasons.
+CHAT_MODELS = MappingProxyType(
+    {
+        "Qwen3ForCausalLM": _QWEN3,
+        "Qwen3MoeForCausalLM": _QWEN3,
+        "Qwen3_5ForCausalLM": _QWEN3_5,
+        "Qwen3_5ForConditionalGeneration": _QWEN3_5,
+        "Qwen3_5MoeForCausalLM": _QWEN3_5,
+        "Qwen3_5MoeForConditionalGeneration": _QWEN3_5,
+        # GLM-5's template has two levels, High for "high" and Max for anything
+        # else (its default), so lower requests map to High rather than Max.
+        "GlmMoeDsaForCausalLM": ChatModel(
+            "glm47",
+            "glm47",
+            thinking_optional=True,
+            reasoning_efforts=MappingProxyType(
+                {"minimal": "high", "low": "high", "medium": "high"}
+            ),
+        ),
+        "DeepseekV4ForCausalLM": _DEEPSEEK_V4,
+        "DeepseekV4ForConditionalGeneration": _DEEPSEEK_V4,
+        "GptOssForCausalLM": ChatModel("openai_gptoss", "openai"),
+    }
+)
+
+
+def resolve_chat_model(architecture, *, reasoning_parser=None, tool_call_parser=None):
+    """Chat settings for an architecture, with explicit parser names taking precedence.
+
+    None when chat mode is unsupported: the architecture is not in
+    ``CHAT_MODELS`` and no parser was given.
+    """
+    model = CHAT_MODELS.get(architecture)
+    if model is None:
+        if reasoning_parser is None and tool_call_parser is None:
+            return None
+        model = ChatModel(reasoning_parser=None, tool_call_parser=None)
+    if reasoning_parser is not None:
+        model = replace(model, reasoning_parser=reasoning_parser)
+    if tool_call_parser is not None:
+        model = replace(model, tool_call_parser=tool_call_parser)
+    return model
 
 
 class ChatInputError(ValueError):
@@ -38,8 +112,8 @@ class ChatInputError(ValueError):
 class ChatPrompt:
     """Chat messages for the worker to render, instead of a prepared prompt.
 
-    Fields follow OpenAI Chat Completions. ``reasoning_effort`` is passed to the
-    template as is, so callers map OpenAI values to the model family's own.
+    Fields follow OpenAI Chat Completions. ``reasoning_effort`` reaches the
+    template as the model's ``ChatModel`` maps it.
     """
 
     messages: list
@@ -146,39 +220,35 @@ class RenderedChat:
     generate_kwargs: dict = field(default_factory=dict)
     parallel_tool_calls: bool | None = None
     tool_choice: str | dict | None = None
-
-    @property
-    def reasons(self):
-        """Whether generation starts in reasoning: a reasoner is active and the prompt leaves it open."""
-        return self.generate_kwargs.get("reasoning_ended") is False
+    # A reasoner is active and the prompt leaves reasoning open, or the model
+    # is gpt-oss, whose Harmony format always opens with reasoning.
+    starts_in_reasoning: bool = False
+    # False for gpt-oss: vLLM's parser there doesn't count reasoning tokens.
+    parser_counts_reasoning: bool = True
 
 
 class ChatEngine:
     """vLLM's chat front end bound to one worker's engine."""
 
-    def __init__(self, llm, *, tool_call_parser=None, reasoning_parser=None):
-        from vllm.parser import ParserManager
+    def __init__(self, llm, chat_model):
         from vllm.renderers.online_renderer import OnlineRenderer
 
         self.model_config = llm.model_config
+        self.chat_model = chat_model
         self.online = OnlineRenderer(
             model_config=llm.model_config,
             renderer=llm.renderer,
             request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
-            enable_auto_tools=tool_call_parser is not None,
-            tool_parser=tool_call_parser,
-            reasoning_parser=reasoning_parser,
+            enable_auto_tools=chat_model.tool_call_parser is not None,
+            tool_parser=chat_model.tool_call_parser,
+            reasoning_parser=chat_model.reasoning_parser,
         )
+        self.harmony = self.online.use_harmony
         self.tokenizer = llm.renderer.get_tokenizer()
-        self.parser_cls = ParserManager.get_parser(
-            tool_parser_name=tool_call_parser,
-            reasoning_parser_name=reasoning_parser,
-            enable_auto_tools=tool_call_parser is not None,
-            model_name=llm.model_config.model,
-            is_harmony=llm.model_config.hf_config.model_type == "gpt_oss",
-        )
+        # The renderer's own unified Parser class, so rendering and parsing agree.
+        self.parser_cls = self.online.parser
         self.guard = SpecialTokenGuard.from_tokenizer(self.tokenizer)
 
     async def render(self, prompt):
@@ -196,7 +266,9 @@ class ChatEngine:
             "tools": prompt.tools,
             "tool_choice": prompt.tool_choice,
             "parallel_tool_calls": prompt.parallel_tool_calls,
-            "reasoning_effort": prompt.reasoning_effort,
+            "reasoning_effort": self.chat_model.template_reasoning_effort(
+                prompt.reasoning_effort
+            ),
         }
         try:
             request = ChatCompletionRequest(
@@ -221,24 +293,13 @@ class ChatEngine:
         prompt_tokens = extract_prompt_len(self.model_config, engine_input)
 
         generate_kwargs = {}
-        if self.parser_cls is not None:
+        if self.parser_cls is None:
+            def new_parser():
+                return None
+        else:
             chat_template_kwargs = request.build_chat_params(
                 None, "auto"
             ).chat_template_kwargs
-            probe = self.parser_cls(
-                self.tokenizer,
-                request.tools,
-                chat_template_kwargs=chat_template_kwargs,
-                model_config=self.model_config,
-            )
-            if probe.reasoning_parser is not None:
-                # Lets structured outputs start after reasoning, as vllm serve does.
-                generate_kwargs["reasoning_ended"] = probe.is_reasoning_end(
-                    list(engine_input.get("prompt_token_ids") or ())
-                )
-                generate_kwargs["reasoning_parser_kwargs"] = {
-                    "chat_template_kwargs": chat_template_kwargs
-                }
 
             def new_parser():
                 return self.parser_cls(
@@ -247,9 +308,16 @@ class ChatEngine:
                     chat_template_kwargs=chat_template_kwargs,
                     model_config=self.model_config,
                 )
-        else:
-            def new_parser():
-                return None
+
+            probe = new_parser()
+            if probe.reasoning_parser is not None:
+                # Lets structured outputs start after reasoning, as vllm serve does.
+                generate_kwargs["reasoning_ended"] = probe.is_reasoning_end(
+                    list(engine_input.get("prompt_token_ids") or ())
+                )
+                generate_kwargs["reasoning_parser_kwargs"] = {
+                    "chat_template_kwargs": chat_template_kwargs
+                }
 
         return RenderedChat(
             engine_input=engine_input,
@@ -264,21 +332,26 @@ class ChatEngine:
             generate_kwargs=generate_kwargs,
             parallel_tool_calls=prompt.parallel_tool_calls,
             tool_choice=prompt.tool_choice,
+            # gpt-oss's reasoner reports reasoning as ended before any token,
+            # since it only detects boundaries, though Harmony always reasons.
+            starts_in_reasoning=self.harmony or generate_kwargs.get("reasoning_ended") is False,
+            parser_counts_reasoning=not self.harmony,
         )
 
 
 class ChatOutput:
     """Turns one stream's engine deltas into content, reasoning and tool-call events.
 
-    Reasoning text is never emitted: OpenAI's Chat Completions API returns only
-    its token count. Deltas the parser holds back (markup it is still matching)
-    emit nothing until they resolve.
+    Reasoning the parser splits out is never emitted as text: OpenAI's Chat
+    Completions API returns only its token count. Deltas the parser holds back
+    (markup it is still matching) emit nothing until they resolve.
     """
 
     def __init__(self, rendered, n):
         self.rendered = rendered
         self.parsers = [rendered.new_parser() for _ in range(n)]
         self.token_ids = [[] for _ in range(n)]
+        self.reasoning_counts = [0] * n
         self.called_tools = [False] * n
 
     def events(self, index, text, token_ids, finished, logprobs=None):
@@ -311,7 +384,12 @@ class ChatOutput:
             token_count = len(token_ids)
             if content or tool_calls:
                 # The delta that ends reasoning; split it as vLLM's parser does.
-                token_count -= len(parser.extract_content_ids(list(token_ids)))
+                try:
+                    token_count -= len(parser.extract_content_ids(list(token_ids)))
+                except NotImplementedError:
+                    # gpt-oss's parser can't split one; it counts as reasoning.
+                    pass
+            self.reasoning_counts[index] += token_count
             events.append(
                 {"type": "reasoning_delta", "choice_index": index, "token_count": token_count}
             )
@@ -348,6 +426,8 @@ class ChatOutput:
         return reason
 
     def reasoning_tokens(self):
+        if not self.rendered.parser_counts_reasoning:
+            return sum(self.reasoning_counts)
         return sum(
             parser.count_reasoning_tokens(token_ids)
             for parser, token_ids in zip(self.parsers, self.token_ids)

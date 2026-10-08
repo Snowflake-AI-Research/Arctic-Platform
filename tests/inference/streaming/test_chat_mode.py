@@ -18,6 +18,7 @@ if os.environ.get("ARCTIC_RUN_GPU_TESTS") == "1":
 
 load_library()
 from arctic_platform.inference.server.chat import (
+    CHAT_MODELS,
     ChatInputError,
     ChatPrompt,
     RenderedChat,
@@ -108,11 +109,25 @@ class AlwaysThinkingParser(ScriptParser):
         self.mode = "reasoning"
 
 
+class HarmonyLikeParser(ScriptParser):
+    """Like vLLM's gpt-oss parser: its reasoning half detects boundaries only."""
+
+    @staticmethod
+    def extract_content_ids(token_ids):
+        raise NotImplementedError("GptOssReasoningParser only provides boundary detection.")
+
+    def count_reasoning_tokens(self, token_ids):
+        return 0
+
+
 class FakeChatEngine:
-    def __init__(self, prompt_tokens=5, error=None, parser=ScriptParser, reasoning_ended=False):
+    def __init__(
+        self, prompt_tokens=5, error=None, parser=ScriptParser, reasoning_ended=False, harmony=False
+    ):
         self.prompt_tokens = prompt_tokens
         self.error = error
         self.parser = parser
+        self.harmony = harmony
         # None: no reasoning parser, so render sets no reasoning_ended.
         self.generate_kwargs = {} if reasoning_ended is None else {"reasoning_ended": reasoning_ended}
         self.guard = SpecialTokenGuard(["<|im_end|>", "<|im_start|>"])
@@ -132,6 +147,10 @@ class FakeChatEngine:
             generate_kwargs=dict(self.generate_kwargs),
             parallel_tool_calls=prompt.parallel_tool_calls,
             tool_choice=prompt.tool_choice,
+            starts_in_reasoning=(
+                self.harmony or self.generate_kwargs.get("reasoning_ended") is False
+            ),
+            parser_counts_reasoning=not self.harmony,
         )
 
 
@@ -353,6 +372,31 @@ def test_a_delta_that_ends_reasoning_counts_its_reasoning_tokens():
     # "Two", then " plus", " two" and the end marker from the mixed delta.
     assert sum(e["token_count"] for e in events if e["type"] == "reasoning_delta") == 4
     assert "".join(e["text"] for e in events if e["type"] == "content_delta") == "It is 4."
+
+
+def gpt_oss_engine():
+    # vLLM's gpt-oss reasoner says reasoning has ended before any token (it
+    # only detects boundaries), though Harmony always opens with reasoning.
+    return FakeChatEngine(parser=HarmonyLikeParser, reasoning_ended=True, harmony=True)
+
+
+def test_gpt_oss_logprobs_are_refused_though_its_reasoner_says_reasoning_ended():
+    worker, events = stream(chat("What is 2+2?"), {"logprobs": 0}, chat_engine=gpt_oss_engine())
+    assert kinds(events) == ["terminal_error"]
+    assert (events[0]["code"], events[0]["param"]) == ("invalid_chat_request", "logprobs")
+    assert worker.llm.calls == []
+
+
+def test_gpt_oss_mixed_delta_counts_as_reasoning_and_usage_sums_the_deltas():
+    script = ["<think>", "Two", (" plus two</think>It is", [201, 202, END_OF_THINKING, 203]), " 4."]
+    _, events = stream(chat("What is 2+2?"), script=script, chat_engine=gpt_oss_engine())
+    assert events[-1]["type"] == "completed"
+    reasoning = [e["token_count"] for e in events if e["type"] == "reasoning_delta"]
+    # "Two", then the whole four-token delta: the parser can't split it.
+    assert reasoning == [1, 4]
+    assert "".join(e["text"] for e in events if e["type"] == "content_delta") == "It is 4."
+    # vLLM's gpt-oss parser counts nothing, so usage adds up the reasoning deltas.
+    assert events[-2]["reasoning_tokens"] == 5
 
 
 def test_named_tool_choice_finishes_with_stop():
@@ -656,6 +700,7 @@ def test_engine_that_cannot_chat_is_logged_once_and_not_rebuilt(monkeypatch, cap
 
     monkeypatch.setattr(chat_module, "ChatEngine", broken)
     worker = make_worker()
+    worker._chat_model = CHAT_MODELS["Qwen3ForCausalLM"]
     del worker._stream_chat_engine
     with caplog.at_level("ERROR"):
         for _ in range(3):
@@ -708,6 +753,8 @@ def _engine_whose_renderer_raises(error):
     engine = object.__new__(ChatEngine)
     engine.guard = SpecialTokenGuard([])
     engine.model_config = SimpleNamespace(model="m")
+    engine.chat_model = CHAT_MODELS["Qwen3ForCausalLM"]
+    engine.harmony = False
     engine.online = SimpleNamespace(render_chat=render_chat)
     return engine
 
@@ -740,10 +787,15 @@ class _ChatRequest(SimpleNamespace):
     """Stands in for vLLM's ChatCompletionRequest, with its detokenizer defaults."""
 
     def __init__(self, **fields):
-        super().__init__(skip_special_tokens=True, spaces_between_special_tokens=True, **fields)
+        super().__init__(
+            skip_special_tokens=True, spaces_between_special_tokens=True, tools=None, **fields
+        )
 
     def extract_structured_outputs(self):
         return None
+
+    def build_chat_params(self, default_template, content_format):
+        return SimpleNamespace(chat_template_kwargs={})
 
 
 def _engine_whose_parser_adjusts(monkeypatch, adjust_request):
@@ -844,3 +896,67 @@ def test_model_without_a_chat_template_is_chat_unsupported(monkeypatch, caplog):
         assert "param" not in events[0]
     [record] = [r for r in caplog.records if "chat template" in r.getMessage().lower()]
     assert record.levelname == "ERROR"
+
+
+class _ProbedParser:
+    """Stands in for vLLM's unified Parser at render time."""
+
+    def __init__(self, tokenizer, tools, **kwargs):
+        self.reasoning_parser = object()
+
+    @staticmethod
+    def is_reasoning_end(prompt_token_ids):
+        return True
+
+
+def _rendered(monkeypatch, architecture, harmony=False, **fields):
+    engine = _engine_whose_parser_adjusts(monkeypatch, lambda request: None)
+    engine.chat_model = CHAT_MODELS[architecture]
+    engine.harmony = harmony
+    engine.parser_cls = _ProbedParser
+    engine.tokenizer = None
+    return asyncio.run(engine.render(chat("hi", **fields)))
+
+
+def test_harmony_always_starts_in_reasoning(monkeypatch):
+    rendered = _rendered(monkeypatch, "GptOssForCausalLM", harmony=True)
+    # vLLM's own reasoning_ended stays as vllm serve sends it.
+    assert rendered.generate_kwargs["reasoning_ended"] is True
+    assert rendered.starts_in_reasoning is True
+    assert rendered.parser_counts_reasoning is False
+
+
+def test_a_prompt_that_ends_reasoning_does_not_start_in_it(monkeypatch):
+    rendered = _rendered(monkeypatch, "Qwen3ForCausalLM")
+    assert rendered.starts_in_reasoning is False
+    assert rendered.parser_counts_reasoning is True
+
+
+def test_reasoning_effort_is_mapped_for_the_template(monkeypatch):
+    rendered = _rendered(monkeypatch, "Qwen3_5ForConditionalGeneration", reasoning_effort="high")
+    assert rendered.request.reasoning_effort == "xhigh"
+
+
+class ChatSupportWorker:
+    def __init__(self, support):
+        self.support = support
+
+    def get_chat_support(self):
+        return self.support
+
+
+def test_driver_reports_chat_support_for_a_loaded_model(runtime):
+    support = {"chat_prompt": True, "thinking_optional": False}
+
+    async def run():
+        actor = ray.remote(num_cpus=0)(ChatSupportWorker).remote(support)
+        pool = ReplicaPool()
+        pool._workers = [actor]
+        driver = Driver()
+        driver._pools["model"] = pool
+        try:
+            return await driver.get_chat_support("model")
+        finally:
+            ray.kill(actor)
+
+    assert asyncio.run(asyncio.wait_for(run(), 30)) == support

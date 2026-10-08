@@ -1,8 +1,8 @@
 """Opt-in real-engine chat-prompt streams: vLLM's renderer and parsers on a Qwen3 model.
 
-ARCTIC_TEST_MODEL_PATH must point at a Qwen3 checkpoint (e.g. Qwen3-0.6B); the
-parsers configured here are Qwen3's (hermes tool calls, qwen3 reasoning), set the
-way DSS sets them: ``chat_reasoning_parser``, so /generate keeps no parser.
+ARCTIC_TEST_MODEL_PATH must point at a Qwen3 checkpoint (e.g. Qwen3-0.6B). No
+chat engine kwargs are set: CHAT_MODELS gives Qwen3ForCausalLM its parsers
+(hermes tool calls, qwen3 reasoning) for chat only, so /generate keeps no parser.
 """
 
 import asyncio
@@ -61,7 +61,6 @@ async def with_driver(check):
             max_num_seqs=4,
             gpu_memory_utilization=0.5,
             trust_remote_code=False,
-            extra_engine_kwargs={"tool_call_parser": "hermes", "chat_reasoning_parser": "qwen3"},
         )
         await asyncio.wait_for(
             driver.initialize(config, model_id="chat-test", num_replicas=1),
@@ -114,6 +113,8 @@ def test_prompt_matches_the_official_template_and_reasoning_is_split():
     ]
 
     async def check(driver):
+        support = await driver.get_chat_support("chat-test")
+        assert support == {"chat_prompt": True, "thinking_optional": True}
         for messages in conversations:
             for effort, thinking in ((None, True), ("none", False)):
                 events = await collect(
@@ -177,7 +178,7 @@ def test_forced_tool_call_streams_a_valid_call(tool_choice):
 
 
 def test_forced_tool_call_waits_for_the_end_of_reasoning():
-    # Needs the engine's structured-output reasoner, which chat_reasoning_parser adds.
+    # Needs the engine's structured-output reasoner, which the worker adds for chat.
     from arctic_platform.inference.server.chat import ChatPrompt
 
     async def check(driver):

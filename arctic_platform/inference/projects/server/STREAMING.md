@@ -100,26 +100,50 @@ and `reasoning_effort`. `"chat_prompt" in STREAM_CAPABILITIES` tells callers the
 installed version supports it. The worker renders it with vLLM's own chat front
 end on the loaded engine, so the model's template applies (including DeepSeek-V4
 and gpt-oss Harmony), and splits output with vLLM's reasoning and tool parsers.
-Which parsers apply is engine configuration: `chat_reasoning_parser` (else the
-job's own `reasoning_parser`), `tool_call_parser` (both popped by the worker,
-like vllm serve's flags) and, for DeepSeek-V4, `tokenizer_mode`.
-`reasoning_effort` is passed to the template as is; callers map OpenAI values to
-the model family's own.
 
-`chat_reasoning_parser` turns on reasoning for chat streams only. The job's
+Which parsers apply comes from `CHAT_MODELS` in `chat.py`, keyed by the
+architecture vLLM resolves for the checkpoint, so every checkpoint of a listed
+architecture gets chat mode without engine kwargs:
+
+| Architectures | Reasoning / tool parser | Thinking off | `reasoning_effort` |
+|---|---|---|---|
+| `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM` | `qwen3` / `hermes` | yes | as is |
+| `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForCausalLM`, `Qwen3_5MoeForConditionalGeneration` | `qwen3` / `qwen3_coder` | yes | `high` becomes `xhigh` (Qwen3.8's level) |
+| `GlmMoeDsaForCausalLM` (GLM-5) | `glm47` / `glm47` | yes | `minimal`, `low`, `medium` become `high`; others as is (the template's Max) |
+| `DeepseekV4ForCausalLM`, `DeepseekV4ForConditionalGeneration` | `deepseek_v4` / `deepseek_v4` | yes | as is (vLLM's tokenizer maps it) |
+| `GptOssForCausalLM` | `openai_gptoss` / `openai` | no | as is (Harmony takes low, medium, high) |
+
+"Thinking off" means `reasoning_effort="none"` turns thinking off: vLLM hands
+the template `enable_thinking=False`. The table suits checkpoints that keep
+their family's chat template; one with a different template (an instruct-only
+or thinking-only variant, a coder model) can set the `chat_reasoning_parser` and
+`tool_call_parser` engine kwargs, which override the table and are popped by the
+worker like vllm serve's flags. They also enable chat on an unlisted
+architecture. Without either, a chat stream on an unlisted architecture fails
+with `chat_unsupported`, logged once per worker. `tokenizer_mode` is left to
+vLLM, which picks DeepSeek-V4's by architecture.
+
+`Driver.get_chat_support(model_id)` (and `ReplicaPool.get_chat_support()`)
+reports `{"chat_prompt": bool, "thinking_optional": bool}` for a loaded model:
+whether its streams take a `ChatPrompt`, and whether thinking can be turned off.
+It builds the worker's chat front end, so `chat_prompt` is false when that
+fails; a model with no chat template still reports true and its streams fail
+with `chat_unsupported`. `"chat_prompt" in STREAM_CAPABILITIES` only says this
+Arctic version has chat mode.
+
+The chat reasoning parser applies to chat streams only. The job's
 `reasoning_parser` also changes `/generate` (it prefills `<think>` for
 `enable_thinking`, splits reasoning out of the result and feeds action-mask
-replay), so setting it to enable chat would change RL rollouts; with only
-`chat_reasoning_parser`, `/generate` keeps no parser. Chat grammars
+replay), so it is not set for chat; `/generate` keeps no parser. Chat grammars
 (`tool_choice` `required` or named) must still wait for the end of reasoning,
 and vLLM does that only with an engine-wide structured-output reasoner, so the
 worker sets one when the engine has none and passes `reasoning_ended=True` with
 every `/generate` request and plain stream. vLLM then constrains those from the
-first token, exactly as with no reasoner. A `chat_reasoning_parser` that
-differs from the engine's reasoner fails engine start, since there is one per
-engine, wherever that reasoner came from: the job's `reasoning_parser`,
+first token, exactly as with no reasoner. An engine that already has a reasoner
+keeps it, and chat parses with it: the job's `reasoning_parser`,
 `structured_outputs_config.reasoning_parser`, or the model's default (gpt-oss
-gets `openai_gptoss`).
+gets `openai_gptoss`). An explicit `chat_reasoning_parser` that differs from it
+fails engine start, since there is one per engine.
 
 - Before rendering, any string in messages, tools or a named `tool_choice` that
   contains one of the tokenizer's special or added tokens fails the stream with
@@ -132,7 +156,7 @@ gets `openai_gptoss`).
   rendered prompt, 4096)`. A prompt that leaves no room fails with
   `context_length_exceeded` and `context_limit_source="prompt"`.
 - Instead of `delta`, a chat stream emits `content_delta` (`text`),
-  `reasoning_delta` (`token_count` only; reasoning text is never emitted) and
+  `reasoning_delta` (`token_count` only, never the reasoning text) and
   `tool_call_delta` (`index`, `arguments`, plus `id` and `name` on a call's first
   event). Markup the parser is still matching emits nothing until it resolves.
   `parallel_tool_calls=false` keeps only the first call.
@@ -144,16 +168,23 @@ gets `openai_gptoss`).
 - `choice_finished` reports `tool_calls` when a choice that called a tool stops,
   except under a named `tool_choice`, which reports `stop` as OpenAI does.
   `usage` adds `reasoning_tokens`, counted by the reasoning parser across choices.
+  Report that count; the sum of `reasoning_delta` `token_count`s can differ,
+  since it leaves out markup the parser consumed without emitting anything.
+  gpt-oss is the exception: vLLM's gpt-oss parser does not count, so
+  `reasoning_tokens` is that sum, and a delta that ends reasoning counts whole,
+  since that parser cannot split one.
 - Undelivered events merge only with the same kind of the same choice; tool-call
   arguments merge only within one call.
 - `logprobs` are refused when the model will reason: a reasoning parser is
   active and the rendered prompt does not already end reasoning (for example
-  Qwen3 with thinking on). The stream fails before any token with
-  `invalid_chat_request` and `param="logprobs"`, because the engine delta that
-  ends reasoning can carry reasoning and answer tokens together, and their
-  logprobs would expose the reasoning. OpenAI's reasoning models do not take
-  logprobs either. With thinking off, or no reasoning parser, every generated
-  token is answer or tool-call text.
+  Qwen3 with thinking on), or the model is gpt-oss, which always reasons. The
+  stream fails before any token with `invalid_chat_request` and
+  `param="logprobs"`, because the engine delta that ends reasoning can carry
+  reasoning and answer tokens together, and their logprobs would expose the
+  reasoning. OpenAI's reasoning models do not take logprobs either. With
+  thinking off, every generated token is answer or tool-call text. Without a
+  reasoning parser nothing is split out, so a model that reasons anyway streams
+  its reasoning as content.
 - With `logprobs`, each `content_delta` carries the `token_ids` and `logprobs`
   of the engine output that produced it; tool-call tokens carry none, as
   OpenAI reports logprobs for the answer only. Logprobs follow engine token
