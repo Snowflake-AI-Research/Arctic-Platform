@@ -46,9 +46,10 @@ incremental `token_ids`. When `logprobs` was requested, a delta also carries
 `{"token_id", "token", "logprob", "top": [{"token_id", "token", "logprob"}]}`.
 `top` holds the requested number of most likely tokens by rank; the chosen
 token keeps its own entry even when it is not among them. A `-inf` logprob is
-sent as `-9999.0`. Without `logprobs` the key is absent. `choice_finished` carries the index and `finish_reason`
-(`stop` or `length`). `usage` carries `prompt_tokens`, `completion_tokens`, and
-`total_tokens`. Prompt usage is counted once, completion usage across all choices.
+sent as `-9999.0`. Without `logprobs` the key is absent. `choice_finished`
+carries the index and `finish_reason` (`stop` or `length`). `usage` carries
+`prompt_tokens`, `completion_tokens`, and `total_tokens`. Prompt usage is
+counted once, completion usage across all choices.
 `completed` follows final usage, after the engine output iterator is closed
 successfully. A `terminal_error` contains a sanitized `code`, never successful
 completion. Only the chat input errors `invalid_message_content` and
@@ -63,7 +64,8 @@ and local cancellation can raise instead of delivering an event. EOF without com
 
 Inputs are one prepared text prompt, token-ID list or chat prompt (below). Supported sampling parameters:
 temperature, top_p, frequency_penalty, presence_penalty, max_tokens, stop, n,
-optional seed, logit_bias, structured_outputs, thinking_token_budget and logprobs. Unknown options are rejected. Defaults: temperature=1, top_p=1,
+optional seed, logit_bias, structured_outputs, thinking_token_budget and
+logprobs. Unknown options are rejected. Defaults: temperature=1, top_p=1,
 frequency_penalty=0, presence_penalty=0, max_tokens=4096, n=1. Penalties must
 be in [-2,2]. Limits: n<=8,
 max_tokens<=131072, 1 MiB text input or 131072 input token IDs. After vLLM
@@ -75,17 +77,18 @@ strings, each <=4096 UTF-8 bytes. Stop holdback/detokenization remain
 engine-owned. `logit_bias` maps at most 300 token IDs (integers or
 decimal strings) to biases in [-100,100]. vLLM checks the IDs against the loaded
 vocabulary; out-of-vocabulary IDs, or logit_bias on a speculative-decoding
-deployment, end the stream with `invalid_sampling_params`. `structured_outputs` is
-`{"json": <JSON schema object>}` (serialized schema <=64 KiB) or
-`{"json_object": true}`; the worker turns it into vLLM's `StructuredOutputsParams`. A
-schema that no vLLM structured-output backend accepts ends the stream with
-`invalid_structured_output`. `thinking_token_budget` is an integer in
-[1, max_tokens], where an omitted max_tokens counts as 4096; vLLM rejects it
-with `invalid_sampling_params` unless the model was loaded with a reasoning
-parser. `logprobs` is an integer in [0, 20],
-the number of alternatives reported per token; a value above the loaded model's
-`max_logprobs` ends the stream with `invalid_sampling_params`. `"sampling_params" in
-STREAM_CAPABILITIES` tells callers these four parameters are accepted. Active LoRA selection is forwarded. No HTTP, SSE, or
+deployment, end the stream with `invalid_sampling_params`. `structured_outputs`
+is `{"json": <JSON schema object>}` (serialized schema <=64 KiB) or
+`{"json_object": true}`; the worker turns it into vLLM's
+`StructuredOutputsParams`. A schema that no vLLM structured-output backend
+accepts ends the stream with `invalid_structured_output`.
+`thinking_token_budget` is an integer in [1, max_tokens], where an omitted
+max_tokens counts as 4096; vLLM rejects it with `invalid_sampling_params` unless
+the model was loaded with a reasoning parser. `logprobs` is an integer in
+[0, 20], the number of alternatives reported per token; a value above the loaded
+model's `max_logprobs` ends the stream with `invalid_sampling_params`.
+`"sampling_params" in STREAM_CAPABILITIES` tells callers these four parameters
+are accepted. Active LoRA selection is forwarded. No HTTP, SSE, or
 training-specific prompt mutation occurs here. For nonstream responses DSS can
 collect the same events into a complete response.
 
@@ -177,20 +180,15 @@ for callers that relay events onward in groups.
 The engine pump never waits for the client; it drains into a bounded queue and
 aborts on overflow rather than silently dropping output or pausing the shared engine.
 While the reader is behind, a new delta joins its choice's newest undelivered
-delta (text and `token_ids` concatenated), so one delivered delta can carry
-several engine steps. A slow reader then needs one queue slot per choice instead
-of one per token. Deltas never merge across choices, past a later event of the
-same choice, or past `usage`; finish events never merge, so the end of a stream
-needs up to 2n + 2 slots. A merge that would exceed the per-event byte limit
-starts a new event instead.
+delta (text, `token_ids` and `logprobs` concatenated), so one delivered delta
+can carry several engine steps. A slow reader then needs one queue slot per
+choice instead of one per token. Deltas never merge across choices, past a
+later event of the same choice, or past `usage`; finish events never merge, so
+the end of a stream needs up to 2n + 2 slots. A merge that would exceed the
+per-event byte limit starts a new event instead.
 
 Defaults: 128 queued events, 1 MiB queued serialized payload, 256 KiB per event,
-and 128 sessions per worker. Logprobs make each token's payload much larger:
-with `logprobs=20` a token serializes to about 1.5 KB, roughly 20 times a
-one-token delta without them, so a reader that falls about 700 tokens behind
-overflows the default buffer. Callers that request logprobs should raise
-`max_buffer_bytes` (ceiling 16 MiB, about 11,000 undelivered tokens at
-`logprobs=20`). Streaming and legacy
+and 128 sessions per worker. Streaming and legacy
 `generate()` requests share each worker's `active_requests` / `concurrency_limit`
 budget. Each dispatched stream consumes one shared slot and is additionally counted
 against the per-worker `MAX_WORKER_STREAMS` cap (128); this is an extra ceiling,
@@ -212,6 +210,12 @@ caps and concurrency bound retained application objects; exact engine/object-sto
 memory requires runtime verification. Limits can be reduced with StreamLimits;
 hard ceilings are checked. Stalled consumers abort after 30 seconds; requests expire
 after 300 seconds including queueing. Cleanup uses a separate finite timeout.
+
+Logprobs make each token's payload much larger: with `logprobs=20` a token
+serializes to about 1.5 KB, roughly 20 times a one-token delta without them, so
+a reader that falls about 700 tokens behind overflows the default buffer.
+Callers that request logprobs should raise `max_buffer_bytes` (ceiling 16 MiB,
+about 11,000 undelivered tokens at `logprobs=20`).
 
 The caller enforces its deadline with a local monotonic clock, including time
 waiting for dispatch. Registration sends the remaining duration, not a wall-clock

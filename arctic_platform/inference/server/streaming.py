@@ -46,12 +46,20 @@ STRUCTURED_OUTPUT_ERRORS = (
     "Regex uses unsupported feature for structured outputs: ",
     "Regex does not have a anchored universal start state",
 )
+# Prefixes of vLLM 0.30.0's sampling-parameter errors that carry no parameter:
+# logit_bias on a speculative-decoding deployment, and a thinking budget on a
+# model without a reasoning parser.
+SAMPLING_PARAM_ERRORS = (
+    "The min_p and logit_bias sampling parameters are not yet supported "
+    "with speculative decoding.",
+    "thinking_token_budget is set but reasoning_config is not configured.",
+)
 # Chat input errors that name the offending request field in ``param``.
 PARAM_ERROR_CODES = frozenset({"invalid_message_content", "invalid_chat_request"})
 # Text prompts emit "delta"; chat prompts emit the output already split by kind.
 DELTA_TYPES = frozenset({"delta", "content_delta", "reasoning_delta", "tool_call_delta"})
 FINISH_REASONS = frozenset({"stop", "length", "tool_calls"})
-# Features callers can check before relying on them, like ``read_buffered``.
+# Optional features; callers test membership before using one.
 STREAM_CAPABILITIES = frozenset({"sampling_params", "chat_prompt"})
 
 
@@ -103,14 +111,7 @@ def classify_engine_error(exc):
     if getattr(exc, "parameter", None) in {"logit_bias", "logprobs"}:
         return "invalid_sampling_params", None
     message = str(exc)
-    if message.startswith(
-        "The min_p and logit_bias sampling parameters are not yet supported "
-        "with speculative decoding."
-    ):
-        return "invalid_sampling_params", None
-    if message.startswith(
-        "thinking_token_budget is set but reasoning_config is not configured."
-    ):
+    if message.startswith(SAMPLING_PARAM_ERRORS):
         return "invalid_sampling_params", None
     if message.startswith(STRUCTURED_OUTPUT_ERRORS):
         return "invalid_structured_output", None
@@ -275,6 +276,7 @@ def validate_request(prompt, sampling_params):
         biases = {}
         for token, bias in logit_bias.items():
             # OpenAI clients send token IDs as JSON object keys, so strings.
+            # 2**31 has 10 digits.
             if (
                 isinstance(token, str)
                 and 0 < len(token) <= 10
@@ -393,8 +395,7 @@ def valid_delta_logprobs(event, top_k):
     logprobs = event["logprobs"]
     token_ids = event.get("token_ids")
     return (
-        type(top_k) is int
-        and isinstance(logprobs, list)
+        isinstance(logprobs, list)
         and isinstance(token_ids, list)
         and len(logprobs) == len(token_ids)
         and all(
@@ -588,7 +589,7 @@ class EngineStream:
         self.prompt = prompt
         # A defaulted budget may run past the context; generation then stops at
         # the context limit instead of failing.
-        self.default_budget = "max_tokens" not in params
+        self.max_tokens_omitted = "max_tokens" not in params
         # A chat prompt's default is set after rendering, from its length.
         self.params = (
             dict(params)
@@ -641,7 +642,7 @@ class EngineStream:
                     prompt_tokens = len(output.prompt_token_ids)
                     max_model_len = self.owner.llm.model_config.max_model_len
                     if (
-                        not self.default_budget
+                        not self.max_tokens_omitted
                         and prompt_tokens + self.params["max_tokens"] > max_model_len
                     ):
                         raise StreamError(

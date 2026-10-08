@@ -28,6 +28,9 @@ from arctic_platform.inference.server.streaming import (
 )
 from arctic_platform.inference.server.worker import InferenceWorker
 
+# The prompt FakeEngine reports having tokenized, whatever it was given.
+FAKE_PROMPT_TOKEN_IDS = [1, 2]
+
 
 def fake_logprobs(token_id, top_k):
     # Shaped like vLLM's per-token dict of token ID to Logprob; the chosen
@@ -91,7 +94,8 @@ class FakeEngine:
                     "sensitive unsupported sampling parameter"
                 )
             # Like vLLM, generation also stops at the model context length.
-            limit = min(params["max_tokens"], self.model_config.max_model_len - 2)
+            room = self.model_config.max_model_len - len(FAKE_PROMPT_TOKEN_IDS)
+            limit = min(params["max_tokens"], room)
             for step in range(limit):
                 if step == 1 and prompt == "blocked":
                     await self.gate.wait()
@@ -120,7 +124,9 @@ class FakeEngine:
                     for index in range(params["n"])
                     if prompt != "different-lengths" or step <= index
                 ]
-                yield SimpleNamespace(prompt_token_ids=[1, 2], outputs=choices)
+                yield SimpleNamespace(
+                    prompt_token_ids=FAKE_PROMPT_TOKEN_IDS, outputs=choices
+                )
         finally:
             self.active.discard(request_id)
 
