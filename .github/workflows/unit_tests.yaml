@@ -61,9 +61,12 @@ jobs:
         run: |
           cd tests
           python -m pytest -s -v --ignore=inference
-      # tests/inference needs a GPU stack, except the streaming tests, which
-      # stub vLLM and torch. They run in their own pytest process: their stubs
-      # in sys.modules would otherwise make importorskip("vllm") pass elsewhere.
+      # tests/conftest.py skips tests/inference unless pytest is pointed at it.
+      # The streaming tests need no GPU, but run in their own pytest process:
+      # their stand-ins replace arctic_platform.inference.server and add a fake
+      # vllm (and torch, if absent) to sys.modules, which would leak into the
+      # rest of the suite. On a GPU runner, tests/rl's importorskip("vllm")
+      # would pass against the fake; here those tests skip earlier, on CUDA.
       - name: Streaming Tests
         # The suite takes about a minute; a hung Ray actor shouldn't hold a
         # runner for GitHub's default 6 hours.
