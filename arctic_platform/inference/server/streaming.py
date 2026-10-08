@@ -31,8 +31,9 @@ DEFAULT_MAX_TOKENS = 4096
 # vllm/v1/structured_output/backend_{xgrammar,guidance,outlines}.py. vLLM raises
 # a bare VLLMValidationError with no parameter for these, so only the message
 # identifies them. With the default "auto" backend a schema xgrammar rejects
-# falls back to guidance, then outlines, so the error can come from any of the
-# three. test_gpu_driver.py triggers real ones; recheck on every vLLM upgrade.
+# falls back to guidance, or to outlines when the schema uses features guidance
+# lacks, so the error can come from any of the three. test_gpu_driver.py
+# triggers real ones; recheck on every vLLM upgrade.
 STRUCTURED_OUTPUT_ERRORS = (
     "Failed to transform json schema into a grammar: ",
     "The provided JSON schema contains features not supported by xgrammar.",
@@ -439,6 +440,11 @@ def event_size(event):
     return len(_compact(event))
 
 
+# Delta fields a merge concatenates: the text or tool-call arguments and the
+# per-token lists.
+MERGED_KEYS = ("text", "arguments", "token_ids", "logprobs")
+
+
 def _appended_size(old, added, key):
     """Bytes that appending ``added[key]`` to ``old[key]`` adds to ``old``.
 
@@ -511,38 +517,23 @@ class EventBuffer:
         if entry is None or entry[0]["type"] != event["type"]:
             return False
         kind = event["type"]
+        merged = dict(entry[0])
         size = entry[1]
         if kind == "reasoning_delta":
-            merged = {
-                **entry[0],
-                "token_count": entry[0]["token_count"] + event["token_count"],
-            }
+            merged["token_count"] = entry[0]["token_count"] + event["token_count"]
             size += len(str(merged["token_count"])) - len(str(entry[0]["token_count"]))
-            joined = ()
-        elif kind == "tool_call_delta":
+        elif kind == "tool_call_delta" and (
+            entry[0]["index"] != event["index"] or "id" in event or "name" in event
+        ):
             # Only argument text continuing the same call joins it; a new id or
             # name starts a call of its own.
-            if entry[0]["index"] != event["index"] or "id" in event or "name" in event:
-                return False
-            merged = {
-                **entry[0],
-                "arguments": entry[0]["arguments"] + event["arguments"],
-            }
-            joined = ("arguments",)
-        else:
-            merged = {**entry[0], "text": entry[0]["text"] + event["text"]}
-            joined = ("text",)
-        if "token_ids" in entry[0] or "token_ids" in event:
-            merged["token_ids"] = [
-                *entry[0].get("token_ids", ()), *event.get("token_ids", ())
-            ]
-        if "logprobs" in entry[0] or "logprobs" in event:
-            merged["logprobs"] = [
-                *entry[0].get("logprobs", ()), *event.get("logprobs", ())
-            ]
+            return False
+        for key in MERGED_KEYS:
+            if key in entry[0] or key in event:
+                empty = [] if key in ("token_ids", "logprobs") else ""
+                merged[key] = entry[0].get(key, empty) + event.get(key, empty)
         size += sum(
-            _appended_size(entry[0], event, key)
-            for key in (*joined, "token_ids", "logprobs")
+            _appended_size(entry[0], event, key) for key in MERGED_KEYS
         )
         if size > self.limits.max_event_bytes:
             return False
@@ -595,8 +586,8 @@ class EngineStream:
         self.owner = owner
         self.attempt_id = attempt_id
         self.prompt = prompt
-        # A defaulted budget may run past the context; vLLM then stops at the
-        # context length instead, as OpenAI does for an omitted max_tokens.
+        # A defaulted budget may run past the context; generation then stops at
+        # the context limit instead of failing.
         self.default_budget = "max_tokens" not in params
         # A chat prompt's default is set after rendering, from its length.
         self.params = (
@@ -884,16 +875,13 @@ class StreamingWorkerMixin:
 
     def _stream_sampling_params(self, params):
         from vllm import SamplingParams
-        from vllm.sampling_params import RequestOutputKind
+        from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
         # Requests carry plain JSON across Ray; the vLLM type is built here.
         params = dict(params)
         structured_outputs = params.get("structured_outputs")
         # A chat prompt's tool grammar arrives already built.
         if isinstance(structured_outputs, dict):
-            # Imported only when used, so plain streams don't depend on it.
-            from vllm.sampling_params import StructuredOutputsParams
-
             params["structured_outputs"] = (
                 StructuredOutputsParams(json=structured_outputs["json"])
                 if "json" in structured_outputs
@@ -1287,10 +1275,13 @@ class ClientStream(AsyncIterator):
                 or not _valid_delta_fields(event, isinstance(self.request.prompt, ChatPrompt))
             ):
                 raise StreamError("invalid_choice_event")
-            if (
+            wants_logprobs = (
                 kind in ("delta", "content_delta")
-                and "logprobs" in event
-                and not valid_delta_logprobs(event, self.params.get("logprobs"))
+                and self.params.get("logprobs") is not None
+            )
+            if ("logprobs" in event) != wants_logprobs or (
+                wants_logprobs
+                and not valid_delta_logprobs(event, self.params["logprobs"])
             ):
                 raise StreamError("invalid_choice_event")
             if kind != "choice_finished" and self.first_delta_time is None:

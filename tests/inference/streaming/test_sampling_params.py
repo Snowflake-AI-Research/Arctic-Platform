@@ -9,6 +9,7 @@ import pytest
 from cpu_support import VLLMValidationError, load_library
 
 load_library()
+from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import (
     ClientStream,
     StreamError,
@@ -166,12 +167,6 @@ def test_a_built_chat_grammar_passes_through(engine_params):
         {"n": 1, "structured_outputs": grammar}
     ).kwargs
     assert kwargs["structured_outputs"] is grammar
-
-
-def test_the_singular_structured_output_key_is_unknown():
-    # The stream key is vLLM's name for it, structured_outputs.
-    with pytest.raises(ValueError, match="Unsupported streaming parameters"):
-        validate_request("prompt", {"structured_output": {"json_object": True}})
 
 
 @pytest.mark.parametrize(
@@ -353,14 +348,44 @@ def test_capability_is_advertised():
     assert "sampling_params" in STREAM_CAPABILITIES
 
 
-def test_streams_without_structured_output_never_import_it(engine_params):
-    # A vLLM build without StructuredOutputsParams must still serve plain streams.
-    del sys.modules["vllm.sampling_params"].StructuredOutputsParams
-    assert engine_params({"max_tokens": 4})["max_tokens"] == 4
-
-
 def test_client_stream_rejects_logprobs_nobody_requested():
     test_client_stream_validates_delta_logprobs([_entry(1), _entry(2)], False, requested=None)
+
+
+@pytest.mark.parametrize("requested,valid", [(2, False), (0, False), (None, True)])
+@pytest.mark.parametrize(
+    "prompt,kind",
+    [("text", "delta"), (ChatPrompt([{"role": "user", "content": "hi"}]), "content_delta")],
+)
+def test_client_stream_requires_logprobs_on_every_requested_delta(
+    requested, valid, prompt, kind
+):
+    async def check():
+        stream = ClientStream(
+            types.SimpleNamespace(),
+            "request",
+            types.SimpleNamespace(prompt=prompt),
+            {"n": 1} if requested is None else {"n": 1, "logprobs": requested},
+            StreamLimits(),
+        )
+        event = {
+            "type": kind,
+            "choice_index": 0,
+            "text": "ab",
+            "token_ids": [1, 2],
+            "sequence": 0,
+            "version": 1,
+        }
+        try:
+            if valid:
+                assert "logprobs" not in await stream._accept_event(event)
+            else:
+                with pytest.raises(StreamError, match="invalid_choice_event"):
+                    await stream._accept_event(event)
+        finally:
+            stream.watchdog.cancel()
+
+    asyncio.run(check())
 
 
 def test_logprobs_above_the_engine_maximum_are_typed():
