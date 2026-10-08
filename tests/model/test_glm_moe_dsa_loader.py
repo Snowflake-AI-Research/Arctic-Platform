@@ -24,6 +24,7 @@ from torch import nn
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
+from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import build_model
 from arctic_platform.model.loaders.glm_moe_dsa import GlmMoeDsaOptions
 from arctic_platform.testing_utils import TestCasePlus
@@ -39,7 +40,10 @@ def test_selection_uses_model_type(tmp_path, composite):
             "text_config": config,
         }
     (tmp_path / "config.json").write_text(json.dumps(config))
-    spec = ModelSpec(model_path_or_name=str(tmp_path), parallelism=ParallelismConfig(expert_parallel=2))
+    spec = ModelSpec(
+        model_path_or_name=str(tmp_path),
+        parallelism=ParallelismConfig(expert_parallel=2),
+    )
     assert spec.loader == "glm_moe_dsa"
 
 
@@ -67,10 +71,22 @@ def test_loader_preserves_options_and_process_group(monkeypatch, backend):
             "tiled_mlp_token_chunk_size": 32,
             "weight_conversion_cache_dir": "",
             "trust_remote_code": False,
-            "ac_config": {"offload_config": {"pin_memory_enabled": False, "pin_memory_max_size_gib": 0}},
+            "ac_config": {
+                "offload_config": {
+                    "pin_memory_enabled": False,
+                    "pin_memory_max_size_gib": 0,
+                }
+            },
         },
     )
-    result = build_model(spec, parallel_groups={"ep_group": ep_group})
+    result = build_model(
+        spec,
+        parallel_groups={"ep_group": ep_group},
+        platform=PlatformCapabilities.for_accelerator(
+            "hopper",
+            ep_comm_backends=frozenset({backend}),
+        ),
+    )
     assert result.model is model
     assert seen["ep_group"] is ep_group
     assert seen["ep_size"] == 2
@@ -102,7 +118,10 @@ def test_unsupported_options_are_rejected(options):
 
 def test_omitted_fused_cross_entropy_defaults_to_liger(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm_moe_dsa"}))
-    spec = ModelSpec(model_path_or_name=str(tmp_path), parallelism=ParallelismConfig(expert_parallel=2))
+    spec = ModelSpec(
+        model_path_or_name=str(tmp_path),
+        parallelism=ParallelismConfig(expert_parallel=2),
+    )
     assert spec.loader_options["fused_cross_entropy"] == "liger"
 
     explicit = ModelSpec(

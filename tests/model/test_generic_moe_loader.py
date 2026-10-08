@@ -23,6 +23,7 @@ from torch import nn
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
+from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import build_model
 from arctic_platform.model.loaders.generic_moe import GENERIC_MOE_MODEL_TYPES
 
@@ -97,7 +98,14 @@ def test_loader_preserves_options_and_process_group(monkeypatch, tmp_path):
         parallelism=ParallelismConfig(expert_parallel=4, sequence_parallel=2),
         loader_options={"ep_comm_backend": "uccl", "fused_cross_entropy": False},
     )
-    result = build_model(spec, parallel_groups={"ep_group": ep_group, "sp_group": sp_group})
+    result = build_model(
+        spec,
+        parallel_groups={"ep_group": ep_group, "sp_group": sp_group},
+        platform=PlatformCapabilities.for_accelerator(
+            "hopper",
+            ep_comm_backends=frozenset({"uccl"}),
+        ),
+    )
     assert result.model is model
     assert seen["ep_group"] is ep_group
     assert seen["sp_group"] is sp_group
@@ -113,7 +121,14 @@ def test_sequence_parallel_requires_process_group(tmp_path):
         parallelism=ParallelismConfig(expert_parallel=2, sequence_parallel=2),
     )
     with pytest.raises(ValueError, match=r"parallel_groups\['sp_group'\]"):
-        build_model(spec, parallel_groups={"ep_group": object()})
+        build_model(
+            spec,
+            parallel_groups={"ep_group": object()},
+            platform=PlatformCapabilities.for_accelerator(
+                "hopper",
+                ep_comm_backends=frozenset({"deepep"}),
+            ),
+        )
 
 
 def test_peft_patch_is_rejected(tmp_path):

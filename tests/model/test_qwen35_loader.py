@@ -23,8 +23,8 @@ from torch import nn
 
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
-from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import Patches
+from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import build_model
 from arctic_platform.model import resolve_model_profile
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
@@ -41,7 +41,10 @@ def test_selection_uses_text_config_not_checkpoint_name(tmp_path, composite):
             "text_config": config,
         }
     (tmp_path / "config.json").write_text(json.dumps(config))
-    spec = ModelSpec(model_path_or_name=str(tmp_path), parallelism=ParallelismConfig(expert_parallel=2))
+    spec = ModelSpec(
+        model_path_or_name=str(tmp_path),
+        parallelism=ParallelismConfig(expert_parallel=2),
+    )
     assert spec.loader == "qwen3_5_moe"
 
 
@@ -86,10 +89,22 @@ def test_loader_preserves_options_and_process_groups(monkeypatch, backend):
             "tiled_mlp_token_chunk_size": 32,
             "weight_conversion_cache_dir": "",
             "trust_remote_code": True,
-            "ac_config": {"offload_config": {"pin_memory_enabled": False, "pin_memory_max_size_gib": 0}},
+            "ac_config": {
+                "offload_config": {
+                    "pin_memory_enabled": False,
+                    "pin_memory_max_size_gib": 0,
+                }
+            },
         },
     )
-    result = build_model(spec, parallel_groups={"ep_group": ep_group, "sp_group": sp_group})
+    result = build_model(
+        spec,
+        parallel_groups={"ep_group": ep_group, "sp_group": sp_group},
+        platform=PlatformCapabilities.for_accelerator(
+            "hopper",
+            ep_comm_backends=frozenset({backend}),
+        ),
+    )
     assert result.model is model
     assert seen["ep_group"] is ep_group and seen["sp_group"] is sp_group
     assert seen["ep_size"] == seen["sp_size"] == 2
@@ -150,7 +165,14 @@ def test_sequence_parallel_group_is_required():
         parallelism=ParallelismConfig(expert_parallel=2, sequence_parallel=2),
     )
     with pytest.raises(ValueError, match="sp_group"):
-        build_model(spec, parallel_groups={"ep_group": object()})
+        build_model(
+            spec,
+            parallel_groups={"ep_group": object()},
+            platform=PlatformCapabilities.for_accelerator(
+                "hopper",
+                ep_comm_backends=frozenset({"deepep"}),
+            ),
+        )
 
 
 @pytest.mark.parametrize("patches", [Patches(gradient_checkpointing=True), Patches(zorro_train={})])

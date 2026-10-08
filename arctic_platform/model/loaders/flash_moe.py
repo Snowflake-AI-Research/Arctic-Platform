@@ -75,7 +75,10 @@ def _validate_glm5_next(spec: ModelSpec) -> None:
         "GLM-5.3-Flash",
         allow_sequence_parallel=True,
     )
-    if spec.attn_implementation is not None and spec.attn_implementation not in (GLM53_ATTN_BACKEND, "flashmla"):
+    if spec.attn_implementation is not None and spec.attn_implementation not in (
+        GLM53_ATTN_BACKEND,
+        "flashmla",
+    ):
         raise ValueError(
             f"GLM-5.3-Flash training requires sparse MLA; got attn_implementation={spec.attn_implementation!r}"
         )
@@ -90,7 +93,10 @@ def _validate_qwen4_exp(spec: ModelSpec) -> None:
         "Qwen3.8-Flash-Next",
         allow_sequence_parallel=True,
     )
-    if spec.attn_implementation is not None and spec.attn_implementation not in (QWEN38_ATTN_BACKEND, "flex_attention"):
+    if spec.attn_implementation is not None and spec.attn_implementation not in (
+        QWEN38_ATTN_BACKEND,
+        "flex_attention",
+    ):
         raise ValueError(
             "Qwen3.8-Flash-Next training requires QSA FlexAttention; "
             f"got attn_implementation={spec.attn_implementation!r}"

@@ -111,13 +111,19 @@ class TestLoaderSelection:
         monkeypatch.setattr("transformers.AutoConfig.from_pretrained", lambda *a, **k: fake_config)
 
         _register("base", default=True)
-        _register("special", matches=lambda ctx: getattr(ctx.hf_config, "model_type", "") == "special")
+        _register(
+            "special",
+            matches=lambda ctx: getattr(ctx.hf_config, "model_type", "") == "special",
+        )
 
         assert ModelSpec(model_path_or_name="x").loader == "special"
 
     def test_multiple_matches_rejected(self, monkeypatch):
         """Two matching predicates are ambiguous and rejected."""
-        monkeypatch.setattr("transformers.AutoConfig.from_pretrained", lambda *a, **k: types.SimpleNamespace())
+        monkeypatch.setattr(
+            "transformers.AutoConfig.from_pretrained",
+            lambda *a, **k: types.SimpleNamespace(),
+        )
 
         _register("base", default=True)
         _register("m1", matches=lambda ctx: True)
@@ -313,7 +319,10 @@ class TestHuggingFaceLoader:
         model = nn.Module()
         model.config = types.SimpleNamespace(model_type="qwen3", use_cache=True)
         configured = []
-        monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
+        monkeypatch.setattr(
+            "transformers.AutoModelForCausalLM.from_pretrained",
+            lambda *args, **kwargs: model,
+        )
         monkeypatch.setattr(
             "arctic_platform.model.implementations.gpu.sp.transformers.apply_gated_delta_net_sequence_parallelism",
             lambda configured_model, group: configured.append((configured_model, group)) or 0,
@@ -355,7 +364,11 @@ class TestFromDsWorkerConfig:
     def test_liger_and_gc_flags_map(self):
         spec = ModelSpec.from_ds_worker_config(
             "x",
-            {"use_liger": True, "enable_gradient_checkpointing": False, "attn_implementation": "sdpa"},
+            {
+                "use_liger": True,
+                "enable_gradient_checkpointing": False,
+                "attn_implementation": "sdpa",
+            },
         )
         assert spec.patches.liger is True
         assert spec.patches.gradient_checkpointing is False
@@ -397,7 +410,11 @@ class TestFromDsWorkerConfig:
 
         spec = ModelSpec.from_ds_worker_config(
             "x",
-            {"attn_implementation": "flash_attention_2", "zorro_train_enable": True, "rollout_n": 4},
+            {
+                "attn_implementation": "flash_attention_2",
+                "zorro_train_enable": True,
+                "rollout_n": 4,
+            },
         )
         z = spec.patches.zorro_train
         assert z is not None
@@ -419,7 +436,11 @@ class TestLigerPatch:
         fake_monkey_patch = types.ModuleType("liger_kernel.transformers.monkey_patch")
         fake_monkey_patch._apply_liger_kernel_to_instance = lambda **kwargs: captured.update(kwargs)
         monkeypatch.setitem(sys.modules, "liger_kernel", types.ModuleType("liger_kernel"))
-        monkeypatch.setitem(sys.modules, "liger_kernel.transformers", types.ModuleType("liger_kernel.transformers"))
+        monkeypatch.setitem(
+            sys.modules,
+            "liger_kernel.transformers",
+            types.ModuleType("liger_kernel.transformers"),
+        )
         monkeypatch.setitem(sys.modules, "liger_kernel.transformers.monkey_patch", fake_monkey_patch)
 
         model = nn.Identity()
@@ -645,4 +666,7 @@ class TestZorroAndGcPatches:
         model = nn.Identity()
         model.config = types.SimpleNamespace(model_type="llama")
         with pytest.raises(ValueError, match="Unsupported model_type=llama"):
-            apply_zorro_train(model, _ctx(zorro_train=ZorroTrainPatch(response_len=1024, rollout_n=8, world_size=1)))
+            apply_zorro_train(
+                model,
+                _ctx(zorro_train=ZorroTrainPatch(response_len=1024, rollout_n=8, world_size=1)),
+            )

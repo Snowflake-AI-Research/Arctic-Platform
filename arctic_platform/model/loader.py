@@ -208,11 +208,7 @@ def resolve_model_profile(
 
     attention = spec.attn_implementation
     if attention is None:
-        attention = (
-            _platform_attention_default(platform)
-            if policy.attention == "platform"
-            else policy.attention
-        )
+        attention = _platform_attention_default(platform) if policy.attention == "platform" else policy.attention
     if attention.startswith("flash_attention_") and attention not in platform.attention_backends:
         raise ValueError(
             f"{attention} is the default for loader {spec.loader!r} on {platform.accelerator}, "
