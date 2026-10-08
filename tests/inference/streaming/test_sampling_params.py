@@ -354,6 +354,36 @@ def test_client_stream_rejects_logprobs_nobody_requested():
     test_client_stream_validates_delta_logprobs([_entry(1), _entry(2)], False, requested=None)
 
 
+@pytest.mark.parametrize("requested,valid", [(2, False), (0, False), (None, True)])
+def test_client_stream_requires_logprobs_on_every_requested_delta(requested, valid):
+    async def check():
+        stream = ClientStream(
+            types.SimpleNamespace(),
+            "request",
+            types.SimpleNamespace(),
+            {"n": 1} if requested is None else {"n": 1, "logprobs": requested},
+            StreamLimits(),
+        )
+        event = {
+            "type": "delta",
+            "choice_index": 0,
+            "text": "ab",
+            "token_ids": [1, 2],
+            "sequence": 0,
+            "version": 1,
+        }
+        try:
+            if valid:
+                assert "logprobs" not in await stream._accept_event(event)
+            else:
+                with pytest.raises(StreamError, match="invalid_choice_event"):
+                    await stream._accept_event(event)
+        finally:
+            stream.watchdog.cancel()
+
+    asyncio.run(check())
+
+
 def test_logprobs_above_the_engine_maximum_are_typed():
     error = VLLMValidationError(
         "Requested sample logprobs of 21, which is greater than max allowed: 20",

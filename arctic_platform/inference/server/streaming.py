@@ -1082,10 +1082,13 @@ class ClientStream(AsyncIterator):
                 or self.usage is not None
             ):
                 raise StreamError("invalid_choice_event")
-            if (
-                kind == "delta"
-                and "logprobs" in event
-                and not valid_delta_logprobs(event, self.params.get("logprobs"))
+            wants_logprobs = self.params.get("logprobs") is not None
+            if kind == "delta" and (
+                ("logprobs" in event) != wants_logprobs
+                or (
+                    wants_logprobs
+                    and not valid_delta_logprobs(event, self.params["logprobs"])
+                )
             ):
                 raise StreamError("invalid_choice_event")
             if kind == "delta" and self.first_delta_time is None:
