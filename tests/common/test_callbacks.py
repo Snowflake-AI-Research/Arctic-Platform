@@ -73,6 +73,14 @@ class _Metrics(MetricsCallback):
         return True
 
 
+class _OtherMetrics(_Metrics):
+    pass
+
+
+class _RankZeroMetrics(_Metrics):
+    rank_zero_only = True
+
+
 class _ErroringOnError(Callback):
     @classmethod
     def enabled(cls, training_config):
@@ -107,6 +115,21 @@ class TestCallbackRunner(unittest.TestCase):
         cb.log("x", 1)
         with self.assertRaises(ValueError):
             cb.log("x", 2)
+
+    def test_rank_zero_only_rejects_non_rank0_reduce(self):
+        cb = _RankZeroMetrics({})
+        with self.assertRaises(ValueError):
+            cb.log("x", 1, reduce=Reduce.SUM)
+        self.assertEqual(cb.pending, {})
+
+    def test_flush_name_clash_clears_pending(self):
+        runner = CallbackRunner([_Metrics, _OtherMetrics], {}, rank=0)
+        runner.callbacks[0].log("x", 1)
+        runner.callbacks[1].log("x", 2)
+        with self.assertRaises(ValueError):
+            runner.flush()
+        self.assertEqual(runner.callbacks[0].pending, {})
+        self.assertEqual(runner.callbacks[1].pending, {})
 
     def test_flush_clears_pending_for_next_step(self):
         runner = CallbackRunner([_Metrics], {}, rank=0)
@@ -162,6 +185,27 @@ class TestMergeMetrics(unittest.TestCase):
 
     def test_mismatched_metric_names_across_ranks_raises(self):
         per_rank = [{"x": (Reduce.SUM, 1)}, {"y": (Reduce.SUM, 1)}]
+        with self.assertRaises(ValueError):
+            merge_metrics(per_rank)
+
+    def test_mean_combines_nested_dicts_and_lists(self):
+        per_rank = [
+            {"d": (Reduce.MEAN, {"a": [2, 4]})},
+            {"d": (Reduce.MEAN, {"a": [4, 8]})},
+        ]
+        self.assertEqual(merge_metrics(per_rank), {"d": {"a": [3.0, 6.0]}})
+
+    def test_empty_per_rank_raises(self):
+        with self.assertRaises(ValueError):
+            merge_metrics([])
+
+    def test_list_length_mismatch_raises(self):
+        per_rank = [{"a": (Reduce.SUM, [1, 2])}, {"a": (Reduce.SUM, [1])}]
+        with self.assertRaises(ValueError):
+            merge_metrics(per_rank)
+
+    def test_mixed_dict_and_scalar_raises(self):
+        per_rank = [{"a": (Reduce.SUM, {"x": 1})}, {"a": (Reduce.SUM, 1)}]
         with self.assertRaises(ValueError):
             merge_metrics(per_rank)
 
