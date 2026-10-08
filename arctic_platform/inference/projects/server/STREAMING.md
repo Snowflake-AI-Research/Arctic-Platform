@@ -76,7 +76,8 @@ engine-owned. `logit_bias` maps at most 300 token IDs (integers or
 decimal strings) to biases in [-100,100]. vLLM checks the IDs against the loaded
 vocabulary; out-of-vocabulary IDs, or logit_bias on a speculative-decoding
 deployment, end the stream with `invalid_sampling_params`. `structured_outputs`
-is `{"json": <JSON schema object>}` (serialized schema <=64 KiB) or
+is `{"json": <JSON schema object>}` (serialized schema <=64 KiB, objects and
+arrays nested <=64 levels) or
 `{"json_object": true}`; the worker turns it into vLLM's
 `StructuredOutputsParams`. A schema that no vLLM structured-output backend
 accepts ends the stream with `invalid_structured_output`.

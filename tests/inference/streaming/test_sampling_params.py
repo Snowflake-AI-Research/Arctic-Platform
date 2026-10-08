@@ -134,6 +134,50 @@ def test_structured_output_schema_size_boundary():
         validate_request("prompt", {"structured_outputs": {"json": over}})
 
 
+def nested_schema(depth, container):
+    """Return a schema of ``depth`` nested objects or arrays."""
+    schema = {} if container == "object" else []
+    for _ in range(depth - 1):
+        schema = {"items": schema} if container == "object" else [schema]
+    return schema if container == "object" else {"enum": schema}
+
+
+def test_structured_output_schema_depth_boundary():
+    validate_request(
+        "prompt", {"structured_outputs": {"json": nested_schema(64, "object")}}
+    )
+    with pytest.raises(ValueError, match="nests deeper than 64 levels"):
+        validate_request(
+            "prompt", {"structured_outputs": {"json": nested_schema(65, "object")}}
+        )
+
+
+def test_structured_output_schema_deep_arrays_rejected():
+    # The {"enum": ...} wrapper adds one level, so 64 lists make depth 65.
+    validate_request(
+        "prompt", {"structured_outputs": {"json": nested_schema(63, "array")}}
+    )
+    with pytest.raises(ValueError, match="nests deeper than 64 levels"):
+        validate_request(
+            "prompt", {"structured_outputs": {"json": nested_schema(64, "array")}}
+        )
+
+
+def test_structured_output_schema_past_recursion_limit_reports_depth():
+    deep = nested_schema(sys.getrecursionlimit() + 100, "object")
+    with pytest.raises(ValueError, match="nests deeper than 64 levels"):
+        validate_request("prompt", {"structured_outputs": {"json": deep}})
+
+
+def test_structured_output_wide_shallow_schema_accepted():
+    wide = {
+        "type": "object",
+        "properties": {f"f{i}": {"type": "string"} for i in range(2000)},
+    }
+    assert len(json.dumps(wide)) > 32 * 1024
+    validate_request("prompt", {"structured_outputs": {"json": wide}})
+
+
 @pytest.mark.parametrize(
     "structured_outputs",
     [
