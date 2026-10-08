@@ -710,15 +710,12 @@ class StreamingWorkerMixin:
 
     def _stream_sampling_params(self, params):
         from vllm import SamplingParams
-        from vllm.sampling_params import RequestOutputKind
+        from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
         # Requests carry plain JSON across Ray; the vLLM type is built here.
         params = dict(params)
         structured_outputs = params.get("structured_outputs")
         if structured_outputs is not None:
-            # Imported only when used, so plain streams don't depend on it.
-            from vllm.sampling_params import StructuredOutputsParams
-
             params["structured_outputs"] = (
                 StructuredOutputsParams(json=structured_outputs["json"])
                 if "json" in structured_outputs

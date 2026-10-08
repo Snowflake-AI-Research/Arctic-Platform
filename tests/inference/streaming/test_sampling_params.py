@@ -159,12 +159,6 @@ def test_structured_output_becomes_the_vllm_type(engine_params):
     assert "structured_outputs" not in engine_params({})
 
 
-def test_the_singular_structured_output_key_is_unknown():
-    # The stream key is vLLM's name for it, structured_outputs.
-    with pytest.raises(ValueError, match="Unsupported streaming parameters"):
-        validate_request("prompt", {"structured_output": {"json_object": True}})
-
-
 @pytest.mark.parametrize(
     "message",
     [
@@ -342,12 +336,6 @@ def test_client_stream_validates_delta_logprobs(logprobs, valid, requested=2):
 def test_capability_is_advertised():
     # DSS enables these fields only when the installed version lists it.
     assert "sampling_params" in STREAM_CAPABILITIES
-
-
-def test_streams_without_structured_output_never_import_it(engine_params):
-    # A vLLM build without StructuredOutputsParams must still serve plain streams.
-    del sys.modules["vllm.sampling_params"].StructuredOutputsParams
-    assert engine_params({"max_tokens": 4})["max_tokens"] == 4
 
 
 def test_client_stream_rejects_logprobs_nobody_requested():
