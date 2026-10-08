@@ -1,10 +1,4 @@
-import os
 from dataclasses import dataclass
-
-# These must be present before importing DeepEP. Leave topology-specific
-# settings such as EP_DISABLE_GIN to the launcher.
-os.environ.setdefault("EP_JIT_CACHE_DIR", "/tmp/deepep25-jit")
-os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
 
 import deep_ep
 import torch
