@@ -22,6 +22,9 @@ from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     stage_sampling_params as _stage_dense_prompt_logprobs,
     take_dense as _take_dense_prompt_logprobs,
 )
+from arctic_platform.inference.vllm.spec_decode_grammar import (
+    ensure_spec_decode_grammar_fix,
+)
 from arctic_platform.inference.vllm.xgrammar_stop_mask import (
     ensure_xgrammar_stop_mask_fix,
 )
@@ -632,6 +635,7 @@ class InferenceWorker(StreamingWorkerMixin):
 
         _ensure_router_replay_vllm_patches()
         ensure_xgrammar_stop_mask_fix()
+        ensure_spec_decode_grammar_fix()
 
         from vllm.v1.engine.async_llm import AsyncLLM
 

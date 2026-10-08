@@ -126,6 +126,7 @@ def test_initialize_retries_vllm_engine_startup_on_address_in_use(monkeypatch):
     monkeypatch.setattr(worker_mod, "_ensure_arctic_vllm_patches", lambda: None)
     monkeypatch.setattr(worker_mod, "_ensure_router_replay_vllm_patches", lambda: None)
     monkeypatch.setattr(worker_mod, "ensure_xgrammar_stop_mask_fix", lambda: None)
+    monkeypatch.setattr(worker_mod, "ensure_spec_decode_grammar_fix", lambda: None)
     monkeypatch.setattr(
         worker_mod,
         "_create_async_engine_args",
