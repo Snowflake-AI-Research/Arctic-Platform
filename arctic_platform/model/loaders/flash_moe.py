@@ -24,8 +24,8 @@ from __future__ import annotations
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
-from arctic_platform.model.loader import LoaderPolicy
 from arctic_platform.model.loader import register_loader
+from arctic_platform.model.loader import resolve_spec_with_defaults
 from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
@@ -109,6 +109,33 @@ def _validate_qwen4_exp(spec: ModelSpec) -> None:
         )
 
 
+def _resolve_glm5_next_spec(spec, platform):
+    return resolve_spec_with_defaults(
+        spec,
+        platform,
+        attention="sparse_mla",
+        ep_comm_backend="uccl",
+        sp_strategy="native",
+        label_contract="logit_aligned",
+        requires_weight_conversion=True,
+        model_forward_requires_labels=True,
+    )
+
+
+def _resolve_qwen4_exp_spec(spec, platform):
+    return resolve_spec_with_defaults(
+        spec,
+        platform,
+        attention="qsa_flex",
+        ep_comm_backend="uccl",
+        sp_strategy="native",
+        sp_requires_head_divisibility=False,
+        label_contract="logit_aligned",
+        requires_weight_conversion=True,
+        model_forward_requires_labels=True,
+    )
+
+
 def _load(ctx: LoaderContext, load_model) -> LoadedModel:
     groups = ctx.parallel_groups or {}
     if groups.get("ep_group") is None:
@@ -135,14 +162,7 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
     matches=_matches("glm5_next"),
     options=GenericMoeOptions,
     validate_spec=_validate_glm5_next,
-    policy=LoaderPolicy(
-        attention="sparse_mla",
-        ep_comm_backend="uccl",
-        sp_strategy="native",
-        label_contract="logit_aligned",
-        requires_weight_conversion=True,
-        model_forward_requires_labels=True,
-    ),
+    resolve_spec=_resolve_glm5_next_spec,
 )
 def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.glm53.deepspeed_integration import load_glm5_next_model
@@ -155,15 +175,7 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     matches=_matches("qwen4_exp"),
     options=GenericMoeOptions,
     validate_spec=_validate_qwen4_exp,
-    policy=LoaderPolicy(
-        attention="qsa_flex",
-        ep_comm_backend="uccl",
-        sp_strategy="native",
-        sp_requires_head_divisibility=False,
-        label_contract="logit_aligned",
-        requires_weight_conversion=True,
-        model_forward_requires_labels=True,
-    ),
+    resolve_spec=_resolve_qwen4_exp_spec,
 )
 def load_qwen4_exp(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import load_qwen4_exp_model

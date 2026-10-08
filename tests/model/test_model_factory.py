@@ -70,7 +70,12 @@ def _ctx(**patch_flags) -> LoaderContext:
 def _register(name, *, matches=None, default=False):
     """Register a stub loader; the autouse fixture restores the registry afterwards."""
 
-    @register_loader(name, matches=matches, default=default)
+    @register_loader(
+        name,
+        resolve_spec=loader_mod.resolve_spec_with_defaults,
+        matches=matches,
+        default=default,
+    )
     def _loader(ctx: LoaderContext) -> LoadedModel:
         return LoadedModel(model=nn.Identity())
 
@@ -137,7 +142,7 @@ class TestLoaderSelection:
         built = nn.Linear(1, 1)
         specs = []
 
-        @register_loader("fake")
+        @register_loader("fake", resolve_spec=loader_mod.resolve_spec_with_defaults)
         def _fake(ctx: LoaderContext) -> LoadedModel:
             specs.append(ctx.spec)
             return LoadedModel(model=built)

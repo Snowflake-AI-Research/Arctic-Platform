@@ -29,8 +29,8 @@ from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
-from arctic_platform.model.loader import LoaderPolicy
 from arctic_platform.model.loader import register_loader
+from arctic_platform.model.loader import resolve_spec_with_defaults
 from arctic_platform.model.loaders.qwen3_5_moe import DebugModelOptions
 
 GENERIC_MOE_MODEL_TYPES = frozenset({"qwen3_moe", "glm4_moe", "minimax", "minimax_m2", "afmoe", "nemotron_h"})
@@ -91,18 +91,24 @@ def _validate_spec(spec: ModelSpec) -> None:
         )
 
 
-@register_loader(
-    "generic_moe",
-    matches=_matches,
-    options=GenericMoeOptions,
-    validate_spec=_validate_spec,
-    policy=LoaderPolicy(
+def _resolve_spec(spec, platform):
+    return resolve_spec_with_defaults(
+        spec,
+        platform,
         ep_comm_backend="deepep",
         sp_strategy="native",
         label_contract="logit_aligned",
         requires_weight_conversion=True,
         model_forward_requires_labels=True,
-    ),
+    )
+
+
+@register_loader(
+    "generic_moe",
+    matches=_matches,
+    options=GenericMoeOptions,
+    validate_spec=_validate_spec,
+    resolve_spec=_resolve_spec,
 )
 def load_generic_moe(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism

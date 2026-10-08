@@ -101,26 +101,16 @@ class LoadedModel:
 Loader = Callable[[LoaderContext], LoadedModel]
 Matcher = Callable[[LoaderContext], bool]
 SpecValidator = Callable[[ModelSpec], None]
-
-
-@dataclass(frozen=True)
-class LoaderPolicy:
-    attention: Literal["platform"] | str = "platform"
-    ep_comm_backend: Literal["deepep", "uccl"] | None = None
-    sp_strategy: Literal["transformers_ulysses", "native"] = "transformers_ulysses"
-    sp_requires_head_divisibility: bool = True
-    label_contract: Literal["causal_labels", "logit_aligned"] = "causal_labels"
-    requires_weight_conversion: bool = False
-    model_forward_requires_labels: bool = False
+SpecResolver = Callable[[ModelSpec, PlatformCapabilities], ResolvedModelSpec]
 
 
 @dataclass
 class _LoaderEntry:
     fn: Loader
     matches: Matcher | None
+    resolve_spec: SpecResolver
     options: type[BaseModel] | None = None
     validate_spec: SpecValidator | None = None
-    policy: LoaderPolicy = field(default_factory=LoaderPolicy)
 
 
 _LOADERS: dict[str, _LoaderEntry] = {}
@@ -129,16 +119,16 @@ _DEFAULT_LOADER: str | None = None
 
 def register_loader(
     name: str,
+    resolve_spec: SpecResolver,
     matches: Matcher | None = None,
     default: bool = False,
     options: type[BaseModel] | None = None,
     validate_spec: SpecValidator | None = None,
-    policy: LoaderPolicy | None = None,
 ) -> Callable[[Loader], Loader]:
     """Register a loader by name.
 
-    Optionally give it a ``matches`` predicate, mark it the ``default``, or attach an
-    ``options`` pydantic model and resolution ``policy``.
+    ``resolve_spec`` applies loader-specific decisions after selection. A loader may
+    also have a ``matches`` predicate, be the ``default``, or validate an ``options`` model.
     """
 
     def decorator(fn: Loader) -> Loader:
@@ -150,9 +140,9 @@ def register_loader(
         _LOADERS[name] = _LoaderEntry(
             fn=fn,
             matches=matches,
+            resolve_spec=resolve_spec,
             options=options,
             validate_spec=validate_spec,
-            policy=policy or LoaderPolicy(),
         )
         return fn
 
@@ -182,42 +172,46 @@ def _platform_attention_default(platform: PlatformCapabilities) -> str:
     }.get(platform.accelerator, "sdpa")
 
 
-def resolve_model_spec(
+def resolve_spec_with_defaults(
     spec: ModelSpec,
-    platform: PlatformCapabilities | None = None,
+    platform: PlatformCapabilities,
+    *,
+    attention: Literal["platform"] | str = "platform",
+    ep_comm_backend: Literal["deepep", "uccl"] | None = None,
+    sp_strategy: Literal["transformers_ulysses", "native"] = "transformers_ulysses",
+    sp_requires_head_divisibility: bool = True,
+    label_contract: Literal["causal_labels", "logit_aligned"] = "causal_labels",
+    requires_weight_conversion: bool = False,
+    model_forward_requires_labels: bool = False,
 ) -> ResolvedModelSpec:
-    if isinstance(spec, ResolvedModelSpec):
-        return spec
     if spec.loader is None:
         raise ValueError("ModelSpec.loader must be selected before platform-dependent fields are resolved")
-    platform = platform or PlatformCapabilities.detect()
     entry = _LOADERS[spec.loader]
-    policy = entry.policy
 
     resolved = spec.model_copy(deep=True)
-    attention = resolved.attn_implementation
-    if attention is None:
-        attention = _platform_attention_default(platform) if policy.attention == "platform" else policy.attention
-    if attention.startswith("flash_attention_") and attention not in platform.attention_backends:
+    resolved_attention = resolved.attn_implementation
+    if resolved_attention is None:
+        resolved_attention = _platform_attention_default(platform) if attention == "platform" else attention
+    if resolved_attention.startswith("flash_attention_") and resolved_attention not in platform.attention_backends:
         raise ValueError(
-            f"{attention} is the default for loader {spec.loader!r} on {platform.accelerator}, "
+            f"{resolved_attention} is the default for loader {spec.loader!r} on {platform.accelerator}, "
             f"but the backend is unavailable; available={sorted(platform.attention_backends)}"
         )
 
-    ep_comm_backend = None
+    resolved_ep_comm_backend = None
     if resolved.parallelism.expert_parallel > 1:
         requested_backend = resolved.loader_options.get("ep_comm_backend")
-        ep_comm_backend = requested_backend or policy.ep_comm_backend
-        if ep_comm_backend is None:
-            raise ValueError(f"loader {spec.loader!r} has no expert-parallel communication policy")
-        if ep_comm_backend not in platform.ep_comm_backends:
+        resolved_ep_comm_backend = requested_backend or ep_comm_backend
+        if resolved_ep_comm_backend is None:
+            raise ValueError(f"loader {spec.loader!r} did not resolve an expert-parallel communication backend")
+        if resolved_ep_comm_backend not in platform.ep_comm_backends:
             raise ValueError(
-                f"{ep_comm_backend} is required by loader {spec.loader!r}, "
+                f"{resolved_ep_comm_backend} is required by loader {spec.loader!r}, "
                 f"but the backend is unavailable; available={sorted(platform.ep_comm_backends)}"
             )
-        resolved.loader_options["ep_comm_backend"] = ep_comm_backend
+        resolved.loader_options["ep_comm_backend"] = resolved_ep_comm_backend
 
-    resolved.attn_implementation = attention
+    resolved.attn_implementation = resolved_attention
     if entry.options is not None:
         resolved.loader_options = entry.options.model_validate(resolved.loader_options).model_dump()
 
@@ -226,14 +220,25 @@ def resolve_model_spec(
         fused_cross_entropy = "liger"
     return ResolvedModelSpec(
         **resolved.model_dump(),
-        ep_comm_backend=ep_comm_backend,
-        sp_strategy=policy.sp_strategy,
-        sp_requires_head_divisibility=policy.sp_requires_head_divisibility,
-        label_contract=policy.label_contract,
-        requires_weight_conversion=policy.requires_weight_conversion,
-        model_forward_requires_labels=policy.model_forward_requires_labels,
+        ep_comm_backend=resolved_ep_comm_backend,
+        sp_strategy=sp_strategy,
+        sp_requires_head_divisibility=sp_requires_head_divisibility,
+        label_contract=label_contract,
+        requires_weight_conversion=requires_weight_conversion,
+        model_forward_requires_labels=model_forward_requires_labels,
         fused_cross_entropy=fused_cross_entropy,
     )
+
+
+def resolve_model_spec(
+    spec: ModelSpec,
+    platform: PlatformCapabilities | None = None,
+) -> ResolvedModelSpec:
+    if isinstance(spec, ResolvedModelSpec):
+        return spec
+    if spec.loader is None:
+        raise ValueError("ModelSpec.loader must be selected before platform-dependent fields are resolved")
+    return _LOADERS[spec.loader].resolve_spec(spec, platform or PlatformCapabilities.detect())
 
 
 def resolve_loader_name(spec: ModelSpec) -> str:

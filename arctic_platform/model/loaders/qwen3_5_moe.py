@@ -29,8 +29,8 @@ from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
-from arctic_platform.model.loader import LoaderPolicy
 from arctic_platform.model.loader import register_loader
+from arctic_platform.model.loader import resolve_spec_with_defaults
 
 # Declarative options owned by the qwen3_5_moe loader.
 
@@ -102,18 +102,24 @@ def _validate_spec(spec: ModelSpec) -> None:
         raise ValueError("qwen3_5_moe uses loader_options.ac_config and does not support generic forward patches")
 
 
-@register_loader(
-    "qwen3_5_moe",
-    matches=_matches,
-    options=Qwen3_5MoeOptions,
-    validate_spec=_validate_spec,
-    policy=LoaderPolicy(
+def _resolve_spec(spec, platform):
+    return resolve_spec_with_defaults(
+        spec,
+        platform,
         ep_comm_backend="deepep",
         sp_strategy="native",
         label_contract="logit_aligned",
         requires_weight_conversion=True,
         model_forward_requires_labels=True,
-    ),
+    )
+
+
+@register_loader(
+    "qwen3_5_moe",
+    matches=_matches,
+    options=Qwen3_5MoeOptions,
+    validate_spec=_validate_spec,
+    resolve_spec=_resolve_spec,
 )
 def load_qwen3_5_moe(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism

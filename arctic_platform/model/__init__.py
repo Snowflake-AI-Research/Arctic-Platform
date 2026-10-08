@@ -32,7 +32,6 @@ from arctic_platform.model.config import ZorroTrainPatch
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
-from arctic_platform.model.loader import LoaderPolicy
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import resolve_model_spec
 from arctic_platform.model.loader import select_loader
@@ -50,7 +49,6 @@ __all__ = [
     "ActivationOffloadConfig",
     "ActivationOffloadPatch",
     "LoadedModel",
-    "LoaderPolicy",
     "LoaderContext",
     "LmHeadPatch",
     "CompilePatch",
