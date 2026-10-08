@@ -1,9 +1,31 @@
-"""Per-request records, sampled engine gauges, and lifetime engine counters.
+"""Per-replica + per-request metrics collection for the Arctic Inference server.
 
-Requests and snapshots use bounded rings drained by the API and DSS job logger.
-EngineTotals accumulate every iteration before snapshot thinning; drains never
-reset them. Difference totals within one started_at epoch to measure intervals.
-The vLLM logger and worker share a process-singleton collector per engine index.
+Two record types:
+
+  * :class:`ReplicaSnapshot` — emitted at fixed intervals from inside vLLM's
+    ``AsyncLLM`` step loop via a custom :class:`StatLoggerBase`. One snapshot
+    captures the replica's KV-cache utilisation, running/pending request
+    counts, the scheduler-side concurrency limit, and the number of tokens
+    scheduled in the most recent step.
+
+  * :class:`RequestRecord` — emitted by the :class:`Scheduler` once per
+    generation call. Captures the assigned replica, the arrival /
+    submission / completion wall-clock timestamps, and the prompt /
+    generation / prefix-cache token counts read off the worker's reply.
+
+The collectors are bounded ring buffers; ``drain()`` returns the buffered
+items and clears the buffer. Consumers (the API ``/metrics`` route, the
+ray_dss zone server, etc.) call ``drain`` periodically so that memory stays
+flat regardless of how often the engine produces snapshots.
+
+The vLLM stat logger lives in the engine process. Because each
+``InferenceWorker`` Ray actor runs its own engine (and process), the
+collector is a process-singleton — the stat logger and the worker share the
+same instance via :func:`get_collector`.
+
+:class:`EngineTotals` accumulates speculative-decoding and preemption counters on every
+iteration, before snapshot thinning; ``drain()`` never resets them, so consumers difference
+totals within one ``started_at`` epoch to measure an interval.
 """
 
 from __future__ import annotations
