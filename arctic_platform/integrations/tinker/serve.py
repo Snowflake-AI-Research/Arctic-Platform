@@ -12,17 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Serve Tinker's HTTP API against Cortex Training.
+"""Provision a Cortex job for the in-process Tinker client.
 
-Run this, point ``TINKER_BASE_URL`` at it, and an unmodified ``tinker-cookbook``
-recipe trains on Cortex::
-
-    python -m arctic_platform.integrations.tinker.serve --config conn.json \\
-        --model Qwen/Qwen3-0.6B --training-gpus 1 --sampling-gpus 1
+Recipes enter through ``python -m arctic_platform.tinker.run``. That module
+builds a :class:`TinkerServeConfig` from ``--training-gpus`` and
+``--sampling-gpus`` and calls :func:`_client_config`. ``TINKER_BASE_URL`` is
+not part of that path.
 
 Provisioning is not expressible in Tinker's protocol -- there is no verb for
 "give me four GPUs with ZeRO-2 and FA3" -- so the job is created here from
-flags and the Tinker surface is bound onto it.
+those counts and the Tinker calls are bound onto it.
 """
 
 from __future__ import annotations

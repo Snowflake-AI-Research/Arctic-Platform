@@ -28,6 +28,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import os
 import logging
 import time
 from typing import Any
@@ -326,9 +327,12 @@ class CortexTransport(Transport):
         else:
             # A mutating create: only retry when the request provably never landed,
             # so we can't spawn duplicate jobs (matches the neutrino client).
-            created = self._send(
-                "POST", self._prefix, retry_on=_is_connect_error, json={"sub_job_configs": self._sub_job_configs()}
-            )
+            body: dict = {"sub_job_configs": self._sub_job_configs()}
+            # Shared schema reports submitted_by=ADMIN; the comment is the ownership signal.
+            comment = os.environ.get("CORTEX_JOB_COMMENT")
+            if comment:
+                body["comment"] = comment
+            created = self._send("POST", self._prefix, retry_on=_is_connect_error, json=body)
             self.job_id = created["job_id"]
             # Logged before the wait: a job can stay PLACING for a long time, and its id
             # is the only way to cancel it if this process stops first.

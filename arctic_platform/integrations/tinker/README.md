@@ -1,24 +1,34 @@
 # Tinker integration
 
-This integration serves Tinker's HTTP API over Cortex Training. Compatible
-`tinker-cookbook` recipes run unchanged except for configuration such as
-`TINKER_BASE_URL`, model, and training parameters.
+Cookbook recipes run on Cortex by importing `arctic_platform.tinker` in place
+of `tinker`. That import registers itself as `sys.modules["tinker"]`, so the
+recipe's existing `import tinker` lines use Cortex. There is no local Tinker
+server and no `TINKER_BASE_URL`.
+
+GPU counts are arguments on the launcher, the same ones the Cortex client CLI
+takes (`--training-gpus`, `--sampling-gpus`). Connection settings stay in
+`ARCTIC_CORTEX_*`.
+
+`python -m tinker_cookbook...` never runs a user import first, so start the
+recipe through `python -m arctic_platform.tinker.run`. A script you own can
+instead put `from arctic_platform import tinker` on its first line and
+construct `tinker.ServiceClient(training_gpus=..., sampling_gpus=...)`.
 
 Validated with `tinker==0.25.0` and `tinker-cookbook==0.5.5`.
 
 ## Request path
 
-`serve.py` creates the Cortex jobs and registers handlers on `router.py`. The router speaks Tinker's HTTP API and does not import Cortex. `cortex.py` is the only file that does.
+`arctic_platform.tinker` opens the Cortex jobs and calls the handlers in
+`cortex.py` in-process. `router.py` converts datums, losses, and sampling
+params, and does not import Cortex. `cortex.py` is the only file that does.
 
 ```mermaid
 flowchart LR
-  cookbook["tinker-cookbook"] --> sdk["tinker SDK"]
-  sdk -->|"HTTP, JSON or protobuf"| router["router.py"]
-  router --> proto["proto_wire.py"]
+  cookbook["tinker-cookbook"] --> client["arctic_platform.tinker"]
+  client --> router["router.py datum conversion"]
   router --> cortex["cortex.py"]
   cortex -->|"forward_backward, optim_step, weight sync"| train["Cortex training job"]
   cortex -->|"sample"| sample["Cortex sampling job"]
-  cortex -->|"teacher compute_logprobs"| teacher["Cortex teacher job"]
 ```
 
 `forward` has no handler, so the router returns 400 before any Cortex call. A training request that is still running after 30 seconds is answered as a future; the SDK polls `retrieve_future` instead of sending the work again.
@@ -46,7 +56,7 @@ pip install "arctic_platform[tinker]"
 pip install "tinker==0.25.0" "tinker-cookbook[math-rl]==0.5.5"
 ```
 
-The server is CPU-only. Cortex runs the training and sampling workers.
+The recipe process is CPU-only. Cortex runs the training and sampling workers.
 
 ## Configure Cortex
 
@@ -65,52 +75,18 @@ The account needs:
 
 A job can remain in `PLACING` while it waits for GPU capacity.
 
-## Start the server
+## Run a cookbook recipe
 
 ```bash
-python -m arctic_platform.integrations.tinker.serve \
-    --model Qwen/Qwen3-0.6B \
+python -m arctic_platform.tinker.run \
     --training-gpus 1 \
     --sampling-gpus 1 \
     --max-prompt-length 1024 \
     --max-response-length 512 \
-    --zero-stage 2 \
-    --port 8112
-```
-
-Check readiness:
-
-```bash
-curl -s http://127.0.0.1:8112/api/v1/get_server_capabilities
-```
-
-Use `--job-id <id>` to attach to an existing Cortex job. The server releases
-jobs it creates when it shuts down; attached jobs remain running.
-
-On-policy distillation samples a teacher with
-`create_sampling_client(base_model=...)` and scores the student's rollouts with
-`compute_logprobs`. Start the server with the teacher as well:
-
-```bash
-python -m arctic_platform.integrations.tinker.serve \
-    --model Qwen/Qwen3.5-9B-Base \
-    --teacher-model Qwen/Qwen3.5-9B \
-    --teacher-sampling-gpus 2 \
-    ...
-```
-
-The teacher runs from its base weights as a sampling-only Cortex job of its
-own, created and released with the server. A sampler for a model that is
-neither the trained model nor the teacher returns 400.
-
-## Run a cookbook recipe
-
-```bash
-TINKER_API_KEY=tml-dummy python -m tinker_cookbook.recipes.math_rl.train \
-    base_url=http://127.0.0.1:8112 \
+    tinker_cookbook.recipes.math_rl.train \
     model_name=Qwen/Qwen3-0.6B \
     renderer_name=qwen3_disable_thinking \
-    lora_rank=0 \
+    lora_rank=32 \
     env=gsm8k \
     group_size=8 \
     groups_per_batch=8 \
@@ -121,30 +97,41 @@ TINKER_API_KEY=tml-dummy python -m tinker_cookbook.recipes.math_rl.train \
     eval_every=0
 ```
 
+`base_url` on the recipe is ignored. The process releases the Cortex job on
+exit.
+
+A handwritten script:
+
+```python
+from arctic_platform import tinker
+
+service = tinker.ServiceClient(training_gpus=1, sampling_gpus=1)
+training = await service.create_lora_training_client_async("Qwen/Qwen3-0.6B", rank=32)
+```
+
 Required settings:
 
-- `TINKER_API_KEY` must start with `tml-`; the value is otherwise unused.
 - Set `renderer_name` explicitly for models absent from the cookbook's
   recommendation table.
-- Use the recipe's `lora_rank` as the server's `--lora-rank` (see below).
+- `lora_rank` on the recipe is the LoRA rank provisioned on the Cortex job.
 - Use `temperature=1.0`.
-- Keep `max_tokens < --max-response-length`.
+- Keep `max_tokens` below `--max-response-length`.
 - Ensure rendered prompts fit `--max-prompt-length`.
-- Use `save_every=0` unless acknowledgment-only saves are acceptable.
+- Use `save_every=0`. The final checkpoint call returns a local
+  `cortex://` path and does not upload weights.
 
 Training rows are never truncated. A prompt or response longer than its limit
 is accepted as long as the whole datum fits
-`--max-prompt-length + --max-response-length`; a longer datum returns 400.
+`--max-prompt-length + --max-response-length`; a longer datum is refused.
 
 ### LoRA and the optimizer
 
-The adapter and the optimizer are part of the Cortex job, so the server fixes
-them at start-up:
+The adapter and the optimizer are part of the Cortex job, so
+`create_lora_training_client_async` fixes them when the job is created:
 
-- `--lora-rank N` trains a LoRA adapter of rank `N` with `--lora-alpha`
-  (default `32`, Tinker's) on `--lora-modules` (default `mlp,attn,unembed`,
-  Tinker's default `train_mlp`, `train_attn`, and `train_unembed`). Weight sync
-  sends only the adapter. `--lora-rank 0` (the default) is full fine-tuning.
+- `rank=N` trains a LoRA adapter of rank `N` with alpha `32` (Tinker's) on
+  `mlp,attn,unembed` (Tinker's `train_mlp`, `train_attn`, and `train_unembed`).
+  Weight sync sends only the adapter. Rank `0` is full fine-tuning.
 - Adam uses `--adam-beta1 0.9 --adam-beta2 0.95 --adam-eps 1e-8
   --weight-decay 0 --grad-clip-norm 0`, the values the cookbook sends.
 
@@ -298,7 +285,8 @@ handling. They do not require a Cortex account or GPU.
 
 | File | Role |
 |---|---|
-| `router.py` | Tinker API routes, sessions, futures, and datum conversion |
+| `arctic_platform/tinker/` | In-process `tinker` module and recipe launcher |
+| `router.py` | Datum conversion, loss checks, and the HTTP routes those functions share |
 | `proto_wire.py` | Tinker protobuf request and response codec |
 | `cortex.py` | Cortex request lowering and tensor alignment |
-| `serve.py` | Cortex job provisioning and ASGI server |
+| `serve.py` | Cortex job provisioning (`TinkerServeConfig`) used by the in-process client |
