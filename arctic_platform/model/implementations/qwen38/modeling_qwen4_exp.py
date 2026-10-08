@@ -20,10 +20,13 @@ import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch import nn
+from transformers.cache_utils import Cache
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
 from transformers.models.qwen4_exp.modeling_qwen4_exp import _build_layer_multipliers
+
+from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
 
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.moe import FeedForward
@@ -102,6 +105,49 @@ class Qwen4ExpSparseMoePrimeRL(MoE):
         return routed_output + shared_output.view_as(hidden_states)
 
 
+class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        conv_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        ple_input_ids: torch.LongTensor | None = None,
+        routed_experts: Tensor | None = None,
+        **kwargs,
+    ) -> torch.FloatTensor:
+        if self.ple is not None:
+            hidden_states = hidden_states + self.ple(
+                hidden_states, ple_input_ids, past_key_values, conv_mask=conv_mask
+            )
+
+        hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
+        if self.layer_type == "linear_attention":
+            hidden_states = self.linear_attn(
+                hidden_states, cache_params=past_key_values, attention_mask=conv_mask, **kwargs
+            )
+        else:
+            hidden_states, _ = self.self_attn(
+                hidden_states,
+                position_embeddings,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                **kwargs,
+            )
+
+        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+        hidden_states = hyper_input + injection.flatten(-2)
+
+        hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
+        routes = routed_experts[:, :, self._replay_layer_idx, :] if routed_experts is not None else None
+        hidden_states = self.mlp(hidden_states, routed_experts=routes)
+
+        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+        hidden_states = hyper_input + injection.flatten(-2)
+        return hidden_states
+
+
 class Qwen4ExpForConditionalGenerationPrimeRL(
     Qwen4ExpForConditionalGeneration,
     PreTrainedModelPrimeRL,
@@ -115,7 +161,9 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
         super().__init__(config)
         text_config = config.text_config
         use_grouped_mm = getattr(config, "use_grouped_mm", True)
-        for layer in self.model.language_model.layers:
+        for layer_idx, layer in enumerate(self.model.language_model.layers):
+            layer.__class__ = Qwen4ExpTextDecoderLayerPrimeRL
+            layer._replay_layer_idx = layer_idx
             if isinstance(layer.mlp, Qwen4ExpTextSparseMoeBlock):
                 layer.mlp = Qwen4ExpSparseMoePrimeRL(
                     text_config,
