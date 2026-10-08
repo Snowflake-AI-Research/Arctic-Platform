@@ -108,6 +108,7 @@ class LoaderRuntimePolicy:
     attention: Literal["platform"] | str = "platform"
     ep_comm_backend: Literal["deepep", "uccl"] | None = None
     sp_strategy: Literal["transformers_ulysses", "native"] = "transformers_ulysses"
+    sp_requires_head_divisibility: bool = True
     label_contract: Literal["causal_labels", "logit_aligned"] = "causal_labels"
     requires_weight_conversion: bool = False
     model_forward_requires_labels: bool = False
@@ -120,6 +121,7 @@ class ModelRuntimeProfile(BaseModel):
     attn_implementation: str
     ep_comm_backend: Literal["deepep", "uccl"] | None = None
     sp_strategy: Literal["transformers_ulysses", "native"]
+    sp_requires_head_divisibility: bool = True
     label_contract: Literal["causal_labels", "logit_aligned"]
     requires_weight_conversion: bool
     model_forward_requires_labels: bool
@@ -242,6 +244,7 @@ def resolve_model_profile(
         attn_implementation=attention,
         ep_comm_backend=ep_comm_backend,
         sp_strategy=policy.sp_strategy,
+        sp_requires_head_divisibility=policy.sp_requires_head_divisibility,
         label_contract=policy.label_contract,
         requires_weight_conversion=policy.requires_weight_conversion,
         model_forward_requires_labels=policy.model_forward_requires_labels,

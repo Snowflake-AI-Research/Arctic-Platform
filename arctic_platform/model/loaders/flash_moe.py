@@ -153,6 +153,7 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
         attention="qsa_flex",
         ep_comm_backend="uccl",
         sp_strategy="native",
+        sp_requires_head_divisibility=False,
         label_contract="logit_aligned",
         requires_weight_conversion=True,
         model_forward_requires_labels=True,
