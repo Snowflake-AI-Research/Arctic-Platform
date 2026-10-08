@@ -786,7 +786,7 @@ class EngineStream:
             raise StreamError("context_length_exceeded", context_limit_source="prompt")
         if "max_tokens" not in self.params:
             self.params["max_tokens"] = min(room, DEFAULT_CHAT_MAX_TOKENS)
-            if self.params.get("thinking_token_budget", 0) > self.params["max_tokens"]:
+            if (self.params.get("thinking_token_budget") or 0) > self.params["max_tokens"]:
                 raise StreamError("invalid_sampling_params")
         if (
             rendered.structured_outputs is not None

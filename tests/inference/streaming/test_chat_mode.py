@@ -311,6 +311,12 @@ def test_named_tool_choice_finishes_with_stop():
     assert finish["finish_reason"] == "stop"
 
 
+def test_an_explicit_null_thinking_budget_counts_as_omitted():
+    worker, events = stream(chat("hi"), {"thinking_token_budget": None})
+    assert events[-1]["type"] == "completed"
+    assert worker.llm.calls[0][1]["max_tokens"] == 4096
+
+
 def test_no_logprobs_key_unless_requested():
     _, events = stream(chat("What is 2+2?"))
     assert all("logprobs" not in e and "token_ids" not in e for e in events)
