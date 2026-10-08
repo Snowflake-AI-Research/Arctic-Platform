@@ -1,6 +1,7 @@
 """Stream sampling parameters: request validation, engine arguments, error codes."""
 
 import asyncio
+import json
 import sys
 import types
 
@@ -9,14 +10,17 @@ import pytest
 from cpu_support import VLLMValidationError, load_library
 
 load_library()
+from arctic_platform.inference.server import streaming
 from arctic_platform.inference.server.streaming import (
     ClientStream,
+    EventBuffer,
     StreamError,
     StreamingWorkerMixin,
     STREAM_CAPABILITIES,
     StreamLimits,
     classify_engine_error,
     delta_logprobs,
+    event_size,
     validate_request,
 )
 
@@ -285,6 +289,33 @@ def _alternative(token_id):
     return {"token_id": token_id, "token": "t", "logprob": -2.0}
 
 
+def _delta(**fields):
+    return {
+        "type": "delta",
+        "choice_index": 0,
+        "text": "ab",
+        "token_ids": [1, 2],
+        "sequence": 0,
+        "version": 1,
+        **fields,
+    }
+
+
+async def accept_delta(event, requested):
+    """Pass ``event`` to a one-choice stream that asked for ``requested`` logprobs."""
+    stream = ClientStream(
+        types.SimpleNamespace(),
+        "request",
+        types.SimpleNamespace(),
+        {"n": 1} if requested is None else {"n": 1, "logprobs": requested},
+        StreamLimits(),
+    )
+    try:
+        return await stream._accept_event(event)
+    finally:
+        stream.watchdog.cancel()
+
+
 @pytest.mark.parametrize(
     "logprobs,valid",
     [
@@ -303,34 +334,13 @@ def _alternative(token_id):
         ("logprobs", False),
     ],
 )
-def test_client_stream_validates_delta_logprobs(logprobs, valid, requested=2):
-    async def check():
-        stream = ClientStream(
-            types.SimpleNamespace(),
-            "request",
-            types.SimpleNamespace(),
-            {"n": 1} if requested is None else {"n": 1, "logprobs": requested},
-            StreamLimits(),
-        )
-        event = {
-            "type": "delta",
-            "choice_index": 0,
-            "text": "ab",
-            "token_ids": [1, 2],
-            "logprobs": logprobs,
-            "sequence": 0,
-            "version": 1,
-        }
-        try:
-            if valid:
-                assert (await stream._accept_event(event))["logprobs"] == logprobs
-            else:
-                with pytest.raises(StreamError, match="invalid_choice_event"):
-                    await stream._accept_event(event)
-        finally:
-            stream.watchdog.cancel()
-
-    asyncio.run(check())
+def test_client_stream_validates_delta_logprobs(logprobs, valid):
+    event = _delta(logprobs=logprobs)
+    if valid:
+        assert asyncio.run(accept_delta(event, requested=2))["logprobs"] == logprobs
+    else:
+        with pytest.raises(StreamError, match="invalid_choice_event"):
+            asyncio.run(accept_delta(event, requested=2))
 
 
 def test_capability_is_advertised():
@@ -339,37 +349,18 @@ def test_capability_is_advertised():
 
 
 def test_client_stream_rejects_logprobs_nobody_requested():
-    test_client_stream_validates_delta_logprobs([_entry(1), _entry(2)], False, requested=None)
+    event = _delta(logprobs=[_entry(1), _entry(2)])
+    with pytest.raises(StreamError, match="invalid_choice_event"):
+        asyncio.run(accept_delta(event, requested=None))
 
 
 @pytest.mark.parametrize("requested,valid", [(2, False), (0, False), (None, True)])
 def test_client_stream_requires_logprobs_on_every_requested_delta(requested, valid):
-    async def check():
-        stream = ClientStream(
-            types.SimpleNamespace(),
-            "request",
-            types.SimpleNamespace(),
-            {"n": 1} if requested is None else {"n": 1, "logprobs": requested},
-            StreamLimits(),
-        )
-        event = {
-            "type": "delta",
-            "choice_index": 0,
-            "text": "ab",
-            "token_ids": [1, 2],
-            "sequence": 0,
-            "version": 1,
-        }
-        try:
-            if valid:
-                assert "logprobs" not in await stream._accept_event(event)
-            else:
-                with pytest.raises(StreamError, match="invalid_choice_event"):
-                    await stream._accept_event(event)
-        finally:
-            stream.watchdog.cancel()
-
-    asyncio.run(check())
+    if valid:
+        assert "logprobs" not in asyncio.run(accept_delta(_delta(), requested))
+    else:
+        with pytest.raises(StreamError, match="invalid_choice_event"):
+            asyncio.run(accept_delta(_delta(), requested))
 
 
 def test_logprobs_above_the_engine_maximum_are_typed():
@@ -405,16 +396,12 @@ def _fill(buffer, tokens):
 def test_logprob_stream_behind_a_slow_reader_overflows_the_default_buffer():
     # Each token with logprobs=20 serializes to over 1 KiB, so the default
     # 1 MiB buffer holds well under a thousand undelivered tokens.
-    from arctic_platform.inference.server.streaming import EventBuffer, event_size
-
     assert event_size(_logprob_delta(10_000)) > 1024
     with pytest.raises(StreamError, match="buffer_overflow"):
         _fill(EventBuffer(StreamLimits()), 3000)
 
 
 def test_logprob_stream_behind_a_slow_reader_fits_a_raised_buffer():
-    from arctic_platform.inference.server.streaming import EventBuffer
-
     buffer = EventBuffer(StreamLimits(max_buffer_bytes=16 * 1024 * 1024))
     _fill(buffer, 3000)
     events = buffer.drain()
@@ -440,8 +427,6 @@ def _mixed_deltas(count):
 
 
 def test_merged_delta_size_matches_its_serialized_size():
-    from arctic_platform.inference.server.streaming import EventBuffer, event_size
-
     bare = {"type": "delta", "choice_index": 0, "text": ""}
     for first in (bare, {**bare, "token_ids": [], "logprobs": []}, None):
         buffer = EventBuffer(StreamLimits(max_buffer_bytes=16 * 1024 * 1024))
@@ -460,8 +445,6 @@ def test_merged_delta_size_matches_its_serialized_size():
 
 
 def test_merge_fills_the_event_cap_exactly():
-    from arctic_platform.inference.server.streaming import EventBuffer, event_size
-
     deltas = list(_mixed_deltas(12))
     probe = EventBuffer(StreamLimits())
     for delta in deltas[:-1]:
@@ -495,11 +478,6 @@ def test_merge_fills_the_event_cap_exactly():
 def test_merge_cost_does_not_grow_with_the_merged_delta(monkeypatch):
     # A reader that lags lets one delta grow toward the 256 KiB event cap;
     # re-serializing all of it per token would cost a millisecond or more.
-    import json
-    from types import SimpleNamespace
-
-    from arctic_platform.inference.server import streaming
-
     serialized = []
 
     def dumps(*args, **kwargs):
@@ -507,7 +485,7 @@ def test_merge_cost_does_not_grow_with_the_merged_delta(monkeypatch):
         serialized.append(len(text))
         return text
 
-    monkeypatch.setattr(streaming, "json", SimpleNamespace(dumps=dumps))
+    monkeypatch.setattr(streaming, "json", types.SimpleNamespace(dumps=dumps))
     buffer = streaming.EventBuffer(StreamLimits(max_buffer_bytes=16 * 1024 * 1024))
     for token_id in range(200):
         buffer.put(_logprob_delta(10_000 + token_id))
