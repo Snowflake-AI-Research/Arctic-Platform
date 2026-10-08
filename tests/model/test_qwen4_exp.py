@@ -22,7 +22,7 @@ import torch
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import PlatformCapabilities
-from arctic_platform.model import resolve_model_profile
+from arctic_platform.model import resolve_model_spec
 from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_hf_to_prime
 from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_prime_to_hf
 
@@ -128,15 +128,15 @@ def test_qwen38_family_dispatch_and_custom_vlm_registration(tmp_path):
         model_path_or_name=_checkpoint(tmp_path, "qwen3_5_moe"),
         parallelism=ParallelismConfig(expert_parallel=2),
     )
-    profile = resolve_model_profile(
+    resolved = resolve_model_spec(
         qwen,
         PlatformCapabilities.for_accelerator("hopper"),
     )
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import _adapter
 
     assert qwen.loader == "qwen4_exp"
-    assert profile.attn_implementation == "qsa_flex"
-    assert profile.ep_comm_backend == "uccl"
+    assert resolved.attn_implementation == "qsa_flex"
+    assert resolved.ep_comm_backend == "uccl"
     assert qwen35.loader == "qwen3_5_moe"
     assert _adapter().extra_weight_iterators == ()
 

@@ -26,9 +26,9 @@ from typing import Literal
 
 import torch.nn as nn
 from pydantic import BaseModel
-from pydantic import ConfigDict
 
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.config import ResolvedModelSpec
 from arctic_platform.model.platform import PlatformCapabilities
 
 if TYPE_CHECKING:
@@ -104,7 +104,7 @@ SpecValidator = Callable[[ModelSpec], None]
 
 
 @dataclass(frozen=True)
-class LoaderRuntimePolicy:
+class LoaderPolicy:
     attention: Literal["platform"] | str = "platform"
     ep_comm_backend: Literal["deepep", "uccl"] | None = None
     sp_strategy: Literal["transformers_ulysses", "native"] = "transformers_ulysses"
@@ -114,27 +114,13 @@ class LoaderRuntimePolicy:
     model_forward_requires_labels: bool = False
 
 
-class ModelRuntimeProfile(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    loader: str
-    attn_implementation: str
-    ep_comm_backend: Literal["deepep", "uccl"] | None = None
-    sp_strategy: Literal["transformers_ulysses", "native"]
-    sp_requires_head_divisibility: bool = True
-    label_contract: Literal["causal_labels", "logit_aligned"]
-    requires_weight_conversion: bool
-    model_forward_requires_labels: bool
-    fused_cross_entropy: bool | str | None = None
-
-
 @dataclass
 class _LoaderEntry:
     fn: Loader
     matches: Matcher | None
     options: type[BaseModel] | None = None
     validate_spec: SpecValidator | None = None
-    runtime_policy: LoaderRuntimePolicy = field(default_factory=LoaderRuntimePolicy)
+    policy: LoaderPolicy = field(default_factory=LoaderPolicy)
 
 
 _LOADERS: dict[str, _LoaderEntry] = {}
@@ -147,12 +133,12 @@ def register_loader(
     default: bool = False,
     options: type[BaseModel] | None = None,
     validate_spec: SpecValidator | None = None,
-    runtime_policy: LoaderRuntimePolicy | None = None,
+    policy: LoaderPolicy | None = None,
 ) -> Callable[[Loader], Loader]:
     """Register a loader by name.
 
     Optionally give it a ``matches`` predicate, mark it the ``default``, or attach an
-    ``options`` pydantic model used to validate ``ModelSpec.loader_options``.
+    ``options`` pydantic model and resolution ``policy``.
     """
 
     def decorator(fn: Loader) -> Loader:
@@ -166,7 +152,7 @@ def register_loader(
             matches=matches,
             options=options,
             validate_spec=validate_spec,
-            runtime_policy=runtime_policy or LoaderRuntimePolicy(),
+            policy=policy or LoaderPolicy(),
         )
         return fn
 
@@ -196,17 +182,20 @@ def _platform_attention_default(platform: PlatformCapabilities) -> str:
     }.get(platform.accelerator, "sdpa")
 
 
-def resolve_model_profile(
+def resolve_model_spec(
     spec: ModelSpec,
     platform: PlatformCapabilities | None = None,
-) -> ModelRuntimeProfile:
+) -> ResolvedModelSpec:
+    if isinstance(spec, ResolvedModelSpec):
+        return spec
     if spec.loader is None:
-        raise ValueError("ModelSpec.loader must be resolved before runtime defaults")
+        raise ValueError("ModelSpec.loader must be selected before platform-dependent fields are resolved")
     platform = platform or PlatformCapabilities.detect()
     entry = _LOADERS[spec.loader]
-    policy = entry.runtime_policy
+    policy = entry.policy
 
-    attention = spec.attn_implementation
+    resolved = spec.model_copy(deep=True)
+    attention = resolved.attn_implementation
     if attention is None:
         attention = _platform_attention_default(platform) if policy.attention == "platform" else policy.attention
     if attention.startswith("flash_attention_") and attention not in platform.attention_backends:
@@ -216,8 +205,8 @@ def resolve_model_profile(
         )
 
     ep_comm_backend = None
-    if spec.parallelism.expert_parallel > 1:
-        requested_backend = spec.loader_options.get("ep_comm_backend")
+    if resolved.parallelism.expert_parallel > 1:
+        requested_backend = resolved.loader_options.get("ep_comm_backend")
         ep_comm_backend = requested_backend or policy.ep_comm_backend
         if ep_comm_backend is None:
             raise ValueError(f"loader {spec.loader!r} has no expert-parallel communication policy")
@@ -226,18 +215,17 @@ def resolve_model_profile(
                 f"{ep_comm_backend} is required by loader {spec.loader!r}, "
                 f"but the backend is unavailable; available={sorted(platform.ep_comm_backends)}"
             )
-        spec.loader_options["ep_comm_backend"] = ep_comm_backend
+        resolved.loader_options["ep_comm_backend"] = ep_comm_backend
 
-    spec.attn_implementation = attention
+    resolved.attn_implementation = attention
     if entry.options is not None:
-        spec.loader_options = entry.options.model_validate(spec.loader_options).model_dump()
+        resolved.loader_options = entry.options.model_validate(resolved.loader_options).model_dump()
 
-    fused_cross_entropy = spec.loader_options.get("fused_cross_entropy")
-    if spec.patches.liger:
+    fused_cross_entropy = resolved.loader_options.get("fused_cross_entropy")
+    if resolved.patches.liger:
         fused_cross_entropy = "liger"
-    return ModelRuntimeProfile(
-        loader=spec.loader,
-        attn_implementation=attention,
+    return ResolvedModelSpec(
+        **resolved.model_dump(),
         ep_comm_backend=ep_comm_backend,
         sp_strategy=policy.sp_strategy,
         sp_requires_head_divisibility=policy.sp_requires_head_divisibility,

@@ -35,7 +35,7 @@ from arctic_platform.model import loader as loader_mod
 from arctic_platform.model import patch as patch_mod
 from arctic_platform.model import register_loader
 from arctic_platform.model import register_patch
-from arctic_platform.model import resolve_model_profile
+from arctic_platform.model import resolve_model_spec
 
 
 @pytest.fixture(autouse=True)
@@ -135,18 +135,24 @@ class TestLoaderSelection:
     def test_build_model_runs_resolved_loader_then_patches(self, monkeypatch):
         """build_model builds via the resolved loader and hands the result to the patch pipeline."""
         built = nn.Linear(1, 1)
+        specs = []
 
         @register_loader("fake")
         def _fake(ctx: LoaderContext) -> LoadedModel:
+            specs.append(ctx.spec)
             return LoadedModel(model=built)
 
         patched = []
         monkeypatch.setattr(factory_mod, "apply_patches", lambda loaded, ctx: patched.append(loaded))
 
-        loaded = build_model(ModelSpec(model_path_or_name="x", loader="fake"))
+        loaded = build_model(
+            ModelSpec(model_path_or_name="x", loader="fake"),
+            platform=PlatformCapabilities.for_accelerator("ampere"),
+        )
 
         assert loaded.model is built
         assert patched == [loaded]
+        assert specs[0].attn_implementation == "sdpa"
 
 
 class TestPatchPipeline:
@@ -235,13 +241,13 @@ class TestHuggingFaceLoader:
             model_path_or_name="qwen",
             loader="huggingface",
         )
-        profile = resolve_model_profile(
+        resolved = resolve_model_spec(
             spec,
             PlatformCapabilities.for_accelerator(accelerator),
         )
 
-        assert profile.attn_implementation == expected
-        assert spec.attn_implementation == expected
+        assert resolved.attn_implementation == expected
+        assert spec.attn_implementation is None
 
     def test_explicit_attention_override_is_preserved(self):
         spec = ModelSpec(
@@ -249,7 +255,7 @@ class TestHuggingFaceLoader:
             loader="huggingface",
             attn_implementation="flash_attention_3",
         )
-        profile = resolve_model_profile(
+        resolved = resolve_model_spec(
             spec,
             PlatformCapabilities.for_accelerator(
                 "blackwell",
@@ -257,7 +263,7 @@ class TestHuggingFaceLoader:
             ),
         )
 
-        assert profile.attn_implementation == "flash_attention_3"
+        assert resolved.attn_implementation == "flash_attention_3"
 
     def test_unavailable_attention_backend_is_rejected(self):
         spec = ModelSpec(model_path_or_name="qwen", loader="huggingface")
@@ -267,16 +273,16 @@ class TestHuggingFaceLoader:
         )
 
         with pytest.raises(ValueError, match="flash_attention_3.*unavailable"):
-            resolve_model_profile(spec, platform)
+            resolve_model_spec(spec, platform)
 
-    def test_runtime_profile_is_serializable(self):
+    def test_resolved_model_spec_is_serializable(self):
         spec = ModelSpec(model_path_or_name="qwen", loader="huggingface")
-        profile = resolve_model_profile(
+        resolved = resolve_model_spec(
             spec,
             PlatformCapabilities.for_accelerator("hopper"),
         )
 
-        assert profile.model_validate_json(profile.model_dump_json()) == profile
+        assert resolved.model_validate_json(resolved.model_dump_json()) == resolved
 
     def test_qwen3_resolves_to_default_loader(self, monkeypatch):
         fake_config = types.SimpleNamespace(model_type="qwen3")

@@ -19,22 +19,23 @@ from __future__ import annotations
 from typing import Any
 
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.config import ResolvedModelSpec
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
-from arctic_platform.model.loader import resolve_model_profile
+from arctic_platform.model.loader import resolve_model_spec
 from arctic_platform.model.loader import select_loader
 from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.platform import PlatformCapabilities
 
 
 def build_model(
-    spec: ModelSpec,
+    spec: ModelSpec | ResolvedModelSpec,
     parallel_groups: Any | None = None,
     platform: PlatformCapabilities | None = None,
 ) -> LoadedModel:
-    """Run the spec's resolved loader, apply its patches, and return the result."""
-    resolve_model_profile(spec, platform)
-    ctx = LoaderContext(spec=spec, parallel_groups=parallel_groups)
+    """Resolve the spec, run its loader, apply its patches, and return the result."""
+    resolved = resolve_model_spec(spec, platform)
+    ctx = LoaderContext(spec=resolved, parallel_groups=parallel_groups)
     loaded = select_loader(ctx)(ctx)
     apply_patches(loaded, ctx)
     return loaded

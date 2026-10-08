@@ -20,14 +20,14 @@ from transformers import AutoModelForCausalLM
 
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
-from arctic_platform.model.loader import LoaderRuntimePolicy
+from arctic_platform.model.loader import LoaderPolicy
 from arctic_platform.model.loader import register_loader
 
 
 @register_loader(
     "huggingface",
     default=True,
-    runtime_policy=LoaderRuntimePolicy(),
+    policy=LoaderPolicy(),
 )
 def load_huggingface(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism

@@ -24,7 +24,7 @@ from __future__ import annotations
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
-from arctic_platform.model.loader import LoaderRuntimePolicy
+from arctic_platform.model.loader import LoaderPolicy
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
@@ -135,7 +135,7 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
     matches=_matches("glm5_next"),
     options=GenericMoeOptions,
     validate_spec=_validate_glm5_next,
-    runtime_policy=LoaderRuntimePolicy(
+    policy=LoaderPolicy(
         attention="sparse_mla",
         ep_comm_backend="uccl",
         sp_strategy="native",
@@ -155,7 +155,7 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     matches=_matches("qwen4_exp"),
     options=GenericMoeOptions,
     validate_spec=_validate_qwen4_exp,
-    runtime_policy=LoaderRuntimePolicy(
+    policy=LoaderPolicy(
         attention="qsa_flex",
         ep_comm_backend="uccl",
         sp_strategy="native",

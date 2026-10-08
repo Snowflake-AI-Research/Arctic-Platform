@@ -29,7 +29,7 @@ from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
-from arctic_platform.model.loader import LoaderRuntimePolicy
+from arctic_platform.model.loader import LoaderPolicy
 from arctic_platform.model.loader import register_loader
 
 
@@ -110,7 +110,7 @@ def _validate_spec(spec: ModelSpec) -> None:
     matches=_matches,
     options=GlmMoeDsaOptions,
     validate_spec=_validate_spec,
-    runtime_policy=LoaderRuntimePolicy(
+    policy=LoaderPolicy(
         ep_comm_backend="uccl",
         sp_strategy="native",
         label_contract="logit_aligned",

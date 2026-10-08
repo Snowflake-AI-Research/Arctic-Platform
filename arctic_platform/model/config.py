@@ -281,3 +281,17 @@ class ModelSpec(BaseModel):
 
         validate_loader_spec(self.loader, self)
         return self
+
+
+class ResolvedModelSpec(ModelSpec):
+    """A model specification with platform-dependent loader decisions applied."""
+
+    attn_implementation: str
+    loader: str
+    ep_comm_backend: Literal["deepep", "uccl"] | None = None
+    sp_strategy: Literal["transformers_ulysses", "native"]
+    sp_requires_head_divisibility: bool = True
+    label_contract: Literal["causal_labels", "logit_aligned"]
+    requires_weight_conversion: bool
+    model_forward_requires_labels: bool
+    fused_cross_entropy: bool | str | None = None
