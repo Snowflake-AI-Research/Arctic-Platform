@@ -81,6 +81,15 @@ class _RecordingWorker:
         self.index = index
         self.replay_result = replay_result
         self.send_router_replay = _RemoteMethod(self._send_router_replay)
+        self.freeze_generation = _RemoteMethod(self._record("freeze_generation"))
+        self.resume_generation = _RemoteMethod(self._record("resume_generation"))
+
+    def _record(self, name):
+        async def call():
+            self.events.append(f"{name}:{self.index}")
+            return {"status": "ok"}
+
+        return call
 
     async def _send_router_replay(self):
         self.events.append(f"send_router_replay:{self.index}")
@@ -181,6 +190,8 @@ def _scheduler_pool(
     )
     worker.acknowledge_stream.remote = AsyncMock(return_value=True)
     worker.abort_stream.remote = AsyncMock(return_value={"status": "aborted"})
+    worker.freeze_generation.remote = AsyncMock(return_value={"status": "paused"})
+    worker.resume_generation.remote = AsyncMock(return_value={"status": "resumed"})
 
     pool = ReplicaPool()
     pool._workers = [worker]
@@ -216,7 +227,7 @@ async def _collect_stream(stream):
         ),
     ],
 )
-def test_router_replay_pauses_drains_sends_and_resumes(
+def test_router_replay_pauses_freezes_sends_and_resumes(
     replay_result, expected_worker,
 ):
     async def run():
@@ -231,9 +242,12 @@ def test_router_replay_pauses_drains_sends_and_resumes(
         }
         assert events == [
             "scheduler.pause",
-            "scheduler.drain",
+            "freeze_generation:0",
+            "freeze_generation:1",
             "send_router_replay:0",
             "send_router_replay:1",
+            "resume_generation:0",
+            "resume_generation:1",
             "scheduler.resume",
         ]
         assert "scheduler.abort_streams" not in events
@@ -254,27 +268,28 @@ def test_router_replay_preserves_preexisting_scheduler_pause():
         assert pool._scheduler.paused
         assert events == [
             "scheduler.pause",
-            "scheduler.drain",
+            "freeze_generation:0",
             "send_router_replay:0",
+            "resume_generation:0",
         ]
 
     asyncio.run(run())
 
 
-def test_router_replay_drains_unary_and_streaming_at_pause_boundary():
+def test_router_replay_sends_without_waiting_for_inflight_requests():
     async def run():
-        unary_started = asyncio.Event()
         unary_release = asyncio.Event()
         stream_release = asyncio.Event()
-        replay_started = asyncio.Event()
 
         async def generate(*_):
-            unary_started.set()
             await unary_release.wait()
             return {"text": "done"}
 
         async def send_router_replay():
-            replay_started.set()
+            # Both requests are still in flight, frozen in place, when the send runs.
+            assert scheduler._workers[0].active_requests == 2
+            worker.freeze_generation.remote.assert_awaited_once()
+            worker.resume_generation.remote.assert_not_awaited()
             return {"status": "ok"}
 
         pool, worker = _scheduler_pool(
@@ -283,62 +298,25 @@ def test_router_replay_drains_unary_and_streaming_at_pause_boundary():
             stream_release=stream_release,
         )
         scheduler = pool._scheduler
-        abort_streams = AsyncMock(wraps=scheduler.abort_streams)
-        cancel_worker_inflight = MagicMock(
-            wraps=scheduler.cancel_worker_inflight
-        )
-        scheduler.abort_streams = abort_streams
-        scheduler.cancel_worker_inflight = cancel_worker_inflight
-        pause_active_requests = []
-        original_pause = scheduler.pause
-
-        def record_pause_boundary():
-            pause_active_requests.append(
-                scheduler._workers[0].active_requests
-            )
-            original_pause()
-
-        scheduler.pause = record_pause_boundary
-
         unary = pool.submit_generate_futures("unary")[0]
         stream = pool.stream_generate("stream", "streaming")
         stream_result = asyncio.create_task(_collect_stream(stream))
-        replay = asyncio.create_task(pool.send_router_replay())
         try:
-            await _wait_until(lambda: scheduler.paused)
-            assert pause_active_requests == [2]
-            assert unary_started.is_set()
-            assert stream.worker is scheduler._workers[0]
-            assert stream.registration is not None
-            await asyncio.sleep(0.02)
-            assert not replay_started.is_set()
-
-            unary_release.set()
-            assert await unary == {"text": "done"}
-            assert scheduler._workers[0].active_requests == 1
-            await asyncio.sleep(0.12)
-            assert not replay_started.is_set()
-
-            stream_release.set()
-            events = await stream_result
-            assert events[-1]["type"] == "completed"
-            result = await asyncio.wait_for(replay, 1)
+            await _wait_until(lambda: scheduler._workers[0].active_requests == 2)
+            result = await asyncio.wait_for(pool.send_router_replay(), 1)
 
             assert result["workers"] == [{"status": "ok"}]
-            assert scheduler._workers[0].active_requests == 0
+            worker.resume_generation.remote.assert_awaited_once()
             assert not scheduler.paused
-            abort_streams.assert_not_awaited()
-            cancel_worker_inflight.assert_not_called()
             worker.abort_stream.remote.assert_not_awaited()
+            unary_release.set()
+            stream_release.set()
+            assert await asyncio.wait_for(unary, 1) == {"text": "done"}
+            assert (await asyncio.wait_for(stream_result, 1))[-1]["type"] == "completed"
         finally:
             unary_release.set()
             stream_release.set()
-            await asyncio.gather(
-                unary,
-                stream_result,
-                replay,
-                return_exceptions=True,
-            )
+            await asyncio.gather(unary, stream_result, return_exceptions=True)
             await scheduler.shutdown()
 
     asyncio.run(run())
