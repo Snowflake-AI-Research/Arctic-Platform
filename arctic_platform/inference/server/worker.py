@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import re
+import stat
 import time
 from collections.abc import Mapping, Sequence
 from enum import Enum
@@ -147,6 +148,21 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
         logger.warning("%s=%r is below %.3f; using %.3f", name, raw, minimum, minimum)
         return minimum
     return value
+
+
+def _console_tail(max_bytes: int = 4096) -> str:
+    """Tail this process's stdout/stderr when they are files (a Ray worker's logs).
+
+    vLLM engine-core and TP worker subprocesses inherit them and print the startup root
+    cause there; vLLM's own exception only says "See root cause above".
+    """
+    tails = []
+    for fd in (1, 2):
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            with open(f"/proc/self/fd/{fd}", "rb") as f:
+                f.seek(max(0, os.fstat(f.fileno()).st_size - max_bytes))
+                tails.append(f.read().decode(errors="replace"))
+    return "\n".join(tails)
 
 
 def _is_address_in_use_error(exc: BaseException) -> bool:
@@ -682,6 +698,8 @@ class InferenceWorker(StreamingWorkerMixin):
             except BaseException as exc:
                 self._cleanup_registered_router_replay_shm()
                 if attempt >= max_attempts or not _is_address_in_use_error(exc):
+                    if tail := _console_tail():
+                        exc.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
                     raise
                 delay_s = retry_base_s * attempt + random.uniform(0.0, retry_base_s)
                 logger.warning(
