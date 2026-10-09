@@ -15,8 +15,8 @@
 
 """Model profiles, one per registered loader and named after it. ``register`` adds them all to a registry.
 
-A cell is ``supports`` only when, at this commit, the loader's own options model has a field for the option, the
-loader accepts and validates a ``ModelSpec`` field for it (such as ``attn_implementation``), or, for the
+A cell is ``supports`` only when, in the current code, the loader's own options model has a field for the option,
+the loader accepts and validates a ``ModelSpec`` field for it (such as ``attn_implementation``), or, for the
 ``huggingface`` loader, ``Patches`` has a field for it. ``tests/model/test_option_profiles.py`` checks that
 against the loaders.
 """

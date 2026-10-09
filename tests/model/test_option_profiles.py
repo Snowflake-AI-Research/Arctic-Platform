@@ -180,7 +180,7 @@ def test_supports_exactly_when_loader_field_exists(name):
 
 @pytest.mark.parametrize("name", sorted(loader_mod._LOADERS))
 def test_attention_backend_is_supported_through_model_spec(name):
-    """Every loader takes ``ModelSpec.attn_implementation`` (revision 2 of the design)."""
+    """Every loader accepts ``ModelSpec.attn_implementation``."""
     assert _mapped_path(name, "attention.backend") in ("attn_implementation", "ModelSpec.attn_implementation")
     assert settle(name)["attention.backend"].status == SUPPORTS
 

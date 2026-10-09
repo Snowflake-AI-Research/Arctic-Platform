@@ -41,7 +41,7 @@ from arctic_platform.common.option_registry import settle
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
 
-# The real registry: the key table and the loader list of the design.
+# The real registry: the 20 keys with where they run and their goal, and the six loaders.
 EXPECTED_KEYS = {
     "checkpointing.mode": ("trainer", "memory"),
     "checkpointing.freq": ("trainer", "memory"),
