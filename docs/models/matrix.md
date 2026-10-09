@@ -94,7 +94,7 @@ Extends `generic_moe`.
 
 5 of 20 options unsupported.
 
-- `attention.sparse_mla` (no): no equivalent option; the sparse MLA kernel is chosen only by the glm_moe_dsa loader
+- `attention.sparse_mla` (no): no equivalent option; sparse MLA is used only by the GLM loaders glm_moe_dsa and glm5_next
 - `checkpointing.mode` (no): no equivalent option; `patches.gradient_checkpointing` always recomputes whole layers
 - `checkpointing.targets` (no): no equivalent option; selective checkpointing exists only in the custom loaders
 - `lm_head.cross_entropy` (no): no equivalent option; the fused cross-entropy comes only with `patches.liger`

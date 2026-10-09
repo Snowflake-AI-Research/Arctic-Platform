@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -85,14 +86,14 @@ def _complete_registry() -> Registry:
     register_profile(
         "dense",
         supports=["lm_head.fp32"],
-        unsupported={"liger": "no kernels"},
+        unsupported=dict(liger="no kernels"),
         not_applicable={"moe.*": "no experts"},
         registry=registry,
     )
     register_profile(
         "moe",
         supports=["lm_head.fp32", "moe.grouped_mm", "moe.comm_backend"],
-        unsupported={"liger": "rejected"},
+        unsupported=dict(liger="rejected"),
         registry=registry,
     )
     register_profile(
@@ -160,7 +161,7 @@ class TestRegisterProfile:
             (dict(supports=["liger", 3]), TypeError, "supports key must be a str"),
             (dict(unsupported=["liger"]), TypeError, "unsupported must be a mapping"),
             (dict(unsupported={3: "reason"}), TypeError, "unsupported key must be a str"),
-            (dict(unsupported={"liger": None}), TypeError, "reason for 'liger' must be a str"),
+            (dict(unsupported=dict(liger=None)), TypeError, "reason for 'liger' must be a str"),
             (dict(not_applicable={("moe",): "reason"}), TypeError, "not_applicable key must be a str"),
             (dict(extends=1), TypeError, "extends must be a str"),
         ],
@@ -185,7 +186,7 @@ class TestRegisterProfile:
             "broken",
             extends="missing_base",
             supports=["lm_head.fp32", "nope.key", "moe.*"],
-            unsupported={"liger": "TODO"},
+            unsupported=dict(liger="TODO"),
             not_applicable={"gdn.*": "no gdn"},
             registry=registry,
         )
@@ -262,7 +263,7 @@ class TestCheckCoverage:
             (
                 dict(
                     supports=["lm_head.fp32", "moe.grouped_mm", "moe.comm_backend", "liger"],
-                    unsupported={"liger": "rejected"},
+                    unsupported=dict(liger="rejected"),
                 ),
                 "liger",
                 "settled more than once in one profile: supports, unsupported",
@@ -271,7 +272,7 @@ class TestCheckCoverage:
             (
                 dict(
                     supports=["lm_head.fp32", "moe.grouped_mm"],
-                    unsupported={"liger": "rejected"},
+                    unsupported=dict(liger="rejected"),
                     not_applicable={"moe.*": "no experts"},
                 ),
                 "moe.grouped_mm",
@@ -301,7 +302,7 @@ class TestCheckCoverage:
             ),
             # a missing reason
             (
-                dict(supports=["lm_head.fp32", "moe.grouped_mm", "moe.comm_backend"], unsupported={"liger": ""}),
+                dict(supports=["lm_head.fp32", "moe.grouped_mm", "moe.comm_backend"], unsupported=dict(liger="")),
                 "liger",
                 "unsupported reason is empty",
             ),
@@ -311,7 +312,7 @@ class TestCheckCoverage:
                 "not_applicable reason is empty",
             ),
             (
-                dict(supports=["lm_head.fp32", "moe.grouped_mm", "moe.comm_backend"], unsupported={"liger": "a\nb"}),
+                dict(supports=["lm_head.fp32", "moe.grouped_mm", "moe.comm_backend"], unsupported=dict(liger="a\nb")),
                 "liger",
                 "unsupported reason must be one line",
             ),
@@ -331,7 +332,7 @@ class TestCheckCoverage:
         assert _problems_naming(problems, "defective", key, text) == problems
 
     @pytest.mark.parametrize("list_name", ["unsupported", "not_applicable"])
-    @pytest.mark.parametrize("reason", ["TODO", "todo", "TODO: decide", " TODO "])
+    @pytest.mark.parametrize("reason", ["TODO", "TODO: decide", " TODO ", "TODO(owner) evaluate"])
     def test_todo_reason_rejected(self, list_name, reason):
         registry = _complete_registry()
         cells = dict(liger=reason)
@@ -343,6 +344,19 @@ class TestCheckCoverage:
         )
         problems = check_coverage(registry)
         assert problems == [f"profile 'todo', key 'liger': {list_name} reason is TODO"]
+
+    @pytest.mark.parametrize(
+        "reason", ["Todo lists are kept elsewhere", "todo", "TODOS", "see the TODO in the loader"]
+    )
+    def test_reason_that_is_not_the_todo_marker_passes(self, reason):
+        registry = _complete_registry()
+        register_profile(
+            "fine",
+            supports=["lm_head.fp32", "moe.grouped_mm", "moe.comm_backend"],
+            unsupported=dict(liger=reason),
+            registry=registry,
+        )
+        assert check_coverage(registry) == []
 
     def test_unknown_extends(self):
         registry = _complete_registry()
@@ -385,7 +399,7 @@ class TestCheckCoverage:
             for key in order:
                 _option(registry, key)
             register_profile("z", registry=registry)
-            register_profile("a", unsupported={"liger": "TODO"}, registry=registry)
+            register_profile("a", unsupported=dict(liger="TODO"), registry=registry)
             return check_coverage(registry)
 
         first = build(SYNTHETIC_KEYS)
@@ -440,6 +454,32 @@ class TestRealRegistry:
         assert names == EXPECTED_PROFILES
         for name in names:
             assert set(settle(name)) == set(EXPECTED_KEYS)
+
+    def test_failed_builtin_load_keeps_failing_until_it_succeeds(self, monkeypatch):
+        """A built-in ``register`` that raises midway must raise on every read, never leave a half-filled registry."""
+        calls = dict(count=0)
+
+        def register(registry: Registry) -> None:
+            calls["count"] += 1
+            _option(registry, "first.ok")
+            if calls["count"] < 3:
+                raise RuntimeError("built-in data module is broken")
+            register_profile("only", supports=["first.ok"], registry=registry)
+
+        monkeypatch.setitem(sys.modules, "_fake_builtin_options", types.SimpleNamespace(register=register))
+        monkeypatch.setattr(reg_mod, "_BUILTIN_MODULES", ("_fake_builtin_options",))
+        monkeypatch.setattr(reg_mod, "REGISTRY", Registry())
+
+        with pytest.raises(RuntimeError, match="broken"):
+            reg_mod.options()
+        with pytest.raises(RuntimeError, match="broken"):
+            check_coverage()
+        assert reg_mod.REGISTRY.option_entries == {}
+        assert reg_mod.REGISTRY.builtins_registered is False
+
+        assert [entry.key for entry in reg_mod.options()] == ["first.ok"]
+        assert check_coverage() == []
+        assert calls["count"] == 3
 
     def test_real_registry_fills_after_common_modules_are_reimported(self, monkeypatch):
         """``test_common_light_imports`` drops ``arctic_platform.common.*`` from ``sys.modules``, after which the

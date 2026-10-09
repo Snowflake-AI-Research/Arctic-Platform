@@ -45,7 +45,7 @@ def register(registry: Registry) -> None:
             "checkpointing.targets": "no equivalent option; selective checkpointing exists only in the custom loaders",
             "lm_head.cross_entropy": "no equivalent option; the fused cross-entropy comes only with `patches.liger`",
             "attention.sparse_mla": (
-                "no equivalent option; the sparse MLA kernel is chosen only by the glm_moe_dsa loader"
+                "no equivalent option; sparse MLA is used only by the GLM loaders glm_moe_dsa and glm5_next"
             ),
             "numerics.reduce_dtype": "no equivalent option",
         },
