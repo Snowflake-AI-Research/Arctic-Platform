@@ -23,6 +23,9 @@ def apply_required_vllm_patches() -> None:
     from arctic_platform.inference.vllm.dflash2_nan_fix import (
         apply_dflash2_nan_fixes,
     )
+    from arctic_platform.inference.vllm.mamba_completion_refresh import (
+        ensure_mamba_completion_refresh,
+    )
     from arctic_platform.inference.vllm.router_replay import (
         ensure_router_replay_vllm_patches,
     )
@@ -38,3 +41,4 @@ def apply_required_vllm_patches() -> None:
     ensure_dense_prompt_logprobs_patch()
     ensure_spec_decode_grammar_fix()
     apply_dflash2_nan_fixes()
+    ensure_mamba_completion_refresh()
