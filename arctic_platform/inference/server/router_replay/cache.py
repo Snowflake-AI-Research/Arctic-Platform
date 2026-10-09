@@ -1,8 +1,9 @@
 """GPU-resident caches for router-replay tensors.
 
 TX (sampling side, overwrite-on-put) and RX (training side, pop-on-read)
-share a common base. Tensors are ``torch.uint8`` on the worker's device,
-shape ``[seq_len, num_layers, topk]``. Byte counts back ``max_bytes``
+share a common base. Tensors are ``torch.uint8`` on the worker's device
+(``torch.uint16`` for models with more than 256 experts, as vLLM captures
+them), shape ``[seq_len, num_layers, topk]``. Byte counts back ``max_bytes``
 backpressure (raises ``RouterReplayCacheFull``).
 """
 
@@ -22,6 +23,8 @@ import torch
 logger = logging.getLogger(__name__)
 
 ROUTER_REPLAY_CACHE_DTYPE = torch.uint8
+# vLLM captures expert ids as uint8 for <= 256 experts and uint16 above; both widths are kept as-is.
+ROUTER_REPLAY_CACHE_DTYPES = (torch.uint8, torch.uint16)
 EXACT_REPLAY_ID_PREFIX = "rr1:"
 _TOMBSTONE_ORDER_LOCK_STRIPES = 64
 
@@ -124,7 +127,7 @@ class _RouterReplayCacheBase:
     # ------------------------------------------------------------------
 
     def put(self, sample_id: str, value: torch.Tensor | np.ndarray) -> None:
-        """Insert or replace the entry; coerces to uint8 on self.device.
+        """Insert or replace the entry; coerces to uint8 (uint16 kept) on self.device.
 
         Overwrite drops the prior tensor BEFORE the max_bytes check so a
         multi-turn rollout replacing its own prior turn does not double-count.
@@ -299,7 +302,7 @@ class _RouterReplayCacheBase:
                 f"router-replay cache.put expects torch.Tensor or np.ndarray, "
                 f"got {type(value).__name__}"
             )
-        if t.dtype != ROUTER_REPLAY_CACHE_DTYPE:
+        if t.dtype not in ROUTER_REPLAY_CACHE_DTYPES:
             t = t.to(ROUTER_REPLAY_CACHE_DTYPE)
         if t.device != self.device:
             t = t.to(self.device, non_blocking=True)

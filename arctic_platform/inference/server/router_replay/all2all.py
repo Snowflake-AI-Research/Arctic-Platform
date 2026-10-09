@@ -40,7 +40,9 @@ from arctic_platform.inference.server.router_replay.cache import (
 logger = logging.getLogger(__name__)
 
 # Dtype stored/transferred for routed_experts. Qwen3.6 MoE has 256 experts,
-# so ids are in [0, 255] and fit in uint8. Training widens to int64 at the
+# so ids are in [0, 255] and fit in uint8; models with more experts keep vLLM's
+# uint16 capture, and senders advertise each tensor's dtype. NCCL has no 16-bit
+# integer type, so tensors travel as raw bytes. Training widens to int64 at the
 # model boundary where torch gather/DeepEP dispatch require long indices.
 _ROUTED_EXPERTS_DTYPE = ROUTER_REPLAY_CACHE_DTYPE
 
@@ -51,8 +53,9 @@ Role = Literal["sender", "receiver"]
 class _PerRankManifest:
     """One rank's Phase-A contribution.
 
-    Senders fill ``held`` + ``shapes``; receivers fill ``needed``. ``role``
-    is in-band so the planner needs no out-of-band role table.
+    Senders fill ``held`` + ``shapes`` + ``dtypes``; receivers fill ``needed``.
+    ``role`` is in-band so the planner needs no out-of-band role table.
+    ``dtypes`` is ``None`` from an older sender, whose cache held uint8 only.
     ``allow_missing`` lets a receiver tolerate needed sids no sender holds.
     ``supports_allow_missing`` is the capability handshake: this code always
     sets it, while a manifest from a rank running an older planner (which
@@ -64,6 +67,7 @@ class _PerRankManifest:
     held: list[str] = field(default_factory=list)
     needed: list[str] = field(default_factory=list)
     shapes: dict[str, list[int]] = field(default_factory=dict)
+    dtypes: dict[str, torch.dtype] | None = None
     discard: bool = True
     allow_missing: bool = False
     supports_allow_missing: bool = False
@@ -76,6 +80,7 @@ class _TransferOp:
     sample_id: str
     shape: tuple[int, ...]
     discard: bool = True
+    dtype: torch.dtype = _ROUTED_EXPERTS_DTYPE
 
 
 def _compute_plan(
@@ -91,6 +96,7 @@ def _compute_plan(
     owner: dict[str, int] = {}
     owners: dict[str, list[int]] = {}
     shape_by_sid: dict[str, tuple[int, ...]] = {}
+    dtype_by_sid: dict[str, torch.dtype] = {}
     for m in sorted(manifests, key=lambda x: x.rank):
         if m.role != "sender":
             continue
@@ -100,6 +106,7 @@ def _compute_plan(
                 continue  # earlier (lower-rank) sender already owns it
             owner[sid] = m.rank
             shape_by_sid[sid] = tuple(m.shapes[sid])
+            dtype_by_sid[sid] = _ROUTED_EXPERTS_DTYPE if m.dtypes is None else m.dtypes[sid]
 
     duplicate_exact = sorted(
         sid for sid, sender_ranks in owners.items()
@@ -140,6 +147,7 @@ def _compute_plan(
                     sample_id=sid,
                     shape=shape_by_sid[sid],
                     discard=m.discard,
+                    dtype=dtype_by_sid[sid],
                 )
             )
     return plan, missing
@@ -317,13 +325,16 @@ class RouterReplayGroup:
 
     def _build_send_manifest(self, snapshot: dict[str, torch.Tensor]) -> _PerRankManifest:
         shapes = {}
+        dtypes = {}
         for sid, tensor in snapshot.items():
             shapes[sid] = list(tensor.shape)
+            dtypes[sid] = tensor.dtype
         return _PerRankManifest(
             role="sender",
             rank=self.rank,
             held=list(shapes.keys()),
             shapes=shapes,
+            dtypes=dtypes,
             supports_allow_missing=True,
         )
 
@@ -394,7 +405,7 @@ class RouterReplayGroup:
                     f"router-replay: cache.get({op.sample_id!r}) failed during send "
                     f"despite manifest claim; snapshot is inconsistent"
                 ) from e
-            tensors_by_op.append((op, t.contiguous()))
+            tensors_by_op.append((op, t.contiguous().view(torch.uint8)))
         self.nccl.group_start()
         for op, t in tensors_by_op:
             self.nccl.send(t, dst=op.recv_rank)
@@ -416,12 +427,12 @@ class RouterReplayGroup:
         dests: list[tuple[_TransferOp, torch.Tensor]] = []
         for op in my_ops:
             dest = torch.empty(
-                op.shape, dtype=_ROUTED_EXPERTS_DTYPE, device=self.device,
+                op.shape, dtype=op.dtype, device=self.device,
             )
             dests.append((op, dest))
         self.nccl.group_start()
         for op, dest in dests:
-            self.nccl.recv(dest, src=op.sender_rank)
+            self.nccl.recv(dest.view(torch.uint8), src=op.sender_rank)
         self.nccl.group_end()
         # Sync so subsequent cache.put copies observe fully-landed data.
         torch.cuda.current_stream(self.device).synchronize()
