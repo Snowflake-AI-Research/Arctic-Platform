@@ -156,7 +156,8 @@ Current limitations. The client raises `RuntimeError` for a refusal. A Cortex re
 | Checkpoints | A sampler save syncs weights. Only the path just saved can be opened, and only in this process. Resume raises. |
 | Sequence limits | A datum longer than `--max-prompt-length + --max-response-length` is refused. |
 | Loss config | `loss_fn_config` keys other than PPO's two clip thresholds are refused. |
-| Forward | `forward` is refused. `forward_backward` returns the log-probs. NLL eval uses `forward`, so set `eval_every=0` for `chat_sl`. Custom losses (DPO, SDFT) call `forward` first and are unavailable. |
+| Forward | `forward` is refused. `forward_backward` returns the log-probs. Held-out NLL uses `forward`, so set `eval_every=0` on supervised recipes. Custom losses (DPO, SDFT) call `forward` first and are unavailable. |
+| Synchronous loops | `rl_loop` and `sl_loop` call synchronous `forward_backward` and `optim_step`. This client implements `forward_backward_async` and `optim_step_async` only. |
 | Gradient accumulation | A second `forward_backward` before `optim_step` is refused. Cortex keeps only the latest gradient. Leave `stream_minibatch_config` unset or use `num_minibatches=1`. |
 | Teacher | `base_model` opens that model's base weights, including the student. Prompt cap is student prompt + response. Response cap matches the student. `model_path` is refused. |
 | Optimizer overrides | Only the learning rate varies per step; other Adam settings are fixed at start-up. |
@@ -191,8 +192,9 @@ Cortex packs several sequences into one micro-batch. Models with linear
 
 ## Validation
 
-Live validation covered `math_rl`, `chat_sl`, and `rl_loop` with importance
-sampling, PPO, and cross-entropy. Detailed results are recorded in the PR.
+Live validation covered `math_rl` and supervised `chat_sl` with importance
+sampling, PPO, and cross-entropy. `rl_loop` and `sl_loop` call synchronous
+`forward_backward`, which is listed under limitations.
 
 Trainer parity with Tinker was measured by sampling rollouts on Tinker once and
 replaying the same datums on Tinker and on this adapter for five steps, both

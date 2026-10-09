@@ -48,7 +48,8 @@ def main() -> None:
         index += 2
     if "training_gpus" not in kwargs or "sampling_gpus" not in kwargs:
         raise SystemExit(
-            "usage: python -m arctic_platform.integrations.tinker.run --training-gpus N --sampling-gpus N <module> [recipe args...]"
+            "usage: python -m arctic_platform.integrations.tinker.run --training-gpus N --sampling-gpus N <module>"
+            " [recipe args...]"
         )
     if index >= len(argv):
         raise SystemExit("missing the cookbook module to run")
