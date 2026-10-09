@@ -15,11 +15,18 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch import nn
+from transformers.cache_utils import Cache
+from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpModel
+from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
+from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELayer
+from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_mask_to_padding_states
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
@@ -102,6 +109,154 @@ class Qwen4ExpSparseMoePrimeRL(MoE):
         return routed_output + shared_output.view_as(hidden_states)
 
 
+class Qwen4ExpTextNGramEmbeddingPrimeRL(Qwen4ExpTextNGramEmbedding):
+    def forward(self, input_ids: torch.Tensor, past_key_values: Cache | None, position_ids: Tensor | None = None) -> torch.Tensor:
+        input_ids = input_ids.long()
+        # This is a trick to store the previous N=self.context_len `input_ids` - indeed the manipulations are identical to storing
+        # a past conv_state, so we can use an additional conv_states inside the Cache for it
+        if past_key_values is not None and past_key_values.has_previous_state(self.layer_idx, state_idx=2):
+            previous_context = past_key_values.layers[self.layer_idx].conv_states[2].clone()
+        else:
+            previous_context = input_ids.new_full((input_ids.shape[0], self.context_len), self.eos_token_id)
+        # Store the current input_ids for the next forward
+        if past_key_values is not None:
+            input_ids_to_cache = input_ids
+            # In the case where `input_ids` would be smaller than `self.context_len`, the `update_conv_state` will pad with zeros, whereas
+            # here we want to pad with eos, so we do it explicitly
+            if (
+                not past_key_values.has_previous_state(self.layer_idx, state_idx=2)
+                and input_ids.shape[1] < self.context_len
+            ):
+                input_ids_to_cache = torch.nn.functional.pad(
+                    input_ids_to_cache, (self.context_len - input_ids.shape[1], 0), value=self.eos_token_id
+                )
+            _ = past_key_values.update_conv_state(
+                input_ids_to_cache, self.layer_idx, state_idx=2, conv_kernel_size=self.context_len
+            )
+
+        # Get full token history
+        token_history = torch.cat([previous_context, input_ids], dim=-1)
+        shifted_tokens = [self._shift_right_ignore_eos(token_history, shift) for shift in range(self.ngram_size)]
+
+        if position_ids is not None and past_key_values is None:
+            positions = F.pad(position_ids, (self.context_len, 0), value=-1)
+            shifted_tokens = [
+                torch.where(positions >= shift, tokens, self.eos_token_id) if shift else tokens
+                for shift, tokens in enumerate(shifted_tokens)
+            ]
+
+        blocks = []
+        for ngram in range(2, self.ngram_size + 1):
+            start_idx = (ngram - 2) * self.heads_per_ngram
+            end_idx = start_idx + self.heads_per_ngram
+            mixed_ids = shifted_tokens[0] * self.layer_multipliers[0]
+            for position in range(1, ngram):
+                mixed_ids = torch.bitwise_xor(
+                    mixed_ids,
+                    shifted_tokens[position] * self.layer_multipliers[position],
+                )
+            head_vocab_sizes = self.ngram_heads_vocab_sizes[start_idx:end_idx]
+            head_offsets = self.ngram_heads_offsets[start_idx:end_idx]
+            ngram_ids = torch.remainder(mixed_ids.unsqueeze(-1), head_vocab_sizes.view(1, 1, -1))
+            blocks.append(ngram_ids + head_offsets.view(1, 1, -1))
+
+        ngram_ids = torch.cat(blocks, dim=-1)[:, -input_ids.shape[1] :]
+        # We need explicit device placement here, as the embedding may be skipped from device_map completely (we just need to be
+        # careful in the case of offloading to disk)
+        execution_device = (
+            self.ngram_embedding.weight.device if self.ngram_embedding.weight.device.type != "meta" else None
+        )
+        return self.ngram_embedding(ngram_ids.to(execution_device)).to(ngram_ids.device).flatten(-2)
+
+
+class Qwen4ExpTextPLELayerPrimeRL(Qwen4ExpTextPLELayer):
+    def _short_conv(self, hidden_states, past_key_values, position_ids=None):
+        if position_ids is None or past_key_values is not None:
+            return super()._short_conv(hidden_states, past_key_values)
+        dilation = self.conv1d.dilation[0]
+        kernel_size = self.conv1d.kernel_size[0]
+        padded = F.pad(hidden_states.transpose(1, 2), (self.short_conv_state_len, 0))
+        windows = padded.unfold(-1, self.short_conv_state_len + 1, 1)[..., ::dilation]
+        offsets = torch.arange(kernel_size - 1, -1, -1, device=hidden_states.device) * dilation
+        valid = position_ids[..., None] >= offsets
+        windows = windows * valid[:, None].to(windows.dtype)
+        accumulation_dtype = torch.float32 if windows.dtype in (torch.float16, torch.bfloat16) else windows.dtype
+        output = (windows.to(accumulation_dtype) * self.conv1d.weight[:, 0][None, :, None].to(accumulation_dtype)).sum(-1)
+        output = output.to(hidden_states.dtype)
+        return F.silu(output).transpose(1, 2)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        past_key_values: Cache | None,
+        conv_mask: torch.Tensor | None = None,
+        position_ids: Tensor | None = None,
+    ) -> torch.Tensor:
+        embeddings = self.ple_embedding(input_ids, past_key_values, position_ids=position_ids)
+        key_normed = self.norm_key(self.key_proj(embeddings)).unflatten(-1, (self.hc_count, self.hidden_size))
+        value = self.value_proj(embeddings)
+        query_normed = self.norm_query(hidden_states).unflatten(-1, (self.hc_count, self.hidden_size))
+        gate = (key_normed * query_normed).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
+        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        gated_value = torch.sigmoid(gate) * value.unsqueeze(-2)
+        gated_value_normed = self.norm_conv(gated_value.flatten(-2))
+        gated_value = gated_value.flatten(-2)
+        if conv_mask is not None:
+            gated_value = apply_mask_to_padding_states(gated_value, conv_mask)
+            gated_value_normed = apply_mask_to_padding_states(gated_value_normed, conv_mask)
+        output = gated_value + self._short_conv(gated_value_normed, past_key_values, position_ids=position_ids)
+        return output
+
+
+class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        conv_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        ple_input_ids: torch.LongTensor | None = None,
+        **kwargs,
+    ) -> torch.FloatTensor:
+        if self.ple is not None:
+            hidden_states = hidden_states + self.ple(
+                hidden_states, ple_input_ids, past_key_values, conv_mask=conv_mask,
+                position_ids=kwargs.pop("ple_position_ids", None),
+            )
+
+        hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
+        if self.layer_type == "linear_attention":
+            hidden_states = self.linear_attn(
+                hidden_states, cache_params=past_key_values, attention_mask=conv_mask, **kwargs
+            )
+        else:
+            hidden_states, _ = self.self_attn(
+                hidden_states,
+                position_embeddings,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                **kwargs,
+            )
+
+        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+        hidden_states = hyper_input + injection.flatten(-2)
+
+        hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+
+        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+        hidden_states = hyper_input + injection.flatten(-2)
+        return hidden_states
+
+class Qwen4ExpModelPrimeRL(Qwen4ExpModel):
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None, *args, **kwargs):
+        if position_ids is not None:
+            kwargs["ple_position_ids"] = position_ids if position_ids.ndim == 2 else position_ids[0]
+        return super().forward(input_ids, attention_mask, position_ids, *args, **kwargs)
+
+
 class Qwen4ExpForConditionalGenerationPrimeRL(
     Qwen4ExpForConditionalGeneration,
     PreTrainedModelPrimeRL,
@@ -113,15 +268,19 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
                 "checkpoint. Native-FP8 training is not implemented."
             )
         super().__init__(config)
+        self.model.__class__ = Qwen4ExpModelPrimeRL
         text_config = config.text_config
         use_grouped_mm = getattr(config, "use_grouped_mm", True)
         for layer in self.model.language_model.layers:
+            layer.__class__ = Qwen4ExpTextDecoderLayerPrimeRL
             if isinstance(layer.mlp, Qwen4ExpTextSparseMoeBlock):
                 layer.mlp = Qwen4ExpSparseMoePrimeRL(
                     text_config,
                     use_grouped_mm=use_grouped_mm,
                 )
             if layer.ple is not None:
+                layer.ple.__class__ = Qwen4ExpTextPLELayerPrimeRL
+                layer.ple.ple_embedding.__class__ = Qwen4ExpTextNGramEmbeddingPrimeRL
                 embedding = layer.ple.ple_embedding.ngram_embedding
                 sharded_embedding = EPShardedEmbedding(
                     embedding.num_embeddings,

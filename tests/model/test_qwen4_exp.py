@@ -543,3 +543,35 @@ def test_qwen38_rejects_native_fp8_training():
     config.quantization_config = {"quant_method": "fp8"}
     with pytest.raises(NotImplementedError, match="Native-FP8"):
         Qwen4ExpForConditionalGenerationPrimeRL(config)
+
+
+def test_packed_ple_survives_custom_lm_head():
+    """Custom heads bypass the outer HF forward; PLE still isolates packed rows."""
+    from transformers import set_seed
+    from arctic_platform.model.implementations.moe.layers.lm_head import _patch_model_forward
+
+    config = _tiny_config()
+    config.text_config.layer_types = ["linear_attention"] * config.text_config.num_hidden_layers
+    config.text_config.use_cache = False
+    set_seed(37)
+    model = Qwen4ExpForConditionalGenerationPrimeRL(config)
+
+    class Zero(torch.nn.Module):
+        def forward(self, hidden_states, *args, **kwargs):
+            return torch.zeros_like(hidden_states)
+
+    class HiddenHead(torch.nn.Module):
+        def forward(self, hidden_states, *args, **kwargs):
+            return hidden_states
+
+    for layer in model.model.language_model.layers:
+        layer.linear_attn = Zero()
+        layer.mlp = Zero()
+    model.lm_head = HiddenHead()
+    _patch_model_forward(model)
+    kwargs = dict(attention_mask={"linear_attention": None, "qwen_sparse_attention": None})
+    ids = torch.tensor([[2, 3, 4, 5, 6, 7, 8, 9]])
+    positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+    packed = model(input_ids=ids, position_ids=positions, **kwargs)
+    separate = model(input_ids=ids[:, 4:], position_ids=positions[:, 4:], **kwargs)
+    torch.testing.assert_close(packed[:, 4:], separate, rtol=0, atol=1e-6)
