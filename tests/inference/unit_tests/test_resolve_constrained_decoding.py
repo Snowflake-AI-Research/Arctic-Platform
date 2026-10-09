@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
+import sys
 from types import SimpleNamespace
 
 
@@ -57,6 +60,7 @@ class _FakeTokenizer:
 
 class _FakeCompiledGrammar(dict):
 
+    @property
     def memory_size_bytes(self):
         return 100
 
@@ -157,6 +161,116 @@ def _install_fake_replay(monkeypatch):
     replay._COMPILED_GRAMMAR_UNMEASURABLE_SKIPS = 0
     monkeypatch.setattr(replay, "_xgrammar", lambda: _FakeXgrammar)
     return replay
+
+
+def test_bounded_repetition_grammar_memory_is_measured():
+    import xgrammar as xgr
+
+    import arctic_platform.inference.server.action_mask_replay as replay
+
+    vocab = list('{}":,abcdefghijklmnopqrstuvwxyz0123456789 ')
+    tokenizer_info = xgr.TokenizerInfo(
+        vocab,
+        vocab_size=len(vocab),
+        stop_token_ids=[0],
+    )
+    compiler = xgr.GrammarCompiler(tokenizer_info, cache_enabled=False)
+    spec = json.dumps({
+        "type": "object",
+        "properties": {
+            f"field_{index}": {
+                "type": "string",
+                "maxLength": 4096,
+            }
+            for index in range(16)
+        },
+        "additionalProperties": False,
+    })
+
+    compiled = compiler.compile_json_schema(spec)
+    native_bytes = int(compiled.memory_size_bytes)
+
+    assert replay._compiled_grammar_size_bytes(
+        compiled, spec) == native_bytes + len(spec.encode("utf-8"))
+    assert native_bytes < 1024 * 1024
+
+
+def test_repeated_bounded_grammar_compilation_releases_native_memory():
+    if sys.platform != "linux":
+        import pytest
+
+        pytest.skip("RSS regression requires Linux /proc and malloc_trim")
+
+    script = r"""
+import ctypes
+import gc
+import json
+import os
+import string
+
+import xgrammar as xgr
+
+page_size = os.sysconf("SC_PAGE_SIZE")
+
+
+def rss_bytes():
+    with open("/proc/self/statm") as statm:
+        return int(statm.read().split()[1]) * page_size
+
+
+def trim():
+    gc.collect()
+    ctypes.CDLL(None).malloc_trim(0)
+
+
+def compile_batch(compiler, start, count):
+    for batch in range(start, start + count):
+        spec = json.dumps({
+            "type": "object",
+            "properties": {
+                f"field_{batch}_{field}": {
+                    "type": "string",
+                    "maxLength": 4096,
+                }
+                for field in range(16)
+            },
+            "additionalProperties": False,
+        })
+        compiled = compiler.compile_json_schema(spec)
+        del compiled
+
+
+vocab = list(string.printable)
+tokenizer_info = xgr.TokenizerInfo(
+    vocab,
+    vocab_size=len(vocab),
+    stop_token_ids=[0],
+)
+compiler = xgr.GrammarCompiler(tokenizer_info, cache_enabled=False)
+compile_batch(compiler, 0, 32)
+trim()
+baseline = rss_bytes()
+measurements = []
+for start in (32, 96, 160, 224):
+    compile_batch(compiler, start, 64)
+    trim()
+    measurements.append(rss_bytes())
+print(json.dumps({
+    "baseline": baseline,
+    "measurements": measurements,
+    "growth": max(measurements) - baseline,
+}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    measurements = json.loads(result.stdout.splitlines()[-1])
+
+    assert measurements["growth"] < 32 * 1024 * 1024, measurements
 
 
 def test_action_mask_replay_grammar_cache_uses_memory_budget(monkeypatch):
