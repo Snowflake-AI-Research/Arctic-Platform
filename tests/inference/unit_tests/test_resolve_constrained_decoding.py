@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 
@@ -57,6 +58,7 @@ class _FakeTokenizer:
 
 class _FakeCompiledGrammar(dict):
 
+    @property
     def memory_size_bytes(self):
         return 100
 
@@ -157,6 +159,38 @@ def _install_fake_replay(monkeypatch):
     replay._COMPILED_GRAMMAR_UNMEASURABLE_SKIPS = 0
     monkeypatch.setattr(replay, "_xgrammar", lambda: _FakeXgrammar)
     return replay
+
+
+def test_bounded_repetition_grammar_memory_is_measured():
+    import xgrammar as xgr
+
+    import arctic_platform.inference.server.action_mask_replay as replay
+
+    vocab = list('{}":,abcdefghijklmnopqrstuvwxyz0123456789 ')
+    tokenizer_info = xgr.TokenizerInfo(
+        vocab,
+        vocab_size=len(vocab),
+        stop_token_ids=[0],
+    )
+    compiler = xgr.GrammarCompiler(tokenizer_info, cache_enabled=False)
+    spec = json.dumps({
+        "type": "object",
+        "properties": {
+            f"field_{index}": {
+                "type": "string",
+                "maxLength": 4096,
+            }
+            for index in range(16)
+        },
+        "additionalProperties": False,
+    })
+
+    compiled = compiler.compile_json_schema(spec)
+    native_bytes = int(compiled.memory_size_bytes)
+
+    assert replay._compiled_grammar_size_bytes(
+        compiled, spec) == native_bytes + len(spec.encode("utf-8"))
+    assert native_bytes < 1024 * 1024
 
 
 def test_action_mask_replay_grammar_cache_uses_memory_budget(monkeypatch):
