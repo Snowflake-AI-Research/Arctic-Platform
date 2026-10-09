@@ -33,9 +33,11 @@ from transformers import Qwen3ForCausalLM
 from arctic_platform.model import LoaderContext
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import Patches
+from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import apply_patches
 from arctic_platform.model import apply_peft
 from arctic_platform.model import build_model
+from arctic_platform.model import resolve_model_spec
 from arctic_platform.model.patches.peft import cast_lora_adapters_off_fp8
 from arctic_platform.model.patches.peft import cast_trainable_params_off_fp8
 from arctic_platform.model.patches.peft import is_peft_lora_param
@@ -277,5 +279,10 @@ def test_worker_bridge_forwards_peft():
 
 
 def test_custom_moe_peft_requires_expert_integration():
+    spec = ModelSpec(
+        model_path_or_name="unused",
+        loader="qwen3_5_moe",
+        patches=Patches(peft={"peft_type": "Lora"}),
+    )
     with pytest.raises(ValueError, match="expert adapter integration"):
-        ModelSpec(model_path_or_name="unused", loader="qwen3_5_moe", patches=Patches(peft={"peft_type": "Lora"}))
+        resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))

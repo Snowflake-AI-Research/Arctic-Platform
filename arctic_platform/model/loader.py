@@ -148,21 +148,6 @@ def register_loader(
     return decorator
 
 
-def is_registered_loader(name: str) -> bool:
-    return name in _LOADERS
-
-
-def get_loader_options_model(name: str) -> type[BaseModel] | None:
-    """Return the pydantic options model registered for a loader, if any."""
-    return _LOADERS[name].options
-
-
-def validate_loader_spec(name: str, spec: ModelSpec) -> None:
-    validator = _LOADERS[name].validate_spec
-    if validator is not None:
-        validator(spec)
-
-
 def _platform_attention_default(platform: PlatformCapabilities) -> str:
     return {
         "blackwell": "flash_attention_4",
@@ -185,7 +170,6 @@ def resolve_spec_with_defaults(
 ) -> ModelSpec:
     if spec.loader is None:
         raise ValueError("ModelSpec.loader must be selected before platform-dependent fields are resolved")
-    entry = _LOADERS[spec.loader]
 
     resolved_attention = spec.attn_implementation
     if resolved_attention is None:
@@ -210,9 +194,6 @@ def resolve_spec_with_defaults(
             )
         loader_options["ep_comm_backend"] = resolved_ep_comm_backend
 
-    if entry.options is not None:
-        loader_options = entry.options.model_validate(loader_options).model_dump()
-
     fused_cross_entropy = loader_options.get("fused_cross_entropy")
     if spec.patches.liger:
         fused_cross_entropy = "liger"
@@ -232,16 +213,26 @@ def resolve_model_spec(
     spec: ModelSpec,
     platform: PlatformCapabilities | None = None,
 ) -> ModelSpec:
+    """Select a loader, validate its configuration, and apply platform decisions in place."""
     if spec.loader is None:
-        raise ValueError("ModelSpec.loader must be selected before platform-dependent fields are resolved")
-    return _LOADERS[spec.loader].resolve_spec(spec, platform or PlatformCapabilities.detect())
+        spec.loader = resolve_loader_name(spec)
+    elif spec.loader not in _LOADERS:
+        raise ValueError(f"unknown loader {spec.loader!r}")
+
+    entry = _LOADERS[spec.loader]
+    if entry.options is not None:
+        spec.loader_options = entry.options.model_validate(spec.loader_options).model_dump()
+    if entry.validate_spec is not None:
+        entry.validate_spec(spec)
+    return entry.resolve_spec(spec, platform or PlatformCapabilities.detect())
 
 
 def resolve_loader_name(spec: ModelSpec) -> str:
     """Resolve which loader a spec should use: single matching predicate, else the default."""
     ctx = LoaderContext(spec=spec)
     matched = [name for name, entry in _LOADERS.items() if entry.matches is not None and entry.matches(ctx)]
-    assert len(matched) <= 1, f"multiple loaders match: {matched}; set spec.loader to disambiguate"
+    if len(matched) > 1:
+        raise ValueError(f"multiple loaders match: {matched}; set spec.loader to disambiguate")
     if len(matched) == 1:
         return matched[0]
 

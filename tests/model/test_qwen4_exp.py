@@ -128,10 +128,9 @@ def test_qwen38_family_dispatch_and_custom_vlm_registration(tmp_path):
         model_path_or_name=_checkpoint(tmp_path, "qwen3_5_moe"),
         parallelism=ParallelismConfig(expert_parallel=2),
     )
-    resolved = resolve_model_spec(
-        qwen,
-        PlatformCapabilities.for_accelerator("hopper"),
-    )
+    platform = PlatformCapabilities.for_accelerator("hopper")
+    resolved = resolve_model_spec(qwen, platform)
+    resolve_model_spec(qwen35, platform)
     from arctic_platform.model.implementations.qwen38.deepspeed_integration import _adapter
 
     assert qwen.loader == "qwen4_exp"

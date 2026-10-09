@@ -25,6 +25,7 @@ from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
 from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import build_model
+from arctic_platform.model import resolve_model_spec
 from arctic_platform.model.loaders.generic_moe import GENERIC_MOE_MODEL_TYPES
 
 
@@ -45,6 +46,7 @@ def test_selection_uses_model_type(tmp_path, model_type, composite):
         model_path_or_name=_checkpoint(tmp_path, model_type, composite=composite),
         parallelism=ParallelismConfig(expert_parallel=2),
     )
+    resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
     assert spec.loader == "generic_moe"
 
 
@@ -54,6 +56,7 @@ def test_expert_parallel_one_does_not_select_generic_loader(tmp_path, model_type
         model_path_or_name=_checkpoint(tmp_path, model_type),
         parallelism=ParallelismConfig(expert_parallel=1),
     )
+    resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
     assert spec.loader == "huggingface"
 
 
@@ -77,6 +80,7 @@ def test_sequence_parallel_selects_generic_loader(tmp_path):
         model_path_or_name=_checkpoint(tmp_path, "qwen3_moe"),
         parallelism=ParallelismConfig(expert_parallel=2, sequence_parallel=2),
     )
+    resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
     assert spec.loader == "generic_moe"
 
 
@@ -132,9 +136,10 @@ def test_sequence_parallel_requires_process_group(tmp_path):
 
 
 def test_peft_patch_is_rejected(tmp_path):
+    spec = ModelSpec(
+        model_path_or_name=_checkpoint(tmp_path, "afmoe"),
+        parallelism=ParallelismConfig(expert_parallel=2),
+        patches=Patches(peft={"peft_type": "LORA"}),
+    )
     with pytest.raises(ValueError, match="expert adapter integration"):
-        ModelSpec(
-            model_path_or_name=_checkpoint(tmp_path, "afmoe"),
-            parallelism=ParallelismConfig(expert_parallel=2),
-            patches=Patches(peft={"peft_type": "LORA"}),
-        )
+        resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))

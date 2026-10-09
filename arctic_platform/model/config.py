@@ -198,7 +198,7 @@ class ModelSpec(BaseModel):
     attn_implementation: str | None = Field(
         None, description="Attention implementation override; the resolved loader supplies its default when omitted."
     )
-    loader: str | None = Field(None, description="Loader name; auto-resolved at construction when not set.")
+    loader: str | None = Field(None, description="Loader name; selected during model resolution when not set.")
     parallelism: ParallelismConfig = Field(
         default_factory=ParallelismConfig, description="Loader-specific parallelism."
     )
@@ -267,24 +267,3 @@ class ModelSpec(BaseModel):
 
         assert value == "auto" or isinstance(getattr(torch, value, None), torch.dtype), f"unknown dtype {value!r}"
         return value
-
-    @model_validator(mode="after")
-    def _resolve_loader(self) -> Self:
-        from arctic_platform.model.loader import get_loader_options_model
-        from arctic_platform.model.loader import is_registered_loader
-        from arctic_platform.model.loader import resolve_loader_name
-
-        if self.loader is None:
-            self.loader = resolve_loader_name(self)
-        else:
-            assert is_registered_loader(self.loader), f"unknown loader {self.loader!r}"
-
-        # Validate loader_options against the resolved loader's schema (if it has one),
-        # storing the fully-defaulted dict back so the spec records the effective values.
-        options_model = get_loader_options_model(self.loader)
-        if options_model is not None:
-            self.loader_options = options_model.model_validate(self.loader_options).model_dump()
-        from arctic_platform.model.loader import validate_loader_spec
-
-        validate_loader_spec(self.loader, self)
-        return self

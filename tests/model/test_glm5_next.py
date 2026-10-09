@@ -103,6 +103,9 @@ def test_glm53_flash_family_dispatch_uses_model_type(tmp_path):
         model_path_or_name=_checkpoint(tmp_path, "glm_moe_dsa"),
         parallelism=ParallelismConfig(expert_parallel=2),
     )
+    platform = PlatformCapabilities.for_accelerator("hopper")
+    resolve_model_spec(glm5, platform)
+    resolve_model_spec(glm52, platform)
 
     assert glm5.loader == "glm5_next"
     assert glm52.loader == "glm_moe_dsa"

@@ -45,10 +45,11 @@ def test_selection_uses_text_config_not_checkpoint_name(tmp_path, composite):
         model_path_or_name=str(tmp_path),
         parallelism=ParallelismConfig(expert_parallel=2),
     )
+    resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
     assert spec.loader == "qwen3_5_moe"
 
 
-def test_resolved_model_spec_uses_platform_attention_and_deepep(tmp_path):
+def test_model_spec_resolution_uses_platform_attention_and_deepep(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe"}))
     spec = ModelSpec(
         model_path_or_name=str(tmp_path),
@@ -148,8 +149,9 @@ def test_liger_fused_cross_entropy_allows_fp32_lm_head():
     ],
 )
 def test_spec_cannot_silently_ignore_settings(kwargs):
+    spec = ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", **kwargs)
     with pytest.raises(ValueError):
-        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", **kwargs)
+        resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
 
 
 def test_runtime_groups_are_required():
@@ -177,8 +179,9 @@ def test_sequence_parallel_group_is_required():
 
 @pytest.mark.parametrize("patches", [Patches(gradient_checkpointing=True), Patches(zorro_train={})])
 def test_generic_forward_patches_are_rejected(patches):
+    spec = ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", patches=patches)
     with pytest.raises(ValueError, match="generic forward patches"):
-        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", patches=patches)
+        resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
 
 
 def test_activation_offload_defaults_to_disabled():

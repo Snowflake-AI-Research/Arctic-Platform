@@ -22,7 +22,6 @@ import types
 
 import pytest
 import torch.nn as nn
-from pydantic import ValidationError
 
 from arctic_platform.model import LoadedModel
 from arctic_platform.model import LoaderContext
@@ -92,7 +91,9 @@ class TestLoaderSelection:
     def test_unset_loader_resolves_to_registered_default(self):
         """An unset loader is populated with whatever loader is registered as the default."""
         _register("base", default=True)
-        assert ModelSpec(model_path_or_name="x").loader == "base"
+        spec = ModelSpec(model_path_or_name="x")
+        assert spec.loader is None
+        assert resolve_model_spec(spec, PlatformCapabilities.for_accelerator("ampere")).loader == "base"
 
     def test_explicit_loader_overrides_default(self):
         _register("base", default=True)
@@ -101,8 +102,9 @@ class TestLoaderSelection:
 
     def test_unknown_loader_rejected(self):
         _register("base", default=True)
-        with pytest.raises(ValidationError):
-            ModelSpec(model_path_or_name="x", loader="nope")
+        spec = ModelSpec(model_path_or_name="x", loader="nope")
+        with pytest.raises(ValueError, match="unknown loader"):
+            resolve_model_spec(spec, PlatformCapabilities.for_accelerator("ampere"))
 
     def test_duplicate_default_rejected(self):
         """A second default loader is rejected at registration, not selection."""
@@ -121,7 +123,8 @@ class TestLoaderSelection:
             matches=lambda ctx: getattr(ctx.hf_config, "model_type", "") == "special",
         )
 
-        assert ModelSpec(model_path_or_name="x").loader == "special"
+        spec = ModelSpec(model_path_or_name="x")
+        assert resolve_model_spec(spec, PlatformCapabilities.for_accelerator("ampere")).loader == "special"
 
     def test_multiple_matches_rejected(self, monkeypatch):
         """Two matching predicates are ambiguous and rejected."""
@@ -134,8 +137,9 @@ class TestLoaderSelection:
         _register("m1", matches=lambda ctx: True)
         _register("m2", matches=lambda ctx: True)
 
-        with pytest.raises(ValidationError, match="multiple loaders match"):
-            ModelSpec(model_path_or_name="x")
+        spec = ModelSpec(model_path_or_name="x")
+        with pytest.raises(ValueError, match="multiple loaders match"):
+            resolve_model_spec(spec, PlatformCapabilities.for_accelerator("ampere"))
 
     def test_build_model_runs_resolved_loader_then_patches(self, monkeypatch):
         """build_model builds via the resolved loader and hands the result to the patch pipeline."""
@@ -280,7 +284,7 @@ class TestHuggingFaceLoader:
         with pytest.raises(ValueError, match="flash_attention_3.*unavailable"):
             resolve_model_spec(spec, platform)
 
-    def test_resolved_model_spec_is_serializable(self):
+    def test_model_spec_is_serializable_after_resolution(self):
         spec = ModelSpec(model_path_or_name="qwen", loader="huggingface")
         resolved = resolve_model_spec(
             spec,
@@ -299,6 +303,7 @@ class TestHuggingFaceLoader:
 
         spec = ModelSpec(model_path_or_name="qwen")
 
+        resolve_model_spec(spec, PlatformCapabilities.for_accelerator("ampere"))
         assert spec.loader == "huggingface"
 
     def test_unreadable_config_is_not_treated_as_a_missing_model(self, tmp_path):

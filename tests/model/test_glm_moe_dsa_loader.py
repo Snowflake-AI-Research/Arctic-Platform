@@ -26,6 +26,7 @@ from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
 from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import build_model
+from arctic_platform.model import resolve_model_spec
 from arctic_platform.model.loaders.glm_moe_dsa import GlmMoeDsaOptions
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
@@ -44,6 +45,7 @@ def test_selection_uses_model_type(tmp_path, composite):
         model_path_or_name=str(tmp_path),
         parallelism=ParallelismConfig(expert_parallel=2),
     )
+    resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
     assert spec.loader == "glm_moe_dsa"
 
 
@@ -122,6 +124,7 @@ def test_omitted_fused_cross_entropy_defaults_to_liger(tmp_path):
         model_path_or_name=str(tmp_path),
         parallelism=ParallelismConfig(expert_parallel=2),
     )
+    resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
     assert spec.loader_options["fused_cross_entropy"] == "liger"
 
     explicit = ModelSpec(
@@ -129,6 +132,7 @@ def test_omitted_fused_cross_entropy_defaults_to_liger(tmp_path):
         parallelism=ParallelismConfig(expert_parallel=2),
         loader_options={"fused_cross_entropy": False},
     )
+    resolve_model_spec(explicit, PlatformCapabilities.for_accelerator("hopper"))
     assert explicit.loader_options["fused_cross_entropy"] is False
 
 
@@ -161,8 +165,9 @@ def test_quack_fused_cross_entropy_is_supported():
     ],
 )
 def test_spec_cannot_silently_ignore_settings(kwargs):
+    spec = ModelSpec(model_path_or_name="local", loader="glm_moe_dsa", **kwargs)
     with pytest.raises(ValueError):
-        ModelSpec(model_path_or_name="local", loader="glm_moe_dsa", **kwargs)
+        resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
 
 
 def test_runtime_group_is_required():
