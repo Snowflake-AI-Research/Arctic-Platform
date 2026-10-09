@@ -229,16 +229,22 @@ def _qsa_indexer_forward(
         unsqueeze_dim=2,
     )
 
-    num_blocks = local_sequence_length // self.compress_ratio
-    grouped_key = raw_key[:, : num_blocks * self.compress_ratio].unflatten(1, (num_blocks, self.compress_ratio))
+    global_raw_key = _gather_sequence_no_grad(raw_key, cp_group)
+    global_cos = _gather_sequence_no_grad(local_cos[:, -local_sequence_length:], cp_group)
+    global_sin = _gather_sequence_no_grad(local_sin[:, -local_sequence_length:], cp_group)
+    global_sequence_length = global_raw_key.shape[1]
+    num_blocks = global_sequence_length // self.compress_ratio
+    grouped_key = global_raw_key[:, : num_blocks * self.compress_ratio].unflatten(
+        1,
+        (num_blocks, self.compress_ratio),
+    )
     compressed_key = grouped_key.float().mean(dim=2).to(raw_key.dtype)
     compressed_key = apply_rotary_pos_emb(
         self.k_layernorm(compressed_key),
-        cos=local_cos[:, : num_blocks * self.compress_ratio : self.compress_ratio],
-        sin=local_sin[:, : num_blocks * self.compress_ratio : self.compress_ratio],
+        cos=global_cos[:, : num_blocks * self.compress_ratio : self.compress_ratio],
+        sin=global_sin[:, : num_blocks * self.compress_ratio : self.compress_ratio],
         unsqueeze_dim=2,
     )
-    compressed_key = _gather_sequence_no_grad(compressed_key, cp_group)
     return select_qsa_token_ids(
         query,
         compressed_key,

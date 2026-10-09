@@ -31,8 +31,6 @@ from arctic_platform.model.implementations.gpu.sp.gated_delta_net import build_g
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from arctic_platform.model.implementations.moe.vlm import get_language_model
 
-# TileLang's dqkwg backward kernel can spin indefinitely on H200.
-os.environ.setdefault("FLA_TILELANG", "0")
 # Keep asynchronous EP backward from overtaking FLA collectives on other ranks.
 os.environ.setdefault("ARCTIC_UCCLEP_BACKWARD_BARRIER", "1")
 
@@ -259,11 +257,7 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
     world_size = dist.get_world_size(cp_group)
     if world_size != cp_size:
         raise ValueError(f"Qwen3.8 CP group size ({world_size}) does not match configured size ({cp_size})")
-    model_cp_group = dist.new_group(
-        ranks=dist.get_process_group_ranks(cp_group),
-        backend=dist.get_backend(cp_group),
-        use_local_synchronization=True,
-    )
+    model_cp_group = cp_group
 
     backbone = get_language_model(model)
     rank = dist.get_rank(model_cp_group)
