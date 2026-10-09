@@ -156,14 +156,12 @@ def _reap_orphan_ray_clusters() -> None:
     A SIGKILLed run can leave several kinds of stragglers behind, each squatting ports / GPU memory and breaking
     the *next* run:
       - Ray daemons (``ray start --head`` gcs / raylet / monitor) under temp dirs named ``ray_arctic_*``.
-      - The local HTTP server (``python -m arctic_platform.rl.http_server``).
       - Ray-actor workers (e.g. the sampling ``InferenceWorker``) and the vLLM ``EngineCore`` subprocesses they
         spawn.
 
-    The daemons / actors carry the ``ray_arctic_*`` session dir on their command line and the HTTP server carries
-    its module name, so we seed on a *cmdline-only* substring match (specific enough to never hit unrelated ray /
-    uvicorn processes) and expand to descendant trees -- which catches a still-linked vLLM ``EngineCore`` under the
-    matched ``raylet`` -> ``InferenceWorker`` (the common lingering-cluster case). An ``EngineCore`` that has been
+    The daemons / actors carry the ``ray_arctic_*`` session dir on their command line, so we seed on a
+    *cmdline-only* substring match (specific enough to never hit unrelated ray processes) and expand to descendant
+    trees -- which catches a still-linked vLLM ``EngineCore`` under the matched ``raylet`` -> ``InferenceWorker`` (the common lingering-cluster case). An ``EngineCore`` that has been
     fully reparented to init rewrites its command line to a bare title (``VLLM::EngineCore``) and is no longer a
     descendant of anything we match; for that narrow case we additionally seed any process *titled* exactly
     ``VLLM::EngineCore`` whose inherited environment still references ``ray_arctic_*``. Crucially we only ever read
@@ -175,7 +173,7 @@ def _reap_orphan_ray_clusters() -> None:
     BEFORE any worker spins up a cluster and every match is necessarily an orphan from an earlier run. Cheap no-op
     for non-RL sessions.
     """
-    cmd_markers = ("ray_arctic_", "arctic_platform.rl.http_server")
+    cmd_markers = ("ray_arctic_",)
     engine_title = "VLLM::EngineCore"
 
     def _read(pid: str, name: str) -> bytes:

@@ -16,13 +16,11 @@
 """TEMPORARY: SFT train → sync_weights → generate smoke (A6).
 
 Topology matches RL e2e: training_gpus=1, sampling_gpus=1, colocate=True.
-Client stays CPU-blanked.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 
 from transformers import AutoTokenizer
@@ -32,27 +30,24 @@ from arctic_platform.client import OnPremConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
-from arctic_platform.sft.examples.run_sft_http_demo import ATTN
-from arctic_platform.sft.examples.run_sft_http_demo import LR
-from arctic_platform.sft.examples.run_sft_http_demo import MODEL
-from arctic_platform.sft.examples.run_sft_http_demo import SEED
-from arctic_platform.sft.examples.run_sft_http_demo import _build_batch
-from arctic_platform.sft.examples.run_sft_http_demo import _load_examples
-from arctic_platform.sft.examples.run_sft_http_demo import _metric
+from arctic_platform.sft.examples.run_sft_demo import ATTN
+from arctic_platform.sft.examples.run_sft_demo import LR
+from arctic_platform.sft.examples.run_sft_demo import MODEL
+from arctic_platform.sft.examples.run_sft_demo import SEED
+from arctic_platform.sft.examples.run_sft_demo import _build_batch
+from arctic_platform.sft.examples.run_sft_demo import _load_examples
+from arctic_platform.sft.examples.run_sft_demo import _metric
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--checkpoint-dir", required=True)
-    ap.add_argument("--server-cuda-visible-devices", default="0")
     ap.add_argument("--steps", type=int, default=1)
     args = ap.parse_args()
 
     ckpt = Path(args.checkpoint_dir)
     ckpt.mkdir(parents=True, exist_ok=True)
-    print(f"client CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')!r}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
@@ -67,13 +62,7 @@ def main() -> None:
         training_gpus=1,
         sampling_gpus=1,
         job_ready_timeout=900.0,
-        backend=OnPremConfig(
-            host="localhost",
-            port=args.port,
-            colocate=True,
-            launch_local_server=True,
-            server_cuda_visible_devices=args.server_cuda_visible_devices,
-        ),
+        backend=OnPremConfig(colocate=True),
         sampling=SamplingConfig(
             vllm={"tensor_parallel_size": 1, "max_model_len": 512, "gpu_memory_utilization": 0.35}
         ),

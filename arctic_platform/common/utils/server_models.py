@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared request models and inference config helpers for HTTP and Ray RL servers."""
+"""Request models and inference config helpers for the Ray RL server."""
 
 from __future__ import annotations
 
@@ -168,34 +168,6 @@ class LogProbsRequest(BaseModel):
     top_k: int = 1
 
 
-class StepRequest(BaseModel):
-    learning_rate: float | None = None
-
-
-class SaveRequest(BaseModel):
-    # On-prem saves to the job's configured checkpoint_path; these mirror
-    # Cortex's `save(checkpoint_id, checkpoint_type)` and are accepted (unused).
-    checkpoint_id: str | None = None
-    checkpoint_type: str = "resumable"
-    # SFT extras (optional path/step override, HF export, rotation, stage metadata).
-    path: str | None = None
-    step: int | None = None
-    export_hf: bool = False
-    save_total_limit: int | None = None
-    stage_info: dict[str, Any] | None = None
-
-
-class LoadCheckpointRequest(BaseModel):
-    path: str | None = None
-    step: int | None = None
-
-
-class ResetPrefixCacheRequest(BaseModel):
-    drain: bool = True
-    timeout_s: float = 60.0
-    retry_interval_s: float = 0.1
-
-
 class WeightSyncRequest(BaseModel):
     # Matches Cortex's `weight_sync(source_sub_job_id, target_sub_job_ids)`.
     # On-prem treats a sub_job_id as its plain job id.
@@ -204,22 +176,6 @@ class WeightSyncRequest(BaseModel):
     target_sub_job_ids: list[int]
     cuda_ipc: bool | None = None
     low_memory: bool | None = None
-
-
-class OperationRequest(BaseModel):
-    # Generic data-plane envelope, matching Cortex's /{job_id}/operation. On-prem
-    # dispatches on operation_type; sub_job_id/sub_job_type are accepted for
-    # parity (unused, since on-prem addresses jobs by the job_id query param).
-    # sub_job_id is int on-prem (plain job id) and may be str on Cortex — accept both.
-    operation_type: str
-    sub_job_id: int | str | None = None
-    sub_job_type: str | None = None
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
-class WeightNormRequest(BaseModel):
-    training_job_id: int
-    sampling_job_id: int
 
 
 def parse_arctic_inference_rollout(arctic_inference_config, model_config_fields=None):

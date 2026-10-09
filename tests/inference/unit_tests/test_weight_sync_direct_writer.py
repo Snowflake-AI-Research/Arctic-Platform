@@ -34,7 +34,8 @@ if "ray" not in sys.modules:
 
 if "vllm" not in sys.modules:
     vllm_module = types.ModuleType("vllm")
-    vllm_module.__version__ = "0.26.0"
+    vllm_module.__path__ = []
+    vllm_module.__version__ = "0.30.0"
     config_module = types.ModuleType("vllm.config")
     scheduler_module = types.ModuleType("vllm.v1.core.sched.scheduler")
     loggers_module = types.ModuleType("vllm.v1.metrics.loggers")
@@ -72,6 +73,20 @@ if "vllm" not in sys.modules:
     sys.modules["vllm.v1.metrics"] = types.ModuleType("vllm.v1.metrics")
     sys.modules["vllm.v1.metrics.loggers"] = loggers_module
     sys.modules["vllm.v1.metrics.stats"] = stats_module
+    xgrammar_mod = types.ModuleType("vllm.v1.structured_output.backend_xgrammar")
+
+    class XgrammarGrammar:
+        def fill_bitmask(self, bitmask, idx):
+            return None
+
+    XgrammarGrammar.fill_bitmask._arctic_stop_mask_fix = True
+    xgrammar_mod.XgrammarGrammar = XgrammarGrammar
+    structured_output = types.ModuleType("vllm.v1.structured_output")
+    structured_output.__path__ = []
+    sys.modules["vllm.v1.structured_output"] = structured_output
+    sys.modules["vllm.v1.structured_output.backend_xgrammar"] = xgrammar_mod
+    for name in ("vllm.v1", "vllm.v1.core", "vllm.v1.core.sched", "vllm.v1.metrics"):
+        sys.modules[name].__path__ = []
 
 from arctic_platform.inference.server.weight_sync.receiver import (
     WeightSyncExtension,
@@ -551,6 +566,97 @@ def test_fused_writer_reports_canonical_moe_destination():
         "model.layers.0.mlp.experts.routed_experts.w13_weight"
     )
     assert writer.feed(wrapped_w13, torch.ones(1, 2, 1))
+
+
+def test_fused_writer_reports_minimax_block_sparse_moe_destination():
+    class RoutedExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w13_weight = nn.Parameter(torch.zeros(1, 2, 1))
+            self.w2_weight = nn.Parameter(torch.zeros(1, 1, 1))
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return expert_id
+
+        def weight_loader(self, *args, **kwargs):
+            return True
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block_sparse_moe = nn.Module()
+            self.block_sparse_moe.experts = nn.Module()
+            self.block_sparse_moe.experts.routed_experts = RoutedExperts()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList([Layer()])
+
+    from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
+
+    writer = _ShardAwareFusedWriter(Model(), torch.device("cpu"))
+    assert writer.destination_name(
+        "model.layers.0.block_sparse_moe.experts.w13_weight"
+    ) == "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight"
+
+
+def test_canonicalize_fused_moe_destination_inserts_routed_experts():
+    from arctic_platform.inference.server.weight_sync.receiver import (
+        _canonicalize_fused_moe_destination,
+    )
+
+    params = {
+        "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight",
+        "model.layers.0.block_sparse_moe.experts.routed_experts.w2_weight",
+    }
+    assert _canonicalize_fused_moe_destination(
+        "model.layers.0.block_sparse_moe.experts.w13_weight", params
+    ) == "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight"
+    assert _canonicalize_fused_moe_destination(
+        "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight", params
+    ) == "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight"
+
+
+def test_fused_writer_feeds_nongated_w13_as_w1_only():
+    calls: list[str] = []
+
+    class RoutedExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w13_weight = nn.Parameter(torch.zeros(2, 4, 1))
+            self.w2_weight = nn.Parameter(torch.zeros(2, 1, 1))
+            self.moe_config = SimpleNamespace(is_act_and_mul=False)
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return expert_id
+
+        def weight_loader(self, param, tensor, weight_name, shard_id, expert_id,
+                          return_success=False):
+            calls.append(shard_id)
+            assert tensor.shape[0] == 4
+            return True
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mixer = nn.Module()
+            self.mixer.experts = RoutedExperts()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList([Layer()])
+
+    from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
+
+    writer = _ShardAwareFusedWriter(Model(), torch.device("cpu"))
+    assert writer.feed(
+        "model.layers.0.mixer.experts.w13_weight", torch.ones(2, 4, 1)
+    )
+    assert calls == ["w1", "w1"]
 
 
 @pytest.mark.parametrize(
