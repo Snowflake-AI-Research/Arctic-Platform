@@ -23,6 +23,9 @@ from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import StreamLimits
 
 THINK, END_THINK = 10, 11
+# A tokenizer whose vocabulary has no think tokens.
+NO_THINK_TOKENS = "no-think-tokenizer"
+THINK_TOKENS_MISSING = "reasoning parser could not locate think start/end tokens in the tokenizer!"
 
 
 class FakeReasoningParser:
@@ -31,6 +34,9 @@ class FakeReasoningParser:
     end_token_id = END_THINK
 
     def __init__(self, tokenizer):
+        if tokenizer == NO_THINK_TOKENS:
+            # As vLLM's BaseThinkingReasoningParser (reasoning/basic_parsers.py:64).
+            raise RuntimeError(f"FakeReasoningParser {THINK_TOKENS_MISSING}")
         self.tokenizer = tokenizer
 
     def is_reasoning_end(self, token_ids):
@@ -87,6 +93,10 @@ def fake_vllm(monkeypatch):
             self.kwargs = kwargs
 
         def create_engine_config(self):
+            # vLLM builds the reasoning_parser kwarg's parser here
+            # (config/reasoning.py:87).
+            if self.kwargs.get("reasoning_parser") and built.get("tokenizer") == NO_THINK_TOKENS:
+                raise RuntimeError(f"FakeReasoningParser {THINK_TOKENS_MISSING}")
             # vLLM copies reasoning_parser over structured_outputs_config's
             # (arg_utils.py:2586); gpt-oss sets one itself when neither does
             # (models/config.py:406).
@@ -124,6 +134,10 @@ def fake_vllm(monkeypatch):
             "ReasoningParserManager": SimpleNamespace(
                 get_reasoning_parser=lambda name: FakeReasoningParser
             )
+        },
+        # None, as under skip_tokenizer_init, unless a test sets one.
+        "vllm.tokenizers": {
+            "cached_tokenizer_from_config": lambda model_config: built.get("tokenizer")
         },
         "vllm.sampling_params": {
             "StructuredOutputsParams": lambda **kwargs: kwargs,
@@ -453,3 +467,45 @@ def test_an_engine_that_already_has_a_reasoner_keeps_it_and_generate_is_unchange
 
     assert fake_vllm["reasoner_at_engine_start"] == "openai_gptoss"
     assert worker.llm.calls[0][2]["reasoning_ended"] is None
+
+
+def test_a_tables_reasoner_the_tokenizer_cannot_run_is_left_out(fake_vllm, monkeypatch, caplog):
+    # vLLM builds the structured-output reasoner on the first request with a
+    # grammar, so a missing think token would fail that request, not engine start.
+    fake_vllm["architecture"] = "Qwen3ForCausalLM"
+    fake_vllm["tokenizer"] = NO_THINK_TOKENS
+    with caplog.at_level("WARNING"):
+        worker = start_worker()
+
+    assert fake_vllm["reasoner_at_engine_start"] == ""
+    assert worker._chat_only_reasoner is False
+    assert chat_parsers(monkeypatch, worker) == (None, "hermes")
+    assert any("qwen3" in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+
+
+def test_a_tables_reasoner_the_tokenizer_can_run_is_kept(fake_vllm, monkeypatch):
+    fake_vllm["architecture"] = "Qwen3ForCausalLM"
+    fake_vllm["tokenizer"] = "tokenizer"
+    worker = start_worker()
+
+    assert fake_vllm["reasoner_at_engine_start"] == "qwen3"
+    assert chat_parsers(monkeypatch, worker) == ("qwen3", "hermes")
+
+
+def test_a_dropped_job_reasoning_parser_leaves_chat_without_one_either(fake_vllm, monkeypatch):
+    # The job's reasoning_parser is dropped when the tokenizer lacks its think
+    # tokens; the table's reasoner for chat needs the same tokens.
+    fake_vllm["architecture"] = "Qwen3ForCausalLM"
+    fake_vllm["tokenizer"] = NO_THINK_TOKENS
+    worker = start_worker(reasoning_parser="deepseek_r1")
+
+    assert "reasoning_parser" not in fake_vllm["engine_kwargs"]
+    assert worker._reasoning_parser is None
+    assert fake_vllm["reasoner_at_engine_start"] == ""
+    assert chat_parsers(monkeypatch, worker) == (None, "hermes")
+
+
+def test_an_explicit_chat_reasoning_parser_the_tokenizer_cannot_run_fails_start(fake_vllm):
+    fake_vllm["tokenizer"] = NO_THINK_TOKENS
+    with pytest.raises(ValueError, match="chat_reasoning_parser='qwen3'.*think tokens"):
+        start_worker(chat_reasoning_parser="qwen3")

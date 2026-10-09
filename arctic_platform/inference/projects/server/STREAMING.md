@@ -143,6 +143,12 @@ keeps it, and chat parses with it: the job's `reasoning_parser`,
 gets `openai_gptoss`). An explicit `chat_reasoning_parser` that differs from it
 fails engine start, since there is one per engine.
 
+A job `reasoning_parser` whose think tokens the tokenizer lacks is dropped with
+a warning (vLLM fails engine creation otherwise). The table's chat reasoner is
+checked against the tokenizer the same way and left out with a warning, so chat
+on such a checkpoint streams reasoning as content; an explicit
+`chat_reasoning_parser` that fails this check fails engine start.
+
 - Before rendering, any string in messages, tools or a named `tool_choice` that
   contains one of the tokenizer's special or added tokens fails the stream with
   `invalid_message_content` and `param` (for example `messages[1]`). Input the

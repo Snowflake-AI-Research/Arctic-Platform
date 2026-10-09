@@ -126,6 +126,29 @@ def _add_chat_reasoner(
     return True
 
 
+def _tokenizer_runs_reasoner(vllm_config: Any, reasoning_parser: str) -> bool:
+    """Whether the tokenizer has the markers ``reasoning_parser`` needs.
+
+    vLLM checks the job's reasoning_parser in create_engine_config, but builds
+    a structured-output reasoner added afterwards only on the first request
+    with a grammar, so check that one here.
+    """
+    from vllm.reasoning import ReasoningParserManager
+    from vllm.tokenizers import cached_tokenizer_from_config
+
+    tokenizer = cached_tokenizer_from_config(model_config=vllm_config.model_config)
+    if tokenizer is None:
+        # skip_tokenizer_init: no tokenizer to check, and no chat to render.
+        return True
+    try:
+        ReasoningParserManager.get_reasoning_parser(reasoning_parser)(tokenizer=tokenizer)
+    except RuntimeError as exc:
+        if "think start/end tokens" not in str(exc):
+            raise
+        return False
+    return True
+
+
 def _optional_bool(value: Any, *, name: str) -> bool | None:
     if value is None:
         return None
@@ -714,6 +737,22 @@ class InferenceWorker(StreamingWorkerMixin):
                     reasoning_parser=chat_reasoning_parser,
                     tool_call_parser=tool_call_parser,
                 )
+                if (
+                    chat_model is not None
+                    and chat_model.reasoning_parser
+                    and not vllm_config.structured_outputs_config.reasoning_parser
+                    and not _tokenizer_runs_reasoner(vllm_config, chat_model.reasoning_parser)
+                ):
+                    if chat_reasoning_parser is not None:
+                        raise ValueError(
+                            f"chat_reasoning_parser={chat_reasoning_parser!r} needs think "
+                            "tokens this model's tokenizer lacks"
+                        )
+                    logger.warning(
+                        "Tokenizer lacks think tokens; chat runs without reasoning_parser=%r",
+                        chat_model.reasoning_parser,
+                    )
+                    chat_model = replace(chat_model, reasoning_parser=None)
                 self._chat_only_reasoner = _add_chat_reasoner(
                     vllm_config,
                     chat_model.reasoning_parser if chat_model is not None else None,
