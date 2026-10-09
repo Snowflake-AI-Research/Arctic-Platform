@@ -99,6 +99,7 @@ def manager_methods(monkeypatch):
         monkeypatch.setattr(mamba_completion_refresh, "_APPLIED", False)
     required_patches.apply_required_vllm_patches()
     required_patches.apply_required_vllm_patches()
+    return root
 
 
 class Queue:
@@ -248,10 +249,10 @@ def test_skipped_checkpoint_rejoins_fenced_release():
 
 @pytest.mark.parametrize("attention_first", [False, True])
 @pytest.mark.parametrize("deferred", [False, True])
-def test_hybrid_completion_retains_a_partial_hit(attention_first, deferred):
+def test_hybrid_completion_retains_a_partial_hit(attention_first, deferred, manager_methods):
     import itertools
 
-    root = Path(os.environ["VLLM_SOURCE_ROOT"]) / "vllm/v1/core"
+    root = manager_methods
     functions = []
     for file, cls, method, name in [
         ("kv_cache_coordinator.py", "KVCacheCoordinator", "free", "coordinator_free"),
