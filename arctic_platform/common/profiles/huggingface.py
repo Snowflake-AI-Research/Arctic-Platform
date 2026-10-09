@@ -17,31 +17,40 @@
 
 from __future__ import annotations
 
+from arctic_platform.common.option_registry import Registry
 from arctic_platform.common.option_registry import register_profile
 
-register_profile(
-    "huggingface",
-    supports=[
-        "checkpointing.freq",
-        "checkpointing.offload",
-        "tiled_mlp.token_chunk_size",
-        "lm_head.fp32",
-        "lm_head.token_chunk_size",
-        "lm_head.vocab_chunk_size",
-        "liger",
-        "attention.backend",
-        "compile.fullgraph",
-        "peft",
-        "zorro_train",
-    ],
-    unsupported={
-        "checkpointing.mode": "no equivalent option; `patches.gradient_checkpointing` always recomputes whole layers",
-        "checkpointing.targets": "no equivalent option; selective checkpointing exists only in the custom loaders",
-        "lm_head.cross_entropy": "no equivalent option; the fused cross-entropy comes only with `patches.liger`",
-        "attention.sparse_mla": "no equivalent option; the sparse MLA kernel is chosen only by the glm_moe_dsa loader",
-        "numerics.reduce_dtype": "no equivalent option",
-    },
-    not_applicable={
-        "moe.*": "the huggingface loader rejects expert parallelism and has no expert options",
-    },
-)
+
+def register(registry: Registry) -> None:
+    """Register the ``huggingface`` profile into ``registry``."""
+    register_profile(
+        "huggingface",
+        supports=[
+            "checkpointing.freq",
+            "checkpointing.offload",
+            "tiled_mlp.token_chunk_size",
+            "lm_head.fp32",
+            "lm_head.token_chunk_size",
+            "lm_head.vocab_chunk_size",
+            "liger",
+            "attention.backend",
+            "compile.fullgraph",
+            "peft",
+            "zorro_train",
+        ],
+        unsupported={
+            "checkpointing.mode": (
+                "no equivalent option; `patches.gradient_checkpointing` always recomputes whole layers"
+            ),
+            "checkpointing.targets": "no equivalent option; selective checkpointing exists only in the custom loaders",
+            "lm_head.cross_entropy": "no equivalent option; the fused cross-entropy comes only with `patches.liger`",
+            "attention.sparse_mla": (
+                "no equivalent option; the sparse MLA kernel is chosen only by the glm_moe_dsa loader"
+            ),
+            "numerics.reduce_dtype": "no equivalent option",
+        },
+        not_applicable={
+            "moe.*": "the huggingface loader rejects expert parallelism and has no expert options",
+        },
+        registry=registry,
+    )

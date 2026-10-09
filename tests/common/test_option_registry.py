@@ -441,6 +441,25 @@ class TestRealRegistry:
         for name in names:
             assert set(settle(name)) == set(EXPECTED_KEYS)
 
+    def test_real_registry_fills_after_common_modules_are_reimported(self, monkeypatch):
+        """``test_common_light_imports`` drops ``arctic_platform.common.*`` from ``sys.modules``, after which the
+        built-in modules re-import against a fresh copy of this module. The real registry must still fill."""
+        import arctic_platform.common as common
+
+        for name in ("option_registry", "model_options", "profiles"):
+            module_name = f"arctic_platform.common.{name}"
+            if module_name in sys.modules:
+                monkeypatch.delitem(sys.modules, module_name)
+            if hasattr(common, name):
+                monkeypatch.delattr(common, name)
+        for module_name in [name for name in sys.modules if name.startswith("arctic_platform.common.profiles.")]:
+            monkeypatch.delitem(sys.modules, module_name)
+        monkeypatch.setattr(reg_mod, "REGISTRY", Registry(matrix_path=reg_mod.DEFAULT_MATRIX_PATH))
+
+        assert check_coverage() == []
+        assert len(reg_mod.options()) == len(EXPECTED_KEYS)
+        assert {profile.name for profile in reg_mod.profiles()} == EXPECTED_PROFILES
+
 
 class TestCommandLine(TestCasePlus):
     def _run(self, *args: str) -> list[str]:
