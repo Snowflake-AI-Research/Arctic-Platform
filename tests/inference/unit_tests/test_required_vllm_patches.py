@@ -1,4 +1,5 @@
 from arctic_platform.inference.vllm import (
+    config,
     dense_prompt_logprobs,
     dflash2_nan_fix,
     required_patches,
@@ -10,6 +11,11 @@ from arctic_platform.inference.vllm import (
 
 def test_required_vllm_patches_are_applied_together(monkeypatch):
     calls = []
+    monkeypatch.setattr(
+        config,
+        "ensure_dflash_max_position_patch",
+        lambda: calls.append("dflash_max_position"),
+    )
     monkeypatch.setattr(
         router_replay,
         "ensure_router_replay_vllm_patches",
@@ -44,4 +50,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "dense_prompt_logprobs",
         "spec_decode_grammar",
         "dflash2",
+        "dflash_max_position",
     ]

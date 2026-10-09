@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+from functools import wraps
 
 import vllm
 from pydantic import ConfigDict
@@ -125,6 +126,30 @@ class SpeculativeConfigPatch(ArcticPatch[SpeculativeConfig]):
                 self.num_speculative_tokens = getattr(self, "num_lookahead_slots", 1)
         else:
             self._orig_post_init()
+
+
+_DFLASH_PATCHED = False
+
+
+def ensure_dflash_max_position_patch() -> None:
+    global _DFLASH_PATCHED
+    if _DFLASH_PATCHED:
+        return
+    original = SpeculativeConfig.__post_init__
+
+    @wraps(original)
+    def post_init(self):
+        result = original(self)
+        if self.method == "dflash":
+            self._maybe_override_draft_max_position_embeddings(
+                self.draft_model_config.hf_config,
+                self.target_model_config.max_model_len,
+            )
+        return result
+
+    SpeculativeConfig.__post_init__ = post_init
+    SpeculativeConfigPatch._orig_post_init = post_init
+    _DFLASH_PATCHED = True
 
 
 class VllmConfigPatch(ArcticPatch[VllmConfig]):
