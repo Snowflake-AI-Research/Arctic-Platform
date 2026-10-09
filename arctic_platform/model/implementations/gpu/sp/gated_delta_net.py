@@ -317,9 +317,12 @@ def head_parallel_gated_delta_net(
     global_cu_seqlens: torch.Tensor,
     num_key_heads: int,
     num_value_heads: int,
+    fp32_beta: bool = True,
     **rule_kwargs,
 ):
     """Run convolution and recurrence on a full-sequence GDN head shard.
+
+    ``fp32_beta`` evaluates the beta gate as a sigmoid of fp32 ``b``; ``False`` evaluates it in ``b``'s own dtype.
 
     The first all-to-all exchanges native projected Q/K/V and gate preactivations
     from local-sequence/all-heads to full-sequence/local-heads. The depthwise
@@ -444,7 +447,12 @@ def head_parallel_gated_delta_net(
         num_value_heads=num_value_heads,
         process_group=process_group,
     )
-    beta = exchanged["b"].sigmoid()
+    # vLLM evaluates the beta gate as a sigmoid of fp32 ``b`` and keeps it in fp32; a sigmoid of low-precision
+    # ``b`` would round the gate before the recurrence reads it. This function is shared by the custom Qwen3.5-MoE
+    # model, which passes its ``fp32_parity`` setting, and by the generic transformers wrapper
+    # (``_adapt_gated_delta_net_module``), which keeps the default, so the layers that wrapper adapts also get the
+    # fp32 gate under sequence parallelism, whatever their own forward computes without it.
+    beta = exchanged["b"].float().sigmoid() if fp32_beta else exchanged["b"].sigmoid()
     g = -local_A_log.float().exp() * F.softplus(exchanged["a"].float() + local_dt_bias)
 
     replication = num_value_heads // num_key_heads
