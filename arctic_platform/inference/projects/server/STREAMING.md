@@ -96,8 +96,7 @@ collect the same events into a complete response.
 
 `prompt` may also be a `ChatPrompt` (`arctic_platform.inference.server.chat`):
 OpenAI-style `messages`, optional `tools`, `tool_choice`, `parallel_tool_calls`
-and `reasoning_effort`. `"chat_prompt" in STREAM_CAPABILITIES` tells callers the
-installed version supports it. The worker renders it with vLLM's own chat front
+and `reasoning_effort`. The worker renders it with vLLM's own chat front
 end on the loaded engine, so the model's template applies (including DeepSeek-V4
 and gpt-oss Harmony), and splits output with vLLM's reasoning and tool parsers.
 
@@ -128,8 +127,7 @@ reports `{"chat_prompt": bool, "thinking_optional": bool}` for a loaded model:
 whether its streams take a `ChatPrompt`, and whether thinking can be turned off.
 It builds the worker's chat front end, so `chat_prompt` is false when that
 fails; a model with no chat template still reports true and its streams fail
-with `chat_unsupported`. `"chat_prompt" in STREAM_CAPABILITIES` only says this
-Arctic version has chat mode.
+with `chat_unsupported`.
 
 The chat reasoning parser applies to chat streams only. The job's
 `reasoning_parser` also changes `/generate` (it prefills `<think>` for
