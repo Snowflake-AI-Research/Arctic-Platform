@@ -509,6 +509,7 @@ def test_qwen38_qsa_compresses_after_gather_for_unaligned_cp_shards(monkeypatch)
         hidden_states,
         position_embeddings,
         torch.ones(1, 3, dtype=torch.bool),
+        position_ids=torch.tensor([[3, 4, 5]]),
     )
 
     assert routes.shape == (1, 3, 3)
