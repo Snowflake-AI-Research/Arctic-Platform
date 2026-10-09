@@ -1,6 +1,6 @@
 # usage: make help
 
-.PHONY: help test test-cpu test-gpu test-fast test-flakefinder format autoflake
+.PHONY: help test test-cpu test-gpu test-fast test-flakefinder format autoflake list-options check-options
 .DEFAULT_GOAL := help
 
 # number of times test-flakefinder repeats every test; the session timeout scales with it (see below)
@@ -23,6 +23,12 @@ test-fast: ## run tests in parallel if there are large gpus
 # whole-suite cap (default session_timeout=3600s, set in pyproject.toml) by FLAKE_RUNS so it doesn't abort the run
 test-flakefinder: ## run the suite with flakefinder (FLAKE_RUNS=10 repeats), scaling the session timeout
 	pytest --flake-finder --flake-runs=$(FLAKE_RUNS) --session-timeout=$$(( 3600 * $(FLAKE_RUNS) )) --disable-warnings --instafail ./tests/
+
+list-options: ## list the registered model options
+	python -m arctic_platform.common.option_registry list
+
+check-options: ## check that every model profile settles every option and docs/models/matrix.md is fresh
+	python -m arctic_platform.common.option_registry check
 
 # pre-commit here runs on all modified files of the current branch, even if already pushed
 format: ## fix formatting
