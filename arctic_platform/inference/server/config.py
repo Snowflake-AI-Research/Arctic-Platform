@@ -118,11 +118,10 @@ class ModelConfig(BaseModel):
         kwargs = {k: v for k, v in self.model_dump().items() if v is not None}
         kwargs.update(self.extra_engine_kwargs)
         if len(self.text_config_overrides) > 0:
-            from arctic_platform.common.text_config_overrides import text_config_hf_overrides
-
             if "hf_overrides" in self.extra_engine_kwargs:
                 raise ValueError("text_config_overrides cannot be combined with extra_engine_kwargs.hf_overrides")
-            kwargs["hf_overrides"] = text_config_hf_overrides(kwargs["model"], self.text_config_overrides)
+            # Resolved in the worker: the coordinator calling this may not have the model files.
+            kwargs["text_config_overrides"] = self.text_config_overrides
         if not arctic_inference_effective_enabled(self.extra_env):
             kwargs.pop("forest_cascade_attn_configs", None)
         return kwargs

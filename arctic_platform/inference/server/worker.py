@@ -224,6 +224,11 @@ def _create_async_engine_args(
         engine_args_cls = Fp32LmHeadAsyncEngineArgs
 
     _coerce_structured_outputs_config(engine_kwargs)
+    text_config_overrides = engine_kwargs.pop("text_config_overrides", None)
+    if text_config_overrides:
+        from arctic_platform.common.text_config_overrides import text_config_hf_overrides
+
+        engine_kwargs["hf_overrides"] = text_config_hf_overrides(engine_kwargs["model"], text_config_overrides)
 
     try:
         engine_args = engine_args_cls(**engine_kwargs)

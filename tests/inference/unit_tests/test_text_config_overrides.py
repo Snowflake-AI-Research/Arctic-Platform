@@ -21,6 +21,7 @@ from transformers import AutoModelForCausalLM
 from vllm.config import ModelConfig as VllmModelConfig
 
 from arctic_platform.inference.server.config import ModelConfig as SamplerModelConfig
+from arctic_platform.inference.server.worker import _create_async_engine_args
 
 
 @pytest.mark.parametrize("layout", ["composite", "flat"])
@@ -62,9 +63,9 @@ def test_text_config_overrides_match_trainer_and_sampler(tmp_path, layout):
         rope_parameters=dict(rope_type="yarn", factor=2.0, original_max_position_embeddings=262144),
     )
     kwargs = SamplerModelConfig(model=path, text_config_overrides=overrides).to_engine_kwargs()
-    hf_overrides = kwargs["hf_overrides"]
+    assert "hf_overrides" not in kwargs
+    hf_overrides = _create_async_engine_args(kwargs).hf_overrides
     assert isinstance(hf_overrides, dict)
-    assert "text_config_overrides" not in kwargs
 
     from arctic_platform.common.text_config_overrides import apply_text_config_overrides
     from arctic_platform.common.text_config_overrides import text_config_hf_overrides
