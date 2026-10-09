@@ -15,7 +15,8 @@
 
 """Profile of the ``generic_moe`` loader (Qwen3-MoE, GLM-4-MoE, MiniMax, AFMoE, Nemotron-H).
 
-Options are ``GenericMoeOptions`` fields. The loader rejects the ``Patches`` wrappers.
+Options are ``GenericMoeOptions`` fields, or a ``ModelSpec`` field the loader accepts (``attn_implementation`` for
+``attention.backend``). The loader rejects the ``Patches`` wrappers.
 """
 
 from __future__ import annotations

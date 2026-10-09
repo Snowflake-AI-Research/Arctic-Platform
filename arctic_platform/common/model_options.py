@@ -16,8 +16,9 @@
 """The option entries: one per configurable option that exists in Arctic-Platform today.
 
 Only options with a one-to-one name on the loader side are registered. ``source`` names where each option is set
-today: a ``ModelSpec`` or ``Patches`` field for the ``huggingface`` loader, a ``loader_options`` field for the
-custom loaders, and an environment variable for the sampler. ``peft`` and ``zorro_train`` are training modes: the
+today: a ``ModelSpec`` or ``Patches`` field for the ``huggingface`` loader; for the custom loaders a
+``loader_options`` field or a ``ModelSpec`` field the loader accepts, such as ``attn_implementation``; and an
+environment variable for the sampler. ``peft`` and ``zorro_train`` are training modes: the
 profiles settle them, but they keep their own config fields.
 """
 
