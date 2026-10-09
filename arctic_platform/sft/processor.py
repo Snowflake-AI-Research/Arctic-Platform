@@ -39,6 +39,7 @@ from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.utils.tiled_logits import TiledLogProbEntropy
 from arctic_platform.common.utils.tiled_logits import chunked_logprobs_entropy_from_hidden
+from arctic_platform.common.utils.tiled_logits import deepspeed_lm_head_compute_params
 from arctic_platform.common.utils.tiled_logits import logits_chunk_rows
 from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
 from arctic_platform.common.utils.tiled_logits import tiled_logprobs_entropy_from_hidden
@@ -217,10 +218,10 @@ def sft_ce_sum_from_hidden(
         flat_labels = safe_labels.reshape(-1)
         chunk_rows = logits_chunk_rows(model.config.vocab_size, peak_mem_gib)
         num_shards = max(1, -(flat_hidden.shape[0] // -chunk_rows))  # ceil division
-        # Bind fp32 CE so it flows through the (replayed) tiled forward, matching
-        # the compute/none paths. lm_head.weight is the tied compute param whose
-        # grad DeepSpeed reduces with the embedding weight.
+        # Bind fp32 CE so it flows through the (replayed) tiled forward, matching the compute/none paths.
+        # DeepSpeed must see exactly one lm_head.weight reduction after every tiled shard has accumulated.
         tiled_fn = partial(tiled_logprobs_entropy_from_hidden, logits_compute_in_fp32=True)
+        compute_params, defer_compute_params_to_outer_graph = deepspeed_lm_head_compute_params(model)
         logprobs, _ = TiledLogProbEntropy.apply(
             tiled_fn,
             model,
@@ -229,7 +230,8 @@ def sft_ce_sum_from_hidden(
             1.0,  # temperature
             False,  # calculate_entropy
             num_shards,
-            [model.lm_head.weight],
+            compute_params,
+            defer_compute_params_to_outer_graph,
         )
         logprobs = logprobs.view(*safe_labels.shape)
 
