@@ -670,6 +670,37 @@ class TestCortexSharedHelper:
         # No advantage may survive on a padding column.
         assert torch.equal((moved_adv != 0), loss_mask)
 
+    def test_explicit_old_log_probs_ride_the_alignment(self):
+        """A caller-supplied pi_old has to move with the tokens it scored."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.tensor([[1, 2, 3, 4], [0, 0, 7, 8]])
+        attn = torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1]])
+        resp_mask = torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]])
+        old = torch.tensor([[0.0, 0.0, -0.1, -0.2], [0.0, 0.0, -0.7, -0.8]], dtype=torch.float64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": resp_mask.to(torch.float32),
+                    "response_mask": resp_mask,
+                    "old_log_probs": torch.full((2, 4), -9.0),
+                },
+                "meta": {},
+            },
+            old_log_probs_shifted=old,
+        )
+        sent = out["context"]["old_log_probs_shifted"]
+        assert sent.dtype == torch.float32
+        loss_mask = out["context"]["loss_mask"]
+        assert sent[1][loss_mask[1]].tolist() == pytest.approx([-0.7, -0.8])
+        assert sent[0][loss_mask[0]].tolist() == pytest.approx([-0.1, -0.2])
+        # The batch's own ``old_log_probs`` are still dropped.
+        assert "old_log_probs" not in out["kwargs"]
+
     def test_already_aligned_batch_is_passed_through(self):
         """An already-conformant batch must not pay for
         a gather -- and must not be perturbed by one."""

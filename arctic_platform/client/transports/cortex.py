@@ -28,6 +28,8 @@ import base64
 import contextlib
 import hashlib
 import json
+import logging
+import os
 import time
 from typing import Any
 from typing import Iterator
@@ -47,6 +49,8 @@ from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
+
+logger = logging.getLogger(__name__)
 
 _MAX_OCTET_BYTES = 60 * 1024 * 1024  # matches the SnowAPI per-request cap
 # HTTP statuses worth retrying: the request was well-formed, so the same call may
@@ -323,10 +327,16 @@ class CortexTransport(Transport):
         else:
             # A mutating create: only retry when the request provably never landed,
             # so we can't spawn duplicate jobs (matches the neutrino client).
-            created = self._send(
-                "POST", self._prefix, retry_on=_is_connect_error, json={"sub_job_configs": self._sub_job_configs()}
-            )
+            body: dict = {"sub_job_configs": self._sub_job_configs()}
+            # Shared schema reports submitted_by=ADMIN; the comment is the ownership signal.
+            comment = os.environ.get("CORTEX_JOB_COMMENT")
+            if comment:
+                body["comment"] = comment
+            created = self._send("POST", self._prefix, retry_on=_is_connect_error, json=body)
             self.job_id = created["job_id"]
+            # Logged before the wait: a job can stay PLACING for a long time, and its id
+            # is the only way to cancel it if this process stops first.
+            logger.info("created cortex job %s; waiting for it to run", self.job_id)
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
         # JobHandles holds each role's sub-job token, so the client's op bodies

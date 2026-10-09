@@ -22,6 +22,7 @@ framework dependencies, so the extras are gated one level down, in each
 adapter's own ``__init__``. Users select an adapter by extra:
 
     pip install "arctic_platform[verl]"    # [rl] + hydra-core, framework user-supplied
+    pip install "arctic_platform[tinker]"  # in-process Tinker client
     pip install "arctic_platform[skyrl]"   # (future)
 
 and, for verl specifically, by exporting the plugin hook at launch time:

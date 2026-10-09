@@ -85,6 +85,7 @@ all = [
     "arctic_platform[testing]",
     "arctic_platform[cortex]",
     "arctic_platform[onprem]",
+    "arctic_platform[tinker]",
     "arctic_platform[verl]",
 ]
 
@@ -93,18 +94,22 @@ dev = [
     "arctic_platform[testing]",
 ]
 
-# Pulls [cortex] so the transport tests can import the client. Not [onprem]: it
-# reaches [rl] -> arctic-inference[vllm], and vLLM's build needs CUDA_HOME, which
-# a CPU-only CI runner does not have. The on-prem tests skip without it.
+# Pulls [tinker], itself a superset of [cortex], so the transport tests can
+# import the client and the Tinker tests can import the SDK. Not [onprem]:
+# it reaches [rl] -> arctic-inference[vllm], and vLLM's build needs CUDA_HOME,
+# which a CPU-only CI runner does not have. The on-prem tests skip without it.
 testing = [
-    "arctic_platform[cortex]",
+    "arctic_platform[tinker]",
+    "httpx",
     "parameterized",
+    "pytest-asyncio",
     "pytest-instafail",
     "pytest-flakefinder",
     "pytest-sugar",
     "pytest-timeout",
     "pytest-xdist",
     "pytest",
+    "tinker==0.25.0",
 ]
 
 formatting = [
@@ -127,6 +132,14 @@ cortex = [
     "tenacity",
     "torch",
     "urllib3",
+]
+
+# In-process Tinker client. [cortex] plus the tokenizer the job config loads.
+# No GPU and no training stack: Cortex owns those. The tinker SDK is
+# user-supplied.
+tinker = [
+    "arctic_platform[cortex]",
+    "transformers",
 ]
 
 # A training-only on-prem server, plus the client that drives it. Deliberately
