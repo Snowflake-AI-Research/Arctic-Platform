@@ -15,7 +15,7 @@
 
 """Reject speculative drafts whose grammar rows were not built for them.
 
-vLLM 0.30.0 fills a structured-output bitmask row from the live grammar only
+vLLM 0.31.0 fills a structured-output bitmask row from the live grammar only
 until it sees a placeholder draft id (-1). Later rows, including the bonus
 row, are left unconstrained. Under async scheduling the rejection sampler does
 not verify that placeholder list. It verifies the drafter's own token ids,
