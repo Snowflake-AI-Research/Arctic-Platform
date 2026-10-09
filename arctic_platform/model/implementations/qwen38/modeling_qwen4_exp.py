@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 from torch import Tensor
@@ -57,11 +58,22 @@ class EPShardedEmbedding(nn.Embedding):
                 f"rank={rank}, expected={local_rows}, actual={self.weight.shape[0]}"
             )
 
+        input_shape = input.shape
+        size = torch.tensor([input.numel()], device=input.device)
+        sizes = [torch.empty_like(size) for _ in range(world_size)]
+        dist.all_gather(sizes, size, group=self._ep_group)
+        counts = [int(value.item()) for value in sizes]
+        padded = F.pad(input.reshape(-1), (0, max(counts) - input.numel()))
+        inputs = [torch.empty_like(padded) for _ in range(world_size)]
+        dist.all_gather(inputs, padded, group=self._ep_group)
+        input = torch.cat([ids[:count] for ids, count in zip(inputs, counts)])
         local_mask = (input >= start) & (input < start + local_rows)
         local_input = (input - start).clamp(min=0, max=local_rows - 1)
         output = F.embedding(local_input, self.weight)
         output = output * local_mask.unsqueeze(-1).to(output.dtype)
-        return dist_nn.all_reduce(output, group=self._ep_group)
+        output = dist_nn.all_reduce(output, group=self._ep_group)
+        offset = sum(counts[:rank])
+        return output[offset : offset + counts[rank]].reshape(*input_shape, self.embedding_dim)
 
 
 class Qwen4ExpSparseMoePrimeRL(MoE):

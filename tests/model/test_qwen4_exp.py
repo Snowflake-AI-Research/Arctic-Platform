@@ -330,6 +330,15 @@ def test_qwen38_ep_embedding_masks_nonlocal_rows(monkeypatch):
         lambda tensor, group: tensor,
     )
 
+    def all_gather_same_ids(outputs, tensor, group):
+        for output in outputs:
+            output.copy_(tensor)
+
+    monkeypatch.setattr(
+        "arctic_platform.model.implementations.qwen38.modeling_qwen4_exp.dist.all_gather",
+        all_gather_same_ids,
+    )
+
     output = embedding(torch.tensor([[0, 4, 6]]))
     torch.testing.assert_close(
         output,
