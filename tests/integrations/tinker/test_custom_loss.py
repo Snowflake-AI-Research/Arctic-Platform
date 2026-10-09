@@ -116,15 +116,21 @@ class TestGrpoSurrogate:
     def test_weights_become_negated_advantages(self):
         body = {"logprob_weights_shifted": torch.tensor([[0.5, -1.5]])}
         out, meta = _grpo_surrogate(body, {"batch_num_tokens": 9})
-        assert out["advantages"].tolist() == [[-0.5, 1.5]]
+        # Advantages carry the token count so token-mean's division cancels.
+        assert out["advantages"].tolist() == [[-4.5, 13.5]]
+        assert meta["batch_num_tokens"] == 9
         assert "logprob_weights_shifted" not in out
 
     def test_token_mean_divisor_is_cancelled(self):
-        """Tinker's CE is an unnormalized sum and the client has already scaled
-        the weights, so grpo's ``masked_sum / batch_num_tokens`` must not
-        rescale the gradient."""
-        _, meta = _grpo_surrogate({"logprob_weights_shifted": torch.zeros(1, 2)}, {"batch_num_tokens": 9})
-        assert meta["batch_num_tokens"] == 1
+        """Tinker's CE is an unnormalized sum. The server rejects a
+        batch_num_tokens that is not the real mask sum, so the count stays
+        and the advantages absorb it."""
+        body, meta = _grpo_surrogate(
+            {"logprob_weights_shifted": torch.tensor([[1.0, -2.0]])},
+            {"batch_num_tokens": 9},
+        )
+        assert meta["batch_num_tokens"] == 9
+        assert body["advantages"].tolist() == [[-9.0, 18.0]]
 
     def test_missing_weights_raises(self):
         with pytest.raises(ValueError, match="logprob_weights_shifted"):
@@ -174,6 +180,36 @@ class TestSurrogateIsScopedToCrossEntropy:
         assert "logprob_weights_shifted" not in sent["kwargs"]
         assert "logprob_weights_shifted" not in sent["context"]
         assert sent["processing"]["config"]["batch_num_tokens"] != 1
+
+
+class TestCrossEntropyKeepsTheRealTokenCount:
+    """The server recomputes ``batch_num_tokens`` from the loss mask and rejects
+    a config value that differs. The wire value has to be that sum, not 1."""
+
+    def test_config_carries_the_mask_sum(self):
+        import asyncio
+
+        from arctic_platform.integrations.tinker.cortex import CortexTinkerBackend
+
+        batch, _ = _pack([_ce_datum([1, 2, 3, 4], [0.0, 1.0, 1.0, 1.0])])
+        expected = int(batch["meta"]["batch_num_tokens"])
+        assert expected > 1
+
+        class _Stub:
+            def __init__(self):
+                self.sent = []
+
+            async def fwd_bwd(self, payload, processing=None, router_replay=None):
+                self.sent.append(payload)
+                return {"batch": {"logprobs": payload["kwargs"]["input_ids"].to(torch.float32)}}
+
+        stub = _Stub()
+        asyncio.run(CortexTinkerBackend(stub).fwd_bwd(batch))
+        sent = stub.sent[0]
+        assert sent["processing"]["config"]["batch_num_tokens"] == expected
+        assert sent["processing"]["config"]["global_batch_size"] == 1
+        scored = sent["context"]["advantages"][sent["context"]["loss_mask"]]
+        assert float(scored.abs().max()) == pytest.approx(expected)
 
 
 class TestGradientEquivalence:

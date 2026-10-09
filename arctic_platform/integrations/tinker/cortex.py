@@ -63,7 +63,13 @@ def _clip_config(ratio_clip: tuple[float, float]) -> dict[str, float]:
 
 
 def _grpo_surrogate(body: dict, meta: dict) -> tuple[dict, dict]:
-    """Encode Tinker's weighted log-prob gradient with stock ``grpo``."""
+    """Encode Tinker's weighted log-prob gradient with stock ``grpo``.
+
+    Token-mean divides by ``batch_num_tokens``. The server writes that same
+    count into the loss context and rejects a config value that differs, so
+    the count stays the real mask sum. Scaling the advantages by it cancels
+    the division and leaves Tinker's unnormalized sum, ``dL/dlogprobs = -weights``.
+    """
     if _LOGPROB_WEIGHTS not in body:
         raise ValueError(
             f"loss_fn={_WEIGHTED_LOGPROB_SUM!r} needs {_LOGPROB_WEIGHTS!r} in the "
@@ -71,7 +77,10 @@ def _grpo_surrogate(body: dict, meta: dict) -> tuple[dict, dict]:
             "advantages would carry no signal and the step would be a no-op."
         )
     weights = body.pop(_LOGPROB_WEIGHTS)
-    return {**body, "advantages": -weights}, {**meta, "batch_num_tokens": 1}
+    token_count = meta.get("batch_num_tokens")
+    if not token_count:
+        raise ValueError("weighted cross-entropy needs a positive meta batch_num_tokens")
+    return {**body, "advantages": -weights * float(token_count)}, meta
 
 
 def _pad_rows(body: dict, min_rows: int) -> dict:
