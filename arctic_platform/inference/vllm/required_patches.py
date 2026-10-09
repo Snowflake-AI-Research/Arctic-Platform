@@ -17,6 +17,7 @@
 
 
 def apply_required_vllm_patches() -> None:
+    from arctic_platform.inference.vllm.mrope_yarn import ensure_mrope_yarn_fix
     from arctic_platform.inference.vllm.dense_prompt_logprobs import (
         ensure_dense_prompt_logprobs_patch,
     )
@@ -38,3 +39,4 @@ def apply_required_vllm_patches() -> None:
     ensure_dense_prompt_logprobs_patch()
     ensure_spec_decode_grammar_fix()
     apply_dflash2_nan_fixes()
+    ensure_mrope_yarn_fix()
