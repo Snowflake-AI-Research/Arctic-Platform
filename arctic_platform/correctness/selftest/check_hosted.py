@@ -52,7 +52,7 @@ class _Client:
     def __init__(self, *, losses=(), save_result=None, catalog=None, added=()) -> None:
         self.losses = list(losses)
         self.save_result = {} if save_result is None else dict(save_result)
-        self.catalog = [dict(entry) for entry in (catalog or [])]
+        self.catalog = [dict(entry) for entry in catalog or []]
         self.added = [dict(entry) for entry in added]
         self.calls: list = []
         self.created: list = []

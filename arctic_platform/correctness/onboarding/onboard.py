@@ -24,7 +24,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
@@ -269,10 +268,11 @@ def build_spec(
     from arctic_platform.correctness.harness.seeds import SEED
     from arctic_platform.correctness.harness.spec import ArmSpec
     from arctic_platform.correctness.harness.spec import TestSpec
+    from arctic_platform.correctness.harness.workdir import correctness_workdir
     from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
     from arctic_platform.correctness.onboarding.synth_model import size_for_single_gpu
 
-    temporary = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="dss-onboard-"))
+    temporary = Path(workdir) if workdir else correctness_workdir("dss-onboard-")
     temporary.mkdir(parents=True, exist_ok=True)
     if num_layers is None:
         num_layers, _ = size_for_single_gpu(source_checkpoint)
@@ -932,6 +932,7 @@ def _parent(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.config import validate_against_host
     from arctic_platform.correctness.harness.dss_driver import available_gpus
     from arctic_platform.correctness.harness.preflight import ensure_no_interrupted_builds
+    from arctic_platform.correctness.harness.workdir import correctness_workdir
 
     config = load_config(args.config)
     if config.is_rl:
@@ -958,13 +959,7 @@ def _parent(args: argparse.Namespace) -> int:
     if args.output_dir is None:
         # Onboarding diagnostics are large and recreatable, so they belong on the node's fast disk rather than
         # in the shared checkout. Losing them costs nothing: the next onboarding writes them again.
-        fast_disk = Path("/data-fast")
-        base = (
-            fast_disk / "dss-correctness/onboarding"
-            if fast_disk.exists()
-            else args.checkout_root / ".agent-work/config-onboarding"
-        )
-        args.output_dir = base / config.config_id
+        args.output_dir = correctness_workdir("config-onboarding-") / config.config_id
     else:
         args.output_dir = args.output_dir.resolve()
     if args.test_spec is None:

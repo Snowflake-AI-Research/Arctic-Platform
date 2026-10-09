@@ -88,12 +88,10 @@ if "vllm" not in sys.modules:
     for name in ("vllm.v1", "vllm.v1.core", "vllm.v1.core.sched", "vllm.v1.metrics"):
         sys.modules[name].__path__ = []
 
-from arctic_platform.inference.server.weight_sync.receiver import (
-    WeightSyncExtension,
-    _loaded_destination_names,
-    _model_parameter_l2,
-    _tensor_l2_sq,
-)
+from arctic_platform.inference.server.weight_sync.receiver import WeightSyncExtension
+from arctic_platform.inference.server.weight_sync.receiver import _loaded_destination_names
+from arctic_platform.inference.server.weight_sync.receiver import _model_parameter_l2
+from arctic_platform.inference.server.weight_sync.receiver import _tensor_l2_sq
 
 
 def test_direct_zero_copy_keeps_non_contiguous_parameter_views(monkeypatch):
@@ -218,29 +216,15 @@ def test_direct_param_writer_maps_checkpoint_wrapped_layer_keys(monkeypatch):
     writer = _DirectParamWriter(Model(), torch.device("cpu"))
 
     unwrapped_q = writer.get_view("model.layers.0.self_attn.q_proj.weight")
-    wrapped_q = writer.get_view(
-        "model.layers.0._checkpoint_wrapped_module.self_attn.q_proj.weight"
-    )
+    wrapped_q = writer.get_view("model.layers.0._checkpoint_wrapped_module.self_attn.q_proj.weight")
     unwrapped_gate = writer.get_view("model.layers.0.mlp.gate_proj.weight")
-    wrapped_gate = writer.get_view(
-        "model.layers.0._checkpoint_wrapped_module.mlp.gate_proj.weight"
-    )
-    unwrapped_w13 = writer.get_view(
-        "model.layers.0.mlp.experts.w13_weight"
-    )
-    wrapped_w13 = writer.get_view(
-        "model.layers.0._checkpoint_wrapped_module.mlp.experts.w13_weight"
-    )
-    unwrapped_w2 = writer.get_view(
-        "model.layers.0.mlp.experts.w2_weight"
-    )
-    wrapped_w2 = writer.get_view(
-        "model.layers.0._checkpoint_wrapped_module.mlp.experts.w2_weight"
-    )
+    wrapped_gate = writer.get_view("model.layers.0._checkpoint_wrapped_module.mlp.gate_proj.weight")
+    unwrapped_w13 = writer.get_view("model.layers.0.mlp.experts.w13_weight")
+    wrapped_w13 = writer.get_view("model.layers.0._checkpoint_wrapped_module.mlp.experts.w13_weight")
+    unwrapped_w2 = writer.get_view("model.layers.0.mlp.experts.w2_weight")
+    wrapped_w2 = writer.get_view("model.layers.0._checkpoint_wrapped_module.mlp.experts.w2_weight")
     unwrapped_ln = writer.get_view("model.layers.0.input_layernorm.weight")
-    wrapped_ln = writer.get_view(
-        "model.layers.0._checkpoint_wrapped_module.input_layernorm.weight"
-    )
+    wrapped_ln = writer.get_view("model.layers.0._checkpoint_wrapped_module.input_layernorm.weight")
 
     assert wrapped_q is unwrapped_q
     assert wrapped_gate is unwrapped_gate
@@ -258,18 +242,22 @@ def test_direct_param_writer_maps_checkpoint_wrapped_layer_keys(monkeypatch):
     assert tuple(unwrapped_w2.shape) == (2, 3, 3)
     assert tuple(unwrapped_ln.shape) == (3,)
 
-    assert writer.get_destination(
-        "model.layers.0._checkpoint_wrapped_module.self_attn.q_proj.weight"
-    ) == "model.layers.0.self_attn.qkv_proj.weight"
-    assert writer.get_destination(
-        "model.layers.0._checkpoint_wrapped_module.mlp.gate_proj.weight"
-    ) == "model.layers.0.mlp.gate_up_proj.weight"
-    assert writer.get_destination(
-        "model.layers.0._checkpoint_wrapped_module.mlp.experts.w13_weight"
-    ) == "model.layers.0.mlp.experts.routed_experts.w13_weight"
-    assert writer.get_destination(
-        "model.layers.0._checkpoint_wrapped_module.input_layernorm.weight"
-    ) == "model.layers.0.input_layernorm.weight"
+    assert (
+        writer.get_destination("model.layers.0._checkpoint_wrapped_module.self_attn.q_proj.weight")
+        == "model.layers.0.self_attn.qkv_proj.weight"
+    )
+    assert (
+        writer.get_destination("model.layers.0._checkpoint_wrapped_module.mlp.gate_proj.weight")
+        == "model.layers.0.mlp.gate_up_proj.weight"
+    )
+    assert (
+        writer.get_destination("model.layers.0._checkpoint_wrapped_module.mlp.experts.w13_weight")
+        == "model.layers.0.mlp.experts.routed_experts.w13_weight"
+    )
+    assert (
+        writer.get_destination("model.layers.0._checkpoint_wrapped_module.input_layernorm.weight")
+        == "model.layers.0.input_layernorm.weight"
+    )
 
 
 class _FakeEngine:
@@ -454,7 +442,7 @@ def test_load_batched_counts_empty_loader_result_as_rank_skip(caplog):
                 ("weight", torch.tensor([2.0])),
                 ("non_local.weight", torch.tensor([3.0])),
             ]
-        )
+        ),
     )
 
     loaded, recv_l2_sq, applied_l2_sq, mappings, skipped = result
@@ -463,9 +451,7 @@ def test_load_batched_counts_empty_loader_result_as_rank_skip(caplog):
     assert applied_l2_sq == 4.0
     assert mappings == {"weight": ["weight"]}
     assert skipped == ["non_local.weight"]
-    assert [record for record in caplog.records if record.levelname == "WARNING"] == [
-        caplog.records[-1]
-    ]
+    assert [record for record in caplog.records if record.levelname == "WARNING"] == [caplog.records[-1]]
     assert "skipped 1/2" in caplog.records[-1].getMessage()
 
 
@@ -553,18 +539,16 @@ def test_fused_writer_reports_canonical_moe_destination():
 
     writer = _ShardAwareFusedWriter(Model(), torch.device("cpu"))
 
-    assert writer.destination_name(
-        "model.layers.0.mlp.experts.w13_weight"
-    ) == "model.layers.0.mlp.experts.routed_experts.w13_weight"
-    assert writer.destination_name(
-        "model.layers.0.mlp.experts.w2_weight"
-    ) == "model.layers.0.mlp.experts.routed_experts.w2_weight"
-    wrapped_w13 = (
-        "model.layers.0._checkpoint_wrapped_module.mlp.experts.w13_weight"
+    assert (
+        writer.destination_name("model.layers.0.mlp.experts.w13_weight")
+        == "model.layers.0.mlp.experts.routed_experts.w13_weight"
     )
-    assert writer.destination_name(wrapped_w13) == (
-        "model.layers.0.mlp.experts.routed_experts.w13_weight"
+    assert (
+        writer.destination_name("model.layers.0.mlp.experts.w2_weight")
+        == "model.layers.0.mlp.experts.routed_experts.w2_weight"
     )
+    wrapped_w13 = "model.layers.0._checkpoint_wrapped_module.mlp.experts.w13_weight"
+    assert writer.destination_name(wrapped_w13) == "model.layers.0.mlp.experts.routed_experts.w13_weight"
     assert writer.feed(wrapped_w13, torch.ones(1, 2, 1))
 
 
@@ -597,26 +581,29 @@ def test_fused_writer_reports_minimax_block_sparse_moe_destination():
     from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
 
     writer = _ShardAwareFusedWriter(Model(), torch.device("cpu"))
-    assert writer.destination_name(
-        "model.layers.0.block_sparse_moe.experts.w13_weight"
-    ) == "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight"
+    assert (
+        writer.destination_name("model.layers.0.block_sparse_moe.experts.w13_weight")
+        == "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight"
+    )
 
 
 def test_canonicalize_fused_moe_destination_inserts_routed_experts():
-    from arctic_platform.inference.server.weight_sync.receiver import (
-        _canonicalize_fused_moe_destination,
-    )
+    from arctic_platform.inference.server.weight_sync.receiver import _canonicalize_fused_moe_destination
 
     params = {
         "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight",
         "model.layers.0.block_sparse_moe.experts.routed_experts.w2_weight",
     }
-    assert _canonicalize_fused_moe_destination(
-        "model.layers.0.block_sparse_moe.experts.w13_weight", params
-    ) == "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight"
-    assert _canonicalize_fused_moe_destination(
-        "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight", params
-    ) == "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight"
+    assert (
+        _canonicalize_fused_moe_destination("model.layers.0.block_sparse_moe.experts.w13_weight", params)
+        == "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight"
+    )
+    assert (
+        _canonicalize_fused_moe_destination(
+            "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight", params
+        )
+        == "model.layers.0.block_sparse_moe.experts.routed_experts.w13_weight"
+    )
 
 
 def test_fused_writer_feeds_nongated_w13_as_w1_only():
@@ -632,8 +619,7 @@ def test_fused_writer_feeds_nongated_w13_as_w1_only():
         def _map_global_expert_id_to_local_expert_id(self, expert_id):
             return expert_id
 
-        def weight_loader(self, param, tensor, weight_name, shard_id, expert_id,
-                          return_success=False):
+        def weight_loader(self, param, tensor, weight_name, shard_id, expert_id, return_success=False):
             calls.append(shard_id)
             assert tensor.shape[0] == 4
             return True
@@ -653,9 +639,7 @@ def test_fused_writer_feeds_nongated_w13_as_w1_only():
     from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
 
     writer = _ShardAwareFusedWriter(Model(), torch.device("cpu"))
-    assert writer.feed(
-        "model.layers.0.mixer.experts.w13_weight", torch.ones(2, 4, 1)
-    )
+    assert writer.feed("model.layers.0.mixer.experts.w13_weight", torch.ones(2, 4, 1))
     assert calls == ["w1", "w1"]
 
 

@@ -30,7 +30,6 @@ from __future__ import annotations
 import copy
 import math
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -43,6 +42,7 @@ from arctic_platform.correctness.harness.dss_driver import gateway  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import pack  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import running_job  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize  # noqa: E402
 
 SOURCE = "/data-fast/base-models/Qwen/Qwen3.8-27B"
@@ -55,7 +55,7 @@ INTERESTING = ("grad_norm", "update_successful", "last_lr", "global_steps")
 def arm(label, training, model_path, vocab, attn, n_gpus):
     body_bytes = pack(build_batch("probe", 1, ROW_TOKENS, vocab, seed=SEED))
     payload = build_payload(training, model_path, SEED, attn_implementation=attn)
-    work = Path(tempfile.mkdtemp(prefix="clipnorm-"))
+    work = correctness_workdir("clipnorm-")
     from sp_gateway_harness import fwd_bwd_response
     from sp_gateway_harness import step
 

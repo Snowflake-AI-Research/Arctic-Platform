@@ -13,14 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Do the two short-convolution kernels in the gated delta net agree?
+"""Do the short-convolution choices in the gated delta net agree?
 
-The engine's varlen path calls ``causal_conv1d_fn`` with a segment index, while a stock HuggingFace
-forward calls ``nn.Conv1d`` and slices the causal tail. They compute the same depthwise convolution
-followed by SiLU, so any difference between them is the kernel, not the model -- and it lands on
-``conv1d.weight`` and on everything the convolution feeds, which is where the residual disagreement sits.
+The raw varlen kernel can call ``causal_conv1d_fn`` with a segment index, while a segmented reference calls
+``nn.Conv1d`` once per packed row and slices the causal tail. They are supposed to compute the same depthwise
+convolution followed by SiLU, so any difference between them lands on ``conv1d.weight`` and everything the
+convolution feeds.
 
-Both paths are given the same input and the same upstream gradient.
+The Qwen3.6 product path deliberately avoids the raw segmented-index kernel for multi-row packed batches.
+This diagnostic therefore prints both the raw kernel comparison and the product-selected branch comparison.
 """
 
 from __future__ import annotations
@@ -37,7 +38,8 @@ import torch.nn.functional as F  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained  # noqa: E402
 
-TOKENS = int(os.environ.get("PROBE_ROW_TOKENS", 2048))
+ROW_TOKENS = int(os.environ.get("PROBE_ROW_TOKENS", 2048))
+ROWS = int(os.environ.get("PROBE_ROWS", 8))
 LAYERS = int(os.environ.get("PROBE_LAYERS", 4))
 SOURCE = "/data-fast/base-models/Qwen/Qwen3.8-27B"
 CACHE_ROOT = "/data-fast/base-models/synthetic"
@@ -54,8 +56,79 @@ def report(name: str, a: torch.Tensor, b: torch.Tensor) -> None:
     )
 
 
-def main() -> int:
+def run_segmented_conv(conv, x: torch.Tensor, tokens_per_row: int) -> torch.Tensor:
+    conv_outs = []
+    for start in range(0, x.shape[-1], tokens_per_row):
+        stop = start + tokens_per_row
+        conv_outs.append(conv(x[:, :, start:stop])[:, :, :tokens_per_row])
+    return F.silu(torch.cat(conv_outs, dim=-1))
+
+
+def run_product_selected_conv(conv, activation: str, x: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _has_multiple_packed_sequences,
+    )
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _packed_sequence_indices,
+    )
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _segmented_causal_conv1d,
+    )
+
+    if _has_multiple_packed_sequences(cu_seqlens):
+        return _segmented_causal_conv1d(conv, x, cu_seqlens)
+
     from causal_conv1d import causal_conv1d_fn
+
+    return causal_conv1d_fn(
+        x=x,
+        weight=conv.weight.squeeze(1),
+        bias=conv.bias,
+        activation=activation,
+        seq_idx=_packed_sequence_indices(cu_seqlens, batch_size=x.shape[0], seq_len=x.shape[-1], device=x.device),
+    )
+
+
+def run_paths(
+    conv, activation: str, x: torch.Tensor, upstream: torch.Tensor, seq_idx: torch.Tensor, cu_seqlens: torch.Tensor
+) -> tuple:
+    from causal_conv1d import causal_conv1d_fn
+
+    outputs, weight_grads, input_grads = {}, {}, {}
+    paths = {
+        "segmented": lambda xi: run_segmented_conv(conv, xi, ROW_TOKENS),
+        "raw_seq_idx": lambda xi: causal_conv1d_fn(
+            x=xi,
+            weight=conv.weight.squeeze(1),
+            bias=conv.bias,
+            activation=activation,
+            seq_idx=seq_idx,
+        ),
+        "product_selected": lambda xi: run_product_selected_conv(conv, activation, xi, cu_seqlens),
+    }
+    for name, run_path in paths.items():
+        conv.zero_grad(set_to_none=True)
+        xi = x.detach().clone().requires_grad_(True)
+        out = run_path(xi)
+        out.backward(upstream)
+        outputs[name] = out.detach()
+        weight_grads[name] = conv.weight.grad.detach().clone()
+        input_grads[name] = xi.grad.detach().clone()
+    return outputs, weight_grads, input_grads
+
+
+def print_comparison(
+    title: str, baseline: str, candidate: str, outputs: dict, weight_grads: dict, input_grads: dict
+) -> None:
+    print("")
+    print(title)
+    print(f"{'quantity':26} {baseline:>17}     {candidate:>16}")
+    report("forward output", outputs[baseline], outputs[candidate])
+    report("conv1d.weight gradient", weight_grads[baseline], weight_grads[candidate])
+    report("input gradient", input_grads[baseline], input_grads[candidate])
+
+
+def main() -> int:
     from transformers import AutoModelForCausalLM
 
     path = materialize_pretrained(SOURCE, f"{CACHE_ROOT}/Qwen3.8-27B-{LAYERS}L", LAYERS).cache_path
@@ -64,39 +137,40 @@ def main() -> int:
     gdn = next(layer.linear_attn for layer in inner.layers if hasattr(layer, "linear_attn"))
     conv = gdn.conv1d.cuda()
     channels = conv.weight.shape[0]
+    causal_conv = getattr(gdn, "causal_conv1d_fn", getattr(gdn, "_causal_conv1d_fn", None))
     print(
         f"conv1d: {channels} channels, kernel {conv.weight.shape[-1]}, groups {conv.groups}, "
-        f"bias {conv.bias is not None}, activation {gdn.activation}, {TOKENS:,} tokens"
+        f"bias {conv.bias is not None}, activation {gdn.activation}, {ROWS} rows x {ROW_TOKENS:,} tokens"
     )
-    print(f"causal_conv1d_fn available on the module: {gdn.causal_conv1d_fn is not None}")
+    print(f"causal_conv1d_fn available on the module: {causal_conv is not None}")
 
     torch.manual_seed(SEED)
-    # causal_conv1d_fn accepts a segment index only in channel-last layout, which is what the engine hands
-    # it: the projection produces [batch, tokens, channels] and transposes the view without copying.
-    x = torch.randn(1, TOKENS, channels, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
-    upstream = torch.randn(1, TOKENS, channels, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
+    tokens = ROWS * ROW_TOKENS
+    # AP's packed path flattens rows to one batch element and passes row ids as ``seq_idx``.
+    x = torch.randn(1, tokens, channels, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
+    upstream = torch.randn(1, tokens, channels, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
+    packed_seq_idx = (
+        torch.arange(ROWS, dtype=torch.int32, device="cuda").repeat_interleave(ROW_TOKENS).reshape(1, tokens)
+    )
+    cu_seqlens = torch.arange(0, tokens + 1, ROW_TOKENS, dtype=torch.int32, device="cuda")
 
-    outputs, weight_grads, input_grads = [], [], []
-    for use_kernel in (False, True):
-        conv.zero_grad(set_to_none=True)
-        xi = x.detach().clone().requires_grad_(True)
-        if use_kernel:
-            seq_idx = torch.zeros(1, TOKENS, dtype=torch.int32, device="cuda")
-            out = causal_conv1d_fn(
-                x=xi, weight=conv.weight.squeeze(1), bias=conv.bias, activation=gdn.activation, seq_idx=seq_idx
-            )
-        else:
-            out = F.silu(conv(xi)[..., :TOKENS])
-        out.backward(upstream)
-        outputs.append(out)
-        weight_grads.append(conv.weight.grad.detach().clone())
-        input_grads.append(xi.grad.detach().clone())
-
-    print("")
-    print(f"{'quantity':26} {'nn.Conv1d':>17}     {'causal_conv1d_fn':>12}")
-    report("forward output", outputs[0], outputs[1])
-    report("conv1d.weight gradient", weight_grads[0], weight_grads[1])
-    report("input gradient", input_grads[0], input_grads[1])
+    outputs, weight_grads, input_grads = run_paths(conv, gdn.activation, x, upstream, packed_seq_idx, cu_seqlens)
+    print_comparison(
+        "raw causal_conv1d_fn(seq_idx=...) on packed 8-row flattened shape",
+        "segmented",
+        "raw_seq_idx",
+        outputs,
+        weight_grads,
+        input_grads,
+    )
+    print_comparison(
+        "product-selected branch on packed 8-row flattened shape",
+        "segmented",
+        "product_selected",
+        outputs,
+        weight_grads,
+        input_grads,
+    )
     return 0
 
 

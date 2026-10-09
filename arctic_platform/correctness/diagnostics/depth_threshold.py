@@ -31,7 +31,6 @@ from __future__ import annotations
 import copy
 import math
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -44,6 +43,7 @@ from arctic_platform.correctness.harness.dss_driver import gateway  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import pack  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import running_job  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize  # noqa: E402
 
 SOURCE = "/data-fast/base-models/Qwen/Qwen3.8-27B"
@@ -80,7 +80,7 @@ def main(config_path: str) -> int:
         vocab = getattr(model_cfg, "text_config", model_cfg).vocab_size
         body_bytes = pack(build_batch("probe", 1, ROW_TOKENS, vocab, seed=SEED))
         payload = build_payload(training, spec.cache_path, SEED, attn_implementation=attn)
-        work = Path(tempfile.mkdtemp(prefix=f"depth{layers}-"))
+        work = correctness_workdir(f"depth{layers}-")
 
         print(f"[probe] {layers}L ({spec.param_count/1e9:.2f}B params) ...", flush=True)
         outcome, gnorm, peak = "?", "?", "-"

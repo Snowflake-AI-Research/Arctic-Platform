@@ -69,7 +69,7 @@ class TestSFTLoss(TestCasePlus):
                 "cpu",
             )
 
-    def test_global_token_scaling_rescales_model_mean_loss(self):
+    def test_global_token_metadata_rescales_model_mean_loss(self):
         labels = torch.tensor([[-100, 1, 2, -100]])  # 2 valid after shift
         loss, metrics = sft_loss(
             {"loss": torch.tensor(3.0, requires_grad=True)},
@@ -78,7 +78,7 @@ class TestSFTLoss(TestCasePlus):
             {},
             "cpu",
         )
-        self.assertAlmostEqual(loss.item(), 3.0 * 2.0 / 10.0 * 2.0, places=5)
+        self.assertAlmostEqual(loss.item(), 1.2, places=5)
         self.assertAlmostEqual(metrics["loss.sum"], 6.0, places=5)
         self.assertEqual(metrics["loss.tokens"], 2.0)
 
@@ -435,3 +435,54 @@ class TestSftCeSumFromHiddenErrors(TestCasePlus):
         )
         with self.assertRaises(ValueError):
             sft_ce_sum_from_hidden(model, torch.randn(1, 3, 4), torch.zeros(1, 3, dtype=torch.long), mode="none")
+
+
+class TestSftCeMemoryTiedHeadBookkeeping(TestCasePlus):
+    class _TinyLm(torch.nn.Module):
+        def __init__(self, *, tied: bool):
+            super().__init__()
+            hidden_size = 4
+            vocab_size = 8
+            self.embed_tokens = torch.nn.Embedding(vocab_size, hidden_size)
+            self.lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+            if tied:
+                self.lm_head.weight = self.embed_tokens.weight
+            self.config = SimpleNamespace(vocab_size=vocab_size)
+
+        def get_input_embeddings(self):
+            return self.embed_tokens
+
+    def _run_memory_ce_backward(self, model):
+        from arctic_platform.sft.processor import sft_ce_sum_from_hidden
+
+        model.lm_head.weight.ds_grad_is_ready = True
+        readiness = []
+        hook_handle = None
+        if hasattr(model.lm_head.weight, "register_post_accumulate_grad_hook"):
+            hook_handle = model.lm_head.weight.register_post_accumulate_grad_hook(
+                lambda param: readiness.append(getattr(param, "ds_grad_is_ready", True))
+            )
+        hidden = torch.randn(1, 3, 4, requires_grad=True)
+        labels = torch.tensor([[-100, 1, 2]], dtype=torch.long)
+        ce_sum, n_valid = sft_ce_sum_from_hidden(model, hidden, labels, mode="memory", peak_mem_gib=1e-12)
+        self.assertEqual(n_valid, 2)
+        try:
+            ce_sum.backward()
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
+        return readiness
+
+    def test_untied_lm_head_reduces_normally(self):
+        model = self._TinyLm(tied=False)
+        readiness = self._run_memory_ce_backward(model)
+        if readiness:
+            self.assertEqual(readiness, [False, True])
+        self.assertTrue(model.lm_head.weight.ds_grad_is_ready)
+
+    def test_tied_lm_head_defers_to_outer_embedding_reduction(self):
+        model = self._TinyLm(tied=True)
+        readiness = self._run_memory_ce_backward(model)
+        if readiness:
+            self.assertEqual(readiness, [False, False])
+        self.assertTrue(model.lm_head.weight.ds_grad_is_ready)

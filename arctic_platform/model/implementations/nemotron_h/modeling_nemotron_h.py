@@ -10,26 +10,30 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
-from torch import Tensor, nn
+from torch import Tensor
+from torch import nn
 from transformers.generation import GenerationMixin
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.utils import auto_docstring, logging
+from transformers.utils import auto_docstring
+from transformers.utils import logging
 
-from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
-from arctic_platform.model.implementations.layers.attn import ATTN_IMPL2CLASS, AttentionConfig
+from arctic_platform.model.implementations.layers.attn import ATTN_IMPL2CLASS
+from arctic_platform.model.implementations.layers.attn import AttentionConfig
 from arctic_platform.model.implementations.layers.cp_mamba import mamba_cp_forward
-from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
-from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, NemotronHRouter, NonGatedGroupedExperts
-from arctic_platform.model.implementations.layers.rms_norm import RMSNorm, RMSNormConfig
-from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import NemotronHConfig
-from arctic_platform.model.implementations.nemotron_h.converting_nemotron_h import (
-    convert_hf_layer_to_prime,
-    convert_hf_to_prime,
-    convert_prime_layer_to_hf,
-    convert_prime_to_hf,
-)
+from arctic_platform.model.implementations.layers.rms_norm import RMSNorm
+from arctic_platform.model.implementations.layers.rms_norm import RMSNormConfig
 from arctic_platform.model.implementations.layers.sequence import get_cu_seqlens_from_position_ids
+from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
+from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
+from arctic_platform.model.implementations.moe.layers.moe import LatentMoE
+from arctic_platform.model.implementations.moe.layers.moe import NemotronHRouter
+from arctic_platform.model.implementations.moe.layers.moe import NonGatedGroupedExperts
+from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import NemotronHConfig
+from arctic_platform.model.implementations.nemotron_h.converting_nemotron_h import convert_hf_layer_to_prime
+from arctic_platform.model.implementations.nemotron_h.converting_nemotron_h import convert_hf_to_prime
+from arctic_platform.model.implementations.nemotron_h.converting_nemotron_h import convert_prime_layer_to_hf
+from arctic_platform.model.implementations.nemotron_h.converting_nemotron_h import convert_prime_to_hf
 
 logger = logging.get_logger(__name__)
 
@@ -63,9 +67,7 @@ def _patch_mamba2_use_triton_ssd():
         return
 
     try:
-        from mamba_ssm.ops.triton.ssd_combined import (
-            mamba_chunk_scan_combined as _mamba_chunk_scan_combined,
-        )
+        from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined as _mamba_chunk_scan_combined
     except ImportError:
         logger.warning_once("mamba_ssm not installed; NemotronH Mamba layers will use torch_forward (bf16 softplus)")
         return
@@ -209,12 +211,12 @@ class NemotronHMambaLayer(GradientCheckpointingLayer):
         self.mlp = None  # No MoE in this layer type
 
     def set_context_parallel_attributes(self, cp_group: dist.ProcessGroup, cp_rank: int, cp_world_size: int) -> None:
-        assert self.mamba.num_heads % cp_world_size == 0, (
-            f"num_heads ({self.mamba.num_heads}) must be divisible by cp_world_size ({cp_world_size})"
-        )
-        assert self.mamba.n_groups % cp_world_size == 0, (
-            f"n_groups ({self.mamba.n_groups}) must be divisible by cp_world_size ({cp_world_size})"
-        )
+        assert (
+            self.mamba.num_heads % cp_world_size == 0
+        ), f"num_heads ({self.mamba.num_heads}) must be divisible by cp_world_size ({cp_world_size})"
+        assert (
+            self.mamba.n_groups % cp_world_size == 0
+        ), f"n_groups ({self.mamba.n_groups}) must be divisible by cp_world_size ({cp_world_size})"
         self._cp_group = cp_group
         self._cp_rank = cp_rank
         self._cp_world_size = cp_world_size

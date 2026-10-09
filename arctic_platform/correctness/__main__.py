@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Dict
@@ -53,6 +52,7 @@ from .harness.runner import assert_applicable_tests_registered
 from .harness.runner import execute
 from .harness.runner import execute_rl
 from .harness.spec import TestSpec
+from .harness.workdir import correctness_workdir
 
 CORRECTNESS_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = CORRECTNESS_DIR / "configs"
@@ -453,7 +453,7 @@ def cmd_hosted(args) -> int:
                 attn_implementation=run_cfg.attention_implementation,
                 # A hosted run materializes no batch files. Nothing on this node reads a batch: the request
                 # bytes are built here and posted to the server.
-                workdir=Path(tempfile.mkdtemp(prefix="dss-correctness-hosted-")),
+                workdir=correctness_workdir("dss-correctness-hosted-"),
                 batch_paths={},
                 vocab_size=vocab_size,
                 transport_factory=lambda _workdir, run_cfg=run_cfg: HostedTransport(connection, run_cfg),

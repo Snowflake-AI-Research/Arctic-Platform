@@ -175,7 +175,7 @@ def build_engine(
     )
 
 
-def mixer_boundaries(row_length: int, rows: int, device: str) -> Dict[str, "torch.Tensor"]:
+def mixer_boundaries(row_length: int, rows: int, device: str, *, flattened: bool = False) -> Dict[str, "torch.Tensor"]:
     """The sequence boundaries the gated delta net reads and does not build.
 
     A caller that omits ``seq_idx`` and ``cu_seq_lens_q`` gets the batched convolution and delta-rule
@@ -183,18 +183,58 @@ def mixer_boundaries(row_length: int, rows: int, device: str) -> Dict[str, "torc
     """
     import torch
 
-    if rows != 1:
-        raise ValueError("mixer packing needs one row per microbatch")
+    if rows < 1:
+        raise ValueError(f"mixer packing needs at least one row, got {rows}")
+    boundaries = torch.arange(0, (rows + 1) * row_length, row_length, dtype=torch.int32, device=device)
+    seq_idx = torch.arange(rows, dtype=torch.int32, device=device).repeat_interleave(row_length)
+    seq_idx_shape = (1, rows * row_length) if flattened else (rows, row_length)
     return {
-        "seq_idx": torch.zeros(1, row_length, dtype=torch.int32, device=device),
-        "cu_seq_lens_q": torch.tensor([0, row_length], dtype=torch.int32, device=device),
+        "seq_idx": seq_idx.reshape(seq_idx_shape),
+        "cu_seq_lens_q": boundaries,
     }
 
 
-def reference_row_groups(lengths, row_length: int, token_budget: int, *, mixer_packing: bool):
-    """Keep each packed mixer sequence in its own reference model call."""
+def mixer_call_inputs(input_ids, labels, device: str):
+    """Prepare an opt-in mixer-packed reference call.
+
+    Qwen3.6's varlen gated-delta path requires flattened inputs when a single model call carries more
+    than one row segment. The default one-row reference path keeps the historical 2-D shape.
+    """
+    rows_here, row_len = input_ids.shape
+    flatten_varlen = rows_here > 1
+    mixer_kwargs = mixer_boundaries(row_len, rows_here, device, flattened=flatten_varlen)
+    if flatten_varlen:
+        return (
+            input_ids.reshape(1, rows_here * row_len),
+            labels.reshape(1, rows_here * row_len),
+            mixer_kwargs,
+        )
+    return input_ids, labels, mixer_kwargs
+
+
+def fixed_row_groups(lengths: List[int], group_rows: int) -> List[List[int]]:
+    """Group whole rows by count, preserving order."""
+    if group_rows < 1:
+        raise ValueError(f"group_rows must be positive, got {group_rows}")
+    return [list(range(start, min(start + group_rows, len(lengths)))) for start in range(0, len(lengths), group_rows)]
+
+
+def reference_row_groups(
+    lengths,
+    row_length: int,
+    token_budget: int,
+    *,
+    mixer_packing: bool,
+    mixer_packing_group_rows: int = 1,
+):
+    """Choose reference model-call groups without changing the default golden path.
+
+    Hybrid-mixer references historically used one row per model call, while Arctic Platform can hand the
+    mixer several row segments in one packed call. ``mixer_packing_group_rows`` is an opt-in diagnostic knob
+    for matching that call shape; production correctness keeps the default of one row.
+    """
     if mixer_packing:
-        return [[row] for row in range(len(lengths))]
+        return fixed_row_groups(lengths, mixer_packing_group_rows)
     return row_groups(lengths, row_length, token_budget)
 
 
@@ -207,6 +247,7 @@ def forward_backward(
     fp32_lm_head: bool = False,
     fused_cross_entropy: bool | str = False,
     mixer_packing: bool = False,
+    mixer_packing_group_rows: int = 1,
     lm_head_token_chunk_size: int | None = None,
     lm_head_vocab_chunk_size: int = 8192,
     accumulate_dtype: "torch.dtype | None" = None,
@@ -252,7 +293,13 @@ def forward_backward(
     total_loss = 0.0
 
     lengths = [seq_len] * int(input_ids.shape[0])
-    groups = reference_row_groups(lengths, seq_len, token_budget, mixer_packing=mixer_packing)
+    groups = reference_row_groups(
+        lengths,
+        seq_len,
+        token_budget,
+        mixer_packing=mixer_packing,
+        mixer_packing_group_rows=mixer_packing_group_rows,
+    )
     for rows in groups:
         index = torch.tensor(rows, device=device)
         ids_mb = input_ids.index_select(0, index)
@@ -260,8 +307,7 @@ def forward_backward(
 
         mixer_kwargs = {}
         if mixer_packing:
-            rows_here, row_len = ids_mb.shape
-            mixer_kwargs = mixer_boundaries(row_len, rows_here, device)
+            ids_mb, labels_mb, mixer_kwargs = mixer_call_inputs(ids_mb, labels_mb, device)
         hidden = decoder(input_ids=ids_mb, use_cache=False, **mixer_kwargs).last_hidden_state
         detached = hidden.detach().requires_grad_(True)
         flat_labels = labels_mb.reshape(-1)
@@ -367,6 +413,7 @@ def run(
     device: str = "cuda",
     accumulate_dtype: "torch.dtype | None" = None,
     mixer_packing: bool = False,
+    mixer_packing_group_rows: int = 1,
     matmul_precision: str = "highest",
     peft_config: Optional[dict] = None,
     peft_adapter_path: str | None = None,
@@ -402,6 +449,7 @@ def run(
         fp32_lm_head=fp32_lm_head,
         fused_cross_entropy=fused_cross_entropy,
         mixer_packing=mixer_packing,
+        mixer_packing_group_rows=mixer_packing_group_rows,
         lm_head_token_chunk_size=lm_head_token_chunk_size,
         lm_head_vocab_chunk_size=lm_head_vocab_chunk_size,
         accumulate_dtype=accumulate_dtype,

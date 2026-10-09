@@ -37,7 +37,6 @@ import os
 import re
 import statistics
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -55,6 +54,7 @@ from arctic_platform.correctness.harness.runner import run_reference  # noqa: E4
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
 from arctic_platform.correctness.harness.spec import STATED_CRITERION_ABS  # noqa: E402
 from arctic_platform.correctness.harness.spec import TestSpec  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained  # noqa: E402
 
 # noqa: E402
@@ -167,13 +167,14 @@ def main(config_path: str, spec_path: str) -> int:
     model_cfg = AutoConfig.from_pretrained(intact, trust_remote_code=True)
     vocab = getattr(model_cfg, "text_config", model_cfg).vocab_size
 
-    work = Path(tempfile.mkdtemp(prefix="attn-ablation-"))
-    batch = build_batch("gas1", 1, ROW_TOKENS, vocab, seed=SEED)
+    work = correctness_workdir("attn-ablation-")
+    batch_rows = int(os.environ.get("PROBE_ROWS", n_gpus))
+    batch = build_batch("gas1", batch_rows, ROW_TOKENS, vocab, seed=SEED)
     batch_path = work / "batch.pt"
     save(batch, batch_path)
     body = pack(batch)
     print(
-        f"{ROW_TOKENS:,}-token sequence, {batch.active_tokens:,} real tokens, attn {attn}, "
+        f"{batch.rows} x {ROW_TOKENS:,}-token sequences, {batch.active_tokens:,} real tokens, attn {attn}, "
         f"fp32_lm_head {fp32_lm_head}, sp {cfg.training.get('sp_size')}\n",
         flush=True,
     )

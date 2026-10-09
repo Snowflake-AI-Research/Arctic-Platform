@@ -42,13 +42,14 @@ from arctic_platform.correctness.harness.dss_driver import fwd_bwd_step
 from arctic_platform.correctness.harness.dss_driver import gateway
 from arctic_platform.correctness.harness.dss_driver import pack
 from arctic_platform.correctness.harness.dss_driver import running_job
+from arctic_platform.correctness.harness.optimizer_capture import optimizer_capture_worker
 from arctic_platform.correctness.harness.seeds import SEED
 from arctic_platform.correctness.harness.spec import TestSpec
+from arctic_platform.correctness.harness.workdir import correctness_workdir
 
 ROOT = Path(__file__).resolve().parents[3]
 CONFIG = ROOT / "arctic_platform/correctness/configs/qwen3.6-35b-a3b/h200/train-sft-lora-8gpus-sp8-64k.config"
 SPEC = ROOT / "arctic_platform/correctness/specs/qwen3.6-35b-a3b-h200-train-sft-lora-8gpus-sp8-64k.json"
-OUTPUT = ROOT / ".agent-work/ap-host4-qwen36-lora-sp8-checkpoint-state"
 TENSOR_COMPONENTS = (
     ("lora_parameters", "parameter"),
     ("fp32_masters", "fp32_master"),
@@ -78,7 +79,7 @@ def _snapshot(capture: Path, destination: Path) -> None:
 def _run_pair(limit: int, work: Path, cfg, spec, arm, bodies: list[dict]) -> tuple[dict[int, float], dict[int, float]]:
     losses = {"uninterrupted": {}, "resumed": {}}
     runtime = work / "runtime"
-    with gateway(runtime, cfg.n_gpus) as session:
+    with optimizer_capture_worker(), gateway(runtime, cfg.n_gpus) as session:
         capture = work / "capture-uninterrupted"
         payload = build_payload(
             cfg.training,
@@ -260,7 +261,7 @@ def _run_independent(limit: int, work: Path, cfg, spec, bodies: list[dict]) -> t
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
     runtime = work / "runtime"
-    with gateway(runtime, cfg.n_gpus) as session:
+    with optimizer_capture_worker(), gateway(runtime, cfg.n_gpus) as session:
         left = _train_uninterrupted(session, "trajectory-a", limit, work, cfg, spec, bodies)
         capture = work / "capture-trajectory-b"
         payload = build_payload(
@@ -312,7 +313,8 @@ def main() -> int:
         for iteration in range(1, ITERATIONS + 1)
     ]
     horizon = CHECKPOINT_ITERATION + 1
-    base = OUTPUT / "independent-uninterrupted"
+    output = correctness_workdir("ap-host4-qwen36-lora-sp8-checkpoint-state-")
+    base = output / "independent-uninterrupted"
     base.mkdir(parents=True, exist_ok=True)
     print(f"INDEPENDENT_TRAJECTORIES horizon={horizon}", flush=True)
     difference = _run_independent(1, base / "step-1", cfg, spec, bodies)

@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import copy
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -46,6 +45,7 @@ from arctic_platform.correctness.harness.dss_driver import pack  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import pin_suite_determinism  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import running_job  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize  # noqa: E402
 
 SOURCE = "/data-fast/base-models/Qwen/Qwen3.8-27B"
@@ -73,7 +73,7 @@ def spread(first: dict, second: dict):
 def measure(training, model_path, vocab, attn, n_gpus, row_tokens, share_job):
     body_bytes = pack(build_batch("floor", 1, row_tokens, vocab, seed=SEED))
     payload = build_payload(training, model_path, SEED, attn_implementation=attn)
-    work = Path(tempfile.mkdtemp(prefix="floor-"))
+    work = correctness_workdir("floor-")
     with gateway(work, n_gpus) as url:
         if share_job:
             with running_job(url, payload) as job_id:

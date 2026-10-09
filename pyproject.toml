@@ -120,7 +120,7 @@ gdn = [
     "causal-conv1d",
 ]
 
-# GPU training stack selected by the stas-dss-repro setup flow.
+# GPU training stack used by local distributed training and GPU tests.
 gpu = [
     "arctic_platform[sft]",
     "arctic_platform[gdn]",

@@ -38,8 +38,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
 
 from arctic_platform.correctness.harness.batches import build_batch  # noqa: E402
+from arctic_platform.correctness.harness.config import LoadedConfig  # noqa: E402
 from arctic_platform.correctness.harness.config import load_config  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
 from arctic_platform.correctness.harness.spec import STATED_CRITERION_ABS  # noqa: E402
@@ -47,6 +49,7 @@ from arctic_platform.correctness.harness.spec import TestSpec  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained  # noqa: E402
 
 ROW_TOKENS = int(os.environ.get("PROBE_ROW_TOKENS", 2048))
+CE_CHUNK = int(os.environ.get("PROBE_CE_CHUNK", 2048))
 LAYERS = int(os.environ.get("PROBE_LAYERS", 4))
 SOURCE = "/data-fast/base-models/Qwen/Qwen3.8-27B"
 CACHE_ROOT = "/data-fast/base-models/synthetic"
@@ -68,26 +71,89 @@ def load_model(model_path: str, attn: str):
     return model.cuda()
 
 
+def _build_liger_fused_cross_entropy():
+    """Build the same fp32-accumulating fused CE used by the correctness reference."""
+    from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
+
+    return LigerFusedLinearCrossEntropyLoss(
+        ignore_index=IGNORE_INDEX,
+        reduction="mean",
+        accum_dtype=torch.float32,
+    )
+
+
+def loss_settings(cfg: LoadedConfig) -> tuple[bool, bool | str, int | None, int]:
+    """Resolve loss knobs the way the correctness harness passes them to the reference."""
+    training = cfg.effective_training
+    return (
+        bool(training.get("fp32_lm_head", False)),
+        cfg.fused_cross_entropy,
+        cfg.lm_head_token_chunk_size,
+        int(training.get("fused_lm_head_vocab_chunk_size", 8192)),
+    )
+
+
 def token_weighted_loss(
-    model, input_ids, labels, active_tokens, fp32_lm_head: bool, token_chunk_size: int, vocab_chunk_size: int
+    model,
+    input_ids,
+    labels,
+    active_tokens,
+    fp32_lm_head: bool,
+    fused_cross_entropy: bool | str,
+    token_chunk_size: int | None,
+    vocab_chunk_size: int,
+    ce_chunk: int = CE_CHUNK,
 ):
-    """The production chunked LM-head loss, identical in both arms."""
+    """The production loss selected by the config, identical in both arms."""
     from arctic_platform.model.implementations.gpu.lm_head import chunked_lm_head_logprobs
+
+    if fused_cross_entropy:
+        if fused_cross_entropy not in {True, "liger"}:
+            raise ValueError(f"diagnostic does not support fused_cross_entropy={fused_cross_entropy!r}")
+        if token_chunk_size is not None:
+            raise ValueError("fused cross-entropy and chunked LM-head logprobs are mutually exclusive")
 
     module = getattr(model, "module", model)
     hidden = module.get_decoder()(input_ids=input_ids, use_cache=False).last_hidden_state
     head = module.get_output_embeddings()
-    logprobs = chunked_lm_head_logprobs(
-        hidden,
-        head.weight,
-        labels,
-        bias=getattr(head, "bias", None),
-        token_chunk_size=token_chunk_size,
-        vocab_chunk_size=vocab_chunk_size,
-        fp32_lm_head=fp32_lm_head,
-    )
-    valid = labels != IGNORE_INDEX
-    return -torch.where(valid, logprobs.float(), 0.0).sum() / active_tokens
+    if token_chunk_size is not None:
+        logprobs = chunked_lm_head_logprobs(
+            hidden,
+            head.weight,
+            labels,
+            bias=getattr(head, "bias", None),
+            token_chunk_size=token_chunk_size,
+            vocab_chunk_size=vocab_chunk_size,
+            fp32_lm_head=fp32_lm_head,
+        )
+        valid = labels != IGNORE_INDEX
+        return -torch.where(valid, logprobs.float(), 0.0).sum() / active_tokens
+
+    flat_labels = labels.reshape(-1)
+    flat_hidden = hidden.reshape(-1, hidden.shape[-1])
+    if fused_cross_entropy:
+        valid_tokens = int((flat_labels != IGNORE_INDEX).sum())
+        if valid_tokens == 0:
+            return hidden.sum() * 0.0
+        fused_ce = _build_liger_fused_cross_entropy()
+        mean_loss = fused_ce(head.weight, flat_hidden, flat_labels)
+        return mean_loss * (valid_tokens / active_tokens)
+
+    total_loss = None
+    for start in range(0, flat_labels.numel(), ce_chunk):
+        chunk_labels = flat_labels[start : start + ce_chunk]
+        if int((chunk_labels != IGNORE_INDEX).sum()) == 0:
+            continue
+        chunk_hidden = flat_hidden[start : start + ce_chunk]
+        if fp32_lm_head:
+            logits = F.linear(chunk_hidden.float(), head.weight.float())
+        else:
+            logits = F.linear(chunk_hidden, head.weight).float()
+        loss = F.cross_entropy(logits, chunk_labels, ignore_index=IGNORE_INDEX, reduction="sum") / active_tokens
+        total_loss = loss if total_loss is None else total_loss + loss
+    if total_loss is None:
+        return hidden.sum() * 0.0
+    return total_loss
 
 
 def grad_norms_plain(model):
@@ -118,9 +184,7 @@ def main(config_path: str, spec_path: str) -> int:
         else materialize_pretrained(SOURCE, f"{CACHE_ROOT}/Qwen3.8-27B-{layers}L", layers).cache_path
     )
     attn = os.environ.get("PROBE_ATTN") or cfg.training.get("attn_implementation", "flash_attention_3")
-    fp32_lm_head = bool(cfg.training.get("fp32_lm_head", False))
-    token_chunk_size = int(cfg.training["fused_lm_head_token_chunk_size"])
-    vocab_chunk_size = int(cfg.training.get("fused_lm_head_vocab_chunk_size", 8192))
+    fp32_lm_head, fused_cross_entropy, token_chunk_size, vocab_chunk_size = loss_settings(cfg)
 
     model_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     vocab = getattr(model_cfg, "text_config", model_cfg).vocab_size
@@ -134,10 +198,24 @@ def main(config_path: str, spec_path: str) -> int:
         f"attn {attn}, one GPU, no gateway\n",
         flush=True,
     )
+    print(
+        f"loss fp32_lm_head={fp32_lm_head}, fused_cross_entropy={fused_cross_entropy!r}, "
+        f"lm_head_token_chunk={token_chunk_size}, lm_head_vocab_chunk={vocab_chunk_size}, ce_chunk={CE_CHUNK}",
+        flush=True,
+    )
 
     print("[plain] forward/backward without DeepSpeed ...", flush=True)
     model = load_model(model_path, attn)
-    loss = token_weighted_loss(model, input_ids, labels, active, fp32_lm_head, token_chunk_size, vocab_chunk_size)
+    loss = token_weighted_loss(
+        model,
+        input_ids,
+        labels,
+        active,
+        fp32_lm_head,
+        fused_cross_entropy,
+        token_chunk_size,
+        vocab_chunk_size,
+    )
     loss.backward()
     plain_loss = float(loss.item())
     plain = grad_norms_plain(model)
@@ -169,7 +247,16 @@ def main(config_path: str, spec_path: str) -> int:
     engine, _, _, _ = deepspeed.initialize(
         model=model, optimizer=optimizer, config=ds_config, model_parameters=model.parameters()
     )
-    loss = token_weighted_loss(engine, input_ids, labels, active, fp32_lm_head, token_chunk_size, vocab_chunk_size)
+    loss = token_weighted_loss(
+        engine,
+        input_ids,
+        labels,
+        active,
+        fp32_lm_head,
+        fused_cross_entropy,
+        token_chunk_size,
+        vocab_chunk_size,
+    )
     engine.backward(loss)
     ds_loss = float(loss.item())
     wrapped = grad_norms_deepspeed(engine, model)

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Router-replay trace: the routing a training rank received from the sampler, and what its MoE routers used.
+"""Router-replay trace helpers for correctness checks.
 
 One trace covers one ``fwd_bwd`` on one rank. It records the per-sample routing popped from the replay cache,
 then for every model call the packed ``input_ids`` and ``position_ids``, the ``routed_experts`` tensor handed to
@@ -27,6 +27,8 @@ from __future__ import annotations
 import re
 from typing import Any
 from typing import Optional
+
+import torch
 
 _LAYER_INDEX = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _LAYER_ATTR = "_dss_router_replay_layer"
@@ -63,14 +65,10 @@ class RouterReplayTrace:
         self._hook_handles.clear()
 
     def record_received(self, sample_ids, routed_experts_list) -> None:
-        import torch
-
         for sample_id, routed in zip(sample_ids, routed_experts_list, strict=True):
             self.received[str(sample_id)] = routed.to(device="cpu", dtype=torch.int64).tolist()
 
     def begin_call(self, model_kwargs: dict, *, padding: bool) -> None:
-        import torch
-
         routed = model_kwargs.get("routed_experts")
         self.calls.append(
             {
@@ -87,8 +85,6 @@ class RouterReplayTrace:
         )
 
     def record_router(self, router: Any, indices: Any, *, replayed: bool) -> None:
-        import torch
-
         entry = {
             "layer": getattr(router, _LAYER_ATTR, None),
             "phase": "recompute" if torch._C._current_graph_task_id() != -1 else "forward",

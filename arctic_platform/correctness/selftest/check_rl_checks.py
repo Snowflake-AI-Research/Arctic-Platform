@@ -24,12 +24,12 @@ import pytest
 
 from arctic_platform.correctness.checks import rl_router_replay
 from arctic_platform.correctness.checks import rl_weight_sync
+from arctic_platform.correctness.harness import router_replay_trace
 from arctic_platform.correctness.harness.config import load_config
 from arctic_platform.correctness.harness.rl_driver import rl_batch
 from arctic_platform.correctness.harness.rl_driver import rl_gpu_count
 from arctic_platform.correctness.harness.rl_driver import rl_sampling_payload
 from arctic_platform.correctness.selftest.config_factory import native_config
-from arctic_platform.model.implementations.debug import router_replay_trace
 
 from .check_rl_config import SAMPLING_CONFIG
 from .check_rl_config import TRAINING_CONFIG

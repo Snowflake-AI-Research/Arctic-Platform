@@ -29,7 +29,7 @@ from arctic_platform.correctness.harness.dss_driver import _training_client_conf
 from arctic_platform.correctness.harness.dss_driver import available_gpus
 from arctic_platform.correctness.harness.dss_driver import build_payload
 from arctic_platform.correctness.harness.dss_driver import copy_checkpoint_peft_adapter
-from arctic_platform.correctness.harness.dss_driver import export_initial_peft_adapter
+from arctic_platform.correctness.harness.dss_driver import pack_microbatches
 
 
 def test_globalize_expert_norms_replaces_rank_local_value() -> None:
@@ -119,6 +119,80 @@ def test_prime_rl_uses_fused_model_loss_with_aligned_labels() -> None:
     assert pack(batch, model_provider="huggingface")["processing"]["loss_fn"] == "sft"
 
 
+def test_pack_microbatches_emits_exact_gas_list() -> None:
+    batch = Batch(
+        name="gas4",
+        input_ids=torch.arange(15).view(5, 3),
+        position_ids=torch.arange(3).unsqueeze(0).expand(5, -1).contiguous(),
+        labels=torch.arange(15).view(5, 3),
+    )
+
+    body = pack_microbatches(batch, 4, model_provider="huggingface")
+
+    assert body["meta"] == {}
+    assert [micro["input_ids"].shape[0] for micro in body["batch"]] == [2, 1, 1, 1]
+    assert body["batch"][0]["input_ids"].tolist() == [[0, 1, 2], [3, 4, 5]]
+    assert body["batch"][-1]["labels"].tolist() == [[12, 13, 14]]
+
+
+def test_pack_microbatches_preserves_prime_rl_shifted_labels() -> None:
+    batch = Batch(
+        name="prime",
+        input_ids=torch.tensor([[4, 5, 6], [7, 8, 9]]),
+        position_ids=torch.arange(3).unsqueeze(0).expand(2, -1).contiguous(),
+        labels=torch.tensor([[4, 5, 6], [7, 8, 9]]),
+    )
+
+    body = pack_microbatches(batch, 2, model_provider="prime_rl")
+
+    assert body["meta"]["labels_are_shifted"] is True
+    assert body["batch"][0]["labels"].tolist() == [[5, 6, -100]]
+    assert body["batch"][1]["labels"].tolist() == [[8, 9, -100]]
+
+
+def test_pack_microbatches_can_request_memory_sft_ce_without_mutating_config() -> None:
+    batch = Batch(
+        name="gas4",
+        input_ids=torch.arange(12).view(4, 3),
+        position_ids=torch.arange(3).unsqueeze(0).expand(4, -1).contiguous(),
+        labels=torch.arange(12).view(4, 3),
+    )
+    processing_config = {
+        "logits_optimization": "memory",
+        "logits_optimization_peak_mem_size_in_gib": 4,
+    }
+
+    body = pack_microbatches(batch, 4, loss_fn="sft_ce", processing_config=processing_config)
+    processing_config["logits_optimization"] = "compute"
+
+    assert body["processing"] == {
+        "loss_fn": "sft_ce",
+        "config": {
+            "logits_optimization": "memory",
+            "logits_optimization_peak_mem_size_in_gib": 4,
+        },
+    }
+
+
+def test_runner_only_routes_qwen8b_full_gas4_to_memory_sft_ce() -> None:
+    from arctic_platform.correctness.harness import runner
+
+    cfg = type("Cfg", (), {"config_id": "qwen3-8b-h200-train-sft-full-4gpus-64k"})()
+    other_cfg = type("Cfg", (), {"config_id": "qwen3-8b-h200-train-sft-lora-4gpus-64k"})()
+    gas4 = type("Arm", (), {"name": "gas4"})()
+    gas1 = type("Arm", (), {"name": "gas1"})()
+
+    assert runner._ap_batch_processing_options(cfg, gas4) == {
+        "loss_fn": "sft_ce",
+        "processing_config": {
+            "logits_optimization": "memory",
+            "logits_optimization_peak_mem_size_in_gib": 4,
+        },
+    }
+    assert runner._ap_batch_processing_options(cfg, gas1) == {}
+    assert runner._ap_batch_processing_options(other_cfg, gas4) == {}
+
+
 def test_reference_runner_passes_the_harness_seed(tmp_path, monkeypatch) -> None:
     from arctic_platform.correctness.harness import runner
 
@@ -150,18 +224,21 @@ def test_reference_runner_passes_the_harness_seed(tmp_path, monkeypatch) -> None
     assert result == {"loss": 0.0}
 
 
-def test_export_initial_peft_adapter_accepts_the_live_adapter_pack(tmp_path) -> None:
-    destination = tmp_path / "adapter"
-    destination.mkdir()
-    (destination / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    (destination / "adapter_model.safetensors").write_bytes(b"adapter")
-
-    assert export_initial_peft_adapter(destination) == destination
-
-
 def test_copy_checkpoint_peft_adapter_accepts_a_checkpoint_adapter_pack(tmp_path) -> None:
     checkpoint_root = tmp_path / "checkpoint"
     source = checkpoint_root / "global_step0" / "default"
+    source.mkdir(parents=True)
+    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
+    (source / "adapter_model.safetensors").write_bytes(b"adapter")
+    destination = tmp_path / "adapter"
+
+    assert copy_checkpoint_peft_adapter(checkpoint_root, destination) == destination
+    assert (destination / "adapter_model.safetensors").read_bytes() == b"adapter"
+
+
+def test_copy_checkpoint_peft_adapter_accepts_a_weights_only_hf_pack(tmp_path) -> None:
+    checkpoint_root = tmp_path / "checkpoint"
+    source = checkpoint_root / "hf"
     source.mkdir(parents=True)
     (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
     (source / "adapter_model.safetensors").write_bytes(b"adapter")
@@ -182,24 +259,57 @@ def test_copy_checkpoint_peft_adapter_rejects_a_full_model_pack(tmp_path) -> Non
         copy_checkpoint_peft_adapter(checkpoint_root, tmp_path / "adapter")
 
 
-def test_payload_routes_initial_adapter_export_to_the_worker(tmp_path) -> None:
-    destination = tmp_path / "adapter"
+def test_payload_routes_optimizer_capture_to_debug_for_harness(tmp_path) -> None:
+    destination = tmp_path / "optimizer"
     payload = build_payload(
         {"n_gpus": 1, "mb_spec": {"max_tokens_per_mb": 1024}},
         "model",
         42,
-        initial_peft_adapter_output_dir=destination,
+        optimizer_state_output_dir=destination,
     )
     client_config = _training_client_config(type("Session", (), {"workdir": tmp_path})(), payload)
     worker_config = client_config.to_onprem("training")["ds_worker_config"]
 
-    assert worker_config["debug"]["initial_peft_adapter_output_dir"] == str(destination.resolve())
+    assert worker_config["debug"]["optimizer_state_output_dir"] == str(destination.resolve())
+
+
+def test_optimizer_capture_worker_context_restores_production_worker() -> None:
+    pytest.importorskip("ray")
+    from arctic_platform.common import deepspeed_worker as deepspeed_worker_module
+    from arctic_platform.correctness.harness.optimizer_capture import _optimizer_capture_worker_class
+    from arctic_platform.correctness.harness.optimizer_capture import optimizer_capture_worker
+
+    original = deepspeed_worker_module.DeepSpeedWorker
+    capture_worker = _optimizer_capture_worker_class()
+    with optimizer_capture_worker():
+        assert deepspeed_worker_module.DeepSpeedWorker is capture_worker
+    assert deepspeed_worker_module.DeepSpeedWorker is original
 
 
 def test_payload_can_skip_unused_gradient_norm_collection() -> None:
     payload = build_payload({}, "model", 42, gradient_norms_per_param=False)
 
     assert payload["training_config"]["debug"]["gradient_norms_per_param"] is False
+
+
+def test_payload_overrides_deepspeed_gas_for_arm_microbatches() -> None:
+    payload = build_payload(
+        {
+            "n_gpus": 4,
+            "ds_config": {
+                "train_batch_size": 4,
+                "train_micro_batch_size_per_gpu": 1,
+                "gradient_accumulation_steps": 1,
+            },
+        },
+        "model",
+        42,
+        gradient_accumulation_steps=4,
+    )
+
+    ds_config = payload["training_config"]["ds_config"]
+    assert ds_config["gradient_accumulation_steps"] == 4
+    assert ds_config["train_batch_size"] == 16
 
 
 def test_payload_caps_large_microbatch_budget_at_64k() -> None:
@@ -310,7 +420,6 @@ def test_payload_determinism_off_clears_a_config_that_asks_for_the_pin() -> None
 def test_gateway_runtime_cleans_before_and_after_standard_port(monkeypatch) -> None:
     import torch
 
-    from arctic_platform.common import ray_cluster
     from arctic_platform.correctness.harness import dss_driver
 
     events = []
@@ -322,13 +431,26 @@ def test_gateway_runtime_cleans_before_and_after_standard_port(monkeypatch) -> N
     def start(*, auto_attach, include_peers):
         events.append(("start", auto_attach, include_peers, os.environ["MASTER_PORT"], os.environ["RAY_AUTH_MODE"]))
 
-    monkeypatch.setattr(ray_cluster, "init_ray_cluster", start)
-    monkeypatch.setattr(ray_cluster, "_shutdown", lambda: events.append("shutdown"))
+    class RayCluster:
+        @staticmethod
+        def init_ray_cluster(*, auto_attach, include_peers):
+            start(auto_attach=auto_attach, include_peers=include_peers)
+
+        @staticmethod
+        def _shutdown():
+            events.append("shutdown")
+
+    def load_ray_cluster():
+        events.append(("load", os.environ["MASTER_PORT"], os.environ["RAY_AUTH_MODE"]))
+        return RayCluster
+
+    monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", load_ray_cluster)
 
     with _gateway_runtime(8):
         events.append(("body", os.environ["MASTER_PORT"], os.environ["RAY_AUTH_MODE"]))
 
     assert events == [
+        ("load", "29500", "token"),
         "clean",
         ("start", False, False, "29500", "token"),
         ("body", "29500", "token"),

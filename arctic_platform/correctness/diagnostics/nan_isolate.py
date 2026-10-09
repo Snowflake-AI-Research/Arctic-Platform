@@ -30,7 +30,6 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -44,6 +43,7 @@ from arctic_platform.correctness.harness.dss_driver import gateway  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import pack  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import running_job  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize  # noqa: E402
 
 SOURCE = "/data-fast/base-models/Qwen/Qwen3.8-27B"
@@ -61,7 +61,7 @@ def model_for(layers: int) -> tuple[str, int]:
 
 def dss_loss(training: dict, model_path: str, attn: str, n_gpus: int, body_bytes: bytes) -> str:
     payload = build_payload(training, model_path, SEED, attn_implementation=attn)
-    work = Path(tempfile.mkdtemp(prefix="nanprobe-"))
+    work = correctness_workdir("nanprobe-")
     try:
         with gateway(work, n_gpus) as url:
             with running_job(url, payload) as job_id:
@@ -74,7 +74,7 @@ def dss_loss(training: dict, model_path: str, attn: str, n_gpus: int, body_bytes
 
 
 def reference_loss(model_path: str, batch) -> str:
-    tmp = Path(tempfile.mkdtemp(prefix="nanprobe-ref-"))
+    tmp = correctness_workdir("nanprobe-ref-")
     save(batch, tmp / "batch.pt")
     out = subprocess.run(
         [

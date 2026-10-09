@@ -30,7 +30,6 @@ import copy
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -51,6 +50,7 @@ from arctic_platform.correctness.harness.names import align  # noqa: E402
 from arctic_platform.correctness.harness.runner import run_reference  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
 from arctic_platform.correctness.harness.spec import STATED_CRITERION_ABS  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained  # noqa: E402
 
 ROW_TOKENS = int(os.environ.get("PROBE_ROW_TOKENS", 2048))
@@ -93,7 +93,7 @@ def main(config_path: str) -> int:
     model_cfg = AutoConfig.from_pretrained(path, trust_remote_code=True)
     vocab = getattr(model_cfg, "text_config", model_cfg).vocab_size
 
-    work = Path(tempfile.mkdtemp(prefix="mixer-packing-"))
+    work = correctness_workdir("mixer-packing-")
     batch = build_batch("gas1", 1, ROW_TOKENS, vocab, seed=SEED)
     batch_path = work / "batch.pt"
     save(batch, batch_path)

@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import math
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -45,6 +44,7 @@ from arctic_platform.correctness.harness.dss_driver import gateway  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import pack  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import running_job  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize  # noqa: E402
 
 SOURCE = "/data-fast/base-models/Qwen/Qwen3.8-27B"
@@ -70,7 +70,7 @@ def main(config_path: str) -> int:
 
     print(f"config {cfg.config_id}, {LAYERS}L, row {ROW_TOKENS:,} tokens, attn {attn}\n", flush=True)
 
-    work = Path(tempfile.mkdtemp(prefix="phase-"))
+    work = correctness_workdir("phase-")
     with gateway(work, cfg.n_gpus) as url:
         with running_job(url, payload) as job_id:
             for label in ("fwd-bwd #1 (no step)", "fwd-bwd #2 (no step)"):

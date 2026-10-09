@@ -27,9 +27,9 @@ run once: it does not depend on any of them.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -47,6 +47,7 @@ from arctic_platform.correctness.harness.runner import run_reference  # noqa: E4
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
 from arctic_platform.correctness.harness.spec import STATED_CRITERION_ABS  # noqa: E402
 from arctic_platform.correctness.harness.spec import TestSpec  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained  # noqa: E402
 
 ROW_TOKENS = int(os.environ.get("PROBE_ROW_TOKENS", 2048))
@@ -96,6 +97,23 @@ ARMS = (
 )
 
 
+def deep_merge(base: dict, over: dict) -> dict:
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def apply_probe_engine_override(training: dict) -> dict:
+    override = os.environ.get("PROBE_ENGINE_OVERRIDE")
+    if override:
+        deep_merge(training, json.loads(override))
+        print(f"engine override {override}", flush=True)
+    return training
+
+
 def main(config_path: str, spec_path: str) -> int:
     from transformers import AutoConfig
 
@@ -117,7 +135,7 @@ def main(config_path: str, spec_path: str) -> int:
     model_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     vocab = getattr(model_cfg, "text_config", model_cfg).vocab_size
 
-    work = Path(tempfile.mkdtemp(prefix="engine-knobs-"))
+    work = correctness_workdir("engine-knobs-")
     batch = build_batch("gas1", 1, ROW_TOKENS, vocab, seed=SEED)
     if os.environ.get("PROBE_FULL_ROWS") == "1":
         # The row is random token ids at every position; only the labels past the row length are masked.
@@ -154,6 +172,7 @@ def main(config_path: str, spec_path: str) -> int:
         repeats = {}
         for label, mutate in selected:
             training = copy.deepcopy(cfg.training)
+            apply_probe_engine_override(training)
             training["sp_size"] = 1
             training["n_gpus"] = 1
             if mutate is not None:

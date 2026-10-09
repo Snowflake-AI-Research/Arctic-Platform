@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 import types
-from typing import Any
 from typing import TypedDict
 
 import torch
@@ -533,18 +532,30 @@ def _patch_model_forward(model: nn.Module) -> None:
         else:
             slice_indices = logits_to_keep
 
-        # action_masks is RL-only (chunked-logprob head); SFT/CE heads reject it, so forward only when set.
-        lm_head_kwargs: dict[str, Any] = {}
+        labels = inherit_lm_head_target_validation(labels, labels[:, slice_indices]) if labels is not None else None
+        temperature = temperature[:, slice_indices] if temperature is not None else None
+        hidden_states = hidden_states[:, slice_indices, :]
         if action_masks is not None:
-            lm_head_kwargs["action_masks"] = action_masks
+            return self.lm_head(
+                hidden_states,
+                labels,
+                temperature=temperature,
+                dss_force_zero_loss=dss_force_zero_loss,
+                action_masks=action_masks,
+            )
         if dss_compute_logprobs and isinstance(self.lm_head, FusedCrossEntropyOutputLinear):
-            lm_head_kwargs["dss_compute_logprobs"] = True
+            return self.lm_head(
+                hidden_states,
+                labels,
+                temperature=temperature,
+                dss_force_zero_loss=dss_force_zero_loss,
+                dss_compute_logprobs=True,
+            )
         return self.lm_head(
-            hidden_states[:, slice_indices, :],
-            inherit_lm_head_target_validation(labels, labels[:, slice_indices]) if labels is not None else None,
-            temperature=temperature[:, slice_indices] if temperature is not None else None,
+            hidden_states,
+            labels,
+            temperature=temperature,
             dss_force_zero_loss=dss_force_zero_loss,
-            **lm_head_kwargs,
         )
 
     # Bind the new forward to the model

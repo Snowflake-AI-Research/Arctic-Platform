@@ -32,7 +32,6 @@ import copy
 import json
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -50,6 +49,7 @@ from arctic_platform.correctness.harness.names import align  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
 from arctic_platform.correctness.harness.spec import STATED_CRITERION_ABS  # noqa: E402
 from arctic_platform.correctness.harness.spec import TestSpec  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 
 # label -> (where it lives, key). "ds" is the DeepSpeed config block, "tc" the training config itself.
 KNOBS = {
@@ -74,7 +74,7 @@ def without(training: dict, label: str) -> dict:
 
 def run(training: dict, model_path: str, attn: str, n_gpus: int, body: bytes):
     payload = build_payload(training, model_path, SEED, attn_implementation=attn)
-    work = Path(tempfile.mkdtemp(prefix="leaveout-"))
+    work = correctness_workdir("leaveout-")
     with gateway(work, n_gpus) as url:
         with running_job(url, payload) as job_id:
             return fwd_bwd_step(url, job_id, body)
@@ -104,7 +104,7 @@ def main(config_path: str, drop: list) -> int:
     }
     print(f"knobs present in this config: {knobs}\n", flush=True)
 
-    tmp = Path(tempfile.mkdtemp(prefix="leaveout-ref-"))
+    tmp = correctness_workdir("leaveout-ref-")
     batch_path = tmp / "batch.pt"
     save(batch, batch_path)
     print("[probe] reference (single GPU, no parallelism) ...", flush=True)

@@ -26,7 +26,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -48,12 +47,12 @@ from .batches import save
 from .config import LoadedConfig
 from .dss_driver import build_payload
 from .dss_driver import copy_checkpoint_peft_adapter
-from .dss_driver import export_initial_peft_adapter
 from .dss_driver import fwd_bwd_step
 from .dss_driver import gateway
-from .dss_driver import pack
+from .dss_driver import pack_microbatches
 from .dss_driver import running_job
 from .dss_driver import save_weights_only_checkpoint
+from .optimizer_capture import optimizer_capture_worker
 from .registry import TestOutcome
 from .registry import TestResult
 from .registry import registered_tests
@@ -61,6 +60,7 @@ from .rl_driver import rl_gpu_count
 from .seeds import SEED
 from .spec import ArmSpec
 from .spec import TestSpec
+from .workdir import correctness_workdir
 
 
 @dataclass
@@ -228,13 +228,10 @@ def materialize_dss_peft_adapter(
         model_path,
         SEED,
         attn_implementation=attn_implementation,
-        initial_peft_adapter_output_dir=adapter_dir,
     )
     checkpoint_root = workdir / "checkpoint"
     with gateway(gateway_dir, cfg.n_gpus) as session:
         with running_job(session, payload) as job:
-            if (adapter_dir / "adapter_model.safetensors").is_file():
-                return export_initial_peft_adapter(adapter_dir)
             exported = Path(save_weights_only_checkpoint(session, job, checkpoint_root))
     return copy_checkpoint_peft_adapter(exported.parent, adapter_dir)
 
@@ -243,6 +240,21 @@ def materialize_dss_peft_adapter(
 # the shared step runs at this rate rather than the config's. Gradient norms are captured after reduction
 # and before clipping and the optimizer, so the rate does not affect them.
 OPTIMIZER_LEARNING_RATE = 1e-2
+
+_QWEN3_8B_FULL_LONG_CONTEXT_CONFIG = "qwen3-8b-h200-train-sft-full-4gpus-64k"
+
+
+def _ap_batch_processing_options(cfg: LoadedConfig, arm: ArmSpec) -> dict:
+    """Select AP-only SFT loss packaging for cases that cannot materialize full vocab logits."""
+    if cfg.config_id == _QWEN3_8B_FULL_LONG_CONTEXT_CONFIG and arm.name == "gas4":
+        return {
+            "loss_fn": "sft_ce",
+            "processing_config": {
+                "logits_optimization": "memory",
+                "logits_optimization_peak_mem_size_in_gib": 4,
+            },
+        }
+    return {}
 
 
 def assert_applicable_tests_registered(spec: TestSpec, config_id: str) -> None:
@@ -331,7 +343,7 @@ def execute(
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("single-step-optimizer requires an onboarded reference_token_budget") from exc
     reference_model_path = str(optimizer_settings.get("model_cache_path", spec.model.cache_path))
-    tmp = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="dss-correctness-"))
+    tmp = Path(workdir) if workdir else correctness_workdir("dss-correctness-")
     tmp.mkdir(parents=True, exist_ok=True)
     attn_impl = attn or cfg.attention_implementation
 
@@ -372,6 +384,7 @@ def execute(
     run_started = time.monotonic()
     per_arm_tests = [t for t in chosen if t.per_arm is not None]
     whole_run_tests = [t for t in chosen if t.per_arm is None]
+    collect_gradient_norms = any(t.test_id == "single-step-grads" for t in chosen)
 
     def payload_for(arm: ArmSpec) -> dict:
         """One job per case, asking for the optimizer artifacts only when the step check reads them."""
@@ -385,8 +398,8 @@ def execute(
             SEED,
             attn_implementation=attn_impl,
             optimizer_state_output_dir=optimizer_state_output_dir,
-            gradient_norms_per_param=not stepping,
-            initial_peft_adapter_output_dir=reference_adapter_path,
+            gradient_norms_per_param=collect_gradient_norms,
+            gradient_accumulation_steps=arm.dss_microbatches,
         )
 
     reference_training = cfg.effective_training
@@ -466,6 +479,8 @@ def execute(
             # no longer holding the checkpoint's weights. Sharing it would make each case depend on the ones
             # before it and on the order they ran in.
             with ExitStack() as stack:
+                if stepping:
+                    stack.enter_context(optimizer_capture_worker())
                 with console.activity("Starting Arctic Platform gateway"):
                     url = stack.enter_context(gateway(tmp, cfg.n_gpus))
                 for arm in arm_specs:
@@ -475,9 +490,11 @@ def execute(
                             context._target[arm.name] = fwd_bwd_step(
                                 url,
                                 job_id,
-                                pack(
+                                pack_microbatches(
                                     load_batch(batch_paths[arm.name]),
+                                    arm.dss_microbatches,
                                     model_provider=str(cfg.training.get("model_provider", "huggingface")),
+                                    **_ap_batch_processing_options(cfg, arm),
                                 ),
                                 learning_rate=OPTIMIZER_LEARNING_RATE if stepping else 0.0,
                             )
@@ -490,6 +507,8 @@ def execute(
                 with console.activity(f"Running reference {arm.name}"):
                     measure_reference(arm)
                 with ExitStack() as stack:
+                    if stepping:
+                        stack.enter_context(optimizer_capture_worker())
                     with console.activity("Starting Arctic Platform gateway"):
                         url = stack.enter_context(gateway(tmp, cfg.n_gpus))
                     with console.activity(f"Running Arctic Platform {arm.name}"):
@@ -498,9 +517,11 @@ def execute(
                             context._target[arm.name] = fwd_bwd_step(
                                 url,
                                 job_id,
-                                pack(
+                                pack_microbatches(
                                     load_batch(batch_paths[arm.name]),
+                                    arm.dss_microbatches,
                                     model_provider=str(cfg.training.get("model_provider", "huggingface")),
+                                    **_ap_batch_processing_options(cfg, arm),
                                 ),
                                 learning_rate=OPTIMIZER_LEARNING_RATE if stepping else 0.0,
                             )
@@ -557,7 +578,7 @@ def execute_rl(
     """
     cfg = cfg.at_gpu_width(cfg.n_gpus)
     assert_applicable_tests_registered(spec, cfg.config_id)
-    tmp = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="dss-correctness-rl-"))
+    tmp = Path(workdir) if workdir else correctness_workdir("dss-correctness-rl-")
     tmp.mkdir(parents=True, exist_ok=True)
     context = RunContext(
         config_id=cfg.config_id,

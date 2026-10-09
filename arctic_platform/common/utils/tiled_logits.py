@@ -37,6 +37,8 @@ historical names.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 try:
@@ -69,6 +71,52 @@ def logits_chunk_rows(vocab_size, peak_mem_gib, bytes_per_elem=4):
     budget_bytes = max(1, int(peak_mem_gib * 2**30))
     row_bytes = max(1, int(vocab_size) * bytes_per_elem)
     return max(1, budget_bytes // row_bytes)
+
+
+def _same_tensor_storage(lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> bool:
+    if lhs is None or rhs is None:
+        return False
+    if lhs is rhs:
+        return True
+    if tuple(lhs.shape) != tuple(rhs.shape):
+        return False
+    try:
+        return (
+            lhs.untyped_storage().data_ptr() == rhs.untyped_storage().data_ptr()
+            and lhs.storage_offset() == rhs.storage_offset()
+        )
+    except RuntimeError:
+        return False
+
+
+def lm_head_weight_is_tied_to_input_embedding(model: Any) -> bool:
+    """Whether the output projection and input embedding are the same parameter storage."""
+    head = getattr(model, "lm_head", None)
+    head_weight = getattr(head, "weight", None)
+    get_input_embeddings = getattr(model, "get_input_embeddings", None)
+    if not callable(get_input_embeddings):
+        return False
+    input_embeddings = get_input_embeddings()
+    input_weight = getattr(input_embeddings, "weight", None)
+    return _same_tensor_storage(head_weight, input_weight)
+
+
+def deferred_deepspeed_compute_params_for_tied_lm_head(model: Any) -> list[torch.nn.Parameter]:
+    """Params whose DeepSpeed reduction must be deferred to an outer tied-embedding gradient."""
+    if not lm_head_weight_is_tied_to_input_embedding(model):
+        return []
+    head = getattr(model, "lm_head", None)
+    head_weight = getattr(head, "weight", None)
+    return [head_weight] if head_weight is not None else []
+
+
+def deepspeed_lm_head_compute_params(model: Any) -> tuple[list[torch.nn.Parameter], bool]:
+    """LM-head params and whether their reduction is owned by the tied embedding path."""
+    head = getattr(model, "lm_head", None)
+    head_weight = getattr(head, "weight", None)
+    if head_weight is None:
+        return [], False
+    return [head_weight], lm_head_weight_is_tied_to_input_embedding(model)
 
 
 def lm_head_logits(
@@ -253,6 +301,7 @@ class TiledLogProbEntropy(torch.autograd.Function):
         calculate_entropy,
         shards,
         compute_params,
+        defer_compute_params_to_outer_graph,
     ) -> torch.Tensor:
 
         # don't store anything for bwd if this is a torch.no_grad forward
@@ -261,6 +310,7 @@ class TiledLogProbEntropy(torch.autograd.Function):
             ctx.model = model
             ctx.shards = shards
             ctx.compute_params = [p for p in compute_params if p.requires_grad]
+            ctx.defer_compute_params_to_outer_graph = defer_compute_params_to_outer_graph
             ctx.temperature = temperature
             ctx.calculate_entropy = calculate_entropy
             ctx.save_for_backward(hidden_states, labels)
@@ -295,6 +345,7 @@ class TiledLogProbEntropy(torch.autograd.Function):
         model = ctx.model
         shards = ctx.shards
         compute_params = ctx.compute_params
+        defer_compute_params_to_outer_graph = ctx.defer_compute_params_to_outer_graph
 
         temperature = ctx.temperature
         calculate_entropy = ctx.calculate_entropy
@@ -318,15 +369,19 @@ class TiledLogProbEntropy(torch.autograd.Function):
         # Create a gradient accumulator for parameters
         # grad_accumulator = GradientAccumulator(compute_params, shards, dtype=hs.dtype)
 
-        # Tell deepspeed not to add a new grad to its ipg bucket during this backward
-        # oddly because of self.lm_head.weight being tied with self.model.embed_tokens.weight we have to tell DS that the grad isn't ready and it'll be reduced when model.embed_tokens.weight grad is reduced
-        # otherwise it asserts the parameter model.embed_tokens.weight has already been reduced.
-        for param in compute_params:
-            param.ds_grad_is_ready = False
-
         labels_step = labels_shards[0].shape[0]
         shard_step = hs_shards[0].numel()
         for i, hs_shard in enumerate(hs_shards):
+            # DeepSpeed ZeRO 1/2 reduces trainable params from autograd hooks. A tiled replay would fire that
+            # hook once per tile, so mirror DeepSpeed's tiled-module convention: suppress non-final tiles and
+            # let the final tile reduce the fully accumulated grad. Tied heads are special because the same
+            # storage also receives the input-embedding gradient later in the outer graph, so the lm-head
+            # replay stays suppressed and the outer embedding hook owns the single reduction.
+            if compute_params:
+                grad_is_ready = False if defer_compute_params_to_outer_graph else i + 1 == len(hs_shards)
+                for param in compute_params:
+                    param.ds_grad_is_ready = grad_is_ready
+
             hs_shard.requires_grad_(hs_requires_grad)
 
             shard_offset = i * shard_step
@@ -362,6 +417,10 @@ class TiledLogProbEntropy(torch.autograd.Function):
 
             torch.autograd.backward(tensors, incoming_grad_shards)
 
+        if defer_compute_params_to_outer_graph:
+            for param in compute_params:
+                param.ds_grad_is_ready = True
+
         # Clean up hooks
         # grad_accumulator.cleanup()
         # del grad_accumulator
@@ -370,6 +429,7 @@ class TiledLogProbEntropy(torch.autograd.Function):
             None,
             None,
             hs_grad,
+            None,
             None,
             None,
             None,

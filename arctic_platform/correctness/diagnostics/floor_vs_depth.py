@@ -38,7 +38,6 @@ from __future__ import annotations
 import re
 import statistics
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -51,6 +50,7 @@ from arctic_platform.correctness.harness.dss_driver import gateway  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import pack  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import running_job  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize  # noqa: E402
 
 SOURCE = "/data-fast/base-models/Qwen/Qwen3.8-27B"
@@ -64,7 +64,7 @@ def measure(training, model_path, vocab, attn, n_gpus):
     """Two runs, separate jobs, identical data."""
     body_bytes = pack(build_batch("floor", 1, ROW_TOKENS, vocab, seed=SEED))
     payload = build_payload(training, model_path, SEED, attn_implementation=attn)
-    work = Path(tempfile.mkdtemp(prefix="depthfloor-"))
+    work = correctness_workdir("depthfloor-")
     with gateway(work, n_gpus) as url:
         with running_job(url, payload) as job_id:
             first = fwd_bwd_step(url, job_id, body_bytes)

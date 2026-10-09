@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import math
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -44,6 +43,7 @@ from arctic_platform.correctness.harness.dss_driver import gateway  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import pack  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import running_job  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize  # noqa: E402
 
 SOURCE = "/data-fast/base-models/Qwen/Qwen3.8-27B"
@@ -80,7 +80,7 @@ def main(config_path: str) -> int:
         model_path, vocab = model_for(layers)
         body_bytes = pack(build_batch("probe", 1, ROW_TOKENS, vocab, seed=SEED))
         payload = build_payload(cfg.training, model_path, SEED, attn_implementation=attn)
-        work = Path(tempfile.mkdtemp(prefix="twostep-"))
+        work = correctness_workdir("twostep-")
         print(f"[probe] {layers}L ...", flush=True)
         try:
             with gateway(work, cfg.n_gpus) as url:

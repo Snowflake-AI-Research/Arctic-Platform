@@ -13,18 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Correctness-only gradient telemetry exposed by the native DeepSpeed worker."""
+"""Debug diagnostics exposed by the native DeepSpeed worker."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from arctic_platform.common import deepspeed_worker as deepspeed_worker_module
 from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
 from arctic_platform.common.deepspeed_worker import _deepspeed_init_kwargs
-from arctic_platform.common.deepspeed_worker import _sync_initial_peft_adapter
-from arctic_platform.common.deepspeed_worker import _synchronize_initial_peft_adapter
 from arctic_platform.common.deepspeed_worker import _worker_debug_config
 
 
@@ -37,91 +34,7 @@ def _worker(model: torch.nn.Module, *, enabled: bool, rank: int = 0, sp_size: in
     return worker
 
 
-def test_live_peft_model_exports_adapter_weights_and_metadata(tmp_path):
-    import json
-
-    from peft import LoraConfig
-    from peft import get_peft_model
-    from safetensors.torch import load_file
-
-    model = get_peft_model(
-        torch.nn.Sequential(torch.nn.Linear(2, 2, bias=False)),
-        LoraConfig(target_modules=["0"], r=1, lora_alpha=1),
-    )
-    output_dir = tmp_path / "adapter"
-
-    _sync_initial_peft_adapter(model, str(output_dir))
-
-    config = json.loads((output_dir / "adapter_config.json").read_text())
-    weights = load_file(output_dir / "adapter_model.safetensors")
-    assert config["peft_type"] == "LORA"
-    assert weights
-    assert all("lora_" in name for name in weights)
-    assert not (output_dir / "config.json").exists()
-    assert not (output_dir / "model.safetensors").exists()
-
-    with torch.no_grad():
-        for name, parameter in model.named_parameters():
-            if "lora_" in name:
-                parameter.add_(1)
-    _sync_initial_peft_adapter(model, str(output_dir))
-
-    from peft import get_peft_model_state_dict
-
-    restored = get_peft_model_state_dict(model)
-    assert set(restored) == set(weights)
-    for name, tensor in weights.items():
-        torch.testing.assert_close(restored[name], tensor)
-
-
-def test_live_peft_export_passes_only_trainable_parameters_to_save_pretrained(tmp_path):
-    class Model(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.peft_config = {"default": object()}
-            self.adapter = torch.nn.Parameter(torch.ones(1))
-            self.frozen = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
-            self.saved_state = None
-
-        def save_pretrained(self, adapter_dir, *, safe_serialization, state_dict):
-            self.saved_state = state_dict
-            output_dir = tmp_path / "adapter"
-            output_dir.mkdir()
-            (output_dir / "adapter_model.safetensors").touch()
-            (output_dir / "adapter_config.json").touch()
-
-    model = Model()
-
-    _sync_initial_peft_adapter(model, str(tmp_path / "adapter"))
-
-    assert model.saved_state is not None
-    assert set(model.saved_state) == {"adapter"}
-    assert model.saved_state["adapter"].device.type == "cpu"
-
-
-@pytest.mark.parametrize(
-    ("rank", "expected"),
-    [
-        (0, ["snapshot", "sync", "barrier", "barrier"]),
-        (1, ["snapshot", "barrier", "sync", "barrier"]),
-    ],
-)
-def test_initial_peft_adapter_is_created_before_nonzero_ranks_restore(monkeypatch, rank, expected):
-    events = []
-    monkeypatch.setattr(
-        deepspeed_worker_module,
-        "_trainable_peft_state_dict",
-        lambda model: events.append("snapshot") or {},
-    )
-    monkeypatch.setattr(deepspeed_worker_module, "_sync_initial_peft_adapter", lambda *args: events.append("sync"))
-    monkeypatch.setattr(deepspeed_worker_module.dist, "barrier", lambda: events.append("barrier"))
-
-    _synchronize_initial_peft_adapter(torch.nn.Module(), "/adapter", rank)
-
-    assert events == expected
-
-
-def test_worker_debug_config_preserves_native_correctness_settings():
+def test_worker_debug_config_preserves_native_debug_settings():
     debug = _worker_debug_config(
         {
             "full_determinism": True,
@@ -165,7 +78,7 @@ def test_per_parameter_gradient_norms_report_trainable_parameters(monkeypatch):
     }
 
 
-def test_per_parameter_gradient_norms_do_not_apply_extra_sp_scale(monkeypatch):
+def test_per_parameter_gradient_norms_do_not_apply_extra_sp_normalization(monkeypatch):
     model = torch.nn.Linear(2, 2, bias=False)
     model.weight.grad = torch.full_like(model.weight, 4.0)
     monkeypatch.setattr("deepspeed.utils.safe_get_full_grad", lambda param: param.grad)

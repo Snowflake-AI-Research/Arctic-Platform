@@ -72,7 +72,7 @@ class AdamWTrajectory:
     @property
     def trainable_names(self) -> List[str]:
         """The parameters this optimizer owns, empty until the first step has decided them."""
-        return [name for name, _ in (self._sources or [])]
+        return [name for name, _ in self._sources or []]
 
     def _adopt(self, gradients: Dict[str, "torch.Tensor"]) -> None:
         """Take the FP32 master copy, once, from the parameters the first request produced a gradient for.

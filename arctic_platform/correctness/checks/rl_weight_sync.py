@@ -130,7 +130,7 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
     holdings = [h for h in find_key(target.get("send"), "trainer_parameters") if h]
     if not holdings:
         raise RuntimeError("the training zone reported no parameter element count beside its manifest")
-    ranks = [v for group in find_key(target.get("recv"), "all_rank_weight_sync_verification") for v in (group or [])]
+    ranks = [v for group in find_key(target.get("recv"), "all_rank_weight_sync_verification") for v in group or []]
     if not ranks:
         raise RuntimeError(
             f"the sampling zone returned no weight-sync verification; its workers need {VERIFY_ENV}=1, which a "

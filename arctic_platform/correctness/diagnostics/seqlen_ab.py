@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import statistics
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -45,6 +44,7 @@ from arctic_platform.correctness.harness.runner import run_reference  # noqa: E4
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
 from arctic_platform.correctness.harness.spec import STATED_CRITERION_ABS  # noqa: E402
 from arctic_platform.correctness.harness.spec import TestSpec  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 
 LENGTHS = (2048, 8192, 32768, 65536)
 SPEC = "arctic_platform/correctness/specs/qwen3.8-27b-h200-train-sft-8gpus-2k.json"
@@ -68,7 +68,7 @@ def main(config_path: str, spec_path: str) -> int:
         flush=True,
     )
 
-    work = Path(tempfile.mkdtemp(prefix="seqlen-ab-"))
+    work = correctness_workdir("seqlen-ab-")
     rows = []
 
     # Every reference runs before the gateway starts, so the single-GPU pass never shares the node with it.

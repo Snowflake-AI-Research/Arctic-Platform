@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import statistics
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -49,6 +48,7 @@ from arctic_platform.correctness.harness.config import load_config  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
 from arctic_platform.correctness.harness.spec import STATED_CRITERION_ABS  # noqa: E402
 from arctic_platform.correctness.harness.spec import TestSpec  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 from arctic_platform.correctness.reference.hf_single_gpu import run as reference_run  # noqa: E402
 
 ROW_TOKENS = 2048
@@ -81,7 +81,7 @@ def main(config_path: str, spec_path: str) -> int:
     model_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     vocab = getattr(model_cfg, "text_config", model_cfg).vocab_size
 
-    work = Path(tempfile.mkdtemp(prefix="bias-source-"))
+    work = correctness_workdir("bias-source-")
     batch = build_batch("gas1", 1, ROW_TOKENS, vocab, seed=SEED)
     path = work / "batch.pt"
     save(batch, path)

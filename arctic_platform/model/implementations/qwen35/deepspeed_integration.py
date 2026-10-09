@@ -18,33 +18,39 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 
-from .config import DebugModelConfig, ModelConfig
-from .sequence_parallel import apply_sequence_parallelism
-from .model_builder import (
-    DTYPE_MAP,
-    _reset_runtime_moe_buffers,
-    apply_ac,
-    configure_moe_ep_backend,
-    get_model,
-    load_dcp_from_hf,
+from arctic_platform.model.implementations.debug.row_invariant_projection import maybe_apply_row_invariant_projections
+from arctic_platform.model.implementations.moe.deepspeed_integration import MoEDeepSpeedAdapter
+from arctic_platform.model.implementations.moe.deepspeed_integration import apply_ep_with_mesh as _apply_ep_with_mesh
+from arctic_platform.model.implementations.moe.deepspeed_integration import (
+    build_iter_full_hf_weights as _build_iter_full_hf_weights,
 )
 from arctic_platform.model.implementations.moe.deepspeed_integration import (
-    MoEDeepSpeedAdapter,
-    apply_ep_with_mesh as _apply_ep_with_mesh,
-    build_iter_full_hf_weights as _build_iter_full_hf_weights,
     convert_dtensors_to_local as _convert_dtensors_to_local,
-    load_moe_model as _load_moe_model,
+)
+from arctic_platform.model.implementations.moe.deepspeed_integration import load_moe_model as _load_moe_model
+from arctic_platform.model.implementations.moe.deepspeed_integration import (
     load_moe_model_for_deepspeed as _load_moe_model_for_deepspeed,
-    patch_deepspeed_moe_detection,
-    setup_model_local_no_train,
-    tag_expert_lora_adapters_for_deepspeed,
+)
+from arctic_platform.model.implementations.moe.deepspeed_integration import patch_deepspeed_moe_detection
+from arctic_platform.model.implementations.moe.deepspeed_integration import setup_model_local_no_train
+from arctic_platform.model.implementations.moe.deepspeed_integration import tag_expert_lora_adapters_for_deepspeed
+from arctic_platform.model.implementations.moe.deepspeed_integration import (
     tag_expert_params_for_deepspeed as _tag_expert_params_for_deepspeed,
 )
 from arctic_platform.model.implementations.moe.layers.lm_head import inject_prime_lm_head
 from arctic_platform.model.implementations.moe.layers.moe import FeedForward
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
-from arctic_platform.model.implementations.debug.row_invariant_projection import maybe_apply_row_invariant_projections
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+
+from .config import DebugModelConfig
+from .config import ModelConfig
+from .model_builder import DTYPE_MAP
+from .model_builder import _reset_runtime_moe_buffers
+from .model_builder import apply_ac
+from .model_builder import configure_moe_ep_backend
+from .model_builder import get_model
+from .model_builder import load_dcp_from_hf
+from .sequence_parallel import apply_sequence_parallelism
 
 
 def shared_expert_mlp_forward(feed_forward: FeedForward, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -113,16 +119,16 @@ def _convert_qwen3_5_moe_layer_to_vllm(
 def _to_vllm_vlm_name(name: str) -> str:
     """Rename a Prime-RL VLM parameter key to vLLM's VLM internal layout."""
     if name.startswith("model.visual."):
-        return "visual." + name[len("model.visual."):]
+        return "visual." + name[len("model.visual.") :]
     if name.startswith("model.language_model."):
-        return "language_model.model." + name[len("model.language_model."):]
+        return "language_model.model." + name[len("model.language_model.") :]
     if name.startswith("lm_head."):
-        return "language_model.lm_head." + name[len("lm_head."):]
+        return "language_model.lm_head." + name[len("lm_head.") :]
     raise RuntimeError(
-        f"_to_vllm_vlm_name: no Prime-RL -> vLLM VLM rule for parameter "
+        "_to_vllm_vlm_name: no Prime-RL -> vLLM VLM rule for parameter "
         f"name {name!r}. Either Prime-RL grew a new top-level submodule "
-        f"or this model is not the Qwen3.5-MoE VLM shape this helper "
-        f"was written for. Extend _to_vllm_vlm_name with a new rule."
+        "or this model is not the Qwen3.5-MoE VLM shape this helper "
+        "was written for. Extend _to_vllm_vlm_name with a new rule."
     )
 
 
@@ -130,7 +136,7 @@ def _build_iter_full_vllm_weights(model: nn.Module):
     """Iterator yielding ``(vllm_name, full_tensor)`` on rank 0 for weight sync."""
     cls_name = type(model).__name__
     assert cls_name.startswith("Qwen3_5Moe"), (
-        f"_build_iter_full_vllm_weights only supports Qwen3.5 MoE today "
+        "_build_iter_full_vllm_weights only supports Qwen3.5 MoE today "
         f"(got {cls_name}); add a per-family layer converter and dispatch."
     )
 
@@ -151,12 +157,7 @@ def _build_iter_full_vllm_weights(model: nn.Module):
                 return int(parts[2])
             except ValueError:
                 pass
-        if (
-            len(parts) >= 4
-            and parts[0] == "model"
-            and parts[1] == "language_model"
-            and parts[2] == "layers"
-        ):
+        if len(parts) >= 4 and parts[0] == "model" and parts[1] == "language_model" and parts[2] == "layers":
             try:
                 return int(parts[3])
             except ValueError:
@@ -259,9 +260,7 @@ def _adapter() -> MoEDeepSpeedAdapter:
         shared_expert_type=FeedForward,
         shared_expert_forward=shared_expert_mlp_forward,
         build_model_config=_build_model_config,
-        extra_weight_iterators=(
-            ("_iter_full_vllm_weights", _build_iter_full_vllm_weights),
-        ),
+        extra_weight_iterators=(("_iter_full_vllm_weights", _build_iter_full_vllm_weights),),
     )
 
 
@@ -344,9 +343,7 @@ def load_qwen3_5_moe_model(
 
 def _apply_generic_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None:
     if sp_size > 1:
-        from arctic_platform.model.implementations.moe.sequence_parallel import (
-            apply_sequence_parallelism,
-        )
+        from arctic_platform.model.implementations.moe.sequence_parallel import apply_sequence_parallelism
 
         apply_sequence_parallelism(model, sp_size, sp_group)
 

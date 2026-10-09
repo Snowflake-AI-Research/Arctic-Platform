@@ -205,7 +205,7 @@ def test_sft_global_token_meta_uses_logical_dp_size_under_sequence_parallelism(m
     batch = {"labels": torch.tensor([[-100, 1, 2, -100]])}
     monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
 
-    worker._inject_sft_global_token_meta("sft", batch, meta)
+    worker._inject_sft_global_token_meta("sft_ce", batch, meta)
 
     assert meta == {"global_num_tokens": 2, "dp_size": 1}
 
@@ -218,9 +218,22 @@ def test_sft_global_token_meta_counts_preshifted_labels(monkeypatch):
     batch = {"labels": torch.tensor([[1, 2, -100, -100]])}
     monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
 
-    worker._inject_sft_global_token_meta("sft", batch, meta)
+    worker._inject_sft_global_token_meta("sft_ce", batch, meta)
 
     assert meta == {"labels_are_shifted": True, "global_num_tokens": 2, "dp_size": 1}
+
+
+def test_sft_global_token_meta_applies_to_model_provided_sft_loss(monkeypatch):
+    worker = _worker(_Engine())
+    worker.world_size = 8
+    worker.sp_size = 8
+    meta = {}
+    batch = {"labels": torch.tensor([[-100, 1, 2, -100]])}
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
+
+    worker._inject_sft_global_token_meta("sft", batch, meta)
+
+    assert meta == {"global_num_tokens": 2, "dp_size": 1}
 
 
 def test_native_worker_applies_local_mean_scales_with_one_stateful_loss_object():

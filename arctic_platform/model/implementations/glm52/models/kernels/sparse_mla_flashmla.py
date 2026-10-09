@@ -87,10 +87,7 @@ def set_sparse_mla_backend(backend: str) -> str:
     global _configured_sparse_mla_backend
     requested = (backend or _DEFAULT_SPARSE_MLA_BACKEND).lower()
     if requested not in _VALID_SPARSE_MLA_BACKENDS:
-        raise ValueError(
-            f"Unknown sparse_mla_backend={backend!r}, "
-            f"expected one of {_VALID_SPARSE_MLA_BACKENDS}"
-        )
+        raise ValueError(f"Unknown sparse_mla_backend={backend!r}, expected one of {_VALID_SPARSE_MLA_BACKENDS}")
     if requested == "flashmla":
         _ensure_flash_mla_sparse_fwd()
     _configured_sparse_mla_backend = requested
@@ -115,9 +112,7 @@ def _prepare_flashmla_indices(
     """
     flash_indices = indices.to(torch.int32).contiguous()
     flash_indices = flash_indices.masked_fill(flash_indices == sentinel_idx, -1)
-    flash_indices = flash_indices.masked_fill(
-        (flash_indices < 0) | (flash_indices >= kv_seq_len), -1
-    )
+    flash_indices = flash_indices.masked_fill((flash_indices < 0) | (flash_indices >= kv_seq_len), -1)
     return flash_indices.unsqueeze(1)
 
 
@@ -138,9 +133,7 @@ def _ref_sparse_mla_fwd_one(
 
     q_f = q.float()
     kv_body = kv[:kv_seq_len, 0].float()
-    gathered = kv_body.index_select(0, idx_safe.reshape(-1)).view(
-        s_q, topk, q.shape[-1]
-    )
+    gathered = kv_body.index_select(0, idx_safe.reshape(-1)).view(s_q, topk, q.shape[-1])
 
     scores = torch.einsum("shd,std->sht", q_f, gathered) * sm_scale
     scores = scores.masked_fill(invalid.unsqueeze(1), float("-inf"))
@@ -218,9 +211,7 @@ def _ref_sparse_mla_bwd_one(
         dv_grad = torch.einsum("sht,shd->std", probs, do_f)
         d_slot[..., :d_v].add_(dv_grad)
 
-        dkv[:kv_seq_len, 0].index_add_(
-            0, idx_safe.reshape(-1), d_slot.reshape(-1, dim_qk)
-        )
+        dkv[:kv_seq_len, 0].index_add_(0, idx_safe.reshape(-1), d_slot.reshape(-1, dim_qk))
 
     return dq.to(q.dtype), dkv.to(kv.dtype)
 
@@ -259,9 +250,7 @@ def _flashmla_fwd_one(
     fwd = _ensure_flash_mla_sparse_fwd()
     topk = int(flash_indices.shape[-1])
     if topk % 128 != 0:
-        raise ValueError(
-            f"FlashMLA sparse prefill requires topk % 128 == 0 (SM90 2*B_TOPK), got topk={topk}"
-        )
+        raise ValueError(f"FlashMLA sparse prefill requires topk % 128 == 0 (SM90 2*B_TOPK), got topk={topk}")
     h_q = int(q.size(1))
     pad_h = flashmla_prefill_h_q_align(h_q, q.device)
     q_kernel = _pad_q_heads(q, pad_h)
@@ -297,12 +286,8 @@ class _SparseMLAFlashMLA(torch.autograd.Function):
         flash_indices_list: list[torch.Tensor] = []
 
         for b in range(batch):
-            flash_idx = _prepare_flashmla_indices(
-                indices[b, :, 0, :], kv_seq_len, sentinel_idx
-            )
-            out_b, lse_b = _flashmla_fwd_one(
-                q[b], kv[b, :kv_seq_len], flash_idx, sm_scale, d_v
-            )
+            flash_idx = _prepare_flashmla_indices(indices[b, :, 0, :], kv_seq_len, sentinel_idx)
+            out_b, lse_b = _flashmla_fwd_one(q[b], kv[b, :kv_seq_len], flash_idx, sm_scale, d_v)
             outs.append(out_b.unsqueeze(0))
             lses.append(lse_b.unsqueeze(0))
             flash_indices_list.append(flash_idx)
@@ -367,12 +352,8 @@ def sparse_mla_ref_fwd_interface(
     outs: list[torch.Tensor] = []
     lses: list[torch.Tensor] = []
     for b in range(batch):
-        flash_idx = _prepare_flashmla_indices(
-            indices[b, :, 0, :], kv_seq_len, sentinel_idx
-        )
-        out_b, lse_b = _ref_sparse_mla_fwd_one(
-            q[b], kv[b], flash_idx, sm_scale, kv_seq_len, d_v
-        )
+        flash_idx = _prepare_flashmla_indices(indices[b, :, 0, :], kv_seq_len, sentinel_idx)
+        out_b, lse_b = _ref_sparse_mla_fwd_one(q[b], kv[b], flash_idx, sm_scale, kv_seq_len, d_v)
         outs.append(out_b.unsqueeze(0))
         lses.append(lse_b.unsqueeze(0))
     return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
@@ -394,12 +375,8 @@ def sparse_mla_ref_bwd_interface(
     dq_parts: list[torch.Tensor] = []
     dkv_parts: list[torch.Tensor] = []
     for b in range(batch):
-        flash_idx = _prepare_flashmla_indices(
-            indices[b, :, 0, :], kv_seq_len, sentinel_idx
-        )
-        dq_b, dkv_b = _ref_sparse_mla_bwd_one(
-            q[b], kv[b], flash_idx, lse[b], do[b], sm_scale, kv_seq_len, d_v
-        )
+        flash_idx = _prepare_flashmla_indices(indices[b, :, 0, :], kv_seq_len, sentinel_idx)
+        dq_b, dkv_b = _ref_sparse_mla_bwd_one(q[b], kv[b], flash_idx, lse[b], do[b], sm_scale, kv_seq_len, d_v)
         dq_parts.append(dq_b.unsqueeze(0))
         dkv_parts.append(dkv_b.unsqueeze(0))
     return torch.cat(dq_parts, dim=0), torch.cat(dkv_parts, dim=0)
@@ -455,12 +432,8 @@ def sparse_mla_flashmla_fwd_interface(
     outs: list[torch.Tensor] = []
     lses: list[torch.Tensor] = []
     for b in range(batch):
-        flash_idx = _prepare_flashmla_indices(
-            indices[b, :, 0, :], kv_seq_len, sentinel_idx
-        )
-        out_b, lse_b = _flashmla_fwd_one(
-            q[b], kv[b, :kv_seq_len], flash_idx, sm_scale, d_v
-        )
+        flash_idx = _prepare_flashmla_indices(indices[b, :, 0, :], kv_seq_len, sentinel_idx)
+        out_b, lse_b = _flashmla_fwd_one(q[b], kv[b, :kv_seq_len], flash_idx, sm_scale, d_v)
         outs.append(out_b.unsqueeze(0))
         lses.append(lse_b.unsqueeze(0))
     return torch.cat(outs, dim=0), torch.cat(lses, dim=0)

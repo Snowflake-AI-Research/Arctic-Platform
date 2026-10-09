@@ -244,3 +244,40 @@ def test_packed_sequence_indices_reject_incomplete_boundaries():
             seq_len=4,
             device=torch.device("cpu"),
         )
+
+
+def test_segmented_qwen35_short_conv_resets_packed_boundaries():
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _has_multiple_packed_sequences,
+    )
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _segmented_causal_conv1d,
+    )
+
+    conv = nn.Conv1d(1, 1, kernel_size=3, groups=1, padding=2, bias=False)
+    conv.weight.data.fill_(1.0)
+    x = torch.tensor([[[1.0, 2.0, 10.0, 20.0, 30.0]]])
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    segmented = _segmented_causal_conv1d(conv, x, cu_seqlens)
+    unsegmented = torch.nn.functional.silu(conv(x)[:, :, : x.shape[-1]])
+
+    assert _has_multiple_packed_sequences(cu_seqlens)
+    assert segmented.shape == x.shape
+    assert segmented[:, :, 2].item() != unsegmented[:, :, 2].item()
+    assert segmented[:, :, 2].item() == torch.nn.functional.silu(torch.tensor(10.0)).item()
+
+
+def test_segmented_qwen35_short_conv_rejects_unflattened_packed_input():
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _segmented_causal_conv1d,
+    )
+
+    conv = nn.Conv1d(1, 1, kernel_size=3, groups=1, padding=2, bias=False)
+
+    with pytest.raises(ValueError, match=r"describe 8 tokens.*contains 4"):
+        _segmented_causal_conv1d(
+            conv,
+            torch.randn(2, 1, 4),
+            torch.tensor([0, 4, 8], dtype=torch.int32),
+        )

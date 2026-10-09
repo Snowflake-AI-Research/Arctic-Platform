@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import statistics
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -45,6 +44,7 @@ from arctic_platform.correctness.harness.dss_driver import gateway  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import pack  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import running_job  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 from arctic_platform.correctness.onboarding.synth_model import materialize  # noqa: E402
 
 SOURCE = "/data-fast/base-models/Qwen/Qwen3.8-27B"
@@ -66,7 +66,7 @@ def main(config_path: str) -> int:
 
     table = []
     payload = build_payload(cfg.training, spec.cache_path, SEED, attn_implementation=attn)
-    work = Path(tempfile.mkdtemp(prefix="rowfloor-"))
+    work = correctness_workdir("rowfloor-")
     with gateway(work, cfg.n_gpus) as url:
         for row_tokens in ROW_LENGTHS:
             batch = build_batch("floor", 1, row_tokens, vocab, seed=SEED)

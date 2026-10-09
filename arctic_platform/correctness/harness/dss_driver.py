@@ -127,25 +127,33 @@ def _stop_and_verify_gateway_runtime() -> None:
     )
 
 
+def _load_gateway_ray_cluster() -> Any:
+    from arctic_platform.common import ray_cluster
+
+    return ray_cluster
+
+
 @contextlib.contextmanager
 def _gateway_runtime(slots: int) -> Iterator[None]:
     """Give one correctness job a clean Ray tree sized to its requested GPU topology."""
     import torch
-
-    from arctic_platform.common import ray_cluster
 
     include_peers = slots > torch.cuda.device_count()
     previous_master_port = os.environ.get("MASTER_PORT")
     previous_auth_mode = os.environ.get("RAY_AUTH_MODE")
     os.environ["MASTER_PORT"] = str(_STANDARD_MASTER_PORT)
     os.environ["RAY_AUTH_MODE"] = "token"
+    ray_cluster = None
     try:
+        # Ray reads auth mode while importing its C extension; set the harness policy before importing Ray.
+        ray_cluster = _load_gateway_ray_cluster()
         _stop_and_verify_gateway_runtime()
         ray_cluster.init_ray_cluster(auto_attach=False, include_peers=include_peers)
         yield
     finally:
         try:
-            ray_cluster._shutdown()
+            if ray_cluster is not None:
+                ray_cluster._shutdown()
         finally:
             try:
                 _stop_and_verify_gateway_runtime()
@@ -243,18 +251,13 @@ def running_job(session: GatewaySession, payload: dict) -> Iterator[ArcticJob]:
             client.shutdown()
 
 
-def export_initial_peft_adapter(destination: Path) -> Path:
-    """Validate the adapter pack exported from the live PEFT model."""
-    adapter_path = destination / "adapter_model.safetensors"
-    config_path = destination / "adapter_config.json"
-    if not adapter_path.is_file() or not config_path.is_file():
-        raise RuntimeError(f"live PEFT adapter export produced an incomplete pack at {destination}")
-    return destination
-
-
 def copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: Path) -> Path:
     """Copy the PEFT pack from a weights-only checkpoint when the exporter retained one."""
-    candidates = [checkpoint_root / "default", *sorted(checkpoint_root.glob("global_step*/default"), reverse=True)]
+    candidates = [
+        checkpoint_root / "hf",
+        checkpoint_root / "default",
+        *sorted(checkpoint_root.glob("global_step*/default"), reverse=True),
+    ]
     source = next((path for path in candidates if (path / "adapter_model.safetensors").is_file()), None)
     if source is None or not (source / "adapter_config.json").is_file():
         raise RuntimeError(f"initial adapter checkpoint produced no PEFT pack under {checkpoint_root}")
@@ -290,16 +293,31 @@ def build_payload(
     *,
     attn_implementation: Optional[str] = None,
     optimizer_state_output_dir: Optional[Path] = None,
-    initial_peft_adapter_output_dir: Optional[Path] = None,
     lm_head_token_chunk_size: Optional[int] = None,
     determinism: str = "best-effort",
     gradient_norms_per_param: bool = True,
+    gradient_accumulation_steps: Optional[int] = None,
 ) -> dict:
     tc = json.loads(json.dumps(training_config))
     if lm_head_token_chunk_size is not None:
         tc.setdefault("fused_lm_head_token_chunk_size", lm_head_token_chunk_size)
     if attn_implementation is not None:
         tc["attn_implementation"] = attn_implementation
+    if gradient_accumulation_steps is not None:
+        gas = int(gradient_accumulation_steps)
+        if gas < 1:
+            raise ValueError(f"gradient_accumulation_steps must be >= 1, got {gradient_accumulation_steps!r}")
+        ds = dict(tc.get("ds_config") or {})
+        ds["gradient_accumulation_steps"] = gas
+        micro = ds.get("train_micro_batch_size_per_gpu")
+        n_gpus = tc.get("n_gpus")
+        if micro is not None and n_gpus is not None:
+            sp_size = int(tc.get("sp_size", 1))
+            train_batch_size = int(micro) * gas * (int(n_gpus) // sp_size)
+            ds["train_batch_size"] = train_batch_size
+            if "train_batch_size" in tc:
+                tc["train_batch_size"] = train_batch_size
+        tc["ds_config"] = ds
     mb_spec = dict(tc.get("mb_spec") or {})
     mb_spec["max_tokens_per_mb"] = correctness_microbatch_tokens(_max_tokens_per_mb_of(tc))
     tc["mb_spec"] = mb_spec
@@ -317,8 +335,6 @@ def build_payload(
     debug.setdefault("fp32_precision", False)
     if optimizer_state_output_dir is not None:
         debug["optimizer_state_output_dir"] = str(Path(optimizer_state_output_dir).resolve())
-    if initial_peft_adapter_output_dir is not None:
-        debug["initial_peft_adapter_output_dir"] = str(Path(initial_peft_adapter_output_dir).resolve())
     tc["debug"] = debug
     return {
         "model_name": model_path,
@@ -334,33 +350,111 @@ def _labels_for_provider(batch, model_provider: str):
 
 
 def _attention_mask(batch):
+    return _attention_mask_from_position_ids(batch.position_ids)
+
+
+def _attention_mask_from_position_ids(position_ids):
     import torch
 
-    offsets = torch.arange(batch.position_ids.shape[1], device=batch.position_ids.device).unsqueeze(0)
-    expected_positions = batch.position_ids[:, :1] + offsets
-    return batch.position_ids.eq(expected_positions).to(torch.long).cumprod(dim=1)
+    offsets = torch.arange(position_ids.shape[1], device=position_ids.device).unsqueeze(0)
+    expected_positions = position_ids[:, :1] + offsets
+    return position_ids.eq(expected_positions).to(torch.long).cumprod(dim=1)
 
 
-def _batch_body(batch, labels, *, loss_fn: str = "sft", labels_are_shifted: bool = False) -> dict:
-    attention_mask = _attention_mask(batch)
+def _batch_dict(input_ids, position_ids, labels) -> dict:
     return {
-        "batch": {
-            "input_ids": batch.input_ids,
-            "position_ids": batch.position_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        },
-        "meta": {"labels_are_shifted": True} if labels_are_shifted else {},
-        "processing": {"loss_fn": loss_fn},
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+        "attention_mask": _attention_mask_from_position_ids(position_ids),
+        "labels": labels,
     }
 
 
-def pack(batch, *, model_provider: str = "huggingface") -> dict:
+def _batch_body_from_wire_batch(
+    wire_batch,
+    *,
+    loss_fn: str = "sft",
+    processing_config: Optional[dict] = None,
+    labels_are_shifted: bool = False,
+) -> dict:
+    processing = {"loss_fn": loss_fn}
+    if processing_config is not None:
+        processing["config"] = deepcopy(processing_config)
+    return {
+        "batch": wire_batch,
+        "meta": {"labels_are_shifted": True} if labels_are_shifted else {},
+        "processing": processing,
+    }
+
+
+def _batch_body(
+    batch,
+    labels,
+    *,
+    loss_fn: str = "sft",
+    processing_config: Optional[dict] = None,
+    labels_are_shifted: bool = False,
+) -> dict:
+    return _batch_body_from_wire_batch(
+        _batch_dict(batch.input_ids, batch.position_ids, labels),
+        loss_fn=loss_fn,
+        processing_config=processing_config,
+        labels_are_shifted=labels_are_shifted,
+    )
+
+
+def pack(
+    batch,
+    *,
+    model_provider: str = "huggingface",
+    loss_fn: str = "sft",
+    processing_config: Optional[dict] = None,
+) -> dict:
     labels_are_shifted = model_provider == "prime_rl"
     return _batch_body(
         batch,
         _labels_for_provider(batch, model_provider),
-        loss_fn="sft",
+        loss_fn=loss_fn,
+        processing_config=processing_config,
+        labels_are_shifted=labels_are_shifted,
+    )
+
+
+def pack_microbatches(
+    batch,
+    microbatches: int,
+    *,
+    model_provider: str = "huggingface",
+    loss_fn: str = "sft",
+    processing_config: Optional[dict] = None,
+) -> dict:
+    """Pack a correctness batch as an AP GAS list when the arm needs several model calls."""
+    if microbatches <= 1:
+        return pack(batch, model_provider=model_provider, loss_fn=loss_fn, processing_config=processing_config)
+    if batch.rows < microbatches:
+        raise ValueError(f"cannot split {batch.rows} row(s) into {microbatches} microbatches")
+    labels_are_shifted = model_provider == "prime_rl"
+    labels = _labels_for_provider(batch, model_provider)
+    wire_batches = []
+    base_rows, extra_rows = divmod(batch.rows, microbatches)
+    start = 0
+    for index in range(microbatches):
+        rows = base_rows + (1 if index < extra_rows else 0)
+        end = start + rows
+        wire_batches.append(
+            _batch_dict(
+                batch.input_ids[start:end].contiguous(),
+                batch.position_ids[start:end].contiguous(),
+                labels[start:end].contiguous(),
+            )
+        )
+        start = end
+    if len(wire_batches) != microbatches:
+        raise ValueError(f"split produced {len(wire_batches)} microbatches, expected {microbatches}")
+    return _batch_body_from_wire_batch(
+        wire_batches,
+        loss_fn=loss_fn,
+        processing_config=processing_config,
         labels_are_shifted=labels_are_shifted,
     )
 

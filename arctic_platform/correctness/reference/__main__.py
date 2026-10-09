@@ -55,6 +55,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--mixer-packing-group-rows",
+        type=int,
+        default=1,
+        help=(
+            "diagnostic-only row grouping for mixer packing; the default preserves the golden reference's "
+            "one-row-per-call behavior"
+        ),
+    )
+    parser.add_argument(
         "--fp32-lm-head", dest="fp32_lm_head", action="store_true", help="apply the engine's fp32_lm_head behavior"
     )
     parser.add_argument(
@@ -99,6 +108,7 @@ def main() -> None:
         fp32_lm_head=args.fp32_lm_head,
         fused_cross_entropy=args.fused_cross_entropy or False,
         mixer_packing=args.mixer_packing,
+        mixer_packing_group_rows=args.mixer_packing_group_rows,
         matmul_precision=args.matmul_precision,
         peft_config=json.loads(args.peft_config) if args.peft_config else None,
         peft_adapter_path=args.peft_adapter,

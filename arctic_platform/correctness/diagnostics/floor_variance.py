@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import statistics
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -41,6 +40,7 @@ from arctic_platform.correctness.harness.dss_driver import gateway  # noqa: E402
 from arctic_platform.correctness.harness.dss_driver import running_job  # noqa: E402
 from arctic_platform.correctness.harness.seeds import SEED  # noqa: E402
 from arctic_platform.correctness.harness.spec import TestSpec  # noqa: E402
+from arctic_platform.correctness.harness.workdir import correctness_workdir  # noqa: E402
 
 DRAWS = 8
 
@@ -72,7 +72,7 @@ def main(config_path: str) -> int:
     attn = next(iter(spec.tolerance)) if spec.tolerance else "flash_attention_3"
     payload = build_payload(cfg.training, spec.model.cache_path, SEED, attn_implementation=attn)
 
-    tmp = Path(tempfile.mkdtemp(prefix="floor-variance-"))
+    tmp = correctness_workdir("floor-variance-")
     steps = []
     with gateway(tmp, cfg.n_gpus) as url:
         with running_job(url, payload) as job_id:
