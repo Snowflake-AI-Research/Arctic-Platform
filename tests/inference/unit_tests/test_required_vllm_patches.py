@@ -1,6 +1,7 @@
 from arctic_platform.inference.vllm import (
     dense_prompt_logprobs,
     dflash2_nan_fix,
+    mrope_yarn,
     required_patches,
     router_replay,
     spec_decode_grammar,
@@ -36,6 +37,12 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("dflash2"),
     )
 
+    monkeypatch.setattr(
+        mrope_yarn,
+        "ensure_mrope_yarn_fix",
+        lambda: calls.append("mrope_yarn"),
+    )
+
     required_patches.apply_required_vllm_patches()
 
     assert calls == [
@@ -44,4 +51,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "dense_prompt_logprobs",
         "spec_decode_grammar",
         "dflash2",
+        "mrope_yarn",
     ]
