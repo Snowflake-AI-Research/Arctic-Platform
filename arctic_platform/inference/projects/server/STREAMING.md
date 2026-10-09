@@ -47,7 +47,8 @@ incremental `token_ids`. When `logprobs` was requested, a delta also carries
 `top` holds the requested number of most likely tokens by rank; the chosen
 token keeps its own entry even when it is not among them. A `-inf` logprob is
 sent as `-9999.0`. Without `logprobs` the key is absent. `choice_finished`
-carries the index and `finish_reason` (`stop` or `length`). `usage` carries
+carries the index and `finish_reason`: `stop`, `length`, or (chat prompts
+only) `tool_calls`. `usage` carries
 `prompt_tokens`, `completion_tokens`, and `total_tokens`. Prompt usage is
 counted once, completion usage across all choices.
 `completed` follows final usage, after the engine output iterator is closed
@@ -104,16 +105,25 @@ Which parsers apply comes from `CHAT_MODELS` in `chat.py`, keyed by the
 architecture vLLM resolves for the checkpoint, so every checkpoint of a listed
 architecture gets chat mode without engine kwargs:
 
-| Architectures | Reasoning / tool parser | Thinking off | `reasoning_effort` |
-|---|---|---|---|
-| `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM` | `qwen3` / `hermes` | yes | as is |
-| `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForCausalLM`, `Qwen3_5MoeForConditionalGeneration` | `qwen3` / `qwen3_coder` | yes | `high` becomes `xhigh` (Qwen3.8's level) |
-| `GlmMoeDsaForCausalLM` (GLM-5) | `glm47` / `glm47` | yes | `minimal`, `low`, `medium` become `high`; others as is (the template's Max) |
-| `DeepseekV4ForCausalLM`, `DeepseekV4ForConditionalGeneration` | `deepseek_v4` / `deepseek_v4` | yes | as is (vLLM's tokenizer maps it) |
-| `GptOssForCausalLM` | `openai_gptoss` / `openai` | no | as is (Harmony takes low, medium, high) |
+| Architectures | Family | Reasoning / tool parser | Thinking off | `reasoning_effort` sent to the template |
+|---|---|---|---|---|
+| `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM` | Qwen3 | `qwen3` / `hermes` | yes | as is (ignored) |
+| `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForCausalLM`, `Qwen3_5MoeForConditionalGeneration`, `Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration` | Qwen3.5, 3.6, 3.8 | `qwen3` / `qwen3_coder` | yes | `minimal` becomes `low`, `high` and `max` become `xhigh` (Qwen3.8 takes low, medium, xhigh) |
+| `GlmMoeDsaForCausalLM` | GLM-5, 5.1, 5.2 | `glm47` / `glm47` | yes | `minimal`, `low`, `medium` become `high`; `xhigh` becomes `max` |
+| `Glm4MoeForCausalLM` | GLM-4.5, 4.6, 4.7 | `glm47` / `glm47` | yes | as is (ignored) |
+| `Glm5NextForCausalLM`, `Glm5NextForConditionalGeneration` | GLM-5.3-Flash | `glm47` / `glm47` | no | `minimal` becomes `low`, `medium` becomes `high`, `xhigh` becomes `max` |
+| `DeepseekV4ForCausalLM`, `DeepseekV4ForConditionalGeneration` | DeepSeek-V4 | `deepseek_v4` / `deepseek_v4` | yes | as is (vLLM's tokenizer maps it) |
+| `GptOssForCausalLM` | gpt-oss | `openai_gptoss` / `openai` | no | `minimal` becomes `low`, `xhigh` and `max` become `high` |
+| `MiniMaxM2ForCausalLM` | MiniMax-M2, M2.1 | `minimax_m2` / `minimax_m2` | no | as is (ignored) |
+| `AfmoeForCausalLM` | Arcee Trinity (thinking) | `deepseek_r1` / `qwen3_coder` | no | as is (ignored) |
+| `NemotronHForCausalLM` | Nemotron 3 Nano, Super | `nemotron_v3` / `qwen3_coder` | yes | as is (ignored) |
 
-"Thinking off" means `reasoning_effort="none"` turns thinking off: vLLM hands
-the template `enable_thinking=False`. The table suits checkpoints that keep
+That is 18 architectures in 10 families. "Thinking off" means
+`reasoning_effort="none"` turns thinking off: vLLM hands the template
+`enable_thinking=False`. Where it can't, `none` fails the stream with
+`invalid_chat_request` and `param="reasoning_effort"` rather than thinking
+anyway. Every other value Arctic accepts reaches the template as a level it
+takes (`test_chat_models.py` checks each family). The table suits checkpoints that keep
 their family's chat template; one with a different template (an instruct-only
 or thinking-only variant, a coder model) can set the `chat_reasoning_parser` and
 `tool_call_parser` engine kwargs, which override the table and are popped by the
@@ -202,6 +212,20 @@ on such a checkpoint streams reasoning as content; an explicit
   grammar of their own (`invalid_chat_request`, `param="structured_outputs"`):
   vLLM applies one grammar per request. Without `max_tokens`,
   `thinking_token_budget` is checked against the budget after rendering.
+
+### Adding a model family
+
+1. Add its architectures to `CHAT_MODELS` in `chat.py`: the reasoning and tool
+   parsers vLLM's recipe for it pairs (both must be registered in the pinned
+   vLLM), whether its template turns thinking off with `enable_thinking`, and a
+   `reasoning_efforts` map if its template takes only some levels. A family
+   Arctic trains but cannot chat with goes in `TRAINED_WITHOUT_CHAT` in
+   `test_chat_models.py`, with the reason.
+2. Add it to the tests in `test_chat_models.py` (its parsers, and the levels
+   its template takes in `TEMPLATE_EFFORTS`) and run the CPU suite.
+3. Run `test_gpu_chat.py` with a checkpoint of the family, then a QA6 run
+   through DSS.
+4. Release Arctic, then bump DSS's Arctic pin.
 
 ## Flow Control and Lifecycle
 
