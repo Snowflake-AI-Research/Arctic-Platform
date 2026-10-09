@@ -20,34 +20,41 @@ Options are ``GenericMoeOptions`` fields. The loader rejects the ``Patches`` wra
 
 from __future__ import annotations
 
+from arctic_platform.common.option_registry import Registry
 from arctic_platform.common.option_registry import register_profile
 
-register_profile(
-    "generic_moe",
-    supports=[
-        "checkpointing.mode",
-        "checkpointing.freq",
-        "checkpointing.targets",
-        "checkpointing.offload",
-        "tiled_mlp.token_chunk_size",
-        "lm_head.fp32",
-        "lm_head.token_chunk_size",
-        "lm_head.cross_entropy",
-        "moe.grouped_mm",
-        "moe.comm_backend",
-        "moe.comm_sms",
-        "moe.comm_token_chunk",
-        "numerics.reduce_dtype",
-    ],
-    unsupported={
-        "lm_head.vocab_chunk_size": "no equivalent option",
-        "liger": "the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead",
-        "attention.backend": "no loader option; the backend is `ModelSpec.attn_implementation`, checked by the loader",
-        "compile.fullgraph": "the loader rejects `patches.compile`",
-        "peft": "the loader rejects `patches.peft`: expert adapter integration is not yet supported",
-        "zorro_train": "the loader rejects `patches.zorro_train`",
-    },
-    not_applicable={
-        "attention.sparse_mla": "no model family behind this loader uses sparse MLA attention",
-    },
-)
+
+def register(registry: Registry) -> None:
+    """Register the ``generic_moe`` profile into ``registry``."""
+    register_profile(
+        "generic_moe",
+        supports=[
+            "checkpointing.mode",
+            "checkpointing.freq",
+            "checkpointing.targets",
+            "checkpointing.offload",
+            "tiled_mlp.token_chunk_size",
+            "lm_head.fp32",
+            "lm_head.token_chunk_size",
+            "lm_head.cross_entropy",
+            "moe.grouped_mm",
+            "moe.comm_backend",
+            "moe.comm_sms",
+            "moe.comm_token_chunk",
+            "numerics.reduce_dtype",
+        ],
+        unsupported={
+            "lm_head.vocab_chunk_size": "no equivalent option",
+            "liger": "the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead",
+            "attention.backend": (
+                "no loader option; the backend is `ModelSpec.attn_implementation`, checked by the loader"
+            ),
+            "compile.fullgraph": "the loader rejects `patches.compile`",
+            "peft": "the loader rejects `patches.peft`: expert adapter integration is not yet supported",
+            "zorro_train": "the loader rejects `patches.zorro_train`",
+        },
+        not_applicable={
+            "attention.sparse_mla": "no model family behind this loader uses sparse MLA attention",
+        },
+        registry=registry,
+    )

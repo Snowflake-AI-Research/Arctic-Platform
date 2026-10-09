@@ -21,12 +21,17 @@ differs.
 
 from __future__ import annotations
 
+from arctic_platform.common.option_registry import Registry
 from arctic_platform.common.option_registry import register_profile
 
-register_profile(
-    "qwen4_exp",
-    extends="generic_moe",
-    not_applicable={
-        "attention.sparse_mla": "Qwen3.8-Flash-Next uses QSA attention, not sparse MLA",
-    },
-)
+
+def register(registry: Registry) -> None:
+    """Register the ``qwen4_exp`` profile into ``registry``."""
+    register_profile(
+        "qwen4_exp",
+        extends="generic_moe",
+        not_applicable={
+            "attention.sparse_mla": "Qwen3.8-Flash-Next uses QSA attention, not sparse MLA",
+        },
+        registry=registry,
+    )

@@ -21,12 +21,17 @@ differs.
 
 from __future__ import annotations
 
+from arctic_platform.common.option_registry import Registry
 from arctic_platform.common.option_registry import register_profile
 
-register_profile(
-    "glm5_next",
-    extends="generic_moe",
-    unsupported={
-        "attention.sparse_mla": "no loader option; the sparse MLA kernel follows `ModelSpec.attn_implementation`",
-    },
-)
+
+def register(registry: Registry) -> None:
+    """Register the ``glm5_next`` profile into ``registry``."""
+    register_profile(
+        "glm5_next",
+        extends="generic_moe",
+        unsupported={
+            "attention.sparse_mla": "no loader option; the sparse MLA kernel follows `ModelSpec.attn_implementation`",
+        },
+        registry=registry,
+    )

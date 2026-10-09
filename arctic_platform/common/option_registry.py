@@ -63,7 +63,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MATRIX_PATH = _REPO_ROOT / "docs" / "models" / "matrix.md"
 _REGENERATE_HINT = "python -m arctic_platform.common.option_registry matrix --write"
 
-# Modules whose import registers the built-in option entries and profiles.
+# Modules whose ``register(registry)`` adds the built-in option entries and profiles.
 _BUILTIN_MODULES = ("arctic_platform.common.model_options", "arctic_platform.common.profiles")
 
 
@@ -113,25 +113,33 @@ class Registry:
     matrix_path: Path | None = None
     option_entries: dict[str, OptionEntry] = field(default_factory=dict)
     profile_entries: dict[str, Profile] = field(default_factory=dict)
+    builtins_registered: bool = False
 
 
 REGISTRY = Registry(matrix_path=DEFAULT_MATRIX_PATH)
 
 
 def _target(registry: Registry | None) -> Registry:
-    """The registry to register into. The real one is filled by the built-in modules as they import."""
+    """The registry to register into: the given one, or the real one."""
     if registry is None:
         return REGISTRY
     return registry
 
 
 def _loaded(registry: Registry | None) -> Registry:
-    """The registry to read from. Reading the real one first imports the built-in entries and profiles."""
-    if registry is None:
+    """The registry to read from. The first read of the real one registers the built-in entries and profiles.
+
+    The built-in modules register through an explicit ``register(REGISTRY)`` call rather than as an import side
+    effect, so this module's ``REGISTRY`` is filled even when it runs as ``__main__`` or after a test has dropped
+    ``arctic_platform.common`` modules from ``sys.modules``.
+    """
+    if registry is not None:
+        return registry
+    if not REGISTRY.builtins_registered:
+        REGISTRY.builtins_registered = True
         for module in _BUILTIN_MODULES:
-            importlib.import_module(module)
-        return REGISTRY
-    return registry
+            importlib.import_module(module).register(REGISTRY)
+    return REGISTRY
 
 
 def _require_str(value: object, what: str) -> str:
@@ -522,8 +530,4 @@ def main(argv: Sequence[str] | None = None, registry: Registry | None = None) ->
 
 
 if __name__ == "__main__":
-    # ``python -m`` runs this file as ``__main__``, a second copy of the module with its own ``REGISTRY``. The
-    # built-in entries register into the importable module, so call that module's ``main``.
-    from arctic_platform.common.option_registry import main as _main
-
-    sys.exit(_main())
+    sys.exit(main())
