@@ -36,7 +36,7 @@ skeleton and no new weights at all.
 
 **The weight hash is the binding, and it is in the skeleton's name.** Nothing
 inside the skeleton references a weight hash -- no pointer file to flip, nothing
-mutable in a digest-verified manifest, and no way for the two halves to disagree,
+mutable in a digest-verified manifest, and no way for the node-partitions to disagree,
 since the key was produced by the dump that made both.  Two weight versions of
 one config are two skeleton directories that coexist, which is also the rollback.
 ``semip_engine`` resolves a restore by listing ``skeleton/`` for
@@ -67,8 +67,8 @@ Usage, from inside a device-manager pod after a dump::
     python3 semip_publish.py <model_dir>            # skeleton + weights if new
     python3 semip_publish.py <model_dir> --skeleton-only
 
-A node-spanning dump (``<model_dir>/node<k>/`` on each pod) is published by
-running the same command on **every** pod that holds a half, concurrently;
+A pod-spanning dump (``<model_dir>/node<k>/`` on each pod) is published by
+running the same command on **every** pod that holds a node-partition, concurrently;
 see ``publish_nodes``.
 
     python3 semip_publish.py <model_dir> --unpublish-skeleton
@@ -150,7 +150,7 @@ _SKELETON_KEY_RE = re.compile(r"([0-9a-f]{12}_[0-9a-f]{12})_([0-9a-f]{12})$")
 REPLICA_DIR_PREFIX = "replica"
 _REPLICA_DIR_RE = re.compile(REPLICA_DIR_PREFIX + r"(\d+)")
 
-# A node-spanning engine (one TP group over several pods) dumps each half into
+# A pod-spanning engine (one TP group over several pods) dumps each node-partition into
 # <key>/node<k>/ on its own pod, beside a <key>/weight/ that holds only that
 # pod's ranks. No pod holds the whole image, so a publish is a rendezvous: every
 # pod stages its file rows under _staging/, waits for the rest, derives the one
@@ -337,7 +337,7 @@ def replica_dirs(model_dir: Path) -> list[Path]:
 
 
 def node_dirs(model_dir: Path) -> list[Path]:
-    """The ``node<k>`` halves of a node-spanning dump held here, in rank order."""
+    """The ``node<k>`` node-partitions of a pod-spanning dump held here, in rank order."""
     found = []
     if model_dir.is_dir():
         for child in model_dir.iterdir():
@@ -348,17 +348,18 @@ def node_dirs(model_dir: Path) -> list[Path]:
 
 
 def load_node_layout(model_dir: Path) -> tuple[str, dict[int, dict]]:
-    """``(key, {node_rank: meta})`` for the halves of a node-spanning dump here.
+    """``(key, {node_rank: meta})`` for the node-partitions of a pod-spanning dump here.
 
-    Usually one half: each pod dumps only its own. Every half present is checked
-    before anything is hashed, because a half that is foreign to the others --
-    another dump, another config -- is a pair that deadlocks in its first
+    Usually one node-partition: each pod dumps only its own. Every
+    node-partition present is checked before anything is hashed, because one
+    that is foreign to the others -- another dump, another config -- makes
+    a set that deadlocks in its first
     collective at restore rather than failing:
 
     * each ``node<k>`` has dumped, as rank ``k`` of a dump with ``nnodes > 1``;
     * its recorded ``model_dir`` is ``<key>/node<k>``, since the baked paths have
       to resolve where the engine materializes it;
-    * the halves agree on the dump, the config, image, driver and uid.
+    * the node-partitions agree on the dump, the config, image, driver and uid.
     """
     key = model_dir.name
     if not _DERIVED_KEY_RE.fullmatch(key):
@@ -382,7 +383,7 @@ def load_node_layout(model_dir: Path) -> tuple[str, dict[int, dict]]:
             raise SystemExit(
                 f"{meta_path} records nnodes={meta.get('nnodes')!r}, "
                 f"node_rank={meta.get('node_rank')!r}, "
-                f"dump_id={meta.get('dump_id')!r}; a {ndir.name}/ half must be "
+                f"dump_id={meta.get('dump_id')!r}; a {ndir.name}/ node-partition must be "
                 f"rank {k} of one multi-node dump")
         recorded = meta.get("model_dir")
         if recorded and (Path(recorded).name != ndir.name
@@ -400,14 +401,14 @@ def load_node_layout(model_dir: Path) -> tuple[str, dict[int, dict]]:
                     f"{NODE_DIR_PREFIX}{k} disagrees with "
                     f"{NODE_DIR_PREFIX}{min(metas)} on {field} "
                     f"({meta.get(field)!r} vs {first.get(field)!r}); these are "
-                    f"not halves of one dump")
+                    f"not node-partitions of one dump")
     return key, metas
 
 
 def load_layout(model_dir: Path) -> tuple[str, dict, list[Path]]:
     """``(key, meta, replicas)`` for a dumped directory, flat or per-replica.
 
-    A node-spanning dump answers with its lowest half's meta and no replicas;
+    A pod-spanning dump answers with its lowest node-partition's meta and no replicas;
     only ``publish_nodes`` publishes one, so this is for the callers that need
     just the key and the model.
 
@@ -787,7 +788,7 @@ def _published_node_count(bucket: str, key: str) -> int | None:
         return None
 
 
-# The rendezvous between the pods of one node-spanning dump. Plain objects under
+# The rendezvous between the pods of one pod-spanning dump. Plain objects under
 # _staging/<key>/<dump_id>/: node<k>.json holds a pod's file rows, and
 # node<k>.done says its uploads finished. These three are the seams the tests
 # replace, as _aws is for the uploads.
@@ -903,7 +904,7 @@ def publish(model_dir: Path, bucket: str, prefix: str,
 
     *model_dir* is the dumped ``<root>/<cfg12>_<env12>``, whether it holds one
     flat image or ``replica<K>/`` directories; see ``load_layout``. A pod's
-    ``node<k>/`` half of a node-spanning dump goes to ``publish_nodes``.
+    ``node<k>/`` node-partition of a pod-spanning dump goes to ``publish_nodes``.
     """
     if node_dirs(model_dir):
         return publish_nodes(model_dir, bucket, prefix,
@@ -1083,7 +1084,7 @@ def _wait_staged(bucket: str, stage: str, nnodes: int, suffix: str,
         if time.time() >= deadline:
             raise SystemExit(
                 f"timed out after {timeout:.0f}s waiting for {', '.join(missing)} "
-                f"under s3://{bucket}/{stage}/. Every pod holding a half of this "
+                f"under s3://{bucket}/{stage}/. Every pod holding a node-partition of this "
                 f"dump must run this script; run it on the missing one(s).")
         print(f"  waiting for {', '.join(missing)} ...")
         time.sleep(_RENDEZVOUS_POLL_S)
@@ -1095,9 +1096,10 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
                   hash_workers: int | None = None,
                   wait_timeout: float | None = None,
                   rendezvous_timeout: float = _RENDEZVOUS_TIMEOUT_S) -> str:
-    """Publish this pod's half of a node-spanning dump; node 0 completes it.
+    """Publish this pod's node-partition of a pod-spanning dump; node-partition 0
+    completes it.
 
-    Run on **every** pod that holds a half, in any order. Published layout::
+    Run on **every** pod that holds a node-partition, in any order. Published layout::
 
       skeleton/<key>_<wt12>/node<k>/{image,compilation}/   one sentinel, by node 0
       weight/<wt12>/rank<R>/                               every rank, one sentinel
@@ -1161,7 +1163,7 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
             continue
         if doc.get("identity") != identity:
             raise SystemExit(
-                f"{name} under {stage}/ disagrees with this pod's half "
+                f"{name} under {stage}/ disagrees with this pod's node-partition "
                 f"({doc.get('identity')} vs {identity}); not one dump")
         for k in doc.get("nodes", ()):
             if k in owner:
@@ -1378,7 +1380,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="hash and report the destinations without uploading")
     parser.add_argument("--rendezvous-timeout", type=float,
                         default=_RENDEZVOUS_TIMEOUT_S, metavar="SECS",
-                        help="for a node<k>/ half: how long to wait for the "
+                        help="for a node<k>/ node-partition: how long to wait for the "
                              "other pods of the dump to stage and finish")
     args = parser.parse_args(argv)
     if not args.bucket:
@@ -1414,7 +1416,7 @@ def main(argv: list[str] | None = None) -> int:
             slug = model_slug(meta)
             wt_hash = args.weight_hash
             if not wt_hash and node_dirs(model_dir):
-                parser.error("this pod holds one half of a node-spanning dump, "
+                parser.error("this pod holds one node-partition of a pod-spanning dump, "
                              "whose weight hash spans every pod's shards; pass "
                              "--weight-hash (publish prints it)")
             if not wt_hash:

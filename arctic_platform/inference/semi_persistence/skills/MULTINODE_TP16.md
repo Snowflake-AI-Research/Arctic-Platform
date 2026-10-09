@@ -1,12 +1,14 @@
-# Multi-node semi-p (TP=16): one engine across two pods
+# Multi-node semi-p (TP=16): one engine across several pods
 
 State as of 2026-10-06. Validated on hardware for the library; the engine layer
 has not yet served a job (see §9).
 
-`nnodes > 1` is a TP group whose ranks live on more than one pod. One leader
-owns ranks `0..local-1` and serves; a `SemipNodeAgent` owns each further block
-and never serves. Every collective is the leader's, because its
-`MultiprocExecutor` spans both halves once NCCL is up.
+`nnodes > 1` is a TP group whose ranks live on more than one pod. Each pod
+holds one **node-partition** of the engine: two at TP=16, four at TP=32. The
+leader owns node-partition 0 (ranks `0..local-1`) and serves; a
+`SemipNodeAgent` owns each further node-partition and never serves. Every
+collective is the leader's, because its `MultiprocExecutor` spans every
+node-partition once NCCL is up.
 
 ## 0. The one thing to know first
 
@@ -129,16 +131,16 @@ ifname)`, passed as `Instance(vllm_config, model_dir, multinode=...)`. `None`
 is single-node.
 
 **`nnodes` lives in `vllm_config` and is hashed; everything else in `MultiNode`
-is not.** The split changes the image — a half of a TP=16 group is not a TP=8
+is not.** The split changes the image — a node-partition of a TP=16 group is not a TP=8
 engine — so it belongs in the key. Node identity changes on every restore and
 must not: the experiment driver put `node_rank`, `master_addr` and
 `master_port` in `vllm_config`, where it is recorded in `meta.json`, compared
-by `criu_restore` and hashed into `cfg12`, so the two halves of one job hashed
-differently and no restored pair could match its own image.
+by `criu_restore` and hashed into `cfg12`, so the node-partitions of one job hashed
+differently and no restored engine could match its own image.
 
 The child merges node identity into **its own private copy** of the config, so
 the dict `criu_dump` records (the parent's) never sees it. That is what lets a
-restored pair rendezvous somewhere new.
+restored engine rendezvous somewhere new.
 
 `MultiNode` reaches the child as a **spawn argument**, not just an `init`
 kwarg: the child pins its NCCL/gloo interface, `VLLM_HOST_IP` and the pinned
@@ -181,8 +183,8 @@ EFA. This is how a cold *reference* run opts out of the Socket pin.
 `reinit_nccl(master_addr=, port=, ifname=)` reads nothing from the
 environment. **The child is a restored process, so its `environ` is the
 dump's**; nothing the restoring job sets would be visible there. `port` is what
-lets the engine pin one rendezvous for both halves — a port that is free on the
-follower says nothing about the node that binds it.
+lets the engine pin one rendezvous for every node-partition — a port that is free
+on a follower says nothing about the node that binds it.
 
 ## 7. The joint protocol
 
@@ -205,9 +207,9 @@ park clears the directory on the leader's pod only.
 
 **One unpark directory per key, on every pod.** The leader's park hands its
 path to all ranks, and each parked reader carries it into its node's image.
-So `Instance._unpark_dir` names a `node<k>` half after its key directory,
-`/dev/shm/semip-unpark-<key>`, and never after `node<k>`. If the halves used
-their own names, the follower would wait for markers, and later write unpark
+So `Instance._unpark_dir` names a `node<k>` node-partition after its key
+directory, `/dev/shm/semip-unpark-<key>`, and never after `node<k>`. If the
+node-partitions used their own names, a follower would wait for markers, and later write unpark
 orders, in a directory its ranks never read.
 
 **Per-pod values come from each pod.** The ranks on node `k` bind their new
@@ -216,7 +218,7 @@ itself; given the leader's, every rank failed with EADDRNOTAVAIL. Likewise each
 agent raises its own PID floor at `init`, because the counter is per PID
 namespace, and reports it with its unprivileged mode for its own `meta.json`.
 
-**`SEMIP_UNPRIVILEGED` has to match across halves.** The engine defaults it to
+**`SEMIP_UNPRIVILEGED` has to match across node-partitions.** The engine defaults it to
 `1` in the leader's process, and `SemipNodeAgent.__init__` sets the same
 default, since it decides the capability level the child records at `init`.
 Without it, the agent's CRIU ran without `--unprivileged` on a uid-1000 pod and
@@ -236,33 +238,33 @@ leader    reinit_nccl (first EFA bring-up), attach, load_weights,
           recapture_graphs
 ```
 
-**Joint or nothing.** A half that cold-starts while the other restores would
+**Joint or nothing.** A node-partition that cold-starts while another restores would
 rendezvous with a group that does not exist, and the failure is a deadlock in
 the first collective rather than an error. Every dump stamps a `dump_id` into
-both halves' `meta.json`, and a hit requires every half to carry the same one;
-a missing half, a mismatched id or a partial materialize all make both halves
-cold-start and dump together.
+every node-partition's `meta.json`, and a hit requires all of them to carry the
+same one; a missing node-partition, a mismatched id or a partial materialize
+all make every node-partition cold-start and dump together.
 
 An **L7 config digest** is exchanged before `init` for the same reason: the
-halves profile their shapes independently and then meet in a collective, so a
+node-partitions profile their shapes independently and then meet in a collective, so a
 disagreement deadlocks for the full gloo timeout with nothing in either log
 naming the field.
 
 ## 8. Layout, placement and timeouts
 
-- **Layout:** `<key>/node<k>/{image,compilation}` per half. Weights stay at
+- **Layout:** `<key>/node<k>/{image,compilation}` per node-partition. Weights stay at
   `<key>/weight/rank{0..15}` — the shards are named by *global* rank, and a
-  restore onto a different pod pair has to find all of them in one place.
+  restore onto a different set of pods has to find all of them in one place.
   `meta.json` gains `nnodes`, `node_rank`, `dump_id`, `dump_ip`.
 - **Placement:** dss builds `nnodes` whole-node bundles with `STRICT_SPREAD`
-  (`build_inference_pg(..., per_node=True)`). PACK could put both halves on one
-  node, where they would contend for the same GPUs and the second node would
+  (`build_inference_pg(..., per_node=True)`). PACK could put several node-partitions
+  on one node, where they would contend for the same GPUs and the second node would
   never appear. `ReplicaPool` gives the leader `world_size / nnodes` GPUs in
   bundle 0 and each agent its own bundle, and keeps
   `distributed_executor_backend="mp"`: forcing `"ray"` would both hand vLLM a
   backend it never uses and change the config `criu_restore` compares byte for
   byte.
-- **Cold-start timeout 3600 s.** The slowest half's first weight load was 25
+- **Cold-start timeout 3600 s.** The slowest node-partition's first weight load was 25
   minutes for GLM-5.3 on a cold page cache, and gloo's own rendezvous timeout
   is 1800 s; anything shorter fails jobs that were about to succeed.
 - **Restore prefetch:** this node's `weight/rank*` are read in the background
@@ -299,7 +301,7 @@ publisher also does **not** understand `node<k>/` (see §10).
 ## 10. Known gaps
 
 - **Publishing is done; materializing from it has not run.** `semip_publish.py`
-  publishes a `node<k>/` half when run on every pod of the dump at once: each
+  publishes a `node<k>/` node-partition when run on every pod of the dump at once: each
   stages its rows under `_staging/<key>/<dump_id>/node<k>.json`, all derive one
   `wt12` over the union, each uploads its own `rank*` and `node<k>/`, and node 0
   writes the weight sentinel and then the one skeleton sentinel after every

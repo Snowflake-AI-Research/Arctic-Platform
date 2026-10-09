@@ -79,10 +79,10 @@ The publisher requires a contiguous `replica0..N-1`, each recording its own
 `model_dir`, all agreeing on config, image, driver and uid; it hashes every
 replica's `weight/`, refuses unless the hashes are equal, and uploads one copy.
 
-> **A node-spanning dump (`node<k>/`) cannot be published yet.** The publisher
+> **A pod-spanning dump (`node<k>/`) cannot be published yet.** The publisher
 > knows the flat and `replica<K>` layouts only. It also cannot simply learn the
-> new level: each pod holds just its own half, so there is nothing for one
-> invocation to walk. It needs a two-pod rendezvous -- per-node rows under
+> new level: each pod holds just its own node-partition, so there is nothing for one
+> invocation to walk. It needs a cross-pod rendezvous -- per-node rows under
 > `_staging/<key>/<dump_id>/node<k>.json`, a `wt12` over the union, each node
 > uploading its own `rank*` and its `node<k>/`, and node 0 writing the sentinel
 > last so the DaemonSet still sees one model directory. See
@@ -124,7 +124,7 @@ appear in the local directory name, and the local cache stays flat.
 
 The binding lives in the skeleton's **name**. Nothing inside a skeleton
 references a weight hash, so there is no pointer to flip, nothing mutable inside
-a digest-verified manifest, and no way for the halves to disagree -- the dump that
+a digest-verified manifest, and no way for the node-partitions to disagree -- the dump that
 produced one produced the other. Two weight versions of one config are two
 skeleton directories that coexist, which is also the rollback.
 `_resolve_published_skeleton` lists `skeleton/` for `<cfg12>_<env12>_*` and
@@ -339,17 +339,17 @@ k     = node rank, present only when one engine spans pods (nnodes > 1)
 ```
 
 `replica<K>` and `node<k>` are different axes and do not nest in practice: a
-node-spanning engine is a single replica by construction, since its placement
+pod-spanning engine is a single replica by construction, since its placement
 group holds the whole `world_size`. So a key carries one or the other.
 
 **`nnodes` is in `cfg12`; the rest of a node's identity is deliberately not.**
-The split changes the image -- half of a TP=16 group is not a TP=8 engine -- so
+The split changes the image -- a node-partition of a TP=16 group is not a TP=8 engine -- so
 it is hashed. `node_rank`, `master_addr`, `master_port` and the interface travel
 in the `MultiNode` parameter instead, because they change on every restore: with
-them in `vllm_config` the two halves of one job hash differently and no restored
-pair can match its own image. Weights also stay at the key level rather than
+them in `vllm_config` the node-partitions of one job hash differently and no restored
+engine can match its own image. Weights also stay at the key level rather than
 under `node<k>/`, since the shards are named by *global* rank
-(`weight/rank{0..15}`) and a restore onto a different pod pair has to find all
+(`weight/rank{0..15}`) and a restore onto a different set of pods has to find all
 of them in one place. See [MULTINODE_TP16.md](MULTINODE_TP16.md).
 
 **The third term is discovered, not derived.** A published skeleton is named

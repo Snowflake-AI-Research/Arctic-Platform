@@ -664,10 +664,10 @@ the config surface. A spec asks for it the ordinary way -- `semi_p: true`,
 - **dss builds a different placement group.** `build_inference_pg(...,
   per_node=cfg.inference_config.semi_p)` produces `nnodes` whole-node bundles
   with `STRICT_SPREAD` instead of `world_size` single-GPU bundles with PACK.
-  Semi-p places *pods*, not ranks: each half is a CRIU image restored on its
+  Semi-p places *pods*, not ranks: each node-partition is a CRIU image restored on its
   own pod driving that pod's whole GPU set, so there is no per-rank actor for a
   per-rank bundle to hold -- and PACK could satisfy the group on one node,
-  where the halves would contend for the same GPUs and the second node would
+  where the node-partitions would contend for the same GPUs and the second node would
   never appear.
 - **`ReplicaPool` creates a leader plus agents.** The leader
   `InferenceWorker` takes bundle 0 with `world_size / nnodes` real GPUs (not
@@ -676,9 +676,9 @@ the config surface. A spec asks for it the ordinary way -- `semi_p: true`,
   `"mp"`: a semi-p engine is restored rather than constructed, so forcing
   `"ray"` would hand vLLM a backend it never uses *and* change the config
   `criu_restore` compares byte for byte.
-- **The dump and restore are joint**, keyed on a `dump_id` both halves carry.
-  Any disagreement makes both halves cold-start together rather than restore a
-  mismatched pair, which would deadlock in its first collective.
+- **The dump and restore are joint**, keyed on a `dump_id` every node-partition
+  carries. Any disagreement makes all of them cold-start together rather than
+  restore a mismatched set, which would deadlock in its first collective.
 
 `NCCL_SOCKET_IFNAME=^lo`, which dss puts in `extra_env` for multi-node jobs,
 names no interface; the semi-p child overrides it with a real one, because it

@@ -1,7 +1,7 @@
 """Node identity for a tensor-parallel group that spans machines.
 
 One ``Instance`` per node drives ``tensor_parallel_size / nnodes`` local GPUs,
-and the halves form a single TP group.  The split itself is topology --
+and the node-partitions form a single TP group.  The split itself is topology --
 ``nnodes`` lives in ``vllm_config``, is hashed into the image cache key, and
 changes the image.  *Which* node this is, and where the rendezvous lives, is
 not: ``node_rank``, ``master_addr``, ``master_port`` and the interface change
@@ -9,10 +9,11 @@ on every restore and must never reach the key.
 
 That separation is the whole point of this module.  The experiment driver put
 all of it in ``vllm_config``, where it was recorded in ``meta.json``, compared
-at ``criu_restore`` and hashed into ``cfg12`` -- so the two halves of one job
-hashed differently and a restore onto a different pod pair could not match its
-own image.  Keeping node identity in a separate parameter means both halves
-derive the same key, and a restored pair is free to rendezvous somewhere new.
+at ``criu_restore`` and hashed into ``cfg12`` -- so the node-partitions of one job
+hashed differently and a restore onto a different set of pods could not match
+its own image.  Keeping node identity in a separate parameter means every
+node-partition derives the same key, and a restored engine is free to
+rendezvous somewhere new.
 
 A ``MultiNode`` of ``None`` is the single-node case, which is every TP <= 8
 deployment today: no cross-node rendezvous, custom all-reduce stays on, and the

@@ -86,7 +86,7 @@ _IMAGE_SOURCE_ENV = "SEMIP_IMAGE_SOURCE"
 _DEFAULT_IMAGE_SOURCE = "/mnt/neutrino/base-models/image-cache"
 
 # Read by semi_persistence/worker._unprivileged in the Instance's worker, which
-# inherits this process's environment. On by default: these nodes grant only
+# inherits this process's environment. On by default: these pods are granted only
 # CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE and the image's criu carries just
 # those, so the privileged path cannot work here. The value decides what the
 # dump writes (the capability level every task records), so it is recorded in
@@ -111,7 +111,7 @@ _UNPRIVILEGED_ENV = "SEMIP_UNPRIVILEGED"
 # Each of these was a bare literal until now, "image" fourteen times across the
 # three sides that build the tree, and that is not a cosmetic debt: it is why a
 # published weight manifest whose paths were scoped to the wrong directory took
-# a day to diagnose. Every node asked S3 for
+# a day to diagnose. Every pod asked S3 for
 # weight/<wt12>/weights/rank0/shard_0000.bin, got a 404, and cold-started while
 # the shards sat correctly beside the manifest.
 _SKELETON_DIR = "skeleton"
@@ -136,39 +136,39 @@ _WEIGHT_DIR = "weight"
 
 # Several replicas in one pod each own <key>/replica<K>/, both locally and in a
 # published skeleton; a pod holding one replica keeps the flat <key>/ layout.
-# K is the node-local slot ReplicaPool assigns (replica_pool._node_slots), so
-# every node of a multi-node job resolves the same layout a single-node dump
+# K is the pod-local slot ReplicaPool assigns (replica_pool._node_slots), so
+# every pod of a multi-pod job resolves the same layout a single-pod dump
 # wrote. The publisher holds a pinned copy of this spelling.
 _REPLICA_DIR_PREFIX = "replica"
 _REPLICA_ID_ENV = "SEMIP_REPLICA_ID"
 _NUM_REPLICAS_ENV = "SEMIP_NUM_REPLICAS"
 
-# One engine spanning N pods puts each half under <key>/node<k>/. This is a
+# One engine spanning N pods puts each node-partition under <key>/node<k>/. This is a
 # different axis from replica<K> and the two do not nest in practice: a
-# node-spanning engine is a single replica by construction (its placement group
+# pod-spanning engine is a single replica by construction (its placement group
 # holds the whole world_size), so a key carries node<k>/ or replica<K>/ and
 # never both.
 #
 # Weights stay at the key level, not under node<k>/: the shards are named by
 # global rank across the whole group (rank0..rank15), and a restore onto a
-# different pod pair has to find all of them in one place. The publisher holds
+# different set of pods has to find all of them in one place. The publisher holds
 # a pinned copy of this spelling, like _REPLICA_DIR_PREFIX.
 _NODE_DIR_PREFIX = "node"
 
-# The interface a node-spanning group rendezvouses and runs NCCL on. dss pins
-# NCCL_SOCKET_IFNAME=^lo into a multi-node job's extra_env, which names no
+# The interface a pod-spanning group rendezvouses and runs NCCL on. dss pins
+# NCCL_SOCKET_IFNAME=^lo into a multi-pod job's extra_env, which names no
 # interface; semi-p needs one it can bind, account for in the socket census and
 # close before the dump.
 _MULTINODE_IFNAME_ENV = "SEMIP_IFNAME"
 _DEFAULT_MULTINODE_IFNAME = "eth0"
 
-# A multi-node cold start has to outlast its slowest half's weight load. On a
+# A multi-pod cold start has to outlast its slowest node-partition's weight load. On a
 # pod whose page cache is cold that was 25 minutes for GLM-5.3, and gloo's own
 # rendezvous timeout is 1800 s -- so a shorter wait here would fail jobs that
 # were about to succeed, and one no longer than gloo's would race it.
 _MULTINODE_INIT_TIMEOUT_S = 3600.0
 
-# Everything else a half does is local work on an image that already exists.
+# Everything else a node-partition does is local work on an image that already exists.
 _MULTINODE_STEP_TIMEOUT_S = 900.0
 
 
@@ -537,9 +537,9 @@ def _check_tp_matches_gpus(vllm_config: dict[str, Any],
     indeed found only by a job that landed on the same devices -- deliberately,
     because it is restorable only there.
 
-    At ``nnodes > 1`` the TP group is split across pods, so what this node
+    At ``nnodes > 1`` the TP group is split across pods, so what this pod
     holds is ``tp / nnodes`` GPUs. The split has to be exact: a TP group whose
-    halves have different rank counts deadlocks in its first collective rather
+    node-partitions have different rank counts deadlocks in its first collective rather
     than failing, which is the kind of error worth catching before the zone is
     even up.
     """
@@ -548,7 +548,7 @@ def _check_tp_matches_gpus(vllm_config: dict[str, Any],
     if nnodes > 1 and tp % nnodes:
         raise RuntimeError(
             f"semi_p: vllm_config.tensor_parallel_size={tp} does not divide "
-            f"evenly over {nnodes} nodes, so the halves would hold different "
+            f"evenly over {nnodes} node-partitions, so they would hold different "
             f"numbers of ranks and deadlock in their first collective")
     expected = tp // nnodes
     if expected != len(gpus):
@@ -842,8 +842,8 @@ class _ImagePaths(NamedTuple):
     ``replica<slot>``.
 
     ``key_dir`` is ``model_dir`` without any ``replica<K>`` / ``node<k>``
-    level. A node-spanning engine needs it because its two halves share one
-    weight directory there, named by global rank rather than by node.
+    level. A pod-spanning engine needs it because its node-partitions share one
+    weight directory there, named by global rank rather than by pod.
     """
     model_dir: str
     key_prefix: str
@@ -911,13 +911,13 @@ def _resolve_model_dir(vllm_config: dict[str, Any],
     model_dir = key_dir
     if count > 1:
         model_dir = os.path.join(model_dir, f"{_REPLICA_DIR_PREFIX}{slot}")
-    # A node-spanning engine puts each half under ``node<k>/`` of one shared
-    # key. The key is identical on both pods -- ``nnodes`` is in the config and
-    # node identity deliberately is not, and both pods expose the same device
-    # set (nvidia0-7, uverbs0-15) -- so this level is what keeps two halves of
-    # one image from writing over each other. Their weights stay at the key
+    # A pod-spanning engine puts each node-partition under ``node<k>/`` of one
+    # shared key. The key is identical on every pod -- ``nnodes`` is in the config and
+    # pod identity deliberately is not, and every pod exposes the same device
+    # set (nvidia0-7, uverbs0-15) -- so this level is what keeps the
+    # node-partitions of one image from writing over each other. Their weights stay at the key
     # level, because the shards are per rank across the whole group rather than
-    # per node.
+    # per pod.
     nnodes = int((vllm_config or {}).get("nnodes", 1) or 1)
     if nnodes > 1:
         model_dir = os.path.join(model_dir, f"{_NODE_DIR_PREFIX}{node_rank}")
@@ -1166,7 +1166,7 @@ def _record_env_files(model_dir: str) -> None:
 
 def _check_env_files(meta: dict[str, Any], model_dir: str, *,
                      under_model_dir: bool) -> list[str]:
-    """Test the image's recorded file-backed mappings against this node.
+    """Test the image's recorded file-backed mappings against this pod.
 
     ``_record_env_files`` wrote ``(path, size, build_id)`` for every mapping in
     ``files.img`` at dump time and nothing has read them until now. CRIU
@@ -1179,7 +1179,7 @@ def _check_env_files(meta: dict[str, Any], model_dir: str, *,
     different reasons and are checkable at different times:
 
     - ``False`` -- the environment (``/usr/...``, the driver libraries). A
-      mismatch here means this node is not the environment the image was
+      mismatch here means this pod is not the environment the image was
       dumped in, despite ``env12`` agreeing. Checkable before copying anything.
     - ``True`` -- what a materialize just copied, almost all of it under
       ``compilation/``. A mismatch here means the copy is short or the
@@ -1394,7 +1394,7 @@ def _weights_dir_for_restore(model_dir: str, weight_root: str | None,
     if weight_root and weight_hash:
         # The skeleton named a hash whose directory is absent or half-synced.
         # A miss, not an error -- but a loud one, because it means a published
-        # skeleton is unrestorable and every node will cold-start silently.
+        # skeleton is unrestorable and every pod will cold-start silently.
         logger.warning(
             "semi_p: skeleton names weight hash %s but %s holds no shard "
             "manifest; cold-starting. The weights were unpublished while a "
@@ -1491,7 +1491,7 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
                              strict: bool = False) -> bool:
     """Populate ``model_dir`` from a published skeleton. True if it now holds an image.
 
-    The middle path between a hit and a cold start: another node dumped this
+    The middle path between a hit and a cold start: another pod dumped this
     exact key, published it, and the DaemonSet has already put it on our
     node's read-only mirror. Copying the two path-bound directories beats
     cold-starting and leaves the weights where they are.
@@ -1609,7 +1609,7 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
     if _check_env_files(meta, model_dir, under_model_dir=False):
         logger.warning(
             "semi_p: %s was dumped against different library bytes than this "
-            "node has, so CRIU would abort re-opening them; cold-starting. "
+            "pod has, so CRIU would abort re-opening them; cold-starting. "
             "The environment hash matched, so this is worth understanding: "
             "run semi_persistence/scripts/imgdiff.py against the image.",
             source_dir)
@@ -1619,7 +1619,7 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
     # captured state names, and the scheduler assigns those slots freely -- so a
     # published TP=2 image is restorable in roughly one pod in four. Declining
     # here makes that a miss: the caller cold-starts, serves, and dumps an image
-    # on *this* pod's slots, which is the same outcome the node would have had
+    # on *this* pod's slots, which is the same outcome the pod would have had
     # with no published image at all.
     #
     # It belongs here rather than only at the restore, because both alternatives
@@ -2017,8 +2017,8 @@ def _dump_lock(model_dir: str):
     restore unrecognisably. Deriving the directory makes that collision the
     normal case rather than an operator error, which is what the lock is for.
 
-    ``O_CREAT | O_EXCL`` is sufficient: both writers are the same uid on one
-    node, since ``Instance.criu_restore`` already forbids the cross-uid case.
+    ``O_CREAT | O_EXCL`` is sufficient: both writers are the same uid in one
+    pod, since ``Instance.criu_restore`` already forbids the cross-uid case.
     """
     lock_path = os.path.join(model_dir, _DUMP_LOCK_NAME)
     deadline = time.monotonic() + _DUMP_LOCK_WAIT_S
@@ -2366,42 +2366,43 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
 #
 # The leader owns ranks 0..local-1 and serves; each agent owns the next block
 # and never serves. Every collective is the leader's, because its executor
-# spans both halves -- so these functions only sequence the steps the leader
-# cannot reach into the other pod to do: that pod's CRIU image, its CUDA state,
+# spans every node-partition -- so these functions only sequence the steps the
+# leader cannot reach into the other pods to do: each pod's CRIU image, its CUDA state,
 # and its end of the message-queue plane.
 #
-# Joint or nothing. A half that cold-starts while the other restores would
+# Joint or nothing. A node-partition that cold-starts while another restores would
 # rendezvous with a group that does not exist, and the failure mode is a
 # deadlock in the first collective rather than an error. So a hit requires
-# every half to hold an image from the *same* dump, which is what ``dump_id``
-# identifies; anything else makes both halves cold-start and dump together.
+# every node-partition to hold an image from the *same* dump, which is what
+# ``dump_id`` identifies; anything else makes all of them cold-start and dump
+# together.
 
 
 def _leader_ip() -> str:
-    """This pod's address on the network the other half will reach it on."""
+    """This pod's address on the network the other node-partitions reach it on."""
     import ray
     return ray.util.get_node_ip_address()
 
 
 def _node_ranks(node_rank: int, local: int) -> list[int]:
-    """The global ranks node *node_rank* owns."""
+    """The global ranks node-partition *node_rank* owns."""
     return list(range(node_rank * local, (node_rank + 1) * local))
 
 
 def _joint_weights_dir(paths: _ImagePaths) -> str:
-    """Where both halves put their shards.
+    """Where every node-partition puts its shards.
 
     At the key level rather than under ``node<k>/``: the shards are named by
-    global rank (rank0..rank15), and a restore onto a different pod pair has to
-    find all of them in one place.
+    global rank (rank0..rank15), and a restore onto a different set of pods has
+    to find all of them in one place.
     """
     return os.path.join(paths.key_dir or paths.model_dir, _WEIGHT_DIR)
 
 
 def _check_digests(agents: list[Any], vllm_config: dict[str, Any]) -> None:
-    """Refuse to cold-start halves that would build different engines.
+    """Refuse to cold-start node-partitions that would build different engines.
 
-    The halves profile their shapes independently and then meet in a
+    The node-partitions profile their shapes independently and then meet in a
     collective. A disagreement there does not raise -- it deadlocks, for the
     full gloo timeout, with nothing in either log that names the field. This
     costs one Ray round trip to turn that into an error.
@@ -2412,14 +2413,14 @@ def _check_digests(agents: list[Any], vllm_config: dict[str, Any]) -> None:
     bad = [(k + 1, d) for k, d in enumerate(theirs) if d != mine]
     if bad:
         raise RuntimeError(
-            f"semi_p: the halves of this engine disagree about its config: "
+            f"semi_p: the node-partitions of this engine disagree about its config: "
             f"leader={mine}, " + ", ".join(f"node{k}={d}" for k, d in bad) +
-            ". Both halves must build the same engine or they deadlock in "
+            ". Every node-partition must build the same engine or they deadlock in "
             "their first collective.")
 
 
 def _prefetch_weights(weights_dir: str, ranks: list[int]) -> Any:
-    """Warm the page cache for this node's shards, in the background.
+    """Warm the page cache for this pod's shards, in the background.
 
     A pod that did not dump reads its shards from disk cold, and that read is
     the whole difference between a same-pod restore and a swapped one (33 s
@@ -2455,13 +2456,13 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
                     gpus: list[int], agents: list[Any], *,
                     master_port: int, ifname: str,
                     image_ref: str, driver_version: str) -> None:
-    """Cold-start every half together and dump them as one image.
+    """Cold-start every node-partition together and dump them as one image.
 
     The ordering is the experiment's, and each step is where it is for a
     reason:
 
-    * both halves ``init`` concurrently, because they rendezvous inside vLLM
-      and neither returns until both have arrived;
+    * all node-partitions ``init`` concurrently, because they rendezvous inside
+      vLLM and none returns until all have arrived;
     * the leader alone generates and stages, since its executor covers every
       rank;
     * the leader checkpoints CUDA first -- that is what drops the graphs and
@@ -2484,7 +2485,7 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
     _check_digests(agents, vllm_config)
 
     t0 = time.perf_counter()
-    # Each half records its own pod's values: the floor is per PID namespace
+    # Each node-partition records its own pod's values: the floor is per PID namespace
     # and the mode is per process, so the leader's say nothing about an agent.
     per_node = {0: {"pid_floor": _raise_pid_floor(),
                     "unprivileged": _unprivileged_mode()}}
@@ -2500,7 +2501,7 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
                     multinode=MultiNode(node_rank=0, master_addr=dump_ip,
                                         master_port=int(master_port),
                                         ifname=ifname))
-    logger.info("semi_p: multi-node cold start, %d nodes, dump_id=%s, "
+    logger.info("semi_p: multi-node cold start, %d pods, dump_id=%s, "
                 "rendezvous %s:%d on %s", nnodes, dump_id, dump_ip,
                 master_port, ifname)
     started = [
@@ -2512,7 +2513,7 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
         for k, agent in enumerate(agents)]
     try:
         inst.init(gpus=gpus)
-        # Both halves load weights from disk here, and on fresh nodes that read
+        # All node-partitions load weights from disk here, and in fresh pods that read
         # dominates: 25 min for GLM-5.3 on a cold page cache. gloo's own
         # rendezvous timeout is 1800 s, so this wait has to be longer than the
         # thing it is waiting for or it fails the job for being slow.
@@ -2524,9 +2525,9 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
         modes = {k: v["unprivileged"] for k, v in per_node.items()}
         if len(set(modes.values())) > 1:
             raise RuntimeError(
-                f"semi_p: the halves run different {_UNPRIVILEGED_ENV} modes "
+                f"semi_p: the node-partitions run different {_UNPRIVILEGED_ENV} modes "
                 f"({modes}); each fixes the capability level its image "
-                "records, so the pair could never restore under one mode")
+                "records, so they could never restore under one mode")
         inst.generate([_DUMP_PROMPT], _DUMP_SAMPLING)
         inst.attach()
         inst.stage()
@@ -2568,7 +2569,7 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
                        gpus: list[int], agents: list[Any], *,
                        weights_dir: str | None, requested: dict[str, Any],
                        after: str) -> "_SemiPEngine":
-    """Restore every half of one image and return the leader's engine."""
+    """Restore every node-partition of one image and return the leader's engine."""
     import ray
     from arctic_platform.inference.semi_persistence import Instance
 
@@ -2611,7 +2612,7 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
 
         # The message-queue plane, rebuilt across pods. Every queue socket was
         # closed before the dump, so nothing here survived the image and the
-        # two halves have to agree on a new one before any collective runs.
+        # node-partitions have to agree on a new one before any collective runs.
         inst.mq_begin_unpark(remote_ranks, leader_ip, local_ranks).wait()
         handle = inst.last_info["mq_begin_unpark"]["handle"]
         # One opaque blob per agent, each encoding its ranks' handles; the
@@ -2669,8 +2670,8 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
 def _agent_gpus(local: int) -> list[int]:
     """The physical GPUs an agent drives.
 
-    Every pod in a zone exposes the same device set, and each half takes the
-    whole pod, so this is the identity list. It is a function rather than a
+    Every pod in a zone exposes the same device set, and each node-partition takes
+    the whole pod, so this is the identity list. It is a function rather than a
     literal because the agent resolves nothing itself -- the leader is the only
     place that knows the group's shape.
     """
@@ -2679,11 +2680,11 @@ def _agent_gpus(local: int) -> list[int]:
 
 def _joint_hit(agents: list[Any], paths: _ImagePaths,
                local: int) -> tuple[bool, str | None]:
-    """Whether every half holds an image from the same dump.
+    """Whether every node-partition holds an image from the same dump.
 
-    Returns ``(hit, dump_id)``. Two halves each holding *an* image prove
+    Returns ``(hit, dump_id)``. Node-partitions each holding *an* image prove
     nothing: they could be from different dumps, and restoring mismatched
-    halves deadlocks rather than failing.
+    node-partitions deadlocks rather than failing.
     """
     import ray
     meta_path = os.path.join(paths.model_dir, _IMAGE_DIR, "meta.json")
@@ -2699,15 +2700,15 @@ def _joint_hit(agents: list[Any], paths: _ImagePaths,
         for k, agent in enumerate(agents)])
     missing = [k + 1 for k, p in enumerate(probes) if not p.get("hit")]
     if missing:
-        logger.info("semi_p: node(s) %s hold no image for this key; every half "
-                    "will cold-start and dump together", missing)
+        logger.info("semi_p: node-partition(s) %s hold no image for this key; every "
+                    "node-partition will cold-start and dump together", missing)
         return False, None
     mismatched = [(k + 1, p.get("dump_id")) for k, p in enumerate(probes)
                   if p.get("dump_id") != my_id]
     if mismatched:
         logger.warning(
-            "semi_p: the halves hold images from different dumps "
-            "(leader=%s, %s); cold-starting rather than restoring a pair that "
+            "semi_p: the node-partitions hold images from different dumps "
+            "(leader=%s, %s); cold-starting rather than restoring a set that "
             "would deadlock in its first collective", my_id,
             ", ".join(f"node{k}={d}" for k, d in mismatched))
         return False, None
@@ -2789,8 +2790,8 @@ def restore_and_wrap(engine_kwargs: dict[str, Any],
 
     Intended to be called via ``asyncio.to_thread`` from the worker.
 
-    ``agents`` are the ``SemipNodeAgent`` handles for the other nodes when this
-    engine's TP group spans pods; ``None`` or empty is the single-node case,
+    ``agents`` are the ``SemipNodeAgent`` handles for the other pods when this
+    engine's TP group spans pods; ``None`` or empty is the single-pod case,
     which is every TP <= 8 deployment and takes exactly the path it always
     did. With agents, the hit decision, the dump and the restore all become
     joint: see ``_joint_hit``, ``_dump_multinode`` and ``_restore_multinode``.
@@ -2830,9 +2831,9 @@ def restore_and_wrap(engine_kwargs: dict[str, Any],
     vllm_config = _vllm_config_from_engine_kwargs(engine_kwargs)
 
     # Topology goes in the key, node identity does not. ``nnodes`` changes the
-    # image -- a half of a TP=16 group is not a TP=8 engine -- so it is hashed;
+    # image -- a node-partition of a TP=16 group is not a TP=8 engine -- so it is hashed;
     # node_rank, the rendezvous address and the interface travel outside the
-    # config so that both halves derive the same key and a restored pair is
+    # config so that all node-partitions derive the same key and a restored engine is
     # free to meet somewhere new.
     agents = list(agents or ())
     if agents:
@@ -2876,7 +2877,7 @@ def restore_and_wrap(engine_kwargs: dict[str, Any],
                                          paths.weight_root, weight_hash,
                                          verified_dir=skeleton_dir,
                                          strict=paths.replica_count > 1):
-                # A node that never ran this config can still serve it warm.
+                # A pod that never ran this config can still serve it warm.
                 after = "copy from the image source"
             else:
                 _dump(vllm_config, model_dir, gpus,
@@ -2901,10 +2902,10 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
                                 agents: list[Any]) -> "_SemiPEngine":
     """``restore_and_wrap`` for an engine whose TP group spans pods.
 
-    Same shape as the single-node path -- hit, else materialize, else dump,
+    Same shape as the single-pod path -- hit, else materialize, else dump,
     then restore -- with every decision made for the group rather than for this
-    pod. The dump lock is taken on the shared key directory, not on this node's
-    half, because the halves dump together and two leaders dumping one key at
+    pod. The dump lock is taken on the shared key directory, not on this pod's
+    node-partition, because the node-partitions dump together and two leaders dumping one key at
     once would interleave their images.
     """
     local = len(gpus)
@@ -2937,8 +2938,8 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
                 hit, dump_id = _joint_hit(agents, paths, local)
                 if not hit:
                     raise RuntimeError(
-                        "semi_p: after a multi-node dump the halves still do "
-                        "not agree on a dump_id; refusing to restore a pair "
+                        "semi_p: after a multi-node dump the node-partitions still do "
+                        "not agree on a dump_id; refusing to restore a set "
                         "that would deadlock in its first collective")
 
     skeleton_dir, weight_hash = _resolve_published_skeleton(paths)
@@ -2958,8 +2959,8 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
         except Exception as exc:
             if not _is_address_in_use(exc) or time.monotonic() >= deadline:
                 raise
-            # Both halves retry together: the ports CRIU rebinds are recorded
-            # per image, so a collision on either side means neither half's
+            # All node-partitions retry together: the ports CRIU rebinds are
+            # recorded per image, so a collision on any of them means no node-partition's
             # restore completed. See _restore_with_port_retry.
             logger.warning(
                 "semi_p: multi-node restore hit a port still in TIME_WAIT "
@@ -2971,9 +2972,9 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
 def _pick_master_port() -> int:
     """One rendezvous port for the whole group, chosen by the leader.
 
-    Both halves have to name the same port, and only the leader is in a
-    position to choose: a port that is free on the follower says nothing about
-    this node, which is the one that binds it.
+    Every node-partition has to name the same port, and only the leader is in a
+    position to choose: a port that is free on a follower says nothing about
+    this pod, which is the one that binds it.
     """
     import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -2983,11 +2984,11 @@ def _pick_master_port() -> int:
 
 
 def _multinode_materialize(agents: list[Any], paths: _ImagePaths) -> bool:
-    """Copy every half of a published skeleton into place, or none of them.
+    """Copy every node-partition of a published skeleton into place, or none.
 
-    A pod that materializes while its partner cold-starts is the mismatched
-    pair this whole protocol exists to avoid, so a partial result is treated as
-    a miss and both halves cold-start.
+    A pod that materializes while another pod of the engine cold-starts is the
+    mismatch this whole protocol exists to avoid, so a partial result is
+    treated as a miss and every node-partition cold-starts.
     """
     import ray
 
@@ -3009,14 +3010,14 @@ def _multinode_materialize(agents: list[Any], paths: _ImagePaths) -> bool:
     if all(theirs):
         return True
     logger.warning(
-        "semi_p: only some halves could be materialized from the published "
-        "skeleton (%s); cold-starting every half instead",
+        "semi_p: only some node-partitions could be materialized from the "
+        "published skeleton (%s); cold-starting every node-partition instead",
         [True] + list(theirs))
     return False
 
 
 def _node_source(skeleton_dir: str | None, node_rank: int) -> str | None:
-    """A published skeleton's ``node<k>/`` half, beside ``_replica_source``."""
+    """A published skeleton's ``node<k>/`` node-partition, beside ``_replica_source``."""
     if not skeleton_dir:
         return None
     return os.path.join(skeleton_dir, f"{_NODE_DIR_PREFIX}{node_rank}")
@@ -3059,7 +3060,7 @@ class _SemiPEngine:
         self._drained = asyncio.Event()
         self._drained.set()
         inst.add_cmd_listener("generate", self._on_generate_done)
-        # The other halves of a node-spanning engine. They hold GPUs and a
+        # The other node-partitions of a pod-spanning engine. They hold GPUs and a
         # restored process tree, so they have to come down with this engine;
         # nothing else owns them.
         self._agents = list(agents or ())
@@ -3283,7 +3284,7 @@ class _SemiPEngine:
             for loop, future in waiters:
                 loop.call_soon_threadsafe(
                     self._settle, future, {}, "engine closed")
-        # Fan out to the other halves. After the leader is down they hold a
+        # Fan out to the other node-partitions. After the leader is down they hold a
         # process tree that can never be driven again -- its executor was the
         # leader's -- so leaving them alive would pin a pod's GPUs until the
         # job ended.

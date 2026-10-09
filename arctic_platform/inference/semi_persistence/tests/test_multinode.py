@@ -6,7 +6,7 @@ Two families of property, and they fail in opposite ways.
 **Key isolation (L1).** ``vllm_config`` is hashed into the image cache key,
 recorded in ``meta.json`` and compared at ``criu_restore``. The experiment
 driver put ``node_rank``, ``master_addr`` and ``master_port`` in it, which
-means the two halves of one job hash differently and no restored pair can ever
+means the node-partitions of one job hash differently and no restored engine can ever
 match its own image. That failure is silent at dump time and only shows up as
 a permanent cache miss, so it is asserted here rather than discovered later.
 
@@ -102,7 +102,7 @@ def test_multinode_carries_node_identity_and_not_nnodes():
 
 def test_init_sends_node_identity_beside_the_config_not_inside_it():
     """The ``init`` command carries ``multinode=`` as its own kwarg. If it were
-    merged into ``vllm_config`` the two halves would hash differently."""
+    merged into ``vllm_config`` the node-partitions would hash differently."""
     src = open(_INSTANCE).read()
     init = _function(_tree(_INSTANCE), "init", cls="Instance")
     seg = ast.get_source_segment(src, init)
@@ -152,7 +152,7 @@ def test_local_gpu_count_splits_the_group_over_nnodes(tp, nnodes, local):
 
 
 def test_local_gpu_count_rejects_an_indivisible_split():
-    """A TP group that does not divide evenly would give the halves different
+    """A TP group that does not divide evenly would give the node-partitions different
     rank counts and deadlock in their first collective."""
     with pytest.raises(ValueError, match="divisible"):
         _lift(_INSTANCE, "_local_gpu_count")(
@@ -373,7 +373,7 @@ def test_the_recapture_requires_every_graph_back():
 
 
 # ---------------------------------------------------------------------------
-# E: the agent's half of the dump (first production job, 2026-10-06)
+# E: the agent's node-partition of the dump (first production job, 2026-10-06)
 # ---------------------------------------------------------------------------
 
 def _unpark_dir_fn():
@@ -392,9 +392,9 @@ def _unpark_dir(model_dir, nnodes):
                                                   nnodes=nnodes))
 
 
-def test_both_halves_rendezvous_in_one_unpark_directory():
+def test_every_node_partition_rendezvouses_in_one_unpark_directory():
     """The leader's park hands its directory to every rank, so the parked
-    readers on node 1 poll the leader's path. Named after each half's own
+    readers on node 1 poll the leader's path. Named after each node-partition's own
     ``node<k>``, the follower waited in, and would have unparked into, a
     directory its ranks never look at."""
     key = "/data-fast/image-cache_neutrino/79c172ce4f58_42387c11e280"
@@ -406,7 +406,7 @@ def test_both_halves_rendezvous_in_one_unpark_directory():
 @pytest.mark.parametrize("model_dir,nnodes,name", [
     ("/cache/abc_def", 1, "abc_def"),              # every TP<=8 image
     ("/cache/abc_def/replica1", 1, "replica1"),    # per-replica layout
-    ("/cache/node0", 1, "node0"),                  # not a half: nnodes is 1
+    ("/cache/node0", 1, "node0"),                  # not a node-partition: nnodes is 1
     ("/data-fast/exp2", 2, "exp2"),                # the experiment driver
 ])
 def test_the_unpark_directory_is_unchanged_off_the_node_layout(
@@ -487,7 +487,7 @@ def test_the_leader_merges_one_handle_blob_per_follower():
             in src), "the child must accept one blob or a list of them"
 
 
-def test_the_agent_records_its_halfs_mapping_set():
+def test_the_agent_records_its_node_partitions_mapping_set():
     """GLM job c5a24fdc's node 1 meta.json recorded 0 env_files beside node 0's
     387, so its modes could not be restored after a copy from the mirror."""
     dump = _function(_tree(_AGENT), "criu_dump", cls="SemipNodeAgent")

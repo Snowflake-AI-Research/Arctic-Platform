@@ -1,9 +1,11 @@
-"""The follower half of a semi-p engine that spans nodes.
+"""A follower node-partition of a semi-p engine that spans pods.
 
-A TP=16 engine is one vLLM engine whose ranks live on two pods. The leader
-``InferenceWorker`` owns ranks 0-7 and serves; a ``SemipNodeAgent`` owns ranks
-8-15 on the other pod and never serves. Every collective is issued by the
-leader, whose ``MultiprocExecutor`` spans both halves, so the agent's job is
+A pod-spanning engine is one vLLM engine whose ranks are split into one
+node-partition per pod: two at TP=16, four at TP=32. The leader
+``InferenceWorker`` owns node-partition 0 (ranks 0-7) and serves; one
+``SemipNodeAgent`` per further pod owns the next block of ranks and never
+serves. Every collective is issued by the leader, whose
+``MultiprocExecutor`` spans every node-partition, so the agent's job is
 only the part the leader cannot reach: this pod's CRIU image, its CUDA
 checkpoint and restore, and its end of the message-queue plane.
 
@@ -11,24 +13,24 @@ The agent is the Ray-actor form of the follower in the out-of-repo experiment
 driver ``exp2_tp16.py``, which drove the same sequence over a TCP socket. The
 ordering below is that protocol, and it is not arbitrary:
 
-  Dump      both halves ``init`` together (they rendezvous over socket NCCL),
+  Dump      all node-partitions ``init`` together (they rendezvous over socket NCCL),
             the leader runs the generation and the staging steps, then the
-            leader checkpoints CUDA and the follower does the same. The
+            leader checkpoints CUDA and each follower does the same. The
             leader's ``criu_dump`` parks every rank's message queue as its
-            last collective step, so the follower can only dump once its own
+            last collective step, so a follower can only dump once its own
             ranks are parked -- hence ``criu_dump`` starts in
             ``wait_parked``.
 
-  Restore   both ``criu_restore``; the leader binds a new broadcast writer and
-            hands out a handle; the follower orders its ranks onto it and
+  Restore   all ``criu_restore``; the leader binds a new broadcast writer and
+            hands out a handle; each follower orders its ranks onto it and
             returns their response handles; the leader connects to those and
-            swaps the plane in. Only then can either half ``cuda_restore``,
+            swaps the plane in. Only then can any node-partition ``cuda_restore``,
             and only then can the leader re-init NCCL -- which is the first
             time EFA comes up, since the cold start ran on sockets.
 
-Joint or nothing: a half that cold-starts while the other restores would
+Joint or nothing: a node-partition that cold-starts while another restores would
 rendezvous with a group that does not exist. ``probe`` reports what this pod
-has so the leader can require both halves to carry the same ``dump_id``.
+has so the leader can require every node-partition to carry the same ``dump_id``.
 """
 from __future__ import annotations
 
@@ -44,9 +46,9 @@ logger = logging.getLogger(__name__)
 
 @ray.remote
 class SemipNodeAgent:
-    """Owns the follower ``Instance`` for one node of a multi-node engine.
+    """Owns the follower ``Instance`` for one pod of a pod-spanning engine.
 
-    Every method is a plain blocking call: the leader sequences the two halves
+    Every method is a plain blocking call: the leader sequences the node-partitions
     and has to know each step finished before it starts the next, so there is
     nothing to gain from returning early. The Ray call is the await point.
     """
@@ -55,8 +57,8 @@ class SemipNodeAgent:
         from arctic_platform.inference.server.semip_engine import (
             _UNPRIVILEGED_ENV)
         # The leader sets this default in its own process only, and the mode
-        # has to match across halves: it decides the capability level each
-        # half's child records at init and the flags its CRIU runs with. As
+        # has to match across node-partitions: it decides the capability level
+        # each node-partition's child records at init and the flags its CRIU runs with. As
         # there, a job's extra_env (this actor's runtime_env) overrides it.
         os.environ.setdefault(_UNPRIVILEGED_ENV, "1")
         self._inst = None
@@ -70,9 +72,9 @@ class SemipNodeAgent:
     def probe(self, model_dir: str) -> dict[str, Any]:
         """What this pod holds for *model_dir*, for the joint hit decision.
 
-        ``dump_id`` is the identity the leader compares. Two halves that each
+        ``dump_id`` is the identity the leader compares. Node-partitions that each
         hold an image prove nothing on their own: they could be from different
-        dumps, and restoring mismatched halves would deadlock in the first
+        dumps, and restoring mismatched node-partitions would deadlock in the first
         collective rather than fail cleanly.
         """
         meta_path = os.path.join(model_dir, "image", "meta.json")
@@ -92,7 +94,7 @@ class SemipNodeAgent:
     def config_digest(self, vllm_config: dict[str, Any]) -> str:
         """This pod's hash of the engine config it is about to build.
 
-        The two halves profile their shapes independently at cold start and
+        The node-partitions profile their shapes independently at cold start and
         then meet in a collective. If they disagree -- a different
         ``max_num_batched_tokens``, a different KV dtype -- they deadlock
         there, silently, for the full gloo timeout. Comparing a digest before
@@ -104,7 +106,7 @@ class SemipNodeAgent:
     def materialize(self, source_dir: str | None, model_dir: str,
                     weight_root: str | None, weight_hash: str | None,
                     verified_dir: str | None = None) -> bool:
-        """Copy this node's half of a published skeleton into place."""
+        """Copy this pod's node-partition of a published skeleton into place."""
         from arctic_platform.inference.server.semip_engine import (
             _materialize_from_source)
         return bool(_materialize_from_source(
@@ -116,18 +118,18 @@ class SemipNodeAgent:
     def init(self, vllm_config: dict[str, Any], model_dir: str,
              gpus: list[int], node_rank: int, nnodes: int,
              master_addr: str, master_port: int, ifname: str) -> dict[str, Any]:
-        """Cold-start this half and block until its ranks have joined.
+        """Cold-start this node-partition and block until its ranks have joined.
 
-        The leader starts its own ``init`` at the same time; the two
-        rendezvous inside vLLM. Neither returns until both have, so a slow
-        half shows up as a long call here rather than as a deadlock.
+        The leader starts its own ``init`` at the same time; they all
+        rendezvous inside vLLM. None returns until all have, so a slow
+        node-partition shows up as a long call here rather than as a deadlock.
         """
         from arctic_platform.inference.semi_persistence import (
             Instance, MultiNode)
         from arctic_platform.inference.server.semip_engine import (
             _raise_pid_floor, _unprivileged_mode)
         # Per pod: the counter is this PID namespace's, and the leader's floor
-        # does nothing for the ids this half's image records.
+        # does nothing for the ids this node-partition's image records.
         pid_floor = _raise_pid_floor()
         self._model_dir = model_dir
         self._node_rank = node_rank
@@ -152,7 +154,7 @@ class SemipNodeAgent:
     # -- dump --------------------------------------------------------------
 
     def cuda_checkpoint(self) -> dict[str, Any]:
-        """Release this half's GPU state.
+        """Release this node-partition's GPU state.
 
         Runs after the leader's, because the leader's ``cuda_checkpoint``
         drops the graphs and tears NCCL down across every rank including
@@ -163,10 +165,10 @@ class SemipNodeAgent:
         return {"ok": True}
 
     def wait_parked(self, timeout_s: float = 300.0) -> dict[str, Any]:
-        """Block until this node's ranks have parked their message queues.
+        """Block until this pod's ranks have parked their message queues.
 
         The leader's ``criu_dump`` parks every rank as its last collective
-        step. Dumping this half before that lands would capture a process
+        step. Dumping this node-partition before that lands would capture a process
         still holding queue sockets, which is exactly what the image must not
         contain.
         """
@@ -187,7 +189,7 @@ class SemipNodeAgent:
             time.sleep(0.2)
 
     def criu_dump(self, meta_extra: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Dump this half once its ranks are parked. Destructive: the child is
+        """Dump this node-partition once its ranks are parked. Destructive: the child is
         gone afterwards.
 
         The wait is in here rather than a separate call because the actor runs
@@ -204,10 +206,10 @@ class SemipNodeAgent:
         if census:
             raise RuntimeError(
                 f"semi_p agent node{self._node_rank}: the image still holds "
-                f"{len(census)} inet socket(s) {census}; a restore on another "
-                "node would fail to rebind them")
-        # The leader records only its own half. Without this one, a copy of
-        # this half from the mirror comes back with every file at the sync's
+                f"{len(census)} inet socket(s) {census}; a restore in another "
+                "pod would fail to rebind them")
+        # The leader records only its own node-partition. Without this one, a
+        # copy of this node-partition from the mirror comes back with every file at the sync's
         # mode, and CRIU refuses the first executable mapping.
         _record_env_files(self._model_dir)
         return {"ok": True, "inet_census": census}
@@ -216,7 +218,7 @@ class SemipNodeAgent:
 
     def criu_restore(self, vllm_config: dict[str, Any], model_dir: str,
                      gpus: list[int], node_rank: int) -> dict[str, Any]:
-        """Rebuild this half's process from its image."""
+        """Rebuild this node-partition's process from its image."""
         from arctic_platform.inference.semi_persistence import Instance
         self._model_dir = model_dir
         self._node_rank = node_rank
@@ -229,7 +231,7 @@ class SemipNodeAgent:
 
     def mq_follower_unpark(self, handle: Any,
                            ranks: list[int]) -> dict[str, Any]:
-        """Order this node's ranks onto the leader's new broadcast writer.
+        """Order this pod's ranks onto the leader's new broadcast writer.
 
         Returns their response handles, which the leader connects to in
         ``mq_finish_unpark``. The plane is only whole once both directions
@@ -244,7 +246,7 @@ class SemipNodeAgent:
         return {"handles": inst.last_info["mq_follower_unpark"]["handles"]}
 
     def cuda_restore(self) -> dict[str, Any]:
-        """Put this half's CUDA state back on its GPUs."""
+        """Put this node-partition's CUDA state back on its GPUs."""
         self._require().cuda_restore(gpus=list(self._gpus)).wait()
         return {"ok": True}
 
@@ -278,12 +280,12 @@ class SemipNodeAgent:
     def _require(self):
         if self._inst is None:
             raise RuntimeError(
-                "semi_p agent: no Instance on this node yet; init() or "
+                "semi_p agent: no Instance in this pod yet; init() or "
                 "criu_restore() has to run first")
         return self._inst
 
     def _parked_markers(self) -> dict[int, str]:
-        """``rank -> path`` of the marker each of this node's ranks writes
+        """``rank -> path`` of the marker each of this pod's ranks writes
         once its message queues are parked."""
         inst = self._require()
         unpark_dir = inst._unpark_dir()
