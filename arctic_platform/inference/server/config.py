@@ -72,6 +72,7 @@ class ModelConfig(BaseModel):
     # does not error).
     forest_cascade_attn_configs: str | None = "{}"
 
+    text_config_overrides: dict[str, Any] = Field(default_factory=dict, exclude=True)
     extra_engine_kwargs: dict[str, Any] = Field(default_factory=dict, exclude=True)
     extra_env: dict[str, str] = Field(default_factory=dict, exclude=True)
     ray_num_gpus: float | None = Field(default=None, exclude=True)
@@ -116,6 +117,12 @@ class ModelConfig(BaseModel):
     def to_engine_kwargs(self) -> dict[str, Any]:
         kwargs = {k: v for k, v in self.model_dump().items() if v is not None}
         kwargs.update(self.extra_engine_kwargs)
+        if len(self.text_config_overrides) > 0:
+            from arctic_platform.common.text_config_overrides import text_config_hf_overrides
+
+            if "hf_overrides" in self.extra_engine_kwargs:
+                raise ValueError("text_config_overrides cannot be combined with extra_engine_kwargs.hf_overrides")
+            kwargs["hf_overrides"] = text_config_hf_overrides(kwargs["model"], self.text_config_overrides)
         if not arctic_inference_effective_enabled(self.extra_env):
             kwargs.pop("forest_cascade_attn_configs", None)
         return kwargs
