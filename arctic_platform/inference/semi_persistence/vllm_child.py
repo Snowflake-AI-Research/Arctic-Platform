@@ -3766,14 +3766,13 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     return error, info
                 # The patches InferenceWorker applies before a cold engine,
                 # which the vLLM plugin does not: without them extra_args'
-                # stop-token sequences are ignored and xgrammar can sample a
-                # stop token its grammar rejects.
-                from arctic_platform.inference.vllm.router_replay import (
-                    ensure_router_replay_vllm_patches)
-                from arctic_platform.inference.vllm.xgrammar_stop_mask import (
-                    ensure_xgrammar_stop_mask_fix)
-                ensure_router_replay_vllm_patches()
-                ensure_xgrammar_stop_mask_fix()
+                # stop-token sequences are ignored, xgrammar can sample a
+                # stop token its grammar rejects, and dense prompt logprobs,
+                # spec-decode grammar checks and the DFlash2 NaN fixes are
+                # missing. Every one is idempotent.
+                from arctic_platform.inference.vllm.required_patches import (
+                    apply_required_vllm_patches)
+                apply_required_vllm_patches()
                 from vllm import LLM
                 llm = LLM(**vllm_config)
                 engine = llm.llm_engine
