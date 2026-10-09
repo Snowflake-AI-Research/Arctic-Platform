@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Profile of the ``qwen3_5_moe`` loader. Options are ``Qwen3_5MoeOptions`` fields; the ``Patches`` wrappers are
-rejected."""
+"""Profile of the ``qwen3_5_moe`` loader.
+
+Options are ``Qwen3_5MoeOptions`` fields, or a ``ModelSpec`` field the loader accepts (``attn_implementation`` for
+``attention.backend``). The loader rejects the ``Patches`` wrappers.
+"""
 
 from __future__ import annotations
 

@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Profile of the ``glm_moe_dsa`` loader (GLM-5 with sparse MLA). Options are ``GlmMoeDsaOptions`` fields; the
-``Patches`` wrappers are rejected."""
+"""Profile of the ``glm_moe_dsa`` loader (GLM-5 with sparse MLA).
+
+Options are ``GlmMoeDsaOptions`` fields, or a ``ModelSpec`` field the loader accepts (``attn_implementation`` for
+``attention.backend``). The loader rejects the ``Patches`` wrappers.
+"""
 
 from __future__ import annotations
 
