@@ -49,6 +49,10 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         dtype=ctx.spec.dtype,
         **kwargs,
     )
+    if ctx.spec.yarn_factors:
+        from arctic_platform.model.yarn_factors import install_yarn_factors
+
+        install_yarn_factors(model, ctx.spec.yarn_factors)
     if parallelism.sequence_parallel > 1:
         from arctic_platform.model.implementations.gpu.sp.transformers import (
             configure_transformers_sequence_parallel_model,

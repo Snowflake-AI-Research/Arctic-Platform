@@ -91,6 +91,7 @@ _ENGINE_FWD_KEYS = frozenset(
     {
         "input_ids",
         "position_ids",
+        "yarn_factor",
         "attention_mask",
         "use_cache",
         "labels",

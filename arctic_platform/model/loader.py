@@ -154,6 +154,8 @@ def get_loader_options_model(name: str) -> type[BaseModel] | None:
 def validate_loader_spec(name: str, spec: ModelSpec) -> None:
     if len(spec.text_config_overrides) > 0 and name != "huggingface":
         raise ValueError(f"{name} loader does not support text_config_overrides")
+    if spec.yarn_factors and name != "huggingface":
+        raise ValueError(f"{name} loader does not support yarn_factors")
     validator = _LOADERS[name].validate_spec
     if validator is not None:
         validator(spec)

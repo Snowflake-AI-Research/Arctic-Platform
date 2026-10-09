@@ -199,6 +199,7 @@ class ModelSpec(BaseModel):
         default_factory=dict,
         description="Merged text config overrides; YaRN must explicitly set original_max_position_embeddings.",
     )
+    yarn_factors: list[float] = Field(default_factory=list)
     dtype: str = Field("bfloat16", description="Parameter dtype.")
     attn_implementation: str | None = Field(None, description="Attention implementation to request from HF.")
     loader: str | None = Field(None, description="Loader name; auto-resolved at construction when not set.")
