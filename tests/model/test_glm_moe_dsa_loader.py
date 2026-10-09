@@ -24,7 +24,9 @@ from torch import nn
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
+from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import build_model
+from arctic_platform.model import resolve_model_spec
 from arctic_platform.model.loaders.glm_moe_dsa import GlmMoeDsaOptions
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
@@ -39,7 +41,11 @@ def test_selection_uses_model_type(tmp_path, composite):
             "text_config": config,
         }
     (tmp_path / "config.json").write_text(json.dumps(config))
-    spec = ModelSpec(model_path_or_name=str(tmp_path), parallelism=ParallelismConfig(expert_parallel=2))
+    spec = ModelSpec(
+        model_path_or_name=str(tmp_path),
+        parallelism=ParallelismConfig(expert_parallel=2),
+    )
+    resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
     assert spec.loader == "glm_moe_dsa"
 
 
@@ -67,16 +73,28 @@ def test_loader_preserves_options_and_process_group(monkeypatch, backend):
             "tiled_mlp_token_chunk_size": 32,
             "weight_conversion_cache_dir": "",
             "trust_remote_code": False,
-            "ac_config": {"offload_config": {"pin_memory_enabled": False, "pin_memory_max_size_gib": 0}},
+            "ac_config": {
+                "offload_config": {
+                    "pin_memory_enabled": False,
+                    "pin_memory_max_size_gib": 0,
+                }
+            },
         },
     )
-    result = build_model(spec, parallel_groups={"ep_group": ep_group})
+    result = build_model(
+        spec,
+        parallel_groups={"ep_group": ep_group},
+        platform=PlatformCapabilities.for_accelerator(
+            "hopper",
+            ep_comm_backends=frozenset({backend}),
+        ),
+    )
     assert result.model is model
     assert seen["ep_group"] is ep_group
     assert seen["ep_size"] == 2
     assert seen["sp_size"] == 1
     assert seen["optimization_dtype"] == "bfloat16"
-    assert seen["attn_implementation"] == "flash_attention_2"
+    assert seen["attn_implementation"] == "flash_attention_3"
     assert seen["options"] == GlmMoeDsaOptions.model_validate(spec.loader_options)
     assert seen["options"].sparse_mla_backend == "dense"
     assert seen["options"].ac_config.offload_config.pin_memory_enabled is False
@@ -102,7 +120,11 @@ def test_unsupported_options_are_rejected(options):
 
 def test_omitted_fused_cross_entropy_defaults_to_liger(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm_moe_dsa"}))
-    spec = ModelSpec(model_path_or_name=str(tmp_path), parallelism=ParallelismConfig(expert_parallel=2))
+    spec = ModelSpec(
+        model_path_or_name=str(tmp_path),
+        parallelism=ParallelismConfig(expert_parallel=2),
+    )
+    resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
     assert spec.loader_options["fused_cross_entropy"] == "liger"
 
     explicit = ModelSpec(
@@ -110,6 +132,7 @@ def test_omitted_fused_cross_entropy_defaults_to_liger(tmp_path):
         parallelism=ParallelismConfig(expert_parallel=2),
         loader_options={"fused_cross_entropy": False},
     )
+    resolve_model_spec(explicit, PlatformCapabilities.for_accelerator("hopper"))
     assert explicit.loader_options["fused_cross_entropy"] is False
 
 
@@ -142,8 +165,9 @@ def test_quack_fused_cross_entropy_is_supported():
     ],
 )
 def test_spec_cannot_silently_ignore_settings(kwargs):
+    spec = ModelSpec(model_path_or_name="local", loader="glm_moe_dsa", **kwargs)
     with pytest.raises(ValueError):
-        ModelSpec(model_path_or_name="local", loader="glm_moe_dsa", **kwargs)
+        resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
 
 
 def test_runtime_group_is_required():

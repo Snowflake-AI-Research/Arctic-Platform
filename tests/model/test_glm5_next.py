@@ -19,6 +19,8 @@ import torch
 
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
+from arctic_platform.model import PlatformCapabilities
+from arctic_platform.model import resolve_model_spec
 from arctic_platform.model.implementations.glm53.converting_glm5_next import convert_hf_layer_to_prime
 from arctic_platform.model.implementations.glm53.converting_glm5_next import convert_prime_layer_to_hf
 from arctic_platform.model.implementations.glm53.vllm_weights import convert_glm5_next_layer_to_vllm
@@ -101,6 +103,9 @@ def test_glm53_flash_family_dispatch_uses_model_type(tmp_path):
         model_path_or_name=_checkpoint(tmp_path, "glm_moe_dsa"),
         parallelism=ParallelismConfig(expert_parallel=2),
     )
+    platform = PlatformCapabilities.for_accelerator("hopper")
+    resolve_model_spec(glm5, platform)
+    resolve_model_spec(glm52, platform)
 
     assert glm5.loader == "glm5_next"
     assert glm52.loader == "glm_moe_dsa"
@@ -314,9 +319,14 @@ def test_glm53_defaults_to_sparse_mla_and_allows_context_parallelism(tmp_path):
         model_path_or_name=_checkpoint(tmp_path, "glm5_next"),
         parallelism=ParallelismConfig(expert_parallel=2, sequence_parallel=2),
     )
+    resolved = resolve_model_spec(
+        spec,
+        PlatformCapabilities.for_accelerator("hopper"),
+    )
 
     assert spec.loader == "glm5_next"
-    assert spec.attn_implementation == "sparse_mla"
+    assert resolved.attn_implementation == "sparse_mla"
+    assert resolved.ep_comm_backend == "uccl"
 
 
 def test_glm53_sparse_reference_supports_rectangular_context_parallelism():

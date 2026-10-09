@@ -22,11 +22,11 @@ import types
 
 import pytest
 import torch.nn as nn
-from pydantic import ValidationError
 
 from arctic_platform.model import LoadedModel
 from arctic_platform.model import LoaderContext
 from arctic_platform.model import ModelSpec
+from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import apply_patches
 from arctic_platform.model import build_model
 from arctic_platform.model import factory as factory_mod
@@ -34,6 +34,7 @@ from arctic_platform.model import loader as loader_mod
 from arctic_platform.model import patch as patch_mod
 from arctic_platform.model import register_loader
 from arctic_platform.model import register_patch
+from arctic_platform.model import resolve_model_spec
 
 
 @pytest.fixture(autouse=True)
@@ -68,7 +69,12 @@ def _ctx(**patch_flags) -> LoaderContext:
 def _register(name, *, matches=None, default=False):
     """Register a stub loader; the autouse fixture restores the registry afterwards."""
 
-    @register_loader(name, matches=matches, default=default)
+    @register_loader(
+        name,
+        resolve_spec=loader_mod.resolve_spec_with_defaults,
+        matches=matches,
+        default=default,
+    )
     def _loader(ctx: LoaderContext) -> LoadedModel:
         return LoadedModel(model=nn.Identity())
 
@@ -85,7 +91,9 @@ class TestLoaderSelection:
     def test_unset_loader_resolves_to_registered_default(self):
         """An unset loader is populated with whatever loader is registered as the default."""
         _register("base", default=True)
-        assert ModelSpec(model_path_or_name="x").loader == "base"
+        spec = ModelSpec(model_path_or_name="x")
+        assert spec.loader is None
+        assert resolve_model_spec(spec, PlatformCapabilities.for_accelerator("ampere")).loader == "base"
 
     def test_explicit_loader_overrides_default(self):
         _register("base", default=True)
@@ -94,8 +102,9 @@ class TestLoaderSelection:
 
     def test_unknown_loader_rejected(self):
         _register("base", default=True)
-        with pytest.raises(ValidationError):
-            ModelSpec(model_path_or_name="x", loader="nope")
+        spec = ModelSpec(model_path_or_name="x", loader="nope")
+        with pytest.raises(ValueError, match="unknown loader"):
+            resolve_model_spec(spec, PlatformCapabilities.for_accelerator("ampere"))
 
     def test_duplicate_default_rejected(self):
         """A second default loader is rejected at registration, not selection."""
@@ -109,36 +118,50 @@ class TestLoaderSelection:
         monkeypatch.setattr("transformers.AutoConfig.from_pretrained", lambda *a, **k: fake_config)
 
         _register("base", default=True)
-        _register("special", matches=lambda ctx: getattr(ctx.hf_config, "model_type", "") == "special")
+        _register(
+            "special",
+            matches=lambda ctx: getattr(ctx.hf_config, "model_type", "") == "special",
+        )
 
-        assert ModelSpec(model_path_or_name="x").loader == "special"
+        spec = ModelSpec(model_path_or_name="x")
+        assert resolve_model_spec(spec, PlatformCapabilities.for_accelerator("ampere")).loader == "special"
 
     def test_multiple_matches_rejected(self, monkeypatch):
         """Two matching predicates are ambiguous and rejected."""
-        monkeypatch.setattr("transformers.AutoConfig.from_pretrained", lambda *a, **k: types.SimpleNamespace())
+        monkeypatch.setattr(
+            "transformers.AutoConfig.from_pretrained",
+            lambda *a, **k: types.SimpleNamespace(),
+        )
 
         _register("base", default=True)
         _register("m1", matches=lambda ctx: True)
         _register("m2", matches=lambda ctx: True)
 
-        with pytest.raises(ValidationError, match="multiple loaders match"):
-            ModelSpec(model_path_or_name="x")
+        spec = ModelSpec(model_path_or_name="x")
+        with pytest.raises(ValueError, match="multiple loaders match"):
+            resolve_model_spec(spec, PlatformCapabilities.for_accelerator("ampere"))
 
     def test_build_model_runs_resolved_loader_then_patches(self, monkeypatch):
         """build_model builds via the resolved loader and hands the result to the patch pipeline."""
         built = nn.Linear(1, 1)
+        specs = []
 
-        @register_loader("fake")
+        @register_loader("fake", resolve_spec=loader_mod.resolve_spec_with_defaults)
         def _fake(ctx: LoaderContext) -> LoadedModel:
+            specs.append(ctx.spec)
             return LoadedModel(model=built)
 
         patched = []
         monkeypatch.setattr(factory_mod, "apply_patches", lambda loaded, ctx: patched.append(loaded))
 
-        loaded = build_model(ModelSpec(model_path_or_name="x", loader="fake"))
+        loaded = build_model(
+            ModelSpec(model_path_or_name="x", loader="fake"),
+            platform=PlatformCapabilities.for_accelerator("ampere"),
+        )
 
         assert loaded.model is built
         assert patched == [loaded]
+        assert specs[0].attn_implementation == "sdpa"
 
 
 class TestPatchPipeline:
@@ -214,6 +237,62 @@ class TestPatchPipeline:
 
 
 class TestHuggingFaceLoader:
+    @pytest.mark.parametrize(
+        ("accelerator", "expected"),
+        [
+            ("ampere", "sdpa"),
+            ("hopper", "flash_attention_3"),
+            ("blackwell", "flash_attention_4"),
+        ],
+    )
+    def test_attention_is_resolved_before_model_load(self, accelerator, expected):
+        spec = ModelSpec(
+            model_path_or_name="qwen",
+            loader="huggingface",
+        )
+        resolved = resolve_model_spec(
+            spec,
+            PlatformCapabilities.for_accelerator(accelerator),
+        )
+
+        assert resolved is spec
+        assert resolved.attn_implementation == expected
+
+    def test_explicit_attention_override_is_preserved(self):
+        spec = ModelSpec(
+            model_path_or_name="qwen",
+            loader="huggingface",
+            attn_implementation="flash_attention_3",
+        )
+        resolved = resolve_model_spec(
+            spec,
+            PlatformCapabilities.for_accelerator(
+                "blackwell",
+                attention_backends=frozenset({"flash_attention_3", "flash_attention_4"}),
+            ),
+        )
+
+        assert resolved.attn_implementation == "flash_attention_3"
+
+    def test_unavailable_attention_backend_is_rejected(self):
+        spec = ModelSpec(model_path_or_name="qwen", loader="huggingface")
+        platform = PlatformCapabilities.for_accelerator(
+            "hopper",
+            attention_backends=frozenset({"sdpa"}),
+        )
+
+        with pytest.raises(ValueError, match="flash_attention_3.*unavailable"):
+            resolve_model_spec(spec, platform)
+
+    def test_model_spec_is_serializable_after_resolution(self):
+        spec = ModelSpec(model_path_or_name="qwen", loader="huggingface")
+        resolved = resolve_model_spec(
+            spec,
+            PlatformCapabilities.for_accelerator("hopper"),
+        )
+
+        assert resolved.model_validate_json(resolved.model_dump_json()) == resolved
+
     def test_qwen3_resolves_to_default_loader(self, monkeypatch):
         fake_config = types.SimpleNamespace(model_type="qwen3")
         monkeypatch.setattr(
@@ -224,6 +303,7 @@ class TestHuggingFaceLoader:
 
         spec = ModelSpec(model_path_or_name="qwen")
 
+        resolve_model_spec(spec, PlatformCapabilities.for_accelerator("ampere"))
         assert spec.loader == "huggingface"
 
     def test_unreadable_config_is_not_treated_as_a_missing_model(self, tmp_path):
@@ -255,7 +335,10 @@ class TestHuggingFaceLoader:
         model = nn.Module()
         model.config = types.SimpleNamespace(model_type="qwen3", use_cache=True)
         configured = []
-        monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
+        monkeypatch.setattr(
+            "transformers.AutoModelForCausalLM.from_pretrained",
+            lambda *args, **kwargs: model,
+        )
         monkeypatch.setattr(
             "arctic_platform.model.implementations.gpu.sp.transformers.apply_gated_delta_net_sequence_parallelism",
             lambda configured_model, group: configured.append((configured_model, group)) or 0,
@@ -297,7 +380,11 @@ class TestFromDsWorkerConfig:
     def test_liger_and_gc_flags_map(self):
         spec = ModelSpec.from_ds_worker_config(
             "x",
-            {"use_liger": True, "enable_gradient_checkpointing": False, "attn_implementation": "sdpa"},
+            {
+                "use_liger": True,
+                "enable_gradient_checkpointing": False,
+                "attn_implementation": "sdpa",
+            },
         )
         assert spec.patches.liger is True
         assert spec.patches.gradient_checkpointing is False
@@ -339,7 +426,11 @@ class TestFromDsWorkerConfig:
 
         spec = ModelSpec.from_ds_worker_config(
             "x",
-            {"attn_implementation": "flash_attention_2", "zorro_train_enable": True, "rollout_n": 4},
+            {
+                "attn_implementation": "flash_attention_2",
+                "zorro_train_enable": True,
+                "rollout_n": 4,
+            },
         )
         z = spec.patches.zorro_train
         assert z is not None
@@ -361,7 +452,11 @@ class TestLigerPatch:
         fake_monkey_patch = types.ModuleType("liger_kernel.transformers.monkey_patch")
         fake_monkey_patch._apply_liger_kernel_to_instance = lambda **kwargs: captured.update(kwargs)
         monkeypatch.setitem(sys.modules, "liger_kernel", types.ModuleType("liger_kernel"))
-        monkeypatch.setitem(sys.modules, "liger_kernel.transformers", types.ModuleType("liger_kernel.transformers"))
+        monkeypatch.setitem(
+            sys.modules,
+            "liger_kernel.transformers",
+            types.ModuleType("liger_kernel.transformers"),
+        )
         monkeypatch.setitem(sys.modules, "liger_kernel.transformers.monkey_patch", fake_monkey_patch)
 
         model = nn.Identity()
@@ -587,4 +682,7 @@ class TestZorroAndGcPatches:
         model = nn.Identity()
         model.config = types.SimpleNamespace(model_type="llama")
         with pytest.raises(ValueError, match="Unsupported model_type=llama"):
-            apply_zorro_train(model, _ctx(zorro_train=ZorroTrainPatch(response_len=1024, rollout_n=8, world_size=1)))
+            apply_zorro_train(
+                model,
+                _ctx(zorro_train=ZorroTrainPatch(response_len=1024, rollout_n=8, world_size=1)),
+            )

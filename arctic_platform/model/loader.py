@@ -22,13 +22,15 @@ from dataclasses import field
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import Literal
 
 import torch.nn as nn
+from pydantic import BaseModel
 
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.platform import PlatformCapabilities
 
 if TYPE_CHECKING:
-    from pydantic import BaseModel
     from transformers import PretrainedConfig
 
 
@@ -98,12 +100,14 @@ class LoadedModel:
 Loader = Callable[[LoaderContext], LoadedModel]
 Matcher = Callable[[LoaderContext], bool]
 SpecValidator = Callable[[ModelSpec], None]
+SpecResolver = Callable[[ModelSpec, PlatformCapabilities], ModelSpec]
 
 
 @dataclass
 class _LoaderEntry:
     fn: Loader
     matches: Matcher | None
+    resolve_spec: SpecResolver
     options: type[BaseModel] | None = None
     validate_spec: SpecValidator | None = None
 
@@ -114,6 +118,7 @@ _DEFAULT_LOADER: str | None = None
 
 def register_loader(
     name: str,
+    resolve_spec: SpecResolver,
     matches: Matcher | None = None,
     default: bool = False,
     options: type[BaseModel] | None = None,
@@ -121,8 +126,8 @@ def register_loader(
 ) -> Callable[[Loader], Loader]:
     """Register a loader by name.
 
-    Optionally give it a ``matches`` predicate, mark it the ``default``, or attach an
-    ``options`` pydantic model used to validate ``ModelSpec.loader_options``.
+    ``resolve_spec`` applies loader-specific decisions after selection. A loader may
+    also have a ``matches`` predicate, be the ``default``, or validate an ``options`` model.
     """
 
     def decorator(fn: Loader) -> Loader:
@@ -134,6 +139,7 @@ def register_loader(
         _LOADERS[name] = _LoaderEntry(
             fn=fn,
             matches=matches,
+            resolve_spec=resolve_spec,
             options=options,
             validate_spec=validate_spec,
         )
@@ -142,26 +148,91 @@ def register_loader(
     return decorator
 
 
-def is_registered_loader(name: str) -> bool:
-    return name in _LOADERS
+def _platform_attention_default(platform: PlatformCapabilities) -> str:
+    return {
+        "blackwell": "flash_attention_4",
+        "hopper": "flash_attention_3",
+        "ampere": "sdpa",
+    }.get(platform.accelerator, "sdpa")
 
 
-def get_loader_options_model(name: str) -> type[BaseModel] | None:
-    """Return the pydantic options model registered for a loader, if any."""
-    return _LOADERS[name].options
+def resolve_spec_with_defaults(
+    spec: ModelSpec,
+    platform: PlatformCapabilities,
+    *,
+    attention: Literal["platform"] | str = "platform",
+    ep_comm_backend: Literal["deepep", "uccl"] | None = None,
+    sp_strategy: Literal["transformers_ulysses", "native"] = "transformers_ulysses",
+    sp_requires_head_divisibility: bool = True,
+    label_contract: Literal["causal_labels", "logit_aligned"] = "causal_labels",
+    requires_weight_conversion: bool = False,
+    model_forward_requires_labels: bool = False,
+) -> ModelSpec:
+    if spec.loader is None:
+        raise ValueError("ModelSpec.loader must be selected before platform-dependent fields are resolved")
+
+    resolved_attention = spec.attn_implementation
+    if resolved_attention is None:
+        resolved_attention = _platform_attention_default(platform) if attention == "platform" else attention
+    if resolved_attention.startswith("flash_attention_") and resolved_attention not in platform.attention_backends:
+        raise ValueError(
+            f"{resolved_attention} is the default for loader {spec.loader!r} on {platform.accelerator}, "
+            f"but the backend is unavailable; available={sorted(platform.attention_backends)}"
+        )
+
+    loader_options = dict(spec.loader_options)
+    resolved_ep_comm_backend = None
+    if spec.parallelism.expert_parallel > 1:
+        requested_backend = loader_options.get("ep_comm_backend")
+        resolved_ep_comm_backend = requested_backend or ep_comm_backend
+        if resolved_ep_comm_backend is None:
+            raise ValueError(f"loader {spec.loader!r} did not resolve an expert-parallel communication backend")
+        if resolved_ep_comm_backend not in platform.ep_comm_backends:
+            raise ValueError(
+                f"{resolved_ep_comm_backend} is required by loader {spec.loader!r}, "
+                f"but the backend is unavailable; available={sorted(platform.ep_comm_backends)}"
+            )
+        loader_options["ep_comm_backend"] = resolved_ep_comm_backend
+
+    fused_cross_entropy = loader_options.get("fused_cross_entropy")
+    if spec.patches.liger:
+        fused_cross_entropy = "liger"
+    spec.attn_implementation = resolved_attention
+    spec.loader_options = loader_options
+    spec.ep_comm_backend = resolved_ep_comm_backend
+    spec.sp_strategy = sp_strategy
+    spec.sp_requires_head_divisibility = sp_requires_head_divisibility
+    spec.label_contract = label_contract
+    spec.requires_weight_conversion = requires_weight_conversion
+    spec.model_forward_requires_labels = model_forward_requires_labels
+    spec.fused_cross_entropy = fused_cross_entropy
+    return spec
 
 
-def validate_loader_spec(name: str, spec: ModelSpec) -> None:
-    validator = _LOADERS[name].validate_spec
-    if validator is not None:
-        validator(spec)
+def resolve_model_spec(
+    spec: ModelSpec,
+    platform: PlatformCapabilities | None = None,
+) -> ModelSpec:
+    """Select a loader, validate its configuration, and apply platform decisions in place."""
+    if spec.loader is None:
+        spec.loader = resolve_loader_name(spec)
+    elif spec.loader not in _LOADERS:
+        raise ValueError(f"unknown loader {spec.loader!r}")
+
+    entry = _LOADERS[spec.loader]
+    if entry.options is not None:
+        spec.loader_options = entry.options.model_validate(spec.loader_options).model_dump()
+    if entry.validate_spec is not None:
+        entry.validate_spec(spec)
+    return entry.resolve_spec(spec, platform or PlatformCapabilities.detect())
 
 
 def resolve_loader_name(spec: ModelSpec) -> str:
     """Resolve which loader a spec should use: single matching predicate, else the default."""
     ctx = LoaderContext(spec=spec)
     matched = [name for name, entry in _LOADERS.items() if entry.matches is not None and entry.matches(ctx)]
-    assert len(matched) <= 1, f"multiple loaders match: {matched}; set spec.loader to disambiguate"
+    if len(matched) > 1:
+        raise ValueError(f"multiple loaders match: {matched}; set spec.loader to disambiguate")
     if len(matched) == 1:
         return matched[0]
 

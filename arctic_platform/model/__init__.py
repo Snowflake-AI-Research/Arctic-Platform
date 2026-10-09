@@ -32,10 +32,12 @@ from arctic_platform.model.factory import build_model
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
+from arctic_platform.model.loader import resolve_model_spec
 from arctic_platform.model.loader import select_loader
 from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.patch import register_patch
 from arctic_platform.model.patches.peft import apply_peft
+from arctic_platform.model.platform import PlatformCapabilities
 
 # Import built-in loaders and patches for their registration side effects.
 from arctic_platform.model import loaders  # noqa: F401  # isort: skip
@@ -59,5 +61,7 @@ __all__ = [
     "build_model",
     "register_loader",
     "register_patch",
+    "resolve_model_spec",
     "select_loader",
+    "PlatformCapabilities",
 ]

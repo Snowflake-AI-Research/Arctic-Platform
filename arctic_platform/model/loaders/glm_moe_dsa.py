@@ -30,6 +30,7 @@ from arctic_platform.model.implementations.moe.config_validation import validate
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
+from arctic_platform.model.loader import resolve_spec_with_defaults
 
 
 class GlmMoeDsaDebugOptions(BaseModel):
@@ -53,7 +54,7 @@ class GlmMoeDsaOptions(BaseModel):
 
     seq_len: int = Field(4096, gt=0)
     trust_remote_code: bool = True
-    ep_comm_backend: Literal["deepep", "uccl"] = "deepep"
+    ep_comm_backend: Literal["deepep", "uccl"] | None = None
     sparse_mla_backend: Literal["flashmla", "ref", "tilelang", "dense"] = "ref"
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     deepep_token_chunk_size: int | None = Field(None, gt=0)
@@ -82,8 +83,6 @@ def _matches(ctx: LoaderContext) -> bool:
 
 
 def _validate_spec(spec: ModelSpec) -> None:
-    if spec.attn_implementation is None:
-        spec.attn_implementation = "flash_attention_2"
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError("glm_moe_dsa dtype must be 'bfloat16' or 'float32'")
     if spec.parallelism.sequence_parallel > 1:
@@ -106,11 +105,24 @@ def _validate_spec(spec: ModelSpec) -> None:
         raise ValueError("glm_moe_dsa uses loader_options.ac_config and does not support generic forward patches")
 
 
+def _resolve_spec(spec, platform):
+    return resolve_spec_with_defaults(
+        spec,
+        platform,
+        ep_comm_backend="uccl",
+        sp_strategy="native",
+        label_contract="logit_aligned",
+        requires_weight_conversion=True,
+        model_forward_requires_labels=True,
+    )
+
+
 @register_loader(
     "glm_moe_dsa",
     matches=_matches,
     options=GlmMoeDsaOptions,
     validate_spec=_validate_spec,
+    resolve_spec=_resolve_spec,
 )
 def load_glm_moe_dsa(ctx: LoaderContext) -> LoadedModel:
     parallelism = ctx.spec.parallelism

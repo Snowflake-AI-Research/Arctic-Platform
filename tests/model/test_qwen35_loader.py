@@ -24,7 +24,9 @@ from torch import nn
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
+from arctic_platform.model import PlatformCapabilities
 from arctic_platform.model import build_model
+from arctic_platform.model import resolve_model_spec
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
@@ -39,8 +41,30 @@ def test_selection_uses_text_config_not_checkpoint_name(tmp_path, composite):
             "text_config": config,
         }
     (tmp_path / "config.json").write_text(json.dumps(config))
-    spec = ModelSpec(model_path_or_name=str(tmp_path), parallelism=ParallelismConfig(expert_parallel=2))
+    spec = ModelSpec(
+        model_path_or_name=str(tmp_path),
+        parallelism=ParallelismConfig(expert_parallel=2),
+    )
+    resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
     assert spec.loader == "qwen3_5_moe"
+
+
+def test_model_spec_resolution_uses_platform_attention_and_deepep(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe"}))
+    spec = ModelSpec(
+        model_path_or_name=str(tmp_path),
+        parallelism=ParallelismConfig(expert_parallel=2),
+    )
+
+    resolved = resolve_model_spec(
+        spec,
+        PlatformCapabilities.for_accelerator("hopper"),
+    )
+
+    assert resolved.attn_implementation == "flash_attention_3"
+    assert resolved.ep_comm_backend == "deepep"
+    assert resolved.sp_strategy == "native"
+    assert resolved.label_contract == "logit_aligned"
 
 
 @pytest.mark.parametrize("backend", ["deepep", "uccl"])
@@ -66,10 +90,22 @@ def test_loader_preserves_options_and_process_groups(monkeypatch, backend):
             "tiled_mlp_token_chunk_size": 32,
             "weight_conversion_cache_dir": "",
             "trust_remote_code": True,
-            "ac_config": {"offload_config": {"pin_memory_enabled": False, "pin_memory_max_size_gib": 0}},
+            "ac_config": {
+                "offload_config": {
+                    "pin_memory_enabled": False,
+                    "pin_memory_max_size_gib": 0,
+                }
+            },
         },
     )
-    result = build_model(spec, parallel_groups={"ep_group": ep_group, "sp_group": sp_group})
+    result = build_model(
+        spec,
+        parallel_groups={"ep_group": ep_group, "sp_group": sp_group},
+        platform=PlatformCapabilities.for_accelerator(
+            "hopper",
+            ep_comm_backends=frozenset({backend}),
+        ),
+    )
     assert result.model is model
     assert seen["ep_group"] is ep_group and seen["sp_group"] is sp_group
     assert seen["ep_size"] == seen["sp_size"] == 2
@@ -113,8 +149,9 @@ def test_liger_fused_cross_entropy_allows_fp32_lm_head():
     ],
 )
 def test_spec_cannot_silently_ignore_settings(kwargs):
+    spec = ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", **kwargs)
     with pytest.raises(ValueError):
-        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", **kwargs)
+        resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
 
 
 def test_runtime_groups_are_required():
@@ -130,13 +167,21 @@ def test_sequence_parallel_group_is_required():
         parallelism=ParallelismConfig(expert_parallel=2, sequence_parallel=2),
     )
     with pytest.raises(ValueError, match="sp_group"):
-        build_model(spec, parallel_groups={"ep_group": object()})
+        build_model(
+            spec,
+            parallel_groups={"ep_group": object()},
+            platform=PlatformCapabilities.for_accelerator(
+                "hopper",
+                ep_comm_backends=frozenset({"deepep"}),
+            ),
+        )
 
 
 @pytest.mark.parametrize("patches", [Patches(gradient_checkpointing=True), Patches(zorro_train={})])
 def test_generic_forward_patches_are_rejected(patches):
+    spec = ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", patches=patches)
     with pytest.raises(ValueError, match="generic forward patches"):
-        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", patches=patches)
+        resolve_model_spec(spec, PlatformCapabilities.for_accelerator("hopper"))
 
 
 def test_activation_offload_defaults_to_disabled():
