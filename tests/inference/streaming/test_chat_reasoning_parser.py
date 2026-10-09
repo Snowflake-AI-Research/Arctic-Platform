@@ -361,11 +361,25 @@ def test_chat_support_is_reported_per_model(
 ):
     from arctic_platform.inference.server import chat as chat_module
 
-    monkeypatch.setattr(chat_module, "ChatEngine", lambda llm, model: object())
+    monkeypatch.setattr(
+        chat_module, "ChatEngine", lambda llm, model: SimpleNamespace(has_chat_template=True)
+    )
     fake_vllm["architecture"] = architecture
     worker = start_worker(**engine_kwargs)
 
     assert worker.get_chat_support() == support
+
+
+def test_chat_support_is_false_without_a_chat_template(fake_vllm, monkeypatch):
+    from arctic_platform.inference.server import chat as chat_module
+
+    monkeypatch.setattr(
+        chat_module, "ChatEngine", lambda llm, model: SimpleNamespace(has_chat_template=False)
+    )
+    fake_vllm["architecture"] = "Qwen3ForCausalLM"
+    worker = start_worker()
+
+    assert worker.get_chat_support() == {"chat_prompt": False, "thinking_optional": False}
 
 
 def test_chat_support_is_false_when_the_chat_front_end_cannot_be_built(

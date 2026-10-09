@@ -126,8 +126,9 @@ vLLM, which picks DeepSeek-V4's by architecture.
 reports `{"chat_prompt": bool, "thinking_optional": bool}` for a loaded model:
 whether its streams take a `ChatPrompt`, and whether thinking can be turned off.
 It builds the worker's chat front end, so `chat_prompt` is false when that
-fails; a model with no chat template still reports true and its streams fail
-with `chat_unsupported`.
+fails, and when vLLM finds no chat template for the model (in the tokenizer,
+the processor or vLLM's fallbacks; gpt-oss and DeepSeek-V4 render without
+one). Streams on such a model fail with `chat_unsupported`.
 
 The chat reasoning parser applies to chat streams only. The job's
 `reasoning_parser` also changes `/generate` (it prefills `<think>` for

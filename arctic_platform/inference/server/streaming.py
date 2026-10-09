@@ -958,8 +958,10 @@ class StreamingWorkerMixin:
     def get_chat_support(self):
         """Whether this model takes chat prompts, and whether its thinking can be turned off."""
         try:
-            self._chat_engine()
+            engine = self._chat_engine()
         except StreamError:
+            engine = None
+        if engine is None or not engine.has_chat_template:
             return {"chat_prompt": False, "thinking_optional": False}
         return {"chat_prompt": True, "thinking_optional": self._chat_model.thinking_optional}
 

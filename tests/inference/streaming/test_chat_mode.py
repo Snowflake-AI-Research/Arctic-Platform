@@ -1007,6 +1007,46 @@ def test_reasoning_effort_is_mapped_for_the_template(monkeypatch):
     assert rendered.request.reasoning_effort == "xhigh"
 
 
+class _HfRenderer:
+    pass
+
+
+@pytest.mark.parametrize(
+    "renderer,template,harmony,expected",
+    [
+        (_HfRenderer(), "{{ messages }}", False, True),
+        (_HfRenderer(), None, False, False),
+        # Harmony and non-HF renderers (DeepSeek-V4's) build prompts in code.
+        (_HfRenderer(), None, True, True),
+        (object(), None, False, True),
+    ],
+)
+def test_chat_engine_knows_whether_the_model_has_a_chat_template(
+    monkeypatch, renderer, template, harmony, expected
+):
+    import sys
+    import types
+
+    from arctic_platform.inference.server.chat import has_chat_template
+
+    module = types.ModuleType("vllm.renderers.hf")
+    module.HfRenderer = _HfRenderer
+    resolved = []
+
+    def resolve_chat_template(tokenizer, chat_template, tools, *, model_config):
+        resolved.append((tokenizer, chat_template, tools, model_config))
+        return template
+
+    module.resolve_chat_template = resolve_chat_template
+    monkeypatch.setitem(sys.modules, "vllm.renderers", types.ModuleType("vllm.renderers"))
+    monkeypatch.setitem(sys.modules, "vllm.renderers.hf", module)
+
+    assert has_chat_template(renderer, "tok", "config", harmony=harmony) is expected
+    if isinstance(renderer, _HfRenderer) and not harmony:
+        # vLLM's own lookup: tokenizer, processor, then its fallback templates.
+        assert resolved == [("tok", None, None, "config")]
+
+
 class ChatSupportWorker:
     def __init__(self, support):
         self.support = support

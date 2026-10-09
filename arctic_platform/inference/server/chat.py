@@ -116,6 +116,16 @@ def without_tool_parser(parser_cls):
     return type(parser_cls.__name__, (parser_cls,), {"tool_parser_cls": None})
 
 
+def has_chat_template(renderer, tokenizer, model_config, *, harmony):
+    """Whether vLLM finds a chat template to render this model's prompts with."""
+    from vllm.renderers.hf import HfRenderer, resolve_chat_template
+
+    if harmony or not isinstance(renderer, HfRenderer):
+        # Harmony and the other renderers (DeepSeek-V4's) build prompts in code.
+        return True
+    return resolve_chat_template(tokenizer, None, None, model_config=model_config) is not None
+
+
 class ChatInputError(ValueError):
     """A chat request the model cannot take; ``param`` names the offending field."""
 
@@ -267,6 +277,9 @@ class ChatEngine:
         # The renderer's own unified Parser class, so rendering and parsing agree.
         self.parser_cls = self.online.parser
         self.guard = SpecialTokenGuard.from_tokenizer(self.tokenizer)
+        self.has_chat_template = has_chat_template(
+            llm.renderer, self.tokenizer, llm.model_config, harmony=self.harmony
+        )
 
     async def render(self, prompt):
         from jinja2 import TemplateError
