@@ -194,9 +194,18 @@ Cortex packs several sequences into one micro-batch. Models with linear
 
 Cookbook source is unchanged. Where a published command names another model, the run below uses `Qwen/Qwen3.5-4B` and leaves the rest of that command as published. Hardware for these runs is 4 training GPUs and 4 sampling GPUs, one H200 node. `rl_loop` and `sl_loop` call synchronous `forward_backward`, which is listed under limitations.
 
-### Qwen3.5-4B, published GSM8K command
+### Qwen3.5-4B, published commands
 
-`tinker_cookbook.recipes.math_rl.train env=gsm8k group_size=64 groups_per_batch=32 learning_rate=8e-5 max_tokens=1024`, with the model set to `Qwen/Qwen3.5-4B` instead of `Qwen/Qwen3.5-9B`. 211 steps.
+Finished runs. The model is `Qwen/Qwen3.5-4B`. The other arguments are the published command, or the recipe defaults when that command already names this model.
+
+| Recipe | Command | Steps | Result |
+|---|---|---|---|
+| GSM8K | `env=gsm8k group_size=64 groups_per_batch=32 learning_rate=8e-5 max_tokens=1024` | 211 | reward 0.549 → 0.999, correct 0.617 → 0.999. Reward is 0.837 at step 3. KL stays near 0.0002 |
+| MATH | `env=math group_size=16 groups_per_batch=64 learning_rate=2e-5 max_tokens=512` | 11 | reward −0.045 → 0.142, correct 0.055 → 0.234. KL stays near 0.0002 |
+| arithmetic | `group_size=4 groups_per_batch=100 learning_rate=1e-4`, `max_tokens` left at 5 | 25 | reward −0.100 → 0.000, correct stayed 0 |
+| guess-number | recipe defaults (`batch_size=32`, `group_size=8`, `max_tokens=64`, `learning_rate=3e-5`) | 10 | reward −0.086 → 0.688 |
+
+GSM8K detail:
 
 | Step | Reward | Correct | KL sample/train |
 |---|---|---|---|
@@ -205,9 +214,7 @@ Cookbook source is unchanged. Where a published command names another model, the
 | 5 | 0.946 | 0.951 | 0.00015 |
 | 210 | 0.999 | 0.999 | 0.00020 |
 
-Reward is above 0.8 at step 3. The cookbook's note for the 9B command is that training reward should pass 0.8 within a few steps.
-
-A separate arithmetic run used group size 8, 32 groups, 64 tokens, and thinking disabled. Reward went from 0.067 at step 0 to 1.0 at step 2. The published arithmetic command (`groups_per_batch=100`, `max_tokens=5`, learning rate `1e-4`) is the run still in the queue.
+Polaris is still running on the same MATH arguments with `env=polaris`. After 38 steps the reward is still −0.10.
 
 ### Five steps, same short arguments on Cortex and the Tinker API
 
