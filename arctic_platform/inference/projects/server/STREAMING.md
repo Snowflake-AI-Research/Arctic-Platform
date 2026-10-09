@@ -163,7 +163,9 @@ on such a checkpoint streams reasoning as content; an explicit
   `reasoning_delta` (`token_count` only, never the reasoning text) and
   `tool_call_delta` (`index`, `arguments`, plus `id` and `name` on a call's first
   event). Markup the parser is still matching emits nothing until it resolves.
-  `parallel_tool_calls=false` keeps only the first call.
+  `parallel_tool_calls=false` keeps only the first call. Tool calls are parsed
+  only when the prompt has `tools`; without them, tool-call markup the model
+  writes is content (gpt-oss drops a Harmony tool message instead).
 - The engine detokenizes as the parsers ask: `skip_special_tokens` and
   `spaces_between_special_tokens` come from the request after the parsers'
   `adjust_request`, as in vllm serve, so tool and reasoning markup made of

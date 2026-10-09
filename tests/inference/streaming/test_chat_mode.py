@@ -788,7 +788,12 @@ class _ChatRequest(SimpleNamespace):
 
     def __init__(self, **fields):
         super().__init__(
-            skip_special_tokens=True, spaces_between_special_tokens=True, tools=None, **fields
+            **{
+                "skip_special_tokens": True,
+                "spaces_between_special_tokens": True,
+                "tools": None,
+                **fields,
+            }
         )
 
     def extract_structured_outputs(self):
@@ -901,6 +906,9 @@ def test_model_without_a_chat_template_is_chat_unsupported(monkeypatch, caplog):
 class _ProbedParser:
     """Stands in for vLLM's unified Parser at render time."""
 
+    reasoning_parser_cls = object
+    tool_parser_cls = None
+
     def __init__(self, tokenizer, tools, **kwargs):
         self.reasoning_parser = object()
 
@@ -916,6 +924,68 @@ def _rendered(monkeypatch, architecture, harmony=False, **fields):
     engine.parser_cls = _ProbedParser
     engine.tokenizer = None
     return asyncio.run(engine.render(chat("hi", **fields)))
+
+
+class _UnifiedScriptParser(ScriptParser):
+    """Built like vLLM's unified Parser: its parts come from class attributes."""
+
+    reasoning_parser_cls = object
+    tool_parser_cls = object
+
+    def __init__(self, tokenizer, tools, **kwargs):
+        super().__init__()
+        self.reasoning_parser = self.reasoning_parser_cls and self.reasoning_parser_cls()
+        self.tool_parser = self.tool_parser_cls and self.tool_parser_cls()
+
+    @staticmethod
+    def is_reasoning_end(prompt_token_ids):
+        return False
+
+    def parse_delta(self, delta_text, *args, **kwargs):
+        if self.tool_parser is None and self.mode != "reasoning" and "tool" in delta_text:
+            return self._message(content=delta_text)
+        return super().parse_delta(delta_text, *args, **kwargs)
+
+
+WEATHER_TOOL = {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
+
+
+@pytest.mark.parametrize(
+    "tools,finish_reason", [(None, "stop"), ([WEATHER_TOOL], "tool_calls")]
+)
+def test_tool_markup_is_content_unless_the_prompt_offers_tools(monkeypatch, tools, finish_reason):
+    # vllm serve parses tool calls whenever a tool parser is configured; with
+    # no tools offered, OpenAI returns what the model wrote as content.
+    engine = _engine_whose_parser_adjusts(monkeypatch, lambda request: None)
+    engine.parser_cls = _UnifiedScriptParser
+    engine.tokenizer = None
+    _, events = stream(chat("Weather in Paris?", tools=tools), script=TOOL_CALL, chat_engine=engine)
+
+    content = "".join(e["text"] for e in events if e["type"] == "content_delta")
+    calls = [e for e in events if e["type"] == "tool_call_delta"]
+    if tools is None:
+        assert content == '<tool:get_weather>{"city": "Paris"}</tool>'
+        assert calls == []
+    else:
+        assert content == ""
+        assert calls[0]["name"] == "get_weather"
+    [finish] = [e for e in events if e["type"] == "choice_finished"]
+    assert finish["finish_reason"] == finish_reason
+
+
+def test_a_parser_without_its_tool_half_keeps_its_reasoning_half():
+    from arctic_platform.inference.server.chat import without_tool_parser
+
+    reasoning_only = without_tool_parser(_UnifiedScriptParser)
+    assert reasoning_only.reasoning_parser_cls is object
+    assert reasoning_only.tool_parser_cls is None
+    assert without_tool_parser(_UnifiedScriptParser) is reasoning_only
+
+    class ToolsOnly(_UnifiedScriptParser):
+        reasoning_parser_cls = None
+
+    assert without_tool_parser(ToolsOnly) is None
+    assert without_tool_parser(None) is None
 
 
 def test_harmony_always_starts_in_reasoning(monkeypatch):

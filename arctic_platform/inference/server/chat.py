@@ -9,6 +9,7 @@ kwargs override it. Chat parses with the engine's reasoner when it has one.
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 from dataclasses import dataclass, field, replace
@@ -97,6 +98,22 @@ def resolve_chat_model(architecture, *, reasoning_parser=None, tool_call_parser=
     if tool_call_parser is not None:
         model = replace(model, tool_call_parser=tool_call_parser)
     return model
+
+
+@functools.cache
+def without_tool_parser(parser_cls):
+    """``parser_cls`` (a vLLM unified Parser class) with no tool parser, or None if nothing is left.
+
+    vllm serve parses tool calls whenever a tool parser is configured, so a
+    model that writes tool-call markup unprompted would get a tool call and
+    finish with ``tool_calls`` though no tools were offered.
+    """
+    if parser_cls is None or parser_cls.tool_parser_cls is None:
+        return parser_cls
+    if parser_cls.reasoning_parser_cls is None:
+        return None
+    # Parser.__init__ builds its parts from these class attributes.
+    return type(parser_cls.__name__, (parser_cls,), {"tool_parser_cls": None})
 
 
 class ChatInputError(ValueError):
@@ -293,7 +310,9 @@ class ChatEngine:
         prompt_tokens = extract_prompt_len(self.model_config, engine_input)
 
         generate_kwargs = {}
-        if self.parser_cls is None:
+        # Without tools, tool-call markup the model writes is content, as OpenAI returns it.
+        parser_cls = self.parser_cls if request.tools else without_tool_parser(self.parser_cls)
+        if parser_cls is None:
             def new_parser():
                 return None
         else:
@@ -302,7 +321,7 @@ class ChatEngine:
             ).chat_template_kwargs
 
             def new_parser():
-                return self.parser_cls(
+                return parser_cls(
                     self.tokenizer,
                     request.tools,
                     chat_template_kwargs=chat_template_kwargs,
