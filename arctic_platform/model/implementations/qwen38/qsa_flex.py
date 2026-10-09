@@ -201,6 +201,8 @@ def _qsa_indexer_forward(
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
     attention_mask: torch.Tensor | None,
     past_key_values=None,
+    position_ids=None,
+    cu_seqlens=None,
 ) -> torch.Tensor:
     if past_key_values is not None and past_key_values.get_seq_length() > 0:
         raise NotImplementedError("Qwen3.8 QSA FlexAttention cache decoding is handled by the inference backend")
@@ -230,29 +232,48 @@ def _qsa_indexer_forward(
     )
 
     global_raw_key = _gather_sequence_no_grad(raw_key, cp_group)
-    global_cos = _gather_sequence_no_grad(local_cos[:, -local_sequence_length:], cp_group)
-    global_sin = _gather_sequence_no_grad(local_sin[:, -local_sequence_length:], cp_group)
-    global_sequence_length = global_raw_key.shape[1]
-    num_blocks = global_sequence_length // self.compress_ratio
-    grouped_key = global_raw_key[:, : num_blocks * self.compress_ratio].unflatten(
-        1,
-        (num_blocks, self.compress_ratio),
+    global_cos = _gather_sequence_no_grad(local_cos[:, -local_sequence_length:].expand(batch_size, -1, -1), cp_group)
+    global_sin = _gather_sequence_no_grad(local_sin[:, -local_sequence_length:].expand(batch_size, -1, -1), cp_group)
+    global_positions = _gather_sequence_no_grad(position_ids.expand(batch_size, -1), cp_group)
+    selected = torch.full(
+        (batch_size, local_sequence_length, self.token_budget + self.compress_ratio - 1),
+        -1, dtype=torch.int32, device=hidden_states.device,
     )
-    compressed_key = grouped_key.float().mean(dim=2).to(raw_key.dtype)
-    compressed_key = apply_rotary_pos_emb(
-        self.k_layernorm(compressed_key),
-        cos=global_cos[:, : num_blocks * self.compress_ratio : self.compress_ratio],
-        sin=global_sin[:, : num_blocks * self.compress_ratio : self.compress_ratio],
-        unsqueeze_dim=2,
-    )
-    return select_qsa_token_ids(
-        query,
-        compressed_key,
-        lengths,
-        token_budget=self.token_budget,
-        compress_ratio=self.compress_ratio,
-        query_offset=cp_rank * local_sequence_length,
-    )
+    query_offset = cp_rank * local_sequence_length
+    for batch_idx, length in enumerate(lengths):
+        length = int(length)
+        if cu_seqlens is None:
+            # transformers' packed-sequence rule: a position that does not follow its predecessor by 1 starts a row.
+            row_positions = global_positions[batch_idx, :length]
+            starts = (torch.where(row_positions[1:] - row_positions[:-1] != 1)[0] + 1).tolist()
+        else:
+            starts = [start for start in cu_seqlens[1:-1].tolist() if 0 < start < length]
+        boundaries = [0, *starts, length]
+        for start, end in zip(boundaries, boundaries[1:]):
+            local_start = max(start, query_offset)
+            local_end = min(end, query_offset + local_sequence_length)
+            if local_start >= local_end:
+                continue
+            num_blocks = (end - start) // self.compress_ratio
+            stop = start + num_blocks * self.compress_ratio
+            grouped_key = global_raw_key[batch_idx:batch_idx + 1, start:stop].unflatten(
+                1, (num_blocks, self.compress_ratio),
+            )
+            compressed_key = grouped_key.float().mean(dim=2).to(raw_key.dtype)
+            compressed_key = apply_rotary_pos_emb(
+                self.k_layernorm(compressed_key),
+                cos=global_cos[batch_idx:batch_idx + 1, start:stop:self.compress_ratio],
+                sin=global_sin[batch_idx:batch_idx + 1, start:stop:self.compress_ratio],
+                unsqueeze_dim=2,
+            )
+            query_slice = slice(local_start - query_offset, local_end - query_offset)
+            routes = select_qsa_token_ids(
+                query[batch_idx:batch_idx + 1, query_slice], compressed_key,
+                lengths.new_tensor([end - start]), token_budget=self.token_budget,
+                compress_ratio=self.compress_ratio, query_offset=local_start - start,
+            )
+            selected[batch_idx:batch_idx + 1, query_slice] = torch.where(routes >= 0, routes + start, routes)
+    return selected
 
 
 @functools.cache
@@ -452,13 +473,18 @@ def _qsa_attention_forward(
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
     attention_mask: torch.Tensor | None,
     past_key_values=None,
+    qsa_position_ids=None,
     **_kwargs,
 ):
     if self.training and self.attention_dropout:
         raise ValueError("Qwen3.8 QSA FlexAttention does not support attention dropout")
     from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
 
-    selected_token_ids = self.indexer(hidden_states, position_embeddings, attention_mask, past_key_values)
+    # Packed-row boundaries from the caller's varlen metadata, when given, outrank boundaries inferred from positions.
+    selected_token_ids = self.indexer(
+        hidden_states, position_embeddings, attention_mask, past_key_values, qsa_position_ids,
+        _kwargs.get("cu_seq_lens_q"),
+    )
     position_embeddings = tuple(value[:, -hidden_states.shape[1] :] for value in position_embeddings)
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
@@ -496,6 +522,24 @@ def _qsa_attention_forward(
 def apply_qsa_flex(model: nn.Module) -> None:
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextAttention
 
+    from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+    backbone = get_language_model(model)
+    original_forward = backbone.forward
+
+    def forward(self, *args, **kwargs):
+        positions = kwargs.get("position_ids", args[2] if len(args) > 2 else None)
+        if positions is None:
+            input_tensor = kwargs.get("input_ids", args[0] if args else None)
+            if input_tensor is None:
+                input_tensor = kwargs["inputs_embeds"]
+            positions = torch.arange(input_tensor.shape[1], device=input_tensor.device)[None, :]
+        if positions.ndim == 3:
+            positions = positions[0]
+        kwargs["qsa_position_ids"] = positions
+        return original_forward(*args, **kwargs)
+
+    backbone.forward = types.MethodType(forward, backbone)
     register_qsa_flex_backend()
     patched = 0
     for module in model.modules():
