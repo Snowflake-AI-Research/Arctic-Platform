@@ -33,7 +33,7 @@ MAX_SCHEMA_BYTES = 64 * 1024
 # Bounds xgrammar compile work, which grows with nesting; real schemas nest a
 # handful of levels.
 MAX_SCHEMA_DEPTH = 64
-# Prefixes of vLLM 0.30.0's structured-output validation errors, from
+# Prefixes of vLLM 0.31.0's structured-output validation errors, from
 # vllm/v1/structured_output/backend_{xgrammar,guidance,outlines}.py. vLLM raises
 # a bare VLLMValidationError with no parameter for these, so only the message
 # identifies them. With the default "auto" backend a schema xgrammar rejects
@@ -52,7 +52,7 @@ STRUCTURED_OUTPUT_ERRORS = (
     "Regex uses unsupported feature for structured outputs: ",
     "Regex does not have a anchored universal start state",
 )
-# Prefixes of vLLM 0.30.0's sampling-parameter errors that carry no parameter:
+# Prefixes of vLLM 0.31.0's sampling-parameter errors that carry no parameter:
 # logit_bias on a speculative-decoding deployment, and a thinking budget on a
 # model without a reasoning parser.
 SAMPLING_PARAM_ERRORS = (
