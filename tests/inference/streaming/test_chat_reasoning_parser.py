@@ -26,6 +26,11 @@ THINK, END_THINK = 10, 11
 # A tokenizer whose vocabulary has no think tokens.
 NO_THINK_TOKENS = "no-think-tokenizer"
 THINK_TOKENS_MISSING = "reasoning parser could not locate think start/end tokens in the tokenizer!"
+# A tokenizer the parser builds on but finds no think tokens in, as vLLM's
+# MiniMaxM2AppendThinkReasoningParser does (minimax_m2_reasoning_parser.py:34).
+THINK_IDS_NONE = "think-ids-none-tokenizer"
+# A tokenizer the parser rejects with some other message.
+REWORDED_ERROR = "reworded-error-tokenizer"
 
 
 class FakeReasoningParser:
@@ -37,6 +42,10 @@ class FakeReasoningParser:
         if tokenizer == NO_THINK_TOKENS:
             # As vLLM's BaseThinkingReasoningParser (reasoning/basic_parsers.py:64).
             raise RuntimeError(f"FakeReasoningParser {THINK_TOKENS_MISSING}")
+        if tokenizer == REWORDED_ERROR:
+            raise RuntimeError("FakeReasoningParser found no reasoning markers")
+        if tokenizer == THINK_IDS_NONE:
+            self.start_token_id = self.end_token_id = None
         self.tokenizer = tokenizer
 
     def is_reasoning_end(self, token_ids):
@@ -517,6 +526,20 @@ def test_a_tables_reasoner_the_tokenizer_can_run_is_kept(fake_vllm, monkeypatch)
     assert chat_parsers(monkeypatch, worker) == ("qwen3", "hermes")
 
 
+@pytest.mark.parametrize("tokenizer", [THINK_IDS_NONE, REWORDED_ERROR])
+def test_a_tables_reasoner_is_left_out_however_the_parser_reports_missing_tokens(
+    fake_vllm, monkeypatch, caplog, tokenizer
+):
+    fake_vllm["architecture"] = "Qwen3ForCausalLM"
+    fake_vllm["tokenizer"] = tokenizer
+    with caplog.at_level("WARNING"):
+        worker = start_worker()
+
+    assert fake_vllm["reasoner_at_engine_start"] == ""
+    assert chat_parsers(monkeypatch, worker) == (None, "hermes")
+    assert any("qwen3" in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+
+
 def test_a_dropped_job_reasoning_parser_leaves_chat_without_one_either(fake_vllm, monkeypatch):
     # The job's reasoning_parser is dropped when the tokenizer lacks its think
     # tokens; the table's reasoner for chat needs the same tokens.
@@ -532,5 +555,5 @@ def test_a_dropped_job_reasoning_parser_leaves_chat_without_one_either(fake_vllm
 
 def test_an_explicit_chat_reasoning_parser_the_tokenizer_cannot_run_fails_start(fake_vllm):
     fake_vllm["tokenizer"] = NO_THINK_TOKENS
-    with pytest.raises(ValueError, match="chat_reasoning_parser='qwen3'.*think tokens"):
+    with pytest.raises(ValueError, match="chat_reasoning_parser='qwen3'.*cannot run"):
         start_worker(chat_reasoning_parser="qwen3")

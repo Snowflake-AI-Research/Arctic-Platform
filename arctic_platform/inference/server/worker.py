@@ -127,11 +127,14 @@ def _add_chat_reasoner(
 
 
 def _tokenizer_runs_reasoner(vllm_config: Any, reasoning_parser: str) -> bool:
-    """Whether the tokenizer has the markers ``reasoning_parser`` needs.
+    """Whether ``reasoning_parser`` can run on the model's tokenizer.
 
     vLLM checks the job's reasoning_parser in create_engine_config, but builds
     a structured-output reasoner added afterwards only on the first request
-    with a grammar, so check that one here.
+    with a grammar, so check that one here. A parser that fails to build is
+    unsupported whatever its error says. Most vLLM parsers raise when the think
+    tokens are missing; some build anyway with ``start_token_id`` or
+    ``end_token_id`` left None.
     """
     from vllm.reasoning import ReasoningParserManager
     from vllm.tokenizers import cached_tokenizer_from_config
@@ -140,11 +143,29 @@ def _tokenizer_runs_reasoner(vllm_config: Any, reasoning_parser: str) -> bool:
     if tokenizer is None:
         # skip_tokenizer_init: no tokenizer to check, and no chat to render.
         return True
+    # Outside the try: an unknown parser name is a config error, not a tokenizer one.
+    parser_cls = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
     try:
-        ReasoningParserManager.get_reasoning_parser(reasoning_parser)(tokenizer=tokenizer)
-    except RuntimeError as exc:
-        if "think start/end tokens" not in str(exc):
-            raise
+        parser = parser_cls(tokenizer=tokenizer)
+    except Exception as exc:
+        logger.warning(
+            "reasoning_parser=%r cannot run on this tokenizer (%s: %s)",
+            reasoning_parser,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+    missing = [
+        name
+        for name in ("start_token_id", "end_token_id")
+        if hasattr(parser, name) and getattr(parser, name) is None
+    ]
+    if missing:
+        logger.warning(
+            "reasoning_parser=%r finds no think tokens in this tokenizer (%s is None)",
+            reasoning_parser,
+            ", ".join(missing),
+        )
         return False
     return True
 
@@ -745,11 +766,11 @@ class InferenceWorker(StreamingWorkerMixin):
                 ):
                     if chat_reasoning_parser is not None:
                         raise ValueError(
-                            f"chat_reasoning_parser={chat_reasoning_parser!r} needs think "
-                            "tokens this model's tokenizer lacks"
+                            f"chat_reasoning_parser={chat_reasoning_parser!r} cannot run on "
+                            "this model's tokenizer (it lacks the parser's think tokens)"
                         )
                     logger.warning(
-                        "Tokenizer lacks think tokens; chat runs without reasoning_parser=%r",
+                        "Chat runs without reasoning_parser=%r",
                         chat_model.reasoning_parser,
                     )
                     chat_model = replace(chat_model, reasoning_parser=None)

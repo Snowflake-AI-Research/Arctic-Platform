@@ -170,8 +170,9 @@ fails engine start, since there is one per engine.
 
 A job `reasoning_parser` whose think tokens the tokenizer lacks is dropped with
 a warning (vLLM fails engine creation otherwise). The table's chat reasoner is
-checked against the tokenizer the same way and left out with a warning, so chat
-on such a checkpoint streams reasoning as content; an explicit
+built on the tokenizer at engine start and left out with a warning if building
+it raises any error or leaves its `start_token_id` or `end_token_id` None, so
+chat on such a checkpoint streams reasoning as content; an explicit
 `chat_reasoning_parser` that fails this check fails engine start.
 
 - Before rendering, any string in messages, tools or a named `tool_choice` that
