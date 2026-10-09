@@ -20,8 +20,10 @@ import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch import nn
+from transformers.activations import ACT2FN
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
+from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNormGated
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
 from transformers.models.qwen4_exp.modeling_qwen4_exp import _build_layer_multipliers
 
@@ -102,6 +104,18 @@ class Qwen4ExpSparseMoePrimeRL(MoE):
         return routed_output + shared_output.view_as(hidden_states)
 
 
+class Qwen4ExpTextRMSNormGatedPrimeRL(Qwen4ExpTextRMSNormGated):
+    # vLLM's RMSNormGated computes norm, weight and gate in float32 and rounds once; transformers' rounds before the weight
+    def forward(self, hidden_states: Tensor, gate: Tensor) -> Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight.float() * hidden_states
+        hidden_states = hidden_states * ACT2FN[self.activation](gate.to(torch.float32))
+        return hidden_states.to(input_dtype)
+
+
 class Qwen4ExpForConditionalGenerationPrimeRL(
     Qwen4ExpForConditionalGeneration,
     PreTrainedModelPrimeRL,
@@ -121,6 +135,8 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
                     text_config,
                     use_grouped_mm=use_grouped_mm,
                 )
+            if layer.layer_type == "linear_attention":
+                layer.linear_attn.norm.__class__ = Qwen4ExpTextRMSNormGatedPrimeRL
             if layer.ple is not None:
                 embedding = layer.ple.ple_embedding.ngram_embedding
                 sharded_embedding = EPShardedEmbedding(
