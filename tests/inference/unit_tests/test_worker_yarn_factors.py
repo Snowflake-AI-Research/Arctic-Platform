@@ -68,17 +68,10 @@ def test_generate_factor_validation_slots_and_cache_salt():
             yield SimpleNamespace(outputs=[], prompt_token_ids=[1, 2])
 
     worker.llm = Engine()
-    for factor, salt, expected in [
-        (None, None, None),
-        (1.0, None, None),
-        (1.5, None, "yarn=1.5"),
-        (2.0, "tenant", "tenant;yarn=2.0"),
-    ]:
+    for factor, expected in [(None, None), (1.0, None), (1.5, "yarn=1.5"), (2.0, "yarn=2.0")]:
         params = {"max_tokens": 1, "extra_args": {"other": 9}}
         if factor is not None:
             params["yarn_factor"] = factor
-        if salt:
-            params["cache_salt"] = salt
         original = dict(params)
         asyncio.run(worker.generate([1, 2], params))
         prompt, sampling = calls[-1]

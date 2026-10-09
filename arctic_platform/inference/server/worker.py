@@ -925,7 +925,7 @@ class InferenceWorker(StreamingWorkerMixin):
         sampling_params = dict(sampling_params)
         if "yarn_factor_slot" in (sampling_params.get("extra_args") or {}):
             raise ValueError("yarn_factor_slot is internal; use yarn_factor")
-        cache_salt = sampling_params.pop("cache_salt", None)
+        cache_salt = None
         if "yarn_factor" in sampling_params:
             factor = sampling_params.pop("yarn_factor")
             tables = getattr(self, "_yarn_tables", None)
@@ -939,8 +939,7 @@ class InferenceWorker(StreamingWorkerMixin):
                 sampling_params["extra_args"] = {
                     **(sampling_params.get("extra_args") or {}), "yarn_factor_slot": slot
                 }
-                salt = f"yarn={tables.factors[slot]}"
-                cache_salt = f"{cache_salt};{salt}" if cache_salt else salt
+                cache_salt = f"yarn={tables.factors[slot]}"
         enable_thinking = _optional_bool(
             sampling_params.pop(_ENABLE_THINKING_PARAM_KEY, None),
             name=_ENABLE_THINKING_PARAM_KEY,
