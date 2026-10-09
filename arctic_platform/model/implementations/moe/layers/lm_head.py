@@ -15,7 +15,9 @@ from arctic_platform.model.implementations.gpu.action_masks import slice_action_
 from arctic_platform.model.implementations.gpu.action_masks import slice_lm_head_action_masks
 from arctic_platform.model.implementations.gpu.action_masks import validate_action_mask_targets
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
+from arctic_platform.model.implementations.gpu.lm_head import inv_temperature_for_tokens
 from arctic_platform.model.implementations.gpu.lm_head import safe_chunked_labels
+from arctic_platform.model.implementations.gpu.lm_head import slice_temperature_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.lm_head import validate_lm_head_targets
 from arctic_platform.model.implementations.gpu.packing import IGNORE_INDEX
 
@@ -75,16 +77,11 @@ class FusedOutputLinear(torch.nn.Linear):
                 "whole row before it is split (ensure_next_token_labels in "
                 "dss/ray_dss/jobs/gpu/sp/data_plane.py)."
             )
-        if temperature is None:
-            temperature = torch.ones_like(labels, dtype=torch.float32)
-
         validate_lm_head_targets(labels, vocab_size=int(self.weight.shape[0]))
         b, s, h = hidden_states.shape
+        inv_t = inv_temperature_for_tokens(temperature, b, s, hidden_states.device)
         hidden_states = hidden_states.reshape(b * s, h).contiguous()
         labels, ignore_mask = safe_chunked_labels(labels.reshape(b * s))
-        temperature = temperature.reshape(b * s).contiguous()
-        safe_temperature = temperature.masked_fill(temperature == 0, 1.0)
-        inv_t = safe_temperature.reciprocal()  # [N]
         lm_head_action_masks = filter_lm_head_action_masks(
             action_masks_to_lm_head(action_masks, device=hidden_states.device), ~ignore_mask
         )
@@ -528,7 +525,7 @@ def _patch_model_forward(model: nn.Module) -> None:
         return self.lm_head(
             hidden_states[:, slice_indices, :],
             inherit_lm_head_target_validation(labels, labels[:, slice_indices]) if labels is not None else None,
-            temperature=temperature[:, slice_indices] if temperature is not None else None,
+            temperature=slice_temperature_for_logits_to_keep(temperature, slice_indices),
             dss_force_zero_loss=dss_force_zero_loss,
             **lm_head_kwargs,
         )

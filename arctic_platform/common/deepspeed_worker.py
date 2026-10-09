@@ -419,8 +419,9 @@ class DeepSpeedWorker:
         return_tensors = meta_data.get("worker_return_tensors", False)
 
         # Resolve before selecting a specialized pipeline so class registry
-        # precedence applies equally to SFT and RL names.
-        loss_fn = processing.get("loss_fn", "ap_grpo")
+        # precedence applies equally to SFT and RL names. Do not fill a missing
+        # loss_fn: a backward pass requires the name in processing.
+        loss_fn = processing.get("loss_fn")
         from arctic_platform.common.registry import LOSS_FNS
         from arctic_platform.rl.processors import resolve_loss
         from arctic_platform.sft.processor import SFT_LOSS_FNS
