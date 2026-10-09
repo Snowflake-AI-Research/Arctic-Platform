@@ -16,7 +16,8 @@
 """Profile of the ``glm5_next`` loader (GLM-5.3-Flash).
 
 The loader registers ``GenericMoeOptions``, so it extends the ``generic_moe`` profile and overrides only what
-differs.
+differs: it supports ``attention.sparse_mla`` through ``ModelSpec.attn_implementation``, which the loader requires
+to name a sparse MLA backend.
 """
 
 from __future__ import annotations
@@ -30,8 +31,6 @@ def register(registry: Registry) -> None:
     register_profile(
         "glm5_next",
         extends="generic_moe",
-        unsupported={
-            "attention.sparse_mla": "no loader option; the sparse MLA kernel follows `ModelSpec.attn_implementation`",
-        },
+        supports=["attention.sparse_mla"],
         registry=registry,
     )

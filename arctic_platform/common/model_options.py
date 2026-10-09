@@ -154,7 +154,7 @@ def register(registry: Registry) -> None:
         runs_in="trainer",
         goal="speed",
         why="The sparse MLA attention kernel.",
-        source="`loader_options.sparse_mla_backend`",
+        source="`loader_options.sparse_mla_backend`; `ModelSpec.attn_implementation` on glm5_next",
         registry=registry,
     )
     register_option(

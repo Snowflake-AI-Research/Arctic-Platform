@@ -16,9 +16,10 @@
 """The model profiles match the loaders. CPU only.
 
 Each option key maps to its loader-side name: a field path under ``ModelSpec`` (its ``Patches`` and its own
-fields) for the ``huggingface`` loader, and a field path under the loader's options model for the custom loaders.
-A profile ``supports`` a key exactly when the mapped field exists, and a key with no loader-side name is never
-``supports``. Every registered loader has a profile named after it.
+fields) for the ``huggingface`` loader, and for the custom loaders either a field path under the loader's options
+model or, prefixed with ``ModelSpec.``, a ``ModelSpec`` field that the loader accepts and validates. A profile
+``supports`` a key exactly when the mapped field exists, and a key with no loader-side name is never ``supports``.
+Every registered loader has a profile named after it.
 """
 
 from __future__ import annotations
@@ -62,7 +63,8 @@ HUGGINGFACE_FIELDS: dict[str, str | None] = {
     "zorro_train": "patches.zorro_train",
 }
 
-# Field paths under a custom loader's options model (``ModelSpec.loader_options``). None: no loader-side name.
+# For the custom loaders: a field path under the loader's options model (``ModelSpec.loader_options``), or a
+# ``ModelSpec.``-prefixed path for a ``ModelSpec`` field the loader accepts. None: no loader-side name.
 LOADER_OPTION_FIELDS: dict[str, str | None] = {
     "checkpointing.mode": "ac_config.mode",
     "checkpointing.freq": "ac_config.freq",
@@ -78,13 +80,22 @@ LOADER_OPTION_FIELDS: dict[str, str | None] = {
     "moe.comm_backend": "ep_comm_backend",
     "moe.comm_sms": "deepep_num_sms",
     "moe.comm_token_chunk": "deepep_token_chunk_size",
-    "attention.backend": None,
+    "attention.backend": "ModelSpec.attn_implementation",
     "attention.sparse_mla": "sparse_mla_backend",
     "numerics.reduce_dtype": "reduce_dtype",
     "compile.fullgraph": None,
     "peft": None,
     "zorro_train": None,
 }
+
+
+# Per-loader entries that differ from ``LOADER_OPTION_FIELDS``. ``glm5_next`` picks its sparse MLA kernel through
+# ``attn_implementation``, which ``_validate_glm5_next`` requires to name a sparse MLA backend.
+LOADER_FIELD_OVERRIDES: dict[str, dict[str, str | None]] = {
+    "glm5_next": {"attention.sparse_mla": "ModelSpec.attn_implementation"},
+}
+
+_MODEL_SPEC_PREFIX = "ModelSpec."
 
 
 def _model_classes(annotation: typing.Any) -> list[type[BaseModel]]:
@@ -110,10 +121,20 @@ def _field_exists(root: type[BaseModel] | None, path: str | None) -> bool:
     return True
 
 
-def _loader_side(name: str) -> tuple[type[BaseModel] | None, dict[str, str | None]]:
+def _mapped_field_exists(name: str, key: str) -> bool:
+    """Whether the loader-side name that ``key`` maps to exists for loader ``name``."""
     if name == HUGGINGFACE:
-        return ModelSpec, HUGGINGFACE_FIELDS
-    return loader_mod._LOADERS[name].options, LOADER_OPTION_FIELDS
+        return _field_exists(ModelSpec, HUGGINGFACE_FIELDS[key])
+    path = LOADER_FIELD_OVERRIDES.get(name, {}).get(key, LOADER_OPTION_FIELDS[key])
+    if path is not None and path.startswith(_MODEL_SPEC_PREFIX):
+        return _field_exists(ModelSpec, path.removeprefix(_MODEL_SPEC_PREFIX))
+    return _field_exists(loader_mod._LOADERS[name].options, path)
+
+
+def _mapped_path(name: str, key: str) -> str | None:
+    if name == HUGGINGFACE:
+        return HUGGINGFACE_FIELDS[key]
+    return LOADER_FIELD_OVERRIDES.get(name, {}).get(key, LOADER_OPTION_FIELDS[key])
 
 
 def test_mapping_tables_cover_every_key():
@@ -127,10 +148,16 @@ def test_every_mapped_name_exists_somewhere():
     for key, path in HUGGINGFACE_FIELDS.items():
         if path is not None:
             assert _field_exists(ModelSpec, path), (key, path)
-    custom_roots = [entry.options for name, entry in loader_mod._LOADERS.items() if name != HUGGINGFACE]
+    custom = [name for name in loader_mod._LOADERS if name != HUGGINGFACE]
     for key, path in LOADER_OPTION_FIELDS.items():
         if path is not None:
-            assert any(_field_exists(root, path) for root in custom_roots), (key, path)
+            assert any(_mapped_field_exists(name, key) for name in custom), (key, path)
+    for name, overrides in LOADER_FIELD_OVERRIDES.items():
+        assert name in loader_mod._LOADERS, name
+        for key, path in overrides.items():
+            assert key in LOADER_OPTION_FIELDS, key
+            if path is not None:
+                assert _mapped_field_exists(name, key), (name, key, path)
 
 
 def test_profile_names_equal_loader_names():
@@ -139,13 +166,27 @@ def test_profile_names_equal_loader_names():
 
 @pytest.mark.parametrize("name", sorted(loader_mod._LOADERS))
 def test_supports_exactly_when_loader_field_exists(name):
-    root, fields = _loader_side(name)
     cells = settle(name)
     mismatches = []
-    for key, path in fields.items():
+    for key in LOADER_OPTION_FIELDS:
+        path = _mapped_path(name, key)
         supported = cells[key].status == SUPPORTS
-        if supported != _field_exists(root, path):
-            mismatches.append(f"{key}: profile says {cells[key].status}, loader field {path!r} on {root}")
+        if supported != _mapped_field_exists(name, key):
+            mismatches.append(f"{key}: profile says {cells[key].status}, loader-side name {path!r}")
         if path is None:
             assert not supported, key
     assert mismatches == []
+
+
+@pytest.mark.parametrize("name", sorted(loader_mod._LOADERS))
+def test_attention_backend_is_supported_through_model_spec(name):
+    """Every loader takes ``ModelSpec.attn_implementation`` (revision 2 of the design)."""
+    assert _mapped_path(name, "attention.backend") in ("attn_implementation", "ModelSpec.attn_implementation")
+    assert settle(name)["attention.backend"].status == SUPPORTS
+
+
+def test_sparse_mla_supported_on_both_glm_loaders_only():
+    supported = {name for name in loader_mod._LOADERS if settle(name)["attention.sparse_mla"].status == SUPPORTS}
+    assert supported == {"glm_moe_dsa", "glm5_next"}
+    assert _mapped_path("glm_moe_dsa", "attention.sparse_mla") == "sparse_mla_backend"
+    assert _mapped_path("glm5_next", "attention.sparse_mla") == "ModelSpec.attn_implementation"
