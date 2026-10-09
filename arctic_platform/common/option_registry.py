@@ -57,7 +57,9 @@ NOT_APPLICABLE: Status = "not_applicable"
 # A lowercase dotted path (``lm_head.fp32``) or a single word (``liger``).
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$")
 _WILDCARD = "*"
-_TODO = "TODO"
+# The placeholder a scaffolded profile starts with: ``TODO`` as the first word, such as ``TODO`` or
+# ``TODO: decide``. Case-sensitive, so a reason that merely starts with the word "Todo" passes.
+_TODO_MARKER = re.compile(r"TODO\b")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MATRIX_PATH = _REPO_ROOT / "docs" / "models" / "matrix.md"
@@ -132,13 +134,25 @@ def _loaded(registry: Registry | None) -> Registry:
     The built-in modules register through an explicit ``register(REGISTRY)`` call rather than as an import side
     effect, so this module's ``REGISTRY`` is filled even when it runs as ``__main__`` or after a test has dropped
     ``arctic_platform.common`` modules from ``sys.modules``.
+
+    The built-ins register into a staging registry that is merged in only once every module succeeded, so a failed
+    load raises again on every read instead of leaving a half-filled registry behind.
     """
     if registry is not None:
         return registry
     if not REGISTRY.builtins_registered:
-        REGISTRY.builtins_registered = True
+        staging = Registry()
         for module in _BUILTIN_MODULES:
-            importlib.import_module(module).register(REGISTRY)
+            importlib.import_module(module).register(staging)
+        for key in staging.option_entries:
+            if key in REGISTRY.option_entries:
+                raise ValueError(f"option {key!r} already registered")
+        for name in staging.profile_entries:
+            if name in REGISTRY.profile_entries:
+                raise ValueError(f"profile {name!r} already registered")
+        REGISTRY.option_entries.update(staging.option_entries)
+        REGISTRY.profile_entries.update(staging.profile_entries)
+        REGISTRY.builtins_registered = True
     return REGISTRY
 
 
@@ -312,7 +326,7 @@ def _reason_problem(reason: str) -> str | None:
     stripped = reason.strip()
     if len(stripped) == 0:
         return "reason is empty"
-    if stripped.upper().startswith(_TODO):
+    if _TODO_MARKER.match(stripped) is not None:
         return "reason is TODO"
     if "\n" in stripped:
         return "reason must be one line"
@@ -505,7 +519,11 @@ def _cmd_matrix(reg: Registry, write: bool) -> int:
 
 def main(argv: Sequence[str] | None = None, registry: Registry | None = None) -> int:
     """Command line entry point. ``registry`` defaults to the real one."""
-    parser = argparse.ArgumentParser(prog="python -m arctic_platform.common.option_registry", description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="python -m arctic_platform.common.option_registry",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("list", help="list the registered options")
     check_parser = commands.add_parser("check", help="check that every profile settles every option")
