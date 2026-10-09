@@ -19,8 +19,6 @@ MAX_SCHEMA_BYTES = 64 * 1024
 # Bounds xgrammar compile work, which grows with nesting; real schemas nest a
 # handful of levels.
 MAX_SCHEMA_DEPTH = 64
-# Optional features; callers test membership before using one.
-STREAM_CAPABILITIES = frozenset({"sampling_params"})
 # Prefixes of vLLM 0.30.0's structured-output validation errors, from
 # vllm/v1/structured_output/backend_{xgrammar,guidance,outlines}.py. vLLM raises
 # a bare VLLMValidationError with no parameter for these, so only the message

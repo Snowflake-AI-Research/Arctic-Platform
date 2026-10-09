@@ -16,7 +16,6 @@ from arctic_platform.inference.server.streaming import (
     EventBuffer,
     StreamError,
     StreamingWorkerMixin,
-    STREAM_CAPABILITIES,
     StreamLimits,
     classify_engine_error,
     delta_logprobs,
@@ -385,11 +384,6 @@ def test_client_stream_validates_delta_logprobs(logprobs, valid):
     else:
         with pytest.raises(StreamError, match="invalid_choice_event"):
             asyncio.run(accept_delta(event, requested=2))
-
-
-def test_capability_is_advertised():
-    # DSS enables these fields only when the installed version lists it.
-    assert "sampling_params" in STREAM_CAPABILITIES
 
 
 def test_client_stream_rejects_logprobs_nobody_requested():
