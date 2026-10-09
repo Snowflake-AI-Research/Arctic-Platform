@@ -6,8 +6,9 @@ recipe's existing `import tinker` lines use Cortex. There is no local Tinker
 server and no `TINKER_BASE_URL`.
 
 GPU counts are arguments on the launcher, the same ones the Cortex client CLI
-takes (`--training-gpus`, `--sampling-gpus`). Connection settings stay in
-`ARCTIC_CORTEX_*`.
+takes (`--training-gpus`, `--sampling-gpus`). The connection is `ARCTIC_CORTEX_*`,
+or a Snowflake connection profile in `~/.snowflake/connections.toml` when those
+variables are unset.
 
 `python -m tinker_cookbook...` never runs a user import first, so start the
 recipe through `python -m arctic_platform.integrations.tinker.run`. A script you own can
@@ -61,12 +62,33 @@ The recipe process is CPU-only. Cortex runs the training and sampling workers.
 
 ## Configure Cortex
 
+Set the connection with environment variables:
+
 ```bash
 export ARCTIC_CORTEX_HOST=<account>.<region>.snowflakecomputing.com
 export ARCTIC_CORTEX_DATABASE=<db>
 export ARCTIC_CORTEX_SCHEMA=<schema>
 export ARCTIC_CORTEX_PAT=<your PAT>
 ```
+
+When those variables are unset, the client reads the Snowflake connection profile that [cortex-training](https://github.com/snowflakedb/cortex-training/blob/main/docs/getting-started/setup.md) uses. Put it in `~/.snowflake/connections.toml` (or `$SNOWFLAKE_HOME/connections.toml`) and keep the file readable only by its owner:
+
+```bash
+chmod 600 ~/.snowflake/connections.toml
+```
+
+```toml
+[default]
+account = "ORG-ACCOUNT"
+host = "ACCOUNT.snowflakecomputing.com"
+user = "USER"
+authenticator = "programmatic_access_token"
+token = "YOUR_PROGRAMMATIC_ACCESS_TOKEN"
+database = "CORTEX_TRAINING_DB"
+schema = "PUBLIC"
+```
+
+The profile is `SNOWFLAKE_DEFAULT_CONNECTION_NAME`, or `default_connection_name` in `config.toml` beside the connections file, or `[default]`. The profile `token` is sent as a programmatic access token. An explicit JSON connection file passed to the job config takes precedence over both.
 
 The account needs:
 
@@ -96,14 +118,45 @@ python -m arctic_platform.integrations.tinker.run \
 `base_url` on the recipe is ignored. The process releases the Cortex job on
 exit.
 
-A handwritten script:
+A one-step script. It creates a LoRA client, takes one cross-entropy step, syncs the adapter, and draws one sample:
 
 ```python
+import asyncio
+
+import numpy as np
 from arctic_platform.integrations import tinker
 
-service = tinker.ServiceClient(training_gpus=1, sampling_gpus=1)
-training = await service.create_lora_training_client_async("Qwen/Qwen3-0.6B", rank=32)
+
+async def main() -> None:
+    service = tinker.ServiceClient(training_gpus=1, sampling_gpus=1)
+    training = await service.create_lora_training_client_async("Qwen/Qwen3.5-4B", rank=32)
+
+    tokens = [1, 2, 3, 4]
+    datum = tinker.types.Datum(
+        model_input=tinker.types.ModelInput.from_ints(tokens[:-1]),
+        loss_fn_inputs={
+            "target_tokens": tinker.TensorData.from_numpy(np.asarray(tokens[1:], dtype=np.int64)),
+            "weights": tinker.TensorData.from_numpy(np.ones(len(tokens) - 1, dtype=np.float32)),
+        },
+    )
+    forward = await training.forward_backward_async([datum], loss_fn="cross_entropy")
+    await forward.result_async()
+    step = await training.optim_step_async(tinker.types.AdamParams(learning_rate=1e-4, eps=1e-8))
+    await step.result_async()
+
+    sampling = await training.save_weights_and_get_sampling_client_async()
+    result = await sampling.sample_async(
+        prompt=tinker.types.ModelInput.from_ints(tokens),
+        num_samples=1,
+        sampling_params=tinker.types.SamplingParams(max_tokens=16, temperature=1.0),
+    )
+    print(result.sequences[0].tokens)
+
+
+asyncio.run(main())
 ```
+
+`eps=1e-8` matches the Adam settings provisioned with the job. The SDK's default epsilon is different, and a mismatch is refused.
 
 Required settings:
 
@@ -162,7 +215,7 @@ Current limitations. The client raises `RuntimeError` for a refusal. A Cortex re
 | Teacher | `base_model` opens that model's base weights, including the student. Prompt cap is student prompt + response. Response cap matches the student. `model_path` is refused. |
 | Optimizer overrides | Only the learning rate varies per step; other Adam settings are fixed at start-up. |
 | Multimodal input | Only encoded text tokens are passed to Cortex. |
-| Authentication | Uses `ARCTIC_CORTEX_*`. `base_url` is ignored. |
+| Authentication | Uses `ARCTIC_CORTEX_*`, or `~/.snowflake/connections.toml` when those variables are unset. `base_url` is ignored. |
 
 Recipes that require audio, images, checkpoint resume, reference-model
 workers, external tools, or external graders are not covered by this

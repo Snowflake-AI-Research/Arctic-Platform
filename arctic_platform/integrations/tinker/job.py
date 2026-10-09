@@ -150,6 +150,19 @@ def isolation(cfg: TinkerJobConfig, model_config: Any) -> tuple[TinkerJobConfig,
     return replace(cfg, max_tokens_per_mb=cfg.max_seq_len), cfg.max_seq_len
 
 
+def _backend_from_env_or_profile(cortex_config: Any) -> Any:
+    """``ARCTIC_CORTEX_*`` when set, otherwise a Snowflake connection profile."""
+    from arctic_platform.integrations.tinker.snowflake_profile import cortex_fields
+    from arctic_platform.integrations.tinker.snowflake_profile import env_configured
+
+    if env_configured():
+        return cortex_config()
+    fields = cortex_fields()
+    if fields is None:
+        return cortex_config()
+    return cortex_config(**fields)
+
+
 def client_config(cfg: TinkerJobConfig) -> Any:
     from arctic_platform.client import ArcticClientConfig
     from arctic_platform.client import CortexConfig
@@ -164,7 +177,7 @@ def client_config(cfg: TinkerJobConfig) -> Any:
         backend_keys = ("base_url", "host", "pat", "database", "schema", "endpoint", "max_retries")
         backend = CortexConfig(**{key: connection[key] for key in backend_keys if key in connection})
     else:
-        backend = CortexConfig()
+        backend = _backend_from_env_or_profile(CortexConfig)
 
     return ArcticClientConfig(
         backend=backend,
