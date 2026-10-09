@@ -19,7 +19,10 @@ vLLM 0.30.0 fills a structured-output bitmask row from the live grammar only
 until it sees a placeholder draft id (-1). Later rows, including the bonus
 row, are left unconstrained. Under async scheduling the rejection sampler does
 not verify that placeholder list. It verifies the drafter's own token ids,
-which can be real tokens in those unconstrained rows.
+which can be real tokens in those unconstrained rows. Both model runners do
+this: V1 verifies ``spec_decode_metadata.draft_token_ids`` and V2 verifies the
+ids it wrote into ``input_ids``. vLLM builds V2 for DFlash2 drafts, which V1
+refuses.
 
 That happens on the first decode step after a weight sync resumes generation
 with ``pause_mode="keep"``: the pause drains the in-flight step, so the
@@ -100,6 +103,30 @@ def reject_unvalidated_drafts(
         metadata,
         draft_token_ids=draft_token_ids.masked_fill(mask, -1),
     )
+
+
+def mask_unvalidated_drafts_v2(grammar_output: Any, input_batch: Any) -> Any:
+    """Model Runner V2: the batch to verify, with -1 from each first unchecked draft.
+
+    V2 verifies ``input_ids[logits_indices]``: request ``i`` owns logits rows
+    ``cu_num_logits_np[i]`` up to the next entry, and its draft ``k`` sits at
+    ``logits_indices[cu_num_logits_np[i] + 1 + k]`` (adaptive verification off,
+    the default). Only the copy handed to sampling changes; the drafter keeps
+    the real ids.
+    """
+    rows = []
+    for i, req_id in enumerate(input_batch.req_ids):
+        num_drafts = int(input_batch.num_draft_tokens_per_req[i])
+        scheduled = list(grammar_output.spec_token_ids.get(req_id, ()))[:num_drafts]
+        if -1 in scheduled:
+            first = int(input_batch.cu_num_logits_np[i]) + 1
+            rows.extend(range(first + scheduled.index(-1), first + num_drafts))
+    if not rows:
+        return input_batch
+    input_ids = input_batch.input_ids.clone()
+    positions = input_batch.logits_indices[torch.tensor(rows, device=input_ids.device)]
+    input_ids[positions] = -1
+    return replace(input_batch, input_ids=input_ids)
 
 
 def stage_sample_metadata(runner: Any, grammar_output: Any) -> None:
@@ -187,5 +214,19 @@ def ensure_spec_decode_grammar_fix() -> None:
         _sample._arctic_spec_grammar = True
         _sample._orig = original_sample
         GPUModelRunner._sample = _sample
+
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
+
+    if not getattr(GPUModelRunnerV2.sample, "_arctic_spec_grammar", False):
+        original_sample_v2 = GPUModelRunnerV2.sample
+
+        def sample_v2(self, hidden_states, input_batch, grammar_output):
+            if grammar_output is not None and input_batch.num_draft_tokens:
+                input_batch = mask_unvalidated_drafts_v2(grammar_output, input_batch)
+            return original_sample_v2(self, hidden_states, input_batch, grammar_output)
+
+        sample_v2._arctic_spec_grammar = True
+        sample_v2._orig = original_sample_v2
+        GPUModelRunnerV2.sample = sample_v2
 
     _APPLIED = True
