@@ -15,6 +15,8 @@ include = [
   "arctic_platform/integrations/verl/config/**/*.yaml",
   "arctic_platform/integrations/verl/examples/*.sh",
   "arctic_platform/integrations/verl/README.md",
+  "arctic_platform/correctness/configs/**/*.config",
+  "arctic_platform/correctness/specs/*.json",
 ]
 # Kept beside the inference package and left out of the wheel. Trailing
 # slashes make hatchling skip the directories. csrc/, setup.py, and
@@ -118,14 +120,34 @@ gdn = [
     "causal-conv1d",
 ]
 
-# The client, talking to Cortex over SnowAPI (DSSST1 tensor wire format).
-cortex = [
-    "aiohttp",
+# GPU training stack used by local distributed training and GPU tests.
+gpu = [
+    "arctic_platform[sft]",
+    "arctic_platform[gdn]",
+    "arctic_platform[testing]",
+    "flash-linear-attention==0.5.2",
+    "tilelang==0.1.12",
+    "transformers==5.12.1",
+]
+
+# Shared DSSST1 tensor wire format.
+wire = [
     "numpy",
-    "requests",
     "safetensors",
-    "tenacity",
     "torch",
+]
+
+# HTTP clients shared by Cortex and on-prem transports.
+transport = [
+    "arctic_platform[wire]",
+    "aiohttp",
+    "requests",
+]
+
+# The client, talking to Cortex over SnowAPI.
+cortex = [
+    "arctic_platform[transport]",
+    "tenacity",
     "urllib3",
 ]
 

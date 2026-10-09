@@ -17,48 +17,55 @@ import contextlib
 import copy
 import gc
 import time
-from typing import Any, Optional, TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import Optional
+from typing import Union
 
 import numpy as np
 import torch
-from tqdm import tqdm
-
 import vllm.distributed.parallel_state as parallel_state
 import vllm.envs as envs
+from tqdm import tqdm
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
-from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.distributed.kv_transfer import (get_kv_transfer_group,
-                                          has_kv_transfer_group)
-from vllm.distributed.parallel_state import (get_pp_group, get_tp_group,
-                                             is_global_first_rank)
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.config import CUDAGraphMode
+from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer import get_kv_transfer_group
+from vllm.distributed.kv_transfer import has_kv_transfer_group
+from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import is_global_first_rank
+from vllm.forward_context import BatchDescriptor
+from vllm.forward_context import set_forward_context
 from vllm.model_executor.model_loader import get_model
 from vllm.sequence import IntermediateTensors
-from vllm.utils.math_utils import round_up, cdiv
+from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput,
-                              SamplerOutput, AsyncModelRunnerOutput)
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+from vllm.v1.outputs import AsyncModelRunnerOutput
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import MAX_SPEC_LEN, RejectionSampler
+from vllm.v1.sample.rejection_sampler import MAX_SPEC_LEN
+from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.utils import record_function_or_nullcontext
-from vllm.v1.worker.gpu_model_runner import (
-    GPUModelRunner,
-    logger,
-    AsyncGPUModelRunnerOutput,
-)
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
+from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.gpu_model_runner import logger
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 from arctic_platform.inference.patching import ArcticPatch
-from arctic_platform.inference.suffix_decoding import (SuffixDecodingCache,
-                                              SuffixDecodingDraft)
-from arctic_platform.inference.vllm.spec_dec.arctic_proposer import (ArcticProposer,
-                                                            SuffixProposer)
+from arctic_platform.inference.suffix_decoding import SuffixDecodingCache
+from arctic_platform.inference.suffix_decoding import SuffixDecodingDraft
+from arctic_platform.inference.vllm.spec_dec.arctic_proposer import ArcticProposer
+from arctic_platform.inference.vllm.spec_dec.arctic_proposer import SuffixProposer
 
 SP_TP_MODE = None
 
@@ -82,8 +89,7 @@ def set_shift_parallel_mode(mode: Optional[bool]):
     old_tp_group = parallel_state.get_tp_group()
     SP_TP_MODE = mode
 
-    parallel_state._TP = (parallel_state._SP_TP
-                          if mode else parallel_state._ORIG_TP)
+    parallel_state._TP = parallel_state._SP_TP if mode else parallel_state._ORIG_TP
 
     try:
         yield
@@ -117,9 +123,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     _orig_reload_weights = GPUModelRunner.reload_weights
 
     def init_routed_experts_capturer(self):
-        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-            RoutedExpertsCapturer,
-        )
+        from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
         if not self.model_config.enable_return_routed_experts:
             return
@@ -129,10 +133,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         )
         capturer = RoutedExpertsCapturer.create()
         self.routed_experts_attn_gid = self._get_attention_kv_cache_gid()
-        block_sizes = [
-            group.kv_cache_spec.block_size
-            for group in self.kv_cache_config.kv_cache_groups
-        ]
+        block_sizes = [group.kv_cache_spec.block_size for group in self.kv_cache_config.kv_cache_groups]
         max_block_size = max(block_sizes) if block_sizes else 1
         self.max_num_kv_tokens = self.kv_cache_config.num_blocks * max_block_size
         dcp = self.vllm_config.parallel_config.decode_context_parallel_size
@@ -162,7 +163,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         device: torch.device,
     ):
         ulysses_sequence_parallel_size = getattr(
-            vllm_config.parallel_config, "ulysses_sequence_parallel_size", 1,
+            vllm_config.parallel_config,
+            "ulysses_sequence_parallel_size",
+            1,
         )
         if ulysses_sequence_parallel_size > 1:
             self.use_ulysses = True
@@ -177,8 +180,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             self.use_ulysses = False
 
         arctic_methods = ("arctic", "suffix", "mlp_speculator")
-        is_arctic_spec = (vllm_config.speculative_config is not None and
-                          vllm_config.speculative_config.method in arctic_methods)
+        is_arctic_spec = (
+            vllm_config.speculative_config is not None and vllm_config.speculative_config.method in arctic_methods
+        )
 
         arctic_speculative_config = None
         if is_arctic_spec:
@@ -192,8 +196,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         if is_arctic_spec:
             self.vllm_config.speculative_config = arctic_speculative_config
             self.speculative_config = arctic_speculative_config
-            self.num_spec_tokens = getattr(self.speculative_config,
-                                           "num_speculative_tokens", 0)
+            self.num_spec_tokens = getattr(self.speculative_config, "num_speculative_tokens", 0)
             self.uniform_decode_query_len = 1 + self.num_spec_tokens
 
             if not hasattr(self, "draft_token_ids_cpu") or self.draft_token_ids_cpu is None:
@@ -206,8 +209,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     pin_memory=PIN_MEMORY,
                 )
 
-            if (self.use_async_scheduling
-                    and self.speculative_config.method in ("arctic", "mlp_speculator", "suffix")):
+            if self.use_async_scheduling and self.speculative_config.method in ("arctic", "mlp_speculator", "suffix"):
                 if not hasattr(self, "valid_sampled_token_count_cpu") or self.valid_sampled_token_count_cpu is None:
                     self.valid_sampled_token_count_event = torch.Event()
                     self.valid_sampled_token_count_copy_stream = torch.cuda.Stream()
@@ -228,8 +230,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
                 self.rejection_sampler = RejectionSampler(self.sampler)
 
-        if (self.speculative_config is not None and
-                getattr(self.speculative_config, "enable_suffix_decoding", False)):
+        if self.speculative_config is not None and getattr(self.speculative_config, "enable_suffix_decoding", False):
 
             if self.speculative_config.method not in arctic_methods:
                 raise ValueError(
@@ -238,8 +239,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 )
             spec_cfg = self.speculative_config
             self._suffix_cache = SuffixDecodingCache(
-                max_tree_depth=spec_cfg.suffix_cache_max_depth,
-                max_cached_requests=spec_cfg.suffix_cache_max_requests
+                max_tree_depth=spec_cfg.suffix_cache_max_depth, max_cached_requests=spec_cfg.suffix_cache_max_requests
             )
 
         # Async suffix decoding infrastructure: a dedicated CUDA stream and
@@ -273,21 +273,25 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # Arctic drafting path (propose_draft_token_ids + suffix merge).
         # Shape: [max_num_reqs, num_spec_tokens], int64 (matches
         # draft_token_ids_cpu for zero-cost _copy_draft_token_ids_to_cpu).
-        if (self.speculative_config is not None
-                and self.use_async_scheduling
-                and self.speculative_config.method
-                    in ("arctic", "mlp_speculator")):
+        if (
+            self.speculative_config is not None
+            and self.use_async_scheduling
+            and self.speculative_config.method in ("arctic", "mlp_speculator")
+        ):
             self._draft_merged_gpu = torch.zeros(
                 (self.max_num_reqs, self.num_spec_tokens),
-                dtype=torch.int64, device=self.device,
+                dtype=torch.int64,
+                device=self.device,
             )
 
         # Pre-allocated pinned index buffer for suffix merge overlay.
         # Avoids per-step torch.tensor(...).pin_memory() allocations.
         if self._suffix_cache is not None and self.use_async_scheduling:
             self._suffix_index_pinned = torch.empty(
-                self.max_num_reqs, dtype=torch.long,
-                device="cpu", pin_memory=PIN_MEMORY,
+                self.max_num_reqs,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=PIN_MEMORY,
             )
 
         # Per-request response tokens for suffix pattern building in async
@@ -307,12 +311,15 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # The arctic proposer has its own buffer; this one covers the case
         # where no arctic drafter is present.
         self._suffix_backup_tokens_gpu: Optional[torch.Tensor] = None
-        if (self._suffix_cache is not None
-                and self.use_async_scheduling
-                and self.speculative_config.method not in ("arctic",
-                                                           "mlp_speculator")):
+        if (
+            self._suffix_cache is not None
+            and self.use_async_scheduling
+            and self.speculative_config.method not in ("arctic", "mlp_speculator")
+        ):
             self._suffix_backup_tokens_gpu = torch.zeros(
-                self.max_num_reqs, dtype=torch.int32, device=self.device,
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device=self.device,
             )
 
     def _suffix_only_rejection_sample(
@@ -328,9 +335,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         directly and feed the results into _copy_valid_sampled_token_count.
         """
         from vllm.triton_utils import triton
-        from vllm.v1.spec_decode.utils import (
-            eagle_prepare_next_token_padded_kernel,
-        )
+        from vllm.v1.spec_decode.utils import eagle_prepare_next_token_padded_kernel
 
         num_reqs = self.input_batch.num_reqs
         batch_size, num_tokens = sampled_token_ids.shape
@@ -343,19 +348,16 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         backup_np = np.empty(num_reqs, dtype=np.int32)
         for i in range(num_reqs):
             req_id = self.input_batch.req_ids[i]
-            backup_np[i] = self.requests[req_id].get_token_id(
-                self.input_batch.num_tokens_no_spec[i] - 1
-            )
+            backup_np[i] = self.requests[req_id].get_token_id(self.input_batch.num_tokens_no_spec[i] - 1)
         # Copy directly from CPU numpy-backed tensor to GPU; avoids
         # creating an intermediate GPU tensor via .to(device).
         backup[:num_reqs].copy_(
-            torch.from_numpy(backup_np), non_blocking=True,
+            torch.from_numpy(backup_np),
+            non_blocking=True,
         )
 
-        next_token_ids = torch.empty(batch_size, dtype=torch.int32,
-                                     device=device)
-        valid_counts = torch.empty(batch_size, dtype=torch.int32,
-                                   device=device)
+        next_token_ids = torch.empty(batch_size, dtype=torch.int32, device=device)
+        valid_counts = torch.empty(batch_size, dtype=torch.int32, device=device)
 
         BLOCK_SIZE_TOKENS = triton.next_power_of_2(num_tokens)
         eagle_prepare_next_token_padded_kernel[(batch_size,)](
@@ -374,8 +376,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self._copy_valid_sampled_token_count(next_token_ids, valid_counts)
 
     def _build_attention_metadata(self, *args, **kwargs):
-        attn_metadata, spec_decode_common_attn_metadata = \
-            self._orig_build_attention_metadata(*args, **kwargs)
+        attn_metadata, spec_decode_common_attn_metadata = self._orig_build_attention_metadata(*args, **kwargs)
 
         logits_indices = kwargs.get("logits_indices", None)
         if logits_indices is not None:
@@ -402,7 +403,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             orig_model, self.model = self.model, self.shift_model
             cc = self.vllm_config.compilation_config
             base_ctx = cc.static_forward_context
-            shift_ctx = getattr(self, 'shift_forward_context', None)
+            shift_ctx = getattr(self, "shift_forward_context", None)
             try:
                 if shift_ctx is not None:
                     cc.static_forward_context = shift_ctx
@@ -422,30 +423,26 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         sp_rank = parallel_state._SP.rank_in_group
         device_group = parallel_state._SP.device_group
         model_forward = self.model.forward
-        input_key = 'inputs_embeds' if self.supports_mm_inputs else 'input_ids'
+        input_key = "inputs_embeds" if self.supports_mm_inputs else "input_ids"
 
         @torch._dynamo.disable
         def ulysses_forward(*args, **kwargs):
             input_tensor = kwargs[input_key]
-            positions = kwargs['positions']
+            positions = kwargs["positions"]
 
             N = input_tensor.shape[0]
             N_ulysses = N // sp_size
             N_offset = N_ulysses * sp_rank
 
-            kwargs[input_key] = input_tensor[N_offset:N_offset + N_ulysses]
-            kwargs['positions'] = positions[N_offset:N_offset + N_ulysses]
+            kwargs[input_key] = input_tensor[N_offset : N_offset + N_ulysses]
+            kwargs["positions"] = positions[N_offset : N_offset + N_ulysses]
 
             with set_shift_parallel_mode(False):
                 output = model_forward(*args, **kwargs)
 
             if output.size(0) == N_ulysses:
-                model_output = torch.empty((N, output.shape[1]),
-                                           dtype=output.dtype,
-                                           device=output.device)
-                torch.distributed.all_gather_into_tensor(model_output,
-                                                         output,
-                                                         group=device_group)
+                model_output = torch.empty((N, output.shape[1]), dtype=output.dtype, device=output.device)
+                torch.distributed.all_gather_into_tensor(model_output, output, group=device_group)
             else:
                 assert output.size(0) == N
                 model_output = output
@@ -502,18 +499,16 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         if torch.distributed.get_rank() == 0:
             print(f"num_tokens_unpadded: {num_tokens_unpadded}, num_reqs: {num_reqs}")
 
-        _cg_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
-            self._determine_batch_execution_and_padding(
-                num_tokens=num_tokens_unpadded,
-                num_reqs=num_reqs,
-                num_scheduled_tokens_np=num_scheduled_tokens,
-                max_num_scheduled_tokens=max_query_len,
-                use_cascade_attn=False,
-                allow_microbatching=allow_microbatching,
-                force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
-                force_uniform_decode=uniform_decode,
-                force_has_lora=False,
-            )
+        _cg_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
+            num_tokens=num_tokens_unpadded,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_np=num_scheduled_tokens,
+            max_num_scheduled_tokens=max_query_len,
+            use_cascade_attn=False,
+            allow_microbatching=allow_microbatching,
+            force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
+            force_uniform_decode=uniform_decode,
+            force_has_lora=False,
         )
 
         if cudagraph_runtime_mode is None:
@@ -523,6 +518,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
 
         from vllm.v1.worker.gpu_model_runner import maybe_create_ubatch_slices
+
         ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
             should_ubatch,
             num_scheduled_tokens,
@@ -554,16 +550,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 self.seq_lens.np[num_reqs:] = 0
                 self.seq_lens.copy_to_gpu()
             else:
-                self.seq_lens[:num_reqs] = torch.tensor(
-                    seq_lens_list, dtype=self.seq_lens.dtype, device=self.device
-                )
+                self.seq_lens[:num_reqs] = torch.tensor(seq_lens_list, dtype=self.seq_lens.dtype, device=self.device)
                 self.seq_lens[num_reqs:].zero_()
 
             cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
             self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
             self.query_start_loc.copy_to_gpu()
 
-            pad_attn = (cudagraph_runtime_mode == CUDAGraphMode.FULL)
+            pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
             attn_metadata, _ = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded if pad_attn else None,
@@ -616,7 +610,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             if not get_pp_group().is_first_rank:
                 if self.intermediate_tensors is None:
                     self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
-                        batch_size=self.max_num_tokens, dtype=self.model_config.dtype, device=self.device)
+                        batch_size=self.max_num_tokens, dtype=self.model_config.dtype, device=self.device
+                    )
                 intermediate_tensors = self.sync_and_slice_intermediate_tensors(num_tokens_padded, None, False)
 
             target_num_tokens = num_tokens_padded
@@ -625,15 +620,27 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = target_num_tokens
 
-            with self.maybe_randomize_inputs(input_ids, inputs_embeds), set_forward_context(
-                attn_metadata, self.vllm_config, num_tokens=target_num_tokens,
-                num_tokens_across_dp=num_tokens_across_dp, cudagraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_desc, ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings):
+            with (
+                self.maybe_randomize_inputs(input_ids, inputs_embeds),
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=target_num_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                ),
+            ):
 
-                outputs = self.model(input_ids=input_ids, positions=positions,
-                                     intermediate_tensors=intermediate_tensors,
-                                     inputs_embeds=inputs_embeds, **model_kwargs)
+                outputs = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
             hidden_states = outputs[0] if self.use_aux_hidden_state_outputs else outputs
 
@@ -661,14 +668,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         sampling_metadata = self.input_batch.sampling_metadata
         self.input_batch.update_async_output_token_ids()
         if spec_decode_metadata is None:
-            return self.sampler(
-                logits=logits, sampling_metadata=sampling_metadata)
+            return self.sampler(logits=logits, sampling_metadata=sampling_metadata)
 
-        if (self.use_async_scheduling
-                and self._draft_token_req_ids is not None):
+        if self.use_async_scheduling and self._draft_token_req_ids is not None:
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
-            self.input_batch.update_async_spec_token_ids(
-                draft_token_ids_cpu)
+            self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
@@ -683,15 +687,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> Union[
-        ModelRunnerOutput, AsyncGPUModelRunnerOutput, IntermediateTensors, None
-    ]:
+    ) -> Union[ModelRunnerOutput, AsyncGPUModelRunnerOutput, IntermediateTensors, None]:
         num_scheduled_tokens = getattr(scheduler_output, "total_num_scheduled_tokens", None)
         if num_scheduled_tokens is None:
             try:
-                num_scheduled_tokens = int(
-                    sum(scheduler_output.num_scheduled_tokens.values())
-                )
+                num_scheduled_tokens = int(sum(scheduler_output.num_scheduled_tokens.values()))
             except Exception:
                 num_scheduled_tokens = 0
 
@@ -707,13 +707,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         orig_model = self.model
         cc = self.vllm_config.compilation_config
         base_ctx = cc.static_forward_context
-        shift_ctx = getattr(self, 'shift_forward_context', None)
+        shift_ctx = getattr(self, "shift_forward_context", None)
         try:
             self.model = self.shift_model
             if shift_ctx is not None:
                 cc.static_forward_context = shift_ctx
-            with set_shift_parallel_mode(True), \
-                 self._use_shift_cudagraph_tables():
+            with set_shift_parallel_mode(True), self._use_shift_cudagraph_tables():
                 result = self._orig_execute_model(scheduler_output, intermediate_tensors)
         finally:
             self.model = orig_model
@@ -746,7 +745,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
     def _fix_shift_logits_ordering(self):
         """Reorder logits vocabulary dimension to fix NCCL rank-sort mismatch."""
-        perm = getattr(self, '_shift_logits_perm', None)
+        perm = getattr(self, "_shift_logits_perm", None)
         if perm is None:
             return
         state = self.execute_model_state
@@ -769,11 +768,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         the 'not-fits-in-drafter' case that the base only handles for Eagle.
         """
         _arctic_saved_state = None
-        if (self.execute_model_state is not None
-                and self.speculative_config is not None
-                and self.speculative_config.method
-                    in ("arctic", "mlp_speculator", "suffix")
-                and self.use_async_scheduling):
+        if (
+            self.execute_model_state is not None
+            and self.speculative_config is not None
+            and self.speculative_config.method in ("arctic", "mlp_speculator", "suffix")
+            and self.use_async_scheduling
+        ):
             _arctic_saved_state = (
                 self.execute_model_state.scheduler_output,
                 self.execute_model_state.spec_decode_common_attn_metadata,
@@ -785,13 +785,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # but never consumed by propose_draft_token_ids, this is the
         # not-fits-in-drafter case.  Mirror Eagle's handling: call
         # _copy_valid_sampled_token_count and set draft tokens to zeros.
-        stashed = getattr(self, '_arctic_async_sampled_tensor', None)
+        stashed = getattr(self, "_arctic_async_sampled_tensor", None)
         if stashed is not None:
             del self._arctic_async_sampled_tensor
             if _arctic_saved_state is not None:
                 scheduler_output, common_attn_meta = _arctic_saved_state
-                self._arctic_handle_not_fits(
-                    stashed, scheduler_output, common_attn_meta)
+                self._arctic_handle_not_fits(stashed, scheduler_output, common_attn_meta)
 
         return result
 
@@ -810,47 +809,48 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         and _prepare_input_ids scatters -1 placeholders into the
         embedding layer.
         """
-        if (hasattr(self, 'drafter')
-                and hasattr(self.drafter, 'prepare_next_token_ids_padded')
-                and common_attn_metadata is not None):
-            next_token_ids, valid_sampled_tokens_count = (
-                self.drafter.prepare_next_token_ids_padded(
-                    common_attn_metadata,
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_mask.gpu,
-                )
+        if (
+            hasattr(self, "drafter")
+            and hasattr(self.drafter, "prepare_next_token_ids_padded")
+            and common_attn_metadata is not None
+        ):
+            next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
+                common_attn_metadata,
+                sampled_token_ids,
+                self.requests,
+                self.input_batch,
+                self.discard_request_mask.gpu,
             )
-            self._copy_valid_sampled_token_count(
-                next_token_ids, valid_sampled_tokens_count)
+            self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
         else:
             # Fallback for drafters without prepare_next_token_ids_padded
             # (e.g. suffix-only).  Compute valid counts with PyTorch ops.
             mask = sampled_token_ids != -1
             valid_counts = mask.sum(dim=1)
             batch_size = sampled_token_ids.shape[0]
-            col_indices = torch.arange(
-                sampled_token_ids.shape[1],
-                device=sampled_token_ids.device,
-            ).unsqueeze(0).expand_as(sampled_token_ids)
-            last_valid_col = (
-                col_indices.masked_fill(~mask, -1).max(dim=1).values)
+            col_indices = (
+                torch.arange(
+                    sampled_token_ids.shape[1],
+                    device=sampled_token_ids.device,
+                )
+                .unsqueeze(0)
+                .expand_as(sampled_token_ids)
+            )
+            last_valid_col = col_indices.masked_fill(~mask, -1).max(dim=1).values
             last_valid_col = last_valid_col.clamp(min=0)
             next_token_ids = sampled_token_ids[
-                torch.arange(batch_size,
-                             device=sampled_token_ids.device),
+                torch.arange(batch_size, device=sampled_token_ids.device),
                 last_valid_col,
             ]
-            self._copy_valid_sampled_token_count(
-                next_token_ids, valid_counts)
+            self._copy_valid_sampled_token_count(next_token_ids, valid_counts)
 
         # Zero draft tokens -- same as Eagle's not-fits path.
         self._draft_token_ids = torch.zeros(
-            1, device=self.device, dtype=torch.int32,
+            1,
+            device=self.device,
+            dtype=torch.int32,
         ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
-        self._copy_draft_token_ids_to_cpu(
-            scheduler_output, zeros_only=True)
+        self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
     def _bookkeeping_sync(
         self,
@@ -876,12 +876,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
              (fits case) or sample_tokens (not-fits case).
         """
         sampled_token_ids = sampler_output.sampled_token_ids
-        if (self.use_async_scheduling
-                and self.speculative_config is not None
-                and self.speculative_config.method
-                    in ("arctic", "mlp_speculator", "suffix")
-                and sampled_token_ids.shape[-1] > 1
-                and self.input_batch.prev_sampled_token_ids is None):
+        if (
+            self.use_async_scheduling
+            and self.speculative_config is not None
+            and self.speculative_config.method in ("arctic", "mlp_speculator", "suffix")
+            and sampled_token_ids.shape[-1] > 1
+            and self.input_batch.prev_sampled_token_ids is None
+        ):
             # Stash the full GPU tensor so propose_draft_token_ids can
             # pick it up later (it normally only receives an empty list
             # in the post-bookkeeping path).
@@ -889,12 +890,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # Placeholder: first column only (bonus token per request).
             # Prevents the assertion from firing; the correct value will
             # be overwritten by _copy_valid_sampled_token_count shortly.
-            self.input_batch.prev_sampled_token_ids = (
-                sampled_token_ids[:, :1])
+            self.input_batch.prev_sampled_token_ids = sampled_token_ids[:, :1]
 
         return self._orig_bookkeeping_sync(
-            scheduler_output, sampler_output, logits, hidden_states,
-            num_scheduled_tokens)
+            scheduler_output, sampler_output, logits, hidden_states, num_scheduled_tokens
+        )
 
     def propose_draft_token_ids(
         self,
@@ -912,9 +912,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # post-bookkeeping path which passes valid_sampled_token_ids
         # (an empty list for async).  Recover the stashed GPU tensor
         # so the fast async drafting path below can activate.
-        if (isinstance(sampled_token_ids, list)
-                and len(sampled_token_ids) == 0
-                and hasattr(self, '_arctic_async_sampled_tensor')):
+        if (
+            isinstance(sampled_token_ids, list)
+            and len(sampled_token_ids) == 0
+            and hasattr(self, "_arctic_async_sampled_tensor")
+        ):
             sampled_token_ids = self._arctic_async_sampled_tensor
             del self._arctic_async_sampled_tensor
 
@@ -942,18 +944,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         if use_async_path:
             assert isinstance(sampled_token_ids, torch.Tensor)
 
-            next_token_ids, valid_sampled_tokens_count = (
-                self.drafter.prepare_next_token_ids_padded(
-                    common_attn_metadata,
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_mask.gpu,
-                )
+            next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
+                common_attn_metadata,
+                sampled_token_ids,
+                self.requests,
+                self.input_batch,
+                self.discard_request_mask.gpu,
             )
-            self._copy_valid_sampled_token_count(
-                next_token_ids, valid_sampled_tokens_count
-            )
+            self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
 
             target_hidden_states = self.drafter.prepare_hidden_states(
                 sample_hidden_states=sample_hidden_states,
@@ -972,7 +970,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # per-step F.pad + torch.zeros allocations.  The buffer is
             # [max_num_reqs, num_spec_tokens] so a single zero_() +
             # copy_() handles both width and batch padding in one shot.
-            merged_buf = getattr(self, '_draft_merged_gpu', None)
+            merged_buf = getattr(self, "_draft_merged_gpu", None)
             if merged_buf is not None:
                 draft = merged_buf[:batch_size]
                 draft.zero_()
@@ -988,8 +986,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     )
                 if draft_limit < batch_size:
                     full_draft = torch.zeros(
-                        batch_size, draft.shape[1],
-                        dtype=draft.dtype, device=draft.device,
+                        batch_size,
+                        draft.shape[1],
+                        dtype=draft.dtype,
+                        device=draft.device,
                     )
                     full_draft[:draft_limit] = draft
                     draft = full_draft
@@ -998,8 +998,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         if isinstance(sampled_token_ids, torch.Tensor):
             vocab_size = self.model_config.get_vocab_size()
             sampled_token_ids_list = [
-                [t for t in seq if t != -1 and t < vocab_size]
-                for seq in sampled_token_ids.tolist()
+                [t for t in seq if t != -1 and t < vocab_size] for seq in sampled_token_ids.tolist()
             ]
             sampled_token_ids_tensor = sampled_token_ids
         else:
@@ -1036,17 +1035,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             arctic_spec_token_ids = arctic_output_tensor.tolist()
             # Pad with empty lists for requests beyond draft_limit.
             if draft_limit < batch_size:
-                arctic_spec_token_ids.extend(
-                    [] for _ in range(batch_size - draft_limit)
-                )
+                arctic_spec_token_ids.extend([] for _ in range(batch_size - draft_limit))
 
         if self._suffix_cache is not None:
             self._update_suffix_cache(sampled_token_ids_list)
             results = self.propose_suffix_draft_token_ids(sampled_token_ids_list)
 
             suffix_spec_token_ids = []
-            min_score = 0 if self.speculative_config.method == "suffix" \
-                else self.drafter.model.n_predict
+            min_score = 0 if self.speculative_config.method == "suffix" else self.drafter.model.n_predict
 
             for result in results:
                 if result.score >= min_score:
@@ -1078,7 +1074,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             )
 
         if spec_token_ids is None:
-             spec_token_ids = [[] for _ in range(len(self.input_batch.req_ids))]
+            spec_token_ids = [[] for _ in range(len(self.input_batch.req_ids))]
 
         # For async scheduling the base _prepare_input_ids asserts that
         # _draft_token_ids is a torch.Tensor and uses it to scatter draft
@@ -1087,31 +1083,38 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         #   1. Convert the list-of-lists draft tokens to a padded tensor.
         #   2. Call _copy_valid_sampled_token_count so the next step's
         #      _get_valid_sampled_token_count returns correct counts.
-        if (self.use_async_scheduling
-                and isinstance(spec_token_ids, list)
-                and isinstance(sampled_token_ids, torch.Tensor)):
+        if (
+            self.use_async_scheduling
+            and isinstance(spec_token_ids, list)
+            and isinstance(sampled_token_ids, torch.Tensor)
+        ):
             # --- _copy_valid_sampled_token_count ---
-            if (hasattr(self, 'drafter')
-                    and hasattr(self.drafter, 'prepare_next_token_ids_padded')
-                    and common_attn_metadata is not None):
-                next_tok, valid_cnt = (
-                    self.drafter.prepare_next_token_ids_padded(
-                        common_attn_metadata,
-                        sampled_token_ids,
-                        self.requests,
-                        self.input_batch,
-                        self.discard_request_mask.gpu,
-                    ))
+            if (
+                hasattr(self, "drafter")
+                and hasattr(self.drafter, "prepare_next_token_ids_padded")
+                and common_attn_metadata is not None
+            ):
+                next_tok, valid_cnt = self.drafter.prepare_next_token_ids_padded(
+                    common_attn_metadata,
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_mask.gpu,
+                )
                 self._copy_valid_sampled_token_count(next_tok, valid_cnt)
             else:
                 # Manual fallback (suffix-only drafter).
                 mask = sampled_token_ids != -1
                 valid_cnt = mask.sum(dim=1)
                 _bs = sampled_token_ids.shape[0]
-                cols = torch.arange(
-                    sampled_token_ids.shape[1],
-                    device=sampled_token_ids.device,
-                ).unsqueeze(0).expand_as(sampled_token_ids)
+                cols = (
+                    torch.arange(
+                        sampled_token_ids.shape[1],
+                        device=sampled_token_ids.device,
+                    )
+                    .unsqueeze(0)
+                    .expand_as(sampled_token_ids)
+                )
                 last_col = cols.masked_fill(~mask, -1).max(dim=1).values
                 last_col = last_col.clamp(min=0)
                 next_tok = sampled_token_ids[
@@ -1122,15 +1125,15 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
             # --- Convert list[list[int]] -> padded tensor ---
             padded = torch.zeros(
-                batch_size, self.num_spec_tokens,
-                dtype=torch.int32, device=self.device,
+                batch_size,
+                self.num_spec_tokens,
+                dtype=torch.int32,
+                device=self.device,
             )
             for i, tokens in enumerate(spec_token_ids):
                 length = min(len(tokens), self.num_spec_tokens)
                 if length > 0:
-                    padded[i, :length] = torch.tensor(
-                        tokens[:length], dtype=torch.int32,
-                        device=self.device)
+                    padded[i, :length] = torch.tensor(tokens[:length], dtype=torch.int32, device=self.device)
             spec_token_ids = padded
 
         return spec_token_ids
@@ -1182,11 +1185,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # In async mode, token_ids_cpu contains -1 placeholders at
             # decoded positions (written by _bookkeeping_sync).  Build the
             # pattern from the clean _suffix_response_tokens instead.
-            if (self.use_async_scheduling
-                    and req_id in self._suffix_response_tokens):
+            if self.use_async_scheduling and req_id in self._suffix_response_tokens:
                 response = self._suffix_response_tokens[req_id]
-                num_prompt = int(
-                    self.input_batch.num_prompt_tokens[index])
+                num_prompt = int(self.input_batch.num_prompt_tokens[index])
                 num_tokens = num_prompt + len(response)
                 if num_tokens >= self.max_model_len:
                     results.append(SuffixDecodingDraft())
@@ -1198,8 +1199,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 else:
                     need = depth - len(response)
                     prompt_start = max(0, num_prompt - need)
-                    prompt_part = self.input_batch.token_ids_cpu[
-                        index, prompt_start:num_prompt].tolist()
+                    prompt_part = self.input_batch.token_ids_cpu[index, prompt_start:num_prompt].tolist()
                     pattern = prompt_part + response
             else:
                 num_tokens = self.input_batch.num_tokens_no_spec[i]
@@ -1207,12 +1207,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     results.append(SuffixDecodingDraft())
                     continue
                 start = max(0, num_tokens - config.suffix_cache_max_depth)
-                pattern = self.input_batch.token_ids_cpu[
-                    i, start:num_tokens].tolist()
+                pattern = self.input_batch.token_ids_cpu[i, start:num_tokens].tolist()
 
-            max_spec = min(
-                MAX_SPEC_LEN, self.max_model_len - num_tokens - 1
-            )
+            max_spec = min(MAX_SPEC_LEN, self.max_model_len - num_tokens - 1)
             result = self._suffix_cache.speculate(
                 req_id,
                 pattern,
@@ -1253,7 +1250,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         with torch.cuda.stream(self.suffix_copy_stream):
             self.suffix_copy_stream.wait_stream(default_stream)
             self.suffix_sampled_ids_pinned[:n_rows, :n_cols].copy_(
-                sampled_token_ids, non_blocking=True,
+                sampled_token_ids,
+                non_blocking=True,
             )
             self.suffix_copy_done_event.record()
         self._suffix_copy_shape = (n_rows, n_cols)
@@ -1271,9 +1269,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         pinned = self.suffix_sampled_ids_pinned[:n_rows, :n_cols]
 
         num_reqs = self.input_batch.num_reqs
-        discard_indices = np.nonzero(
-            self.discard_request_mask.np[:num_reqs]
-        )[0]
+        discard_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
 
         if n_cols == 1:
             result = pinned.tolist()
@@ -1327,15 +1323,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
-            apply_grammar_bitmask(
-                scheduler_output, grammar_output, self.input_batch, logits
-            )
+            apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
 
         sample_metadata = spec_decode_metadata
         if grammar_output is not None and spec_decode_metadata is not None:
-            from arctic_platform.inference.vllm.spec_decode_grammar import (
-                reject_unvalidated_drafts,
-            )
+            from arctic_platform.inference.vllm.spec_decode_grammar import reject_unvalidated_drafts
 
             sample_metadata = reject_unvalidated_drafts(
                 grammar_output,
@@ -1346,8 +1338,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, sample_metadata)
 
-        self._update_states_after_model_execute(
-            sampler_output.sampled_token_ids, scheduler_output)
+        self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
@@ -1398,9 +1389,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         #      using CPU valid_sampled_token_ids from bookkeeping.
 
         has_suffix = self._suffix_cache is not None
-        is_arctic_method = (
-            self.speculative_config is not None
-            and self.speculative_config.method in ("arctic", "mlp_speculator")
+        is_arctic_method = self.speculative_config is not None and self.speculative_config.method in (
+            "arctic",
+            "mlp_speculator",
         )
         input_fits_in_drafter = spec_decode_common_attn_metadata is not None
         sampled_token_ids = sampler_output.sampled_token_ids
@@ -1423,20 +1414,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 # Track actual draft lengths for next step's allocation.
                 _n_predict = self.drafter.model.n_predict
                 _batch_size = len(self.input_batch.req_ids)
-                _disable_bs = (
-                    self.speculative_config.disable_by_batch_size
-                    if self.speculative_config else None
-                )
+                _disable_bs = self.speculative_config.disable_by_batch_size if self.speculative_config else None
                 _draft_limit = _batch_size
                 if _disable_bs and _batch_size > _disable_bs:
                     _draft_limit = _disable_bs
                 self._prev_actual_draft_lens = {
-                    req_id: _n_predict if i < _draft_limit else 0
-                    for i, req_id in enumerate(self.input_batch.req_ids)
+                    req_id: _n_predict if i < _draft_limit else 0 for i, req_id in enumerate(self.input_batch.req_ids)
                 }
-                scheduler_output._actual_draft_lens = (
-                    self._prev_actual_draft_lens
-                )
+                scheduler_output._actual_draft_lens = self._prev_actual_draft_lens
 
             elif is_arctic_method:
                 # (B) Arctic + suffix async.
@@ -1449,9 +1434,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 self._start_suffix_copy(sampled_token_ids)
 
                 # Step 2: Launch arctic on the default stream.
-                with record_function_or_nullcontext(
-                    "gpu_model_runner: draft (arctic)"
-                ):
+                with record_function_or_nullcontext("gpu_model_runner: draft (arctic)"):
                     arctic_draft = self.propose_draft_token_ids(
                         scheduler_output,
                         sampled_token_ids,
@@ -1466,21 +1449,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
                 # Step 3: Wait for D2H copy, then run suffix on CPU.
                 #         This overlaps with remaining Arctic GPU work.
-                with record_function_or_nullcontext(
-                    "gpu_model_runner: draft (suffix)"
-                ):
+                with record_function_or_nullcontext("gpu_model_runner: draft (suffix)"):
                     sampled_cpu = self._finish_suffix_copy()
                     self._update_suffix_cache(sampled_cpu)
-                    suffix_results = self.propose_suffix_draft_token_ids(
-                        sampled_cpu
-                    )
+                    suffix_results = self.propose_suffix_draft_token_ids(sampled_cpu)
 
                     min_score = self.drafter.model.n_predict
-                    suffix_draft = [
-                        result.token_ids if result.score >= min_score
-                        else []
-                        for result in suffix_results
-                    ]
+                    suffix_draft = [result.token_ids if result.score >= min_score else [] for result in suffix_results]
 
                 # Step 4: Merge arctic + suffix results.
                 #         Suffix takes priority when available.
@@ -1491,9 +1466,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 #         and uses it for on-device scatter.
 
                 # Collect suffix rows that have results.
-                suffix_indices = [
-                    i for i, s in enumerate(suffix_draft) if s
-                ]
+                suffix_indices = [i for i, s in enumerate(suffix_draft) if s]
 
                 # arctic_draft is already a [batch, num_spec_tokens]
                 # GPU tensor (from the pre-allocated _draft_merged_gpu
@@ -1511,9 +1484,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     for i, row in enumerate(arctic_draft):
                         t = row[:k]
                         if t:
-                            pin_np[i, :len(t)] = t
-                    merged = pin.to(
-                        device=self.device, non_blocking=True)
+                            pin_np[i, : len(t)] = t
+                    merged = pin.to(device=self.device, non_blocking=True)
 
                 if merged.shape[1] < self.num_spec_tokens:
                     merged = torch.nn.functional.pad(
@@ -1532,8 +1504,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 width = merged.shape[1]
                 if suffix_indices:
                     n_sfx = len(suffix_indices)
-                    overlay_pin = \
-                        self._suffix_merge_pinned[:n_sfx, :width]
+                    overlay_pin = self._suffix_merge_pinned[:n_sfx, :width]
                     overlay_np = overlay_pin.numpy()
                     overlay_np[:] = 0
                     for j, idx in enumerate(suffix_indices):
@@ -1541,22 +1512,16 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                         slen = min(len(s), width)
                         overlay_np[j, :slen] = s[:slen]
                     # Pinned H2C -- truly non-blocking.
-                    overlay_t = overlay_pin.to(
-                        device=self.device, non_blocking=True)
+                    overlay_t = overlay_pin.to(device=self.device, non_blocking=True)
                     # Use pre-allocated pinned index buffer when
                     # available to avoid per-step allocation.
-                    idx_pinned = getattr(
-                        self, '_suffix_index_pinned', None)
+                    idx_pinned = getattr(self, "_suffix_index_pinned", None)
                     if idx_pinned is not None:
                         idx_pin = idx_pinned[:n_sfx]
-                        idx_pin[:] = torch.tensor(
-                            suffix_indices, dtype=torch.long)
+                        idx_pin[:] = torch.tensor(suffix_indices, dtype=torch.long)
                     else:
-                        idx_pin = torch.tensor(
-                            suffix_indices, dtype=torch.long
-                        ).pin_memory()
-                    idx_t = idx_pin.to(
-                        device=self.device, non_blocking=True)
+                        idx_pin = torch.tensor(suffix_indices, dtype=torch.long).pin_memory()
+                    idx_t = idx_pin.to(device=self.device, non_blocking=True)
                     merged.index_copy_(0, idx_t, overlay_t)
 
                 self._draft_token_ids = merged
@@ -1565,17 +1530,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 # Track actual draft lengths for next step's allocation.
                 _n_predict = self.drafter.model.n_predict
                 _batch_size = len(self.input_batch.req_ids)
-                _disable_bs = (
-                    self.speculative_config.disable_by_batch_size
-                    if self.speculative_config else None
-                )
+                _disable_bs = self.speculative_config.disable_by_batch_size if self.speculative_config else None
                 _draft_limit = _batch_size
                 if _disable_bs and _batch_size > _disable_bs:
                     _draft_limit = _disable_bs
                 _actual_lens: dict[str, int] = {}
                 for _i, _req_id in enumerate(self.input_batch.req_ids):
-                    _s = (len(suffix_draft[_i])
-                          if _i < len(suffix_draft) else 0)
+                    _s = len(suffix_draft[_i]) if _i < len(suffix_draft) else 0
                     _a = _n_predict if _i < _draft_limit else 0
                     # Suffix takes priority when available.
                     _actual_lens[_req_id] = _s if _s > 0 else _a
@@ -1598,13 +1559,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 # default stream (waits for the rejection kernel, which
                 # is lightweight), then parse_output performs CPU-side
                 # rejection to extract accepted token IDs.
-                with record_function_or_nullcontext(
-                    "gpu_model_runner: draft (suffix)"
-                ):
+                with record_function_or_nullcontext("gpu_model_runner: draft (suffix)"):
                     num_reqs = self.input_batch.num_reqs
-                    discard_indices = np.nonzero(
-                        self.discard_request_mask.np[:num_reqs]
-                    )[0]
+                    discard_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
                     n_cols = sampled_token_ids.shape[-1]
                     if n_cols == 1:
                         sampled_cpu = sampled_token_ids.tolist()
@@ -1618,14 +1575,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                         )
 
                     self._update_suffix_cache(sampled_cpu)
-                    suffix_results = self.propose_suffix_draft_token_ids(
-                        sampled_cpu
-                    )
-                    suffix_draft = [
-                        result.token_ids if result.score >= 0
-                        else []
-                        for result in suffix_results
-                    ]
+                    suffix_results = self.propose_suffix_draft_token_ids(sampled_cpu)
+                    suffix_draft = [result.token_ids if result.score >= 0 else [] for result in suffix_results]
 
                 # Build GPU tensor from suffix lists via pinned buffer.
                 k = self.num_spec_tokens
@@ -1637,15 +1588,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     if s:
                         slen = min(len(s), k)
                         pin_np[i, :slen] = s[:slen]
-                self._draft_token_ids = pin.to(
-                    device=self.device, non_blocking=True)
+                self._draft_token_ids = pin.to(device=self.device, non_blocking=True)
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
                 # Track actual draft lengths for next step's allocation.
                 _actual_lens_b2: dict[str, int] = {}
                 for _i, _req_id in enumerate(self.input_batch.req_ids):
-                    _s = (len(suffix_draft[_i])
-                          if _i < len(suffix_draft) else 0)
+                    _s = len(suffix_draft[_i]) if _i < len(suffix_draft) else 0
                     _actual_lens_b2[_req_id] = _s
                 self._prev_actual_draft_lens = _actual_lens_b2
                 scheduler_output._actual_draft_lens = _actual_lens_b2
@@ -1677,11 +1626,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # filters out -1 to build the CPU list for
         # prepare_next_token_ids_cpu and keeps the raw tensor for
         # prepare_hidden_states.
-        if (
-            self.speculative_config is not None
-            and not use_async_spec
-            and input_fits_in_drafter
-        ):
+        if self.speculative_config is not None and not use_async_spec and input_fits_in_drafter:
             propose_draft_token_ids(sampled_token_ids)
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
@@ -1689,9 +1634,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:
-                from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-                    RoutedExpertsCapturer,
-                )
+                from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
                 capturer = RoutedExpertsCapturer.get_instance()
                 if capturer is not None:
@@ -1706,9 +1649,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 kv_connector_output=kv_connector_output,
-                ec_connector_output=ec_connector_output
-                if self.supports_mm_inputs
-                else None,
+                ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
@@ -1716,15 +1657,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # scheduler can read them reliably in update_from_output.
             # This survives the async pipeline (scheduler_output attrs
             # may not due to object lifecycle in the batch queue).
-            output._actual_draft_lens = getattr(
-                scheduler_output, '_actual_draft_lens', None)
+            output._actual_draft_lens = getattr(scheduler_output, "_actual_draft_lens", None)
 
         if not self.use_async_scheduling:
             return output
 
-        with record_function_or_nullcontext(
-            "gpu_model_runner: AsyncGPUModelRunnerOutput"
-        ):
+        with record_function_or_nullcontext("gpu_model_runner: AsyncGPUModelRunnerOutput"):
             async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=output,
                 sampled_token_ids=sampler_output.sampled_token_ids,
@@ -1734,9 +1672,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 vocab_size=self.input_batch.vocab_size,
                 num_nans=num_nans_device,
             )
-        with record_function_or_nullcontext(
-            "gpu_model_runner: set_async_sampled_token_ids"
-        ):
+        with record_function_or_nullcontext("gpu_model_runner: set_async_sampled_token_ids"):
             # Save ref of sampled_token_ids CPU tensor if the batch contains
             # any requests with sampling params that require output ids.
             self.input_batch.set_async_sampled_token_ids(
@@ -1747,9 +1683,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         return async_output
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
-        load_shift_model = bool(
-            getattr(self.vllm_config.parallel_config, "enable_shift_parallel", False)
-        )
+        load_shift_model = bool(getattr(self.vllm_config.parallel_config, "enable_shift_parallel", False))
 
         if load_shift_model:
             shift_config = copy.deepcopy(self.vllm_config)
@@ -1769,20 +1703,21 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 self.shift_model = get_model(vllm_config=shift_config)
             torch.cuda.set_device(self.device)
             self.shift_parallel_threshold = getattr(
-                shift_config.parallel_config, "shift_parallel_threshold", 512,
+                shift_config.parallel_config,
+                "shift_parallel_threshold",
+                512,
             )
-            self.shift_forward_context = (
-                shift_config.compilation_config.static_forward_context
-            )
+            self.shift_forward_context = shift_config.compilation_config.static_forward_context
 
-            from vllm.distributed.device_communicators.cuda_communicator import (
-                CudaCommunicator,
-            )
+            from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+
             sp_tp = parallel_state._SP_TP
-            if (sp_tp is not None
-                    and sp_tp.device_communicator is not None
-                    and isinstance(sp_tp.device_communicator, CudaCommunicator)
-                    and sp_tp.device_communicator.ca_comm is not None):
+            if (
+                sp_tp is not None
+                and sp_tp.device_communicator is not None
+                and isinstance(sp_tp.device_communicator, CudaCommunicator)
+                and sp_tp.device_communicator.ca_comm is not None
+            ):
                 sp_tp.device_communicator.ca_comm.disabled = True
 
             self._shift_logits_perm = self._compute_shift_logits_perm()
@@ -1791,8 +1726,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 if hasattr(self.model, "model") and hasattr(self.model.model, "decode_runner"):
                     self.model.model.decode_runner = self.shift_model.model.decode_runner
                 else:
-                    logger.warning("Could not apply SwiftKV HACK: "
-                                   "model.model.decode_runner not found.")
+                    logger.warning("Could not apply SwiftKV HACK: model.model.decode_runner not found.")
         else:
             self.shift_model = None
             self.shift_parallel_threshold = 0
@@ -1809,21 +1743,21 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
     def initialize_kv_cache(self, kv_cache_config, *args, **kwargs) -> None:
         self._orig_initialize_kv_cache(kv_cache_config, *args, **kwargs)
-        shift_ctx = getattr(self, 'shift_forward_context', None)
+        shift_ctx = getattr(self, "shift_forward_context", None)
         if shift_ctx is None:
             return
         base_ctx = self.compilation_config.static_forward_context
         bound = 0
         for name, shift_attn in shift_ctx.items():
             base_attn = base_ctx.get(name)
-            if base_attn is not None and hasattr(base_attn, 'kv_cache'):
+            if base_attn is not None and hasattr(base_attn, "kv_cache"):
                 shift_attn.kv_cache = base_attn.kv_cache
                 bound += 1
         if is_global_first_rank():
-            logger.info("Bound KV cache to %d shift model attention layers",
-                        bound)
+            logger.info("Bound KV cache to %d shift model attention layers", bound)
 
     from vllm.forward_context import BatchDescriptor
+
     def _case_bs(self, case) -> int:
         # vLLM can pass ints, tuples, or sometimes BatchDescriptor-like objects
         if isinstance(case, int):
@@ -1855,14 +1789,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         capture natively.  Custom all-reduce communicators were not set up through
         the normal vLLM graph_capture() path, so using them inside a CUDA graph
         would crash."""
-        from vllm.distributed.device_communicators.cuda_communicator import (
-            CudaCommunicator,
-        )
+        from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 
         def _get_ca_comm(group):
-            if (group is not None
-                    and group.device_communicator is not None
-                    and isinstance(group.device_communicator, CudaCommunicator)):
+            if (
+                group is not None
+                and group.device_communicator is not None
+                and isinstance(group.device_communicator, CudaCommunicator)
+            ):
                 return group.device_communicator.ca_comm
             return None
 
@@ -1889,8 +1823,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         dispatcher's padded-size lookup table to the shift (unscaled) values so
         vLLM internals (dispatcher, pad_for_cudagraph, bounds checks) all see the
         shift model's sizes."""
-        disp = getattr(self, 'cudagraph_dispatcher', None)
-        if disp is None or not hasattr(disp, '_bs_to_padded_graph_size'):
+        disp = getattr(self, "cudagraph_dispatcher", None)
+        if disp is None or not hasattr(disp, "_bs_to_padded_graph_size"):
             yield
             return
 
@@ -1925,8 +1859,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         graphs captured.  The shift path may profile-warmup with _dummy_run and
         capture at a possibly different runtime mode than the base model.
         """
-        assert cudagraph_runtime_mode != CUDAGraphMode.NONE and \
-            cudagraph_runtime_mode.is_valid_runtime_mode()
+        assert cudagraph_runtime_mode != CUDAGraphMode.NONE and cudagraph_runtime_mode.is_valid_runtime_mode()
 
         if (
             getattr(self.parallel_config, "ulysses_sequence_parallel_size", 1) <= 1
@@ -1949,24 +1882,21 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # base model would deadlock because the Ulysses all-to-all collectives
         # diverge across ranks at small batch sizes.
         if has_shift and not is_swiftkv:
-            batch_descriptors_base = [
-                case for case in batch_descriptors
-                if self._case_bs(case) > threshold
-            ]
+            batch_descriptors_base = [case for case in batch_descriptors if self._case_bs(case) > threshold]
         else:
             batch_descriptors_base = list(batch_descriptors)
 
         if is_global_first_rank():
             logger.info(
                 "base model (SP=%s, TP=%s) cudagraph mode %s shapes %s",
-                sp_size, tp_size, cudagraph_runtime_mode,
+                sp_size,
+                tp_size,
+                cudagraph_runtime_mode,
                 [self._case_bs(c) for c in batch_descriptors_base],
             )
 
         if batch_descriptors_base:
-            self._orig_capture_cudagraphs(
-                batch_descriptors_base, cudagraph_runtime_mode
-            )
+            self._orig_capture_cudagraphs(batch_descriptors_base, cudagraph_runtime_mode)
 
         # --- Shift model (SP*TP fused as TP-only): uses the unscaled lookup table ---
         # The incoming batch_descriptors contain *scaled* base sizes (e.g.
@@ -1980,8 +1910,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # Use the first base case as a template for non-bs fields
             template = batch_descriptors[0] if batch_descriptors else None
             batch_descriptors_shift = [
-                self._with_bs(template, bs) if template is not None else bs
-                for bs in reversed(shift_sizes)
+                self._with_bs(template, bs) if template is not None else bs for bs in reversed(shift_sizes)
             ]
 
             if is_global_first_rank():
@@ -1995,15 +1924,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 orig_model, self.model = self.model, self.shift_model
                 cc = self.vllm_config.compilation_config
                 base_ctx = cc.static_forward_context
-                shift_ctx = getattr(self, 'shift_forward_context', None)
+                shift_ctx = getattr(self, "shift_forward_context", None)
                 try:
                     if shift_ctx is not None:
                         cc.static_forward_context = shift_ctx
                     torch._dynamo.reset()
-                    with set_shift_parallel_mode(True), \
-                         self._use_shift_cudagraph_tables():
-                        max_shift = max(self._case_bs(c)
-                                        for c in batch_descriptors_shift)
+                    with set_shift_parallel_mode(True), self._use_shift_cudagraph_tables():
+                        max_shift = max(self._case_bs(c) for c in batch_descriptors_shift)
                         self._dummy_run(max_shift, is_profile=True)
                         torch.distributed.barrier()
                     shift_runtime_mode = (
@@ -2011,9 +1938,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                         if cudagraph_runtime_mode == CUDAGraphMode.FULL
                         else cudagraph_runtime_mode
                     )
-                    with set_shift_parallel_mode(True), \
-                         self._use_shift_cudagraph_tables(), \
-                         self._shift_graph_capture_context():
+                    with (
+                        set_shift_parallel_mode(True),
+                        self._use_shift_cudagraph_tables(),
+                        self._shift_graph_capture_context(),
+                    ):
                         self._orig_capture_cudagraphs(
                             batch_descriptors_shift,
                             shift_runtime_mode,

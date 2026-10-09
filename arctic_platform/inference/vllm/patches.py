@@ -25,22 +25,20 @@ from vllm.v1.worker.worker_base import WorkerBase
 import arctic_platform.inference.envs as envs
 from arctic_platform.inference.patching import ArcticPatch
 from arctic_platform.inference.utils import require_supported_vllm_version
-from arctic_platform.inference.vllm.args import EngineArgsPatch, AsyncEngineArgsPatch
-from arctic_platform.inference.vllm.config import (ParallelConfigPatch,
-                                          SpeculativeConfigPatch,
-                                          VllmConfigPatch,
-                                          MLPSpeculatorConfigPatch)
-from arctic_platform.inference.vllm.fp32_lm_head import (
-    apply_fp32_lm_head_patches, set_fp32_lm_head_enabled)
-from arctic_platform.inference.vllm.stats import (SpecDecodingStatsPatch,
-                                         SpecDecodingLoggingPatch)
-from arctic_platform.inference.vllm.structured_output import XgrammarBackendPatch
+from arctic_platform.inference.vllm.args import AsyncEngineArgsPatch
+from arctic_platform.inference.vllm.args import EngineArgsPatch
 from arctic_platform.inference.vllm.attention import apply_forest_cascade_patches
-from arctic_platform.inference.vllm.router_replay import (
-    patch_scheduler_check_stop as _patch_scheduler_check_stop,
-)
+from arctic_platform.inference.vllm.config import MLPSpeculatorConfigPatch
+from arctic_platform.inference.vllm.config import ParallelConfigPatch
+from arctic_platform.inference.vllm.config import SpeculativeConfigPatch
+from arctic_platform.inference.vllm.config import VllmConfigPatch
+from arctic_platform.inference.vllm.fp32_lm_head import apply_fp32_lm_head_patches
+from arctic_platform.inference.vllm.fp32_lm_head import set_fp32_lm_head_enabled
+from arctic_platform.inference.vllm.router_replay import patch_scheduler_check_stop as _patch_scheduler_check_stop
+from arctic_platform.inference.vllm.stats import SpecDecodingLoggingPatch
+from arctic_platform.inference.vllm.stats import SpecDecodingStatsPatch
+from arctic_platform.inference.vllm.structured_output import XgrammarBackendPatch
 from arctic_platform.inference.vllm.ulysses import apply_shift_parallel_patches
-
 
 logger = init_logger(__name__)
 require_supported_vllm_version("ArcticInference vLLM patches")
@@ -71,9 +69,7 @@ def _stop_token_sequence_matched(request) -> bool:
             from vllm.v1.request import RequestStatus
 
             request.status = RequestStatus.FINISHED_STOPPED
-            request.stop_reason = (
-                stop_reason if stop_reason is not None else "dss_stop_token_sequence"
-            )
+            request.stop_reason = stop_reason if stop_reason is not None else "dss_stop_token_sequence"
             return True
     return False
 
@@ -105,10 +101,7 @@ def _patch_scheduler_check_stop() -> None:
         if _stop_token_sequence_matched(request):
             return True
 
-        if (
-            request.num_tokens >= max_model_len
-            or request.num_output_tokens >= request.max_tokens
-        ):
+        if request.num_tokens >= max_model_len or request.num_output_tokens >= request.max_tokens:
             request.status = RequestStatus.FINISHED_LENGTH_CAPPED
             return True
 
@@ -153,10 +146,8 @@ class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
         # Respect disable_by_batch_size: only add spec token placeholders
         # for the first N decode requests (matching the worker's draft_limit
         # in propose_draft_token_ids).
-        spec_config = getattr(self.vllm_config, 'speculative_config', None)
-        disable_bs = (
-            spec_config.disable_by_batch_size if spec_config else None
-        )
+        spec_config = getattr(self.vllm_config, "speculative_config", None)
+        disable_bs = spec_config.disable_by_batch_size if spec_config else None
         decode_with_spec_count = 0
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
@@ -164,8 +155,7 @@ class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
                 continue
 
             scheduler_output.pending_structured_output_tokens |= (
-                request.use_structured_output
-                and request.num_output_placeholders > 0
+                request.use_structured_output and request.num_output_placeholders > 0
             )
 
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
@@ -188,11 +178,9 @@ class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
             # allocate only that many to avoid wasting attention
             # compute on zero-padded positions.
             # Cold start: allocate full width (generous).
-            prev_actual = getattr(
-                request, '_prev_actual_draft_len', None)
+            prev_actual = getattr(request, "_prev_actual_draft_len", None)
             if prev_actual is not None:
-                num_placeholders = min(
-                    max(prev_actual, 1), self.num_spec_tokens)
+                num_placeholders = min(max(prev_actual, 1), self.num_spec_tokens)
             else:
                 num_placeholders = self.num_spec_tokens
 
@@ -225,20 +213,17 @@ class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
         sampled_token_ids = model_runner_output.sampled_token_ids
         req_id_to_index = model_runner_output.req_id_to_index
 
-        result = Scheduler.update_from_output(
-            self, scheduler_output, model_runner_output)
+        result = Scheduler.update_from_output(self, scheduler_output, model_runner_output)
 
         # Primary path: read from model_runner_output (most reliable
         # for async scheduling — the ModelRunnerOutput object is
         # returned by get_output() and guaranteed to survive).
-        actual_lens = getattr(
-            model_runner_output, '_actual_draft_lens', None)
+        actual_lens = getattr(model_runner_output, "_actual_draft_lens", None)
 
         # Legacy path: read from scheduler_output (works for non-async
         # or same-process setups where the attribute is preserved).
         if not actual_lens:
-            actual_lens = getattr(
-                scheduler_output, '_actual_draft_lens', None)
+            actual_lens = getattr(scheduler_output, "_actual_draft_lens", None)
 
         if actual_lens:
             for req_id, actual_len in actual_lens.items():
@@ -264,8 +249,7 @@ class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
             return result
 
         for req_id in scheduler_output.num_scheduled_tokens:
-            scheduled_spec = (
-                scheduler_output.scheduled_spec_decode_tokens.get(req_id))
+            scheduled_spec = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             if not scheduled_spec:
                 continue
 
@@ -281,21 +265,18 @@ class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
             num_accepted = (len(generated) - 1) if generated else 0
             num_draft = len(scheduled_spec)
 
-            prev = getattr(request, '_prev_actual_draft_len', None)
+            prev = getattr(request, "_prev_actual_draft_len", None)
 
             if num_accepted > 0:
                 if num_accepted >= num_draft and num_draft > 0:
                     # All drafted tokens accepted — the drafter (or
                     # suffix cache) could produce more if given room.
                     # Double the allocation for exponential ramp-up.
-                    new_val = min(
-                        num_draft * 2, self.num_spec_tokens)
+                    new_val = min(num_draft * 2, self.num_spec_tokens)
                 else:
                     # Partial acceptance: grow linearly.
-                    new_val = min(
-                        num_accepted + 1, self.num_spec_tokens)
-                request._prev_actual_draft_len = max(
-                    prev or 0, new_val)
+                    new_val = min(num_accepted + 1, self.num_spec_tokens)
+                request._prev_actual_draft_len = max(prev or 0, new_val)
             elif prev is None:
                 # First step for this request, zero acceptance.
                 # Seed with 1 so _update_after_schedule doesn't
@@ -370,9 +351,7 @@ class WorkerPatch(ArcticPatch[Worker]):
         return state
 
     @staticmethod
-    def _restore_module_state(
-        module, state: dict[str, torch.Tensor]
-    ) -> None:
+    def _restore_module_state(module, state: dict[str, torch.Tensor]) -> None:
         for name, param in module.named_parameters():
             key = f"param.{name}"
             if key in state:
@@ -410,10 +389,7 @@ class WorkerPatch(ArcticPatch[Worker]):
             self._sleep_level = 2
 
             model = self.model_runner.model
-            self._sleep_saved_buffers = {
-                name: buffer.cpu().clone()
-                for name, buffer in model.named_buffers()
-            }
+            self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
         # vLLM 0.30 routes sleep through a pluggable backend instead of
         # calling CuMemAllocator directly. Preserve that abstraction while
@@ -434,6 +410,7 @@ class WorkerPatch(ArcticPatch[Worker]):
             # path (flag absent / False) preserves the original behavior.
             if not getattr(self, "_skip_main_reload_on_wake", False):
                 from arctic_platform.inference.vllm.model_runner import GPUModelRunnerPatch
+
                 GPUModelRunnerPatch._orig_reload_weights(self.model_runner)
 
             saved_drafter = getattr(self, "_sleep_saved_drafter_state", {})
@@ -449,6 +426,7 @@ class WorkerPatch(ArcticPatch[Worker]):
 def apply_arctic_patches():
 
     from transformers import AutoConfig
+
     from arctic_platform.inference.common.swiftkv import LlamaSwiftKVConfig
 
     # Register SwiftKV model configurations to transformers.
@@ -458,19 +436,17 @@ def apply_arctic_patches():
 
     # Register SwiftKV model definitions to vLLM.
     ModelRegistry.register_model(
-        "LlamaSwiftKVForCausalLM",
-        "arctic_platform.inference.vllm.swiftkv:LlamaSwiftKVForCausalLM")
+        "LlamaSwiftKVForCausalLM", "arctic_platform.inference.vllm.swiftkv:LlamaSwiftKVForCausalLM"
+    )
 
     # Register ArcticSpeculator models to vLLM.
-    from arctic_platform.inference.vllm.spec_dec.arctic_speculator import (
-        ArcticMLPSpeculator, ArcticLSTMSpeculator)
-    ModelRegistry.register_model("ArcticMLPSpeculatorPreTrainedModel",
-                                 ArcticMLPSpeculator)
-    ModelRegistry.register_model("ArcticLSTMSpeculatorPreTrainedModel",
-                                 ArcticLSTMSpeculator)
+    from arctic_platform.inference.vllm.spec_dec.arctic_speculator import ArcticLSTMSpeculator
+    from arctic_platform.inference.vllm.spec_dec.arctic_speculator import ArcticMLPSpeculator
+
+    ModelRegistry.register_model("ArcticMLPSpeculatorPreTrainedModel", ArcticMLPSpeculator)
+    ModelRegistry.register_model("ArcticLSTMSpeculatorPreTrainedModel", ArcticLSTMSpeculator)
     # This name is currently used in corvo
-    ModelRegistry.register_model("MLPVariantSpeculatorPreTrainedModel",
-                                 ArcticLSTMSpeculator)
+    ModelRegistry.register_model("MLPVariantSpeculatorPreTrainedModel", ArcticLSTMSpeculator)
 
     WorkerBasePatch.apply_patch()
 
@@ -507,7 +483,6 @@ def apply_arctic_patches():
 
     # kvcached prefix-cache patches (only when kvcached autopatch is active).
     if os.environ.get("KVCACHED_AUTOPATCH", "").lower() in ("1", "true"):
-        from arctic_platform.inference.vllm.kvcached.patches import (
-            apply_kvcached_prefix_cache_patches,
-        )
+        from arctic_platform.inference.vllm.kvcached.patches import apply_kvcached_prefix_cache_patches
+
         apply_kvcached_prefix_cache_patches()

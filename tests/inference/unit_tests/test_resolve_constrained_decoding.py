@@ -64,9 +64,7 @@ class _FakeCompiledGrammar(dict):
 class _FakeCompiler:
 
     def compile_json_schema(self, spec, any_whitespace=True):
-        return _FakeCompiledGrammar(
-            kind="json", spec=spec, allowed=[{5}, {6}]
-        )
+        return _FakeCompiledGrammar(kind="json", spec=spec, allowed=[{5}, {6}])
 
     def compile_regex(self, spec):
         return _FakeCompiledGrammar(kind="regex", spec=spec, allowed=[{7}])
@@ -81,9 +79,7 @@ class _FakeCompiler:
                 spec=spec,
                 allowed=[{12}, {7}],
             )
-        return _FakeCompiledGrammar(
-            kind="structural_tag", spec=spec, allowed=[{7}]
-        )
+        return _FakeCompiledGrammar(kind="structural_tag", spec=spec, allowed=[{7}])
 
 
 class _FakeMatcher:
@@ -161,12 +157,8 @@ def _install_fake_replay(monkeypatch):
 
 def test_action_mask_replay_grammar_cache_uses_memory_budget(monkeypatch):
     replay = _install_fake_replay(monkeypatch)
-    monkeypatch.setattr(
-        replay, "_compiled_grammar_cache_budget_bytes", lambda: 250
-    )
-    monkeypatch.setattr(
-        replay, "_compiled_grammar_cache_max_entries", lambda: 10
-    )
+    monkeypatch.setattr(replay, "_compiled_grammar_cache_budget_bytes", lambda: 250)
+    monkeypatch.setattr(replay, "_compiled_grammar_cache_max_entries", lambda: 10)
     tokenizer = _FakeTokenizer()
 
     def params(index):
@@ -197,12 +189,8 @@ def test_action_mask_replay_grammar_cache_uses_memory_budget(monkeypatch):
 
 def test_action_mask_replay_grammar_cache_enforces_entry_limit(monkeypatch):
     replay = _install_fake_replay(monkeypatch)
-    monkeypatch.setattr(
-        replay, "_compiled_grammar_cache_budget_bytes", lambda: 10_000
-    )
-    monkeypatch.setattr(
-        replay, "_compiled_grammar_cache_max_entries", lambda: 2
-    )
+    monkeypatch.setattr(replay, "_compiled_grammar_cache_budget_bytes", lambda: 10_000)
+    monkeypatch.setattr(replay, "_compiled_grammar_cache_max_entries", lambda: 2)
     tokenizer = _FakeTokenizer()
 
     for index in range(3):
@@ -215,16 +203,12 @@ def test_action_mask_replay_grammar_cache_enforces_entry_limit(monkeypatch):
         )
 
     assert len(replay._COMPILED_GRAMMARS) == 2
-    assert replay.action_mask_replay_cache_stats()[
-        "compiled_grammar_evictions"
-    ] == 1
+    assert replay.action_mask_replay_cache_stats()["compiled_grammar_evictions"] == 1
 
 
 def test_action_mask_replay_does_not_cache_grammar_over_budget(monkeypatch):
     replay = _install_fake_replay(monkeypatch)
-    monkeypatch.setattr(
-        replay, "_compiled_grammar_cache_budget_bytes", lambda: 50
-    )
+    monkeypatch.setattr(replay, "_compiled_grammar_cache_budget_bytes", lambda: 50)
     tokenizer = _FakeTokenizer()
     params = SimpleNamespace(
         json={"type": "object"},
@@ -236,9 +220,7 @@ def test_action_mask_replay_does_not_cache_grammar_over_budget(monkeypatch):
 
     assert first is not second
     assert not replay._COMPILED_GRAMMARS
-    assert replay.action_mask_replay_cache_stats()[
-        "compiled_grammar_oversized_skips"
-    ] == 2
+    assert replay.action_mask_replay_cache_stats()["compiled_grammar_oversized_skips"] == 2
 
 
 def test_action_mask_cache_stats_reach_scheduler_metrics(monkeypatch):
@@ -264,9 +246,7 @@ def test_action_mask_cache_stats_reach_scheduler_metrics(monkeypatch):
             return result()
 
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler._workers = [
-        SimpleNamespace(handle=SimpleNamespace(drain_metrics=DrainRemote()))
-    ]
+    scheduler._workers = [SimpleNamespace(handle=SimpleNamespace(drain_metrics=DrainRemote()))]
     scheduler._concurrency_history = []
     scheduler._request_records = SimpleNamespace(drain=lambda: [])
 
@@ -276,7 +256,8 @@ def test_action_mask_cache_stats_reach_scheduler_metrics(monkeypatch):
 
 
 def test_vllm_qwen_parser_natively_ends_reasoning_at_tool_call():
-    from vllm.parser.qwen3 import Qwen3Parser, qwen3_config
+    from vllm.parser.qwen3 import Qwen3Parser
+    from vllm.parser.qwen3 import qwen3_config
     from vllm.reasoning import ReasoningParserManager
 
     parser_engine = Qwen3Parser.__new__(Qwen3Parser)
@@ -298,11 +279,9 @@ def test_vllm_qwen_parser_natively_ends_reasoning_at_tool_call():
 
 
 def test_disabled_arctic_plugin_applies_required_runtime_patches(monkeypatch):
-    from arctic_platform.inference.vllm import (
-        fp32_lm_head,
-        plugin,
-        required_patches,
-    )
+    from arctic_platform.inference.vllm import fp32_lm_head
+    from arctic_platform.inference.vllm import plugin
+    from arctic_platform.inference.vllm import required_patches
 
     calls = []
     monkeypatch.setattr(plugin.envs, "ARCTIC_INFERENCE_SKIP_VERSION_CHECK", True)
@@ -356,14 +335,13 @@ def test_worker_coerces_guided_json_for_vllm():
 
 
 def test_worker_prefills_think_for_thinking_request():
-    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker
+    from arctic_platform.inference.server.worker import WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
     captured = {}
 
-    async def fake_generate_once(
-        prompt_input, _params, _request_id, *, reasoning_ended, **_kwargs
-    ):
+    async def fake_generate_once(prompt_input, _params, _request_id, *, reasoning_ended, **_kwargs):
         captured["prompt_input"] = prompt_input
         captured["reasoning_ended"] = reasoning_ended
         choice = SimpleNamespace(text="r</think>{}", token_ids=[1], finish_reason="stop", logprobs=None)
@@ -399,14 +377,13 @@ def test_worker_prefills_think_for_thinking_request():
 
 
 def test_worker_prefills_think_without_structured_outputs():
-    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker
+    from arctic_platform.inference.server.worker import WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
     captured = {}
 
-    async def fake_generate_once(
-        prompt_input, _params, _request_id, *, reasoning_ended, **_kwargs
-    ):
+    async def fake_generate_once(prompt_input, _params, _request_id, *, reasoning_ended, **_kwargs):
         captured["prompt_input"] = prompt_input
         captured["reasoning_ended"] = reasoning_ended
         choice = SimpleNamespace(text="r", token_ids=[1], finish_reason="stop", logprobs=None)
@@ -449,14 +426,13 @@ def test_worker_preserves_renderer_prefilled_think_for_thinking_request():
 
 
 def test_worker_disables_reasoning_for_structured_nothink_request():
-    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker
+    from arctic_platform.inference.server.worker import WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
     captured = {}
 
-    async def fake_generate_once(
-        prompt_input, _params, _request_id, *, reasoning_ended, **_kwargs
-    ):
+    async def fake_generate_once(prompt_input, _params, _request_id, *, reasoning_ended, **_kwargs):
         captured["prompt_input"] = prompt_input
         captured["reasoning_ended"] = reasoning_ended
         choice = SimpleNamespace(text="{}", token_ids=[1], finish_reason="stop", logprobs=None)
@@ -487,7 +463,8 @@ def test_worker_disables_reasoning_for_structured_nothink_request():
 
 
 def test_worker_uses_parser_without_returning_reasoning_or_masks():
-    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker
+    from arctic_platform.inference.server.worker import WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
 
@@ -520,7 +497,8 @@ def test_worker_uses_parser_without_returning_reasoning_or_masks():
 
 def test_worker_replays_action_masks_with_raw_completion_token_ids(monkeypatch):
     from arctic_platform.inference.server import action_mask_replay
-    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker
+    from arctic_platform.inference.server.worker import WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
     captured = {}
@@ -540,7 +518,9 @@ def test_worker_replays_action_masks_with_raw_completion_token_ids(monkeypatch):
     monkeypatch.setattr(action_mask_replay, "build_action_masks_for_output", fake_build_action_masks_for_output)
 
     async def fake_generate_once(*args, **kwargs):
-        choice = SimpleNamespace(text="<think>r</think>{}", token_ids=[10, 12, 11, 5, 6], finish_reason="stop", logprobs=None)
+        choice = SimpleNamespace(
+            text="<think>r</think>{}", token_ids=[10, 12, 11, 5, 6], finish_reason="stop", logprobs=None
+        )
         return SimpleNamespace(outputs=[choice], prompt_token_ids=[1, 2], num_cached_tokens=0, prompt_logprobs=None)
 
     fake_parser = SimpleNamespace(
@@ -585,9 +565,7 @@ def test_replays_action_masks_from_structured_output(monkeypatch):
         prompt_token_ids=[1, 2],
         completion_token_ids=[5, 6],
         text="{}",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(json={"type": "object"})
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
         tokenizer=_FakeTokenizer(),
     )
 
@@ -635,9 +613,7 @@ def test_replay_returns_empty_mask_for_empty_completion(monkeypatch):
         prompt_token_ids=[1, 2],
         completion_token_ids=[],
         text="",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(json={"type": "object"})
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
         tokenizer=_FakeTokenizer(),
     )
 
@@ -665,9 +641,7 @@ def test_replay_returns_empty_mask_for_empty_content_span(monkeypatch):
         prompt_token_ids=[1],
         completion_token_ids=[10, 12],
         text="<think>r",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(json={"type": "object"})
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
         tokenizer=_FakeTokenizer(),
         reasoning_parser=parser,
     )
@@ -707,9 +681,7 @@ def test_replay_returns_empty_mask_when_rows_are_allow_all(monkeypatch):
         prompt_token_ids=[1],
         completion_token_ids=[5],
         text="{",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(json={"type": "object"})
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
         tokenizer=_FakeTokenizer(),
     )
 
@@ -735,9 +707,7 @@ def test_replay_fails_when_generated_token_violates_mask(monkeypatch):
             prompt_token_ids=[1],
             completion_token_ids=[9],
             text="bad",
-            sampling_params=SimpleNamespace(
-                structured_outputs=StructuredOutputsParams(json={"type": "object"})
-            ),
+            sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
             tokenizer=_FakeTokenizer(),
         )
     message = str(exc_info.value)
@@ -762,9 +732,7 @@ def test_replay_constrains_only_reasoning_content_span(monkeypatch):
         prompt_token_ids=[1],
         completion_token_ids=[10, 12, 11, 5, 6],
         text="<think>r</think>{}",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(json={"type": "object"})
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
         tokenizer=_FakeTokenizer(),
         reasoning_parser=parser,
     )
@@ -790,9 +758,7 @@ def test_replay_skips_qwen_tool_call_reasoning_boundary_for_json(monkeypatch):
         prompt_token_ids=[1, 10],
         completion_token_ids=[12, 13, 5, 6],
         text="r<tool_call>{}",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(json={"type": "object"})
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
         tokenizer=_FakeTokenizer(),
         reasoning_parser=parser,
         reasoning_ended=False,
@@ -817,9 +783,7 @@ def test_replay_covers_full_completion_when_structured_outputs_are_enabled_in_re
         prompt_token_ids=[1],
         completion_token_ids=[12, 7],
         text="rok",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(structural_tag='{"full": true}')
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(structural_tag='{"full": true}')),
         tokenizer=_FakeTokenizer(),
         reasoning_parser=parser,
         reasoning_ended=False,
@@ -845,9 +809,7 @@ def test_replay_error_reports_streaming_reasoning_boundary(monkeypatch):
             prompt_token_ids=[1, 10],
             completion_token_ids=[12, 13, 9],
             text="r<tool_call>bad",
-            sampling_params=SimpleNamespace(
-                structured_outputs=StructuredOutputsParams(json={"type": "object"})
-            ),
+            sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
             tokenizer=_FakeTokenizer(),
             reasoning_parser=parser,
             reasoning_ended=False,
@@ -874,9 +836,7 @@ def test_replay_returns_empty_masks_when_reasoning_never_ends(monkeypatch):
         prompt_token_ids=[1, 10],
         completion_token_ids=[12],
         text="r",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(json={"type": "object"})
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
         tokenizer=_FakeTokenizer(),
         reasoning_parser=parser,
         reasoning_ended=False,
@@ -906,9 +866,7 @@ def test_replay_uses_parser_content_ids_when_they_cover_full_completion(monkeypa
         prompt_token_ids=[1],
         completion_token_ids=[5, 6],
         text="{}",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(json={"type": "object"})
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
         tokenizer=_FakeTokenizer(),
         reasoning_parser=parser,
     )
@@ -934,9 +892,7 @@ def test_replay_prefers_parser_content_ids_before_text_parsing(monkeypatch):
         prompt_token_ids=[1],
         completion_token_ids=[10, 12, 11, 5, 6],
         text="<think>r</think>{}",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(json={"type": "object"})
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
         tokenizer=_FakeTokenizer(),
         reasoning_parser=parser,
     )
@@ -967,9 +923,7 @@ def test_replay_does_not_retokenize_content_when_parser_ids_align(monkeypatch):
         prompt_token_ids=[1],
         completion_token_ids=[10, 12, 11, 5, 6],
         text="<think>r</think>{}",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(json={"type": "object"})
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
         tokenizer=tokenizer,
         reasoning_parser=parser,
     )
@@ -995,9 +949,7 @@ def test_replay_uses_full_completion_when_reasoning_already_ended(monkeypatch):
         prompt_token_ids=[1],
         completion_token_ids=[5, 6],
         text="{}",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(json={"type": "object"})
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
         tokenizer=_FakeTokenizer(),
         reasoning_parser=parser,
         reasoning_ended=True,
@@ -1019,9 +971,7 @@ def test_replay_falls_back_to_think_close_when_content_text_does_not_retokenize(
         prompt_token_ids=[1],
         completion_token_ids=[10, 12, 11, 5, 6],
         text="<think>r</think>{}",
-        sampling_params=SimpleNamespace(
-            structured_outputs=StructuredOutputsParams(json={"type": "object"})
-        ),
+        sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
         tokenizer=_FakeTokenizer(),
         reasoning_parser=parser,
     )
@@ -1045,9 +995,7 @@ def test_replay_fails_without_parser_ids_or_reasoning_boundary(monkeypatch):
             prompt_token_ids=[1],
             completion_token_ids=[10, 12, 5, 6],
             text="<think>r{}",
-            sampling_params=SimpleNamespace(
-                structured_outputs=StructuredOutputsParams(json={"type": "object"})
-            ),
+            sampling_params=SimpleNamespace(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
             tokenizer=_FakeTokenizer(),
             reasoning_parser=parser,
         )
@@ -1079,7 +1027,8 @@ def test_action_mask_normalizer_accepts_integral_floats_and_rejects_fractional()
 
 
 def test_worker_returns_action_masks_from_server_replay(monkeypatch):
-    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker
+    from arctic_platform.inference.server.worker import WorkerLifecycleState
 
     _install_fake_replay(monkeypatch)
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
@@ -1131,7 +1080,8 @@ def test_worker_returns_action_masks_from_server_replay(monkeypatch):
 
 
 def test_worker_can_return_reasoning_fields_when_enabled():
-    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker
+    from arctic_platform.inference.server.worker import WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
 
@@ -1162,12 +1112,15 @@ def test_worker_can_return_reasoning_fields_when_enabled():
 
 
 def test_worker_returns_reasoning_and_content_token_ids_when_enabled():
-    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
+    from arctic_platform.inference.server.worker import InferenceWorker
+    from arctic_platform.inference.server.worker import WorkerLifecycleState
 
     WorkerClass = InferenceWorker.__ray_metadata__.modified_class
 
     async def fake_generate_once(*args, **kwargs):
-        choice = SimpleNamespace(text="<think>r</think>{}", token_ids=[10, 12, 11, 5, 6], finish_reason="stop", logprobs=None)
+        choice = SimpleNamespace(
+            text="<think>r</think>{}", token_ids=[10, 12, 11, 5, 6], finish_reason="stop", logprobs=None
+        )
         return SimpleNamespace(outputs=[choice], prompt_token_ids=[9], num_cached_tokens=0, prompt_logprobs=None)
 
     fake_parser = SimpleNamespace(
@@ -1270,7 +1223,9 @@ def test_worker_does_not_inject_resolve_reasoning_parser_plugin(monkeypatch):
         def from_vllm_config(cls, *_args, **_kwargs):
             return object()
 
-    monkeypatch.setattr("arctic_platform.inference.server.worker._create_async_engine_args", fake_create_async_engine_args)
+    monkeypatch.setattr(
+        "arctic_platform.inference.server.worker._create_async_engine_args", fake_create_async_engine_args
+    )
     monkeypatch.setattr("vllm.v1.engine.async_llm.AsyncLLM", FakeAsyncLLM)
 
     import asyncio

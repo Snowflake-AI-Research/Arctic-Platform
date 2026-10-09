@@ -205,24 +205,40 @@ class ModelSpec(BaseModel):
 
     @classmethod
     def from_ds_worker_config(cls, model_name: str, ds_worker_config: dict) -> "ModelSpec":
-        """Transitional bridge: map flat verl ``ds_worker_config`` into a ``ModelSpec``.
-
-        Callers (adapter / SFT demos) own the knobs on the flat dict today. Longer-term,
-        ``ModelSpec`` should be constructed upstream as part of the main client config
-        instead of being inferred here.
-        """
+        """Map the transitional flat DeepSpeed worker config into the native model spec."""
         cfg = ds_worker_config or {}
-
-        # Require an explicit attention backend. ZoRRo Train needs a flash-attention
-        # implementation; do not invent a second default here (ModelSpec leaves it None).
-        if "attn_implementation" not in cfg or cfg["attn_implementation"] is None:
+        attention = cfg.get("attn_implementation")
+        if attention is None:
             raise ValueError(
                 "from_ds_worker_config requires attn_implementation (ZoRRo Train needs a flash-attention backend)."
             )
 
+        ep_size = int(cfg.get("ep_size", 1))
+        sp_size = int(cfg.get("sp_size", 1))
+        if ep_size > 1:
+            from arctic_platform.model.loaders.qwen3_5_moe import DebugModelOptions
+            from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+
+            effective = {**cfg, **(cfg.get("prime_rl") or {})}
+            option_keys = set(Qwen3_5MoeOptions.model_fields) - {"debug"}
+            options = {key: effective[key] for key in option_keys if key in effective}
+            debug = effective.get("debug")
+            if isinstance(debug, dict):
+                loader_debug = {key: debug[key] for key in DebugModelOptions.model_fields if key in debug}
+                if loader_debug:
+                    options["debug"] = loader_debug
+            return cls(
+                model_path_or_name=model_name,
+                dtype=str(effective.get("optimization_dtype", "bfloat16")),
+                attn_implementation=attention,
+                loader="qwen3_5_moe",
+                parallelism=ParallelismConfig(expert_parallel=ep_size, sequence_parallel=sp_size),
+                loader_options=options,
+                patches=Patches(peft=cfg.get("peft_config")),
+            )
+
         zorro_train_patch = None
         if cfg.get("zorro_train_enable", False):
-            # Only forward keys present in cfg; ZorroTrainPatch pydantic defaults fill the rest.
             zorro_keys = (
                 "response_len",
                 "max_token_len",
@@ -235,18 +251,44 @@ class ModelSpec(BaseModel):
                 "logits_compute_from_fp32_inputs",
                 "logits_compute_in_fp32",
             )
-            zorro_train_patch = ZorroTrainPatch(**{k: cfg[k] for k in zorro_keys if k in cfg})
+            zorro_train_patch = ZorroTrainPatch(**{key: cfg[key] for key in zorro_keys if key in cfg})
 
-        # Worker bridge defaults GC on (historical DeepSpeedWorker behavior). Generic
-        # ``Patches.gradient_checkpointing`` stays False for direct ModelSpec users.
+        activation_offload = None
+        offload = (cfg.get("ac_config") or {}).get("offload_config") or {}
+        if offload.get("enabled", False):
+            activation_offload = {
+                key: value for key, value in offload.items() if key != "enabled" and value is not None
+            }
+
+        token_chunk = cfg.get("fused_lm_head_token_chunk_size")
+        if not isinstance(token_chunk, int) or isinstance(token_chunk, bool):
+            token_chunk = None
+        fp32_lm_head = bool(cfg.get("fp32_lm_head", False))
+        lm_head = None
+        if fp32_lm_head or token_chunk is not None:
+            lm_head = {
+                "fp32": fp32_lm_head,
+                "token_chunk_size": token_chunk,
+                "vocab_chunk_size": int(cfg.get("fused_lm_head_vocab_chunk_size", 8192)),
+            }
+        tiled_mlp = None
+        if cfg.get("tiled_mlp_token_chunk_size") is not None:
+            tiled_mlp = {"token_chunk_size": int(cfg["tiled_mlp_token_chunk_size"])}
+
+        gradient_checkpointing = cfg.get("activation_checkpointing", cfg.get("enable_gradient_checkpointing", True))
         return cls(
             model_path_or_name=model_name,
-            dtype="bfloat16",
-            attn_implementation=cfg["attn_implementation"],
+            dtype=str(cfg.get("optimization_dtype", "bfloat16")),
+            attn_implementation=attention,
+            parallelism=ParallelismConfig(sequence_parallel=sp_size),
             patches=Patches(
-                liger=cfg.get("use_liger", False),
+                liger=bool(cfg.get("use_liger", False) or cfg.get("model_provider") == "liger"),
                 zorro_train=zorro_train_patch,
-                gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
+                gradient_checkpointing=gradient_checkpointing,
+                activation_offload=activation_offload,
+                compile=cfg.get("compile"),
+                tiled_mlp=tiled_mlp,
+                lm_head=lm_head,
                 peft=cfg.get("peft_config"),
             ),
         )

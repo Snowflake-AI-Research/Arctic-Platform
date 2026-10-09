@@ -53,15 +53,9 @@ def convert_nemotron_h_layer_to_vllm(
         layer_sd[f"{prefix}.mixer.experts.w2_weight"] = layer_sd.pop(w2_key)
     layer_sd.pop(f"{prefix}.mlp.experts.w3", None)
 
-    _rename_prefix(
-        layer_sd, f"{prefix}.mlp.shared_expert.", f"{prefix}.mixer.shared_experts."
-    )
-    _rename_prefix(
-        layer_sd, f"{prefix}.mlp.fc1_latent_proj.", f"{prefix}.mixer.fc1_latent_proj."
-    )
-    _rename_prefix(
-        layer_sd, f"{prefix}.mlp.fc2_latent_proj.", f"{prefix}.mixer.fc2_latent_proj."
-    )
+    _rename_prefix(layer_sd, f"{prefix}.mlp.shared_expert.", f"{prefix}.mixer.shared_experts.")
+    _rename_prefix(layer_sd, f"{prefix}.mlp.fc1_latent_proj.", f"{prefix}.mixer.fc1_latent_proj.")
+    _rename_prefix(layer_sd, f"{prefix}.mlp.fc2_latent_proj.", f"{prefix}.mixer.fc2_latent_proj.")
 
     for buf_key in (f"{prefix}.mlp.expert_bias", f"{prefix}.mlp.tokens_per_expert"):
         layer_sd.pop(buf_key, None)

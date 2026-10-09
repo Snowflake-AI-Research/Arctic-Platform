@@ -4,29 +4,31 @@ import pickle
 import pytest
 import torch
 
-from arctic_platform.inference.server.router_replay import (
-    RouterReplayCacheRX,
-    RouterReplayCacheTX,
-    RouterReplayMissingError,
-)
-from arctic_platform.inference.server.router_replay.all2all import (
-    RouterReplayGroup,
-    _compute_plan,
-    _missing_is_tolerated,
-    _PerRankManifest,
-)
+from arctic_platform.inference.server.router_replay import RouterReplayCacheRX
+from arctic_platform.inference.server.router_replay import RouterReplayCacheTX
+from arctic_platform.inference.server.router_replay import RouterReplayMissingError
+from arctic_platform.inference.server.router_replay.all2all import RouterReplayGroup
+from arctic_platform.inference.server.router_replay.all2all import _compute_plan
+from arctic_platform.inference.server.router_replay.all2all import _missing_is_tolerated
+from arctic_platform.inference.server.router_replay.all2all import _PerRankManifest
 
 
 def _sender(rank, held, shape=(4, 2, 2), supports_allow_missing=True):
     return _PerRankManifest(
-        role="sender", rank=rank, held=list(held), shapes={sid: list(shape) for sid in held},
+        role="sender",
+        rank=rank,
+        held=list(held),
+        shapes={sid: list(shape) for sid in held},
         supports_allow_missing=supports_allow_missing,
     )
 
 
 def _receiver(rank, needed, allow_missing=False, supports_allow_missing=True):
     return _PerRankManifest(
-        role="receiver", rank=rank, needed=list(needed), allow_missing=allow_missing,
+        role="receiver",
+        rank=rank,
+        needed=list(needed),
+        allow_missing=allow_missing,
         supports_allow_missing=supports_allow_missing,
     )
 
@@ -225,5 +227,6 @@ def test_legacy_sender_does_not_matter_when_nothing_is_missing():
     rx = RouterReplayCacheRX(device=torch.device("cpu"), max_bytes=1 << 20)
 
     assert group.recv(rx, needed_sample_ids=["rr1:a"], allow_missing=True) == {
-        "tensors_recv": 1, "dropped_sample_ids": [],
+        "tensors_recv": 1,
+        "dropped_sample_ids": [],
     }

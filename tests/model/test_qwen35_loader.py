@@ -19,6 +19,7 @@ import json
 import sys
 
 import pytest
+import torch
 from torch import nn
 
 from arctic_platform.model import ModelSpec
@@ -105,16 +106,19 @@ def test_liger_fused_cross_entropy_allows_fp32_lm_head():
     assert options.fp32_lm_head is True
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"dtype": "float16"},
-        {"patches": Patches(peft={"peft_type": "Lora"})},
-    ],
-)
-def test_spec_cannot_silently_ignore_settings(kwargs):
+def test_spec_rejects_unsupported_dtype():
     with pytest.raises(ValueError):
-        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", **kwargs)
+        ModelSpec(model_path_or_name="local", loader="qwen3_5_moe", dtype="float16")
+
+
+def test_spec_accepts_peft_patch():
+    spec = ModelSpec(
+        model_path_or_name="local",
+        loader="qwen3_5_moe",
+        patches=Patches(peft={"peft_type": "Lora", "target_modules": ["q_proj"]}),
+    )
+
+    assert spec.patches.peft == {"peft_type": "Lora", "target_modules": ["q_proj"]}
 
 
 def test_runtime_groups_are_required():
@@ -181,6 +185,14 @@ def test_runtime_config_is_derived_from_validated_options():
     assert config.ac.offload_config.keep_last_n == 3
 
 
+def test_deepep_combine_casts_fp32_expert_output_to_bf16():
+    pytest.importorskip("deep_ep")
+    from arctic_platform.model.implementations.moe.distributed.deepep import _combine_wire_input
+
+    expert_output = torch.empty(2, 8, dtype=torch.float32)
+    assert _combine_wire_input(expert_output).dtype == torch.bfloat16
+
+
 def test_legacy_qwen_types_are_shared():
     from arctic_platform.model.implementations.moe.layers.moe import MoE
     from arctic_platform.model.implementations.qwen35.models.layers.moe import MoE as LegacyMoE
@@ -203,3 +215,69 @@ from arctic_platform.model.implementations import fp8
 print('Standalone MoE and FP8 imports passed')
 """
         execute_subprocess_async([sys.executable, "-c", code], env=self.get_env(), timeout=60)
+
+
+def test_packed_sequence_indices_preserve_batch_shape():
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _packed_sequence_indices,
+    )
+
+    indices = _packed_sequence_indices(
+        torch.tensor([0, 2, 4, 8], dtype=torch.int32),
+        batch_size=2,
+        seq_len=4,
+        device=torch.device("cpu"),
+    )
+
+    assert indices.tolist() == [[0, 0, 1, 1], [2, 2, 2, 2]]
+
+
+def test_packed_sequence_indices_reject_incomplete_boundaries():
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _packed_sequence_indices,
+    )
+
+    with pytest.raises(ValueError, match=r"describe 3 tokens.*contain 8"):
+        _packed_sequence_indices(
+            torch.tensor([0, 3], dtype=torch.int32),
+            batch_size=2,
+            seq_len=4,
+            device=torch.device("cpu"),
+        )
+
+
+def test_segmented_qwen35_short_conv_resets_packed_boundaries():
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _has_multiple_packed_sequences,
+    )
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _segmented_causal_conv1d,
+    )
+
+    conv = nn.Conv1d(1, 1, kernel_size=3, groups=1, padding=2, bias=False)
+    conv.weight.data.fill_(1.0)
+    x = torch.tensor([[[1.0, 2.0, 10.0, 20.0, 30.0]]])
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    segmented = _segmented_causal_conv1d(conv, x, cu_seqlens)
+    unsegmented = torch.nn.functional.silu(conv(x)[:, :, : x.shape[-1]])
+
+    assert _has_multiple_packed_sequences(cu_seqlens)
+    assert segmented.shape == x.shape
+    assert segmented[:, :, 2].item() != unsegmented[:, :, 2].item()
+    assert segmented[:, :, 2].item() == torch.nn.functional.silu(torch.tensor(10.0)).item()
+
+
+def test_segmented_qwen35_short_conv_rejects_unflattened_packed_input():
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        _segmented_causal_conv1d,
+    )
+
+    conv = nn.Conv1d(1, 1, kernel_size=3, groups=1, padding=2, bias=False)
+
+    with pytest.raises(ValueError, match=r"describe 8 tokens.*contains 4"):
+        _segmented_causal_conv1d(
+            conv,
+            torch.randn(2, 1, 4),
+            torch.tensor([0, 4, 8], dtype=torch.int32),
+        )

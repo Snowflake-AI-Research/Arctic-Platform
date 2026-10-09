@@ -16,12 +16,18 @@ from torch import nn
 logger = logging.getLogger(__name__)
 
 _SF_DTYPE_MAP = {
-    "F16": torch.float16, "BF16": torch.bfloat16,
-    "F32": torch.float32, "F64": torch.float64,
-    "I8": torch.int8, "I16": torch.int16,
-    "I32": torch.int32, "I64": torch.int64,
-    "U8": torch.uint8, "BOOL": torch.bool,
-    "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "I8": torch.int8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
 }
 
 
@@ -29,8 +35,8 @@ _SF_DTYPE_MAP = {
 # NCCL group creation (shared by sender + receiver)
 # ---------------------------------------------------------------------------
 
-def stateless_init_nccl(master_addr, master_port, rank, world_size, device,
-                        *, is_server=None):
+
+def stateless_init_nccl(master_addr, master_port, rank, world_size, device, *, is_server=None):
     """Create an independent PyNcclCommunicator via StatelessProcessGroup.
 
     When *is_server* is ``None`` (default), ``rank == 0`` creates the TCP
@@ -39,12 +45,11 @@ def stateless_init_nccl(master_addr, master_port, rank, world_size, device,
     allows one direction of connectivity (e.g. training → inference).
     """
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-    from vllm.distributed.utils import StatelessProcessGroup, create_tcp_store
+    from vllm.distributed.utils import StatelessProcessGroup
+    from vllm.distributed.utils import create_tcp_store
 
     if is_server is None:
-        pg = StatelessProcessGroup.create(
-            host=master_addr, port=master_port, rank=rank, world_size=world_size
-        )
+        pg = StatelessProcessGroup.create(host=master_addr, port=master_port, rank=rank, world_size=world_size)
     else:
         import socket
         from datetime import timedelta
@@ -80,11 +85,18 @@ def stateless_init_nccl(master_addr, master_port, rank, world_size, device,
 # ---------------------------------------------------------------------------
 
 _DTYPE_BYTES = {
-    torch.float16: 2, torch.bfloat16: 2,
-    torch.float32: 4, torch.float64: 8,
-    torch.int8: 1, torch.int16: 2, torch.int32: 4, torch.int64: 8,
-    torch.uint8: 1, torch.bool: 1,
-    torch.float8_e4m3fn: 1, torch.float8_e5m2: 1,
+    torch.float16: 2,
+    torch.bfloat16: 2,
+    torch.float32: 4,
+    torch.float64: 8,
+    torch.int8: 1,
+    torch.int16: 2,
+    torch.int32: 4,
+    torch.int64: 8,
+    torch.uint8: 1,
+    torch.bool: 1,
+    torch.float8_e4m3fn: 1,
+    torch.float8_e5m2: 1,
 }
 
 
@@ -108,8 +120,7 @@ class WeightInfo:
 
     @classmethod
     def from_dict(cls, d: dict) -> WeightInfo:
-        return cls(d["name"], torch.Size(d["shape"]),
-                   getattr(torch, d["dtype"].replace("torch.", "")))
+        return cls(d["name"], torch.Size(d["shape"]), getattr(torch, d["dtype"].replace("torch.", "")))
 
 
 def build_weights_info(model_path: str) -> list[WeightInfo]:
@@ -120,6 +131,7 @@ def build_weights_info(model_path: str) -> list[WeightInfo]:
     p = Path(model_path)
     if not p.is_dir():
         from huggingface_hub import snapshot_download
+
         p = Path(snapshot_download(model_path))
 
     sf_files = sorted(glob.glob(str(p / "*.safetensors")))
@@ -152,8 +164,11 @@ _STACKED_PARAMS = {
 }
 
 _SHARD_IDS = {
-    "q_proj": "q", "k_proj": "k", "v_proj": "v",
-    "gate_proj": 0, "up_proj": 1,
+    "q_proj": "q",
+    "k_proj": "k",
+    "v_proj": "v",
+    "gate_proj": 0,
+    "up_proj": 1,
 }
 
 _SHARD_COUNTS = {"qkv_proj": 3, "gate_up_proj": 2}
@@ -168,13 +183,13 @@ class _FP8InplaceUpdater:
     """
 
     def __init__(self, model: nn.Module, target_dtype: torch.dtype, device):
+        from vllm.model_executor.layers.linear import ColumnParallelLinear
+        from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+        from vllm.model_executor.layers.linear import QKVParallelLinear
+        from vllm.model_executor.layers.linear import RowParallelLinear
         from vllm.model_executor.parameter import BasevLLMParameter
-        from vllm.model_executor.layers.linear import (
-            ColumnParallelLinear, MergedColumnParallelLinear,
-            QKVParallelLinear, RowParallelLinear,
-        )
-        self._linear_types = (ColumnParallelLinear, MergedColumnParallelLinear,
-                              QKVParallelLinear, RowParallelLinear)
+
+        self._linear_types = (ColumnParallelLinear, MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear)
         self._model = model
         self._device = device
         self._dtype = target_dtype
@@ -196,12 +211,11 @@ class _FP8InplaceUpdater:
         if mod_path in self._bufs:
             return self._bufs[mod_path]
         from vllm.model_executor.layers.linear import RowParallelLinear
+
         mod = self._fp8_modules[mod_path]
         w = mod.weight
         orig_shape = (w.shape[1], w.shape[0]) if w.ndim == 2 else w.shape
-        buf = nn.Parameter(
-            torch.empty(orig_shape, dtype=self._dtype, device=self._device),
-            requires_grad=False)
+        buf = nn.Parameter(torch.empty(orig_shape, dtype=self._dtype, device=self._device), requires_grad=False)
         buf.weight_loader = mod.weight_loader
         if isinstance(mod, RowParallelLinear):
             buf.input_dim = 1
@@ -214,6 +228,7 @@ class _FP8InplaceUpdater:
 
     def _flush_module(self, mod_path: str):
         from vllm._custom_ops import scaled_fp8_quant
+
         buf = self._bufs.pop(mod_path)
         mod = self._fp8_modules[mod_path]
         qweight, scale = scaled_fp8_quant(buf.data, scale=None)
@@ -229,12 +244,13 @@ class _FP8InplaceUpdater:
         else:
             param.data.copy_(tensor)
 
-    def _quant_and_copy(self, param: nn.Parameter, tensor: torch.Tensor,
-                        scale_param: nn.Parameter | None = None):
+    def _quant_and_copy(self, param: nn.Parameter, tensor: torch.Tensor, scale_param: nn.Parameter | None = None):
         """FP8-quantize a BF16 tensor and copy into an FP8-transposed param."""
         from vllm._custom_ops import scaled_fp8_quant
+
         qweight, scale = scaled_fp8_quant(
-            tensor.to(dtype=self._dtype, device=self._device), scale=None,
+            tensor.to(dtype=self._dtype, device=self._device),
+            scale=None,
         )
         if param.data.ndim == 2 and param.data.shape == (qweight.shape[1], qweight.shape[0]):
             param.data.copy_(qweight.t().contiguous())
@@ -243,8 +259,7 @@ class _FP8InplaceUpdater:
         if scale_param is not None:
             scale_param.data.copy_(scale)
 
-    def _feed_fp8_module(self, mod_path: str, tensor: torch.Tensor,
-                         shard_id=None) -> None:
+    def _feed_fp8_module(self, mod_path: str, tensor: torch.Tensor, shard_id=None) -> None:
         buf = self._ensure_buf(mod_path)
         if shard_id is not None:
             buf.weight_loader(buf, tensor, shard_id)
@@ -294,6 +309,7 @@ class _FP8InplaceUpdater:
 # Non-quantized direct-to-parameter writer (zero temp allocation for TP=1)
 # ---------------------------------------------------------------------------
 
+
 class _DirectParamWriter:
     """Pre-computes views into model parameter storage for zero-copy writes.
 
@@ -303,9 +319,9 @@ class _DirectParamWriter:
     """
 
     def __init__(self, model: nn.Module, device):
-        from vllm.model_executor.layers.linear import (
-            QKVParallelLinear, MergedColumnParallelLinear,
-        )
+        from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+        from vllm.model_executor.layers.linear import QKVParallelLinear
+
         self._device = device
         self._views: dict[str, torch.Tensor] = {}
         self._destinations: dict[str, str] = {}
@@ -379,16 +395,8 @@ class _DirectParamWriter:
     def _add_checkpoint_wrapper_alias(sf_key: str) -> str:
         parts = sf_key.split(".")
         for idx in range(len(parts) - 2):
-            if (
-                parts[idx] == "layers"
-                and parts[idx + 1].isdigit()
-                and parts[idx + 2] != "_checkpoint_wrapped_module"
-            ):
-                return ".".join(
-                    parts[: idx + 2]
-                    + ["_checkpoint_wrapped_module"]
-                    + parts[idx + 2 :]
-                )
+            if parts[idx] == "layers" and parts[idx + 1].isdigit() and parts[idx + 2] != "_checkpoint_wrapped_module":
+                return ".".join(parts[: idx + 2] + ["_checkpoint_wrapped_module"] + parts[idx + 2 :])
         return sf_key
 
     def get_view(self, sf_key: str) -> torch.Tensor | None:
@@ -410,6 +418,7 @@ class _DirectParamWriter:
 # ---------------------------------------------------------------------------
 # TP>1 shard-aware writer for vLLM-fused param families (batched sync)
 # ---------------------------------------------------------------------------
+
 
 class _ShardAwareFusedWriter:
     """Loads the fused param families that ``model.load_weights`` cannot place
@@ -463,15 +472,11 @@ class _ShardAwareFusedWriter:
         ``in_proj_qkvz`` + ``in_proj_ba`` and nothing else (``conv1d`` is a
         plain ``ColumnParallelLinear``; ``out_proj`` is row-parallel)."""
         try:
-            from vllm.model_executor.layers.linear import (
-                MergedColumnParallelLinear,
-            )
+            from vllm.model_executor.layers.linear import MergedColumnParallelLinear
         except Exception:
             return
         try:
-            from vllm.model_executor.layers.mamba.gdn.base import (
-                GatedDeltaNetAttention,
-            )
+            from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
         except Exception:
             return
 
@@ -495,17 +500,12 @@ class _ShardAwareFusedWriter:
 
     def _register_sparse_indexer(self, modules: dict[str, nn.Module]) -> None:
         try:
-            from vllm.model_executor.layers.linear import (
-                MergedColumnParallelLinear,
-            )
+            from vllm.model_executor.layers.linear import MergedColumnParallelLinear
         except Exception:
             return
 
         for mod_path, mod in modules.items():
-            if not (
-                isinstance(mod, MergedColumnParallelLinear)
-                and mod_path.endswith(".indexer.wk_weights_proj")
-            ):
+            if not (isinstance(mod, MergedColumnParallelLinear) and mod_path.endswith(".indexer.wk_weights_proj")):
                 continue
             wname = f"{mod_path}.weight"
             param = self._params.get(wname)
@@ -526,12 +526,14 @@ class _ShardAwareFusedWriter:
         w13_weight``) and the DSS wire name (``...experts.w13_weight``, which
         drops the ``routed_experts`` level) are registered."""
         for mod_path, mod in modules.items():
-            if not (hasattr(mod, "w13_weight") and hasattr(mod, "w2_weight")
-                    and hasattr(mod, "_map_global_expert_id_to_local_expert_id")
-                    and callable(getattr(mod, "weight_loader", None))):
+            if not (
+                hasattr(mod, "w13_weight")
+                and hasattr(mod, "w2_weight")
+                and hasattr(mod, "_map_global_expert_id_to_local_expert_id")
+                and callable(getattr(mod, "weight_loader", None))
+            ):
                 continue
-            for leaf, family in (("w13_weight", "moe_w13"),
-                                 ("w2_weight", "moe_w2")):
+            for leaf, family in (("w13_weight", "moe_w13"), ("w2_weight", "moe_w2")):
                 reg_name = f"{mod_path}.{leaf}"
                 param = self._params.get(reg_name)
                 if param is None:
@@ -586,8 +588,7 @@ class _ShardAwareFusedWriter:
                     offset += output_size
                 if offset != tensor.shape[output_dim]:
                     raise ValueError(
-                        f"Fused GDN tensor has {tensor.shape[output_dim]} rows, "
-                        f"but registered shards consume {offset}"
+                        f"Fused GDN tensor has {tensor.shape[output_dim]} rows, but registered shards consume {offset}"
                     )
                 return True
             # MergedColumnParallelLinear.weight_loader(param, full_weight,
@@ -607,32 +608,46 @@ class _ShardAwareFusedWriter:
             # contains "weight" (and none of scale/zero/offset/g_idx/shape), so
             # we pass the param's own name ("w13_weight") like vLLM's oracle.
             moe_config = getattr(module, "moe_config", None)
-            gated = True if moe_config is None else bool(
-                getattr(moe_config, "is_act_and_mul", True)
-            )
+            gated = True if moe_config is None else bool(getattr(moe_config, "is_act_and_mul", True))
             for expert_id in range(tensor.shape[0]):
                 if gated:
                     inter = tensor.shape[1] // 2
                     module.weight_loader(
-                        param, tensor[expert_id, :inter, :],
-                        "w13_weight", "w1", expert_id, return_success=True,
+                        param,
+                        tensor[expert_id, :inter, :],
+                        "w13_weight",
+                        "w1",
+                        expert_id,
+                        return_success=True,
                     )
                     module.weight_loader(
-                        param, tensor[expert_id, inter:, :],
-                        "w13_weight", "w3", expert_id, return_success=True,
+                        param,
+                        tensor[expert_id, inter:, :],
+                        "w13_weight",
+                        "w3",
+                        expert_id,
+                        return_success=True,
                     )
                 else:
                     module.weight_loader(
-                        param, tensor[expert_id],
-                        "w13_weight", "w1", expert_id, return_success=True,
+                        param,
+                        tensor[expert_id],
+                        "w13_weight",
+                        "w1",
+                        expert_id,
+                        return_success=True,
                     )
             return True
 
         if family == "moe_w2":
             for expert_id in range(tensor.shape[0]):
                 module.weight_loader(
-                    param, tensor[expert_id],
-                    "w2_weight", "w2", expert_id, return_success=True,
+                    param,
+                    tensor[expert_id],
+                    "w2_weight",
+                    "w2",
+                    expert_id,
+                    return_success=True,
                 )
             return True
 
@@ -642,6 +657,7 @@ class _ShardAwareFusedWriter:
 # ---------------------------------------------------------------------------
 # Checkpoint loading helpers
 # ---------------------------------------------------------------------------
+
 
 def load_spec_checkpoint(
     model_path: str,
@@ -658,6 +674,7 @@ def load_spec_checkpoint(
     st_files = sorted(_glob.glob(os.path.join(model_path, "*.safetensors")))
     if st_files:
         from safetensors.torch import load_file
+
         for f in st_files:
             for name, tensor in load_file(f, device="cpu").items():
                 weights.append((name, tensor))

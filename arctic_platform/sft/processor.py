@@ -39,6 +39,7 @@ from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.utils.tiled_logits import TiledLogProbEntropy
 from arctic_platform.common.utils.tiled_logits import chunked_logprobs_entropy_from_hidden
+from arctic_platform.common.utils.tiled_logits import deepspeed_lm_head_compute_params
 from arctic_platform.common.utils.tiled_logits import logits_chunk_rows
 from arctic_platform.common.utils.tiled_logits import logprobs_entropy_from_flat_logits
 from arctic_platform.common.utils.tiled_logits import tiled_logprobs_entropy_from_hidden
@@ -57,20 +58,46 @@ def _require_labels(batch: dict, who: str) -> torch.Tensor:
     return labels
 
 
-def count_valid_target_tokens(batch: Any) -> int | None:
+def _labels_are_shifted(meta: dict | None) -> bool:
+    return bool((meta or {}).get("labels_are_shifted", False))
+
+
+def _count_valid_targets_in_labels(
+    labels: torch.Tensor, *, labels_are_shifted: bool, position_ids: torch.Tensor | None = None
+) -> int:
+    if labels_are_shifted:
+        return int((labels != -100).sum().item())
+    if position_ids is not None:
+        return int(((labels != -100) & (position_ids != 0)).sum().item())
+    return int((labels[:, 1:] != -100).sum().item())
+
+
+def count_valid_target_tokens(batch: Any, meta: dict | None = None) -> int | None:
     """Valid next-token targets after HF's ``labels[:, 1:]`` / ``-100`` shift.
 
-    ``batch`` is one microbatch dict or a gas list of them. ``None`` means no
-    labels (skip global-token injection); ``0`` means all positions masked.
+    ``batch`` is one microbatch dict or a gas list of them. ``None`` means no labels (skip global-token injection);
+    ``0`` means all positions masked.
     """
+    labels_are_shifted = _labels_are_shifted(meta)
     if isinstance(batch, list):
         mbs = [mb for mb in batch if isinstance(mb, dict) and mb.get("labels") is not None]
         if not mbs:
             return None
-        return sum(int((mb["labels"][:, 1:] != -100).sum().item()) for mb in mbs)
+        return sum(
+            _count_valid_targets_in_labels(
+                mb["labels"],
+                labels_are_shifted=labels_are_shifted,
+                position_ids=mb.get("position_ids"),
+            )
+            for mb in mbs
+        )
     if not isinstance(batch, dict) or batch.get("labels") is None:
         return None
-    return int((batch["labels"][:, 1:] != -100).sum().item())
+    return _count_valid_targets_in_labels(
+        batch["labels"],
+        labels_are_shifted=labels_are_shifted,
+        position_ids=batch.get("position_ids"),
+    )
 
 
 def _paired_loss_metrics(loss_sum: float, tokens: float) -> dict:
@@ -99,14 +126,18 @@ def sft_loss(
     if loss is None:
         raise ValueError("SFT loss is None — model returned no loss (check that labels are present and not all -100)")
 
-    labels = _require_labels(batch, "sft loss")
-    # HF CE targets are labels[:, 1:], ignore_index=-100.
-    n_valid = int((labels[:, 1:] != -100).sum().item())
+    _require_labels(batch, "sft loss")
+    n_valid = count_valid_target_tokens(batch, meta)
+    if n_valid is None:
+        raise ValueError("sft loss requires countable labels")
+    raw_loss = loss
     if n_valid == 0:
         # HF CE is NaN when every target is ignore_index.
         loss = torch.zeros_like(loss, requires_grad=loss.requires_grad)
+    elif meta.get("global_num_tokens"):
+        loss = loss * (float(n_valid) / float(meta["global_num_tokens"])) * int(meta.get("dp_size", 1) or 1)
     # Reconstruct Σ CE from HF's token-mean so cross-rank aggregation stays exact.
-    loss_sum = float(loss.detach().float().item()) * n_valid
+    loss_sum = 0.0 if n_valid == 0 else float(raw_loss.detach().float().item()) * n_valid
     return loss, _paired_loss_metrics(loss_sum, n_valid)
 
 
@@ -117,7 +148,7 @@ LOGIT_LOSS_FNS = {"sft_ce"}
 SFT_LOSS_FNS = {"sft", "sft_ce"}
 
 # Opt-in: worker injects ``global_num_tokens`` + ``dp_size`` before the loss runs.
-SFT_GLOBAL_TOKEN_LOSS_FNS = {"sft_ce"}
+SFT_GLOBAL_TOKEN_LOSS_FNS = {"sft", "sft_ce"}
 
 
 @register_loss_fn("sft_ce")
@@ -134,8 +165,12 @@ def sft_ce_loss(
         raise ValueError("sft_ce requires logits — run_sft_pipeline must capture them for this loss_fn")
 
     labels = _require_labels(batch, "sft_ce loss").to(logits.device)
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = labels[:, 1:].contiguous()
+    if _labels_are_shifted(meta):
+        shift_logits = logits.contiguous()
+        shift_labels = labels.contiguous()
+    else:
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
     vocab = shift_logits.size(-1)
 
     # Compute CE through the shared logprobs core rather than F.cross_entropy so
@@ -173,6 +208,7 @@ def sft_ce_sum_from_hidden(
     *,
     mode: str,
     peak_mem_gib: float = 4.0,
+    labels_are_shifted: bool = False,
 ) -> tuple[torch.Tensor, int]:
     """Summed causal-LM CE over valid targets, computed from the last hidden
     states without ever materializing the full ``[B, S, V]`` logits.
@@ -196,8 +232,12 @@ def sft_ce_sum_from_hidden(
     if mode not in ("compute", "memory"):
         raise ValueError(f"sft_ce_sum_from_hidden: mode must be 'compute' or 'memory', got {mode!r}")
 
-    shift_hidden = hidden[:, :-1, :].contiguous()
-    shift_labels = labels[:, 1:].contiguous()
+    if labels_are_shifted:
+        shift_hidden = hidden.contiguous()
+        shift_labels = labels.contiguous()
+    else:
+        shift_hidden = hidden[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
 
     valid = shift_labels != -100
     safe_labels = shift_labels.clamp_min(0)
@@ -217,10 +257,10 @@ def sft_ce_sum_from_hidden(
         flat_labels = safe_labels.reshape(-1)
         chunk_rows = logits_chunk_rows(model.config.vocab_size, peak_mem_gib)
         num_shards = max(1, -(flat_hidden.shape[0] // -chunk_rows))  # ceil division
-        # Bind fp32 CE so it flows through the (replayed) tiled forward, matching
-        # the compute/none paths. lm_head.weight is the tied compute param whose
-        # grad DeepSpeed reduces with the embedding weight.
+        # Bind fp32 CE so it flows through the (replayed) tiled forward, matching the compute/none paths.
+        # DeepSpeed must see exactly one lm_head.weight reduction after every tiled shard has accumulated.
         tiled_fn = partial(tiled_logprobs_entropy_from_hidden, logits_compute_in_fp32=True)
+        compute_params, defer_compute_params_to_outer_graph = deepspeed_lm_head_compute_params(model)
         logprobs, _ = TiledLogProbEntropy.apply(
             tiled_fn,
             model,
@@ -229,7 +269,8 @@ def sft_ce_sum_from_hidden(
             1.0,  # temperature
             False,  # calculate_entropy
             num_shards,
-            [model.lm_head.weight],
+            compute_params,
+            defer_compute_params_to_outer_graph,
         )
         logprobs = logprobs.view(*safe_labels.shape)
 
@@ -291,6 +332,13 @@ def _build_sft_model_kwargs(batch: dict, meta: dict, labels: torch.Tensor, need_
     return model_kwargs
 
 
+def _model_output_field(outputs: Any, name: str) -> Any:
+    """Read one output from either a Hugging Face result object or a model-owned mapping."""
+    if isinstance(outputs, dict):
+        return outputs.get(name)
+    return getattr(outputs, name, None)
+
+
 def run_sft_pipeline(
     engine,
     batch: dict,
@@ -324,7 +372,6 @@ def run_sft_pipeline(
         )
     peak_mem_gib = float(config.get("logits_optimization_peak_mem_size_in_gib", 4) or 4)
     hidden_ce = loss_fn_name == "sft_ce" and logits_opt in ("compute", "memory")
-
     # ``need_logits`` = keep the full logits tensor for the loss (only the classic
     # sft_ce path). ``omit_labels`` also drops HF's own CE when we compute it.
     need_logits = loss_fn_name in LOGIT_LOSS_FNS and not hidden_ce
@@ -362,20 +409,26 @@ def run_sft_pipeline(
         # Tiled / chunked CE straight from hidden states — the full logits are
         # never materialized (memory) or never fully softmaxed at once (compute).
         hf_model = getattr(engine, "module", engine)
-        hidden = outputs.hidden_states[-1]
+        hidden = _model_output_field(outputs, "hidden_states")[-1]
         with sft_profile.timed("loss"):
             ce_sum, n_valid = sft_ce_sum_from_hidden(
-                hf_model, hidden, labels.to(hidden.device), mode=logits_opt, peak_mem_gib=peak_mem_gib
+                hf_model,
+                hidden,
+                labels.to(hidden.device),
+                mode=logits_opt,
+                peak_mem_gib=peak_mem_gib,
+                labels_are_shifted=_labels_are_shifted(meta),
             )
             loss = _scale_ce_sum(ce_sum, n_valid, meta)
         metrics = _paired_loss_metrics(float(ce_sum.detach().float().item()), n_valid)
     else:
         model_outputs: dict[str, Any] = {}
-        if hasattr(outputs, "loss") and outputs.loss is not None:
-            model_outputs["loss"] = outputs.loss
+        output_loss = _model_output_field(outputs, "loss")
+        if output_loss is not None:
+            model_outputs["loss"] = output_loss
         if need_logits:
             # Consumed locally by the loss_fn only; never placed on the wire response.
-            model_outputs["logits"] = outputs.logits
+            model_outputs["logits"] = _model_output_field(outputs, "logits")
 
         fn = _resolve_fn(LOSS_FNS, loss_fn_name)
         loss, metrics = fn(model_outputs, batch, meta, config, device)

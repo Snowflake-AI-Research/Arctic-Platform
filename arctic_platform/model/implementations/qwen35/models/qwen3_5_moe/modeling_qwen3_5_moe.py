@@ -1,35 +1,40 @@
 import functools
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional
+from typing import Union
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn
+from torch import Tensor
+from torch import nn
 from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, logging
+from transformers.utils import TransformersKwargs
+from transformers.utils import logging
 
+from arctic_platform.model.implementations.debug.determinism import flash_attention_determinism_must_comply
 from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
 from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import head_parallel_gated_delta_net
+from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
+from arctic_platform.model.implementations.moe.layers.moe import FeedForward
+from arctic_platform.model.implementations.moe.layers.moe import MoE
+from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 
 from ..base import PreTrainedModelPrimeRL
-from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
-from arctic_platform.model.implementations.moe.layers.moe import FeedForward, MoE, MoEArgs
-from ..layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig, apply_rotary_pos_emb
-
+from ..layers.rotary_emb import RotaryEmbedding
+from ..layers.rotary_emb import RotaryEmbeddingConfig
+from ..layers.rotary_emb import apply_rotary_pos_emb
 from .configuration_qwen3_5_moe import Qwen3_5MoeConfig
-from .converting_qwen3_5_moe import (
-    convert_hf_layer_to_tt,
-    convert_hf_to_tt_moe,
-    convert_tt_layer_to_hf,
-    convert_tt_to_hf_moe,
-)
+from .converting_qwen3_5_moe import convert_hf_layer_to_tt
+from .converting_qwen3_5_moe import convert_hf_to_tt_moe
+from .converting_qwen3_5_moe import convert_tt_layer_to_hf
+from .converting_qwen3_5_moe import convert_tt_to_hf_moe
 
 # Optional VLM vision encoder. Text-only loading must work even when the
 # composite VLM vision class is not present in the installed transformers.
@@ -195,6 +200,48 @@ def torch_chunk_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+def _packed_sequence_indices(
+    cu_seqlens: torch.LongTensor, *, batch_size: int, seq_len: int, device: torch.device
+) -> torch.LongTensor:
+    """Expand packed boundaries into the batch-shaped segment indices required by causal-conv1d."""
+    segment_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    seq_idx = torch.repeat_interleave(
+        torch.arange(segment_lengths.numel(), dtype=torch.int32, device=device),
+        segment_lengths,
+    )
+    expected_tokens = batch_size * seq_len
+    if seq_idx.numel() != expected_tokens:
+        raise ValueError(
+            f"cu_seqlens describe {seq_idx.numel()} tokens, but hidden states contain {expected_tokens} "
+            f"({batch_size} x {seq_len})"
+        )
+    return seq_idx.reshape(batch_size, seq_len)
+
+
+def _has_multiple_packed_sequences(cu_seqlens: torch.LongTensor | None) -> bool:
+    return cu_seqlens is not None and cu_seqlens.numel() > 2
+
+
+def _segmented_causal_conv1d(
+    conv1d: nn.Conv1d,
+    mixed_qkv: torch.Tensor,
+    cu_seqlens: torch.LongTensor,
+) -> torch.Tensor:
+    total_tokens = int(cu_seqlens[-1].item())
+    if total_tokens != mixed_qkv.shape[-1]:
+        raise ValueError(
+            f"cu_seqlens describe {total_tokens} tokens, but convolution input contains {mixed_qkv.shape[-1]}"
+        )
+
+    cu = cu_seqlens.tolist()
+    conv_outs = []
+    for start, stop in zip(cu[:-1], cu[1:], strict=True):
+        if start == stop:
+            continue
+        conv_outs.append(conv1d(mixed_qkv[:, :, start:stop])[:, :, : stop - start])
+    return F.silu(torch.cat(conv_outs, dim=-1))
+
+
 class Qwen3_5MoeGatedDeltaNet(nn.Module):
     """GatedDeltaNet linear attention with Conv1d, beta/gamma gates, and chunk delta rule."""
 
@@ -251,6 +298,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.LongTensor | None = None,
     ) -> torch.Tensor:
+        output_batch_size, output_seq_len, hidden_size = hidden_states.shape
+        if cu_seqlens is not None and output_batch_size > 1 and getattr(self, "cp_group", None) is None:
+            hidden_states = hidden_states.reshape(1, output_batch_size * output_seq_len, hidden_size)
         batch_size, seq_len, _ = hidden_states.shape
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
@@ -269,11 +319,10 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         if getattr(self, "cp_group", None) is not None:
             global_cu_seqlens = getattr(self, "_dss_sp_global_cu_seqlens", None)
             if not torch.is_tensor(global_cu_seqlens):
-                raise RuntimeError(
-                    "head-parallel GatedDeltaNet requires global packed cu_seqlens"
-                )
+                raise RuntimeError("head-parallel GatedDeltaNet requires global packed cu_seqlens")
+            causal_convolution = None if _has_multiple_packed_sequences(global_cu_seqlens) else self._causal_conv1d_fn
             core_attn_out, _ = head_parallel_gated_delta_net(
-                self._causal_conv1d_fn,
+                causal_convolution,
                 self._chunk_gated_delta_rule,
                 query,
                 key,
@@ -295,14 +344,15 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             )
         else:
             mixed_qkv = mixed_qkv.transpose(1, 2)
-            if self._causal_conv1d_fn is not None:
+            if _has_multiple_packed_sequences(cu_seqlens):
+                # The causal-conv1d seq_idx path is not equivalent to per-sequence convolution for packed rows.
+                mixed_qkv = _segmented_causal_conv1d(self.conv1d, mixed_qkv, cu_seqlens)
+            elif self._causal_conv1d_fn is not None:
                 seq_idx = None
                 if cu_seqlens is not None:
-                    seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-                    seq_idx = torch.repeat_interleave(
-                        torch.arange(seg_lens.numel(), dtype=torch.int32, device=hidden_states.device),
-                        seg_lens,
-                    ).unsqueeze(0)
+                    seq_idx = _packed_sequence_indices(
+                        cu_seqlens, batch_size=batch_size, seq_len=seq_len, device=hidden_states.device
+                    )
                 mixed_qkv = self._causal_conv1d_fn(
                     x=mixed_qkv,
                     weight=self.conv1d.weight.squeeze(1),
@@ -311,13 +361,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     seq_idx=seq_idx,
                 )
             elif cu_seqlens is not None:
-                cu = cu_seqlens.tolist()
-                conv_outs = []
-                for start, stop in zip(cu[:-1], cu[1:], strict=True):
-                    if start == stop:
-                        continue
-                    conv_outs.append(self.conv1d(mixed_qkv[:, :, start:stop])[:, :, : stop - start])
-                mixed_qkv = F.silu(torch.cat(conv_outs, dim=-1))
+                mixed_qkv = _segmented_causal_conv1d(self.conv1d, mixed_qkv, cu_seqlens)
             else:
                 mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
             mixed_qkv = mixed_qkv.transpose(1, 2)
@@ -349,7 +393,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
-        return self.out_proj(core_attn_out)
+        output = self.out_proj(core_attn_out)
+        return output.reshape(output_batch_size, output_seq_len, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -483,8 +528,8 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
         if self.func is None:
             raise ImportError(
                 f"flash-attn v{flash_attn_version} varlen entry point is not importable; "
-                f"install the matching flash-attn package (v3 -> flash_attn_interface, "
-                f"v4 -> flash_attn.cute)."
+                "install the matching flash-attn package (v3 -> flash_attn_interface, "
+                "v4 -> flash_attn.cute)."
             )
         self._flash_attn_call = self.func
         # This model calls the varlen entry point directly rather than through the attention integration that
@@ -492,7 +537,10 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
         # read here. Resolving it at construction means a request the installed kernel cannot honour at this head
         # dimension refuses before any training runs.
         self._deterministic = resolve_flash_attention_determinism(
-            self.func, config.head_dim, f"flash_attention_{flash_attn_version}"
+            self.func,
+            config.head_dim,
+            f"flash_attention_{flash_attn_version}",
+            must_comply=flash_attention_determinism_must_comply(),
         )
 
     def _compute_attention(self, q, k, v, cu_seqlens, max_seqlen):
@@ -502,9 +550,13 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
         # request that has already been checked against it.
         deterministic = {"deterministic": True} if self._deterministic else {}
         out = self._flash_attn_call(
-            q, k, v,
-            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
             causal=True,
             **deterministic,
         )
@@ -796,6 +848,7 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        output_batch_size, output_seq_len = inputs_embeds.shape[:2]
         if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
             flat_position_ids = position_ids.view(-1)
             # Segment lengths from boundary indices (where position_ids resets to 0), not position values, so
@@ -805,15 +858,14 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             is_segment_start[0] = True
             start_indices = torch.nonzero(is_segment_start, as_tuple=False).flatten()
             total_length = flat_position_ids.shape[0]
-            boundaries = torch.cat(
-                [start_indices, start_indices.new_tensor([total_length])]
-            )
+            boundaries = torch.cat([start_indices, start_indices.new_tensor([total_length])])
             segment_lengths = (boundaries[1:] - boundaries[:-1]).to(torch.int32)
             max_seqlen = int(segment_lengths.max().item())
-            cu_seqlens = torch.cat(
-                [segment_lengths.new_zeros(1), segment_lengths.cumsum(dim=0, dtype=torch.int32)]
-            )
+            cu_seqlens = torch.cat([segment_lengths.new_zeros(1), segment_lengths.cumsum(dim=0, dtype=torch.int32)])
             torch._dynamo.mark_dynamic(cu_seqlens, 0)
+            if output_batch_size > 1:
+                inputs_embeds = inputs_embeds.reshape(1, output_batch_size * output_seq_len, -1)
+                position_ids = position_ids.reshape(1, output_batch_size * output_seq_len)
         else:
             max_seqlen = None
             cu_seqlens = None
@@ -832,6 +884,7 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             )
 
         hidden_states = self.norm(hidden_states)
+        hidden_states = hidden_states.reshape(output_batch_size, output_seq_len, -1)
         return MoeModelOutputWithPast(last_hidden_state=hidden_states)
 
 
@@ -989,7 +1042,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
     @classmethod
     def is_prime_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
-        return any("mlp.experts.w1" in name for name in state_dict)
+        prime_names = ("mlp.router.gate.weight", "mlp.experts.w1", ".shared_expert.w1.weight")
+        return any(any(prime_name in name for prime_name in prime_names) for name in state_dict)
 
     @classmethod
     def convert_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -1093,9 +1147,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             slice_indices = logits_to_keep
         return self.lm_head(
             hidden_states[:, slice_indices, :],
-            inherit_lm_head_target_validation(labels, labels[:, slice_indices])
-            if labels is not None
-            else None,
+            inherit_lm_head_target_validation(labels, labels[:, slice_indices]) if labels is not None else None,
             temperature=temperature[:, slice_indices] if temperature is not None else None,
             action_masks=action_masks,
         )

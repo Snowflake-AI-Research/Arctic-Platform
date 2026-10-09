@@ -1,34 +1,32 @@
 import functools
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional
+from typing import Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
-from transformers.masking_utils import (
-    create_causal_mask,
-    create_sliding_window_causal_mask,
-)
+from transformers.masking_utils import create_causal_mask
+from transformers.masking_utils import create_sliding_window_causal_mask
 from transformers.modeling_layers import GradientCheckpointingLayer
-from transformers.modeling_outputs import (
-    MoeModelOutputWithPast,
-)
+from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from arctic_platform.model.implementations.layers.mlp import MLP
+from arctic_platform.model.implementations.layers.mlp import MLPConfig
+from arctic_platform.model.implementations.layers.norms import RMSNorm
+from arctic_platform.model.implementations.layers.norms import RMSNormConfig
+from arctic_platform.model.implementations.layers.rotary_emb import RotaryEmbedding
+from arctic_platform.model.implementations.layers.rotary_emb import RotaryEmbeddingConfig
+from arctic_platform.model.implementations.layers.rotary_emb import apply_rotary_pos_emb
+from arctic_platform.model.implementations.layers.sequence import get_cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
-from arctic_platform.model.implementations.layers.mlp import MLP, MLPConfig
-from arctic_platform.model.implementations.moe.layers.moe import MoE, MoEArgs
-from arctic_platform.model.implementations.layers.norms import RMSNorm, RMSNormConfig
-from arctic_platform.model.implementations.layers.rotary_emb import (
-    RotaryEmbedding,
-    RotaryEmbeddingConfig,
-    apply_rotary_pos_emb,
-)
-from arctic_platform.model.implementations.layers.sequence import get_cu_seqlens_from_position_ids
+from arctic_platform.model.implementations.moe.layers.moe import MoE
+from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 
 try:
     from flash_attn import flash_attn_varlen_func
@@ -46,12 +44,10 @@ except ImportError:
     flash_attn_4_varlen_func = None  # type: ignore
 
 from .configuration_afmoe import AfmoeConfig
-from .converting_afmoe import (
-    convert_hf_layer_to_tt,
-    convert_hf_to_tt_moe,
-    convert_tt_layer_to_hf,
-    convert_tt_to_hf_moe,
-)
+from .converting_afmoe import convert_hf_layer_to_tt
+from .converting_afmoe import convert_hf_to_tt_moe
+from .converting_afmoe import convert_tt_layer_to_hf
+from .converting_afmoe import convert_tt_to_hf_moe
 
 
 @dataclass
@@ -327,7 +323,8 @@ def _get_afmoe_attention(config: AfmoeConfig, layer_idx: int) -> nn.Module:
     if attn_impl not in AFMOE_ATTN_IMPL2CLASS:
         supported = list(AFMOE_ATTN_IMPL2CLASS.keys())
         raise ValueError(
-            f"AFMoE attention does not support '{config._attn_implementation}'. Supported implementations: {supported}."
+            f"AFMoE attention does not support '{config._attn_implementation}'. Supported implementations:"
+            f" {supported}."
         )
 
     return AFMOE_ATTN_IMPL2CLASS[attn_impl](attn_config)

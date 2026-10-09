@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import torch
 
+from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client import TrainingConfig
 from arctic_platform.common.utils.batch import _split_batch
 from arctic_platform.common.utils.batch import dp_sp_world_size
+from arctic_platform.common.utils.batch import merge_sp_dict_shards
 from arctic_platform.common.utils.batch import split_dict
 from arctic_platform.common.utils.batch import unpack_batch
 from arctic_platform.common.utils.server_models import JobConfig
@@ -141,10 +144,29 @@ class TestDpSizeDividesBySp(TestCasePlus):
         with self.assertRaises(ValueError):
             dp_sp_world_size(8, 3)
 
-    def test_split_rejects_sp_greater_than_one(self):
-        with self.assertRaises(ValueError) as ctx:
-            _split_batch(self._envelope(), num_workers=8, sp_size=2)
-        self.assertIn("sequence-parallel data-plane is not implemented", str(ctx.exception))
+    def test_split_shards_rows_by_dp_and_tokens_by_sp(self):
+        shards, _ = _split_batch(self._envelope(), num_workers=8, sp_size=2)
+        self.assertEqual(len(shards), 8)
+        self.assertTrue(all(shard["meta"]["dp_size"] == 4 for shard in shards))
+        self.assertEqual(shards[0]["batch"]["input_ids"].tolist(), [[0], [2]])
+        self.assertEqual(shards[1]["batch"]["input_ids"].tolist(), [[1], [3]])
+        self.assertEqual(shards[2]["batch"]["input_ids"].tolist(), [[4], [6]])
+
+    def test_merge_sp_shards_restores_sequence_then_dp_order(self):
+        shards, _ = _split_batch(self._envelope(), num_workers=8, sp_size=2)
+        results = [{"logprobs": shard["batch"]["input_ids"].float()} for shard in shards]
+        merged = merge_sp_dict_shards(results, sp_size=2)
+        torch_assert_equal(merged["logprobs"], self._envelope()["batch"]["input_ids"].float())
+
+    def test_sp_shards_pad_to_equal_collective_shapes(self):
+        envelope = self._envelope()
+        envelope["batch"]["input_ids"] = torch.arange(13).view(1, 13)
+        envelope["batch"]["attention_mask"] = torch.ones(1, 13, dtype=torch.long)
+        envelope["batch"]["labels"] = torch.arange(13).view(1, 13)
+        shards, _ = _split_batch(envelope, num_workers=8, sp_size=8)
+        self.assertTrue(all(shard["batch"]["input_ids"].shape == (1, 2) for shard in shards))
+        self.assertEqual(shards[-1]["batch"]["input_ids"].tolist(), [[0, 0]])
+        self.assertEqual(shards[-1]["batch"]["labels"].tolist(), [[-100, -100]])
 
     def test_split_rejects_sp_that_does_not_divide_workers(self):
         with self.assertRaises(ValueError):
@@ -172,6 +194,41 @@ class TestDpSizeDividesBySp(TestCasePlus):
 
     def test_sp_size_from_training_config(self):
         self.assertEqual(sp_size_from_job_config({"training_config": {"sp_size": 4}}), 4)
+
+    def test_sp_size_from_nested_training_worker_config(self):
+        payload = {"training_config": {"ds_worker_config": {"sp_size": 8}}}
+        self.assertEqual(sp_size_from_job_config(payload), 8)
+        self.assertEqual(JobConfig(model_name="m", **payload).sp_size, 8)
+
+    def test_ap_client_worker_sp_routes_one_row_across_sequence(self):
+        config = ArcticClientConfig(
+            model_name="m",
+            training_gpus=8,
+            training=TrainingConfig(ds_worker_config={"sp_size": 8}),
+        )
+        payload = config.to_onprem("training")
+        job = JobConfig.model_validate(payload)
+        values = torch.arange(job.sp_size).view(1, job.sp_size)
+        envelope = {
+            "batch": {
+                "input_ids": values,
+                "attention_mask": torch.ones_like(values),
+                "position_ids": values,
+                "labels": values,
+            },
+            "meta": {},
+            "processing": {"loss_fn": "sft"},
+        }
+
+        shards, _ = _split_batch(envelope, num_workers=config.training_gpus, sp_size=job.sp_size)
+
+        self.assertEqual(job.sp_size, 8)
+        self.assertEqual(len(shards), 8)
+        self.assertTrue(all(shard["batch"]["input_ids"].shape == (1, 1) for shard in shards))
+        torch_assert_equal(
+            torch.cat([shard["batch"]["input_ids"] for shard in shards], dim=1),
+            values,
+        )
 
     def test_sp_size_unset_is_one(self):
         self.assertEqual(sp_size_from_job_config({}), 1)

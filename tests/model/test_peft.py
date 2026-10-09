@@ -276,6 +276,8 @@ def test_worker_bridge_forwards_peft():
     assert spec.patches.peft == config
 
 
-def test_custom_moe_peft_requires_expert_integration():
-    with pytest.raises(ValueError, match="expert adapter integration"):
-        ModelSpec(model_path_or_name="unused", loader="qwen3_5_moe", patches=Patches(peft={"peft_type": "Lora"}))
+def test_custom_moe_peft_supports_replicated_projection_adapters():
+    config = {"peft_type": "Lora", "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"]}
+    spec = ModelSpec(model_path_or_name="unused", loader="qwen3_5_moe", patches=Patches(peft=config))
+
+    assert spec.patches.peft == config

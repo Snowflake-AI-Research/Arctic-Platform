@@ -34,7 +34,8 @@ if "vllm" not in sys.modules:
         sys.modules[name] = module
 
 from arctic_platform.inference.server import worker as worker_mod
-from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
+from arctic_platform.inference.server.worker import InferenceWorker
+from arctic_platform.inference.server.worker import WorkerLifecycleState
 
 
 def _install_fake_vllm(monkeypatch, async_llm_cls):
@@ -63,8 +64,7 @@ def _install_fake_vllm(monkeypatch, async_llm_cls):
 
 def test_is_address_in_use_error_walks_exception_chain():
     bind_error = RuntimeError(
-        "torch.distributed.DistNetworkError: port: 43041, code: -98, "
-        "name: EADDRINUSE, message: address already in use"
+        "torch.distributed.DistNetworkError: port: 43041, code: -98, name: EADDRINUSE, message: address already in use"
     )
     startup_error = RuntimeError("Engine core initialization failed")
     startup_error.__cause__ = bind_error
@@ -74,7 +74,8 @@ def test_is_address_in_use_error_walks_exception_chain():
 
 
 def test_arctic_patch_fallback_stays_flag_independent(monkeypatch):
-    from arctic_platform.inference.vllm import patches, required_patches
+    from arctic_platform.inference.vllm import patches
+    from arctic_platform.inference.vllm import required_patches
 
     arg_utils_mod = types.ModuleType("vllm.engine.arg_utils")
     arg_utils_mod.AsyncEngineArgs = type("AsyncEngineArgs", (), {})
@@ -105,9 +106,7 @@ def test_initialize_retries_vllm_engine_startup_on_address_in_use(monkeypatch):
     class FakeEngineArgs:
         def create_engine_config(self):
             return types.SimpleNamespace(
-                structured_outputs_config=types.SimpleNamespace(
-                    enable_in_reasoning=False
-                ),
+                structured_outputs_config=types.SimpleNamespace(enable_in_reasoning=False),
                 model_config=types.SimpleNamespace(skip_tokenizer_init=True),
             )
 
@@ -156,13 +155,9 @@ def test_initialize_drops_reasoning_parser_when_tokenizer_lacks_think_tokens(
 
         def create_engine_config(self):
             if self.kwargs.get("reasoning_parser"):
-                raise RuntimeError(
-                    "deepseek_r1 reasoning parser requires think start/end tokens"
-                )
+                raise RuntimeError("deepseek_r1 reasoning parser requires think start/end tokens")
             return types.SimpleNamespace(
-                structured_outputs_config=types.SimpleNamespace(
-                    enable_in_reasoning=False
-                ),
+                structured_outputs_config=types.SimpleNamespace(enable_in_reasoning=False),
                 model_config=types.SimpleNamespace(skip_tokenizer_init=True),
             )
 

@@ -75,7 +75,10 @@ def get_language_model(model: nn.Module, override: str | None = None) -> nn.Modu
 
 
 def is_vlm_architecture(model_config: PretrainedConfig) -> bool:
-    """Check if the model config belongs to a known VLM architecture."""
+    """Check if the model config declares a known multimodal architecture."""
+    architectures = getattr(model_config, "architectures", None) or []
+    if architectures and all(str(architecture).endswith("ForCausalLM") for architecture in architectures):
+        return False
     return _get_model_info_from_config(model_config) is not None
 
 

@@ -24,7 +24,6 @@ from torch import nn
 
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
-
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from arctic_platform.model.implementations.moe.vlm import get_language_model
 
@@ -37,14 +36,11 @@ def _ulysses_attn_forward(self, hidden_states, position_embeddings, cu_seqlens=N
     group = self._sp_group
     if hidden_states.size(0) != 1:
         raise NotImplementedError(
-            f"Ulysses varlen path assumes a single packed row (B==1), got "
-            f"B={hidden_states.size(0)}"
+            f"Ulysses varlen path assumes a single packed row (B==1), got B={hidden_states.size(0)}"
         )
 
     # Local projections; RoPE uses the shard's true positions.
-    query_states, key_states, value_states, gate = self.attn_projections(
-        hidden_states, position_embeddings
-    )
+    query_states, key_states, value_states, gate = self.attn_projections(hidden_states, position_embeddings)
 
     # GQA KV-head replication for sp > num_kv_heads: the all-to-all scatters KV heads across sp ranks, so it
     # needs sp % num_kv_heads == 0. num_kv_heads is read from the tensor at runtime (e.g. 2 for the

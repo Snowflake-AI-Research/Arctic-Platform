@@ -7,7 +7,8 @@ import os
 import random
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
+from collections.abc import Sequence
 from enum import Enum
 from typing import Any
 from uuid import uuid4
@@ -15,20 +16,16 @@ from uuid import uuid4
 import ray
 
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
-from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
-from arctic_platform.inference.server.streaming import StreamingWorkerMixin, stream_lifecycle_change
-from arctic_platform.inference.vllm.dense_prompt_logprobs import (
-    RESULT_KEY as _DENSE_PROMPT_LOGPROBS_KEY,
-    stage_sampling_params as _stage_dense_prompt_logprobs,
-    take_dense as _take_dense_prompt_logprobs,
-)
-from arctic_platform.inference.vllm.spec_decode_grammar import (
-    ensure_spec_decode_grammar_fix,
-)
-from arctic_platform.inference.vllm.xgrammar_stop_mask import (
-    ensure_xgrammar_stop_mask_fix,
-)
+from arctic_platform.inference.server.metrics import RingStatLogger
+from arctic_platform.inference.server.metrics import get_collector
+from arctic_platform.inference.server.streaming import StreamingWorkerMixin
+from arctic_platform.inference.server.streaming import stream_lifecycle_change
 from arctic_platform.inference.utils import require_supported_vllm_version
+from arctic_platform.inference.vllm.dense_prompt_logprobs import RESULT_KEY as _DENSE_PROMPT_LOGPROBS_KEY
+from arctic_platform.inference.vllm.dense_prompt_logprobs import stage_sampling_params as _stage_dense_prompt_logprobs
+from arctic_platform.inference.vllm.dense_prompt_logprobs import take_dense as _take_dense_prompt_logprobs
+from arctic_platform.inference.vllm.spec_decode_grammar import ensure_spec_decode_grammar_fix
+from arctic_platform.inference.vllm.xgrammar_stop_mask import ensure_xgrammar_stop_mask_fix
 
 logger = logging.getLogger("arctic_platform.inference.server")
 
@@ -184,9 +181,7 @@ def _ensure_arctic_vllm_patches() -> None:
         return
 
     from arctic_platform.inference.vllm.patches import apply_arctic_patches
-    from arctic_platform.inference.vllm.required_patches import (
-        apply_required_vllm_patches,
-    )
+    from arctic_platform.inference.vllm.required_patches import apply_required_vllm_patches
 
     apply_required_vllm_patches()
     try:
@@ -197,9 +192,7 @@ def _ensure_arctic_vllm_patches() -> None:
 
 
 def _ensure_router_replay_vllm_patches() -> None:
-    from arctic_platform.inference.vllm.router_replay import (
-        ensure_router_replay_vllm_patches,
-    )
+    from arctic_platform.inference.vllm.router_replay import ensure_router_replay_vllm_patches
 
     ensure_router_replay_vllm_patches()
 
@@ -215,12 +208,12 @@ def _create_async_engine_args(
     if enable_arctic_patches:
         _ensure_arctic_vllm_patches()
         from vllm.engine.arg_utils import AsyncEngineArgs
+
         engine_args_cls = AsyncEngineArgs
     else:
-        from arctic_platform.inference.vllm.fp32_lm_head import (
-            Fp32LmHeadAsyncEngineArgs,
-            ensure_fp32_lm_head_vllm_patches,
-        )
+        from arctic_platform.inference.vllm.fp32_lm_head import Fp32LmHeadAsyncEngineArgs
+        from arctic_platform.inference.vllm.fp32_lm_head import ensure_fp32_lm_head_vllm_patches
+
         engine_args_cls = Fp32LmHeadAsyncEngineArgs
 
     _coerce_structured_outputs_config(engine_kwargs)
@@ -230,8 +223,7 @@ def _create_async_engine_args(
         if not enable_arctic_patches:
             ensure_fp32_lm_head_vllm_patches(
                 enabled=(
-                    bool(getattr(engine_args, "fp32_lm_head", False))
-                    or os.getenv("ARCTIC_FP32_LM_HEAD", "0") == "1"
+                    bool(getattr(engine_args, "fp32_lm_head", False)) or os.getenv("ARCTIC_FP32_LM_HEAD", "0") == "1"
                 )
             )
         return engine_args
@@ -244,11 +236,7 @@ def _create_async_engine_args(
         if unsupported not in engine_kwargs:
             raise
 
-        if (
-            enable_arctic_patches
-            and unsupported == "fp32_lm_head"
-            and engine_kwargs.get(unsupported)
-        ):
+        if enable_arctic_patches and unsupported == "fp32_lm_head" and engine_kwargs.get(unsupported):
             raise TypeError(
                 "fp32_lm_head was requested but ArcticInference could not "
                 "install the vLLM ArcticArgs patch before AsyncEngineArgs "
@@ -267,9 +255,7 @@ def _create_async_engine_args(
 def _pop_router_replay_engine_kwargs(engine_kwargs: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY in engine_kwargs:
-        out[_ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY] = engine_kwargs.pop(
-            _ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY
-        )
+        out[_ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY] = engine_kwargs.pop(_ROUTER_REPLAY_MAX_CACHE_BYTES_ENGINE_KEY)
     return out
 
 
@@ -301,7 +287,9 @@ def _normalize_stop_token_sequences(value: Any) -> list[dict[str, Any]]:
     return out
 
 
-def _extract_reasoning_content(parser: Any, text: str, *, reasoning_ended: bool | None = None) -> tuple[str | None, str]:
+def _extract_reasoning_content(
+    parser: Any, text: str, *, reasoning_ended: bool | None = None
+) -> tuple[str | None, str]:
     if parser is None or not text:
         return None, text
     reasoning, content = parser.extract_reasoning(text, None)
@@ -383,10 +371,7 @@ def _sampled_logprobs_for_output(choice: Any) -> list[float]:
     token_ids = list(choice.token_ids)
     if choice.logprobs is None:
         return [0.0] * len(token_ids)
-    logprobs = [
-        _sampled_logprob(pos, int(token_id))
-        for pos, token_id in zip(choice.logprobs, token_ids)
-    ]
+    logprobs = [_sampled_logprob(pos, int(token_id)) for pos, token_id in zip(choice.logprobs, token_ids)]
     if len(logprobs) < len(token_ids):
         logprobs.extend([0.0] * (len(token_ids) - len(logprobs)))
     return logprobs
@@ -436,18 +421,13 @@ def _result_from_output(
         if dense is not None:
             result[_DENSE_PROMPT_LOGPROBS_KEY] = dense
         else:
-            result["prompt_logprobs"] = [
-                _serialize_logprobs_position(pos)
-                for pos in final_output.prompt_logprobs
-            ]
+            result["prompt_logprobs"] = [_serialize_logprobs_position(pos) for pos in final_output.prompt_logprobs]
 
     if choice.logprobs is not None:
         if return_sampled_logprobs_only:
             result["logprobs"] = _sampled_logprobs_for_output(choice)
         else:
-            result["logprobs"] = [
-                _serialize_logprobs_position(pos) for pos in choice.logprobs
-            ]
+            result["logprobs"] = [_serialize_logprobs_position(pos) for pos in choice.logprobs]
 
     _maybe_cache_routed_experts(
         result,
@@ -518,7 +498,6 @@ def _maybe_cache_routed_experts(
             }
         )
     result[_ROUTER_REPLAY_MARKER_KEY] = marker
-
 
 
 class WorkerLifecycleState(str, Enum):
@@ -606,9 +585,7 @@ class InferenceWorker(StreamingWorkerMixin):
         # Multi-node coordinators use num_gpus=0 (CVD=''). Clear before any CUDA
         # touch so router-replay NCCL can use a local GPU.
         if _clear_ray_blanked_cuda_visible_devices():
-            logger.info(
-                "Cleared empty CUDA_VISIBLE_DEVICES before vLLM engine init"
-            )
+            logger.info("Cleared empty CUDA_VISIBLE_DEVICES before vLLM engine init")
 
         # `reasoning_parser` is used by vLLM structured outputs to avoid
         # constraining reasoning tokens.
@@ -621,6 +598,7 @@ class InferenceWorker(StreamingWorkerMixin):
         # AsyncEngineArgs.__post_init__, which runs *after* __init__ has
         # already validated kwargs against the un-patched field set.
         import vllm.plugins
+
         vllm.plugins.load_general_plugins()
 
         arctic_enabled = arctic_inference_effective_enabled()
@@ -685,8 +663,7 @@ class InferenceWorker(StreamingWorkerMixin):
                     raise
                 delay_s = retry_base_s * attempt + random.uniform(0.0, retry_base_s)
                 logger.warning(
-                    "vLLM engine startup hit address-in-use on attempt %d/%d; "
-                    "retrying in %.2fs",
+                    "vLLM engine startup hit address-in-use on attempt %d/%d; retrying in %.2fs",
                     attempt,
                     max_attempts,
                     delay_s,
@@ -699,8 +676,7 @@ class InferenceWorker(StreamingWorkerMixin):
         # skip_tokenizer_init, and such an engine cannot compile a grammar to
         # replay in the first place.
         if not vllm_config.model_config.skip_tokenizer_init:
-            self._grammar_stop_token_ids = _grammar_stop_token_ids(
-                vllm_config, self.llm.get_tokenizer())
+            self._grammar_stop_token_ids = _grammar_stop_token_ids(vllm_config, self.llm.get_tokenizer())
         self._maybe_init_reasoning_parser(reasoning_parser_name)
         if lora_adapter_path:
             await self._load_checkpoint_lora_adapter(lora_adapter_path)
@@ -804,8 +780,9 @@ class InferenceWorker(StreamingWorkerMixin):
     ) -> None:
         if not engine_kwargs.get("enable_return_routed_experts"):
             return
-        from arctic_platform.inference.server.router_replay import RouterReplayCacheTX
         import torch
+
+        from arctic_platform.inference.server.router_replay import RouterReplayCacheTX
 
         # Avoid torch.cuda.* while CVD is still ''; keep TX on CPU until NCCL init.
         if _ray_blanked_cuda_visible_devices():
@@ -837,11 +814,9 @@ class InferenceWorker(StreamingWorkerMixin):
     ) -> None:
         if not engine_kwargs.get("enable_return_routed_experts"):
             return
-        from arctic_platform.inference.server.router_replay.shm import (
-            cleanup_scope,
-            current_scope,
-            register_expected_buffer,
-        )
+        from arctic_platform.inference.server.router_replay.shm import cleanup_scope
+        from arctic_platform.inference.server.router_replay.shm import current_scope
+        from arctic_platform.inference.server.router_replay.shm import register_expected_buffer
 
         scope = current_scope(None)
         cleanup_scope(scope=scope, model_id=model_id, stale_only=True)
@@ -885,8 +860,7 @@ class InferenceWorker(StreamingWorkerMixin):
         completion_token_ids: Sequence[int] = result.get("token_ids") or []
         if getattr(final_output, "outputs", None):
             completion_token_ids = list(getattr(final_output.outputs[0], "token_ids", None) or completion_token_ids)
-        grammar_stop_token_ids = tuple(
-            set(self._grammar_stop_token_ids) | sampling_params.all_stop_token_ids)
+        grammar_stop_token_ids = tuple(set(self._grammar_stop_token_ids) | sampling_params.all_stop_token_ids)
         return build_action_masks_for_output(
             prompt_token_ids=list(prompt_token_ids or []),
             completion_token_ids=list(completion_token_ids),
@@ -928,17 +902,13 @@ class InferenceWorker(StreamingWorkerMixin):
             replay_id = str(replay_id)
         if replay_id is not None and sample_id is None:
             raise ValueError(f"{_REPLAY_ID_PARAM_KEY} requires {_SAMPLE_ID_PARAM_KEY}")
-        return_back_router_info = bool(
-            sampling_params.pop(_ROUTER_REPLAY_RETURN_INFO_PARAM_KEY, False)
-        )
+        return_back_router_info = bool(sampling_params.pop(_ROUTER_REPLAY_RETURN_INFO_PARAM_KEY, False))
         stop_token_sequences = _normalize_stop_token_sequences(
             sampling_params.pop(_ROUTER_REPLAY_STOP_TOKEN_SEQUENCES_PARAM_KEY, None)
         )
         router_replay_required = sample_id is not None and self._router_replay_tx is not None
         if router_replay_required and _has_string_stop(sampling_params) and not stop_token_sequences:
-            raise ValueError(
-                "Router replay generation with string stop requires dss_stop_token_sequences."
-            )
+            raise ValueError("Router replay generation with string stop requires dss_stop_token_sequences.")
         if stop_token_sequences:
             sampling_params.pop("stop", None)
             extra_args = dict(sampling_params.pop("extra_args", None) or {})
@@ -1012,7 +982,8 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def is_healthy(self) -> bool:
         return self.llm is not None and self.state in (
-            WorkerLifecycleState.READY, WorkerLifecycleState.SLEEPING,
+            WorkerLifecycleState.READY,
+            WorkerLifecycleState.SLEEPING,
         )
 
     def get_state(self) -> str:
@@ -1036,9 +1007,7 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def drain_metrics(self) -> dict[str, Any]:
         """Return and clear the buffered per-step replica snapshots."""
-        from arctic_platform.inference.server.action_mask_replay import (
-            action_mask_replay_cache_stats,
-        )
+        from arctic_platform.inference.server.action_mask_replay import action_mask_replay_cache_stats
 
         return {
             "pid": os.getpid(),
@@ -1064,18 +1033,15 @@ class InferenceWorker(StreamingWorkerMixin):
     ) -> dict[str, Any]:
         if self._router_replay_tx is None:
             raise RuntimeError("router-replay TX cache is not initialized")
-        from arctic_platform.inference.server.router_replay import (
-            RouterReplayCacheTX,
-            init_router_replay_group,
-        )
         import torch
+
+        from arctic_platform.inference.server.router_replay import RouterReplayCacheTX
+        from arctic_platform.inference.server.router_replay import init_router_replay_group
 
         # Re-clear if CVD was blanked again. Prefer runtime device count over
         # is_available() (NVML can lie after an empty-CVD probe).
         if _clear_ray_blanked_cuda_visible_devices():
-            logger.info(
-                "Cleared empty CUDA_VISIBLE_DEVICES before router-replay NCCL"
-            )
+            logger.info("Cleared empty CUDA_VISIBLE_DEVICES before router-replay NCCL")
         raw_count = int(torch._C._cuda_getDeviceCount())
         if raw_count <= 0:
             raise RuntimeError(
@@ -1245,8 +1211,7 @@ class InferenceWorker(StreamingWorkerMixin):
         """Receive + load weights on all TP workers via a single call."""
         results = await self.llm.collective_rpc(
             "sync_weights",
-            args=(master_addr, master_port, rank_offset, world_size,
-                  bucket_size, engine_only, direct_mode, reverse),
+            args=(master_addr, master_port, rank_offset, world_size, bucket_size, engine_only, direct_mode, reverse),
         )
         return results[0] if results else {}
 
@@ -1270,29 +1235,22 @@ class InferenceWorker(StreamingWorkerMixin):
         """
         results = await self.llm.collective_rpc(
             "sync_weights_broadcast",
-            args=(master_addr, master_port, rank_offset, world_size,
-                  bucket_size, engine_only, weight_format),
+            args=(master_addr, master_port, rank_offset, world_size, bucket_size, engine_only, weight_format),
         )
         if not results:
             return {}
         from arctic_platform.inference import envs
+
         if not envs.ARCTIC_INFERENCE_DUMP_PARAM_L2:
             return results[0]
         # Verification path only: preserve the original full-model trace and
         # gather the loaded-only trace under a distinct field.
         head = dict(results[0])
-        head["all_rank_param_l2"] = [
-            (r.get("param_l2") if isinstance(r, dict) else None) for r in results
-        ]
+        head["all_rank_param_l2"] = [(r.get("param_l2") if isinstance(r, dict) else None) for r in results]
         head.pop("param_l2", None)
         if head.get("loaded_destination_trace_collected"):
             head["all_rank_loaded_param_l2"] = [
-                (
-                    r.get("loaded_param_l2")
-                    if isinstance(r, dict)
-                    else None
-                )
-                for r in results
+                (r.get("loaded_param_l2") if isinstance(r, dict) else None) for r in results
             ]
             head.pop("loaded_param_l2", None)
         return head
@@ -1318,16 +1276,24 @@ class InferenceWorker(StreamingWorkerMixin):
         """
         results = await self.llm.collective_rpc(
             "sync_lora_weights_broadcast",
-            args=(master_addr, master_port, rank_offset, world_size,
-                  lora_int_id, lora_name, lora_config, bucket_size,
-                  engine_only, staging, evict_first),
+            args=(
+                master_addr,
+                master_port,
+                rank_offset,
+                world_size,
+                lora_int_id,
+                lora_name,
+                lora_config,
+                bucket_size,
+                engine_only,
+                staging,
+                evict_first,
+            ),
         )
         if not engine_only:
             self._active_lora_int_id = lora_int_id
             self._active_lora_name = lora_name
-            self._active_lora_is_3d = bool(
-                results[0].get("is_3d_lora_weight", False) if results else False
-            )
+            self._active_lora_is_3d = bool(results[0].get("is_3d_lora_weight", False) if results else False)
         return results[0] if results else {}
 
     @stream_lifecycle_change
@@ -1344,8 +1310,7 @@ class InferenceWorker(StreamingWorkerMixin):
         """Receive + load spec (drafter) model weights on all TP workers."""
         results = await self.llm.collective_rpc(
             "sync_spec_weights",
-            args=(master_addr, master_port, rank_offset, world_size,
-                  bucket_size, engine_only, reverse),
+            args=(master_addr, master_port, rank_offset, world_size, bucket_size, engine_only, reverse),
         )
         return results[0] if results else {}
 

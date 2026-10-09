@@ -112,11 +112,7 @@ def stage_sample_metadata(runner: Any, grammar_output: Any) -> None:
     """
     override: Any = _NO_OVERRIDE
     state = getattr(runner, "execute_model_state", None)
-    if (
-        grammar_output is not None
-        and state is not None
-        and state.spec_decode_metadata is not None
-    ):
+    if grammar_output is not None and state is not None and state.spec_decode_metadata is not None:
         override = reject_unvalidated_drafts(
             grammar_output,
             runner.input_batch.req_ids,

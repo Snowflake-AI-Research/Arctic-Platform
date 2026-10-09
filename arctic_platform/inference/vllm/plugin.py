@@ -25,28 +25,23 @@ def arctic_inference_plugin():
     if not envs.ARCTIC_INFERENCE_SKIP_VERSION_CHECK:
         require_supported_vllm_version("Arctic Inference plugin")
 
-    from arctic_platform.inference.vllm.required_patches import (
-        apply_required_vllm_patches,
-    )
+    from arctic_platform.inference.vllm.required_patches import apply_required_vllm_patches
 
     apply_required_vllm_patches()
 
     if not envs.ARCTIC_INFERENCE_ENABLED:
-        from arctic_platform.inference.vllm.fp32_lm_head import (
-            ensure_fp32_lm_head_vllm_patches,
-        )
+        from arctic_platform.inference.vllm.fp32_lm_head import ensure_fp32_lm_head_vllm_patches
 
         ensure_fp32_lm_head_vllm_patches()
         return
 
     if not envs.ARCTIC_INFERENCE_SKIP_PLATFORM_CHECK:
         if not current_platform.is_cuda():
-            raise RuntimeError(
-                "Arctic Inference plugin requires the cuda platform!")
+            raise RuntimeError("Arctic Inference plugin requires the cuda platform!")
 
-    print("\x1b[36;1mArctic Inference plugin is enabled!\x1b[0m",
-          file=sys.stderr)
+    print("\x1b[36;1mArctic Inference plugin is enabled!\x1b[0m", file=sys.stderr)
 
     # Lazy import to avoid potential errors when the plugin is disabled.
     from .patches import apply_arctic_patches
+
     apply_arctic_patches()

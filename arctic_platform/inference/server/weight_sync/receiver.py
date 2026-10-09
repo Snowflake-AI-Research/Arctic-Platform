@@ -55,11 +55,7 @@ def _model_parameter_l2(
 ]:
     """Measure the full model and an optional unique destination subset."""
     full_l2_sq = torch.zeros((), dtype=torch.float64, device=device)
-    loaded_l2_sq = (
-        torch.zeros((), dtype=torch.float64, device=device)
-        if loaded_destinations is not None
-        else None
-    )
+    loaded_l2_sq = torch.zeros((), dtype=torch.float64, device=device) if loaded_destinations is not None else None
     names: list[str] = []
     values: list[torch.Tensor] = []
     found: set[str] = set()
@@ -77,23 +73,14 @@ def _model_parameter_l2(
     missing = loaded_destinations - found if loaded_destinations is not None else set()
     if missing:
         sample = sorted(missing)[:8]
-        raise RuntimeError(
-            "Weight sync resolved destination names that are not model parameters: "
-            f"{sample}"
-        )
+        raise RuntimeError(f"Weight sync resolved destination names that are not model parameters: {sample}")
 
     param_l2 = None
     loaded_param_l2 = None
     if collect:
-        param_l2 = dict(
-            zip(names, torch.stack(values).tolist() if values else [])
-        )
+        param_l2 = dict(zip(names, torch.stack(values).tolist() if values else []))
         if loaded_destinations is not None:
-            loaded_param_l2 = {
-                name: value
-                for name, value in param_l2.items()
-                if name in loaded_destinations
-            }
+            loaded_param_l2 = {name: value for name, value in param_l2.items() if name in loaded_destinations}
     return (
         full_l2_sq.item(),
         loaded_l2_sq.item() if loaded_l2_sq is not None else None,
@@ -122,25 +109,14 @@ def _canonicalize_fused_moe_destination(name: str, param_names: set[str]) -> str
     return name
 
 
-def _canonicalize_destinations(
-    destinations: list[str], param_names: set[str]
-) -> list[str]:
-    return sorted(
-        {
-            _canonicalize_fused_moe_destination(name, param_names)
-            for name in destinations
-        }
-    )
+def _canonicalize_destinations(destinations: list[str], param_names: set[str]) -> list[str]:
+    return sorted({_canonicalize_fused_moe_destination(name, param_names) for name in destinations})
 
 
 def _loaded_destination_names(
     source_to_destinations: dict[str, list[str]],
 ) -> set[str]:
-    return {
-        destination
-        for destinations in source_to_destinations.values()
-        for destination in destinations
-    }
+    return {destination for destinations in source_to_destinations.values() for destination in destinations}
 
 
 def _served_lm_module_prefix(model) -> str:
@@ -175,12 +151,12 @@ def _remap_lora_key(name: str, served_prefix: str) -> str:
     if served_prefix == "model.":
         return name
     head = "base_model.model." if name.startswith("base_model.model.") else ""
-    body = name[len(head):]
+    body = name[len(head) :]
     # Longer trainer root first so ``model.language_model.`` is not
     # partially rewritten via the ``model.`` branch.
     for trainer_root in ("model.language_model.", "model."):
         if body.startswith(trainer_root):
-            body = served_prefix + body[len(trainer_root):]
+            body = served_prefix + body[len(trainer_root) :]
             break
     return head + body
 
@@ -215,10 +191,7 @@ def _pack_fused_expert_loras(lora_model) -> int:
         missing = [p for p in _FUSED_EXPERT_PROJS if p not in parts]
         if missing:
             have = sorted(parts)
-            raise RuntimeError(
-                "Fused expert LoRA for "
-                f"{experts_mod!r} is missing {missing}; have {have}"
-            )
+            raise RuntimeError(f"Fused expert LoRA for {experts_mod!r} is missing {missing}; have {have}")
         lora_model.loras[experts_mod] = PackedLoRALayerWeights.pack_moe_stacked(
             [parts[p][1] for p in _FUSED_EXPERT_PROJS],
             experts_mod,
@@ -251,9 +224,7 @@ def _build_lora_model(
     # Central point for all LoRA key rewriting: strip AC wraps and remap the LM
     # root to the served model's namespace (see ``_remap_lora_key``).
     prefix = _served_lm_module_prefix(model)
-    tensors = {
-        _remap_lora_key(name, prefix): tensor for name, tensor in tensors.items()
-    }
+    tensors = {_remap_lora_key(name, prefix): tensor for name, tensor in tensors.items()}
 
     # Dropout affects training only. target_parameters is represented by the
     # received tensor names and vLLM's mixed-MoE LoRA mode, not PEFTHelper.
@@ -274,9 +245,7 @@ def _build_lora_model(
         hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
         if hf_to_vllm_mapper is not None:
             weights_mapper = hf_to_vllm_mapper.get_rename_mapper()
-    lora_skip_prefixes = (
-        getattr(model, "lora_skip_prefixes", None) if model is not None else None
-    )
+    lora_skip_prefixes = getattr(model, "lora_skip_prefixes", None) if model is not None else None
     lora_model = LoRAModel.from_lora_tensors(
         lora_model_id=lora_int_id,
         tensors=tensors,
@@ -296,15 +265,10 @@ def _build_lora_model(
     has_double_base_nest = any(".base_layer.base_layer." in name for name in tensors)
     has_3d_gate_up = any(".experts.base_layer." in name for name in tensors)
     has_per_expert_2d = any(
-        (".experts." in name)
-        and any(f".{p}." in name for p in ("gate_proj", "down_proj", "up_proj"))
+        (".experts." in name) and any(f".{p}." in name for p in ("gate_proj", "down_proj", "up_proj"))
         for name in tensors
     )
-    if (
-        has_3d_gate_up
-        and not has_double_base_nest
-        and not has_per_expert_2d
-    ):
+    if has_3d_gate_up and not has_double_base_nest and not has_per_expert_2d:
         lora_model.is_3d_lora_weight = True
     return lora_model
 
@@ -313,26 +277,18 @@ def _install_lora_adapter(adapter_manager, lora_model, lora_int_id: int) -> tupl
     """Register and activate one adapter, failing if vLLM rejects either step."""
     added = bool(adapter_manager.add_adapter(lora_model))
     if not added:
-        raise RuntimeError(
-            f"vLLM failed to add synced LoRA adapter id {lora_int_id}"
-        )
+        raise RuntimeError(f"vLLM failed to add synced LoRA adapter id {lora_int_id}")
     activated = bool(adapter_manager.activate_adapter(lora_int_id))
     if not activated:
-        raise RuntimeError(
-            f"vLLM failed to activate synced LoRA adapter id {lora_int_id}"
-        )
+        raise RuntimeError(f"vLLM failed to activate synced LoRA adapter id {lora_int_id}")
     return added, activated
 
 
 def _ensure_engine_process_vllm_patches() -> None:
     require_supported_vllm_version("WeightSyncExtension")
 
-    from arctic_platform.inference.vllm.router_replay import (
-        ensure_router_replay_vllm_patches,
-    )
-    from arctic_platform.inference.vllm.xgrammar_stop_mask import (
-        ensure_xgrammar_stop_mask_fix,
-    )
+    from arctic_platform.inference.vllm.router_replay import ensure_router_replay_vllm_patches
+    from arctic_platform.inference.vllm.xgrammar_stop_mask import ensure_xgrammar_stop_mask_fix
 
     ensure_router_replay_vllm_patches()
     ensure_xgrammar_stop_mask_fix()
@@ -380,6 +336,7 @@ class WeightSyncExtension:
         base and spec models.
         """
         from vllm.distributed.parallel_state import get_world_group
+
         from arctic_platform.inference.server.weight_sync.engine import NCCLEngine
 
         tp_rank = get_world_group().rank
@@ -392,7 +349,10 @@ class WeightSyncExtension:
                 engine.destroy()
             logger.info(
                 "Creating %sNCCLEngine rank=1 ws=2 port=%d tp_rank=%d bucket=%dMB",
-                label, my_port, tp_rank, bucket_size // (1024 * 1024),
+                label,
+                my_port,
+                tp_rank,
+                bucket_size // (1024 * 1024),
             )
             engine = NCCLEngine(
                 master_addr=master_addr,
@@ -450,13 +410,15 @@ class WeightSyncExtension:
         If *engine_only* is True, only the NCCL rendezvous is performed.
         If *direct_mode* is True, per-weight send/recv is used (BF16 TP=1).
         """
-        from vllm.distributed.parallel_state import (
-            get_tensor_model_parallel_world_size,
-        )
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 
         engine = self._get_or_create_engine(
-            master_addr, master_port, bucket_size, reverse,
-            engine_attr="_ws_engine", key_attr="_ws_engine_key",
+            master_addr,
+            master_port,
+            bucket_size,
+            reverse,
+            engine_attr="_ws_engine",
+            key_attr="_ws_engine_key",
         )
 
         if engine_only:
@@ -492,7 +454,9 @@ class WeightSyncExtension:
         from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
 
         updater = _FP8InplaceUpdater(
-            model, self.model_config.dtype, self.device,
+            model,
+            self.model_config.dtype,
+            self.device,
         )
         loaded = 0
         recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
@@ -502,7 +466,8 @@ class WeightSyncExtension:
             loaded += 1
         if updater.pending:
             logger.warning(
-                "FP8 updater has %d incomplete modules", updater.pending,
+                "FP8 updater has %d incomplete modules",
+                updater.pending,
             )
         return loaded, recv_l2_sq.item()
 
@@ -564,15 +529,12 @@ class WeightSyncExtension:
 
         if orphans:
             sample = "\n".join(f"  - {n}" for n in orphans[:10])
-            more = (
-                f"\n  ... and {len(orphans) - 10} more"
-                if len(orphans) > 10 else ""
-            )
+            more = f"\n  ... and {len(orphans) - 10} more" if len(orphans) > 10 else ""
             raise AssertionError(
                 f"Weight sync (_load_direct) received {len(orphans)}/{loaded} "
-                f"tensor(s) whose names do not match any vLLM parameter view -- "
-                f"they were dropped on the floor, which corrupts the inference "
-                f"model.\n\n"
+                "tensor(s) whose names do not match any vLLM parameter view -- "
+                "they were dropped on the floor, which corrupts the inference "
+                "model.\n\n"
                 f"Sample orphan names:\n{sample}{more}\n\n"
             )
         received_value = recv_l2_sq.item()
@@ -605,9 +567,7 @@ class WeightSyncExtension:
         Returns the received count, all-byte and applied-source squared-L2
         norms, canonical destination mapping, and skipped source names.
         """
-        from arctic_platform.inference.server.weight_sync.utils import (
-            _ShardAwareFusedWriter,
-        )
+        from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
 
         writer = _ShardAwareFusedWriter(model, self.device)
         loaded = 0
@@ -615,9 +575,7 @@ class WeightSyncExtension:
         skipped_source_names: list[str] = []
         param_names = {pname for pname, _ in model.named_parameters()}
         recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
-        applied_source_l2_sq = torch.zeros(
-            (), dtype=torch.float64, device=self.device
-        )
+        applied_source_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
         for name, tensor in engine.receive_weights():
             source_l2_sq = _tensor_l2_sq(tensor)
             recv_l2_sq.add_(source_l2_sq)
@@ -673,9 +631,12 @@ class WeightSyncExtension:
             if engine is not None:
                 engine.destroy()
             engine = BroadcastNCCLEngine(
-                master_addr=master_addr, master_port=master_port,
-                rank=rank, world_size=world_size,
-                device=self.device, bucket_size=bucket_size,
+                master_addr=master_addr,
+                master_port=master_port,
+                rank=rank,
+                world_size=world_size,
+                device=self.device,
+                bucket_size=bucket_size,
             )
             self._ws_bcast_engine = engine
             self._ws_bcast_engine_key = key
@@ -704,24 +665,26 @@ class WeightSyncExtension:
         includes full-model and loaded-only per-parameter L2 values, the
         source-to-destination mapping, and skipped source names.
         """
-        from vllm.distributed.parallel_state import (
-            get_tensor_model_parallel_world_size,
-            get_world_group,
-        )
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
+        from vllm.distributed.parallel_state import get_world_group
 
         if weight_format not in ("vllm", "hf"):
-            raise ValueError(
-                f"weight_format must be 'vllm' or 'hf'; got {weight_format!r}"
-            )
+            raise ValueError(f"weight_format must be 'vllm' or 'hf'; got {weight_format!r}")
 
         rank = rank_offset + get_world_group().rank
         engine = self._get_or_create_broadcast_engine(
-            master_addr, master_port, rank, world_size, bucket_size,
+            master_addr,
+            master_port,
+            rank,
+            world_size,
+            bucket_size,
         )
 
         if engine_only:
             return {
-                "status": "engine_ready", "rank": rank, "world_size": world_size,
+                "status": "engine_ready",
+                "rank": rank,
+                "world_size": world_size,
                 "weight_format": weight_format,
             }
 
@@ -732,10 +695,9 @@ class WeightSyncExtension:
 
         # Opt-in weight-sync correctness diagnostic, env-gated (default off).
         from arctic_platform.inference import envs
+
         dump_param_l2 = envs.ARCTIC_INFERENCE_DUMP_PARAM_L2
-        loaded_destination_validation_applicable = not bool(
-            self.model_config.quantization
-        )
+        loaded_destination_validation_applicable = not bool(self.model_config.quantization)
 
         model_l2_sq_before, _, _, _ = _model_parameter_l2(model, self.device)
 
@@ -774,10 +736,7 @@ class WeightSyncExtension:
                 skipped_source_names,
             ) = self._load_batched(model, engine)
 
-        if (
-            loaded_destination_validation_applicable
-            and source_to_destinations is not None
-        ):
+        if loaded_destination_validation_applicable and source_to_destinations is not None:
             loaded_destinations = _loaded_destination_names(source_to_destinations)
             (
                 model_l2_sq_after,
@@ -816,12 +775,8 @@ class WeightSyncExtension:
         result["weight_format"] = weight_format
         result["model_l2_sq_before"] = model_l2_sq_before
         result["model_l2_sq_after"] = model_l2_sq_after
-        result["loaded_destination_validation_applicable"] = (
-            loaded_destination_validation_applicable
-        )
-        result["loaded_destination_trace_collected"] = (
-            loaded_destination_trace_collected
-        )
+        result["loaded_destination_validation_applicable"] = loaded_destination_validation_applicable
+        result["loaded_destination_trace_collected"] = loaded_destination_trace_collected
         if loaded_destinations is not None:
             result["loaded_model_l2_sq_after"] = loaded_model_l2_sq_after
             result["loaded_parameter_count"] = len(loaded_destinations)
@@ -880,21 +835,23 @@ class WeightSyncExtension:
         """
         from vllm.distributed.parallel_state import get_world_group
 
-        lora_config = normalize_lora_peft_config(
-            lora_config, location="lora_config"
-        )
+        lora_config = normalize_lora_peft_config(lora_config, location="lora_config")
         if staging not in {"cpu", "gpu"}:
-            raise ValueError(
-                f"lora_sync_staging must be 'cpu' or 'gpu', got {staging!r}"
-            )
+            raise ValueError(f"lora_sync_staging must be 'cpu' or 'gpu', got {staging!r}")
         rank = rank_offset + get_world_group().rank
         engine = self._get_or_create_broadcast_engine(
-            master_addr, master_port, rank, world_size, bucket_size,
+            master_addr,
+            master_port,
+            rank,
+            world_size,
+            bucket_size,
         )
 
         if engine_only:
             return {
-                "status": "engine_ready", "rank": rank, "world_size": world_size,
+                "status": "engine_ready",
+                "rank": rank,
+                "world_size": world_size,
                 "weight_format": "lora",
             }
 
@@ -916,6 +873,7 @@ class WeightSyncExtension:
         if staging == "cpu":
             try:
                 from vllm.utils.platform_utils import is_pin_memory_available
+
                 pin_memory = bool(is_pin_memory_available())
             except ImportError:
                 pass
@@ -949,7 +907,9 @@ class WeightSyncExtension:
         if not evict_first:
             replaced = bool(adapter_manager.remove_adapter(lora_int_id))
         added, activated = _install_lora_adapter(
-            adapter_manager, lora_model, lora_int_id,
+            adapter_manager,
+            lora_model,
+            lora_int_id,
         )
 
         result = self._build_result(start, mem_before, "lora", n_tensors)
@@ -997,13 +957,15 @@ class WeightSyncExtension:
         """
         drafter = getattr(self.model_runner, "drafter", None)
         if drafter is None or getattr(drafter, "model", None) is None:
-            raise RuntimeError(
-                "sync_spec_weights called but no drafter model is loaded"
-            )
+            raise RuntimeError("sync_spec_weights called but no drafter model is loaded")
 
         engine = self._get_or_create_engine(
-            master_addr, master_port, bucket_size, reverse,
-            engine_attr="_ws_spec_engine", key_attr="_ws_spec_engine_key",
+            master_addr,
+            master_port,
+            bucket_size,
+            reverse,
+            engine_attr="_ws_spec_engine",
+            key_attr="_ws_spec_engine_key",
             label="spec ",
         )
 

@@ -64,6 +64,7 @@ from __future__ import annotations
 import functools
 import inspect
 import os
+import warnings
 from typing import Any
 from typing import Mapping
 from typing import Optional
@@ -75,6 +76,7 @@ DEFAULT_SEED = 42
 # The variable a full-determinism run exports for flash attention. Hugging Face's attention integration
 # reads it; a model that calls a flash-attention entry point directly has to read it itself.
 FLASH_ATTENTION_DETERMINISTIC_ENV = "FLASH_ATTENTION_DETERMINISTIC"
+FLASH_ATTENTION_DETERMINISTIC_MUST_COMPLY_ENV = "FLASH_ATTENTION_DETERMINISTIC_MUST_COMPLY"
 
 # Whether activation checkpointing restores RNG state before recomputing a block. Saving and restoring the CPU and
 # CUDA generators around every checkpointed block is not free, and it only buys anything when the block consumes
@@ -107,6 +109,16 @@ def full_determinism_enabled(training_config: Mapping[str, Any]) -> bool:
     value = debug_config.get("full_determinism", False)
     if not isinstance(value, bool):
         raise TypeError(f"full_determinism in the training debug config must be a bool, got {type(value).__name__}")
+    return value
+
+
+def full_determinism_must_comply(training_config: Mapping[str, Any]) -> bool:
+    """Whether unsupported attention determinism must fail a full-determinism request."""
+    value = training_debug_config(training_config).get("full_determinism_must_comply", True)
+    if not isinstance(value, bool):
+        raise TypeError(
+            f"full_determinism_must_comply in the training debug config must be a bool, got {type(value).__name__}"
+        )
     return value
 
 
@@ -156,8 +168,50 @@ def determinism_worker_env(training_config: Mapping[str, Any], seed: Optional[in
         "CUBLAS_WORKSPACE_CONFIG": CUBLAS_WORKSPACE,
         "NCCL_DETERMINISTIC": "1",
         FLASH_ATTENTION_DETERMINISTIC_ENV: "1",
+        FLASH_ATTENTION_DETERMINISTIC_MUST_COMPLY_ENV: "1" if full_determinism_must_comply(training_config) else "0",
         "PYTHONHASHSEED": str(seed),
     }
+
+
+def _fla_autotuner(kernel, *, name: str):
+    """Reach the Triton autotuner wrapped by FLA heuristics."""
+    current = kernel
+    for _ in range(4):
+        if hasattr(current, "configs") and hasattr(current, "cache"):
+            return current
+        current = getattr(current, "fn", None)
+        if current is None:
+            break
+    raise RuntimeError(f"cannot reach the autotuner behind {name}")
+
+
+def _pin_first_fla_configuration(kernel, *, name: str) -> None:
+    """Keep one installed FLA configuration so call shape cannot choose a different reduction order."""
+    autotuner = _fla_autotuner(kernel, name=name)
+    if not autotuner.configs:
+        raise RuntimeError(f"{name} exposes no Triton configurations")
+    autotuner.configs = [autotuner.configs[0]]
+    autotuner.cache.clear()
+
+
+def pin_fla_gdn_autotuners(model_path: str) -> None:
+    """Pin GatedDeltaNet autotuners when the checkpoint declares linear-attention layers."""
+    import json
+    from pathlib import Path
+
+    config = json.loads((Path(model_path) / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    if "linear_attention" not in text_config.get("layer_types", []):
+        return
+
+    from fla.ops.common import chunk_o
+    from fla.ops.utils import cumsum as cumsum_module
+
+    _pin_first_fla_configuration(chunk_o.chunk_fwd_kernel_o, name="chunk_fwd_kernel_o")
+    _pin_first_fla_configuration(
+        cumsum_module.chunk_local_cumsum_scalar_kernel,
+        name="chunk_local_cumsum_scalar_kernel",
+    )
 
 
 def configure_full_determinism(training_config: Mapping[str, Any]) -> None:
@@ -186,6 +240,12 @@ def flash_attention_determinism_requested() -> bool:
     stops at the process boundary while the configuration still claims the run is reproducible.
     """
     return os.environ.get(FLASH_ATTENTION_DETERMINISTIC_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def flash_attention_determinism_must_comply() -> bool:
+    """Whether an unsupported deterministic attention backward must stop the worker."""
+    value = os.environ.get(FLASH_ATTENTION_DETERMINISTIC_MUST_COMPLY_ENV, "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def _varlen_backward_error(varlen_func, head_dim: int, *, deterministic: bool) -> Optional[str]:
@@ -244,7 +304,57 @@ def flash_attention_deterministic_backward_refusal(varlen_func, head_dim: int) -
     return _varlen_backward_error(varlen_func, head_dim, deterministic=True)
 
 
-def resolve_flash_attention_determinism(varlen_func, head_dim: int, implementation: str) -> bool:
+def maybe_partial_determinism_support(
+    model_path: str, implementation: Optional[str], training_config: Mapping[str, Any]
+) -> None:
+    """Withdraw kernel-specific determinism requests that best-effort mode cannot satisfy."""
+    if full_determinism_enabled(training_config):
+        pin_fla_gdn_autotuners(model_path)
+    if full_determinism_must_comply(training_config):
+        return
+    withdraw_unsupported_flash_attention_determinism(model_path, implementation)
+
+
+def withdraw_unsupported_flash_attention_determinism(model_path: str, implementation: Optional[str]) -> None:
+    """Clear the FlashAttention request when the installed kernel refuses its deterministic backward."""
+    if not flash_attention_determinism_requested():
+        return
+    if not implementation or not implementation.startswith("flash_attention"):
+        return
+    try:
+        if implementation == "flash_attention_4":
+            from flash_attn.cute import flash_attn_varlen_func
+        else:
+            from flash_attn_interface import flash_attn_varlen_func
+        from transformers import AutoConfig
+
+        model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        inner = getattr(model_config, "text_config", model_config)
+        head_dim = int(getattr(inner, "head_dim", None) or inner.hidden_size // inner.num_attention_heads)
+        refusal = flash_attention_deterministic_backward_refusal(flash_attn_varlen_func, head_dim)
+    except Exception as exc:
+        warnings.warn(
+            f"could not establish whether {implementation} supports a deterministic backward "
+            f"({type(exc).__name__}: {exc}); leaving the request in place",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return
+    if refusal is None:
+        return
+    os.environ[FLASH_ATTENTION_DETERMINISTIC_ENV] = "0"
+    warnings.warn(
+        f"best-effort determinism: the installed {implementation} kernel refuses a deterministic backward at "
+        f"head_dim={head_dim} ({refusal.rstrip('. ')}), so the attention backward stays nondeterministic while "
+        "the rest of the determinism set applies",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def resolve_flash_attention_determinism(
+    varlen_func, head_dim: int, implementation: str, *, must_comply: bool = True
+) -> bool:
     """Whether to ask ``varlen_func`` for a deterministic backward, refusing when the request cannot be honoured.
 
     Returning ``False`` whenever nothing asked keeps the product path exactly as it is and leaves this the only
@@ -260,6 +370,15 @@ def resolve_flash_attention_determinism(varlen_func, head_dim: int, implementati
     refusal = flash_attention_deterministic_backward_refusal(varlen_func, head_dim)
     if refusal is None:
         return True
+    if not must_comply:
+        warnings.warn(
+            f"best-effort determinism: the installed {implementation} kernel refuses a deterministic backward "
+            f"at head_dim={head_dim} ({refusal.rstrip('. ')}), so the attention backward stays nondeterministic "
+            "while the rest of the determinism set applies",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
     raise RuntimeError(
         "debug.full_determinism asks for a deterministic attention backward and the installed "
         f"{implementation} kernel refuses one at head_dim={head_dim}: {refusal.rstrip('. ')}. Either run this "
