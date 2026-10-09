@@ -95,12 +95,12 @@ dev = [
 ]
 
 # Pulls [tinker], itself a superset of [cortex], so the transport tests can
-# import the client and the Tinker tests can build the ASGI app. Not [onprem]:
+# import the client and the Tinker tests can import the SDK. Not [onprem]:
 # it reaches [rl] -> arctic-inference[vllm], and vLLM's build needs CUDA_HOME,
 # which a CPU-only CI runner does not have. The on-prem tests skip without it.
 testing = [
     "arctic_platform[tinker]",
-    "httpx",  # ASGITransport, for driving the Tinker router without a socket
+    "httpx",
     "parameterized",
     "pytest-asyncio",
     "pytest-instafail",
@@ -109,7 +109,7 @@ testing = [
     "pytest-timeout",
     "pytest-xdist",
     "pytest",
-    "tinker==0.25.0",  # generated protobuf schema used by the Tinker wire tests
+    "tinker==0.25.0",
 ]
 
 formatting = [
