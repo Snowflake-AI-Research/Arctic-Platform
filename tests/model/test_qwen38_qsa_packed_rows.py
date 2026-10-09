@@ -4,7 +4,9 @@ import torch
 pytest.importorskip("transformers.models.qwen4_exp")
 
 
-def test_qsa_packed_rows_match_isolated_rows(monkeypatch):
+# Row-B positions restart at 0, restart at an offset, or continue row A (only varlen metadata can split it).
+@pytest.mark.parametrize("layout", ["zero", "offset", "continuous_with_cu_seqlens"])
+def test_qsa_packed_rows_match_isolated_rows(monkeypatch, layout):
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
     from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
@@ -33,13 +35,19 @@ def test_qsa_packed_rows_match_isolated_rows(monkeypatch):
     for lengths in ((2, 4), (3, 5), (1, 3)):
         a, b = lengths
         ids = torch.arange(a + b)[None] + 1
-        positions = torch.cat((torch.arange(a), torch.arange(b)))[None]
+        if layout == "zero":
+            positions = torch.cat((torch.arange(a), torch.arange(b)))[None]
+        elif layout == "offset":
+            positions = torch.cat((torch.arange(a) + 7, torch.arange(b) + 7))[None]
+        else:
+            positions = torch.arange(a + b)[None] + 7
+        varlen = {"cu_seq_lens_q": torch.tensor([0, a, a + b], dtype=torch.int32)} if layout.endswith("cu_seqlens") else {}
         for mask in (None, torch.ones_like(ids)):
-            def run(tokens, pos, amask):
+            def run(tokens, pos, amask, **kwargs):
                 x = model.model.embed_tokens(tokens).detach().requires_grad_(True)
-                y = model(inputs_embeds=x, position_ids=pos, attention_mask=amask, use_cache=False).logits
+                y = model(inputs_embeds=x, position_ids=pos, attention_mask=amask, use_cache=False, **kwargs).logits
                 return x, y
-            x, packed = run(ids, positions, mask)
+            x, packed = run(ids, positions, mask, **varlen)
             bx, isolated = run(ids[:, a:], positions[:, a:], None if mask is None else mask[:, a:])
             torch.testing.assert_close(packed[:, a:], isolated, rtol=1e-5, atol=1e-6)
             packed[:, a:].square().sum().backward()
@@ -48,9 +56,8 @@ def test_qsa_packed_rows_match_isolated_rows(monkeypatch):
             torch.testing.assert_close(x.grad[:, :a], torch.zeros_like(x.grad[:, :a]))
             changed = ids.clone()
             changed[:, :a] += 10
-            _, perturbed = run(changed, positions, mask)
+            _, perturbed = run(changed, positions, mask, **varlen)
             torch.testing.assert_close(perturbed[:, a:], isolated, rtol=1e-5, atol=1e-6)
-            print(f'packed lengths={lengths} mask={mask is not None}: output/input-gradient/isolation PASS')
     ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
     with torch.no_grad():
         implicit = model(input_ids=ids, use_cache=False).logits

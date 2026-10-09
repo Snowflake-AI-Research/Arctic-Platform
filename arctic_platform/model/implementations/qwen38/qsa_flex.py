@@ -202,6 +202,7 @@ def _qsa_indexer_forward(
     attention_mask: torch.Tensor | None,
     past_key_values=None,
     position_ids=None,
+    cu_seqlens=None,
 ) -> torch.Tensor:
     if past_key_values is not None and past_key_values.get_seq_length() > 0:
         raise NotImplementedError("Qwen3.8 QSA FlexAttention cache decoding is handled by the inference backend")
@@ -241,8 +242,13 @@ def _qsa_indexer_forward(
     query_offset = cp_rank * local_sequence_length
     for batch_idx, length in enumerate(lengths):
         length = int(length)
-        resets = torch.where(global_positions[batch_idx, 1:length] == 0)[0] + 1
-        boundaries = [0, *resets.tolist(), length]
+        if cu_seqlens is None:
+            # transformers' packed-sequence rule: a position that does not follow its predecessor by 1 starts a row.
+            row_positions = global_positions[batch_idx, :length]
+            starts = (torch.where(row_positions[1:] - row_positions[:-1] != 1)[0] + 1).tolist()
+        else:
+            starts = [start for start in cu_seqlens[1:-1].tolist() if 0 < start < length]
+        boundaries = [0, *starts, length]
         for start, end in zip(boundaries, boundaries[1:]):
             local_start = max(start, query_offset)
             local_end = min(end, query_offset + local_sequence_length)
@@ -474,7 +480,11 @@ def _qsa_attention_forward(
         raise ValueError("Qwen3.8 QSA FlexAttention does not support attention dropout")
     from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
 
-    selected_token_ids = self.indexer(hidden_states, position_embeddings, attention_mask, past_key_values, qsa_position_ids)
+    # Packed-row boundaries from the caller's varlen metadata, when given, outrank boundaries inferred from positions.
+    selected_token_ids = self.indexer(
+        hidden_states, position_embeddings, attention_mask, past_key_values, qsa_position_ids,
+        _kwargs.get("cu_seq_lens_q"),
+    )
     position_embeddings = tuple(value[:, -hidden_states.shape[1] :] for value in position_embeddings)
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
