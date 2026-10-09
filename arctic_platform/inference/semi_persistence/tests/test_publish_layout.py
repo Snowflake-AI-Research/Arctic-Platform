@@ -749,7 +749,7 @@ def test_a_flat_dump_is_unchanged_by_the_replica_layout():
 
 
 # --------------------------------------------------------------------------
-# One engine over several pods: each pod holds only its node<k>/ half
+# One engine over several pods: each pod holds only its node<k>/ node-partition
 # --------------------------------------------------------------------------
 
 DUMP_ID = "4cc6c196ea1c4c59b59df9842c2ea85e"
@@ -784,7 +784,7 @@ def _node_pod(tmp, pod, k, *, nnodes=2, tp=4, dump_id=DUMP_ID,
 
 
 def _publish_pods(roots, **kw):
-    """Publish every pod's half concurrently, as the operator does."""
+    """Publish every pod's node-partition concurrently, as the operator does."""
     import threading
     results, errors = {}, {}
 
@@ -857,7 +857,7 @@ def test_the_sentinels_follow_every_pods_uploads():
 
 def test_the_weight_hash_spans_every_pods_ranks():
     """Each pod alone would hash only its ranks; the published hash is the
-    union's, which is what both pods must agree on."""
+    union's, which is what every pod must agree on."""
     def body(tmp):
         def run(bucket):
             roots = [_node_pod(tmp, "pod-a", 0), _node_pod(tmp, "pod-b", 1)]
@@ -883,7 +883,7 @@ def test_missing_ranks_refuse_before_anything_is_uploaded():
     _in_tmp(body)
 
 
-def test_halves_of_different_configs_refuse():
+def test_node_partitions_of_different_configs_refuse():
     def body(tmp):
         def run(bucket):
             a = _node_pod(tmp, "pod-a", 0)
@@ -898,7 +898,7 @@ def test_halves_of_different_configs_refuse():
     _in_tmp(body)
 
 
-def test_a_lone_half_times_out_rather_than_publishing():
+def test_a_lone_node_partition_times_out_rather_than_publishing():
     def body(tmp):
         def run(bucket):
             root = sp.Path(_node_pod(tmp, "pod-a", 0))
@@ -909,7 +909,7 @@ def test_a_lone_half_times_out_rather_than_publishing():
     _in_tmp(body)
 
 
-def test_a_half_recorded_under_another_rank_refuses():
+def test_a_node_partition_recorded_under_another_rank_refuses():
     def body(tmp):
         root = _node_pod(tmp, "pod-a", 1)
         path = os.path.join(root, "node1", "image", "meta.json")
@@ -920,7 +920,7 @@ def test_a_half_recorded_under_another_rank_refuses():
     _in_tmp(body)
 
 
-def test_a_half_moved_after_its_dump_refuses():
+def test_a_node_partition_moved_after_its_dump_refuses():
     def body(tmp):
         root = _node_pod(tmp, "pod-a", 1)
         path = os.path.join(root, "node1", "image", "meta.json")
@@ -931,7 +931,7 @@ def test_a_half_moved_after_its_dump_refuses():
     _in_tmp(body)
 
 
-def test_a_node_half_still_answers_the_key_and_model():
+def test_a_node_partition_still_answers_the_key_and_model():
     """unpublish_skeleton and --status need only these two."""
     def body(tmp):
         root = sp.Path(_node_pod(tmp, "pod-a", 1))

@@ -109,8 +109,8 @@ class Instance:
         # single-node, which is every TP <= 8 deployment.  It never enters
         # ``vllm_config``: that dict is hashed into the image cache key and
         # compared at restore, so a node_rank or a master address in it would
-        # make the two halves of one job disagree and a restore onto a
-        # different pod pair impossible.  ``nnodes`` is the exception and does
+        # make the node-partitions of one job disagree and a restore onto a
+        # different set of pods impossible.  ``nnodes`` is the exception and does
         # live in the config, because the split changes the image.
         self.multinode = multinode
         # Optional per-model directory.  When set, the image lives at
@@ -389,7 +389,7 @@ class Instance:
             return self._send("init", vllm_config=vllm_config)
         # Node identity travels beside the config, never inside it: the child
         # merges it into its own private copy so the dict that gets hashed and
-        # written to meta.json stays identical on both halves.
+        # written to meta.json stays identical on every node-partition.
         return self._send("init", vllm_config=vllm_config,
                           multinode=self.multinode.as_init_kwargs())
 
@@ -490,7 +490,7 @@ class Instance:
         is the dump's, so nothing the restoring job sets would be visible
         there.  ``master_addr`` is the leader's address in a multi-node group
         and loopback otherwise; ``port`` lets the engine pin one rendezvous
-        for both halves and retry jointly; ``ifname`` is the interface EFA
+        for all node-partitions and retry jointly; ``ifname`` is the interface EFA
         comes up on.  All three default to what this node can work out alone,
         which is the single-node case.
         """
@@ -543,7 +543,8 @@ class Instance:
             raise RuntimeError("message-queue park requires a model_dir")
         model_dir = os.path.normpath(self.model_dir)
         key = os.path.basename(model_dir)
-        # A half of a multi-node image lives at <key>/node<k>. Every half has
+        # A node-partition of a multi-node image lives at <key>/node<k>. Every
+        # node-partition has
         # to name the same directory: the leader's park hands its path to all
         # ranks, each parked reader carries it into its node's image, and the
         # follower's unpark has to write where those readers poll.

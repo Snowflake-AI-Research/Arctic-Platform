@@ -272,7 +272,7 @@ def test_engine_and_publisher_spell_the_replica_level_alike():
 
 
 def test_engine_and_publisher_spell_the_node_level_alike():
-    """Each pod of a node-spanning engine copies ``node<k>/`` out of the
+    """Each pod of a pod-spanning engine copies ``node<k>/`` out of the
     skeleton the publisher wrote; ``_node_source`` names it from this prefix."""
     assert (_ENGINE_CONSTS["_NODE_DIR_PREFIX"]
             == _PUBLISH_CONSTS["NODE_DIR_PREFIX"] == "node")

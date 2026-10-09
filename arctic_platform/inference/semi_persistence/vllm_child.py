@@ -1101,7 +1101,7 @@ _MQ_PARK = {}
 _FOLLOWER = {}
 _UNPARK = {}
 
-# Node identity when this child is one half of a TP group that spans machines:
+# Node identity when this child is one node-partition of a TP group that spans pods:
 # ``MultiNode.as_init_kwargs()``, set once at spawn.  ``None`` means
 # single-node, which is every TP <= 8 deployment and the path that keeps its
 # graphs through the dump and rebinds them.
@@ -2863,7 +2863,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
 
     ``gpus`` is the physical GPU list for this instance (a single-element
     list at TP=1).  ``multinode`` is ``MultiNode.as_init_kwargs()`` when this
-    node is one half of a TP group that spans machines, and ``None`` -- the
+    child is one node-partition of a TP group that spans pods, and ``None`` -- the
     single-node case -- otherwise.  It arrives at spawn rather than with the
     ``init`` command because the environment it decides (the NCCL/gloo
     interface, ``VLLM_HOST_IP`` and the pinned aws-ofi-nccl values) has to be
@@ -3720,8 +3720,8 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     # L1: node identity reaches the engine only here, on this
                     # private copy.  The caller's dict -- the one hashed into
                     # the image cache key and written to meta.json -- keeps
-                    # only ``nnodes``, so both halves derive the same key and a
-                    # restored pair can rendezvous somewhere new.
+                    # only ``nnodes``, so every node-partition derives the same key
+                    # and a restored engine can rendezvous somewhere new.
                     vllm_config["node_rank"] = _MULTINODE["node_rank"]
                     vllm_config["master_addr"] = _MULTINODE["master_addr"]
                     vllm_config["master_port"] = _MULTINODE["master_port"]
@@ -3755,7 +3755,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                             **_fkw["compilation_config"])
                     # The usage context picks scheduler defaults such as
                     # max_num_batched_tokens; it has to be the leader's
-                    # (LLM_CLASS) or the two halves profile different shapes
+                    # (LLM_CLASS) or the node-partitions profile different shapes
                     # and deadlock in their first mismatched collective.
                     _fvc = EngineArgs(**_fkw).create_engine_config(
                         usage_context=UsageContext.LLM_CLASS, headless=True)
@@ -4535,7 +4535,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     log.warning("  cuda probe failed", exc_info=True)
                 # The leader picks the port unless the caller pinned one.  A
                 # multi-node group rendezvouses on it, so at nnodes > 1 the
-                # engine chooses it for both halves and retries jointly (E6);
+                # engine chooses it for every node-partition and retries jointly (E6);
                 # a free port here would only be free on this node.
                 port = int(kwargs.get("port") or 0) or get_open_port()
                 results = _collective_rpc_with_timeout(

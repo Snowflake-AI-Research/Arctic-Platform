@@ -1,4 +1,4 @@
-"""Node-local replica slots: what a semi-p replica's image directory keys on.
+"""Pod-local replica slots: what a semi-p replica's image directory keys on.
 
 Lifted out of the source so this runs without ray or torch installed.
 """

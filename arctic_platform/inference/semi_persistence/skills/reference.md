@@ -71,8 +71,8 @@ this. See [MULTINODE_TP16.md](MULTINODE_TP16.md).
 
 `Instance(vllm_config, model_dir, multinode=MultiNode(node_rank, master_addr,
 master_port, ifname))`. `nnodes` goes in `vllm_config` and is hashed into the
-cache key; everything in `MultiNode` is deliberately not, so both halves derive
-the same key and a restored pair can rendezvous somewhere new.
+cache key; everything in `MultiNode` is deliberately not, so every node-partition
+derives the same key and a restored engine can rendezvous somewhere new.
 
 `reinit_nccl(master_addr=, port=, ifname=)` takes kwargs only on this path: the
 child is a restored process, so its `environ` is the dump's and nothing the
