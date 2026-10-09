@@ -69,9 +69,9 @@ class Trainer(Protocol):
     world_size: int
     global_steps: int
     cuda_device: int
-    engine: Any
     model: Any
-    optimizer: Any  # None for frozen models
+    _engine: Any
+    _optimizer: Any  # None for frozen models
 
 
 class Callback:
