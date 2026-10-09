@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Run a tinker-cookbook module with ``arctic_platform.tinker`` installed.
+"""Run a tinker-cookbook module with ``arctic_platform.integrations.tinker`` installed.
 
-    python -m arctic_platform.tinker.run --training-gpus 1 --sampling-gpus 1 \\
+    python -m arctic_platform.integrations.tinker.run --training-gpus 1 --sampling-gpus 1 \\
         tinker_cookbook.recipes.math_rl.train env=gsm8k model_name=Qwen/Qwen3.5-4B
 """
 
@@ -33,7 +33,7 @@ _FLAGS = {
 
 
 def main() -> None:
-    from arctic_platform import tinker
+    import arctic_platform.integrations.tinker as tinker
 
     argv = sys.argv[1:]
     kwargs: dict[str, int] = {}
@@ -48,7 +48,7 @@ def main() -> None:
         index += 2
     if "training_gpus" not in kwargs or "sampling_gpus" not in kwargs:
         raise SystemExit(
-            "usage: python -m arctic_platform.tinker.run --training-gpus N --sampling-gpus N <module> [recipe args...]"
+            "usage: python -m arctic_platform.integrations.tinker.run --training-gpus N --sampling-gpus N <module> [recipe args...]"
         )
     if index >= len(argv):
         raise SystemExit("missing the cookbook module to run")

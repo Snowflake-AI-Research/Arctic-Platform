@@ -1,6 +1,6 @@
 # Tinker integration
 
-Cookbook recipes run on Cortex by importing `arctic_platform.tinker` in place
+Cookbook recipes run on Cortex by importing `arctic_platform.integrations.tinker` in place
 of `tinker`. That import registers itself as `sys.modules["tinker"]`, so the
 recipe's existing `import tinker` lines use Cortex. There is no local Tinker
 server and no `TINKER_BASE_URL`.
@@ -10,22 +10,22 @@ takes (`--training-gpus`, `--sampling-gpus`). Connection settings stay in
 `ARCTIC_CORTEX_*`.
 
 `python -m tinker_cookbook...` never runs a user import first, so start the
-recipe through `python -m arctic_platform.tinker.run`. A script you own can
-instead put `from arctic_platform import tinker` on its first line and
+recipe through `python -m arctic_platform.integrations.tinker.run`. A script you own can
+instead put `from arctic_platform.integrations import tinker` on its first line and
 construct `tinker.ServiceClient(training_gpus=..., sampling_gpus=...)`.
 
 Validated with `tinker==0.25.0` and `tinker-cookbook==0.5.5`.
 
 ## Request path
 
-`arctic_platform.tinker` is the client a recipe imports. It calls three modules
-in `arctic_platform.integrations.tinker`: `convert.py` turns datums and sampling
+`arctic_platform.integrations.tinker` is the client a recipe imports. In that
+package, `convert.py` turns datums and sampling
 params into batch fields, `job.py` builds the Cortex job, and `cortex.py` runs
 that job. Only `cortex.py` imports Cortex.
 
 ```mermaid
 flowchart LR
-  cookbook["tinker-cookbook"] --> client["arctic_platform.tinker"]
+  cookbook["tinker-cookbook"] --> client["arctic_platform.integrations.tinker"]
   client --> convert["convert.py datum conversion"]
   convert --> cortex["cortex.py"]
   cortex -->|"forward_backward, optim_step, weight sync"| train["Cortex training job"]
@@ -79,7 +79,7 @@ A job can remain in `PLACING` while it waits for GPU capacity.
 ## Run a cookbook recipe
 
 ```bash
-python -m arctic_platform.tinker.run \
+python -m arctic_platform.integrations.tinker.run \
     --training-gpus 1 \
     --sampling-gpus 1 \
     --max-prompt-length 4096 \
@@ -99,7 +99,7 @@ exit.
 A handwritten script:
 
 ```python
-from arctic_platform import tinker
+from arctic_platform.integrations import tinker
 
 service = tinker.ServiceClient(training_gpus=1, sampling_gpus=1)
 training = await service.create_lora_training_client_async("Qwen/Qwen3-0.6B", rank=32)
@@ -243,8 +243,8 @@ handling. They do not require a Cortex account or GPU.
 
 | File | Role |
 |---|---|
-| `arctic_platform/tinker/__init__.py` | `ServiceClient`, `TrainingClient`, `SamplingClient` |
-| `arctic_platform/tinker/run.py` | `python -m arctic_platform.tinker.run` |
+| `arctic_platform/integrations/tinker/__init__.py` | `ServiceClient`, `TrainingClient`, `SamplingClient` |
+| `arctic_platform/integrations/tinker/run.py` | `python -m arctic_platform.integrations.tinker.run` |
 | `arctic_platform/integrations/tinker/convert.py` | Datum, loss, and sampling-param conversion |
 | `arctic_platform/integrations/tinker/job.py` | Cortex job config (`TinkerJobConfig`) |
 | `arctic_platform/integrations/tinker/cortex.py` | Forward-backward, optimizer step, sampling |

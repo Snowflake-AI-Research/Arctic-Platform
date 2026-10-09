@@ -15,7 +15,7 @@
 
 """The in-process client registers itself as ``tinker`` before a recipe imports it.
 
-Importing ``arctic_platform.tinker`` inside this process would replace
+Importing ``arctic_platform.integrations.tinker`` inside this process would replace
 ``sys.modules["tinker"]`` for the rest of the suite, so these checks run in a
 child interpreter.
 """
@@ -32,10 +32,10 @@ pytest.importorskip("tinker")
 
 def test_import_registers_the_tinker_module() -> None:
     script = """
-import arctic_platform.tinker
+import arctic_platform.integrations.tinker
 import tinker
 from tinker.types import LossFnType
-assert tinker.ServiceClient.__module__ == "arctic_platform.tinker", tinker.ServiceClient
+assert tinker.ServiceClient.__module__ == "arctic_platform.integrations.tinker", tinker.ServiceClient
 assert "importance_sampling" in LossFnType.__args__
 tinker.configure(training_gpus=1, sampling_gpus=1)
 try:
@@ -51,7 +51,7 @@ else:
 def test_teacher_logprobs_use_the_prompt_tokens() -> None:
     script = """
 import asyncio
-import arctic_platform.tinker as tinker
+import arctic_platform.integrations.tinker as tinker
 
 seen = {}
 
@@ -77,7 +77,7 @@ assert logprobs == [None, -0.4, -0.2], logprobs
 def test_sampler_save_syncs_the_live_weights() -> None:
     script = """
 import asyncio
-import arctic_platform.tinker as tinker
+import arctic_platform.integrations.tinker as tinker
 
 synced = {}
 
@@ -100,7 +100,7 @@ assert result.path == "cortex://session/step20/sampler"
 def test_cookbook_client_contract() -> None:
     script = """
 import asyncio
-import arctic_platform.tinker as tinker
+import arctic_platform.integrations.tinker as tinker
 
 synced = {}
 
@@ -191,7 +191,7 @@ else:
 def test_optim_step_refuses_adam_the_job_cannot_apply() -> None:
     script = """
 import asyncio
-import arctic_platform.tinker as tinker
+import arctic_platform.integrations.tinker as tinker
 
 called = {}
 
@@ -232,7 +232,7 @@ asyncio.run(main())
 
 def test_launcher_requires_gpu_counts() -> None:
     completed = subprocess.run(
-        [sys.executable, "-m", "arctic_platform.tinker.run", "tinker_cookbook.recipes.math_rl.train"],
+        [sys.executable, "-m", "arctic_platform.integrations.tinker.run", "tinker_cookbook.recipes.math_rl.train"],
         capture_output=True,
         text=True,
     )

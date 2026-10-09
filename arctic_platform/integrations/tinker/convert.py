@@ -15,7 +15,7 @@
 
 """Convert Tinker datums, losses, and sampling params into Cortex batch fields.
 
-:mod:`arctic_platform.tinker` calls these helpers. This module does not import Cortex.
+:mod:`arctic_platform.integrations.tinker` calls these helpers. This module does not import Cortex.
 """
 
 from __future__ import annotations
