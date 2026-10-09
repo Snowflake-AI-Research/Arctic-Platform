@@ -192,15 +192,46 @@ Cortex packs several sequences into one micro-batch. Models with linear
 
 ## Validation
 
-Live validation covered `math_rl` and supervised `chat_sl` with importance
-sampling, PPO, and cross-entropy. `rl_loop` and `sl_loop` call synchronous
-`forward_backward`, which is listed under limitations.
+Cookbook source is unchanged. Where a published command names another model, the run below uses `Qwen/Qwen3.5-4B` and leaves the rest of that command as published. Hardware for these runs is 4 training GPUs and 4 sampling GPUs, one H200 node. `rl_loop` and `sl_loop` call synchronous `forward_backward`, which is listed under limitations.
 
-Trainer parity with Tinker was measured by sampling rollouts on Tinker once and
-replaying the same datums on Tinker and on this adapter for five steps, both
-training the same LoRA with the cookbook's Adam settings. The convergence
-recipes were re-run for ten steps against runs made before the packing,
-chunking, and resend fixes:
+### Qwen3.5-4B, published GSM8K command
+
+`tinker_cookbook.recipes.math_rl.train env=gsm8k group_size=64 groups_per_batch=32 learning_rate=8e-5 max_tokens=1024`, with the model set to `Qwen/Qwen3.5-4B` instead of `Qwen/Qwen3.5-9B`. 211 steps.
+
+| Step | Reward | Correct | KL sample/train |
+|---|---|---|---|
+| 0 | 0.549 | 0.617 | 0.00025 |
+| 3 | 0.837 | 0.855 | 0.00023 |
+| 5 | 0.946 | 0.951 | 0.00015 |
+| 210 | 0.999 | 0.999 | 0.00020 |
+
+Reward is above 0.8 at step 3. The cookbook's note for the 9B command is that training reward should pass 0.8 within a few steps.
+
+A separate arithmetic run used group size 8, 32 groups, 64 tokens, and thinking disabled. Reward went from 0.067 at step 0 to 1.0 at step 2. The published arithmetic command (`groups_per_batch=100`, `max_tokens=5`, learning rate `1e-4`) is the run still in the queue.
+
+### Five steps, same short arguments on Cortex and the Tinker API
+
+These used `Qwen/Qwen3.5-4B` on both sides, 4 training and 4 sampling GPUs, and smaller batches than the published commands. Math batches were 4 groups of 4, so both sides stayed on the format penalty. Supervised loss fell on both sides.
+
+| Recipe | Cortex | Tinker API |
+|---|---|---|
+| arithmetic, GSM8K, MATH, Polaris, DeepMath, rl-basic | reward −0.10 → −0.10 | reward −0.10 → −0.10 |
+| rubric | reward −0.10 → 0.088 | reward −0.031 → 0.106 |
+| guess-number | reward −0.50 → 0.188 | reward 0.00 → 0.188 |
+| twenty-questions | reward 0 → 0 | reward 0 → 0 |
+| tic-tac-toe | reward −1.00 → −1.00 | reward −1.00 → −0.50 |
+| shorter | reward −0.50 → 0.00 | reward −0.50 → 0.00 |
+| chat-sl | NLL 2.188 → 1.449 | NLL 2.189 → 1.444 |
+| sl-basic | NLL 2.188 → 1.367 | NLL 2.189 → 1.364 |
+| prompt distillation | NLL 5.610 → 0.161 | NLL 5.642 → 0.168 |
+| on-policy distillation | reward 0, teacher KL ~0 | reward 0, teacher KL ~0 |
+| code RL | exited while loading the task list, 0 steps | same |
+
+Harbor, search, and verifiers were not started: the extra packages or local services they import are not installed. `rl_loop`, `sl_loop`, DPO, and SDFT are outside this client.
+
+### Earlier same-datum parity
+
+Trainer parity with Tinker was measured by sampling rollouts on Tinker once and replaying the same datums on Tinker and on this adapter for five steps, both training the same LoRA with the cookbook's Adam settings. The convergence recipes were re-run for ten steps against runs made before the packing, chunking, and resend fixes:
 
 | Recipe | Model | Setup | Result |
 |---|---|---|---|
