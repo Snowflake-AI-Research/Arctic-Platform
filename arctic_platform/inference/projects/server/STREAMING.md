@@ -105,18 +105,32 @@ Which parsers apply comes from `CHAT_MODELS` in `chat.py`, keyed by the
 architecture vLLM resolves for the checkpoint, so every checkpoint of a listed
 architecture gets chat mode without engine kwargs:
 
-| Architectures | Family | Reasoning / tool parser | Thinking off | `reasoning_effort` sent to the template |
-|---|---|---|---|---|
-| `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM` | Qwen3 | `qwen3` / `hermes` | yes | as is (ignored) |
-| `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForCausalLM`, `Qwen3_5MoeForConditionalGeneration`, `Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration` | Qwen3.5, 3.6, 3.8 | `qwen3` / `qwen3_coder` | yes | `minimal` becomes `low`, `high` and `max` become `xhigh` (Qwen3.8 takes low, medium, xhigh) |
-| `GlmMoeDsaForCausalLM` | GLM-5, 5.1, 5.2 | `glm47` / `glm47` | yes | `minimal`, `low`, `medium` become `high`; `xhigh` becomes `max` |
-| `Glm4MoeForCausalLM` | GLM-4.5, 4.6, 4.7 | `glm47` / `glm47` | yes | as is (ignored) |
-| `Glm5NextForCausalLM`, `Glm5NextForConditionalGeneration` | GLM-5.3-Flash | `glm47` / `glm47` | no | `minimal` becomes `low`, `medium` becomes `high`, `xhigh` becomes `max` |
-| `DeepseekV4ForCausalLM`, `DeepseekV4ForConditionalGeneration` | DeepSeek-V4 | `deepseek_v4` / `deepseek_v4` | yes | as is (vLLM's tokenizer maps it) |
-| `GptOssForCausalLM` | gpt-oss | `openai_gptoss` / `openai` | no | `minimal` becomes `low`, `xhigh` and `max` become `high` |
-| `MiniMaxM2ForCausalLM` | MiniMax-M2, M2.1 | `minimax_m2` / `minimax_m2` | no | as is (ignored) |
-| `AfmoeForCausalLM` | Arcee Trinity (thinking) | `deepseek_r1` / `qwen3_coder` | no | as is (ignored) |
-| `NemotronHForCausalLM` | Nemotron 3 Nano, Super | `nemotron_v3` / `qwen3_coder` | yes | as is (ignored) |
+| Architectures | Family | Reasoning / tool parser | Thinking off | `reasoning_effort` sent to the template | Verified |
+|---|---|---|---|---|---|
+| `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM` | Qwen3 | `qwen3` / `hermes` | yes | as is (ignored) | GPU (Qwen3-0.6B) |
+| `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForCausalLM`, `Qwen3_5MoeForConditionalGeneration`, `Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration` | Qwen3.5, 3.6, 3.8 | `qwen3` / `qwen3_coder` | yes | `minimal` becomes `low`, `high` and `max` become `xhigh` (Qwen3.8 takes low, medium, xhigh) | not yet |
+| `GlmMoeDsaForCausalLM` | GLM-5, 5.1, 5.2 | `glm47` / `glm47` | yes | `minimal`, `low`, `medium` become `high`; `xhigh` becomes `max` | not yet |
+| `Glm4MoeForCausalLM` | GLM-4.5, 4.6, 4.7 | `glm47` / `glm47` | yes | as is (ignored) | not yet |
+| `Glm5NextForCausalLM`, `Glm5NextForConditionalGeneration` | GLM-5.3-Flash | `glm47` / `glm47` | no | `minimal` becomes `low`, `medium` becomes `high`, `xhigh` becomes `max` | not yet |
+| `DeepseekV4ForCausalLM`, `DeepseekV4ForConditionalGeneration` | DeepSeek-V4 | `deepseek_v4` / `deepseek_v4` | yes | as is (vLLM's tokenizer maps it) | not yet |
+| `GptOssForCausalLM` | gpt-oss | `openai_gptoss` / `openai` | no | `minimal` becomes `low`, `xhigh` and `max` become `high` | not yet |
+| `MiniMaxM2ForCausalLM` | MiniMax-M2, M2.1 | `minimax_m2` / `minimax_m2` | no | as is (ignored) | not yet |
+| `AfmoeForCausalLM` | Arcee Trinity (Large-Preview; see below) | none / `hermes` | yes (never thinks) | as is (ignored) | not yet |
+| `NemotronHForCausalLM` | Nemotron 3 Nano, Super | `nemotron_v3` / `qwen3_coder` | yes | as is (ignored) | not yet |
+
+"Verified" is how far each family has been run: GPU is `test_gpu_chat.py`
+(Qwen3-0.6B); QA6 is a DSS run on QA6, which no family has had yet (the DSS
+QA6 matrix runs before the pin bump). Entries not yet verified are best-effort
+from vLLM's parsers and the families' templates.
+
+A reasoning parser of "none" means the family does not reason: everything it
+writes is content, logprobs are allowed, and `reasoning_tokens` is 0. Trinity's
+checkpoints differ under one architecture, and the table follows
+Trinity-Large-Preview. Trinity-Large-Thinking opens `<think>` and writes XML
+tool calls, so it needs `chat_reasoning_parser=deepseek_r1` and
+`tool_call_parser=qwen3_coder`; Trinity-Mini opens `<think>` with hermes calls
+and needs `chat_reasoning_parser=deepseek_r1`. A reasoner on a model that never
+closes `</think>` would return its whole answer as reasoning.
 
 That is 18 architectures in 10 families. "Thinking off" means
 `reasoning_effort="none"` turns thinking off: vLLM hands the template
@@ -217,7 +231,7 @@ on such a checkpoint streams reasoning as content; an explicit
 
 1. Add its architectures to `CHAT_MODELS` in `chat.py`: the reasoning and tool
    parsers vLLM's recipe for it pairs (both must be registered in the pinned
-   vLLM), whether its template turns thinking off with `enable_thinking`, and a
+   vLLM; `reasoning_parser=None` for a family that does not reason), whether its template turns thinking off with `enable_thinking`, and a
    `reasoning_efforts` map if its template takes only some levels. A family
    Arctic trains but cannot chat with goes in `TRAINED_WITHOUT_CHAT` in
    `test_chat_models.py`, with the reason.
