@@ -104,7 +104,8 @@ def test_every_trainable_architecture_has_a_chat_decision():
         ("Qwen4ExpForConditionalGeneration", "qwen3", "qwen3_coder", True),
         ("Qwen4ExpForCausalLM", "qwen3", "qwen3_coder", True),
         ("MiniMaxM2ForCausalLM", "minimax_m2", "minimax_m2", False),
-        ("AfmoeForCausalLM", "deepseek_r1", "qwen3_coder", False),
+        # Trinity-Large-Preview: no thinking, hermes-style JSON tool calls.
+        ("AfmoeForCausalLM", None, "hermes", True),
         ("NemotronHForCausalLM", "nemotron_v3", "qwen3_coder", True),
     ],
 )
@@ -135,6 +136,13 @@ def test_unknown_architecture_has_no_chat_unless_parsers_are_given():
     assert model == ChatModel(reasoning_parser=None, tool_call_parser="hermes")
     # Nothing says thinking can be turned off.
     assert model.thinking_optional is False
+
+
+def test_a_family_without_a_reasoner_takes_every_reasoning_effort():
+    model = CHAT_MODELS["AfmoeForCausalLM"]
+    assert model.reasoning_parser is None
+    # Nothing to turn off, so "none" is honoured rather than refused.
+    assert [model.template_reasoning_effort(e) for e in ("none", "high")] == ["none", "high"]
 
 
 @pytest.mark.parametrize(

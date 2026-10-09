@@ -343,11 +343,22 @@ def test_a_jobs_own_reasoner_wins_over_the_architectures(fake_vllm, monkeypatch)
     assert worker._chat_only_reasoner is False
 
 
+def test_a_family_without_a_reasoner_adds_none_to_the_engine(fake_vllm, monkeypatch):
+    fake_vllm["architecture"] = "AfmoeForCausalLM"
+    worker = start_worker()
+
+    assert chat_parsers(monkeypatch, worker) == (None, "hermes")
+    assert fake_vllm["reasoner_at_engine_start"] == ""
+    assert worker._chat_only_reasoner is False
+
+
 @pytest.mark.parametrize(
     ("architecture", "engine_kwargs", "support"),
     [
         ("Qwen3ForCausalLM", {}, {"chat_prompt": True, "thinking_optional": True}),
         ("GptOssForCausalLM", {}, {"chat_prompt": True, "thinking_optional": False}),
+        # No reasoner: nothing to turn off.
+        ("AfmoeForCausalLM", {}, {"chat_prompt": True, "thinking_optional": True}),
         ("MysteryForCausalLM", {}, {"chat_prompt": False, "thinking_optional": False}),
         (
             "MysteryForCausalLM",

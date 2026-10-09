@@ -29,6 +29,11 @@ class ChatModel:
 
     ``reasoning_efforts`` maps a requested ``reasoning_effort`` to the level the
     family's template names; values it does not list reach the template as is.
+
+    ``reasoning_parser=None`` in a ``CHAT_MODELS`` entry means the family does
+    not reason: everything it writes is content, so logprobs are allowed, and
+    such entries set ``thinking_optional`` since there is nothing to turn off.
+    A job's own engine reasoner still replaces it, as for every entry.
     """
 
     reasoning_parser: str | None
@@ -102,9 +107,14 @@ CHAT_MODELS = MappingProxyType(
         ),
         # MiniMax-M2 and M2.1 always think.
         "MiniMaxM2ForCausalLM": ChatModel("minimax_m2", "minimax_m2"),
-        # Arcee Trinity's thinking checkpoints, as vLLM's Trinity-Large-Thinking
-        # recipe pairs them; their templates open <think> unconditionally.
-        "AfmoeForCausalLM": ChatModel("deepseek_r1", "qwen3_coder"),
+        # Arcee Trinity, as Trinity-Large-Preview's template writes it: no
+        # thinking, hermes JSON tool calls. Its checkpoints differ under one
+        # architecture: Trinity-Large-Thinking opens <think> and writes XML tool
+        # calls (chat_reasoning_parser=deepseek_r1, tool_call_parser=qwen3_coder);
+        # Trinity-Mini opens <think> with hermes calls (chat_reasoning_parser=
+        # deepseek_r1). A reasoner on a model that never closes </think> would
+        # hide its whole answer as reasoning.
+        "AfmoeForCausalLM": ChatModel(None, "hermes", thinking_optional=True),
         # Nemotron 3 Nano and Super.
         "NemotronHForCausalLM": ChatModel("nemotron_v3", "qwen3_coder", thinking_optional=True),
     }

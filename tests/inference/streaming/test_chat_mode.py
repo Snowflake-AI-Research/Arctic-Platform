@@ -988,6 +988,32 @@ def test_a_parser_without_its_tool_half_keeps_its_reasoning_half():
     assert without_tool_parser(None) is None
 
 
+class _ToolsOnlyParser(_UnifiedScriptParser):
+    """vLLM's unified Parser for a family with a tool parser and no reasoner."""
+
+    reasoning_parser_cls = None
+
+
+@pytest.mark.parametrize("tools", [None, [WEATHER_TOOL]])
+def test_a_family_without_a_reasoner_streams_everything_as_content(monkeypatch, tools):
+    engine = _engine_whose_parser_adjusts(monkeypatch, lambda request: None)
+    engine.chat_model = CHAT_MODELS["AfmoeForCausalLM"]
+    engine.parser_cls = _ToolsOnlyParser
+    engine.tokenizer = None
+    _, events = stream(
+        chat("What is 2+2?", tools=tools), {"logprobs": 0}, script=ANSWER, chat_engine=engine
+    )
+
+    contents = [e for e in events if e["type"] == "content_delta"]
+    assert "".join(e["text"] for e in contents) == "It is 4."
+    # Logprobs are allowed: no token can be reasoning.
+    assert [len(e["logprobs"]) for e in contents] == [1, 1]
+    assert "reasoning_delta" not in kinds(events)
+    [usage] = [e for e in events if e["type"] == "usage"]
+    assert usage["reasoning_tokens"] == 0
+    assert events[-1]["type"] == "completed"
+
+
 def test_harmony_always_starts_in_reasoning(monkeypatch):
     rendered = _rendered(monkeypatch, "GptOssForCausalLM", harmony=True)
     # vLLM's own reasoning_ended stays as vllm serve sends it.
