@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch import nn
 from transformers.cache_utils import Cache
+from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpModel
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELayer
 from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_mask_to_padding_states
@@ -249,6 +250,13 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
         hidden_states = hyper_input + injection.flatten(-2)
         return hidden_states
 
+class Qwen4ExpModelPrimeRL(Qwen4ExpModel):
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None, *args, **kwargs):
+        if position_ids is not None:
+            kwargs["ple_position_ids"] = position_ids if position_ids.ndim == 2 else position_ids[0]
+        return super().forward(input_ids, attention_mask, position_ids, *args, **kwargs)
+
+
 class Qwen4ExpForConditionalGenerationPrimeRL(
     Qwen4ExpForConditionalGeneration,
     PreTrainedModelPrimeRL,
@@ -260,6 +268,7 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
                 "checkpoint. Native-FP8 training is not implemented."
             )
         super().__init__(config)
+        self.model.__class__ = Qwen4ExpModelPrimeRL
         text_config = config.text_config
         use_grouped_mm = getattr(config, "use_grouped_mm", True)
         for layer in self.model.language_model.layers:
@@ -284,11 +293,6 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
                 layer.ple.ple_embedding.ngram_embedding = sharded_embedding
         self._is_vlm = True
         self._requires_hf_weight_sync = True
-
-    def forward(self, input_ids=None, attention_mask=None, position_ids=None, *args, **kwargs):
-        if position_ids is not None:
-            kwargs["ple_position_ids"] = position_ids if position_ids.ndim == 2 else position_ids[0]
-        return super().forward(input_ids, attention_mask, position_ids, *args, **kwargs)
 
     @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
