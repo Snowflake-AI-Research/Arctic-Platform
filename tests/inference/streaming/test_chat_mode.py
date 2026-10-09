@@ -47,8 +47,22 @@ def chat(*contents, **fields):
     )
 
 
+class ScriptReasoner:
+    """The reasoning half of a ``ScriptParser``."""
+
+    @staticmethod
+    def extract_content_ids(token_ids):
+        return token_ids[token_ids.index(END_OF_THINKING) + 1 :]
+
+
 class ScriptParser:
-    """Stands in for vLLM's Parser: reads the scripted markup, one engine delta at a time."""
+    """Stands in for vLLM's Parser: reads the scripted markup, one engine delta at a time.
+
+    Shaped like vLLM 0.31's DelegatingParser: no public ``extract_content_ids``;
+    only its reasoning parser has one.
+    """
+
+    reasoning_parser = ScriptReasoner()
 
     def __init__(self):
         self.mode = "content"
@@ -96,6 +110,18 @@ class ScriptParser:
     def count_reasoning_tokens(self, token_ids):
         return sum(1 for token in token_ids if token in self.reasoning_ids)
 
+    def _extract_content_ids(self, token_ids):
+        return self.reasoning_parser.extract_content_ids(token_ids)
+
+
+class EngineScriptParser(ScriptParser):
+    """Like vLLM's engine parsers (MiniMax-M2, Kimi-K2): its own public ``extract_content_ids``."""
+
+    class reasoning_parser:
+        @staticmethod
+        def extract_content_ids(token_ids):
+            raise AssertionError("the parser's own extract_content_ids comes first")
+
     @staticmethod
     def extract_content_ids(token_ids):
         return token_ids[token_ids.index(END_OF_THINKING) + 1 :]
@@ -112,9 +138,10 @@ class AlwaysThinkingParser(ScriptParser):
 class HarmonyLikeParser(ScriptParser):
     """Like vLLM's gpt-oss parser: its reasoning half detects boundaries only."""
 
-    @staticmethod
-    def extract_content_ids(token_ids):
-        raise NotImplementedError("GptOssReasoningParser only provides boundary detection.")
+    class reasoning_parser:
+        @staticmethod
+        def extract_content_ids(token_ids):
+            raise NotImplementedError("GptOssReasoningParser only provides boundary detection.")
 
     def count_reasoning_tokens(self, token_ids):
         return 0
@@ -431,9 +458,14 @@ def test_logprobs_are_refused_before_any_token_when_the_model_will_reason(parser
     assert worker.llm.calls == []
 
 
-def test_a_delta_that_ends_reasoning_counts_its_reasoning_tokens():
+@pytest.mark.parametrize("parser", [ScriptParser, EngineScriptParser])
+def test_a_delta_that_ends_reasoning_counts_its_reasoning_tokens(parser):
+    # ScriptParser has vLLM 0.31's DelegatingParser shape (content ids from its
+    # reasoner); EngineScriptParser its own public extract_content_ids.
     script = ["<think>", "Two", (" plus two</think>It is", [201, 202, END_OF_THINKING, 203]), " 4."]
-    _, events = stream(chat("What is 2+2?"), script=script)
+    _, events = stream(
+        chat("What is 2+2?"), script=script, chat_engine=FakeChatEngine(parser=parser)
+    )
     assert kinds(events)[:3] == ["reasoning_delta", "reasoning_delta", "content_delta"]
     # "Two", then " plus", " two" and the end marker from the mixed delta.
     assert sum(e["token_count"] for e in events if e["type"] == "reasoning_delta") == 4

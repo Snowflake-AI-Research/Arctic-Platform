@@ -410,6 +410,19 @@ class ChatEngine:
         )
 
 
+def content_token_ids(parser, token_ids):
+    """The content tokens of a delta that ends reasoning, as ``parser`` splits it.
+
+    vLLM 0.31 made ``DelegatingParser.extract_content_ids`` private; it only
+    called its reasoning parser's, so that is used. Parsers that still define
+    their own (vLLM's engine parsers) keep it.
+    """
+    if hasattr(parser, "extract_content_ids"):
+        return parser.extract_content_ids(token_ids)
+    reasoner = parser.reasoning_parser
+    return token_ids if reasoner is None else reasoner.extract_content_ids(token_ids)
+
+
 class ChatOutput:
     """Turns one stream's engine deltas into content, reasoning and tool-call events.
 
@@ -469,7 +482,7 @@ class ChatOutput:
             if content or tool_calls:
                 # The delta that ends reasoning; split it as vLLM's parser does.
                 try:
-                    token_count -= len(parser.extract_content_ids(list(token_ids)))
+                    token_count -= len(content_token_ids(parser, list(token_ids)))
                 except NotImplementedError:
                     # gpt-oss's parser can't split one; it counts as reasoning.
                     pass

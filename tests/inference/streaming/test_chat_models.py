@@ -97,7 +97,7 @@ def test_every_trainable_architecture_has_a_chat_decision():
         ("DeepseekV4ForCausalLM", "deepseek_v4", "deepseek_v4", True),
         ("DeepseekV4ForConditionalGeneration", "deepseek_v4", "deepseek_v4", True),
         ("GptOssForCausalLM", "openai_gptoss", "openai", False),
-        # vLLM 0.30 recipes and docs pair these parsers with each family.
+        # vLLM 0.31 recipes and docs pair these parsers with each family.
         ("Glm4MoeForCausalLM", "glm47", "glm47", True),
         ("Glm5NextForConditionalGeneration", "glm47", "glm47", False),
         ("Glm5NextForCausalLM", "glm47", "glm47", False),
@@ -187,10 +187,10 @@ def test_reasoning_effort_reaches_the_template_as_the_family_names_it(
 ANY = None
 # Levels each family's template (or vLLM's renderer for it) accepts; ANY for
 # templates that ignore the value. From the checkpoints' chat templates and
-# vLLM 0.30: Qwen3.8 raises outside low/medium/xhigh; GLM-5.3-Flash reads
+# vLLM 0.31: Qwen3.8 raises outside low/medium/xhigh; GLM-5.3-Flash reads
 # anything but low/high as Max; Harmony raises outside low/medium/high
-# (harmony_utils.py:65); vLLM's DeepSeek-V4 tokenizer maps every value
-# (tokenizers/deepseek_v4.py:43).
+# (harmony_utils.py:68); vLLM's DeepSeek-V4 tokenizer maps every value
+# (tokenizers/deepseek_v4.py:51).
 TEMPLATE_EFFORTS = {
     "Qwen3ForCausalLM": ANY,
     "Qwen3MoeForCausalLM": ANY,

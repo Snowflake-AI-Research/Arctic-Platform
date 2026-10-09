@@ -27,7 +27,7 @@ THINK, END_THINK = 10, 11
 NO_THINK_TOKENS = "no-think-tokenizer"
 THINK_TOKENS_MISSING = "reasoning parser could not locate think start/end tokens in the tokenizer!"
 # A tokenizer the parser builds on but finds no think tokens in, as vLLM's
-# MiniMaxM2AppendThinkReasoningParser does (minimax_m2_reasoning_parser.py:34).
+# MiniMaxM2AppendThinkReasoningParser does (minimax_m2_reasoning_parser.py:31).
 THINK_IDS_NONE = "think-ids-none-tokenizer"
 # A tokenizer the parser rejects with some other message.
 REWORDED_ERROR = "reworded-error-tokenizer"
@@ -40,7 +40,7 @@ class FakeReasoningParser:
 
     def __init__(self, tokenizer):
         if tokenizer == NO_THINK_TOKENS:
-            # As vLLM's BaseThinkingReasoningParser (reasoning/basic_parsers.py:64).
+            # As vLLM's BaseThinkingReasoningParser (reasoning/basic_parsers.py:63).
             raise RuntimeError(f"FakeReasoningParser {THINK_TOKENS_MISSING}")
         if tokenizer == REWORDED_ERROR:
             raise RuntimeError("FakeReasoningParser found no reasoning markers")
@@ -107,8 +107,8 @@ def fake_vllm(monkeypatch):
             if self.kwargs.get("reasoning_parser") and built.get("tokenizer") == NO_THINK_TOKENS:
                 raise RuntimeError(f"FakeReasoningParser {THINK_TOKENS_MISSING}")
             # vLLM copies reasoning_parser over structured_outputs_config's
-            # (arg_utils.py:2586); gpt-oss sets one itself when neither does
-            # (models/config.py:406).
+            # (arg_utils.py:2712); gpt-oss sets one itself when neither does
+            # (models/config.py:423).
             structured = self.kwargs.get("structured_outputs_config") or {}
             config = SimpleNamespace(
                 parallel_config=SimpleNamespace(data_parallel_rank=0),
@@ -492,7 +492,7 @@ def test_a_chat_parser_matching_a_configured_reasoner_is_accepted(fake_vllm):
 
 
 def test_an_engine_that_already_has_a_reasoner_keeps_it_and_generate_is_unchanged(fake_vllm):
-    # gpt-oss gets openai_gptoss without asking (models/config.py:406), so
+    # gpt-oss gets openai_gptoss without asking (models/config.py:423), so
     # /generate already waits for reasoning there; don't change that.
     fake_vllm["engine_reasoner"] = "openai_gptoss"
     worker = start_worker(chat_reasoning_parser="openai_gptoss")
