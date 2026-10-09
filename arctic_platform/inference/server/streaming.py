@@ -66,7 +66,7 @@ PARAM_ERROR_CODES = frozenset({"invalid_message_content", "invalid_chat_request"
 DELTA_TYPES = frozenset({"delta", "content_delta", "reasoning_delta", "tool_call_delta"})
 FINISH_REASONS = frozenset({"stop", "length", "tool_calls"})
 # Optional features; callers test membership before using one.
-STREAM_CAPABILITIES = frozenset({"sampling_params", "chat_prompt"})
+STREAM_CAPABILITIES = frozenset({"chat_prompt"})
 
 
 class StreamError(RuntimeError):

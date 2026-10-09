@@ -24,6 +24,9 @@ from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     stage_sampling_params as _stage_dense_prompt_logprobs,
     take_dense as _take_dense_prompt_logprobs,
 )
+from arctic_platform.inference.vllm.spec_decode_grammar import (
+    ensure_spec_decode_grammar_fix,
+)
 from arctic_platform.inference.vllm.xgrammar_stop_mask import (
     ensure_xgrammar_stop_mask_fix,
 )
@@ -210,7 +213,11 @@ def _ensure_arctic_vllm_patches() -> None:
         return
 
     from arctic_platform.inference.vllm.patches import apply_arctic_patches
+    from arctic_platform.inference.vllm.required_patches import (
+        apply_required_vllm_patches,
+    )
 
+    apply_required_vllm_patches()
     try:
         apply_arctic_patches()
     except ValueError as exc:
@@ -667,6 +674,7 @@ class InferenceWorker(StreamingWorkerMixin):
 
         _ensure_router_replay_vllm_patches()
         ensure_xgrammar_stop_mask_fix()
+        ensure_spec_decode_grammar_fix()
 
         from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -684,7 +692,23 @@ class InferenceWorker(StreamingWorkerMixin):
                     attempt_kwargs,
                     enable_arctic_patches=arctic_enabled,
                 )
-                vllm_config = engine_args.create_engine_config()
+                try:
+                    vllm_config = engine_args.create_engine_config()
+                except RuntimeError as exc:
+                    if "think start/end tokens" not in str(exc):
+                        raise
+                    dropped = attempt_kwargs.pop("reasoning_parser", None)
+                    engine_kwargs.pop("reasoning_parser", None)
+                    logger.warning(
+                        "Tokenizer lacks think tokens; dropping reasoning_parser=%r",
+                        dropped,
+                    )
+                    reasoning_parser_name = None
+                    engine_args = _create_async_engine_args(
+                        attempt_kwargs,
+                        enable_arctic_patches=arctic_enabled,
+                    )
+                    vllm_config = engine_args.create_engine_config()
                 chat_model = resolve_chat_model(
                     vllm_config.model_config.architecture,
                     reasoning_parser=chat_reasoning_parser,

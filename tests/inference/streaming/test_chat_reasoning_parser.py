@@ -140,6 +140,7 @@ def fake_vllm(monkeypatch):
     monkeypatch.setattr(worker_module, "arctic_inference_effective_enabled", lambda *a: False)
     monkeypatch.setattr(worker_module, "_ensure_router_replay_vllm_patches", lambda: None)
     monkeypatch.setattr(worker_module, "ensure_xgrammar_stop_mask_fix", lambda: None)
+    monkeypatch.setattr(worker_module, "ensure_spec_decode_grammar_fix", lambda: None)
     monkeypatch.setattr(
         worker_module,
         "_create_async_engine_args",
