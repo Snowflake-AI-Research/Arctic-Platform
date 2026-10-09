@@ -42,4 +42,4 @@ repos:
       - id: mypy
         additional_dependencies: [types-PyYAML, pydantic]
         args: [--ignore-missing-imports]
-        files: ^arctic_platform/model/
+        files: ^arctic_platform/(model/|common/(option_registry\.py|model_options\.py|profiles/))
