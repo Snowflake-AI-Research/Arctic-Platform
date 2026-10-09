@@ -350,6 +350,72 @@ def test_logprobs_cover_every_answer_token_when_nothing_reasons(reasoning_ended)
     assert events[-1]["type"] == "completed"
 
 
+class HoldBackParser(ScriptParser):
+    """Holds a lone "<" back until the next delta shows whether it opens a tool call."""
+
+    def __init__(self):
+        super().__init__()
+        self.held = ""
+
+    def parse_delta(self, delta_text, *args, **kwargs):
+        if delta_text == "<":
+            self.held += delta_text
+            return None
+        if self.held:
+            delta_text, self.held = self.held + delta_text, ""
+            if not delta_text.startswith("<tool:"):
+                return self._message(content=delta_text)
+        return super().parse_delta(delta_text, *args, **kwargs)
+
+
+def logprob_stream(script, parser=HoldBackParser):
+    _, events = stream(
+        chat("What is 2+2?"),
+        {"logprobs": 0},
+        script=script,
+        chat_engine=FakeChatEngine(parser=parser, reasoning_ended=True),
+    )
+    assert events[-1]["type"] == "completed"
+    contents = [e for e in events if e["type"] == "content_delta"]
+    token_ids = [t for e in contents for t in e["token_ids"]]
+    entries = [entry for e in contents for entry in e["logprobs"]]
+    assert all(len(e["token_ids"]) == len(e["logprobs"]) for e in contents)
+    assert token_ids == [entry["token_id"] for entry in entries]
+    return "".join(e["text"] for e in contents), entries
+
+
+def test_logprobs_cover_tokens_the_parser_held_back_and_released_as_content():
+    text, entries = logprob_stream(["It is", "<", "b>", " 4."])
+
+    assert text == "It is<b> 4."
+    assert [entry["token_id"] for entry in entries] == [100, 101, 102, 103]
+    assert [entry["token"] for entry in entries] == ["It is", "<", "b>", " 4."]
+
+
+def test_held_back_tokens_that_open_a_tool_call_carry_no_logprobs():
+    script = ["It is", "<", "tool:get_weather>", '{"city": "Paris"}', "</tool>", " Done."]
+    text, entries = logprob_stream(script)
+
+    # "<" opened the call and "</tool>" closed it: neither is content.
+    assert text == "It is Done."
+    assert [entry["token_id"] for entry in entries] == [100, 105]
+
+
+def test_held_back_tokens_that_become_reasoning_carry_no_logprobs():
+    text, entries = logprob_stream(["It is", "<think>", "hmm", "</think>", " 4."], ScriptParser)
+
+    assert text == "It is 4."
+    assert [entry["token_id"] for entry in entries] == [100, 104]
+
+
+def test_logprobs_cover_tokens_that_decode_to_no_text_yet():
+    # The detokenizer holds a partial character back as empty text.
+    text, entries = logprob_stream(["It is", ("", [200]), (" é", [201])], parser=lambda: None)
+
+    assert text == "It is é"
+    assert [entry["token_id"] for entry in entries] == [100, 200, 201]
+
+
 @pytest.mark.parametrize(
     "parser,script",
     [(ScriptParser, THINK_THEN_ANSWER), (AlwaysThinkingParser, ["Two", "</think>", "It is"])],
@@ -571,19 +637,21 @@ def test_merged_chat_event_sizes_match_their_serialized_sizes():
     def reasoning(count):
         return {"type": "reasoning_delta", "choice_index": 0, "token_count": count}
 
-    def content(text):
+    def content(text, tokens=1):
+        # Several tokens: a delta that also carries tokens held back before it.
         return {
             "type": "content_delta",
             "choice_index": 0,
             "text": text,
-            "token_ids": [7],
-            "logprobs": [{"token_id": 7, "token": text, "logprob": -0.5, "top": []}],
+            "token_ids": [7] * tokens,
+            "logprobs": [{"token_id": 7, "token": text, "logprob": -0.5, "top": []}] * tokens,
         }
 
     streams = [
         [reasoning(count) for count in (1, 8, 1, 90, 900, 9000)],
         [call("", id="call_0", name="f")] + [call('{"城": "\\n"}') for _ in range(50)],
         [content(text) for text in ("猫", "😀", '"', "a") * 20],
+        [content(text, tokens) for text, tokens in (("猫", 3), ("a", 1), ('"', 12), ("", 2)) * 10],
     ]
     for events in streams:
         buffer = EventBuffer(StreamLimits())

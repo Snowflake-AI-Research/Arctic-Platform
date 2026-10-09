@@ -218,11 +218,15 @@ chat on such a checkpoint streams reasoning as content; an explicit
   reasoning parser nothing is split out, so a model that reasons anyway streams
   its reasoning as content.
 - With `logprobs`, each `content_delta` carries the `token_ids` and `logprobs`
-  of the engine output that produced it; tool-call tokens carry none, as
-  OpenAI reports logprobs for the answer only. Logprobs follow engine token
-  deltas, so when the parser holds text back and releases it later, or splits
-  one delta into content and a tool call, they may not line up one-to-one with
-  the content text.
+  of the engine delta that produced it, preceded by those of earlier deltas
+  the parser held back and now releases as content. A held delta counts as
+  released when the content repeats its text just before this delta's text;
+  one that decoded to no text yet (a partial character) always does. Held
+  deltas the content does not repeat were markup and carry no logprobs, nor do
+  deltas that become tool calls or reasoning (OpenAI reports logprobs for the
+  answer only). Coverage is per engine delta, so one delta the parser splits
+  into content and a tool call gives all its tokens to the content, and a
+  parser that rewrites held text before releasing it leaves those tokens out.
 - `structured_outputs` cannot be combined with a chat prompt whose tools need a
   grammar of their own (`invalid_chat_request`, `param="structured_outputs"`):
   vLLM applies one grammar per request. Without `max_tokens`,

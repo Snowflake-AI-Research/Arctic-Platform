@@ -416,6 +416,12 @@ class ChatOutput:
     Reasoning the parser splits out is never emitted as text: OpenAI's Chat
     Completions API returns only its token count. Deltas the parser holds back
     (markup it is still matching) emit nothing until they resolve.
+
+    With logprobs, a content delta carries its own engine delta's tokens plus
+    the held-back deltas it released: the latest held deltas whose text the
+    content repeats just before this delta's text. Held deltas it does not
+    repeat were markup, and a reasoning or tool-call delta discards them, so
+    reasoning and tool-call tokens carry no logprobs.
     """
 
     def __init__(self, rendered, n):
@@ -424,17 +430,24 @@ class ChatOutput:
         self.token_ids = [[] for _ in range(n)]
         self.reasoning_counts = [0] * n
         self.called_tools = [False] * n
+        # Per choice, (text, token_ids, logprobs) of deltas that emitted nothing.
+        self.held = [[] for _ in range(n)]
 
     def events(self, index, text, token_ids, finished, logprobs=None):
         """``logprobs``, when requested, go with the content these tokens produced."""
         self.token_ids[index].extend(token_ids)
+        events = self._parse(index, text, token_ids, finished, logprobs)
+        if logprobs is not None:
+            if events:
+                self.held[index].clear()
+            elif not finished:
+                self.held[index].append((text, list(token_ids), logprobs))
+        return events
+
+    def _parse(self, index, text, token_ids, finished, logprobs):
         parser = self.parsers[index]
         if parser is None:
-            return (
-                [self._content(index, text, token_ids, logprobs)]
-                if text
-                else []
-            )
+            return [self._content(index, text, text, token_ids, logprobs)] if text else []
         message = parser.parse_delta(
             delta_text=text,
             delta_token_ids=list(token_ids),
@@ -465,7 +478,7 @@ class ChatOutput:
                 {"type": "reasoning_delta", "choice_index": index, "token_count": token_count}
             )
         if content:
-            events.append(self._content(index, content, token_ids, logprobs))
+            events.append(self._content(index, content, text, token_ids, logprobs))
         for call in tool_calls:
             event = {"type": "tool_call_delta", "choice_index": index, "index": call.index}
             function = getattr(call, "function", None)
@@ -478,12 +491,20 @@ class ChatOutput:
             self.called_tools[index] = True
         return events
 
-    @staticmethod
-    def _content(index, text, token_ids, logprobs):
-        event = {"type": "content_delta", "choice_index": index, "text": text}
+    def _content(self, index, content, delta_text, token_ids, logprobs):
+        event = {"type": "content_delta", "choice_index": index, "text": content}
         if logprobs is not None:
-            event["token_ids"] = list(token_ids)
-            event["logprobs"] = logprobs
+            released = []
+            if content.endswith(delta_text):
+                before = content[: len(content) - len(delta_text)]
+                for held in reversed(self.held[index]):
+                    if not before.endswith(held[0]):
+                        break
+                    before = before[: len(before) - len(held[0])]
+                    released.append(held)
+            released.reverse()
+            event["token_ids"] = [t for held in released for t in held[1]] + list(token_ids)
+            event["logprobs"] = [e for held in released for e in held[2]] + list(logprobs)
         return event
 
     def finish_reason(self, index, reason):
