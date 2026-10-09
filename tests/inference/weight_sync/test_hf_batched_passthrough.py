@@ -66,7 +66,7 @@ def main() -> int:
     _init_single_rank()
 
     from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
     from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 
@@ -75,11 +75,11 @@ def main() -> int:
     cfg_ctx = set_current_vllm_config(VllmConfig())
     cfg_ctx.__enter__()
     initialize_model_parallel(tensor_model_parallel_size=1)
-    experts = FusedMoE(
+    experts = FusedMoEFactory(
         num_experts=NUM_EXPERTS, top_k=2, hidden_size=HIDDEN,
         intermediate_size=INTERMEDIATE, params_dtype=DTYPE,
         renormalize=True, quant_config=None, prefix="experts",
-    ).to(device)
+    ).routed_experts.to(device)
     qkvz = MergedColumnParallelLinear(
         input_size=HIDDEN,
         output_sizes=[KEY_DIM, KEY_DIM, VALUE_DIM, VALUE_DIM],
