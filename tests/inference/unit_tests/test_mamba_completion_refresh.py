@@ -244,3 +244,69 @@ def test_skipped_checkpoint_rejoins_fenced_release():
     assert blocks[8].ref_cnt == 0
     finish(obj, True)
     assert [b.name for b in pool.free_block_queue.blocks] == ["M8", "M4"]
+
+
+@pytest.mark.parametrize("attention_first", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_hybrid_completion_retains_a_partial_hit(attention_first, deferred):
+    import itertools
+
+    root = Path(os.environ["VLLM_SOURCE_ROOT"]) / "vllm/v1/core"
+    functions = []
+    for file, cls, method, name in [
+        ("kv_cache_coordinator.py", "KVCacheCoordinator", "free", "coordinator_free"),
+        ("kv_cache_coordinator.py", "KVCacheCoordinator", "pop_blocks_for_free", "coordinator_pop"),
+        ("single_type_kv_cache_manager.py", "MambaManager", "find_longest_cache_hit", "mamba_hit"),
+        ("single_type_kv_cache_manager.py", "FullAttentionManager", "find_longest_cache_hit", "attention_hit"),
+    ]:
+        [fn] = methods(root, file, cls, {method})
+        fn.name = name
+        functions.append(fn)
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *functions],
+        type_ignores=[],
+    )
+    scope = dict(
+        itertools=itertools,
+        cdiv=lambda a, b: (a + b - 1) // b,
+        MambaSpec=SimpleNamespace,
+        FullAttentionSpec=SimpleNamespace,
+        ChunkedLocalAttentionSpec=SimpleNamespace,
+        resolve_block_hashes=lambda hashes, *args, **kwargs: hashes,
+    )
+    exec(compile(ast.fix_missing_locations(module), str(root), "exec"), scope)  # noqa: S102
+    obj, pool, states, mapping = setup((4, 8))
+    attention = [Block(f"A{i}", pool) for i in range(1, 9)]
+    mapping.update((block.block_hash, block) for block in attention)
+    manager = SimpleNamespace(
+        pop_blocks_for_free=lambda request_id: attention, free=lambda request_id: pool.free_blocks(reversed(attention))
+    )
+    managers = [manager, obj] if attention_first else [obj, manager]
+    coordinator = SimpleNamespace(single_type_managers=managers)
+    if deferred:
+        blocks = scope["coordinator_pop"](coordinator, "r")
+        scheduler = SimpleNamespace(
+            deferred_frees=deque([(2, blocks)]), processed_step_seq=1, kv_cache_manager=SimpleNamespace(block_pool=pool)
+        )
+        ns["_drain_deferred_frees"](scheduler)
+        assert pool.get_num_free_blocks() == 0
+        scheduler.processed_step_seq = 2
+        ns["_drain_deferred_frees"](scheduler)
+    else:
+        scope["coordinator_free"](coordinator, "r")
+    pool.hash_block_size = 1
+    pool.get_cached_block = lambda h, groups: (
+        [mapping[f"{groups[0]}{h + 1}"]] if f"{groups[0]}{h + 1}" in mapping else None
+    )
+    cls = SimpleNamespace(supports_fine_grained_hash_lookup=True)
+    spec = SimpleNamespace(block_size=1)
+    hits = []
+    while True:
+        attention_hit = scope["attention_hit"](cls, range(8), 8, ["A"], pool, spec, False, 1)[1]
+        hits.append(scope["mamba_hit"](cls, range(8), attention_hit, ["M"], pool, spec, False, 1)[1])
+        if not pool.get_num_free_blocks():
+            break
+        ns["get_new_blocks"](pool, 1)
+    assert hits[0] == 8 and hits[-1] == 0
+    assert 4 in hits, hits
+    assert hits == sorted(hits, reverse=True)
