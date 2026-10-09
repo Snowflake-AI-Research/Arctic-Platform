@@ -443,7 +443,12 @@ def head_parallel_gated_delta_net(
         num_value_heads=num_value_heads,
         process_group=process_group,
     )
-    beta = exchanged["b"].sigmoid()
+    # vLLM evaluates the beta gate as a sigmoid of fp32 ``b`` and keeps it in fp32; a sigmoid of low-precision
+    # ``b`` would round the gate before the recurrence reads it. This function is shared by the custom Qwen3.5-MoE
+    # model and by the generic transformers wrapper (``_adapt_gated_delta_net_module``), so the layers that
+    # wrapper adapts also get the fp32 gate under sequence parallelism, whatever their own forward computes
+    # without it.
+    beta = exchanged["b"].float().sigmoid()
     g = -local_A_log.float().exp() * F.softplus(exchanged["a"].float() + local_dt_bias)
 
     replication = num_value_heads // num_key_heads

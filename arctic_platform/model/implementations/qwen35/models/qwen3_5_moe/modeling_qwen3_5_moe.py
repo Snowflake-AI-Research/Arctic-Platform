@@ -21,7 +21,7 @@ from arctic_platform.model.implementations.gpu.sp.gated_delta_net import head_pa
 from ..base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.moe.layers.moe import FeedForward, MoE, MoEArgs
-from ..layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig, apply_rotary_pos_emb
+from ..layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig
 
 from .configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from .converting_qwen3_5_moe import (
@@ -72,8 +72,64 @@ logger = logging.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _compute_dtype(x: torch.Tensor) -> torch.dtype:
+    """Return fp32 for the low-precision training dtypes and ``x``'s own dtype otherwise.
+
+    Keeping fp64 inputs in fp64 lets ``torch.autograd.gradcheck`` exercise :class:`_FusedAddRMSNorm`.
+    """
+    if x.dtype in (torch.bfloat16, torch.float16):
+        return torch.float32
+    return x.dtype
+
+
+class _FusedAddRMSNorm(torch.autograd.Function):
+    """Residual add followed by (1+weight) RMSNorm, both evaluated in fp32.
+
+    This follows vLLM's ``fused_add_rms_norm``: the sum of ``x`` and ``residual`` is formed in fp32, and the
+    variance and the normalized value are computed from that fp32 sum rather than from a sum already rounded to
+    the input dtype. Both outputs, the normalized value and the sum that becomes the next residual, are returned
+    in the input dtype.
+
+    For backward it saves only the inputs as given (``x``, ``residual`` and ``weight``) and the per-row
+    ``rstd``, and recomputes the fp32 sum from them, instead of keeping the fp32 sum and the fp32 normalized
+    value alive until backward.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float):
+        compute_dtype = _compute_dtype(x)
+        summed = x.to(compute_dtype) + residual.to(compute_dtype)
+        rstd = torch.rsqrt(summed.pow(2).mean(-1, keepdim=True) + eps)
+        out = summed * rstd * (1.0 + weight.to(compute_dtype))
+        ctx.save_for_backward(x, residual, weight, rstd)
+        return out.to(x.dtype), summed.to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor, grad_residual: torch.Tensor):
+        x, residual, weight, rstd = ctx.saved_tensors
+        compute_dtype = _compute_dtype(x)
+        summed = x.to(compute_dtype) + residual.to(compute_dtype)
+        normed = summed * rstd
+        scale = 1.0 + weight.to(compute_dtype)
+
+        grad = grad_out.to(compute_dtype)
+        grad_weight = (grad * normed).reshape(-1, weight.shape[-1]).sum(0).to(weight.dtype)
+
+        # Gradient through normed = summed * rstd(summed), with rstd = (mean(summed**2) + eps) ** -0.5.
+        grad_normed = grad * scale
+        hidden_size = summed.shape[-1]
+        grad_summed = rstd * (grad_normed - normed * (grad_normed * normed).sum(-1, keepdim=True) / hidden_size)
+        grad_summed = grad_summed + grad_residual.to(compute_dtype)
+        return grad_summed.to(x.dtype), grad_summed.to(residual.dtype), grad_weight, None
+
+
 class Qwen3_5MoeRMSNorm(nn.Module):
-    """RMSNorm with (1+weight) parameterization. Weight initialized to zeros."""
+    """RMSNorm with (1+weight) parameterization. Weight initialized to zeros.
+
+    Called with one tensor, it normalizes that tensor and returns the result. Called with ``residual``, it adds
+    the residual in fp32, normalizes the fp32 sum (see :class:`_FusedAddRMSNorm`) and returns
+    ``(normalized, residual_out)``, where ``residual_out`` is the sum in the input dtype.
+    """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -83,10 +139,16 @@ class Qwen3_5MoeRMSNorm(nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x):
-        output = self._norm(x.float())
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            output = self._norm(x.float())
+            output = output * (1.0 + self.weight.float())
+            return output.type_as(x)
+        return _FusedAddRMSNorm.apply(x, residual, self.weight, self.eps)
 
 
 class Qwen3_5MoeRMSNormGated(nn.Module):
@@ -325,7 +387,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
             key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
             value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
-            beta = b.sigmoid()
+            # vLLM evaluates the beta gate as a sigmoid of fp32 ``b`` and keeps it in fp32; a sigmoid of
+            # low-precision ``b`` would round the gate before the kernel reads it.
+            beta = b.float().sigmoid()
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
             if self.num_v_heads // self.num_k_heads > 1:
                 replication = self.num_v_heads // self.num_k_heads
@@ -355,6 +419,24 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 # ---------------------------------------------------------------------------
 # Gated softmax attention (for full_attention layers)
 # ---------------------------------------------------------------------------
+
+
+def _rope_rotary_slice_fp32(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply partial RoPE in fp32 and cast the rotated channels back to ``x``'s dtype once.
+
+    ``x`` is ``[batch, heads, seq, head_dim]`` and ``cos``/``sin`` are ``[batch, seq, rotary_dim]``; they are
+    unsqueezed on the head axis. Only the first ``rotary_dim`` channels are rotated; the remaining channels are
+    returned unchanged. The result is bitwise equal to upcasting all of ``x``, rotating in fp32 and casting back,
+    because the pass-through channels survive the round trip through fp32 exactly. Upcasting only the rotary
+    slice avoids materializing an fp32 copy of the whole head dimension.
+    """
+    rotary_dim = cos.shape[-1]
+    x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
+    x_rot_fp32 = x_rot.float()
+    half = rotary_dim // 2
+    rotated = torch.cat((-x_rot_fp32[..., half:], x_rot_fp32[..., :half]), dim=-1)
+    embed = (x_rot_fp32 * cos.unsqueeze(1).float()) + (rotated * sin.unsqueeze(1).float())
+    return torch.cat((embed.to(x.dtype), x_pass), dim=-1)
 
 
 @dataclass
@@ -436,7 +518,8 @@ class Qwen3_5MoeGatedSDPAAttention(Qwen3_5MoeGatedAttentionBase):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states = _rope_rotary_slice_fp32(query_states, cos, sin)
+        key_states = _rope_rotary_slice_fp32(key_states, cos, sin)
 
         return query_states, key_states, value_states, gate
 
@@ -542,7 +625,8 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states = _rope_rotary_slice_fp32(query_states, cos, sin)
+        key_states = _rope_rotary_slice_fp32(key_states, cos, sin)
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
 
@@ -660,13 +744,25 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         cu_seqlens: torch.LongTensor | None = None,
         max_seqlen: int | None = None,
         routed_experts: Optional[torch.LongTensor] = None,
-    ) -> torch.FloatTensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(branch_output, residual)``.
+
+        Each residual add is deferred into the next norm, which performs it in fp32 (see
+        :class:`_FusedAddRMSNorm`). ``hidden_states`` is the previous layer's MLP output, or the embeddings for
+        the first layer, which receives ``residual=None`` because there is nothing to add yet. The returned
+        ``branch_output`` is this layer's MLP output, not yet added to the returned ``residual``; the next
+        layer's input norm, or the model's final norm, adds them.
+        """
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # Token mixer
         if self.layer_type == "linear_attention":
@@ -679,11 +775,8 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
                 max_seqlen=max_seqlen,
             )
 
-        hidden_states = residual + hidden_states
-
         # MLP: routed experts + gated shared expert
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Routed experts
         routed_output = self.mlp(hidden_states, routed_experts=routed_experts)
@@ -695,8 +788,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
         shared_output = _shared_expert_gate(hidden_flat, self.shared_expert_gate) * shared_output
         shared_output = shared_output.view(bs, slen, dim)
 
-        hidden_states = residual + routed_output + shared_output
-        return hidden_states
+        return routed_output + shared_output, residual
 
 
 # ---------------------------------------------------------------------------
@@ -821,17 +913,21 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        # The residual is threaded between layers so that every residual add, including the last one, happens
+        # in fp32 inside a norm.
+        residual = None
         for layer_idx, decoder_layer in enumerate(self.layers):
             routed_experts_layer = routed_experts[:, :, layer_idx, :] if routed_experts is not None else None
-            hidden_states = decoder_layer(
+            hidden_states, residual = decoder_layer(
                 hidden_states,
+                residual,
                 position_embeddings=position_embeddings,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 routed_experts=routed_experts_layer,
             )
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return MoeModelOutputWithPast(last_hidden_state=hidden_states)
 
 
