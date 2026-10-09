@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -36,6 +37,7 @@ from arctic_platform.model import Patches
 from arctic_platform.model import apply_patches
 from arctic_platform.model import apply_peft
 from arctic_platform.model import build_model
+from arctic_platform.model.patches.peft import apply_peft_patch
 from arctic_platform.model.patches.peft import attach_unfused_expert_lora_factors
 from arctic_platform.model.patches.peft import cast_lora_adapters_off_fp8
 from arctic_platform.model.patches.peft import cast_trainable_params_off_fp8
@@ -339,3 +341,60 @@ def test_unfused_expert_lora_uses_ap_owned_factor_store():
         for attr in ("_ap_activate_lora_original", "_ap_skip_fused_expert_delta"):
             if hasattr(ParamWrapper, attr):
                 delattr(ParamWrapper, attr)
+
+
+@pytest.mark.parametrize(
+    "peft_config",
+    [
+        {
+            "peft_type": "IA3",
+            "target_modules": ["proj"],
+            "feedforward_modules": ["proj"],
+            "task_type": "FEATURE_EXTRACTION",
+        },
+        {
+            "peft_type": "Lora",
+            "r": 4,
+            "lora_alpha": 8,
+            "target_modules": ["proj"],
+            "modules_to_save": ["head"],
+        },
+        {
+            "peft_type": "Lora",
+            "r": 4,
+            "lora_alpha": 8,
+            "target_modules": ["proj"],
+            "use_dora": True,
+        },
+        {
+            "peft_type": "Lora",
+            "r": 4,
+            "lora_alpha": 8,
+            "bias": "all",
+            "target_modules": ["proj"],
+        },
+    ],
+)
+def test_peft_patch_allows_trainables_outside_lora_export(peft_config):
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8)
+            self.head = nn.Linear(8, 4)
+
+        def forward(self, hidden):
+            return self.head(self.proj(hidden))
+
+    wrapped = apply_peft_patch(
+        Net(),
+        LoaderContext(
+            spec=SimpleNamespace(
+                dtype="float32",
+                patches=SimpleNamespace(peft=peft_config),
+                parallelism=SimpleNamespace(expert_parallel=1),
+            )
+        ),
+    )
+    trainable = [name for name, param in wrapped.named_parameters() if param.requires_grad]
+    assert trainable
+    assert any("lora_A" not in name and "lora_B" not in name for name in trainable)

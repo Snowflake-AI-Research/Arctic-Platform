@@ -115,6 +115,18 @@ def pretrained_module_for_hf_save(model: Any) -> Any:
     return get_base() if callable(get_base) else model
 
 
+def _family_model_for_export(model: nn.Module) -> nn.Module:
+    """Return the model export builders were written against.
+
+    HF and direct-vLLM builders read class methods such as ``convert_layer_to_hf``
+    from ``type(model)``. Those methods live on the family model. A PEFT wrapper
+    does not define them, and instance forwarding does not satisfy the lookup.
+    """
+    if not is_peft_model(model):
+        return model
+    return pretrained_module_for_hf_save(model)
+
+
 def pretrained_config_of(model: Any) -> Any:
     candidates: list[Any] = []
     get_base = getattr(model, "get_base_model", None)
@@ -340,6 +352,7 @@ def iter_lora_weights(
         raise NotImplementedError("weight_format='lora' does not support ZeRO-3")
     if not is_peft_model(model):
         raise ValueError("weight_format='lora' requires a PEFT model")
+    validate_lora_sync_trainable_parameters(model)
 
     from arctic_platform.model.patches.peft import is_peft_lora_param
 
@@ -404,7 +417,7 @@ def iter_model_weights(
     if builder is not None:
         if is_zero3:
             raise NotImplementedError(f"weight_format={weight_format!r} does not support ZeRO-3")
-        yield from builder(model)()
+        yield from builder(_family_model_for_export(model))()
         return
 
     if weight_format == "vllm":

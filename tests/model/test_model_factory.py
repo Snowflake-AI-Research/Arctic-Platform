@@ -423,6 +423,29 @@ class TestModelFeaturePatches:
         assert model.input_grads_enabled is True
         assert [layer.fullgraph for layer in model.model.layers] == [True, True]
 
+    def test_periodic_checkpointing_disables_non_qwen_cache(self):
+        from arctic_platform.model.patches.gradient_checkpointing import apply_gradient_checkpointing
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.text_config = types.SimpleNamespace(model_type="llama", use_cache=True)
+                self.config = types.SimpleNamespace(
+                    model_type="llama",
+                    use_cache=True,
+                    get_text_config=lambda: self.text_config,
+                )
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+
+        model = _Model()
+        apply_gradient_checkpointing(model, _ctx(gradient_checkpointing=2))
+
+        assert model.config.use_cache is False
+        assert model.text_config.use_cache is False
+        assert type(model.model.layers[0]).__name__ == "CheckpointWrapper"
+        assert type(model.model.layers[1]).__name__ == "Linear"
+
     def test_rejects_fullgraph_with_tiling(self):
         from arctic_platform.model.config import Patches
 

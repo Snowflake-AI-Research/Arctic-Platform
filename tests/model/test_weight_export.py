@@ -251,3 +251,117 @@ def test_hf_and_adapter_checkpoint_contract(tmp_path):
     adapter = tmp_path / PEFT_ADAPTER_DIRNAME
     assert (adapter / "adapter_config.json").is_file()
     assert (adapter / "adapter_model.safetensors").is_file()
+
+
+def test_iter_lora_weights_rejects_non_lora_trainables():
+    model = _Model(
+        [
+            (
+                "base_model.model.q_proj.lora_A.default.weight",
+                SimpleNamespace(requires_grad=True, data=torch.ones(1)),
+            ),
+            (
+                "base_model.model.lm_head.modules_to_save.default.weight",
+                SimpleNamespace(requires_grad=True, data=torch.ones(1)),
+            ),
+        ],
+        peft_config={"default": SimpleNamespace(r=8)},
+    )
+
+    with pytest.raises(NotImplementedError, match="Unsupported trainable"):
+        list(iter_lora_weights(model, is_master=True, is_zero3=False))
+
+
+def _export_names(model, weight_format, monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    return [
+        name
+        for name, _ in iter_model_weights(
+            model,
+            weight_format,
+            is_master=True,
+            is_zero3=False,
+        )
+    ]
+
+
+def test_peft_wrapped_qwen3_moe_keeps_hf_family_export(monkeypatch):
+    from peft import LoraConfig
+    from peft import get_peft_model
+
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+    from arctic_platform.model.implementations.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from arctic_platform.model.implementations.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+
+    family = Qwen3MoeForCausalLM(
+        Qwen3MoeConfig(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            use_grouped_mm=False,
+            attn_implementation="sdpa",
+        )
+    )
+    register_weight_export(family, WeightExportContract(hf=build_iter_full_hf_weights))
+    wrapped = get_peft_model(family, LoraConfig(r=4, lora_alpha=8, target_modules=["lm_head"]))
+    transfer_weight_export(family, wrapped)
+
+    assert wrapped.get_base_model() is family
+    assert type(wrapped).__name__.startswith("Peft")
+    with pytest.raises(RuntimeError, match="convert_layer_to_hf"):
+        build_iter_full_hf_weights(wrapped)
+
+    names = _export_names(wrapped, "hf", monkeypatch)
+    assert "model.layers.0.mlp.gate.weight" in names
+    assert any(name.startswith("model.layers.0.mlp.experts.") for name in names)
+    assert not any("lora_" in name for name in names)
+
+
+def test_peft_wrapped_qwen3_5_moe_keeps_vllm_family_export(monkeypatch):
+    from peft import LoraConfig
+    from peft import get_peft_model
+
+    from arctic_platform.model.implementations.qwen35.deepspeed_integration import _build_iter_full_vllm_weights
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+        Qwen3_5MoeConfig,
+    )
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeForCausalLM,
+    )
+
+    family = Qwen3_5MoeForCausalLM(
+        Qwen3_5MoeConfig(
+            vocab_size=32,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=32,
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            layer_types=["full_attention"],
+            use_grouped_mm=False,
+            attn_implementation="sdpa",
+        )
+    )
+    register_weight_export(family, WeightExportContract(vllm=_build_iter_full_vllm_weights))
+    wrapped = get_peft_model(family, LoraConfig(r=4, lora_alpha=8, target_modules=["lm_head"]))
+    transfer_weight_export(family, wrapped)
+
+    assert wrapped.get_base_model() is family
+    with pytest.raises(AssertionError, match="PeftModel"):
+        _build_iter_full_vllm_weights(wrapped)
+
+    names = _export_names(wrapped, "vllm", monkeypatch)
+    assert "model.layers.0.mlp.gate.weight" in names
+    assert "model.layers.0.mlp.experts.w13_weight" in names
