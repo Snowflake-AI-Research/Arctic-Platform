@@ -29,16 +29,19 @@ inst.criu_dump("/data-fast/image-cache/foo").wait()
 | `remove()` | Deregister from `Instance._all`; non-blocking, non-destructive | Main |
 | `wait()` | Block until pending commands complete | Main |
 
-`Instance(vllm_config, model_dir=None)`. With a `model_dir`, the dump and
-restore paths default to `<model_dir>/image` and the compile cache moves
-under `<model_dir>/compilation`; see [semi-p_DESIGN.md](semi-p_DESIGN.md).
+`Instance(vllm_config, model_dir=None, multinode=None)`. With a `model_dir`,
+the dump and restore paths default to `<model_dir>/image` and the compile cache
+moves under `<model_dir>/compilation`; see
+[semi-p_DESIGN.md](semi-p_DESIGN.md). `multinode` is for a TP group that spans
+pods and is `None` everywhere else; see
+[MULTINODE_TP16.md](MULTINODE_TP16.md).
 
 ### GPU residency
 
 | Primitive | Effect |
 |---|---|
 | `sleep()` | `llm.sleep(level=2)` — frees GPU memory for main and drafter weights |
-| `cuda_checkpoint()` | Save CUDA state to CPU via `cuCheckpointProcess`; `gpu` becomes `None`. At TP>1 also inserts `cleargraph` + `destroy_nccl` first |
+| `cuda_checkpoint()` | Save CUDA state to CPU via `cuCheckpointProcess`; `gpu` becomes `None`. At TP>1 also inserts `destroy_nccl` first |
 | `cuda_restore(gpus=[...])` | Restore CUDA state onto specific GPU(s). Defaults to the placement recorded in the image; a scalar `gpu=` still works at TP=1 |
 | `wake_up_weights()` | Re-allocate weight tensors on GPU (main + drafter) |
 | `wake_up_kv_cache()` | Re-allocate the KV cache on GPU |
@@ -51,10 +54,29 @@ placement only and must have exactly that many entries. See
 
 | Primitive | Effect |
 |---|---|
-| `destroy_nccl(graph_mode="reuse")` | Tear down NCCL and CustomAllreduce IPC before a checkpoint. Also marks the worker's inet TCP sockets `SO_LINGER(1,0)` so their ports skip `TIME_WAIT` when the dump kills the tree (Complication 12) |
+| `destroy_nccl()` | Tear down NCCL and CustomAllreduce IPC before a checkpoint, always via the graph-preserving unilateral abort. Also marks the worker's inet TCP sockets `SO_LINGER(1,0)` so their ports skip `TIME_WAIT` when the dump kills the tree (Complication 12) |
 | `reinit_nccl()` | Rebuild NCCL on a fresh port. Must run after `cuda_restore` and before the model runs or a captured graph replays; `attach`/`load_weights` are CPU-only and unconstrained by it |
-| `cleargraph(graph_mode="reuse")` | Drop CUDA-graph exec handles; `reuse` preserves them |
-| `recapture_graphs(graph_mode="reuse")` | Rebind (`reuse`) or recapture (`full`) decode graphs, after `wake_up_kv_cache` |
+| `rebind_graphs()` | Rewrite the preserved decode graphs' stale CustomAllreduce addresses, after `wake_up_kv_cache`. Takes no argument. **Raises at `nnodes > 1`** — there is nothing to rebind there. Was `recapture_graphs(graph_mode=...)` until 2026-09-24; `cleargraph` was retired with it |
+
+### Multi-node (`nnodes > 1` only)
+
+One engine whose ranks span pods. The gate is the node boundary, not TP: two
+TP=8 replicas across two nodes are two single-node engines and use none of
+this. See [MULTINODE_TP16.md](MULTINODE_TP16.md).
+
+| Primitive | Effect |
+|---|---|
+| `drop_graphs()` | Destroy every captured CUDA graph and empty the containers holding them, then refresh the shared graph pool. Auto-inserted by `cuda_checkpoint` ahead of `destroy_nccl`: across nodes the graphs hold NCCL kernels, and `commDestroySync` polls `while (comm->localPersistentRefs != 0)` until they are gone |
+| `recapture_graphs()` | `model_runner.capture_model()` on every rank, after `reinit_nccl` and `wake_up_kv_cache`. Unlocks the workspace first, since `capture_model()` leaves it locked. Replaces `rebind_graphs` on this path |
+
+`Instance(vllm_config, model_dir, multinode=MultiNode(node_rank, master_addr,
+master_port, ifname))`. `nnodes` goes in `vllm_config` and is hashed into the
+cache key; everything in `MultiNode` is deliberately not, so every node-partition
+derives the same key and a restored engine can rendezvous somewhere new.
+
+`reinit_nccl(master_addr=, port=, ifname=)` takes kwargs only on this path: the
+child is a restored process, so its `environ` is the dump's and nothing the
+restoring job sets is visible there.
 
 ### CPU buffer and weight transfer
 
@@ -223,24 +245,40 @@ In the child (`prepare_criu_dump` in `vllm_child.py`):
 1. Drain in-flight engine requests.
 2. Destroy the PyTorch process group (NCCL, TCPStore threads).
 3. Wait for store threads to exit — poll `/proc/<pid>/task`, up to 2.5 s.
-4. `dup2 /dev/null` over stdout and stderr.
+4. Leave stdout and stderr alone: they are the pod-log pipe (PID 1's stdout),
+   dumped as an external pipe and recorded as `stdout_resource`.
 5. Walk `/proc/<pid>/fd` and close everything off the keep-list.
 6. Munmap every `io_uring` region found in `/proc/<pid>/maps`.
-7. Remove `/dev/shm/sem.*` (the mappings stay live as anonymous memory).
-8. Audit `/proc/<pid>/task` for non-`python` threads (informational only).
+7. Remove the `/dev/shm/sem.*` this tree maps, matched by inode (the mappings
+   stay live as anonymous memory); each rank does the same for its own
+   `psm_*`. Never another replica's files.
+8. `waitpid(-1, WNOHANG)` sweep: reap this process's own strays, whose pgid/sid
+   references would otherwise keep its pid allocated after the kill.
+9. Audit `/proc/<pid>/task` for non-`python` threads (informational only).
 
 Then back in the worker (`_worker_criu_save` in `worker.py`): map child socket
 FDs to `--external unix[ino]`, record `/dev/nvidia*` FDs into `meta.json`, and
 run the destructive `criu dump`.
 
+After the image is on disk, the worker reaps what the dump killed, so the
+restore that follows can have the ids back: `_reap_dumped_child` joins the child
+itself, then `_reap_orphaned_descendants` sweeps the grandchildren that hold the
+leader's process-group and session ids. Both run outside the handler's `try` —
+a reap problem must never fail a dump whose image is already written — and the
+sweep depends on `_set_child_subreaper` having run at worker start.
+
 ### Restore sequence
 
-Pass the pipe FD through a Unix socket via `SCM_RIGHTS` into a helper (under
-`sudo` only when the worker is not already root), which `dup2`s it into place,
-unshares a private PID namespace, and runs `criu restore` inside it with
-`--inherit-fd` for the pipe plus stdout/stderr, `--link-remap` and
-`--tcp-close` (no `--shell-job` — the child holds no tty).  The CUDA context
-comes back via `cuda-checkpoint restore`.
+Pass the pipe FD through a Unix socket via `SCM_RIGHTS` into a helper, which
+`dup2`s it into place and runs `criu restore` with `--inherit-fd` for the pipe
+plus this pod's log pipe (sent in the same `SCM_RIGHTS` message and matched to
+the recorded `stdout_resource`), `--link-remap` and `--tcp-close` (no `--shell-job` — the
+child holds no tty).  The helper is a separate process regardless of
+privilege, because `subprocess` closes fds >= 3 either way.  On the default
+path it runs under `sudo` and unshares a private PID namespace to run criu
+inside; on the `SEMIP_UNPRIVILEGED` path it runs at the worker's own uid with
+no `sudo` and no namespace.  The CUDA context comes back through the driver
+API (`cuCheckpointProcessRestore`), not the `cuda-checkpoint` CLI.
 
 ### The thirteen complications
 
@@ -248,11 +286,11 @@ comes back via `cuda-checkpoint restore`.
 |---|---|---|
 | 1 | PyTorch distributed (NCCL + TCPStore) | Destroy process group, wait for store threads |
 | 2 | io_uring | Munmap the rings before dump |
-| 3 | POSIX semaphores (`/dev/shm/sem.*`) | Unlink the files, keep the mappings |
-| 4 | stdout/stderr | `dup2 /dev/null`, restore with `--inherit-fd` |
-| 5 | Pipe FD through `sudo` | Pass via `SCM_RIGHTS`, helper `dup2`s then `execvp`s |
+| 3 | POSIX semaphores (`/dev/shm/sem.*`) and `psm_*` segments | Unlink this tree's files (matched by inode), keep the mappings |
+| 4 | stdout/stderr | Pod-log pipe recorded as `stdout_resource`; restore with `--inherit-fd` onto the new pod's pipe |
+| 5 | Pipe FD into the helper (`subprocess` closes fds >= 3; `sudo` too on the namespace path) | Pass via `SCM_RIGHTS`, helper `dup2`s then `execvp`s |
 | 6 | CUDA context | Driver API rather than the CLI |
-| 7 | CRIU plugin directory | `--libdir` needs `/usr/lib/criu/empty`; the dump creates it |
+| 7 | CRIU plugin directory | Dump passes `--libdir` at a per-dump `mkdtemp` so no plugin loads; restore passes none and gets the real one |
 | 8 | Task-id collisions at restore (threads count, not just PIDs) | Restore into a private PID namespace; on the no-namespace path a preflight that names the occupants (`scripts/pidcheck.py`) and dump-side id placement; retry loop as backstop |
 | 9 | Ghost remap race (CRIU 4.2) | `--link-remap` handling |
 | 10 | Per-restore PID namespace, and the tty it forced out | Reaper + private `/proc`; child `setsid`, `--shell-job` dropped |
@@ -268,7 +306,11 @@ on reboot and lets `criu_restore` validate the image against the instance.
 
 | Variable | Effect |
 |---|---|
-| `SEMIP_UNPRIVILEGED=1` | Run dump and restore on a pod granting only `CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE`. Adds `--unprivileged` to both, takes the no-namespace restore path, and sheds the child's capabilities so the image is portable to a low-cap node. Costs concurrent restore (one live restore per node). See Complication 11 |
+| `SEMIP_UNPRIVILEGED=1` | Run dump and restore on a pod granting only `CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE`. Adds `--unprivileged` to both, takes the no-namespace restore path, and sheds the child's capabilities so the image is portable to a low-cap node. Costs concurrent restore of images whose recorded task ids overlap; replicas dumped together in one pod have disjoint ids and restore concurrently (8 at TP=1, measured 2026-10-03). The serving adapter defaults it to `1` (`restore_and_wrap`) and records it in `meta.json` as `unprivileged`. See Complication 11 |
+| `SEMIP_IMAGE_CACHE` | Local image-cache root. Default `/data-fast/image-cache_neutrino` |
+| `SEMIP_IMAGE_SOURCE` | Read-only mirror of published skeletons. Default `/mnt/neutrino/base-models/image-cache`; `""` turns it off |
+| `SEMIP_REPLICA_ID`, `SEMIP_NUM_REPLICAS` | Set per worker by `ReplicaPool`: node-local slot and replicas on that node. With more than one, `model_dir` gains `/replica<K>`. Not a user flag |
+| `SEMIP_LOG_TARGET` | Where the pod log is opened. Default `/proc/1/fd/1`; point it at your own shell's stdout to keep a hand-run experiment out of a job's log |
 | `_SEMIP_CHILD_DROP_CAPS=1` | Internal only, set by the worker across the child's spawn. Not a user flag |
 
 ---

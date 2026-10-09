@@ -87,6 +87,47 @@ async def _await_maybe(value: Any) -> Any:
     return value
 
 
+def _node_slots(node_ids: list[Any]) -> list[tuple[int, int]]:
+    """``(slot, replicas in that pod)`` for each worker, in worker order.
+
+    ``node_ids`` are Ray node ids, and each pod runs one Ray node, so slots
+    number the replicas *within* a pod, in worker order; in a single pod they
+    equal the worker indices. They are what a replica's semi-p image directory
+    and VLLM_PORT range are keyed on: both are per pod, and Ray does not place
+    actors in index order across pods, so a global index taken modulo the
+    per-pod count could put two replicas of one pod on one slot.
+    """
+    counts: dict[Any, int] = {}
+    slots = []
+    for node in node_ids:
+        slots.append(counts.get(node, 0))
+        counts[node] = counts.get(node, 0) + 1
+    return [(slot, counts[node]) for slot, node in zip(slots, node_ids)]
+
+
+def _free_slot(taken: set[int], preferred: int | None = None) -> int:
+    """``preferred`` if it is not ``taken``, else the lowest free slot."""
+    if preferred is not None and preferred not in taken:
+        return preferred
+    slot = 0
+    while slot in taken:
+        slot += 1
+    return slot
+
+
+async def _worker_node_id(worker: Any) -> Any:
+    """The Ray node (pod) a worker actor landed on, or ``None`` if it cannot say."""
+    getter = getattr(worker, "get_node_id", None)
+    if getter is None:
+        return None
+    try:
+        return await _await_maybe(getter.remote())
+    except Exception:
+        logger.warning("could not read a worker's Ray node id; numbering it as "
+                       "if it shared a pod with the others", exc_info=True)
+        return None
+
+
 def ensure_ray() -> int:
     """Initialize Ray and return the total number of GPUs in the cluster."""
     ray.init(ignore_reinit_error=True, log_to_driver=True)
@@ -135,6 +176,12 @@ class ReplicaPool:
         self._config: ModelConfig | None = None
         self._model_id: str | None = None
         self._workers: list[ray.actor.ActorHandle] = []
+        # The non-leader node-partitions of a semi-p engine that spans pods. Empty in
+        # every other configuration, including single-pod semi-p.
+        self._semip_agents: list[ray.actor.ActorHandle] = []
+        # ``(node_id, slot)`` per worker, parallel to ``_workers``. See
+        # ``_node_slots``.
+        self._slots: list[tuple[Any, int]] = []
         self._scheduler: Scheduler | None = None
         self._lock = asyncio.Lock()
         self._stream_admission_blocked = False
@@ -150,7 +197,7 @@ class ReplicaPool:
         self._cached_spec_weights_info: list[dict] | None = None
         self._sleeping = False
         self._synced_lora_name: str | None = None
-        # Cross-node placement group for a node-spanning engine, built and
+        # Cross-node placement group for a pod-spanning engine, built and
         # owned by the caller (dss-platform) and threaded in via initialize().
         # When set, this pool runs the multi-node path: a single 0-GPU
         # coordinator actor is scheduled into this PG (bundle 0) and vLLM's Ray
@@ -203,14 +250,75 @@ class ReplicaPool:
     # ------------------------------------------------------------------
 
     def _is_multi_node(self) -> bool:
-        """True when this engine runs the node-spanning path.
+        """True when this engine runs the pod-spanning path.
 
-        The caller (dss-platform) decides node-spanning by building a cross-node
+        The caller (dss-platform) decides pod-spanning by building a cross-node
         placement group and passing it to :meth:`initialize`. The pool simply
         keys off that PG's presence: when set, it schedules a 0-GPU coordinator
         into the PG; when ``None`` it takes the single-node path.
         """
         return self._engine_pg is not None
+
+    def _is_semip_per_node(self) -> bool:
+        """Whether this pool is one semi-p engine spread over whole pods.
+
+        Two conditions, and both matter. ``semi_p`` because only a restored
+        engine works this way -- a cold vLLM engine across pods uses the Ray
+        executor and the 0-GPU coordinator above. A bundle count below the
+        world size because that is what distinguishes a per-pod placement
+        group (``nnodes`` bundles, each holding one pod's GPUs) from the
+        per-rank one (``world_size`` bundles of 1).
+        """
+        if self._engine_pg is None:
+            return False
+        if not bool(getattr(self._config, "semi_p", False)):
+            return False
+        bundles = getattr(self._engine_pg, "bundle_specs", None) or []
+        return 0 < len(bundles) < self.world_size
+
+    def _nnodes(self) -> int:
+        bundles = getattr(self._engine_pg, "bundle_specs", None) or []
+        return len(bundles)
+
+    def _local_gpus(self) -> int:
+        """GPUs one pod of a per-pod placement holds."""
+        return self.world_size // max(self._nnodes(), 1)
+
+    def _node_bundle_options(self, bundle_index: int,
+                             num_gpus: int) -> dict[str, Any]:
+        """Actor options pinning a node-partition to its own pod's bundle.
+
+        ``capture_child_tasks`` is deliberately absent: this actor's children
+        are the semi-p worker and the vLLM child, which are plain processes on
+        this pod rather than Ray tasks, and capturing would scope them to a
+        bundle they do not draw resources from.
+        """
+        options: dict[str, Any] = dict(
+            num_gpus=num_gpus,
+            max_concurrency=2048,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=self._engine_pg,
+                placement_group_bundle_index=bundle_index,
+            ),
+        )
+        worker_env = {
+            k: str(v) for k, v in (self._config.extra_env or {}).items()
+        }
+        if worker_env:
+            options["runtime_env"] = {"env_vars": worker_env}
+        return options
+
+    def _make_semip_agents(self) -> list[ray.actor.ActorHandle]:
+        """One agent per non-leader pod, each owning that pod's GPUs."""
+        from arctic_platform.inference.server.semip_agent import SemipNodeAgent
+
+        local = self._local_gpus()
+        return [
+            SemipNodeAgent.options(
+                **self._node_bundle_options(k, local)
+            ).remote()
+            for k in range(1, self._nnodes())
+        ]
 
     def _make_worker(self) -> ray.actor.ActorHandle:
         """Create one inference-worker actor.
@@ -219,7 +327,18 @@ class ReplicaPool:
         vLLM engine (unchanged). Multi-node: the actor is a 0-GPU coordinator
         pinned into a cross-node PG; vLLM inherits that PG via
         ``get_current_placement_group()`` and schedules one rank per bundle.
+
+        Semi-p across pods is neither. Its engine is restored from a CRIU image
+        rather than constructed, so there is no vLLM Ray executor to inherit a
+        PG and no per-rank actor to schedule: the leader owns a real
+        ``Instance`` driving this pod's whole GPU set, and a ``SemipNodeAgent``
+        owns the other pod's. So the leader reserves ``world_size / nnodes``
+        GPUs in bundle 0 and keeps the mp backend.
         """
+        if self._is_semip_per_node():
+            return self._worker_cls.options(
+                **self._node_bundle_options(0, self._local_gpus())
+            ).remote()
         if self._is_multi_node():
             options: dict[str, Any] = dict(
                 num_gpus=0,
@@ -274,6 +393,30 @@ class ReplicaPool:
             raise ValueError(
                 "caller-provided placement group must expose bundle_specs"
             )
+        total_gpus = sum(float(b.get("GPU", 0)) for b in bundle_specs)
+        per_node = (bool(getattr(config, "semi_p", False))
+                    and len(bundle_specs) != expected
+                    and total_gpus == expected)
+        if per_node:
+            # Semi-p across pods places whole pods, not ranks: `nnodes`
+            # bundles whose GPUs sum to the world size. The engine is restored
+            # from an image rather than built by vLLM's Ray executor, so there
+            # is no per-rank actor for a per-rank bundle to hold.
+            if expected % len(bundle_specs):
+                raise ValueError(
+                    f"semi_p placement group has {len(bundle_specs)} bundles "
+                    f"for a world size of {expected}, which does not divide "
+                    f"evenly; the node-partitions would hold different rank counts and "
+                    f"deadlock in their first collective"
+                )
+            sizes = {float(b.get("GPU", 0)) for b in bundle_specs}
+            if len(sizes) != 1:
+                raise ValueError(
+                    f"semi_p placement group bundles hold different GPU "
+                    f"counts ({sorted(sizes)}); every pod of one engine must "
+                    f"hold the same number of ranks"
+                )
+            return
         if len(bundle_specs) != expected:
             raise ValueError(
                 "caller-provided placement group has "
@@ -294,6 +437,16 @@ class ReplicaPool:
     ) -> dict[str, Any]:
         """Build engine kwargs and enforce the multi-node Ray executor."""
         kwargs = config.to_engine_kwargs()
+        if multi_node and bool(getattr(config, "semi_p", False)):
+            # A semi-p engine is restored, not constructed, so there is no Ray
+            # executor to place: each node-partition runs its own mp-backed executor
+            # over its pod's GPUs, and the leader's spans all of them once NCCL is
+            # re-initialized. Forcing "ray" here would hand vLLM a backend it
+            # never gets to use and override the mp backend the image was
+            # dumped with -- which has to match, because criu_restore compares
+            # the config byte for byte.
+            kwargs.setdefault("distributed_executor_backend", "mp")
+            return kwargs
         if multi_node:
             backend = kwargs.get("distributed_executor_backend")
             if backend not in (None, "ray"):
@@ -352,6 +505,7 @@ class ReplicaPool:
 
     def _reset_lifecycle_state(self) -> None:
         self._workers.clear()
+        self._slots.clear()
         # The engine PG is owned by the caller (dss-platform); we only drop our
         # reference to it here and never remove it.
         self._engine_pg = None
@@ -451,6 +605,51 @@ class ReplicaPool:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
 
+    def _worker_env(
+        self,
+        slot: int,
+        count: int,
+        extra_env: dict[str, str] | None,
+    ) -> dict[str, str]:
+        """The env one worker initializes with, for its pod-local ``slot``.
+
+        ``SEMIP_REPLICA_ID`` and ``SEMIP_NUM_REPLICAS`` tell a semi-p engine
+        which per-pod image directory is its own; harmless otherwise.
+        """
+        worker_env = dict(extra_env or {})
+        # The per-replica VLLM_PORT pin only exists to keep multiple single-pod
+        # replicas in one pod from colliding, so it keys on the pod-local
+        # slot. A pod-spanning engine has a single replica whose vLLM Ray
+        # executor derives its torch.distributed rendezvous port from
+        # VLLM_PORT; pinning it collides with the co-located EngineCore
+        # (EADDRINUSE). Let vLLM pick free ports instead.
+        if not self._is_multi_node():
+            port_base = _env_int("ARCTIC_VLLM_PORT_BASE", 8000, minimum=1)
+            port_stride = _env_int("ARCTIC_VLLM_PORT_STRIDE", 100, minimum=1)
+            worker_env["VLLM_PORT"] = str(port_base + slot * port_stride)
+        worker_env["SEMIP_REPLICA_ID"] = str(slot)
+        worker_env["SEMIP_NUM_REPLICAS"] = str(count)
+        return worker_env
+
+    async def _place_new_worker(
+        self,
+        worker: ray.actor.ActorHandle,
+        preferred: int | None = None,
+        replacing: int | None = None,
+    ) -> tuple[Any, int, int]:
+        """``(node, slot, count)`` for a worker joining an initialized pool.
+
+        ``replacing`` is the index whose slot is being handed over (a restart);
+        its old slot is ``preferred`` when the new actor lands in the same pod.
+        """
+        node = None if self._is_multi_node() else await _worker_node_id(worker)
+        taken = {
+            slot for i, (other, slot) in enumerate(self._slots)
+            if other == node and i != replacing
+        }
+        slot = _free_slot(taken, preferred)
+        return node, slot, len(taken) + 1
+
     async def _initialize_workers(
         self,
         engine_kwargs: dict[str, Any],
@@ -468,24 +667,31 @@ class ReplicaPool:
                 stagger_s,
             )
 
-        port_base = _env_int("ARCTIC_VLLM_PORT_BASE", 8000, minimum=1)
-        port_stride = _env_int("ARCTIC_VLLM_PORT_STRIDE", 100, minimum=1)
-        # The per-replica VLLM_PORT pin only exists to keep multiple single-node
-        # replicas on one host from colliding. A node-spanning engine has a
-        # single replica whose vLLM Ray executor derives its torch.distributed
-        # rendezvous port from VLLM_PORT; pinning it collides with the
-        # co-located EngineCore (EADDRINUSE). Let vLLM pick free ports instead.
-        pin_vllm_port = not self._is_multi_node()
+        if self._is_multi_node():
+            node_ids: list[Any] = [None] * n
+        else:
+            node_ids = list(await asyncio.gather(
+                *[_worker_node_id(w) for w in self._workers]))
+        slots = _node_slots(node_ids)
+        self._slots = [(node, slot) for node, (slot, _) in zip(node_ids, slots)]
+
+        if self._semip_agents:
+            # The leader drives the other node-partitions from inside restore_and_wrap,
+            # so the handles have to reach it. They travel in engine_kwargs
+            # beside the semi_p flag itself, and InferenceWorker.initialize
+            # pops both before AsyncEngineArgs ever sees them.
+            engine_kwargs = {**engine_kwargs,
+                             "semi_p_agents": list(self._semip_agents)}
 
         for start in range(0, n, concurrency):
             batch = self._workers[start : start + concurrency]
             refs = []
             for offset, worker in enumerate(batch):
                 worker_idx = start + offset
-                logger.info("Initializing worker %d/%d", worker_idx + 1, n)
-                worker_env = dict(extra_env or {})
-                if pin_vllm_port:
-                    worker_env["VLLM_PORT"] = str(port_base + worker_idx * port_stride)
+                slot, count = slots[worker_idx]
+                logger.info("Initializing worker %d/%d (slot %d of %d in its "
+                            "pod)", worker_idx + 1, n, slot, count)
+                worker_env = self._worker_env(slot, count, extra_env)
                 refs.append(worker.initialize.remote(engine_kwargs, worker_env, self._model_id))
                 if stagger_s > 0 and offset + 1 < len(batch):
                     await asyncio.sleep(stagger_s)
@@ -506,11 +712,11 @@ class ReplicaPool:
             num_replicas: Number of replicas. If ``None``, uses all
                 available GPUs (``total_gpus // world_size`` where
                 world_size = tensor_parallel_size * pipeline_parallel_size).
-                Ignored when ``placement_group`` is given (a node-spanning
+                Ignored when ``placement_group`` is given (a pod-spanning
                 engine is a single replica bound to that one PG).
             placement_group: Optional pre-built cross-node Ray placement group
                 from the caller (dss-platform). When given, this pool runs the
-                node-spanning path: one 0-GPU coordinator actor is scheduled
+                pod-spanning path: one 0-GPU coordinator actor is scheduled
                 into the PG (bundle 0) and vLLM's Ray executor inherits it via
                 capture_child_tasks. The pool does not create or remove the PG.
                 ``None`` keeps the single-node path (the pool reserves
@@ -537,7 +743,7 @@ class ReplicaPool:
         self._engine_pg = placement_group
 
         if self._engine_pg is not None:
-            # A node-spanning engine occupies its whole PG as a single replica;
+            # A pod-spanning engine occupies its whole PG as a single replica;
             # the caller sized the PG to exactly this engine's world_size.
             num_replicas = 1
         elif num_replicas is None:
@@ -552,15 +758,27 @@ class ReplicaPool:
 
         n = num_replicas
         multi_node = self._is_multi_node()
+        per_node = self._is_semip_per_node()
+        if per_node:
+            shape = (f"semi_p across {self._nnodes()} pods: leader + "
+                     f"{self._nnodes() - 1} agent(s), "
+                     f"{self._local_gpus()} GPUs each")
+        elif multi_node:
+            shape = "multi-node: 0-GPU coordinator + cross-node PG"
+        else:
+            shape = "single-node"
         logger.info(
             f"Creating {n} workers (TP={self.tp_size}, PP={self.pp_size}, "
-            f"world_size={self.world_size}, "
-            f"{'multi-node: 0-GPU coordinator + cross-node PG' if multi_node else 'single-node'})"
+            f"world_size={self.world_size}, {shape})"
         )
 
         extra_env = self._config.extra_env or None
         try:
             self._workers = []
+            if per_node:
+                # Created before the leader initializes: its restore_and_wrap
+                # drives them, so they have to exist by the time it runs.
+                self._semip_agents = self._make_semip_agents()
             for _ in range(n):
                 self._workers.append(self._make_worker())
             await self._initialize_workers(engine_kwargs, extra_env)
@@ -752,6 +970,8 @@ class ReplicaPool:
                     await self._scheduler.drain_worker(idx)
                 finally:
                     worker = self._workers.pop()
+                    if len(self._slots) > len(self._workers):
+                        self._slots.pop()
                     try:
                         ray.kill(worker)
                     except Exception:
@@ -780,7 +1000,12 @@ class ReplicaPool:
             while len(self._workers) < target_count:
                 worker = self._make_worker()
                 try:
-                    await worker.initialize.remote(engine_kwargs, extra_env, self._model_id)
+                    node, slot, count = await self._place_new_worker(worker)
+                    await worker.initialize.remote(
+                        engine_kwargs,
+                        self._worker_env(slot, count, extra_env),
+                        self._model_id,
+                    )
                 except asyncio.CancelledError:
                     try:
                         ray.kill(worker)
@@ -808,6 +1033,7 @@ class ReplicaPool:
                     return
 
                 self._workers.append(worker)
+                self._slots.append((node, slot))
                 self._scheduler.add_worker(
                     worker,
                     concurrency_limit=self._worker_concurrency_limit(),
@@ -1763,6 +1989,10 @@ class ReplicaPool:
         engine_kwargs = self._engine_kwargs()
         extra_env = self._config.extra_env or None
 
+        # The old slot, so a semi-p replica restores its own image again. The
+        # old tree is killed first, so the ids that image records are free.
+        preferred = self._slots[idx][1] if idx < len(self._slots) else idx
+        node = None
         if not self._is_multi_node():
             try:
                 ray.kill(old)
@@ -1770,9 +2000,11 @@ class ReplicaPool:
                 pass
             new_worker = self._make_worker()
             try:
+                node, slot, count = await self._place_new_worker(
+                    new_worker, preferred=preferred, replacing=idx)
                 await new_worker.initialize.remote(
                     engine_kwargs,
-                    extra_env,
+                    self._worker_env(slot, count, extra_env),
                     self._model_id,
                 )
             except BaseException:
@@ -1786,12 +2018,15 @@ class ReplicaPool:
             # Ask the coordinator to shut down first, then retry creation until
             # the placement-group restart deadline expires.
             await self._shutdown_workers([old])
+            slot = 0
             new_worker = await self._restart_placement_worker(
                 engine_kwargs,
-                extra_env,
+                self._worker_env(slot, 1, extra_env),
             )
 
         self._workers[idx] = new_worker
+        if idx < len(self._slots):
+            self._slots[idx] = (node, slot)
 
         if self._scheduler is not None:
             self._scheduler.update_worker_handle(idx, new_worker)

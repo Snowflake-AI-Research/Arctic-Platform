@@ -30,7 +30,7 @@ here would be copied by value per worker and its writes discarded; each
 rank also owns a different shard of the parameters.  The same code path
 serves TP=1, where the single worker is in-process.
 """
-import ctypes, json, os, shutil, subprocess, sys, time
+import ctypes, json, os, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -51,9 +51,30 @@ def _drop_caps_for_portable_image():
     Gated by the internal _SEMIP_CHILD_DROP_CAPS signal (set transiently by
     the worker only across this child's spawn -- NOT a user-facing flag; the
     user-facing switch is SEMIP_UNPRIVILEGED) so ONLY the child drops -- the
-    parent worker keeps its caps to run ``sudo criu``.  Safe for inference: host
-    pinning uses RLIMIT_MEMLOCK (unlimited on GPU nodes), not CAP_IPC_LOCK,
-    and all sockets bind to unprivileged ports.
+    parent worker keeps its caps to seize this child with ``criu``.  Safe for
+    inference: host pinning uses RLIMIT_MEMLOCK (unlimited on GPU nodes), not
+    CAP_IPC_LOCK, and all sockets bind to unprivileged ports.
+
+    NO_NEW_PRIVS is set for the restore, not for this process.  CRIU's
+    restore_creds() trims the bounding set by calling PR_CAPBSET_DROP for
+    every capability *absent from the recorded cap_bnd*, without first
+    checking whether it is already absent from its own -- and the kernel's
+    cap_prctl_drop() tests CAP_SETPCAP before it tests anything else, so an
+    already-dropped capability still returns EPERM.  On a pod granting only
+    CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE that is fatal for all ~200 tasks
+    (restorer.c:317 "Unable to drop capability 0", then BUG at
+    restorer.c:820).
+
+    `setcap cap_setpcap` on criu cannot fix it, and makes things worse rather
+    than merely not better.  CAP_SETPCAP is outside that bounding set, and
+    bprm_caps_from_vfs_caps() computes pP' = (pB & fP) | (pI & fI) and then
+    returns EPERM if any file-permitted bit did not survive -- whenever the
+    file's effective bit is set, which the +e we require for a root worker
+    does.  So a criu carrying a capability the pod cannot grant fails to
+    execve at all.  CRIU's own escape hatch is the image recording
+    no_new_privs with an empty permitted set, in which case the EPERM
+    degrades to a warning -- so set it here, where it lands in every task's
+    recorded creds.
     """
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -61,11 +82,22 @@ def _drop_caps_for_portable_image():
         PR_CAP_AMBIENT = 47
         PR_CAP_AMBIENT_CLEAR_ALL = 4
         PR_SET_DUMPABLE = 4
+        PR_SET_NO_NEW_PRIVS = 38
         # Drop the bounding set first -- it needs CAP_SETPCAP, which the
         # capset() below removes.  EINVAL past the last valid cap is ignored.
+        # These calls are expected to fail with EPERM on a pod that never had
+        # CAP_SETPCAP; the image then records the pod's own bounding set, and
+        # the NO_NEW_PRIVS below is what makes that restorable.
         for cap in range(64):
             libc.prctl(PR_CAPBSET_DROP, cap, 0, 0, 0)
         libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+        # Needs no privilege, is irreversible, and is inherited by every
+        # thread and child forked after it -- which is why it belongs here,
+        # before torch spawns any: CRIU dumps creds per thread.  It only
+        # forbids gaining privilege through execve (setuid/setgid binaries and
+        # file capabilities), and nothing the child execs wants that.  It must
+        # not leak to the worker, which execs a file-capability `criu`.
+        nnp = libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
 
         class _CapHeader(ctypes.Structure):
             _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
@@ -79,11 +111,11 @@ def _drop_caps_for_portable_image():
         hdr = _CapHeader(_LINUX_CAPABILITY_VERSION_3, 0)
         data = (_CapData * 2)()  # zero-initialized -> clears eff/prm/inh
         rc = libc.capset(ctypes.byref(hdr), ctypes.byref(data))
-        # Keep the process dumpable so `sudo criu` seizes it cleanly after
+        # Keep the process dumpable so `criu` seizes it cleanly after
         # the credential change (capset can reset dumpable to suid_dumpable).
         libc.prctl(PR_SET_DUMPABLE, 1, 0, 0, 0)
         print(f"[semip] dropped capabilities for portable image "
-              f"(capset rc={rc})", flush=True)
+              f"(capset rc={rc}, no_new_privs rc={nnp})", flush=True)
     except Exception as e:  # never block startup on a cap-drop failure
         print(f"[semip] cap-drop failed (continuing): {e}", flush=True)
 
@@ -91,7 +123,7 @@ def _drop_caps_for_portable_image():
 # Internal signal (leading underscore): the worker sets _SEMIP_CHILD_DROP_CAPS
 # only in this spawned child's environment when running unprivileged.  It is
 # deliberately NOT the user-facing SEMIP_UNPRIVILEGED flag -- the worker itself
-# imports this module and must keep its caps to run `sudo criu`.
+# imports this module and must keep its caps to run `criu` against this child.
 if os.environ.get("_SEMIP_CHILD_DROP_CAPS") == "1":
     _drop_caps_for_portable_image()
 
@@ -133,11 +165,274 @@ def _truncate_for_display(value, limit=200):
 _WEIGHTS_SHARD_BYTES = 2 * 2**30   # 2 GiB per shard
 _WEIGHTS_IO_WORKERS = 8            # thread pool size for shard I/O
 
+# Fraction of *measured* free VRAM the restore staging buffer may claim.
+# The budget that reaches this file is predicted on the host from
+# ``total_gpu_bytes * gpu_memory_utilization - weights``, which treats
+# everything in the allotment that is not weights as available.  It is not:
+# CUDA graph private pools, one CUDA context per rank *on every GPU* (NCCL
+# P2P/CUMEM peer mapping maps them all), and activations sit in there too.
+# On GLM-5.3 at TP=8 that came to ~9 GiB of headroom that did not exist.
+_STAGING_FREE_FRACTION = 0.9
+
 _cudart = ctypes.CDLL("libcudart.so")
 _cudart.cudaHostUnregister.argtypes = [ctypes.c_void_p]
 _cudart.cudaHostUnregister.restype = ctypes.c_int
 _cudart.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
 _cudart.cudaHostRegister.restype = ctypes.c_int
+_cudart.cudaGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
+_cudart.cudaGetDevice.restype = ctypes.c_int
+_cudart.cudaGetDeviceCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
+_cudart.cudaGetDeviceCount.restype = ctypes.c_int
+_cudart.cudaDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int,
+                                          ctypes.c_int]
+_cudart.cudaDeviceGetPCIBusId.restype = ctypes.c_int
+_cudart.cudaHostAlloc.argtypes = [ctypes.POINTER(ctypes.c_void_p),
+                                  ctypes.c_size_t, ctypes.c_uint]
+_cudart.cudaHostAlloc.restype = ctypes.c_int
+_cudart.cudaFreeHost.argtypes = [ctypes.c_void_p]
+_cudart.cudaFreeHost.restype = ctypes.c_int
+_cudart.cudaGetErrorString.argtypes = [ctypes.c_int]
+_cudart.cudaGetErrorString.restype = ctypes.c_char_p
+
+
+def _cuda_err(ret):
+    """``cudaError`` as ``<int> (<name>)``, which is what a reader needs."""
+    try:
+        text = _cudart.cudaGetErrorString(ctypes.c_int(ret))
+        return f"{ret} ({(text or b'?').decode(errors='replace')})"
+    except Exception:  # noqa: BLE001
+        return str(ret)
+
+
+_NVML_SO = "libnvidia-ml.so.1"
+_NVML_P2P_CAPS_INDEX_READ = 0
+# One directory per GPU on the *node*, named by its real PCI address. Measured
+# 2026-09-22: a pod holding only /dev/nvidia1 still sees all eight entries here,
+# so this is the node's inventory and not the pod's allocation -- useful for
+# knowing the node width, and wrong to use as "an address we own".
+_NVIDIA_PROC_GPUS = "/proc/driver/nvidia/gpus"
+
+
+class _NvmlPciInfo(ctypes.Structure):
+    """``nvmlPciInfo_t``. Only ``busId`` is read; the rest fixes the layout."""
+
+    _fields_ = [
+        ("busIdLegacy", ctypes.c_char * 16),
+        ("domain", ctypes.c_uint),
+        ("bus", ctypes.c_uint),
+        ("device", ctypes.c_uint),
+        ("pciDeviceId", ctypes.c_uint),
+        ("pciSubSystemId", ctypes.c_uint),
+        ("busId", ctypes.c_char * 32),
+    ]
+
+
+def _load_nvml():
+    """``libnvidia-ml.so.1`` via ``dlopen``, the same way NCCL reaches it.
+
+    NCCL does not link NVML; ``nvmlwrap.cc`` dlopens it and caches the function
+    pointers. Loading it the same way keeps this probe answering the question
+    NCCL asks rather than a nearby one.
+    """
+    lib = ctypes.CDLL(_NVML_SO)
+    lib.nvmlErrorString.argtypes = [ctypes.c_int]
+    lib.nvmlErrorString.restype = ctypes.c_char_p
+    lib.nvmlInit_v2.argtypes = []
+    lib.nvmlInit_v2.restype = ctypes.c_int
+    lib.nvmlDeviceGetCount_v2.argtypes = [ctypes.POINTER(ctypes.c_uint)]
+    lib.nvmlDeviceGetCount_v2.restype = ctypes.c_int
+    lib.nvmlDeviceGetHandleByIndex_v2.argtypes = [ctypes.c_uint,
+                                                  ctypes.POINTER(ctypes.c_void_p)]
+    lib.nvmlDeviceGetHandleByIndex_v2.restype = ctypes.c_int
+    lib.nvmlDeviceGetHandleByPciBusId_v2.argtypes = [ctypes.c_char_p,
+                                                     ctypes.POINTER(ctypes.c_void_p)]
+    lib.nvmlDeviceGetHandleByPciBusId_v2.restype = ctypes.c_int
+    lib.nvmlDeviceGetIndex.argtypes = [ctypes.c_void_p,
+                                       ctypes.POINTER(ctypes.c_uint)]
+    lib.nvmlDeviceGetIndex.restype = ctypes.c_int
+    lib.nvmlDeviceGetPciInfo_v3.argtypes = [ctypes.c_void_p,
+                                            ctypes.POINTER(_NvmlPciInfo)]
+    lib.nvmlDeviceGetPciInfo_v3.restype = ctypes.c_int
+    lib.nvmlDeviceGetP2PStatus.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                           ctypes.c_int,
+                                           ctypes.POINTER(ctypes.c_uint)]
+    lib.nvmlDeviceGetP2PStatus.restype = ctypes.c_int
+    return lib
+
+
+def _nvml_err(lib, ret):
+    try:
+        text = lib.nvmlErrorString(ctypes.c_int(ret))
+        return f"{ret} ({(text or b'?').decode(errors='replace')})"
+    except Exception:  # noqa: BLE001
+        return str(ret)
+
+
+def _local_pci_bus_ids():
+    """The PCI addresses of the GPUs this pod actually holds, uppercased."""
+    try:
+        return sorted(name.upper() for name in os.listdir(_NVIDIA_PROC_GPUS))
+    except OSError:
+        return []
+
+
+def _bus_id_variants(bus_id):
+    """``bus_id`` in every spelling NVML might want, most literal first.
+
+    Both domain widths and both cases. Ordered so the caller's own string is
+    tried first and the answer stays attributable to it when it works.
+    """
+    out = []
+    for text in (bus_id, bus_id.upper(), bus_id.lower()):
+        parts = text.split(":")
+        forms = [text]
+        if len(parts) == 3:
+            try:
+                domain = int(parts[0], 16)
+            except ValueError:
+                domain = None
+            if domain is not None:
+                rest = ":".join(parts[1:])
+                forms += ["%04X:%s" % (domain, rest), "%08X:%s" % (domain, rest),
+                          "%04x:%s" % (domain, rest), "%08x:%s" % (domain, rest)]
+        for form in forms:
+            if form not in out:
+                out.append(form)
+    return out
+
+
+def _nvml_probe(stale_bus_id):
+    """Which of the seven lines in NCCL's ``commAlloc`` actually fails.
+
+    A slot-mismatched TP>1 restore dies inside ``commAlloc``: the last NCCL line
+    is ``Using network Socket`` and ``Init START`` -- logged immediately after
+    ``commAlloc`` returns -- never appears. Between them sit
+    ``ncclNvmlDeviceGetHandleByPciBusId(busId, &nvmlDev)`` and
+    ``ncclNvmlDeviceGetIndex``, and the former returns ``ncclSystemError`` when
+    NVML cannot resolve the address, which is the error observed.
+
+    But the matching ``NVMLCHECK`` WARN (``nvmlDeviceGetHandleByPciBusId()
+    failed: Not Found``) is *absent* from the logs while other NCCL WARNs are
+    present, and there is a second path that would explain that silence:
+    ``ncclNvmlDeviceGetHandleByPciBusId`` first calls
+    ``ncclNvmlEnsureInitialized``, which returns a cached ``initResult`` with no
+    new warning if NVML initialisation failed earlier -- and that init walks a
+    P2P-status matrix over every visible device.
+
+    So two candidates, indistinguishable from the logs. This separates them by
+    making both calls directly:
+
+    ``init`` / ``p2p_matrix``
+        Reproduces ``ncclNvmlEnsureInitialized``. A failure here means the
+        cached-init path, and the bus-ID lookup is never the real story.
+    ``lookup_stale``
+        The suspect call, on the address CUDA still reports from the dump node.
+        ``NOT_FOUND`` here with a healthy init confirms the bus-ID reading.
+    ``lookup_owned``
+        Control, on an address NVML itself enumerated. It must succeed; if it
+        does not, NVML is broken generally rather than confused by a stale id.
+
+    Answered on hardware 2026-09-22, on a slot-mismatched TP=2 restore:
+    ``init`` Success, ``p2p_matrix`` OK, ``lookup_owned`` Success,
+    ``lookup_stale`` ``6 (Not Found)``. So it is the bus-ID lookup, and the
+    cached-init path is not involved.
+
+    Never raises: this runs on a restore that is already in trouble.
+    """
+    out = {}
+    try:
+        lib = _load_nvml()
+    except BaseException as exc:  # noqa: BLE001
+        return {"dlopen": f"{type(exc).__name__}: {exc}"}
+    try:
+        rc = lib.nvmlInit_v2()
+        out["init"] = _nvml_err(lib, rc)
+        if rc != 0:
+            return out
+
+        count = ctypes.c_uint(0)
+        rc = lib.nvmlDeviceGetCount_v2(ctypes.byref(count))
+        out["device_count"] = count.value if rc == 0 else _nvml_err(lib, rc)
+
+        handles = []
+        for i in range(count.value if rc == 0 else 0):
+            h = ctypes.c_void_p()
+            hrc = lib.nvmlDeviceGetHandleByIndex_v2(ctypes.c_uint(i),
+                                                    ctypes.byref(h))
+            if hrc != 0:
+                out.setdefault("handle_by_index_failures", []).append(
+                    f"{i}: {_nvml_err(lib, hrc)}")
+            else:
+                handles.append(h)
+
+        # The walk ncclNvmlEnsureInitialized performs. One bad pair is enough to
+        # fail the init and poison every later call with a cached result.
+        p2p_failures = []
+        for i, a in enumerate(handles):
+            for j, b in enumerate(handles):
+                if i == j:
+                    continue
+                status = ctypes.c_uint(0)
+                prc = lib.nvmlDeviceGetP2PStatus(
+                    a, b, ctypes.c_int(_NVML_P2P_CAPS_INDEX_READ),
+                    ctypes.byref(status))
+                if prc != 0:
+                    p2p_failures.append(f"{i}->{j}: {_nvml_err(lib, prc)}")
+        out["p2p_matrix"] = ("OK (%d pairs)" % (len(handles) * (len(handles) - 1))
+                             if not p2p_failures else p2p_failures)
+
+        def lookup(bus_id):
+            """Resolve ``bus_id``, trying every spelling before believing a miss.
+
+            CUDA renders the domain in 8 hex digits (``00000000:8B:00.0``) and
+            /proc in 4 (``0000:8b:00.0``). Without trying both, a formatting
+            difference would read as ``NOT_FOUND`` and be mistaken for the very
+            thing this probe exists to detect.
+            """
+            if not bus_id:
+                return "no bus id to try"
+            first_err = None
+            for form in _bus_id_variants(bus_id):
+                h = ctypes.c_void_p()
+                lrc = lib.nvmlDeviceGetHandleByPciBusId_v2(
+                    form.encode(), ctypes.byref(h))
+                if lrc != 0:
+                    if first_err is None:
+                        first_err = _nvml_err(lib, lrc)
+                    continue
+                # NCCL's very next call, so a handle that resolves but cannot be
+                # indexed still shows up as the failure it would cause.
+                idx = ctypes.c_uint(0)
+                irc = lib.nvmlDeviceGetIndex(h, ctypes.byref(idx))
+                got = (f"OK -> index {idx.value}" if irc == 0
+                       else f"handle OK but GetIndex {_nvml_err(lib, irc)}")
+                return got if form == bus_id else f"{got} (as {form})"
+            return f"{first_err} (tried {len(_bus_id_variants(bus_id))} spellings)"
+
+        # The control has to be an address NVML *owns*, which is not the same as
+        # an address on this node. Measured 2026-09-22: /proc/driver/nvidia/gpus
+        # lists all eight node GPUs even in a one-GPU pod, so taking its first
+        # entry tested a device the pod was never allocated and returned
+        # NOT_FOUND for a reason that had nothing to do with the bug. Enumerate
+        # through NVML instead, so a passing control really does mean "NVML can
+        # resolve what it holds".
+        owned = []
+        for i, h in enumerate(handles):
+            info = _NvmlPciInfo()
+            prc = lib.nvmlDeviceGetPciInfo_v3(h, ctypes.byref(info))
+            if prc == 0:
+                owned.append(info.busId.decode(errors="replace"))
+            else:
+                out.setdefault("pci_info_failures", []).append(
+                    f"{i}: {_nvml_err(lib, prc)}")
+        out["owned_bus_ids"] = owned
+        out["node_bus_ids"] = _local_pci_bus_ids()
+        out["stale_bus_id"] = stale_bus_id
+        out["lookup_stale"] = lookup(stale_bus_id)
+        out["lookup_owned"] = lookup(owned[0] if owned else None)
+    except BaseException as exc:  # noqa: BLE001
+        out["probe_error"] = f"{type(exc).__name__}: {exc}"
+    return out
 
 
 def _unpin_buffer(buf):
@@ -154,6 +449,88 @@ def _repin_buffer(buf):
     )
     if ret != 0:
         raise RuntimeError(f"cudaHostRegister failed with cudaError={ret}")
+
+
+def _install_faulthandler():
+    """Make ``kill -USR1 <pid>`` dump every thread's Python stack.
+
+    The 302 s post-restore warmup hangs left a rank burning a core in
+    userspace with nothing in the log, and the image ships neither py-spy nor
+    gdb. ``faulthandler`` is stdlib and needs no privilege at all, unlike ptrace
+    -- which matters because the pod runs with ``CapEff: 0000000000000000``.
+
+    Registered from ``_cuda_restore_probe`` because that already runs in every
+    rank on the restore path, so a hung rank is always dumpable by the time
+    anything can hang. The handler is left installed for the process's life.
+
+    Never raises: this is diagnostics.
+    """
+    try:
+        import faulthandler
+        import signal
+        if getattr(_install_faulthandler, "_done", False):
+            return "already"
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+        _install_faulthandler._done = True
+        return "registered on SIGUSR1"
+    except BaseException as exc:  # noqa: BLE001
+        return f"unavailable: {type(exc).__name__}: {exc}"
+
+
+def _cuda_restore_probe(worker):
+    """What CUDA believes about this rank's device, and whether pinning works.
+
+    Answers the question a failed ``reinit_nccl`` cannot. NCCL's init calls
+    ``ncclCudaHostCalloc`` and, when that fails, returns ``ncclSystemError`` --
+    surfaced as ``NCCL error: unhandled system error`` with the underlying
+    ``cudaError`` discarded. Measured 2026-09-20 on a slot-mismatched restore,
+    the last thing NCCL logs is ``init.cc:1994 Cuda Host Alloc`` and then it
+    dies, so the pinned host allocation is the operation that fails and its
+    error code is the one fact nobody has. This performs the same call directly
+    and names the result.
+
+    The device identity is recorded beside it because a restored rank carries
+    its dump-time view: NCCL prints the *cached* ``busId`` (a5000, i.e. GPU
+    slots 6,7) while the pod it landed in actually holds different PCI
+    addresses. Printing both CUDA's answer and the physical one is how a stale
+    mapping becomes visible rather than inferred.
+
+    The ``nvml`` key carries ``_nvml_probe``, which narrows the failure from
+    "somewhere in ``commAlloc``" to a specific call. See its docstring.
+
+    Never raises. This is diagnostics on the path of a restore that is already
+    in trouble; it must not be what breaks it.
+    """
+    out = {"rank": getattr(worker, "rank", "?")}
+    out["faulthandler"] = _install_faulthandler()
+    try:
+        dev = ctypes.c_int(-1)
+        out["get_device"] = _cuda_err(_cudart.cudaGetDevice(ctypes.byref(dev)))
+        out["device"] = dev.value
+        count = ctypes.c_int(-1)
+        _cudart.cudaGetDeviceCount(ctypes.byref(count))
+        out["device_count"] = count.value
+
+        buf = ctypes.create_string_buffer(64)
+        rc = _cudart.cudaDeviceGetPCIBusId(buf, 64, dev.value)
+        out["pci_bus_id"] = (buf.value.decode(errors="replace") if rc == 0
+                             else _cuda_err(rc))
+
+        # The operation NCCL dies on, done in isolation. 4 KiB: the question is
+        # whether pinning is possible at all, not how much of it.
+        ptr = ctypes.c_void_p()
+        rc = _cudart.cudaHostAlloc(ctypes.byref(ptr), ctypes.c_size_t(4096),
+                                   ctypes.c_uint(0))
+        out["cudaHostAlloc"] = _cuda_err(rc)
+        if rc == 0:
+            out["cudaFreeHost"] = _cuda_err(_cudart.cudaFreeHost(ptr))
+
+        # Which line of commAlloc kills a slot-mismatched restore. Logged as its
+        # own key so the answer is greppable rather than buried in prose.
+        out["nvml"] = _nvml_probe(out.get("pci_bus_id"))
+    except BaseException as exc:  # noqa: BLE001
+        out["probe_error"] = f"{type(exc).__name__}: {exc}"
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +630,18 @@ def _semip_plan_load_weights(worker, max_buffer_bytes=None):
     index = worker._semip_index
     total_bytes = buf.numel()
     cs = total_bytes if max_buffer_bytes is None else min(int(max_buffer_bytes), total_bytes)
+    # ``max_buffer_bytes`` is a prediction made on the host, which cannot see
+    # this device and sends one number for every rank.  Ask the driver the same
+    # question instead: this runs under collective_rpc with the rank's device
+    # current, and the buffer it is sizing is a plain cudaMalloc that the driver
+    # -- not torch's bookkeeping -- has to satisfy.  min() only, so a measured
+    # reading can shrink a plan but never grow one, and the reading is taken
+    # where it is valid: weights are already resident (wake_up_weights) and the
+    # KV cache is not yet mapped (wake_up_kv_cache runs after restore_weights).
+    free_bytes, _ = torch.cuda.mem_get_info(worker.device)
+    free_cap = int(_STAGING_FREE_FRACTION * free_bytes)
+    clamped = free_cap < cs
+    cs = min(cs, free_cap)
     plan = []
     cur = []
     cur_lo = 0
@@ -270,7 +659,8 @@ def _semip_plan_load_weights(worker, max_buffer_bytes=None):
         plan.append((cur_lo, cur_hi, cur))
     worker._semip_chunk_plan = plan
     worker._semip_chunk_size = cs
-    return {"bytes": total_bytes, "n_chunks": len(plan), "chunk_size": cs}
+    return {"bytes": total_bytes, "n_chunks": len(plan), "chunk_size": cs,
+            "free_bytes": free_bytes, "clamped": clamped}
 
 
 def _semip_restore_weights(worker):
@@ -337,8 +727,11 @@ def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
     if os.path.exists(rank_dir):
         try:
             shutil.rmtree(rank_dir)
-        except PermissionError:
-            subprocess.run(["sudo", "rm", "-rf", rank_dir], check=True)
+        except PermissionError as e:
+            raise RuntimeError(
+                f"cannot clear stale weights at {rank_dir}: {e}. They were "
+                f"written by a run under a different uid; remove them by hand "
+                f"as that user and re-run save_weights()") from e
     os.makedirs(rank_dir, exist_ok=True)
 
     total = buf.numel()
@@ -430,13 +823,63 @@ def _semip_load_weights(worker, weights_dir, io_workers=None):
 # TP>1 NCCL teardown / reinit around CRIU (worker-local, via collective_rpc).
 #
 # CRIU cannot restore live NCCL communicators or CustomAllreduce IPC handles,
-# so they are torn down before checkpoint and rebuilt after restore.  For
-# graph reuse the teardown must be graph-preserving (unilateral ncclCommAbort,
-# not the collective ncclCommDestroy that a live captured graph would deadlock);
-# for MoE/EP the abort must also be concurrent (see _nccl_abort_comms_concurrent).
+# so they are torn down before checkpoint and rebuilt after restore.  The
+# teardown is always graph-preserving (unilateral ncclCommAbort, not the
+# collective ncclCommDestroy that a live captured graph would deadlock); for
+# MoE/EP the abort must also be concurrent (see _nccl_abort_comms_concurrent).
+#
+# Graph reuse is the only mode.  There was a `full` alternative -- drop the
+# preserved graphs and rebuild them with capture_model() -- selectable at dump
+# time through SEMIP_GRAPH_MODE.  Retired 2026-09-24 after wave 10 (17/17) and
+# GLM-5.3 at TP=8: reuse-against-a-warm-image is the only method we trust, so
+# it is the only one anyone can select.  Warming the image is likewise no longer
+# a knob; it is part of `init`.  See skills/tp_DESIGN.md section 5.
 # ---------------------------------------------------------------------------
-GRAPH_MODE_REUSE = "reuse"
-GRAPH_MODE_FULL = "full"
+
+
+_COMPILE_CACHE_ENVS = ("TRITON_CACHE_DIR", "VLLM_CACHE_ROOT",
+                       "TORCHINDUCTOR_CACHE_DIR", "FLASHINFER_WORKSPACE_BASE")
+
+
+def _compile_cache_fingerprint(budget_s=2.0):
+    """File count and byte total under each JIT cache dir.
+
+    Taken on both sides of the checkpoint. The caches are pinned into
+    ``<model_dir>/compilation`` so CRIU can find the dlopen'd .so's at restore,
+    which also puts them on shared storage, outside the image, writable by every
+    instance of this model at once. With a reading from each side, a restore that
+    JIT-compiles a kernel can be attributed: absent from the cache means it was
+    never built, present means the restored process missed the cache key. Those
+    have different fixes and are indistinguishable today.
+
+    Time-boxed rather than exhaustive -- this walks a network filesystem, and a
+    truncated count compared against another truncated count is still a signal.
+    """
+    out = {}
+    deadline = time.monotonic() + budget_s
+    for env in _COMPILE_CACHE_ENVS:
+        path = os.environ.get(env)
+        if not path:
+            continue
+        n = total = 0
+        truncated = False
+        try:
+            for root, _dirs, files in os.walk(path):
+                for fn in files:
+                    try:
+                        total += os.stat(os.path.join(root, fn)).st_size
+                        n += 1
+                    except OSError:
+                        pass
+                if time.monotonic() > deadline:
+                    truncated = True
+                    break
+        except OSError:
+            continue
+        out[env] = {"files": n, "bytes": total, "truncated": truncated}
+    return out
+
+
 _MISSING = object()
 _LIBNCCL = None
 
@@ -468,13 +911,23 @@ def _semip_tp_size(worker):
         getattr(worker, "vllm_config", None), "tensor_parallel_size", 1) or 1)
 
 
-def _semip_ep_enabled(config):
-    return bool(_semip_config_value(config, "enable_expert_parallel", False))
-
-
 def _is_arctic_parallel_worker(worker):
     # Ulysses / shift SP is out of scope for this port (dense TP + EP only).
     return False
+
+
+def _iface_ip(ifname):
+    """IPv4 address of *ifname*, read live from the kernel."""
+    import fcntl
+    import socket as _sock
+    import struct
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+    try:
+        packed = fcntl.ioctl(s.fileno(), 0x8915,  # SIOCGIFADDR
+                             struct.pack("256s", ifname[:15].encode()))
+    finally:
+        s.close()
+    return _sock.inet_ntoa(packed[20:24])
 
 
 def _clear_fd_backed_nccl_env():
@@ -561,20 +1014,6 @@ def _abort_torch_process_groups():
         pass
 
 
-def _semip_destroy_fi_ar_workspace():
-    """Free the FlashInfer fused allreduce+RMSNorm workspace before checkpoint
-    (full mode only).  Defensive no-op when it was never created."""
-    try:
-        from vllm.distributed.device_communicators import (
-            flashinfer_all_reduce as _fiar)
-    except Exception:
-        return
-    try:
-        _fiar.destroy_fi_ar_workspace()
-    except Exception:  # noqa: BLE001
-        pass
-
-
 def _mark_rst_on_close(fd_int):
     """Set SO_LINGER(1,0) on an inet TCP socket so its eventual close sends RST
     (skips TIME_WAIT) -> avoids restore-time EADDRINUSE on the rebind. AF_UNIX
@@ -636,19 +1075,725 @@ def _mark_inet_sockets_rst(where):
     return marked
 
 
-def _destroy_nccl(worker, graph_mode=None):
-    """Tear down NCCL process groups before checkpoint.  No-op at TP1."""
+# Set once this process has aborted its NCCL comms in ``_destroy_nccl``.  The
+# abort is unilateral, so once it returns the torch rendezvous is dead whether or
+# not the clean destroy that follows it succeeded -- and that, not torch's
+# bookkeeping, is what the dump-side listener close needs to know.  On this path
+# the bookkeeping is exactly what fails: the ``destroy_process_group()`` that
+# clears ``GroupMember.WORLD`` (and so flips ``is_initialized()``) runs only
+# inside vLLM's ``destroy_distributed_environment()``, which
+# ``destroy_model_parallel()`` never reaches when it raises on an aborted comm.
+#
+# Per-process, and deliberately so: ``_destroy_nccl`` is a ``collective_rpc``
+# target, so this becomes true in the worker processes and stays False in the
+# driver -- which keeps relying on its own ``destroyed_pg``.  It also stays False
+# at TP1, where ``_destroy_nccl`` returns before the abort.  See Complication 15.
+_PG_ABORTED = False
+
+# Set by ``arm_mq_park``: the rendezvous directory ``prepare_criu_dump`` parks
+# the executor's message queues into, as its last collective step.  The park
+# cannot be a command of its own before ``cuda_checkpoint``, because
+# ``destroy_nccl`` and ``prepare_criu_dump`` still need the queues after it.
+_MQ_PARK = {}
+
+# A follower node's headless executor, and the leader's new broadcast writer
+# between mq_begin_unpark and mq_finish_unpark.
+_FOLLOWER = {}
+_UNPARK = {}
+
+# Node identity when this child is one node-partition of a TP group that spans pods:
+# ``MultiNode.as_init_kwargs()``, set once at spawn.  ``None`` means
+# single-node, which is every TP <= 8 deployment and the path that keeps its
+# graphs through the dump and rebinds them.
+#
+# This is the one source of truth inside the child.  It gates the broadcaster
+# close, the model process-group detach, the graph drop and ``_reinit_nccl``,
+# so a stale second copy would split those decisions.  The experiment driver's
+# ``SEMIP_EXP_MULTINODE_IFNAME`` seeds it at startup rather than being consulted
+# separately.
+_MULTINODE = None
+
+
+# Both helpers below have to answer in two kinds of process.  ``_MULTINODE`` is
+# set in the child, but ``_destroy_nccl`` and ``_reinit_nccl`` are
+# ``collective_rpc`` targets that run in the vLLM worker processes, which import
+# this module fresh and never see the child's globals.  What the workers do
+# inherit is the environment, so the child exports the same two facts there
+# before vLLM spawns them -- and a restored worker carries the dump's environ,
+# which is where ``_reinit_nccl`` reads them from.
+
+
+def _multinode_ifname():
+    """The interface a multi-node group rendezvouses and runs NCCL on.
+
+    ``None`` when single-node, which is what every caller branches on.
+    """
+    return ((_MULTINODE or {}).get("ifname")
+            or os.environ.get("SEMIP_MULTINODE_IFNAME") or None)
+
+
+def _is_multinode():
+    """True when this process belongs to a TP group that spans machines."""
+    if _MULTINODE is not None:
+        return True
+    return int(os.environ.get("SEMIP_NNODES", "1") or 1) > 1
+
+
+def _communicator_checkpoint_targets(ps):
+    """Every distinct device communicator, in an order all ranks agree on.
+
+    vLLM 0.30's communicator checkpoint hooks end in a cross-rank barrier
+    (``flashinfer/comm/allreduce.py``: "Do not return until every rank has
+    released all workspace handles"), so a rank that visits a different set --
+    or the same set in a different order -- wedges the job rather than failing
+    it. Group names are identical on every rank, so sort by them instead of
+    trusting ``_groups`` insertion order.
+
+    Deduped by communicator identity because several group names share one
+    communicator. The hooks are idempotent ("repeated successful calls are
+    no-ops"), so this is a tidiness measure, not a correctness one.
+    """
+    seen = set()
+    out = []
+    groups = getattr(ps, "_groups", {})
+    for name in sorted(groups):
+        ref = groups[name]
+        group = ref() if callable(ref) else ref
+        if group is None:
+            continue
+        comm = getattr(group, "device_communicator", None)
+        if comm is None or id(comm) in seen:
+            continue
+        seen.add(id(comm))
+        out.append((name, comm))
+    return out
+
+
+# Where ``checkpoint_prepare``'s inventory waits for the restore half to read it.
+# A worker attribute rather than a module global because that is what
+# ``_reinit_nccl`` already holds, and it rides the CRIU image exactly the way
+# ``_semip_rank_data_keep`` does -- both are ordinary in-process memory.  The
+# references are strong on purpose: the prepared workspaces are orphaned the
+# moment ``_reinit_nccl`` replaces the groups that own them, and a weakref would
+# let them be collected somewhere in the middle of the dump.
+_CKPT_PREPARED_ATTR = "_semip_ckpt_prepared"
+
+# Group-name prefix -> the ``parallel_state`` getter for that role.  The restore
+# half resolves roles through these rather than through ``ps._groups[name]``
+# because the names carry a disambiguating suffix that a rebuild bumps (``ep:0``
+# becomes ``ep:1``), while the getters always name the live group.
+_CKPT_ROLE_GETTERS = {
+    "tp": "get_tp_group",
+    "ep": "get_ep_group",
+    "dp": "get_dp_group",
+    "pp": "get_pp_group",
+    "world": "get_world_group",
+}
+
+
+def _fi_ar_workspaces_for(comm):
+    """The FlashInfer all-reduce workspaces this communicator's hooks will touch.
+
+    The same list ``checkpoint_prepare`` and ``checkpoint_restore`` iterate --
+    vLLM reaches it through ``_fi_ar_workspaces_for_group(self.cpu_group)`` --
+    which is the whole point of computing it here.  Counting the list on both
+    sides is what turns "the loop body never ran" from an invisible no-op into a
+    number that disagrees.
+
+    A missing module means vLLM 0.26 or older, where none of this exists and the
+    answer is honestly zero.  Anything the lookup itself raises is a real fault
+    and propagates: it refuses a workspace whose creating group was dropped
+    ("process group was not retained"), which is precisely the condition the
+    caller needs to hear about.
+    """
+    try:
+        from vllm.distributed.device_communicators import (
+            flashinfer_all_reduce as fiar)
+    except Exception:  # noqa: BLE001 - pre-0.30 has no fabric workspaces
+        return []
+    group = getattr(comm, "cpu_group", None)
+    if group is None:
+        return []
+    return list(fiar._fi_ar_workspaces_for_group(group))
+
+
+def _checkpoint_target_inventory(name, comm):
+    """What one target's checkpoint hook is about to act on.
+
+    Must be taken *before* ``checkpoint_prepare`` runs: afterwards the workspaces
+    are detached and the all2all buffers are gone, and neither leaves a record of
+    how many there were.
+
+    Two resources, reached two different ways, and they need opposite handling on
+    the way back.  The FlashInfer workspaces are process-level globals that vLLM
+    matches to their creating group by object identity, so re-keying them is
+    enough to put them back in the hook's path.  The MoE all2all buffers hang off
+    *this* communicator's ``all2all_manager``, an object the restore side never
+    sees again -- so the manager itself has to be carried across, and restored by
+    hand.
+    """
+    rec = {"name": name, "role": name.split(":")[0],
+           "workspaces": [], "all2all": None, "err": None}
+    try:
+        rec["workspaces"] = _fi_ar_workspaces_for(comm)
+    except Exception as exc:  # noqa: BLE001
+        rec["err"] = f"workspace inventory: {type(exc).__name__}: {exc}"
+    mgr = getattr(comm, "all2all_manager", None)
+    # `initialized` is what gates vLLM's own all2all hooks; an uninitialized
+    # manager's `checkpoint_prepare` is a no-op, so counting it would invent an
+    # obligation the restore side could never discharge.
+    if mgr is not None and getattr(mgr, "initialized", False):
+        rec["all2all"] = mgr
+    return rec
+
+
+def _run_communicator_checkpoint_hook(ps, which, worker=None):
+    """Drive ``checkpoint_prepare`` / ``checkpoint_restore`` across every group.
+
+    vLLM 0.30 backs the FlashInfer all-reduce workspace -- and, under EP, the
+    MoE all2all buffers -- with MNNVL fabric handles. ``cuCheckpointProcess*``
+    cannot carry those: NVIDIA's list of unsupported memory is "IPC, UVM, RDMA,
+    or fabric handle" (cuda-checkpoint#14), and because the driver "does not
+    attempt to keep the process in a good state" on error it shows up two ways.
+    Measured on GLM-5.3 TP=8, same payload throughout: vLLM 0.26 checkpointed in
+    26.8 s and restored in 15.9 s; 0.30 either stalled in ``cuda_checkpoint``
+    indefinitely or checkpointed in 43.9 s and then failed
+    ``cuCheckpointProcessRestore`` with CUresult=801 (CUDA_ERROR_NOT_SUPPORTED).
+
+    The hooks detach the *physical* backing and keep the virtual address stable,
+    so nothing baked into a captured graph moves and ``ca_graph_rebind`` has
+    nothing extra to do -- the opposite of custom all-reduce, whose meta_ptrs
+    really do move.
+
+    A failure is logged rather than raised. Every rank runs identical code over
+    an identical group set, so a raise here is uniform across ranks and none of
+    them reached the barrier; letting one rank abandon the loop early would turn
+    a clean failure into a wedge.
+
+    ``worker`` is what makes the two halves comparable. On the prepare side each
+    target's inventory is stashed on it; on the restore side the same counts are
+    recomputed so the caller can check that what was detached came back. Passing
+    None keeps the old fire-and-forget behaviour, which is all the TP1 and 0.26
+    paths need.
+
+    ``failed_material`` is the subset of failures on targets that actually held
+    something. A stale group left over from a rebuild can raise here while owning
+    no workspace at all, and failing the restore over that would be a regression;
+    a raise on a target that *was* carrying a workspace is a different matter,
+    and the counts cannot see it because the inventory is taken before the call.
+    """
+    done, failed, failed_material, targets = [], [], [], []
+    n_workspaces = 0
+    for name, comm in _communicator_checkpoint_targets(ps):
+        fn = getattr(comm, which, None)
+        if fn is None:
+            continue
+        rec = _checkpoint_target_inventory(name, comm)
+        material = bool(rec["workspaces"]) or rec["all2all"] is not None
+        n_workspaces += len(rec["workspaces"])
+        targets.append(rec)
+        if rec["err"]:
+            failed.append(f"{name}: {rec['err']}")
+            failed_material.append(f"{name}: {rec['err']}")
+        try:
+            fn()
+            done.append(name)
+        except Exception as exc:  # noqa: BLE001
+            failed.append(f"{name}: {type(exc).__name__}: {exc}")
+            if material:
+                failed_material.append(f"{name}: {type(exc).__name__}: {exc}")
+            # The message alone is not enough when the raise comes from inside
+            # FlashInfer: `checkCudaErrors` renders every driver failure the same
+            # way, so "CUDA error code=101" could be any of half a dozen calls
+            # and only the frame says which. Printed rather than returned -- the
+            # return value crosses a collective_rpc and is quoted into a job
+            # error, where a multi-line traceback per rank is unreadable.
+            import traceback as _tb
+            print(f"[ckpt-hook] {which} traceback for {name}:\n"
+                  f"{_tb.format_exc()}", flush=True)
+    n_all2all = sum(1 for rec in targets if rec["all2all"] is not None)
+    if worker is not None and which == "checkpoint_prepare":
+        setattr(worker, _CKPT_PREPARED_ATTR,
+                {"targets": targets, "n_workspaces": n_workspaces,
+                 "n_all2all": n_all2all})
+    if done or failed:
+        # Worker process, not the child: `log` is a child-process local, and the
+        # worker-side idiom here is stdout, which vLLM prefixes with the rank.
+        # The counts are on the same line as the names because the names alone
+        # are what made this bug survive three runs: two matching target sets say
+        # nothing about whether either one moved any memory.
+        print(f"[ckpt-hook] {which}: ok={','.join(done) or 'none'} "
+              f"failed={'; '.join(failed) or 'none'} "
+              f"workspaces={n_workspaces} all2all={n_all2all}", flush=True)
+    return {"ok": done, "failed": failed, "failed_material": failed_material,
+            "n_workspaces": n_workspaces, "n_all2all": n_all2all}
+
+
+def _prepared_device_indices(prepared):
+    """The CUDA devices the prepared workspaces were built on.
+
+    ``SymmDeviceMemory`` keeps the ``device_idx`` it was constructed with and
+    feeds it straight back into ``allocation_prop.location.id`` and
+    ``cuMulticastBindMem`` when the handles are re-mapped, so this -- not
+    whatever the restoring thread happens to have current -- is the device the
+    restore has to run on.
+
+    Reach it down the same attribute path FlashInfer's own hooks use:
+    ``MNNVLAllReduceFusionWorkspace.checkpoint_restore`` reads
+    ``self.handle.mcast_device_memory`` and refuses anything that is not a
+    ``SymmDeviceMemory``.  ``mem_handles`` is a field of ``MnnvlMemory``'s
+    allocation record, not of the fusion workspace, and asking only for it is
+    why job 6e386668 printed ``probe={}`` on all eight ranks: the list came
+    back empty, ``_probe_restore_devices`` queried no device at all, and the
+    context binding fell through to ``worker.local_rank``.  Both shapes are
+    accepted here because both exist in FlashInfer; neither is assumed.
+    """
+    out = []
+    for rec in prepared.get("targets", ()):
+        for ws in rec.get("workspaces", ()):
+            memory = getattr(getattr(ws, "handle", None),
+                             "mcast_device_memory", None)
+            for holder in (memory, *(getattr(ws, "mem_handles", None) or ())):
+                idx = getattr(holder, "device_idx", None)
+                if isinstance(idx, int) and idx not in out:
+                    out.append(idx)
+    return out
+
+
+def _bind_cuda_context_for_restore(worker, prepared):
+    """Make the right primary context current before FlashInfer re-maps handles.
+
+    ``SymmDeviceMemory.__init__`` establishes it and only then maps::
+
+        cu_device   = cuDeviceGet(device_idx)
+        primary_ctx = cuDevicePrimaryCtxRetain(cu_device)
+        cuCtxSetCurrent(primary_ctx)
+        cudaSetDevice(device_idx)
+        ...
+        self._create_and_map_handles(self.comm_backend)
+
+    The restore path reaches ``_create_and_map_handles`` directly and it repeats
+    none of that -- it reads ``self.device_idx`` into the allocation properties
+    and the multicast bind and trusts the caller's context.  Its only guard,
+    ``_verify_cuda_context``, logs a warning and carries on.  Nothing on the
+    semi-p restore path sets a device either, so the thread runs with whatever
+    CRIU and ``cuda_restore`` left current, and the driver answers
+    CUDA_ERROR_INVALID_DEVICE (101).
+
+    The before/after device is reported rather than just fixed, because the two
+    already agreeing would mean the 101 comes from a stale ``device_idx``
+    instead -- a different fault with a different fix, and one this cannot
+    distinguish without saying what it saw.
+    """
+    out = {"want": None, "want_src": None, "before": None, "after": None,
+           "problems": []}
+    wanted = _prepared_device_indices(prepared)
+    if len(wanted) > 1:
+        out["problems"].append(
+            f"prepared workspaces span devices {wanted}; expected one per rank")
+    if wanted:
+        out["want_src"] = "workspace"
+    else:
+        # Say so. On job 6e386668 this fallback fired on all eight ranks and
+        # `want` was read as the workspace's device when it was only the
+        # worker's -- so `before == want` proved less than it appeared to.
+        out["want_src"] = "local_rank_fallback"
+        idx = getattr(worker, "local_rank", None)
+        wanted = [idx] if isinstance(idx, int) else []
+    if not wanted:
+        out["problems"].append("no device index to bind: no workspace handle "
+                               "carried one and the worker has no local_rank")
+        return out
+    device_idx = wanted[0]
+    out["want"] = device_idx
+    try:
+        from cuda.bindings import driver as _cu
+    except Exception:  # noqa: BLE001 - cuda-python < 13 spells it differently
+        try:
+            from cuda import cuda as _cu
+        except Exception as exc:  # noqa: BLE001
+            out["problems"].append(
+                f"no cuda driver bindings: {type(exc).__name__}: {exc}")
+            return out
+
+    def _ck(res):
+        err = res[0]
+        if err != _cu.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(str(err))
+        return res[1] if len(res) > 1 else None
+
+    try:
+        out["before"] = int(_ck(_cu.cuCtxGetDevice()))
+    except Exception as exc:  # noqa: BLE001 - no current context is the finding
+        out["before"] = f"none ({type(exc).__name__}: {exc})"
+    try:
+        import torch
+        torch.cuda.set_device(device_idx)
+        cu_device = _ck(_cu.cuDeviceGet(device_idx))
+        primary = _ck(_cu.cuDevicePrimaryCtxRetain(cu_device))
+        _ck(_cu.cuCtxSetCurrent(primary))
+        out["after"] = int(_ck(_cu.cuCtxGetDevice()))
+    except Exception as exc:  # noqa: BLE001
+        out["problems"].append(
+            f"binding device {device_idx}: {type(exc).__name__}: {exc}")
+    return out
+
+
+def _probe_restore_devices(prepared):
+    """What the driver thinks of the devices the prepared handles name.
+
+    ``_create_and_map_handles``' very first act is ``make_handle_exchanger()``,
+    which calls ``is_mnnvl_fabric_supported(device_idx)``, which is::
+
+        checkCudaErrors(cuda.cuDeviceGetAttribute(
+            CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device_idx))
+
+    That runs *before* FlashInfer's own ``_verify_cuda_context``, and it is a
+    device-level query rather than a context-level one -- so a
+    CUDA_ERROR_INVALID_DEVICE out of it says the ordinal is wrong, not that the
+    context is unset.  The ordinal is whatever the workspace was constructed
+    with on the dump side, and nothing guarantees it still resolves here: the
+    restore may land on a different node with a different visible set, which is
+    the whole point of not requiring ``SEMIP_REQUIRE_DEVICE_MATCH``.
+
+    So ask the same questions first, in our own code, where the answer can be
+    logged rather than raised from six frames inside a vendor package.
+    """
+    import os as _os
+    out = {"visible": _os.environ.get("CUDA_VISIBLE_DEVICES"), "count": None,
+           "devices": {}}
+    try:
+        import torch
+        out["count"] = torch.cuda.device_count()
+    except Exception as exc:  # noqa: BLE001
+        out["count"] = f"unavailable ({type(exc).__name__})"
+    try:
+        from cuda.bindings import driver as _cu
+    except Exception:  # noqa: BLE001
+        try:
+            from cuda import cuda as _cu
+        except Exception:  # noqa: BLE001
+            return out
+    for idx in _prepared_device_indices(prepared):
+        info = {}
+        # Report the attribute *value*, not merely that the driver answered.
+        # The first version recorded "ok" whenever the call returned
+        # CUDA_SUCCESS and threw away ``res[1]``, so job 07fd79b4 printed
+        # ``multicast: 'ok'`` on all eight ranks while saying nothing at all
+        # about whether multicast is supported -- a successful query returning
+        # 0 and a successful query returning 1 read identically. That is the
+        # question this whole probe exists to answer, and it is the same
+        # silent-success shape as the bugs it was written to catch.
+        # ``cuDeviceGet`` returns a handle rather than a flag, so it stays a
+        # status; the two attribute queries report what the driver said.
+        for label, call, is_attr in (
+                ("get", lambda i=idx: _cu.cuDeviceGet(i), False),
+                ("fabric", lambda i=idx: _cu.cuDeviceGetAttribute(
+                    _cu.CUdevice_attribute
+                    .CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, i),
+                 True),
+                ("multicast", lambda i=idx: _cu.cuDeviceGetAttribute(
+                    _cu.CUdevice_attribute
+                    .CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, i), True)):
+            try:
+                res = call()
+                err = res[0]
+                if err != _cu.CUresult.CUDA_SUCCESS:
+                    info[label] = str(err)
+                elif not is_attr:
+                    info[label] = "ok"
+                else:
+                    value = res[1] if len(res) > 1 else None
+                    info[label] = int(value) if isinstance(
+                        value, int) else f"ok(value={value!r})"
+            except Exception as exc:  # noqa: BLE001
+                info[label] = f"{type(exc).__name__}: {exc}"
+        out["devices"][idx] = info
+    return out
+
+
+def _current_role_communicator(ps, role):
+    """The device communicator ``parallel_state`` currently gives for a role."""
+    getter = _CKPT_ROLE_GETTERS.get(role)
+    if getter is None:
+        return None
+    try:
+        grp = getattr(ps, getter)()
+    except Exception:  # noqa: BLE001 - absent roles are not an error here
+        return None
+    if grp is None:
+        return None
+    return getattr(grp, "device_communicator", None)
+
+
+def _restore_prepared_comm_state(ps, worker):
+    """Point what ``checkpoint_prepare`` detached at the groups that exist now.
+
+    ``_reinit_nccl`` tears the distributed environment down and rebuilds it, so
+    every ``ProcessGroup`` and every device communicator on this side of the
+    restore is a new object.  vLLM finds a FlashInfer workspace by comparing
+    ``workspace_group is group`` against the group that *created* it, so without
+    this the lookup misses on every target, the loop body never runs, and the
+    hook reports ``failed=none`` over an empty list -- the workspace keeps its
+    reserved VA with no physical backing and the first graph replay faults.
+
+    The two prepared resources need opposite treatment:
+
+    * the workspaces are re-keyed here and then left to the normal
+      ``checkpoint_restore`` hook, which hands FlashInfer a live
+      ``TorchDistBackend(group=...)``.  That parameter exists precisely so a
+      workspace can be restored against a group other than its creator's --
+      ``checkpoint_prepare`` barriers over the backend it stored at creation,
+      ``checkpoint_restore`` over whatever it is given.  Replaying the *old*
+      communicators instead would satisfy the identity check and then hang, since
+      the re-map's allgather needs a group whose sockets still exist.
+    * the all2all managers are restored here, by hand.  The hook drives the new
+      communicator, whose ``all2all_manager`` is a different object that was
+      never prepared; the prepared one is reachable only through the stash.
+
+    Re-keying assigns straight into ``_fi_ar_workspace_groups`` rather than
+    re-registering: vLLM's registration path raises "already associated with a
+    different process group" by design, and that guard is worth leaving intact.
+    The entry is reassigned and never removed -- ``_fi_ar_workspaces_for_group``
+    raises on a workspace whose group entry has gone missing.
+
+    Targets are walked in the order the prepare side recorded them, which is
+    sorted by group name and therefore identical on every rank.  The all2all
+    restore below is collective, so that ordering is load-bearing here for the
+    same reason it is in the hook.
+    """
+    out = {"n_workspaces": 0, "n_all2all": 0, "problems": []}
+    prepared = getattr(worker, _CKPT_PREPARED_ATTR, None)
+    if not prepared:
+        return out
+    # Before anything is re-mapped, and only when there is something to re-map:
+    # FlashInfer's re-map reads the device out of the handle and trusts the
+    # caller's context, and nothing on this path has set one.
+    ctx = None
+    if prepared["n_workspaces"] or prepared["n_all2all"]:
+        probe = _probe_restore_devices(prepared)
+        print(f"[ckpt-hook] devices: visible={probe['visible']} "
+              f"count={probe['count']} probe={probe['devices']}", flush=True)
+        ctx = _bind_cuda_context_for_restore(worker, prepared)
+        out["problems"].extend(ctx["problems"])
+        print(f"[ckpt-hook] cuda-ctx: want={ctx['want']} "
+              f"src={ctx['want_src']} "
+              f"before={ctx['before']} after={ctx['after']}", flush=True)
+    try:
+        from vllm.distributed.device_communicators import (
+            flashinfer_all_reduce as fiar)
+    except Exception as exc:  # noqa: BLE001
+        if prepared["n_workspaces"]:
+            out["problems"].append(
+                f"flashinfer_all_reduce import: {type(exc).__name__}: {exc}")
+        fiar = None
+    for rec in prepared["targets"]:
+        if not rec["workspaces"] and rec["all2all"] is None:
+            continue
+        comm = _current_role_communicator(ps, rec["role"])
+        group = getattr(comm, "cpu_group", None) if comm is not None else None
+        if group is None:
+            # Nothing to re-key onto. Never skip quietly: a detached workspace
+            # with no live group is exactly the state that faults later.
+            out["problems"].append(
+                f"{rec['name']}: no live '{rec['role']}' group after reinit")
+            continue
+        if fiar is not None:
+            for ws in rec["workspaces"]:
+                try:
+                    fiar._fi_ar_workspace_groups[id(ws)] = group
+                    out["n_workspaces"] += 1
+                except Exception as exc:  # noqa: BLE001
+                    out["problems"].append(
+                        f"{rec['name']}: re-key: {type(exc).__name__}: {exc}")
+        mgr = rec["all2all"]
+        if mgr is not None:
+            try:
+                mgr.cpu_group = group
+                mgr.checkpoint_restore()
+                out["n_all2all"] += 1
+            except Exception as exc:  # noqa: BLE001
+                out["problems"].append(
+                    f"{rec['name']}: all2all restore: "
+                    f"{type(exc).__name__}: {exc}")
+    print(f"[ckpt-hook] rekey: workspaces={out['n_workspaces']} "
+          f"all2all={out['n_all2all']} "
+          f"problems={'; '.join(out['problems']) or 'none'}", flush=True)
+    return out
+
+
+def _assert_checkpoint_state_restored(worker, rekey, restored):
+    """Fail here rather than let a detached workspace fault in the first forward.
+
+    Every step involved is a loop over a set that can be empty, and an empty loop
+    returns cleanly: ``checkpoint_restore_fi_ar_workspaces`` over no workspaces
+    reports exactly what a full restore reports.  That is how a workspace stayed
+    detached across three cluster runs while the hook printed ``failed=none``, so
+    the count is the check -- what ``checkpoint_prepare`` detached has to come
+    back, and any other number is an error even though nothing raised.
+
+    Zero prepared stays legal.  A bf16 model never builds a workspace and the
+    0.26 path has no hooks at all; the invariant is equality, not presence.
+
+    Called after the hook's loop has finished, never from inside it. Every rank
+    has to clear the barriers in there before any rank is allowed to unwind --
+    failing earlier would leave the others waiting on a rank that has left.
+    """
+    prepared = getattr(worker, _CKPT_PREPARED_ATTR, None)
+    if not prepared:
+        return
+    problems = list(rekey.get("problems", ()))
+    problems += [f"restore hook: {f}"
+                 for f in restored.get("failed_material", ())]
+    want_ws, got_ws = prepared["n_workspaces"], restored.get("n_workspaces", 0)
+    if got_ws != want_ws:
+        problems.append(
+            f"checkpoint_prepare detached {want_ws} FlashInfer workspace(s), "
+            f"checkpoint_restore saw {got_ws}")
+    want_a2a, got_a2a = prepared["n_all2all"], rekey.get("n_all2all", 0)
+    if got_a2a != want_a2a:
+        problems.append(
+            f"checkpoint_prepare prepared {want_a2a} all2all manager(s), "
+            f"{got_a2a} were restored")
+    if problems:
+        raise RuntimeError("communicator checkpoint state was not fully "
+                           "restored: " + "; ".join(problems))
+
+
+# Model attributes that held a ProcessGroup when the dump detached them, as
+# ``(module, attr, group_prefix, "device_group" | "cpu_group")``.  Process
+# memory, so it rides through CRIU to the restore that re-points them.
+_DETACHED_PG_ATTRS = []
+
+
+def _worker_model(worker):
+    try:
+        return worker.get_model()
+    except Exception:  # noqa: BLE001
+        return getattr(getattr(worker, "model_runner", None), "model", None)
+
+
+def _detach_model_process_groups(worker, ps):
+    """Drop every ProcessGroup a model module holds as a plain attribute.
+
+    MoE layers keep ``self.ep_group = get_ep_group().device_group``, so the
+    model outlives vLLM's teardown still referencing the old group, and the
+    group keeps its rendezvous store.  Across nodes that store is a TCPStore:
+    every rank keeps an established connection to rank 0, and the image has
+    to carry them.
+    """
+    import torch
+    from torch.distributed import ProcessGroup
+    owners = {}
+    for name, ref in list(getattr(ps, "_groups", {}).items()):
+        group = ref() if callable(ref) else ref
+        if group is None:
+            continue
+        for kind in ("device_group", "cpu_group"):
+            pg = getattr(group, kind, None)
+            if pg is not None:
+                owners[id(pg)] = (name.split(":")[0], kind)
+    model = _worker_model(worker)
+    if not isinstance(model, torch.nn.Module):
+        return []
+    detached = []
+    for mod in model.modules():
+        for attr, val in list(vars(mod).items()):
+            if isinstance(val, ProcessGroup):
+                prefix, kind = owners.get(id(val), (None, None))
+                detached.append((mod, attr, prefix, kind))
+                setattr(mod, attr, None)
+    return detached
+
+
+def _reattach_model_process_groups(ps):
+    """Point the attributes ``_detach_model_process_groups`` cleared at the
+    rebuilt groups.  Returns ``(reattached, unowned)`` counts."""
+    reattached = unowned = 0
+    for mod, attr, prefix, kind in _DETACHED_PG_ATTRS:
+        getter = getattr(ps, f"get_{prefix}_group", None) if prefix else None
+        group = getter() if getter is not None else None
+        pg = getattr(group, kind, None) if group is not None else None
+        if pg is None:
+            unowned += 1
+            continue
+        setattr(mod, attr, pg)
+        reattached += 1
+    return reattached, unowned
+
+
+def _own_store_connections(port):
+    """This process's ESTABLISHED TCP sockets with *port* at either end."""
+    inodes = set()
+    for fd_name in os.listdir("/proc/self/fd"):
+        try:
+            link = os.readlink(f"/proc/self/fd/{fd_name}")
+        except OSError:
+            continue
+        if link.startswith("socket:["):
+            inodes.add(link[8:-1])
+    found = []
+    for table in ("tcp", "tcp6"):
+        try:
+            with open(f"/proc/self/net/{table}") as f:
+                next(f)
+                for line in f:
+                    parts = line.split()
+                    if parts[3] != "01" or parts[9] not in inodes:
+                        continue
+                    lport = int(parts[1].rsplit(":", 1)[1], 16)
+                    rport = int(parts[2].rsplit(":", 1)[1], 16)
+                    if port in (lport, rport):
+                        found.append((lport, rport))
+        except OSError:
+            continue
+    return found
+
+
+def _process_group_holders(limit=12):
+    """Python containers that still reference a ProcessGroup or Store.
+
+    pybind objects are not GC-tracked themselves, so this finds them through
+    the containers that hold them, and names a dict by the object it is the
+    ``__dict__`` of.
+    """
+    import gc
+    from torch.distributed import ProcessGroup, Store
+    found = []
+    for obj in gc.get_objects():
+        try:
+            refs = gc.get_referents(obj)
+        except Exception:  # noqa: BLE001
+            continue
+        hits = [r for r in refs if isinstance(r, (ProcessGroup, Store))]
+        if not hits:
+            continue
+        where = f"{type(obj).__module__}.{type(obj).__qualname__}"
+        if isinstance(obj, dict):
+            keys = [k for k, v in obj.items() if any(v is h for h in hits)]
+            owners = [f"{type(o).__module__}.{type(o).__qualname__}"
+                      for o in gc.get_referrers(obj)
+                      if getattr(o, "__dict__", None) is obj][:2]
+            where = f"dict{keys[:3]} of {owners or '?'}"
+        found.append(f"{where} -> {[type(h).__name__ for h in hits]}")
+        if len(found) >= limit:
+            break
+    return found
+
+
+def _destroy_nccl(worker):
+    """Tear down NCCL process groups before checkpoint.  No-op at TP1.
+
+    Always graph-preserving: abort (unilateral ncclCommAbort) rather than
+    collective-destroy, because a live captured graph pins the comm and the
+    MoE/EP topology would deadlock a collective destroy.  The graphs are always
+    preserved now, so the collective path is gone with the `full` mode that was
+    its only caller.
+    """
     import torch.distributed as dist
 
-    graph_mode = graph_mode or GRAPH_MODE_REUSE
     if _semip_tp_size(worker) <= 1:
         return None
-
-    preserve_graph = graph_mode == GRAPH_MODE_REUSE
-    # Abort (unilateral) rather than collective-destroy when a live graph pins
-    # the comm (reuse) or the MoE/EP topology would deadlock a collective destroy.
-    abort_nccl = preserve_graph or _semip_ep_enabled(
-        getattr(worker, "vllm_config", None))
 
     def _close_custom_allreduce_ipc_handles(ca):
         if ca is None or getattr(ca, "disabled", True):
@@ -678,10 +1823,11 @@ def _destroy_nccl(worker, graph_mode=None):
     # rendezvous socket.
     _mark_inet_sockets_rst("destroy_nccl")
 
-    # Free the FlashInfer AR+RMS multicast workspace before NCCL teardown (full
-    # only; reuse preserves graphs and thus the workspace they reference).
-    if not preserve_graph:
-        _semip_destroy_fi_ar_workspace()
+    # Before the abort, while cpu_group still works: the hooks barrier across
+    # ranks, and an aborted comm cannot carry one.  The worker carries the
+    # inventory to the restore side, which cannot rediscover it: by then the
+    # groups that owned these workspaces have been replaced.
+    _run_communicator_checkpoint_hook(ps, "checkpoint_prepare", worker)
 
     seen_pynccl_ids = set()
     seen_ca_ids = set()
@@ -700,15 +1846,11 @@ def _destroy_nccl(worker, graph_mode=None):
         if pynccl is not None and getattr(pynccl, "comm", None) is not None:
             if id(pynccl) not in seen_pynccl_ids:
                 seen_pynccl_ids.add(id(pynccl))
-                if abort_nccl:
-                    cp = pynccl.comm
-                    cp = (int(cp.value) if isinstance(cp, ctypes.c_void_p)
-                          else int(cp))
-                    abort_targets.append((name, cp))
-                    abort_pynccls.append(pynccl)
-                else:
-                    pynccl.nccl.ncclCommDestroy(pynccl.comm)
-                    pynccl.comm = None
+                cp = pynccl.comm
+                cp = (int(cp.value) if isinstance(cp, ctypes.c_void_p)
+                      else int(cp))
+                abort_targets.append((name, cp))
+                abort_pynccls.append(pynccl)
         ca = getattr(comm, "ca_comm", None)
         if ca is not None and id(ca) not in seen_ca_ids:
             seen_ca_ids.add(id(ca))
@@ -716,32 +1858,65 @@ def _destroy_nccl(worker, graph_mode=None):
             ca.close()
             comm.ca_comm = None
 
-    _torch_abort_state = {"done": False}
-
-    def _do_torch_pg_abort():
-        _abort_torch_process_groups()
-        _torch_abort_state["done"] = True
+    _multinode = _is_multinode()
+    if _multinode:
+        _DETACHED_PG_ATTRS[:] = _detach_model_process_groups(worker, ps)
+        print(f"[semip-exp] rank {getattr(worker, 'rank', '?')} detached "
+              f"{len(_DETACHED_PG_ATTRS)} model process-group attr(s): "
+              f"{sorted({(a, p, k) for _, a, p, k in _DETACHED_PG_ATTRS})}",
+              flush=True)
+        # Across nodes a group's broadcaster holds TCP sockets bound to the pod
+        # address, and MessageQueue has no close of its own.
+        import mq_plane
+        seen_mq = set()
+        for name, ref in list(getattr(ps, "_groups", {}).items()):
+            group = ref() if callable(ref) else ref
+            mq = getattr(group, "mq_broadcaster", None) if group else None
+            if mq is not None and id(mq) not in seen_mq:
+                seen_mq.add(id(mq))
+                mq_plane.close_queue(mq)
+                group.mq_broadcaster = None
 
     if abort_targets:
-        _nccl_abort_comms_concurrent(
-            abort_targets,
-            after_fire=(_do_torch_pg_abort if not preserve_graph else None))
+        _nccl_abort_comms_concurrent(abort_targets)
         for pynccl in abort_pynccls:
             pynccl.comm = None
 
-    if abort_nccl and not _torch_abort_state["done"]:
-        _do_torch_pg_abort()
+    # The ``after_fire`` hook on the concurrent abort existed to set these flags
+    # while the pynccl aborts were in flight, which only mattered on the clean
+    # collective-destroy path.  Preserving the graph means we always abort, so
+    # this runs afterwards and unconditionally.
+    _abort_torch_process_groups()
+
+    # Recorded here rather than at the top of the function: every early return
+    # above (TP1, never-initialized) leaves the comms alone, so only code that
+    # has actually aborted them may claim it.  And recorded before the clean
+    # destroy rather than after, because that destroy is expected to raise and
+    # the listener close downstream depends on this surviving the raise.
+    global _PG_ABORTED
+    _PG_ABORTED = True
 
     try:
         destroy_model_parallel()
         destroy_distributed_environment()
     except Exception:  # noqa: BLE001
         # Aborted comms make the clean destroy raise; parallel_state is reset
-        # enough for reinit to rebuild.  Only re-raise on the clean path.
-        if not abort_nccl:
-            raise
+        # enough for reinit to rebuild.  We always abort, so this is expected
+        # rather than a failure to report.
+        pass
     _clear_fd_backed_nccl_env()
-    return {"graph_mode": graph_mode}
+    if _multinode:
+        import gc
+        gc.collect()
+        _port = int(getattr(worker.vllm_config.parallel_config,
+                            "master_port", 0) or 0)
+        _left = _own_store_connections(_port) if _port else []
+        if _left:
+            print(f"[semip-exp] rank {getattr(worker, 'rank', '?')} still "
+                  f"holds {len(_left)} rendezvous connection(s) on :{_port} "
+                  f"after teardown; holders: {_process_group_holders()}",
+                  flush=True)
+    return {}
 
 
 def _force_dist_uninitialized_for_restore():
@@ -776,8 +1951,27 @@ def _force_dist_uninitialized_for_restore():
             pass
     except BaseException:  # noqa: BLE001
         pass
-    for _g in ("_WORLD", "_INNER_DP_WORLD", "_NODE_COUNT", "_TP", "_PP", "_DP",
-               "_DCP", "_PCP", "_EP", "_EPLB", "_SP", "_SP_TP"):
+    # `initialize_model_parallel` asserts each of its groups is None, so one
+    # left behind turns the next init into an AssertionError instead of a
+    # rebuild -- and the assert names the group, which is the only reason the
+    # 0.30 upgrade was diagnosable at all.  The set is version-dependent: 0.30
+    # added `_ETP` and `_ENGRAM_DP`, and a hand-kept list silently misses the
+    # next one, so discovery is the primary mechanism and the names below are
+    # only the floor.  Discovery cannot stand alone because a group left as
+    # None-but-present, or a non-coordinator like `_NODE_COUNT`, is invisible
+    # to it.
+    _named = ("_WORLD", "_INNER_DP_WORLD", "_NODE_COUNT", "_TP", "_PP", "_DP",
+              "_DCP", "_PCP", "_EP", "_EPLB", "_ETP", "_ENGRAM_DP", "_SP",
+              "_SP_TP")
+    _found = []
+    try:
+        from vllm.distributed.parallel_state import GroupCoordinator
+        _found = [n for n in dir(ps)
+                  if n.startswith("_")
+                  and isinstance(getattr(ps, n, None), GroupCoordinator)]
+    except BaseException:  # noqa: BLE001
+        pass
+    for _g in dict.fromkeys(_named + tuple(_found)):
         try:
             if hasattr(ps, _g):
                 setattr(ps, _g, None)
@@ -785,10 +1979,108 @@ def _force_dist_uninitialized_for_restore():
             pass
 
 
-def _reinit_nccl(worker, port):
+_RPC_TIMEOUT_DEFAULT_S = 300.0
+
+
+def _descendant_pids(root=None):
+    """Every descendant of ``root`` (default: this process), breadth first."""
+    root = os.getpid() if root is None else root
+    found, queue = [], [root]
+    while queue:
+        pid = queue.pop(0)
+        try:
+            tasks = os.listdir(f"/proc/{pid}/task")
+        except OSError:
+            continue
+        for tid in tasks:
+            try:
+                with open(f"/proc/{pid}/task/{tid}/children") as f:
+                    kids = f.read().split()
+            except OSError:
+                continue
+            for kid in kids:
+                kid = int(kid)
+                if kid not in found:
+                    found.append(kid)
+                    queue.append(kid)
+    return found
+
+
+def _hang_report():
+    """Where every descendant is blocked -- one line each, for a timeout.
+
+    ``wchan`` is the kernel function a task is parked in, and it is enough to
+    tell the three candidates apart without a debugger in the image:
+    ``futex_wait_queue`` is an internal lock, ``ep_poll``/``do_poll`` is
+    waiting on a peer, and anything in ``ioctl`` is the CUDA driver.
+    """
+    lines = []
+    for pid in _descendant_pids():
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                comm = f.read().strip()
+            with open(f"/proc/{pid}/stat") as f:
+                state = f.read().rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            continue
+        try:
+            with open(f"/proc/{pid}/wchan") as f:
+                wchan = f.read().strip() or "-"
+        except OSError:
+            wchan = "?"
+        lines.append(f"{pid}({comm}) state={state} wchan={wchan}")
+    return "; ".join(lines) or "no descendants readable"
+
+
+def _collective_rpc_with_timeout(llm, fn, args, timeout_s=None, log=None):
+    """``llm.collective_rpc``, bounded, and self-diagnosing when it expires.
+
+    An unbounded ``collective_rpc`` is how a single deadlocked rank turns into
+    a job that sits idle for its full timeout with nothing in the log after
+    ``>>> reinit_nccl``. The RPC cannot be cancelled once a worker is wedged,
+    so this does not try: it reports where every process is parked and raises,
+    which is strictly more than the caller had before.
+
+    ``timeout_s`` arrives as a command kwarg rather than from the environment
+    on purpose. This process is restored, so its ``environ`` is the dump's and
+    no ``extra_env`` set on the restoring job would ever be visible here.
+    """
+    timeout_s = _RPC_TIMEOUT_DEFAULT_S if timeout_s is None else float(timeout_s)
+    box = {}
+
+    def _run():
+        try:
+            box["result"] = llm.collective_rpc(fn, args=args)
+        except BaseException as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True,
+                              name=f"rpc-{getattr(fn, '__name__', fn)}")
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        report = _hang_report()
+        if log is not None:
+            log.error("  %s did not return within %.0fs; %s",
+                      getattr(fn, "__name__", fn), timeout_s, report)
+        raise TimeoutError(
+            f"{getattr(fn, '__name__', fn)} did not return within "
+            f"{timeout_s:.0f}s. Where each process is blocked: {report}")
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
+def _reinit_nccl(worker, port, master_addr=None, ifname=None):
     """Re-initialize NCCL after restore on a fresh TCP port, then rebind the
     canonical tp:0/world:0 (+ ep:0/dp:0 for MoE) group slots the captured graphs
-    look up."""
+    look up.
+
+    ``ifname`` is the multi-node interface, passed as a kwarg rather than read
+    from the environment: this process is restored, so its ``environ`` is the
+    dump's and nothing the restoring job sets would be visible here.  It falls
+    back to the inherited value so a single-node restore is unchanged.
+    """
     import traceback
     import weakref
     from vllm.config import set_current_vllm_config
@@ -797,10 +2089,47 @@ def _reinit_nccl(worker, port):
     try:
         _clear_fd_backed_nccl_env()
         _force_dist_uninitialized_for_restore()
+        _net_reset = None
+        _reinit_ifname = (ifname or os.environ.get("SEMIP_EXP_REINIT_IFNAME")
+                          or _multinode_ifname())
+        if _reinit_ifname:
+            # The cold start ran on NCCL_NET=Socket so the image holds no
+            # initialized EFA state; this is the first EFA bring-up.
+            import nccl_bootstrap
+            os.environ.pop("NCCL_NET", None)
+            os.environ["NCCL_SOCKET_IFNAME"] = _reinit_ifname
+            _net_reset = nccl_bootstrap.reset()
+            print(f"[semip-exp] rank {getattr(worker, 'rank', '?')} "
+                  f"nccl_bootstrap.reset -> {_net_reset}", flush=True)
         # NVLS / SymmMem exchange fds that do not survive CRIU -> keep them off.
+        # FlashInfer allreduce is off for a different reason -- the captured
+        # graphs must hold `cross_device_reduce` nodes for the rebind to have
+        # anything to rewrite -- but it has to hold on both sides, or the
+        # rebuilt communicator disagrees with the graphs it is rebound into.
         os.environ["NCCL_NVLS_ENABLE"] = "0"
         os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
-        _rd_keep = getattr(worker, "_semip_rank_data_keep", None)
+        os.environ["VLLM_ALLREDUCE_USE_FLASHINFER"] = "0"
+        _mn_ifname = ifname or _multinode_ifname()
+        if _mn_ifname:
+            # The restored environ carries the dump pod's address, and the
+            # rebuilt groups' broadcasters bind to get_ip().
+            import vllm.envs as _envs
+            os.environ["VLLM_HOST_IP"] = _iface_ip(_mn_ifname)
+            _envs.disable_envs_cache()
+            _envs.enable_envs_cache()
+        _host = master_addr or "127.0.0.1"
+        _pc = worker.vllm_config.parallel_config
+        if int(getattr(_pc, "nnodes", 1) or 1) > 1:
+            # init_distributed_environment reads the rendezvous from here, not
+            # from distributed_init_method, once nnodes > 1.
+            _pc.master_addr = _host
+            _pc.master_port = port
+        # G3: the rank_data reuse patch keeps the preserved graphs' baked
+        # CustomAllreduce `_dp` pointers valid across the rebuild.  Across
+        # nodes there are no preserved graphs and no CustomAllreduce, so
+        # reusing a dump-era tensor would only pin memory the recapture needs.
+        _rd_keep = (None if _is_multinode()
+                    else getattr(worker, "_semip_rank_data_keep", None))
         with set_current_vllm_config(worker.vllm_config):
             # Reuse the preserved cold-start rank_data tensor (same VA) so the
             # kept-graph CA _dp pointers stay valid.
@@ -812,7 +2141,7 @@ def _reinit_nccl(worker, port):
                 init_worker_distributed_environment(
                     worker.vllm_config,
                     worker.rank,
-                    distributed_init_method=f"tcp://127.0.0.1:{port}",
+                    distributed_init_method=f"tcp://{_host}:{port}",
                     local_rank=worker.local_rank,
                     backend="nccl",
                 )
@@ -824,20 +2153,352 @@ def _reinit_nccl(worker, port):
         if hasattr(ps, "_groups"):
             ps._groups["tp:0"] = weakref.ref(new_tp)
             ps._groups["world:0"] = weakref.ref(new_world)
-            if _semip_ep_enabled(getattr(worker, "vllm_config", None)):
-                for _grp_name, _getter in (("ep:0", "get_ep_group"),
-                                           ("dp:0", "get_dp_group")):
-                    try:
-                        _grp = getattr(ps, _getter)()
-                    except Exception:  # noqa: BLE001
-                        _grp = None
-                    if _grp is not None:
-                        ps._groups[_grp_name] = weakref.ref(_grp)
-        return {"ok": True, "rank": getattr(worker, "rank", "?")}
+            # Gated on the group existing, not on `enable_expert_parallel`.
+            # vLLM builds ep/dp groups for any MoE model -- the flag only decides
+            # whether experts are sharded across them -- so testing the flag left
+            # GLM-5.3, which is MoE with the flag off, holding a dead weakref at
+            # `ep:0` while the rebuilt group registered itself as `ep:1`. That is
+            # what made the two `[ckpt-hook]` lines name different group sets.
+            for _grp_name, _getter in (("ep:0", "get_ep_group"),
+                                       ("dp:0", "get_dp_group")):
+                try:
+                    _grp = getattr(ps, _getter)()
+                except Exception:  # noqa: BLE001
+                    _grp = None
+                if _grp is not None:
+                    ps._groups[_grp_name] = weakref.ref(_grp)
+        if _DETACHED_PG_ATTRS:
+            _reattached, _unowned = _reattach_model_process_groups(ps)
+            print(f"[semip-exp] rank {getattr(worker, 'rank', '?')} "
+                  f"reattached {_reattached} model process-group attr(s), "
+                  f"{_unowned} left None", flush=True)
+        # Re-attach the physical backing that checkpoint_prepare detached on the
+        # dump side. Last, because the hook barriers over the rebuilt cpu_group
+        # and reads the canonical slots written just above.
+        _rekey = _restore_prepared_comm_state(ps, worker)
+        _restored = _run_communicator_checkpoint_hook(ps, "checkpoint_restore",
+                                                      worker)
+        # After the hook's loop, never inside it: every rank has to clear the
+        # barriers in there before any rank is allowed to fail.
+        _assert_checkpoint_state_restored(worker, _rekey, _restored)
+        out = {"ok": True, "rank": getattr(worker, "rank", "?")}
+        # L3: aws-ofi-nccl exports its EFA defaults ("Adding X to environment")
+        # when it initializes, which on this path is right here.  The cold start
+        # pinned those same values so that a restored engine computes
+        # bit-identically to an EFA cold start -- so a plugin upgrade that
+        # changes a default silently breaks that property.  Report the drift
+        # rather than assert: a mismatch is a correctness warning for the next
+        # dump, not a reason to fail a restore that is otherwise healthy.
+        try:
+            from multinode import PINNED_OFI_ENV
+            drift = {k: (v, os.environ.get(k))
+                     for k, v in PINNED_OFI_ENV.items()
+                     if os.environ.get(k) not in (None, v)}
+            if drift:
+                out["ofi_drift"] = drift
+        except Exception:  # noqa: BLE001
+            pass
+        if _net_reset is not None:
+            import nccl_bootstrap
+            out["net_reset"] = _net_reset
+            out["bootstrap_after"] = nccl_bootstrap.bootstrap_state()
+            out["ib_fds"] = sum(
+                1 for fd in os.listdir("/proc/self/fd")
+                if os.path.realpath(f"/proc/self/fd/{fd}").startswith(
+                    "/dev/infiniband/"))
+        return out
     except BaseException as e:  # noqa: BLE001
         return {"ok": False, "rank": getattr(worker, "rank", "?"),
                 "error": f"{type(e).__name__}: {e}",
                 "traceback": traceback.format_exc()}
+
+
+# Threads torch leaves behind around its rendezvous.  Two lists, not one, and the
+# difference matters:
+#
+# ``_WAIT_STORE_THREADS`` are the ones a teardown is expected to reap, so waiting
+# on them terminates quickly.  ``pt_gloo_runloop`` is deliberately absent -- gloo's
+# listening socket lives for the whole process (see the ``GLOO_SOCKET_IFNAME`` note
+# in ``init``), so waiting on it would turn a fast poll into a guaranteed timeout
+# and a warning on every dump.
+#
+# ``_CENSUS_STORE_THREADS`` adds it anyway, for reporting only.  The live-process
+# probe behind Complication 15 found ``pt_gloo_runloop`` holding one of the
+# restored listeners, so whether it is still alive at dump time is worth knowing
+# -- it decides whether thread death could ever gate the close.
+_WAIT_STORE_THREADS = ("pt_tcpstore", "pt_nccl_watchdg", "pt_nccl_heartbt")
+_CENSUS_STORE_THREADS = _WAIT_STORE_THREADS + ("pt_gloo_runloop",)
+
+
+def _live_store_threads(pid=None, names=_CENSUS_STORE_THREADS):
+    """``tid(comm)`` for every rendezvous/watchdog thread still alive in *pid*."""
+    pid = os.getpid() if pid is None else pid
+    alive = []
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return alive
+    for tid_name in tids:
+        try:
+            with open(f"/proc/{pid}/task/{tid_name}/comm") as f:
+                comm = f.read().strip()
+        except OSError:
+            continue
+        if any(comm.startswith(n) for n in names):
+            alive.append(f"{tid_name}({comm})")
+    return alive
+
+
+def _wait_store_threads_exit(pid=None, attempts=50, interval=0.05):
+    """Wait for the reapable rendezvous threads to exit.
+
+    Returns ``(ok, still_alive, polls)``.  Advisory: callers log the outcome and
+    carry on either way, because a thread outliving the teardown costs a noisy
+    dump, not a wrong one.  Waits on ``_WAIT_STORE_THREADS`` only -- see the note
+    there for why gloo is excluded.
+    """
+    alive = _live_store_threads(pid, _WAIT_STORE_THREADS)
+    for n in range(attempts):
+        if not alive:
+            return True, [], n
+        time.sleep(interval)
+        alive = _live_store_threads(pid, _WAIT_STORE_THREADS)
+    return False, alive, attempts
+
+
+def _ephemeral_port_range():
+    """``(low, high)`` from ``ip_local_port_range``, or ``(None, None)``.
+
+    Duplicated from ``worker.py`` rather than imported: these two modules do not
+    import each other, and the child must not grow a dependency on the worker.
+    """
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            lo, hi = f.read().split()[:2]
+        return int(lo), int(hi)
+    except (OSError, ValueError):
+        return None, None
+
+
+def _loopback_listeners():
+    """This process's listening loopback TCP sockets, split by port kind.
+
+    Returns ``(ephemeral, fixed)``, each a list of ``(fd, "addr:port")``.  Pure:
+    nothing is closed and no fd is consumed, so a caller that only wants to
+    describe what the image is about to record cannot accidentally alter it.
+    That separation is deliberate -- see ``_close_loopback_listeners``, which is
+    the only thing in this module allowed to close one of these.
+
+    The split is the whole question of Complication 15:
+
+    * **ephemeral** (inside ``ip_local_port_range``) is torch's rendezvous at
+      TP=1, and the restore discards it -- seven ports were recorded in the
+      measured image and none of the seven was live afterwards, because
+      ``reinit_nccl`` rebuilds the rendezvous from scratch.
+    * **fixed** is a service advertising itself.  NCCL's RAS listener sits on
+      ``localhost:28028`` (``NCCL_RAS_ADDR``), behind a thread no torch teardown
+      stops.
+
+    An unreadable port range reports nothing as ephemeral, which keeps the safe
+    direction: describe less, and so close less.
+    """
+    import socket as _sock
+    pid = os.getpid()
+    lo, hi = _ephemeral_port_range()
+    ephemeral = []
+    fixed = []
+    for fd_name in sorted(os.listdir(f"/proc/{pid}/fd"), key=int):
+        try:
+            fd_int = int(fd_name)
+            if fd_int <= 2:
+                continue
+            link = os.readlink(f"/proc/{pid}/fd/{fd_name}")
+            if not link.startswith("socket:"):
+                continue
+            # socket(fileno=) takes ownership of the fd, so detach() before
+            # deciding anything -- letting the wrapper be collected would
+            # close sockets that have to survive the dump.
+            s = _sock.socket(fileno=fd_int)
+            try:
+                fam = s.family
+                listening = s.getsockopt(_sock.SOL_SOCKET,
+                                         _sock.SO_ACCEPTCONN)
+                addr = s.getsockname()
+            finally:
+                s.detach()
+            if not listening:
+                continue
+            if fam not in (_sock.AF_INET, _sock.AF_INET6):
+                continue
+            if addr[0] not in ("127.0.0.1", "::1"):
+                continue
+            row = (fd_int, f"{addr[0]}:{addr[1]}")
+            if lo is not None and lo <= addr[1] <= hi:
+                ephemeral.append(row)
+            else:
+                fixed.append(row)
+        except (OSError, ValueError):
+            pass
+    return ephemeral, fixed
+
+
+def _close_loopback_listeners():
+    """Close this process's orphaned torch rendezvous listeners.  **TP=1 only.**
+
+    ``destroy_process_group()`` retires torch's TCPStore and Gloo threads but
+    not their listening sockets: the threads exit, the fds stay open, and the FD
+    keep-list preserves every ``socket:`` fd into the image.  CRIU then has to
+    ``bind()`` every recorded port on every restore, and those ports are
+    ephemeral -- the kernel assigned them on the dump host -- so a live occupant
+    in the restoring pod fails the whole restore with EADDRINUSE.
+    ``SO_REUSEADDR`` does not help against a live listener, and retrying never
+    clears it.  Nothing reuses the ports either: ``reinit_nccl`` builds a fresh
+    rendezvous, so the rebind buys nothing.
+
+    **Callers must confirm the process group is down first**, and must be on the
+    TP=1 path.  Both conditions, because only their conjunction makes these
+    sockets nobody's:
+
+    * At TP=1 this is measured to be exactly torch's set -- seven listeners, all
+      on the driver's own fds, with ``pt_tcpstore`` and fourteen
+      ``pt_gloo_runloop`` threads beside them -- and NCCL's RAS subsystem is not
+      running at all, so there is nothing else here to catch.
+    * **At TP>1 there is nothing of torch's left to close.**  Its teardown
+      retires its own listeners before the dump (measured: 28 across two ranks
+      during init, 2 by dump time), and the ephemeral loopback listener that
+      survives belongs to RAS.  Closing it left RAS calling ``accept()`` on a
+      dead fd after restore, spinning ``EBADF`` with no backoff at ~143 MB/s
+      while the job reported ``RUNNING`` and served correct answers.  So the
+      TP>1 path censuses via ``_loopback_listeners`` and closes nothing.
+
+    Fixed ports are skipped even here.  It costs nothing at TP=1, where there are
+    none, and it is the second line of defence if RAS ever does appear on this
+    path: a fixed loopback port is how a long-lived service advertises itself,
+    never something the kernel handed out by accident.
+
+    Returns ``(closed, skipped)`` as ``addr:port`` strings.
+    """
+    ephemeral, fixed = _loopback_listeners()
+    closed = []
+    for fd_int, tag in ephemeral:
+        try:
+            os.close(fd_int)
+            closed.append(tag)
+        except OSError:
+            pass
+    return closed, [tag for _, tag in fixed]
+
+
+_PSM_PREFIXES = ("/dev/shm/psm_", "/dev/shm/psm2_")
+_SEM_PREFIXES = ("/dev/shm/sem.",)
+
+
+def _own_shm_paths(pids, prefixes, proc="/proc", shm_dir="/dev/shm"):
+    """The ``/dev/shm`` files *pids* map or hold open, among *prefixes*.
+
+    The dump unlinks these so CRIU captures their mappings as memory rather than
+    as files to reopen. It used to glob ``/dev/shm`` instead, which reached every
+    other replica in the pod: a segment unlinked under a live sibling breaks the
+    next process that opens it by name -- a rank attaching to its broadcast
+    queue, or a worker spawned with a queue whose semaphores it reopens.
+    Restricting the unlink to what this tree actually maps leaves the siblings
+    alone. Already-unlinked files are skipped.
+
+    **A mapping's path is not always the file's name.** glibc's ``sem_open``
+    creates the semaphore under a temporary ``sem.XXXXXX``, links it to the real
+    name (``sem.loky-<pid>-...``) and unlinks the temporary, so ``maps`` shows
+    ``sem.XXXXXX (deleted)`` while the file still has a live name. Left linked,
+    CRIU cannot ghost it and link-remaps it instead: it hard-links
+    ``/dev/shm/link_remap.<id>`` in the dumping pod, which the image then needs
+    at restore -- nowhere else has it, the first restore consumes it, and
+    replicas whose trees number their files alike collide on the same ``<id>``
+    and fail the dump. So every mapped ``(device, inode)`` under *shm_dir* is
+    matched back to the names that still point at it, and those are returned
+    too.
+    """
+    found = set()
+    inodes = set()
+    for pid in pids:
+        try:
+            with open(f"{proc}/{pid}/maps") as handle:
+                for line in handle:
+                    parts = line.split(None, 5)
+                    if len(parts) < 6:
+                        continue
+                    path = parts[5].strip()
+                    if not path.startswith(prefixes):
+                        continue
+                    if not path.endswith("(deleted)"):
+                        found.add(path)
+                    try:
+                        major, minor = (int(x, 16) for x in parts[3].split(":"))
+                        inodes.add((os.makedev(major, minor), int(parts[4])))
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+        try:
+            fds = os.listdir(f"{proc}/{pid}/fd")
+        except OSError:
+            continue
+        for fd_name in fds:
+            try:
+                link = os.readlink(f"{proc}/{pid}/fd/{fd_name}")
+            except OSError:
+                continue
+            if link.startswith(prefixes) and not link.endswith("(deleted)"):
+                found.add(link)
+    if inodes:
+        names = tuple(p[len("/dev/shm/"):] for p in prefixes
+                      if p.startswith("/dev/shm/"))
+        try:
+            entries = os.listdir(shm_dir)
+        except OSError:
+            entries = []
+        for name in entries:
+            if not name.startswith(names):
+                continue
+            path = os.path.join(shm_dir, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) in inodes:
+                found.add(path)
+    return sorted(found)
+
+
+def _tree_pids(root, proc="/proc"):
+    """*root* and every descendant, via ``/proc/<pid>/task/<tid>/children``."""
+    seen = []
+    stack = [root]
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.append(pid)
+        try:
+            tids = os.listdir(f"{proc}/{pid}/task")
+        except OSError:
+            continue
+        for tid in tids:
+            try:
+                with open(f"{proc}/{pid}/task/{tid}/children") as handle:
+                    stack.extend(int(c) for c in handle.read().split())
+            except (OSError, ValueError):
+                pass
+    return seen
+
+
+def _unlink_paths(paths):
+    removed = []
+    for path in paths:
+        try:
+            os.remove(path)
+            removed.append(path)
+        except OSError:
+            pass
+    return removed
 
 
 def _prepare_worker_dump(worker):
@@ -847,10 +2508,55 @@ def _prepare_worker_dump(worker):
     pid = os.getpid()
     closed_fds = []
     unmapped = []
-    devnull = os.open(os.devnull, os.O_RDWR)
-    for std_fd in (1, 2):
-        os.dup2(devnull, std_fd)
-    os.close(devnull)
+    # fd 1/2 stay on the pod-log pipe inherited from the child: CRIU dumps it as
+    # the same external pipe as the child's, and the restore hands it back.
+    # Complication 15, worker side.  At TP>1 each rank is its own process with its
+    # own torch rendezvous listeners, so the driver-side close in
+    # prepare_criu_dump cannot reach them -- and these are the only ones that
+    # matter: CRIU seized nine processes for the TP8 image and every recorded
+    # listener sat in one of the eight workers, none in the driver.
+    # `destroy_nccl` runs before `criu_dump` (auto-inserted by
+    # Instance.cuda_checkpoint when n_gpus > 1), so the group is down by now.
+    #
+    # **Nothing is closed here.**  This runs only at TP>1 -- prepare_criu_dump
+    # gates the collective_rpc on len(gpus) > 1 -- and at TP>1 torch has already
+    # retired its own rendezvous listeners by the time the dump prep runs.
+    # Measured on a 35B TP=2: 28 ephemeral loopback listeners across the two
+    # ranks during init, 26 of them gone without anyone closing anything, and the
+    # one per rank that survived belonged to NCCL's RAS thread, which no torch
+    # teardown stops.  Closing that one is what produced a restore that spun
+    # accept() on EBADF at ~143 MB/s while the job reported RUNNING.
+    #
+    # So the ports ride into the image, which is both what RAS needs and the only
+    # thing the restore survives.  It costs no collision exposure that was
+    # avoidable: the survivor is RAS's, and RAS needs it recorded either way.
+    # The TP=1 driver path in prepare_criu_dump still closes, because there the
+    # listeners really are torch's and RAS is not running -- see
+    # `_close_loopback_listeners`.
+    #
+    # The census travels back in the reply as well as the log, because what the
+    # image records is the thing a restore failure will ask about.
+    listener_diag = {"pg_aborted": _PG_ABORTED,
+                     "store_threads": _live_store_threads()}
+    try:
+        import torch.distributed as _dist
+        listener_diag["dist_initialized"] = bool(_dist.is_initialized())
+    except Exception as _e:  # noqa: BLE001
+        listener_diag["dist_initialized"] = f"unreadable: {_e!r}"
+    try:
+        _eph, _fixed = _loopback_listeners()
+        # Named for what they are -- what this image will carry -- rather than
+        # `would_close`, which implied a close was being withheld pending some
+        # condition.  It is not: at TP>1 there is no condition under which these
+        # should be closed.
+        listener_diag["recorded_ephemeral"] = [tag for _, tag in _eph]
+        listener_diag["recorded_fixed"] = [tag for _, tag in _fixed]
+    except Exception as _e:  # noqa: BLE001
+        listener_diag["error"] = repr(_e)
+
+    # Before the fd sweep below closes them, so the fds still name the files.
+    own_psm = _own_shm_paths([pid], _PSM_PREFIXES)
+
     close_anon = ("infinibandevent", "io_uring")
     close_shm = ("/dev/shm/psm_",)
     keep_prefixes = ("/dev/nvidia", "/dev/shm", "anon_inode:", "socket:", "pipe:")
@@ -891,25 +2597,20 @@ def _prepare_worker_dump(worker):
     # worker.  Instead unlink the /dev/shm/psm_* file while keeping the mapping;
     # the inode stays alive so the worker is unaffected, and CRIU then captures
     # the mapping as anonymous memory (no file to reopen on restore).
-    import glob as _glob
-    removed_psm = []
-    for _pf in _glob.glob("/dev/shm/psm_*") + _glob.glob("/dev/shm/psm2_*"):
-        try:
-            os.remove(_pf)
-            removed_psm.append(_pf)
-        except OSError:
-            pass
+    removed_psm = _unlink_paths(own_psm)
     return {"closed_fds": closed_fds, "unmapped": unmapped,
-            "removed_psm": removed_psm}
+            "removed_psm": removed_psm,
+            "listener_diag": listener_diag}
 
 
 # ---------------------------------------------------------------------------
 # CUDA graph handling around CRIU (worker-local, via collective_rpc).
 #
-# Default is graph REUSE: cold-start graphs are preserved in the CRIU image and
-# their stale CustomAllreduce addresses are rewritten after reinit by
-# ca_graph_rebind (fast).  graph_mode="full" is an explicit fallback that drops
-# the graphs (cleargraph) and rebuilds them with capture_model() (slow).
+# Graphs are preserved in the CRIU image and their stale CustomAllreduce
+# addresses are rewritten after reinit by ca_graph_rebind.  Nothing is ever
+# recaptured: the `full` path that dropped the graphs and rebuilt them with
+# capture_model() was retired 2026-09-24, along with the cleargraph primitive
+# that only it could reach.
 # ---------------------------------------------------------------------------
 def _semip_prepare_graph_reuse_snapshot(worker):
     """Cold-start hook: record the CA meta/buffer/rank_data snapshot the
@@ -921,217 +2622,254 @@ def _semip_prepare_graph_reuse_snapshot(worker):
     if not _CA_REBIND_AVAILABLE or ca_graph_rebind is None:
         return {"available": False}
     try:
-        result = ca_graph_rebind.store_snapshot(worker, None, None)
-        result["graph_mode"] = GRAPH_MODE_REUSE
-        return result
+        return ca_graph_rebind.store_snapshot(worker, None, None)
     except Exception as e:  # noqa: BLE001
         return {"available": True, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
-def _semip_cleargraph(worker, graph_mode=None):
-    """Drop captured cudagraphs so the next capture_model() runs fresh.  No-op in
-    reuse mode (graphs are preserved).  In full mode: destroy exec handles, call
-    each wrapper's clear_all_graphs(), refresh the shared graph pool (else
-    recapture mints private per-size pools and OOMs), reset the MoE aux stream,
-    and reset the V2 ModelCudaGraphManager."""
-    import gc
-    from vllm.compilation.monitor import set_cudagraph_capturing_enabled
-    from vllm.platforms import current_platform
-
-    graph_mode = graph_mode or GRAPH_MODE_REUSE
-    if graph_mode == GRAPH_MODE_REUSE:
-        return {"graph_mode": graph_mode, "skipped": "reuse_preserves_graph"}
-
-    set_cudagraph_capturing_enabled(False)
-    try:
-        mr = getattr(worker, "model_runner", None)
-        mgr = getattr(mr, "cudagraph_manager", None)
-        wrapper_classes = {}
-
-        def _consider(cls):
-            if cls is not None and hasattr(cls, "_all_instances") \
-                    and hasattr(cls, "clear_all_graphs"):
-                wrapper_classes[id(cls)] = cls
-
-        for _mod, _name in (
-                ("vllm.compilation.cuda_graph", "CUDAGraphWrapper"),
-                ("vllm.compilation.breakable_cudagraph", "BreakableCUDAGraphWrapper")):
-            try:
-                _m = __import__(_mod, fromlist=[_name])
-                _consider(getattr(_m, _name, None))
-            except Exception:  # noqa: BLE001
-                pass
-        _mdl = getattr(mr, "model", None)
-        _consider(type(_mdl) if _mdl is not None else None)
-        _inner = getattr(_mdl, "cudagraph_wrapper", None) if _mdl is not None else None
-        _consider(type(_inner) if _inner is not None else None)
-        _bcr = getattr(mgr, "breakable_cg_runner", None)
-        _consider(type(_bcr) if _bcr is not None else None)
-        if len(wrapper_classes) < 2:
-            for o in gc.get_objects():
-                t = type(o)
-                try:
-                    if hasattr(t, "_all_instances") and hasattr(t, "clear_all_graphs"):
-                        wrapper_classes[id(t)] = t
-                except Exception:  # noqa: BLE001
-                    pass
-
-        def _entries_of(inst):
-            for attr in ("concrete_cudagraph_entries", "entries", "cudagraphs"):
-                d = getattr(inst, attr, None)
-                if isinstance(d, dict):
-                    return d
-            return {}
-
-        def _reset_graph(obj):
-            if obj is not None and hasattr(obj, "reset"):
-                try:
-                    obj.reset()
-                except Exception:  # noqa: BLE001
-                    pass
-
-        for cls in wrapper_classes.values():
-            for i in list(getattr(cls, "_all_instances", []) or []):
-                for e in list(_entries_of(i).values()):
-                    _reset_graph(getattr(e, "cudagraph", None))
-                    cap = getattr(e, "capture", None)
-                    for seg in list(getattr(cap, "segments", []) or []):
-                        _reset_graph(getattr(seg, "__self__", None))
-
-        for cls in wrapper_classes.values():
-            try:
-                cls.clear_all_graphs()
-            except Exception:  # noqa: BLE001
-                for i in list(getattr(cls, "_all_instances", []) or []):
-                    try:
-                        i.clear_graphs()
-                    except Exception:  # noqa: BLE001
-                        try:
-                            _entries_of(i).clear()
-                        except Exception:  # noqa: BLE001
-                            pass
-
-        for cand in (_mdl, getattr(_mdl, "cudagraph_wrapper", None)
-                     if _mdl is not None else None):
-            if (cand is not None and not hasattr(type(cand), "_all_instances")
-                    and hasattr(cand, "cudagraphs") and hasattr(cand, "clear_graphs")):
-                try:
-                    cand.clear_graphs()
-                except Exception:  # noqa: BLE001
-                    pass
-
-        fresh_pool = None
-        try:
-            type(current_platform)._global_graph_pool = None
-            fresh_pool = current_platform.get_global_graph_pool()
-        except Exception:  # noqa: BLE001
-            pass
-        if fresh_pool is not None:
-            for cls in wrapper_classes.values():
-                for i in list(getattr(cls, "_all_instances", []) or []):
-                    if hasattr(i, "graph_pool"):
-                        try:
-                            i.graph_pool = fresh_pool
-                        except Exception:  # noqa: BLE001
-                            pass
-
-        try:
-            import vllm.utils.torch_utils as _vtu
-            if getattr(_vtu, "_aux_stream", None) is not None:
-                _vtu._aux_stream = None
-        except Exception:  # noqa: BLE001
-            pass
-
-        if mgr is not None:
-            try:
-                for _g in list(getattr(mgr, "graphs", {}).values()):
-                    _reset_graph(_g)
-                if hasattr(mgr, "graphs"):
-                    mgr.graphs.clear()
-                if hasattr(mgr, "_graphs_captured"):
-                    mgr._graphs_captured = False
-                if getattr(mgr, "pool", None) is not None and fresh_pool is not None:
-                    mgr.pool = fresh_pool
-            except Exception:  # noqa: BLE001
-                pass
-
-        gc.collect()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-    finally:
-        set_cudagraph_capturing_enabled(True)
-    return {"graph_mode": graph_mode}
-
-
-def _semip_reuse_graphs(worker):
+def _semip_rebind_graphs(worker):
     """Repair preserved CUDA graphs against the post-restore runtime by rewriting
-    the moved CustomAllreduce addresses (ca_graph_rebind).  No capture_model()."""
+    the moved CustomAllreduce addresses (ca_graph_rebind).  No capture_model().
+
+    This is address staleness, not missing execs.  A warm image carries every
+    cudaGraphExec_t through CRIU intact (measured on GLM-5.3 at TP=8: 4080
+    exec_ok and 0 uninstantiated at the dump, and the same on the restored
+    side).  What does not survive is the CA meta/buffer *contents* baked into
+    the graph nodes, because destroy_nccl -> reinit_nccl reallocates them at
+    new addresses -- 144126 kernel argument slots and 16014 memcpy pointers per
+    rank on that run.  No amount of dump-time warming can pre-empt that; the
+    addresses only go stale after the restore.
+    """
     if _semip_tp_size(worker) <= 1:
         torch.cuda.synchronize()
-        return {"ok": True, "recaptured": False, "graph_mode": GRAPH_MODE_REUSE,
-                "skipped": "tp1_graph_reuse"}
+        return {"ok": True, "recaptured": False,
+                "skipped": "tp1_no_rebind",
+                "rank": getattr(worker, "rank", "?")}
     if not _CA_REBIND_AVAILABLE or ca_graph_rebind is None:
-        return {"ok": False, "graph_mode": GRAPH_MODE_REUSE,
-                "error": "ca_graph_rebind unavailable"}
+        return {"ok": False, "error": "ca_graph_rebind unavailable",
+                "rank": getattr(worker, "rank", "?")}
     ca_rebind = ca_graph_rebind.rebind_after_reinit(worker)
     torch.cuda.synchronize()
     return {"ok": bool(ca_rebind.get("ok")), "recaptured": False,
-            "graph_mode": GRAPH_MODE_REUSE, "ca_rebind": ca_rebind}
+            "ca_rebind": ca_rebind,
+            "rank": getattr(worker, "rank", "?")}
 
 
-def _semip_connect_ep_channels_before_capture(worker):
-    """Connect every MoE/EP NCCL channel on the default stream before a full
-    capture_model().  Without this the ep all_gather/reduce_scatter lazily
-    connects on the graph-capture stream and recapture hangs.  EP-only."""
-    if not _semip_ep_enabled(getattr(worker, "vllm_config", None)):
-        return {"skipped": "not_ep"}
-    mr = getattr(worker, "model_runner", None)
-    dummy = getattr(mr, "_dummy_run", None)
-    if mr is None or dummy is None:
-        return {"skipped": "no_dummy_run"}
-    from vllm.config import CUDAGraphMode
-    none_mode = CUDAGraphMode.NONE
-    try:
-        cc = (getattr(mr, "compilation_config", None)
-              or getattr(getattr(worker, "vllm_config", None),
-                         "compilation_config", None))
-        sizes = getattr(cc, "cudagraph_capture_sizes", None) or [32]
-        max_sz = int(max(sizes))
-    except Exception:  # noqa: BLE001
-        max_sz = 32
-    diag = {}
-    for name, ntok, uniform in (("mixed", max_sz, False), ("decode", 1, True)):
+def _graph_wrappers():
+    """Every live CUDAGraphWrapper and BreakableCUDAGraphWrapper."""
+    wrappers = []
+    for mod, name in (("vllm.compilation.cuda_graph", "CUDAGraphWrapper"),
+                      ("vllm.compilation.breakable_cudagraph",
+                       "BreakableCUDAGraphWrapper")):
         try:
-            dummy(ntok, cudagraph_runtime_mode=none_mode, uniform_decode=uniform,
-                  skip_eplb=True, remove_lora=False)
-            torch.cuda.synchronize()
-            diag[name] = "ok"
+            cls = getattr(__import__(mod, fromlist=[name]), name)
+            wrappers += list(getattr(cls, "_all_instances", ()) or ())
+        except Exception:  # noqa: BLE001
+            pass
+    return wrappers
+
+
+def _semip_drop_graphs(worker):
+    """Destroy every captured CUDA graph and empty the containers holding them.
+
+    Across nodes vLLM has no custom all-reduce, so every all-reduce a graph
+    captured is an NCCL kernel, and ``ncclCommAbort`` does not return while a
+    graph that captured the communicator is alive. A multi-node dump therefore
+    drops the graphs before ``destroy_nccl``, and the restore captures them
+    again with ``capture_model()``.
+
+    On vLLM 0.30 the graphs sit in three places: the wrapper entries, the V2
+    runner's manager, and piecewise segments reachable only through bound
+    ``replay`` methods. ``_collect_graph_entries`` finds all three, so every
+    graph is reset explicitly rather than left to garbage collection.
+    """
+    import gc
+    rank = getattr(worker, "rank", "?")
+    if not _CA_REBIND_AVAILABLE or ca_graph_rebind is None:
+        return {"ok": False, "error": "ca_graph_rebind unavailable",
+                "rank": rank}
+    torch.cuda.synchronize()
+    free_before = torch.cuda.mem_get_info()[0]
+    entries, diag = ca_graph_rebind._collect_graph_entries(worker)
+    n_found = len(entries)
+    n_reset = 0
+    reset_errors = []
+    for _key, graph in entries:
+        try:
+            graph.reset()
+            n_reset += 1
         except Exception as e:  # noqa: BLE001
-            diag[name] = f"err: {type(e).__name__}: {e}"
-    return diag
+            if len(reset_errors) < 3:
+                reset_errors.append(f"{type(e).__name__}: {e}")
+    del entries
 
+    # Empty the containers too, or capture_model() finds the entries and
+    # replays the reset graphs instead of capturing.
+    wrappers = _graph_wrappers()
+    n_cleared = 0
+    for w in wrappers:
+        for attr in ("concrete_cudagraph_entries", "entries"):
+            m = getattr(w, attr, None)
+            if isinstance(m, dict):
+                n_cleared += len(m)
+                m.clear()
+    managers, _why = ca_graph_rebind._graph_manager_holders(worker)
+    for mgr in managers:
+        graphs = getattr(mgr, "graphs", None)
+        if isinstance(graphs, dict):
+            n_cleared += len(graphs)
+            graphs.clear()
+        if hasattr(mgr, "_graphs_captured"):
+            mgr._graphs_captured = False
 
-def _semip_recapture_graphs(worker, graph_mode=None):
-    """Repair (reuse) or rebuild (full) CUDA graphs against the live post-restore
-    state."""
-    graph_mode = graph_mode or GRAPH_MODE_REUSE
-    if graph_mode == GRAPH_MODE_REUSE:
-        return _semip_reuse_graphs(worker)
-    mr = worker.model_runner
-    cleargraph = _semip_cleargraph(worker, GRAPH_MODE_FULL)
-    _semip_connect_ep_channels_before_capture(worker)
+    # A fresh shared pool: recapturing into the old one leaves its blocks
+    # pinned, and without a shared pool each size gets a private one.
+    pool_refreshed = False
+    try:
+        from vllm.platforms import current_platform
+        type(current_platform)._global_graph_pool = None
+        fresh = current_platform.get_global_graph_pool()
+        for w in wrappers:
+            if hasattr(w, "graph_pool"):
+                w.graph_pool = fresh
+        for mgr in managers:
+            if getattr(mgr, "pool", None) is not None:
+                mgr.pool = fresh
+        pool_refreshed = True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import vllm.utils.torch_utils as _vtu
+        if getattr(_vtu, "_aux_stream", None) is not None:
+            _vtu._aux_stream = None
+    except Exception:  # noqa: BLE001
+        pass
+
+    gc.unfreeze()
+    try:
+        gc.collect()
+    finally:
+        gc.freeze()
     torch.cuda.synchronize()
-    mr.capture_model()
+    torch.cuda.empty_cache()
+    free_after = torch.cuda.mem_get_info()[0]
+    census = ca_graph_rebind.graph_exec_census(worker)
+    return {"ok": n_found > 0 and not census.get("n_exec_ok"),
+            "rank": rank, "n_found": n_found, "n_reset": n_reset,
+            "n_cleared": n_cleared, "pool_refreshed": pool_refreshed,
+            "freed_mib": (free_after - free_before) >> 20,
+            "exec_ok_after": census.get("n_exec_ok"),
+            "discovery": {k: diag.get(k) for k in (
+                "n_wrapper_graphs", "n_manager_graphs",
+                "n_gc_fallback_graphs", "complete")},
+            "reset_errors": reset_errors}
+
+
+def _semip_recapture_graphs(worker):
+    """Capture the CUDA graphs again after a restore whose dump dropped them.
+
+    Calls ``capture_model()`` directly rather than ``compile_or_warm_up_model``,
+    which also redoes one-time warmup. Outside that method the keep-graph patch
+    is not installed, so this is stock capture and every graph is
+    instantiated.
+
+    ``capture_model()`` ends with ``lock_workspace()``, so by the time a dump
+    happens the workspace refuses any allocation bigger than the current one.
+    Unlocking first puts the recapture back in the state the cold-start capture
+    ran in; ``capture_model()`` locks it again on the way out.
+    """
+    rank = getattr(worker, "rank", "?")
     torch.cuda.synchronize()
-    return {"ok": True, "recaptured": True, "graph_mode": graph_mode,
-            "cleargraph": cleargraph, "rank": getattr(worker, "rank", "?")}
+    free_before = torch.cuda.mem_get_info()[0]
+    unlocked = False
+    try:
+        from vllm.v1.worker.workspace import unlock_workspace
+        unlock_workspace()
+        unlocked = True
+    except Exception:  # noqa: BLE001
+        pass
+    t0 = time.monotonic()
+    worker.model_runner.capture_model()
+    torch.cuda.synchronize()
+    seconds = time.monotonic() - t0
+    free_after = torch.cuda.mem_get_info()[0]
+    census = (ca_graph_rebind.graph_exec_census(worker)
+              if _CA_REBIND_AVAILABLE and ca_graph_rebind is not None else {})
+    n_graphs = census.get("n_graphs") or 0
+    n_exec_ok = census.get("n_exec_ok") or 0
+    # G5: the cold start subtracted this from the KV budget
+    # (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS), so it is the number the
+    # recapture is supposed to fit inside.  Reported rather than enforced --
+    # the estimate is an estimate, and an over-run that still fits in free
+    # memory is not a failure -- but a recapture creeping past it is how the
+    # restore's staging budget starts colliding with the capture.
+    used_mib = (free_before - free_after) >> 20
+    estimate = getattr(worker, "cudagraph_memory_estimate", None)
+    # Every captured graph must come back instantiated.  `n_exec_ok > 0` would
+    # pass on a recapture that built one graph of four thousand, which is the
+    # failure this is here to catch: `capture_model()` silently returns 0 when
+    # the manager thinks it has nothing to capture.
+    return {"ok": n_graphs > 0 and n_exec_ok == n_graphs, "rank": rank,
+            "seconds": round(seconds, 2),
+            "unlocked_workspace": unlocked,
+            "used_mib": used_mib,
+            "estimate_mib": (int(estimate) >> 20) if estimate else None,
+            "free_after_mib": free_after >> 20,
+            "n_graphs": n_graphs,
+            "n_exec_ok": n_exec_ok}
 
 
-def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
+def _semip_graph_census(worker):
+    """Per-rank count of captured graphs that currently hold a cudaGraphExec_t.
+
+    Cheap enough to call between warmup rungs: a warm image holds the count flat
+    across the whole ladder, a cold one steps by one wrapper-set per rung, and
+    that difference is the direct read on whether a rung replayed or built."""
+    if not _CA_REBIND_AVAILABLE or ca_graph_rebind is None:
+        return {"ok": False, "error": "ca_graph_rebind unavailable",
+                "rank": getattr(worker, "rank", "?")}
+    out = ca_graph_rebind.graph_exec_census(worker)
+    out["rank"] = getattr(worker, "rank", "?")
+    return out
+
+
+def _log_graph_census(llm, log, when):
+    """Run the census on every rank, log one compact line each, return the dicts.
+
+    The return value is what lets a caller enforce ``uninstantiated == 0``
+    rather than leave it to whoever reads the log.  An empty list means the
+    census itself failed, which is deliberately not the same as a clean reading:
+    a census must never be the reason a dump or a restore fails, so callers that
+    treat it as an invariant have to decide what an absent answer means.
+    """
+    try:
+        census = [c for c in llm.collective_rpc(_semip_graph_census)
+                  if isinstance(c, dict)]
+    except Exception:
+        log.warning("  census[%s] failed", when, exc_info=True)
+        return []
+    for _c in census:
+        log.info("  census[%s] rank=%s exec_ok=%s uninstantiated=%s "
+                 "shapes=%s per_shape=%s", when, _c.get("rank", "?"),
+                 _c.get("n_exec_ok"), _c.get("n_uninstantiated"),
+                 _c.get("n_shapes_instantiated"),
+                 _c.get("execs_per_shape_hist"))
+    return census
+
+
+def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
+                    multinode=None):
     """Runs in a spawned child process: owns CUDA and vLLM.
 
     ``gpus`` is the physical GPU list for this instance (a single-element
-    list at TP=1).  The main loop has two modes:
+    list at TP=1).  ``multinode`` is ``MultiNode.as_init_kwargs()`` when this
+    child is one node-partition of a TP group that spans pods, and ``None`` -- the
+    single-node case -- otherwise.  It arrives at spawn rather than with the
+    ``init`` command because the environment it decides (the NCCL/gloo
+    interface, ``VLLM_HOST_IP`` and the pinned aws-ofi-nccl values) has to be
+    in place before vLLM is imported.
+
+    The main loop has two modes:
     - **Idle**: blocks on pipe_conn.recv() (zero CPU).
     - **Active** (engine has unfinished requests): alternates between
       engine.step() and non-blocking pipe_conn.poll() so new generate
@@ -1141,6 +2879,16 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
         gpus = [gpus]
     gpus = list(gpus)
     rank = gpus[0]
+    global _MULTINODE
+    if multinode:
+        _MULTINODE = dict(multinode)
+    elif os.environ.get("SEMIP_EXP_MULTINODE_IFNAME"):
+        # The experiment driver predates the MultiNode parameter and sets the
+        # interface in the environment.  Fold it into the same state rather
+        # than leaving two sources of truth for the gates below.
+        _MULTINODE = {"ifname": os.environ["SEMIP_EXP_MULTINODE_IFNAME"],
+                      "node_rank": None, "master_addr": None,
+                      "master_port": None}
     if len(gpus) > 1:
         # TP>1: keep ALL GPUs visible so tensor parallelism can span the
         # group; each vLLM worker is placed on its physical GPU by
@@ -1163,7 +2911,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
     # listening socket's bound address; restoring on a different node then
     # fails at bind() with EADDRNOTAVAIL.  127.0.0.1 exists identically on
     # every node, so loopback makes images node-portable.
-    os.environ["VLLM_HOST_IP"] = "127.0.0.1"
+    _mn_ifname = _multinode_ifname()
+    os.environ["VLLM_HOST_IP"] = (_iface_ip(_mn_ifname)
+                                  if _mn_ifname else "127.0.0.1")
     # VLLM_HOST_IP only steers vLLM's own rendezvous.  The collective
     # libraries pick their transport interface independently and default to
     # the routable NIC: gloo keeps a persistent listening socket for the life
@@ -1173,8 +2923,31 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
     # single-node even at TP>1 -- the TP group's ranks are local, so their
     # NCCL bootstrap reaches across loopback fine and the data path rides
     # NVLink/P2P rather than these sockets.
-    os.environ["NCCL_SOCKET_IFNAME"] = "lo"
-    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    # A multi-node group cannot rendezvous over loopback; every socket bound
+    # to the pod address has to be closed before the dump instead.
+    # Assignment, not setdefault: dss pins NCCL_SOCKET_IFNAME=^lo into the
+    # job's extra_env for multi-node jobs, which the child inherits, and a
+    # semi-p cold start has to bind sockets its dump can account for and close.
+    os.environ["NCCL_SOCKET_IFNAME"] = _mn_ifname or "lo"
+    os.environ["GLOO_SOCKET_IFNAME"] = _mn_ifname or "lo"
+
+    if _is_multinode():
+        # L2: the multi-node cold-start environment, before vLLM is imported.
+        #
+        # NCCL_NET=Socket keeps EFA out of the image -- its state does not
+        # survive CRIU, and the restore's re-init is the first EFA bring-up.
+        # The pinned aws-ofi-nccl values are what make a restored engine
+        # compute bit-identically to an EFA cold start: NCCL caches its
+        # parameters at the first init in a process, so a socket cold start
+        # would otherwise cache socket-era defaults and the plugin's EFA
+        # values would arrive at the re-init, too late to take effect.
+        from multinode import MULTINODE_COLD_START_ENV, PINNED_OFI_ENV
+        for _k, _v in {**MULTINODE_COLD_START_ENV, **PINNED_OFI_ENV}.items():
+            os.environ[_k] = _v
+        # Readable by the vLLM worker processes, which see the environment but
+        # not this module's globals.  SEMIP_NNODES joins it at ``init``, where
+        # the config is known.
+        os.environ["SEMIP_MULTINODE_IFNAME"] = _mn_ifname
 
     # JIT/compile caches (Triton, vLLM torch.compile, torch inductor,
     # FlashInfer) all produce .so's that get dlopen()'d into the process.
@@ -1207,25 +2980,22 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                            os.environ["FLASHINFER_WORKSPACE_BASE"]):
             os.makedirs(_cache_dir, exist_ok=True)
 
-    semip_logging.init_process()
+    # vLLM's own lines carry the replica tag too, since several replicas share
+    # one pod log. Before vLLM is imported: its logger formats this in once.
+    os.environ.setdefault(
+        "VLLM_LOGGING_PREFIX",
+        f"[r{os.environ.get('SEMIP_REPLICA_ID') or '0'}] ")
+
+    semip_logging.init_process(role="child")
     log = semip_logging.child(instance_id, rank)
-    # First-run path: route this process's stdout/stderr to the shared
-    # per-instance log file from the very first byte.  CRIU later dumps
-    # fd 1/2 as regular-file references to this path.
-    #
-    # Across runs the path baked into the image can be stale: if this
-    # model was instance N when it was dumped, the restored child will
-    # re-open /tmp/instN.log even when the orchestrator has now placed
-    # it at a different instance_id (so its output silently leaks into
-    # another instance's log).  To fix that, the worker sends a
-    # ``rebind_log`` command immediately after CRIU restore (handled in
-    # ``_handle_command`` below), which dup2s fd 1/2 onto the file
-    # matching the *current* instance_id and rebuilds the log adapter.
-    _child_log_path = semip_logging.redirect_stdio_to_instance_file(
-        instance_id)
+    # Route this process's stdout/stderr to the pod log from the very first
+    # byte. The TP ranks inherit both fds, and CRIU dumps them as an external
+    # pipe that the restore hands back with --inherit-fd -- so a restored tree
+    # keeps writing to the new pod's log with nothing to rebind.
+    semip_logging.redirect_stdio_to_pod_log()
 
     # Detach from the controlling terminal before anything is captured.
-    # fd 1/2 are already the per-instance log file (above); fd 0 is still
+    # fd 1/2 are already the pod log (above); fd 0 is still
     # the interactive shell's pts, inherited down the spawn chain.  A pts
     # on fd 0 makes CRIU dump the process as a --shell-job tied to an
     # external terminal/session, which cannot be reattached when the tree
@@ -1307,7 +3077,44 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
         _next_engine_id += 1
         return eid
 
-    def _submit_generate(req_id, prompts, sampling_params_dict):
+    def _add_request(eid, prompt, sp, reasoning_ended=None):
+        """``engine.add_request``, plus the ``reasoning_ended`` AsyncLLM takes.
+
+        LLMEngine has no such argument; AsyncLLM sets it on the processed
+        request, so do the same and hand the engine that request.
+        """
+        if reasoning_ended is None:
+            engine.add_request(eid, prompt, sp)
+            return
+        request = engine.input_processor.process_inputs(
+            eid, prompt, sp, supported_tasks=engine.get_supported_tasks())
+        request.reasoning_ended = reasoning_ended
+        engine.add_request(eid, request, sp)
+
+    def _portable_logprobs(logprobs):
+        """Sample or prompt logprobs in a form that pickles across the pipe.
+
+        Stock vLLM gives one ``{token_id: Logprob}`` per position (``None`` at
+        prompt position 0); the dense prompt-logprobs patch gives a dict of
+        tensors, sent as numpy arrays.
+        """
+        if logprobs is None:
+            return None
+        if isinstance(logprobs, dict):
+            return {key: value.cpu().numpy() if hasattr(value, "cpu") else value
+                    for key, value in logprobs.items()}
+        return [None if pos is None else dict(pos) for pos in logprobs]
+
+    def _join_logprobs(pre, new, pre_count):
+        """Pre-pause sample logprobs followed by the resumed ones."""
+        if new is None:
+            return None
+        if pre is None:
+            return new if pre_count == 0 else None
+        return list(pre) + list(new)
+
+    def _submit_generate(req_id, prompts, sampling_params_dict,
+                         reasoning_ended=None):
         if _dormant and not _paused:
             # Defense-in-depth fail-fast: the orchestrator should
             # never enqueue a generate cmd onto an engine that has
@@ -1367,9 +3174,12 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 "first_token_ts": None,
                 "prompts": list(prompts),
                 "sampling_params": dict(sampling_params_dict),
+                "reasoning_ended": reasoning_ended,
                 "eids": [{"prompt_token_ids": [],
                           "output_token_ids": [],
-                          "output_text": ""}
+                          "output_text": "",
+                          "output_logprobs": None,
+                          "prompt_logprobs": None}
                          for _ in prompts],
             })
             log.info("  submitted req_id=%s  prompts=%s  "
@@ -1382,7 +3192,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
         engine_ids = []
         for prompt in prompts:
             eid = _alloc_engine_id()
-            engine.add_request(eid, prompt, sp)
+            _add_request(eid, prompt, sp, reasoning_ended)
             _engine_to_req[eid] = req_id
             engine_ids.append(eid)
         # `per_eid` tracks the latest cumulative engine output per
@@ -1391,7 +3201,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
         # `_process_step_outputs` on every step.
         per_eid = {eid: {"prompt_token_ids": None,
                          "output_token_ids": [],
-                         "output_text": ""} for eid in engine_ids}
+                         "output_text": "",
+                         "logprobs": None,
+                         "prompt_logprobs": None} for eid in engine_ids}
         _active_reqs[req_id] = {
             "t0": time.perf_counter(),
             "engine_ids": engine_ids,
@@ -1399,6 +3211,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
             "prompts": list(prompts),
             "first_token_ts": None,
             "sampling_params": dict(sampling_params_dict),
+            "reasoning_ended": reasoning_ended,
             "per_eid": per_eid,
         }
         log.info("  submitted req_id=%s  prompts=%s",
@@ -1433,10 +3246,16 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                         and output.prompt_token_ids):
                     per_eid_state["prompt_token_ids"] = list(
                         output.prompt_token_ids)
+                if (per_eid_state["prompt_logprobs"] is None
+                        and output.prompt_logprobs is not None):
+                    per_eid_state["prompt_logprobs"] = output.prompt_logprobs
                 if output.outputs:
                     per_eid_state["output_token_ids"] = list(
                         output.outputs[0].token_ids)
                     per_eid_state["output_text"] = output.outputs[0].text
+                    # A reference, not a copy: cumulative, and only
+                    # converted if a pause snapshots it.
+                    per_eid_state["logprobs"] = output.outputs[0].logprobs
 
             if not output.finished:
                 continue
@@ -1455,9 +3274,35 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
 
                 if pre_completion is not None:
                     eid_index = {e: i for i, e in enumerate(entry["engine_ids"])}
+                    pre_ids = entry["pre_pause_token_ids"]
+                    orig_prompt_ids = entry["original_prompt_token_ids"]
                     outputs = [
                         [pre_text[eid_index[r.request_id]] + o.text
                          for o in r.outputs]
+                        for r in ordered]
+                    pre_lps = entry["pre_pause_logprobs"]
+                    orig_prompt_lps = entry["original_prompt_logprobs"]
+                    completion_token_ids = [
+                        [pre_ids[eid_index[r.request_id]] + list(o.token_ids)
+                         for o in r.outputs]
+                        for r in ordered]
+                    completion_logprobs = [
+                        [_join_logprobs(pre_lps[eid_index[r.request_id]],
+                                        _portable_logprobs(o.logprobs),
+                                        pre_completion[eid_index[r.request_id]])
+                         for o in r.outputs]
+                        for r in ordered]
+                    # A request paused before its first step has no recorded
+                    # prompt ids, and nothing generated either, so the prompt
+                    # the engine just ran is the original one.
+                    prompt_token_ids = [
+                        orig_prompt_ids[eid_index[r.request_id]]
+                        or list(r.prompt_token_ids or [])
+                        for r in ordered]
+                    prompt_logprobs = [
+                        orig_prompt_lps[eid_index[r.request_id]]
+                        if orig_prompt_ids[eid_index[r.request_id]]
+                        else _portable_logprobs(r.prompt_logprobs)
                         for r in ordered]
                     completion_tokens = sum(
                         len(o.token_ids)
@@ -1466,6 +3311,17 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                     prompt_tokens = sum(orig_prompt_tokens)
                 else:
                     outputs = [[o.text for o in r.outputs] for r in ordered]
+                    completion_token_ids = [
+                        [list(o.token_ids) for o in r.outputs]
+                        for r in ordered]
+                    completion_logprobs = [
+                        [_portable_logprobs(o.logprobs) for o in r.outputs]
+                        for r in ordered]
+                    prompt_token_ids = [
+                        list(r.prompt_token_ids or []) for r in ordered]
+                    prompt_logprobs = [
+                        _portable_logprobs(r.prompt_logprobs)
+                        for r in ordered]
                     prompt_tokens = sum(
                         len(r.prompt_token_ids) for r in ordered)
                     completion_tokens = sum(
@@ -1479,6 +3335,13 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 info = {
                     "req_id": req_id,
                     "outputs": outputs,
+                    # [ids per prompt] and [[ids per sample] per prompt],
+                    # shaped like ``outputs``.
+                    "prompt_token_ids": prompt_token_ids,
+                    "completion_token_ids": completion_token_ids,
+                    # The same shapes; ``None`` where none were requested.
+                    "prompt_logprobs": prompt_logprobs,
+                    "completion_logprobs": completion_logprobs,
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "num_cached_tokens": cached_tokens,
@@ -1532,6 +3395,124 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
         while engine is not None and engine.has_unfinished_requests():
             _process_step_outputs(engine.step())
 
+    # The five rungs the post-restore pass drives to verify the rebind.  Still
+    # wave 9's ladder: it is no longer a warmup, but keeping the shapes fixed
+    # keeps its timings comparable against every earlier wave.
+    _REBIND_VERIFY_SIZES = (1, 2, 4, 8, 16)
+
+    def _capture_sizes():
+        """Every batch size vLLM captured a graph for, ascending.
+
+        The warm pass drives this rather than a hand-picked ladder. Instantiation
+        is already shape-agnostic -- ``instantiate_captured_graphs`` walks every
+        entry of every wrapper -- but JIT is not: a kernel is only compiled by
+        running the shape that dispatches to it, and the dispatch demonstrably
+        moves with batch size (the CuTeDSL delta-rule kernel first appears
+        between decode 8 and 16, while the preserved graphs bake the Triton one).
+        Warming five of fifty-one shapes would just relocate the first-run
+        compile from the restore warmup into live traffic.
+
+        Falls back to the old ladder if the config cannot be read: a warm pass
+        over the wrong sizes is still better than none, and this must not be
+        able to fail a cold start.
+        """
+        try:
+            cc = llm.llm_engine.vllm_config.compilation_config
+            sizes = sorted({int(s) for s in
+                            (cc.cudagraph_capture_sizes or []) if int(s) > 0})
+            if sizes:
+                return tuple(sizes)
+        except Exception:  # noqa: BLE001
+            log.warning("  could not read cudagraph_capture_sizes; warming the "
+                        "verify rungs only", exc_info=True)
+        return _REBIND_VERIFY_SIZES
+
+    def _ladder_plan(sizes):
+        """The original warmup's ``(nreq, toklen)`` pairs for a set of sizes.
+
+        Kept exactly as wave 9 ran it -- a 64-token budget per rung, capped at
+        20 tokens per request -- because the restore path's timings are only
+        comparable against the earlier waves if its rungs are identical.
+        """
+        return [(n, max(1, min(64 // n, 20))) for n in sizes]
+
+    def _warm_plan(sizes):
+        """``(nreq, toklen)`` pairs that reach every captured shape on both axes.
+
+        The size sweep covers all the decode shapes, and -- because the token
+        budget collapses toklen to 1 once nreq passes 64 -- most of the mixed
+        prefill ones too. What it cannot reach is the small end: at nreq below
+        40 the budget yields 20-, 40- and 64-token prefills, so a 1-, 2-, 4-,
+        8-, 16- or 32-token mixed batch never occurs. Those are exactly the
+        shapes a single short request lands on, so leaving them cold would move
+        the first-run JIT out of the warmup and into live traffic, which is the
+        failure this whole change exists to remove.
+
+        A single-request pass closes them. Prompts are held a little under
+        max_model_len so the two sampled tokens still fit.
+        """
+        plan = _ladder_plan(sizes)
+
+        def _pad(n):
+            for s in sizes:
+                if s >= n:
+                    return s
+            return None
+
+        covered = {_pad(n * t) for n, t in plan}
+        try:
+            budget = int(llm.llm_engine.vllm_config.model_config.max_model_len) - 4
+        except Exception:  # noqa: BLE001
+            budget = 0
+        missed = [s for s in sizes if s not in covered]
+        reachable = [s for s in missed if 0 < s <= budget]
+        plan += [(1, s) for s in reachable]
+        if missed:
+            log.info("  mixed shapes the size sweep misses: %s; warming %s "
+                     "single-request (budget=%d tokens)",
+                     missed, reachable, budget)
+        return plan
+
+    def _drive_warmup_ladder(phase, plan):
+        """Drive a set of batch shapes through the engine.
+
+        Runs on both sides of the checkpoint, doing a different job on each.
+        Before the dump it is what makes the image warm: each rung forces the
+        lazy first-replay instantiate of its shapes and the first-run JIT of the
+        kernels only that shape reaches, so the restore finds both done. After a
+        restore it builds nothing -- the warm image already carries the execs --
+        and serves as the first collective traffic after the rebind, which is
+        what would catch a rebind that read back clean but does not replay.
+
+        Instrumented per rung. This loop, not the rebind, is where the 302 s
+        hangs happened: a rank wedges, the peer starves in shm_broadcast, and the
+        stall surfaces as "RPC call to sample_tokens timed out" because
+        engine.step() samples. A rung that never completes leaves its "start"
+        line as the last one rather than nothing at all. Those hangs were a cold
+        image paying for its instantiate here, four ranks deep; warming the dump
+        is what removed them.
+
+        Callers census either side of this, never between rungs: a collective_rpc
+        in the gaps would drop a fresh synchronisation point immediately before
+        nreq=16, the rung the hang lives on, and perturbing the one measurement
+        we are trying to take is not worth the detail.
+        """
+        from vllm import SamplingParams
+        for nreq, toklen in plan:
+            log.info("    %s nreq=%d toklen=%d start", phase, nreq, toklen)
+            _t_warm = time.monotonic()
+            for _ in range(nreq):
+                engine.add_request(
+                    _alloc_engine_id(),
+                    {"prompt_token_ids": [0] * toklen},
+                    SamplingParams(max_tokens=2, ignore_eos=True))
+            _steps = 0
+            while engine.has_unfinished_requests():
+                engine.step()
+                _steps += 1
+            log.info("    %s nreq=%d OK (%.3fs, %d steps)",
+                     phase, nreq, time.monotonic() - _t_warm, _steps)
+
     def _snapshot_active_into_saved() -> tuple[int, int]:
         """Snapshot every active sub-request into ``_saved_requests`` and
         abort it in the engine.  Mirrors the pause-time snapshot path,
@@ -1554,16 +3535,37 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 raise RuntimeError(
                     f"snapshot with n={n_branch} not supported "
                     "(n=1 only)")
+            # A request already resumed once runs on prompt + pre-pause
+            # output; fold that back apart so a second resume re-prefills
+            # the same sequence and reports the whole completion.
+            pre_ids = entry.get("pre_pause_token_ids")
+            pre_text = entry.get("pre_pause_text")
+            pre_lps = entry.get("pre_pause_logprobs")
+            orig_prompt_ids = entry.get("original_prompt_token_ids")
+            orig_prompt_lps = entry.get("original_prompt_logprobs")
             eids_data = []
-            for eid in entry["engine_ids"]:
+            for i, eid in enumerate(entry["engine_ids"]):
                 per_eid_state = entry["per_eid"].get(eid, {})
+                prompt_ids = list(per_eid_state.get("prompt_token_ids") or [])
+                output_ids = list(per_eid_state.get("output_token_ids") or [])
+                output_text = per_eid_state.get("output_text", "")
+                output_lps = _portable_logprobs(per_eid_state.get("logprobs"))
+                prompt_lps = _portable_logprobs(
+                    per_eid_state.get("prompt_logprobs"))
+                if pre_ids is not None:
+                    if orig_prompt_ids[i]:
+                        prompt_ids = list(orig_prompt_ids[i])
+                        prompt_lps = orig_prompt_lps[i]
+                    output_lps = _join_logprobs(
+                        pre_lps[i], output_lps, len(pre_ids[i]))
+                    output_ids = list(pre_ids[i]) + output_ids
+                    output_text = pre_text[i] + output_text
                 eids_data.append({
-                    "prompt_token_ids": list(
-                        per_eid_state.get("prompt_token_ids") or []),
-                    "output_token_ids": list(
-                        per_eid_state.get("output_token_ids") or []),
-                    "output_text":
-                        per_eid_state.get("output_text", ""),
+                    "prompt_token_ids": prompt_ids,
+                    "output_token_ids": output_ids,
+                    "output_text": output_text,
+                    "output_logprobs": output_lps,
+                    "prompt_logprobs": prompt_lps,
                 })
             saved.append({
                 "req_id": req_id,
@@ -1571,6 +3573,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 "first_token_ts": entry["first_token_ts"],
                 "prompts": list(entry.get("prompts") or []),
                 "sampling_params": dict(sp_dict),
+                "reasoning_ended": entry.get("reasoning_ended"),
                 "eids": eids_data,
             })
 
@@ -1591,7 +3594,6 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
     def _handle_command(cmd, kwargs):
         nonlocal llm, engine
         nonlocal _paused, _dormant
-        nonlocal log, _child_log_path
 
         error = None
         info = {}
@@ -1616,6 +3618,48 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                     os.environ["NCCL_NVLS_ENABLE"] = "0"
                     os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
                     os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
+                    # FlashInfer allreduce has to be off for the same reason,
+                    # and it is the rebind's load-bearing assumption rather
+                    # than a preference: `ca_graph_rebind` finds the pointers
+                    # it must rewrite by matching `cross_device_reduce` kernel
+                    # nodes, and FlashInfer's allreduce is not one, so its
+                    # workspace addresses ride into the image unrebindable.
+                    # This was true by default until vLLM 0.30 flipped
+                    # VLLM_ALLREDUCE_USE_FLASHINFER to True, at which point
+                    # every TP>1 restore patched 0 nodes of 2142 graphs and
+                    # died on an illegal memory access. Pin it rather than
+                    # inherit it.
+                    os.environ["VLLM_ALLREDUCE_USE_FLASHINFER"] = "0"
+                    # ...and that flag is not enough, which cost this ticket
+                    # five bugs and twelve waves. It gates `cuda_communicator`
+                    # building a FlashInferAllReduce; it does NOT gate
+                    # `get_fi_ar_workspace`. Job 14f13e5a caught the real
+                    # caller: fp8 models route through the DeepSeek-V3.2 layer
+                    # path, which calls the getter directly --
+                    #   deepseek_v32/nvidia/model.py:158 fused_allreduce_rms_norm
+                    #     common/ops/fused_allreduce_rms_norm.py:41 _can_use_flashinfer
+                    #       fused_allreduce_gemma_rms_norm.py:91   get_fi_ar_workspace
+                    # -- during `determine_available_memory`'s
+                    # `capture_model(profile_only=True)`. So the backends log
+                    # honestly reads ['CUSTOM', 'PYNCCL'] while an MNNVL
+                    # multicast workspace is built anyway, and that is the one
+                    # class of memory `cuCheckpointProcess*` cannot carry:
+                    # the restore's `cuMulticastAddDevice` returns
+                    # CUDA_ERROR_INVALID_DEVICE and `reinit_nccl` dies.
+                    #
+                    # Refusing the allocation is the fix. `get_fi_ar_workspace`
+                    # returning None is a supported outcome -- it is what every
+                    # caller already gets on a GPU without NVSwitch multicast,
+                    # and `_can_use_flashinfer` falls back to the unfused path.
+                    # With it, GLM-5.3 TP=8 completes the round trip for the
+                    # first time on 0.30 (job 14f13e5a, zero failures).
+                    #
+                    # `setdefault`, not assignment: unlike the pins above this
+                    # one keeps an escape hatch, because a future driver or
+                    # FlashInfer that can rebuild multicast would want the
+                    # workspace back. Put SEMIP_SUPPRESS_FI_AR_WORKSPACE=0 in
+                    # the payload's extra_env to get the old behaviour.
+                    os.environ.setdefault("SEMIP_SUPPRESS_FI_AR_WORKSPACE", "1")
 
                 # Per-model env vars: vllm_config["_env"] is a reserved
                 # mapping applied to os.environ before vLLM is imported,
@@ -1647,6 +3691,17 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                         log.warning(
                             "ignoring reserved env key in _env: %s", k)
                         continue
+                    if v == "":
+                        # An empty value means *unset*, not "set to empty".
+                        # Without this there is no way for a caller to take a
+                        # variable back off that something else put on -- and
+                        # for a few of them, NCCL_NET among them, "absent" and
+                        # "empty" are different answers: absent lets NCCL pick
+                        # its plugin, which is how an EFA cold start differs
+                        # from the socket one a multi-node dump needs.
+                        os.environ.pop(k, None)
+                        log.info("  _env unset %s", k)
+                        continue
                     os.environ[k] = str(v)
 
                 # Force vLLM plugins (e.g. arctic_inference) to load
@@ -1661,6 +3716,63 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 # `from vllm.plugins import ...` form.
                 from vllm.plugins import load_general_plugins
                 load_general_plugins()
+                if _is_multinode():
+                    # L1: node identity reaches the engine only here, on this
+                    # private copy.  The caller's dict -- the one hashed into
+                    # the image cache key and written to meta.json -- keeps
+                    # only ``nnodes``, so every node-partition derives the same key
+                    # and a restored engine can rendezvous somewhere new.
+                    vllm_config["node_rank"] = _MULTINODE["node_rank"]
+                    vllm_config["master_addr"] = _MULTINODE["master_addr"]
+                    vllm_config["master_port"] = _MULTINODE["master_port"]
+                    vllm_config.setdefault("distributed_executor_backend", "mp")
+                    # G3: the keep-graph machinery runs in the worker
+                    # processes vLLM is about to spawn, which cannot see this
+                    # module's globals.  It only serves the rebind path, so at
+                    # nnodes > 1 it builds execs for graphs the dump is about
+                    # to destroy; the gate travels in the environment.
+                    os.environ["SEMIP_NNODES"] = str(
+                        int(vllm_config.get("nnodes", 2) or 2))
+                    log.info(
+                        "  multi-node: node_rank=%s master=%s:%s ifname=%s "
+                        "nnodes=%s", _MULTINODE["node_rank"],
+                        _MULTINODE["master_addr"], _MULTINODE["master_port"],
+                        _MULTINODE["ifname"], os.environ["SEMIP_NNODES"])
+                if int(vllm_config.get("node_rank", 0) or 0) > 0:
+                    # Follower node: only this node's ranks, driven by the
+                    # leader's executor. No LLM and no engine here, so every
+                    # collective command must come from the leader.
+                    from vllm.config import CompilationConfig
+                    from vllm.engine.arg_utils import EngineArgs
+                    from vllm.usage.usage_lib import UsageContext
+                    from vllm.v1.executor.multiproc_executor import (
+                        MultiprocExecutor)
+                    _fkw = dict(vllm_config)
+                    _fkw.setdefault("seed", 0)
+                    _fkw.setdefault("disable_log_stats", True)
+                    if isinstance(_fkw.get("compilation_config"), dict):
+                        _fkw["compilation_config"] = CompilationConfig(
+                            **_fkw["compilation_config"])
+                    # The usage context picks scheduler defaults such as
+                    # max_num_batched_tokens; it has to be the leader's
+                    # (LLM_CLASS) or the node-partitions profile different shapes
+                    # and deadlock in their first mismatched collective.
+                    _fvc = EngineArgs(**_fkw).create_engine_config(
+                        usage_context=UsageContext.LLM_CLASS, headless=True)
+                    _FOLLOWER["executor"] = MultiprocExecutor(
+                        _fvc, monitor_workers=False)
+                    info["pid"] = os.getpid()
+                    info["follower"] = True
+                    return error, info
+                # The patches InferenceWorker applies before a cold engine,
+                # which the vLLM plugin does not: without them extra_args'
+                # stop-token sequences are ignored, xgrammar can sample a
+                # stop token its grammar rejects, and dense prompt logprobs,
+                # spec-decode grammar checks and the DFlash2 NaN fixes are
+                # missing. Every one is idempotent.
+                from arctic_platform.inference.vllm.required_patches import (
+                    apply_required_vllm_patches)
+                apply_required_vllm_patches()
                 from vllm import LLM
                 llm = LLM(**vllm_config)
                 engine = llm.llm_engine
@@ -1702,8 +3814,79 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
 
                 # Record the cold-start CustomAllreduce snapshot that the
                 # post-reinit graph rebind rewrites against (TP>=2, reuse).
-                if _tp >= 2:
-                    llm.collective_rpc(_semip_prepare_graph_reuse_snapshot)
+                #
+                # G3: none of this block survives contact with a multi-node
+                # dump.  The snapshot records CustomAllreduce state, which vLLM
+                # does not even build across nodes; the warm pass builds execs
+                # for graphs that `drop_graphs` destroys a few steps later; and
+                # the COLD IMAGE census asks whether the restored engine will
+                # replay or rebuild, when it is going to capture from scratch.
+                if _tp >= 2 and _is_multinode():
+                    log.info(
+                        "  multi-node: graph reuse snapshot, warm pass and "
+                        "COLD IMAGE census skipped -- the graphs are dropped "
+                        "before destroy_nccl and recaptured after the restore")
+                elif _tp >= 2:
+                    # The return value used to be dropped. It carries this
+                    # rank's meta_ptrs and the cold-start graph inventory --
+                    # the only dump-side view of what goes into the image, and
+                    # the counterpart to every post-restore dict we have been
+                    # reading. Logged per rank rather than summarised: the four
+                    # ranks are what the rebind later has to agree about.
+                    for _i, _snap in enumerate(llm.collective_rpc(
+                            _semip_prepare_graph_reuse_snapshot)):
+                        log.info("  graph reuse snapshot rank=%d: %s",
+                                 _i, _snap)
+                    if engine is None:
+                        engine = llm.llm_engine
+                    # Warm the image while the process is still healthy, so the
+                    # restore inherits built execs and compiled kernels instead
+                    # of building them four ranks deep in the warmup ladder.
+                    # The per-rank instantiate already ran inside
+                    # compile_or_warm_up_model; this is the other half, the part
+                    # that needs the engine and so cannot live in the worker.
+                    # Unconditional since 2026-09-24: this is part of `init`,
+                    # not a knob.  A cold image is not a supported artefact.
+                    _sizes = _capture_sizes()
+                    _plan = _warm_plan(_sizes)
+                    log.info("  warming %d captured shape(s) in %d rung(s)",
+                             len(_sizes), len(_plan))
+                    _t_warm_all = time.monotonic()
+                    try:
+                        _drive_warmup_ladder("dump", _plan)
+                        log.info("  warm pass done in %.1fs",
+                                 time.monotonic() - _t_warm_all)
+                    except Exception:
+                        # A rung that fails costs warmth, not the image. The
+                        # census below reports how far it got, and a
+                        # partially warm image still beats no image at all
+                        # -- this runs during init, so raising here would
+                        # mean the dump never happens.
+                        log.warning(
+                            "  warm pass failed after %.1fs; dumping a "
+                            "partially warm image",
+                            time.monotonic() - _t_warm_all, exc_info=True)
+                        _drain_engine()
+                    # The invariant, checked rather than merely printed. Every
+                    # captured graph must hold an exec before the checkpoint;
+                    # a cold image restores into the 302 s warmup hang, and
+                    # downstream a key minted from one is indistinguishable
+                    # from a warm one. Loud rather than fatal because the dump
+                    # has not happened yet and a partially warm image is still
+                    # worth more than no image -- but nothing should be able to
+                    # publish one quietly.
+                    _cold = [c for c in _log_graph_census(llm, log, "dump:warm")
+                             if (c.get("n_uninstantiated") or 0) > 0]
+                    if _cold:
+                        log.error(
+                            "  COLD IMAGE: %d of %d rank(s) still hold "
+                            "uninstantiated graphs after the warm pass %s -- "
+                            "do not publish a key from this dump",
+                            len(_cold), _tp,
+                            [(c.get("rank", "?"), c.get("n_uninstantiated"))
+                             for c in _cold])
+                    log.info("  compile cache before dump: %s",
+                             _compile_cache_fingerprint())
 
             elif cmd == "attach":
                 if llm is None:
@@ -1797,6 +3980,20 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 info["chunk_size"] = max(chunk_bytes, default=0)
                 log.info("  planned <= %d chunk(s) per worker (total %.2f GiB)",
                          info["n_chunks"], info["bytes"] / 2**30)
+                # Predicted against actual, per rank.  Without this the only
+                # record of the config budget overshooting free VRAM was the
+                # OOM traceback itself, 22 minutes into a restore.
+                free_bytes = [r["free_bytes"] for r in results]
+                clamped_ranks = [i for i, r in enumerate(results) if r["clamped"]]
+                info["free_bytes_per_worker"] = free_bytes
+                info["clamped_workers"] = clamped_ranks
+                log.info("  staging: host asked %.2f GiB, tightest device free "
+                         "%.2f GiB, chunk %.2f GiB%s",
+                         (mb if mb else info["bytes"]) / 2**30,
+                         min(free_bytes, default=0) / 2**30,
+                         min(chunk_bytes, default=0) / 2**30,
+                         (f" -- clamped on rank(s) {clamped_ranks}"
+                          if clamped_ranks else ""))
 
             elif cmd == "restore_weights":
                 if llm is None:
@@ -1864,6 +4061,10 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                     new_engine_ids = []
                     pre_pause_completion = []
                     pre_pause_text = []
+                    pre_pause_token_ids = []
+                    pre_pause_logprobs = []
+                    original_prompt_token_ids = []
+                    original_prompt_logprobs = []
                     original_prompt_tokens = []
                     all_finished_outputs = []
 
@@ -1900,11 +4101,21 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                         sp = SamplingParams(**sp_kwargs)
 
                         new_eid = _alloc_engine_id()
-                        engine.add_request(new_eid, prompt_obj, sp)
+                        # Once tokens were generated the engine has to read
+                        # the reasoning state off the re-prefilled prompt.
+                        _add_request(new_eid, prompt_obj, sp,
+                                     None if output_tids
+                                     else record.get("reasoning_ended"))
                         _engine_to_req[new_eid] = req_id
                         new_engine_ids.append(new_eid)
                         pre_pause_completion.append(len(output_tids))
                         pre_pause_text.append(output_text)
+                        pre_pause_token_ids.append(list(output_tids))
+                        pre_pause_logprobs.append(
+                            eid_data.get("output_logprobs"))
+                        original_prompt_token_ids.append(list(prompt_tids))
+                        original_prompt_logprobs.append(
+                            eid_data.get("prompt_logprobs"))
 
                     if not new_engine_ids:
                         # Every branch was already finished pre-pause;
@@ -1916,6 +4127,15 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                         synth_info = {
                             "req_id": req_id,
                             "outputs": [[t] for t in all_finished_outputs],
+                            "prompt_token_ids": [
+                                list(d["prompt_token_ids"]) for d in eids_data],
+                            "completion_token_ids": [
+                                [list(d["output_token_ids"])]
+                                for d in eids_data],
+                            "prompt_logprobs": [
+                                d.get("prompt_logprobs") for d in eids_data],
+                            "completion_logprobs": [
+                                [d.get("output_logprobs")] for d in eids_data],
                             "prompt_tokens": prompt_tokens,
                             "completion_tokens": completion_tokens,
                             "num_cached_tokens": 0,
@@ -1935,7 +4155,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                     new_per_eid = {
                         new_eid: {"prompt_token_ids": None,
                                    "output_token_ids": [],
-                                   "output_text": ""}
+                                   "output_text": "",
+                                   "logprobs": None,
+                                   "prompt_logprobs": None}
                         for new_eid in new_engine_ids
                     }
                     _active_reqs[req_id] = {
@@ -1945,9 +4167,14 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                         "prompts": list(prompts_orig),
                         "first_token_ts": record["first_token_ts"],
                         "sampling_params": dict(sp_dict),
+                        "reasoning_ended": record.get("reasoning_ended"),
                         "per_eid": new_per_eid,
                         "pre_pause_completion": pre_pause_completion,
                         "pre_pause_text": pre_pause_text,
+                        "pre_pause_token_ids": pre_pause_token_ids,
+                        "pre_pause_logprobs": pre_pause_logprobs,
+                        "original_prompt_token_ids": original_prompt_token_ids,
+                        "original_prompt_logprobs": original_prompt_logprobs,
                         "original_prompt_tokens": original_prompt_tokens,
                     }
                     restored += 1
@@ -1979,9 +4206,37 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                         wr = llm.collective_rpc(_prepare_worker_dump)
                         info["worker_closed_fds"] = [r["closed_fds"] for r in wr]
                         info["worker_unmapped"] = [r["unmapped"] for r in wr]
+                        # No `worker_closed_listeners`: the TP>1 path closes
+                        # nothing, and an always-empty field reads like a close
+                        # that found no work rather than one that is not
+                        # attempted.  The census below is what this image
+                        # carries, and it is the thing a restore failure asks
+                        # about.
+                        info["worker_listener_diag"] = [
+                            r.get("listener_diag", {}) for r in wr]
                     except Exception as _e:
                         log.warning(
                             "  prepare_criu_dump: worker dump prep error: %s", _e)
+
+                if llm is not None and len(gpus) > 1 and _MQ_PARK:
+                    import mq_plane
+                    try:
+                        parked = mq_plane.park(
+                            llm, _MQ_PARK["dir"],
+                            lambda fn, args: _collective_rpc_with_timeout(
+                                llm, fn, args, log=log),
+                            ranks=_MQ_PARK.get("ranks"))
+                        info["mq_park"] = {"ok": True,
+                                           "dir": _MQ_PARK["dir"],
+                                           "parked": parked["parked"]}
+                        log.info("  prepare_criu_dump: message queues parked "
+                                 "in %s for ranks %s", _MQ_PARK["dir"],
+                                 parked["parked"])
+                    except Exception as _e:  # noqa: BLE001
+                        info["mq_park"] = {"ok": False,
+                                           "error": f"{type(_e).__name__}: {_e}"}
+                        log.error("  prepare_criu_dump: message-queue park "
+                                  "failed: %s", _e)
 
                 closed_fds = []
                 unmapped = []
@@ -1997,35 +4252,85 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                     log.warning("  prepare_criu_dump: dist teardown error: %s", _e)
 
                 if destroyed_pg:
-                    store_names = ("pt_tcpstore", "pt_nccl_watchdg",
-                                   "pt_nccl_heartbt")
-                    for _attempt in range(50):
-                        alive = []
-                        for tid_name in os.listdir(f"/proc/{pid}/task"):
-                            try:
-                                comm = open(
-                                    f"/proc/{pid}/task/{tid_name}/comm"
-                                ).read().strip()
-                                if any(comm.startswith(s)
-                                       for s in store_names):
-                                    alive.append(f"{tid_name}({comm})")
-                            except (OSError, ValueError):
-                                pass
-                        if not alive:
-                            log.info("  prepare_criu_dump: store threads "
-                                     "exited after %d polls", _attempt)
-                            break
-                        time.sleep(0.05)
+                    _thr_ok, _thr_alive, _polls = _wait_store_threads_exit(pid)
+                    if _thr_ok:
+                        log.info("  prepare_criu_dump: store threads "
+                                 "exited after %d polls", _polls)
                     else:
                         log.warning("  prepare_criu_dump: store threads "
-                                    "still alive: %s", alive)
+                                    "still alive: %s", _thr_alive)
+
+                # Complication 15, driver side -- **the TP=1 path**, and the only
+                # one that still closes anything.  Only reachable once the group
+                # is down, hence the gate: a failed teardown leaves sockets that
+                # may still be live, and those must be left alone.  Here the
+                # driver *is* the process holding the listeners and its own
+                # destroy_process_group above is clean, because there was no
+                # abort to make it raise.
+                #
+                # Measured at TP=1 on 35B: seven ephemeral loopback listeners,
+                # all on this process's fds, `pt_tcpstore` and fourteen
+                # `pt_gloo_runloop` threads beside them, and **no RAS listener
+                # anywhere** -- NCCL does not start its RAS subsystem for a
+                # single rank.  So this set is torch's, entirely, and closing it
+                # is what keeps criu from rebinding seven ports the restore
+                # throws away.  The restore that followed was clean: 0 NCCL
+                # warnings and an 8 KB restore-side log.
+                #
+                # At TP>1 the ranks are separate processes handled in
+                # _prepare_worker_dump, which closes nothing, and the driver
+                # holds no listeners at all.
+                #
+                # `_PG_ABORTED` is accepted alongside destroyed_pg, but it is
+                # False here by construction: _destroy_nccl is a collective_rpc
+                # target, so it sets the flag in the workers and never in this
+                # process.  It is listed because the condition should say what
+                # makes the close safe, not what happens to be true today.
+                closed_listeners = []
+                listener_diag = {"destroyed_pg": destroyed_pg,
+                                 "pg_aborted": _PG_ABORTED,
+                                 "store_threads": _live_store_threads()}
+                try:
+                    import torch.distributed as _dist
+                    listener_diag["dist_initialized"] = bool(
+                        _dist.is_initialized())
+                except Exception as _e:  # noqa: BLE001
+                    listener_diag["dist_initialized"] = f"unreadable: {_e!r}"
+                try:
+                    if destroyed_pg or _PG_ABORTED:
+                        closed_listeners, _skipped = _close_loopback_listeners()
+                    else:
+                        # Refused, so report the cost of refusing: these are the
+                        # ports the image is about to demand back on every
+                        # restore.  An empty `closed_listeners` otherwise cannot
+                        # be told from a refused one, and the two mean opposite
+                        # things.
+                        _eph, _fix = _loopback_listeners()
+                        listener_diag["would_close"] = [t for _, t in _eph]
+                        _skipped = [t for _, t in _fix]
+                    # A fixed loopback port left in the image on purpose.  There
+                    # are none at TP=1 today; this is the line that would say so
+                    # if RAS ever did appear on this path.
+                    if _skipped:
+                        listener_diag["skipped_fixed_port"] = _skipped
+                except Exception as _e:  # noqa: BLE001
+                    listener_diag["error"] = repr(_e)
+                info["closed_listeners"] = closed_listeners
+                info["listener_diag"] = listener_diag
+                if closed_listeners:
+                    log.info("  prepare_criu_dump: closed %d orphaned "
+                             "loopback listener(s), so the image records no "
+                             "port to re-bind: %s",
+                             len(closed_listeners),
+                             ", ".join(closed_listeners))
+                else:
+                    log.info("  prepare_criu_dump: closed no loopback "
+                             "listeners; gate was %s", listener_diag)
 
                 pipe_fd = kwargs.get("pipe_fd", -1)
-                # stdout/stderr were already pointed at the per-instance
-                # log file by redirect_stdio_to_instance_file at process
-                # startup, so CRIU dumps them as regular files pointing
-                # to that path -- restoring re-opens the same path and
-                # the restored child keeps logging there.
+                # stdout/stderr are the pod-log pipe (redirect_stdio_to_pod_log
+                # at startup), which CRIU dumps as an external pipe and the
+                # restore hands back with --inherit-fd.
 
                 keep_prefixes = ("/dev/nvidia", "/dev/shm", "anon_inode:",
                                  "socket:", "pipe:")
@@ -2055,12 +4360,36 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                                         ctypes.c_size_t(length))
                             unmapped.append(f"0x{start:x}")
 
-                import glob as _criu_glob
-                for _sem in _criu_glob.glob("/dev/shm/sem.*"):
+                # Only this tree's semaphores: under spawn a SemLock keeps its
+                # name for its whole life, and another replica's live Instance
+                # reopens its queues' semaphores by name in every worker it
+                # spawns -- a pod-wide glob here broke those.
+                info["removed_sem"] = _unlink_paths(
+                    _own_shm_paths(_tree_pids(pid), _SEM_PREFIXES))
+
+                # Reap our own dead children before the tree is frozen.  This
+                # process setsid()s at startup, so its pid names both its
+                # process group and its session, and every child it ever
+                # forked holds a reference on that pid -- zombies included,
+                # because a corpse keeps those links.  Any stray left here
+                # therefore keeps the leader's id allocated after the dump
+                # kills the tree, and the restore cannot place the leader back
+                # at it: clone3(set_tid) fails EEXIST on an id that /proc shows
+                # as free.  Complements the worker's post-dump sweep, which
+                # only reaches strays still alive at dump time; these are
+                # already dead, so they are not in the image either way and
+                # reaping them only drops references.  WNOHANG throughout, so
+                # a live TP worker -- part of the tree being dumped -- is never
+                # waited on.
+                reaped_strays = []
+                while True:
                     try:
-                        os.remove(_sem)
+                        _stray, _ = os.waitpid(-1, os.WNOHANG)
                     except OSError:
-                        pass
+                        break          # ECHILD: nothing left to collect
+                    if _stray == 0:
+                        break          # children remain, but all still alive
+                    reaped_strays.append(_stray)
 
                 remaining_threads = []
                 for tid_name in os.listdir(f"/proc/{pid}/task"):
@@ -2076,89 +4405,250 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 info["unmapped"] = unmapped
                 info["destroyed_pg"] = destroyed_pg
                 info["remaining_threads"] = remaining_threads
+                info["reaped_strays"] = reaped_strays
                 log.info("  prepare_criu_dump: fds=%s, unmapped=%s, "
-                         "destroyed_pg=%s, remaining_threads=%s",
+                         "destroyed_pg=%s, remaining_threads=%s, "
+                         "reaped_strays=%s",
                          closed_fds, unmapped, destroyed_pg,
-                         remaining_threads)
-
-            elif cmd == "rebind_log":
-                # Sent by the worker right after CRIU restore when the
-                # current instance_id differs from the one baked into the
-                # image: re-dup2 stdout/stderr onto /tmp/inst{new_id}.log
-                # and rebuild the log adapter so subsequent records carry
-                # the correct i{N} scope.
-                new_id = kwargs["instance_id"]
-                _child_log_path = semip_logging.redirect_stdio_to_instance_file(
-                    new_id)
-                log = semip_logging.child(new_id, rank)
-                info["instance_id"] = new_id
-                info["path"] = _child_log_path
+                         remaining_threads, reaped_strays)
 
             elif cmd == "destroy_nccl":
                 if llm is None:
                     raise RuntimeError("destroy_nccl requires init first")
-                graph_mode = kwargs.get("graph_mode")
-                results = llm.collective_rpc(_destroy_nccl, args=(graph_mode,))
-                info["graph_mode"] = graph_mode
+                results = llm.collective_rpc(_destroy_nccl)
                 if all(r is None for r in results):
-                    log.info("  destroy_nccl(%s): TP1 no-op", graph_mode)
+                    log.info("  destroy_nccl: TP1 no-op")
                 else:
-                    log.info("  NCCL destroyed across %d workers (graph_mode=%s)",
-                             len(results), graph_mode)
+                    log.info("  NCCL destroyed across %d workers", len(results))
+
+            elif cmd == "arm_mq_park":
+                _MQ_PARK.clear()
+                _MQ_PARK.update(dir=kwargs["unpark_dir"],
+                                ranks=kwargs.get("ranks"))
+                info["mq_park"] = dict(_MQ_PARK)
+
+            elif cmd == "park_mq":
+                if llm is None:
+                    raise RuntimeError("park_mq requires init first")
+                import mq_plane
+                parked = mq_plane.park(
+                    llm, kwargs["unpark_dir"],
+                    lambda fn, args: _collective_rpc_with_timeout(
+                        llm, fn, args, kwargs.get("timeout_s"), log),
+                    ranks=kwargs.get("ranks"))
+                info["parked"] = parked["parked"]
+                log.info("  message queues parked for ranks %s",
+                         parked["parked"])
+
+            elif cmd == "unpark_mq":
+                if llm is None:
+                    raise RuntimeError("unpark_mq requires init first")
+                import mq_plane
+                _t_unpark = time.perf_counter()
+                result = mq_plane.unpark(
+                    llm, kwargs["unpark_dir"],
+                    remote_ranks=kwargs.get("remote_ranks") or (),
+                    connect_ip=kwargs.get("connect_ip"),
+                    timeout_s=kwargs.get("timeout_s") or 120.0)
+                _MQ_PARK.clear()
+                info.update(result)
+                log.info("  message queues rebuilt in %.3fs: world=%d, "
+                         "remote ranks=%s", time.perf_counter() - _t_unpark,
+                         result["world"], result["remote"])
+
+            elif cmd == "mq_begin_unpark":
+                if llm is None:
+                    raise RuntimeError("mq_begin_unpark requires init first")
+                import base64
+                import pickle
+                import mq_plane
+                writer, handle = mq_plane.begin_unpark(
+                    llm, kwargs["remote_ranks"], kwargs["connect_ip"])
+                _UNPARK["writer"] = writer
+                mq_plane.write_orders(kwargs["unpark_dir"], handle,
+                                      kwargs["local_ranks"])
+                info["handle"] = base64.b64encode(
+                    pickle.dumps(handle)).decode()
+
+            elif cmd == "mq_follower_unpark":
+                import base64
+                import pickle
+                import mq_plane
+                handle = pickle.loads(base64.b64decode(kwargs["handle"]))
+                ranks = kwargs["ranks"]
+                mq_plane.write_orders(kwargs["unpark_dir"], handle, ranks,
+                                      remote_ranks=ranks,
+                                      connect_ip=kwargs["connect_ip"])
+                handles = mq_plane.collect_handles(kwargs["unpark_dir"], ranks)
+                info["handles"] = base64.b64encode(
+                    pickle.dumps(handles)).decode()
+
+            elif cmd == "mq_finish_unpark":
+                if llm is None:
+                    raise RuntimeError("mq_finish_unpark requires init first")
+                import base64
+                import pickle
+                import mq_plane
+                _t_unpark = time.perf_counter()
+                handles = mq_plane.collect_handles(kwargs["unpark_dir"],
+                                                   kwargs["local_ranks"])
+                # One blob per follower node, as mq_follower_unpark returns it.
+                remote = kwargs["remote_handles"]
+                for blob in [remote] if isinstance(remote, str) else remote:
+                    handles.update(pickle.loads(base64.b64decode(blob)))
+                result = mq_plane.finish_unpark(llm, _UNPARK.pop("writer"),
+                                                handles)
+                _MQ_PARK.clear()
+                info.update(result)
+                log.info("  message queues rebuilt across nodes in %.3fs: "
+                         "world=%d, remote ranks=%s",
+                         time.perf_counter() - _t_unpark, result["world"],
+                         result["remote"])
 
             elif cmd == "reinit_nccl":
                 if llm is None:
                     raise RuntimeError("reinit_nccl requires init first")
                 from vllm.utils.network_utils import get_open_port
-                port = get_open_port()
-                results = llm.collective_rpc(_reinit_nccl, args=(port,))
+                # The ranks' stdout is the pod log they kept through the dump,
+                # but NCCL_DEBUG_FILE overrides it with a FILE* opened at cold
+                # start, which the dump closed -- the combination is silent
+                # rather than noisy, and cost the 2026-09-19 investigation all
+                # six of its instrumented restores. The dump's environ is what
+                # the restored ranks carry, so say so here.
+                _ndf = os.environ.get("NCCL_DEBUG_FILE")
+                if _ndf:
+                    log.warning(
+                        "  NCCL_DEBUG_FILE=%s was set when this image was "
+                        "dumped, so NCCL writes to a FILE* that did not survive "
+                        "the restore and its output will NOT appear in the pod "
+                        "log. Re-dump without it to see NCCL from the ranks.",
+                        _ndf)
+                # What CUDA thinks it has, before NCCL asks it for anything.
+                # A mismatched restore fails inside ncclCudaHostCalloc and NCCL
+                # throws the cudaError away, so take it here while the answer is
+                # still attributable to the restore rather than to NCCL.
+                try:
+                    for _p in llm.collective_rpc(_cuda_restore_probe):
+                        log.info("  cuda probe: %s", _p)
+                except Exception:
+                    log.warning("  cuda probe failed", exc_info=True)
+                # The leader picks the port unless the caller pinned one.  A
+                # multi-node group rendezvouses on it, so at nnodes > 1 the
+                # engine chooses it for every node-partition and retries jointly (E6);
+                # a free port here would only be free on this node.
+                port = int(kwargs.get("port") or 0) or get_open_port()
+                results = _collective_rpc_with_timeout(
+                    llm, _reinit_nccl,
+                    (port, kwargs.get("master_addr"), kwargs.get("ifname")),
+                    timeout_s=kwargs.get("timeout_s"), log=log)
                 failures = [r for r in results
                             if isinstance(r, dict) and not r.get("ok", True)]
                 if failures:
+                    # Re-probe on the way out: "unhandled system error" is the
+                    # same string whatever went wrong, so the post-failure CUDA
+                    # state is what distinguishes a device that vanished from
+                    # one that merely cannot pin host memory.
+                    try:
+                        for _p in llm.collective_rpc(_cuda_restore_probe):
+                            log.info("  cuda probe after failure: %s", _p)
+                    except Exception:
+                        log.warning("  post-failure cuda probe failed",
+                                    exc_info=True)
                     raise RuntimeError(f"NCCL reinit failed on workers: {failures}")
                 log.info("  NCCL re-initialized on port %d across %d workers",
                          port, len(results))
+                _drift = {r.get("rank"): r["ofi_drift"] for r in results
+                          if isinstance(r, dict) and r.get("ofi_drift")}
+                if _drift:
+                    log.warning(
+                        "  aws-ofi-nccl exports differ from the pinned set on "
+                        "%d rank(s): %s. The cold start pinned these so a "
+                        "restore matches an EFA cold start bit for bit; a "
+                        "plugin upgrade changing them means the next dump "
+                        "needs the new values pinned instead.",
+                        len(_drift), _drift)
+                for _r in results:
+                    if isinstance(_r, dict) and "net_reset" in _r:
+                        log.info("    [semip-exp] reinit rank=%s bootstrap=%s "
+                                 "ib_fds=%s", _r.get("rank"),
+                                 _r.get("bootstrap_after"), _r.get("ib_fds"))
 
-            elif cmd == "cleargraph":
+            elif cmd == "rebind_graphs":
                 if llm is None:
-                    raise RuntimeError("cleargraph requires init/load first")
-                graph_mode = kwargs.get("graph_mode")
-                results = llm.collective_rpc(_semip_cleargraph, args=(graph_mode,))
-                info["graph_mode"] = graph_mode
-                log.info("  cleargraph(%s) across %d worker(s)",
-                         graph_mode, len(results))
-
-            elif cmd == "recapture_graphs":
-                if llm is None:
-                    raise RuntimeError("recapture_graphs requires init/load first")
-                graph_mode = kwargs.get("graph_mode") or GRAPH_MODE_REUSE
-                results = llm.collective_rpc(
-                    _semip_recapture_graphs, args=(graph_mode,))
-                info["graph_mode"] = graph_mode
+                    raise RuntimeError("rebind_graphs requires init/load first")
+                results = llm.collective_rpc(_semip_rebind_graphs)
                 failures = [r for r in results
                             if not (isinstance(r, dict) and r.get("ok", False))]
                 if failures:
                     raise RuntimeError(
-                        f"semip recapture_graphs({graph_mode}) failed: {failures}")
-                log.info("  recapture_graphs(%s) across %d worker(s)",
-                         graph_mode, len(results))
-                # Reuse preserves graph topology but restore drops most
-                # cudaGraphExec handles; re-instantiate them in lockstep across
-                # ranks before live traffic by driving a few co-scheduled batches
-                # at increasing concurrency.
-                if graph_mode == GRAPH_MODE_REUSE:
-                    if engine is None:
-                        engine = llm.llm_engine
-                    from vllm import SamplingParams
-                    for nreq in (1, 2, 4, 8, 16):
-                        toklen = max(1, min(64 // nreq, 20))
-                        for _ in range(nreq):
-                            engine.add_request(
-                                _alloc_engine_id(),
-                                {"prompt_token_ids": [0] * toklen},
-                                SamplingParams(max_tokens=2, ignore_eos=True))
-                        while engine.has_unfinished_requests():
-                            engine.step()
+                        f"semip rebind_graphs failed: {failures}")
+                log.info("  rebind_graphs across %d worker(s)", len(results))
+                # The rebind's own verdict, which used to be computed and
+                # dropped. Measured 2026-09-22: a TP=2 restore logged the line
+                # above at 1.7s and then hung for 302s, so the rebind "succeeds"
+                # and something after it wedges -- but with the result discarded
+                # there was no way to see what it thought it had done.
+                for _r in results:
+                    if isinstance(_r, dict):
+                        log.info("    rebind rank=%s ok=%s ca_rebind=%s",
+                                 _r.get("rank", "?"), _r.get("ok"),
+                                 _r.get("ca_rebind"))
+                # Verify the rebind before live traffic sees it.  This used to
+                # be a warmup, on the premise that "restore drops most
+                # cudaGraphExec handles" and they had to be re-instantiated in
+                # lockstep across ranks.  That was true of a cold image, where
+                # the execs never existed.  A warm image falsifies it: on
+                # GLM-5.3 at TP=8 the census read exec_ok=4080 uninstantiated=0
+                # identically before and after these rungs, 336 ms apart, on all
+                # eight ranks.  Nothing is built here any more.
+                #
+                # It stays because it is the first collective traffic after the
+                # rebind, so it is what catches a bad rebind -- rewritten
+                # addresses that read back clean but do not replay -- while the
+                # census either side still says whether the image arrived warm.
+                if engine is None:
+                    engine = llm.llm_engine
+                info["compile_cache"] = _compile_cache_fingerprint()
+                log.info("  compile cache after restore: %s",
+                         info["compile_cache"])
+                _log_graph_census(llm, log, "restore:pre-verify")
+                _drive_warmup_ladder("verify",
+                                     _ladder_plan(_REBIND_VERIFY_SIZES))
+                _log_graph_census(llm, log, "restore:post-verify")
+
+            elif cmd in ("drop_graphs", "recapture_graphs"):
+                if llm is None:
+                    raise RuntimeError(f"{cmd} requires init/load first")
+                fn = (_semip_drop_graphs if cmd == "drop_graphs"
+                      else _semip_recapture_graphs)
+                results = llm.collective_rpc(fn)
+                for _r in results:
+                    log.info("  %s %s", cmd, _r)
+                failures = [r for r in results
+                            if not (isinstance(r, dict) and r.get("ok"))]
+                if failures:
+                    raise RuntimeError(f"semip {cmd} failed: {failures}")
+                if cmd == "recapture_graphs":
+                    # G5: what the capture cost against what the cold start
+                    # reserved for it, and what is left.  One line, because the
+                    # ranks differ only in the low tens of MiB and the useful
+                    # signal is the worst of them.
+                    _ok = [r for r in results if isinstance(r, dict)]
+                    if _ok:
+                        _est = next((r.get("estimate_mib") for r in _ok
+                                     if r.get("estimate_mib")), None)
+                        log.info(
+                            "  recapture: %d graphs/rank in %.1f-%.1fs, "
+                            "%d-%d MiB used (cold-start estimate %s MiB), "
+                            "%d MiB free on the tightest rank",
+                            max(r.get("n_graphs") or 0 for r in _ok),
+                            min(r.get("seconds") or 0 for r in _ok),
+                            max(r.get("seconds") or 0 for r in _ok),
+                            min(r.get("used_mib") or 0 for r in _ok),
+                            max(r.get("used_mib") or 0 for r in _ok),
+                            _est if _est is not None else "?",
+                            min(r.get("free_after_mib") or 0 for r in _ok))
+                info[cmd] = results
 
             elif cmd == "save_weights":
                 if llm is None:
@@ -2196,12 +4686,6 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
 
     # -- Main loop --------------------------------------------------------------
 
-    # After a CRIU restore the original stdout/stderr fds are stale and the
-    # first write raises OSError.  Redirect to a per-rank log file (instead
-    # of /dev/null) so that any traceback/log from a restored child is
-    # still captured for post-mortem debugging.
-    _stdout_fixed = False
-
     # The current in-flight command, captured outside the per-iteration
     # scope so the fatal-error reporter below can blame the right cmd.
     cmd = None
@@ -2228,19 +4712,6 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 except EOFError:
                     break
 
-            if not _stdout_fixed:
-                try:
-                    sys.stdout.write("")
-                    sys.stdout.flush()
-                except OSError:
-                    _logfp = open(_child_log_path, "a", buffering=1)
-                    sys.stdout = _logfp
-                    sys.stderr = _logfp
-                    _stdout_fixed = True
-                    semip_logging.rebind_stdout()
-                    log.info("stdout/stderr redirected to %s after CRIU restore",
-                             _child_log_path)
-
             if cmd == "exit":
                 _drain_engine()
                 log.info("exit")
@@ -2255,7 +4726,8 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                     req_id = f"auto-{_next_engine_id}"
                 try:
                     _submit_generate(req_id, kwargs["prompts"],
-                                     kwargs["sampling_params"])
+                                     kwargs["sampling_params"],
+                                     kwargs.get("reasoning_ended"))
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
@@ -2274,7 +4746,8 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                                            f"auto-{_next_engine_id}")
                         try:
                             _submit_generate(rid2, kwargs2["prompts"],
-                                             kwargs2["sampling_params"])
+                                             kwargs2["sampling_params"],
+                                             kwargs2.get("reasoning_ended"))
                         except Exception as e2:
                             import traceback
                             traceback.print_exc()

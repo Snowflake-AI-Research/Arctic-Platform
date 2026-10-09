@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import weakref
@@ -36,11 +37,30 @@ import weakref
 import pynvml
 import torch.multiprocessing as mp
 
+import mq_plane
 import semip_logging
 from demuxer import Demuxer
 from worker import worker_loop
 
 _spawn_ctx = mp.get_context("spawn")
+
+# The flat layout an Instance derives from ``model_dir``. Named here because
+# this class is what creates it: pass ``model_dir`` at init and every path below
+# follows from these, with no caller ever composing one.
+#
+# Three other files have to agree, and none of them can import this one -- the
+# vLLM child is spawned into a deliberately clean address space,
+# ``server/semip_engine.py`` is what imports *us*, and
+# ``scripts/semip_publish.py`` is copied into a pod on its own and run with a
+# bare ``python3``. So the spellings are duplicated there and held to these by
+# ``tests/test_layout_names.py``, which reads them out of the source.
+#
+# ``weight`` is singular, and matches the published tree exactly. It was
+# ``weights`` until the two were unified; nothing here depended on the plural,
+# but the publisher folds this prefix into its weight hash, so every weight
+# directory published under the old name has a hash no dump produces again.
+_IMAGE_DIR = "image"
+_WEIGHT_DIR = "weight"
 
 _next_instance_id = 0
 _id_lock = threading.Lock()
@@ -51,6 +71,16 @@ def _alloc_instance_id():
     with _id_lock:
         _next_instance_id += 1
         return _next_instance_id - 1
+
+
+def _local_gpu_count(vllm_config):
+    """GPUs this node's Instance drives: the TP group split over ``nnodes``."""
+    tp = int(vllm_config.get("tensor_parallel_size", 1) or 1)
+    nnodes = int(vllm_config.get("nnodes", 1) or 1)
+    if tp % nnodes:
+        raise ValueError(f"tensor_parallel_size={tp} is not divisible by "
+                         f"nnodes={nnodes}")
+    return tp // nnodes
 
 
 def _truncate_for_display(value, limit=200):
@@ -71,9 +101,18 @@ class Instance:
 
     _all: weakref.WeakValueDictionary[int, "Instance"] = weakref.WeakValueDictionary()
 
-    def __init__(self, vllm_config: dict, model_dir: str | None = None):
+    def __init__(self, vllm_config: dict, model_dir: str | None = None,
+                 multinode=None):
         self.gpu = None
         self.vllm_config = vllm_config
+        # Node identity for a TP group that spans machines; None is
+        # single-node, which is every TP <= 8 deployment.  It never enters
+        # ``vllm_config``: that dict is hashed into the image cache key and
+        # compared at restore, so a node_rank or a master address in it would
+        # make the node-partitions of one job disagree and a restore onto a
+        # different set of pods impossible.  ``nnodes`` is the exception and does
+        # live in the config, because the split changes the image.
+        self.multinode = multinode
         # Optional per-model directory.  When set, the image lives at
         # ``<model_dir>/image`` and ``criu_dump`` / ``criu_restore`` can be
         # called without a filename.  When unset, callers pass explicit
@@ -82,20 +121,15 @@ class Instance:
         self.instance_id = _alloc_instance_id()
         Instance._all[self.instance_id] = self
         self.log = semip_logging.instance(self.instance_id, self.gpu)
-        # Per-instance file gets a fresh start at construction time so
-        # any later instance.N / worker.N / child.N records land in a
-        # clean file.  Worker subprocesses do NOT re-truncate (they'd
-        # erase parent-side records that arrived before they spawned).
-        _log_path = semip_logging.truncate_instance_file(self.instance_id)
-        semip_logging.attach_instance_file(self.instance_id)
-        # Breadcrumb on the terminal (via the orch logger so it isn't
-        # swallowed by the per-instance file route) so users know where
-        # to tail.
+        # The worker and child write to the pod log themselves; this sends the
+        # parent-side instance.N records there too, so one stream carries all
+        # three processes.
+        semip_logging.attach_pod_log(["semip.inst"])
         semip_logging.orch().info(
             "instance %d created  model=%s  log=%s",
             self.instance_id,
             vllm_config.get("model", "?"),
-            _log_path,
+            semip_logging.pod_log_target(),
         )
 
         self.pid = None
@@ -113,7 +147,24 @@ class Instance:
         # TP>1, where the aggregate ``pinned_cpu_bytes`` overstates the per-GPU
         # budget).
         self.gpus = None
-        self.n_gpus = int(vllm_config.get("tensor_parallel_size", 1) or 1)
+        self.n_gpus = _local_gpu_count(vllm_config)
+        self.nnodes = int(vllm_config.get("nnodes", 1) or 1)
+        # ``node_rank`` still falls back to the config for the experiment
+        # driver, which predates ``MultiNode``.  Production passes the
+        # parameter, and the two must not disagree.
+        if multinode is not None:
+            if self.nnodes < 2:
+                raise ValueError(
+                    "multinode= requires nnodes > 1 in vllm_config; got "
+                    f"nnodes={self.nnodes}")
+            if not 0 <= multinode.node_rank < self.nnodes:
+                raise ValueError(
+                    f"node_rank={multinode.node_rank} out of range for "
+                    f"nnodes={self.nnodes}")
+            self.node_rank = multinode.node_rank
+        else:
+            self.node_rank = int(vllm_config.get("node_rank", 0) or 0)
+        self.last_info = {}
         self.max_pinned_bytes_per_worker = 0
 
         self._cmd_queue = None
@@ -124,7 +175,7 @@ class Instance:
         self.last_generate_result = None
         self.last_prompt_tokens = None
         self.last_completion_tokens = None
-        self.generate_results = {}  # req_id -> {prompts, outputs, prompt_tokens, completion_tokens, ttft_s, tpot_ms}
+        self.generate_results = {}  # req_id -> {prompts, outputs, prompt_token_ids, completion_token_ids, prompt_logprobs, completion_logprobs, prompt_tokens, completion_tokens, finish_reasons, num_cached_tokens, ttft_s, tpot_ms}
         self._pending_prompts = {}  # req_id -> prompts (popped on completion)
 
         # The demuxer is the sole consumer of ``_result_queue``; it is
@@ -215,12 +266,12 @@ class Instance:
         if filename is not None:
             return filename
         if self.model_dir is not None:
-            return os.path.join(self.model_dir, "image")
+            return os.path.join(self.model_dir, _IMAGE_DIR)
         return self._image_dir
 
     def _resolve_weights_dir(self, weights_dir=None):
         """Pick the weights directory: explicit arg, then model_dir, then
-        a ``weights`` sibling of the image directory.
+        a ``weight`` sibling of the image directory.
 
         The sibling fallback keeps ``save_weights`` usable for callers that
         pass explicit image paths (the orchestrator) rather than a model_dir.
@@ -228,10 +279,10 @@ class Instance:
         if weights_dir is not None:
             return weights_dir
         if self.model_dir is not None:
-            return os.path.join(self.model_dir, "weights")
+            return os.path.join(self.model_dir, _WEIGHT_DIR)
         if self._image_dir is not None:
             return os.path.join(os.path.dirname(self._image_dir.rstrip("/")),
-                                "weights")
+                                _WEIGHT_DIR)
         return None
 
     @property
@@ -334,7 +385,13 @@ class Instance:
         vllm_config = dict(self.vllm_config)
         if tp > 1:
             vllm_config.setdefault("worker_cls", "_semip_worker.SemipGPUWorker")
-        return self._send("init", vllm_config=vllm_config)
+        if self.multinode is None:
+            return self._send("init", vllm_config=vllm_config)
+        # Node identity travels beside the config, never inside it: the child
+        # merges it into its own private copy so the dict that gets hashed and
+        # written to meta.json stays identical on every node-partition.
+        return self._send("init", vllm_config=vllm_config,
+                          multinode=self.multinode.as_init_kwargs())
 
     def attach(self):
         self._log("attach")
@@ -401,44 +458,178 @@ class Instance:
 
     def cuda_checkpoint(self):
         self._log("cuda_checkpoint")
-        # TP>1: drop/preserve graphs then tear down NCCL (CRIU cannot restore
-        # live communicators / CustomAllreduce IPC) before the CUDA checkpoint.
-        # graph_mode="reuse" preserves the captured graphs; destroy_nccl uses
-        # the graph-preserving unilateral-abort teardown.  Both are no-ops at
-        # TP=1, but the gate keeps the single-GPU path free of extra commands.
-        if self.n_gpus > 1:
-            self._send("cleargraph", graph_mode="reuse")
-            self._send("destroy_nccl", graph_mode="reuse")
+        # TP>1: tear down NCCL (CRIU cannot restore live communicators /
+        # CustomAllreduce IPC) before the CUDA checkpoint, using the
+        # graph-preserving unilateral-abort teardown so the captured graphs
+        # survive into the image.  A no-op at TP=1, but the gate keeps the
+        # single-GPU path free of extra commands.
+        # A follower node holds no executor-side queues; the leader's
+        # destroy_nccl reaches its ranks.
+        if self.n_gpus > 1 and self.node_rank == 0:
+            # G1: across nodes the graphs cannot survive the teardown and must
+            # go first.  vLLM turns custom all-reduce off when ranks span
+            # machines, so every all-reduce a graph captured is an NCCL kernel,
+            # and NCCL will not release a communicator a live graph captured:
+            # commDestroySync spins on `while (comm->localPersistentRefs != 0)`
+            # until the graphs referencing it are destroyed.  Ordering this
+            # before destroy_nccl is what turns that hang into a 2-3 s drop.
+            # The restore pairs it with recapture_graphs.
+            if self.nnodes > 1:
+                self._send("drop_graphs")
+            self._send("destroy_nccl")
         return self._send("cuda_checkpoint")
 
-    def reinit_nccl(self):
+    def reinit_nccl(self, master_addr=None, port=None, ifname=None):
         """Rebuild NCCL / the torch process group after a CRIU restore.
 
         Must run immediately after ``cuda_restore`` and before any
         collective (attach, weight restore, graph replay).  No-op at TP=1.
+
+        Every argument is a kwarg and none of them is read from the
+        environment, because the child is a restored process: its ``environ``
+        is the dump's, so nothing the restoring job sets would be visible
+        there.  ``master_addr`` is the leader's address in a multi-node group
+        and loopback otherwise; ``port`` lets the engine pin one rendezvous
+        for all node-partitions and retry jointly; ``ifname`` is the interface EFA
+        comes up on.  All three default to what this node can work out alone,
+        which is the single-node case.
         """
         self._log("reinit_nccl")
-        return self._send("reinit_nccl")
+        if ifname is None and self.multinode is not None:
+            ifname = self.multinode.ifname
+        if master_addr is None and self.multinode is not None:
+            master_addr = self.multinode.master_addr
+        return self._send("reinit_nccl", master_addr=master_addr, port=port,
+                          ifname=ifname)
 
-    def destroy_nccl(self, graph_mode="reuse"):
-        """Tear down NCCL and CustomAllreduce IPC.  No-op at TP=1."""
-        self._log(f"destroy_nccl(graph_mode={graph_mode})")
-        return self._send("destroy_nccl", graph_mode=graph_mode)
+    def mq_begin_unpark(self, remote_ranks, connect_ip, local_ranks):
+        """Leader: bind the new broadcast writer, order the local ranks.
 
-    def cleargraph(self, graph_mode="reuse"):
-        """Drop CUDA-graph exec handles.  ``reuse`` preserves them."""
-        self._log(f"cleargraph(graph_mode={graph_mode})")
-        return self._send("cleargraph", graph_mode=graph_mode)
+        The handle for the follower lands in ``last_info``.
+        """
+        self._log("mq_begin_unpark")
+        return self._send("mq_begin_unpark", unpark_dir=self._unpark_dir(),
+                          remote_ranks=list(remote_ranks),
+                          connect_ip=connect_ip, local_ranks=list(local_ranks))
 
-    def recapture_graphs(self, graph_mode="reuse"):
-        """Rebind (``reuse``) or recapture (``full``) the decode graphs.
+    def mq_follower_unpark(self, handle, ranks, connect_ip):
+        """Follower: order this node's ranks onto the leader's writer.
+
+        Their response handles land in ``last_info``.
+        """
+        self._log("mq_follower_unpark")
+        return self._send("mq_follower_unpark", unpark_dir=self._unpark_dir(),
+                          handle=handle, ranks=list(ranks),
+                          connect_ip=connect_ip)
+
+    def mq_finish_unpark(self, remote_handles, local_ranks):
+        """Leader: connect to every rank's response writer and swap in."""
+        self._log("mq_finish_unpark")
+        return self._send("mq_finish_unpark", unpark_dir=self._unpark_dir(),
+                          remote_handles=remote_handles,
+                          local_ranks=list(local_ranks))
+
+    def destroy_nccl(self):
+        """Tear down NCCL and CustomAllreduce IPC.  No-op at TP=1.
+
+        Always the graph-preserving unilateral-abort teardown: the captured
+        graphs go into the image and are rebound after restore.
+        """
+        self._log("destroy_nccl")
+        return self._send("destroy_nccl")
+
+    def _unpark_dir(self):
+        if self.model_dir is None:
+            raise RuntimeError("message-queue park requires a model_dir")
+        model_dir = os.path.normpath(self.model_dir)
+        key = os.path.basename(model_dir)
+        # A node-partition of a multi-node image lives at <key>/node<k>. Every
+        # node-partition has
+        # to name the same directory: the leader's park hands its path to all
+        # ranks, each parked reader carries it into its node's image, and the
+        # follower's unpark has to write where those readers poll.
+        if self.nnodes > 1 and re.fullmatch(r"node\d+", key):
+            key = os.path.basename(os.path.dirname(model_dir))
+        return mq_plane.unpark_dir_for(key)
+
+    def arm_mq_park(self, ranks=None):
+        """Park the executor's message queues as the dump's last collective.
+
+        The park itself runs inside ``criu_dump`` (its ``prepare_criu_dump``
+        step), after the collectives the dump still needs. Every queue socket
+        is closed, so the image carries none of them; ``unpark_mq`` must
+        follow ``criu_restore`` before any collective. ``ranks`` are the ones
+        on this node; all of them when ``None``. No-op at TP=1.
+        """
+        self._log("arm_mq_park")
+        return self._send("arm_mq_park", unpark_dir=self._unpark_dir(),
+                          ranks=ranks)
+
+    def park_mq(self, ranks=None):
+        """Park the message queues now (no dump); pairs with ``unpark_mq``."""
+        self._log("park_mq")
+        return self._send("park_mq", unpark_dir=self._unpark_dir(),
+                          ranks=ranks)
+
+    def unpark_mq(self, remote_ranks=None, connect_ip=None):
+        """Build a fresh message-queue plane and swap it in.
+
+        ``remote_ranks`` talk to the executor over TCP via ``connect_ip``
+        rather than through shared memory.
+        """
+        self._log("unpark_mq")
+        return self._send("unpark_mq", unpark_dir=self._unpark_dir(),
+                          remote_ranks=list(remote_ranks or ()),
+                          connect_ip=connect_ip)
+
+    def rebind_graphs(self):
+        """Rebind the preserved decode graphs against the restored runtime.
 
         Run after ``wake_up_kv_cache``.  No-op at TP=1.
-        """
-        self._log(f"recapture_graphs(graph_mode={graph_mode})")
-        return self._send("recapture_graphs", graph_mode=graph_mode)
 
-    def criu_dump(self, filename: str | None = None):
+        ``destroy_nccl`` -> ``reinit_nccl`` moves the CustomAllreduce meta and
+        buffer allocations, so the addresses baked into the preserved graph
+        nodes go stale and are rewritten in place by ``ca_graph_rebind``.
+
+        Called ``recapture_graphs`` until 2026-09-24, which was wrong twice
+        over: the ``full`` mode that actually recaptured (``capture_model()``)
+        was retired, and a warm image carries its ``cudaGraphExec_t`` handles
+        through CRIU intact, so there is nothing to instantiate either.  The
+        work is address rewriting and always was, once the image is warm.
+
+        Single-node only.  Across nodes there is nothing to rebind: vLLM turns
+        custom all-reduce off, so the graphs held NCCL kernels, so the dump had
+        to destroy them for ``ncclCommAbort`` to return.  Use
+        ``recapture_graphs``.  Raising rather than quietly doing nothing keeps
+        a mis-ordered restore from reporting success and then wedging on the
+        first replay of a graph that no longer exists.
+        """
+        if self.nnodes > 1:
+            raise RuntimeError(
+                "rebind_graphs is single-node only: a multi-node dump drops "
+                "its graphs before destroy_nccl, so there is nothing to "
+                "rebind. Call recapture_graphs() after wake_up_kv_cache().")
+        self._log("rebind_graphs")
+        return self._send("rebind_graphs")
+
+    def drop_graphs(self):
+        """Destroy every captured CUDA graph, before ``cuda_checkpoint``.
+
+        Across nodes the graphs hold NCCL kernels, and ``ncclCommAbort`` does
+        not return while they are alive. Pair with ``recapture_graphs`` on
+        the restore side.
+        """
+        self._log("drop_graphs")
+        return self._send("drop_graphs")
+
+    def recapture_graphs(self):
+        """Capture the CUDA graphs again after a restore whose dump dropped
+        them. Run after ``reinit_nccl`` and ``wake_up_kv_cache``."""
+        self._log("recapture_graphs")
+        return self._send("recapture_graphs")
+
+    def criu_dump(self, filename: str | None = None,
+                  meta_extra: dict | None = None):
         """CRIU-dump the child process tree to disk (destructive).
 
         Must be called after cuda_checkpoint() (GPU resources released).
@@ -446,6 +637,12 @@ class Instance:
         on-disk image is later restored via criu_restore().
 
         If filename is None, uses ``<model_dir>/image``.
+
+        ``meta_extra`` merges caller-supplied fields over the ones recorded
+        below, so a layer above can record what only it knows -- the serving
+        adapter puts the container image digest and driver version there,
+        which is what its image cache keys on.  Keys collide with the built-in
+        ones at the caller's own risk; nothing here reserves a namespace.
         """
         filename = self._resolve_image_dir(filename)
         if filename is None:
@@ -453,15 +650,16 @@ class Instance:
                 "criu_dump() requires a filename or a model_dir")
         self._log(f"criu_dump({filename})")
         self._image_dir = filename
-        return self._send(
-            "criu_dump", filename=filename,
-            meta_extra={"vllm_config":      self.vllm_config,
-                        "model_dir":        self.model_dir,
-                        "total_gpu_bytes":  self.total_gpu_bytes,
-                        "pinned_cpu_bytes": self.pinned_cpu_bytes,
-                        "n_gpus":           self.n_gpus,
-                        "max_pinned_bytes_per_worker":
-                            self.max_pinned_bytes_per_worker})
+        meta = {"vllm_config":      self.vllm_config,
+                "model_dir":        self.model_dir,
+                "total_gpu_bytes":  self.total_gpu_bytes,
+                "pinned_cpu_bytes": self.pinned_cpu_bytes,
+                "n_gpus":           self.n_gpus,
+                "max_pinned_bytes_per_worker":
+                    self.max_pinned_bytes_per_worker}
+        if meta_extra:
+            meta.update(meta_extra)
+        return self._send("criu_dump", filename=filename, meta_extra=meta)
 
     def criu_restore(self, filename: str | None = None):
         """Restore a live process from a CRIU image on disk.
@@ -498,6 +696,28 @@ class Instance:
                     f"image at {filename} was dumped with {saved_model_dir}; "
                     f"the image bakes absolute compile-cache paths, so it "
                     f"must be restored under the same model_dir")
+            # Dump and restore must run as the same user.  The restored child
+            # keeps the uid recorded in the image (SEMIP_UNPRIVILEGED drops
+            # capabilities without changing uid), while this parent runs as
+            # whoever launched it.  Mixing the two puts both identities on the
+            # same files with neither able to write the other's:
+            # rebind_graphs() writes <model_dir>/compilation, and a restore
+            # writes into image/.  No file mode resolves it -- CRIU
+            # re-validates the recorded mode of every path it re-maps -- and
+            # the failure otherwise lands late, as a bare PermissionError at
+            # the end of an expensive restore.  root->root and
+            # unprivileged->unprivileged are both supported; only the mix is
+            # rejected.  Images dumped before ``uid`` was recorded carry no
+            # value and are let through.
+            saved_uid = meta.get("uid")
+            if saved_uid is not None and saved_uid != os.getuid():
+                raise RuntimeError(
+                    f"uid mismatch: image at {filename} was dumped by uid "
+                    f"{saved_uid} but this process is uid {os.getuid()}; the "
+                    f"restored child would keep uid {saved_uid} and collide "
+                    f"with this parent over {self.model_dir}/compilation "
+                    f"and {filename}. Restore as uid "
+                    f"{saved_uid}, or re-dump the image as uid {os.getuid()}")
             # Hydrate budget inputs from meta.json; the child holds the
             # real pinned buffer that survived CRIU.  Old images without
             # ``total_gpu_bytes`` degrade to single-chunk behavior in
@@ -511,9 +731,9 @@ class Instance:
             # meta["n_gpus"] is only a fallback for images predating
             # config-wired TP.  Placement and the per-worker budget are
             # hydrated from the image, with a legacy rank -> [rank] shim.
-            self.n_gpus = int(
-                self.vllm_config.get("tensor_parallel_size",
-                                     meta.get("n_gpus", 1)) or 1)
+            self.n_gpus = (_local_gpu_count(self.vllm_config)
+                           if "tensor_parallel_size" in self.vllm_config
+                           else int(meta.get("n_gpus", 1) or 1))
             self.max_pinned_bytes_per_worker = int(
                 meta.get("max_pinned_bytes_per_worker", 0))
             _meta_gpus = meta.get("gpus") or (
@@ -588,6 +808,14 @@ class Instance:
             allotment = self.total_gpu_bytes * gpu_memory_utilization
             budget    = min(self.pinned_cpu_bytes,
                             allotment - self.pinned_cpu_bytes)
+
+        This is an outer bound only.  The formula is a prediction -- it
+        asserts that everything inside the allotment which is not weights
+        is free, which ignores graph pools, the per-rank CUDA contexts
+        mapped on every GPU, and activations -- so the worker clamps it
+        against the free VRAM its own device reports (see
+        ``_STAGING_FREE_FRACTION``).  Passing ``max_buffer_bytes``
+        explicitly raises the bound; it does not defeat that clamp.
 
         The formula is self-validating: if ``budget`` ends up smaller
         than the largest single parameter, the child's plan walk raises
@@ -669,14 +897,18 @@ class Instance:
         return self._send("load_weights", weights_dir=weights_dir,
                           io_workers=io_workers)
 
-    def generate(self, prompts, sampling_params):
+    def generate(self, prompts, sampling_params, reasoning_ended=None):
+        """``reasoning_ended`` is AsyncLLM.generate's argument of that name:
+        whether the prompt already closed its reasoning section, which decides
+        when a structured-output grammar starts to apply."""
         self._log(f"generate({len(prompts)} prompts)")
         req_id = f"inst{self.instance_id}-{self._next_req_id}"
         self._next_req_id += 1
         self.last_req_id = req_id
         self._pending_prompts[req_id] = prompts
         return self._send("generate", req_id=req_id, prompts=prompts,
-                           sampling_params=sampling_params)
+                           sampling_params=sampling_params,
+                           reasoning_ended=reasoning_ended)
 
     def teardown(self):
         self._log("teardown")
@@ -698,6 +930,7 @@ class Instance:
 
     def _apply_result(self, cmd: str, info: dict) -> None:
         """Update local state after a successful command completion."""
+        self.last_info[cmd] = info
         if cmd == "init":
             self.pid = info.get("pid")
             self.state = "alive"
@@ -748,8 +981,14 @@ class Instance:
                 self.generate_results[req_id] = {
                     "prompts": info.get("prompts"),
                     "outputs": info.get("outputs"),
+                    "prompt_token_ids": info.get("prompt_token_ids"),
+                    "completion_token_ids": info.get("completion_token_ids"),
+                    "prompt_logprobs": info.get("prompt_logprobs"),
+                    "completion_logprobs": info.get("completion_logprobs"),
                     "prompt_tokens": info.get("prompt_tokens"),
                     "completion_tokens": info.get("completion_tokens"),
+                    "finish_reasons": info.get("finish_reasons"),
+                    "num_cached_tokens": info.get("num_cached_tokens"),
                     "ttft_s": info.get("ttft_s"),
                     "tpot_ms": info.get("tpot_ms"),
                 }

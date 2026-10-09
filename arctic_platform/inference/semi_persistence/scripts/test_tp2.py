@@ -6,14 +6,14 @@ one pair of GPUs, and the restore places the group on a different pair.
 The TP-specific steps are the only difference from the single-GPU flow in
 ``test_weights.py``:
 
-  * ``cuda_checkpoint()`` auto-inserts ``cleargraph`` + ``destroy_nccl``
-    when tensor_parallel_size > 1, so the caller does not.
+  * ``cuda_checkpoint()`` auto-inserts ``destroy_nccl`` when
+    tensor_parallel_size > 1, so the caller does not.
   * ``reinit_nccl()`` must run after ``cuda_restore``, and before anything
-    that runs the model or replays a captured graph (``recapture_graphs``,
+    that runs the model or replays a captured graph (``rebind_graphs``,
     ``generate``).  ``attach`` and ``load_weights`` are CPU-only per rank,
     so they are not constrained by it and run first below.
-  * ``recapture_graphs("reuse")`` runs after ``wake_up_kv_cache`` and
-    rebinds the preserved decode graphs' baked addresses.
+  * ``rebind_graphs()`` runs after ``wake_up_kv_cache`` and rewrites the
+    preserved decode graphs' baked CustomAllreduce addresses.
 
 TP size comes from the vLLM config; the ``gpus`` argument is placement
 only and must have exactly tensor_parallel_size entries.
@@ -24,11 +24,13 @@ import os
 
 from arctic_platform.inference.semi_persistence import Instance
 
+os.environ["SEMIP_UNPRIVILEGED"] = "1"
+
 # TP2 + EP
 config_qwen_35b = {"model": "Qwen/Qwen3.6-35B-A3B", "gpu_memory_utilization": 0.7,
                    "tensor_parallel_size": 2, "enable_expert_parallel": True}
 
-MODEL_DIR = "/data-fast/image-cache/tp2test"
+MODEL_DIR = "/data-fast/image-cache_neutrino"
 
 conversation = ["Write an essay about the importance of higher education."]
 sampling_params = {"temperature": 0.0, "max_tokens": 800}
@@ -42,7 +44,7 @@ def init(inst: Instance, gpus):
     inst.save_weights()
     inst.detach()
     inst.sleep()
-    inst.cuda_checkpoint()  # TP>1: cleargraph + destroy_nccl inside
+    inst.cuda_checkpoint()  # TP>1: destroy_nccl inside
     inst.criu_dump()  # destroys the instance
 
 
@@ -56,21 +58,24 @@ def load_(inst: Instance, gpus):
     inst.repin()
     inst.restore_weights()
     inst.wake_up_kv_cache()
-    inst.recapture_graphs("reuse")  # TP>1: rebind preserved graphs
+    inst.rebind_graphs()  # TP>1: rebind preserved graphs
     inst.generate(conversation, sampling_params)
 
 
 def main():
-    inst1 = Instance(config_qwen_35b, os.path.join(MODEL_DIR, "qwen_35b"))
+    modelpath = os.path.join(MODEL_DIR, "qwen_35b_tp2")
+    inst1 = Instance(config_qwen_35b, modelpath)
     cache_hit = os.path.isfile(
-        os.path.join(MODEL_DIR, "qwen_35b", "image", "meta.json"))
+        os.path.join(modelpath, "image", "meta.json"))
 
     if cache_hit:
         print("[test] cache HIT — loading from image")
-        load_(inst1, [0, 1])   # migrate onto 0,1 if the image was dumped elsewhere
+        # Deliberately not the pair init() dumps on, so the restore builds a
+        # device map instead of keeping the dump's GPU UUIDs.
+        load_(inst1, [5, 7])
     else:
         print("[test] cache MISS — cold-starting, saving image")
-        init(inst1, [2, 3])
+        init(inst1, [4, 6])
 
     print("[test] waiting for instances to finish")
     inst1.wait()

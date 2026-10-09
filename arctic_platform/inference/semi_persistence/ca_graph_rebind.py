@@ -29,8 +29,52 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 
 log = logging.getLogger("semip.ca.rebind")
+
+
+def _ensure_worker_log_handler() -> None:
+    """Give this logger its own stdout handler when the process has no root one.
+
+    Everything in this module runs inside the TP worker subprocess, where
+    ``semip_logging.init_process()`` is never called and nothing else installs a
+    root handler -- so every ``log.info`` here was discarded. Wave 9 was the
+    first round able to read any of it, and only because ``vllm_child`` logs the
+    returned dict from the child instead; the free-standing lines (E9's dumps,
+    REUSE_DIAG's per-replay lines) stayed invisible.
+
+    Attaching to this logger rather than calling ``init_process`` is deliberate:
+    ``init_process`` replaces the root handler list, which in a vLLM worker would
+    trample vLLM's own logging configuration. ``propagate`` stays on so that a
+    process which *does* configure a root handler keeps seeing these records
+    once, via the root; the local handler is only added when no root handler
+    exists to receive them.
+
+    Called from the entry points, never at import. Import time is too early in
+    the *parent*: ``vllm_child`` imports this module at its own module top but
+    does not call ``semip_logging.init_process()`` until inside
+    ``vllm_child_loop``, so an import-time install would see an empty root
+    handler list, attach, and then double every record once the root is
+    configured (visible at TP=1, where the worker is that same process). It
+    would also bind the ``sys.stdout`` object that exists at import, which
+    ``redirect_stdio_to_pod_log`` later replaces.
+    """
+    if log.handlers:
+        return
+    if logging.getLogger().handlers:
+        return
+    try:
+        h = logging.StreamHandler(sys.stdout)
+        h.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d %(name)s %(levelname)s %(message)s",
+            "%H:%M:%S"))
+        log.addHandler(h)
+        if log.level == logging.NOTSET:
+            log.setLevel(logging.INFO)
+    except Exception:  # noqa: BLE001 - logging must never break a restore
+        pass
+
 
 _SNAP_ATTR = "_semip_graph_reuse_snapshot"
 _RANK_DATA_KEEP_ATTR = "_semip_rank_data_keep"
@@ -43,8 +87,8 @@ _recorder: dict = {"active": False, "orig": None, "handle": None, "offset": None
 def enabled() -> bool:
     """Compatibility shim for older callers.
 
-    The active gate now lives in ``recapture_graphs("reuse")`` policy; this
-    module only performs work when its explicit preparation/rebind helpers run.
+    The active gate now lives in ``rebind_graphs()`` policy; this module
+    only performs work when its explicit preparation/rebind helpers run.
     """
     return True
 
@@ -172,6 +216,120 @@ def restore_keepgraph_patch() -> None:
     _kg["orig"] = None
 
 
+_fiar_probe = {"active": False, "orig": {}, "fired": False, "suppress": False}
+
+# Every name in ``flashinfer_all_reduce`` that can reach the allocator. Patching
+# one of them was not enough: the first attempt wrapped ``_create_workspace``
+# alone, printed nothing on a run where the workspace was demonstrably built
+# mid-capture, and left no way to tell "never called" from "never installed".
+_FIAR_PROBE_TARGETS = ("_create_workspace", "get_fi_ar_workspace",
+                       "get_fi_ar_quant_workspace")
+
+# Refuse the allocation outright instead of merely watching it. Read from the
+# environment so one image can do both -- the payload's `extra_env` flips it
+# without a rebuild, and each cold start costs ~1070 s.
+_FIAR_SUPPRESS_ENV = "SEMIP_SUPPRESS_FI_AR_WORKSPACE"
+
+
+def install_fi_ar_workspace_probe() -> dict:
+    """Name whoever allocates a FlashInfer all-reduce workspace, and optionally
+    refuse to let them.
+
+    **Why this is not a one-liner.** The workspace is what
+    ``cuCheckpointProcess*`` cannot carry, and re-mapping it after a restore is
+    now known to be impossible -- ``cuMulticastAddDevice`` returns
+    CUDA_ERROR_INVALID_DEVICE in a restored process, independently reproduced by
+    torch's own ``CUDASymmetricMemory``, which degrades gracefully where
+    FlashInfer cannot. So the remaining lever is to never build it. That needs a
+    name, and static reading has now failed twice: outside the module there are
+    exactly two callers of the getters, ``AllReduceFusionPass.__init__`` (gated
+    on ``fuse_allreduce_rms``, which GLM reports False) and
+    ``fused_allreduce_gemma_rms_norm`` (reachable only from deepseek_v32,
+    kimi_k3 and minimax_m3, none of which glm5next imports). One premise is
+    false and only a stack will say which.
+
+    **Patching all three names, not just the private one.** The first version
+    wrapped ``_create_workspace`` on the theory that every path funnels through
+    it. It printed nothing on a run where ``Initialized FlashInfer Allreduce``
+    appears at 57% through the PIECEWISE captures -- inside the window this is
+    scoped to. Whether that means the call did not happen or the patch did not
+    install was unanswerable, which is the same silent-no-op shape as the three
+    bugs this wave already cost. Cover the surface and report what stuck.
+
+    **Returning a dict, not a bool.** The caller discarded the bool, so a failed
+    install looked exactly like a quiet capture. This returns what was patched
+    so the call site can say so out loud.
+
+    Prints to stdout because this runs in the worker, where ``log`` is a
+    child-process local -- and because on the restore side no logging handler
+    survives at all, so ``print`` is the only channel that reaches the log.
+    """
+    import os
+    import traceback
+    out = {"patched": [], "missing": [], "suppress": False, "err": None}
+    if _fiar_probe["active"]:
+        # Report the live state, not the defaults. This is now called from two
+        # places (see ``_semip_worker``) and a second call that said
+        # ``suppress=False`` over an active kill switch would be a lie in the
+        # log of exactly the kind this probe exists to stop telling.
+        out["patched"] = sorted(_fiar_probe["orig"])
+        out["suppress"] = _fiar_probe["suppress"]
+        return out
+    try:
+        from vllm.distributed.device_communicators import (
+            flashinfer_all_reduce as fiar)
+    except Exception as exc:  # noqa: BLE001 - pre-0.30 has no fabric workspaces
+        out["err"] = f"{type(exc).__name__}: {exc}"
+        return out
+    suppress = os.environ.get(_FIAR_SUPPRESS_ENV, "") not in ("", "0")
+    out["suppress"] = suppress
+    _fiar_probe["suppress"] = suppress
+
+    def _wrap(name, orig):
+        def _probed(*args, **kwargs):
+            if not _fiar_probe["fired"]:
+                _fiar_probe["fired"] = True
+                print(f"[fi-ar-probe] first FlashInfer AR workspace call via "
+                      f"{name}, suppress={suppress}:\n"
+                      + "".join(traceback.format_stack()[:-1]), flush=True)
+            if suppress:
+                # None is a supported outcome, not a hack: `_create_workspace`
+                # already returns it when the backend is unavailable, and the
+                # callers branch on it (`if get_fi_ar_workspace(...) is None`).
+                # vLLM logs "Failed to initialize ... workspace" and continues.
+                return None
+            return orig(*args, **kwargs)
+        return _probed
+
+    for name in _FIAR_PROBE_TARGETS:
+        orig = getattr(fiar, name, None)
+        if orig is None:
+            out["missing"].append(name)
+            continue
+        _fiar_probe["orig"][name] = orig
+        setattr(fiar, name, _wrap(name, orig))
+        out["patched"].append(name)
+    _fiar_probe["active"] = bool(out["patched"])
+    return out
+
+
+def restore_fi_ar_workspace_probe() -> None:
+    """Put every patched name back. Scoped by the caller so no monkey-patched
+    vLLM private rides into the CRIU image."""
+    if not _fiar_probe["active"]:
+        return
+    try:
+        from vllm.distributed.device_communicators import (
+            flashinfer_all_reduce as fiar)
+        for name, orig in _fiar_probe["orig"].items():
+            setattr(fiar, name, orig)
+    except Exception:  # noqa: BLE001
+        pass
+    _fiar_probe["active"] = False
+    _fiar_probe["orig"] = {}
+    _fiar_probe["suppress"] = False
+
+
 _fc = {"active": False, "orig": None}
 
 
@@ -180,7 +338,24 @@ def install_force_copy_patch() -> bool:
     captured graph bakes only the ONE static `buffer_ptrs[rank]` (in a memcpy
     node) instead of thousands of per-buffer RankData. Install before the
     (re)capture; restore after. The peer table for that one buffer lives in
-    rank_data slot 0, which the post-reinit `register_buffer` auto-refreshes."""
+    rank_data slot 0, which the post-reinit `register_buffer` auto-refreshes.
+
+    On 0.30 this is load-bearing for a second reason, and the window it has to
+    cover is wider than "the capture" used to mean. `CustomAllreduce.capture()`
+    always calls `register_graph_buffers()` on exit, which exports an IPC
+    handle for every pointer recorded during capture
+    (`custom_all_reduce.cuh:164`, `cudaIpcGetMemHandle`). That is the LEGACY
+    IPC API: it only works on cudaMalloc'd memory and returns
+    CUDA_ERROR_INVALID_VALUE -- 'invalid argument' -- for the VMM-backed memory
+    that semip's `enable_sleep_mode` puts in play. Unpatched, the recorded
+    pointers are raw activations (`custom_all_reduce.py:448` passes
+    `registered=True` while capturing) and any one of them landing in a cumem
+    region kills the process from inside CUDACHECK, with no Python exception to
+    catch. Patched, the only recorded pointer is `buffer_ptrs[rank]`, which is
+    IPC-registered by construction. Job 37414847 (Qwen3.8-Flash-Next TP=8) is
+    the measurement: eight ranks, eight faults, inside the profiling capture --
+    which runs in `determine_available_memory`, before the warmup hook this
+    patch used to be scoped to. Hence the install from `init_device`."""
     try:
         import torch
         from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -217,6 +392,24 @@ def install_force_copy_patch() -> bool:
     _CA.all_reduce = _forced_ar
     _CA.custom_all_reduce = _forced_car
     return True
+
+
+def force_copy_state() -> dict:
+    """Report whether the patch is live and how much traffic it has taken.
+
+    `install_force_copy_patch` returns a bare bool and the first call site
+    discarded it, which is the shape that has cost this ticket three bugs. The
+    counts are the half that matters: the patch is installed from
+    `init_device`, so a non-zero `car_calls` at the warmup install is the
+    evidence that the *profiling* capture -- the one in
+    `determine_available_memory`, which is where Qwen3.8-Flash-Next died --
+    actually went through the copy path. Installed-and-silent is exactly what
+    an installed-but-too-late patch looks like."""
+    return {
+        "active": _fc["active"],
+        "ar_calls": _fc.get("ar_calls", 0),
+        "car_calls": _fc.get("car_calls", 0),
+    }
 
 
 def restore_force_copy_patch() -> None:
@@ -270,6 +463,20 @@ def install_suppress_register_patch() -> bool:
     return True
 
 
+def suppress_register_state() -> dict:
+    """Report whether registration is being skipped, and how often it was.
+
+    `skipped` is the count of `register_graph_buffers` calls the patch
+    swallowed, which is also the number of capture contexts that exited while
+    it was live. Read it BEFORE `restore_suppress_register_patch`, which
+    clears `active`: the count is the only evidence that the window this patch
+    was armed for is the window the capture actually landed in."""
+    return {
+        "active": _sr["active"],
+        "skipped": _sr.get("skipped", 0),
+    }
+
+
 def restore_suppress_register_patch() -> None:
     if not _sr["active"]:
         return
@@ -300,9 +507,14 @@ def install_rank_data_reuse_patch(tensor) -> bool:
     (exactly 8*1024*1024 uint8 on cuda); MUST be paired with restore_rank_data_reuse_patch
     right after the CA is constructed. Returns False if no tensor to reuse.
 
-    Safe because semip runs with VLLM_ALLREDUCE_USE_SYMM_MEM=0 and FlashInfer AR off, so
+    Safe because semip pins VLLM_ALLREDUCE_USE_SYMM_MEM=0 and
+    VLLM_ALLREDUCE_USE_FLASHINFER=0 (vllm_child, both at capture and at reinit), so
     within init_worker_distributed_environment the CA rank_data is the only 8MB-uint8-cuda
-    torch.empty; the one-shot `used` flag guarantees we intercept it at most once."""
+    torch.empty; the one-shot `used` flag guarantees we intercept it at most once.
+    Both are pinned rather than inherited: FlashInfer AR was off by default until
+    vLLM 0.30 turned it on, and this comment asserted it as a fact for one release
+    too long -- the captured graphs then held no `cross_device_reduce` node at all
+    and every TP>1 restore rewrote nothing and faulted."""
     import torch
     if _rd_reuse["active"]:
         return True
@@ -344,6 +556,7 @@ def restore_rank_data_reuse_patch() -> bool:
 def store_snapshot(worker, handle, offset) -> dict:
     """Store this rank's recorded registration + old meta_ptrs on the worker so
     they survive the checkpoint and drive the post-reinit rebind."""
+    _ensure_worker_log_handler()
     ca = _find_ca(worker)
     snap = {
         "handle": handle,
@@ -650,11 +863,19 @@ def _graph_manager_holders(worker):
     `*cudagraph_manager` is `encoder_cudagraph_manager` for multimodal encoders, and
     its FULL graphs go through CUDAGraphWrapper, so source 1 already covers them.
 
-    So `n_managers == 0` is EXPECTED on a V1 model (any Qwen3Moe / Qwen2 / Qwen3_5 /
-    GLM / DeepseekV4 / gpt-oss ...) and is a BUG only on a V2 model. Record
-    `runner_class` in diag rather than inferring it: an empty result is otherwise
-    indistinguishable between the two, which is what made the first read of the
-    Qwen3-235B-A22B-tp4 (Qwen3MoeForCausalLM -> V1) validation run wrong."""
+    So `n_managers == 0` is EXPECTED on a V1 model and is a BUG only on a V2 model.
+    Record `runner_class` in diag rather than inferring it: an empty result is
+    otherwise indistinguishable between the two, which is what made the first read
+    of the Qwen3-235B-A22B-tp4 (Qwen3MoeForCausalLM -> V1) validation run wrong.
+    `runner_class` does NOT disambiguate on its own either -- both runners name the
+    class GPUModelRunner, they differ only by module.
+
+    THE ALLOWLIST IS NOT STABLE ACROSS VLLM VERSIONS. This docstring used to list
+    GLM among the V1 models. On 0.30 GLM-5.3 TP=8 reports `n_managers: 1`, i.e. it
+    has moved to V2, so which source covers the FULL graphs moved with it. Treat
+    the per-model V1/V2 claims here as a reading of one version, not a fact about
+    the model, and rely on the completeness verdict (`_discovery_verdict`) rather
+    than on knowing which source should have supplied what."""
     out = []
     mr = getattr(worker, "model_runner", None)
     if worker is None:
@@ -675,6 +896,121 @@ def _graph_manager_holders(worker):
         return out, None
     return out, (f"{type(mr).__name__} has no cudagraph_manager -- expected on the "
                  f"V1 runner, where FULL graphs live in CUDAGraphWrapper (source 1)")
+
+
+# Depth of the wrapper-entry walk below. 3 reaches entry -> container -> object;
+# the graph has never been deeper than that on any vLLM we have run.
+_ENTRY_SCAN_MAX_DEPTH = 3
+
+
+def _slot_names(obj):
+    """Every ``__slots__`` name declared anywhere in ``type(obj)``'s MRO."""
+    names = []
+    for klass in type(obj).__mro__:
+        slots = getattr(klass, "__slots__", None)
+        if not slots:
+            continue
+        if isinstance(slots, str):
+            names.append(slots)
+            continue
+        try:
+            names.extend(slots)
+        except TypeError:  # pathological __slots__; nothing to read
+            pass
+    return names
+
+
+def _entry_attr_values(obj, include_descriptors):
+    """Attribute values of one object: ``__dict__`` and ``__slots__`` always,
+    non-callable descriptors only when *include_descriptors*.
+
+    Descriptors are opt-in because reading an arbitrary property can raise or do
+    real work; the caller turns them on only for an entry that the cheap scan
+    came up empty on, which is the case we are trying to rescue."""
+    vals = []
+    d = getattr(obj, "__dict__", None)
+    if isinstance(d, dict):
+        vals.extend(d.values())
+    for name in _slot_names(obj):
+        try:
+            vals.append(getattr(obj, name))
+        except Exception:  # noqa: BLE001 - unset slot
+            continue
+    if include_descriptors:
+        for name in dir(obj):
+            if name.startswith("__"):
+                continue
+            try:
+                v = getattr(obj, name)
+            except Exception:  # noqa: BLE001 - property raised; not our graph
+                continue
+            if not callable(v):
+                vals.append(v)
+    return vals
+
+
+def _entry_cuda_graphs(entry, cls):
+    """Every ``torch.cuda.CUDAGraph`` reachable from one wrapper entry.
+
+    Deliberately shape-agnostic. The attribute holding the graph has moved more
+    than once across vLLM versions, and each move is invisible: an entry whose
+    graph we cannot see is indistinguishable from an entry that holds none, so
+    the scan reports the entry, yields nothing, and the rebind goes on to patch
+    a subset. That is exactly what happened on GLM-5.3 under 0.30, where a
+    ``vars()``-only scan turned 51 entries into 0 graphs and the FULL family
+    kept its pre-checkpoint addresses into the first replay.
+
+    Two passes: ``__dict__``/``__slots__`` first, and only if that finds nothing
+    a second pass that also reads non-callable descriptors on the entry itself.
+    """
+    found = []
+    seen_ids = set()
+
+    def _walk(obj, depth, descriptors):
+        if depth > _ENTRY_SCAN_MAX_DEPTH or id(obj) in seen_ids:
+            return
+        seen_ids.add(id(obj))
+        if isinstance(obj, cls):
+            found.append(obj)
+            return
+        if isinstance(obj, dict):
+            items = list(obj.values())
+        elif isinstance(obj, (list, tuple, set, frozenset)):
+            items = list(obj)
+        elif hasattr(obj, "__dict__") or _slot_names(obj):
+            # Descriptors only on the entry itself (depth 0): a dir() sweep of
+            # every nested object would be both slow and needlessly risky.
+            items = _entry_attr_values(obj, descriptors and depth == 0)
+        else:
+            return
+        for it in items:
+            _walk(it, depth + 1, descriptors)
+
+    _walk(entry, 0, False)
+    if not found:
+        seen_ids.clear()
+        _walk(entry, 0, True)
+    return found
+
+
+def _discovery_verdict(diag, n_found):
+    """``(complete, why)`` for a finished discovery pass.
+
+    "Complete" is not "no exception was raised" -- every integrity check in this
+    module runs over the discovered set, so a pass that silently missed a whole
+    graph family audits perfectly clean. These are the cases where the set we
+    hold cannot be trusted to be the whole one."""
+    if diag["n_entries"] and not diag["n_wrapper_graphs"]:
+        return False, (f"{diag['n_entries']} wrapper entries yielded no "
+                       f"CUDAGraph; every graph came from the manager "
+                       f"({diag['n_manager_graphs']})")
+    if diag["n_entries_without_graph"]:
+        return False, (f"{diag['n_entries_without_graph']} of "
+                       f"{diag['n_entries']} wrapper entries yielded no "
+                       f"CUDAGraph")
+    if not n_found:
+        return False, "no captured CUDA graphs found by any source"
+    return True, None
 
 
 def _find_captured_graphs(worker=None):
@@ -727,6 +1063,24 @@ def _find_captured_graphs(worker=None):
     work, but passing None silently reverts to the piecewise-only bug -- hence
     diag["src"] records which sources actually contributed.
 
+    NEITHER SOURCE CAN BE ASSUMED TO COVER ITS HALF. Both the entry layout and
+    the V1/V2 split have moved under us, and a source that quietly contributes
+    nothing looks exactly like a source that had nothing to contribute. GLM-5.3
+    on 0.30: `n_wrappers: 1, n_entries: 51, n_manager_graphs: 51,
+    n_cudagraph_objs: 51` -- 51 entries yielded 0 graphs because the CUDAGraph
+    was no longer on the entry's `__dict__`, the manager supplied the other
+    family, and the rebind patched half the graphs and reported success. The
+    restore then died on `cudaErrorIllegalAddress` in the first `engine.step()`.
+    Against 35B-A3B TP=4, which restores cleanly: `n_wrappers: 41,
+    n_entries: 2091, n_manager_graphs: 51, n_cudagraph_objs: 2142`.
+
+    Hence two defences, both here rather than in the caller: `_entry_cuda_graphs`
+    is shape-agnostic about where the graph sits, and `_discovery_verdict` sets
+    diag["complete"], which `rewrite_addrs_in_graphs` refuses to report success
+    without. The audits downstream (topo_readback, stale_ca_audit) range over the
+    discovered set and so are structurally unable to notice a missing family --
+    they returned bad=0 on the GLM run above.
+
     Topology needs keep_graph=True (install_keepgraph_patch, on __new__); exec may
     be 0 for a shape captured-but-not-yet-instantiated -- we patch topology for all
     and exec for the instantiated ones (later instantiate() inherits the patched
@@ -741,7 +1095,14 @@ def _find_captured_graphs(worker=None):
             "n_topo_ok": 0, "n_exec_ok": 0, "n_topo_fail": 0,
             "n_uninstantiated": 0, "n_managers": 0, "n_manager_graphs": 0,
             "n_dup_handles": 0, "src": None, "err": None,
-            "runner_class": None, "mgr_why": None}
+            "runner_class": None, "mgr_why": None,
+            # Source 1's own contribution, and the completeness verdict built
+            # from it. Before these existed, "source 1 found nothing" was only
+            # inferable by subtracting n_manager_graphs from n_cudagraph_objs
+            # after the fact, and nothing acted on it.
+            "n_wrapper_graphs": 0, "n_entries_without_graph": 0,
+            "n_gc_fallback_graphs": 0,
+            "complete": False, "incomplete_why": None}
     try:
         import torch
         cls = torch.cuda.CUDAGraph
@@ -771,16 +1132,13 @@ def _find_captured_graphs(worker=None):
                     continue
                 for entry in m.values():
                     diag["n_entries"] += 1
-                    vals = (list(vars(entry).values())
-                            if hasattr(entry, "__dict__") else [])
-                    for v in vals:
-                        if isinstance(v, cls):
-                            if id(v) not in seen:
-                                seen.add(id(v)); cgs.append(v)
-                        elif isinstance(v, (list, tuple)):
-                            for it in v:
-                                if isinstance(it, cls) and id(it) not in seen:
-                                    seen.add(id(it)); cgs.append(it)
+                    got = _entry_cuda_graphs(entry, cls)
+                    if not got:
+                        diag["n_entries_without_graph"] += 1
+                    for v in got:
+                        if id(v) not in seen:
+                            seen.add(id(v)); cgs.append(v)
+                            diag["n_wrapper_graphs"] += 1
         # Source 2: the FULL graphs, which live in no registry (see docstring).
         # V2 runner only -- on V1 there is no manager and source 1 already has them.
         mgr_ids = set()
@@ -801,22 +1159,47 @@ def _find_captured_graphs(worker=None):
                 diag["n_manager_graphs"] += 1
         if diag["n_managers"]:
             diag["src"] = "vllm_wrappers+manager" if wrappers else "manager"
-        # Fallback (registries unexpectedly empty): unfreeze the heap, gc scan,
-        # then re-freeze -- so we still find graphs if the wrapper path changes.
-        if not cgs:
-            import gc
-            gc.unfreeze()
+        diag["complete"], diag["incomplete_why"] = _discovery_verdict(diag,
+                                                                      len(cgs))
+        # Fallback: unfreeze the heap, gc scan, then re-freeze. This used to run
+        # only when the registries came back completely empty, which is why it
+        # sat out the GLM failure -- the manager had supplied 51 graphs, so
+        # `cgs` was non-empty and the half-empty result looked fine. Trigger on
+        # any incomplete verdict, not just a barren one.
+        if not diag["complete"]:
+            n_before = len(cgs)
             try:
-                for o in gc.get_objects():
-                    try:
-                        ok = isinstance(o, cls)
-                    except Exception:  # noqa: BLE001
-                        ok = False
-                    if ok and id(o) not in seen:
-                        seen.add(id(o)); cgs.append(o)
-            finally:
-                gc.freeze()
-            diag["src"] = "gc_unfreeze_fallback"
+                import gc
+                gc.unfreeze()
+                try:
+                    for o in gc.get_objects():
+                        try:
+                            ok = isinstance(o, cls)
+                        except Exception:  # noqa: BLE001
+                            ok = False
+                        if ok and id(o) not in seen:
+                            seen.add(id(o)); cgs.append(o)
+                finally:
+                    gc.freeze()
+            except Exception as ex:  # noqa: BLE001 - stay incomplete, say why
+                diag["incomplete_why"] = (f"{diag['incomplete_why']}; "
+                                          f"gc fallback failed: "
+                                          f"{type(ex).__name__}: {ex}")
+            else:
+                diag["n_gc_fallback_graphs"] = len(cgs) - n_before
+                diag["src"] = ("gc_unfreeze_fallback" if not n_before
+                               else f"{diag['src']}+gc_unfreeze_fallback")
+                # The scan walks every GC-tracked object, so once it has run
+                # cleanly the set is a superset of whatever the registries hid.
+                # An empty result is still incomplete: that means no captured
+                # graph exists anywhere, which is never true post-restore.
+                if cgs:
+                    diag["complete"], diag["incomplete_why"] = True, None
+                else:
+                    diag["complete"] = False
+                    diag["incomplete_why"] = (
+                        "no captured CUDA graphs found by any source, "
+                        "including the gc fallback")
         emitted = set()
         mgr_handles = []
         for o in cgs:
@@ -855,6 +1238,309 @@ def _find_captured_graphs(worker=None):
     log.info("Part B _find_captured_graphs: %s",
              {k: v for k, v in diag.items() if not k.startswith("_")})
     return pairs, diag
+
+
+# ---------------------------------------------------------------------------
+# Instantiation census and pre-dump instantiation.
+#
+# Background, because it inverts what the reuse investigation assumed for nine
+# waves. ``install_keepgraph_patch`` forces ``keep_graph=True`` so that
+# ``raw_cuda_graph()`` can serve the rebind. torch's ``CUDAGraph::capture_end``
+# instantiates *only* when ``!keep_graph_``, so that patch also, as a side
+# effect, stopped vLLM's graphs from being instantiated at capture: they are
+# instantiated lazily, on first replay, instead.
+#
+# The consequence is that an image dumped after N batch shapes have executed
+# carries execs for those N shapes and for nothing else -- wave 9 measured
+# n_exec_ok=42 against n_topo_ok=2142 on every rank of every reuse arm, and 42
+# is exactly n_wrappers, i.e. one shape driven through all 42 wrappers by the
+# dump-time sampling job. That was read as CRIU destroying execs, but it cannot
+# be: ``raw_cuda_graph_exec()`` raises on a host-side ``TORCH_CHECK`` of the
+# ``has_graph_exec_`` bool, which cuCheckpointProcessCheckpoint/Restore has no
+# way to reach. The 2100 were never built in the first place, and the
+# post-restore warmup ladder is the first code to build them.
+# ---------------------------------------------------------------------------
+# The bucket for a graph the heap scan found. It reached us with no entry and
+# so no shape, and saying that is better than inventing one: a census that reads
+# `{'<gc-recovered>': 4029}` is legible, one that folds them into a real shape
+# claims 4029 captures at a batch size that never ran.
+_GC_SHAPE_KEY = "<gc-recovered>"
+
+
+def _shape_label(key) -> str:
+    """Compact label for a capture-entry key.
+
+    An int batch size on the wrapper path; a BatchExecutionDescriptor on the
+    manager path. Only ever used as a histogram bucket, so any stable, short
+    rendering will do.
+    """
+    if key is _GC_SHAPE_KEY:
+        return key
+    if isinstance(key, int):
+        return str(key)
+    if all(hasattr(key, a) for a in
+           ("num_tokens", "num_reqs", "uniform_token_count")):
+        return "(%s,%s,%s)" % (key.num_tokens, key.num_reqs,
+                               key.uniform_token_count)
+    return repr(key)[:48]
+
+
+def _collect_graph_entries(worker=None):
+    """Every captured graph as ``(shape_key, torch.cuda.CUDAGraph)``.
+
+    ``_find_captured_graphs`` discards the dict key on its way to the (g, e) int
+    pairs the rewrite needs, but the key is the shape the entry was captured for,
+    and the instantiation census is only legible per shape: "42 of 2142" says
+    nothing on its own, ``{one shape: 42}`` says the image only ever ran one
+    batch. Mirrors that function's three freeze-immune sources, and dedups by
+    object identity for the same reason.
+
+    The gc fallback is the third of those, and it is not optional. This function
+    used to stop after the wrappers and the manager on the strength of a claim --
+    kept in this docstring for several waves -- that a heap scan returns nothing
+    here. It returns plenty: vLLM 0.30 keeps piecewise segment graphs behind
+    bound methods (``segments.append(graph.replay)``), which no attribute walk of
+    any depth reaches, and on GLM-5.3 that is 4029 of 4080 graphs. Reporting a
+    census over the remaining 51 is worse than reporting none, because the
+    dump-side ``COLD IMAGE`` check reads it and 51 of 51 instantiated looks warm.
+    """
+    entries = []
+    diag = {"n_wrappers": 0, "n_entries": 0, "n_managers": 0, "err": None,
+            "n_entries_without_graph": 0, "n_wrapper_graphs": 0,
+            "n_manager_graphs": 0, "n_gc_fallback_graphs": 0,
+            "complete": False, "incomplete_why": None}
+    try:
+        import torch
+        cls = torch.cuda.CUDAGraph
+        wrappers = []
+        try:
+            from vllm.compilation.cuda_graph import CUDAGraphWrapper
+            wrappers += list(CUDAGraphWrapper._all_instances)
+        except Exception as ex:  # noqa: BLE001
+            diag["err"] = f"import CUDAGraphWrapper: {type(ex).__name__}: {ex}"
+        try:
+            from vllm.compilation.breakable_cudagraph import (
+                BreakableCUDAGraphWrapper)
+            wrappers += list(BreakableCUDAGraphWrapper._all_instances)
+        except Exception:  # noqa: BLE001
+            pass
+        diag["n_wrappers"] = len(wrappers)
+        seen = set()
+
+        def _emit(key, v):
+            if isinstance(v, cls) and id(v) not in seen:
+                seen.add(id(v))
+                entries.append((key, v))
+
+        for w in wrappers:
+            for attr in ("concrete_cudagraph_entries", "entries"):
+                m = getattr(w, attr, None)
+                if not isinstance(m, dict):
+                    continue
+                for key, entry in m.items():
+                    diag["n_entries"] += 1
+                    n_before = len(entries)
+                    vals = (list(vars(entry).values())
+                            if hasattr(entry, "__dict__") else [])
+                    for v in vals:
+                        if isinstance(v, (list, tuple)):
+                            for it in v:
+                                _emit(key, it)
+                        else:
+                            _emit(key, v)
+                    if len(entries) == n_before:
+                        diag["n_entries_without_graph"] += 1
+        diag["n_wrapper_graphs"] = len(entries)
+        managers, _why = _graph_manager_holders(worker)
+        for mgr in managers:
+            graphs = getattr(mgr, "graphs", None)
+            if not isinstance(graphs, dict):
+                continue
+            diag["n_managers"] += 1
+            n_before = len(entries)
+            for key, g in graphs.items():
+                _emit(key, g)
+            diag["n_manager_graphs"] += len(entries) - n_before
+        # Same verdict and same fallback as `_find_captured_graphs`, and for the
+        # same reason: every number this function feeds is computed over the set
+        # it returns, so a pass that missed a whole family reports a clean census
+        # of the part it found. Trigger on any incomplete verdict, not just a
+        # barren one -- the manager's 51 made GLM's result non-empty and the
+        # half-empty set looked fine.
+        diag["complete"], diag["incomplete_why"] = _discovery_verdict(
+            diag, len(entries))
+        if not diag["complete"]:
+            n_before = len(entries)
+            try:
+                import gc
+                gc.unfreeze()
+                try:
+                    for o in gc.get_objects():
+                        try:
+                            ok = isinstance(o, cls)
+                        except Exception:  # noqa: BLE001
+                            ok = False
+                        if ok and id(o) not in seen:
+                            seen.add(id(o))
+                            entries.append((_GC_SHAPE_KEY, o))
+                finally:
+                    gc.freeze()
+            except Exception as ex:  # noqa: BLE001 - stay incomplete, say why
+                diag["incomplete_why"] = (f"{diag['incomplete_why']}; "
+                                          f"gc fallback failed: "
+                                          f"{type(ex).__name__}: {ex}")
+            else:
+                diag["n_gc_fallback_graphs"] = len(entries) - n_before
+                if entries:
+                    diag["complete"], diag["incomplete_why"] = True, None
+                else:
+                    diag["complete"] = False
+                    diag["incomplete_why"] = (
+                        "no captured CUDA graphs found by any source, "
+                        "including the gc fallback")
+    except Exception as e:  # noqa: BLE001
+        diag["err"] = f"{type(e).__name__}: {e}"
+    return entries, diag
+
+
+def graph_exec_census(worker=None) -> dict:
+    """Which captured graphs hold a cudaGraphExec_t right now, bucketed by shape.
+
+    Read-only and cheap -- ``raw_cuda_graph_exec()`` is a host-side check on a
+    bool, not a driver round trip -- so this is safe to call on both sides of the
+    checkpoint and between warmup rungs.
+
+    Three readings answer three different questions. Before the dump it says
+    whether the image is going out warm (``n_exec_ok`` at the full graph count)
+    or cold (at the handful of shapes the dump-time job happened to run). After
+    the rebind it says what the restore inherited. Across a single warmup rung it
+    says whether that rung replayed an existing exec or built one, which is the
+    distinction the whole reuse-versus-full result turns on.
+    """
+    _ensure_worker_log_handler()
+    out = {"step": "graph_exec_census"}
+    try:
+        entries, diag = _collect_graph_entries(worker)
+        by_shape: dict = {}
+        n_inst = n_uninst = n_topo_fail = 0
+        for key, o in entries:
+            try:
+                o.raw_cuda_graph()
+            except Exception:  # noqa: BLE001 - captured without keep_graph
+                n_topo_fail += 1
+            try:
+                o.raw_cuda_graph_exec()
+            except Exception:  # noqa: BLE001 - captured, never instantiated
+                n_uninst += 1
+                continue
+            n_inst += 1
+            label = _shape_label(key)
+            by_shape[label] = by_shape.get(label, 0) + 1
+        # Histogram of the histogram: 51 shapes x 42 wrappers prints as
+        # {42: 51} instead of 51 near-identical entries, and a partial
+        # instantiation still stands out as more than one bucket.
+        count_hist: dict = {}
+        for n in by_shape.values():
+            count_hist[n] = count_hist.get(n, 0) + 1
+        out.update(discovery=diag, n_graphs=len(entries), n_exec_ok=n_inst,
+                   n_uninstantiated=n_uninst, n_topo_fail=n_topo_fail,
+                   n_shapes_instantiated=len(by_shape),
+                   execs_per_shape_hist=count_hist,
+                   shapes_sample=sorted(by_shape)[:8], ok=True)
+        log.info("GRAPH CENSUS: graphs=%d exec_ok=%d uninstantiated=%d "
+                 "shapes=%d per_shape=%s", len(entries), n_inst, n_uninst,
+                 len(by_shape), count_hist)
+    except Exception as e:  # noqa: BLE001
+        out["ok"] = False
+        out["error"] = f"{type(e).__name__}: {e}"
+        log.warning("graph_exec_census failed: %s", out["error"])
+    return out
+
+
+def instantiate_captured_graphs(worker=None) -> dict:
+    """Build the missing cudaGraphExec_t for every captured graph, before the dump.
+
+    Uses ``torch.cuda.CUDAGraph.instantiate()`` rather than a hand-rolled
+    ``cuGraphInstantiateWithFlags``. The object then owns ``graph_exec_`` and its
+    own ``replay()`` finds it, so there is no handback step and no monkeypatch,
+    and the instantiate flags match what ``capture_end`` would have used
+    (AutoFreeOnLaunch, plus UseNodePriority on a new enough CUDA). E5 hand-rolled
+    the call with flags=0 *and* skipped every graph whose
+    ``raw_cuda_graph_exec()`` raised, which is precisely the set that needed
+    instantiating -- hence its recorded verdict that the patch never fired on the
+    faulting path.
+
+    Belongs before the checkpoint, not after a restore. The point is that the
+    image goes out with the execs already built, so the post-restore warmup
+    replays rather than instantiating, and the rebind's exec-level rewrite covers
+    every graph instead of the few the dump-time job happened to touch.
+
+    Memory is not a new risk: stock vLLM, with ``keep_graph=False``, holds this
+    same full set of execs at this same ``gpu_memory_utilization``. The free-VRAM
+    delta is reported anyway so that an OOM here is attributable on sight.
+    """
+    _ensure_worker_log_handler()
+    out = {"step": "instantiate_captured_graphs"}
+    try:
+        import torch
+        entries, diag = _collect_graph_entries(worker)
+        out["discovery"] = diag
+        if entries and not hasattr(entries[0][1], "instantiate"):
+            out["ok"] = False
+            out["error"] = ("torch.cuda.CUDAGraph has no instantiate(); this "
+                            "build cannot pre-instantiate")
+            log.warning("instantiate_captured_graphs: %s", out["error"])
+            return out
+        try:
+            free_before = int(torch.cuda.mem_get_info()[0])
+        except Exception:  # noqa: BLE001
+            free_before = -1
+        n_ok = n_already = n_fail = n_topo_fail = 0
+        errs = []
+        for _key, o in entries:
+            try:
+                o.raw_cuda_graph()
+            except Exception:  # noqa: BLE001 - no topology to instantiate from
+                n_topo_fail += 1
+                continue
+            try:
+                o.raw_cuda_graph_exec()
+            except Exception:  # noqa: BLE001 - the ones we are here for
+                pass
+            else:
+                # Already instantiated. instantiate() would destroy and rebuild
+                # a live exec, so leave it: the dump-time job's shapes are
+                # exactly the ones known to work.
+                n_already += 1
+                continue
+            try:
+                o.instantiate()
+                n_ok += 1
+            except Exception as ex:  # noqa: BLE001
+                n_fail += 1
+                if len(errs) < 6:
+                    errs.append(f"{type(ex).__name__}: {ex}")
+        try:
+            free_after = int(torch.cuda.mem_get_info()[0])
+        except Exception:  # noqa: BLE001
+            free_after = -1
+        out.update(n_graphs=len(entries), n_instantiated=n_ok,
+                   n_already=n_already, n_failed=n_fail,
+                   n_topo_fail=n_topo_fail,
+                   free_bytes_before=free_before, free_bytes_after=free_after,
+                   ok=(n_fail == 0))
+        if errs:
+            out["errors"] = errs
+        log.info("INSTANTIATE ALL: graphs=%d built=%d already=%d failed=%d "
+                 "topo_fail=%d vram_used=%.3f GiB", len(entries), n_ok,
+                 n_already, n_fail, n_topo_fail,
+                 ((free_before - free_after) / 2**30
+                  if free_before >= 0 and free_after >= 0 else float("nan")))
+    except Exception as e:  # noqa: BLE001
+        out["ok"] = False
+        out["error"] = f"{type(e).__name__}: {e}"
+        log.warning("instantiate_captured_graphs failed: %s", out["error"])
+    return out
 
 
 def dump_sp_nccl_nodes(worker, max_samples=48, n_words=8):
@@ -1405,7 +2091,15 @@ def _force_recommit_ca_nodes(worker, out) -> dict:
                 mn += _recommit_ca_memcpy_node(cu, e, node, ctx, ca_buf_set)
         out["kernel_nodes_recommitted"] = kn
         out["memcpy_nodes_recommitted"] = mn
-        out["ok"] = True
+        # Same gate as the rewrite path: this is the other way out of
+        # rewrite_addrs_in_graphs, so leaving it ungated would keep the
+        # disk-wake branch reporting success over a partial graph set.
+        out["ok"] = bool(gdiag.get("complete"))
+        if not out["ok"]:
+            out["error"] = (f"incomplete graph discovery: "
+                            f"{gdiag.get('incomplete_why')}")
+            log.error("force_recommit: %s -- refusing to report success",
+                      out["error"])
         log.info("FORCE_RECOMMIT: %d graphs; recommitted kernel=%d memcpy=%d "
                  "(identical values, addr_map empty)", len(pairs), kn, mn)
     except Exception as ex:  # noqa: BLE001
@@ -1491,7 +2185,18 @@ def rewrite_addrs_in_graphs(worker, addr_map) -> dict:
             log.warning("audit: _find_ca failed: %s", ex)
         out["stale_ca_audit"] = _audit_stale_ca_addrs(cu, pairs, addr_map,
                                                      ca_for_audit)
-        out["ok"] = True
+        # Patching every graph we found is not success if we did not find them
+        # all. topo_readback and stale_ca_audit both range over `pairs`, so they
+        # cannot see a missing family -- on GLM-5.3 they returned bad=0 for a
+        # process that faulted on its first replay. The discovery verdict is the
+        # only check here with an outside view.
+        out["ok"] = bool(gdiag.get("complete"))
+        if not out["ok"]:
+            out["error"] = (f"incomplete graph discovery: "
+                            f"{gdiag.get('incomplete_why')}")
+            log.error("rewrite_addrs_in_graphs: %s -- refusing to report a "
+                      "successful rebind; the unpatched graphs would fault on "
+                      "first replay", out["error"])
         log.info("rewrite_addrs_in_graphs: %d graphs (%d from manager); kernel %d "
                  "nodes/%d slots (manager %d); memcpy %d nodes/%d ptrs (manager %d); "
                  "topo_readback ok=%s(%d/%d ok, %d bad, %d err); audit bad=%s "
@@ -2815,7 +3520,8 @@ def _e11_walk(worker) -> list:
     E9 rfg hook replays self.graphs[desc]); it carries the desc natively; and crucially
     capture_model() REPOPULATES it on the fresh side. The earlier version enumerated
     _find_captured_graphs() (the CUDAGraphWrapper piecewise registry) instead -- but
-    _semip_cleargraph EMPTIES those wrapper entries and the manager-driven recapture does
+    the graph-clearing step (_semip_cleargraph, retired with `full` mode on
+    2026-09-24) EMPTIED those wrapper entries and the manager-driven recapture did
     NOT refill them, so the fresh dump came back EMPTY -> matched pairs=0 and the (1,1,1)
     graph was never even walked (NO_FAULTING_DESC_MATCHED). We now walk the manager
     directly. Fall back to the wrapper scan (desc=None, sig-matched) only if no manager
@@ -3803,6 +4509,7 @@ def rebind_after_reinit(worker) -> dict:
     node); the per-buffer RankData is rank_data slot 0, which the new CA's
     register_buffer already refilled at the same (stable) VA. So we just rewrite
     meta_ptrs + buffer_ptrs old->new across the captured graphs."""
+    _ensure_worker_log_handler()
     if not enabled():
         return {"enabled": False}
     out: dict = {"enabled": True, "step": "rebind_after_reinit"}
