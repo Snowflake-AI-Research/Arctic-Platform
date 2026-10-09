@@ -72,6 +72,8 @@ class ModelConfig(BaseModel):
     # does not error).
     forest_cascade_attn_configs: str | None = "{}"
 
+    yarn_factors: list[float] = Field(default_factory=list, exclude=True)
+    text_config_overrides: dict[str, Any] = Field(default_factory=dict, exclude=True)
     extra_engine_kwargs: dict[str, Any] = Field(default_factory=dict, exclude=True)
     extra_env: dict[str, str] = Field(default_factory=dict, exclude=True)
     ray_num_gpus: float | None = Field(default=None, exclude=True)
@@ -116,6 +118,15 @@ class ModelConfig(BaseModel):
     def to_engine_kwargs(self) -> dict[str, Any]:
         kwargs = {k: v for k, v in self.model_dump().items() if v is not None}
         kwargs.update(self.extra_engine_kwargs)
+        if self.yarn_factors:
+            kwargs["additional_config"] = {
+                **kwargs.get("additional_config", {}), "yarn_factors": self.yarn_factors
+            }
+        if len(self.text_config_overrides) > 0:
+            if "hf_overrides" in self.extra_engine_kwargs:
+                raise ValueError("text_config_overrides cannot be combined with extra_engine_kwargs.hf_overrides")
+            # Resolved in the worker: the coordinator calling this may not have the model files.
+            kwargs["text_config_overrides"] = self.text_config_overrides
         if not arctic_inference_effective_enabled(self.extra_env):
             kwargs.pop("forest_cascade_attn_configs", None)
         return kwargs

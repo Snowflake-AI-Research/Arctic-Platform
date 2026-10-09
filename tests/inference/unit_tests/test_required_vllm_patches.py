@@ -5,11 +5,15 @@ from arctic_platform.inference.vllm import (
     router_replay,
     spec_decode_grammar,
     xgrammar_stop_mask,
+    yarn_factors,
 )
 
 
 def test_required_vllm_patches_are_applied_together(monkeypatch):
     calls = []
+    monkeypatch.setattr(
+        yarn_factors, "ensure_yarn_factor_patches", lambda: calls.append("yarn")
+    )
     monkeypatch.setattr(
         router_replay,
         "ensure_router_replay_vllm_patches",
@@ -39,6 +43,7 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
     required_patches.apply_required_vllm_patches()
 
     assert calls == [
+        "yarn",
         "router",
         "xgrammar",
         "dense_prompt_logprobs",
