@@ -1007,6 +1007,12 @@ def test_reasoning_effort_is_mapped_for_the_template(monkeypatch):
     assert rendered.request.reasoning_effort == "xhigh"
 
 
+def test_none_is_refused_where_thinking_cannot_be_turned_off(monkeypatch):
+    with pytest.raises(ChatInputError) as raised:
+        _rendered(monkeypatch, "MiniMaxM2ForCausalLM", reasoning_effort="none")
+    assert (raised.value.code, raised.value.param) == ("invalid_chat_request", "reasoning_effort")
+
+
 class _HfRenderer:
     pass
 

@@ -9,7 +9,13 @@ import pytest
 from cpu_support import load_library
 
 load_library()
-from arctic_platform.inference.server.chat import CHAT_MODELS, ChatModel, resolve_chat_model
+from arctic_platform.inference.server.chat import (
+    CHAT_MODELS,
+    REASONING_EFFORTS,
+    ChatInputError,
+    ChatModel,
+    resolve_chat_model,
+)
 
 MODEL_PACKAGE = Path(__file__).resolve().parents[3] / "arctic_platform" / "model"
 
@@ -25,6 +31,15 @@ LOADER_ARCHITECTURES = {
     },
     "qwen3_5_moe": {"Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"},
     "glm_moe_dsa": {"GlmMoeDsaForCausalLM"},
+    "generic_moe": {
+        "Qwen3MoeForCausalLM",
+        "Glm4MoeForCausalLM",
+        "MiniMaxM2ForCausalLM",
+        "AfmoeForCausalLM",
+        "NemotronHForCausalLM",
+    },
+    "glm5_next": {"Glm5NextForConditionalGeneration"},
+    "qwen4_exp": {"Qwen4ExpForConditionalGeneration"},
 }
 # Trainable architectures deliberately left without chat mode, with the reason.
 TRAINED_WITHOUT_CHAT: dict[str, str] = {}
@@ -82,6 +97,15 @@ def test_every_trainable_architecture_has_a_chat_decision():
         ("DeepseekV4ForCausalLM", "deepseek_v4", "deepseek_v4", True),
         ("DeepseekV4ForConditionalGeneration", "deepseek_v4", "deepseek_v4", True),
         ("GptOssForCausalLM", "openai_gptoss", "openai", False),
+        # vLLM 0.30 recipes and docs pair these parsers with each family.
+        ("Glm4MoeForCausalLM", "glm47", "glm47", True),
+        ("Glm5NextForConditionalGeneration", "glm47", "glm47", False),
+        ("Glm5NextForCausalLM", "glm47", "glm47", False),
+        ("Qwen4ExpForConditionalGeneration", "qwen3", "qwen3_coder", True),
+        ("Qwen4ExpForCausalLM", "qwen3", "qwen3_coder", True),
+        ("MiniMaxM2ForCausalLM", "minimax_m2", "minimax_m2", False),
+        ("AfmoeForCausalLM", "deepseek_r1", "qwen3_coder", False),
+        ("NemotronHForCausalLM", "nemotron_v3", "qwen3_coder", True),
     ],
 )
 def test_catalog_architectures_get_their_parsers(
@@ -129,13 +153,81 @@ def test_unknown_architecture_has_no_chat_unless_parsers_are_given():
         ("GlmMoeDsaForCausalLM", "high", "high"),
         ("GlmMoeDsaForCausalLM", "max", "max"),
         ("GlmMoeDsaForCausalLM", "none", "none"),
+        ("GlmMoeDsaForCausalLM", "xhigh", "max"),
         # vLLM's DeepSeek-V4 tokenizer and gpt-oss's Harmony map these themselves.
         ("DeepseekV4ForCausalLM", "medium", "medium"),
         ("GptOssForCausalLM", "low", "low"),
         ("GptOssForCausalLM", None, None),
+        # Harmony takes low, medium and high only.
+        ("GptOssForCausalLM", "minimal", "low"),
+        ("GptOssForCausalLM", "xhigh", "high"),
+        # Qwen3.8 refuses "minimal".
+        ("Qwen3_5ForConditionalGeneration", "minimal", "low"),
+        ("Qwen4ExpForConditionalGeneration", "high", "xhigh"),
+        # GLM-5.3-Flash takes low and high, and reads anything else as Max.
+        ("Glm5NextForConditionalGeneration", "minimal", "low"),
+        ("Glm5NextForConditionalGeneration", "medium", "high"),
+        ("Glm5NextForConditionalGeneration", "xhigh", "max"),
     ],
 )
 def test_reasoning_effort_reaches_the_template_as_the_family_names_it(
     architecture, requested, template
 ):
     assert resolve_chat_model(architecture).template_reasoning_effort(requested) == template
+
+
+ANY = None
+# Levels each family's template (or vLLM's renderer for it) accepts; ANY for
+# templates that ignore the value. From the checkpoints' chat templates and
+# vLLM 0.30: Qwen3.8 raises outside low/medium/xhigh; GLM-5.3-Flash reads
+# anything but low/high as Max; Harmony raises outside low/medium/high
+# (harmony_utils.py:65); vLLM's DeepSeek-V4 tokenizer maps every value
+# (tokenizers/deepseek_v4.py:43).
+TEMPLATE_EFFORTS = {
+    "Qwen3ForCausalLM": ANY,
+    "Qwen3MoeForCausalLM": ANY,
+    "Qwen3_5ForCausalLM": {"low", "medium", "xhigh"},
+    "Qwen3_5ForConditionalGeneration": {"low", "medium", "xhigh"},
+    "Qwen3_5MoeForCausalLM": {"low", "medium", "xhigh"},
+    "Qwen3_5MoeForConditionalGeneration": {"low", "medium", "xhigh"},
+    "Qwen4ExpForCausalLM": {"low", "medium", "xhigh"},
+    "Qwen4ExpForConditionalGeneration": {"low", "medium", "xhigh"},
+    "GlmMoeDsaForCausalLM": {"high", "max"},
+    "Glm4MoeForCausalLM": ANY,
+    "Glm5NextForCausalLM": {"low", "high", "max"},
+    "Glm5NextForConditionalGeneration": {"low", "high", "max"},
+    "DeepseekV4ForCausalLM": ANY,
+    "DeepseekV4ForConditionalGeneration": ANY,
+    "GptOssForCausalLM": {"low", "medium", "high"},
+    "MiniMaxM2ForCausalLM": ANY,
+    "AfmoeForCausalLM": ANY,
+    "NemotronHForCausalLM": ANY,
+}
+
+
+def test_every_chat_model_lists_the_efforts_its_template_takes():
+    assert TEMPLATE_EFFORTS.keys() == CHAT_MODELS.keys()
+
+
+@pytest.mark.parametrize("architecture", sorted(CHAT_MODELS))
+@pytest.mark.parametrize("effort", sorted(REASONING_EFFORTS - {"none"}))
+def test_every_accepted_effort_reaches_a_level_the_template_takes(architecture, effort):
+    accepted = TEMPLATE_EFFORTS[architecture]
+    level = CHAT_MODELS[architecture].template_reasoning_effort(effort)
+    assert accepted is ANY or level in accepted
+
+
+@pytest.mark.parametrize("architecture", sorted(CHAT_MODELS))
+def test_none_turns_thinking_off_or_is_refused(architecture):
+    model = CHAT_MODELS[architecture]
+    if model.thinking_optional:
+        # vLLM hands the template enable_thinking=False.
+        assert model.template_reasoning_effort("none") == "none"
+    else:
+        # Thinking can't be turned off, so "none" would silently think.
+        with pytest.raises(ChatInputError) as raised:
+            model.template_reasoning_effort("none")
+        assert (raised.value.code, raised.value.param) == (
+            "invalid_chat_request",
+            "reasoning_effort",
+        )

@@ -34,29 +34,38 @@ class ChatModel:
     reasoning_parser: str | None
     tool_call_parser: str | None
     # Whether reasoning_effort="none" turns thinking off (vLLM passes the
-    # template enable_thinking=False).
+    # template enable_thinking=False). If not, "none" is refused.
     thinking_optional: bool = False
     reasoning_efforts: Mapping[str, str] = MappingProxyType({})
 
     def template_reasoning_effort(self, effort):
+        if effort == "none" and not self.thinking_optional:
+            raise ChatInputError("invalid_chat_request", "reasoning_effort")
         return self.reasoning_efforts.get(effort, effort)
 
 
-_QWEN3 = ChatModel("qwen3", "hermes", thinking_optional=True)
-# Qwen3.8's template takes low, medium and xhigh and refuses "high"; Qwen3.5's
-# and 3.6's, on the same architectures, ignore the value.
+# Qwen3.8's template takes low, medium and xhigh and raises on anything else;
+# Qwen3.5's and 3.6's, on the same architectures, ignore the value.
 _QWEN3_5 = ChatModel(
     "qwen3",
     "qwen3_coder",
     thinking_optional=True,
-    reasoning_efforts=MappingProxyType({"high": "xhigh"}),
+    reasoning_efforts=MappingProxyType({"minimal": "low", "high": "xhigh", "max": "xhigh"}),
 )
+_QWEN3 = ChatModel("qwen3", "hermes", thinking_optional=True)
 _DEEPSEEK_V4 = ChatModel("deepseek_v4", "deepseek_v4", thinking_optional=True)
+# GLM-5.3-Flash always thinks, and its template takes Low and High, reading
+# anything else as Max.
+_GLM5_NEXT = ChatModel(
+    "glm47",
+    "glm47",
+    reasoning_efforts=MappingProxyType({"minimal": "low", "medium": "high", "xhigh": "max"}),
+)
 # Names as vLLM resolves them (``model_config.architecture``). Parser names are
-# vLLM's registered ones. tokenizer_mode is left to vLLM, which picks
-# deepseek_v4 for DeepSeek-V4 by architecture. vLLM's DeepSeek-V4 tokenizer and
-# gpt-oss's Harmony renderer map reasoning_effort themselves; Harmony refuses
-# "none", since gpt-oss always reasons.
+# vLLM's registered ones, as its recipes pair them. tokenizer_mode is left to
+# vLLM, which picks deepseek_v4 for DeepSeek-V4 by architecture. vLLM's
+# DeepSeek-V4 tokenizer maps every reasoning_effort itself. Families whose
+# templates ignore reasoning_effort get no mapping.
 CHAT_MODELS = MappingProxyType(
     {
         "Qwen3ForCausalLM": _QWEN3,
@@ -65,19 +74,39 @@ CHAT_MODELS = MappingProxyType(
         "Qwen3_5ForConditionalGeneration": _QWEN3_5,
         "Qwen3_5MoeForCausalLM": _QWEN3_5,
         "Qwen3_5MoeForConditionalGeneration": _QWEN3_5,
-        # GLM-5's template has two levels, High for "high" and Max for anything
-        # else (its default), so lower requests map to High rather than Max.
+        # Qwen3.8-Flash-Next.
+        "Qwen4ExpForCausalLM": _QWEN3_5,
+        "Qwen4ExpForConditionalGeneration": _QWEN3_5,
+        # GLM-5.2's template has High for "high" and Max for anything else (its
+        # default), so lower requests map to High rather than Max. GLM-5's and
+        # 5.1's ignore the value.
         "GlmMoeDsaForCausalLM": ChatModel(
             "glm47",
             "glm47",
             thinking_optional=True,
             reasoning_efforts=MappingProxyType(
-                {"minimal": "high", "low": "high", "medium": "high"}
+                {"minimal": "high", "low": "high", "medium": "high", "xhigh": "max"}
             ),
         ),
+        # GLM-4.5 to 4.7; vLLM's glm45 parsers are the glm47 ones.
+        "Glm4MoeForCausalLM": ChatModel("glm47", "glm47", thinking_optional=True),
+        "Glm5NextForCausalLM": _GLM5_NEXT,
+        "Glm5NextForConditionalGeneration": _GLM5_NEXT,
         "DeepseekV4ForCausalLM": _DEEPSEEK_V4,
         "DeepseekV4ForConditionalGeneration": _DEEPSEEK_V4,
-        "GptOssForCausalLM": ChatModel("openai_gptoss", "openai"),
+        # Harmony takes low, medium and high, and gpt-oss always reasons.
+        "GptOssForCausalLM": ChatModel(
+            "openai_gptoss",
+            "openai",
+            reasoning_efforts=MappingProxyType({"minimal": "low", "xhigh": "high", "max": "high"}),
+        ),
+        # MiniMax-M2 and M2.1 always think.
+        "MiniMaxM2ForCausalLM": ChatModel("minimax_m2", "minimax_m2"),
+        # Arcee Trinity's thinking checkpoints, as vLLM's Trinity-Large-Thinking
+        # recipe pairs them; their templates open <think> unconditionally.
+        "AfmoeForCausalLM": ChatModel("deepseek_r1", "qwen3_coder"),
+        # Nemotron 3 Nano and Super.
+        "NemotronHForCausalLM": ChatModel("nemotron_v3", "qwen3_coder", thinking_optional=True),
     }
 )
 
