@@ -302,6 +302,16 @@ chat on such a checkpoint streams reasoning as content; an explicit
   `invalid_sampling_params`. Without `max_tokens`, the budget is checked against
   the one chosen after rendering.
 
+### Known limitations
+
+- A tool-call token can end reasoning early. vLLM 0.31's `qwen3` and `glm47`
+  parsers end reasoning at a tool-call start token, even on a request without
+  tools (`vllm/parser/qwen3.py:140-144`, `vllm/parser/glm47_moe.py:153-156`).
+  If the model writes `<tool_call>` mid-thought (seen on QA6 only when the
+  prompt asks about that tag), the rest of its thinking, and the `</think>`
+  after it, come back as content. vllm serve does the same. This affects the
+  Qwen3, Qwen3.5 to 3.8 and GLM families.
+
 ### Adding a model family
 
 1. Add its architectures to `CHAT_MODELS` in `chat.py`: the reasoning and tool
