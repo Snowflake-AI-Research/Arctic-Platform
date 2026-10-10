@@ -208,9 +208,108 @@ denominator when sequence parallelism splits observation tokens, and the
 response then carries `echo_full_observation_denominator=1`. Both losses
 support CISPO-only ratio gates (`ratio_mask_bounds_pos` / `_neg`,
 `prob_diff_mask_max_pos` / `_neg`, `seq_mask_stat`, `seq_mask_bounds_pos` /
-`_neg`, `ratio_m2_threshold`) and the independent `log_ratio_sq_coef` penalty;
+`_neg`, `ratio_m2_threshold`), the independent `log_ratio_sq_coef` penalty and
+`ratio_mask_rebalance`, which rescales the kept advantages (below);
 `ratio_stats=True` enables additive per-bin telemetry without changing the
-objective. Ratio-control keys without `use_cispo_loss=True` pass the batching
+objective. An explicit `false` of `ratio_stats` or of `ratio_mask_rebalance`
+with no other ratio control is inert: no echo, no metrics and no
+`use_cispo_loss` requirement.
+
+Whenever ratio controls are active (any ratio-control key, or
+`ratio_stats=True`, or `ratio_mask_rebalance=True`), the loss also reports four
+additive signed-mass metrics,
+`ratio_mask_{pos,neg}_{pre,kept}_mass_sum`. `pre` is the sum of `|A|` over the
+policy tokens the loss trains; `kept` is the same sum over those that survive
+every active ratio-control drop (ratio band, probability gap, sequence gate and
+`ratio_m2_threshold`). The legacy `m2_threshold` shrinks the loss mask before
+the ratio controls act, so a token it removes is not a trained token: it is in
+neither `pre` nor `kept`, whereas a `ratio_m2_threshold` drop stays in `pre` and
+leaves `kept`. `pos` covers the tokens whose advantage `A` is `>= 0` and `neg`
+those with `A < 0`. `A` is the advantage the loss uses: with
+`importance_sampling_level="token"` the token-level advantage (including the
+teacher term when enabled), and with `"sequence"` the sequence-averaged
+advantage, which gives every token of a sequence that sequence's mean, so the
+whole sequence counts as `pos` or `neg` by the sign of its mean (the `_pos` /
+`_neg` gates keep splitting by the token-level sign, below). The sums run
+through the policy term's own aggregation, so they carry its denominators
+(`batch_num_tokens`, `global_batch_size`, `loss_scale_factor`, row weights)
+without the DP gradient compensation (`dp_size`), and no ratio, clip,
+`rollout_is_weights` or behavior weight (`behav_imp_weight_cap`) is applied.
+`token-mean` reports `sum(|A|) / batch_num_tokens`; weighted `prompt-mean`
+reports `sum(sequence_weight * sum(|A|) / sequence_token_count)`. These
+measurements precede the optional advantage scaling of `ratio_mask_rebalance`.
+
+The sums add up across microbatches, DP workers and SP ranks under the
+conditions in which the loss itself is split-invariant, that is when its
+denominators are step-global:
+
+- `token-mean`: `batch_num_tokens`.
+- `seq-mean-token-sum` and `seq-mean-token-mean`: `global_batch_size`.
+- `seq-mean-token-sum-norm`: `global_batch_size` and an explicit
+  `loss_scale_factor` (context `packed_loss_scale_factor`); without it every
+  call divides by its own longest segment or row width.
+- `prompt-mean` with `sequence_loss_weights`: the weights.
+- `prompt-mean` with `prompt_group_ids`: `global_batch_size`, and
+  `prompt_token_counts` (the total number of loss-mask tokens over all rollouts
+  of the row's prompt in the whole step, the same value on every row of a
+  prompt; DSS derives it for grouped requests) whenever the rollouts of a prompt
+  are spread over several calls or workers. Without it only prompts that sit whole in one
+  call add up. One exception lets `global_batch_size` be omitted: with
+  `torch.distributed` initialised and `dp_size > 1`, the loss all-reduces each
+  call's prompt count, so prompts that sit whole on one worker, in one call per
+  worker, add up across DP workers (not across the microbatches of a worker,
+  where the count is each call's own).
+
+Apart from that exception, the sums are not additive outside these conditions: a
+call that lacks a denominator normalizes by its own counts, as the loss does, so
+adding calls does not recover the unsplit value (a cut prompt without
+`prompt_token_counts`, for example, is counted once per call). SP shards are
+summed once: only the SP leader reports the group's total and the other ranks
+report 0, as does a worker with no policy tokens. The M2PO ranking is per model
+call, so both M2 mechanisms depend on how rows are placed. `ratio_m2_threshold`
+ranks the tokens of each worker's single model call (see below), so its `kept`,
+its dropped-token count and the k3 sum below are the sums of what each worker's
+own ranking kept or dropped: they can differ from a single-process run, while
+`pre` and `ratio_trainable_token_count` do not.
+The legacy `m2_threshold` shrinks the loss mask per call before the ratio
+controls act, so with it `pre`, `kept`, the k3 sum and
+`ratio_trainable_token_count` all depend on how rows are placed in calls.
+
+`ratio_mask_kept_k3_sum` is meant to be read next to dss-platform's
+`trainable_logprob_lowvar_all/mean`, the k3 estimate averaged over all trainable
+tokens before masking. For a token, k3 = exp(Δ) − 1 − Δ, where Δ is the trainer
+log-probability minus the sampler log-probability (`old_log_probs_shifted`),
+clamped to [−20, 20] before k3 is taken, as `trainable_logprob_lowvar_all/mean`
+does. The sum is therefore finite for any finite log-probabilities (at most
+exp(20) − 21 ≈ 4.85e8 per token). The clamp applies to this reported sum only:
+`seq_mask_stat="mean_k3"` gates on the unclamped k3, so which tokens are dropped
+does not depend on it. The sum runs over the kept tokens, the loss-mask tokens
+that survive every active drop. It is a raw sum, not divided by the loss
+denominators, so the denominator conditions above do not apply to it: it adds up
+across microbatches, DP workers and SP ranks (counted once, like the masses) in
+every aggregation mode, except for the placement dependence under
+`ratio_m2_threshold` and the legacy `m2_threshold` described above. Two counts
+come with it: `ratio_trainable_token_count`, the number of tokens the ratio
+controls see (the loss-mask tokens, minus those the legacy `m2_threshold`
+removes), and `ratio_mask_dropped_token_count`, the number of those that some
+active drop removes, each counted once. The kept-token mean k3 is
+`ratio_mask_kept_k3_sum / (ratio_trainable_token_count −
+ratio_mask_dropped_token_count)`; with no drop, no legacy `m2_threshold` and
+finite log-probabilities, `ratio_mask_kept_k3_sum / ratio_trainable_token_count`
+is `trainable_logprob_lowvar_all/mean` up to rounding. That rounding is
+dss-platform's: it evaluates `exp(Δ) − 1 − Δ` in fp32, which loses precision for
+|Δ| of about 1e-3 or less (k3 is then about Δ²/2, far below the fp32 resolution
+of `exp(Δ) − 1`), while this code uses `expm1`. A gap in that regime comes from
+the dss-platform expression, not from a different definition. A trainer
+log-probability that is not finite is replaced by 0 before the loss, and its
+token still counts in this population (its Δ is then minus the sampler
+log-probability), whereas `trainable_logprob_lowvar_all/mean` leaves such tokens
+out of both its sum and its count. A sampler log-probability that is not finite
+is not sanitised here: its token counts too, and adds k3 at the clamped Δ (4.85e8
+for a −inf sampler log-probability, 19 for +inf) or makes the sum NaN for a NaN
+one, whereas `trainable_logprob_lowvar_all/mean` leaves it out.
+
+Ratio-control keys without `use_cispo_loss=True` pass the batching
 and validation callbacks; they are rejected when the packed loss reduction is
 resolved (DSS and the native worker do this before any forward), and otherwise
 by the loss. An explicit `null` is rejected for every ratio-control key (omit
@@ -222,10 +321,85 @@ zero-advantage token uses the `_pos` settings. The `seq_stat_bin_*` histogram
 always bins the sequence mean log ratio, even when `seq_mask_stat="mean_k3"`
 selects the gating statistic. `ratio_m2_threshold` requires one packed model call per worker and
 must be positive; it does not support sequence parallelism because M2PO
-ranking needs one complete token set. `ap_grpo_mixed_v1` requires CISPO, a
+ranking needs one complete token set.
+
+`ratio_mask_rebalance=True` (boolean, default false; `true` activates the ratio
+controls like `ratio_stats=True`, while `false` with no other control is inert)
+undoes the loss of signed advantage mass that ratio masking causes.
+Once the masks have decided, the kept tokens of positive advantage are scaled by
+`P0/Pk` and those of negative advantage by `N0/Nk`, where `P0`, `N0` are the
+`pre` and `Pk`, `Nk` the `kept` masses of the sign
+(`ratio_mask_{pos,neg}_{pre,kept}_mass_sum`: the loss's own normalization, DP
+compensation removed) summed over all DP and SP ranks, so every rank applies the
+same scale. The sign is that of the advantage the loss uses, the sequence mean
+under `importance_sampling_level="sequence"`. Only advantage magnitudes change:
+which tokens are dropped, the counts and histograms and `ratio_mask_kept_k3_sum`
+do not depend on the scaling. Each sign returns to its own pre-mask mass, not to
+the other sign's: masses that were unbalanced before masking stay so. A sign with
+no surviving mass has nothing to scale and gets scale 1, so its mass stays lost.
+The scale is computed as `(Pk + Pd)/Pk`, where `Pd` is the dropped mass summed
+over the ranks (each rank contributes `pre - kept`, which is an exact 0 when it
+dropped nothing of that sign), provided the loss aggregation returns bit-equal
+sums for bit-equal inputs. So when no token of a sign is dropped on any rank its
+scale is exactly 1, and with nothing dropped the loss and gradients are
+bit-identical to `ratio_mask_rebalance=False`. This was tested on CPU for every
+aggregation mode (float32 advantages, one process) and for float64 advantages on
+4 and 7 ranks (`token-mean`). For float32, bfloat16 and float16 advantages the
+cast of the scale to the advantage dtype also absorbs a difference of about
+1e-16, on any device. For float64 advantages with a scatter-based aggregation on
+CUDA (`scatter_add_`, which the packed per-sequence sums and the grouped
+`prompt-mean` use, is nondeterministic there) it is untested, and the scale could
+differ from 1 by about 1e-16. The CISPO cap still clips ratios, independently of
+advantage scaling; this does not equalize ratio-weighted gradients.
+
+The scale of a sign is `pre/kept` of the world-summed masses (computed as
+above). It is not capped and is not reported as a metric, but it can be derived from the reported
+`ratio_mask_{pos,neg}_pre_mass_sum` and `ratio_mask_{pos,neg}_kept_mass_sum`
+(each summed over the workers). It is large when little of a sign's mass
+survives: with one of 100 equal-magnitude positive tokens kept it is 100, and
+with a survivor whose advantage is a thousandth of the dropped token's it is
+1001; the survivors then carry the sign's whole pre-mask mass.
+
+This version requires exactly one synchronized model call per worker: a request
+with more than one model call on any worker is rejected before any forward, with
+a message that names `ratio_mask_rebalance` and the per-worker counts. DSS checks
+it once, when it prepares the request, on the counts of all workers, and gives
+every worker the same request-wide count. The native worker and
+`run_pipeline(pack=True)` check it on each worker, before their first forward,
+and do not exchange the verdict: the worker passes its number of
+gradient-accumulation microbatches, the pipeline its number of packed
+microbatches, which the splitter first raises to the maximum over the ranks when
+`torch.distributed` is initialised (a rank with fewer rows than that maximum
+fails in the splitter instead). Under data parallelism every worker must
+therefore see a count of one, that is one gradient-accumulation step and, with
+`pack=True`, every worker's tokens within `max_tokens_per_mb`: a worker that
+rejects the request while a peer has passed the check leaves that peer waiting in
+the restoration's world collective until the process-group timeout, instead of
+the request failing. Exact multi-microbatch support requires a request-wide
+statistics prepass. Balancing each microbatch independently is a different
+objective: it restores the request's per-sign mass only when no microbatch loses
+a whole sign, and it concentrates each microbatch's removed mass on that
+microbatch's survivors.
+
+Whenever ratio controls are active the response carries `ratio_mask_rebalance`
+(1.0 or 0.0), the echo of the flag. With the flag true it adds
+`ratio_rebalance_{pos,neg}_{post,unrestored}_mass_sum`, built on the existing
+`ratio_mask_{pos,neg}_{pre,kept}_mass_sum`: `post` is the kept mass times the
+scale, in float64, so it is 0 for a sign whose kept mass is 0 and otherwise equals `pre` to rounding (about 1e-16 relative), while
+the advantages the loss uses are scaled in their own dtype, so the mass they
+carry matches `pre` to that dtype's rounding (about 6e-8 relative in fp32);
+`unrestored` is the pre-mask mass of a sign with no surviving mass and 0 otherwise.
+Like the other mass sums, these four are additive over DP workers (there is one
+model call per worker), and the SP leader alone reports its group's total.
+With `ratio_m2_threshold` the masses, and so the scale, come from what each
+worker's own ranking kept.
+
+`ap_grpo_mixed_v1` requires CISPO, a
 finite positive `is_weight_clip_max`, token-level `importance_sampling_level`, and the
 prediction-aligned `nll_mask` column; it intentionally rejects ratio-mask
-options to avoid applying policy-only penalties to NLL tokens. It accepts only
+options, by key presence (an explicit `ratio_stats=false` or
+`ratio_mask_rebalance=false` as well), to avoid applying policy-only penalties
+to NLL tokens. It accepts only
 the baseline GRPO config keys (`_GRPO_CONFIG_DEFAULTS` in `grpo.py`), so ECHO
 keys and any unrecognized key are rejected. It also rejects `use_sapo_loss`,
 `use_decoupled_loss`, `use_kl_loss`, an `entropy_coeff` other than `0.0`

@@ -256,6 +256,36 @@ def test_native_worker_rejects_split_m2po_before_forward():
         worker.forward_backward(request)
 
 
+def test_native_worker_rejects_split_ratio_mask_rebalance_before_forward():
+    microbatch = {
+        "input_ids": torch.ones(1, 1, dtype=torch.long),
+        "attention_mask": torch.ones(1, 1, dtype=torch.long),
+    }
+
+    def request(flag):
+        return {
+            "batch": [dict(microbatch), dict(microbatch)],
+            "meta": {"pad_token_id": 0},
+            "processing": {
+                "loss_fn": "ap_grpo",
+                "config": {"use_cispo_loss": True, "is_weight_clip_max": 5.0, "ratio_mask_rebalance": flag},
+            },
+        }
+
+    # Two microbatches are two model calls on this worker: rejected before the engine is ever called.
+    worker = _worker(_NeverForwardEngine())
+    with pytest.raises(
+        ValueError, match=r"ratio_mask_rebalance requires exactly one synchronized model call per worker, got \(2,\)"
+    ):
+        worker.forward_backward(request(True))
+
+    # With the flag false the same split request is not stopped by that guard (it fails later, on the missing loss
+    # context, which these bare microbatches do not carry).
+    with pytest.raises(ValueError) as error:
+        _worker(_NeverForwardEngine()).forward_backward(request(False))
+    assert "requires exactly one synchronized model call" not in str(error.value)
+
+
 def test_native_worker_honors_class_precedence_for_sft_name(monkeypatch):
     _ShadowSFTLoss.calls = 0
     monkeypatch.setitem(RegistryMeta._registry["BaseLoss"], "sft", _ShadowSFTLoss)
