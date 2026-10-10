@@ -26,7 +26,6 @@
           "seq_len": 128,
           "ep_comm_backend": "deepep",
           "optimization_dtype": "bfloat16",
-          "reduce_dtype": "float32",
           "moe_use_grouped_mm": true,
           "fused_lm_head_token_chunk_size": "disabled",
           "fp32_lm_head": false,
