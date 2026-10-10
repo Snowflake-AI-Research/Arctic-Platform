@@ -20,4 +20,8 @@ def get_ep_comm_module(backend: str) -> ModuleType:
         from . import deepep
 
         return deepep
+    if backend == "deepep_v2":
+        from . import deepep_v2
+
+        return deepep_v2
     raise NotImplementedError(f"Unsupported EP comm backend {backend!r}; expected one of {DISPATCH_EP_BACKENDS}.")

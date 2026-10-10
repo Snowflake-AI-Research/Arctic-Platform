@@ -43,7 +43,7 @@ def test_selection_uses_text_config_not_checkpoint_name(tmp_path, composite):
     assert spec.loader == "qwen3_5_moe"
 
 
-@pytest.mark.parametrize("backend", ["deepep", "uccl"])
+@pytest.mark.parametrize("backend", ["deepep", "deepep_v2", "uccl"])
 def test_loader_preserves_options_and_process_groups(monkeypatch, backend):
     from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
 

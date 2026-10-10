@@ -50,7 +50,9 @@ class Qwen3_5MoeOptions(BaseModel):
 
     seq_len: int = Field(4096, gt=0, description="Training sequence length.")
     trust_remote_code: bool = False
-    ep_comm_backend: Literal["deepep", "uccl"] = Field("deepep", description="Expert-parallel comm backend.")
+    ep_comm_backend: Literal["deepep", "deepep_v2", "uccl"] = Field(
+        "deepep", description="Expert-parallel comm backend."
+    )
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     reduce_dtype: Literal["bfloat16", "float32"] = Field("float32", description="Gradient reduction dtype.")
     moe_use_grouped_mm: bool = Field(True, description="Use grouped matmul for experts.")
