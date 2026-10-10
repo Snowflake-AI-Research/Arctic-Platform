@@ -108,6 +108,27 @@ def _left_align_batch(tensors: dict, attention_mask, extra: dict) -> tuple[dict,
     )
 
 
+def _missing_zorro_meta_keys(meta: dict) -> list[str]:
+    """Keys the worker indexes directly once a ZoRRo flag is on.
+
+    ``run_pipeline`` reads ``max_prompt_len`` when ``zorro_train_enable`` is
+    set. The ZoRRo load balancer reads ``max_response_len``,
+    ``max_token_len_per_gpu``, and ``rollout_n`` (or
+    ``zorro_train_max_rollouts``) when ``load_balancer`` is set.
+    """
+    missing: list[str] = []
+    if meta.get("zorro_train_enable"):
+        if "max_prompt_len" not in meta:
+            missing.append("max_prompt_len")
+    if meta.get("load_balancer"):
+        for key in ("max_response_len", "max_token_len_per_gpu"):
+            if key not in meta:
+                missing.append(key)
+        if "rollout_n" not in meta and "zorro_train_max_rollouts" not in meta:
+            missing.append("rollout_n")
+    return missing
+
+
 def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) -> dict:
     """Reshape a SkyRL fwd_bwd payload into Cortex's wire shape.
 
@@ -131,6 +152,10 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
     else:
         tensors = dict(payload)
         meta = dict(tensors.pop("context", None) or {})
+
+    missing_zorro = _missing_zorro_meta_keys(meta)
+    if missing_zorro:
+        raise ValueError("ZoRRo meta is missing " + ", ".join(missing_zorro))
 
     input_ids = tensors.get("input_ids")
     attention_mask = tensors.get("attention_mask")
@@ -174,9 +199,23 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
         if k not in proc_config and k in meta:
             proc_config[k] = int(meta[k])
 
+    # Same meta the on-prem worker forwards. Cortex calls this bag context.
+    # dp_size stays off the wire: the server treats it as a loss divisor.
+    # The aligned tensors win over any copy that arrived on meta.
+    context = {key: value for key, value in meta.items() if key != "dp_size"}
+    for k in ("global_batch_size", "batch_num_tokens"):
+        # The caller's own processing.config value already won in proc_config
+        # above; a meta copy of the same key on context would be stale (or
+        # just redundant) next to it, so drop it only when the caller set it.
+        if k in caller_config:
+            context.pop(k, None)
+    context["input_ids"] = input_ids
+    context["advantages"] = advantages
+    context["loss_mask"] = loss_mask
+
     return {
         "args": (),
         "kwargs": kwargs_out,
-        "context": {"input_ids": input_ids, "advantages": advantages, "loss_mask": loss_mask},
+        "context": context,
         "processing": {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": proc_config},
     }
