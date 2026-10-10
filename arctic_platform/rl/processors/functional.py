@@ -18,8 +18,10 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from functools import partial
 from numbers import Integral
 from numbers import Real
 from typing import Optional
@@ -884,6 +886,10 @@ LOG_RATIO_BIN_EDGES = (
     math.log(10.0),
 )
 SEQ_STAT_BIN_EDGES = (-0.2, -0.05, -0.01, 0.01, 0.05, 0.2)
+# Bound on the log ratio in the reported ``ratio_mask_kept_k3_sum``: the clamp of dss-platform's
+# ``trainable_logprob_lowvar_all``, which the sum is read against, and of ``kl_penalty``'s low_var_kl. It keeps the sum
+# finite (at most exp(20) - 21 per token) and does not touch the unclamped k3 that ``seq_mask_stat="mean_k3"`` gates on.
+KEPT_K3_LOG_RATIO_CLAMP = 20.0
 _JOINT_SHAPE = (2, len(SAMPLER_LOGPROB_BIN_EDGES) + 1, len(LOG_RATIO_BIN_EDGES) + 1)
 _VECTOR_COUNT_NAMES = {
     "ratio_joint": tuple(
@@ -1091,7 +1097,10 @@ def _ratio_mask_keep(
     counts["ratio_trainable_token_count"] = loss_mask.sum()
     counts.update({f"{name}_count": hit.sum() for name, hit in drops.items()})
     counts["ratio_mask_dropped_token_count"] = dropped.sum()
-    return loss_mask & ~dropped, counts
+    keep = loss_mask & ~dropped
+    reported_log_ratio = log_ratio.clamp(min=-KEPT_K3_LOG_RATIO_CLAMP, max=KEPT_K3_LOG_RATIO_CLAMP)
+    counts["ratio_mask_kept_k3_sum"] = torch.where(keep, reported_log_ratio.expm1() - reported_log_ratio, 0.0).sum()
+    return keep, counts
 
 
 def _reduce_ratio_mask_counts(counts: dict[str, torch.Tensor]) -> dict[str, float]:
@@ -1103,6 +1112,26 @@ def _reduce_ratio_mask_counts(counts: dict[str, torch.Tensor]) -> dict[str, floa
         if dist.get_rank(group=sp_group) != 0:
             stacked = torch.zeros_like(stacked)
     return dict(zip(names, stacked.tolist()))
+
+
+@torch.no_grad()
+def _ratio_mask_mass(
+    advantages: torch.Tensor,
+    policy_mask: torch.Tensor,
+    aggregate: Callable[[torch.Tensor], torch.Tensor],
+    dp_size: int,
+) -> dict[str, torch.Tensor]:
+    """``ratio_mask_{sign}_{stage}_mass_sum`` for the signed ``|advantage|`` before (pre) and after (kept) the drops."""
+    # aggregate retains the original mask/row denominators; remove only DP gradient compensation.
+    advantages = advantages.double()
+    magnitudes = {"pos": advantages.clamp(min=0), "neg": (-advantages).clamp(min=0)}
+    return {
+        f"ratio_mask_{sign}_{stage}_mass_sum": (
+            aggregate(magnitude if stage == "pre" else torch.where(policy_mask, magnitude, 0.0)) / dp_size
+        )
+        for stage in ("pre", "kept")
+        for sign, magnitude in magnitudes.items()
+    }
 
 
 def cispo_actor_loss_fn(
@@ -1171,6 +1200,21 @@ def cispo_actor_loss_fn(
         penalty_logprobs = logprobs if ratio_masks.log_ratio_sq_coef > 0.0 else logprobs.detach()
         log_ratio_sq = torch.where(loss_mask, penalty_logprobs - old_logprobs, 0.0).square()
     advantages = _safe_masked_operand(advantages, loss_mask)
+    aggregate = partial(
+        agg_loss,
+        loss_mask=objective_mask,
+        loss_agg_mode=loss_agg_mode,
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+        loss_scale_factor=loss_scale_factor,
+        prompt_group_ids=prompt_group_ids,
+        prompt_token_counts=prompt_token_counts,
+        sequence_loss_weights=sequence_loss_weights,
+        cu_seqlens=cu_seqlens,
+    )
+    if ratio_masks is not None:
+        ratio_mask_counts.update(_ratio_mask_mass(advantages, policy_mask, aggregate, dp_size))
     logprobs = _safe_masked_operand(logprobs, loss_mask)
 
     if is_weight_clip_max is not None:
@@ -1206,19 +1250,7 @@ def cispo_actor_loss_fn(
     logging_loss = pg_loss.detach()
     if ratio_masks is not None and ratio_masks.log_ratio_sq_coef > 0.0:
         pg_loss = pg_loss + ratio_masks.log_ratio_sq_coef * log_ratio_sq
-    pg_loss = agg_loss(
-        pg_loss,
-        objective_mask,
-        loss_agg_mode=loss_agg_mode,
-        dp_size=dp_size,
-        batch_num_tokens=batch_num_tokens,
-        global_batch_size=global_batch_size,
-        loss_scale_factor=loss_scale_factor,
-        prompt_group_ids=prompt_group_ids,
-        prompt_token_counts=prompt_token_counts,
-        sequence_loss_weights=sequence_loss_weights,
-        cu_seqlens=cu_seqlens,
-    )
+    pg_loss = aggregate(pg_loss)
 
     stat = dict(
         loss=logging_loss,
