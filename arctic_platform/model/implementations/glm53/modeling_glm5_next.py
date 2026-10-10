@@ -113,6 +113,7 @@ class Glm5NextForConditionalGenerationPrimeRL(
         if fp8_block_size is not None:
             _replace_native_fp8_linears(self, config, fp8_block_size)
         self._is_vlm = True
+        self._requires_hf_weight_sync = fp8_block_size is not None
 
     @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
