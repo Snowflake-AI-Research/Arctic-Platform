@@ -886,6 +886,10 @@ LOG_RATIO_BIN_EDGES = (
     math.log(10.0),
 )
 SEQ_STAT_BIN_EDGES = (-0.2, -0.05, -0.01, 0.01, 0.05, 0.2)
+# Bound on the log ratio in the reported ``ratio_mask_kept_k3_sum``: the clamp of dss-platform's
+# ``trainable_logprob_lowvar_all``, which the sum is read against, and of ``kl_penalty``'s low_var_kl. It keeps the sum
+# finite (at most exp(20) - 21 per token) and does not touch the unclamped k3 that ``seq_mask_stat="mean_k3"`` gates on.
+KEPT_K3_LOG_RATIO_CLAMP = 20.0
 _JOINT_SHAPE = (2, len(SAMPLER_LOGPROB_BIN_EDGES) + 1, len(LOG_RATIO_BIN_EDGES) + 1)
 _VECTOR_COUNT_NAMES = {
     "ratio_joint": tuple(
@@ -1037,10 +1041,9 @@ def _ratio_mask_keep(
         ):
             if limit is not None:
                 drops[f"prob_diff_mask_{sign}_drop"] = sides[sign] & (gap > limit)
-    k3 = log_ratio.expm1() - log_ratio
     values = [log_ratio, sides["pos"].float(), sides["neg"].float()]
     if masks.seq_stat == "mean_k3":
-        values.append(k3)
+        values.append(log_ratio.expm1() - log_ratio)
     packed = cu_seqlens is not None
     if packed:
         sequence_idx, totals = _packed_per_sequence_sums(cu_seqlens, *values)
@@ -1095,7 +1098,8 @@ def _ratio_mask_keep(
     counts.update({f"{name}_count": hit.sum() for name, hit in drops.items()})
     counts["ratio_mask_dropped_token_count"] = dropped.sum()
     keep = loss_mask & ~dropped
-    counts["ratio_mask_kept_k3_sum"] = torch.where(keep, k3, 0.0).sum()
+    reported_log_ratio = log_ratio.clamp(min=-KEPT_K3_LOG_RATIO_CLAMP, max=KEPT_K3_LOG_RATIO_CLAMP)
+    counts["ratio_mask_kept_k3_sum"] = torch.where(keep, reported_log_ratio.expm1() - reported_log_ratio, 0.0).sum()
     return keep, counts
 
 
@@ -1112,22 +1116,22 @@ def _reduce_ratio_mask_counts(counts: dict[str, torch.Tensor]) -> dict[str, floa
 
 @torch.no_grad()
 def _ratio_mask_mass(
-    advantages: torch.Tensor, policy_mask: torch.Tensor, aggregate: Callable[[torch.Tensor], torch.Tensor], dp_size: int
-) -> torch.Tensor:
+    advantages: torch.Tensor,
+    policy_mask: torch.Tensor,
+    aggregate: Callable[[torch.Tensor], torch.Tensor],
+    dp_size: int,
+) -> dict[str, torch.Tensor]:
+    """``ratio_mask_{sign}_{stage}_mass_sum`` for the signed ``|advantage|`` before (pre) and after (kept) the drops."""
     # aggregate retains the original mask/row denominators; remove only DP gradient compensation.
-    positive, negative = advantages.detach().double().clamp(min=0), (-advantages.detach().double()).clamp(min=0)
-    local = (
-        torch.stack(
-            [
-                aggregate(positive),
-                aggregate(negative),
-                aggregate(torch.where(policy_mask, positive, 0.0)),
-                aggregate(torch.where(policy_mask, negative, 0.0)),
-            ]
+    advantages = advantages.double()
+    magnitudes = {"pos": advantages.clamp(min=0), "neg": (-advantages).clamp(min=0)}
+    return {
+        f"ratio_mask_{sign}_{stage}_mass_sum": (
+            aggregate(magnitude if stage == "pre" else torch.where(policy_mask, magnitude, 0.0)) / dp_size
         )
-        / dp_size
-    )
-    return local
+        for stage in ("pre", "kept")
+        for sign, magnitude in magnitudes.items()
+    }
 
 
 def cispo_actor_loss_fn(
@@ -1210,15 +1214,7 @@ def cispo_actor_loss_fn(
         cu_seqlens=cu_seqlens,
     )
     if ratio_masks is not None:
-        mass = _ratio_mask_mass(advantages, policy_mask, aggregate, dp_size)
-        ratio_mask_counts.update(
-            {
-                f"ratio_mask_{sign}_{stage}_mass_sum": mass[index]
-                for index, (stage, sign) in enumerate(
-                    (stage, sign) for stage in ("pre", "kept") for sign in ("pos", "neg")
-                )
-            }
-        )
+        ratio_mask_counts.update(_ratio_mask_mass(advantages, policy_mask, aggregate, dp_size))
     logprobs = _safe_masked_operand(logprobs, loss_mask)
 
     if is_weight_clip_max is not None:
