@@ -913,7 +913,8 @@ class StreamingWorkerMixin:
         # Requests carry plain JSON across Ray; the vLLM type is built here.
         params = dict(params)
         structured_outputs = params.get("structured_outputs")
-        # A chat prompt's tool grammar arrives already built.
+        # A chat prompt's grammar (its JSON format and tools, as the parsers
+        # fitted them) arrives already built.
         if isinstance(structured_outputs, dict):
             params["structured_outputs"] = (
                 StructuredOutputsParams(json=structured_outputs["json"])
@@ -954,7 +955,7 @@ class StreamingWorkerMixin:
             raise StreamError("chat_unsupported")
         return engine
 
-    def get_chat_support(self):
+    async def get_chat_support(self):
         """Whether this model takes chat prompts, and whether its thinking can be turned off."""
         try:
             engine = self._chat_engine()
@@ -962,7 +963,9 @@ class StreamingWorkerMixin:
             engine = None
         if engine is None or not engine.has_chat_template:
             return {"chat_prompt": False, "thinking_optional": False}
-        return {"chat_prompt": True, "thinking_optional": self._chat_model.thinking_optional}
+        # The template decides whether thinking turns off, whatever CHAT_MODELS says.
+        await engine.probe()
+        return {"chat_prompt": True, "thinking_optional": engine.chat_model.thinking_optional}
 
     def start_stream(self, attempt_id, prompt, sampling_params, remaining_s, limits):
         if (

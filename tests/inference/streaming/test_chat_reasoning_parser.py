@@ -1,7 +1,7 @@
 """chat_reasoning_parser: a reasoning parser for chat streams that leaves /generate as it was."""
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import os
 import sys
 import types
@@ -381,13 +381,41 @@ def test_chat_support_is_reported_per_model(
 ):
     from arctic_platform.inference.server import chat as chat_module
 
-    monkeypatch.setattr(
-        chat_module, "ChatEngine", lambda llm, model: SimpleNamespace(has_chat_template=True)
-    )
+    monkeypatch.setattr(chat_module, "ChatEngine", lambda llm, model: _ProbedEngine(model))
     fake_vllm["architecture"] = architecture
     worker = start_worker(**engine_kwargs)
 
-    assert worker.get_chat_support() == support
+    assert asyncio.run(worker.get_chat_support()) == support
+
+
+class _ProbedEngine:
+    """A ChatEngine whose template probe narrows nothing, or finds it always thinks."""
+
+    has_chat_template = True
+
+    def __init__(self, chat_model, forces_thinking=False):
+        self.chat_model = chat_model
+        self.forces_thinking = forces_thinking
+
+    async def probe(self):
+        if self.forces_thinking:
+            self.chat_model = replace(self.chat_model, thinking_optional=False)
+
+
+def test_chat_support_reports_what_the_template_probe_found(fake_vllm, monkeypatch):
+    # GLM-5.3 shares GLM-5.2's architecture, which the table marks thinking-optional.
+    from arctic_platform.inference.server import chat as chat_module
+
+    monkeypatch.setattr(
+        chat_module, "ChatEngine", lambda llm, model: _ProbedEngine(model, forces_thinking=True)
+    )
+    fake_vllm["architecture"] = "GlmMoeDsaForCausalLM"
+    worker = start_worker()
+
+    assert asyncio.run(worker.get_chat_support()) == {
+        "chat_prompt": True,
+        "thinking_optional": False,
+    }
 
 
 def test_chat_support_is_false_without_a_chat_template(fake_vllm, monkeypatch):
@@ -399,7 +427,7 @@ def test_chat_support_is_false_without_a_chat_template(fake_vllm, monkeypatch):
     fake_vllm["architecture"] = "Qwen3ForCausalLM"
     worker = start_worker()
 
-    assert worker.get_chat_support() == {"chat_prompt": False, "thinking_optional": False}
+    assert asyncio.run(worker.get_chat_support()) == {"chat_prompt": False, "thinking_optional": False}
 
 
 def test_chat_support_is_false_when_the_chat_front_end_cannot_be_built(
@@ -414,7 +442,7 @@ def test_chat_support_is_false_when_the_chat_front_end_cannot_be_built(
     fake_vllm["architecture"] = "Qwen3ForCausalLM"
     worker = start_worker()
 
-    assert worker.get_chat_support() == {"chat_prompt": False, "thinking_optional": False}
+    assert asyncio.run(worker.get_chat_support()) == {"chat_prompt": False, "thinking_optional": False}
 
 
 def test_unknown_architecture_chat_is_unsupported_and_logged_once(fake_vllm, caplog):
@@ -515,6 +543,24 @@ def test_a_tables_reasoner_the_tokenizer_cannot_run_is_left_out(fake_vllm, monke
     assert worker._chat_only_reasoner is False
     assert chat_parsers(monkeypatch, worker) == (None, "hermes")
     assert any("qwen3" in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+
+
+@pytest.mark.parametrize("architecture", ["MiniMaxM2ForCausalLM", "Glm5NextForCausalLM"])
+def test_a_model_that_always_thinks_still_refuses_none_without_its_reasoner(
+    fake_vllm, monkeypatch, architecture
+):
+    # Dropping the reasoner changes what chat parses, not whether the model thinks.
+    from arctic_platform.inference.server import chat as chat_module
+
+    fake_vllm["architecture"] = architecture
+    fake_vllm["tokenizer"] = NO_THINK_TOKENS
+    worker = start_worker()
+
+    built = []
+    monkeypatch.setattr(chat_module, "ChatEngine", lambda llm, model: built.append(model))
+    worker._chat_engine()
+    [model] = built
+    assert (model.reasoning_parser, model.thinking_optional) == (None, False)
 
 
 def test_a_tables_reasoner_the_tokenizer_can_run_is_kept(fake_vllm, monkeypatch):

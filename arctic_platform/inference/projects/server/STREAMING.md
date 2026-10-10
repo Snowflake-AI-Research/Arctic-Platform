@@ -136,9 +136,22 @@ That is 18 architectures in 10 families. "Thinking off" means
 `reasoning_effort="none"` turns thinking off: vLLM hands the template
 `enable_thinking=False`. Where it can't, `none` fails the stream with
 `invalid_chat_request` and `param="reasoning_effort"` rather than thinking
-anyway. Every other value Arctic accepts reaches the template as a level it
-takes (`test_chat_models.py` checks each family). The table suits checkpoints that keep
-their family's chat template; one with a different template (an instruct-only
+anyway. The table can only narrow what the checkpoint's template does: the
+template probe (see the token guard below) renders the generation prompt with
+`enable_thinking` true and false, and if the two match and the prompt opens
+the reasoner's start marker, the template always thinks, so `none` is refused
+(logged once). GLM-5.3 shares
+GLM-5.2's architecture this way; so does Trinity-Mini once given a reasoner.
+Matching prompts without the marker (Qwen3-Instruct-2507, which never thinks)
+keep `none`. A family the table marks as always thinking (MiniMax-M2,
+GLM-5.3-Flash, gpt-oss) keeps refusing `none` even when the worker drops its
+reasoner. The probe does not check `reasoning_effort` levels: vLLM's request
+type takes only the seven named levels, so a render can't tell a level the
+template reads from one it falls back on, and GLM-5.3 gets High for `minimal`
+and `low` (the table's GLM-5.2 mapping) though its template takes Low. Every
+other value Arctic accepts reaches the template as a level it takes
+(`test_chat_models.py` checks each family). The table suits checkpoints that
+keep their family's chat template; one with a different template (an instruct-only
 or thinking-only variant, a coder model) can set `ModelConfig`'s
 `chat_reasoning_parser` and `tool_call_parser`, which override the table like
 vllm serve's flags. They also enable chat on an unlisted architecture. Without
@@ -149,8 +162,9 @@ vLLM, which picks DeepSeek-V4's by architecture.
 `Driver.get_chat_support(model_id)` (and `ReplicaPool.get_chat_support()`)
 reports `{"chat_prompt": bool, "thinking_optional": bool}` for a loaded model:
 whether its streams take a `ChatPrompt`, and whether thinking can be turned off.
-It builds the worker's chat front end, so `chat_prompt` is false when that
-fails, and when vLLM finds no chat template for the model (in the tokenizer,
+It builds the worker's chat front end and runs its template probe (below), so
+`thinking_optional` is what the checkpoint's template allows. `chat_prompt` is
+false when building fails, and when vLLM finds no chat template for the model (in the tokenizer,
 the processor or vLLM's fallbacks; gpt-oss and DeepSeek-V4 render without
 one). Streams on such a model fail with `chat_unsupported`.
 
@@ -179,12 +193,39 @@ chat on such a checkpoint streams reasoning as content; an explicit
   video or file part fails with `invalid_chat_request` and `param` (for example
   `messages[1].content`), so the worker never fetches media for a client.
 - Before rendering, any string in messages, tools or a named `tool_choice` that
-  contains one of the tokenizer's special tokens (such as `<|im_end|>`) fails the
-  stream with `invalid_message_content` and `param` (for example `messages[1]`).
-  Added tokens that are not special (Qwen3's `<think>` or `<tool_call>`) pass, as
-  in vllm serve: they can't start a turn, and Arctic returns them as content
-  itself, so a client may echo them back. Input the template or vLLM rejects
-  fails with `invalid_chat_request`, with `param` when vLLM names one. Neither
+  spells one of the model's control tokens fails the stream with
+  `invalid_message_content` and `param` (for example `messages[1]`). The
+  tokenizer reads such text in the prompt as the real token, so it could forge
+  a turn. Control tokens are every special token, plus every added token the
+  chat template writes itself. The worker finds those once, on the first chat
+  request or `get_chat_support` call, by rendering a probe conversation
+  (system, user, assistant, user, with plain text) through its own renderer:
+  with and without the generation prompt, at the default and a set
+  `reasoning_effort`, and with thinking off where the model allows it. Added
+  tokens outside the probe's text are the template's. This catches delimiters
+  a tokenizer does not mark special, and reasoning markers the prompt holds,
+  since a forged `</think>` would end reasoning early (vLLM reads the prompt's
+  last marker). If a user turn opens with an added token that is not special,
+  the flags can't separate control tokens from text (and a role the API can't
+  send has delimiters no probe renders), so every added token is blocked. If the
+  probe fails to render, every added token is blocked and `none` is refused,
+  logged once. Added tokens
+  the template never writes pass, as in vllm serve; Arctic returns them as
+  content itself (tool markup without tools), so a client may echo them back.
+  With the checkpoints' own templates (vLLM 0.31):
+
+  | Family | Added tokens blocked beyond the special ones | Added tokens allowed |
+  |---|---|---|
+  | Qwen3-8B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next, Nemotron-3-Nano | `<think>`, `</think>` | `<tool_call>`, `<tool_response>` (and their closers); Qwen's FIM markers |
+  | Qwen3-4B-Instruct-2507 (Qwen3 architecture) | none | all, including `<think>` |
+  | GLM-5.2, GLM-5.3, GLM-5.3-Flash | `<think>`, `</think>` | `<tool_call>`, `<arg_key>`, `<arg_value>`, `<tool_response>`, `/nothink`, box and code markers |
+  | DeepSeek-V4-Flash | all 53 (`<｜User｜>`, `<｜Assistant｜>`, `<｜latest_reminder｜>` and the rest are not special) | none |
+  | MiniMax-M2, Trinity-Mini | `<think>` (the generation prompt opens it) | `</think>`, MiniMax's `<minimax:tool_call>` |
+  | gpt-oss-20b | none (all 21 are special) | none |
+
+  Turn delimiters are blocked in every family: special in all but DeepSeek-V4.
+  Input the template or vLLM rejects fails with `invalid_chat_request`, with
+  `param` when vLLM names one. Neither
   carries message text. A worker that cannot render
   chat at all (for example, its engine has no tokenizer) or a model with no chat
   template fails with `chat_unsupported`, logged once per worker.
@@ -236,9 +277,10 @@ chat on such a checkpoint streams reasoning as content; an explicit
   serve does with `response_format`, so the parsers fit it to the model: gpt-oss
   writes the JSON in Harmony's final channel after its analysis, and with
   `tool_choice="auto"` and strict tools the grammar allows either a call or the
-  JSON. A forced tool call (`required` or named) has a grammar of its own, so
-  `structured_outputs` with one fails with `invalid_chat_request` and
-  `param="structured_outputs"`.
+  JSON. With `auto` and tools that are not strict, vLLM applies only the JSON
+  grammar, so the model can't call a tool, as in vllm serve. A forced tool call
+  (`required` or named) has a grammar of its own, so `structured_outputs` with
+  one fails with `invalid_chat_request` and `param="structured_outputs"`.
 - Tool-call arguments follow the tool's schema only for tools with
   `"strict": true` (vLLM 0.31's default `tool_strict_level="auto"`); for other
   tools a forced call constrains only the call's markup.

@@ -208,7 +208,7 @@ def test_structured_output_becomes_the_vllm_type(engine_params):
 
 
 def test_a_built_chat_grammar_passes_through(engine_params):
-    # A chat prompt's tool grammar arrives as vLLM's type, already built.
+    # A chat prompt's grammar arrives as vLLM's type, already built.
     grammar = object()
     kwargs = StreamingWorkerMixin()._stream_sampling_params(
         {"n": 1, "structured_outputs": grammar}

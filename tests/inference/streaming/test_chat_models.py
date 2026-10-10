@@ -133,9 +133,10 @@ def test_explicit_parsers_override_the_table():
 def test_unknown_architecture_has_no_chat_unless_parsers_are_given():
     assert resolve_chat_model("MysteryForCausalLM") is None
     model = resolve_chat_model("MysteryForCausalLM", tool_call_parser="hermes")
-    assert model == ChatModel(reasoning_parser=None, tool_call_parser="hermes")
     # No reasoner, so there is no thinking to turn off.
-    assert model.thinking_optional is True
+    assert model == ChatModel(
+        reasoning_parser=None, tool_call_parser="hermes", thinking_optional=True
+    )
     model = resolve_chat_model("MysteryForCausalLM", reasoning_parser="deepseek_r1")
     # Nothing says this one's thinking can be turned off.
     assert model.thinking_optional is False

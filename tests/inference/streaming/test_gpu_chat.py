@@ -297,6 +297,14 @@ def test_chat_input_errors_are_typed():
         assert injected[-1]["code"] == "invalid_message_content"
         assert injected[-1]["param"] == "messages[0]"
 
+        # Qwen3's thinking-off prompt writes <think></think>, so the template
+        # probe blocks both; it never writes <tool_call>, which passes.
+        for text, passes in (("Spell </think> backwards", False), ("What is <tool_call>?", True)):
+            events = await collect(
+                driver, ChatPrompt([{"role": "user", "content": text}]), {"max_tokens": 8}
+            )
+            assert (events[-1]["type"] == "completed") is passes, (text, events[-1])
+
         unknown_tool = await collect(
             driver,
             ChatPrompt(

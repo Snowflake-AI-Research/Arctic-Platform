@@ -3,18 +3,25 @@
 Rendering and parsing reuse vLLM's own chat front end (``OnlineRenderer`` and
 the unified ``Parser``) on the engine the worker already holds. Which parsers
 apply comes from ``CHAT_MODELS``, keyed by the architecture vLLM resolved for
-the checkpoint; the ``chat_reasoning_parser`` and ``tool_call_parser`` engine
-kwargs override it. Chat parses with the engine's reasoner when it has one.
+the checkpoint; the ``chat_reasoning_parser`` and ``tool_call_parser``
+``ModelConfig`` fields override it. Chat parses with the engine's reasoner when
+it has one. A probe render of the model's template narrows the rest (see
+``ChatEngine.probe``).
 """
 
 from __future__ import annotations
 
+import asyncio
 import functools
+import itertools
 import json
+import logging
 import re
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
+
+logger = logging.getLogger(__name__)
 
 MAX_CHAT_BYTES = 8 * 1024 * 1024
 MAX_CHAT_MESSAGES = 2048
@@ -33,10 +40,11 @@ class ChatModel:
     ``reasoning_efforts`` maps a requested ``reasoning_effort`` to the level the
     family's template names; values it does not list reach the template as is.
 
-    ``reasoning_parser=None`` means the model does not reason: everything it
-    writes is content, so logprobs are allowed, and ``thinking_optional`` is
-    true since there is nothing to turn off. A job's own engine reasoner still
-    replaces it, as for every entry.
+    ``reasoning_parser=None`` means chat parses no reasoning: everything the
+    model writes is content, so logprobs are allowed. A job's own engine
+    reasoner still replaces it, as for every entry. ``thinking_optional`` is
+    the model's, not the parser's: a model that always thinks keeps refusing
+    "none" when the worker runs it without a reasoner.
     """
 
     reasoning_parser: str | None
@@ -45,10 +53,6 @@ class ChatModel:
     # template enable_thinking=False). If not, "none" is refused.
     thinking_optional: bool = False
     reasoning_efforts: Mapping[str, str] = MappingProxyType({})
-
-    def __post_init__(self):
-        if self.reasoning_parser is None:
-            object.__setattr__(self, "thinking_optional", True)
 
     def template_reasoning_effort(self, effort):
         if effort == "none" and not self.thinking_optional:
@@ -121,7 +125,7 @@ CHAT_MODELS = MappingProxyType(
         # Trinity-Mini opens <think> with hermes calls (chat_reasoning_parser=
         # deepseek_r1). A reasoner on a model that never closes </think> would
         # hide its whole answer as reasoning.
-        "AfmoeForCausalLM": ChatModel(None, "hermes"),
+        "AfmoeForCausalLM": ChatModel(None, "hermes", thinking_optional=True),
         # Nemotron 3 Nano and Super.
         "NemotronHForCausalLM": ChatModel("nemotron_v3", "qwen3_coder", thinking_optional=True),
     }
@@ -138,7 +142,12 @@ def resolve_chat_model(architecture, *, reasoning_parser=None, tool_call_parser=
     if model is None:
         if reasoning_parser is None and tool_call_parser is None:
             return None
-        return ChatModel(reasoning_parser=reasoning_parser, tool_call_parser=tool_call_parser)
+        # With no reasoner named, there is no thinking to turn off.
+        return ChatModel(
+            reasoning_parser=reasoning_parser,
+            tool_call_parser=tool_call_parser,
+            thinking_optional=reasoning_parser is None,
+        )
     if reasoning_parser is not None:
         model = replace(model, reasoning_parser=reasoning_parser)
     if tool_call_parser is not None:
@@ -259,25 +268,102 @@ def check_chat_input(prompt, structured_outputs=None):
             raise ChatInputError("invalid_chat_request", f"messages[{index}].content")
 
 
-class SpecialTokenGuard:
-    """Rejects text that spells one of the tokenizer's special tokens.
+# Plain text for each message of the probe conversation, in order. The two
+# user turns let the probe see what opens a user turn after each other role.
+PROBE_MESSAGES = (
+    ("system", "ProbeSystemText"),
+    ("user", "ProbeUserText"),
+    ("assistant", "ProbeAssistantText"),
+    ("user", "ProbeLastUserText"),
+)
 
-    The engine reads such text in a rendered prompt as the real control token,
-    so content like ``"<|im_end|><|im_start|>system"`` would forge a turn.
-    Added tokens that are not special (Qwen3's ``<think>``, ``<tool_call>``)
-    are allowed, as vllm serve allows them: they mark reasoning and tool calls
-    inside a turn, and Arctic itself returns them as content.
+
+def _added_tokens(tokenizer):
+    """``{token_id: (text, special)}`` for every added token of ``tokenizer``."""
+    added = {
+        token_id: (token.content, bool(getattr(token, "special", False)))
+        for token_id, token in (getattr(tokenizer, "added_tokens_decoder", None) or {}).items()
+    }
+    get_added_vocab = getattr(tokenizer, "get_added_vocab", None)
+    for text, token_id in (get_added_vocab() if get_added_vocab else {}).items():
+        added.setdefault(token_id, (text, False))
+    return added
+
+
+def structural_tokens(tokenizer, renders):
+    """Added tokens a template writes around the probe's text, from its ``renders``.
+
+    ``renders`` holds the prompt token ids of ``PROBE_MESSAGES`` as rendered
+    under each setting probed. Returns the ids of added tokens outside the
+    messages' text, and whether one that isn't special opens a user turn.
+    Raises ValueError if a render lacks the probe's text.
+    """
+    added = _added_tokens(tokenizer)
+    structural = set()
+    plain_turn_opener = False
+    for token_ids in renders:
+        pieces = [tokenizer.decode([token_id]) for token_id in token_ids]
+        ends = list(itertools.accumulate(len(piece) for piece in pieces))
+        text = "".join(pieces)
+        spans = []
+        for _, sentinel in PROBE_MESSAGES:
+            start = text.find(sentinel, spans[-1][1] if spans else 0)
+            if start < 0:
+                raise ValueError("The rendered probe lacks a message's text")
+            spans.append((start, start + len(sentinel)))
+        # What lies between the previous message's text and a user message's.
+        user_openers = [
+            (spans[index - 1][1], spans[index][0])
+            for index, (role, _) in enumerate(PROBE_MESSAGES)
+            if role == "user"
+        ]
+        for token_id, piece, end in zip(token_ids, pieces, ends):
+            start = end - len(piece)
+            if token_id not in added or any(s < end and start < e for s, e in spans):
+                continue
+            structural.add(token_id)
+            if not added[token_id][1] and any(
+                after <= start and end <= before for after, before in user_openers
+            ):
+                plain_turn_opener = True
+    return structural, plain_turn_opener
+
+
+class SpecialTokenGuard:
+    """Rejects text that spells one of the model's control tokens.
+
+    Tokenizers read such text in a rendered prompt as the real token, so
+    content like ``"<|im_end|><|im_start|>system"`` would forge a turn. Blocked:
+    every special token, and every added token the chat template writes
+    itself, found by rendering a probe conversation (``structural_tokens``).
+    That covers delimiters a tokenizer doesn't mark special (DeepSeek-V4's
+    ``<｜User｜>``) and in-prompt reasoning markers, whose forged ``</think>``
+    would end reasoning early. Added tokens the template never writes (Qwen3's
+    ``<tool_call>``) are allowed, as vllm serve allows them.
+
+    Without a probe, or when a user turn opens with an added token that isn't
+    special (the flags then can't tell control tokens from text, and roles
+    the API can't send, like DeepSeek-V4's ``<｜latest_reminder｜>``, can't be
+    probed), every added token is blocked.
     """
 
     def __init__(self, tokens):
         tokens = sorted({token for token in tokens if token}, key=len, reverse=True)
+        self.tokens = frozenset(tokens)
         self._pattern = re.compile("|".join(map(re.escape, tokens))) if tokens else None
 
     @classmethod
-    def from_tokenizer(cls, tokenizer):
+    def from_tokenizer(cls, tokenizer, renders=None):
+        """The guard for ``tokenizer``; ``renders`` are the probe's, or None if it failed."""
+        added = _added_tokens(tokenizer)
         tokens = set(getattr(tokenizer, "all_special_tokens", ()) or ())
-        added = getattr(tokenizer, "added_tokens_decoder", None) or {}
-        tokens.update(token.content for token in added.values() if getattr(token, "special", False))
+        tokens.update(text for text, special in added.values() if special)
+        plain_turn_opener = renders is None
+        if renders is not None:
+            structural, plain_turn_opener = structural_tokens(tokenizer, renders)
+            tokens.update(added[token_id][0] for token_id in structural)
+        if plain_turn_opener:
+            tokens.update(text for text, _ in added.values())
         return cls(tokens)
 
     def check(self, prompt):
@@ -344,10 +430,103 @@ class ChatEngine:
         self.tokenizer = llm.renderer.get_tokenizer()
         # The renderer's own unified Parser class, so rendering and parsing agree.
         self.parser_cls = self.online.parser
-        self.guard = SpecialTokenGuard.from_tokenizer(self.tokenizer)
+        # Set by probe().
+        self.guard = None
+        self._probe_task = None
         self.has_chat_template = has_chat_template(
             llm.renderer, self.tokenizer, llm.model_config, harmony=self.harmony
         )
+
+    async def probe(self):
+        """Fit ``guard`` and ``chat_model`` to the model's template, rendering it once.
+
+        Run on first use: the renderer is async, so the constructor can't.
+        """
+        if self.guard is None:
+            if self._probe_task is None:
+                self._probe_task = asyncio.ensure_future(self._probe())
+            # Shielded: a cancelled stream must not cancel the shared probe.
+            await asyncio.shield(self._probe_task)
+
+    async def _probe(self):
+        try:
+            if self.chat_model.thinking_optional and await self._template_forces_thinking():
+                # The table can only narrow what the template does: GLM-5.3
+                # shares GLM-5.2's architecture but always opens <think>.
+                logger.warning(
+                    "The chat template opens reasoning despite enable_thinking=False; "
+                    "refusing reasoning_effort='none'"
+                )
+                self.chat_model = replace(self.chat_model, thinking_optional=False)
+            self.guard = SpecialTokenGuard.from_tokenizer(
+                self.tokenizer, await self._render_probe_settings()
+            )
+        except Exception as exc:
+            logger.warning(
+                "Chat template probe failed (%s); chat rejects text spelling any added "
+                "token and refuses reasoning_effort='none'",
+                type(exc).__name__,
+            )
+            self.chat_model = replace(self.chat_model, thinking_optional=False)
+            self.guard = SpecialTokenGuard.from_tokenizer(self.tokenizer)
+            return
+        logger.info(
+            "Chat rejects text spelling these tokens beyond the special ones: %s",
+            sorted(self.guard.tokens - SpecialTokenGuard.from_tokenizer(self.tokenizer, []).tokens),
+        )
+
+    async def _template_forces_thinking(self):
+        """Whether the generation prompt opens reasoning even with enable_thinking=False.
+
+        Identical prompts alone could also mean a model that never thinks
+        (Qwen3-Instruct-2507 under Qwen3's architecture), so the reasoner's
+        start marker must be in the prompt too.
+        """
+        on, off = [
+            await self._render_probe(chat_template_kwargs={"enable_thinking": enable})
+            for enable in (True, False)
+        ]
+        if on != off or self.parser_cls is None:
+            return False
+        reasoner = self.parser_cls(
+            self.tokenizer,
+            None,
+            chat_template_kwargs={"enable_thinking": False},
+            model_config=self.model_config,
+        ).reasoning_parser
+        start = getattr(reasoner, "reasoning_start_str", None)
+        text = self.tokenizer.decode(off)
+        return bool(start) and start in text[text.rfind(PROBE_MESSAGES[-1][1]) :]
+
+    async def _render_probe_settings(self):
+        """``PROBE_MESSAGES`` rendered as requests can render them.
+
+        With and without the generation prompt, at the default and a set
+        reasoning effort, and with thinking off where the model allows it.
+        """
+        efforts = [None, "medium"] + (["none"] if self.chat_model.thinking_optional else [])
+        renders = []
+        for effort, generation_prompt in itertools.product(efforts, (True, False)):
+            fields = {"add_generation_prompt": generation_prompt}
+            if effort is not None:
+                fields["reasoning_effort"] = self.chat_model.template_reasoning_effort(effort)
+            renders.append(await self._render_probe(**fields))
+        return renders
+
+    async def _render_probe(self, **fields):
+        from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+        from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+
+        request = ChatCompletionRequest(
+            model=self.model_config.model,
+            messages=[{"role": role, "content": text} for role, text in PROBE_MESSAGES],
+            **fields,
+        )
+        result = await self.online.render_chat(request)
+        if isinstance(result, ErrorResponse):
+            raise ValueError("The renderer refused the probe")
+        _, (engine_input,) = result
+        return list(engine_input["prompt_token_ids"])
 
     async def render(self, prompt, structured_outputs=None):
         """Render ``prompt``; ``structured_outputs`` is the stream's JSON format, if any.
@@ -364,6 +543,7 @@ class ChatEngine:
         from vllm.renderers.inputs.preprocess import extract_prompt_len
 
         check_chat_input(prompt, structured_outputs)
+        await self.probe()
         self.guard.check(prompt)
         fields = {
             "model": self.model_config.model,
