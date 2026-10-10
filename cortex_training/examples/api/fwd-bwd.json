@@ -1,0 +1,25 @@
+{
+  "payload": {
+    "add_special_tokens": true,
+    "batch_size": 8,
+    "include_attention_mask": false,
+    "labels": {
+      "ignore_index": -100,
+      "mask_padding": true,
+      "strategy": "next_token"
+    },
+    "max_length": 128,
+    "padding": "max_length",
+    "position_ids": "arange",
+    "texts": [
+      "Snowflake builds reliable data systems, and this short batch checks one forward backward pass.",
+      "A mixture of experts model routes tokens through sparse expert layers during training."
+    ],
+    "tokenizer": {
+      "model_name": "Qwen/Qwen3.6-35B-A3B",
+      "trust_remote_code": false
+    },
+    "truncation": true
+  },
+  "poll": true
+}

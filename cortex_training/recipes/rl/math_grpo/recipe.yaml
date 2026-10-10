@@ -1,0 +1,18 @@
+id: math-grpo
+title: Math reinforcement learning with GRPO
+status: runnable
+task: reinforcement-learning
+method: grpo
+models:
+  - Qwen/Qwen3-8B
+datasets:
+  - hendrycks_math
+  - HuggingFaceH4/MATH-500
+precision:
+  - bfloat16
+default_training_gpus: 4
+default_sampling_gpus: 4
+provenance:
+  project: tinker-cookbook
+  recipe: recipes/math_rl/train.py
+last_validated: null
