@@ -372,7 +372,7 @@ def test_a_family_without_a_reasoner_adds_none_to_the_engine(fake_vllm, monkeypa
         (
             "MysteryForCausalLM",
             {"tool_call_parser": "hermes"},
-            {"chat_prompt": True, "thinking_optional": False},
+            {"chat_prompt": True, "thinking_optional": True},
         ),
     ],
 )

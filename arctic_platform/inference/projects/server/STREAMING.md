@@ -86,7 +86,7 @@ arrays nested <=64 levels) or
 accepts ends the stream with `invalid_structured_output`.
 `thinking_token_budget` is an integer in [1, max_tokens], where an omitted
 max_tokens counts as 4096; vLLM rejects it with `invalid_sampling_params` unless
-the model was loaded with a reasoning parser. `logprobs` is an integer in
+the job sets `reasoning_parser` (the reasoner chat adds does not count). `logprobs` is an integer in
 [0, 20], the number of alternatives reported per token; a value above the loaded
 model's `max_logprobs` ends the stream with `invalid_sampling_params`.
 Active LoRA selection is forwarded. No HTTP, SSE, or
@@ -139,10 +139,10 @@ That is 18 architectures in 10 families. "Thinking off" means
 anyway. Every other value Arctic accepts reaches the template as a level it
 takes (`test_chat_models.py` checks each family). The table suits checkpoints that keep
 their family's chat template; one with a different template (an instruct-only
-or thinking-only variant, a coder model) can set the `chat_reasoning_parser` and
-`tool_call_parser` engine kwargs, which override the table and are popped by the
-worker like vllm serve's flags. They also enable chat on an unlisted
-architecture. Without either, a chat stream on an unlisted architecture fails
+or thinking-only variant, a coder model) can set `ModelConfig`'s
+`chat_reasoning_parser` and `tool_call_parser`, which override the table like
+vllm serve's flags. They also enable chat on an unlisted architecture. Without
+either, a chat stream on an unlisted architecture fails
 with `chat_unsupported`, logged once per worker. `tokenizer_mode` is left to
 vLLM, which picks DeepSeek-V4's by architecture.
 
@@ -175,11 +175,17 @@ it raises any error or leaves its `start_token_id` or `end_token_id` None, so
 chat on such a checkpoint streams reasoning as content; an explicit
 `chat_reasoning_parser` that fails this check fails engine start.
 
+- Message content must be a string or a list of text parts; an image, audio,
+  video or file part fails with `invalid_chat_request` and `param` (for example
+  `messages[1].content`), so the worker never fetches media for a client.
 - Before rendering, any string in messages, tools or a named `tool_choice` that
-  contains one of the tokenizer's special or added tokens fails the stream with
-  `invalid_message_content` and `param` (for example `messages[1]`). Input the
-  template or vLLM rejects fails with `invalid_chat_request`, with `param` when
-  vLLM names one. Neither carries message text. A worker that cannot render
+  contains one of the tokenizer's special tokens (such as `<|im_end|>`) fails the
+  stream with `invalid_message_content` and `param` (for example `messages[1]`).
+  Added tokens that are not special (Qwen3's `<think>` or `<tool_call>`) pass, as
+  in vllm serve: they can't start a turn, and Arctic returns them as content
+  itself, so a client may echo them back. Input the template or vLLM rejects
+  fails with `invalid_chat_request`, with `param` when vLLM names one. Neither
+  carries message text. A worker that cannot render
   chat at all (for example, its engine has no tokenizer) or a model with no chat
   template fails with `chat_unsupported`, logged once per worker.
 - If `max_tokens` is omitted, the budget is `min(context left after the
@@ -199,12 +205,11 @@ chat on such a checkpoint streams reasoning as content; an explicit
   `engine_error` and is logged by type and stack only.
 - `choice_finished` reports `tool_calls` when a choice that called a tool stops,
   except under a named `tool_choice`, which reports `stop` as OpenAI does.
-  `usage` adds `reasoning_tokens`, counted by the reasoning parser across choices.
-  Report that count; the sum of `reasoning_delta` `token_count`s can differ,
-  since it leaves out markup the parser consumed without emitting anything.
-  gpt-oss is the exception: vLLM's gpt-oss parser does not count, so
-  `reasoning_tokens` is that sum, and a delta that ends reasoning counts whole,
-  since that parser cannot split one.
+  `usage` adds `reasoning_tokens`, counted by vLLM's parser across choices, as
+  vllm serve counts them. Report that count; the sum of `reasoning_delta`
+  `token_count`s can differ, since it leaves out markup the parser consumed
+  without emitting anything, and on gpt-oss a delta that ends reasoning counts
+  whole, since its parser cannot split one.
 - Undelivered events merge only with the same kind of the same choice; tool-call
   arguments merge only within one call.
 - `logprobs` are refused when the model will reason: a reasoning parser is
@@ -227,10 +232,21 @@ chat on such a checkpoint streams reasoning as content; an explicit
   answer only). Coverage is per engine delta, so one delta the parser splits
   into content and a tool call gives all its tokens to the content, and a
   parser that rewrites held text before releasing it leaves those tokens out.
-- `structured_outputs` cannot be combined with a chat prompt whose tools need a
-  grammar of their own (`invalid_chat_request`, `param="structured_outputs"`):
-  vLLM applies one grammar per request. Without `max_tokens`,
-  `thinking_token_budget` is checked against the budget after rendering.
+- A chat stream's `structured_outputs` goes on the rendered request, as vllm
+  serve does with `response_format`, so the parsers fit it to the model: gpt-oss
+  writes the JSON in Harmony's final channel after its analysis, and with
+  `tool_choice="auto"` and strict tools the grammar allows either a call or the
+  JSON. A forced tool call (`required` or named) has a grammar of its own, so
+  `structured_outputs` with one fails with `invalid_chat_request` and
+  `param="structured_outputs"`.
+- Tool-call arguments follow the tool's schema only for tools with
+  `"strict": true` (vLLM 0.31's default `tool_strict_level="auto"`); for other
+  tools a forced call constrains only the call's markup.
+- `thinking_token_budget` needs a reasoning parser on the engine itself (the
+  job's `reasoning_parser`). The reasoner the worker adds for chat grammars does
+  not enable it, so on such an engine a budget fails with
+  `invalid_sampling_params`. Without `max_tokens`, the budget is checked against
+  the one chosen after rendering.
 
 ### Adding a model family
 

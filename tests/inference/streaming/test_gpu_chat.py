@@ -27,6 +27,9 @@ WEATHER_TOOL = {
     "function": {
         "name": "get_weather",
         "description": "Current weather for a city",
+        # vLLM 0.31 checks a forced call's arguments against the schema only
+        # for strict tools.
+        "strict": True,
         "parameters": {
             "type": "object",
             "properties": {"city": {"type": "string"}},
@@ -197,6 +200,49 @@ def test_forced_tool_call_waits_for_the_end_of_reasoning():
             assert calls and calls[0]["name"] == "get_weather", events
             [finish] = [e for e in events if e["type"] == "choice_finished"]
             assert finish["finish_reason"] == "tool_calls"
+
+    asyncio.run(with_driver(check))
+
+
+@pytest.mark.parametrize(
+    "structured_outputs",
+    [
+        {"json_object": True},
+        {
+            "json": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": False,
+            }
+        },
+    ],
+    ids=["json_object", "json_schema"],
+)
+def test_chat_json_output_follows_reasoning(structured_outputs):
+    # Model-agnostic: on gpt-oss the JSON must land in Harmony's final channel.
+    from arctic_platform.inference.server.chat import ChatPrompt
+
+    messages = [
+        {
+            "role": "user",
+            "content": 'Answer with a JSON object whose "city" is the capital of France.',
+        }
+    ]
+
+    async def check(driver):
+        events = await collect(
+            driver,
+            ChatPrompt(messages),
+            {"temperature": 0.0, "max_tokens": 1536, "structured_outputs": structured_outputs},
+        )
+        answer = json.loads(content(events))
+        assert isinstance(answer, dict)
+        if "json" in structured_outputs:
+            assert set(answer) == {"city"} and isinstance(answer["city"], str)
+        assert usage(events)["reasoning_tokens"] > 0
+        [finish] = [e for e in events if e["type"] == "choice_finished"]
+        assert finish["finish_reason"] == "stop"
 
     asyncio.run(with_driver(check))
 

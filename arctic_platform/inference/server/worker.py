@@ -690,10 +690,9 @@ class InferenceWorker(StreamingWorkerMixin):
         # `reasoning_parser` is used by vLLM structured outputs to avoid
         # constraining reasoning tokens.
         reasoning_parser_name = engine_kwargs.get("reasoning_parser")
-        # Chat-mode overrides of CHAT_MODELS, not engine args. tool_call_parser
-        # is vllm serve's --tool-call-parser; chat_reasoning_parser applies to
-        # chat streams only, leaving /generate (think prefill, reasoning split,
-        # action masks) on the job's own parser.
+        # Chat-mode overrides of CHAT_MODELS (see ModelConfig), not engine args.
+        # chat_reasoning_parser leaves /generate (think prefill, reasoning
+        # split, action masks) on the job's own parser.
         tool_call_parser = engine_kwargs.pop("tool_call_parser", None)
         chat_reasoning_parser = engine_kwargs.pop("chat_reasoning_parser", None)
         self._return_reasoning_content = bool(engine_kwargs.pop("return_reasoning_content", False))

@@ -648,6 +648,9 @@ class EngineStream:
             if isinstance(self.prompt, ChatPrompt):
                 chat, prepared = await self._render_chat(kwargs)
                 params = {**self.params, **chat.rendered.detokenize_params}
+                # The request's grammar: the stream's format as the parsers fit it,
+                # tool calls' grammar, both, or neither.
+                params.pop("structured_outputs", None)
                 if chat.rendered.structured_outputs is not None:
                     params["structured_outputs"] = chat.rendered.structured_outputs
                 params = self.owner._stream_sampling_params(params)
@@ -790,7 +793,9 @@ class EngineStream:
     async def _render_chat(self, generate_kwargs):
         """Render the chat prompt and fix the output budget from its length."""
         try:
-            rendered = await self.owner._chat_engine().render(self.prompt)
+            rendered = await self.owner._chat_engine().render(
+                self.prompt, self.params.get("structured_outputs")
+            )
         except ChatInputError as exc:
             if exc.code == "context_length_exceeded":
                 raise StreamError(
@@ -822,12 +827,6 @@ class EngineStream:
             # together, so its logprobs would expose reasoning. OpenAI's
             # reasoning models take no logprobs either.
             raise StreamError("invalid_chat_request", param="logprobs")
-        if (
-            rendered.structured_outputs is not None
-            and "structured_outputs" in self.params
-        ):
-            # Tool calls need their own grammar; vLLM applies one per request.
-            raise StreamError("invalid_chat_request", param="structured_outputs")
         generate_kwargs.update(rendered.generate_kwargs)
         return ChatOutput(rendered, self.params["n"]), rendered.engine_input
 

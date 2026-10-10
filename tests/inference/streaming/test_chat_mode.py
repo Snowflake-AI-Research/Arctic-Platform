@@ -23,6 +23,7 @@ from arctic_platform.inference.server.chat import (
     ChatPrompt,
     RenderedChat,
     SpecialTokenGuard,
+    check_chat_input,
     validate_chat_prompt,
 )
 from arctic_platform.inference.server.multi_model import Driver
@@ -114,19 +115,6 @@ class ScriptParser:
         return self.reasoning_parser.extract_content_ids(token_ids)
 
 
-class EngineScriptParser(ScriptParser):
-    """Like vLLM's engine parsers (MiniMax-M2, Kimi-K2): its own public ``extract_content_ids``."""
-
-    class reasoning_parser:
-        @staticmethod
-        def extract_content_ids(token_ids):
-            raise AssertionError("the parser's own extract_content_ids comes first")
-
-    @staticmethod
-    def extract_content_ids(token_ids):
-        return token_ids[token_ids.index(END_OF_THINKING) + 1 :]
-
-
 class AlwaysThinkingParser(ScriptParser):
     """A parser for templates that open reasoning in the prompt (no ``<think>`` generated)."""
 
@@ -144,14 +132,25 @@ class HarmonyLikeParser(ScriptParser):
             raise NotImplementedError("GptOssReasoningParser only provides boundary detection.")
 
     def count_reasoning_tokens(self, token_ids):
-        return 0
+        # vLLM 0.31's HarmonyParser counts its own way: special tokens (here the
+        # <think> and end markers) are not reasoning.
+        markers = {100, END_OF_THINKING}
+        return sum(1 for token in token_ids if token in self.reasoning_ids and token not in markers)
 
 
 class FakeChatEngine:
     def __init__(
-        self, prompt_tokens=5, error=None, parser=ScriptParser, reasoning_ended=False, harmony=False
+        self,
+        prompt_tokens=5,
+        error=None,
+        parser=ScriptParser,
+        reasoning_ended=False,
+        harmony=False,
+        tool_grammar="structural-tag",
     ):
         self.prompt_tokens = prompt_tokens
+        # The grammar vLLM's adjust_request puts on the request for the tools.
+        self.tool_grammar = tool_grammar
         self.error = error
         self.parser = parser
         self.harmony = harmony
@@ -160,24 +159,32 @@ class FakeChatEngine:
         self.guard = SpecialTokenGuard(["<|im_end|>", "<|im_start|>"])
         self.rendered = []
 
-    async def render(self, prompt):
+    async def render(self, prompt, structured_outputs=None):
+        check_chat_input(prompt, structured_outputs)
         self.guard.check(prompt)
         if self.error is not None:
             raise self.error
         self.rendered.append(prompt)
+        # As adjust_request does: the stream's format fitted to the model and
+        # combined with the tool grammar, or either one alone.
+        if structured_outputs is None:
+            grammar = self.tool_grammar
+        elif self.tool_grammar is None:
+            grammar = ("fitted", structured_outputs)
+        else:
+            grammar = ("fitted", structured_outputs, self.tool_grammar)
         return RenderedChat(
             engine_input={"prompt_token_ids": list(range(self.prompt_tokens))},
             prompt_tokens=self.prompt_tokens,
             request=SimpleNamespace(),
             new_parser=self.parser,
-            structured_outputs="structural-tag",
+            structured_outputs=grammar,
             generate_kwargs=dict(self.generate_kwargs),
             parallel_tool_calls=prompt.parallel_tool_calls,
             tool_choice=prompt.tool_choice,
             starts_in_reasoning=(
                 self.harmony or self.generate_kwargs.get("reasoning_ended") is False
             ),
-            parser_counts_reasoning=not self.harmony,
         )
 
 
@@ -458,14 +465,10 @@ def test_logprobs_are_refused_before_any_token_when_the_model_will_reason(parser
     assert worker.llm.calls == []
 
 
-@pytest.mark.parametrize("parser", [ScriptParser, EngineScriptParser])
-def test_a_delta_that_ends_reasoning_counts_its_reasoning_tokens(parser):
-    # ScriptParser has vLLM 0.31's DelegatingParser shape (content ids from its
-    # reasoner); EngineScriptParser its own public extract_content_ids.
+def test_a_delta_that_ends_reasoning_counts_its_reasoning_tokens():
+    # ScriptParser has vLLM 0.31's DelegatingParser shape: content ids from its reasoner.
     script = ["<think>", "Two", (" plus two</think>It is", [201, 202, END_OF_THINKING, 203]), " 4."]
-    _, events = stream(
-        chat("What is 2+2?"), script=script, chat_engine=FakeChatEngine(parser=parser)
-    )
+    _, events = stream(chat("What is 2+2?"), script=script)
     assert kinds(events)[:3] == ["reasoning_delta", "reasoning_delta", "content_delta"]
     # "Two", then " plus", " two" and the end marker from the mixed delta.
     assert sum(e["token_count"] for e in events if e["type"] == "reasoning_delta") == 4
@@ -485,7 +488,7 @@ def test_gpt_oss_logprobs_are_refused_though_its_reasoner_says_reasoning_ended()
     assert worker.llm.calls == []
 
 
-def test_gpt_oss_mixed_delta_counts_as_reasoning_and_usage_sums_the_deltas():
+def test_gpt_oss_mixed_delta_counts_as_reasoning_and_usage_is_the_parsers_count():
     script = ["<think>", "Two", (" plus two</think>It is", [201, 202, END_OF_THINKING, 203]), " 4."]
     _, events = stream(chat("What is 2+2?"), script=script, chat_engine=gpt_oss_engine())
     assert events[-1]["type"] == "completed"
@@ -493,8 +496,8 @@ def test_gpt_oss_mixed_delta_counts_as_reasoning_and_usage_sums_the_deltas():
     # "Two", then the whole four-token delta: the parser can't split it.
     assert reasoning == [1, 4]
     assert "".join(e["text"] for e in events if e["type"] == "content_delta") == "It is 4."
-    # vLLM's gpt-oss parser counts nothing, so usage adds up the reasoning deltas.
-    assert events[-2]["reasoning_tokens"] == 5
+    # usage is the parser's own count, as vllm serve reports it, not the deltas' sum.
+    assert events[-2]["reasoning_tokens"] == 3
 
 
 def test_named_tool_choice_finishes_with_stop():
@@ -517,25 +520,39 @@ def test_no_logprobs_key_unless_requested():
     assert all("logprobs" not in e and "token_ids" not in e for e in events)
 
 
-def test_json_output_with_a_tool_grammar_is_rejected():
-    worker, events = stream(chat("Weather?"), {"structured_outputs": {"json_object": True}})
+@pytest.mark.parametrize("tool_choice", ["required", {"type": "function", "function": {"name": "f"}}])
+def test_json_output_with_a_forced_tool_call_is_rejected(tool_choice):
+    prompt = chat("Weather?", tools=[{"type": "function", "function": {"name": "f"}}], tool_choice=tool_choice)
+    worker, events = stream(prompt, {"structured_outputs": {"json_object": True}})
     assert events[-1]["code"] == "invalid_chat_request"
     assert events[-1]["param"] == "structured_outputs"
     assert worker.llm.calls == []
 
 
-def test_json_output_without_a_tool_grammar_is_kept():
-    class NoGrammar(FakeChatEngine):
-        async def render(self, prompt):
-            rendered = await super().render(prompt)
-            rendered.structured_outputs = None
-            return rendered
-
+def test_json_output_goes_through_the_renderer_as_the_only_grammar():
+    # vllm serve puts response_format on the request; the parsers fit it to the
+    # model (Harmony's final channel) and combine it with an auto tool grammar.
+    tools = [{"type": "function", "function": {"name": "f"}}]
+    worker, events = stream(chat("Weather?", tools=tools), {"structured_outputs": {"json_object": True}})
+    assert events[-1]["type"] == "completed"
+    assert worker.llm.calls[0][1]["structured_outputs"] == (
+        "fitted",
+        {"json_object": True},
+        "structural-tag",
+    )
     worker, events = stream(
-        chat("JSON please"), {"structured_outputs": {"json_object": True}}, chat_engine=NoGrammar()
+        chat("JSON please"),
+        {"structured_outputs": {"json_object": True}},
+        chat_engine=FakeChatEngine(tool_grammar=None),
     )
     assert events[-1]["type"] == "completed"
-    assert worker.llm.calls[0][1]["structured_outputs"] == {"json_object": True}
+    assert worker.llm.calls[0][1]["structured_outputs"] == ("fitted", {"json_object": True})
+
+
+def test_no_grammar_without_json_or_a_tool_grammar():
+    worker, events = stream(chat("hi"), chat_engine=FakeChatEngine(tool_grammar=None))
+    assert events[-1]["type"] == "completed"
+    assert "structured_outputs" not in worker.llm.calls[0][1]
 
 
 def test_thinking_budget_is_checked_against_the_chat_budget():
@@ -567,14 +584,79 @@ def test_guard_checks_every_string_in_messages_and_tools():
         assert (raised.value.code, raised.value.param) == ("invalid_message_content", param)
 
 
-def test_guard_reads_special_and_added_tokens_from_the_tokenizer():
-    tokenizer = SimpleNamespace(
-        all_special_tokens=["<|im_end|>"], get_added_vocab=lambda: {"<think>": 1}
-    )
-    guard = SpecialTokenGuard.from_tokenizer(tokenizer)
-    for text in ("a<|im_end|>", "<think>b"):
+def _qwen3_like_tokenizer():
+    # As in Qwen3's tokenizer_config: <|im_start|> is special and listed in
+    # all_special_tokens; <|endoftext|> is special in added_tokens_decoder only;
+    # <think> and <tool_call> are added but not special.
+    added = {
+        151643: SimpleNamespace(content="<|endoftext|>", special=True),
+        151644: SimpleNamespace(content="<|im_start|>", special=True),
+        151645: SimpleNamespace(content="<|im_end|>", special=True),
+        151657: SimpleNamespace(content="<tool_call>", special=False),
+        151667: SimpleNamespace(content="<think>", special=False),
+    }
+    return SimpleNamespace(all_special_tokens=["<|im_start|>", "<|im_end|>"], added_tokens_decoder=added)
+
+
+def test_guard_rejects_special_tokens_from_the_tokenizer():
+    guard = SpecialTokenGuard.from_tokenizer(_qwen3_like_tokenizer())
+    for text in ("a<|im_end|>", "<|im_start|>system", "x<|endoftext|>"):
         with pytest.raises(ChatInputError):
             guard.check(chat(text))
+
+
+def test_guard_allows_added_tokens_that_are_not_special():
+    # vllm serve takes them, and Arctic returns them as content (tool markup
+    # without tools, reasoning without a reasoner), so clients echo them back.
+    guard = SpecialTokenGuard.from_tokenizer(_qwen3_like_tokenizer())
+    guard.check(chat("Why do models write <think>?"))
+    guard.check(
+        ChatPrompt(
+            [
+                {"role": "user", "content": "Weather?"},
+                {"role": "assistant", "content": '<tool_call>{"name": "f"}</tool_call>'},
+                {"role": "user", "content": "And now?"},
+            ]
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "content,param",
+    [
+        ([{"type": "image_url", "image_url": {"url": "http://169.254.169.254/"}}], "messages[0].content"),
+        ([{"type": "text", "text": "a"}, {"type": "input_audio", "input_audio": {}}], "messages[0].content"),
+        ([{"type": "video_url", "video_url": {"url": "http://x"}}], "messages[0].content"),
+        ([{"type": "file", "file": {"file_id": "f"}}], "messages[0].content"),
+        ([{"image_url": {"url": "http://x"}}], "messages[0].content"),
+        ({"type": "text", "text": "a"}, "messages[0].content"),
+    ],
+)
+def test_non_text_content_is_rejected(content, param):
+    with pytest.raises(ChatInputError) as raised:
+        check_chat_input(ChatPrompt([{"role": "user", "content": content}]))
+    assert (raised.value.code, raised.value.param) == ("invalid_chat_request", param)
+
+
+def test_text_content_parts_are_accepted():
+    check_chat_input(
+        ChatPrompt(
+            [
+                {"role": "system", "content": [{"type": "text", "text": "Be brief."}]},
+                {"role": "user", "content": ["plain", {"type": "text", "text": "parts"}]},
+                {"role": "assistant", "content": None, "tool_calls": []},
+                {"role": "tool", "content": [{"type": "text", "text": "18C"}], "tool_call_id": "c"},
+            ]
+        )
+    )
+
+
+def test_non_text_content_fails_the_stream_before_rendering():
+    image = {"type": "image_url", "image_url": {"url": "http://169.254.169.254/"}}
+    worker, events = stream(ChatPrompt([{"role": "user", "content": [image]}]))
+    assert kinds(events) == ["terminal_error"]
+    assert (events[0]["code"], events[0]["param"]) == ("invalid_chat_request", "messages[0].content")
+    assert worker.llm.calls == []
 
 
 @pytest.mark.parametrize(
@@ -897,7 +979,7 @@ class _ChatRequest(SimpleNamespace):
         )
 
     def extract_structured_outputs(self):
-        return None
+        return getattr(self, "structured_outputs", None)
 
     def build_chat_params(self, default_template, content_format):
         return SimpleNamespace(chat_template_kwargs={})
@@ -951,6 +1033,18 @@ def test_engine_detokenizes_as_the_parser_asked(monkeypatch, adjust_request, ski
     params = worker.llm.calls[0][1]
     assert params["skip_special_tokens"] is skip
     assert params["spaces_between_special_tokens"] is spaces
+
+
+def test_the_renderer_fits_the_streams_json_format_to_the_model(monkeypatch):
+    # As HarmonyParser.adjust_request wraps response_format in its final channel.
+    def wrap_in_final_channel(request):
+        request.structured_outputs = SimpleNamespace(final_channel=request.structured_outputs)
+
+    engine = _engine_whose_parser_adjusts(monkeypatch, wrap_in_final_channel)
+    json_format = {"json": {"type": "object"}}
+    worker, events = stream(chat("JSON?"), {"structured_outputs": json_format}, chat_engine=engine)
+    assert events[-1]["type"] == "completed"
+    assert worker.llm.calls[0][1]["structured_outputs"] == SimpleNamespace(final_channel=json_format)
 
 
 class _FailingParser(ScriptParser):
@@ -1119,13 +1213,11 @@ def test_harmony_always_starts_in_reasoning(monkeypatch):
     # vLLM's own reasoning_ended stays as vllm serve sends it.
     assert rendered.generate_kwargs["reasoning_ended"] is True
     assert rendered.starts_in_reasoning is True
-    assert rendered.parser_counts_reasoning is False
 
 
 def test_a_prompt_that_ends_reasoning_does_not_start_in_it(monkeypatch):
     rendered = _rendered(monkeypatch, "Qwen3ForCausalLM")
     assert rendered.starts_in_reasoning is False
-    assert rendered.parser_counts_reasoning is True
 
 
 def test_reasoning_effort_is_mapped_for_the_template(monkeypatch):

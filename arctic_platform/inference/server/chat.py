@@ -20,6 +20,9 @@ MAX_CHAT_BYTES = 8 * 1024 * 1024
 MAX_CHAT_MESSAGES = 2048
 MAX_CHAT_TOOLS = 128
 CHAT_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
+# Content part types vLLM reads as text. Media parts would make the worker fetch
+# URLs or load tensors on the client's behalf.
+TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text", "refusal", "thinking"})
 REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 
 
@@ -30,10 +33,10 @@ class ChatModel:
     ``reasoning_efforts`` maps a requested ``reasoning_effort`` to the level the
     family's template names; values it does not list reach the template as is.
 
-    ``reasoning_parser=None`` in a ``CHAT_MODELS`` entry means the family does
-    not reason: everything it writes is content, so logprobs are allowed, and
-    such entries set ``thinking_optional`` since there is nothing to turn off.
-    A job's own engine reasoner still replaces it, as for every entry.
+    ``reasoning_parser=None`` means the model does not reason: everything it
+    writes is content, so logprobs are allowed, and ``thinking_optional`` is
+    true since there is nothing to turn off. A job's own engine reasoner still
+    replaces it, as for every entry.
     """
 
     reasoning_parser: str | None
@@ -42,6 +45,10 @@ class ChatModel:
     # template enable_thinking=False). If not, "none" is refused.
     thinking_optional: bool = False
     reasoning_efforts: Mapping[str, str] = MappingProxyType({})
+
+    def __post_init__(self):
+        if self.reasoning_parser is None:
+            object.__setattr__(self, "thinking_optional", True)
 
     def template_reasoning_effort(self, effort):
         if effort == "none" and not self.thinking_optional:
@@ -114,7 +121,7 @@ CHAT_MODELS = MappingProxyType(
         # Trinity-Mini opens <think> with hermes calls (chat_reasoning_parser=
         # deepseek_r1). A reasoner on a model that never closes </think> would
         # hide its whole answer as reasoning.
-        "AfmoeForCausalLM": ChatModel(None, "hermes", thinking_optional=True),
+        "AfmoeForCausalLM": ChatModel(None, "hermes"),
         # Nemotron 3 Nano and Super.
         "NemotronHForCausalLM": ChatModel("nemotron_v3", "qwen3_coder", thinking_optional=True),
     }
@@ -131,7 +138,7 @@ def resolve_chat_model(architecture, *, reasoning_parser=None, tool_call_parser=
     if model is None:
         if reasoning_parser is None and tool_call_parser is None:
             return None
-        model = ChatModel(reasoning_parser=None, tool_call_parser=None)
+        return ChatModel(reasoning_parser=reasoning_parser, tool_call_parser=tool_call_parser)
     if reasoning_parser is not None:
         model = replace(model, reasoning_parser=reasoning_parser)
     if tool_call_parser is not None:
@@ -230,11 +237,36 @@ def validate_chat_prompt(prompt):
     return ChatPrompt(messages, tools, tool_choice, parallel_tool_calls, reasoning_effort)
 
 
+def check_chat_input(prompt, structured_outputs=None):
+    """Checks vLLM's renderer would not make: text-only content, and one grammar.
+
+    Content must be a string or a list of text parts. A forced tool call has its
+    own grammar, and vLLM would silently drop a JSON format given with one.
+    """
+    if structured_outputs is not None and prompt.tools and (
+        prompt.tool_choice == "required" or isinstance(prompt.tool_choice, dict)
+    ):
+        raise ChatInputError("invalid_chat_request", "structured_outputs")
+    for index, message in enumerate(prompt.messages):
+        content = message.get("content")
+        if content is None or isinstance(content, str):
+            continue
+        if not isinstance(content, list) or any(
+            not isinstance(part, str)
+            and not (isinstance(part, dict) and part.get("type") in TEXT_PART_TYPES)
+            for part in content
+        ):
+            raise ChatInputError("invalid_chat_request", f"messages[{index}].content")
+
+
 class SpecialTokenGuard:
-    """Rejects text that spells one of the tokenizer's special or added tokens.
+    """Rejects text that spells one of the tokenizer's special tokens.
 
     The engine reads such text in a rendered prompt as the real control token,
     so content like ``"<|im_end|><|im_start|>system"`` would forge a turn.
+    Added tokens that are not special (Qwen3's ``<think>``, ``<tool_call>``)
+    are allowed, as vllm serve allows them: they mark reasoning and tool calls
+    inside a turn, and Arctic itself returns them as content.
     """
 
     def __init__(self, tokens):
@@ -244,9 +276,8 @@ class SpecialTokenGuard:
     @classmethod
     def from_tokenizer(cls, tokenizer):
         tokens = set(getattr(tokenizer, "all_special_tokens", ()) or ())
-        get_added_vocab = getattr(tokenizer, "get_added_vocab", None)
-        if get_added_vocab is not None:
-            tokens.update(get_added_vocab())
+        added = getattr(tokenizer, "added_tokens_decoder", None) or {}
+        tokens.update(token.content for token in added.values() if getattr(token, "special", False))
         return cls(tokens)
 
     def check(self, prompt):
@@ -289,8 +320,6 @@ class RenderedChat:
     # A reasoner is active and the prompt leaves reasoning open, or the model
     # is gpt-oss, whose Harmony format always opens with reasoning.
     starts_in_reasoning: bool = False
-    # False for gpt-oss: vLLM's parser there doesn't count reasoning tokens.
-    parser_counts_reasoning: bool = True
 
 
 class ChatEngine:
@@ -320,7 +349,13 @@ class ChatEngine:
             llm.renderer, self.tokenizer, llm.model_config, harmony=self.harmony
         )
 
-    async def render(self, prompt):
+    async def render(self, prompt, structured_outputs=None):
+        """Render ``prompt``; ``structured_outputs`` is the stream's JSON format, if any.
+
+        The format goes on the request, as vllm serve puts ``response_format``
+        there, so the parsers' ``adjust_request`` fits it to the model (Harmony
+        wraps it in its final channel) and combines it with any tool grammar.
+        """
         from jinja2 import TemplateError
         from vllm.entrypoints.chat_utils import ChatTemplateResolutionError
         from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -328,6 +363,7 @@ class ChatEngine:
         from vllm.exceptions import VLLMClientError
         from vllm.renderers.inputs.preprocess import extract_prompt_len
 
+        check_chat_input(prompt, structured_outputs)
         self.guard.check(prompt)
         fields = {
             "model": self.model_config.model,
@@ -338,6 +374,7 @@ class ChatEngine:
             "reasoning_effort": self.chat_model.template_reasoning_effort(
                 prompt.reasoning_effort
             ),
+            "structured_outputs": structured_outputs,
         }
         try:
             request = ChatCompletionRequest(
@@ -406,19 +443,15 @@ class ChatEngine:
             # gpt-oss's reasoner reports reasoning as ended before any token,
             # since it only detects boundaries, though Harmony always reasons.
             starts_in_reasoning=self.harmony or generate_kwargs.get("reasoning_ended") is False,
-            parser_counts_reasoning=not self.harmony,
         )
 
 
 def content_token_ids(parser, token_ids):
-    """The content tokens of a delta that ends reasoning, as ``parser`` splits it.
+    """The content tokens of a delta that ends reasoning, split by ``parser``'s reasoner.
 
-    vLLM 0.31 made ``DelegatingParser.extract_content_ids`` private; it only
-    called its reasoning parser's, so that is used. Parsers that still define
-    their own (vLLM's engine parsers) keep it.
+    vLLM's unified parsers keep this split private and delegate it to their
+    reasoning parser, so that is called directly.
     """
-    if hasattr(parser, "extract_content_ids"):
-        return parser.extract_content_ids(token_ids)
     reasoner = parser.reasoning_parser
     return token_ids if reasoner is None else reasoner.extract_content_ids(token_ids)
 
@@ -441,7 +474,6 @@ class ChatOutput:
         self.rendered = rendered
         self.parsers = [rendered.new_parser() for _ in range(n)]
         self.token_ids = [[] for _ in range(n)]
-        self.reasoning_counts = [0] * n
         self.called_tools = [False] * n
         # Per choice, (text, token_ids, logprobs) of deltas that emitted nothing.
         self.held = [[] for _ in range(n)]
@@ -486,7 +518,6 @@ class ChatOutput:
                 except NotImplementedError:
                     # gpt-oss's parser can't split one; it counts as reasoning.
                     pass
-            self.reasoning_counts[index] += token_count
             events.append(
                 {"type": "reasoning_delta", "choice_index": index, "token_count": token_count}
             )
@@ -531,8 +562,6 @@ class ChatOutput:
         return reason
 
     def reasoning_tokens(self):
-        if not self.rendered.parser_counts_reasoning:
-            return sum(self.reasoning_counts)
         return sum(
             parser.count_reasoning_tokens(token_ids)
             for parser, token_ids in zip(self.parsers, self.token_ids)

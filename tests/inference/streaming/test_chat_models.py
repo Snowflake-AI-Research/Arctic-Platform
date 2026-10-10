@@ -134,7 +134,10 @@ def test_unknown_architecture_has_no_chat_unless_parsers_are_given():
     assert resolve_chat_model("MysteryForCausalLM") is None
     model = resolve_chat_model("MysteryForCausalLM", tool_call_parser="hermes")
     assert model == ChatModel(reasoning_parser=None, tool_call_parser="hermes")
-    # Nothing says thinking can be turned off.
+    # No reasoner, so there is no thinking to turn off.
+    assert model.thinking_optional is True
+    model = resolve_chat_model("MysteryForCausalLM", reasoning_parser="deepseek_r1")
+    # Nothing says this one's thinking can be turned off.
     assert model.thinking_optional is False
 
 
@@ -239,3 +242,14 @@ def test_none_turns_thinking_off_or_is_refused(architecture):
             "invalid_chat_request",
             "reasoning_effort",
         )
+
+
+def test_chat_parser_overrides_are_model_config_fields():
+    from arctic_platform.inference.server.config import ModelConfig
+
+    kwargs = ModelConfig(
+        model="m", tool_call_parser="hermes", chat_reasoning_parser="deepseek_r1"
+    ).to_engine_kwargs()
+    assert (kwargs["tool_call_parser"], kwargs["chat_reasoning_parser"]) == ("hermes", "deepseek_r1")
+    # Unset, they reach the worker as nothing, so the table decides.
+    assert not {"tool_call_parser", "chat_reasoning_parser"} & ModelConfig(model="m").to_engine_kwargs().keys()
