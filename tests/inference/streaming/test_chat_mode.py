@@ -870,6 +870,92 @@ def test_none_stays_allowed_where_the_template_always_closes_thinking(monkeypatc
     assert engine.chat_model.thinking_optional is True
 
 
+def _effort_template(known, default="max", raises=False, thinks_by_default=True):
+    """GLM-5-like: writes its reasoning effort, reading a level outside ``known`` as ``default``.
+
+    With ``raises``, such a level raises instead, as Qwen3.8's template does.
+    """
+
+    def template(messages, fields):
+        text = _glm5_template(messages, fields)
+        thinking = _thinking(fields)
+        if thinking or (thinking is None and thinks_by_default):
+            level = fields.get("reasoning_effort") or default
+            if level not in known:
+                if raises:
+                    raise ValueError(f"Unexpected reasoning effort {level}")
+                level = default
+            effort_line = f"<|system|>Reasoning Effort: {level.capitalize()}"
+            text = text.replace("<sop>", "<sop>" + effort_line, 1)
+        return text
+
+    return template
+
+
+GLM5_3_SENT = {
+    "minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max"
+}
+GLM5_2_SENT = {**GLM5_3_SENT, "minimal": "high", "low": "high"}
+
+
+@pytest.mark.parametrize(
+    "template,sent",
+    [
+        # GLM-5.3: Low, High, and Max for anything else.
+        (_effort_template({"low", "high", "max"}), GLM5_3_SENT),
+        # GLM-5.2, same architecture: High, and Max for anything else.
+        (_effort_template({"high", "max"}), GLM5_2_SENT),
+        # Its default is a level it names (Low), and it raises on the rest.
+        (_effort_template({"low", "high", "max"}, default="low", raises=True), GLM5_3_SENT),
+        # Thinks only when asked: the no-effort probe must still think.
+        (_effort_template({"low", "high", "max"}, thinks_by_default=False), GLM5_3_SENT),
+    ],
+)
+def test_reasoning_effort_passes_through_where_the_template_knows_it(monkeypatch, template, sent):
+    engine = _probed_engine(monkeypatch, GLM5_TOKENS, template, "GlmMoeDsaForCausalLM")
+    for requested, level in sent.items():
+        rendered = asyncio.run(engine.render(chat("hi", reasoning_effort=requested)))
+        assert rendered.request.reasoning_effort == level, requested
+        prompt = engine.tokenizer.decode(rendered.engine_input["prompt_token_ids"])
+        assert f"Reasoning Effort: {level.capitalize()}" in prompt
+    assert engine.chat_model.thinking_optional is True
+
+
+def test_levels_a_template_raises_on_are_mapped(monkeypatch):
+    # Qwen3.8: low, medium and xhigh (its default), raising on the rest.
+    engine = _probed_engine(
+        monkeypatch,
+        GLM5_TOKENS,
+        _effort_template({"low", "medium", "xhigh"}, default="xhigh", raises=True),
+        "Qwen4ExpForConditionalGeneration",
+    )
+    sent = {
+        "minimal": "low", "low": "low", "medium": "medium",
+        "high": "xhigh", "xhigh": "xhigh", "max": "xhigh",
+    }
+    for requested, level in sent.items():
+        rendered = asyncio.run(engine.render(chat("hi", reasoning_effort=requested)))
+        assert rendered.request.reasoning_effort == level, requested
+    assert engine.chat_model.recognized_efforts == {"low", "medium", "xhigh"}
+    # The raising renders don't count as a failed probe.
+    assert engine.chat_model.thinking_optional is True
+
+
+def test_a_failed_probe_maps_reasoning_effort_by_the_table(monkeypatch, caplog):
+    engine = _probed_engine(
+        monkeypatch,
+        GLM5_TOKENS,
+        _effort_template({"low", "high", "max"}),
+        "GlmMoeDsaForCausalLM",
+        fail=True,
+    )
+    with caplog.at_level("WARNING"):
+        rendered = asyncio.run(engine.render(chat("hi", reasoning_effort="low")))
+    assert rendered.request.reasoning_effort == "high"
+    assert engine.chat_model.recognized_efforts == frozenset()
+    assert any("Reasoning effort probe failed" in r.getMessage() for r in caplog.records)
+
+
 def test_a_cancelled_first_render_does_not_cancel_the_shared_probe(monkeypatch):
     async def scenario():
         gate = (asyncio.Event(), asyncio.Event())

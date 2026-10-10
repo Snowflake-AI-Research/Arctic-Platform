@@ -109,7 +109,7 @@ architecture gets chat mode without engine kwargs:
 |---|---|---|---|---|---|
 | `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM` | Qwen3 | `qwen3` / `hermes` | yes | as is (ignored) | GPU (Qwen3-0.6B), QA6 |
 | `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForCausalLM`, `Qwen3_5MoeForConditionalGeneration`, `Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration` | Qwen3.5, 3.6, 3.8 | `qwen3` / `qwen3_coder` | yes | `minimal` becomes `low`, `high` and `max` become `xhigh` (Qwen3.8 takes low, medium, xhigh) | QA6 |
-| `GlmMoeDsaForCausalLM` | GLM-5, 5.1, 5.2, 5.3 | `glm47` / `glm47` | yes (GLM-5.3: no, from the template probe) | `minimal`, `low`, `medium` become `high`; `xhigh` becomes `max` | QA6 (GLM-5.2, GLM-5.3) |
+| `GlmMoeDsaForCausalLM` | GLM-5, 5.1, 5.2, 5.3 | `glm47` / `glm47` | yes (GLM-5.3: no, from the template probe) | GLM-5.3: `minimal` becomes `low`, `medium` becomes `high`, `xhigh` becomes `max`. GLM-5.2: `minimal`, `low`, `medium` become `high`, `xhigh` becomes `max` (from the template probe) | QA6 (GLM-5.2, GLM-5.3) |
 | `Glm4MoeForCausalLM` | GLM-4.5, 4.6, 4.7 | `glm47` / `glm47` | yes | as is (ignored) | not yet |
 | `Glm5NextForCausalLM`, `Glm5NextForConditionalGeneration` | GLM-5.3-Flash | `glm47` / `glm47` | no | `minimal` becomes `low`, `medium` becomes `high`, `xhigh` becomes `max` | not run: vLLM 0.31 fails to start it on H200 |
 | `DeepseekV4ForCausalLM`, `DeepseekV4ForConditionalGeneration` | DeepSeek-V4 | `deepseek_v4` / `deepseek_v4` | yes | as is (vLLM's tokenizer maps it) | QA6 |
@@ -146,11 +146,22 @@ way; so does Trinity-Mini once given a reasoner. Matching prompts with no
 marker (Qwen3-Instruct-2507, which never thinks) or an empty `<think></think>`
 keep `none`. A family the table marks as always thinking (MiniMax-M2,
 GLM-5.3-Flash, gpt-oss) keeps refusing `none` even when the worker drops its
-reasoner. The probe does not check `reasoning_effort` levels: vLLM's request
-type takes only the seven named levels, so a render can't tell a level the
-template reads from one it falls back on, and GLM-5.3 gets High for `minimal`
-and `low` (the table's GLM-5.2 mapping) though its template takes Low. Every
-other value Arctic accepts reaches the template as a level it takes
+reasoner.
+
+The same probe fits `reasoning_effort` to the checkpoint, for families whose
+table maps it. vLLM's request type takes only the seven named levels, so the
+probe renders the generation prompt at each level but `none`, and once with no
+effort (thinking on). A level the template knows passes through unchanged: its
+prompt differs from the no-effort one, or it is the only level whose prompt
+matches it (the template's default, named: Qwen3.8's `xhigh`, Harmony's
+`medium`). The table maps only the other levels: those that fail to render,
+and those that render the default together with other levels, since the
+renders can't say which of them the template names (GLM-5.2's `low` and
+`max`). It maps again while the result is still a level the template doesn't
+know, so GLM's `minimal` goes to `low` on GLM-5.3 and on to `high` on GLM-5.2.
+If the no-effort render fails, the table maps every level. The worker logs the
+result once (`Chat sends reasoning_effort to this template as ...`). Every
+value Arctic accepts reaches the template as a level it takes
 (`test_chat_models.py` checks each family). The table suits checkpoints that
 keep their family's chat template; one with a different template (an
 instruct-only or thinking-only variant, a coder model) can set `ModelConfig`'s
@@ -296,7 +307,9 @@ chat on such a checkpoint streams reasoning as content; an explicit
 1. Add its architectures to `CHAT_MODELS` in `chat.py`: the reasoning and tool
    parsers vLLM's recipe for it pairs (both must be registered in the pinned
    vLLM; `reasoning_parser=None` for a family that does not reason), whether its template turns thinking off with `enable_thinking`, and a
-   `reasoning_efforts` map if its template takes only some levels. A family
+   `reasoning_efforts` map if its template takes only some levels (the probe
+   keeps the levels a checkpoint's template knows, so the map can follow the
+   family's narrowest template). A family
    Arctic trains but cannot chat with goes in `TRAINED_WITHOUT_CHAT` in
    `test_chat_models.py`, with the reason.
 2. Add it to the tests in `test_chat_models.py` (its parsers, and the levels

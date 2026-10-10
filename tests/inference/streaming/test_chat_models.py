@@ -2,6 +2,7 @@
 
 import ast
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -188,6 +189,38 @@ def test_reasoning_effort_reaches_the_template_as_the_family_names_it(
     assert resolve_chat_model(architecture).template_reasoning_effort(requested) == template
 
 
+@pytest.mark.parametrize("architecture", sorted(CHAT_MODELS))
+@pytest.mark.parametrize("effort", sorted(REASONING_EFFORTS - {"none"}))
+def test_the_table_never_maps_a_level_the_template_knows(architecture, effort):
+    model = replace(CHAT_MODELS[architecture], recognized_efforts=frozenset({effort}))
+    assert model.template_reasoning_effort(effort) == effort
+
+
+@pytest.mark.parametrize("architecture", sorted(CHAT_MODELS))
+def test_every_effort_table_ends(architecture):
+    # template_reasoning_effort follows the table until it reaches a level the
+    # table leaves alone, so a cycle would never return.
+    table = CHAT_MODELS[architecture].reasoning_efforts
+    for effort in table:
+        for _ in range(len(table)):
+            effort = table.get(effort, effort)
+        assert effort not in table
+
+
+def test_glm5_3_keeps_low_where_glm5_2_maps_it_to_high():
+    glm5_2 = CHAT_MODELS["GlmMoeDsaForCausalLM"]
+    # Recognized as the probe finds them on vLLM 0.31's renderer.
+    glm5_3 = replace(glm5_2, recognized_efforts=frozenset({"low", "high"}))
+    glm5_2 = replace(glm5_2, recognized_efforts=frozenset({"high"}))
+    efforts = ["minimal", "low", "medium", "high", "xhigh", "max"]
+    assert [glm5_3.template_reasoning_effort(e) for e in efforts] == [
+        "low", "low", "high", "high", "max", "max"
+    ]
+    assert [glm5_2.template_reasoning_effort(e) for e in efforts] == [
+        "high", "high", "high", "high", "max", "max"
+    ]
+
+
 ANY = None
 # Levels each family's template (or vLLM's renderer for it) accepts; ANY for
 # templates that ignore the value. From the checkpoints' chat templates and
@@ -204,6 +237,7 @@ TEMPLATE_EFFORTS = {
     "Qwen3_5MoeForConditionalGeneration": {"low", "medium", "xhigh"},
     "Qwen4ExpForCausalLM": {"low", "medium", "xhigh"},
     "Qwen4ExpForConditionalGeneration": {"low", "medium", "xhigh"},
+    # GLM-5.2's; GLM-5.3's adds low, which the probe finds.
     "GlmMoeDsaForCausalLM": {"high", "max"},
     "Glm4MoeForCausalLM": ANY,
     "Glm5NextForCausalLM": {"low", "high", "max"},

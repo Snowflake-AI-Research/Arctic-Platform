@@ -39,6 +39,10 @@ class ChatModel:
 
     ``reasoning_efforts`` maps a requested ``reasoning_effort`` to the level the
     family's template names; values it does not list reach the template as is.
+    It maps only levels the checkpoint's template doesn't know (those outside
+    ``recognized_efforts``, which ``ChatEngine.probe`` finds), and maps again
+    while the result is still one it doesn't know. So one table serves
+    checkpoints of an architecture whose templates name different levels.
 
     ``reasoning_parser=None`` means chat parses no reasoning: everything the
     model writes is content, so logprobs are allowed. A job's own engine
@@ -53,11 +57,14 @@ class ChatModel:
     # template enable_thinking=False). If not, "none" is refused.
     thinking_optional: bool = False
     reasoning_efforts: Mapping[str, str] = MappingProxyType({})
+    recognized_efforts: frozenset = frozenset()
 
     def template_reasoning_effort(self, effort):
         if effort == "none" and not self.thinking_optional:
             raise ChatInputError("invalid_chat_request", "reasoning_effort")
-        return self.reasoning_efforts.get(effort, effort)
+        while effort in self.reasoning_efforts and effort not in self.recognized_efforts:
+            effort = self.reasoning_efforts[effort]
+        return effort
 
 
 # Qwen3.8's template takes low, medium and xhigh and raises on anything else;
@@ -94,14 +101,15 @@ CHAT_MODELS = MappingProxyType(
         "Qwen4ExpForCausalLM": _QWEN3_5,
         "Qwen4ExpForConditionalGeneration": _QWEN3_5,
         # GLM-5.2's template has High for "high" and Max for anything else (its
-        # default), so lower requests map to High rather than Max. GLM-5's and
-        # 5.1's ignore the value.
+        # default), so lower requests map to High rather than Max. GLM-5.3's
+        # also has Low, which the probe finds, so "low" and "minimal" stay Low
+        # there. GLM-5's and 5.1's ignore the value.
         "GlmMoeDsaForCausalLM": ChatModel(
             "glm47",
             "glm47",
             thinking_optional=True,
             reasoning_efforts=MappingProxyType(
-                {"minimal": "high", "low": "high", "medium": "high", "xhigh": "max"}
+                {"minimal": "low", "low": "high", "medium": "high", "xhigh": "max"}
             ),
         ),
         # GLM-4.5 to 4.7; vLLM's glm45 parsers are the glm47 ones.
@@ -465,6 +473,8 @@ class ChatEngine:
 
     async def _probe(self):
         try:
+            if self.chat_model.reasoning_efforts:
+                await self._probe_reasoning_efforts()
             if self.chat_model.thinking_optional and await self._template_forces_thinking():
                 # The table can only narrow what the template does: GLM-5.3
                 # shares GLM-5.2's architecture but always opens <think>.
@@ -488,6 +498,46 @@ class ChatEngine:
         logger.info(
             "Chat rejects text spelling these tokens beyond the special ones: %s",
             sorted(self.guard.tokens - SpecialTokenGuard.from_tokenizer(self.tokenizer, []).tokens),
+        )
+
+    async def _probe_reasoning_efforts(self):
+        """Set ``chat_model.recognized_efforts``: the levels the template knows.
+
+        vLLM takes only the named levels, so the probe renders each, and once
+        with no effort. A level is known if its prompt differs from the
+        no-effort one, or if it is the only level whose prompt matches it (the
+        template's default, named: Qwen3.8's xhigh, Harmony's medium). When
+        several levels match, the template reads them all as its default and
+        the renders can't say which one it names, so the table maps them
+        (GLM-5.2's low and max). A level that fails to render isn't known. If
+        the no-effort render fails, nothing is known and the table maps every
+        level.
+        """
+        try:
+            default = await self._render_probe(chat_template_kwargs={"enable_thinking": True})
+        except Exception as exc:
+            logger.warning(
+                "Reasoning effort probe failed (%s); the table maps every reasoning_effort",
+                type(exc).__name__,
+            )
+            return
+        renders = {}
+        for effort in sorted(REASONING_EFFORTS - {"none"}):
+            try:
+                renders[effort] = await self._render_probe(reasoning_effort=effort)
+            except Exception:
+                # Qwen3.8's template and Harmony raise on levels they lack.
+                renders[effort] = None
+        at_default = [effort for effort, render in renders.items() if render == default]
+        recognized = frozenset(
+            effort
+            for effort, render in renders.items()
+            if render is not None and (render != default or at_default == [effort])
+        )
+        self.chat_model = replace(self.chat_model, recognized_efforts=recognized)
+        logger.info(
+            "Chat sends reasoning_effort to this template as %s",
+            {effort: self.chat_model.template_reasoning_effort(effort) for effort in renders},
         )
 
     async def _template_forces_thinking(self):
