@@ -818,7 +818,7 @@ class Scheduler:
 
           * ``requests``: list of :class:`RequestRecord` dicts (one per
             generation call completed since the last drain).
-          * ``replicas``: per-replica snapshots and action-mask replay cache
+          * ``replicas``: snapshots, lifetime engine totals, and replay-cache
             counters. Each snapshot has ``max_concurrency`` back-filled from
             the scheduler's per-replica concurrency-limit history.
 
@@ -857,6 +857,7 @@ class Scheduler:
             replicas_payload.append({
                 "replica_id": idx,
                 "snapshots": snaps,
+                "engine_totals": res["engine_totals"],
                 "action_mask_replay_cache": (
                     res.get("action_mask_replay_cache", {})
                     if isinstance(res, dict)

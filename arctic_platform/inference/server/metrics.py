@@ -22,6 +22,10 @@ The vLLM stat logger lives in the engine process. Because each
 ``InferenceWorker`` Ray actor runs its own engine (and process), the
 collector is a process-singleton — the stat logger and the worker share the
 same instance via :func:`get_collector`.
+
+:class:`EngineTotals` accumulates speculative-decoding and preemption counters on every
+iteration, before snapshot thinning; ``drain()`` never resets them, so consumers difference
+totals within one ``started_at`` epoch to measure an interval.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ import bisect
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -67,6 +71,17 @@ class RequestRecord:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class EngineTotals:
+    """Lifetime counters; started_at distinguishes worker restarts."""
+
+    started_at: float = field(default_factory=time.time)
+    num_preempted_reqs: int = 0
+    num_drafts: int = 0
+    num_draft_tokens: int = 0
+    num_accepted_tokens: int = 0
 
 
 @dataclass
@@ -137,6 +152,7 @@ class WorkerMetricsCollector:
         self.min_interval_s = max(0.0, min_interval_s)
         self._snapshots = _BoundedDeque(max_items=max_snapshots)
         self._last_record_time: float = 0.0
+        self._totals = EngineTotals()
 
     def set_replica_id(self, replica_id: int) -> None:
         self.replica_id = replica_id
@@ -146,8 +162,15 @@ class WorkerMetricsCollector:
         scheduler_stats: SchedulerStats | None,
         iteration_stats: IterationStats | None,
     ) -> None:
+        if iteration_stats is not None:
+            self._totals.num_preempted_reqs += iteration_stats.num_preempted_reqs
         if scheduler_stats is None:
             return
+        spec = scheduler_stats.spec_decoding_stats
+        if spec is not None:
+            self._totals.num_drafts += spec.num_drafts
+            self._totals.num_draft_tokens += spec.num_draft_tokens
+            self._totals.num_accepted_tokens += spec.num_accepted_tokens
         now = time.time()
         if (
             self.min_interval_s > 0
@@ -183,6 +206,9 @@ class WorkerMetricsCollector:
             max_concurrency=0,
             num_tokens_in_step=int(tokens_in_step),
         ))
+
+    def totals(self) -> dict[str, Any]:
+        return asdict(self._totals)
 
     def drain_snapshots(self) -> list[dict[str, Any]]:
         return [s.to_dict() for s in self._snapshots.drain()]
