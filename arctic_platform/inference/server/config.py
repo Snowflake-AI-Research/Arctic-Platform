@@ -83,6 +83,18 @@ class ModelConfig(BaseModel):
     extra_env: dict[str, str] = Field(default_factory=dict, exclude=True)
     ray_num_gpus: float | None = Field(default=None, exclude=True)
     lora_sync_staging: Literal["cpu", "gpu"] = Field(default="cpu", exclude=True)
+    # Clear the prefix cache when a weight sync pauses generation with
+    # strategy="pause", pause_mode="keep", so requests after the sync never
+    # read KV computed under the old weights. A request's clear_cache=True
+    # still forces clearing; set this to False for the run to opt out.
+    # Clearing preempts in-flight requests (they re-prefill) and discards
+    # reusable prefix KV; False leaves clearing to the best-effort post-load
+    # reset, so the cache may be kept across syncs at the cost of possibly
+    # reading KV computed under the old weights.
+    # pause_mode="abort" is unaffected (it already requires the post-load
+    # reset), and drain/skip/hotswap/engine_only syncs issue no pause, so
+    # this has no effect on them either. Not an AsyncEngineArgs field.
+    clear_cache_on_weight_sync: bool = Field(default=True, exclude=True)
 
     @model_validator(mode="after")
     def validate_sequence_parallelism(self) -> ModelConfig:
