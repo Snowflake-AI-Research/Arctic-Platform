@@ -138,14 +138,15 @@ That is 18 architectures in 10 families. "Thinking off" means
 `invalid_chat_request` and `param="reasoning_effort"` rather than thinking
 anyway. The table can only narrow what the checkpoint's template does: the
 template probe (see the token guard below) renders the generation prompt with
-`enable_thinking` true and false, and if the two match and the prompt opens
-the reasoner's start marker, the template always thinks, so `none` is refused
-(logged once). GLM-5.3 shares
+`enable_thinking` true and false, and if the two match and the prompt leaves
+reasoning open (it writes the start marker of the reasoner, built as for a
+thinking request, with no end marker after it), the template always thinks, so
+`none` is refused (logged once). GLM-5.3 shares
 GLM-5.2's architecture this way; so does Trinity-Mini once given a reasoner.
-Matching prompts without the marker (Qwen3-Instruct-2507, which never thinks)
-keep `none`. A family the table marks as always thinking (MiniMax-M2,
-GLM-5.3-Flash, gpt-oss) keeps refusing `none` even when the worker drops its
-reasoner. The probe does not check `reasoning_effort` levels: vLLM's request
+Matching prompts with no marker (Qwen3-Instruct-2507, which never thinks) or
+an empty `<think></think>` keep `none`. A family the table marks as always
+thinking (MiniMax-M2, GLM-5.3-Flash, gpt-oss) keeps refusing `none` even when
+the worker drops its reasoner. The probe does not check `reasoning_effort` levels: vLLM's request
 type takes only the seven named levels, so a render can't tell a level the
 template reads from one it falls back on, and GLM-5.3 gets High for `minimal`
 and `low` (the table's GLM-5.2 mapping) though its template takes Low. Every

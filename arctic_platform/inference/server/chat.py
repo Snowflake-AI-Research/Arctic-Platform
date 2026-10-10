@@ -329,6 +329,21 @@ def structural_tokens(tokenizer, renders):
     return structural, plain_turn_opener
 
 
+def prompt_opens_reasoning(tokenizer, reasoner, prompt):
+    """Whether ``prompt``, ``PROBE_MESSAGES``' generation prompt, leaves ``reasoner`` reasoning.
+
+    The reasoner's start marker must follow the last user text, and reasoning
+    must still be open: a template that writes an empty ``<think></think>``
+    turns thinking off.
+    """
+    start = getattr(reasoner, "reasoning_start_str", None)
+    if not start:
+        return False
+    text = tokenizer.decode(prompt)
+    opened = start in text[text.rfind(PROBE_MESSAGES[-1][1]) :]
+    return opened and not reasoner.is_reasoning_end(prompt)
+
+
 class SpecialTokenGuard:
     """Rejects text that spells one of the model's control tokens.
 
@@ -479,8 +494,8 @@ class ChatEngine:
         """Whether the generation prompt opens reasoning even with enable_thinking=False.
 
         Identical prompts alone could also mean a model that never thinks
-        (Qwen3-Instruct-2507 under Qwen3's architecture), so the reasoner's
-        start marker must be in the prompt too.
+        (Qwen3-Instruct-2507 under Qwen3's architecture), so the prompt must
+        also leave the reasoner's start marker open.
         """
         on, off = [
             await self._render_probe(chat_template_kwargs={"enable_thinking": enable})
@@ -488,15 +503,15 @@ class ChatEngine:
         ]
         if on != off or self.parser_cls is None:
             return False
+        # Built as for a thinking request: glm47's parser has no start marker
+        # when enable_thinking is False.
         reasoner = self.parser_cls(
             self.tokenizer,
             None,
-            chat_template_kwargs={"enable_thinking": False},
+            chat_template_kwargs={"enable_thinking": True},
             model_config=self.model_config,
         ).reasoning_parser
-        start = getattr(reasoner, "reasoning_start_str", None)
-        text = self.tokenizer.decode(off)
-        return bool(start) and start in text[text.rfind(PROBE_MESSAGES[-1][1]) :]
+        return prompt_opens_reasoning(self.tokenizer, reasoner, off)
 
     async def _render_probe_settings(self):
         """``PROBE_MESSAGES`` rendered as requests can render them.

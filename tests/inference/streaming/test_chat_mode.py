@@ -668,20 +668,89 @@ def _glm5_template(messages, fields, reads_enable_thinking=True):
     return text
 
 
-def _probed_engine(monkeypatch, tokens, template, architecture="Qwen3ForCausalLM", fail=False):
-    """A real ChatEngine that probes ``template`` through its renderer."""
+class _ProbedParser:
+    """Stands in for vLLM's unified Parser at render time."""
+
+    reasoning_parser_cls = object
+    tool_parser_cls = None
+
+    def __init__(self, tokenizer, tools, **kwargs):
+        self.reasoning_parser = object()
+
+    @staticmethod
+    def is_reasoning_end(prompt_token_ids):
+        return True
+
+
+class _FakeReasoner:
+    """Reads the prompt's last <think> or </think>, as vLLM 0.31's reasoners do."""
+
+    def __init__(self, tokenizer, thinking, keeps_markers):
+        self.reasoning_start_str = "<think>" if thinking or keeps_markers else None
+        self._thinking = thinking
+        self._start, self._end = (tokenizer._ids.get(t) for t in ("<think>", "</think>"))
+
+    def is_reasoning_end(self, prompt_token_ids):
+        if not self._thinking:
+            return True
+        for token_id in reversed(prompt_token_ids):
+            if token_id in (self._start, self._end):
+                return token_id == self._end
+        return False
+
+
+class _ReasoningProbedParser(_ProbedParser):
+    """A unified Parser built like vLLM 0.31's glm47: no markers once enable_thinking=False."""
+
+    keeps_markers = False
+
+    def __init__(self, tokenizer, tools, chat_template_kwargs=None, **kwargs):
+        thinking = (chat_template_kwargs or {}).get("enable_thinking") is not False
+        self.reasoning_parser = _FakeReasoner(tokenizer, thinking, self.keeps_markers)
+
+
+class _Qwen3ReasoningProbedParser(_ReasoningProbedParser):
+    """Like vLLM 0.31's qwen3: the start marker stays, but enable_thinking=False ends reasoning."""
+
+    keeps_markers = True
+
+
+def _probed_engine(
+    monkeypatch,
+    tokens,
+    template,
+    architecture="Qwen3ForCausalLM",
+    fail=False,
+    parser_cls=_ReasoningProbedParser,
+    gate=None,
+):
+    """A real ChatEngine that probes ``template`` through its renderer.
+
+    With ``gate`` (started, release events), probe renders wait for release.
+    """
     engine = _engine_whose_parser_adjusts(monkeypatch, lambda request: None)
     engine.guard = None
     engine._probe_task = None
     engine.chat_model = CHAT_MODELS[architecture]
     engine.tokenizer = _FakeTokenizer(tokens)
-    engine.parser_cls = _ReasoningProbedParser
+    engine.parser_cls = parser_cls
     engine.probes = 0
+    engine.probe_runs = 0
+    probe = engine._probe
+
+    async def counted_probe():
+        engine.probe_runs += 1
+        await probe()
+
+    engine._probe = counted_probe
 
     async def render_chat(request):
         fields = vars(request)
         if fields["messages"][0]["content"] == "ProbeSystemText":
             engine.probes += 1
+            if gate is not None:
+                gate[0].set()
+                await gate[1].wait()
             if fail:
                 raise ValueError("this template wants something else")
         text = template(fields["messages"], fields)
@@ -753,19 +822,22 @@ def test_a_failed_probe_rejects_every_added_token_and_logs_once(monkeypatch, cap
     assert engine.chat_model.thinking_optional is False
 
 
+@pytest.mark.parametrize("parser_cls", [_ReasoningProbedParser, _Qwen3ReasoningProbedParser])
 @pytest.mark.parametrize(
     "reads_enable_thinking,optional", [(True, True), (False, False)]
 )
 def test_none_is_refused_where_the_template_always_opens_thinking(
-    monkeypatch, reads_enable_thinking, optional
+    monkeypatch, reads_enable_thinking, optional, parser_cls
 ):
     # GLM-5.3 shares GLM-5.2's architecture, but its template has no
     # enable_thinking: "none" would leave the model thinking into the answer.
+    # glm47's parser drops <think> when built with enable_thinking=False.
     engine = _probed_engine(
         monkeypatch,
         GLM5_TOKENS,
         lambda m, f: _glm5_template(m, f, reads_enable_thinking),
         "GlmMoeDsaForCausalLM",
+        parser_cls=parser_cls,
     )
     expected = True if optional else ("invalid_chat_request", "reasoning_effort")
     assert _accepts(engine, "hi", reasoning_effort="none") == expected
@@ -773,13 +845,63 @@ def test_none_is_refused_where_the_template_always_opens_thinking(
     assert _accepts(engine, "hi", reasoning_effort="high") is True
 
 
-def test_none_stays_allowed_for_a_model_that_never_thinks(monkeypatch):
+@pytest.mark.parametrize("parser_cls", [_ReasoningProbedParser, _Qwen3ReasoningProbedParser])
+def test_none_stays_allowed_for_a_model_that_never_thinks(monkeypatch, parser_cls):
     # Qwen3-Instruct-2507 ignores enable_thinking too, but opens no reasoning.
     engine = _probed_engine(
-        monkeypatch, QWEN3_TOKENS, lambda m, f: _qwen3_template(m, f, writes_think=False)
+        monkeypatch,
+        QWEN3_TOKENS,
+        lambda m, f: _qwen3_template(m, f, writes_think=False),
+        parser_cls=parser_cls,
     )
     assert _accepts(engine, "hi", reasoning_effort="none") is True
     assert engine.chat_model.thinking_optional is True
+
+
+@pytest.mark.parametrize("parser_cls", [_ReasoningProbedParser, _Qwen3ReasoningProbedParser])
+def test_none_stays_allowed_where_the_template_always_closes_thinking(monkeypatch, parser_cls):
+    # Ignores enable_thinking but writes an empty <think></think>: never thinks.
+    def template(messages, fields):
+        off = {"chat_template_kwargs": {"enable_thinking": False}}
+        return _qwen3_template(messages, {**fields, **off})
+
+    engine = _probed_engine(monkeypatch, QWEN3_TOKENS, template, parser_cls=parser_cls)
+    assert _accepts(engine, "hi", reasoning_effort="none") is True
+    assert engine.chat_model.thinking_optional is True
+
+
+def test_a_cancelled_first_render_does_not_cancel_the_shared_probe(monkeypatch):
+    async def scenario():
+        gate = (asyncio.Event(), asyncio.Event())
+        engine = _probed_engine(monkeypatch, QWEN3_TOKENS, _qwen3_template, gate=gate)
+        first = asyncio.ensure_future(engine.render(chat("first")))
+        await gate[0].wait()
+        first.cancel()
+        second = asyncio.ensure_future(engine.render(chat("second")))
+        await asyncio.sleep(0)
+        gate[1].set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await second
+        return engine
+
+    engine = asyncio.run(scenario())
+    assert engine.probe_runs == 1
+    assert engine.guard is not None
+
+
+def test_concurrent_first_renders_share_one_probe(monkeypatch):
+    async def scenario():
+        gate = (asyncio.Event(), asyncio.Event())
+        engine = _probed_engine(monkeypatch, QWEN3_TOKENS, _qwen3_template, gate=gate)
+        renders = [asyncio.ensure_future(engine.render(chat(text))) for text in ("a", "b")]
+        await gate[0].wait()
+        await asyncio.sleep(0)
+        gate[1].set()
+        await asyncio.gather(*renders)
+        return engine
+
+    assert asyncio.run(scenario()).probe_runs == 1
 
 
 def test_render_checks_the_content_and_grammar_vllm_would_let_through(monkeypatch):
@@ -1271,27 +1393,6 @@ def test_model_without_a_chat_template_is_chat_unsupported(monkeypatch, caplog):
         assert "param" not in events[0]
     [record] = [r for r in caplog.records if "chat template" in r.getMessage().lower()]
     assert record.levelname == "ERROR"
-
-
-class _ProbedParser:
-    """Stands in for vLLM's unified Parser at render time."""
-
-    reasoning_parser_cls = object
-    tool_parser_cls = None
-
-    def __init__(self, tokenizer, tools, **kwargs):
-        self.reasoning_parser = object()
-
-    @staticmethod
-    def is_reasoning_end(prompt_token_ids):
-        return True
-
-
-class _ReasoningProbedParser(_ProbedParser):
-    """A unified Parser whose reasoner opens reasoning with <think>."""
-
-    def __init__(self, tokenizer, tools, **kwargs):
-        self.reasoning_parser = SimpleNamespace(reasoning_start_str="<think>")
 
 
 def _rendered(monkeypatch, architecture, harmony=False, **fields):
