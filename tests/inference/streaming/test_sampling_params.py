@@ -11,6 +11,7 @@ from cpu_support import VLLMValidationError, load_library
 
 load_library()
 from arctic_platform.inference.server import streaming
+from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import (
     ClientStream,
     EventBuffer,
@@ -206,6 +207,15 @@ def test_structured_output_becomes_the_vllm_type(engine_params):
     assert "structured_outputs" not in engine_params({})
 
 
+def test_a_built_chat_grammar_passes_through(engine_params):
+    # A chat prompt's grammar arrives as vLLM's type, already built.
+    grammar = object()
+    kwargs = StreamingWorkerMixin()._stream_sampling_params(
+        {"n": 1, "structured_outputs": grammar}
+    ).kwargs
+    assert kwargs["structured_outputs"] is grammar
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -344,12 +354,12 @@ def _delta(**fields):
     }
 
 
-async def accept_delta(event, requested):
+async def accept_delta(event, requested, prompt="text"):
     """Pass ``event`` to a one-choice stream that asked for ``requested`` logprobs."""
     stream = ClientStream(
         types.SimpleNamespace(),
         "request",
-        types.SimpleNamespace(),
+        types.SimpleNamespace(prompt=prompt),
         {"n": 1} if requested is None else {"n": 1, "logprobs": requested},
         StreamLimits(),
     )
@@ -393,12 +403,19 @@ def test_client_stream_rejects_logprobs_nobody_requested():
 
 
 @pytest.mark.parametrize("requested,valid", [(2, False), (0, False), (None, True)])
-def test_client_stream_requires_logprobs_on_every_requested_delta(requested, valid):
+@pytest.mark.parametrize(
+    "prompt,kind",
+    [("text", "delta"), (ChatPrompt([{"role": "user", "content": "hi"}]), "content_delta")],
+)
+def test_client_stream_requires_logprobs_on_every_requested_delta(
+    requested, valid, prompt, kind
+):
+    event = _delta(type=kind)
     if valid:
-        assert "logprobs" not in asyncio.run(accept_delta(_delta(), requested))
+        assert "logprobs" not in asyncio.run(accept_delta(event, requested, prompt))
     else:
         with pytest.raises(StreamError, match="invalid_choice_event"):
-            asyncio.run(accept_delta(_delta(), requested))
+            asyncio.run(accept_delta(event, requested, prompt))
 
 
 def test_logprobs_above_the_engine_maximum_are_typed():

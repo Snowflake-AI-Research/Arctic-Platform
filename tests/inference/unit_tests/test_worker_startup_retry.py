@@ -108,7 +108,9 @@ def test_initialize_retries_vllm_engine_startup_on_address_in_use(monkeypatch):
                 structured_outputs_config=types.SimpleNamespace(
                     enable_in_reasoning=False
                 ),
-                model_config=types.SimpleNamespace(skip_tokenizer_init=True),
+                model_config=types.SimpleNamespace(
+                    skip_tokenizer_init=True, architecture="LlamaForCausalLM"
+                ),
             )
 
     class FakeAsyncLLM:
@@ -163,7 +165,9 @@ def test_initialize_drops_reasoning_parser_when_tokenizer_lacks_think_tokens(
                 structured_outputs_config=types.SimpleNamespace(
                     enable_in_reasoning=False
                 ),
-                model_config=types.SimpleNamespace(skip_tokenizer_init=True),
+                model_config=types.SimpleNamespace(
+                    skip_tokenizer_init=True, architecture="LlamaForCausalLM"
+                ),
             )
 
     class FakeAsyncLLM:
