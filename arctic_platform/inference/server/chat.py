@@ -330,7 +330,7 @@ def structural_tokens(tokenizer, renders):
 
 
 def prompt_opens_reasoning(tokenizer, reasoner, prompt):
-    """Whether ``prompt``, ``PROBE_MESSAGES``' generation prompt, leaves ``reasoner`` reasoning.
+    """Whether the probe's generation prompt ``prompt`` leaves ``reasoner`` in reasoning.
 
     The reasoner's start marker must follow the last user text, and reasoning
     must still be open: a template that writes an empty ``<think></think>``

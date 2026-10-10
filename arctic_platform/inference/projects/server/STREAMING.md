@@ -141,24 +141,24 @@ template probe (see the token guard below) renders the generation prompt with
 `enable_thinking` true and false, and if the two match and the prompt leaves
 reasoning open (it writes the start marker of the reasoner, built as for a
 thinking request, with no end marker after it), the template always thinks, so
-`none` is refused (logged once). GLM-5.3 shares
-GLM-5.2's architecture this way; so does Trinity-Mini once given a reasoner.
-Matching prompts with no marker (Qwen3-Instruct-2507, which never thinks) or
-an empty `<think></think>` keep `none`. A family the table marks as always
-thinking (MiniMax-M2, GLM-5.3-Flash, gpt-oss) keeps refusing `none` even when
-the worker drops its reasoner. The probe does not check `reasoning_effort` levels: vLLM's request
+`none` is refused (logged once). GLM-5.3 shares GLM-5.2's architecture this
+way; so does Trinity-Mini once given a reasoner. Matching prompts with no
+marker (Qwen3-Instruct-2507, which never thinks) or an empty `<think></think>`
+keep `none`. A family the table marks as always thinking (MiniMax-M2,
+GLM-5.3-Flash, gpt-oss) keeps refusing `none` even when the worker drops its
+reasoner. The probe does not check `reasoning_effort` levels: vLLM's request
 type takes only the seven named levels, so a render can't tell a level the
 template reads from one it falls back on, and GLM-5.3 gets High for `minimal`
 and `low` (the table's GLM-5.2 mapping) though its template takes Low. Every
 other value Arctic accepts reaches the template as a level it takes
 (`test_chat_models.py` checks each family). The table suits checkpoints that
-keep their family's chat template; one with a different template (an instruct-only
-or thinking-only variant, a coder model) can set `ModelConfig`'s
+keep their family's chat template; one with a different template (an
+instruct-only or thinking-only variant, a coder model) can set `ModelConfig`'s
 `chat_reasoning_parser` and `tool_call_parser`, which override the table like
 vllm serve's flags. They also enable chat on an unlisted architecture. Without
-either, a chat stream on an unlisted architecture fails
-with `chat_unsupported`, logged once per worker. `tokenizer_mode` is left to
-vLLM, which picks DeepSeek-V4's by architecture.
+either, a chat stream on an unlisted architecture fails with
+`chat_unsupported`, logged once per worker. `tokenizer_mode` is left to vLLM,
+which picks DeepSeek-V4's by architecture.
 
 `Driver.get_chat_support(model_id)` (and `ReplicaPool.get_chat_support()`)
 reports `{"chat_prompt": bool, "thinking_optional": bool}` for a loaded model:
