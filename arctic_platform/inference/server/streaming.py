@@ -14,6 +14,38 @@ from uuid import uuid4
 
 MAX_WORKER_STREAMS = 128
 CONTEXT_LIMIT_SOURCES = frozenset({"prompt", "completion_budget"})
+DEFAULT_MAX_TOKENS = 4096
+MAX_SCHEMA_BYTES = 64 * 1024
+# Bounds xgrammar compile work, which grows with nesting; real schemas nest a
+# handful of levels.
+MAX_SCHEMA_DEPTH = 64
+# Prefixes of vLLM 0.31.0's structured-output validation errors, from
+# vllm/v1/structured_output/backend_{xgrammar,guidance,outlines}.py. vLLM raises
+# a bare VLLMValidationError with no parameter for these, so only the message
+# identifies them. With the default "auto" backend a schema xgrammar rejects
+# falls back to guidance, or to outlines when the schema uses features guidance
+# lacks, so the error can come from any of the three. test_gpu_driver.py
+# triggers real ones; recheck on every vLLM upgrade.
+STRUCTURED_OUTPUT_ERRORS = (
+    "Failed to transform json schema into a grammar: ",
+    "The provided JSON schema contains features not supported by xgrammar.",
+    "Invalid JSON grammar specification.",
+    "Invalid grammar specification",
+    "Grammar error: ",
+    "Error serializing structured outputs jsonschema: ",
+    "Failed to transform json schema into a regex: ",
+    "Error parsing regex: ",
+    "Regex uses unsupported feature for structured outputs: ",
+    "Regex does not have a anchored universal start state",
+)
+# Prefixes of vLLM 0.31.0's sampling-parameter errors that carry no parameter:
+# logit_bias on a speculative-decoding deployment, and a thinking budget on a
+# model without a reasoning parser.
+SAMPLING_PARAM_ERRORS = (
+    "The min_p and logit_bias sampling parameters are not yet supported "
+    "with speculative decoding.",
+    "thinking_token_budget is set but reasoning_config is not configured.",
+)
 
 
 class StreamError(RuntimeError):
@@ -44,7 +76,13 @@ def classify_engine_error(exc):
         return "engine_error", None
     if getattr(exc, "parameter", None) == "input_tokens":
         return "context_length_exceeded", "prompt"
+    if getattr(exc, "parameter", None) in {"logit_bias", "logprobs"}:
+        return "invalid_sampling_params", None
     message = str(exc)
+    if message.startswith(SAMPLING_PARAM_ERRORS):
+        return "invalid_sampling_params", None
+    if message.startswith(STRUCTURED_OUTPUT_ERRORS):
+        return "invalid_structured_output", None
     if (
         message.startswith("This model's maximum context length is ")
         and "your prompt contains" in message
@@ -123,6 +161,21 @@ class StreamLimits:
             raise ValueError("max_event_bytes must not exceed max_buffer_bytes")
 
 
+def schema_depth(value) -> int:
+    """Return how many JSON objects and arrays nest at the deepest point."""
+    deepest = 0
+    pending = [(value, 1)]
+    while pending and deepest <= MAX_SCHEMA_DEPTH:
+        value, depth = pending.pop()
+        if isinstance(value, dict):
+            value = value.values()
+        elif not isinstance(value, (list, tuple)):
+            continue
+        deepest = max(deepest, depth)
+        pending.extend((child, depth + 1) for child in value)
+    return deepest
+
+
 def validate_request(prompt, sampling_params):
     if isinstance(prompt, str):
         if not prompt or len(prompt.encode("utf-8")) > 1024 * 1024:
@@ -145,12 +198,18 @@ def validate_request(prompt, sampling_params):
         "stop",
         "n",
         "seed",
+        "logit_bias",
+        "structured_outputs",
+        "thinking_token_budget",
+        "logprobs",
     }
     if unsupported:
         raise ValueError(f"Unsupported streaming parameters: {sorted(unsupported)}")
-    params.setdefault("max_tokens", 4096)
+    # An omitted max_tokens stays unset: the worker defaults it, capped by the context.
     params.setdefault("n", 1)
     for name, ceiling in (("max_tokens", 131072), ("n", 8)):
+        if name not in params:
+            continue
         if type(params[name]) is not int or not 1 <= params[name] <= ceiling:
             raise ValueError(f"{name} must be an integer in [1, {ceiling}]")
     for name, default, lower, upper in (
@@ -188,13 +247,182 @@ def validate_request(prompt, sampling_params):
                 "stop must be a string or 1..4 nonempty strings of at most 4096 bytes"
             )
         params["stop"] = list(stops)
+    logit_bias = params.get("logit_bias")
+    if logit_bias is not None:
+        if not isinstance(logit_bias, dict) or len(logit_bias) > 300:
+            raise ValueError("logit_bias must map at most 300 token IDs to biases")
+        biases = {}
+        for token, bias in logit_bias.items():
+            # OpenAI clients send token IDs as JSON object keys, so strings.
+            # 2**31 has 10 digits.
+            if (
+                isinstance(token, str)
+                and 0 < len(token) <= 10
+                and token.isascii()
+                and token.isdigit()
+            ):
+                token = int(token)
+            if (
+                type(token) is not int
+                or not 0 <= token < 2**31
+                or token in biases
+                or isinstance(bias, bool)
+                or not isinstance(bias, (int, float))
+                or not math.isfinite(bias)
+                or not -100 <= bias <= 100
+            ):
+                raise ValueError(
+                    "logit_bias keys must be distinct token IDs in [0, 2**31) "
+                    "and values numbers in [-100, 100]"
+                )
+            biases[token] = float(bias)
+        params["logit_bias"] = biases
+    structured_outputs = params.get("structured_outputs")
+    if structured_outputs is not None:
+        if not isinstance(structured_outputs, dict) or not (
+            (
+                structured_outputs.keys() == {"json"}
+                and isinstance(structured_outputs["json"], dict)
+            )
+            or (
+                structured_outputs.keys() == {"json_object"}
+                and structured_outputs["json_object"] is True
+            )
+        ):
+            raise ValueError(
+                'structured_outputs must be {"json": <schema object>} '
+                'or {"json_object": true}'
+            )
+        if "json" in structured_outputs:
+            # Before json.dumps, which recurses and would report a very deep
+            # schema as not JSON.
+            if schema_depth(structured_outputs["json"]) > MAX_SCHEMA_DEPTH:
+                raise ValueError(
+                    "structured_outputs schema nests deeper than "
+                    f"{MAX_SCHEMA_DEPTH} levels"
+                )
+            try:
+                schema = json.dumps(
+                    structured_outputs["json"],
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError, RecursionError):
+                raise ValueError("structured_outputs schema must be JSON") from None
+            if len(schema.encode("utf-8")) > MAX_SCHEMA_BYTES:
+                raise ValueError(
+                    f"structured_outputs schema exceeds {MAX_SCHEMA_BYTES} bytes"
+                )
+    budget = params.get("thinking_token_budget")
+    if budget is not None and (
+        type(budget) is not int
+        or not 1 <= budget <= params.get("max_tokens", DEFAULT_MAX_TOKENS)
+    ):
+        raise ValueError("thinking_token_budget must be an integer in [1, max_tokens]")
+    logprobs = params.get("logprobs")
+    if logprobs is not None and (type(logprobs) is not int or not 0 <= logprobs <= 20):
+        raise ValueError("logprobs must be an integer in [0, 20]")
     return prompt, params
 
 
-def event_size(event):
-    return len(
-        json.dumps(event, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+def _logprob_entry(token_id, logprob):
+    value = float(logprob.logprob)
+    return {
+        "token_id": token_id,
+        "token": logprob.decoded_token or "",
+        # JSON has no -inf; OpenAI reports it as -9999.0.
+        "logprob": -9999.0 if value == -math.inf else value,
+    }
+
+
+def delta_logprobs(token_ids, positions, top_k):
+    """One entry per token: the chosen token and the ``top_k`` best by rank.
+
+    vLLM also reports the chosen token when it ranks below ``top_k``; it keeps
+    its own entry but is left out of ``top``.
+    """
+    if positions is None or len(positions) != len(token_ids):
+        raise StreamError("invalid_engine_output")
+    entries = []
+    for token_id, position in zip(token_ids, positions):
+        if token_id not in position:
+            raise StreamError("invalid_engine_output")
+        top = sorted(
+            (
+                item
+                for item in position.items()
+                if item[1].rank is not None and item[1].rank <= top_k
+            ),
+            key=lambda item: item[1].rank,
+        )
+        entries.append(
+            {
+                **_logprob_entry(token_id, position[token_id]),
+                "top": [_logprob_entry(*item) for item in top],
+            }
+        )
+    return entries
+
+
+def _valid_logprob_entry(entry):
+    return (
+        isinstance(entry, dict)
+        and type(entry.get("token_id")) is int
+        and isinstance(entry.get("token"), str)
+        and type(entry.get("logprob")) in (int, float)
+        and math.isfinite(entry["logprob"])
     )
+
+
+def valid_delta_logprobs(event, top_k):
+    """Check a delta's logprobs against the ``top_k`` alternatives requested."""
+    logprobs = event["logprobs"]
+    token_ids = event.get("token_ids")
+    return (
+        isinstance(logprobs, list)
+        and isinstance(token_ids, list)
+        and len(logprobs) == len(token_ids)
+        and all(
+            _valid_logprob_entry(entry)
+            and entry["token_id"] == token_id
+            and isinstance(entry.get("top"), list)
+            and len(entry["top"]) <= top_k
+            and all(_valid_logprob_entry(item) for item in entry["top"])
+            for entry, token_id in zip(logprobs, token_ids)
+        )
+    )
+
+
+def _compact(value):
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
+def event_size(event):
+    # ASCII-escaped, so characters and bytes count the same.
+    return len(_compact(event))
+
+
+# Delta fields a merge concatenates: the text and the per-token lists.
+MERGED_KEYS = ("text", "token_ids", "logprobs")
+
+
+def _appended_size(old, added, key):
+    """Bytes that appending ``added[key]`` to ``old[key]`` adds to ``old``.
+
+    Serializes only the appended part. Escaping is per character and list
+    items serialize independently, so a joined string or list grows by the
+    added part without its quotes or brackets, plus a comma between items.
+    """
+    if key not in added:
+        return 0
+    part = _compact(added[key])
+    if key not in old:
+        return len(f',"{key}":') + len(part)
+    if isinstance(added[key], str):
+        return len(part) - 2
+    if not added[key]:
+        return 0
+    return len(part) - 2 + (1 if old[key] else 0)
 
 
 class EventBuffer:
@@ -248,12 +476,14 @@ class EventBuffer:
         entry = self._open_deltas.get(event["choice_index"])
         if entry is None:
             return False
-        merged = {**entry[0], "text": entry[0]["text"] + event["text"]}
-        if "token_ids" in entry[0] or "token_ids" in event:
-            merged["token_ids"] = [
-                *entry[0].get("token_ids", ()), *event.get("token_ids", ())
-            ]
-        size = event_size(merged)
+        merged = dict(entry[0])
+        for key in MERGED_KEYS:
+            if key in entry[0] or key in event:
+                empty = "" if key == "text" else []
+                merged[key] = entry[0].get(key, empty) + event.get(key, empty)
+        size = entry[1] + sum(
+            _appended_size(entry[0], event, key) for key in MERGED_KEYS
+        )
         if size > self.limits.max_event_bytes:
             return False
         if self.bytes - entry[1] + size > self.limits.max_buffer_bytes:
@@ -305,7 +535,10 @@ class EngineStream:
         self.owner = owner
         self.attempt_id = attempt_id
         self.prompt = prompt
-        self.params = params
+        # A defaulted budget may run past the context; generation then stops at
+        # the context limit instead of failing.
+        self.max_tokens_omitted = "max_tokens" not in params
+        self.params = {"max_tokens": DEFAULT_MAX_TOKENS, **params}
         self.expires_at = expires_at
         self.limits = limits
         self.buffer = EventBuffer(limits)
@@ -340,7 +573,10 @@ class EngineStream:
                 if output.prompt_token_ids is not None:
                     prompt_tokens = len(output.prompt_token_ids)
                     max_model_len = self.owner.llm.model_config.max_model_len
-                    if prompt_tokens + self.params["max_tokens"] > max_model_len:
+                    if (
+                        not self.max_tokens_omitted
+                        and prompt_tokens + self.params["max_tokens"] > max_model_len
+                    ):
                         raise StreamError(
                             "context_length_exceeded",
                             context_limit_source="completion_budget",
@@ -353,14 +589,19 @@ class EngineStream:
                     if counts[index] > self.params["max_tokens"]:
                         raise StreamError("invalid_engine_output")
                     if choice.text or choice.token_ids:
-                        self.buffer.put(
-                            {
-                                "type": "delta",
-                                "choice_index": index,
-                                "text": choice.text,
-                                "token_ids": list(choice.token_ids),
-                            }
-                        )
+                        delta = {
+                            "type": "delta",
+                            "choice_index": index,
+                            "text": choice.text,
+                            "token_ids": list(choice.token_ids),
+                        }
+                        if self.params.get("logprobs") is not None:
+                            delta["logprobs"] = delta_logprobs(
+                                delta["token_ids"],
+                                choice.logprobs,
+                                self.params["logprobs"],
+                            )
+                        self.buffer.put(delta)
                     if choice.finish_reason is not None:
                         if choice.finish_reason not in {"stop", "length"}:
                             raise StreamError("engine_aborted")
@@ -496,7 +737,17 @@ class StreamingWorkerMixin:
 
     def _stream_sampling_params(self, params):
         from vllm import SamplingParams
-        from vllm.sampling_params import RequestOutputKind
+        from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
+
+        # Requests carry plain JSON across Ray; the vLLM type is built here.
+        params = dict(params)
+        structured_outputs = params.get("structured_outputs")
+        if structured_outputs is not None:
+            params["structured_outputs"] = (
+                StructuredOutputsParams(json=structured_outputs["json"])
+                if "json" in structured_outputs
+                else StructuredOutputsParams(json_object=True)
+            )
 
         return SamplingParams(
             **params,
@@ -853,6 +1104,15 @@ class ClientStream(AsyncIterator):
                 or not 0 <= index < self.params["n"]
                 or index in self.finished_choices
                 or self.usage is not None
+            ):
+                raise StreamError("invalid_choice_event")
+            wants_logprobs = self.params.get("logprobs") is not None
+            if kind == "delta" and (
+                ("logprobs" in event) != wants_logprobs
+                or (
+                    wants_logprobs
+                    and not valid_delta_logprobs(event, self.params["logprobs"])
+                )
             ):
                 raise StreamError("invalid_choice_event")
             if kind == "delta" and self.first_delta_time is None:

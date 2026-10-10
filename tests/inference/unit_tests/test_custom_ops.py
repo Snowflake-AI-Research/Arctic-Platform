@@ -71,23 +71,21 @@ def test_reshape_and_cache_flash_bulk(
     if not try_load_torch_library():
         pytest.skip("Custom ops not available, skipping test.")
 
-    torch.set_default_device(device)
-
     hidden_size = num_heads * head_size
 
-    keys = torch.randn(num_layers * num_tokens, hidden_size, device=device)
-    values = torch.randn(num_layers * num_tokens, hidden_size, device=device)
+    keys = torch.randn(num_tokens, num_layers * hidden_size, device=device)
+    values = torch.randn(num_tokens, num_layers * hidden_size, device=device)
     key_caches = [
-        torch.randn(num_tokens, hidden_size, device=device)
+        torch.randn(1, num_tokens, num_heads, head_size, device=device)
         for _ in range(num_layers)
     ]
     value_caches = [
-        torch.randn(num_tokens, hidden_size, device=device)
+        torch.randn(1, num_tokens, num_heads, head_size, device=device)
         for _ in range(num_layers)
     ]
-    key_caches_ref = key_caches.copy()
-    value_caches_ref = value_caches.copy()
-    slot_mapping = torch.randint(0, num_tokens, (num_tokens, ), device=device)
+    key_caches_ref = [cache.clone() for cache in key_caches]
+    value_caches_ref = [cache.clone() for cache in value_caches]
+    slot_mapping = torch.arange(num_tokens, device=device)
     kv_cache_dtype = "auto"
     k_scales = [
         torch.tensor(0.1, dtype=torch.float32, device=device)

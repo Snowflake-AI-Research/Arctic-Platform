@@ -137,14 +137,15 @@ sft = [
     "liger-kernel>=0.8.0",
     "numpy",
     "nvidia-ml-py",
-    "peft>=0.18,<0.20",
+    # 0.20+ imports EmbeddingParallel only when a tensor-parallel LoRA module is present.
+    "peft>=0.21.2,<0.22",
     "psutil",
     "ray",
     "safetensors",
     "tensordict",
     "torch",
-    # PEFT 0.19 adapter reload imports EmbeddingParallel, removed in Transformers 5.16.
-    "transformers>=5.12.1,<5.16",
+    # GLM-5.3-Flash and Qwen3.8-Flash-Next need the Transformers 5.17 model modules.
+    "transformers>=5.17,<5.18",
 ]
 
 # Sampling stack that lives in arctic_platform.inference. Not referenced by
@@ -157,8 +158,8 @@ inference = [
     "ray",
     "tqdm",
     "uvicorn",
-    "vllm==0.30.0",
-    "xgrammar==0.2.6",
+    "vllm==0.31.0",
+    "xgrammar==0.2.7",
 ]
 
 # [sft] plus the published sampling package. On-prem still imports

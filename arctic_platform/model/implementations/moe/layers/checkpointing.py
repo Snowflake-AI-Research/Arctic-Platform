@@ -32,7 +32,12 @@ from arctic_platform.model.implementations.debug.determinism import CHECKPOINT_P
 SELECTIVE_AC_TARGETS = frozenset({"norm", "attn_proj", "mlp", "mla_up_proj", "routed_experts", "linear_attn"})
 _PATCHED_METHODS_ATTR = "_prime_rl_selective_ac_patched_methods"
 
-_SELECTIVE_AC_MODEL_MODULE_PREFIX = __name__.split(".moe.", 1)[0] + ".qwen35.models."
+_MODEL_IMPLEMENTATIONS_PREFIX = __name__.split(".moe.", 1)[0]
+_SELECTIVE_AC_MODEL_MODULE_PREFIXES = (
+    _MODEL_IMPLEMENTATIONS_PREFIX + ".qwen35.models.",
+    _MODEL_IMPLEMENTATIONS_PREFIX + ".qwen38.",
+    "transformers.models.qwen4_exp.",
+)
 
 
 def _is_norm_module(module: nn.Module) -> bool:
@@ -146,4 +151,4 @@ def set_selective_activation_checkpointing(layer: nn.Module, targets: Iterable[s
 
 
 def supports_selective_activation_checkpointing(layer: nn.Module) -> bool:
-    return type(layer).__module__.startswith(_SELECTIVE_AC_MODEL_MODULE_PREFIX)
+    return type(layer).__module__.startswith(_SELECTIVE_AC_MODEL_MODULE_PREFIXES)

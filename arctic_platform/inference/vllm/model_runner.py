@@ -121,11 +121,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             RoutedExpertsCapturer,
         )
 
-        if not self.model_config.enable_return_routed_experts:
+        enable_return_routed_experts = getattr(
+            self.model_config, "enable_return_routed_experts", False)
+        if not enable_return_routed_experts:
             return
         logger.info(
             "Initializing routed experts capturer, enable_return_routed_experts=%s",
-            self.model_config.enable_return_routed_experts,
+            enable_return_routed_experts,
         )
         capturer = RoutedExpertsCapturer.create()
         self.routed_experts_attn_gid = self._get_attention_kv_cache_gid()
@@ -395,8 +397,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         num_input_tokens = round_up(num_scheduled_tokens, sp_size)
         return num_input_tokens
 
-    def profile_run(self) -> None:
-        self._orig_profile_run()
+    def profile_run(self, randomize_inputs: bool = False) -> None:
+        self._orig_profile_run(randomize_inputs=randomize_inputs)
         if getattr(self, "shift_model", None) is not None:
             torch.distributed.barrier()
             orig_model, self.model = self.model, self.shift_model
@@ -1331,8 +1333,20 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        sample_metadata = spec_decode_metadata
+        if grammar_output is not None and spec_decode_metadata is not None:
+            from arctic_platform.inference.vllm.spec_decode_grammar import (
+                reject_unvalidated_drafts,
+            )
+
+            sample_metadata = reject_unvalidated_drafts(
+                grammar_output,
+                self.input_batch.req_ids,
+                spec_decode_metadata,
+            )
+
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(logits, sample_metadata)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output)
@@ -1676,7 +1690,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             self.eplb_step()
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
-            if self.model_config.enable_return_routed_experts:
+            if getattr(self.model_config, "enable_return_routed_experts", False):
                 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
                     RoutedExpertsCapturer,
                 )
