@@ -684,7 +684,9 @@ class TestMigratedGrpo(TestCasePlus):
         # log ratios ln2, -ln2 (kept), ln4 (dropped above 3.0), and one token outside loss_mask.
         values = torch.full((1, 4), -1.0)
         context = {
-            "old_log_probs_shifted": torch.tensor([[-1.0 - math.log(2), -1.0 + math.log(2), -1.0 - math.log(4), -3.0]]),
+            "old_log_probs_shifted": torch.tensor(
+                [[-1.0 - math.log(2), -1.0 + math.log(2), -1.0 - math.log(4), -3.0]]
+            ),
             "advantages": torch.ones_like(values),
             "loss_mask": torch.tensor([[True, True, True, False]]),
         }

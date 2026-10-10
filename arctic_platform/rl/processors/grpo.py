@@ -849,8 +849,11 @@ def _grpo_loss(
         the ratio-control keys in :data:`functional.RATIO_MASK_CONFIG_KEYS`
         (ratio, probability-difference and sequence masks, the
         ``ratio_m2_threshold`` M2PO filter, the
-        ``log_ratio_sq_coef`` penalty and ``ratio_stats`` telemetry; all
-        require ``use_cispo_loss``),
+        ``log_ratio_sq_coef`` penalty, ``ratio_stats`` telemetry and the
+        ``ratio_mask_rebalance`` restoration of each sign's masked advantage
+        mass; all require ``use_cispo_loss``, except that an explicit false of
+        ``ratio_stats`` or ``ratio_mask_rebalance`` with no other ratio control
+        is inert),
         ``entropy_coeff`` (default 0.0; subtract entropy bonus from loss),
         ``use_kl_loss`` (default False; add KL penalty vs ``ref_log_probs_shifted`` in context),
         ``kl_loss_coef`` (default 0.001), ``kl_loss_type`` (default "low_var_kl"),
@@ -1056,7 +1059,11 @@ def _reject_sequence_parallel_m2po(ratio_masks: RatioMasks | None) -> None:
 
 
 def _grpo_model_call_count_callback(model_call_counts: Sequence[int | None], config: dict) -> None:
-    required = [key for key in ("ratio_m2_threshold", "ratio_mask_rebalance") if config.get(key)]
+    required = []
+    if config.get("ratio_m2_threshold") is not None:
+        required.append("ratio_m2_threshold")
+    if config.get("ratio_mask_rebalance") is True:
+        required.append("ratio_mask_rebalance")
     counts = tuple(model_call_counts)
     if required and set(counts) != {1}:
         raise ValueError(

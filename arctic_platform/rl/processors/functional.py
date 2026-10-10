@@ -886,6 +886,11 @@ LOG_RATIO_BIN_EDGES = (
     math.log(10.0),
 )
 SEQ_STAT_BIN_EDGES = (-0.2, -0.05, -0.01, 0.01, 0.05, 0.2)
+# Bound on the log ratio in the reported ``ratio_mask_kept_k3_sum``: the clamp of dss-platform's
+# ``trainable_logprob_lowvar_all/mean``, which the sum is read against, and of ``kl_penalty``'s low_var_kl. It keeps
+# the sum finite (at most exp(20) - 21 per token) and does not touch the unclamped k3 that
+# ``seq_mask_stat="mean_k3"`` gates on.
+KEPT_K3_LOG_RATIO_CLAMP = 20.0
 _JOINT_SHAPE = (2, len(SAMPLER_LOGPROB_BIN_EDGES) + 1, len(LOG_RATIO_BIN_EDGES) + 1)
 _VECTOR_COUNT_NAMES = {
     "ratio_joint": tuple(
@@ -1045,10 +1050,9 @@ def _ratio_mask_keep(
         ):
             if limit is not None:
                 drops[f"prob_diff_mask_{sign}_drop"] = sides[sign] & (gap > limit)
-    k3 = log_ratio.expm1() - log_ratio
     values = [log_ratio, sides["pos"].float(), sides["neg"].float()]
     if masks.seq_stat == "mean_k3":
-        values.append(k3)
+        values.append(log_ratio.expm1() - log_ratio)
     packed = cu_seqlens is not None
     if packed:
         sequence_idx, totals = _packed_per_sequence_sums(cu_seqlens, *values)
@@ -1103,7 +1107,8 @@ def _ratio_mask_keep(
     counts.update({f"{name}_count": hit.sum() for name, hit in drops.items()})
     counts["ratio_mask_dropped_token_count"] = dropped.sum()
     keep = loss_mask & ~dropped
-    counts["ratio_mask_kept_k3_sum"] = torch.where(keep, k3, 0.0).sum()
+    reported_log_ratio = log_ratio.clamp(min=-KEPT_K3_LOG_RATIO_CLAMP, max=KEPT_K3_LOG_RATIO_CLAMP)
+    counts["ratio_mask_kept_k3_sum"] = torch.where(keep, reported_log_ratio.expm1() - reported_log_ratio, 0.0).sum()
     return keep, counts
 
 
@@ -1120,38 +1125,68 @@ def _reduce_ratio_mask_counts(counts: dict[str, torch.Tensor]) -> dict[str, floa
 
 @torch.no_grad()
 def _ratio_mask_mass(
-    advantages: torch.Tensor, policy_mask: torch.Tensor, aggregate: Callable[[torch.Tensor], torch.Tensor], dp_size: int
-) -> torch.Tensor:
+    advantages: torch.Tensor,
+    policy_mask: torch.Tensor,
+    aggregate: Callable[[torch.Tensor], torch.Tensor],
+    dp_size: int,
+) -> dict[str, torch.Tensor]:
+    """``ratio_mask_{sign}_{stage}_mass_sum`` for the signed ``|advantage|`` before (pre) and after (kept) the drops."""
     # aggregate retains the original mask/row denominators; remove only DP gradient compensation.
-    positive, negative = advantages.detach().double().clamp(min=0), (-advantages.detach().double()).clamp(min=0)
-    local = (
-        torch.stack(
-            [
-                aggregate(positive),
-                aggregate(negative),
-                aggregate(torch.where(policy_mask, positive, 0.0)),
-                aggregate(torch.where(policy_mask, negative, 0.0)),
-            ]
+    advantages = advantages.double()
+    magnitudes = {"pos": advantages.clamp(min=0), "neg": (-advantages).clamp(min=0)}
+    return {
+        f"ratio_mask_{sign}_{stage}_mass_sum": (
+            aggregate(magnitude if stage == "pre" else torch.where(policy_mask, magnitude, 0.0)) / dp_size
         )
-        / dp_size
-    )
-    return local
+        for stage in ("pre", "kept")
+        for sign, magnitude in magnitudes.items()
+    }
 
 
 @torch.no_grad()
 def _rebalance_ratio_mask_mass(
     advantages: torch.Tensor,
-    local: torch.Tensor,
+    mass: dict[str, torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    total = local.clone()
+    """Scale each sign's advantages so that, over all ranks, the kept mass returns to the pre-mask mass.
+
+    This is a collective over the default process group: it all-reduces the masses of the call, so every rank of that
+    group must reach it exactly once per request, or the ranks that did wait for them until the process-group timeout.
+    ``ratio_mask_rebalance`` therefore needs exactly one model call per worker, which
+    ``_grpo_model_call_count_callback`` (grpo.py) checks before any forward. DSS runs the check once, when it
+    prepares the request, on the counts of all shards, and its dispatch gives every shard the same request-wide count.
+    The native paths run it on each worker and do not exchange the verdict: the native worker (deepspeed_worker.py)
+    passes the number of gradient-accumulation microbatches it received, and ``run_pipeline(pack=True)`` (pipeline.py)
+    its number of packed microbatches, which the splitter has first raised to the maximum over the ranks when
+    torch.distributed is initialised (a rank with fewer rows than that maximum fails in the splitter instead). Under
+    data parallelism every worker must therefore see a count of one (one gradient-accumulation step and, with
+    ``pack=True``, every worker's tokens within ``max_tokens_per_mb``): a worker that rejects the request on its own
+    while a peer has passed the check leaves that peer waiting in this collective until the timeout instead of the
+    request failing. A caller that reaches ``cispo_actor_loss_fn`` without that guard, or on only some ranks of the
+    group, hangs instead of failing.
+    """
+    # This worker's pre-mask and kept masses of the two signs, read from the named measurements. What is reduced is the
+    # dropped mass (pre - kept) and the kept mass, not pre and kept: on a worker that dropped nothing of a sign the two
+    # are bit-equal, so its dropped part is an exact 0 and the reduced dropped mass is exactly 0 whatever the order of
+    # the summation. The scale (kept + dropped) / kept is then exactly 1.0 when no token of that sign is dropped anywhere.
+    # Reducing pre and kept separately cannot promise that: their sums may differ in the last bit, which float64
+    # advantages show (a cast to float32, bfloat16 or float16 absorbs it). The exact 0 relies on the aggregation
+    # returning bit-equal sums for bit-equal inputs. Tested on CPU for every aggregation mode and for float64 advantages
+    # on 4 and 7 ranks; untested for float64 advantages with a scatter-based aggregation on CUDA (scatter_add_ is
+    # nondeterministic there), where the scale could differ from 1 by about 1e-16.
+    pre = torch.stack([mass[f"ratio_mask_{sign}_pre_mass_sum"] for sign in ("pos", "neg")])
+    kept = torch.stack([mass[f"ratio_mask_{sign}_kept_mass_sum"] for sign in ("pos", "neg")])
+    total = torch.stack([pre - kept, kept])
     if dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(total, op=dist.ReduceOp.SUM)
-    kept = total[2:]
-    scales = torch.where(kept > 0, total[:2] / torch.where(kept > 0, kept, 1.0), 1.0)
+    dropped_total, kept_total = total
+    scales = torch.where(
+        kept_total > 0, (kept_total + dropped_total) / torch.where(kept_total > 0, kept_total, 1.0), 1.0
+    )
     stats = {}
     for index, sign in enumerate(("pos", "neg")):
-        stats[f"ratio_rebalance_{sign}_post_mass_sum"] = local[index + 2] * scales[index]
-        stats[f"ratio_rebalance_{sign}_unrestored_mass_sum"] = torch.where(kept[index] > 0, 0.0, local[index])
+        stats[f"ratio_rebalance_{sign}_post_mass_sum"] = kept[index] * scales[index]
+        stats[f"ratio_rebalance_{sign}_unrestored_mass_sum"] = torch.where(kept_total[index] > 0, 0.0, pre[index])
     scale = torch.where(advantages >= 0, scales[0], scales[1]).to(advantages.dtype)
     return advantages * scale, stats
 
@@ -1237,14 +1272,7 @@ def cispo_actor_loss_fn(
     )
     if ratio_masks is not None:
         mass = _ratio_mask_mass(advantages, policy_mask, aggregate, dp_size)
-        ratio_mask_counts.update(
-            {
-                f"ratio_mask_{sign}_{stage}_mass_sum": mass[index]
-                for index, (stage, sign) in enumerate(
-                    (stage, sign) for stage in ("pre", "kept") for sign in ("pos", "neg")
-                )
-            }
-        )
+        ratio_mask_counts.update(mass)
         if ratio_masks.rebalance:
             advantages, mass_stats = _rebalance_ratio_mask_mass(advantages, mass)
             ratio_mask_counts.update(mass_stats)
