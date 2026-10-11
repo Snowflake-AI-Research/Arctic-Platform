@@ -28,11 +28,14 @@ import time
 import traceback
 import urllib.request
 
-# Pin this (trainer) process to a single GPU *before* torch initializes CUDA; the vLLM server gets its own GPU via the
-# child process env below. Mirrors TRL's canonical layout (server and trainer on separate CUDA_VISIBLE_DEVICES).
-_TRAINER_GPU = os.environ.get("BASELINE_TRAINER_GPU", "0")
+# Single-GPU launch pins the trainer before torch initializes CUDA. Under `accelerate launch` each rank already
+# has its own CUDA_VISIBLE_DEVICES, so leave that alone. BASELINE_VLLM_URL skips the in-process `vllm serve`.
+_EXTERNAL_VLLM = os.environ.get("BASELINE_VLLM_URL", "").strip()
+_UNDER_ACCEL = "LOCAL_RANK" in os.environ
 _SERVER_GPU = os.environ.get("BASELINE_SERVER_GPU", "1")
-os.environ["CUDA_VISIBLE_DEVICES"] = _TRAINER_GPU
+if not _UNDER_ACCEL:
+    _TRAINER_GPU = os.environ.get("BASELINE_TRAINER_GPU", "0")
+    os.environ["CUDA_VISIBLE_DEVICES"] = _TRAINER_GPU
 
 import torch  # noqa: E402
 
@@ -52,11 +55,11 @@ def format_sample(sample: dict) -> dict:
 # --------------------------------------------------------------------------------------------------------------- #
 # vLLM server lifecycle (own process group; hardened teardown) -- mirrors the Arctic script
 # --------------------------------------------------------------------------------------------------------------- #
-def _wait_health(url: str, timeout: float, server: subprocess.Popen) -> None:
+def _wait_health(url: str, timeout: float, server: subprocess.Popen | None) -> None:
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
-        if server.poll() is not None:
+        if server is not None and server.poll() is not None:
             raise RuntimeError(f"vllm server exited early with code {server.returncode} before healthy")
         try:
             with urllib.request.urlopen(url, timeout=5) as r:
@@ -108,41 +111,51 @@ def main() -> None:
 
     chat_template_kwargs = {"enable_thinking": False}
 
-    base_url = f"http://{args.host}:{args.port}"
+    base_url = _EXTERNAL_VLLM or f"http://{args.host}:{args.port}"
+    server = None
+    pgid = None
+    logf = None
 
-    # ----- launch stock `vllm serve` on the server GPU as its own process group -----
-    server_cmd = [
-        "vllm",
-        "serve",
-        args.model,
-        "--host",
-        args.host,
-        "--port",
-        str(args.port),
-        "--max-model-len",
-        str(args.max_model_len),
-        "--seed",
-        str(args.seed),
-        # `processed_logprobs`: the sampler returns post-temperature/top-k/top-p logprobs, matching how the trainer's
-        # patched model computes its (temperature-scaled) logprobs -> ratio ~ 1 on-policy.
-        "--logprobs-mode",
-        "processed_logprobs",
-        # NCCL weight transfer endpoints (/init_weight_transfer_engine, /update_weights, ...) used by WeightTransferClient.
-        "--weight-transfer-config",
-        '{"backend":"nccl"}',
-    ]
-    server_env = dict(os.environ)
-    server_env["CUDA_VISIBLE_DEVICES"] = _SERVER_GPU
-    server_env["VLLM_SERVER_DEV_MODE"] = "1"  # exposes /pause,/resume,/*_weight_update (dev-only endpoints)
-    print(f"[base] launching vllm serve on GPU {_SERVER_GPU}: {' '.join(server_cmd)}", flush=True)
-    print(f"[base] trainer on GPU {_TRAINER_GPU}; torch.cuda.device_count()={torch.cuda.device_count()}", flush=True)
-    print(f"[base] server stdout/stderr -> {SERVER_LOG}", flush=True)
-    logf = open(SERVER_LOG, "w")
-    server = subprocess.Popen(
-        server_cmd, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, env=server_env
-    )
-    pgid = os.getpgid(server.pid)
-    print(f"[base] vllm server pid={server.pid} pgid={pgid}", flush=True)
+    # ----- launch stock `vllm serve` on the server GPU, unless a 4-sample server is already up -----
+    if not _EXTERNAL_VLLM:
+        server_cmd = [
+            "vllm",
+            "serve",
+            args.model,
+            "--host",
+            args.host,
+            "--port",
+            str(args.port),
+            "--max-model-len",
+            str(args.max_model_len),
+            "--seed",
+            str(args.seed),
+            # `processed_logprobs`: the sampler returns post-temperature/top-k/top-p logprobs, matching how the trainer's
+            # patched model computes its (temperature-scaled) logprobs -> ratio ~ 1 on-policy.
+            "--logprobs-mode",
+            "processed_logprobs",
+            # NCCL weight transfer endpoints (/init_weight_transfer_engine, /update_weights, ...) used by WeightTransferClient.
+            "--weight-transfer-config",
+            '{"backend":"nccl"}',
+        ]
+        server_env = dict(os.environ)
+        server_env["CUDA_VISIBLE_DEVICES"] = _SERVER_GPU
+        server_env["VLLM_SERVER_DEV_MODE"] = "1"  # exposes /pause,/resume,/*_weight_update (dev-only endpoints)
+        print(f"[base] launching vllm serve on GPU {_SERVER_GPU}: {' '.join(server_cmd)}", flush=True)
+        print(f"[base] trainer on GPU {_TRAINER_GPU}; torch.cuda.device_count()={torch.cuda.device_count()}", flush=True)
+        print(f"[base] server stdout/stderr -> {SERVER_LOG}", flush=True)
+        logf = open(SERVER_LOG, "w")
+        server = subprocess.Popen(
+            server_cmd, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, env=server_env
+        )
+        pgid = os.getpgid(server.pid)
+        print(f"[base] vllm server pid={server.pid} pgid={pgid}", flush=True)
+    else:
+        print(
+            f"[base] external vllm {base_url}; cuda_devices={os.environ.get('CUDA_VISIBLE_DEVICES', '')} "
+            f"device_count={torch.cuda.device_count()}",
+            flush=True,
+        )
 
     ok = False
     out_dir = tempfile.mkdtemp(prefix="trl_base_out_")
@@ -177,7 +190,7 @@ def main() -> None:
             token_budget=0,  # FixedCountBatcher: per_device_train_batch_size samples/step (mirrors the Arctic run)
             logging_steps=1,
             report_to="none",
-            log_completions=True,
+            log_completions=os.environ.get("BASELINE_LOG_COMPLETIONS", "1") not in ("0", "false", "False"),
             vllm_server_base_url=base_url,
         )
 
@@ -210,7 +223,7 @@ def main() -> None:
     finally:
         # Always dump whatever metrics we have, so a partial run is still comparable.
         try:
-            if trainer is not None:
+            if trainer is not None and os.environ.get("LOCAL_RANK", "0") in ("0", ""):
                 with open(args.metrics_out, "w") as f:
                     json.dump(trainer.state.log_history, f, indent=2)
                 print(
@@ -219,22 +232,24 @@ def main() -> None:
                 )
         except Exception as e:  # noqa: BLE001
             print(f"[base] metrics dump raised (ignored): {e}", flush=True)
-        print(f"[base] terminating vllm server process group pgid={pgid} ...", flush=True)
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-            for _ in range(30):
-                if server.poll() is not None:
-                    break
-                time.sleep(1)
-            if server.poll() is None:
-                os.killpg(pgid, signal.SIGKILL)
-                server.wait(timeout=30)
-        except ProcessLookupError:
-            pass
-        logf.close()
-        print("[base] ---- vllm server log tail ----", flush=True)
-        print(_tail(SERVER_LOG), flush=True)
-        print("[base] ---- end vllm server log tail ----", flush=True)
+        if server is not None and pgid is not None:
+            print(f"[base] terminating vllm server process group pgid={pgid} ...", flush=True)
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+                for _ in range(30):
+                    if server.poll() is not None:
+                        break
+                    time.sleep(1)
+                if server.poll() is None:
+                    os.killpg(pgid, signal.SIGKILL)
+                    server.wait(timeout=30)
+            except ProcessLookupError:
+                pass
+            if logf is not None:
+                logf.close()
+            print("[base] ---- vllm server log tail ----", flush=True)
+            print(_tail(SERVER_LOG), flush=True)
+            print("[base] ---- end vllm server log tail ----", flush=True)
 
     sys.exit(0 if ok else 1)
 

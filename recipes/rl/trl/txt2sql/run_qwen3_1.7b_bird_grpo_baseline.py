@@ -97,7 +97,7 @@ def main() -> None:
             print(f"[base] BIRD dataset ready: {len(dataset)} prompts (from {args.data_path})", flush=True)
             print(
                 f"[base] token_budget={token_budget!r} per_device_bsz={args.per_device_bsz} "
-                f"gas={args.grad_accum} max_inflight={max_inflight}",
+                f"gas={args.grad_accum} max_inflight={max_inflight} dtype=bfloat16",
                 flush=True,
             )
             print(
@@ -114,6 +114,8 @@ def main() -> None:
             gradient_checkpointing=True,  # long SQL prompts: trade compute for memory
             learning_rate=args.learning_rate,
             bf16=True,  # real GPU training (the Arctic server also trains bf16)
+            # bf16=True does not change the load dtype. The default is float32, which OOMs an 8B DDP replica.
+            dtype="bfloat16",
             num_generations=args.num_generations,
             max_completion_length=args.max_completion_length,
             temperature=1.0,

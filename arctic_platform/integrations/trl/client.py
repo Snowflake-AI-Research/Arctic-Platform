@@ -136,15 +136,15 @@ class ArcticTrainingClient:
 
     def forward_backward(
         self,
-        model: torch.nn.Module,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         completion_mask: torch.Tensor,
         loss: Any = None,
         loss_fn: Any = None,
+        model: torch.nn.Module | None = None,
         aux_loss_coef: float = 0.0,
     ) -> ForwardBackwardOutput:
-        del model  # trainer-local; Arctic owns the weights
+        del model, aux_loss_coef  # #6676 no longer passes these; aux coef lives on GRPOLoss
         # Rebased TRL passes a GRPOLoss as ``loss``. Older callers pass ``loss_fn``.
         if loss is None:
             loss = loss_fn
