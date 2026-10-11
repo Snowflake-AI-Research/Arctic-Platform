@@ -60,6 +60,7 @@ client = create_arctic_rl_client(config)
 ### Integrated
 
 1. [SkyRL](https://github.com/NovaSky-AI/SkyRL/pull/1837). [Documentation](https://github.com/NovaSky-AI/SkyRL/tree/main/integrations/arctic_rl)
+2. [OpenHands](recipes/rl/openhands/code_localization) code localization on Cortex. The harness runs on the CPU driver. Cortex owns training and sampling. SkyRL drives GRPO.
 
 ### Integration is done but not yet merged
 

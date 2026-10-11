@@ -16,7 +16,7 @@
 """Third-party framework adapters for arctic_platform.
 
 Each subpackage under ``arctic_platform.integrations`` is a self-contained
-adapter to an external RL/training framework (verl, SkyRL, ...). Adapters
+adapter to an external RL/training framework (verl, SkyRL, OpenHands, ...). Adapters
 are opt-in: importing this parent package deliberately pulls in *no* heavy
 framework dependencies, so the extras are gated one level down, in each
 adapter's own ``__init__``. Users select an adapter by extra:

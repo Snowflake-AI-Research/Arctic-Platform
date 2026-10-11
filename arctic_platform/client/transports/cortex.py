@@ -28,7 +28,9 @@ import base64
 import contextlib
 import hashlib
 import json
+import os
 import time
+from pathlib import Path
 from typing import Any
 from typing import Iterator
 from urllib.parse import urlencode
@@ -300,6 +302,19 @@ async def _aread_json(resp: Any) -> Any:
         return None
 
 
+def job_create_payload(sub_job_configs: list[dict], comment: str | None) -> dict:
+    """Body of the job-create POST.
+
+    ``comment`` is the only ownership signal in a schema where every job is
+    submitted as ADMIN. An empty comment is omitted so the body stays the one
+    Cortex already accepts.
+    """
+    payload = {"sub_job_configs": sub_job_configs}
+    if comment is not None and comment != "":
+        payload["comment"] = comment
+    return payload
+
+
 class CortexTransport(Transport):
     def __init__(self, config: ArcticClientConfig) -> None:
         self.config = config
@@ -324,9 +339,15 @@ class CortexTransport(Transport):
             # A mutating create: only retry when the request provably never landed,
             # so we can't spawn duplicate jobs (matches the neutrino client).
             created = self._send(
-                "POST", self._prefix, retry_on=_is_connect_error, json={"sub_job_configs": self._sub_job_configs()}
+                "POST",
+                self._prefix,
+                retry_on=_is_connect_error,
+                json=job_create_payload(self._sub_job_configs(), os.environ.get("CORTEX_JOB_COMMENT")),
             )
             self.job_id = created["job_id"]
+            job_id_path = os.environ.get("ARCTIC_CORTEX_JOB_ID_FILE")
+            if job_id_path is not None and job_id_path != "":
+                Path(job_id_path).write_text(f"{self.job_id}\n")
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
         # JobHandles holds each role's sub-job token, so the client's op bodies

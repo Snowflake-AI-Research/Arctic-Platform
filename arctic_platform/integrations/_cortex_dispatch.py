@@ -38,6 +38,31 @@ from arctic_platform.rl.config import ArcticRLClientConfig as _LegacyConfig
 
 __all__ = ["create_cortex_client"]
 
+# ArcticClientConfig.max_seq_len. SkyRL writes vLLM max_model_len for every
+# recipe, including GSM8K (prompt 512 + response 1024). to_cortex drops that
+# vLLM field and uses this one, so forwarding a shorter length would shrink the
+# GSM8K job. Only a context longer than the default has to be set.
+_DEFAULT_MAX_SEQ_LEN = 8192
+
+
+def legacy_max_seq_len(legacy: Any) -> int | None:
+    """Sequence length to set on the unified client, or ``None`` to keep 8192.
+
+    vLLM's ``max_model_len`` bounds every sampled conversation, so it also bounds
+    every training sequence. The training ``max_length`` is only the fallback.
+    """
+    vllm = getattr(legacy, "vllm_config", None) or {}
+    training = getattr(legacy, "training_config", None) or {}
+    length = vllm.get("max_model_len")
+    if length is None:
+        length = training.get("max_length")
+    if length is None:
+        return None
+    length = int(length)
+    if length <= _DEFAULT_MAX_SEQ_LEN:
+        return None
+    return length
+
 
 def _to_unified_config(legacy: _LegacyConfig):
     """Legacy config -> unified client config. Optimizer is merged into
@@ -75,6 +100,9 @@ def _to_unified_config(legacy: _LegacyConfig):
         v = getattr(legacy, k, None)
         if v is not None:
             fields[k] = v
+    max_seq_len = legacy_max_seq_len(legacy)
+    if max_seq_len is not None:
+        fields["max_seq_len"] = max_seq_len
     return U(**fields)
 
 
