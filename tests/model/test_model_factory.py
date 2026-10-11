@@ -127,18 +127,27 @@ class TestLoaderSelection:
     def test_build_model_runs_resolved_loader_then_patches(self, monkeypatch):
         """build_model builds via the resolved loader and hands the result to the patch pipeline."""
         built = nn.Linear(1, 1)
+        calls = []
 
         @register_loader("fake")
         def _fake(ctx: LoaderContext) -> LoadedModel:
             return LoadedModel(model=built)
 
-        patched = []
-        monkeypatch.setattr(factory_mod, "apply_patches", lambda loaded, ctx: patched.append(loaded))
+        monkeypatch.setattr(
+            factory_mod,
+            "apply_patches",
+            lambda loaded, ctx: calls.append(("patch", loaded)),
+        )
+        monkeypatch.setattr(
+            factory_mod,
+            "finalize_model_for_training",
+            lambda model: calls.append(("finalize", model)),
+        )
 
         loaded = build_model(ModelSpec(model_path_or_name="x", loader="fake"))
 
         assert loaded.model is built
-        assert patched == [loaded]
+        assert calls == [("patch", loaded), ("finalize", built)]
 
 
 class TestPatchPipeline:
@@ -413,6 +422,29 @@ class TestModelFeaturePatches:
         assert model.gradient_checkpointing_kwargs == {"use_reentrant": False}
         assert model.input_grads_enabled is True
         assert [layer.fullgraph for layer in model.model.layers] == [True, True]
+
+    def test_periodic_checkpointing_disables_non_qwen_cache(self):
+        from arctic_platform.model.patches.gradient_checkpointing import apply_gradient_checkpointing
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.text_config = types.SimpleNamespace(model_type="llama", use_cache=True)
+                self.config = types.SimpleNamespace(
+                    model_type="llama",
+                    use_cache=True,
+                    get_text_config=lambda: self.text_config,
+                )
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+
+        model = _Model()
+        apply_gradient_checkpointing(model, _ctx(gradient_checkpointing=2))
+
+        assert model.config.use_cache is False
+        assert model.text_config.use_cache is False
+        assert type(model.model.layers[0]).__name__ == "CheckpointWrapper"
+        assert type(model.model.layers[1]).__name__ == "Linear"
 
     def test_rejects_fullgraph_with_tiling(self):
         from arctic_platform.model.config import Patches

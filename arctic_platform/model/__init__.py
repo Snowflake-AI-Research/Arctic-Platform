@@ -29,13 +29,45 @@ from arctic_platform.model.config import Patches
 from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
 from arctic_platform.model.factory import build_model
+from arctic_platform.model.implementations.fp8 import keeps_fp32
+from arctic_platform.model.implementations.fp8 import mark_keep_fp32
+from arctic_platform.model.implementations.gpu.activation_offload import activation_offload_stats
+from arctic_platform.model.implementations.gpu.lm_head import mark_lm_head_targets_validated
+from arctic_platform.model.implementations.gpu.lm_head import validated_lm_head_targets_to
+from arctic_platform.model.implementations.moe.config_validation import effective_fused_cross_entropy
+from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
+from arctic_platform.model.implementations.moe.conversion_cache import conversion_cache_is_node_local
+from arctic_platform.model.implementations.moe.conversion_cache import conversion_cache_ready
+from arctic_platform.model.implementations.moe.conversion_cache import resolve_conversion_cache_path
+from arctic_platform.model.implementations.moe.layers.moe import ROUTER_REPLAY_FRESH
+from arctic_platform.model.implementations.moe.vlm import get_language_model
+from arctic_platform.model.implementations.moe.vlm import get_vision_encoder
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
+from arctic_platform.model.loader import ModelParallelismMetadata
+from arctic_platform.model.loader import canonical_parameter_name
+from arctic_platform.model.loader import finalize_model_for_training
+from arctic_platform.model.loader import model_parallelism_metadata_from_config
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import select_loader
 from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.patch import register_patch
 from arctic_platform.model.patches.peft import apply_peft
+from arctic_platform.model.weight_export import PEFT_ADAPTER_DIRNAME
+from arctic_platform.model.weight_export import WeightExportContract
+from arctic_platform.model.weight_export import checkpoint_peft_adapter_dir
+from arctic_platform.model.weight_export import gather_peft_adapter_state_dict
+from arctic_platform.model.weight_export import hf_export_parameter_name
+from arctic_platform.model.weight_export import iter_lora_weights
+from arctic_platform.model.weight_export import iter_model_weights
+from arctic_platform.model.weight_export import pretrained_config_of
+from arctic_platform.model.weight_export import pretrained_module_for_hf_save
+from arctic_platform.model.weight_export import save_exported_state_dict
+from arctic_platform.model.weight_export import save_hf_pretrained
+from arctic_platform.model.weight_export import save_peft_adapters
+from arctic_platform.model.weight_export import supports_weight_format
+from arctic_platform.model.weight_export import validate_lora_sync_trainable_parameters
+from arctic_platform.model.weight_export import weight_export_contract
 
 # Import built-in loaders and patches for their registration side effects.
 from arctic_platform.model import loaders  # noqa: F401  # isort: skip
@@ -45,13 +77,38 @@ __all__ = [
     "ActivationCheckpointConfig",
     "ActivationOffloadConfig",
     "ActivationOffloadPatch",
+    "activation_offload_stats",
+    "PEFT_ADAPTER_DIRNAME",
+    "WeightExportContract",
+    "canonical_parameter_name",
+    "checkpoint_peft_adapter_dir",
+    "conversion_cache_is_node_local",
+    "conversion_cache_ready",
+    "effective_fused_cross_entropy",
+    "finalize_model_for_training",
+    "gather_peft_adapter_state_dict",
+    "get_language_model",
+    "get_vision_encoder",
+    "hf_export_parameter_name",
+    "iter_lora_weights",
+    "iter_model_weights",
+    "keeps_fp32",
     "LoadedModel",
     "LoaderContext",
     "LmHeadPatch",
+    "mark_keep_fp32",
+    "mark_lm_head_targets_validated",
     "CompilePatch",
+    "ModelParallelismMetadata",
     "ModelSpec",
+    "model_parallelism_metadata_from_config",
     "ParallelismConfig",
     "Patches",
+    "pretrained_config_of",
+    "pretrained_module_for_hf_save",
+    "save_hf_pretrained",
+    "save_peft_adapters",
+    "supports_weight_format",
     "TiledMlpPatch",
     "ZorroTrainPatch",
     "apply_patches",
@@ -59,5 +116,12 @@ __all__ = [
     "build_model",
     "register_loader",
     "register_patch",
+    "resolve_conversion_cache_path",
+    "ROUTER_REPLAY_FRESH",
+    "save_exported_state_dict",
     "select_loader",
+    "validate_lora_sync_trainable_parameters",
+    "validate_lm_head_fused_ce_config",
+    "validated_lm_head_targets_to",
+    "weight_export_contract",
 ]

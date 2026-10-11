@@ -209,14 +209,16 @@ class ActivationOffloadManager:
         pin_memory_bucket_size_mib: int = _DEFAULT_PIN_MEMORY_BUCKET_SIZE_MIB,
         config: Optional[ActivationOffloadConfig] = None,
     ) -> None:
-        resolved = config or ActivationOffloadConfig(
-            keep_last_n=keep_last_n,
-            use_streams=use_streams,
-            tensor_size_threshold=tensor_size_threshold,
-            pin_memory_enabled=pin_memory_enabled,
-            pin_memory_max_size_gib=pin_memory_max_size_gib,
-            pin_memory_bucket_size_mib=pin_memory_bucket_size_mib,
-        )
+        config_values = {
+            "keep_last_n": keep_last_n,
+            "use_streams": use_streams,
+            "pin_memory_enabled": pin_memory_enabled,
+            "pin_memory_max_size_gib": pin_memory_max_size_gib,
+            "pin_memory_bucket_size_mib": pin_memory_bucket_size_mib,
+        }
+        if tensor_size_threshold is not None:
+            config_values["tensor_size_threshold"] = tensor_size_threshold
+        resolved = config or ActivationOffloadConfig(**config_values)
         self._apply_config(resolved)
 
     def _apply_config(self, config: ActivationOffloadConfig) -> None:
@@ -507,14 +509,16 @@ def install_activation_offload(
     Pass ``manager`` to wrap a second module with an existing manager. Two modules in one stack must share a
     manager: separate managers keep separate slot books, which interleave and break backward's LIFO unpacking.
     """
-    resolved = config or ActivationOffloadConfig(
-        keep_last_n=keep_last_n,
-        use_streams=use_streams,
-        tensor_size_threshold=tensor_size_threshold,
-        pin_memory_enabled=pin_memory_enabled,
-        pin_memory_max_size_gib=pin_memory_max_size_gib,
-        pin_memory_bucket_size_mib=pin_memory_bucket_size_mib,
-    )
+    config_values = {
+        "keep_last_n": keep_last_n,
+        "use_streams": use_streams,
+        "pin_memory_enabled": pin_memory_enabled,
+        "pin_memory_max_size_gib": pin_memory_max_size_gib,
+        "pin_memory_bucket_size_mib": pin_memory_bucket_size_mib,
+    }
+    if tensor_size_threshold is not None:
+        config_values["tensor_size_threshold"] = tensor_size_threshold
+    resolved = config or ActivationOffloadConfig(**config_values)
     attached_manager: Optional[ActivationOffloadManager] = getattr(model, _MANAGER_ATTR, None)
     if manager is not None and attached_manager is not None and manager is not attached_manager:
         raise ValueError(

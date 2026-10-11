@@ -51,8 +51,6 @@ def _validate_common(
         raise ValueError(f"{family} dtype must be 'bfloat16' or 'float32'")
     if spec.parallelism.sequence_parallel > 1 and not allow_sequence_parallel:
         raise NotImplementedError(f"Sequence parallelism is not implemented for {family}.")
-    if spec.patches.peft is not None:
-        raise ValueError(f"{family} PEFT requires expert adapter integration, which is not yet supported")
     if spec.patches.liger:
         raise ValueError(
             f"the {family} loader does not support the liger patch; "

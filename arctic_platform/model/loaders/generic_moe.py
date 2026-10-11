@@ -73,8 +73,6 @@ def _validate_spec(spec: ModelSpec) -> None:
         spec.attn_implementation = "flash_attention_3"
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError("generic MoE dtype must be 'bfloat16' or 'float32'")
-    if spec.patches.peft is not None:
-        raise ValueError("generic MoE PEFT requires expert adapter integration, which is not yet supported")
     if spec.patches.liger:
         raise ValueError(
             "the generic MoE loader does not support the liger patch; "
