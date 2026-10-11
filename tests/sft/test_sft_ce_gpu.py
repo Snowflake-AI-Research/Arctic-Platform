@@ -17,9 +17,8 @@
 These exercise the real server-side CE path on CUDA. They skip when no GPU is
 visible (``@require_torch_gpu``) — run them via autorun on the GPU box.
 
-HTTP e2e: client process uses ``CUDA_VISIBLE_DEVICES=`` empty; the launched server
-gets ``--server-cuda-visible-devices``. Do **not** force the torch CE fallback
-here: whatever kernel the server has (flash-attn or torch) is what production uses.
+Do **not** force the torch CE fallback in the e2e: whatever kernel the server
+has (flash-attn or torch) is what production uses.
 """
 
 from __future__ import annotations
@@ -140,13 +139,12 @@ class TestSftCeSumFromHiddenParityGPU(TestCasePlus):
 
 @require_torch_gpu
 @pytest.mark.gpu_serial
-class TestSftCeHttpE2EModesGPU(TestCasePlus):
-    """End-to-end: CPU-blanked client + local GPU server, all three sft_ce modes.
+class TestSftCeE2EModesGPU(TestCasePlus):
+    """End-to-end over the Ray transport, all three sft_ce modes.
 
-    Matches production topology: client ``CUDA_VISIBLE_DEVICES=`` empty, server
-    child sees GPUs via ``server_cuda_visible_devices``. Per-step ``loss`` and
-    ``grad_norm`` must match exactly across ``none`` / ``compute`` / ``memory``
-    on the same batch (same math, same seeds — not "close enough").
+    Per-step ``loss`` and ``grad_norm`` must match exactly across ``none`` /
+    ``compute`` / ``memory`` on the same batch (same math, same seeds — not
+    "close enough").
     """
 
     def test_modes_match_loss_and_grad_norm_curves(self):
@@ -156,19 +154,14 @@ class TestSftCeHttpE2EModesGPU(TestCasePlus):
 
         for mode in ("none", "compute", "memory"):
             env = self.get_env()
-            env["CUDA_VISIBLE_DEVICES"] = ""  # client blank
+            env["CUDA_VISIBLE_DEVICES"] = "0"
             env["WANDB_DISABLED"] = "true"
             env.setdefault("HF_HOME", "/data-fast/huggingface")
-            # HTTP port from this worker's block; DeepSpeed rendezvous uses a second probe.
-            http_port = reserve_free_port(_PORT_BASE + 1, span=3)
-            env["MASTER_PORT"] = str(reserve_free_port(_PORT_BASE + 4, span=4))
+            env["MASTER_PORT"] = str(reserve_free_port(_PORT_BASE + 1, span=7))
             cmd = [
                 sys.executable,
                 "-m",
-                "arctic_platform.sft.examples.run_sft_http_demo",
-                "--launch-local-server",
-                "--server-cuda-visible-devices",
-                "0",
+                "arctic_platform.sft.examples.run_sft_demo",
                 "--training-gpus",
                 "1",
                 "--steps",
@@ -177,8 +170,6 @@ class TestSftCeHttpE2EModesGPU(TestCasePlus):
                 "sft_ce",
                 "--logits-optimization",
                 mode,
-                "--port",
-                str(http_port),
                 "--checkpoint-dir",
                 str(ckpt / mode),
             ]

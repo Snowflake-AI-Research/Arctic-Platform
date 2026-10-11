@@ -17,6 +17,11 @@ from ..config import EPCommBackend
 from ..distributed.ep_backend import get_ep_comm_module
 from ..distributed.ep_backend import uses_dispatch_ep
 
+# ``routed_experts`` value marking a token with no captured routing: a caller that tolerates missing captures
+# (such as a trainer replaying sampler routing) sets it, and an opted-in router selects that token's experts with
+# its own gate instead of gathering.
+ROUTER_REPLAY_FRESH = -1
+
 
 def _maybe_to_local(t: torch.Tensor) -> torch.Tensor:
     """Return the local shard if `t` is a DTensor, else `t` itself.
@@ -89,6 +94,18 @@ class MoEArgs:
     load_balance_coeff: float | None = 1e-3
     fp8_block_size: int | None = None
     """HF finegrained-FP8 tile size. None means weights are not stored as FP8."""
+    swiglu_limit: float | None = None
+
+
+def _apply_swiglu(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    limit: float | None,
+) -> torch.Tensor:
+    if limit is not None:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    return F.silu(gate) * up
 
 
 # can be used as dense FFN layer or shared experts in MoE layers
@@ -108,14 +125,16 @@ class FeedForward(nn.Module):
         self,
         dim: int,
         hidden_dim: int,
+        swiglu_limit: float | None = None,
     ) -> None:
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(_apply_swiglu(self.w1(x), self.w3(x), self.swiglu_limit))
 
     def init_weights(self, init_std: float = 0.02):
         nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
@@ -129,9 +148,11 @@ class BCFeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         fp8_block_size: int | None = None,
+        swiglu_limit: float | None = None,
     ) -> None:
         super().__init__()
         self.fp8_block_size = fp8_block_size
+        self.swiglu_limit = swiglu_limit
         if fp8_block_size is not None:
             self.w1 = nn.Parameter(torch.empty(hidden_dim, dim, dtype=torch.float8_e4m3fn))
             self.w2 = nn.Parameter(torch.empty(dim, hidden_dim, dtype=torch.float8_e4m3fn))
@@ -179,11 +200,15 @@ class BCFeedForward(nn.Module):
             s1 = _maybe_to_local(self.w1_scale_inv)
             s2 = _maybe_to_local(self.w2_scale_inv)
             s3 = _maybe_to_local(self.w3_scale_inv)
-            h = F.silu(fp8_linear_with_lora_delta(x, w1, s1, self.fp8_block_size, d1)) * (
-                fp8_linear_with_lora_delta(x, w3, s3, self.fp8_block_size, d3)
+            h = _apply_swiglu(
+                fp8_linear_with_lora_delta(x, w1, s1, self.fp8_block_size, d1),
+                fp8_linear_with_lora_delta(x, w3, s3, self.fp8_block_size, d3),
+                self.swiglu_limit,
             )
             return fp8_linear_with_lora_delta(h, w2, s2, self.fp8_block_size, d2)
-        return torch.matmul(F.silu(torch.matmul(x, self.w1.T)) * torch.matmul(x, self.w3.T), self.w2.T)
+        gate = torch.matmul(x, self.w1.T)
+        up = torch.matmul(x, self.w3.T)
+        return torch.matmul(_apply_swiglu(gate, up, self.swiglu_limit), self.w2.T)
 
     def init_weights(self, init_std: float):
         if self.fp8_block_size is not None:
@@ -201,6 +226,7 @@ def _run_experts_for_loop_impl(
     w3: torch.Tensor,
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     # NOTE: this would incur a synchronization between device and host
     num_tokens_per_expert = num_tokens_per_expert.tolist()
@@ -217,8 +243,9 @@ def _run_experts_for_loop_impl(
     )
     out_experts_splits = []
     for expert_idx, x_expert in enumerate(x):
-        h = F.silu(torch.matmul(x_expert, w1[expert_idx].transpose(-2, -1)))
-        h = h * torch.matmul(x_expert, w3[expert_idx].transpose(-2, -1))
+        gate = torch.matmul(x_expert, w1[expert_idx].transpose(-2, -1))
+        up = torch.matmul(x_expert, w3[expert_idx].transpose(-2, -1))
+        h = _apply_swiglu(gate, up, swiglu_limit)
         h = torch.matmul(h, w2[expert_idx].transpose(-2, -1))
         # h shape (tokens_per_expert(varying), dim)
         out_experts_splits.append(h)
@@ -265,14 +292,16 @@ def _run_experts_grouped_mm_impl(
     w3: torch.Tensor,
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     # grouped mm between a 2D tensor and a 3D tensor
     assert x.dim() == 2
     _offsets_must_cover_no_more_than_the_rows("gated", x, num_tokens_per_expert, offsets)
 
-    h = F.silu(torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets))
-    h = h * torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
+    gate = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
+    up = torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
+    h = _apply_swiglu(gate, up, swiglu_limit)
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
 
     return out
@@ -286,6 +315,7 @@ class GroupedExperts(nn.Module):
         num_experts: int,
         use_grouped_mm: bool,
         fp8_block_size: int | None = None,
+        swiglu_limit: float | None = None,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -322,6 +352,7 @@ class GroupedExperts(nn.Module):
             self.register_parameter("w2_scale_inv", None)
             self.register_parameter("w3_scale_inv", None)
         self.use_grouped_mm = use_grouped_mm
+        self.swiglu_limit = swiglu_limit
         self.ep_comm_backend: EPCommBackend = "deepep"
 
     def set_ep_comm_backend(self, backend: EPCommBackend) -> None:
@@ -345,14 +376,13 @@ class GroupedExperts(nn.Module):
             s3 = _maybe_to_local(self.w3_scale_inv)
             ab = getattr(self, "_dss_lora_ab", {})
             if self.use_grouped_mm:
-                h = F.silu(
-                    grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size)
-                    + _packed_expert_linear(x, d1, num_tokens_per_expert, ab.get("w1"))
+                gate = grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size) + _packed_expert_linear(
+                    x, d1, num_tokens_per_expert, ab.get("w1")
                 )
-                h = h * (
-                    grouped_fp8_mm(x, w3, s3, num_tokens_per_expert, self.fp8_block_size)
-                    + _packed_expert_linear(x, d3, num_tokens_per_expert, ab.get("w3"))
+                up = grouped_fp8_mm(x, w3, s3, num_tokens_per_expert, self.fp8_block_size) + _packed_expert_linear(
+                    x, d3, num_tokens_per_expert, ab.get("w3")
                 )
+                h = _apply_swiglu(gate, up, self.swiglu_limit)
                 return grouped_fp8_mm(h, w2, s2, num_tokens_per_expert, self.fp8_block_size) + (
                     _packed_expert_linear(h, d2, num_tokens_per_expert, ab.get("w2"))
                 )
@@ -361,18 +391,16 @@ class GroupedExperts(nn.Module):
             splits = torch.split(x[: sum(counts)], counts, dim=0)
             outs = []
             for i, x_e in enumerate(splits):
-                he = F.silu(
-                    fp8_linear_with_expert_lora(
-                        x_e,
-                        w1[i],
-                        s1[i],
-                        self.fp8_block_size,
-                        None if d1 is None else d1[i],
-                        ab.get("w1"),
-                        i,
-                    )
+                gate = fp8_linear_with_expert_lora(
+                    x_e,
+                    w1[i],
+                    s1[i],
+                    self.fp8_block_size,
+                    None if d1 is None else d1[i],
+                    ab.get("w1"),
+                    i,
                 )
-                he = he * fp8_linear_with_expert_lora(
+                up = fp8_linear_with_expert_lora(
                     x_e,
                     w3[i],
                     s3[i],
@@ -381,6 +409,7 @@ class GroupedExperts(nn.Module):
                     ab.get("w3"),
                     i,
                 )
+                he = _apply_swiglu(gate, up, self.swiglu_limit)
                 outs.append(
                     fp8_linear_with_expert_lora(
                         he,
@@ -400,8 +429,8 @@ class GroupedExperts(nn.Module):
         w2 = _maybe_to_local(self.w2)
         w3 = _maybe_to_local(self.w3)
         if self.use_grouped_mm:
-            return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert)
-        return _run_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert)
+            return _run_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit)
+        return _run_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert, self.swiglu_limit)
 
     def forward(
         self,
@@ -451,6 +480,12 @@ class TokenChoiceTopKRouter(nn.Module):
         self.score_func = score_func
         self.route_norm = route_norm
         self.route_scale = route_scale
+        # Off unless the caller opts in via enable_fresh_replay_routing(); otherwise replay stays gather-only.
+        self.fresh_replay_routing = False
+
+    def enable_fresh_replay_routing(self) -> None:
+        """Route ``ROUTER_REPLAY_FRESH`` tokens in ``routed_experts`` with this router's own gate."""
+        self.fresh_replay_routing = True
 
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor | None = None, routed_experts: torch.Tensor | None = None
@@ -473,7 +508,15 @@ class TokenChoiceTopKRouter(nn.Module):
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
 
-        if routed_experts is not None:
+        if routed_experts is not None and self.fresh_replay_routing:
+            # Replayed tokens gather their captured experts; ROUTER_REPLAY_FRESH tokens take the same topk the
+            # replay-off path below would pick. The gate's own choice is made off the autograd graph, so both
+            # kinds of token save the same tensors -- which the activation-checkpoint recompute relies on.
+            biased_scores = scores.detach() if expert_bias is None else scores.detach() + expert_bias
+            _, own_experts = torch.topk(biased_scores, k=self.top_k, dim=1)
+            selected_experts_indices = torch.where(routed_experts == ROUTER_REPLAY_FRESH, own_experts, routed_experts)
+            top_scores = scores.gather(dim=1, index=selected_experts_indices)
+        elif routed_experts is not None:
             top_scores = scores.gather(dim=1, index=routed_experts)
             selected_experts_indices = routed_experts
         elif expert_bias is not None:
@@ -557,6 +600,7 @@ class MoE(nn.Module):
             num_experts=num_experts,
             use_grouped_mm=moe_args.use_grouped_mm,
             fp8_block_size=moe_args.fp8_block_size,
+            swiglu_limit=moe_args.swiglu_limit,
         )
         self.ep_comm_backend: EPCommBackend = "deepep"
         self.experts.set_ep_comm_backend(self.ep_comm_backend)
@@ -575,6 +619,7 @@ class MoE(nn.Module):
                 dim=dim,
                 hidden_dim=hidden_dim * moe_args.num_shared_experts,
                 fp8_block_size=moe_args.fp8_block_size,
+                swiglu_limit=moe_args.swiglu_limit,
             )
             if moe_args.num_shared_experts > 0
             else None
@@ -716,6 +761,8 @@ class MoE(nn.Module):
         Args:
             x (torch.Tensor): Input tensor with shape ``(bs, slen, dim)``.
             routed_experts (torch.Tensor | None, optional): Optional tensor with shape ``(bs, slen, top_k)``.
+                Tokens set to ``ROUTER_REPLAY_FRESH`` are routed by the gate when the router opted into fresh
+                routing; the rest are replayed.
 
         Returns:
             out (torch.Tensor): Output tensor with shape ``(bs, slen, dim)``.

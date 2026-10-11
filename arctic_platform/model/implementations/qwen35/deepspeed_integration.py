@@ -340,3 +340,78 @@ def load_qwen3_5_moe_model(
     maybe_apply_row_invariant_projections(model, options.model_dump())
 
     return model
+
+
+def _apply_generic_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None:
+    if sp_size > 1:
+        from arctic_platform.model.implementations.moe.sequence_parallel import (
+            apply_sequence_parallelism,
+        )
+
+        apply_sequence_parallelism(model, sp_size, sp_group)
+
+
+def _generic_adapter() -> MoEDeepSpeedAdapter:
+    from dataclasses import replace
+
+    from arctic_platform.model.implementations.moe.vllm_weights import build_iter_full_vllm_weights
+
+    return replace(
+        _adapter(),
+        apply_sequence_parallelism=_apply_generic_sequence_parallelism,
+        extra_weight_iterators=(("_iter_full_vllm_weights", build_iter_full_vllm_weights),),
+    )
+
+
+def load_generic_moe_model_for_deepspeed(
+    model_config: ModelConfig,
+    parallel_dims: ParallelDims,
+    ep_mesh: DeviceMesh,
+    ep_group_name: str,
+    *,
+    fused_cross_entropy: bool | str = False,
+    tiled_mlp_token_chunk_size: int | None = None,
+    sp_size: int = 1,
+    sp_group=None,
+) -> nn.Module:
+    return _load_moe_model_for_deepspeed(
+        _generic_adapter(),
+        model_config,
+        parallel_dims,
+        ep_mesh,
+        ep_group_name,
+        fused_cross_entropy=fused_cross_entropy,
+        tiled_mlp_token_chunk_size=tiled_mlp_token_chunk_size,
+        sp_size=sp_size,
+        sp_group=sp_group,
+    )
+
+
+def load_generic_moe_model(
+    *,
+    model_name: str,
+    optimization_dtype: str,
+    attn_implementation: str,
+    ep_size: int,
+    sp_size: int = 1,
+    sp_group=None,
+    ep_group=None,
+    options: Qwen3_5MoeOptions,
+) -> nn.Module:
+    """Load Qwen3 MoE, GLM-4.5, MiniMax M2, AFMoE, or Nemotron H."""
+    model = _load_moe_model(
+        _generic_adapter(),
+        load_generic_moe_model_for_deepspeed,
+        model_name=model_name,
+        optimization_dtype=optimization_dtype,
+        attn_implementation=attn_implementation,
+        ep_size=ep_size,
+        sp_size=sp_size,
+        sp_group=sp_group,
+        ep_group=ep_group,
+        options=options,
+        patch_moe_detection=patch_deepspeed_moe_detection,
+        device_mesh_type=DeviceMesh,
+    )
+    maybe_apply_row_invariant_projections(model, options.model_dump())
+    return model

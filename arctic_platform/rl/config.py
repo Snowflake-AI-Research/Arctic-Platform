@@ -26,13 +26,7 @@ from pydantic import model_validator
 
 
 class ArcticRLClientConfig(BaseModel):
-    backend: Literal["local", "dss-platform"] = "local"
-    comm_protocol: Literal["http", "ray"] = "http"
     checkpoint_path: Optional[str] = None
-
-    # it's best not to pass explicitly the host and port since they are auto derived from comm_protocol
-    host: Optional[str] = None
-    port: Optional[int] = None
 
     model_name: str = Field(description="Model name or HuggingFace ID to load on all engines.")
     ds_config: dict = Field(default_factory=dict, description="DeepSpeed config for training engine.")
@@ -90,21 +84,6 @@ class ArcticRLClientConfig(BaseModel):
         ),
     )
 
-    server_logs: bool = Field(default=True, description="Show server subprocess stdout/stderr.")
-
-    ray_auto_attach: bool = Field(
-        default=True,
-        description=(
-            "If True, the local server will attempt to attach to a pre-existing Ray cluster"
-            " (only honored when that cluster has GPU resources). Set to False to always start"
-            " a fresh Ray cluster — useful when an unrelated CPU-only Ray cluster is running."
-        ),
-    )
-
-    startup_timeout: float = Field(
-        default=300.0, description="Seconds to wait for the local server to become healthy."
-    )
-    health_check_interval: float = Field(default=2.0, description="Seconds between health-check polls during startup.")
     # How long to wait for each job to reach RUNNING state after /initialize.
     job_ready_timeout: float = Field(
         default=600.0, description="Seconds to wait for each job to become RUNNING after initialization."
@@ -118,26 +97,8 @@ class ArcticRLClientConfig(BaseModel):
     log_prob_job_id: Optional[int] = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
-    def _derive_host_port(self) -> "ArcticRLClientConfig":
-        """Derive host/port from comm_protocol unless explicitly provided.
-
-        ray comms don't use host/port (both None). http binds the RL server on
-        this node's routable IP at port 7000 so off-node Ray workers can reach
-        the driver node by IP rather than "localhost". Values passed explicitly
-        by the caller are left untouched (e.g. reconnecting to a known server).
-        """
-        # Lazy import to avoid pulling ray in at config import time.
-        from arctic_platform.rl.ray_cluster import primary_ip
-
-        if "host" not in self.model_fields_set:
-            self.host = None if self.comm_protocol == "ray" else primary_ip()
-        if "port" not in self.model_fields_set:
-            self.port = None if self.comm_protocol == "ray" else 7000
-        return self
-
-    @model_validator(mode="after")
     def _validate_local_gpu_counts(self) -> "ArcticRLClientConfig":
-        if self.backend != "local" or self.training_job_id is not None:
+        if self.training_job_id is not None:
             return self  # skip validation in reconnect mode
         # Any individual engine may be 0 (e.g. a sampling-only generate test or a
         # training-only forward test); require only that at least one job exists.
@@ -151,7 +112,7 @@ class ArcticRLClientConfig(BaseModel):
 class WeightSyncConfig(BaseModel):
     """NCCL weight-transfer topology between training GPUs and inference replicas.
 
-    Used by :class:`WeightSyncCoordinator` (standalone, not part of the HTTP client).
+    Used by :class:`WeightSyncCoordinator` (standalone, not part of the client).
     """
 
     training_sharding: str = Field(

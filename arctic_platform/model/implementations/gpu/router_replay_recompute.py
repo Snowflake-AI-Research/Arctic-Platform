@@ -84,6 +84,8 @@ def _router_supports_routed_experts(router: object) -> bool:
 
 
 def _wrap_router(router) -> bool:
+    # ``_self_replay_wrapped`` (set below) is also read by trainers to verify that a checkpointed router is
+    # protected before they enable fresh routing on it; keep the name stable.
     if getattr(router, "_self_replay_wrapped", False):
         return False
     if not _router_supports_routed_experts(router):
@@ -91,14 +93,40 @@ def _wrap_router(router) -> bool:
 
     original = router.forward
     router._self_replay_queue = collections.deque()
+    # Contract read by forward below: a router that never opts into fresh routing (only
+    # TokenChoiceTopKRouter.enable_fresh_replay_routing does) keeps gather-only replay, so production replay
+    # defers to it.
+    if not hasattr(router, "fresh_replay_routing"):
+        router.fresh_replay_routing = False
 
     @wraps(original)
     def forward(x, expert_bias=None, routed_experts=None):
+        replay_queue = router._self_replay_queue
+
         # Production replay (sampler-sourced routing) already feeds routed_experts to both passes; defer to it.
-        if routed_experts is not None:
+        if routed_experts is not None and not router.fresh_replay_routing:
             return original(x, expert_bias, routed_experts=routed_experts)
 
-        replay_queue = router._self_replay_queue
+        # An opted-in router picks experts by topk for tokens marked ROUTER_REPLAY_FRESH, so the experts the
+        # original forward actually selected are captured and replayed verbatim on recompute. The router's
+        # fresh-routing path saves the same tensors whichever experts it is handed, so no extra off-graph pass
+        # is needed.
+        if routed_experts is not None:
+            if _in_recompute():
+                if len(replay_queue) == 0:
+                    # Falling back to routed_experts would re-topk the fresh tokens and diverge from the forward.
+                    raise RuntimeError(
+                        "router-replay recompute found no captured experts for a fresh-routing replay forward"
+                    )
+                return original(x, expert_bias, routed_experts=replay_queue.popleft())
+            out = original(x, expert_bias, routed_experts=routed_experts)
+            if torch.is_grad_enabled():
+                # Each graph-building forward is recomputed before this router's next one, so anything still
+                # queued belongs to a forward whose backward never ran (an aborted step); replaying it would hand
+                # this forward's recompute another step's experts.
+                replay_queue.clear()
+                replay_queue.append(out[1].detach())
+            return out
 
         # Forward and recompute must save the same tensors, so both passes take the gather path
         # (routed_experts=expert_indices). The discrete topk decision is made once off the autograd graph

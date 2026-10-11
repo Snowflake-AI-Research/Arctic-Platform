@@ -19,7 +19,7 @@ def _install_fix(monkeypatch, *, stop_accepted):
     monkeypatch.setattr(
         stop_mask,
         "require_supported_vllm_version",
-        lambda _feature: "0.30.0",
+        lambda _feature: "0.31.0",
     )
     stop_mask.ensure_xgrammar_stop_mask_fix()
 
@@ -103,7 +103,7 @@ def test_xgrammar_stop_mask_checks_vllm_version(monkeypatch):
 def test_xgrammar_stop_mask_matches_pinned_accept_rollback_contract():
     import xgrammar as xgr
 
-    assert version("xgrammar") == "0.2.6"
+    assert version("xgrammar") == "0.2.7"
     vocab = [
         b'{"',
         b"value",

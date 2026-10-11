@@ -13,11 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ArcticRLClient -- a unified frontend client for HTTP and Ray clients for RL training.
-
-Works identically against a remote dss-platform deployment or a local
-``server.py`` instance -- the only differences are ``base_url`` and whether the
-client launches the server.
+"""ArcticRLClient -- frontend for the in-process Ray RL client.
 
 All jobs (training, sampling, log-prob) are initialized automatically at
 construction time.
@@ -25,23 +21,10 @@ construction time.
 
 from __future__ import annotations
 
-import logging
-
 from arctic_platform.rl.config import ArcticRLClientConfig
-from arctic_platform.rl.http_client import ArcticRLHTTPClient
 from arctic_platform.rl.ray_client import ArcticRLRayClient
-
-# from arctic_platform.rl.ray_server import ArcticRLRayServerState
 from arctic_platform.rl.server import ArcticRLServerState
-
-logger = logging.getLogger(__name__)
 
 
 def create_arctic_rl_client(config: ArcticRLClientConfig, arctic_rl_server_state: ArcticRLServerState = None):
-    if config.comm_protocol == "http":
-        return ArcticRLHTTPClient(config)
-    elif config.comm_protocol == "ray":
-        # assert arctic_rl_server_state is not None, "arctic_rl_server_state is required for comm_protocol: ray"
-        return ArcticRLRayClient(config, arctic_rl_server_state)
-    else:
-        raise ValueError(f"Invalid communication protocol: {config.comm_protocol}")
+    return ArcticRLRayClient(config, arctic_rl_server_state)

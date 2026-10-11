@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU wire-format tests for the HTTP SFT demo (``run_sft_http_demo``).
+"""CPU wire-format tests for the SFT demo (``run_sft_demo``).
 
-These are the discriminator behind the GPU e2e ``TestSftCeHttpE2EModesGPU``:
+These are the discriminator behind the GPU e2e ``TestSftCeE2EModesGPU``:
 that test only proves the three ``logits_optimization`` modes *agree*, so it
 cannot tell "all modes correct" from "the mode flag was silently ignored".
 The distinguishing logic is ``_build_batch`` mapping the CLI flags onto the
@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import torch
 
-from arctic_platform.sft.examples.run_sft_http_demo import _build_batch
+from arctic_platform.sft.examples.run_sft_demo import _build_batch
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import torch_assert_equal
 

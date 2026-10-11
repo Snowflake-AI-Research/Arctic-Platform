@@ -119,8 +119,5 @@ rollout:
 # Trainer <-> RL server communication settings.
 comms:
 
-  # ray or http: ray would be much faster for payload comms in the on-prem use case
-  protocol: ray
-
   # Drop position_ids on the wire; server reconstructs from attention_mask. Set False for mrope / 3D rope.
   drop_position_ids: True

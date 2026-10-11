@@ -13,15 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Local RL server matching the dss-platform sftp_server HTTP API.
-
-Uses Ray to manage DeepSpeed workers and ArcticInference ReplicaPools.
-
-Usage::
-
-    python -m arctic_platform.common.http_server \\
-        --training-gpus 4 --sampling-gpus 2 --log-prob-gpus 2
-"""
+"""DeepSpeed Ray worker actor used by the on-prem RL server."""
 
 from __future__ import annotations
 

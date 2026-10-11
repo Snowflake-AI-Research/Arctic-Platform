@@ -18,9 +18,7 @@ kernel so backward does not emit NaNs from ``exp(-inf - +inf)``.
 
 import torch
 
-_FLASHMLA_INSTALL_HINT = (
-    "flash_mla is not installed. Install flash_mla or a vLLM build that ships vllm._flashmla_C."
-)
+_FLASHMLA_INSTALL_HINT = "flash_mla is not installed. Install flash_mla or a vLLM build that ships vllm._flashmla_C."
 
 
 def _load_flash_mla_sparse_fwd():
@@ -37,7 +35,16 @@ def _load_flash_mla_sparse_fwd():
 
         _op = torch.ops._flashmla_C.sparse_prefill_fwd
 
-        def _fn(q, kv, indices, sm_scale, d_v=512, attn_sink=None, topk_length=None, out=None):
+        def _fn(
+            q,
+            kv,
+            indices,
+            sm_scale,
+            d_v=512,
+            attn_sink=None,
+            topk_length=None,
+            out=None,
+        ):
             return _op(q, kv, indices, sm_scale, d_v, attn_sink, topk_length, out)
 
         return _fn
@@ -98,15 +105,19 @@ def sparse_mla_backend() -> str:
 
 def _prepare_flashmla_indices(
     indices: torch.Tensor,
-    seq_len: int,
+    kv_seq_len: int,
     sentinel_idx: int,
 ) -> torch.Tensor:
-    """Convert prime-rl indices [S, topk] to FlashMLA [S, 1, topk] with masking."""
+    """Convert PrimeRL indices [S_q, topk] to FlashMLA [S_q, 1, topk].
+
+    The indexer already applies causal/document masking. Do not compare global
+    K indices against local Q row numbers under context parallelism.
+    """
     flash_indices = indices.to(torch.int32).contiguous()
-    positions = torch.arange(seq_len, device=indices.device, dtype=torch.int32).unsqueeze(1)
-    flash_indices = flash_indices.masked_fill(flash_indices > positions, -1)
     flash_indices = flash_indices.masked_fill(flash_indices == sentinel_idx, -1)
-    flash_indices = flash_indices.masked_fill(flash_indices < 0, -1)
+    flash_indices = flash_indices.masked_fill(
+        (flash_indices < 0) | (flash_indices >= kv_seq_len), -1
+    )
     return flash_indices.unsqueeze(1)
 
 
@@ -115,18 +126,21 @@ def _ref_sparse_mla_fwd_one(
     kv: torch.Tensor,
     flash_indices: torch.Tensor,
     sm_scale: float,
-    seq_len: int,
+    kv_seq_len: int,
     d_v: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference forward for one sequence; matches FlashMLA tests/ref.py."""
     idx = flash_indices.squeeze(1)
+    s_q = q.shape[0]
     topk = idx.shape[-1]
-    invalid = (idx < 0) | (idx >= seq_len)
+    invalid = (idx < 0) | (idx >= kv_seq_len)
     idx_safe = idx.clamp_min(0)
 
     q_f = q.float()
-    kv_body = kv[:seq_len, 0].float()
-    gathered = kv_body.index_select(0, idx_safe.reshape(-1)).view(seq_len, topk, q.shape[-1])
+    kv_body = kv[:kv_seq_len, 0].float()
+    gathered = kv_body.index_select(0, idx_safe.reshape(-1)).view(
+        s_q, topk, q.shape[-1]
+    )
 
     scores = torch.einsum("shd,std->sht", q_f, gathered) * sm_scale
     scores = scores.masked_fill(invalid.unsqueeze(1), float("-inf"))
@@ -155,7 +169,7 @@ def _ref_sparse_mla_bwd_one(
     lse: torch.Tensor,
     do: torch.Tensor,
     sm_scale: float,
-    seq_len: int,
+    kv_seq_len: int,
     d_v: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference backward for one sequence (softmax over topk, scatter dKV).
@@ -164,19 +178,20 @@ def _ref_sparse_mla_bwd_one(
     instead of O(S × topk × dim).
     """
     idx = flash_indices.squeeze(1)
+    s_q = q.shape[0]
     topk = idx.shape[-1]
     dim_qk = q.shape[-1]
-    kv_body = kv[:seq_len, 0].float()
+    kv_body = kv[:kv_seq_len, 0].float()
 
     dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
-    dkv = torch.zeros(seq_len + 1, 1, dim_qk, device=kv.device, dtype=torch.float32)
+    dkv = torch.zeros(kv_seq_len + 1, 1, dim_qk, device=kv.device, dtype=torch.float32)
     chunk = _sparse_mla_bwd_chunk()
 
-    for s0 in range(0, seq_len, chunk):
-        s1 = min(s0 + chunk, seq_len)
+    for s0 in range(0, s_q, chunk):
+        s1 = min(s0 + chunk, s_q)
         sl = s1 - s0
         idx_c = idx[s0:s1]
-        invalid = (idx_c < 0) | (idx_c >= seq_len)
+        invalid = (idx_c < 0) | (idx_c >= kv_seq_len)
         idx_safe = idx_c.clamp_min(0)
 
         q_f = q[s0:s1].float()
@@ -203,7 +218,9 @@ def _ref_sparse_mla_bwd_one(
         dv_grad = torch.einsum("sht,shd->std", probs, do_f)
         d_slot[..., :d_v].add_(dv_grad)
 
-        dkv[:seq_len, 0].index_add_(0, idx_safe.reshape(-1), d_slot.reshape(-1, dim_qk))
+        dkv[:kv_seq_len, 0].index_add_(
+            0, idx_safe.reshape(-1), d_slot.reshape(-1, dim_qk)
+        )
 
     return dq.to(q.dtype), dkv.to(kv.dtype)
 
@@ -211,6 +228,25 @@ def _ref_sparse_mla_bwd_one(
 def _lse_to_ref_convention(lse: torch.Tensor) -> torch.Tensor:
     """Map FlashMLA empty-row LSE (+inf) onto logsumexp empty-row LSE (-inf)."""
     return lse.masked_fill(torch.isposinf(lse), float("-inf"))
+
+
+def flashmla_prefill_h_q_align(h_q: int, device: torch.device) -> int:
+    if device.type != "cuda":
+        return h_q
+    major, _ = torch.cuda.get_device_capability(device)
+    align = 128 if major >= 10 else 64
+    if h_q % align == 0:
+        return h_q
+    return ((h_q + align - 1) // align) * align
+
+
+def _pad_q_heads(q: torch.Tensor, pad_h: int) -> torch.Tensor:
+    h_q = q.size(1)
+    if pad_h == h_q:
+        return q
+    padded = q.new_zeros(q.size(0), pad_h, q.size(2))
+    padded[:, :h_q].copy_(q)
+    return padded
 
 
 def _flashmla_fwd_one(
@@ -226,7 +262,13 @@ def _flashmla_fwd_one(
         raise ValueError(
             f"FlashMLA sparse prefill requires topk % 128 == 0 (SM90 2*B_TOPK), got topk={topk}"
         )
-    out, _, lse = fwd(q, kv, flash_indices, sm_scale, d_v=d_v)
+    h_q = int(q.size(1))
+    pad_h = flashmla_prefill_h_q_align(h_q, q.device)
+    q_kernel = _pad_q_heads(q, pad_h)
+    out, _, lse = fwd(q_kernel, kv, flash_indices, sm_scale, d_v=d_v)
+    if pad_h != h_q:
+        out = out[:, :h_q]
+        lse = lse[:, :h_q]
     return out, _lse_to_ref_convention(lse)
 
 
@@ -237,14 +279,15 @@ class _SparseMLAFlashMLA(torch.autograd.Function):
     def forward(ctx, q, kv, indices, sm_scale):
         _ensure_flash_mla_sparse_fwd()
 
-        batch, seq_len, _, dim_qk = q.shape
+        batch, q_seq_len, _, dim_qk = q.shape
         _, seq_len_kv, kv_group, _ = kv.shape
-        sentinel_idx = seq_len
+        kv_seq_len = seq_len_kv - 1
+        sentinel_idx = kv_seq_len
         d_v = 512
 
         assert kv_group == 1
         assert dim_qk == 576
-        assert seq_len_kv == seq_len + 1
+        assert indices.shape[1] == q_seq_len
 
         if sm_scale is None:
             sm_scale = dim_qk**-0.5
@@ -254,9 +297,11 @@ class _SparseMLAFlashMLA(torch.autograd.Function):
         flash_indices_list: list[torch.Tensor] = []
 
         for b in range(batch):
-            flash_idx = _prepare_flashmla_indices(indices[b, :, 0, :], seq_len, sentinel_idx)
+            flash_idx = _prepare_flashmla_indices(
+                indices[b, :, 0, :], kv_seq_len, sentinel_idx
+            )
             out_b, lse_b = _flashmla_fwd_one(
-                q[b], kv[b, :seq_len], flash_idx, sm_scale, d_v
+                q[b], kv[b, :kv_seq_len], flash_idx, sm_scale, d_v
             )
             outs.append(out_b.unsqueeze(0))
             lses.append(lse_b.unsqueeze(0))
@@ -268,7 +313,7 @@ class _SparseMLAFlashMLA(torch.autograd.Function):
         # Activation offload hooks only see tensors retained via save_for_backward.
         ctx.save_for_backward(q, kv, lse, *flash_indices_list)
         ctx.sm_scale = sm_scale
-        ctx.seq_len = seq_len
+        ctx.kv_seq_len = kv_seq_len
         ctx.d_v = d_v
         return out
 
@@ -276,7 +321,7 @@ class _SparseMLAFlashMLA(torch.autograd.Function):
     def backward(ctx, do):
         q, kv, lse, *flash_indices_list = ctx.saved_tensors
         batch = q.shape[0]
-        seq_len = ctx.seq_len
+        kv_seq_len = ctx.kv_seq_len
         sm_scale = ctx.sm_scale
         d_v = ctx.d_v
 
@@ -291,7 +336,7 @@ class _SparseMLAFlashMLA(torch.autograd.Function):
                 lse[b],
                 do[b],
                 sm_scale,
-                seq_len,
+                kv_seq_len,
                 d_v,
             )
             dq_parts.append(dq_b.unsqueeze(0))
@@ -313,16 +358,21 @@ def sparse_mla_ref_fwd_interface(
     d_v: int = 512,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference-only forward (for tests / debugging)."""
-    batch, seq_len, _, dim_qk = q.shape
+    batch, _q_seq_len, _, dim_qk = q.shape
     if sm_scale is None:
         sm_scale = dim_qk**-0.5
-    sentinel_idx = seq_len
+    kv_seq_len = kv.shape[1] - 1
+    sentinel_idx = kv_seq_len
 
     outs: list[torch.Tensor] = []
     lses: list[torch.Tensor] = []
     for b in range(batch):
-        flash_idx = _prepare_flashmla_indices(indices[b, :, 0, :], seq_len, sentinel_idx)
-        out_b, lse_b = _ref_sparse_mla_fwd_one(q[b], kv[b], flash_idx, sm_scale, seq_len, d_v)
+        flash_idx = _prepare_flashmla_indices(
+            indices[b, :, 0, :], kv_seq_len, sentinel_idx
+        )
+        out_b, lse_b = _ref_sparse_mla_fwd_one(
+            q[b], kv[b], flash_idx, sm_scale, kv_seq_len, d_v
+        )
         outs.append(out_b.unsqueeze(0))
         lses.append(lse_b.unsqueeze(0))
     return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
@@ -338,14 +388,17 @@ def sparse_mla_ref_bwd_interface(
     d_v: int = 512,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference backward for batched prime-rl sparse MLA tensors."""
-    batch, seq_len = q.shape[:2]
-    sentinel_idx = seq_len
+    batch = q.shape[0]
+    kv_seq_len = kv.shape[1] - 1
+    sentinel_idx = kv_seq_len
     dq_parts: list[torch.Tensor] = []
     dkv_parts: list[torch.Tensor] = []
     for b in range(batch):
-        flash_idx = _prepare_flashmla_indices(indices[b, :, 0, :], seq_len, sentinel_idx)
+        flash_idx = _prepare_flashmla_indices(
+            indices[b, :, 0, :], kv_seq_len, sentinel_idx
+        )
         dq_b, dkv_b = _ref_sparse_mla_bwd_one(
-            q[b], kv[b], flash_idx, lse[b], do[b], sm_scale, seq_len, d_v
+            q[b], kv[b], flash_idx, lse[b], do[b], sm_scale, kv_seq_len, d_v
         )
         dq_parts.append(dq_b.unsqueeze(0))
         dkv_parts.append(dkv_b.unsqueeze(0))
@@ -393,17 +446,21 @@ def sparse_mla_flashmla_fwd_interface(
     """Forward-only FlashMLA path (natural-log LSE). Prefer ``sparse_mla_flashmla_apply``."""
     _ensure_flash_mla_sparse_fwd()
 
-    batch, seq_len, heads, dim_qk = q.shape
-    assert heads in (64, 128)
+    batch, _q_seq_len, _heads, dim_qk = q.shape
+    kv_seq_len = kv.shape[1] - 1
     if sm_scale is None:
         sm_scale = dim_qk**-0.5
-    sentinel_idx = seq_len
+    sentinel_idx = kv_seq_len
 
     outs: list[torch.Tensor] = []
     lses: list[torch.Tensor] = []
     for b in range(batch):
-        flash_idx = _prepare_flashmla_indices(indices[b, :, 0, :], seq_len, sentinel_idx)
-        out_b, lse_b = _flashmla_fwd_one(q[b], kv[b, :seq_len], flash_idx, sm_scale, d_v)
+        flash_idx = _prepare_flashmla_indices(
+            indices[b, :, 0, :], kv_seq_len, sentinel_idx
+        )
+        out_b, lse_b = _flashmla_fwd_one(
+            q[b], kv[b, :kv_seq_len], flash_idx, sm_scale, d_v
+        )
         outs.append(out_b.unsqueeze(0))
         lses.append(lse_b.unsqueeze(0))
     return torch.cat(outs, dim=0), torch.cat(lses, dim=0)

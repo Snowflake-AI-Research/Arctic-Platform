@@ -19,6 +19,7 @@ from arctic_platform.model.implementations.gpu.tiled_mlp import enable_tiled_mlp
 
 from .distributed.ep_backend import uses_dispatch_ep
 from .distributed.expert_parallel import DeepEPExpertParallel
+from .distributed.expert_parallel import DeepEPShardParallel
 from .layers.moe import LatentMoE
 from .layers.moe import MoE
 from .logging_utils import get_logger
@@ -84,6 +85,13 @@ def apply_ep_with_mesh(model: nn.Module, config: Any, ep_mesh: DeviceMesh) -> No
                 device_mesh=ep_mesh,
                 parallelize_plan=DeepEPExpertParallel(),
             )
+    for module in model.modules():
+        if getattr(module, "_dss_shard_on_ep", False):
+            parallelize_module(
+                module,
+                device_mesh=ep_mesh,
+                parallelize_plan=DeepEPShardParallel(),
+            )
 
 
 def convert_dtensors_to_local(model: nn.Module) -> int:
@@ -97,6 +105,8 @@ def convert_dtensors_to_local(model: nn.Module) -> int:
                 parameter,
                 nn.Parameter(local, requires_grad=parameter.requires_grad),
             )
+            if getattr(parameter, "_dss_skip_weight_sync", False):
+                replacement._dss_skip_weight_sync = True
             module.register_parameter(name, replacement)
             count += 1
     return count
@@ -108,6 +118,15 @@ def tag_expert_params_for_deepspeed(model: nn.Module, ep_group_name: str) -> int
         if not isinstance(module, (MoE, LatentMoE)):
             continue
         for parameter in module.experts.parameters(recurse=False):
+            parameter.allreduce = False
+            parameter.group_name = ep_group_name
+            count += 1
+    for module in model.modules():
+        if not getattr(module, "_dss_ep_sharded", False):
+            continue
+        for parameter in module.parameters(recurse=False):
+            if parameter.numel() == 0:
+                continue
             parameter.allreduce = False
             parameter.group_name = ep_group_name
             count += 1
@@ -153,25 +172,35 @@ def build_iter_full_hf_weights(model: nn.Module):
 
     def iterator():
         is_master = dist.get_rank() == 0
-        by_layer: dict[int, list[tuple[str, nn.Parameter]]] = {}
-        for name, parameter in model.named_parameters():
+        from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
+
+        skipped_parameter_ids = {
+            id(parameter)
+            for module in model.modules()
+            if getattr(module, "_dss_skip_weight_sync", False)
+            for parameter in module.parameters(recurse=False)
+        }
+        by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
+        for name, tensor in named_weight_sync_tensors(model):
+            if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
+                continue
             hf_name = hf_export_param_name(name)
             if hf_name is not None:
-                by_layer.setdefault(layer_index(hf_name), []).append((hf_name, parameter))
+                by_layer.setdefault(layer_index(hf_name), []).append((hf_name, tensor))
 
         ordered_layers = ([-1] if -1 in by_layer else []) + sorted(index for index in by_layer if index >= 0)
         for index in ordered_layers:
             layer_state: dict[str, torch.Tensor] = {}
-            for name, parameter in by_layer[index]:
-                if hasattr(parameter, "group_name") and getattr(parameter, "allreduce", True) is False:
-                    ep_group = ds_groups._get_expert_parallel_group(parameter.group_name)
-                    local = parameter.data.contiguous()
+            for name, tensor in by_layer[index]:
+                if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
+                    ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
+                    local = tensor.data.contiguous()
                     shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
                     dist.all_gather(shards, local, group=ep_group)
                     if is_master:
                         layer_state[name] = torch.cat(shards, dim=0)
                 elif is_master:
-                    layer_state[name] = parameter.data
+                    layer_state[name] = tensor.data
 
             if not is_master:
                 continue

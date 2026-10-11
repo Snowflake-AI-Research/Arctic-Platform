@@ -13,11 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ArcticRLClient -- unified HTTP client for RL training.
-
-Works identically against a remote dss-platform deployment or a local
-``server.py`` instance -- the only differences are ``base_url`` and whether the
-client launches the server.
+"""ArcticRLRayClient -- in-process Ray client for RL training.
 
 All jobs (training, sampling, log-prob) are initialized automatically at
 construction time.
@@ -50,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 class ArcticRLRayClient:
-    """HTTP client for RL training against dss-platform or a local server.
+    """In-process Ray client for RL training.
 
     Jobs are created automatically during ``__init__`` for each engine type.
 
@@ -62,8 +58,6 @@ class ArcticRLRayClient:
 
     def __init__(self, config: ArcticRLClientConfig, rl_server_state: ArcticRLRayServerState) -> None:
         self.config = config
-
-        assert config.backend == "local", "ArcticRLRayClient only supports local backend"
 
         pr0(f"[ArcticRLRayClient] entry: config: {config=} {rl_server_state=}")
 
@@ -100,8 +94,7 @@ class ArcticRLRayClient:
 
         The returned config can be passed to ``ArcticRLClient()`` in another
         process (e.g. a Ray actor) to connect to the same jobs without calling
-        ``/initialize`` again.  ``backend`` is always ``"dss-platform"`` since
-        the server is already running.
+        ``initialize`` again.
 
         Example::
 
@@ -113,12 +106,10 @@ class ArcticRLRayClient:
             actor_client = ArcticRLClient(rc)   # reconnects, no /initialize
         """
         return ArcticRLClientConfig(
-            backend="local",
             model_name=self.config.model_name,
             training_job_id=self._training_job_id,
             sampling_job_id=self._sampling_job_id,
             log_prob_job_id=self._log_prob_job_id,
-            comm_protocol="ray",
         )
 
     def get_server_state(self) -> ArcticRLRayServerState:

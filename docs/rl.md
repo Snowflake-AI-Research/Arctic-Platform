@@ -42,7 +42,7 @@ from arctic_platform.rl import ArcticRLClientConfig, create_arctic_rl_client
 
 - Config: `arctic_platform.rl.config.ArcticRLClientConfig`
 - Factory: `arctic_platform.rl.client.create_arctic_rl_client` → async
-  `ArcticRLHTTPClient` or `ArcticRLRayClient`
+  `ArcticRLRayClient`
 
 **Unified client (migration target; subset of ops).** The unqualified name blocks;
 the `Async` prefix awaits:
@@ -62,9 +62,7 @@ import asyncio
 from arctic_platform.rl import ArcticRLClientConfig, create_arctic_rl_client
 
 config = ArcticRLClientConfig(
-    backend="local",
     model_name="Qwen/Qwen3-4B",
-    comm_protocol="ray",          # or "http"
     training_gpus=8,
     sampling_gpus=8,
     log_prob_gpus=0,              # 0 = disabled
@@ -80,18 +78,6 @@ results = asyncio.run(client.generate(
 client.shutdown()
 ```
 
-With `backend="local"` + `comm_protocol="http"`, the client can launch a local
-server subprocess (`python -m arctic_platform.common.http_server` via the
-`rl.http_server` shim).
-
-Standalone server:
-
-```bash
-python -m arctic_platform.common.http_server \
-  --host 0.0.0.0 --port 7000 \
-  --training-gpus 4 --sampling-gpus 4 --colocate
-```
-
 Reconnect after a Ray handoff:
 
 ```python
@@ -103,15 +89,12 @@ client2 = create_arctic_rl_client(rc)
 
 | Field | Default | Notes |
 |-------|---------|-------|
-| `backend` | `"local"` | `"local"` or `"dss-platform"` |
-| `comm_protocol` | `"http"` | `"http"` or `"ray"` |
 | `model_name` | **required** | HF id |
 | `training_gpus` / `sampling_gpus` / `log_prob_gpus` | `0` | Job created iff > 0 |
 | `log_prob_engine` | `"vllm"` | `"deepspeed"` or `"vllm"` |
 | `colocate` | `False` | Fractional GPU sharing |
 | `cuda_ipc` | `False` | Colocated weight-sync strategy, baked onto the training job at init: CUDA-IPC vs CPU-file |
 | `low_memory` | `False` | With `cuda_ipc`, stream one param at a time (bounds peak GPU mem); sent at init |
-| `host` / `port` | derived | HTTP often routable IP + **7000** |
 | `ds_config` | `{}` | Training DeepSpeed config |
 | `training_config` | `None` | Optimizer / scheduler / `training_horizon` |
 | `log_prob_ds_config` | `None` | Log-prob DeepSpeed engine |
@@ -120,12 +103,12 @@ client2 = create_arctic_rl_client(rc)
 | `arctic_inference_config` | `None` | **`zorro_inference`**, speculative decoding |
 | `checkpoint_path` | `None` | Required for new training jobs |
 | `full_determinism` / `seed` | `False` / `42` | Reproducibility |
-| `startup_timeout` / `job_ready_timeout` | `300` / `600` | Seconds |
+| `job_ready_timeout` | `600` | Seconds |
 | `training_job_id` / `sampling_job_id` / `log_prob_job_id` | `None` | Reconnect mode |
 
 ## Client methods
 
-Async methods on the HTTP/Ray clients from `create_arctic_rl_client`:
+Async methods on the Ray client from `create_arctic_rl_client`:
 
 | Method | Job | Notes |
 |--------|-----|-------|
@@ -143,7 +126,7 @@ Async methods on the HTTP/Ray clients from `create_arctic_rl_client`:
 | `sleep_log_prob` / `wake_log_prob` | log_prob | |
 | `empty_training_cache()` | training | |
 | `reconnect_config()` | — | Serializable reconnect |
-| `shutdown()` | all | Destroy jobs + stop local server |
+| `shutdown()` | all | Destroy jobs |
 
 `save_weights(path)` is a stub on-prem (not implemented for disk reload yet).
 
@@ -170,7 +153,7 @@ Unlike SFT's flat labels batch, RL `fwd_bwd` typically carries:
 ```
 
 Log-prob tensors often use a `_shifted` suffix convention (see
-`arctic_platform.rl.http_client`). Batch shapes still differ slightly across
+`arctic_platform.rl.ray_client`). Batch shapes still differ slightly across
 backends — treat unification as WIP.
 
 `fwd_bwd` omits the per-token result `batch` by default (VeRL only reads

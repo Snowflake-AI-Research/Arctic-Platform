@@ -15,20 +15,17 @@
 
 """Arctic RL log-prob engine tests: the DeepSpeed reference engine and the text ``log_probs`` API.
 
-Every other RL test runs with log_prob_gpus=0, so the log-prob job branch (ray_server / http_server initialize for
-"log_prob"), the forward-only DeepSpeed engine, fwd_no_grad(reference_model=True) -- the KL-reference path -- and
-the client ``log_probs`` text API never run; the e2e loop only hits the "no_log_prob_job" no-op. This stands up a
+Every other RL test runs with log_prob_gpus=0, so the log-prob job branch (ray_server initialize for "log_prob"),
+the forward-only DeepSpeed engine, fwd_no_grad(reference_model=True) -- the KL-reference path -- and the client
+``log_probs`` text API never run; the e2e loop only hits the "no_log_prob_job" no-op. This stands up a
 log-prob-only topology (log_prob_gpus=1, log_prob_engine="deepspeed") and covers two entry points:
 
   * ``test_reference_log_prob``: wake the engine, run fwd_no_grad(reference_model=True), offload it again. The
     reference per-token log-probs must match an independent per-row unpadded HF reference (same correctness bar as
-    the training-engine forward in test_train_engine) and be finite. ``ray`` runs both ZoRRO on/off -- the only
-    forward path this entry adds; http there is pure serialization plumbing already covered by test_train_engine /
-    test_e2e, so it is omitted.
+    the training-engine forward in test_train_engine) and be finite. Runs both ZoRRO on/off -- the only forward
+    path this entry adds.
   * ``test_text_log_probs``: the high-level ``client.log_probs(prompts, completions)`` path -- server-side
-    tokenization + the DeepSpeed worker's full-sequence ``compute_log_probs``. This is the one place that path runs,
-    and its server wiring differs per transport (ray_server vs http_server build/split the batch separately), so it
-    runs over both ``ray`` and ``http``.
+    tokenization + the DeepSpeed worker's full-sequence ``compute_log_probs``. This is the one place that path runs.
 
 Shared infra lives in ``rl_harness``. Heavyweight GPU test::
 
@@ -72,17 +69,12 @@ log_prob_gpus = 1
 # nats, so this absorbs bf16 jitter yet rejects garbage.
 LOGPROB_ATOL = 0.25
 
-# ray covers both reference-engine forward paths (ZoRRO on/off). http is pure serialization plumbing, independent of
-# the forward path and already covered by test_train_engine's http cell + test_e2e, so it's dropped to save a spin-up.
-log_prob_params = [("ray", True), ("ray", False)]
+log_prob_params = [(True,), (False,)]
 
 # Short prompt+completion texts for the log_probs API; the combined token count stays well under the engine's
 # max_length (prompt_len + response_len). The server tokenizes these, so geometry above doesn't constrain them.
 text_prompts = ["The capital of France is", "2 + 2 ="]
 text_completions = [" Paris", " 4"]
-
-# log_probs server wiring differs per transport (ray_server vs http_server), so cover both.
-text_log_prob_params = [("ray",), ("http",)]
 
 
 @require_torch_gpu
@@ -98,16 +90,15 @@ class TestLogProbEngine(TestCasePlus):
         return response
 
     @parameterized.expand(log_prob_params, name_func=parameterized_custom_name_func)
-    def test_reference_log_prob(self, comm_protocol, zorro_enable):
+    def test_reference_log_prob(self, zorro_enable):
         """Reference-engine fwd_no_grad(reference_model=True) log-probs match the independent HF reference."""
         skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus)
         batch, _, response_lens, ref, valid = cached_padded_batch_and_reference(
             model_name, attn_implementation, num_unique_prompts, rollout_n, prompt_len, response_len
         )
         cl_payload = build_compute_log_prob_payload(batch, zorro_enable, rollout_n, prompt_len, response_len)
-        tag = cell_tag(comm_protocol, zorro_enable)
+        tag = cell_tag(zorro_enable)
         with arctic_rl_client_session(
-            comm_protocol,
             zorro_enable,
             model_name,
             attn_implementation,
@@ -133,12 +124,10 @@ class TestLogProbEngine(TestCasePlus):
         await client.sleep_log_prob()
         return response
 
-    @parameterized.expand(text_log_prob_params, name_func=parameterized_custom_name_func)
-    def test_text_log_probs(self, comm_protocol):
-        """client.log_probs(prompts, completions) scores text through the DeepSpeed engine over both transports."""
+    def test_text_log_probs(self):
+        """client.log_probs(prompts, completions) scores text through the DeepSpeed engine."""
         skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus)
         with arctic_rl_client_session(
-            comm_protocol,
             False,
             model_name,
             attn_implementation,
@@ -151,10 +140,10 @@ class TestLogProbEngine(TestCasePlus):
         ) as client:
             response = asyncio.run(self._drive_text_log_probs(client))
 
-        self.assertIn("results", response, f"[{comm_protocol}] log_probs response missing 'results': {list(response)}")
+        self.assertIn("results", response, f"log_probs response missing 'results': {list(response)}")
         results = response["results"]
-        self.assertTrue(torch.is_tensor(results), f"[{comm_protocol}] expected results tensor, got {type(results)}")
-        self.assertEqual(results.ndim, 2, f"[{comm_protocol}] expected [B, S-1] results, got {tuple(results.shape)}")
-        self.assertEqual(results.shape[0], len(text_prompts), f"[{comm_protocol}] results batch dim mismatch")
-        self.assertTrue(torch.isfinite(results).all(), f"[{comm_protocol}] log_probs contain non-finite values")
-        print(f"[log-prob-engine] text log_probs {comm_protocol}: results shape={tuple(results.shape)}")
+        self.assertTrue(torch.is_tensor(results), f"expected results tensor, got {type(results)}")
+        self.assertEqual(results.ndim, 2, f"expected [B, S-1] results, got {tuple(results.shape)}")
+        self.assertEqual(results.shape[0], len(text_prompts), "results batch dim mismatch")
+        self.assertTrue(torch.isfinite(results).all(), "log_probs contain non-finite values")
+        print(f"[log-prob-engine] text log_probs: results shape={tuple(results.shape)}")

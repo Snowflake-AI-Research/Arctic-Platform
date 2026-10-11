@@ -75,13 +75,8 @@ def test_flashmla_load_error_is_not_hidden_as_missing(monkeypatch):
         flash_mla_available()
 
 
-def test_tilelang_keeps_local_row_causal_mask_and_inf_grad_merge_flag():
-    """sp=1 TileLang still masks with local s_i; only the Inf-grad flag is new.
-
-    Reading the kernel sources (not a hand-built tensor) so a revert of either
-    expression fails this test. Context-parallel global-index masking lives on
-    the stacked CP PR.
-    """
+def test_sparse_backends_keep_expected_masks_and_inf_grad_merge_flag():
+    """TileLang uses local causal rows; FlashMLA validates global CP indices."""
     kernels = Path(__file__).resolve().parents[2] / "arctic_platform/model/implementations/glm52/models/kernels"
     fwd = (kernels / "sparse_mla_fwd.py").read_text()
     bwd = (kernels / "sparse_mla_bwd.py").read_text()
@@ -90,7 +85,9 @@ def test_tilelang_keeps_local_row_causal_mask_and_inf_grad_merge_flag():
     assert "max_kv_i = q_i" in fwd
     assert "mask[bi_i] = Indices[by, s_i, bz // NH, i_i * BS + bi_i] <= max_kv_i" in bwd
     assert "TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: False" in bwd
-    assert "flash_indices > positions" in flash
+    assert "flash_indices == sentinel_idx" in flash
+    assert "(flash_indices < 0) | (flash_indices >= kv_seq_len)" in flash
+    assert "flash_indices > positions" not in flash
 
 
 def test_lse_to_ref_convention_maps_posinf_to_neginf():

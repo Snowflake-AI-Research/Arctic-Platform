@@ -28,28 +28,21 @@ infrastructure lives under `arctic_platform.common`; SFT-specific code under
 
 ## Quick start
 
-Colocated HTTP server, CPU-blanked client:
+In-process Ray server:
 
 ```bash
-CUDA_VISIBLE_DEVICES= python -m arctic_platform.sft.examples.run_sft_http_demo \
-  --launch-local-server --server-cuda-visible-devices 0,1 --training-gpus 2
+CUDA_VISIBLE_DEVICES=0,1 python -m arctic_platform.sft.examples.run_sft_demo --training-gpus 2
 ```
 
 Or drive the client yourself:
 
 ```python
-from arctic_platform.client import OnPremConfig, TrainingConfig
+from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient, ArcticSFTClientConfig
 
 config = ArcticSFTClientConfig(
     model_name="NousResearch/Llama-3.2-1B",
     training_gpus=2,
-    backend=OnPremConfig(
-        host="localhost",
-        port=8765,
-        launch_local_server=True,
-        server_cuda_visible_devices="0,1",
-    ),
     training=TrainingConfig(
         checkpoint_path="/data-fast/my-run/ckpt",  # required for new jobs
         ds_config={
@@ -74,16 +67,6 @@ try:
     client.save_checkpoint()
 finally:
     client.shutdown()
-```
-
-Connect to an already-running server by setting `launch_local_server=False` on
-the `OnPremConfig` (and optionally `training_job_id=` on the client config to
-reconnect). Start the server with:
-
-```bash
-python -m arctic_platform.common.http_server \
-  --host 0.0.0.0 --port 8765 \
-  --training-gpus 2 --sampling-gpus 0 --log-prob-gpus 0
 ```
 
 ## Package layout
@@ -266,12 +249,7 @@ vLLM settings on `sampling`.
 | `model_name` | **required** | HF model id |
 | `training_gpus` | `0` | Server training GPUs (or set `training_job_id` to reconnect) |
 | `max_seq_len` | `8192` | Max sequence length (training + sampling) |
-| `backend.protocol` | `"http"` | `"http"` or `"ray"` for `OnPremConfig` |
-| `backend.host` / `backend.port` | `localhost` / `8000` | Server address |
 | `backend.colocate` | `false` | Share GPUs between training and sampling |
-| `backend.launch_local_server` | `false` | Spawn local HTTP server from the client |
-| `backend.server_cuda_visible_devices` | `null` | GPU list for that subprocess (e.g. `"0,1"`) |
-| `backend.startup_timeout` | `600` | Seconds to wait for a launched server |
 | `training.checkpoint_path` | **required** for new jobs | Server-side checkpoint dir |
 | `training.ds_config` | `null` | DeepSpeed config (optimizer, scheduler, micro-batch, ZeRO, bf16, …) |
 | `training.ds_worker_config` | `null` | e.g. `attn_implementation`, `enable_gradient_checkpointing` |
@@ -317,12 +295,11 @@ with a sampling allocation or sampling job ID is rejected. A separate log-prob
 job uses the unadapted base model. The custom Qwen3.5 MoE loader also rejects
 this PEFT patch pending its expert-adapter integration.
 
-## CPU-only client requirement
+## GPU visibility
 
-The client process must be runnable with `CUDA_VISIBLE_DEVICES=` (empty). All
-GPU work happens on the server. When colocating via
-`backend.launch_local_server=True`, pass `backend.server_cuda_visible_devices`
-so the server child still sees GPUs.
+On-prem runs the Ray server in the client process, so the client must see the
+training GPUs (`CUDA_VISIBLE_DEVICES`). With a `CortexConfig` backend the client
+is CPU-only.
 
 ## Framework integrations
 
@@ -333,11 +310,6 @@ so the server child still sees GPUs.
 ## Examples
 
 ```bash
-# HTTP smoke (colocated)
-CUDA_VISIBLE_DEVICES= python -m arctic_platform.sft.examples.run_sft_http_demo \
-  --launch-local-server --server-cuda-visible-devices 0,1 --training-gpus 2
-
-# Unified example (http or ray)
-CUDA_VISIBLE_DEVICES= python -m arctic_platform.sft.examples.sft_example \
-  --backend onprem-http --server-cuda-visible-devices 0,1 --training-gpus 2
+CUDA_VISIBLE_DEVICES=0,1 python -m arctic_platform.sft.examples.run_sft_demo --training-gpus 2
+CUDA_VISIBLE_DEVICES=0,1 python -m arctic_platform.sft.examples.sft_example --training-gpus 2
 ```

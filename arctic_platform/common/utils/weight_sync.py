@@ -15,12 +15,11 @@
 
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared training→sampling weight-sync helpers (HTTP + Ray servers).
+"""Training→sampling weight-sync helpers for the Ray server.
 
-Colocated CUDA-IPC / CPU-file paths live here so both servers call one
-implementation. Staged ``wake_inference`` (weights → load → kv_cache) is the
-caller's job: Ray does it inside its wrappers; HTTP leaves it to the client
-(see legacy ``rl/http_client.sync_weights`` and unified ``AsyncArcticRLClient``).
+Colocated CUDA-IPC / CPU-file paths live here. Staged ``wake_inference``
+(weights → load → kv_cache) is the caller's job: the Ray server does it inside
+its wrappers.
 """
 
 from __future__ import annotations

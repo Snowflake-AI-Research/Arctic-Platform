@@ -56,22 +56,16 @@ from arctic_platform.client.transport import initialize_or_cleanup
 
 
 def make_transport(config: ArcticClientConfig, server_state: Any = None) -> Transport:
-    protocol = config.backend.protocol
-    if config.backend.type == "remote" and protocol == "cortex":
+    if config.backend.type == "remote":
         require_any_dep_group("cortex")
         from arctic_platform.client.transports.cortex import CortexTransport
 
         return CortexTransport(config)
 
     require_any_dep_group("sft", "rl")
-    from arctic_platform.client.transports.onprem_http import HttpTransport
-    from arctic_platform.client.transports.onprem_ray import RayTransport
+    from arctic_platform.client.transports.onprem import OnPremTransport
 
-    if protocol == "ray":
-        return RayTransport(config, server_state=server_state)
-    if server_state is not None:
-        raise ValueError("server_state reconnect is only supported by the in-process Ray transport.")
-    return HttpTransport(config)
+    return OnPremTransport(config, server_state=server_state)
 
 
 def _check_weight_format(config: ArcticClientConfig, weight_format: str | None) -> None:

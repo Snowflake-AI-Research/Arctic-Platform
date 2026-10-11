@@ -451,6 +451,7 @@ class _ShardAwareFusedWriter:
         self._handlers: dict[str, dict] = {}
 
         self._register_gdn(modules)
+        self._register_sparse_indexer(modules)
         self._register_moe(modules)
 
     # -- registration ------------------------------------------------------
@@ -480,6 +481,31 @@ class _ShardAwareFusedWriter:
             parent_path = mod_path.rsplit(".", 1)[0] if "." in mod_path else ""
             parent = modules.get(parent_path)
             if parent is None or not isinstance(parent, GatedDeltaNetAttention):
+                continue
+            wname = f"{mod_path}.weight"
+            param = self._params.get(wname)
+            if param is None:
+                continue
+            self._handlers[wname] = {
+                "family": "gdn_merged",
+                "module": mod,
+                "param": param,
+                "destination": wname,
+            }
+
+    def _register_sparse_indexer(self, modules: dict[str, nn.Module]) -> None:
+        try:
+            from vllm.model_executor.layers.linear import (
+                MergedColumnParallelLinear,
+            )
+        except Exception:
+            return
+
+        for mod_path, mod in modules.items():
+            if not (
+                isinstance(mod, MergedColumnParallelLinear)
+                and mod_path.endswith(".indexer.wk_weights_proj")
+            ):
                 continue
             wname = f"{mod_path}.weight"
             param = self._params.get(wname)
@@ -548,6 +574,22 @@ class _ShardAwareFusedWriter:
         module = handler["module"]
 
         if family == "gdn_merged":
+            replicated_shard_ids = getattr(module, "replicated_shard_ids", None)
+            if replicated_shard_ids:
+                output_dim = getattr(param, "output_dim", 0)
+                offset = 0
+                for shard_id, output_size in enumerate(module.output_sizes):
+                    if shard_id in replicated_shard_ids:
+                        output_size //= module.tp_size
+                    loaded_shard = tensor.narrow(output_dim, offset, output_size)
+                    module.weight_loader(param, loaded_shard, shard_id)
+                    offset += output_size
+                if offset != tensor.shape[output_dim]:
+                    raise ValueError(
+                        f"Fused GDN tensor has {tensor.shape[output_dim]} rows, "
+                        f"but registered shards consume {offset}"
+                    )
+                return True
             # MergedColumnParallelLinear.weight_loader(param, full_weight,
             # loaded_shard_id=None) splits the full fused tensor by
             # ``output_sizes`` ([q,k,v,z] / [b,a]) and TP-narrows each shard
@@ -556,23 +598,34 @@ class _ShardAwareFusedWriter:
             return True
 
         if family == "moe_w13":
-            # Fused vLLM w13 is [w1(gate) | w3(up)] on the intermediate dim.
-            # Feed each per-expert 2-D shard through the expert loader, which
-            # maps the (global) expert id to local and TP-narrows intermediate.
+            # Gated FusedMoE w13 is [w1(gate) | w3(up)] on the intermediate dim.
+            # Non-gated MoE (Nemotron-H) stores only w1 in w13_weight; splitting
+            # in half then loading shard_id=w3 does expert_data.narrow(shard_size)
+            # past the TP-local intermediate (e.g. 672/672 on Super TP=4).
             # NOTE: RoutedExperts.weight_loader routes by *substring* of
             # ``weight_name``; the model-weight copy branch only runs when it
             # contains "weight" (and none of scale/zero/offset/g_idx/shape), so
             # we pass the param's own name ("w13_weight") like vLLM's oracle.
-            inter = tensor.shape[1] // 2
+            moe_config = getattr(module, "moe_config", None)
+            gated = True if moe_config is None else bool(
+                getattr(moe_config, "is_act_and_mul", True)
+            )
             for expert_id in range(tensor.shape[0]):
-                module.weight_loader(
-                    param, tensor[expert_id, :inter, :],
-                    "w13_weight", "w1", expert_id, return_success=True,
-                )
-                module.weight_loader(
-                    param, tensor[expert_id, inter:, :],
-                    "w13_weight", "w3", expert_id, return_success=True,
-                )
+                if gated:
+                    inter = tensor.shape[1] // 2
+                    module.weight_loader(
+                        param, tensor[expert_id, :inter, :],
+                        "w13_weight", "w1", expert_id, return_success=True,
+                    )
+                    module.weight_loader(
+                        param, tensor[expert_id, inter:, :],
+                        "w13_weight", "w3", expert_id, return_success=True,
+                    )
+                else:
+                    module.weight_loader(
+                        param, tensor[expert_id],
+                        "w13_weight", "w1", expert_id, return_success=True,
+                    )
             return True
 
         if family == "moe_w2":
