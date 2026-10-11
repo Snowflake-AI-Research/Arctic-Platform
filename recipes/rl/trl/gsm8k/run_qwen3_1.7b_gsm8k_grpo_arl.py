@@ -122,9 +122,8 @@ def build_client(
 
     zero_stage = int(os.environ.get("ARCTIC_ZERO_STAGE", "1"))
     ds_config = {
-        # DeepSpeed asserts train_batch_size == micro_bsz * grad_accum * world_size, and world_size is the
-        # number of training GPUs. The server drives fwd/bwd with client-shaped batches, so these are just
-        # DeepSpeed bookkeeping -- keep micro/grad_accum at 1 and scale the global batch by training_gpus.
+        # TRL sends one forward of the global batch (GAS=1). DeepSpeed GAS splits that batch so each
+        # microbatch fits. train_batch_size must equal micro_bsz * gas * world_size.
         "train_micro_batch_size_per_gpu": 1,
         "train_batch_size": training_gpus * grad_accum_steps,
         "gradient_accumulation_steps": grad_accum_steps,
@@ -265,8 +264,18 @@ def main() -> None:
     ap.add_argument("--max-steps", type=int, default=int(os.environ.get("MAX_STEPS", "-1")))
     ap.add_argument("--num-train-epochs", type=float, default=float(os.environ.get("NUM_TRAIN_EPOCHS", "1")))
     ap.add_argument("--num-generations", type=int, default=int(os.environ.get("NUM_GEN", "8")))
-    ap.add_argument("--per-device-bsz", type=int, default=int(os.environ.get("PER_DEVICE_BSZ", "8")))
-    ap.add_argument("--grad-accum", type=int, default=int(os.environ.get("GRAD_ACCUM", "1")))
+    ap.add_argument(
+        "--per-device-bsz",
+        type=int,
+        default=int(os.environ.get("PER_DEVICE_BSZ", "8")),
+        help="Global batch TRL sends in one forward. TRL GAS stays 1.",
+    )
+    ap.add_argument(
+        "--grad-accum",
+        type=int,
+        default=int(os.environ.get("GRAD_ACCUM", "1")),
+        help="DeepSpeed engine GAS. Splits the TRL global batch so each microbatch fits.",
+    )
     ap.add_argument("--max-completion-length", type=int, default=int(os.environ.get("MAX_COMPLETION_LEN", "256")))
     ap.add_argument("--max-seq-len", type=int, default=int(os.environ.get("MAX_SEQ_LEN", "1024")))
     # num_prompts <= 0 => full GSM8K train split (7473 prompts).
@@ -433,11 +442,13 @@ def main() -> None:
         max_inflight = args.max_inflight_tasks
         if max_inflight < 0:
             # max_staleness=0 would otherwise infer inflight=0 and stall generate.
+            # One TRL step is one forward of the global batch; DeepSpeed GAS does not add forwards.
             horizon = max(args.max_staleness, 1)
-            max_inflight = horizon * args.per_device_bsz * args.grad_accum * world
+            max_inflight = horizon * args.per_device_bsz * world
         print(
             f"[e2e] max_staleness={args.max_staleness} max_inflight_tasks={max_inflight} "
             f"world={world} gpu_mem_util={args.gpu_mem_util} "
+            f"gbs={args.per_device_bsz} ds_gas={args.grad_accum} trl_gas=1 "
             f"zero_stage={os.environ.get('ARCTIC_ZERO_STAGE', '1')}",
             flush=True,
         )
@@ -446,7 +457,8 @@ def main() -> None:
             output_dir=out_dir,
             save_strategy="no",
             per_device_train_batch_size=args.per_device_bsz,
-            gradient_accumulation_steps=args.grad_accum,
+            # TRL GAS=1: one forward is the global batch. DeepSpeed GAS is args.grad_accum.
+            gradient_accumulation_steps=1,
             seed=args.seed,
             # Client is CPU-only; the local stub never computes, and bf16/fp16 defaults would trip CPU autocast
             # checks. Real training precision lives in the server's ds_config (bf16).
