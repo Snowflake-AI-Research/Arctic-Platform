@@ -28,7 +28,9 @@ import base64
 import contextlib
 import hashlib
 import json
+import os
 import time
+from pathlib import Path
 from typing import Any
 from typing import Iterator
 from urllib.parse import urlencode
@@ -300,6 +302,21 @@ async def _aread_json(resp: Any) -> Any:
         return None
 
 
+def job_create_payload(sub_job_configs: list[dict], comment: str | None) -> dict:
+    """Job-create body. An empty comment is omitted."""
+    payload = {"sub_job_configs": sub_job_configs}
+    if comment is not None and comment != "":
+        payload["comment"] = comment
+    return payload
+
+
+def record_job_id(path: str | None, job_id: str | None) -> None:
+    """Write ``job_id`` where a launcher can cancel it. A missing path does nothing."""
+    if path is None or path == "" or job_id is None or job_id == "":
+        return
+    Path(path).write_text(f"{job_id}\n")
+
+
 class CortexTransport(Transport):
     def __init__(self, config: ArcticClientConfig) -> None:
         self.config = config
@@ -324,9 +341,15 @@ class CortexTransport(Transport):
             # A mutating create: only retry when the request provably never landed,
             # so we can't spawn duplicate jobs (matches the neutrino client).
             created = self._send(
-                "POST", self._prefix, retry_on=_is_connect_error, json={"sub_job_configs": self._sub_job_configs()}
+                "POST",
+                self._prefix,
+                retry_on=_is_connect_error,
+                json=job_create_payload(self._sub_job_configs(), os.environ.get("CORTEX_JOB_COMMENT")),
             )
             self.job_id = created["job_id"]
+        # The id has to be on disk before the placement wait. A driver that dies
+        # during that wait otherwise leaves the GPUs with no id to cancel.
+        record_job_id(os.environ.get("ARCTIC_CORTEX_JOB_ID_FILE"), self.job_id)
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
         # JobHandles holds each role's sub-job token, so the client's op bodies

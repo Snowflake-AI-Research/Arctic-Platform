@@ -29,6 +29,9 @@ swaps the name in upstream's module for one that builds on
 
 Choosing the entrypoint *is* choosing Cortex, so there is no environment
 variable deciding it: the recipe names this module or it does not.
+
+:func:`main` runs SkyRL's own experiment. A recipe with a different one calls
+:func:`launch_driver` and passes the function that builds it.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ from typing import Optional
 
 import ray
 
-__all__ = ["main"]
+__all__ = ["launch_driver", "main", "patch_upstream"]
 
 
 def _create_cortex_client(config: Any, server_state: Any = None) -> Any:
@@ -78,6 +81,70 @@ def _patch_upstream() -> Any:
     install_cortex_driver_shims()
     upstream.create_arctic_rl_client = _create_cortex_client
     return upstream
+
+
+def patch_upstream() -> Any:
+    """Rebind SkyRL's client factory to the Cortex client in this process."""
+    return _patch_upstream()
+
+
+def _with_placement_timeout(cfg: Any, rl_config: Any) -> Any:
+    from arctic_platform.integrations._cortex_dispatch import placement_timeout
+
+    arctic = getattr(cfg.trainer, "arctic_rl", None)
+    startup = getattr(arctic, "startup_timeout", None) if arctic is not None else None
+    timeout = placement_timeout(rl_config.job_ready_timeout, startup)
+    if timeout == rl_config.job_ready_timeout:
+        return rl_config
+    return rl_config.model_copy(update=dict(job_ready_timeout=timeout))
+
+
+def launch_driver(
+    cfg: Any,
+    remote_fn: Any,
+    *,
+    num_cpus: float = 0,
+    env_prefixes: tuple[str, ...] = ("ARCTIC_", "WANDB_", "GIT_"),
+    env_keys: tuple[str, ...] = ("PATH", "HF_HOME", "HF_HUB_CACHE"),
+) -> None:
+    """Provision Cortex, then run ``remote_fn(cfg, reconnect_config)`` under Ray.
+
+    ``remote_fn`` has to call :func:`patch_upstream` itself. It runs in a fresh
+    worker, and the driver's rebind does not reach that process. Use
+    ``num_cpus=0`` when ``remote_fn`` submits more Ray tasks: a reserved CPU on
+    the coordinator deadlocks them.
+    """
+    import os
+    from pathlib import Path
+
+    from integrations.arctic_rl.config import build_rl_config
+    from loguru import logger
+    from skyrl.train.utils.utils import prepare_runtime_environment
+
+    from arctic_platform.integrations._cortex_dispatch import create_cortex_client
+
+    upstream = patch_upstream()
+    rl_config = _with_placement_timeout(cfg, build_rl_config(cfg))
+    logger.info("Provisioning Cortex training and sampling jobs")
+    pre_client = create_cortex_client(rl_config)
+    reconnect = pre_client.reconnect_config()
+    logger.info(f"Cortex jobs ready: training={pre_client.training_job_id} sampling={pre_client.sampling_job_id}")
+
+    env_vars = prepare_runtime_environment(cfg)
+    for key, value in os.environ.items():
+        if key.startswith(env_prefixes):
+            env_vars[key] = value
+    for key in env_keys:
+        value = os.environ.get(key)
+        if value is not None and value != "":
+            env_vars[key] = value
+    skyrl_root = str(Path(upstream.__file__).resolve().parents[2])
+    python_path = [skyrl_root, os.environ.get("PYTHONPATH", "")]
+    env_vars["PYTHONPATH"] = os.pathsep.join(part for part in python_path if part != "")
+    runtime_env = dict(env_vars=env_vars)
+    remote = ray.remote(num_cpus=num_cpus)(remote_fn)
+    ray.init(num_gpus=0, runtime_env=runtime_env, ignore_reinit_error=True)
+    ray.get(remote.options(runtime_env=runtime_env).remote(cfg, reconnect))
 
 
 @ray.remote(num_cpus=1)

@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
 """A Cortex client behind the surface SkyRL's Arctic integration expects.
 
 Translates the ``arctic_platform.rl`` config SkyRL hands us into a unified
@@ -36,7 +33,43 @@ from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payloa
 from arctic_platform.integrations._cortex_shared import zero_logprobs_like
 from arctic_platform.rl.config import ArcticRLClientConfig as _LegacyConfig
 
-__all__ = ["create_cortex_client"]
+__all__ = ["create_cortex_client", "legacy_max_seq_len", "placement_timeout"]
+
+# ArcticClientConfig.max_seq_len. SkyRL writes vLLM max_model_len for every
+# recipe, including GSM8K (prompt 512 + response 1024). to_cortex drops that
+# vLLM field and uses this one, so forwarding a shorter length would shrink the
+# GSM8K job. Only a context longer than the default has to be set.
+_DEFAULT_MAX_SEQ_LEN = 8192
+
+
+def legacy_max_seq_len(legacy: Any) -> int | None:
+    """Sequence length to set on the unified client, or ``None`` to keep 8192.
+
+    vLLM's ``max_model_len`` bounds every sampled conversation, so it also bounds
+    every training sequence. The training ``max_length`` is only the fallback.
+    """
+    vllm = getattr(legacy, "vllm_config", None) or {}
+    training = getattr(legacy, "training_config", None) or {}
+    length = vllm.get("max_model_len")
+    if length is None:
+        length = training.get("max_length")
+    if length is None:
+        return None
+    length = int(length)
+    if length <= _DEFAULT_MAX_SEQ_LEN:
+        return None
+    return length
+
+
+def placement_timeout(job_ready_timeout: float, startup_timeout: float | None) -> float:
+    """SkyRL's ``startup_timeout`` when it is longer than the client default.
+
+    The client waits ``job_ready_timeout`` (600s). SkyRL's own knob defaults
+    lower than that, so a shorter value must not shrink GSM8K's wait.
+    """
+    if startup_timeout is not None and float(startup_timeout) > float(job_ready_timeout):
+        return float(startup_timeout)
+    return float(job_ready_timeout)
 
 
 def _to_unified_config(legacy: _LegacyConfig):
@@ -75,6 +108,9 @@ def _to_unified_config(legacy: _LegacyConfig):
         v = getattr(legacy, k, None)
         if v is not None:
             fields[k] = v
+    max_seq_len = legacy_max_seq_len(legacy)
+    if max_seq_len is not None:
+        fields["max_seq_len"] = max_seq_len
     return U(**fields)
 
 
