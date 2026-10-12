@@ -15,8 +15,10 @@
 """Bring-your-own-harness endpoint for SkyRL on Cortex.
 
 A harness keeps its own loop. It points its OpenAI client at
-:class:`arctic_platform.integrations.harness.proxy.ChatCompletionsProxy` and
-returns token events plus a reward. :class:`HarnessGenerator` turns that into
-a SkyRL batch. OpenHands, OpenCode, and Codex are clients. Import the
-submodules directly so this package does not load aiohttp or Ray.
+:class:`arctic_platform.integrations.harness.proxy.ChatCompletionsProxy`.
+:class:`HarnessGenerator` calls ``rollout(request)`` and stitches the returned
+token events and reward into a SkyRL batch. The request carries the row and
+the per-rollout URL. The harness owns the agent, the tools, and the grader.
+OpenHands, OpenCode, and Codex are clients. Import the submodules directly so
+this package does not load aiohttp.
 """

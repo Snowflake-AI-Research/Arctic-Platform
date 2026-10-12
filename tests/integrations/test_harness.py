@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import json
 
+from arctic_platform.integrations.harness.generator import RolloutRequest
 from arctic_platform.integrations.harness.generator import _detail_means
 from arctic_platform.integrations.harness.generator import _invoke
+from arctic_platform.integrations.harness.generator import trajectory_payload
 from arctic_platform.integrations.harness.loss_mask import assistant_loss_mask
 from arctic_platform.integrations.harness.loss_mask import mask_if_exhausted
 from arctic_platform.integrations.harness.proxy import ChatCompletionsProxy
@@ -102,14 +104,45 @@ def test_training_row_uses_the_harness_reward():
     assert exhausted["loss_mask"] == [0] * len(exhausted["response_ids"])
 
 
+def _request() -> RolloutRequest:
+    return RolloutRequest(
+        env_extra=dict(instance_id="inst"),
+        trajectory_id=None,
+        routing_key="route-1",
+        base_url="http://127.0.0.1:9/r/route-1/v1",
+        phase="train",
+        global_step=1,
+    )
+
+
 def test_one_failed_call_does_not_drop_the_batch():
-    def boom(*_args):
+    def boom(_request):
         raise RuntimeError("sandbox")
 
-    row = _invoke(boom, dict(reward=0.0), ({}, "model", "url", 10, "/tmp", "train", "route-1"))
+    row = _invoke(boom, dict(reward=0.0), _request())
     assert row["reward"] == 0.0
     assert row["routing_key"] == "route-1"
     assert "sandbox" in row["error"]
+
+
+def test_rollout_receives_the_request():
+    def rollout(request: RolloutRequest):
+        assert request.base_url.endswith("/r/route-1/v1")
+        return dict(messages=[], token_messages=[], reward=1.0, reward_detail=dict(score=1.0), exhausted=False)
+
+    row = _invoke(rollout, dict(reward=0.0), _request())
+    assert row["reward"] == 1.0
+
+
+def test_trajectory_keeps_harness_fields():
+    payload = trajectory_payload(
+        "inst",
+        dict(reward=2.0, reward_detail=dict(reward=2.0)),
+        dict(messages=[dict(content="hi", prompt_token_ids=[1])], locations=[dict(file="a.py")], reward=2.0),
+    )
+    assert payload["locations"] == [dict(file="a.py")]
+    assert payload["messages"] == [dict(content="hi")]
+    assert "reward" not in payload
 
 
 def test_reward_means_follow_the_keys_the_harness_returns():

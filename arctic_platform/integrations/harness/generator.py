@@ -14,9 +14,9 @@
 # limitations under the License.
 """SkyRL generator for a harness that calls the chat endpoint.
 
-The harness function owns the agent and the reward. This class batches it,
-stitches tokens, and writes trajectories. It does not import a harness
-or Ray. Rollouts in one batch run on threads.
+The harness function owns the agent and the reward. This class calls
+``rollout(request)`` for each row, stitches tokens, and writes trajectories.
+It does not import a harness. Rollouts in one batch run on threads.
 """
 
 from __future__ import annotations
@@ -24,24 +24,51 @@ from __future__ import annotations
 import asyncio
 import json
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from typing import Callable
 
 from arctic_platform.integrations.harness.tokens import training_row
 
-RolloutFn = Callable[..., dict[str, Any]]
-FinalizeFn = Callable[[dict[str, Any], Any, str, int], dict[str, Any]]
-
 _HIDDEN = {"prompt_token_ids", "response_token_ids"}
+_PRIVATE = {
+    "messages",
+    "token_messages",
+    "exhausted",
+    "reward",
+    "reward_detail",
+    "error",
+    "routing_key",
+}
 
 
-def _invoke(rollout: RolloutFn, error_detail: dict[str, Any], args: tuple) -> dict[str, Any]:
+@dataclass(frozen=True)
+class RolloutRequest:
+    """One SkyRL row and the chat URL for that rollout.
+
+    ``env_extra`` is the dataset row. ``base_url`` is
+    ``ChatCompletionsProxy.url_for(routing_key)``. The harness reads whatever
+    else it needs from its own closure.
+    """
+
+    env_extra: dict[str, Any]
+    trajectory_id: Any
+    routing_key: str
+    base_url: str
+    phase: str
+    global_step: int
+
+
+RolloutFn = Callable[[RolloutRequest], dict[str, Any]]
+FinalizeFn = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+def _invoke(rollout: RolloutFn, error_detail: dict[str, Any], request: RolloutRequest) -> dict[str, Any]:
     """Call a task rollout. One failure becomes a zero-reward row, not a dead batch."""
     try:
-        return rollout(*args)
+        return rollout(request)
     except Exception:
-        routing_key = args[6] if len(args) >= 7 else ""
         return dict(
             messages=[],
             token_messages=[],
@@ -49,7 +76,7 @@ def _invoke(rollout: RolloutFn, error_detail: dict[str, Any], args: tuple) -> di
             reward=0.0,
             reward_detail=dict(error_detail),
             error=traceback.format_exc(),
-            routing_key=routing_key,
+            routing_key=request.routing_key,
         )
 
 
@@ -72,26 +99,21 @@ class HarnessGenerator:
 
     def __init__(
         self,
-        generator_cfg: Any,
         tokenizer: Any,
         model_name: str,
         proxy: Any,
-        workspace_root: str,
         traj_dir: str,
         rollout: RolloutFn,
         finalize: FinalizeFn | None = None,
         error_detail: dict[str, Any] | None = None,
     ) -> None:
-        self._cfg = generator_cfg
         self._tokenizer = tokenizer
         self._model_name = model_name
         self._proxy = proxy
-        self._workspace_root = workspace_root
         self._traj_dir = traj_dir
         self._rollout = rollout
         self._finalize = finalize
         self._error_detail = dict(error_detail or dict(reward=0.0))
-        self._litellm_model = "openai/" + model_name
 
     async def generate(self, input_batch: dict) -> dict:
         from skyrl.train.generators.utils import get_rollout_metrics
@@ -100,31 +122,29 @@ class HarnessGenerator:
         phase = metadata.training_phase
         if not isinstance(phase, str):
             phase = getattr(phase, "value", str(phase))
-        max_turns = int(self._cfg.max_turns)
-        calls = []
-        for instance, trajectory in zip(input_batch["env_extras"], input_batch["trajectory_ids"]):
+        requests = []
+        for env_extra, trajectory in zip(input_batch["env_extras"], input_batch["trajectory_ids"]):
             routing_key = f"step{metadata.global_step}-{phase}-{trajectory.to_string()}"
-            calls.append(
-                (
-                    instance,
-                    self._litellm_model,
-                    self._proxy.url_for(routing_key),
-                    max_turns,
-                    self._workspace_root,
-                    phase,
-                    routing_key,
+            requests.append(
+                RolloutRequest(
+                    env_extra=env_extra,
+                    trajectory_id=trajectory,
+                    routing_key=routing_key,
+                    base_url=self._proxy.url_for(routing_key),
+                    phase=phase,
+                    global_step=int(metadata.global_step),
                 )
             )
         results = await asyncio.gather(
-            *[asyncio.to_thread(_invoke, self._rollout, self._error_detail, args) for args in calls]
+            *[asyncio.to_thread(_invoke, self._rollout, self._error_detail, request) for request in requests]
         )
         rows = []
         reward_details = []
-        for result, instance, trajectory in zip(results, input_batch["env_extras"], input_batch["trajectory_ids"]):
-            scored = self._score(result, max_turns)
+        for result, env_extra, trajectory in zip(results, input_batch["env_extras"], input_batch["trajectory_ids"]):
+            scored = self._score(result)
             rows.append(scored)
             reward_details.append(scored["reward_detail"])
-            self._write_trajectory(metadata, phase, instance, trajectory, result, scored)
+            self._write_trajectory(metadata, phase, env_extra, trajectory, result, scored)
         metrics = get_rollout_metrics(
             [row["response_ids"] for row in rows],
             [row["reward"] for row in rows],
@@ -143,31 +163,38 @@ class HarnessGenerator:
             is_last_step=None,
         )
 
-    def _score(self, result: dict, max_turns: int) -> dict[str, Any]:
+    def _score(self, result: dict) -> dict[str, Any]:
         if self._finalize is not None:
-            result = self._finalize(result, self._tokenizer, self._model_name, max_turns)
+            result = self._finalize(result)
         return training_row(result, self._tokenizer, self._model_name)
 
     def _write_trajectory(
-        self, metadata: Any, phase: str, instance: dict, trajectory: Any, result: dict, scored: dict
+        self, metadata: Any, phase: str, env_extra: dict, trajectory: Any, result: dict, scored: dict
     ) -> None:
         if self._traj_dir == "":
             return
         directory = Path(self._traj_dir) / f"step_{metadata.global_step}" / phase
         directory.mkdir(parents=True, exist_ok=True)
         repetition = getattr(trajectory, "repetition_id", 0)
-        instance_id = instance.get("instance_id", "unknown")
+        instance_id = env_extra.get("instance_id", "unknown")
         if result.get("error"):
             path = directory / f"{instance_id}_{repetition}.error"
             path.write_text(result["error"], encoding="utf-8")
             return
         path = directory / f"{instance_id}_{repetition}.json"
-        payload = dict(
-            instance_id=instance_id,
-            total_reward=scored["reward"],
-            reward_dict=scored["reward_detail"],
-            messages=_public_messages(result.get("messages") or []),
-        )
-        if "locations" in result:
-            payload["locations"] = result.get("locations")
+        payload = trajectory_payload(instance_id, scored, result)
         path.write_text(json.dumps(payload, default=str), encoding="utf-8")
+
+
+def trajectory_payload(instance_id: str, scored: dict, result: dict) -> dict[str, Any]:
+    """JSON for one rollout. Extra keys from the harness are kept as they are."""
+    payload = dict(
+        instance_id=instance_id,
+        total_reward=scored["reward"],
+        reward_dict=scored["reward_detail"],
+        messages=_public_messages(result.get("messages") or []),
+    )
+    for key, value in result.items():
+        if key not in _PRIVATE and key not in payload:
+            payload[key] = value
+    return payload
