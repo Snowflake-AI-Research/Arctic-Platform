@@ -87,8 +87,10 @@ constrains what runs correctly here:
   presents the client surface SkyRL expects over `AsyncArcticRLClient`.
 * **Payload lowering** —
   [`arctic_platform.integrations._cortex_shared`](../arctic_platform/integrations/_cortex_shared.py)
-  reshapes SkyRL's batch into Cortex's wire format and left-aligns each row,
-  which the server's microbatch packer requires.
+  reshapes SkyRL's batch into Cortex's wire format. Packed rows are
+  left-aligned, which the server's microbatch packer requires. A ZoRRo batch
+  keeps the verl ``[PAD|prompt|response|PAD]`` layout and sends
+  ``pad_token_id`` on context so the unpacked worker can unpad.
 * **SkyRL driver shim** —
   [`arctic_platform.integrations.skyrl`](../arctic_platform/integrations/skyrl/__init__.py)
   provides `install_cortex_driver_shims()` to patch out SkyRL's

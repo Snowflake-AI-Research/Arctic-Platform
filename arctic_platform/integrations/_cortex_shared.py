@@ -37,6 +37,21 @@ _DEFAULT_PROC_CONFIG: dict[str, Any] = {
     "entropy_coeff": 0.0,
 }
 
+# Per-call ZoRRo scalars. They belong on Cortex context (worker meta), not kwargs.
+_ZORRO_CONTEXT_SCALARS = (
+    "zorro_train_enable",
+    "max_prompt_len",
+    "max_response_len",
+    "pad_token_id",
+    "rollout_n",
+    "temperature",
+    "epsilon_low",
+    "epsilon_high",
+    "grad_accum_steps",
+    "global_batch_size",
+    "batch_num_tokens",
+)
+
 
 def zero_logprobs_like(batch: dict) -> torch.Tensor:
     """A ``[B, T]`` float32 zero tensor sized from ``batch``'s ``input_ids``.
@@ -138,8 +153,11 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
     Requires ``loss_mask`` or ``response_mask``; falling back to
     ``attention_mask`` would train on prompt tokens.
 
-    Rows are left-aligned on the way out (see :func:`_left_align_batch`) --
-    Cortex's packer rejects any other layout.
+    Non-ZoRRo rows are left-aligned on the way out (see
+    :func:`_left_align_batch`) -- Cortex's packer rejects any other layout.
+    ZoRRo batches keep verl's ``[PAD|prompt|response|PAD]`` rows: the patched
+    forward splits each row at ``max_prompt_len``. ``pad_token_id`` rides on
+    context so the unpacked worker can unpad.
     """
     import torch
 
@@ -176,7 +194,12 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
     advantages = tensors.pop("advantages", None)
     if advantages is None:
         raise ValueError("cortex fwd_bwd requires 'advantages' [B, S]")
-    tensors.pop("old_log_probs", None)
+    old_log_probs = tensors.pop("old_log_probs", None)
+
+    if meta.get("zorro_train_enable"):
+        return _to_cortex_zorro_payload(
+            tensors, meta, processing_in, input_ids, attention_mask, advantages, loss_mask, old_log_probs
+        )
 
     forwarded = {"input_ids": input_ids}
     for k in ("position_ids", "labels"):
@@ -218,4 +241,61 @@ def to_cortex_fwd_bwd_payload(batch: dict, *, processing: dict | None = None) ->
         "kwargs": kwargs_out,
         "context": context,
         "processing": {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": proc_config},
+    }
+
+
+def _to_cortex_zorro_payload(
+    tensors: dict,
+    meta: dict,
+    processing_in: dict | None,
+    input_ids,
+    attention_mask,
+    advantages,
+    loss_mask,
+    old_log_probs,
+) -> dict:
+    """ZoRRo wire shape, the same contract the TRL Cortex client sends.
+
+    ``prompts``, ``response_mask`` and ``old_log_probs`` are batch tensors: left
+    on context they would land on worker meta and ``run_pipeline`` would never
+    enter the ZoRRo path.
+    """
+    import torch
+
+    prompts = tensors.get("prompts")
+    if not torch.is_tensor(prompts) or prompts.ndim != 2 or prompts.shape[1] == 0:
+        raise ValueError("ZoRRo fwd_bwd requires batch['prompts'] with width max_prompt_len")
+    if "global_batch_size" not in meta:
+        raise ValueError("ZoRRo fwd_bwd requires meta['global_batch_size']")
+    response_mask = tensors.get("response_mask", loss_mask)
+    for name, value in (("response_mask", response_mask), ("old_log_probs", old_log_probs)):
+        if not torch.is_tensor(value) or tuple(value.shape) != tuple(attention_mask.shape):
+            raise ValueError(f"ZoRRo fwd_bwd requires batch['{name}'] with the same shape as attention_mask")
+
+    kwargs_out: dict[str, Any] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "prompts": prompts,
+        "response_mask": response_mask,
+        "old_log_probs": old_log_probs,
+    }
+    if "position_ids" in tensors:
+        kwargs_out["position_ids"] = tensors["position_ids"]
+
+    caller_config = dict((processing_in or {}).get("config") or {})
+    proc_config: dict[str, Any] = {**_DEFAULT_PROC_CONFIG, **caller_config}
+    for k in ("global_batch_size", "batch_num_tokens"):
+        if k not in proc_config and k in meta:
+            proc_config[k] = int(meta[k])
+
+    context: dict[str, Any] = {"input_ids": input_ids, "advantages": advantages, "loss_mask": loss_mask}
+    for key in _ZORRO_CONTEXT_SCALARS:
+        if key in meta:
+            context[key] = meta[key]
+
+    return {
+        "args": (),
+        "kwargs": kwargs_out,
+        "context": context,
+        "processing": {"post": ["compute_logprobs"], "loss_fn": "verl_grpo", "config": proc_config},
     }

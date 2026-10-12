@@ -639,33 +639,48 @@ class TestCortexSharedHelper:
 
     def test_forwards_onprem_meta_scalars_onto_context(self):
         """On-prem reads max_prompt_len and zorro_train_enable from meta.
-        Cortex must receive those same client values on context."""
+        Cortex must receive those same client values on context, including
+        pad_token_id, and must not left-align the verl row layout."""
         import torch
 
         from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
 
-        ids = torch.zeros((2, 10), dtype=torch.int64)
+        ids = torch.tensor([[0, 0, 1, 2, 3, 4], [0, 5, 6, 7, 8, 9]])
+        attn = torch.tensor([[0, 0, 1, 1, 1, 1], [0, 1, 1, 1, 1, 1]])
+        prompts = torch.tensor([[0, 0, 1, 2], [0, 5, 6, 7]])
+        old = torch.zeros((2, 6))
+        response_mask = torch.tensor([[0, 0, 0, 0, 1, 1], [0, 0, 0, 0, 1, 1]])
         out = to_cortex_fwd_bwd_payload(
             {
                 "batch": {
                     "input_ids": ids,
-                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
-                    "advantages": torch.zeros((2, 10)),
-                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "attention_mask": attn,
+                    "advantages": torch.zeros((2, 6)),
+                    "response_mask": response_mask,
+                    "prompts": prompts,
+                    "old_log_probs": old,
                 },
                 "meta": {
-                    "max_prompt_len": 6,
+                    "max_prompt_len": 4,
                     "zorro_train_enable": True,
-                    "max_response_len": 4,
+                    "max_response_len": 2,
+                    "pad_token_id": 0,
+                    "global_batch_size": 2,
                     "dp_size": 8,
                 },
             },
         )
-        assert out["context"]["max_prompt_len"] == 6
+        assert out["context"]["max_prompt_len"] == 4
         assert out["context"]["zorro_train_enable"] is True
-        assert out["context"]["max_response_len"] == 4
+        assert out["context"]["max_response_len"] == 2
+        assert out["context"]["pad_token_id"] == 0
         assert "dp_size" not in out["context"]
         assert "dp_size" not in out["processing"]["config"]
+        assert torch.equal(out["kwargs"]["input_ids"], ids)
+        assert torch.equal(out["kwargs"]["prompts"], prompts)
+        assert torch.equal(out["kwargs"]["old_log_probs"], old)
+        assert "old_log_probs" not in out["context"]
+        assert out["processing"]["loss_fn"] == "verl_grpo"
 
     def test_rejects_zorro_meta_that_is_missing_the_keys_the_worker_indexes(self):
         """run_pipeline and the ZoRRo load balancer subscript these keys."""
