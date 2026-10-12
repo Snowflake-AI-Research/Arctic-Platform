@@ -40,9 +40,23 @@ def _tp2_block():
     raise AssertionError("vllm_child.py has no `if _tp >= 2:` block")
 
 
-def _environ_assignments(tree):
+def _is_multinode_guard(node):
+    return (isinstance(node, ast.If) and isinstance(node.test, ast.Call)
+            and isinstance(node.test.func, ast.Name) and node.test.func.id == "_is_multinode")
+
+
+def _walk_single_pod(tree):
+    """``ast.walk`` minus ``if _is_multinode():`` bodies, which matched_baseline does not cover."""
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(c for c in ast.iter_child_nodes(node) if not _is_multinode_guard(c))
+
+
+def _environ_assignments(tree, walk=_walk_single_pod):
     found = {}
-    for sub in ast.walk(tree):
+    for sub in walk(tree):
         if isinstance(sub, ast.Assign):
             for tgt in sub.targets:
                 if (isinstance(tgt, ast.Subscript) and isinstance(tgt.value, ast.Attribute)
@@ -54,7 +68,7 @@ def _environ_assignments(tree):
 
 def _environ_setdefaults(tree):
     found = {}
-    for sub in ast.walk(tree):
+    for sub in _walk_single_pod(tree):
         if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
                 and sub.func.attr == "setdefault" and isinstance(sub.func.value, ast.Attribute)
                 and sub.func.value.attr == "environ" and len(sub.args) == 2
@@ -78,6 +92,15 @@ def test_env_matches_the_childs_tp2_block():
     block = _tp2_block()
     assert _environ_assignments(block) == mb.COLLECTIVE_ENV
     assert _environ_setdefaults(block) == mb.COLLECTIVE_ENV_DEFAULTS
+
+
+def test_shared_experts_stream_is_off_only_across_pods():
+    guards = [n for n in ast.walk(_tp2_block()) if _is_multinode_guard(n)]
+    across_pods = {}
+    for guard in guards:
+        across_pods.update(_environ_assignments(guard, walk=ast.walk))
+    assert across_pods.get("VLLM_DISABLE_SHARED_EXPERTS_STREAM") == "1"
+    assert "VLLM_DISABLE_SHARED_EXPERTS_STREAM" not in mb.COLLECTIVE_ENV
 
 
 def test_pass_config_matches_the_childs_tp2_block():

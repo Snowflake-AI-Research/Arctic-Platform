@@ -226,9 +226,9 @@ in the child.  All of it degrades to a no-op at TP=1.
   `CUDA_VISIBLE_DEVICES` and sets `SEMIP_GPU_MAP`; TP=1 pins the single
   GPU as device 0 (unchanged).
 - **TP-only engine config** (`init`, `_tp >= 2`): disables fused
-  allreduce+RMS, NVLS, symmetric-memory allreduce and the MoE
-  shared-experts stream, all of which hold state CRIU cannot serialize
-  or complicate graph capture.
+  allreduce+RMS, NVLS and symmetric-memory allreduce, which hold state
+  CRIU cannot serialize. The MoE shared-experts stream is disabled only
+  for a multi-node engine, whose restore recaptures the graphs.
 - **`_destroy_nccl` / `_reinit_nccl`**: NCCL abort/rebuild; both
   early-out when `_semip_tp_size(worker) <= 1`.
 - **`_prepare_worker_dump`**: per-worker CRIU dump prep (FD close,

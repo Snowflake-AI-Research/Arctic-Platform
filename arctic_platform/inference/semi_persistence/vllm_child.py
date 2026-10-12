@@ -3605,8 +3605,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
 
                 # TP>1 only: steer the collective path onto shapes that survive
                 # a checkpoint.  Fused allreduce+RMS and NVLS/symmetric-memory
-                # allreduce keep state CRIU cannot serialize, and the MoE
-                # shared-experts side stream complicates graph capture.
+                # allreduce keep state CRIU cannot serialize.
                 _tp = int(vllm_config.get("tensor_parallel_size", 1) or 1)
                 if _tp >= 2:
                     _cc = vllm_config.get("compilation_config")
@@ -3617,7 +3616,12 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     vllm_config["compilation_config"] = _cc
                     os.environ["NCCL_NVLS_ENABLE"] = "0"
                     os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
-                    os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
+                    # The MoE shared-experts side stream has to be off where the
+                    # restore recaptures the graphs (multi-node): a recapture with
+                    # it on failed with cudaErrorStreamCaptureUnjoined. A
+                    # single-pod restore rebinds the graphs it dumped instead.
+                    if _is_multinode():
+                        os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
                     # FlashInfer allreduce has to be off for the same reason,
                     # and it is the rebind's load-bearing assumption rather
                     # than a preference: `ca_graph_rebind` finds the pointers

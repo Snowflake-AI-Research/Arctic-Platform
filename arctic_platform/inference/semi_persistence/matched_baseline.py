@@ -2,8 +2,9 @@
 
 At ``tensor_parallel_size >= 2`` a semi_p engine does not run vLLM's stock
 collective path. ``vllm_child`` pins NCCL NVLS, symmetric-memory and FlashInfer
-all-reduce off, turns off the fused all-reduce + RMSNorm pass and the MoE
-shared-experts side stream, and enables sleep mode; ``Instance`` runs every TP
+all-reduce off, turns off the fused all-reduce + RMSNorm pass, and enables
+sleep mode (it also turns off the MoE shared-experts side stream, but only
+for a pod-spanning engine, which this module does not cover); ``Instance`` runs every TP
 worker as ``_semip_worker.SemipGPUWorker``, which refuses the FlashInfer
 all-reduce workspace and forces CustomAllreduce's copy path while the CUDA
 graphs are captured. Each of those changes a reduction order, so a stock plain
@@ -32,7 +33,6 @@ MATCH_ENV = "SEMIP_MATCH_COLLECTIVES"
 COLLECTIVE_ENV = {
     "NCCL_NVLS_ENABLE": "0",
     "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
-    "VLLM_DISABLE_SHARED_EXPERTS_STREAM": "1",
     "VLLM_ALLREDUCE_USE_FLASHINFER": "0",
 }
 # ... and defaulted, so extra_env can still override it.

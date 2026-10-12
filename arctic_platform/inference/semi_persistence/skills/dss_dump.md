@@ -221,8 +221,9 @@ Five TP>1 facts that do bear on the surrounding code, none of which is a step:
    the restore neither needs nor sees it. Section 4's projection must not add it.
 2. **The TP>1 collective-path flags: covered at TP2, an open item above it.**
    `vllm_child.py:1611-1621` disables `fuse_allreduce_rms` and sets
-   `NCCL_NVLS_ENABLE=0`, `VLLM_ALLREDUCE_USE_SYMM_MEM=0`,
-   `VLLM_DISABLE_SHARED_EXPERTS_STREAM=1` when `tensor_parallel_size >= 2`, and
+   `NCCL_NVLS_ENABLE=0`, `VLLM_ALLREDUCE_USE_SYMM_MEM=0` when
+   `tensor_parallel_size >= 2` (plus `VLLM_DISABLE_SHARED_EXPERTS_STREAM=1`
+   for a multi-node engine), and
    in this library version it does so before its own `from vllm import LLM`
    (line 1667), so the ordering looks sufficient on paper.
 
