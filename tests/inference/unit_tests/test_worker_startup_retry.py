@@ -5,7 +5,7 @@ import types
 if "vllm" not in sys.modules:
     vllm_module = types.ModuleType("vllm")
     vllm_module.__path__ = []
-    vllm_module.__version__ = "0.30.0"
+    vllm_module.__version__ = "0.31.0"
     scheduler_module = types.ModuleType("vllm.v1.core.sched.scheduler")
 
     def check_stop(*args, **kwargs):
@@ -40,7 +40,7 @@ from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifec
 def _install_fake_vllm(monkeypatch, async_llm_cls):
     vllm_mod = types.ModuleType("vllm")
     vllm_mod.__path__ = []
-    vllm_mod.__version__ = "0.30.0"
+    vllm_mod.__version__ = "0.31.0"
     plugins_mod = types.ModuleType("vllm.plugins")
     plugins_mod.load_general_plugins = lambda: None
     v1_mod = types.ModuleType("vllm.v1")
@@ -108,7 +108,9 @@ def test_initialize_retries_vllm_engine_startup_on_address_in_use(monkeypatch):
                 structured_outputs_config=types.SimpleNamespace(
                     enable_in_reasoning=False
                 ),
-                model_config=types.SimpleNamespace(skip_tokenizer_init=True),
+                model_config=types.SimpleNamespace(
+                    skip_tokenizer_init=True, architecture="LlamaForCausalLM"
+                ),
             )
 
     class FakeAsyncLLM:
@@ -163,7 +165,9 @@ def test_initialize_drops_reasoning_parser_when_tokenizer_lacks_think_tokens(
                 structured_outputs_config=types.SimpleNamespace(
                     enable_in_reasoning=False
                 ),
-                model_config=types.SimpleNamespace(skip_tokenizer_init=True),
+                model_config=types.SimpleNamespace(
+                    skip_tokenizer_init=True, architecture="LlamaForCausalLM"
+                ),
             )
 
     class FakeAsyncLLM:
