@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import types
 from typing import Any
@@ -583,9 +584,50 @@ def head_parallel_gated_delta_rule(
     return output, None
 
 
+_KERNEL_DISPATCH = {
+    "causal_conv1d_fn": (
+        "causal_conv1d_fn",
+        "causal_conv1d",
+        "causal_conv1d_fn",
+    ),
+    "chunk_gated_delta_rule": (
+        "torch_chunk_gated_delta_rule",
+        "fla.ops.gated_delta_rule",
+        "chunk_gated_delta_rule",
+    ),
+}
+
+
+def _resolve_gated_delta_net_kernel(module: nn.Module, attribute: str):
+    kernel = getattr(module, attribute, None) or getattr(module, f"_{attribute}", None)
+    if kernel is not None:
+        return kernel
+
+    dispatch_name, package_name, package_attribute = _KERNEL_DISPATCH[attribute]
+    implementation = importlib.import_module(type(module).__module__)
+    dispatch = getattr(implementation, dispatch_name, None)
+    if dispatch is None or not hasattr(dispatch, "__wrapped__"):
+        return dispatch
+    try:
+        package = importlib.import_module(package_name)
+    except ImportError:
+        return dispatch
+    return getattr(package, package_attribute, dispatch)
+
+
+def _has_gated_delta_net_kernel_slot(module: nn.Module, attribute: str) -> bool:
+    if hasattr(module, attribute) or hasattr(module, f"_{attribute}"):
+        return True
+    dispatch_name = _KERNEL_DISPATCH[attribute][0]
+    implementation = importlib.import_module(type(module).__module__)
+    return hasattr(implementation, dispatch_name)
+
+
 def _is_gated_delta_net_module(module: nn.Module) -> bool:
-    return all(
-        hasattr(module, attribute) for attribute in ("causal_conv1d_fn", "chunk_gated_delta_rule", "conv_kernel_size")
+    return (
+        hasattr(module, "conv_kernel_size")
+        and _has_gated_delta_net_kernel_slot(module, "causal_conv1d_fn")
+        and _has_gated_delta_net_kernel_slot(module, "chunk_gated_delta_rule")
     )
 
 
@@ -632,8 +674,8 @@ def _adapt_gated_delta_net_module(module: nn.Module, process_group) -> None:
             f"full temporal-core head parallelism: {missing}"
         )
 
-    original_causal_convolution = module.causal_conv1d_fn
-    original_gated_delta_rule = module.chunk_gated_delta_rule
+    original_causal_convolution = _resolve_gated_delta_net_kernel(module, "causal_conv1d_fn")
+    original_gated_delta_rule = _resolve_gated_delta_net_kernel(module, "chunk_gated_delta_rule")
     num_key_heads, num_value_heads = _module_head_counts(module)
     world_size = dist.get_world_size(process_group)
     if num_key_heads % world_size or num_value_heads % world_size:
