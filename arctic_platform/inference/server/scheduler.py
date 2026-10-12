@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 import ray
+from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
 
 from arctic_platform.inference.server.metrics import (
@@ -99,14 +100,14 @@ RoutingFn = Callable[[_Request, list[WorkerState]], int]
 ConcurrencyFn = Callable[[list[WorkerState]], list[int]]
 
 
-def _compute_prefix_hash(prompt) -> int:
+def _compute_prefix_hash(prompt: str | list[int] | ChatPrompt) -> int:
     """Hash the full prompt for affinity routing."""
+    if isinstance(prompt, ChatPrompt):
+        # Already validated as plain JSON.
+        return hash(json.dumps(asdict(prompt), sort_keys=True))
     if isinstance(prompt, str):
         return hash(prompt)
-    if isinstance(prompt, list):
-        return hash(tuple(prompt))
-    # A chat prompt, already validated as plain JSON.
-    return hash(json.dumps(asdict(prompt), sort_keys=True))
+    return hash(tuple(prompt))
 
 
 def least_loaded_routing(request: _Request, workers: list[WorkerState]) -> int:

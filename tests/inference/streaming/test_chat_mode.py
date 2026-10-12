@@ -1081,6 +1081,24 @@ def test_chat_prompts_hash_by_content():
     assert _compute_prefix_hash(chat("a")) != _compute_prefix_hash(chat("b"))
 
 
+class _TokenTensor:
+    """A 1-D tensor stand-in: /generate also takes token IDs as a tensor."""
+
+    def __init__(self, token_ids):
+        self.token_ids = token_ids
+
+    def __iter__(self):
+        return iter(self.token_ids)
+
+    def __len__(self):
+        return len(self.token_ids)
+
+
+@pytest.mark.parametrize("prompt", [_TokenTensor([1, 2, 3]), (1, 2, 3)])
+def test_other_token_sequences_still_hash_by_their_tokens(prompt):
+    assert _compute_prefix_hash(prompt) == _compute_prefix_hash([1, 2, 3])
+
+
 def test_validated_chat_prompt_is_a_copy():
     messages = [{"role": "user", "content": "a"}]
     prompt = validate_chat_prompt(ChatPrompt(messages))
