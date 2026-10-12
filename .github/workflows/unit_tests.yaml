@@ -69,3 +69,23 @@ jobs:
         run: |
           PYTHONPATH=$PWD:$PWD/tests/inference/streaming python -m pytest -v -m "not gpu" \
             -c tests/inference/streaming/pytest.ini tests/inference/streaming
+      # These files pass with the CPU torch, ray, and pydantic this job already
+      # installs, and without vLLM. The rest of tests/inference stays ignored:
+      # some import vLLM, some require CUDA, and several server tests fail
+      # while importing ChatModel under the pydantic this job resolves.
+      # --noconftest skips tests/conftest.py, which initializes DeepSpeed for
+      # the training suite. These tests do not use that process group.
+      # Grammar tests are a separate process: test_weight_sync_engine_buffers.py
+      # installs a stand-in vllm at import, and the grammar file uses
+      # importorskip("vllm") to skip the checks that need the real package.
+      - name: Inference CPU tests
+        run: |
+          python -m pytest -v --noconftest \
+            tests/inference/unit_tests/test_spec_decode_grammar.py
+          python -m pytest -v --noconftest \
+            tests/inference/unit_tests/test_dense_prompt_logprobs.py \
+            tests/inference/unit_tests/test_lora_peft_config.py \
+            tests/inference/unit_tests/test_model_config.py \
+            tests/inference/unit_tests/test_patching.py \
+            tests/inference/unit_tests/test_vllm_version.py \
+            tests/inference/unit_tests/test_weight_sync_engine_buffers.py
