@@ -35,7 +35,7 @@ if "ray" not in sys.modules:
 if "vllm" not in sys.modules:
     vllm_module = types.ModuleType("vllm")
     vllm_module.__path__ = []
-    vllm_module.__version__ = "0.30.0"
+    vllm_module.__version__ = "0.31.0"
     config_module = types.ModuleType("vllm.config")
     scheduler_module = types.ModuleType("vllm.v1.core.sched.scheduler")
     loggers_module = types.ModuleType("vllm.v1.metrics.loggers")

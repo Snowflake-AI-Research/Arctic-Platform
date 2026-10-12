@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
 import time
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 import ray
+from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
 
 from arctic_platform.inference.server.metrics import (
@@ -98,8 +100,11 @@ RoutingFn = Callable[[_Request, list[WorkerState]], int]
 ConcurrencyFn = Callable[[list[WorkerState]], list[int]]
 
 
-def _compute_prefix_hash(prompt: str | list[int]) -> int:
+def _compute_prefix_hash(prompt: str | list[int] | ChatPrompt) -> int:
     """Hash the full prompt for affinity routing."""
+    if isinstance(prompt, ChatPrompt):
+        # Already validated as plain JSON.
+        return hash(json.dumps(asdict(prompt), sort_keys=True))
     if isinstance(prompt, str):
         return hash(prompt)
     return hash(tuple(prompt))
@@ -476,6 +481,18 @@ class Scheduler:
     def is_worker_available(self, idx: int) -> bool:
         self._check_idx(idx)
         return self._workers[idx].schedulable
+
+    async def wait_for_schedulable_worker(self, timeout: float) -> ray.actor.ActorHandle:
+        """A worker that takes requests, waiting up to ``timeout`` seconds for one."""
+        deadline = time.monotonic() + timeout
+        while not self._stopped:
+            for ws in self._workers:
+                if ws.schedulable:
+                    return ws.handle
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"No schedulable worker within {timeout:g}s")
+            await asyncio.sleep(0.05)
+        raise RuntimeError("Scheduler stopped")
 
     def mark_worker_unavailable(self, idx: int) -> None:
         self._check_idx(idx)

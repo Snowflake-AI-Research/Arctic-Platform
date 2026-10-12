@@ -557,6 +557,11 @@ class ReplicaPool:
             f"world_size={self.world_size}, "
             f"{'multi-node: 0-GPU coordinator + cross-node PG' if multi_node else 'single-node'})"
         )
+        logger.info(
+            "clear_cache_on_weight_sync=%s (applies to strategy='pause', "
+            "pause_mode='keep' weight syncs)",
+            self._config.clear_cache_on_weight_sync,
+        )
 
         extra_env = self._config.extra_env or None
         try:
@@ -892,6 +897,23 @@ class ReplicaPool:
             "replica_states": list(states),
         }
 
+    async def get_chat_support(
+        self, model_id: str | None = None, *, timeout: float = 600.0
+    ) -> dict[str, bool]:
+        """Report ``{"chat_prompt": bool, "thinking_optional": bool}`` for the loaded model.
+
+        ``chat_prompt``: streams take a ``ChatPrompt``. ``thinking_optional``:
+        ``reasoning_effort="none"`` turns thinking off. Waits up to ``timeout``
+        seconds for a worker the scheduler can route to, as a restarting
+        worker is not initialized yet.
+        """
+        self._check_model_id(model_id)
+        if self._scheduler is None:
+            raise RuntimeError("ReplicaPool not initialized")
+        # Every replica loads the same model with the same engine kwargs.
+        worker = await self._scheduler.wait_for_schedulable_worker(timeout)
+        return await worker.get_chat_support.remote()
+
     # ------------------------------------------------------------------
     # Metrics
     # ------------------------------------------------------------------
@@ -942,7 +964,11 @@ class ReplicaPool:
         self,
         pause_mode: str,
         clear_cache: bool,
-    ) -> None:
+    ) -> bool:
+        """Pause generation on every worker; return the clear_cache value sent."""
+        clear_cache = clear_cache or (
+            self.config.clear_cache_on_weight_sync and pause_mode == "keep"
+        )
         pause_results = await asyncio.gather(
             *[
                 worker.pause_generation.remote(
@@ -963,6 +989,7 @@ class ReplicaPool:
                 f"Failed to pause inference workers {failed_workers}: "
                 f"{_worker_error_messages(pause_results, failed_workers)}"
             )
+        return clear_cache
 
     async def _resume_generation_after_weight_sync(self) -> None:
         resume_results = await asyncio.gather(
@@ -1213,6 +1240,15 @@ class ReplicaPool:
           - **drain**: pause scheduler, wait for in-flight to finish, sync, resume.
           - **skip**: mark workers unavailable, cancel in-flight, sync, re-enable.
           - **hotswap**: sync while serving continues. Unsafe during active generation.
+
+        With **pause** and ``pause_mode="keep"``, the pause also clears the
+        prefix cache when ``clear_cache`` is true or the run's
+        ``ModelConfig.clear_cache_on_weight_sync`` is true (the default). A
+        request can force clearing on but not off; a run opts out by setting
+        ``clear_cache_on_weight_sync: false`` in its ``vllm_config``. Other
+        pause modes use ``clear_cache`` as given, and the other strategies
+        issue no pause. The response's ``clear_cache`` is the value sent to
+        the workers' pause, or ``False`` when no pause was issued.
         """
         self._validate_weight_sync_strategy(strategy, pause_mode)
         self._check_model_id(model_id)
@@ -1248,6 +1284,7 @@ class ReplicaPool:
             scheduler_paused = False
             skipped_workers = False
             generation_paused = False
+            pause_clear_cache = False
             weight_update_started = False
             update_succeeded = False
             prefix_cache_reset: dict[str, Any] | None = None
@@ -1263,7 +1300,9 @@ class ReplicaPool:
                         self._scheduler.mark_worker_unavailable(i)
                 await self._scheduler.abort_streams()
                 if effective_strategy == "pause":
-                    await self._pause_generation_for_weight_sync(pause_mode, clear_cache)
+                    pause_clear_cache = await self._pause_generation_for_weight_sync(
+                        pause_mode, clear_cache
+                    )
                     generation_paused = True
                     if pause_mode == "abort":
                         await self._scheduler.drain()
@@ -1348,6 +1387,7 @@ class ReplicaPool:
                 "num_groups": len(groups),
                 "strategy": strategy,
                 "pause_mode": pause_mode,
+                "clear_cache": pause_clear_cache,
                 "strategy_elapsed": elapsed,
                 "workers": per_worker,
             }
@@ -1394,6 +1434,7 @@ class ReplicaPool:
             scheduler_paused = False
             skipped_workers = False
             generation_paused = False
+            pause_clear_cache = False
             weight_update_started = False
             update_succeeded = False
             prefix_cache_reset: dict[str, Any] | None = None
@@ -1409,7 +1450,9 @@ class ReplicaPool:
                         self._scheduler.mark_worker_unavailable(i)
                 await self._scheduler.abort_streams()
                 if effective_strategy == "pause":
-                    await self._pause_generation_for_weight_sync(pause_mode, clear_cache)
+                    pause_clear_cache = await self._pause_generation_for_weight_sync(
+                        pause_mode, clear_cache
+                    )
                     generation_paused = True
                     if pause_mode == "abort":
                         await self._scheduler.drain()
@@ -1469,6 +1512,7 @@ class ReplicaPool:
                 "world_size": world_size,
                 "strategy": strategy,
                 "pause_mode": pause_mode,
+                "clear_cache": pause_clear_cache,
                 "workers": per_worker,
             }
             if extra_response:
