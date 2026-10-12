@@ -877,6 +877,12 @@ class InferenceWorker(StreamingWorkerMixin):
             )
             return
 
+        from arctic_platform.inference.semi_persistence import matched_baseline
+        if matched_baseline.requested():
+            changed = matched_baseline.apply(engine_kwargs)
+            logger.info("%s=1: plain engine matched to semi_p's collective setup: %s",
+                        matched_baseline.MATCH_ENV, ", ".join(changed) or "nothing to change below TP 2")
+
         # Force-load vLLM general_plugins before constructing AsyncEngineArgs.
         # vLLM normally calls load_general_plugins() in
         # AsyncEngineArgs.__post_init__, which runs *after* __init__ has
