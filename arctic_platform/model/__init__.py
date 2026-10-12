@@ -46,7 +46,7 @@ from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import ModelParallelismMetadata
 from arctic_platform.model.loader import canonical_parameter_name
-from arctic_platform.model.loader import finalize_model_for_training
+from arctic_platform.model.loader import freeze_fp8_weights_and_scales
 from arctic_platform.model.loader import model_parallelism_metadata_from_config
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import select_loader
@@ -85,7 +85,7 @@ __all__ = [
     "conversion_cache_is_node_local",
     "conversion_cache_ready",
     "effective_fused_cross_entropy",
-    "finalize_model_for_training",
+    "freeze_fp8_weights_and_scales",
     "gather_peft_adapter_state_dict",
     "get_language_model",
     "get_vision_encoder",

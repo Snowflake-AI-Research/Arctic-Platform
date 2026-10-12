@@ -138,7 +138,7 @@ def _float8_dtypes() -> frozenset[torch.dtype]:
     )
 
 
-def finalize_model_for_training(model: nn.Module) -> int:
+def freeze_fp8_weights_and_scales(model: nn.Module) -> int:
     """Freeze FP8 storage and inverse-scale parameters after model transformations."""
     float8_dtypes = _float8_dtypes()
     frozen = 0

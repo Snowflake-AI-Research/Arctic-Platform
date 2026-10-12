@@ -140,7 +140,7 @@ class TestLoaderSelection:
         )
         monkeypatch.setattr(
             factory_mod,
-            "finalize_model_for_training",
+            "freeze_fp8_weights_and_scales",
             lambda model: calls.append(("finalize", model)),
         )
 

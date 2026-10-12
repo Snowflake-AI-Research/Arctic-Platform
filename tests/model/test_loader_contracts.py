@@ -23,7 +23,7 @@ from torch import nn
 
 from arctic_platform.model import ModelParallelismMetadata
 from arctic_platform.model import canonical_parameter_name
-from arctic_platform.model import finalize_model_for_training
+from arctic_platform.model import freeze_fp8_weights_and_scales
 from arctic_platform.model import model_parallelism_metadata_from_config
 
 
@@ -185,7 +185,7 @@ class _TransformedModel(nn.Module):
         self.adapter_bias = nn.Parameter(torch.ones(1), requires_grad=True)
 
 
-def test_finalize_model_for_training_refreezes_storage_and_scales():
+def test_freeze_fp8_weights_and_scales():
     float8_dtypes = [
         dtype
         for name in dir(torch)
@@ -193,11 +193,11 @@ def test_finalize_model_for_training_refreezes_storage_and_scales():
     ]
     model = _TransformedModel(float8_dtypes)
 
-    frozen = finalize_model_for_training(model)
+    frozen = freeze_fp8_weights_and_scales(model)
 
     assert frozen == len(float8_dtypes) + 1
     assert all(not holder.weight.requires_grad for holder in model.fp8)
     assert model.weight_scale_inv.requires_grad is False
     assert model.lora_A.requires_grad is True
     assert model.adapter_bias.requires_grad is True
-    assert finalize_model_for_training(model) == 0
+    assert freeze_fp8_weights_and_scales(model) == 0
