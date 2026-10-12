@@ -108,6 +108,32 @@ def test_extract_raises_on_multiprocess_trainer():
         _extract_grpo_ingredients(loss_fn)
 
 
+class _GRPOLoss:
+    """Field stub of TRL's ``GRPOLoss``. It does not carry the trainer."""
+
+    def __init__(self) -> None:
+        self.num_tokens_per_rank = torch.tensor(4.0)
+        self.old_log_probs = torch.zeros(1, 2)
+        self.advantages = torch.ones(1, 2)
+        self.completion_mask = torch.ones(1, 2)
+        self.epsilon_low = 0.2
+        self.epsilon_high = 0.28
+
+
+def test_extract_grpo_loss_single_process(monkeypatch):
+    monkeypatch.setattr("arctic_platform.integrations.trl.client._trl_num_processes", lambda: 1)
+    ing = _extract_grpo_ingredients(_GRPOLoss())
+    assert ing["tokens_per_rank"] == pytest.approx(4.0)
+    assert ing["epsilon_low"] == pytest.approx(0.2)
+    assert ing["epsilon_high"] == pytest.approx(0.28)
+
+
+def test_extract_grpo_loss_raises_when_num_processes_gt_1(monkeypatch):
+    monkeypatch.setattr("arctic_platform.integrations.trl.client._trl_num_processes", lambda: 2)
+    with pytest.raises(RuntimeError, match="single-process"):
+        _extract_grpo_ingredients(_GRPOLoss())
+
+
 def test_to_server_bs_places_shifted_into_padded_rows():
     # TRL-frame [1, T-1] -> server [B, S]: unshift appends a trailing 0, unpack by seq_lens.
     shifted = torch.tensor([[1.0, 2.0, 3.0, 4.0]])  # T-1 = 4
