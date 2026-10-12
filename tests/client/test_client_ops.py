@@ -629,22 +629,6 @@ class TestCortexBackendOnlyConstruction:
         assert transport.jobs == JobHandles()
         assert transport.job_id is None
 
-    def test_provisioning_config_is_passed_to_job_creation(self):
-        """Job creation receives stateful configuration without storing it on the transport."""
-        pytest.importorskip("tenacity")
-        from arctic_platform.client import CortexConfig
-        from arctic_platform.client.transports.cortex import CortexTransport
-
-        backend = CortexConfig(base_url="http://mock")
-        client_config = ArcticClientConfig(
-            model_name="m",
-            backend=backend,
-            training_gpus=1,
-        )
-        transport = CortexTransport(backend)
-        assert transport.config is backend
-        assert transport._sub_job_configs(client_config) == client_config.to_cortex()
-
     def test_parent_id_normalizes_sub_job_tokens(self):
         """Cluster routes can address a parent from either parent or sub-job IDs."""
         pytest.importorskip("tenacity")

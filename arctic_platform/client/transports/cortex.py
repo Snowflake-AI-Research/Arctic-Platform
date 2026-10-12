@@ -330,7 +330,7 @@ class CortexTransport(Transport):
                 "POST",
                 self._prefix,
                 retry_on=_is_connect_error,
-                json={"sub_job_configs": self._sub_job_configs(client_config)},
+                json={"sub_job_configs": client_config.to_cortex()},
             )
             self.job_id = created["job_id"]
         self._wait_running()
@@ -604,10 +604,6 @@ class CortexTransport(Transport):
         for role in _SUB_JOB_KEY.values():
             sub_jobs.setdefault(role, f"{self.job_id}:{role}:0")
         return sub_jobs
-
-    # ── create-job body (SubJobConfig wire shape) ────────────────────────────
-    def _sub_job_configs(self, client_config: ArcticClientConfig) -> list[dict]:
-        return client_config.to_cortex()
 
     # ── HTTP + auth ──────────────────────────────────────────────────────────
     @property

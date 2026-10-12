@@ -39,7 +39,6 @@ from typing_extensions import Self
 from arctic_platform._dependency_groups import require_any_dep_group
 from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import CortexConfig
-from arctic_platform.client.config import OnPremConfig
 from arctic_platform.client.requests import fwd_bwd_request
 from arctic_platform.client.requests import fwd_no_grad_request
 from arctic_platform.client.requests import generate_request
@@ -65,7 +64,6 @@ def make_transport(client_config: ArcticClientConfig, server_state: Any = None) 
 
         return CortexTransport(backend_config)
 
-    assert isinstance(backend_config, OnPremConfig)
     require_any_dep_group("sft", "rl")
     from arctic_platform.client.transports.onprem import OnPremTransport
 
