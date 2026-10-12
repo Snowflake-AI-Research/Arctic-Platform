@@ -358,10 +358,12 @@ class ArcticTrainingClient:
         )
 
     def save(self, output_dir: str) -> None:
-        del output_dir  # weights stay on the Arctic engine
+        # TRL treats a return as "checkpoint written". Persist through the server
+        # save op; a failure must surface instead of looking like success.
+        self.client.save_checkpoint(path=output_dir)
 
     def load(self, checkpoint_dir: str) -> None:
-        del checkpoint_dir
+        self.client.load_checkpoint(path=checkpoint_dir)
 
 
 class ArcticOptimizer(torch.optim.Optimizer):
