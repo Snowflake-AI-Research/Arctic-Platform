@@ -5,7 +5,7 @@ import types
 if "vllm" not in sys.modules:
     vllm_module = types.ModuleType("vllm")
     vllm_module.__path__ = []
-    vllm_module.__version__ = "0.30.0"
+    vllm_module.__version__ = "0.31.0"
     scheduler_module = types.ModuleType("vllm.v1.core.sched.scheduler")
 
     def check_stop(*args, **kwargs):
@@ -40,7 +40,7 @@ from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifec
 def _install_fake_vllm(monkeypatch, async_llm_cls):
     vllm_mod = types.ModuleType("vllm")
     vllm_mod.__path__ = []
-    vllm_mod.__version__ = "0.30.0"
+    vllm_mod.__version__ = "0.31.0"
     plugins_mod = types.ModuleType("vllm.plugins")
     plugins_mod.load_general_plugins = lambda: None
     v1_mod = types.ModuleType("vllm.v1")

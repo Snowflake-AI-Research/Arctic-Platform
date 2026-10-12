@@ -158,8 +158,8 @@ inference = [
     "ray",
     "tqdm",
     "uvicorn",
-    "vllm==0.30.0",
-    "xgrammar==0.2.6",
+    "vllm==0.31.0",
+    "xgrammar==0.2.7",
 ]
 
 # [sft] plus the published sampling package. On-prem still imports
