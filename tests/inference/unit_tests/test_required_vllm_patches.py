@@ -1,12 +1,10 @@
-from arctic_platform.inference.vllm import (
-    dense_prompt_logprobs,
-    dflash2_nan_fix,
-    glm5next_indexer_page,
-    required_patches,
-    router_replay,
-    spec_decode_grammar,
-    xgrammar_stop_mask,
-)
+from arctic_platform.inference.vllm import dense_prompt_logprobs
+from arctic_platform.inference.vllm import dflash2_nan_fix
+from arctic_platform.inference.vllm import glm5next_indexer_page
+from arctic_platform.inference.vllm import required_patches
+from arctic_platform.inference.vllm import router_replay
+from arctic_platform.inference.vllm import spec_decode_grammar
+from arctic_platform.inference.vllm import xgrammar_stop_mask
 
 
 def test_required_vllm_patches_are_applied_together(monkeypatch):

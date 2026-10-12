@@ -46,9 +46,7 @@ def paged_mqa_page_sizes(sm120: bool) -> tuple[int, ...]:
     return _SM120_PAGE_STATES if sm120 else _HOPPER_PAGE_STATES
 
 
-def indexer_kernel_block_sizes(
-    index_kpool: int, page_states: tuple[int, ...]
-) -> list[int]:
+def indexer_kernel_block_sizes(index_kpool: int, page_states: tuple[int, ...]) -> list[int]:
     """Token counts of one DeepGEMM page, for this model's state packing."""
     return [index_kpool * states for states in page_states]
 
@@ -108,9 +106,7 @@ _BACKENDS: dict[tuple[int, tuple[int, ...]], type] = {}
 
 
 def _indexer_backend(index_kpool: int, page_states: tuple[int, ...]):
-    from vllm.v1.attention.backends.mla.indexer import (
-        DeepseekV32IndexerBackend,
-    )
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 
     key = (index_kpool, page_states)
     backend = _BACKENDS.get(key)
@@ -135,9 +131,7 @@ def apply_glm5next_indexer_page_fix() -> None:
 
     from vllm.models.glm5next.common.attention import Glm5NextIndexerCache
     from vllm.platforms import current_platform
-    from vllm.v1.attention.backends.mla.indexer import (
-        DeepseekV32IndexerMetadataBuilder,
-    )
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 
     page_states = paged_mqa_page_sizes(_is_sm120(current_platform))
     original_backend = Glm5NextIndexerCache.get_attn_backend
@@ -153,12 +147,10 @@ def apply_glm5next_indexer_page_fix() -> None:
                 return original_backend(self)
             return _indexer_backend(kpool, page_states)
 
-    class DeepseekV32IndexerMetadataBuilderPatch(
-            ArcticPatch[DeepseekV32IndexerMetadataBuilder]):
+    class DeepseekV32IndexerMetadataBuilderPatch(ArcticPatch[DeepseekV32IndexerMetadataBuilder]):
 
         def build(self, *args, **kwargs):
-            return build_with_deepgemm_page(
-                self, original_build, page_states, args, kwargs)
+            return build_with_deepgemm_page(self, original_build, page_states, args, kwargs)
 
     Glm5NextIndexerCachePatch.apply_patch()
     DeepseekV32IndexerMetadataBuilderPatch.apply_patch()
