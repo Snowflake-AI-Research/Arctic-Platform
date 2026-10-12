@@ -617,6 +617,26 @@ def _response_window_to_shifted(full_2d: torch.Tensor, layout: dict, response_le
 _TRL_LOSS_FREEVARS = ("shifted_old_log_probs", "shifted_advantages", "shifted_completion_mask", "tokens_per_rank")
 
 
+def _reject_multiprocess_trl(world_size: int) -> None:
+    """Server-side ``trl_grpo`` treats ``tokens_per_rank`` as the global token count.
+
+    A multi-process TRL trainer puts only one rank's tokens in ``num_tokens_per_rank``,
+    so dividing by that and multiplying by ``dp_size`` scales the gradient wrong.
+    """
+    if int(world_size) != 1:
+        raise RuntimeError(
+            "server_side_loss assumes a single-process TRL trainer, but "
+            f"num_processes={world_size}. Use loss_placement=client."
+        )
+
+
+def _trl_num_processes() -> int:
+    """TRL process count. ``GRPOLoss`` does not carry the trainer."""
+    from accelerate import PartialState
+
+    return int(PartialState().num_processes)
+
+
 def _extract_grpo_ingredients(loss_fn: Any) -> dict:
     """Recover GRPO tensors/scalars from a ``GRPOLoss`` or TRL's old ``loss_fn`` closure.
 
@@ -624,6 +644,7 @@ def _extract_grpo_ingredients(loss_fn: Any) -> dict:
     handed a closure; advantages/old_log_probs/mask/epsilons lived in its freevars.
     """
     if hasattr(loss_fn, "num_tokens_per_rank") and hasattr(loss_fn, "old_log_probs"):
+        _reject_multiprocess_trl(_trl_num_processes())
         return {
             "old_log_probs": loss_fn.old_log_probs,
             "advantages": loss_fn.advantages,
@@ -649,14 +670,10 @@ def _extract_grpo_ingredients(loss_fn: Any) -> dict:
         )
 
     trainer = cells["self"]
-    # Single-process TRL trainer: tokens_per_rank == global completion tokens, so
-    # server-side dp_size normalization (in trl_grpo) is the only DP correction.
-    world_size = int(getattr(trainer.accelerator, "num_processes", 1))
-    if world_size != 1:
-        raise RuntimeError(
-            "server_side_loss assumes a single-process TRL trainer, but "
-            f"accelerator.num_processes={world_size}. Use loss_placement=client."
-        )
+    # tokens_per_rank must be the global completion count. trl_grpo divides by it
+    # and multiplies by dp_size, which is the only DP correction.
+    _reject_multiprocess_trl(int(getattr(trainer.accelerator, "num_processes", 1)))
+    _reject_multiprocess_trl(_trl_num_processes())
 
     return {
         "old_log_probs": cells["shifted_old_log_probs"],
