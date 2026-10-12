@@ -17,16 +17,14 @@
 
 vLLM's hybrid aligner grows the shared KV block so it covers the Mamba page.
 For GLM-5.3-Flash that block is 640 tokens. The indexer stores one state per
-``index_kpool`` tokens (4), so a 640-token block contains 160 states. DeepGEMM's
-paged-MQA kernel only accepts 32 or 64 states per page on Hopper, and the
-indexer metadata builder passes that 160-state count through. CUDA-graph
+``index_kpool`` tokens (4), so a 640-token block contains 160 states. CUDA-graph
 capture then dies in ``get_paged_mqa_logits_metadata``.
 
-The kernel page vLLM already computes for this indexer is
-``index_kpool * {32, 64}`` tokens. On a 640-token block the common size is
-128 tokens, which is 32 states and divides the Mamba page. This patch makes
-the GLM indexer advertise those pages, then builds indexer metadata against
-that kernel page instead of recompressing it back to the 160-state block.
+The DeepGEMM pinned with vLLM 0.31 asserts ``block_kv == 64``, and allows 32
+only when ``arch_major == 10``. H200 is Hopper, so a 32-state page fails the
+same way 160 does. The legal kernel page is ``index_kpool * 64`` tokens (256
+for GLM-5.3-Flash). Advertising only that page makes vLLM's aligner round the
+640-token block up to 768, which splits into three 256-token pages of 64 states.
 
 Remove this once the pinned vLLM contains
 https://github.com/vllm-project/vllm/pull/57169.
@@ -36,14 +34,16 @@ from dataclasses import replace
 
 from arctic_platform.inference.patching import ArcticPatch
 
-# DeepGEMM ``get_paged_mqa_logits_metadata`` accepts these state counts.
-# SM120 drops the 32-state page; every other CUDA arch used here keeps both.
-_HOPPER_PAGE_STATES = (32, 64)
-_SM120_PAGE_STATES = (64,)
+# The DeepGEMM in the vLLM 0.31 image accepts 64 states on every arch it runs,
+# and 32 only on Blackwell. Hopper rejects 32, so this holdover advertises the
+# 64-state page alone. ``sm120`` stays in the signature so the call sites match
+# the platform check they already make.
+_PAGE_STATES = (64,)
 
 
 def paged_mqa_page_sizes(sm120: bool) -> tuple[int, ...]:
-    return _SM120_PAGE_STATES if sm120 else _HOPPER_PAGE_STATES
+    del sm120
+    return _PAGE_STATES
 
 
 def indexer_kernel_block_sizes(index_kpool: int, page_states: tuple[int, ...]) -> list[int]:
