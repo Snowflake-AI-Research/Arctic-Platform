@@ -15,16 +15,17 @@
 """OpenAI chat server in front of Cortex ``generate``.
 
 Any harness that already speaks chat completions points its client at
-``url_for(rollout_id)``. The server applies the chat template, calls
-``generate`` with token ids, and returns those ids plus the decoded message.
-OpenHands, OpenCode, and Codex are clients of this server. None of them are
-imported here. Each rollout uses ``{base}/r/{routing_key}/v1``.
+``url_for(rollout_id)`` with the key from ``issue``. Each call is stored as an
+episode. A request that continues the same messages is sent to ``generate``
+with the previous sampled token ids still in the prompt. OpenHands, OpenCode,
+and Codex are clients of this server. None of them are imported here.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import threading
 import time
 import uuid
@@ -34,42 +35,34 @@ from typing import Any
 
 from aiohttp import web
 
+from arctic_platform.integrations.harness.episodes import Session
+from arctic_platform.integrations.harness.episodes import normalize_messages
+from arctic_platform.integrations.harness.episodes import plan_prompt
+from arctic_platform.integrations.harness.episodes import remember
 from arctic_platform.integrations.harness.tool_parser import parse_tool_calls as _parse_tool_calls
 
 GenerateFn = Callable[[list[int], dict[str, Any], str | None], Awaitable[dict[str, Any]]]
 
 
-def _text_content(content: Any) -> Any:
-    if isinstance(content, list):
-        return "".join(part.get("text", "") for part in content if isinstance(part, dict))
-    return content
+def _bearer_ok(request: web.Request, api_key: str | None) -> bool:
+    if api_key is None:
+        return True
+    return request.headers.get("Authorization", "") == f"Bearer {api_key}"
 
 
-def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Flatten content parts and decode tool-call argument strings.
-
-    Qwen's chat template runs ``arguments | tojson``. It needs a mapping, which
-    is what vLLM produces before rendering.
-    """
-    normalized = []
-    for message in messages:
-        message = dict(message)
-        if "content" in message:
-            message["content"] = _text_content(message["content"])
-        if message.get("tool_calls"):
-            calls = []
-            for call in message["tool_calls"]:
-                call = json.loads(json.dumps(call))
-                arguments = call.get("function", {}).get("arguments")
-                if isinstance(arguments, str):
-                    try:
-                        call["function"]["arguments"] = json.loads(arguments)
-                    except json.JSONDecodeError:
-                        pass
-                calls.append(call)
-            message["tool_calls"] = calls
-        normalized.append(message)
-    return normalized
+def _numeric_logprobs(raw: Any, length: int) -> list[float] | None:
+    """Sampler logprobs, when they line up with the response tokens."""
+    if not isinstance(raw, list) or len(raw) != length:
+        return None
+    values = []
+    for item in raw:
+        if isinstance(item, (int, float)):
+            values.append(float(item))
+        elif isinstance(item, dict) and isinstance(item.get("logprob"), (int, float)):
+            values.append(float(item["logprob"]))
+        else:
+            return None
+    return values
 
 
 def _error(status: int, message: str) -> web.Response:
@@ -105,6 +98,9 @@ class ChatCompletionsProxy:
         self._thread: threading.Thread | None = None
         self._runner: web.AppRunner | None = None
         self.base_url: str | None = None
+        self._mu = threading.Lock()
+        self._sessions: dict[str, Session] = {}
+        self._key_locks: dict[str, asyncio.Lock] = {}
 
     def url_for(self, routing_key: str) -> str:
         if self.base_url is None:
@@ -127,7 +123,7 @@ class ChatCompletionsProxy:
             started.set()
             self._loop.run_forever()
 
-        self._thread = threading.Thread(target=run, name="openhands-sampling-proxy", daemon=True)
+        self._thread = threading.Thread(target=run, name="harness-chat-proxy", daemon=True)
         self._thread.start()
         started.wait()
         if len(failure) > 0:
@@ -171,6 +167,40 @@ class ChatCompletionsProxy:
             dict(object="list", data=[dict(id=self._model_name, object="model", owned_by="cortex")])
         )
 
+    def issue(self, routing_key: str) -> str:
+        """Mint the bearer token the harness sends as ``api_key`` for this rollout."""
+        token = secrets.token_urlsafe(16)
+        with self._mu:
+            self._session(routing_key).api_key = token
+        return token
+
+    def episodes(self, routing_key: str) -> list:
+        """Episodes recorded for one rollout. Empty if the rollout never called the model."""
+        with self._mu:
+            session = self._sessions.get(routing_key)
+            if session is None:
+                return []
+            return list(session.episodes)
+
+    def drop(self, routing_key: str) -> None:
+        """Forget a finished rollout. The next request with this key starts a new session."""
+        with self._mu:
+            self._sessions.pop(routing_key, None)
+
+    def _session(self, routing_key: str) -> Session:
+        session = self._sessions.get(routing_key)
+        if session is None:
+            session = Session()
+            self._sessions[routing_key] = session
+        return session
+
+    def _key_lock(self, routing_key: str) -> asyncio.Lock:
+        lock = self._key_locks.get(routing_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._key_locks[routing_key] = lock
+        return lock
+
     def render_prompt(self, body: dict[str, Any]) -> list[int]:
         template_kwargs = dict(body.get("chat_template_kwargs") or {})
         add_generation_prompt = template_kwargs.pop("add_generation_prompt", True)
@@ -200,27 +230,50 @@ class ChatCompletionsProxy:
             return _error(400, "streaming is not supported")
         if body.get("n", 1) != 1:
             return _error(400, "only n=1 is supported")
+        if "messages" not in body:
+            return _error(400, "messages is required")
 
-        prompt_ids = await asyncio.to_thread(self.render_prompt, body)
-        if len(prompt_ids) >= self._max_model_len:
-            return _error(
-                400,
-                f"This model's maximum context length is {self._max_model_len} tokens. "
-                f"However, your request has {len(prompt_ids)} input tokens.",
-            )
-        try:
-            result = await self._generate_fn(
-                prompt_ids,
-                self.sampling_params(body, len(prompt_ids)),
-                request.match_info.get("routing_key"),
-            )
-        except Exception as exc:
-            return _error(500, f"Cortex generate failed: {exc}")
+        routing_key = request.match_info.get("routing_key") or "_default"
+        async with self._key_lock(routing_key):
+            with self._mu:
+                session = self._session(routing_key)
+                if not _bearer_ok(request, session.api_key):
+                    return _error(401, "invalid api key")
+                snapshot = Session(
+                    episodes=list(session.episodes),
+                    messages=list(session.messages),
+                    raw_messages=list(session.raw_messages),
+                    assistant=session.assistant,
+                )
+            prompt_ids, extended = await asyncio.to_thread(plan_prompt, snapshot, self._tokenizer, body)
+            if len(prompt_ids) >= self._max_model_len:
+                return _error(
+                    400,
+                    f"This model's maximum context length is {self._max_model_len} tokens. "
+                    f"However, your request has {len(prompt_ids)} input tokens.",
+                )
+            params = self.sampling_params(body, len(prompt_ids))
+            try:
+                result = await self._generate_fn(prompt_ids, params, routing_key)
+            except Exception as exc:
+                return _error(500, f"Cortex generate failed: {exc}")
 
-        response_ids = [int(token) for token in result.get("token_ids") or []]
-        text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
-        tools_offered = bool(body.get("tools")) and body.get("tool_choice") != "none"
-        content, tool_calls = self._parse_tool_calls(text) if tools_offered else (text, [])
+            response_ids = [int(token) for token in result.get("token_ids") or []]
+            text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
+            tools_offered = bool(body.get("tools")) and body.get("tool_choice") != "none"
+            content, tool_calls = self._parse_tool_calls(text) if tools_offered else (text, [])
+            assistant_message = dict(role="assistant", content=content, tool_calls=tool_calls)
+            with self._mu:
+                remember(
+                    self._session(routing_key),
+                    body,
+                    assistant_message,
+                    prompt_ids,
+                    response_ids,
+                    params,
+                    extended,
+                    _numeric_logprobs(result.get("logprobs"), len(response_ids)),
+                )
         finish_reason = result.get("finish_reason") or "stop"
         if len(tool_calls) > 0 and finish_reason == "stop":
             finish_reason = "tool_calls"
@@ -233,7 +286,7 @@ class ChatCompletionsProxy:
                 choices=[
                     dict(
                         index=0,
-                        message=dict(role="assistant", content=content, tool_calls=tool_calls),
+                        message=assistant_message,
                         logprobs=None,
                         finish_reason=finish_reason,
                         token_ids=response_ids,
