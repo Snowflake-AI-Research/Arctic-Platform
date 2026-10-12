@@ -346,7 +346,7 @@ class TestOpRegistry:
 
 class TestClusterRequestBuilders:
     @pytest.mark.parametrize(
-        ("request", "expected"),
+        ("actual", "expected"),
         [
             (cluster_requests.list_jobs_request("running"), Request("list-jobs", body={"status": "running"})),
             (cluster_requests.get_job_request("job-1"), Request("get-job", "job-1")),
@@ -367,9 +367,9 @@ class TestClusterRequestBuilders:
             ),
         ],
     )
-    def test_context_free_request_shape(self, request, expected):
+    def test_context_free_request_shape(self, actual, expected):
         """Cluster builders lower arguments without client or transport state."""
-        assert request == expected
+        assert actual == expected
 
     def test_optional_filters_are_omitted(self):
         """Absent account filters do not become explicit null query values."""
