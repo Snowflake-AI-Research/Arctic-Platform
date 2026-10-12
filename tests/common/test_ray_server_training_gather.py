@@ -20,19 +20,53 @@ class _Remote:
 
 
 class _Worker:
-    def __init__(self, log, hold):
+    def __init__(self, log, hold, *, fail_once=False):
         self._log = log
         self._hold = hold
+        self._fail_once = fail_once
+        self._calls = 0
         self.step = _Remote(self._step)
+        self.offload_to_cpu = _Remote(self._offload)
 
     async def _step(self):
-        self._log.append("start")
+        self._calls += 1
+        self._log.append(f"step-{self._calls}")
+        if self._fail_once and self._calls == 1:
+            raise RuntimeError("worker failed")
         await self._hold.wait()
-        self._log.append("done")
+        self._log.append(f"step-done-{self._calls}")
+        return {"metrics": {}, "batch": {}}
+
+    async def _offload(self):
+        self._log.append("sleep")
+        return {"ok": True}
+
+
+class _Plain:
+    """``.remote()`` returns a value, not an ObjectRef."""
+
+    def remote(self):
         return {"metrics": {}, "batch": {}}
 
 
+class _State:
+    def __init__(self, log):
+        self._log = log
+        self.reset_prefix_cache = _Remote(self._reset)
+        self._empty_training_cache = _Remote(self._empty)
+
+    async def _reset(self, job_id):
+        self._log.append(f"reset-{job_id}")
+        return {}
+
+    async def _empty(self, workers):
+        self._log.append("empty")
+        return ["ok"]
+
+
 def _server(workers):
+    # ``__init__`` starts Ray. Tests build the lock themselves, the same object
+    # ``ArcticRLRayServer.__init__`` assigns.
     server = object.__new__(ArcticRLRayServer)
     server.jobs = {1: {"job_type": "training"}}
     server.training_workers = workers
@@ -61,17 +95,99 @@ class TestGatherTrainingRefs(TestCasePlus):
         async def _run():
             first = asyncio.create_task(server.step(1))
             for _ in range(50):
-                if log.count("start") == 2:
+                if log.count("step-1") == 2:
                     break
                 await asyncio.sleep(0)
-            self.assertEqual(log.count("start"), 2)
+            self.assertEqual(log.count("step-1"), 2)
             second = asyncio.create_task(server.step(1))
             await asyncio.sleep(0)
-            self.assertEqual(log.count("start"), 2, "second step submitted remotes while the first was in flight")
+            self.assertEqual(log.count("step-1"), 2, "second step submitted remotes while the first was in flight")
             hold.set()
             await asyncio.gather(first, second)
-            self.assertEqual(log[:4], ["start", "start", "done", "done"])
-            self.assertEqual(log.count("start"), 4)
-            self.assertEqual(log.count("done"), 4)
+            self.assertEqual(log[:4], ["step-1", "step-1", "step-done-1", "step-done-1"])
+            self.assertEqual(log.count("step-1"), 2)
+            self.assertEqual(log.count("step-2"), 2)
+            self.assertEqual(log.count("step-done-1"), 2)
+            self.assertEqual(log.count("step-done-2"), 2)
+
+        asyncio.run(_run())
+
+    def test_lock_covers_sleep_and_weight_sync(self):
+        hold = asyncio.Event()
+        log: list[str] = []
+        server = _server([_Worker(log, hold), _Worker(log, hold)])
+        server.colocate = False
+        server.sampling_pool = object()
+        server.jobs[2] = {"job_type": "sampling"}
+        server.arctic_rl_ray_server_state = _State(log)
+
+        async def _sync(workers, pool):
+            log.append("sync")
+            return {"status": "ok"}
+
+        server._sync_weights_nccl = _sync
+
+        async def _run():
+            first = asyncio.create_task(server.step(1))
+            for _ in range(50):
+                if log.count("step-1") == 2:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(log.count("step-1"), 2)
+            sleep_task = asyncio.create_task(server.sleep_training(1))
+            sync_task = asyncio.create_task(
+                server.weight_sync(1, {"source_sub_job_id": 1, "target_sub_job_ids": [2]})
+            )
+            empty_task = asyncio.create_task(server.empty_training_cache(1))
+            for _ in range(10):
+                await asyncio.sleep(0)
+            self.assertNotIn("sleep", log)
+            self.assertNotIn("sync", log)
+            self.assertNotIn("empty", log)
+            hold.set()
+            await first
+            await asyncio.gather(sleep_task, sync_task, empty_task)
+            self.assertEqual(log.count("sleep"), 2)
+            self.assertIn("sync", log)
+            self.assertIn("empty", log)
+            self.assertLess(log.index("step-done-1"), log.index("sleep"))
+            self.assertLess(log.index("step-done-1"), log.index("sync"))
+            self.assertLess(log.index("step-done-1"), log.index("empty"))
+
+        asyncio.run(_run())
+
+    def test_failed_worker_holds_the_lock_until_siblings_finish(self):
+        hold = asyncio.Event()
+        log: list[str] = []
+        server = _server([_Worker(log, hold, fail_once=True), _Worker(log, hold)])
+
+        async def _run():
+            first = asyncio.create_task(server.step(1))
+            for _ in range(50):
+                if log.count("step-1") == 2:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(log.count("step-1"), 2)
+            # The failing worker has already raised. The other is still inside the op,
+            # so the lock must stay held and the next step must not submit.
+            second = asyncio.create_task(server.step(1))
+            await asyncio.sleep(0)
+            self.assertNotIn("step-2", log)
+            self.assertNotIn("step-done-1", log)
+            hold.set()
+            with self.assertRaises(RuntimeError):
+                await first
+            await second
+            self.assertLess(log.index("step-done-1"), log.index("step-2"))
+
+        asyncio.run(_run())
+
+    def test_non_awaitable_worker_result_is_rejected(self):
+        server = _server([])
+        server.training_workers = [type("W", (), {"step": _Plain()})()]
+
+        async def _run():
+            with self.assertRaises(TypeError):
+                await server.step(1)
 
         asyncio.run(_run())
