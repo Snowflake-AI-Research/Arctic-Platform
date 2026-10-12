@@ -80,6 +80,8 @@ jobs:
       # A third process loads tests/inference/cpu_vllm.py, which satisfies
       # import vllm for the worker, weight-sync, and router-replay tests.
       # That stand-in must not share a process with the grammar file.
+      # test_multi_model_placement_group.py stays out: it imports the server
+      # API, and FastAPI is not installed in this job.
       - name: Inference CPU tests
         run: |
           python -m pytest -v --noconftest \
@@ -104,6 +106,5 @@ jobs:
             tests/inference/unit_tests/test_scheduler_prefix_routing.py \
             tests/inference/unit_tests/test_replica_pool_placement_group.py \
             tests/inference/unit_tests/test_replica_pool_startup_cleanup.py \
-            tests/inference/unit_tests/test_multi_model_placement_group.py \
             tests/inference/unit_tests/test_weight_sync_direct_writer.py \
             tests/inference/unit_tests/test_weight_sync_pause.py
