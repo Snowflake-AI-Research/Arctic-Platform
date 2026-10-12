@@ -76,6 +76,11 @@ def _transfer_schedule_cls():
 
 logger = logging.getLogger(__name__)
 
+# After one worker fails, how long to let the others finish or accept cancellation
+# before giving up the training lock. An unbounded wait lets a dead rank wedge
+# every later step, save, and weight sync.
+_TRAINING_REF_GRACE_S = 5.0
+
 # PROFILER_TYPE = "c"
 # PROFILER_TYPE = "torch"
 PROFILER_TYPE = "none"
@@ -623,30 +628,73 @@ class ArcticRLRayServer:
         # ``_gather_training_refs`` covers forward / step / save / load. weight_sync,
         # sleep/wake, empty-cache, and weight_norm take the same lock directly.
         self._training_op_lock = asyncio.Lock()
+        self._training_failed = False
+        self._training_failure: BaseException | None = None
+
+    def _raise_if_training_failed(self) -> None:
+        if getattr(self, "_training_failed", False):
+            raise RuntimeError(
+                "training workers failed and did not finish; refusing further training ops"
+            ) from getattr(self, "_training_failure", None)
+
+    def _cancel_training_ref(self, ref: Any, task: asyncio.Task) -> None:
+        task.cancel()
+        if isinstance(ref, ray.ObjectRef):
+            try:
+                ray.cancel(ref, force=False)
+            except Exception:
+                logger.warning("could not cancel training worker ref", exc_info=True)
 
     async def _await_training_refs(self, submit_refs):
         """Await refs. Caller must already hold ``_training_op_lock``.
 
-        ``asyncio.gather`` re-raises the first failure and abandons the other refs.
-        Wait for every ref, then re-raise, so the lock is not released while a
-        sibling worker RPC is still running.
+        On the first worker failure, siblings get ``_training_ref_grace_s`` to
+        finish. Whatever is still running is cancelled. If a sibling ignores
+        cancellation, the job is marked failed so later ops raise instead of
+        queueing on the lock.
         """
+        self._raise_if_training_failed()
         refs = list(submit_refs())
-        awaitables = []
-        rejected = False
+        paired: list[tuple[Any, asyncio.Task]] = []
+        rejected: list[str] = []
         for ref in refs:
             if inspect.isawaitable(ref):
-                awaitables.append(ref)
+
+                async def _consume(awaitable=ref):
+                    return await awaitable
+
+                paired.append((ref, asyncio.ensure_future(_consume())))
             else:
-                rejected = True
-        results = await asyncio.gather(*awaitables, return_exceptions=True) if awaitables else []
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
+                rejected.append(type(ref).__name__)
+        tasks = [task for _, task in paired]
+        grace = getattr(self, "_training_ref_grace_s", _TRAINING_REF_GRACE_S)
+        try:
+            if tasks:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+            else:
+                done, pending = set(), set()
+            errors = [task.exception() for task in done if not task.cancelled() and task.exception() is not None]
+            if errors and pending:
+                _, pending = await asyncio.wait(pending, timeout=grace)
+            if errors and pending:
+                for ref, task in paired:
+                    if not task.done():
+                        self._cancel_training_ref(ref, task)
+                _, pending = await asyncio.wait(pending, timeout=grace)
+            if errors and pending:
+                self._training_failed = True
+                self._training_failure = errors[0]
+                raise errors[0]
+            if errors:
+                raise errors[0]
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
         if rejected:
-            kinds = ", ".join(sorted({type(ref).__name__ for ref in refs if not inspect.isawaitable(ref)}))
+            kinds = ", ".join(sorted(set(rejected)))
             raise TypeError(f"training worker RPC must return an awaitable ObjectRef, got {kinds}")
-        return results
+        return [task.result() for _, task in paired]
 
     async def _gather_training_refs(self, submit_refs):
         """Submit and await worker ObjectRefs without blocking the transport loop.
@@ -654,7 +702,9 @@ class ArcticRLRayServer:
         ``submit_refs`` runs inside the lock so one op's ``.remote()`` calls stay
         contiguous and cannot overlap another training-worker op.
         """
+        self._raise_if_training_failed()
         async with self._training_op_lock:
+            self._raise_if_training_failed()
             return await self._await_training_refs(submit_refs)
 
     def _verify_job(self, job_id: int, expected_types: Union[str, list[str]]) -> None:
@@ -931,12 +981,15 @@ class ArcticRLRayServer:
             mode = "all"
         workers = self.training_workers
         if mode == "non_lp":
-            submit = lambda: [w.offload_non_lp_states.remote() for w in workers]
+            results = await self._gather_training_refs(
+                lambda: [w.offload_non_lp_states.remote() for w in workers]
+            )
         elif mode == "lp_params":
-            submit = lambda: [w.offload_lp_params.remote() for w in workers]
+            results = await self._gather_training_refs(
+                lambda: [w.offload_lp_params.remote() for w in workers]
+            )
         else:
-            submit = lambda: [w.offload_to_cpu.remote() for w in workers]
-        results = await self._gather_training_refs(submit)
+            results = await self._gather_training_refs(lambda: [w.offload_to_cpu.remote() for w in workers])
         logger.info("Offload training (mode=%s): %s", mode, results)
         return {"job_id": job_id, "workers": results}
 
@@ -1022,6 +1075,7 @@ class ArcticRLRayServer:
         )
 
         async with self._training_op_lock:
+            self._raise_if_training_failed()
             if colocate:
                 lp_pool = self.log_prob_pool
                 if cuda_ipc:

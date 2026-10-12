@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import patch
 
 from arctic_platform.common.ray_server import ArcticRLRayServer
@@ -179,6 +180,76 @@ class TestGatherTrainingRefs(TestCasePlus):
                 await first
             await second
             self.assertLess(log.index("step-done-1"), log.index("step-2"))
+
+        asyncio.run(_run())
+
+    def test_failed_worker_does_not_hold_the_lock_for_a_sibling_that_never_returns(self):
+        log: list[str] = []
+
+        class _Fail:
+            def __init__(self):
+                self.step = _Remote(self._step)
+
+            async def _step(self):
+                log.append("fail")
+                raise RuntimeError("boom")
+
+        class _Hang:
+            def __init__(self):
+                self.step = _Remote(self._step)
+
+            async def _step(self):
+                log.append("hang")
+                await asyncio.Event().wait()
+
+        server = _server([_Fail(), _Hang()])
+        server._training_ref_grace_s = 0.05
+        hold = asyncio.Event()
+        hold.set()
+
+        async def _run():
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                await server.step(1)
+            self.assertLess(time.monotonic() - started, 2.0)
+            server.training_workers = [_Worker(log, hold)]
+            out = await asyncio.wait_for(server.step(1), timeout=1.0)
+            self.assertEqual(out["job_id"], 1)
+
+        asyncio.run(_run())
+
+    def test_sibling_that_ignores_cancel_fails_later_ops_immediately(self):
+        log: list[str] = []
+
+        class _Fail:
+            def __init__(self):
+                self.step = _Remote(self._step)
+
+            async def _step(self):
+                raise RuntimeError("boom")
+
+        class _Stubborn:
+            def __init__(self):
+                self.step = _Remote(self._step)
+
+            async def _step(self):
+                log.append("stubborn")
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(1)
+
+        server = _server([_Fail(), _Stubborn()])
+        server._training_ref_grace_s = 0.05
+
+        async def _run():
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                await asyncio.wait_for(server.step(1), timeout=2.0)
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "refusing further training ops"):
+                await server.step(1)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(log.count("stubborn"), 1)
 
         asyncio.run(_run())
 
