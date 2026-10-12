@@ -41,10 +41,14 @@ except Exception:  # noqa: BLE001
 def _sampled_logprob(position: dict, token_id: int) -> float:
     """Sampled-token logprob from one generate position (int or str keys)."""
     if token_id in position:
-        return float(position[token_id]["logprob"])
-    if str(token_id) in position:
-        return float(position[str(token_id)]["logprob"])
-    return float(next(iter(position.values()))["logprob"])
+        entry = position[token_id]
+    elif str(token_id) in position:
+        entry = position[str(token_id)]
+    else:
+        raise RuntimeError(
+            f"sampled token {token_id} is missing from logprobs at this position; keys={list(position)}"
+        )
+    return float(entry["logprob"])
 
 
 class ArcticRolloutWorker:
