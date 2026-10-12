@@ -70,14 +70,16 @@ jobs:
           PYTHONPATH=$PWD:$PWD/tests/inference/streaming python -m pytest -v -m "not gpu" \
             -c tests/inference/streaming/pytest.ini tests/inference/streaming
       # These files pass with the CPU torch, ray, and pydantic this job already
-      # installs, and without vLLM. The rest of tests/inference stays ignored:
-      # some import vLLM, some require CUDA, and several server tests fail
-      # while importing ChatModel under the pydantic this job resolves.
+      # installs. The rest of tests/inference stays ignored: some need the real
+      # vLLM objects they patch, and some require CUDA.
       # --noconftest skips tests/conftest.py, which initializes DeepSpeed for
       # the training suite. These tests do not use that process group.
-      # Grammar tests are a separate process: test_weight_sync_engine_buffers.py
+      # Grammar tests are their own process: test_weight_sync_engine_buffers.py
       # installs a stand-in vllm at import, and the grammar file uses
       # importorskip("vllm") to skip the checks that need the real package.
+      # A third process loads tests/inference/cpu_vllm.py, which satisfies
+      # import vllm for the worker, weight-sync, and router-replay tests.
+      # That stand-in must not share a process with the grammar file.
       - name: Inference CPU tests
         run: |
           python -m pytest -v --noconftest \
@@ -89,3 +91,19 @@ jobs:
             tests/inference/unit_tests/test_patching.py \
             tests/inference/unit_tests/test_vllm_version.py \
             tests/inference/unit_tests/test_weight_sync_engine_buffers.py
+          PYTHONPATH=$PWD/tests/inference python -m pytest -v --noconftest -p cpu_vllm \
+            tests/inference/unit_tests/test_required_vllm_patches.py \
+            tests/inference/unit_tests/test_dflash2_nan_fix.py \
+            tests/inference/unit_tests/test_worker_sleep.py \
+            tests/inference/unit_tests/test_worker_startup_retry.py \
+            tests/inference/unit_tests/test_worker_router_replay.py \
+            tests/inference/unit_tests/test_router_replay_shm.py \
+            tests/inference/unit_tests/test_router_replay_scheduler_stops.py \
+            tests/inference/unit_tests/test_router_replay_all2all.py \
+            tests/inference/unit_tests/test_router_replay_cache.py \
+            tests/inference/unit_tests/test_scheduler_prefix_routing.py \
+            tests/inference/unit_tests/test_replica_pool_placement_group.py \
+            tests/inference/unit_tests/test_replica_pool_startup_cleanup.py \
+            tests/inference/unit_tests/test_multi_model_placement_group.py \
+            tests/inference/unit_tests/test_weight_sync_direct_writer.py \
+            tests/inference/unit_tests/test_weight_sync_pause.py
