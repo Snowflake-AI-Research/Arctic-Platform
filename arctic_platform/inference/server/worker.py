@@ -131,8 +131,8 @@ def _tokenizer_runs_reasoner(vllm_config: Any, reasoning_parser: str) -> bool:
 
     vLLM checks the job's reasoning_parser in create_engine_config, but builds
     a structured-output reasoner added afterwards only on the first request
-    with a grammar, so check that one here. A parser that fails to build is
-    unsupported whatever its error says. Most vLLM parsers raise when the think
+    with a grammar, so check that one here. A parser that is unknown or fails
+    to build is unsupported whatever its error says. Most vLLM parsers raise when the think
     tokens are missing; some build anyway with ``start_token_id`` or
     ``end_token_id`` left None.
     """
@@ -143,9 +143,8 @@ def _tokenizer_runs_reasoner(vllm_config: Any, reasoning_parser: str) -> bool:
     if tokenizer is None:
         # skip_tokenizer_init: no tokenizer to check, and no chat to render.
         return True
-    # Outside the try: an unknown parser name is a config error, not a tokenizer one.
-    parser_cls = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
     try:
+        parser_cls = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
         parser = parser_cls(tokenizer=tokenizer)
     except Exception as exc:
         logger.warning(
@@ -192,7 +191,8 @@ def _resolve_chat_mode(
         if chat_reasoning_parser is not None:
             raise ValueError(
                 f"chat_reasoning_parser={chat_reasoning_parser!r} cannot run on "
-                "this model's tokenizer (it lacks the parser's think tokens)"
+                "this model's tokenizer (an unknown parser, or the tokenizer lacks its "
+                "think tokens)"
             )
         logger.warning(
             "Chat runs without reasoning_parser=%r",

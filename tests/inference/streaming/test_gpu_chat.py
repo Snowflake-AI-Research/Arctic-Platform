@@ -353,3 +353,17 @@ def test_chat_logprobs_cover_the_answer_tokens():
         assert (events[0]["code"], events[0]["param"]) == ("invalid_chat_request", "logprobs")
 
     asyncio.run(with_driver(check))
+
+
+def test_every_chat_models_parser_is_registered_in_vllm():
+    # An unknown table reasoner only drops chat's reasoner with a warning, so
+    # a renamed vLLM parser would otherwise go unnoticed.
+    from arctic_platform.inference.server.chat import CHAT_MODELS
+    from vllm.reasoning import ReasoningParserManager
+    from vllm.tool_parsers import ToolParserManager
+
+    for model in CHAT_MODELS.values():
+        if model.reasoning_parser is not None:
+            ReasoningParserManager.get_reasoning_parser(model.reasoning_parser)
+        if model.tool_call_parser is not None:
+            ToolParserManager.get_tool_parser(model.tool_call_parser)

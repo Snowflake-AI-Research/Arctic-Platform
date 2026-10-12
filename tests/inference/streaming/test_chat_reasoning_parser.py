@@ -127,6 +127,12 @@ def fake_vllm(monkeypatch):
             built["vllm_config"] = config
             return config
 
+    def get_reasoning_parser(name):
+        # As vLLM's ReasoningParserManager for a name it has not registered.
+        if name in built.get("unregistered", ()):
+            raise KeyError(f"Reasoning parser '{name}' not found")
+        return FakeReasoningParser
+
     class FakeAsyncLLM:
         @classmethod
         def from_vllm_config(cls, vllm_config, **_kwargs):
@@ -141,7 +147,7 @@ def fake_vllm(monkeypatch):
         "vllm.v1.engine.async_llm": {"AsyncLLM": FakeAsyncLLM},
         "vllm.reasoning": {
             "ReasoningParserManager": SimpleNamespace(
-                get_reasoning_parser=lambda name: FakeReasoningParser
+                get_reasoning_parser=get_reasoning_parser
             )
         },
         # None, as under skip_tokenizer_init, unless a test sets one.
@@ -603,3 +609,23 @@ def test_an_explicit_chat_reasoning_parser_the_tokenizer_cannot_run_fails_start(
     fake_vllm["tokenizer"] = NO_THINK_TOKENS
     with pytest.raises(ValueError, match="chat_reasoning_parser='qwen3'.*cannot run"):
         start_worker(chat_reasoning_parser="qwen3")
+
+
+def test_a_tables_reasoner_vllm_does_not_know_is_left_out(fake_vllm, monkeypatch, caplog):
+    # test_gpu_chat checks the table's names against the real vLLM.
+    fake_vllm["architecture"] = "Qwen3ForCausalLM"
+    fake_vllm["tokenizer"] = "tokenizer"
+    fake_vllm["unregistered"] = {"qwen3"}
+    with caplog.at_level("WARNING"):
+        worker = start_worker()
+
+    assert fake_vllm["reasoner_at_engine_start"] == ""
+    assert chat_parsers(monkeypatch, worker) == (None, "hermes")
+    assert any("KeyError" in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+
+
+def test_an_explicit_chat_reasoning_parser_vllm_does_not_know_fails_start(fake_vllm):
+    fake_vllm["tokenizer"] = "tokenizer"
+    fake_vllm["unregistered"] = {"nonexistent"}
+    with pytest.raises(ValueError, match="chat_reasoning_parser='nonexistent'.*cannot run"):
+        start_worker(chat_reasoning_parser="nonexistent")
