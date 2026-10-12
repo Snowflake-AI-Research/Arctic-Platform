@@ -316,6 +316,7 @@ class CortexTransport(Transport):
         self.session = self._build_session()
         self._asession = None  # aiohttp.ClientSession, lazy on first acall
         self._asession_loop = None  # the event loop that session is bound to
+        self._session_guards = []  # async generators that close sessions when the loop ends
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def initialize(self) -> JobHandles:
@@ -348,12 +349,15 @@ class CortexTransport(Transport):
         return self.jobs
 
     def shutdown(self) -> None:
-        if self.job_id is None:
-            return
-        # GS uses colon-action syntax: /{job_id}:cancel. Best-effort teardown routed
-        # through _send (retry + auth), tolerating failure (the job may be gone).
-        with contextlib.suppress(requests.exceptions.RequestException):
-            self._send("POST", f"{self._prefix}/{self.job_id}:cancel")
+        try:
+            if self.job_id is None:
+                return
+            # GS uses colon-action syntax: /{job_id}:cancel. Best-effort teardown routed
+            # through _send (retry + auth), tolerating failure (the job may be gone).
+            with contextlib.suppress(requests.exceptions.RequestException):
+                self._send("POST", f"{self._prefix}/{self.job_id}:cancel")
+        finally:
+            self.session.close()
 
     def list_jobs(self) -> list[dict]:
         """Every Cortex job on this account, with its status."""
@@ -577,9 +581,26 @@ class CortexTransport(Transport):
     def _wait_running(self) -> None:
         deadline = time.monotonic() + self.poll_timeout
         delay = self.poll_interval
+        started = time.monotonic()
+        announced: str | None = None
+        last_note = 0.0
         while time.monotonic() < deadline:
             job = self._job()
-            state = _short(job.get("status"))
+            state = _short(job.get("status")) or "pending"
+            elapsed = time.monotonic() - started
+            if state != announced:
+                announced = state
+                last_note = elapsed
+                if state == "running":
+                    logger.info("Cortex job is running (%s).", _clock(elapsed))
+                else:
+                    logger.info(
+                        "Cortex job is %s. Workers are starting and loading the model.",
+                        state,
+                    )
+            elif state != "running" and elapsed - last_note >= 15:
+                last_note = elapsed
+                logger.info("Still %s (%s).", state, _clock(elapsed))
             if state == "running":
                 return
             if state in _JOB_TERMINAL:
@@ -664,12 +685,28 @@ class CortexTransport(Transport):
         if self._asession is None or self._asession.closed or self._asession_loop is not loop:
             import aiohttp
 
-            self._asession = aiohttp.ClientSession(
+            session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.request_timeout),
                 headers=self._auth_headers(),
             )
+            self._asession = session
             self._asession_loop = loop
+            await self._guard_session(session)
         return self._asession
+
+    async def _guard_session(self, session: Any) -> None:
+        """Close this session when the loop shuts down, before aiohttp warns."""
+
+        async def _close_on_shutdown() -> Any:
+            try:
+                yield
+            finally:
+                if not session.closed:
+                    await session.close()
+
+        guard = _close_on_shutdown()
+        self._session_guards.append(guard)
+        await guard.asend(None)
 
     async def _asend(self, method: str, url: str, *, retry_on=None, **kwargs: Any) -> dict:
         session = await self._ensure_asession()
@@ -696,6 +733,11 @@ class CortexTransport(Transport):
                 await self._asession.close()
             self._asession = None
             self._asession_loop = None
+
+
+def _clock(seconds: float) -> str:
+    total = int(seconds)
+    return f"{total // 60}:{total % 60:02d}"
 
 
 def _next_delay(delay: float) -> float:

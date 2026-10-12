@@ -102,6 +102,41 @@ def _release_sessions() -> None:
 atexit.register(_release_sessions)
 
 
+def _enable_progress_log() -> None:
+    """Print Cortex status when the caller has not configured logging."""
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    log = logging.getLogger("arctic_platform")
+    if any(getattr(handler, "_arctic_progress", False) for handler in log.handlers):
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler._arctic_progress = True  # type: ignore[attr-defined]
+    log.addHandler(handler)
+    if log.level == logging.NOTSET or log.level > logging.INFO:
+        log.setLevel(logging.INFO)
+
+
+class _QuietHub:
+    """Hide the Hub's unauthenticated-request warning during public config downloads."""
+
+    def __enter__(self) -> None:
+        names = ("huggingface_hub", "huggingface_hub.utils._http", "transformers")
+        self._levels = [(logging.getLogger(name), logging.getLogger(name).level) for name in names]
+        for hub_logger, _level in self._levels:
+            hub_logger.setLevel(logging.ERROR)
+
+    def __exit__(self, *_exc: object) -> None:
+        for hub_logger, level in self._levels:
+            hub_logger.setLevel(level)
+
+
+def _gpu_phrase(count: int, role: str) -> str:
+    noun = "GPU" if count == 1 else "GPUs"
+    return f"{count} {role} {noun}"
+
+
 class _Future(_sdk.APIFuture[Any]):
     def __init__(self, task: asyncio.Task) -> None:
         self._task = task
@@ -379,6 +414,7 @@ class ServiceClient:
         **_: Any,
     ) -> None:
         del base_url, user_metadata
+        _enable_progress_log()
         self.training_gpus = _pick(training_gpus, "training_gpus")
         self.sampling_gpus = _pick(sampling_gpus, "sampling_gpus")
         self.teacher_sampling_gpus = int(
@@ -474,6 +510,11 @@ class ServiceClient:
         from arctic_platform.integrations.tinker.job import isolation
 
         # Prompt cap fits a full student sequence. Response cap matches the student.
+        logger.info(
+            "Opening a sampling job for teacher %s (%s). The wait is the worker loading the model.",
+            model,
+            _gpu_phrase(self.teacher_sampling_gpus, "sampling"),
+        )
         cfg = TinkerJobConfig(
             model=model,
             training_gpus=0,
@@ -483,7 +524,8 @@ class ServiceClient:
             lora_rank=0,
             seed=7,
         )
-        model_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+        with _QuietHub():
+            model_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
         cfg, isolate = isolation(cfg, model_config)
         client = AsyncArcticRLClient(client_config(cfg))
         _sessions.append(client)
@@ -506,6 +548,12 @@ class ServiceClient:
         from arctic_platform.integrations.tinker.job import client_config
         from arctic_platform.integrations.tinker.job import isolation
 
+        logger.info(
+            "Opening a Cortex job for %s (%s, %s). The wait is the workers loading the model.",
+            base_model,
+            _gpu_phrase(self.training_gpus, "training"),
+            _gpu_phrase(self.sampling_gpus, "sampling"),
+        )
         cfg = TinkerJobConfig(
             model=base_model,
             training_gpus=self.training_gpus,
@@ -516,11 +564,12 @@ class ServiceClient:
             lora_modules=lora_modules,
             seed=7 if seed is None else seed,
         )
-        model_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+        with _QuietHub():
+            model_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+            tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
         cfg, isolate = isolation(cfg, model_config)
         client = AsyncArcticRLClient(client_config(cfg))
         _sessions.append(client)
-        tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
         pad = tokenizer.pad_token_id
         if pad is None:
             pad = tokenizer.eos_token_id

@@ -128,8 +128,8 @@ from arctic_platform.integrations import tinker
 
 
 async def main() -> None:
-    service = tinker.ServiceClient(training_gpus=1, sampling_gpus=1)
-    training = await service.create_lora_training_client_async("Qwen/Qwen3.5-4B", rank=32)
+    service = tinker.ServiceClient(training_gpus=1, sampling_gpus=1, max_prompt_length=128, max_response_length=32)
+    training = await service.create_lora_training_client_async("Qwen/Qwen3-0.6B", rank=32)
 
     tokens = [1, 2, 3, 4]
     datum = tinker.types.Datum(
@@ -139,11 +139,14 @@ async def main() -> None:
             "weights": tinker.TensorData.from_numpy(np.ones(len(tokens) - 1, dtype=np.float32)),
         },
     )
+    print("forward-backward", flush=True)
     forward = await training.forward_backward_async([datum], loss_fn="cross_entropy")
     await forward.result_async()
+    print("optimizer step", flush=True)
     step = await training.optim_step_async(tinker.types.AdamParams(learning_rate=1e-4, eps=1e-8))
     await step.result_async()
 
+    print("sample", flush=True)
     sampling = await training.save_weights_and_get_sampling_client_async()
     result = await sampling.sample_async(
         prompt=tinker.types.ModelInput.from_ints(tokens),
@@ -156,7 +159,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`eps=1e-8` matches the Adam settings provisioned with the job. The SDK's default epsilon is different, and a mismatch is refused.
+`Qwen/Qwen3-0.6B` is the smallest model this client starts. While the workers load it, the client prints the Cortex status and the elapsed time every 15 seconds. `eps=1e-8` matches the Adam settings provisioned with the job. The SDK's default epsilon is different, and a mismatch is refused.
 
 Required settings:
 
