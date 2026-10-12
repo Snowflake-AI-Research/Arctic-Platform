@@ -170,6 +170,53 @@ def _tokenizer_runs_reasoner(vllm_config: Any, reasoning_parser: str) -> bool:
     return True
 
 
+def _resolve_chat_mode(
+    vllm_config: Any, chat_reasoning_parser: str | None, tool_call_parser: str | None
+) -> tuple[ChatModel | None, bool]:
+    """Chat parsers for this engine, and whether chat's reasoner was added to it.
+
+    May add chat's structured-output reasoner to ``vllm_config`` (see
+    ``_add_chat_reasoner``). The chat model is None when chat is unsupported.
+    """
+    chat_model = resolve_chat_model(
+        vllm_config.model_config.architecture,
+        reasoning_parser=chat_reasoning_parser,
+        tool_call_parser=tool_call_parser,
+    )
+    if (
+        chat_model is not None
+        and chat_model.reasoning_parser
+        and not vllm_config.structured_outputs_config.reasoning_parser
+        and not _tokenizer_runs_reasoner(vllm_config, chat_model.reasoning_parser)
+    ):
+        if chat_reasoning_parser is not None:
+            raise ValueError(
+                f"chat_reasoning_parser={chat_reasoning_parser!r} cannot run on "
+                "this model's tokenizer (it lacks the parser's think tokens)"
+            )
+        logger.warning(
+            "Chat runs without reasoning_parser=%r",
+            chat_model.reasoning_parser,
+        )
+        chat_model = replace(chat_model, reasoning_parser=None)
+    chat_only_reasoner = _add_chat_reasoner(
+        vllm_config,
+        chat_model.reasoning_parser if chat_model is not None else None,
+        explicit=chat_reasoning_parser is not None,
+    )
+    if chat_model is not None:
+        # Chat parses with the reasoner the engine gates grammars on,
+        # wherever it came from (the table, chat_reasoning_parser,
+        # reasoning_parser, structured_outputs_config or the model's
+        # default).
+        chat_model = replace(
+            chat_model,
+            reasoning_parser=vllm_config.structured_outputs_config.reasoning_parser
+            or None,
+        )
+    return chat_model, chat_only_reasoner
+
+
 def _optional_bool(value: Any, *, name: str) -> bool | None:
     if value is None:
         return None
@@ -752,43 +799,9 @@ class InferenceWorker(StreamingWorkerMixin):
                         enable_arctic_patches=arctic_enabled,
                     )
                     vllm_config = engine_args.create_engine_config()
-                chat_model = resolve_chat_model(
-                    vllm_config.model_config.architecture,
-                    reasoning_parser=chat_reasoning_parser,
-                    tool_call_parser=tool_call_parser,
+                self._chat_model, self._chat_only_reasoner = _resolve_chat_mode(
+                    vllm_config, chat_reasoning_parser, tool_call_parser
                 )
-                if (
-                    chat_model is not None
-                    and chat_model.reasoning_parser
-                    and not vllm_config.structured_outputs_config.reasoning_parser
-                    and not _tokenizer_runs_reasoner(vllm_config, chat_model.reasoning_parser)
-                ):
-                    if chat_reasoning_parser is not None:
-                        raise ValueError(
-                            f"chat_reasoning_parser={chat_reasoning_parser!r} cannot run on "
-                            "this model's tokenizer (it lacks the parser's think tokens)"
-                        )
-                    logger.warning(
-                        "Chat runs without reasoning_parser=%r",
-                        chat_model.reasoning_parser,
-                    )
-                    chat_model = replace(chat_model, reasoning_parser=None)
-                self._chat_only_reasoner = _add_chat_reasoner(
-                    vllm_config,
-                    chat_model.reasoning_parser if chat_model is not None else None,
-                    explicit=chat_reasoning_parser is not None,
-                )
-                if chat_model is not None:
-                    # Chat parses with the reasoner the engine gates grammars on,
-                    # wherever it came from (the table, chat_reasoning_parser,
-                    # reasoning_parser, structured_outputs_config or the model's
-                    # default).
-                    chat_model = replace(
-                        chat_model,
-                        reasoning_parser=vllm_config.structured_outputs_config.reasoning_parser
-                        or None,
-                    )
-                self._chat_model = chat_model
                 self._structured_outputs_enabled_in_reasoning = bool(
                     vllm_config.structured_outputs_config.enable_in_reasoning
                 )
