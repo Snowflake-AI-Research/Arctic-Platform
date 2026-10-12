@@ -12,16 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Localization task: sandbox, agent, and reward.
+"""Localization task: sandbox, agent, and grader.
 
-The chat endpoint and the training row live in
-``arctic_platform.integrations.harness``. This module is the OpenHands example:
-it builds the agent, closes the conversation, and grades the submission.
+The chat endpoint and the episodes live in
+``arctic_platform.integrations.harness``. This module is the OpenHands example.
+``submit`` starts the agent, ``collect_output`` returns the submission, and
+``grade_localization`` scores it. The agent does not see the reward.
 """
 
 from __future__ import annotations
 
 import threading
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,8 @@ from openhands_localization.prompt_text import render_system_prompt
 from openhands_localization.prompt_text import render_user_prompt
 from openhands_localization.reward import localization_reward
 from openhands_localization.workspace import clone_instance
+
+from arctic_platform.integrations.harness.generator import Grade
 
 _FINISH_REGISTERED = False
 _FINISH_LOCK = threading.Lock()
@@ -48,25 +52,16 @@ def _register_finish_tool(register_tool, tool_cls) -> None:
         _FINISH_REGISTERED = True
 
 
-def _token_events(messages: list[dict]) -> list[dict]:
-    return [message for message in messages if message.get("kind") == "TokenEvent"]
-
-
-def grade_rollout(locations: list[dict] | None, instance: dict) -> tuple[float, dict]:
-    """Score a finished conversation. This does not run the agent."""
-    return localization_reward(locations, instance)
-
-
-def run_rollout(
+def run_conversation(
     instance: dict,
     model_name: str,
     base_url: str,
+    api_key: str,
     max_turns: int,
     workspace_root: str,
     training_phase: str,
-    routing_key: str,
 ) -> dict[str, Any]:
-    """Clone the repo, run the conversation, then grade the submission."""
+    """Clone the repo and run the agent. Grading happens after this returns."""
     from openhands.sdk import LLM
     from openhands.sdk import Agent
     from openhands.sdk import Conversation
@@ -93,7 +88,7 @@ def run_rollout(
             usage_id="agent",
             model=model_name,
             base_url=base_url,
-            api_key="sk-xxx",
+            api_key=api_key,
             temperature=temperature,
             litellm_extra_body=dict(
                 return_token_ids=True,
@@ -108,37 +103,75 @@ def run_rollout(
         agent=agent, max_iteration_per_run=max_turns, visualizer=None, workspace=str(working_dir)
     )
     messages = run_and_close(conversation, render_user_prompt(instance, str(working_dir)))
-    locations = finish_locations(messages)
-    token_messages = _token_events(messages)
-    exhausted = locations is None and len(token_messages) >= max_turns
-    reward, detail = grade_rollout(locations, instance)
-    return dict(
-        messages=messages,
-        token_messages=token_messages,
-        locations=locations,
-        exhausted=exhausted,
-        reward=reward,
-        reward_detail=detail,
-        routing_key=routing_key,
-    )
+    return dict(messages=messages, locations=finish_locations(messages))
 
 
-def finalize_rollout(result: dict[str, Any], tokenizer: Any, _model_name: str, max_turns: int) -> dict[str, Any]:
-    """Reject a malformed last tool call, and mark a rollout that never submitted.
+class OpenHandsAdapter:
+    """Runs one conversation per ``submit``. Status is the thread, not the reward."""
 
-    A rejected call scores 0 and keeps its loss mask. Spending the whole turn
-    budget without a submission drops the rollout from the loss.
+    def __init__(self, model_name: str, max_turns: int, workspace: str) -> None:
+        self._model_name = model_name
+        self._max_turns = max_turns
+        self._workspace = workspace
+        self._lock = threading.Lock()
+        self._runs: dict[str, dict[str, Any]] = {}
+
+    def submit(self, request: Any) -> str:
+        rollout_id = request.routing_key
+        with self._lock:
+            self._runs[rollout_id] = dict(status="running", artifacts=None)
+
+        def work() -> None:
+            try:
+                artifacts = run_conversation(
+                    request.env_extra,
+                    self._model_name,
+                    request.base_url,
+                    request.api_key,
+                    self._max_turns,
+                    self._workspace,
+                    request.phase,
+                )
+            except Exception:
+                artifacts = dict(error=traceback.format_exc(), locations=None, messages=[])
+                self._store(rollout_id, "errored", artifacts)
+                return
+            self._store(rollout_id, "completed", artifacts)
+
+        threading.Thread(target=work, name=f"openhands-{rollout_id}", daemon=True).start()
+        return rollout_id
+
+    def _store(self, rollout_id: str, status: str, artifacts: dict) -> None:
+        with self._lock:
+            self._runs[rollout_id] = dict(status=status, artifacts=artifacts)
+
+    def get_status(self, rollout_id: str) -> str:
+        with self._lock:
+            return self._runs[rollout_id]["status"]
+
+    def collect_output(self, rollout_id: str) -> dict:
+        with self._lock:
+            artifacts = self._runs[rollout_id]["artifacts"]
+        return dict(artifacts or {})
+
+
+def grade_localization(episodes: list[Any], artifacts: dict, instance: dict, tokenizer: Any, max_turns: int) -> Grade:
+    """Score the submission. A malformed last tool call scores 0 and stays in the loss.
+
+    Spending the whole turn budget without a submission drops the rollout from the loss.
     """
-    if result.get("error"):
-        return result
-    token_messages = result.get("token_messages") or []
-    locations = result.get("locations")
-    exhausted = bool(result.get("exhausted")) or (locations is None and len(token_messages) >= max_turns)
-    if locations is not None and len(token_messages) > 0:
-        last_ids = token_messages[-1].get("response_token_ids") or []
+    if artifacts.get("error"):
+        reward, detail = localization_reward(None, {})
+        return Grade(reward=reward, reward_detail=detail, exhausted=False)
+    locations = artifacts.get("locations")
+    if locations is not None and len(episodes) > 0:
+        last_ids = list(episodes[-1].response_token_ids)
         last_text = tokenizer.decode(last_ids, skip_special_tokens=False)
         if not last_step_is_one_tool_call(last_text):
-            _reward, detail = grade_rollout(None, {})
-            return dict(result, locations=None, exhausted=False, reward=0.0, reward_detail=detail)
-    reward = 0.0 if locations is None else result.get("reward")
-    return dict(result, locations=locations, exhausted=exhausted, reward=reward)
+            locations = None
+    exhausted = locations is None and len(episodes) >= max_turns
+    if locations is None:
+        reward, detail = localization_reward(None, {})
+    else:
+        reward, detail = localization_reward(locations, instance)
+    return Grade(reward=reward, reward_detail=detail, exhausted=exhausted)

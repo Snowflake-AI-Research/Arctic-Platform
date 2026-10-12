@@ -47,8 +47,8 @@ def _max_model_len(cfg: Any) -> int:
 
 def _experiment_cls():
     from integrations.arctic_rl.entrypoint import ArcticRLExp
-    from openhands_localization.rollout import finalize_rollout as _finalize
-    from openhands_localization.rollout import run_rollout as _run
+    from openhands_localization.rollout import OpenHandsAdapter
+    from openhands_localization.rollout import grade_localization
     from openhands_localization.trainer import openhands_trainer_cls
 
     trainer_cls = openhands_trainer_cls()
@@ -84,29 +84,20 @@ def _experiment_cls():
             model_name = cfg.trainer.policy.model.path
             max_turns = int(cfg.generator.max_turns)
             workspace = os.environ.get("OPENHANDS_WORKSPACE", "/tmp/testbed")
+            adapter = OpenHandsAdapter("openai/" + model_name, max_turns, workspace)
 
-            def rollout(request):
-                return _run(
-                    request.env_extra,
-                    "openai/" + model_name,
-                    request.base_url,
-                    max_turns,
-                    workspace,
-                    request.phase,
-                    request.routing_key,
-                )
-
-            def finalize(result):
-                return _finalize(result, tokenizer, model_name, max_turns)
+            def grader(episodes, artifacts, request):
+                return grade_localization(episodes, artifacts, request.env_extra, tokenizer, max_turns)
 
             return HarnessGenerator(
                 tokenizer=tokenizer,
                 model_name=model_name,
                 proxy=self.sampling_proxy,
                 traj_dir=str(Path(cfg.trainer.ckpt_path) / "trajectories"),
-                rollout=rollout,
-                finalize=finalize,
+                adapter=adapter,
+                grader=grader,
                 error_detail=_ERROR_DETAIL,
+                step_wise=bool(cfg.generator.step_wise_trajectories),
             )
 
         def get_trainer(

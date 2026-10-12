@@ -20,8 +20,9 @@ from types import SimpleNamespace
 
 import pytest
 from openhands_localization.conversation import run_and_close
-from openhands_localization.rollout import finalize_rollout
-from openhands_localization.rollout import grade_rollout
+from openhands_localization.rollout import grade_localization
+
+from arctic_platform.integrations.harness.episodes import Episode
 
 
 class _Conversation:
@@ -65,20 +66,25 @@ def test_conversation_closes_when_the_run_raises(fail: str):
 
 
 def test_malformed_finish_scores_zero_and_stays_in_the_loss():
-    result = dict(
-        token_messages=[dict(response_token_ids=[9])],
-        locations=[dict(file="a.py")],
-        reward=3.0,
-        reward_detail=dict(reward=3.0),
-        exhausted=False,
-    )
-    graded = finalize_rollout(result, _Tokenizer(), "Qwen/Qwen3.5-4B", 10)
-    assert graded["reward"] == 0.0
-    assert graded["locations"] is None
-    assert graded["exhausted"] is False
+    episodes = [
+        Episode(prompt_token_ids=[1], response_token_ids=[9], logprobs=None, sampling_params={}, extended=False)
+    ]
+    graded = grade_localization(episodes, dict(locations=[dict(file="a.py")]), {}, _Tokenizer(), 10)
+    assert graded.reward == 0.0
+    assert graded.exhausted is False
+
+
+def test_spending_the_turn_budget_drops_the_rollout_from_the_loss():
+    episodes = [
+        Episode(prompt_token_ids=[1], response_token_ids=[9], logprobs=None, sampling_params={}, extended=False)
+        for _ in range(10)
+    ]
+    graded = grade_localization(episodes, dict(locations=None), {}, _Tokenizer(), 10)
+    assert graded.reward == 0.0
+    assert graded.exhausted is True
 
 
 def test_grader_does_not_require_a_conversation():
-    reward, detail = grade_rollout(None, {})
-    assert reward == 0.0
-    assert detail["reward"] == 0.0
+    graded = grade_localization([], dict(locations=None), {}, _Tokenizer(), 10)
+    assert graded.reward == 0.0
+    assert graded.reward_detail["reward"] == 0.0

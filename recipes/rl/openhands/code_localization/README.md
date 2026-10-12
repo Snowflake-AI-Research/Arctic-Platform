@@ -11,17 +11,18 @@ never submits within 10 turns is left out of the loss.
 Job setup goes through `arctic_platform.integrations.skyrl.entrypoint.launch_driver`.
 The branch is `karthik/openhands-cortex`.
 
-This directory is one example. The chat endpoint and the SkyRL training row
-live in `arctic_platform.integrations.harness` and do not import a harness.
-`HarnessGenerator` calls `rollout(request)`. The request is a `RolloutRequest`:
-the dataset row, the phase, and `base_url` from
-`ChatCompletionsProxy.url_for(routing_key)`. The example owns the agent, the
-sandbox path, and the turn budget. It returns token events plus a reward.
-OpenHands, OpenCode, or Codex can supply that function.
+This directory is one example. The chat endpoint and the episodes live in
+`arctic_platform.integrations.harness` and do not import a harness.
+`HarnessGenerator` calls `submit`, `get_status`, and `collect_output`. The
+request carries the dataset row, the phase, `base_url` from
+`ChatCompletionsProxy.url_for(routing_key)`, and a bearer token from `issue`.
+The proxy keeps each sampled response and splices it into the next prompt.
+The grader scores `collect_output`. The adapter does not return tokens or a
+reward. OpenHands, OpenCode, or Codex can supply those three methods.
 
 `openhands_localization` is the OpenHands example: the sandbox, the tools,
-and `grade_rollout`. A different task copies this directory and replaces those
-three. The launcher refuses to start when a cached wheel shadows
+and `grade_localization`. A different task copies this directory and replaces
+those three. The launcher refuses to start when a cached wheel shadows
 `launch_driver`.
 
 ## Install
