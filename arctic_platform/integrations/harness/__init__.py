@@ -16,9 +16,9 @@
 
 A harness keeps its own loop. It points its OpenAI client at
 :class:`arctic_platform.integrations.harness.proxy.ChatCompletionsProxy`.
-:class:`HarnessGenerator` calls ``rollout(request)`` and stitches the returned
-token events and reward into a SkyRL batch. The request carries the row and
-the per-rollout URL. The harness owns the agent, the tools, and the grader.
-OpenHands, OpenCode, and Codex are clients. Import the submodules directly so
-this package does not load aiohttp.
+:class:`HarnessGenerator` calls ``submit``, ``get_status``, and
+``collect_output``. The proxy records each model call as an episode and keeps
+the sampled token ids. A grader scores the artifacts. The adapter does not
+return tokens or a reward. OpenHands, OpenCode, and Codex are clients. Import
+the submodules directly so this package does not load aiohttp.
 """

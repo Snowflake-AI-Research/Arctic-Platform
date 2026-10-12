@@ -56,6 +56,35 @@ def stitch_response(token_messages: list[dict]) -> tuple[list[int], list[int]] |
     return first_prompt, combined[len(first_prompt) :]
 
 
+def masked_row(
+    prompt_ids: list[int],
+    response_ids: list[int],
+    reward: float,
+    reward_detail: dict[str, Any],
+    exhausted: bool,
+    tokenizer: Any,
+    model_name: str,
+) -> dict[str, Any]:
+    """One SkyRL row. The reward is the grader's scalar for the whole rollout."""
+    start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    assistant_id = tokenizer.convert_tokens_to_ids("assistant")
+    mask = assistant_loss_mask(
+        response_ids,
+        start_token_id=start_id,
+        assistant_token_id=assistant_id,
+        buffer_succeed=buffer_after_role(model_name),
+    )
+    mask = mask_if_exhausted(mask, exhausted)
+    return dict(
+        prompt_token_ids=list(prompt_ids),
+        response_ids=list(response_ids),
+        reward=float(reward),
+        reward_detail=reward_detail,
+        loss_mask=mask,
+        stop_reason="complete",
+    )
+
+
 def training_row(result: dict[str, Any], tokenizer: Any, model_name: str) -> dict[str, Any]:
     """Mask a stitched rollout. The reward is whatever the task already set."""
     token_messages = result.get("token_messages") or []
@@ -72,20 +101,13 @@ def training_row(result: dict[str, Any], tokenizer: Any, model_name: str) -> dic
             stop_reason="error",
         )
     prompt_ids, response_ids = stitched
-    start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-    assistant_id = tokenizer.convert_tokens_to_ids("assistant")
-    mask = assistant_loss_mask(
+    row = masked_row(
+        prompt_ids,
         response_ids,
-        start_token_id=start_id,
-        assistant_token_id=assistant_id,
-        buffer_succeed=buffer_after_role(model_name),
+        float(result.get("reward") or 0.0),
+        detail,
+        bool(result.get("exhausted")),
+        tokenizer,
+        model_name,
     )
-    mask = mask_if_exhausted(mask, bool(result.get("exhausted")))
-    return dict(
-        prompt_token_ids=prompt_ids,
-        response_ids=response_ids,
-        reward=float(result.get("reward") or 0.0),
-        reward_detail=detail,
-        loss_mask=mask,
-        stop_reason="complete",
-    )
+    return row
