@@ -57,6 +57,13 @@ def test_unified_config_keeps_8192_for_a_shorter_vllm_length(monkeypatch):
     assert _to_unified_config(legacy).max_seq_len == 8192
 
 
+def test_skyrl_comm_protocol_is_kept():
+    # SkyRL's build_rl_config passes comm_protocol="ray". Dropping it makes the
+    # documented GSM8K entrypoint raise AttributeError before training starts.
+    legacy = ArcticRLClientConfig(model_name="Qwen/Qwen3-0.6B", training_gpus=1, comm_protocol="ray")
+    assert legacy.comm_protocol == "ray"
+
+
 def test_placement_timeout_grows_only_past_the_client_default():
     assert placement_timeout(600.0, None) == 600.0
     assert placement_timeout(600.0, 300.0) == 600.0

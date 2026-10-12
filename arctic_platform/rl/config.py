@@ -63,6 +63,13 @@ class ArcticRLClientConfig(BaseModel):
     log_prob_engine: Literal["vllm", "deepspeed"] = Field(
         default="vllm", description="Engine backend for the log-prob job."
     )
+    comm_protocol: Literal["http", "ray"] = Field(
+        default="http",
+        description=(
+            "SkyRL sets this to ray and then reads it back to decide whether to pass in-process server state. "
+            "Cortex has no Ray server; the shim's get_server_state returns None."
+        ),
+    )
     colocate: bool = Field(
         default=False,
         description=(
