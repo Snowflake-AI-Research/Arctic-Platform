@@ -482,6 +482,18 @@ class Scheduler:
         self._check_idx(idx)
         return self._workers[idx].schedulable
 
+    async def wait_for_schedulable_worker(self, timeout: float) -> ray.actor.ActorHandle:
+        """A worker that takes requests, waiting up to ``timeout`` seconds for one."""
+        deadline = time.monotonic() + timeout
+        while not self._stopped:
+            for ws in self._workers:
+                if ws.schedulable:
+                    return ws.handle
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"No schedulable worker within {timeout:g}s")
+            await asyncio.sleep(0.05)
+        raise RuntimeError("Scheduler stopped")
+
     def mark_worker_unavailable(self, idx: int) -> None:
         self._check_idx(idx)
         self._workers[idx].available = False

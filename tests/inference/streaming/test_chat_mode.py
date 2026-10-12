@@ -1667,18 +1667,89 @@ class ChatSupportWorker:
         return self.support
 
 
+CHAT_UNSUPPORTED = {"chat_prompt": False, "thinking_optional": False}
+CHAT_SUPPORTED = {"chat_prompt": True, "thinking_optional": True}
+
+
+def chat_support_driver(supports):
+    """A Driver over one ChatSupportWorker per entry, all schedulable."""
+    actors = [ray.remote(num_cpus=0)(ChatSupportWorker).remote(s) for s in supports]
+    pool = ReplicaPool()
+    pool._workers = list(actors)
+    pool._scheduler = Scheduler(actors, dynamic_concurrency=False)
+    driver = Driver()
+    driver._pools["model"] = pool
+    return driver, pool, actors
+
+
+async def close_chat_support_driver(pool, actors):
+    await pool._scheduler.shutdown()
+    for actor in actors:
+        ray.kill(actor)
+
+
 def test_driver_reports_chat_support_for_a_loaded_model(runtime):
     support = {"chat_prompt": True, "thinking_optional": False}
 
     async def run():
-        actor = ray.remote(num_cpus=0)(ChatSupportWorker).remote(support)
-        pool = ReplicaPool()
-        pool._workers = [actor]
-        driver = Driver()
-        driver._pools["model"] = pool
+        driver, pool, actors = chat_support_driver([support])
         try:
             return await driver.get_chat_support("model")
         finally:
-            ray.kill(actor)
+            await close_chat_support_driver(pool, actors)
 
     assert asyncio.run(asyncio.wait_for(run(), 30)) == support
+
+
+def test_chat_support_comes_from_a_worker_the_scheduler_can_route_to(runtime):
+    # Worker 0 is restarting; worker 1 answers.
+    supports = [CHAT_UNSUPPORTED, CHAT_SUPPORTED]
+
+    async def run():
+        driver, pool, actors = chat_support_driver(supports)
+        pool._scheduler.mark_worker_unavailable(0)
+        try:
+            return await driver.get_chat_support("model")
+        finally:
+            await close_chat_support_driver(pool, actors)
+
+    assert asyncio.run(asyncio.wait_for(run(), 30)) == supports[1]
+
+
+def test_chat_support_waits_for_a_worker_to_become_ready(runtime):
+    supports = [CHAT_UNSUPPORTED, CHAT_SUPPORTED]
+
+    async def run():
+        driver, pool, actors = chat_support_driver(supports)
+        pool._scheduler.mark_worker_unavailable(0)
+        pool._scheduler.mark_worker_unavailable(1)
+        try:
+            query = asyncio.ensure_future(driver.get_chat_support("model"))
+            await asyncio.sleep(0.3)
+            assert not query.done()
+            pool._scheduler.mark_worker_available(1)
+            return await query
+        finally:
+            await close_chat_support_driver(pool, actors)
+
+    assert asyncio.run(asyncio.wait_for(run(), 30)) == supports[1]
+
+
+@pytest.mark.parametrize("stop", ["shutdown", "timeout"])
+def test_chat_support_fails_as_a_request_would_when_no_worker_can_answer(runtime, stop):
+    async def run():
+        _, pool, actors = chat_support_driver([CHAT_SUPPORTED])
+        pool._scheduler.mark_worker_unavailable(0)
+        try:
+            timeout = 0.2 if stop == "timeout" else 30
+            query = asyncio.ensure_future(pool.get_chat_support(timeout=timeout))
+            await asyncio.sleep(0.1)
+            if stop == "shutdown":
+                await pool._scheduler.shutdown()
+            error = "Scheduler stopped" if stop == "shutdown" else "No schedulable worker"
+            with pytest.raises(RuntimeError, match=error):
+                await query
+        finally:
+            await close_chat_support_driver(pool, actors)
+
+    asyncio.run(asyncio.wait_for(run(), 30))
