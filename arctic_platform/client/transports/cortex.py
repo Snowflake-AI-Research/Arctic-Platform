@@ -593,9 +593,7 @@ class CortexTransport(Transport):
                 raise RuntimeError(f"cortex job {self.job_id} reached terminal state '{state}';{detail}")
             time.sleep(delay)
             delay = _next_delay(delay)
-        raise TimeoutError(
-            f"cortex job {self.job_id} did not become running within {self.config.job_ready_timeout}s"
-        )
+        raise TimeoutError(f"cortex job {self.job_id} did not become running within {self.config.job_ready_timeout}s")
 
     def _capture_sub_jobs(self) -> dict[str, str]:
         job = self._job()

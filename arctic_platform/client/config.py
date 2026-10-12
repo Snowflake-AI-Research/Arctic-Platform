@@ -104,9 +104,7 @@ class CortexConfig(BaseSettings):
     )
     endpoint: str = Field("cortex-training", description="cortex: SnowAPI endpoint name.")
     max_retries: int = Field(10, ge=0, description="cortex: transient-failure retries per HTTP request (tenacity).")
-    request_timeout: float = Field(
-        1800.0, gt=0, description="Maximum seconds allowed for one Cortex HTTP request."
-    )
+    request_timeout: float = Field(1800.0, gt=0, description="Maximum seconds allowed for one Cortex HTTP request.")
     poll_timeout: float = Field(
         1800.0, gt=0, description="Maximum total seconds to poll a submitted Cortex operation."
     )
