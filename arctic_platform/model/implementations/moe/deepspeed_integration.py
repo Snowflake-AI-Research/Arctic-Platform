@@ -17,6 +17,7 @@ from arctic_platform.model.implementations.debug.token_combine import maybe_use_
 from arctic_platform.model.implementations.fp8 import carry_keep_fp32
 from arctic_platform.model.implementations.gpu.tiled_mlp import enable_tiled_mlp
 
+from .config import DISPATCH_EP_BACKENDS
 from .distributed.ep_backend import uses_dispatch_ep
 from .distributed.expert_parallel import DeepEPExpertParallel
 from .distributed.expert_parallel import DeepEPShardParallel
@@ -75,7 +76,7 @@ def patch_deepspeed_moe_detection() -> None:
 def apply_ep_with_mesh(model: nn.Module, config: Any, ep_mesh: DeviceMesh) -> None:
     if not uses_dispatch_ep(config.ep_comm_backend):
         raise NotImplementedError(
-            f"EP comm backend must be one of ('deepep', 'uccl'), got {config.ep_comm_backend!r}."
+            f"EP comm backend must be one of {DISPATCH_EP_BACKENDS}, got {config.ep_comm_backend!r}."
         )
     for transformer_block in get_language_model(model).layers:
         block_mlp = getattr(transformer_block, "mlp", None)

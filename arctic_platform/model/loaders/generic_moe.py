@@ -43,7 +43,7 @@ class GenericMoeOptions(BaseModel):
 
     seq_len: int = Field(4096, gt=0)
     trust_remote_code: bool = False
-    ep_comm_backend: Literal["deepep", "uccl"] = "deepep"
+    ep_comm_backend: Literal["deepep", "deepep_v2", "uccl"] = "deepep"
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     moe_use_grouped_mm: bool = True

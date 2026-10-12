@@ -53,7 +53,7 @@ class GlmMoeDsaOptions(BaseModel):
 
     seq_len: int = Field(4096, gt=0)
     trust_remote_code: bool = True
-    ep_comm_backend: Literal["deepep", "uccl"] = "deepep"
+    ep_comm_backend: Literal["deepep", "deepep_v2", "uccl"] = "deepep"
     sparse_mla_backend: Literal["flashmla", "ref", "tilelang", "dense"] = "ref"
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     deepep_token_chunk_size: int | None = Field(None, gt=0)
