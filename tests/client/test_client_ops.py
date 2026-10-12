@@ -666,7 +666,7 @@ class TestCortexCancelToleratesEmptyBody:
     release that had in fact succeeded as ``could not release <id>``, which
     points the operator at the GPU cap instead of at their freed GPUs."""
 
-    def test_cancel_job_accepts_empty_response(self, monkeypatch):
+    def test_cancel_request_accepts_empty_response(self, monkeypatch):
         pytest.importorskip("tenacity")
         monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
         from arctic_platform.client import CortexConfig
@@ -692,7 +692,7 @@ class TestCortexCancelToleratesEmptyBody:
 
         monkeypatch.setattr(t.session, "request", _request)
 
-        t.cancel_job("job-abc")
+        t.call(cluster_requests.cancel_job_request("job-abc"))
 
         assert sent["method"] == "POST"
         assert sent["url"].endswith("/job-abc:cancel")

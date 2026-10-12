@@ -29,9 +29,11 @@ import contextlib
 import hashlib
 import json
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 from typing import Iterator
-from urllib.parse import urlencode
+from typing import Literal
 
 import requests
 from tenacity import AsyncRetrying
@@ -58,7 +60,6 @@ _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
 # SnowAPI requires DSSST1 octet bodies for these ops. This is a wire requirement of
 # the endpoint, not payload binary-ness (generate carries no tensors), so it lives in
 # the transport rather than on Request.binary.
-_OCTET_OPS = {"forward-backward", "generate"}
 _OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
 # The chunk envelope's operation label is the wire's own name, not our canonical op name.
 _WIRE_OPERATION = {"forward-backward": "fwd-bwd", "forward": "forward", "generate": "generate"}
@@ -78,15 +79,6 @@ _FORCE_CHUNK_OPS = {"forward-backward"}
 # forward-backward carries the large gradient frame; a mid-stream chunk-group
 # desync (GS restart) is recoverable only by re-posting the whole group.
 _GROUP_RESTART_OPS = {"forward-backward"}
-# Direct octet endpoints carry no routing envelope, so the control plane infers the
-# target sub-job from the op itself: forward-backward is training, generate is
-# sampling. `forward` still sends the caller's token because a session can hold more
-# than one training zone, and because reference_model=True aims at the log_prob
-# sub-job: Cortex answers that with Unimplemented (its zone serves forward on
-# training only), which is the error we want the caller to see rather than
-# current-policy numbers silently standing in for reference ones. It rides the
-# /operation envelope, so that token is a body field rather than a query param.
-_SUB_JOB_ROUTED_OPS: set[str] = set()
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
 # Neutrino never colocates training and sampling on the same GPUs, so it exposes no
@@ -114,12 +106,56 @@ def _parent_id(job_id: JobId) -> str:
     return str(job_id).split(":", 1)[0]
 
 
-def _canonical_result(op: str, result: dict) -> dict:
-    if op == "generate":
-        return _to_python(result)
-    if op == "forward":
-        return _unwrap_forward_payload(result)
-    if op != "forward-backward" or "post_process_outputs" not in result:
+def _identity(value: Any) -> Any:
+    return value
+
+
+def _jobs_result(value: Any) -> list[dict]:
+    if isinstance(value, list):
+        return value
+    if "jobs" in value:
+        return value["jobs"] or []
+    return value.get("data") or []
+
+
+def _job_result(value: dict) -> dict:
+    return value.get("job", value)
+
+
+def _capacity_result(value: dict) -> dict:
+    return {
+        "has_reservation": bool(value.get("has_reservation", False)),
+        "max_total_gpus": int(value.get("max_total_gpus", 0)),
+        "reserved_gpus": int(value.get("reserved_gpus", 0)),
+        "in_use_gpus": int(value.get("in_use_gpus", 0)),
+        "pending_gpus": int(value.get("pending_gpus", 0)),
+        "available_gpus": int(value.get("available_gpus", 0)),
+    }
+
+
+def _checkpoints_result(value: Any) -> list[dict]:
+    if isinstance(value, list):
+        return value
+    return value.get("checkpoints") or []
+
+
+def _no_result(value: Any) -> None:
+    return None
+
+
+@dataclass(frozen=True)
+class _Route:
+    method: str
+    path: str
+    send: Literal["none", "query", "json", "octet", "forward", "noop"] = "json"
+    target: Literal["none", "request", "session"] = "session"
+    poll: bool = False
+    retry: Literal["transient", "connect"] = "transient"
+    normalize: Callable[[Any], Any] = _identity
+
+
+def _fwd_bwd_result(result: dict) -> dict:
+    if "post_process_outputs" not in result:
         return result
     if "batch" in result:
         raise ValueError("Cortex fwd-bwd returned both 'batch' and 'post_process_outputs'")
@@ -134,6 +170,62 @@ def _canonical_result(op: str, result: dict) -> dict:
     canonical.pop("post_process_outputs")
     canonical["batch"] = batch
     return canonical
+
+
+_ROUTES = {
+    "list-jobs": _Route("GET", "", "query", target="none", normalize=_jobs_result),
+    "get-job": _Route("GET", "/{job}", "none", target="request", normalize=_job_result),
+    "cancel-job": _Route(
+        "POST",
+        "/{job}:cancel",
+        "none",
+        target="request",
+        retry="connect",
+        normalize=_no_result,
+    ),
+    "capacity": _Route("GET", "/capacity", "query", target="none", normalize=_capacity_result),
+    "list-checkpoints": _Route(
+        "GET",
+        "/{job}/checkpoints",
+        "none",
+        target="request",
+        normalize=_checkpoints_result,
+    ),
+    "export-checkpoint": _Route(
+        "POST",
+        "/{job}/checkpoints/{checkpoint_id}:export",
+        "none",
+        target="request",
+        retry="connect",
+    ),
+    "delete-checkpoint": _Route(
+        "DELETE",
+        "/{job}/checkpoints/{checkpoint_id}",
+        "none",
+        target="request",
+        retry="connect",
+        normalize=_no_result,
+    ),
+    "forward-backward": _Route("POST", "/{job}/forward-backward", "octet", poll=True, normalize=_fwd_bwd_result),
+    "forward": _Route(
+        "POST",
+        "/{job}/operation",
+        "forward",
+        poll=True,
+        normalize=lambda result: _unwrap_forward_payload(result),
+    ),
+    "step": _Route("POST", "/{job}/step", poll=True),
+    "save": _Route("POST", "/{job}/save", poll=True),
+    "generate": _Route(
+        "POST",
+        "/{job}/generate",
+        "octet",
+        poll=True,
+        normalize=lambda result: _to_python(result),
+    ),
+    "operation": _Route("POST", "/{job}/operation", poll=True),
+    **{op: _Route("", "", "noop", target="none") for op in _NOOP_OPS},
+}
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -166,6 +258,13 @@ def _is_connect_error(exc: BaseException) -> bool:
         reason = getattr(cause, "reason", None)
         return isinstance(cause, NewConnectionError) or isinstance(reason, NewConnectionError)
     return False
+
+
+def _is_connect_error_async(exc: BaseException) -> bool:
+    """Async failures proving a mutating request was never delivered."""
+    import aiohttp
+
+    return isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError))
 
 
 class _ChunkGroupError(Exception):
@@ -349,53 +448,60 @@ class CortexTransport(Transport):
         # GS uses colon-action syntax: /{job_id}:cancel. Best-effort teardown routed
         # through _send (retry + auth), tolerating failure (the job may be gone).
         with contextlib.suppress(requests.exceptions.RequestException):
-            self._send("POST", f"{self._prefix}/{self.job_id}:cancel")
+            self._send("POST", f"{self._prefix}/{self.job_id}:cancel", retry_on=_is_connect_error)
 
-    def list_jobs(self) -> list[dict]:
-        """Every Cortex job on this account, with its status."""
-        payload = self._send("GET", self._prefix)
-        if isinstance(payload, list):
-            return payload
-        return payload.get("jobs") or payload.get("data") or []
+    # ── deliver one op ───────────────────────────────────────────────────────
+    def call(self, request: Request) -> Any:
+        route, url, body = self._prepare(request)
+        submitted = self._send_route(route, url, request, body)
+        result = self._poll(submitted) if route.poll else submitted
+        return route.normalize(result)
 
-    def cancel_job(self, job_id: str) -> None:
-        """Release one job's GPUs by id."""
-        self._send("POST", f"{self._prefix}/{job_id}:cancel")
+    async def acall(self, request: Request) -> Any:
+        route, url, body = self._prepare(request)
+        submitted = await self._asend_route(route, url, request, body)
+        result = await self._apoll(submitted) if route.poll else submitted
+        return route.normalize(result)
 
-    # ── deliver one op: submit + poll to completion ──────────────────────────
-    def call(self, request: Request) -> dict:
-        if request.op in _NOOP_OPS:
+    def _prepare(self, request: Request) -> tuple[_Route, str, dict]:
+        route = _ROUTES.get(request.op)
+        if route is None:
+            raise NotImplementedError(f"cortex has no {request.op}")
+        body = {key: value for key, value in (request.body or {}).items() if value is not None}
+        values = {}
+        if "{job}" in route.path:
+            job_id = request.job_id if route.target == "request" else self.job_id
+            if job_id is None:
+                raise ValueError(f"{request.op} requires a job id")
+            values["job"] = _parent_id(job_id)
+        if "{checkpoint_id}" in route.path:
+            values["checkpoint_id"] = body.pop("checkpoint_id")
+        url = self._prefix + route.path.format(**values)
+        return route, url, body
+
+    def _send_route(self, route: _Route, url: str, request: Request, body: dict) -> Any:
+        if route.send == "noop":
             return {}
-        result = self._poll(self._submit(request))
-        return _canonical_result(request.op, result)
+        if route.send == "octet":
+            return self._submit_octet(url, request.op, body)
+        if route.send == "forward":
+            return self._submit_forward(url, request)
+        kwargs = {"params": body} if route.send == "query" else {"json": body} if route.send == "json" else {}
+        retry_on = _is_connect_error if route.retry == "connect" else _is_transient
+        response = self._send(route.method, url, retry_on=retry_on, **kwargs)
+        return _submitted(request.op, body, response) if route.poll else response
 
-    async def acall(self, request: Request) -> dict:
-        if request.op in _NOOP_OPS:
+    async def _asend_route(self, route: _Route, url: str, request: Request, body: dict) -> Any:
+        if route.send == "noop":
             return {}
-        result = await self._apoll(await self._asubmit(request))
-        return _canonical_result(request.op, result)
-
-    def _op_target(self, request: Request) -> tuple[str, dict]:
-        """The url (+ sub-job hint where the op needs one) and body (None-valued keys dropped)."""
-        url = f"{self._prefix}/{self.job_id}/{request.op}"
-        if request.op in _SUB_JOB_ROUTED_OPS and request.job_id is not None:
-            url = f"{url}?{urlencode({'target_sub_job_id': str(request.job_id)})}"
-        return url, {k: v for k, v in request.body.items() if v is not None}
-
-    def _submit(self, request: Request) -> str | dict:
-        # Same shape as on-prem's call: build the url, then pick the wire. Octet ops
-        # (forward-backward, forward, generate) go DSSST1; the rest post JSON as-is. The
-        # client assembles the full /operation envelope (incl. sub-job routing hints), so
-        # `operation` is just another JSON post. `log-probs` doesn't exist here.
-        op = request.op
-        if op == "forward":
-            return self._submit_forward(request)
-        url, body = self._op_target(request)
-        if op in _OCTET_OPS:
-            return self._submit_octet(url, op, body)
-        if op in ("step", "save", "operation"):
-            return _submitted(op, body, self._send("POST", url, json=body))
-        raise NotImplementedError(f"cortex has no {op}")
+        if route.send == "octet":
+            return await self._asubmit_octet(url, request.op, body)
+        if route.send == "forward":
+            return await self._asubmit_forward(url, request)
+        kwargs = {"params": body} if route.send == "query" else {"json": body} if route.send == "json" else {}
+        retry_on = _is_connect_error_async if route.retry == "connect" else _is_transient_async
+        response = await self._asend(route.method, url, retry_on=retry_on, **kwargs)
+        return _submitted(request.op, body, response) if route.poll else response
 
     def _octet_chunks(self, body: dict, op: str) -> list[bytes]:
         frame = wire.dumps(body, metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}})
@@ -409,8 +515,8 @@ class CortexTransport(Transport):
             )
         )
 
-    def _forward_operation_bodies(self, request: Request) -> tuple[str, list[dict]]:
-        """The /operation url and one envelope per chunk of the forward frame.
+    def _forward_operation_bodies(self, request: Request) -> list[dict]:
+        """One /operation envelope per chunk of the forward frame.
 
         Unlike the octet routes, chunking here happens *inside* the envelope: each
         POST is a complete, valid `/operation` call whose payload is one chunk of
@@ -418,7 +524,6 @@ class CortexTransport(Transport):
         final POST answers with a request_id -- the earlier ones report the chunk
         was cached -- so callers must post them in order and keep the last reply.
         """
-        url = f"{self._prefix}/{self.job_id}/operation"
         body = {k: v for k, v in request.body.items() if v is not None}
         # The budget is on the JSON body, and base64 costs 4 bytes per 3, so the
         # frame slice has to be the smaller 3/4 share of what is left.
@@ -440,17 +545,17 @@ class CortexTransport(Transport):
             if request.job_id is not None:
                 envelope["sub_job_id"] = str(request.job_id)
             envelopes.append(envelope)
-        return url, envelopes
+        return envelopes
 
-    def _submit_forward(self, request: Request) -> str:
-        url, envelopes = self._forward_operation_bodies(request)
+    def _submit_forward(self, url: str, request: Request) -> str:
+        envelopes = self._forward_operation_bodies(request)
         final: dict = {}
         for envelope in envelopes:
             final = self._send("POST", url, json=envelope)
         return _forward_request_id(final, len(envelopes))
 
-    async def _asubmit_forward(self, request: Request) -> str:
-        url, envelopes = self._forward_operation_bodies(request)
+    async def _asubmit_forward(self, url: str, request: Request) -> str:
+        envelopes = self._forward_operation_bodies(request)
         final: dict = {}
         for envelope in envelopes:
             final = await self._asend("POST", url, json=envelope)
@@ -475,17 +580,6 @@ class CortexTransport(Transport):
                 continue
             idx += 1
         return final["request_id"]
-
-    async def _asubmit(self, request: Request) -> str | dict:
-        op = request.op
-        if op == "forward":
-            return await self._asubmit_forward(request)
-        url, body = self._op_target(request)
-        if op in _OCTET_OPS:
-            return await self._asubmit_octet(url, op, body)
-        if op in ("step", "save", "operation"):
-            return _submitted(op, body, await self._asend("POST", url, json=body))
-        raise NotImplementedError(f"cortex has no {op}")
 
     async def _asubmit_octet(self, url: str, op: str, body: dict) -> str:
         chunks = self._octet_chunks(body, op)
@@ -669,7 +763,8 @@ class CortexTransport(Transport):
             async with session.request(method, url, **kwargs) as resp:
                 if resp.status >= 400:
                     await _araise_for_status(resp)
-                return await resp.json(content_type=None)
+                body = await resp.read()
+                return json.loads(body) if body.strip() else {}
 
         retryer = AsyncRetrying(
             retry=retry_if_exception(retry_on or _is_transient_async),

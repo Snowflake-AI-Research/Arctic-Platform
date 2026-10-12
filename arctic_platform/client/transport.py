@@ -119,6 +119,13 @@ class JobHandles:
             raise ValueError(f"No {job_type} job initialized.")
         return job_id
 
+    def require_any(self) -> JobId:
+        for job_type in JOB_TYPES:
+            job_id = getattr(self, job_type)
+            if job_id is not None:
+                return job_id
+        raise ValueError("No job initialized.")
+
 
 @dataclass
 class Request:
