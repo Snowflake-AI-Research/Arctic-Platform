@@ -132,9 +132,9 @@ def _tokenizer_runs_reasoner(vllm_config: Any, reasoning_parser: str) -> bool:
     vLLM checks the job's reasoning_parser in create_engine_config, but builds
     a structured-output reasoner added afterwards only on the first request
     with a grammar, so check that one here. A parser that is unknown or fails
-    to build is unsupported whatever its error says. Most vLLM parsers raise when the think
-    tokens are missing; some build anyway with ``start_token_id`` or
-    ``end_token_id`` left None.
+    to build is unsupported whatever its error says. Most vLLM parsers raise
+    when the think tokens are missing; some build anyway with
+    ``start_token_id`` or ``end_token_id`` left None.
     """
     from vllm.reasoning import ReasoningParserManager
     from vllm.tokenizers import cached_tokenizer_from_config
