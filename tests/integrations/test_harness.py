@@ -106,7 +106,7 @@ def test_one_failed_call_does_not_drop_the_batch():
     def boom(*_args):
         raise RuntimeError("sandbox")
 
-    row = _invoke(boom, dict(reward=0.0), {}, "model", "url", 10, "/tmp", "train", "route-1")
+    row = _invoke(boom, dict(reward=0.0), ({}, "model", "url", 10, "/tmp", "train", "route-1"))
     assert row["reward"] == 0.0
     assert row["routing_key"] == "route-1"
     assert "sandbox" in row["error"]

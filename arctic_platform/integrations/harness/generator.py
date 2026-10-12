@@ -15,8 +15,8 @@
 """SkyRL generator for a harness that calls the chat endpoint.
 
 The harness function owns the agent and the reward. This class batches it,
-stitches tokens, and writes trajectories. It does not import a harness.
-Ray is imported when a batch runs.
+stitches tokens, and writes trajectories. It does not import a harness
+or Ray. Rollouts in one batch run on threads.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import json
 import traceback
-from functools import partial
 from pathlib import Path
 from typing import Any
 from typing import Callable
@@ -34,11 +33,10 @@ from arctic_platform.integrations.harness.tokens import training_row
 RolloutFn = Callable[..., dict[str, Any]]
 FinalizeFn = Callable[[dict[str, Any], Any, str, int], dict[str, Any]]
 
-_REMOTES: dict[int, Any] = {}
 _HIDDEN = {"prompt_token_ids", "response_token_ids"}
 
 
-def _invoke(rollout: RolloutFn, error_detail: dict[str, Any], *args: Any) -> dict[str, Any]:
+def _invoke(rollout: RolloutFn, error_detail: dict[str, Any], args: tuple) -> dict[str, Any]:
     """Call a task rollout. One failure becomes a zero-reward row, not a dead batch."""
     try:
         return rollout(*args)
@@ -53,16 +51,6 @@ def _invoke(rollout: RolloutFn, error_detail: dict[str, Any], *args: Any) -> dic
             error=traceback.format_exc(),
             routing_key=routing_key,
         )
-
-
-def _remote(rollout: RolloutFn, error_detail: dict[str, Any]) -> Any:
-    """Ray task for this rollout function. Decorated once; decorating again raises."""
-    key = id(rollout)
-    if key not in _REMOTES:
-        import ray
-
-        _REMOTES[key] = ray.remote(num_cpus=0.01)(partial(_invoke, rollout, error_detail))
-    return _REMOTES[key]
 
 
 def _public_messages(messages: list[dict]) -> list[dict]:
@@ -106,21 +94,18 @@ class HarnessGenerator:
         self._litellm_model = "openai/" + model_name
 
     async def generate(self, input_batch: dict) -> dict:
-        import ray
         from skyrl.train.generators.utils import get_rollout_metrics
 
-        remote = _remote(self._rollout, self._error_detail)
         metadata = input_batch["batch_metadata"]
         phase = metadata.training_phase
         if not isinstance(phase, str):
             phase = getattr(phase, "value", str(phase))
         max_turns = int(self._cfg.max_turns)
-        refs = []
-        for index, instance in enumerate(input_batch["env_extras"]):
-            trajectory = input_batch["trajectory_ids"][index]
+        calls = []
+        for instance, trajectory in zip(input_batch["env_extras"], input_batch["trajectory_ids"]):
             routing_key = f"step{metadata.global_step}-{phase}-{trajectory.to_string()}"
-            refs.append(
-                remote.remote(
+            calls.append(
+                (
                     instance,
                     self._litellm_model,
                     self._proxy.url_for(routing_key),
@@ -130,7 +115,9 @@ class HarnessGenerator:
                     routing_key,
                 )
             )
-        results = await asyncio.gather(*[asyncio.to_thread(ray.get, ref) for ref in refs])
+        results = await asyncio.gather(
+            *[asyncio.to_thread(_invoke, self._rollout, self._error_detail, args) for args in calls]
+        )
         rows = []
         reward_details = []
         for result, instance, trajectory in zip(results, input_batch["env_extras"], input_batch["trajectory_ids"]):
