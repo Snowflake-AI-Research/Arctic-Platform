@@ -1,6 +1,7 @@
 from arctic_platform.inference.vllm import (
     dense_prompt_logprobs,
     dflash2_nan_fix,
+    glm5next_indexer_page,
     required_patches,
     router_replay,
     spec_decode_grammar,
@@ -35,6 +36,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "apply_dflash2_nan_fixes",
         lambda: calls.append("dflash2"),
     )
+    monkeypatch.setattr(
+        glm5next_indexer_page,
+        "apply_glm5next_indexer_page_fix",
+        lambda: calls.append("glm5next_indexer_page"),
+    )
 
     required_patches.apply_required_vllm_patches()
 
@@ -44,4 +50,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "dense_prompt_logprobs",
         "spec_decode_grammar",
         "dflash2",
+        "glm5next_indexer_page",
     ]
