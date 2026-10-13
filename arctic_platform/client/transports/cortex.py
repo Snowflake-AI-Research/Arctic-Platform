@@ -28,7 +28,6 @@ import base64
 import contextlib
 import hashlib
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
@@ -344,12 +343,12 @@ class CortexTransport(Transport):
                 "POST",
                 self._prefix,
                 retry_on=_is_connect_error,
-                json=job_create_payload(self._sub_job_configs(), os.environ.get("CORTEX_JOB_COMMENT")),
+                json=job_create_payload(self._sub_job_configs(), cfg.backend.job_comment),
             )
             self.job_id = created["job_id"]
         # The id has to be on disk before the placement wait. A driver that dies
         # during that wait otherwise leaves the GPUs with no id to cancel.
-        record_job_id(os.environ.get("ARCTIC_CORTEX_JOB_ID_FILE"), self.job_id)
+        record_job_id(cfg.backend.job_id_file, self.job_id)
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
         # JobHandles holds each role's sub-job token, so the client's op bodies

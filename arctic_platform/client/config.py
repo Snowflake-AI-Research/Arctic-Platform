@@ -104,6 +104,13 @@ class CortexConfig(BaseSettings):
     )
     endpoint: str = Field("cortex-training", description="cortex: SnowAPI endpoint name.")
     max_retries: int = Field(10, ge=0, description="cortex: transient-failure retries per HTTP request (tenacity).")
+    # Every job on a shared account reports the same submitter, so the comment
+    # is the only way to tell who owns a job before cancelling it.
+    job_comment: str | None = Field(None, description="cortex: comment stored on the job at create time.")
+    job_id_file: str | None = Field(
+        None,
+        description="cortex: file that receives the job id before the placement wait, so a launcher can cancel it.",
+    )
 
     @model_validator(mode="after")
     def _check(self) -> Self:

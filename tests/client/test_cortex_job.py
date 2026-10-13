@@ -16,8 +16,25 @@
 
 from __future__ import annotations
 
+from arctic_platform.client.config import CortexConfig
 from arctic_platform.client.transports.cortex import job_create_payload
 from arctic_platform.client.transports.cortex import record_job_id
+
+
+def test_comment_and_id_file_read_from_the_cortex_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARCTIC_CORTEX_JOB_COMMENT", "karthik openhands")
+    monkeypatch.setenv("ARCTIC_CORTEX_JOB_ID_FILE", str(tmp_path / "cortex_job_id"))
+    config = CortexConfig(base_url="http://localhost:1")
+    assert config.job_comment == "karthik openhands"
+    assert config.job_id_file == str(tmp_path / "cortex_job_id")
+
+
+def test_empty_comment_env_is_unset(monkeypatch):
+    monkeypatch.setenv("ARCTIC_CORTEX_JOB_COMMENT", "")
+    monkeypatch.delenv("ARCTIC_CORTEX_JOB_ID_FILE", raising=False)
+    config = CortexConfig(base_url="http://localhost:1")
+    assert config.job_comment is None
+    assert config.job_id_file is None
 
 
 def test_job_comment_is_added_only_when_set():
