@@ -154,6 +154,35 @@ def test_qwen38_replaces_moe_and_shards_ple_embedding():
     assert embedding.weight._dss_skip_weight_sync
 
 
+def test_qwen38_decoder_forwards_its_physical_layer_routes():
+    _require()
+    from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+    class LinearAttention(torch.nn.Module):
+        def forward(self, hidden_states, **_kwargs):
+            return torch.zeros_like(hidden_states)
+
+    class RouteSpy(torch.nn.Module):
+        def forward(self, hidden_states, routed_experts=None):
+            self.routed_experts = routed_experts
+            return torch.zeros_like(hidden_states)
+
+    model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
+    layer = get_language_model(model).layers[0]
+    layer.ple = None
+    layer.linear_attn = LinearAttention()
+    layer.mlp = RouteSpy()
+    routes = torch.arange(8).reshape(1, 2, 2, 2)
+
+    layer(
+        torch.randn(1, 2, 32),
+        position_embeddings=(torch.ones(1), torch.zeros(1)),
+        routed_experts=routes,
+    )
+
+    torch.testing.assert_close(layer.mlp.routed_experts, routes[:, :, 0, :])
+
+
 def test_qwen38_model_builder_selects_custom_vlm(tmp_path):
     _require()
     _tiny_config().save_pretrained(tmp_path)
