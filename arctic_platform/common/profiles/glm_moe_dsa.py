@@ -16,7 +16,7 @@
 """Profile of the ``glm_moe_dsa`` loader (GLM-5 with sparse MLA).
 
 Options are ``GlmMoeDsaOptions`` fields, or a ``ModelSpec`` field the loader accepts (``attn_implementation`` for
-``attention.backend``). The loader rejects the ``Patches`` wrappers.
+``attention.backend``, ``dtype`` for ``numerics.optimization_dtype``). The loader rejects the ``Patches`` wrappers.
 """
 
 from __future__ import annotations
@@ -45,8 +45,10 @@ def register(registry: Registry) -> None:
             "attention.sparse_mla",
             "attention.backend",
             "numerics.reduce_dtype",
+            "numerics.optimization_dtype",
         ],
         unsupported={
+            "numerics.fp32_parity": "the option exists only in the Qwen3.5-MoE implementation",
             "lm_head.vocab_chunk_size": "no equivalent option",
             "liger": "the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead",
             "compile.fullgraph": "the loader rejects `patches.compile`",

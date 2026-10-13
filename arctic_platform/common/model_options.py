@@ -167,6 +167,30 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "numerics.fp32_parity",
+        runs_in="trainer",
+        goal="parity",
+        why=(
+            "Evaluate the residual adds, the partial rotary embedding and the GatedDeltaNet beta gate in fp32, as"
+            " vLLM does. Each norm returns the residual in the dtype of the branch output, so with fp32 weights"
+            " under bf16 autocast the residual stream and the final hidden state are bf16 rather than fp32, and"
+            " under full activation checkpointing every decoder layer after the first holds the residual as a"
+            " second tensor at its boundary. Off evaluates all three in the input dtype, the residual adds at the"
+            " end of each layer."
+        ),
+        remove_when="no job needs the residual adds, rotary embedding and beta gate in the input dtype",
+        source="`loader_options.fp32_parity`",
+        registry=registry,
+    )
+    register_option(
+        "numerics.optimization_dtype",
+        runs_in="trainer",
+        goal="parity",
+        why="The dtype the trainer keeps and optimizes the weights in: bfloat16 or float32.",
+        source="`ModelSpec.dtype` on the custom MoE loaders",
+        registry=registry,
+    )
+    register_option(
         "compile.fullgraph",
         runs_in="trainer",
         goal="speed",
