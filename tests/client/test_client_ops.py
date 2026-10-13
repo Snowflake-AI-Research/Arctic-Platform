@@ -242,6 +242,12 @@ class TestLifecycle:
         with pytest.raises(ValueError, match="No training job"):
             JobHandles().require("training")
 
+    def test_require_any_returns_the_first_live_job(self):
+        """require_any picks any initialized job and fails when none exists."""
+        assert JobHandles(sampling=SAMPLING, log_prob=LOG_PROB).require_any() == SAMPLING
+        with pytest.raises(ValueError, match="No job initialized"):
+            JobHandles().require_any()
+
 
 class TestServerState:
     """Reconnect handoff: a client can expose (and reattach via) the transport's
@@ -390,6 +396,41 @@ class TestClusterRequestBuilders:
         )
         assert {request.op for request in requests} == CLUSTER_OPS
         assert CLUSTER_OPS.isdisjoint(OPS)
+
+
+class TestClusterClientMethods:
+    @pytest.fixture
+    def sync_client(self, monkeypatch) -> ArcticRLClient:
+        return _build(monkeypatch, ArcticRLClient)
+
+    def test_account_ops_use_the_given_arguments(self, sync_client):
+        """Account-level ops need no stored handle."""
+        sync_client.list_jobs("running")
+        assert _last(sync_client) == cluster_requests.list_jobs_request("running")
+        sync_client.capacity("H200")
+        assert _last(sync_client) == cluster_requests.capacity_request("H200")
+        sync_client.cancel_job("job-9")
+        assert _last(sync_client) == cluster_requests.cancel_job_request("job-9")
+
+    def test_get_job_targets_a_stored_handle(self, sync_client):
+        sync_client.get_job()
+        assert _last(sync_client) == cluster_requests.get_job_request(TRAINING)
+
+    def test_checkpoint_ops_target_the_training_job(self, sync_client):
+        sync_client.list_checkpoints()
+        assert _last(sync_client) == cluster_requests.list_checkpoints_request(TRAINING)
+        sync_client.export_checkpoint("cp-1")
+        assert _last(sync_client) == cluster_requests.export_checkpoint_request(TRAINING, "cp-1")
+        sync_client.delete_checkpoint("cp-1")
+        assert _last(sync_client) == cluster_requests.delete_checkpoint_request(TRAINING, "cp-1")
+
+    def test_onprem_rejects_cluster_ops(self):
+        """On-prem has no job persistence, so cluster ops fail instead of reaching the Ray server."""
+        from arctic_platform.client.transports.onprem import OnPremTransport
+
+        transport = OnPremTransport(OnPremConfig())
+        with pytest.raises(NotImplementedError, match="list-jobs"):
+            transport.call(cluster_requests.list_jobs_request())
 
 
 class TestTransportSelection:
@@ -659,6 +700,16 @@ class TestCortexTransportNoopOps:
         # short-circuit means the shim never has to guard these calls.
         assert t.call(Request("wake-inference", 1, None)) == {}
         assert t.call(Request("sleep-training", 1, {"mode": "all"})) == {}
+
+    def test_wake_inference_tag_list_is_a_noop(self, monkeypatch):
+        """sync_weights wakes with a bare tag list as the body; it must not be read as a dict."""
+        pytest.importorskip("tenacity")
+        from arctic_platform.client import CortexConfig
+        from arctic_platform.client.transports.cortex import CortexTransport
+
+        t = CortexTransport(CortexConfig(base_url="http://mock"))
+        assert t.call(cluster_requests.wake_inference_request(JobHandles(sampling=SAMPLING), ["weights"])) == {}
+        assert asyncio.run(t.acall(Request("wake-inference", SAMPLING, ["kv_cache"]))) == {}
 
 
 class TestCortexCancelToleratesEmptyBody:
