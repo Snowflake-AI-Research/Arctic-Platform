@@ -60,10 +60,10 @@ def _select_sparse_indices(
     hidden_states: torch.Tensor,
     q_resid: torch.Tensor,
     attention_mask: torch.Tensor,
+    global_cu_seqlens: torch.Tensor,
     *,
     cp_group,
     cp_rank: int,
-    cp_world_size: int,
 ) -> torch.Tensor:
     batch_size, local_length = hidden_states.shape[:2]
     hidden_shape = (batch_size, local_length, -1, indexer.head_dim)
@@ -75,54 +75,73 @@ def _select_sparse_indices(
         dim=-1,
     )
     packed_states = _gather_sequence_no_grad(packed_local, cp_group)
-    valid_keys = packed_states[..., -1].bool()
-    global_length = packed_states.shape[1]
-
-    query_positions = cp_rank * local_length + torch.arange(local_length, device=hidden_states.device)
-    key_positions = torch.arange(global_length, device=hidden_states.device)
-    visible_tokens = (key_positions[None, None, :] <= query_positions[None, :, None]) & valid_keys[:, None, :]
-
-    pool_keys, pool_indices, pool_valid = indexer.get_pooled_states(packed_states=packed_states)
-    scores = torch.matmul(query.float(), pool_keys.transpose(-1, -2).float().unsqueeze(1))
-    scores = F.relu(scores * indexer.softmax_scale)
     weights = indexer.weights_proj(hidden_states.to(indexer.weights_proj.weight.dtype)).float() * (
         indexer.n_heads**-0.5
     )
-    index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
-
-    pool_end = pool_indices[..., -1].clamp(0, global_length - 1)
-    pool_visible = visible_tokens.gather(
-        dim=-1,
-        index=pool_end[:, None, :].expand(batch_size, local_length, -1),
-    )
-    valid_candidates = pool_visible & pool_valid[:, None]
-    index_scores.masked_fill_(~valid_candidates, torch.finfo(index_scores.dtype).min)
-
-    select_k = min(
-        indexer.index_topk // indexer.index_kpool,
-        index_scores.shape[-1],
-    )
-    selected = index_scores.topk(select_k, dim=-1).indices
-    batch_idx = torch.arange(batch_size, device=hidden_states.device)[:, None, None]
-    selected_valid = valid_candidates.gather(-1, selected)
-    selected_indices = pool_indices[batch_idx, selected]
-    topk_indices = selected_indices.flatten(-2)
-    topk_indices.masked_fill_(
-        ~selected_valid[..., None].expand_as(selected_indices).flatten(-2),
-        -1,
-    )
-
     output_width = indexer.index_topk
     if indexer.index_kpool_always_select_tail:
-        topk_indices = indexer.append_visible_tail(topk_indices, visible_tokens, valid_keys)
         output_width += indexer.index_kpool - 1
-    topk_indices = F.pad(
-        topk_indices,
-        (0, output_width - topk_indices.shape[-1]),
-        value=-1,
-    )[..., :output_width]
-    topk_indices.masked_fill_(~attention_mask[..., None], -1)
-    return topk_indices.to(torch.int32)
+    topk_indices = torch.full(
+        (batch_size, local_length, output_width),
+        -1,
+        dtype=torch.int32,
+        device=hidden_states.device,
+    )
+    query_offset = cp_rank * local_length
+    for start_tensor, end_tensor in zip(global_cu_seqlens[:-1], global_cu_seqlens[1:], strict=True):
+        start = int(start_tensor)
+        end = int(end_tensor)
+        local_start = max(start, query_offset)
+        local_end = min(end, query_offset + local_length)
+        if local_start >= local_end:
+            continue
+
+        segment_states = packed_states[:, start:end]
+        valid_keys = segment_states[..., -1].bool()
+        segment_length = end - start
+        query_slice = slice(local_start - query_offset, local_end - query_offset)
+        query_positions = torch.arange(local_start - start, local_end - start, device=hidden_states.device)
+        key_positions = torch.arange(segment_length, device=hidden_states.device)
+        visible_tokens = (key_positions[None, None, :] <= query_positions[None, :, None]) & valid_keys[:, None]
+
+        pool_keys, pool_indices, pool_valid = indexer.get_pooled_states(packed_states=segment_states)
+        scores = torch.matmul(
+            query[:, query_slice].float(),
+            pool_keys.transpose(-1, -2).float().unsqueeze(1),
+        )
+        scores = F.relu(scores * indexer.softmax_scale)
+        index_scores = torch.matmul(weights[:, query_slice].unsqueeze(-2), scores).squeeze(-2)
+
+        pool_end = pool_indices[..., -1].clamp(0, segment_length - 1)
+        pool_visible = visible_tokens.gather(
+            dim=-1,
+            index=pool_end[:, None].expand(batch_size, local_end - local_start, -1),
+        )
+        valid_candidates = pool_visible & pool_valid[:, None]
+        index_scores.masked_fill_(~valid_candidates, torch.finfo(index_scores.dtype).min)
+
+        select_k = min(indexer.index_topk // indexer.index_kpool, index_scores.shape[-1])
+        selected = index_scores.topk(select_k, dim=-1).indices
+        batch_idx = torch.arange(batch_size, device=hidden_states.device)[:, None, None]
+        selected_valid = valid_candidates.gather(-1, selected)
+        selected_indices = pool_indices[batch_idx, selected]
+        selected_indices.masked_fill_(
+            ~selected_valid[..., None].expand_as(selected_indices),
+            -1,
+        )
+        segment_topk = selected_indices.flatten(-2)
+
+        if indexer.index_kpool_always_select_tail:
+            segment_topk = indexer.append_visible_tail(segment_topk, visible_tokens, valid_keys)
+        segment_topk = F.pad(
+            segment_topk,
+            (0, output_width - segment_topk.shape[-1]),
+            value=-1,
+        )[..., :output_width]
+        segment_topk = torch.where(segment_topk >= 0, segment_topk + start, segment_topk)
+        segment_topk.masked_fill_(~attention_mask[:, query_slice, None], -1)
+        topk_indices[:, query_slice] = segment_topk.to(torch.int32)
+    return topk_indices
 
 
 def _reference_sparse_mla(
@@ -202,9 +221,9 @@ def _sparse_attention_forward(
             hidden_states,
             q_resid,
             attention_mask,
+            getattr(self, _GLOBAL_CU_SEQLENS),
             cp_group=self._cp_group,
             cp_rank=self._cp_rank,
-            cp_world_size=self._cp_world_size,
         )
     elif prev_topk_indices is None:
         raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
@@ -355,13 +374,17 @@ def _wrap_backbone_forward(backbone: nn.Module, parallel_modules: list[nn.Module
 
     def forward(self, *args, **kwargs):
         position_ids = kwargs.get("position_ids")
+        if position_ids is None and len(args) >= 3:
+            position_ids = args[2]
         if not torch.is_tensor(position_ids):
             raise ValueError("GLM-5.3 context parallelism requires position_ids for packed boundaries")
         global_position_ids = _gather_sequence_no_grad(
             position_ids,
             self._cp_group,
         )
-        cu_seqlens = cu_seqlens_from_position_ids(global_position_ids)
+        cu_seqlens = kwargs.get("cu_seq_lens_q")
+        if cu_seqlens is None or self._cp_world_size > 1:
+            cu_seqlens = cu_seqlens_from_position_ids(global_position_ids)
         for module in parallel_modules:
             setattr(module, _GLOBAL_POSITION_IDS, global_position_ids)
             setattr(module, _GLOBAL_CU_SEQLENS, cu_seqlens)
@@ -399,6 +422,7 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
                 _sparse_attention_forward,
                 attention,
             )
+            parallel_modules.append(attention)
             sparse_layers += 1
         elif cp_size > 1 and layer.block_type == "linear_attention":
             if attention.num_heads % cp_world_size:
@@ -414,8 +438,7 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
 
     if not sparse_layers:
         raise TypeError("GLM-5.3 model exposes no sparse-attention layers")
-    if cp_size > 1:
-        _wrap_backbone_forward(backbone, parallel_modules)
+    _wrap_backbone_forward(backbone, parallel_modules)
     get_logger().info(
         "Applied GLM-5.3 sparse MLA and context parallelism (cp_size=%d, sparse_layers=%d, KDA_layers=%d)",
         cp_world_size,
