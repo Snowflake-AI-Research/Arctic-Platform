@@ -121,6 +121,15 @@ def test_spec_accepts_peft_patch():
     assert spec.patches.peft == {"peft_type": "Lora", "target_modules": ["q_proj"]}
 
 
+def test_spec_accepts_peft():
+    spec = ModelSpec(
+        model_path_or_name="local",
+        loader="qwen3_5_moe",
+        patches=Patches(peft={"peft_type": "Lora"}),
+    )
+    assert spec.patches.peft == {"peft_type": "Lora"}
+
+
 def test_runtime_groups_are_required():
     spec = ModelSpec(model_path_or_name="local", loader="qwen3_5_moe")
     with pytest.raises(ValueError, match="ep_group"):

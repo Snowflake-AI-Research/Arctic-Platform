@@ -16,12 +16,15 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
 
 from arctic_platform.model.implementations.moe.layers.lm_head import FusedCrossEntropyOutputLinear
 from arctic_platform.model.implementations.moe.layers.lm_head import FusedOutputLinear
+from arctic_platform.model.implementations.moe.layers.lm_head import _patch_model_forward
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import torch_assert_close
 
@@ -76,4 +79,33 @@ def test_fused_cross_entropy_can_return_target_logprobs():
     output = head(hidden_states, labels=labels, dss_compute_logprobs=True)
 
     torch.testing.assert_close(output["logprobs"], -(labels.float() + 0.5))
+    assert "loss" not in output
+
+
+@pytest.mark.parametrize("logits_to_keep", [3, torch.tensor([0, 2, 3])])
+@pytest.mark.parametrize("temperature", [1.0, torch.tensor(1.0)])
+def test_injected_fused_ce_logprobs_preserve_selector_and_scalar_temperature(logits_to_keep, temperature):
+    class Backbone(nn.Module):
+        def forward(self, input_ids=None, **kwargs):
+            return SimpleNamespace(last_hidden_state=torch.zeros(*input_ids.shape, 3))
+
+    model = nn.Module()
+    model.model = Backbone()
+    # Exercise routing and the real head forward without requiring optional fused kernels.
+    model.lm_head = FusedCrossEntropyOutputLinear.__new__(FusedCrossEntropyOutputLinear)
+    nn.Linear.__init__(model.lm_head, 3, 5, bias=False)
+    model.lm_head.fused_logprobs = _PerTokenLoss()
+    _patch_model_forward(model)
+    labels = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])
+
+    output = model(
+        input_ids=labels,
+        labels=labels,
+        logits_to_keep=logits_to_keep,
+        temperature=temperature,
+        dss_compute_logprobs=True,
+    )
+
+    columns = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    torch.testing.assert_close(output["logprobs"], -(labels[:, columns].float() + 0.5), rtol=0, atol=0)
     assert "loss" not in output

@@ -44,7 +44,6 @@ import pytest
 import torch
 
 from arctic_platform import wire
-from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import JobHandles
 from arctic_platform.client.requests import fwd_bwd_request
@@ -92,13 +91,7 @@ class FakeSend:
 
 
 def _transport(result: dict | None = None) -> tuple[CortexTransport, FakeSend]:
-    config = ArcticClientConfig(
-        model_name="m",
-        backend=CortexConfig(base_url="http://gs.test"),
-        training_gpus=1,
-        log_prob_gpus=1,
-    )
-    transport = CortexTransport(config)
+    transport = CortexTransport(CortexConfig(base_url="http://gs.test"))
     transport.job_id = JOB
     transport.jobs = JobHandles(training=TRAINING, log_prob=LOG_PROB)
     send = FakeSend(result or {})

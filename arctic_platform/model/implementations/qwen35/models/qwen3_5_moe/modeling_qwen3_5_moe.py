@@ -20,6 +20,7 @@ from arctic_platform.model.implementations.debug.determinism import flash_attent
 from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
 from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
+from arctic_platform.model.implementations.gpu.lm_head import slice_temperature_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import head_parallel_gated_delta_net
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.moe.layers.moe import FeedForward
@@ -1101,7 +1102,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        temperature: Union[torch.Tensor, None] = None,
+        temperature: Union[float, torch.Tensor, None] = None,
         action_masks: Optional[object] = None,
         routed_experts: Optional[torch.LongTensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
@@ -1150,7 +1151,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
         return self.lm_head(
             hidden_states[:, slice_indices, :],
             inherit_lm_head_target_validation(labels, labels[:, slice_indices]) if labels is not None else None,
-            temperature=temperature[:, slice_indices] if temperature is not None else None,
+            temperature=slice_temperature_for_logits_to_keep(temperature, slice_indices),
             action_masks=action_masks,
         )
 
