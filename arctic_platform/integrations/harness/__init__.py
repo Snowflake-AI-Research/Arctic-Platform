@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Bring-your-own-harness endpoint for SkyRL on Cortex.
+"""Harness endpoint for SkyRL on Cortex.
 
 A harness keeps its own loop. It points its OpenAI client at
 :class:`arctic_platform.integrations.harness.proxy.ChatCompletionsProxy`.
