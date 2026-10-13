@@ -65,6 +65,10 @@ from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.patch import register_patch
 from arctic_platform.model.patches.peft import apply_peft
 from arctic_platform.model.sequence_parallel import validate_sequence_parallel
+from arctic_platform.model.training_engine import OptimizerSettings
+from arctic_platform.model.training_engine import TrainingEngineSpec
+from arctic_platform.model.training_engine import build_deepspeed_config
+from arctic_platform.model.training_engine import initialize_training_engine
 from arctic_platform.model.weight_export import PEFT_ADAPTER_DIRNAME
 from arctic_platform.model.weight_export import WeightExportContract
 from arctic_platform.model.weight_export import checkpoint_peft_adapter_dir
@@ -118,6 +122,8 @@ __all__ = [
     "CompilePatch",
     "ModelParallelismMetadata",
     "ModelSpec",
+    "OptimizerSettings",
+    "TrainingEngineSpec",
     "model_parallelism_metadata_from_config",
     "moe_model_spec",
     "ParallelismConfig",
@@ -132,8 +138,10 @@ __all__ = [
     "ZorroTrainPatch",
     "apply_patches",
     "apply_peft",
+    "build_deepspeed_config",
     "build_model",
     "build_moe_model",
+    "initialize_training_engine",
     "register_loader",
     "register_patch",
     "resolve_conversion_cache_path",
