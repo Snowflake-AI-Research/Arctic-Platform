@@ -59,10 +59,9 @@ class OptimizerSettings(BaseModel):
 class TrainingEngineSpec(BaseModel):
     """Engine inputs that do not depend on a training service.
 
-    ``fp32_masters`` and ``zero_bucket_size`` are explicit. A caller that reads
-    them from the environment translates those variables before constructing
-    the spec. ``ds_overrides`` is shallow-merged last, matching a client
-    DeepSpeed override block.
+    ``fp32_masters`` and ``zero_bucket_size`` come from the caller's job config.
+    ``ds_overrides`` is shallow-merged last, matching a client DeepSpeed
+    override block.
     """
 
     model_config = ConfigDict(extra="forbid")
