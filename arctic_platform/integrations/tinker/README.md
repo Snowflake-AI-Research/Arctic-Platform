@@ -252,14 +252,17 @@ Cookbook source is unchanged. Where a published command names another model, the
 
 ### Qwen3.5-4B, published commands
 
-Finished runs. The model is `Qwen/Qwen3.5-4B`. The other arguments are the published command, or the recipe defaults when that command already names this model.
+These seven runs showed learning. The model is `Qwen/Qwen3.5-4B`. The other arguments are the published command, or the recipe defaults when that command already names this model.
 
 | Recipe | Command | Steps | Result |
 |---|---|---|---|
 | GSM8K | `env=gsm8k group_size=64 groups_per_batch=32 learning_rate=8e-5 max_tokens=1024` | 211 | reward 0.549 → 0.999, correct 0.617 → 0.999. Reward is 0.837 at step 3. KL stays near 0.0002 |
 | MATH | `env=math group_size=16 groups_per_batch=64 learning_rate=2e-5 max_tokens=512` | 11 | reward −0.045 → 0.142, correct 0.055 → 0.234. KL stays near 0.0002 |
-| arithmetic | `group_size=4 groups_per_batch=100 learning_rate=1e-4`, `max_tokens` left at 5 | 25 | reward −0.100 → 0.000, correct stayed 0 |
+| DeepMath | the MATH command with `env=deepmath` | 52 | reward −0.100 → 0.021, correct 0 → 0.121. KL stays near 0.0003 |
 | guess-number | recipe defaults (`batch_size=32`, `group_size=8`, `max_tokens=64`, `learning_rate=3e-5`) | 10 | reward −0.086 → 0.688 |
+| rl-basic | recipe defaults (`learning_rate=4e-5`, `max_tokens=256`, GSM8K batch 128, group 16). The published model is `Qwen/Qwen3.5-9B-Base` | 5 | reward −0.077 → 0.195, correct 0.023 → 0.290 |
+| tic-tac-toe | recipe defaults (`batch_size=512`, `learning_rate=3e-5`) | 4 | reward −0.887 → −0.184 |
+| shorter | recipe defaults (`batch_size=32`, `group_size=16`, `max_tokens=64`, `learning_rate=3e-5`) | 4 | reward −0.275 → −0.002 |
 
 GSM8K detail:
 
@@ -270,7 +273,7 @@ GSM8K detail:
 | 5 | 0.946 | 0.951 | 0.00015 |
 | 210 | 0.999 | 0.999 | 0.00020 |
 
-Polaris is still running on the same MATH arguments with `env=polaris`. After 38 steps the reward is still −0.10.
+Arithmetic, Polaris, and twenty-questions finished on the same hardware. Arithmetic ran 25 steps, reward −0.100 → 0.000, and correct stayed 0 (`max_tokens` left at 5). Polaris ran 143 steps on the MATH arguments with `env=polaris`, reward −0.100 → −0.067, correct 0.033. Twenty-questions ran 10 steps on its recipe defaults, reward 0.049 → 0.105.
 
 ### Five steps, same short arguments on Cortex and the Tinker API
 
