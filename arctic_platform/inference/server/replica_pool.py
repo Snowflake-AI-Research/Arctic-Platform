@@ -954,6 +954,13 @@ class ReplicaPool:
         payload["drained_at"] = time.time()
         return payload
 
+    async def perftrace_drain(self, model_id: str | None = None) -> list[dict[str, Any]]:
+        """See :meth:`Scheduler.perftrace_drain`."""
+        self._check_model_id(model_id)
+        if self._scheduler is None:
+            return []
+        return await self._scheduler.perftrace_drain()
+
     # ------------------------------------------------------------------
     # Weight sync
     # ------------------------------------------------------------------

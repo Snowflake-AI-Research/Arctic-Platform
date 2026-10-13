@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 import ray
+from arctic_platform.inference.server import perftrace
 from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
 from arctic_platform.inference.server.token_prompts import is_token_tensor
@@ -58,6 +59,7 @@ class _Request:
     prefix_hash: int | None = None
     routing_key: str | None = None
     strict: bool = False
+    trace_id: str | None = None
 
 
 @dataclass
@@ -302,6 +304,7 @@ class Scheduler:
                 w.set_replica_id.remote(idx)
             except Exception:
                 pass
+        perftrace.register_gauges(self._perftrace_gauges)
 
     # ------------------------------------------------------------------
     # Public API
@@ -336,6 +339,9 @@ class Scheduler:
 
         self._ensure_background_tasks()
 
+        trace_id = perftrace.current_trace_id()
+        if trace_id is not None:
+            perftrace.mark(trace_id, "sch_submit_enter")
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         if routing_key is not None:
@@ -352,9 +358,12 @@ class Scheduler:
             prefix_hash=prefix_hash,
             routing_key=routing_key,
             strict=strict,
+            trace_id=trace_id,
         )
         self._next_id += 1
         asyncio.create_task(self._process_request(req))
+        if trace_id is not None:
+            perftrace.mark(trace_id, "sch_submit", {"sid": req.id})
         return future
 
     def stream_generate(self, request_id, prompt, sampling_params=None, *, limits=None, routing_key=None, strict=False):
@@ -700,6 +709,10 @@ class Scheduler:
         tracked_worker_idx: int | None = None
         submitted_time: float = 0.0
         result: Any = None
+        trace_id = req.trace_id
+        polls = 0
+        if trace_id is not None:
+            perftrace.mark(trace_id, "sch_task_start", {"sid": req.id})
 
         if self._group_affinity_enabled and req.routing_key is not None:
             routing_fn: RoutingFn | None = None
@@ -750,6 +763,7 @@ class Scheduler:
                             route_diagnostics.routing_key_preview if route_diagnostics is not None else None,
                         )
                     break
+                polls += 1
                 await asyncio.sleep(0.005)
             else:
                 if not req.future.done():
@@ -761,7 +775,23 @@ class Scheduler:
                 self._inflight_tasks[tracked_worker_idx].add(current_task)
 
             try:
-                result = await ws.handle.generate.remote(req.prompt, req.sampling_params)
+                if trace_id is None:
+                    result = await ws.handle.generate.remote(req.prompt, req.sampling_params)
+                else:
+                    perftrace.mark(trace_id, "sch_dispatch", {
+                        "sid": req.id,
+                        "worker": tracked_worker_idx,
+                        "polls": polls,
+                        "active": ws.active_requests,
+                        "limit": ws.concurrency_limit,
+                    })
+                    ref = ws.handle.generate.remote(
+                        req.prompt, req.sampling_params, perftrace_id=trace_id
+                    )
+                    perftrace.mark(trace_id, "sch_sent")
+                    result = await ref
+                    perftrace.mark(trace_id, "sch_worker_ret")
+                    self._record_worker_marks(trace_id, tracked_worker_idx, result)
                 if not req.future.done():
                     req.future.set_result(result)
             except asyncio.CancelledError:
@@ -785,6 +815,8 @@ class Scheduler:
             if not req.future.done():
                 req.future.set_exception(e)
         finally:
+            if trace_id is not None:
+                perftrace.mark(trace_id, "sch_task_end", {"sid": req.id})
             if current_task is not None and tracked_worker_idx is not None:
                 self._inflight_tasks[tracked_worker_idx].discard(current_task)
             if ws is not None:
@@ -898,3 +930,53 @@ class Scheduler:
             "requests": requests_payload,
             "replicas": replicas_payload,
         }
+
+    # ------------------------------------------------------------------
+    # Perftrace
+    # ------------------------------------------------------------------
+
+    def _perftrace_gauges(self) -> dict[str, Any]:
+        workers = list(self._workers)
+        return {
+            "sch_submitted": self._next_id,
+            "sch_inflight": sum(len(tasks) for tasks in list(self._inflight_tasks.values())),
+            "sch_active": [ws.active_requests for ws in workers],
+            "sch_limit": [ws.concurrency_limit for ws in workers],
+            "sch_engine_running": [ws.running_reqs for ws in workers],
+            "sch_engine_waiting": [ws.waiting_reqs for ws in workers],
+        }
+
+    @staticmethod
+    def _record_worker_marks(trace_id: str, worker_idx: int | None, result: Any) -> None:
+        """Re-record the marks a traced worker returned, under the request's id."""
+        if not isinstance(result, dict):
+            return
+        marks = result.pop("_perftrace", None)
+        if not marks:
+            return
+        perftrace.extend(
+            (trace_id, point, wall_ns, {"worker": worker_idx, **(extra or {})})
+            for point, wall_ns, extra in marks
+        )
+
+    async def perftrace_drain(self) -> list[dict[str, Any]]:
+        """This process's perftrace ring plus each worker's, tagged with its replica."""
+        if not perftrace.enabled():
+            return []
+        sources = [perftrace.drain()]
+        handles = [(idx, ws.handle) for idx, ws in enumerate(self._workers)]
+        results = await asyncio.gather(
+            *[h.perftrace_drain.remote() for _, h in handles],
+            return_exceptions=True,
+        )
+        for (idx, _), res in zip(handles, results):
+            if isinstance(res, Exception):
+                sources.append({
+                    "src": "worker",
+                    "replica": idx,
+                    "marks": [[None, "drain_error", time.time_ns(), {"error": repr(res)[:500]}]],
+                })
+            elif isinstance(res, dict):
+                res["replica"] = idx
+                sources.append(res)
+        return sources

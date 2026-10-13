@@ -17,6 +17,7 @@ from uuid import uuid4
 import ray
 
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
+from arctic_platform.inference.server import perftrace
 from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
 from arctic_platform.inference.server.streaming import StreamingWorkerMixin, stream_lifecycle_change
@@ -718,6 +719,7 @@ class InferenceWorker(StreamingWorkerMixin):
         request_id: str,
         reasoning_ended: bool | None = None,
         lora_request: Any | None = None,
+        trace_marks: list[tuple[str, int, dict[str, Any] | None]] | None = None,
     ) -> Any:
         final_output = None
         generate_kwargs: dict[str, Any] = {
@@ -727,16 +729,22 @@ class InferenceWorker(StreamingWorkerMixin):
         }
         if lora_request is not None:
             generate_kwargs["lora_request"] = lora_request
+        outputs = 0
         try:
             async for output in self.llm.generate(
                 prompt_input,
                 params,
                 **generate_kwargs,
             ):
+                if trace_marks is not None and outputs == 0:
+                    trace_marks.append(("wk_first_output", time.time_ns(), None))
+                outputs += 1
                 final_output = output
         except GeneratorExit:
             raise
 
+        if trace_marks is not None:
+            trace_marks.append(("wk_last_output", time.time_ns(), {"outputs": outputs}))
         return final_output
 
     async def initialize(
@@ -747,6 +755,8 @@ class InferenceWorker(StreamingWorkerMixin):
     ) -> None:
         if extra_env:
             os.environ.update(extra_env)
+        if perftrace.configure(role="worker"):
+            perftrace.start_sampler(process_tree=True)
 
         # Multi-node coordinators use num_gpus=0 (CVD=''). Clear before any CUDA
         # touch so router-replay NCCL can use a local GPU.
@@ -1085,8 +1095,20 @@ class InferenceWorker(StreamingWorkerMixin):
             grammar_stop_token_ids=grammar_stop_token_ids,
         )
 
-    async def generate(self, prompt: Any, sampling_params: dict[str, Any]) -> dict[str, Any]:
-        """Generate for one prompt: text, ``list[int]``, or a 1-D integer CPU tensor of token ids."""
+    async def generate(
+        self,
+        prompt: Any,
+        sampling_params: dict[str, Any],
+        perftrace_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate for one prompt: text, ``list[int]``, or a 1-D integer CPU tensor of token ids.
+
+        ``perftrace_id`` is set by a scheduler tracing this request; the result
+        then carries this worker's marks under ``"_perftrace"``.
+        """
+        trace_marks: list[tuple[str, int, dict[str, Any] | None]] | None = None
+        if perftrace_id is not None:
+            trace_marks = [("wk_enter", time.time_ns(), None)]
         if self.state != WorkerLifecycleState.READY:
             raise RuntimeError(f"Worker not ready: state={self.state.value}")
         if getattr(self, "_stream_cleanup_failed", False):
@@ -1154,12 +1176,15 @@ class InferenceWorker(StreamingWorkerMixin):
         else:
             prompt_input = effective_prompt
 
+        if trace_marks is not None:
+            trace_marks.append(("wk_engine_submit", time.time_ns(), None))
         final_output = await self._generate_once(
             prompt_input,
             params,
             request_id,
             reasoning_ended=reasoning_ended,
             lora_request=self._active_lora_request(),
+            trace_marks=trace_marks,
         )
         result = _result_from_output(
             final_output,
@@ -1181,6 +1206,12 @@ class InferenceWorker(StreamingWorkerMixin):
                 fallback_prompt_token_ids=prompt_token_ids,
                 reasoning_ended=reasoning_ended,
             )
+        if trace_marks is not None:
+            trace_marks.append(("wk_result", time.time_ns(), {
+                "prompt_len": result.get("prompt_len"),
+                "prefix_cache_len": result.get("prefix_cache_len"),
+            }))
+            result["_perftrace"] = trace_marks
         return result
 
     def _apply_reasoning_parser(self, result: dict[str, Any], *, reasoning_ended: bool | None = None) -> None:
@@ -1239,6 +1270,10 @@ class InferenceWorker(StreamingWorkerMixin):
             "snapshots": get_collector().drain_snapshots(),
             "action_mask_replay_cache": action_mask_replay_cache_stats(),
         }
+
+    def perftrace_drain(self) -> dict[str, Any]:
+        """Return and clear this worker's perftrace ring (samples and engine stats)."""
+        return perftrace.drain()
 
     def set_replica_id(self, replica_id: int) -> None:
         """Tell this worker its position in the replica pool so that the
