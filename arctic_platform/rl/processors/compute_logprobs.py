@@ -63,8 +63,9 @@ def compute_logprobs_post(model_outputs: dict, batch: dict, meta: dict, device: 
     positions. Pass through when the model already returned ``logprobs``.
     """
     del device
-    if "logprobs" in model_outputs:
-        return {}
+    logprobs = model_outputs.get("logprobs")
+    if logprobs is not None:
+        return {"logprobs": logprobs}
 
     logits = model_outputs.get("logits")
     if logits is None:
