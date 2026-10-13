@@ -21,6 +21,7 @@ import logging
 
 from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import JobId
+from arctic_platform.client.config import OnPremConfig
 from arctic_platform.client.transport import JOB_CREATE_ORDER
 from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
@@ -45,22 +46,11 @@ class OnPremTransport(Transport):
     server instead of creating one, and never tears it down.
     """
 
-    def __init__(self, config: ArcticClientConfig, server_state: object | None = None) -> None:
+    def __init__(self, config: OnPremConfig, server_state: object | None = None) -> None:
         self.config = config
         self.jobs = JobHandles()
         self._reconnect = server_state is not None
-        if self._reconnect:
-            self._state = server_state
-        else:
-            from arctic_platform.rl.ray_server import create_arctic_rl_ray_server_state
-
-            self._state = create_arctic_rl_ray_server_state(
-                training_gpus=config.training_gpus,
-                sampling_gpus=config.sampling_gpus,
-                log_prob_gpus=config.log_prob_gpus,
-                log_prob_engine=config.sampling.log_prob_engine,
-                colocate=config.backend.colocate,
-            )
+        self._state = server_state
         self._server = None  # ArcticRLRayServer, built once jobs exist
         # One long-lived loop for every sync op instead of asyncio.run() per call.
         self._loop = asyncio.new_event_loop()
@@ -79,17 +69,26 @@ class OnPremTransport(Transport):
         self.__dict__.update(state)
         self._loop = asyncio.new_event_loop()
 
-    def initialize(self) -> JobHandles:
-        reconnect = JobHandles.from_config(self.config)
+    def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
+        if not self._reconnect:
+            from arctic_platform.rl.ray_server import create_arctic_rl_ray_server_state
+
+            self._state = create_arctic_rl_ray_server_state(
+                training_gpus=client_config.training_gpus,
+                sampling_gpus=client_config.sampling_gpus,
+                log_prob_gpus=client_config.log_prob_gpus,
+                log_prob_engine=client_config.sampling.log_prob_engine,
+                colocate=self.config.colocate,
+            )
+        reconnect = JobHandles.from_config(client_config)
         if reconnect.any_set:
             self.jobs = reconnect
             self._build_server()
             return self.jobs
-        cfg = self.config
         try:
             for job_type in JOB_CREATE_ORDER:
-                if cfg.gpus_for(job_type) > 0:
-                    self.jobs.set(job_type, self._start(cfg.to_onprem(job_type)))
+                if client_config.gpus_for(job_type) > 0:
+                    self.jobs.set(job_type, self._start(client_config.to_onprem(job_type)))
             self._build_server()
         except Exception:
             # Tear down partial jobs so GPUs are not orphaned.
