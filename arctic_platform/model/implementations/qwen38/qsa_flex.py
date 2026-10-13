@@ -63,6 +63,37 @@ def _gather_sequence_no_grad(tensor: torch.Tensor, group) -> torch.Tensor:
     return torch.cat(gathered, dim=1)
 
 
+def _normalize_packed_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+    *,
+    sequence_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if not torch.is_tensor(cu_seqlens) or cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+        raise ValueError("Qwen3.8 packed boundaries must be a one-dimensional tensor with at least two entries")
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32)
+    if int(cu_seqlens[0]) != 0:
+        raise ValueError("Qwen3.8 packed boundaries must start at zero")
+    if bool((cu_seqlens[1:] <= cu_seqlens[:-1]).any()):
+        raise ValueError("Qwen3.8 packed boundaries must be strictly increasing")
+    real_length = int(cu_seqlens[-1])
+    if real_length > sequence_length:
+        raise ValueError(f"Qwen3.8 packed boundaries end at {real_length}, beyond sequence length {sequence_length}")
+    if real_length < sequence_length:
+        cu_seqlens = torch.cat(
+            [
+                cu_seqlens,
+                torch.arange(
+                    real_length + 1,
+                    sequence_length + 1,
+                    device=device,
+                    dtype=torch.int32,
+                ),
+            ]
+        )
+    return cu_seqlens
+
+
 def _compact_qsa_mask(*, attention_mask=None, **_kwargs):
     if attention_mask is not None and attention_mask.ndim != 2:
         raise NotImplementedError("Qwen3.8 QSA FlexAttention supports only a 2D right-padded attention mask")
@@ -235,9 +266,17 @@ def _qsa_indexer_forward(
     global_cos = _gather_sequence_no_grad(local_cos[:, -local_sequence_length:].expand(batch_size, -1, -1), cp_group)
     global_sin = _gather_sequence_no_grad(local_sin[:, -local_sequence_length:].expand(batch_size, -1, -1), cp_group)
     global_positions = _gather_sequence_no_grad(position_ids.expand(batch_size, -1), cp_group)
+    if cu_seqlens is not None:
+        cu_seqlens = _normalize_packed_cu_seqlens(
+            cu_seqlens,
+            sequence_length=global_raw_key.shape[1],
+            device=hidden_states.device,
+        )
     selected = torch.full(
         (batch_size, local_sequence_length, self.token_budget + self.compress_ratio - 1),
-        -1, dtype=torch.int32, device=hidden_states.device,
+        -1,
+        dtype=torch.int32,
+        device=hidden_states.device,
     )
     query_offset = cp_rank * local_sequence_length
     for batch_idx, length in enumerate(lengths):
@@ -256,23 +295,27 @@ def _qsa_indexer_forward(
                 continue
             num_blocks = (end - start) // self.compress_ratio
             stop = start + num_blocks * self.compress_ratio
-            grouped_key = global_raw_key[batch_idx:batch_idx + 1, start:stop].unflatten(
-                1, (num_blocks, self.compress_ratio),
+            grouped_key = global_raw_key[batch_idx : batch_idx + 1, start:stop].unflatten(
+                1,
+                (num_blocks, self.compress_ratio),
             )
             compressed_key = grouped_key.float().mean(dim=2).to(raw_key.dtype)
             compressed_key = apply_rotary_pos_emb(
                 self.k_layernorm(compressed_key),
-                cos=global_cos[batch_idx:batch_idx + 1, start:stop:self.compress_ratio],
-                sin=global_sin[batch_idx:batch_idx + 1, start:stop:self.compress_ratio],
+                cos=global_cos[batch_idx : batch_idx + 1, start : stop : self.compress_ratio],
+                sin=global_sin[batch_idx : batch_idx + 1, start : stop : self.compress_ratio],
                 unsqueeze_dim=2,
             )
             query_slice = slice(local_start - query_offset, local_end - query_offset)
             routes = select_qsa_token_ids(
-                query[batch_idx:batch_idx + 1, query_slice], compressed_key,
-                lengths.new_tensor([end - start]), token_budget=self.token_budget,
-                compress_ratio=self.compress_ratio, query_offset=local_start - start,
+                query[batch_idx : batch_idx + 1, query_slice],
+                compressed_key,
+                lengths.new_tensor([end - start]),
+                token_budget=self.token_budget,
+                compress_ratio=self.compress_ratio,
+                query_offset=local_start - start,
             )
-            selected[batch_idx:batch_idx + 1, query_slice] = torch.where(routes >= 0, routes + start, routes)
+            selected[batch_idx : batch_idx + 1, query_slice] = torch.where(routes >= 0, routes + start, routes)
     return selected
 
 
@@ -482,7 +525,11 @@ def _qsa_attention_forward(
 
     # Packed-row boundaries from the caller's varlen metadata, when given, outrank boundaries inferred from positions.
     selected_token_ids = self.indexer(
-        hidden_states, position_embeddings, attention_mask, past_key_values, qsa_position_ids,
+        hidden_states,
+        position_embeddings,
+        attention_mask,
+        past_key_values,
+        qsa_position_ids,
         _kwargs.get("cu_seq_lens_q"),
     )
     position_embeddings = tuple(value[:, -hidden_states.shape[1] :] for value in position_embeddings)
