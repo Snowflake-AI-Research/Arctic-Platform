@@ -26,6 +26,7 @@ live in the [project README](../README.md).
 | [**SFT**](sft.md) | Supervised fine-tuning — CPU client, wire batch, `sft` vs `sft_ce`, config |
 | [**RL**](rl.md) | Reinforcement learning — engines, client API, ZoRRo Train / Inference, integrations |
 | [**Common**](common.md) | Shared server infra — HTTP CLI, jobs/endpoints, DeepSpeed worker, metrics, env |
+| [**Long-sequence tuning**](long-seqlen-tuning-guide.md) | Memory controls, tuning order, measured ceilings, and allocator diagnostics across `arctic-platform` and `dss-platform` |
 
 ## Quick paths
 
