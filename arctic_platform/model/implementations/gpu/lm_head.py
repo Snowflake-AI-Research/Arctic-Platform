@@ -86,7 +86,7 @@ def safe_chunked_labels(labels):
     return torch.where(ignore_mask, substitute, labels).contiguous(), ignore_mask.contiguous()
 
 
-_VALIDATED_TARGETS_ATTR = "_dss_validated_lm_head_vocab_size"
+_VALIDATED_TARGETS_ATTR = "_ap_validated_lm_head_vocab_size"
 
 
 def mark_lm_head_targets_validated(labels, *, vocab_size: int):
@@ -156,6 +156,8 @@ def _get_sequence_chunked_logprob_fn():
     enable_* helpers at config-validation time."""
     import torch
 
+    from arctic_platform.model.implementations.gpu.grouped_lm_head import GroupedLogProbAccumulator
+
     def online_logsumexp_update(m, s, chunk_logits):
         """Streaming logsumexp: combine the running ``(max, sum_exp)`` state
         ``(m, s)`` with a new ``[N, k]`` chunk's logits, returning the
@@ -192,6 +194,7 @@ def _get_sequence_chunked_logprob_fn():
             vocab_chunk_size: int,
             fp32_lm_head: bool,
             action_masks=None,
+            group_token_ids=None,
         ):
             if hidden.dim() != 2 or weight.dim() != 2:
                 raise ValueError(
@@ -214,6 +217,15 @@ def _get_sequence_chunked_logprob_fn():
             device = hidden.device
             labels = labels.to(torch.long)
             inv_temperature = inv_temperature.to(torch.float32)
+            grouped = (
+                None
+                if group_token_ids is None
+                else GroupedLogProbAccumulator(
+                    group_token_ids,
+                    inv_temperature,
+                    vocab_size,
+                )
+            )
 
             logprobs = torch.empty(n_tokens, device=device, dtype=torch.float32)
             logz = torch.empty(n_tokens, device=device, dtype=torch.float32)
@@ -257,6 +269,8 @@ def _get_sequence_chunked_logprob_fn():
                     if torch.any(mask):
                         idx = (labels_chunk[mask] - vocab_start).to(torch.long)
                         target_logits[mask] = scaled_logits[mask, idx]
+                    if grouped is not None:
+                        grouped.accumulate_forward_tile(scaled_logits, start, vocab_start)
 
                 # log_softmax(x)[t] = x[t] - logsumexp(x). Cache logz so
                 # backward can rebuild softmax without re-streaming logits.
@@ -276,10 +290,13 @@ def _get_sequence_chunked_logprob_fn():
             ctx.token_chunk_size = token_chunk_size
             ctx.vocab_chunk_size = vocab_chunk_size
             ctx.fp32_lm_head = fp32_lm_head
-            return logprobs
+            ctx.grouped = grouped
+            if grouped is None:
+                return logprobs
+            return logprobs, grouped.normalized_log_probs(logz)
 
         @staticmethod
-        def backward(ctx, grad_logprobs):
+        def backward(ctx, grad_logprobs, grad_group_log_probs=None):
             saved = ctx.saved_tensors
             hidden, weight, labels, inv_temperature, logz = saved[:5]
             bias = saved[5] if ctx.has_bias else None
@@ -287,6 +304,7 @@ def _get_sequence_chunked_logprob_fn():
             vocab_chunk_size: int = ctx.vocab_chunk_size
             fp32_lm_head: bool = ctx.fp32_lm_head
             action_masks = ctx.action_masks
+            grouped = ctx.grouped
 
             n_tokens = hidden.shape[0]
             vocab_size = weight.shape[0]
@@ -306,6 +324,14 @@ def _get_sequence_chunked_logprob_fn():
                 inv_t_chunk = inv_temperature[start:end].to(torch.float32).unsqueeze(-1)
                 logz_chunk = logz[start:end]
                 token_masks = slice_lm_head_action_masks(action_masks, token_start=start, token_end=end)
+                normalizer_gradients = grad_chunk
+                group_gradient_state = None
+                if grouped is not None:
+                    if grad_group_log_probs is None:
+                        grad_group_log_probs = torch.zeros_like(grouped.groups)
+                    normalizer_gradients, group_gradient_state = grouped.combine_output_gradients(
+                        grad_chunk, grad_group_log_probs, start, end
+                    )
 
                 for vocab_start in range(0, vocab_size, vocab_chunk_size):
                     vocab_end = min(vocab_start + vocab_chunk_size, vocab_size)
@@ -329,11 +355,18 @@ def _get_sequence_chunked_logprob_fn():
                     probs = torch.exp(scaled_logits - logz_chunk.unsqueeze(-1))
 
                     # d log_softmax(z)[t] / d z = onehot(t) - softmax(z).
-                    grad_logits = (-grad_chunk).unsqueeze(-1) * probs
+                    grad_logits = (-normalizer_gradients).unsqueeze(-1) * probs
                     mask = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
                     if torch.any(mask):
                         idx = (labels_chunk[mask] - vocab_start).to(torch.long)
                         grad_logits[mask, idx] += grad_chunk[mask]
+                    if grouped is not None:
+                        grouped.add_group_gradients_to_tile(
+                            grad_logits,
+                            scaled_logits,
+                            group_gradient_state,
+                            vocab_start,
+                        )
                     # Chain rule for temperature scaling: scaled = logits * inv_t.
                     grad_logits = grad_logits * inv_t_chunk
 
@@ -348,6 +381,7 @@ def _get_sequence_chunked_logprob_fn():
                 None,
                 None,
                 grad_bias.to(bias.dtype) if grad_bias is not None else None,
+                None,
                 None,
                 None,
                 None,
@@ -415,6 +449,19 @@ def _coerce_BS_shape(name: str, t, batch_size: int, seq_len: int):
     return t.reshape(batch_size, seq_len)
 
 
+def _coerce_BSG_shape(name: str, tensor, batch_size: int, seq_len: int):
+    """Reshape candidate ids to ``[B, S, M]`` while preserving their width."""
+    positions = batch_size * seq_len
+    if tensor.ndim >= 3 and tuple(tensor.shape[:2]) == (batch_size, seq_len):
+        return tensor.reshape(batch_size, seq_len, -1)
+    if tensor.ndim < 2 or positions == 0 or tensor.numel() % positions:
+        raise ValueError(
+            f"{name} shape {tuple(tensor.shape)} must provide the same candidate "
+            f"width for hidden states [{batch_size}, {seq_len}, *]"
+        )
+    return tensor.reshape(batch_size, seq_len, -1)
+
+
 def chunked_lm_head_logprobs(
     hidden_states,
     weight,
@@ -426,13 +473,17 @@ def chunked_lm_head_logprobs(
     vocab_chunk_size: int,
     fp32_lm_head: bool,
     action_masks=None,
+    group_token_ids=None,
 ):
-    """Per-token logprobs at ``labels`` via tiled (token x vocab) matmuls.
+    """Per-token and optional grouped log probabilities via tiled matmuls.
 
     Flattens ``[B, S, *]`` to ``[B*S, *]`` so the autograd Function can iterate
-    a 1-D token axis; reshapes the output back to ``[B, S]``.
+    a 1-D token axis. When ``group_token_ids`` is present, returns
+    ``(logprobs [B,S], group_log_probs [B,S,M+1])``.
     """
     import torch
+
+    from arctic_platform.model.implementations.gpu.grouped_lm_head import prepare_group_temperature
 
     if hidden_states.dim() != 3:
         raise ValueError(f"expected hidden_states [B,S,H], got {tuple(hidden_states.shape)}")
@@ -443,6 +494,18 @@ def chunked_lm_head_logprobs(
     n_tokens = batch_size * seq_len
     validate_lm_head_targets(labels, vocab_size=int(weight.shape[0]))
     labels = _coerce_BS_shape("labels", labels.to(hidden_states.device), batch_size, seq_len)
+    if group_token_ids is not None:
+        group_token_ids = _coerce_BSG_shape(
+            "group_token_ids",
+            group_token_ids,
+            batch_size,
+            seq_len,
+        )
+        temperature = prepare_group_temperature(
+            temperature,
+            token_shape=(batch_size, seq_len),
+            device=hidden_states.device,
+        )
 
     hidden_flat = hidden_states.reshape(n_tokens, hidden_size).contiguous()
     labels_flat, ignore_mask = safe_chunked_labels(labels.reshape(n_tokens).to(torch.long))
@@ -453,7 +516,7 @@ def chunked_lm_head_logprobs(
     inv_temperature = inv_temperature_for_tokens(temperature, batch_size, seq_len, hidden_states.device)
 
     fn = _get_sequence_chunked_logprob_fn()
-    logprobs = fn.apply(
+    outputs = fn.apply(
         hidden_flat,
         weight,
         labels_flat,
@@ -463,8 +526,14 @@ def chunked_lm_head_logprobs(
         int(vocab_chunk_size),
         bool(fp32_lm_head),
         lm_head_action_masks,
+        group_token_ids,
     )
-    return logprobs.reshape(batch_size, seq_len)
+    if group_token_ids is None:
+        return outputs.reshape(batch_size, seq_len)
+    return (
+        outputs[0].reshape(batch_size, seq_len),
+        outputs[1].reshape(batch_size, seq_len, -1),
+    )
 
 
 def enable_chunked_lm_head_logprobs(
@@ -516,6 +585,7 @@ def enable_chunked_lm_head_logprobs(
         temperature=None,
         action_masks=None,
         dss_compute_logprobs: bool = False,
+        group_token_ids=None,
         **kwargs,
     ):
         import torch
@@ -574,8 +644,23 @@ def enable_chunked_lm_head_logprobs(
         hidden_states = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
         if labels.dim() != 2:
             labels = inherit_lm_head_target_validation(labels, labels.reshape(hidden_states.shape[:2]))
-        if torch.is_tensor(temperature) and temperature.numel() > 1 and temperature.dim() != 2:
+        if group_token_ids is not None:
+            from arctic_platform.model.implementations.gpu.grouped_lm_head import prepare_group_temperature
+
+            temperature = prepare_group_temperature(
+                temperature,
+                token_shape=tuple(hidden_states.shape[:2]),
+                device=hidden_states.device,
+            )
+        elif torch.is_tensor(temperature) and temperature.numel() > 1 and temperature.dim() != 2:
             temperature = temperature.reshape(hidden_states.shape[:2])
+        if group_token_ids is not None:
+            group_token_ids = _coerce_BSG_shape(
+                "group_token_ids",
+                group_token_ids,
+                int(hidden_states.shape[0]),
+                int(hidden_states.shape[1]),
+            )
 
         # ``logits_to_keep > 0`` is the HF convention for "only score the last
         # k tokens" (e.g. RL rollouts of length k); a 1D integer tensor names the kept columns directly.
@@ -594,8 +679,10 @@ def enable_chunked_lm_head_logprobs(
         hidden_states = hidden_states[:, slice_indices, :]
         labels = inherit_lm_head_target_validation(labels, labels[:, slice_indices])
         temperature = slice_temperature_for_logits_to_keep(temperature, slice_indices)
+        if group_token_ids is not None:
+            group_token_ids = group_token_ids[:, slice_indices]
 
-        return {
+        outputs = {
             "logprobs": chunked_lm_head_logprobs(
                 hidden_states,
                 self.lm_head.weight,
@@ -606,8 +693,12 @@ def enable_chunked_lm_head_logprobs(
                 vocab_chunk_size=self._dss_chunked_lm_head_vocab_chunk_size,
                 fp32_lm_head=self._dss_chunked_lm_head_fp32,
                 action_masks=action_masks,
+                group_token_ids=group_token_ids,
             )
         }
+        if group_token_ids is not None:
+            outputs["logprobs"], outputs["group_log_probs"] = outputs["logprobs"]
+        return outputs
 
     model.forward = types.MethodType(dss_forward, model)
     model._dss_chunked_lm_head_old_forward = old_forward
