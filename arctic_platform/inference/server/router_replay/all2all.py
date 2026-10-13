@@ -23,19 +23,19 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
-from dataclasses import field
-from typing import Any
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 import torch
 
-from arctic_platform.inference.server.router_replay.cache import ROUTER_REPLAY_CACHE_DTYPE
-from arctic_platform.inference.server.router_replay.cache import RouterReplayCacheRX
-from arctic_platform.inference.server.router_replay.cache import RouterReplayCacheTX
-from arctic_platform.inference.server.router_replay.cache import RouterReplayDuplicateError
-from arctic_platform.inference.server.router_replay.cache import RouterReplayMissingError
-from arctic_platform.inference.server.router_replay.cache import is_exact_replay_id
+from arctic_platform.inference.server.router_replay.cache import (
+    ROUTER_REPLAY_CACHE_DTYPE,
+    RouterReplayCacheRX,
+    RouterReplayCacheTX,
+    RouterReplayDuplicateError,
+    RouterReplayMissingError,
+    is_exact_replay_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,8 @@ def _compute_plan(
             dtype_by_sid[sid] = _ROUTED_EXPERTS_DTYPE if m.dtypes is None else m.dtypes[sid]
 
     duplicate_exact = sorted(
-        sid for sid, sender_ranks in owners.items() if len(sender_ranks) > 1 and is_exact_replay_id(sid)
+        sid for sid, sender_ranks in owners.items()
+        if len(sender_ranks) > 1 and is_exact_replay_id(sid)
     )
     if duplicate_exact:
         raise RouterReplayDuplicateError(
@@ -117,11 +118,13 @@ def _compute_plan(
             owners={sid: owners[sid] for sid in duplicate_exact},
         )
     duplicate_legacy = sorted(
-        sid for sid, sender_ranks in owners.items() if len(sender_ranks) > 1 and not is_exact_replay_id(sid)
+        sid for sid, sender_ranks in owners.items()
+        if len(sender_ranks) > 1 and not is_exact_replay_id(sid)
     )
     if duplicate_legacy:
         logger.warning(
-            "router-replay legacy duplicate ids use lowest-rank owner count=%d ids_head=%s owners_head=%s",
+            "router-replay legacy duplicate ids use lowest-rank owner "
+            "count=%d ids_head=%s owners_head=%s",
             len(duplicate_legacy),
             duplicate_legacy[:8],
             {sid: owners[sid] for sid in duplicate_legacy[:8]},
@@ -163,7 +166,9 @@ def _missing_is_tolerated(
     must raise too or they would block in the data collective without it.
     """
     return all(m.supports_allow_missing for m in manifests) and all(
-        m.allow_missing for m in manifests if m.role == "receiver" and not missing.isdisjoint(m.needed)
+        m.allow_missing
+        for m in manifests
+        if m.role == "receiver" and not missing.isdisjoint(m.needed)
     )
 
 
@@ -223,7 +228,11 @@ class RouterReplayGroup:
         manifest = self._build_send_manifest(snapshot)
         plan, _ = self._exchange_manifest(manifest)  # raises on untolerated missing
         n_sent = self._run_data_exchange_send(plan, snapshot)
-        discard_sample_ids = [op.sample_id for op in plan if op.sender_rank == self.rank and op.discard]
+        discard_sample_ids = [
+            op.sample_id
+            for op in plan
+            if op.sender_rank == self.rank and op.discard
+        ]
         if discard_sample_ids:
             cache_tx.discard(discard_sample_ids)
         self._n_exchanges += 1
@@ -262,13 +271,10 @@ class RouterReplayGroup:
         if stale:
             logger.warning(
                 "router-replay: cleared %d stale RX entries before exchange "
-                "(prior step likely crashed between recv and fwd_bwd)",
-                stale,
+                "(prior step likely crashed between recv and fwd_bwd)", stale,
             )
         manifest = self._build_recv_manifest(
-            needed_sample_ids,
-            discard=discard,
-            allow_missing=allow_missing,
+            needed_sample_ids, discard=discard, allow_missing=allow_missing,
         )
         try:
             plan, missing = self._exchange_manifest(manifest)
@@ -278,10 +284,9 @@ class RouterReplayGroup:
         dropped = list(dict.fromkeys(sid for sid in needed_sample_ids if sid in missing))
         if len(dropped) > 0:
             logger.info(
-                "router-replay: dropped %d of %d needed sample_id(s) with no sender (allow_missing) ids_head=%s",
-                len(dropped),
-                len(needed_sample_ids),
-                dropped[:8],
+                "router-replay: dropped %d of %d needed sample_id(s) with no "
+                "sender (allow_missing) ids_head=%s",
+                len(dropped), len(needed_sample_ids), dropped[:8],
             )
         n_recv = self._run_data_exchange_recv(plan, cache_rx)
         self._n_exchanges += 1
@@ -350,8 +355,7 @@ class RouterReplayGroup:
         )
 
     def _exchange_manifest(
-        self,
-        mine: _PerRankManifest,
+        self, mine: _PerRankManifest,
     ) -> tuple[list[_TransferOp], set[str]]:
         """Phase A + Phase B: gather manifests, compute plan, raise if missing.
 
@@ -361,11 +365,13 @@ class RouterReplayGroup:
         all_manifests: list[_PerRankManifest] = self.pg.all_gather_obj(mine)
         plan, missing = _compute_plan(all_manifests)
         if len(missing) > 0 and not _missing_is_tolerated(all_manifests, missing):
-            legacy_ranks = sorted(m.rank for m in all_manifests if not m.supports_allow_missing)
+            legacy_ranks = sorted(
+                m.rank for m in all_manifests if not m.supports_allow_missing
+            )
             if mine.allow_missing and len(legacy_ranks) > 0:
                 logger.info(
-                    "router-replay: allow_missing refused; ranks %s run a planner without missing-sid tolerance",
-                    legacy_ranks[:16],
+                    "router-replay: allow_missing refused; ranks %s run a "
+                    "planner without missing-sid tolerance", legacy_ranks[:16],
                 )
             # Every rank raises identically (same input -> same missing set),
             # so the data collective never runs and no rank blocks.
@@ -397,7 +403,7 @@ class RouterReplayGroup:
             except KeyError as e:
                 raise RuntimeError(
                     f"router-replay: cache.get({op.sample_id!r}) failed during send "
-                    "despite manifest claim; snapshot is inconsistent"
+                    f"despite manifest claim; snapshot is inconsistent"
                 ) from e
             tensors_by_op.append((op, t.contiguous().view(torch.uint8)))
         self.nccl.group_start()
@@ -421,9 +427,7 @@ class RouterReplayGroup:
         dests: list[tuple[_TransferOp, torch.Tensor]] = []
         for op in my_ops:
             dest = torch.empty(
-                op.shape,
-                dtype=op.dtype,
-                device=self.device,
+                op.shape, dtype=op.dtype, device=self.device,
             )
             dests.append((op, dest))
         self.nccl.group_start()
@@ -473,7 +477,8 @@ def init_router_replay_group(
     pg = nccl.group  # StatelessProcessGroup stored on the comm by PyNccl init
     if pg is None:
         raise RuntimeError(
-            "router-replay: PyNcclCommunicator.group is None — stateless bootstrap did not attach a process group"
+            "router-replay: PyNcclCommunicator.group is None — "
+            "stateless bootstrap did not attach a process group"
         )
     return RouterReplayGroup(
         role=role,

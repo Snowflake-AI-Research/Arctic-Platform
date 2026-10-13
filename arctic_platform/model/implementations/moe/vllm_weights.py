@@ -8,12 +8,17 @@ import torch.nn as nn
 
 def named_weight_sync_tensors(model: nn.Module):
     yield from model.named_parameters()
-    yield from ((name, buffer) for name, buffer in model.named_buffers() if name.endswith(".expert_bias"))
+    yield from (
+        (name, buffer) for name, buffer in model.named_buffers() if name.endswith(".expert_bias")
+    )
 
 
 def raise_unmapped_mlp_keys(packer: str, leftover: list[str]) -> None:
     if leftover:
-        raise RuntimeError(f"{packer} vLLM packer left unmapped mlp keys: " + ", ".join(sorted(leftover)))
+        raise RuntimeError(
+            f"{packer} vLLM packer left unmapped mlp keys: "
+            + ", ".join(sorted(leftover))
+        )
 
 
 def pack_routed_experts_to_vllm(layer_sd: dict, prefix: str) -> None:
@@ -43,7 +48,9 @@ def pack_routed_experts_to_vllm(layer_sd: dict, prefix: str) -> None:
         key
         for key in layer_sd
         if key.startswith(f"{prefix}.mlp.router.")
-        or (key.startswith(f"{prefix}.mlp.experts.") and key not in packed_experts)
+        or (
+            key.startswith(f"{prefix}.mlp.experts.") and key not in packed_experts
+        )
     ]
     raise_unmapped_mlp_keys("generic routed-expert", leftover)
 
@@ -62,7 +69,9 @@ def pack_shared_expert_to_vllm(layer_sd: dict, prefix: str) -> None:
             if old in layer_sd:
                 layer_sd[f"{dst}.{hf_leaf}"] = layer_sd.pop(old)
                 break
-    leftover = [key for key in layer_sd if key.startswith(f"{prefix}.mlp.shared_expert.")]
+    leftover = [
+        key for key in layer_sd if key.startswith(f"{prefix}.mlp.shared_expert.")
+    ]
     raise_unmapped_mlp_keys("generic shared-expert", leftover)
 
 
@@ -90,27 +99,35 @@ def to_vllm_vlm_name(name: str) -> str:
     if name.startswith("lm_head."):
         return "language_model.lm_head." + name[len("lm_head.") :]
     raise RuntimeError(
-        "to_vllm_vlm_name: no Prime-RL -> vLLM VLM rule for parameter "
+        f"to_vllm_vlm_name: no Prime-RL -> vLLM VLM rule for parameter "
         f"name {name!r}. Either Prime-RL grew a new top-level submodule "
-        "or this model is not the Qwen3.5-MoE VLM shape this helper "
-        "was written for. Extend to_vllm_vlm_name with a new rule."
+        f"or this model is not the Qwen3.5-MoE VLM shape this helper "
+        f"was written for. Extend to_vllm_vlm_name with a new rule."
     )
 
 
 def vllm_layer_converter(model: nn.Module):
     cls_name = type(model).__name__
     if cls_name.startswith("Glm5Next"):
-        from arctic_platform.model.implementations.glm53.vllm_weights import convert_glm5_next_layer_to_vllm
+        from arctic_platform.model.implementations.glm53.vllm_weights import (
+            convert_glm5_next_layer_to_vllm,
+        )
 
         return convert_glm5_next_layer_to_vllm
     if cls_name.startswith("Qwen3_5Moe"):
-        raise RuntimeError("Qwen3.5-MoE vLLM packing stays on the qwen3_5_moe path")
+        raise RuntimeError(
+            "Qwen3.5-MoE vLLM packing stays on the qwen3_5_moe path"
+        )
     if cls_name.startswith("NemotronH"):
-        from arctic_platform.model.implementations.nemotron_h.vllm_weights import convert_nemotron_h_layer_to_vllm
+        from arctic_platform.model.implementations.nemotron_h.vllm_weights import (
+            convert_nemotron_h_layer_to_vllm,
+        )
 
         return convert_nemotron_h_layer_to_vllm
     if cls_name.startswith("MiniMaxM2"):
-        from arctic_platform.model.implementations.minimax_m2.vllm_weights import convert_minimax_m2_layer_to_vllm
+        from arctic_platform.model.implementations.minimax_m2.vllm_weights import (
+            convert_minimax_m2_layer_to_vllm,
+        )
 
         return convert_minimax_m2_layer_to_vllm
     return convert_generic_moe_layer_to_vllm
@@ -124,7 +141,9 @@ def build_iter_full_vllm_weights(model: nn.Module):
     import torch.distributed as dist
 
     is_vlm = bool(getattr(model, "_is_vlm", False))
-    layer_prefix_pattern = "model.language_model.layers.{i}" if is_vlm else "model.layers.{i}"
+    layer_prefix_pattern = (
+        "model.language_model.layers.{i}" if is_vlm else "model.layers.{i}"
+    )
 
     def _strip_ac_wrapper(name: str) -> str:
         return name.replace("._checkpoint_wrapped_module", "")
@@ -136,7 +155,12 @@ def build_iter_full_vllm_weights(model: nn.Module):
                 return int(parts[2])
             except ValueError:
                 pass
-        if len(parts) >= 4 and parts[0] == "model" and parts[1] == "language_model" and parts[2] == "layers":
+        if (
+            len(parts) >= 4
+            and parts[0] == "model"
+            and parts[1] == "language_model"
+            and parts[2] == "layers"
+        ):
             try:
                 return int(parts[3])
             except ValueError:
@@ -157,10 +181,16 @@ def build_iter_full_vllm_weights(model: nn.Module):
         for layer_idx in ordered_layers:
             layer_sd: dict[str, torch.Tensor] = {}
             for name, tensor in by_layer[layer_idx]:
-                if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
+                if (
+                    hasattr(tensor, "group_name")
+                    and getattr(tensor, "allreduce", True) is False
+                ):
                     ep_pg = ds_groups._get_expert_parallel_group(tensor.group_name)
                     local = tensor.data.contiguous()
-                    shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_pg))]
+                    shards = [
+                        torch.empty_like(local)
+                        for _ in range(dist.get_world_size(group=ep_pg))
+                    ]
                     dist.all_gather(shards, local, group=ep_pg)
                     if is_master:
                         layer_sd[name] = torch.cat(shards, dim=0)
@@ -175,7 +205,9 @@ def build_iter_full_vllm_weights(model: nn.Module):
             convert_layer(
                 layer_sd,
                 layer_idx,
-                layer_prefix=(layer_prefix_pattern.format(i=layer_idx) if layer_idx >= 0 else None),
+                layer_prefix=(
+                    layer_prefix_pattern.format(i=layer_idx) if layer_idx >= 0 else None
+                ),
             )
 
             for name, tensor in layer_sd.items():

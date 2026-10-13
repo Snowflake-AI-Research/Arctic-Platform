@@ -15,8 +15,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -47,7 +46,8 @@ class RouterReplayMissingError(RuntimeError):
     def __init__(self, missing_sample_ids: list[str]) -> None:
         self.missing_sample_ids = list(missing_sample_ids)
         super().__init__(
-            f"router-replay missing for {len(self.missing_sample_ids)} sample_id(s): {self.missing_sample_ids[:8]}"
+            f"router-replay missing for {len(self.missing_sample_ids)} "
+            f"sample_id(s): {self.missing_sample_ids[:8]}"
             + ("..." if len(self.missing_sample_ids) > 8 else "")
         )
 
@@ -62,7 +62,10 @@ class RouterReplayDuplicateError(RuntimeError):
     def __init__(self, duplicate_sample_ids: list[str], *, owners: dict[str, list[int]] | None = None) -> None:
         self.duplicate_sample_ids = list(duplicate_sample_ids)
         self.owners = dict(owners or {})
-        owner_summary = {sample_id: self.owners.get(sample_id, []) for sample_id in self.duplicate_sample_ids[:8]}
+        owner_summary = {
+            sample_id: self.owners.get(sample_id, [])
+            for sample_id in self.duplicate_sample_ids[:8]
+        }
         super().__init__(
             f"router-replay duplicate exact id(s): count={len(self.duplicate_sample_ids)} "
             f"ids={self.duplicate_sample_ids[:8]} owners={owner_summary}"
@@ -169,7 +172,7 @@ class _RouterReplayCacheBase:
             )
             if projected > self.max_bytes:
                 raise RouterReplayCacheFull(
-                    "router-replay cache would exceed max_bytes "
+                    f"router-replay cache would exceed max_bytes "
                     f"({projected} > {self.max_bytes}) on put({sample_id!r}, "
                     f"shape={list(tensor.shape)}, dtype={tensor.dtype})"
                 )
@@ -295,7 +298,10 @@ class _RouterReplayCacheBase:
         elif isinstance(value, torch.Tensor):
             t = value
         else:
-            raise TypeError(f"router-replay cache.put expects torch.Tensor or np.ndarray, got {type(value).__name__}")
+            raise TypeError(
+                f"router-replay cache.put expects torch.Tensor or np.ndarray, "
+                f"got {type(value).__name__}"
+            )
         if t.dtype not in ROUTER_REPLAY_CACHE_DTYPES:
             t = t.to(ROUTER_REPLAY_CACHE_DTYPE)
         if t.device != self.device:
@@ -380,7 +386,9 @@ class RouterReplayCacheTX(_RouterReplayCacheBase):
     def __init__(self, device: torch.device, max_bytes: int) -> None:
         super().__init__(device=device, max_bytes=max_bytes)
         self._tombstones: OrderedDict[str, float] = OrderedDict()
-        self._tombstone_order_locks = [threading.Lock() for _ in range(_TOMBSTONE_ORDER_LOCK_STRIPES)]
+        self._tombstone_order_locks = [
+            threading.Lock() for _ in range(_TOMBSTONE_ORDER_LOCK_STRIPES)
+        ]
         self.ttl_s = max(0.0, float(os.environ.get("ARCTIC_ROUTER_REPLAY_TX_TTL_S", "86400")))
         self.evict_min_age_s = max(
             0.0,
@@ -418,7 +426,13 @@ class RouterReplayCacheTX(_RouterReplayCacheBase):
     def discard(self, sample_ids: Iterable[str]) -> int:
         """Remove entries and suppress late inserts for absent exact ids."""
         sample_ids = list(sample_ids)
-        lock_indexes = sorted({self._tombstone_order_lock_index(sid) for sid in sample_ids if is_exact_replay_id(sid)})
+        lock_indexes = sorted(
+            {
+                self._tombstone_order_lock_index(sid)
+                for sid in sample_ids
+                if is_exact_replay_id(sid)
+            }
+        )
         order_locks = [self._tombstone_order_locks[index] for index in lock_indexes]
         for lock in order_locks:
             lock.acquire()
@@ -445,7 +459,9 @@ class RouterReplayCacheTX(_RouterReplayCacheBase):
         return hash(sample_id) % len(self._tombstone_order_locks)
 
     def _tombstone_order_lock(self, sample_id: str):
-        return self._tombstone_order_locks[self._tombstone_order_lock_index(sample_id)]
+        return self._tombstone_order_locks[
+            self._tombstone_order_lock_index(sample_id)
+        ]
 
     def clear(self) -> int:
         with self._lock:
@@ -487,8 +503,7 @@ class RouterReplayCacheTX(_RouterReplayCacheBase):
                 projected_after=projected,
             )
             expired = [
-                sid
-                for sid, created_at in self._created_at.items()
+                sid for sid, created_at in self._created_at.items()
                 if sid != sample_id and now - created_at >= self.ttl_s
             ]
             for sid in expired:
