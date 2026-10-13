@@ -18,7 +18,9 @@ def find_free_port():
 
 
 def _sender_fn(port, ref_tensors, world_size):
-    from arctic_platform.inference.server.weight_sync import NCCLEngine
+    from arctic_platform.inference.server.weight_sync.broadcast import (
+        BroadcastNCCLEngine as NCCLEngine,
+    )
 
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
@@ -41,7 +43,9 @@ def _sender_fn(port, ref_tensors, world_size):
 
 
 def _receiver_fn(rank, port, ref_tensors, world_size, results_dict):
-    from arctic_platform.inference.server.weight_sync import NCCLEngine
+    from arctic_platform.inference.server.weight_sync.broadcast import (
+        BroadcastNCCLEngine as NCCLEngine,
+    )
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)

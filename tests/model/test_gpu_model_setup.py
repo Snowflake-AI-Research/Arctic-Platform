@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 import torch
 import torch.nn as nn
@@ -22,6 +25,7 @@ import torch.nn as nn
 from arctic_platform.model import ActivationOffloadConfig
 from arctic_platform.model.implementations.gpu.lm_head import chunked_lm_head_logprobs
 from arctic_platform.model.implementations.gpu.lm_head import enable_fp32_lm_head
+from arctic_platform.model.implementations.gpu.sp import gated_delta_net
 
 
 def test_chunked_lm_head_matches_full_projection_and_gradients():
@@ -74,3 +78,32 @@ def test_fp32_lm_head_projection():
 def test_activation_offload_config_rejects_negative_pin_memory_limit():
     with pytest.raises(ValueError, match="non-negative"):
         ActivationOffloadConfig(pin_memory_max_size_gib=-1)
+
+
+def test_gated_delta_net_resolves_transformers_5_17_module_level_kernels(monkeypatch):
+    implementation = types.ModuleType("fake_transformers_gated_delta_net")
+
+    def causal_conv1d_fn(*args, **kwargs):
+        return args, kwargs
+
+    def torch_chunk_gated_delta_rule(*args, **kwargs):
+        return args, kwargs
+
+    implementation.causal_conv1d_fn = causal_conv1d_fn
+    implementation.torch_chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+    monkeypatch.setitem(sys.modules, implementation.__name__, implementation)
+
+    class TransformersGatedDeltaNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv_kernel_size = 4
+
+    TransformersGatedDeltaNet.__module__ = implementation.__name__
+    module = TransformersGatedDeltaNet()
+
+    assert gated_delta_net._is_gated_delta_net_module(module)
+    assert gated_delta_net._resolve_gated_delta_net_kernel(module, "causal_conv1d_fn") is causal_conv1d_fn
+    assert (
+        gated_delta_net._resolve_gated_delta_net_kernel(module, "chunk_gated_delta_rule")
+        is torch_chunk_gated_delta_rule
+    )
