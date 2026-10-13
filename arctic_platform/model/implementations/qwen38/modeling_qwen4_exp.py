@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 from torch import Tensor
@@ -57,11 +58,59 @@ class EPShardedEmbedding(nn.Embedding):
                 f"rank={rank}, expected={local_rows}, actual={self.weight.shape[0]}"
             )
 
-        local_mask = (input >= start) & (input < start + local_rows)
-        local_input = (input - start).clamp(min=0, max=local_rows - 1)
-        output = F.embedding(local_input, self.weight)
-        output = output * local_mask.unsqueeze(-1).to(output.dtype)
-        return dist_nn.all_reduce(output, group=self._ep_group)
+        input_shape = input.shape
+        flat_input = input.reshape(-1)
+        large_shard_rows = rows_per_rank + 1
+        large_shard_cutoff = remainder * large_shard_rows
+        if rows_per_rank:
+            owners = torch.where(
+                flat_input < large_shard_cutoff,
+                flat_input // large_shard_rows,
+                remainder + (flat_input - large_shard_cutoff) // rows_per_rank,
+            )
+        else:
+            owners = flat_input
+
+        order = torch.argsort(owners, stable=True)
+        send_ids = flat_input[order].contiguous()
+        send_counts_tensor = torch.bincount(owners, minlength=world_size)
+        recv_counts_tensor = torch.empty_like(send_counts_tensor)
+        dist.all_to_all_single(
+            recv_counts_tensor,
+            send_counts_tensor,
+            group=self._ep_group,
+        )
+        send_counts = send_counts_tensor.cpu().tolist()
+        recv_counts = recv_counts_tensor.cpu().tolist()
+
+        recv_ids = torch.empty(
+            sum(recv_counts),
+            dtype=send_ids.dtype,
+            device=send_ids.device,
+        )
+        dist.all_to_all_single(
+            recv_ids,
+            send_ids,
+            output_split_sizes=recv_counts,
+            input_split_sizes=send_counts,
+            group=self._ep_group,
+        )
+        local_output = F.embedding(recv_ids - start, self.weight)
+        sorted_output = torch.empty(
+            (flat_input.numel(), self.embedding_dim),
+            dtype=local_output.dtype,
+            device=local_output.device,
+        )
+        sorted_output = dist_nn.all_to_all_single(
+            sorted_output,
+            local_output,
+            output_split_sizes=send_counts,
+            input_split_sizes=recv_counts,
+            group=self._ep_group,
+        )
+        output = torch.empty_like(sorted_output)
+        output[order] = sorted_output
+        return output.reshape(*input_shape, self.embedding_dim)
 
 
 class Qwen4ExpSparseMoePrimeRL(MoE):
