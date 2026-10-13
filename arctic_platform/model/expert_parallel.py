@@ -38,8 +38,7 @@ def validate_expert_parallel(
         return
     if zero_stage == 3:
         raise ValueError(
-            f"ep_size={ep_size} requires ZeRO stage 1 or 2; "
-            "stage 3 does not support MoE expert-DP groups"
+            f"ep_size={ep_size} requires ZeRO stage 1 or 2; stage 3 does not support MoE expert-DP groups"
         )
     if world_size % ep_size != 0:
         raise ValueError(f"ep_size ({ep_size}) must divide world_size ({world_size})")
@@ -54,7 +53,18 @@ def setup_replicated_expert_groups(ep_size: int) -> None:
         _create_expert_and_data_parallel(ep_size)
 
 
+def expert_parallel_group(ep_size: int):
+    """Return the DeepSpeed expert group registered for this degree."""
+    return _expert_parallel_group(ep_group_name(ep_size))
+
+
 def _create_expert_and_data_parallel(ep_size: int) -> None:
     import deepspeed.utils.groups as ds_groups
 
     ds_groups._create_expert_and_data_parallel(ep_size)
+
+
+def _expert_parallel_group(group_name: str):
+    import deepspeed.utils.groups as ds_groups
+
+    return ds_groups._get_expert_parallel_group(group_name)

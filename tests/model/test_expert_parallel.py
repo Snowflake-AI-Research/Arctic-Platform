@@ -60,3 +60,15 @@ def test_replicated_expert_groups_register_only_when_expert_parallel_is_enabled(
     expert_parallel_mod.setup_replicated_expert_groups(4)
 
     assert calls == [4]
+
+
+def test_expert_parallel_group_uses_the_registry_key(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        expert_parallel_mod,
+        "_expert_parallel_group",
+        lambda group_name: seen.append(group_name) or group_name,
+    )
+
+    assert expert_parallel_mod.expert_parallel_group(8) == "ep_size_8"
+    assert seen == ["ep_size_8"]

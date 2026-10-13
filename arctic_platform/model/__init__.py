@@ -28,7 +28,9 @@ from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
 from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
+from arctic_platform.model.dense_spec import dense_model_spec
 from arctic_platform.model.expert_parallel import ep_group_name
+from arctic_platform.model.expert_parallel import expert_parallel_group
 from arctic_platform.model.expert_parallel import setup_replicated_expert_groups
 from arctic_platform.model.expert_parallel import validate_expert_parallel
 from arctic_platform.model.factory import build_model
@@ -51,12 +53,13 @@ from arctic_platform.model.loader import ModelParallelismMetadata
 from arctic_platform.model.loader import canonical_parameter_name
 from arctic_platform.model.loader import freeze_fp8_weights_and_scales
 from arctic_platform.model.loader import model_parallelism_metadata_from_config
-from arctic_platform.model.moe_spec import moe_model_spec
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import select_loader
+from arctic_platform.model.moe_spec import moe_model_spec
 from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.patch import register_patch
 from arctic_platform.model.patches.peft import apply_peft
+from arctic_platform.model.sequence_parallel import validate_sequence_parallel
 from arctic_platform.model.weight_export import PEFT_ADAPTER_DIRNAME
 from arctic_platform.model.weight_export import WeightExportContract
 from arctic_platform.model.weight_export import checkpoint_peft_adapter_dir
@@ -88,8 +91,10 @@ __all__ = [
     "checkpoint_peft_adapter_dir",
     "conversion_cache_is_node_local",
     "conversion_cache_ready",
+    "dense_model_spec",
     "effective_fused_cross_entropy",
     "ep_group_name",
+    "expert_parallel_group",
     "freeze_fp8_weights_and_scales",
     "gather_peft_adapter_state_dict",
     "get_language_model",
@@ -129,6 +134,7 @@ __all__ = [
     "setup_replicated_expert_groups",
     "validate_lora_sync_trainable_parameters",
     "validate_expert_parallel",
+    "validate_sequence_parallel",
     "validate_lm_head_fused_ce_config",
     "validated_lm_head_targets_to",
     "weight_export_contract",
