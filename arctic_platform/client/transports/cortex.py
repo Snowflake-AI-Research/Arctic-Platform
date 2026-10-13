@@ -70,10 +70,6 @@ _OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
 _OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
-# Neutrino never colocates training and sampling on the same GPUs, so it exposes no
-# sleep/wake surface. They resolve to no-ops here rather than errors, which keeps
-# shared client flows like sync_weights() (wake → operation → wake → reset) portable.
-_NOOP_OPS = {"sleep-inference", "wake-inference", "sleep-training", "wake-training"}
 # /operation is polymorphic: async ops (weight-sync, ...) return {request_id: ...} and we
 # poll to completion; inline ops answer with the finished body directly. Whitelisting the
 # inline set lets us tell the two apart without silently dropping either kind of response.
@@ -216,7 +212,23 @@ class _Route:
         return prefix + self.path.format_map(body | {"job": job}), self.encode(request, body)
 
 
+class _NoopRoute(_Route):
+    """Sends nothing and answers `{}`, whatever the body's shape."""
+
+    def prepare(self, prefix: str, request: Request) -> tuple[str, list[Send]]:
+        return "", []
+
+
+# Neutrino never colocates training and sampling on the same GPUs, so it exposes no
+# sleep/wake surface. These send nothing rather than erroring, which keeps shared
+# client flows like sync_weights() (wake → operation → wake → reset) portable.
+_NOOP = _NoopRoute(method="NOOP", path="")
+
 _ROUTES = {
+    "sleep-inference": _NOOP,
+    "wake-inference": _NOOP,
+    "sleep-training": _NOOP,
+    "wake-training": _NOOP,
     # A replayed create would spawn a second job.
     "create-job": _Route(method="POST", path="", replay_safe=False),
     "get-job": _Route(method="GET", path="/{job}", encode=_no_body),
@@ -449,8 +461,6 @@ class CortexTransport(Transport):
 
     # ── deliver one op ───────────────────────────────────────────────────────
     def call(self, request: Request) -> Any:
-        if request.op in _NOOP_OPS:
-            return {}
         route = _route(request.op)
         url, sends = route.prepare(self._prefix, request)
         reply = self._send_group(route, url, sends)
@@ -459,8 +469,6 @@ class CortexTransport(Transport):
         return route.normalize(reply)
 
     async def acall(self, request: Request) -> Any:
-        if request.op in _NOOP_OPS:
-            return {}
         route = _route(request.op)
         url, sends = route.prepare(self._prefix, request)
         reply = await self._asend_group(route, url, sends)
