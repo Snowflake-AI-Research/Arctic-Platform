@@ -1,35 +1,40 @@
 import functools
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional
+from typing import Union
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn
+from torch import Tensor
+from torch import nn
 from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, logging
+from transformers.utils import TransformersKwargs
+from transformers.utils import logging
 
 from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
 from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
+from arctic_platform.model.implementations.gpu.lm_head import slice_temperature_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import head_parallel_gated_delta_net
+from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
+from arctic_platform.model.implementations.moe.layers.moe import FeedForward
+from arctic_platform.model.implementations.moe.layers.moe import MoE
+from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 
 from ..base import PreTrainedModelPrimeRL
-from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
-from arctic_platform.model.implementations.moe.layers.moe import FeedForward, MoE, MoEArgs
-from ..layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig, apply_rotary_pos_emb
-
+from ..layers.rotary_emb import RotaryEmbedding
+from ..layers.rotary_emb import RotaryEmbeddingConfig
+from ..layers.rotary_emb import apply_rotary_pos_emb
 from .configuration_qwen3_5_moe import Qwen3_5MoeConfig
-from .converting_qwen3_5_moe import (
-    convert_hf_layer_to_tt,
-    convert_hf_to_tt_moe,
-    convert_tt_layer_to_hf,
-    convert_tt_to_hf_moe,
-)
+from .converting_qwen3_5_moe import convert_hf_layer_to_tt
+from .converting_qwen3_5_moe import convert_hf_to_tt_moe
+from .converting_qwen3_5_moe import convert_tt_layer_to_hf
+from .converting_qwen3_5_moe import convert_tt_to_hf_moe
 
 # Optional VLM vision encoder. Text-only loading must work even when the
 # composite VLM vision class is not present in the installed transformers.
@@ -269,9 +274,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         if getattr(self, "cp_group", None) is not None:
             global_cu_seqlens = getattr(self, "_dss_sp_global_cu_seqlens", None)
             if not torch.is_tensor(global_cu_seqlens):
-                raise RuntimeError(
-                    "head-parallel GatedDeltaNet requires global packed cu_seqlens"
-                )
+                raise RuntimeError("head-parallel GatedDeltaNet requires global packed cu_seqlens")
             core_attn_out, _ = head_parallel_gated_delta_net(
                 self._causal_conv1d_fn,
                 self._chunk_gated_delta_rule,
@@ -483,8 +486,8 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
         if self.func is None:
             raise ImportError(
                 f"flash-attn v{flash_attn_version} varlen entry point is not importable; "
-                f"install the matching flash-attn package (v3 -> flash_attn_interface, "
-                f"v4 -> flash_attn.cute)."
+                "install the matching flash-attn package (v3 -> flash_attn_interface, "
+                "v4 -> flash_attn.cute)."
             )
         self._flash_attn_call = self.func
         # This model calls the varlen entry point directly rather than through the attention integration that
@@ -502,9 +505,13 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
         # request that has already been checked against it.
         deterministic = {"deterministic": True} if self._deterministic else {}
         out = self._flash_attn_call(
-            q, k, v,
-            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
             causal=True,
             **deterministic,
         )
@@ -805,14 +812,10 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             is_segment_start[0] = True
             start_indices = torch.nonzero(is_segment_start, as_tuple=False).flatten()
             total_length = flat_position_ids.shape[0]
-            boundaries = torch.cat(
-                [start_indices, start_indices.new_tensor([total_length])]
-            )
+            boundaries = torch.cat([start_indices, start_indices.new_tensor([total_length])])
             segment_lengths = (boundaries[1:] - boundaries[:-1]).to(torch.int32)
             max_seqlen = int(segment_lengths.max().item())
-            cu_seqlens = torch.cat(
-                [segment_lengths.new_zeros(1), segment_lengths.cumsum(dim=0, dtype=torch.int32)]
-            )
+            cu_seqlens = torch.cat([segment_lengths.new_zeros(1), segment_lengths.cumsum(dim=0, dtype=torch.int32)])
             torch._dynamo.mark_dynamic(cu_seqlens, 0)
         else:
             max_seqlen = None
@@ -1045,7 +1048,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        temperature: Union[torch.Tensor, None] = None,
+        temperature: Union[float, torch.Tensor, None] = None,
         action_masks: Optional[object] = None,
         routed_experts: Optional[torch.LongTensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
@@ -1093,10 +1096,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             slice_indices = logits_to_keep
         return self.lm_head(
             hidden_states[:, slice_indices, :],
-            inherit_lm_head_target_validation(labels, labels[:, slice_indices])
-            if labels is not None
-            else None,
-            temperature=temperature[:, slice_indices] if temperature is not None else None,
+            inherit_lm_head_target_validation(labels, labels[:, slice_indices]) if labels is not None else None,
+            temperature=slice_temperature_for_logits_to_keep(temperature, slice_indices),
             action_masks=action_masks,
         )
 
