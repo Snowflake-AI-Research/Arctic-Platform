@@ -221,10 +221,11 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
         routed_experts: Tensor | None = None,
         **kwargs,
     ) -> torch.FloatTensor:
+        ple_position_ids = kwargs.pop("ple_position_ids", None)
         if self.ple is not None:
             hidden_states = hidden_states + self.ple(
                 hidden_states, ple_input_ids, past_key_values, conv_mask=conv_mask,
-                position_ids=kwargs.pop("ple_position_ids", None),
+                position_ids=ple_position_ids,
             )
 
         hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)

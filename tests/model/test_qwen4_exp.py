@@ -590,6 +590,7 @@ def test_packed_ple_survives_custom_lm_head():
 
     class Zero(torch.nn.Module):
         def forward(self, hidden_states, *args, **kwargs):
+            assert "ple_position_ids" not in kwargs
             return torch.zeros_like(hidden_states)
 
     class HiddenHead(torch.nn.Module):
