@@ -44,7 +44,6 @@ it was applied:
 
 from __future__ import annotations
 
-import os
 import shutil
 import traceback
 from pathlib import Path
@@ -52,9 +51,6 @@ from typing import Dict
 from typing import List
 from typing import Sequence
 from typing import Tuple
-
-from arctic_platform.testing_utils import get_unique_port_number
-from arctic_platform.testing_utils import reserve_free_port
 
 from ..harness import gsm8k
 from ..harness.arms import correctness_microbatch_tokens
@@ -336,19 +332,10 @@ def _run(ctx) -> TestResult:
             attn_implementation=ctx.attn_implementation,
             gradient_norms_per_param=False,
         )
-        reload_master_port = reserve_free_port(get_unique_port_number() + 1, span=7)
-        previous_master_port = os.environ.get("MASTER_PORT")
-        os.environ["MASTER_PORT"] = str(reload_master_port)
-        try:
-            with running_job(url, reload_payload) as reloaded_training_job:
-                reloaded_rows = reference_answer_logprobs(
-                    forward_logprobs(url, reloaded_training_job, validation_body), validation_examples
-                )
-        finally:
-            if previous_master_port is None:
-                os.environ.pop("MASTER_PORT", None)
-            else:
-                os.environ["MASTER_PORT"] = previous_master_port
+        with running_job(url, reload_payload) as reloaded_training_job:
+            reloaded_rows = reference_answer_logprobs(
+                forward_logprobs(url, reloaded_training_job, validation_body), validation_examples
+            )
 
     reference_ce, reference_count = cross_entropy(reference_rows)
     reloaded_ce, reloaded_count = cross_entropy(reloaded_rows)

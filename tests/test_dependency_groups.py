@@ -30,6 +30,8 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 from arctic_platform import _dependency_groups as dependency_groups
 
@@ -160,6 +162,20 @@ class TestExtraNamesResolve:
                 if dep.startswith("arctic_platform["):
                     ref = dep.split("[")[1].rstrip("]")
                     assert ref in optional, f"[{extra}] references undefined [{ref}]"
+
+    def test_gpu_transformers_constraints_accept_supported_sft_release(self):
+        """The GPU install must not contradict the SFT model-module requirement."""
+        optional = _optional_dependencies()
+        assert "arctic_platform[sft]" in optional["gpu"]
+        requirements = [
+            Requirement(value)
+            for extra in ("sft", "gpu")
+            for value in optional[extra]
+            if canonicalize_name(Requirement(value).name) == "transformers"
+        ]
+        assert requirements
+        for requirement in requirements:
+            assert requirement.specifier.contains("5.17.0"), f"GPU/SFT conflict: {requirement}"
 
     def test_cortex_install_does_not_pull_the_inference_extra(self):
         """[cortex] and [sft] do not select [inference]. [rl] keeps published arctic-inference."""

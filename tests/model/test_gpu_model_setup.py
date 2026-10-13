@@ -22,6 +22,56 @@ import torch.nn as nn
 from arctic_platform.model import ActivationOffloadConfig
 from arctic_platform.model.implementations.gpu.lm_head import chunked_lm_head_logprobs
 from arctic_platform.model.implementations.gpu.lm_head import enable_fp32_lm_head
+from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import torch_assert_close
+
+
+def _check_tile_gradient_accumulation(device, accumulation_axis, dtype):
+    # Uniform logits give exact gradients; many tiles expose contributions
+    # lost when a running BF16 sum grows larger than each new contribution.
+    rows, vocab = (1, 4096) if accumulation_axis == "hidden" else (4096, 8)
+    hidden_value, weight_value = (0.0, 1.0) if accumulation_axis == "hidden" else (1.0, 0.0)
+    hidden = torch.full((1, rows, 1), hidden_value, device=device, dtype=dtype, requires_grad=True)
+    weight = torch.full((vocab, 1), weight_value, device=device, dtype=dtype, requires_grad=True)
+    bias = torch.zeros(vocab, device=device, dtype=dtype, requires_grad=True)
+    labels = torch.full((1, rows), vocab - 1, device=device, dtype=torch.long)
+    actual = chunked_lm_head_logprobs(
+        hidden,
+        weight,
+        labels,
+        bias=bias,
+        token_chunk_size=8,
+        vocab_chunk_size=8,
+        fp32_lm_head=False,
+    )
+    expected = (
+        torch.log_softmax((hidden @ weight.t() + bias).float(), dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    )
+    torch_assert_close(actual, expected, rtol=0, atol=1e-6)
+    (-actual.mean()).backward(retain_graph=True)
+    actual_hidden_grad, actual_weight_grad, actual_bias_grad = (
+        hidden.grad.clone(),
+        weight.grad.clone(),
+        bias.grad.clone(),
+    )
+    hidden.grad = weight.grad = bias.grad = None
+    (-expected.mean()).backward()
+    torch_assert_close(actual_hidden_grad, hidden.grad, rtol=0, atol=1e-6)
+    torch_assert_close(actual_weight_grad, weight.grad, rtol=0, atol=1e-6)
+    torch_assert_close(actual_bias_grad, bias.grad, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("accumulation_axis", ["hidden", "weight"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_chunked_lm_head_preserves_small_tile_gradients(accumulation_axis, dtype):
+    _check_tile_gradient_accumulation("cpu", accumulation_axis, dtype)
+
+
+@require_torch_gpu
+@pytest.mark.parametrize("accumulation_axis", ["hidden", "weight"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_chunked_lm_head_preserves_small_tile_gradients_cuda(accumulation_axis, dtype):
+    _check_tile_gradient_accumulation("cuda", accumulation_axis, dtype)
 
 
 def test_chunked_lm_head_matches_full_projection_and_gradients():

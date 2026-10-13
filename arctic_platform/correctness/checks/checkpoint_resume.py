@@ -39,10 +39,14 @@ from decimal import Decimal
 from typing import Dict
 from typing import List
 
+from ..harness.arms import ArmDefinition
+from ..harness.arms import correctness_microbatch_tokens
 from ..harness.batches import Batch
 from ..harness.batches import build_batch
 from ..harness.dss_driver import GatewayTransport
-from ..harness.dss_driver import pack
+from ..harness.dss_driver import _max_tokens_per_mb_of
+from ..harness.dss_driver import ap_batch_processing_options
+from ..harness.dss_driver import pack_microbatches
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
@@ -85,7 +89,7 @@ RECORDED_ITERATIONS = (CHECKPOINT_ITERATION, ITERATIONS)
     requires_hosted_control_plane=False,
 )
 def run(ctx) -> List[TestResult]:
-    """One transport for the whole check; every case runs its three jobs through it, one at a time.
+    """Each case runs its three jobs through a transport with matching gradient accumulation.
 
     The transport decides where those jobs run -- a gateway on this node, or the hosted control plane --
     and nothing below this line depends on which it is.
@@ -93,21 +97,21 @@ def run(ctx) -> List[TestResult]:
     results: List[TestResult] = []
     workdir = ctx.workdir / TEST_ID
     workdir.mkdir(parents=True, exist_ok=True)
-    with ctx.transport_for(workdir) as transport:
-        for arm in ctx.arms:
-            try:
+    for arm in ctx.arms:
+        try:
+            with ctx.transport_for(workdir / arm.name, arm=arm) as transport:
                 results.append(_run_arm(ctx, transport, arm))
-            except Exception as exc:  # noqa: BLE001 - one failing case must not hide the others
-                traceback.print_exc()
-                results.append(
-                    TestResult(
-                        test_id=TEST_ID,
-                        config_id=ctx.config_id,
-                        arm=arm.name,
-                        outcome=TestOutcome.FAIL,
-                        summary=f"{type(exc).__name__}: {exc}",
-                    )
+        except Exception as exc:  # noqa: BLE001 - one failing case must not hide the others
+            traceback.print_exc()
+            results.append(
+                TestResult(
+                    test_id=TEST_ID,
+                    config_id=ctx.config_id,
+                    arm=arm.name,
+                    outcome=TestOutcome.FAIL,
+                    summary=f"{type(exc).__name__}: {exc}",
                 )
+            )
     return results
 
 
@@ -134,7 +138,15 @@ def iteration_batches(ctx, arm) -> List[Batch]:
 def _iteration_bodies(ctx, arm) -> List[bytes]:
     """The iteration batches as request bytes, so both runs send the same bytes in the same order."""
     provider = str(ctx.cfg.training.get("model_provider", "huggingface"))
-    return [pack(batch, model_provider=provider) for batch in iteration_batches(ctx, arm)]
+    return [
+        pack_microbatches(
+            batch,
+            arm.dss_microbatches,
+            model_provider=provider,
+            **ap_batch_processing_options(ctx.config_id, arm.name),
+        )
+        for batch in iteration_batches(ctx, arm)
+    ]
 
 
 def _trajectory(job: TrainingJob, bodies: List[bytes], *, first_iteration: int) -> Dict[int, float]:
@@ -241,29 +253,33 @@ def measure_undeterministic_loss_range(
 ):
     """Three 10-step runs per case, determinism off. Returns the widest per-iteration loss range.
 
-    Every run of a case consumes the same ten batches, so the range is the engine's spread and not a
-    change of data. The regression that follows keeps best-effort determinism and reads the gate this
-    range selects.
+    Every run consumes identical requests with the case's regression microbatch packing and accumulation.
+    The regression keeps best-effort determinism and reads the gate this range selects.
     """
     provider = str(training_config.get("model_provider", "huggingface"))
     widest = -1.0
     where = ""
     workdir.mkdir(parents=True, exist_ok=True)
-    with GatewayTransport(
-        workdir,
-        training_config,
-        model_path,
-        SEED,
-        slots=slots,
-        attn_implementation=attn_implementation,
-        determinism="off",
-    ) as transport:
-        for arm in arms:
+    token_budget = correctness_microbatch_tokens(_max_tokens_per_mb_of(training_config))
+    dp_size = slots // int(training_config.get("sp_size", 1))
+    for arm in arms:
+        definition = ArmDefinition(arm.name, arm.global_batch_size, arm.max_seq_len)
+        microbatches = definition.microbatches(token_budget, dp_size)
+        with GatewayTransport(
+            workdir / arm.name,
+            training_config,
+            model_path,
+            SEED,
+            slots=slots,
+            attn_implementation=attn_implementation,
+            determinism="off",
+            gradient_accumulation_steps=microbatches,
+        ) as transport:
             batches = [
                 build_batch(arm.name, arm.global_batch_size, arm.max_seq_len, vocab_size, seed=SEED + iteration)
                 for iteration in range(1, CALIBRATION_STEPS + 1)
             ]
-            bodies = [pack(batch, model_provider=provider) for batch in batches]
+            bodies = [pack_microbatches(batch, microbatches, model_provider=provider) for batch in batches]
             runs = []
             for run_index in range(CALIBRATION_RUNS):
                 with transport.job() as job:

@@ -110,9 +110,10 @@ def _dispatch_op_impl(
 
 
 def _dispatch_setup_context(ctx, inputs, output) -> None:
-    x, *_ = inputs
+    x, _, topk_weights, *_ = inputs
     *_, handle_id = output
     ctx.input_dtype = x.dtype
+    ctx.topk_weights_dtype = topk_weights.dtype
     ctx.saved_handle = _handle_cache.get(handle_id.item())
 
 
@@ -130,11 +131,13 @@ def _dispatch_backward(
     handle = ctx.saved_handle
     assert handle is not None
 
+    grad_recv_x = grad_recv_x.contiguous()
+    grad_recv_scores = grad_recv_scores.float().contiguous() if grad_recv_scores is not None else None
     previous_event = _new_event_overlap()
     grad_x, grad_scores, after_event = _buffer.combine(
         x=grad_recv_x,
         handle=handle,
-        topk_weights=grad_recv_scores.float() if grad_recv_scores is not None else None,
+        topk_weights=grad_recv_scores,
         previous_event=previous_event,
         async_finish=True,
         allocate_on_comm_stream=True,
@@ -142,7 +145,7 @@ def _dispatch_backward(
     _finish_backward_event(after_event)
 
     grad_x = grad_x.to(ctx.input_dtype)
-    grad_topk_weights = grad_scores.to(ctx.input_dtype) if grad_scores is not None else None
+    grad_topk_weights = grad_scores.to(ctx.topk_weights_dtype) if grad_scores is not None else None
     return grad_x, None, grad_topk_weights, None, None, None, None
 
 
@@ -175,6 +178,7 @@ class _UcclEPCombine(torch.autograd.Function):
         handle = ctx.handle
         assert handle is not None, "Handle not found in UCCL-EP combine backward."
 
+        grad_combined = grad_combined.contiguous()
         previous_event = _new_event_overlap()
         grad_x, _, _, _, _, after_event = _buffer.dispatch(
             x=grad_combined,

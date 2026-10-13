@@ -18,16 +18,49 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
+from typing import Iterator
 
 import torch
 import torch.distributed as dist
 
+from arctic_platform.correctness.harness.model_state_capture import ModelStateCaptureMixin
+
 _OPTIMIZER_CAPTURE_WORKER: Any | None = None
+
+
+def _publish_optimizer_capture(workers: list[Any], manifest: str) -> None:
+    import ray
+
+    path = Path(manifest)
+    if not path.is_absolute():
+        raise ValueError("optimizer-state manifest must be an absolute path")
+    if not workers:
+        raise RuntimeError("optimizer-state capture has no training workers")
+    hosts = list(
+        dict.fromkeys(
+            node["NodeManagerAddress"] for node in ray.nodes() if node.get("Alive") and node.get("NodeManagerAddress")
+        )
+    )
+    addresses = ray.get([worker.routable_ip.remote() for worker in workers])
+    unknown = sorted(set(addresses) - set(hosts))
+    if unknown:
+        raise RuntimeError(f"worker addresses {unknown} are outside the Ray node addresses {hosts}")
+    representatives = {}
+    for worker, address in zip(workers, addresses):
+        representatives.setdefault(address, worker)
+    # Training workers are rank-ordered; only rank zero writes these captures.
+    peers = [host for host in hosts if host != addresses[0]]
+    files = ray.get(workers[0].export_node_checkpoint.remote(str(path.parent), peers))
+    if path.name not in files:
+        raise FileNotFoundError(f"optimizer-state manifest was not exported: {path}")
+    ray.get([worker.require_checkpoint_files.remote(str(path.parent), files) for worker in representatives.values()])
 
 
 def _optimizer_capture_worker_class() -> Any:
@@ -43,7 +76,7 @@ def _optimizer_capture_worker_class() -> Any:
     base_worker = deepspeed_worker_module.DeepSpeedWorker.__ray_metadata__.modified_class
 
     @ray.remote
-    class OptimizerCaptureDeepSpeedWorker(base_worker):
+    class OptimizerCaptureDeepSpeedWorker(ModelStateCaptureMixin, base_worker):
         """Add optimizer-state artifact capture for correctness harness jobs only."""
 
         def initialize(self, master_addr: str, job_config: dict) -> bool:
@@ -54,6 +87,12 @@ def _optimizer_capture_worker_class() -> Any:
                 if not os.path.isabs(optimizer_state_output_dir):
                     raise ValueError("debug.optimizer_state_output_dir must be an absolute path")
             self._optimizer_state_output_dir = optimizer_state_output_dir
+            model_state_output_dir = debug_config.get("model_state_output_dir")
+            if model_state_output_dir is not None:
+                model_state_output_dir = os.fspath(model_state_output_dir)
+                if not os.path.isabs(model_state_output_dir):
+                    raise ValueError("debug.model_state_output_dir must be an absolute path")
+            self._model_state_output_dir = model_state_output_dir
             return super().initialize(master_addr, job_config)
 
         def _globalize_expert_optimizer_tensor(self, param: Any, tensor: torch.Tensor) -> torch.Tensor:
@@ -129,6 +168,21 @@ def _optimizer_capture_worker_class() -> Any:
                 before_dir.mkdir(parents=True)
             dist.barrier()
             model = self.engine.module if hasattr(self.engine, "module") else self.engine
+            accumulated_gradients = self._bf16_accumulated_gradients()
+            inactive_parameters = (
+                {
+                    id(parameter)
+                    for parameters, has_gradients in zip(
+                        getattr(optimizer, "bf16_groups", []),
+                        getattr(optimizer, "fp32_groups_has_gradients", []),
+                        strict=True,
+                    )
+                    for parameter, has_gradient in zip(parameters, has_gradients, strict=True)
+                    if not has_gradient and parameter.grad is None
+                }
+                if accumulated_gradients is not None
+                else set()
+            )
             for index, (name, param) in enumerate(sorted(model.named_parameters(), key=lambda item: item[0])):
                 if not param.requires_grad:
                     continue
@@ -136,10 +190,15 @@ def _optimizer_capture_worker_class() -> Any:
                 if full_parameter is None:
                     raise RuntimeError(f"optimizer-state capture found no FP32 master for {name}")
                 full_parameter = self._globalize_expert_optimizer_tensor(param, full_parameter)
-                gradient = safe_get_full_grad(param)
-                if gradient is None:
+                gradient = (
+                    accumulated_gradients.get(id(param))
+                    if accumulated_gradients is not None
+                    else safe_get_full_grad(param)
+                )
+                if gradient is None and id(param) not in inactive_parameters:
                     raise RuntimeError(f"optimizer-state capture found no reduced gradient for {name}")
-                gradient = self._globalize_expert_optimizer_tensor(param, gradient)
+                if gradient is not None:
+                    gradient = self._globalize_expert_optimizer_tensor(param, gradient)
                 exp_avg, exp_avg_sq = self._full_adam_moments(param)
                 if exp_avg is not None:
                     exp_avg = self._globalize_expert_optimizer_tensor(param, exp_avg)
@@ -150,7 +209,7 @@ def _optimizer_capture_worker_class() -> Any:
                             "name": name,
                             "parameter": param.detach().cpu(),
                             "fp32_master": full_parameter.detach().cpu(),
-                            "gradient": gradient.detach().cpu(),
+                            "gradient": None if gradient is None else gradient.detach().cpu(),
                             "exp_avg": None if exp_avg is None else exp_avg.detach().cpu(),
                             "exp_avg_sq": None if exp_avg_sq is None else exp_avg_sq.detach().cpu(),
                         },
@@ -252,14 +311,61 @@ def _optimizer_capture_worker_class() -> Any:
 
 
 @contextlib.contextmanager
-def optimizer_capture_worker() -> Any:
-    """Install the correctness worker overlay for jobs created inside the context."""
+def _patched_deepspeed_worker_bindings(capture_worker: Any) -> Iterator[None]:
     from arctic_platform.common import deepspeed_worker as deepspeed_worker_module
 
-    capture_worker = _optimizer_capture_worker_class()
-    original = deepspeed_worker_module.DeepSpeedWorker
-    deepspeed_worker_module.DeepSpeedWorker = capture_worker
+    modules = [deepspeed_worker_module]
+    for module_name in ("arctic_platform.common.ray_server", "arctic_platform.rl.ray_server"):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "DeepSpeedWorker"):
+            modules.append(module)
+
+    originals = [(module, module.DeepSpeedWorker) for module in modules]
+    for module, _ in originals:
+        module.DeepSpeedWorker = capture_worker
     try:
         yield
     finally:
-        deepspeed_worker_module.DeepSpeedWorker = original
+        for module, original in reversed(originals):
+            module.DeepSpeedWorker = original
+
+
+@contextlib.contextmanager
+def optimizer_capture_worker() -> Iterator[None]:
+    """Install the correctness worker overlay for jobs created inside the context."""
+    from arctic_platform.common import ray_server
+
+    # Load the compatibility re-export before patching so lazy clients cannot retain an overlay.
+    compatibility_server = importlib.import_module("arctic_platform.rl.ray_server")
+    server_modules = [ray_server, compatibility_server]
+    originals = [(module, module.ArcticRLRayServerState, module.ArcticRLRayServer) for module in server_modules]
+    capture_worker = _optimizer_capture_worker_class()
+    original_server_state = ray_server.ArcticRLRayServerState
+    original_server = ray_server.ArcticRLRayServer
+
+    class OptimizerCaptureServerState(original_server_state):
+        async def initialize(self, job_config_dict):
+            # Ray imports the product server by reference in a fresh actor process.
+            with _patched_deepspeed_worker_bindings(_optimizer_capture_worker_class()):
+                return await super().initialize(job_config_dict)
+
+    class OptimizerCaptureServer(original_server):
+        async def step(self, job_id, body=None):
+            result = await super().step(job_id, body)
+            manifests = result.get("metrics", {}).get("optimizer_state_manifest", [])
+            if isinstance(manifests, str):
+                manifests = [manifests]
+            for manifest in dict.fromkeys(manifests):
+                _publish_optimizer_capture(self.training_workers, manifest)
+            return result
+
+    with _patched_deepspeed_worker_bindings(capture_worker):
+        for module in server_modules:
+            module.ArcticRLRayServerState = OptimizerCaptureServerState
+            module.ArcticRLRayServer = OptimizerCaptureServer
+        try:
+            yield
+        finally:
+            for module, server_state, server in reversed(originals):
+                module.ArcticRLRayServer = server
+                module.ArcticRLRayServerState = server_state

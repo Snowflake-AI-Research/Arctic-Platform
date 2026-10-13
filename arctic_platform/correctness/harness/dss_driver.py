@@ -253,6 +253,8 @@ def running_job(session: GatewaySession, payload: dict) -> Iterator[ArcticJob]:
 
 def copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: Path) -> Path:
     """Copy the PEFT pack from a weights-only checkpoint when the exporter retained one."""
+    from safetensors import safe_open
+
     candidates = [
         checkpoint_root / "hf",
         checkpoint_root / "default",
@@ -261,6 +263,11 @@ def copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: Path) -> Pa
     source = next((path for path in candidates if (path / "adapter_model.safetensors").is_file()), None)
     if source is None or not (source / "adapter_config.json").is_file():
         raise RuntimeError(f"initial adapter checkpoint produced no PEFT pack under {checkpoint_root}")
+    if not json.loads((source / "adapter_config.json").read_text()).get("peft_type"):
+        raise RuntimeError(f"initial adapter checkpoint produced no PEFT type under {source}")
+    with safe_open(source / "adapter_model.safetensors", framework="pt") as adapter:
+        if not adapter.keys():
+            raise RuntimeError(f"initial adapter checkpoint produced no adapter tensors under {source}")
     shutil.rmtree(destination, ignore_errors=True)
     shutil.copytree(source, destination)
     return destination
@@ -343,6 +350,19 @@ def build_payload(
         "dtype": tc.get("dtype", "bfloat16"),
         "training_config": tc,
     }
+
+
+def ap_batch_processing_options(config_id: str, case: str) -> dict:
+    """Select AP-only loss packaging without materializing long full-vocabulary logits."""
+    if config_id == "qwen3-8b-h200-train-sft-full-4gpus-64k" and case == "gas4":
+        return {
+            "loss_fn": "sft_ce",
+            "processing_config": {
+                "logits_optimization": "memory",
+                "logits_optimization_peak_mem_size_in_gib": 4,
+            },
+        }
+    return {}
 
 
 def _labels_for_provider(batch, model_provider: str):
@@ -626,6 +646,7 @@ class GatewayTransport:
         slots: int,
         attn_implementation: Optional[str] = None,
         determinism: str = "best-effort",
+        gradient_accumulation_steps: Optional[int] = None,
     ) -> None:
         self.session = GatewaySession(Path(workdir), slots)
         self.payload = build_payload(
@@ -634,6 +655,7 @@ class GatewayTransport:
             seed,
             attn_implementation=attn_implementation,
             determinism=determinism,
+            gradient_accumulation_steps=gradient_accumulation_steps,
         )
 
     def __enter__(self) -> "GatewayTransport":

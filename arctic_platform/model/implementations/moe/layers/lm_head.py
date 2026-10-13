@@ -14,6 +14,7 @@ from arctic_platform.model.implementations.gpu.action_masks import filter_lm_hea
 from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.action_masks import slice_lm_head_action_masks
 from arctic_platform.model.implementations.gpu.action_masks import validate_action_mask_targets
+from arctic_platform.model.implementations.gpu.lm_head import accumulate_lm_head_gradient_
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
 from arctic_platform.model.implementations.gpu.lm_head import safe_chunked_labels
 from arctic_platform.model.implementations.gpu.lm_head import validate_lm_head_targets
@@ -335,8 +336,13 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         vocab = weight.shape[0]
         vocab_chunk_size = min(vocab, 8192)
 
-        grad_hidden = torch.zeros_like(hidden, dtype=torch.float32 if fp32_lm_head else hidden.dtype)
-        grad_weight = torch.zeros_like(weight, dtype=torch.float32 if fp32_lm_head else weight.dtype)
+        # Keep tile products and running sums in FP32 without widening the configured projection.
+        grad_hidden = torch.zeros_like(
+            hidden, dtype=torch.float32 if fp32_lm_head else torch.promote_types(hidden.dtype, torch.float32)
+        )
+        grad_weight = torch.zeros_like(
+            weight, dtype=torch.float32 if fp32_lm_head else torch.promote_types(weight.dtype, torch.float32)
+        )
 
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
@@ -372,8 +378,10 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
 
                 grad_logits_for_hidden = grad_logits if fp32_lm_head else grad_logits.to(hidden.dtype)
                 grad_logits_for_weight = grad_logits if fp32_lm_head else grad_logits.to(weight.dtype)
-                grad_hidden[start:end].add_(grad_logits_for_hidden @ weight_for_logits)
-                grad_weight[vocab_start:vocab_end].add_(grad_logits_for_weight.t() @ hidden_for_logits)
+                accumulate_lm_head_gradient_(grad_hidden[start:end], grad_logits_for_hidden, weight_for_logits)
+                accumulate_lm_head_gradient_(
+                    grad_weight[vocab_start:vocab_end], grad_logits_for_weight.t(), hidden_for_logits
+                )
 
         return grad_hidden.to(hidden.dtype), grad_weight.to(weight.dtype), None, None, None, None, None
 

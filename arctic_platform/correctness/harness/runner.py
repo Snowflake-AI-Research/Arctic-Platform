@@ -45,13 +45,13 @@ from .arms import correctness_microbatch_tokens
 from .batches import build_batch
 from .batches import save
 from .config import LoadedConfig
+from .dss_driver import ap_batch_processing_options
 from .dss_driver import build_payload
 from .dss_driver import copy_checkpoint_peft_adapter
 from .dss_driver import fwd_bwd_step
 from .dss_driver import gateway
 from .dss_driver import pack_microbatches
 from .dss_driver import running_job
-from .dss_driver import save_weights_only_checkpoint
 from .optimizer_capture import optimizer_capture_worker
 from .registry import TestOutcome
 from .registry import TestResult
@@ -84,7 +84,7 @@ class RunContext:
     # Seconds spent in each engine per case, so the report can say which case dominates the run.
     _timing: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
-    def transport_for(self, workdir: Path):
+    def transport_for(self, workdir: Path, *, arm: ArmSpec | None = None):
         """The transport a check creates its jobs through, entered by the caller and exited when it ends."""
         if self.transport_factory is not None:
             return self.transport_factory(workdir)
@@ -97,6 +97,7 @@ class RunContext:
             SEED,
             slots=self.cfg.n_gpus,
             attn_implementation=self.attn_implementation,
+            gradient_accumulation_steps=arm.dss_microbatches if arm is not None else None,
         )
 
     def reference_for(self, arm: ArmSpec) -> dict:
@@ -232,7 +233,8 @@ def materialize_dss_peft_adapter(
     checkpoint_root = workdir / "checkpoint"
     with gateway(gateway_dir, cfg.n_gpus) as session:
         with running_job(session, payload) as job:
-            exported = Path(save_weights_only_checkpoint(session, job, checkpoint_root))
+            saved = job.client.save_checkpoint(path=str(checkpoint_root), export_hf=True)
+            exported = Path(saved.get("hf_path") or saved["path"])
     return copy_checkpoint_peft_adapter(exported.parent, adapter_dir)
 
 
@@ -240,21 +242,6 @@ def materialize_dss_peft_adapter(
 # the shared step runs at this rate rather than the config's. Gradient norms are captured after reduction
 # and before clipping and the optimizer, so the rate does not affect them.
 OPTIMIZER_LEARNING_RATE = 1e-2
-
-_QWEN3_8B_FULL_LONG_CONTEXT_CONFIG = "qwen3-8b-h200-train-sft-full-4gpus-64k"
-
-
-def _ap_batch_processing_options(cfg: LoadedConfig, arm: ArmSpec) -> dict:
-    """Select AP-only SFT loss packaging for cases that cannot materialize full vocab logits."""
-    if cfg.config_id == _QWEN3_8B_FULL_LONG_CONTEXT_CONFIG and arm.name == "gas4":
-        return {
-            "loss_fn": "sft_ce",
-            "processing_config": {
-                "logits_optimization": "memory",
-                "logits_optimization_peak_mem_size_in_gib": 4,
-            },
-        }
-    return {}
 
 
 def assert_applicable_tests_registered(spec: TestSpec, config_id: str) -> None:
@@ -494,7 +481,7 @@ def execute(
                                     load_batch(batch_paths[arm.name]),
                                     arm.dss_microbatches,
                                     model_provider=str(cfg.training.get("model_provider", "huggingface")),
-                                    **_ap_batch_processing_options(cfg, arm),
+                                    **ap_batch_processing_options(cfg.config_id, arm.name),
                                 ),
                                 learning_rate=OPTIMIZER_LEARNING_RATE if stepping else 0.0,
                             )
@@ -521,7 +508,7 @@ def execute(
                                     load_batch(batch_paths[arm.name]),
                                     arm.dss_microbatches,
                                     model_provider=str(cfg.training.get("model_provider", "huggingface")),
-                                    **_ap_batch_processing_options(cfg, arm),
+                                    **ap_batch_processing_options(cfg.config_id, arm.name),
                                 ),
                                 learning_rate=OPTIMIZER_LEARNING_RATE if stepping else 0.0,
                             )

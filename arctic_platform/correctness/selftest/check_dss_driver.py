@@ -15,11 +15,16 @@
 
 """Arctic Platform result normalization covers all expert-parallel shards."""
 
+import asyncio
 import contextlib
 import os
+import sys
+import types
+from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from arctic_platform.correctness.harness.batches import Batch
 from arctic_platform.correctness.harness.dss_driver import _gateway_runtime
@@ -88,6 +93,74 @@ def test_fwd_bwd_step_unwraps_rank_owned_optimizer_manifest() -> None:
     result = fwd_bwd_step(None, Job(), {}, learning_rate=1e-3)
 
     assert result.optimizer_state_manifest == "/tmp/manifest.json"
+
+
+def test_optimizer_capture_worker_patches_imported_server_worker_bindings(monkeypatch) -> None:
+    import arctic_platform.common as common_package
+    from arctic_platform.correctness.harness.optimizer_capture import _patched_deepspeed_worker_bindings
+
+    worker_module = types.ModuleType("arctic_platform.common.deepspeed_worker")
+    original_worker = object()
+    stale_worker = object()
+    capture_worker = object()
+    common_server = types.ModuleType("arctic_platform.common.ray_server")
+    rl_server = types.ModuleType("arctic_platform.rl.ray_server")
+    worker_module.DeepSpeedWorker = original_worker
+    common_server.DeepSpeedWorker = stale_worker
+    rl_server.DeepSpeedWorker = stale_worker
+    monkeypatch.setitem(sys.modules, "arctic_platform.common.deepspeed_worker", worker_module)
+    monkeypatch.setattr(common_package, "deepspeed_worker", worker_module, raising=False)
+    monkeypatch.setitem(sys.modules, "arctic_platform.common.ray_server", common_server)
+    monkeypatch.setitem(sys.modules, "arctic_platform.rl.ray_server", rl_server)
+
+    with _patched_deepspeed_worker_bindings(capture_worker):
+        assert worker_module.DeepSpeedWorker is capture_worker
+        assert common_server.DeepSpeedWorker is capture_worker
+        assert rl_server.DeepSpeedWorker is capture_worker
+
+    assert worker_module.DeepSpeedWorker is original_worker
+    assert common_server.DeepSpeedWorker is stale_worker
+    assert rl_server.DeepSpeedWorker is stale_worker
+
+
+def test_optimizer_capture_server_patches_workers_inside_actor(monkeypatch) -> None:
+    import arctic_platform.common as common_package
+    from arctic_platform.correctness.harness import optimizer_capture
+
+    worker_module = types.ModuleType("arctic_platform.common.deepspeed_worker")
+    server_module = types.ModuleType("arctic_platform.common.ray_server")
+    original_worker, capture_worker = object(), object()
+    worker_module.DeepSpeedWorker = original_worker
+    server_module.DeepSpeedWorker = original_worker
+    events = []
+
+    class ServerState:
+        async def initialize(self, payload):
+            events.append((worker_module.DeepSpeedWorker, server_module.DeepSpeedWorker))
+            if payload.get("fail"):
+                raise RuntimeError("initialize failed")
+            return {"job_id": 7}
+
+    server_module.ArcticRLRayServerState = ServerState
+    server_module.ArcticRLRayServer = type("RequestServer", (), {})
+    monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
+    monkeypatch.setitem(sys.modules, server_module.__name__, server_module)
+    monkeypatch.setattr(common_package, "deepspeed_worker", worker_module, raising=False)
+    monkeypatch.setattr(common_package, "ray_server", server_module, raising=False)
+    monkeypatch.setattr(optimizer_capture, "_optimizer_capture_worker_class", lambda: capture_worker)
+
+    with optimizer_capture.optimizer_capture_worker():
+        capture_state = server_module.ArcticRLRayServerState
+    assert server_module.ArcticRLRayServerState is ServerState
+    # A fresh actor imports production bindings, not the driver's patched globals.
+    actor = capture_state()
+    assert asyncio.run(actor.initialize({})) == {"job_id": 7}
+    with pytest.raises(RuntimeError, match="initialize failed"):
+        asyncio.run(actor.initialize({"fail": True}))
+
+    assert events == [(capture_worker, capture_worker)] * 2
+    assert worker_module.DeepSpeedWorker is original_worker
+    assert server_module.DeepSpeedWorker is original_worker
 
 
 def test_prime_rl_receives_prediction_aligned_labels() -> None:
@@ -174,23 +247,19 @@ def test_pack_microbatches_can_request_memory_sft_ce_without_mutating_config() -
     }
 
 
-def test_runner_only_routes_qwen8b_full_gas4_to_memory_sft_ce() -> None:
-    from arctic_platform.correctness.harness import runner
+def test_only_qwen8b_full_gas4_routes_to_memory_sft_ce() -> None:
+    from arctic_platform.correctness.harness.dss_driver import ap_batch_processing_options
 
-    cfg = type("Cfg", (), {"config_id": "qwen3-8b-h200-train-sft-full-4gpus-64k"})()
-    other_cfg = type("Cfg", (), {"config_id": "qwen3-8b-h200-train-sft-lora-4gpus-64k"})()
-    gas4 = type("Arm", (), {"name": "gas4"})()
-    gas1 = type("Arm", (), {"name": "gas1"})()
-
-    assert runner._ap_batch_processing_options(cfg, gas4) == {
+    config_id = "qwen3-8b-h200-train-sft-full-4gpus-64k"
+    assert ap_batch_processing_options(config_id, "gas4") == {
         "loss_fn": "sft_ce",
         "processing_config": {
             "logits_optimization": "memory",
             "logits_optimization_peak_mem_size_in_gib": 4,
         },
     }
-    assert runner._ap_batch_processing_options(cfg, gas1) == {}
-    assert runner._ap_batch_processing_options(other_cfg, gas4) == {}
+    assert ap_batch_processing_options(config_id, "gas1") == {}
+    assert ap_batch_processing_options("qwen3-8b-h200-train-sft-lora-4gpus-64k", "gas4") == {}
 
 
 def test_reference_runner_passes_the_harness_seed(tmp_path, monkeypatch) -> None:
@@ -229,11 +298,13 @@ def test_copy_checkpoint_peft_adapter_accepts_a_checkpoint_adapter_pack(tmp_path
     source = checkpoint_root / "global_step0" / "default"
     source.mkdir(parents=True)
     (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    (source / "adapter_model.safetensors").write_bytes(b"adapter")
+    save_file({"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)}, source / "adapter_model.safetensors")
     destination = tmp_path / "adapter"
 
     assert copy_checkpoint_peft_adapter(checkpoint_root, destination) == destination
-    assert (destination / "adapter_model.safetensors").read_bytes() == b"adapter"
+    assert (destination / "adapter_model.safetensors").read_bytes() == (
+        source / "adapter_model.safetensors"
+    ).read_bytes()
 
 
 def test_copy_checkpoint_peft_adapter_accepts_a_weights_only_hf_pack(tmp_path) -> None:
@@ -241,11 +312,62 @@ def test_copy_checkpoint_peft_adapter_accepts_a_weights_only_hf_pack(tmp_path) -
     source = checkpoint_root / "hf"
     source.mkdir(parents=True)
     (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    (source / "adapter_model.safetensors").write_bytes(b"adapter")
+    save_file({"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)}, source / "adapter_model.safetensors")
     destination = tmp_path / "adapter"
 
     assert copy_checkpoint_peft_adapter(checkpoint_root, destination) == destination
-    assert (destination / "adapter_model.safetensors").read_bytes() == b"adapter"
+    assert (destination / "adapter_model.safetensors").read_bytes() == (
+        source / "adapter_model.safetensors"
+    ).read_bytes()
+
+
+def test_copy_checkpoint_peft_adapter_rejects_empty_tensors_before_copy(tmp_path) -> None:
+    source = tmp_path / "checkpoint" / "hf"
+    source.mkdir(parents=True)
+    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
+    save_file({}, source / "adapter_model.safetensors")
+    destination = tmp_path / "adapter"
+    destination.mkdir()
+    (destination / "sentinel").write_text("preserve")
+
+    with pytest.raises(RuntimeError, match="no adapter tensors"):
+        copy_checkpoint_peft_adapter(source.parent, destination)
+    assert (destination / "sentinel").read_text() == "preserve"
+
+
+def test_materialize_peft_adapter_accepts_adapter_only_export(tmp_path, monkeypatch) -> None:
+    from arctic_platform.correctness.harness import runner
+
+    cfg = SimpleNamespace(training={"peft_config": {"peft_type": "LORA"}}, n_gpus=1)
+    cfg.at_gpu_width = lambda width: cfg
+    source = tmp_path / "checkpoint" / "hf"
+    source.mkdir(parents=True)
+    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
+    save_file({"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)}, source / "adapter_model.safetensors")
+    calls = []
+
+    def save_checkpoint(**kwargs):
+        calls.append(kwargs)
+        return {"path": str(source.parent), "hf_path": str(source)}
+
+    monkeypatch.setattr(runner, "build_payload", lambda *args, **kwargs: {})
+    monkeypatch.setattr(runner, "gateway", lambda *args: contextlib.nullcontext(object()))
+    job = SimpleNamespace(client=SimpleNamespace(save_checkpoint=save_checkpoint))
+    monkeypatch.setattr(runner, "running_job", lambda *args: contextlib.nullcontext(job))
+
+    exported = runner.materialize_dss_peft_adapter(cfg, "unused", tmp_path, attn_implementation="eager")
+
+    assert exported == tmp_path / "adapter"
+    assert (exported / "adapter_model.safetensors").read_bytes() == (source / "adapter_model.safetensors").read_bytes()
+    assert calls == [{"path": str(source.parent), "export_hf": True}]
+
+
+def test_full_model_weights_only_export_still_requires_model_config(tmp_path) -> None:
+    from arctic_platform.correctness.harness.dss_driver import save_weights_only_checkpoint
+
+    client = SimpleNamespace(save_checkpoint=lambda **kwargs: {"hf_path": str(tmp_path), "path": str(tmp_path)})
+    with pytest.raises(RuntimeError, match="no model config"):
+        save_weights_only_checkpoint(None, SimpleNamespace(client=client), tmp_path)
 
 
 def test_copy_checkpoint_peft_adapter_rejects_a_full_model_pack(tmp_path) -> None:

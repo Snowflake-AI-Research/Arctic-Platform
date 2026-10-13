@@ -189,8 +189,9 @@ def _split_value(val, num_chunks: int):
                 f"{num_chunks}. The client must send at least one sample per "
                 "DP worker."
             )
-        chunk_size = (len(val) + num_chunks - 1) // num_chunks
-        return [val[i * chunk_size : (i + 1) * chunk_size] for i in range(num_chunks)]
+        chunk_size, remainder = divmod(len(val), num_chunks)
+        boundaries = [i * chunk_size + min(i, remainder) for i in range(num_chunks + 1)]
+        return [val[start:end] for start, end in zip(boundaries, boundaries[1:])]
     return [val] * num_chunks
 
 

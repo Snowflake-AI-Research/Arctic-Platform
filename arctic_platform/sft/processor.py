@@ -132,8 +132,8 @@ def sft_loss(
         raise ValueError("sft loss requires countable labels")
     raw_loss = loss
     if n_valid == 0:
-        # HF CE is NaN when every target is ignore_index.
-        loss = torch.zeros_like(loss, requires_grad=loss.requires_grad)
+        # HF CE is NaN for all-ignored targets; keep model backward hooks connected.
+        loss = torch.nan_to_num(loss) * 0.0
     elif meta.get("global_num_tokens"):
         loss = loss * (float(n_valid) / float(meta["global_num_tokens"])) * int(meta.get("dp_size", 1) or 1)
     # Reconstruct Σ CE from HF's token-mean so cross-rank aggregation stays exact.
@@ -357,6 +357,7 @@ def run_sft_pipeline(
     packing/unpad pipeline — SFT stays on the plain HF causal-LM surface.
     """
     from arctic_platform import sft_profile
+    from arctic_platform.model.implementations.moe.layers.lm_head import FusedOutputLinear
 
     see_memory_usage("run_sft_pipeline start", force=True)
     loss_fn_name = processing.get("loss_fn", "sft")
@@ -372,6 +373,12 @@ def run_sft_pipeline(
         )
     peak_mem_gib = float(config.get("logits_optimization_peak_mem_size_in_gib", 4) or 4)
     hidden_ce = loss_fn_name == "sft_ce" and logits_opt in ("compute", "memory")
+    hf_model = getattr(engine, "module", engine)
+    native_chunked_ce = (
+        loss_fn_name == "sft"
+        and getattr(hf_model, "_dss_native_lm_head_logprobs", False)
+        and isinstance(getattr(hf_model, "lm_head", None), FusedOutputLinear)
+    )
     # ``need_logits`` = keep the full logits tensor for the loss (only the classic
     # sft_ce path). ``omit_labels`` also drops HF's own CE when we compute it.
     need_logits = loss_fn_name in LOGIT_LOSS_FNS and not hidden_ce
@@ -379,6 +386,15 @@ def run_sft_pipeline(
 
     labels = _require_labels(batch, "run_sft_pipeline (SFT wire batch)")
     model_kwargs = _build_sft_model_kwargs(batch, meta, labels, omit_labels)
+    if native_chunked_ce:
+        # Native heads consume hidden-state-aligned targets; unlike HF, they do not shift labels.
+        targets = labels.clone()
+        if not _labels_are_shifted(meta):
+            targets[:, :-1] = labels[:, 1:]
+            targets[:, -1] = -100
+            if batch.get("position_ids") is not None:
+                targets[:, :-1].masked_fill_(batch["position_ids"][:, 1:] == 0, -100)
+        model_kwargs["labels"] = targets
     if hidden_ce:
         # Request last-layer hidden states (post-final-norm) and keep only the
         # last token's logits so HF doesn't project the whole sequence to vocab.
@@ -405,7 +421,17 @@ def run_sft_pipeline(
             outputs = engine(**model_kwargs)
         _cuda_sync()
 
-    if hidden_ce:
+    if native_chunked_ce:
+        logprobs = _model_output_field(outputs, "logprobs")
+        if not torch.is_tensor(logprobs) or logprobs.shape != targets.shape:
+            raise ValueError("Native chunked SFT requires logprobs matching the target-label shape")
+        with sft_profile.timed("loss"):
+            valid = targets.to(logprobs.device) != -100
+            ce_sum = -logprobs.masked_fill(~valid, 0.0).sum()
+            n_valid = int(valid.sum().item())
+            loss = _scale_ce_sum(ce_sum, n_valid, meta)
+        metrics = _paired_loss_metrics(float(ce_sum.detach().float().item()), n_valid)
+    elif hidden_ce:
         # Tiled / chunked CE straight from hidden states — the full logits are
         # never materialized (memory) or never fully softmaxed at once (compute).
         hf_model = getattr(engine, "module", engine)

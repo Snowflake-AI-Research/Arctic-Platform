@@ -33,6 +33,7 @@ from arctic_platform.sft.processor import run_sft_pipeline
 from arctic_platform.sft.processor import sft_ce_loss
 from arctic_platform.sft.processor import sft_loss
 from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import torch_assert_equal
 
 
 class TestSFTRegistry(TestCasePlus):
@@ -81,6 +82,51 @@ class TestSFTLoss(TestCasePlus):
         self.assertAlmostEqual(loss.item(), 1.2, places=5)
         self.assertAlmostEqual(metrics["loss.sum"], 6.0, places=5)
         self.assertEqual(metrics["loss.tokens"], 2.0)
+
+    def test_all_masked_loss_preserves_model_backward_graph(self):
+        for labels_are_shifted in (False, True):
+            for global_tokens in (0, 8):
+                with self.subTest(labels_are_shifted=labels_are_shifted, global_tokens=global_tokens):
+                    logits = torch.zeros(1, 4, 3, requires_grad=True)
+                    labels = torch.full((1, 4), -100, dtype=torch.long)
+                    model_loss = torch.nn.functional.cross_entropy(
+                        logits.reshape(-1, 3), labels.reshape(-1), ignore_index=-100
+                    )
+                    self.assertTrue(torch.isnan(model_loss).item())
+                    contributions = []
+                    handle = logits.register_hook(lambda gradient: contributions.append(gradient.clone()))
+                    loss, metrics = sft_loss(
+                        {"loss": model_loss},
+                        {"labels": labels},
+                        {"labels_are_shifted": labels_are_shifted, "global_num_tokens": global_tokens, "dp_size": 2},
+                        {},
+                        "cpu",
+                    )
+                    self.assertEqual(loss.ndim, 0)
+                    self.assertEqual(loss.item(), 0.0)
+                    self.assertIsNotNone(loss.grad_fn)
+                    self.assertEqual(metrics, {"loss.sum": 0.0, "loss.tokens": 0.0})
+                    loss.backward()
+                    self.assertEqual(len(contributions), 1)
+                    self.assertIsNotNone(logits.grad)
+                    self.assertEqual(torch.count_nonzero(logits.grad).item(), 0)
+                    self.assertEqual(torch.count_nonzero(contributions[0]).item(), 0)
+                    handle.remove()
+
+    def test_all_masked_microbatch_preserves_accumulated_gradients(self):
+        logits = torch.zeros(1, 4, 3, requires_grad=True)
+        logits.sum().backward()
+        accumulated = logits.grad.clone()
+        labels = torch.full((1, 4), -100, dtype=torch.long)
+        model_loss = torch.nn.functional.cross_entropy(logits.reshape(-1, 3), labels.reshape(-1), ignore_index=-100)
+        loss, _ = sft_loss({"loss": model_loss}, {"labels": labels}, {"global_num_tokens": 8, "dp_size": 2}, {}, "cpu")
+        contributions = []
+        handle = logits.register_hook(lambda gradient: contributions.append(gradient.clone()))
+        loss.backward()
+        self.assertEqual(len(contributions), 1)
+        self.assertEqual(torch.count_nonzero(contributions[0]).item(), 0)
+        torch_assert_equal(logits.grad, accumulated)
+        handle.remove()
 
 
 class TestSFTCELoss(TestCasePlus):

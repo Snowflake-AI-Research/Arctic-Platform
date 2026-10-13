@@ -16,32 +16,43 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Locate the first inexact component between two uninterrupted training trajectories.
+"""Locate the first inexact component in fresh trajectories or shared-prefix checkpoint resume.
 
 Each trajectory is one fresh job on the same batches. Comparison starts at iteration 1 and stops at the
 first inexact pre-step parameter, loss, or gradient. A one-step pair runs first; an exact one-step pair
 continues through the checkpoint iteration plus one.
+
+The optional loss control runs two complete trajectories without checkpoint operations or capture hooks.
+The checkpoint control saves after ten steps, continues the same job, and then resumes the saved state
+in a fresh job. Both branches share their exact pre-checkpoint training history.
+The checkpoint-state mode captures the first post-boundary step from that shared prefix.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
 from arctic_platform.correctness.checks.checkpoint_resume import CHECKPOINT_ITERATION
-from arctic_platform.correctness.checks.checkpoint_resume import ITERATIONS
 from arctic_platform.correctness.checks.checkpoint_resume import LEARNING_RATE
-from arctic_platform.correctness.harness.batches import build_batch
+from arctic_platform.correctness.checks.checkpoint_resume import RECORDED_ITERATIONS
+from arctic_platform.correctness.checks.checkpoint_resume import TEST_ID
+from arctic_platform.correctness.checks.checkpoint_resume import _iteration_bodies
+from arctic_platform.correctness.checks.checkpoint_resume import _trajectory
+from arctic_platform.correctness.checks.checkpoint_resume import _uninterrupted
 from arctic_platform.correctness.harness.config import load_config
+from arctic_platform.correctness.harness.dss_driver import GatewayTransport
 from arctic_platform.correctness.harness.dss_driver import build_payload
 from arctic_platform.correctness.harness.dss_driver import fwd_bwd_step
 from arctic_platform.correctness.harness.dss_driver import gateway
-from arctic_platform.correctness.harness.dss_driver import pack
 from arctic_platform.correctness.harness.dss_driver import running_job
+from arctic_platform.correctness.harness.model_state_capture import compare_model_state
 from arctic_platform.correctness.harness.optimizer_capture import optimizer_capture_worker
 from arctic_platform.correctness.harness.seeds import SEED
 from arctic_platform.correctness.harness.spec import TestSpec
@@ -76,18 +87,26 @@ def _snapshot(capture: Path, destination: Path) -> None:
     shutil.copytree(capture, destination)
 
 
+def _capture_payload(cfg, spec, arm, capture: Path, model_state: Path | None = None) -> dict:
+    payload = build_payload(
+        cfg.training,
+        spec.model.cache_path,
+        SEED,
+        attn_implementation=cfg.attention_implementation,
+        optimizer_state_output_dir=capture,
+        gradient_accumulation_steps=arm.dss_microbatches,
+    )
+    if model_state is not None:
+        payload["training_config"]["debug"]["model_state_output_dir"] = str(model_state.resolve())
+    return payload
+
+
 def _run_pair(limit: int, work: Path, cfg, spec, arm, bodies: list[dict]) -> tuple[dict[int, float], dict[int, float]]:
     losses = {"uninterrupted": {}, "resumed": {}}
     runtime = work / "runtime"
     with optimizer_capture_worker(), gateway(runtime, cfg.n_gpus) as session:
         capture = work / "capture-uninterrupted"
-        payload = build_payload(
-            cfg.training,
-            spec.model.cache_path,
-            SEED,
-            attn_implementation=cfg.attention_implementation,
-            optimizer_state_output_dir=capture,
-        )
+        payload = _capture_payload(cfg, spec, arm, capture)
         with running_job(session, payload) as job:
             for iteration, body in enumerate(bodies[:limit], start=1):
                 result = fwd_bwd_step(session, job, body, learning_rate=LEARNING_RATE)
@@ -96,26 +115,14 @@ def _run_pair(limit: int, work: Path, cfg, spec, arm, bodies: list[dict]) -> tup
                     _snapshot(capture, work / "uninterrupted" / f"step-{iteration}")
 
         first_capture = work / "capture-before-checkpoint"
-        first_payload = build_payload(
-            cfg.training,
-            spec.model.cache_path,
-            SEED,
-            attn_implementation=cfg.attention_implementation,
-            optimizer_state_output_dir=first_capture,
-        )
+        first_payload = _capture_payload(cfg, spec, arm, first_capture)
         with running_job(session, first_payload) as first_job:
             for body in bodies[:CHECKPOINT_ITERATION]:
                 fwd_bwd_step(session, first_job, body, learning_rate=LEARNING_RATE)
             checkpoint = first_job.client.save_checkpoint()["path"]
 
         resumed_capture = work / "capture-resumed"
-        resumed_payload = build_payload(
-            cfg.training,
-            spec.model.cache_path,
-            SEED,
-            attn_implementation=cfg.attention_implementation,
-            optimizer_state_output_dir=resumed_capture,
-        )
+        resumed_payload = _capture_payload(cfg, spec, arm, resumed_capture)
         with running_job(session, resumed_payload) as resumed_job:
             restored_step = int(resumed_job.client.load_checkpoint(path=checkpoint)["global_step"])
             print(f"RESTORE requested_step={CHECKPOINT_ITERATION} restored_step={restored_step}", flush=True)
@@ -124,6 +131,38 @@ def _run_pair(limit: int, work: Path, cfg, spec, arm, bodies: list[dict]) -> tup
                 losses["resumed"][iteration] = result.avg_loss
                 _snapshot(resumed_capture, work / "resumed" / f"step-{iteration}")
     return losses["uninterrupted"], losses["resumed"]
+
+
+def _run_shared_prefix_pair(
+    limit: int, work: Path, cfg, spec, arm, bodies: list[dict], *, model_state: bool = False
+) -> tuple[dict[int, float], dict[int, float]]:
+    """Capture continuation and resume after one identical saved prefix."""
+    if not CHECKPOINT_ITERATION < limit <= len(bodies):
+        raise ValueError("shared-prefix state capture requires post-checkpoint batches")
+    left, right = {}, {}
+    model_state_directory = work / "model-state" if model_state else None
+    with optimizer_capture_worker(), gateway(work / "runtime", cfg.n_gpus) as session:
+        capture = work / "capture-uninterrupted"
+        with running_job(session, _capture_payload(cfg, spec, arm, capture, model_state_directory)) as job:
+            for iteration, body in enumerate(bodies[:limit], start=1):
+                result = fwd_bwd_step(session, job, body, learning_rate=LEARNING_RATE)
+                if iteration == CHECKPOINT_ITERATION:
+                    checkpoint = job.client.save_checkpoint()["path"]
+                if iteration > CHECKPOINT_ITERATION:
+                    left[iteration] = result.avg_loss
+                    _snapshot(capture, work / "uninterrupted" / f"step-{iteration}")
+
+        capture = work / "capture-resumed"
+        with running_job(session, _capture_payload(cfg, spec, arm, capture, model_state_directory)) as job:
+            restored_step = int(job.client.load_checkpoint(path=checkpoint)["global_step"])
+            print(f"RESTORE requested_step={CHECKPOINT_ITERATION} restored_step={restored_step}", flush=True)
+            if restored_step != CHECKPOINT_ITERATION:
+                raise RuntimeError(f"restored step {restored_step}, expected {CHECKPOINT_ITERATION}")
+            for iteration, body in enumerate(bodies[CHECKPOINT_ITERATION:limit], start=CHECKPOINT_ITERATION + 1):
+                result = fwd_bwd_step(session, job, body, learning_rate=LEARNING_RATE)
+                right[iteration] = result.avg_loss
+                _snapshot(capture, work / "resumed" / f"step-{iteration}")
+    return left, right
 
 
 def _manifest(snapshot: Path) -> dict:
@@ -235,19 +274,13 @@ def _first_difference(
 
 
 def _train_uninterrupted(
-    session, label: str, limit: int, work: Path, cfg, spec, bodies: list[dict]
+    session, label: str, limit: int, work: Path, cfg, spec, arm, bodies: list[dict]
 ) -> dict[int, float]:
     """Train one fresh job and keep each step's pre-update snapshot."""
     print(f"TRAJECTORY label={label} limit={limit}", flush=True)
     losses: dict[int, float] = {}
     capture = work / f"capture-{label}"
-    payload = build_payload(
-        cfg.training,
-        spec.model.cache_path,
-        SEED,
-        attn_implementation=cfg.attention_implementation,
-        optimizer_state_output_dir=capture,
-    )
+    payload = _capture_payload(cfg, spec, arm, capture)
     with running_job(session, payload) as job:
         for iteration, body in enumerate(bodies[:limit], start=1):
             result = fwd_bwd_step(session, job, body, learning_rate=LEARNING_RATE)
@@ -256,21 +289,15 @@ def _train_uninterrupted(
     return losses
 
 
-def _run_independent(limit: int, work: Path, cfg, spec, bodies: list[dict]) -> tuple[int, Comparison] | None:
+def _run_independent(limit: int, work: Path, cfg, spec, bodies: list[dict], *, arm) -> tuple[int, Comparison] | None:
     """Train two fresh jobs on the same batches and return the first inexact component."""
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
     runtime = work / "runtime"
     with optimizer_capture_worker(), gateway(runtime, cfg.n_gpus) as session:
-        left = _train_uninterrupted(session, "trajectory-a", limit, work, cfg, spec, bodies)
+        left = _train_uninterrupted(session, "trajectory-a", limit, work, cfg, spec, arm, bodies)
         capture = work / "capture-trajectory-b"
-        payload = build_payload(
-            cfg.training,
-            spec.model.cache_path,
-            SEED,
-            attn_implementation=cfg.attention_implementation,
-            optimizer_state_output_dir=capture,
-        )
+        payload = _capture_payload(cfg, spec, arm, capture)
         print(f"TRAJECTORY label=trajectory-b limit={limit}", flush=True)
         with running_job(session, payload) as job:
             for iteration, body in enumerate(bodies[:limit], start=1):
@@ -290,37 +317,122 @@ def _run_independent(limit: int, work: Path, cfg, spec, bodies: list[dict]) -> t
     return None
 
 
-def main() -> int:
+def _run_loss_control(work: Path, cfg, spec, arm, bodies: list[dict], *, checkpoint_control: bool = False) -> dict:
+    """Compare fresh trajectories or a shared-prefix resume, without capture hooks."""
+    with GatewayTransport(
+        work / "runtime",
+        cfg.training,
+        spec.model.cache_path,
+        SEED,
+        slots=cfg.n_gpus,
+        attn_implementation=cfg.attention_implementation,
+        gradient_accumulation_steps=arm.dss_microbatches,
+    ) as transport:
+        if checkpoint_control:
+            with transport.job() as first_job:
+                left = _trajectory(first_job, bodies[:CHECKPOINT_ITERATION], first_iteration=1)
+                checkpoint = first_job.save_resumable()
+                right = dict(left)
+                left.update(
+                    _trajectory(first_job, bodies[CHECKPOINT_ITERATION:], first_iteration=CHECKPOINT_ITERATION + 1)
+                )
+            with transport.job(resume_from=checkpoint) as resumed_job:
+                right.update(
+                    _trajectory(resumed_job, bodies[CHECKPOINT_ITERATION:], first_iteration=CHECKPOINT_ITERATION + 1)
+                )
+        else:
+            left = _uninterrupted(transport, bodies)
+            right = _uninterrupted(transport, bodies)
+    gate = spec.tolerance_for(TEST_ID)
+    return {
+        "case": arm.name,
+        "gate": gate,
+        "comparisons": [
+            {
+                "iteration": iteration,
+                "left_loss": left[iteration],
+                "right_loss": right[iteration],
+                "abs_diff": abs(left[iteration] - right[iteration]),
+                "within_gate": abs(left[iteration] - right[iteration]) <= gate,
+            }
+            for iteration in RECORDED_ITERATIONS
+        ],
+    }
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--case", choices=("gas1", "gas4"), default="gas1")
+    controls = parser.add_mutually_exclusive_group()
+    controls.add_argument(
+        "--loss-control", action="store_true", help="Compare two full runs without checkpoints or hooks"
+    )
+    controls.add_argument(
+        "--checkpoint-control", action="store_true", help="Compare continuation and resume from one shared prefix"
+    )
+    controls.add_argument(
+        "--checkpoint-state", action="store_true", help="Capture the first post-resume step from one shared prefix"
+    )
+    controls.add_argument(
+        "--checkpoint-model-state",
+        action="store_true",
+        help="Also fingerprint every rank's parameters and buffers immediately around save and load",
+    )
+    args = parser.parse_args(argv)
     cfg = load_config(CONFIG)
     spec = TestSpec.read(SPEC)
-    arm = next(item for item in spec.arms if item.name == "gas1")
-    provider = str(cfg.training.get("model_provider", "huggingface"))
+    arm = next(item for item in spec.arms if item.name == args.case)
     from transformers import AutoConfig
 
     model_config = AutoConfig.from_pretrained(spec.model.cache_path, trust_remote_code=True)
     vocab_size = int(getattr(model_config, "text_config", model_config).vocab_size)
-    bodies = [
-        pack(
-            build_batch(
-                arm.name,
-                arm.global_batch_size,
-                arm.max_seq_len,
-                vocab_size,
-                seed=SEED + iteration,
-            ),
-            model_provider=provider,
-        )
-        for iteration in range(1, ITERATIONS + 1)
-    ]
+    ctx = SimpleNamespace(cfg=cfg, config_id=cfg.config_id, vocab_size=vocab_size)
+    bodies = _iteration_bodies(ctx, arm)
     horizon = CHECKPOINT_ITERATION + 1
-    output = correctness_workdir("ap-host4-qwen36-lora-sp8-checkpoint-state-")
+    output = correctness_workdir(f"ap-qwen36-lora-sp8-checkpoint-state-{arm.name}-")
+    if args.loss_control or args.checkpoint_control:
+        if args.checkpoint_control:
+            result = _run_loss_control(output, cfg, spec, arm, bodies, checkpoint_control=True)
+            filename = "checkpoint-control.json"
+            label = "SHARED_PREFIX_CHECKPOINT_CONTROL"
+        else:
+            result = _run_loss_control(output, cfg, spec, arm, bodies)
+            filename = "loss-control.json"
+            label = "UNINTERRUPTED_LOSS_CONTROL"
+        (output / filename).write_text(json.dumps(result, indent=2) + "\n")
+        print(label, json.dumps(result), "OUTPUT", output, flush=True)
+        return 0
+    if args.checkpoint_state or args.checkpoint_model_state:
+        options = {"model_state": True} if args.checkpoint_model_state else {}
+        left, right = _run_shared_prefix_pair(horizon, output, cfg, spec, arm, bodies, **options)
+        if args.checkpoint_model_state:
+            directory = output / "model-state"
+            result = compare_model_state(directory / "before-save", directory / "after-load", ranks=cfg.n_gpus)
+            (directory / "comparison.json").write_text(json.dumps(result, indent=2) + "\n")
+            print("MODEL_STATE_COMPARISON", json.dumps(result), flush=True)
+        difference = _first_difference(output, left, right)
+        if difference is None:
+            print(f"DIAGNOSIS shared_prefix_exact_through_iteration={horizon}", flush=True)
+        else:
+            iteration, comparison = difference
+            print(
+                f"FIRST_DIFFERENCE iteration={iteration} component={comparison.component} "
+                f"max_abs={comparison.max_abs:.17g} l2={comparison.l2:.17g} worst={comparison.worst}",
+                flush=True,
+            )
+        print("SHARED_PREFIX_STATE_OUTPUT", output, flush=True)
+        return 0
     base = output / "independent-uninterrupted"
     base.mkdir(parents=True, exist_ok=True)
-    print(f"INDEPENDENT_TRAJECTORIES horizon={horizon}", flush=True)
-    difference = _run_independent(1, base / "step-1", cfg, spec, bodies)
+    print(
+        f"INDEPENDENT_TRAJECTORIES case={arm.name} microbatches={arm.dss_microbatches} "
+        f"horizon={horizon} output={output}",
+        flush=True,
+    )
+    difference = _run_independent(1, base / "step-1", cfg, spec, bodies, arm=arm)
     if difference is None:
         print("STEP_1_EXACT extending_to_checkpoint_horizon", flush=True)
-        difference = _run_independent(horizon, base / "through-horizon", cfg, spec, bodies)
+        difference = _run_independent(horizon, base / "through-horizon", cfg, spec, bodies, arm=arm)
     if difference is None:
         print(f"DIAGNOSIS exact_through_iteration={horizon}", flush=True)
         return 0

@@ -132,9 +132,11 @@ def _run(ctx) -> TestResult:
         results = generate(client, prompts, params)
         samples = [sample_from_result(prompt, result) for prompt, result in zip(prompts, results)]
         batch = rl_batch([s["tokens"] for s in samples], [s["prompt_len"] for s in samples], pad_id)
-        batch["rr_sample_ids"] = [s["marker"]["replay_id"] for s in samples]
-        batch["rr_replay_meta"] = [{k: s["marker"].get(k) for k in _MARKER_IDENTITY_FIELDS} for s in samples]
-        batch["rr_discard"] = True
+        mask = batch["kwargs"]["attention_mask"]
+        batch["kwargs"]["position_ids"] = (mask.cumsum(dim=-1) - 1).clamp_min(0) * mask
+        batch["kwargs"]["rr_sample_ids"] = [s["marker"]["replay_id"] for s in samples]
+        batch["kwargs"]["rr_replay_meta"] = [{k: s["marker"].get(k) for k in _MARKER_IDENTITY_FIELDS} for s in samples]
+        batch["kwargs"]["rr_discard"] = True
         response = rl_fwd_bwd(client, batch, replay_sampling=True)
 
     traces = response.get("router_replay_trace")

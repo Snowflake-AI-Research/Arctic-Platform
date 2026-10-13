@@ -16,10 +16,48 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
 import torch
 from torch import nn
 
 from arctic_platform.model.implementations.moe.layers.lm_head import FusedCrossEntropyOutputLinear
+from arctic_platform.model.implementations.moe.layers.lm_head import FusedOutputLinear
+from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import torch_assert_close
+
+
+def _check_native_tile_gradient_accumulation(device, accumulation_axis, dtype):
+    # Uniform logits expose both token-tile sum loss and vocabulary-tile product rounding.
+    rows, vocab = (1, 16384) if accumulation_axis == "hidden" else (4096, 8)
+    hidden_value, weight_value = (0.0, 1.0) if accumulation_axis == "hidden" else (1.0, 0.0)
+    hidden = torch.full((1, rows, 1), hidden_value, device=device, dtype=dtype, requires_grad=True)
+    head = FusedOutputLinear(1, vocab, chunk_size=8).to(device=device, dtype=dtype)
+    nn.init.constant_(head.weight, weight_value)
+    labels = torch.full((1, rows), vocab - 1, device=device, dtype=torch.long)
+    actual = head(hidden, labels=labels)["logprobs"]
+    expected = (
+        torch.log_softmax((hidden @ head.weight.t()).float(), dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    )
+    torch_assert_close(actual, expected, rtol=0, atol=1e-6)
+    (-actual.mean()).backward(retain_graph=True)
+    actual_hidden_grad, actual_weight_grad = hidden.grad.clone(), head.weight.grad.clone()
+    hidden.grad = head.weight.grad = None
+    (-expected.mean()).backward()
+    torch_assert_close(actual_hidden_grad, hidden.grad, rtol=0, atol=1e-6)
+    torch_assert_close(actual_weight_grad, head.weight.grad, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("accumulation_axis", ["hidden", "weight"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_native_chunked_lm_head_preserves_small_tile_gradients(accumulation_axis, dtype):
+    _check_native_tile_gradient_accumulation("cpu", accumulation_axis, dtype)
+
+
+@require_torch_gpu
+@pytest.mark.parametrize("accumulation_axis", ["hidden", "weight"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_native_chunked_lm_head_preserves_small_tile_gradients_cuda(accumulation_axis, dtype):
+    _check_native_tile_gradient_accumulation("cuda", accumulation_axis, dtype)
 
 
 class _PerTokenLoss(nn.Module):

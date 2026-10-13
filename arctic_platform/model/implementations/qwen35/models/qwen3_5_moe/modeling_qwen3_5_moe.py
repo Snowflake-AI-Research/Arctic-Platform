@@ -666,13 +666,14 @@ def _shared_expert_gate(
     Sequence parallelism changes the token dimension of this ``D -> 1``
     projection. cuBLAS can select a different BF16 kernel for the sharded
     matrix, and a one-ULP gate change is amplified by later residual layers.
-    Keeping the reduction and sigmoid in FP32 makes the token-local result
-    stable without gathering sequence shards.
+    Keeping the projection reduction in FP32 makes the token-local result
+    stable without gathering sequence shards. Round logits before the sigmoid
+    to preserve the model's activation-dtype gate and its derivative.
     """
     bias = gate.bias.float() if gate.bias is not None else None
     with torch.autocast(device_type=hidden_states.device.type, enabled=False):
         logits = F.linear(hidden_states.float(), gate.weight.float(), bias)
-        return torch.sigmoid(logits).to(dtype=hidden_states.dtype)
+        return torch.sigmoid(logits.to(dtype=hidden_states.dtype))
 
 
 class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
@@ -695,6 +696,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
             route_norm=True,
             route_scale=1.0,
             score_before_experts=False,
+            route_weights_dtype="logits",
             top_k=config.num_experts_per_tok,
             use_grouped_mm=config.use_grouped_mm,
             load_balance_coeff=config.load_balance_coeff,
@@ -747,7 +749,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
         shared_output = _shared_expert_gate(hidden_flat, self.shared_expert_gate) * shared_output
         shared_output = shared_output.view(bs, slen, dim)
 
-        hidden_states = residual + routed_output + shared_output
+        hidden_states = residual + (routed_output + shared_output)
         return hidden_states
 
 

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,8 @@ from arctic_platform.common.deepspeed_worker import _canonical_hf_export_state_d
 from arctic_platform.common.deepspeed_worker import _copy_source_sidecars
 from arctic_platform.common.deepspeed_worker import _model_full_hf_export_state_dict
 from arctic_platform.common.deepspeed_worker import restore_source_weight_layout
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_equal
 
 
 def _write_model(path: Path, tensors: dict[str, torch.Tensor], config: dict) -> None:
@@ -121,6 +124,125 @@ def test_hf_model_export_only_canonicalizes_checkpoint_wrapper_names() -> None:
     exported = _canonical_hf_export_state_dict(SimpleNamespace(), state_dict)
 
     assert exported == {"model.layer.weight": tensor}
+
+
+@pytest.mark.parametrize("checkpoint_wrapped", [False, True])
+def test_moe_peft_export_preserves_adapter_tensors_and_reload(tmp_path: Path, monkeypatch, checkpoint_wrapped) -> None:
+    from peft import LoraConfig
+    from peft import PeftModel
+    from peft import get_peft_model
+    from peft import get_peft_model_state_dict
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+    from transformers import Qwen3Config
+    from transformers import Qwen3ForCausalLM
+
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+
+    set_seed(41)
+    base = Qwen3ForCausalLM(
+        Qwen3Config(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            use_cache=False,
+            attn_implementation="eager",
+        )
+    )
+    reload_base = copy.deepcopy(base)
+    if checkpoint_wrapped:
+        base.model.layers[0] = checkpoint_wrapper(base.model.layers[0])
+    monkeypatch.setattr(type(base), "convert_layer_to_hf", staticmethod(lambda state, index: state), raising=False)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    base._iter_full_hf_weights = build_iter_full_hf_weights(base)
+    model = get_peft_model(
+        base, LoraConfig(task_type="CAUSAL_LM", target_modules=["q_proj", "v_proj"], r=2, lora_alpha=4)
+    )
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.copy_(torch.arange(parameter.numel()).reshape_as(parameter) / 100)
+    expected = {
+        name.replace("._checkpoint_wrapped_module", ""): tensor.clone()
+        for name, tensor in get_peft_model_state_dict(model, state_dict=dict(model.named_parameters())).items()
+    }
+    assert len(expected) == 4
+    worker = SimpleNamespace(rank=0, engine=SimpleNamespace(module=model), _source_model_dir=None)
+    worker_class = DeepSpeedWorker.__ray_metadata__.modified_class
+
+    exported = worker_class.export_hf_checkpoint(worker, str(tmp_path))
+
+    assert exported == str(tmp_path / "hf")
+    with safe_open(tmp_path / "hf" / "adapter_model.safetensors", framework="pt") as handle:
+        assert set(handle.keys()) == set(expected)
+        for name, tensor in expected.items():
+            torch_assert_equal(handle.get_tensor(name), tensor)
+    reloaded = PeftModel.from_pretrained(reload_base, exported).eval()
+    for name, tensor in get_peft_model_state_dict(reloaded).items():
+        torch_assert_equal(tensor, expected[name])
+    model.eval()
+    tokens = torch.tensor([[1, 2, 3, 4]])
+    with torch.no_grad():
+        torch_assert_equal(reloaded(input_ids=tokens).logits, model(input_ids=tokens).logits)
+
+
+def test_peft_export_bypasses_base_iterator_on_nonzero_rank(tmp_path: Path) -> None:
+    def base_iterator():
+        raise AssertionError("PEFT adapter export must not use the base-only HF iterator")
+
+    model = SimpleNamespace(
+        peft_config={"default": object()}, _iter_full_hf_weights=base_iterator, named_parameters=lambda: []
+    )
+    worker = SimpleNamespace(rank=1, engine=SimpleNamespace(module=model))
+    worker_class = DeepSpeedWorker.__ray_metadata__.modified_class
+
+    assert worker_class.export_hf_checkpoint(worker, str(tmp_path)) is None
+    assert not (tmp_path / "hf").exists()
+
+
+@pytest.mark.parametrize("invalid", ["collision", "empty", "missing"])
+def test_peft_adapter_canonicalization_rejects_invalid_files(tmp_path: Path, invalid) -> None:
+    from arctic_platform.common import deepspeed_worker
+
+    checkpoint = tmp_path / "adapter_model.safetensors"
+    if invalid != "missing":
+        tensors = (
+            {}
+            if invalid == "empty"
+            else {
+                "layer.q_proj.lora_A.weight": torch.ones(2),
+                "layer._checkpoint_wrapped_module.q_proj.lora_A.weight": torch.zeros(2),
+            }
+        )
+        save_file(tensors, checkpoint, metadata={"format": "pt"})
+        original = checkpoint.read_bytes()
+    with pytest.raises((ValueError, FileNotFoundError)):
+        deepspeed_worker._canonicalize_peft_adapter_checkpoint(str(tmp_path), ["default"])
+    if invalid != "missing":
+        assert checkpoint.read_bytes() == original
+
+
+def test_peft_adapter_canonicalization_preserves_named_adapters_and_metadata(tmp_path: Path) -> None:
+    from arctic_platform.common import deepspeed_worker
+
+    for adapter, value in [("default", 2.0), ("research", 3.0)]:
+        directory = tmp_path / ("" if adapter == "default" else adapter)
+        directory.mkdir(exist_ok=True)
+        save_file(
+            {"layer._checkpoint_wrapped_module.q_proj.lora_A.weight": torch.full((2,), value)},
+            directory / "adapter_model.safetensors",
+            metadata={"format": "pt", "adapter": adapter},
+        )
+    deepspeed_worker._canonicalize_peft_adapter_checkpoint(str(tmp_path), ["default", "research"])
+    for adapter, value in [("default", 2.0), ("research", 3.0)]:
+        checkpoint = tmp_path / ("" if adapter == "default" else adapter) / "adapter_model.safetensors"
+        with safe_open(checkpoint, framework="pt") as handle:
+            assert list(handle.keys()) == ["layer.q_proj.lora_A.weight"]
+            assert handle.metadata() == {"format": "pt", "adapter": adapter}
+            torch_assert_equal(handle.get_tensor(handle.keys()[0]), torch.full((2,), value))
 
 
 def test_qwen3_5_text_export_loads_as_qwen3_5_config(tmp_path: Path) -> None:

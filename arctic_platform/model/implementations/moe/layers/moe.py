@@ -95,6 +95,7 @@ class MoEArgs:
     fp8_block_size: int | None = None
     """HF finegrained-FP8 tile size. None means weights are not stored as FP8."""
     swiglu_limit: float | None = None
+    route_weights_dtype: Literal["float32", "input", "logits"] = "float32"
 
 
 def _apply_swiglu(
@@ -462,6 +463,7 @@ class TokenChoiceTopKRouter(nn.Module):
         score_func (Literal["softmax", "sigmoid"]): Whether to use sigmoid or softmax for router scores.
         route_norm (bool): Whether to normalize the routing scores when using sigmoid.
         route_scale (float): Scaling factor applied to the routing scores.
+        route_weights_dtype (Literal["float32", "input", "logits"]): Precision of selected expert weights.
     """
 
     def __init__(
@@ -472,6 +474,7 @@ class TokenChoiceTopKRouter(nn.Module):
         score_func: Literal["softmax", "sigmoid"],
         route_norm: bool,
         route_scale: float,
+        route_weights_dtype: Literal["float32", "input", "logits"] = "float32",
     ):
         super().__init__()
         self.gate = nn.Linear(dim, num_experts, bias=False)
@@ -480,6 +483,9 @@ class TokenChoiceTopKRouter(nn.Module):
         self.score_func = score_func
         self.route_norm = route_norm
         self.route_scale = route_scale
+        if route_weights_dtype not in ("float32", "input", "logits"):
+            raise ValueError(f"Unknown route weights dtype {route_weights_dtype}")
+        self.route_weights_dtype = route_weights_dtype
         # Off unless the caller opts in via enable_fresh_replay_routing(); otherwise replay stays gather-only.
         self.fresh_replay_routing = False
 
@@ -495,6 +501,7 @@ class TokenChoiceTopKRouter(nn.Module):
             routed_experts is None or routed_experts.shape[-1] == self.top_k
         ), f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
         scores = self.gate(x)
+        logits_dtype = scores.dtype
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
@@ -538,6 +545,10 @@ class TokenChoiceTopKRouter(nn.Module):
             max=self.num_experts,
         )
 
+        if self.route_weights_dtype == "input":
+            top_scores = top_scores.to(dtype=x.dtype)
+        elif self.route_weights_dtype == "logits":
+            top_scores = top_scores.to(dtype=logits_dtype)
         return top_scores, selected_experts_indices, num_tokens_per_expert
 
     def init_weights(self, init_std: float):
@@ -611,6 +622,7 @@ class MoE(nn.Module):
             score_func=moe_args.score_func,
             route_norm=moe_args.route_norm,
             route_scale=moe_args.route_scale,
+            route_weights_dtype=moe_args.route_weights_dtype,
         )
         self.reorderer = TokenReorderer(num_experts=num_experts, top_k=moe_args.top_k)
         # TODO: Add the s back and use FF when the weights support it

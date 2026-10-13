@@ -127,7 +127,6 @@ gpu = [
     "arctic_platform[testing]",
     "flash-linear-attention==0.5.2",
     "tilelang==0.1.12",
-    "transformers==5.12.1",
 ]
 
 # Shared DSSST1 tensor wire format.

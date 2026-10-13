@@ -160,8 +160,8 @@ def sp_size_from_job_config(job_config: Any) -> int:
 
 
 class GenerateRequest(BaseModel):
-    prompts: list[str]
-    sampling_params: dict[str, Any] | None = None
+    prompts: list[str | list[int]]
+    sampling_params: dict[str, Any] | list[dict[str, Any] | None] | None = None
     routing_key: Any = None
     strict: bool = False
 
@@ -214,9 +214,15 @@ def build_model_config(
     ModelConfig, which expands them into real engine kwargs in
     ``ModelConfig.to_engine_kwargs()``.
     """
-    from arctic_inference.server.config import ModelConfig
+    replay = (arctic_inference_config or {}).get("router_replay") or {}
+    if replay.get("enabled"):
+        from arctic_platform.inference.server.config import ModelConfig
+    else:
+        from arctic_inference.server.config import ModelConfig
 
     cfg = dict(vllm_config or {})
+    if replay.get("enabled"):
+        cfg["enable_return_routed_experts"] = True
     cfg["model"] = model_name
     known_fields = set(ModelConfig.model_fields.keys())
     cfg.update(parse_arctic_inference_rollout(arctic_inference_config, known_fields))

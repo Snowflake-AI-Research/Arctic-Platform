@@ -87,6 +87,37 @@ def _canonical_hf_export_name(name: str) -> str:
     return name.replace("._checkpoint_wrapped_module", "")
 
 
+def _canonicalize_peft_adapter_checkpoint(hf_dir: str, adapter_names) -> None:
+    """Canonicalize adapter keys after PEFT selects tensors by live module names."""
+    import tempfile
+
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    for adapter_name in adapter_names:
+        directory = hf_dir if adapter_name == "default" else os.path.join(hf_dir, adapter_name)
+        path = os.path.join(directory, "adapter_model.safetensors")
+        with safe_open(path, framework="pt") as handle:
+            keys = list(handle.keys())
+            metadata = handle.metadata()
+            canonical = [_canonical_hf_export_name(key) for key in keys]
+            if not keys:
+                raise ValueError(f"PEFT exported no adapter tensors: {path}")
+            if len(set(canonical)) != len(keys):
+                raise ValueError(f"PEFT export has duplicate canonical adapter names: {path}")
+            if canonical == keys:
+                continue
+            tensors = {name: handle.get_tensor(key) for key, name in zip(keys, canonical, strict=True)}
+        with tempfile.NamedTemporaryFile(dir=directory, prefix=".adapter-export-", delete=False) as temporary:
+            temporary_path = temporary.name
+        try:
+            save_file(tensors, temporary_path, metadata=metadata)
+            os.replace(temporary_path, path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+
 def _composite_renames(names, checkpoint_names: set[str]) -> dict[str, str]:
     """Map text-only trained names onto a composite source checkpoint."""
     checkpoint_names = {_canonical_hf_export_name(name) for name in checkpoint_names}
@@ -392,9 +423,9 @@ def _worker_debug_config(job_config: dict) -> dict:
 def _setup_model_parallel_groups(spec: ModelSpec) -> dict[str, Any]:
     """Create the runtime process groups consumed by the native model loaders.
 
-    The native worker supports either no sequence parallelism or full-world sequence parallelism. Expert groups
-    remain node-local contiguous blocks; ranks at the same position in each block form the expert-data-parallel
-    replica groups that DeepSpeed uses for gradient reduction and optimizer sharding.
+    Sequence-parallel groups are contiguous blocks whose size divides the world. Expert groups remain node-local
+    contiguous blocks; ranks at the same position in each block form the expert-data-parallel replica groups that
+    DeepSpeed uses for gradient reduction and optimizer sharding.
     """
     import deepspeed.utils.groups as ds_groups
     from deepspeed.runtime.sequence_parallel import parallel_state_sp as sp_mpu
@@ -414,10 +445,8 @@ def _setup_model_parallel_groups(spec: ModelSpec) -> dict[str, Any]:
             "mpu": None,
         }
 
-    if sp_size != world_size:
-        raise ValueError(
-            f"the native worker supports sequence_parallel=1 or the full world ({world_size}), got {sp_size}"
-        )
+    if world_size % sp_size:
+        raise ValueError(f"world_size={world_size} must be divisible by sequence_parallel={sp_size}")
     sp_mpu.initialize_sequence_parallel(sp_size)
 
     ep_name = f"ep_size_{ep_size}"
@@ -458,14 +487,33 @@ def _deepspeed_init_kwargs(model, ds_config: dict, parallel_groups: dict[str, An
 async def spawn_and_initialize_workers(gpus, master_port, config_dict, actor_options):
     """Create DeepSpeed ranks and initialize them. Destroy every spawned actor if any step fails.
 
-    ``actor_options(rank)`` is the kwargs for ``DeepSpeedWorker.options``. Rank 0's host is the
-    distributed rendezvous master so off-node ranks do not hang on their own localhost.
+    ``actor_options(rank)`` supplies ``DeepSpeedWorker.options``. Expert-parallel actors are reordered
+    into node-contiguous ranks before initialization. Rank zero's host is the rendezvous master.
     """
     workers = []
     try:
         for rank in range(gpus):
             workers.append(DeepSpeedWorker.options(**actor_options(rank)).remote(rank, gpus, master_port))
-        master_addr = await workers[0].get_ip.remote()
+        hosts = await asyncio.gather(*[worker.get_ip.remote() for worker in workers])
+        ep_size = int((config_dict.get("ds_worker_config") or {}).get("ep_size", 1))
+        if ep_size > 1:
+            # DeepEP opens CUDA IPC handles within consecutive groups of at most eight ranks.
+            order = [index for host in dict.fromkeys(hosts) for index, value in enumerate(hosts) if value == host]
+            workers = [workers[index] for index in order]
+            hosts = [hosts[index] for index in order]
+            ipc_group_size = min(ep_size, 8)
+            if gpus % ep_size or any(
+                len(set(hosts[start : start + ipc_group_size])) != 1 for start in range(0, gpus, ipc_group_size)
+            ):
+                raise ValueError("expert-parallel CUDA IPC rank blocks must be node-local on each host")
+            await asyncio.gather(
+                *[
+                    worker.set_rank.remote(rank)
+                    for rank, (worker, original) in enumerate(zip(workers, order, strict=True))
+                    if rank != original
+                ]
+            )
+        master_addr = hosts[0]
         await asyncio.gather(*[w.initialize.remote(master_addr, config_dict) for w in workers])
     except Exception:
         await asyncio.gather(*[w.destroy.remote() for w in workers], return_exceptions=True)
@@ -486,12 +534,20 @@ class DeepSpeedWorker:
         self.engine = None
         self.sp_size = 1
         self._weight_sender = None
+        self._router_replay_group = None
+        self._router_replay_cache_rx = None
         self._on_gpu = True
         self._gradient_norms_per_param = False
         self._source_model_dir: str | None = None
 
     def get_ip(self) -> str:
         return self.my_addr
+
+    def set_rank(self, rank: int) -> None:
+        """Assign the node-contiguous rank before distributed initialization."""
+        if self.engine is not None:
+            raise RuntimeError("Cannot reassign the rank of an initialized worker")
+        self.rank = rank
 
     def initialize(self, master_addr: str, job_config: dict) -> bool:
         self.master_addr = master_addr
@@ -782,6 +838,8 @@ class DeepSpeedWorker:
                 batch_data = [self._move_batch_to_device(mb, self._device) for mb in batch_data]
             else:
                 batch_data = self._move_batch_to_device(batch_data, self._device)
+            for replay_batch in batch_data if isinstance(batch_data, list) else [batch_data]:
+                self._consume_router_replay(replay_batch)
             if sft_profile.enabled() and torch.cuda.is_available():
                 torch.cuda.synchronize()
 
@@ -986,6 +1044,24 @@ class DeepSpeedWorker:
         timers.stop_and_print_elapsed(tname)
         return results
 
+    def _bf16_accumulated_gradients(self) -> dict[int, torch.Tensor] | None:
+        optimizer = getattr(self.engine, "optimizer", None)
+        parameter_groups = getattr(optimizer, "bf16_groups", None)
+        if parameter_groups is None:
+            return None
+        # BF16 param.grad is rank-local; the optimizer buffers hold reduced accumulated gradients.
+        return {
+            id(parameter): gradient.view_as(parameter)
+            for parameters, gradients, has_gradients in zip(
+                parameter_groups,
+                optimizer.fp32_groups_gradients,
+                optimizer.fp32_groups_has_gradients,
+                strict=True,
+            )
+            for parameter, gradient, has_gradient in zip(parameters, gradients, has_gradients, strict=True)
+            if has_gradient
+        }
+
     def _per_parameter_gradient_norm_metrics(self) -> dict[str, Any]:
         """Return one full-gradient norm per trainable parameter from rank zero."""
         if not self._gradient_norms_per_param:
@@ -994,11 +1070,16 @@ class DeepSpeedWorker:
         from deepspeed.utils import safe_get_full_grad
 
         model = self.engine.module if hasattr(self.engine, "module") else self.engine
+        accumulated_gradients = self._bf16_accumulated_gradients()
         norms: dict[str, float] = {}
         for name, param in sorted(model.named_parameters(), key=lambda item: item[0]):
             if not param.requires_grad:
                 continue
-            full_grad = safe_get_full_grad(param)
+            full_grad = (
+                accumulated_gradients.get(id(param))
+                if accumulated_gradients is not None
+                else safe_get_full_grad(param)
+            )
             if full_grad is None:
                 continue
             norms[name] = float(torch.linalg.vector_norm(full_grad.detach().float()))
@@ -1015,6 +1096,7 @@ class DeepSpeedWorker:
         from deepspeed.utils import safe_get_full_grad
 
         model = self.engine.module if hasattr(self.engine, "module") else self.engine
+        accumulated_gradients = self._bf16_accumulated_gradients()
         norms: dict[str, list[float]] = {}
         for name, param in sorted(model.named_parameters(), key=lambda item: item[0]):
             if not param.requires_grad:
@@ -1022,7 +1104,11 @@ class DeepSpeedWorker:
             group_name = getattr(param, "group_name", None)
             if group_name is None or getattr(param, "allreduce", True) is not False:
                 continue
-            full_grad = safe_get_full_grad(param)
+            full_grad = (
+                accumulated_gradients.get(id(param))
+                if accumulated_gradients is not None
+                else safe_get_full_grad(param)
+            )
             if full_grad is None or full_grad.dim() < 2:
                 continue
             local = torch.linalg.vector_norm(full_grad.detach().float().flatten(1), dim=1).contiguous()
@@ -1095,7 +1181,11 @@ class DeepSpeedWorker:
 
     def save_checkpoint(self, path: str, export_hf: bool = False) -> dict:
         """Save DeepSpeed checkpoint; optionally export HF weights to ``{path}/hf/`` (rank 0)."""
-        self.engine.save_checkpoint(path)
+        from arctic_platform.common.utils.expert_checkpoint import save_expert_parallel_weights
+
+        tag = f"global_step{self.engine.global_steps}"
+        self.engine.save_checkpoint(path, tag=tag)
+        save_expert_parallel_weights(self.engine.module, os.path.join(path, tag))
         hf_path = None
         if export_hf:
             hf_path = self.export_hf_checkpoint(path)
@@ -1125,28 +1215,30 @@ class DeepSpeedWorker:
 
     def load_checkpoint(self, path: str) -> int:
         """Restore DeepSpeed state. Returns restored ``global_steps``, or 0 if none found."""
+        from arctic_platform.common.utils.expert_checkpoint import load_expert_parallel_weights
+
         load_path, _ = self.engine.load_checkpoint(path)
         if load_path is None:
             return 0
+        load_expert_parallel_weights(self.engine.module, os.path.dirname(load_path))
         return int(self.engine.global_steps)
 
     def export_hf_checkpoint(self, checkpoint_dir: str) -> str | None:
-        """Convert a DeepSpeed checkpoint dir to HF ``save_pretrained`` under ``hf/``.
-
-        Rank 0 only; other ranks return None after a barrier. Prefer DeepSpeed's
-        ``get_fp32_state_dict_from_zero_checkpoint``; fall back to gathering live params.
-        """
+        """Gather live weights and serialize a full HF model or PEFT adapter under ``hf/`` on rank zero."""
         import os
 
         hf_dir = os.path.join(checkpoint_dir, "hf")
         model = self.engine.module
-        full_state_dict = _model_full_hf_export_state_dict(model, self.rank)
-        if not hasattr(model, "_iter_full_hf_weights"):
+        is_peft = bool(getattr(model, "peft_config", None))
+        use_model_iterator = not is_peft and hasattr(model, "_iter_full_hf_weights")
+        if use_model_iterator:
+            full_state_dict = _model_full_hf_export_state_dict(model, self.rank)
+        else:
             full_state_dict = _gather_live_hf_export_state_dict(model, self.rank)
         if self.rank == 0:
             os.makedirs(hf_dir, exist_ok=True)
             state_dict = full_state_dict
-            if not hasattr(model, "_iter_full_hf_weights"):
+            if not is_peft and not use_model_iterator:
                 state_dict = _canonical_hf_export_state_dict(model, state_dict)
             try:
                 model.save_pretrained(hf_dir, state_dict=state_dict, safe_serialization=True)
@@ -1156,6 +1248,8 @@ class DeepSpeedWorker:
                 if missing or unexpected:
                     logger.warning("HF export load_state_dict missing=%s unexpected=%s", missing, unexpected)
                 model.save_pretrained(hf_dir, safe_serialization=True)
+            if is_peft:
+                _canonicalize_peft_adapter_checkpoint(hf_dir, model.peft_config)
             if self._source_model_dir and restore_source_weight_layout(self._source_model_dir, hf_dir):
                 _copy_source_sidecars(self._source_model_dir, hf_dir)
             replace_exported_qwen3_5_text_config(self._source_model_dir, hf_dir)
@@ -1200,12 +1294,150 @@ class DeepSpeedWorker:
         return token_log_probs.cpu()
 
     def max_param_bytes(self) -> int:
+        if getattr(self.engine.module, "_iter_full_hf_weights", None) is not None:
+            # Transfer conversion can fuse projections and gather EP shards.
+            return max((tensor.numel() * tensor.element_size() for _, tensor in self.get_weights()), default=0)
         max_bytes = 0
         for p in self.engine.module.parameters():
             elem_size = p.data.element_size()
             numel = p.ds_numel if hasattr(p, "ds_id") else p.data.numel()
             max_bytes = max(max_bytes, numel * elem_size)
         return max_bytes
+
+    def init_router_replay(
+        self,
+        master_addr: str,
+        master_port: int,
+        rank: int,
+        world_size: int,
+        max_cache_bytes: int = 16 * 1024**3,
+        is_server: bool = False,
+    ) -> dict:
+        from arctic_platform.inference.server.router_replay import RouterReplayCacheRX
+        from arctic_platform.inference.server.router_replay import init_router_replay_group
+
+        if self._router_replay_group is not None:
+            self._router_replay_group.close()
+            self._router_replay_group = None
+        if self._router_replay_cache_rx is None:
+            self._router_replay_cache_rx = RouterReplayCacheRX(
+                device=torch.device(self._device), max_bytes=max_cache_bytes
+            )
+        else:
+            self._router_replay_cache_rx.clear()
+        self._router_replay_group = init_router_replay_group(
+            role="receiver",
+            master_addr=master_addr,
+            master_port=master_port,
+            rank=rank,
+            world_size=world_size,
+            device=torch.device(self._device),
+            is_server=is_server,
+        )
+        return {"status": "ok", "rank": rank, "world_size": world_size}
+
+    def recv_router_replay(
+        self, sample_ids: list[str], discard: bool = True, replay_meta: list[dict] | None = None
+    ) -> dict:
+        if self._router_replay_group is None or self._router_replay_cache_rx is None:
+            raise RuntimeError("router-replay receiver is not initialized")
+        result = self._router_replay_group.recv(
+            self._router_replay_cache_rx, needed_sample_ids=sample_ids, discard=discard
+        )
+        validations = []
+        if replay_meta is not None:
+            for row, sample_id in enumerate(sample_ids):
+                meta = replay_meta[row] if row < len(replay_meta) else {}
+                cached = self._router_replay_cache_rx.peek(sample_id)
+                shape = cached.get("shape") if isinstance(cached, dict) else None
+                valid_shape = (
+                    isinstance(shape, (list, tuple))
+                    and len(shape) == 3
+                    and all(type(dimension) is int and dimension > 0 for dimension in shape)
+                )
+                expected = meta.get("capture_len") if isinstance(meta, dict) else None
+                reason = None
+                if cached is None:
+                    reason = "cache_missing"
+                elif not valid_shape:
+                    reason = "capture_shape"
+                elif type(expected) is not int or expected <= 0:
+                    reason = "metadata_capture_len"
+                elif shape[0] != expected:
+                    reason = "capture_len"
+                validations.append(
+                    {
+                        "valid": reason is None,
+                        "reason": reason,
+                        "rank": self.rank,
+                        "row": row,
+                        "replay_id": sample_id,
+                        "shape": shape,
+                        "capture_len": shape[0] if valid_shape else None,
+                        "expected_capture_len": expected,
+                    }
+                )
+        result["validations"] = validations
+        return result
+
+    def close_router_replay(self) -> dict:
+        if self._router_replay_cache_rx is not None:
+            self._router_replay_cache_rx.clear()
+        if self._router_replay_group is not None:
+            self._router_replay_group.close()
+            self._router_replay_group = None
+        return {"status": "ok"}
+
+    @staticmethod
+    def _assemble_routed_experts(captures, attention_mask, device, position_ids=None):
+        if not torch.is_tensor(attention_mask) or attention_mask.ndim != 2:
+            raise ValueError("router-replay requires a 2D attention_mask")
+        rows, width = attention_mask.shape
+        if len(captures) != rows or rows == 0:
+            raise ValueError("router-replay sample count does not match batch rows")
+        router_shape = None
+        for routed in captures:
+            if not torch.is_tensor(routed) or routed.ndim != 3 or any(size <= 0 for size in routed.shape):
+                raise ValueError("router-replay capture requires [tokens, layers, top_k]")
+            if routed.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+                raise ValueError("router-replay capture indices must be integers")
+            if router_shape is not None and tuple(routed.shape[1:]) != router_shape:
+                raise ValueError("router-replay captures disagree on router shape")
+            router_shape = tuple(routed.shape[1:])
+        mask = attention_mask.to(device=device, dtype=torch.bool)
+        if position_ids is not None:
+            if (
+                not torch.is_tensor(position_ids)
+                or tuple(position_ids.shape) != (rows, width)
+                or position_ids.dtype not in (torch.int32, torch.int64)
+            ):
+                raise ValueError("router-replay position_ids must match attention_mask")
+            positions = position_ids.to(device=device, dtype=torch.long)
+        else:
+            positions = (mask.long().cumsum(dim=-1) - 1).clamp_min(0)
+            if any(routed.shape[0] > int(mask[row].sum()) for row, routed in enumerate(captures)):
+                raise ValueError("router-replay capture exceeds attended sequence")
+        assembled = torch.zeros((rows, width, *router_shape), dtype=torch.int64, device=device)
+        for row, routed in enumerate(captures):
+            routed = routed.to(device=device, dtype=torch.int64)
+            valid = mask[row] & (positions[row] >= 0) & (positions[row] < routed.shape[0])
+            # Position IDs refer to the original sample, including on a noncontiguous SP slice.
+            gathered = routed[positions[row].clamp(0, routed.shape[0] - 1)]
+            assembled[row] = gathered * valid[:, None, None]
+        return assembled
+
+    def _consume_router_replay(self, batch: dict) -> None:
+        sample_ids = batch.pop("rr_sample_ids", None)
+        batch.pop("rr_replay_meta", None)
+        batch.pop("rr_discard", None)
+        if not sample_ids:
+            return
+        if self._router_replay_cache_rx is None:
+            raise RuntimeError("router-replay RX cache is not initialized")
+        captures = [self._router_replay_cache_rx.pop(sample_id) for sample_id in sample_ids]
+        batch["routed_experts"] = self._assemble_routed_experts(
+            captures, batch.get("attention_mask"), self._device, position_ids=batch.get("position_ids")
+        )
 
     def init_weight_sender(self, group, schedule, master_addr, base_port, bucket_size) -> bool:
         from arctic_inference.server.weight_sync.sender import WeightSender
@@ -1221,11 +1453,31 @@ class DeepSpeedWorker:
         return True
 
     def get_weights(self) -> list[tuple[str, torch.Tensor]]:
+        model = self.engine.module
+        iterator = getattr(model, "_iter_full_hf_weights", None)
+        if iterator is not None:
+            # The converter gathers experts collectively and emits complete HF tensors only on rank zero.
+            weights = list(iterator())
+            metadata = [
+                (
+                    [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in weights]
+                    if dist.get_rank() == 0
+                    else None
+                )
+            ]
+            dist.broadcast_object_list(metadata, src=0)
+            if dist.get_rank() != 0:
+                weights = [
+                    (name, torch.empty(shape, dtype=dtype, device=self._device)) for name, shape, dtype in metadata[0]
+                ]
+            for _, tensor in weights:
+                dist.broadcast(tensor, src=0)
+            return weights
         weights = []
-        for n, p in self.engine.module.named_parameters():
+        for n, p in model.named_parameters():
             if hasattr(p, "ds_id"):
                 with deepspeed.zero.GatheredParameters([p], enabled=True):
-                    weights.append((n, p.data))
+                    weights.append((n, p.data.detach().clone()))
             else:
                 weights.append((n, p.data))
         return weights
@@ -1674,6 +1926,7 @@ class DeepSpeedWorker:
         return {"gpu_mb": mem_mb}
 
     def destroy(self) -> bool:
+        self.close_router_replay()
         if self._weight_sender is not None:
             self._weight_sender.destroy()
             self._weight_sender = None
