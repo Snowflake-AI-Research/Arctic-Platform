@@ -197,7 +197,7 @@ def _to_python(obj: Any) -> Any:
     return obj
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class _Route:
     method: str
     # Under the prefix. `{job}` is the parent of request.job_id; other fields come from the body.
@@ -218,26 +218,30 @@ class _Route:
 
 _ROUTES = {
     # A replayed create would spawn a second job.
-    "create-job": _Route("POST", "", replay_safe=False),
-    "get-job": _Route("GET", "/{job}", _no_body),
-    "cancel-job": _Route("POST", "/{job}:cancel", _no_body),
+    "create-job": _Route(method="POST", path="", replay_safe=False),
+    "get-job": _Route(method="GET", path="/{job}", encode=_no_body),
+    "cancel-job": _Route(method="POST", path="/{job}:cancel", encode=_no_body),
     # forward-backward always carries a chunk envelope, even when the frame fits: its
     # chunk_group_id is the server's idempotency key. A mid-stream chunk-group desync
     # (GS restart) is recoverable only by re-posting the whole group.
     "forward-backward": _Route(
-        "POST",
-        "/{job}/forward-backward",
-        _octet("fwd-bwd", force_chunk=True),
+        method="POST",
+        path="/{job}/forward-backward",
+        encode=_octet("fwd-bwd", force_chunk=True),
         poll=True,
         restartable=True,
         normalize=_fwd_bwd_result,
     ),
     # SnowAPI requires DSSST1 octet bodies here even though generate carries no tensors.
-    "generate": _Route("POST", "/{job}/generate", _octet("generate"), poll=True, normalize=_to_python),
-    "forward": _Route("POST", "/{job}/operation", _forward, poll=True, normalize=_unwrap_forward_payload),
-    "step": _Route("POST", "/{job}/step", poll=True),
-    "save": _Route("POST", "/{job}/save", poll=True),
-    "operation": _Route("POST", "/{job}/operation", poll=True),
+    "generate": _Route(
+        method="POST", path="/{job}/generate", encode=_octet("generate"), poll=True, normalize=_to_python
+    ),
+    "forward": _Route(
+        method="POST", path="/{job}/operation", encode=_forward, poll=True, normalize=_unwrap_forward_payload
+    ),
+    "step": _Route(method="POST", path="/{job}/step", poll=True),
+    "save": _Route(method="POST", path="/{job}/save", poll=True),
+    "operation": _Route(method="POST", path="/{job}/operation", poll=True),
 }
 
 
