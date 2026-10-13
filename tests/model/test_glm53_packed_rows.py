@@ -132,6 +132,43 @@ def test_glm53_sparse_packed_rows_match_isolated_rows(layout):
         torch.testing.assert_close(perturbed[:, row_a_length:], isolated, rtol=1e-5, atol=1e-6)
 
 
+def test_glm53_sparse_forward_without_explicit_positions():
+    model = _tiny_glm_sparse_model()
+    output = model(input_ids=torch.tensor([[1, 2, 3, 4]]), use_cache=False)
+    assert output.last_hidden_state.shape == (1, 4, 16)
+
+
+def test_glm53_packed_boundaries_isolate_padded_tail():
+    from arctic_platform.model.implementations.glm53.context_parallel import _normalize_cu_seqlens
+
+    normalized = _normalize_cu_seqlens(
+        torch.tensor([0, 3, 5], dtype=torch.int32),
+        sequence_length=8,
+        device=torch.device("cpu"),
+    )
+    assert normalized.tolist() == [0, 3, 5, 6, 7, 8]
+
+
+@pytest.mark.parametrize(
+    "boundaries",
+    [
+        [1, 3],
+        [0, 3, 2],
+        [0, 2, 2],
+        [0, 9],
+    ],
+)
+def test_glm53_rejects_malformed_packed_boundaries(boundaries):
+    from arctic_platform.model.implementations.glm53.context_parallel import _normalize_cu_seqlens
+
+    with pytest.raises(ValueError, match="packed boundaries"):
+        _normalize_cu_seqlens(
+            torch.tensor(boundaries, dtype=torch.int32),
+            sequence_length=8,
+            device=torch.device("cpu"),
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="packed KDA kernels require CUDA")
 def test_glm53_sp1_packed_kda_outputs_and_gradients_match_isolated_row():
     torch.manual_seed(23)

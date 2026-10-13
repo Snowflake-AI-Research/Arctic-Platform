@@ -55,6 +55,37 @@ def _gather_sequence_no_grad(tensor: torch.Tensor, group) -> torch.Tensor:
     return torch.cat(gathered, dim=1)
 
 
+def _normalize_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+    *,
+    sequence_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if not torch.is_tensor(cu_seqlens) or cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+        raise ValueError("GLM-5.3 packed boundaries must be a one-dimensional tensor with at least two entries")
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32)
+    if int(cu_seqlens[0]) != 0:
+        raise ValueError("GLM-5.3 packed boundaries must start at zero")
+    if bool((cu_seqlens[1:] <= cu_seqlens[:-1]).any()):
+        raise ValueError("GLM-5.3 packed boundaries must be strictly increasing")
+    real_length = int(cu_seqlens[-1])
+    if real_length > sequence_length:
+        raise ValueError(f"GLM-5.3 packed boundaries end at {real_length}, beyond sequence length {sequence_length}")
+    if real_length < sequence_length:
+        cu_seqlens = torch.cat(
+            [
+                cu_seqlens,
+                torch.arange(
+                    real_length + 1,
+                    sequence_length + 1,
+                    device=device,
+                    dtype=torch.int32,
+                ),
+            ]
+        )
+    return cu_seqlens
+
+
 @torch.no_grad()
 def _select_sparse_indices(
     indexer: nn.Module,
@@ -452,15 +483,33 @@ def _wrap_backbone_forward(backbone: nn.Module, parallel_modules: list[nn.Module
         position_ids = kwargs.get("position_ids")
         if position_ids is None and len(args) >= 3:
             position_ids = args[2]
-        if not torch.is_tensor(position_ids):
-            raise ValueError("GLM-5.3 context parallelism requires position_ids for packed boundaries")
-        global_position_ids = _gather_sequence_no_grad(
-            position_ids,
-            self._cp_group,
+        input_tensor = kwargs.get("input_ids")
+        if input_tensor is None:
+            input_tensor = kwargs.get("inputs_embeds")
+        if input_tensor is None and args:
+            input_tensor = args[0]
+        if not torch.is_tensor(input_tensor) or input_tensor.ndim < 2:
+            raise ValueError("GLM-5.3 needs input_ids or inputs_embeds to determine the sequence length")
+        global_sequence_length = int(input_tensor.shape[1]) * self._cp_world_size
+        global_position_ids = (
+            _gather_sequence_no_grad(position_ids, self._cp_group) if torch.is_tensor(position_ids) else None
         )
         cu_seqlens = kwargs.get("cu_seq_lens_q")
-        if cu_seqlens is None or self._cp_world_size > 1:
-            cu_seqlens = cu_seqlens_from_position_ids(global_position_ids)
+        if cu_seqlens is None:
+            cu_seqlens = (
+                cu_seqlens_from_position_ids(global_position_ids)
+                if global_position_ids is not None
+                else torch.tensor(
+                    [0, global_sequence_length],
+                    dtype=torch.int32,
+                    device=input_tensor.device,
+                )
+            )
+        cu_seqlens = _normalize_cu_seqlens(
+            cu_seqlens,
+            sequence_length=global_sequence_length,
+            device=input_tensor.device,
+        )
         for module in parallel_modules:
             setattr(module, _GLOBAL_POSITION_IDS, global_position_ids)
             setattr(module, _GLOBAL_CU_SEQLENS, cu_seqlens)
