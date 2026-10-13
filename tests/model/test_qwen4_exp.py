@@ -449,10 +449,8 @@ def test_qwen38_rank_zero_ple_halo_keeps_collective_backward(monkeypatch):
 
 def test_qwen38_packed_ple_components_reset_at_position_boundaries():
     _require()
-    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import (
-        Qwen4ExpTextNGramEmbeddingPrimeRL,
-        Qwen4ExpTextPLELayerPrimeRL,
-    )
+    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpTextNGramEmbeddingPrimeRL
+    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpTextPLELayerPrimeRL
 
     config = _tiny_config().text_config
     positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
@@ -677,6 +675,7 @@ def test_qwen38_rejects_native_fp8_training():
 def test_packed_ple_survives_custom_lm_head():
     """Custom heads bypass the outer HF forward; PLE still isolates packed rows."""
     from transformers import set_seed
+
     from arctic_platform.model.implementations.moe.layers.lm_head import _patch_model_forward
 
     config = _tiny_config()

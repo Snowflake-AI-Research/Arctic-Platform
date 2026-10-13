@@ -23,14 +23,14 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch import nn
 from transformers.cache_utils import Cache
+from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpModel
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
-from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELayer
-from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_mask_to_padding_states
-from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextNGramEmbedding
+from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextPLELayer
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
 from transformers.models.qwen4_exp.modeling_qwen4_exp import _build_layer_multipliers
+from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_mask_to_padding_states
 
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.moe import FeedForward
@@ -110,7 +110,9 @@ class Qwen4ExpSparseMoePrimeRL(MoE):
 
 
 class Qwen4ExpTextNGramEmbeddingPrimeRL(Qwen4ExpTextNGramEmbedding):
-    def forward(self, input_ids: torch.Tensor, past_key_values: Cache | None, position_ids: Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, past_key_values: Cache | None, position_ids: Tensor | None = None
+    ) -> torch.Tensor:
         input_ids = input_ids.long()
         # This is a trick to store the previous N=self.context_len `input_ids` - indeed the manipulations are identical to storing
         # a past conv_state, so we can use an additional conv_states inside the Cache for it
@@ -181,7 +183,9 @@ class Qwen4ExpTextPLELayerPrimeRL(Qwen4ExpTextPLELayer):
         valid = position_ids[..., None] >= offsets
         windows = windows * valid[:, None].to(windows.dtype)
         accumulation_dtype = torch.float32 if windows.dtype in (torch.float16, torch.bfloat16) else windows.dtype
-        output = (windows.to(accumulation_dtype) * self.conv1d.weight[:, 0][None, :, None].to(accumulation_dtype)).sum(-1)
+        output = (windows.to(accumulation_dtype) * self.conv1d.weight[:, 0][None, :, None].to(accumulation_dtype)).sum(
+            -1
+        )
         output = output.to(hidden_states.dtype)
         return F.silu(output).transpose(1, 2)
 
@@ -224,7 +228,10 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
         ple_position_ids = kwargs.pop("ple_position_ids", None)
         if self.ple is not None:
             hidden_states = hidden_states + self.ple(
-                hidden_states, ple_input_ids, past_key_values, conv_mask=conv_mask,
+                hidden_states,
+                ple_input_ids,
+                past_key_values,
+                conv_mask=conv_mask,
                 position_ids=ple_position_ids,
             )
 
@@ -252,6 +259,7 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
         injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
         hidden_states = hyper_input + injection.flatten(-2)
         return hidden_states
+
 
 class Qwen4ExpModelPrimeRL(Qwen4ExpModel):
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, *args, **kwargs):

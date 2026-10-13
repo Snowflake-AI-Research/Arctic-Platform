@@ -187,8 +187,11 @@ def _adapt_ple_layer(module: nn.Module, process_group) -> None:
         extended = torch.cat([previous, input_ids], dim=1)
         if position_ids is not None:
             previous_positions = _previous_rank_context(
-                position_ids, context_length, process_group=process_group,
-                pad_value=-1, differentiable=False,
+                position_ids,
+                context_length,
+                process_group=process_group,
+                pad_value=-1,
+                differentiable=False,
             )
             position_ids = torch.cat([previous_positions, position_ids], dim=1)
         return embedding_forward(extended, None, position_ids=position_ids)[:, context_length:]
@@ -211,8 +214,11 @@ def _adapt_ple_layer(module: nn.Module, process_group) -> None:
         extended = torch.cat([previous, hidden_states], dim=1)
         if position_ids is not None:
             previous_positions = _previous_rank_context(
-                position_ids, conv_context_length, process_group=process_group,
-                pad_value=-1, differentiable=False,
+                position_ids,
+                conv_context_length,
+                process_group=process_group,
+                pad_value=-1,
+                differentiable=False,
             )
             position_ids = torch.cat([previous_positions, position_ids], dim=1)
         return short_conv(extended, None, position_ids=position_ids)[:, conv_context_length:]
