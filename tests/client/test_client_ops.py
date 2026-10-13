@@ -598,6 +598,151 @@ class TestCortexCancelToleratesEmptyBody:
         assert sent["url"].endswith("/job-abc:cancel")
 
 
+class TestCortexPollSurvivesTransientErrors:
+    """A submitted request keeps running while its status is unreachable. Giving
+    up on the poll before the deadline made callers resubmit it, and a
+    resubmitted forward-backward accumulated its gradient twice."""
+
+    _DONE = {"status": "REQUEST_STATE_DONE", "result": {"loss": 1.5}}
+
+    @staticmethod
+    def _cortex():
+        # The transport imports tenacity, which lives in the `cortex` extra.
+        pytest.importorskip("tenacity")
+        from arctic_platform.client.transports import cortex
+
+        return cortex
+
+    def _transport(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
+        from arctic_platform.client import CortexConfig
+
+        cfg = ArcticClientConfig(model_name="m", backend=CortexConfig(max_retries=0), training_gpus=1, sampling_gpus=1)
+        t = self._cortex().CortexTransport(cfg)
+        t.job_id, t.poll_interval = "job-1", 0.0
+        return t
+
+    @staticmethod
+    def _response(status_code, body):
+        import json
+
+        import requests
+
+        resp = requests.Response()
+        resp.status_code, resp._content, resp.url = status_code, json.dumps(body).encode(), "http://mock/requests/r1"
+        return resp
+
+    def _serve(self, monkeypatch, t, outcomes):
+        calls = []
+
+        def _request(method, url, **kwargs):
+            calls.append((method, url))
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(t.session, "request", _request)
+        return calls
+
+    def _aserve(self, monkeypatch, t, outcomes):
+        retry_policies = []
+
+        async def _asend(method, url, *, retry_on=None, **kwargs):
+            retry_policies.append(retry_on)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(t, "_asend", _asend)
+        return retry_policies
+
+    def test_poll_outlasts_retry_budget_and_truncated_bodies(self, monkeypatch):
+        import requests
+
+        t = self._transport(monkeypatch)
+        unavailable = self._response(503, {"message": "no healthy upstream"})
+        calls = self._serve(
+            monkeypatch,
+            t,
+            [
+                unavailable,
+                unavailable,
+                requests.exceptions.ChunkedEncodingError("cut off"),
+                self._response(200, self._DONE),
+            ],
+        )
+
+        assert t._poll("r1") == {"loss": 1.5}
+        assert len(calls) == 4
+        assert all(method == "GET" and url.endswith("/job-1/requests/r1") for method, url in calls)
+
+    def test_poll_still_raises_a_client_error(self, monkeypatch):
+        import requests
+
+        t = self._transport(monkeypatch)
+        calls = self._serve(monkeypatch, t, [self._response(400, {"message": "bad"}), self._response(200, self._DONE)])
+
+        with pytest.raises(requests.exceptions.HTTPError):
+            t._poll("r1")
+        assert len(calls) == 1
+
+    def test_poll_still_raises_a_failed_request(self, monkeypatch):
+        t = self._transport(monkeypatch)
+        self._serve(monkeypatch, t, [self._response(200, {"status": "REQUEST_STATE_FAILED", "error": "oom"})])
+
+        with pytest.raises(RuntimeError, match="oom"):
+            t._poll("r1")
+
+    def test_poll_deadline_reports_the_last_error(self, monkeypatch):
+        import requests
+
+        t = self._transport(monkeypatch)
+        t.poll_timeout = 0.05
+        unavailable = self._response(503, {"message": "no healthy upstream"})
+        monkeypatch.setattr(t.session, "request", lambda method, url, **kwargs: unavailable)
+
+        with pytest.raises(TimeoutError) as info:
+            t._poll("r1")
+        assert isinstance(info.value.__cause__, requests.exceptions.HTTPError)
+
+    def test_async_poll_outlasts_unreachable_status(self, monkeypatch):
+        t = self._transport(monkeypatch)
+        aiohttp = pytest.importorskip("aiohttp")
+        outcomes = [
+            aiohttp.ClientResponseError(None, (), status=503),
+            aiohttp.ClientPayloadError("Response payload is not completed"),
+            self._DONE,
+        ]
+        retry_policies = self._aserve(monkeypatch, t, outcomes)
+
+        assert asyncio.run(t._apoll("r1")) == {"loss": 1.5}
+        assert retry_policies == [self._cortex()._is_poll_transient_async] * 3
+
+    def test_async_poll_still_raises_a_client_error(self, monkeypatch):
+        t = self._transport(monkeypatch)
+        aiohttp = pytest.importorskip("aiohttp")
+        outcomes = [aiohttp.ClientResponseError(None, (), status=400), self._DONE]
+        self._aserve(monkeypatch, t, outcomes)
+
+        with pytest.raises(aiohttp.ClientResponseError):
+            asyncio.run(t._apoll("r1"))
+        assert len(outcomes) == 1
+
+    def test_truncated_bodies_are_transient_only_for_polls(self):
+        cortex = self._cortex()
+        aiohttp = pytest.importorskip("aiohttp")
+        import requests
+
+        truncated = aiohttp.ClientPayloadError("Response payload is not completed")
+        assert cortex._is_poll_transient_async(truncated)
+        assert not cortex._is_transient_async(truncated)
+        chunked = requests.exceptions.ChunkedEncodingError("cut off")
+        assert cortex._is_poll_transient(chunked)
+        assert not cortex._is_transient(chunked)
+
+
 class TestCortexSharedHelper:
     """``to_cortex_fwd_bwd_payload`` lives under ``arctic_platform.integrations``
     so the reshape rule sits next to the dispatch shim that uses it."""
