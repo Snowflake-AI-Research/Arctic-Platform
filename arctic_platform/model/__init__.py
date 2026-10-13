@@ -32,10 +32,12 @@ from arctic_platform.model.dense_spec import dense_model_spec
 from arctic_platform.model.expert_parallel import ep_group_name
 from arctic_platform.model.expert_parallel import expert_parallel_group
 from arctic_platform.model.expert_parallel import setup_replicated_expert_groups
+from arctic_platform.model.expert_parallel import split_expert_param_groups
 from arctic_platform.model.expert_parallel import validate_expert_parallel
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import mark_keep_fp32
+from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.implementations.gpu.activation_offload import activation_offload_stats
 from arctic_platform.model.implementations.gpu.lm_head import mark_lm_head_targets_validated
 from arctic_platform.model.implementations.gpu.lm_head import validated_lm_head_targets_to
@@ -55,6 +57,9 @@ from arctic_platform.model.loader import freeze_fp8_weights_and_scales
 from arctic_platform.model.loader import model_parallelism_metadata_from_config
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import select_loader
+from arctic_platform.model.moe_spec import build_moe_model
+from arctic_platform.model.moe_spec import hf_text_model_type
+from arctic_platform.model.moe_spec import is_glm_moe_model
 from arctic_platform.model.moe_spec import moe_model_spec
 from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.patch import register_patch
@@ -98,9 +103,11 @@ __all__ = [
     "freeze_fp8_weights_and_scales",
     "gather_peft_adapter_state_dict",
     "get_language_model",
+    "hf_text_model_type",
     "get_vision_encoder",
     "hf_export_parameter_name",
     "iter_lora_weights",
+    "is_glm_moe_model",
     "iter_model_weights",
     "keeps_fp32",
     "LoadedModel",
@@ -115,6 +122,7 @@ __all__ = [
     "moe_model_spec",
     "ParallelismConfig",
     "Patches",
+    "preserve_fp8_params_through_ds_cast",
     "pretrained_config_of",
     "pretrained_module_for_hf_save",
     "save_hf_pretrained",
@@ -125,6 +133,7 @@ __all__ = [
     "apply_patches",
     "apply_peft",
     "build_model",
+    "build_moe_model",
     "register_loader",
     "register_patch",
     "resolve_conversion_cache_path",
@@ -132,6 +141,7 @@ __all__ = [
     "save_exported_state_dict",
     "select_loader",
     "setup_replicated_expert_groups",
+    "split_expert_param_groups",
     "validate_lora_sync_trainable_parameters",
     "validate_expert_parallel",
     "validate_sequence_parallel",

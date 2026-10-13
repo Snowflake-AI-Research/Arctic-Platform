@@ -72,3 +72,21 @@ def test_expert_parallel_group_uses_the_registry_key(monkeypatch):
 
     assert expert_parallel_mod.expert_parallel_group(8) == "ep_size_8"
     assert seen == ["ep_size_8"]
+
+
+def test_split_expert_param_groups_names_groups_before_the_deepspeed_split(monkeypatch):
+    seen = {}
+
+    def configure(groups):
+        seen["groups"] = groups
+        return [{"name": "experts", "params": groups[0]["params"]}]
+
+    monkeypatch.setattr(
+        "deepspeed.moe.utils.configure_moe_param_groups",
+        configure,
+    )
+    params = [object()]
+    result = expert_parallel_mod.split_expert_param_groups([{"params": params}])
+
+    assert seen["groups"] == [{"params": params, "name": "group_0"}]
+    assert result == [{"name": "experts", "params": params}]

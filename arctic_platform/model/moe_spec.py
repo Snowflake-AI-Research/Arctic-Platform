@@ -32,6 +32,49 @@ def _omit_none(value: Any) -> Any:
     return value
 
 
+def hf_text_model_type(model_path: str) -> str:
+    """Read the text model type without requiring its config class to be registered."""
+    from transformers import PretrainedConfig
+
+    config, _ = PretrainedConfig.get_config_dict(model_path)
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict) and text_config.get("model_type"):
+        return str(text_config["model_type"])
+    return str(config.get("model_type") or "")
+
+
+def is_glm_moe_model(model_path: str) -> bool:
+    return hf_text_model_type(model_path) == "glm_moe_dsa"
+
+
+def build_moe_model(
+    *,
+    model_name: str,
+    ep_size: int,
+    sp_size: int = 1,
+    sp_group: Any = None,
+    loader_options: dict | None = None,
+    tiled_mlp_token_chunk_size: int | None = None,
+    peft_config: dict | None = None,
+):
+    """Build an expert-parallel MoE from training options and the registered expert group."""
+    from arctic_platform.model import build_model
+    from arctic_platform.model.expert_parallel import expert_parallel_group
+
+    spec = moe_model_spec(
+        model_name=model_name,
+        ep_size=ep_size,
+        sp_size=sp_size,
+        loader_options=loader_options,
+        tiled_mlp_token_chunk_size=tiled_mlp_token_chunk_size,
+        peft_config=peft_config,
+    )
+    return build_model(
+        spec,
+        parallel_groups={"ep_group": expert_parallel_group(ep_size), "sp_group": sp_group},
+    ).model
+
+
 def moe_model_spec(
     *,
     model_name: str,

@@ -64,6 +64,21 @@ def _create_expert_and_data_parallel(ep_size: int) -> None:
     ds_groups._create_expert_and_data_parallel(ep_size)
 
 
+def split_expert_param_groups(param_groups: list) -> list:
+    """Name optimizer groups and split MoE parameters onto the expert-data-parallel group.
+
+    DeepSpeed only does this split when it builds the optimizer itself. A caller-supplied
+    optimizer has to hand it groups that already separate expert parameters.
+    """
+    from deepspeed.moe.utils import configure_moe_param_groups
+
+    named = []
+    for index, group in enumerate(param_groups):
+        group.setdefault("name", f"group_{index}")
+        named.append(group)
+    return configure_moe_param_groups(named)
+
+
 def _expert_parallel_group(group_name: str):
     import deepspeed.utils.groups as ds_groups
 

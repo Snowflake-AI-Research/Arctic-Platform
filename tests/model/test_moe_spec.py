@@ -21,6 +21,8 @@ import json
 
 import pytest
 
+from arctic_platform.model.moe_spec import hf_text_model_type
+from arctic_platform.model.moe_spec import is_glm_moe_model
 from arctic_platform.model.moe_spec import moe_model_spec
 
 
@@ -28,6 +30,15 @@ def _write_config(path, payload):
     path.mkdir()
     (path / "config.json").write_text(json.dumps(payload))
     return str(path)
+
+
+def test_text_model_type_reads_a_nested_glm_config(tmp_path):
+    checkpoint = _write_config(
+        tmp_path / "glm",
+        {"model_type": "glm4v_moe", "text_config": {"model_type": "glm_moe_dsa"}},
+    )
+    assert hf_text_model_type(checkpoint) == "glm_moe_dsa"
+    assert is_glm_moe_model(checkpoint)
 
 
 def test_qwen_spec_lifts_dtype_attention_and_parallelism(tmp_path):
