@@ -897,6 +897,23 @@ class ReplicaPool:
             "replica_states": list(states),
         }
 
+    async def get_chat_support(
+        self, model_id: str | None = None, *, timeout: float = 600.0
+    ) -> dict[str, bool]:
+        """Report ``{"chat_prompt": bool, "thinking_optional": bool}`` for the loaded model.
+
+        ``chat_prompt``: streams take a ``ChatPrompt``. ``thinking_optional``:
+        ``reasoning_effort="none"`` turns thinking off. Waits up to ``timeout``
+        seconds for a worker the scheduler can route to, as a restarting
+        worker is not initialized yet.
+        """
+        self._check_model_id(model_id)
+        if self._scheduler is None:
+            raise RuntimeError("ReplicaPool not initialized")
+        # Every replica loads the same model with the same engine kwargs.
+        worker = await self._scheduler.wait_for_schedulable_worker(timeout)
+        return await worker.get_chat_support.remote()
+
     # ------------------------------------------------------------------
     # Metrics
     # ------------------------------------------------------------------

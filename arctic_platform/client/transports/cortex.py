@@ -44,6 +44,8 @@ from urllib3.exceptions import NewConnectionError
 
 from arctic_platform import wire
 from arctic_platform.client.config import ArcticClientConfig
+from arctic_platform.client.config import CortexConfig
+from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
@@ -107,6 +109,10 @@ _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
 # JobHandles role -> Cortex sub-job job_type name.
 _SUB_JOB_KEY = {"training": "training", "sampling": "sampling", "log_prob": "log_probability"}
+
+
+def _parent_id(job_id: JobId) -> str:
+    return str(job_id).split(":", 1)[0]
 
 
 def _canonical_result(op: str, result: dict) -> dict:
@@ -317,25 +323,22 @@ def record_job_id(path: str | None, job_id: str | None) -> None:
 
 
 class CortexTransport(Transport):
-    def __init__(self, config: ArcticClientConfig) -> None:
+    def __init__(self, config: CortexConfig) -> None:
         self.config = config
         self.jobs = JobHandles()
         self.job_id: str | None = None
-        self.request_timeout = config.request_timeout
-        self.max_retries = config.backend.max_retries
+        self.max_retries = config.max_retries
         self.poll_interval = 0.5
-        self.poll_timeout = config.job_ready_timeout
         self.session = self._build_session()
         self._asession = None  # aiohttp.ClientSession, lazy on first acall
         self._asession_loop = None  # the event loop that session is bound to
 
     # ── lifecycle ──────────────────────────────────────────────────────────
-    def initialize(self) -> JobHandles:
-        cfg = self.config
-        reconnect = JobHandles.from_config(cfg)
+    def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
+        reconnect = JobHandles.from_config(client_config)
         if reconnect.any_set:  # reattach; a sub-job token embeds its parent job id
             token = next(t for t in (reconnect.training, reconnect.sampling, reconnect.log_prob) if t is not None)
-            self.job_id = str(token).split(":", 1)[0]
+            self.job_id = _parent_id(token)
         else:
             # A mutating create: only retry when the request provably never landed,
             # so we can't spawn duplicate jobs (matches the neutrino client).
@@ -343,19 +346,19 @@ class CortexTransport(Transport):
                 "POST",
                 self._prefix,
                 retry_on=_is_connect_error,
-                json=job_create_payload(self._sub_job_configs(), cfg.backend.job_comment),
+                json=job_create_payload(client_config.to_cortex(), self.config.job_comment),
             )
             self.job_id = created["job_id"]
         # The id has to be on disk before the placement wait. A driver that dies
         # during that wait otherwise leaves the GPUs with no id to cancel.
-        record_job_id(cfg.backend.job_id_file, self.job_id)
+        record_job_id(self.config.job_id_file, self.job_id)
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
         # JobHandles holds each role's sub-job token, so the client's op bodies
         # (e.g. weight-sync source/target) already carry Cortex-correct ids with no
         # transport-side rewrite -- exactly as on-prem does with plain job ids.
         for role in JOB_TYPES:
-            if cfg.gpus_for(role) > 0:
+            if client_config.gpus_for(role) > 0:
                 self.jobs.set(role, sub_jobs[_SUB_JOB_KEY[role]])
         return self.jobs
 
@@ -550,7 +553,7 @@ class CortexTransport(Transport):
         if isinstance(submitted, dict):
             return submitted
         request_id = submitted
-        deadline = time.monotonic() + self.poll_timeout
+        deadline = time.monotonic() + self.config.poll_timeout
         delay = self.poll_interval
         chunks: list[bytes] = []
         cursor: str | None = None
@@ -564,13 +567,13 @@ class CortexTransport(Transport):
                 continue
             time.sleep(delay)
             delay = _next_delay(delay)
-        raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s")
+        raise TimeoutError(f"cortex request {request_id} did not complete within {self.config.poll_timeout}s")
 
     async def _apoll(self, submitted: str | dict) -> dict:
         if isinstance(submitted, dict):
             return submitted  # inline op — see _poll
         request_id = submitted
-        deadline = time.monotonic() + self.poll_timeout
+        deadline = time.monotonic() + self.config.poll_timeout
         delay = self.poll_interval
         chunks: list[bytes] = []
         cursor: str | None = None
@@ -584,10 +587,10 @@ class CortexTransport(Transport):
                 continue
             await asyncio.sleep(delay)
             delay = _next_delay(delay)
-        raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s")
+        raise TimeoutError(f"cortex request {request_id} did not complete within {self.config.poll_timeout}s")
 
     def _wait_running(self) -> None:
-        deadline = time.monotonic() + self.poll_timeout
+        deadline = time.monotonic() + self.config.job_ready_timeout
         delay = self.poll_interval
         while time.monotonic() < deadline:
             job = self._job()
@@ -609,7 +612,7 @@ class CortexTransport(Transport):
                 raise RuntimeError(f"cortex job {self.job_id} reached terminal state '{state}';{detail}")
             time.sleep(delay)
             delay = _next_delay(delay)
-        raise TimeoutError(f"cortex job {self.job_id} did not become running within {self.poll_timeout}s")
+        raise TimeoutError(f"cortex job {self.job_id} did not become running within {self.config.job_ready_timeout}s")
 
     def _capture_sub_jobs(self) -> dict[str, str]:
         job = self._job()
@@ -621,20 +624,15 @@ class CortexTransport(Transport):
             sub_jobs.setdefault(role, f"{self.job_id}:{role}:0")
         return sub_jobs
 
-    # ── create-job body (SubJobConfig wire shape) ────────────────────────────
-    def _sub_job_configs(self) -> list[dict]:
-        return self.config.to_cortex()
-
     # ── HTTP + auth ──────────────────────────────────────────────────────────
     @property
     def _prefix(self) -> str:
-        cfg = self.config
-        cx = cfg.backend
+        cx = self.config
         base = (cx.base_url or f"https://{cx.host}").rstrip("/")
         return f"{base}/api/v2/databases/{cx.database}/schemas/{cx.schema_}/{cx.endpoint}"
 
     def _auth_headers(self) -> dict[str, str]:
-        cx = self.config.backend
+        cx = self.config
         if cx.base_url is not None:  # local/dev host: no PAT auth
             return {}
         return {  # config validated the PAT is present for host/PAT auth
@@ -654,7 +652,7 @@ class CortexTransport(Transport):
         # Every SnowAPI call goes through here so transient 429/5xx/connection blips
         # are retried with exponential-jitter backoff (the neutrino client's policy).
         def attempt() -> dict:
-            resp = self.session.request(method, url, timeout=self.request_timeout, **kwargs)
+            resp = self.session.request(method, url, timeout=self.config.request_timeout, **kwargs)
             _raise_for_status(resp)
             # `:cancel` answers 200 with an empty body. Decoding that as JSON
             # would report an already-completed release as a failure.
@@ -677,7 +675,7 @@ class CortexTransport(Transport):
             import aiohttp
 
             self._asession = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.request_timeout),
+                timeout=aiohttp.ClientTimeout(total=self.config.request_timeout),
                 headers=self._auth_headers(),
             )
             self._asession_loop = loop

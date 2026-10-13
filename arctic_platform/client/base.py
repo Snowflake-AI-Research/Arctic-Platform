@@ -38,6 +38,7 @@ from typing_extensions import Self
 
 from arctic_platform._dependency_groups import require_any_dep_group
 from arctic_platform.client.config import ArcticClientConfig
+from arctic_platform.client.config import CortexConfig
 from arctic_platform.client.requests import fwd_bwd_request
 from arctic_platform.client.requests import fwd_no_grad_request
 from arctic_platform.client.requests import generate_request
@@ -55,17 +56,18 @@ from arctic_platform.client.transport import Transport
 from arctic_platform.client.transport import initialize_or_cleanup
 
 
-def make_transport(config: ArcticClientConfig, server_state: Any = None) -> Transport:
-    if config.backend.type == "remote":
+def make_transport(client_config: ArcticClientConfig, server_state: Any = None) -> Transport:
+    backend_config = client_config.backend
+    if isinstance(backend_config, CortexConfig):
         require_any_dep_group("cortex")
         from arctic_platform.client.transports.cortex import CortexTransport
 
-        return CortexTransport(config)
+        return CortexTransport(backend_config)
 
     require_any_dep_group("sft", "rl")
     from arctic_platform.client.transports.onprem import OnPremTransport
 
-    return OnPremTransport(config, server_state=server_state)
+    return OnPremTransport(backend_config, server_state=server_state)
 
 
 def _check_weight_format(config: ArcticClientConfig, weight_format: str | None) -> None:
@@ -107,7 +109,7 @@ class _ArcticClientCore:
     def __init__(self, config: ArcticClientConfig, server_state: Any = None) -> None:
         self.config = config
         self.transport = make_transport(config, server_state=server_state)
-        self.jobs = initialize_or_cleanup(self.transport)
+        self.jobs = initialize_or_cleanup(self.transport, client_config=config)
 
     def reconnect_config(self) -> ArcticClientConfig:
         """A serializable config that reattaches to these jobs in another process."""
