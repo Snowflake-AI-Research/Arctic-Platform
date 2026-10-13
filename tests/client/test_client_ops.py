@@ -498,6 +498,34 @@ class TestUnifiedConfigDoesNotReadEnv:
         assert cfg.backend.type == "onprem"
 
 
+class TestCortexLigerPatch:
+    def test_use_liger_stays_a_training_field(self):
+        from arctic_platform.client import CortexConfig
+
+        cfg = ArcticClientConfig(
+            model_name="m",
+            training_gpus=1,
+            backend=CortexConfig(base_url="https://x", pat="y"),
+            training={"ds_worker_config": {"use_liger": True}},
+        )
+        training = cfg._cortex_training_sub_job()["training_config"]
+        assert training["use_liger"] is True
+        assert "model_provider" not in training
+
+    def test_legacy_liger_provider_becomes_the_patch_field(self):
+        from arctic_platform.client import CortexConfig
+
+        cfg = ArcticClientConfig(
+            model_name="m",
+            training_gpus=1,
+            backend=CortexConfig(base_url="https://x", pat="y"),
+            training={"ds_worker_config": {"model_provider": "liger"}},
+        )
+        training = cfg._cortex_training_sub_job()["training_config"]
+        assert training["model_provider"] == "huggingface"
+        assert training["use_liger"] is True
+
+
 class TestCortexNoopOffload:
     """``to_cortex`` drops ``offload_*: {device: none}`` from the forwarded
     ds_config. Cortex builds the optimizer from the lifted typed ``optimizer``
