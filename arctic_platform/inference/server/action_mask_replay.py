@@ -81,12 +81,12 @@ def _compiled_grammar_cache_max_entries() -> int:
 
 
 def _compiled_grammar_size_bytes(compiled: object, spec: str) -> int | None:
-    memory_size_bytes = getattr(compiled, "memory_size_bytes", None)
-    if not callable(memory_size_bytes):
-        return None
     try:
-        native_bytes = int(memory_size_bytes())
-    except (OverflowError, RuntimeError, TypeError, ValueError):
+        memory_size_bytes = getattr(compiled, "memory_size_bytes")
+        if callable(memory_size_bytes):
+            memory_size_bytes = memory_size_bytes()
+        native_bytes = int(memory_size_bytes)
+    except (AttributeError, OverflowError, RuntimeError, TypeError, ValueError):
         return None
     if native_bytes < 0:
         return None
