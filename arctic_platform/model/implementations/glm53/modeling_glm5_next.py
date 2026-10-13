@@ -20,12 +20,11 @@ from torch import Tensor
 from torch import nn
 from transformers.cache_utils import Cache
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextForConditionalGeneration
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextMoE
 
 from arctic_platform.model.implementations.fp8 import BlockFp8Linear
 from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
-from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
-
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
@@ -77,8 +76,6 @@ def _replace_native_fp8_linears(model: nn.Module, config, block_size: int) -> No
                 device=module.weight.device,
             ),
         )
-
-
 
 
 class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
@@ -137,6 +134,7 @@ class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
         )
 
         return hidden_states, topk_indices
+
 
 class Glm5NextForConditionalGenerationPrimeRL(
     Glm5NextForConditionalGeneration,
