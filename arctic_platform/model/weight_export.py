@@ -29,7 +29,7 @@ import torch.nn as nn
 
 WeightFormat = Literal["hf", "vllm", "lora"]
 WeightIterator = Iterator[tuple[str, torch.Tensor]]
-WeightIteratorBuilder = Callable[[nn.Module], Callable[[], WeightIterator]]
+WeightIteratorBuilder = Callable[[nn.Module], Callable[..., WeightIterator]]
 
 PEFT_ADAPTER_DIRNAME = "default"
 
@@ -406,8 +406,11 @@ def iter_model_weights(
     *,
     is_master: bool,
     is_zero3: bool,
+    include_skipped: bool = False,
 ) -> WeightIterator:
     """Yield model weights through the AP-owned export contract."""
+    if include_skipped and weight_format != "hf":
+        raise ValueError("include_skipped is only supported for weight_format='hf'")
     if weight_format == "lora":
         yield from iter_lora_weights(model, is_master=is_master, is_zero3=is_zero3)
         return
@@ -417,7 +420,8 @@ def iter_model_weights(
     if builder is not None:
         if is_zero3:
             raise NotImplementedError(f"weight_format={weight_format!r} does not support ZeRO-3")
-        yield from builder(_family_model_for_export(model))()
+        iterator = builder(_family_model_for_export(model))
+        yield from (iterator(include_skipped=True) if weight_format == "hf" and include_skipped else iterator())
         return
 
     if weight_format == "vllm":
