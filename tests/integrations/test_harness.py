@@ -71,9 +71,7 @@ def test_qwen_xml_and_hermes_json_both_parse():
 
 
 def test_json_list_parameter_stays_structured():
-    text = (
-        "<tool_call><function=finish><parameter=locations>" '[{"file": "src/a.py"}]</parameter></function></tool_call>'
-    )
+    text = '<tool_call><function=finish><parameter=locations>[{"file": "src/a.py"}]</parameter></function></tool_call>'
     _, calls = parse_tool_calls(text)
     assert json.loads(calls[0]["function"]["arguments"])["locations"] == [dict(file="src/a.py")]
 
