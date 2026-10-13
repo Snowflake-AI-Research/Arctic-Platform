@@ -337,18 +337,21 @@ def test_qwen38_ep_embedding_masks_nonlocal_rows(monkeypatch):
     )
 
 
-def test_qwen38_hf_sync_excludes_frozen_ple_table(monkeypatch):
+def test_qwen38_hf_checkpoint_includes_frozen_ple_table(monkeypatch):
     _require()
     from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
 
     model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-    embedding = model.model.language_model.layers[0].ple.ple_embedding.ngram_embedding
-    del embedding.weight._dss_skip_weight_sync
+    ngram_name = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.weight"
 
-    names = {name for name, _ in build_iter_full_hf_weights(model)()}
-    assert not any("ngram_embedding.weight" in name for name in names)
-    assert "model.language_model.layers.0.mlp.experts.gate_up_proj" in names
+    iterator = build_iter_full_hf_weights(model)
+    sync_names = {name for name, _ in iterator()}
+    checkpoint_names = {name for name, _ in iterator(include_skipped=True)}
+
+    assert ngram_name not in sync_names
+    assert ngram_name in checkpoint_names
+    assert "model.language_model.layers.0.mlp.experts.gate_up_proj" in sync_names
 
 
 def test_qwen38_adapter_uses_qsa_flex_and_validates_context_parallelism():
