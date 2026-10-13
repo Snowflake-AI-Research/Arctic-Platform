@@ -96,7 +96,7 @@ export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export OPENHANDS_WORKSPACE="${OPENHANDS_WORKSPACE:-/tmp/testbed}"
 export ARCTIC_CORTEX_JOB_ID_FILE="${CKPT_DIR}/cortex_job_id"
-export CORTEX_JOB_COMMENT="${CORTEX_JOB_COMMENT:-openhands code localization ${MODEL} ${NUM_TRAIN_GPUS}+${NUM_SAMPLING_ENGINES}}"
+export ARCTIC_CORTEX_JOB_COMMENT="${ARCTIC_CORTEX_JOB_COMMENT:-openhands code localization ${MODEL} ${NUM_TRAIN_GPUS}+${NUM_SAMPLING_ENGINES}}"
 
 ENGINE_URLS="$(printf 'http://cortex-managed,%.0s' $(seq "${NUM_SAMPLING_ENGINES}"))"
 ENGINE_URLS="[${ENGINE_URLS%,}]"

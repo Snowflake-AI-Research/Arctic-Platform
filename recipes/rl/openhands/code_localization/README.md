@@ -62,7 +62,7 @@ Rows need `instance_id`, `repo`, `base_commit`, `problem_statement`, `patch`,
 ```bash
 export LOGGER=console
 export OPENHANDS_WORKSPACE=/tmp/testbed
-export CORTEX_JOB_COMMENT="your name, openhands localization"
+export ARCTIC_CORTEX_JOB_COMMENT="your name, openhands localization"
 
 bash recipes/rl/openhands/code_localization/run_qwen35_4b.sh \
   trainer.max_training_steps=100
