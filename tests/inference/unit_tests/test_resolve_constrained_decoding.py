@@ -1287,3 +1287,35 @@ def test_worker_does_not_inject_resolve_reasoning_parser_plugin(monkeypatch):
     assert captured["reasoning_parser"] == "qwen3"
     assert "reasoning_parser_plugin" not in captured
     assert worker_instance._structured_outputs_enabled_in_reasoning is False
+
+
+def test_worker_moves_cache_salt_from_sampling_params_onto_the_prompt():
+    from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
+
+    WorkerClass = InferenceWorker.__ray_metadata__.modified_class
+    captured = []
+
+    async def fake_generate_once(prompt_input, params, _request_id, **_kwargs):
+        captured.append((prompt_input, params))
+        choice = SimpleNamespace(text="ok", token_ids=[7], finish_reason="stop", logprobs=None)
+        return SimpleNamespace(outputs=[choice], prompt_token_ids=[1, 2], num_cached_tokens=0, prompt_logprobs=None)
+
+    worker_instance = _new_worker(WorkerClass)
+    worker_instance.state = WorkerLifecycleState.READY
+    worker_instance._router_replay_tx = None
+    worker_instance._replica_label = None
+    worker_instance._reasoning_parser = None
+    worker_instance._return_reasoning_content = False
+    worker_instance._generate_once = fake_generate_once
+    worker_instance.llm = SimpleNamespace(get_tokenizer=lambda: object())
+
+    asyncio.run(worker_instance.generate([1, 2], {"max_tokens": 1, "cache_salt": "weights-v3"}))
+    asyncio.run(worker_instance.generate("hi", {"max_tokens": 1, "cache_salt": "weights-v3"}))
+    asyncio.run(worker_instance.generate([1, 2], {"max_tokens": 1}))
+
+    assert [prompt for prompt, _ in captured] == [
+        {"prompt_token_ids": [1, 2], "cache_salt": "weights-v3"},
+        {"prompt": "hi", "cache_salt": "weights-v3"},
+        {"prompt_token_ids": [1, 2]},
+    ]
+    assert captured[0][1].max_tokens == 1
