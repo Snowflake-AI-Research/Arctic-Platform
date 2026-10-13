@@ -22,6 +22,7 @@ The chat endpoint and the episodes live in
 
 from __future__ import annotations
 
+import shutil
 import threading
 import traceback
 import uuid
@@ -71,38 +72,43 @@ def run_conversation(
     from openhands_localization.finish import LocalizationFinishTool
 
     rollout_dir = Path(workspace_root) / uuid.uuid4().hex[:8]
-    working_dir = clone_instance(
-        instance["repo"],
-        instance.get("base_commit"),
-        instance["instance_id"],
-        rollout_dir,
-        instance.get("patch") if instance.get("use_patch") else None,
-    )
-    system_path = rollout_dir / "system_prompt.txt"
-    system_path.write_text(render_system_prompt(max_turns), encoding="utf-8")
+    # Grading reads only the messages. A kept clone per rollout fills the disk
+    # within a few hundred steps.
+    try:
+        working_dir = clone_instance(
+            instance["repo"],
+            instance.get("base_commit"),
+            instance["instance_id"],
+            rollout_dir,
+            instance.get("patch") if instance.get("use_patch") else None,
+        )
+        system_path = rollout_dir / "system_prompt.txt"
+        system_path.write_text(render_system_prompt(max_turns), encoding="utf-8")
 
-    _register_finish_tool(register_tool, LocalizationFinishTool)
-    temperature = 0.6 if training_phase == "eval" else 1.0
-    agent = Agent(
-        llm=LLM(
-            usage_id="agent",
-            model=model_name,
-            base_url=base_url,
-            api_key=api_key,
-            temperature=temperature,
-            litellm_extra_body=dict(
-                return_token_ids=True,
-                include_stop_str_in_output=False,
-                chat_template_kwargs=dict(add_generation_prompt=True, enable_thinking=False),
+        _register_finish_tool(register_tool, LocalizationFinishTool)
+        temperature = 0.6 if training_phase == "eval" else 1.0
+        agent = Agent(
+            llm=LLM(
+                usage_id="agent",
+                model=model_name,
+                base_url=base_url,
+                api_key=api_key,
+                temperature=temperature,
+                litellm_extra_body=dict(
+                    return_token_ids=True,
+                    include_stop_str_in_output=False,
+                    chat_template_kwargs=dict(add_generation_prompt=True, enable_thinking=False),
+                ),
             ),
-        ),
-        tools=[Tool(name=TerminalTool.name), Tool(name="localization_finish")],
-        system_prompt_filename=str(system_path),
-    )
-    conversation = Conversation(
-        agent=agent, max_iteration_per_run=max_turns, visualizer=None, workspace=str(working_dir)
-    )
-    messages = run_and_close(conversation, render_user_prompt(instance, str(working_dir)))
+            tools=[Tool(name=TerminalTool.name), Tool(name="localization_finish")],
+            system_prompt_filename=str(system_path),
+        )
+        conversation = Conversation(
+            agent=agent, max_iteration_per_run=max_turns, visualizer=None, workspace=str(working_dir)
+        )
+        messages = run_and_close(conversation, render_user_prompt(instance, str(working_dir)))
+    finally:
+        shutil.rmtree(rollout_dir, ignore_errors=True)
     return dict(messages=messages, locations=finish_locations(messages))
 
 
