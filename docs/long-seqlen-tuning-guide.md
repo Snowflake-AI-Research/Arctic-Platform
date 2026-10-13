@@ -125,6 +125,8 @@ The `ep` direction is counter-intuitive and holds at every `sp` tier measured. O
 
 **Rising utilization is not rising throughput.** The same `sp8·ep2` configuration at DeepEP chunk 1024 takes 12.68 secs per 100K tokens at a 1000K sequence and 24.45 secs per 100K at its 2.28M ceiling, while utilization goes from 39.0% to 44.6%. The GPU is busier and every token costs nearly twice the wall-clock, because the work per token itself grows with the sequence. Raising `sp` at a *fixed* length costs about 11% per doubling in forward/backward; what it buys is the ability to hold the longer sequence at all, not a cheaper token.
 
+**That slowdown is an attention-dominated result, not a universal rule about longer sequences.** Here, growing attention work per token outweighs the reduction in fixed overhead per token. A different workload with substantial optimizer time and nearly constant forward/backward cost per token can show the opposite outcome: a longer packed call improves complete-step tokens/sec. [Optimizer amortization](#why-longer-packed-sequences-can-improve-throughput) explains that regime and the Flash-Next measurements below.
+
 ### Diagnostics
 
 The first is a request config field; the rest are environment variables.
@@ -232,6 +234,37 @@ Smallest-that-fits is a throughput rule, and per-token time is where it shows: o
 Because the default is `None` -- unchunked, the whole local shard in one dispatch -- a ceiling measured without the flag does not carry that bound. Real data routes with more skew than uniform-random probe data does, so a config tuned to its wall on synthetic tokens needs headroom left for it. Reserve roughly `(ep - 1) x chunk x topk x (2 x hidden + 3 x moe_intermediate) x dtype_bytes`, which at `ep4` and chunk 8192 on this model is ~4 GiB and matches the measured ~4 GiB inter-rank peak spread. Or shrink the chunk until the budget fits the headroom already there: 1024 cuts it about eightfold.
 
 At the wall the two settings trade cleanly rather than one dominating: sp8·ep2 on one node reaches 2.28M tokens at 441 TFLOPS with chunk 1024, and 2.18M at 482 TFLOPS with chunk 4096. Take 1024 when context-bound and 4096 when not.
+
+## Why longer packed sequences can improve throughput
+
+**A longer packed sequence can improve tokens/sec, especially when optimizer time is significant and forward/backward cost per token stays roughly constant.** A complete training update includes both forward/backward and an optimizer update. The optimizer processes the model's parameters, gradients and state once per update, not once per input token, so its parameter-sized work can take approximately the same time at different packed lengths. More tokens in that update spread the optimizer cost over more useful work. The step can take longer while each token takes less time overall; this is higher complete-step throughput, not lower step latency.
+
+**The packed length can increase without changing the engine microbatch size.** DSS concatenates multiple source samples into one `[1, packed_tokens]` model call. Packing 32 samples of 8192 tokens produces a 262144-token call; packing 102 samples of the same length produces an 835584-token call. Both can use engine microbatch size one, gradient accumulation one, and one optimizer update. The source-sample counts are not counts of microbatches: total packed sequence length is what changes.
+
+**A simple cost model shows the amortization.** Let `N` be the actual global non-padding input tokens per update, `a` the approximately constant forward/backward seconds per token, and `T_optimizer` the approximately fixed optimizer seconds per update. With the same model, optimizer, allocation, parallelism and number of packed calls:
+
+```text
+complete_step_seconds ~= a * N + T_optimizer
+seconds_per_token     ~= a + T_optimizer / N
+tokens_per_second     ~= 1 / (a + T_optimizer / N)
+```
+
+Increasing `N` reduces the optimizer contribution per token. The benefit is especially visible with CPU optimizer offload, where a parameter-sized CPU Adam update can take tens of seconds; it diminishes once forward/backward dominates.
+
+**The two opposite outcomes come from competing costs.** The earlier long-context measurement slows down because attention work per token grows; in the cost model above, `a` is then no longer constant. The Flash-Next comparison below has nearly constant measured forward/backward cost per token, so the falling `T_optimizer / N` term accounts for most of its throughput improvement. Extending the context each token attends to and increasing total packed tokens per update are distinct changes, even when the model-call batch dimension remains one. Neither optimizer amortization nor attention scaling alone determines the net result.
+
+**The Flash-Next final runs illustrate this effect without an engine batch-size change.** Both ran on 16 H200s with `sp16`, `ep8`, one data-parallel group, engine microbatch size one and accumulation one. Every recorded update contained one packed model call and one optimizer update. The [Arctic Platform tuning results](../long-seq-tuning-results.md#timing-and-memory) record these warm medians, excluding the first update:
+
+| Total packed tokens | Source samples | Forward/backward | Optimizer | Complete step | Complete-step input tokens/sec |
+| --- | --- | --- | --- | --- | --- |
+| 262144 | 32 x 8192 | 44.75 seconds | 40.28 seconds | 84.72 seconds | 3094.40 |
+| 835584 | 102 x 8192 | 138.31 seconds | 40.77 seconds | 179.21 seconds | 4662.49 |
+
+The longer packed call processes **3.1875 times** as many tokens, while the optimizer still takes about **40 seconds**. Its optimizer contribution falls from about **154 to 49 microseconds/token**. Forward/backward-only rates are much closer, approximately **5858 versus 6041 tokens/sec**, but complete-step throughput rises by about **1.51x**. The table's complete-step medians are computed from each update's summed durations; separate component medians need not add to the complete-step median.
+
+**This is not a promise that the longest sequence is always fastest per token.** With dense attention, extending an individual sample increases quadratic attention work and can outweigh optimizer amortization, as the earlier `sp8·ep2` attention-dominated measurement shows. Packing more short samples can keep attention work per token approximately constant only when the backend actually isolates sample boundaries. Flash-Next's inspected QSA backend does not isolate packed rows; its measured runs are implementation stress tests, not independent-sample training certification. The two configs also differ in activation offload and dispatch chunk size, so this example is not a controlled sequence-length-only benchmark. Changes in offload, recomputation, routing or parallelism can offset the benefit; increasing tokens per optimizer update also changes training update frequency.
+
+**Measure complete-step tokens/sec rather than inferring performance from step time or utilization.** Count actual non-padding input tokens across data-parallel groups and accumulated microbatches once, not once per sequence- or expert-parallel rank. Divide by consistently measured warm forward/backward plus optimizer time, and report step latency, workload shape and memory margin alongside throughput. At a fixed target length, compare configuration choices at that target; for a throughput objective with a flexible packed budget, test whether increasing occupied packed length reduces the optimizer cost per token before adding more memory-saving knobs.
 
 ## Measured ceilings
 
