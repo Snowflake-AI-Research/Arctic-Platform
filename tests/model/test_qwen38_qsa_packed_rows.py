@@ -24,6 +24,7 @@ pytest.importorskip("transformers.models.qwen4_exp")
 def test_qsa_packed_rows_match_isolated_rows(monkeypatch, layout):
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
+
     from arctic_platform.model.implementations.qwen38 import qsa_flex as qsa
 
     torch.set_num_threads(1)
