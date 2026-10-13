@@ -1,0 +1,22 @@
+id: conversational-sft
+title: Conversational supervised fine-tuning
+status: runnable
+task: sft
+methods:
+  - lora
+  - full-parameter
+planned_methods:
+  - qlora
+models:
+  - Qwen/Qwen3-8B
+  - Qwen/Qwen3.6-35B-A3B
+datasets:
+  - HuggingFaceH4/no_robots
+  - HuggingFaceH4/ultrachat_200k
+precision:
+  - bfloat16
+default_training_gpus: 8
+provenance:
+  project: tinker-cookbook
+  recipe: recipes/sl_loop.py
+last_validated: null
