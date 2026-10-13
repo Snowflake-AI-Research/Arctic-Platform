@@ -136,7 +136,14 @@ class TestIsolation(TestCasePlus):
             "routed_experts": torch.zeros(1, 4, 1, 1, dtype=torch.long),
             "advantages": torch.ones(1, 4),
         }
-        meta = {"temperature": 0.7, "cu_seq_lens_q": torch.tensor([0, 4], dtype=torch.int32)}
+        meta = {
+            "temperature": 0.7,
+            "cu_seq_lens_q": torch.tensor([0, 4], dtype=torch.int32),
+            "cu_seq_lens_k": torch.tensor([0, 4], dtype=torch.int32),
+            "max_length_q": 4,
+            "max_length_k": 4,
+            "seq_idx": torch.zeros(1, 4, dtype=torch.int32),
+        }
         kwargs = _engine_forward_kwargs(batch, meta)
         self.assertIn("action_masks", kwargs)
         self.assertIn("pixel_values", kwargs)
@@ -144,6 +151,10 @@ class TestIsolation(TestCasePlus):
         self.assertIn("routed_experts", kwargs)
         self.assertIn("temperature", kwargs)
         self.assertIn("cu_seq_lens_q", kwargs)
+        self.assertIn("cu_seq_lens_k", kwargs)
+        self.assertIn("max_length_q", kwargs)
+        self.assertIn("max_length_k", kwargs)
+        self.assertIn("seq_idx", kwargs)
         self.assertNotIn("advantages", kwargs)
 
     def test_fwd_meta_keys_can_add_but_not_blocked_keys(self):

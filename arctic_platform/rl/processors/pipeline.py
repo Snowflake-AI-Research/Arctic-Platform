@@ -109,6 +109,7 @@ _ENGINE_FWD_KEYS = frozenset(
         "cu_seq_lens_k",
         "max_length_q",
         "max_length_k",
+        "seq_idx",
     }
 )
 # Blocked even if listed in ``fwd_meta_keys``. ``labels`` stays on the allowlist
