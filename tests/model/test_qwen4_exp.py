@@ -354,9 +354,26 @@ def test_qwen38_ep_embedding_masks_nonlocal_rows(monkeypatch):
     embedding._ep_rank = 1
     embedding._ep_world_size = 2
     embedding._ep_group = object()
+
+    def all_to_all_single(output, tensor, **_kwargs):
+        if tensor.numel() == 2:
+            output.copy_(torch.tensor([0, 2]))
+        else:
+            output.copy_(tensor[1:])
+
     monkeypatch.setattr(
-        "arctic_platform.model.implementations.qwen38.modeling_qwen4_exp.dist_nn.all_reduce",
-        lambda tensor, group: tensor,
+        "arctic_platform.model.implementations.qwen38.modeling_qwen4_exp.dist.all_to_all_single",
+        all_to_all_single,
+    )
+
+    def differentiable_all_to_all(output, tensor, **_kwargs):
+        output.zero_()
+        output[1:].copy_(tensor)
+        return output
+
+    monkeypatch.setattr(
+        "arctic_platform.model.implementations.qwen38.modeling_qwen4_exp.dist_nn.all_to_all_single",
+        differentiable_all_to_all,
     )
 
     output = embedding(torch.tensor([[0, 4, 6]]))
