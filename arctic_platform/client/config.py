@@ -104,6 +104,13 @@ class CortexConfig(BaseSettings):
     )
     endpoint: str = Field("cortex-training", description="cortex: SnowAPI endpoint name.")
     max_retries: int = Field(10, ge=0, description="cortex: transient-failure retries per HTTP request (tenacity).")
+    request_timeout: float = Field(1800.0, gt=0, description="Maximum seconds allowed for one Cortex HTTP request.")
+    poll_timeout: float = Field(
+        1800.0, gt=0, description="Maximum total seconds to poll a submitted Cortex operation."
+    )
+    job_ready_timeout: float = Field(
+        1800.0, gt=0, description="Maximum total seconds to wait for a Cortex job to reach RUNNING."
+    )
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -224,11 +231,6 @@ class ArcticClientConfig(BaseModel):
     sampling_gpus: int = 0
     log_prob_gpus: int = 0
 
-    # Shared across backends.
-    job_ready_timeout: float = Field(1800.0, description="Seconds to wait for a created job to reach RUNNING.")
-    request_timeout: float = Field(
-        1800.0, description="Per-request timeout (seconds) applied to every call. Generous for long ops."
-    )
     training: TrainingConfig = Field(default_factory=TrainingConfig, description="Training job settings.")
     sampling: SamplingConfig = Field(
         default_factory=SamplingConfig, description="Sampling / log-prob engine settings."
