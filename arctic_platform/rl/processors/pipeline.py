@@ -109,6 +109,8 @@ _ENGINE_FWD_KEYS = frozenset(
         "cu_seq_lens_k",
         "max_length_q",
         "max_length_k",
+        # Packed-row ids: without them a hybrid model's GatedDeltaNet convolution runs across packed rows.
+        "seq_idx",
     }
 )
 # Blocked even if listed in ``fwd_meta_keys``. ``labels`` stays on the allowlist

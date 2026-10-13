@@ -228,6 +228,51 @@ class TestIsolation(TestCasePlus):
         )
         self.assertEqual(engine.backward_scale, [False])
 
+    def test_packed_row_ignores_its_neighbour(self):
+        """Hybrid models at SP1: a packed row's forward must not depend on the row packed before it."""
+
+        def probe_output(neighbour):
+            probe = torch.tensor([7, 8, 9, 10, 11])
+            lens = [neighbour.numel(), probe.numel()]
+            cu = torch.tensor([0, lens[0], sum(lens)], dtype=torch.int32)
+            batch = {  # the [1, T] model kwargs DSS builds for a packed hybrid-model call
+                "input_ids": torch.cat([neighbour, probe]).view(1, -1),
+                "position_ids": torch.cat([torch.arange(n) for n in lens]).view(1, -1),
+                "use_cache": False,
+                "cu_seq_lens_q": cu,
+                "cu_seq_lens_k": cu,
+                "max_length_q": max(lens),
+                "max_length_k": max(lens),
+                "seq_idx": torch.repeat_interleave(torch.arange(2, dtype=torch.int32), torch.tensor(lens)).view(1, -1),
+            }
+            engine = _SegmentedConvEngine()
+            run_pipeline(
+                engine,
+                (),
+                batch,
+                {"cu_seqlens": cu},
+                {"loss_fn": None, "post": ["identity"], "config": {}},
+                "cpu",
+                backward=False,
+                pack=False,
+            )
+            return engine.conv_out[0, -probe.numel() :]
+
+        self.assertTrue(torch.equal(probe_output(torch.tensor([1, 2, 3, 4])), probe_output(torch.tensor([5, 6, 1, 3]))))
+
+
+class _SegmentedConvEngine(_StubEngine):
+    """A width-4 causal conv over ids, like GatedDeltaNet's: it restarts where ``seq_idx`` changes."""
+
+    def __call__(self, *args, **kwargs):
+        outputs = super().__call__(*args, **kwargs)
+        ids = kwargs["input_ids"].float()
+        seq_idx = kwargs.get("seq_idx", torch.zeros_like(kwargs["input_ids"]))
+        self.conv_out = ids.clone()
+        for lag in (1, 2, 3):
+            self.conv_out[:, lag:] += ids[:, :-lag] * (seq_idx[:, lag:] == seq_idx[:, :-lag])
+        return outputs
+
 
 class TestPackedInnerCall(TestCasePlus):
     def test_packing_path_no_typeerror_and_filters_forward(self):
