@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import types
 
 import pytest
 import torch
@@ -121,6 +122,30 @@ def test_glm53_custom_model_replaces_only_sparse_moe():
     assert layers[3].mlp.experts.use_grouped_mm is False
     assert layers[3].mlp.experts.swiglu_limit == 10.0
     assert model._is_vlm is True
+
+
+def test_glm53_decoder_forwards_its_physical_layer_routes():
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    class SparseAttention(torch.nn.Module):
+        def forward(self, hidden_states, **_kwargs):
+            return torch.zeros_like(hidden_states), None, None
+
+    def record_routes(self, hidden_states, routed_experts=None):
+        self.routed_experts = routed_experts
+        return torch.zeros_like(hidden_states)
+
+    config = _tiny_config()
+    config.use_grouped_mm = False
+    model = Glm5NextForConditionalGenerationPrimeRL(config)
+    layer = model.model.language_model.layers[3]
+    layer.self_attn = SparseAttention()
+    layer.mlp.forward = types.MethodType(record_routes, layer.mlp)
+    routes = torch.arange(16).reshape(1, 2, 4, 2)
+
+    layer(torch.randn(1, 2, 2, 16), routed_experts=routes)
+
+    torch.testing.assert_close(layer.mlp.routed_experts, routes[:, :, 3, :])
 
 
 def test_glm53_tiled_shared_expert_bypasses_wrapped_forward():
