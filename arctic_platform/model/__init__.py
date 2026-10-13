@@ -28,6 +28,9 @@ from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
 from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
+from arctic_platform.model.expert_parallel import ep_group_name
+from arctic_platform.model.expert_parallel import setup_replicated_expert_groups
+from arctic_platform.model.expert_parallel import validate_expert_parallel
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import mark_keep_fp32
@@ -48,6 +51,7 @@ from arctic_platform.model.loader import ModelParallelismMetadata
 from arctic_platform.model.loader import canonical_parameter_name
 from arctic_platform.model.loader import freeze_fp8_weights_and_scales
 from arctic_platform.model.loader import model_parallelism_metadata_from_config
+from arctic_platform.model.moe_spec import moe_model_spec
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import select_loader
 from arctic_platform.model.patch import apply_patches
@@ -85,6 +89,7 @@ __all__ = [
     "conversion_cache_is_node_local",
     "conversion_cache_ready",
     "effective_fused_cross_entropy",
+    "ep_group_name",
     "freeze_fp8_weights_and_scales",
     "gather_peft_adapter_state_dict",
     "get_language_model",
@@ -102,6 +107,7 @@ __all__ = [
     "ModelParallelismMetadata",
     "ModelSpec",
     "model_parallelism_metadata_from_config",
+    "moe_model_spec",
     "ParallelismConfig",
     "Patches",
     "pretrained_config_of",
@@ -120,7 +126,9 @@ __all__ = [
     "ROUTER_REPLAY_FRESH",
     "save_exported_state_dict",
     "select_loader",
+    "setup_replicated_expert_groups",
     "validate_lora_sync_trainable_parameters",
+    "validate_expert_parallel",
     "validate_lm_head_fused_ce_config",
     "validated_lm_head_targets_to",
     "weight_export_contract",
