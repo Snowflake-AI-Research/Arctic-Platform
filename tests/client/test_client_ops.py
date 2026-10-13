@@ -691,22 +691,25 @@ class TestCortexCancelToleratesEmptyBody:
         t = CortexTransport(CortexConfig())
 
         class _EmptyResp:
-            status_code = 200
-            content = b""
+            status = 200
 
-            def raise_for_status(self):
+            async def read(self):
+                return b""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
                 return None
-
-            def json(self):
-                raise ValueError("Expecting value: line 1 column 1 (char 0)")
 
         sent = {}
 
-        def _request(method, url, **kwargs):
-            sent["method"], sent["url"] = method, url
-            return _EmptyResp()
+        class _Session:
+            def request(self, method, url, **kwargs):
+                sent["method"], sent["url"] = method, url
+                return _EmptyResp()
 
-        monkeypatch.setattr(t.session, "request", _request)
+        t._session = _Session()
 
         t.cancel_job("job-abc")
 

@@ -14,16 +14,16 @@
 # limitations under the License.
 """Cortex `_ROUTES`: the HTTP each op sends, its retry policy, and its normalized reply.
 
-`_send` / `_asend` are stubbed, so these tests pin what the transport sends and
-how it reads replies without a live GS.
+`_send` is stubbed, so these tests pin what the transport sends and how it
+reads replies without a live GS.
 """
 
 from __future__ import annotations
 
 import asyncio
 
+import aiohttp
 import pytest
-import requests
 import torch
 
 from arctic_platform import wire
@@ -49,7 +49,7 @@ class FakeSend:
         self.sent: list[dict] = []
         self.replies = replies or {}
 
-    def __call__(self, method: str, url: str, *, retry_on=None, **kwargs):
+    async def __call__(self, method: str, url: str, *, retry_on=None, **kwargs):
         self.sent.append({"method": method, "url": url, "retry_on": retry_on, **kwargs})
         for (reply_method, suffix), reply in self.replies.items():
             if method == reply_method and url.endswith(suffix):
@@ -102,8 +102,8 @@ class TestLifecycleRoutes:
     def test_shutdown_tolerates_a_failed_cancel(self):
         transport, _ = _transport()
 
-        def fail(*args, **kwargs):
-            raise requests.exceptions.ConnectionError("gone")
+        async def fail(*args, **kwargs):
+            raise aiohttp.ClientConnectionError("gone")
 
         transport._send = fail  # type: ignore[method-assign]
         transport.shutdown()
@@ -152,25 +152,21 @@ class TestChunkGroupRestart:
 
     def test_async_fwd_bwd_reposts_the_whole_group_once(self):
         transport, send = _transport({("POST", "/forward-backward"): _fail_first_post(RESTART)})
-
-        async def asend(method, url, *, retry_on=None, **kwargs):
-            return send(method, url, retry_on=retry_on, **kwargs)
-
-        transport._asend = asend  # type: ignore[method-assign]
         asyncio.run(transport.acall(_fwd_bwd_request()))
 
         posts = [sent for sent in send.sent if sent["method"] == "POST"]
         assert len(posts) == 2
-        assert posts[1]["retry_on"] is cortex_module._is_transient_async
+        assert posts[1]["retry_on"] is cortex_module._is_transient
 
     def test_error_body_raises_chunk_group_error_that_is_never_retried(self):
         """GS wraps the chunk-group error as JSON inside a string field."""
-        resp = requests.Response()
-        resp.status_code = 409
-        resp._content = b'{"message": "{\\"code\\": \\"chunk_group_restart_required\\"}"}'
+
+        class Resp:
+            async def text(self):
+                return '{"message": "{\\"code\\": \\"chunk_group_restart_required\\"}"}'
 
         with pytest.raises(cortex_module._ChunkGroupError) as exc_info:
-            cortex_module._raise_for_status(resp)
+            asyncio.run(cortex_module._raise_for_status(Resp()))
         assert exc_info.value.restart_required
         assert not cortex_module._is_transient(exc_info.value)
 

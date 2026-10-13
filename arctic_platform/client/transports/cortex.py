@@ -16,9 +16,9 @@
 
 Each op is one `_Route`: its URL, how its body becomes HTTP sends, whether it
 polls, whether it may be replayed, and how its reply is normalized. The
-transport only executes those sends, so sync and async differ only at the HTTP
-call. Cortex-specific request and response shapes are translated here until the
-servers share one API. Log-probs is unsupported.
+transport only executes those sends, on its own event loop, so sync and async
+callers share one implementation. Cortex-specific request and response shapes
+are translated here until the servers share one API. Log-probs is unsupported.
 """
 
 from __future__ import annotations
@@ -28,19 +28,18 @@ import base64
 import contextlib
 import hashlib
 import json
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any
 from typing import Iterator
 
-import requests
 from tenacity import AsyncRetrying
-from tenacity import Retrying
 from tenacity import retry_if_exception
 from tenacity import stop_after_attempt
 from tenacity import wait_exponential_jitter
-from urllib3.exceptions import NewConnectionError
 
 from arctic_platform import wire
 from arctic_platform.client.config import ArcticClientConfig
@@ -70,16 +69,6 @@ _OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
 _OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
-# /operation is polymorphic: async ops (weight-sync, ...) return {request_id: ...} and we
-# poll to completion; inline ops answer with the finished body directly. Whitelisting the
-# inline set lets us tell the two apart without silently dropping either kind of response.
-_INLINE_OPERATION_TYPES = {
-    "bootstrap-router-replay",
-    "cancel-request",
-    "reset-prefix-cache",
-    "router-replay-discard",
-    "tail-logs",
-}
 _JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
 _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
@@ -204,12 +193,30 @@ class _Route:
     replay_safe: bool = True
     # Re-post the whole chunk group once when the server reports it lost track of it.
     restartable: bool = False
+    # `operation_type`s that may answer in the POST reply instead of with a request_id.
+    inline_types: frozenset[str] = frozenset()
     normalize: Callable[[Any], Any] = _identity
 
     def prepare(self, prefix: str, request: Request) -> tuple[str, list[Send]]:
         body = {k: v for k, v in request.body.items() if v is not None}
         job = None if request.job_id is None else _parent_id(request.job_id)
         return prefix + self.path.format_map(body | {"job": job}), self.encode(request, body)
+
+    def submitted(self, request: Request, reply: dict) -> str | dict:
+        """The request_id to poll, or the reply itself for an inline type.
+
+        A missing request_id anywhere else raises: it would otherwise read as a
+        finished op that was never waited on.
+        """
+        if reply.get("request_id") is not None:
+            return str(reply["request_id"])
+        operation_type = request.body.get("operation_type")
+        if operation_type in self.inline_types:
+            return reply
+        raise RuntimeError(f"cortex {operation_type or request.op} response carried no request_id: {reply}")
+
+    def finish(self, chunks: list[bytes], result: dict) -> Any:
+        return self.normalize(wire.decode_result_chunks(chunks) if chunks else _decode_result(result))
 
 
 class _NoopRoute(_Route):
@@ -253,7 +260,10 @@ _ROUTES = {
     ),
     "step": _Route(method="POST", path="/{job}/step", poll=True),
     "save": _Route(method="POST", path="/{job}/save", poll=True),
-    "operation": _Route(method="POST", path="/{job}/operation", poll=True),
+    # /operation is polymorphic: weight-sync is polled, reset-prefix-cache answers inline.
+    "operation": _Route(
+        method="POST", path="/{job}/operation", poll=True, inline_types=frozenset({"reset-prefix-cache"})
+    ),
 }
 
 
@@ -265,16 +275,6 @@ def _route(op: str) -> _Route:
 
 def _is_transient(exc: BaseException) -> bool:
     """Retry connection/timeout errors and transient HTTP statuses (safe for reads)."""
-    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
-        return True
-    if isinstance(exc, requests.exceptions.HTTPError):
-        resp = exc.response
-        return resp is not None and resp.status_code in _TRANSIENT_STATUSES
-    return False
-
-
-def _is_transient_async(exc: BaseException) -> bool:
-    """`_is_transient` for the aiohttp path (different exception hierarchy)."""
     import aiohttp
 
     if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
@@ -286,17 +286,6 @@ def _is_transient_async(exc: BaseException) -> bool:
 
 def _is_connect_error(exc: BaseException) -> bool:
     """Only failures proving the request never reached the server (safe for mutating POSTs)."""
-    if isinstance(exc, requests.exceptions.ConnectTimeout):
-        return True
-    if isinstance(exc, requests.exceptions.ConnectionError):
-        cause = exc.args[0] if exc.args else None
-        reason = getattr(cause, "reason", None)
-        return isinstance(cause, NewConnectionError) or isinstance(reason, NewConnectionError)
-    return False
-
-
-def _is_connect_error_async(exc: BaseException) -> bool:
-    """Async failures proving a mutating request was never delivered."""
     import aiohttp
 
     return isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError))
@@ -353,48 +342,13 @@ def _chunk_group_detail(body: Any) -> dict | None:
     return None
 
 
-def _submitted(op: str, body: dict, response: dict) -> str | dict:
-    """A poll handle for an async op, or the finished result for an inline one.
+async def _raise_for_status(resp: Any) -> None:
+    """Raise for an error response, keeping the server's error body in the message.
 
-    SnowAPI's contract on ``/operation`` is "poll if the response carries a
-    ``request_id``, else consume it inline". Only operations in
-    ``_INLINE_OPERATION_TYPES`` are allowed to answer inline; anything else must
-    return a ``request_id`` and be polled to completion.
-    """
-    request_id = response.get("request_id")
-    if request_id is not None:
-        return str(request_id)
-    operation_type = body.get("operation_type")
-    if operation_type in _INLINE_OPERATION_TYPES:
-        return response
-    raise RuntimeError(f"cortex {operation_type or op} response carried no request_id: {response}")
-
-
-def _raise_for_status(resp: requests.Response) -> None:
-    """``raise_for_status()`` that keeps the server's error body in the message.
-
-    GS explains a 4xx in the response body; the stock HTTPError shows only the
-    status line, which turns an actionable rejection into a guessing game. The
-    ``response`` is preserved so retry inspection still works. A chunk-group
-    error raises `_ChunkGroupError` instead.
-    """
-    try:
-        resp.raise_for_status()
-    except requests.exceptions.HTTPError as exc:
-        body = (resp.text or "").strip()
-        detail = _chunk_group_detail(body)
-        if detail is not None:
-            raise _ChunkGroupError(detail) from exc
-        if not body:
-            raise
-        raise requests.exceptions.HTTPError(f"{exc}: {body[:2000]}", response=resp) from None
-
-
-async def _araise_for_status(resp: Any) -> None:
-    """`_raise_for_status` for the aiohttp path.
-
-    Stays a `ClientResponseError` (carrying `status`) so `_is_transient_async` keeps
-    classifying it, but folds the body into the message.
+    GS explains a 4xx in the response body; the stock error shows only the status
+    line, which turns an actionable rejection into a guessing game. Stays a
+    `ClientResponseError` (carrying `status`) so `_is_transient` keeps classifying
+    it. A chunk-group error raises `_ChunkGroupError` instead.
     """
     import aiohttp
 
@@ -419,9 +373,29 @@ class CortexTransport(Transport):
         self.job_id: str | None = None
         self.max_retries = config.max_retries
         self.poll_interval = 0.5
-        self.session = self._build_session()
-        self._asession = None  # aiohttp.ClientSession, lazy on first acall
-        self._asession_loop = None  # the event loop that session is bound to
+        self._start_loop()
+
+    # Every HTTP exchange runs on this transport's own loop thread, so sync and async
+    # callers share one implementation and one aiohttp session. Encoding (`prepare`)
+    # and decoding (`finish`) stay on the caller's thread so a large frame never
+    # stalls the loop for other callers.
+    def _start_loop(self) -> None:
+        self._session = None  # aiohttp.ClientSession, built on the loop at first send
+        self._loop = asyncio.new_event_loop()
+        threading.Thread(target=self._loop.run_forever, name="cortex-transport", daemon=True).start()
+
+    def _on_loop(self, coro) -> Future:
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    # A loop and its thread are not picklable; the receiving side starts its own.
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        del state["_loop"], state["_session"]
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._start_loop()
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
@@ -442,79 +416,70 @@ class CortexTransport(Transport):
         return self.jobs
 
     def shutdown(self) -> None:
-        if self.job_id is None:
-            return
-        # Best-effort teardown, tolerating failure (the job may be gone).
-        with contextlib.suppress(requests.exceptions.RequestException):
-            self.call(cancel_job_request(self.job_id))
+        import aiohttp
+
+        if self.job_id is not None:
+            # Best-effort teardown, tolerating failure (the job may be gone).
+            with contextlib.suppress(aiohttp.ClientError, asyncio.TimeoutError):
+                self.call(cancel_job_request(self.job_id))
+        self._on_loop(self._close_session()).result()
 
     def list_jobs(self) -> list[dict]:
         """Every Cortex job on this account, with its status."""
-        payload = self._send("GET", self._prefix)
+        payload = self._on_loop(self._send("GET", self._prefix)).result()
         if isinstance(payload, list):
             return payload
         return payload.get("jobs") or payload.get("data") or []
 
     def cancel_job(self, job_id: str) -> None:
         """Release one job's GPUs by id."""
-        self._send("POST", f"{self._prefix}/{job_id}:cancel")
+        self._on_loop(self._send("POST", f"{self._prefix}/{job_id}:cancel")).result()
 
     # ── deliver one op ───────────────────────────────────────────────────────
     def call(self, request: Request) -> Any:
-        route = _route(request.op)
-        url, sends = route.prepare(self._prefix, request)
-        reply = self._send_group(route, url, sends)
-        if route.poll:
-            reply = self._poll(_submitted(request.op, request.body, reply))
-        return route.normalize(reply)
+        route, future = self._submit(request)
+        return route.finish(*future.result())
 
     async def acall(self, request: Request) -> Any:
+        route, future = self._submit(request)
+        return route.finish(*await asyncio.wrap_future(future))
+
+    def _submit(self, request: Request) -> tuple[_Route, Future]:
         route = _route(request.op)
         url, sends = route.prepare(self._prefix, request)
-        reply = await self._asend_group(route, url, sends)
-        if route.poll:
-            reply = await self._apoll(_submitted(request.op, request.body, reply))
-        return route.normalize(reply)
+        return route, self._on_loop(self._deliver(route, request, url, sends))
 
-    def _send_group(self, route: _Route, url: str, sends: list[Send]) -> dict:
+    async def _deliver(self, route: _Route, request: Request, url: str, sends: list[Send]) -> tuple[list[bytes], dict]:
+        reply = await self._send_group(route, url, sends)
+        if not route.poll:
+            return [], reply
+        return await self._poll(route.submitted(request, reply))
+
+    async def _send_group(self, route: _Route, url: str, sends: list[Send]) -> dict:
         try:
-            return self._send_each(route, url, sends)
+            return await self._send_each(route, url, sends)
         except _ChunkGroupError as exc:
             if not (route.restartable and exc.restart_required):
                 raise
-        return self._send_each(route, url, sends)
+        return await self._send_each(route, url, sends)
 
-    def _send_each(self, route: _Route, url: str, sends: list[Send]) -> dict:
+    async def _send_each(self, route: _Route, url: str, sends: list[Send]) -> dict:
         """Post every send in order; the last reply is the op's answer."""
         retry_on = _is_transient if route.replay_safe else _is_connect_error
         reply: dict = {}
         for kwargs in sends:
-            reply = self._send(route.method, url, retry_on=retry_on, **kwargs)
-        return reply
-
-    async def _asend_group(self, route: _Route, url: str, sends: list[Send]) -> dict:
-        try:
-            return await self._asend_each(route, url, sends)
-        except _ChunkGroupError as exc:
-            if not (route.restartable and exc.restart_required):
-                raise
-        return await self._asend_each(route, url, sends)
-
-    async def _asend_each(self, route: _Route, url: str, sends: list[Send]) -> dict:
-        retry_on = _is_transient_async if route.replay_safe else _is_connect_error_async
-        reply: dict = {}
-        for kwargs in sends:
-            reply = await self._asend(route.method, url, retry_on=retry_on, **kwargs)
+            reply = await self._send(route.method, url, retry_on=retry_on, **kwargs)
         return reply
 
     def _request_url(self, request_id: str, cursor: str | None) -> tuple[str, dict | None]:
         url = f"{self._prefix}/{self.job_id}/requests/{request_id}"
         return url, ({"cursor": cursor} if cursor else None)
 
-    def _poll(self, submitted: str | dict) -> dict:
-        # Inline ops (_INLINE_OPERATION_TYPES) return their body from POST.
+    async def _poll(self, submitted: str | dict) -> tuple[list[bytes], dict]:
+        """The finished request's result chunks and inline result, left for the caller to decode."""
+        # Inline types (`_Route.inline_types`) return their body from POST.
         if isinstance(submitted, dict):
-            return submitted
+            return [], submitted
         request_id = submitted
         deadline = time.monotonic() + self.config.poll_timeout
         delay = self.poll_interval
@@ -522,31 +487,11 @@ class CortexTransport(Transport):
         cursor: str | None = None
         while time.monotonic() < deadline:
             url, params = self._request_url(request_id, cursor)
-            action, value = _poll_progress(self._send("GET", url, params=params), chunks, request_id)
+            action, value = _poll_progress(await self._send("GET", url, params=params), chunks, request_id)
             if action == "done":
-                return value
+                return chunks, value
             if action == "drain":
                 cursor = value  # more result chunks queued; re-poll without backing off
-                continue
-            time.sleep(delay)
-            delay = _next_delay(delay)
-        raise TimeoutError(f"cortex request {request_id} did not complete within {self.config.poll_timeout}s")
-
-    async def _apoll(self, submitted: str | dict) -> dict:
-        if isinstance(submitted, dict):
-            return submitted  # inline op — see _poll
-        request_id = submitted
-        deadline = time.monotonic() + self.config.poll_timeout
-        delay = self.poll_interval
-        chunks: list[bytes] = []
-        cursor: str | None = None
-        while time.monotonic() < deadline:
-            url, params = self._request_url(request_id, cursor)
-            action, value = _poll_progress(await self._asend("GET", url, params=params), chunks, request_id)
-            if action == "done":
-                return value
-            if action == "drain":
-                cursor = value
                 continue
             await asyncio.sleep(delay)
             delay = _next_delay(delay)
@@ -601,73 +546,42 @@ class CortexTransport(Transport):
             "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
         }
 
-    def _build_session(self) -> requests.Session:
-        session = requests.Session()
-        session.headers.update(self._auth_headers())
-        return session
-
     def _job(self) -> dict:
         return self.call(get_job_request(self.job_id))
 
-    def _send(self, method: str, url: str, *, retry_on=None, **kwargs: Any) -> dict:
+    async def _send(self, method: str, url: str, *, retry_on=_is_transient, **kwargs: Any) -> dict:
         # Every SnowAPI call goes through here so transient 429/5xx/connection blips
         # are retried with exponential-jitter backoff (the neutrino client's policy).
-        def attempt() -> dict:
-            resp = self.session.request(method, url, timeout=self.config.request_timeout, **kwargs)
-            _raise_for_status(resp)
-            # `:cancel` answers 200 with an empty body. Decoding that as JSON
-            # would report an already-completed release as a failure.
-            return resp.json() if resp.content.strip() else {}
+        import aiohttp
 
-        retryer = Retrying(
-            retry=retry_if_exception(retry_on or _is_transient),
-            stop=stop_after_attempt(1 + self.max_retries),
-            wait=wait_exponential_jitter(initial=0.5, max=10.0),
-            reraise=True,
-        )
-        return retryer(attempt)
-
-    async def _ensure_asession(self):
-        # A ClientSession is bound to the loop it's built on; reuse it only on that
-        # same loop. On a new loop (e.g. a fresh asyncio.run) rebuild -- the stale
-        # one can't be awaited closed from here.
-        loop = asyncio.get_running_loop()
-        if self._asession is None or self._asession.closed or self._asession_loop is not loop:
-            import aiohttp
-
-            self._asession = aiohttp.ClientSession(
+        if self._session is None:
+            self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.config.request_timeout),
                 headers=self._auth_headers(),
             )
-            self._asession_loop = loop
-        return self._asession
-
-    async def _asend(self, method: str, url: str, *, retry_on=None, **kwargs: Any) -> dict:
-        session = await self._ensure_asession()
+        session = self._session
 
         async def attempt() -> dict:
             async with session.request(method, url, **kwargs) as resp:
                 if resp.status >= 400:
-                    await _araise_for_status(resp)
+                    await _raise_for_status(resp)
                 body = await resp.read()
+                # `:cancel` answers 200 with an empty body. Decoding that as JSON
+                # would report an already-completed release as a failure.
                 return json.loads(body) if body.strip() else {}
 
         retryer = AsyncRetrying(
-            retry=retry_if_exception(retry_on or _is_transient_async),
+            retry=retry_if_exception(retry_on),
             stop=stop_after_attempt(1 + self.max_retries),
             wait=wait_exponential_jitter(initial=0.5, max=10.0),
             reraise=True,
         )
         return await retryer(attempt)
 
-    async def aclose(self) -> None:
-        # Only the loop that owns the session can close it; on any other loop just
-        # drop the reference.
-        if self._asession is not None:
-            if not self._asession.closed and self._asession_loop is asyncio.get_running_loop():
-                await self._asession.close()
-            self._asession = None
-            self._asession_loop = None
+    async def _close_session(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
 
 
 def _next_delay(delay: float) -> float:
@@ -679,15 +593,16 @@ def _poll_progress(status: dict, chunks: list[bytes], request_id: str) -> tuple[
     """Fold one poll response into an action, mutating `chunks` with any result chunks.
 
     Returns ``("drain", next_cursor)`` (more chunks queued — re-poll now),
-    ``("done", result)`` (finished, decoded result), or ``("wait", None)`` (still
-    running — back off). Raises ``RuntimeError`` if the request ended failed.
+    ``("done", inline_result)`` (finished; `chunks` holds any chunked result), or
+    ``("wait", None)`` (still running — back off). Raises ``RuntimeError`` if the
+    request ended failed.
     """
     chunks.extend(c for c in map(_result_chunk, status.get("events") or []) if c is not None)
     if status.get("next_cursor"):
         return "drain", status["next_cursor"]
     state = _short(status.get("status"))
     if state in _REQUEST_DONE:
-        return "done", (wire.decode_result_chunks(chunks) if chunks else _decode_result(status.get("result") or {}))
+        return "done", status.get("result") or {}
     if state in _REQUEST_FAILED:
         raise RuntimeError(f"cortex request {request_id} ended '{state}': {status.get('error', '')}")
     return "wait", None

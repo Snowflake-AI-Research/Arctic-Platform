@@ -156,9 +156,6 @@ class Transport(ABC):
     async def acall(self, request: Request) -> Any:
         """Async delivery of one operation to this deployment."""
 
-    async def aclose(self) -> None:
-        """Release async resources (e.g. an aiohttp session); no-op by default."""
-
     @abstractmethod
     def shutdown(self) -> None:
         """Tear down jobs / connections."""
