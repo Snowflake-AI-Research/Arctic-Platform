@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import time
 from typing import Any
 
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 import ray
 import torch
 
+from arctic_platform.inference.server import perftrace
 from arctic_platform.inference.server.worker import WorkerLifecycleState
 from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     RESULT_KEY as _DENSE_PROMPT_LOGPROBS_KEY,
@@ -34,12 +36,32 @@ class DummyWorker:
     ) -> None:
         self.state = WorkerLifecycleState.READY
         self._model = engine_kwargs.get("model", "dummy")
+        if perftrace.configure(extra_env, role="worker"):
+            perftrace.start_sampler()
 
-    async def generate(self, prompt: str | list[int], sampling_params: dict[str, Any]) -> dict[str, Any]:
+    async def generate(
+        self,
+        prompt: str | list[int],
+        sampling_params: dict[str, Any],
+        perftrace_id: str | None = None,
+    ) -> dict[str, Any]:
         if self.state != WorkerLifecycleState.READY:
             raise RuntimeError(f"Worker not ready: state={self.state.value}")
 
+        enter_ns = time.time_ns()
         await asyncio.sleep(0.01)
+        result = self._dummy_result(prompt, sampling_params)
+        if perftrace_id is not None:
+            result["_perftrace"] = [
+                ("wk_enter", enter_ns, None),
+                ("wk_result", time.time_ns(), None),
+            ]
+        return result
+
+    def perftrace_drain(self) -> dict[str, Any]:
+        return perftrace.drain()
+
+    def _dummy_result(self, prompt: str | list[int], sampling_params: dict[str, Any]) -> dict[str, Any]:
         sampling_params = dict(sampling_params)
         return_sampled_logprobs_only = bool(sampling_params.pop("return_sampled_logprobs_only", False))
         # Mirror InferenceWorker: the opt-in moves into extra_args, and the

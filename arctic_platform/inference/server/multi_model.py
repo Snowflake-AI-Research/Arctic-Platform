@@ -408,6 +408,10 @@ class Driver:
             models[mid] = await pool.drain_metrics()
         return {"models": models}
 
+    async def perftrace_drain(self, model_id: str | None = None) -> list[dict[str, Any]]:
+        """Perftrace sources of one model's scheduler and workers."""
+        return await self._get_pool(model_id).perftrace_drain()
+
 
 # Swap backend and reuse the app — no endpoint duplication.
 api.backend = Driver()

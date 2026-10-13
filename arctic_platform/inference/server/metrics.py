@@ -33,6 +33,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from arctic_platform.inference.server import perftrace
 from vllm.config import VllmConfig
 from vllm.v1.metrics.loggers import StatLoggerBase
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
@@ -259,6 +260,7 @@ class RingStatLogger(StatLoggerBase):
         mm_cache_stats: Any | None = None,
         engine_idx: int = 0,
     ) -> None:
+        perftrace.record_engine_stats(scheduler_stats, iteration_stats)
         self._collector.push_snapshot(scheduler_stats, iteration_stats)
 
     def log_engine_initialized(self) -> None:
