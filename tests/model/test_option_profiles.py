@@ -39,7 +39,8 @@ from arctic_platform.model import loader as loader_mod
 
 HUGGINGFACE = "huggingface"
 
-# Field paths under ``ModelSpec``. None: the loader has no option for the key.
+# Field paths under ``ModelSpec``. None: no option of the loader takes the key. For numerics.optimization_dtype the
+# loader reads ``ModelSpec.dtype``, but the job sets it, not the key.
 HUGGINGFACE_FIELDS: dict[str, str | None] = {
     "checkpointing.mode": None,
     "checkpointing.freq": "patches.gradient_checkpointing",
@@ -58,6 +59,8 @@ HUGGINGFACE_FIELDS: dict[str, str | None] = {
     "attention.backend": "attn_implementation",
     "attention.sparse_mla": None,
     "numerics.reduce_dtype": None,
+    "numerics.fp32_parity": None,
+    "numerics.optimization_dtype": None,
     "compile.fullgraph": "patches.compile.fullgraph",
     "peft": "patches.peft",
     "zorro_train": "patches.zorro_train",
@@ -83,6 +86,8 @@ LOADER_OPTION_FIELDS: dict[str, str | None] = {
     "attention.backend": "ModelSpec.attn_implementation",
     "attention.sparse_mla": "sparse_mla_backend",
     "numerics.reduce_dtype": "reduce_dtype",
+    "numerics.fp32_parity": "fp32_parity",
+    "numerics.optimization_dtype": "ModelSpec.dtype",
     "compile.fullgraph": None,
     "peft": None,
     "zorro_train": None,

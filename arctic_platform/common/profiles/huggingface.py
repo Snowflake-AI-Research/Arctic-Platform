@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Profile of the default ``huggingface`` loader: options are ``Patches`` and ``ModelSpec`` fields."""
+"""Profile of the default ``huggingface`` loader: options are ``Patches`` and ``ModelSpec`` fields.
+
+The loader reads ``ModelSpec.dtype`` too, but ``numerics.optimization_dtype`` is unsupported here: on this route
+the job sets that dtype, and the key would have no effect.
+"""
 
 from __future__ import annotations
 
@@ -48,6 +52,13 @@ def register(registry: Registry) -> None:
                 "no equivalent option; sparse MLA is used only by the GLM loaders glm_moe_dsa and glm5_next"
             ),
             "numerics.reduce_dtype": "no equivalent option",
+            "numerics.optimization_dtype": (
+                "the key has no effect on this route: the job sets the model dtype, not this key"
+            ),
+            "numerics.fp32_parity": (
+                "only the custom Qwen3.5-MoE model, loaded by qwen3_5_moe with expert parallelism above 1, has this "
+                "option"
+            ),
         },
         not_applicable={
             "moe.*": "the huggingface loader rejects expert parallelism and has no expert options",
