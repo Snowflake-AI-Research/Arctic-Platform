@@ -31,6 +31,7 @@ from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_po
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _pack_and_exchange_head_tensors
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _packed_sequence_indices
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _shard_convolution_parameter
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from arctic_platform.model.implementations.moe.vlm import get_language_model
@@ -216,12 +217,19 @@ def _sparse_attention_forward(
     k_position_full = _gather_sequence(k_position, self._cp_group)
 
     if self.indexer is not None:
+        global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
+        if global_cu_seqlens is None:
+            global_cu_seqlens = torch.tensor(
+                [0, local_length * self._cp_world_size],
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
         topk_indices = _select_sparse_indices(
             self.indexer,
             hidden_states,
             q_resid,
             attention_mask,
-            getattr(self, _GLOBAL_CU_SEQLENS),
+            global_cu_seqlens,
             cp_group=self._cp_group,
             cp_rank=self._cp_rank,
         )
@@ -369,6 +377,74 @@ def _linear_attention_forward(
     return self.o_proj(output)
 
 
+def _local_linear_attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    cache_params=None,
+    attention_mask: torch.Tensor | None = None,
+    **_kwargs,
+):
+    if cache_params is not None:
+        raise NotImplementedError("GLM-5.3 packed KDA is a training-only path")
+    if hidden_states.shape[0] != 1:
+        raise NotImplementedError("GLM-5.3 packed KDA currently requires one packed row")
+    if attention_mask is not None:
+        hidden_states = hidden_states * attention_mask[..., None].to(hidden_states.dtype)
+
+    batch_size, sequence_length = hidden_states.shape[:2]
+    global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
+    if global_cu_seqlens is None:
+        global_cu_seqlens = torch.tensor(
+            [0, sequence_length],
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+    shape = (batch_size, sequence_length, self.num_heads, self.head_dim)
+    mixed_qkv = torch.cat(
+        [
+            self.q_proj(hidden_states),
+            self.k_proj(hidden_states),
+            self.v_proj(hidden_states),
+        ],
+        dim=-1,
+    ).transpose(1, 2)
+
+    from causal_conv1d import causal_conv1d_fn
+
+    mixed_qkv = causal_conv1d_fn(
+        mixed_qkv,
+        weight=self.conv1d.weight.squeeze(1),
+        bias=self.conv1d.bias,
+        activation=self.activation,
+        seq_idx=_packed_sequence_indices(global_cu_seqlens),
+    ).transpose(1, 2)
+    query, key, value = torch.split(mixed_qkv, [self.qkv_dim] * 3, dim=-1)
+    query = query.view(shape)
+    key = key.view(shape)
+    value = value.view(shape)
+    decay = self.forget_gate(hidden_states)
+    beta = torch.sigmoid(self.b_proj(hidden_states))
+
+    from fla.ops.kda import chunk_kda
+
+    output, final_state = chunk_kda(
+        query,
+        key,
+        value,
+        g=decay,
+        beta=beta,
+        initial_state=None,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=global_cu_seqlens,
+    )
+    if final_state is not None:
+        raise RuntimeError("GLM-5.3 KDA unexpectedly returned recurrent state")
+    gate = self.g_b_proj(self.g_a_proj(hidden_states)).view(shape)
+    output = self.o_norm(output, gate).reshape(batch_size, sequence_length, -1)
+    return self.o_proj(output)
+
+
 def _wrap_backbone_forward(backbone: nn.Module, parallel_modules: list[nn.Module]):
     original_forward = backbone.forward
 
@@ -424,13 +500,13 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
             )
             parallel_modules.append(attention)
             sparse_layers += 1
-        elif cp_size > 1 and layer.block_type == "linear_attention":
+        elif layer.block_type == "linear_attention":
             if attention.num_heads % cp_world_size:
                 raise ValueError(
                     f"GLM-5.3 KDA heads ({attention.num_heads}) must be divisible by CP size ({cp_world_size})"
                 )
             attention.forward = types.MethodType(
-                _linear_attention_forward,
+                _linear_attention_forward if cp_size > 1 else _local_linear_attention_forward,
                 attention,
             )
             parallel_modules.append(attention)
