@@ -68,6 +68,79 @@ def _transport(replies: dict | None = None) -> tuple[CortexTransport, FakeSend]:
     return transport, send
 
 
+class TestClusterRoutes:
+    @pytest.mark.parametrize(
+        ("request_", "method", "path", "retry_on"),
+        [
+            (client_requests.list_jobs_request("running"), "GET", "", cortex_module._is_transient),
+            (client_requests.get_job_request(TRAINING), "GET", f"/{JOB}", cortex_module._is_transient),
+            (client_requests.cancel_job_request(JOB), "POST", f"/{JOB}:cancel", cortex_module._is_transient),
+            (client_requests.capacity_request("H200"), "GET", "/capacity", cortex_module._is_transient),
+            (
+                client_requests.list_checkpoints_request(TRAINING),
+                "GET",
+                f"/{JOB}/checkpoints",
+                cortex_module._is_transient,
+            ),
+            (
+                client_requests.export_checkpoint_request(TRAINING, "cp-1"),
+                "POST",
+                f"/{JOB}/checkpoints/cp-1:export",
+                cortex_module._is_transient,
+            ),
+            (
+                client_requests.delete_checkpoint_request(TRAINING, "cp-1"),
+                "DELETE",
+                f"/{JOB}/checkpoints/cp-1",
+                cortex_module._is_connect_error,
+            ),
+        ],
+        ids=lambda value: value.op if hasattr(value, "op") else None,
+    )
+    def test_method_url_and_retry_policy(self, request_, method, path, retry_on):
+        """Sub-job tokens address their parent job, and only a delete is never replayed."""
+        transport, send = _transport()
+        transport.call(request_)
+
+        (sent,) = send.sent
+        assert (sent["method"], sent["url"], sent["retry_on"]) == (method, PREFIX + path, retry_on)
+
+    def test_account_filters_travel_as_query_params(self):
+        transport, send = _transport()
+        transport.call(client_requests.list_jobs_request("running"))
+        transport.call(client_requests.capacity_request("H200"))
+
+        assert [sent["params"] for sent in send.sent] == [{"status": "running"}, {"hardware": "H200"}]
+
+    def test_path_only_routes_send_no_body(self):
+        """checkpoint_id fills the URL and is not also sent as a body."""
+        transport, send = _transport()
+        transport.call(client_requests.export_checkpoint_request(TRAINING, "cp-1"))
+
+        assert set(send.sent[0]) == {"method", "url", "retry_on"}
+
+    def test_lists_unwrap_and_tolerate_omitted_empty_fields(self):
+        """Proto3 JSON omits empty lists, so a bare `{}` means none."""
+        transport, _ = _transport({("GET", "cortex-training"): {"jobs": [{"job_id": JOB}]}})
+        assert transport.call(client_requests.list_jobs_request()) == [{"job_id": JOB}]
+
+        transport, _ = _transport({("GET", "cortex-training"): {}, ("GET", "/checkpoints"): {}})
+        assert transport.call(client_requests.list_jobs_request()) == []
+        assert transport.call(client_requests.list_checkpoints_request(TRAINING)) == []
+
+    def test_capacity_fills_omitted_fields(self):
+        transport, _ = _transport({("GET", "/capacity"): {"max_total_gpus": 64, "in_use_gpus": 8}})
+
+        assert transport.call(client_requests.capacity_request()) == {
+            "has_reservation": False,
+            "max_total_gpus": 64,
+            "reserved_gpus": 0,
+            "in_use_gpus": 8,
+            "pending_gpus": 0,
+            "available_gpus": 0,
+        }
+
+
 class TestLifecycleRoutes:
     def test_initialize_creates_without_replay_and_captures_sub_jobs(self):
         """Create retries only undelivered sends, so a retry cannot spawn a second job."""

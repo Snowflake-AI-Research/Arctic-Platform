@@ -39,9 +39,17 @@ from typing_extensions import Self
 from arctic_platform._dependency_groups import require_any_dep_group
 from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import CortexConfig
+from arctic_platform.client.config import JobId
+from arctic_platform.client.requests import cancel_job_request
+from arctic_platform.client.requests import capacity_request
+from arctic_platform.client.requests import delete_checkpoint_request
+from arctic_platform.client.requests import export_checkpoint_request
 from arctic_platform.client.requests import fwd_bwd_request
 from arctic_platform.client.requests import fwd_no_grad_request
 from arctic_platform.client.requests import generate_request
+from arctic_platform.client.requests import get_job_request
+from arctic_platform.client.requests import list_checkpoints_request
+from arctic_platform.client.requests import list_jobs_request
 from arctic_platform.client.requests import load_checkpoint_request
 from arctic_platform.client.requests import reset_prefix_cache_request
 from arctic_platform.client.requests import save_checkpoint_request
@@ -135,10 +143,32 @@ class _ArcticClientCore:
 class ArcticClient(_ArcticClientCore):
     """The blocking frontend: every op shared by SFT and RL."""
 
-    def _call(self, request: Request) -> dict:
+    def _call(self, request: Request) -> Any:
         out = self.transport.call(request)
         _maybe_print_server_profile(request.op, out)
         return out
+
+    # ── cluster ──────────────────────────────────────────────────────────
+    def list_jobs(self, status: str | None = None) -> list[dict]:
+        return self._call(list_jobs_request(status))
+
+    def capacity(self, hardware: str | None = None) -> dict:
+        return self._call(capacity_request(hardware))
+
+    def cancel_job(self, job_id: JobId) -> None:
+        self._call(cancel_job_request(job_id))
+
+    def get_job(self) -> dict:
+        return self._call(get_job_request(self.jobs.require_any()))
+
+    def list_checkpoints(self) -> list[dict]:
+        return self._call(list_checkpoints_request(self.jobs.require("training")))
+
+    def export_checkpoint(self, checkpoint_id: str) -> dict:
+        return self._call(export_checkpoint_request(self.jobs.require("training"), checkpoint_id))
+
+    def delete_checkpoint(self, checkpoint_id: str) -> None:
+        self._call(delete_checkpoint_request(self.jobs.require("training"), checkpoint_id))
 
     # ── training ─────────────────────────────────────────────────────────
     def fwd_bwd(

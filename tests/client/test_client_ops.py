@@ -398,6 +398,41 @@ class TestClusterRequestBuilders:
         assert CLUSTER_OPS.isdisjoint(OPS)
 
 
+class TestClusterClientMethods:
+    @pytest.fixture
+    def sync_client(self, monkeypatch) -> ArcticRLClient:
+        return _build(monkeypatch, ArcticRLClient)
+
+    def test_account_ops_use_the_given_arguments(self, sync_client):
+        """Account-level ops need no stored handle."""
+        sync_client.list_jobs("running")
+        assert _last(sync_client) == cluster_requests.list_jobs_request("running")
+        sync_client.capacity("H200")
+        assert _last(sync_client) == cluster_requests.capacity_request("H200")
+        sync_client.cancel_job("job-9")
+        assert _last(sync_client) == cluster_requests.cancel_job_request("job-9")
+
+    def test_get_job_targets_a_stored_handle(self, sync_client):
+        sync_client.get_job()
+        assert _last(sync_client) == cluster_requests.get_job_request(TRAINING)
+
+    def test_checkpoint_ops_target_the_training_job(self, sync_client):
+        sync_client.list_checkpoints()
+        assert _last(sync_client) == cluster_requests.list_checkpoints_request(TRAINING)
+        sync_client.export_checkpoint("cp-1")
+        assert _last(sync_client) == cluster_requests.export_checkpoint_request(TRAINING, "cp-1")
+        sync_client.delete_checkpoint("cp-1")
+        assert _last(sync_client) == cluster_requests.delete_checkpoint_request(TRAINING, "cp-1")
+
+    def test_onprem_rejects_cluster_ops(self):
+        """On-prem has no job persistence, so cluster ops fail instead of reaching the Ray server."""
+        from arctic_platform.client.transports.onprem import OnPremTransport
+
+        transport = OnPremTransport(OnPremConfig())
+        with pytest.raises(NotImplementedError, match="list-jobs"):
+            transport.call(cluster_requests.list_jobs_request())
+
+
 class TestTransportSelection:
     def test_make_transport_passes_cortex_config(self, monkeypatch):
         """Stateful clients pass the complete Cortex transport config unchanged."""
@@ -682,7 +717,7 @@ class TestCortexCancelToleratesEmptyBody:
     release that had in fact succeeded as ``could not release <id>``, which
     points the operator at the GPU cap instead of at their freed GPUs."""
 
-    def test_cancel_job_accepts_empty_response(self, monkeypatch):
+    def test_cancel_request_accepts_empty_response(self, monkeypatch):
         pytest.importorskip("tenacity")
         monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
         from arctic_platform.client import CortexConfig
@@ -711,7 +746,7 @@ class TestCortexCancelToleratesEmptyBody:
 
         t._session = _Session()
 
-        t.cancel_job("job-abc")
+        t.call(cluster_requests.cancel_job_request("job-abc"))
 
         assert sent["method"] == "POST"
         assert sent["url"].endswith("/job-abc:cancel")
