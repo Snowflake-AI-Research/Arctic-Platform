@@ -447,6 +447,103 @@ def test_qwen38_rank_zero_ple_halo_keeps_collective_backward(monkeypatch):
     torch.testing.assert_close(source.grad, torch.zeros_like(source))
 
 
+def test_qwen38_packed_ple_components_reset_at_position_boundaries():
+    _require()
+    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import (
+        Qwen4ExpTextNGramEmbeddingPrimeRL,
+        Qwen4ExpTextPLELayerPrimeRL,
+    )
+
+    config = _tiny_config().text_config
+    positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+    first = torch.tensor([[2, 3, 4, 5]])
+    second = torch.tensor([[6, 7, 8, 9]])
+
+    ngram = Qwen4ExpTextNGramEmbeddingPrimeRL(
+        config,
+        config.ple_embed_dim,
+        layer_idx=0,
+    )
+    packed_ngram = ngram(
+        torch.cat([first, second], dim=1),
+        None,
+        position_ids=positions,
+    )[:, 4:]
+    separate_ngram = ngram(second, None)
+    torch.testing.assert_close(packed_ngram, separate_ngram)
+
+    ple = Qwen4ExpTextPLELayerPrimeRL(config, layer_idx=0, ple_layer_index=0)
+    with torch.no_grad():
+        ple.conv1d.weight.fill_(1)
+    first_hidden = torch.ones(1, 4, config.hidden_size * config.hc_count)
+    second_hidden = torch.zeros_like(first_hidden)
+    packed_conv = ple._short_conv(
+        torch.cat([first_hidden, second_hidden], dim=1),
+        None,
+        position_ids=positions,
+    )[:, 4:]
+    separate_conv = ple._short_conv(second_hidden, None)
+    torch.testing.assert_close(packed_conv, separate_conv)
+
+
+def test_qwen38_context_parallel_ple_transports_positions(monkeypatch):
+    from arctic_platform.model.implementations.qwen38 import context_parallel
+
+    class Embedding(torch.nn.Module):
+        context_len = 2
+        eos_token_id = 0
+
+        def forward(self, input_ids, past_key_values, position_ids=None):
+            self.received_positions = position_ids
+            return input_ids.unsqueeze(-1).float()
+
+    class PLE(torch.nn.Module):
+        short_conv_state_len = 2
+
+        def __init__(self):
+            super().__init__()
+            self.ple_embedding = Embedding()
+
+        def _short_conv(self, hidden_states, past_key_values, position_ids=None):
+            self.received_positions = position_ids
+            return hidden_states
+
+    calls = []
+
+    def previous(tensor, width, *, process_group, pad_value, differentiable):
+        calls.append((width, pad_value, differentiable))
+        return torch.full_like(tensor[:, :width], pad_value)
+
+    monkeypatch.setattr(context_parallel, "_previous_rank_context", previous)
+    ple = PLE()
+    context_parallel._adapt_ple_layer(ple, process_group=object())
+
+    positions = torch.tensor([[0, 1, 2]])
+    ple.ple_embedding(
+        torch.tensor([[3, 4, 5]]),
+        None,
+        position_ids=positions,
+    )
+    ple._short_conv(
+        torch.randn(1, 3, 4),
+        None,
+        position_ids=positions,
+    )
+
+    expected_positions = torch.tensor([[-1, -1, 0, 1, 2]])
+    torch.testing.assert_close(
+        ple.ple_embedding.received_positions,
+        expected_positions,
+    )
+    torch.testing.assert_close(ple.received_positions, expected_positions)
+    assert calls == [
+        (2, 0, False),
+        (2, -1, False),
+        (2, 0, True),
+        (2, -1, False),
+    ]
+
+
 def test_qwen38_supports_selective_activation_checkpointing():
     _require()
     from arctic_platform.model.implementations.moe.layers.checkpointing import get_supported_targets
