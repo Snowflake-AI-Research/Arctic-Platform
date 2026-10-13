@@ -97,6 +97,32 @@ def test_registered_weight_export_survives_model_replacement():
     assert not hasattr(target, "_iter_full_hf_weights")
 
 
+def test_iter_model_weights_forwards_complete_hf_export_mode():
+    model = nn.Linear(2, 2)
+    received = []
+
+    def hf_builder(_model):
+        def iterator(*, include_skipped=False):
+            received.append(include_skipped)
+            yield "registered.weight", model.weight
+
+        return iterator
+
+    register_weight_export(model, WeightExportContract(hf=hf_builder))
+
+    assert [
+        name
+        for name, _ in iter_model_weights(
+            model,
+            "hf",
+            is_master=True,
+            is_zero3=False,
+            include_skipped=True,
+        )
+    ] == ["registered.weight"]
+    assert received == [True]
+
+
 def test_iter_lora_weights_normalizes_dense_adapter_names():
     tensor = torch.ones(2, 2)
     model = _Model(
