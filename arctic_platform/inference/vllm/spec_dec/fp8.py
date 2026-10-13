@@ -345,10 +345,11 @@ class Fp8LinearMethodEmbedding(OriginalFp8LinearMethod):
 
 class Fp8ConfigWithEmbedding(Fp8Config):
 
-    def get_quant_method_patch(self, layer: torch.nn.Module,
-                               prefix: str) -> Optional["QuantizeMethodBase"]:
+    def get_quant_method(self, layer: torch.nn.Module,
+                         prefix: str) -> Optional["QuantizeMethodBase"]:
         from vllm.model_executor.layers.attention import Attention
-        from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+        from arctic_platform.inference.vllm.spec_dec.vocab_parallel_embedding import (
+            VocabParallelEmbedding)
     
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
