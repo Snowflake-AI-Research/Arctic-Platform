@@ -23,7 +23,8 @@ placement from the environment. The Hugging Face and Liger attention adapter sta
 from __future__ import annotations
 
 import logging
-from typing import Any, NamedTuple
+from typing import Any
+from typing import NamedTuple
 
 import deepspeed.runtime.sequence_parallel.parallel_state_sp as sp_mpu
 import deepspeed.utils.groups as ds_groups
@@ -99,9 +100,7 @@ def setup_parallel_groups(
     )
 
     if ep_topology == "node-local":
-        return setup_node_local_groups(
-            sp_size, ep_size, resolved_world_size, resolved_gpus_per_node
-        )
+        return setup_node_local_groups(sp_size, ep_size, resolved_world_size, resolved_gpus_per_node)
 
     # Cases 2-4 share these contiguous SP + seq-DP groups ({0..sp-1},{sp..2sp-1},...).
     sp_mpu.initialize_sequence_parallel(sp_size)
@@ -313,9 +312,7 @@ def log_topology(
     node-local EP.
     ``sp_group`` is ``None`` on the ``sp_size == 1`` path.
     """
-    sp_ranks = (
-        list(dist.get_process_group_ranks(sp_group)) if sp_group is not None else [rank]
-    )
+    sp_ranks = list(dist.get_process_group_ranks(sp_group)) if sp_group is not None else [rank]
     if ep_size > 1:
         ep_name = ep_group_name(ep_size)
         ep_ranks = list(ds_groups._get_expert_parallel_group_ranks(ep_name))

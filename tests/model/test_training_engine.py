@@ -238,16 +238,12 @@ def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypa
         calls["kwargs"] = kwargs
         return "engine", kwargs.get("optimizer"), None, None
 
-    monkeypatch.setattr(
-        "arctic_platform.model.training_engine.build_training_optimizer", _build
-    )
+    monkeypatch.setattr("arctic_platform.model.training_engine.build_training_optimizer", _build)
     monkeypatch.setattr(
         "arctic_platform.model.training_engine.preserve_fp8_params_through_ds_cast",
         lambda model: (0, 0),
     )
-    monkeypatch.setattr(
-        "arctic_platform.model.training_engine.is_glm_moe_model", lambda path: False
-    )
+    monkeypatch.setattr("arctic_platform.model.training_engine.is_glm_moe_model", lambda path: False)
     monkeypatch.setattr("deepspeed.initialize", _initialize)
     model = torch.nn.Linear(1, 1)
     ds_config = {"train_micro_batch_size_per_gpu": 1}
@@ -310,12 +306,8 @@ def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monke
 
     monkeypatch.setattr("deepspeed.ops.adam.FusedAdam", _Adam)
     monkeypatch.setattr("torch.optim.AdamW", _Adam)
-    monkeypatch.setattr(
-        "arctic_platform.model.training_engine.is_glm_moe_model", lambda path: True
-    )
-    monkeypatch.setattr(
-        "arctic_platform.model.training_engine.split_expert_param_groups", _split
-    )
+    monkeypatch.setattr("arctic_platform.model.training_engine.is_glm_moe_model", lambda path: True)
+    monkeypatch.setattr("arctic_platform.model.training_engine.split_expert_param_groups", _split)
     monkeypatch.setattr(
         "arctic_platform.model.training_engine.preserve_fp8_params_through_ds_cast",
         lambda model: (0, 0),

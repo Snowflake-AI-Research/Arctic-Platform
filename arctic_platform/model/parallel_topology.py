@@ -47,7 +47,8 @@ Decoupled intra-node-EP (bottom section): the EP axis as a function of ``ep`` on
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List
+from typing import Tuple
 
 EP_GROUP_LAYOUTS = frozenset({"auto", "packed", "mesh"})
 
@@ -55,9 +56,7 @@ EP_GROUP_LAYOUTS = frozenset({"auto", "packed", "mesh"})
 def normalize_ep_group_layout(value) -> str:
     layout = "auto" if value is None else value
     if layout not in EP_GROUP_LAYOUTS:
-        raise ValueError(
-            f"ep_group_layout must be one of {sorted(EP_GROUP_LAYOUTS)}; got {value!r}"
-        )
+        raise ValueError(f"ep_group_layout must be one of {sorted(EP_GROUP_LAYOUTS)}; got {value!r}")
     return layout
 
 
@@ -87,9 +86,7 @@ def use_node_local_ep(world_size: int, sp_size: int, ep_size: int, gpus_per_node
     return gpus_per_node % (sp_size * ep_size) != 0
 
 
-def use_intra_node_ep_decoupled(
-    world_size: int, sp_size: int, ep_size: int, gpus_per_node: int
-) -> bool:
+def use_intra_node_ep_decoupled(world_size: int, sp_size: int, ep_size: int, gpus_per_node: int) -> bool:
     if sp_size == 1 or ep_size == 1:
         return False
     if gpus_per_node <= 0 or gpus_per_node % ep_size != 0:
@@ -141,16 +138,12 @@ def resolve_ep_group_topology(
     if sp_size <= 1 or ep_size <= 1:
         return "standard"
 
-    mesh_valid = (
-        world_size % sp_size == 0
-        and sp_size != world_size
-        and (world_size // sp_size) % ep_size == 0
-    )
+    mesh_valid = world_size % sp_size == 0 and sp_size != world_size and (world_size // sp_size) % ep_size == 0
     if layout == "mesh":
         if mesh_valid:
             return "orthogonal"
         raise ValueError(
-            f"ep_group_layout='mesh' requires (world_size // sp_size) % ep_size == 0 "
+            "ep_group_layout='mesh' requires (world_size // sp_size) % ep_size == 0 "
             f"and sp_size != world_size; got world={world_size}, sp={sp_size}, ep={ep_size}"
         )
 
@@ -164,7 +157,7 @@ def resolve_ep_group_topology(
         if use_host_complete_ep(world_size, sp_size, ep_size, gpus_per_node):
             return "host-complete"
         raise ValueError(
-            f"ep_group_layout='packed' requires ep_size to divide gpus_per_node or be a "
+            "ep_group_layout='packed' requires ep_size to divide gpus_per_node or be a "
             f"power-of-two multiple of it; got ep={ep_size}, gpus_per_node={gpus_per_node}"
         )
 
@@ -218,11 +211,7 @@ def sp_groups(world_size: int, ep_size: int, gpus_per_node: int, sp_size: int) -
         ]
         for ep_position in range(ep_size)
     ]
-    return [
-        ranks[start : start + sp_size]
-        for ranks in by_expert
-        for start in range(0, len(ranks), sp_size)
-    ]
+    return [ranks[start : start + sp_size] for ranks in by_expert for start in range(0, len(ranks), sp_size)]
 
 
 def ep_groups(world_size: int, ep_size: int, gpus_per_node: int) -> List[List[int]]:
@@ -236,9 +225,7 @@ def ep_groups(world_size: int, ep_size: int, gpus_per_node: int) -> List[List[in
     ]
 
 
-def rank_to_dp_sp(
-    world_size: int, ep_size: int, gpus_per_node: int, sp_size: int
-) -> List[Tuple[int, int]]:
+def rank_to_dp_sp(world_size: int, ep_size: int, gpus_per_node: int, sp_size: int) -> List[Tuple[int, int]]:
     """Per-rank ``(dp_index, sp_rank)`` for the data plane.
 
     ``dp_index = replica * ep + ep_position`` selects the DP sample; ``sp_rank`` is the token window.
@@ -273,8 +260,7 @@ def orthogonal_edp_groups(world_size: int, sp_size: int, ep_size: int) -> List[L
     degree equals the expert-parallel degree.
     """
     return [
-        [rank for rank in range(world_size) if (rank // sp_size) % ep_size == position]
-        for position in range(ep_size)
+        [rank for rank in range(world_size) if (rank // sp_size) % ep_size == position] for position in range(ep_size)
     ]
 
 
@@ -288,7 +274,4 @@ def intra_node_ep_replica_groups(world_size: int, ep_size: int) -> List[List[int
     Intra-node ``ep``-blocks and host-complete consecutive blocks both make ``rank % ep`` name the shard.
     ``sp`` never enters, so the same groups serve all three.
     """
-    return [
-        [rank for rank in range(world_size) if rank % ep_size == ep_position]
-        for ep_position in range(ep_size)
-    ]
+    return [[rank for rank in range(world_size) if rank % ep_size == ep_position] for ep_position in range(ep_size)]

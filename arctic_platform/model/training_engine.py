@@ -167,9 +167,7 @@ def initialize_training_engine(
 
     init_kwargs = {"mpu": mpu} if mpu is not None else {}
     if built is not None:
-        engine, built, _, _ = deepspeed.initialize(
-            model=model, optimizer=built, config=ds_config, **init_kwargs
-        )
+        engine, built, _, _ = deepspeed.initialize(model=model, optimizer=built, config=ds_config, **init_kwargs)
     else:
         engine, *_ = deepspeed.initialize(model=model, config=ds_config, **init_kwargs)
         built = None
@@ -288,9 +286,7 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
 
 def _data_parallel_size(world_size: int, sequence_parallel: int) -> int:
     if sequence_parallel > 1 and world_size % sequence_parallel != 0:
-        raise ValueError(
-            f"world_size ({world_size}) must be divisible by sp_size ({sequence_parallel})"
-        )
+        raise ValueError(f"world_size ({world_size}) must be divisible by sp_size ({sequence_parallel})")
     return world_size // sequence_parallel
 
 

@@ -73,12 +73,8 @@ def test_orthogonal_setup_registers_every_replica(monkeypatch):
     expert_parallel_groups = []
     for offset in range(sp_size):
         dp_ranks = list(range(offset, world_size, sp_size))
-        expert_parallel_groups.extend(
-            dp_ranks[start : start + ep_size] for start in range(0, len(dp_ranks), ep_size)
-        )
-    positions = {
-        peer: position for group in expert_parallel_groups for position, peer in enumerate(group)
-    }
+        expert_parallel_groups.extend(dp_ranks[start : start + ep_size] for start in range(0, len(dp_ranks), ep_size))
+    positions = {peer: position for group in expert_parallel_groups for position, peer in enumerate(group)}
     ds_groups = SimpleNamespace(
         _EXPERT_PARALLEL_GROUP={},
         _EXPERT_PARALLEL_GROUP_RANKS={},
