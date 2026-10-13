@@ -68,6 +68,15 @@ def make_transport(config: ArcticClientConfig, server_state: Any = None) -> Tran
     return OnPremTransport(config, server_state=server_state)
 
 
+def _zorro_train_enabled(config: ArcticClientConfig) -> bool:
+    """Whether this deployment asked the worker to patch the Qwen forward."""
+    worker = config.training.ds_worker_config or {}
+    if worker.get("zorro_train_enable"):
+        return True
+    zorro = worker.get("zorro_train")
+    return isinstance(zorro, dict) and bool(zorro.get("enable"))
+
+
 def _check_weight_format(config: ArcticClientConfig, weight_format: str | None) -> None:
     """Refuse a weight_format the deployment would drop on the floor.
 
@@ -104,7 +113,16 @@ class _ArcticClientCore:
     block or are awaited.
     """
 
+    # ZoRRo replaces the model forward with an RL response-logprob path.
+    # ArcticRLClient and AsyncArcticRLClient opt in; every other frontend refuses.
+    _allows_zorro_train = False
+
     def __init__(self, config: ArcticClientConfig, server_state: Any = None) -> None:
+        if _zorro_train_enabled(config) and not type(self)._allows_zorro_train:
+            raise ValueError(
+                "ZoRRo Train is only compatible with ArcticRLClient (and its async "
+                f"frontend, AsyncArcticRLClient); {type(self).__name__} cannot enable it"
+            )
         self.config = config
         self.transport = make_transport(config, server_state=server_state)
         self.jobs = initialize_or_cleanup(self.transport)

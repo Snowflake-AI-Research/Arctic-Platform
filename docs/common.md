@@ -96,6 +96,12 @@ worker; that API is not present in this tree yet.
 
 If `ds_worker_config["zorro_train_enable"]` is true at init, the worker patches
 the HF model for ZoRRo Train (see [`rl.md`](rl.md#zorro-train)).
+`ArcticRLClient` and `AsyncArcticRLClient` accept that flag.
+`ArcticClient`, `AsyncArcticClient`, and `ArcticSFTClient` raise `ValueError`
+at construction when it is truthy, and when the nested
+`ds_worker_config["zorro_train"]["enable"]` spelling is set.
+A later `fwd_bwd` that sets `zorro_train_enable` is rejected unless this init
+flag patched the model.
 
 ## Config blobs
 

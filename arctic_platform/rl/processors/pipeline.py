@@ -298,6 +298,38 @@ def dump_dict_payload(payload: dict, tag: str):
 c = 0
 
 
+def _next_wrapped_module(module: Any) -> Any | None:
+    """The next user module under a DeepSpeed or DDP wrapper, if this object has one."""
+    prop = getattr(type(module), "module", None)
+    if isinstance(prop, property):
+        return prop.__get__(module, type(module))
+    return getattr(module, "__dict__", {}).get("module")
+
+
+def _model_has_zorro_patch(engine: Any) -> bool:
+    """True when init applied the ZoRRo forward patch to this engine's model."""
+    module = engine
+    seen: set[int] = set()
+    while module is not None and id(module) not in seen:
+        seen.add(id(module))
+        if getattr(module, "__dict__", {}).get("_arctic_zorro_once_patcher") is not None:
+            return True
+        module = _next_wrapped_module(module)
+    return False
+
+
+def _reject_zorro_on_unpatched_model(engine: Any, meta: dict) -> None:
+    """A per-call ZoRRo flag is the data layout. It requires the init-time patch."""
+    if not meta.get("zorro_train_enable"):
+        return
+    if _model_has_zorro_patch(engine):
+        return
+    raise ValueError(
+        "ZoRRo Train was requested, but this model was not patched at init. "
+        "Set ds_worker_config['zorro_train_enable'] when the training job is created."
+    )
+
+
 def run_pipeline(
     engine,
     args: tuple,
@@ -375,6 +407,7 @@ def run_pipeline(
         When ``backward="loss_only"``: same as loss path but also includes
         ``"loss_tensor"`` (undetached, caller handles backward).
     """
+    _reject_zorro_on_unpatched_model(engine, meta)
     loss_fn_name = processing.get("loss_fn", "ap_grpo")
     if loss_object is None and loss_fn_name is not None:
         loss_object = resolve_loss(loss_fn_name)

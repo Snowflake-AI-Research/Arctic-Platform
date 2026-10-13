@@ -150,6 +150,12 @@ class _CortexClientShim:
                 "trainer.algorithm.use_kl_loss=false, use_kl_in_reward=false).\n\n"
                 "See docs/cortex-integration.md#supported-recipes."
             )
+        meta = batch.get("meta") if isinstance(batch, dict) else None
+        if isinstance(meta, dict) and meta.get("zorro_train_enable"):
+            raise ValueError(
+                "ZoRRo Train was requested, but this model was not patched at init. "
+                "Cortex has no forward sub-job, so fwd_no_grad cannot run the ZoRRo patch."
+            )
         # Both spellings of each key: SkyRL reads them inconsistently by call site.
         z = zero_logprobs_like(batch)
         return {"batch": {"logprobs": z, "log_probs": z, "entropy": z, "entropies": z}}
