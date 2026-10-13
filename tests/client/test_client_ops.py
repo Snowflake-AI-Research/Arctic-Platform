@@ -39,7 +39,9 @@ from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
 from arctic_platform.client import Transport
 from arctic_platform.client import base as base_module
+from arctic_platform.client import requests as cluster_requests
 from arctic_platform.client import unresolved_ops
+from arctic_platform.client.transport import CLUSTER_OPS
 from arctic_platform.client.transport import method_name
 
 TRAINING, SAMPLING, LOG_PROB = 1, 2, 3
@@ -52,7 +54,7 @@ class FakeTransport(Transport):
         self.jobs = JobHandles()
         self.calls: list[Request] = []
 
-    def initialize(self) -> JobHandles:
+    def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
         self.jobs = JobHandles(training=TRAINING, sampling=SAMPLING, log_prob=LOG_PROB)
         return self.jobs
 
@@ -274,7 +276,7 @@ class TestServerState:
                 self.server_state = server_state
                 self.jobs = JobHandles(training=TRAINING, sampling=SAMPLING, log_prob=LOG_PROB)
 
-            def initialize(self):
+            def initialize(self, client_config):
                 return self.jobs
 
             def get_server_state(self):
@@ -342,7 +344,76 @@ class TestOpRegistry:
         assert unresolved_ops(server) == []
 
 
+class TestClusterRequestBuilders:
+    @pytest.mark.parametrize(
+        ("actual", "expected"),
+        [
+            (cluster_requests.list_jobs_request("running"), Request("list-jobs", body={"status": "running"})),
+            (cluster_requests.get_job_request("job-1"), Request("get-job", "job-1")),
+            (cluster_requests.cancel_job_request("job-1"), Request("cancel-job", "job-1")),
+            (cluster_requests.capacity_request("H100"), Request("capacity", body={"hardware": "H100"})),
+            (cluster_requests.list_checkpoints_request("job-1"), Request("list-checkpoints", "job-1")),
+            (
+                cluster_requests.export_checkpoint_request("job-1", "step-1"),
+                Request("export-checkpoint", "job-1", {"checkpoint_id": "step-1"}),
+            ),
+            (
+                cluster_requests.delete_checkpoint_request("job-1", "step-1"),
+                Request("delete-checkpoint", "job-1", {"checkpoint_id": "step-1"}),
+            ),
+            (
+                cluster_requests.download_artifacts_request("job-1", "stdout", "/tmp/logs"),
+                Request("download-artifacts", "job-1", {"kind": "stdout", "output_dir": "/tmp/logs"}),
+            ),
+        ],
+    )
+    def test_context_free_request_shape(self, actual, expected):
+        """Cluster builders lower arguments without client or transport state."""
+        assert actual == expected
+
+    def test_optional_filters_are_omitted(self):
+        """Absent account filters do not become explicit null query values."""
+        assert cluster_requests.list_jobs_request().body == {}
+        assert cluster_requests.capacity_request().body == {}
+
+    def test_cluster_vocabulary_is_separate_from_live_ops(self):
+        """Cluster builders have their own registry and do not expand on-prem coverage."""
+        requests = (
+            cluster_requests.list_jobs_request(),
+            cluster_requests.get_job_request("job"),
+            cluster_requests.cancel_job_request("job"),
+            cluster_requests.capacity_request(),
+            cluster_requests.list_checkpoints_request("job"),
+            cluster_requests.export_checkpoint_request("job", "checkpoint"),
+            cluster_requests.delete_checkpoint_request("job", "checkpoint"),
+            cluster_requests.download_artifacts_request("job", "stdout", "/tmp/logs"),
+        )
+        assert {request.op for request in requests} == CLUSTER_OPS
+        assert CLUSTER_OPS.isdisjoint(OPS)
+
+
 class TestTransportSelection:
+    def test_make_transport_passes_cortex_config(self, monkeypatch):
+        """Stateful clients pass the complete Cortex transport config unchanged."""
+        pytest.importorskip("tenacity")
+        import arctic_platform.client.transports.cortex as cortex_mod
+
+        class DummyCortex:
+            def __init__(self, config):
+                self.config = config
+
+        monkeypatch.setattr(cortex_mod, "CortexTransport", DummyCortex)
+        from arctic_platform.client import CortexConfig
+
+        backend = CortexConfig(base_url="http://mock")
+        cfg = ArcticClientConfig(
+            model_name="m",
+            backend=backend,
+        )
+        transport = base_module.make_transport(cfg)
+        assert isinstance(transport, DummyCortex)
+        assert transport.config is backend
+
     def test_make_transport_selects_onprem(self, monkeypatch):
         """onprem routes to OnPremTransport (constructed lazily, so patch it)."""
         import arctic_platform.client.transports.onprem as onprem_mod
@@ -354,7 +425,9 @@ class TestTransportSelection:
 
         monkeypatch.setattr(onprem_mod, "OnPremTransport", DummyRay)
         cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(), training_gpus=1)
-        assert isinstance(base_module.make_transport(cfg), DummyRay)
+        transport = base_module.make_transport(cfg)
+        assert isinstance(transport, DummyRay)
+        assert transport.config is cfg.backend
 
     def test_make_transport_forwards_server_state_to_onprem(self, monkeypatch):
         """make_transport threads server_state into the on-prem transport (reconnect path)."""
@@ -538,6 +611,34 @@ class TestCortexNoopOffload:
         assert self._zero_block({"zero_optimization": {"stage": 2}}) == {"stage": 2}
 
 
+class TestCortexBackendOnlyConstruction:
+    def test_backend_config_does_not_initialize_jobs(self):
+        """A bare CortexConfig builds transport plumbing but cannot create a job."""
+        pytest.importorskip("tenacity")
+        from arctic_platform.client import CortexConfig
+        from arctic_platform.client.transports.cortex import CortexTransport
+
+        backend = CortexConfig(
+            base_url="http://mock",
+            database="db",
+            schema="schema",
+        )
+        transport = CortexTransport(backend)
+        assert transport.config is backend
+        assert transport._prefix == "http://mock/api/v2/databases/db/schemas/schema/cortex-training"
+        assert transport.jobs == JobHandles()
+        assert transport.job_id is None
+
+    def test_parent_id_normalizes_sub_job_tokens(self):
+        """Cluster routes can address a parent from either parent or sub-job IDs."""
+        pytest.importorskip("tenacity")
+        from arctic_platform.client.transports.cortex import _parent_id
+
+        assert _parent_id("job-1") == "job-1"
+        assert _parent_id("job-1:training:0") == "job-1"
+        assert _parent_id(42) == "42"
+
+
 class TestCortexTransportNoopOps:
     """``wake_*`` / ``sleep_*`` short-circuit in the Cortex transport so the
     shim doesn't have to wrap each call — including the ones ``sync_weights``
@@ -553,7 +654,7 @@ class TestCortexTransportNoopOps:
         from arctic_platform.client.transports.cortex import CortexTransport
 
         cfg = ArcticClientConfig(model_name="m", backend=CortexConfig(), training_gpus=1, sampling_gpus=1)
-        t = CortexTransport(cfg)
+        t = CortexTransport(cfg.backend)
         # Would normally raise NotImplementedError on the transport; the noop
         # short-circuit means the shim never has to guard these calls.
         assert t.call(Request("wake-inference", 1, None)) == {}
@@ -571,8 +672,7 @@ class TestCortexCancelToleratesEmptyBody:
         from arctic_platform.client import CortexConfig
         from arctic_platform.client.transports.cortex import CortexTransport
 
-        cfg = ArcticClientConfig(model_name="m", backend=CortexConfig(), training_gpus=1, sampling_gpus=1)
-        t = CortexTransport(cfg)
+        t = CortexTransport(CortexConfig())
 
         class _EmptyResp:
             status_code = 200
