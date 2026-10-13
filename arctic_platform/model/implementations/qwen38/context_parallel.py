@@ -30,6 +30,7 @@ from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_po
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import build_gated_delta_net_cp_context
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from arctic_platform.model.implementations.moe.vlm import get_language_model
+from arctic_platform.model.implementations.qwen38.qsa_flex import _normalize_packed_cu_seqlens
 
 # Keep asynchronous EP backward from overtaking FLA collectives on other ranks.
 os.environ.setdefault("ARCTIC_UCCLEP_BACKWARD_BARRIER", "1")
@@ -248,9 +249,16 @@ def _wrap_backbone_forward(backbone: nn.Module, linear_modules: list[nn.Module],
         if not torch.is_tensor(position_ids):
             raise ValueError("Qwen3.8 context parallelism requires position_ids")
         local_positions = _text_position_ids(position_ids)
-        gathered = [torch.empty_like(local_positions) for _ in range(world_size)]
-        dist.all_gather(gathered, local_positions.contiguous(), group=process_group)
-        global_cu_seqlens = cu_seqlens_from_position_ids(torch.cat(gathered, dim=1))
+        global_cu_seqlens = kwargs.get("cu_seq_lens_q")
+        if global_cu_seqlens is None:
+            gathered = [torch.empty_like(local_positions) for _ in range(world_size)]
+            dist.all_gather(gathered, local_positions.contiguous(), group=process_group)
+            global_cu_seqlens = cu_seqlens_from_position_ids(torch.cat(gathered, dim=1))
+        global_cu_seqlens = _normalize_packed_cu_seqlens(
+            global_cu_seqlens,
+            sequence_length=local_positions.shape[-1] * world_size,
+            device=local_positions.device,
+        )
         cp_context = build_gated_delta_net_cp_context(
             local_sequence_length=local_positions.shape[-1],
             device=local_positions.device,
