@@ -93,10 +93,17 @@ class TestPeftConfig(TestCasePlus):
         self.assertTrue(training["use_liger"])
         self.assertNotIn("model_provider", training)
 
+        legacy = ArcticClientConfig(
+            model_name="unused",
+            training_gpus=1,
+            training=TrainingConfig(ds_worker_config={"model_provider": "prime_rl", "ep_size": 4}),
+        )
+        training = legacy._cortex_training_sub_job()["training_config"]
+        self.assertEqual(training["model_provider"], "arctic")
+
     def test_cortex_rejects_retired_model_providers(self):
         cases = (
             ("liger", "use_liger=true"),
-            ("prime_rl", "renamed to 'arctic'"),
             ("transformers", "must be 'huggingface' or 'arctic'"),
         )
         for provider, message in cases:

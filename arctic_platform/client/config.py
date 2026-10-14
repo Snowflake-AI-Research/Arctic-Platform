@@ -338,7 +338,7 @@ class ArcticClientConfig(BaseModel):
                 "Set use_liger=true to apply Liger kernels on a huggingface model."
             )
         if provider == "prime_rl":
-            raise ValueError("ds_worker_config.model_provider='prime_rl' was renamed to 'arctic'.")
+            provider = "arctic"
         if provider and provider not in {"huggingface", "arctic"}:
             raise ValueError(f"ds_worker_config.model_provider must be 'huggingface' or 'arctic', got {provider!r}.")
         if worker.get("use_liger") and provider == "arctic":
