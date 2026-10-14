@@ -124,11 +124,6 @@ def apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None
 
     backbone = get_language_model(model)
     model_type = getattr(backbone.config, "model_type", None)
-    if model_type == "nemotron_h":
-        raise NotImplementedError(
-            "Nemotron H needs Mamba context parallelism in addition to Ulysses attention; "
-            "generic sequence parallelism is unsafe."
-        )
     if getattr(backbone.config, "_attn_implementation", None) not in _FA_IMPLS:
         raise ValueError("generic MoE sequence parallelism requires flash_attention_2, _3, or _4")
 
@@ -138,6 +133,8 @@ def apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None
 
     softmax_attn_modules = []
     linear_attn_modules = []
+    mamba_layers = []
+    cp_rank = dist.get_rank(sp_group) if model_type == "nemotron_h" else None
     for layer in backbone.layers:
         layer_type = getattr(layer, "layer_type", None) or getattr(layer, "attention_type", None)
         if layer_type == "linear_attention" and hasattr(layer, "linear_attn"):
@@ -150,7 +147,12 @@ def apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None
             self_attn._sp_world_size = sp_world_size
             self_attn.forward = types.MethodType(_ulysses_attn_forward, self_attn)
             softmax_attn_modules.append(self_attn)
+        elif model_type == "nemotron_h" and hasattr(layer, "set_context_parallel_attributes"):
+            layer.set_context_parallel_attributes(sp_group, cp_rank, sp_world_size)
+            mamba_layers.append(layer)
 
+    if model_type == "nemotron_h" and not mamba_layers:
+        raise TypeError(f"{type(backbone).__name__} exposes no Mamba layers for context parallelism")
     if not softmax_attn_modules and not linear_attn_modules:
         raise TypeError(f"{type(backbone).__name__} exposes no supported sequence-parallel attention layers")
 
@@ -165,8 +167,9 @@ def apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None
     )
 
     get_logger().info(
-        "Applied generic MoE SP (sp_size=%d): wrapped %d softmax-attention and %d linear-attention layers",
+        "Applied generic MoE SP (sp_size=%d): wrapped %d softmax-attention, %d linear-attention, and %d Mamba layers",
         sp_world_size,
         len(softmax_attn_modules),
         len(linear_attn_modules),
+        len(mamba_layers),
     )

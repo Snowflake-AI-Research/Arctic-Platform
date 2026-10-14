@@ -58,11 +58,39 @@ def test_generic_sequence_parallel_wraps_softmax_attention(monkeypatch, layer_ty
     assert attention._sp_group is not None
 
 
-def test_generic_sequence_parallel_rejects_nemotron(monkeypatch):
+class _MambaLayer(nn.Module):
+    def set_context_parallel_attributes(self, cp_group, cp_rank, cp_world_size):
+        self.cp_group = cp_group
+        self.cp_rank = cp_rank
+        self.cp_world_size = cp_world_size
+
+
+def test_generic_sequence_parallel_wires_nemotron_mamba(monkeypatch):
+    backbone = _Backbone("nemotron_h", [None])
+    mamba = _MambaLayer()
+    backbone.layers.insert(0, mamba)
+    group = object()
+    monkeypatch.setattr(sequence_parallel, "get_language_model", lambda model: model)
+    monkeypatch.setattr(sequence_parallel.dist, "get_world_size", lambda group: 8)
+    monkeypatch.setattr(sequence_parallel.dist, "get_rank", lambda group: 3)
+
+    sequence_parallel.apply_sequence_parallelism(backbone, 8, group)
+
+    assert mamba.cp_group is group
+    assert mamba.cp_rank == 3
+    assert mamba.cp_world_size == 8
+    attention = backbone.layers[1].self_attn
+    assert attention._sp_group is group
+    assert attention._sp_world_size == 8
+
+
+def test_generic_sequence_parallel_requires_nemotron_mamba_layers(monkeypatch):
     backbone = _Backbone("nemotron_h", [None])
     monkeypatch.setattr(sequence_parallel, "get_language_model", lambda model: model)
+    monkeypatch.setattr(sequence_parallel.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(sequence_parallel.dist, "get_rank", lambda group: 0)
 
-    with pytest.raises(NotImplementedError, match="Mamba context parallelism"):
+    with pytest.raises(TypeError, match="no Mamba layers"):
         sequence_parallel.apply_sequence_parallelism(backbone, 2, object())
 
 
