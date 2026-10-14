@@ -257,7 +257,8 @@ class TestHuggingFaceLoader:
         with pytest.raises(ValueError, match="requires parallel_groups"):
             load_huggingface(LoaderContext(spec=spec))
 
-    def test_loader_applies_required_sequence_parallel_setup(self, monkeypatch):
+    @pytest.mark.parametrize(("loader_options", "fp32_beta"), [({}, True), ({"fp32_parity": False}, False)])
+    def test_loader_applies_required_sequence_parallel_setup(self, monkeypatch, loader_options, fp32_beta):
         from arctic_platform.model import ParallelismConfig
         from arctic_platform.model.loaders.huggingface import load_huggingface
 
@@ -267,19 +268,29 @@ class TestHuggingFaceLoader:
         monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
         monkeypatch.setattr(
             "arctic_platform.model.implementations.gpu.sp.transformers.apply_gated_delta_net_sequence_parallelism",
-            lambda configured_model, group: configured.append((configured_model, group)) or 0,
+            lambda configured_model, group, *, fp32_beta: configured.append((configured_model, group, fp32_beta)) or 0,
         )
         spec = ModelSpec(
             model_path_or_name="qwen",
             loader="huggingface",
             parallelism=ParallelismConfig(sequence_parallel=2),
+            loader_options=loader_options,
         )
         group = object()
 
         load_huggingface(LoaderContext(spec=spec, parallel_groups={"sp_group": group}))
 
         assert model.config.use_cache is False
-        assert configured == [(model, group)]
+        # The loader's fp32_parity option decides the beta gate of the GatedDeltaNet layers the wrapper adapts.
+        assert configured == [(model, group, fp32_beta)]
+
+    def test_loader_options_default_and_reject_unknown_keys(self):
+        from pydantic import ValidationError
+
+        spec = ModelSpec(model_path_or_name="qwen", loader="huggingface")
+        assert spec.loader_options == {"fp32_parity": True}
+        with pytest.raises(ValidationError, match="not_an_option"):
+            ModelSpec(model_path_or_name="qwen", loader="huggingface", loader_options={"not_an_option": 1})
 
 
 class TestFromDsWorkerConfig:

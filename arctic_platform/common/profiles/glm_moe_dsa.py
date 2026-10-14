@@ -48,7 +48,7 @@ def register(registry: Registry) -> None:
             "numerics.optimization_dtype",
         ],
         unsupported={
-            "numerics.fp32_parity": "the option exists only in the Qwen3.5-MoE implementation",
+            "numerics.fp32_parity": "this loader has no fp32_parity option; qwen3_5_moe and huggingface have one",
             "lm_head.vocab_chunk_size": "no equivalent option",
             "liger": "the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead",
             "compile.fullgraph": "the loader rejects `patches.compile`",

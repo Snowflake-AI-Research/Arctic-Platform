@@ -66,7 +66,7 @@ each loader's own validation. The reasons follow the table.
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
-- `numerics.fp32_parity` (no): the option exists only in the Qwen3.5-MoE implementation
+- `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
@@ -79,7 +79,7 @@ Extends `generic_moe`.
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
-- `numerics.fp32_parity` (no): the option exists only in the Qwen3.5-MoE implementation
+- `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
@@ -90,7 +90,7 @@ Extends `generic_moe`.
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
-- `numerics.fp32_parity` (no): the option exists only in the Qwen3.5-MoE implementation
+- `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
@@ -106,7 +106,7 @@ Extends `generic_moe`.
 - `moe.comm_sms` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.comm_token_chunk` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.grouped_mm` (n/a): the huggingface loader rejects expert parallelism and has no expert options
-- `numerics.fp32_parity` (no): only the custom Qwen3.5-MoE model, loaded by qwen3_5_moe with expert parallelism above 1, has this option
+- `numerics.fp32_parity` (no): the loader's fp32_parity option sets only the beta gate of the GatedDeltaNet layers adapted for sequence parallelism, not the residual adds or the rotary embedding
 - `numerics.optimization_dtype` (no): the key has no effect on this route: the job sets the model dtype, not this key
 - `numerics.reduce_dtype` (no): no equivalent option
 
@@ -131,6 +131,6 @@ Extends `generic_moe`.
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
-- `numerics.fp32_parity` (no): the option exists only in the Qwen3.5-MoE implementation
+- `numerics.fp32_parity` (no): this loader has no fp32_parity option; qwen3_5_moe and huggingface have one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
