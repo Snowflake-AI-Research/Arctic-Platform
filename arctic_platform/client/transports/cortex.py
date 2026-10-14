@@ -28,6 +28,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,8 @@ from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
+
+logger = logging.getLogger(__name__)
 
 _MAX_OCTET_BYTES = 60 * 1024 * 1024  # matches the SnowAPI per-request cap
 # HTTP statuses worth retrying: the request was well-formed, so the same call may
@@ -349,6 +352,7 @@ class CortexTransport(Transport):
                 json=job_create_payload(client_config.to_cortex(), self.config.job_comment),
             )
             self.job_id = created["job_id"]
+            logger.info("Created Cortex job %s; waiting for placement", self.job_id)
         # The id has to be on disk before the placement wait. A driver that dies
         # during that wait otherwise leaves the GPUs with no id to cancel.
         record_job_id(self.config.job_id_file, self.job_id)

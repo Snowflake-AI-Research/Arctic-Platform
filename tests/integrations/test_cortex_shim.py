@@ -33,10 +33,10 @@ def test_vllm_length_wins_over_the_training_fallback():
     assert legacy_max_seq_len(legacy) == 40960
 
 
-def test_gsm8k_sized_length_keeps_the_8192_default():
+def test_a_shorter_length_is_forwarded():
     # SkyRL writes max_model_len = prompt + response for every recipe. GSM8K is 1536.
     legacy = SimpleNamespace(vllm_config=dict(max_model_len=1536), training_config=dict(max_length=1536))
-    assert legacy_max_seq_len(legacy) is None
+    assert legacy_max_seq_len(legacy) == 1536
 
 
 def test_unified_config_carries_a_longer_sequence_length(monkeypatch):
@@ -51,17 +51,18 @@ def test_unified_config_without_a_length_stays_at_8192(monkeypatch):
     assert _to_unified_config(legacy).max_seq_len == 8192
 
 
-def test_unified_config_keeps_8192_for_a_shorter_vllm_length(monkeypatch):
+def test_unified_config_carries_a_shorter_vllm_length(monkeypatch):
     monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://example.invalid")
     legacy = ArcticRLClientConfig(model_name="Qwen/Qwen3-0.6B", training_gpus=1, vllm_config=dict(max_model_len=1536))
-    assert _to_unified_config(legacy).max_seq_len == 8192
+    assert _to_unified_config(legacy).max_seq_len == 1536
 
 
-def test_skyrl_comm_protocol_is_kept():
-    # SkyRL's build_rl_config passes comm_protocol="ray". Dropping it makes the
-    # documented GSM8K entrypoint raise AttributeError before training starts.
+def test_skyrl_can_read_comm_protocol():
+    # SkyRL's build_rl_config still passes comm_protocol="ray", and its entrypoint
+    # reads it back. Without the attribute that read raises AttributeError.
     legacy = ArcticRLClientConfig(model_name="Qwen/Qwen3-0.6B", training_gpus=1, comm_protocol="ray")
     assert legacy.comm_protocol == "ray"
+    assert "comm_protocol" not in legacy.model_dump()
 
 
 def test_placement_timeout_grows_only_past_the_client_default():

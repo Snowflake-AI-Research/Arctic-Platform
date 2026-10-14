@@ -63,13 +63,6 @@ class ArcticRLClientConfig(BaseModel):
     log_prob_engine: Literal["vllm", "deepspeed"] = Field(
         default="vllm", description="Engine backend for the log-prob job."
     )
-    comm_protocol: Literal["http", "ray"] = Field(
-        default="http",
-        description=(
-            "SkyRL sets this to ray and then reads it back to decide whether to pass in-process server state. "
-            "Cortex has no Ray server; the shim's get_server_state returns None."
-        ),
-    )
     colocate: bool = Field(
         default=False,
         description=(
@@ -114,6 +107,15 @@ class ArcticRLClientConfig(BaseModel):
                 "Local backend requires at least one of training_gpus / sampling_gpus / log_prob_gpus > 0."
             )
         return self
+
+    @property
+    def comm_protocol(self) -> str:
+        """SkyRL's Arctic entrypoint reads this to decide whether to fetch server state.
+
+        Ray is the only on-prem transport. On Cortex the client's ``get_server_state``
+        returns ``None``, so the answer does not change what SkyRL passes along.
+        """
+        return "ray"
 
 
 class WeightSyncConfig(BaseModel):
