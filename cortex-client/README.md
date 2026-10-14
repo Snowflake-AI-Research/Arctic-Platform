@@ -171,8 +171,7 @@ dss-neutrino submit examples/sampling.json
 ```
 
 That file creates a training sub-job for `Qwen/Qwen3.6-35B-A3B` with
-expert parallelism. Dense models run on Hugging Face and MoE models run on
-the Arctic stack.
+`training_config.model_provider` set to `prime_rl`.
 
 #### Debug options (internal only)
 

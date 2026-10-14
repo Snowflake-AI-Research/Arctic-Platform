@@ -112,14 +112,14 @@ python -m recipes.sft.standalone.sft_loop config=recipes/config.json \
 
 ### MoE / expert parallelism (`ep_size`)
 
-MoE checkpoints like `Qwen/Qwen3.6-35B-A3B` run on the Arctic stack. Set
-`ep_size` so that `n_gpus` is a multiple of `ep_size` (e.g. 8 GPUs with
-`ep_size=4`):
+MoE checkpoints like `Qwen/Qwen3.6-35B-A3B` need Prime-RL plus expert
+parallelism for full fine-tuning. Set `model_provider=prime_rl` and `ep_size` so
+that `n_gpus` is a multiple of `ep_size` (e.g. 8 GPUs with `ep_size=4`):
 
 ```bash
 python -m recipes.sft.standalone.sft_loop config=recipes/config.json \
     model_name=Qwen/Qwen3.6-35B-A3B \
-    ep_size=4 \
+    model_provider=prime_rl ep_size=4 \
     n_gpus=8 lora_rank=0
 ```
 

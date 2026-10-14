@@ -283,6 +283,7 @@ def job_body(config: Config) -> dict:
         )
 
     training_config: dict = {
+        "model_provider": "huggingface",
         "n_gpus": config.training_gpus,
         "max_seq_len": config.max_seq_len,
         "train_batch_size": config.train_batch_size,

@@ -1178,7 +1178,7 @@ resized; a `true`/default resume against a different DP/world size fails fast
 with an actionable error. `None` (omitted) uses the server default (`true`).
 
 `extra_training` is merged as open passthrough data, without overriding typed
-keys. Examples include `use_liger`, `ep_size`, `ds_config`,
+keys. Examples include `model_provider`, `ep_size`, `ds_config`,
 `activation_checkpointing`, `prime_rl`, `router_replay`, `peft_config`, the
 memory-diagnostics settings in [section 8.5](#85-memory-diagnostics-settings),
 and these newer long-context/memory knobs:

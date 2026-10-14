@@ -87,24 +87,6 @@ class TestPeftConfig(TestCasePlus):
         self.assertEqual(subs["training"]["training_config"]["peft_config"], peft)
         self.assertEqual(subs["sampling"]["inference_config"]["peft_config"], peft)
 
-    def test_cortex_forwards_use_liger_and_rejects_model_provider(self):
-        config = ArcticClientConfig(
-            model_name="unused",
-            training_gpus=1,
-            training=TrainingConfig(ds_worker_config={"use_liger": True, "attn_implementation": "eager"}),
-            backend=CortexConfig(base_url="http://localhost"),
-        )
-        training = config.to_cortex()[0]["training_config"]
-        self.assertTrue(training["use_liger"])
-        self.assertNotIn("model_provider", training)
-        with self.assertRaisesRegex(ValueError, "model_provider is not accepted"):
-            ArcticClientConfig(
-                model_name="unused",
-                training_gpus=1,
-                training=TrainingConfig(ds_worker_config={"model_provider": "huggingface"}),
-                backend=CortexConfig(base_url="http://localhost"),
-            ).to_cortex()
-
     def test_onprem_sync_cannot_fall_back_to_full_weights(self):
         config = ArcticClientConfig(model_name="unused", training=TrainingConfig(peft={"peft_type": "LORA"}))
         for weight_format in (None, "lora"):
