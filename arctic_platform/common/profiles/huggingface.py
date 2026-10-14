@@ -13,10 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Profile of the default ``huggingface`` loader: options are ``Patches`` and ``ModelSpec`` fields.
+"""Profile of the default ``huggingface`` loader.
+
+Its options are ``Patches`` and ``ModelSpec`` fields, and the loader's own ``loader_options.fp32_parity``.
 
 The loader reads ``ModelSpec.dtype`` too, but ``numerics.optimization_dtype`` is unsupported here: on this route
 the job sets that dtype, and the key would have no effect.
+
+``loader_options.fp32_parity`` is on by default. It changes the rounding of the dense Qwen3.5 family (transformers
+``Qwen3_5TextModel``). Other models load unchanged, except that with sequence parallelism the beta gate of any
+GatedDeltaNet layer the sequence-parallel wrapper adapts follows it. Its fused residual-add norm reads each norm's
+weight instead of calling the norm, so with ``patches.liger`` only the first layer's input norm, of the decoder-layer
+and final norms, runs Liger's RMSNorm kernel. ``numerics.fp32_parity`` stays unsupported here because the job
+server does not pass a ``model_options`` value on to that loader option yet, so a request to turn it off would have
+no effect.
 """
 
 from __future__ import annotations
@@ -56,8 +66,8 @@ def register(registry: Registry) -> None:
                 "the key has no effect on this route: the job sets the model dtype, not this key"
             ),
             "numerics.fp32_parity": (
-                "the loader's fp32_parity option sets only the beta gate of the GatedDeltaNet layers adapted for "
-                "sequence parallelism, not the residual adds or the rotary embedding"
+                "the loader option fp32_parity exists and is on by default for the stock dense Qwen3.5 family, but no "
+                "model_options key reaches it on this route yet: the job server does not pass the value on"
             ),
         },
         not_applicable={
