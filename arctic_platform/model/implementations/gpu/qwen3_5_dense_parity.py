@@ -80,6 +80,8 @@ _STOCK_SOURCE_SHA256: dict[str, str] = {
 
 _PATCHED_ATTRIBUTE = "_arctic_fp32_parity"
 _BETA_HOOK_ATTRIBUTE = "_arctic_fp32_parity_beta_hook"
+# Each norm's epsilon, resolved when the patch is applied so that the forward reads a plain attribute.
+_NORM_EPSILON_ATTRIBUTE = "_arctic_fp32_parity_norm_epsilon"
 
 
 def _digest(source: str) -> str:
@@ -185,6 +187,14 @@ def _norm_epsilon(norm: nn.Module) -> float | None:
     return None
 
 
+def _norms(text_model: nn.Module) -> list[nn.Module]:
+    """The norms the patched forwards fuse with a residual add: every decoder layer's two norms and the final one."""
+    norms = [text_model.norm]
+    for layer in text_model.layers:
+        norms.extend([layer.input_layernorm, layer.post_attention_layernorm])
+    return norms
+
+
 def _check_text_model(text_model: nn.Module) -> None:
     """Check the code ``text_model``'s own modules run, and that every norm is a (1 + weight) RMSNorm."""
     layers = list(text_model.layers)
@@ -204,10 +214,7 @@ def _check_text_model(text_model: nn.Module) -> None:
                 _check_functions(
                     _class_functions(type(text_model), layer_class, attention_class, gated_delta_net_class)
                 )
-    norms = [text_model.norm]
-    for layer in layers:
-        norms.extend([layer.input_layernorm, layer.post_attention_layernorm])
-    unrecognized = sorted({type(norm).__qualname__ for norm in norms if _norm_epsilon(norm) is None})
+    unrecognized = sorted({type(norm).__qualname__ for norm in _norms(text_model) if _norm_epsilon(norm) is None})
     if len(unrecognized) > 0:
         _fail(f"its norms of type {', '.join(unrecognized)} are not a (1 + weight) RMSNorm it recognizes")
 
@@ -215,9 +222,10 @@ def _check_text_model(text_model: nn.Module) -> None:
 def _fused_add_rms_norm(norm: nn.Module, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Add ``residual`` to ``x`` in fp32 and apply ``norm``'s (1 + weight) RMSNorm to the fp32 sum.
 
-    Returns the normalized value and the sum, both in ``x``'s dtype; the sum is the next residual.
+    Returns the normalized value and the sum, both in ``x``'s dtype; the sum is the next residual. The epsilon is the
+    one ``apply_fp32_parity`` resolved, so the forward runs no source inspection and can be compiled as one graph.
     """
-    return FusedAddRMSNorm.apply(x, residual, norm.weight, _norm_epsilon(norm))
+    return FusedAddRMSNorm.apply(x, residual, norm.weight, getattr(norm, _NORM_EPSILON_ATTRIBUTE))
 
 
 def _apply_rotary_pos_emb_fp32(q, k, cos, sin, unsqueeze_dim=1):
@@ -399,6 +407,8 @@ def apply_fp32_parity(model: nn.Module, *, sequence_parallel: bool) -> int:
         _check_text_model(text_model)
     text_model_forward = _text_model_forward()
     for text_model in text_models:
+        for norm in _norms(text_model):
+            setattr(norm, _NORM_EPSILON_ATTRIBUTE, _norm_epsilon(norm))
         for layer in text_model.layers:
             layer.forward = types.MethodType(_decoder_layer_forward, layer)
             if layer.block_type == "full_attention":
@@ -418,6 +428,8 @@ def remove_fp32_parity(model: nn.Module) -> int:
     for text_model in _text_models(model):
         if not getattr(text_model, _PATCHED_ATTRIBUTE, False):
             continue
+        for norm in _norms(text_model):
+            norm.__dict__.pop(_NORM_EPSILON_ATTRIBUTE, None)
         for layer in text_model.layers:
             layer.__dict__.pop("forward", None)
             if layer.block_type == "full_attention":
