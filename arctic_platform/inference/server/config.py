@@ -56,6 +56,13 @@ class ModelConfig(BaseModel):
     # is a serving-layer concept, not an AsyncEngineArgs field, so the worker
     # pops it before building the engine.
     reasoning_parser: str | None = None
+    # Chat-mode overrides of chat.CHAT_MODELS, which picks parsers by
+    # architecture. tool_call_parser is vllm serve's --tool-call-parser.
+    # chat_reasoning_parser applies to chat streams only, so /generate keeps
+    # reasoning_parser; an engine that already has a reasoner must name the
+    # same one. Either field enables chat on an architecture not listed there.
+    tool_call_parser: str | None = None
+    chat_reasoning_parser: str | None = None
     # When true, include parsed `reasoning` / `content` fields in generate
     # responses. The parser may still be used internally when this is false.
     return_reasoning_content: bool = False

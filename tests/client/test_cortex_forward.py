@@ -44,7 +44,6 @@ import pytest
 import torch
 
 from arctic_platform import wire
-from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import JobHandles
 from arctic_platform.client.requests import fwd_bwd_request
@@ -66,7 +65,7 @@ class FakeSend:
         self.posts: list[dict] = []
         self.result = result
 
-    def __call__(self, method: str, url: str, *, retry_on=None, **kwargs):
+    async def __call__(self, method: str, url: str, *, retry_on=None, **kwargs):
         if method == "GET":
             return {"status": "REQUEST_STATE_DONE", "result": self.result}
         self.posts.append({"url": url, **kwargs})
@@ -92,13 +91,7 @@ class FakeSend:
 
 
 def _transport(result: dict | None = None) -> tuple[CortexTransport, FakeSend]:
-    config = ArcticClientConfig(
-        model_name="m",
-        backend=CortexConfig(base_url="http://gs.test"),
-        training_gpus=1,
-        log_prob_gpus=1,
-    )
-    transport = CortexTransport(config)
+    transport = CortexTransport(CortexConfig(base_url="http://gs.test"))
     transport.job_id = JOB
     transport.jobs = JobHandles(training=TRAINING, log_prob=LOG_PROB)
     send = FakeSend(result or {})
@@ -185,7 +178,11 @@ class TestForwardWire:
     def test_missing_request_id_on_the_last_chunk_is_an_error(self):
         """Only the final chunk starts execution; without its id there is nothing to poll."""
         transport, send = _transport()
-        transport._send = lambda *a, **kw: {"status": "chunk_cached"}  # type: ignore[method-assign]
+
+        async def cached(*args, **kwargs):
+            return {"status": "chunk_cached"}
+
+        transport._send = cached  # type: ignore[method-assign]
 
         with pytest.raises(RuntimeError, match="carried no request_id"):
             transport.call(fwd_no_grad_request(transport.jobs, _batch()))
