@@ -15,6 +15,8 @@ include = [
   "arctic_platform/integrations/verl/config/**/*.yaml",
   "arctic_platform/integrations/verl/examples/*.sh",
   "arctic_platform/integrations/verl/README.md",
+  "arctic_platform/integrations/prime_rl/examples/**/*.toml",
+  "arctic_platform/integrations/prime_rl/README.md",
 ]
 # Kept beside the inference package and left out of the wheel. Trailing
 # slashes make hatchling skip the directories. csrc/, setup.py, and
@@ -86,6 +88,7 @@ all = [
     "arctic_platform[cortex]",
     "arctic_platform[onprem]",
     "arctic_platform[verl]",
+    "arctic_platform[prime-rl]",
 ]
 
 dev = [
@@ -181,6 +184,17 @@ verl = [
     "arctic_platform[rl]",
     "codetiming",
     "omegaconf",
+]
+
+# prime-rl launcher (arctic_platform/integrations/prime_rl). prime-rl itself and its
+# verifiers runtime are user-supplied and version-pinned in launchers (see that package's
+# README); here we only carry the Cortex client stack plus the few libraries the launcher
+# and worker need beyond [cortex]. The worker trains on Cortex, so no local vLLM/DeepSpeed.
+prime-rl = [
+    "arctic_platform[cortex]",
+    "httpx",
+    "huggingface-hub",
+    "orjson",
 ]
 
 [tool.pytest.ini_options]

@@ -1,0 +1,72 @@
+# prime-rl on Snowflake Cortex
+
+Train and serve a [PrimeIntellect prime-rl](https://github.com/PrimeIntellect-ai/prime-rl)
+RL run on Snowflake Cortex, with **no fork of prime-rl**. This is the prime-rl analogue of
+the `verl` adapter: prime-rl is user-supplied and version-pinned by the launcher, and this
+package drives it from the outside.
+
+prime-rl has no in-process plugin hook, so this is a **launcher**, not a registered backend.
+`rl.py` reuses an unmodified prime-rl install — its `orchestrator` and `env-server` run as
+subprocesses exactly as under prime-rl's own `rl` entrypoint — while the Cortex **worker**
+(`worker.py`) stands in for both the trainer and the vLLM-shaped inference server: it serves
+`/inference/v1/generate` + `/v1/chat/completions` + the admin routes to the orchestrator, and
+on the training side it runs one forward-backward + optimizer step + weight sync per policy
+version on the Cortex **training** sub-job, generating rollouts on the Cortex **sampling**
+sub-job. Everything crosses the wire through `arctic_platform.client`.
+
+## Install
+
+```bash
+# 1. The integration (this package) + Cortex client stack.
+pip install "arctic-platform[prime-rl]"
+
+# 2. prime-rl, user-supplied and pinned (brings its own verifiers / renderers / configs).
+#    Follow prime-rl's install for its torch/vLLM closure; the pin below is what this
+#    integration targets:
+PRIME_RL=84e94bf05c29d73e293341b24f6eda2b15bbc900   # v0.9.1.dev234
+pip install "prime-rl @ git+https://github.com/PrimeIntellect-ai/prime-rl@${PRIME_RL}"
+```
+
+`prime-rl` and its `verifiers` runtime are **not** dependencies of the `[prime-rl]` extra
+(the same contract `[verl]` uses for verl): prime-rl's dependency closure — `prime-rl-configs`,
+`verifiers`, `renderers`, `prime-pydantic-config`, and the torch/vLLM indexes — is wired by
+prime-rl's own `[tool.uv.sources]`/workspace, which does not travel with a plain dependency
+pin, so install prime-rl from its repo rather than relying on this extra to pull it.
+
+Pins this integration targets:
+
+| component | pin | source |
+|---|---|---|
+| prime-rl | `84e94bf05c` (v0.9.1.dev234) | `PrimeIntellect-ai/prime-rl` |
+| verifiers | `da75527ca` (brought by prime-rl) | `PrimeIntellect-ai/verifiers` |
+
+The reused prime-rl surface (`entrypoints.rl` config plumbing, `transports.batch.MicroBatch`,
+`transports.weights.base` markers, `utils.pathing`) is internal to prime-rl; bump the pin
+deliberately and re-run the dry run below after any bump.
+
+## Run
+
+```bash
+# Math (stock subprocess runtime, no sandbox):
+python -m arctic_platform.integrations.prime_rl.rl \
+  @ arctic_platform/integrations/prime_rl/examples/qwen3.6-35b-a3b/math.toml
+
+# SWE (sandbox via PrimeIntellect's sandbox service — verifiers' default `prime` runtime):
+python -m arctic_platform.integrations.prime_rl.rl \
+  @ arctic_platform/integrations/prime_rl/examples/qwen3.6-35b-a3b/swe.toml
+
+# Resolve-only, writes cortex_job_body.json and exits:
+python -m arctic_platform.integrations.prime_rl.rl @ <recipe>.toml --dry-run
+```
+
+Cortex credentials come from `ARCTIC_CORTEX_*` (host, database, schema, PAT), read by
+`CortexConnectionConfig`. The recipes serve `Qwen/Qwen3.6-35B-A3B` from the Cortex model
+catalog, at half the scale of the upstream `qwen3-30b-a3b` recipes (batch 256, 512 in-flight,
+one 8-GPU training sub-job + one 8-GPU sampling sub-job).
+
+## Sandboxes
+
+The SWE recipes use PrimeIntellect's sandbox service — verifiers' default `prime` runtime —
+so an external user reproduces SWE with PrimeIntellect's own sandbox. Point
+`env.agent.runtime.*` at any other verifiers runtime (`docker`, `e2b`, `modal`, …) to use a
+different sandbox backend.
