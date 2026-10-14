@@ -29,7 +29,14 @@ def test_comment_and_id_file_read_from_the_cortex_env(monkeypatch, tmp_path):
     assert config.job_id_file == str(tmp_path / "cortex_job_id")
 
 
+def test_launcher_comment_name_is_read(monkeypatch):
+    monkeypatch.delenv("ARCTIC_CORTEX_JOB_COMMENT", raising=False)
+    monkeypatch.setenv("CORTEX_JOB_COMMENT", "karthik r2e-gym")
+    assert CortexConfig(base_url="http://localhost:1").job_comment == "karthik r2e-gym"
+
+
 def test_empty_comment_env_is_unset(monkeypatch):
+    monkeypatch.delenv("CORTEX_JOB_COMMENT", raising=False)
     monkeypatch.setenv("ARCTIC_CORTEX_JOB_COMMENT", "")
     monkeypatch.delenv("ARCTIC_CORTEX_JOB_ID_FILE", raising=False)
     config = CortexConfig(base_url="http://localhost:1")

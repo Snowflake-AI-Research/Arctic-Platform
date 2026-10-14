@@ -30,6 +30,7 @@ from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_po
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import build_gated_delta_net_cp_context
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from arctic_platform.model.implementations.moe.vlm import get_language_model
+from arctic_platform.model.implementations.qwen38.qsa_flex import _normalize_packed_cu_seqlens
 
 # Keep asynchronous EP backward from overtaking FLA collectives on other ranks.
 os.environ.setdefault("ARCTIC_UCCLEP_BACKWARD_BARRIER", "1")
@@ -174,7 +175,7 @@ def _adapt_ple_layer(module: nn.Module, process_group) -> None:
     embedding_forward = embedding.forward
     context_length = int(embedding.context_len)
 
-    def embedding_cp_forward(self, input_ids, past_key_values):
+    def embedding_cp_forward(self, input_ids, past_key_values, position_ids=None):
         if past_key_values is not None:
             raise RuntimeError("Qwen3.8 context-parallel PLE is a training-only path")
         previous = _previous_rank_context(
@@ -185,14 +186,23 @@ def _adapt_ple_layer(module: nn.Module, process_group) -> None:
             differentiable=False,
         )
         extended = torch.cat([previous, input_ids], dim=1)
-        return embedding_forward(extended, None)[:, context_length:]
+        if position_ids is not None:
+            previous_positions = _previous_rank_context(
+                position_ids,
+                context_length,
+                process_group=process_group,
+                pad_value=-1,
+                differentiable=False,
+            )
+            position_ids = torch.cat([previous_positions, position_ids], dim=1)
+        return embedding_forward(extended, None, position_ids=position_ids)[:, context_length:]
 
     embedding.forward = types.MethodType(embedding_cp_forward, embedding)
 
     short_conv = module._short_conv
     conv_context_length = int(module.short_conv_state_len)
 
-    def short_conv_cp_forward(self, hidden_states, past_key_values):
+    def short_conv_cp_forward(self, hidden_states, past_key_values, position_ids=None):
         if past_key_values is not None:
             raise RuntimeError("Qwen3.8 context-parallel PLE is a training-only path")
         previous = _previous_rank_context(
@@ -203,7 +213,16 @@ def _adapt_ple_layer(module: nn.Module, process_group) -> None:
             differentiable=True,
         )
         extended = torch.cat([previous, hidden_states], dim=1)
-        return short_conv(extended, None)[:, conv_context_length:]
+        if position_ids is not None:
+            previous_positions = _previous_rank_context(
+                position_ids,
+                conv_context_length,
+                process_group=process_group,
+                pad_value=-1,
+                differentiable=False,
+            )
+            position_ids = torch.cat([previous_positions, position_ids], dim=1)
+        return short_conv(extended, None, position_ids=position_ids)[:, conv_context_length:]
 
     module._short_conv = types.MethodType(short_conv_cp_forward, module)
 
@@ -230,9 +249,16 @@ def _wrap_backbone_forward(backbone: nn.Module, linear_modules: list[nn.Module],
         if not torch.is_tensor(position_ids):
             raise ValueError("Qwen3.8 context parallelism requires position_ids")
         local_positions = _text_position_ids(position_ids)
-        gathered = [torch.empty_like(local_positions) for _ in range(world_size)]
-        dist.all_gather(gathered, local_positions.contiguous(), group=process_group)
-        global_cu_seqlens = cu_seqlens_from_position_ids(torch.cat(gathered, dim=1))
+        global_cu_seqlens = kwargs.get("cu_seq_lens_q")
+        if global_cu_seqlens is None:
+            gathered = [torch.empty_like(local_positions) for _ in range(world_size)]
+            dist.all_gather(gathered, local_positions.contiguous(), group=process_group)
+            global_cu_seqlens = cu_seqlens_from_position_ids(torch.cat(gathered, dim=1))
+        global_cu_seqlens = _normalize_packed_cu_seqlens(
+            global_cu_seqlens,
+            sequence_length=local_positions.shape[-1] * world_size,
+            device=local_positions.device,
+        )
         cp_context = build_gated_delta_net_cp_context(
             local_sequence_length=local_positions.shape[-1],
             device=local_positions.device,

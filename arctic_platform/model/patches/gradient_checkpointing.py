@@ -29,15 +29,21 @@ def _text_config(model: nn.Module):
     return get_text_config() if callable(get_text_config) else config
 
 
+def _disable_kv_cache(config) -> None:
+    if config is not None and hasattr(config, "use_cache"):
+        config.use_cache = False
+
+
 @register_patch("gradient_checkpointing")
 def apply_gradient_checkpointing(model: nn.Module, ctx: LoaderContext) -> None:
     value = ctx.spec.patches.gradient_checkpointing
     frequency = 1 if value is True else int(value)
+    root_config = getattr(model, "config", None)
     config = _text_config(model)
     is_qwen3 = getattr(config, "model_type", "") == "qwen3"
-
-    if is_qwen3 and hasattr(config, "use_cache"):
-        config.use_cache = False
+    _disable_kv_cache(root_config)
+    if config is not root_config:
+        _disable_kv_cache(config)
 
     if frequency == 1:
         if is_qwen3:
