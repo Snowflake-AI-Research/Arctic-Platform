@@ -16,70 +16,46 @@
 
 from __future__ import annotations
 
+from pydantic import BaseModel
+from pydantic import ConfigDict
+from pydantic import Field
+from pydantic import field_validator
+
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
 
-_LOADER_OPTION_KEYS_IN_TRAINING = ("fp32_parity", "fp32_residual")
+
+class DenseModelSettings(BaseModel):
+    """Typed dense-model input shared by runtime adapters."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    model_path: str
+    dtype: str = "bfloat16"
+    attn_implementation: str | None = None
+    sequence_parallel: int = 1
+    patches: Patches = Field(default_factory=Patches)
+
+    @field_validator("dtype")
+    @classmethod
+    def _normalize_dtype(cls, value: str) -> str:
+        return {
+            "bf16": "bfloat16",
+            "fp16": "float16",
+            "fp32": "float32",
+        }.get(value.lower(), value.lower())
 
 
-def dense_model_spec(
-    *,
-    model_path: str,
-    dtype: str,
-    attn_implementation: str | None,
-    sequence_parallel: int,
-    liger: bool,
-    training_options: dict,
-    loader_options: dict | None = None,
-) -> ModelSpec:
-    """Translate dense training options into one Hugging Face ``ModelSpec``.
-
-    ``loader_options`` is forwarded whole. The Hugging Face schema validates it;
-    this function does not read its keys. Hugging Face loader fields left in
-    ``training_options`` are rejected so a misplaced key cannot change numerics
-    silently.
-    """
+def dense_model_spec(settings: DenseModelSettings) -> ModelSpec:
+    """Build a Hugging Face ``ModelSpec`` from typed dense settings."""
     import arctic_platform.model.loaders  # noqa: F401  # registers the huggingface loader
 
-    misplaced = [name for name in _LOADER_OPTION_KEYS_IN_TRAINING if name in training_options]
-    if misplaced:
-        raise ValueError(
-            "dense_model_spec takes Hugging Face loader fields only as loader_options, "
-            f"not in training_options; move {', '.join(misplaced)}"
-        )
-
-    offload_config = (training_options.get("ac_config") or {}).get("offload_config") or {}
-    activation_offload = None
-    if offload_config.get("enabled", False):
-        activation_offload = {
-            key: value for key, value in offload_config.items() if key != "enabled" and value is not None
-        }
-    token_chunk_size = training_options.get("fused_lm_head_token_chunk_size")
-    lm_head = None
-    fp32_lm_head = training_options.get("fp32_lm_head", False)
-    if fp32_lm_head or token_chunk_size is not None:
-        lm_head = {
-            "fp32": fp32_lm_head,
-            "token_chunk_size": token_chunk_size,
-            "vocab_chunk_size": training_options["fused_lm_head_vocab_chunk_size"],
-        }
-    tiled_mlp_token_chunk_size = training_options.get("tiled_mlp_token_chunk_size")
-    tiled_mlp = {"token_chunk_size": tiled_mlp_token_chunk_size} if tiled_mlp_token_chunk_size is not None else None
     return ModelSpec(
-        model_path_or_name=model_path,
-        dtype=dtype,
-        attn_implementation=attn_implementation,
+        model_path_or_name=settings.model_path,
+        dtype=settings.dtype,
+        attn_implementation=settings.attn_implementation,
         loader="huggingface",
-        parallelism=ParallelismConfig(sequence_parallel=sequence_parallel),
-        patches=Patches(
-            liger=liger,
-            gradient_checkpointing=training_options.get("activation_checkpointing", False),
-            activation_offload=activation_offload,
-            compile=training_options.get("compile"),
-            tiled_mlp=tiled_mlp,
-            lm_head=lm_head,
-            peft=training_options.get("peft_config"),
-        ),
-        **({"loader_options": loader_options} if loader_options else {}),
+        parallelism=ParallelismConfig(sequence_parallel=settings.sequence_parallel),
+        patches=settings.patches,
     )

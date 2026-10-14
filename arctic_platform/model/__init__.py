@@ -28,6 +28,7 @@ from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
 from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
+from arctic_platform.model.dense_spec import DenseModelSettings
 from arctic_platform.model.dense_spec import dense_model_spec
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.implementations.fp8 import keeps_fp32
@@ -116,6 +117,7 @@ __all__ = [
     "mark_keep_fp32",
     "mark_lm_head_targets_validated",
     "CompilePatch",
+    "DenseModelSettings",
     "ModelParallelismMetadata",
     "ModelSpec",
     "model_parallelism_metadata_from_config",
