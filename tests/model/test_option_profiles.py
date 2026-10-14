@@ -39,7 +39,8 @@ from arctic_platform.model import loader as loader_mod
 
 HUGGINGFACE = "huggingface"
 
-# Field paths under ``ModelSpec``. None: no option of the loader takes the key. For numerics.optimization_dtype the
+# Field paths under ``ModelSpec``, or under the loader's options model for a ``loader_options.`` path. None: no option
+# of the loader takes the key. For numerics.optimization_dtype the
 # loader reads ``ModelSpec.dtype``, but the job sets it, not the key.
 HUGGINGFACE_FIELDS: dict[str, str | None] = {
     "checkpointing.mode": None,
@@ -59,8 +60,7 @@ HUGGINGFACE_FIELDS: dict[str, str | None] = {
     "attention.backend": "attn_implementation",
     "attention.sparse_mla": None,
     "numerics.reduce_dtype": None,
-    # The loader has loader_options.fp32_parity, but no model_options key reaches it on this route yet.
-    "numerics.fp32_parity": None,
+    "numerics.fp32_parity": "loader_options.fp32_parity",
     "numerics.optimization_dtype": None,
     "compile.fullgraph": "patches.compile.fullgraph",
     "peft": "patches.peft",
@@ -127,10 +127,19 @@ def _field_exists(root: type[BaseModel] | None, path: str | None) -> bool:
     return True
 
 
+_LOADER_OPTIONS_PREFIX = "loader_options."
+
+
+def _huggingface_field_exists(path: str | None) -> bool:
+    if path is not None and path.startswith(_LOADER_OPTIONS_PREFIX):
+        return _field_exists(loader_mod._LOADERS[HUGGINGFACE].options, path.removeprefix(_LOADER_OPTIONS_PREFIX))
+    return _field_exists(ModelSpec, path)
+
+
 def _mapped_field_exists(name: str, key: str) -> bool:
     """Whether the loader-side name that ``key`` maps to exists for loader ``name``."""
     if name == HUGGINGFACE:
-        return _field_exists(ModelSpec, HUGGINGFACE_FIELDS[key])
+        return _huggingface_field_exists(HUGGINGFACE_FIELDS[key])
     path = LOADER_FIELD_OVERRIDES.get(name, {}).get(key, LOADER_OPTION_FIELDS[key])
     if path is not None and path.startswith(_MODEL_SPEC_PREFIX):
         return _field_exists(ModelSpec, path.removeprefix(_MODEL_SPEC_PREFIX))
@@ -153,7 +162,7 @@ def test_every_mapped_name_exists_somewhere():
     """Guards the tables against typos: each mapped name is a real field of at least one loader."""
     for key, path in HUGGINGFACE_FIELDS.items():
         if path is not None:
-            assert _field_exists(ModelSpec, path), (key, path)
+            assert _huggingface_field_exists(path), (key, path)
     custom = [name for name in loader_mod._LOADERS if name != HUGGINGFACE]
     for key, path in LOADER_OPTION_FIELDS.items():
         if path is not None:

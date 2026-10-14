@@ -24,9 +24,9 @@ the job sets that dtype, and the key would have no effect.
 ``Qwen3_5TextModel``). Other models load unchanged, except that with sequence parallelism the beta gate of any
 GatedDeltaNet layer the sequence-parallel wrapper adapts follows it. Its fused residual-add norm reads each norm's
 weight instead of calling the norm, so with ``patches.liger`` only the first layer's input norm, of the decoder-layer
-and final norms, runs Liger's RMSNorm kernel. ``numerics.fp32_parity`` stays unsupported here because the job
-server does not pass a ``model_options`` value on to that loader option yet, so a request to turn it off would have
-no effect.
+and final norms, runs Liger's RMSNorm kernel. ``numerics.fp32_parity`` is supported here and maps to
+``loader_options.fp32_parity``; it changes only the stock dense Qwen3.5 family and, with sequence parallelism, that
+beta gate.
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ def register(registry: Registry) -> None:
             "lm_head.fp32",
             "lm_head.token_chunk_size",
             "lm_head.vocab_chunk_size",
+            "numerics.fp32_parity",
             "liger",
             "attention.backend",
             "compile.fullgraph",
@@ -64,10 +65,6 @@ def register(registry: Registry) -> None:
             "numerics.reduce_dtype": "no equivalent option",
             "numerics.optimization_dtype": (
                 "the key has no effect on this route: the job sets the model dtype, not this key"
-            ),
-            "numerics.fp32_parity": (
-                "the loader option fp32_parity exists and is on by default for the stock dense Qwen3.5 family, but no "
-                "model_options key reaches it on this route yet: the job server does not pass the value on"
             ),
         },
         not_applicable={
