@@ -163,8 +163,6 @@ class CortexWorker:
             max_seq_len=self.config.max_model_len,
             training_gpus=self.cortex.training.num_gpus,
             sampling_gpus=self.cortex.sampling.num_gpus,
-            job_ready_timeout=self.cortex.poll_timeout,
-            request_timeout=self.cortex.request_timeout,
             backend=ArcticCortexConfig(
                 host=connection.host,
                 database=connection.database,
@@ -172,6 +170,10 @@ class CortexWorker:
                 endpoint=connection.endpoint,
                 pat=os.environ[connection.pat_env_var],
                 max_retries=connection.max_retries,
+                # The per-request / poll / job-ready timeouts live on the backend config.
+                request_timeout=self.cortex.request_timeout,
+                poll_timeout=self.cortex.poll_timeout,
+                job_ready_timeout=self.cortex.job_ready_timeout,
             ),
             training_job_id=sub_job_id(self.config.job_id, "training"),
             sampling_job_id=sub_job_id(self.config.job_id, "sampling"),
