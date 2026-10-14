@@ -17,7 +17,8 @@
 With the patch, the three roundings are checked at the stock classes against references written here: the residual
 add in fp32 inside the next RMSNorm, the partial rotary embedding in fp32, and the GatedDeltaNet beta gate as a sigmoid
 of fp32 ``b``. Forward and backward are checked under the generic gradient-checkpointing patch (full layers, every
-layer and every other layer, reentrant and not), under activation offload, and with fp32 weights under bf16 autocast.
+layer and every other layer, reentrant and not), under activation offload, with each decoder layer compiled (traced by
+dynamo, as one graph and with graph breaks, and run eagerly), and with fp32 weights under bf16 autocast.
 The huggingface loader's ``fp32_parity`` set to false installs nothing, so the model is the stock one. The copied stock
 forward is pinned against the stock source of the verified transformers version, and the patch is applied only to the
 dense Qwen3.5 text model, once, and can be removed.
@@ -209,6 +210,11 @@ def _beta_hooks(model: nn.Module) -> int:
     return sum(len(module._forward_hooks) for module in model.modules() if isinstance(module, nn.Linear))
 
 
+def _resolved_epsilons(model: nn.Module) -> list[float]:
+    name = hf_dense_parity._NORM_EPSILON_ATTRIBUTE
+    return [vars(module)[name] for module in model.modules() if name in vars(module)]
+
+
 def test_patch_is_applied_once_and_can_be_removed():
     model = _tiny_model()
     assert hf_dense_parity.apply_fp32_parity(model, sequence_parallel=False) == 1
@@ -222,9 +228,12 @@ def test_patch_is_applied_once_and_can_be_removed():
     # The module-level rotary function stays the stock one.
     assert modeling_qwen3_5.apply_rotary_pos_emb is not hf_dense_parity._apply_rotary_pos_emb_fp32
 
+    # Every fused norm holds the epsilon resolved at patch time: two per decoder layer and the final norm.
+    assert len(_resolved_epsilons(model)) == 9
     assert hf_dense_parity.remove_fp32_parity(model) == 1
     assert _instance_forwards(model) == []
     assert _beta_hooks(model) == 0
+    assert _resolved_epsilons(model) == []
     expected_output, expected_grads = _forward_backward(_tiny_model())
     _assert_same_run(*_forward_backward(model), expected_output, expected_grads)
 
@@ -474,6 +483,30 @@ def test_activation_offload_forward_backward_matches_eager(monkeypatch):
 
     assert manager.stats.offloaded_tensors > 0
     assert manager.stats.restored_tensors == manager.stats.offloaded_tensors
+    _assert_same_run(output, grads, expected_output, expected_grads)
+
+
+def _compiled_layers(model: nn.Module, *, fullgraph: bool) -> nn.Module:
+    torch._dynamo.reset()
+    # The compile patch's per-layer compilation, with a backend that traces the graph but runs it eagerly.
+    for layer in model.model.layers:
+        layer.compile(fullgraph=fullgraph, backend="aot_eager")
+    return model
+
+
+@pytest.mark.parametrize("fp32_parity", [True, False], ids=["fp32-parity", "stock"])
+@pytest.mark.parametrize("fullgraph", [True, False], ids=["fullgraph", "graph-breaks"])
+def test_compiled_layers_forward_backward_match_eager(fp32_parity, fullgraph):
+    reference_model = _tiny_model()
+    if fp32_parity:
+        _patched(reference_model)
+    compiled_model = _compiled_layers(copy.deepcopy(reference_model), fullgraph=fullgraph)
+
+    expected_output, expected_grads = _forward_backward(reference_model)
+    try:
+        output, grads = _forward_backward(compiled_model)
+    finally:
+        torch._dynamo.reset()
     _assert_same_run(output, grads, expected_output, expected_grads)
 
 
