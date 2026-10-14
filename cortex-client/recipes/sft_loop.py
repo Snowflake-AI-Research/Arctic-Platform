@@ -57,8 +57,8 @@ class Config:
     attn_implementation: str = "flash_attention_3"
     dtype: str = "bfloat16"
     seed: int = 42
-    # huggingface for dense / LoRA; prime_rl for MoE with expert parallelism.
-    model_provider: str = "huggingface"
+    # Liger kernels for a dense model. MoE selection follows the checkpoint.
+    use_liger: bool = False
     ep_size: int | None = None
 
     dataset: str = "HuggingFaceH4/no_robots"
@@ -111,7 +111,7 @@ def job_body(config: Config) -> dict:
             )
 
     training_config: dict[str, Any] = {
-        "model_provider": config.model_provider,
+        "use_liger": config.use_liger,
         "n_gpus": config.n_gpus,
         "max_seq_len": config.max_length,
         "train_batch_size": config.batch_size,

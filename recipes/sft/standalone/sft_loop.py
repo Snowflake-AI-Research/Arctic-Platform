@@ -57,8 +57,8 @@ class Config:
     attn_implementation: str = "flash_attention_3"
     dtype: str = "bfloat16"
     seed: int = 42
-    # huggingface for dense / LoRA; prime_rl for MoE with expert parallelism.
-    model_provider: str = "huggingface"
+    # Liger kernels for a dense model. MoE selection follows the checkpoint.
+    use_liger: bool = False
     ep_size: int | None = None
 
     dataset: str = "HuggingFaceH4/no_robots"
@@ -94,7 +94,7 @@ def build_config(config: Config):
 
     worker: dict[str, Any] = {
         "attn_implementation": config.attn_implementation,
-        "model_provider": config.model_provider,
+        "use_liger": config.use_liger,
     }
     if config.ep_size is not None:
         worker["ep_size"] = config.ep_size

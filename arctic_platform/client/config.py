@@ -331,9 +331,14 @@ class ArcticClientConfig(BaseModel):
             training["optimizer"] = optimizer
         if "enable_gradient_checkpointing" in worker:
             training["activation_checkpointing"] = worker["enable_gradient_checkpointing"]
-        provider = worker.get("model_provider") or ("liger" if worker.get("use_liger") else None)
-        if provider:
-            training["model_provider"] = provider
+        if "model_provider" in worker:
+            raise ValueError(
+                "ds_worker_config.model_provider is not accepted. Dense models use "
+                "Hugging Face and MoE models use the Arctic stack. Set use_liger=true "
+                "to apply Liger kernels on a dense model."
+            )
+        if "use_liger" in worker:
+            training["use_liger"] = bool(worker["use_liger"])
         if worker.get("attn_implementation"):
             training["attn_implementation"] = worker["attn_implementation"]
         # Neutrino-only engine knobs ride along in ds_worker_config; on-prem ignores them.

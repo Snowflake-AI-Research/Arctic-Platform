@@ -7,7 +7,6 @@
       "seed": 42,
       "training_config": {
         "nccl_debug": false,
-        "model_provider": "prime_rl",
         "max_seq_len": 128,
         "train_batch_size": 8,
         "n_gpus": 8,

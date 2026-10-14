@@ -282,7 +282,6 @@ def build_config(config: Config):
         ds_config=ds_config,
         ds_worker_config={
             "attn_implementation": config.attn_implementation,
-            "model_provider": "huggingface",
             "mb_spec": {"max_tokens_per_mb": config.max_tokens_per_mb},
         },
         job_id=config.job_id,

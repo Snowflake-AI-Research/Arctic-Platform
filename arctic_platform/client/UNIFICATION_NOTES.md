@@ -94,7 +94,7 @@ canonical shape into today's on-prem `/initialize` and Cortex `sub_job_configs`
 wires:
 
 - nest engine kwargs under `inference_config.vllm_config` (Neutrino)
-- map `training.model` → Neutrino `model_provider` / `ep_size` / `attn_*`
+- map `training.model` → Neutrino `use_liger` / `ep_size` / `attn_*`
 - map `training.model` → on-prem `ds_worker_config` (`use_liger`, attn, …)
 
 **These adapters should go away** once both servers accept the canonical nesting
