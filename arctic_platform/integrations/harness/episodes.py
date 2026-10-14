@@ -249,27 +249,22 @@ def split_chains(episodes: list[Episode]) -> list[list[Episode]]:
 
 
 def sampled_mask(episodes: list[Episode], prompt_ids: list[int], response_ids: list[int]) -> list[int]:
-    """1 on each response token the sampler produced at that position, 0 elsewhere.
+    """1 on response tokens the sampler produced, 0 elsewhere.
 
     An episode counts only when its prompt and response are a prefix of the
-    sequence. Template tokens, tool output, and history that was re-rendered
-    into different ids stay 0.
+    sequence, so history re-rendered into different ids stays 0.
     """
     full = list(prompt_ids) + list(response_ids)
     mask = [0] * len(full)
     for episode in episodes:
-        start = len(episode.prompt_token_ids)
-        end = start + len(episode.response_token_ids)
-        if end > len(full):
-            continue
-        if full[start:end] != list(episode.response_token_ids) or full[:start] != list(episode.prompt_token_ids):
-            continue
-        mask[start:end] = [1] * (end - start)
+        sampled = list(episode.prompt_token_ids) + list(episode.response_token_ids)
+        if full[: len(sampled)] == sampled:
+            mask[len(episode.prompt_token_ids) : len(sampled)] = [1] * len(episode.response_token_ids)
     return mask[len(prompt_ids) :]
 
 
 def sequence_from_chain(chain: list[Episode]) -> tuple[list[int], list[int], list[int]]:
-    """First prompt, every later sampled token the last prompt still contains, and the sampled mask."""
+    """First prompt, every later token the last prompt still contains, and the mask."""
     first = list(chain[0].prompt_token_ids)
     last = list(chain[-1].prompt_token_ids) + list(chain[-1].response_token_ids)
     if last[: len(first)] != first:

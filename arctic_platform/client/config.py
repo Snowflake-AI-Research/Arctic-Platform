@@ -111,16 +111,13 @@ class CortexConfig(BaseSettings):
     job_ready_timeout: float = Field(
         1800.0, gt=0, description="Maximum total seconds to wait for a Cortex job to reach RUNNING."
     )
-    # Free text, sent as the job's `comment` field. Every job on a shared account
-    # reports the same submitter, so this is where a person or run name goes.
-    # CORTEX_JOB_COMMENT is the name launchers already export.
+    # Every job on a shared account has the same submitter, so put a person or
+    # run name here. Existing launchers export CORTEX_JOB_COMMENT.
     job_comment: str | None = Field(
         None,
         validation_alias=AliasChoices("job_comment", "ARCTIC_CORTEX_JOB_COMMENT", "CORTEX_JOB_COMMENT"),
         description="cortex: comment stored on the job at create time.",
     )
-    # Placement can take hours. A launcher that is killed during that wait has
-    # no other record of the id, and the job keeps its GPUs until cancelled.
     job_id_file: str | None = Field(
         None,
         description="cortex: file that receives the job id before the placement wait, so a launcher can cancel it.",

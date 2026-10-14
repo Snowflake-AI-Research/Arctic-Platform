@@ -58,8 +58,7 @@ def test_unified_config_carries_a_shorter_vllm_length(monkeypatch):
 
 
 def test_skyrl_can_read_comm_protocol():
-    # SkyRL's build_rl_config still passes comm_protocol="ray", and its entrypoint
-    # reads it back. Without the attribute that read raises AttributeError.
+    # SkyRL passes comm_protocol="ray" and its entrypoint reads it back.
     legacy = ArcticRLClientConfig(model_name="Qwen/Qwen3-0.6B", training_gpus=1, comm_protocol="ray")
     assert legacy.comm_protocol == "ray"
     assert "comm_protocol" not in legacy.model_dump()

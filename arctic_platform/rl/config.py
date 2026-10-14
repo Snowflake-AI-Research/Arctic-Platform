@@ -110,11 +110,7 @@ class ArcticRLClientConfig(BaseModel):
 
     @property
     def comm_protocol(self) -> str:
-        """SkyRL's Arctic entrypoint reads this to decide whether to fetch server state.
-
-        Ray is the only on-prem transport. On Cortex the client's ``get_server_state``
-        returns ``None``, so the answer does not change what SkyRL passes along.
-        """
+        """Read by SkyRL's Arctic entrypoint. On Cortex ``get_server_state`` returns ``None`` either way."""
         return "ray"
 
 
