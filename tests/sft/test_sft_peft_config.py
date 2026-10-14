@@ -74,6 +74,48 @@ class TestPeftConfig(TestCasePlus):
                 with self.subTest(jobs=jobs, settings=settings), self.assertRaisesRegex(ValueError, "adapter sync"):
                     ArcticClientConfig(model_name="unused", training=TrainingConfig(**settings), **jobs)
 
+    def test_cortex_forwards_arctic_and_use_liger(self):
+        arctic = ArcticClientConfig(
+            model_name="unused",
+            training_gpus=1,
+            training=TrainingConfig(ds_worker_config={"model_provider": "arctic", "ep_size": 4}),
+        )
+        training = arctic._cortex_training_sub_job()["training_config"]
+        self.assertEqual(training["model_provider"], "arctic")
+        self.assertNotIn("use_liger", training)
+
+        liger = ArcticClientConfig(
+            model_name="unused",
+            training_gpus=1,
+            training=TrainingConfig(ds_worker_config={"use_liger": True}),
+        )
+        training = liger._cortex_training_sub_job()["training_config"]
+        self.assertTrue(training["use_liger"])
+        self.assertNotIn("model_provider", training)
+
+    def test_cortex_rejects_retired_model_providers(self):
+        cases = (
+            ("liger", "use_liger=true"),
+            ("prime_rl", "renamed to 'arctic'"),
+            ("transformers", "must be 'huggingface' or 'arctic'"),
+        )
+        for provider, message in cases:
+            config = ArcticClientConfig(
+                model_name="unused",
+                training_gpus=1,
+                training=TrainingConfig(ds_worker_config={"model_provider": provider}),
+            )
+            with self.subTest(provider=provider), self.assertRaisesRegex(ValueError, message):
+                config._cortex_training_sub_job()
+
+        mixed = ArcticClientConfig(
+            model_name="unused",
+            training_gpus=1,
+            training=TrainingConfig(ds_worker_config={"model_provider": "arctic", "use_liger": True}),
+        )
+        with self.assertRaisesRegex(ValueError, "prime_rl.fused_cross_entropy"):
+            mixed._cortex_training_sub_job()
+
     def test_cortex_keeps_training_and_sampling_peft(self):
         peft = {"peft_type": "LORA", "target_modules": ["q_proj"]}
         config = ArcticClientConfig(
