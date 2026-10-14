@@ -217,21 +217,52 @@ def test_device_binding_threshold_matches_the_restore_check():
             assert key_binds == check_binds, tp
 
 
-def test_tp1_binds_the_key_but_not_the_check_with_several_replicas():
-    """The one place the two part ways, on purpose.
+def test_tp1_binds_the_replica_layout_not_the_devices_with_several_replicas():
+    """The one place the key and the check part ways, on purpose.
 
     Several TP=1 replicas dump under <key>/replica<K>/ where a lone one dumps
-    flat, so the pod's allocation has to keep a 1-GPU and an 8-GPU pod off one
-    key. Restorability is unchanged -- a TP=1 image still lands on any slot --
-    so the device check keeps exempting it.
+    flat, so the two shapes need different keys -- but not one per pod size.
+    Restorability is unchanged -- a TP=1 image still lands on any slot -- so
+    the device check keeps exempting it.
     """
     with _Devices(["nvidia0", "nvidia1", "uverbs0", "uverbs1"]):
         assert se._device_binding(BASE_CONFIG, replica_count=1) is None
-        assert se._device_binding(BASE_CONFIG, replica_count=2) == [
-            "nvidia0", "nvidia1", "uverbs0", "uverbs1"]
+        two = se._device_binding(BASE_CONFIG, replica_count=2)
+    with _Devices([f"nvidia{i}" for i in range(8)]
+                  + [f"uverbs{i}" for i in range(16)]):
+        eight = se._device_binding(BASE_CONFIG, replica_count=8)
+    assert two == eight == list(se._TP1_REPLICA_LAYOUT)
     meta = {"vllm_config": {"tensor_parallel_size": 1},
             "device_nodes": ["nvidia6", "nvidia7"]}
     assert se._missing_device_nodes(meta) == []
+
+
+def test_every_tp1_pod_with_several_replicas_resolves_the_whole_node_key():
+    """n_gpus=2..7 (one pod of that size) finds the image an 8-GPU pod dumped,
+    each replica its own replica<K>/; a lone replica keeps the flat key."""
+    original = se._env_hash
+    se._env_hash = lambda: ("eeeeeeeeeeee", "img@sha256:abc", "580.159.03")
+    os.environ["SEMIP_IMAGE_CACHE"] = "/data-fast/image-cache_neutrino"
+
+    def resolve(gpus, count, slot):
+        devices = ([f"nvidia{g}" for g in gpus]
+                   + [f"uverbs{u}" for g in gpus for u in (2 * g, 2 * g + 1)])
+        with _Devices(devices):
+            return _with_slot(count, slot,
+                              lambda: se._resolve_model_dir(BASE_CONFIG))
+    try:
+        node = resolve(range(8), 8, 5)
+        small = resolve([3, 6, 7], 3, 2)
+        pair = resolve([4, 5], 2, 1)
+        lone = resolve([2], None, None)
+        assert node.key_prefix == small.key_prefix == pair.key_prefix
+        assert lone.key_prefix != node.key_prefix
+        assert small.model_dir == os.path.join(
+            "/data-fast/image-cache_neutrino", node.key_prefix, "replica2")
+        assert os.path.basename(lone.model_dir) == lone.key_prefix
+    finally:
+        se._env_hash = original
+        os.environ.pop("SEMIP_IMAGE_CACHE", None)
 
 
 # --------------------------------------------------------------------------

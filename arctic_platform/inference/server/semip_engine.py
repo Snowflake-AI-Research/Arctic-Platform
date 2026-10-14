@@ -93,6 +93,26 @@ _DEFAULT_IMAGE_SOURCE = "/mnt/neutrino/base-models/image-cache"
 # meta.json and a restore under the other value is refused.
 _UNPRIVILEGED_ENV = "SEMIP_UNPRIVILEGED"
 
+# A miss cold-starts, dumps, restores and publishes only when the job sets this
+# (through vllm_config.extra_env). Without it a miss fails the job: there is no
+# plain-engine fallback, and a dump nobody publishes is lost with the pod.
+_DUMP_PUBLISH_ENV = "SEMIP_DUMP_PUBLISH"
+
+# The model bucket the publisher uploads to. It is per cluster and the
+# device-manager pod's environment does not carry it (only the model-cache
+# DaemonSet's does), so it is pinned to the one cluster semi_p runs on.
+_PUBLISH_BUCKET = "neutrino-sfc-or-dev-meta-k8s-2"
+_PUBLISHER = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "semi_persistence", "scripts", "semip_publish.py")
+_PUBLISH_HASH_WORKERS = 32
+# Outside the image cache, so nothing here is ever uploaded. Each replica of a
+# pod marks itself ready here once its dump has restored; slot 0 publishes the
+# pod's key when every slot has.
+_PUBLISH_DIR = "/tmp/semip-publish"
+_PUBLISH_READY_TIMEOUT_S = 3600.0
+_PUBLISH_POLL_S = 5.0
+
 # The published tree, which is *not* shaped like the local cache:
 #
 #   <source>/<model>/skeleton/<cfg12>_<env12>_<wt12>/   image/ compilation/
@@ -142,6 +162,13 @@ _WEIGHT_DIR = "weight"
 _REPLICA_DIR_PREFIX = "replica"
 _REPLICA_ID_ENV = "SEMIP_REPLICA_ID"
 _NUM_REPLICAS_ENV = "SEMIP_NUM_REPLICAS"
+# What a TP=1 key with several replicas per pod binds in place of the pod's
+# devices (see _device_binding). No device node is named like it.
+_TP1_REPLICA_LAYOUT = ("replica-layout",)
+# A whole node, the only pod shape whose dump is published: a smaller pod's
+# skeleton would lack replica<K>/ directories a whole node needs, or (TP>1) be
+# bound to devices other pods do not hold.
+_GPUS_PER_NODE = 8
 
 # One engine spanning N pods puts each node-partition under <key>/node<k>/. This is a
 # different axis from replica<K> and the two do not nest in practice: a
@@ -656,8 +683,9 @@ def _config_hash(vllm_config: dict[str, Any],
     directory. A changed model root causing a miss is the harmless direction;
     two models sharing a directory is not.
 
-    ``device_nodes`` is the pod's ``/dev`` allocation at TP>1 and ``None``
-    below it -- ``_device_binding`` decides which, and says why. It is folded
+    ``device_nodes`` is the pod's ``/dev`` allocation at TP>1, the TP=1 replica
+    layout marker with several replicas per pod, and ``None`` for a lone TP=1
+    replica -- ``_device_binding`` decides which, and says why. It is folded
     in here rather than added as a third component of the key so the directory
     name stays ``<cfg12>_<env12>``: criu validates that exact string, the
     compile caches are written under it, and ``semip_publish._DERIVED_KEY_RE``
@@ -705,19 +733,22 @@ def _device_binding(vllm_config: dict[str, Any],
     Binding it would split one universally restorable image into one key per
     GPU, turning a hit rate of 1 into 1/N.
 
-    **Bound for TP=1 when the pod holds several replicas**, and for a different
-    reason: not restorability but layout. Those replicas dump under
-    ``<key>/replica<K>/`` where a lone replica dumps flat under ``<key>/``, and
-    without the device set a 1-GPU and an 8-GPU pod would give both shapes one
-    key. The pod's allocation tells them apart, as it already does at TP>1.
-    ``_missing_device_nodes`` keeps exempting TP=1, since such an image still
+    **TP=1 with several replicas in the pod binds ``_TP1_REPLICA_LAYOUT``,**
+    not the pod's devices. Those replicas dump under ``<key>/replica<K>/``
+    where a lone replica dumps flat under ``<key>/``, so the two shapes need
+    different keys; but binding the allocation would give every pod size its
+    own key. With the marker, a pod of any size computes the key a whole node
+    dumped, and replica slot K restores ``replica<K>/`` of that image.
+    ``_missing_device_nodes`` keeps exempting TP=1, since such an image
     restores on any slot; at TP>1 the key and the check share
     ``_DEVICE_BOUND_MIN_TP``.
     """
     tp = int((vllm_config or {}).get("tensor_parallel_size", 1) or 1)
-    if tp < _DEVICE_BOUND_MIN_TP and replica_count <= 1:
+    if tp >= _DEVICE_BOUND_MIN_TP:
+        return _visible_device_nodes()
+    if replica_count <= 1:
         return None
-    return _visible_device_nodes()
+    return list(_TP1_REPLICA_LAYOUT)
 
 
 def _pod_image_ref() -> str:
@@ -953,12 +984,16 @@ def _resolve_model_dir(vllm_config: dict[str, Any],
     weight_root = (os.path.join(source_root, slug, _WEIGHT_DIR)
                    if source_root else None)
 
+    if device_nodes == list(_TP1_REPLICA_LAYOUT):
+        binding = "the TP=1 replica layout, for any pod size"
+    elif device_nodes:
+        binding = f"devices {','.join(device_nodes)}"
+    else:
+        binding = "no device binding (TP=1)"
     logger.info(
         "semi_p: resolved model_dir=%s (config=%s over %s, env=%s from image "
         "%s driver %s, replica slot %d of %d%s); published skeletons %s",
-        model_dir, cfg_hash,
-        f"devices {','.join(device_nodes)}" if device_nodes
-        else "no device binding (TP=1)", env_hash, image_ref, driver,
+        model_dir, cfg_hash, binding, env_hash, image_ref, driver,
         slot, count,
         f", node {node_rank} of {nnodes}" if nnodes > 1 else "",
         skeleton_root or "not configured")
@@ -2784,6 +2819,190 @@ def _restore_with_port_retry(model_dir: str, engine_kwargs: dict[str, Any],
             time.sleep(_RESTORE_RETRY_SLEEP_S)
 
 
+def _dump_publish_requested() -> bool:
+    """Whether the job asked a miss to dump and publish (``SEMIP_DUMP_PUBLISH``)."""
+    value = (os.environ.get(_DUMP_PUBLISH_ENV) or "").strip().lower()
+    return value in ("1", "true", "yes")
+
+
+def _miss_error(model_dir: str, skeleton_dir: str | None) -> RuntimeError:
+    """The refusal for a miss the job did not ask to dump."""
+    found = (f" A published image exists at {skeleton_dir} but could not be "
+             f"used on this node; the warning above says why."
+             if skeleton_dir else "")
+    return RuntimeError(
+        f"semi_p: no image for this config on this node or in the published "
+        f"cache (key {model_dir}).{found} Set inference_config.semi_p to false "
+        f"(or remove it) and resubmit to run without semi_p, or set "
+        f"vllm_config.extra_env.{_DUMP_PUBLISH_ENV}=1 to cold-start, dump and "
+        f"publish an image for this config.")
+
+
+def _world_size(vllm_config: dict[str, Any]) -> int:
+    config = vllm_config or {}
+    return (int(config.get("tensor_parallel_size", 1) or 1)
+            * int(config.get("pipeline_parallel_size", 1) or 1))
+
+
+def _publish_skip_reason(paths: _ImagePaths, skeleton_dir: str | None,
+                         world_size: int | None = None) -> str | None:
+    """Why a fresh dump must not be published, or ``None`` to publish it.
+
+    A job that turned the mirror off cannot tell whether its key is already
+    published, and a key that is published already would gain a second
+    skeleton, which makes every later restore of it refuse to choose and
+    cold-start. ``world_size`` (one engine's GPUs, single-pod engines only)
+    limits publishing to a whole-node pod or a lone TP=1 replica.
+    """
+    if not paths.skeleton_root:
+        return (f"{_IMAGE_SOURCE_ENV} turns the published mirror off, so this "
+                f"job cannot tell whether the key is published already")
+    if skeleton_dir:
+        return f"the key is already published as {skeleton_dir}"
+    if world_size is not None:
+        pod_gpus = world_size * paths.replica_count
+        lone_tp1 = world_size == 1 and paths.replica_count == 1
+        if not lone_tp1 and pod_gpus != _GPUS_PER_NODE:
+            return (f"this pod holds {paths.replica_count} replica(s) of "
+                    f"{world_size} GPU(s), and only a whole node "
+                    f"({_GPUS_PER_NODE} GPUs) or a lone TP=1 replica is "
+                    f"published; dump this config at that size to publish it")
+    return None
+
+
+def _publish_ready_marker(key_dir: str, slot: int) -> str:
+    return os.path.join(_PUBLISH_DIR, os.path.basename(key_dir),
+                        f"{_REPLICA_DIR_PREFIX}{slot}.ready")
+
+
+def _publish_command(key_dir: str) -> list[str]:
+    return [sys.executable, _PUBLISHER, key_dir, "--bucket", _PUBLISH_BUCKET,
+            "--hash-workers", str(_PUBLISH_HASH_WORKERS)]
+
+
+def _run_publisher(key_dir: str) -> int:
+    """Run ``semip_publish.py`` on ``key_dir`` and log the outcome; blocking.
+
+    ``HOME`` is pointed at ``/tmp`` because the aws CLI writes its config
+    there and the container's own home is not writable.
+    """
+    os.makedirs(_PUBLISH_DIR, exist_ok=True)
+    log_path = os.path.join(_PUBLISH_DIR, os.path.basename(key_dir) + ".log")
+    env = dict(os.environ, HOME="/tmp")
+    try:
+        subprocess.run(["aws", "configure", "set",
+                        "default.s3.max_concurrent_requests", "64"],
+                       env=env, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("semi_p: could not raise the aws CLI's S3 concurrency; "
+                       "publishing with its default", exc_info=True)
+    command = _publish_command(key_dir)
+    logger.info("semi_p: publishing %s to s3://%s (log %s): %s",
+                key_dir, _PUBLISH_BUCKET, log_path, " ".join(command))
+    t0 = time.perf_counter()
+    with open(log_path, "w") as log:
+        rc = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
+                            stdout=log, stderr=subprocess.STDOUT).returncode
+    with open(log_path, errors="replace") as log:
+        tail = "".join(log.readlines()[-20:])
+    if rc == 0:
+        logger.info("semi_p: published %s in %.0fs:\n%s",
+                    key_dir, time.perf_counter() - t0, tail)
+    else:
+        logger.error("semi_p: publishing %s failed (rc=%d) after %.0fs; the "
+                     "image still serves this job but no other pod will find "
+                     "it:\n%s", key_dir, rc, time.perf_counter() - t0, tail)
+    return rc
+
+
+def _publish_now(key_dir: str) -> None:
+    """``_run_publisher`` for a background thread, where a raise would vanish."""
+    try:
+        _run_publisher(key_dir)
+    except Exception:
+        logger.exception("semi_p: publishing %s raised", key_dir)
+
+
+def _publish_when_ready(key_dir: str, count: int, timeout_s: float) -> None:
+    """Publish ``key_dir`` once all ``count`` replicas of the pod marked ready."""
+    markers = [_publish_ready_marker(key_dir, slot) for slot in range(count)]
+    deadline = time.monotonic() + timeout_s
+    while True:
+        missing = [slot for slot, path in enumerate(markers)
+                   if not os.path.exists(path)]
+        if not missing:
+            break
+        if time.monotonic() > deadline:
+            logger.error(
+                "semi_p: not publishing %s: replica slot(s) %s did not dump "
+                "and restore within %.0fs, and a skeleton missing them would "
+                "fail every pod that restores it", key_dir, missing, timeout_s)
+            return
+        time.sleep(_PUBLISH_POLL_S)
+    _publish_now(key_dir)
+
+
+def _is_publishing_pod() -> bool:
+    """Whether this pod publishes for the job: the GPU pod with the lowest
+    address in the job's Ray cluster. Every pod of a multi-pod job dumps the
+    same key, and two uploads into one skeleton would interleave two dumps."""
+    try:
+        import ray
+        pods = sorted(node["NodeManagerAddress"] for node in ray.nodes()
+                      if node.get("Alive") and (node.get("Resources") or {}).get("GPU"))
+        return not pods or pods[0] == ray.util.get_node_ip_address()
+    except Exception:
+        logger.warning("semi_p: cannot tell which pod of the job publishes; "
+                       "not publishing from this one", exc_info=True)
+        return False
+
+
+def _start_publish(paths: _ImagePaths, skeleton_dir: str | None,
+                   world_size: int) -> None:
+    """Publish the image this pod just dumped and restored, in the background.
+
+    The job serves meanwhile. With several replicas in the pod they share one
+    key, so each marks itself ready and slot 0 alone publishes; with several
+    pods, only ``_is_publishing_pod``'s does.
+    """
+    key_dir = paths.key_dir or paths.model_dir
+    skip = _publish_skip_reason(paths, skeleton_dir, world_size)
+    if skip:
+        logger.warning("semi_p: dumped %s but not publishing it: %s",
+                       key_dir, skip)
+        return
+    marker = _publish_ready_marker(key_dir, paths.replica_slot)
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    with open(marker, "w"):
+        pass
+    if paths.replica_slot != 0:
+        return
+    if not _is_publishing_pod():
+        logger.info("semi_p: dumped %s; another pod of this job publishes it",
+                    key_dir)
+        return
+    threading.Thread(
+        target=_publish_when_ready,
+        args=(key_dir, paths.replica_count, _PUBLISH_READY_TIMEOUT_S),
+        name="semip-publish", daemon=True).start()
+
+
+def _start_publish_nodes(paths: _ImagePaths, skeleton_dir: str | None,
+                         agents: list[Any]) -> None:
+    """``_start_publish`` for a pod-spanning engine: every pod publishes its
+    own node-partition, and the publisher's node 0 completes the skeleton."""
+    key_dir = paths.key_dir or paths.model_dir
+    skip = _publish_skip_reason(paths, skeleton_dir)
+    if skip:
+        logger.warning("semi_p: dumped %s but not publishing it: %s",
+                       key_dir, skip)
+        return
+    for agent in agents:
+        agent.publish.remote(key_dir)
+    threading.Thread(target=_publish_now, args=(key_dir,),
+                     name="semip-publish", daemon=True).start()
+
+
 def restore_and_wrap(engine_kwargs: dict[str, Any],
                      agents: list[Any] | None = None) -> "_SemiPEngine":
     """Bring a semi-p engine up and return a ``_SemiPEngine`` (blocking).
@@ -2798,9 +3017,11 @@ def restore_and_wrap(engine_kwargs: dict[str, Any],
 
     On a cache hit this restores the image and serves from it. On a **miss**
     it first tries to materialize the image from the read-only published
-    mirror; failing that it cold-starts vLLM and dumps an image into the
-    derived directory. Either way it then restores and serves from that
-    restore: the cold-started engine cannot serve directly because
+    mirror; failing that, and only if the job set ``SEMIP_DUMP_PUBLISH``, it
+    cold-starts vLLM, dumps an image into the derived directory, and once that
+    image has restored publishes it in the background. Without the flag a miss
+    raises, naming both ways out. Every path ends in a restore that serves:
+    the cold-started engine cannot serve directly because
     ``criu_dump()`` is destructive, and since a restore is needed regardless,
     doing it here makes "the dump worked" and "the image is restorable" a
     single observation.
@@ -2862,6 +3083,7 @@ def restore_and_wrap(engine_kwargs: dict[str, Any],
 
     meta_path = os.path.join(model_dir, _IMAGE_DIR, "meta.json")
     after = "previous run's teardown"
+    dumped = False
     if not os.path.isfile(meta_path):
         # Creates the parent too: the image-cache root need not exist yet.
         os.makedirs(model_dir, exist_ok=True)
@@ -2879,21 +3101,27 @@ def restore_and_wrap(engine_kwargs: dict[str, Any],
                                          strict=paths.replica_count > 1):
                 # A pod that never ran this config can still serve it warm.
                 after = "copy from the image source"
+            elif not _dump_publish_requested():
+                raise _miss_error(model_dir, skeleton_dir)
             else:
                 _dump(vllm_config, model_dir, gpus,
                       image_ref=paths.image_ref,
                       driver_version=paths.driver_version)
                 after = "dump we just took"
+                dumped = True
 
     # Nothing is cleaned up here on the miss path: _worker_criu_save rmtree's
     # image/ before writing, and _semip_save_weights does the same for its rank
     # dir, both with a targeted message when the leftovers belong to another uid.
     # Repeating that would duplicate the work and swallow the diagnostic.
-    return _restore_with_port_retry(
+    engine = _restore_with_port_retry(
         model_dir, engine_kwargs, gpus, after=after,
         weights_dir=_weights_dir_for_restore(
             model_dir, paths.weight_root, weight_hash),
         requested=vllm_config)
+    if dumped:
+        _start_publish(paths, skeleton_dir, _world_size(vllm_config))
+    return engine
 
 
 def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
@@ -2902,8 +3130,9 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
                                 agents: list[Any]) -> "_SemiPEngine":
     """``restore_and_wrap`` for an engine whose TP group spans pods.
 
-    Same shape as the single-pod path -- hit, else materialize, else dump,
-    then restore -- with every decision made for the group rather than for this
+    Same shape as the single-pod path -- hit, else materialize, else dump if
+    ``SEMIP_DUMP_PUBLISH`` asks for it, then restore and publish -- with every
+    decision made for the group rather than for this
     pod. The dump lock is taken on the shared key directory, not on this pod's
     node-partition, because the node-partitions dump together and two leaders dumping one key at
     once would interleave their images.
@@ -2912,6 +3141,7 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
     key_dir = paths.key_dir or paths.model_dir
     hit, dump_id = _joint_hit(agents, paths, local)
     after = "previous run's teardown"
+    dumped = False
 
     if not hit:
         os.makedirs(paths.model_dir, exist_ok=True)
@@ -2927,6 +3157,9 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
                 materialized = _multinode_materialize(agents, paths)
                 if materialized:
                     after = "copy from the image source"
+                elif not _dump_publish_requested():
+                    raise _miss_error(key_dir,
+                                      _resolve_published_skeleton(paths)[0])
                 else:
                     _dump_multinode(
                         vllm_config, paths, gpus, agents,
@@ -2935,6 +3168,7 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
                         image_ref=paths.image_ref,
                         driver_version=paths.driver_version)
                     after = "dump we just took"
+                    dumped = True
                 hit, dump_id = _joint_hit(agents, paths, local)
                 if not hit:
                     raise RuntimeError(
@@ -2953,9 +3187,12 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
     while True:
         attempt += 1
         try:
-            return _restore_multinode(
+            engine = _restore_multinode(
                 engine_kwargs, paths, gpus, agents,
                 weights_dir=weights_dir, requested=vllm_config, after=after)
+            if dumped:
+                _start_publish_nodes(paths, skeleton_dir, agents)
+            return engine
         except Exception as exc:
             if not _is_address_in_use(exc) or time.monotonic() >= deadline:
                 raise

@@ -283,6 +283,12 @@ path is inert for a real `AsyncLLM`.
   > besides `_log_config_divergence` and `tokenizer_path` — the dump path
   > projects it into the `vllm_config` it bakes. See
   > [`dss_dump.md`](dss_dump.md), Section 11 for what was built.
+  >
+  > **Since 2026-10-14 only on request.** The miss dumps only when the job sets
+  > `SEMIP_DUMP_PUBLISH=1` in `vllm_config.extra_env`, and then also publishes
+  > the image once it has restored; without the flag it raises, telling the
+  > user to set `semi_p` to false or add the flag. See SKILL.md, "A miss fails
+  > the job unless it sets `SEMIP_DUMP_PUBLISH=1`".
 - `_SemiPEngine` — stands in for `self.llm`. Forwards `generate` onto
   `Instance.generate`, collects results out of `instance.generate_results`
   keyed by `instance.last_req_id`, and maps the server's lifecycle calls onto

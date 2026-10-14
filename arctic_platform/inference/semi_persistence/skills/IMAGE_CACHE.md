@@ -55,11 +55,14 @@ job resolves on each node exactly the layout a single-node dump wrote. That is
 the intended workflow: dump and publish at `n_gpus=8`, wait until every node
 is verified, then run the multi-node job, which restores and never dumps. It
 is a rule, not a check. A replica knows only its own node's slot and count, so
-a multi-node miss cold-starts and dumps on every node independently. The
-replicas share one key: at TP>1 the pod's device set is in `cfg12` already, and
-at TP=1 it is folded in only when the pod holds several replicas, which keeps a
-1-GPU and an 8-GPU pod (two shapes) on two keys. Nothing about the replica set
-goes into `meta.json`; the publisher reconstructs it from the directories.
+a multi-node miss (with `SEMIP_DUMP_PUBLISH=1`; without it the job fails) cold-starts
+and dumps on every node independently, and only the lowest-address pod
+publishes. The replicas share one key: at TP>1 the pod's device set is in
+`cfg12` already, and at TP=1 a pod with several replicas binds the fixed
+`_TP1_REPLICA_LAYOUT` marker, which keeps the lone replica (flat) on its own
+key while a TP=1 pod of any size resolves the 8-GPU dump's key, slot K reading
+`replica<K>/`. Nothing about the replica set goes into `meta.json`; the
+publisher reconstructs it from the directories.
 
 **The published tree is shaped differently, and §9.1 is why.** Only `image/` and
 `compilation/` are bound to `model_dir`, so only they have to travel together
@@ -79,14 +82,13 @@ The publisher requires a contiguous `replica0..N-1`, each recording its own
 `model_dir`, all agreeing on config, image, driver and uid; it hashes every
 replica's `weight/`, refuses unless the hashes are equal, and uploads one copy.
 
-> **A pod-spanning dump (`node<k>/`) cannot be published yet.** The publisher
-> knows the flat and `replica<K>` layouts only. It also cannot simply learn the
-> new level: each pod holds just its own node-partition, so there is nothing for one
-> invocation to walk. It needs a cross-pod rendezvous -- per-node rows under
-> `_staging/<key>/<dump_id>/node<k>.json`, a `wt12` over the union, each node
-> uploading its own `rank*` and its `node<k>/`, and node 0 writing the sentinel
-> last so the DaemonSet still sees one model directory. See
-> [MULTINODE_TP16.md](MULTINODE_TP16.md) §10.
+> **A pod-spanning dump (`node<k>/`) is published from every pod at once.**
+> Each pod holds just its own node-partition, so `semip_publish.py` runs on each
+> (`publish_nodes`): per-node rows under `_staging/<key>/<dump_id>/node<k>.json`,
+> a `wt12` over the union, each node uploading its own `rank*` and its
+> `node<k>/`, and node 0 writing the sentinel last so the DaemonSet still sees
+> one model directory. With `SEMIP_DUMP_PUBLISH=1` the engine starts it on every
+> pod itself. See [MULTINODE_TP16.md](MULTINODE_TP16.md) §10.
 The skeleton carries **one** sentinel over every `replica<K>/`, so a node
 verifies all replicas at once -- and the engine treats a pod that cannot
 materialize every replica as a failed job rather than mix restores with cold
@@ -420,14 +422,18 @@ and `_missing_device_nodes`, because a key that bound the devices where the chec
 did not would publish images nothing looks up, and the reverse is the placement
 lottery this replaced.
 
-**One exception, by design: TP=1 with several replicas per pod binds too**
-(`_device_binding(vllm_config, replica_count)`, since 2026-10-03). Not because a
-TP=1 image cannot move -- it still renumbers onto any GPU, and
-`_missing_device_nodes` stays TP>=2 only -- but because a 1-GPU pod (flat
-layout) and an 8-GPU pod (`replica0..7/`) are two shapes of the same config,
-and they must not share a directory. Folding in the pod's `/dev` set separates
-them, and makes a TP=1 multi-replica key behave like a TP>1 one. A single
-TP=1 replica keeps its old key.
+**One exception, by design: TP=1 with several replicas per pod binds a layout
+marker** (`_device_binding(vllm_config, replica_count)` returns
+`_TP1_REPLICA_LAYOUT`). Not because a TP=1 image cannot move -- it still
+renumbers onto any GPU, and `_missing_device_nodes` stays TP>=2 only -- but
+because the flat layout (one replica) and `replica<K>/` (several) are two
+shapes of the same config and must not share a directory. From 2026-10-03 the
+pod's `/dev` set did that job, which also gave every pod size its own key, so
+only an 8-GPU pod found the 8-replica image. Since 2026-10-14 the marker
+separates the two shapes and nothing else: a TP=1 pod of 2-7 GPUs resolves the
+8-GPU dump's key and restores `replica0..N-1` of it. A single TP=1 replica
+keeps its flat key. Only a whole-node pod publishes a TP=1 multi-replica
+dump, since a smaller pod's skeleton would lack the higher slots.
 
 **Why this is not "placement leaking into the key".** It reads like the thing a
 cache key should never depend on, and until this landed the code said so in as

@@ -243,7 +243,11 @@ rendezvous with a group that does not exist, and the failure is a deadlock in
 the first collective rather than an error. Every dump stamps a `dump_id` into
 every node-partition's `meta.json`, and a hit requires all of them to carry the
 same one; a missing node-partition, a mismatched id or a partial materialize
-all make every node-partition cold-start and dump together.
+all make every node-partition cold-start and dump together -- when the job sets
+`SEMIP_DUMP_PUBLISH=1`; otherwise the leader raises before any cold start.
+After such a dump restores, the leader and every `SemipNodeAgent` run
+`semip_publish.py` on their own pod (`_start_publish_nodes`), and node 0
+writes the sentinel.
 
 An **L7 config digest** is exchanged before `init` for the same reason: the
 node-partitions profile their shapes independently and then meet in a collective, so a

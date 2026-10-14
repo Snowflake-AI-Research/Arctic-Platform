@@ -250,6 +250,21 @@ class SemipNodeAgent:
         self._require().cuda_restore(gpus=list(self._gpus)).wait()
         return {"ok": True}
 
+    # -- publish -----------------------------------------------------------
+
+    def publish(self, key_dir: str) -> dict[str, Any]:
+        """Start publishing this pod's node-partition of ``key_dir``; returns at once.
+
+        The publisher has to run on every pod of the engine, since each holds
+        only its own ``node<k>/``; it runs in the background while the leader
+        serves.
+        """
+        import threading
+        from arctic_platform.inference.server.semip_engine import _publish_now
+        threading.Thread(target=_publish_now, args=(key_dir,),
+                         name="semip-publish", daemon=True).start()
+        return {"ok": True, "node_rank": self._node_rank}
+
     # -- lifecycle ---------------------------------------------------------
 
     def teardown(self) -> dict[str, Any]:

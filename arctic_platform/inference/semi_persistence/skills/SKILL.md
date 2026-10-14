@@ -143,6 +143,9 @@ semi_persistence/
   scripts/       imperative repros: need real GPUs and real vLLM
                  (except imgdiff.py / pidcheck.py, which only need crit + root)
   reproduce/     example_full.py: the saved -> up sweep across TP1/2/4/8
+  onboarding/    the model onboarding suite (semi_p vs plain jobs through the
+                 Cortex Training API), publish.py, and the root model configs
+                 with backends.json; see onboarding/README.md
   skills/        this skill (SKILL.md + reference.md) and every design doc
 ```
 
@@ -175,16 +178,18 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
   overwrite each other forever. The driver is in the key because it is
   bind-mounted from the host rather than shipped in the image, so the image
   digest alone does not fix it. See `IMAGE_CACHE.md` Section 6.
-- **At TP>1 the pod's device allocation is in the key; at TP=1 only with
-  several replicas per pod.** A TP>1 image can only be restored where every
-  device node it captured can be reopened, so `_device_binding` folds the
-  sorted `/dev` set into `cfg12` and "found" becomes the same statement as
-  "restorable". A single TP=1 image renumbers onto whatever slot it lands on,
-  so binding it would split one universally restorable image into one key per
-  GPU. TP=1 with several replicas per pod binds anyway, only so that a 1-GPU
-  pod (flat) and an 8-GPU pod (`replica0..7/`) never share a directory;
-  `_missing_device_nodes` stays TP>=2 only, because a TP=1 image still
-  restores on any GPU. The set is **sorted**,
+- **At TP>1 the pod's device allocation is in the key; at TP=1 it never is.**
+  A TP>1 image can only be restored where every device node it captured can be
+  reopened, so `_device_binding` folds the sorted `/dev` set into `cfg12` and
+  "found" becomes the same statement as "restorable". A single TP=1 image
+  renumbers onto whatever slot it lands on, so binding it would split one
+  universally restorable image into one key per GPU. TP=1 with several
+  replicas per pod binds a fixed marker (`_TP1_REPLICA_LAYOUT`) instead, so
+  the flat layout (a lone replica: the `tp1` root) and the `replica<K>/`
+  layout never share a directory, while a pod of **any** size computes the
+  key an 8-GPU pod dumped (the `tp1x8` root) and slot K restores
+  `replica<K>/`. `_missing_device_nodes` stays TP>=2 only, because a TP=1
+  image still restores on any GPU. The set is **sorted**,
   because a restore onto the same devices in a different order works
   (`[3, 1, 2, 0]` was measured coming back on `[3, 2, 0, 1]`); hashing the order
   would split an image into up to `TP!` keys. The gain is that dumps on
@@ -198,8 +203,19 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
   turns it off) and reads `weight/` (no baked path) in place. Every way it
   declines — an unverified directory, a foreign `model_dir` or uid, a publish
   that withheld the weights, a recorded size mismatch, any I/O failure — is a
-  cache miss that cold-starts, so the checks are strict on purpose. See
+  cache miss, never an error, so the checks are strict on purpose. See
   `IMAGE_CACHE.md` Section 9.
+- **A miss fails the job unless it sets `SEMIP_DUMP_PUBLISH=1`.** There is no
+  plain-engine fallback. Without the flag `restore_and_wrap` raises, telling
+  the user to set `semi_p` to false (or remove it) and resubmit, or to add the
+  flag. With it (in `vllm_config.extra_env`) the engine cold-starts, dumps,
+  restores and serves, then publishes in the background (`_start_publish`
+  runs `scripts/semip_publish.py` to the dev cluster's bucket). It publishes
+  only a whole-node pod or a lone TP=1 replica, only from one pod of the job
+  (the lowest-address GPU pod), never with the mirror off, and never over a
+  key that is already published. A TP=1 pod of 2–7 GPUs therefore dumps and
+  serves but does not publish: its skeleton would lack `replica<K>/` for the
+  slots a whole node needs.
 - **With several replicas per pod it is all-or-none.** A replica that
   cold-starts beside siblings that restore lands its new processes on the task
   ids their images recorded. So the checks every replica answers identically
@@ -216,15 +232,18 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
   every replica's weights hash the same, uploads one weight copy and writes one
   sentinel. Because slots restart at 0 on every node, an `n_gpus=16` job
   restores `replica0`/`replica1` of a single-node TP=4 dump on each node
-  (measured 2026-10-03). One replica per pod (TP=8 at `n_gpus=8`) keeps the
-  flat layout. See `IMAGE_CACHE.md` Sections 1 and 11.
-- **Never let an `n_gpus=16`/`32` job be the one that dumps.** Dump the same
-  spec at `n_gpus=8`, publish it, wait for `--status --wait-verified` to show
-  every node, and only then submit the multi-node job. `n_gpus` is not in the
-  key, so the larger job resolves the same skeleton. Nothing enforces this: a
-  replica sees only its own node, so on a miss every node cold-starts and
-  dumps its own identical local copy, and a node the skeleton is not yet
-  verified on cold-starts while the others restore.
+  (measured 2026-10-03), and a TP=1 pod of N < 8 GPUs restores
+  `replica0..N-1` of the `tp1x8` skeleton. One replica per pod (TP=8 at
+  `n_gpus=8`, TP=1 at `n_gpus=1`) keeps the flat layout. See `IMAGE_CACHE.md`
+  Sections 1 and 11.
+- **Publish at the root size, not from an `n_gpus=16`/`32` job.** Run
+  `onboarding/publish.py` (one job per root config, at its own `n_gpus`), wait
+  for the skeleton to be verified on every node, and only then submit larger
+  jobs. `n_gpus` is not in the key, so the larger job resolves the same
+  skeleton. A multi-pod job with `SEMIP_DUMP_PUBLISH=1` that misses still
+  cold-starts and dumps on every pod (each sees only its own node); only one
+  pod publishes, and a node the skeleton is not yet verified on cold-starts
+  while the others restore.
 - **Replicas share `/dev/shm`, so the dump unlinks only its own files.** The
   pre-dump unlink of `sem.*` (child) and `psm_*` (ranks) used to glob the pod,
   deleting segments a live sibling still needed. It is now scoped to the
