@@ -21,7 +21,7 @@ name = "Qwen/Qwen3-8B"
 project = "prime_rl_ct"
 
 [trainer.model]
-attn = "flash_attention_2"
+attn = "auto"
 ep = 1
 
 [trainer.model.ac]
