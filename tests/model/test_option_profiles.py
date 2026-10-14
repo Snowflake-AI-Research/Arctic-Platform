@@ -59,6 +59,7 @@ HUGGINGFACE_FIELDS: dict[str, str | None] = {
     "attention.backend": "attn_implementation",
     "attention.sparse_mla": None,
     "numerics.reduce_dtype": None,
+    # The loader has loader_options.fp32_parity, but no model_options key reaches it on this route yet.
     "numerics.fp32_parity": None,
     "numerics.optimization_dtype": None,
     "compile.fullgraph": "patches.compile.fullgraph",
