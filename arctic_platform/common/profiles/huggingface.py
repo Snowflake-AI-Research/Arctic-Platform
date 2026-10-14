@@ -15,7 +15,8 @@
 
 """Profile of the default ``huggingface`` loader.
 
-Its options are ``Patches`` and ``ModelSpec`` fields, and the loader's own ``loader_options.fp32_parity``.
+Its options are ``Patches`` and ``ModelSpec`` fields, and the loader's own ``loader_options.fp32_parity`` and
+``loader_options.fp32_residual``.
 
 The loader reads ``ModelSpec.dtype`` too, but ``numerics.optimization_dtype`` is unsupported here: on this route
 the job sets that dtype, and the key would have no effect.
@@ -27,6 +28,10 @@ weight instead of calling the norm, so with ``patches.liger`` only the first lay
 and final norms, runs Liger's RMSNorm kernel. ``numerics.fp32_parity`` is supported here and maps to
 ``loader_options.fp32_parity``; it changes only the stock dense Qwen3.5 family and, with sequence parallelism, that
 beta gate.
+
+``numerics.fp32_residual`` maps to ``loader_options.fp32_residual``, which is off by default, experimental, and
+accepted only with ``fp32_parity`` on. It keeps the residual stream of the patched dense forward in fp32 between
+decoder layers, so under full activation checkpointing each boundary after the first holds an fp32 residual.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ def register(registry: Registry) -> None:
             "lm_head.token_chunk_size",
             "lm_head.vocab_chunk_size",
             "numerics.fp32_parity",
+            "numerics.fp32_residual",
             "liger",
             "attention.backend",
             "compile.fullgraph",

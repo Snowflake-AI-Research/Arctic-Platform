@@ -16,7 +16,7 @@
 """The option entries: one per configurable option that exists in Arctic-Platform today.
 
 Only options with a one-to-one name on the loader side are registered. ``source`` names where each option is set
-today: a ``ModelSpec`` or ``Patches`` field, or its own ``loader_options.fp32_parity``, for the ``huggingface``
+today: a ``ModelSpec`` or ``Patches`` field, or one of its own ``loader_options``, for the ``huggingface``
 loader; for the custom loaders a ``loader_options`` field or a ``ModelSpec`` field the loader accepts, such as
 ``attn_implementation``; and an environment variable for the sampler. ``peft`` and ``zorro_train`` are training modes: the
 profiles settle them, but they keep their own config fields.
@@ -180,6 +180,21 @@ def register(registry: Registry) -> None:
         ),
         remove_when="no job needs the residual adds, rotary embedding and beta gate in the input dtype",
         source="`loader_options.fp32_parity`",
+        registry=registry,
+    )
+    register_option(
+        "numerics.fp32_residual",
+        runs_in="trainer",
+        goal="parity",
+        why=(
+            "Experimental. With fp32_parity on, carry the residual stream of the stock dense Qwen3.5 family in fp32"
+            " between decoder layers, from the embeddings on, instead of rounding it to the branch dtype after each"
+            " fused add. Checked on CPU against a reference and under checkpointing, offload and compile; its effect"
+            " on GPU training is not yet measured. Under full activation checkpointing each decoder layer after the"
+            " first holds an fp32 residual at its boundary, twice the bytes of a bf16 one."
+        ),
+        remove_when="GPU runs show it does not bring training closer to vLLM, or it becomes part of fp32_parity",
+        source="`loader_options.fp32_residual`",
         registry=registry,
     )
     register_option(

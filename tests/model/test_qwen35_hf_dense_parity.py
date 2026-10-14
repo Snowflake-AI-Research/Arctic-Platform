@@ -18,7 +18,9 @@ With the patch, the three roundings are checked at the stock classes against ref
 add in fp32 inside the next RMSNorm, the partial rotary embedding in fp32, and the GatedDeltaNet beta gate as a sigmoid
 of fp32 ``b``. Forward and backward are checked under the generic gradient-checkpointing patch (full layers, every
 layer and every other layer, reentrant and not), under activation offload, with each decoder layer compiled (traced by
-dynamo, as one graph and with graph breaks, and run eagerly), and with fp32 weights under bf16 autocast.
+dynamo, as one graph and with graph breaks, and run eagerly), and with fp32 weights under bf16 autocast. The
+experimental ``fp32_residual`` setting, which carries the residual stream in fp32 between decoder layers, is checked
+against the same reference loop and under the same checkpointing, offload and compile paths.
 The huggingface loader's ``fp32_parity`` set to false installs nothing, so the model is the stock one. The copied stock
 forward is pinned against the stock source of the verified transformers version, and the patch is applied only to the
 dense Qwen3.5 text model, once, and can be removed.
@@ -132,8 +134,22 @@ def _assert_same_run(output, grads, expected_output, expected_grads) -> None:
         torch_assert_equal(grads[name], expected_grads[name], msg=name)
 
 
-def _patched(model: nn.Module, *, sequence_parallel: bool = False) -> nn.Module:
-    assert hf_dense_parity.apply_fp32_parity(model, sequence_parallel=sequence_parallel) == 1
+def _patched(model: nn.Module, *, sequence_parallel: bool = False, fp32_residual: bool = False) -> nn.Module:
+    assert (
+        hf_dense_parity.apply_fp32_parity(model, sequence_parallel=sequence_parallel, fp32_residual=fp32_residual) == 1
+    )
+    return model
+
+
+# The forwards the checkpointing, offload and compile checks run: the patch, the patch with an fp32 residual stream,
+# and the stock model.
+_MODES = ["fp32-parity", "fp32-residual", "stock"]
+
+
+def _model_in_mode(mode: str, dtype: torch.dtype = torch.bfloat16) -> nn.Module:
+    model = _tiny_model(dtype)
+    if mode != "stock":
+        _patched(model, fp32_residual=mode == "fp32-residual")
     return model
 
 
@@ -269,16 +285,19 @@ def test_other_models_are_unaffected():
 # ---------------------------------------------------------------------------
 
 
-def _reference_fused_add_rms_norm(x, residual, weight, eps):
+def _reference_fused_add_rms_norm(x, residual, weight, eps, fp32_residual=False):
     # fp32 for the 16-bit dtypes; fp64 stays fp64 so the backward check can use it.
     compute = torch.float32 if x.dtype in (torch.bfloat16, torch.float16) else x.dtype
     summed = x.to(compute) + residual.to(compute)
     normed = summed * torch.rsqrt(summed.pow(2).mean(-1, keepdim=True) + eps) * (1.0 + weight.to(compute))
-    return normed.to(x.dtype), summed.to(x.dtype)
+    return normed.to(x.dtype), summed if fp32_residual else summed.to(x.dtype)
 
 
-def _reference_text_model(text_model, input_ids):
-    """The patched model's loop, with every norm written out: the residual add in fp32 inside the next norm."""
+def _reference_text_model(text_model, input_ids, fp32_residual=False):
+    """The patched model's loop, with every norm written out: the residual add in fp32 inside the next norm.
+
+    With ``fp32_residual`` the residual is the fp32 embeddings for the first layer and every sum stays unrounded.
+    """
     hidden = text_model.embed_tokens(input_ids)
     position_ids = torch.arange(input_ids.shape[1]).view(1, 1, -1).expand(4, 1, -1)
     position_embeddings = text_model.rotary_emb(hidden, position_ids[1:])
@@ -295,11 +314,11 @@ def _reference_text_model(text_model, input_ids):
     residual = None
     for layer, layer_type in zip(text_model.layers, text_model.config.layer_types):
         if residual is None:
-            residual = hidden
+            residual = hidden.float() if fp32_residual else hidden
             hidden = layer.input_layernorm(hidden)
         else:
             hidden, residual = _reference_fused_add_rms_norm(
-                hidden, residual, layer.input_layernorm.weight, layer.input_layernorm.eps
+                hidden, residual, layer.input_layernorm.weight, layer.input_layernorm.eps, fp32_residual
             )
         if layer_type == "linear_attention":
             hidden = layer.linear_attn(hidden_states=hidden, attention_mask=None)
@@ -311,7 +330,7 @@ def _reference_text_model(text_model, input_ids):
                 position_embeddings=position_embeddings,
             )
         hidden, residual = _reference_fused_add_rms_norm(
-            hidden, residual, layer.post_attention_layernorm.weight, layer.post_attention_layernorm.eps
+            hidden, residual, layer.post_attention_layernorm.weight, layer.post_attention_layernorm.eps, fp32_residual
         )
         hidden = layer.mlp(hidden)
     hidden, _ = _reference_fused_add_rms_norm(hidden, residual, text_model.norm.weight, text_model.norm.eps)
@@ -414,24 +433,20 @@ def _checkpointed(model: nn.Module, gradient_checkpointing) -> nn.Module:
     return replacement if replacement is not None else model
 
 
-@pytest.mark.parametrize("fp32_parity", [True, False], ids=["fp32-parity", "stock"])
+@pytest.mark.parametrize("mode", _MODES)
 @pytest.mark.parametrize("gradient_checkpointing", [True, 2], ids=["every-layer", "every-other-layer"])
-def test_gradient_checkpointing_patch_forward_backward_matches_eager(fp32_parity, gradient_checkpointing):
-    reference_model = _tiny_model()
-    if fp32_parity:
-        _patched(reference_model)
+def test_gradient_checkpointing_patch_forward_backward_matches_eager(mode, gradient_checkpointing):
+    reference_model = _model_in_mode(mode)
     checkpointed_model = _checkpointed(copy.deepcopy(reference_model), gradient_checkpointing)
 
     expected_output, expected_grads = _forward_backward(reference_model)
     _assert_same_run(*_forward_backward(checkpointed_model), expected_output, expected_grads)
 
 
-@pytest.mark.parametrize("fp32_parity", [True, False], ids=["fp32-parity", "stock"])
+@pytest.mark.parametrize("mode", _MODES)
 @pytest.mark.parametrize("use_reentrant", [True, False])
-def test_transformers_gradient_checkpointing_forward_backward_matches_eager(use_reentrant, fp32_parity):
-    reference_model = _tiny_model()
-    if fp32_parity:
-        _patched(reference_model)
+def test_transformers_gradient_checkpointing_forward_backward_matches_eager(use_reentrant, mode):
+    reference_model = _model_in_mode(mode)
     checkpointed_model = copy.deepcopy(reference_model)
     checkpointed_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": use_reentrant})
 
@@ -439,24 +454,28 @@ def test_transformers_gradient_checkpointing_forward_backward_matches_eager(use_
     _assert_same_run(*_forward_backward(checkpointed_model), expected_output, expected_grads)
 
 
-@pytest.mark.parametrize("fp32_parity", [True, False], ids=["fp32-parity", "stock"])
-def test_tensors_each_checkpointed_layer_receives(fp32_parity):
-    model = _tiny_model()
-    if fp32_parity:
-        _patched(model)
+@pytest.mark.parametrize("mode", _MODES)
+def test_tensors_each_checkpointed_layer_receives(mode):
+    model = _model_in_mode(mode)
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     received = []
     for layer in model.model.layers:
         checkpoint = layer._gradient_checkpointing_func
 
         def recording(function, *args, checkpoint=checkpoint, **kwargs):
-            received.append(sum(1 for arg in args if torch.is_tensor(arg) and arg.shape[-1] == 32))
+            received.append([arg.dtype for arg in args if torch.is_tensor(arg) and arg.shape[-1] == 32])
             return checkpoint(function, *args, **kwargs)
 
         layer._gradient_checkpointing_func = recording
     _forward_backward(model)
-    # With the patch every layer after the first holds the branch output and the residual at its boundary.
-    assert received == ([1, 2, 2, 2] if fp32_parity else [1, 1, 1, 1])
+    # With the patch every layer after the first holds the branch output and the residual at its boundary; with the
+    # fp32 residual stream that residual is fp32.
+    expected = {
+        "fp32-parity": [[torch.bfloat16]] + [[torch.bfloat16, torch.bfloat16]] * 3,
+        "fp32-residual": [[torch.bfloat16]] + [[torch.bfloat16, torch.float32]] * 3,
+        "stock": [[torch.bfloat16]] * 4,
+    }
+    assert received == expected[mode]
 
 
 def _eligible_on_any_device(self: ActivationOffloadManager, tensor: torch.Tensor) -> bool:
@@ -470,9 +489,10 @@ def _eligible_on_any_device(self: ActivationOffloadManager, tensor: torch.Tensor
     return True
 
 
-def test_activation_offload_forward_backward_matches_eager(monkeypatch):
+@pytest.mark.parametrize("mode", _MODES)
+def test_activation_offload_forward_backward_matches_eager(monkeypatch, mode):
     monkeypatch.setattr(ActivationOffloadManager, "_eligible", _eligible_on_any_device)
-    reference_model = _patched(_tiny_model())
+    reference_model = _model_in_mode(mode)
     offloaded_model = _checkpointed(copy.deepcopy(reference_model), True)
     manager = activation_offload.install_activation_offload(
         offloaded_model.model, keep_last_n=0, use_streams=False, tensor_size_threshold=0, pin_memory_enabled=False
@@ -494,12 +514,10 @@ def _compiled_layers(model: nn.Module, *, fullgraph: bool) -> nn.Module:
     return model
 
 
-@pytest.mark.parametrize("fp32_parity", [True, False], ids=["fp32-parity", "stock"])
+@pytest.mark.parametrize("mode", _MODES)
 @pytest.mark.parametrize("fullgraph", [True, False], ids=["fullgraph", "graph-breaks"])
-def test_compiled_layers_forward_backward_match_eager(fp32_parity, fullgraph):
-    reference_model = _tiny_model()
-    if fp32_parity:
-        _patched(reference_model)
+def test_compiled_layers_forward_backward_match_eager(mode, fullgraph):
+    reference_model = _model_in_mode(mode)
     compiled_model = _compiled_layers(copy.deepcopy(reference_model), fullgraph=fullgraph)
 
     expected_output, expected_grads = _forward_backward(reference_model)
@@ -542,8 +560,102 @@ def test_output_hidden_states_is_refused():
 
 
 # ---------------------------------------------------------------------------
+# The experimental fp32 residual stream
+# ---------------------------------------------------------------------------
+
+
+def _residual_dtypes(model: nn.Module) -> list[torch.dtype]:
+    dtypes = []
+    for layer in model.model.layers:
+        layer.register_forward_hook(lambda module, args, output: dtypes.append(output[1].dtype))
+    return dtypes
+
+
+@pytest.mark.parametrize(("dtype", "autocast"), [(torch.bfloat16, False), (torch.float32, True)])
+def test_fp32_residual_carries_the_residual_stream_in_fp32(dtype, autocast):
+    model = _patched(_tiny_model(dtype), fp32_residual=True)
+    residual_dtypes = _residual_dtypes(model)
+    output, grads = _forward_backward(model, autocast=autocast)
+    # From the first layer on, including the seed the embeddings give it; the final norm returns the branch dtype.
+    assert residual_dtypes == [torch.float32] * 4
+    assert output.dtype == torch.bfloat16
+    assert all(torch.isfinite(grad).all() for grad in grads.values())
+
+
+def test_fp32_residual_forward_matches_the_reference_loop():
+    model = _patched(_tiny_model(), fp32_residual=True)
+    input_ids = _input_ids()
+    with torch.no_grad():
+        expected = _reference_text_model(model.model, input_ids, fp32_residual=True)
+        actual = model.model(input_ids=input_ids).last_hidden_state
+    torch_assert_equal(actual, expected)
+    # The rounded residual stream gives a different result, so the setting is in effect.
+    with torch.no_grad():
+        rounded = _reference_text_model(model.model, input_ids)
+    assert not torch.equal(actual, rounded)
+
+
+def test_fp32_residual_backward_matches_the_reference_loop():
+    model = _patched(_tiny_model(), fp32_residual=True)
+    reference = copy.deepcopy(model)
+    input_ids = _input_ids()
+    model.model(input_ids=input_ids).last_hidden_state.float().pow(2).mean().backward()
+    _reference_text_model(reference.model, input_ids, fp32_residual=True).float().pow(2).mean().backward()
+    # The fused backward recomputes the sum and orders its fp32 reductions differently from autograd through the
+    # reference, so the bf16 gradients agree to bf16 resolution rather than bit for bit.
+    for (name, parameter), (_, expected) in zip(model.named_parameters(), reference.named_parameters()):
+        if parameter.grad is not None:
+            torch_assert_close(parameter.grad.float(), expected.grad.float(), rtol=2e-2, atol=1e-3, msg=name)
+
+
+def test_fp32_residual_brings_a_bf16_model_closer_to_its_fp64_copy():
+    model = _tiny_model()
+    exact = copy.deepcopy(model).to(torch.float64)
+    with torch.no_grad():
+        expected = exact.model(input_ids=_input_ids()).last_hidden_state
+        errors = {}
+        for fp32_residual in (False, True):
+            patched = _patched(copy.deepcopy(model), fp32_residual=fp32_residual)
+            output = patched.model(input_ids=_input_ids()).last_hidden_state.double()
+            errors[fp32_residual] = (output - expected).norm() / expected.norm()
+    assert errors[True] < errors[False]
+
+
+def test_fp32_residual_is_cleared_when_the_patch_is_removed():
+    model = _patched(_tiny_model(), fp32_residual=True)
+    assert all(getattr(layer, "_arctic_fp32_residual") for layer in model.model.layers)
+    assert hf_dense_parity.remove_fp32_parity(model) == 1
+    assert not any("_arctic_fp32_residual" in vars(layer) for layer in model.model.layers)
+    _patched(model)
+    residual_dtypes = _residual_dtypes(model)
+    with torch.no_grad():
+        model.model(input_ids=_input_ids())
+    assert residual_dtypes == [torch.bfloat16] * 4
+
+
+# ---------------------------------------------------------------------------
 # The huggingface loader
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("loader_options", "fp32_residual"), [({}, False), ({"fp32_residual": True}, True)])
+def test_loader_passes_fp32_residual_to_the_patch(monkeypatch, loader_options, fp32_residual):
+    from arctic_platform.model.loaders.huggingface import load_huggingface
+
+    model = _tiny_model()
+    monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
+    spec = ModelSpec(model_path_or_name="tiny", loader="huggingface", loader_options=loader_options)
+
+    load_huggingface(LoaderContext(spec=spec))
+
+    assert [getattr(layer, "_arctic_fp32_residual") for layer in model.model.layers] == [fp32_residual] * 4
+
+
+def test_fp32_residual_without_fp32_parity_is_rejected():
+    from arctic_platform.model.loaders.huggingface import HuggingfaceOptions
+
+    with pytest.raises(ValueError, match="fp32_residual requires fp32_parity"):
+        HuggingfaceOptions.model_validate({"fp32_parity": False, "fp32_residual": True})
 
 
 @pytest.mark.parametrize(("loader_options", "patched"), [({}, True), ({"fp32_parity": False}, False)])
