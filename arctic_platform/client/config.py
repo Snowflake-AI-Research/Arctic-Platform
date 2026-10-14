@@ -331,14 +331,9 @@ class ArcticClientConfig(BaseModel):
             training["optimizer"] = optimizer
         if "enable_gradient_checkpointing" in worker:
             training["activation_checkpointing"] = worker["enable_gradient_checkpointing"]
-        provider = worker.get("model_provider")
-        use_liger = bool(worker.get("use_liger")) or provider == "liger"
-        if provider == "liger":
-            provider = "huggingface"
+        provider = worker.get("model_provider") or ("liger" if worker.get("use_liger") else None)
         if provider:
             training["model_provider"] = provider
-        if use_liger:
-            training["use_liger"] = True
         if worker.get("attn_implementation"):
             training["attn_implementation"] = worker["attn_implementation"]
         # Neutrino-only engine knobs ride along in ds_worker_config; on-prem ignores them.
