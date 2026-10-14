@@ -79,7 +79,9 @@ def _ulysses_attn_forward(
     return self.output_proj(attn_output.flatten(-2)), None
 
 
-def _make_backbone_sp_forward(original_forward, sp_group, softmax_attn_modules, linear_attn_modules):
+def _make_backbone_sp_forward(
+    original_forward, sp_group, softmax_attn_modules, linear_attn_modules, mamba_layers
+):
     sp_world_size = dist.get_world_size(sp_group)
     accepted = inspect.signature(original_forward).parameters
 
@@ -92,7 +94,7 @@ def _make_backbone_sp_forward(original_forward, sp_group, softmax_attn_modules, 
         routed_experts=None,
         **kwargs,
     ):
-        if position_ids is not None and (softmax_attn_modules or linear_attn_modules):
+        if position_ids is not None and (softmax_attn_modules or linear_attn_modules or mamba_layers):
             gathered_position_ids = [torch.empty_like(position_ids) for _ in range(sp_world_size)]
             dist.all_gather(gathered_position_ids, position_ids.contiguous(), group=sp_group)
             global_position_ids = torch.cat(gathered_position_ids, dim=1)
@@ -103,6 +105,8 @@ def _make_backbone_sp_forward(original_forward, sp_group, softmax_attn_modules, 
                 module._sp_max_seqlen = max_seqlen
             for module in linear_attn_modules:
                 module._dss_sp_global_cu_seqlens = cu_seqlens
+            for layer in mamba_layers:
+                layer._sp_cu_seqlens = cu_seqlens
 
         call_kwargs = {
             "input_ids": input_ids,
@@ -162,6 +166,7 @@ def apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None
             sp_group,
             softmax_attn_modules,
             linear_attn_modules,
+            mamba_layers,
         ),
         backbone,
     )

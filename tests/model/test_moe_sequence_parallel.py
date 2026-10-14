@@ -16,7 +16,10 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 from torch import nn
+
+from arctic_platform.model.implementations.layers.cp_mamba import _causal_conv_packed
 
 from arctic_platform.model.implementations.moe import sequence_parallel
 
@@ -92,6 +95,45 @@ def test_generic_sequence_parallel_requires_nemotron_mamba_layers(monkeypatch):
 
     with pytest.raises(TypeError, match="no Mamba layers"):
         sequence_parallel.apply_sequence_parallelism(backbone, 2, object())
+
+
+def test_nemotron_sp_stashes_global_cu_seqlens(monkeypatch):
+    backbone = _Backbone("nemotron_h", [None])
+    mamba = _MambaLayer()
+    backbone.layers.insert(0, mamba)
+    group = object()
+
+    def all_gather(output_list, tensor, group=None):
+        del group
+        for buf in output_list:
+            buf.copy_(tensor)
+
+    monkeypatch.setattr(sequence_parallel, "get_language_model", lambda model: model)
+    monkeypatch.setattr(sequence_parallel.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(sequence_parallel.dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(sequence_parallel.dist, "all_gather", all_gather)
+
+    sequence_parallel.apply_sequence_parallelism(backbone, 2, group)
+    position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+    backbone(position_ids=position_ids)
+
+    cu_seqlens = mamba._sp_cu_seqlens
+    assert int(cu_seqlens[-1]) == position_ids.shape[1] * 2
+    assert cu_seqlens.numel() > 2
+
+
+def test_causal_conv_packed_resets_at_row_boundaries():
+    weight = torch.tensor([[[1.0, 1.0, 1.0]]])
+    hidden = torch.tensor([[[1.0], [1.0], [1.0], [9.0], [9.0], [9.0]]])
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+
+    packed = _causal_conv_packed(hidden, weight, None, 1, cu_seqlens)
+    left = _causal_conv_packed(hidden[:, :3], weight, None, 1, None)
+    right = _causal_conv_packed(hidden[:, 3:], weight, None, 1, None)
+    whole = _causal_conv_packed(hidden, weight, None, 1, None)
+
+    assert torch.allclose(packed, torch.cat([left, right], dim=1))
+    assert not torch.allclose(packed[:, 3:], whole[:, 3:])
 
 
 def test_generic_sequence_parallel_requires_flash_attention(monkeypatch):
