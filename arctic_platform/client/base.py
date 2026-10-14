@@ -274,10 +274,32 @@ class ArcticClient(_ArcticClientCore):
 class AsyncArcticClient(_ArcticClientCore):
     """The awaitable frontend; the async twin of `ArcticClient`."""
 
-    async def _acall(self, request: Request) -> dict:
+    async def _acall(self, request: Request) -> dict | list[dict]:
         out = await self.transport.acall(request)
         _maybe_print_server_profile(request.op, out)
         return out
+
+    # ── cluster ──────────────────────────────────────────────────────────
+    async def list_jobs(self, status: str | None = None) -> list[dict]:
+        return await self._acall(list_jobs_request(status))
+
+    async def capacity(self, hardware: str | None = None) -> dict:
+        return await self._acall(capacity_request(hardware))
+
+    async def cancel_job(self, job_id: JobId) -> None:
+        await self._acall(cancel_job_request(job_id))
+
+    async def get_job(self) -> dict:
+        return await self._acall(get_job_request(self.jobs.require_any()))
+
+    async def list_checkpoints(self) -> list[dict]:
+        return await self._acall(list_checkpoints_request(self.jobs.require("training")))
+
+    async def export_checkpoint(self, checkpoint_id: str) -> dict:
+        return await self._acall(export_checkpoint_request(self.jobs.require("training"), checkpoint_id))
+
+    async def delete_checkpoint(self, checkpoint_id: str) -> None:
+        await self._acall(delete_checkpoint_request(self.jobs.require("training"), checkpoint_id))
 
     # ── training ─────────────────────────────────────────────────────────
     async def fwd_bwd(

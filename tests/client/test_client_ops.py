@@ -399,30 +399,26 @@ class TestClusterRequestBuilders:
 
 
 class TestClusterClientMethods:
-    @pytest.fixture
-    def sync_client(self, monkeypatch) -> ArcticRLClient:
-        return _build(monkeypatch, ArcticRLClient)
-
-    def test_account_ops_use_the_given_arguments(self, sync_client):
+    def test_account_ops_use_the_given_arguments(self, client):
         """Account-level ops need no stored handle."""
-        sync_client.list_jobs("running")
-        assert _last(sync_client) == cluster_requests.list_jobs_request("running")
-        sync_client.capacity("H200")
-        assert _last(sync_client) == cluster_requests.capacity_request("H200")
-        sync_client.cancel_job("job-9")
-        assert _last(sync_client) == cluster_requests.cancel_job_request("job-9")
+        _call(client, "list_jobs", "running")
+        assert _last(client) == cluster_requests.list_jobs_request("running")
+        _call(client, "capacity", "H200")
+        assert _last(client) == cluster_requests.capacity_request("H200")
+        _call(client, "cancel_job", "job-9")
+        assert _last(client) == cluster_requests.cancel_job_request("job-9")
 
-    def test_get_job_targets_a_stored_handle(self, sync_client):
-        sync_client.get_job()
-        assert _last(sync_client) == cluster_requests.get_job_request(TRAINING)
+    def test_get_job_targets_a_stored_handle(self, client):
+        _call(client, "get_job")
+        assert _last(client) == cluster_requests.get_job_request(TRAINING)
 
-    def test_checkpoint_ops_target_the_training_job(self, sync_client):
-        sync_client.list_checkpoints()
-        assert _last(sync_client) == cluster_requests.list_checkpoints_request(TRAINING)
-        sync_client.export_checkpoint("cp-1")
-        assert _last(sync_client) == cluster_requests.export_checkpoint_request(TRAINING, "cp-1")
-        sync_client.delete_checkpoint("cp-1")
-        assert _last(sync_client) == cluster_requests.delete_checkpoint_request(TRAINING, "cp-1")
+    def test_checkpoint_ops_target_the_training_job(self, client):
+        _call(client, "list_checkpoints")
+        assert _last(client) == cluster_requests.list_checkpoints_request(TRAINING)
+        _call(client, "export_checkpoint", "cp-1")
+        assert _last(client) == cluster_requests.export_checkpoint_request(TRAINING, "cp-1")
+        _call(client, "delete_checkpoint", "cp-1")
+        assert _last(client) == cluster_requests.delete_checkpoint_request(TRAINING, "cp-1")
 
     def test_onprem_rejects_cluster_ops(self):
         """On-prem has no job persistence, so cluster ops fail instead of reaching the Ray server."""
