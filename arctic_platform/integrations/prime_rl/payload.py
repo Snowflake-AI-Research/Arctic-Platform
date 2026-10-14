@@ -74,13 +74,16 @@ def _split_samples(micro_batch: MicroBatch) -> list[_Sample]:
 
 
 def build_fwd_bwd_payload(
-    micro_batches: list[MicroBatch], *, adv_tau: float, min_rows: int
+    micro_batches: list[MicroBatch], *, adv_tau: float, min_rows: int, include_temperature: bool = True
 ) -> tuple[dict[str, Any], dict[str, float]]:
     """The forward-backward payload of one training step, and batch statistics.
 
     A sample whose only trainable token is its first predicts nothing and is dropped.
     Cortex hands every data-parallel rank at least one row, so short batches are
     padded to ``min_rows`` with one-token rows that carry no loss.
+
+    ``include_temperature`` adds the per-token temperature tensor the MoE provider's chunked
+    LM head requires; the default (dense) provider's forward takes no such kwarg, so pass False.
     """
     samples = [
         sample
@@ -108,15 +111,17 @@ def build_fwd_bwd_payload(
     attention_mask[len(samples) :, 0] = 1
 
     input_ids_tensor = torch.from_numpy(input_ids)
+    kwargs: dict[str, Any] = {
+        "input_ids": input_ids_tensor,
+        "attention_mask": torch.from_numpy(attention_mask),
+    }
+    if include_temperature:
+        # The MoE chunked LM head scales every position's logits by its temperature; all loss
+        # tokens were sampled at temperature 1 (see _split_samples).
+        kwargs["temperature"] = torch.ones((num_rows, width), dtype=torch.float32)
     payload = {
         "args": (),
-        "kwargs": {
-            "input_ids": input_ids_tensor,
-            "attention_mask": torch.from_numpy(attention_mask),
-            # The chunked LM head scales every position's logits by its temperature; all loss
-            # tokens were sampled at temperature 1 (see _split_samples).
-            "temperature": torch.ones((num_rows, width), dtype=torch.float32),
-        },
+        "kwargs": kwargs,
         "context": {
             "input_ids": input_ids_tensor,
             "loss_mask": torch.from_numpy(loss_mask),

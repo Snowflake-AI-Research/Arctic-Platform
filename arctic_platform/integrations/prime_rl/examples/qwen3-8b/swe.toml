@@ -1,0 +1,55 @@
+# Qwen3-8B (dense) SWE RL on Snowflake Cortex via the default training provider — a smaller,
+# cheaper counterpart to the qwen3.6-35b-a3b MoE SWE recipe. One 8-GPU training sub-job + one
+# 8-GPU sampling sub-job (TP 1 -> 8 replicas). seq_len is 32768 (the default provider has no
+# sequence parallelism), so long agent trajectories truncate — this is a small/cheap run.
+#
+#   python -m arctic_platform.integrations.prime_rl.rl \
+#     @ arctic_platform/integrations/prime_rl/examples/qwen3-8b/swe.toml
+#
+# The SWE sandbox uses PrimeIntellect's sandbox service (verifiers' default `prime` runtime);
+# set env.agent.runtime.* to pick another verifiers runtime.
+
+seq_len = 32768
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3-8B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "flash_attention_2"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[orchestrator]
+batch_size = 64
+max_off_policy_steps = 16
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.concurrency]
+initial_inflight = 256
+
+[[orchestrator.train.source]]
+name = "swe"
+env.taskset.id = "r2e-gym"
+env.agent.harness.id = "bash"
+env.agent.runtime.labels = ["qwen3-8b-cortex-swe", "swe"]
+
+# Dense model -> Cortex default training provider (no prime_rl/ep/sp block).
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1

@@ -404,6 +404,8 @@ class CortexWorker:
     async def train(self) -> None:
         processing = grpo_processing(self.trainer.loss)
         min_rows = self.cortex.training.num_gpus // self.cortex.training.sp_size
+        # Only the MoE provider's chunked LM head takes a per-token temperature kwarg.
+        include_temperature = self.cortex.training.model_provider == "prime_rl"
         self.logger.info("Offering the startup policy (v0), which the sampler already serves")
         await self.offer(0, sync=False)
 
@@ -415,7 +417,11 @@ class CortexWorker:
 
             t0 = time.perf_counter()
             payload, batch_stats = await asyncio.to_thread(
-                build_fwd_bwd_payload, micro_batches, adv_tau=self.trainer.loss.adv_tau, min_rows=min_rows
+                build_fwd_bwd_payload,
+                micro_batches,
+                adv_tau=self.trainer.loss.adv_tau,
+                min_rows=min_rows,
+                include_temperature=include_temperature,
             )
             payload_time = time.perf_counter() - t0
 

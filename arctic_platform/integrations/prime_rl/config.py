@@ -71,6 +71,11 @@ class CortexTrainingConfig(BaseConfig):
     sp_size: int = Field(1, ge=1)
     """Ulysses sequence-parallel degree of the training sub-job (the Cortex counterpart of the trainer's cp)."""
 
+    model_provider: str | None = "prime_rl"
+    """Cortex training model provider. ``prime_rl`` runs the MoE provider (expert parallelism, grouped
+    MoE matmul, DeepEP, chunked LM head). Anything else — ``None`` for the plain default provider, or e.g.
+    ``liger`` — runs a dense model through the default provider, with no MoE/ep/sp block."""
+
     max_tokens_per_mb: int | None = Field(None, ge=1)
     """Token budget of one packed training micro batch. Defaults to ``seq_len``."""
 
@@ -183,6 +188,12 @@ class CortexRLConfig(RLConfig):
             raise ValueError("Use cortex.training.sp_size for sequence parallelism; trainer.model.cp must be 1.")
         if not isinstance(model.ep, int):
             raise ValueError("Set trainer.model.ep explicitly: it becomes the Cortex training sub-job's ep_size.")
+        if self.cortex.training.model_provider != "prime_rl":
+            # Dense model on Cortex's default provider: no MoE expert/sequence parallelism.
+            if model.ep != 1:
+                raise ValueError("The default provider has no expert parallelism: set trainer.model.ep = 1.")
+            if self.cortex.training.sp_size != 1:
+                raise ValueError("The default provider has no sequence parallelism: set cortex.training.sp_size = 1.")
         if self.trainer.enable_router_replay:
             raise ValueError("Router replay is not wired to Cortex.")
 

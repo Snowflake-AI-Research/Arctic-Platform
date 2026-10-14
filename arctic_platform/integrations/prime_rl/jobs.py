@@ -51,25 +51,10 @@ def training_sub_job(config: CortexRLConfig) -> dict[str, Any]:
     training = config.cortex.training
     dp_size = training.num_gpus // training.sp_size
     training_config: dict[str, Any] = {
-        "model_provider": "prime_rl",
         "max_seq_len": model.seq_len,
         "train_batch_size": dp_size,
         "n_gpus": training.num_gpus,
-        "ep_size": model.ep,
         "mb_spec": {"max_tokens_per_mb": training.max_tokens_per_mb or model.seq_len},
-        "prime_rl": {
-            "seq_len": model.seq_len,
-            "ep_comm_backend": "deepep",
-            "optimization_dtype": model.optimization_dtype,
-            "reduce_dtype": model.reduce_dtype,
-            "moe_use_grouped_mm": True,
-            # The fused cross-entropy head returns only a loss, never the logprobs GRPO needs; the
-            # chunked head computes them token chunk by token chunk, as the native trainer does.
-            "fused_lm_head_token_chunk_size": model.fused_lm_head_token_chunk_size,
-            "fp32_lm_head": False,
-            "fused_cross_entropy": False,
-            **training.prime_rl,
-        },
         "optimizer": {
             "name": "AdamW",
             "lr": optim.lr,
@@ -87,16 +72,42 @@ def training_sub_job(config: CortexRLConfig) -> dict[str, Any]:
     }
     if model.attn != "auto":
         training_config["attn_implementation"] = model.attn
-        training_config["attn_impl"] = model.attn
-    if training.sp_size > 1:
-        training_config["sp_size"] = training.sp_size
     if optim.max_norm is not None:
         training_config["gradient_clipping"] = optim.max_norm
-    if model.ac is not None:
-        ac_config: dict[str, Any] = {"mode": model.ac.mode, "freq": model.ac.freq}
-        if model.ac_offloading is not None:
-            ac_config["offload_config"] = {"enabled": True}
-        training_config["ac_config"] = ac_config
+
+    if training.model_provider == "prime_rl":
+        # MoE provider: expert parallelism, grouped MoE matmul, DeepEP, and the chunked LM head
+        # (the fused cross-entropy head returns only a loss, never the logprobs GRPO needs; the
+        # chunked head computes them token chunk by token chunk, as the native trainer does).
+        training_config["model_provider"] = "prime_rl"
+        training_config["ep_size"] = model.ep
+        training_config["prime_rl"] = {
+            "seq_len": model.seq_len,
+            "ep_comm_backend": "deepep",
+            "optimization_dtype": model.optimization_dtype,
+            "reduce_dtype": model.reduce_dtype,
+            "moe_use_grouped_mm": True,
+            "fused_lm_head_token_chunk_size": model.fused_lm_head_token_chunk_size,
+            "fp32_lm_head": False,
+            "fused_cross_entropy": False,
+            **training.prime_rl,
+        }
+        if model.attn != "auto":
+            training_config["attn_impl"] = model.attn
+        if training.sp_size > 1:
+            training_config["sp_size"] = training.sp_size
+        if model.ac is not None:
+            ac_config: dict[str, Any] = {"mode": model.ac.mode, "freq": model.ac.freq}
+            if model.ac_offloading is not None:
+                ac_config["offload_config"] = {"enabled": True}
+            training_config["ac_config"] = ac_config
+    else:
+        # Dense model on Cortex's default provider: the model forward returns logits, so GRPO's
+        # compute_logprobs needs no MoE/ep/sp block, no chunked LM head, and no per-token temperature.
+        if training.model_provider not in (None, "default"):
+            training_config["model_provider"] = training.model_provider
+        if model.ac is not None:
+            training_config["activation_checkpointing"] = True
     training_config.update(training.extra)
     return {
         "job_type": "training",
