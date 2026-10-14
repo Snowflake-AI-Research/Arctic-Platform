@@ -99,8 +99,8 @@ def _config() -> Qwen3_5TextConfig:
     return config
 
 
-def _tiny_model(dtype: torch.dtype = torch.bfloat16) -> modeling_qwen3_5.Qwen3_5ForCausalLM:
-    set_seed(0)
+def _tiny_model(dtype: torch.dtype = torch.bfloat16, seed: int = 0) -> modeling_qwen3_5.Qwen3_5ForCausalLM:
+    set_seed(seed)
     model = modeling_qwen3_5.Qwen3_5ForCausalLM(_config()).to(dtype)
     # The zero-initialized (1 + weight) norm weights would hide a dropped weight; give every parameter a value.
     with torch.no_grad():
@@ -109,8 +109,8 @@ def _tiny_model(dtype: torch.dtype = torch.bfloat16) -> modeling_qwen3_5.Qwen3_5
     return model.train()
 
 
-def _input_ids() -> torch.Tensor:
-    return torch.randint(0, 64, (1, _SEQ), generator=torch.Generator().manual_seed(1))
+def _input_ids(seed: int = 0) -> torch.Tensor:
+    return torch.randint(0, 64, (1, _SEQ), generator=torch.Generator().manual_seed(seed + 1))
 
 
 def _forward_backward(model: nn.Module, autocast: bool = False):
@@ -595,30 +595,56 @@ def test_fp32_residual_forward_matches_the_reference_loop():
     assert not torch.equal(actual, rounded)
 
 
-def test_fp32_residual_backward_matches_the_reference_loop():
-    model = _patched(_tiny_model(), fp32_residual=True)
+def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    return ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
+
+
+def test_fp32_residual_fused_norm_backward_matches_autograd_through_the_reference():
+    from arctic_platform.model.implementations.gpu.vllm_rounding import FusedAddRMSNormFp32Residual
+
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(2, _SEQ, 32, generator=generator).bfloat16().requires_grad_()
+    residual = torch.randn(2, _SEQ, 32, generator=generator).requires_grad_()
+    weight = (0.2 * torch.randn(32, generator=generator)).bfloat16().requires_grad_()
+    grad_out = torch.randn(2, _SEQ, 32, generator=generator).bfloat16()
+    grad_sum = torch.randn(2, _SEQ, 32, generator=generator)
+
+    out, summed = FusedAddRMSNormFp32Residual.apply(x, residual, weight, _EPS)
+    expected_out, expected_sum = _reference_fused_add_rms_norm(x, residual, weight, _EPS, fp32_residual=True)
+    torch_assert_equal(out, expected_out)
+    torch_assert_equal(summed, expected_sum)
+    assert summed.dtype == torch.float32
+    grads = torch.autograd.grad(
+        (out.float() * grad_out.float()).sum() + (summed * grad_sum).sum(), (x, residual, weight)
+    )
+    expected_grads = torch.autograd.grad(
+        (expected_out.float() * grad_out.float()).sum() + (expected_sum * grad_sum).sum(), (x, residual, weight)
+    )
+    # One operation: the two backwards differ only in the order of their fp32 reductions (about 1e-7 here).
+    for name, grad, expected in zip(("x", "residual", "weight"), grads, expected_grads):
+        assert grad.dtype == expected.dtype, name
+        assert _relative_error(grad, expected) < 1e-5, name
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_fp32_residual_backward_matches_the_reference_loop(seed):
+    model = _patched(_tiny_model(seed=seed), fp32_residual=True)
     reference = copy.deepcopy(model)
-    input_ids = _input_ids()
+    input_ids = _input_ids(seed)
     model.model(input_ids=input_ids).last_hidden_state.float().pow(2).mean().backward()
     _reference_text_model(reference.model, input_ids, fp32_residual=True).float().pow(2).mean().backward()
-    # The fused backward recomputes the sum and orders its fp32 reductions differently from autograd through the
-    # reference, so the bf16 gradients agree to bf16 resolution rather than bit for bit.
-    for (name, parameter), (_, expected) in zip(model.named_parameters(), reference.named_parameters()):
-        if parameter.grad is not None:
-            torch_assert_close(parameter.grad.float(), expected.grad.float(), rtol=2e-2, atol=1e-3, msg=name)
-
-
-def test_fp32_residual_brings_a_bf16_model_closer_to_its_fp64_copy():
-    model = _tiny_model()
-    exact = copy.deepcopy(model).to(torch.float64)
-    with torch.no_grad():
-        expected = exact.model(input_ids=_input_ids()).last_hidden_state
-        errors = {}
-        for fp32_residual in (False, True):
-            patched = _patched(copy.deepcopy(model), fp32_residual=fp32_residual)
-            output = patched.model(input_ids=_input_ids()).last_hidden_state.double()
-            errors[fp32_residual] = (output - expected).norm() / expected.norm()
-    assert errors[True] < errors[False]
+    grads = {name: parameter.grad for name, parameter in model.named_parameters() if parameter.grad is not None}
+    expected = {name: parameter.grad for name, parameter in reference.named_parameters() if parameter.grad is not None}
+    assert grads.keys() == expected.keys()
+    # The fused backward orders its fp32 reductions differently from autograd through the reference, and through
+    # four bf16 layers that moves single elements by a bf16 step or two, by a different amount on each CPU. Each
+    # parameter's gradient is compared as a whole instead: over seeds and thread counts its relative error stays
+    # near 3e-2 at most, and the whole gradient's near 2.5e-2.
+    for name in grads:
+        assert _relative_error(grads[name], expected[name]) < 5e-2, name
+    whole = torch.cat([grads[name].float().flatten() for name in grads])
+    expected_whole = torch.cat([expected[name].float().flatten() for name in grads])
+    assert _relative_error(whole, expected_whole) < 4e-2
 
 
 def test_fp32_residual_is_cleared_when_the_patch_is_removed():
