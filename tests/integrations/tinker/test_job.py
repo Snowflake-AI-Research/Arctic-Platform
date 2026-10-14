@@ -31,6 +31,7 @@ def test_client_config_uses_packaged_types(monkeypatch):
     config = client_config(TinkerJobConfig())
 
     assert config.backend.base_url == "http://cortex.test"
+    assert config.backend.job_ready_timeout == 3600.0
     assert config.training.peft is None
     assert config.training.ds_config["zero_optimization"] == {"stage": 2}
     assert config.sampling.vllm == {"gpu_memory_utilization": 0.8}
@@ -43,6 +44,7 @@ def test_client_config_reads_a_connection_file(tmp_path):
     config = client_config(TinkerJobConfig(config=str(path)))
 
     assert config.backend.base_url == "http://cortex.test"
+    assert config.backend.job_ready_timeout == 3600.0
 
 
 def test_adam_is_provisioned_as_the_cookbook_sends_it(monkeypatch):

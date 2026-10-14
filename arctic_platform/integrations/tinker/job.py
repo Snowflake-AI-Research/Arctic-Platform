@@ -179,6 +179,7 @@ def client_config(cfg: TinkerJobConfig) -> Any:
     else:
         backend = _backend_from_env_or_profile(CortexConfig)
 
+    backend = backend.model_copy(update={"job_ready_timeout": 3600.0})
     return ArcticClientConfig(
         backend=backend,
         model_name=cfg.model,
@@ -187,7 +188,6 @@ def client_config(cfg: TinkerJobConfig) -> Any:
         dtype=cfg.dtype,
         training_gpus=cfg.training_gpus,
         sampling_gpus=cfg.sampling_gpus,
-        job_ready_timeout=3600.0,
         training=TrainingConfig(
             ds_config={
                 "train_batch_size": cfg.micro_batch_size * cfg.training_gpus * cfg.gradient_accumulation_steps,

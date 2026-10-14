@@ -154,6 +154,35 @@ def test_qwen38_replaces_moe_and_shards_ple_embedding():
     assert embedding.weight._dss_skip_weight_sync
 
 
+def test_qwen38_decoder_forwards_its_physical_layer_routes():
+    _require()
+    from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+    class LinearAttention(torch.nn.Module):
+        def forward(self, hidden_states, **_kwargs):
+            return torch.zeros_like(hidden_states)
+
+    class RouteSpy(torch.nn.Module):
+        def forward(self, hidden_states, routed_experts=None):
+            self.routed_experts = routed_experts
+            return torch.zeros_like(hidden_states)
+
+    model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
+    layer = get_language_model(model).layers[0]
+    layer.ple = None
+    layer.linear_attn = LinearAttention()
+    layer.mlp = RouteSpy()
+    routes = torch.arange(8).reshape(1, 2, 2, 2)
+
+    layer(
+        torch.randn(1, 2, 32),
+        position_embeddings=(torch.ones(1), torch.zeros(1)),
+        routed_experts=routes,
+    )
+
+    torch.testing.assert_close(layer.mlp.routed_experts, routes[:, :, 0, :])
+
+
 def test_qwen38_model_builder_selects_custom_vlm(tmp_path):
     _require()
     _tiny_config().save_pretrained(tmp_path)
@@ -325,9 +354,26 @@ def test_qwen38_ep_embedding_masks_nonlocal_rows(monkeypatch):
     embedding._ep_rank = 1
     embedding._ep_world_size = 2
     embedding._ep_group = object()
+
+    def all_to_all_single(output, tensor, **_kwargs):
+        if tensor.numel() == 2:
+            output.copy_(torch.tensor([0, 2]))
+        else:
+            output.copy_(tensor[1:])
+
     monkeypatch.setattr(
-        "arctic_platform.model.implementations.qwen38.modeling_qwen4_exp.dist_nn.all_reduce",
-        lambda tensor, group: tensor,
+        "arctic_platform.model.implementations.qwen38.modeling_qwen4_exp.dist.all_to_all_single",
+        all_to_all_single,
+    )
+
+    def differentiable_all_to_all(output, tensor, **_kwargs):
+        output.zero_()
+        output[1:].copy_(tensor)
+        return output
+
+    monkeypatch.setattr(
+        "arctic_platform.model.implementations.qwen38.modeling_qwen4_exp.dist_nn.all_to_all_single",
+        differentiable_all_to_all,
     )
 
     output = embedding(torch.tensor([[0, 4, 6]]))
@@ -337,18 +383,21 @@ def test_qwen38_ep_embedding_masks_nonlocal_rows(monkeypatch):
     )
 
 
-def test_qwen38_hf_sync_excludes_frozen_ple_table(monkeypatch):
+def test_qwen38_hf_checkpoint_includes_frozen_ple_table(monkeypatch):
     _require()
     from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
 
     model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-    embedding = model.model.language_model.layers[0].ple.ple_embedding.ngram_embedding
-    del embedding.weight._dss_skip_weight_sync
+    ngram_name = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.weight"
 
-    names = {name for name, _ in build_iter_full_hf_weights(model)()}
-    assert not any("ngram_embedding.weight" in name for name in names)
-    assert "model.language_model.layers.0.mlp.experts.gate_up_proj" in names
+    iterator = build_iter_full_hf_weights(model)
+    sync_names = {name for name, _ in iterator()}
+    checkpoint_names = {name for name, _ in iterator(include_skipped=True)}
+
+    assert ngram_name not in sync_names
+    assert ngram_name in checkpoint_names
+    assert "model.language_model.layers.0.mlp.experts.gate_up_proj" in sync_names
 
 
 def test_qwen38_adapter_uses_qsa_flex_and_validates_context_parallelism():
@@ -413,6 +462,101 @@ def test_qwen38_rank_zero_ple_halo_keeps_collective_backward(monkeypatch):
 
     torch.testing.assert_close(previous, torch.zeros_like(previous))
     torch.testing.assert_close(source.grad, torch.zeros_like(source))
+
+
+def test_qwen38_packed_ple_components_reset_at_position_boundaries():
+    _require()
+    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpTextNGramEmbeddingPrimeRL
+    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpTextPLELayerPrimeRL
+
+    config = _tiny_config().text_config
+    positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+    first = torch.tensor([[2, 3, 4, 5]])
+    second = torch.tensor([[6, 7, 8, 9]])
+
+    ngram = Qwen4ExpTextNGramEmbeddingPrimeRL(
+        config,
+        config.ple_embed_dim,
+        layer_idx=0,
+    )
+    packed_ngram = ngram(
+        torch.cat([first, second], dim=1),
+        None,
+        position_ids=positions,
+    )[:, 4:]
+    separate_ngram = ngram(second, None)
+    torch.testing.assert_close(packed_ngram, separate_ngram)
+
+    ple = Qwen4ExpTextPLELayerPrimeRL(config, layer_idx=0, ple_layer_index=0)
+    with torch.no_grad():
+        ple.conv1d.weight.fill_(1)
+    first_hidden = torch.ones(1, 4, config.hidden_size * config.hc_count)
+    second_hidden = torch.zeros_like(first_hidden)
+    packed_conv = ple._short_conv(
+        torch.cat([first_hidden, second_hidden], dim=1),
+        None,
+        position_ids=positions,
+    )[:, 4:]
+    separate_conv = ple._short_conv(second_hidden, None)
+    torch.testing.assert_close(packed_conv, separate_conv)
+
+
+def test_qwen38_context_parallel_ple_transports_positions(monkeypatch):
+    from arctic_platform.model.implementations.qwen38 import context_parallel
+
+    class Embedding(torch.nn.Module):
+        context_len = 2
+        eos_token_id = 0
+
+        def forward(self, input_ids, past_key_values, position_ids=None):
+            self.received_positions = position_ids
+            return input_ids.unsqueeze(-1).float()
+
+    class PLE(torch.nn.Module):
+        short_conv_state_len = 2
+
+        def __init__(self):
+            super().__init__()
+            self.ple_embedding = Embedding()
+
+        def _short_conv(self, hidden_states, past_key_values, position_ids=None):
+            self.received_positions = position_ids
+            return hidden_states
+
+    calls = []
+
+    def previous(tensor, width, *, process_group, pad_value, differentiable):
+        calls.append((width, pad_value, differentiable))
+        return torch.full_like(tensor[:, :width], pad_value)
+
+    monkeypatch.setattr(context_parallel, "_previous_rank_context", previous)
+    ple = PLE()
+    context_parallel._adapt_ple_layer(ple, process_group=object())
+
+    positions = torch.tensor([[0, 1, 2]])
+    ple.ple_embedding(
+        torch.tensor([[3, 4, 5]]),
+        None,
+        position_ids=positions,
+    )
+    ple._short_conv(
+        torch.randn(1, 3, 4),
+        None,
+        position_ids=positions,
+    )
+
+    expected_positions = torch.tensor([[-1, -1, 0, 1, 2]])
+    torch.testing.assert_close(
+        ple.ple_embedding.received_positions,
+        expected_positions,
+    )
+    torch.testing.assert_close(ple.received_positions, expected_positions)
+    assert calls == [
+        (2, 0, False),
+        (2, -1, False),
+        (2, 0, True),
+        (2, -1, False),
+    ]
 
 
 def test_qwen38_supports_selective_activation_checkpointing():
@@ -509,6 +653,8 @@ def test_qwen38_qsa_compresses_after_gather_for_unaligned_cp_shards(monkeypatch)
         hidden_states,
         position_embeddings,
         torch.ones(1, 3, dtype=torch.bool),
+        position_ids=torch.tensor([[3, 4, 5]]),
+        cu_seqlens=torch.tensor([0, 6]),
     )
 
     assert routes.shape == (1, 3, 3)
@@ -543,3 +689,37 @@ def test_qwen38_rejects_native_fp8_training():
     config.quantization_config = {"quant_method": "fp8"}
     with pytest.raises(NotImplementedError, match="Native-FP8"):
         Qwen4ExpForConditionalGenerationPrimeRL(config)
+
+
+def test_packed_ple_survives_custom_lm_head():
+    """Custom heads bypass the outer HF forward; PLE still isolates packed rows."""
+    from transformers import set_seed
+
+    from arctic_platform.model.implementations.moe.layers.lm_head import _patch_model_forward
+
+    config = _tiny_config()
+    config.text_config.layer_types = ["linear_attention"] * config.text_config.num_hidden_layers
+    config.text_config.use_cache = False
+    set_seed(37)
+    model = Qwen4ExpForConditionalGenerationPrimeRL(config)
+
+    class Zero(torch.nn.Module):
+        def forward(self, hidden_states, *args, **kwargs):
+            assert "ple_position_ids" not in kwargs
+            return torch.zeros_like(hidden_states)
+
+    class HiddenHead(torch.nn.Module):
+        def forward(self, hidden_states, *args, **kwargs):
+            return hidden_states
+
+    for layer in model.model.language_model.layers:
+        layer.linear_attn = Zero()
+        layer.mlp = Zero()
+    model.lm_head = HiddenHead()
+    _patch_model_forward(model)
+    kwargs = dict(attention_mask={"linear_attention": None, "qwen_sparse_attention": None})
+    ids = torch.tensor([[2, 3, 4, 5, 6, 7, 8, 9]])
+    positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+    packed = model(input_ids=ids, position_ids=positions, **kwargs)
+    separate = model(input_ids=ids[:, 4:], position_ids=positions[:, 4:], **kwargs)
+    torch.testing.assert_close(packed[:, 4:], separate, rtol=0, atol=1e-6)

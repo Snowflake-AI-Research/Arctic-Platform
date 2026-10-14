@@ -171,7 +171,11 @@ def to_cortex_fwd_bwd_payload(
         scored["old_log_probs_shifted"] = old_log_probs_shifted.to(torch.float32)
     forwarded, scored, attention_mask = _left_align_batch(forwarded, attention_mask, scored)
     input_ids = forwarded["input_ids"]
-    context: dict[str, Any] = {"input_ids": input_ids, **scored}
+    context: dict[str, Any] = {
+        "input_ids": input_ids,
+        **scored,
+        **{key: meta[key] for key in ("temperature", "calculate_entropy") if key in meta},
+    }
 
     kwargs_out: dict[str, Any] = {"input_ids": input_ids, "attention_mask": attention_mask}
     for k in ("position_ids", "labels"):
