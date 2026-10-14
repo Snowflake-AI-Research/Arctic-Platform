@@ -37,13 +37,11 @@ __all__ = ["create_cortex_client", "legacy_max_seq_len", "placement_timeout"]
 
 
 def legacy_max_seq_len(legacy: Any) -> int | None:
-    """Sequence length to set on the unified client, or ``None`` to keep its default.
+    """Sequence length for the unified client, or ``None`` to keep its default.
 
-    ``to_cortex`` drops vLLM's ``max_model_len`` and sizes both sub-jobs from
-    ``ArcticClientConfig.max_seq_len``, so the length SkyRL asked for has to be
-    carried over. ``max_model_len`` bounds every sampled conversation, so it
-    also bounds every training sequence. The training ``max_length`` is only
-    the fallback.
+    ``to_cortex`` sizes both sub-jobs from ``max_seq_len`` and drops vLLM's
+    ``max_model_len``, so SkyRL's length is carried over here. ``max_model_len``
+    wins and the training ``max_length`` is the fallback.
     """
     vllm = getattr(legacy, "vllm_config", None) or {}
     training = getattr(legacy, "training_config", None) or {}
