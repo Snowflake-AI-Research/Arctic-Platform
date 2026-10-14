@@ -26,7 +26,7 @@ each loader's own validation. The reasons follow the table.
 | `moe.comm_sms` | trainer | speed | yes | yes | yes | n/a | yes | yes |
 | `moe.comm_token_chunk` | trainer | speed | yes | yes | yes | n/a | yes | yes |
 | `moe.grouped_mm` | trainer | speed | yes | yes | yes | n/a | yes | yes |
-| `numerics.fp32_parity` | trainer | parity | no | no | no | no | yes | no |
+| `numerics.fp32_parity` | trainer | parity | no | no | no | yes | yes | no |
 | `numerics.optimization_dtype` | trainer | parity | yes | yes | yes | no | yes | yes |
 | `numerics.reduce_dtype` | trainer | parity | yes | yes | yes | no | yes | yes |
 | `peft` | trainer | mode | no | no | no | yes | no | no |
@@ -96,7 +96,7 @@ Extends `generic_moe`.
 
 ## `huggingface`
 
-7 of 22 options unsupported.
+6 of 22 options unsupported.
 
 - `attention.sparse_mla` (no): no equivalent option; sparse MLA is used only by the GLM loaders glm_moe_dsa and glm5_next
 - `checkpointing.mode` (no): no equivalent option; `patches.gradient_checkpointing` always recomputes whole layers
@@ -106,7 +106,6 @@ Extends `generic_moe`.
 - `moe.comm_sms` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.comm_token_chunk` (n/a): the huggingface loader rejects expert parallelism and has no expert options
 - `moe.grouped_mm` (n/a): the huggingface loader rejects expert parallelism and has no expert options
-- `numerics.fp32_parity` (no): the loader option fp32_parity exists and is on by default for the stock dense Qwen3.5 family, but no model_options key reaches it on this route yet: the job server does not pass the value on
 - `numerics.optimization_dtype` (no): the key has no effect on this route: the job sets the model dtype, not this key
 - `numerics.reduce_dtype` (no): no equivalent option
 
