@@ -23,11 +23,10 @@ import sys
 
 
 def main(argv: list[str]) -> None:
-    from arctic_platform.client import ArcticClientConfig
     from arctic_platform.client.config import CortexConfig
     from arctic_platform.client.transports.cortex import CortexTransport
 
-    transport = CortexTransport(ArcticClientConfig(model_name="unused", backend=CortexConfig()))
+    transport = CortexTransport(CortexConfig())
     for job_id in argv:
         transport.cancel_job(job_id)
         print(f"released {job_id}", file=sys.stderr)
