@@ -145,6 +145,17 @@ def _identity(value: Any) -> Any:
     return value
 
 
+def _capacity_result(result: dict) -> dict:
+    return {
+        "has_reservation": bool(result.get("has_reservation", False)),
+        "max_total_gpus": int(result.get("max_total_gpus", 0)),
+        "reserved_gpus": int(result.get("reserved_gpus", 0)),
+        "in_use_gpus": int(result.get("in_use_gpus", 0)),
+        "pending_gpus": int(result.get("pending_gpus", 0)),
+        "available_gpus": int(result.get("available_gpus", 0)),
+    }
+
+
 def _fwd_bwd_result(result: dict) -> dict:
     if "post_process_outputs" not in result:
         return result
@@ -206,6 +217,8 @@ class _Route:
     # `operation_type`s that may answer in the POST reply instead of with a request_id.
     inline_types: frozenset[str] = frozenset()
     normalize: Callable[[Any], Any] = _identity
+    request_timeout: float | None = None
+    max_retries: int | None = None
 
     def prepare(self, prefix: str, request: Request) -> tuple[str, list[Send]]:
         body = {k: v for k, v in request.body.items() if v is not None}
@@ -251,7 +264,14 @@ _ROUTES = {
     "list-jobs": _Route(method="GET", path="", encode=_query, normalize=lambda reply: reply.get("jobs", [])),
     "get-job": _Route(method="GET", path="/{job}", encode=_no_body),
     "cancel-job": _Route(method="POST", path="/{job}:cancel", encode=_no_body),
-    "capacity": _Route(method="GET", path="/capacity", encode=_query),
+    "capacity": _Route(
+        method="GET",
+        path="/capacity",
+        encode=_query,
+        normalize=_capacity_result,
+        request_timeout=30.0,
+        max_retries=0,
+    ),
     "list-checkpoints": _Route(
         method="GET",
         path="/{job}/checkpoints",
@@ -487,7 +507,14 @@ class CortexTransport(Transport):
         retry_on = _is_transient if route.replay_safe else _is_connect_error
         reply: dict = {}
         for kwargs in sends:
-            reply = await self._send(route.method, url, retry_on=retry_on, **kwargs)
+            reply = await self._send(
+                route.method,
+                url,
+                retry_on=retry_on,
+                request_timeout=route.request_timeout,
+                max_retries=route.max_retries,
+                **kwargs,
+            )
         return reply
 
     def _request_url(self, request_id: str, cursor: str | None) -> tuple[str, dict | None]:
@@ -585,7 +612,16 @@ class CortexTransport(Transport):
     def _job(self) -> dict:
         return self.call(get_job_request(self.job_id))
 
-    async def _send(self, method: str, url: str, *, retry_on=_is_transient, **kwargs: Any) -> dict:
+    async def _send(
+        self,
+        method: str,
+        url: str,
+        *,
+        retry_on=_is_transient,
+        request_timeout: float | None = None,
+        max_retries: int | None = None,
+        **kwargs: Any,
+    ) -> dict:
         # Every SnowAPI call goes through here so transient 429/5xx/connection blips
         # are retried with exponential-jitter backoff (the neutrino client's policy).
         import aiohttp
@@ -596,6 +632,8 @@ class CortexTransport(Transport):
                 headers=self._auth_headers(),
             )
         session = self._session
+        if request_timeout is not None:
+            kwargs["timeout"] = aiohttp.ClientTimeout(total=request_timeout)
 
         async def attempt() -> dict:
             async with session.request(method, url, **kwargs) as resp:
@@ -606,9 +644,10 @@ class CortexTransport(Transport):
                 # would report an already-completed release as a failure.
                 return json.loads(body) if body.strip() else {}
 
+        retry_limit = self.max_retries if max_retries is None else max_retries
         retryer = AsyncRetrying(
             retry=retry_if_exception(retry_on),
-            stop=stop_after_attempt(1 + self.max_retries),
+            stop=stop_after_attempt(1 + retry_limit),
             wait=wait_exponential_jitter(initial=0.5, max=10.0),
             reraise=True,
         )
