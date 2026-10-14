@@ -282,20 +282,51 @@ class TestHuggingFaceLoader:
         assert configured == [(model, group)]
 
 
-class TestFromDsWorkerConfig:
-    def test_defaults_preserve_worker_behavior(self):
-        spec = ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {"attn_implementation": "flash_attention_2"})
+class TestDenseModelSettings:
+    @staticmethod
+    def _spec(options):
+        from arctic_platform.model import Patches
+        from arctic_platform.model.dense_spec import DenseModelSettings
+        from arctic_platform.model.dense_spec import dense_model_spec
+
+        zorro = None
+        if options.get("zorro_train_enable", False):
+            keys = (
+                "response_len",
+                "max_token_len",
+                "rollout_n",
+                "temperature",
+                "use_unpad",
+                "world_size",
+                "logits_optimization",
+                "logits_optimization_peak_mem_size_in_gib",
+                "logits_compute_from_fp32_inputs",
+                "logits_compute_in_fp32",
+            )
+            zorro = {key: options[key] for key in keys if key in options}
+        return dense_model_spec(
+            DenseModelSettings(
+                model_path="Qwen/Qwen3-1.7B",
+                dtype="bfloat16",
+                attn_implementation=options.get("attn_implementation"),
+                sequence_parallel=1,
+                patches=Patches(
+                    liger=options.get("use_liger", False),
+                    gradient_checkpointing=options.get("enable_gradient_checkpointing", False),
+                    zorro_train=zorro,
+                ),
+            )
+        )
+
+    def test_defaults_are_canonical_model_defaults(self):
+        spec = self._spec({"attn_implementation": "flash_attention_2"})
 
         assert spec.model_path_or_name == "Qwen/Qwen3-1.7B"
         assert spec.dtype == "bfloat16"
         assert spec.attn_implementation == "flash_attention_2"
         assert spec.patches.liger is False
-        assert spec.patches.gradient_checkpointing is True  # bridge default
+        assert spec.patches.gradient_checkpointing is False
         assert spec.patches.zorro_train is None  # None disables (empty patch would be truthy)
-
-    def test_requires_attn_implementation(self):
-        with pytest.raises(ValueError, match="requires attn_implementation"):
-            ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {})
 
     def test_generic_patches_default_gc_off(self):
         from arctic_platform.model.config import Patches
@@ -304,8 +335,7 @@ class TestFromDsWorkerConfig:
         assert ModelSpec(model_path_or_name="x").attn_implementation is None
 
     def test_liger_and_gc_flags_map(self):
-        spec = ModelSpec.from_ds_worker_config(
-            "x",
+        spec = self._spec(
             {"use_liger": True, "enable_gradient_checkpointing": False, "attn_implementation": "sdpa"},
         )
         assert spec.patches.liger is True
@@ -314,8 +344,7 @@ class TestFromDsWorkerConfig:
         assert spec.patches.zorro_train is None
 
     def test_zorro_enabled_maps_fields(self):
-        spec = ModelSpec.from_ds_worker_config(
-            "x",
+        spec = self._spec(
             {
                 "attn_implementation": "flash_attention_2",
                 "zorro_train_enable": True,
@@ -346,8 +375,7 @@ class TestFromDsWorkerConfig:
     def test_zorro_uses_pydantic_defaults_for_omitted_fields(self):
         from arctic_platform.model.config import ZorroTrainPatch
 
-        spec = ModelSpec.from_ds_worker_config(
-            "x",
+        spec = self._spec(
             {"attn_implementation": "flash_attention_2", "zorro_train_enable": True, "rollout_n": 4},
         )
         z = spec.patches.zorro_train

@@ -203,54 +203,6 @@ class ModelSpec(BaseModel):
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
     loader_options: dict = Field(default_factory=dict, description="JSON-only loader-specific extras.")
 
-    @classmethod
-    def from_ds_worker_config(cls, model_name: str, ds_worker_config: dict) -> "ModelSpec":
-        """Transitional bridge: map flat verl ``ds_worker_config`` into a ``ModelSpec``.
-
-        Callers (adapter / SFT demos) own the knobs on the flat dict today. Longer-term,
-        ``ModelSpec`` should be constructed upstream as part of the main client config
-        instead of being inferred here.
-        """
-        cfg = ds_worker_config or {}
-
-        # Require an explicit attention backend. ZoRRo Train needs a flash-attention
-        # implementation; do not invent a second default here (ModelSpec leaves it None).
-        if "attn_implementation" not in cfg or cfg["attn_implementation"] is None:
-            raise ValueError(
-                "from_ds_worker_config requires attn_implementation (ZoRRo Train needs a flash-attention backend)."
-            )
-
-        zorro_train_patch = None
-        if cfg.get("zorro_train_enable", False):
-            # Only forward keys present in cfg; ZorroTrainPatch pydantic defaults fill the rest.
-            zorro_keys = (
-                "response_len",
-                "max_token_len",
-                "rollout_n",
-                "temperature",
-                "use_unpad",
-                "world_size",
-                "logits_optimization",
-                "logits_optimization_peak_mem_size_in_gib",
-                "logits_compute_from_fp32_inputs",
-                "logits_compute_in_fp32",
-            )
-            zorro_train_patch = ZorroTrainPatch(**{k: cfg[k] for k in zorro_keys if k in cfg})
-
-        # Worker bridge defaults GC on (historical DeepSpeedWorker behavior). Generic
-        # ``Patches.gradient_checkpointing`` stays False for direct ModelSpec users.
-        return cls(
-            model_path_or_name=model_name,
-            dtype="bfloat16",
-            attn_implementation=cfg["attn_implementation"],
-            patches=Patches(
-                liger=cfg.get("use_liger", False),
-                zorro_train=zorro_train_patch,
-                gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
-                peft=cfg.get("peft_config"),
-            ),
-        )
-
     @field_validator("dtype")
     @classmethod
     def _validate_dtype(cls, value: str) -> str:
