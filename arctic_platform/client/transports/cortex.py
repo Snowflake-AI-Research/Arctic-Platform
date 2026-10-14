@@ -28,6 +28,8 @@ import base64
 import contextlib
 import hashlib
 import json
+import logging
+import os
 import time
 from typing import Any
 from typing import Iterator
@@ -49,6 +51,8 @@ from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
+
+logger = logging.getLogger(__name__)
 
 _MAX_OCTET_BYTES = 60 * 1024 * 1024  # matches the SnowAPI per-request cap
 # HTTP statuses worth retrying: the request was well-formed, so the same call may
@@ -316,6 +320,7 @@ class CortexTransport(Transport):
         self.session = self._build_session()
         self._asession = None  # aiohttp.ClientSession, lazy on first acall
         self._asession_loop = None  # the event loop that session is bound to
+        self._session_guards = []  # async generators that close sessions when the loop ends
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
@@ -326,13 +331,16 @@ class CortexTransport(Transport):
         else:
             # A mutating create: only retry when the request provably never landed,
             # so we can't spawn duplicate jobs (matches the neutrino client).
-            created = self._send(
-                "POST",
-                self._prefix,
-                retry_on=_is_connect_error,
-                json={"sub_job_configs": client_config.to_cortex()},
-            )
+            body: dict = {"sub_job_configs": client_config.to_cortex()}
+            # Shared schema reports submitted_by=ADMIN; the comment is the ownership signal.
+            comment = os.environ.get("CORTEX_JOB_COMMENT")
+            if comment:
+                body["comment"] = comment
+            created = self._send("POST", self._prefix, retry_on=_is_connect_error, json=body)
             self.job_id = created["job_id"]
+            # Logged before the wait: a job can stay PLACING for a long time, and its id
+            # is the only way to cancel it if this process stops first.
+            logger.info("created cortex job %s; waiting for it to run", self.job_id)
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
         # JobHandles holds each role's sub-job token, so the client's op bodies
@@ -344,12 +352,15 @@ class CortexTransport(Transport):
         return self.jobs
 
     def shutdown(self) -> None:
-        if self.job_id is None:
-            return
-        # GS uses colon-action syntax: /{job_id}:cancel. Best-effort teardown routed
-        # through _send (retry + auth), tolerating failure (the job may be gone).
-        with contextlib.suppress(requests.exceptions.RequestException):
-            self._send("POST", f"{self._prefix}/{self.job_id}:cancel")
+        try:
+            if self.job_id is None:
+                return
+            # GS uses colon-action syntax: /{job_id}:cancel. Best-effort teardown routed
+            # through _send (retry + auth), tolerating failure (the job may be gone).
+            with contextlib.suppress(requests.exceptions.RequestException):
+                self._send("POST", f"{self._prefix}/{self.job_id}:cancel")
+        finally:
+            self.session.close()
 
     def list_jobs(self) -> list[dict]:
         """Every Cortex job on this account, with its status."""
@@ -573,9 +584,26 @@ class CortexTransport(Transport):
     def _wait_running(self) -> None:
         deadline = time.monotonic() + self.config.job_ready_timeout
         delay = self.poll_interval
+        started = time.monotonic()
+        announced: str | None = None
+        last_note = 0.0
         while time.monotonic() < deadline:
             job = self._job()
-            state = _short(job.get("status"))
+            state = _short(job.get("status")) or "pending"
+            elapsed = time.monotonic() - started
+            if state != announced:
+                announced = state
+                last_note = elapsed
+                if state == "running":
+                    logger.info("Cortex job is running (%s).", _clock(elapsed))
+                else:
+                    logger.info(
+                        "Cortex job is %s. Workers are starting and loading the model.",
+                        state,
+                    )
+            elif state != "running" and elapsed - last_note >= 15:
+                last_note = elapsed
+                logger.info("Still %s (%s).", state, _clock(elapsed))
             if state == "running":
                 return
             if state in _JOB_TERMINAL:
@@ -655,12 +683,28 @@ class CortexTransport(Transport):
         if self._asession is None or self._asession.closed or self._asession_loop is not loop:
             import aiohttp
 
-            self._asession = aiohttp.ClientSession(
+            session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.config.request_timeout),
                 headers=self._auth_headers(),
             )
+            self._asession = session
             self._asession_loop = loop
+            await self._guard_session(session)
         return self._asession
+
+    async def _guard_session(self, session: Any) -> None:
+        """Close this session when the loop shuts down, before aiohttp warns."""
+
+        async def _close_on_shutdown() -> Any:
+            try:
+                yield
+            finally:
+                if not session.closed:
+                    await session.close()
+
+        guard = _close_on_shutdown()
+        self._session_guards.append(guard)
+        await guard.asend(None)
 
     async def _asend(self, method: str, url: str, *, retry_on=None, **kwargs: Any) -> dict:
         session = await self._ensure_asession()
@@ -687,6 +731,11 @@ class CortexTransport(Transport):
                 await self._asession.close()
             self._asession = None
             self._asession_loop = None
+
+
+def _clock(seconds: float) -> str:
+    total = int(seconds)
+    return f"{total // 60}:{total % 60:02d}"
 
 
 def _next_delay(delay: float) -> float:
