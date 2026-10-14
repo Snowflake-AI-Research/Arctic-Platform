@@ -91,7 +91,6 @@ def _experiment_cls():
 
             return HarnessGenerator(
                 tokenizer=tokenizer,
-                model_name=model_name,
                 proxy=self.sampling_proxy,
                 traj_dir=str(Path(cfg.trainer.ckpt_path) / "trajectories"),
                 adapter=adapter,
