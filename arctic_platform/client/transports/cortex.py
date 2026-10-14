@@ -191,7 +191,9 @@ class _Route:
     poll: bool = False
     # False: retry only sends that provably never reached the server.
     replay_safe: bool = True
-    # Re-post the whole chunk group once when the server reports it lost track of it.
+    # Re-post the whole chunk group once on `chunk_group_restart_required`. Only endpoints
+    # that stage chunks on the job's actor (forward-backward) send that code; it is not a
+    # general retry flag.
     restartable: bool = False
     # `operation_type`s that may answer in the POST reply instead of with a request_id.
     inline_types: frozenset[str] = frozenset()
