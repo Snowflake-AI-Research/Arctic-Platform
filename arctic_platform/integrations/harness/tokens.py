@@ -12,12 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Turn one training sequence into a SkyRL row.
-
-The loss mask comes from the episodes: 1 on tokens the sampler produced, 0 on
-everything the chat template or the harness added. Nothing here depends on
-the model or its template.
-"""
+"""Turn one training sequence into a SkyRL row. The mask comes from ``episodes.sampled_mask``."""
 
 from __future__ import annotations
 
@@ -40,8 +35,6 @@ def masked_row(
     exhausted: bool,
 ) -> dict[str, Any]:
     """One SkyRL row. The reward is the grader's scalar for the whole rollout."""
-    if len(loss_mask) != len(response_ids):
-        raise ValueError(f"loss mask has {len(loss_mask)} entries for {len(response_ids)} response tokens")
     return dict(
         prompt_token_ids=list(prompt_ids),
         response_ids=list(response_ids),

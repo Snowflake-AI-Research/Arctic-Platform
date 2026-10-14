@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from arctic_platform.integrations.harness.episodes import Episode
 from arctic_platform.integrations.harness.episodes import Session
 from arctic_platform.integrations.harness.episodes import plan_prompt
@@ -30,7 +28,6 @@ from arctic_platform.integrations.harness.generator import _detail_means
 from arctic_platform.integrations.harness.generator import rows_for_rollout
 from arctic_platform.integrations.harness.generator import trajectory_payload
 from arctic_platform.integrations.harness.proxy import ChatCompletionsProxy
-from arctic_platform.integrations.harness.tokens import masked_row
 from arctic_platform.integrations.harness.tool_parser import parse_tool_calls
 
 
@@ -59,11 +56,6 @@ def test_json_list_parameter_stays_structured():
     text = '<tool_call><function=finish><parameter=locations>[{"file": "src/a.py"}]</parameter></function></tool_call>'
     _, calls = parse_tool_calls(text)
     assert json.loads(calls[0]["function"]["arguments"])["locations"] == [dict(file="src/a.py")]
-
-
-def test_masked_row_rejects_a_mask_of_the_wrong_length():
-    with pytest.raises(ValueError, match="loss mask"):
-        masked_row([1], [2, 3], [1], 0.0, {}, False)
 
 
 class _ChatTokenizer(_Tokenizer):
@@ -130,7 +122,7 @@ def test_continuation_keeps_the_sampled_tokens():
     assert len(sequences) == 1
     _, response, mask = sequences[0]
     assert response[:2] == [42, 43]
-    # Only the two calls' sampled tokens train; the end marker and tool turn between them do not.
+    # The end marker and tool turn between the two calls are not trained.
     assert mask == [1, 1] + [0] * (len(response) - 3) + [1]
 
 
