@@ -143,7 +143,7 @@ class _ArcticClientCore:
 class ArcticClient(_ArcticClientCore):
     """The blocking frontend: every op shared by SFT and RL."""
 
-    def _call(self, request: Request) -> Any:
+    def _call(self, request: Request) -> dict | list[dict]:
         out = self.transport.call(request)
         _maybe_print_server_profile(request.op, out)
         return out

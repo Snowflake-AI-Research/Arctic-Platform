@@ -128,18 +128,6 @@ class TestClusterRoutes:
         assert transport.call(client_requests.list_jobs_request()) == []
         assert transport.call(client_requests.list_checkpoints_request(TRAINING)) == []
 
-    def test_capacity_fills_omitted_fields(self):
-        transport, _ = _transport({("GET", "/capacity"): {"max_total_gpus": 64, "in_use_gpus": 8}})
-
-        assert transport.call(client_requests.capacity_request()) == {
-            "has_reservation": False,
-            "max_total_gpus": 64,
-            "reserved_gpus": 0,
-            "in_use_gpus": 8,
-            "pending_gpus": 0,
-            "available_gpus": 0,
-        }
-
 
 class TestLifecycleRoutes:
     def test_initialize_creates_without_replay_and_captures_sub_jobs(self):

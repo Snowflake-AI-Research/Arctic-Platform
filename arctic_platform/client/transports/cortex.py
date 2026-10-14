@@ -145,18 +145,6 @@ def _identity(value: Any) -> Any:
     return value
 
 
-def _capacity_result(value: dict) -> dict:
-    """All six capacity fields; proto3 JSON omits false and zero values."""
-    return {
-        "has_reservation": bool(value.get("has_reservation", False)),
-        "max_total_gpus": int(value.get("max_total_gpus", 0)),
-        "reserved_gpus": int(value.get("reserved_gpus", 0)),
-        "in_use_gpus": int(value.get("in_use_gpus", 0)),
-        "pending_gpus": int(value.get("pending_gpus", 0)),
-        "available_gpus": int(value.get("available_gpus", 0)),
-    }
-
-
 def _fwd_bwd_result(result: dict) -> dict:
     if "post_process_outputs" not in result:
         return result
@@ -263,7 +251,7 @@ _ROUTES = {
     "list-jobs": _Route(method="GET", path="", encode=_query, normalize=lambda reply: reply.get("jobs", [])),
     "get-job": _Route(method="GET", path="/{job}", encode=_no_body),
     "cancel-job": _Route(method="POST", path="/{job}:cancel", encode=_no_body),
-    "capacity": _Route(method="GET", path="/capacity", encode=_query, normalize=_capacity_result),
+    "capacity": _Route(method="GET", path="/capacity", encode=_query),
     "list-checkpoints": _Route(
         method="GET",
         path="/{job}/checkpoints",
