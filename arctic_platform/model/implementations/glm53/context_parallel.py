@@ -31,6 +31,7 @@ from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_po
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _pack_and_exchange_head_tensors
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _packed_sequence_indices
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _shard_convolution_parameter
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from arctic_platform.model.implementations.moe.vlm import get_language_model
@@ -54,16 +55,47 @@ def _gather_sequence_no_grad(tensor: torch.Tensor, group) -> torch.Tensor:
     return torch.cat(gathered, dim=1)
 
 
+def _normalize_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+    *,
+    sequence_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if not torch.is_tensor(cu_seqlens) or cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+        raise ValueError("GLM-5.3 packed boundaries must be a one-dimensional tensor with at least two entries")
+    cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32)
+    if int(cu_seqlens[0]) != 0:
+        raise ValueError("GLM-5.3 packed boundaries must start at zero")
+    if bool((cu_seqlens[1:] <= cu_seqlens[:-1]).any()):
+        raise ValueError("GLM-5.3 packed boundaries must be strictly increasing")
+    real_length = int(cu_seqlens[-1])
+    if real_length > sequence_length:
+        raise ValueError(f"GLM-5.3 packed boundaries end at {real_length}, beyond sequence length {sequence_length}")
+    if real_length < sequence_length:
+        cu_seqlens = torch.cat(
+            [
+                cu_seqlens,
+                torch.arange(
+                    real_length + 1,
+                    sequence_length + 1,
+                    device=device,
+                    dtype=torch.int32,
+                ),
+            ]
+        )
+    return cu_seqlens
+
+
 @torch.no_grad()
 def _select_sparse_indices(
     indexer: nn.Module,
     hidden_states: torch.Tensor,
     q_resid: torch.Tensor,
     attention_mask: torch.Tensor,
+    global_cu_seqlens: torch.Tensor,
     *,
     cp_group,
     cp_rank: int,
-    cp_world_size: int,
 ) -> torch.Tensor:
     batch_size, local_length = hidden_states.shape[:2]
     hidden_shape = (batch_size, local_length, -1, indexer.head_dim)
@@ -75,54 +107,73 @@ def _select_sparse_indices(
         dim=-1,
     )
     packed_states = _gather_sequence_no_grad(packed_local, cp_group)
-    valid_keys = packed_states[..., -1].bool()
-    global_length = packed_states.shape[1]
-
-    query_positions = cp_rank * local_length + torch.arange(local_length, device=hidden_states.device)
-    key_positions = torch.arange(global_length, device=hidden_states.device)
-    visible_tokens = (key_positions[None, None, :] <= query_positions[None, :, None]) & valid_keys[:, None, :]
-
-    pool_keys, pool_indices, pool_valid = indexer.get_pooled_states(packed_states=packed_states)
-    scores = torch.matmul(query.float(), pool_keys.transpose(-1, -2).float().unsqueeze(1))
-    scores = F.relu(scores * indexer.softmax_scale)
     weights = indexer.weights_proj(hidden_states.to(indexer.weights_proj.weight.dtype)).float() * (
         indexer.n_heads**-0.5
     )
-    index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
-
-    pool_end = pool_indices[..., -1].clamp(0, global_length - 1)
-    pool_visible = visible_tokens.gather(
-        dim=-1,
-        index=pool_end[:, None, :].expand(batch_size, local_length, -1),
-    )
-    valid_candidates = pool_visible & pool_valid[:, None]
-    index_scores.masked_fill_(~valid_candidates, torch.finfo(index_scores.dtype).min)
-
-    select_k = min(
-        indexer.index_topk // indexer.index_kpool,
-        index_scores.shape[-1],
-    )
-    selected = index_scores.topk(select_k, dim=-1).indices
-    batch_idx = torch.arange(batch_size, device=hidden_states.device)[:, None, None]
-    selected_valid = valid_candidates.gather(-1, selected)
-    selected_indices = pool_indices[batch_idx, selected]
-    topk_indices = selected_indices.flatten(-2)
-    topk_indices.masked_fill_(
-        ~selected_valid[..., None].expand_as(selected_indices).flatten(-2),
-        -1,
-    )
-
     output_width = indexer.index_topk
     if indexer.index_kpool_always_select_tail:
-        topk_indices = indexer.append_visible_tail(topk_indices, visible_tokens, valid_keys)
         output_width += indexer.index_kpool - 1
-    topk_indices = F.pad(
-        topk_indices,
-        (0, output_width - topk_indices.shape[-1]),
-        value=-1,
-    )[..., :output_width]
-    topk_indices.masked_fill_(~attention_mask[..., None], -1)
-    return topk_indices.to(torch.int32)
+    topk_indices = torch.full(
+        (batch_size, local_length, output_width),
+        -1,
+        dtype=torch.int32,
+        device=hidden_states.device,
+    )
+    query_offset = cp_rank * local_length
+    for start_tensor, end_tensor in zip(global_cu_seqlens[:-1], global_cu_seqlens[1:], strict=True):
+        start = int(start_tensor)
+        end = int(end_tensor)
+        local_start = max(start, query_offset)
+        local_end = min(end, query_offset + local_length)
+        if local_start >= local_end:
+            continue
+
+        segment_states = packed_states[:, start:end]
+        valid_keys = segment_states[..., -1].bool()
+        segment_length = end - start
+        query_slice = slice(local_start - query_offset, local_end - query_offset)
+        query_positions = torch.arange(local_start - start, local_end - start, device=hidden_states.device)
+        key_positions = torch.arange(segment_length, device=hidden_states.device)
+        visible_tokens = (key_positions[None, None, :] <= query_positions[None, :, None]) & valid_keys[:, None]
+
+        pool_keys, pool_indices, pool_valid = indexer.get_pooled_states(packed_states=segment_states)
+        scores = torch.matmul(
+            query[:, query_slice].float(),
+            pool_keys.transpose(-1, -2).float().unsqueeze(1),
+        )
+        scores = F.relu(scores * indexer.softmax_scale)
+        index_scores = torch.matmul(weights[:, query_slice].unsqueeze(-2), scores).squeeze(-2)
+
+        pool_end = pool_indices[..., -1].clamp(0, segment_length - 1)
+        pool_visible = visible_tokens.gather(
+            dim=-1,
+            index=pool_end[:, None].expand(batch_size, local_end - local_start, -1),
+        )
+        valid_candidates = pool_visible & pool_valid[:, None]
+        index_scores.masked_fill_(~valid_candidates, torch.finfo(index_scores.dtype).min)
+
+        select_k = min(indexer.index_topk // indexer.index_kpool, index_scores.shape[-1])
+        selected = index_scores.topk(select_k, dim=-1).indices
+        batch_idx = torch.arange(batch_size, device=hidden_states.device)[:, None, None]
+        selected_valid = valid_candidates.gather(-1, selected)
+        selected_indices = pool_indices[batch_idx, selected]
+        selected_indices.masked_fill_(
+            ~selected_valid[..., None].expand_as(selected_indices),
+            -1,
+        )
+        segment_topk = selected_indices.flatten(-2)
+
+        if indexer.index_kpool_always_select_tail:
+            segment_topk = indexer.append_visible_tail(segment_topk, visible_tokens, valid_keys)
+        segment_topk = F.pad(
+            segment_topk,
+            (0, output_width - segment_topk.shape[-1]),
+            value=-1,
+        )[..., :output_width]
+        segment_topk = torch.where(segment_topk >= 0, segment_topk + start, segment_topk)
+        segment_topk.masked_fill_(~attention_mask[:, query_slice, None], -1)
+        topk_indices[:, query_slice] = segment_topk.to(torch.int32)
+    return topk_indices
 
 
 def _reference_sparse_mla(
@@ -197,14 +248,21 @@ def _sparse_attention_forward(
     k_position_full = _gather_sequence(k_position, self._cp_group)
 
     if self.indexer is not None:
+        global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
+        if global_cu_seqlens is None:
+            global_cu_seqlens = torch.tensor(
+                [0, local_length * self._cp_world_size],
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
         topk_indices = _select_sparse_indices(
             self.indexer,
             hidden_states,
             q_resid,
             attention_mask,
+            global_cu_seqlens,
             cp_group=self._cp_group,
             cp_rank=self._cp_rank,
-            cp_world_size=self._cp_world_size,
         )
     elif prev_topk_indices is None:
         raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
@@ -350,18 +408,108 @@ def _linear_attention_forward(
     return self.o_proj(output)
 
 
+def _local_linear_attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    cache_params=None,
+    attention_mask: torch.Tensor | None = None,
+    **_kwargs,
+):
+    if cache_params is not None:
+        raise NotImplementedError("GLM-5.3 packed KDA is a training-only path")
+    if hidden_states.shape[0] != 1:
+        raise NotImplementedError("GLM-5.3 packed KDA currently requires one packed row")
+    if attention_mask is not None:
+        hidden_states = hidden_states * attention_mask[..., None].to(hidden_states.dtype)
+
+    batch_size, sequence_length = hidden_states.shape[:2]
+    global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
+    if global_cu_seqlens is None:
+        global_cu_seqlens = torch.tensor(
+            [0, sequence_length],
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+    shape = (batch_size, sequence_length, self.num_heads, self.head_dim)
+    mixed_qkv = torch.cat(
+        [
+            self.q_proj(hidden_states),
+            self.k_proj(hidden_states),
+            self.v_proj(hidden_states),
+        ],
+        dim=-1,
+    ).transpose(1, 2)
+
+    from causal_conv1d import causal_conv1d_fn
+
+    mixed_qkv = causal_conv1d_fn(
+        mixed_qkv,
+        weight=self.conv1d.weight.squeeze(1),
+        bias=self.conv1d.bias,
+        activation=self.activation,
+        seq_idx=_packed_sequence_indices(global_cu_seqlens),
+    ).transpose(1, 2)
+    query, key, value = torch.split(mixed_qkv, [self.qkv_dim] * 3, dim=-1)
+    query = query.view(shape)
+    key = key.view(shape)
+    value = value.view(shape)
+    decay = self.forget_gate(hidden_states)
+    beta = torch.sigmoid(self.b_proj(hidden_states))
+
+    from fla.ops.kda import chunk_kda
+
+    output, final_state = chunk_kda(
+        query,
+        key,
+        value,
+        g=decay,
+        beta=beta,
+        initial_state=None,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=global_cu_seqlens,
+    )
+    if final_state is not None:
+        raise RuntimeError("GLM-5.3 KDA unexpectedly returned recurrent state")
+    gate = self.g_b_proj(self.g_a_proj(hidden_states)).view(shape)
+    output = self.o_norm(output, gate).reshape(batch_size, sequence_length, -1)
+    return self.o_proj(output)
+
+
 def _wrap_backbone_forward(backbone: nn.Module, parallel_modules: list[nn.Module]):
     original_forward = backbone.forward
 
     def forward(self, *args, **kwargs):
         position_ids = kwargs.get("position_ids")
-        if not torch.is_tensor(position_ids):
-            raise ValueError("GLM-5.3 context parallelism requires position_ids for packed boundaries")
-        global_position_ids = _gather_sequence_no_grad(
-            position_ids,
-            self._cp_group,
+        if position_ids is None and len(args) >= 3:
+            position_ids = args[2]
+        input_tensor = kwargs.get("input_ids")
+        if input_tensor is None:
+            input_tensor = kwargs.get("inputs_embeds")
+        if input_tensor is None and args:
+            input_tensor = args[0]
+        if not torch.is_tensor(input_tensor) or input_tensor.ndim < 2:
+            raise ValueError("GLM-5.3 needs input_ids or inputs_embeds to determine the sequence length")
+        global_sequence_length = int(input_tensor.shape[1]) * self._cp_world_size
+        global_position_ids = (
+            _gather_sequence_no_grad(position_ids, self._cp_group) if torch.is_tensor(position_ids) else None
         )
-        cu_seqlens = cu_seqlens_from_position_ids(global_position_ids)
+        cu_seqlens = kwargs.get("cu_seq_lens_q")
+        if cu_seqlens is None:
+            cu_seqlens = (
+                cu_seqlens_from_position_ids(global_position_ids)
+                if global_position_ids is not None
+                else torch.tensor(
+                    [0, global_sequence_length],
+                    dtype=torch.int32,
+                    device=input_tensor.device,
+                )
+            )
+        cu_seqlens = _normalize_cu_seqlens(
+            cu_seqlens,
+            sequence_length=global_sequence_length,
+            device=input_tensor.device,
+        )
         for module in parallel_modules:
             setattr(module, _GLOBAL_POSITION_IDS, global_position_ids)
             setattr(module, _GLOBAL_CU_SEQLENS, cu_seqlens)
@@ -399,14 +547,15 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
                 _sparse_attention_forward,
                 attention,
             )
+            parallel_modules.append(attention)
             sparse_layers += 1
-        elif cp_size > 1 and layer.block_type == "linear_attention":
+        elif layer.block_type == "linear_attention":
             if attention.num_heads % cp_world_size:
                 raise ValueError(
                     f"GLM-5.3 KDA heads ({attention.num_heads}) must be divisible by CP size ({cp_world_size})"
                 )
             attention.forward = types.MethodType(
-                _linear_attention_forward,
+                _linear_attention_forward if cp_size > 1 else _local_linear_attention_forward,
                 attention,
             )
             parallel_modules.append(attention)
@@ -414,8 +563,7 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
 
     if not sparse_layers:
         raise TypeError("GLM-5.3 model exposes no sparse-attention layers")
-    if cp_size > 1:
-        _wrap_backbone_forward(backbone, parallel_modules)
+    _wrap_backbone_forward(backbone, parallel_modules)
     get_logger().info(
         "Applied GLM-5.3 sparse MLA and context parallelism (cp_size=%d, sparse_layers=%d, KDA_layers=%d)",
         cp_world_size,
