@@ -18,6 +18,7 @@ from arctic_platform.inference.server.scheduler import (
     Scheduler,
     prefix_affinity_routing,
 )
+from arctic_platform.inference.server.token_prompts import compact_token_tensor, is_token_tensor
 from arctic_platform.inference.server.worker import InferenceWorker
 
 logger = logging.getLogger("arctic_platform.inference.server")
@@ -651,8 +652,10 @@ class ReplicaPool:
         """Generate completions for one or more prompts.
 
         Args:
-            prompts: A single prompt (``str`` or token-id ``list[int]``) or a
-                batch of prompts (``list[str | list[int]]``).
+            prompts: A single prompt (``str``, token-id ``list[int]``, or a 1-D
+                integer CPU tensor of token ids) or a batch of prompts (a list
+                of those, or a 2-D integer tensor with one prompt per row).
+                Tensors reach the worker as tensors; see ``token_prompts``.
             sampling_params: vLLM sampling parameters (dict or SamplingParams).
             model_id: Ignored in single-model mode.
             routing_key: Optional per-batch affinity key. A single string
@@ -702,6 +705,18 @@ class ReplicaPool:
                 )
             return params[0] or {}
 
+        if is_token_tensor(prompts):
+            if prompts.dim() == 1:
+                return [self._scheduler.submit(
+                    compact_token_tensor(prompts), _single_params(),
+                    routing_key=_single_key(), strict=strict,
+                )]
+            if prompts.dim() != 2:
+                raise ValueError(
+                    "A token-id tensor must be 1-D (one prompt) or 2-D (a batch), "
+                    f"got shape {tuple(prompts.shape)}"
+                )
+            prompts = list(prompts)
         if isinstance(prompts, str):
             return [self._scheduler.submit(
                 prompts, _single_params(), routing_key=_single_key(), strict=strict,
@@ -710,6 +725,7 @@ class ReplicaPool:
             return [self._scheduler.submit(
                 prompts, _single_params(), routing_key=_single_key(), strict=strict,
             )]
+        prompts = [compact_token_tensor(p) if is_token_tensor(p) else p for p in prompts]
         if isinstance(routing_key, list):
             if len(routing_key) != len(prompts):
                 raise ValueError(

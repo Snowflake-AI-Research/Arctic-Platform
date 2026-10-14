@@ -14,6 +14,7 @@ import ray
 from arctic_platform.inference.server import perftrace
 from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
+from arctic_platform.inference.server.token_prompts import is_token_tensor
 
 from arctic_platform.inference.server.metrics import (
     ConcurrencyHistory,
@@ -50,7 +51,7 @@ def _env_bool(name: str, default: bool) -> bool:
 @dataclass
 class _Request:
     id: int
-    prompt: str | list[int]
+    prompt: Any  # str, list[int], 1-D integer tensor, or ChatPrompt
     sampling_params: dict[str, Any]
     future: asyncio.Future
     worker_idx: int | None = None
@@ -102,13 +103,22 @@ RoutingFn = Callable[[_Request, list[WorkerState]], int]
 ConcurrencyFn = Callable[[list[WorkerState]], list[int]]
 
 
-def _compute_prefix_hash(prompt: str | list[int] | ChatPrompt) -> int:
-    """Hash the full prompt for affinity routing."""
+def _compute_prefix_hash(prompt: Any) -> int:
+    """Hash the full prompt for affinity routing.
+
+    A tensor prompt hashes its int32 bytes, so the same tokens route the same
+    way whatever integer dtype they arrive in. It hashes differently from the
+    same tokens sent as a list.
+    """
     if isinstance(prompt, ChatPrompt):
         # Already validated as plain JSON.
         return hash(json.dumps(asdict(prompt), sort_keys=True))
     if isinstance(prompt, str):
         return hash(prompt)
+    if is_token_tensor(prompt):
+        import torch
+
+        return hash(prompt.to(torch.int32).contiguous().numpy().tobytes())
     return hash(tuple(prompt))
 
 
@@ -302,7 +312,7 @@ class Scheduler:
 
     def submit(
         self,
-        prompt: str | list[int],
+        prompt: Any,
         sampling_params: dict[str, Any],
         routing_key: str | None = None,
         strict: bool = False,
@@ -310,6 +320,8 @@ class Scheduler:
         """Submit a single prompt for generation.
 
         Args:
+            prompt: Text, ``list[int]``, or a 1-D integer CPU tensor of token
+                ids; a tensor is sent to the worker as is.
             routing_key: Optional opaque string used as the affinity key for
                 routing. By default, the first request for a key is assigned
                 to the least-loaded worker and later requests for the same
