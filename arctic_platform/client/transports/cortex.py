@@ -28,6 +28,8 @@ import base64
 import contextlib
 import hashlib
 import json
+import logging
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -51,6 +53,8 @@ from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
+
+logger = logging.getLogger(__name__)
 
 _MAX_OCTET_BYTES = 60 * 1024 * 1024  # matches the SnowAPI per-request cap
 # HTTP statuses worth retrying: the request was well-formed, so the same call may
@@ -405,8 +409,15 @@ class CortexTransport(Transport):
         if reconnect.any_set:  # reattach; a sub-job token embeds its parent job id
             self.job_id = _parent_id(reconnect.require_any())
         else:
-            create = Request("create-job", body={"sub_job_configs": client_config.to_cortex()})
-            self.job_id = self.call(create)["job_id"]
+            body: dict = {"sub_job_configs": client_config.to_cortex()}
+            # Shared schema reports submitted_by=ADMIN; the comment is the ownership signal.
+            comment = os.environ.get("CORTEX_JOB_COMMENT")
+            if comment:
+                body["comment"] = comment
+            self.job_id = self.call(Request("create-job", body=body))["job_id"]
+            # Logged before the wait: a job can stay PLACING for a long time, and its id
+            # is the only way to cancel it if this process stops first.
+            logger.info("created cortex job %s; waiting for it to run", self.job_id)
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
         # JobHandles holds each role's sub-job token, so the client's op bodies
@@ -502,9 +513,26 @@ class CortexTransport(Transport):
     def _wait_running(self) -> None:
         deadline = time.monotonic() + self.config.job_ready_timeout
         delay = self.poll_interval
+        started = time.monotonic()
+        announced: str | None = None
+        last_note = 0.0
         while time.monotonic() < deadline:
             job = self._job()
-            state = _short(job.get("status"))
+            state = _short(job.get("status")) or "pending"
+            elapsed = time.monotonic() - started
+            if state != announced:
+                announced = state
+                last_note = elapsed
+                if state == "running":
+                    logger.info("Cortex job is running (%s).", _clock(elapsed))
+                else:
+                    logger.info(
+                        "Cortex job is %s. Workers are starting and loading the model.",
+                        state,
+                    )
+            elif state != "running" and elapsed - last_note >= 15:
+                last_note = elapsed
+                logger.info("Still %s (%s).", state, _clock(elapsed))
             if state == "running":
                 return
             if state in _JOB_TERMINAL:
@@ -584,6 +612,11 @@ class CortexTransport(Transport):
         if self._session is not None:
             await self._session.close()
             self._session = None
+
+
+def _clock(seconds: float) -> str:
+    total = int(seconds)
+    return f"{total // 60}:{total % 60:02d}"
 
 
 def _next_delay(delay: float) -> float:
