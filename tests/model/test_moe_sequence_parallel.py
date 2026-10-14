@@ -20,7 +20,6 @@ import torch
 from torch import nn
 
 from arctic_platform.model.implementations.layers.cp_mamba import _causal_conv_packed
-
 from arctic_platform.model.implementations.moe import sequence_parallel
 
 
