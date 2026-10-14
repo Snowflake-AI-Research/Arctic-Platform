@@ -340,9 +340,6 @@ class AsyncArcticClient(_ArcticClientCore):
 
     # ── lifecycle ────────────────────────────────────────────────────────
     async def shutdown(self) -> None:
-        # aiohttp's session must be closed with await; the sync shutdown() that
-        # tears down jobs can't do that from inside a running event loop.
-        await self.transport.aclose()
         self.transport.shutdown()
 
     async def __aenter__(self) -> Self:
