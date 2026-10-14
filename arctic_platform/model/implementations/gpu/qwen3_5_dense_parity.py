@@ -58,6 +58,7 @@ from transformers.models.qwen3_5 import modeling_qwen3_5 as modeling
 from transformers.utils.output_capturing import _active_collector
 
 from arctic_platform.model.implementations.gpu.vllm_rounding import FusedAddRMSNorm
+from arctic_platform.model.implementations.gpu.vllm_rounding import FusedAddRMSNormFp32Residual
 from arctic_platform.model.implementations.gpu.vllm_rounding import rope_rotary_slice_fp32
 
 VERIFIED_TRANSFORMERS_VERSION = "5.17.0"
@@ -79,6 +80,7 @@ _STOCK_SOURCE_SHA256: dict[str, str] = {
 }
 
 _PATCHED_ATTRIBUTE = "_arctic_fp32_parity"
+_FP32_RESIDUAL_ATTRIBUTE = "_arctic_fp32_residual"
 _BETA_HOOK_ATTRIBUTE = "_arctic_fp32_parity_beta_hook"
 # Each norm's epsilon, resolved when the patch is applied so that the forward reads a plain attribute.
 _NORM_EPSILON_ATTRIBUTE = "_arctic_fp32_parity_norm_epsilon"
@@ -219,13 +221,24 @@ def _check_text_model(text_model: nn.Module) -> None:
         _fail(f"its norms of type {', '.join(unrecognized)} are not a (1 + weight) RMSNorm it recognizes")
 
 
-def _fused_add_rms_norm(norm: nn.Module, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _fused_add_rms_norm(
+    norm: nn.Module, x: torch.Tensor, residual: torch.Tensor, fp32_residual: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Add ``residual`` to ``x`` in fp32 and apply ``norm``'s (1 + weight) RMSNorm to the fp32 sum.
 
-    Returns the normalized value and the sum, both in ``x``'s dtype; the sum is the next residual. The epsilon is the
-    one ``apply_fp32_parity`` resolved, so the forward runs no source inspection and can be compiled as one graph.
+    Returns the normalized value in ``x``'s dtype and the sum, which is the next residual: in ``x``'s dtype, or
+    unrounded (fp32 for 16-bit inputs) with ``fp32_residual``. The epsilon is the one ``apply_fp32_parity`` resolved,
+    so the forward runs no source inspection and can be compiled as one graph.
     """
-    return FusedAddRMSNorm.apply(x, residual, norm.weight, getattr(norm, _NORM_EPSILON_ATTRIBUTE))
+    function = FusedAddRMSNormFp32Residual if fp32_residual else FusedAddRMSNorm
+    return function.apply(x, residual, norm.weight, getattr(norm, _NORM_EPSILON_ATTRIBUTE))
+
+
+def _fp32_residual_seed(hidden_states: torch.Tensor) -> torch.Tensor:
+    """The first layer's residual for an fp32 residual stream: the embeddings, in fp32 when they are 16-bit."""
+    if hidden_states.dtype in (torch.bfloat16, torch.float16):
+        return hidden_states.float()
+    return hidden_states
 
 
 def _apply_rotary_pos_emb_fp32(q, k, cos, sin, unsqueeze_dim=1):
@@ -269,13 +282,15 @@ def _decoder_layer_forward(
     Each residual add is deferred into the next norm, which performs it in fp32. ``hidden_states`` is the previous
     layer's MLP output, or the embeddings for the first layer, which receives ``residual=None``. The returned
     ``branch_output`` is this layer's MLP output, not yet added to the returned ``residual``; the next layer's input
-    norm, or the model's final norm, adds them. The token mixer is the stock one.
+    norm, or the model's final norm, adds them. The token mixer is the stock one. With the layer's fp32 residual
+    setting, the residual is carried in fp32 from the first layer on.
     """
+    fp32_residual = getattr(self, _FP32_RESIDUAL_ATTRIBUTE, False)
     if residual is None:
-        residual = hidden_states
+        residual = _fp32_residual_seed(hidden_states) if fp32_residual else hidden_states
         hidden_states = self.input_layernorm(hidden_states)
     else:
-        hidden_states, residual = _fused_add_rms_norm(self.input_layernorm, hidden_states, residual)
+        hidden_states, residual = _fused_add_rms_norm(self.input_layernorm, hidden_states, residual, fp32_residual)
 
     # Token Mixer
     if self.block_type == "linear_attention":
@@ -297,7 +312,9 @@ def _decoder_layer_forward(
         )
 
     # Fully Connected
-    hidden_states, residual = _fused_add_rms_norm(self.post_attention_layernorm, hidden_states, residual)
+    hidden_states, residual = _fused_add_rms_norm(
+        self.post_attention_layernorm, hidden_states, residual, fp32_residual
+    )
     hidden_states = self.mlp(hidden_states)
     return hidden_states, residual
 
@@ -395,12 +412,13 @@ def _text_models(model: nn.Module) -> list[nn.Module]:
     return [module for module in model.modules() if type(module) is modeling.Qwen3_5TextModel]
 
 
-def apply_fp32_parity(model: nn.Module, *, sequence_parallel: bool) -> int:
+def apply_fp32_parity(model: nn.Module, *, sequence_parallel: bool, fp32_residual: bool = False) -> int:
     """Make every stock dense Qwen3.5 text model in ``model`` round like vLLM; return how many were patched.
 
     ``sequence_parallel`` says whether the sequence-parallel wrapper will replace the GatedDeltaNet forwards; then the
-    wrapper sets the beta gate's precision and no beta hook is installed. A model without a ``Qwen3_5TextModel`` is
-    left alone. A text model patched before is skipped.
+    wrapper sets the beta gate's precision and no beta hook is installed. ``fp32_residual`` carries the residual stream
+    in fp32 between decoder layers instead of rounding it to the branch dtype after each add (experimental). A model
+    without a ``Qwen3_5TextModel`` is left alone. A text model patched before is skipped.
     """
     text_models = [module for module in _text_models(model) if not getattr(module, _PATCHED_ATTRIBUTE, False)]
     for text_model in text_models:
@@ -411,6 +429,7 @@ def apply_fp32_parity(model: nn.Module, *, sequence_parallel: bool) -> int:
             setattr(norm, _NORM_EPSILON_ATTRIBUTE, _norm_epsilon(norm))
         for layer in text_model.layers:
             layer.forward = types.MethodType(_decoder_layer_forward, layer)
+            setattr(layer, _FP32_RESIDUAL_ATTRIBUTE, fp32_residual)
             if layer.block_type == "full_attention":
                 attention_forward = _attention_forward_with_fp32_rope(type(layer.self_attn))
                 layer.self_attn.forward = types.MethodType(attention_forward, layer.self_attn)
@@ -432,6 +451,7 @@ def remove_fp32_parity(model: nn.Module) -> int:
             norm.__dict__.pop(_NORM_EPSILON_ATTRIBUTE, None)
         for layer in text_model.layers:
             layer.__dict__.pop("forward", None)
+            layer.__dict__.pop(_FP32_RESIDUAL_ATTRIBUTE, None)
             if layer.block_type == "full_attention":
                 layer.self_attn.__dict__.pop("forward", None)
             elif layer.block_type == "linear_attention":

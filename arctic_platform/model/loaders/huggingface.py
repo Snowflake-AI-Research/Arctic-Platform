@@ -19,6 +19,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import model_validator
 from transformers import AutoModelForCausalLM
 
 from arctic_platform.model.loader import LoadedModel
@@ -46,6 +47,23 @@ class HuggingfaceOptions(BaseModel):
             " model unchanged and evaluates that beta gate in b's own dtype. Other models are unaffected."
         ),
     )
+    fp32_residual: bool = Field(
+        False,
+        description=(
+            "Experimental. With fp32_parity, carry the residual stream of the dense Qwen3.5 family in fp32 between"
+            " decoder layers, from the embeddings on, instead of rounding it to the dtype of the branch output after"
+            " each fused add; the final norm still returns the hidden state in that dtype. Under full activation"
+            " checkpointing the residual every decoder layer after the first holds at its boundary is then fp32"
+            " (4 bytes per hidden value instead of 2 for a bf16 model). Requires fp32_parity; other models are"
+            " unaffected."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _fp32_residual_needs_fp32_parity(self) -> HuggingfaceOptions:
+        if self.fp32_residual and not self.fp32_parity:
+            raise ValueError("fp32_residual requires fp32_parity: only the fp32 parity forward carries the residual")
+        return self
 
 
 def _is_local_qwen3_5_dense(model_path_or_name: str) -> bool:
@@ -98,7 +116,9 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
     if options.fp32_parity:
         from arctic_platform.model.implementations.gpu.qwen3_5_dense_parity import apply_fp32_parity
 
-        apply_fp32_parity(model, sequence_parallel=parallelism.sequence_parallel > 1)
+        apply_fp32_parity(
+            model, sequence_parallel=parallelism.sequence_parallel > 1, fp32_residual=options.fp32_residual
+        )
     if parallelism.sequence_parallel > 1:
         from arctic_platform.model.implementations.gpu.sp.transformers import (
             configure_transformers_sequence_parallel_model,

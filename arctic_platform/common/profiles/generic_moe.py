@@ -48,6 +48,7 @@ def register(registry: Registry) -> None:
         ],
         unsupported={
             "numerics.fp32_parity": "this loader has no fp32_parity option; qwen3_5_moe and huggingface have one",
+            "numerics.fp32_residual": "this loader has no fp32_residual option; only huggingface has one",
             "lm_head.vocab_chunk_size": "no equivalent option",
             "liger": "the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead",
             "compile.fullgraph": "the loader rejects `patches.compile`",

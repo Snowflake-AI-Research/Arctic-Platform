@@ -14,8 +14,9 @@
 # limitations under the License.
 """Operations evaluated in fp32 the way vLLM evaluates them, shared by the Qwen3.5 trainer models.
 
-``FusedAddRMSNorm`` is a residual add followed by a (1 + weight) RMSNorm, both in fp32. ``rope_rotary_slice_fp32``
-applies a partial rotary embedding in fp32.
+``FusedAddRMSNorm`` is a residual add followed by a (1 + weight) RMSNorm, both in fp32;
+``FusedAddRMSNormFp32Residual`` returns the sum unrounded. ``rope_rotary_slice_fp32`` applies a partial rotary
+embedding in fp32.
 """
 
 from __future__ import annotations
@@ -33,6 +34,33 @@ def _compute_dtype(x: torch.Tensor) -> torch.dtype:
     return x.dtype
 
 
+def _fused_add_rms_norm_forward(ctx, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float):
+    compute_dtype = _compute_dtype(x)
+    summed = x.to(compute_dtype) + residual.to(compute_dtype)
+    rstd = torch.rsqrt(summed.pow(2).mean(-1, keepdim=True) + eps)
+    out = summed * rstd * (1.0 + weight.to(compute_dtype))
+    ctx.save_for_backward(x, residual, weight, rstd)
+    return out.to(x.dtype), summed
+
+
+def _fused_add_rms_norm_backward(ctx, grad_out: torch.Tensor, grad_residual: torch.Tensor):
+    x, residual, weight, rstd = ctx.saved_tensors
+    compute_dtype = _compute_dtype(x)
+    summed = x.to(compute_dtype) + residual.to(compute_dtype)
+    normed = summed * rstd
+    scale = 1.0 + weight.to(compute_dtype)
+
+    grad = grad_out.to(compute_dtype)
+    grad_weight = (grad * normed).reshape(-1, weight.shape[-1]).sum(0).to(weight.dtype)
+
+    # Gradient through normed = summed * rstd(summed), with rstd = (mean(summed**2) + eps) ** -0.5.
+    grad_normed = grad * scale
+    hidden_size = summed.shape[-1]
+    grad_summed = rstd * (grad_normed - normed * (grad_normed * normed).sum(-1, keepdim=True) / hidden_size)
+    grad_summed = grad_summed + grad_residual.to(compute_dtype)
+    return grad_summed.to(x.dtype), grad_summed.to(residual.dtype), grad_weight, None
+
+
 class FusedAddRMSNorm(torch.autograd.Function):
     """Residual add followed by (1+weight) RMSNorm, both evaluated in fp32.
 
@@ -48,30 +76,28 @@ class FusedAddRMSNorm(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float):
-        compute_dtype = _compute_dtype(x)
-        summed = x.to(compute_dtype) + residual.to(compute_dtype)
-        rstd = torch.rsqrt(summed.pow(2).mean(-1, keepdim=True) + eps)
-        out = summed * rstd * (1.0 + weight.to(compute_dtype))
-        ctx.save_for_backward(x, residual, weight, rstd)
-        return out.to(x.dtype), summed.to(x.dtype)
+        out, summed = _fused_add_rms_norm_forward(ctx, x, residual, weight, eps)
+        return out, summed.to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor, grad_residual: torch.Tensor):
-        x, residual, weight, rstd = ctx.saved_tensors
-        compute_dtype = _compute_dtype(x)
-        summed = x.to(compute_dtype) + residual.to(compute_dtype)
-        normed = summed * rstd
-        scale = 1.0 + weight.to(compute_dtype)
+        return _fused_add_rms_norm_backward(ctx, grad_out, grad_residual)
 
-        grad = grad_out.to(compute_dtype)
-        grad_weight = (grad * normed).reshape(-1, weight.shape[-1]).sum(0).to(weight.dtype)
 
-        # Gradient through normed = summed * rstd(summed), with rstd = (mean(summed**2) + eps) ** -0.5.
-        grad_normed = grad * scale
-        hidden_size = summed.shape[-1]
-        grad_summed = rstd * (grad_normed - normed * (grad_normed * normed).sum(-1, keepdim=True) / hidden_size)
-        grad_summed = grad_summed + grad_residual.to(compute_dtype)
-        return grad_summed.to(x.dtype), grad_summed.to(residual.dtype), grad_weight, None
+class FusedAddRMSNormFp32Residual(torch.autograd.Function):
+    """``FusedAddRMSNorm`` that returns the sum, the next residual, unrounded: in fp32 for 16-bit inputs.
+
+    The normalized value is still returned in the input dtype. Used to carry the residual stream in fp32 between
+    decoder layers.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float):
+        return _fused_add_rms_norm_forward(ctx, x, residual, weight, eps)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor, grad_residual: torch.Tensor):
+        return _fused_add_rms_norm_backward(ctx, grad_out, grad_residual)
 
 
 def rope_rotary_slice_fp32(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
