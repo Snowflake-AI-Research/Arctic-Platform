@@ -100,27 +100,18 @@ def rows_for_rollout(
     episodes: list[Any],
     grade: Grade,
     tokenizer: Any,
-    model_name: str,
     step_wise: bool,
 ) -> list[dict[str, Any]]:
     """Training rows for one rollout. No episodes is one masked token and reward 0."""
     sequences = training_sequences(episodes, step_wise) if len(episodes) > 0 else []
     if len(sequences) == 0:
         eos = tokenizer.eos_token_id or 0
-        row = masked_row([eos], [eos], 0.0, grade.reward_detail, True, tokenizer, model_name)
+        row = masked_row([eos], [eos], [0], 0.0, grade.reward_detail, True)
         row["stop_reason"] = "error"
         return [row]
     return [
-        masked_row(
-            prompt_ids,
-            response_ids,
-            grade.reward,
-            grade.reward_detail,
-            grade.exhausted,
-            tokenizer,
-            model_name,
-        )
-        for prompt_ids, response_ids in sequences
+        masked_row(prompt_ids, response_ids, mask, grade.reward, grade.reward_detail, grade.exhausted)
+        for prompt_ids, response_ids, mask in sequences
     ]
 
 
@@ -130,7 +121,6 @@ class HarnessGenerator:
     def __init__(
         self,
         tokenizer: Any,
-        model_name: str,
         proxy: Any,
         traj_dir: str,
         adapter: HarnessAdapter,
@@ -139,7 +129,6 @@ class HarnessGenerator:
         step_wise: bool = False,
     ) -> None:
         self._tokenizer = tokenizer
-        self._model_name = model_name
         self._proxy = proxy
         self._traj_dir = traj_dir
         self._adapter = adapter
@@ -225,7 +214,7 @@ class HarnessGenerator:
             grade = Grade(reward=0.0, reward_detail=dict(self._error_detail), exhausted=False)
         if not isinstance(grade, Grade):
             grade = Grade(reward=0.0, reward_detail=dict(self._error_detail), exhausted=False)
-        rows = rows_for_rollout(episodes, grade, self._tokenizer, self._model_name, self._step_wise)
+        rows = rows_for_rollout(episodes, grade, self._tokenizer, self._step_wise)
         return rows, artifacts, grade
 
     def _write_trajectory(

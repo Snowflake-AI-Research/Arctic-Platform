@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from arctic_platform.integrations.harness.episodes import Episode
 from arctic_platform.integrations.harness.episodes import Session
 from arctic_platform.integrations.harness.episodes import plan_prompt
@@ -27,30 +29,13 @@ from arctic_platform.integrations.harness.generator import Grade
 from arctic_platform.integrations.harness.generator import _detail_means
 from arctic_platform.integrations.harness.generator import rows_for_rollout
 from arctic_platform.integrations.harness.generator import trajectory_payload
-from arctic_platform.integrations.harness.loss_mask import assistant_loss_mask
-from arctic_platform.integrations.harness.loss_mask import mask_if_exhausted
 from arctic_platform.integrations.harness.proxy import ChatCompletionsProxy
-from arctic_platform.integrations.harness.tokens import buffer_after_role
-from arctic_platform.integrations.harness.tokens import stitch_response
-from arctic_platform.integrations.harness.tokens import training_row
+from arctic_platform.integrations.harness.tokens import masked_row
 from arctic_platform.integrations.harness.tool_parser import parse_tool_calls
-
-START = 1
-ASSISTANT = 2
 
 
 class _Tokenizer:
     eos_token_id = 7
-
-    def convert_tokens_to_ids(self, token: str) -> int:
-        return {"<|im_start|>": START, "assistant": ASSISTANT}[token]
-
-
-def _events() -> list[dict]:
-    return [
-        dict(prompt_token_ids=[1, 2], response_token_ids=[3]),
-        dict(prompt_token_ids=[1, 2, 3, 4], response_token_ids=[5]),
-    ]
 
 
 def test_plain_text_has_no_tool_calls():
@@ -76,35 +61,9 @@ def test_json_list_parameter_stays_structured():
     assert json.loads(calls[0]["function"]["arguments"])["locations"] == [dict(file="src/a.py")]
 
 
-def test_mask_trains_on_assistant_content_only():
-    response = [9, START, ASSISTANT, 4, 5]
-    mask = assistant_loss_mask(response, start_token_id=START, assistant_token_id=ASSISTANT, buffer_succeed=1)
-    assert mask == [0, 0, 0, 0, 1]
-    assert mask_if_exhausted(mask, True) == [0, 0, 0, 0, 0]
-
-
-def test_stitch_drops_the_shared_prefix():
-    prompt, response = stitch_response(_events())
-    assert prompt == [1, 2]
-    assert response == [3, 4, 5]
-    assert buffer_after_role("Qwen/Qwen3-4B-Instruct-2507") == 1
-    assert buffer_after_role("Qwen/Qwen3.5-4B") == 5
-
-
-def test_training_row_uses_the_harness_reward():
-    row = training_row(
-        dict(token_messages=_events(), reward=2.0, reward_detail=dict(reward=2.0), exhausted=False),
-        _Tokenizer(),
-        "Qwen/Qwen3.5-4B",
-    )
-    assert row["reward"] == 2.0
-    assert row["response_ids"] == [3, 4, 5]
-    exhausted = training_row(
-        dict(token_messages=_events(), reward=2.0, reward_detail=dict(reward=2.0), exhausted=True),
-        _Tokenizer(),
-        "Qwen/Qwen3.5-4B",
-    )
-    assert exhausted["loss_mask"] == [0] * len(exhausted["response_ids"])
+def test_masked_row_rejects_a_mask_of_the_wrong_length():
+    with pytest.raises(ValueError, match="loss mask"):
+        masked_row([1], [2, 3], [1], 0.0, {}, False)
 
 
 class _ChatTokenizer(_Tokenizer):
@@ -169,7 +128,10 @@ def test_continuation_keeps_the_sampled_tokens():
     remember(session, second, dict(role="assistant", content="done"), spliced, [7], {}, extended, None)
     sequences = training_sequences(session.episodes, step_wise=False)
     assert len(sequences) == 1
-    assert sequences[0][1][:2] == [42, 43]
+    _, response, mask = sequences[0]
+    assert response[:2] == [42, 43]
+    # Only the two calls' sampled tokens train; the end marker and tool turn between them do not.
+    assert mask == [1, 1] + [0] * (len(response) - 3) + [1]
 
 
 def test_a_new_system_message_starts_a_new_episode():
@@ -190,14 +152,36 @@ def test_rows_use_the_grader_and_keep_one_row_per_trajectory():
         Episode([1, 2, 3, 4], [5], None, {}, False),
     ]
     grade = Grade(reward=2.0, reward_detail=dict(file_reward=1.0, reward=2.0), exhausted=False)
-    rows = rows_for_rollout(episodes, grade, _Tokenizer(), "Qwen/Qwen3.5-4B", step_wise=False)
+    rows = rows_for_rollout(episodes, grade, _Tokenizer(), step_wise=False)
     assert len(rows) == 1
     assert rows[0]["reward"] == 2.0
     assert rows[0]["response_ids"] == [3, 4, 5]
-    split = rows_for_rollout(episodes, grade, _Tokenizer(), "Qwen/Qwen3.5-4B", step_wise=True)
+    assert rows[0]["loss_mask"] == [1, 0, 1]
+    split = rows_for_rollout(episodes, grade, _Tokenizer(), step_wise=True)
     assert len(split) == 2
     assert split[0]["response_ids"] == [3]
     assert split[1]["response_ids"] == [5]
+    exhausted = Grade(reward=2.0, reward_detail=dict(reward=2.0), exhausted=True)
+    assert rows_for_rollout(episodes, exhausted, _Tokenizer(), step_wise=False)[0]["loss_mask"] == [0, 0, 0]
+
+
+def test_re_rendered_history_that_changed_ids_is_not_trained():
+    # The second call re-rendered the first turn as 9 instead of the sampled 3.
+    episodes = [
+        Episode([1, 2], [3], None, {}, False),
+        Episode([1, 2, 9, 4], [5], None, {}, False),
+    ]
+    grade = Grade(reward=1.0, reward_detail=dict(reward=1.0), exhausted=False)
+    rows = rows_for_rollout(episodes, grade, _Tokenizer(), step_wise=False)
+    assert rows[0]["response_ids"] == [9, 4, 5]
+    assert rows[0]["loss_mask"] == [0, 0, 1]
+
+
+def test_a_rollout_with_no_episodes_is_one_masked_token():
+    grade = Grade(reward=1.0, reward_detail=dict(reward=1.0), exhausted=False)
+    rows = rows_for_rollout([], grade, _Tokenizer(), step_wise=False)
+    assert rows[0]["loss_mask"] == [0]
+    assert rows[0]["stop_reason"] == "error"
 
 
 def test_trajectory_keeps_adapter_fields():
