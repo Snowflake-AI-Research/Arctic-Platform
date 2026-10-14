@@ -201,6 +201,46 @@ def _to_python(obj: Any) -> Any:
     return obj
 
 
+def _is_transient(exc: BaseException) -> bool:
+    """Retry connection/timeout errors and transient HTTP statuses (safe for reads)."""
+    import aiohttp
+
+    if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
+        return True
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status in _TRANSIENT_STATUSES
+    return False
+
+
+def _is_connect_error(exc: BaseException) -> bool:
+    """Only failures proving the request never reached the server (safe for mutating POSTs)."""
+    import aiohttp
+
+    return isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError))
+
+
+@dataclass(frozen=True)
+class _SendPolicy:
+    timeout: float
+    max_retries: int
+    retry_on: Callable[[BaseException], bool]
+
+
+def _default_send_policy(config: CortexConfig) -> _SendPolicy:
+    return _SendPolicy(config.request_timeout, config.max_retries, _is_transient)
+
+
+def _connect_only_send_policy(config: CortexConfig) -> _SendPolicy:
+    return _SendPolicy(config.request_timeout, config.max_retries, _is_connect_error)
+
+
+def _capacity_send_policy(config: CortexConfig) -> _SendPolicy:
+    return _SendPolicy(min(config.request_timeout, 30.0), 0, _is_transient)
+
+
+PolicyFactory = Callable[[CortexConfig], _SendPolicy]
+
+
 @dataclass(frozen=True, kw_only=True)
 class _Route:
     method: str
@@ -208,8 +248,7 @@ class _Route:
     path: str
     encode: Callable[[Request, dict], list[Send]] = _json
     poll: bool = False
-    # False: retry only sends that provably never reached the server.
-    replay_safe: bool = True
+    policy_factory: PolicyFactory = _default_send_policy
     # Re-post the whole chunk group once on `chunk_group_restart_required`. Only endpoints
     # that stage chunks on the job's actor (forward-backward) send that code; it is not a
     # general retry flag.
@@ -217,8 +256,6 @@ class _Route:
     # `operation_type`s that may answer in the POST reply instead of with a request_id.
     inline_types: frozenset[str] = frozenset()
     normalize: Callable[[Any], Any] = _identity
-    request_timeout: float | None = None
-    max_retries: int | None = None
 
     def prepare(self, prefix: str, request: Request) -> tuple[str, list[Send]]:
         body = {k: v for k, v in request.body.items() if v is not None}
@@ -260,7 +297,7 @@ _ROUTES = {
     "sleep-training": _NOOP,
     "wake-training": _NOOP,
     # A replayed create would spawn a second job.
-    "create-job": _Route(method="POST", path="", replay_safe=False),
+    "create-job": _Route(method="POST", path="", policy_factory=_connect_only_send_policy),
     "list-jobs": _Route(method="GET", path="", encode=_query, normalize=lambda reply: reply.get("jobs", [])),
     "get-job": _Route(method="GET", path="/{job}", encode=_no_body),
     "cancel-job": _Route(method="POST", path="/{job}:cancel", encode=_no_body),
@@ -269,8 +306,7 @@ _ROUTES = {
         path="/capacity",
         encode=_query,
         normalize=_capacity_result,
-        request_timeout=30.0,
-        max_retries=0,
+        policy_factory=_capacity_send_policy,
     ),
     "list-checkpoints": _Route(
         method="GET",
@@ -281,7 +317,10 @@ _ROUTES = {
     "export-checkpoint": _Route(method="POST", path="/{job}/checkpoints/{checkpoint_id}:export", encode=_no_body),
     # A replayed delete answers 404 for a checkpoint the first send already removed.
     "delete-checkpoint": _Route(
-        method="DELETE", path="/{job}/checkpoints/{checkpoint_id}", encode=_no_body, replay_safe=False
+        method="DELETE",
+        path="/{job}/checkpoints/{checkpoint_id}",
+        encode=_no_body,
+        policy_factory=_connect_only_send_policy,
     ),
     # forward-backward always carries a chunk envelope, even when the frame fits: its
     # chunk_group_id is the server's idempotency key. A mid-stream chunk-group desync
@@ -314,24 +353,6 @@ def _route(op: str) -> _Route:
     if op not in _ROUTES:
         raise NotImplementedError(f"cortex has no {op}")
     return _ROUTES[op]
-
-
-def _is_transient(exc: BaseException) -> bool:
-    """Retry connection/timeout errors and transient HTTP statuses (safe for reads)."""
-    import aiohttp
-
-    if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
-        return True
-    if isinstance(exc, aiohttp.ClientResponseError):
-        return exc.status in _TRANSIENT_STATUSES
-    return False
-
-
-def _is_connect_error(exc: BaseException) -> bool:
-    """Only failures proving the request never reached the server (safe for mutating POSTs)."""
-    import aiohttp
-
-    return isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError))
 
 
 class _ChunkGroupError(Exception):
@@ -414,7 +435,6 @@ class CortexTransport(Transport):
         self.config = config
         self.jobs = JobHandles()
         self.job_id: str | None = None
-        self.max_retries = config.max_retries
         self.poll_interval = 0.5
         self._start_loop()
 
@@ -504,17 +524,10 @@ class CortexTransport(Transport):
 
     async def _send_each(self, route: _Route, url: str, sends: list[Send]) -> dict:
         """Post every send in order; the last reply is the op's answer."""
-        retry_on = _is_transient if route.replay_safe else _is_connect_error
+        policy = route.policy_factory(self.config)
         reply: dict = {}
         for kwargs in sends:
-            reply = await self._send(
-                route.method,
-                url,
-                retry_on=retry_on,
-                request_timeout=route.request_timeout,
-                max_retries=route.max_retries,
-                **kwargs,
-            )
+            reply = await self._send(route.method, url, policy=policy, **kwargs)
         return reply
 
     def _request_url(self, request_id: str, cursor: str | None) -> tuple[str, dict | None]:
@@ -531,9 +544,11 @@ class CortexTransport(Transport):
         delay = self.poll_interval
         chunks: list[bytes] = []
         cursor: str | None = None
+        policy = _default_send_policy(self.config)
         while time.monotonic() < deadline:
             url, params = self._request_url(request_id, cursor)
-            action, value = _poll_progress(await self._send("GET", url, params=params), chunks, request_id)
+            reply = await self._send("GET", url, policy=policy, params=params)
+            action, value = _poll_progress(reply, chunks, request_id)
             if action == "done":
                 return chunks, value
             if action == "drain":
@@ -617,23 +632,16 @@ class CortexTransport(Transport):
         method: str,
         url: str,
         *,
-        retry_on=_is_transient,
-        request_timeout: float | None = None,
-        max_retries: int | None = None,
+        policy: _SendPolicy,
         **kwargs: Any,
     ) -> dict:
-        # Every SnowAPI call goes through here so transient 429/5xx/connection blips
-        # are retried with exponential-jitter backoff (the neutrino client's policy).
+        # Every SnowAPI call goes through here with its route's complete send policy.
         import aiohttp
 
         if self._session is None:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.config.request_timeout),
-                headers=self._auth_headers(),
-            )
+            self._session = aiohttp.ClientSession(headers=self._auth_headers())
         session = self._session
-        if request_timeout is not None:
-            kwargs["timeout"] = aiohttp.ClientTimeout(total=request_timeout)
+        kwargs["timeout"] = aiohttp.ClientTimeout(total=policy.timeout)
 
         async def attempt() -> dict:
             async with session.request(method, url, **kwargs) as resp:
@@ -644,10 +652,9 @@ class CortexTransport(Transport):
                 # would report an already-completed release as a failure.
                 return json.loads(body) if body.strip() else {}
 
-        retry_limit = self.max_retries if max_retries is None else max_retries
         retryer = AsyncRetrying(
-            retry=retry_if_exception(retry_on),
-            stop=stop_after_attempt(1 + retry_limit),
+            retry=retry_if_exception(policy.retry_on),
+            stop=stop_after_attempt(1 + policy.max_retries),
             wait=wait_exponential_jitter(initial=0.5, max=10.0),
             reraise=True,
         )
