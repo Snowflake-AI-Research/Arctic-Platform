@@ -56,8 +56,8 @@ def register(registry: Registry) -> None:
                 "the key has no effect on this route: the job sets the model dtype, not this key"
             ),
             "numerics.fp32_parity": (
-                "only the custom Qwen3.5-MoE model, loaded by qwen3_5_moe with expert parallelism above 1, has this "
-                "option"
+                "the loader's fp32_parity option sets only the beta gate of the GatedDeltaNet layers adapted for "
+                "sequence parallelism, not the residual adds or the rotary embedding"
             ),
         },
         not_applicable={

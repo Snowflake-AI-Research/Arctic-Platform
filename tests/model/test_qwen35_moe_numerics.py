@@ -19,8 +19,8 @@ With ``fp32_parity`` (the default) the custom model rounds like vLLM in three pl
 inside the next RMSNorm, partial RoPE is evaluated in fp32, and the GatedDeltaNet beta gate is a sigmoid of fp32 ``b``.
 These tests check each of them against an independently written reference, check that the residual threading between
 decoder layers survives activation checkpointing and activation offload in forward and backward, and check that the
-state dict keys and shapes are the expected ones. One test pins the fp32 beta gate that the generic transformers
-sequence-parallel wrapper gets from the same shared head-parallel function.
+state dict keys and shapes are the expected ones. Other tests check that the generic transformers sequence-parallel
+wrapper passes its ``fp32_beta`` argument to the same shared head-parallel function.
 
 With ``fp32_parity`` off each decoder layer adds its residuals in the input dtype at the end of the layer, and the
 rotary embedding and the beta gate run in the input dtype. Those tests compare the model bitwise, in forward and
@@ -486,6 +486,7 @@ def test_head_parallel_gated_delta_net_beta_is_fp32(single_rank_group, monkeypat
         global_cu_seqlens=torch.tensor([0, 6], dtype=torch.int32),
         num_key_heads=2,
         num_value_heads=2,
+        fp32_beta=True,
         initial_state=None,
         output_final_state=False,
         use_qk_l2norm_in_kernel=True,
@@ -537,15 +538,16 @@ class _TransformersStyleGatedDeltaNet(nn.Module):
         raise AssertionError("the sequence-parallel wrapper replaces this forward")
 
 
-def test_transformers_sequence_parallel_wrapper_beta_is_fp32(single_rank_group, monkeypatch):
-    # head_parallel_gated_delta_net is shared by the custom model and the generic transformers wrapper, so the
-    # wrapper's adapted layers get the fp32 beta gate too. This pins that, so narrowing the fp32 gate to the custom
-    # model is a deliberate change. With one rank the all-to-all is the identity.
+@pytest.mark.parametrize("fp32_beta", [True, False])
+def test_transformers_sequence_parallel_wrapper_beta_follows_its_argument(single_rank_group, monkeypatch, fp32_beta):
+    # The generic transformers wrapper passes the fp32_beta it is given (the huggingface loader's fp32_parity) to the
+    # shared head-parallel function; False gives b.sigmoid() in b's own dtype, as the stock forward computes it. With
+    # one rank the all-to-all is the identity.
     monkeypatch.setattr(sp_gated_delta_net, "sequence_head_all_to_all", lambda group, tensor, **kwargs: tensor)
     set_seed(0)
     module = _TransformersStyleGatedDeltaNet().to(torch.bfloat16)
     assert sp_gated_delta_net._is_gated_delta_net_module(module)
-    sp_gated_delta_net._adapt_gated_delta_net_module(module, single_rank_group)
+    sp_gated_delta_net._adapt_gated_delta_net_module(module, single_rank_group, fp32_beta=fp32_beta)
     setattr(module, sp_gated_delta_net._GLOBAL_CU_SEQLENS_ATTRIBUTE, torch.tensor([0, 6], dtype=torch.int32))
     hidden_states = torch.randn(1, 6, 16).to(torch.bfloat16)
 
@@ -553,8 +555,86 @@ def test_transformers_sequence_parallel_wrapper_beta_is_fp32(single_rank_group, 
 
     b = module.in_proj_b(hidden_states)
     assert b.dtype == torch.bfloat16
-    assert module.captured["beta"].dtype == torch.float32
-    torch_assert_equal(module.captured["beta"], b.float().sigmoid())
+    if fp32_beta:
+        assert module.captured["beta"].dtype == torch.float32
+        torch_assert_equal(module.captured["beta"], b.float().sigmoid())
+    else:
+        assert module.captured["beta"].dtype == torch.bfloat16
+        torch_assert_equal(module.captured["beta"], b.sigmoid())
+
+
+@pytest.mark.parametrize("fp32_beta", [True, False])
+def test_stock_qwen3_5_gated_delta_net_through_the_wrapper_follows_its_argument(
+    single_rank_group, monkeypatch, fp32_beta
+):
+    # The wrapper adapts the stock transformers Qwen3.5 GatedDeltaNet class itself, not only modules shaped like it.
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    config = Qwen3_5TextConfig(
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        intermediate_size=64,
+        vocab_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+    )
+    set_seed(0)
+    module = modeling_qwen3_5.Qwen3_5GatedDeltaNet(config, 0).to(torch.bfloat16)
+    assert sp_gated_delta_net._is_gated_delta_net_module(module)
+    captured = {}
+
+    def convolution(*, x, weight, bias, activation, seq_idx):
+        return F.silu(x)
+
+    def gated_delta_rule(query, key, value, g, beta, **kwargs):
+        captured["beta"] = beta
+        return torch.zeros_like(value), None
+
+    monkeypatch.setattr(sp_gated_delta_net, "sequence_head_all_to_all", lambda group, tensor, **kwargs: tensor)
+    monkeypatch.setattr(
+        sp_gated_delta_net,
+        "_resolve_gated_delta_net_kernel",
+        lambda module, attribute: gated_delta_rule if attribute == "chunk_gated_delta_rule" else convolution,
+    )
+    sp_gated_delta_net._adapt_gated_delta_net_module(module, single_rank_group, fp32_beta=fp32_beta)
+    setattr(module, sp_gated_delta_net._GLOBAL_CU_SEQLENS_ATTRIBUTE, torch.tensor([0, 6], dtype=torch.int32))
+    hidden_states = torch.randn(1, 6, 32).to(torch.bfloat16)
+
+    module(hidden_states)
+
+    b = module.in_proj_b(hidden_states)
+    expected = b.float().sigmoid() if fp32_beta else b.sigmoid()
+    torch_assert_equal(captured["beta"].reshape(b.shape), expected)
+
+
+def test_head_parallel_gated_delta_net_requires_fp32_beta():
+    # No default: a caller that does not say which beta gate it wants fails instead of getting one silently.
+    tensor = torch.zeros(1)
+    with pytest.raises(TypeError, match="fp32_beta"):
+        sp_gated_delta_net.head_parallel_gated_delta_net(
+            None,
+            None,
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            convolution_weight=tensor,
+            convolution_bias=None,
+            convolution_activation=None,
+            A_log=tensor,
+            dt_bias=tensor,
+            process_group=None,
+            global_cu_seqlens=tensor,
+            num_key_heads=1,
+            num_value_heads=1,
+        )
 
 
 # ---------------------------------------------------------------------------

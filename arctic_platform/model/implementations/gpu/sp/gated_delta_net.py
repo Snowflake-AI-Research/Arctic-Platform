@@ -317,12 +317,13 @@ def head_parallel_gated_delta_net(
     global_cu_seqlens: torch.Tensor,
     num_key_heads: int,
     num_value_heads: int,
-    fp32_beta: bool = True,
+    fp32_beta: bool,
     **rule_kwargs,
 ):
     """Run convolution and recurrence on a full-sequence GDN head shard.
 
-    ``fp32_beta`` evaluates the beta gate as a sigmoid of fp32 ``b``; ``False`` evaluates it in ``b``'s own dtype.
+    ``fp32_beta`` evaluates the beta gate as a sigmoid of fp32 ``b``; ``False`` evaluates it in ``b``'s own dtype. It
+    has no default, so every caller chooses.
 
     The first all-to-all exchanges native projected Q/K/V and gate preactivations
     from local-sequence/all-heads to full-sequence/local-heads. The depthwise
@@ -449,9 +450,8 @@ def head_parallel_gated_delta_net(
     )
     # vLLM evaluates the beta gate as a sigmoid of fp32 ``b`` and keeps it in fp32; a sigmoid of low-precision
     # ``b`` would round the gate before the recurrence reads it. This function is shared by the custom Qwen3.5-MoE
-    # model, which passes its ``fp32_parity`` setting, and by the generic transformers wrapper
-    # (``_adapt_gated_delta_net_module``), which keeps the default, so the layers that wrapper adapts also get the
-    # fp32 gate under sequence parallelism, whatever their own forward computes without it.
+    # model and by the generic transformers wrapper (``_adapt_gated_delta_net_module``); each passes its loader's
+    # ``fp32_parity`` setting.
     beta = exchanged["b"].float().sigmoid() if fp32_beta else exchanged["b"].sigmoid()
     g = -local_A_log.float().exp() * F.softplus(exchanged["a"].float() + local_dt_bias)
 
@@ -660,7 +660,12 @@ def _module_head_counts(module: nn.Module) -> tuple[int, int]:
     return num_key_heads, num_value_heads
 
 
-def _adapt_gated_delta_net_module(module: nn.Module, process_group) -> None:
+def _adapt_gated_delta_net_module(module: nn.Module, process_group, *, fp32_beta: bool) -> None:
+    """Replace ``module.forward`` with the head-parallel forward.
+
+    ``fp32_beta`` is passed to :func:`head_parallel_gated_delta_net`: ``True`` evaluates the beta gate as a sigmoid of
+    fp32 ``b``, ``False`` as ``b.sigmoid()`` in ``b``'s own dtype, which is what the stock transformers forward does.
+    """
     required_attributes = (
         "in_proj_qkv",
         "in_proj_z",
@@ -766,6 +771,7 @@ def _adapt_gated_delta_net_module(module: nn.Module, process_group) -> None:
             global_cu_seqlens=global_cu_seqlens,
             num_key_heads=num_key_heads,
             num_value_heads=num_value_heads,
+            fp32_beta=fp32_beta,
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
@@ -819,8 +825,11 @@ def _install_global_boundary_wrapper(model: nn.Module, modules: list, process_gr
     model.forward = forward
 
 
-def apply_gated_delta_net_sequence_parallelism(model: nn.Module, process_group) -> int:
-    """Adapt every HF-style GatedDeltaNet module in ``model`` and return the count."""
+def apply_gated_delta_net_sequence_parallelism(model: nn.Module, process_group, *, fp32_beta: bool) -> int:
+    """Adapt every HF-style GatedDeltaNet module in ``model`` and return the count.
+
+    ``fp32_beta`` selects the beta gate's precision in every adapted module (see ``_adapt_gated_delta_net_module``).
+    """
     if process_group is None:
         return 0
 
@@ -832,7 +841,7 @@ def apply_gated_delta_net_sequence_parallelism(model: nn.Module, process_group) 
         compatible_modules += 1
         if getattr(module, "_dss_gated_delta_net_sequence_parallel", False):
             continue
-        _adapt_gated_delta_net_module(module, process_group)
+        _adapt_gated_delta_net_module(module, process_group, fp32_beta=fp32_beta)
         adapted.append(module)
     adapted_modules = len(adapted)
     if adapted:

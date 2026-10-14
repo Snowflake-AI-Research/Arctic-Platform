@@ -17,8 +17,9 @@
 
 A cell is ``supports`` only when, in the current code, the loader's own options model has a field for the option,
 the loader accepts and validates a ``ModelSpec`` field for it (such as ``attn_implementation``), or, for the
-``huggingface`` loader, ``Patches`` has a field for it. ``tests/model/test_option_profiles.py`` checks that
-against the loaders.
+``huggingface`` loader, ``Patches`` has a field for it. The ``huggingface`` loader's own options model has one field,
+``fp32_parity``, which its profile describes. ``tests/model/test_option_profiles.py`` checks all of that against the
+loaders.
 """
 
 from __future__ import annotations
