@@ -49,7 +49,6 @@ class ModelConfig:
 
     impl: Literal["hf", "custom", "auto"] = "auto"
     optimization_dtype: Literal["bfloat16", "float32"] = "float32"
-    reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     moe_use_grouped_mm: bool = True
 
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"

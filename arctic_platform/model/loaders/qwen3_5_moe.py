@@ -52,7 +52,6 @@ class Qwen3_5MoeOptions(BaseModel):
     trust_remote_code: bool = False
     ep_comm_backend: Literal["deepep", "uccl"] = Field("deepep", description="Expert-parallel comm backend.")
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
-    reduce_dtype: Literal["bfloat16", "float32"] = Field("float32", description="Gradient reduction dtype.")
     moe_use_grouped_mm: bool = Field(True, description="Use grouped matmul for experts.")
     fused_cross_entropy: bool | Literal["liger"] = Field("liger", description="LM-head fused CE backend.")
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = Field(
