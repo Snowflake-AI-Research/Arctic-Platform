@@ -260,8 +260,8 @@ class ArcticClient(_ArcticClientCore):
 
     def load_checkpoint(
         self,
-        path: str | None = None,
         *,
+        path: str | None = None,
         step: int | None = None,
         checkpoint_id: str | None = None,
         source_job_id: JobId | None = None,
@@ -444,8 +444,8 @@ class AsyncArcticClient(_ArcticClientCore):
 
     async def load_checkpoint(
         self,
-        path: str | None = None,
         *,
+        path: str | None = None,
         step: int | None = None,
         checkpoint_id: str | None = None,
         source_job_id: JobId | None = None,
