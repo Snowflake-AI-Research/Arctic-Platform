@@ -141,9 +141,10 @@ def ensure_dflash_max_position_patch() -> None:
     def post_init(self):
         result = original(self)
         if self.method == "dflash":
+            # DFlash queries the draft up to num_speculative_tokens past the last target position, unclamped.
             self._maybe_override_draft_max_position_embeddings(
                 self.draft_model_config.hf_config,
-                self.target_model_config.max_model_len,
+                self.target_model_config.max_model_len + self.num_speculative_tokens,
             )
         return result
 

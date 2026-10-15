@@ -58,8 +58,8 @@ def test_dflash_rotary_cache_covers_target_positions(tmp_path, monkeypatch):
             rope_parameters=draft.rope_parameters,
             dtype=torch.float32,
         )
-    positions = torch.tensor([native_length, target_length - 1])
-    query = torch.ones(2, 8)
+    positions = torch.tensor([native_length, target_length - 1, target_length + spec.num_speculative_tokens - 1])
+    query = torch.ones(len(positions), 8)
     rotated, _ = rope.forward_native(positions, query, query)
     assert torch.isfinite(rotated).all()
-    assert draft.max_position_embeddings == target.max_model_len
+    assert draft.max_position_embeddings == target.max_model_len + spec.num_speculative_tokens
