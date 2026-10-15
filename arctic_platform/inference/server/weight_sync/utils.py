@@ -274,25 +274,35 @@ class _FP8InplaceUpdater:
     ) -> None:
         from vllm.model_executor.layers.linear import RowParallelLinear
 
-        tp_rank = module.tp_rank
+        # Shard from the full tensor: ``param`` may be stored transposed.
+        tp_rank, tp_size = module.tp_rank, module.tp_size
         if isinstance(module, RowParallelLinear):
-            shard_size = param.shape[1]
+            if tensor.shape[1] % tp_size:
+                raise ValueError(
+                    f"native FP8 scale shape {tuple(tensor.shape)} does not "
+                    f"split across {tp_size} input shards"
+                )
+            shard_size = tensor.shape[1] // tp_size
             local = tensor.narrow(1, tp_rank * shard_size, shard_size)
-        elif output_sizes := getattr(module, "output_partition_sizes", None):
+        else:
+            output_sizes = getattr(module, "output_partition_sizes", None) or (1,)
             total = sum(output_sizes)
             offset = 0
             shards = []
             for output_size in output_sizes:
-                scale_rows = tensor.shape[0] * output_size // total
-                shard_size = scale_rows // module.tp_size
+                scale_rows, rows_rem = divmod(tensor.shape[0] * output_size, total)
+                if rows_rem or scale_rows % tp_size:
+                    raise ValueError(
+                        f"native FP8 scale shape {tuple(tensor.shape)} does not "
+                        f"split into output sizes {list(output_sizes)} across "
+                        f"{tp_size} shards"
+                    )
+                shard_size = scale_rows // tp_size
                 shards.append(
                     tensor.narrow(0, offset + tp_rank * shard_size, shard_size)
                 )
                 offset += scale_rows
             local = torch.cat(shards, dim=0)
-        else:
-            shard_size = param.shape[0]
-            local = tensor.narrow(0, tp_rank * shard_size, shard_size)
 
         if param.shape == local.shape:
             param.data.copy_(local)
