@@ -60,8 +60,8 @@ constrains what runs correctly here:
   Ctrl-C, and on SIGTERM, including during the placement wait. A driver killed
   outright (`kill -9`, OOM, a lost pod) cannot cancel anything. The server
   reclaims that job once it has been idle for `backend.idle_timeout_seconds`,
-  30 minutes by default. `CortexTransport.list_jobs()` / `cancel_job()` release
-  it sooner.
+  30 minutes by default. `list_jobs_request()` / `cancel_job_request()` sent
+  through `CortexTransport.call()` release it sooner.
 * **Holding a job across a long placement wait.** `ArcticClient(config,
   wait=False)` returns once the job is requested; `wait_until_ready()` blocks
   until it runs. The caller holds the client for the whole wait, so a `with`

@@ -199,8 +199,9 @@ cortex_jobs() {
 import os
 import sys
 
-from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client.config import CortexConfig
+from arctic_platform.client.requests import cancel_job_request
+from arctic_platform.client.requests import list_jobs_request
 from arctic_platform.client.transports.cortex import CortexTransport
 
 # Anything not in here still holds its GPUs.
@@ -217,12 +218,10 @@ def is_this_model(job: dict) -> bool:
     return bool(subs) and all(s.get("model_name") == model for s in subs)
 
 
-# model_name is required by the config but unused for job queries: this never
-# provisions anything, it only reads and cancels.
-transport = CortexTransport(ArcticClientConfig(model_name="unused", backend=CortexConfig()))
+transport = CortexTransport(CortexConfig())
 live = [
     j.get("job_id") or j.get("id") or j.get("name")
-    for j in transport.list_jobs()
+    for j in transport.call(list_jobs_request())
     if str(j.get("status") or j.get("state") or "?").lower() not in TERMINAL and is_this_model(j)
 ]
 
@@ -230,8 +229,9 @@ if mode == "list":
     print("\n".join(str(j) for j in live))
 else:
     for job_id in (j for j in live if j in wanted):
-        transport.cancel_job(job_id)
+        transport.call(cancel_job_request(job_id))
         print(f"released {job_id}", file=sys.stderr)
+transport.shutdown()
 PY
 }
 
