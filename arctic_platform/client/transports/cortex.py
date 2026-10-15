@@ -325,7 +325,6 @@ _ROUTES = {
     ),
     "step": _Route(method="POST", path="/{job}/step", poll=True),
     "save": _Route(method="POST", path="/{job}/save", poll=True),
-    # Without a target_sub_job_id the server loads into the training sub-job.
     "load-checkpoint": _Route(method="POST", path="/{job}/load", poll=True),
     # /operation is polymorphic: weight-sync is polled, the rest answer inline.
     "operation": _Route(
