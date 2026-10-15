@@ -118,9 +118,17 @@ class CortexConfig(BaseSettings):
         validation_alias=AliasChoices("job_comment", "ARCTIC_CORTEX_JOB_COMMENT", "CORTEX_JOB_COMMENT"),
         description="cortex: comment stored on the job at create time.",
     )
-    job_id_file: str | None = Field(
+    # The server reclaims a job nobody is using, so a client that is killed
+    # outright still releases its GPUs. None keeps the server default (30 min).
+    idle_timeout_seconds: int | None = Field(
         None,
-        description="cortex: file that receives the job id before the placement wait, so a launcher can cancel it.",
+        description="cortex: seconds a job may sit idle before the server reclaims it; 0 disables, else 300-604800.",
+    )
+    pending_timeout_seconds: int | None = Field(
+        None,
+        ge=300,
+        le=604_800,
+        description="cortex: seconds a job may wait for capacity before the server fails it (default 24h).",
     )
 
     @model_validator(mode="after")
@@ -132,6 +140,9 @@ class CortexConfig(BaseSettings):
                 raise ValueError("cortex: database + schema required for host/PAT auth.")
             if not (self.pat and self.pat.get_secret_value()):
                 raise ValueError("cortex: no PAT — set `pat` or ARCTIC_CORTEX_PAT for host auth.")
+        idle = self.idle_timeout_seconds
+        if idle is not None and idle != 0 and not 300 <= idle <= 604_800:
+            raise ValueError("cortex: idle_timeout_seconds must be 0 or between 300 and 604800.")
         return self
 
 

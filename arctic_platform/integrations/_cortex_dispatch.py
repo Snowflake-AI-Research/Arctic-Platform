@@ -110,13 +110,13 @@ class _CortexClientShim:
     Unified-client calls are delegated via ``__getattr__``; only the two
     shape mismatches and ``reconnect_config()`` live here."""
 
-    def __init__(self, legacy_config: _LegacyConfig) -> None:
+    def __init__(self, legacy_config: _LegacyConfig, *, wait: bool = True) -> None:
         # Must be the async client: this shim's callers await every op.
         from arctic_platform.client import AsyncArcticRLClient
 
         self._legacy_config = legacy_config
         self._unified_config = _to_unified_config(legacy_config)
-        self._client = AsyncArcticRLClient(self._unified_config)
+        self._client = AsyncArcticRLClient(self._unified_config, wait=wait)
 
     @property
     def config(self) -> _LegacyConfig:
@@ -190,5 +190,5 @@ class _CortexClientShim:
         )
 
 
-def create_cortex_client(config: _LegacyConfig) -> _CortexClientShim:
-    return _CortexClientShim(config)
+def create_cortex_client(config: _LegacyConfig, *, wait: bool = True) -> _CortexClientShim:
+    return _CortexClientShim(config, wait=wait)
