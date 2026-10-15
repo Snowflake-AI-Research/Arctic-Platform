@@ -498,7 +498,13 @@ class WeightSyncExtension:
         recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
         for name, tensor in engine.receive_weights():
             recv_l2_sq.add_(_tensor_l2_sq(tensor))
-            updater.feed(name, tensor)
+            try:
+                updater.feed(name, tensor)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"FP8 weight sync failed for {name!r} with shape "
+                    f"{tuple(tensor.shape)} and dtype {tensor.dtype}"
+                ) from exc
             loaded += 1
         if updater.pending:
             logger.warning(
