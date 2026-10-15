@@ -38,9 +38,18 @@ from typing_extensions import Self
 
 from arctic_platform._dependency_groups import require_any_dep_group
 from arctic_platform.client.config import ArcticClientConfig
+from arctic_platform.client.config import CortexConfig
+from arctic_platform.client.config import JobId
+from arctic_platform.client.requests import cancel_job_request
+from arctic_platform.client.requests import capacity_request
+from arctic_platform.client.requests import delete_checkpoint_request
+from arctic_platform.client.requests import export_checkpoint_request
 from arctic_platform.client.requests import fwd_bwd_request
 from arctic_platform.client.requests import fwd_no_grad_request
 from arctic_platform.client.requests import generate_request
+from arctic_platform.client.requests import get_job_request
+from arctic_platform.client.requests import list_checkpoints_request
+from arctic_platform.client.requests import list_jobs_request
 from arctic_platform.client.requests import load_checkpoint_request
 from arctic_platform.client.requests import reset_prefix_cache_request
 from arctic_platform.client.requests import save_checkpoint_request
@@ -55,17 +64,18 @@ from arctic_platform.client.transport import Transport
 from arctic_platform.client.transport import initialize_or_cleanup
 
 
-def make_transport(config: ArcticClientConfig, server_state: Any = None) -> Transport:
-    if config.backend.type == "remote":
+def make_transport(client_config: ArcticClientConfig, server_state: Any = None) -> Transport:
+    backend_config = client_config.backend
+    if isinstance(backend_config, CortexConfig):
         require_any_dep_group("cortex")
         from arctic_platform.client.transports.cortex import CortexTransport
 
-        return CortexTransport(config)
+        return CortexTransport(backend_config)
 
     require_any_dep_group("sft", "rl")
     from arctic_platform.client.transports.onprem import OnPremTransport
 
-    return OnPremTransport(config, server_state=server_state)
+    return OnPremTransport(backend_config, server_state=server_state)
 
 
 def _check_weight_format(config: ArcticClientConfig, weight_format: str | None) -> None:
@@ -107,7 +117,7 @@ class _ArcticClientCore:
     def __init__(self, config: ArcticClientConfig, server_state: Any = None) -> None:
         self.config = config
         self.transport = make_transport(config, server_state=server_state)
-        self.jobs = initialize_or_cleanup(self.transport)
+        self.jobs = initialize_or_cleanup(self.transport, client_config=config)
 
     def reconnect_config(self) -> ArcticClientConfig:
         """A serializable config that reattaches to these jobs in another process."""
@@ -133,10 +143,32 @@ class _ArcticClientCore:
 class ArcticClient(_ArcticClientCore):
     """The blocking frontend: every op shared by SFT and RL."""
 
-    def _call(self, request: Request) -> dict:
+    def _call(self, request: Request) -> dict | list[dict]:
         out = self.transport.call(request)
         _maybe_print_server_profile(request.op, out)
         return out
+
+    # ── cluster ──────────────────────────────────────────────────────────
+    def list_jobs(self, status: str | None = None) -> list[dict]:
+        return self._call(list_jobs_request(status))
+
+    def capacity(self, hardware: str | None = None) -> dict:
+        return self._call(capacity_request(hardware))
+
+    def cancel_job(self, job_id: JobId) -> None:
+        self._call(cancel_job_request(job_id))
+
+    def get_job(self) -> dict:
+        return self._call(get_job_request(self.jobs.require_any()))
+
+    def list_checkpoints(self) -> list[dict]:
+        return self._call(list_checkpoints_request(self.jobs.require("training")))
+
+    def export_checkpoint(self, checkpoint_id: str) -> dict:
+        return self._call(export_checkpoint_request(self.jobs.require("training"), checkpoint_id))
+
+    def delete_checkpoint(self, checkpoint_id: str) -> None:
+        self._call(delete_checkpoint_request(self.jobs.require("training"), checkpoint_id))
 
     # ── training ─────────────────────────────────────────────────────────
     def fwd_bwd(
@@ -242,10 +274,32 @@ class ArcticClient(_ArcticClientCore):
 class AsyncArcticClient(_ArcticClientCore):
     """The awaitable frontend; the async twin of `ArcticClient`."""
 
-    async def _acall(self, request: Request) -> dict:
+    async def _acall(self, request: Request) -> dict | list[dict]:
         out = await self.transport.acall(request)
         _maybe_print_server_profile(request.op, out)
         return out
+
+    # ── cluster ──────────────────────────────────────────────────────────
+    async def list_jobs(self, status: str | None = None) -> list[dict]:
+        return await self._acall(list_jobs_request(status))
+
+    async def capacity(self, hardware: str | None = None) -> dict:
+        return await self._acall(capacity_request(hardware))
+
+    async def cancel_job(self, job_id: JobId) -> None:
+        await self._acall(cancel_job_request(job_id))
+
+    async def get_job(self) -> dict:
+        return await self._acall(get_job_request(self.jobs.require_any()))
+
+    async def list_checkpoints(self) -> list[dict]:
+        return await self._acall(list_checkpoints_request(self.jobs.require("training")))
+
+    async def export_checkpoint(self, checkpoint_id: str) -> dict:
+        return await self._acall(export_checkpoint_request(self.jobs.require("training"), checkpoint_id))
+
+    async def delete_checkpoint(self, checkpoint_id: str) -> None:
+        await self._acall(delete_checkpoint_request(self.jobs.require("training"), checkpoint_id))
 
     # ── training ─────────────────────────────────────────────────────────
     async def fwd_bwd(
@@ -338,9 +392,6 @@ class AsyncArcticClient(_ArcticClientCore):
 
     # ── lifecycle ────────────────────────────────────────────────────────
     async def shutdown(self) -> None:
-        # aiohttp's session must be closed with await; the sync shutdown() that
-        # tears down jobs can't do that from inside a running event loop.
-        await self.transport.aclose()
         self.transport.shutdown()
 
     async def __aenter__(self) -> Self:

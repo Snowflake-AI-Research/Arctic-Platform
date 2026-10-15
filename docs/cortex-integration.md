@@ -60,9 +60,8 @@ constrains what runs correctly here:
   does; the next launch then fails the per-account cap. The driver additionally
   ignores SIGINT and SIGTERM, Ray having installed handlers, so there is no
   graceful stop to trigger it either. Callers must cancel explicitly — the
-  GSM8K recipe's launcher does this on every exit path, and
-  `CortexTransport.list_jobs()` / `cancel_job()` are there for anything it
-  cannot cover, such as a `kill -9` of the launcher itself.
+  GSM8K recipe's launcher does this on every exit path through the reusable
+  cluster request builders and `CortexTransport.call()`.
 
 ## What's provided
 
