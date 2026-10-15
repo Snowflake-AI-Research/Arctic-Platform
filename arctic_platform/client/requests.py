@@ -143,9 +143,9 @@ def save_checkpoint_request(
 
 def load_checkpoint_request(
     jobs: JobHandles,
+    *,
     path: str | None = None,
     step: int | None = None,
-    *,
     checkpoint_id: str | None = None,
     source_job_id: JobId | None = None,
 ) -> Request:

@@ -268,7 +268,9 @@ class ArcticClient(_ArcticClientCore):
     ) -> dict:
         """Restore weights/optimizer/LR/step: Cortex by ``checkpoint_id``, on-prem by ``path``/``step``."""
         return self._call(
-            load_checkpoint_request(self.jobs, path, step, checkpoint_id=checkpoint_id, source_job_id=source_job_id)
+            load_checkpoint_request(
+                self.jobs, path=path, step=step, checkpoint_id=checkpoint_id, source_job_id=source_job_id
+            )
         )
 
     # ── router replay ────────────────────────────────────────────────────
@@ -451,7 +453,9 @@ class AsyncArcticClient(_ArcticClientCore):
         source_job_id: JobId | None = None,
     ) -> dict:
         return await self._acall(
-            load_checkpoint_request(self.jobs, path, step, checkpoint_id=checkpoint_id, source_job_id=source_job_id)
+            load_checkpoint_request(
+                self.jobs, path=path, step=step, checkpoint_id=checkpoint_id, source_job_id=source_job_id
+            )
         )
 
     # ── router replay ────────────────────────────────────────────────────
