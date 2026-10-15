@@ -35,7 +35,6 @@ WeightIterator = Iterator[tuple[str, torch.Tensor]]
 WeightIteratorBuilder = Callable[[nn.Module], Callable[..., WeightIterator]]
 
 PEFT_ADAPTER_DIRNAME = "default"
-DEFAULT_EP_GATHER_BUCKET_BYTES = 64 << 20
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +71,9 @@ def supports_weight_format(model: nn.Module, weight_format: WeightFormat) -> boo
     if contract is not None:
         if getattr(contract, weight_format) is not None:
             return True
-        return weight_format == "hf" and not _has_ep_sharded_parameters(model)
-    return weight_format == "vllm" or not _has_ep_sharded_parameters(model)
+        if weight_format == "vllm":
+            return False
+    return not _has_ep_sharded_parameters(model)
 
 
 def strip_activation_checkpoint_segments(name: str) -> str:
@@ -540,27 +540,6 @@ def iter_lora_weights(
             yield export_name, parameter.data
 
 
-def _gather_ep_parameter_chunked(parameter: Any, *, is_master: bool, bucket_bytes: int) -> torch.Tensor | None:
-    """All-gather an EP shard along dim 0 in bounded chunks; the result lands on ``is_master``."""
-    import torch.distributed as dist
-
-    group = _expert_parallel_group(parameter)
-    assert not is_master or dist.get_rank(group=group) == 0, "DP rank 0 must be EP rank 0 for weight sync"
-    local = parameter.data.contiguous()
-    world_size = dist.get_world_size(group=group)
-    numel = local.numel()
-    chunk = max(1, min(numel, bucket_bytes // (max(1, local.element_size()) * world_size)))
-    shards = [torch.empty_like(local) for _ in range(world_size)]
-    local_flat = local.view(-1)
-    shard_flats = [shard.view(-1) for shard in shards]
-    for offset in range(0, numel, chunk):
-        count = min(chunk, numel - offset)
-        dist.all_gather(
-            [shard.narrow(0, offset, count) for shard in shard_flats], local_flat.narrow(0, offset, count), group=group
-        )
-    return torch.cat(shards, dim=0) if is_master else None
-
-
 def _iter_generic_weights(
     model: nn.Module,
     weight_format: WeightFormat,
@@ -568,13 +547,10 @@ def _iter_generic_weights(
     is_master: bool,
     is_zero3: bool,
     checkpoint_dir: str | None,
-    ep_gather_bucket_bytes: int,
 ) -> WeightIterator:
-    names: dict[str, str] = {}
-    if weight_format == "hf":
-        if _has_ep_sharded_parameters(model):
-            raise RuntimeError("EP-sharded models require an AP HF weight-export contract")
-        names = hf_sync_name_map(model, checkpoint_dir)
+    if _has_ep_sharded_parameters(model):
+        raise RuntimeError("EP-sharded models require an AP weight-export contract")
+    names = hf_sync_name_map(model, checkpoint_dir) if weight_format == "hf" else {}
     for name, parameter in model.named_parameters():
         if weight_format == "hf":
             export_name = hf_export_parameter_name(name)
@@ -584,9 +560,7 @@ def _iter_generic_weights(
         else:
             export_name = strip_activation_checkpoint_segments(name)
 
-        if _is_ep_sharded_parameter(parameter):
-            tensor = _gather_ep_parameter_chunked(parameter, is_master=is_master, bucket_bytes=ep_gather_bucket_bytes)
-        elif is_zero3 and hasattr(parameter, "ds_id"):
+        if is_zero3 and hasattr(parameter, "ds_id"):
             import deepspeed
 
             with deepspeed.zero.GatheredParameters(parameter):
@@ -606,7 +580,6 @@ def iter_model_weights(
     is_zero3: bool,
     include_skipped: bool = False,
     checkpoint_dir: str | None = None,
-    ep_gather_bucket_bytes: int = DEFAULT_EP_GATHER_BUCKET_BYTES,
 ) -> WeightIterator:
     """Yield model weights on ``is_master``; every rank must iterate in lockstep for the gathers.
 
@@ -639,5 +612,4 @@ def iter_model_weights(
         is_master=is_master,
         is_zero3=is_zero3,
         checkpoint_dir=checkpoint_dir,
-        ep_gather_bucket_bytes=ep_gather_bucket_bytes,
     )

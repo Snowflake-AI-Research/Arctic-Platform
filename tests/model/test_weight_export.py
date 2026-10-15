@@ -528,19 +528,10 @@ def test_generic_vllm_export_streams_unwrapped_names_without_a_contract():
     ]
 
 
-def _install_deepspeed_stubs(monkeypatch, *, ep_group=None, gathered=None):
-    groups_module = ModuleType("deepspeed.utils.groups")
-    groups_module._get_expert_parallel_group = lambda _name: ep_group
-    utils_module = ModuleType("deepspeed.utils")
-    utils_module.__path__ = []
-    utils_module.groups = groups_module
+def _install_gathered_parameters(monkeypatch, gathered):
     deepspeed_module = ModuleType("deepspeed")
-    deepspeed_module.__path__ = []
-    deepspeed_module.utils = utils_module
     deepspeed_module.zero = SimpleNamespace(GatheredParameters=gathered)
     monkeypatch.setitem(sys.modules, "deepspeed", deepspeed_module)
-    monkeypatch.setitem(sys.modules, "deepspeed.utils", utils_module)
-    monkeypatch.setitem(sys.modules, "deepspeed.utils.groups", groups_module)
 
 
 @pytest.mark.parametrize("is_master", [True, False])
@@ -561,7 +552,7 @@ def test_generic_export_gathers_zero3_parameters_in_lockstep(monkeypatch, is_mas
         def __exit__(self, *_exc):
             parameter.data = torch.empty(0)
 
-    _install_deepspeed_stubs(monkeypatch, gathered=GatheredParameters)
+    _install_gathered_parameters(monkeypatch, GatheredParameters)
 
     weights = list(
         iter_model_weights(_Model([("layers.0.weight", parameter)]), "hf", is_master=is_master, is_zero3=True)
@@ -575,39 +566,13 @@ def test_generic_export_gathers_zero3_parameters_in_lockstep(monkeypatch, is_mas
         assert weights == []
 
 
-def test_generic_vllm_export_gathers_ep_shards_in_bounded_chunks(monkeypatch):
-    ep_group = object()
-    _install_deepspeed_stubs(monkeypatch, ep_group=ep_group)
-    local = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
-    remote = local + 100
-    parameter = nn.Parameter(local)
+@pytest.mark.parametrize("weight_format", ["hf", "vllm"])
+def test_generic_export_requires_a_contract_for_ep_shards(weight_format):
+    parameter = nn.Parameter(torch.ones(2))
     parameter.group_name = "ep_size_2"
     parameter.allreduce = False
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
-    offset = 0
+    model = _Model([("experts.weight", parameter)])
 
-    def all_gather(outputs, local_chunk, group=None):
-        nonlocal offset
-        assert group is ep_group
-        count = local_chunk.numel()
-        assert count <= 5
-        outputs[0].copy_(local.reshape(-1).narrow(0, offset, count))
-        outputs[1].copy_(remote.reshape(-1).narrow(0, offset, count))
-        offset += count
-
-    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
-
-    weights = list(
-        iter_model_weights(
-            _Model([("experts.weight", parameter)]),
-            "vllm",
-            is_master=True,
-            is_zero3=False,
-            ep_gather_bucket_bytes=40,
-        )
-    )
-
-    assert offset == local.numel()
-    assert weights[0][0] == "experts.weight"
-    assert torch.equal(weights[0][1], torch.cat((local, remote), dim=0))
+    assert not supports_weight_format(model, weight_format)
+    with pytest.raises(RuntimeError, match="EP-sharded models require an AP weight-export contract"):
+        list(iter_model_weights(model, weight_format, is_master=True, is_zero3=False))
