@@ -49,8 +49,8 @@ class FakeSend:
         self.sent: list[dict] = []
         self.replies = replies or {}
 
-    async def __call__(self, method: str, url: str, *, retry_on=None, **kwargs):
-        self.sent.append({"method": method, "url": url, "retry_on": retry_on, **kwargs})
+    async def __call__(self, method: str, url: str, *, policy=None, **kwargs):
+        self.sent.append({"method": method, "url": url, "policy": policy, **kwargs})
         for (reply_method, suffix), reply in self.replies.items():
             if method == reply_method and url.endswith(suffix):
                 return reply(len(self.sent)) if callable(reply) else reply
@@ -68,6 +68,75 @@ def _transport(replies: dict | None = None) -> tuple[CortexTransport, FakeSend]:
     return transport, send
 
 
+class TestClusterRoutes:
+    @pytest.mark.parametrize(
+        ("request_", "method", "path", "policy"),
+        [
+            (client_requests.list_jobs_request("running"), "GET", "", cortex_module._DEFAULT),
+            (client_requests.get_job_request(TRAINING), "GET", f"/{JOB}", cortex_module._DEFAULT),
+            (client_requests.cancel_job_request(JOB), "POST", f"/{JOB}:cancel", cortex_module._DEFAULT),
+            (client_requests.capacity_request("H200"), "GET", "/capacity", cortex_module._QUICK_READ),
+            (client_requests.list_checkpoints_request(TRAINING), "GET", f"/{JOB}/checkpoints", cortex_module._DEFAULT),
+            (
+                client_requests.export_checkpoint_request(TRAINING, "cp-1"),
+                "POST",
+                f"/{JOB}/checkpoints/cp-1:export",
+                cortex_module._DEFAULT,
+            ),
+            (
+                client_requests.delete_checkpoint_request(TRAINING, "cp-1"),
+                "DELETE",
+                f"/{JOB}/checkpoints/cp-1",
+                cortex_module._NO_REPLAY,
+            ),
+        ],
+        ids=lambda value: value.op if hasattr(value, "op") else None,
+    )
+    def test_method_url_and_retry_policy(self, request_, method, path, policy):
+        """Sub-job tokens address their parent job, and a delete is never replayed."""
+        transport, send = _transport()
+        transport.call(request_)
+
+        (sent,) = send.sent
+        assert (sent["method"], sent["url"], sent["policy"]) == (method, PREFIX + path, policy)
+
+    def test_account_filters_travel_as_query_params(self):
+        transport, send = _transport()
+        transport.call(client_requests.list_jobs_request("running"))
+        transport.call(client_requests.capacity_request("H200"))
+
+        assert [sent["params"] for sent in send.sent] == [{"status": "running"}, {"hardware": "H200"}]
+
+    def test_path_only_routes_send_no_body(self):
+        """checkpoint_id fills the URL and is not also sent as a body."""
+        transport, send = _transport()
+        transport.call(client_requests.export_checkpoint_request(TRAINING, "cp-1"))
+
+        assert set(send.sent[0]) == {"method", "url", "policy"}
+
+    def test_lists_unwrap_and_tolerate_omitted_empty_fields(self):
+        """Proto3 JSON omits empty lists, so a bare `{}` means none."""
+        transport, _ = _transport({("GET", "cortex-training"): {"jobs": [{"job_id": JOB}]}})
+        assert transport.call(client_requests.list_jobs_request()) == [{"job_id": JOB}]
+
+        transport, _ = _transport({("GET", "cortex-training"): {}, ("GET", "/checkpoints"): {}})
+        assert transport.call(client_requests.list_jobs_request()) == []
+        assert transport.call(client_requests.list_checkpoints_request(TRAINING)) == []
+
+    def test_capacity_fills_omitted_fields(self):
+        """Proto3 JSON omits false and zero fields; every key is still returned, as cortex-training does."""
+        transport, _ = _transport({("GET", "/capacity"): {"max_total_gpus": 64, "in_use_gpus": 8}})
+
+        assert transport.call(client_requests.capacity_request()) == {
+            "has_reservation": False,
+            "max_total_gpus": 64,
+            "reserved_gpus": 0,
+            "in_use_gpus": 8,
+            "pending_gpus": 0,
+            "available_gpus": 0,
+        }
+
+
 class TestLifecycleRoutes:
     def test_initialize_creates_without_replay_and_captures_sub_jobs(self):
         """Create retries only undelivered sends, so a retry cannot spawn a second job."""
@@ -83,11 +152,7 @@ class TestLifecycleRoutes:
         jobs = transport.initialize(ArcticClientConfig(model_name="m", backend=transport.config, training_gpus=1))
 
         create = send.sent[0]
-        assert (create["method"], create["url"], create["retry_on"]) == (
-            "POST",
-            PREFIX,
-            cortex_module._is_connect_error,
-        )
+        assert (create["method"], create["url"], create["policy"]) == ("POST", PREFIX, cortex_module._NO_REPLAY)
         assert "sub_job_configs" in create["json"]
         assert jobs == JobHandles(training=TRAINING)
 
@@ -97,7 +162,7 @@ class TestLifecycleRoutes:
         transport.shutdown()
 
         (sent,) = send.sent
-        assert (sent["url"], sent["retry_on"]) == (f"{PREFIX}/{JOB}:cancel", cortex_module._is_transient)
+        assert (sent["url"], sent["policy"]) == (f"{PREFIX}/{JOB}:cancel", cortex_module._DEFAULT)
 
     def test_shutdown_tolerates_a_failed_cancel(self):
         transport, _ = _transport()
@@ -156,7 +221,7 @@ class TestChunkGroupRestart:
 
         posts = [sent for sent in send.sent if sent["method"] == "POST"]
         assert len(posts) == 2
-        assert posts[1]["retry_on"] is cortex_module._is_transient
+        assert posts[1]["policy"] is cortex_module._DEFAULT
 
     def test_error_body_raises_chunk_group_error_that_is_never_retried(self):
         """GS wraps the chunk-group error as JSON inside a string field."""

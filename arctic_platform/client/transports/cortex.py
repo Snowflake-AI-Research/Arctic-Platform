@@ -95,6 +95,10 @@ def _json(request: Request, body: dict) -> list[Send]:
     return [{"json": body}]
 
 
+def _query(request: Request, body: dict) -> list[Send]:
+    return [{"params": body}]
+
+
 def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dict], list[Send]]:
     """DSSST1 octet bodies, one send per chunk; ``wire_op`` labels the chunk envelope."""
 
@@ -139,6 +143,17 @@ def _forward(request: Request, body: dict) -> list[Send]:
 # ── normalizers: a Cortex reply -> the canonical result ─────────────────────
 def _identity(value: Any) -> Any:
     return value
+
+
+def _capacity_result(result: dict) -> dict:
+    return {
+        "has_reservation": bool(result.get("has_reservation", False)),
+        "max_total_gpus": int(result.get("max_total_gpus", 0)),
+        "reserved_gpus": int(result.get("reserved_gpus", 0)),
+        "in_use_gpus": int(result.get("in_use_gpus", 0)),
+        "pending_gpus": int(result.get("pending_gpus", 0)),
+        "available_gpus": int(result.get("available_gpus", 0)),
+    }
 
 
 def _fwd_bwd_result(result: dict) -> dict:
@@ -186,6 +201,38 @@ def _to_python(obj: Any) -> Any:
     return obj
 
 
+def _is_transient(exc: BaseException) -> bool:
+    """Retry connection/timeout errors and transient HTTP statuses (safe for reads)."""
+    import aiohttp
+
+    if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
+        return True
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status in _TRANSIENT_STATUSES
+    return False
+
+
+def _is_connect_error(exc: BaseException) -> bool:
+    """Only failures proving the request never reached the server (safe for mutating POSTs)."""
+    import aiohttp
+
+    return isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError))
+
+
+@dataclass(frozen=True)
+class _SendPolicy:
+    retry_on: Callable[[BaseException], bool] = _is_transient
+    max_retries: int | None = None  # None: config.max_retries
+    timeout: float | None = None  # caps config.request_timeout
+
+
+_DEFAULT = _SendPolicy()
+# Only failures before the request reached the server; a replay would duplicate it.
+_NO_REPLAY = _SendPolicy(retry_on=_is_connect_error)
+# Control-plane read: answer fast or fail, as cortex-training does.
+_QUICK_READ = _SendPolicy(max_retries=0, timeout=30.0)
+
+
 @dataclass(frozen=True, kw_only=True)
 class _Route:
     method: str
@@ -193,8 +240,7 @@ class _Route:
     path: str
     encode: Callable[[Request, dict], list[Send]] = _json
     poll: bool = False
-    # False: retry only sends that provably never reached the server.
-    replay_safe: bool = True
+    policy: _SendPolicy = _DEFAULT
     # Re-post the whole chunk group once on `chunk_group_restart_required`. Only endpoints
     # that stage chunks on the job's actor (forward-backward) send that code; it is not a
     # general retry flag.
@@ -243,9 +289,22 @@ _ROUTES = {
     "sleep-training": _NOOP,
     "wake-training": _NOOP,
     # A replayed create would spawn a second job.
-    "create-job": _Route(method="POST", path="", replay_safe=False),
+    "create-job": _Route(method="POST", path="", policy=_NO_REPLAY),
+    "list-jobs": _Route(method="GET", path="", encode=_query, normalize=lambda reply: reply.get("jobs", [])),
     "get-job": _Route(method="GET", path="/{job}", encode=_no_body),
     "cancel-job": _Route(method="POST", path="/{job}:cancel", encode=_no_body),
+    "capacity": _Route(method="GET", path="/capacity", encode=_query, policy=_QUICK_READ, normalize=_capacity_result),
+    "list-checkpoints": _Route(
+        method="GET",
+        path="/{job}/checkpoints",
+        encode=_no_body,
+        normalize=lambda reply: reply.get("checkpoints", []),
+    ),
+    "export-checkpoint": _Route(method="POST", path="/{job}/checkpoints/{checkpoint_id}:export", encode=_no_body),
+    # A replayed delete answers 404 for a checkpoint the first send already removed.
+    "delete-checkpoint": _Route(
+        method="DELETE", path="/{job}/checkpoints/{checkpoint_id}", encode=_no_body, policy=_NO_REPLAY
+    ),
     # forward-backward always carries a chunk envelope, even when the frame fits: its
     # chunk_group_id is the server's idempotency key. A mid-stream chunk-group desync
     # (GS restart) is recoverable only by re-posting the whole group.
@@ -277,24 +336,6 @@ def _route(op: str) -> _Route:
     if op not in _ROUTES:
         raise NotImplementedError(f"cortex has no {op}")
     return _ROUTES[op]
-
-
-def _is_transient(exc: BaseException) -> bool:
-    """Retry connection/timeout errors and transient HTTP statuses (safe for reads)."""
-    import aiohttp
-
-    if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
-        return True
-    if isinstance(exc, aiohttp.ClientResponseError):
-        return exc.status in _TRANSIENT_STATUSES
-    return False
-
-
-def _is_connect_error(exc: BaseException) -> bool:
-    """Only failures proving the request never reached the server (safe for mutating POSTs)."""
-    import aiohttp
-
-    return isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError))
 
 
 class _ChunkGroupError(Exception):
@@ -377,7 +418,6 @@ class CortexTransport(Transport):
         self.config = config
         self.jobs = JobHandles()
         self.job_id: str | None = None
-        self.max_retries = config.max_retries
         self.poll_interval = 0.5
         self._start_loop()
 
@@ -437,17 +477,6 @@ class CortexTransport(Transport):
                 self.call(cancel_job_request(self.job_id))
         self._on_loop(self._close_session()).result()
 
-    def list_jobs(self) -> list[dict]:
-        """Every Cortex job on this account, with its status."""
-        payload = self._on_loop(self._send("GET", self._prefix)).result()
-        if isinstance(payload, list):
-            return payload
-        return payload.get("jobs") or payload.get("data") or []
-
-    def cancel_job(self, job_id: str) -> None:
-        """Release one job's GPUs by id."""
-        self._on_loop(self._send("POST", f"{self._prefix}/{job_id}:cancel")).result()
-
     # ── deliver one op ───────────────────────────────────────────────────────
     def call(self, request: Request) -> Any:
         route, future = self._submit(request)
@@ -478,10 +507,9 @@ class CortexTransport(Transport):
 
     async def _send_each(self, route: _Route, url: str, sends: list[Send]) -> dict:
         """Post every send in order; the last reply is the op's answer."""
-        retry_on = _is_transient if route.replay_safe else _is_connect_error
         reply: dict = {}
         for kwargs in sends:
-            reply = await self._send(route.method, url, retry_on=retry_on, **kwargs)
+            reply = await self._send(route.method, url, policy=route.policy, **kwargs)
         return reply
 
     def _request_url(self, request_id: str, cursor: str | None) -> tuple[str, dict | None]:
@@ -579,17 +607,17 @@ class CortexTransport(Transport):
     def _job(self) -> dict:
         return self.call(get_job_request(self.job_id))
 
-    async def _send(self, method: str, url: str, *, retry_on=_is_transient, **kwargs: Any) -> dict:
+    async def _send(self, method: str, url: str, *, policy: _SendPolicy = _DEFAULT, **kwargs: Any) -> dict:
         # Every SnowAPI call goes through here so transient 429/5xx/connection blips
         # are retried with exponential-jitter backoff (the neutrino client's policy).
         import aiohttp
 
         if self._session is None:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.config.request_timeout),
-                headers=self._auth_headers(),
-            )
+            self._session = aiohttp.ClientSession(headers=self._auth_headers())
         session = self._session
+        retries = self.config.max_retries if policy.max_retries is None else policy.max_retries
+        timeout = min(self.config.request_timeout, policy.timeout or self.config.request_timeout)
+        kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
 
         async def attempt() -> dict:
             async with session.request(method, url, **kwargs) as resp:
@@ -601,8 +629,8 @@ class CortexTransport(Transport):
                 return json.loads(body) if body.strip() else {}
 
         retryer = AsyncRetrying(
-            retry=retry_if_exception(retry_on),
-            stop=stop_after_attempt(1 + self.max_retries),
+            retry=retry_if_exception(policy.retry_on),
+            stop=stop_after_attempt(1 + retries),
             wait=wait_exponential_jitter(initial=0.5, max=10.0),
             reraise=True,
         )
