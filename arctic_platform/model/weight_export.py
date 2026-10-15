@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import glob
+import json
+import logging
 import os
 from collections.abc import Callable
 from collections.abc import Iterator
@@ -32,6 +35,9 @@ WeightIterator = Iterator[tuple[str, torch.Tensor]]
 WeightIteratorBuilder = Callable[[nn.Module], Callable[..., WeightIterator]]
 
 PEFT_ADAPTER_DIRNAME = "default"
+DEFAULT_EP_GATHER_BUCKET_BYTES = 64 << 20
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -63,9 +69,11 @@ def supports_weight_format(model: nn.Module, weight_format: WeightFormat) -> boo
     if weight_format == "lora":
         return is_peft_model(model)
     contract = weight_export_contract(model)
-    if contract is not None and getattr(contract, weight_format) is not None:
-        return True
-    return weight_format == "hf" and not _has_ep_sharded_parameters(model)
+    if contract is not None:
+        if getattr(contract, weight_format) is not None:
+            return True
+        return weight_format == "hf" and not _has_ep_sharded_parameters(model)
+    return weight_format == "vllm" or not _has_ep_sharded_parameters(model)
 
 
 def strip_activation_checkpoint_segments(name: str) -> str:
@@ -138,6 +146,92 @@ def hf_checkpoint_name_map(model: nn.Module) -> dict[str, str]:
         if converter_pattern is None and checkpoint_name != export_name:
             names[export_name] = checkpoint_name
     return names
+
+
+def read_checkpoint_weight_names(checkpoint_dir: str) -> set[str]:
+    """Tensor names in an HF checkpoint directory, or empty if unreadable.
+
+    Only the index or safetensors headers are read.
+    """
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = os.path.join(checkpoint_dir, index_name)
+        if os.path.exists(index_path):
+            try:
+                with open(index_path) as handle:
+                    return set(json.load(handle)["weight_map"])
+            except (OSError, ValueError, KeyError):
+                return set()
+
+    shards = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
+    if not shards:
+        return set()
+    try:
+        from safetensors import safe_open
+
+        names: set[str] = set()
+        for shard in shards:
+            with safe_open(shard, framework="pt") as handle:
+                names.update(handle.keys())
+        return names
+    except Exception:  # noqa: BLE001 - best-effort probe
+        return set()
+
+
+_HF_SYNC_NAME_MAPS: WeakKeyDictionary[nn.Module, tuple[str | None, dict[str, str]]] = WeakKeyDictionary()
+
+
+def hf_sync_name_map(model: nn.Module, checkpoint_dir: str | None = None) -> dict[str, str]:
+    """Renames that put generic ``weight_format="hf"`` names in the checkpoint's layout.
+
+    Starts from :func:`hf_checkpoint_name_map`. With ``checkpoint_dir``, a rename
+    is kept only if the checkpoint has the target name, and a partial translation
+    raises: the hf receiver drops unmatched names silently. Cached per model.
+    """
+    cached = _HF_SYNC_NAME_MAPS.get(model)
+    if cached is not None and cached[0] == checkpoint_dir:
+        return cached[1]
+
+    names = hf_checkpoint_name_map(model)
+    saved = read_checkpoint_weight_names(checkpoint_dir) if checkpoint_dir else set()
+    if saved:
+        renames: dict[str, str] = {}
+        unmapped: list[str] = []
+        for name, _ in model.named_parameters():
+            export_name = hf_export_parameter_name(name)
+            if export_name is None:
+                continue
+            target = names.get(export_name, export_name)
+            if target in saved:
+                if target != export_name:
+                    renames[export_name] = target
+            # Tied-embedding checkpoints omit lm_head.
+            elif export_name not in saved and export_name != "lm_head.weight":
+                unmapped.append(export_name)
+        if renames and unmapped:
+            raise RuntimeError(
+                f"weight_format='hf' name translation is incomplete: {len(renames)} parameter(s) map onto "
+                f"{checkpoint_dir} but {len(unmapped)} do not (e.g. {', '.join(unmapped[:10])}). Was the model "
+                "loaded with from_pretrained?"
+            )
+        names = renames
+    if names:
+        logger.info(
+            "weight sync: translating %d parameter name(s) into the HF checkpoint layout (e.g. %s -> %s)",
+            len(names),
+            *next(iter(names.items())),
+        )
+    _HF_SYNC_NAME_MAPS[model] = (checkpoint_dir, names)
+    return names
+
+
+def requires_hf_weight_sync(model: nn.Module, checkpoint_dir: str | None = None) -> bool:
+    """Whether direct vLLM copy would drop tensors, so sync must use ``weight_format="hf"``."""
+    if getattr(model, "_requires_hf_weight_sync", False):
+        return True
+    contract = weight_export_contract(model)
+    if contract is not None and contract.vllm is not None:
+        return False
+    return bool(hf_sync_name_map(model, checkpoint_dir))
 
 
 def is_peft_model(model: Any) -> bool:
@@ -446,6 +540,64 @@ def iter_lora_weights(
             yield export_name, parameter.data
 
 
+def _gather_ep_parameter_chunked(parameter: Any, *, is_master: bool, bucket_bytes: int) -> torch.Tensor | None:
+    """All-gather an EP shard along dim 0 in bounded chunks; the result lands on ``is_master``."""
+    import torch.distributed as dist
+
+    group = _expert_parallel_group(parameter)
+    assert not is_master or dist.get_rank(group=group) == 0, "DP rank 0 must be EP rank 0 for weight sync"
+    local = parameter.data.contiguous()
+    world_size = dist.get_world_size(group=group)
+    numel = local.numel()
+    chunk = max(1, min(numel, bucket_bytes // (max(1, local.element_size()) * world_size)))
+    shards = [torch.empty_like(local) for _ in range(world_size)]
+    local_flat = local.view(-1)
+    shard_flats = [shard.view(-1) for shard in shards]
+    for offset in range(0, numel, chunk):
+        count = min(chunk, numel - offset)
+        dist.all_gather(
+            [shard.narrow(0, offset, count) for shard in shard_flats], local_flat.narrow(0, offset, count), group=group
+        )
+    return torch.cat(shards, dim=0) if is_master else None
+
+
+def _iter_generic_weights(
+    model: nn.Module,
+    weight_format: WeightFormat,
+    *,
+    is_master: bool,
+    is_zero3: bool,
+    checkpoint_dir: str | None,
+    ep_gather_bucket_bytes: int,
+) -> WeightIterator:
+    names: dict[str, str] = {}
+    if weight_format == "hf":
+        if _has_ep_sharded_parameters(model):
+            raise RuntimeError("EP-sharded models require an AP HF weight-export contract")
+        names = hf_sync_name_map(model, checkpoint_dir)
+    for name, parameter in model.named_parameters():
+        if weight_format == "hf":
+            export_name = hf_export_parameter_name(name)
+            if export_name is None:
+                continue
+            export_name = names.get(export_name, export_name)
+        else:
+            export_name = strip_activation_checkpoint_segments(name)
+
+        if _is_ep_sharded_parameter(parameter):
+            tensor = _gather_ep_parameter_chunked(parameter, is_master=is_master, bucket_bytes=ep_gather_bucket_bytes)
+        elif is_zero3 and hasattr(parameter, "ds_id"):
+            import deepspeed
+
+            with deepspeed.zero.GatheredParameters(parameter):
+                tensor = parameter.data.clone() if is_master else None
+        else:
+            tensor = parameter.data
+        if is_master:
+            assert tensor is not None
+            yield export_name, tensor
+
+
 def iter_model_weights(
     model: nn.Module,
     weight_format: WeightFormat,
@@ -453,8 +605,17 @@ def iter_model_weights(
     is_master: bool,
     is_zero3: bool,
     include_skipped: bool = False,
+    checkpoint_dir: str | None = None,
+    ep_gather_bucket_bytes: int = DEFAULT_EP_GATHER_BUCKET_BYTES,
 ) -> WeightIterator:
-    """Yield model weights through the AP-owned export contract."""
+    """Yield model weights on ``is_master``; every rank must iterate in lockstep for the gathers.
+
+    Models without a family contract stream ``named_parameters()``: unchanged for
+    ``"vllm"`` (direct copy), and in the checkpoint's layout for ``"hf"`` (see
+    :func:`hf_sync_name_map`, which uses ``checkpoint_dir`` when given).
+    """
+    if weight_format not in ("hf", "vllm", "lora"):
+        raise ValueError(f"weight_format must be 'hf', 'vllm', or 'lora'; got {weight_format!r}")
     if include_skipped and weight_format != "hf":
         raise ValueError("include_skipped is only supported for weight_format='hf'")
     if weight_format == "lora":
@@ -470,15 +631,13 @@ def iter_model_weights(
         yield from (iterator(include_skipped=True) if weight_format == "hf" and include_skipped else iterator())
         return
 
-    if weight_format == "vllm":
+    if weight_format == "vllm" and contract is not None:
         raise ValueError("this model does not provide direct vLLM weight export")
-    if _has_ep_sharded_parameters(model):
-        raise RuntimeError("EP-sharded models require an AP HF weight-export contract")
-    if is_zero3:
-        raise NotImplementedError("generic HF weight export does not support ZeRO-3")
-    if is_master:
-        checkpoint_names = hf_checkpoint_name_map(model)
-        for name, parameter in model.named_parameters():
-            export_name = hf_export_parameter_name(name)
-            if export_name is not None:
-                yield checkpoint_names.get(export_name, export_name), parameter.data
+    yield from _iter_generic_weights(
+        model,
+        weight_format,
+        is_master=is_master,
+        is_zero3=is_zero3,
+        checkpoint_dir=checkpoint_dir,
+        ep_gather_bucket_bytes=ep_gather_bucket_bytes,
+    )

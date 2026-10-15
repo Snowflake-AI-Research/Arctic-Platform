@@ -28,8 +28,11 @@ from arctic_platform.model import WeightExportContract
 from arctic_platform.model import gather_peft_adapter_state_dict
 from arctic_platform.model import hf_checkpoint_name_map
 from arctic_platform.model import hf_export_parameter_name
+from arctic_platform.model import hf_sync_name_map
 from arctic_platform.model import iter_lora_weights
 from arctic_platform.model import iter_model_weights
+from arctic_platform.model import read_checkpoint_weight_names
+from arctic_platform.model import requires_hf_weight_sync
 from arctic_platform.model import save_hf_pretrained
 from arctic_platform.model import save_peft_adapters
 from arctic_platform.model import supports_weight_format
@@ -446,15 +449,165 @@ def _legacy_llava(name):
     return name
 
 
+@pytest.mark.parametrize("with_checkpoint_dir", [False, True])
 @pytest.mark.parametrize("checkpoint_name", [_nested_siglip, _legacy_llava])
-def test_generic_hf_export_emits_the_loaded_checkpoint_names(tmp_path, checkpoint_name):
+def test_generic_hf_export_emits_the_loaded_checkpoint_names(tmp_path, checkpoint_name, with_checkpoint_dir):
     model, checkpoint_names = _tiny_gemma3_checkpoint(tmp_path, checkpoint_name)
+    checkpoint_dir = str(tmp_path) if with_checkpoint_dir else None
 
-    exported = {name for name, _ in iter_model_weights(model, "hf", is_master=True, is_zero3=False)}
+    exported = {
+        name
+        for name, _ in iter_model_weights(model, "hf", is_master=True, is_zero3=False, checkpoint_dir=checkpoint_dir)
+    }
 
     assert "model.vision_tower.embeddings.patch_embedding.weight" in dict(model.named_parameters())
     assert exported == checkpoint_names
+    assert requires_hf_weight_sync(model, checkpoint_dir)
 
 
 def test_hf_checkpoint_name_map_is_empty_without_load_renames():
     assert hf_checkpoint_name_map(nn.Linear(2, 2)) == {}
+
+
+def _save_checkpoint_keys(path, names):
+    from safetensors.torch import save_file
+
+    save_file({name: torch.zeros(1) for name in names}, path / "model.safetensors")
+    return str(path)
+
+
+def _with_load_renames(monkeypatch, renames):
+    monkeypatch.setattr("arctic_platform.model.weight_export.hf_checkpoint_name_map", lambda _model: renames)
+
+
+def _named(*names):
+    return _Model([(name, nn.Parameter(torch.ones(1))) for name in names])
+
+
+def test_read_checkpoint_weight_names_prefers_the_index(tmp_path):
+    _save_checkpoint_keys(tmp_path, ["shard.weight"])
+    assert read_checkpoint_weight_names(str(tmp_path)) == {"shard.weight"}
+
+    (tmp_path / "model.safetensors.index.json").write_text('{"weight_map": {"indexed.weight": "a"}}')
+    assert read_checkpoint_weight_names(str(tmp_path)) == {"indexed.weight"}
+    assert read_checkpoint_weight_names(str(tmp_path / "missing")) == set()
+
+
+def test_hf_sync_name_map_keeps_live_names_the_checkpoint_has(tmp_path, monkeypatch):
+    _with_load_renames(monkeypatch, {"model.layers.0.weight": "model.language_model.layers.0.weight"})
+    checkpoint_dir = _save_checkpoint_keys(tmp_path, ["model.layers.0.weight"])
+
+    assert hf_sync_name_map(_named("model.layers.0.weight"), checkpoint_dir) == {}
+
+
+def test_hf_sync_name_map_rejects_partial_translation(tmp_path, monkeypatch):
+    _with_load_renames(monkeypatch, {"vision.a.weight": "vision.vision_model.a.weight"})
+    checkpoint_dir = _save_checkpoint_keys(tmp_path, ["vision.vision_model.a.weight"])
+
+    with pytest.raises(RuntimeError, match="translation is incomplete"):
+        hf_sync_name_map(_named("vision.a.weight", "vision.b.weight", "lm_head.weight"), checkpoint_dir)
+
+
+def test_requires_hf_weight_sync_honors_model_flag_and_vllm_contract():
+    flagged = nn.Linear(2, 2)
+    flagged._requires_hf_weight_sync = True
+    direct = nn.Linear(2, 2)
+    register_weight_export(direct, WeightExportContract(vllm=lambda _model: lambda: iter(())))
+
+    assert requires_hf_weight_sync(flagged)
+    assert not requires_hf_weight_sync(direct)
+    assert not requires_hf_weight_sync(nn.Linear(2, 2))
+
+
+def test_generic_vllm_export_streams_unwrapped_names_without_a_contract():
+    model = _named("layers.0._checkpoint_wrapped_module.weight")
+
+    assert supports_weight_format(model, "vllm")
+    assert [name for name, _ in iter_model_weights(model, "vllm", is_master=True, is_zero3=False)] == [
+        "layers.0.weight"
+    ]
+
+
+def _install_deepspeed_stubs(monkeypatch, *, ep_group=None, gathered=None):
+    groups_module = ModuleType("deepspeed.utils.groups")
+    groups_module._get_expert_parallel_group = lambda _name: ep_group
+    utils_module = ModuleType("deepspeed.utils")
+    utils_module.__path__ = []
+    utils_module.groups = groups_module
+    deepspeed_module = ModuleType("deepspeed")
+    deepspeed_module.__path__ = []
+    deepspeed_module.utils = utils_module
+    deepspeed_module.zero = SimpleNamespace(GatheredParameters=gathered)
+    monkeypatch.setitem(sys.modules, "deepspeed", deepspeed_module)
+    monkeypatch.setitem(sys.modules, "deepspeed.utils", utils_module)
+    monkeypatch.setitem(sys.modules, "deepspeed.utils.groups", groups_module)
+
+
+@pytest.mark.parametrize("is_master", [True, False])
+def test_generic_export_gathers_zero3_parameters_in_lockstep(monkeypatch, is_master):
+    full = torch.arange(4.0)
+    parameter = nn.Parameter(torch.empty(0))
+    parameter.ds_id = 0
+    entered = []
+
+    class GatheredParameters:
+        def __init__(self, gathered_parameter):
+            assert gathered_parameter is parameter
+
+        def __enter__(self):
+            entered.append(True)
+            parameter.data = full
+
+        def __exit__(self, *_exc):
+            parameter.data = torch.empty(0)
+
+    _install_deepspeed_stubs(monkeypatch, gathered=GatheredParameters)
+
+    weights = list(
+        iter_model_weights(_Model([("layers.0.weight", parameter)]), "hf", is_master=is_master, is_zero3=True)
+    )
+
+    assert entered == [True]
+    if is_master:
+        assert [name for name, _ in weights] == ["layers.0.weight"]
+        assert torch.equal(weights[0][1], full)
+    else:
+        assert weights == []
+
+
+def test_generic_vllm_export_gathers_ep_shards_in_bounded_chunks(monkeypatch):
+    ep_group = object()
+    _install_deepspeed_stubs(monkeypatch, ep_group=ep_group)
+    local = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    remote = local + 100
+    parameter = nn.Parameter(local)
+    parameter.group_name = "ep_size_2"
+    parameter.allreduce = False
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    offset = 0
+
+    def all_gather(outputs, local_chunk, group=None):
+        nonlocal offset
+        assert group is ep_group
+        count = local_chunk.numel()
+        assert count <= 5
+        outputs[0].copy_(local.reshape(-1).narrow(0, offset, count))
+        outputs[1].copy_(remote.reshape(-1).narrow(0, offset, count))
+        offset += count
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+
+    weights = list(
+        iter_model_weights(
+            _Model([("experts.weight", parameter)]),
+            "vllm",
+            is_master=True,
+            is_zero3=False,
+            ep_gather_bucket_bytes=40,
+        )
+    )
+
+    assert offset == local.numel()
+    assert weights[0][0] == "experts.weight"
+    assert torch.equal(weights[0][1], torch.cat((local, remote), dim=0))
