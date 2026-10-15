@@ -520,3 +520,29 @@ def test_unconfirmed_retirement_is_pruned_with_its_record():
             await scheduler.shutdown()
 
     asyncio.run(scenario())
+
+
+def test_unconfirmed_cleanup_drops_a_chat_error_param(monkeypatch):
+    # param belongs to chat input errors; cleanup_unconfirmed must not carry one.
+    from arctic_platform.inference.server.chat import ChatPrompt
+
+    async def scenario():
+        monkeypatch.setattr("ray.cancel", MagicMock())
+        pool, handle = make_pool()
+        handle.abort_stream.remote.return_value = {"status": "cleanup_unconfirmed"}
+        scheduler = pool._scheduler
+        stream = scheduler.stream_generate("chat", ChatPrompt([{"role": "user", "content": "hi"}]))
+        stream.worker = scheduler._workers[0]
+        stream.worker.active_requests = stream.worker.streaming_requests = 1
+        stream.remote_stream = _OneEvent({
+            "type": "terminal_error", "code": "invalid_message_content",
+            "param": "messages[0]", "sequence": 0, "version": 1,
+        })
+        try:
+            event = await anext(stream)
+            assert event["code"] == "cleanup_unconfirmed"
+            assert "param" not in event
+        finally:
+            await scheduler.shutdown()
+
+    asyncio.run(scenario())
