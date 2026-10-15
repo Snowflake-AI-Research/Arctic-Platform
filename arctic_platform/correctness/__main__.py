@@ -27,6 +27,11 @@ from typing import List
 from typing import Optional
 from typing import Tuple
 
+from pydantic import SecretStr
+
+from arctic_platform.client import CortexConfig
+from arctic_platform.client import OnPremConfig
+
 from .harness import console
 from .harness.arms import ArmDefinition
 from .harness.arms import arms_for
@@ -37,9 +42,8 @@ from .harness.config import local_gpu_type
 from .harness.config import placement_widths
 from .harness.config import validate_against_host
 from .harness.dss_driver import available_gpus
-from .harness.hosted import HostedConnection
-from .harness.hosted import HostedTransport
 from .harness.hosted import read_pat
+from .harness.hosted import require_local_cortex_gateway
 from .harness.preflight import ensure_no_interrupted_builds
 from .harness.registry import RL_INAPPLICABLE_REASON
 from .harness.registry import TestOutcome
@@ -47,12 +51,14 @@ from .harness.registry import TestResult
 from .harness.registry import reference_tests
 from .harness.registry import registered_tests
 from .harness.report import write as write_report
-from .harness.runner import RunContext
 from .harness.runner import assert_applicable_tests_registered
+from .harness.runner import cortex_unavailable_reason
 from .harness.runner import execute
 from .harness.runner import execute_rl
+from .harness.runner import validate_local_full_model
 from .harness.spec import TestSpec
 from .harness.workdir import correctness_workdir
+from .harness.workdir import require_data_fast_path
 
 CORRECTNESS_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = CORRECTNESS_DIR / "configs"
@@ -211,10 +217,18 @@ def _frozen_spec(
     return spec, [a for a in arm_defs if a.name in wanted]
 
 
-def _finish(results: List[TestResult], specs: Dict[str, TestSpec], out: Path, *, configs: int, started: float) -> int:
+def _finish(
+    results: List[TestResult],
+    specs: Dict[str, TestSpec],
+    out: Path,
+    *,
+    configs: int,
+    started: float,
+    execution: Dict[str, dict] | None = None,
+) -> int:
     """Write the report and print what the run concluded. Zero only when something passed and none failed."""
     print(f"total run time across {configs} config(s): {console.duration(time.monotonic() - started)}", flush=True)
-    write_report(results, specs, out)
+    write_report(results, specs, out, execution=execution)
     failed = [r for r in results if r.outcome is TestOutcome.FAIL]
     passed = [r for r in results if r.outcome is TestOutcome.PASS]
     skipped = [r for r in results if r.outcome is TestOutcome.INAPPLICABLE]
@@ -235,24 +249,110 @@ def _catalog_vocab_size(model_name: str) -> int:
     return int(getattr(model_cfg, "text_config", model_cfg).vocab_size)
 
 
-def cmd_run(args) -> int:
+def _client_backend(args) -> OnPremConfig | CortexConfig:
+    if getattr(args, "backend", "cortex") == "onprem":
+        return OnPremConfig()
+    options = {
+        key: getattr(args, key)
+        for key in ("host", "database", "schema", "endpoint", "base_url")
+        if getattr(args, key, None) is not None
+    }
+    if getattr(args, "pat_file", None) is not None:
+        options["pat"] = SecretStr(read_pat(args.pat_file))
+    return CortexConfig(**options)
+
+
+def _run_vocab_size(
+    cfg, spec, select, backend, published_fixture: dict | None = None, *, local_full_model_path: Path | None = None
+) -> int:
     from transformers import AutoConfig
 
+    if local_full_model_path is not None:
+        model_cfg = AutoConfig.from_pretrained(local_full_model_path, local_files_only=True, trust_remote_code=True)
+        return int(getattr(model_cfg, "text_config", model_cfg).vocab_size)
+    if (
+        select
+        and set(select) == {"inference-checkpoint-loss"}
+        and "inference-checkpoint-loss" in spec.applicable_tests
+    ):
+        with console.activity("Reading configured model vocabulary"):
+            return _catalog_vocab_size(cfg.model_name)
+
+    if isinstance(backend, CortexConfig):
+        runnable = any(
+            test.test_id in spec.applicable_tests
+            and (not select or test.test_id in select)
+            and cortex_unavailable_reason(test, published_fixture) is None
+            for test in registered_tests().values()
+        )
+        if not runnable:
+            return 0
+        if published_fixture is None:
+            with console.activity("Reading catalog model vocabulary"):
+                return _catalog_vocab_size(cfg.model_name)
+    with console.activity("Loading model config"):
+        model_cfg = AutoConfig.from_pretrained(spec.model.cache_path, trust_remote_code=True)
+        return int(getattr(model_cfg, "text_config", model_cfg).vocab_size)
+
+
+def cmd_run(args) -> int:
     started = time.monotonic()
-    config_paths = _resolve_configs(args)
+    backend = _client_backend(args)
+    remote = isinstance(backend, CortexConfig)
+    fixture_path = getattr(args, "cortex_fixture", None)
+    local_fixture = getattr(args, "local_cortex_fixture", False)
+    local_full_model = getattr(args, "local_gateway_full_model", False)
+    if fixture_path is not None and (not remote or not args.config or args.all_configs):
+        raise SystemExit("--cortex-fixture requires one --config and --backend cortex")
+    if local_fixture and (
+        not remote
+        or not args.config
+        or args.all_configs
+        or fixture_path is not None
+        or not args.test
+        or not set(args.test) <= {"single-step-grads", "single-step-optimizer"}
+    ):
+        raise SystemExit("--local-cortex-fixture requires one Cortex config and only single-step-grads/optimizer")
+    if local_full_model and (
+        not remote
+        or not args.config
+        or args.all_configs
+        or local_fixture
+        or fixture_path is not None
+        or not args.test
+        or not set(args.test) <= {"e2e-sft-train-validate", "inference-checkpoint-loss"}
+    ):
+        raise SystemExit("--local-gateway-full-model requires one Cortex config and only e2e/inference")
+    if local_fixture or local_full_model:
+        require_local_cortex_gateway(backend)
+    config_paths = _resolve_configs(args, filter_by_local_gpu=not remote)
     results: List[TestResult] = []
     specs: Dict[str, TestSpec] = {}
-    ensure_no_interrupted_builds()
+    execution: Dict[str, dict] = {}
+    if not remote:
+        ensure_no_interrupted_builds()
+    tests = registered_tests()
+    unknown = sorted(set(args.test or []) - set(tests))
+    if unknown:
+        raise SystemExit(f"unknown check(s): {', '.join(unknown)}")
 
     for path in config_paths:
         try:
             cfg = load_config(path)
-            pool = available_gpus()
-            validate_against_host(cfg, pool, check_gpu_type=not args.any_gpu)
+            execution[cfg.config_id] = {
+                "backend": "cortex" if remote else "onprem",
+                **({"requested_model_name": cfg.model_name} if remote else {}),
+            }
+            pool = (args.gpu_pool or cfg.n_gpus) if remote else available_gpus()
+            if remote:
+                if pool < cfg.n_gpus:
+                    raise ValueError(f"GPU pool {pool} is smaller than declared training width {cfg.n_gpus}")
+            else:
+                validate_against_host(cfg, pool, check_gpu_type=not args.any_gpu)
             # Both are read from the config as written. The cases belong to the reviewed spec and do not
             # move with the placement, so every width measures the same work on a different topology.
             arm_defs = arms_for(cfg.max_seq_len, cfg.n_gpus)
-            widths = placement_widths(cfg.n_gpus, pool)
+            widths = [cfg.n_gpus] if local_fixture or local_full_model else placement_widths(cfg.n_gpus, pool)
         except (ValueError, KeyError) as exc:
             results.append(
                 TestResult(
@@ -266,6 +366,8 @@ def cmd_run(args) -> int:
             print(f"skip {path.name}: {exc}", flush=True)
             continue
         if cfg.is_rl:
+            if fixture_path is not None or local_fixture or local_full_model:
+                raise SystemExit("--cortex-fixture currently supports supervised single-step-grads only")
             for test in reference_tests().values():
                 if args.test and test.test_id not in args.test:
                     continue
@@ -290,10 +392,14 @@ def cmd_run(args) -> int:
             if prepared is None:
                 continue
             spec, _ = prepared
+            if (
+                remote
+                and "inference-checkpoint-loss" in spec.applicable_tests
+                and (not args.test or "inference-checkpoint-loss" in args.test)
+            ):
+                execution[cfg.config_id]["inference_model_name"] = cfg.model_name
             print(f"=== {cfg.config_id} (reinforcement learning) ===", flush=True)
-            with console.activity("Loading model config"):
-                model_cfg = AutoConfig.from_pretrained(spec.model.cache_path, trust_remote_code=True)
-                vocab_size = getattr(model_cfg, "text_config", model_cfg).vocab_size
+            vocab_size = _run_vocab_size(cfg, spec, args.test, backend)
             results.extend(
                 execute_rl(
                     cfg,
@@ -301,6 +407,7 @@ def cmd_run(args) -> int:
                     vocab_size=vocab_size,
                     select=args.test or None,
                     attn=args.attn[0] if args.attn else None,
+                    client_backend=backend,
                 )
             )
             continue
@@ -316,11 +423,80 @@ def cmd_run(args) -> int:
         if prepared is None:
             continue
         spec, selected_cases = prepared
+        if (
+            remote
+            and "inference-checkpoint-loss" in spec.applicable_tests
+            and (not args.test or "inference-checkpoint-loss" in args.test)
+        ):
+            execution[cfg.config_id]["inference_model_name"] = cfg.model_name
+        published_fixture = None
+        local_full_model_path = None
+        if local_full_model:
+            local_full_model_path = validate_local_full_model(backend, cfg, spec)
+            execution[cfg.config_id].update(
+                requested_model_name=cfg.model_name,
+                local_full_model_path=str(local_full_model_path),
+                full_model_distribution="local-gateway",
+                gateway_url=backend.base_url,
+            )
+        if fixture_path is not None:
+            from .harness.cortex_fixture import load_fixture
+
+            try:
+                published_fixture = load_fixture(fixture_path, spec)
+            except (OSError, ValueError) as exc:
+                results.append(
+                    TestResult(
+                        test_id="-",
+                        config_id=cfg.config_id,
+                        outcome=TestOutcome.FAIL,
+                        summary="published fixture identity unavailable",
+                        reason=str(exc),
+                    )
+                )
+                print(f"skip {path.name}: {exc}", flush=True)
+                continue
+            execution[cfg.config_id].update(
+                requested_model_name=published_fixture["model_name"],
+                fixture_sha256=published_fixture["fixture_sha256"],
+                fixture_stage_path=published_fixture["publication"]["stage_path"],
+            )
+        if local_fixture:
+            from .harness.cortex_fixture import load_local_fixture
+
+            try:
+                published_fixture = load_local_fixture(backend, spec)
+            except ValueError as exc:
+                results.extend(
+                    [
+                        TestResult(
+                            test_id=test_id,
+                            config_id=cfg.config_id,
+                            outcome=TestOutcome.FAIL,
+                            summary="local Cortex fixture identity unavailable",
+                            reason=str(exc),
+                        )
+                        for test_id in args.test
+                    ]
+                )
+                print(f"skip {path.name}: {exc}", flush=True)
+                continue
+            execution[cfg.config_id].update(
+                requested_model_name=published_fixture["model_name"],
+                fixture_sha256=published_fixture["fixture_sha256"],
+                fixture_distribution="local-gateway",
+                gateway_url=backend.base_url,
+            )
 
         print(f"=== {cfg.config_id} ===", flush=True)
-        with console.activity("Loading model config"):
-            model_cfg = AutoConfig.from_pretrained(spec.model.cache_path, trust_remote_code=True)
-            vocab_size = getattr(model_cfg, "text_config", model_cfg).vocab_size
+        vocab_size = _run_vocab_size(
+            cfg,
+            spec,
+            args.test,
+            backend,
+            published_fixture,
+            **({"local_full_model_path": local_full_model_path} if local_full_model else {}),
+        )
 
         for width in widths:
             multiple = width // cfg.n_gpus
@@ -338,146 +514,20 @@ def cmd_run(args) -> int:
                     vocab_size=vocab_size,
                     select=args.test or None,
                     attn=args.attn[0] if args.attn else None,
+                    client_backend=backend,
+                    **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
+                    **({"local_cortex_fixture": True} if local_fixture else {}),
+                    **({"local_gateway_full_model": True} if local_full_model else {}),
                 )
             )
 
-    return _finish(results, specs, Path(args.out), configs=len(config_paths), started=started)
-
-
-def _hosted_placement_pool() -> int:
-    """The GPU pool a hosted placement widens into.
-
-    A local run reads the allocation from the gateway hostfile once ``DSS_GATEWAY_URL`` is set. The hosted
-    command starts no gateway, so the same file is read directly when ``DSS_GATEWAY_HOSTFILE`` names it.
-    Without that variable the pool is this process's own devices, and a config already as wide as those
-    devices has no second slot.
-    """
-    hostfile = os.environ.get("DSS_GATEWAY_HOSTFILE")
-    if hostfile and Path(hostfile).is_file():
-        from arctic_platform.correctness.harness.hostfile import parse_hostfile
-
-        slots = sum(entry.slots for entry in parse_hostfile(hostfile))
-        if slots:
-            return slots
-    return available_gpus()
+    return _finish(results, specs, Path(args.out), configs=len(config_paths), started=started, execution=execution)
 
 
 def cmd_hosted(args) -> int:
-    """Run named checks against the hosted Arctic Platform server, which allocates the GPUs each job declares.
-
-    The hosted server owns the checkpoint stage, which is why a job can be initialized from another job's
-    checkpoint here and not through a gateway a client drives directly: the server mints the stage and
-    stamps the scoped credentials onto the sub-job config before a zone reads it.
-
-    The checks named on the command line run whether or not a config's spec lists them as applicable. That
-    list records what onboarding measured against the single-GPU reference, and a check comparing Arctic Platform
-    against Arctic Platform has no reference arm to onboard. Everything else the spec fixes still gates: a config whose
-    content, cases, or attention backend has drifted from its reviewed spec is refused rather than run.
-
-    A wider multiple runs when ``DSS_GATEWAY_HOSTFILE`` names a pool that fits one, with the batch identity
-    and the case row counts scaled for that width, and that run does not repeat the declared width. A pool
-    with no wider multiple runs the declared width, which is the only placement that fits. The file is not
-    written.
-    """
-    started = time.monotonic()
-    tests = registered_tests()
-    unknown = sorted(set(args.test) - set(tests))
-    if unknown:
-        raise SystemExit(f"unknown check(s): {', '.join(unknown)}. Registered: {', '.join(sorted(tests))}")
-    chosen = [tests[test_id] for test_id in args.test]
-    against_reference = [t.test_id for t in chosen if t.compares_to_reference]
-    if against_reference:
-        raise SystemExit(
-            f"{', '.join(against_reference)} compares Arctic Platform against the single-GPU Hugging Face reference, "
-            "which runs on this node and not on the hosted server. Run those with the run command."
-        )
-    connection = HostedConnection(
-        host=args.host, database=args.database, schema=args.schema, pat=read_pat(args.pat_file), endpoint=args.endpoint
-    )
-
-    config_paths = _resolve_configs(args, filter_by_local_gpu=False)
-    results: List[TestResult] = []
-    specs: Dict[str, TestSpec] = {}
-    for path in config_paths:
-        try:
-            cfg = load_config(path)
-            arm_defs = arms_for(cfg.max_seq_len, cfg.n_gpus)
-        except (ValueError, KeyError) as exc:
-            results.append(
-                TestResult(
-                    test_id="-",
-                    config_id=path.stem,
-                    outcome=TestOutcome.INAPPLICABLE,
-                    summary="config not runnable",
-                    reason=str(exc),
-                )
-            )
-            print(f"skip {path.name}: {exc}", flush=True)
-            continue
-        prepared = _frozen_spec(
-            cfg,
-            path,
-            arm_defs,
-            attention=cfg.attention_implementation,
-            cases=getattr(args, "case", None),
-            results=results,
-            specs=specs,
-        )
-        if prepared is None:
-            continue
-        spec, selected_cases = prepared
-        selected = {case.name for case in selected_cases}
-        # The spec's cases rather than freshly derived ones: the case checksum above proves the two agree,
-        # and the spec carries the token counts and padding fraction each verdict prints.
-        arms = [arm for arm in spec.arms if arm.name in selected]
-
-        pool = _hosted_placement_pool()
-        widths = [width for width in placement_widths(cfg.n_gpus, pool) if width != cfg.n_gpus]
-        if not widths:
-            # The declared width is the measurement when nothing wider fits. Skipping it would leave a
-            # hosted-only check with no placement on a node the config was written for.
-            widths = [cfg.n_gpus]
-        print(f"=== {cfg.config_id} on the hosted server, pool {pool} ===", flush=True)
-        with console.activity(f"Reading the vocabulary of {cfg.model_name}"):
-            vocab_size = _catalog_vocab_size(cfg.model_name)
-        for width in widths:
-            multiple = width // cfg.n_gpus
-            run_cfg = cfg.at_gpu_width(width)
-            run_arms = scaled_for_placement(arms, multiple)
-            print(f"--- {cfg.config_id} on {width} GPU(s) ---", flush=True)
-            context = RunContext(
-                config_id=cfg.config_id,
-                cfg=run_cfg,
-                spec=spec,
-                arms=run_arms,
-                attn_implementation=run_cfg.attention_implementation,
-                # A hosted run materializes no batch files. Nothing on this node reads a batch: the request
-                # bytes are built here and posted to the server.
-                workdir=correctness_workdir("dss-correctness-hosted-"),
-                batch_paths={},
-                vocab_size=vocab_size,
-                transport_factory=lambda _workdir, run_cfg=run_cfg: HostedTransport(connection, run_cfg),
-            )
-            by_name = {arm.name: arm for arm in run_arms}
-            for test in chosen:
-                try:
-                    produced = list(test.fn(context))
-                except Exception as exc:  # noqa: BLE001 - one failing check must not hide the rest
-                    produced = [
-                        TestResult(
-                            test_id=test.test_id,
-                            config_id=cfg.config_id,
-                            outcome=TestOutcome.FAIL,
-                            summary=f"{type(exc).__name__}: {exc}",
-                        )
-                    ]
-                for result in produced:
-                    if result.gpus is None:
-                        result.gpus = width
-                    print(console.arm_verdict(result, by_name.get(result.arm)), flush=True)
-                results.extend(produced)
-
-    return _finish(results, specs, Path(args.out), configs=len(config_paths), started=started)
+    """Backward-compatible spelling of the Cortex-default run command."""
+    args.backend = "cortex"
+    return cmd_run(args)
 
 
 def cmd_list(args) -> int:
@@ -503,7 +553,46 @@ def cmd_selftest(args) -> int:
     import pytest
 
     selftest_dir = Path(__file__).resolve().parent / "selftest"
-    return pytest.main(["-q", "--instafail", "-o", "python_files=check_*.py", str(selftest_dir), *args.runner_args])
+    runner_args = list(args.runner_args)
+    has_basetemp = False
+    for index, argument in enumerate(runner_args):
+        if argument == "--basetemp":
+            if index + 1 == len(runner_args):
+                raise ValueError("--basetemp requires a path under /data-fast")
+            require_data_fast_path(runner_args[index + 1], label="selftest temporary root")
+            has_basetemp = True
+        elif argument.startswith("--basetemp="):
+            require_data_fast_path(argument.split("=", 1)[1], label="selftest temporary root")
+            has_basetemp = True
+    if not has_basetemp:
+        runner_args.extend(["--basetemp", str(correctness_workdir("ap-correctness-selftest-") / "pytest")])
+    return pytest.main(["-sv", "--instafail", "-o", "python_files=check_*.py", str(selftest_dir), *runner_args])
+
+
+def cmd_publish_fixture(args) -> int:
+    """Use the managed dev-model uploader on a disposable copy of reviewed HF weights."""
+    from .onboarding.cortex_fixture_upload import publish_fixture
+
+    cfg = load_config(Path(args.config))
+    spec = TestSpec.read(SPEC_DIR / f"{cfg.config_id}.json")
+    if cfg.is_rl or cfg.training.get("peft_config"):
+        raise SystemExit("fixture publication currently supports full supervised models only")
+    if spec.config_checksum != config_checksum(cfg):
+        raise SystemExit("config checksum does not match the reviewed spec")
+    staging_root = Path(args.staging_dir).resolve()
+    if Path("/data-fast") not in staging_root.parents:
+        raise SystemExit("--staging-dir must be under /data-fast; do not put model weights in the checkout")
+    try:
+        binding = publish_fixture(
+            spec, staging_root, Path(args.uploader), args.uploader_python, Path(args.out), stage=args.stage
+        )
+    except (OSError, ValueError) as exc:
+        print(f"fixture publication failed: {exc}", flush=True)
+        return 1
+    print(f"published reduced model: {binding['model_name']}", flush=True)
+    print(f"binding: {args.out}", flush=True)
+    print("Verify the dev model-cache rollout before running the Cortex target.", flush=True)
+    return 0
 
 
 def main(argv=None) -> int:
@@ -538,8 +627,19 @@ def main(argv=None) -> int:
             ),
         )
 
+    def connection(p):
+        p.add_argument("--backend", choices=["cortex", "onprem"], default="cortex")
+        p.add_argument("--host", help="Snowflake account host; otherwise ARCTIC_CORTEX_HOST")
+        p.add_argument("--database", help="Snowflake database; otherwise ARCTIC_CORTEX_DATABASE")
+        p.add_argument("--schema", help="Snowflake schema; otherwise ARCTIC_CORTEX_SCHEMA")
+        p.add_argument("--endpoint", help="SnowAPI endpoint; default cortex-training")
+        p.add_argument("--base-url", help="direct Cortex development URL without PAT authentication")
+        p.add_argument("--pat-file", help="PAT file; otherwise ARCTIC_CORTEX_PAT, never logged")
+        p.add_argument("--gpu-pool", type=int, help="remote training GPU placement pool; default declared width")
+
     r = sub.add_parser("run", help="run tests over the config-by-test matrix")
     shared(r)
+    connection(r)
     r.add_argument("--test", action="append", help="test id (repeatable); default every applicable test")
     r.add_argument(
         "--case",
@@ -550,7 +650,33 @@ def main(argv=None) -> int:
         ),
     )
     r.add_argument("--out", default="correctness-report")
+    r.add_argument(
+        "--cortex-fixture",
+        type=Path,
+        help="verified publication binding from a supported publisher; keeps HF local and selects the Cortex model",
+    )
+    r.add_argument(
+        "--local-cortex-fixture",
+        action="store_true",
+        help="bind reviewed local HF weights to the existing loopback gateway for single-step comparisons",
+    )
+    r.add_argument(
+        "--local-gateway-full-model",
+        action="store_true",
+        help="use the pinned original offline model on the existing loopback gateway for e2e/inference",
+    )
     r.set_defaults(func=cmd_run)
+
+    publish = sub.add_parser("publish-fixture", help="publish reviewed reduced weights as a separate dev model")
+    publish.add_argument("--config", required=True)
+    publish.add_argument("--staging-dir", default="/data-fast/tmp/ap-cortex-fixtures")
+    publish.add_argument("--uploader", required=True, help="Neutrino scripts/upload_model.py path")
+    publish.add_argument("--uploader-python", default=sys.executable, help="interpreter with uploader dependencies")
+    publish.add_argument(
+        "--stage", required=True, help="explicit destination stage; authentication belongs to the uploader"
+    )
+    publish.add_argument("--out", required=True, help="new publication receipt JSON path")
+    publish.set_defaults(func=cmd_publish_fixture)
 
     list_parser = sub.add_parser("list", help="show registered tests")
     list_parser.set_defaults(func=cmd_list)
@@ -559,30 +685,16 @@ def main(argv=None) -> int:
         "hosted",
         help="run Arctic Platform-against-Arctic Platform checks on the hosted server, which supplies the GPUs",
     )
-    h.add_argument("--config", help="path to one Arctic Platform job config")
-    h.add_argument("--all-configs", action="store_true", help="every config in --config-dir")
-    h.add_argument(
-        "--config-dir",
-        default=str(CONFIG_DIR),
-        help="root of the model/gpu-type/workload config tree, searched recursively",
-    )
+    shared(h)
+    connection(h)
     h.add_argument(
         "--test",
         action="append",
         required=True,
-        help="check id to run (repeatable); runs whether or not the spec lists it as applicable",
+        help="check id to run (repeatable); requires reviewed applicability",
     )
     h.add_argument(
         "--case", action="append", help="case name to run, e.g. gas1 (repeatable); default every case in the spec"
-    )
-    h.add_argument("--host", required=True, help="account host serving the Arctic Platform API")
-    h.add_argument("--database", required=True, help="database the API path is scoped to")
-    h.add_argument("--schema", required=True, help="schema the API path is scoped to")
-    h.add_argument("--endpoint", help="API endpoint name; default is the client's own")
-    h.add_argument(
-        "--pat-file",
-        required=True,
-        help="file holding the programmatic access token; read at startup and never written out",
     )
     h.add_argument("--out", default="correctness-report-hosted")
     h.set_defaults(func=cmd_hosted)

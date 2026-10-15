@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Drive correctness jobs through the Arctic Platform in-process Ray client."""
+"""Drive correctness jobs through the unified Arctic client, on Cortex or in-process Ray."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ import subprocess
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 from typing import Any
 from typing import Dict
@@ -34,16 +35,19 @@ from typing import Iterator
 from typing import List
 from typing import Optional
 
-from arctic_platform.client import ArcticClient
 from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
 from arctic_platform.client.requests import log_probs_request
 
 from .arms import correctness_microbatch_tokens
+from .cortex import CorrectnessClient as ArcticClient
+from .cortex import CortexTrainingConfig
 from .hostfile import parse_hostfile
 from .transport import Checkpoint
+from .workdir import require_data_fast_path
 
 
 @dataclass
@@ -59,6 +63,7 @@ class StepResult:
 class GatewaySession:
     workdir: Path
     slots: int
+    backend: OnPremConfig | CortexConfig = field(default_factory=OnPremConfig)
 
 
 @dataclass
@@ -169,10 +174,12 @@ def _gateway_runtime(slots: int) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def gateway(tmp_dir: Path, slots: int) -> Iterator[GatewaySession]:
-    workdir = Path(tmp_dir)
+def gateway(
+    tmp_dir: Path, slots: int, *, backend: OnPremConfig | CortexConfig | None = None
+) -> Iterator[GatewaySession]:
+    workdir = require_data_fast_path(tmp_dir, label="gateway workdir")
     workdir.mkdir(parents=True, exist_ok=True)
-    yield GatewaySession(workdir=workdir, slots=slots)
+    yield GatewaySession(workdir=workdir, slots=slots, backend=backend if backend is not None else OnPremConfig())
 
 
 def _ds_optimizer(value: Any) -> dict | None:
@@ -202,8 +209,13 @@ def _training_client_config(session: GatewaySession, payload: dict) -> ArcticCli
     if activation_checkpointing is not None:
         tc.setdefault("enable_gradient_checkpointing", bool(activation_checkpointing))
     debug = tc.get("debug") if isinstance(tc.get("debug"), dict) else {}
-    checkpoint_path = str(session.workdir / "checkpoints")
-    return ArcticClientConfig(
+    backend = getattr(session, "backend", OnPremConfig())
+    checkpoint_path = None
+    if not isinstance(backend, CortexConfig):
+        workdir = require_data_fast_path(session.workdir, label="training workdir")
+        checkpoint_path = str(require_data_fast_path(workdir / "checkpoints", label="training checkpoint output"))
+    config_type = CortexTrainingConfig if isinstance(backend, CortexConfig) else ArcticClientConfig
+    return config_type(
         model_name=payload["model_name"],
         seed=payload.get("seed"),
         dtype=payload.get("dtype"),
@@ -216,11 +228,14 @@ def _training_client_config(session: GatewaySession, payload: dict) -> ArcticCli
             ds_worker_config=tc,
             peft=peft,
         ),
-        backend=OnPremConfig(),
+        backend=backend,
+        **({"hardware": payload.get("hardware")} if isinstance(backend, CortexConfig) else {}),
     )
 
 
-def _inference_client_config(payload: dict) -> ArcticClientConfig:
+def _inference_client_config(
+    payload: dict, *, backend: OnPremConfig | CortexConfig | None = None
+) -> ArcticClientConfig:
     inf = deepcopy(payload.get("inference_config") or {})
     n_gpus = int(inf.pop("n_gpus"))
     max_seq_len = int(inf.pop("max_seq_len", 8192))
@@ -235,15 +250,22 @@ def _inference_client_config(payload: dict) -> ArcticClientConfig:
         sampling_gpus=n_gpus if job_type == "sampling" else 0,
         log_prob_gpus=n_gpus if job_type == "log_prob" else 0,
         sampling=SamplingConfig(vllm=vllm, arctic_inference_config=inf or None),
-        backend=OnPremConfig(),
+        backend=backend if backend is not None else OnPremConfig(),
     )
 
 
 @contextlib.contextmanager
 def running_job(session: GatewaySession, payload: dict) -> Iterator[ArcticJob]:
     job_type = str(payload.get("job_type", "training"))
-    config = _training_client_config(session, payload) if job_type == "training" else _inference_client_config(payload)
-    with _gateway_runtime(session.slots):
+    config = (
+        _training_client_config(session, payload)
+        if job_type == "training"
+        else _inference_client_config(payload, backend=session.backend)
+    )
+    runtime = (
+        _gateway_runtime(session.slots) if isinstance(session.backend, OnPremConfig) else contextlib.nullcontext()
+    )
+    with runtime:
         client = ArcticClient(config)
         try:
             yield ArcticJob(client=client, job_type=job_type)
@@ -251,8 +273,47 @@ def running_job(session: GatewaySession, payload: dict) -> Iterator[ArcticJob]:
             client.shutdown()
 
 
+def cortex_training_body(body: dict) -> dict:
+    """Lower the correctness SFT batch into the Cortex zone's tensor RPC contract."""
+    import torch
+
+    if "batch" not in body:
+        return body
+    batches = body["batch"]
+    if isinstance(batches, list):
+        if not batches or any(set(batch) != set(batches[0]) for batch in batches):
+            raise ValueError("Cortex SFT microbatches must be non-empty and carry identical tensor keys")
+        # Cortex performs its own packing and GAS split from mb_spec and ds_config.
+        tensors = {key: torch.cat([batch[key] for batch in batches], dim=0) for key in batches[0]}
+    else:
+        tensors = dict(batches)
+    processing = deepcopy(body.get("processing") or {})
+    if processing.get("loss_fn") == "sft_ce":
+        raise ValueError("Cortex SFT does not support request-level memory CE options; use --backend onprem")
+    if processing.get("loss_fn") == "sft":
+        if set(processing) != {"loss_fn"}:
+            raise ValueError("Cortex SFT does not support request-level processing options; use --backend onprem")
+        processing = {}
+    lowered = {
+        "args": (),
+        "kwargs": tensors,
+        "context": dict(body.get("meta") or {}),
+    }
+    # No processing dictionary selects supervised dispatch; a dictionary selects the RL pipeline.
+    if processing:
+        lowered["processing"] = processing
+    return lowered
+
+
+def training_body(job: ArcticJob, body: dict) -> dict:
+    if isinstance(getattr(getattr(job.client, "config", None), "backend", None), CortexConfig):
+        return cortex_training_body(body)
+    return body
+
+
 def copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: Path) -> Path:
     """Copy the PEFT pack from a weights-only checkpoint when the exporter retained one."""
+    destination = require_data_fast_path(destination, label="PEFT adapter output")
     from safetensors import safe_open
 
     candidates = [
@@ -274,6 +335,7 @@ def copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: Path) -> Pa
 
 
 def save_weights_only_checkpoint(session: GatewaySession, job: ArcticJob, path: str | Path) -> str:
+    path = require_data_fast_path(path, label="weights checkpoint output")
     saved = job.client.save_checkpoint(path=str(path), export_hf=True)
     directory = Path(saved.get("hf_path") or saved["path"])
     if not (directory / "config.json").exists():
@@ -303,33 +365,15 @@ def build_payload(
     lm_head_token_chunk_size: Optional[int] = None,
     determinism: str = "best-effort",
     gradient_norms_per_param: bool = True,
-    gradient_accumulation_steps: Optional[int] = None,
 ) -> dict:
     tc = json.loads(json.dumps(training_config))
     if lm_head_token_chunk_size is not None:
         tc.setdefault("fused_lm_head_token_chunk_size", lm_head_token_chunk_size)
     if attn_implementation is not None:
         tc["attn_implementation"] = attn_implementation
-    if gradient_accumulation_steps is not None:
-        gas = int(gradient_accumulation_steps)
-        if gas < 1:
-            raise ValueError(f"gradient_accumulation_steps must be >= 1, got {gradient_accumulation_steps!r}")
-        ds = dict(tc.get("ds_config") or {})
-        ds["gradient_accumulation_steps"] = gas
-        micro = ds.get("train_micro_batch_size_per_gpu")
-        n_gpus = tc.get("n_gpus")
-        if micro is not None and n_gpus is not None:
-            sp_size = int(tc.get("sp_size", 1))
-            train_batch_size = int(micro) * gas * (int(n_gpus) // sp_size)
-            ds["train_batch_size"] = train_batch_size
-            if "train_batch_size" in tc:
-                tc["train_batch_size"] = train_batch_size
-        tc["ds_config"] = ds
     mb_spec = dict(tc.get("mb_spec") or {})
     mb_spec["max_tokens_per_mb"] = correctness_microbatch_tokens(_max_tokens_per_mb_of(tc))
     tc["mb_spec"] = mb_spec
-    if int(tc.get("ep_size", 1)) > 1:
-        tc.setdefault("deepep_token_chunk_size", mb_spec["max_tokens_per_mb"])
     debug = dict(tc.get("debug") or {})
     debug.update({"gradient_norms_per_param": gradient_norms_per_param, "gradient_sample_max_numel": 0})
     if determinism == "off":
@@ -341,7 +385,9 @@ def build_payload(
         raise ValueError(f"determinism must be 'best-effort' or 'off', got {determinism!r}")
     debug.setdefault("fp32_precision", False)
     if optimizer_state_output_dir is not None:
-        debug["optimizer_state_output_dir"] = str(Path(optimizer_state_output_dir).resolve())
+        debug["optimizer_state_output_dir"] = str(
+            require_data_fast_path(optimizer_state_output_dir, label="optimizer artifact output")
+        )
     tc["debug"] = debug
     return {
         "model_name": model_path,
@@ -350,19 +396,6 @@ def build_payload(
         "dtype": tc.get("dtype", "bfloat16"),
         "training_config": tc,
     }
-
-
-def ap_batch_processing_options(config_id: str, case: str) -> dict:
-    """Select AP-only loss packaging without materializing long full-vocabulary logits."""
-    if config_id == "qwen3-8b-h200-train-sft-full-4gpus-64k" and case == "gas4":
-        return {
-            "loss_fn": "sft_ce",
-            "processing_config": {
-                "logits_optimization": "memory",
-                "logits_optimization_peak_mem_size_in_gib": 4,
-            },
-        }
-    return {}
 
 
 def _labels_for_provider(batch, model_provider: str):
@@ -390,91 +423,28 @@ def _batch_dict(input_ids, position_ids, labels) -> dict:
     }
 
 
-def _batch_body_from_wire_batch(
-    wire_batch,
-    *,
-    loss_fn: str = "sft",
-    processing_config: Optional[dict] = None,
-    labels_are_shifted: bool = False,
-) -> dict:
-    processing = {"loss_fn": loss_fn}
-    if processing_config is not None:
-        processing["config"] = deepcopy(processing_config)
-    return {
-        "batch": wire_batch,
-        "meta": {"labels_are_shifted": True} if labels_are_shifted else {},
-        "processing": processing,
-    }
-
-
 def _batch_body(
     batch,
     labels,
     *,
-    loss_fn: str = "sft",
-    processing_config: Optional[dict] = None,
     labels_are_shifted: bool = False,
 ) -> dict:
-    return _batch_body_from_wire_batch(
-        _batch_dict(batch.input_ids, batch.position_ids, labels),
-        loss_fn=loss_fn,
-        processing_config=processing_config,
-        labels_are_shifted=labels_are_shifted,
-    )
+    return {
+        "batch": _batch_dict(batch.input_ids, batch.position_ids, labels),
+        "meta": {"labels_are_shifted": True} if labels_are_shifted else {},
+        "processing": {"loss_fn": "sft"},
+    }
 
 
 def pack(
     batch,
     *,
     model_provider: str = "huggingface",
-    loss_fn: str = "sft",
-    processing_config: Optional[dict] = None,
 ) -> dict:
     labels_are_shifted = model_provider == "prime_rl"
     return _batch_body(
         batch,
         _labels_for_provider(batch, model_provider),
-        loss_fn=loss_fn,
-        processing_config=processing_config,
-        labels_are_shifted=labels_are_shifted,
-    )
-
-
-def pack_microbatches(
-    batch,
-    microbatches: int,
-    *,
-    model_provider: str = "huggingface",
-    loss_fn: str = "sft",
-    processing_config: Optional[dict] = None,
-) -> dict:
-    """Pack a correctness batch as an AP GAS list when the arm needs several model calls."""
-    if microbatches <= 1:
-        return pack(batch, model_provider=model_provider, loss_fn=loss_fn, processing_config=processing_config)
-    if batch.rows < microbatches:
-        raise ValueError(f"cannot split {batch.rows} row(s) into {microbatches} microbatches")
-    labels_are_shifted = model_provider == "prime_rl"
-    labels = _labels_for_provider(batch, model_provider)
-    wire_batches = []
-    base_rows, extra_rows = divmod(batch.rows, microbatches)
-    start = 0
-    for index in range(microbatches):
-        rows = base_rows + (1 if index < extra_rows else 0)
-        end = start + rows
-        wire_batches.append(
-            _batch_dict(
-                batch.input_ids[start:end].contiguous(),
-                batch.position_ids[start:end].contiguous(),
-                labels[start:end].contiguous(),
-            )
-        )
-        start = end
-    if len(wire_batches) != microbatches:
-        raise ValueError(f"split produced {len(wire_batches)} microbatches, expected {microbatches}")
-    return _batch_body_from_wire_batch(
-        wire_batches,
-        loss_fn=loss_fn,
-        processing_config=processing_config,
         labels_are_shifted=labels_are_shifted,
     )
 
@@ -530,7 +500,7 @@ def _globalize_expert_norms(per_parameter: Dict[str, float], per_expert: Dict[st
 
 
 def fwd_bwd_step(session: GatewaySession, job: ArcticJob, body: dict, learning_rate: float = 0.0) -> StepResult:
-    response = job.client.fwd_bwd(body)
+    response = job.client.fwd_bwd(training_body(job, body))
     stepped = job.client.step(learning_rate)
     step_metrics = stepped.get("metrics") or {}
     response_metrics = response.get("metrics") or {}
@@ -575,9 +545,6 @@ def sampling_payload(model_dir: str | Path, seed: int, *, dtype: str, n_gpus: in
                 "gpu_memory_utilization": 0.85,
                 "disable_custom_all_reduce": True,
                 "enforce_eager": True,
-                # Qwen GDN training calls FLA chunk_gated_delta_rule. vLLM's auto prefill selects
-                # FlashInfer on Hopper; triton selects the FLA prefill.
-                "gdn_prefill_backend": "triton",
             },
         },
     }
@@ -600,7 +567,7 @@ def log_probs(
 
 def forward_loss(session: GatewaySession, job: ArcticJob, body: dict) -> float:
     """Return the loss from Arctic Platform's forward-only response."""
-    response = job.client.fwd_no_grad(body)
+    response = job.client.fwd_no_grad(training_body(job, body))
     metrics = response.get("metrics") or {}
     loss = response.get("avg_loss", metrics.get("loss"))
     if loss is None:
@@ -611,7 +578,7 @@ def forward_loss(session: GatewaySession, job: ArcticJob, body: dict) -> float:
 def forward_logprobs(session: GatewaySession, job: ArcticJob, body: dict):
     import torch
 
-    response = job.client.fwd_no_grad(body)
+    response = job.client.fwd_no_grad(training_body(job, body))
     if "logprobs" not in response:
         metrics = response.get("metrics") or {}
         if "logprobs" in metrics:
@@ -646,20 +613,20 @@ class GatewayTransport:
         slots: int,
         attn_implementation: Optional[str] = None,
         determinism: str = "best-effort",
-        gradient_accumulation_steps: Optional[int] = None,
     ) -> None:
-        self.session = GatewaySession(Path(workdir), slots)
+        self.session = GatewaySession(require_data_fast_path(workdir, label="gateway transport workdir"), slots)
         self.payload = build_payload(
             training_config,
             model_path,
             seed,
             attn_implementation=attn_implementation,
             determinism=determinism,
-            gradient_accumulation_steps=gradient_accumulation_steps,
         )
 
     def __enter__(self) -> "GatewayTransport":
-        self.session.workdir.mkdir(parents=True, exist_ok=True)
+        require_data_fast_path(self.session.workdir, label="gateway transport workdir").mkdir(
+            parents=True, exist_ok=True
+        )
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:

@@ -18,11 +18,22 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+import pytest
+
+from arctic_platform.client import CortexConfig
+from arctic_platform.correctness.harness import runner
 from arctic_platform.correctness.harness.config import load_config
+from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
 from arctic_platform.correctness.harness.registry import reference_tests
 from arctic_platform.correctness.harness.registry import registered_tests
+from arctic_platform.correctness.harness.spec import TestSpec as Spec
 from arctic_platform.correctness.selftest.config_factory import native_config
+
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG = ROOT / "configs/qwen3.6-35b-a3b/h200/train-rl-16gpus-64k.config"
+SPEC = ROOT / "specs/qwen3.6-35b-a3b-h200-train-rl-16gpus-64k.json"
 
 TRAINING_CONFIG = {
     "max_seq_len": 4096,
@@ -61,3 +72,37 @@ def test_every_reference_check_is_registered():
     registered without belonging to this set.
     """
     assert set(reference_tests()) <= set(registered_tests())
+
+
+@pytest.mark.parametrize("check", ["rl-weight-sync", "rl-router-replay"])
+def test_frozen_rl_checks_do_not_require_the_reduced_reference(check):
+    cfg = load_config(CONFIG)
+    spec = Spec.read(SPEC)
+    assert cfg.is_rl
+    assert cfg.model_name == spec.model.source_checkpoint == "Qwen/Qwen3.6-35B-A3B"
+    assert spec.model.cache_path == "/data-fast/base-models/synthetic/Qwen3.6-35B-A3B-4L"
+    assert spec.model.num_hidden_layers == 4
+    assert check in spec.applicable_tests
+    assert registered_tests()[check].compares_to_reference is False
+    assert check not in reference_tests()
+
+
+@pytest.mark.parametrize("check", ["rl-weight-sync", "rl-router-replay"])
+def test_frozen_rl_cortex_capability_guard_precedes_check_setup(tmp_path, monkeypatch, check):
+    cfg = load_config(CONFIG)
+    spec = Spec.read(SPEC)
+    entry = registered_tests()[check]
+    monkeypatch.setattr(entry, "fn", lambda ctx: pytest.fail("unsupported check must not load a model or client"))
+    results = runner.execute_rl(
+        cfg,
+        spec,
+        vocab_size=128,
+        select=[check],
+        workdir=tmp_path,
+        client_backend=CortexConfig(base_url="http://unused"),
+    )
+    assert len(results) == 1
+    assert results[0].outcome is Outcome.FAIL
+    assert results[0].summary == "check not supported on Cortex"
+    assert results[0].reason == runner.cortex_unavailable_reason(entry)
+    assert "worker-local" in results[0].reason

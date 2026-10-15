@@ -56,7 +56,7 @@ def _table(headers: List[str], rows: List[List[str]], right: Optional[set] = Non
     return [fmt(headers), "| " + " | ".join(sep) + " |"] + [fmt(r) for r in rows]
 
 
-def _header(specs: Dict[str, TestSpec]) -> List[str]:
+def _header(specs: Dict[str, TestSpec], execution: Dict[str, dict]) -> List[str]:
     """What was measured, on what, with which software."""
     lines = [
         "# Arctic Platform correctness report",
@@ -79,6 +79,19 @@ def _header(specs: Dict[str, TestSpec]) -> List[str]:
         ),
         "",
     ]
+    if any(item.get("backend") == "cortex" for item in execution.values()):
+        lines[2:5] = [
+            (
+                "Cortex checks use the requested catalog model or an explicitly published reduced model. A publication"
+                " binding records local model/tokenizer SHA-256 digests and the separate managed model ID; the HF"
+                " reference runs outside Cortex. Publication alone does not verify remote worker bytes. Checkpoint"
+                " checks compare Arctic Platform against Arctic Platform. Checks requiring local fixtures without a"
+                " publication binding or worker instrumentation fail before remote execution. The frozen specs are"
+                " retained as reviewed contracts, not evidence of remote model identity."
+            ),
+            "",
+            "Environment fields below describe the client process, not the remote worker image or GPUs.",
+        ]
     env = collect()
     labels = {
         "generated": "generated",
@@ -96,9 +109,12 @@ def _header(specs: Dict[str, TestSpec]) -> List[str]:
     return lines
 
 
-def to_markdown(results: List[TestResult], specs: Dict[str, TestSpec]) -> str:
+def to_markdown(
+    results: List[TestResult], specs: Dict[str, TestSpec], *, execution: Dict[str, dict] | None = None
+) -> str:
+    execution = execution or {}
     counts = _counts(results)
-    lines: List[str] = _header(specs)
+    lines: List[str] = _header(specs, execution)
     lines.append(
         f"**Overall: {counts['pass']} passed, {counts['fail']} failed, {counts['inapplicable']} inapplicable**"
     )
@@ -107,8 +123,37 @@ def to_markdown(results: List[TestResult], specs: Dict[str, TestSpec]) -> str:
     for config_id, spec in sorted(specs.items()):
         lines.append(f"## {config_id}")
         lines.append("")
+        metadata = execution.get(config_id, {})
+        remote = metadata.get("backend") == "cortex"
+        bound_fixture = remote and metadata.get("fixture_sha256") is not None
+        local_fixture = bound_fixture and metadata.get("fixture_distribution") == "local-gateway"
+        published = bound_fixture and not local_fixture
+        inference_model = metadata.get("inference_model_name") if remote else None
+        if metadata:
+            lines.append(f"- execution backend: `{metadata['backend']}`")
+        if remote:
+            label = "requested published reduced model" if published else "requested catalog model"
+            if local_fixture:
+                label = "requested local reduced model"
+            if bound_fixture and inference_model is not None:
+                label += " (fixture-based checks only)"
+            lines.append(f"- {label}: `{metadata['requested_model_name']}`")
+            if inference_model is not None:
+                lines.append(f"- `inference-checkpoint-loss` requested full model: `{inference_model}`")
+            if bound_fixture:
+                lines.append(f"- local model/tokenizer SHA-256 binding: `{metadata['fixture_sha256']}`")
+                if local_fixture:
+                    lines.append(f"- local gateway: `{metadata['gateway_url']}`")
+                else:
+                    lines.append(f"- publication stage: `{metadata['fixture_stage_path']}`")
+            lines.append("- remote model weights and worker environment: not independently verified")
+        model_label = "model"
+        if remote and not bound_fixture:
+            model_label = "reviewed reference fixture (not loaded on Cortex)"
+        elif bound_fixture and inference_model is not None:
+            model_label = "reviewed reference fixture (fixture-based checks only; not used by inference)"
         lines.append(
-            f"- model: {spec.model.param_count:,} parameters, {spec.model.num_hidden_layers} layers "
+            f"- {model_label}: {spec.model.param_count:,} parameters, {spec.model.num_hidden_layers} layers "
             f"of `{spec.model.source_checkpoint}`, hash `{spec.model.content_hash}`"
         )
         lines.append(f"- attention implementations: {', '.join(spec.attn_implementations)}")
@@ -179,7 +224,7 @@ def to_markdown(results: List[TestResult], specs: Dict[str, TestSpec]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def to_json(results: List[TestResult], specs: Dict[str, TestSpec]) -> str:
+def to_json(results: List[TestResult], specs: Dict[str, TestSpec], *, execution: Dict[str, dict] | None = None) -> str:
     payload = {
         "totals": _counts(results),
         "results": [
@@ -206,6 +251,7 @@ def to_json(results: List[TestResult], specs: Dict[str, TestSpec]) -> str:
             for r in results
         ],
         "specs": {k: asdict(v) for k, v in specs.items()},
+        "execution": execution or {},
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
@@ -223,12 +269,13 @@ def write(
     out_dir: Path,
     *,
     timestamp: str | None = None,
+    execution: Dict[str, dict] | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = timestamp or datetime.now().strftime("%Y-%m-%d-%H-%M")
     markdown = out_dir / f"report-{stamp}.md"
     machine = out_dir / f"report-{stamp}.json"
-    markdown.write_text(to_markdown(results, specs))
-    machine.write_text(to_json(results, specs))
+    markdown.write_text(to_markdown(results, specs, execution=execution))
+    machine.write_text(to_json(results, specs, execution=execution))
     _point_latest(out_dir / "report.md", markdown)
     _point_latest(out_dir / "report.json", machine)

@@ -24,6 +24,8 @@ from typing import Dict
 
 import torch
 
+from arctic_platform.correctness.harness.workdir import require_data_fast_path
+
 NO_DECAY_NAMES = ("bias", "layer_norm.weight", "layernorm.weight", "norm.weight", "ln_f.weight")
 ADAMW_NAMES = {"adam", "adamw", "fusedadam", "fused_adam", "torch_adamw", "deepspeed_cpu_adam"}
 
@@ -56,12 +58,11 @@ def assert_adamw_semantics(optimizer_config: dict) -> None:
         raise ValueError(f"optimizer-state correctness supports AdamW semantics, got {optimizer_name!r}")
 
 
-def build_adamw(named_masters, optimizer_config: dict, *, learning_rate: float, backend: str = "torch"):
+def build_adamw(named_masters, optimizer_config: dict, *, learning_rate: float):
     """One AdamW over the config's hyperparameters, with weight decay withheld from biases and norms.
 
-    The one-step reference uses PyTorch so its moments are independent evidence. A multi-step trajectory uses the
-    product backend because backend scalar rounding compounds across its hundred steps. Both retain the same
-    parameter grouping, master precision, and configured hyperparameters.
+    Single-step and trajectory references both use independent PyTorch AdamW with fused and foreach
+    implementations disabled. Product optimizer rounding remains a measured difference.
     """
     import torch
 
@@ -80,12 +81,6 @@ def build_adamw(named_masters, optimizer_config: dict, *, learning_rate: float, 
         "betas": (float(betas[0]), float(betas[1])),
         "eps": float(optimizer_config.get("eps", 1e-8)),
     }
-    if backend == "fused_adam":
-        from deepspeed.ops.adam import FusedAdam
-
-        return FusedAdam(groups, adam_w_mode=True, **kwargs)
-    if backend != "torch":
-        raise ValueError(f"unknown AdamW backend: {backend!r}")
     return torch.optim.AdamW(groups, foreach=False, fused=False, **kwargs)
 
 
@@ -100,6 +95,7 @@ def run_adamw_step(
     output_dir: Path,
 ) -> OptimizerStepArtifact:
     """Apply one independent AdamW step and write each named state without an HTTP payload."""
+    output_dir = require_data_fast_path(output_dir, label="reference optimizer output")
     import torch
 
     dtype = master_dtype(optimizer_dtype)
@@ -130,7 +126,6 @@ def run_adamw_step(
         torch.nn.utils.clip_grad_norm_(list(masters.values()), float(gradient_clipping))
     optimizer.step()
 
-    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     entries = []
     source_parameters = dict(named_parameters)

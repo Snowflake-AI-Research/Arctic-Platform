@@ -94,8 +94,7 @@ def fixed_order_sum_rows_by_token(
     hidden_dim = rows.shape[1]
     row_count = token_indices.shape[0]
     if row_count == 0:
-        # Empty ranks must still traverse the dispatch graph; unrouted padding may contain NaNs.
-        return rows[:0].sum(dim=0, keepdim=True).expand(num_tokens, hidden_dim).contiguous()
+        return rows.new_zeros((num_tokens, hidden_dim))
     # The expert stage can return more rows than routing produced, because a padded receive buffer keeps its
     # tail. Those rows belong to no token and are dropped, which is what the scatter this replaces also did by
     # iterating over the index rather than over the source.

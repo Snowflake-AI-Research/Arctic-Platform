@@ -94,8 +94,8 @@ def _assert_payloads(payloads, cfg, arm):
     assert payloads
     for payload in payloads:
         training = payload["training_config"]
-        assert training["ds_config"]["gradient_accumulation_steps"] == arm.dss_microbatches
-        assert training["ds_config"]["train_batch_size"] == arm.dss_microbatches * cfg.n_gpus
+        assert training["ds_config"]["gradient_accumulation_steps"] == 1
+        assert training["ds_config"]["train_batch_size"] == cfg.training["ds_config"]["train_batch_size"]
         assert training["attn_implementation"] == cfg.attention_implementation
         assert training["debug"]["full_determinism"] is True
         assert training["debug"]["full_determinism_must_comply"] is False
@@ -292,8 +292,8 @@ def test_loss_control_runs_twenty_steps_without_checkpoint_or_capture(tmp_path, 
     assert len(payloads) == 2
     for payload in payloads:
         training = payload["training_config"]
-        assert training["ds_config"]["gradient_accumulation_steps"] == arm.dss_microbatches
-        assert training["ds_config"]["train_batch_size"] == cfg.n_gpus * arm.dss_microbatches
+        assert training["ds_config"]["gradient_accumulation_steps"] == 1
+        assert training["ds_config"]["train_batch_size"] == cfg.training["ds_config"]["train_batch_size"]
         assert training["debug"]["full_determinism"] is True
         assert training["debug"]["full_determinism_must_comply"] is False
         assert "optimizer_state_output_dir" not in training["debug"]
@@ -399,7 +399,7 @@ def test_checkpoint_control_shares_prefix_and_resumes_exact_saved_checkpoint(tmp
     assert all(rate == checkpoint_resume.LEARNING_RATE for index, body, rate in steps)
     for payload in payloads:
         training = payload["training_config"]
-        assert training["ds_config"]["gradient_accumulation_steps"] == arm.dss_microbatches
+        assert training["ds_config"]["gradient_accumulation_steps"] == 1
         assert training["debug"]["full_determinism"] is True
         assert training["debug"]["full_determinism_must_comply"] is False
         assert "optimizer_state_output_dir" not in training["debug"]
@@ -483,8 +483,7 @@ def test_main_uses_current_checkpoint_iteration_bodies(tmp_path, monkeypatch, ca
     assert len(observed) == len(expected) == checkpoint_resume.ITERATIONS
     for actual_body, expected_body in zip(observed, expected, strict=True):
         assert actual_body["processing"] == expected_body["processing"]
-        assert isinstance(actual_body["batch"], list)
-        assert len(actual_body["batch"]) == arm.dss_microbatches
-        for actual_batch, expected_batch in zip(actual_body["batch"], expected_body["batch"], strict=True):
-            for field in ("input_ids", "position_ids", "labels"):
-                assert torch.equal(actual_batch[field], expected_batch[field])
+        assert isinstance(actual_body["batch"], dict)
+        assert actual_body["batch"]["input_ids"].shape == (arm.global_batch_size, arm.max_seq_len)
+        for field in ("input_ids", "position_ids", "labels"):
+            assert torch.equal(actual_body["batch"][field], expected_body["batch"][field])

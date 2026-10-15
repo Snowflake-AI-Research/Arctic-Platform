@@ -29,6 +29,9 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
 from pathlib import Path
 
+from arctic_platform.correctness.harness.workdir import correctness_workdir
+from arctic_platform.correctness.harness.workdir import require_data_fast_path
+
 # Sixteen reference executions over an eight-GPU node: two waves, so more samples cost the same wall
 # clock as two sequential runs.
 CALIBRATION_RUNS = 16
@@ -41,6 +44,12 @@ CALIBRATION_RUNS = 16
 GATE_SAFETY_FACTOR = 4.0
 
 OOM_EXIT = 42
+
+
+def _validate_storage(args: argparse.Namespace) -> None:
+    args.cache_root = require_data_fast_path(args.cache_root, label="onboarding model cache")
+    if getattr(args, "output_dir", None) is not None:
+        args.output_dir = require_data_fast_path(args.output_dir, label="onboarding work directory")
 
 
 def _checkout_root(config_path: Path) -> Path:
@@ -179,6 +188,7 @@ def _memory_snapshot() -> dict:
 
 
 def _probe_worker(args: argparse.Namespace) -> int:
+    _validate_storage(args)
     os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
     os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "0"
 
@@ -260,6 +270,10 @@ def build_spec(
     workdir: Path | None = None,
 ):
     """Materialize the reduced reference model and freeze the generated cases."""
+    cache_root = require_data_fast_path(cache_root, label="onboarding model cache")
+    if workdir is not None:
+        workdir = require_data_fast_path(workdir, label="onboarding work directory")
+
     from transformers import AutoConfig
 
     from arctic_platform.correctness.harness.arms import correctness_microbatch_tokens
@@ -268,15 +282,14 @@ def build_spec(
     from arctic_platform.correctness.harness.seeds import SEED
     from arctic_platform.correctness.harness.spec import ArmSpec
     from arctic_platform.correctness.harness.spec import TestSpec
-    from arctic_platform.correctness.harness.workdir import correctness_workdir
     from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
     from arctic_platform.correctness.onboarding.synth_model import size_for_single_gpu
 
-    temporary = Path(workdir) if workdir else correctness_workdir("dss-onboard-")
+    temporary = workdir if workdir is not None else correctness_workdir("dss-onboard-")
     temporary.mkdir(parents=True, exist_ok=True)
     if num_layers is None:
         num_layers, _ = size_for_single_gpu(source_checkpoint)
-    destination = f"{cache_root}/{Path(source_checkpoint).name}-{num_layers}L"
+    destination = str(cache_root / f"{Path(source_checkpoint).name}-{num_layers}L")
     model = materialize_pretrained(source_checkpoint, destination, num_layers)
     print(f"[onboard] model {model.param_count:,} params, {num_layers} layers -> {destination}", flush=True)
 
@@ -391,6 +404,9 @@ def _render_and_run_calibration(args: argparse.Namespace, selected: dict) -> Pat
 
 def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     """Calibrate full-tensor optimizer deltas across a set of nondeterministic reference runs."""
+    args.output_dir = require_data_fast_path(args.output_dir, label="optimizer calibration work directory")
+    model_path = require_data_fast_path(args.optimizer_model_path, label="optimizer calibration model cache")
+
     from decimal import ROUND_CEILING
     from decimal import Decimal
 
@@ -416,7 +432,6 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     gas1 = next((arm for arm in spec.arms if arm.name == "gas1"), None)
     if gas1 is None:
         raise ValueError("the existing spec has no gas1 case")
-    model_path = Path(args.optimizer_model_path)
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     vocab_size = getattr(model_config, "text_config", model_config).vocab_size
     batch = build_batch(gas1.name, gas1.global_batch_size, gas1.max_seq_len, vocab_size, seed=SEED)
@@ -434,10 +449,7 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     )
 
     lanes = max(1, min(CALIBRATION_RUNS, torch.cuda.device_count()))
-    fast_root = Path("/data-fast/dss-correctness-calibration")
-    calibration_root = (fast_root if fast_root.parent.exists() else args.output_dir) / config.config_id
-    shutil.rmtree(calibration_root, ignore_errors=True)
-    calibration_root.mkdir(parents=True)
+    calibration_root = correctness_workdir("optimizer-calibration-")
     manifests: list[Path] = []
     worst_delta = 0.0
     worst_name = None
@@ -610,6 +622,8 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         "-m",
         "arctic_platform.correctness",
         "run",
+        "--backend",
+        "onprem",
         "--config",
         str(args.config),
         "--test",
@@ -924,15 +938,14 @@ def _onboard_optimizer_test(args: argparse.Namespace, config) -> int:
 
 
 def _parent(args: argparse.Namespace) -> int:
+    _validate_storage(args)
     args.checkout_root = _checkout_root(args.config)
     sys.path.insert(0, str(args.checkout_root))
-    args.cache_root = args.cache_root.resolve()
 
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.config import validate_against_host
     from arctic_platform.correctness.harness.dss_driver import available_gpus
     from arctic_platform.correctness.harness.preflight import ensure_no_interrupted_builds
-    from arctic_platform.correctness.harness.workdir import correctness_workdir
 
     config = load_config(args.config)
     if config.is_rl:
@@ -960,8 +973,6 @@ def _parent(args: argparse.Namespace) -> int:
         # Onboarding diagnostics are large and recreatable, so they belong on the node's fast disk rather than
         # in the shared checkout. Losing them costs nothing: the next onboarding writes them again.
         args.output_dir = correctness_workdir("config-onboarding-") / config.config_id
-    else:
-        args.output_dir = args.output_dir.resolve()
     if args.test_spec is None:
         args.test_spec = Path(__file__).resolve().parent.parent / "specs" / f"{config.config_id}.json"
     else:
@@ -1066,13 +1077,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
+    _validate_storage(args)
     args.config = args.config.resolve()
     if args.probe_layers is not None:
         if args.probe_output is None:
             raise ValueError("sizing worker requires --probe-output")
         args.checkout_root = _checkout_root(args.config)
         sys.path.insert(0, str(args.checkout_root))
-        args.cache_root = args.cache_root.resolve()
         args.probe_output = args.probe_output.resolve()
         return _probe_worker(args)
     return _parent(args)

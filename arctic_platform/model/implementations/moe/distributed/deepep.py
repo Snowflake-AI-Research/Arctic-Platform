@@ -81,10 +81,9 @@ def _dispatch_op_impl(
 
 
 def _dispatch_setup_context(ctx, inputs, output) -> None:
-    x, _, topk_weights, *_ = inputs
+    x, *_ = inputs
     *_, handle_id = output
     ctx.input_dtype = x.dtype
-    ctx.topk_weights_dtype = topk_weights.dtype
     ctx.saved_handle = _handle_cache.get(handle_id.item())
 
 
@@ -102,13 +101,11 @@ def _dispatch_backward(
     handle = ctx.saved_handle
     assert handle is not None
 
-    grad_recv_x = grad_recv_x.contiguous()
-    grad_recv_scores = grad_recv_scores.float().contiguous() if grad_recv_scores is not None else None
     previous_event = _new_event_overlap()
     grad_x, grad_scores, after_event = _buffer.combine(
         x=grad_recv_x,
         handle=handle,
-        topk_weights=grad_recv_scores,
+        topk_weights=grad_recv_scores.float() if grad_recv_scores is not None else None,
         previous_event=previous_event,
         async_finish=True,
         allocate_on_comm_stream=True,
@@ -116,7 +113,7 @@ def _dispatch_backward(
     after_event.current_stream_wait()
 
     grad_x = grad_x.to(ctx.input_dtype)
-    grad_topk_weights = grad_scores.to(ctx.topk_weights_dtype) if grad_scores is not None else None
+    grad_topk_weights = grad_scores.to(ctx.input_dtype) if grad_scores is not None else None
     return grad_x, None, grad_topk_weights, None, None, None, None
 
 
@@ -130,28 +127,13 @@ class _DeepEPCombine(torch.autograd.Function):
         assert handle is not None, f"Handle not found for handle_id={handle_id.item()}"
 
         previous_event = _new_event_overlap()
-        try:
-            combined, _, after_event = _buffer.combine(
-                x=x,
-                handle=handle,
-                previous_event=previous_event,
-                async_finish=True,
-                allocate_on_comm_stream=True,
-            )
-        except RuntimeError as error:
-            hidden_bytes = get_hidden_bytes(x)
-            required_nvl_bytes = max(
-                config.get_nvl_buffer_size_hint(hidden_bytes, _buffer.group.size())
-                for config in (
-                    Buffer.get_dispatch_config(_buffer.group.size()),
-                    Buffer.get_combine_config(_buffer.group.size()),
-                )
-            )
-            raise RuntimeError(
-                f"DeepEP combine failed for shape={tuple(x.shape)}, dtype={x.dtype}, "
-                f"hidden_bytes={hidden_bytes}, allocated_nvl_bytes={_buffer.num_nvl_bytes}, "
-                f"current_hint_nvl_bytes={required_nvl_bytes}"
-            ) from error
+        combined, _, after_event = _buffer.combine(
+            x=x,
+            handle=handle,
+            previous_event=previous_event,
+            async_finish=True,
+            allocate_on_comm_stream=True,
+        )
         _pending_combine_event = after_event
         ctx.handle = handle
         return combined
@@ -162,7 +144,6 @@ class _DeepEPCombine(torch.autograd.Function):
         handle = ctx.handle
         assert handle is not None, "Handle not found in DeepEP combine backward."
 
-        grad_combined = grad_combined.contiguous()
         previous_event = _new_event_overlap()
         grad_x, _, _, _, _, after_event = _buffer.dispatch(
             x=grad_combined,
@@ -322,18 +303,13 @@ def finalize_dispatch_tokens(
     return hidden_states, num_tokens_per_expert, state
 
 
-def _combine_wire_input(hidden_states: torch.Tensor) -> torch.Tensor:
-    """Cast the post-unpermute payload to the bf16 dtype used to size the DeepEP buffer."""
-    return hidden_states.to(torch.bfloat16)
-
-
 def combine_tokens(hidden_states: torch.Tensor, state: _DispatchState) -> torch.Tensor:
     if state.permuted_scores is not None:
         hidden_states = (hidden_states.to(torch.float32) * state.permuted_scores.to(torch.float32).reshape(-1, 1)).to(
             hidden_states.dtype
         )
     hidden_states = unpermute_tokens(hidden_states, state.permuted_indices, state.num_recv_tokens)
-    return _DeepEPCombine.apply(_combine_wire_input(hidden_states), state.handle_id)
+    return _DeepEPCombine.apply(hidden_states, state.handle_id)
 
 
 register_deepep_cuda_ops()

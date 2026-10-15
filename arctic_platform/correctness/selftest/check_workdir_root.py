@@ -39,7 +39,7 @@ def test_correctness_workdir_prefers_data_fast_over_unsafe_tmpdir(
     data_fast_tmp.parent.mkdir()
     _reset_tmp_env(monkeypatch)
     monkeypatch.setattr(workdir, "_DATA_FAST_TMPDIR", data_fast_tmp)
-    monkeypatch.setattr(workdir, "_SAFE_FALLBACK_TMPDIR", tmp_path / "fallback")
+    monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", data_fast_tmp.parent)
     monkeypatch.setenv("TMPDIR", "/code/users/stas/ap3tmp")
 
     created = workdir.correctness_workdir("dss-correctness-")
@@ -48,25 +48,25 @@ def test_correctness_workdir_prefers_data_fast_over_unsafe_tmpdir(
     assert created.name.startswith("dss-correctness-")
 
 
-def test_correctness_workdir_does_not_fall_back_to_unsafe_tmpdir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    fallback = tmp_path / "safe-tmp"
+def test_correctness_workdir_fails_closed_without_data_fast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    missing_root = tmp_path / "missing-data-fast"
     _reset_tmp_env(monkeypatch)
-    monkeypatch.setattr(workdir, "_DATA_FAST_TMPDIR", tmp_path / "missing-data-fast" / "tmp")
-    monkeypatch.setattr(workdir, "_SAFE_FALLBACK_TMPDIR", fallback)
+    monkeypatch.setattr(workdir, "_DATA_FAST_TMPDIR", missing_root / "tmp")
+    monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", missing_root)
     monkeypatch.setenv("TMPDIR", "/code/users/stas/ap3tmp")
 
-    created = workdir.correctness_workdir("dss-correctness-")
-
-    assert created.parent == fallback
-    assert not str(created).startswith("/code/users/stas/")
+    with pytest.raises(ValueError, match="existing /data-fast"):
+        workdir.correctness_workdir("dss-correctness-")
+    assert not missing_root.exists()
 
 
 def test_correctness_workdir_honors_safe_explicit_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    override = tmp_path / "override"
+    data_fast = tmp_path / "data-fast"
+    data_fast.mkdir()
+    override = data_fast / "override"
     _reset_tmp_env(monkeypatch)
-    monkeypatch.setattr(workdir, "_DATA_FAST_TMPDIR", tmp_path / "data-fast" / "tmp")
+    monkeypatch.setattr(workdir, "_DATA_FAST_TMPDIR", data_fast / "tmp")
+    monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", data_fast)
     monkeypatch.setenv("TMPDIR", "/code/users/stas/ap3tmp")
     monkeypatch.setenv(CORRECTNESS_TMPDIR_ENV, str(override))
 

@@ -20,12 +20,14 @@ import contextlib
 import os
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 from safetensors.torch import save_file
 
+from arctic_platform.correctness.diagnostics.execution_controls import pack_microbatches
 from arctic_platform.correctness.harness.batches import Batch
 from arctic_platform.correctness.harness.dss_driver import _gateway_runtime
 from arctic_platform.correctness.harness.dss_driver import _globalize_expert_norms
@@ -34,7 +36,7 @@ from arctic_platform.correctness.harness.dss_driver import _training_client_conf
 from arctic_platform.correctness.harness.dss_driver import available_gpus
 from arctic_platform.correctness.harness.dss_driver import build_payload
 from arctic_platform.correctness.harness.dss_driver import copy_checkpoint_peft_adapter
-from arctic_platform.correctness.harness.dss_driver import pack_microbatches
+from arctic_platform.correctness.harness.dss_driver import pack
 
 
 def test_globalize_expert_norms_replaces_rank_local_value() -> None:
@@ -247,19 +249,12 @@ def test_pack_microbatches_can_request_memory_sft_ce_without_mutating_config() -
     }
 
 
-def test_only_qwen8b_full_gas4_routes_to_memory_sft_ce() -> None:
-    from arctic_platform.correctness.harness.dss_driver import ap_batch_processing_options
+def test_normal_packing_uses_plain_supervised_loss() -> None:
+    from arctic_platform.correctness.harness.batches import build_batch
 
-    config_id = "qwen3-8b-h200-train-sft-full-4gpus-64k"
-    assert ap_batch_processing_options(config_id, "gas4") == {
-        "loss_fn": "sft_ce",
-        "processing_config": {
-            "logits_optimization": "memory",
-            "logits_optimization_peak_mem_size_in_gib": 4,
-        },
-    }
-    assert ap_batch_processing_options(config_id, "gas1") == {}
-    assert ap_batch_processing_options("qwen3-8b-h200-train-sft-lora-4gpus-64k", "gas4") == {}
+    body = pack(build_batch("gas4", 16, 8, 128))
+    assert isinstance(body["batch"], dict)
+    assert body["processing"] == {"loss_fn": "sft"}
 
 
 def test_reference_runner_passes_the_harness_seed(tmp_path, monkeypatch) -> None:
@@ -291,6 +286,86 @@ def test_reference_runner_passes_the_harness_seed(tmp_path, monkeypatch) -> None
     assert captured["command"][seed_index + 1] == "1234"
     assert captured["command"][adapter_index + 1] == str(tmp_path / "adapter")
     assert result == {"loss": 0.0}
+
+
+@pytest.mark.parametrize("unsafe", ["/tmp", "/code", "/data-fast-shadow", "/data-fast", "symlink"])
+@pytest.mark.parametrize("boundary", ["execute", "execute_rl", "adapter", "reference_optimizer"])
+def test_runner_requires_data_fast_before_operational_side_effects(tmp_path, monkeypatch, unsafe, boundary):
+    from arctic_platform.correctness.harness import runner
+
+    destination = Path(unsafe)
+    if unsafe == "symlink":
+        destination = tmp_path / "escape"
+        destination.symlink_to("/tmp", target_is_directory=True)
+        destination /= "output"
+    cfg = SimpleNamespace(
+        training={"peft_config": {"peft_type": "LORA"}},
+        n_gpus=1,
+        at_gpu_width=lambda *args: pytest.fail("unsafe workdir reached config preparation"),
+    )
+    monkeypatch.setattr(
+        runner.subprocess, "run", lambda *args, **kwargs: pytest.fail("unsafe output reached subprocess")
+    )
+    with pytest.raises(ValueError, match="/data-fast"):
+        if boundary == "execute":
+            runner.execute(cfg, None, [], vocab_size=128, workdir=destination)
+        elif boundary == "execute_rl":
+            runner.execute_rl(cfg, None, vocab_size=128, workdir=destination)
+        elif boundary == "adapter":
+            runner.materialize_dss_peft_adapter(cfg, "read-only-model", destination, attn_implementation="eager")
+        else:
+            runner.run_reference(
+                "read-only-model",
+                tmp_path / "batch.pt",
+                tmp_path / "reference.json",
+                token_budget=1,
+                ce_chunk=1,
+                attn="sdpa",
+                fp32_lm_head=False,
+                optimizer_output_dir=destination,
+            )
+    assert not (tmp_path / "reference.json").exists()
+
+
+def test_reference_allows_small_repo_report_with_data_fast_optimizer_output(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import runner
+
+    output = Path(__file__).resolve().parents[3] / ".codex-run-state" / f"reference-report-{tmp_path.name}.json"
+    optimizer_output = tmp_path / "optimizer"
+    commands = []
+
+    def run_subprocess(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    original_read_text = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if path == output:
+            return '{"loss": 0.0}'
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(runner.subprocess, "run", run_subprocess)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    assert not output.exists()
+    result = runner.run_reference(
+        "read-only-model",
+        tmp_path / "batch.pt",
+        output,
+        token_budget=1,
+        ce_chunk=1,
+        attn="sdpa",
+        fp32_lm_head=False,
+        optimizer_config={"name": "AdamW"},
+        learning_rate=0.01,
+        optimizer_output_dir=optimizer_output,
+    )
+    assert result == {"loss": 0.0}
+    assert len(commands) == 1
+    command = commands[0]
+    assert command[command.index("--out") + 1] == str(output)
+    assert command[command.index("--optimizer-output-dir") + 1] == str(optimizer_output)
+    assert not output.exists()
 
 
 def test_copy_checkpoint_peft_adapter_accepts_a_checkpoint_adapter_pack(tmp_path) -> None:
@@ -395,6 +470,144 @@ def test_payload_routes_optimizer_capture_to_debug_for_harness(tmp_path) -> None
     assert worker_config["debug"]["optimizer_state_output_dir"] == str(destination.resolve())
 
 
+@pytest.mark.parametrize(
+    "job_config",
+    [
+        {},
+        {"training_config": None, "ds_worker_config": None},
+        {"training_config": {"debug": None}, "ds_worker_config": {"debug": {}}},
+        {"debug": {"optimizer_state_output_dir": "/ignored"}},
+    ],
+)
+def test_optimizer_capture_debug_config_defaults(job_config) -> None:
+    from arctic_platform.correctness.harness.optimizer_capture import _optimizer_capture_debug_config
+
+    assert _optimizer_capture_debug_config(job_config) == {}
+
+
+def test_optimizer_capture_debug_config_merges_supported_sections_without_mutation() -> None:
+    from arctic_platform.correctness.harness.optimizer_capture import _optimizer_capture_debug_config
+
+    training_debug = {"optimizer_state_output_dir": "/training", "model_state_output_dir": "/model"}
+    worker_debug = {"optimizer_state_output_dir": "/worker"}
+    debug = _optimizer_capture_debug_config(
+        {"training_config": {"debug": training_debug}, "ds_worker_config": {"debug": worker_debug}}
+    )
+
+    assert debug == {"optimizer_state_output_dir": "/worker", "model_state_output_dir": "/model"}
+    debug["optimizer_state_output_dir"] = "/changed"
+    assert training_debug == {"optimizer_state_output_dir": "/training", "model_state_output_dir": "/model"}
+    assert worker_debug == {"optimizer_state_output_dir": "/worker"}
+
+
+@pytest.mark.parametrize("section", ["training_config", "ds_worker_config"])
+@pytest.mark.parametrize("nested_debug", [False, True], ids=["config", "debug"])
+@pytest.mark.parametrize("value", [[], "", False])
+def test_optimizer_capture_debug_config_rejects_malformed_sections(section, nested_debug, value) -> None:
+    from arctic_platform.correctness.harness.optimizer_capture import _optimizer_capture_debug_config
+
+    config = {section: {"debug": value} if nested_debug else value}
+    field = f"{section}.debug" if nested_debug else section
+    with pytest.raises(TypeError, match=rf"{field} must be a dict"):
+        _optimizer_capture_debug_config(config)
+
+
+@pytest.fixture
+def optimizer_capture_initializer(monkeypatch):
+    import arctic_platform.common as common_package
+    from arctic_platform.correctness.harness import optimizer_capture
+
+    class Worker:
+        def initialize(self, master_addr, job_config):
+            self.production_initialization = (master_addr, job_config)
+            return True
+
+    worker_module = types.ModuleType("arctic_platform.common.deepspeed_worker")
+    worker_module.DeepSpeedWorker = SimpleNamespace(__ray_metadata__=SimpleNamespace(modified_class=Worker))
+    ray_module = types.ModuleType("ray")
+    ray_module.remote = lambda worker: worker
+    monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
+    monkeypatch.setitem(sys.modules, ray_module.__name__, ray_module)
+    monkeypatch.setattr(common_package, "deepspeed_worker", worker_module, raising=False)
+    monkeypatch.setattr(optimizer_capture, "_OPTIMIZER_CAPTURE_WORKER", None)
+    return optimizer_capture._optimizer_capture_worker_class()()
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        (),
+        ("optimizer_state_output_dir",),
+        ("model_state_output_dir",),
+        ("optimizer_state_output_dir", "model_state_output_dir"),
+    ],
+    ids=["disabled", "optimizer", "model", "both"],
+)
+def test_optimizer_capture_initialize_uses_current_client_job_config(optimizer_capture_initializer, tmp_path, fields):
+    payload = build_payload({"n_gpus": 1}, "model", 42)
+    payload["training_config"]["debug"].update({field: str(tmp_path / field) for field in fields})
+    client_config = _training_client_config(SimpleNamespace(workdir=tmp_path), payload)
+    job_config = client_config.to_onprem("training")
+    worker = optimizer_capture_initializer
+
+    assert worker.initialize("master", job_config) is True
+    assert worker._optimizer_state_output_dir == (
+        str(tmp_path / "optimizer_state_output_dir") if "optimizer_state_output_dir" in fields else None
+    )
+    assert worker._model_state_output_dir == (
+        str(tmp_path / "model_state_output_dir") if "model_state_output_dir" in fields else None
+    )
+    assert worker.production_initialization[0] == "master"
+    assert worker.production_initialization[1] is job_config
+
+
+def test_optimizer_capture_initialize_accepts_path_objects(optimizer_capture_initializer, tmp_path):
+    worker = optimizer_capture_initializer
+    job_config = {
+        "training_config": {
+            "debug": {
+                "optimizer_state_output_dir": tmp_path / "optimizer",
+                "model_state_output_dir": tmp_path / "model",
+            }
+        }
+    }
+
+    assert worker.initialize("master", job_config) is True
+    assert worker._optimizer_state_output_dir == str(tmp_path / "optimizer")
+    assert worker._model_state_output_dir == str(tmp_path / "model")
+
+
+def test_optimizer_capture_initialize_worker_settings_can_disable_training_capture(optimizer_capture_initializer):
+    worker = optimizer_capture_initializer
+    job_config = {
+        "training_config": {"debug": {"optimizer_state_output_dir": "/training", "model_state_output_dir": "/model"}},
+        "ds_worker_config": {"debug": {"optimizer_state_output_dir": None, "model_state_output_dir": None}},
+    }
+
+    assert worker.initialize("master", job_config) is True
+    assert worker._optimizer_state_output_dir is None
+    assert worker._model_state_output_dir is None
+
+
+@pytest.mark.parametrize("field", ["optimizer_state_output_dir", "model_state_output_dir"])
+@pytest.mark.parametrize("value", ["", "relative/path"])
+def test_optimizer_capture_initialize_rejects_relative_paths(optimizer_capture_initializer, field, value):
+    worker = optimizer_capture_initializer
+
+    with pytest.raises(ValueError, match=rf"debug.{field} must be an absolute path"):
+        worker.initialize("master", {"ds_worker_config": {"debug": {field: value}}})
+    assert not hasattr(worker, "production_initialization")
+
+
+@pytest.mark.parametrize("field", ["optimizer_state_output_dir", "model_state_output_dir"])
+def test_optimizer_capture_initialize_rejects_non_path_values(optimizer_capture_initializer, field):
+    worker = optimizer_capture_initializer
+
+    with pytest.raises(TypeError):
+        worker.initialize("master", {"ds_worker_config": {"debug": {field: 123}}})
+    assert not hasattr(worker, "production_initialization")
+
+
 def test_optimizer_capture_worker_context_restores_production_worker() -> None:
     pytest.importorskip("ray")
     from arctic_platform.common import deepspeed_worker as deepspeed_worker_module
@@ -414,7 +627,7 @@ def test_payload_can_skip_unused_gradient_norm_collection() -> None:
     assert payload["training_config"]["debug"]["gradient_norms_per_param"] is False
 
 
-def test_payload_overrides_deepspeed_gas_for_arm_microbatches() -> None:
+def test_payload_preserves_configured_deepspeed_accumulation() -> None:
     payload = build_payload(
         {
             "n_gpus": 4,
@@ -426,12 +639,11 @@ def test_payload_overrides_deepspeed_gas_for_arm_microbatches() -> None:
         },
         "model",
         42,
-        gradient_accumulation_steps=4,
     )
 
     ds_config = payload["training_config"]["ds_config"]
-    assert ds_config["gradient_accumulation_steps"] == 4
-    assert ds_config["train_batch_size"] == 16
+    assert ds_config["gradient_accumulation_steps"] == 1
+    assert ds_config["train_batch_size"] == 4
 
 
 def test_payload_caps_large_microbatch_budget_at_64k() -> None:
@@ -467,14 +679,14 @@ def test_payload_preserves_smaller_microbatch_budget() -> None:
     assert payload["training_config"]["mb_spec"]["max_tokens_per_mb"] == 10240
 
 
-def test_payload_uses_microbatch_budget_for_deepep_chunks() -> None:
+def test_payload_does_not_choose_deepep_chunks() -> None:
     payload = build_payload(
         {"ep_size": 4, "mb_spec": {"max_tokens_per_mb": 10240}},
         "model",
         42,
     )
 
-    assert payload["training_config"]["deepep_token_chunk_size"] == 10240
+    assert "deepep_token_chunk_size" not in payload["training_config"]
 
 
 def test_pool_is_the_local_devices_when_the_harness_owns_the_gateway(monkeypatch) -> None:

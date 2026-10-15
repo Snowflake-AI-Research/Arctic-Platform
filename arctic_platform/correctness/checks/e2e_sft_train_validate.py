@@ -58,6 +58,7 @@ from typing import Tuple
 
 import torch
 
+from arctic_platform.client import CortexConfig
 from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
 
 from ..harness import gsm8k
@@ -72,12 +73,14 @@ from ..harness.dss_driver import gateway
 from ..harness.dss_driver import pack
 from ..harness.dss_driver import pack_logit_aligned
 from ..harness.dss_driver import running_job
+from ..harness.hosted import require_local_cortex_gateway
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
 from ..harness.seeds import SEED
 from ..harness.spec import tolerance_text
+from ..harness.workdir import require_data_fast_path
 from ..reference.model_features import uses_mixer_packing
 from .inference_checkpoint_loss import TRAIN_SPLIT
 from .inference_checkpoint_loss import VALIDATION_SPLIT
@@ -200,20 +203,6 @@ def write_replay_manifest(replay: Replay, path: Path) -> Path:
     return path
 
 
-def reference_optimizer_backend(cfg) -> str:
-    """The backend the product resolves for this optimizer block.
-
-    Qwen training defaults AdamW to DeepSpeed FusedAdam. An explicit torch name or ``fused: false`` keeps the
-    independent PyTorch implementation; the trajectory must otherwise use the product backend because its scalar
-    rounding compounds across every step.
-    """
-    optimizer = cfg.training["optimizer"]
-    name = str(optimizer.get("name", "AdamW")).strip().lower().replace("-", "_")
-    if name == "torch_adamw" or optimizer.get("fused") is False:
-        return "torch"
-    return "fused_adam"
-
-
 def reference_command(
     ctx, replay: Replay, manifest: Path, out_path: Path, peft_adapter_path: Path | None
 ) -> List[str]:
@@ -224,12 +213,13 @@ def reference_command(
     gateway claims the node's GPUs.
     """
     training = ctx.cfg.effective_training
+    model_path = reference_model_path(ctx)
     command = [
         sys.executable,
         "-m",
         "arctic_platform.correctness.reference.sft_trajectory",
         "--model",
-        str(ctx.spec.model.cache_path),
+        model_path,
         "--replay",
         str(manifest),
         "--out",
@@ -250,11 +240,11 @@ def reference_command(
         json.dumps(ctx.cfg.training["optimizer"], sort_keys=True),
         "--optimizer-dtype",
         ctx.cfg.optimizer_dtype,
-        "--optimizer-backend",
-        reference_optimizer_backend(ctx.cfg),
         "--deterministic",
     ]
-    if uses_mixer_packing(ctx.spec.model.cache_path):
+    if getattr(ctx, "local_gateway_full_model", False):
+        command += ["--optimizer-chunk-elements", "1048576"]
+    if uses_mixer_packing(model_path):
         command.append("--mixer-packing")
     if training.get("fp32_lm_head", False):
         command.append("--fp32-lm-head")
@@ -319,22 +309,48 @@ def run_reference_trajectory(ctx, replay: Replay, workdir: Path, peft_adapter_pa
     return payload
 
 
+def reference_model_path(ctx) -> str:
+    """Use the independently validated full snapshot only in explicit local-gateway mode."""
+    if not getattr(ctx, "local_gateway_full_model", False):
+        return ctx.spec.model.cache_path
+    backend = getattr(ctx, "client_backend", None)
+    if not isinstance(backend, CortexConfig):
+        raise ValueError("full-model e2e requires an existing local Cortex gateway")
+    require_local_cortex_gateway(backend)
+    model_path = getattr(ctx, "local_full_model_path", None)
+    if not isinstance(model_path, str) or not model_path:
+        raise ValueError("full-model e2e requires a validated local full-model snapshot")
+    return str(require_data_fast_path(model_path, label="full-model e2e reference"))
+
+
 def run_dss_trajectory(ctx, replay: Replay, workdir: Path) -> Tuple[List[float], "torch.Tensor"]:
     """The same replay through Arctic Platform at the config's own topology, then the held-out forward.
 
     One job for the whole trajectory: a job restarted mid-run would reload the checkpoint, and the point
     of a hundred steps is that step 100 stands on the ninety-nine before it.
     """
+    backend = getattr(ctx, "client_backend", None)
+    model_name = reference_model_path(ctx)
+    if isinstance(backend, CortexConfig):
+        if getattr(ctx, "local_gateway_full_model", False):
+            model_name = ctx.cfg.model_name
+        else:
+            model_name = getattr(ctx, "target_model_name", None)
+            if not model_name:
+                raise ValueError("e2e comparison requires a validated published Cortex fixture")
     provider = str(ctx.cfg.training.get("model_provider", "huggingface"))
     training_bodies, validation_body = request_bodies(replay, model_provider=provider)
+    if isinstance(backend, CortexConfig):
+        # Cortex forward returns logprobs without the on-prem processing option.
+        validation_body["processing"].pop("return_logprobs")
     learning_rate = configured_learning_rate(ctx.cfg)
-    payload = build_payload(
-        ctx.cfg.training, ctx.spec.model.cache_path, SEED, attn_implementation=ctx.attn_implementation
-    )
+    payload = build_payload(ctx.cfg.training, model_name, SEED, attn_implementation=ctx.attn_implementation)
+    if isinstance(backend, CortexConfig) and ctx.cfg.gpu_type is not None:
+        payload["hardware"] = ctx.cfg.gpu_type.upper()
     # ``serve_gateway`` writes its hostfile into the directory it is handed and does not create it.
     gateway_dir = workdir / "gateway"
     gateway_dir.mkdir(parents=True, exist_ok=True)
-    with gateway(gateway_dir, ctx.cfg.n_gpus) as url:
+    with gateway(gateway_dir, ctx.cfg.n_gpus, backend=backend) as url:
         with running_job(url, payload) as job_id:
             losses = [
                 fwd_bwd_step(url, job_id, body, learning_rate=learning_rate).avg_loss for body in training_bodies
@@ -510,7 +526,7 @@ def run(ctx) -> List[TestResult]:
 def _run(ctx) -> TestResult:
     import torch
 
-    model_path = ctx.spec.model.cache_path
+    model_path = reference_model_path(ctx)
     tokenizer = gsm8k.load_tokenizer(model_path)
     pad_id = gsm8k.padding_token_id(tokenizer)
     rows_per_step = configured_rows_per_step(ctx.cfg)

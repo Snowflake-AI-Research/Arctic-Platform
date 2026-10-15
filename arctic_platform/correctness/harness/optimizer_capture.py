@@ -35,6 +35,23 @@ from arctic_platform.correctness.harness.model_state_capture import ModelStateCa
 _OPTIMIZER_CAPTURE_WORKER: Any | None = None
 
 
+def _optimizer_capture_debug_config(job_config: dict) -> dict[str, Any]:
+    debug_config: dict[str, Any] = {}
+    for section in ("training_config", "ds_worker_config"):
+        config = job_config.get(section)
+        if config is None:
+            continue
+        if not isinstance(config, dict):
+            raise TypeError(f"{section} must be a dict")
+        debug = config.get("debug")
+        if debug is None:
+            continue
+        if not isinstance(debug, dict):
+            raise TypeError(f"{section}.debug must be a dict")
+        debug_config.update(debug)
+    return debug_config
+
+
 def _publish_optimizer_capture(workers: list[Any], manifest: str) -> None:
     import ray
 
@@ -71,7 +88,6 @@ def _optimizer_capture_worker_class() -> Any:
     import ray
 
     from arctic_platform.common import deepspeed_worker as deepspeed_worker_module
-    from arctic_platform.common.deepspeed_worker import _worker_debug_config
 
     base_worker = deepspeed_worker_module.DeepSpeedWorker.__ray_metadata__.modified_class
 
@@ -80,7 +96,7 @@ def _optimizer_capture_worker_class() -> Any:
         """Add optimizer-state artifact capture for correctness harness jobs only."""
 
         def initialize(self, master_addr: str, job_config: dict) -> bool:
-            debug_config = _worker_debug_config(job_config)
+            debug_config = _optimizer_capture_debug_config(job_config)
             optimizer_state_output_dir = debug_config.get("optimizer_state_output_dir")
             if optimizer_state_output_dir is not None:
                 optimizer_state_output_dir = os.fspath(optimizer_state_output_dir)

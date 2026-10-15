@@ -35,16 +35,12 @@ DEFAULT_SEED = 42
 # and ``ds_worker_config`` / ``ModelSpec.parallelism.sequence_parallel`` carry
 # it on the worker-shaped configs.
 _DS_WORKER_SP_PATHS: tuple[tuple[str, ...], ...] = (
-    ("ds_worker_config", "sp_size"),
     ("ds_worker_config", "sequence_parallel"),
     ("ds_worker_config", "sequence_parallel_size"),
     ("ds_worker_config", "parallelism", "sequence_parallel"),
 )
 _TRAINING_SP_PATHS: tuple[tuple[str, ...], ...] = (
     ("training_config", "sp_size"),
-    ("training_config", "ds_worker_config", "sp_size"),
-    ("training_config", "ds_worker_config", "sequence_parallel"),
-    ("training_config", "ds_worker_config", "sequence_parallel_size"),
     ("ds_config", "sequence_parallel_size"),
 )
 _LOG_PROB_SP_PATH: tuple[str, ...] = ("log_prob_config", "sequence_parallel_size")
@@ -160,8 +156,8 @@ def sp_size_from_job_config(job_config: Any) -> int:
 
 
 class GenerateRequest(BaseModel):
-    prompts: list[str | list[int]]
-    sampling_params: dict[str, Any] | list[dict[str, Any] | None] | None = None
+    prompts: list[str]
+    sampling_params: dict[str, Any] | None = None
     routing_key: Any = None
     strict: bool = False
 
@@ -214,15 +210,9 @@ def build_model_config(
     ModelConfig, which expands them into real engine kwargs in
     ``ModelConfig.to_engine_kwargs()``.
     """
-    replay = (arctic_inference_config or {}).get("router_replay") or {}
-    if replay.get("enabled"):
-        from arctic_platform.inference.server.config import ModelConfig
-    else:
-        from arctic_inference.server.config import ModelConfig
+    from arctic_inference.server.config import ModelConfig
 
     cfg = dict(vllm_config or {})
-    if replay.get("enabled"):
-        cfg["enable_return_routed_experts"] = True
     cfg["model"] = model_name
     known_fields = set(ModelConfig.model_fields.keys())
     cfg.update(parse_arctic_inference_rollout(arctic_inference_config, known_fields))

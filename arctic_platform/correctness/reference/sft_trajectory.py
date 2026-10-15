@@ -156,6 +156,7 @@ def run(
     learning_rate: float,
     gradient_clipping: float | None,
     optimizer_dtype: str = "float32",
+    optimizer_chunk_elements: int | None = None,
     token_budget: int = 65536,
     ce_chunk: int = 2048,
     dtype: Optional[str] = "bfloat16",
@@ -169,7 +170,6 @@ def run(
     seed: int = 0,
     lm_head_token_chunk_size: int | None = None,
     lm_head_vocab_chunk_size: int = 8192,
-    optimizer_backend: str = "torch",
     device: str = "cuda",
 ) -> TrajectoryResult:
     """Train every batch in order through one engine and one optimizer, then score the held-out batch."""
@@ -191,7 +191,7 @@ def run(
         learning_rate=learning_rate,
         gradient_clipping=gradient_clipping,
         optimizer_dtype=optimizer_dtype,
-        optimizer_backend=optimizer_backend,
+        optimizer_chunk_elements=optimizer_chunk_elements,
     )
     torch.cuda.reset_peak_memory_stats(device)
 
@@ -264,7 +264,6 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--learning-rate", type=float, required=True)
     parser.add_argument("--gradient-clipping", type=float)
     parser.add_argument("--optimizer-dtype", choices=("float32", "bfloat16"), default="float32")
-    parser.add_argument("--optimizer-backend", choices=("torch", "fused_adam"), default="torch")
     parser.add_argument("--token-budget", type=int, default=65536)
     parser.add_argument("--ce-chunk", type=int, default=2048)
     parser.add_argument("--dtype", default="bfloat16")
@@ -291,6 +290,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--lm-head-token-chunk", type=int)
     parser.add_argument("--lm-head-vocab-chunk", type=int, default=8192)
+    parser.add_argument("--optimizer-chunk-elements", type=int)
     parser.add_argument("--peft-config", help="JSON PEFT config to apply before the run")
     parser.add_argument("--peft-adapter", help="Arctic Platform-initialized PEFT adapter directory")
     parser.add_argument(
@@ -327,7 +327,7 @@ def main() -> None:
         learning_rate=args.learning_rate,
         gradient_clipping=args.gradient_clipping,
         optimizer_dtype=args.optimizer_dtype,
-        optimizer_backend=args.optimizer_backend,
+        optimizer_chunk_elements=args.optimizer_chunk_elements,
         token_budget=args.token_budget,
         ce_chunk=args.ce_chunk,
         dtype=args.dtype,

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Calibration uses regression's per-arm accumulation and request packing."""
+"""Calibration preserves the written engine config and regression's plain requests."""
 
 import contextlib
 from copy import deepcopy
@@ -32,7 +32,7 @@ from arctic_platform.correctness.harness.spec import ArmSpec
 @pytest.mark.parametrize("slots,sp_size", [(8, 1), (16, 1), (8, 8), (16, 8)])
 @pytest.mark.parametrize("provider", ["huggingface", "prime_rl"])
 @pytest.mark.parametrize("reviewed_arms", [False, True])
-def test_calibration_uses_arm_specific_accumulation_and_identical_work(
+def test_calibration_preserves_config_accumulation_and_identical_work(
     monkeypatch, tmp_path, slots, sp_size, provider, reviewed_arms
 ):
     training = {
@@ -92,25 +92,23 @@ def test_calibration_uses_arm_specific_accumulation_and_identical_work(
     assert len(transports) == 2
     assert raw == 0.0 and where == "gas1 loss at iteration 1"
     for arm, transport in zip(definitions, transports, strict=True):
-        gas = arm.microbatches(64, slots // sp_size)
         assert transport.workdir == tmp_path / arm.name
         assert transport.options == {
             "slots": slots,
             "attn_implementation": "flash_attention_3",
             "determinism": "off",
-            "gradient_accumulation_steps": gas,
         }
         assert len(transport.jobs) == 3
         for job in transport.jobs:
             assert len(job) == 10
             for iteration, (body, rate) in enumerate(job, start=1):
                 batch = build_batch(arm.name, arm.global_batch_size, arm.max_seq_len, 128, seed=SEED + iteration)
-                wires = body["batch"] if isinstance(body["batch"], list) else [body["batch"]]
-                assert len(wires) == gas
+                assert isinstance(body["batch"], dict)
+                wire = body["batch"]
                 for field in ("input_ids", "position_ids"):
-                    assert torch.equal(torch.cat([wire[field] for wire in wires]), getattr(batch, field))
+                    assert torch.equal(wire[field], getattr(batch, field))
                 labels = batch.shifted_labels() if provider == "prime_rl" else batch.labels
-                assert torch.equal(torch.cat([wire["labels"] for wire in wires]), labels)
+                assert torch.equal(wire["labels"], labels)
                 assert body["processing"] == {"loss_fn": "sft"}
                 assert rate == checkpoint_resume.LEARNING_RATE
         for run in transport.jobs[1:]:

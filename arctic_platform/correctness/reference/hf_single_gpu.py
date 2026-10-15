@@ -45,6 +45,8 @@ from typing import Optional
 
 import torch
 
+from arctic_platform.correctness.harness.workdir import require_data_fast_path
+
 IGNORE_INDEX = -100
 
 
@@ -71,15 +73,15 @@ class ForwardBackwardResult:
     skipped_no_grad: List[str] = field(default_factory=list)
 
 
-def _build_liger_fused_cross_entropy():
-    """Build the same fp32-accumulating fused CE used by the Arctic Platform PrimeRL MoE head."""
+def _build_liger_fused_cross_entropy(*, fp32_lm_head: bool):
+    """Use the DSS reference's explicit LM-head precision choice."""
     import torch
     from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 
     return LigerFusedLinearCrossEntropyLoss(
         ignore_index=IGNORE_INDEX,
         reduction="mean",
-        accum_dtype=torch.float32,
+        accum_dtype=torch.float32 if fp32_lm_head else None,
     )
 
 
@@ -271,7 +273,7 @@ def forward_backward(
             raise ValueError(f"reference does not support fused_cross_entropy={fused_cross_entropy!r}")
         if lm_head_token_chunk_size is not None:
             raise ValueError("fused cross-entropy and chunked LM-head logprobs are mutually exclusive")
-        fused_ce = _build_liger_fused_cross_entropy()
+        fused_ce = _build_liger_fused_cross_entropy(fp32_lm_head=fp32_lm_head)
 
     input_ids = batch.input_ids.to(device)
     # The batch carries HuggingFace-convention labels. The Arctic Platform driver pre-shifts them for PrimeRL before
@@ -427,6 +429,8 @@ def run(
     optimizer_output_dir: str | None = None,
 ) -> ReferenceResult:
     """Forward-backward the whole request and return one L2 gradient norm per parameter."""
+    if optimizer_output_dir is not None:
+        optimizer_output_dir = str(require_data_fast_path(optimizer_output_dir, label="reference optimizer output"))
     import torch
 
     engine = build_engine(

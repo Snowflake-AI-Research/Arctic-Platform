@@ -48,335 +48,6 @@ from arctic_platform.model import build_model
 
 logger = logging.getLogger(__name__)
 
-_COMPOSITE_NAME_PREFIXES = (("model.", "model.language_model."), ("", "language_model."))
-_HF_CONFIG_FILES = ("config.json", "generation_config.json")
-_HF_INDEX_FILE = "model.safetensors.index.json"
-_DTYPE_BYTES = {
-    "F64": 8,
-    "I64": 8,
-    "U64": 8,
-    "F32": 4,
-    "I32": 4,
-    "U32": 4,
-    "F16": 2,
-    "BF16": 2,
-    "I16": 2,
-    "U16": 2,
-    "F8_E4M3": 1,
-    "F8_E5M2": 1,
-    "I8": 1,
-    "U8": 1,
-    "BOOL": 1,
-}
-
-
-def _safetensors_names(model_dir: str) -> dict[str, str]:
-    """Map tensor names to shard names for a model directory."""
-    from safetensors import safe_open
-
-    names: dict[str, str] = {}
-    for shard in sorted(os.listdir(model_dir)):
-        if shard.endswith(".safetensors"):
-            with safe_open(os.path.join(model_dir, shard), framework="pt") as handle:
-                names.update({name: shard for name in handle.keys()})
-    return names
-
-
-def _canonical_hf_export_name(name: str) -> str:
-    """Remove activation-checkpoint wrapper segments from a Hugging Face parameter name."""
-    return name.replace("._checkpoint_wrapped_module", "")
-
-
-def _canonicalize_peft_adapter_checkpoint(hf_dir: str, adapter_names) -> None:
-    """Canonicalize adapter keys after PEFT selects tensors by live module names."""
-    import tempfile
-
-    from safetensors import safe_open
-    from safetensors.torch import save_file
-
-    for adapter_name in adapter_names:
-        directory = hf_dir if adapter_name == "default" else os.path.join(hf_dir, adapter_name)
-        path = os.path.join(directory, "adapter_model.safetensors")
-        with safe_open(path, framework="pt") as handle:
-            keys = list(handle.keys())
-            metadata = handle.metadata()
-            canonical = [_canonical_hf_export_name(key) for key in keys]
-            if not keys:
-                raise ValueError(f"PEFT exported no adapter tensors: {path}")
-            if len(set(canonical)) != len(keys):
-                raise ValueError(f"PEFT export has duplicate canonical adapter names: {path}")
-            if canonical == keys:
-                continue
-            tensors = {name: handle.get_tensor(key) for key, name in zip(keys, canonical, strict=True)}
-        with tempfile.NamedTemporaryFile(dir=directory, prefix=".adapter-export-", delete=False) as temporary:
-            temporary_path = temporary.name
-        try:
-            save_file(tensors, temporary_path, metadata=metadata)
-            os.replace(temporary_path, path)
-        finally:
-            if os.path.exists(temporary_path):
-                os.unlink(temporary_path)
-
-
-def _composite_renames(names, checkpoint_names: set[str]) -> dict[str, str]:
-    """Map text-only trained names onto a composite source checkpoint."""
-    checkpoint_names = {_canonical_hf_export_name(name) for name in checkpoint_names}
-    renames: dict[str, str] = {}
-    unmapped: list[str] = []
-    for name in names:
-        if name in checkpoint_names:
-            continue
-        for old, new in _COMPOSITE_NAME_PREFIXES:
-            if name.startswith(old) and new + name[len(old) :] in checkpoint_names:
-                renames[name] = new + name[len(old) :]
-                break
-        else:
-            unmapped.append(name)
-    if not renames:
-        return {}
-    unmapped = [name for name in unmapped if name != "lm_head.weight"]
-    if unmapped:
-        examples = ", ".join(unmapped[:10])
-        raise RuntimeError(
-            f"checkpoint name translation mapped {len(renames)} name(s) but not {len(unmapped)} (e.g. {examples})"
-        )
-    return renames
-
-
-def _hf_config_class_name(model_type: object) -> str | None:
-    """Return the Hugging Face config class name registered for ``model_type``."""
-    if not isinstance(model_type, str) or not model_type:
-        return None
-    from transformers import AutoConfig
-
-    try:
-        return type(AutoConfig.for_model(model_type)).__name__
-    except (AttributeError, KeyError, OSError, ValueError):
-        return None
-
-
-def _read_hf_config(model_dir: str) -> dict | None:
-    import json
-
-    path = os.path.join(model_dir, _HF_CONFIG_FILES[0])
-    if not os.path.isfile(path):
-        return None
-    with open(path, encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def restore_source_weight_layout(source_model_dir: str, out_dir: str) -> bool:
-    """Complete a text-only weights export into its composite source checkpoint layout."""
-    import json
-
-    from safetensors import safe_open
-    from safetensors.torch import save_file
-
-    source_config = _read_hf_config(source_model_dir)
-    saved_config = _read_hf_config(out_dir)
-    if source_config is None or saved_config is None:
-        return False
-    if "text_config" not in source_config:
-        return False
-    source = _safetensors_names(source_model_dir)
-    saved = _safetensors_names(out_dir)
-    if not source or not saved:
-        return False
-    saved_architectures = saved_config.get("architectures") or []
-    saved_is_text_model = "text_config" not in saved_config or any(
-        str(architecture).endswith("ForCausalLM") for architecture in saved_architectures
-    )
-    source_class = _hf_config_class_name(source_config.get("model_type"))
-    saved_class = _hf_config_class_name(saved_config.get("model_type"))
-    nested_text = saved_config.get("text_config")
-    nested_class = _hf_config_class_name(nested_text.get("model_type")) if isinstance(nested_text, dict) else None
-    # vLLM Qwen3_5ProcessingInfo.get_hf_config accepts Qwen3_5Config and rejects Qwen3_5TextConfig.
-    engine_requires_qwen3_5_config = source_class == "Qwen3_5Config" and (
-        saved_class == "Qwen3_5TextConfig" or (saved_class == "Qwen3_5Config" and nested_class == "Qwen3_5TextConfig")
-    )
-    if engine_requires_qwen3_5_config:
-        saved_is_text_model = False
-    if saved_is_text_model:
-        source_layout: set[str] = set()
-        saved_layout = {name for name in saved if not name.startswith(("model.visual.", "visual."))}
-        renames = {}
-        for name in saved_layout:
-            if name.startswith("model.language_model."):
-                renames[name] = "model." + name.removeprefix("model.language_model.")
-            elif name.startswith("language_model."):
-                renames[name] = name.removeprefix("language_model.")
-    else:
-        source_layout = set(source)
-        saved_layout = {
-            name
-            for name in saved
-            if name in source_layout
-            or any(
-                name.startswith(old) and new + name[len(old) :] in source_layout
-                for old, new in _COMPOSITE_NAME_PREFIXES
-            )
-            or name == "lm_head.weight"
-        }
-        renames = _composite_renames(saved_layout, source_layout)
-    excluded = set(saved) - saved_layout
-    weight_map: dict[str, str] = {}
-    total_size = 0
-
-    def account(handle, keys, shard_name: str) -> None:
-        nonlocal total_size
-        for key in keys:
-            weight_map[renames.get(key, key)] = shard_name
-            sliced = handle.get_slice(key)
-            numel = 1
-            for dimension in sliced.get_shape():
-                numel *= dimension
-            total_size += numel * _DTYPE_BYTES[sliced.get_dtype()]
-
-    for shard in sorted(set(saved.values())):
-        path = os.path.join(out_dir, shard)
-        target = "model-00001-of-00001.safetensors" if shard == "model.safetensors" else shard
-        with safe_open(path, framework="pt") as handle:
-            keys = [key for key in handle.keys() if key not in excluded]
-            account(handle, keys, target)
-            tensors = (
-                {renames.get(key, key): handle.get_tensor(key) for key in keys}
-                if any(key in renames or key in excluded for key in handle.keys())
-                else None
-            )
-        if tensors is not None:
-            os.remove(path)
-            if tensors:
-                save_file(tensors, os.path.join(out_dir, target), metadata={"format": "pt"})
-        elif target != shard:
-            os.replace(path, os.path.join(out_dir, target))
-
-    source_only = sorted(
-        name for name in source_layout if name not in weight_map and _canonical_hf_export_name(name) not in weight_map
-    )
-    if source_only:
-        extra = "model-source-only.safetensors"
-        tensors = {}
-        by_shard: dict[str, list[str]] = {}
-        for name in source_only:
-            by_shard.setdefault(source[name], []).append(name)
-        for shard, names in sorted(by_shard.items()):
-            with safe_open(os.path.join(source_model_dir, shard), framework="pt") as handle:
-                tensors.update({name: handle.get_tensor(name) for name in names})
-                account(handle, names, extra)
-        save_file(tensors, os.path.join(out_dir, extra), metadata={"format": "pt"})
-    with open(os.path.join(out_dir, _HF_INDEX_FILE), "w", encoding="utf-8") as handle:
-        json.dump({"metadata": {"total_size": total_size}, "weight_map": dict(sorted(weight_map.items()))}, handle)
-    config_path = os.path.join(out_dir, _HF_CONFIG_FILES[0])
-    if saved_class == "Qwen3_5TextConfig" and source_class == "Qwen3_5Config":
-        with open(config_path, "w", encoding="utf-8") as handle:
-            json.dump(source_config, handle)
-    elif saved_is_text_model and isinstance(nested_text, dict):
-        text_config = dict(nested_text)
-        text_config["architectures"] = saved_architectures
-        with open(config_path, "w", encoding="utf-8") as handle:
-            json.dump(text_config, handle)
-    logger.info(
-        "weights-only save: completed source layout (%d renamed, %d excluded, %d copied from %s)",
-        len(renames),
-        len(excluded),
-        len(source_only),
-        source_model_dir,
-    )
-    return True
-
-
-def replace_exported_qwen3_5_text_config(source_model_dir: str | None, out_dir: str) -> bool:
-    """Rewrite an exported ``Qwen3_5TextConfig`` to ``Qwen3_5Config``.
-
-    ``AutoModelForCausalLM`` maps model type ``qwen3_5`` to ``Qwen3_5ForCausalLM``, and that class
-    serializes ``Qwen3_5TextConfig``. The serving engine resolves ``Qwen3_5ForCausalLM`` to
-    ``Qwen3_5ForConditionalGeneration`` and accepts only ``Qwen3_5Config``. The saved text fields stay the
-    exported text config; vision fields come from the source checkpoint when that checkpoint is ``qwen3_5``.
-    """
-    import json
-
-    from transformers import Qwen3_5Config
-
-    saved = _read_hf_config(out_dir)
-    if not isinstance(saved, dict) or saved.get("model_type") != "qwen3_5_text":
-        return False
-    source = _read_hf_config(source_model_dir) if source_model_dir else None
-    text_config = dict(saved)
-    architectures = text_config.pop("architectures", None)
-    kwargs: dict = {"text_config": text_config}
-    if isinstance(source, dict) and source.get("model_type") == "qwen3_5":
-        for key in (
-            "vision_config",
-            "image_token_id",
-            "video_token_id",
-            "vision_start_token_id",
-            "vision_end_token_id",
-            "tie_word_embeddings",
-        ):
-            if key in source:
-                kwargs[key] = source[key]
-    exported = Qwen3_5Config(**kwargs).to_dict()
-    if architectures:
-        exported["architectures"] = architectures
-    with open(os.path.join(out_dir, _HF_CONFIG_FILES[0]), "w", encoding="utf-8") as handle:
-        json.dump(exported, handle)
-    return True
-
-
-def _copy_source_sidecars(source_model_dir: str, out_dir: str) -> None:
-    """Copy non-weight source assets without replacing the exported model config."""
-    import shutil
-
-    for name in sorted(os.listdir(source_model_dir)):
-        source = os.path.join(source_model_dir, name)
-        target = os.path.join(out_dir, name)
-        if not os.path.isfile(source):
-            continue
-        lower = name.lower()
-        if lower.endswith((".safetensors", ".bin", ".pt", ".pth", ".index.json")):
-            continue
-        if name == "config.json" and os.path.isfile(target):
-            continue
-        shutil.copyfile(source, target)
-
-
-def _canonical_hf_export_state_dict(model, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Convert internal weights and remove activation-checkpoint wrappers before Hugging Face serialization."""
-    state_dict = {_canonical_hf_export_name(name): tensor for name, tensor in state_dict.items()}
-    is_prime_state_dict = getattr(model, "is_prime_state_dict", None)
-    if is_prime_state_dict is not None and is_prime_state_dict(state_dict):
-        state_dict = model.convert_to_hf(state_dict)
-    return state_dict
-
-
-def _gather_live_hf_export_state_dict(model, rank: int) -> dict[str, torch.Tensor] | None:
-    """Gather expert-parallel shards and return the complete live state on rank zero."""
-    import deepspeed.utils.groups as ds_groups
-
-    state_dict = {} if rank == 0 else None
-    for name, parameter in model.named_parameters():
-        group_name = getattr(parameter, "group_name", None)
-        if group_name is not None and getattr(parameter, "allreduce", True) is False:
-            group = ds_groups._get_expert_parallel_group(group_name)
-            local = parameter.detach().contiguous()
-            shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
-            dist.all_gather(shards, local, group=group)
-            if rank == 0:
-                state_dict[name] = torch.cat(shards, dim=0).cpu()
-        elif rank == 0:
-            state_dict[name] = parameter.detach().cpu()
-    return state_dict
-
-
-def _model_full_hf_export_state_dict(model, rank: int) -> dict[str, torch.Tensor] | None:
-    """Collect a model-provided full Hugging Face state dict on rank zero."""
-    iterator = getattr(model, "_iter_full_hf_weights", None)
-    if iterator is None:
-        return None
-    state_dict = dict(iterator())
-    return state_dict if rank == 0 else None
-
-
 # ---------------------------------------------------------------------------
 # Request / response models (mirrors dss-platform sftp_server)
 # ---------------------------------------------------------------------------
@@ -410,110 +81,17 @@ def make_model_gradient_checkpointing_compatible(model):
 # ---------------------------------------------------------------------------
 
 
-def _worker_debug_config(job_config: dict) -> dict:
-    """Resolve debug settings from native and legacy on-prem job payloads."""
-    training_debug = (job_config.get("training_config") or {}).get("debug") or {}
-    worker_debug = (job_config.get("ds_worker_config") or {}).get("debug") or {}
-    debug = {**training_debug, **worker_debug}
-    if "full_determinism" in job_config:
-        debug["full_determinism"] = job_config["full_determinism"]
-    return debug
-
-
-def _setup_model_parallel_groups(spec: ModelSpec) -> dict[str, Any]:
-    """Create the runtime process groups consumed by the native model loaders.
-
-    Sequence-parallel groups are contiguous blocks whose size divides the world. Expert groups remain node-local
-    contiguous blocks; ranks at the same position in each block form the expert-data-parallel replica groups that
-    DeepSpeed uses for gradient reduction and optimizer sharding.
-    """
-    import deepspeed.utils.groups as ds_groups
-    from deepspeed.runtime.sequence_parallel import parallel_state_sp as sp_mpu
-
-    ep_size = spec.parallelism.expert_parallel
-    sp_size = spec.parallelism.sequence_parallel
-    world_size = dist.get_world_size()
-    if world_size % ep_size:
-        raise ValueError(f"world_size={world_size} must be divisible by expert_parallel={ep_size}")
-
-    if sp_size == 1:
-        if ep_size > 1:
-            ds_groups._create_expert_and_data_parallel(ep_size)
-        return {
-            "ep_group": ds_groups._get_expert_parallel_group(f"ep_size_{ep_size}") if ep_size > 1 else None,
-            "sp_group": None,
-            "mpu": None,
-        }
-
-    if world_size % sp_size:
-        raise ValueError(f"world_size={world_size} must be divisible by sequence_parallel={sp_size}")
-    sp_mpu.initialize_sequence_parallel(sp_size)
-
-    ep_name = f"ep_size_{ep_size}"
-    rank = dist.get_rank()
-    if ep_size > 1:
-        for start in range(0, world_size, ep_size):
-            ranks = list(range(start, start + ep_size))
-            group = dist.new_group(ranks)
-            if rank in ranks:
-                ds_groups._EXPERT_PARALLEL_GROUP[ep_name] = group
-                ds_groups._EXPERT_PARALLEL_GROUP_RANKS[ep_name] = ranks
-        for offset in range(ep_size):
-            ranks = list(range(offset, world_size, ep_size))
-            group = dist.new_group(ranks)
-            if rank in ranks:
-                ds_groups._EXPERT_DATA_PARALLEL_GROUP[ep_name] = group
-                ds_groups._EXPERT_DATA_PARALLEL_GROUP_RANKS[ep_name] = ranks
-
-    ds_groups.mpu = sp_mpu
-    return {
-        "ep_group": ds_groups._get_expert_parallel_group(ep_name) if ep_size > 1 else None,
-        "sp_group": sp_mpu.get_sequence_parallel_group(),
-        "mpu": sp_mpu,
-    }
-
-
-def _deepspeed_init_kwargs(model, ds_config: dict, parallel_groups: dict[str, Any], has_optimizer: bool) -> dict:
-    """Build DeepSpeed initialization arguments with the runtime's model-parallel topology."""
-    kwargs = {"model": model, "config": ds_config}
-    mpu = parallel_groups.get("mpu")
-    if mpu is not None:
-        kwargs["mpu"] = mpu
-    if has_optimizer:
-        kwargs["model_parameters"] = model.parameters()
-    return kwargs
-
-
 async def spawn_and_initialize_workers(gpus, master_port, config_dict, actor_options):
     """Create DeepSpeed ranks and initialize them. Destroy every spawned actor if any step fails.
 
-    ``actor_options(rank)`` supplies ``DeepSpeedWorker.options``. Expert-parallel actors are reordered
-    into node-contiguous ranks before initialization. Rank zero's host is the rendezvous master.
+    ``actor_options(rank)`` is the kwargs for ``DeepSpeedWorker.options``. Rank 0's host is the
+    distributed rendezvous master so off-node ranks do not hang on their own localhost.
     """
     workers = []
     try:
         for rank in range(gpus):
             workers.append(DeepSpeedWorker.options(**actor_options(rank)).remote(rank, gpus, master_port))
-        hosts = await asyncio.gather(*[worker.get_ip.remote() for worker in workers])
-        ep_size = int((config_dict.get("ds_worker_config") or {}).get("ep_size", 1))
-        if ep_size > 1:
-            # DeepEP opens CUDA IPC handles within consecutive groups of at most eight ranks.
-            order = [index for host in dict.fromkeys(hosts) for index, value in enumerate(hosts) if value == host]
-            workers = [workers[index] for index in order]
-            hosts = [hosts[index] for index in order]
-            ipc_group_size = min(ep_size, 8)
-            if gpus % ep_size or any(
-                len(set(hosts[start : start + ipc_group_size])) != 1 for start in range(0, gpus, ipc_group_size)
-            ):
-                raise ValueError("expert-parallel CUDA IPC rank blocks must be node-local on each host")
-            await asyncio.gather(
-                *[
-                    worker.set_rank.remote(rank)
-                    for rank, (worker, original) in enumerate(zip(workers, order, strict=True))
-                    if rank != original
-                ]
-            )
-        master_addr = hosts[0]
+        master_addr = await workers[0].get_ip.remote()
         await asyncio.gather(*[w.initialize.remote(master_addr, config_dict) for w in workers])
     except Exception:
         await asyncio.gather(*[w.destroy.remote() for w in workers], return_exceptions=True)
@@ -534,20 +112,10 @@ class DeepSpeedWorker:
         self.engine = None
         self.sp_size = 1
         self._weight_sender = None
-        self._router_replay_group = None
-        self._router_replay_cache_rx = None
         self._on_gpu = True
-        self._gradient_norms_per_param = False
-        self._source_model_dir: str | None = None
 
     def get_ip(self) -> str:
         return self.my_addr
-
-    def set_rank(self, rank: int) -> None:
-        """Assign the node-contiguous rank before distributed initialization."""
-        if self.engine is not None:
-            raise RuntimeError("Cannot reassign the rank of an initialized worker")
-        self.rank = rank
 
     def initialize(self, master_addr: str, job_config: dict) -> bool:
         self.master_addr = master_addr
@@ -561,18 +129,8 @@ class DeepSpeedWorker:
             }
         )
 
-        debug_config = _worker_debug_config(job_config)
-        determinism_config = {"debug": debug_config}
-        from arctic_platform.model.implementations.debug.determinism import configure_full_determinism
-        from arctic_platform.model.implementations.debug.determinism import determinism_worker_env
-        from arctic_platform.model.implementations.debug.determinism import full_determinism_enabled
-        from arctic_platform.model.implementations.debug.determinism import resolve_seed
-
-        seed = resolve_seed(job_config.get("seed"), determinism_config)
-        os.environ.update(determinism_worker_env(determinism_config, seed))
-        if full_determinism_enabled(determinism_config):
-            enable_full_determinism(seed=seed)
-            configure_full_determinism(determinism_config)
+        if job_config.get("full_determinism", False):
+            enable_full_determinism(seed=job_config.get("seed", 42))
 
         # aws-ofi-nccl generates a per-process topology and hands it to NCCL by setting NCCL_TOPO_FILE to a
         # /proc/self/fd/<N> path (an in-memory fd). That handle is only valid in the process that created it: once
@@ -601,15 +159,7 @@ class DeepSpeedWorker:
         ds_worker_config = job_config.get("ds_worker_config") or {}
         ds_worker_config["world_size"] = self.world_size
         self.ds_worker_config = ds_worker_config
-        self._source_model_dir = model_name
         self.sp_size = sp_size_from_job_config(job_config)
-        gradient_norms_per_param = debug_config.get("gradient_norms_per_param", False)
-        if not isinstance(gradient_norms_per_param, bool):
-            raise TypeError(
-                "gradient_norms_per_param in the training debug config must be a bool, "
-                f"got {type(gradient_norms_per_param).__name__}"
-            )
-        self._gradient_norms_per_param = gradient_norms_per_param
 
         # Build the DeepSpeed config per job type. Training engines get an
         # optimizer; the reference/log-prob engine is forward-only and is
@@ -626,18 +176,17 @@ class DeepSpeedWorker:
 
         # HF load + patches via ModelSpec (world_size already injected above).
         spec = ModelSpec.from_ds_worker_config(model_name, ds_worker_config)
-        from arctic_platform.model.implementations.debug.determinism import maybe_partial_determinism_support
-
-        maybe_partial_determinism_support(model_name, spec.attn_implementation, ds_worker_config)
-        parallel_groups = _setup_model_parallel_groups(spec)
-        loaded = build_model(spec, parallel_groups=parallel_groups)
+        loaded = build_model(spec)
         model = loaded.model
 
         zorro_train_enable = ds_worker_config.get("zorro_train_enable", False)
         self.dedup_actor_model_once_patcher = getattr(model, "_arctic_zorro_once_patcher", None)
 
-        # Forward-only (log-prob) engines omit model parameters so DeepSpeed allocates no optimizer state.
-        init_kwargs = _deepspeed_init_kwargs(model, ds_config, parallel_groups, self._has_optimizer)
+        init_kwargs = dict(model=model, config=ds_config)
+        if self._has_optimizer:
+            # Forward-only (log-prob) engines are initialized without an
+            # optimizer so DeepSpeed allocates no optimizer state.
+            init_kwargs["model_parameters"] = model.parameters()
         self.engine, _, _, _ = deepspeed.initialize(**init_kwargs)
         self._device = get_accelerator().device_name(self.engine.local_rank)
 
@@ -795,8 +344,8 @@ class DeepSpeedWorker:
     def _inject_sft_global_token_meta(self, loss_fn: str, batch_data, meta_data: dict) -> None:
         """All-reduce valid-target count into ``meta["global_num_tokens"]`` + ``dp_size``.
 
-        The loss callback scales by the logical data-parallel degree. Under sequence parallelism, the SP ranks are
-        one logical replica and their label shards are summed into the global token denominator.
+        ``dp_size`` is ``world_size`` while shards stay disjoint. ``sp_size`` is
+        still validated against ``world_size``.
         Opt-in via ``SFT_GLOBAL_TOKEN_LOSS_FNS``. No-op when labels are absent.
         """
         from arctic_platform.sft.processor import SFT_GLOBAL_TOKEN_LOSS_FNS
@@ -805,7 +354,7 @@ class DeepSpeedWorker:
         if loss_fn not in SFT_GLOBAL_TOKEN_LOSS_FNS:
             return
 
-        local_tokens = count_valid_target_tokens(batch_data, meta_data)
+        local_tokens = count_valid_target_tokens(batch_data)
         if local_tokens is None:
             return
 
@@ -815,7 +364,8 @@ class DeepSpeedWorker:
             torch.distributed.all_reduce(tok, op=torch.distributed.ReduceOp.SUM)
             global_tokens = int(tok.item())
         meta_data["global_num_tokens"] = global_tokens
-        meta_data["dp_size"] = dp_sp_world_size(self.world_size, self.sp_size)
+        dp_sp_world_size(self.world_size, self.sp_size)
+        meta_data["dp_size"] = self.world_size
 
     def _forward_maybe_backward(self, batch: dict, backward: bool) -> dict:
         # torch.autograd.set_detect_anomaly(True)
@@ -838,8 +388,6 @@ class DeepSpeedWorker:
                 batch_data = [self._move_batch_to_device(mb, self._device) for mb in batch_data]
             else:
                 batch_data = self._move_batch_to_device(batch_data, self._device)
-            for replay_batch in batch_data if isinstance(batch_data, list) else [batch_data]:
-                self._consume_router_replay(replay_batch)
             if sft_profile.enabled() and torch.cuda.is_available():
                 torch.cuda.synchronize()
 
@@ -1045,83 +593,6 @@ class DeepSpeedWorker:
         timers.stop_and_print_elapsed(tname)
         return results
 
-    def _bf16_accumulated_gradients(self) -> dict[int, torch.Tensor] | None:
-        optimizer = getattr(self.engine, "optimizer", None)
-        parameter_groups = getattr(optimizer, "bf16_groups", None)
-        if parameter_groups is None:
-            return None
-        # BF16 param.grad is rank-local; the optimizer buffers hold reduced accumulated gradients.
-        return {
-            id(parameter): gradient.view_as(parameter)
-            for parameters, gradients, has_gradients in zip(
-                parameter_groups,
-                optimizer.fp32_groups_gradients,
-                optimizer.fp32_groups_has_gradients,
-                strict=True,
-            )
-            for parameter, gradient, has_gradient in zip(parameters, gradients, has_gradients, strict=True)
-            if has_gradient
-        }
-
-    def _per_parameter_gradient_norm_metrics(self) -> dict[str, Any]:
-        """Return one full-gradient norm per trainable parameter from rank zero."""
-        if not self._gradient_norms_per_param:
-            return {}
-
-        from deepspeed.utils import safe_get_full_grad
-
-        model = self.engine.module if hasattr(self.engine, "module") else self.engine
-        accumulated_gradients = self._bf16_accumulated_gradients()
-        norms: dict[str, float] = {}
-        for name, param in sorted(model.named_parameters(), key=lambda item: item[0]):
-            if not param.requires_grad:
-                continue
-            full_grad = (
-                accumulated_gradients.get(id(param))
-                if accumulated_gradients is not None
-                else safe_get_full_grad(param)
-            )
-            if full_grad is None:
-                continue
-            norms[name] = float(torch.linalg.vector_norm(full_grad.detach().float()))
-        if self.rank != 0:
-            return {}
-        return {"gradient_norms_per_param": norms}
-
-    def _per_global_expert_gradient_norm_metrics(self) -> dict[str, Any]:
-        """Return norms indexed by global expert for expert-parallel parameters from rank zero."""
-        if not self._gradient_norms_per_param:
-            return {}
-
-        import deepspeed.utils.groups as ds_groups
-        from deepspeed.utils import safe_get_full_grad
-
-        model = self.engine.module if hasattr(self.engine, "module") else self.engine
-        accumulated_gradients = self._bf16_accumulated_gradients()
-        norms: dict[str, list[float]] = {}
-        for name, param in sorted(model.named_parameters(), key=lambda item: item[0]):
-            if not param.requires_grad:
-                continue
-            group_name = getattr(param, "group_name", None)
-            if group_name is None or getattr(param, "allreduce", True) is not False:
-                continue
-            full_grad = (
-                accumulated_gradients.get(id(param))
-                if accumulated_gradients is not None
-                else safe_get_full_grad(param)
-            )
-            if full_grad is None or full_grad.dim() < 2:
-                continue
-            local = torch.linalg.vector_norm(full_grad.detach().float().flatten(1), dim=1).contiguous()
-            ep_group = ds_groups._get_expert_parallel_group(group_name)
-            shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
-            dist.all_gather(shards, local, group=ep_group)
-            if self.rank == 0:
-                norms[name] = [float(value) for value in torch.cat(shards)]
-        if self.rank != 0 or not norms:
-            return {}
-        return {"gradient_norms_per_expert": norms}
-
     def _is_bf16_zero_norm_assert(self, exc: BaseException) -> bool:
         """True only for BF16_Optimizer's bare ``assert all_groups_norm > 0.``."""
         return is_bf16_zero_norm_assert(exc, getattr(self.engine, "optimizer", None))
@@ -1142,21 +613,9 @@ class DeepSpeedWorker:
                 return
             raise
 
-    def _set_optimizer_learning_rate(self, learning_rate: float | None) -> None:
-        if learning_rate is None:
-            return
-        optimizer = getattr(self.engine, "optimizer", None)
-        if optimizer is None:
-            return
-        for group in optimizer.param_groups:
-            group["lr"] = float(learning_rate)
-
-    def step(self, learning_rate: float | None = None) -> dict:
+    def step(self) -> dict:
         from arctic_platform import sft_profile
 
-        self._set_optimizer_learning_rate(learning_rate)
-        gradient_norm_metrics = self._per_parameter_gradient_norm_metrics()
-        expert_gradient_norm_metrics = self._per_global_expert_gradient_norm_metrics()
         with sft_profile.timed("step"):
             self._engine_step()
             if sft_profile.enabled() and torch.cuda.is_available():
@@ -1168,10 +627,7 @@ class DeepSpeedWorker:
         if isinstance(grad_norm, torch.Tensor):
             grad_norm = grad_norm.item()
         metrics = dict(
-            global_steps=self.engine.global_steps,
             last_lr=self.engine.get_lr()[0],
-            **gradient_norm_metrics,
-            **expert_gradient_norm_metrics,
         )
         if grad_norm is not None:
             metrics["grad_norm"] = grad_norm
@@ -1182,11 +638,7 @@ class DeepSpeedWorker:
 
     def save_checkpoint(self, path: str, export_hf: bool = False) -> dict:
         """Save DeepSpeed checkpoint; optionally export HF weights to ``{path}/hf/`` (rank 0)."""
-        from arctic_platform.common.utils.expert_checkpoint import save_expert_parallel_weights
-
-        tag = f"global_step{self.engine.global_steps}"
-        self.engine.save_checkpoint(path, tag=tag)
-        save_expert_parallel_weights(self.engine.module, os.path.join(path, tag))
+        self.engine.save_checkpoint(path)
         hf_path = None
         if export_hf:
             hf_path = self.export_hf_checkpoint(path)
@@ -1196,51 +648,34 @@ class DeepSpeedWorker:
             "global_step": int(self.engine.global_steps),
         }
 
-    def routable_ip(self) -> str:
-        """Return this worker's address on the allocation network."""
-        from arctic_platform.common.ray_cluster import primary_ip
-
-        return primary_ip()
-
-    def export_node_checkpoint(self, path: str, peers: list[str]) -> list[str]:
-        """Copy checkpoint files written on this node to ``peers`` and open them here."""
-        from arctic_platform.common.utils.checkpoint import publish_node_checkpoint
-
-        return publish_node_checkpoint(path, peers)
-
-    def require_checkpoint_files(self, path: str, relative_paths: list[str]) -> None:
-        """Open every checkpoint file in ``relative_paths`` under ``path``."""
-        from arctic_platform.common.utils.checkpoint import require_checkpoint_files
-
-        require_checkpoint_files(path, relative_paths)
-
     def load_checkpoint(self, path: str) -> int:
         """Restore DeepSpeed state. Returns restored ``global_steps``, or 0 if none found."""
-        from arctic_platform.common.utils.expert_checkpoint import load_expert_parallel_weights
-
         load_path, _ = self.engine.load_checkpoint(path)
         if load_path is None:
             return 0
-        load_expert_parallel_weights(self.engine.module, os.path.dirname(load_path))
         return int(self.engine.global_steps)
 
     def export_hf_checkpoint(self, checkpoint_dir: str) -> str | None:
-        """Gather live weights and serialize a full HF model or PEFT adapter under ``hf/`` on rank zero."""
+        """Convert a DeepSpeed checkpoint dir to HF ``save_pretrained`` under ``hf/``.
+
+        Rank 0 only; other ranks return None after a barrier. Prefer DeepSpeed's
+        ``get_fp32_state_dict_from_zero_checkpoint``; fall back to gathering live params.
+        """
         import os
 
         hf_dir = os.path.join(checkpoint_dir, "hf")
-        model = self.engine.module
-        is_peft = bool(getattr(model, "peft_config", None))
-        use_model_iterator = not is_peft and hasattr(model, "_iter_full_hf_weights")
-        if use_model_iterator:
-            full_state_dict = _model_full_hf_export_state_dict(model, self.rank)
-        else:
-            full_state_dict = _gather_live_hf_export_state_dict(model, self.rank)
         if self.rank == 0:
             os.makedirs(hf_dir, exist_ok=True)
-            state_dict = full_state_dict
-            if not is_peft and not use_model_iterator:
-                state_dict = _canonical_hf_export_state_dict(model, state_dict)
+            model = self.engine.module
+            state_dict = None
+            try:
+                from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+
+                state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir)
+            except Exception:
+                logger.exception("zero_to_fp32 export failed; falling back to live gather")
+            if state_dict is None:
+                state_dict = {n: p.detach().cpu() for n, p in model.named_parameters()}
             try:
                 model.save_pretrained(hf_dir, state_dict=state_dict, safe_serialization=True)
             except TypeError:
@@ -1249,14 +684,9 @@ class DeepSpeedWorker:
                 if missing or unexpected:
                     logger.warning("HF export load_state_dict missing=%s unexpected=%s", missing, unexpected)
                 model.save_pretrained(hf_dir, safe_serialization=True)
-            if is_peft:
-                _canonicalize_peft_adapter_checkpoint(hf_dir, model.peft_config)
-            if self._source_model_dir and restore_source_weight_layout(self._source_model_dir, hf_dir):
-                _copy_source_sidecars(self._source_model_dir, hf_dir)
-            replace_exported_qwen3_5_text_config(self._source_model_dir, hf_dir)
             logger.info("Exported HF checkpoint to %s", hf_dir)
-        # The Ray server waits for every worker result, including rank zero's complete export. A distributed
-        # barrier here only leaves nonzero ranks inside NCCL while rank zero reconstructs the full fp32 state.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
         return hf_dir if self.rank == 0 else None
 
     @staticmethod
@@ -1275,170 +705,20 @@ class DeepSpeedWorker:
         """
         _, kwargs, _, _ = unpack_batch(batch)
         kwargs = {k: v.to(self._device) if torch.is_tensor(v) else v for k, v in kwargs.items()}
-        model = self.engine.module
         with torch.no_grad():
-            if getattr(model, "_dss_chunked_lm_head_logprobs", False) or getattr(
-                model, "_dss_native_lm_head_logprobs", False
-            ):
-                outputs = self.engine(**kwargs, dss_compute_logprobs=True)
-                token_log_probs = outputs["logprobs"] if isinstance(outputs, dict) else outputs.logprobs
-            else:
-                outputs = self.engine(**kwargs)
-                if isinstance(outputs, dict) and outputs.get("logprobs") is not None:
-                    token_log_probs = outputs["logprobs"]
-                else:
-                    logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
-                    shifted_ids = kwargs["input_ids"][:, 1:]
-                    token_log_probs = (
-                        torch.log_softmax(logits, dim=-1)[:, :-1].gather(-1, shifted_ids.unsqueeze(-1)).squeeze(-1)
-                    )
+            logits = self.engine(**kwargs).logits
+        log_probs = torch.log_softmax(logits, dim=-1)
+        shifted_ids = kwargs["input_ids"][:, 1:]
+        token_log_probs = log_probs[:, :-1].gather(-1, shifted_ids.unsqueeze(-1)).squeeze(-1)
         return token_log_probs.cpu()
 
     def max_param_bytes(self) -> int:
-        if getattr(self.engine.module, "_iter_full_hf_weights", None) is not None:
-            # Transfer conversion can fuse projections and gather EP shards.
-            return max((tensor.numel() * tensor.element_size() for _, tensor in self.get_weights()), default=0)
         max_bytes = 0
         for p in self.engine.module.parameters():
             elem_size = p.data.element_size()
             numel = p.ds_numel if hasattr(p, "ds_id") else p.data.numel()
             max_bytes = max(max_bytes, numel * elem_size)
         return max_bytes
-
-    def init_router_replay(
-        self,
-        master_addr: str,
-        master_port: int,
-        rank: int,
-        world_size: int,
-        max_cache_bytes: int = 16 * 1024**3,
-        is_server: bool = False,
-    ) -> dict:
-        from arctic_platform.inference.server.router_replay import RouterReplayCacheRX
-        from arctic_platform.inference.server.router_replay import init_router_replay_group
-
-        if self._router_replay_group is not None:
-            self._router_replay_group.close()
-            self._router_replay_group = None
-        if self._router_replay_cache_rx is None:
-            self._router_replay_cache_rx = RouterReplayCacheRX(
-                device=torch.device(self._device), max_bytes=max_cache_bytes
-            )
-        else:
-            self._router_replay_cache_rx.clear()
-        self._router_replay_group = init_router_replay_group(
-            role="receiver",
-            master_addr=master_addr,
-            master_port=master_port,
-            rank=rank,
-            world_size=world_size,
-            device=torch.device(self._device),
-            is_server=is_server,
-        )
-        return {"status": "ok", "rank": rank, "world_size": world_size}
-
-    def recv_router_replay(
-        self, sample_ids: list[str], discard: bool = True, replay_meta: list[dict] | None = None
-    ) -> dict:
-        if self._router_replay_group is None or self._router_replay_cache_rx is None:
-            raise RuntimeError("router-replay receiver is not initialized")
-        result = self._router_replay_group.recv(
-            self._router_replay_cache_rx, needed_sample_ids=sample_ids, discard=discard
-        )
-        validations = []
-        if replay_meta is not None:
-            for row, sample_id in enumerate(sample_ids):
-                meta = replay_meta[row] if row < len(replay_meta) else {}
-                cached = self._router_replay_cache_rx.peek(sample_id)
-                shape = cached.get("shape") if isinstance(cached, dict) else None
-                valid_shape = (
-                    isinstance(shape, (list, tuple))
-                    and len(shape) == 3
-                    and all(type(dimension) is int and dimension > 0 for dimension in shape)
-                )
-                expected = meta.get("capture_len") if isinstance(meta, dict) else None
-                reason = None
-                if cached is None:
-                    reason = "cache_missing"
-                elif not valid_shape:
-                    reason = "capture_shape"
-                elif type(expected) is not int or expected <= 0:
-                    reason = "metadata_capture_len"
-                elif shape[0] != expected:
-                    reason = "capture_len"
-                validations.append(
-                    {
-                        "valid": reason is None,
-                        "reason": reason,
-                        "rank": self.rank,
-                        "row": row,
-                        "replay_id": sample_id,
-                        "shape": shape,
-                        "capture_len": shape[0] if valid_shape else None,
-                        "expected_capture_len": expected,
-                    }
-                )
-        result["validations"] = validations
-        return result
-
-    def close_router_replay(self) -> dict:
-        if self._router_replay_cache_rx is not None:
-            self._router_replay_cache_rx.clear()
-        if self._router_replay_group is not None:
-            self._router_replay_group.close()
-            self._router_replay_group = None
-        return {"status": "ok"}
-
-    @staticmethod
-    def _assemble_routed_experts(captures, attention_mask, device, position_ids=None):
-        if not torch.is_tensor(attention_mask) or attention_mask.ndim != 2:
-            raise ValueError("router-replay requires a 2D attention_mask")
-        rows, width = attention_mask.shape
-        if len(captures) != rows or rows == 0:
-            raise ValueError("router-replay sample count does not match batch rows")
-        router_shape = None
-        for routed in captures:
-            if not torch.is_tensor(routed) or routed.ndim != 3 or any(size <= 0 for size in routed.shape):
-                raise ValueError("router-replay capture requires [tokens, layers, top_k]")
-            if routed.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
-                raise ValueError("router-replay capture indices must be integers")
-            if router_shape is not None and tuple(routed.shape[1:]) != router_shape:
-                raise ValueError("router-replay captures disagree on router shape")
-            router_shape = tuple(routed.shape[1:])
-        mask = attention_mask.to(device=device, dtype=torch.bool)
-        if position_ids is not None:
-            if (
-                not torch.is_tensor(position_ids)
-                or tuple(position_ids.shape) != (rows, width)
-                or position_ids.dtype not in (torch.int32, torch.int64)
-            ):
-                raise ValueError("router-replay position_ids must match attention_mask")
-            positions = position_ids.to(device=device, dtype=torch.long)
-        else:
-            positions = (mask.long().cumsum(dim=-1) - 1).clamp_min(0)
-            if any(routed.shape[0] > int(mask[row].sum()) for row, routed in enumerate(captures)):
-                raise ValueError("router-replay capture exceeds attended sequence")
-        assembled = torch.zeros((rows, width, *router_shape), dtype=torch.int64, device=device)
-        for row, routed in enumerate(captures):
-            routed = routed.to(device=device, dtype=torch.int64)
-            valid = mask[row] & (positions[row] >= 0) & (positions[row] < routed.shape[0])
-            # Position IDs refer to the original sample, including on a noncontiguous SP slice.
-            gathered = routed[positions[row].clamp(0, routed.shape[0] - 1)]
-            assembled[row] = gathered * valid[:, None, None]
-        return assembled
-
-    def _consume_router_replay(self, batch: dict) -> None:
-        sample_ids = batch.pop("rr_sample_ids", None)
-        batch.pop("rr_replay_meta", None)
-        batch.pop("rr_discard", None)
-        if not sample_ids:
-            return
-        if self._router_replay_cache_rx is None:
-            raise RuntimeError("router-replay RX cache is not initialized")
-        captures = [self._router_replay_cache_rx.pop(sample_id) for sample_id in sample_ids]
-        batch["routed_experts"] = self._assemble_routed_experts(
-            captures, batch.get("attention_mask"), self._device, position_ids=batch.get("position_ids")
-        )
 
     def init_weight_sender(self, group, schedule, master_addr, base_port, bucket_size) -> bool:
         from arctic_inference.server.weight_sync.sender import WeightSender
@@ -1454,31 +734,11 @@ class DeepSpeedWorker:
         return True
 
     def get_weights(self) -> list[tuple[str, torch.Tensor]]:
-        model = self.engine.module
-        iterator = getattr(model, "_iter_full_hf_weights", None)
-        if iterator is not None:
-            # The converter gathers experts collectively and emits complete HF tensors only on rank zero.
-            weights = list(iterator())
-            metadata = [
-                (
-                    [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in weights]
-                    if dist.get_rank() == 0
-                    else None
-                )
-            ]
-            dist.broadcast_object_list(metadata, src=0)
-            if dist.get_rank() != 0:
-                weights = [
-                    (name, torch.empty(shape, dtype=dtype, device=self._device)) for name, shape, dtype in metadata[0]
-                ]
-            for _, tensor in weights:
-                dist.broadcast(tensor, src=0)
-            return weights
         weights = []
-        for n, p in model.named_parameters():
+        for n, p in self.engine.module.named_parameters():
             if hasattr(p, "ds_id"):
                 with deepspeed.zero.GatheredParameters([p], enabled=True):
-                    weights.append((n, p.data.detach().clone()))
+                    weights.append((n, p.data))
             else:
                 weights.append((n, p.data))
         return weights
@@ -1927,7 +1187,6 @@ class DeepSpeedWorker:
         return {"gpu_mb": mem_mb}
 
     def destroy(self) -> bool:
-        self.close_router_replay()
         if self._weight_sender is not None:
             self._weight_sender.destroy()
             self._weight_sender = None

@@ -94,7 +94,6 @@ def _capture_payload(cfg, spec, arm, capture: Path, model_state: Path | None = N
         SEED,
         attn_implementation=cfg.attention_implementation,
         optimizer_state_output_dir=capture,
-        gradient_accumulation_steps=arm.dss_microbatches,
     )
     if model_state is not None:
         payload["training_config"]["debug"]["model_state_output_dir"] = str(model_state.resolve())
@@ -326,7 +325,6 @@ def _run_loss_control(work: Path, cfg, spec, arm, bodies: list[dict], *, checkpo
         SEED,
         slots=cfg.n_gpus,
         attn_implementation=cfg.attention_implementation,
-        gradient_accumulation_steps=arm.dss_microbatches,
     ) as transport:
         if checkpoint_control:
             with transport.job() as first_job:

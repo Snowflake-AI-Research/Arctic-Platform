@@ -146,16 +146,6 @@ def validate_lm_head_targets(labels_flat, *, vocab_size: int) -> None:
         )
 
 
-def accumulate_lm_head_gradient_(gradient, left, right):
-    """Accumulate a tile without rounding its product or running sum to BF16/FP16."""
-    import torch
-
-    if left.is_cuda and left.dtype in (torch.bfloat16, torch.float16):
-        gradient.add_(torch.mm(left, right, out_dtype=torch.float32))
-    else:
-        gradient.add_(left.to(gradient.dtype) @ right.to(gradient.dtype))
-
-
 # TODO: replace ``SequenceChunkedLogProbFn`` with an OSS kernel such as
 # LigerFusedLinearCrossEntropy once it is a viable drop-in for DSS per-token
 # logprob output.
@@ -319,16 +309,12 @@ def _get_sequence_chunked_logprob_fn():
             n_tokens = hidden.shape[0]
             vocab_size = weight.shape[0]
 
-            # Round low-precision gradients only once, after all tiles have accumulated.
-            # Projection operands still follow fp32_lm_head.
+            # Accumulate in fp32 when requested, otherwise in each input's
+            # native dtype; we cast back to input dtypes on return.
             accum = torch.float32 if fp32_lm_head else None
-            grad_hidden = torch.zeros_like(hidden, dtype=accum or torch.promote_types(hidden.dtype, torch.float32))
-            grad_weight = torch.zeros_like(weight, dtype=accum or torch.promote_types(weight.dtype, torch.float32))
-            grad_bias = (
-                torch.zeros_like(bias, dtype=accum or torch.promote_types(bias.dtype, torch.float32))
-                if bias is not None
-                else None
-            )
+            grad_hidden = torch.zeros_like(hidden, dtype=accum or hidden.dtype)
+            grad_weight = torch.zeros_like(weight, dtype=accum or weight.dtype)
+            grad_bias = torch.zeros_like(bias, dtype=accum or bias.dtype) if bias is not None else None
 
             for start in range(0, n_tokens, token_chunk_size):
                 end = min(start + token_chunk_size, n_tokens)
@@ -384,15 +370,10 @@ def _get_sequence_chunked_logprob_fn():
                     # Chain rule for temperature scaling: scaled = logits * inv_t.
                     grad_logits = grad_logits * inv_t_chunk
 
-                    accumulate_lm_head_gradient_(grad_hidden[start:end], grad_logits.to(w_proj.dtype), w_proj)
-                    accumulate_lm_head_gradient_(
-                        grad_weight[vocab_start:vocab_end], grad_logits.to(h_proj.dtype).t(), h_proj
-                    )
+                    grad_hidden[start:end].add_(grad_logits.to(grad_hidden.dtype) @ w_proj)
+                    grad_weight[vocab_start:vocab_end].add_(grad_logits.to(grad_weight.dtype).t() @ h_proj)
                     if grad_bias is not None:
-                        bias_dtype = torch.float32 if fp32_lm_head else bias.dtype
-                        grad_bias[vocab_start:vocab_end].add_(
-                            grad_logits.to(bias_dtype).sum(dim=0, dtype=grad_bias.dtype)
-                        )
+                        grad_bias[vocab_start:vocab_end].add_(grad_logits.to(grad_bias.dtype).sum(dim=0))
 
             return (
                 grad_hidden.to(hidden.dtype),

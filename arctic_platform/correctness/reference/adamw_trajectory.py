@@ -55,15 +55,21 @@ class AdamWTrajectory:
         learning_rate: float,
         gradient_clipping: float | None,
         optimizer_dtype: str,
-        optimizer_backend: str = "torch",
+        optimizer_chunk_elements: int | None = None,
     ) -> None:
         assert_adamw_semantics(optimizer_config)
+        if optimizer_chunk_elements is not None and (
+            isinstance(optimizer_chunk_elements, bool)
+            or not isinstance(optimizer_chunk_elements, int)
+            or optimizer_chunk_elements <= 0
+        ):
+            raise ValueError("optimizer_chunk_elements must be a positive integer")
         self._model = model
         self._optimizer_config = optimizer_config
         self._learning_rate = float(learning_rate)
         self._gradient_clipping = gradient_clipping
         self._dtype = master_dtype(optimizer_dtype)
-        self._optimizer_backend = optimizer_backend
+        self._optimizer_chunk_elements = optimizer_chunk_elements
         self._sources: Optional[List[Tuple[str, "torch.nn.Parameter"]]] = None
         self._masters: Dict[str, "torch.nn.Parameter"] = {}
         self._optimizer = None
@@ -92,15 +98,88 @@ class AdamWTrajectory:
             raise ValueError("optimizer trajectory found no trainable parameters with gradients")
         self._sources = named
         self._masters = {
-            name: torch.nn.Parameter(parameter.detach().to(self._dtype).clone(), requires_grad=True)
+            name: torch.nn.Parameter(
+                parameter.detach()
+                .to(self._dtype)
+                .clone(
+                    memory_format=(
+                        torch.contiguous_format
+                        if self._optimizer_chunk_elements is not None
+                        else torch.preserve_format
+                    )
+                ),
+                requires_grad=True,
+            )
             for name, parameter in named
         }
         self._optimizer = build_adamw(
             [(name, self._masters[name]) for name, _ in named],
             self._optimizer_config,
             learning_rate=self._learning_rate,
-            backend=self._optimizer_backend,
         )
+
+    @torch.no_grad()
+    def _bounded_step(self, gradients: Dict[str, "torch.Tensor"]) -> "torch.Tensor":
+        from torch.optim._functional import adamw
+
+        # Preserve the reference's per-parameter norm reduction and global clipping. Only one
+        # parameter's gradient is on the device during this pass; the update streams smaller chunks.
+        norms = []
+        for name, _ in self._sources:
+            master = self._masters[name]
+            gradient = gradients[name].detach().to(device=master.device, dtype=self._dtype)
+            norms.append(torch.linalg.vector_norm(gradient))
+            del gradient
+        norm = torch.linalg.vector_norm(torch.stack(norms))
+        coefficient = None
+        if self._gradient_clipping is not None and float(self._gradient_clipping) > 0:
+            coefficient = (float(self._gradient_clipping) / (norm + 1e-6)).clamp(max=1.0)
+
+        for group in self._optimizer.param_groups:
+            for master in group["params"]:
+                state = self._optimizer.state[master]
+                if not state:
+                    state["step"] = torch.tensor(0.0)
+                    state["exp_avg"] = torch.zeros_like(master)
+                    state["exp_avg_sq"] = torch.zeros_like(master)
+
+        groups = {id(master): group for group in self._optimizer.param_groups for master in group["params"]}
+        for name, _ in self._sources:
+            master = self._masters[name]
+            group = groups[id(master)]
+            state = self._optimizer.state[master]
+            parameter = master.view(-1)
+            first_moment = state["exp_avg"].view(-1)
+            second_moment = state["exp_avg_sq"].view(-1)
+            source_gradient = gradients[name].detach().reshape(-1)
+            for start in range(0, master.numel(), self._optimizer_chunk_elements):
+                stop = start + self._optimizer_chunk_elements
+                gradient = source_gradient[start:stop].to(device=master.device, dtype=self._dtype).clone()
+                if coefficient is not None:
+                    gradient.mul_(coefficient.to(device=master.device))
+                # Functional AdamW increments its scalar counter. Each chunk starts from the same
+                # previous parameter step, so chunking cannot advance bias correction more than once.
+                chunk_step = state["step"].clone()
+                adamw(
+                    [parameter[start:stop]],
+                    [gradient],
+                    [first_moment[start:stop]],
+                    [second_moment[start:stop]],
+                    [],
+                    [chunk_step],
+                    foreach=False,
+                    fused=False,
+                    amsgrad=False,
+                    beta1=group["betas"][0],
+                    beta2=group["betas"][1],
+                    lr=group["lr"],
+                    weight_decay=group["weight_decay"],
+                    eps=group["eps"],
+                    maximize=False,
+                )
+                del gradient
+            state["step"].add_(1)
+        return norm
 
     def step(self, gradients: Dict[str, "torch.Tensor"]) -> float:
         """Apply one step and write the result back into the model. Returns the pre-clip gradient norm."""
@@ -114,16 +193,25 @@ class AdamWTrajectory:
                 f"step {self.steps + 1} received no gradient for {len(missing)} parameter(s) the "
                 f"optimizer owns, the first being {missing[0]!r}; the trainable set changed mid-run"
             )
-        for name, _ in self._sources:
-            master = self._masters[name]
-            master.grad = gradients[name].detach().to(device=master.device, dtype=self._dtype).clone()
+        for name, source in self._sources:
+            if gradients[name].shape != source.shape:
+                raise ValueError(
+                    f"step {self.steps + 1} gradient {name!r} has shape {tuple(gradients[name].shape)}, "
+                    f"expected {tuple(source.shape)}"
+                )
+        if self._optimizer_chunk_elements is not None:
+            norm = self._bounded_step(gradients)
+        else:
+            for name, _ in self._sources:
+                master = self._masters[name]
+                master.grad = gradients[name].detach().to(device=master.device, dtype=self._dtype).clone()
 
-        norm = torch.linalg.vector_norm(
-            torch.stack([torch.linalg.vector_norm(self._masters[name].grad) for name, _ in self._sources])
-        )
-        if self._gradient_clipping is not None and float(self._gradient_clipping) > 0:
-            torch.nn.utils.clip_grad_norm_(list(self._masters.values()), float(self._gradient_clipping))
-        self._optimizer.step()
+            norm = torch.linalg.vector_norm(
+                torch.stack([torch.linalg.vector_norm(self._masters[name].grad) for name, _ in self._sources])
+            )
+            if self._gradient_clipping is not None and float(self._gradient_clipping) > 0:
+                torch.nn.utils.clip_grad_norm_(list(self._masters.values()), float(self._gradient_clipping))
+            self._optimizer.step()
 
         # The next forward reads the model, not the master copy, so the step is not finished until the
         # parameters carry it. Narrowing back to the parameter dtype here is what the engine's bf16

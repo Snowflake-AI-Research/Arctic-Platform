@@ -13,19 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Full determinism fixes the FLA kernel configuration instead of autotuning by call shape."""
+"""The reference must not resurrect the removed product FLA autotuner pin."""
 
-from types import SimpleNamespace
+import inspect
 
-from arctic_platform.model.implementations.debug.determinism import _pin_first_fla_configuration
+from arctic_platform.correctness.reference import process_determinism
 
 
-def test_fla_autotuner_keeps_its_first_owned_configuration_and_clears_shape_cache() -> None:
-    first = object()
-    autotuner = SimpleNamespace(configs=[first, object()], cache={"shape": object()})
-    wrapped = SimpleNamespace(fn=SimpleNamespace(fn=autotuner))
-
-    _pin_first_fla_configuration(wrapped, name="example")
-
-    assert autotuner.configs == [first]
-    assert autotuner.cache == {}
+def test_reference_reduction_pinning_does_not_mutate_fla_autotuners() -> None:
+    assert "pin_fla_gdn_autotuners" not in inspect.getsource(process_determinism)

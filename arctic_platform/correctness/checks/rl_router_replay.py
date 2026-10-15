@@ -107,7 +107,7 @@ def expects_full_recompute(training_config: dict) -> bool:
 
 def _run(ctx) -> TestResult:
     cfg = ctx.cfg
-    model_path = ctx.spec.model.cache_path
+    model_path = cfg.model_name
     tokenizer = gsm8k.load_tokenizer(model_path)
     pad_id = gsm8k.padding_token_id(tokenizer)
     examples = gsm8k.tokenize_examples(tokenizer, gsm8k.read_rows(TRAIN_SPLIT, count=configured_rows_per_step(cfg)))
@@ -128,7 +128,9 @@ def _run(ctx) -> TestResult:
     training["training_config"]["debug"]["router_replay_trace"] = True
     gateway_dir = Path(ctx.workdir) / TEST_ID / "gateway"
     gateway_dir.mkdir(parents=True, exist_ok=True)
-    with running_rl_client(cfg, training, model_path, gateway_dir) as client:
+    with running_rl_client(
+        cfg, training, model_path, gateway_dir, backend=getattr(ctx, "client_backend", None)
+    ) as client:
         results = generate(client, prompts, params)
         samples = [sample_from_result(prompt, result) for prompt, result in zip(prompts, results)]
         batch = rl_batch([s["tokens"] for s in samples], [s["prompt_len"] for s in samples], pad_id)

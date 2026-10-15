@@ -19,19 +19,27 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
+from arctic_platform.common.utils.batch import unpack_batch
 from arctic_platform.correctness.checks import rl_router_replay
 from arctic_platform.correctness.checks import rl_weight_sync
+from arctic_platform.correctness.harness import rl_driver
 from arctic_platform.correctness.harness import router_replay_trace
 from arctic_platform.correctness.harness.config import load_config
+from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
 from arctic_platform.correctness.harness.rl_driver import rl_batch
 from arctic_platform.correctness.harness.rl_driver import rl_gpu_count
 from arctic_platform.correctness.harness.rl_driver import rl_sampling_payload
+from arctic_platform.correctness.harness.spec import TestSpec as Spec
 from arctic_platform.correctness.selftest.config_factory import native_config
 
+from .check_rl_config import CONFIG
 from .check_rl_config import SAMPLING_CONFIG
+from .check_rl_config import SPEC
 from .check_rl_config import TRAINING_CONFIG
 
 
@@ -235,6 +243,158 @@ def test_rl_batch_scores_only_answer_predictions():
     assert batch["kwargs"]["input_ids"].tolist() == [[5, 6, 7, 8], [9, 4, 0, 0]]
     assert batch["kwargs"]["attention_mask"].tolist() == [[1, 1, 1, 1], [1, 1, 0, 0]]
     assert batch["context"]["loss_mask"].tolist() == [[0, 1, 1, 0], [1, 0, 0, 0]]
+
+
+def test_rl_batch_uses_native_scalar_temperature_boundary():
+    request = rl_batch([[5, 6, 7, 8], [9, 4]], [2, 1], pad_id=0)
+    _, batch, meta, processing = unpack_batch(request)
+    assert "temperature" not in request["kwargs"]
+    assert request["context"]["temperature"] == meta["temperature"] == 1.0
+    assert batch["input_ids"].tolist() == [[5, 6, 7, 8], [9, 4, 0, 0]]
+    assert batch["loss_mask"].tolist() == [[0, 1, 1, 0], [1, 0, 0, 0]]
+    assert batch["advantages"].eq(1).all()
+    assert processing == {
+        "post": ["compute_logprobs"],
+        "loss_fn": "grpo",
+        "config": {"loss_agg_mode": "token-mean"},
+    }
+
+
+@pytest.mark.parametrize("check", [rl_weight_sync, rl_router_replay], ids=["weight-sync", "router-replay"])
+@pytest.mark.parametrize("local_model", [False, True], ids=["frozen-catalog-model", "configured-local-model"])
+def test_rl_checks_use_configured_model_for_tokenizer_and_both_zones(tmp_path, monkeypatch, check, local_model):
+    cfg = load_config(CONFIG)
+    if local_model:
+        model_name = "/data-fast/base-models/full-configured-model"
+        sub_job = {**cfg.sub_job, "model_name": model_name}
+        cfg = replace(
+            cfg,
+            sub_job=sub_job,
+            sub_jobs=[{**job, "model_name": model_name} for job in cfg.sub_jobs],
+            native=cfg.native.model_copy(update={"model_name": model_name}, deep=True),
+        )
+    spec = Spec.read(SPEC)
+    original_native = cfg.native.model_dump()
+    original_training = copy.deepcopy(cfg.training)
+    original_sampling = copy.deepcopy(cfg.sub_jobs[1])
+    ctx = SimpleNamespace(
+        cfg=cfg,
+        spec=spec,
+        config_id=cfg.config_id,
+        workdir=tmp_path,
+        attn_implementation=cfg.attention_implementation,
+        target_model_name="published-reduced-reference",
+    )
+    assert cfg.model_name != spec.model.cache_path
+    tokenizer_paths, configs, batches, generations, rates, closed = [], [], [], [], [], []
+    rows_per_step = check.configured_rows_per_step(cfg)
+    examples = [
+        check.gsm8k.Example(
+            question=str(i),
+            prompt="prompt",
+            completion="answer",
+            input_ids=(3 * i + 5, 3 * i + 6, 3 * i + 7),
+            n_prompt=2,
+        )
+        for i in range(rows_per_step)
+    ]
+    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=1)
+    generated_samples = []
+
+    def load_tokenizer(path):
+        tokenizer_paths.append(path)
+        return tokenizer
+
+    def read_rows(path, *, count):
+        assert path == check.TRAIN_SPLIT
+        assert count == rows_per_step
+        return [("question", "answer")] * count
+
+    def tokenize_examples(actual_tokenizer, rows):
+        assert actual_tokenizer is tokenizer
+        assert len(rows) == rows_per_step
+        return examples
+
+    class Client:
+        jobs = SimpleNamespace(sampling="native-sampling-job")
+
+        def __init__(self, config):
+            configs.append(config)
+
+        def generate(self, prompts, params):
+            generations.append((prompts, params))
+            results = []
+            for example, prompt, parameters in zip(examples, prompts, params, strict=True):
+                assert prompt == list(example.input_ids[: example.n_prompt])
+                assert parameters["max_tokens"] == example.answer_tokens
+                assert parameters["dss_return_back_router_info"] is True
+                marker = {
+                    "sample_id": parameters["dss_sample_id"],
+                    "replay_id": parameters["dss_router_replay_id"],
+                    "prompt_len": len(prompt),
+                    "generation_len": 1,
+                    "capture_len": 2,
+                    "routed_experts": [[[1], [2]], [[3], [4]]],
+                }
+                result = {"token_ids": list(example.input_ids[example.n_prompt :]), "router_replay": marker}
+                results.append(result)
+                generated_samples.append(rl_router_replay.sample_from_result(prompt, result))
+            return results
+
+        def fwd_bwd(self, batch, *, router_replay=None):
+            batches.append((batch, router_replay))
+            traces = [_trace(generated_samples[i : i + 2]) for i in range(0, len(generated_samples), 2)]
+            return {"avg_loss": 1.0, "router_replay_trace": traces}
+
+        def step(self, learning_rate):
+            rates.append(learning_rate)
+            return {}
+
+        def sync_weights(self):
+            assert check is rl_weight_sync
+            return _sync()
+
+        def shutdown(self):
+            closed.append(True)
+
+    monkeypatch.setattr(check.gsm8k, "load_tokenizer", load_tokenizer)
+    monkeypatch.setattr(check.gsm8k, "read_rows", read_rows)
+    monkeypatch.setattr(check.gsm8k, "tokenize_examples", tokenize_examples)
+    monkeypatch.setattr(rl_driver, "ArcticClient", Client)
+    monkeypatch.setenv(rl_weight_sync.VERIFY_ENV, "test-original")
+    result = check._run(ctx)
+
+    assert result.outcome is Outcome.PASS
+    assert tokenizer_paths == [cfg.model_name]
+    assert len(configs) == len(batches) == len(closed) == 1
+    native = configs[0]
+    assert native.model_name == cfg.model_name
+    assert native.to_onprem("training")["model_name"] == native.to_onprem("sampling")["model_name"] == cfg.model_name
+    assert native.sampling.model_dump() == cfg.native.sampling.model_dump()
+    assert native.training_gpus == cfg.native.training_gpus == 8
+    assert native.sampling_gpus == cfg.native.sampling_gpus == 8
+    assert native.max_seq_len == cfg.native.max_seq_len == 32768
+    assert native.training.ds_config == cfg.native.training.ds_config
+    assert native.training.ds_worker_config["model_provider"] == "prime_rl"
+    assert native.training.ds_worker_config["attn_implementation"] == cfg.attention_implementation
+    assert native.training.checkpoint_path == str(tmp_path / check.TEST_ID / "gateway" / "checkpoints")
+    batch, replay = batches[0]
+    assert batch["kwargs"]["input_ids"].tolist() == [list(example.input_ids) for example in examples]
+    if check is rl_weight_sync:
+        assert native.training.ds_worker_config["debug"]["weight_sync_manifest"] is True
+        assert replay is None
+        assert rates == [check.configured_learning_rate(cfg)]
+        assert generations == []
+    else:
+        assert native.training.ds_worker_config["debug"]["router_replay_trace"] is True
+        assert replay == {"sampling_job_id": "native-sampling-job", "identity_version": 1}
+        assert len(generations) == 1
+        assert rates == []
+        assert batch["kwargs"]["rr_sample_ids"] == [sample["marker"]["replay_id"] for sample in generated_samples]
+        assert batch["kwargs"]["rr_discard"] is True
+    assert cfg.native.model_dump() == original_native
+    assert cfg.training == original_training
+    assert cfg.sub_jobs[1] == original_sampling
 
 
 def test_sampling_payload_keeps_the_config_and_swaps_only_the_model(tmp_path):

@@ -159,7 +159,7 @@ class _RemoteEventIterator:
             raise StopAsyncIteration from None
 
         async def resolve():
-            return [event]
+            return event
 
         return resolve()
 

@@ -22,50 +22,31 @@ import tempfile
 from pathlib import Path
 
 CORRECTNESS_TMPDIR_ENV = "DSS_CORRECTNESS_TMPDIR"
+_DATA_FAST_ROOT = Path("/data-fast")
 _DATA_FAST_TMPDIR = Path("/data-fast/tmp")
-_SAFE_FALLBACK_TMPDIR = Path("/tmp")
-_UNSAFE_TMPDIR_ROOTS = (Path("/code/users/stas"),)
 
 
-def _resolved(path: Path) -> Path:
-    return path.expanduser().resolve(strict=False)
-
-
-def _is_under(path: Path, root: Path) -> bool:
+def require_data_fast_path(path: str | Path, *, label: str = "correctness storage path") -> Path:
+    """Return a canonical fast-storage descendant without creating any directories."""
     try:
-        _resolved(path).relative_to(_resolved(root))
-    except ValueError:
-        return False
-    return True
-
-
-def _is_unsafe_tmpdir(path: Path) -> bool:
-    return any(_is_under(path, root) for root in _UNSAFE_TMPDIR_ROOTS)
-
-
-def _safe_env_tmpdir() -> Path | None:
-    for name in ("TMPDIR", "TEMP", "TMP"):
-        value = os.environ.get(name)
-        if value and not _is_unsafe_tmpdir(Path(value)):
-            return Path(value)
-    return None
+        resolved = Path(path).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        raise ValueError(f"{label} must resolve under /data-fast") from None
+    if resolved == _DATA_FAST_ROOT or not resolved.is_relative_to(_DATA_FAST_ROOT):
+        raise ValueError(f"{label} must be a resolved descendant of /data-fast")
+    if not _DATA_FAST_ROOT.is_dir():
+        raise ValueError(f"{label} requires an existing /data-fast directory")
+    return resolved
 
 
 def correctness_workdir(prefix: str) -> Path:
-    """Create a correctness harness workdir away from home-code storage.
-
-    Correctness runs place checkpoint trees below their workdir, so they should not inherit a job
-    script's home-directory TMPDIR. An explicit correctness override is still available for operators
-    that need a different fast-disk root.
-    """
+    """Create a heavyweight correctness workdir exclusively on fast storage."""
+    if not isinstance(prefix, str) or os.sep in prefix or (os.altsep and os.altsep in prefix):
+        raise ValueError("correctness workdir prefix must not contain a directory path")
     override = os.environ.get(CORRECTNESS_TMPDIR_ENV)
-    if override:
-        root = Path(override)
-        if _is_unsafe_tmpdir(root):
-            raise ValueError(f"{CORRECTNESS_TMPDIR_ENV} must not point under /code/users/stas")
-    elif _DATA_FAST_TMPDIR.exists() or _DATA_FAST_TMPDIR.parent.exists():
-        root = _DATA_FAST_TMPDIR
-    else:
-        root = _safe_env_tmpdir() or _SAFE_FALLBACK_TMPDIR
+    root = require_data_fast_path(
+        override if override else _DATA_FAST_TMPDIR,
+        label=CORRECTNESS_TMPDIR_ENV if override else "correctness workdir",
+    )
     root.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix=prefix, dir=root))

@@ -91,7 +91,7 @@ def run(ctx) -> List[TestResult]:
 
 def _run(ctx) -> TestResult:
     cfg = ctx.cfg
-    model_path = ctx.spec.model.cache_path
+    model_path = cfg.model_name
     tokenizer = gsm8k.load_tokenizer(model_path)
     pad_id = gsm8k.padding_token_id(tokenizer)
     learning_rate = configured_learning_rate(cfg)
@@ -104,7 +104,9 @@ def _run(ctx) -> TestResult:
     gateway_dir.mkdir(parents=True, exist_ok=True)
     os.environ[VERIFY_ENV] = "1"
 
-    with running_rl_client(cfg, training, model_path, gateway_dir) as client:
+    with running_rl_client(
+        cfg, training, model_path, gateway_dir, backend=getattr(ctx, "client_backend", None)
+    ) as client:
         loss = float(rl_fwd_bwd(client, batch)["avg_loss"])
         step(client, learning_rate)
         sync = sync_weights(client)

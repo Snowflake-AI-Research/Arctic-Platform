@@ -39,14 +39,10 @@ from decimal import Decimal
 from typing import Dict
 from typing import List
 
-from ..harness.arms import ArmDefinition
-from ..harness.arms import correctness_microbatch_tokens
 from ..harness.batches import Batch
 from ..harness.batches import build_batch
 from ..harness.dss_driver import GatewayTransport
-from ..harness.dss_driver import _max_tokens_per_mb_of
-from ..harness.dss_driver import ap_batch_processing_options
-from ..harness.dss_driver import pack_microbatches
+from ..harness.dss_driver import pack
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
@@ -83,13 +79,11 @@ RECORDED_ITERATIONS = (CHECKPOINT_ITERATION, ITERATIONS)
         "within the absolute gate onboarding measured for this config"
     ),
     compares_to_reference=False,
-    # TODO: switch back to ``requires_hosted_control_plane=True`` once the hosted worker image carries
-    # ``debug.full_determinism_must_comply``. That image raises on a refused deterministic attention backward, so
-    # every head-dimension-256 config dies at worker init there; a gateway resumes through the runtime load route.
+    # Both Cortex create-time checkpoint initialization and on-prem runtime load are supported.
     requires_hosted_control_plane=False,
 )
 def run(ctx) -> List[TestResult]:
-    """Each case runs its three jobs through a transport with matching gradient accumulation.
+    """Each case runs its three jobs through the same unmodified training configuration.
 
     The transport decides where those jobs run -- a gateway on this node, or the hosted control plane --
     and nothing below this line depends on which it is.
@@ -99,7 +93,7 @@ def run(ctx) -> List[TestResult]:
     workdir.mkdir(parents=True, exist_ok=True)
     for arm in ctx.arms:
         try:
-            with ctx.transport_for(workdir / arm.name, arm=arm) as transport:
+            with ctx.transport_for(workdir / arm.name) as transport:
                 results.append(_run_arm(ctx, transport, arm))
         except Exception as exc:  # noqa: BLE001 - one failing case must not hide the others
             traceback.print_exc()
@@ -138,15 +132,7 @@ def iteration_batches(ctx, arm) -> List[Batch]:
 def _iteration_bodies(ctx, arm) -> List[bytes]:
     """The iteration batches as request bytes, so both runs send the same bytes in the same order."""
     provider = str(ctx.cfg.training.get("model_provider", "huggingface"))
-    return [
-        pack_microbatches(
-            batch,
-            arm.dss_microbatches,
-            model_provider=provider,
-            **ap_batch_processing_options(ctx.config_id, arm.name),
-        )
-        for batch in iteration_batches(ctx, arm)
-    ]
+    return [pack(batch, model_provider=provider) for batch in iteration_batches(ctx, arm)]
 
 
 def _trajectory(job: TrainingJob, bodies: List[bytes], *, first_iteration: int) -> Dict[int, float]:
@@ -253,18 +239,14 @@ def measure_undeterministic_loss_range(
 ):
     """Three 10-step runs per case, determinism off. Returns the widest per-iteration loss range.
 
-    Every run consumes identical requests with the case's regression microbatch packing and accumulation.
+    Every run consumes identical plain supervised requests, as the regression does.
     The regression keeps best-effort determinism and reads the gate this range selects.
     """
     provider = str(training_config.get("model_provider", "huggingface"))
     widest = -1.0
     where = ""
     workdir.mkdir(parents=True, exist_ok=True)
-    token_budget = correctness_microbatch_tokens(_max_tokens_per_mb_of(training_config))
-    dp_size = slots // int(training_config.get("sp_size", 1))
     for arm in arms:
-        definition = ArmDefinition(arm.name, arm.global_batch_size, arm.max_seq_len)
-        microbatches = definition.microbatches(token_budget, dp_size)
         with GatewayTransport(
             workdir / arm.name,
             training_config,
@@ -273,13 +255,12 @@ def measure_undeterministic_loss_range(
             slots=slots,
             attn_implementation=attn_implementation,
             determinism="off",
-            gradient_accumulation_steps=microbatches,
         ) as transport:
             batches = [
                 build_batch(arm.name, arm.global_batch_size, arm.max_seq_len, vocab_size, seed=SEED + iteration)
                 for iteration in range(1, CALIBRATION_STEPS + 1)
             ]
-            bodies = [pack_microbatches(batch, microbatches, model_provider=provider) for batch in batches]
+            bodies = [pack(batch, model_provider=provider) for batch in batches]
             runs = []
             for run_index in range(CALIBRATION_RUNS):
                 with transport.job() as job:

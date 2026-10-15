@@ -31,6 +31,8 @@ from typing import List
 from typing import Sequence
 
 from arctic_platform.client import ArcticClient
+from arctic_platform.client import CortexConfig
+from arctic_platform.client import OnPremConfig
 
 from .dss_driver import GatewaySession
 from .dss_driver import _training_client_config
@@ -44,7 +46,7 @@ def sub_job_of_type(cfg, job_type: str) -> dict:
 
 
 def rl_sampling_payload(cfg, model_path: str) -> dict:
-    """The config's sampling sub-job as written, serving the model the spec names instead of the full one."""
+    """The config's sampling sub-job as written, serving the explicitly selected model."""
     payload = copy.deepcopy(sub_job_of_type(cfg, "sampling"))
     payload["model_name"] = str(model_path)
     return payload
@@ -57,11 +59,18 @@ def rl_gpu_count(cfg) -> int:
 
 
 @contextlib.contextmanager
-def running_rl_client(cfg, training_payload: dict, model_path: str, workdir: Path) -> Iterator[ArcticClient]:
+def running_rl_client(
+    cfg,
+    training_payload: dict,
+    model_path: str,
+    workdir: Path,
+    *,
+    backend: OnPremConfig | CortexConfig | None = None,
+) -> Iterator[ArcticClient]:
     """Create one native client whose training and sampling jobs share the reviewed config."""
     if cfg.native is None:
         raise ValueError(f"{cfg.config_id}: native ArcticClientConfig is required")
-    session = GatewaySession(Path(workdir), rl_gpu_count(cfg))
+    session = GatewaySession(Path(workdir), rl_gpu_count(cfg), backend if backend is not None else OnPremConfig())
     training_only = _training_client_config(session, training_payload)
     native = cfg.native.model_copy(
         update={
@@ -125,12 +134,12 @@ def rl_batch(rows: Sequence[Sequence[int]], loss_starts: Sequence[int], pad_id: 
         "kwargs": {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "temperature": torch.ones(count, width, dtype=torch.float32),
         },
         "context": {
             "input_ids": input_ids.clone(),
             "advantages": torch.ones(count, width, dtype=torch.float32),
             "loss_mask": loss_mask,
+            "temperature": 1.0,
         },
         "processing": {
             "post": ["compute_logprobs"],

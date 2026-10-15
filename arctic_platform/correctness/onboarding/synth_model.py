@@ -37,6 +37,7 @@ from typing import Tuple
 from ..harness.seeds import SEED
 from ..harness.spec import ModelSpec
 from ..harness.spec import hash_directory
+from ..harness.workdir import require_data_fast_path
 
 # A single H200 must hold the reference's weights, its fp32 gradient accumulator, the live gradients of
 # one backward pass, one microbatch of activations, and the chunked cross-entropy workspace. The margin
@@ -165,6 +166,7 @@ def copy_sidecars(source: str, dest_path: Path) -> List[Path]:
     read-only, so an earlier copy is removed rather than opened for writing, and the replacement is created
     with the ambient mode instead of inheriting the snapshot's.
     """
+    dest_path = require_data_fast_path(dest_path, label="reduced model sidecar destination")
     copied: List[Path] = []
     for sidecar in sidecar_files(source):
         target = dest_path / sidecar.name
@@ -192,10 +194,11 @@ def materialize_pretrained(
     The written tree carries the source's tokenizer sidecars, so it can be tokenized against and a
     weights-only checkpoint saved from a job that loaded it is self-contained for a serving engine.
     """
+    dest_path = require_data_fast_path(dest, label="reduced pretrained model destination")
+
     import torch
     import transformers
 
-    dest_path = Path(dest)
     cfg, _, _ = reduce_config(source, num_layers, vision_depth)
 
     if force or not (dest_path / "config.json").exists():
@@ -227,10 +230,11 @@ def materialize(
     The weights are regenerable from the seed, so ``dest`` is a cache rather than an input. A caller that
     finds a matching content hash reuses it; anything else rebuilds.
     """
+    dest_path = require_data_fast_path(dest, label="reduced model destination")
+
     import torch
     import transformers
 
-    dest_path = Path(dest)
     cfg, original, period = reduce_config(source, num_layers, vision_depth)
 
     if force or not (dest_path / "config.json").exists():

@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import List
 
 from .seeds import SEED
+from .workdir import require_data_fast_path
 
 IGNORE_INDEX = -100
 
@@ -143,6 +144,7 @@ def assert_invariants(batch: Batch) -> None:
 
 def save(batch: Batch, path: Path) -> str:
     """Materialize so both engines read identical bytes, and return a hash for the report."""
+    path = require_data_fast_path(path, label="batch tensor output")
     import hashlib
 
     import torch

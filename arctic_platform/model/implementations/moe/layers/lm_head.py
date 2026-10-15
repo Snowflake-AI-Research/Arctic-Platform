@@ -16,7 +16,6 @@ from arctic_platform.model.implementations.gpu.action_masks import slice_lm_head
 from arctic_platform.model.implementations.gpu.action_masks import validate_action_mask_targets
 from arctic_platform.model.implementations.gpu.grouped_lm_head import GroupedLogProbAccumulator
 from arctic_platform.model.implementations.gpu.grouped_lm_head import prepare_group_temperature
-from arctic_platform.model.implementations.gpu.lm_head import accumulate_lm_head_gradient_
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
 from arctic_platform.model.implementations.gpu.lm_head import inv_temperature_for_tokens
 from arctic_platform.model.implementations.gpu.lm_head import safe_chunked_labels
@@ -160,18 +159,11 @@ class FusedCrossEntropyOutputLinear(torch.nn.Linear):
         # product through addmm(out_dtype=float32), in fp32, which makes the sum partition-independent. Requires
         # liger_kernel >= 0.8.1; earlier versions accept accum_dtype but round each product to bf16 first, which
         # does not fix it. See docs/lm_head_gradient_precision.md.
-        accum_dtype = torch.float32 if fp32_lm_head else None
         self.fused_ce = LigerFusedLinearCrossEntropyLoss(
             ignore_index=IGNORE_INDEX,
             reduction="mean",
             softcap=softcap,
-            accum_dtype=accum_dtype,
-        )
-        self.fused_logprobs = LigerFusedLinearCrossEntropyLoss(
-            ignore_index=IGNORE_INDEX,
-            reduction="none",
-            softcap=softcap,
-            accum_dtype=accum_dtype,
+            accum_dtype=torch.float32 if fp32_lm_head else None,
         )
 
     def forward(
@@ -180,7 +172,6 @@ class FusedCrossEntropyOutputLinear(torch.nn.Linear):
         labels: torch.Tensor | None = None,
         temperature: Tensor | None = None,
         dss_force_zero_loss: bool = False,
-        dss_compute_logprobs: bool = False,
     ) -> PrimeLmOutput:
         if dss_force_zero_loss:
             return PrimeLmOutput(loss=_zero_lm_head_loss(hidden_states, self.weight))
@@ -190,9 +181,6 @@ class FusedCrossEntropyOutputLinear(torch.nn.Linear):
         b, s, h = hidden_states.shape
         hidden_flat = hidden_states.reshape(b * s, h).contiguous()
         labels_flat = labels.reshape(b * s).contiguous()
-        if dss_compute_logprobs:
-            losses = self.fused_logprobs(self.weight, hidden_flat, labels_flat)
-            return PrimeLmOutput(logprobs=-losses.reshape(b, s))
         loss = self.fused_ce(self.weight, hidden_flat, labels_flat)
         return PrimeLmOutput(loss=loss)
 
@@ -363,13 +351,8 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         vocab = weight.shape[0]
         vocab_chunk_size = min(vocab, 8192)
 
-        # Keep tile products and running sums in FP32 without widening the configured projection.
-        grad_hidden = torch.zeros_like(
-            hidden, dtype=torch.float32 if fp32_lm_head else torch.promote_types(hidden.dtype, torch.float32)
-        )
-        grad_weight = torch.zeros_like(
-            weight, dtype=torch.float32 if fp32_lm_head else torch.promote_types(weight.dtype, torch.float32)
-        )
+        grad_hidden = torch.zeros_like(hidden, dtype=torch.float32 if fp32_lm_head else hidden.dtype)
+        grad_weight = torch.zeros_like(weight, dtype=torch.float32 if fp32_lm_head else weight.dtype)
 
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
@@ -420,10 +403,8 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
 
                 grad_logits_for_hidden = grad_logits if fp32_lm_head else grad_logits.to(hidden.dtype)
                 grad_logits_for_weight = grad_logits if fp32_lm_head else grad_logits.to(weight.dtype)
-                accumulate_lm_head_gradient_(grad_hidden[start:end], grad_logits_for_hidden, weight_for_logits)
-                accumulate_lm_head_gradient_(
-                    grad_weight[vocab_start:vocab_end], grad_logits_for_weight.t(), hidden_for_logits
-                )
+                grad_hidden[start:end].add_(grad_logits_for_hidden @ weight_for_logits)
+                grad_weight[vocab_start:vocab_end].add_(grad_logits_for_weight.t() @ hidden_for_logits)
 
         return (
             grad_hidden.to(hidden.dtype),
@@ -593,11 +574,9 @@ def _patch_model_forward(model: nn.Module) -> None:
             slice_indices = logits_to_keep
 
         # action_masks is RL-only (chunked-logprob head); SFT/CE heads reject it, so forward only when set.
-        lm_head_kwargs: dict[str, object] = {}
+        lm_head_kwargs = {}
         if action_masks is not None:
             lm_head_kwargs["action_masks"] = action_masks
-        elif dss_compute_logprobs and isinstance(self.lm_head, FusedCrossEntropyOutputLinear):
-            lm_head_kwargs["dss_compute_logprobs"] = True
         if group_token_ids is not None and isinstance(self.lm_head, FusedOutputLinear):
             temperature = prepare_group_temperature(
                 temperature,
@@ -622,4 +601,3 @@ def _patch_model_forward(model: nn.Module) -> None:
 
     # Bind the new forward to the model
     model.forward = types.MethodType(new_forward, model)
-    model._dss_native_lm_head_logprobs = True

@@ -20,18 +20,7 @@ from pathlib import Path
 from arctic_platform.correctness.harness.config import LoadedConfig
 
 
-def test_hosted_training_sub_job_pins_determinism(monkeypatch) -> None:
-    captured = {}
-
-    class SubJobConfig:
-        @staticmethod
-        def training_job(*args, **kwargs):
-            captured.update(kwargs)
-            return kwargs
-
-    import dss_client.neutrino_client as client
-
-    monkeypatch.setattr(client, "SubJobConfig", SubJobConfig)
+def test_hosted_training_sub_job_pins_determinism() -> None:
     from arctic_platform.correctness.harness.hosted import training_sub_job
 
     cfg = LoadedConfig(
@@ -52,8 +41,7 @@ def test_hosted_training_sub_job_pins_determinism(monkeypatch) -> None:
         },
     )
 
-    training_sub_job(cfg)
-
-    debug = captured["extra_training"]["debug"]
+    wire = training_sub_job(cfg)
+    debug = wire["training_config"]["debug"]
     assert debug["full_determinism"] is True
     assert debug["full_determinism_must_comply"] is False

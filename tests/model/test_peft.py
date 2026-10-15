@@ -292,13 +292,6 @@ def test_worker_bridge_forwards_peft():
     assert spec.patches.peft == config
 
 
-def test_custom_moe_peft_supports_replicated_projection_adapters():
-    config = {"peft_type": "Lora", "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"]}
-    spec = ModelSpec(model_path_or_name="unused", loader="qwen3_5_moe", patches=Patches(peft=config))
-
-    assert spec.patches.peft == config
-
-
 @pytest.mark.parametrize("loader", ["qwen3_5_moe", "glm_moe_dsa", "generic_moe", "glm5_next", "qwen4_exp"])
 def test_custom_moe_loaders_accept_peft(loader):
     spec = ModelSpec(

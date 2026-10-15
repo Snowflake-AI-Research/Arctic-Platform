@@ -22,12 +22,17 @@ from pathlib import Path
 
 import pytest
 
+from arctic_platform.client import CortexConfig
+from arctic_platform.client.transport import JobHandles
 from arctic_platform.correctness.harness import hosted
 from arctic_platform.correctness.harness.config import load_config
 from arctic_platform.correctness.harness.hosted import HostedConnection
 from arctic_platform.correctness.harness.hosted import HostedTrainingJob
 from arctic_platform.correctness.harness.hosted import HostedTransport
+from arctic_platform.correctness.harness.hosted import is_local_cortex_gateway
+from arctic_platform.correctness.harness.hosted import require_local_cortex_gateway
 from arctic_platform.correctness.harness.hosted import save_and_resolve_checkpoint_id
+from arctic_platform.correctness.harness.hosted import save_local_checkpoint
 from arctic_platform.correctness.harness.hosted import training_sub_job
 from arctic_platform.correctness.harness.transport import Checkpoint
 
@@ -40,10 +45,7 @@ def _config():
 
 
 def _wire(cfg, **kwargs) -> dict:
-    """The create-job body for this config, validated the way ``create_job`` validates it."""
-    sub_job = training_sub_job(cfg, **kwargs)
-    sub_job.validate()
-    return sub_job.to_wire()
+    return training_sub_job(cfg, **kwargs)
 
 
 class _Client:
@@ -58,45 +60,40 @@ class _Client:
         self.created: list = []
         self.cancelled: list = []
         self.closed = False
-        self._results: dict = {}
+        self.transport = self
+        self.jobs = JobHandles(training="job-1:training:0")
 
-    def _request(self, result: dict) -> str:
-        request_id = f"request-{len(self._results) + 1}"
-        self._results[request_id] = result
-        return request_id
+    def create(self, config):
+        self.config = config
+        self.created.append((config.to_cortex()[0], config.hardware))
+        self.jobs = JobHandles(training=f"job-{len(self.created)}:training:0")
+        return self
 
-    def create_job(self, sub_jobs, hardware=None):
-        for sub_job in sub_jobs:
-            sub_job.validate()
-        self.created.append((sub_jobs[0].to_wire(), hardware))
-        return f"job-{len(self.created)}"
+    def fwd_bwd(self, body):
+        self.calls.append(("fwd-bwd", body))
+        return {"avg_loss": self.losses.pop(0) if self.losses else 0.0}
 
-    def wait_for_job(self, job_id):
-        self.calls.append(("wait", job_id))
+    def step(self, learning_rate=None):
+        self.calls.append(("step", learning_rate))
+        return {"global_steps": len(self.calls)}
 
-    def cancel_job(self, job_id):
-        self.cancelled.append(job_id)
-
-    def forward_backward(self, job_id, body):
-        self.calls.append(("fwd-bwd", job_id, body))
-        return self._request({"avg_loss": self.losses.pop(0) if self.losses else 0.0})
-
-    def step(self, job_id, learning_rate=None):
-        self.calls.append(("step", job_id, learning_rate))
-        return self._request({"global_steps": len(self._results)})
-
-    def save(self, job_id, checkpoint_type=None):
-        self.calls.append(("save", job_id, checkpoint_type))
+    def save_checkpoint(self, checkpoint_type=None, *, path=None):
+        self.calls.append(("save", checkpoint_type) if path is None else ("save", checkpoint_type, path))
         self.catalog = self.catalog + self.added
-        return self._request(self.save_result)
+        return self.save_result
 
-    def list_checkpoints(self, job_id):
+    def load_checkpoint(self, *, path):
+        self.calls.append(("load", path))
+        return {"checkpoint_path": path, "checkpoint_tag": "global_step10", "version": 10}
+
+    def list_checkpoints(self):
         return [dict(entry) for entry in self.catalog]
 
-    def poll_request(self, job_id, request_id):
-        return self._results[request_id]
+    def __enter__(self):
+        return self
 
-    def close(self):
+    def __exit__(self, *exc):
+        self.cancelled.append(str(self.jobs.training).split(":", 1)[0])
         self.closed = True
 
 
@@ -110,11 +107,11 @@ def test_the_created_sub_job_is_the_config_file_s_training_sub_job() -> None:
     assert wire["dtype"] == cfg.sub_job["dtype"]
     assert wire["seed"] == cfg.sub_job["seed"]
     for key, value in cfg.training.items():
-        if key == "optimizer":
+        if key in {"optimizer", "debug"}:
             continue
         assert wire["training_config"][key] == value, key
     for key, value in cfg.training["optimizer"].items():
-        assert wire["training_config"]["optimizer"][key] == value, key
+        assert wire["training_config"]["optimizer"]["name" if key == "type" else key] == value, key
 
 
 def test_building_a_sub_job_leaves_the_loaded_config_alone() -> None:
@@ -155,7 +152,7 @@ def test_the_checkpoint_id_is_the_stage_path_segment() -> None:
     )
 
     assert save_and_resolve_checkpoint_id(client, "job-1", "resumable") == "cp_4c1f0a2b"
-    assert ("save", "job-1", "resumable") in client.calls
+    assert ("save", "resumable") in client.calls
 
 
 def test_the_checkpoint_id_falls_back_to_what_the_save_added_to_the_catalog() -> None:
@@ -180,24 +177,25 @@ def test_one_iteration_is_a_forward_backward_then_a_step_at_the_requested_rate()
     """The loss is the forward-backward's, so it is read before the step that follows changes a parameter."""
     client = _Client(losses=[2.5])
 
-    loss = HostedTrainingJob(client, "job-1").fwd_bwd_step(b"frame", learning_rate=1e-3)
+    body = {"args": (), "kwargs": {}}
+    loss = HostedTrainingJob(client, "job-1").fwd_bwd_step(body, learning_rate=1e-3)
 
     assert loss == 2.5
-    assert client.calls == [("fwd-bwd", "job-1", b"frame"), ("step", "job-1", 1e-3)]
+    assert client.calls == [("fwd-bwd", body), ("step", 1e-3)]
 
 
 def test_a_forward_backward_that_reports_no_loss_is_an_error() -> None:
     class Silent(_Client):
-        def forward_backward(self, job_id, body):
-            return self._request({"metrics": {}})
+        def fwd_bwd(self, body):
+            return {"metrics": {}}
 
     with pytest.raises(RuntimeError, match="no avg_loss"):
-        HostedTrainingJob(Silent(), "job-1").fwd_bwd_step(b"frame", learning_rate=1e-3)
+        HostedTrainingJob(Silent(), "job-1").fwd_bwd_step({}, learning_rate=1e-3)
 
 
 def test_a_job_releases_its_gpus_when_its_block_ends(monkeypatch) -> None:
     client = _Client()
-    monkeypatch.setattr(hosted, "hosted_client", lambda connection: client)
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
 
     with HostedTransport(CONNECTION, _config()) as transport:
         with transport.job() as job:
@@ -209,7 +207,7 @@ def test_a_job_releases_its_gpus_when_its_block_ends(monkeypatch) -> None:
 
 def test_a_job_releases_its_gpus_when_the_block_raises(monkeypatch) -> None:
     client = _Client()
-    monkeypatch.setattr(hosted, "hosted_client", lambda connection: client)
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
 
     with pytest.raises(ZeroDivisionError):
         with HostedTransport(CONNECTION, _config()) as transport:
@@ -221,7 +219,7 @@ def test_a_job_releases_its_gpus_when_the_block_raises(monkeypatch) -> None:
 
 def test_a_resumed_job_is_created_from_the_checkpoint_it_was_given(monkeypatch) -> None:
     client = _Client()
-    monkeypatch.setattr(hosted, "hosted_client", lambda connection: client)
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
 
     with HostedTransport(CONNECTION, _config()) as transport:
         with transport.job(resume_from=Checkpoint(reference="cp_1", source_job="job-a")):
@@ -241,3 +239,275 @@ def test_creating_a_job_before_the_transport_is_entered_is_an_error() -> None:
 
 def test_the_connection_does_not_render_its_token() -> None:
     assert "not-a-token" not in repr(CONNECTION)
+
+
+def test_explicit_checkpoint_id_does_not_use_a_deepspeed_tag() -> None:
+    client = _Client(save_result={"checkpoint_id": "cp_new", "checkpoint_tag": "global_step10"})
+    assert save_and_resolve_checkpoint_id(client, "job-1", "resumable") == "cp_new"
+
+
+def test_an_ambiguous_catalog_delta_is_refused() -> None:
+    client = _Client(added=[{"checkpoint_id": "cp_one"}, {"checkpoint_id": "cp_two"}])
+    with pytest.raises(RuntimeError, match="cannot be identified"):
+        save_and_resolve_checkpoint_id(client, "job-1", "resumable")
+
+
+def test_checkpoint_jobs_preserve_dss_engine_gas_and_width(monkeypatch) -> None:
+    client = _Client()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    cfg = _config().at_gpu_width(8)
+    with HostedTransport(CONNECTION, cfg) as transport:
+        with transport.job():
+            pass
+        with transport.job(resume_from=Checkpoint("cp_new", "job-1")):
+            pass
+    assert len(client.created) == 2
+    for wire, hardware in client.created:
+        assert hardware == "H200"
+        assert wire["training_config"]["n_gpus"] == 8
+        assert wire["training_config"]["ds_config"]["gradient_accumulation_steps"] == 1
+    assert client.cancelled == ["job-1", "job-2"]
+
+
+def _local_backend(url="http://127.0.0.1:8003", **kwargs):
+    return CortexConfig(base_url=url, host=None, pat=None, **kwargs)
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:8003", "http://localhost:8003/", "http://[::1]:8003"])
+def test_local_gateway_accepts_only_explicit_http_loopback(url) -> None:
+    backend = _local_backend(url)
+    assert is_local_cortex_gateway(backend)
+    require_local_cortex_gateway(backend)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://localhost:8003",
+        "http://localhost.example:8003",
+        "http://127.0.0.2:8003",
+        "http://0.0.0.0:8003",
+        "http://10.0.0.1:8003",
+        "http://user:secret@localhost:8003",
+        "http://localhost:8003/api",
+        "http://localhost:8003/?value=secret",
+        "http://localhost:8003/#secret",
+    ],
+)
+def test_local_gateway_rejects_nonloopback_and_decorated_urls(url) -> None:
+    with pytest.raises(ValueError, match="unauthenticated HTTP loopback") as exc:
+        require_local_cortex_gateway(_local_backend(url))
+    assert "secret" not in str(exc.value)
+
+
+@pytest.mark.parametrize("options", [{"host": "server"}, {"pat": "not-a-token"}])
+def test_local_gateway_refuses_hosted_credentials(options) -> None:
+    backend = CortexConfig(base_url="http://127.0.0.1:8003", **options)
+    with pytest.raises(ValueError, match="unauthenticated HTTP loopback") as exc:
+        require_local_cortex_gateway(backend)
+    assert "not-a-token" not in str(exc.value)
+
+
+class _LocalClient(_Client):
+    def list_checkpoints(self):
+        raise AssertionError("the supplied local gateway has no checkpoint catalog")
+
+
+@pytest.mark.parametrize("checkpoint_type", ["resumable", "weights-only"])
+def test_local_save_uses_a_fresh_fast_path_without_catalog(monkeypatch, tmp_path, checkpoint_type) -> None:
+    root = tmp_path / "retained-checkpoint"
+    root.mkdir()
+    marker = root / "retained-evidence"
+    marker.write_text("preserve", encoding="ascii")
+    monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
+    client = _LocalClient(save_result={"checkpoint_path": str(root), "checkpoint_tag": "global_step10", "version": 10})
+
+    assert save_local_checkpoint(client, checkpoint_type) == root.resolve()
+    assert client.calls == [("save", checkpoint_type, str(root))]
+    assert marker.read_text(encoding="ascii") == "preserve"
+
+
+def test_local_resumable_checkpoint_keeps_the_saving_job_identity(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "checkpoint"
+    root.mkdir()
+    monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
+    client = _LocalClient(save_result={"checkpoint_path": str(root), "checkpoint_tag": "global_step10", "version": 10})
+    checkpoint = HostedTrainingJob(client, "owned-parent", local_gateway=True).save_resumable()
+    assert checkpoint == Checkpoint(reference=str(root), source_job="owned-parent")
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"checkpoint_path": None},
+        {"checkpoint_path": "relative/checkpoint"},
+        {"checkpoint_path": "/tmp/checkpoint"},
+        {"checkpoint_path": "/data-fast"},
+        {"checkpoint_path": "/data-fast/tmp/not-this-save"},
+        {"checkpoint_tag": None},
+        {"checkpoint_tag": "cp_123"},
+        {"checkpoint_tag": "global_step-1"},
+        {"checkpoint_tag": "global_step010"},
+        {"checkpoint_tag": "../global_step10"},
+        {"version": None},
+        {"version": "10"},
+        {"version": 10.0},
+        {"version": True},
+        {"version": 11},
+    ],
+)
+def test_local_save_rejects_inconsistent_metadata_and_retains_output(monkeypatch, tmp_path, changes) -> None:
+    root = tmp_path / "checkpoint"
+    root.mkdir()
+    marker = root / "retained-evidence"
+    marker.write_text("preserve", encoding="ascii")
+    monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
+    result = {"checkpoint_path": str(root), "checkpoint_tag": "global_step10", "version": 10, **changes}
+    with pytest.raises((ValueError, RuntimeError)):
+        save_local_checkpoint(_LocalClient(save_result=result), "resumable")
+    assert marker.read_text(encoding="ascii") == "preserve"
+
+
+@pytest.mark.parametrize("result", [None, [], "global_step10"])
+def test_local_save_rejects_nonmapping_response(monkeypatch, tmp_path, result) -> None:
+    monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: tmp_path)
+    client = _LocalClient()
+    client.save_result = result
+    with pytest.raises(RuntimeError, match="no checkpoint metadata"):
+        save_local_checkpoint(client, "resumable")
+
+
+def test_local_save_rejects_invalid_checkpoint_type_before_creating_storage(monkeypatch) -> None:
+    def unexpected(*args, **kwargs):
+        raise AssertionError("invalid type must not allocate storage")
+
+    monkeypatch.setattr(hosted, "correctness_workdir", unexpected)
+    with pytest.raises(ValueError, match="checkpoint_type"):
+        save_local_checkpoint(_LocalClient(), "unknown")
+
+
+def test_local_resume_creates_a_fresh_full_model_job_then_loads_before_training(monkeypatch, tmp_path) -> None:
+    cfg = _config()
+    before = json.dumps(cfg.sub_job, sort_keys=True)
+    root = tmp_path / "checkpoint"
+    root.mkdir()
+    (root / "latest").write_text("global_step10\n", encoding="ascii")
+    client = _LocalClient(
+        losses=[2.5],
+        save_result={"checkpoint_path": str(root), "checkpoint_tag": "global_step10", "version": 10},
+    )
+    monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+
+    with HostedTransport(_local_backend(), cfg) as transport:
+        with transport.job() as first:
+            checkpoint = first.save_resumable()
+        assert client.cancelled == ["job-1"]
+        with transport.job(resume_from=checkpoint) as resumed:
+            assert resumed.job_id == "job-2"
+            assert client.calls[-1] == ("load", str(root))
+            assert resumed.fwd_bwd_step({"args": (), "kwargs": {}}, learning_rate=1e-3) == 2.5
+
+    assert client.cancelled == ["job-1", "job-2"]
+    assert client.calls == [
+        ("save", "resumable", str(root)),
+        ("load", str(root)),
+        ("fwd-bwd", {"args": (), "kwargs": {}}),
+        ("step", 1e-3),
+    ]
+    for wire, hardware in client.created:
+        assert wire["model_name"] == cfg.model_name == "Qwen/Qwen3-8B"
+        assert "source_checkpoint_info" not in wire
+        assert hardware == "H200"
+        assert wire["training_config"]["n_gpus"] == cfg.n_gpus == 4
+        assert wire["training_config"]["ds_config"]["gradient_accumulation_steps"] == 1
+    assert json.dumps(cfg.sub_job, sort_keys=True) == before
+    assert root.is_dir()
+
+
+def test_local_resume_load_failure_releases_fresh_job_and_retains_checkpoint(monkeypatch, tmp_path) -> None:
+    class FailingLoad(_LocalClient):
+        def load_checkpoint(self, *, path):
+            super().load_checkpoint(path=path)
+            raise RuntimeError("runtime load unavailable")
+
+    client = FailingLoad()
+    (tmp_path / "latest").write_text("global_step10\n", encoding="ascii")
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(RuntimeError, match="runtime load unavailable"):
+        with HostedTransport(_local_backend(), _config()) as transport:
+            with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
+                raise AssertionError("must not train before a successful load")
+    assert client.cancelled == ["job-1"]
+    assert client.calls == [("load", str(tmp_path))]
+    assert tmp_path.is_dir()
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {},
+        {"checkpoint_tag": "global_step0", "version": 0},
+        {"checkpoint_tag": "global_step10", "version": True},
+        {"checkpoint_tag": "global_step10", "version": 9},
+    ],
+)
+def test_local_resume_rejects_unconfirmed_or_wrong_step_and_releases_fresh_job(monkeypatch, tmp_path, result) -> None:
+    class IncorrectLoad(_LocalClient):
+        def load_checkpoint(self, *, path):
+            super().load_checkpoint(path=path)
+            return {"checkpoint_path": path, **result}
+
+    (tmp_path / "latest").write_text("global_step10\n", encoding="ascii")
+    client = IncorrectLoad()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(RuntimeError, match="local checkpoint load"):
+        with HostedTransport(_local_backend(), _config()) as transport:
+            with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
+                raise AssertionError("must not train before confirmed restored step")
+    assert client.cancelled == ["job-1"]
+    assert tmp_path.is_dir()
+
+
+@pytest.mark.parametrize("marker", [None, b"", b"cp_123", b"global_step-1", b"\xff", b"global_step10" + b" " * 129])
+def test_local_resume_rejects_missing_or_invalid_marker_before_allocating_job(monkeypatch, tmp_path, marker) -> None:
+    def unexpected(*args, **kwargs):
+        raise AssertionError("invalid latest marker must not allocate a job")
+
+    if marker is not None:
+        (tmp_path / "latest").write_bytes(marker)
+    monkeypatch.setattr(hosted, "ArcticClient", unexpected)
+    with pytest.raises(ValueError, match="latest marker"):
+        with HostedTransport(_local_backend(), _config()) as transport:
+            with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
+                pass
+
+
+def test_local_resume_refuses_a_symlink_latest_marker(monkeypatch, tmp_path) -> None:
+    target = tmp_path / "real-marker"
+    target.write_text("global_step10\n", encoding="ascii")
+    (tmp_path / "latest").symlink_to(target)
+    with pytest.raises(ValueError, match="regular latest marker"):
+        with HostedTransport(_local_backend(), _config()) as transport:
+            with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
+                pass
+
+
+def test_local_resume_refuses_a_nonregular_latest_marker(tmp_path) -> None:
+    (tmp_path / "latest").mkdir()
+    with pytest.raises(ValueError, match="regular latest marker"):
+        with HostedTransport(_local_backend(), _config()) as transport:
+            with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
+                pass
+
+
+@pytest.mark.parametrize("reference", ["cp_hosted", "relative/checkpoint", "/tmp/checkpoint", "/data-fast"])
+def test_local_resume_rejects_nonfast_or_nonabsolute_reference_before_job_creation(monkeypatch, reference) -> None:
+    def unexpected(*args, **kwargs):
+        raise AssertionError("invalid reference must not create a training job")
+
+    monkeypatch.setattr(hosted, "ArcticClient", unexpected)
+    with pytest.raises(ValueError, match="/data-fast"):
+        with HostedTransport(_local_backend(), _config()) as transport:
+            with transport.job(resume_from=Checkpoint(reference, "owned-source")):
+                pass

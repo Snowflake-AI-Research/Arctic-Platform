@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from arctic_platform.client import OnPremConfig
 from arctic_platform.correctness.checks import inference_checkpoint_loss as check
 
 
@@ -29,6 +30,7 @@ def inference_run(tmp_path, monkeypatch):
     tokenizer = SimpleNamespace(save_pretrained=lambda path: None)
     distribution = {"examples": 1, "minimum_tokens": 4, "median_tokens": 4, "maximum_tokens": 4}
     cfg = SimpleNamespace(
+        model_name="Qwen/Qwen3-8B",
         training={"model_provider": "huggingface", "dtype": "bfloat16"},
         sub_job={},
         n_gpus=16,
@@ -67,7 +69,8 @@ def inference_run(tmp_path, monkeypatch):
     ports, jobs, allocations = [], [], []
 
     @contextmanager
-    def gateway(path, slots):
+    def gateway(path, slots, *, backend):
+        assert isinstance(backend, OnPremConfig)
         yield object()
 
     @contextmanager

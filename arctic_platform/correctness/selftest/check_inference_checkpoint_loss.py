@@ -22,11 +22,13 @@ failure mode the check exists to catch and the one a real run cannot distinguish
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from arctic_platform.client import CortexConfig
 from arctic_platform.correctness.checks import inference_checkpoint_loss as check
 from arctic_platform.correctness.harness import gsm8k
 from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
@@ -236,3 +238,133 @@ def test_forward_loss_reads_the_ap_response_contract() -> None:
     job = SimpleNamespace(client=client)
 
     assert forward_loss(None, job, {"batch": {}}) == pytest.approx(1.25)
+
+
+def _generate_results():
+    return [
+        {
+            "prompt_len": row.length,
+            "prompt_logprobs": [
+                None,
+                *[
+                    {999: {"logprob": -99.0}, str(token): {"logprob": -float(position)}}
+                    for position, token in enumerate(row.input_ids[1:])
+                ],
+            ],
+            # generate's token_ids are the newly generated token, not the scored input.
+            "token_ids": [999],
+        }
+        for row in ROWS
+    ]
+
+
+def test_cortex_selects_expected_prompt_tokens_not_first_dictionary_entries():
+    results = _generate_results()
+    results[0]["prompt_logprobs"][1] = {999: {"logprob": -99.0}, ROWS[0].input_ids[1]: -0.0}
+    normalized = check.cortex_prompt_logprobs(results, ROWS)
+    assert [row["token_ids"] for row in normalized] == [list(row.input_ids[1:]) for row in ROWS]
+    assert check.target_answer_logprobs(normalized, ROWS) == [[-2.0, -3.0, -4.0], [-1.0, -2.0]]
+
+
+@pytest.mark.parametrize("results", [None, {}, [], _generate_results()[:1], _generate_results() + [{}]])
+def test_cortex_rejects_wrong_generate_row_counts(results):
+    with pytest.raises(RuntimeError, match="one row per validation example"):
+        check.cortex_prompt_logprobs(results, ROWS)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "non_dict_row",
+        "missing_positions",
+        "short_positions",
+        "long_positions",
+        "initial_dict",
+        "interior_none",
+        "empty_position",
+        "missing_token",
+        "duplicate_token",
+        "wrong_prompt_length",
+        "missing_logprob",
+        "nan",
+        "inf",
+        "bool",
+        "text",
+    ],
+)
+def test_cortex_rejects_malformed_prompt_logprobs(change):
+    results = _generate_results()
+    row = results[0]
+    token = ROWS[0].input_ids[1]
+    if change == "non_dict_row":
+        results[0] = None
+    elif change == "missing_positions":
+        del row["prompt_logprobs"]
+    elif change == "short_positions":
+        row["prompt_logprobs"].pop()
+    elif change == "long_positions":
+        row["prompt_logprobs"].append({token: -1.0})
+    elif change == "initial_dict":
+        row["prompt_logprobs"][0] = {}
+    elif change == "wrong_prompt_length":
+        row["prompt_len"] += 1
+    else:
+        values = {
+            "interior_none": None,
+            "empty_position": {},
+            "missing_token": {999: {"logprob": -1.0}},
+            "duplicate_token": {token: -1.0, str(token): -1.0},
+            "missing_logprob": {token: {"rank": 1}},
+            "nan": {token: {"logprob": float("nan")}},
+            "inf": {token: {"logprob": float("-inf")}},
+            "bool": {token: {"logprob": True}},
+            "text": {token: {"logprob": "-1.0"}},
+        }
+        row["prompt_logprobs"][1] = values[change]
+    with pytest.raises(RuntimeError):
+        check.cortex_prompt_logprobs(results, ROWS)
+
+
+@pytest.mark.parametrize("boundary", [0, -1, ROWS[0].length, ROWS[0].length + 1])
+def test_cortex_rejects_invalid_answer_boundaries(boundary):
+    examples = [replace(ROWS[0], n_prompt=boundary), ROWS[1]]
+    with pytest.raises(RuntimeError, match="answer span"):
+        check.cortex_prompt_logprobs(_generate_results(), examples)
+
+
+@pytest.mark.parametrize(
+    "results", [[], positional_log_prob_results(ROWS)[:1], positional_log_prob_results(ROWS) + [{}]]
+)
+def test_target_extraction_does_not_silently_truncate_rows(results):
+    with pytest.raises(RuntimeError, match="validation examples"):
+        check.target_answer_logprobs(results, ROWS)
+
+
+@pytest.mark.parametrize("shape", [(1, 6), (3, 6), (2, 6, 1)])
+def test_reference_extraction_requires_exact_rows_and_rank(shape):
+    with pytest.raises(RuntimeError, match="two-dimensional row"):
+        check.reference_answer_logprobs(torch.zeros(shape), ROWS)
+
+
+def test_nonfinite_answer_scores_fail_instead_of_passing_the_gate():
+    values = positional_logprobs_tensor(ROWS, 6)
+    values[0, ROWS[0].n_prompt] = float("nan")
+    with pytest.raises(RuntimeError, match="finite"):
+        check.reference_answer_logprobs(values, ROWS)
+    results = positional_log_prob_results(ROWS)
+    results[0]["logprobs"][0] = float("nan")
+    with pytest.raises(RuntimeError, match="finite"):
+        check.target_answer_logprobs(results, ROWS)
+
+
+@pytest.mark.parametrize("model_name", [None, "", "   ", "/node/local/model"])
+def test_cortex_requires_full_configured_model_before_loading_tokenizer(model_name, tmp_path, monkeypatch):
+    monkeypatch.setattr(check.gsm8k, "load_tokenizer", lambda *args: pytest.fail("must reject before tokenizer load"))
+    ctx = SimpleNamespace(
+        client_backend=CortexConfig(base_url="http://unused"),
+        cfg=SimpleNamespace(model_name=model_name),
+        target_model_name="published-reduced-fixture",
+        spec=SimpleNamespace(model=SimpleNamespace(cache_path="/local/reference")),
+    )
+    with pytest.raises(ValueError, match="full configured model"):
+        check._run(ctx)

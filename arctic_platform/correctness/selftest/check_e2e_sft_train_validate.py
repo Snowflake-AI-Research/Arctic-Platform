@@ -318,14 +318,19 @@ def test_reference_fused_cross_entropy_matches_product_selection(tmp_path) -> No
     assert cfg({"model_provider": "huggingface"}).fused_cross_entropy is False
 
 
-def test_reference_optimizer_backend_matches_product_selection() -> None:
-    def cfg(optimizer):
-        return SimpleNamespace(training={"optimizer": optimizer})
-
-    assert check.reference_optimizer_backend(cfg({"name": "AdamW"})) == "fused_adam"
-    assert check.reference_optimizer_backend(cfg({"name": "FusedAdam"})) == "fused_adam"
-    assert check.reference_optimizer_backend(cfg({"name": "AdamW", "fused": False})) == "torch"
-    assert check.reference_optimizer_backend(cfg({"name": "torch_adamw"})) == "torch"
+@pytest.mark.parametrize("name", ["AdamW", "FusedAdam", "torch_adamw"])
+def test_reference_uses_independent_unfused_pytorch_adamw(name) -> None:
+    trajectory = AdamWTrajectory(
+        _model(),
+        {**ADAMW, "name": name},
+        learning_rate=1e-2,
+        gradient_clipping=None,
+        optimizer_dtype="float32",
+    )
+    trajectory.step(_gradients(trajectory._model))
+    assert type(trajectory._optimizer) is torch.optim.AdamW
+    assert trajectory._optimizer.defaults["fused"] is False
+    assert trajectory._optimizer.defaults["foreach"] is False
 
 
 def test_trajectories_of_different_lengths_are_refused() -> None:

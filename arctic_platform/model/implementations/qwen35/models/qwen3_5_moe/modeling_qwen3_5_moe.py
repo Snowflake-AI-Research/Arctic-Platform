@@ -16,7 +16,6 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 from transformers.utils import logging
 
-from arctic_platform.model.implementations.debug.determinism import flash_attention_determinism_must_comply
 from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
 from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
@@ -201,48 +200,6 @@ def torch_chunk_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
-def _packed_sequence_indices(
-    cu_seqlens: torch.LongTensor, *, batch_size: int, seq_len: int, device: torch.device
-) -> torch.LongTensor:
-    """Expand packed boundaries into the batch-shaped segment indices required by causal-conv1d."""
-    segment_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    seq_idx = torch.repeat_interleave(
-        torch.arange(segment_lengths.numel(), dtype=torch.int32, device=device),
-        segment_lengths,
-    )
-    expected_tokens = batch_size * seq_len
-    if seq_idx.numel() != expected_tokens:
-        raise ValueError(
-            f"cu_seqlens describe {seq_idx.numel()} tokens, but hidden states contain {expected_tokens} "
-            f"({batch_size} x {seq_len})"
-        )
-    return seq_idx.reshape(batch_size, seq_len)
-
-
-def _has_multiple_packed_sequences(cu_seqlens: torch.LongTensor | None) -> bool:
-    return cu_seqlens is not None and cu_seqlens.numel() > 2
-
-
-def _segmented_causal_conv1d(
-    conv1d: nn.Conv1d,
-    mixed_qkv: torch.Tensor,
-    cu_seqlens: torch.LongTensor,
-) -> torch.Tensor:
-    total_tokens = int(cu_seqlens[-1].item())
-    if total_tokens != mixed_qkv.shape[-1]:
-        raise ValueError(
-            f"cu_seqlens describe {total_tokens} tokens, but convolution input contains {mixed_qkv.shape[-1]}"
-        )
-
-    cu = cu_seqlens.tolist()
-    conv_outs = []
-    for start, stop in zip(cu[:-1], cu[1:], strict=True):
-        if start == stop:
-            continue
-        conv_outs.append(conv1d(mixed_qkv[:, :, start:stop])[:, :, : stop - start])
-    return F.silu(torch.cat(conv_outs, dim=-1))
-
-
 class Qwen3_5MoeGatedDeltaNet(nn.Module):
     """GatedDeltaNet linear attention with Conv1d, beta/gamma gates, and chunk delta rule."""
 
@@ -299,9 +256,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.LongTensor | None = None,
     ) -> torch.Tensor:
-        output_batch_size, output_seq_len, hidden_size = hidden_states.shape
-        if cu_seqlens is not None and output_batch_size > 1 and getattr(self, "cp_group", None) is None:
-            hidden_states = hidden_states.reshape(1, output_batch_size * output_seq_len, hidden_size)
         batch_size, seq_len, _ = hidden_states.shape
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
@@ -321,9 +275,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             global_cu_seqlens = getattr(self, "_dss_sp_global_cu_seqlens", None)
             if not torch.is_tensor(global_cu_seqlens):
                 raise RuntimeError("head-parallel GatedDeltaNet requires global packed cu_seqlens")
-            causal_convolution = None if _has_multiple_packed_sequences(global_cu_seqlens) else self._causal_conv1d_fn
             core_attn_out, _ = head_parallel_gated_delta_net(
-                causal_convolution,
+                self._causal_conv1d_fn,
                 self._chunk_gated_delta_rule,
                 query,
                 key,
@@ -345,15 +298,14 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             )
         else:
             mixed_qkv = mixed_qkv.transpose(1, 2)
-            if _has_multiple_packed_sequences(cu_seqlens):
-                # The causal-conv1d seq_idx path is not equivalent to per-sequence convolution for packed rows.
-                mixed_qkv = _segmented_causal_conv1d(self.conv1d, mixed_qkv, cu_seqlens)
-            elif self._causal_conv1d_fn is not None:
+            if self._causal_conv1d_fn is not None:
                 seq_idx = None
                 if cu_seqlens is not None:
-                    seq_idx = _packed_sequence_indices(
-                        cu_seqlens, batch_size=batch_size, seq_len=seq_len, device=hidden_states.device
-                    )
+                    seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+                    seq_idx = torch.repeat_interleave(
+                        torch.arange(seg_lens.numel(), dtype=torch.int32, device=hidden_states.device),
+                        seg_lens,
+                    ).unsqueeze(0)
                 mixed_qkv = self._causal_conv1d_fn(
                     x=mixed_qkv,
                     weight=self.conv1d.weight.squeeze(1),
@@ -362,7 +314,13 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     seq_idx=seq_idx,
                 )
             elif cu_seqlens is not None:
-                mixed_qkv = _segmented_causal_conv1d(self.conv1d, mixed_qkv, cu_seqlens)
+                cu = cu_seqlens.tolist()
+                conv_outs = []
+                for start, stop in zip(cu[:-1], cu[1:], strict=True):
+                    if start == stop:
+                        continue
+                    conv_outs.append(self.conv1d(mixed_qkv[:, :, start:stop])[:, :, : stop - start])
+                mixed_qkv = F.silu(torch.cat(conv_outs, dim=-1))
             else:
                 mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
             mixed_qkv = mixed_qkv.transpose(1, 2)
@@ -394,8 +352,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
-        output = self.out_proj(core_attn_out)
-        return output.reshape(output_batch_size, output_seq_len, -1)
+        return self.out_proj(core_attn_out)
 
 
 # ---------------------------------------------------------------------------
@@ -538,10 +495,7 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
         # read here. Resolving it at construction means a request the installed kernel cannot honour at this head
         # dimension refuses before any training runs.
         self._deterministic = resolve_flash_attention_determinism(
-            self.func,
-            config.head_dim,
-            f"flash_attention_{flash_attn_version}",
-            must_comply=flash_attention_determinism_must_comply(),
+            self.func, config.head_dim, f"flash_attention_{flash_attn_version}"
         )
 
     def _compute_attention(self, q, k, v, cu_seqlens, max_seqlen):
@@ -667,14 +621,13 @@ def _shared_expert_gate(
     Sequence parallelism changes the token dimension of this ``D -> 1``
     projection. cuBLAS can select a different BF16 kernel for the sharded
     matrix, and a one-ULP gate change is amplified by later residual layers.
-    Keeping the projection reduction in FP32 makes the token-local result
-    stable without gathering sequence shards. Round logits before the sigmoid
-    to preserve the model's activation-dtype gate and its derivative.
+    Keeping the reduction and sigmoid in FP32 makes the token-local result
+    stable without gathering sequence shards.
     """
     bias = gate.bias.float() if gate.bias is not None else None
     with torch.autocast(device_type=hidden_states.device.type, enabled=False):
         logits = F.linear(hidden_states.float(), gate.weight.float(), bias)
-        return torch.sigmoid(logits.to(dtype=hidden_states.dtype))
+        return torch.sigmoid(logits).to(dtype=hidden_states.dtype)
 
 
 class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
@@ -697,7 +650,6 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
             route_norm=True,
             route_scale=1.0,
             score_before_experts=False,
-            route_weights_dtype="logits",
             top_k=config.num_experts_per_tok,
             use_grouped_mm=config.use_grouped_mm,
             load_balance_coeff=config.load_balance_coeff,
@@ -750,7 +702,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
         shared_output = _shared_expert_gate(hidden_flat, self.shared_expert_gate) * shared_output
         shared_output = shared_output.view(bs, slen, dim)
 
-        hidden_states = residual + (routed_output + shared_output)
+        hidden_states = residual + routed_output + shared_output
         return hidden_states
 
 
@@ -851,7 +803,6 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        output_batch_size, output_seq_len = inputs_embeds.shape[:2]
         if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
             flat_position_ids = position_ids.view(-1)
             # Segment lengths from boundary indices (where position_ids resets to 0), not position values, so
@@ -866,9 +817,6 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             max_seqlen = int(segment_lengths.max().item())
             cu_seqlens = torch.cat([segment_lengths.new_zeros(1), segment_lengths.cumsum(dim=0, dtype=torch.int32)])
             torch._dynamo.mark_dynamic(cu_seqlens, 0)
-            if output_batch_size > 1:
-                inputs_embeds = inputs_embeds.reshape(1, output_batch_size * output_seq_len, -1)
-                position_ids = position_ids.reshape(1, output_batch_size * output_seq_len)
         else:
             max_seqlen = None
             cu_seqlens = None
@@ -887,7 +835,6 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             )
 
         hidden_states = self.norm(hidden_states)
-        hidden_states = hidden_states.reshape(output_batch_size, output_seq_len, -1)
         return MoeModelOutputWithPast(last_hidden_state=hidden_states)
 
 
@@ -1045,8 +992,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
     @classmethod
     def is_prime_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
-        prime_names = ("mlp.router.gate.weight", "mlp.experts.w1", ".shared_expert.w1.weight")
-        return any(any(prime_name in name for prime_name in prime_names) for name in state_dict)
+        return any("mlp.experts.w1" in name for name in state_dict)
 
     @classmethod
     def convert_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:

@@ -157,11 +157,16 @@ class TestSpec:
 NON_MODEL_PROCESSOR_SIDECARS = frozenset({"preprocessor_config.json", "video_preprocessor_config.json"})
 
 
-def hash_directory(path: Path, suffixes=(".safetensors", ".json")) -> str:
+def hash_directory(path: Path, suffixes=(".safetensors", ".json"), *, exclude_names=()) -> str:
     """Hash model and tokenizer assets while ignoring processor metadata that does not affect text execution."""
     h = hashlib.sha256()
     for f in sorted(Path(path).rglob("*")):
-        if f.is_file() and f.suffix in suffixes and f.name not in NON_MODEL_PROCESSOR_SIDECARS:
+        if (
+            f.is_file()
+            and f.suffix in suffixes
+            and f.name not in NON_MODEL_PROCESSOR_SIDECARS
+            and f.name not in exclude_names
+        ):
             h.update(f.name.encode())
             h.update(str(f.stat().st_size).encode())
     return h.hexdigest()[:16]

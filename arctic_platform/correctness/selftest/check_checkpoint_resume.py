@@ -184,7 +184,7 @@ def _context(transport, tmp_path):
         cfg=SimpleNamespace(training={}),
         spec=_Gate(),
         arms=[SimpleNamespace(name="gas1", global_batch_size=2, max_seq_len=64, dss_microbatches=1)],
-        transport_for=lambda workdir, *, arm: transport,
+        transport_for=lambda workdir: transport,
     )
 
 
@@ -219,43 +219,40 @@ def test_every_iteration_steps_at_the_check_s_own_learning_rate(tmp_path) -> Non
     assert rates == {checkpoint_resume.LEARNING_RATE}
 
 
-def test_gas4_packs_the_same_microbatches_for_uninterrupted_and_resumed_jobs(tmp_path) -> None:
+def test_gas4_uses_identical_plain_requests_for_uninterrupted_and_resumed_jobs(tmp_path) -> None:
     transport = _Transport()
     ctx = _context(transport, tmp_path)
     ctx.config_id = "qwen3-8b-h200-train-sft-full-4gpus-64k"
     ctx.arms = [SimpleNamespace(name="gas4", global_batch_size=8, max_seq_len=64, dss_microbatches=4)]
     calls = []
 
-    def transport_for(workdir, *, arm):
-        calls.append((workdir, arm.dss_microbatches))
+    def transport_for(workdir):
+        calls.append(workdir)
         return transport
 
     ctx.transport_for = transport_for
     results = checkpoint_resume.run(ctx)
 
-    assert calls == [(tmp_path / checkpoint_resume.TEST_ID / "gas4", 4)]
+    assert calls == [tmp_path / checkpoint_resume.TEST_ID / "gas4"]
     assert [result.outcome for result in results] == [Outcome.PASS]
     bodies = checkpoint_resume._iteration_bodies(ctx, ctx.arms[0])
     expected = checkpoint_resume.iteration_batches(ctx, ctx.arms[0])
     for body, batch in zip(bodies, expected):
-        assert len(body["batch"]) == 4
-        assert all(microbatch["input_ids"].shape == (2, 64) for microbatch in body["batch"])
-        assert torch.equal(torch.cat([mb["input_ids"] for mb in body["batch"]]), batch.input_ids)
-        assert torch.equal(torch.cat([mb["labels"] for mb in body["batch"]]), batch.labels)
-        assert body["processing"] == {
-            "loss_fn": "sft_ce",
-            "config": {"logits_optimization": "memory", "logits_optimization_peak_mem_size_in_gib": 4},
-        }
+        assert isinstance(body["batch"], dict)
+        assert body["batch"]["input_ids"].shape == (8, 64)
+        assert torch.equal(body["batch"]["input_ids"], batch.input_ids)
+        assert torch.equal(body["batch"]["labels"], batch.labels)
+        assert body["processing"] == {"loss_fn": "sft"}
     uninterrupted, first_half, resumed = transport.jobs
     for full_body, split_body in zip(uninterrupted.bodies, first_half.bodies + resumed.bodies):
         assert torch.equal(
-            torch.cat([mb["input_ids"] for mb in full_body["batch"]]),
-            torch.cat([mb["input_ids"] for mb in split_body["batch"]]),
+            full_body["batch"]["input_ids"],
+            split_body["batch"]["input_ids"],
         )
     assert resumed.resume_from == first_half.saved
 
 
-def test_gateway_transport_preserves_case_accumulation_for_all_three_jobs(tmp_path, monkeypatch) -> None:
+def test_gateway_transport_preserves_config_accumulation_for_all_three_jobs(tmp_path, monkeypatch) -> None:
     payloads = []
 
     @contextlib.contextmanager
@@ -266,19 +263,25 @@ def test_gateway_transport_preserves_case_accumulation_for_all_three_jobs(tmp_pa
     monkeypatch.setattr(dss_driver, "running_job", running_job)
     transport = dss_driver.GatewayTransport(
         tmp_path,
-        {"n_gpus": 4, "ds_config": {"train_micro_batch_size_per_gpu": 1, "train_batch_size": 4}},
+        {
+            "n_gpus": 4,
+            "ds_config": {
+                "train_micro_batch_size_per_gpu": 1,
+                "train_batch_size": 4,
+                "gradient_accumulation_steps": 1,
+            },
+        },
         "/models/reduced",
         1234,
         slots=4,
-        gradient_accumulation_steps=4,
     )
     for checkpoint in (None, None, Checkpoint(reference="/saved/step10", source_job="/saved/step10")):
         with transport.job(resume_from=checkpoint):
             pass
 
     assert len(payloads) == 3
-    assert all(payload["training_config"]["ds_config"]["gradient_accumulation_steps"] == 4 for payload in payloads)
-    assert all(payload["training_config"]["ds_config"]["train_batch_size"] == 16 for payload in payloads)
+    assert all(payload["training_config"]["ds_config"]["gradient_accumulation_steps"] == 1 for payload in payloads)
+    assert all(payload["training_config"]["ds_config"]["train_batch_size"] == 4 for payload in payloads)
 
 
 def test_a_case_that_raises_fails_that_case_alone(tmp_path) -> None:

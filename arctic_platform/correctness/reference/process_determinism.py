@@ -39,9 +39,6 @@ def pin_reduction_order(model_path: str, attn_implementation: str) -> None:
     torch.use_deterministic_algorithms(True, warn_only=True)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    from arctic_platform.model.implementations.debug.determinism import pin_fla_gdn_autotuners
-
-    pin_fla_gdn_autotuners(model_path)
     request_flash_attention_determinism(model_path, attn_implementation)
 
 

@@ -234,10 +234,12 @@ def main(out: Path):
     from arctic_platform.correctness.harness.dss_driver import build_payload
     from arctic_platform.correctness.harness.dss_driver import fwd_bwd_step
     from arctic_platform.correctness.harness.dss_driver import gateway
-    from arctic_platform.correctness.harness.dss_driver import pack_microbatches
     from arctic_platform.correctness.harness.dss_driver import running_job
     from arctic_platform.correctness.harness.spec import TestSpec
     from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
+
+    from .execution_controls import pack_microbatches
+    from .execution_controls import with_accumulation
 
     assert "B200" in torch.cuda.get_device_name()
     out.mkdir(parents=True, exist_ok=False)
@@ -256,11 +258,10 @@ def main(out: Path):
     cfg, spec = load_config(CONFIG), TestSpec.read(SPEC)
     arm = spec.arms[0]
     payload = build_payload(
-        cfg.training,
+        with_accumulation(cfg.training, arm.dss_microbatches),
         spec.model.cache_path,
         SEED,
         attn_implementation=cfg.attention_implementation,
-        gradient_accumulation_steps=arm.dss_microbatches,
     )
     with capture_workers(out), gateway(out / "gateway", cfg.n_gpus) as url:
         with running_job(url, payload) as job_id:

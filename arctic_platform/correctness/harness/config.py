@@ -352,6 +352,10 @@ def _legacy_views(native: ArcticClientConfig) -> tuple[Dict[str, Any], List[Dict
 def load_config(path: str | Path) -> LoadedConfig:
     path = Path(path)
     raw = normalize_ints(json.loads(path.read_text()))
+    backend = raw.get("backend")
+    if isinstance(backend, dict) and backend.get("type") == "onprem" and backend.get("protocol") == "ray":
+        # Retained reviewed recipes predate the public client's single on-prem protocol.
+        backend.pop("protocol")
     native = ArcticClientConfig.model_validate(raw)
     training, sub_jobs = _legacy_views(native)
     return LoadedConfig(config_id=config_id(path), path=path, sub_job=training, sub_jobs=sub_jobs, native=native)
