@@ -41,6 +41,7 @@ import textwrap
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
@@ -542,7 +543,7 @@ def _sdpa_after_a_graph_break(*args, **kwargs):
     return sdpa_attention_forward(*args, **kwargs)
 
 
-def _graph_break_model(monkeypatch, mode: str, where: str) -> nn.Module:
+def _graph_break_model(monkeypatch, mode: str, where: str, *, sequence_parallel: bool = False) -> nn.Module:
     """A model with two full-attention layers whose compiled decoder layers break their graph at ``where``."""
     set_seed(0)
     config = _config(layer_types=["linear_attention", "full_attention"] * 2)
@@ -552,7 +553,7 @@ def _graph_break_model(monkeypatch, mode: str, where: str) -> nn.Module:
             parameter.normal_(0.0, 0.2)
     model.train()
     if mode != "stock":
-        _patched(model, fp32_residual=mode == "fp32-residual")
+        _patched(model, sequence_parallel=sequence_parallel, fp32_residual=mode == "fp32-residual")
     if where == "in-attention":
         monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._local_mapping, _GRAPH_BREAK_ATTENTION, _sdpa_after_a_graph_break)
         model.config._attn_implementation = _GRAPH_BREAK_ATTENTION
@@ -565,9 +566,16 @@ def _graph_break_model(monkeypatch, mode: str, where: str) -> nn.Module:
     return model
 
 
-@pytest.mark.parametrize("mode", _MODES)
-@pytest.mark.parametrize("checkpointing", [False, True], ids=["eager-layers", "checkpointed-layers"])
-@pytest.mark.parametrize("where", ["in-attention", "before-attention"])
+# The patched modes everywhere a graph break used to reuse another layer's compiled attention code, and one stock
+# control. A break before the attention of layers that are not checkpointed is left out: it never reused that code.
+_GRAPH_BREAK_CASES = [
+    pytest.param(mode, checkpointing, where, id=f"{where}-{'checkpointed' if checkpointing else 'eager'}-{mode}")
+    for mode in ("fp32-parity", "fp32-residual")
+    for checkpointing, where in ((False, "in-attention"), (True, "in-attention"), (True, "before-attention"))
+] + [pytest.param("stock", True, "in-attention", id="in-attention-checkpointed-stock")]
+
+
+@pytest.mark.parametrize(("mode", "checkpointing", "where"), _GRAPH_BREAK_CASES)
 def test_compiled_layers_with_a_graph_break_match_eager(monkeypatch, mode, checkpointing, where):
     reference_model = _graph_break_model(monkeypatch, mode, where)
     compiled_model = copy.deepcopy(reference_model)
@@ -578,6 +586,80 @@ def test_compiled_layers_with_a_graph_break_match_eager(monkeypatch, mode, check
     expected_output, expected_grads = _forward_backward(reference_model)
     try:
         output, grads = _forward_backward(compiled_model)
+    finally:
+        torch._dynamo.reset()
+    _assert_same_run(output, grads, expected_output, expected_grads)
+
+
+@pytest.fixture
+def single_rank_group():
+    """A single-rank gloo process group: the default one, or one created here and destroyed again afterwards."""
+    created = not dist.is_initialized()
+    if created:
+        dist.init_process_group(backend="gloo", world_size=1, rank=0, store=dist.HashStore())
+    assert dist.get_world_size() == 1
+    yield dist.group.WORLD
+    if created and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _sequence_parallel(monkeypatch, model: nn.Module, group, *, fp32_beta: bool) -> nn.Module:
+    """``model`` behind the sequence-parallel GatedDeltaNet wrapper, on one rank, with stand-ins for its kernels.
+
+    With one rank the all-to-all is the identity. The causal convolution and the gated delta rule need kernels this
+    CPU does not have, so they are replaced by differentiable stand-ins; the attention layers are the ones checked.
+    """
+    from arctic_platform.model.implementations.gpu.sp import gated_delta_net as sp_gated_delta_net
+    from arctic_platform.model.implementations.gpu.sp.transformers import (
+        configure_transformers_sequence_parallel_model,
+    )
+
+    def convolution(*, x, weight, bias, activation, seq_idx):
+        return F.silu(x + weight.mean())
+
+    def gated_delta_rule(query, key, value, g, beta, **kwargs):
+        return value * 0.5, None
+
+    monkeypatch.setattr(sp_gated_delta_net, "sequence_head_all_to_all", lambda group, tensor, **kwargs: tensor)
+    monkeypatch.setattr(
+        sp_gated_delta_net,
+        "_resolve_gated_delta_net_kernel",
+        lambda module, attribute: gated_delta_rule if attribute == "chunk_gated_delta_rule" else convolution,
+    )
+    assert configure_transformers_sequence_parallel_model(model, group, fp32_beta=fp32_beta) == 2
+    return model
+
+
+def _sequence_parallel_forward_backward(model: nn.Module):
+    model.zero_grad(set_to_none=True)
+    # The sequence-parallel wrapper locates the packed sequences from the position ids.
+    hidden = model.model(input_ids=_input_ids(), position_ids=torch.arange(_SEQ).unsqueeze(0)).last_hidden_state
+    hidden.float().pow(2).mean().backward()
+    grads = {
+        name.replace("_checkpoint_wrapped_module.", ""): parameter.grad.clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+    return hidden.detach(), grads
+
+
+@pytest.mark.parametrize("mode", ["fp32-parity", "fp32-residual"])
+def test_compiled_checkpointed_layers_with_sequence_parallelism_match_eager(monkeypatch, single_rank_group, mode):
+    # The wrapper binds the forwards it replaces to their model, so each model is built and wrapped on its own.
+    reference_model, compiled_model = (
+        _sequence_parallel(
+            monkeypatch,
+            _graph_break_model(monkeypatch, mode, "in-attention", sequence_parallel=True),
+            single_rank_group,
+            fp32_beta=True,
+        )
+        for _ in range(2)
+    )
+    compiled_model = _compiled_layers(_checkpointed(compiled_model, True), fullgraph=False)
+
+    expected_output, expected_grads = _sequence_parallel_forward_backward(reference_model)
+    try:
+        output, grads = _sequence_parallel_forward_backward(compiled_model)
     finally:
         torch._dynamo.reset()
     _assert_same_run(output, grads, expected_output, expected_grads)
