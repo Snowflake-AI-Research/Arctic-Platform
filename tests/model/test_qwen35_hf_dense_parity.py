@@ -41,7 +41,6 @@ import textwrap
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
@@ -589,18 +588,6 @@ def test_compiled_layers_with_a_graph_break_match_eager(monkeypatch, mode, check
     finally:
         torch._dynamo.reset()
     _assert_same_run(output, grads, expected_output, expected_grads)
-
-
-@pytest.fixture
-def single_rank_group():
-    """A single-rank gloo process group: the default one, or one created here and destroyed again afterwards."""
-    created = not dist.is_initialized()
-    if created:
-        dist.init_process_group(backend="gloo", world_size=1, rank=0, store=dist.HashStore())
-    assert dist.get_world_size() == 1
-    yield dist.group.WORLD
-    if created and dist.is_initialized():
-        dist.destroy_process_group()
 
 
 def _sequence_parallel(monkeypatch, model: nn.Module, group, *, fp32_beta: bool) -> nn.Module:
