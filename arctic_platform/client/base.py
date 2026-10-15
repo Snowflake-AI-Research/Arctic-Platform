@@ -54,6 +54,7 @@ from arctic_platform.client.requests import wake_training_request
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
 from arctic_platform.client.transport import initialize_or_cleanup
+from arctic_platform.client.transport import wait_or_cleanup
 
 
 def make_transport(client_config: ArcticClientConfig, server_state: Any = None) -> Transport:
@@ -106,10 +107,20 @@ class _ArcticClientCore:
     block or are awaited.
     """
 
-    def __init__(self, config: ArcticClientConfig, server_state: Any = None) -> None:
+    def __init__(self, config: ArcticClientConfig, server_state: Any = None, *, wait: bool = True) -> None:
+        """Provision or reattach to the jobs.
+
+        ``wait=False`` returns as soon as the jobs are requested, so the caller
+        holds a client it can ``shutdown`` during a placement wait that may take
+        hours. Call ``wait_until_ready`` before any op.
+        """
         self.config = config
         self.transport = make_transport(config, server_state=server_state)
-        self.jobs = initialize_or_cleanup(self.transport, client_config=config)
+        self.jobs = initialize_or_cleanup(self.transport, client_config=config, wait=wait)
+
+    def wait_until_ready(self) -> None:
+        """Block until the jobs accept ops; cancel them if the wait fails or is interrupted."""
+        self.jobs = wait_or_cleanup(self.transport)
 
     def reconnect_config(self) -> ArcticClientConfig:
         """A serializable config that reattaches to these jobs in another process."""

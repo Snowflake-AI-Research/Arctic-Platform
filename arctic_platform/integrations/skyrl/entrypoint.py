@@ -36,15 +36,23 @@ variable deciding it: the recipe names this module or it does not.
 
 from __future__ import annotations
 
+import contextlib
+import signal
+import threading
 from typing import Any
+from typing import Iterator
 from typing import Optional
 
 import ray
 
 __all__ = ["launch_driver", "main", "patch_upstream"]
 
+_RECONNECT_FIELDS = ("training_job_id", "sampling_job_id", "log_prob_job_id")
+# Clients in this process that created their jobs, as opposed to reattaching.
+_created_clients: list[Any] = []
 
-def _create_cortex_client(config: Any, server_state: Any = None) -> Any:
+
+def _create_cortex_client(config: Any, server_state: Any = None, *, wait: bool = True) -> Any:
     """Stand-in for upstream's ``create_arctic_rl_client``.
 
     ``server_state`` exists only to match upstream's signature: Cortex holds the
@@ -52,7 +60,41 @@ def _create_cortex_client(config: Any, server_state: Any = None) -> Any:
     """
     from arctic_platform.integrations._cortex_dispatch import create_cortex_client
 
-    return create_cortex_client(config)
+    client = create_cortex_client(config, wait=wait)
+    if all(getattr(config, field, None) is None for field in _RECONNECT_FIELDS):
+        _created_clients.append(client)
+    return client
+
+
+def _exit_on_sigterm(signum: int, frame: Any) -> None:
+    raise SystemExit(128 + signum)
+
+
+@contextlib.contextmanager
+def _releasing_created_jobs() -> Iterator[None]:
+    """Cancel the jobs this driver created when the block exits, however it exits.
+
+    SkyRL never calls ``shutdown``. Python's default SIGTERM action skips
+    ``finally``, and Ray only installs a handler that raises ``SystemExit`` from
+    ``ray.init`` on, which is after the placement wait. A process killed outright
+    is left to the server's idle timeout.
+    """
+    from loguru import logger
+
+    previous = None
+    if threading.current_thread() is threading.main_thread():
+        previous = signal.signal(signal.SIGTERM, _exit_on_sigterm)
+    try:
+        yield
+    finally:
+        while _created_clients:
+            client = _created_clients.pop()
+            try:
+                client.shutdown()
+            except Exception:
+                logger.exception("Could not cancel a Cortex job on exit")
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 def _patch_upstream() -> Any:
@@ -112,7 +154,8 @@ def launch_driver(
     ``remote_fn`` has to call :func:`patch_upstream` itself. It runs in a fresh
     worker, and the driver's rebind does not reach that process. Use
     ``num_cpus=0`` when ``remote_fn`` submits more Ray tasks: a reserved CPU on
-    the coordinator deadlocks them.
+    the coordinator deadlocks them. The job is cancelled when this returns or
+    raises, including on Ctrl-C and SIGTERM.
     """
     import os
     from pathlib import Path
@@ -121,15 +164,8 @@ def launch_driver(
     from loguru import logger
     from skyrl.train.utils.utils import prepare_runtime_environment
 
-    from arctic_platform.integrations._cortex_dispatch import create_cortex_client
-
     upstream = patch_upstream()
     rl_config = _with_placement_timeout(cfg, build_rl_config(cfg))
-    logger.info("Provisioning Cortex training and sampling jobs")
-    pre_client = create_cortex_client(rl_config)
-    reconnect = pre_client.reconnect_config()
-    logger.info(f"Cortex jobs ready: training={pre_client.training_job_id} sampling={pre_client.sampling_job_id}")
-
     env_vars = prepare_runtime_environment(cfg)
     for key, value in os.environ.items():
         if key.startswith(env_prefixes):
@@ -143,8 +179,14 @@ def launch_driver(
     env_vars["PYTHONPATH"] = os.pathsep.join(part for part in python_path if part != "")
     runtime_env = dict(env_vars=env_vars)
     remote = ray.remote(num_cpus=num_cpus)(remote_fn)
-    ray.init(num_gpus=0, runtime_env=runtime_env, ignore_reinit_error=True)
-    ray.get(remote.options(runtime_env=runtime_env).remote(cfg, reconnect))
+
+    with _releasing_created_jobs():
+        logger.info("Provisioning Cortex training and sampling jobs")
+        pre_client = _create_cortex_client(rl_config, wait=False)
+        pre_client.wait_until_ready()
+        logger.info(f"Cortex jobs ready: training={pre_client.training_job_id} sampling={pre_client.sampling_job_id}")
+        ray.init(num_gpus=0, runtime_env=runtime_env, ignore_reinit_error=True)
+        ray.get(remote.options(runtime_env=runtime_env).remote(cfg, pre_client.reconnect_config()))
 
 
 @ray.remote(num_cpus=1)
@@ -169,7 +211,8 @@ def main() -> None:
     upstream = _patch_upstream()
     # `main()` looks this up as a module global when it submits the task.
     upstream.skyrl_entrypoint = _cortex_skyrl_entrypoint
-    upstream.main()
+    with _releasing_created_jobs():
+        upstream.main()
 
 
 if __name__ == "__main__":
