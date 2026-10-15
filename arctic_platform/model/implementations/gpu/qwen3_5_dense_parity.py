@@ -249,18 +249,13 @@ def _apply_rotary_pos_emb_fp32(q, k, cos, sin, unsqueeze_dim=1):
     return rope_rotary_slice_fp32(q, cos, sin), rope_rotary_slice_fp32(k, cos, sin)
 
 
-def _attention_forward_with_fp32_rope(attention_class) -> types.FunctionType:
-    """``attention_class``'s forward, with its global ``apply_rotary_pos_emb`` resolved to the fp32 rotation.
-
-    The bytecode is the class's own; only the name lookup differs. The globals are a copy of the forward's own, taken
-    the first time the patch meets the class, and every layer of the class shares the one returned function.
-    """
-    return _fp32_rope_forward(attention_class.forward)
-
-
 @functools.cache
 def _fp32_rope_forward(stock: types.FunctionType) -> types.FunctionType:
-    """The fp32-rotation copy of the attention forward ``stock``: one function, one code object, one globals dict.
+    """The attention forward ``stock`` with its global ``apply_rotary_pos_emb`` resolved to the fp32 rotation.
+
+    The bytecode is the stock forward's own; only the name lookup differs. The globals are a copy of the forward's
+    own, taken the first time the patch meets it, and every layer it is applied to shares the one returned function:
+    one function, one code object, one globals dict.
 
     torch.compile keeps its compiled code on the code object and, after a graph break, stores the names that code
     loads (compiled graphs, imported modules) in the globals of the frame it compiled. A code object that runs with
@@ -448,7 +443,7 @@ def apply_fp32_parity(model: nn.Module, *, sequence_parallel: bool, fp32_residua
             layer.forward = types.MethodType(_decoder_layer_forward, layer)
             setattr(layer, _FP32_RESIDUAL_ATTRIBUTE, fp32_residual)
             if layer.block_type == "full_attention":
-                attention_forward = _attention_forward_with_fp32_rope(type(layer.self_attn))
+                attention_forward = _fp32_rope_forward(type(layer.self_attn).forward)
                 layer.self_attn.forward = types.MethodType(attention_forward, layer.self_attn)
             elif layer.block_type == "linear_attention" and not sequence_parallel:
                 in_proj_b = layer.linear_attn.in_proj_b
