@@ -188,9 +188,7 @@ def test_native_worker_applies_local_mean_scales_with_one_stateful_loss_object()
     ]
 
 
-def test_native_worker_reuses_implicit_default_loss_across_gas(monkeypatch):
-    _DefaultStatefulWeightedLoss.instances = 0
-    _DefaultStatefulWeightedLoss.events = []
+def test_native_worker_requires_explicit_loss_fn_on_backward(monkeypatch):
     monkeypatch.setitem(
         RegistryMeta._registry["BaseLoss"],
         "ap_grpo",
@@ -214,22 +212,8 @@ def test_native_worker_reuses_implicit_default_loss_across_gas(monkeypatch):
     }
     worker = _worker(_ScoreEngine())
 
-    response = worker.forward_backward(request)
-
-    assert response["avg_loss"] == 2.0
-    assert worker.engine.parameter.grad.item() == -1.0
-    assert _DefaultStatefulWeightedLoss.instances == 1
-    assert _DefaultStatefulWeightedLoss.events == [
-        "reduction",
-        "validation",
-        "model",
-        "loss",
-        "output",
-        "validation",
-        "model",
-        "loss",
-        "output",
-    ]
+    with pytest.raises(ValueError, match="processing requires 'loss_fn' when backward is not False"):
+        worker.forward_backward(request)
 
 
 def test_native_worker_rejects_split_m2po_before_forward():
@@ -254,6 +238,36 @@ def test_native_worker_rejects_split_m2po_before_forward():
 
     with pytest.raises(ValueError, match="requires exactly one synchronized model call"):
         worker.forward_backward(request)
+
+
+def test_native_worker_rejects_split_ratio_mask_rebalance_before_forward():
+    microbatch = {
+        "input_ids": torch.ones(1, 1, dtype=torch.long),
+        "attention_mask": torch.ones(1, 1, dtype=torch.long),
+    }
+
+    def request(flag):
+        return {
+            "batch": [dict(microbatch), dict(microbatch)],
+            "meta": {"pad_token_id": 0},
+            "processing": {
+                "loss_fn": "ap_grpo",
+                "config": {"use_cispo_loss": True, "is_weight_clip_max": 5.0, "ratio_mask_rebalance": flag},
+            },
+        }
+
+    # Two microbatches are two model calls on this worker: rejected before the engine is ever called.
+    worker = _worker(_NeverForwardEngine())
+    with pytest.raises(
+        ValueError, match=r"ratio_mask_rebalance requires exactly one synchronized model call per worker, got \(2,\)"
+    ):
+        worker.forward_backward(request(True))
+
+    # With the flag false the same split request is not stopped by that guard (it fails later, on the missing loss
+    # context, which these bare microbatches do not carry).
+    with pytest.raises(ValueError) as error:
+        _worker(_NeverForwardEngine()).forward_backward(request(False))
+    assert "requires exactly one synchronized model call" not in str(error.value)
 
 
 def test_native_worker_honors_class_precedence_for_sft_name(monkeypatch):

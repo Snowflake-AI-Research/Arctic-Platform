@@ -112,6 +112,7 @@ def _config(
         pipeline_parallel_size=pp,
         ray_num_gpus=ray_num_gpus,
         extra_env=extra_env or {},
+        clear_cache_on_weight_sync=True,
         to_engine_kwargs=lambda: {"model": "test-model", **(engine_kwargs or {})},
     )
 

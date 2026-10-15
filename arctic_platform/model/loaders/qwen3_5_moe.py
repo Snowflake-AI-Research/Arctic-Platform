@@ -85,8 +85,6 @@ def _validate_spec(spec: ModelSpec) -> None:
         spec.attn_implementation = "flash_attention_3"
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError("qwen3_5_moe dtype must be 'bfloat16' or 'float32'")
-    if spec.patches.peft is not None:
-        raise ValueError("qwen3_5_moe PEFT requires expert adapter integration, which is not yet supported")
     if spec.patches.liger:
         raise ValueError(
             "the qwen3_5_moe loader does not support the liger patch; "

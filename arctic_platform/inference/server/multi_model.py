@@ -388,6 +388,9 @@ class Driver:
             "models": models,
         }
 
+    async def get_chat_support(self, model_id: str | None = None) -> dict[str, bool]:
+        return await self._get_pool(model_id).get_chat_support()
+
     # ------------------------------------------------------------------
     # Metrics
     # ------------------------------------------------------------------
