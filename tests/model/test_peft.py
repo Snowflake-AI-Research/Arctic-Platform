@@ -286,19 +286,14 @@ def test_empty_patch_cannot_enable_dense_training():
         Patches(peft={})
 
 
-def test_dense_settings_forward_peft():
-    from arctic_platform.model import DenseModelSettings
-    from arctic_platform.model import dense_model_spec
-
+def test_dense_model_spec_forwards_peft():
     config = {"peft_type": "Lora", "target_modules": ["q_proj"]}
-    settings = DenseModelSettings(
-        model_path="unused",
-        dtype="bfloat16",
+    spec = ModelSpec(
+        model_path_or_name="unused",
         attn_implementation="eager",
-        sequence_parallel=1,
+        loader="huggingface",
         patches=Patches(peft=config),
     )
-    spec = dense_model_spec(settings)
     assert spec.patches.peft == config
 
 

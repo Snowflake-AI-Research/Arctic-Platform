@@ -373,7 +373,7 @@ def test_initialize_native_deepspeed_optimizer_forwards_model_parameters(monkeyp
         return "engine", "optimizer", None, None
 
     monkeypatch.setattr(
-        "arctic_platform.model.training_engine.preserve_fp8_params_through_ds_cast",
+        "arctic_platform.common.deepspeed_engine.preserve_fp8_params_through_ds_cast",
         lambda model: (0, 0),
     )
     monkeypatch.setattr("deepspeed.initialize", _initialize)

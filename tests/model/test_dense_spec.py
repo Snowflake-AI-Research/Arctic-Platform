@@ -13,36 +13,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dense training options become one Hugging Face ModelSpec."""
+"""A dense Hugging Face model is one ModelSpec."""
 
 from __future__ import annotations
 
+from arctic_platform.model import ModelSpec
+from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
-from arctic_platform.model.dense_spec import DenseModelSettings
-from arctic_platform.model.dense_spec import dense_model_spec
 
 
-def _patches():
-    return Patches(
-        liger=True,
-        gradient_checkpointing=2,
-        activation_offload={"keep_last_n": 3, "use_streams": False},
-        compile={"fullgraph": False},
-        lm_head={"fp32": True, "token_chunk_size": 128, "vocab_chunk_size": 4096},
-        tiled_mlp={"token_chunk_size": 64},
-        peft={"peft_type": "Lora", "r": 8, "target_modules": ["q_proj"]},
-    )
-
-
-def test_dense_spec_transfers_setup_into_patches():
-    spec = dense_model_spec(
-        DenseModelSettings(
-            model_path="Qwen/Qwen3-8B",
-            dtype="bfloat16",
-            attn_implementation="flash_attention_3",
-            sequence_parallel=4,
-            patches=_patches(),
-        )
+def test_dense_model_spec_records_patches():
+    spec = ModelSpec(
+        model_path_or_name="Qwen/Qwen3-8B",
+        dtype="bfloat16",
+        attn_implementation="flash_attention_3",
+        loader="huggingface",
+        parallelism=ParallelismConfig(sequence_parallel=4),
+        patches=Patches(
+            liger=True,
+            gradient_checkpointing=2,
+            activation_offload={"keep_last_n": 3, "use_streams": False},
+            compile={"fullgraph": False},
+            lm_head={"fp32": True, "token_chunk_size": 128, "vocab_chunk_size": 4096},
+            tiled_mlp={"token_chunk_size": 64},
+            peft={"peft_type": "Lora", "r": 8, "target_modules": ["q_proj"]},
+        ),
     )
 
     assert spec.loader == "huggingface"
@@ -61,17 +56,16 @@ def test_dense_spec_transfers_setup_into_patches():
 
 
 def test_dense_offload_uses_the_typed_patch_default():
-    spec = dense_model_spec(
-        DenseModelSettings(
-            model_path="Qwen/Qwen3-8B",
-            dtype="bfloat16",
-            attn_implementation="flash_attention_3",
-            sequence_parallel=1,
-            patches=Patches(
-                gradient_checkpointing=True,
-                activation_offload={"keep_last_n": 3},
-            ),
-        )
+    spec = ModelSpec(
+        model_path_or_name="Qwen/Qwen3-8B",
+        dtype="bfloat16",
+        attn_implementation="flash_attention_3",
+        loader="huggingface",
+        patches=Patches(
+            gradient_checkpointing=True,
+            activation_offload={"keep_last_n": 3},
+        ),
     )
 
     assert spec.patches.activation_offload.tensor_size_threshold == 1 << 20
+    assert spec.patches.activation_offload.use_streams is True

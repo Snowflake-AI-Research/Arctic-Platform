@@ -27,6 +27,8 @@ from pydantic import ValidationError
 from arctic_platform.model import LoadedModel
 from arctic_platform.model import LoaderContext
 from arctic_platform.model import ModelSpec
+from arctic_platform.model import Patches
+from arctic_platform.model import ZorroTrainPatch
 from arctic_platform.model import apply_patches
 from arctic_platform.model import build_model
 from arctic_platform.model import factory as factory_mod
@@ -282,44 +284,14 @@ class TestHuggingFaceLoader:
         assert configured == [(model, group)]
 
 
-class TestDenseModelSettings:
-    @staticmethod
-    def _spec(options):
-        from arctic_platform.model import Patches
-        from arctic_platform.model.dense_spec import DenseModelSettings
-        from arctic_platform.model.dense_spec import dense_model_spec
-
-        zorro = None
-        if options.get("zorro_train_enable", False):
-            keys = (
-                "response_len",
-                "max_token_len",
-                "rollout_n",
-                "temperature",
-                "use_unpad",
-                "world_size",
-                "logits_optimization",
-                "logits_optimization_peak_mem_size_in_gib",
-                "logits_compute_from_fp32_inputs",
-                "logits_compute_in_fp32",
-            )
-            zorro = {key: options[key] for key in keys if key in options}
-        return dense_model_spec(
-            DenseModelSettings(
-                model_path="Qwen/Qwen3-1.7B",
-                dtype="bfloat16",
-                attn_implementation=options.get("attn_implementation"),
-                sequence_parallel=1,
-                patches=Patches(
-                    liger=options.get("use_liger", False),
-                    gradient_checkpointing=options.get("enable_gradient_checkpointing", False),
-                    zorro_train=zorro,
-                ),
-            )
-        )
-
+class TestDenseModelSpec:
     def test_defaults_are_canonical_model_defaults(self):
-        spec = self._spec({"attn_implementation": "flash_attention_2"})
+        spec = ModelSpec(
+            model_path_or_name="Qwen/Qwen3-1.7B",
+            dtype="bfloat16",
+            attn_implementation="flash_attention_2",
+            loader="huggingface",
+        )
 
         assert spec.model_path_or_name == "Qwen/Qwen3-1.7B"
         assert spec.dtype == "bfloat16"
@@ -329,14 +301,15 @@ class TestDenseModelSettings:
         assert spec.patches.zorro_train is None  # None disables (empty patch would be truthy)
 
     def test_generic_patches_default_gc_off(self):
-        from arctic_platform.model.config import Patches
-
         assert Patches().gradient_checkpointing is False
         assert ModelSpec(model_path_or_name="x").attn_implementation is None
 
     def test_liger_and_gc_flags_map(self):
-        spec = self._spec(
-            {"use_liger": True, "enable_gradient_checkpointing": False, "attn_implementation": "sdpa"},
+        spec = ModelSpec(
+            model_path_or_name="Qwen/Qwen3-1.7B",
+            attn_implementation="sdpa",
+            loader="huggingface",
+            patches=Patches(liger=True, gradient_checkpointing=False),
         )
         assert spec.patches.liger is True
         assert spec.patches.gradient_checkpointing is False
@@ -344,21 +317,24 @@ class TestDenseModelSettings:
         assert spec.patches.zorro_train is None
 
     def test_zorro_enabled_maps_fields(self):
-        spec = self._spec(
-            {
-                "attn_implementation": "flash_attention_2",
-                "zorro_train_enable": True,
-                "response_len": 1024,
-                "max_token_len": 16384,
-                "rollout_n": 8,
-                "temperature": 1.0,
-                "use_unpad": True,
-                "world_size": 2,
-                "logits_optimization": "memory",
-                "logits_optimization_peak_mem_size_in_gib": 8,
-                "logits_compute_from_fp32_inputs": True,
-                "logits_compute_in_fp32": True,
-            },
+        spec = ModelSpec(
+            model_path_or_name="Qwen/Qwen3-1.7B",
+            attn_implementation="flash_attention_2",
+            loader="huggingface",
+            patches=Patches(
+                zorro_train={
+                    "response_len": 1024,
+                    "max_token_len": 16384,
+                    "rollout_n": 8,
+                    "temperature": 1.0,
+                    "use_unpad": True,
+                    "world_size": 2,
+                    "logits_optimization": "memory",
+                    "logits_optimization_peak_mem_size_in_gib": 8,
+                    "logits_compute_from_fp32_inputs": True,
+                    "logits_compute_in_fp32": True,
+                }
+            ),
         )
         z = spec.patches.zorro_train
         assert z is not None
@@ -373,15 +349,8 @@ class TestDenseModelSettings:
         assert z.logits_compute_in_fp32 is True
 
     def test_zorro_uses_pydantic_defaults_for_omitted_fields(self):
-        from arctic_platform.model.config import ZorroTrainPatch
-
-        spec = self._spec(
-            {"attn_implementation": "flash_attention_2", "zorro_train_enable": True, "rollout_n": 4},
-        )
-        z = spec.patches.zorro_train
-        assert z is not None
+        z = ZorroTrainPatch.model_validate({"rollout_n": 4})
         assert z.rollout_n == 4
-        # Omitted keys come from ZorroTrainPatch field defaults (single source of truth).
         defaults = ZorroTrainPatch()
         assert z.use_unpad == defaults.use_unpad
         assert z.logits_optimization == defaults.logits_optimization

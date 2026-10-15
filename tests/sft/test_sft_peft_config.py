@@ -21,9 +21,8 @@ from arctic_platform.client import CortexConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
 from arctic_platform.client.base import _check_weight_format
-from arctic_platform.model import DenseModelSettings
+from arctic_platform.model import ModelSpec
 from arctic_platform.model import Patches
-from arctic_platform.model import dense_model_spec
 from arctic_platform.testing_utils import TestCasePlus
 
 
@@ -38,14 +37,12 @@ class TestPeftConfig(TestCasePlus):
         payload = config.to_onprem("training")
         self.assertEqual(payload["ds_worker_config"]["peft_config"], peft)
         self.assertEqual(config, expected)
-        settings = DenseModelSettings(
-            model_path=payload["model_name"],
-            dtype="bfloat16",
+        spec = ModelSpec(
+            model_path_or_name=payload["model_name"],
             attn_implementation=payload["ds_worker_config"]["attn_implementation"],
-            sequence_parallel=1,
+            loader="huggingface",
             patches=Patches(peft=payload["ds_worker_config"]["peft_config"]),
         )
-        spec = dense_model_spec(settings)
         self.assertEqual(spec.patches.peft, peft)
         self.assertEqual(ArcticClientConfig.model_validate_json(config.model_dump_json()), config)
 
