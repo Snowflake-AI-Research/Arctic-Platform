@@ -45,7 +45,6 @@ import copy
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
@@ -82,22 +81,6 @@ def _without_flash_attention_determinism_request(monkeypatch):
     stand-in kernel used here cannot.
     """
     monkeypatch.delenv(FLASH_ATTENTION_DETERMINISTIC_ENV, raising=False)
-
-
-@pytest.fixture
-def single_rank_group():
-    """The default process group, with one rank.
-
-    The root conftest normally provides it, but tests that tear the session group down leave none behind, so a
-    single-rank gloo group is created here when none exists and destroyed again only if it was created here.
-    """
-    created = not dist.is_initialized()
-    if created:
-        dist.init_process_group(backend="gloo", world_size=1, rank=0, store=dist.HashStore())
-    assert dist.get_world_size() == 1
-    yield dist.group.WORLD
-    if created and dist.is_initialized():
-        dist.destroy_process_group()
 
 
 def _input_dtype_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
