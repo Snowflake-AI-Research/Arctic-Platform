@@ -206,6 +206,20 @@ def test_on_error_drops_partial_totals():
     assert report["router"]["tokens_per_expert"] == [0.0] * EXPERTS
 
 
+def test_on_error_during_step_keeps_completed_fwd_bwd_totals():
+    model, callback, trainer = _hooked(stride=1)
+    x = torch.randn(4, DIM)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(x)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+
+    callback.on_error(trainer, "step", RuntimeError("optimizer blew up"))
+    callback.post_step(trainer)
+
+    _reduce, report = callback.pending["router_stats"]
+    assert report["router"]["sampled_tokens"] == pytest.approx(float(len(x)))
+
+
 @pytest.mark.parametrize(
     "config",
     [
