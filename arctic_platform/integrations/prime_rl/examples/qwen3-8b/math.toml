@@ -28,17 +28,17 @@ type = "adamw"
 lr = 1e-6
 
 [orchestrator]
-batch_size = 128
+batch_size = 256
 max_off_policy_steps = 8
 
 [orchestrator.train]
 group_size = 8
 
 [orchestrator.concurrency]
-initial_inflight = 256
+initial_inflight = 512
 
 [orchestrator.train.sampling]
-max_completion_tokens = 8192
+max_completion_tokens = 32768
 
 [[orchestrator.train.source]]
 name = "math"
