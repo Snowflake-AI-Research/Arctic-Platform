@@ -16,8 +16,8 @@ from typing import Any
 
 
 def is_token_tensor(value: Any) -> bool:
-    torch = sys.modules.get("torch")
-    return torch is not None and torch.is_tensor(value)
+    is_tensor = getattr(sys.modules.get("torch"), "is_tensor", None)
+    return is_tensor is not None and is_tensor(value)
 
 
 def check_token_tensor(prompt: Any) -> Any:
