@@ -196,6 +196,8 @@ class _FP8InplaceUpdater:
         self._bufs: dict[str, nn.Parameter] = {}
         self._shards_left: dict[str, int] = {}
         self._fused_writer = _ShardAwareFusedWriter(model, device)
+        # Block-FP8 weights whose vLLM target is BF16, keyed by weight name.
+        self._dequant_pending: dict[str, dict[str, torch.Tensor]] = {}
 
     def _ensure_buf(self, mod_path: str) -> nn.Parameter:
         if mod_path in self._bufs:
@@ -339,8 +341,50 @@ class _FP8InplaceUpdater:
         if self._shards_left[mod_path] <= 0:
             self._flush_module(mod_path)
 
+    def _dequant_target(self, sf_key: str, tensor: torch.Tensor) -> tuple[str, str] | None:
+        """Return ``(weight_name, part)`` when *sf_key* belongs to a block-FP8
+        weight that vLLM keeps in a non-FP8 dtype (e.g. GLM-5 sparse MLA)."""
+        if sf_key.endswith(".weight"):
+            if tensor.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                return None
+            weight_name, part = sf_key, "weight"
+        elif sf_key.endswith(".weight_scale_inv"):
+            if sf_key in self._params:
+                return None
+            weight_name, part = sf_key[: -len("_scale_inv")], "scale"
+        else:
+            return None
+        param = self._params.get(weight_name)
+        if param is None or param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            return None
+        return weight_name, part
+
+    def _feed_dequant(self, weight_name: str, part: str, tensor: torch.Tensor) -> None:
+        entry = self._dequant_pending.setdefault(weight_name, {})
+        if ("scale" if part == "weight" else "weight") not in entry:
+            # Received tensors alias the engine's reusable bucket buffer.
+            entry[part] = tensor.clone()
+            return
+        del self._dequant_pending[weight_name]
+        entry[part] = tensor
+        weight, scale = entry["weight"], entry["scale"]
+        rows, cols = weight.shape
+        block = -(-cols // scale.shape[1])
+        pad_r, pad_c = (-rows) % block, (-cols) % block
+        w = weight.to(torch.float32)
+        if pad_r or pad_c:
+            w = torch.nn.functional.pad(w, (0, pad_c, 0, pad_r))
+        s = scale.to(torch.float32).repeat_interleave(block, 0).repeat_interleave(block, 1)
+        param = self._params[weight_name]
+        self._copy_param(param, (w * s)[:rows, :cols].to(param.dtype))
+
     def feed(self, sf_key: str, tensor: torch.Tensor):
         """Route one received BF16 tensor to the correct module."""
+        dequant = self._dequant_target(sf_key, tensor)
+        if dequant is not None:
+            self._feed_dequant(*dequant, tensor)
+            return
+
         if sf_key.endswith(".weight"):
             mod_candidate = sf_key[: -len(".weight")]
             prefix, _, leaf = mod_candidate.rpartition(".")
@@ -398,7 +442,7 @@ class _FP8InplaceUpdater:
 
     @property
     def pending(self) -> int:
-        return len(self._bufs)
+        return len(self._bufs) + len(self._dequant_pending)
 
 
 # ---------------------------------------------------------------------------

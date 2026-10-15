@@ -554,6 +554,7 @@ def test_fp8_updater_uses_native_weight_loader_for_tp_sharding(monkeypatch):
     updater._fp8_modules = {"layer.down_proj": module}
     updater._bufs = {}
     updater._shards_left = {}
+    updater._dequant_pending = {}
 
     full = torch.arange(32, dtype=torch.float32).reshape(4, 8).to(
         torch.float8_e4m3fn
@@ -655,6 +656,36 @@ def test_fp8_updater_rejects_scales_that_do_not_split_across_tp(monkeypatch):
 
     with pytest.raises(ValueError, match="does not split"):
         updater.feed("layer.proj.weight_scale_inv", torch.zeros(1, 3))
+
+
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_fp8_updater_dequantizes_block_fp8_into_bf16_targets(monkeypatch, scale_first):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    linear = _install_fp8_vllm_stubs(monkeypatch)
+    model = nn.Module()
+    model.attn = nn.Module()
+    model.attn.o_proj = linear.RowParallelLinear(
+        _frozen(torch.zeros((3, 4), dtype=torch.bfloat16))
+    )
+    updater = _FP8InplaceUpdater(model, torch.bfloat16, "cpu")
+    weight = torch.tensor(
+        [[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.0, -2.0], [4.0, 1.0, -0.5, 8.0]]
+    ).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[2.0, 0.25], [4.0, 8.0]])
+    parts = [("attn.o_proj.weight", weight), ("attn.o_proj.weight_scale_inv", scale)]
+    if scale_first:
+        parts.reverse()
+
+    updater.feed(*parts[0])
+    assert updater.pending == 1
+    updater.feed(*parts[1])
+
+    expected = weight.float() * scale.repeat_interleave(2, 0).repeat_interleave(2, 1)[:3]
+    torch.testing.assert_close(
+        model.attn.o_proj.weight.data, expected.to(torch.bfloat16)
+    )
+    assert updater.pending == 0
 
 
 def test_fp8_updater_requantizes_bf16_and_copies_unquantized_layers(monkeypatch):
