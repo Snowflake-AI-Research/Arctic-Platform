@@ -32,14 +32,14 @@ type = "adamw"
 lr = 1e-6
 
 [orchestrator]
-batch_size = 64
+batch_size = 256
 max_off_policy_steps = 16
 
 [orchestrator.train]
 group_size = 8
 
 [orchestrator.concurrency]
-initial_inflight = 256
+initial_inflight = 512
 
 [[orchestrator.train.source]]
 name = "swe"
