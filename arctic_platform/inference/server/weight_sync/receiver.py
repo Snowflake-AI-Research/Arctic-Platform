@@ -327,6 +327,9 @@ def _install_lora_adapter(adapter_manager, lora_model, lora_int_id: int) -> tupl
 def _ensure_engine_process_vllm_patches() -> None:
     require_supported_vllm_version("WeightSyncExtension")
 
+    from arctic_platform.inference.vllm.gemma3_vision_mapper import (
+        ensure_gemma3_vision_mapper_patch,
+    )
     from arctic_platform.inference.vllm.router_replay import (
         ensure_router_replay_vllm_patches,
     )
@@ -336,6 +339,7 @@ def _ensure_engine_process_vllm_patches() -> None:
 
     ensure_router_replay_vllm_patches()
     ensure_xgrammar_stop_mask_fix()
+    ensure_gemma3_vision_mapper_patch()
 
 
 _ensure_engine_process_vllm_patches()
