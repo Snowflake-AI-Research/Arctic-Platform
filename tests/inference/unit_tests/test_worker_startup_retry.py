@@ -205,12 +205,14 @@ def test_initialize_drops_reasoning_parser_when_tokenizer_lacks_think_tokens(
     assert worker._reasoning_parser is None
 
 
-def test_initialize_failure_carries_engine_console_tail(monkeypatch, tmp_path):
+def _initialize_with_failing_engine_core(monkeypatch, tmp_path):
     class FakeEngineArgs:
         def create_engine_config(self):
             return types.SimpleNamespace(
                 structured_outputs_config=types.SimpleNamespace(enable_in_reasoning=False),
-                model_config=types.SimpleNamespace(skip_tokenizer_init=True),
+                model_config=types.SimpleNamespace(
+                    skip_tokenizer_init=True, architecture="LlamaForCausalLM"
+                ),
             )
 
     class FakeAsyncLLM:
@@ -240,6 +242,22 @@ def test_initialize_failure_carries_engine_console_tail(monkeypatch, tmp_path):
         finally:
             os.dup2(saved[0], 1)
             os.dup2(saved[1], 2)
-    rendered = "".join(traceback.format_exception(info.value))
+    return info.value
+
+
+def test_initialize_failure_carries_engine_console_tail(monkeypatch, tmp_path):
+    exc = _initialize_with_failing_engine_core(monkeypatch, tmp_path)
+    rendered = "".join(traceback.format_exception(exc))
     assert "engine core starting" in rendered
     assert "ImportError: deep_gemm" in rendered
+
+
+def test_unreadable_console_keeps_original_startup_error(monkeypatch, tmp_path):
+    def deny_open(path, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(worker_mod, "open", deny_open, raising=False)
+    exc = _initialize_with_failing_engine_core(monkeypatch, tmp_path)
+    assert type(exc) is RuntimeError
+    assert "See root cause above" in str(exc)
+    assert not getattr(exc, "__notes__", None)

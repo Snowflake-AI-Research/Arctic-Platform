@@ -278,10 +278,14 @@ def _console_tail(max_bytes: int = 4096) -> str:
     """
     tails = []
     for fd in (1, 2):
-        if stat.S_ISREG(os.fstat(fd).st_mode):
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                continue
             with open(f"/proc/self/fd/{fd}", "rb") as f:
                 f.seek(max(0, os.fstat(f.fileno()).st_size - max_bytes))
                 tails.append(f.read().decode(errors="replace"))
+        except OSError:
+            continue
     return "\n".join(tails)
 
 
