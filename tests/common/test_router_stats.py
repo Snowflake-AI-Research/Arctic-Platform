@@ -232,6 +232,25 @@ def test_public_facade_exports_the_callback():
     assert facade.RouterStatsCallback is impl.RouterStatsCallback
 
 
+def test_public_recompute_facade_shares_one_idempotent_detector():
+    import torch.utils.checkpoint as ckpt
+
+    from arctic_platform.model import recompute as facade
+    from arctic_platform.model.implementations.gpu import router_replay_recompute as impl
+
+    assert facade.in_recompute is impl._in_recompute
+    assert facade.install_recompute_detector is impl._install_recompute_detector
+
+    facade.install_recompute_detector()
+    first_hook = ckpt._recomputation_hook
+    first_local = ckpt._recompute_thread_local
+    facade.install_recompute_detector()
+    impl._install_recompute_detector()
+    assert ckpt._recomputation_hook is first_hook
+    assert ckpt._recompute_thread_local is first_local
+    assert facade.in_recompute() is False
+
+
 def test_loader_debug_options_accept_router_stats_strides():
     assert DebugModelOptions(router_stats_sample_stride=4, router_stats_call_stride=2).router_stats_sample_stride == 4
     assert GlmMoeDsaDebugOptions(router_stats_sample_stride=8).router_stats_call_stride == 1
