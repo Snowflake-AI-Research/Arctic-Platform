@@ -85,6 +85,7 @@ all = [
     "arctic_platform[testing]",
     "arctic_platform[cortex]",
     "arctic_platform[onprem]",
+    "arctic_platform[tinker]",
     "arctic_platform[verl]",
 ]
 
@@ -93,18 +94,22 @@ dev = [
     "arctic_platform[testing]",
 ]
 
-# Pulls [cortex] so the transport tests can import the client. Not [onprem]: it
-# reaches [rl] -> arctic-inference[vllm], and vLLM's build needs CUDA_HOME, which
-# a CPU-only CI runner does not have. The on-prem tests skip without it.
+# Pulls [tinker], itself a superset of [cortex], so the transport tests can
+# import the client and the Tinker tests can import the SDK. Not [onprem]:
+# it reaches [rl] -> arctic-inference[vllm], and vLLM's build needs CUDA_HOME,
+# which a CPU-only CI runner does not have. The on-prem tests skip without it.
 testing = [
-    "arctic_platform[cortex]",
+    "arctic_platform[tinker]",
+    "httpx",
     "parameterized",
+    "pytest-asyncio",
     "pytest-instafail",
     "pytest-flakefinder",
     "pytest-sugar",
     "pytest-timeout",
     "pytest-xdist",
     "pytest",
+    "tinker==0.25.0",
 ]
 
 formatting = [
@@ -127,6 +132,14 @@ cortex = [
     "tenacity",
     "torch",
     "urllib3",
+]
+
+# In-process Tinker client. [cortex] plus the tokenizer the job config loads.
+# No GPU and no training stack: Cortex owns those. The tinker SDK is
+# user-supplied.
+tinker = [
+    "arctic_platform[cortex]",
+    "transformers",
 ]
 
 # A training-only on-prem server, plus the client that drives it. Deliberately
@@ -158,8 +171,8 @@ inference = [
     "ray",
     "tqdm",
     "uvicorn",
-    "vllm==0.30.0",
-    "xgrammar==0.2.6",
+    "vllm==0.31.0",
+    "xgrammar==0.2.7",
 ]
 
 # [sft] plus the published sampling package. On-prem still imports
@@ -199,4 +212,5 @@ timeout_method = "signal"
 markers = [
     "vllm: marks a GPU test that drives the vLLM sampling engine; it cannot run concurrently with other GPU tests, so it is pinned to a single xdist worker via xdist_group. Exclude it from a parallel pool with '-m \"not vllm\"' and run it on its own.",
     "gpu_serial: marks a heavyweight GPU test whose body must hold the host-wide GPU lock (serialized across xdist workers by the _serialize_gpu_work autouse fixture).",
+    "integration: GPU or multi-process model tests. They skip when CUDA is unavailable, so the CPU unit job still collects them.",
 ]

@@ -680,6 +680,23 @@ class TestMigratedGrpo(TestCasePlus):
         loss.backward()
         torch_assert_close(values.grad, torch.tensor([[-1 / 3, 1 / 3, 1 / 3]]), rtol=0, atol=1e-6)
 
+    def test_ratio_mask_kept_k3_sum_covers_only_kept_tokens(self):
+        # log ratios ln2, -ln2 (kept), ln4 (dropped above 3.0), and one token outside loss_mask.
+        values = torch.full((1, 4), -1.0)
+        context = {
+            "old_log_probs_shifted": torch.tensor(
+                [[-1.0 - math.log(2), -1.0 + math.log(2), -1.0 - math.log(4), -3.0]]
+            ),
+            "advantages": torch.ones_like(values),
+            "loss_mask": torch.tensor([[True, True, True, False]]),
+        }
+        config = {"use_cispo_loss": True, "is_weight_clip_max": 10.0, "ratio_mask_bounds_pos": [0.25, 3.0]}
+        _, metrics = grpo_loss({"logprobs": values}, context, {}, config, "cpu")
+        self.assertEqual(metrics["ratio_trainable_token_count"], 3.0)
+        self.assertEqual(metrics["ratio_mask_dropped_token_count"], 1.0)
+        # k3(ln2) + k3(-ln2) = (1 - ln2) + (ln2 - 1/2)
+        self.assertAlmostEqual(metrics["ratio_mask_kept_k3_sum"], 0.5, places=6)
+
     def test_packed_ratio_sequence_gate_uses_per_sequence_totals(self):
         values = torch.tensor([-0.5, -1.0, -1.0], requires_grad=True)
         context = {

@@ -140,3 +140,92 @@ def test_ensure_spec_decode_grammar_fix_is_idempotent():
     assert get_grammar_bitmask._arctic_spec_grammar is True
     assert sample_tokens._arctic_spec_grammar is True
     assert sample._arctic_spec_grammar is True
+
+
+def test_fix_reaches_model_runner_v2(monkeypatch):
+    # vLLM 0.30.0 builds Model Runner V2 (vllm.v1.worker.gpu.model_runner) for
+    # DFlash2 drafts, and V2 verifies input_ids[logits_indices]: entry r + 1 is
+    # the draft checked at logits row r. Stand-ins replace the vLLM classes so
+    # the real installer and wrappers run on CPU.
+    import sys
+    import types
+
+    import numpy as np
+
+    import arctic_platform.inference.utils as utils
+    import arctic_platform.inference.vllm.spec_decode_grammar as sdg
+
+    class Scheduler:
+        def get_grammar_bitmask(self, scheduler_output):
+            return SimpleNamespace(
+                structured_output_request_ids=["a", "b", "d"])
+
+    class GPUModelRunner:
+        def sample_tokens(self, grammar_output):
+            return None
+
+        def _sample(self, logits, spec_decode_metadata):
+            return None
+
+    class GPUModelRunnerV2:
+        def sample(self, hidden_states, input_batch, grammar_output):
+            return input_batch.input_ids[input_batch.logits_indices].tolist()
+
+    leaves = {
+        "vllm.v1.core.sched.scheduler": {"Scheduler": Scheduler},
+        "vllm.v1.worker.gpu_model_runner": {"GPUModelRunner": GPUModelRunner},
+        "vllm.v1.worker.gpu.model_runner": {"GPUModelRunner": GPUModelRunnerV2},
+    }
+    for name, attrs in leaves.items():
+        parts = name.split(".")
+        for i in range(1, len(parts) + 1):
+            monkeypatch.setitem(
+                sys.modules, ".".join(parts[:i]),
+                types.ModuleType(".".join(parts[:i])))
+        for key, value in attrs.items():
+            setattr(sys.modules[name], key, value)
+    monkeypatch.setattr(
+        utils, "require_supported_vllm_version", lambda *args: "0.30.0")
+    monkeypatch.setattr(sdg, "_APPLIED", False)
+
+    sdg.ensure_spec_decode_grammar_fix()
+
+    # Requests a, b, c (no drafts), d, e (not structured). Each query is the
+    # last sampled token then the drafts; two other tokens sit between queries.
+    # d is the first step after a weight-sync resume: its rows were built from
+    # placeholders while the runner holds real drafts.
+    queries = {"a": [1, 10, 11, 12], "b": [2, 20, 21, 22], "c": [3],
+               "d": [4, 40, 41, 42], "e": [5, 50, 51]}
+    input_ids, logits_indices, cu = [], [], [0]
+    for query in queries.values():
+        input_ids += [0, 0]
+        logits_indices += range(len(input_ids), len(input_ids) + len(query))
+        input_ids += query
+        cu.append(cu[-1] + len(query))
+
+    @dataclass
+    class _InputBatch:
+        req_ids: list
+        num_draft_tokens: int
+        num_draft_tokens_per_req: np.ndarray
+        cu_num_logits_np: np.ndarray
+        input_ids: torch.Tensor
+        logits_indices: torch.Tensor
+
+    batch = _InputBatch(
+        list(queries), 11,
+        np.array([len(q) - 1 for q in queries.values()], dtype=np.int32),
+        np.array(cu, dtype=np.int32),
+        torch.tensor(input_ids, dtype=torch.int32),
+        torch.tensor(logits_indices, dtype=torch.int64))
+    grammar = Scheduler().get_grammar_bitmask(SimpleNamespace(
+        scheduled_spec_decode_tokens={
+            "a": [10, 11, 12], "b": [20, -1, -1], "d": [-1, -1, -1],
+            "e": [50, 51]}))
+
+    verified = GPUModelRunnerV2().sample(None, batch, grammar)
+
+    assert verified == [1, 10, 11, 12, 2, 20, -1, -1, 3,
+                        4, -1, -1, -1, 5, 50, 51]
+    assert batch.input_ids[batch.logits_indices].tolist()[9:13] == [
+        4, 40, 41, 42], "the drafter keeps the real ids"

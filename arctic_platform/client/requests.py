@@ -19,16 +19,50 @@ target job, user-data body. Nothing here touches a transport or an event loop,
 so the sync and async frontends in `base.py` share every builder and differ only
 at `transport.call` vs `transport.acall`.
 
-The set of ops built here must match `transport.OPS`; `test_client_ops.py`
-asserts that in both directions.
+Live-engine builders match `transport.OPS`; context-free cluster builders match
+the separate internal `transport.CLUSTER_OPS` vocabulary.
 """
 
 from __future__ import annotations
 
+from os import PathLike
 from typing import Any
 
+from arctic_platform.client.config import JobId
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
+
+
+def list_jobs_request(status: str | None = None) -> Request:
+    return Request("list-jobs", body={} if status is None else {"status": status})
+
+
+def get_job_request(job_id: JobId) -> Request:
+    return Request("get-job", job_id)
+
+
+def cancel_job_request(job_id: JobId) -> Request:
+    return Request("cancel-job", job_id)
+
+
+def capacity_request(hardware: str | None = None) -> Request:
+    return Request("capacity", body={} if hardware is None else {"hardware": hardware})
+
+
+def list_checkpoints_request(job_id: JobId) -> Request:
+    return Request("list-checkpoints", job_id)
+
+
+def export_checkpoint_request(job_id: JobId, checkpoint_id: str) -> Request:
+    return Request("export-checkpoint", job_id, {"checkpoint_id": checkpoint_id})
+
+
+def delete_checkpoint_request(job_id: JobId, checkpoint_id: str) -> Request:
+    return Request("delete-checkpoint", job_id, {"checkpoint_id": checkpoint_id})
+
+
+def download_artifacts_request(job_id: JobId, kind: str, output_dir: str | PathLike[str]) -> Request:
+    return Request("download-artifacts", job_id, {"kind": kind, "output_dir": output_dir})
 
 
 def fwd_bwd_request(

@@ -61,3 +61,11 @@ jobs:
         run: |
           cd tests
           python -m pytest -s -v --ignore=inference
+      # Own pytest process: the streaming stand-ins put a fake vllm in
+      # sys.modules, which would leak into the main suite.
+      - name: Streaming Tests
+        timeout-minutes: 10  # the suite takes ~1 min; guards against a hung Ray actor
+        # Ray actor processes import cpu_support too, so conftest.py's sys.path fix isn't enough.
+        run: |
+          PYTHONPATH=$PWD:$PWD/tests/inference/streaming python -m pytest -v -m "not gpu" \
+            -c tests/inference/streaming/pytest.ini tests/inference/streaming

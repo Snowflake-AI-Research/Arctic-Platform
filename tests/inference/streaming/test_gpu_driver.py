@@ -1,6 +1,7 @@
 """Opt-in real-engine Driver streaming acceptance tests."""
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -66,6 +67,44 @@ def test_legacy_driver_generate():
         assert isinstance(results[0]["text"], str)
         assert 0 < len(results[0]["token_ids"]) <= 16
         assert results[0]["finish_reason"] in {"stop", "length"}
+
+    asyncio.run(with_driver(check))
+
+
+async def collect(driver, prompt, params):
+    return [
+        event
+        async for event in driver.stream_generate(
+            "stream-test", uuid4().hex, prompt, params
+        )
+    ]
+
+
+def test_logit_bias_forces_and_bans_a_token():
+    async def check(driver):
+        prompt = "The capital of France is"
+        greedy = {"temperature": 0.0, "max_tokens": 1}
+
+        def first_token(events):
+            assert events[-1]["type"] == "completed", events[-1]
+            return next(e for e in events if e["type"] == "delta")["token_ids"][0]
+
+        baseline = first_token(await collect(driver, prompt, greedy))
+        other = first_token(await collect(driver, "Hello", greedy))
+        if other == baseline:
+            other = first_token(await collect(driver, "1, 2, 3,", greedy))
+        assert other != baseline
+        forced = await collect(
+            driver, prompt, {**greedy, "logit_bias": {str(other): 100}}
+        )
+        assert first_token(forced) == other
+        banned = await collect(driver, prompt, {**greedy, "logit_bias": {baseline: -100}})
+        assert first_token(banned) != baseline
+        out_of_vocab = await collect(
+            driver, prompt, {**greedy, "logit_bias": {2**31 - 1: 1}}
+        )
+        assert out_of_vocab[-1]["type"] == "terminal_error"
+        assert out_of_vocab[-1]["code"] == "invalid_sampling_params"
 
     asyncio.run(with_driver(check))
 
@@ -162,6 +201,49 @@ def test_driver_abort_reclaims_engine_requests():
     asyncio.run(with_driver(check))
 
 
+def test_structured_output_always_matches_the_schema():
+    # Bounded fields only: a free integer lets a small model emit digits until
+    # max_tokens, which is valid JSON so far but never finishes.
+    schema = {
+        "type": "object",
+        "properties": {
+            "country": {"enum": ["France", "Japan", "Kenya", "Peru"]},
+            "is_capital": {"type": "boolean"},
+        },
+        "required": ["country", "is_capital"],
+        "additionalProperties": False,
+    }
+
+    async def check(driver):
+        runs = await asyncio.gather(
+            *(
+                collect(
+                    driver,
+                    "Describe a city as JSON:",
+                    {
+                        "temperature": 0.7,
+                        "max_tokens": 256,
+                        "seed": seed,
+                        "structured_outputs": {"json": schema},
+                    },
+                )
+                for seed in range(20)
+            )
+        )
+        for events in runs:
+            assert events[-1]["type"] == "completed", events[-1]
+            finish = next(e for e in events if e["type"] == "choice_finished")
+            assert finish["finish_reason"] == "stop"
+            value = json.loads(
+                "".join(e["text"] for e in events if e["type"] == "delta")
+            )
+            assert value.keys() == {"country", "is_capital"}
+            assert value["country"] in schema["properties"]["country"]["enum"]
+            assert type(value["is_capital"]) is bool
+
+    asyncio.run(with_driver(check))
+
+
 def test_slow_consumer_is_bounded_and_reclaimed():
     async def check(driver):
         from arctic_platform.inference.server.streaming import StreamError, StreamLimits
@@ -254,5 +336,83 @@ def test_context_limit_errors_are_classified():
             )
         ]
         assert followup[-1]["type"] == "completed"
+
+    asyncio.run(with_driver(check))
+
+
+def test_default_output_budget_stops_at_model_context():
+    # 500 prompt tokens leave 12 of the 512-token context; the 4096 default must not fail.
+    async def check(driver):
+        events = [
+            event
+            async for event in driver.stream_generate(
+                "stream-test", uuid4().hex, [1] * 500, {"temperature": 0.0}
+            )
+        ]
+        assert events[-1]["type"] == "completed"
+        usage = events[-2]
+        assert usage["prompt_tokens"] == 500
+        assert 0 < usage["completion_tokens"] <= 12
+        finished = next(event for event in events if event["type"] == "choice_finished")
+        assert finished["finish_reason"] in {"length", "stop"}
+
+    asyncio.run(with_driver(check))
+
+
+def test_logprobs_cover_every_completion_token():
+    async def check(driver):
+        events = await collect(
+            driver,
+            "The capital of France is",
+            {"temperature": 0.0, "max_tokens": 32, "logprobs": 2},
+        )
+        assert events[-1]["type"] == "completed"
+        entries = [
+            entry
+            for event in events
+            if event["type"] == "delta"
+            for entry in event["logprobs"]
+        ]
+        assert len(entries) == events[-2]["completion_tokens"]
+        for entry in entries:
+            assert len(entry["top"]) == 2
+            # Greedy picks a most likely token; on an exact tie vLLM may rank
+            # the other one first, so compare values, not IDs.
+            assert entry["logprob"] == entry["top"][0]["logprob"]
+            assert entry["logprob"] <= 0
+
+    asyncio.run(with_driver(check))
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "object", "properties": {"a": {"type": "string", "pattern": "("}}},
+        {"type": "nonsense"},
+    ],
+)
+def test_real_structured_output_errors_are_classified(schema):
+    # classify_engine_error matches vLLM's message text, which has no structured
+    # field for these errors. Real errors from the pinned vLLM catch rewording.
+    async def check(driver):
+        events = await collect(
+            driver,
+            "Describe a city as JSON:",
+            {"max_tokens": 16, "structured_outputs": {"json": schema}},
+        )
+        assert events[-1]["type"] == "terminal_error", events[-1]
+        assert events[-1]["code"] == "invalid_structured_output"
+
+    asyncio.run(with_driver(check))
+
+
+def test_real_thinking_budget_error_is_classified():
+    # The test engine has no reasoning parser, so vLLM rejects the budget.
+    async def check(driver):
+        events = await collect(
+            driver, "The capital of France is", {"max_tokens": 16, "thinking_token_budget": 8}
+        )
+        assert events[-1]["type"] == "terminal_error", events[-1]
+        assert events[-1]["code"] == "invalid_sampling_params"
 
     asyncio.run(with_driver(check))

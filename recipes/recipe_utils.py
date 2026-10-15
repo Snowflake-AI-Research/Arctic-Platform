@@ -300,8 +300,7 @@ def client_config(
         max_seq_len=max_seq_len,
         training_gpus=training_gpus,
         sampling_gpus=sampling_gpus,
-        job_ready_timeout=job_ready_timeout,
-        backend=backend,
+        backend=backend.model_copy(update={"job_ready_timeout": job_ready_timeout}),
         training=TrainingConfig(
             peft=lora_config(lora_rank),
             ds_config=ds_config,
