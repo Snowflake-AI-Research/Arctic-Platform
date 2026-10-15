@@ -523,6 +523,50 @@ def test_load_fp8_tracks_all_received_bytes(monkeypatch):
     assert recv_l2_sq == 14.0
 
 
+def test_fp8_updater_uses_native_weight_loader_for_tp_sharding(monkeypatch):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    linear_module = types.ModuleType("vllm.model_executor.layers.linear")
+
+    class RowParallelLinear:
+        tp_rank = 3
+        tp_size = 4
+
+        def weight_loader(self, param, loaded):
+            param.data.copy_(loaded.narrow(1, 6, 2))
+
+    linear_module.RowParallelLinear = RowParallelLinear
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.layers.linear", linear_module
+    )
+
+    target = nn.Parameter(
+        torch.zeros((4, 2), dtype=torch.float8_e4m3fn),
+        requires_grad=False,
+    )
+    target_scale = nn.Parameter(torch.zeros((2, 1)), requires_grad=False)
+    module = RowParallelLinear()
+    updater = _FP8InplaceUpdater.__new__(_FP8InplaceUpdater)
+    updater._params = {
+        "layer.down_proj.weight": target,
+        "layer.down_proj.weight_scale_inv": target_scale,
+    }
+    updater._fp8_modules = {"layer.down_proj": module}
+    updater._bufs = {}
+    updater._shards_left = {}
+
+    full = torch.arange(32, dtype=torch.float32).reshape(4, 8).to(
+        torch.float8_e4m3fn
+    )
+    updater.feed("layer.down_proj.weight", full)
+    full_scale = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    updater.feed("layer.down_proj.weight_scale_inv", full_scale)
+
+    torch.testing.assert_close(target.data.float(), full[:, 6:8].float())
+    torch.testing.assert_close(target_scale, full_scale[:, 3:4])
+    assert updater.pending == 0
+
+
 def test_fused_writer_reports_canonical_moe_destination():
     class RoutedExperts(nn.Module):
         def __init__(self):
