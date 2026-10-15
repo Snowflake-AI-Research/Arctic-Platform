@@ -365,6 +365,11 @@ def _create_async_engine_args(
         engine_args_cls = Fp32LmHeadAsyncEngineArgs
 
     _coerce_structured_outputs_config(engine_kwargs)
+    text_config_overrides = engine_kwargs.pop("text_config_overrides", None)
+    if text_config_overrides:
+        from arctic_platform.common.text_config_overrides import text_config_hf_overrides
+
+        engine_kwargs["hf_overrides"] = text_config_hf_overrides(engine_kwargs["model"], text_config_overrides)
 
     try:
         engine_args = engine_args_cls(**engine_kwargs)
@@ -674,6 +679,7 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def __init__(self) -> None:
         self.llm = None
+        self._yarn_tables = None
         self.state = WorkerLifecycleState.UNINITIALIZED
         self._reasoning_parser: Any = None
         self._chat_only_reasoner = False
@@ -820,6 +826,15 @@ class InferenceWorker(StreamingWorkerMixin):
                         enable_arctic_patches=arctic_enabled,
                     )
                     vllm_config = engine_args.create_engine_config()
+                factors = getattr(vllm_config, "additional_config", {}).get("yarn_factors", [])
+                if factors:
+                    from arctic_platform.common.yarn_factors import build_yarn_factors
+
+                    if not vllm_config.use_v2_model_runner:
+                        raise ValueError("yarn_factors requires V2 Model Runner")
+                    self._yarn_tables = build_yarn_factors(
+                        vllm_config.model_config.hf_text_config, factors
+                    )
                 self._chat_model, self._chat_only_reasoner = _resolve_chat_mode(
                     vllm_config, chat_reasoning_parser, tool_call_parser
                 )
@@ -1102,6 +1117,23 @@ class InferenceWorker(StreamingWorkerMixin):
         from vllm import SamplingParams
 
         sampling_params = dict(sampling_params)
+        if "yarn_factor_slot" in (sampling_params.get("extra_args") or {}):
+            raise ValueError("yarn_factor_slot is internal; use yarn_factor")
+        cache_salt = None
+        if "yarn_factor" in sampling_params:
+            factor = sampling_params.pop("yarn_factor")
+            tables = getattr(self, "_yarn_tables", None)
+            if tables is None:
+                raise ValueError("yarn_factor requires declared yarn_factors")
+            try:
+                slot = tables.slot(factor)
+            except (TypeError, RuntimeError) as exc:
+                raise ValueError(f"Invalid yarn_factor: {factor!r}") from exc
+            if slot:
+                sampling_params["extra_args"] = {
+                    **(sampling_params.get("extra_args") or {}), "yarn_factor_slot": slot
+                }
+                cache_salt = f"yarn={tables.factors[slot]}"
         enable_thinking = _optional_bool(
             sampling_params.pop(_ENABLE_THINKING_PARAM_KEY, None),
             name=_ENABLE_THINKING_PARAM_KEY,
@@ -1153,6 +1185,11 @@ class InferenceWorker(StreamingWorkerMixin):
             prompt_input: Any = {"prompt_token_ids": effective_prompt}
         else:
             prompt_input = effective_prompt
+
+        if cache_salt is not None:
+            if isinstance(prompt_input, str):
+                prompt_input = {"prompt": prompt_input}
+            prompt_input["cache_salt"] = cache_salt
 
         final_output = await self._generate_once(
             prompt_input,

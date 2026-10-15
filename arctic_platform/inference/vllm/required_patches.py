@@ -23,7 +23,9 @@ def apply_required_vllm_patches() -> None:
     from arctic_platform.inference.vllm.router_replay import ensure_router_replay_vllm_patches
     from arctic_platform.inference.vllm.spec_decode_grammar import ensure_spec_decode_grammar_fix
     from arctic_platform.inference.vllm.xgrammar_stop_mask import ensure_xgrammar_stop_mask_fix
+    from arctic_platform.inference.vllm.yarn_factors import ensure_yarn_factor_patches
 
+    ensure_yarn_factor_patches()
     ensure_router_replay_vllm_patches()
     ensure_xgrammar_stop_mask_fix()
     ensure_dense_prompt_logprobs_patch()
