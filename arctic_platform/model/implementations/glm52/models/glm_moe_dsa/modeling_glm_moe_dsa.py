@@ -12,7 +12,10 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring
 from transformers.utils.deprecation import deprecate_kwarg
 
-from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
+from arctic_platform.model.implementations.gpu.lm_head import (
+    inherit_lm_head_target_validation,
+    slice_temperature_for_logits_to_keep,
+)
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.configuration_glm_moe_dsa import (
     GlmMoeDsaConfig,
@@ -479,7 +482,7 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
             inherit_lm_head_target_validation(labels, labels[:, slice_indices])
             if labels is not None
             else None,
-            temperature=temperature[:, slice_indices] if temperature is not None else None,
+            temperature=slice_temperature_for_logits_to_keep(temperature, slice_indices),
         )
 
     def init_buffers_post_meta(self):

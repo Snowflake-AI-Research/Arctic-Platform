@@ -227,3 +227,21 @@ def test_legacy_sender_does_not_matter_when_nothing_is_missing():
     assert group.recv(rx, needed_sample_ids=["rr1:a"], allow_missing=True) == {
         "tensors_recv": 1, "dropped_sample_ids": [],
     }
+
+
+def test_uint16_ids_cross_as_bytes_and_land_exact():
+    """vLLM captures uint16 ids above 256 experts; NCCL has no 16-bit integer type."""
+    ids = torch.tensor([255, 256, 287, 511], dtype=torch.uint16).reshape(4, 1, 1)
+    tx = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
+    tx.put("rr1:a", ids)
+    sender = _group("sender", 1, [_receiver(0, ["rr1:a"]), _sender(1, [])])
+    peers = [_receiver(0, ["rr1:a"]), sender._build_send_manifest(tx.snapshot())]
+    sender.send(tx)
+    [(dst, wire)] = sender.nccl.sent
+    rx = RouterReplayCacheRX(device=torch.device("cpu"), max_bytes=1 << 20)
+
+    _group("receiver", 0, peers, _FakeNCCL([wire])).recv(rx, needed_sample_ids=["rr1:a"])
+
+    assert (dst, wire.dtype) == (0, torch.uint8)
+    out = rx.pop("rr1:a")
+    assert out.dtype == torch.uint16 and torch.equal(out, ids)
