@@ -1,6 +1,11 @@
 import asyncio
+import os
+import subprocess
 import sys
+import traceback
 import types
+
+import pytest
 
 if "vllm" not in sys.modules:
     vllm_module = types.ModuleType("vllm")
@@ -198,3 +203,61 @@ def test_initialize_drops_reasoning_parser_when_tokenizer_lacks_think_tokens(
     assert len(configs) == 1
     assert worker.state == WorkerLifecycleState.READY
     assert worker._reasoning_parser is None
+
+
+def _initialize_with_failing_engine_core(monkeypatch, tmp_path):
+    class FakeEngineArgs:
+        def create_engine_config(self):
+            return types.SimpleNamespace(
+                structured_outputs_config=types.SimpleNamespace(enable_in_reasoning=False),
+                model_config=types.SimpleNamespace(
+                    skip_tokenizer_init=True, architecture="LlamaForCausalLM"
+                ),
+            )
+
+    class FakeAsyncLLM:
+        @classmethod
+        def from_vllm_config(cls, vllm_config, stat_loggers):
+            # Like vLLM's engine-core subprocess: the root cause goes to inherited stdio only.
+            script = "import sys; print('engine core starting'); sys.stderr.write('ImportError: deep_gemm\\n')"
+            subprocess.run([sys.executable, "-c", script], check=True)
+            raise RuntimeError("Engine core initialization failed. See root cause above. Failed core proc(s): {}")
+
+    _install_fake_vllm(monkeypatch, FakeAsyncLLM)
+    monkeypatch.setattr(worker_mod, "_ensure_arctic_vllm_patches", lambda: None)
+    monkeypatch.setattr(worker_mod, "_ensure_router_replay_vllm_patches", lambda: None)
+    monkeypatch.setattr(worker_mod, "ensure_xgrammar_stop_mask_fix", lambda: None)
+    monkeypatch.setattr(worker_mod, "ensure_spec_decode_grammar_fix", lambda: None)
+    monkeypatch.setattr(worker_mod, "_create_async_engine_args", lambda kwargs, **_ignored: FakeEngineArgs())
+    worker = InferenceWorker.__ray_metadata__.modified_class()
+
+    # A Ray worker's stdout/stderr are files under the session's logs/ directory.
+    saved = os.dup(1), os.dup(2)
+    with open(tmp_path / "worker.out", "wb") as out, open(tmp_path / "worker.err", "wb") as err:
+        os.dup2(out.fileno(), 1)
+        os.dup2(err.fileno(), 2)
+        try:
+            with pytest.raises(RuntimeError) as info:
+                asyncio.run(worker.initialize({"model": "test-model"}, model_id="job-1"))
+        finally:
+            os.dup2(saved[0], 1)
+            os.dup2(saved[1], 2)
+    return info.value
+
+
+def test_initialize_failure_carries_engine_console_tail(monkeypatch, tmp_path):
+    exc = _initialize_with_failing_engine_core(monkeypatch, tmp_path)
+    rendered = "".join(traceback.format_exception(exc))
+    assert "engine core starting" in rendered
+    assert "ImportError: deep_gemm" in rendered
+
+
+def test_unreadable_console_keeps_original_startup_error(monkeypatch, tmp_path):
+    def deny_open(path, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(worker_mod, "open", deny_open, raising=False)
+    exc = _initialize_with_failing_engine_core(monkeypatch, tmp_path)
+    assert type(exc) is RuntimeError
+    assert "See root cause above" in str(exc)
+    assert not getattr(exc, "__notes__", None)
