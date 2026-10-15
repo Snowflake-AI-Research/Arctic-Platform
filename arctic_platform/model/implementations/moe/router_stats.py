@@ -98,7 +98,13 @@ class RouterStatsCallback(MetricsCallback):
             self.log("router_stats", report, reduce=Reduce.SUM)
 
     def on_error(self, trainer: Trainer, stage: str, exc: BaseException) -> None:
-        self._reset()
+        # fwd_bwd / forward_only can leave partial totals; clear those so a retry
+        # does not double-count. step failures must keep the completed fwd_bwd
+        # totals so a step-only retry still publishes them via post_step.
+        if stage in {"fwd_bwd", "forward_only"}:
+            self._reset()
+        else:
+            self._counting = True
 
     def _reset(self) -> None:
         """Drop partial totals and count the next router call."""
