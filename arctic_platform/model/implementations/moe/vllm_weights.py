@@ -30,12 +30,29 @@ def pack_routed_experts_to_vllm(layer_sd: dict, prefix: str) -> None:
     w1_key = f"{prefix}.mlp.experts.w1"
     w3_key = f"{prefix}.mlp.experts.w3"
     w2_key = f"{prefix}.mlp.experts.w2"
+    w1_scale_key = f"{prefix}.mlp.experts.w1_scale_inv"
+    w2_scale_key = f"{prefix}.mlp.experts.w2_scale_inv"
+    w3_scale_key = f"{prefix}.mlp.experts.w3_scale_inv"
     if w1_key in layer_sd and w3_key in layer_sd:
         w1 = layer_sd.pop(w1_key)
         w3 = layer_sd.pop(w3_key)
         layer_sd[f"{prefix}.mlp.experts.w13_weight"] = torch.cat([w1, w3], dim=1)
+        w1_scale = layer_sd.pop(w1_scale_key, None)
+        w3_scale = layer_sd.pop(w3_scale_key, None)
+        if w1_scale is not None or w3_scale is not None:
+            if w1_scale is None or w3_scale is None:
+                raise RuntimeError(
+                    f"{prefix}: native FP8 experts require both w1_scale_inv and "
+                    f"w3_scale_inv when packing w13_weight"
+                )
+            layer_sd[f"{prefix}.mlp.experts.w13_weight_scale_inv"] = torch.cat(
+                [w1_scale, w3_scale], dim=1
+            )
     if w2_key in layer_sd:
         layer_sd[f"{prefix}.mlp.experts.w2_weight"] = layer_sd.pop(w2_key)
+        w2_scale = layer_sd.pop(w2_scale_key, None)
+        if w2_scale is not None:
+            layer_sd[f"{prefix}.mlp.experts.w2_weight_scale_inv"] = w2_scale
 
     for buf_key in (f"{prefix}.mlp.expert_bias", f"{prefix}.mlp.tokens_per_expert"):
         layer_sd.pop(buf_key, None)
@@ -43,6 +60,8 @@ def pack_routed_experts_to_vllm(layer_sd: dict, prefix: str) -> None:
     packed_experts = {
         f"{prefix}.mlp.experts.w13_weight",
         f"{prefix}.mlp.experts.w2_weight",
+        f"{prefix}.mlp.experts.w13_weight_scale_inv",
+        f"{prefix}.mlp.experts.w2_weight_scale_inv",
     }
     leftover = [
         key
@@ -69,6 +88,15 @@ def pack_shared_expert_to_vllm(layer_sd: dict, prefix: str) -> None:
             if old in layer_sd:
                 layer_sd[f"{dst}.{hf_leaf}"] = layer_sd.pop(old)
                 break
+    scale_pairs = (
+        ("w1_scale_inv", "gate_proj.weight_scale_inv"),
+        ("w2_scale_inv", "down_proj.weight_scale_inv"),
+        ("w3_scale_inv", "up_proj.weight_scale_inv"),
+    )
+    for tt_name, hf_leaf in scale_pairs:
+        old = f"{src}.{tt_name}"
+        if old in layer_sd:
+            layer_sd[f"{dst}.{hf_leaf}"] = layer_sd.pop(old)
     leftover = [
         key for key in layer_sd if key.startswith(f"{prefix}.mlp.shared_expert.")
     ]

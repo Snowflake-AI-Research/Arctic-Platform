@@ -22,6 +22,7 @@ import logging
 from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import JobId
 from arctic_platform.client.config import OnPremConfig
+from arctic_platform.client.transport import CLUSTER_OPS
 from arctic_platform.client.transport import JOB_CREATE_ORDER
 from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
@@ -117,6 +118,8 @@ class OnPremTransport(Transport):
         return ray.get(self._state.initialize.remote(payload))["job_id"]
 
     def _resolve(self, request: Request):
+        if request.op in CLUSTER_OPS:
+            raise NotImplementedError(f"on-prem does not support cluster operation {request.op!r}")
         method = getattr(self._server, method_name(request.op))
         # Pass job_id only when set (ops omitting it call method(body)), then the body.
         args = (request.body,) if request.job_id is None else (request.job_id, request.body)
