@@ -57,6 +57,7 @@ from arctic_platform.model.weight_export import PEFT_ADAPTER_DIRNAME
 from arctic_platform.model.weight_export import WeightExportContract
 from arctic_platform.model.weight_export import checkpoint_peft_adapter_dir
 from arctic_platform.model.weight_export import gather_peft_adapter_state_dict
+from arctic_platform.model.weight_export import hf_checkpoint_name_map
 from arctic_platform.model.weight_export import hf_export_parameter_name
 from arctic_platform.model.weight_export import iter_lora_weights
 from arctic_platform.model.weight_export import iter_model_weights
@@ -89,6 +90,7 @@ __all__ = [
     "gather_peft_adapter_state_dict",
     "get_language_model",
     "get_vision_encoder",
+    "hf_checkpoint_name_map",
     "hf_export_parameter_name",
     "iter_lora_weights",
     "iter_model_weights",

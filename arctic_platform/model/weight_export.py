@@ -94,6 +94,52 @@ def hf_export_parameter_name(name: str) -> str | None:
     return name
 
 
+def hf_checkpoint_name_map(model: nn.Module) -> dict[str, str]:
+    """Map exported parameter names onto the names ``save_pretrained`` writes.
+
+    Transformers renames checkpoint keys on load (for example, Transformers 5
+    drops Siglip's ``vision_model`` segment). Weight sync streams live
+    parameters, so it must apply the same reverse renames that saving does.
+    Only names that change are returned. Names consumed by a tensor converter
+    are left alone because they do not map one-to-one.
+    """
+    from transformers import PreTrainedModel
+    from transformers.core_model_loading import PrefixChange
+    from transformers.core_model_loading import WeightConverter
+    from transformers.core_model_loading import WeightRenaming
+    from transformers.core_model_loading import rename_source_key
+
+    base = pretrained_module_for_hf_save(model)
+    if not isinstance(base, PreTrainedModel):
+        return {}
+    conversions = getattr(base, "_weight_conversions", None)
+    if conversions is None:
+        from transformers.conversion_mapping import get_model_conversion_mapping
+
+        # Without load-time history Transformers cannot tell whether a removed
+        # prefix existed, so ``save_pretrained`` drops prefix changes too.
+        conversions = [
+            conversion
+            for conversion in get_model_conversion_mapping(base, add_legacy=False)
+            if not isinstance(conversion, PrefixChange)
+        ]
+    if not conversions:
+        return {}
+
+    reverse = [conversion.reverse_transform() for conversion in conversions[::-1]]
+    renamings = [transform for transform in reverse if isinstance(transform, WeightRenaming)]
+    converters = [transform for transform in reverse if isinstance(transform, WeightConverter)]
+    names: dict[str, str] = {}
+    for name, _ in model.named_parameters():
+        export_name = hf_export_parameter_name(name)
+        if export_name is None:
+            continue
+        checkpoint_name, converter_pattern = rename_source_key(export_name, renamings, converters, reverse=True)
+        if converter_pattern is None and checkpoint_name != export_name:
+            names[export_name] = checkpoint_name
+    return names
+
+
 def is_peft_model(model: Any) -> bool:
     peft_config = getattr(model, "peft_config", None)
     if isinstance(peft_config, dict) and peft_config:
@@ -431,7 +477,8 @@ def iter_model_weights(
     if is_zero3:
         raise NotImplementedError("generic HF weight export does not support ZeRO-3")
     if is_master:
+        checkpoint_names = hf_checkpoint_name_map(model)
         for name, parameter in model.named_parameters():
             export_name = hf_export_parameter_name(name)
             if export_name is not None:
-                yield export_name, parameter.data
+                yield checkpoint_names.get(export_name, export_name), parameter.data

@@ -26,6 +26,7 @@ from torch import nn
 from arctic_platform.model import PEFT_ADAPTER_DIRNAME
 from arctic_platform.model import WeightExportContract
 from arctic_platform.model import gather_peft_adapter_state_dict
+from arctic_platform.model import hf_checkpoint_name_map
 from arctic_platform.model import hf_export_parameter_name
 from arctic_platform.model import iter_lora_weights
 from arctic_platform.model import iter_model_weights
@@ -391,3 +392,69 @@ def test_peft_wrapped_qwen3_5_moe_keeps_vllm_family_export(monkeypatch):
     names = _export_names(wrapped, "vllm", monkeypatch)
     assert "model.layers.0.mlp.gate.weight" in names
     assert "model.layers.0.mlp.experts.w13_weight" in names
+
+
+def _tiny_gemma3_checkpoint(tmp_path, checkpoint_name):
+    from safetensors.torch import save_file
+    from transformers import Gemma3Config
+    from transformers import Gemma3ForConditionalGeneration
+
+    config = Gemma3Config(
+        text_config={
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": 300,
+            "sliding_window": 8,
+        },
+        vision_config={
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "image_size": 28,
+            "patch_size": 14,
+        },
+        mm_tokens_per_image=4,
+    )
+    state = {
+        checkpoint_name(name): tensor.contiguous()
+        for name, tensor in Gemma3ForConditionalGeneration(config).state_dict().items()
+        if name != "lm_head.weight"
+    }
+    config.save_pretrained(tmp_path)
+    save_file(state, tmp_path / "model.safetensors", metadata={"format": "pt"})
+    return Gemma3ForConditionalGeneration.from_pretrained(tmp_path), set(state)
+
+
+def _nested_siglip(name):
+    return name.replace("model.vision_tower.", "model.vision_tower.vision_model.")
+
+
+def _legacy_llava(name):
+    name = _nested_siglip(name)
+    for live, saved in (
+        ("model.language_model.", "language_model.model."),
+        ("model.vision_tower.", "vision_tower."),
+        ("model.multi_modal_projector.", "multi_modal_projector."),
+    ):
+        if name.startswith(live):
+            return saved + name[len(live) :]
+    return name
+
+
+@pytest.mark.parametrize("checkpoint_name", [_nested_siglip, _legacy_llava])
+def test_generic_hf_export_emits_the_loaded_checkpoint_names(tmp_path, checkpoint_name):
+    model, checkpoint_names = _tiny_gemma3_checkpoint(tmp_path, checkpoint_name)
+
+    exported = {name for name, _ in iter_model_weights(model, "hf", is_master=True, is_zero3=False)}
+
+    assert "model.vision_tower.embeddings.patch_embedding.weight" in dict(model.named_parameters())
+    assert exported == checkpoint_names
+
+
+def test_hf_checkpoint_name_map_is_empty_without_load_renames():
+    assert hf_checkpoint_name_map(nn.Linear(2, 2)) == {}
