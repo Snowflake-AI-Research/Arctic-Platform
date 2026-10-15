@@ -18,7 +18,9 @@ With the patch, the three roundings are checked at the stock classes against ref
 add in fp32 inside the next RMSNorm, the partial rotary embedding in fp32, and the GatedDeltaNet beta gate as a sigmoid
 of fp32 ``b``. Forward and backward are checked under the generic gradient-checkpointing patch (full layers, every
 layer and every other layer, reentrant and not), under activation offload, with each decoder layer compiled (traced by
-dynamo, as one graph and with graph breaks, and run eagerly), and with fp32 weights under bf16 autocast. The
+dynamo, as one graph and with graph breaks, and run eagerly; also with a graph break forced inside or before the
+attention of models with two full-attention layers, and with stock and patched models compiled in one process), and
+with fp32 weights under bf16 autocast. The
 experimental ``fp32_residual`` setting, which carries the residual stream in fp32 between decoder layers, is checked
 against the same reference loop and under the same checkpointing, offload and compile paths.
 The huggingface loader's ``fp32_parity`` set to false installs nothing, so the model is the stock one. The copied stock
@@ -41,6 +43,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_5 import modeling_qwen3_5
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
@@ -78,7 +82,7 @@ def _stock_classes(monkeypatch):
         monkeypatch.setattr(owner, name, value)
 
 
-def _config() -> Qwen3_5TextConfig:
+def _config(layer_types: list[str] | None = None) -> Qwen3_5TextConfig:
     config = Qwen3_5TextConfig(
         hidden_size=32,
         num_hidden_layers=4,
@@ -94,6 +98,7 @@ def _config() -> Qwen3_5TextConfig:
         linear_conv_kernel_dim=4,
         rms_norm_eps=_EPS,
         tie_word_embeddings=False,
+        layer_types=layer_types,
     )
     config._attn_implementation = "sdpa"
     return config
@@ -526,6 +531,78 @@ def test_compiled_layers_forward_backward_match_eager(mode, fullgraph):
     finally:
         torch._dynamo.reset()
     _assert_same_run(output, grads, expected_output, expected_grads)
+
+
+_GRAPH_BREAK_ATTENTION = "sdpa_after_a_graph_break"
+
+
+def _sdpa_after_a_graph_break(*args, **kwargs):
+    """SDPA behind a graph break, as a compiled layer meets one at an attention kernel dynamo cannot trace."""
+    torch._dynamo.graph_break()
+    return sdpa_attention_forward(*args, **kwargs)
+
+
+def _graph_break_model(monkeypatch, mode: str, where: str) -> nn.Module:
+    """A model with two full-attention layers whose compiled decoder layers break their graph at ``where``."""
+    set_seed(0)
+    config = _config(layer_types=["linear_attention", "full_attention"] * 2)
+    model = modeling_qwen3_5.Qwen3_5ForCausalLM(config).to(torch.bfloat16)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(0.0, 0.2)
+    model.train()
+    if mode != "stock":
+        _patched(model, fp32_residual=mode == "fp32-residual")
+    if where == "in-attention":
+        monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._local_mapping, _GRAPH_BREAK_ATTENTION, _sdpa_after_a_graph_break)
+        model.config._attn_implementation = _GRAPH_BREAK_ATTENTION
+    else:
+        # A break in the decoder layer before the attention call, so that the attention forward is compiled as a
+        # frame of its own.
+        for layer in model.model.layers:
+            if layer.block_type == "full_attention":
+                layer.self_attn.register_forward_pre_hook(lambda module, args: torch._dynamo.graph_break())
+    return model
+
+
+@pytest.mark.parametrize("mode", _MODES)
+@pytest.mark.parametrize("checkpointing", [False, True], ids=["eager-layers", "checkpointed-layers"])
+@pytest.mark.parametrize("where", ["in-attention", "before-attention"])
+def test_compiled_layers_with_a_graph_break_match_eager(monkeypatch, mode, checkpointing, where):
+    reference_model = _graph_break_model(monkeypatch, mode, where)
+    compiled_model = copy.deepcopy(reference_model)
+    if checkpointing:
+        compiled_model = _checkpointed(compiled_model, True)
+    compiled_model = _compiled_layers(compiled_model, fullgraph=False)
+
+    expected_output, expected_grads = _forward_backward(reference_model)
+    try:
+        output, grads = _forward_backward(compiled_model)
+    finally:
+        torch._dynamo.reset()
+    _assert_same_run(output, grads, expected_output, expected_grads)
+
+
+def test_stock_and_patched_models_compiled_in_one_process_match_eager(monkeypatch):
+    # The stock attention forward and the patched one run the same bytecode; each must keep its own compiled code.
+    models = [_graph_break_model(monkeypatch, mode, "in-attention") for mode in ("stock", "fp32-parity", "stock")]
+    expected = [_forward_backward(model) for model in models]
+    compiled = [_compiled_layers(copy.deepcopy(model), fullgraph=False) for model in models]
+    try:
+        for model, (expected_output, expected_grads) in zip(compiled, expected):
+            _assert_same_run(*_forward_backward(model), expected_output, expected_grads)
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("mode", _MODES)
+def test_fullgraph_compile_refuses_a_graph_break_in_attention(monkeypatch, mode):
+    model = _compiled_layers(_graph_break_model(monkeypatch, mode, "in-attention"), fullgraph=True)
+    try:
+        with pytest.raises(torch._dynamo.exc.Unsupported, match="graph_break"):
+            _forward_backward(model)
+    finally:
+        torch._dynamo.reset()
 
 
 def test_fp32_weights_under_bf16_autocast_keep_a_bf16_residual_stream():

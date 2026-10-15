@@ -30,7 +30,8 @@ does, in the same way as the custom Qwen3.5-MoE implementation:
    decoder-layer and final norms, only where a norm is called on one tensor: the first layer's input norm.
 2. The partial rotary embedding of q and k is evaluated in fp32 and cast back once. Each patched attention module
    gets its class's forward with ``apply_rotary_pos_emb`` bound to the fp32 rotation; the module-level function and
-   every unpatched model keep the stock rotation.
+   every unpatched model keep the stock rotation. That forward is one function per class, with a code object of its
+   own, so torch.compile never runs one compiled code object under two globals dicts.
 3. The GatedDeltaNet beta gate is a sigmoid of fp32 ``b``: a forward hook makes ``in_proj_b`` return fp32, and the
    stock forward uses ``b`` only for ``beta = b.sigmoid()``. With sequence parallelism the sequence-parallel wrapper
    replaces that forward and takes the setting itself (its ``fp32_beta`` argument), so no hook is installed.
@@ -251,13 +252,29 @@ def _apply_rotary_pos_emb_fp32(q, k, cos, sin, unsqueeze_dim=1):
 def _attention_forward_with_fp32_rope(attention_class) -> types.FunctionType:
     """``attention_class``'s forward, with its global ``apply_rotary_pos_emb`` resolved to the fp32 rotation.
 
-    The code object is the class's own; only the name lookup differs. The globals are a copy of the forward's own,
-    taken when the patch is applied.
+    The bytecode is the class's own; only the name lookup differs. The globals are a copy of the forward's own, taken
+    the first time the patch meets the class, and every layer of the class shares the one returned function.
     """
-    stock = attention_class.forward
+    return _fp32_rope_forward(attention_class.forward)
+
+
+@functools.cache
+def _fp32_rope_forward(stock: types.FunctionType) -> types.FunctionType:
+    """The fp32-rotation copy of the attention forward ``stock``: one function, one code object, one globals dict.
+
+    torch.compile keeps its compiled code on the code object and, after a graph break, stores the names that code
+    loads (compiled graphs, imported modules) in the globals of the frame it compiled. A code object that runs with
+    more than one globals dict, as the stock forward and its copies would, can therefore load a name that only
+    another dict holds, which fails with a NameError. So the copy gets its own code object, the same bytecode under
+    a distinct qualified name, and all layers share its globals.
+    """
     module_globals = dict(stock.__globals__)
     module_globals["apply_rotary_pos_emb"] = _apply_rotary_pos_emb_fp32
-    return types.FunctionType(stock.__code__, module_globals, stock.__name__, stock.__defaults__, stock.__closure__)
+    code = stock.__code__.replace(co_qualname=f"{stock.__qualname__}_with_fp32_rope")
+    forward = types.FunctionType(code, module_globals, stock.__name__, stock.__defaults__, stock.__closure__)
+    forward.__kwdefaults__ = stock.__kwdefaults__
+    forward.__qualname__ = code.co_qualname
+    return forward
 
 
 def _fp32_output(module: nn.Module, args: tuple, output: torch.Tensor) -> torch.Tensor:
