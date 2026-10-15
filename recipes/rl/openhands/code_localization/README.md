@@ -103,13 +103,10 @@ Checkpoints are server-side every 10 steps. Ids are appended to
 
 ## Stop
 
-Exiting the launcher cancels the Cortex job. If the process dies first, the
-GPUs stay allocated until you cancel the id in `$CKPT_DIR/cortex_job_id`:
-
-```bash
-PYTHONPATH=recipes/rl/openhands/code_localization \
-  python -m openhands_localization.release "$(cat "$CKPT_DIR/cortex_job_id")"
-```
+Ctrl-C, `kill`, or the end of training cancels the Cortex job. A driver killed
+with `kill -9` or by the OOM killer cannot. The server reclaims that job after
+30 idle minutes; set `ARCTIC_CORTEX_IDLE_TIMEOUT_SECONDS` (at least 300) to
+shorten that.
 
 ## Sources
 

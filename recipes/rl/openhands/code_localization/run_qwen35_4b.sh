@@ -95,20 +95,12 @@ export RAY_DEDUP_LOGS=0
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export OPENHANDS_WORKSPACE="${OPENHANDS_WORKSPACE:-/tmp/testbed}"
-export ARCTIC_CORTEX_JOB_ID_FILE="${CKPT_DIR}/cortex_job_id"
 export ARCTIC_CORTEX_JOB_COMMENT="${ARCTIC_CORTEX_JOB_COMMENT:-openhands code localization ${MODEL} ${NUM_TRAIN_GPUS}+${NUM_SAMPLING_ENGINES}}"
 
 ENGINE_URLS="$(printf 'http://cortex-managed,%.0s' $(seq "${NUM_SAMPLING_ENGINES}"))"
 ENGINE_URLS="[${ENGINE_URLS%,}]"
 
-release_job() {
-    if [[ -f "${ARCTIC_CORTEX_JOB_ID_FILE}" ]]; then
-        uv run --isolated --no-project --with "${AP_ROOT}[cortex]" \
-            -- python -m openhands_localization.release \
-            "$(cat "${ARCTIC_CORTEX_JOB_ID_FILE}")" || true
-    fi
-}
-
+# The driver cancels its Cortex job on SIGTERM, so wait for it to finish.
 stop_driver() {
     if [[ -n "${DRIVER_PID:-}" ]]; then
         kill -TERM "${DRIVER_PID}" 2>/dev/null || true
@@ -117,15 +109,7 @@ stop_driver() {
     exit 130
 }
 
-on_exit() {
-    local code=$?
-    trap - EXIT
-    release_job
-    exit "${code}"
-}
-
 trap stop_driver INT TERM
-trap on_exit EXIT
 
 cd "${SKYRL_HOME}"
 uv run --isolated --extra skyrl-train \
