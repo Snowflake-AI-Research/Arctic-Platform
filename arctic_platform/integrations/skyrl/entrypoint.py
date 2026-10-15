@@ -37,6 +37,7 @@ variable deciding it: the recipe names this module or it does not.
 from __future__ import annotations
 
 import contextlib
+import logging
 import signal
 import threading
 from typing import Any
@@ -46,6 +47,8 @@ from typing import Optional
 import ray
 
 __all__ = ["launch_driver", "main", "patch_upstream"]
+
+logger = logging.getLogger(__name__)
 
 _RECONNECT_FIELDS = ("training_job_id", "sampling_job_id", "log_prob_job_id")
 # Clients in this process that created their jobs, as opposed to reattaching.
@@ -79,8 +82,6 @@ def _releasing_created_jobs() -> Iterator[None]:
     ``ray.init`` on, which is after the placement wait. A process killed outright
     is left to the server's idle timeout.
     """
-    from loguru import logger
-
     previous = None
     if threading.current_thread() is threading.main_thread():
         previous = signal.signal(signal.SIGTERM, _exit_on_sigterm)
