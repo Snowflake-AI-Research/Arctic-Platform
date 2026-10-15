@@ -65,7 +65,7 @@ class FakeSend:
         self.posts: list[dict] = []
         self.result = result
 
-    def __call__(self, method: str, url: str, *, retry_on=None, **kwargs):
+    async def __call__(self, method: str, url: str, *, retry_on=None, **kwargs):
         if method == "GET":
             return {"status": "REQUEST_STATE_DONE", "result": self.result}
         self.posts.append({"url": url, **kwargs})
@@ -178,7 +178,11 @@ class TestForwardWire:
     def test_missing_request_id_on_the_last_chunk_is_an_error(self):
         """Only the final chunk starts execution; without its id there is nothing to poll."""
         transport, send = _transport()
-        transport._send = lambda *a, **kw: {"status": "chunk_cached"}  # type: ignore[method-assign]
+
+        async def cached(*args, **kwargs):
+            return {"status": "chunk_cached"}
+
+        transport._send = cached  # type: ignore[method-assign]
 
         with pytest.raises(RuntimeError, match="carried no request_id"):
             transport.call(fwd_no_grad_request(transport.jobs, _batch()))

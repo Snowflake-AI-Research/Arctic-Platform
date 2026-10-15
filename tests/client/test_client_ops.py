@@ -242,6 +242,12 @@ class TestLifecycle:
         with pytest.raises(ValueError, match="No training job"):
             JobHandles().require("training")
 
+    def test_require_any_returns_the_first_live_job(self):
+        """require_any picks any initialized job and fails when none exists."""
+        assert JobHandles(sampling=SAMPLING, log_prob=LOG_PROB).require_any() == SAMPLING
+        with pytest.raises(ValueError, match="No job initialized"):
+            JobHandles().require_any()
+
 
 class TestServerState:
     """Reconnect handoff: a client can expose (and reattach via) the transport's
@@ -390,6 +396,37 @@ class TestClusterRequestBuilders:
         )
         assert {request.op for request in requests} == CLUSTER_OPS
         assert CLUSTER_OPS.isdisjoint(OPS)
+
+
+class TestClusterClientMethods:
+    def test_account_ops_use_the_given_arguments(self, client):
+        """Account-level ops need no stored handle."""
+        _call(client, "list_jobs", "running")
+        assert _last(client) == cluster_requests.list_jobs_request("running")
+        _call(client, "capacity", "H200")
+        assert _last(client) == cluster_requests.capacity_request("H200")
+        _call(client, "cancel_job", "job-9")
+        assert _last(client) == cluster_requests.cancel_job_request("job-9")
+
+    def test_get_job_targets_a_stored_handle(self, client):
+        _call(client, "get_job")
+        assert _last(client) == cluster_requests.get_job_request(TRAINING)
+
+    def test_checkpoint_ops_target_the_training_job(self, client):
+        _call(client, "list_checkpoints")
+        assert _last(client) == cluster_requests.list_checkpoints_request(TRAINING)
+        _call(client, "export_checkpoint", "cp-1")
+        assert _last(client) == cluster_requests.export_checkpoint_request(TRAINING, "cp-1")
+        _call(client, "delete_checkpoint", "cp-1")
+        assert _last(client) == cluster_requests.delete_checkpoint_request(TRAINING, "cp-1")
+
+    def test_onprem_rejects_cluster_ops(self):
+        """On-prem has no job persistence, so cluster ops fail instead of reaching the Ray server."""
+        from arctic_platform.client.transports.onprem import OnPremTransport
+
+        transport = OnPremTransport(OnPremConfig())
+        with pytest.raises(NotImplementedError, match="list-jobs"):
+            transport.call(cluster_requests.list_jobs_request())
 
 
 class TestTransportSelection:
@@ -660,13 +697,23 @@ class TestCortexTransportNoopOps:
         assert t.call(Request("wake-inference", 1, None)) == {}
         assert t.call(Request("sleep-training", 1, {"mode": "all"})) == {}
 
+    def test_wake_inference_tag_list_is_a_noop(self, monkeypatch):
+        """sync_weights wakes with a bare tag list as the body; it must not be read as a dict."""
+        pytest.importorskip("tenacity")
+        from arctic_platform.client import CortexConfig
+        from arctic_platform.client.transports.cortex import CortexTransport
+
+        t = CortexTransport(CortexConfig(base_url="http://mock"))
+        assert t.call(cluster_requests.wake_inference_request(JobHandles(sampling=SAMPLING), ["weights"])) == {}
+        assert asyncio.run(t.acall(Request("wake-inference", SAMPLING, ["kv_cache"]))) == {}
+
 
 class TestCortexCancelToleratesEmptyBody:
     """``:cancel`` answers 200 with no body. Decoding that as JSON reported a
     release that had in fact succeeded as ``could not release <id>``, which
     points the operator at the GPU cap instead of at their freed GPUs."""
 
-    def test_cancel_job_accepts_empty_response(self, monkeypatch):
+    def test_cancel_request_accepts_empty_response(self, monkeypatch):
         pytest.importorskip("tenacity")
         monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
         from arctic_platform.client import CortexConfig
@@ -675,24 +722,27 @@ class TestCortexCancelToleratesEmptyBody:
         t = CortexTransport(CortexConfig())
 
         class _EmptyResp:
-            status_code = 200
-            content = b""
+            status = 200
 
-            def raise_for_status(self):
+            async def read(self):
+                return b""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
                 return None
-
-            def json(self):
-                raise ValueError("Expecting value: line 1 column 1 (char 0)")
 
         sent = {}
 
-        def _request(method, url, **kwargs):
-            sent["method"], sent["url"] = method, url
-            return _EmptyResp()
+        class _Session:
+            def request(self, method, url, **kwargs):
+                sent["method"], sent["url"] = method, url
+                return _EmptyResp()
 
-        monkeypatch.setattr(t.session, "request", _request)
+        t._session = _Session()
 
-        t.cancel_job("job-abc")
+        t.call(cluster_requests.cancel_job_request("job-abc"))
 
         assert sent["method"] == "POST"
         assert sent["url"].endswith("/job-abc:cancel")

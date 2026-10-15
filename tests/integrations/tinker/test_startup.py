@@ -15,9 +15,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import warnings
+
+import aiohttp
 
 from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
@@ -43,24 +44,19 @@ def test_wait_running_logs_each_status_once(caplog, monkeypatch):
     assert len(messages) == 2
 
 
-def test_async_session_closes_when_the_loop_ends():
-    transport = CortexTransport.__new__(CortexTransport)
-    transport._asession = None
-    transport._asession_loop = None
-    transport._session_guards = []
-    transport.config = CortexConfig(base_url="http://mock", request_timeout=5)
-    transport._auth_headers = lambda: {}
+def test_shutdown_closes_the_session():
+    transport = CortexTransport(CortexConfig(base_url="http://mock"))
 
-    async def open_session() -> None:
-        session = await transport._ensure_asession()
-        assert session.closed is False
-        assert session.timeout.total == 5
+    async def open_session() -> aiohttp.ClientSession:
+        transport._session = aiohttp.ClientSession()
+        return transport._session
 
+    session = transport._on_loop(open_session()).result()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ResourceWarning)
-        asyncio.run(open_session())
+        transport.shutdown()
 
-    assert transport._asession.closed
+    assert session.closed
     assert not any("Unclosed" in str(item.message) for item in caught)
 
 
@@ -73,7 +69,7 @@ def test_initialize_preserves_job_comment_with_client_config(monkeypatch):
     transport = CortexTransport(config.backend)
     sent = {}
 
-    def send(method, url, **kwargs):
+    async def send(method, url, **kwargs):
         sent.update(kwargs["json"])
         return {"job_id": "job-123"}
 
@@ -81,12 +77,9 @@ def test_initialize_preserves_job_comment_with_client_config(monkeypatch):
     monkeypatch.setattr(transport, "_send", send)
     monkeypatch.setattr(transport, "_wait_running", lambda: None)
     monkeypatch.setattr(transport, "_capture_sub_jobs", lambda: {"training": "job-123:training"})
-    try:
-        jobs = transport.initialize(config)
-        assert sent == {"sub_job_configs": config.to_cortex(), "comment": "tinker-test"}
-        assert jobs.training == "job-123:training"
-    finally:
-        transport.session.close()
+    jobs = transport.initialize(config)
+    assert sent == {"sub_job_configs": config.to_cortex(), "comment": "tinker-test"}
+    assert jobs.training == "job-123:training"
 
 
 def test_quiet_hub_restores_the_logger_level():
