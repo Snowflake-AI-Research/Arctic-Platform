@@ -1,8 +1,8 @@
 {
-  "glm53-tp16":            {"image_tag": "dev_20261012_114216_1d19a926eba"},
-  "glm53-tp8":             {"image_tag": "dev_20261012_114216_1d19a926eba"},
-  "qwen36-35b-a3b-tp1":    {"image_tag": "dev_20261012_114216_1d19a926eba"},
-  "qwen36-35b-a3b-tp1x8":  {"image_tag": "dev_20261012_164831_d9a1f8c2620"},
+  "glm53-tp16":            {"image_tag": "dev_20261014_134647_8504440038f"},
+  "glm53-tp8":             {"image_tag": "dev_20261014_134647_8504440038f"},
+  "qwen36-35b-a3b-tp1":    {"image_tag": "dev_20261014_134647_8504440038f"},
+  "qwen36-35b-a3b-tp1x8":  {"image_tag": "dev_20261014_134647_8504440038f"},
   "qwen36-35b-a3b-tp2x4":  {"image_tag": "dev_20261012_164831_d9a1f8c2620"},
   "qwen36-35b-a3b-tp4x2":  {"image_tag": "dev_20261012_114216_1d19a926eba"},
   "qwen38-27b-tp1":        {"image_tag": "dev_20261012_114216_1d19a926eba"},
