@@ -163,11 +163,12 @@ _REPLICA_DIR_PREFIX = "replica"
 _REPLICA_ID_ENV = "SEMIP_REPLICA_ID"
 _NUM_REPLICAS_ENV = "SEMIP_NUM_REPLICAS"
 # What a TP=1 key with several replicas per pod binds in place of the pod's
-# devices (see _device_binding). No device node is named like it.
-_TP1_REPLICA_LAYOUT = ("replica-layout",)
-# A whole node, the only pod shape whose dump is published: a smaller pod's
-# skeleton would lack replica<K>/ directories a whole node needs, or (TP>1) be
-# bound to devices other pods do not hold.
+# devices (see _device_binding), suffixed with the replica count except on a
+# whole node, whose spelling every published tp1x8 key was hashed with. No
+# device node is named like it.
+_TP1_REPLICA_LAYOUT = "replica-layout"
+# A whole node. At TP>1 the only pod shape whose dump is published: a smaller
+# pod's skeleton would be bound to devices other pods do not hold.
 _GPUS_PER_NODE = 8
 
 # One engine spanning N pods puts each node-partition under <key>/node<k>/. This is a
@@ -733,12 +734,15 @@ def _device_binding(vllm_config: dict[str, Any],
     Binding it would split one universally restorable image into one key per
     GPU, turning a hit rate of 1 into 1/N.
 
-    **TP=1 with several replicas in the pod binds ``_TP1_REPLICA_LAYOUT``,**
-    not the pod's devices. Those replicas dump under ``<key>/replica<K>/``
-    where a lone replica dumps flat under ``<key>/``, so the two shapes need
-    different keys; but binding the allocation would give every pod size its
-    own key. With the marker, a pod of any size computes the key a whole node
-    dumped, and replica slot K restores ``replica<K>/`` of that image.
+    **TP=1 with several replicas in the pod binds the replica layout and its
+    size** (``_tp1_replica_layout``), not the pod's devices. Those replicas
+    dump under ``<key>/replica<K>/`` where a lone replica dumps flat under
+    ``<key>/``, so the two shapes need different keys. The size is in the key
+    because every replica's image records all of the pod's GPUs, and
+    ``cuda_restore``'s device map is a bijection over them: an image dumped
+    in an 8-GPU pod cannot restore in a 3-GPU one. The devices themselves are
+    not, so a pod of a given size finds the image any pod of that size
+    dumped, on whichever GPUs, and replica slot K restores ``replica<K>/``.
     ``_missing_device_nodes`` keeps exempting TP=1, since such an image
     restores on any slot; at TP>1 the key and the check share
     ``_DEVICE_BOUND_MIN_TP``.
@@ -748,7 +752,14 @@ def _device_binding(vllm_config: dict[str, Any],
         return _visible_device_nodes()
     if replica_count <= 1:
         return None
-    return list(_TP1_REPLICA_LAYOUT)
+    return _tp1_replica_layout(replica_count)
+
+
+def _tp1_replica_layout(replica_count: int) -> list[str]:
+    """What a TP=1 pod of ``replica_count`` replicas binds; one GPU each."""
+    if replica_count == _GPUS_PER_NODE:
+        return [_TP1_REPLICA_LAYOUT]
+    return [f"{_TP1_REPLICA_LAYOUT}-x{replica_count}"]
 
 
 def _pod_image_ref() -> str:
@@ -984,8 +995,8 @@ def _resolve_model_dir(vllm_config: dict[str, Any],
     weight_root = (os.path.join(source_root, slug, _WEIGHT_DIR)
                    if source_root else None)
 
-    if device_nodes == list(_TP1_REPLICA_LAYOUT):
-        binding = "the TP=1 replica layout, for any pod size"
+    if device_nodes == _tp1_replica_layout(count):
+        binding = f"the TP=1 layout of {count} replicas, on any GPUs"
     elif device_nodes:
         binding = f"devices {','.join(device_nodes)}"
     else:
@@ -2852,21 +2863,21 @@ def _publish_skip_reason(paths: _ImagePaths, skeleton_dir: str | None,
     published, and a key that is published already would gain a second
     skeleton, which makes every later restore of it refuse to choose and
     cold-start. ``world_size`` (one engine's GPUs, single-pod engines only)
-    limits publishing to a whole-node pod or a lone TP=1 replica.
+    limits publishing at TP>1 to a whole-node pod; a TP=1 pod of any size is
+    published, since its key names the pod size and not its devices.
     """
     if not paths.skeleton_root:
         return (f"{_IMAGE_SOURCE_ENV} turns the published mirror off, so this "
                 f"job cannot tell whether the key is published already")
     if skeleton_dir:
         return f"the key is already published as {skeleton_dir}"
-    if world_size is not None:
+    if world_size is not None and world_size > 1:
         pod_gpus = world_size * paths.replica_count
-        lone_tp1 = world_size == 1 and paths.replica_count == 1
-        if not lone_tp1 and pod_gpus != _GPUS_PER_NODE:
+        if pod_gpus != _GPUS_PER_NODE:
             return (f"this pod holds {paths.replica_count} replica(s) of "
-                    f"{world_size} GPU(s), and only a whole node "
-                    f"({_GPUS_PER_NODE} GPUs) or a lone TP=1 replica is "
-                    f"published; dump this config at that size to publish it")
+                    f"{world_size} GPU(s), and at TP>1 only a whole node "
+                    f"({_GPUS_PER_NODE} GPUs) is published; dump this config "
+                    f"at that size to publish it")
     return None
 
 

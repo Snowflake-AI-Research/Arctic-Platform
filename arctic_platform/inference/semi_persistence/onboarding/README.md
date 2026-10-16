@@ -130,10 +130,11 @@ cold-starts, dumps, restores and serves, then publishes the image to the
 cluster's model bucket in the background; the `neutrino-model-cache` DaemonSet
 puts it on every node within minutes. The engine does not publish when the
 mirror is off (`SEMIP_IMAGE_SOURCE=""`) or when the key is published already,
-and it publishes only a whole-node pod (8 GPUs) or a lone TP=1 replica. At TP=1
-a pod with several replicas resolves the `tp1x8` key whatever its size, each
-replica restoring its own `replica<K>/`, so publish the `-tp1x8` config and an
-`n_gpus` of 2-7 restores from it; `n_gpus=1` uses the `-tp1` config's image.
+and at TP>1 it publishes only a whole-node pod (8 GPUs). At TP=1 every pod size
+has its own key (`n_gpus=1` the flat `-tp1` image, 8 the `-tp1x8` one, each
+replica restoring its own `replica<K>/`), because the restore's GPU map covers
+every GPU in the pod; a TP=1 pod of 2-7 GPUs therefore needs a dump at that
+size, and publishes it.
 
 To publish every config for a new backend image:
 

@@ -58,10 +58,10 @@ is a rule, not a check. A replica knows only its own node's slot and count, so
 a multi-node miss (with `SEMIP_DUMP_PUBLISH=1`; without it the job fails) cold-starts
 and dumps on every node independently, and only the lowest-address pod
 publishes. The replicas share one key: at TP>1 the pod's device set is in
-`cfg12` already, and at TP=1 a pod with several replicas binds the fixed
-`_TP1_REPLICA_LAYOUT` marker, which keeps the lone replica (flat) on its own
-key while a TP=1 pod of any size resolves the 8-GPU dump's key, slot K reading
-`replica<K>/`. Nothing about the replica set goes into `meta.json`; the
+`cfg12` already, and at TP=1 a pod with several replicas binds a layout
+marker with its replica count (`_tp1_replica_layout`), which keeps the lone
+replica (flat) on its own key while every TP=1 pod of N GPUs resolves the key
+an N-GPU dump wrote, slot K reading `replica<K>/`. Nothing about the replica set goes into `meta.json`; the
 publisher reconstructs it from the directories.
 
 **The published tree is shaped differently, and §9.1 is why.** Only `image/` and
@@ -423,17 +423,21 @@ did not would publish images nothing looks up, and the reverse is the placement
 lottery this replaced.
 
 **One exception, by design: TP=1 with several replicas per pod binds a layout
-marker** (`_device_binding(vllm_config, replica_count)` returns
-`_TP1_REPLICA_LAYOUT`). Not because a TP=1 image cannot move -- it still
-renumbers onto any GPU, and `_missing_device_nodes` stays TP>=2 only -- but
-because the flat layout (one replica) and `replica<K>/` (several) are two
-shapes of the same config and must not share a directory. From 2026-10-03 the
-pod's `/dev` set did that job, which also gave every pod size its own key, so
-only an 8-GPU pod found the 8-replica image. Since 2026-10-14 the marker
-separates the two shapes and nothing else: a TP=1 pod of 2-7 GPUs resolves the
-8-GPU dump's key and restores `replica0..N-1` of it. A single TP=1 replica
-keeps its flat key. Only a whole-node pod publishes a TP=1 multi-replica
-dump, since a smaller pod's skeleton would lack the higher slots.
+marker and the pod's size** (`_device_binding(vllm_config, replica_count)`
+returns `_tp1_replica_layout(replica_count)`: `replica-layout-x<N>`, or the
+bare `replica-layout` at N=8, the spelling the published `tp1x8` keys were
+hashed with). Not because a TP=1 image cannot move -- it still renumbers onto
+any GPU, and `_missing_device_nodes` stays TP>=2 only -- but for two other
+reasons. The flat layout (one replica) and `replica<K>/` (several) are two
+shapes of the same config and must not share a directory. And every replica's
+image records all of the pod's GPU UUIDs, while `cuda_restore`'s device map is
+a bijection over every GPU the restoring pod sees, so an image restores only in
+a pod of the same size. From 2026-10-03 the pod's `/dev` set did both jobs, but
+also gave every GPU set its own key. On 2026-10-14 a bare marker replaced it,
+which let a 3-GPU pod find the 8-GPU image and then fail in `cuda_restore`
+(`image recorded 8 GPU UUID(s) but this node has 3`, job `8cd8c2dc`); the
+count fixes that. A single TP=1 replica keeps its flat key, and a TP=1 pod of
+any size publishes its own dump.
 
 **Why this is not "placement leaking into the key".** It reads like the thing a
 cache key should never depend on, and until this landed the code said so in as

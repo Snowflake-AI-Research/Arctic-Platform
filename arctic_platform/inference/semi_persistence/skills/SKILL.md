@@ -184,11 +184,14 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
   "found" becomes the same statement as "restorable". A single TP=1 image
   renumbers onto whatever slot it lands on, so binding it would split one
   universally restorable image into one key per GPU. TP=1 with several
-  replicas per pod binds a fixed marker (`_TP1_REPLICA_LAYOUT`) instead, so
-  the flat layout (a lone replica: the `tp1` root) and the `replica<K>/`
-  layout never share a directory, while a pod of **any** size computes the
-  key an 8-GPU pod dumped (the `tp1x8` root) and slot K restores
-  `replica<K>/`. `_missing_device_nodes` stays TP>=2 only, because a TP=1
+  replicas per pod binds a layout marker and the replica count instead
+  (`_tp1_replica_layout`; an 8-GPU pod keeps the bare `_TP1_REPLICA_LAYOUT`,
+  the `tp1x8` root), so the flat layout (a lone replica: the `tp1` root) and
+  the `replica<K>/` layout never share a directory, and a pod finds the image
+  any pod of its size dumped, on any GPUs. The size has to be there:
+  `cuda_restore`'s device map is a bijection over every GPU the pod sees, so
+  an 8-GPU dump fails to restore in a 3-GPU pod (job `8cd8c2dc`).
+  `_missing_device_nodes` stays TP>=2 only, because a TP=1
   image still restores on any GPU. The set is **sorted**,
   because a restore onto the same devices in a different order works
   (`[3, 1, 2, 0]` was measured coming back on `[3, 2, 0, 1]`); hashing the order
@@ -211,11 +214,10 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
   flag. With it (in `vllm_config.extra_env`) the engine cold-starts, dumps,
   restores and serves, then publishes in the background (`_start_publish`
   runs `scripts/semip_publish.py` to the dev cluster's bucket). It publishes
-  only a whole-node pod or a lone TP=1 replica, only from one pod of the job
-  (the lowest-address GPU pod), never with the mirror off, and never over a
-  key that is already published. A TP=1 pod of 2–7 GPUs therefore dumps and
-  serves but does not publish: its skeleton would lack `replica<K>/` for the
-  slots a whole node needs.
+  a TP>1 engine only from a whole-node pod (a TP=1 pod of any size, since its
+  key names its size), only from one pod of the job (the lowest-address GPU
+  pod), never with the mirror off, and never over a key that is already
+  published.
 - **With several replicas per pod it is all-or-none.** A replica that
   cold-starts beside siblings that restore lands its new processes on the task
   ids their images recorded. So the checks every replica answers identically
@@ -232,8 +234,8 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
   every replica's weights hash the same, uploads one weight copy and writes one
   sentinel. Because slots restart at 0 on every node, an `n_gpus=16` job
   restores `replica0`/`replica1` of a single-node TP=4 dump on each node
-  (measured 2026-10-03), and a TP=1 pod of N < 8 GPUs restores
-  `replica0..N-1` of the `tp1x8` skeleton. One replica per pod (TP=8 at
+  (measured 2026-10-03), and a TP=1 pod of N GPUs restores
+  `replica0..N-1` of the `tp1xN` skeleton. One replica per pod (TP=8 at
   `n_gpus=8`, TP=1 at `n_gpus=1`) keeps the flat layout. See `IMAGE_CACHE.md`
   Sections 1 and 11.
 - **Publish at the root size, not from an `n_gpus=16`/`32` job.** Run

@@ -221,25 +221,37 @@ def test_tp1_binds_the_replica_layout_not_the_devices_with_several_replicas():
     """The one place the key and the check part ways, on purpose.
 
     Several TP=1 replicas dump under <key>/replica<K>/ where a lone one dumps
-    flat, so the two shapes need different keys -- but not one per pod size.
-    Restorability is unchanged -- a TP=1 image still lands on any slot -- so
-    the device check keeps exempting it.
+    flat, so the two shapes need different keys, and cuda_restore maps every
+    GPU of the pod, so each pod size needs its own. The devices are not bound:
+    a TP=1 image still lands on any slot, so the device check keeps exempting
+    it.
     """
     with _Devices(["nvidia0", "nvidia1", "uverbs0", "uverbs1"]):
         assert se._device_binding(BASE_CONFIG, replica_count=1) is None
         two = se._device_binding(BASE_CONFIG, replica_count=2)
+    with _Devices(["nvidia6", "nvidia7", "uverbs12", "uverbs13"]):
+        assert se._device_binding(BASE_CONFIG, replica_count=2) == two
     with _Devices([f"nvidia{i}" for i in range(8)]
                   + [f"uverbs{i}" for i in range(16)]):
         eight = se._device_binding(BASE_CONFIG, replica_count=8)
-    assert two == eight == list(se._TP1_REPLICA_LAYOUT)
+    assert two == ["replica-layout-x2"] and eight != two
     meta = {"vllm_config": {"tensor_parallel_size": 1},
             "device_nodes": ["nvidia6", "nvidia7"]}
     assert se._missing_device_nodes(meta) == []
 
 
-def test_every_tp1_pod_with_several_replicas_resolves_the_whole_node_key():
-    """n_gpus=2..7 (one pod of that size) finds the image an 8-GPU pod dumped,
-    each replica its own replica<K>/; a lone replica keeps the flat key."""
+def test_a_whole_tp1_node_keeps_the_key_it_was_published_under():
+    """Every published tp1x8 skeleton was hashed with the bare marker."""
+    assert se._device_binding(BASE_CONFIG, replica_count=8) == ["replica-layout"]
+    assert (se._config_hash(BASE_CONFIG, ["replica-layout"])
+            == se._config_hash(BASE_CONFIG,
+                               se._device_binding(BASE_CONFIG, replica_count=8)))
+
+
+def test_each_tp1_pod_size_resolves_its_own_key_on_any_gpus():
+    """A pod of n replicas finds the image any n-replica pod dumped, each
+    replica its own replica<K>/, but never another size's: cuda_restore maps
+    every GPU of the pod. A lone replica keeps the flat key."""
     original = se._env_hash
     se._env_hash = lambda: ("eeeeeeeeeeee", "img@sha256:abc", "580.159.03")
     os.environ["SEMIP_IMAGE_CACHE"] = "/data-fast/image-cache_neutrino"
@@ -253,12 +265,14 @@ def test_every_tp1_pod_with_several_replicas_resolves_the_whole_node_key():
     try:
         node = resolve(range(8), 8, 5)
         small = resolve([3, 6, 7], 3, 2)
+        small_elsewhere = resolve([0, 1, 4], 3, 0)
         pair = resolve([4, 5], 2, 1)
         lone = resolve([2], None, None)
-        assert node.key_prefix == small.key_prefix == pair.key_prefix
-        assert lone.key_prefix != node.key_prefix
+        assert small.key_prefix == small_elsewhere.key_prefix
+        assert len({node.key_prefix, small.key_prefix, pair.key_prefix,
+                    lone.key_prefix}) == 4
         assert small.model_dir == os.path.join(
-            "/data-fast/image-cache_neutrino", node.key_prefix, "replica2")
+            "/data-fast/image-cache_neutrino", small.key_prefix, "replica2")
         assert os.path.basename(lone.model_dir) == lone.key_prefix
     finally:
         se._env_hash = original

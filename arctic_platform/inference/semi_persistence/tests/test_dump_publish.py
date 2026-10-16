@@ -203,16 +203,16 @@ def test_publish_goes_ahead_for_a_new_key(tmp_path):
 @pytest.mark.parametrize("count,world,published", [
     (1, 1, True),    # lone TP=1: the flat tp1 key
     (8, 1, True),    # tp1x8
+    (3, 1, True),    # tp1x3: its own key, on any 3 GPUs
+    (2, 1, True),
     (4, 2, True),    # tp2x4
     (2, 4, True),    # tp4x2
     (1, 8, True),    # tp8
-    (3, 1, False),   # 3 TP=1 replicas: would publish replica0-2 of tp1x8 only
-    (2, 1, False),
     (1, 2, False),   # TP=2 on a 2-GPU pod: bound to devices others lack
     (2, 2, False),
 ])
-def test_only_a_whole_node_or_a_lone_tp1_replica_is_published(tmp_path, count,
-                                                              world, published):
+def test_only_a_whole_node_or_a_tp1_pod_is_published(tmp_path, count, world,
+                                                     published):
     reason = se._publish_skip_reason(_paths(tmp_path, count=count), None, world)
     assert (reason is None) is published
     if not published:
@@ -259,11 +259,23 @@ def test_slot_zero_waits_for_every_replica_of_the_pod(tmp_path, publish_dir,
     assert published == [_paths(tmp_path).key_dir]
 
 
-def test_a_partial_tp1_pod_publishes_nothing(tmp_path, publish_dir,
+def test_a_partial_tp1_pod_publishes_its_own_key(tmp_path, publish_dir,
+                                                 monkeypatch):
+    published, done = _record_publishes(monkeypatch)
+    for slot in (1, 2):
+        se._start_publish(_paths(tmp_path, slot=slot, count=3), None, 1)
+    time.sleep(0.1)
+    assert published == []
+    se._start_publish(_paths(tmp_path, slot=0, count=3), None, 1)
+    assert done.wait(5)
+    assert published == [_paths(tmp_path).key_dir]
+
+
+def test_a_partial_tp2_pod_publishes_nothing(tmp_path, publish_dir,
                                              monkeypatch):
     published, _ = _record_publishes(monkeypatch)
     for slot in range(3):
-        se._start_publish(_paths(tmp_path, slot=slot, count=3), None, 1)
+        se._start_publish(_paths(tmp_path, slot=slot, count=3), None, 2)
     time.sleep(0.1)
     assert published == []
     assert not os.path.exists(se._publish_ready_marker(
