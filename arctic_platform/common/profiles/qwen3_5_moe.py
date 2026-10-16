@@ -16,7 +16,7 @@
 """Profile of the ``qwen3_5_moe`` loader.
 
 Options are ``Qwen3_5MoeOptions`` fields, or a ``ModelSpec`` field the loader accepts (``attn_implementation`` for
-``attention.backend``). The loader rejects the ``Patches`` wrappers.
+``attention.backend``, ``dtype`` for ``numerics.optimization_dtype``). The loader rejects the ``Patches`` wrappers.
 """
 
 from __future__ import annotations
@@ -44,8 +44,11 @@ def register(registry: Registry) -> None:
             "moe.comm_token_chunk",
             "attention.backend",
             "numerics.reduce_dtype",
+            "numerics.optimization_dtype",
+            "numerics.fp32_parity",
         ],
         unsupported={
+            "numerics.fp32_residual": "this loader has no fp32_residual option; only huggingface has one",
             "lm_head.vocab_chunk_size": "no equivalent option",
             "liger": "the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead",
             "compile.fullgraph": "the loader rejects `patches.compile`",
