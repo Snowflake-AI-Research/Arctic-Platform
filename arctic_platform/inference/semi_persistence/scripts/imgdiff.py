@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check a CRIU image's file-backed mappings against the local filesystem.
 
-    sudo python3 scripts/imgdiff.py /data-fast/image-cache/qwen_27b/image
+    python3 scripts/imgdiff.py /data-fast/image-cache/qwen_27b/image
 
 Use this before attempting a cross-node restore.  CRIU records every
 file-backed mapping by absolute path *and* size and re-validates the size
@@ -55,13 +55,12 @@ NT_GNU_BUILD_ID = 3
 
 
 def decode_files_img(path):
-    cmd = ["crit", "decode", "-i", path]
-    if os.geteuid() != 0:
-        cmd = ["sudo", "-n"] + cmd
-    res = subprocess.run(cmd, capture_output=True)
+    res = subprocess.run(["crit", "decode", "-i", path], capture_output=True)
     if res.returncode != 0:
-        sys.exit("crit decode failed (rc=%d):\n%s"
-                 % (res.returncode, res.stderr.decode("utf-8", "replace")))
+        sys.exit("crit decode failed (rc=%d); the image must be readable by "
+                 "this user (uid %d):\n%s"
+                 % (res.returncode, os.getuid(),
+                    res.stderr.decode("utf-8", "replace")))
     return json.loads(res.stdout.decode("utf-8", "replace"))
 
 
@@ -70,10 +69,7 @@ def ghost_ids(img_path):
     remap = os.path.join(os.path.dirname(img_path), "remap-fpath.img")
     if not os.path.exists(remap):
         return set()
-    cmd = ["crit", "decode", "-i", remap]
-    if os.geteuid() != 0:
-        cmd = ["sudo", "-n"] + cmd
-    res = subprocess.run(cmd, capture_output=True)
+    res = subprocess.run(["crit", "decode", "-i", remap], capture_output=True)
     if res.returncode != 0:
         return set()
     doc = json.loads(res.stdout.decode("utf-8", "replace"))
