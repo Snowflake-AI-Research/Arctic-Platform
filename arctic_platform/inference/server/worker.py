@@ -313,14 +313,16 @@ def _end_engine_startup_capture(directory: str | None) -> None:
 
 
 def _engine_startup_error(exc: BaseException, directory: str | None) -> RuntimeError | None:
-    """vLLM's startup error with the earliest engine process's own failure appended.
+    """vLLM's generic startup error with the earliest engine process's own failure appended.
 
     The root has to be in the message: Ray drops ``__cause__``, and dss-platform's
     classifier matches on the error's type and ``str()``, which leaves out
-    ``__notes__``. Returns None, so the original is raised as it is, for a
-    cancellation or an interrupt, when there is no record, or when reading one fails.
+    ``__notes__``. Only a plain ``RuntimeError``, the type of vLLM's generic error, is
+    replaced, so every other type keeps the type a classifier matches on. Returns
+    None, so the original is raised as it is, for any other type, when there is no
+    record, or when reading one fails.
     """
-    if directory is None or not isinstance(exc, Exception):
+    if directory is None or type(exc) is not RuntimeError:
         return None
     try:
         root_cause = earliest_startup_error(directory)
@@ -875,9 +877,12 @@ class InferenceWorker(StreamingWorkerMixin):
             except BaseException as exc:
                 self._cleanup_registered_router_replay_shm()
                 if attempt >= max_attempts or not _is_address_in_use_error(exc):
-                    if tail := _console_tail():
-                        exc.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
-                    if (startup_exc := _engine_startup_error(exc, startup_error_dir)) is not None:
+                    tail = _console_tail()
+                    startup_exc = _engine_startup_error(exc, startup_error_dir)
+                    target = startup_exc if startup_exc is not None else exc
+                    if tail:
+                        target.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
+                    if startup_exc is not None:
                         raise startup_exc from exc
                     raise
                 delay_s = retry_base_s * attempt + random.uniform(0.0, retry_base_s)

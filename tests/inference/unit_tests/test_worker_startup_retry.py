@@ -350,9 +350,11 @@ def test_initialize_failure_carries_the_engine_root_cause(monkeypatch, tmp_path)
     assert type(exc) is RuntimeError
     assert str(exc) == f"{_GENERIC_STARTUP_ERROR}\nRoot cause in MainProcess: ValueError: {root}"
     assert exc.__cause__ is original
-    assert not getattr(exc, "__notes__", None)
-    # #196's console tail stays on vLLM's error and is rendered once, through the cause.
-    assert "".join(traceback.format_exception(exc)).count("Engine console tail") == 1
+    assert not getattr(original, "__notes__", None)
+    # #196's console tail goes on the raised error, so it is rendered once, after the root.
+    rendered = "".join(traceback.format_exception(exc))
+    assert rendered.count("Engine console tail") == 1
+    assert rendered.index("Root cause in") < rendered.index("Engine console tail")
     assert not os.path.exists(seen_dirs[0])
     assert worker_mod._STARTUP_ERROR_DIR_ENV not in os.environ
 
@@ -398,8 +400,27 @@ def test_record_from_a_previous_attempt_is_ignored(monkeypatch, tmp_path):
     assert worker_mod._STARTUP_ERROR_DIR_ENV not in os.environ
 
 
-@pytest.mark.parametrize("exc", [asyncio.CancelledError(), KeyboardInterrupt()])
-def test_engine_startup_error_never_converts_a_base_exception(tmp_path, exc):
+class _OutOfMemoryError(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize(
+    "original", [ValueError("max_model_len is too large"), _OutOfMemoryError("CUDA out of memory")]
+)
+def test_initialize_failure_of_another_type_keeps_its_type(monkeypatch, tmp_path, original):
+    exc, _ = _initialize_with_engine_attempts(
+        monkeypatch, tmp_path, [_engine_fails("EngineCore failed to start.", "CUDA out of memory.", original)]
+    )
+
+    assert exc is original
+    assert "Root cause in" not in str(exc)
+    assert any(note.startswith("Engine console tail") for note in exc.__notes__)
+
+
+@pytest.mark.parametrize(
+    "exc", [asyncio.CancelledError(), KeyboardInterrupt(), ValueError("x"), _OutOfMemoryError("x")]
+)
+def test_engine_startup_error_converts_only_a_plain_runtime_error(tmp_path, exc):
     (tmp_path / "1.json").write_text('{"process": "EngineCore", "type": "RuntimeError", "message": "x", "time": 1.0}')
 
     assert worker_mod._engine_startup_error(exc, str(tmp_path)) is None
