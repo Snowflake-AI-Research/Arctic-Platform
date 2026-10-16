@@ -20,11 +20,11 @@ from types import SimpleNamespace
 
 import pytest
 
-import arctic_platform.model.parallel.parallel_groups as parallel_groups
-from arctic_platform.model.parallel.parallel_groups import SPGroups
-from arctic_platform.model.parallel.parallel_groups import setup_parallel_groups
-from arctic_platform.model.parallel.parallel_topology import orthogonal_edp_groups
-from arctic_platform.model.parallel.parallel_topology import resolve_ep_group_topology
+import arctic_platform.model.parallel.groups as parallel_groups
+from arctic_platform.model.parallel.groups import SPGroups
+from arctic_platform.model.parallel.groups import setup_parallel_groups
+from arctic_platform.model.parallel.topology import orthogonal_edp_groups
+from arctic_platform.model.parallel.topology import resolve_ep_group_topology
 
 
 def test_spgroups_unpacks_positionally():
@@ -36,7 +36,7 @@ def test_spgroups_unpacks_positionally():
 def test_setup_parallel_groups_sp1_registers_replicated_experts(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        "arctic_platform.model.parallel.parallel_groups.setup_replicated_expert_groups",
+        "arctic_platform.model.parallel.groups.setup_replicated_expert_groups",
         lambda ep_size: calls.append(ep_size),
     )
     assert setup_parallel_groups(1, 4) == SPGroups(None, None, 1, 0)
