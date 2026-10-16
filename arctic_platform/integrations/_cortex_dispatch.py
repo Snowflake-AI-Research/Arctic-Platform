@@ -58,8 +58,7 @@ def _to_unified_config(legacy: _LegacyConfig):
         "training_gpus": legacy.training_gpus,
         "sampling_gpus": legacy.sampling_gpus,
         "log_prob_gpus": legacy.log_prob_gpus,
-        "job_ready_timeout": legacy.job_ready_timeout,
-        "backend": CortexConfig(),
+        "backend": CortexConfig(job_ready_timeout=legacy.job_ready_timeout),
         "training": TrainingConfig(
             ds_config=ds_config or None,
             ds_worker_config=legacy.ds_worker_config or None,

@@ -6,8 +6,10 @@ import logging
 import os
 import random
 import re
+import stat
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from enum import Enum
 from typing import Any
 from uuid import uuid4
@@ -15,8 +17,10 @@ from uuid import uuid4
 import ray
 
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
+from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
 from arctic_platform.inference.server.streaming import StreamingWorkerMixin, stream_lifecycle_change
+from arctic_platform.inference.server.token_prompts import check_token_tensor, is_token_tensor
 from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     RESULT_KEY as _DENSE_PROMPT_LOGPROBS_KEY,
     stage_sampling_params as _stage_dense_prompt_logprobs,
@@ -97,6 +101,124 @@ def _coerce_structured_outputs_config(engine_kwargs: dict[str, Any]) -> None:
         engine_kwargs["structured_outputs_config"] = StructuredOutputsConfig(**dict(raw_config))
 
 
+def _add_chat_reasoner(
+    vllm_config: Any, chat_reasoning_parser: str | None, *, explicit: bool
+) -> bool:
+    """Give the engine a structured-output reasoner for chat, if it has none.
+
+    Chat grammars (tool_choice, JSON answers) must wait for the end of
+    reasoning, which vLLM does only with an engine-wide reasoner. Returns True
+    when it was added here; other requests then pass ``reasoning_ended=True``,
+    which vLLM treats exactly like having no reasoner. An engine that already
+    has one keeps it; an ``explicit`` chat_reasoning_parser must then match it.
+    """
+    if not chat_reasoning_parser:
+        return False
+    config = vllm_config.structured_outputs_config
+    if config.reasoning_parser:
+        # One reasoner per engine, from the reasoning_parser kwarg,
+        # structured_outputs_config or the model's own default (gpt-oss).
+        if explicit and config.reasoning_parser != chat_reasoning_parser:
+            raise ValueError(
+                f"chat_reasoning_parser={chat_reasoning_parser!r} differs from "
+                f"reasoning_parser={config.reasoning_parser!r}"
+            )
+        return False
+    config.reasoning_parser = chat_reasoning_parser
+    return True
+
+
+def _tokenizer_runs_reasoner(vllm_config: Any, reasoning_parser: str) -> bool:
+    """Whether ``reasoning_parser`` can run on the model's tokenizer.
+
+    vLLM checks the job's reasoning_parser in create_engine_config, but builds
+    a structured-output reasoner added afterwards only on the first request
+    with a grammar, so check that one here. A parser that is unknown or fails
+    to build is unsupported whatever its error says. Most vLLM parsers raise
+    when the think tokens are missing; some build anyway with
+    ``start_token_id`` or ``end_token_id`` left None.
+    """
+    from vllm.reasoning import ReasoningParserManager
+    from vllm.tokenizers import cached_tokenizer_from_config
+
+    tokenizer = cached_tokenizer_from_config(model_config=vllm_config.model_config)
+    if tokenizer is None:
+        # skip_tokenizer_init: no tokenizer to check, and no chat to render.
+        return True
+    try:
+        parser_cls = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
+        parser = parser_cls(tokenizer=tokenizer)
+    except Exception as exc:
+        logger.warning(
+            "reasoning_parser=%r cannot run on this tokenizer (%s: %s)",
+            reasoning_parser,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+    missing = [
+        name
+        for name in ("start_token_id", "end_token_id")
+        if hasattr(parser, name) and getattr(parser, name) is None
+    ]
+    if missing:
+        logger.warning(
+            "reasoning_parser=%r finds no think tokens in this tokenizer (%s is None)",
+            reasoning_parser,
+            ", ".join(missing),
+        )
+        return False
+    return True
+
+
+def _resolve_chat_mode(
+    vllm_config: Any, chat_reasoning_parser: str | None, tool_call_parser: str | None
+) -> tuple[ChatModel | None, bool]:
+    """Chat parsers for this engine, and whether chat's reasoner was added to it.
+
+    May add chat's structured-output reasoner to ``vllm_config`` (see
+    ``_add_chat_reasoner``). The chat model is None when chat is unsupported.
+    """
+    chat_model = resolve_chat_model(
+        vllm_config.model_config.architecture,
+        reasoning_parser=chat_reasoning_parser,
+        tool_call_parser=tool_call_parser,
+    )
+    if (
+        chat_model is not None
+        and chat_model.reasoning_parser
+        and not vllm_config.structured_outputs_config.reasoning_parser
+        and not _tokenizer_runs_reasoner(vllm_config, chat_model.reasoning_parser)
+    ):
+        if chat_reasoning_parser is not None:
+            raise ValueError(
+                f"chat_reasoning_parser={chat_reasoning_parser!r} cannot run on "
+                "this model's tokenizer (an unknown parser, or the tokenizer lacks its "
+                "think tokens)"
+            )
+        logger.warning(
+            "Chat runs without reasoning_parser=%r",
+            chat_model.reasoning_parser,
+        )
+        chat_model = replace(chat_model, reasoning_parser=None)
+    chat_only_reasoner = _add_chat_reasoner(
+        vllm_config,
+        chat_model.reasoning_parser if chat_model is not None else None,
+        explicit=chat_reasoning_parser is not None,
+    )
+    if chat_model is not None:
+        # Chat parses with the reasoner the engine gates grammars on,
+        # wherever it came from (the table, chat_reasoning_parser,
+        # reasoning_parser, structured_outputs_config or the model's
+        # default).
+        chat_model = replace(
+            chat_model,
+            reasoning_parser=vllm_config.structured_outputs_config.reasoning_parser
+            or None,
+        )
+    return chat_model, chat_only_reasoner
+
+
 def _optional_bool(value: Any, *, name: str) -> bool | None:
     if value is None:
         return None
@@ -147,6 +269,25 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
         logger.warning("%s=%r is below %.3f; using %.3f", name, raw, minimum, minimum)
         return minimum
     return value
+
+
+def _console_tail(max_bytes: int = 4096) -> str:
+    """Tail this process's stdout/stderr when they are files (a Ray worker's logs).
+
+    vLLM engine-core and TP worker subprocesses inherit them and print the startup root
+    cause there; vLLM's own exception only says "See root cause above".
+    """
+    tails = []
+    for fd in (1, 2):
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                continue
+            with open(f"/proc/self/fd/{fd}", "rb") as f:
+                f.seek(max(0, os.fstat(f.fileno()).st_size - max_bytes))
+                tails.append(f.read().decode(errors="replace"))
+        except OSError:
+            continue
+    return "\n".join(tails)
 
 
 def _is_address_in_use_error(exc: BaseException) -> bool:
@@ -535,6 +676,9 @@ class InferenceWorker(StreamingWorkerMixin):
         self.llm = None
         self.state = WorkerLifecycleState.UNINITIALIZED
         self._reasoning_parser: Any = None
+        self._chat_only_reasoner = False
+        # Chat parsers for this engine's model; None when chat is unsupported.
+        self._chat_model: ChatModel | None = None
         self._router_replay_tx: Any = None
         self._router_replay_group: Any = None
         self._replica_label: str | None = None
@@ -578,7 +722,8 @@ class InferenceWorker(StreamingWorkerMixin):
         final_output = None
         generate_kwargs: dict[str, Any] = {
             "request_id": request_id,
-            "reasoning_ended": reasoning_ended,
+            # A grammar applies from the first token, as on an engine without chat's reasoner.
+            "reasoning_ended": True if self._chat_only_reasoner else reasoning_ended,
         }
         if lora_request is not None:
             generate_kwargs["lora_request"] = lora_request
@@ -613,6 +758,11 @@ class InferenceWorker(StreamingWorkerMixin):
         # `reasoning_parser` is used by vLLM structured outputs to avoid
         # constraining reasoning tokens.
         reasoning_parser_name = engine_kwargs.get("reasoning_parser")
+        # Chat-mode overrides of CHAT_MODELS (see ModelConfig), not engine args.
+        # chat_reasoning_parser leaves /generate (think prefill, reasoning
+        # split, action masks) on the job's own parser.
+        tool_call_parser = engine_kwargs.pop("tool_call_parser", None)
+        chat_reasoning_parser = engine_kwargs.pop("chat_reasoning_parser", None)
         self._return_reasoning_content = bool(engine_kwargs.pop("return_reasoning_content", False))
         lora_adapter_path = engine_kwargs.pop("lora_adapter_path", None)
 
@@ -670,6 +820,9 @@ class InferenceWorker(StreamingWorkerMixin):
                         enable_arctic_patches=arctic_enabled,
                     )
                     vllm_config = engine_args.create_engine_config()
+                self._chat_model, self._chat_only_reasoner = _resolve_chat_mode(
+                    vllm_config, chat_reasoning_parser, tool_call_parser
+                )
                 self._structured_outputs_enabled_in_reasoning = bool(
                     vllm_config.structured_outputs_config.enable_in_reasoning
                 )
@@ -682,6 +835,8 @@ class InferenceWorker(StreamingWorkerMixin):
             except BaseException as exc:
                 self._cleanup_registered_router_replay_shm()
                 if attempt >= max_attempts or not _is_address_in_use_error(exc):
+                    if tail := _console_tail():
+                        exc.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
                     raise
                 delay_s = retry_base_s * attempt + random.uniform(0.0, retry_base_s)
                 logger.warning(
@@ -742,12 +897,22 @@ class InferenceWorker(StreamingWorkerMixin):
         self._reasoning_parser = parser_cls(self.llm.get_tokenizer())
         logger.info("Worker %d reasoning parser enabled: %s", os.getpid(), reasoning_parser_name)
 
-    def _is_reasoning_open(self, prompt_ids: Sequence[int]) -> bool:
+    def _is_reasoning_open(self, prompt_ids: Any) -> bool:
+        """Whether the last think-start token comes after the last think-end token."""
         parser = self._reasoning_parser
         start_token_id = getattr(parser, "start_token_id", None)
         end_token_id = getattr(parser, "end_token_id", None)
         if start_token_id is None or end_token_id is None:
             return False
+        if is_token_tensor(prompt_ids):
+            import numpy as np
+
+            ids = prompt_ids.numpy()
+            starts = np.flatnonzero(ids == start_token_id)
+            if start_token_id == end_token_id:
+                return starts.size > 0
+            ends = np.flatnonzero(ids == end_token_id)
+            return (starts[-1] if starts.size else -1) > (ends[-1] if ends.size else -1)
         last_start = -1
         last_end = -1
         for index, token_id in enumerate(prompt_ids):
@@ -759,10 +924,12 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def _prefill_think_for_generation(
         self,
-        prompt: str | list[int],
+        prompt: Any,
         *,
         enable_thinking: bool | None,
     ) -> tuple[str | list[int], list[int], bool | None]:
+        if is_token_tensor(prompt):
+            return self._prefill_think_for_token_tensor(prompt, enable_thinking=enable_thinking)
         if isinstance(prompt, list):
             prompt_ids = [int(token_id) for token_id in prompt]
         else:
@@ -790,6 +957,25 @@ class InferenceWorker(StreamingWorkerMixin):
         if start_token not in prompt_text.rsplit("</think>", 1)[-1]:
             prompt_text = f"{prompt_text}{start_token}"
         return prompt_text, [], False
+
+    def _prefill_think_for_token_tensor(
+        self,
+        prompt: Any,
+        *,
+        enable_thinking: bool | None,
+    ) -> tuple[list[int], list[int], bool | None]:
+        """The token-list contract, for a tensor: ``tolist()`` builds the one list vLLM gets."""
+        prompt_ids = prompt.tolist()
+        if enable_thinking is None:
+            return prompt_ids, prompt_ids, self._reasoning_ended_for_prompt(prompt_ids)
+        if not enable_thinking:
+            return prompt_ids, prompt_ids, True
+        start_token_id = getattr(self._reasoning_parser, "start_token_id", None)
+        if start_token_id is None:
+            return prompt_ids, prompt_ids, None
+        if not self._is_reasoning_open(prompt):
+            prompt_ids.append(int(start_token_id))
+        return prompt_ids, prompt_ids, False
 
     def _reasoning_ended_for_prompt(self, prompt_ids: list[int]) -> bool | None:
         parser = self._reasoning_parser
@@ -899,11 +1085,19 @@ class InferenceWorker(StreamingWorkerMixin):
             grammar_stop_token_ids=grammar_stop_token_ids,
         )
 
-    async def generate(self, prompt: str | list[int], sampling_params: dict[str, Any]) -> dict[str, Any]:
+    async def generate(self, prompt: Any, sampling_params: dict[str, Any]) -> dict[str, Any]:
+        """Generate for one prompt: text, ``list[int]``, or a 1-D integer CPU tensor of token ids."""
         if self.state != WorkerLifecycleState.READY:
             raise RuntimeError(f"Worker not ready: state={self.state.value}")
         if getattr(self, "_stream_cleanup_failed", False):
             raise RuntimeError("Worker streaming cleanup unconfirmed")
+        # Anything else would be stringified and generated from as text.
+        if is_token_tensor(prompt):
+            check_token_tensor(prompt)
+        elif not isinstance(prompt, (str, list)):
+            raise TypeError(
+                f"Expected a text prompt, a token-id list or a 1-D token-id tensor, got {type(prompt).__name__}"
+            )
 
         from vllm import SamplingParams
 

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import types
 
 import pytest
 import torch
@@ -121,6 +122,30 @@ def test_glm53_custom_model_replaces_only_sparse_moe():
     assert layers[3].mlp.experts.use_grouped_mm is False
     assert layers[3].mlp.experts.swiglu_limit == 10.0
     assert model._is_vlm is True
+
+
+def test_glm53_decoder_forwards_its_physical_layer_routes():
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    class SparseAttention(torch.nn.Module):
+        def forward(self, hidden_states, **_kwargs):
+            return torch.zeros_like(hidden_states), None, None
+
+    def record_routes(self, hidden_states, routed_experts=None):
+        self.routed_experts = routed_experts
+        return torch.zeros_like(hidden_states)
+
+    config = _tiny_config()
+    config.use_grouped_mm = False
+    model = Glm5NextForConditionalGenerationPrimeRL(config)
+    layer = model.model.language_model.layers[3]
+    layer.self_attn = SparseAttention()
+    layer.mlp.forward = types.MethodType(record_routes, layer.mlp)
+    routes = torch.arange(16).reshape(1, 2, 4, 2)
+
+    layer(torch.randn(1, 2, 2, 16), routed_experts=routes)
+
+    torch.testing.assert_close(layer.mlp.routed_experts, routes[:, :, 3, :])
 
 
 def test_glm53_tiled_shared_expert_bypasses_wrapped_forward():
@@ -285,6 +310,61 @@ def test_glm53_vllm_packer_fuses_sparse_mla_and_moe():
         4,
     )
     assert f"{prefix}.mlp.gate.e_score_correction_bias" in state
+
+
+def test_glm53_vllm_packer_fuses_fp8_moe_scale_inv():
+    """Native FP8 expert scales must pack to vLLM w13/w2_weight_scale_inv keys."""
+    prefix = "model.language_model.layers.3"
+    attn = f"{prefix}.self_attn"
+    w1_scale = torch.rand(2, 1, 1)
+    w3_scale = torch.rand(2, 1, 1)
+    w2_scale = torch.rand(2, 1, 1)
+    sw1_scale = torch.rand(1, 1)
+    sw3_scale = torch.rand(1, 1)
+    sw2_scale = torch.rand(1, 1)
+    state = {
+        f"{attn}.q_a_proj.weight": torch.randn(3, 4),
+        f"{attn}.kv_a_proj_with_mqa.weight": torch.randn(2, 4),
+        f"{attn}.indexer.wk.weight": torch.randn(5, 4),
+        f"{attn}.indexer.weights_proj.weight": torch.randn(2, 4),
+        f"{prefix}.mlp.router.gate.weight": torch.randn(2, 4),
+        f"{prefix}.mlp.expert_bias": torch.randn(2),
+        f"{prefix}.mlp.experts.w1": torch.randn(2, 3, 4),
+        f"{prefix}.mlp.experts.w2": torch.randn(2, 4, 3),
+        f"{prefix}.mlp.experts.w3": torch.randn(2, 3, 4),
+        f"{prefix}.mlp.experts.w1_scale_inv": w1_scale.clone(),
+        f"{prefix}.mlp.experts.w2_scale_inv": w2_scale.clone(),
+        f"{prefix}.mlp.experts.w3_scale_inv": w3_scale.clone(),
+        f"{prefix}.mlp.shared_expert.w1": torch.randn(3, 4),
+        f"{prefix}.mlp.shared_expert.w2": torch.randn(4, 3),
+        f"{prefix}.mlp.shared_expert.w3": torch.randn(3, 4),
+        f"{prefix}.mlp.shared_expert.w1_scale_inv": sw1_scale.clone(),
+        f"{prefix}.mlp.shared_expert.w2_scale_inv": sw2_scale.clone(),
+        f"{prefix}.mlp.shared_expert.w3_scale_inv": sw3_scale.clone(),
+    }
+
+    convert_glm5_next_layer_to_vllm(state, 3)
+
+    assert f"{prefix}.mlp.experts.w1_scale_inv" not in state
+    assert f"{prefix}.mlp.experts.w2_scale_inv" not in state
+    assert f"{prefix}.mlp.experts.w3_scale_inv" not in state
+    assert not any(key.startswith(f"{prefix}.mlp.shared_expert.") for key in state)
+    torch.testing.assert_close(
+        state[f"{prefix}.mlp.experts.w13_weight_scale_inv"],
+        torch.cat([w1_scale, w3_scale], dim=1),
+    )
+    torch.testing.assert_close(
+        state[f"{prefix}.mlp.experts.w2_weight_scale_inv"],
+        w2_scale,
+    )
+    torch.testing.assert_close(
+        state[f"{prefix}.mlp.shared_experts.gate_up_proj.weight_scale_inv"],
+        torch.cat([sw1_scale, sw3_scale], dim=0),
+    )
+    torch.testing.assert_close(
+        state[f"{prefix}.mlp.shared_experts.down_proj.weight_scale_inv"],
+        sw2_scale,
+    )
 
 
 def test_glm53_native_fp8_training_builds_quantized_modules():
