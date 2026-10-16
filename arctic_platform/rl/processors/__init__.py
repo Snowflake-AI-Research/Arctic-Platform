@@ -130,6 +130,10 @@ from .stats_tracker import scope
 from .stats_tracker import stat
 from .verl_grpo import verl_grpo_loss
 
+# Importing registers "trl_grpo". Release tags through v0.1.5rc14 do not
+# ship this loss; the TRL Cortex client names it in processing.loss_fn.
+from arctic_platform.integrations.trl.loss import trl_grpo
+
 __all__ = [
     # pipeline
     "POST_PROCESSORS",
@@ -211,6 +215,7 @@ __all__ = [
     "cortex_grpo_loss",
     "cortex_grpo_mixed_v1_loss",
     "cortex_grpo_echo_v1_loss",
+    "trl_grpo",
     "sft_loss",
     "sft_ce_loss",
     "LOGIT_LOSS_FNS",
