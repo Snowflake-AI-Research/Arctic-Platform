@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import re
+import stat
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -19,6 +20,7 @@ from arctic_platform.inference.envs import arctic_inference_effective_enabled
 from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
 from arctic_platform.inference.server.streaming import StreamingWorkerMixin, stream_lifecycle_change
+from arctic_platform.inference.server.token_prompts import check_token_tensor, is_token_tensor
 from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     RESULT_KEY as _DENSE_PROMPT_LOGPROBS_KEY,
     stage_sampling_params as _stage_dense_prompt_logprobs,
@@ -267,6 +269,25 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
         logger.warning("%s=%r is below %.3f; using %.3f", name, raw, minimum, minimum)
         return minimum
     return value
+
+
+def _console_tail(max_bytes: int = 4096) -> str:
+    """Tail this process's stdout/stderr when they are files (a Ray worker's logs).
+
+    vLLM engine-core and TP worker subprocesses inherit them and print the startup root
+    cause there; vLLM's own exception only says "See root cause above".
+    """
+    tails = []
+    for fd in (1, 2):
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                continue
+            with open(f"/proc/self/fd/{fd}", "rb") as f:
+                f.seek(max(0, os.fstat(f.fileno()).st_size - max_bytes))
+                tails.append(f.read().decode(errors="replace"))
+        except OSError:
+            continue
+    return "\n".join(tails)
 
 
 def _is_address_in_use_error(exc: BaseException) -> bool:
@@ -814,6 +835,8 @@ class InferenceWorker(StreamingWorkerMixin):
             except BaseException as exc:
                 self._cleanup_registered_router_replay_shm()
                 if attempt >= max_attempts or not _is_address_in_use_error(exc):
+                    if tail := _console_tail():
+                        exc.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
                     raise
                 delay_s = retry_base_s * attempt + random.uniform(0.0, retry_base_s)
                 logger.warning(
@@ -874,12 +897,22 @@ class InferenceWorker(StreamingWorkerMixin):
         self._reasoning_parser = parser_cls(self.llm.get_tokenizer())
         logger.info("Worker %d reasoning parser enabled: %s", os.getpid(), reasoning_parser_name)
 
-    def _is_reasoning_open(self, prompt_ids: Sequence[int]) -> bool:
+    def _is_reasoning_open(self, prompt_ids: Any) -> bool:
+        """Whether the last think-start token comes after the last think-end token."""
         parser = self._reasoning_parser
         start_token_id = getattr(parser, "start_token_id", None)
         end_token_id = getattr(parser, "end_token_id", None)
         if start_token_id is None or end_token_id is None:
             return False
+        if is_token_tensor(prompt_ids):
+            import numpy as np
+
+            ids = prompt_ids.numpy()
+            starts = np.flatnonzero(ids == start_token_id)
+            if start_token_id == end_token_id:
+                return starts.size > 0
+            ends = np.flatnonzero(ids == end_token_id)
+            return (starts[-1] if starts.size else -1) > (ends[-1] if ends.size else -1)
         last_start = -1
         last_end = -1
         for index, token_id in enumerate(prompt_ids):
@@ -891,10 +924,12 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def _prefill_think_for_generation(
         self,
-        prompt: str | list[int],
+        prompt: Any,
         *,
         enable_thinking: bool | None,
     ) -> tuple[str | list[int], list[int], bool | None]:
+        if is_token_tensor(prompt):
+            return self._prefill_think_for_token_tensor(prompt, enable_thinking=enable_thinking)
         if isinstance(prompt, list):
             prompt_ids = [int(token_id) for token_id in prompt]
         else:
@@ -922,6 +957,25 @@ class InferenceWorker(StreamingWorkerMixin):
         if start_token not in prompt_text.rsplit("</think>", 1)[-1]:
             prompt_text = f"{prompt_text}{start_token}"
         return prompt_text, [], False
+
+    def _prefill_think_for_token_tensor(
+        self,
+        prompt: Any,
+        *,
+        enable_thinking: bool | None,
+    ) -> tuple[list[int], list[int], bool | None]:
+        """The token-list contract, for a tensor: ``tolist()`` builds the one list vLLM gets."""
+        prompt_ids = prompt.tolist()
+        if enable_thinking is None:
+            return prompt_ids, prompt_ids, self._reasoning_ended_for_prompt(prompt_ids)
+        if not enable_thinking:
+            return prompt_ids, prompt_ids, True
+        start_token_id = getattr(self._reasoning_parser, "start_token_id", None)
+        if start_token_id is None:
+            return prompt_ids, prompt_ids, None
+        if not self._is_reasoning_open(prompt):
+            prompt_ids.append(int(start_token_id))
+        return prompt_ids, prompt_ids, False
 
     def _reasoning_ended_for_prompt(self, prompt_ids: list[int]) -> bool | None:
         parser = self._reasoning_parser
@@ -1031,11 +1085,19 @@ class InferenceWorker(StreamingWorkerMixin):
             grammar_stop_token_ids=grammar_stop_token_ids,
         )
 
-    async def generate(self, prompt: str | list[int], sampling_params: dict[str, Any]) -> dict[str, Any]:
+    async def generate(self, prompt: Any, sampling_params: dict[str, Any]) -> dict[str, Any]:
+        """Generate for one prompt: text, ``list[int]``, or a 1-D integer CPU tensor of token ids."""
         if self.state != WorkerLifecycleState.READY:
             raise RuntimeError(f"Worker not ready: state={self.state.value}")
         if getattr(self, "_stream_cleanup_failed", False):
             raise RuntimeError("Worker streaming cleanup unconfirmed")
+        # Anything else would be stringified and generated from as text.
+        if is_token_tensor(prompt):
+            check_token_tensor(prompt)
+        elif not isinstance(prompt, (str, list)):
+            raise TypeError(
+                f"Expected a text prompt, a token-id list or a 1-D token-id tensor, got {type(prompt).__name__}"
+            )
 
         from vllm import SamplingParams
 

@@ -312,6 +312,61 @@ def test_glm53_vllm_packer_fuses_sparse_mla_and_moe():
     assert f"{prefix}.mlp.gate.e_score_correction_bias" in state
 
 
+def test_glm53_vllm_packer_fuses_fp8_moe_scale_inv():
+    """Native FP8 expert scales must pack to vLLM w13/w2_weight_scale_inv keys."""
+    prefix = "model.language_model.layers.3"
+    attn = f"{prefix}.self_attn"
+    w1_scale = torch.rand(2, 1, 1)
+    w3_scale = torch.rand(2, 1, 1)
+    w2_scale = torch.rand(2, 1, 1)
+    sw1_scale = torch.rand(1, 1)
+    sw3_scale = torch.rand(1, 1)
+    sw2_scale = torch.rand(1, 1)
+    state = {
+        f"{attn}.q_a_proj.weight": torch.randn(3, 4),
+        f"{attn}.kv_a_proj_with_mqa.weight": torch.randn(2, 4),
+        f"{attn}.indexer.wk.weight": torch.randn(5, 4),
+        f"{attn}.indexer.weights_proj.weight": torch.randn(2, 4),
+        f"{prefix}.mlp.router.gate.weight": torch.randn(2, 4),
+        f"{prefix}.mlp.expert_bias": torch.randn(2),
+        f"{prefix}.mlp.experts.w1": torch.randn(2, 3, 4),
+        f"{prefix}.mlp.experts.w2": torch.randn(2, 4, 3),
+        f"{prefix}.mlp.experts.w3": torch.randn(2, 3, 4),
+        f"{prefix}.mlp.experts.w1_scale_inv": w1_scale.clone(),
+        f"{prefix}.mlp.experts.w2_scale_inv": w2_scale.clone(),
+        f"{prefix}.mlp.experts.w3_scale_inv": w3_scale.clone(),
+        f"{prefix}.mlp.shared_expert.w1": torch.randn(3, 4),
+        f"{prefix}.mlp.shared_expert.w2": torch.randn(4, 3),
+        f"{prefix}.mlp.shared_expert.w3": torch.randn(3, 4),
+        f"{prefix}.mlp.shared_expert.w1_scale_inv": sw1_scale.clone(),
+        f"{prefix}.mlp.shared_expert.w2_scale_inv": sw2_scale.clone(),
+        f"{prefix}.mlp.shared_expert.w3_scale_inv": sw3_scale.clone(),
+    }
+
+    convert_glm5_next_layer_to_vllm(state, 3)
+
+    assert f"{prefix}.mlp.experts.w1_scale_inv" not in state
+    assert f"{prefix}.mlp.experts.w2_scale_inv" not in state
+    assert f"{prefix}.mlp.experts.w3_scale_inv" not in state
+    assert not any(key.startswith(f"{prefix}.mlp.shared_expert.") for key in state)
+    torch.testing.assert_close(
+        state[f"{prefix}.mlp.experts.w13_weight_scale_inv"],
+        torch.cat([w1_scale, w3_scale], dim=1),
+    )
+    torch.testing.assert_close(
+        state[f"{prefix}.mlp.experts.w2_weight_scale_inv"],
+        w2_scale,
+    )
+    torch.testing.assert_close(
+        state[f"{prefix}.mlp.shared_experts.gate_up_proj.weight_scale_inv"],
+        torch.cat([sw1_scale, sw3_scale], dim=0),
+    )
+    torch.testing.assert_close(
+        state[f"{prefix}.mlp.shared_experts.down_proj.weight_scale_inv"],
+        sw2_scale,
+    )
+
+
 def test_glm53_native_fp8_training_builds_quantized_modules():
     from arctic_platform.model.implementations.fp8 import BlockFp8Linear
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
