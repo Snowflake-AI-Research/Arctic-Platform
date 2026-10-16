@@ -25,6 +25,7 @@ import torch
 from arctic_platform.common.callbacks import Reduce
 from arctic_platform.common.callbacks import merge_metrics
 from arctic_platform.model.implementations.debug.config import router_stats_strides
+from arctic_platform.model.implementations.moe.layers.moe import ROUTER_REPLAY_FRESH
 from arctic_platform.model.implementations.moe.layers.moe import TokenChoiceTopKRouter
 from arctic_platform.model.loaders.glm_moe_dsa import GlmMoeDsaDebugOptions
 from arctic_platform.model.loaders.qwen3_5_moe import DebugModelOptions
@@ -144,6 +145,31 @@ def test_replaying_the_routers_own_near_tied_choices_agrees_fully(score_func, bi
 
     stats = _reported(hooked)
     assert stats["replay_agreement_sum"] == stats["replayed_tokens"] == len(x)
+
+
+def test_fresh_replay_rows_do_not_inflate_replay_agreement():
+    """ROUTER_REPLAY_FRESH rows become the router's own top-k in output[1]; agreement must ignore them."""
+    model, hooked, trainer = _hooked(stride=1)
+    model.router.enable_fresh_replay_routing()
+    x = torch.randn(4, DIM, generator=torch.Generator().manual_seed(7))
+    # Rows 0-1: deliberate wrong replay (should disagree). Rows 2-3: FRESH (would agree by construction).
+    wrong = torch.tensor([[0, 1], [1, 2], [ROUTER_REPLAY_FRESH, ROUTER_REPLAY_FRESH], [ROUTER_REPLAY_FRESH, ROUTER_REPLAY_FRESH]])
+    model.router(x, None, routed_experts=wrong)
+
+    stats = _reported(hooked)
+    assert stats["sampled_tokens"] == pytest.approx(4.0)
+    assert stats["replayed_tokens"] == pytest.approx(2.0), "only the non-FRESH rows count as replayed"
+    own = torch.topk(torch.softmax(model.router.gate(x[:2]), -1), TOP_K).indices
+    agreement = sum(len(set(o.tolist()) & set(r.tolist())) / TOP_K for o, r in zip(own, wrong[:2]))
+    assert stats["replay_agreement_sum"] == pytest.approx(agreement)
+    assert stats["replay_agreement_sum"] < stats["replayed_tokens"], "wrong replay must not look perfect"
+
+
+def test_enabled_stride_with_no_token_choice_router_raises():
+    trainer = SimpleNamespace(model=torch.nn.Linear(DIM, DIM))
+    callback = RouterStatsCallback(_training_config(stride=1))
+    with pytest.raises(ValueError, match="no TokenChoiceTopKRouter"):
+        callback.post_init(trainer)
 
 
 def test_an_activation_checkpoint_rerun_of_the_router_is_not_counted_again():
