@@ -298,3 +298,25 @@ def test_loader_debug_options_accept_router_stats_strides():
         DebugModelOptions(router_stats_sample_stride=True)
     with pytest.raises(Exception):
         GlmMoeDsaDebugOptions(router_stats_call_stride=0)
+
+
+def test_provider_debug_model_config_excludes_router_stats_strides():
+    """Training-only strides must not be splat into provider DebugModelConfig dataclasses."""
+    from dataclasses import fields
+
+    from arctic_platform.model.implementations.debug.config import ROUTER_STATS_STRIDE_FIELDS
+    from arctic_platform.model.implementations.glm52.config import DebugModelConfig as GlmDebug
+    from arctic_platform.model.implementations.qwen35.config import DebugModelConfig as QwenDebug
+
+    qwen = DebugModelOptions(num_layers=2, router_stats_sample_stride=4, router_stats_call_stride=2)
+    glm = GlmMoeDsaDebugOptions(num_layers=3, router_stats_sample_stride=8, router_stats_call_stride=2)
+
+    assert set(qwen.model_dump()) - ROUTER_STATS_STRIDE_FIELDS == {f.name for f in fields(QwenDebug)}
+    assert set(glm.model_dump()) - ROUTER_STATS_STRIDE_FIELDS == {f.name for f in fields(GlmDebug)}
+
+    QwenDebug(**qwen.model_dump(exclude=ROUTER_STATS_STRIDE_FIELDS))
+    GlmDebug(**glm.model_dump(exclude=ROUTER_STATS_STRIDE_FIELDS))
+    with pytest.raises(TypeError, match="router_stats_sample_stride"):
+        QwenDebug(**qwen.model_dump())
+    with pytest.raises(TypeError, match="router_stats_sample_stride"):
+        GlmDebug(**glm.model_dump())
