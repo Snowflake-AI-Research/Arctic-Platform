@@ -59,7 +59,7 @@ def build_moe_model(
 ):
     """Build an expert-parallel MoE from training options and the registered expert group."""
     from arctic_platform.model import build_model
-    from arctic_platform.model.parallel.expert_parallel import expert_parallel_group
+    from arctic_platform.model.parallel.groups import expert_parallel_group
 
     spec = moe_model_spec(
         model_name=model_name,

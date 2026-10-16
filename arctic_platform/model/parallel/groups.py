@@ -31,10 +31,35 @@ import deepspeed.utils.groups as ds_groups
 import torch.distributed as dist
 
 from arctic_platform.model.parallel import topology
-from arctic_platform.model.parallel.expert_parallel import ep_group_name
-from arctic_platform.model.parallel.expert_parallel import setup_replicated_expert_groups
 
 logger = logging.getLogger(__name__)
+
+
+def ep_group_name(ep_size: int) -> str:
+    """DeepSpeed expert-group registry key for an expert-parallel degree."""
+    return f"ep_size_{ep_size}"
+
+
+def setup_replicated_expert_groups(ep_size: int) -> None:
+    """Register expert and expert-data-parallel groups when sequence parallelism is 1.
+
+    ``ep_size == 1`` creates nothing. Sequence-parallel topologies are not created here.
+    """
+    if ep_size > 1:
+        _create_expert_and_data_parallel(ep_size)
+
+
+def expert_parallel_group(ep_size: int):
+    """Return the DeepSpeed expert group registered for this degree."""
+    return _expert_parallel_group(ep_group_name(ep_size))
+
+
+def _create_expert_and_data_parallel(ep_size: int) -> None:
+    ds_groups._create_expert_and_data_parallel(ep_size)
+
+
+def _expert_parallel_group(group_name: str):
+    return ds_groups._get_expert_parallel_group(group_name)
 
 
 class SPGroups(NamedTuple):

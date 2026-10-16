@@ -12,11 +12,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sequence-parallel degree checks that do not depend on a training service."""
+"""Expert- and sequence-parallel degree checks that do not depend on a training service."""
 
 from __future__ import annotations
 
 from arctic_platform.model.loader import ModelParallelismMetadata
+
+
+def validate_expert_parallel(
+    ep_size: int,
+    world_size: int,
+    *,
+    zero_stage: int | None = None,
+) -> None:
+    """Reject an expert-parallel degree DeepSpeed cannot run.
+
+    ``ep_size == 1`` is a no-op. Otherwise the degree must divide ``world_size``,
+    and ZeRO stage 3 is rejected because it does not support expert-data-parallel
+    groups.
+    """
+    if ep_size == 1:
+        return
+    if zero_stage == 3:
+        raise ValueError(
+            f"ep_size={ep_size} requires ZeRO stage 1 or 2; stage 3 does not support MoE expert-DP groups"
+        )
+    if world_size % ep_size != 0:
+        raise ValueError(f"ep_size ({ep_size}) must divide world_size ({world_size})")
 
 
 def validate_sequence_parallel(

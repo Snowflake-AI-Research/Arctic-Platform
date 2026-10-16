@@ -35,7 +35,6 @@ from pydantic import Field
 
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.moe_spec import is_glm_moe_model
-from arctic_platform.model.parallel.expert_parallel import split_expert_param_groups
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +131,21 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         ds_config.get("communication_data_type"),
     )
     return ds_config
+
+
+def split_expert_param_groups(param_groups: list) -> list:
+    """Name optimizer groups and split MoE parameters onto the expert-data-parallel group.
+
+    DeepSpeed only does this split when it builds the optimizer itself. A caller-supplied
+    optimizer has to hand it groups that already separate expert parameters.
+    """
+    from deepspeed.moe.utils import configure_moe_param_groups
+
+    named = []
+    for index, group in enumerate(param_groups):
+        group.setdefault("name", f"group_{index}")
+        named.append(group)
+    return configure_moe_param_groups(named)
 
 
 def initialize_training_engine(
