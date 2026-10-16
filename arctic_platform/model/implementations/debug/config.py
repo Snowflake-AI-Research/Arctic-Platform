@@ -30,12 +30,17 @@ class RouterStatsStrides(BaseModel):
     """Validated token/call strides for per-step router health statistics.
 
     Composed into MoE loader debug options so ``extra="forbid"`` accepts the same keys.
+    These fields are training-callback config only; exclude them when building provider
+    ``DebugModelConfig`` dataclasses via ``model_dump(exclude=ROUTER_STATS_STRIDE_FIELDS)``.
     """
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     router_stats_sample_stride: StrictInt = Field(0, ge=0)
     router_stats_call_stride: StrictInt = Field(1, ge=1)
+
+
+ROUTER_STATS_STRIDE_FIELDS = frozenset(RouterStatsStrides.model_fields)
 
 
 def training_debug_config(training_config: Mapping[str, Any]) -> Mapping[str, Any]:
