@@ -1,0 +1,22 @@
+{
+  "name": "qwen38-flash-next-tp8",
+  "description": "Qwen/Qwen3.8-Flash-Next, TP=8, 1 replica(s) on 8 GPU(s)",
+  "sub_job": {
+    "dtype": "bfloat16",
+    "inference_config": {
+      "max_seq_len": 262144,
+      "n_gpus": 8,
+      "vllm_config": {
+        "enable_flashinfer_autotune": false,
+        "enable_prefix_caching": true,
+        "gpu_memory_utilization": 0.9,
+        "max_num_seqs": 256,
+        "moe_backend": "triton",
+        "reasoning_parser": "qwen3",
+        "tensor_parallel_size": 8
+      }
+    },
+    "job_type": "sampling",
+    "model_name": "Qwen/Qwen3.8-Flash-Next"
+  }
+}
