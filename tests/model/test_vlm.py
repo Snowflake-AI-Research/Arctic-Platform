@@ -58,3 +58,58 @@ def test_vlm_peft_wrapper_resolves_language_and_vision_modules():
 
     assert get_language_model(wrapped) is language_model
     assert get_vision_encoder(wrapped) is vision_encoder
+
+
+def test_plain_text_model_keeps_the_text_fallback():
+    backbone = nn.Module()
+    backbone.layers = nn.ModuleList()
+    model = nn.Module()
+    model.config = SimpleNamespace(model_type="qwen3_5_text")
+    model.model = backbone
+
+    assert get_language_model(model) is backbone
+    assert get_vision_encoder(model) is None
+
+
+def test_plain_vlm_resolves_language_and_vision_modules():
+    language_model = nn.Module()
+    language_model.layers = nn.ModuleList()
+    vision_encoder = nn.Module()
+    model = nn.Module()
+    model.config = SimpleNamespace(model_type="qwen3_5")
+    model.model = nn.Module()
+    model.model.language_model = language_model
+    model.model.visual = vision_encoder
+
+    assert get_language_model(model) is language_model
+    assert get_vision_encoder(model) is vision_encoder
+
+
+def test_empty_peft_config_does_not_unwrap():
+    backbone = nn.Module()
+    backbone.layers = nn.ModuleList()
+    model = nn.Module()
+    model.config = SimpleNamespace(model_type="qwen3_5_text")
+    model.model = backbone
+    model.peft_config = {}
+    decoy = nn.Module()
+    decoy.model = nn.Module()
+    model.get_base_model = lambda: decoy
+
+    assert get_language_model(model) is backbone
+    assert get_vision_encoder(model) is None
+
+
+def test_override_resolves_on_the_pretrained_model():
+    language_model = nn.Module()
+    language_model.layers = nn.ModuleList()
+    vision_encoder = nn.Module()
+    base_model = nn.Module()
+    base_model.config = SimpleNamespace(model_type="qwen3_5")
+    base_model.model = nn.Module()
+    base_model.model.language_model = language_model
+    base_model.model.visual = vision_encoder
+    wrapped = _PeftWrapper(base_model)
+
+    assert get_language_model(wrapped, override="model.language_model") is language_model
+    assert get_vision_encoder(wrapped, override="model.visual") is vision_encoder

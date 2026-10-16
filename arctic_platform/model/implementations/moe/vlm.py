@@ -46,7 +46,8 @@ def get_vision_encoder(model: nn.Module, override: str | None = None) -> nn.Modu
     """Get the vision encoder module.
 
     Checks: config override -> registry. Returns None if not found.
-    Raises ValueError on a bad config override.
+    Raises ValueError on a bad config override. An override is a path on the
+    pretrained model. A PEFT wrapper is removed first.
     """
     model = _unwrap_peft_model(model)
     if override is not None:
@@ -66,7 +67,8 @@ def get_language_model(model: nn.Module, override: str | None = None) -> nn.Modu
     """Get the language model module (the part with transformer layers).
 
     Checks: config override -> registry -> model.model (text-only default).
-    Raises ValueError on a bad config override.
+    Raises ValueError on a bad config override. An override is a path on the
+    pretrained model. A PEFT wrapper is removed first.
     """
     model = _unwrap_peft_model(model)
     if override is not None:
