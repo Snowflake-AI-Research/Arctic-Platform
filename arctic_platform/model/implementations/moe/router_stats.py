@@ -22,8 +22,10 @@ zero-fills, as ``top_k`` tokens on expert 0. These statistics keep their own per
   repeats an expert, so a row of zeros is a pad row.
 - ``entropy_sum`` / ``sampled_tokens``: entropy (nats) of the router's normalized scores, on every
   ``stride``-th token from an offset that advances each observed call.
-- ``replay_agreement_sum`` / ``replayed_tokens``: on the same sample, when routing was replayed, the fraction of
-  the replayed experts the router's own top-k also picks.
+- ``replay_agreement_sum`` / ``replayed_tokens``: on the same sample, for tokens whose ``routed_experts`` are
+  true replays (not ``ROUTER_REPLAY_FRESH``), the fraction of those experts the router's own top-k also picks.
+  Fresh-replay rows are excluded: the router already replaced them with its own choice, so agreement would be
+  1.0 by construction.
 
 Totals are taken on every ``call_stride``-th router call only. Scheduled padding calls and activation-checkpoint
 reruns are not counted. Forward-only calls, including reference logprobs, are included; ``post_step`` publishes
@@ -42,6 +44,7 @@ from arctic_platform.common.callbacks import MetricsCallback
 from arctic_platform.common.callbacks import Reduce
 from arctic_platform.common.callbacks import Trainer
 from arctic_platform.model.implementations.debug.config import router_stats_strides
+from arctic_platform.model.implementations.moe.layers.moe import ROUTER_REPLAY_FRESH
 from arctic_platform.model.implementations.moe.layers.moe import TokenChoiceTopKRouter
 from arctic_platform.model.recompute import in_recompute
 from arctic_platform.model.recompute import install_recompute_detector
@@ -78,6 +81,11 @@ class RouterStatsCallback(MetricsCallback):
             router.register_forward_hook(self._hook(len(self._layers), totals), with_kwargs=True)
             self._layers.append((name, totals))
             self._calls.append(0)
+        if self._stride > 0 and not self._layers:
+            raise ValueError(
+                "router_stats_sample_stride > 0 but the model has no TokenChoiceTopKRouter; "
+                "disable the stride or use a MoE model that exposes that router"
+            )
         install_recompute_detector()
 
     def pre_fwd_bwd_microbatch(self, trainer: Trainer, is_padding: bool) -> None:
@@ -154,11 +162,16 @@ class RouterStatsCallback(MetricsCallback):
                 entropy = -(log_probs.exp() * log_probs).sum(-1)
                 sampled_tokens = sampled.sum()
                 sums = [sampled_tokens, sampled @ entropy]
-                if kwargs.get("routed_experts") is not None:
+                routed_experts = kwargs.get("routed_experts")
+                if routed_experts is not None:
+                    # Compare against the caller's routed_experts, not output[1]: with fresh_replay_routing,
+                    # FRESH rows are already replaced by the router's own top-k in ``selected``.
                     scores = torch.sigmoid(logits) if router.score_func == "sigmoid" else F.softmax(logits, dim=-1)
                     own = torch.topk(scores if expert_bias is None else scores + expert_bias, top_k, dim=-1).indices
-                    hits = (own.unsqueeze(-1) == selected.index_select(0, picks).unsqueeze(-2)).any(-1)
-                    sums += [sampled_tokens, sampled @ hits.to(totals.dtype).mean(-1)]
+                    routed = routed_experts.index_select(0, picks)
+                    replayed = sampled * (routed[:, 0] != ROUTER_REPLAY_FRESH).to(totals.dtype)
+                    hits = (own.unsqueeze(-1) == routed.unsqueeze(-2)).any(-1)
+                    sums += [replayed.sum(), replayed @ hits.to(totals.dtype).mean(-1)]
                 totals[experts : experts + len(sums)].add_(torch.stack(sums))
 
         return accumulate
