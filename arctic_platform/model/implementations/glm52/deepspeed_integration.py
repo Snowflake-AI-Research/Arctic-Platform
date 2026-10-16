@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 
+from arctic_platform.model.implementations.debug.config import ROUTER_STATS_STRIDE_FIELDS
 from arctic_platform.model.implementations.moe.deepspeed_integration import (
     MoEDeepSpeedAdapter,
     load_moe_model as _load_moe_model,
@@ -79,7 +80,13 @@ def _build_model_config(
         ac=options.ac_config,
         fused_lm_head_token_chunk_size=options.fused_lm_head_token_chunk_size,
         fp32_lm_head=options.fp32_lm_head,
-        debug=DebugModelConfig(**options.debug.model_dump()) if options.debug is not None else DebugModelConfig(),
+        debug=(
+            DebugModelConfig(
+                **options.debug.model_dump(exclude=ROUTER_STATS_STRIDE_FIELDS)
+            )
+            if options.debug is not None
+            else DebugModelConfig()
+        ),
     )
 
 

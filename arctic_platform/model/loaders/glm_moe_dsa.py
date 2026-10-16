@@ -26,13 +26,16 @@ from typing_extensions import Self
 
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.implementations.debug.config import RouterStatsStrides
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
 
 
-class GlmMoeDsaDebugOptions(BaseModel):
+class GlmMoeDsaDebugOptions(RouterStatsStrides):
+    """Loader debug options; includes ``RouterStatsStrides`` so training debug keys are not rejected."""
+
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     num_layers: int | None = Field(None, gt=0)
