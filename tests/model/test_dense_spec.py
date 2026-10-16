@@ -13,34 +13,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dense training options become one Hugging Face ModelSpec."""
+"""A dense Hugging Face model is one ModelSpec."""
 
 from __future__ import annotations
 
-from arctic_platform.model.dense_spec import dense_model_spec
+from arctic_platform.model import ModelSpec
+from arctic_platform.model import ParallelismConfig
+from arctic_platform.model import Patches
 
 
-def _training_options():
-    return {
-        "activation_checkpointing": 2,
-        "ac_config": {"offload_config": {"enabled": True, "keep_last_n": 3, "use_streams": False}},
-        "compile": {"fullgraph": False},
-        "fp32_lm_head": True,
-        "fused_lm_head_token_chunk_size": 128,
-        "fused_lm_head_vocab_chunk_size": 4096,
-        "tiled_mlp_token_chunk_size": 64,
-        "peft_config": {"peft_type": "Lora", "r": 8, "target_modules": ["q_proj"]},
-    }
-
-
-def test_dense_spec_transfers_setup_into_patches():
-    spec = dense_model_spec(
-        model_path="Qwen/Qwen3-8B",
+def test_dense_model_spec_records_patches():
+    spec = ModelSpec(
+        model_path_or_name="Qwen/Qwen3-8B",
         dtype="bfloat16",
         attn_implementation="flash_attention_3",
-        sequence_parallel=4,
-        liger=True,
-        training_options=_training_options(),
+        loader="huggingface",
+        parallelism=ParallelismConfig(sequence_parallel=4),
+        patches=Patches(
+            liger=True,
+            gradient_checkpointing=2,
+            activation_offload={"keep_last_n": 3, "use_streams": False},
+            compile={"fullgraph": False},
+            lm_head={"fp32": True, "token_chunk_size": 128, "vocab_chunk_size": 4096},
+            tiled_mlp={"token_chunk_size": 64},
+            peft={"peft_type": "Lora", "r": 8, "target_modules": ["q_proj"]},
+        ),
     )
 
     assert spec.loader == "huggingface"
@@ -58,16 +55,17 @@ def test_dense_spec_transfers_setup_into_patches():
     assert spec.patches.tiled_mlp.token_chunk_size == 64
 
 
-def test_dense_offload_omits_a_none_tensor_size_threshold():
-    options = _training_options()
-    options["ac_config"]["offload_config"]["tensor_size_threshold"] = None
-    spec = dense_model_spec(
-        model_path="Qwen/Qwen3-8B",
+def test_dense_offload_uses_the_typed_patch_default():
+    spec = ModelSpec(
+        model_path_or_name="Qwen/Qwen3-8B",
         dtype="bfloat16",
         attn_implementation="flash_attention_3",
-        sequence_parallel=1,
-        liger=False,
-        training_options=options,
+        loader="huggingface",
+        patches=Patches(
+            gradient_checkpointing=True,
+            activation_offload={"keep_last_n": 3},
+        ),
     )
 
     assert spec.patches.activation_offload.tensor_size_threshold == 1 << 20
+    assert spec.patches.activation_offload.use_streams is True
