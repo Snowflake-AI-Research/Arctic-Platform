@@ -1,0 +1,54 @@
+# Qwen3-8B (dense) math RL on Snowflake Cortex via the default training provider — a smaller,
+# cheaper counterpart to the qwen3.6-35b-a3b MoE recipe. One 8-GPU training sub-job + one 8-GPU
+# sampling sub-job (TP 1 -> 8 replicas). Dense: no MoE expert/sequence parallelism.
+#
+#   python -m arctic_platform.integrations.prime_rl.rl \
+#     @ arctic_platform/integrations/prime_rl/examples/qwen3-8b/math.toml
+
+seq_len = 32768
+
+[log]
+level = "debug"
+
+[model]
+name = "Qwen/Qwen3-8B"
+
+[monitors.wandb]
+project = "prime_rl_ct"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+[orchestrator]
+batch_size = 256
+max_off_policy_steps = 8
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.concurrency]
+initial_inflight = 512
+
+[orchestrator.train.sampling]
+max_completion_tokens = 32768
+
+[[orchestrator.train.source]]
+name = "math"
+env.taskset.id = "i3_math"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+# Dense model -> Cortex default training provider (no prime_rl/ep/sp block).
+[cortex.training]
+model_provider = "default"
+
+[cortex.sampling.vllm_config]
+tensor_parallel_size = 1
