@@ -22,14 +22,17 @@ vLLM release:
 * https://github.com/vllm-project/vllm/pull/56524
 """
 
+import logging
 from itertools import product as iprod
 from typing import Any, Iterable
 
+import numpy as np
 import torch
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
     SingleTypeKVCacheManager,
@@ -38,6 +41,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
 from arctic_platform.inference.patching import ArcticPatch
+
+logger = logging.getLogger(__name__)
 
 
 def _sanitize_stale_gdn_metadata(metadata):
@@ -253,6 +258,46 @@ class KVBlockZeroerPatch(ArcticPatch[KVBlockZeroer]):
         )
 
 
+def _nonfinite_sampled_requests(model_runner_output) -> list[str]:
+    """Requests whose sampled-token logprob (column 0) is not finite in this step."""
+    logprobs = model_runner_output.logprobs
+    sampled = model_runner_output.sampled_token_ids
+    if logprobs is None or not sampled or np.isfinite(logprobs.logprobs[:, 0]).all():
+        return []
+    return [
+        req_id
+        for req_id, index in model_runner_output.req_id_to_index.items()
+        if sampled[index]
+        and not np.isfinite(logprobs.slice_request(index, len(sampled[index])).logprobs[:, 0]).all()
+    ]
+
+
+class SchedulerPatch(ArcticPatch[Scheduler]):
+
+    _orig_update_from_output = Scheduler.update_from_output
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        bad = _nonfinite_sampled_requests(model_runner_output)
+        # A non-finite sampled logprob means the target row was non-finite, so the request's KV/GDN
+        # state is poisoned. Collect its blocks before the update frees a request that stops now.
+        block_ids = {
+            block_id
+            for req_id in bad
+            for group in self.kv_cache_manager.get_block_ids(req_id)
+            for block_id in group
+        }
+        outputs = self._orig_update_from_output(scheduler_output, model_runner_output)
+        if bad:
+            # Drop the prefix-cache hashes of every block it read or wrote, so no later request resumes
+            # from them; blocks still referenced stay allocated (BlockPool.evict_blocks).
+            self.kv_cache_manager.evict_blocks(block_ids)
+            seen = self.__dict__.setdefault("_arctic_nonfinite_requests", set())
+            if new := [req_id for req_id in bad if req_id not in seen]:
+                seen.update(new)
+                logger.warning("Non-finite sampled logprob: requests=%s, evicted %d blocks", new, len(block_ids))
+        return outputs
+
+
 _PATCHED = False
 
 
@@ -265,4 +310,5 @@ def apply_dflash2_nan_fixes() -> None:
     SingleTypeKVCacheManagerPatch.apply_patch()
     MambaManagerPatch.apply_patch()
     KVBlockZeroerPatch.apply_patch()
+    SchedulerPatch.apply_patch()
     _PATCHED = True

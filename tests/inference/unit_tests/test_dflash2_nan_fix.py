@@ -156,3 +156,61 @@ def test_mamba_state_tensors_are_included_in_zeroing_metadata():
     assert zeroer._meta is not None
     addresses = set(zeroer._meta[0].tolist())
     assert addresses == {conv_state.data_ptr(), recurrent_state.data_ptr()}
+
+
+def _runner_output(rows, req_ids):
+    """One step: `rows[i]` are request i's sampled-token logprobs, laid out as speculative decoding does."""
+    import numpy as np
+    from vllm.v1.outputs import LogprobsLists
+
+    flat = np.array([lp for row in rows for lp in row], dtype=np.float32)
+    starts = np.cumsum([0] + [len(row) for row in rows[:-1]]).tolist()
+    return SimpleNamespace(
+        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+        sampled_token_ids=[[7] * len(row) for row in rows],
+        logprobs=LogprobsLists(
+            logprob_token_ids=np.zeros((len(flat), 2), dtype=np.int32),
+            logprobs=np.stack([flat, flat], axis=1),
+            sampled_token_ranks=np.ones(len(flat), dtype=np.int32),
+            cu_num_generated_tokens=starts,
+        ),
+    )
+
+
+def _scheduler(blocks_by_request, freed_by_update):
+    evicted = []
+
+    def update(scheduler_output, model_runner_output):
+        for req_id in freed_by_update:
+            blocks_by_request.pop(req_id)
+        return {"outputs": True}
+
+    manager = SimpleNamespace(
+        get_block_ids=lambda req_id: blocks_by_request.get(req_id, ([],)),
+        evict_blocks=lambda block_ids: evicted.append(set(block_ids)),
+    )
+    return SimpleNamespace(kv_cache_manager=manager, _orig_update_from_output=update), evicted
+
+
+def test_nonfinite_sampled_logprob_evicts_the_request_blocks_even_when_it_stops_this_step():
+    from arctic_platform.inference.vllm.dflash2_nan_fix import SchedulerPatch
+
+    nan = float("nan")
+    output = _runner_output([[-0.1, -0.2, -0.3], [-0.5, nan], [-0.7]], ["ok", "bad", "ok2"])
+    scheduler, evicted = _scheduler(
+        {"ok": ([1, 2], [3]), "bad": ([4, 5], [6, 0]), "ok2": ([8], [9])}, freed_by_update=["bad"])
+
+    assert SchedulerPatch.update_from_output(scheduler, None, output) == {"outputs": True}
+
+    assert evicted == [{0, 4, 5, 6}]
+
+
+def test_finite_step_evicts_nothing():
+    from arctic_platform.inference.vllm.dflash2_nan_fix import SchedulerPatch
+
+    output = _runner_output([[-0.1, -0.2], [-0.5]], ["a", "b"])
+    scheduler, evicted = _scheduler({"a": ([1],), "b": ([2],)}, freed_by_update=[])
+
+    SchedulerPatch.update_from_output(scheduler, None, output)
+
+    assert evicted == []
