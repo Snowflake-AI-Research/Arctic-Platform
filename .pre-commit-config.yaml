@@ -42,4 +42,4 @@ repos:
       - id: mypy
         additional_dependencies: [types-PyYAML, pydantic]
         args: [--ignore-missing-imports]
-        files: ^arctic_platform/model/
+        files: ^(arctic_platform/model/|arctic_platform/common/deepspeed_engine\.py)
