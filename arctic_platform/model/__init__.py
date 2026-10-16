@@ -29,11 +29,6 @@ from arctic_platform.model.config import Patches
 from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
 from arctic_platform.model.dense_spec import dense_model_spec
-from arctic_platform.model.expert_parallel import ep_group_name
-from arctic_platform.model.expert_parallel import expert_parallel_group
-from arctic_platform.model.expert_parallel import setup_replicated_expert_groups
-from arctic_platform.model.expert_parallel import split_expert_param_groups
-from arctic_platform.model.expert_parallel import validate_expert_parallel
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import mark_keep_fp32
@@ -61,14 +56,15 @@ from arctic_platform.model.moe_spec import build_moe_model
 from arctic_platform.model.moe_spec import hf_text_model_type
 from arctic_platform.model.moe_spec import is_glm_moe_model
 from arctic_platform.model.moe_spec import moe_model_spec
+from arctic_platform.model.parallel.expert_parallel import ep_group_name
+from arctic_platform.model.parallel.expert_parallel import expert_parallel_group
+from arctic_platform.model.parallel.expert_parallel import setup_replicated_expert_groups
+from arctic_platform.model.parallel.expert_parallel import split_expert_param_groups
+from arctic_platform.model.parallel.expert_parallel import validate_expert_parallel
+from arctic_platform.model.parallel.sequence_parallel import validate_sequence_parallel
 from arctic_platform.model.patch import apply_patches
 from arctic_platform.model.patch import register_patch
 from arctic_platform.model.patches.peft import apply_peft
-from arctic_platform.model.sequence_parallel import validate_sequence_parallel
-from arctic_platform.model.training_engine import OptimizerSettings
-from arctic_platform.model.training_engine import TrainingEngineSpec
-from arctic_platform.model.training_engine import build_deepspeed_config
-from arctic_platform.model.training_engine import initialize_training_engine
 from arctic_platform.model.weight_export import PEFT_ADAPTER_DIRNAME
 from arctic_platform.model.weight_export import WeightExportContract
 from arctic_platform.model.weight_export import checkpoint_peft_adapter_dir
@@ -122,8 +118,6 @@ __all__ = [
     "CompilePatch",
     "ModelParallelismMetadata",
     "ModelSpec",
-    "OptimizerSettings",
-    "TrainingEngineSpec",
     "model_parallelism_metadata_from_config",
     "moe_model_spec",
     "ParallelismConfig",
@@ -138,10 +132,8 @@ __all__ = [
     "ZorroTrainPatch",
     "apply_patches",
     "apply_peft",
-    "build_deepspeed_config",
     "build_model",
     "build_moe_model",
-    "initialize_training_engine",
     "register_loader",
     "register_patch",
     "resolve_conversion_cache_path",

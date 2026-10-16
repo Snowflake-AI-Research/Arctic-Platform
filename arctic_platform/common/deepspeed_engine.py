@@ -12,7 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DeepSpeed config, optimizer, and engine initialization for a training job."""
+"""DeepSpeed engine bring-up for a training job.
+
+Builds the DeepSpeed config, constructs the optimizer, and calls
+``deepspeed.initialize``. This is separate from model construction. The
+on-prem RL worker in ``arctic_platform.common.deepspeed_worker`` still builds
+its own config in ``ds_training_config`` and calls ``deepspeed.initialize``
+itself.
+
+TODO: combine this module with ``deepspeed_worker`` once both callers share
+one engine-construction path.
+"""
 
 from __future__ import annotations
 
@@ -23,9 +33,9 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 
-from arctic_platform.model.expert_parallel import split_expert_param_groups
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.moe_spec import is_glm_moe_model
+from arctic_platform.model.parallel.expert_parallel import split_expert_param_groups
 
 logger = logging.getLogger(__name__)
 

@@ -30,9 +30,9 @@ import deepspeed.runtime.sequence_parallel.parallel_state_sp as sp_mpu
 import deepspeed.utils.groups as ds_groups
 import torch.distributed as dist
 
-from arctic_platform.model import parallel_topology as topology
-from arctic_platform.model.expert_parallel import ep_group_name
-from arctic_platform.model.expert_parallel import setup_replicated_expert_groups
+from arctic_platform.model.parallel import parallel_topology as topology
+from arctic_platform.model.parallel.expert_parallel import ep_group_name
+from arctic_platform.model.parallel.expert_parallel import setup_replicated_expert_groups
 
 logger = logging.getLogger(__name__)
 

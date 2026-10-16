@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from arctic_platform.model import expert_parallel as expert_parallel_mod
+from arctic_platform.model.parallel import expert_parallel as expert_parallel_mod
 
 
 def test_ep_group_name_matches_the_deepspeed_registry_key():

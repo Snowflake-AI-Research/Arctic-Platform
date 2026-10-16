@@ -20,7 +20,7 @@ from __future__ import annotations
 import pytest
 
 from arctic_platform.model.loader import ModelParallelismMetadata
-from arctic_platform.model.sequence_parallel import validate_sequence_parallel
+from arctic_platform.model.parallel.sequence_parallel import validate_sequence_parallel
 
 
 def _metadata(**overrides) -> ModelParallelismMetadata:

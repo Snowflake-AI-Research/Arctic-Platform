@@ -19,15 +19,15 @@ from __future__ import annotations
 import pytest
 import torch
 
-from arctic_platform.model.training_engine import OptimizerSettings
-from arctic_platform.model.training_engine import TrainingEngineSpec
-from arctic_platform.model.training_engine import build_deepspeed_config
-from arctic_platform.model.training_engine import build_training_optimizer
-from arctic_platform.model.training_engine import cpu_adam_fp32_optimizer_states
-from arctic_platform.model.training_engine import initialize_training_engine
-from arctic_platform.model.training_engine import optimizer_choice
-from arctic_platform.model.training_engine import optimizer_implementation
-from arctic_platform.model.training_engine import resolve_optimizer_name
+from arctic_platform.common.deepspeed_engine import OptimizerSettings
+from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
+from arctic_platform.common.deepspeed_engine import build_deepspeed_config
+from arctic_platform.common.deepspeed_engine import build_training_optimizer
+from arctic_platform.common.deepspeed_engine import cpu_adam_fp32_optimizer_states
+from arctic_platform.common.deepspeed_engine import initialize_training_engine
+from arctic_platform.common.deepspeed_engine import optimizer_choice
+from arctic_platform.common.deepspeed_engine import optimizer_implementation
+from arctic_platform.common.deepspeed_engine import resolve_optimizer_name
 
 _ZERO2 = {"zero_optimization": {"stage": 2}}
 _OFFLOAD = {"zero_optimization": {"stage": 2, "offload_optimizer": {"device": "cpu"}}}
@@ -238,12 +238,12 @@ def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypa
         calls["kwargs"] = kwargs
         return "engine", kwargs.get("optimizer"), None, None
 
-    monkeypatch.setattr("arctic_platform.model.training_engine.build_training_optimizer", _build)
+    monkeypatch.setattr("arctic_platform.common.deepspeed_engine.build_training_optimizer", _build)
     monkeypatch.setattr(
-        "arctic_platform.model.training_engine.preserve_fp8_params_through_ds_cast",
+        "arctic_platform.common.deepspeed_engine.preserve_fp8_params_through_ds_cast",
         lambda model: (0, 0),
     )
-    monkeypatch.setattr("arctic_platform.model.training_engine.is_glm_moe_model", lambda path: False)
+    monkeypatch.setattr("arctic_platform.common.deepspeed_engine.is_glm_moe_model", lambda path: False)
     monkeypatch.setattr("deepspeed.initialize", _initialize)
     model = torch.nn.Linear(1, 1)
     ds_config = {"train_micro_batch_size_per_gpu": 1}
@@ -274,7 +274,7 @@ def test_initialize_without_an_optimizer_omits_it_and_the_mpu(monkeypatch):
         return "engine", None, None, None
 
     monkeypatch.setattr(
-        "arctic_platform.model.training_engine.preserve_fp8_params_through_ds_cast",
+        "arctic_platform.common.deepspeed_engine.preserve_fp8_params_through_ds_cast",
         lambda model: (0, 0),
     )
     monkeypatch.setattr("deepspeed.initialize", _initialize)
@@ -306,10 +306,10 @@ def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monke
 
     monkeypatch.setattr("deepspeed.ops.adam.FusedAdam", _Adam)
     monkeypatch.setattr("torch.optim.AdamW", _Adam)
-    monkeypatch.setattr("arctic_platform.model.training_engine.is_glm_moe_model", lambda path: True)
-    monkeypatch.setattr("arctic_platform.model.training_engine.split_expert_param_groups", _split)
+    monkeypatch.setattr("arctic_platform.common.deepspeed_engine.is_glm_moe_model", lambda path: True)
+    monkeypatch.setattr("arctic_platform.common.deepspeed_engine.split_expert_param_groups", _split)
     monkeypatch.setattr(
-        "arctic_platform.model.training_engine.preserve_fp8_params_through_ds_cast",
+        "arctic_platform.common.deepspeed_engine.preserve_fp8_params_through_ds_cast",
         lambda model: (0, 0),
     )
 
