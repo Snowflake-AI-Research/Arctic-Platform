@@ -16,6 +16,7 @@
 import logging
 from functools import wraps
 
+import torch
 import vllm
 from pydantic import ConfigDict
 from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
@@ -150,6 +151,24 @@ def ensure_dflash_max_position_patch() -> None:
 
     SpeculativeConfig.__post_init__ = post_init
     SpeculativeConfigPatch._orig_post_init = post_init
+
+    from vllm.model_executor.layers.rotary_embedding import YaRNScalingRotaryEmbedding
+    from vllm.model_executor.models import qwen3_dflash
+
+    get_rope = qwen3_dflash.get_rope
+
+    @wraps(get_rope)
+    def get_draft_rope(*args, max_position, **kwargs):
+        rope = get_rope(*args, max_position=max_position, **kwargs)
+        if isinstance(rope, YaRNScalingRotaryEmbedding) and rope.cos_sin_cache.shape[0] < max_position:
+            # YaRN sizes its table original x factor, ignoring max_position; extend it with YaRN's own formula.
+            t = torch.arange(max_position, dtype=torch.float32)
+            freqs = torch.einsum("i,j -> ij", t, rope._compute_inv_freq(rope.scaling_factor))
+            cache = torch.cat((freqs.cos() * rope.mscale, freqs.sin() * rope.mscale), dim=-1)
+            rope.cos_sin_cache = cache.to(rope.cos_sin_cache)
+        return rope
+
+    qwen3_dflash.get_rope = get_draft_rope
     _DFLASH_PATCHED = True
 
 
