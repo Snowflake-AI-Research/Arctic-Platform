@@ -1059,7 +1059,7 @@ def _resolve_published_skeleton(paths: _ImagePaths) -> tuple[str | None,
     **More than one match is a refusal.** Two weight versions of one config and
     backend is a deliberate state (it is how a rollback is kept), but which one a
     job should get is an operator's decision, not a tie-break to invent here. So
-    this logs the candidates and reports a miss, which cold-starts.
+    this logs the candidates and reports a miss.
     """
     root = paths.skeleton_root
     if not root:
@@ -2862,7 +2862,7 @@ def _publish_skip_reason(paths: _ImagePaths, skeleton_dir: str | None,
     A job that turned the mirror off cannot tell whether its key is already
     published, and a key that is published already would gain a second
     skeleton, which makes every later restore of it refuse to choose and
-    cold-start. ``world_size`` (one engine's GPUs, single-pod engines only)
+    miss. ``world_size`` (one engine's GPUs, single-pod engines only)
     limits publishing at TP>1 to a whole-node pod; a TP=1 pod of any size is
     published, since its key names the pod size and not its devices.
     """
