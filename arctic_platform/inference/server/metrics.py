@@ -137,6 +137,9 @@ class WorkerMetricsCollector:
         self.min_interval_s = max(0.0, min_interval_s)
         self._snapshots = _BoundedDeque(max_items=max_snapshots)
         self._last_record_time: float = 0.0
+        # Speculative-decoding counters since engine start, summed over every step
+        self._spec_lock = threading.Lock()
+        self._spec_totals = {"num_drafts": 0, "num_draft_tokens": 0, "num_accepted_tokens": 0}
 
     def set_replica_id(self, replica_id: int) -> None:
         self.replica_id = replica_id
@@ -148,6 +151,12 @@ class WorkerMetricsCollector:
     ) -> None:
         if scheduler_stats is None:
             return
+        spec = scheduler_stats.spec_decoding_stats
+        if spec is not None:
+            with self._spec_lock:
+                self._spec_totals["num_drafts"] += spec.num_drafts
+                self._spec_totals["num_draft_tokens"] += spec.num_draft_tokens
+                self._spec_totals["num_accepted_tokens"] += spec.num_accepted_tokens
         now = time.time()
         if (
             self.min_interval_s > 0
@@ -186,6 +195,15 @@ class WorkerMetricsCollector:
 
     def drain_snapshots(self) -> list[dict[str, Any]]:
         return [s.to_dict() for s in self._snapshots.drain()]
+
+    def spec_decoding_totals(self) -> dict[str, int]:
+        """Cumulative speculative-decoding counters (not cleared by a drain).
+
+        Mean acceptance length over a window is
+        ``1 + d(num_accepted_tokens) / d(num_drafts)`` between two reads.
+        """
+        with self._spec_lock:
+            return dict(self._spec_totals)
 
     def latest(self) -> dict[str, Any]:
         """Return the latest scheduler stats without draining the ring.

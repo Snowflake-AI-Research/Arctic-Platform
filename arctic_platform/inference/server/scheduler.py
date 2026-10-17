@@ -886,6 +886,7 @@ class Scheduler:
             replicas_payload.append({
                 "replica_id": idx,
                 "snapshots": snaps,
+                "spec_decoding": res.get("spec_decoding", {}) if isinstance(res, dict) else {},
                 "action_mask_replay_cache": (
                     res.get("action_mask_replay_cache", {})
                     if isinstance(res, dict)
