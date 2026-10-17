@@ -1237,6 +1237,7 @@ class InferenceWorker(StreamingWorkerMixin):
         return {
             "pid": os.getpid(),
             "snapshots": get_collector().drain_snapshots(),
+            "spec_decoding": get_collector().spec_decoding_totals(),
             "action_mask_replay_cache": action_mask_replay_cache_stats(),
         }
 
