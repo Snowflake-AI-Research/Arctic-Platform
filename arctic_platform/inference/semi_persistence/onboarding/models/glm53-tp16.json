@@ -1,0 +1,20 @@
+{
+  "name": "glm53-tp16",
+  "description": "zai-org/GLM-5.3, TP=16, 1 replica(s) on 16 GPU(s)",
+  "sub_job": {
+    "dtype": "bfloat16",
+    "inference_config": {
+      "max_seq_len": 327680,
+      "n_gpus": 16,
+      "vllm_config": {
+        "gpu_memory_utilization": 0.9,
+        "kv_cache_dtype": "fp8_ds_mla",
+        "reasoning_parser": "glm45",
+        "tensor_parallel_size": 16
+      }
+    },
+    "job_type": "sampling",
+    "model_name": "zai-org/GLM-5.3",
+    "seed": 42
+  }
+}
