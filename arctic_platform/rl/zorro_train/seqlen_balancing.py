@@ -435,55 +435,14 @@ def compute_group_costs(batch, prompt_groups, prompt_len, quadratic_coeff=0):
 
 
 def create_prompt_groups(input_ids, response_length, max_token_len, max_group_length_threshold):
-    batch_size, seq_len = input_ids.shape
-    prompt_len = seq_len - response_length
+    from arctic_platform.common.utils.balanced_batch import prompt_groups
 
-    # Step 1: Find prompt groups in the entire mini-batch
-    # Extract prompts and group by equality
-    prompts = input_ids[:, :prompt_len]
-
-    prompt_groups_map = {}  # Maps prompt tuple hash -> list of sample indices
-    for i in range(batch_size):
-        prompt_tuple = tuple(prompts[i].tolist())
-        if prompt_tuple not in prompt_groups_map:
-            prompt_groups_map[prompt_tuple] = []
-        prompt_groups_map[prompt_tuple].append(i)
-
-    # Convert to list of groups
-    prompt_groups = list(prompt_groups_map.values())
-
-    # Split large groups if max_group_length_threshold is set and positive
-    if prompt_groups and max_group_length_threshold is not None and max_group_length_threshold > 0:
-
-        # first check the boundaries are configured correctly
-        max_token_len_effective = prompt_len + response_length * max_group_length_threshold
-        # pr0(f"sanity check: {max_token_len_effective=} {max_token_len=}")
-        if max_token_len < max_token_len_effective:
-            raise ValueError(
-                f"""
-                {max_token_len=} is smaller than {max_token_len_effective}.
-                Where max_token_len_effective = {prompt_len=} + {response_length=} * {max_group_length_threshold=}.
-                You can either raise actor_rollout_ref.actor.ppo_max_token_len_per_gpu to a higher value or reduce the number of rollouts (`actor_rollout_ref.rollout.n`) or to split the prompt groups by setting `arctic_rl.train.zorro_train.max_rollouts` to a smaller value than `actor_rollout_ref.rollout.n`, so that the math above checks out.
-                Reducing prompt and/or response sizes is another way if it doesn't break the training needs."""
-            )
-
-        max_group_length = max(len(group) for group in prompt_groups)
-        if max_group_length > max_group_length_threshold:
-            # Split large groups into smaller groups of size <= max_group_length_threshold
-            # This trades off some deduplication efficiency for memory/compute constraints
-
-            split_prompt_groups = []
-            for group in prompt_groups:
-                if len(group) > max_group_length_threshold:
-                    # Split into chunks of max_group_length_threshold
-                    for i in range(0, len(group), max_group_length_threshold):
-                        end_idx = min(i + max_group_length_threshold, len(group))
-                        split_prompt_groups.append(group[i:end_idx])
-                else:
-                    split_prompt_groups.append(group)
-            prompt_groups = split_prompt_groups
-
-    return prompt_groups
+    return prompt_groups(
+        input_ids,
+        response_length=response_length,
+        max_token_len=max_token_len,
+        max_group_length=max_group_length_threshold,
+    )
 
 
 def reorg_global_batch_verl(
@@ -638,92 +597,23 @@ def reorg_global_batch(
 
     prompt_groups = create_prompt_groups(input_ids, response_length, max_token_len, max_group_length_threshold)
     prompt_len = seq_len - response_length
-    group_costs, total_dedup_tokens = compute_group_costs(batch, prompt_groups, prompt_len)
+    group_costs, _total_dedup_tokens = compute_group_costs(batch, prompt_groups, prompt_len)
 
-    # Step 3: num_micro_batches has to be of world_size because verl/ray split data world_size-way
-    # it'd be very difficult to make world_size*n batches because we then won't be able to pack into bins as we won't know when to stop packing
-    num_micro_batches = world_size
+    from arctic_platform.common.utils.balanced_batch import assign_zorro_groups
 
-    # Create micro-batch bins
-    micro_batch_bins = [[] for _ in range(num_micro_batches)]
-    micro_batch_costs = [0 for _ in range(num_micro_batches)]
-
-    # because of how verl splits the global batch the bins all have to end up with the same number of total batches
-    batch_size_per_bin = batch_size // world_size
-
-    def find_min_cost_index(num_micro_batches, micro_batch_bins, micro_batch_costs, group):
-        # There are 2 constraints in this early version of bin packing:
-        # 1. choose a bin with min cost
-        # 2. while ensuring its capacity isn't going to overflow
-        # if constraint 2 isn't satisfied go the next higher min cost bin
-        # at the end all bins have to have the exact same number of items (batch size)
-        # we can't do a more optimal version without the 2nd constraint because it may result in ranks having different batch_sizes which can't work with verl.
-
-        # Important: there is no guarantee group-size is always the same for all items in micro_batch_costs.
-        # Thus we need to make sure to put the largest costs first, in particular to deal with a situation of a duplicated prompt where 1 prompt group's size could be double of all other group sizes and then the last item won't fit into any bin as there will be 2 bins with a gap of 2 large group's size halves - so the duplicated prompt groups have to go in first. Probably could do a pre-sort by group size, but I think the 2x prompt group is already guaranting a larger micro_batch cost
-        sorted_by_cost_indices = sorted(range(num_micro_batches), key=lambda i: micro_batch_costs[i])
-
-        gs = len(group)
-        for idx in sorted_by_cost_indices:
-            bs = len(list(itertools.chain.from_iterable(micro_batch_bins[idx])))
-            # pr(f"{idx=} {bs=} {gs=} {micro_batch_costs[idx]=}")
-            if bs + gs <= batch_size_per_bin:
-                return idx
-
-        # If we hit this it means packing failed and some smaller item got where the large item could fit and thus at least one item now can't fit. I dealt with all use-cases I run into but perhaps there are some that I haven't encountered.
-        raise ValueError("shouldn't reach here")
-
-    # Sort groups
-    # 1. by group size (descending)
-    # 2. by cost (descending) (secondary)
-    # for better load balancing and to ensure we can fit all groups into the exact amount of slots in the bins - because we have a constraint of needing all batches per rank to remain of the same batch_size - therefore triple and double-prompt groups have to go first to ensure everything fits - the prompt gets replicated by verl when it doesn't have enough samples.
-    group_costs.sort(reverse=True, key=lambda x: (len(x[1]), x[0]))
-
-    # pr0(f"{group_costs=}")
-    # pr0(f"{num_micro_batches=}")
-    # pr0(f"{batch_size_per_bin=}")
-
-    # Greedy bin packing: assign each group to the bin with minimum current cost
-    # note that it purposefully doesn't respect max_token_len (Samyam's design) so it's possible for a bin to be longer than max_token_len
-    for cost, group in group_costs:
-        # Find bin with minimum cost
-        min_bin_idx = find_min_cost_index(num_micro_batches, micro_batch_bins, micro_batch_costs, group)
-
-        micro_batch_bins[min_bin_idx].append(group)
-        micro_batch_costs[min_bin_idx] += cost
-
-    # pr0(f"{micro_batch_costs=}")
-
-    # sanity check to ensure each bin is of batch_size/world_size size
-    for i in range(world_size):
-        assert (
-            len(list(itertools.chain.from_iterable(micro_batch_bins[i]))) == batch_size_per_bin
-        ), f"{len(list(itertools.chain.from_iterable(micro_batch_bins[i])))} != {batch_size_per_bin=}"
-
+    # Equal bins, whole groups, insertion order. num_micro_batches is world_size,
+    # so each rank keeps the bin it was assigned. Do not stripe bins across ranks.
+    assignment = assign_zorro_groups(
+        [group for _cost, group in group_costs],
+        [cost for cost, _group in group_costs],
+        world_size,
+        batch_size,
+    )
+    if assignment is None:
+        return batch, None
     if ENABLE_BALANCE_STATS:
-        max_cost, min_max_ratio, divergence_cost = compute_variation(micro_batch_costs)
-        pr0("everything micro_batch_costs unsorted:\n", "\n".join(map(str, micro_batch_costs)), sep="")
-        pr0(f"everything micro_batch_costs max_cost {max_cost} in {len(micro_batch_costs)} items)")
-        pr0(
-            f"everything micro_batch_costs outlier max/min diff is of {min_max_ratio:0.2f}x (in"
-            f" {len(micro_batch_costs)} items)"
-        )
-        pr0(f"everything micro_batch_costs variation {divergence_cost:0.4f} (in {len(micro_batch_costs)} items)")
-
-    # re-org batches to match the micro_batch_bin packing order, while preparing for a future /world_size split on the batch_size dimension
-    from_to_indices = []
-    # we already ensured micro_batch_bins is divisible by world_size
-    slice_len = len(micro_batch_bins) // world_size
-    # because the bins are sorted by cost, and we want each index in the micro-batch across ranks to be close in length/cost to other ranks, instead of taking a slice, we will index 1 item from each world size slice - e.g. with world_size=8:
-    # rank 0: items 0, 8, 16
-    # rank 1: items 1, 9, 17
-    for rank in range(world_size):
-        this_rank_micro_batch_bins = [micro_batch_bins[rank + world_size * i] for i in range(slice_len)]
-        # remap the global batch into this rank's batch to keep only the entries it needs
-        # while remapping the bin_groups to those new batch indices
-        for bin_groups in this_rank_micro_batch_bins:
-            for group in bin_groups:
-                from_to_indices.extend(group)
+        pr0(f"zorro group assignment rows per rank {[len(rank) for rank in assignment]}")
+    from_to_indices = [index for rank in assignment for index in rank]
 
     for key in batch.keys():
         # print(key, batch[key])
