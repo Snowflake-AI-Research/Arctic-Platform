@@ -50,6 +50,7 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import Patches
+from arctic_platform.model import ZorroTrainPatch
 from arctic_platform.model.implementations.gpu import activation_offload
 from arctic_platform.model.implementations.gpu import qwen3_5_dense_parity as hf_dense_parity
 from arctic_platform.model.implementations.gpu.activation_offload import ActivationOffloadManager
@@ -865,6 +866,65 @@ def test_loader_checks_the_source_before_loading_weights(monkeypatch, tmp_path):
     spec = ModelSpec(model_path_or_name=str(tmp_path), loader="huggingface")
     with pytest.raises(RuntimeError, match="Qwen3_5DecoderLayer.forward"):
         load_huggingface(LoaderContext(spec=spec))
+
+
+def _zorro_train_spec(loader_options: dict) -> ModelSpec:
+    return ModelSpec(
+        model_path_or_name="tiny",
+        loader="huggingface",
+        loader_options=loader_options,
+        patches=Patches(zorro_train=ZorroTrainPatch(response_len=8, rollout_n=2)),
+    )
+
+
+def _zorro_train_layer_loop(model: nn.Module) -> torch.Tensor:
+    """The last hidden state of the layer loop the zorro_train patch installs on ``Qwen3_5TextModel``.
+
+    That loop (``Qwen3ModelOncePatcher`` in ``arctic_platform/rl/zorro_train/qwen_model_patcher.py``) passes one tensor
+    from each decoder layer to the next and gives no residual.
+    """
+    text_model = model.model
+    hidden = text_model.embed_tokens(_input_ids())
+    position_ids = torch.arange(_SEQ)[None, None, :].expand(3, 1, -1)
+    position_embeddings = text_model.rotary_emb(hidden, position_ids)
+    for layer in text_model.layers[: text_model.config.num_hidden_layers]:
+        hidden = layer(hidden, attention_mask=None, position_embeddings=position_embeddings)
+    return text_model.norm(hidden)
+
+
+def test_the_parity_layers_do_not_survive_the_zorro_train_layer_loop():
+    with pytest.raises(AttributeError, match="'tuple' object"):
+        _zorro_train_layer_loop(_patched(_tiny_model()))
+
+
+@pytest.mark.parametrize(
+    ("loader_options", "logged"), [({}, True), ({"fp32_parity": True}, True), ({"fp32_parity": False}, False)]
+)
+def test_loader_leaves_the_model_stock_under_zorro_train(monkeypatch, caplog, loader_options, logged):
+    from arctic_platform.model.loaders.huggingface import load_huggingface
+
+    model = _tiny_model()
+    monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
+
+    with caplog.at_level("INFO", logger="arctic_platform.model.loaders.huggingface"):
+        load_huggingface(LoaderContext(spec=_zorro_train_spec(loader_options)))
+
+    assert getattr(model.model, "_arctic_fp32_parity", False) is False
+    assert _instance_forwards(model) == []
+    assert _beta_hooks(model) == 0
+    assert ("does not apply fp32_parity" in caplog.text) is logged
+    torch_assert_equal(_zorro_train_layer_loop(model), _zorro_train_layer_loop(_tiny_model()))
+
+
+def test_fp32_residual_with_zorro_train_is_refused_before_loading_weights(monkeypatch):
+    from arctic_platform.model.loaders.huggingface import load_huggingface
+
+    def no_weights(*args, **kwargs):
+        raise AssertionError("the weights must not load when the options are refused")
+
+    monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", no_weights)
+    with pytest.raises(ValueError, match="fp32_residual cannot be combined with the zorro_train patch"):
+        load_huggingface(LoaderContext(spec=_zorro_train_spec({"fp32_residual": True})))
 
 
 def test_a_different_installed_source_is_named_as_such(monkeypatch):
