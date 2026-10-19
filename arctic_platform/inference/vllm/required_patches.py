@@ -17,6 +17,7 @@
 
 
 def apply_required_vllm_patches() -> None:
+    from arctic_platform.inference.vllm.config import ensure_dflash_max_position_patch
     from arctic_platform.inference.vllm.dense_prompt_logprobs import ensure_dense_prompt_logprobs_patch
     from arctic_platform.inference.vllm.dflash2_nan_fix import apply_dflash2_nan_fixes
     from arctic_platform.inference.vllm.glm5next_indexer_page import apply_glm5next_indexer_page_fix
@@ -32,3 +33,4 @@ def apply_required_vllm_patches() -> None:
     # Drop with glm5next_indexer_page.py once the pinned vLLM contains
     # https://github.com/vllm-project/vllm/pull/57169.
     apply_glm5next_indexer_page_fix()
+    ensure_dflash_max_position_patch()

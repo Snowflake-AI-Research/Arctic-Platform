@@ -59,6 +59,17 @@ class Qwen3_5MoeOptions(BaseModel):
         "disabled", description="Chunked LM-head logprobs token size."
     )
     fp32_lm_head: bool = Field(False, description="Compute the LM head in fp32.")
+    fp32_parity: bool = Field(
+        True,
+        description=(
+            "Evaluate the residual adds, the partial rotary embedding and the GatedDeltaNet beta gate in fp32, as "
+            "vLLM does. Each norm returns the residual in the dtype of the branch output, so with fp32 weights under "
+            "bf16 autocast the residual stream and the final hidden state are bf16 rather than fp32, and under full "
+            "activation checkpointing every decoder layer after the first holds the residual as a second tensor at "
+            "its boundary. False adds each layer's residuals in the input dtype at the end of the layer and "
+            "evaluates the rotary embedding and the beta gate in the input dtype."
+        ),
+    )
     tiled_mlp_token_chunk_size: int | None = Field(None, gt=0, description="ALST tiled shared-expert MLP token chunk.")
     deepep_token_chunk_size: int | None = Field(None, gt=0, description="DeepEP dispatch token chunk size.")
     # Mirrors ModelConfig.weight_conversion_cache_dir (the implementation's effective default).

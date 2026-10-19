@@ -43,7 +43,7 @@ OPS = frozenset(
         "forward",
         "step",
         "save",
-        "load-checkpoint",  # SFT resume; not in Cortex surface
+        "load-checkpoint",
         "generate",
         "log-probs",
         # Control-plane ops share one canonical envelope (op_type + payload),
@@ -54,6 +54,10 @@ OPS = frozenset(
         "wake-inference",
         "sleep-training",
         "wake-training",
+        # Streaming generate: submit, then poll the request for events or cancel it.
+        "generate-stream",
+        "request-status",
+        "cancel-request",
     }
 )
 
