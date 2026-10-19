@@ -16,12 +16,39 @@
 
 ``FusedAddRMSNorm`` is a residual add followed by a (1 + weight) RMSNorm, both in fp32;
 ``FusedAddRMSNormFp32Residual`` returns the sum unrounded. ``rope_rotary_slice_fp32`` applies a partial rotary
-embedding in fp32.
+embedding in fp32. ``rms_norm_gated_fp32`` is the GatedDeltaNet output norm in fp32, rounded once, and
+``round_gated_norms_once`` makes the stock transformers output norms of a model use it.
 """
 
 from __future__ import annotations
 
+import importlib
+import types
+
 import torch
+from torch import nn
+from transformers.activations import ACT2FN
+
+try:
+    from fla.modules import FusedRMSNormGated
+    from fla.modules.fused_norm_gate import rms_norm_gated as fla_rms_norm_gated
+except ImportError:
+    FusedRMSNormGated = None  # type: ignore
+    fla_rms_norm_gated = None  # type: ignore
+
+# The transformers GatedDeltaNet output norms whose forward normalizes in fp32, rounds to the input dtype, multiplies by
+# the weight in the input dtype and rounds again; and the GatedDeltaNet layers that hold them as ``norm``.
+_STOCK_GATED_NORMS = (
+    ("transformers.models.qwen3_5.modeling_qwen3_5", "Qwen3_5RMSNormGated"),
+    ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeRMSNormGated"),
+    ("transformers.models.qwen3_next.modeling_qwen3_next", "Qwen3NextRMSNormGated"),
+    ("transformers.models.qwen4_exp.modeling_qwen4_exp", "Qwen4ExpTextRMSNormGated"),
+)
+_STOCK_GATED_DELTA_NETS = (
+    ("transformers.models.qwen3_5.modeling_qwen3_5", "Qwen3_5GatedDeltaNet"),
+    ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeGatedDeltaNet"),
+    ("transformers.models.qwen3_next.modeling_qwen3_next", "Qwen3NextGatedDeltaNet"),
+)
 
 
 def _compute_dtype(x: torch.Tensor) -> torch.dtype:
@@ -116,3 +143,73 @@ def rope_rotary_slice_fp32(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     rotated = torch.cat((-x_rot_fp32[..., half:], x_rot_fp32[..., :half]), dim=-1)
     embed = (x_rot_fp32 * cos.unsqueeze(1).float()) + (rotated * sin.unsqueeze(1).float())
     return torch.cat((embed.to(x.dtype), x_pass), dim=-1)
+
+
+def _uses_fla_kernel(x: torch.Tensor) -> bool:
+    # Under torch.compile the torch formula runs, so a compiled layer never traces fla's Triton autograd function.
+    return fla_rms_norm_gated is not None and x.is_cuda and not torch.compiler.is_compiling()
+
+
+def rms_norm_gated_fp32(
+    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float, activation: str
+) -> torch.Tensor:
+    """RMSNorm of ``x`` times ``weight`` times ``activation(gate)``, evaluated in fp32 and rounded once to ``x``'s dtype.
+
+    This is vLLM's ``RMSNormGated`` with ``norm_before_gate=True``, the GatedDeltaNet output norm of the sampler. On
+    CUDA it runs fla's fused ``rms_norm_gated`` kernel, which computes the same way and has a fused backward.
+    """
+    if _uses_fla_kernel(x):
+        return fla_rms_norm_gated(x, gate, weight, None, activation, eps=eps)
+    compute_dtype = _compute_dtype(x)
+    hidden = x.to(compute_dtype)
+    hidden = hidden * torch.rsqrt(hidden.pow(2).mean(-1, keepdim=True) + eps)
+    hidden = hidden * weight.to(compute_dtype)
+    return (hidden * ACT2FN[activation](gate.to(compute_dtype))).to(x.dtype)
+
+
+def _rms_norm_gated_once_forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    return rms_norm_gated_fp32(hidden_states, gate, self.weight, self.variance_epsilon, self.activation)
+
+
+def _resolve(names: tuple[tuple[str, str], ...]) -> tuple[type[nn.Module], ...]:
+    """The classes of ``names`` that the installed transformers has."""
+    classes: list[type[nn.Module]] = []
+    for module_name, class_name in names:
+        try:
+            classes.append(getattr(importlib.import_module(module_name), class_name))
+        except (ImportError, AttributeError):
+            continue
+    return tuple(classes)
+
+
+def round_gated_norm_once(norm: nn.Module) -> None:
+    """Make one stock transformers GatedDeltaNet output norm evaluate in fp32 and round once, as vLLM's does.
+
+    The norm keeps its class, parameters and state-dict keys; only its forward is replaced. Any other module raises,
+    so a transformers release that changes the norm fails here instead of keeping the old rounding.
+    """
+    if not isinstance(norm, _resolve(_STOCK_GATED_NORMS)):
+        raise RuntimeError(
+            f"expected a stock transformers GatedDeltaNet output norm, got {type(norm).__module__}."
+            f"{type(norm).__qualname__}; its rounding is unknown, so it cannot be made to round once"
+        )
+    norm.forward = types.MethodType(_rms_norm_gated_once_forward, norm)
+
+
+def round_gated_norms_once(model: nn.Module) -> int:
+    """Make the output norm of every stock transformers Qwen GatedDeltaNet layer in ``model`` round once.
+
+    Returns how many norms were changed. A norm that is fla's ``FusedRMSNormGated`` already rounds once and is left
+    as it is. Models without these GatedDeltaNet layers are left alone.
+    """
+    gated_delta_net_classes = _resolve(_STOCK_GATED_DELTA_NETS)
+    changed = 0
+    for module in model.modules():
+        if not isinstance(module, gated_delta_net_classes):
+            continue
+        norm = module.get_submodule("norm")
+        if FusedRMSNormGated is not None and isinstance(norm, FusedRMSNormGated):
+            continue
+        round_gated_norm_once(norm)
+        changed += 1
+    return changed
