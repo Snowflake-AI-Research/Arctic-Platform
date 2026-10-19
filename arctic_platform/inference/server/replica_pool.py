@@ -194,7 +194,8 @@ def _kill_process_trees(
 
     def running(proc):
         try:
-            return proc.status() != psutil.STATUS_ZOMBIE
+            # is_running() also catches a pid reused since ``proc`` was made.
+            return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
         except psutil.NoSuchProcess:
             return False
         except psutil.Error:
@@ -988,9 +989,11 @@ class ReplicaPool:
         finally:
             for task in pending:
                 task.cancel()
+            # Only a worker whose graceful shutdown hung or failed has its own
+            # process SIGKILLed with its tree.
             await self._kill_workers_and_confirm(
                 workers,
-                [_shut_down_cleanly(task, pending) for task in tasks],
+                kill_roots=[not _shut_down_cleanly(task, pending) for task in tasks],
             )
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
@@ -998,7 +1001,7 @@ class ReplicaPool:
     async def _kill_workers_and_confirm(
         self,
         workers: list[ray.actor.ActorHandle],
-        shut_down_cleanly: list[bool] | None = None,
+        kill_roots: list[bool] | None = None,
     ) -> None:
         """Kill every worker with its process tree, and wait for it to die.
 
@@ -1007,22 +1010,23 @@ class ReplicaPool:
         workers it could not confirm. Never raises: it runs on error paths
         whose own exception is the one the caller has to see.
 
-        A worker that shut down cleanly goes through the same path, since
-        even then its engine's processes may have outlived the actor, but
-        only its descendants are SIGKILLed here: its own process is left to
-        ``ray.kill``, so an ordinary unload is not reported as a worker that
-        died unexpectedly. ``shut_down_cleanly`` defaults to all ``False``.
-        See the comment above :func:`_kill_process_trees`.
+        By default only each worker's descendants are SIGKILLed here,
+        collected while the worker still roots them, and its own process is
+        left to ``ray.kill``, so an ordinary unload or rebalance is not
+        reported as a worker that died unexpectedly. ``kill_roots`` marks the
+        workers whose own process is SIGKILLed with the tree as well: those
+        whose graceful shutdown hung or failed. See the comment above
+        :func:`_kill_process_trees`.
         """
         try:
-            await self._kill_workers_and_confirm_impl(workers, shut_down_cleanly or [False] * len(workers))
+            await self._kill_workers_and_confirm_impl(workers, kill_roots or [False] * len(workers))
         except Exception:
             logger.exception("Hard kill of %d inference workers failed", len(workers))
 
     async def _kill_workers_and_confirm_impl(
         self,
         workers: list[ray.actor.ActorHandle],
-        shut_down_cleanly: list[bool],
+        kill_roots: list[bool],
     ) -> None:
         if len(workers) == 0:
             return
@@ -1036,7 +1040,6 @@ class ReplicaPool:
         killed: list[tuple[str, str, set[int]]] = []
         try:
             records = await _bounded_to_thread(_read_actor_records, actor_ids, deadline=deadline)
-            kill_roots = [not clean for clean in shut_down_cleanly]
             killed = await _kill_actor_trees(records, labels, kill_roots, deadline)
         except Exception:
             logger.exception("Could not kill the process trees of %d inference workers", len(workers))
@@ -1451,21 +1454,24 @@ class ReplicaPool:
             raise RuntimeError("ReplicaPool not initialized")
 
         async with self._stream_lifecycle():
-            while len(self._workers) > target_count:
-                idx = len(self._workers) - 1
-                self._scheduler.mark_worker_unavailable(idx)
-                try:
-                    await self._scheduler.abort_streams(worker_idx=idx)
-                    await self._scheduler.drain_worker(idx)
-                finally:
-                    worker = self._workers.pop()
-                    if len(self._slots) > len(self._workers):
-                        self._slots.pop()
+            removed: list[ray.actor.ActorHandle] = []
+            try:
+                while len(self._workers) > target_count:
+                    idx = len(self._workers) - 1
+                    self._scheduler.mark_worker_unavailable(idx)
                     try:
-                        await self._kill_workers_and_confirm([worker])
+                        await self._scheduler.abort_streams(worker_idx=idx)
+                        await self._scheduler.drain_worker(idx)
                     finally:
+                        removed.append(self._workers.pop())
+                        if len(self._slots) > len(self._workers):
+                            self._slots.pop()
                         self._scheduler.remove_last_worker()
-                    logger.info(f"Scaled down: removed worker {idx}")
+                        logger.info(f"Scaled down: removed worker {idx}")
+            finally:
+                # One kill for all of them, still under the lock, so a
+                # scale_up cannot hand their GPUs out before they are free.
+                await self._kill_workers_and_confirm(removed)
 
     async def scale_up(self, target_count: int) -> None:
         """Add workers until *target_count* are running.

@@ -371,23 +371,56 @@ def _ready_pool(monkeypatch, worker_cls, workers):
     pool._slots = [(None, idx) for idx in range(len(workers))]
     pool._scheduler = _Scheduler()
     hard_kills: list[list[int]] = []
+    pool.kill_roots_seen = []
 
-    async def kill_workers_and_confirm(workers, shut_down_cleanly=None):
+    async def kill_workers_and_confirm(workers, kill_roots=None):
         hard_kills.append([worker.index for worker in workers])
+        pool.kill_roots_seen.append(kill_roots)
         pool._scheduler.events.append(f"hard-killed {[worker.index for worker in workers]}")
 
     monkeypatch.setattr(pool, "_kill_workers_and_confirm", kill_workers_and_confirm)
     return pool, hard_kills
 
 
-def test_scale_down_hard_kills_the_removed_worker(monkeypatch):
-    pool, hard_kills = _ready_pool(monkeypatch, _WorkerClass(fail_init_index=-1), [_Actor(0), _Actor(1)])
+def test_scale_down_hard_kills_all_removed_workers_at_once(monkeypatch):
+    workers = [_Actor(0), _Actor(1), _Actor(2)]
+    pool, hard_kills = _ready_pool(monkeypatch, _WorkerClass(fail_init_index=-1), workers)
 
     asyncio.run(pool.scale_down(1))
 
-    assert hard_kills == [[1]]
-    assert pool._scheduler.events[-2:] == ["hard-killed [1]", "removed"]
-    assert len(pool._workers) == 1
+    # One call for both, after both have left the scheduler, with the roots
+    # left to ray.kill.
+    assert hard_kills == [[2, 1]]
+    assert pool.kill_roots_seen == [None]
+    assert pool._scheduler.events == [
+        "unavailable 2",
+        "removed",
+        "unavailable 1",
+        "removed",
+        "hard-killed [2, 1]",
+    ]
+    assert pool._workers == [workers[0]]
+
+
+def test_scale_down_leaves_roots_to_ray_kill(monkeypatch, caplog):
+    gcs = _FakeGcs()
+    workers = [_Actor(0), _Actor(1), _Actor(2)]
+    for worker in workers:
+        gcs.add(worker.actor_id, pid=100 + worker.index)
+    seen = _install(monkeypatch, gcs)
+    caplog.set_level(logging.ERROR, logger=_LOGGER)
+
+    pool = ReplicaPool()
+    pool._config = _config()
+    pool._workers = list(workers)
+    pool._scheduler = _Scheduler()
+    asyncio.run(pool.scale_down(1))
+
+    start_s = _START_MS / 1000.0
+    assert seen.tree_kills == [("node-a", [(102, start_s, False), (101, start_s, False)])]
+    assert sorted(seen.killed) == ["actor1", "actor2"]
+    assert gcs.observed_dead == {"actor1", "actor2"}
+    assert _errors(caplog) == []
 
 
 def test_scale_up_init_failure_hard_kills_the_new_worker(monkeypatch):
@@ -398,6 +431,7 @@ def test_scale_up_init_failure_hard_kills_the_new_worker(monkeypatch):
         asyncio.run(pool.scale_up(1))
 
     assert hard_kills == [[0]]
+    assert pool.kill_roots_seen == [None]
     assert pool._workers == []
 
 
@@ -417,6 +451,7 @@ def test_single_node_restart_waits_for_old_worker_death_before_replacing(monkeyp
     asyncio.run(pool._restart_worker(0))
 
     assert made_after_kill == [True]
+    assert pool.kill_roots_seen == [None]
     assert pool._workers == [worker_cls.actors[0]]
 
 
@@ -428,6 +463,7 @@ def test_single_node_restart_hard_kills_a_replacement_that_fails(monkeypatch):
         asyncio.run(pool._restart_worker(0))
 
     assert hard_kills == [[99], [0]]
+    assert pool.kill_roots_seen == [None, None]
 
 
 # ----------------------------------------------------------------------
