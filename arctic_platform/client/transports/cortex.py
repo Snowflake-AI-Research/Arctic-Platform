@@ -112,6 +112,21 @@ def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dic
     return encode
 
 
+def _unchunked_octet(request: Request, body: dict) -> list[Send]:
+    """One DSSST1 octet body; the route has no chunk reassembly, so an oversized frame is refused."""
+    frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
+    if len(frame) > _MAX_OCTET_BYTES:
+        raise ValueError(
+            f"cortex {request.op} body is {len(frame) / 2**20:.1f} MiB, over the "
+            f"{_MAX_OCTET_BYTES // 2**20} MiB cap; send fewer or shorter prompts"
+        )
+    return [{"data": frame, "headers": _OCTET_HEADERS}]
+
+
+def _status_query(request: Request, body: dict) -> list[Send]:
+    return [{"params": {"max_events": body["max_events"]}}]
+
+
 def _forward(request: Request, body: dict) -> list[Send]:
     """One /operation envelope per slice of the forward frame.
 
@@ -187,6 +202,20 @@ def _unwrap_forward_payload(result: dict) -> dict:
     if not isinstance(result, dict) or not isinstance(result.get("payload_b64"), str):
         return result
     return wire.loads(base64.b64decode(result["payload_b64"]))
+
+
+def _request_status(status: dict) -> dict:
+    """A poll reply -> ``{"state": "running"|"done"|"failed", "error", "events"}`` with results decoded."""
+    state = _short(status.get("status"))
+    events = [
+        {**event, "result": _to_python(_decode_result(event["result"]))} if event.get("type") == "result" else event
+        for event in status.get("events") or []
+    ]
+    return {
+        "state": "done" if state in _REQUEST_DONE else "failed" if state in _REQUEST_FAILED else "running",
+        "error": status.get("error", ""),
+        "events": events,
+    }
 
 
 def _to_python(obj: Any) -> Any:
@@ -320,6 +349,17 @@ _ROUTES = {
     "generate": _Route(
         method="POST", path="/{job}/generate", encode=_octet("generate"), poll=True, normalize=_to_python
     ),
+    # Answers {request_id, count} at once; events are read with request-status. A replay
+    # would start a second generation nobody reads.
+    "generate-stream": _Route(
+        method="POST", path="/{job}/generate-stream", encode=_unchunked_octet, policy=_NO_REPLAY
+    ),
+    # Each poll drains the events it returns from the server.
+    "request-status": _Route(
+        method="GET", path="/{job}/requests/{request_id}", encode=_status_query, normalize=_request_status
+    ),
+    # An /operation that is never polled: its acknowledgement may name the cancelled request.
+    "cancel-request": _Route(method="POST", path="/{job}/operation"),
     "forward": _Route(
         method="POST", path="/{job}/operation", encode=_forward, poll=True, normalize=_unwrap_forward_payload
     ),
