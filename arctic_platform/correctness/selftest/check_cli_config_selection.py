@@ -18,8 +18,12 @@
 from __future__ import annotations
 
 import json
+import os
+import runpy
 from argparse import Namespace
 from pathlib import Path
+
+import pytest
 
 from arctic_platform.correctness import __main__ as cli
 from arctic_platform.correctness.selftest.config_factory import native_config
@@ -36,22 +40,23 @@ def _args(config_dir: Path, *, any_gpu: bool = False, config: str | None = None)
     return Namespace(all_configs=config is None, any_gpu=any_gpu, config_dir=str(config_dir), config=config)
 
 
-def test_cli_restarts_once_with_ray_token_auth(monkeypatch) -> None:
-    calls = []
-    monkeypatch.delenv("RAY_AUTH_MODE", raising=False)
-    monkeypatch.setattr(cli.sys, "argv", ["correctness", "run", "--all-configs"])
-    monkeypatch.setattr(cli.os, "execv", lambda executable, argv: calls.append((executable, argv)))
+@pytest.mark.parametrize("auth_mode", [None, "disabled", "token"])
+def test_cli_entry_preserves_ray_auth_mode(monkeypatch, auth_mode) -> None:
+    if auth_mode is None:
+        monkeypatch.delenv("RAY_AUTH_MODE", raising=False)
+    else:
+        monkeypatch.setenv("RAY_AUTH_MODE", auth_mode)
+    monkeypatch.setattr(cli.sys, "argv", ["correctness", "--help"])
 
-    cli._restart_with_ray_token_auth()
-    cli._restart_with_ray_token_auth()
+    def forbidden_restart(*args):
+        pytest.fail("the correctness CLI must not reexec to change Ray authentication")
 
-    assert cli.os.environ["RAY_AUTH_MODE"] == "token"
-    assert calls == [
-        (
-            cli.sys.executable,
-            [cli.sys.executable, "-m", "arctic_platform.correctness", "run", "--all-configs"],
-        )
-    ]
+    monkeypatch.setattr(os, "execv", forbidden_restart)
+    with pytest.raises(SystemExit) as exited:
+        runpy.run_module("arctic_platform.correctness", run_name="__main__")
+
+    assert exited.value.code == 0
+    assert os.environ.get("RAY_AUTH_MODE") == auth_mode
 
 
 def test_all_configs_selects_only_the_local_gpu_family(tmp_path: Path, monkeypatch) -> None:

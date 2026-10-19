@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 from dataclasses import dataclass
 from dataclasses import field
@@ -40,6 +41,55 @@ from .workdir import require_data_fast_path
 
 _STAGE_CHECKPOINT_ID = re.compile(r"/checkpoints/(cp_[0-9a-fA-F-]+)/")
 _LOCAL_CHECKPOINT_TAG = re.compile(r"global_step(0|[1-9][0-9]*)")
+_LOCAL_CHECKPOINT_ID = re.compile(r"cp_[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+
+@dataclass(frozen=True)
+class LocalCortexCheckpoint(Checkpoint):
+    checkpoint_path: str
+    checkpoint_tag: str
+    version: int
+    stage_info: dict | None = field(default=None, repr=False)
+
+
+def require_local_checkpoint_id(value: str) -> str:
+    if not isinstance(value, str) or _LOCAL_CHECKPOINT_ID.fullmatch(value) is None:
+        raise ValueError("local checkpoint load requires a durable cp_<uuid> checkpoint_id, not a FAST path or tag")
+    return value
+
+
+def _local_stage_info(value: dict | None, checkpoint_id: str) -> dict | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, dict)
+        or value.get("location_type") not in ("S3", "AZURE", "GCS")
+        or any(not isinstance(value.get(key), str) or not value[key] for key in ("bucket", "prefix"))
+        or set(value) - {"location_type", "bucket", "prefix", "region", "cred_expiry_time_ms", "aws", "azure", "gcp"}
+    ):
+        raise ValueError("local checkpoint load requires explicit cloud stage_info, not a filesystem restore address")
+    if (
+        value["bucket"].startswith("/")
+        or "://" in value["bucket"]
+        or value["prefix"].rstrip("/").rsplit("/", 1)[-1] != checkpoint_id
+        or any(part in {".", ".."} for part in value["prefix"].split("/"))
+    ):
+        raise ValueError("local checkpoint stage prefix must name the requested durable checkpoint_id")
+    try:
+        return json.loads(json.dumps(value, allow_nan=False))
+    except (TypeError, ValueError):
+        raise ValueError("local checkpoint stage_info must be JSON metadata") from None
+
+
+def _local_load_metadata(result: dict, checkpoint_id: str) -> dict:
+    if not isinstance(result, dict) or result.get("checkpoint_id") != checkpoint_id:
+        raise RuntimeError("local checkpoint load returned a different or missing checkpoint_id")
+    tag = result.get("checkpoint_tag")
+    match = _LOCAL_CHECKPOINT_TAG.fullmatch(tag) if isinstance(tag, str) else None
+    version = result.get("version")
+    if match is None or type(version) is not int or version != int(match.group(1)):
+        raise RuntimeError("local checkpoint load returned inconsistent checkpoint_tag/version")
+    return result
 
 
 def read_pat(path: str | Path) -> str:
@@ -141,13 +191,18 @@ def require_local_cortex_gateway(backend: CortexConfig) -> None:
 
 def save_local_checkpoint(client: ArcticClient, checkpoint_type: str) -> Path:
     """Retain a local DSS save without a hosted catalog or stage credentials."""
+    root, _ = _save_local_checkpoint(client, checkpoint_type)
+    return root
+
+
+def _save_local_checkpoint(client: ArcticClient, checkpoint_type: str) -> tuple[Path, dict]:
     if checkpoint_type not in {"resumable", "weights-only"}:
         raise ValueError("local checkpoint_type must be resumable or weights-only")
     root = require_data_fast_path(correctness_workdir("cortex-checkpoint-"), label="local checkpoint save")
     result = client.save_checkpoint(path=str(root), checkpoint_type=checkpoint_type)
     _local_checkpoint_metadata(result, root, "save")
     # Keep successful and partial saves: the correctness caller never owns deletion.
-    return root
+    return root, result
 
 
 def _local_checkpoint_metadata(result: dict, root: Path, operation: str) -> str:
@@ -198,7 +253,22 @@ class HostedTrainingJob:
 
     def save_resumable(self) -> Checkpoint:
         if self.local_gateway:
-            return Checkpoint(reference=str(save_local_checkpoint(self.client, "resumable")), source_job=self.job_id)
+            root, result = _save_local_checkpoint(self.client, "resumable")
+            checkpoint_id = result.get("checkpoint_id")
+            if checkpoint_id is None:
+                raise RuntimeError(
+                    "local resumable save returned only a FAST path/tag; the gateway has no durable checkpoint "
+                    "catalog, so cross-job resume is unavailable (saved files retained)"
+                )
+            require_local_checkpoint_id(checkpoint_id)
+            return LocalCortexCheckpoint(
+                reference=checkpoint_id,
+                source_job=self.job_id,
+                checkpoint_path=str(root),
+                checkpoint_tag=result["checkpoint_tag"],
+                version=result["version"],
+                stage_info=_local_stage_info(result.get("stage_info"), checkpoint_id),
+            )
         return Checkpoint(
             reference=save_and_resolve_checkpoint_id(self.client, self.job_id, "resumable"),
             source_job=self.job_id,
@@ -235,14 +305,29 @@ class HostedTransport:
         if local_gateway:
             require_local_cortex_gateway(self.backend)
         local_checkpoint = None
-        local_tag = None
         source = None
         if resume_from is not None:
             if local_gateway:
-                if not Path(resume_from.reference).is_absolute():
-                    raise ValueError("local checkpoint resume requires an absolute /data-fast path")
-                local_checkpoint = require_data_fast_path(resume_from.reference, label="local checkpoint resume")
-                local_tag = _local_resume_tag(local_checkpoint)
+                if not isinstance(resume_from, LocalCortexCheckpoint):
+                    raise ValueError(
+                        "local cross-job resume requires a saved durable checkpoint identity with explicit stage_info;"
+                        " FAST paths and source_job_id cannot be loaded by this gateway"
+                    )
+                require_local_checkpoint_id(resume_from.reference)
+                if _local_stage_info(resume_from.stage_info, resume_from.reference) is None:
+                    raise RuntimeError(
+                        "local cross-job resume requires explicit stage_info; this gateway cannot resolve "
+                        "another parent's checkpoint store"
+                    )
+                _local_load_metadata(
+                    {
+                        "checkpoint_id": resume_from.reference,
+                        "checkpoint_tag": resume_from.checkpoint_tag,
+                        "version": resume_from.version,
+                    },
+                    resume_from.reference,
+                )
+                local_checkpoint = resume_from
             else:
                 source = {"checkpoint_id": resume_from.reference, "source_job_id": resume_from.source_job}
         config = training_client_config(
@@ -253,8 +338,11 @@ class HostedTransport:
         )
         with ArcticClient(config) as client:
             if local_checkpoint is not None:
-                result = client.load_checkpoint(path=str(local_checkpoint))
-                if _local_checkpoint_metadata(result, local_checkpoint, "load") != local_tag:
+                result = client.transport.load_checkpoint(
+                    local_checkpoint.reference,
+                    stage_info=local_checkpoint.stage_info,
+                )
+                if result["checkpoint_tag"] != local_checkpoint.checkpoint_tag:
                     raise RuntimeError("local checkpoint load restored a different global step")
             job_id = str(client.jobs.require("training")).split(":", 1)[0]
             print(f"  Cortex job {job_id} ready for {self.cfg.config_id}", flush=True)

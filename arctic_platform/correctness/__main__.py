@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
@@ -298,6 +297,10 @@ def _run_vocab_size(
 def cmd_run(args) -> int:
     started = time.monotonic()
     backend = _client_backend(args)
+    if getattr(args, "reference_records_dir", None) is not None:
+        from .harness.reference_records import require_git_records_dir
+
+        args.reference_records_dir = require_git_records_dir(args.reference_records_dir)
     remote = isinstance(backend, CortexConfig)
     fixture_path = getattr(args, "cortex_fixture", None)
     local_fixture = getattr(args, "local_cortex_fixture", False)
@@ -518,6 +521,11 @@ def cmd_run(args) -> int:
                     **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
                     **({"local_cortex_fixture": True} if local_fixture else {}),
                     **({"local_gateway_full_model": True} if local_full_model else {}),
+                    **(
+                        {"reference_records_dir": Path(args.reference_records_dir)}
+                        if getattr(args, "reference_records_dir", None) is not None
+                        else {}
+                    ),
                 )
             )
 
@@ -651,6 +659,11 @@ def main(argv=None) -> int:
     )
     r.add_argument("--out", default="correctness-report")
     r.add_argument(
+        "--reference-records-dir",
+        type=Path,
+        help="Git-tracked prepared HF records; missing records require explicit onboarding",
+    )
+    r.add_argument(
         "--cortex-fixture",
         type=Path,
         help="verified publication binding from a supported publisher; keeps HF local and selects the Cortex model",
@@ -713,14 +726,5 @@ def main(argv=None) -> int:
     return args.func(args)
 
 
-def _restart_with_ray_token_auth() -> None:
-    """Start the CLI with Ray token mode set before any dependency imports Ray."""
-    if os.environ.get("RAY_AUTH_MODE") == "token":
-        return
-    os.environ["RAY_AUTH_MODE"] = "token"
-    os.execv(sys.executable, [sys.executable, "-m", "arctic_platform.correctness", *sys.argv[1:]])
-
-
 if __name__ == "__main__":
-    _restart_with_ray_token_auth()
     sys.exit(main())

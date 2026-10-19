@@ -153,6 +153,20 @@ def apply_peft(
     if peft_config is None:
         return model
 
+    initialization = None
+    if "deterministic_init" in peft_config:
+        from arctic_platform.common.peft import normalize_lora_initialization
+        from arctic_platform.common.peft import normalize_lora_peft_config
+
+        topology = dict(peft_config)
+        initialization = normalize_lora_initialization(topology.pop("deterministic_init"))
+        # The public DSS spelling is Lora; direct AP callers may use PEFT's LORA.
+        topology["peft_type"] = "Lora" if topology.get("peft_type") == "LORA" else topology.get("peft_type")
+        normalize_lora_peft_config({**topology, "deterministic_init": initialization})
+        if getattr(getattr(model, "config", None), "model_type", None) != "qwen3":
+            raise ValueError("deterministic LoRA initialization currently supports dense Qwen3 only")
+        peft_config = {key: value for key, value in peft_config.items() if key != "deterministic_init"}
+
     import peft
 
     config = _resolve_peft_config_class(peft, peft_config)(**peft_config)
@@ -161,6 +175,10 @@ def apply_peft(
         cast_trainable_params_off_fp8(model, optimization_dtype)
     else:
         model = peft.get_peft_model(model, config)
+    if initialization is not None:
+        from arctic_platform.model.lora_initialization import initialize_lora_factors
+
+        initialize_lora_factors(model, initialization)
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
     from arctic_platform.model.patches.tiled_mlp import register_tiled_mlp_peft_parameter_wrappers
@@ -171,6 +189,9 @@ def apply_peft(
 
 @register_patch("peft")
 def apply_peft_patch(model: nn.Module, ctx: LoaderContext) -> nn.Module:
+    if (ctx.spec.patches.peft or {}).get("deterministic_init") is not None:
+        if ctx.spec.parallelism.expert_parallel != 1 or ctx.spec.parallelism.sequence_parallel != 1:
+            raise ValueError("deterministic LoRA initialization currently requires dense EP1/SP1")
     dtype = torch.bfloat16 if ctx.spec.dtype == "auto" else getattr(torch, ctx.spec.dtype)
     fp8_base = model_has_fp8_weights(model)
     wrapped = apply_peft(model, ctx.spec.patches.peft, optimization_dtype=dtype)

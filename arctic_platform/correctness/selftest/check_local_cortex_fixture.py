@@ -219,9 +219,21 @@ def test_execution_transport_stays_on_unauthenticated_loopback(monkeypatch):
     from arctic_platform.correctness.harness.cortex_transport import CorrectnessCortexTransport
 
     transport = CorrectnessCortexTransport(CortexConfig(base_url="http://127.0.0.1:8003"))
-    assert transport.session.trust_env is False
     sent = {}
-    monkeypatch.setattr(CortexTransport, "_send", lambda self, method, url, **kwargs: sent.update(kwargs))
-    transport._send("GET", f"{transport._prefix}/p1")
-    assert sent["allow_redirects"] is False
-    transport.session.close()
+
+    async def send(self, method, url, **kwargs):
+        assert method == "GET" and url == f"{transport._prefix}/p1"
+        sent.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(CortexTransport, "_send", send)
+    try:
+        assert transport._on_loop(transport._send("GET", f"{transport._prefix}/p1")).result() == {}
+        session = transport._session
+        assert session is not None and session.trust_env is False
+        assert "Authorization" not in session.headers
+        assert sent["allow_redirects"] is False
+    finally:
+        transport.shutdown()
+    assert session.closed
+    assert transport._session is None

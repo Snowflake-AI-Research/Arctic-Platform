@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Single-GPU HuggingFace forward-backward, with no parallelism and no offload.
+"""Single-GPU HuggingFace forward-backward, with no parallelism.
+
+Qwen4's frozen PLE lookup table stays on CPU; its upstream lookup returns the selected rows to CUDA.
 
 Two properties make this usable as a golden truth for a config that needs eight GPUs.
 
@@ -147,7 +149,14 @@ def build_engine(
     torch_dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     cls = getattr(transformers, cfg.architectures[0])
-    model = cls.from_pretrained(model_path, dtype=torch_dtype, attn_implementation=attn_implementation).to(device)
+    if getattr(cfg, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}:
+        from arctic_platform.correctness.reference.qwen4_reference import load_qwen4_reference
+
+        model = load_qwen4_reference(
+            cls, model_path, dtype=torch_dtype, attn_implementation=attn_implementation, device=device
+        )
+    else:
+        model = cls.from_pretrained(model_path, dtype=torch_dtype, attn_implementation=attn_implementation).to(device)
     if peft_adapter_path:
         from peft import PeftModel
 

@@ -92,6 +92,9 @@ VALIDATION_SPLIT = Path("/code/shared/gsm8k/test.parquet")
 
 TRAIN_STEPS = 10
 
+_EXPORT_JSON_LIMIT_BYTES = 16 * 1024 * 1024
+_TOKENIZER_JSON_LIMIT_BYTES = 32 * 1024 * 1024
+
 # Fixed, and deliberately not calibrated. The two sides are one set of weights read by two engines, so
 # there is no engine-to-engine spread for a calibration to size: a checkpoint that carries the model
 # reproduces the loss. A measurement above the accelerator-family gate is the check's finding, not noise.
@@ -104,11 +107,75 @@ B200_TOLERANCE = 3e-3
 # gateway's own default is 1 (arctic_platform/client/requests.py:181) while the zone body's is 0.
 LOG_PROB_TOP_K = 0
 
-# The sampling zone uses a separate GPU and a bounded prefill batch. The full configured model must fit
-# this serving placement; a memory failure must not silently substitute reduced weights.
+# Default sampling uses one GPU and a bounded prefill batch. Explicit Flash-Next topology is opt-in;
+# neither placement may substitute reduced weights after a memory failure.
 SAMPLING_GPUS = 1
+_FLASHNEXT_CONFIG_ID = "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k"
 
 QUANTITY = "validation cross entropy over answer tokens"
+
+
+def _sampling_topology(ctx) -> tuple[int, int, int]:
+    topology = getattr(ctx, "inference_sampling_topology", None)
+    if topology is None:
+        return SAMPLING_GPUS, SAMPLING_GPUS, 1
+    if (
+        not isinstance(topology, tuple)
+        or len(topology) != 3
+        or any(type(size) is not int or size <= 0 for size in topology)
+        or topology[0] != topology[1] * topology[2]
+    ):
+        raise ValueError("inference sampling topology requires positive integer allocation, TP and PP with GPUs=TP*PP")
+    if (
+        ctx.cfg.config_id != _FLASHNEXT_CONFIG_ID
+        or ctx.cfg.model_name != "Qwen/Qwen3.8-Flash-Next"
+        or ctx.cfg.n_gpus != 16
+        or topology not in ((8, 8, 1), (16, 8, 2))
+    ):
+        raise ValueError("explicit inference sampling topology is restricted to the original 16-GPU Flash-Next config")
+    return topology
+
+
+def sampling_gpu_count(ctx) -> int:
+    return _sampling_topology(ctx)[0]
+
+
+def _sampling_payload(ctx, model_path, token_budget: int) -> dict:
+    allocation, tensor, pipeline = _sampling_topology(ctx)
+    payload = sampling_payload(
+        model_path,
+        SEED,
+        dtype=str(ctx.cfg.sub_job.get("dtype") or ctx.cfg.training.get("dtype") or "bfloat16"),
+        n_gpus=allocation,
+        max_seq_len=token_budget + 1,
+    )
+    if getattr(ctx, "inference_sampling_topology", None) is not None:
+        payload["inference_config"]["vllm_config"].update(
+            tensor_parallel_size=tensor,
+            pipeline_parallel_size=pipeline,
+            enable_expert_parallel=True,
+            extra_engine_kwargs={
+                "distributed_executor_backend": "ray",
+                "data_parallel_size": 1,
+                "prefill_context_parallel_size": 1,
+                "decode_context_parallel_size": 1,
+                "enable_eplb": False,
+                "enable_elastic_ep": False,
+                "engram_config": {
+                    "cpu_offload": False,
+                    "embedding_across_dp": False,
+                    "dp_shared_memory": False,
+                    "use_thp": False,
+                },
+            },
+        )
+    return payload
+
+
+def _cortex_sampling_parallelism(ctx) -> dict:
+    if getattr(ctx, "inference_sampling_topology", None) is None:
+        return {}
+    return {"inference_tensor_parallel_size": _sampling_topology(ctx)[1]}
 
 
 @correctness_test(
@@ -301,13 +368,7 @@ def cortex_sampling_config(
     model_name = _full_model_name(ctx)
     if not checkpoint_id.startswith("cp_") or not source_job_id:
         raise ValueError("managed sampling requires a durable checkpoint_id and source_job_id")
-    payload = sampling_payload(
-        model_name,
-        SEED,
-        dtype=str(ctx.cfg.sub_job.get("dtype") or ctx.cfg.training.get("dtype") or "bfloat16"),
-        n_gpus=SAMPLING_GPUS,
-        max_seq_len=token_budget + 1,
-    )
+    payload = _sampling_payload(ctx, model_name, token_budget)
     payload["job_type"] = "sampling"
     config = _inference_client_config(payload, backend=backend)
     return CortexTrainingConfig.model_validate(
@@ -315,6 +376,7 @@ def cortex_sampling_config(
             **config.model_dump(),
             "hardware": ctx.cfg.gpu_type.upper() if ctx.cfg.gpu_type is not None else None,
             "source_checkpoint_info": {"checkpoint_id": checkpoint_id, "source_job_id": source_job_id},
+            **_cortex_sampling_parallelism(ctx),
         }
     )
 
@@ -359,9 +421,10 @@ def materialize_checkpoint_tokenizer(tokenizer, checkpoint_path: str | Path) -> 
 def _export_json(path: Path) -> dict:
     if path.is_symlink() or not path.is_file():
         raise RuntimeError(f"local HF export requires a regular file: {path.name}")
+    limit = _TOKENIZER_JSON_LIMIT_BYTES if path.name == "tokenizer.json" else _EXPORT_JSON_LIMIT_BYTES
     with path.open("rb") as stream:
-        data = stream.read(16 * 1024 * 1024 + 1)
-    if len(data) > 16 * 1024 * 1024:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
         raise RuntimeError(f"local HF export metadata exceeds its bound: {path.name}")
     value = json.loads(data)
     if not isinstance(value, dict):
@@ -375,12 +438,41 @@ def validate_local_inference_export(ctx, weights_dir: Path) -> Path:
     from transformers import AutoConfig
     from transformers.utils.hub import cached_file
 
+    from ..harness.inference_export import FAMILIES
+    from ..harness.inference_export import read_export_json
+    from ..harness.inference_export import read_inventory
+    from ..harness.inference_export import validate_qwen4_full_config
+    from ..harness.inference_export import validate_qwen4_full_schema
+    from ..harness.inference_export import validate_text_projection
+
     canonical = require_data_fast_path(weights_dir, label="local inference HF export")
     if weights_dir != canonical or weights_dir.is_symlink() or not weights_dir.is_dir():
         raise RuntimeError("local inference requires a regular exported directory")
     weights_dir = canonical
     source = AutoConfig.from_pretrained(_full_model_name(ctx), local_files_only=True)
     exported = _export_json(weights_dir / "config.json")
+    if source.model_type in FAMILIES and exported.get("model_type") != source.model_type:
+        source_config = require_data_fast_path(
+            Path(cached_file(_full_model_name(ctx), "config.json", local_files_only=True)),
+            label="local full-model config",
+        )
+        source_index = require_data_fast_path(
+            Path(cached_file(_full_model_name(ctx), "model.safetensors.index.json", local_files_only=True)),
+            label="local full-model index",
+        )
+        if source_config.parent != source_index.parent:
+            raise RuntimeError("local full-model config and tensor index must belong to one snapshot")
+        original_config = read_export_json(source_config)
+        if original_config.get("model_type") != source.model_type:
+            raise RuntimeError("local full-model configuration identity changed")
+        original_schema = read_inventory(source_index.parent, read_export_json(source_index))
+        exported_schema = read_inventory(weights_dir, read_export_json(weights_dir / "model.safetensors.index.json"))
+        receipt = validate_text_projection(
+            original_config, read_export_json(weights_dir / "config.json"), original_schema, exported_schema
+        )
+        if receipt is None:
+            raise RuntimeError("local text-export configuration identity changed")
+        return weights_dir
     for field in (
         "model_type",
         "architectures",
@@ -397,6 +489,22 @@ def validate_local_inference_export(ctx, weights_dir: Path) -> Path:
     if exported.get("auto_map"):
         raise RuntimeError("local HF export must not require remote code")
     source_index = cached_file(_full_model_name(ctx), "model.safetensors.index.json", local_files_only=True)
+    if source.model_type == "qwen4_exp":
+        source_index = require_data_fast_path(Path(source_index), label="local full-model index")
+        source_config = require_data_fast_path(
+            Path(cached_file(_full_model_name(ctx), "config.json", local_files_only=True)),
+            label="local full-model config",
+        )
+        if source_config.parent != source_index.parent:
+            raise RuntimeError("local full-model config and tensor index must belong to one snapshot")
+        original_config = read_export_json(source_config)
+        if original_config.get("model_type") != source.model_type:
+            raise RuntimeError("local full-model configuration identity changed")
+        validate_qwen4_full_config(original_config, exported)
+        original_schema = read_inventory(source_index.parent, read_export_json(source_index))
+        exported_schema = read_inventory(weights_dir, read_export_json(weights_dir / "model.safetensors.index.json"))
+        validate_qwen4_full_schema(original_schema, exported_schema)
+        return weights_dir
     expected = _export_json(require_data_fast_path(Path(source_index), label="local full-model index"))
     index = _export_json(weights_dir / "model.safetensors.index.json")
     mapping = index.get("weight_map")
@@ -463,24 +571,20 @@ def save_local_inference_checkpoint(ctx, backend: CortexConfig, client, tokenize
 def local_cortex_sampling_config(ctx, backend: CortexConfig, weights_dir: Path, token_budget: int):
     require_local_cortex_gateway(backend)
     weights_dir = validate_local_inference_export(ctx, weights_dir)
-    payload = sampling_payload(
-        str(weights_dir),
-        SEED,
-        dtype=str(ctx.cfg.sub_job.get("dtype") or ctx.cfg.training.get("dtype") or "bfloat16"),
-        n_gpus=SAMPLING_GPUS,
-        max_seq_len=token_budget + 1,
-    )
+    payload = _sampling_payload(ctx, str(weights_dir), token_budget)
     payload["job_type"] = "sampling"
     config = _inference_client_config(payload, backend=backend)
     return CortexTrainingConfig.model_validate(
         {
             **config.model_dump(),
             "hardware": ctx.cfg.gpu_type.upper() if ctx.cfg.gpu_type is not None else None,
+            **_cortex_sampling_parallelism(ctx),
         }
     )
 
 
 def _run(ctx) -> TestResult:
+    sampling_gpus = sampling_gpu_count(ctx)
     backend = getattr(ctx, "client_backend", None)
     backend = backend if backend is not None else OnPremConfig()
     managed = isinstance(backend, CortexConfig)
@@ -488,6 +592,11 @@ def _run(ctx) -> TestResult:
     if local:
         require_local_cortex_gateway(backend)
     model_path = _full_model_name(ctx)
+    gateway_slots = (
+        max(ctx.cfg.n_gpus, sampling_gpus)
+        if getattr(ctx, "inference_sampling_topology", None) is not None
+        else ctx.cfg.n_gpus + sampling_gpus
+    )
     tokenizer = gsm8k.load_tokenizer(model_path)
     pad_id = gsm8k.padding_token_id(tokenizer)
     learning_rate = configured_learning_rate(ctx.cfg)
@@ -531,7 +640,7 @@ def _run(ctx) -> TestResult:
         validation_body["processing"].pop("return_logprobs")
     training_bodies = [pack(batch, model_provider=provider) for batch in train_batches]
 
-    with gateway(gateway_dir, ctx.cfg.n_gpus + SAMPLING_GPUS, backend=backend) as url:
+    with gateway(gateway_dir, gateway_slots, backend=backend) as url:
         with running_job(url, payload) as training_job:
             losses = [
                 fwd_bwd_step(url, training_job, body, learning_rate=learning_rate).avg_loss for body in training_bodies
@@ -610,13 +719,7 @@ def _run(ctx) -> TestResult:
 
 
 def _onprem_sampling_and_reload(ctx, session, weights_dir, token_budget, examples, validation_body):
-    sampling = sampling_payload(
-        weights_dir,
-        SEED,
-        dtype=str(ctx.cfg.sub_job.get("dtype") or ctx.cfg.training.get("dtype") or "bfloat16"),
-        n_gpus=SAMPLING_GPUS,
-        max_seq_len=token_budget + 1,
-    )
+    sampling = _sampling_payload(ctx, weights_dir, token_budget)
     with running_job(session, sampling) as sampling_job:
         target_rows = target_answer_logprobs(
             log_probs(

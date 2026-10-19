@@ -20,10 +20,9 @@ the same roles the gradient and optimizer checks use. What is new is duration: o
 forwards, and a hundred steps compares two *trajectories*, so the optimizer state each engine carries is
 under test as well as the arithmetic of any one step.
 
-Both engines read one materialized copy of the run's inputs. The per-step batches and the held-out batch
-are written to disk before either engine starts, the reference process loads those files and the Arctic Platform
-requests are packed from the same files, so "the two runs consumed identical inputs" is a property of the
-bytes rather than of two code paths agreeing.
+Explicit onboarding runs HF once and publishes compact scalar measurements with input reconstruction
+identities. Regression recreates the same ordered batches, validates their semantic hashes against the
+prepared record, and runs only Arctic Platform. Missing or incompatible records never trigger HF.
 
 The verdict compares two numbers: the final step's training loss and the held-out validation loss. The
 whole per-step trajectory is recorded from both engines and reported beside them as a diagnostic. It is
@@ -46,6 +45,8 @@ obvious failure.
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import subprocess
 import sys
@@ -62,6 +63,7 @@ from arctic_platform.client import CortexConfig
 from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
 
 from ..harness import gsm8k
+from ..harness import reference_records
 from ..harness.arms import correctness_microbatch_tokens
 from ..harness.batches import Batch
 from ..harness.batches import load
@@ -90,6 +92,8 @@ from .inference_checkpoint_loss import cross_entropy
 from .inference_checkpoint_loss import reference_answer_logprobs
 
 TEST_ID = "e2e-sft-train-validate"
+GSM8K_DATA_ROOT_ENV = "DSS_CORRECTNESS_GSM8K_ROOT"
+logger = logging.getLogger(__name__)
 
 # The recipe length the criterion names: "~100 step SFT recipe with HF".
 TRAIN_STEPS = 100
@@ -138,6 +142,16 @@ class Replay:
     @property
     def steps(self) -> int:
         return len(self.train_batch_paths)
+
+
+@dataclass(frozen=True)
+class PreparedInputs:
+    replay: Replay
+    validation_examples: List[gsm8k.Example]
+    recipe: dict
+    measured: Dict[str, float]
+    workdir: Path
+    peft_adapter_path: Path | None = None
 
 
 def replay_batches(examples: Sequence[gsm8k.Example], rows_per_step: int, steps: int, pad_id: int) -> List[Batch]:
@@ -203,6 +217,32 @@ def write_replay_manifest(replay: Replay, path: Path) -> Path:
     return path
 
 
+def reference_options(ctx, model_path: str) -> dict:
+    """Resolve HF options once for both workload identity and subprocess arguments."""
+    training = ctx.cfg.effective_training
+    fused = ctx.cfg.fused_cross_entropy
+    return {
+        "seed": SEED,
+        "attn": ctx.attn_implementation,
+        "token_budget": correctness_microbatch_tokens(ctx.cfg.max_tokens_per_mb),
+        "ce_chunk": 2048,
+        "matmul_precision": training.get("matmul_precision", "highest"),
+        "dtype": ctx.cfg.sub_job.get("dtype") or training.get("dtype") or "bfloat16",
+        "learning_rate": configured_learning_rate(ctx.cfg),
+        "optimizer_config": ctx.cfg.training["optimizer"],
+        "optimizer_dtype": ctx.cfg.optimizer_dtype,
+        "optimizer_chunk_elements": 1048576 if getattr(ctx, "local_gateway_full_model", False) else None,
+        "deterministic": True,
+        "mixer_packing": uses_mixer_packing(model_path),
+        "fp32_lm_head": bool(training.get("fp32_lm_head", False)),
+        "fused_cross_entropy": "liger" if fused is True else fused or False,
+        "lm_head_token_chunk_size": ctx.cfg.lm_head_token_chunk_size,
+        "lm_head_vocab_chunk_size": training.get("fused_lm_head_vocab_chunk_size", 8192),
+        "gradient_clipping": ctx.cfg.training.get("gradient_clipping"),
+        "peft_config": training.get("peft_config"),
+    }
+
+
 def reference_command(
     ctx, replay: Replay, manifest: Path, out_path: Path, peft_adapter_path: Path | None
 ) -> List[str]:
@@ -212,8 +252,8 @@ def reference_command(
     the reason the one-step reference is: its CUDA context and allocator caches are reclaimed before the
     gateway claims the node's GPUs.
     """
-    training = ctx.cfg.effective_training
     model_path = reference_model_path(ctx)
+    options = reference_options(ctx, model_path)
     command = [
         sys.executable,
         "-m",
@@ -225,46 +265,48 @@ def reference_command(
         "--out",
         str(out_path),
         "--seed",
-        str(SEED),
+        str(options["seed"]),
         "--attn",
-        str(ctx.attn_implementation),
+        str(options["attn"]),
         "--token-budget",
-        str(correctness_microbatch_tokens(ctx.cfg.max_tokens_per_mb)),
+        str(options["token_budget"]),
+        "--ce-chunk",
+        str(options["ce_chunk"]),
         "--matmul-precision",
-        str(training.get("matmul_precision", "highest")),
+        str(options["matmul_precision"]),
         "--dtype",
-        str(ctx.cfg.sub_job.get("dtype") or training.get("dtype") or "bfloat16"),
+        str(options["dtype"]),
         "--learning-rate",
-        str(configured_learning_rate(ctx.cfg)),
+        str(options["learning_rate"]),
         "--optimizer-config",
-        json.dumps(ctx.cfg.training["optimizer"], sort_keys=True),
+        json.dumps(options["optimizer_config"], sort_keys=True),
         "--optimizer-dtype",
-        ctx.cfg.optimizer_dtype,
+        options["optimizer_dtype"],
         "--deterministic",
     ]
-    if getattr(ctx, "local_gateway_full_model", False):
-        command += ["--optimizer-chunk-elements", "1048576"]
-    if uses_mixer_packing(model_path):
+    if options["optimizer_chunk_elements"] is not None:
+        command += ["--optimizer-chunk-elements", str(options["optimizer_chunk_elements"])]
+    if options["mixer_packing"]:
         command.append("--mixer-packing")
-    if training.get("fp32_lm_head", False):
+    if options["fp32_lm_head"]:
         command.append("--fp32-lm-head")
-    fused = ctx.cfg.fused_cross_entropy
+    fused = options["fused_cross_entropy"]
     if fused:
-        command += ["--fused-cross-entropy", "liger" if fused is True else str(fused)]
-    if ctx.cfg.lm_head_token_chunk_size is not None:
+        command += ["--fused-cross-entropy", str(fused)]
+    if options["lm_head_token_chunk_size"] is not None:
         command += [
             "--lm-head-token-chunk",
-            str(ctx.cfg.lm_head_token_chunk_size),
+            str(options["lm_head_token_chunk_size"]),
             "--lm-head-vocab-chunk",
-            str(training.get("fused_lm_head_vocab_chunk_size", 8192)),
+            str(options["lm_head_vocab_chunk_size"]),
         ]
-    clipping = ctx.cfg.training.get("gradient_clipping")
+    clipping = options["gradient_clipping"]
     if clipping is not None:
         command += ["--gradient-clipping", str(clipping)]
     if peft_adapter_path is not None:
         command += ["--peft-adapter", str(peft_adapter_path)]
-    elif training.get("peft_config"):
-        command += ["--peft-config", json.dumps(training["peft_config"], sort_keys=True)]
+    elif options["peft_config"]:
+        command += ["--peft-config", json.dumps(options["peft_config"], sort_keys=True)]
     return command
 
 
@@ -323,7 +365,9 @@ def reference_model_path(ctx) -> str:
     return str(require_data_fast_path(model_path, label="full-model e2e reference"))
 
 
-def run_dss_trajectory(ctx, replay: Replay, workdir: Path) -> Tuple[List[float], "torch.Tensor"]:
+def run_dss_trajectory(
+    ctx, replay: Replay, workdir: Path, peft_adapter_path: Path | None = None
+) -> Tuple[List[float], "torch.Tensor"]:
     """The same replay through Arctic Platform at the config's own topology, then the held-out forward.
 
     One job for the whole trajectory: a job restarted mid-run would reload the checkpoint, and the point
@@ -345,6 +389,10 @@ def run_dss_trajectory(ctx, replay: Replay, workdir: Path) -> Tuple[List[float],
         validation_body["processing"].pop("return_logprobs")
     learning_rate = configured_learning_rate(ctx.cfg)
     payload = build_payload(ctx.cfg.training, model_name, SEED, attn_implementation=ctx.attn_implementation)
+    if peft_adapter_path is not None:
+        from ..harness.deterministic_lora import bind_payload
+
+        payload = bind_payload(payload, peft_adapter_path)
     if isinstance(backend, CortexConfig) and ctx.cfg.gpu_type is not None:
         payload["hardware"] = ctx.cfg.gpu_type.upper()
     # ``serve_gateway`` writes its hostfile into the directory it is handed and does not create it.
@@ -504,15 +552,19 @@ def verdict(
     ),
 )
 def run(ctx) -> List[TestResult]:
-    """One reference process and one Arctic Platform job, both over one materialized replay.
+    """Prepare HF explicitly, or run one target job against a validated compact reference.
 
     No case axis. The cases vary gradient-accumulation depth in one step, and this check varies step
     count instead; a second case would run the same trajectory at another accumulation depth, which is
     what the one-step checks already measure.
     """
+    if getattr(ctx, "prepare_references", False):
+        prepare_reference_record(ctx)
+        return []
     try:
         return [_run(ctx)]
     except Exception as exc:  # noqa: BLE001 - a failure here is this check's verdict, not a crash
+        logger.exception("E2E SFT check failed for %s", ctx.config_id)
         return [
             TestResult(
                 test_id=TEST_ID,
@@ -523,59 +575,250 @@ def run(ctx) -> List[TestResult]:
         ]
 
 
-def _run(ctx) -> TestResult:
-    import torch
+def dataset_paths() -> Tuple[Path, Path]:
+    """Resolve staged GSM8K files without changing their logical split identities."""
+    staged = os.environ.get(GSM8K_DATA_ROOT_ENV)
+    if staged is None:
+        return TRAIN_SPLIT, VALIDATION_SPLIT
+    root = require_data_fast_path(staged, label=GSM8K_DATA_ROOT_ENV)
+    return root / "train.parquet", root / "test.parquet"
+
+
+def _prepare_adapter(ctx, model_path: str, workdir: Path) -> Tuple[Path | None, dict]:
+    if not ctx.cfg.effective_training.get("peft_config"):
+        return None, {"kind": "base-model"}
+    from ..harness import deterministic_lora
+
+    adapter = deterministic_lora.materialize_adapter(ctx.cfg, model_path, workdir / "adapter-init")
+    if adapter is None:
+        raise reference_records.ReferencePrerequisiteError("LoRA initialization produced no deterministic adapter")
+    adapter = require_data_fast_path(adapter, label="E2E deterministic adapter")
+    if not getattr(ctx, "prepare_references", False):
+        payload = build_payload(ctx.cfg.training, model_path, SEED, attn_implementation=ctx.attn_implementation)
+        deterministic_lora.bind_payload(payload, adapter)
+    return adapter, {
+        "kind": "deterministic-lora",
+        "metadata": deterministic_lora.identity_metadata(adapter),
+    }
+
+
+def prepare_inputs(ctx) -> PreparedInputs:
+    """Reconstruct the unchanged 100-step replay and its path-independent content identity."""
+    workdir = require_data_fast_path(Path(ctx.workdir) / TEST_ID, label="E2E replay workdir")
 
     model_path = reference_model_path(ctx)
+    model = reference_records.model_identity(model_path)
     tokenizer = gsm8k.load_tokenizer(model_path)
     pad_id = gsm8k.padding_token_id(tokenizer)
     rows_per_step = configured_rows_per_step(ctx.cfg)
     learning_rate = configured_learning_rate(ctx.cfg)
     token_budget = correctness_microbatch_tokens(ctx.cfg.max_tokens_per_mb)
+    train_path, validation_path = dataset_paths()
+    source_files = {
+        "train": reference_records.file_identity(train_path),
+        "test": reference_records.file_identity(validation_path),
+    }
 
     training_examples = gsm8k.tokenize_examples(
-        tokenizer, gsm8k.read_rows(TRAIN_SPLIT, count=TRAIN_STEPS * rows_per_step)
+        tokenizer, gsm8k.read_rows(train_path, count=TRAIN_STEPS * rows_per_step)
     )
-    held_out = gsm8k.tokenize_examples(tokenizer, gsm8k.read_rows(VALIDATION_SPLIT))
+    held_out = gsm8k.tokenize_examples(tokenizer, gsm8k.read_rows(validation_path))
+    if source_files != {
+        "train": reference_records.file_identity(train_path),
+        "test": reference_records.file_identity(validation_path),
+    }:
+        raise reference_records.ReferencePrerequisiteError("GSM8K source changed while constructing the replay")
     distribution = gsm8k.length_distribution(held_out)
     validation_examples, padded_width = gsm8k.select_by_token_budget(held_out, token_budget, ctx.cfg.dp_size)
     gsm8k.assert_disjoint(training_examples, validation_examples)
-
-    workdir = Path(ctx.workdir) / TEST_ID
+    train_batches = replay_batches(training_examples, rows_per_step, TRAIN_STEPS, pad_id)
+    validation_batch = gsm8k.build_batch("validation", validation_examples, pad_id)
+    adapter, initialization = _prepare_adapter(ctx, model_path, workdir)
+    recipe = {
+        "version": 1,
+        "model": model,
+        "initialization": initialization,
+        "reference_options": reference_options(ctx, model_path),
+        "criterion": {
+            "steps": TRAIN_STEPS,
+            "absolute_tolerance": TOLERANCE,
+            "gated_training_steps": list(gated_training_steps(TRAIN_STEPS)),
+            "gate_validation_loss": GATE_VALIDATION_LOSS,
+        },
+        "dataset": {
+            "name": "gsm8k-extra-info-parquet",
+            "source_files": source_files,
+            "ordering": "file-order",
+            "train": {"start": 0, "count": TRAIN_STEPS * rows_per_step, "rows_per_step": rows_per_step},
+            "train_groups": [{"start": step * rows_per_step, "count": rows_per_step} for step in range(TRAIN_STEPS)],
+            "validation": {
+                "split": "test",
+                "start": 0,
+                "count": len(validation_examples),
+                "source_rows": len(held_out),
+                "selection": "longest-leading-padded-rectangle-within-token-budget",
+                "token_budget": token_budget,
+                "minimum_rows": ctx.cfg.dp_size,
+            },
+        },
+        "tokenizer": {
+            "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
+            "vocabulary_size": len(tokenizer),
+            "padding_side": tokenizer.padding_side,
+            "pad_token_id": pad_id,
+            "bos_token_id": tokenizer.bos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "assets": {
+                name: content
+                for name, content in model["assets"].items()
+                if not name.endswith((".safetensors", ".bin"))
+            },
+        },
+        "preprocessing": {
+            "prompt_template": gsm8k.PROMPT_TEMPLATE,
+            "completion_template": gsm8k.COMPLETION_TEMPLATE,
+            "add_special_tokens": True,
+            "answer_boundary": "longest-common-prefix-of-prompt-and-joined-tokenization",
+            "truncation": False,
+            "padding_side": "right",
+            "position_ids": "zero-based-with-zero-padded-tail",
+            "labels": "answer-only-huggingface",
+            "ignore_index": -100,
+            "forward_labels": "shifted-once-to-logit-alignment",
+        },
+        "train_batches": [reference_records.batch_identity(batch) for batch in train_batches],
+        "validation_batch": reference_records.batch_identity(validation_batch),
+        "validation_logit_aligned_labels": reference_records.tensor_identity(validation_batch.shifted_labels()),
+        "scored_answer_tokens": sum(example.answer_tokens for example in validation_examples),
+    }
     replay = materialize_replay(
-        replay_batches(training_examples, rows_per_step, TRAIN_STEPS, pad_id),
-        gsm8k.build_batch("validation", validation_examples, pad_id),
+        train_batches,
+        validation_batch,
         workdir / "replay",
     )
+    measured: Dict[str, float] = {
+        "train_rows_per_step": float(rows_per_step),
+        "learning_rate": learning_rate,
+        "n_gpus_dss": float(ctx.cfg.n_gpus),
+        "validation_examples": float(len(validation_examples)),
+        "validation_padded_width": float(padded_width),
+        "validation_token_slots": float(len(validation_examples) * padded_width),
+        "single_forward_token_budget": float(token_budget),
+        "scored_answer_tokens": float(recipe["scored_answer_tokens"]),
+        "held_out_examples": float(distribution["examples"]),
+        "held_out_minimum_tokens": float(distribution["minimum_tokens"]),
+        "held_out_median_tokens": float(distribution["median_tokens"]),
+        "held_out_maximum_tokens": float(distribution["maximum_tokens"]),
+    }
+    inputs = PreparedInputs(replay, validation_examples, recipe, measured, workdir, adapter)
+    validate_replay(inputs)
+    return inputs
 
-    # A LoRA config's adapter is initialized by Arctic Platform and exported so the reference starts from identical
-    # bytes, which is what the one-step reference comparison does. Without it the two engines would train
-    # from different adapters and the trajectories would part at step 1 for a reason that is not a defect.
-    peft_adapter_path = None
-    if ctx.cfg.training.get("peft_config"):
-        from ..harness.runner import materialize_dss_peft_adapter
 
-        peft_adapter_path = materialize_dss_peft_adapter(
-            ctx.cfg, model_path, workdir / "reference-adapter-init", attn_implementation=ctx.attn_implementation
+def validate_replay(inputs: PreparedInputs) -> None:
+    """Check the exact materialized batches before any model allocation."""
+    if inputs.replay.steps != TRAIN_STEPS:
+        raise reference_records.ReferencePrerequisiteError("E2E replay must contain all 100 training batches")
+    actual = [reference_records.batch_identity(load(path)) for path in inputs.replay.train_batch_paths]
+    validation = load(inputs.replay.validation_batch_path)
+    if (
+        actual != inputs.recipe["train_batches"]
+        or reference_records.batch_identity(validation) != inputs.recipe["validation_batch"]
+        or reference_records.tensor_identity(validation.shifted_labels())
+        != inputs.recipe["validation_logit_aligned_labels"]
+    ):
+        raise reference_records.ReferencePrerequisiteError("materialized E2E replay differs from its input identity")
+
+
+def validate_reference(reference: dict, inputs: PreparedInputs) -> None:
+    """Require complete finite scalar diagnostics and the regenerated answer-token count."""
+    for key in ("train_losses", "train_gradient_norms"):
+        values = reference.get(key)
+        if (
+            not isinstance(values, list)
+            or len(values) != TRAIN_STEPS
+            or any(type(value) not in (int, float) or not math.isfinite(value) for value in values)
+        ):
+            raise reference_records.ReferencePrerequisiteError(f"E2E reference requires 100 finite scalar {key}")
+    if any(value < 0 for value in reference["train_gradient_norms"]):
+        raise reference_records.ReferencePrerequisiteError("E2E reference gradient norms must be nonnegative")
+    if type(reference.get("optimizer_steps")) is not int or reference["optimizer_steps"] != TRAIN_STEPS:
+        raise reference_records.ReferencePrerequisiteError("E2E reference requires 100 optimizer steps")
+    ce = reference.get("validation_cross_entropy")
+    if type(ce) not in (int, float) or not math.isfinite(ce):
+        raise reference_records.ReferencePrerequisiteError("E2E reference requires finite validation cross-entropy")
+    count = reference.get("scored_answer_tokens")
+    if type(count) is not int or count <= 0 or count != inputs.recipe["scored_answer_tokens"]:
+        raise reference_records.ReferencePrerequisiteError("E2E reference answer-token count differs from replay")
+    if "active_tokens" in reference and reference["active_tokens"] != [
+        batch["active_tokens"] for batch in inputs.recipe["train_batches"]
+    ]:
+        raise reference_records.ReferencePrerequisiteError("E2E reference active-token trajectory differs from replay")
+    for key in ("peak_gib", "trainable_parameters"):
+        if key in reference and (
+            type(reference[key]) not in (int, float) or not math.isfinite(reference[key]) or reference[key] < 0
+        ):
+            raise reference_records.ReferencePrerequisiteError(f"E2E reference has invalid {key}")
+    if "validation_logprobs" in reference:
+        raise reference_records.ReferencePrerequisiteError("E2E Git references must not contain token logprobs")
+
+
+def prepare_reference_record(ctx) -> Path:
+    """Publish HF scalars only during explicit onboarding; never allocate the target."""
+    if not getattr(ctx, "prepare_references", False):
+        raise reference_records.ReferencePrerequisiteError("HF preparation requires explicit --prepare-references")
+    inputs = prepare_inputs(ctx)
+    identity = reference_records.workload_identity(ctx, TEST_ID, inputs.recipe)
+    try:
+        reference = reference_records.load_record(ctx, identity)
+    except reference_records.ReferencePrerequisiteError as exc:
+        if not isinstance(exc.__cause__, FileNotFoundError):
+            raise
+        raw = run_reference_trajectory(ctx, inputs.replay, inputs.workdir / "reference", inputs.peft_adapter_path)
+        ce, count = cross_entropy(
+            reference_answer_logprobs(
+                torch.as_tensor(raw["validation_logprobs"], dtype=torch.float32), inputs.validation_examples
+            )
         )
+        reference = {
+            "train_losses": raw["train_losses"],
+            "train_gradient_norms": raw["train_gradient_norms"],
+            "optimizer_steps": raw["optimizer_steps"],
+            "validation_cross_entropy": ce,
+            "scored_answer_tokens": count,
+        }
+        for key in ("active_tokens", "peak_gib", "trainable_parameters"):
+            if key in raw:
+                reference[key] = raw[key]
+    validate_reference(reference, inputs)
+    return reference_records.publish_record(ctx, identity, reference)
 
-    reference = run_reference_trajectory(ctx, replay, workdir / "reference", peft_adapter_path)
-    target_losses, target_logprobs = run_dss_trajectory(ctx, replay, workdir / "dss")
 
-    reference_ce, reference_count = cross_entropy(
-        reference_answer_logprobs(
-            torch.as_tensor(reference["validation_logprobs"], dtype=torch.float32), validation_examples
-        )
+def _run(ctx) -> TestResult:
+    inputs = prepare_inputs(ctx)
+    identity = reference_records.workload_identity(ctx, TEST_ID, inputs.recipe)
+    reference = reference_records.load_record(ctx, identity)
+    validate_reference(reference, inputs)
+    validate_replay(inputs)
+    target_losses, target_logprobs = run_dss_trajectory(
+        ctx, inputs.replay, inputs.workdir / "dss", inputs.peft_adapter_path
     )
-    target_ce, target_count = cross_entropy(reference_answer_logprobs(target_logprobs, validation_examples))
+    if len(target_losses) != TRAIN_STEPS or any(
+        type(value) not in (int, float) or not math.isfinite(value) for value in target_losses
+    ):
+        raise RuntimeError("target returned an incomplete or nonfinite E2E training trajectory")
+    target_ce, target_count = cross_entropy(reference_answer_logprobs(target_logprobs, inputs.validation_examples))
+    reference_count = reference["scored_answer_tokens"]
+    if not math.isfinite(target_ce):
+        raise RuntimeError("target returned nonfinite E2E validation cross-entropy")
     if reference_count != target_count:
         raise RuntimeError(
             f"the two engines scored different numbers of answer tokens: {reference_count} in the "
-            f"single-GPU reference against {target_count} in Arctic Platform"
+            f"prepared single-GPU reference against {target_count} in Arctic Platform"
         )
-
     reference_losses = [float(value) for value in reference["train_losses"]]
-    (workdir / "trajectories.json").write_text(
+    reference_ce = float(reference["validation_cross_entropy"])
+    (inputs.workdir / "trajectories.json").write_text(
         json.dumps(
             {
                 "reference_train_losses": reference_losses,
@@ -585,24 +828,12 @@ def _run(ctx) -> TestResult:
                 "target_validation_cross_entropy": target_ce,
             },
             indent=2,
+            allow_nan=False,
         )
         + "\n"
     )
-
-    measured: Dict[str, float] = {
-        "train_rows_per_step": float(rows_per_step),
-        "learning_rate": learning_rate,
-        "n_gpus_dss": float(ctx.cfg.n_gpus),
-        "validation_examples": float(len(validation_examples)),
-        "validation_padded_width": float(padded_width),
-        "validation_token_slots": float(len(validation_examples) * padded_width),
-        "single_forward_token_budget": float(token_budget),
-        "scored_answer_tokens": float(reference_count),
-        "held_out_examples": float(distribution["examples"]),
-        "held_out_minimum_tokens": float(distribution["minimum_tokens"]),
-        "held_out_median_tokens": float(distribution["median_tokens"]),
-        "held_out_maximum_tokens": float(distribution["maximum_tokens"]),
-        "reference_peak_gib": float(reference["peak_gib"]),
-        "reference_trainable_parameters": float(reference["trainable_parameters"]),
-    }
+    measured = dict(inputs.measured)
+    for key in ("peak_gib", "trainable_parameters"):
+        if key in reference:
+            measured[f"reference_{key}"] = float(reference[key])
     return verdict(ctx, reference_losses, target_losses, reference_ce, target_ce, measured)

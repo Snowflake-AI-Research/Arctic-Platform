@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 import requests
 import torch
@@ -50,6 +51,9 @@ CONFIG = ROOT / "configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"
 
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
+    monkeypatch.setattr(
+        aiohttp.ClientSession, "request", lambda *args, **kwargs: pytest.fail("unit tests must not access the network")
+    )
     monkeypatch.setattr(
         requests.Session, "request", lambda *args, **kwargs: pytest.fail("unit tests must not access the network")
     )
@@ -108,6 +112,7 @@ def test_hosted_config_does_not_depend_on_removed_public_backend_fields():
 @pytest.mark.parametrize("startup_error", [False, True])
 def test_reviewed_gradient_cases_send_dss_requests_not_onprem_workarounds(tmp_path, monkeypatch, order, startup_error):
     from arctic_platform.correctness.harness import cortex_fixture
+    from arctic_platform.correctness.harness import reference_records
 
     cfg = load_config(CONFIG)
     spec = ConfigSpec.read(ROOT / f"specs/{cfg.config_id}.json")
@@ -117,12 +122,13 @@ def test_reviewed_gradient_cases_send_dss_requests_not_onprem_workarounds(tmp_pa
     cancels = []
     replies = {}
 
-    def reference(model, batch, *args, **kwargs):
-        assert model == spec.model.cache_path
-        references.append(load_batch(batch))
-        return {"loss": 2.0, "grad_norms": {"weight": 1.0}, "microbatches": 1}
+    def reference(ctx, identity):
+        assert identity["check_id"] == "single-step-grads"
+        name = identity["recipe"]["synthetic_inputs"]["batch"]["name"]
+        references.append(load_batch(ctx.batch_paths[name]))
+        return {"loss": 2.0, "grad_norms": {"weight": 1.0}, "microbatches": 1, "active_tokens": 1}
 
-    def send(transport, method, url, **kwargs):
+    async def send(transport, method, url, **kwargs):
         if method == "POST" and url == transport._prefix:
             creates.append(kwargs["json"])
             return {"job_id": f"job-{len(creates)}"}
@@ -150,7 +156,9 @@ def test_reviewed_gradient_cases_send_dss_requests_not_onprem_workarounds(tmp_pa
         return {"request_id": request_id}
 
     monkeypatch.setattr(cortex_fixture, "load_fixture", lambda *args: {"model_name": "published-reviewed-fixture"})
-    monkeypatch.setattr(runner, "run_reference", reference)
+    monkeypatch.setattr(runner, "run_reference", lambda *a, **k: pytest.fail("regression must not run HF"))
+    monkeypatch.setattr(reference_records, "model_identity", lambda *a: {"sha256": "unit-model"})
+    monkeypatch.setattr(reference_records, "load_record", reference)
     monkeypatch.setattr(runner, "uses_mixer_packing", lambda *args: False)
     assert not hasattr(runner, "ap_batch_processing_options")
     monkeypatch.setattr(CortexTransport, "_send", send)
@@ -260,11 +268,11 @@ def test_managed_inference_uses_public_transport_and_cleans_up(tmp_path, monkeyp
     transports, closed, replies = [], [], {}
     saved = False
     checkpoint_id = "cp_1234abcd"
-    original_close = requests.Session.close
+    original_close = CortexTransport._close_session
 
-    def close(session):
-        closed.append(session)
-        original_close(session)
+    async def close(transport):
+        await original_close(transport)
+        closed.append(transport)
 
     def forbidden(*args, **kwargs):
         pytest.fail("managed inference must not enter Ray or use a local checkpoint export/tokenizer write")
@@ -274,9 +282,9 @@ def test_managed_inference_uses_public_transport_and_cleans_up(tmp_path, monkeyp
     monkeypatch.setattr(inference, "materialize_checkpoint_tokenizer", forbidden)
     monkeypatch.setattr(inference, "_onprem_sampling_and_reload", forbidden)
     monkeypatch.setattr(inference.shutil, "rmtree", forbidden)
-    monkeypatch.setattr(requests.Session, "close", close)
+    monkeypatch.setattr(CortexTransport, "_close_session", close)
 
-    def send(transport, method, url, **kwargs):
+    async def send(transport, method, url, **kwargs):
         nonlocal saved
         path = url.split("?", 1)[0]
         if method == "POST" and url == transport._prefix:
@@ -361,7 +369,9 @@ def test_managed_inference_uses_public_transport_and_cleans_up(tmp_path, monkeyp
     expected_jobs = 1 if mode in {"save_error", "forward_error"} else 2
     assert cancels == [f"job-{index}" for index in range(1, expected_jobs + 1)]
     assert len(transports) == expected_jobs
-    assert all(transport.job_id is None and transport.session in closed for transport in transports)
+    assert all(
+        transport.job_id is None and transport._session is None and transport in closed for transport in transports
+    )
     assert tokenizer_paths == [cfg.model_name]
     assert len(backward) == len(steps) == inference.TRAIN_STEPS == 10
     assert len(forwards) == 1

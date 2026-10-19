@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+from pydantic import StrictInt
 from pydantic import model_validator
 from typing_extensions import Self
 
@@ -34,9 +35,23 @@ class CortexTrainingConfig(ArcticClientConfig):
 
     hardware: str | None = None
     source_checkpoint_info: dict[str, str] | None = None
+    inference_tensor_parallel_size: StrictInt | None = None
 
     @model_validator(mode="after")
     def _check_source(self) -> Self:
+        if self.inference_tensor_parallel_size is not None:
+            if not isinstance(self.backend, CortexConfig) or self.inference_tensor_parallel_size <= 0:
+                raise ValueError("explicit inference tensor parallelism requires a positive size and CortexConfig")
+            pipeline = self.sampling.vllm.get("pipeline_parallel_size", 1)
+            if type(pipeline) is not int or pipeline <= 0:
+                raise ValueError("explicit inference pipeline parallelism requires a positive integer")
+            expected_gpus = self.inference_tensor_parallel_size * pipeline
+            allocations = (self.sampling_gpus, self.log_prob_gpus)
+            if not any(allocations) or any(size not in (0, expected_gpus) for size in allocations):
+                raise ValueError("inference allocation must equal tensor times pipeline parallelism")
+            tensor = self.sampling.vllm.get("tensor_parallel_size")
+            if type(tensor) is not int or tensor != self.inference_tensor_parallel_size:
+                raise ValueError("explicit inference tensor parallelism differs from sampling configuration")
         if self.source_checkpoint_info is not None:
             if not isinstance(self.backend, CortexConfig):
                 raise ValueError("source_checkpoint_info requires CortexConfig")
@@ -61,6 +76,11 @@ class CortexTrainingConfig(ArcticClientConfig):
 
     def _cortex_inference_sub_job(self, job_type: str, n_gpus: int) -> dict:
         sub = super()._cortex_inference_sub_job(job_type, n_gpus)
+        if self.inference_tensor_parallel_size is not None:
+            sub = deepcopy(sub)
+            sub["inference_config"].setdefault("vllm_config", {})[
+                "tensor_parallel_size"
+            ] = self.inference_tensor_parallel_size
         if self.source_checkpoint_info is not None:
             sub["source_checkpoint_info"] = dict(self.source_checkpoint_info)
         return sub

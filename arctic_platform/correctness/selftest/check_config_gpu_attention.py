@@ -170,3 +170,79 @@ def test_absent_row_width_follows_the_engine_default(tmp_path) -> None:
     cfg = _write(tmp_path, {"n_gpus": 8, "attn_implementation": "flash_attention_3"})
 
     assert load_config(cfg).max_seq_len == ArcticClientConfig.model_fields["max_seq_len"].default
+
+
+@pytest.mark.parametrize("attention", [None, "qsa_flex"])
+def test_flash_next_requires_model_specific_attention(tmp_path: Path, attention: str | None) -> None:
+    path = _write_config(tmp_path, "h200", attention, n_gpus=16)
+    raw = json.loads(path.read_text())
+    raw["model_name"] = "Qwen/Qwen3.8-Flash-Next"
+    path.write_text(json.dumps(raw))
+
+    config = load_config(path)
+    validate_against_host(config, available_gpus=16, check_gpu_type=False)
+    assert config.attention_implementation == "qsa_flex"
+
+
+def test_flash_next_rejects_generic_h200_attention(tmp_path: Path) -> None:
+    path = _write_config(tmp_path, "h200", "flash_attention_3")
+    raw = json.loads(path.read_text())
+    raw["model_name"] = "Qwen/Qwen3.8-Flash-Next"
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ValueError, match="Qwen/Qwen3.8-Flash-Next requires attn_implementation='qsa_flex'"):
+        validate_against_host(load_config(path), available_gpus=8, check_gpu_type=False)
+
+
+def test_flash_next_reviewed_recipe_keeps_training_settings() -> None:
+    path = (
+        Path(__file__).resolve().parents[1] / "configs/qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config"
+    )
+    config = load_config(path)
+
+    validate_against_host(config, available_gpus=16, check_gpu_type=False)
+    assert config.config_id == "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k"
+    assert config.n_gpus == config.sp_size == 16
+    assert config.dp_size == 1
+    assert config.max_seq_len == config.max_tokens_per_mb == 262144
+    assert config.attention_implementation == "qsa_flex"
+    assert config.optimizer_dtype == "float32"
+    assert config.training["train_batch_size"] == 1
+    assert config.training["ep_size"] == 8
+    assert config.training["deepep_token_chunk_size"] == 8192
+    assert config.training["ac_config"]["offload_config"]["enabled"] is False
+    assert config.training["ds_config"]["zero_optimization"]["offload_optimizer"] == {
+        "device": "cpu",
+        "pin_memory": False,
+    }
+    assert config.native.backend.type == "remote"
+    assert config.native.backend.base_url == "http://127.0.0.1:8003"
+
+
+def test_flash_next_cortex_wire_preserves_all_training_fields() -> None:
+    from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
+
+    path = (
+        Path(__file__).resolve().parents[1] / "configs/qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config"
+    )
+    native = load_config(path).native
+    wire = CortexTrainingConfig.model_validate(native.model_dump(mode="json")).to_cortex()
+    ds = native.training.ds_config
+    assert wire == [
+        {
+            "job_type": "training",
+            "model_name": "Qwen/Qwen3.8-Flash-Next",
+            "dtype": "bfloat16",
+            "seed": 42,
+            "training_config": {
+                **native.training.ds_worker_config,
+                "n_gpus": 16,
+                "max_seq_len": 262144,
+                "train_batch_size": 1,
+                "gradient_clipping": 1.0,
+                "optimizer": {"name": ds["optimizer"]["type"], **ds["optimizer"]["params"]},
+                "ds_config": ds,
+                "debug": {"full_determinism": False},
+            },
+        }
+    ]

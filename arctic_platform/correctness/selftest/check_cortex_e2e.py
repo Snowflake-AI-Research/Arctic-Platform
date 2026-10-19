@@ -15,12 +15,14 @@
 
 """Verify reduced and explicit full-model identity without allocating gateway or GPU workers."""
 
+import asyncio
 import base64
 import contextlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 import requests
 import torch
@@ -28,7 +30,9 @@ import torch
 from arctic_platform import wire
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
+from arctic_platform.client.transports.cortex import _DEFAULT
 from arctic_platform.client.transports.cortex import CortexTransport
+from arctic_platform.client.transports.cortex import _SendPolicy
 from arctic_platform.correctness.checks import e2e_sft_train_validate as check
 from arctic_platform.correctness.harness import dss_driver
 from arctic_platform.correctness.harness import gsm8k
@@ -42,9 +46,26 @@ FULL_SNAPSHOT = "/data-fast/tmp/e2e-full-test/hf/hub/models--Qwen--Qwen3-8B/snap
 
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
-    monkeypatch.setattr(
-        requests.Session, "request", lambda *args, **kwargs: pytest.fail("unit tests must not access the network")
-    )
+    def forbidden(*args, **kwargs):
+        pytest.fail("unit tests must not access the network")
+
+    monkeypatch.setattr(requests.Session, "request", forbidden)
+    monkeypatch.setattr(aiohttp.ClientSession, "request", forbidden)
+    closes = []
+    original_close = CortexTransport._close_session
+
+    async def close(transport):
+        assert asyncio.get_running_loop() is transport._loop
+        session = transport._session
+        await original_close(transport)
+        assert transport._session is None
+        assert session is None or session.closed
+        closes.append(transport)
+
+    monkeypatch.setattr(CortexTransport, "_close_session", close)
+    yield closes
+    for transport in set(closes):
+        transport._loop.call_soon_threadsafe(transport._loop.stop)
 
 
 def context(tmp_path, width=4):
@@ -52,6 +73,7 @@ def context(tmp_path, width=4):
     return SimpleNamespace(
         cfg=cfg,
         spec=ConfigSpec.read(ROOT / f"specs/{cfg.config_id}.json"),
+        workdir=tmp_path / "work",
         attn_implementation=cfg.attention_implementation,
         client_backend=CortexConfig(base_url="http://unused"),
         target_model_name="ap-correctness/reviewed-fixture",
@@ -74,7 +96,7 @@ def replay(tmp_path):
 
 @pytest.mark.parametrize("width", [4, 8])
 @pytest.mark.parametrize("failure", [None, "backward", "forward"])
-def test_e2e_replay_uses_validated_fixture_and_cleans_up(tmp_path, monkeypatch, width, failure):
+def test_e2e_replay_uses_validated_fixture_and_cleans_up(tmp_path, monkeypatch, no_network, width, failure):
     ctx = context(tmp_path, width)
     before = json.dumps(ctx.cfg.training, sort_keys=True)
     recorded = replay(tmp_path)
@@ -86,7 +108,9 @@ def test_e2e_replay_uses_validated_fixture_and_cleans_up(tmp_path, monkeypatch, 
 
     monkeypatch.setattr(dss_driver, "_gateway_runtime", forbidden)
 
-    def send(transport, method, url, **kwargs):
+    async def send(transport, method, url, *, policy=_DEFAULT, **kwargs):
+        assert asyncio.get_running_loop() is transport._loop
+        assert isinstance(policy, _SendPolicy)
         if method == "POST" and url == transport._prefix:
             creates.append(kwargs["json"])
             return {"job_id": "e2e-job"}
@@ -140,6 +164,7 @@ def test_e2e_replay_uses_validated_fixture_and_cleans_up(tmp_path, monkeypatch, 
             forward[0]["kwargs"]["labels"], expected_validation["batch"]["labels"], rtol=0, atol=0
         )
     assert cancels == ["e2e-job"]
+    assert no_network and all(transport.job_id is None for transport in no_network)
     assert creates[0]["hardware"] == "H200"
     sub = creates[0]["sub_job_configs"][0]
     assert sub["model_name"] == ctx.target_model_name
@@ -203,14 +228,25 @@ def test_e2e_tokenizer_uses_selected_reference_identity(tmp_path, monkeypatch, f
     expected = FULL_SNAPSHOT if full else ctx.spec.model.cache_path
     seen = []
 
+    def model_identity(path):
+        seen.append(("model", path))
+        return {"assets": {}, "sha256": "mock-selected-model-content"}
+
     def tokenizer(path):
-        seen.append(path)
+        seen.append(("tokenizer", path))
         raise RuntimeError("stop before materializing any data")
 
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid tokenizer must stop before records, HF, or target allocation")
+
+    monkeypatch.setattr(check.reference_records, "model_identity", model_identity)
     monkeypatch.setattr(gsm8k, "load_tokenizer", tokenizer)
+    monkeypatch.setattr(check.reference_records, "load_record", forbidden)
+    monkeypatch.setattr(check, "run_reference_trajectory", forbidden)
+    monkeypatch.setattr(check, "run_dss_trajectory", forbidden)
     with pytest.raises(RuntimeError, match="stop before materializing"):
         check._run(ctx)
-    assert seen == [expected]
+    assert seen == [("model", expected), ("tokenizer", expected)]
 
 
 @pytest.mark.parametrize("failure", [None, "backward", "forward"])

@@ -751,19 +751,25 @@ def test_payload_determinism_off_clears_a_config_that_asks_for_the_pin() -> None
     assert debug["full_determinism_must_comply"] is False
 
 
-def test_gateway_runtime_cleans_before_and_after_standard_port(monkeypatch) -> None:
+@pytest.mark.parametrize("auth_mode", [None, "disabled", "token", "legacy-mode"])
+def test_gateway_runtime_cleans_before_and_after_standard_port(monkeypatch, auth_mode) -> None:
     import torch
 
     from arctic_platform.correctness.harness import dss_driver
 
     events = []
     monkeypatch.setenv("MASTER_PORT", "12345")
-    monkeypatch.setenv("RAY_AUTH_MODE", "legacy-mode")
+    if auth_mode is None:
+        monkeypatch.delenv("RAY_AUTH_MODE", raising=False)
+    else:
+        monkeypatch.setenv("RAY_AUTH_MODE", auth_mode)
     monkeypatch.setattr(dss_driver, "_stop_and_verify_gateway_runtime", lambda: events.append("clean"))
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
 
     def start(*, auto_attach, include_peers):
-        events.append(("start", auto_attach, include_peers, os.environ["MASTER_PORT"], os.environ["RAY_AUTH_MODE"]))
+        events.append(
+            ("start", auto_attach, include_peers, os.environ["MASTER_PORT"], os.environ.get("RAY_AUTH_MODE"))
+        )
 
     class RayCluster:
         @staticmethod
@@ -775,24 +781,24 @@ def test_gateway_runtime_cleans_before_and_after_standard_port(monkeypatch) -> N
             events.append("shutdown")
 
     def load_ray_cluster():
-        events.append(("load", os.environ["MASTER_PORT"], os.environ["RAY_AUTH_MODE"]))
+        events.append(("load", os.environ["MASTER_PORT"], os.environ.get("RAY_AUTH_MODE")))
         return RayCluster
 
     monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", load_ray_cluster)
 
     with _gateway_runtime(8):
-        events.append(("body", os.environ["MASTER_PORT"], os.environ["RAY_AUTH_MODE"]))
+        events.append(("body", os.environ["MASTER_PORT"], os.environ.get("RAY_AUTH_MODE")))
 
     assert events == [
-        ("load", "29500", "token"),
+        ("load", "29500", auth_mode),
         "clean",
-        ("start", False, False, "29500", "token"),
-        ("body", "29500", "token"),
+        ("start", False, False, "29500", auth_mode),
+        ("body", "29500", auth_mode),
         "shutdown",
         "clean",
     ]
     assert os.environ["MASTER_PORT"] == "12345"
-    assert os.environ["RAY_AUTH_MODE"] == "legacy-mode"
+    assert os.environ.get("RAY_AUTH_MODE") == auth_mode
 
 
 def test_allocation_runtime_command_uses_hostfile_ds_ssh(monkeypatch, tmp_path) -> None:

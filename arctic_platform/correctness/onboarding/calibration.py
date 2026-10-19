@@ -214,7 +214,7 @@ def main() -> int:
         "gradient_ranges": ranges,
         "tolerance": {
             "raw_max_same_tensor_range": raw_variation,
-            "multiplier": 2.0,
+            "multiplier": GATE_SAFETY_FACTOR,
             "computed_gate": computed_gate,
             "rounding_quantum": float(GATE_QUANTUM),
             "minimum_gate": float(GATE_QUANTUM),
@@ -225,7 +225,7 @@ def main() -> int:
     OUTPUT.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\\n")
     print(f"loss range: {payload['loss_range']:.9e}")
     print(f"raw variation: {raw_variation:.9e}")
-    print(f"computed 2x gate: {computed_gate:.9e}")
+    print(f"computed {GATE_SAFETY_FACTOR:g}x gate: {computed_gate:.9e}")
     print(f"selected gate: {selected_gate:.9e}")
     print(f"{'tensor':64} {'minimum':>13} {'maximum':>13} {'range':>13}")
     for row in ranges[:10]:
@@ -236,12 +236,12 @@ def main() -> int:
         "absolute": selected_gate,
         "calibration_runs": RUNS,
         "raw_max_same_tensor_range": raw_variation,
-        "multiplier": 2.0,
+        "multiplier": GATE_SAFETY_FACTOR,
         "computed_gate": computed_gate,
         "rounding_quantum": float(GATE_QUANTUM),
         "minimum_gate": float(GATE_QUANTUM),
         "worst_tensor": ranges[0]["name"],
-        "status": f"calibrated from {RUNS} nondeterministic reference executions; 2x rounded upward in 1e-3 units",
+        "status": f"calibrated from {RUNS} nondeterministic reference executions; {GATE_SAFETY_FACTOR:g}x rounded upward in 1e-3 units",
     }
     SPEC_PATH.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\\n")
     return 0

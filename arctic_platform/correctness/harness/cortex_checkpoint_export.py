@@ -29,6 +29,8 @@ from urllib.parse import urlsplit
 
 import requests
 
+from arctic_platform.client.requests import export_checkpoint_request
+
 from .workdir import require_data_fast_path
 
 _CHUNK_BYTES = 1024 * 1024
@@ -296,7 +298,7 @@ def export_checkpoint(
     try:
         parent = _destination_parent(output_dir)
         # Preserve the original public client's framing, auth and retry policy.
-        reply = transport._send("POST", f"{transport._prefix}/{job_id}/checkpoints/{checkpoint_id}:export")
+        reply = transport.call(export_checkpoint_request(job_id, checkpoint_id))
         entries, tag = _manifest(reply, checkpoint_id, dp_size, max_total_bytes)
         parent.mkdir(parents=True, exist_ok=True)
         if not parent.is_dir() or any(path.is_symlink() for path in (parent, *parent.parents)):

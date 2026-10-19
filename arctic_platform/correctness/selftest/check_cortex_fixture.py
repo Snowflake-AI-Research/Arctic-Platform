@@ -28,6 +28,7 @@ from arctic_platform.correctness.harness.arms import ArmDefinition
 from arctic_platform.correctness.harness.config import load_config
 from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
 from arctic_platform.correctness.harness.registry import TestResult as Result
+from arctic_platform.correctness.harness.spec import TestTolerance as Tolerance
 from arctic_platform.correctness.harness.spec import hash_directory
 from arctic_platform.correctness.selftest.check_applicable_tests import _spec
 
@@ -353,10 +354,14 @@ def _receipt(tmp_path):
 
 
 @pytest.mark.parametrize("include_gas4", [False, True])
-def test_gradient_runner_keeps_hf_local_and_routes_only_target_to_cortex(tmp_path, monkeypatch, include_gas4):
+def test_gradient_runner_loads_prepared_reference_and_routes_only_target_to_cortex(
+    tmp_path, monkeypatch, include_gas4
+):
     from arctic_platform.client import CortexConfig
+    from arctic_platform.correctness.harness import reference_records
 
     spec, receipt, binding = _receipt(tmp_path)
+    spec.test_tolerances["single-step-grads"] = Tolerance(absolute=0.01)
     cfg = load_config(Path("arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"))
     backend = CortexConfig(base_url="http://cortex.test")
     events = []
@@ -375,13 +380,13 @@ def test_gradient_runner_keeps_hf_local_and_routes_only_target_to_cortex(tmp_pat
         assert payload["training_config"]["debug"]["gradient_norms_per_param"]
         yield SimpleNamespace()
 
-    def reference(model, *args, **kwargs):
-        assert model == spec.model.cache_path
-        assert "backend" not in kwargs
-        events.append("hf")
-        return {}
+    def reference(ctx, identity):
+        assert identity["check_id"] == "single-step-grads"
+        events.append("prepared")
+        return {"loss": 1.0, "grad_norms": {"weight": 1.0}, "microbatches": 1, "active_tokens": 1}
 
-    monkeypatch.setattr(runner, "run_reference", reference)
+    monkeypatch.setattr(runner, "run_reference", lambda *a, **k: pytest.fail("regression must not run HF"))
+    monkeypatch.setattr(reference_records, "load_record", reference)
     monkeypatch.setattr(runner, "gateway", remote_gateway)
     monkeypatch.setattr(runner, "running_job", remote_job)
     monkeypatch.setattr(runner, "fwd_bwd_step", lambda *a, **k: {})
@@ -405,10 +410,10 @@ def test_gradient_runner_keeps_hf_local_and_routes_only_target_to_cortex(tmp_pat
     )
     if include_gas4:
         assert [(result.arm, result.outcome) for result in results] == [("gas1", Outcome.PASS), ("gas4", Outcome.PASS)]
-        assert events == ["hf", "hf", "cortex"]
+        assert events == ["prepared", "prepared", "cortex"]
     else:
         assert [result.outcome for result in results] == [Outcome.PASS]
-        assert events == ["hf", "cortex"]
+        assert events == ["prepared", "cortex"]
 
 
 def test_fixture_cli_uses_local_vocab_and_records_published_target(tmp_path, monkeypatch):

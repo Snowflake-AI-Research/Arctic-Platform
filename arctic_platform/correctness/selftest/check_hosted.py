@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,12 @@ from arctic_platform.correctness.harness.transport import Checkpoint
 
 CONFIG = Path(__file__).resolve().parents[1] / "configs" / "qwen3-8b" / "h200" / "train-sft-full-4gpus-64k.config"
 CONNECTION = HostedConnection(host="server", database="DB", schema="SCHEMA", pat="not-a-token")
+LOCAL_CHECKPOINT_ID = "cp_00000000-0000-0000-0000-000000000001"
+LOCAL_STAGE = {
+    "location_type": "S3",
+    "bucket": "synthetic-control-bucket",
+    "prefix": f"jobs/saving-parent/checkpoints/{LOCAL_CHECKPOINT_ID}/",
+}
 
 
 def _config():
@@ -312,6 +319,24 @@ class _LocalClient(_Client):
     def list_checkpoints(self):
         raise AssertionError("the supplied local gateway has no checkpoint catalog")
 
+    def load_checkpoint(self, checkpoint_id, *, stage_info=None):
+        self.calls.append(("load", checkpoint_id, deepcopy(stage_info)))
+        return hosted._local_load_metadata(
+            {"checkpoint_id": checkpoint_id, "checkpoint_tag": "global_step10", "version": 10},
+            checkpoint_id,
+        )
+
+
+def _local_checkpoint(root):
+    return hosted.LocalCortexCheckpoint(
+        LOCAL_CHECKPOINT_ID,
+        "owned-source",
+        str(root),
+        "global_step10",
+        10,
+        stage_info=deepcopy(LOCAL_STAGE),
+    )
+
 
 @pytest.mark.parametrize("checkpoint_type", ["resumable", "weights-only"])
 def test_local_save_uses_a_fresh_fast_path_without_catalog(monkeypatch, tmp_path, checkpoint_type) -> None:
@@ -331,9 +356,49 @@ def test_local_resumable_checkpoint_keeps_the_saving_job_identity(monkeypatch, t
     root = tmp_path / "checkpoint"
     root.mkdir()
     monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
-    client = _LocalClient(save_result={"checkpoint_path": str(root), "checkpoint_tag": "global_step10", "version": 10})
+    client = _LocalClient(
+        save_result={
+            "checkpoint_path": str(root),
+            "checkpoint_tag": "global_step10",
+            "version": 10,
+            "checkpoint_id": LOCAL_CHECKPOINT_ID,
+            "stage_info": deepcopy(LOCAL_STAGE),
+        }
+    )
     checkpoint = HostedTrainingJob(client, "owned-parent", local_gateway=True).save_resumable()
-    assert checkpoint == Checkpoint(reference=str(root), source_job="owned-parent")
+    assert checkpoint == hosted.LocalCortexCheckpoint(
+        LOCAL_CHECKPOINT_ID,
+        "owned-parent",
+        str(root),
+        "global_step10",
+        10,
+        stage_info=LOCAL_STAGE,
+    )
+    assert checkpoint.stage_info is not client.save_result["stage_info"]
+    assert client.calls == [("save", "resumable", str(root))]
+
+
+def test_local_resumable_save_without_durable_identity_retains_output_and_releases_job(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "checkpoint"
+    root.mkdir()
+    marker = root / "retained-evidence"
+    marker.write_text("preserve", encoding="ascii")
+    monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
+    client = _LocalClient(
+        save_result={
+            "checkpoint_path": str(root),
+            "checkpoint_tag": "global_step10",
+            "version": 10,
+        }
+    )
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(RuntimeError, match="only a FAST path/tag"):
+        with HostedTransport(_local_backend(), _config()) as transport:
+            with transport.job() as job:
+                job.save_resumable()
+    assert client.calls == [("save", "resumable", str(root))]
+    assert client.cancelled == ["job-1"] and client.closed
+    assert marker.read_text(encoding="ascii") == "preserve"
 
 
 @pytest.mark.parametrize(
@@ -394,7 +459,13 @@ def test_local_resume_creates_a_fresh_full_model_job_then_loads_before_training(
     (root / "latest").write_text("global_step10\n", encoding="ascii")
     client = _LocalClient(
         losses=[2.5],
-        save_result={"checkpoint_path": str(root), "checkpoint_tag": "global_step10", "version": 10},
+        save_result={
+            "checkpoint_path": str(root),
+            "checkpoint_tag": "global_step10",
+            "version": 10,
+            "checkpoint_id": LOCAL_CHECKPOINT_ID,
+            "stage_info": deepcopy(LOCAL_STAGE),
+        },
     )
     monkeypatch.setattr(hosted, "correctness_workdir", lambda prefix: root)
     monkeypatch.setattr(hosted, "ArcticClient", client.create)
@@ -405,13 +476,13 @@ def test_local_resume_creates_a_fresh_full_model_job_then_loads_before_training(
         assert client.cancelled == ["job-1"]
         with transport.job(resume_from=checkpoint) as resumed:
             assert resumed.job_id == "job-2"
-            assert client.calls[-1] == ("load", str(root))
+            assert client.calls[-1] == ("load", LOCAL_CHECKPOINT_ID, LOCAL_STAGE)
             assert resumed.fwd_bwd_step({"args": (), "kwargs": {}}, learning_rate=1e-3) == 2.5
 
     assert client.cancelled == ["job-1", "job-2"]
     assert client.calls == [
         ("save", "resumable", str(root)),
-        ("load", str(root)),
+        ("load", LOCAL_CHECKPOINT_ID, LOCAL_STAGE),
         ("fwd-bwd", {"args": (), "kwargs": {}}),
         ("step", 1e-3),
     ]
@@ -423,12 +494,14 @@ def test_local_resume_creates_a_fresh_full_model_job_then_loads_before_training(
         assert wire["training_config"]["ds_config"]["gradient_accumulation_steps"] == 1
     assert json.dumps(cfg.sub_job, sort_keys=True) == before
     assert root.is_dir()
+    assert (root / "latest").read_text(encoding="ascii") == "global_step10\n"
+    assert client.closed
 
 
 def test_local_resume_load_failure_releases_fresh_job_and_retains_checkpoint(monkeypatch, tmp_path) -> None:
     class FailingLoad(_LocalClient):
-        def load_checkpoint(self, *, path):
-            super().load_checkpoint(path=path)
+        def load_checkpoint(self, checkpoint_id, *, stage_info=None):
+            super().load_checkpoint(checkpoint_id, stage_info=stage_info)
             raise RuntimeError("runtime load unavailable")
 
     client = FailingLoad()
@@ -436,11 +509,13 @@ def test_local_resume_load_failure_releases_fresh_job_and_retains_checkpoint(mon
     monkeypatch.setattr(hosted, "ArcticClient", client.create)
     with pytest.raises(RuntimeError, match="runtime load unavailable"):
         with HostedTransport(_local_backend(), _config()) as transport:
-            with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
+            with transport.job(resume_from=_local_checkpoint(tmp_path)):
                 raise AssertionError("must not train before a successful load")
     assert client.cancelled == ["job-1"]
-    assert client.calls == [("load", str(tmp_path))]
+    assert client.calls == [("load", LOCAL_CHECKPOINT_ID, LOCAL_STAGE)]
     assert tmp_path.is_dir()
+    assert (tmp_path / "latest").read_text(encoding="ascii") == "global_step10\n"
+    assert client.closed
 
 
 @pytest.mark.parametrize(
@@ -454,30 +529,34 @@ def test_local_resume_load_failure_releases_fresh_job_and_retains_checkpoint(mon
 )
 def test_local_resume_rejects_unconfirmed_or_wrong_step_and_releases_fresh_job(monkeypatch, tmp_path, result) -> None:
     class IncorrectLoad(_LocalClient):
-        def load_checkpoint(self, *, path):
-            super().load_checkpoint(path=path)
-            return {"checkpoint_path": path, **result}
+        def load_checkpoint(self, checkpoint_id, *, stage_info=None):
+            super().load_checkpoint(checkpoint_id, stage_info=stage_info)
+            return hosted._local_load_metadata({"checkpoint_id": checkpoint_id, **result}, checkpoint_id)
 
     (tmp_path / "latest").write_text("global_step10\n", encoding="ascii")
     client = IncorrectLoad()
     monkeypatch.setattr(hosted, "ArcticClient", client.create)
     with pytest.raises(RuntimeError, match="local checkpoint load"):
         with HostedTransport(_local_backend(), _config()) as transport:
-            with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
+            with transport.job(resume_from=_local_checkpoint(tmp_path)):
                 raise AssertionError("must not train before confirmed restored step")
     assert client.cancelled == ["job-1"]
+    assert client.calls == [("load", LOCAL_CHECKPOINT_ID, LOCAL_STAGE)]
     assert tmp_path.is_dir()
+    assert client.closed
 
 
 @pytest.mark.parametrize("marker", [None, b"", b"cp_123", b"global_step-1", b"\xff", b"global_step10" + b" " * 129])
 def test_local_resume_rejects_missing_or_invalid_marker_before_allocating_job(monkeypatch, tmp_path, marker) -> None:
     def unexpected(*args, **kwargs):
-        raise AssertionError("invalid latest marker must not allocate a job")
+        raise AssertionError("a FAST marker must not authorize cross-job resume")
 
     if marker is not None:
         (tmp_path / "latest").write_bytes(marker)
     monkeypatch.setattr(hosted, "ArcticClient", unexpected)
     with pytest.raises(ValueError, match="latest marker"):
+        hosted._local_resume_tag(tmp_path)
+    with pytest.raises(ValueError, match="durable checkpoint identity"):
         with HostedTransport(_local_backend(), _config()) as transport:
             with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
                 pass
@@ -488,17 +567,29 @@ def test_local_resume_refuses_a_symlink_latest_marker(monkeypatch, tmp_path) -> 
     target.write_text("global_step10\n", encoding="ascii")
     (tmp_path / "latest").symlink_to(target)
     with pytest.raises(ValueError, match="regular latest marker"):
+        hosted._local_resume_tag(tmp_path)
+    client = _LocalClient()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(ValueError, match="durable checkpoint identity"):
         with HostedTransport(_local_backend(), _config()) as transport:
             with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
                 pass
+    assert client.created == client.calls == client.cancelled == []
+    assert target.read_text(encoding="ascii") == "global_step10\n"
 
 
-def test_local_resume_refuses_a_nonregular_latest_marker(tmp_path) -> None:
+def test_local_resume_refuses_a_nonregular_latest_marker(monkeypatch, tmp_path) -> None:
     (tmp_path / "latest").mkdir()
     with pytest.raises(ValueError, match="regular latest marker"):
+        hosted._local_resume_tag(tmp_path)
+    client = _LocalClient()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(ValueError, match="durable checkpoint identity"):
         with HostedTransport(_local_backend(), _config()) as transport:
             with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
                 pass
+    assert client.created == client.calls == client.cancelled == []
+    assert (tmp_path / "latest").is_dir()
 
 
 @pytest.mark.parametrize("reference", ["cp_hosted", "relative/checkpoint", "/tmp/checkpoint", "/data-fast"])
@@ -507,7 +598,37 @@ def test_local_resume_rejects_nonfast_or_nonabsolute_reference_before_job_creati
         raise AssertionError("invalid reference must not create a training job")
 
     monkeypatch.setattr(hosted, "ArcticClient", unexpected)
-    with pytest.raises(ValueError, match="/data-fast"):
+    with pytest.raises(ValueError, match="durable checkpoint identity"):
         with HostedTransport(_local_backend(), _config()) as transport:
             with transport.job(resume_from=Checkpoint(reference, "owned-source")):
                 pass
+
+
+def test_local_resume_refuses_a_valid_fast_marker_before_allocating_job(monkeypatch, tmp_path) -> None:
+    (tmp_path / "latest").write_text("global_step10\n", encoding="ascii")
+    assert hosted._local_resume_tag(tmp_path) == "global_step10"
+    client = _LocalClient()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(ValueError, match="durable checkpoint identity"):
+        with HostedTransport(_local_backend(), _config()) as transport:
+            with transport.job(resume_from=Checkpoint(str(tmp_path), "owned-source")):
+                raise AssertionError("a valid FAST marker is not a durable identity")
+    assert client.created == client.calls == client.cancelled == []
+    assert (tmp_path / "latest").read_text(encoding="ascii") == "global_step10\n"
+
+
+def test_local_resume_requires_explicit_stage_before_allocating_job(monkeypatch, tmp_path) -> None:
+    checkpoint = hosted.LocalCortexCheckpoint(
+        LOCAL_CHECKPOINT_ID,
+        "owned-source",
+        str(tmp_path),
+        "global_step10",
+        10,
+    )
+    client = _LocalClient()
+    monkeypatch.setattr(hosted, "ArcticClient", client.create)
+    with pytest.raises(RuntimeError, match="explicit stage_info"):
+        with HostedTransport(_local_backend(), _config()) as transport:
+            with transport.job(resume_from=checkpoint):
+                raise AssertionError("a checkpoint id alone cannot resolve another parent's store")
+    assert client.created == client.calls == client.cancelled == []

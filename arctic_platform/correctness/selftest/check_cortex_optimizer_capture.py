@@ -22,6 +22,7 @@ from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 import requests
 import torch
@@ -30,8 +31,10 @@ from arctic_platform import wire
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client.transports.cortex import CortexTransport
+from arctic_platform.correctness.checks.optimizer_state import summarize_optimizer_artifacts
 from arctic_platform.correctness.harness import cortex_fixture
 from arctic_platform.correctness.harness import cortex_optimizer_capture as capture
+from arctic_platform.correctness.harness import reference_records
 from arctic_platform.correctness.harness import runner
 from arctic_platform.correctness.harness.arms import ArmDefinition
 from arctic_platform.correctness.harness.config import load_config
@@ -61,6 +64,54 @@ def _manifest(root, *, step=1):
     path = root / "manifest.json"
     path.write_text(json.dumps({"step": step, "parameters": [{"name": "weight", "file": filename}]}))
     return path
+
+
+def _prepared_references(monkeypatch, spec, cfg, tmp_path):
+    references = []
+    model = spec.test_settings["single-step-optimizer"]["model_cache_path"]
+    compact = {
+        "loss": 2.0,
+        "grad_norms": {"weight": 1.0},
+        "microbatches": 1,
+        "optimizer_norms": summarize_optimizer_artifacts(
+            _manifest(tmp_path / "prepared-reference"),
+            optimizer_config=cfg.training["optimizer"],
+            learning_rate=runner.OPTIMIZER_LEARNING_RATE,
+        ),
+        "optimizer_norm_gate": {
+            "criterion": "optimizer-state-l2-norm-v1",
+            "absolute": 1e-3,
+            "status": "reviewed",
+            "provenance": "selftest reviewed prepared reference",
+        },
+    }
+
+    def model_identity(path):
+        assert path == model == spec.model.cache_path
+        return {"sha256": "mock-reviewed-model"}
+
+    def workload_identity(ctx, test_id, recipe):
+        assert recipe["model"] == {"sha256": "mock-reviewed-model"}
+        assert recipe["token_budget"] == 10240
+        assert recipe["optimizer"]["learning_rate"] == runner.OPTIMIZER_LEARNING_RATE == 0.01
+        assert recipe["optimizer"]["config"] == cfg.training["optimizer"]
+        return {
+            "check_id": test_id,
+            "arm": f"gas{recipe['synthetic_inputs']['rows'] // cfg.n_gpus}",
+            "active_tokens": recipe["synthetic_inputs"]["batch"]["active_tokens"],
+        }
+
+    def load_record(ctx, identity):
+        key = identity["check_id"], identity["arm"]
+        references.append(key)
+        ctx.reference_record_paths["/".join(key)] = str(tmp_path / f"{key[0]}-{key[1]}.json")
+        return {**compact, "active_tokens": identity["active_tokens"]}
+
+    monkeypatch.setattr(reference_records, "model_identity", model_identity)
+    monkeypatch.setattr(reference_records, "workload_identity", workload_identity)
+    monkeypatch.setattr(reference_records, "load_record", load_record)
+    monkeypatch.setattr(runner, "run_reference", lambda *a, **k: pytest.fail("regression must not run HF"))
+    return references
 
 
 @pytest.fixture
@@ -260,39 +311,30 @@ def test_runner_public_cortex_capture_keeps_fixture_budget_gradient_and_cleanup(
     cfg = load_config(CONFIG)
     spec = Spec.read(SPEC)
     original = CONFIG.read_bytes(), SPEC.read_bytes()
-    creates, cancels, calls, references, snapshots = [], [], [], [], []
+    creates, cancels, calls, snapshots = [], [], [], []
+    references = _prepared_references(monkeypatch, spec, cfg, tmp_path)
     transports, closed = [], []
     replies = {}
     counts = {}
     exports, decodes = artifact_stubs
     cfg.training["debug"] = {"optimizer_state_output_dir": "/local-only-ray-hook"}
-    original_close = requests.Session.close
+    original_close = CortexTransport._close_session
 
-    def close(session):
-        closed.append(session)
-        return original_close(session)
+    async def close(transport):
+        if transport._session is not None:
+            closed.append((transport, transport._session))
+        await original_close(transport)
 
-    monkeypatch.setattr(requests.Session, "close", close)
+    monkeypatch.setattr(CortexTransport, "_close_session", close)
 
     def record(job_id, action):
         calls.append((job_id, action))
         if action == failure:
             raise RuntimeError("injected capture failure")
 
-    def reference(model, batch, out, **kwargs):
-        assert model == spec.model.cache_path
-        assert kwargs["token_budget"] == 10240
-        assert kwargs["learning_rate"] == 0.01
-        assert kwargs["optimizer_config"] == cfg.training["optimizer"]
-        references.append(model)
-        return {
-            "loss": 2.0,
-            "grad_norms": {"weight": 1.0},
-            "microbatches": 1,
-            "optimizer_state_manifest": str(_manifest(kwargs["optimizer_output_dir"])),
-        }
-
-    def send(transport, method, url, **kwargs):
+    async def send(transport, method, url, **kwargs):
+        if transport._session is None:
+            transport._session = aiohttp.ClientSession(headers=transport._auth_headers())
         if method == "POST" and url == transport._prefix:
             transports.append(transport)
             creates.append(kwargs["json"])
@@ -300,7 +342,18 @@ def test_runner_public_cortex_capture_keeps_fixture_budget_gradient_and_cleanup(
             counts[parent] = 0
             return {"job_id": parent}
         if method == "GET" and url == f"{transport._prefix}/{transport.job_id}":
-            return {"status": "RUNNING"}
+            state = "cancelled" if transport.job_id in cancels else "running"
+            return {
+                "job_id": transport.job_id,
+                "status": state,
+                "sub_jobs": [
+                    {
+                        "job_type": "training",
+                        "sub_job_id": f"{transport.job_id}:training:0",
+                        "status": state,
+                    }
+                ],
+            }
         if method == "GET" and url.endswith("/checkpoints"):
             return {"checkpoints": []}
         if method == "GET":
@@ -350,7 +403,6 @@ def test_runner_public_cortex_capture_keeps_fixture_budget_gradient_and_cleanup(
     exports.export_checkpoint = export
     decodes.decode_optimizer_capture = decode
     monkeypatch.setattr(cortex_fixture, "load_fixture", lambda *args: {"model_name": "published-reviewed"})
-    monkeypatch.setattr(runner, "run_reference", reference)
     monkeypatch.setattr(runner, "uses_mixer_packing", lambda *args: False)
     monkeypatch.setattr(CortexTransport, "_send", send)
 
@@ -388,16 +440,31 @@ def test_runner_public_cortex_capture_keeps_fixture_budget_gradient_and_cleanup(
         assert "capture_optimizer_step" in traceback
         assert "RuntimeError: injected capture failure" in traceback
         assert cancels == ["job-1"]
-        assert all(transport.job_id is None and transport.session in closed for transport in transports)
+        assert [transport for transport, _ in closed] == transports
+        assert all(session is not None and session.closed for _, session in closed)
+        assert all(transport.job_id is None and transport._session is None for transport in transports)
         assert all(not snapshot.exists() for snapshot in snapshots)
         assert not list((tmp_path / "optimizer" / "dss" / "gas1").iterdir())
+        assert references == [
+            (check, arm) for arm in ("gas1", "gas4") for check in ("single-step-grads", "single-step-optimizer")
+        ]
         assert CONFIG.read_bytes() == original[0] and SPEC.read_bytes() == original[1]
         return
     results = execute()
     assert len(results) == 4 and all(result.outcome is Outcome.PASS for result in results)
-    assert len(references) == len(creates) == len(cancels) == 2
+    assert references == [
+        (check, arm) for arm in ("gas1", "gas4") for check in ("single-step-grads", "single-step-optimizer")
+    ]
+    assert len(creates) == len(cancels) == 2
+    assert all(
+        result.metrics["stated_criterion_abs"] == 1e-3
+        for result in results
+        if result.test_id == "single-step-optimizer"
+    )
     assert cancels == ["job-1", "job-2"]
-    assert all(transport.job_id is None and transport.session in closed for transport in transports)
+    assert [transport for transport, _ in closed] == transports
+    assert all(session is not None and session.closed for _, session in closed)
+    assert all(transport.job_id is None and transport._session is None for transport in transports)
     assert counts == {"job-1": 1, "job-2": 1}
     for job_id in counts:
         assert [action for parent, action in calls if parent == job_id] == [
@@ -424,14 +491,7 @@ def test_runner_onprem_preserves_local_optimizer_capture(tmp_path, monkeypatch, 
     spec = Spec.read(SPEC)
     observed = []
     backend = OnPremConfig()
-
-    def reference(model, batch, out, **kwargs):
-        assert kwargs["token_budget"] == 10240 and kwargs["learning_rate"] == 0.01
-        return {
-            "loss": 2.0,
-            "microbatches": 1,
-            "optimizer_state_manifest": str(_manifest(kwargs["optimizer_output_dir"])),
-        }
+    references = _prepared_references(monkeypatch, spec, cfg, tmp_path)
 
     @contextmanager
     def gateway(path, slots, **kwargs):
@@ -448,7 +508,6 @@ def test_runner_onprem_preserves_local_optimizer_capture(tmp_path, monkeypatch, 
         path = Path(payload["training_config"]["debug"]["optimizer_state_output_dir"]) / "step1"
         return StepResult(2.0, {}, optimizer_state_manifest=str(_manifest(path)))
 
-    monkeypatch.setattr(runner, "run_reference", reference)
     monkeypatch.setattr(runner, "uses_mixer_packing", lambda *args: False)
     monkeypatch.setattr(runner, "gateway", gateway)
     monkeypatch.setattr(runner, "running_job", running_job)
@@ -465,5 +524,7 @@ def test_runner_onprem_preserves_local_optimizer_capture(tmp_path, monkeypatch, 
         order=order,
     )
     assert len(results) == 1 and results[0].outcome is Outcome.PASS
+    assert references == [("single-step-optimizer", "gas1")]
+    assert results[0].metrics["stated_criterion_abs"] == 1e-3
     assert observed[0]["model_name"] == spec.model.cache_path
     assert "hardware" not in observed[0]

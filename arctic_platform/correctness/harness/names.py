@@ -18,7 +18,8 @@
 Container aliases are removed first. PrimeRL then needs one architecture conversion: Qwen3.5 MoE stores
 routed gate/up projections as separate ``w1`` and ``w3`` tensors, while Hugging Face stores their
 concatenation as ``gate_up_proj``. The L2 norm of that concatenated gradient is exactly
-``hypot(norm(w1), norm(w3))``. Router and shared-expert paths are renamed without changing their values.
+``hypot(norm(w1), norm(w3))``. Router and shared-expert paths, including Qwen4's ``qwen_shared_expert``
+container, are renamed without changing their values.
 
 Checkpoint wrapping can expose more than one name for one tensor. Equal-norm aliases collapse to one
 semantic parameter; unequal aliases remain unmatched so the correctness test cannot hide a real collision.
@@ -50,7 +51,9 @@ _CONTAINER_SEGMENTS = frozenset(
 )
 
 _ROUTED_EXPERT = re.compile(r"^(?P<prefix>.*\.mlp\.experts)\.(?P<weight>w[123])$")
-_SHARED_EXPERT = re.compile(r"^(?P<layer>(?:.*\.)?layers\.\d+)\.(?:mlp\.)?shared_expert\.(?P<weight>w[123])\.weight$")
+_SHARED_EXPERT = re.compile(
+    r"^(?P<layer>(?:.*\.)?layers\.\d+)\.(?:mlp\.)?(?:qwen_)?shared_expert\.(?P<weight>w[123])\.weight$"
+)
 _SHARED_NAMES = {
     "w1": "gate_proj.weight",
     "w2": "down_proj.weight",

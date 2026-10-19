@@ -145,12 +145,9 @@ def _gateway_runtime(slots: int) -> Iterator[None]:
 
     include_peers = slots > torch.cuda.device_count()
     previous_master_port = os.environ.get("MASTER_PORT")
-    previous_auth_mode = os.environ.get("RAY_AUTH_MODE")
     os.environ["MASTER_PORT"] = str(_STANDARD_MASTER_PORT)
-    os.environ["RAY_AUTH_MODE"] = "token"
     ray_cluster = None
     try:
-        # Ray reads auth mode while importing its C extension; set the harness policy before importing Ray.
         ray_cluster = _load_gateway_ray_cluster()
         _stop_and_verify_gateway_runtime()
         ray_cluster.init_ray_cluster(auto_attach=False, include_peers=include_peers)
@@ -167,10 +164,6 @@ def _gateway_runtime(slots: int) -> Iterator[None]:
                     os.environ.pop("MASTER_PORT", None)
                 else:
                     os.environ["MASTER_PORT"] = previous_master_port
-                if previous_auth_mode is None:
-                    os.environ.pop("RAY_AUTH_MODE", None)
-                else:
-                    os.environ["RAY_AUTH_MODE"] = previous_auth_mode
 
 
 @contextlib.contextmanager

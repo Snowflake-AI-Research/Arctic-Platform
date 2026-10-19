@@ -23,6 +23,7 @@ import torch
 from arctic_platform.correctness.checks.fwd_bwd_step import _compare_arm
 from arctic_platform.correctness.checks.optimizer_state import compare_optimizer_artifacts
 from arctic_platform.correctness.checks.optimizer_state import max_pairwise_optimizer_delta
+from arctic_platform.correctness.checks.optimizer_state import summarize_optimizer_artifacts
 from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
 from arctic_platform.correctness.harness.runner import OPTIMIZER_LEARNING_RATE
 from arctic_platform.correctness.harness.spec import TestTolerance as Tolerance
@@ -149,7 +150,7 @@ def test_compare_optimizer_artifacts_rejects_shape_mismatch(tmp_path):
         compare_optimizer_artifacts(dss, reference, **COMPARE_KWARGS)
 
 
-def test_delta_update_arm_applies_frozen_gate_to_every_state(tmp_path):
+def test_delta_update_arm_applies_reviewed_norm_gate_to_every_state(tmp_path):
     reference = _write_artifact(
         tmp_path / "reference",
         "layer.weight",
@@ -165,12 +166,22 @@ def test_delta_update_arm_applies_frozen_gate_to_every_state(tmp_path):
         _first_step_adam_state(torch.tensor([0.02, 0.0]), backend="dss"),
     )
     spec = SimpleNamespace(
-        tolerance_for=lambda test_id: 1e-3,
-        test_tolerances={"single-step-optimizer": Tolerance(absolute=1e-3)},
+        tolerance_for=lambda test_id: 1.0,
+        test_tolerances={"single-step-optimizer": Tolerance(absolute=1.0)},
     )
     ctx = SimpleNamespace(config_id="config", spec=spec, cfg=SimpleNamespace(training={"optimizer": {}}))
     arm = SimpleNamespace(name="gas1")
-    reference_result = {"optimizer_state_manifest": str(reference), "loss": 2.0, "microbatches": 1}
+    reference_result = {
+        "optimizer_norms": summarize_optimizer_artifacts(reference, **COMPARE_KWARGS),
+        "optimizer_norm_gate": {
+            "criterion": "optimizer-state-l2-norm-v1",
+            "absolute": 1e-3,
+            "status": "reviewed",
+            "provenance": "selftest reviewed reference calibration",
+        },
+        "loss": 2.0,
+        "microbatches": 1,
+    }
     dss_result = SimpleNamespace(
         optimizer_state_manifest=str(dss_manifest),
         avg_loss=2.0,
@@ -182,6 +193,7 @@ def test_delta_update_arm_applies_frozen_gate_to_every_state(tmp_path):
     assert result.outcome is Outcome.FAIL
     assert result.metrics["optimizer_values_compared"] == 3
     assert result.metrics["optimizer_values_over_criterion"] == 1
+    assert result.metrics["stated_criterion_abs"] == 1e-3
     assert result.worst_name == "layer.weight::exp_avg"
     assert [mismatch.name for mismatch in result.mismatches] == ["layer.weight::exp_avg"]
 

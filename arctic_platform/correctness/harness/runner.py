@@ -15,9 +15,8 @@
 
 """Execute selected tests for one config and collect their results.
 
-Ordering is forced by the hardware. The reference needs one GPU with nothing else on the node, and the
-gateway claims every GPU it is given, so all reference arms run first, in a subprocess so their CUDA
-context is reclaimed, and the gateway comes up afterwards.
+HF measurements are prepared explicitly during onboarding. Regression validates compact Git records
+and reconstructed inputs before allocating any target GPUs. Normal-workload references stay live.
 """
 
 from __future__ import annotations
@@ -30,6 +29,7 @@ import subprocess
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from dataclasses import field
@@ -87,7 +87,12 @@ class RunContext:
     target_model_name: str | None = None
     local_gateway_full_model: bool = False
     local_full_model_path: str | None = None
+    inference_sampling_topology: tuple[int, int, int] | None = None
+    prepare_references: bool = False
+    reference_records_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1] / "reference_data")
+    reference_record_paths: Dict[str, str] = field(default_factory=dict)
     _reference: Dict[str, dict] = field(default_factory=dict)
+    _reference_by_check: Dict[str, Dict[str, dict]] = field(default_factory=dict)
     _target: Dict[str, object] = field(default_factory=dict)
     # Seconds spent in each engine per case, so the report can say which case dominates the run.
     _timing: Dict[str, Dict[str, float]] = field(default_factory=dict)
@@ -223,7 +228,19 @@ def run_reference(
         env["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if proc.returncode != 0:
-        raise RuntimeError(f"reference failed ({proc.returncode}):\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}")
+        try:
+            log_dir = require_data_fast_path(out_path.parent, label="reference failure logs")
+        except ValueError:
+            log_dir = correctness_workdir("hf-reference-failure-")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_log = require_data_fast_path(log_dir / f"{out_path.stem}.stdout.log", label="reference stdout")
+        stderr_log = require_data_fast_path(log_dir / f"{out_path.stem}.stderr.log", label="reference stderr")
+        stdout_log.write_text(proc.stdout)
+        stderr_log.write_text(proc.stderr)
+        raise RuntimeError(
+            f"reference failed ({proc.returncode}); full stdout: {stdout_log}; full stderr: {stderr_log}:\n"
+            f"{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+        )
     return json.loads(out_path.read_text())
 
 
@@ -312,14 +329,20 @@ def cortex_unavailable_reason(test, published_fixture: dict | None = None) -> st
 
 
 def _cortex_rejection(
-    test, cfg, published_fixture: dict | None = None, *, local_gateway_full_model: bool = False
+    test,
+    cfg,
+    published_fixture: dict | None = None,
+    *,
+    local_gateway_full_model: bool = False,
+    local_gateway_lora_save0: bool = False,
 ) -> TestResult | None:
     reason = (
         None
         if local_gateway_full_model and test.test_id == "e2e-sft-train-validate"
         else cortex_unavailable_reason(test, published_fixture)
     )
-    if reason is None and test.compares_to_reference and cfg.training.get("peft_config"):
+    save0_check = local_gateway_lora_save0 and test.test_id in {"single-step-grads", "single-step-optimizer"}
+    if reason is None and test.compares_to_reference and cfg.training.get("peft_config") and not save0_check:
         reason = "Cortex reference comparisons cannot export the product-initialized LoRA adapter"
     if reason is None:
         return None
@@ -346,16 +369,52 @@ def validate_local_full_model(backend: CortexConfig, cfg: LoadedConfig, spec: Te
     require_local_cortex_gateway(backend)
     if os.environ.get("HF_HUB_OFFLINE") != "1" or os.environ.get("DSS_ALLOW_REMOTE_MODELS") != "1":
         raise ValueError("local full model requires offline HF cache and DSS_ALLOW_REMOTE_MODELS=1")
-    # This explicit local mode is bounded to the pinned source of the requested Qwen3-8B config.
-    revision = "b968826d9c46dd6066d109eabc6255188de91218"
-    if cfg.model_name != "Qwen/Qwen3-8B" or spec.model.source_checkpoint != cfg.model_name:
-        raise ValueError("local full model mode currently supports only the pinned Qwen/Qwen3-8B source")
+    tensor_count, shard_count, payload_bytes = 1199, 18, 55562855904
+    vocabulary_shape = [248320, 5120]
+    schema_sha256 = "9c0eb904ed294a62882adb287b81e36fdb48e5fb8e006ee25b084341ac78fd55"
+    dtype_bytes = {"BF16": 2, "F32": 4}
+    if cfg.model_name == "Qwen/Qwen3-8B" and spec.model.source_checkpoint == cfg.model_name:
+        revision = "b968826d9c46dd6066d109eabc6255188de91218"
+        config_sha256 = "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30"
+        index_sha256 = None
+        layer_pattern = r"model\.layers\.(\d+)\."
+    elif (
+        cfg.config_id == "qwen3.8-27b-b200-train-sft-8gpus-2k"
+        and cfg.model_name == "Qwen/Qwen3.8-27B"
+        and spec.model.source_checkpoint in {cfg.model_name, "/data-fast/base-models/Qwen/Qwen3.8-27B"}
+    ):
+        revision = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+        config_sha256 = "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab"
+        index_sha256 = "77042094076611b69791a610065f28b7013b8c621795fa86ddccc8bac7d1b9df"
+        layer_pattern = r"model\.language_model\.layers\.(\d+)\."
+    elif (
+        cfg.config_id == "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k"
+        and cfg.model_name == "Qwen/Qwen3.8-Flash-Next"
+        and spec.model.source_checkpoint
+        in {
+            cfg.model_name,
+            (
+                "/checkpoint/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next/"
+                "snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540"
+            ),
+        }
+    ):
+        revision = "de4b8e4d43b917e7706784d8bb445c9af86a3540"
+        config_sha256 = "889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b"
+        index_sha256 = "99e815241ef03325536b0aaa4441deea45174c17fae31e10f0bb456410c590de"
+        layer_pattern = r"model\.language_model\.layers\.(\d+)\."
+        tensor_count, shard_count, payload_bytes = 1658, 131, 359999963128
+        vocabulary_shape = [248320, 2560]
+        schema_sha256 = "1d55a6d3f64b1b2b004302864c0e74e11871ddf9f3481b10fc21fc8b0ec53d26"
+        dtype_bytes = {"BF16": 2, "I64": 8}
+    else:
+        raise ValueError("local full model mode requires a supported pinned original source")
     cache = require_data_fast_path(os.environ.get("HF_HUB_CACHE", ""), label="offline full model cache")
     config_file = cached_file(cfg.model_name, "config.json", local_files_only=True)
     if not isinstance(config_file, str):
         raise ValueError("original full model config is not present in the offline cache")
     root = require_data_fast_path(Path(config_file).parent, label="offline full model snapshot")
-    if root != cache / "models--Qwen--Qwen3-8B" / "snapshots" / revision:
+    if root != cache / ("models--" + cfg.model_name.replace("/", "--")) / "snapshots" / revision:
         raise ValueError("offline full model snapshot does not match the pinned original revision")
 
     def readable(relative: str) -> Path:
@@ -368,12 +427,15 @@ def validate_local_full_model(backend: CortexConfig, cfg: LoadedConfig, spec: Te
         return resolved
 
     config_bytes = readable("config.json").read_bytes()
-    if hashlib.sha256(config_bytes).hexdigest() != "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30":
-        raise ValueError("offline full model config does not match the pinned original Qwen3-8B config")
+    if hashlib.sha256(config_bytes).hexdigest() != config_sha256:
+        raise ValueError("offline full model config does not match the pinned original config")
     config = json.loads(config_bytes)
     readable("tokenizer_config.json")
     readable("tokenizer.json")
-    index = json.loads(readable("model.safetensors.index.json").read_text())
+    index_bytes = readable("model.safetensors.index.json").read_bytes()
+    if index_sha256 is not None and hashlib.sha256(index_bytes).hexdigest() != index_sha256:
+        raise ValueError("offline full model index does not match the pinned original index")
+    index = json.loads(index_bytes)
     mapping = index.get("weight_map") if isinstance(index, dict) else None
     if (
         not isinstance(mapping, dict)
@@ -384,16 +446,63 @@ def validate_local_full_model(backend: CortexConfig, cfg: LoadedConfig, spec: Te
         )
     ):
         raise ValueError("offline full model requires an indexed safetensors checkpoint")
+    if index_sha256 is not None and (
+        len(mapping) != tensor_count
+        or index.get("metadata", {}).get("total_size") != payload_bytes
+        or set(mapping.values())
+        != {f"model-{i:05d}-of-{shard_count:05d}.safetensors" for i in range(1, shard_count + 1)}
+    ):
+        raise ValueError("offline full model index is missing original tensors or shards")
     keys = set()
+    vocabulary_shapes = {}
+    tensor_bytes = 0
+    tensor_schema = {}
     for shard in sorted(set(mapping.values())):
         with safe_open(readable(shard), framework="pt", device="cpu") as stream:
             actual = set(stream.keys())
             if actual != {name for name, filename in mapping.items() if filename == shard} or keys & actual:
                 raise ValueError("offline full model safetensors keys do not match the complete weight index")
             keys.update(actual)
-    layers = {int(match.group(1)) for name in keys if (match := re.match(r"model\.layers\.(\d+)\.", name)) is not None}
-    if layers != set(range(config["num_hidden_layers"])):
+            if index_sha256 is not None:
+                # Read tensor headers, not the full weights or GPU tensors.
+                for name in actual:
+                    view = stream.get_slice(name)
+                    shape = view.get_shape()
+                    dtype = view.get_dtype()
+                    tensor_schema[name] = [dtype, shape]
+                    if dtype not in dtype_bytes:
+                        raise ValueError("offline full model tensor dtype differs from the original source")
+                    elements = 1
+                    for size in shape:
+                        elements *= size
+                    tensor_bytes += elements * dtype_bytes[dtype]
+                    if name in {"lm_head.weight", "model.language_model.embed_tokens.weight"}:
+                        vocabulary_shapes[name] = shape
+    layers = {int(match.group(1)) for name in keys if (match := re.match(layer_pattern, name)) is not None}
+    text_config = config.get("text_config", config)
+    if layers != set(range(text_config["num_hidden_layers"])):
         raise ValueError("offline full model checkpoint is missing original transformer layers")
+    if index_sha256 is not None:
+        vision_layers = {
+            int(match.group(1))
+            for name in keys
+            if (match := re.match(r"model\.visual\.blocks\.(\d+)\.", name)) is not None
+        }
+        if (
+            vision_layers != set(range(config["vision_config"]["depth"]))
+            or tensor_bytes != payload_bytes
+            or vocabulary_shapes
+            != {
+                "lm_head.weight": vocabulary_shape,
+                "model.language_model.embed_tokens.weight": vocabulary_shape,
+            }
+        ):
+            raise ValueError("offline full model checkpoint is missing original vision or vocabulary tensors")
+        schema_bytes = json.dumps(tensor_schema, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+            "ascii"
+        )
+        if hashlib.sha256(schema_bytes).hexdigest() != schema_sha256:
+            raise ValueError("offline full model tensor shapes or dtypes differ from the pinned original source")
     return root
 
 
@@ -415,6 +524,11 @@ def execute(
     cortex_fixture: Path | None = None,
     local_cortex_fixture: bool = False,
     local_gateway_full_model: bool = False,
+    local_gateway_lora_save0: bool = False,
+    prepare_references: bool = False,
+    reference_records_dir: Path | None = None,
+    reference_calibration_runs: int = 16,
+    reference_calibration_workers: int = 1,
 ) -> List[TestResult]:
     """Use the config's GPU-family FlashAttention kernel for the reference unless explicitly overridden.
 
@@ -425,7 +539,38 @@ def execute(
     if workdir is not None:
         workdir = require_data_fast_path(workdir, label="correctness workdir")
     cfg = cfg.at_gpu_width(cfg.n_gpus)
+    if prepare_references and (
+        not select or not set(select) <= {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}
+    ):
+        raise ValueError("reference preparation supports only explicit HF reference check selection")
     client_backend = client_backend if client_backend is not None else OnPremConfig()
+    if local_gateway_lora_save0:
+        if (
+            not isinstance(client_backend, CortexConfig)
+            or not local_cortex_fixture
+            or cortex_fixture is not None
+            or local_gateway_full_model
+            or prepare_references
+            or reference_records_dir is None
+            or not select
+            or not set(select) <= {"single-step-grads", "single-step-optimizer"}
+            or cfg.config_id != "qwen3-8b-h200-train-sft-lora-4gpus-64k"
+            or spec.config_id != cfg.config_id
+            or cfg.model_name != "Qwen/Qwen3-8B"
+            or cfg.n_gpus != 4
+            or cfg.is_rl
+            or not cfg.training.get("peft_config")
+            or spec.model.source_checkpoint != cfg.model_name
+            or spec.model.num_hidden_layers != 4
+            or any(cfg.training.get(key, 1) != 1 for key in ("ep_size", "sp_size"))
+        ):
+            raise ValueError(
+                "LoRA SAVE0 requires cached-only original four-GPU dense Qwen3-8B LoRA "
+                "grads/optimizer with the reviewed four-layer local Cortex fixture"
+            )
+        from .hosted import require_local_cortex_gateway
+
+        require_local_cortex_gateway(client_backend)
     tests = registered_tests()
     assert_applicable_tests_registered(spec, cfg.config_id)
     chosen = [t for t in tests.values() if select is None or t.test_id in select]
@@ -442,7 +587,7 @@ def execute(
         ):
             raise ValueError("local full model requires one loopback Cortex backend and only full-model checks")
         local_full_model_path = str(validate_local_full_model(client_backend, cfg, spec))
-    if local_cortex_fixture:
+    if local_cortex_fixture and not prepare_references:
         from .cortex_fixture import load_local_fixture
 
         if not isinstance(client_backend, CortexConfig) or cortex_fixture is not None:
@@ -471,13 +616,17 @@ def execute(
         if not isinstance(client_backend, CortexConfig):
             raise ValueError("--cortex-fixture requires --backend cortex")
         published_fixture = load_fixture(cortex_fixture, spec)
-    if isinstance(client_backend, CortexConfig):
+    if isinstance(client_backend, CortexConfig) and not prepare_references:
         rejected = []
         for test in chosen:
             if test.test_id not in spec.applicable_tests:
                 continue
             rejection = _cortex_rejection(
-                test, cfg, published_fixture, local_gateway_full_model=local_gateway_full_model
+                test,
+                cfg,
+                published_fixture,
+                local_gateway_full_model=local_gateway_full_model,
+                local_gateway_lora_save0=local_gateway_lora_save0,
             )
             if rejection is not None:
                 results.append(rejection)
@@ -565,6 +714,8 @@ def execute(
         target_model_name=published_fixture["model_name"] if published_fixture is not None else None,
         local_gateway_full_model=local_gateway_full_model,
         local_full_model_path=local_full_model_path,
+        prepare_references=prepare_references,
+        **({"reference_records_dir": reference_records_dir} if reference_records_dir is not None else {}),
     )
 
     run_started = time.monotonic()
@@ -592,6 +743,10 @@ def execute(
             payload["training_config"]["debug"].pop("optimizer_state_output_dir", None)
             if cfg.gpu_type is not None:
                 payload["hardware"] = cfg.gpu_type.upper()
+        if context.reference_adapter_path is not None and not local_gateway_lora_save0:
+            from .deterministic_lora import bind_payload
+
+            payload = bind_payload(payload, context.reference_adapter_path)
         return payload
 
     def measure_target(session, job, arm: ArmSpec):
@@ -624,30 +779,48 @@ def execute(
     reference_training = cfg.effective_training
     if per_arm_tests and cfg.training.get("peft_config"):
         with console.activity("Preparing LoRA adapter"):
-            reference_adapter_path = materialize_dss_peft_adapter(
-                cfg,
-                reference_model_path,
-                tmp / "reference-adapter-init",
-                attn_implementation=attn_impl,
-            )
+            from .deterministic_lora import materialize_adapter
+
+            reference_adapter_path = materialize_adapter(cfg, reference_model_path, tmp / "reference-adapter-init")
     else:
         reference_adapter_path = None
     context.reference_adapter_path = reference_adapter_path
+    save0_metadata = None
+    if reference_adapter_path is not None and not prepare_references:
+        if local_gateway_lora_save0:
+            from .deterministic_lora import adapter_identity
+            from .lora_save0 import bind_initialization
+
+            save0_metadata = adapter_identity(reference_adapter_path)
+            bind_initialization(build_payload(cfg.training, target_model, SEED), save0_metadata)
+        else:
+            from .deterministic_lora import bind_payload
+
+            bind_payload(build_payload(cfg.training, target_model, SEED), reference_adapter_path)
+    if local_gateway_lora_save0 and save0_metadata is None:
+        raise ValueError("LoRA SAVE0 requires a verified deterministic reference adapter")
 
     from .batches import load as load_batch
 
-    def measure_reference(arm: ArmSpec) -> None:
+    def measure_reference(
+        arm: ArmSpec,
+        *,
+        output_name: str | None = None,
+        cuda_device: int | None = None,
+        deterministic: bool = True,
+    ) -> dict:
         started = time.monotonic()
+        output_name = output_name or arm.name
         optimizer_output_dir = None
         if stepping:
             optimizer_output_dir = require_data_fast_path(
-                tmp / "optimizer" / "reference" / arm.name / "states", label="reference optimizer output"
+                tmp / "optimizer" / "reference" / output_name / "states", label="reference optimizer output"
             )
             optimizer_output_dir.parent.mkdir(parents=True, exist_ok=True)
         ref = run_reference(
             reference_model_path,
             batch_paths[arm.name],
-            tmp / f"ref-{arm.name}.json",
+            tmp / f"ref-{output_name}.json",
             token_budget=reference_token_budget,
             ce_chunk=ce_chunk,
             attn=reference_attn or cfg.attention_implementation,
@@ -665,18 +838,164 @@ def execute(
             gradient_clipping=cfg.training.get("gradient_clipping"),
             optimizer_dtype=cfg.optimizer_dtype,
             optimizer_output_dir=optimizer_output_dir,
+            cuda_device=cuda_device,
+            deterministic=deterministic,
         )
         elapsed = time.monotonic() - started
         context._reference[arm.name] = ref
         context._timing.setdefault(arm.name, {})["reference"] = elapsed
+        return ref
+
+    from .reference_records import ReferencePrerequisiteError
+    from .reference_records import batch_identity
+    from .reference_records import load_record
+    from .reference_records import model_identity
+    from .reference_records import publish_record
+    from .reference_records import workload_identity
+
+    def reference_identity(test_id: str, arm: ArmSpec) -> dict:
+        batch = load_batch(batch_paths[arm.name])
+        initialization = "external-model"
+        if reference_adapter_path is not None:
+            from .deterministic_lora import adapter_identity
+
+            initialization = adapter_identity(reference_adapter_path)
+        recipe = {
+            "model": model_identity(reference_model_path),
+            "initialization": initialization,
+            "synthetic_inputs": {
+                "version": "private-cpu-generator-v1",
+                "seed": SEED,
+                "rows": arm.global_batch_size,
+                "max_seq_len": arm.max_seq_len,
+                "vocab_size": vocab_size,
+                "batch": batch_identity(batch),
+            },
+            "attention": reference_attn or cfg.attention_implementation,
+            "token_budget": reference_token_budget,
+            "ce_chunk": ce_chunk,
+            "training": {
+                "fp32_lm_head": bool(reference_training.get("fp32_lm_head", False)),
+                "fused_cross_entropy": cfg.fused_cross_entropy,
+                "mixer_packing": uses_mixer_packing(reference_model_path),
+                "matmul_precision": reference_training.get("matmul_precision", "highest"),
+                "peft_config": reference_training.get("peft_config"),
+                "lm_head_token_chunk_size": cfg.lm_head_token_chunk_size,
+                "lm_head_vocab_chunk_size": reference_training.get("fused_lm_head_vocab_chunk_size", 8192),
+                "deterministic": True,
+            },
+            "optimizer": (
+                {
+                    "config": optimizer_config,
+                    "learning_rate": OPTIMIZER_LEARNING_RATE,
+                    "gradient_clipping": cfg.training.get("gradient_clipping"),
+                    "dtype": cfg.optimizer_dtype,
+                }
+                if stepping
+                else None
+            ),
+        }
+        return workload_identity(context, test_id, recipe)
+
+    def prepared_reference(arm: ArmSpec) -> None:
+        identities = {test.test_id: reference_identity(test.test_id, arm) for test in per_arm_tests}
+        records = {}
+        for test_id, identity in identities.items():
+            try:
+                records[test_id] = load_record(context, identity)
+            except ReferencePrerequisiteError as exc:
+                if not prepare_references or "prepared HF reference missing:" not in str(exc):
+                    raise
+        if len(records) != len(identities):
+            if not prepare_references:
+                raise ReferencePrerequisiteError("HF reference preparation required")
+            reference = measure_reference(arm)
+            compact = {key: value for key, value in reference.items() if key != "optimizer_state_manifest"}
+            if stepping:
+                from decimal import ROUND_CEILING
+                from decimal import Decimal
+
+                from ..checks.optimizer_state import max_pairwise_optimizer_norm_delta
+                from ..checks.optimizer_state import summarize_optimizer_artifacts
+
+                if reference_calibration_runs < 2 or reference_calibration_workers < 1:
+                    raise ValueError("norm onboarding requires at least two calibration runs and one worker")
+                compact["optimizer_norms"] = summarize_optimizer_artifacts(
+                    Path(reference["optimizer_state_manifest"]),
+                    optimizer_config=optimizer_config,
+                    learning_rate=OPTIMIZER_LEARNING_RATE,
+                )
+                print(
+                    f"Onboarding optimizer norm gate: {reference_calibration_runs} HF runs, "
+                    f"{reference_calibration_workers} worker(s), arm={arm.name}",
+                    flush=True,
+                )
+                manifests = []
+                for start in range(0, reference_calibration_runs, reference_calibration_workers):
+                    indices = range(start, min(start + reference_calibration_workers, reference_calibration_runs))
+                    with ThreadPoolExecutor(max_workers=reference_calibration_workers) as pool:
+                        futures = [
+                            pool.submit(
+                                measure_reference,
+                                arm,
+                                output_name=f"{arm.name}-calibration-{index}",
+                                cuda_device=index % reference_calibration_workers,
+                                deterministic=False,
+                            )
+                            for index in indices
+                        ]
+                        manifests.extend(Path(future.result()["optimizer_state_manifest"]) for future in futures)
+                worst = max_pairwise_optimizer_norm_delta(
+                    manifests, optimizer_config=optimizer_config, learning_rate=OPTIMIZER_LEARNING_RATE
+                )
+                spread = worst.delta_norm if worst is not None else 0.0
+                quantum = Decimal("0.001")
+                absolute = float(
+                    max(
+                        quantum,
+                        (Decimal(str(4 * spread)) / quantum).to_integral_value(rounding=ROUND_CEILING) * quantum,
+                    )
+                )
+                compact["optimizer_norm_gate"] = {
+                    "criterion": "optimizer-state-l2-norm-v1",
+                    "absolute": absolute,
+                    "status": "reviewed",
+                    "provenance": {
+                        "policy": "onboarding-norm-repeatability-4x-upward-1e-3-v1",
+                        "calibration_runs": reference_calibration_runs,
+                        "maximum_pairwise_norm_delta": spread,
+                        "worst_quantity": f"{worst.name}::{worst.state}" if worst is not None else None,
+                        "multiplier": 4,
+                        "minimum_gate": 0.001,
+                    },
+                }
+            for test_id, identity in identities.items():
+                if test_id not in records:
+                    publish_record(context, identity, compact)
+                    records[test_id] = compact
+        primary = "single-step-optimizer" if stepping else "single-step-grads"
+        context._reference_by_check[arm.name] = records
+        context._reference[arm.name] = records[primary]
+        context._timing.setdefault(arm.name, {})["reference"] = 0.0
+
+    # Validate every prerequisite before allocating any target job, including arm-at-a-time runs.
+    for arm in arm_specs if per_arm_tests else []:
+        prepared_reference(arm)
+    if prepare_references:
+        for test in whole_run_tests:
+            list(test.fn(context))
+        print(f"HF reference preparation complete: {len(context.reference_record_paths)} record(s)", flush=True)
+        return []
 
     def judge(arm: ArmSpec) -> bool:
         """Print each per-arm verdict as it is reached. True when any verdict for this arm is not a pass."""
         bad = False
         for test in per_arm_tests:
             try:
+                context._reference[arm.name] = context._reference_by_check[arm.name][test.test_id]
                 result = test.per_arm(context, arm)
             except Exception as exc:  # noqa: BLE001 - one failing test must not hide the rest
+                traceback.print_exc()
                 result = TestResult(
                     test_id=test.test_id,
                     config_id=cfg.config_id,
@@ -694,7 +1013,20 @@ def execute(
     def measure_target_arm(session, arm: ArmSpec) -> bool:
         try:
             with console.activity(f"Running Arctic Platform {arm.name}"):
-                with running_job(session, payload_for(arm)) as job_id:
+                with ExitStack() as job_stack:
+                    if local_gateway_lora_save0:
+                        from .lora_save0 import verified_running_job
+
+                        job_id, _proof = job_stack.enter_context(
+                            verified_running_job(
+                                session,
+                                payload_for(arm),
+                                save0_metadata,
+                                proof_path=tmp / "lora-save0" / f"{arm.name}.json",
+                            )
+                        )
+                    else:
+                        job_id = job_stack.enter_context(running_job(session, payload_for(arm)))
                     started = time.monotonic()
                     context._target[arm.name] = measure_target(session, job_id, arm)
                     context._timing.setdefault(arm.name, {})["dss"] = time.monotonic() - started
@@ -718,9 +1050,6 @@ def execute(
     measured: List[ArmSpec] = []
     if per_arm_tests:
         if order == "batched":
-            for arm in arm_specs:
-                with console.activity(f"Running reference {arm.name}"):
-                    measure_reference(arm)
             # One job per case, sharing the gateway. Reading the gradient norms costs an optimizer update,
             # because ``/step`` is the only endpoint that returns them, so a job that has served one case is
             # no longer holding the checkpoint's weights. Sharing it would make each case depend on the ones
@@ -738,8 +1067,6 @@ def execute(
                         break
         else:
             for arm in arm_specs:
-                with console.activity(f"Running reference {arm.name}"):
-                    measure_reference(arm)
                 with ExitStack() as stack:
                     with console.activity("Starting Arctic Platform gateway"):
                         url = stack.enter_context(gateway(tmp, cfg.n_gpus, backend=client_backend))
@@ -765,6 +1092,7 @@ def execute(
         try:
             produced = list(test.fn(context))
         except Exception as exc:  # noqa: BLE001 - one failing test must not hide the rest
+            traceback.print_exc()
             produced = [
                 TestResult(
                     test_id=test.test_id,

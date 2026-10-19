@@ -40,6 +40,9 @@ GPU_ATTENTION_IMPLEMENTATIONS = {
     "b200": "flash_attention_4",
     "b300": "flash_attention_4",
 }
+MODEL_ATTENTION_IMPLEMENTATIONS = {
+    "Qwen/Qwen3.8-Flash-Next": "qsa_flex",
+}
 
 
 @dataclass
@@ -206,12 +209,14 @@ class LoadedConfig:
 
     @property
     def attention_implementation(self) -> str:
-        """Attention backend required by the accelerator named in the config path."""
+        """Use the model's required backend, otherwise the config's accelerator-family backend."""
         configured = self.training.get("attn_implementation")
-        expected = expected_attention_implementation(self.gpu_type)
+        model_expected = MODEL_ATTENTION_IMPLEMENTATIONS.get(self.model_name)
+        expected = model_expected or expected_attention_implementation(self.gpu_type)
         if configured is not None and expected is not None and configured != expected:
+            requirement = self.model_name if model_expected else self.gpu_type
             raise ValueError(
-                f"{self.config_id}: {self.gpu_type} requires attn_implementation={expected!r}, "
+                f"{self.config_id}: {requirement} requires attn_implementation={expected!r}, "
                 f"but the config selects {configured!r}"
             )
         if configured is not None:

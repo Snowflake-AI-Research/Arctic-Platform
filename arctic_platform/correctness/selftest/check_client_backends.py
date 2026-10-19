@@ -15,10 +15,12 @@
 
 """Backend selection and current Cortex wire contracts without GPUs or network."""
 
+import asyncio
 from argparse import Namespace
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
+import aiohttp
 import pytest
 import requests
 import torch
@@ -28,7 +30,9 @@ from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import TrainingConfig
 from arctic_platform.client.transport import JobHandles
+from arctic_platform.client.transports.cortex import _DEFAULT
 from arctic_platform.client.transports.cortex import CortexTransport
+from arctic_platform.client.transports.cortex import _SendPolicy
 from arctic_platform.correctness import __main__ as cli
 from arctic_platform.correctness.checks import inference_checkpoint_loss as inference
 from arctic_platform.correctness.harness import cortex_fixture
@@ -50,9 +54,45 @@ def _remote():
 
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
-    monkeypatch.setattr(
-        requests.Session, "request", lambda *args, **kwargs: pytest.fail("unit tests must not access the network")
-    )
+    def forbidden(*args, **kwargs):
+        pytest.fail("unit tests must not access the network")
+
+    monkeypatch.setattr(requests.Session, "request", forbidden)
+    monkeypatch.setattr(aiohttp.ClientSession, "request", forbidden)
+    transports = []
+    original_start = CortexTransport._start_loop
+
+    def start(transport):
+        original_start(transport)
+        transports.append(transport)
+
+    monkeypatch.setattr(CortexTransport, "_start_loop", start)
+    yield
+    for transport in transports:
+        transport._on_loop(transport._close_session()).result()
+        transport._loop.call_soon_threadsafe(transport._loop.stop)
+
+
+def _session_with_close_spy(transport, monkeypatch, closed):
+    async def create():
+        assert asyncio.get_running_loop() is transport._loop
+        transport._session = aiohttp.ClientSession(headers=transport._auth_headers(), trust_env=False)
+        return transport._session
+
+    session = transport._on_loop(create()).result()
+    original_close = transport._close_session
+
+    async def close():
+        assert asyncio.get_running_loop() is transport._loop
+        current = transport._session
+        await original_close()
+        assert transport._session is None
+        assert current is None or current.closed
+        if current is not None:
+            closed.append("close")
+
+    monkeypatch.setattr(transport, "_close_session", close)
+    return session
 
 
 def test_cli_defaults_to_cortex_and_accepts_explicit_onprem(monkeypatch):
@@ -97,28 +137,47 @@ def test_local_cortex_uses_direct_url_without_hosted_auth(monkeypatch, base_url,
     transport = CortexTransport(backend)
     calls = []
 
-    def request(method, url, **kwargs):
-        calls.append((method, url, dict(transport.session.headers), kwargs))
-        response = requests.Response()
-        response.status_code = 200
-        response._content = b'{"ok": true}'
-        return response
+    class Reply:
+        status = 200
 
-    monkeypatch.setattr(transport.session, "request", request)
+        async def __aenter__(self):
+            assert asyncio.get_running_loop() is transport._loop
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def read(self):
+            return b'{"ok": true}'
+
+    def request(session, method, url, **kwargs):
+        assert asyncio.get_running_loop() is transport._loop
+        assert session is transport._session
+        assert session._loop is transport._loop
+        assert session.trust_env is False
+        calls.append((method, url, dict(session.headers), kwargs))
+        return Reply()
+
+    monkeypatch.setattr(aiohttp.ClientSession, "request", request)
     try:
         expected = f"{base_url.rstrip('/')}/api/v2/databases/LOCAL_DB/schemas/LOCAL_SCHEMA/cortex-training"
         assert transport._prefix == expected
         assert transport._auth_headers() == {}
-        assert transport._send("GET", transport._prefix) == {"ok": True}
+        assert transport._on_loop(transport._send("GET", transport._prefix)).result() == {"ok": True}
         assert len(calls) == 1
         method, url, headers, kwargs = calls[0]
         assert (method, url) == ("GET", expected)
         assert urlsplit(url).netloc == urlsplit(base_url).netloc
         assert "Authorization" not in headers
         assert "X-Snowflake-Authorization-Token-Type" not in headers
-        assert kwargs == {"timeout": backend.request_timeout}
+        assert set(kwargs) == {"timeout"}
+        assert isinstance(kwargs["timeout"], aiohttp.ClientTimeout)
+        assert kwargs["timeout"].total == backend.request_timeout
     finally:
-        transport.session.close()
+        session = transport._session
+        transport.shutdown()
+        assert session is None or session.closed
+        assert transport._session is None
 
 
 def test_remote_run_never_probes_local_allocation(tmp_path, monkeypatch):
@@ -236,7 +295,9 @@ def test_cortex_transport_sends_hardware_and_lists_durable_checkpoints(monkeypat
     transport = CorrectnessCortexTransport(CortexConfig(base_url="http://cortex.test"))
     calls = []
 
-    def send(self, method, path, **kwargs):
+    async def send(self, method, path, *, policy=_DEFAULT, **kwargs):
+        assert asyncio.get_running_loop() is self._loop
+        assert isinstance(policy, _SendPolicy)
         calls.append((method, path, kwargs))
         if method == "POST":
             return {"job_id": "parent"}
@@ -259,12 +320,23 @@ def test_cortex_shutdown_closes_session_when_cancel_fails(monkeypatch):
     transport = CorrectnessCortexTransport(_remote())
     transport.job_id = "parent"
     closed = []
-    monkeypatch.setattr(transport.session, "close", lambda: closed.append(True))
-    monkeypatch.setattr(transport, "_send", lambda *args, **kwargs: (_ for _ in ()).throw(requests.ConnectionError()))
+    session = _session_with_close_spy(transport, monkeypatch, closed)
+    attempts = []
+
+    async def send(method, url, *, policy=_DEFAULT, **kwargs):
+        assert asyncio.get_running_loop() is transport._loop
+        assert isinstance(policy, _SendPolicy)
+        assert method == "POST" and url.endswith("/parent:cancel")
+        attempts.append(url)
+        raise aiohttp.ClientConnectionError("cancel unavailable")
+
+    monkeypatch.setattr(transport, "_send", send)
     transport.shutdown()
     transport.shutdown()
     assert transport.job_id is None
-    assert closed
+    assert attempts == [f"{transport._prefix}/parent:cancel"]
+    assert closed == ["close"]
+    assert session.closed and transport._session is None
 
 
 def test_inapplicable_check_is_not_also_a_cortex_failure(tmp_path, monkeypatch):
@@ -626,7 +698,9 @@ def test_checkpoint_check_uses_three_real_cortex_clients(tmp_path, monkeypatch, 
     events = []
     checkpoint_id = "cp_aabb"
 
-    def send(transport, method, url, **kwargs):
+    async def send(transport, method, url, *, policy=_DEFAULT, **kwargs):
+        assert asyncio.get_running_loop() is transport._loop
+        assert isinstance(policy, _SendPolicy)
         if method == "POST" and url == transport._prefix:
             body = kwargs["json"]
             config = body["sub_job_configs"][0]
@@ -729,7 +803,9 @@ def test_remote_startup_failure_releases_job_and_session(tmp_path, monkeypatch, 
     transport = CorrectnessCortexTransport(_remote())
     events = []
 
-    def send(method, url, **kwargs):
+    async def send(method, url, *, policy=_DEFAULT, **kwargs):
+        assert asyncio.get_running_loop() is transport._loop
+        assert isinstance(policy, _SendPolicy)
         if method == "POST" and url == transport._prefix:
             return {"job_id": "failed-job"}
         if method == "GET":
@@ -737,11 +813,11 @@ def test_remote_startup_failure_releases_job_and_session(tmp_path, monkeypatch, 
         assert url.endswith("/failed-job:cancel")
         events.append("cancel")
         if cancel_fails:
-            raise requests.ConnectionError("cancel unavailable")
+            raise aiohttp.ClientConnectionError("cancel unavailable")
         return {}
 
+    session = _session_with_close_spy(transport, monkeypatch, events)
     monkeypatch.setattr(transport, "_send", send)
-    monkeypatch.setattr(transport.session, "close", lambda: events.append("close"))
     monkeypatch.setattr(cortex_transport, "CorrectnessCortexTransport", lambda *args, **kwargs: transport)
     with pytest.raises(RuntimeError, match="no capacity"):
         if path == "hosted":
@@ -751,8 +827,9 @@ def test_remote_startup_failure_releases_job_and_session(tmp_path, monkeypatch, 
                     pytest.fail("failed startup must not yield a job")
         else:
             payload = {"model_name": "model", "training_config": {"n_gpus": 8}}
-            with dss_driver.gateway(tmp_path, 8, backend=_remote()) as session:
-                with dss_driver.running_job(session, payload):
+            with dss_driver.gateway(tmp_path, 8, backend=_remote()) as gateway_session:
+                with dss_driver.running_job(gateway_session, payload):
                     pytest.fail("failed startup must not yield a job")
     assert events == ["cancel", "close"]
     assert transport.job_id is None
+    assert session.closed and transport._session is None

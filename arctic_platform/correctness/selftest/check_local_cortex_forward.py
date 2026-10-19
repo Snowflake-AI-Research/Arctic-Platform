@@ -21,8 +21,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
+import aiohttp
 import pytest
-import requests
 import torch
 
 from arctic_platform import wire
@@ -35,11 +35,45 @@ from arctic_platform.correctness.harness.cortex_transport import CorrectnessCort
 
 
 def response(payload=None, *, status=200, data=None):
-    reply = requests.Response()
-    reply.status_code = status
-    reply.url = "http://127.0.0.1:8003/mock"
-    reply._content = data if data is not None else json.dumps(payload).encode()
-    return reply
+    class Reply:
+        reason = "synthetic gateway response"
+        request_info = SimpleNamespace(real_url="http://127.0.0.1:8003/mock")
+        history = ()
+        headers = {}
+
+        def __init__(self):
+            self.status = status
+            self.data = data if data is not None else json.dumps(payload).encode()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def read(self):
+            return self.data
+
+        async def text(self):
+            return self.data.decode()
+
+    return Reply()
+
+
+def native_reply(monkeypatch, reply):
+    original = aiohttp.ClientSession.request
+
+    def request(session, method, url, **kwargs):
+        if "/forward?job_id=" in url or "/log-probs?job_id=" in url:
+            assert method == "POST"
+            assert asyncio.get_running_loop() is session._loop
+            assert session.trust_env is False
+            assert kwargs["allow_redirects"] is False
+            assert "Authorization" not in session.headers
+            return reply(session, url, **kwargs)
+        return original(session, method, url, **kwargs)
+
+    monkeypatch.setattr(aiohttp.ClientSession, "request", request)
 
 
 def client_config(backend=None, **kwargs):
@@ -65,31 +99,56 @@ def gateway(monkeypatch):
     monkeypatch.setenv(LOCAL_NATIVE_FORWARD_ENV, "1")
     calls = []
     schema = openapi("/forward", "/log-probs")
+    state = {"roles": [], "cancelled": False}
+    transports = []
+
+    from arctic_platform.client.transports.cortex import CortexTransport
+
+    original_start = CortexTransport._start_loop
+
+    def start(actual):
+        original_start(actual)
+        transports.append(actual)
+
+    monkeypatch.setattr(CortexTransport, "_start_loop", start)
 
     def send(session, method, url, **kwargs):
         calls.append((method, url, kwargs))
+        assert asyncio.get_running_loop() is session._loop
         assert session.trust_env is False
         assert kwargs["allow_redirects"] is False
+        assert "Authorization" not in session.headers
         if url.endswith("/openapi.json"):
             return response(schema)
         if url.endswith(":cancel"):
+            state["cancelled"] = True
             return response({})
         if method == "POST" and url.endswith("/cortex-training"):
+            state["roles"] = [sub["job_type"] for sub in kwargs["json"]["sub_job_configs"]]
+            state["cancelled"] = False
             return response({"job_id": "owned-parent"})
         if method == "GET" and url.endswith("/owned-parent"):
             return response(
                 {
-                    "status": "RUNNING",
+                    "job_id": "owned-parent",
+                    "status": "cancelled" if state["cancelled"] else "RUNNING",
                     "sub_jobs": [
-                        {"job_type": role, "sub_job_id": f"owned-parent:{role}:0"}
-                        for role in ("training", "sampling", "log_probability")
+                        {
+                            "job_type": role,
+                            "sub_job_id": f"owned-parent:{'log_prob' if role == 'log_probability' else role}:0",
+                            "status": "cancelled" if state["cancelled"] else "running",
+                        }
+                        for role in state["roles"]
                     ],
                 }
             )
         pytest.fail(f"unexpected request: {method} {url}")
 
-    monkeypatch.setattr(requests.Session, "request", send)
-    return calls, schema
+    monkeypatch.setattr(aiohttp.ClientSession, "request", send)
+    yield calls, schema
+    for transport in transports:
+        transport._on_loop(transport._close_session()).result()
+        transport._loop.call_soon_threadsafe(transport._loop.stop)
 
 
 def created(calls):
@@ -117,7 +176,8 @@ def test_native_binding_uses_only_fresh_public_config_ids(gateway):
         assert transport._native_bindings[str(token)] == (role, sub["job_id"])
     assert calls[0][1].endswith("/openapi.json")
     transport.shutdown()
-    assert calls[-1][1].endswith("/owned-parent:cancel")
+    assert calls[-2][1].endswith("/owned-parent:cancel")
+    assert calls[-1][0] == "GET" and calls[-1][1].endswith("/owned-parent")
     assert transport._native_bindings == transport._native_children == {}
 
 
@@ -185,7 +245,8 @@ def test_log_probability_route_checked_for_declared_log_probability_job(gateway)
 
 
 @pytest.mark.parametrize("op,role", [("forward", "training"), ("log-probs", "log_prob"), ("log-probs", "sampling")])
-def test_native_wire_request_uses_owned_uuid_not_synthetic_token(gateway, monkeypatch, op, role):
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_native_wire_request_uses_owned_uuid_not_synthetic_token(gateway, monkeypatch, op, role, asynchronous):
     calls, _ = gateway
     config = client_config(sampling_gpus=1, log_prob_gpus=1)
     transport = CorrectnessCortexTransport(config.backend)
@@ -196,18 +257,19 @@ def test_native_wire_request_uses_owned_uuid_not_synthetic_token(gateway, monkey
     expected = {"logprobs": torch.tensor([[-1.2, -2.3]], dtype=torch.float32)}
     captured = []
 
-    def post(url, **kwargs):
+    def post(session, url, **kwargs):
         captured.append((url, kwargs))
         return response(data=wire.dumps(expected))
 
-    monkeypatch.setattr(transport.session, "post", post)
-    result = transport.call(Request(op, token, body))
+    native_reply(monkeypatch, post)
+    request = Request(op, token, body)
+    result = asyncio.run(transport.acall(request)) if asynchronous else transport.call(request)
     assert torch.equal(result["logprobs"], expected["logprobs"])
     url, kwargs = captured[0]
     assert url == f"http://127.0.0.1:8003/{op}?job_id={child}"
     assert "owned-parent" not in url
     assert kwargs["allow_redirects"] is False
-    assert kwargs["timeout"] == config.backend.request_timeout
+    assert kwargs["timeout"].total == config.backend.request_timeout
     if op == "forward":
         decoded = wire.loads(kwargs["data"])
         assert torch.equal(decoded["batch"]["input_ids"], body["batch"]["input_ids"])
@@ -227,33 +289,45 @@ def test_native_wire_request_uses_owned_uuid_not_synthetic_token(gateway, monkey
         ("log-probs", "owned-parent:training:0"),
     ],
 )
-def test_native_forward_never_discovers_or_reroutes_foreign_or_wrong_role(gateway, op, token):
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_native_forward_never_discovers_or_reroutes_foreign_or_wrong_role(gateway, op, token, asynchronous):
     calls, _ = gateway
     config = client_config(log_prob_gpus=1)
     transport = CorrectnessCortexTransport(config.backend)
     transport.initialize(config)
     before = len(calls)
     with pytest.raises(ValueError, match="owned child|cannot target"):
-        transport.call(Request(op, token, {}))
+        request = Request(op, token, {})
+        if asynchronous:
+            asyncio.run(transport.acall(request))
+        else:
+            transport.call(request)
     assert len(calls) == before
     transport.shutdown()
     with pytest.raises(ValueError, match="owned child"):
-        transport.call(Request("forward", "owned-parent:training:0", {}))
+        request = Request("forward", "owned-parent:training:0", {})
+        if asynchronous:
+            asyncio.run(transport.acall(request))
+        else:
+            transport.call(request)
 
 
 @pytest.mark.parametrize("status", [302, 400, 500])
-def test_native_error_preserves_server_reason_and_cleanup(gateway, monkeypatch, status):
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_native_error_preserves_server_reason_and_cleanup(gateway, monkeypatch, status, asynchronous):
     calls, _ = gateway
     config = client_config()
     transport = CorrectnessCortexTransport(config.backend)
     jobs = transport.initialize(config)
-    monkeypatch.setattr(
-        transport.session, "post", lambda *args, **kwargs: response({"detail": "actual gateway error"}, status=status)
-    )
-    with pytest.raises((requests.HTTPError, RuntimeError), match="actual gateway error|without redirects"):
-        transport.call(Request("forward", jobs.training, {}))
+    native_reply(monkeypatch, lambda *args, **kwargs: response({"detail": "actual gateway error"}, status=status))
+    with pytest.raises((aiohttp.ClientResponseError, RuntimeError), match="actual gateway error|without redirects"):
+        request = Request("forward", jobs.training, {})
+        if asynchronous:
+            asyncio.run(transport.acall(request))
+        else:
+            transport.call(request)
     transport.shutdown()
-    assert calls[-1][1].endswith(":cancel")
+    assert calls[-2][1].endswith(":cancel")
     assert transport._native_bindings == {}
 
 
@@ -267,7 +341,7 @@ def test_native_creation_failure_cleans_parent_and_binding(gateway, monkeypatch)
     with pytest.raises(RuntimeError, match="actual startup error"):
         initialize_or_cleanup(transport, config)
     assert "job_id" in created(calls)["sub_job_configs"][0]
-    assert calls[-1][1].endswith("/owned-parent:cancel")
+    assert calls[-2][1].endswith("/owned-parent:cancel")
     assert transport.job_id is None
     assert transport._native_bindings == transport._native_children == {}
 
@@ -277,13 +351,18 @@ def test_native_creation_failure_cleans_parent_and_binding(gateway, monkeypatch)
     [b"invalid wire", wire.dumps({"job_id": "foreign-child", "logprobs": [0.0]})],
     ids=["invalid-wire", "foreign-identity"],
 )
-def test_native_malformed_or_wrong_identity_response_rejected(gateway, monkeypatch, payload):
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_native_malformed_or_wrong_identity_response_rejected(gateway, monkeypatch, payload, asynchronous):
     config = client_config()
     transport = CorrectnessCortexTransport(config.backend)
     jobs = transport.initialize(config)
-    monkeypatch.setattr(transport.session, "post", lambda *args, **kwargs: response(data=payload))
+    native_reply(monkeypatch, lambda *args, **kwargs: response(data=payload))
     with pytest.raises(ValueError):
-        transport.call(Request("forward", jobs.training, {}))
+        request = Request("forward", jobs.training, {})
+        if asynchronous:
+            asyncio.run(transport.acall(request))
+        else:
+            transport.call(request)
     transport.shutdown()
 
 
@@ -295,10 +374,11 @@ def test_no_opt_in_leaves_public_cortex_unchanged(gateway, monkeypatch, base_url
     calls = []
 
     def initialize(actual, cfg):
-        actual._send("POST", actual._prefix, json={"sub_job_configs": cfg.to_cortex()})
+        actual._on_loop(actual._send("POST", actual._prefix, json={"sub_job_configs": cfg.to_cortex()})).result()
         return actual.jobs
 
-    def send(actual, method, url, **kwargs):
+    async def send(actual, method, url, **kwargs):
+        assert asyncio.get_running_loop() is actual._loop
         calls.append((method, url, kwargs))
         return {"job_id": "public-parent"}
 
@@ -314,39 +394,40 @@ def test_no_opt_in_leaves_public_cortex_unchanged(gateway, monkeypatch, base_url
     assert transport.call(Request("log-probs", "public-log-prob", {})) == {"public": "log-probs"}
 
 
-def test_native_async_forward_same_binding_and_wire(gateway, monkeypatch):
+def test_native_sync_and_async_forward_share_owned_loop_session_binding_and_wire(gateway, monkeypatch):
     config = client_config()
     transport = CorrectnessCortexTransport(config.backend)
     jobs = transport.initialize(config)
     expected = {"logprobs": torch.tensor([[-0.5]])}
     calls = []
+    caller_loops = []
 
-    class Reply:
-        status = 200
+    def post(session, url, **kwargs):
+        calls.append((session, asyncio.get_running_loop(), url, kwargs))
+        return response(data=wire.dumps(expected))
 
-        async def __aenter__(self):
-            return self
+    native_reply(monkeypatch, post)
+    request = Request("forward", jobs.training, {"batch": {"input_ids": [1]}})
+    sync_result = transport.call(request)
 
-        async def __aexit__(self, *args):
-            return False
+    async def call():
+        caller_loops.append(asyncio.get_running_loop())
+        return await transport.acall(request)
 
-        async def read(self):
-            return wire.dumps(expected)
-
-    class Session:
-        def post(self, url, **kwargs):
-            calls.append((url, kwargs))
-            return Reply()
-
-    async def session():
-        return Session()
-
-    monkeypatch.setattr(transport, "_ensure_asession", session)
-    result = asyncio.run(transport.acall(Request("forward", jobs.training, {"batch": {"input_ids": [1]}})))
+    result = asyncio.run(call())
+    assert torch.equal(sync_result["logprobs"], expected["logprobs"])
     assert torch.equal(result["logprobs"], expected["logprobs"])
-    assert calls[0][0].endswith(f"/forward?job_id={transport._native_children['training']}")
-    assert calls[0][1]["allow_redirects"] is False
+    assert len(calls) == 2
+    session = transport._session
+    assert session is not None
+    assert all(actual_session is session and loop is transport._loop for actual_session, loop, _, _ in calls)
+    assert caller_loops[0] is not transport._loop
+    assert all(url.endswith(f"/forward?job_id={transport._native_children['training']}") for _, _, url, _ in calls)
+    assert all(kwargs["allow_redirects"] is False for _, _, _, kwargs in calls)
+    assert all(kwargs["timeout"].total == config.backend.request_timeout for _, _, _, kwargs in calls)
+    assert wire.loads(calls[0][3]["data"]) == wire.loads(calls[1][3]["data"]) == request.body
     transport.shutdown()
+    assert session.closed and transport._session is None
 
 
 @pytest.mark.parametrize("failure", [False, True])
@@ -379,7 +460,7 @@ def test_full_model_e2e_existing_replay_routes_held_out_to_owned_native_child(ga
     _, validation = check.request_bodies(replay, model_provider="huggingface")
     validation["processing"].pop("return_logprobs")
     expected = dss_driver.cortex_training_body(validation)
-    original_send = requests.Session.request
+    original_send = aiohttp.ClientSession.request
     calls, _ = gateway
     replies, backward, steps, forwards = {}, [], [], []
 
@@ -403,10 +484,10 @@ def test_full_model_e2e_existing_replay_routes_held_out_to_owned_native_child(ga
         replies[identifier] = result
         return response({"request_id": identifier})
 
-    monkeypatch.setattr(requests.Session, "request", send)
+    monkeypatch.setattr(aiohttp.ClientSession, "request", send)
     monkeypatch.setattr(dss_driver, "_gateway_runtime", lambda *args, **kwargs: pytest.fail("no new gateway"))
     if failure:
-        with pytest.raises(requests.HTTPError, match="native forward failed"):
+        with pytest.raises(aiohttp.ClientResponseError, match="native forward failed"):
             check.run_dss_trajectory(ctx, replay, tmp_path / "target")
     else:
         losses, scores = check.run_dss_trajectory(ctx, replay, tmp_path / "target")
@@ -424,4 +505,5 @@ def test_full_model_e2e_existing_replay_routes_held_out_to_owned_native_child(ga
     for key, value in expected["kwargs"].items():
         assert torch.equal(actual["kwargs"][key], value)
     assert actual["context"] == expected["context"]
-    assert calls[-1][1].endswith("/owned-parent:cancel")
+    assert calls[-2][1].endswith("/owned-parent:cancel")
+    assert calls[-1][0] == "GET" and calls[-1][1].endswith("/owned-parent")

@@ -19,7 +19,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+from decimal import ROUND_CEILING
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -90,6 +93,40 @@ def test_renderer_passes_peft_config_to_reference(tmp_path: Path) -> None:
     )
 
     assert "peft_config={'peft_type': 'Lora', 'r': 32, 'target_modules': ['q_proj', 'v_proj']}" in rendered
+
+
+def test_renderer_gate_metadata_uses_the_computed_safety_factor(tmp_path: Path) -> None:
+    rendered = _render_config(tmp_path, None)
+    tree = ast.parse(rendered)
+    multiplier_values = [
+        value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values)
+        if isinstance(key, ast.Constant) and key.value == "multiplier"
+    ]
+    assert len(multiplier_values) == 2
+    assert all(isinstance(value, ast.Name) and value.id == "GATE_SAFETY_FACTOR" for value in multiplier_values)
+    assert "computed {GATE_SAFETY_FACTOR:g}x gate" in rendered
+    assert "{GATE_SAFETY_FACTOR:g}x rounded upward" in rendered
+
+    definitions = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in {"GATE_QUANTUM", "GATE_SAFETY_FACTOR"}
+                for target in node.targets
+            )
+        )
+        or (isinstance(node, ast.FunctionDef) and node.name == "_select_gate")
+    ]
+    namespace = {"Decimal": Decimal, "ROUND_CEILING": ROUND_CEILING}
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), "<calibration-gate>", "exec"), namespace)
+    assert namespace["GATE_SAFETY_FACTOR"] == 4.0
+    assert namespace["_select_gate"](0.01) == (0.04, 0.04)
+    assert namespace["_select_gate"](0.0) == (0.0, 0.001)
 
 
 def test_model_shape_uses_first_prefix_containing_every_attention_type(monkeypatch) -> None:

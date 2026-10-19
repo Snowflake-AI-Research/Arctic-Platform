@@ -26,6 +26,7 @@ from safetensors.torch import save_file
 from arctic_platform.client import CortexConfig
 from arctic_platform.correctness.harness import batches
 from arctic_platform.correctness.harness import dss_driver
+from arctic_platform.correctness.harness import reference_records
 from arctic_platform.correctness.harness import runner
 from arctic_platform.correctness.harness import workdir
 from arctic_platform.correctness.harness.arms import ArmDefinition
@@ -130,9 +131,16 @@ def test_runner_rejects_derived_optimizer_symlink_before_mkdir_or_payload(
         return {"loss": 2.0, "grad_norms": {}, "microbatches": 1}
 
     monkeypatch.setattr(Path, "mkdir", mkdir)
-    monkeypatch.setattr(runner, "save", lambda *args: None)
     monkeypatch.setattr(runner, "run_reference", reference)
     monkeypatch.setattr(runner, "uses_mixer_packing", lambda *args: False)
+    monkeypatch.setattr(reference_records, "model_identity", lambda path: {"sha256": "unit-model"})
+
+    def prepared_record(ctx, identity):
+        if branch == "reference":
+            raise reference_records.ReferencePrerequisiteError("prepared HF reference missing: unit-record")
+        return {"loss": 2.0, "grad_norms": {}, "microbatches": 1}
+
+    monkeypatch.setattr(reference_records, "load_record", prepared_record)
     monkeypatch.setattr(runner, "gateway", lambda *args, **kwargs: contextlib.nullcontext(None))
     monkeypatch.setattr(
         runner, "running_job", lambda *args, **kwargs: pytest.fail("unsafe optimizer path reached job payload")
@@ -147,6 +155,7 @@ def test_runner_rejects_derived_optimizer_symlink_before_mkdir_or_payload(
             select=["single-step-optimizer"],
             workdir=tmp_path,
             order=order,
+            prepare_references=branch == "reference",
         )
 
     if branch == "reference":
@@ -164,7 +173,7 @@ def test_runner_rejects_derived_optimizer_symlink_before_mkdir_or_payload(
         assert "Traceback (most recent call last):" in traceback
         assert "payload_for" in traceback and "require_data_fast_path" in traceback
         assert f"ValueError: {result.reason}" in traceback
-    assert len(references) == (branch == "dss")
+    assert not references
 
 
 def test_fast_batch_destination_is_canonical_and_read_inputs_remain_unrestricted(tmp_path, monkeypatch):

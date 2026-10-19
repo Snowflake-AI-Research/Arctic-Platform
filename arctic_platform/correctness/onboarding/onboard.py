@@ -1069,16 +1069,93 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cache-root", type=Path, default=Path("/data-fast/base-models/synthetic"))
     parser.add_argument("--test-spec", type=Path)
     parser.add_argument("--test-id", default="single-step-grads")
+    parser.add_argument(
+        "--reference-tests",
+        nargs="+",
+        help="prepare these HF checks together using the same workload; requires --prepare-references",
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--tokens", type=int)
     parser.add_argument("--reference-token-budget", type=int)
     parser.add_argument("--probe-layers", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--probe-output", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--prepare-references",
+        action="store_true",
+        help="prepare or reuse compact Git HF references from an existing frozen spec; run no target",
+    )
+    parser.add_argument(
+        "--reference-records-dir",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "reference_data",
+    )
+    parser.add_argument("--reference-calibration-runs", type=int, default=16)
+    parser.add_argument("--reference-calibration-workers", type=int, default=1)
+    parser.add_argument(
+        "--local-gateway-full-model",
+        action="store_true",
+        help="prepare full-model E2E against the already validated offline Qwen3-8B snapshot",
+    )
+
+
+def _prepare_references(args: argparse.Namespace) -> int:
+    """Prepare an existing workload without resizing models or rewriting historical gates."""
+    from transformers import AutoConfig
+
+    from arctic_platform.client import CortexConfig
+    from arctic_platform.correctness.harness.arms import ArmDefinition
+    from arctic_platform.correctness.harness.config import config_checksum
+    from arctic_platform.correctness.harness.config import load_config
+    from arctic_platform.correctness.harness.reference_records import CRITERIA
+    from arctic_platform.correctness.harness.reference_records import require_git_records_dir
+    from arctic_platform.correctness.harness.runner import execute
+    from arctic_platform.correctness.harness.spec import TestSpec
+
+    selection = args.reference_tests or [args.test_id]
+    if any(test_id not in CRITERIA for test_id in selection):
+        raise ValueError("--prepare-references supports only the three HF single-GPU checks")
+    args.reference_records_dir = require_git_records_dir(args.reference_records_dir)
+    config = load_config(args.config)
+    spec_path = args.test_spec or Path(__file__).resolve().parents[1] / "specs" / f"{config.config_id}.json"
+    spec = TestSpec.read(spec_path)
+    if config.is_rl or spec.config_checksum != config_checksum(config) or spec.config_id != config.config_id:
+        raise ValueError("reference preparation requires the matching reviewed SFT config and frozen spec")
+    for test_id in selection:
+        if test_id not in spec.applicable_tests:
+            raise ValueError(f"{test_id} is not applicable to {config.config_id}")
+    if args.local_gateway_full_model and selection != ["e2e-sft-train-validate"]:
+        raise ValueError("full-model reference mode is only for E2E")
+    model = AutoConfig.from_pretrained(spec.model.cache_path, trust_remote_code=True)
+    vocab_size = int(getattr(model, "text_config", model).vocab_size)
+    backend = CortexConfig(base_url="http://127.0.0.1:8003", database="dev", schema="dev")
+    arms = [ArmDefinition(arm.name, arm.global_batch_size, arm.max_seq_len) for arm in spec.arms]
+    execute(
+        config,
+        spec,
+        arms,
+        vocab_size=vocab_size,
+        select=selection,
+        reference_token_budget=args.reference_token_budget,
+        workdir=args.output_dir,
+        prepare_references=True,
+        reference_records_dir=args.reference_records_dir,
+        reference_calibration_runs=args.reference_calibration_runs,
+        reference_calibration_workers=args.reference_calibration_workers,
+        client_backend=backend,
+        local_gateway_full_model=args.local_gateway_full_model,
+    )
+    return 0
 
 
 def run(args: argparse.Namespace) -> int:
     _validate_storage(args)
     args.config = args.config.resolve()
+    if getattr(args, "prepare_references", False):
+        if args.probe_layers is not None:
+            raise ValueError("reference preparation cannot be combined with model sizing")
+        return _prepare_references(args)
+    if getattr(args, "reference_tests", None):
+        raise ValueError("--reference-tests requires --prepare-references")
     if args.probe_layers is not None:
         if args.probe_output is None:
             raise ValueError("sizing worker requires --probe-output")

@@ -25,6 +25,8 @@ from types import SimpleNamespace
 import pytest
 import requests
 
+from arctic_platform.client.requests import export_checkpoint_request
+from arctic_platform.client.transports.cortex import _route
 from arctic_platform.correctness.harness import cortex_checkpoint_export as exporter
 
 JOB_ID = "0abf38e6-80f6-49cc-820d-883c8c451df4"
@@ -109,11 +111,15 @@ def _fixture(monkeypatch, *, dp_size=2, prefix="bf16_", reply=None, responses=No
         }
     posted = []
 
-    def send(*args, **kwargs):
-        posted.append((args, kwargs))
+    def call(request):
+        assert request == export_checkpoint_request(JOB_ID, CP_ID)
+        route = _route(request.op)
+        url, sends = route.prepare("https://cortex.example/jobs", request)
+        assert sends == [{}]
+        posted.append(((route.method, url), sends[0]))
         return copy.deepcopy(reply)
 
-    transport = SimpleNamespace(job_id=JOB_ID, _prefix="https://cortex.example/jobs", _send=send)
+    transport = SimpleNamespace(job_id=JOB_ID, call=call)
     # Sentinel credentials live ONLY in the public transport, never the download session.
     transport.session = SimpleNamespace(headers={"Authorization": "Bearer DO-NOT-LEAK-PAT"})
     client = SimpleNamespace(transport=transport)
@@ -136,9 +142,7 @@ def test_export_requires_data_fast_before_public_post(tmp_path, monkeypatch, uns
         destination.symlink_to("/tmp", target_is_directory=True)
         destination /= "output"
     client, _, posted, session, _ = _fixture(monkeypatch)
-    monkeypatch.setattr(
-        client.transport, "_send", lambda *args, **kwargs: pytest.fail("unsafe output reached public POST")
-    )
+    monkeypatch.setattr(client.transport, "call", lambda request: pytest.fail("unsafe output reached public POST"))
     with pytest.raises(exporter.CheckpointExportError, match="/data-fast|symlink"):
         _export(client, destination)
     assert posted == []
@@ -192,13 +196,13 @@ def test_each_export_allocates_new_directory_without_reusing_completed_snapshot(
 def test_valid_export_creates_parent_only_after_manifest_validation(tmp_path, monkeypatch):
     destination = tmp_path / "nested" / "exports"
     client, reply, posted, _, _ = _fixture(monkeypatch)
-    original_send = client.transport._send
+    original_call = client.transport.call
 
-    def send(*args, **kwargs):
+    def call(request):
         assert not destination.exists()
-        return original_send(*args, **kwargs)
+        return original_call(request)
 
-    monkeypatch.setattr(client.transport, "_send", send)
+    monkeypatch.setattr(client.transport, "call", call)
     root = _export(client, destination)
     assert root.parent == destination
     assert (root / "export_receipt.json").is_file()
@@ -427,7 +431,7 @@ def test_http_and_post_exception_messages_do_not_leak_secrets(tmp_path, monkeypa
     assert SECRET not in "".join(traceback.format_exception(error.value))
     assert session.closed
     assert not list(tmp_path.iterdir())
-    client.transport._send = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError(SECRET))
+    client.transport.call = lambda request: (_ for _ in ()).throw(RuntimeError(SECRET))
     with pytest.raises(exporter.CheckpointExportError) as error:
         _export(client, tmp_path)
     assert SECRET not in "".join(traceback.format_exception(error.value))
@@ -623,7 +627,7 @@ def test_invalid_caller_budgets_rejected_before_post(tmp_path, monkeypatch, valu
 @pytest.mark.parametrize("reply", [None, [], {"checkpoint_id": CP_ID}, {"checkpoint_id": CP_ID, "files": {}}])
 def test_malformed_export_envelope_rejected_without_download(tmp_path, monkeypatch, reply):
     client, _, _, session, _ = _fixture(monkeypatch)
-    client.transport._send = lambda *args, **kwargs: reply
+    client.transport.call = lambda request: reply
     with pytest.raises(exporter.CheckpointExportError):
         _export(client, tmp_path / "nested" / "exports")
     assert not session.calls

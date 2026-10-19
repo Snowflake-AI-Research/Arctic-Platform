@@ -15,18 +15,22 @@
 
 """Existing-gateway local optimizer checkpoints retain real client framing and decoder gates."""
 
+import asyncio
 import json
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 import requests
 import torch
 
 from arctic_platform import wire
 from arctic_platform.client import CortexConfig
+from arctic_platform.client.transports.cortex import _DEFAULT
 from arctic_platform.client.transports.cortex import CortexTransport
+from arctic_platform.client.transports.cortex import _SendPolicy
 from arctic_platform.correctness import __main__ as cli
 from arctic_platform.correctness.harness import cortex_fixture
 from arctic_platform.correctness.harness import cortex_optimizer_capture as capture
@@ -45,30 +49,68 @@ from arctic_platform.correctness.selftest.check_cortex_optimizer_capture import 
 from arctic_platform.correctness.selftest.check_cortex_optimizer_capture import OPTIMIZER
 from arctic_platform.correctness.selftest.check_cortex_optimizer_capture import SPEC
 from arctic_platform.correctness.selftest.check_cortex_optimizer_capture import _manifest
+from arctic_platform.correctness.selftest.check_cortex_optimizer_capture import _prepared_references
 from arctic_platform.correctness.selftest.check_cortex_optimizer_decode import _pair
 
 
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
-    monkeypatch.setattr(requests.Session, "request", lambda *args, **kwargs: pytest.fail("no network allowed"))
+    def forbidden(*args, **kwargs):
+        pytest.fail("no network allowed")
+
+    monkeypatch.setattr(requests.Session, "request", forbidden)
+    monkeypatch.setattr(aiohttp.ClientSession, "request", forbidden)
+    closes = []
+    original_close = CortexTransport._close_session
+
+    async def close(transport):
+        assert asyncio.get_running_loop() is transport._loop
+        session = transport._session
+        await original_close(transport)
+        assert transport._session is None
+        assert session is None or session.closed
+        closes.append(transport)
+
+    monkeypatch.setattr(CortexTransport, "_close_session", close)
+    yield closes
+    for transport in set(closes):
+        transport._loop.call_soon_threadsafe(transport._loop.stop)
 
 
 @pytest.fixture
-def local_capture(tmp_path, monkeypatch):
+def local_capture(tmp_path, monkeypatch, no_network):
     pair = _pair(tmp_path / "source", world_size=4)
     backend = CortexConfig(base_url="http://127.0.0.1:8003")
     session = GatewaySession(tmp_path, 4, backend)
     events, replies, paths = [], {}, []
-    state = SimpleNamespace(step=0, failure=None, receipt=None)
+    state = SimpleNamespace(step=0, failure=None, receipt=None, cancelled=False)
 
-    def send(transport, method, url, **kwargs):
+    async def send(transport, method, url, *, policy=_DEFAULT, **kwargs):
+        assert asyncio.get_running_loop() is transport._loop
+        assert isinstance(policy, _SendPolicy)
+        assert kwargs["allow_redirects"] is False
+        assert transport._session.trust_env is False
+        assert "Authorization" not in transport._session.headers
+        if url.endswith(":cancel") or (state.cancelled and method == "GET"):
+            assert policy.max_retries == 0 and policy.timeout > 0
         if method == "POST" and url == transport._prefix:
             return {"job_id": "local-parent"}
         if method == "GET" and url == f"{transport._prefix}/{transport.job_id}":
-            return {"status": "RUNNING"}
+            return {
+                "job_id": "local-parent",
+                "status": "cancelled" if state.cancelled else "RUNNING",
+                "sub_jobs": [
+                    {
+                        "job_type": "training",
+                        "sub_job_id": "local-parent:training:0",
+                        "status": "cancelled" if state.cancelled else "running",
+                    }
+                ],
+            }
         if method == "GET" and "/requests/" in url:
             return {"status": "REQUEST_STATE_DONE", "result": replies[url.rsplit("/", 1)[-1]]}
         if url.endswith(":cancel"):
+            state.cancelled = True
             return {}
         if url.endswith("/save"):
             body = kwargs["json"]
@@ -122,6 +164,8 @@ def local_capture(tmp_path, monkeypatch):
         pair=pair,
     )
     client.shutdown()
+    assert state.cancelled
+    assert len(no_network) == 1 and no_network[0].job_id is None
 
 
 def _capture(case):
@@ -267,25 +311,17 @@ def test_local_checkpoint_flag_rejects_nonloopback_or_auth_before_writes(local_c
 
 
 @pytest.mark.parametrize("order", ["batched", "interleaved"])
-def test_local_fixture_optimizer_runner_uses_same_model_and_frozen_budget(tmp_path, monkeypatch, order):
+def test_local_fixture_optimizer_runner_uses_same_model_and_frozen_budget(tmp_path, monkeypatch, no_network, order):
     cfg, spec = load_config(CONFIG), Spec.read(SPEC)
     original = CONFIG.read_bytes(), SPEC.read_bytes()
-    references, captures, creates = [], [], []
+    captures, creates = [], []
+    cancelled = set()
+    references = _prepared_references(monkeypatch, spec, cfg, tmp_path)
     model = str(tmp_path / "reviewed-fixture")
     monkeypatch.setattr(
         cortex_fixture, "load_local_fixture", lambda *args: {"model_name": model, "distribution": "local-gateway"}
     )
     monkeypatch.setattr(runner, "uses_mixer_packing", lambda *args: False)
-
-    def reference(path, batch, out, **kwargs):
-        assert path == spec.test_settings["single-step-optimizer"]["model_cache_path"]
-        assert kwargs["token_budget"] == 10240 and kwargs["learning_rate"] == 0.01
-        references.append(path)
-        return {
-            "loss": 2.0,
-            "microbatches": 1,
-            "optimizer_state_manifest": str(_manifest(kwargs["optimizer_output_dir"])),
-        }
 
     def local_step(session, job, body, **kwargs):
         assert kwargs["local_checkpoint"] is True
@@ -294,17 +330,34 @@ def test_local_fixture_optimizer_runner_uses_same_model_and_frozen_budget(tmp_pa
         captures.append(kwargs)
         return StepResult(2.0, {}, optimizer_state_manifest=str(_manifest(kwargs["output_dir"] / "states")))
 
-    def send(transport, method, url, **kwargs):
+    async def send(transport, method, url, *, policy=_DEFAULT, **kwargs):
+        assert asyncio.get_running_loop() is transport._loop
+        assert isinstance(policy, _SendPolicy)
+        assert kwargs["allow_redirects"] is False
+        assert transport._session.trust_env is False
+        assert "Authorization" not in transport._session.headers
+        if url.endswith(":cancel") or (method == "GET" and transport.job_id in cancelled):
+            assert policy.max_retries == 0 and policy.timeout > 0
         if method == "POST" and url == transport._prefix:
             creates.append(kwargs["json"])
             return {"job_id": f"parent-{len(creates)}"}
         if method == "GET":
-            return {"status": "RUNNING"}
+            return {
+                "job_id": transport.job_id,
+                "status": "cancelled" if transport.job_id in cancelled else "RUNNING",
+                "sub_jobs": [
+                    {
+                        "job_type": "training",
+                        "sub_job_id": f"{transport.job_id}:training:0",
+                        "status": "cancelled" if transport.job_id in cancelled else "running",
+                    }
+                ],
+            }
         if url.endswith(":cancel"):
+            cancelled.add(transport.job_id)
             return {}
         pytest.fail("runner should call local capture, no catalog/export or native worker hooks")
 
-    monkeypatch.setattr(runner, "run_reference", reference)
     monkeypatch.setattr(capture, "capture_optimizer_step", local_step)
     monkeypatch.setattr(CortexTransport, "_send", send)
     results = runner.execute(
@@ -320,7 +373,11 @@ def test_local_fixture_optimizer_runner_uses_same_model_and_frozen_budget(tmp_pa
     )
     assert [result.arm for result in results] == ["gas1", "gas4"]
     assert all(result.outcome is Outcome.PASS and result.gpus == 4 for result in results)
+    assert all(result.metrics["stated_criterion_abs"] == 1e-3 for result in results)
+    assert references == [("single-step-optimizer", "gas1"), ("single-step-optimizer", "gas4")]
     assert len(references) == len(captures) == len(creates) == 2
+    assert cancelled == {f"parent-{index}" for index in (1, 2)}
+    assert len(no_network) == 2 and all(transport.job_id is None for transport in no_network)
     for create in creates:
         child = create["sub_job_configs"][0]
         assert child["model_name"] == model and child["training_config"]["n_gpus"] == 4
