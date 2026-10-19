@@ -891,12 +891,19 @@ class InferenceWorker(StreamingWorkerMixin):
         vllm.plugins.load_general_plugins()
 
         arctic_enabled = arctic_inference_effective_enabled()
+        fca_only = os.getenv("ARCTIC_INFERENCE_FCA_ONLY", "0") == "1"
         if arctic_enabled:
             # Some PrimeRL uv envs import arctic_platform.inference from PYTHONPATH
             # without installed entrypoint metadata, so load_general_plugins()
             # cannot discover the Arctic plugin. Apply the same patches
             # directly when ArcticInference is explicitly enabled.
             _ensure_arctic_vllm_patches()
+        elif fca_only or engine_kwargs.get("forest_cascade_attn_configs") is not None:
+            # vLLM 0.31 FCA without the rest of the Arctic patch set. The
+            # engine arg is unknown to stock AsyncEngineArgs until this runs.
+            from arctic_platform.inference.vllm.attention import install_forest_cascade_patches
+
+            install_forest_cascade_patches()
         else:
             engine_kwargs.pop("forest_cascade_attn_configs", None)
 

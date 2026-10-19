@@ -63,3 +63,18 @@ def apply_forest_cascade_patches():
     """
     import vllm.v1.attention.backends.flash_attn as target_module
     target_module.FlashAttentionBackend = ForestFlashAttentionBackend
+
+
+def install_forest_cascade_patches() -> None:
+    """Accept ``forest_cascade_attn_configs`` and register the FCA backend.
+
+    Idempotent. Does not load the rest of the Arctic plugin. The caller has
+    already checked that the process is on vLLM 0.31.
+    """
+    from vllm.engine.arg_utils import AsyncEngineArgs
+
+    from arctic_platform.inference.vllm.args import AsyncEngineArgsPatch
+
+    if "__new__" not in getattr(AsyncEngineArgs, "_arctic_patches", {}):
+        AsyncEngineArgsPatch.apply_patch()
+    apply_forest_cascade_patches()

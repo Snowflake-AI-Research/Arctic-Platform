@@ -33,7 +33,7 @@ launches from that env.
    ```
 
 2. **Install pinned Python deps** into a fresh conda env. The validated stack
-   is Python 3.12, torch 2.11 (cu130), and vLLM 0.26 — `arctic-inference`
+   is Python 3.12, torch 2.11 (cu130), and vLLM 0.31 — in-tree `arctic_platform.inference`
    owns the vLLM pin; `overrides.txt` forces the few transitive deps that
    otherwise drift.
 

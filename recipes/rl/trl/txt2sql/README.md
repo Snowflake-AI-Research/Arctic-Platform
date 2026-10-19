@@ -55,7 +55,7 @@ uv pip install -e ../../../../../trl
 uv pip install flash-attn --no-build-isolation
 ```
 
-Native C1 also needs `vllm serve` extras on the 0.26 stack (`openai>=2.5`,
+Native C1 also needs `vllm serve` extras on the 0.31 stack (`openai>=2.5`,
 `kernels~=0.16`). `requirements.txt` already lists them.
 
 See the top-level [`README`](../README.md#install) for why FA2 is required.

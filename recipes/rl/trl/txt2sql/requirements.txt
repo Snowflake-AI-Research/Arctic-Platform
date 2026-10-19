@@ -4,7 +4,7 @@
 # cu130 index). `flash-attn` is also installed separately (`--no-build-isolation`).
 # If you use a different CUDA version, change the torch index URL in the README.
 #
-# arctic-inference owns the validated vLLM pin (0.26). overrides.txt forces the
+# arctic_platform[inference] owns the validated vLLM pin (0.31). overrides.txt forces the
 # few transitive deps that otherwise drift on that stack.
 
 accelerate
@@ -12,6 +12,6 @@ accelerate
 arctic-platform[rl]
 datasets
 kernels>=0.16.0,<0.17.0
-# Native C1 `vllm serve` / transformers 5.x on the 0.26 stack
+# Native C1 `vllm serve` / transformers 5.x on the 0.31 stack
 openai>=2.54.0
 wandb
