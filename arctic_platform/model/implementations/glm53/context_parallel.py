@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import types
 
@@ -318,6 +319,11 @@ def _sparse_attention_forward(
     )
 
 
+@functools.cache
+def _report_convolution_fallback(error: str) -> None:
+    get_logger().info("GLM53_KDA_CONVOLUTION_FALLBACK causal_conv1d unavailable (%s); using unfused F.conv1d", error)
+
+
 def _linear_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -384,7 +390,8 @@ def _linear_attention_forward(
     )
     try:
         from causal_conv1d import causal_conv1d_fn
-    except ImportError:
+    except ImportError as error:
+        _report_convolution_fallback(str(error))
         mixed_qkv = _fallback_depthwise_causal_convolution(
             mixed_qkv,
             weight=conv_weight,
