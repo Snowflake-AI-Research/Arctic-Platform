@@ -146,7 +146,10 @@ class ModelConfig(BaseModel):
     def to_engine_kwargs(self) -> dict[str, Any]:
         kwargs = {k: v for k, v in self.model_dump().items() if v is not None}
         kwargs.update(self.extra_engine_kwargs)
-        if not arctic_inference_effective_enabled(self.extra_env):
+        fca_only = False
+        if self.extra_env and str(self.extra_env.get("ARCTIC_INFERENCE_FCA_ONLY", "0")) == "1":
+            fca_only = True
+        if not arctic_inference_effective_enabled(self.extra_env) and not fca_only:
             kwargs.pop("forest_cascade_attn_configs", None)
         return kwargs
 

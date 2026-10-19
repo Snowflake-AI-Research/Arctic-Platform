@@ -373,6 +373,16 @@ def _create_async_engine_args(
     if os.getenv("ARCTIC_INFERENCE_SKIP_VERSION_CHECK", "0") != "1":
         require_supported_vllm_version("InferenceWorker")
 
+    # Stock AsyncEngineArgs rejects this field, and its __init__ still runs
+    # after the __new__ patch. Build the Arctic subclass directly so FCA stays on.
+    if engine_kwargs.get("forest_cascade_attn_configs") is not None:
+        from arctic_platform.inference.vllm.args import ArcticAsyncEngineArgs
+        from arctic_platform.inference.vllm.attention import install_forest_cascade_patches
+
+        install_forest_cascade_patches()
+        _coerce_structured_outputs_config(engine_kwargs)
+        return ArcticAsyncEngineArgs(**engine_kwargs)
+
     if enable_arctic_patches:
         _ensure_arctic_vllm_patches()
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -891,12 +901,19 @@ class InferenceWorker(StreamingWorkerMixin):
         vllm.plugins.load_general_plugins()
 
         arctic_enabled = arctic_inference_effective_enabled()
+        fca_only = os.getenv("ARCTIC_INFERENCE_FCA_ONLY", "0") == "1"
         if arctic_enabled:
             # Some PrimeRL uv envs import arctic_platform.inference from PYTHONPATH
             # without installed entrypoint metadata, so load_general_plugins()
             # cannot discover the Arctic plugin. Apply the same patches
             # directly when ArcticInference is explicitly enabled.
             _ensure_arctic_vllm_patches()
+        elif fca_only or engine_kwargs.get("forest_cascade_attn_configs") is not None:
+            # vLLM 0.31 FCA without the rest of the Arctic patch set. The
+            # engine arg is unknown to stock AsyncEngineArgs until this runs.
+            from arctic_platform.inference.vllm.attention import install_forest_cascade_patches
+
+            install_forest_cascade_patches()
         else:
             engine_kwargs.pop("forest_cascade_attn_configs", None)
 

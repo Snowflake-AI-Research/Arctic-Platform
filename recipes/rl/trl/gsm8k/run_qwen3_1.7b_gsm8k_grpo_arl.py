@@ -64,6 +64,13 @@ def format_sample(sample: dict) -> dict:
     }
 
 
+def _arctic_inference_config() -> dict | None:
+    # Forest cascade on the sampler. ZoRRo training is the separate --zorro flag.
+    if os.environ.get("ARCTIC_ZORRO_INFERENCE", "0") in ("0", "false", "False"):
+        return None
+    return {"zorro_inference": {"enable": True}}
+
+
 # --------------------------------------------------------------------------------------------------------------- #
 # Arctic client (co-located training + sampling), mirroring the stage-2 smoke config
 # --------------------------------------------------------------------------------------------------------------- #
@@ -133,6 +140,7 @@ def build_client(
         use_unpad=(os.environ.get("ARCTIC_ATTN_IMPL", "flash_attention_2") == "flash_attention_2"),
         use_autocast=False,
     )
+    aic = _arctic_inference_config()
     vllm = {
         # TP=1 => `sampling_gpus` data-parallel replicas; the ReplicaPool spreads generate() across them.
         "tensor_parallel_size": tensor_parallel_size,
@@ -140,6 +148,9 @@ def build_client(
         "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "0") not in ("0", "false", "False"),
         "enable_prefix_caching": os.environ.get("VLLM_PREFIX_CACHING", "1") not in ("0", "false", "False"),
     }
+    if aic is not None:
+        # Full CUDA graphs skip forest cascade at runtime.
+        vllm["compilation_config"] = {"cudagraph_mode": "PIECEWISE"}
     cfg = ArcticClientConfig(
         model_name=model,
         seed=seed,
@@ -148,7 +159,7 @@ def build_client(
         sampling_gpus=sampling_gpus,
         log_prob_gpus=0,
         training=TrainingConfig(ds_config=ds_config, ds_worker_config=ds_worker_config, checkpoint_path=ckpt_dir),
-        sampling=SamplingConfig(vllm=vllm),
+        sampling=SamplingConfig(vllm=vllm, arctic_inference_config=aic),
         backend=OnPremConfig(colocate=colocate),
     )
     return ArcticRLClient(cfg)
