@@ -243,10 +243,10 @@ def test_glm53_kda_convolution_shards_select_matching_qkv_channels(monkeypatch):
     assert torch.equal(reassembled, bias)
 
 
-def test_glm53_head_parallel_kda_requires_global_cu_seqlens():
+def test_glm53_head_parallel_kda_requires_global_cu_seqlens(tiny_glm_sparse_model):
     from arctic_platform.model.implementations.glm53 import context_parallel as cp
 
-    model = _tiny_glm_sparse_model(with_linear_attention=True)
+    model = tiny_glm_sparse_model(with_linear_attention=True)
     attention = model.model.layers[1].self_attn
     hidden_states = torch.zeros(1, 8, model.model.config.hidden_size, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="global cu_seqlens"):
@@ -278,6 +278,7 @@ def _head_parallel_kda_worker(rank, world_size, rendezvous, fallback_convolution
     import torch.distributed as dist
 
     from arctic_platform.model.implementations.glm53 import context_parallel as cp
+    from tests.model.conftest import build_tiny_glm_sparse_model
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -289,9 +290,9 @@ def _head_parallel_kda_worker(rank, world_size, rendezvous, fallback_convolution
     )
     try:
         torch.manual_seed(29)
-        model = _tiny_glm_sparse_model(with_linear_attention=True).cuda()
+        model = build_tiny_glm_sparse_model(with_linear_attention=True).cuda()
         attention = model.model.layers[1].self_attn
-        attention.conv1d.bias = nn.Parameter(0.1 * torch.randn_like(attention.conv1d.weight[:, 0, 0]))
+        attention.conv1d.bias = torch.nn.Parameter(0.1 * torch.randn_like(attention.conv1d.weight[:, 0, 0]))
         global_length = 8
         local_length = global_length // world_size
         # The second packed sequence starts inside rank 0's shard and continues into rank 1's.
