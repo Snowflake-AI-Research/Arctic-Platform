@@ -13,8 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import types
+
 import pytest
 import torch
+
+from arctic_platform.testing_utils import get_unique_port_number
+from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import require_torch_multi_gpu
+from arctic_platform.testing_utils import reserve_free_port
 
 pytest.importorskip("transformers.models.glm5_next")
 
@@ -196,3 +203,179 @@ def test_glm53_sp1_packed_kda_outputs_and_gradients_match_isolated_row(tiny_glm_
             rtol=3e-2,
             atol=3e-2,
         )
+
+
+def test_glm53_kda_convolution_shards_select_matching_qkv_channels(monkeypatch):
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _shard_convolution_parameter
+
+    num_heads, head_dim, world_size = 4, 3, 2
+    channels = num_heads * head_dim
+    weight = torch.arange(3 * channels, dtype=torch.float32)[:, None].repeat(1, 4)
+    bias = torch.arange(3 * channels, dtype=torch.float32)
+    weight_shards, bias_shards = [], []
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: world_size)
+    for rank in range(world_size):
+        monkeypatch.setattr(dist, "get_rank", lambda group=None, rank=rank: rank)
+        for value, shards in ((weight, weight_shards), (bias, bias_shards)):
+            shards.append(
+                _shard_convolution_parameter(
+                    value,
+                    name="conv1d",
+                    num_key_heads=num_heads,
+                    num_value_heads=num_heads,
+                    key_head_dim=head_dim,
+                    value_head_dim=head_dim,
+                    process_group=None,
+                )
+            )
+
+    for weight_shard, bias_shard in zip(weight_shards, bias_shards, strict=True):
+        assert torch.equal(weight_shard[:, 0], bias_shard)
+    local_channels = channels // world_size
+    reassembled = torch.cat(
+        [
+            torch.cat([shard[part * local_channels : (part + 1) * local_channels] for shard in bias_shards])
+            for part in range(3)
+        ]
+    )
+    assert torch.equal(reassembled, bias)
+
+
+def test_glm53_head_parallel_kda_requires_global_cu_seqlens(tiny_glm_sparse_model):
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+
+    model = tiny_glm_sparse_model(with_linear_attention=True)
+    attention = model.model.layers[1].self_attn
+    hidden_states = torch.zeros(1, 8, model.model.config.hidden_size, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="global cu_seqlens"):
+        cp._linear_attention_forward(attention, hidden_states)
+
+
+def _unfused_causal_conv1d_module(global_cu_seqlens):
+    from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
+
+    def causal_conv1d_fn(x, weight, bias, activation, seq_idx):
+        return _fallback_depthwise_causal_convolution(
+            x,
+            weight=weight,
+            bias=bias,
+            activation=activation,
+            global_cu_seqlens=global_cu_seqlens,
+        )
+
+    module = types.ModuleType("causal_conv1d")
+    module.causal_conv1d_fn = causal_conv1d_fn
+    return module
+
+
+def _head_parallel_kda_worker(rank, world_size, rendezvous, fallback_convolution):
+    import sys
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+    from tests.model.conftest import build_tiny_glm_sparse_model
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        torch.manual_seed(29)
+        model = build_tiny_glm_sparse_model(with_linear_attention=True).cuda()
+        attention = model.model.layers[1].self_attn
+        attention.conv1d.bias = torch.nn.Parameter(0.1 * torch.randn_like(attention.conv1d.weight[:, 0, 0]))
+        global_length = 8
+        local_length = global_length // world_size
+        # The second packed sequence starts inside rank 0's shard and continues into rank 1's.
+        global_cu_seqlens = torch.tensor([0, 3, global_length], dtype=torch.int32).cuda()
+        setattr(attention, cp._GLOBAL_CU_SEQLENS, global_cu_seqlens)
+        hidden_states = torch.randn(1, global_length, model.model.config.hidden_size, dtype=torch.bfloat16).cuda()
+
+        def run(forward, inputs):
+            attention.zero_grad(set_to_none=True)
+            inputs = inputs.detach().requires_grad_(True)
+            output = forward(attention, inputs)
+            output.float().square().sum().backward()
+            gradients = {
+                name: parameter.grad.detach().float()
+                for name, parameter in attention.named_parameters()
+                if parameter.grad is not None
+            }
+            return output.detach(), inputs.grad.detach(), gradients
+
+        # The fallback case must not need a loadable causal_conv1d, including for the local reference.
+        reference_modules = (
+            {"causal_conv1d": _unfused_causal_conv1d_module(global_cu_seqlens)} if fallback_convolution else {}
+        )
+        with patch.dict(sys.modules, reference_modules):
+            local_output, local_input_gradient, local_gradients = run(
+                cp._local_linear_attention_forward, hidden_states
+            )
+        attention._cp_group = dist.group.WORLD
+        attention._cp_world_size = world_size
+        shard = slice(rank * local_length, (rank + 1) * local_length)
+        parallel_modules = {"causal_conv1d": None} if fallback_convolution else {}
+        with patch.dict(sys.modules, parallel_modules), patch.object(cp, "get_logger") as get_logger:
+            output, input_gradient, gradients = run(cp._linear_attention_forward, hidden_states[:, shard])
+            with torch.no_grad():
+                cp._linear_attention_forward(attention, hidden_states[:, shard])
+        fallback_logs = [
+            call for call in get_logger.return_value.info.call_args_list if "CONVOLUTION_FALLBACK" in call.args[0]
+        ]
+
+        outputs = [torch.empty_like(output) for _ in range(world_size)]
+        dist.all_gather(outputs, output.contiguous())
+        for gradient in gradients.values():
+            dist.all_reduce(gradient)
+    finally:
+        dist.destroy_process_group()
+
+    assert len(fallback_logs) == (1 if fallback_convolution else 0)
+    torch.testing.assert_close(torch.cat(outputs, dim=1), local_output, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(input_gradient, local_input_gradient[:, shard], rtol=3e-2, atol=3e-2)
+    assert gradients.keys() == local_gradients.keys()
+    assert "conv1d.bias" in gradients
+    for name, gradient in gradients.items():
+        torch.testing.assert_close(gradient, local_gradients[name], rtol=3e-2, atol=3e-2, msg=name)
+
+
+def _spawn_head_parallel_kda(world_size, fallback_convolution):
+    import torch.multiprocessing as mp
+
+    if not fallback_convolution:
+        pytest.importorskip("causal_conv1d", exc_type=ImportError)
+    port = reserve_free_port(get_unique_port_number() + 1)
+    mp.spawn(
+        _head_parallel_kda_worker,
+        args=(world_size, f"tcp://127.0.0.1:{port}", fallback_convolution),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+_CONVOLUTIONS = pytest.mark.parametrize(
+    "fallback_convolution",
+    [False, True],
+    ids=["causal_conv1d", "fallback_convolution"],
+)
+
+
+@require_torch_gpu
+@_CONVOLUTIONS
+def test_glm53_head_parallel_kda_matches_local_path(fallback_convolution):
+    _spawn_head_parallel_kda(1, fallback_convolution)
+
+
+@require_torch_multi_gpu
+@_CONVOLUTIONS
+def test_glm53_head_parallel_kda_multi_gpu_matches_local_path(fallback_convolution):
+    _spawn_head_parallel_kda(2, fallback_convolution)

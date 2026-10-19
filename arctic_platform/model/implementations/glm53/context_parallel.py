@@ -605,6 +605,11 @@ def _sparse_attention_forward(
     )
 
 
+@functools.cache
+def _report_convolution_fallback(error: str) -> None:
+    get_logger().info("GLM53_KDA_CONVOLUTION_FALLBACK causal_conv1d unavailable (%s); using unfused F.conv1d", error)
+
+
 def _linear_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -616,6 +621,9 @@ def _linear_attention_forward(
         raise NotImplementedError("GLM-5.3 head-parallel KDA is a training-only path")
     if hidden_states.shape[0] != 1:
         raise NotImplementedError("GLM-5.3 head-parallel KDA currently requires one packed row")
+    global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
+    if global_cu_seqlens is None:
+        raise RuntimeError("GLM-5.3 head-parallel KDA requires global cu_seqlens from the backbone wrapper")
     if attention_mask is not None:
         hidden_states = hidden_states * attention_mask[..., None].to(hidden_states.dtype)
 
@@ -657,13 +665,35 @@ def _linear_attention_forward(
         ],
         dim=-1,
     ).transpose(1, 2)
-    mixed_qkv = _fallback_depthwise_causal_convolution(
-        mixed_qkv,
-        weight=conv_weight,
-        bias=None,
-        activation=self.activation,
-        global_cu_seqlens=getattr(self, _GLOBAL_CU_SEQLENS),
-    ).transpose(1, 2)
+    conv_bias = _shard_convolution_parameter(
+        self.conv1d.bias,
+        name="conv1d.bias",
+        num_key_heads=self.num_heads,
+        num_value_heads=self.num_heads,
+        key_head_dim=self.head_dim,
+        value_head_dim=self.head_dim,
+        process_group=self._cp_group,
+    )
+    try:
+        from causal_conv1d import causal_conv1d_fn
+    except ImportError as error:
+        _report_convolution_fallback(str(error))
+        mixed_qkv = _fallback_depthwise_causal_convolution(
+            mixed_qkv,
+            weight=conv_weight,
+            bias=conv_bias,
+            activation=self.activation,
+            global_cu_seqlens=global_cu_seqlens,
+        )
+    else:
+        mixed_qkv = causal_conv1d_fn(
+            mixed_qkv,
+            weight=conv_weight,
+            bias=conv_bias,
+            activation=self.activation,
+            seq_idx=_packed_sequence_indices(global_cu_seqlens),
+        )
+    mixed_qkv = mixed_qkv.transpose(1, 2)
     local_width = local_heads * self.head_dim
     query, key, value = torch.split(
         mixed_qkv,
@@ -674,9 +704,9 @@ def _linear_attention_forward(
     key = key.view(batch_size, global_length, local_heads, self.head_dim)
     value = value.view(batch_size, global_length, local_heads, self.head_dim)
 
-    from transformers.models.glm5_next.modeling_glm5_next import chunk_kimi_delta_attention
+    from fla.ops.kda import chunk_kda
 
-    output, final_state = chunk_kimi_delta_attention(
+    output, final_state = chunk_kda(
         query,
         key,
         value,
@@ -685,7 +715,7 @@ def _linear_attention_forward(
         initial_state=None,
         output_final_state=False,
         use_qk_l2norm_in_kernel=True,
-        cu_seqlens=getattr(self, _GLOBAL_CU_SEQLENS),
+        cu_seqlens=global_cu_seqlens,
     )
     if final_state is not None:
         raise RuntimeError("GLM-5.3 KDA unexpectedly returned recurrent state")
