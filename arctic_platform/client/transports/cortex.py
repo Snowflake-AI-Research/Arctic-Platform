@@ -36,6 +36,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any
 from typing import Iterator
+from urllib.parse import unquote
 
 from tenacity import AsyncRetrying
 from tenacity import retry_if_exception
@@ -74,6 +75,8 @@ _MIN_OPERATION_MAX_JSON_BYTES = 16 * 1024
 _OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
+_JOB_NOT_FOUND_CODE = "517601"
+_RECENTLY_CREATED_SECONDS = 120.0
 _JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
 _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
@@ -271,6 +274,8 @@ def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
         return True
     if isinstance(exc, aiohttp.ClientResponseError):
+        if getattr(exc, "error_code", None) == _JOB_NOT_FOUND_CODE:
+            return bool(getattr(exc, "retry_job_not_found", False))
         return exc.status in _TRANSIENT_STATUSES
     return False
 
@@ -472,7 +477,15 @@ def _chunk_group_detail(body: Any) -> dict | None:
     return None
 
 
-async def _raise_for_status(resp: Any) -> None:
+def _response_error_code(body: Any) -> str | None:
+    for candidate in _iter_error_dicts(body):
+        code = candidate.get("code") or candidate.get("error_code")
+        if code is not None:
+            return str(code)
+    return None
+
+
+async def _raise_for_status(resp: Any, *, retry_job_not_found: bool = False) -> None:
     """Raise for an error response, keeping the server's error body in the message.
 
     GS explains a 4xx in the response body; the stock error shows only the status
@@ -487,13 +500,16 @@ async def _raise_for_status(resp: Any) -> None:
     if detail is not None:
         raise _ChunkGroupError(detail)
     message = f"{resp.reason}: {body[:2000]}" if body else (resp.reason or "")
-    raise aiohttp.ClientResponseError(
+    error = aiohttp.ClientResponseError(
         resp.request_info,
         resp.history,
         status=resp.status,
         message=message,
         headers=resp.headers,
     )
+    error.error_code = _response_error_code(body)
+    error.retry_job_not_found = retry_job_not_found
+    raise error
 
 
 def job_create_payload(sub_job_configs: list[dict], config: CortexConfig) -> dict:
@@ -515,6 +531,7 @@ class CortexTransport(Transport):
         self.job_id: str | None = None
         self._roles: list[str] = []
         self._owns_job = False
+        self._created_at: float | None = None
         self.poll_interval = 0.5
         self._start_loop()
 
@@ -554,6 +571,7 @@ class CortexTransport(Transport):
             body = job_create_payload(client_config.to_cortex(), self.config)
             self.job_id = self.call(Request("create-job", body=body))["job_id"]
             self._owns_job = True
+            self._created_at = time.monotonic()
             # Logged before the wait: a job can stay PLACING for a long time.
             logger.info("created cortex job %s", self.job_id)
         return self.jobs
@@ -711,6 +729,13 @@ class CortexTransport(Transport):
     def _job(self) -> dict:
         return self.call(get_job_request(self.job_id))
 
+    def _recent_job_url(self, url: str) -> bool:
+        return bool(
+            self._created_at is not None
+            and time.monotonic() - self._created_at <= _RECENTLY_CREATED_SECONDS
+            and f"/{self.job_id}" in unquote(url)
+        )
+
     async def _send(self, method: str, url: str, *, policy: _SendPolicy = _DEFAULT, **kwargs: Any) -> dict:
         # Every SnowAPI call goes through here so transient 429/5xx/connection blips
         # are retried with exponential-jitter backoff (the neutrino client's policy).
@@ -726,7 +751,7 @@ class CortexTransport(Transport):
         async def attempt() -> dict:
             async with session.request(method, url, **kwargs) as resp:
                 if resp.status >= 400:
-                    await _raise_for_status(resp)
+                    await _raise_for_status(resp, retry_job_not_found=self._recent_job_url(url))
                 body = await resp.read()
                 # `:cancel` answers 200 with an empty body. Decoding that as JSON
                 # would report an already-completed release as a failure.
