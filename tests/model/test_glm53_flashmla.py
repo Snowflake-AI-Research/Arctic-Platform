@@ -101,10 +101,66 @@ def test_flashinfer_guard_does_not_query_cuda_for_cpu(monkeypatch):
     capability_lookup.assert_not_called()
 
 
+@pytest.mark.parametrize("all_empty", [False, True])
+def test_flashinfer_request_contract_and_empty_rows(monkeypatch, all_empty):
+    query = torch.zeros(1, 3, 2, 512, dtype=torch.bfloat16)
+    kv = torch.zeros(1, 5, 1, 512, dtype=torch.bfloat16)
+    indices = torch.tensor([[[-1, -1, 7], [2, 0, -1], [0, 0, 2]]], dtype=torch.int32)
+    if all_empty:
+        indices.fill_(-1)
+    counts = torch.tensor([0, 0, 0] if all_empty else [0, 2, 3], dtype=torch.int32)
+    packed = torch.tensor([0] if all_empty else [2, 0, 0, 0, 2], dtype=torch.int32)
+    observed = []
+
+    class Wrapper:
+        def plan(
+            self,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_len_arr,
+            num_heads,
+            head_dim_ckv,
+            head_dim_kpe,
+            page_size,
+            causal,
+            sm_scale,
+            q_data_type,
+            kv_data_type,
+        ):
+            observed.append("plan")
+            torch_assert_equal(qo_indptr, torch.arange(4, dtype=torch.int32))
+            torch_assert_equal(kv_indptr, torch.cat([counts.new_zeros(1), counts.cumsum(0).to(torch.int32)]))
+            torch_assert_equal(kv_indices, packed)
+            torch_assert_equal(kv_len_arr, counts)
+            assert (num_heads, head_dim_ckv, head_dim_kpe, page_size, causal) == (2, 512, 0, 1, False)
+            assert sm_scale == 0.125
+            assert q_data_type == kv_data_type == torch.bfloat16
+
+        def run(self, q_nope, q_rope, ckv_cache, kpe_cache):
+            observed.append("run")
+            assert q_nope.shape == (3, 2, 512)
+            assert q_rope.shape == (3, 2, 0)
+            assert ckv_cache.shape == (4, 1, 512)
+            assert kpe_cache.shape == (4, 1, 0)
+            assert q_nope.is_contiguous() and ckv_cache.is_contiguous()
+            output = torch.ones_like(q_nope)
+            output[counts == 0] = float("nan")
+            return output
+
+    monkeypatch.setattr(context_parallel, "_flashinfer_wrapper", lambda _device: Wrapper())
+    actual = context_parallel._flashinfer_sparse_mla_requests(query, kv, indices, 0.125, 512)
+    assert observed == ["plan", "run"]
+    expected = torch.ones_like(query)
+    expected[:, counts == 0] = 0
+    torch_assert_equal(actual, expected)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("tile_rows", [1, 3])
 @pytest.mark.parametrize("requires_grad", [(True, True), (True, False), (False, True)])
-def test_tiled_reference_gradients_match_fp32_dense(monkeypatch, dtype, tile_rows, requires_grad):
+@pytest.mark.parametrize("use_flashinfer", [False, True])
+def test_tiled_reference_gradients_match_fp32_dense(monkeypatch, dtype, tile_rows, requires_grad, use_flashinfer):
     set_seed(42)
     query = torch.randn(1, 17, 2, 8, dtype=dtype).requires_grad_(requires_grad[0])
     kv = torch.randn(1, 7, 1, 8, dtype=dtype).requires_grad_(requires_grad[1])
@@ -116,7 +172,10 @@ def test_tiled_reference_gradients_match_fp32_dense(monkeypatch, dtype, tile_row
     gradient = torch.randn_like(expected)
     expected.backward(gradient)
     monkeypatch.setattr(context_parallel, "_REFERENCE_SPARSE_MLA_TILE_BYTES", tile_rows * 4 * 8 * 4)
-    actual = context_parallel._reference_sparse_mla(query, kv, indices, scale=0.25, value_dim=5)
+    forward = Mock(wraps=context_parallel._reference_sparse_mla_math)
+    monkeypatch.setattr(context_parallel, "_flashinfer_sparse_mla", forward)
+    actual = context_parallel._TiledSparseMLA.apply(query, kv, indices, 0.25, 5, use_flashinfer)
+    assert forward.call_count == int(use_flashinfer)
     actual.backward(gradient)
     torch_assert_close(actual, expected, rtol=0, atol=1e-6)
     for value, reference in [(query, reference_query), (kv, reference_kv)]:

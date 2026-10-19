@@ -23,6 +23,10 @@ from arctic_platform.model import ParallelismConfig
 from arctic_platform.model.implementations.glm53.converting_glm5_next import convert_hf_layer_to_prime
 from arctic_platform.model.implementations.glm53.converting_glm5_next import convert_prime_layer_to_hf
 from arctic_platform.model.implementations.glm53.vllm_weights import convert_glm5_next_layer_to_vllm
+from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_close
+from arctic_platform.testing_utils import torch_assert_equal
 
 
 def _checkpoint(tmp_path, model_type: str) -> str:
@@ -460,34 +464,42 @@ def test_glm53_sparse_reference_tiles_match_dense():
     torch.testing.assert_close(key_value.grad, key_grad)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer MLA runs on CUDA")
-def test_glm53_flashinfer_sparse_mla_matches_reference():
+@require_torch_gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_glm53_flashinfer_sparse_mla_matches_reference(monkeypatch, dtype):
     pytest.importorskip("flashinfer")
     from arctic_platform.model.implementations.glm53 import context_parallel as cp
 
-    torch.manual_seed(0)
+    set_seed(0)
     device = "cuda"
-    query = torch.randn(1, 4, 64, 512, device=device, dtype=torch.bfloat16, requires_grad=True)
-    key_value = torch.randn(1, 33, 1, 512, device=device, dtype=torch.bfloat16, requires_grad=True)
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("FlashInfer FA3 MLA requires Hopper")
+    query = (torch.randn(1, 4, 64, 512, device=device, dtype=dtype) * 0.05).requires_grad_()
+    key_value = (torch.randn(1, 33, 1, 512, device=device, dtype=dtype) * 0.05).requires_grad_()
     indices = torch.randint(0, 32, (1, 4, 16), device=device, dtype=torch.int32)
     indices[:, :, -3:] = -1
     indices[0, 0, :] = -1
     scale = 512**-0.5
 
     assert cp._use_flashinfer(query, key_value)
-    dense = cp._reference_sparse_mla_math(query, key_value, indices, scale, 512)
+    reference_query = query.detach().float().requires_grad_()
+    reference_kv = key_value.detach().float().requires_grad_()
+    dense = cp._reference_sparse_mla_math(reference_query, reference_kv, indices, scale, 512).to(dtype)
     output = cp._flashinfer_sparse_mla_apply(query, key_value, indices, scale=scale, value_dim=512)
-    torch.testing.assert_close(output, dense, atol=2e-2, rtol=2e-2)
-    previous = cp._FLASHINFER_MAX_REQUESTS
-    cp._FLASHINFER_MAX_REQUESTS = 2
-    try:
-        chunked = cp._flashinfer_sparse_mla_apply(query, key_value, indices, scale=scale, value_dim=512)
-    finally:
-        cp._FLASHINFER_MAX_REQUESTS = previous
-    torch.testing.assert_close(chunked, dense, atol=2e-2, rtol=2e-2)
-    output.float().square().sum().backward()
-    assert query.grad is not None
-    assert key_value.grad is not None
+    monkeypatch.setattr(cp, "_FLASHINFER_MAX_REQUESTS", 2)
+    monkeypatch.setattr(cp, "_REFERENCE_SPARSE_MLA_TILE_BYTES", 16 * 512 * 4)
+    chunked = cp._flashinfer_sparse_mla_apply(query, key_value, indices, scale=scale, value_dim=512)
+    # Permit one dtype rounding unit per element and a fixed CUDA-cancellation floor.
+    for actual in (output, chunked):
+        torch_assert_close(actual, dense, atol=1e-4, rtol=torch.finfo(dtype).eps)
+        torch_assert_equal(actual[:, 0], torch.zeros_like(actual[:, 0]))
+    gradient = torch.randn_like(dense)
+    expected_grads = torch.autograd.grad(dense, (reference_query, reference_kv), gradient)
+    for actual in (output, chunked):
+        actual_grads = torch.autograd.grad(actual, (query, key_value), gradient)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            assert torch.isfinite(actual_grad).all()
+            torch_assert_close(actual_grad, expected_grad.to(dtype), atol=1e-6, rtol=torch.finfo(dtype).eps)
 
 
 def test_glm53_sparse_indices_are_padded_for_flashmla():

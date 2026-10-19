@@ -307,6 +307,8 @@ def _flashinfer_sparse_mla_requests(
         key_value[0, :kv_len].contiguous(),
         key_value.new_empty(kv_len, 1, 0),
     )
+    # Empty sparse rows have zero output even if the backend leaves them undefined.
+    absorbed = absorbed.masked_fill(counts[:, None, None] == 0, 0)
     return absorbed.unsqueeze(0)[..., :value_dim]
 
 
