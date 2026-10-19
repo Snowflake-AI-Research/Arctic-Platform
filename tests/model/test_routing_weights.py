@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import gc
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -102,8 +103,9 @@ def test_routing_weights_second_derivatives():
 
 @pytest.mark.parametrize("score_before_experts", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_uccl_weighting_sites_preserve_forward_and_gradients(monkeypatch, score_before_experts, dtype):
-    uccl = pytest.importorskip("arctic_platform.model.implementations.moe.distributed.ucclep")
+@pytest.mark.parametrize("backend", ["ucclep", "deepep"])
+def test_ep_weighting_sites_preserve_forward_and_gradients(monkeypatch, score_before_experts, dtype, backend):
+    ep = pytest.importorskip(f"arctic_platform.model.implementations.moe.distributed.{backend}")
     hidden = torch.randn(6, 4, dtype=dtype, requires_grad=True)
     scores = torch.randn(6, 2, requires_grad=True)
     indices = torch.tensor([[0, 1], [1, 0], [0, -1], [1, 0], [-1, 1], [0, 1]])
@@ -113,6 +115,8 @@ def test_uccl_weighting_sites_preserve_forward_and_gradients(monkeypatch, score_
     calls = []
 
     def recorded_weighting(x, weights):
+        assert weights.dtype == torch.float32
+        assert weights.ndim == 1 and len(weights) == len(x)
         calls.append(score_before_experts)
         return apply_routing_weights(x, weights)
 
@@ -122,10 +126,10 @@ def test_uccl_weighting_sites_preserve_forward_and_gradients(monkeypatch, score_
             assert handle_id is handle
             return x
 
-    monkeypatch.setattr(uccl, "apply_routing_weights", recorded_weighting)
-    monkeypatch.setattr(uccl, "_sync_dispatch", lambda _: None)
-    monkeypatch.setattr(uccl, "_UcclEPCombine", LocalCombine)
-    pending = uccl._PendingDispatchState(
+    monkeypatch.setattr(ep, "apply_routing_weights", recorded_weighting)
+    monkeypatch.setattr(ep, "_sync_dispatch", lambda _: None)
+    monkeypatch.setattr(ep, "_UcclEPCombine" if backend == "ucclep" else "_DeepEPCombine", LocalCombine)
+    pending = ep._PendingDispatchState(
         hidden,
         indices,
         scores,
@@ -133,13 +137,67 @@ def test_uccl_weighting_sites_preserve_forward_and_gradients(monkeypatch, score_
         handle,
         score_before_experts,
     )
-    dispatched, _, state = uccl.finalize_dispatch_tokens(pending)
-    actual = uccl.combine_tokens(dispatched, state)
-    rows, weights, row_indices = uccl._permute_tokens(reference_hidden, indices, reference_scores)
-    expected = uccl._unpermute_tokens(_reference(rows, weights), row_indices, len(hidden))
+    dispatched, _, state = ep.finalize_dispatch_tokens(pending)
+    actual = ep.combine_tokens(dispatched, state)
+    permute = ep._permute_tokens if backend == "ucclep" else ep.permute_tokens
+    unpermute = ep._unpermute_tokens if backend == "ucclep" else ep.unpermute_tokens
+    if backend == "ucclep":
+        rows, weights, row_indices = permute(reference_hidden, indices, reference_scores)
+    else:
+        rows, weights, row_indices, _ = permute(reference_hidden, indices, reference_scores, 2)
+    expected = unpermute(_reference(rows, weights), row_indices, len(hidden))
     assert calls == [score_before_experts]
     torch_assert_equal(actual, expected)
     gradient = torch.randn(actual.shape, dtype=dtype)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch_assert_equal(hidden.grad, reference_hidden.grad)
+    torch_assert_equal(scores.grad, reference_scores.grad)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("site", ["before", "after", "latent"])
+def test_local_moe_weighting_sites_preserve_forward_and_gradients(monkeypatch, dtype, site):
+    from arctic_platform.model.implementations.moe.layers import moe
+
+    hidden = torch.randn(6, 4, dtype=dtype, requires_grad=True)
+    scores = torch.randn(10, requires_grad=True)
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    reference_scores = scores.detach().clone().requires_grad_()
+    rows = torch.tensor([0, 1, 2, 3, 4, 0, 1, 3, 4, 5])
+    counts = torch.tensor([5, 5])
+    calls = []
+
+    def recorded_weighting(x, weights):
+        assert weights.dtype == torch.float32
+        assert weights.shape == (len(x),)
+        calls.append((x.dtype, weights.shape))
+        return apply_routing_weights(x, weights)
+
+    def experts(x, num_tokens_per_expert):
+        torch_assert_equal(num_tokens_per_expert, counts)
+        return x.square()
+
+    monkeypatch.setattr(moe, "apply_routing_weights", recorded_weighting)
+    layer = SimpleNamespace(
+        experts=experts,
+        score_before_experts=site == "before",
+        fc1_latent_proj=lambda x: x * 0.5,
+        fc2_latent_proj=lambda x: x * 0.25,
+        routed_scaling_factor=1.5,
+    )
+    cls = moe.LatentMoE if site == "latent" else moe.MoE
+    actual = cls._run_routed_experts(layer, hidden, rows, counts, scores)
+    gathered = reference_hidden.index_select(0, rows)
+    if site == "before":
+        expected = _reference(gathered, reference_scores).square()
+    elif site == "after":
+        expected = _reference(gathered.square(), reference_scores)
+    else:
+        expected = _reference((gathered * 0.5).square(), reference_scores) * 1.5 * 0.25
+    assert calls == [(dtype, scores.shape)]
+    torch_assert_equal(actual, expected)
+    gradient = torch.randn_like(actual)
     actual.backward(gradient)
     expected.backward(gradient)
     torch_assert_equal(hidden.grad, reference_hidden.grad)

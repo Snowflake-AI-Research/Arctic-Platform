@@ -76,12 +76,21 @@ def test_real_flashmla_padded_width_matches_original_reference():
         scale=scale,
         value_dim=512,
     ).to(query.dtype)
-    actual = sparse_mla_flashmla_apply(
-        torch.nn.functional.pad(query, (0, 64)),
-        torch.nn.functional.pad(kv, (0, 64)),
-        indices.unsqueeze(2),
-        scale,
-    )
+    padded_query = torch.nn.functional.pad(query, (0, 64))
+    padded_kv = torch.nn.functional.pad(kv, (0, 64))
+    saved = []
+
+    def pack(value):
+        saved.append((value.data_ptr(), value.numel() * value.element_size()))
+        return value
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda value: value):
+        actual = sparse_mla_flashmla_apply(padded_query, padded_kv, indices.unsqueeze(2), scale)
+    # FlashMLA retains the padded inputs for reference backward, including 64 zero channels.
+    input_bytes = sum(value.numel() * value.element_size() for value in (query, kv))
+    retained_bytes = sum(size for ptr, size in saved if ptr in (padded_query.data_ptr(), padded_kv.data_ptr()))
+    assert retained_bytes == input_bytes * 576 // 512
+    assert {ptr for ptr, _ in saved}.issuperset({padded_query.data_ptr(), padded_kv.data_ptr()})
     _assert_bf16_kernel_close(actual, expected)
     torch_assert_equal(actual[:, 0], torch.zeros_like(actual[:, 0]))
     grad = torch.randn_like(expected)
