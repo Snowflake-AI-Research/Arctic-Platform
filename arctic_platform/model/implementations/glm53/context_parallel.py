@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import functools
+import importlib.util
 import math
 import types
 
@@ -38,6 +40,8 @@ from arctic_platform.model.implementations.moe.vlm import get_language_model
 
 _GLOBAL_POSITION_IDS = "_ap_glm53_global_position_ids"
 _GLOBAL_CU_SEQLENS = "_ap_glm53_global_cu_seqlens"
+# Bound one fp32 gathered-key tile while recomputing reference sparse-MLA backward.
+_REFERENCE_SPARSE_MLA_TILE_BYTES = 1 << 30
 
 
 def _gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:
@@ -176,11 +180,10 @@ def _select_sparse_indices(
     return topk_indices
 
 
-def _reference_sparse_mla(
+def _reference_sparse_mla_math(
     query: torch.Tensor,
     key_value: torch.Tensor,
     indices: torch.Tensor,
-    *,
     scale: float,
     value_dim: int,
 ) -> torch.Tensor:
@@ -200,6 +203,208 @@ def _reference_sparse_mla(
         probabilities,
         gathered[..., :value_dim],
     )
+
+
+def _sparse_mla_query_tile(query_len: int, topk: int, dim: int) -> int:
+    row_bytes = topk * dim * 4
+    if row_bytes <= 0:
+        return max(query_len, 1)
+    return max(1, min(query_len, _REFERENCE_SPARSE_MLA_TILE_BYTES // row_bytes))
+
+
+def _reference_sparse_mla_tiled(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    indices: torch.Tensor,
+    scale: float,
+    value_dim: int,
+) -> torch.Tensor:
+    query_len = query.shape[1]
+    output = query.new_empty(query.shape[0], query_len, query.shape[2], value_dim)
+    tile = _sparse_mla_query_tile(query_len, indices.shape[-1], key_value.shape[-1])
+    for start in range(0, query_len, tile):
+        end = min(start + tile, query_len)
+        output[:, start:end] = _reference_sparse_mla_math(
+            query[:, start:end],
+            key_value,
+            indices[:, start:end],
+            scale,
+            value_dim,
+        )
+    return output
+
+
+# Hopper MLA scheduler keeps at most this many work items. One query token is one request.
+_FLASHINFER_MAX_REQUESTS = 16384
+_FLASHINFER_WRAPPERS: dict[torch.device, object] = {}
+
+
+@functools.cache
+def _flashinfer_available() -> bool:
+    return importlib.util.find_spec("flashinfer") is not None
+
+
+def _use_flashinfer(query: torch.Tensor, key_value: torch.Tensor) -> bool:
+    return (
+        query.is_cuda
+        and query.dtype in (torch.bfloat16, torch.float16)
+        and query.shape[-1] == 512
+        and key_value.shape[-1] == 512
+        and _flashinfer_available()
+    )
+
+
+def _flashinfer_wrapper(device: torch.device):
+    import flashinfer
+
+    key = torch.device(device)
+    wrapper = _FLASHINFER_WRAPPERS.get(key)
+    if wrapper is None:
+        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=key)
+        wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa3")
+        _FLASHINFER_WRAPPERS[key] = wrapper
+    return wrapper
+
+
+def _flashinfer_sparse_mla_requests(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    indices: torch.Tensor,
+    scale: float,
+    value_dim: int,
+) -> torch.Tensor:
+    """One FlashInfer plan. ``query`` must stay within ``_FLASHINFER_MAX_REQUESTS``."""
+    kv_len = key_value.shape[1] - 1
+    rows = indices[0]
+    valid = (rows >= 0) & (rows < kv_len)
+    counts = valid.sum(dim=-1).to(torch.int32)
+    packed = rows.masked_select(valid).to(torch.int32).contiguous()
+    if packed.numel() == 0:
+        packed = rows.new_zeros(1, dtype=torch.int32)
+    query_len, heads, _dim = query.shape[1:]
+    qo_indptr = torch.arange(query_len + 1, device=query.device, dtype=torch.int32)
+    kv_indptr = torch.zeros(query_len + 1, device=query.device, dtype=torch.int32)
+    kv_indptr[1:] = counts.cumsum(0)
+    wrapper = _flashinfer_wrapper(query.device)
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        packed,
+        counts,
+        heads,
+        query.shape[-1],
+        0,
+        1,
+        False,
+        scale,
+        query.dtype,
+        key_value.dtype,
+    )
+    absorbed = wrapper.run(
+        query[0].contiguous(),
+        query.new_empty(query_len, heads, 0),
+        key_value[0, :kv_len].contiguous(),
+        key_value.new_empty(kv_len, 1, 0),
+    )
+    return absorbed.unsqueeze(0)[..., :value_dim]
+
+
+def _flashinfer_sparse_mla(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    indices: torch.Tensor,
+    scale: float,
+    value_dim: int,
+) -> torch.Tensor:
+    """Hopper FlashInfer MLA. Each query row is one page-size-1 request over its valid keys."""
+    if query.shape[0] != 1:
+        raise NotImplementedError("FlashInfer sparse MLA is wired for one packed row")
+    query_len = query.shape[1]
+    if query_len <= _FLASHINFER_MAX_REQUESTS:
+        return _flashinfer_sparse_mla_requests(query, key_value, indices, scale, value_dim)
+    output = query.new_empty(1, query_len, query.shape[2], value_dim)
+    for start in range(0, query_len, _FLASHINFER_MAX_REQUESTS):
+        end = min(start + _FLASHINFER_MAX_REQUESTS, query_len)
+        output[:, start:end] = _flashinfer_sparse_mla_requests(
+            query[:, start:end],
+            key_value,
+            indices[:, start:end],
+            scale,
+            value_dim,
+        )
+    return output
+
+
+class _TiledSparseMLA(torch.autograd.Function):
+    """Sparse MLA forward through FlashInfer or the tiled reference.
+
+    Backward always recomputes the reference math one query tile at a time.
+    """
+
+    @staticmethod
+    def forward(ctx, query, key_value, indices, scale, value_dim, use_flashinfer):
+        ctx.scale = float(scale)
+        ctx.value_dim = int(value_dim)
+        ctx.save_for_backward(query, key_value, indices)
+        with torch.no_grad():
+            if use_flashinfer:
+                return _flashinfer_sparse_mla(query, key_value, indices, ctx.scale, ctx.value_dim)
+            return _reference_sparse_mla_tiled(query, key_value, indices, ctx.scale, ctx.value_dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        query, key_value, indices = ctx.saved_tensors
+        need_query, need_kv = ctx.needs_input_grad[:2]
+        grad_query = torch.zeros_like(query) if need_query else None
+        grad_kv = torch.zeros_like(key_value) if need_kv else None
+        if need_query or need_kv:
+            query_len = query.shape[1]
+            tile = _sparse_mla_query_tile(query_len, indices.shape[-1], key_value.shape[-1])
+            grad_output = grad_output.contiguous()
+            for start in range(0, query_len, tile):
+                end = min(start + tile, query_len)
+                query_tile = query[:, start:end].detach()
+                kv_tile = key_value.detach()
+                if need_query:
+                    query_tile = query_tile.requires_grad_(True)
+                if need_kv:
+                    kv_tile = kv_tile.requires_grad_(True)
+                with torch.enable_grad():
+                    tile_out = _reference_sparse_mla_math(
+                        query_tile,
+                        kv_tile,
+                        indices[:, start:end],
+                        ctx.scale,
+                        ctx.value_dim,
+                    )
+                    torch.autograd.backward(tile_out, grad_output[:, start:end])
+                if need_query:
+                    grad_query[:, start:end] = query_tile.grad
+                if need_kv:
+                    grad_kv.add_(kv_tile.grad)
+        return grad_query, grad_kv, None, None, None, None
+
+
+def _reference_sparse_mla(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    scale: float,
+    value_dim: int,
+) -> torch.Tensor:
+    return _TiledSparseMLA.apply(query, key_value, indices, float(scale), int(value_dim), False)
+
+
+def _flashinfer_sparse_mla_apply(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    scale: float,
+    value_dim: int,
+) -> torch.Tensor:
+    return _TiledSparseMLA.apply(query, key_value, indices, float(scale), int(value_dim), True)
 
 
 def _pad_sparse_indices(indices: torch.Tensor, multiple: int = 128) -> torch.Tensor:
@@ -288,7 +493,21 @@ def _sparse_attention_forward(
     )
 
     kernel_indices = _pad_sparse_indices(topk_indices)
-    if sparse_query.is_cuda and self.kv_lora_rank == 512 and sparse_query.shape[-1] in (512, 576):
+    if self.kv_lora_rank == 512 and _use_flashinfer(sparse_query, sparse_kv):
+        absorbed_output = _flashinfer_sparse_mla_apply(
+            sparse_query,
+            sparse_kv,
+            kernel_indices,
+            scale=self.scaling,
+            value_dim=self.kv_lora_rank,
+        )
+        if not getattr(self, "_ap_flashinfer_dispatch_reported", False):
+            get_logger().info(
+                "GLM53_FLASHINFER_EXECUTED rank=%s query_width=512 backward=reference",
+                dist.get_rank() if dist.is_initialized() else 0,
+            )
+            self._ap_flashinfer_dispatch_reported = True
+    elif sparse_query.is_cuda and self.kv_lora_rank == 512 and sparse_query.shape[-1] in (512, 576):
         # The rope-free checkpoint keeps the same dot products with zero-padded kernel channels.
         padding = 576 - sparse_query.shape[-1]
         if padding:

@@ -421,6 +421,75 @@ def test_glm53_sparse_reference_supports_rectangular_context_parallelism():
     assert key_value.grad is not None
 
 
+def test_glm53_sparse_reference_tiles_match_dense():
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+
+    torch.manual_seed(0)
+    query = torch.randn(1, 5, 2, 4, requires_grad=True)
+    key_value = torch.randn(1, 7, 1, 4, requires_grad=True)
+    indices = torch.tensor(
+        [[[0, 2, -1, 6], [1, 3, 4, -1], [0, 1, 2, 3], [-1, -1, -1, -1], [5, 5, 0, 2]]],
+        dtype=torch.int32,
+    )
+    scale = 0.5
+    value_dim = 3
+
+    dense = cp._reference_sparse_mla_math(query, key_value, indices, scale, value_dim)
+    dense.square().sum().backward()
+    query_grad = query.grad.detach().clone()
+    key_grad = key_value.grad.detach().clone()
+    query.grad = None
+    key_value.grad = None
+
+    previous = cp._REFERENCE_SPARSE_MLA_TILE_BYTES
+    cp._REFERENCE_SPARSE_MLA_TILE_BYTES = 64
+    try:
+        output = cp._reference_sparse_mla(
+            query,
+            key_value,
+            indices,
+            scale=scale,
+            value_dim=value_dim,
+        )
+        output.square().sum().backward()
+    finally:
+        cp._REFERENCE_SPARSE_MLA_TILE_BYTES = previous
+
+    torch.testing.assert_close(output, dense)
+    torch.testing.assert_close(query.grad, query_grad)
+    torch.testing.assert_close(key_value.grad, key_grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer MLA runs on CUDA")
+def test_glm53_flashinfer_sparse_mla_matches_reference():
+    pytest.importorskip("flashinfer")
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+
+    torch.manual_seed(0)
+    device = "cuda"
+    query = torch.randn(1, 4, 64, 512, device=device, dtype=torch.bfloat16, requires_grad=True)
+    key_value = torch.randn(1, 33, 1, 512, device=device, dtype=torch.bfloat16, requires_grad=True)
+    indices = torch.randint(0, 32, (1, 4, 16), device=device, dtype=torch.int32)
+    indices[:, :, -3:] = -1
+    indices[0, 0, :] = -1
+    scale = 512**-0.5
+
+    assert cp._use_flashinfer(query, key_value)
+    dense = cp._reference_sparse_mla_math(query, key_value, indices, scale, 512)
+    output = cp._flashinfer_sparse_mla_apply(query, key_value, indices, scale=scale, value_dim=512)
+    torch.testing.assert_close(output, dense, atol=2e-2, rtol=2e-2)
+    previous = cp._FLASHINFER_MAX_REQUESTS
+    cp._FLASHINFER_MAX_REQUESTS = 2
+    try:
+        chunked = cp._flashinfer_sparse_mla_apply(query, key_value, indices, scale=scale, value_dim=512)
+    finally:
+        cp._FLASHINFER_MAX_REQUESTS = previous
+    torch.testing.assert_close(chunked, dense, atol=2e-2, rtol=2e-2)
+    output.float().square().sum().backward()
+    assert query.grad is not None
+    assert key_value.grad is not None
+
+
 def test_glm53_sparse_indices_are_padded_for_flashmla():
     from arctic_platform.model.implementations.glm53.context_parallel import _pad_sparse_indices
 

@@ -195,16 +195,17 @@ def test_sparse_attention_dispatches_only_supported_flashmla_layouts(kv_lora_ran
     attention = attention.to(device="cuda", dtype=torch.bfloat16)
     hidden_states = torch.randn(1, 4, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     indices = torch.arange(4, device="cuda").expand(1, 4, -1)
-    with patch.object(context_parallel, "sparse_mla_flashmla_apply", wraps=sparse_mla_flashmla_apply) as flash:
-        with patch.object(
-            context_parallel, "_reference_sparse_mla", wraps=context_parallel._reference_sparse_mla
-        ) as ref:
-            hidden, _, _ = context_parallel._sparse_attention_forward(
-                attention, hidden_states, None, prev_topk_indices=indices
-            )
-            assert torch.isfinite(hidden).all()
-            hidden.float().square().mean().backward()
-            torch.cuda.synchronize()
+    with patch.object(context_parallel, "_flashinfer_available", return_value=False):
+        with patch.object(context_parallel, "sparse_mla_flashmla_apply", wraps=sparse_mla_flashmla_apply) as flash:
+            with patch.object(
+                context_parallel, "_reference_sparse_mla", wraps=context_parallel._reference_sparse_mla
+            ) as ref:
+                hidden, _, _ = context_parallel._sparse_attention_forward(
+                    attention, hidden_states, None, prev_topk_indices=indices
+                )
+                assert torch.isfinite(hidden).all()
+                hidden.float().square().mean().backward()
+                torch.cuda.synchronize()
     assert flash.call_count == int(use_flashmla)
     assert ref.call_count == int(not use_flashmla)
     if use_flashmla:
@@ -225,14 +226,45 @@ def test_glm53_rope_free_model_executes_flashmla():
     sparse_layers = sum(layer.block_type == "deepseek_sparse_attention" for layer in model.model.layers)
     assert sparse_layers > 0
     tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
-    with patch.object(context_parallel, "sparse_mla_flashmla_apply", wraps=sparse_mla_flashmla_apply) as flash:
-        with patch.object(context_parallel, "_reference_sparse_mla", side_effect=AssertionError("Reference fallback")):
-            hidden = model.model(input_ids=tokens, use_cache=False).last_hidden_state
-            assert torch.isfinite(hidden).all()
-            hidden.float().square().mean().backward()
-            torch.cuda.synchronize()
+    with patch.object(context_parallel, "_flashinfer_available", return_value=False):
+        with patch.object(context_parallel, "sparse_mla_flashmla_apply", wraps=sparse_mla_flashmla_apply) as flash:
+            with patch.object(
+                context_parallel, "_reference_sparse_mla", side_effect=AssertionError("Reference fallback")
+            ):
+                hidden = model.model(input_ids=tokens, use_cache=False).last_hidden_state
+                assert torch.isfinite(hidden).all()
+                hidden.float().square().mean().backward()
+                torch.cuda.synchronize()
     assert flash.call_count == sparse_layers
     assert flash.call_args.args[0].shape[-1] == 576
     assert flash.call_args.args[1].shape[-1] == 576
+    grads = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+    assert grads and all(torch.isfinite(gradient).all() for gradient in grads)
+
+
+@require_torch_gpu
+def test_glm53_rope_free_model_prefers_flashinfer():
+    pytest.importorskip("flashinfer")
+    set_seed(42)
+    model = _tiny_glm_sparse_model().to(device="cuda", dtype=torch.bfloat16).train()
+    sparse_layers = sum(layer.block_type == "deepseek_sparse_attention" for layer in model.model.layers)
+    assert sparse_layers > 0
+    tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
+    with patch.object(
+        context_parallel,
+        "_flashinfer_sparse_mla_apply",
+        wraps=context_parallel._flashinfer_sparse_mla_apply,
+    ) as flashinfer:
+        with patch.object(context_parallel, "sparse_mla_flashmla_apply", side_effect=AssertionError("FlashMLA")):
+            with patch.object(
+                context_parallel, "_reference_sparse_mla", side_effect=AssertionError("Reference fallback")
+            ):
+                hidden = model.model(input_ids=tokens, use_cache=False).last_hidden_state
+                assert torch.isfinite(hidden).all()
+                hidden.float().square().mean().backward()
+                torch.cuda.synchronize()
+    assert flashinfer.call_count == sparse_layers
+    assert flashinfer.call_args.args[0].shape[-1] == 512
+    assert flashinfer.call_args.args[1].shape[-1] == 512
     grads = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
     assert grads and all(torch.isfinite(gradient).all() for gradient in grads)
