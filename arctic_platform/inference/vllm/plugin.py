@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import sys
 
 from vllm.platforms import current_platform
@@ -31,14 +30,6 @@ def arctic_inference_plugin():
     )
 
     apply_required_vllm_patches()
-
-    # FCA without the rest of the Arctic patches. Still requires vLLM 0.31,
-    # which was checked above. The full plugin path below also registers FCA.
-    if os.getenv("ARCTIC_INFERENCE_FCA_ONLY", "0") == "1" and not envs.ARCTIC_INFERENCE_ENABLED:
-        from arctic_platform.inference.vllm.attention import install_forest_cascade_patches
-
-        install_forest_cascade_patches()
-        return
 
     if not envs.ARCTIC_INFERENCE_ENABLED:
         from arctic_platform.inference.vllm.fp32_lm_head import (

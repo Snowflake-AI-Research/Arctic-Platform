@@ -76,24 +76,15 @@ def _transfer_schedule_cls():
 def _arctic_sampling_env(job_config) -> dict[str, str]:
     """Env for vLLM workers when the job asked for the in-tree Arctic Inference plugin.
 
-    The plugin accepts vLLM 0.31 only. Forest cascade stays on the engine kwargs
-    when this env is set. A zorro-inference-only request uses the FCA path so
-    the worker does not import the uncompiled suffix-decoding extension.
+    The plugin accepts vLLM 0.31 only.
     """
-    cfg = getattr(job_config, "arctic_inference_config", None)
-    if not cfg:
+    if not getattr(job_config, "arctic_inference_config", None):
         return {}
-    env = {
+    return {
+        "ARCTIC_INFERENCE_ENABLED": "1",
         "VLLM_DISABLE_COMPILE_CACHE": "0",
         "VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY": "ARCTIC_INFERENCE_",
     }
-    zorro = cfg.get("zorro_inference") if isinstance(cfg, dict) else None
-    spec = cfg.get("speculative_decoding") if isinstance(cfg, dict) else None
-    if isinstance(zorro, dict) and zorro.get("enable") and not spec:
-        env["ARCTIC_INFERENCE_FCA_ONLY"] = "1"
-        return env
-    env["ARCTIC_INFERENCE_ENABLED"] = "1"
-    return env
 
 
 logger = logging.getLogger(__name__)
