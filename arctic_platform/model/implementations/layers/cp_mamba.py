@@ -55,9 +55,7 @@ def _all_to_all_seq_to_head(x: torch.Tensor, cp_group: dist.ProcessGroup, cp_siz
     Each rank sends its S_local tokens split into cp_size chunks along D,
     and receives one D_local chunk from each of the cp_size ranks.
     """
-    if cp_size == 1:
-        return x
-    barrier_group = _exchange_barrier_group(cp_group)
+    barrier_group = _exchange_barrier_group(cp_group) if cp_size > 1 else None
     B, S_local, D = x.shape
     D_local = D // cp_size
 
@@ -77,9 +75,7 @@ def _all_to_all_head_to_seq(x: torch.Tensor, cp_group: dist.ProcessGroup, cp_siz
 
     Inverse of _all_to_all_seq_to_head.
     """
-    if cp_size == 1:
-        return x
-    barrier_group = _exchange_barrier_group(cp_group)
+    barrier_group = _exchange_barrier_group(cp_group) if cp_size > 1 else None
     B, S_global, D_local = x.shape
     S_local = S_global // cp_size
 

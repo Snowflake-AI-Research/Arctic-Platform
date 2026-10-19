@@ -300,12 +300,32 @@ def test_mamba_barrier_follows_forward_and_backward_exchange(monkeypatch, enable
     assert events == expected_events * 2
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("noncontiguous", [False, True])
 @pytest.mark.parametrize("direction", ["seq_to_head_parallel", "head_to_seq_parallel"])
-def test_mamba_single_rank_does_not_exchange_or_create_a_barrier(monkeypatch, direction):
+def test_mamba_single_rank_preserves_contiguous_copy_without_a_barrier(monkeypatch, enabled, noncontiguous, direction):
+    if enabled:
+        monkeypatch.setenv("ARCTIC_SP_ALLTOALL_BARRIER", "1")
     monkeypatch.setattr(cp_mamba, "_exchange_barrier_group", lambda group: pytest.fail("unexpected group"))
-    monkeypatch.setattr(cp_mamba.dist, "all_to_all_single", lambda *args, **kwargs: pytest.fail("unexpected exchange"))
-    value = torch.ones(1, 2, 2, requires_grad=True)
-    result = getattr(cp_mamba, direction)(value, object(), 1)
+    events = []
+    group = object()
+
+    def exchange(output, value, **kwargs):
+        assert kwargs["group"] is group
+        assert value.is_contiguous()
+        events.append("exchange")
+        output.copy_(value)
+
+    monkeypatch.setattr(cp_mamba.dist, "all_to_all_single", exchange)
+    value = torch.arange(12.0).reshape(1, 3, 4).transpose(1, 2)
+    if not noncontiguous:
+        value = value.contiguous()
+    value.requires_grad_()
+    assert value.is_contiguous() is not noncontiguous
+    result = getattr(cp_mamba, direction)(value, group, 1)
     torch_assert_equal(result, value)
-    result.sum().backward()
+    assert result.is_contiguous()
+    assert result.data_ptr() != value.data_ptr()
+    result.view(-1).sum().backward()
     torch_assert_equal(value.grad, torch.ones_like(value))
+    assert events == ["exchange", "exchange"]
