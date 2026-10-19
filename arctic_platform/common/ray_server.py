@@ -198,7 +198,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
             assert self.placement, "Placement groups must be created when colocate=True"
 
         self.training_workers = []
-        # ReplicaPool pulls in arctic_inference → vLLM; only build it when a
+        # ReplicaPool pulls in arctic_platform.inference → vLLM; only build it when a
         # sampling / vLLM-log-prob job is actually requested so training-only
         # SFT servers start without the inference stack.
         self.sampling_pool = _replica_pool_cls()() if self.sampling_gpus > 0 else None
