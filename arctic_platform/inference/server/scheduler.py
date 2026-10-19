@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 import ray
+from vllm.v1.engine.exceptions import EngineDeadError
 from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
 from arctic_platform.inference.server.token_prompts import is_token_tensor
@@ -776,7 +777,16 @@ class Scheduler:
                     exc,
                     exc_info=True,
                 )
-                raise
+                if not isinstance(exc, (ray.exceptions.ActorDiedError, EngineDeadError)) or self._stopped:
+                    raise
+                # A replica whose actor or engine died never serves again: stop routing to it and re-route this request.
+                ws.quarantine()
+                if all(w.quarantined for w in self._workers):
+                    raise  # no replica left to re-route to: the caller must see the death
+                self._inflight_tasks[tracked_worker_idx].discard(current_task)
+                ws.active_requests = max(0, ws.active_requests - 1)
+                ws = tracked_worker_idx = None
+                await self._process_request(req)
 
         except asyncio.CancelledError:
             if not req.future.done():
