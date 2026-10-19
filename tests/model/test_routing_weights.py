@@ -73,6 +73,25 @@ def test_routing_weights_forward_and_gradients(hidden_dtype, score_dtype, requir
             torch_assert_equal(value.grad, reference.grad)
 
 
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_routing_weights_explicit_output_dtype(out_dtype):
+    hidden = torch.randn(6, 8, dtype=torch.bfloat16)[:, ::2].requires_grad_()
+    scores = torch.randn(2, 3, requires_grad=True)
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    reference_scores = scores.detach().clone().requires_grad_()
+    expected = (reference_hidden.float() * reference_scores.reshape(-1, 1)).to(out_dtype)
+    actual = apply_routing_weights(hidden, scores, out_dtype=out_dtype)
+    assert actual.dtype == out_dtype
+    torch_assert_equal(actual, expected)
+    if out_dtype == torch.float32:
+        assert not torch.equal(expected, expected.to(hidden.dtype).float())
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch_assert_equal(hidden.grad, reference_hidden.grad)
+    torch_assert_equal(scores.grad, reference_scores.grad)
+
+
 def test_routing_weights_preserves_score_shape():
     hidden = torch.randn(6, 4, requires_grad=True)
     scores = torch.randn(2, 3, requires_grad=True)
@@ -82,7 +101,8 @@ def test_routing_weights_preserves_score_shape():
     torch_assert_equal(scores.grad, hidden.sum(dim=1).reshape(scores.shape))
 
 
-def test_routing_weights_saves_original_precision():
+@pytest.mark.parametrize("out_dtype", [None, torch.float32])
+def test_routing_weights_saves_original_precision(out_dtype):
     hidden = torch.randn(16, 32, dtype=torch.bfloat16, requires_grad=True)
     scores = torch.randn(16, requires_grad=True)
     captured = []
@@ -92,7 +112,7 @@ def test_routing_weights_saves_original_precision():
         return value
 
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda value: value):
-        output = apply_routing_weights(hidden, scores)
+        output = apply_routing_weights(hidden, scores, out_dtype=out_dtype)
     assert captured == [
         (hidden.dtype, hidden.numel() * hidden.element_size(), hidden.data_ptr()),
         (scores.dtype, scores.numel() * scores.element_size(), scores.data_ptr()),
@@ -187,11 +207,11 @@ def test_local_moe_weighting_sites_preserve_forward_and_gradients(monkeypatch, d
     counts = torch.tensor([5, 5])
     calls = []
 
-    def recorded_weighting(x, weights):
+    def recorded_weighting(x, weights, *, out_dtype=None):
         assert weights.dtype == torch.float32
         assert weights.shape == (len(x),)
-        calls.append((x.dtype, weights.shape))
-        return apply_routing_weights(x, weights)
+        calls.append((x.dtype, weights.shape, out_dtype))
+        return apply_routing_weights(x, weights, out_dtype=out_dtype)
 
     def experts(x, num_tokens_per_expert):
         torch_assert_equal(num_tokens_per_expert, counts)
@@ -214,7 +234,35 @@ def test_local_moe_weighting_sites_preserve_forward_and_gradients(monkeypatch, d
         expected = _reference(gathered.square(), reference_scores)
     else:
         expected = _reference((gathered * 0.5).square(), reference_scores) * 1.5 * 0.25
-    assert calls == [(dtype, scores.shape)]
+    assert calls == [(dtype, scores.shape, dtype if site == "after" else None)]
+    torch_assert_equal(actual, expected)
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient)
+    expected.backward(gradient)
+    torch_assert_equal(hidden.grad, reference_hidden.grad)
+    torch_assert_equal(scores.grad, reference_scores.grad)
+
+
+def test_local_moe_after_experts_preserves_fp32_output():
+    from arctic_platform.model.implementations.moe.layers import moe
+
+    hidden = torch.randn(6, 4, dtype=torch.float32, requires_grad=True)
+    scores = torch.randn(10, requires_grad=True)
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    reference_scores = scores.detach().clone().requires_grad_()
+    rows = torch.tensor([0, 1, 2, 3, 4, 0, 1, 3, 4, 5])
+    counts = torch.tensor([5, 5])
+
+    def experts(x, num_tokens_per_expert):
+        torch_assert_equal(num_tokens_per_expert, counts)
+        return x.square().to(torch.bfloat16)
+
+    layer = SimpleNamespace(experts=experts, score_before_experts=False)
+    expert_output = experts(reference_hidden.index_select(0, rows), counts)
+    expected = (expert_output.float() * reference_scores.reshape(-1, 1)).to(reference_hidden.dtype)
+    actual = moe.MoE._run_routed_experts(layer, hidden, rows, counts, scores)
+    assert actual.dtype == torch.float32
+    assert not torch.equal(expected, expected.to(torch.bfloat16).float())
     torch_assert_equal(actual, expected)
     gradient = torch.randn_like(actual)
     actual.backward(gradient)

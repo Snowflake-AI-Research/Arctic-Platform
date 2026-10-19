@@ -680,7 +680,7 @@ class MoE(nn.Module):
         routed_output = self.experts(routed_input, num_tokens_per_expert)
 
         if not self.score_before_experts:
-            routed_output = apply_routing_weights(routed_output, top_scores_experts_sorted).to(x.dtype)
+            routed_output = apply_routing_weights(routed_output, top_scores_experts_sorted, out_dtype=x.dtype)
 
         return routed_output
 
