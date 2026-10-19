@@ -32,6 +32,10 @@ belong to the transport, so a client never mentions them.
 
 from __future__ import annotations
 
+import asyncio
+import time
+from collections.abc import AsyncIterator
+from collections.abc import Iterator
 from typing import Any
 
 from typing_extensions import Self
@@ -40,6 +44,7 @@ from arctic_platform._dependency_groups import require_any_dep_group
 from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import CortexConfig
 from arctic_platform.client.config import JobId
+from arctic_platform.client.requests import bootstrap_router_replay_request
 from arctic_platform.client.requests import cancel_job_request
 from arctic_platform.client.requests import capacity_request
 from arctic_platform.client.requests import delete_checkpoint_request
@@ -52,11 +57,13 @@ from arctic_platform.client.requests import list_checkpoints_request
 from arctic_platform.client.requests import list_jobs_request
 from arctic_platform.client.requests import load_checkpoint_request
 from arctic_platform.client.requests import reset_prefix_cache_request
+from arctic_platform.client.requests import router_replay_discard_request
 from arctic_platform.client.requests import save_checkpoint_request
 from arctic_platform.client.requests import sleep_inference_request
 from arctic_platform.client.requests import sleep_training_request
 from arctic_platform.client.requests import step_request
 from arctic_platform.client.requests import sync_weights_request
+from arctic_platform.client.requests import tail_logs_request
 from arctic_platform.client.requests import wake_inference_request
 from arctic_platform.client.requests import wake_training_request
 from arctic_platform.client.transport import Request
@@ -104,6 +111,15 @@ def _maybe_print_server_profile(op: str, out: dict | None) -> None:
     prof = (out.get("metrics") or {}).get("_profile_ms")
     if isinstance(prof, dict) and prof:
         sft_profile.maybe_print(f"server {op}", prof)
+
+
+def _next_log_wait(page: dict, wait: float, poll_interval: float, follow: bool) -> float | None:
+    """Seconds before `stream_logs` fetches again (0 after new entries), or None to stop."""
+    if page["entries"]:
+        return 0.0
+    if page["eof"] and not follow:
+        return None
+    return min(max(wait * 1.25, poll_interval), 6.0)
 
 
 class _ArcticClientCore:
@@ -170,6 +186,31 @@ class ArcticClient(_ArcticClientCore):
     def delete_checkpoint(self, checkpoint_id: str) -> None:
         self._call(delete_checkpoint_request(self.jobs.require("training"), checkpoint_id))
 
+    # ── logs ─────────────────────────────────────────────────────────────
+    def tail_logs(self, role: str = "training", *, cursor: str | None = None, max_lines: int | None = None) -> dict:
+        """One page of a sub-job's log: ``{"entries", "next_cursor", "eof"}``."""
+        return self._call(tail_logs_request(self.jobs.require(role), cursor, max_lines))
+
+    def stream_logs(
+        self,
+        role: str = "training",
+        *,
+        cursor: str | None = None,
+        max_lines: int | None = None,
+        follow: bool = True,
+        poll_interval: float = 0.5,
+    ) -> Iterator[dict]:
+        """Yield a sub-job's log entries; with ``follow=False``, stop at the end of the log."""
+        wait = 0.0
+        while True:
+            page = self.tail_logs(role, cursor=cursor, max_lines=max_lines)
+            cursor = page["next_cursor"] or cursor
+            yield from page["entries"] or []
+            wait = _next_log_wait(page, wait, poll_interval, follow)
+            if wait is None:
+                return
+            time.sleep(wait)
+
     # ── training ─────────────────────────────────────────────────────────
     def fwd_bwd(
         self,
@@ -217,9 +258,27 @@ class ArcticClient(_ArcticClientCore):
             )
         )
 
-    def load_checkpoint(self, path: str | None = None, *, step: int | None = None) -> dict:
-        """Restore weights/optimizer/LR/step. Returns ``{"global_step", ...}``."""
-        return self._call(load_checkpoint_request(self.jobs, path, step))
+    def load_checkpoint(
+        self,
+        *,
+        path: str | None = None,
+        step: int | None = None,
+        checkpoint_id: str | None = None,
+        source_job_id: JobId | None = None,
+    ) -> dict:
+        """Restore weights/optimizer/LR/step: Cortex by ``checkpoint_id``, on-prem by ``path``/``step``."""
+        return self._call(
+            load_checkpoint_request(
+                self.jobs, path=path, step=step, checkpoint_id=checkpoint_id, source_job_id=source_job_id
+            )
+        )
+
+    # ── router replay ────────────────────────────────────────────────────
+    def bootstrap_router_replay(self, max_cache_bytes: int | None = None) -> dict:
+        return self._call(bootstrap_router_replay_request(self.jobs, max_cache_bytes))
+
+    def router_replay_discard(self, sample_ids: list[str]) -> dict:
+        return self._call(router_replay_discard_request(self.jobs, sample_ids))
 
     # ── sampling ─────────────────────────────────────────────────────────
     def generate(
@@ -229,17 +288,28 @@ class ArcticClient(_ArcticClientCore):
 
     # ── weight sync + cache ──────────────────────────────────────────────
     def sync_weights(
-        self, cuda_ipc: bool | None = None, low_memory: bool | None = None, weight_format: str | None = None
+        self,
+        cuda_ipc: bool | None = None,
+        low_memory: bool | None = None,
+        weight_format: str | None = None,
+        bucket_size: int | None = None,
     ) -> dict:
         """Sync training weights to sampling (staged wake → operation → wake → reset).
 
         ``cuda_ipc`` / ``low_memory`` default to the training job's ``TrainingConfig``; pass a value to override this
-        call. ``weight_format="lora"`` broadcasts only the adapter tensors (Cortex only).
+        call. ``weight_format="lora"`` broadcasts only the adapter tensors (Cortex only). ``bucket_size`` (bytes,
+        Cortex only) raises the transfer bucket when one tensor exceeds the server default.
         """
         _check_weight_format(self.config, weight_format)
         self.wake_inference(tags=["weights"])
         out = self._call(
-            sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory, weight_format=weight_format)
+            sync_weights_request(
+                self.jobs,
+                cuda_ipc=cuda_ipc,
+                low_memory=low_memory,
+                weight_format=weight_format,
+                bucket_size=bucket_size,
+            )
         )
         self.wake_inference(tags=["kv_cache"])
         self.reset_prefix_cache()
@@ -301,6 +371,32 @@ class AsyncArcticClient(_ArcticClientCore):
     async def delete_checkpoint(self, checkpoint_id: str) -> None:
         await self._acall(delete_checkpoint_request(self.jobs.require("training"), checkpoint_id))
 
+    # ── logs ─────────────────────────────────────────────────────────────
+    async def tail_logs(
+        self, role: str = "training", *, cursor: str | None = None, max_lines: int | None = None
+    ) -> dict:
+        return await self._acall(tail_logs_request(self.jobs.require(role), cursor, max_lines))
+
+    async def stream_logs(
+        self,
+        role: str = "training",
+        *,
+        cursor: str | None = None,
+        max_lines: int | None = None,
+        follow: bool = True,
+        poll_interval: float = 0.5,
+    ) -> AsyncIterator[dict]:
+        wait = 0.0
+        while True:
+            page = await self.tail_logs(role, cursor=cursor, max_lines=max_lines)
+            cursor = page["next_cursor"] or cursor
+            for entry in page["entries"] or []:
+                yield entry
+            wait = _next_log_wait(page, wait, poll_interval, follow)
+            if wait is None:
+                return
+            await asyncio.sleep(wait)
+
     # ── training ─────────────────────────────────────────────────────────
     async def fwd_bwd(
         self,
@@ -348,8 +444,26 @@ class AsyncArcticClient(_ArcticClientCore):
             )
         )
 
-    async def load_checkpoint(self, path: str | None = None, *, step: int | None = None) -> dict:
-        return await self._acall(load_checkpoint_request(self.jobs, path, step))
+    async def load_checkpoint(
+        self,
+        *,
+        path: str | None = None,
+        step: int | None = None,
+        checkpoint_id: str | None = None,
+        source_job_id: JobId | None = None,
+    ) -> dict:
+        return await self._acall(
+            load_checkpoint_request(
+                self.jobs, path=path, step=step, checkpoint_id=checkpoint_id, source_job_id=source_job_id
+            )
+        )
+
+    # ── router replay ────────────────────────────────────────────────────
+    async def bootstrap_router_replay(self, max_cache_bytes: int | None = None) -> dict:
+        return await self._acall(bootstrap_router_replay_request(self.jobs, max_cache_bytes))
+
+    async def router_replay_discard(self, sample_ids: list[str]) -> dict:
+        return await self._acall(router_replay_discard_request(self.jobs, sample_ids))
 
     # ── sampling ─────────────────────────────────────────────────────────
     async def generate(
@@ -361,13 +475,23 @@ class AsyncArcticClient(_ArcticClientCore):
 
     # ── weight sync + cache ──────────────────────────────────────────────
     async def sync_weights(
-        self, cuda_ipc: bool | None = None, low_memory: bool | None = None, weight_format: str | None = None
+        self,
+        cuda_ipc: bool | None = None,
+        low_memory: bool | None = None,
+        weight_format: str | None = None,
+        bucket_size: int | None = None,
     ) -> dict:
         """Async twin of ArcticClient.sync_weights (staged wake → operation → wake → reset)."""
         _check_weight_format(self.config, weight_format)
         await self.wake_inference(tags=["weights"])
         out = await self._acall(
-            sync_weights_request(self.jobs, cuda_ipc=cuda_ipc, low_memory=low_memory, weight_format=weight_format)
+            sync_weights_request(
+                self.jobs,
+                cuda_ipc=cuda_ipc,
+                low_memory=low_memory,
+                weight_format=weight_format,
+                bucket_size=bucket_size,
+            )
         )
         await self.wake_inference(tags=["kv_cache"])
         await self.reset_prefix_cache()
