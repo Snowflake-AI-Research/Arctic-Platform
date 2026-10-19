@@ -38,6 +38,7 @@ from arctic_platform.model.implementations.moe.vlm import get_language_model
 
 _GLOBAL_POSITION_IDS = "_ap_glm53_global_position_ids"
 _GLOBAL_CU_SEQLENS = "_ap_glm53_global_cu_seqlens"
+_INDEXER_SCORE_CHUNK_BYTES = 512 * 1024 * 1024
 
 
 def _gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:
@@ -131,48 +132,52 @@ def _select_sparse_indices(
         segment_states = packed_states[:, start:end]
         valid_keys = segment_states[..., -1].bool()
         segment_length = end - start
-        query_slice = slice(local_start - query_offset, local_end - query_offset)
-        query_positions = torch.arange(local_start - start, local_end - start, device=hidden_states.device)
         key_positions = torch.arange(segment_length, device=hidden_states.device)
-        visible_tokens = (key_positions[None, None, :] <= query_positions[None, :, None]) & valid_keys[:, None]
-
         pool_keys, pool_indices, pool_valid = indexer.get_pooled_states(packed_states=segment_states)
-        scores = torch.matmul(
-            query[:, query_slice].float(),
-            pool_keys.transpose(-1, -2).float().unsqueeze(1),
-        )
-        scores = F.relu(scores * indexer.softmax_scale)
-        index_scores = torch.matmul(weights[:, query_slice].unsqueeze(-2), scores).squeeze(-2)
-
+        pool_keys_transposed = pool_keys.transpose(-1, -2).float().unsqueeze(1)
         pool_end = pool_indices[..., -1].clamp(0, segment_length - 1)
-        pool_visible = visible_tokens.gather(
-            dim=-1,
-            index=pool_end[:, None].expand(batch_size, local_end - local_start, -1),
-        )
-        valid_candidates = pool_visible & pool_valid[:, None]
-        index_scores.masked_fill_(~valid_candidates, torch.finfo(index_scores.dtype).min)
-
-        select_k = min(indexer.index_topk // indexer.index_kpool, index_scores.shape[-1])
-        selected = index_scores.topk(select_k, dim=-1).indices
         batch_idx = torch.arange(batch_size, device=hidden_states.device)[:, None, None]
-        selected_valid = valid_candidates.gather(-1, selected)
-        selected_indices = pool_indices[batch_idx, selected]
-        selected_indices.masked_fill_(
-            ~selected_valid[..., None].expand_as(selected_indices),
-            -1,
-        )
-        segment_topk = selected_indices.flatten(-2)
 
-        if indexer.index_kpool_always_select_tail:
-            segment_topk = indexer.append_visible_tail(segment_topk, visible_tokens, valid_keys)
-        segment_topk = F.pad(
-            segment_topk,
-            (0, output_width - segment_topk.shape[-1]),
-            value=-1,
-        )[..., :output_width]
-        segment_topk = torch.where(segment_topk >= 0, segment_topk + start, segment_topk)
-        segment_topk.masked_fill_(~attention_mask[:, query_slice, None], -1)
-        topk_indices[:, query_slice] = segment_topk.to(torch.int32)
+        # Score every pooled key, but bound the temporary by processing query rows in chunks.
+        score_bytes_per_query = batch_size * indexer.n_heads * pool_keys.shape[-2] * 4
+        query_chunk_size = max(1, _INDEXER_SCORE_CHUNK_BYTES // max(1, score_bytes_per_query))
+        for chunk_start in range(local_start, local_end, query_chunk_size):
+            chunk_end = min(chunk_start + query_chunk_size, local_end)
+            query_slice = slice(chunk_start - query_offset, chunk_end - query_offset)
+            query_positions = torch.arange(chunk_start - start, chunk_end - start, device=hidden_states.device)
+            visible_tokens = (key_positions[None, None, :] <= query_positions[None, :, None]) & valid_keys[:, None]
+            scores = torch.matmul(query[:, query_slice].float(), pool_keys_transposed)
+            scores.mul_(indexer.softmax_scale).relu_()
+            index_scores = torch.matmul(weights[:, query_slice].unsqueeze(-2), scores).squeeze(-2)
+            del scores
+
+            pool_visible = visible_tokens.gather(
+                dim=-1,
+                index=pool_end[:, None].expand(batch_size, chunk_end - chunk_start, -1),
+            )
+            valid_candidates = pool_visible & pool_valid[:, None]
+            index_scores.masked_fill_(~valid_candidates, torch.finfo(index_scores.dtype).min)
+
+            select_k = min(indexer.index_topk // indexer.index_kpool, index_scores.shape[-1])
+            selected = index_scores.topk(select_k, dim=-1).indices
+            selected_valid = valid_candidates.gather(-1, selected)
+            selected_indices = pool_indices[batch_idx, selected]
+            selected_indices.masked_fill_(
+                ~selected_valid[..., None].expand_as(selected_indices),
+                -1,
+            )
+            segment_topk = selected_indices.flatten(-2)
+
+            if indexer.index_kpool_always_select_tail:
+                segment_topk = indexer.append_visible_tail(segment_topk, visible_tokens, valid_keys)
+            segment_topk = F.pad(
+                segment_topk,
+                (0, output_width - segment_topk.shape[-1]),
+                value=-1,
+            )[..., :output_width]
+            segment_topk = torch.where(segment_topk >= 0, segment_topk + start, segment_topk)
+            segment_topk.masked_fill_(~attention_mask[:, query_slice, None], -1)
+            topk_indices[:, query_slice] = segment_topk.to(torch.int32)
     return topk_indices
 
 
