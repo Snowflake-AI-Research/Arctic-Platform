@@ -54,6 +54,10 @@ OPS = frozenset(
         "wake-inference",
         "sleep-training",
         "wake-training",
+        # Streaming generate: submit, then poll the request for events or cancel it.
+        "generate-stream",
+        "request-status",
+        "cancel-request",
     }
 )
 
@@ -67,10 +71,6 @@ CLUSTER_OPS = frozenset(
         "export-checkpoint",
         "delete-checkpoint",
         "download-artifacts",
-        # Cortex polls a submitted request for its events; on-prem answers inline.
-        "generate-stream",
-        "request-status",
-        "cancel-request",
     }
 )
 
