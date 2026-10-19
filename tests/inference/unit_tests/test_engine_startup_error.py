@@ -65,10 +65,15 @@ def test_handler_names_the_type_as_tracebacks_do(tmp_path):
     )
 
 
-def test_handler_write_failure_is_swallowed(tmp_path):
+def test_handler_write_failure_goes_to_handle_error(tmp_path):
     handler = startup_error.StartupErrorHandler(str(tmp_path / "removed"))
+    reported = []
+    handler.handleError = reported.append
+    record = _record("EngineCore failed to start.", RuntimeError("x"))
 
-    handler.handle(_record("EngineCore failed to start.", RuntimeError("x")))
+    handler.handle(record)
+
+    assert reported == [record]
 
 
 def test_message_and_line_are_bounded(tmp_path):
@@ -107,7 +112,8 @@ def test_earliest_record_is_the_root(tmp_path):
     )
 
 
-def test_unreadable_records_are_skipped(tmp_path):
+def test_unreadable_records_are_skipped(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=startup_error.__name__)
     (tmp_path / "1.json").write_text("{not json")
     (tmp_path / "2.json").write_text(json.dumps({"time": 1.0}))
     (tmp_path / "3.json").write_text(json.dumps(["not", "a", "record"]))
@@ -116,6 +122,8 @@ def test_unreadable_records_are_skipped(tmp_path):
     )
 
     assert startup_error.earliest_startup_error(str(tmp_path)) is None
+    skipped = sorted(record.args[0] for record in caplog.records if record.msg.startswith("Skipping unreadable"))
+    assert skipped == ["1.json", "2.json", "3.json"]
 
     _write(tmp_path, 5, process="EngineCore", type="RuntimeError", message="readable", time=9.0)
     assert startup_error.earliest_startup_error(str(tmp_path)) == "Root cause in EngineCore: RuntimeError: readable"

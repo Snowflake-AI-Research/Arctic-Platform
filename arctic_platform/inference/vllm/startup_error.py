@@ -34,6 +34,8 @@ import os
 ENV_VAR = "ARCTIC_ENGINE_STARTUP_ERROR_DIR"
 MAX_CHARS = 2000
 
+logger = logging.getLogger(__name__)
+
 # What vLLM 0.31 logs, with the exception, when an EngineCore or a worker dies
 # before it is ready (core.py run_engine_core, multiproc_executor.py worker_main).
 _STARTUP_FAILURES = frozenset({"EngineCore failed to start.", "WorkerProc failed to start."})
@@ -48,7 +50,7 @@ class StartupErrorHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            if not (isinstance(record.msg, str) and record.msg in _STARTUP_FAILURES and record.exc_info):
+            if not isinstance(record.msg, str) or record.msg not in _STARTUP_FAILURES or record.exc_info is None:
                 return
             exc = record.exc_info[1]
             if exc is None:
@@ -70,13 +72,13 @@ class StartupErrorHandler(logging.Handler):
             os.replace(f"{path}.tmp", path)
         except Exception:
             # Best effort: without a record, InferenceWorker raises vLLM's error unchanged.
-            pass
+            self.handleError(record)
 
 
 def install_startup_error_handler() -> None:
     """Add the handler to the ``vllm`` logger when InferenceWorker asked for records."""
     directory = os.environ.get(ENV_VAR)
-    if not directory:
+    if directory is None or directory == "":
         return
     vllm_logger = logging.getLogger("vllm")
     if any(isinstance(handler, StartupErrorHandler) for handler in vllm_logger.handlers):
@@ -98,9 +100,10 @@ def earliest_startup_error(directory: str) -> str | None:
             with open(os.path.join(directory, name), encoding="utf-8") as f:
                 entry = json.load(f)
             records.append((float(entry["time"]), entry["process"], entry["type"], entry["message"]))
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logger.info("Skipping unreadable engine startup record %s: %s", name, exc)
             continue
-    if not records:
+    if len(records) == 0:
         return None
     _, process, type_name, message = min(records, key=lambda record: record[0])
     return f"Root cause in {process}: {type_name}: {message}"[:MAX_CHARS]

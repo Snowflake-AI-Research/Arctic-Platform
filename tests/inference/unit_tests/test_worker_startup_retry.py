@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import subprocess
 import sys
@@ -359,16 +360,20 @@ def test_initialize_failure_carries_the_engine_root_cause(monkeypatch, tmp_path)
     assert worker_mod._STARTUP_ERROR_DIR_ENV not in os.environ
 
 
-def test_initialize_failure_without_a_record_is_raised_unchanged(monkeypatch, tmp_path):
+def test_initialize_failure_without_a_record_is_raised_unchanged(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=worker_mod.logger.name)
     original = RuntimeError(_GENERIC_STARTUP_ERROR)
 
     exc, _ = _initialize_with_engine_attempts(monkeypatch, tmp_path, [_raise(original)])
 
     assert exc is original
     assert str(exc) == _GENERIC_STARTUP_ERROR
+    assert any("no engine process recorded a failure" in record.getMessage() for record in caplog.records)
 
 
-def test_unreadable_record_keeps_the_original_error(monkeypatch, tmp_path):
+def test_unreadable_record_keeps_the_original_error(monkeypatch, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=worker_mod.logger.name)
+
     def unreadable(directory):
         raise PermissionError(13, "Permission denied", directory)
 
@@ -381,6 +386,23 @@ def test_unreadable_record_keeps_the_original_error(monkeypatch, tmp_path):
 
     assert exc is original
     assert str(exc) == _GENERIC_STARTUP_ERROR
+    failed = [record for record in caplog.records if "reading" in record.getMessage()]
+    assert len(failed) == 1
+    assert isinstance(failed[0].exc_info[1], PermissionError)
+
+
+def test_capture_directory_failure_is_logged(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=worker_mod.logger.name)
+    monkeypatch.delenv(worker_mod._STARTUP_ERROR_DIR_ENV, raising=False)
+
+    def no_space(prefix):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(worker_mod.tempfile, "mkdtemp", no_space)
+
+    assert worker_mod._begin_engine_startup_capture() is None
+    assert worker_mod._STARTUP_ERROR_DIR_ENV not in os.environ
+    assert any("not recorded for this attempt" in record.getMessage() for record in caplog.records)
 
 
 def test_record_from_a_previous_attempt_is_ignored(monkeypatch, tmp_path):

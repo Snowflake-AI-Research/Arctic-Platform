@@ -320,7 +320,8 @@ def _begin_engine_startup_capture() -> str | None:
     """Point this attempt's engine processes at a fresh directory for their startup failure."""
     try:
         directory = tempfile.mkdtemp(prefix="arctic-engine-startup-")
-    except OSError:
+    except OSError as exc:
+        logger.info("Engine startup failures are not recorded for this attempt: %s", exc)
         return None
     os.environ[_STARTUP_ERROR_DIR_ENV] = directory
     return directory
@@ -340,15 +341,19 @@ def _engine_startup_error(exc: BaseException, directory: str | None) -> RuntimeE
     ``__notes__``. Only a plain ``RuntimeError``, the type of vLLM's generic error, is
     replaced, so every other type keeps the type a classifier matches on. Returns
     None, so the original is raised as it is, for any other type, when there is no
-    record, or when reading one fails.
+    record, or when reading one fails; the last two are logged.
     """
     if directory is None or type(exc) is not RuntimeError:
         return None
     try:
         root_cause = earliest_startup_error(directory)
-        return RuntimeError(f"{exc}\n{root_cause}") if root_cause else None
     except Exception:
+        logger.info("Engine startup root cause not appended: reading %s failed", directory, exc_info=True)
         return None
+    if root_cause is None:
+        logger.info("Engine startup root cause not appended: no engine process recorded a failure in %s", directory)
+        return None
+    return RuntimeError(f"{exc}\n{root_cause}")
 
 
 def _is_address_in_use_error(exc: BaseException) -> bool:
@@ -997,7 +1002,7 @@ class InferenceWorker(StreamingWorkerMixin):
                     tail = _console_tail()
                     startup_exc = _engine_startup_error(exc, startup_error_dir)
                     target = startup_exc if startup_exc is not None else exc
-                    if tail:
+                    if len(tail) > 0:
                         target.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
                     if startup_exc is not None:
                         raise startup_exc from exc
