@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from functools import wraps
+from traceback import walk_tb
 
 from arctic_platform.inference.utils import require_supported_vllm_version
 
@@ -8,15 +10,11 @@ logger = logging.getLogger(__name__)
 
 
 def ensure_xgrammar_request_error_isolation() -> None:
-    """Fail the one request whose grammar raises inside xgrammar, not the engine.
+    """Route xgrammar runtime failures to vLLM's per-request FINISHED_ERROR path.
 
-    xgrammar raises RuntimeError when one request's parser state outgrows its
-    int32-indexed arrays (e.g. a JSON schema string with minLength 20000 and no
-    maxLength). vLLM's scheduler calls accept_tokens and fill_bitmask without a
-    try, so that error kills the EngineCore. Here accept_tokens returns False,
-    vLLM's existing path for rejected tokens: the request finishes with
-    FINISHED_ERROR. A raise while filling the mask leaves that row unmasked and
-    fails the request at its next accept_tokens.
+    A failed mask stays open until accept_tokens rejects the sampled output;
+    those unconstrained tokens can accompany the final error response.
+    Speculative validation and rollback must also stop using a failed matcher.
     """
     require_supported_vllm_version("xgrammar request error isolation")
 
@@ -25,27 +23,44 @@ def ensure_xgrammar_request_error_isolation() -> None:
     if getattr(XgrammarGrammar.accept_tokens, "_arctic_request_error_isolation", False):
         return
 
-    original_accept_tokens = XgrammarGrammar.accept_tokens
-    original_fill_bitmask = XgrammarGrammar.fill_bitmask
+    def isolate(method):
+        @wraps(method)
+        def wrapped(self, *args):
+            if getattr(self, "_arctic_xgrammar_failed", False):
+                return None
+            try:
+                return method(self, *args)
+            except RuntimeError as error:
+                # Do not hide Python subclasses or RuntimeErrors from Arctic/tensor code.
+                if type(error) is not RuntimeError or not any(
+                    frame.f_globals.get("__name__", "").startswith("xgrammar.")
+                    for frame, _ in walk_tb(error.__traceback__)
+                ):
+                    raise
+                logger.exception("xgrammar failed in %s; finishing only that request", method.__name__)
+                self._arctic_xgrammar_failed = True
+                return None
+
+        return wrapped
+
+    original_accept_tokens = isolate(XgrammarGrammar.accept_tokens)
+    original_validate_tokens = isolate(XgrammarGrammar.validate_tokens)
+    original_fill_bitmask = isolate(XgrammarGrammar.fill_bitmask)
 
     def accept_tokens(self, request_id, tokens):
-        if getattr(self, "_arctic_xgrammar_failed", False):
-            return False
-        try:
-            return original_accept_tokens(self, request_id, tokens)
-        except RuntimeError:
-            logger.exception("xgrammar failed for request %s; finishing only that request", request_id)
-            self._arctic_xgrammar_failed = True
-            return False
+        return original_accept_tokens(self, request_id, tokens) is True
 
+    def validate_tokens(self, tokens):
+        return original_validate_tokens(self, tokens) or []
+
+    @wraps(original_fill_bitmask)
     def fill_bitmask(self, bitmask, idx):
-        try:
-            original_fill_bitmask(self, bitmask, idx)
-        except RuntimeError:
-            logger.exception("xgrammar failed filling a token mask; the request ends at its next accept_tokens")
-            self._arctic_xgrammar_failed = True
+        original_fill_bitmask(self, bitmask, idx)
+        if getattr(self, "_arctic_xgrammar_failed", False):
             bitmask[idx].fill_(-1)
 
     accept_tokens._arctic_request_error_isolation = True
     XgrammarGrammar.accept_tokens = accept_tokens
+    XgrammarGrammar.validate_tokens = validate_tokens
+    XgrammarGrammar.rollback = isolate(XgrammarGrammar.rollback)
     XgrammarGrammar.fill_bitmask = fill_bitmask
