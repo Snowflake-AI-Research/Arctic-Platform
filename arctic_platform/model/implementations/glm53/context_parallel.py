@@ -20,7 +20,6 @@ from __future__ import annotations
 import functools
 import importlib.util
 import math
-import os
 import types
 
 import torch
@@ -250,25 +249,28 @@ def _flashinfer_available() -> bool:
     return importlib.util.find_spec("flashinfer") is not None
 
 
+@functools.cache
+def _cuda_device_major(device: torch.device) -> int | None:
+    """Classify each concrete tensor device once without retaining input tensors."""
+    if device.type != "cuda":
+        return None
+    return torch.cuda.get_device_capability(device)[0]
+
+
 def _use_flashinfer(query: torch.Tensor, key_value: torch.Tensor) -> bool:
+    # FlashInfer's FA3 backend targets Hopper (compute-capability major 9).
     return (
-        os.environ.get("ARCTIC_GLM53_FLASHINFER") == "1"
-        and query.is_cuda
+        _cuda_device_major(query.device) == 9
         and query.dtype in (torch.bfloat16, torch.float16)
         and query.shape[-1] == 512
         and key_value.shape[-1] == 512
         and _flashinfer_available()
-        and torch.cuda.get_device_capability(query.device)[0] == 9
     )
 
 
 def _use_flashmla(query: torch.Tensor, value_dim: int) -> bool:
-    return (
-        query.is_cuda
-        and value_dim == 512
-        and query.shape[-1] in (512, 576)
-        and torch.cuda.get_device_capability(query.device)[0] in (9, 10)
-    )
+    # Allow Hopper (compute-capability major 9) and datacenter Blackwell (major 10), not SM12x.
+    return _cuda_device_major(query.device) in (9, 10) and value_dim == 512 and query.shape[-1] in (512, 576)
 
 
 def _flashinfer_wrapper(device: torch.device):
@@ -516,40 +518,21 @@ def _sparse_attention_forward(
     )
 
     kernel_indices = _pad_sparse_indices(topk_indices)
-    absorbed_output = None
-    if (
-        self.kv_lora_rank == 512
-        and not getattr(self, "_ap_flashinfer_failed", False)
-        and _use_flashinfer(sparse_query, sparse_kv)
-    ):
-        try:
-            absorbed_output = _flashinfer_sparse_mla_apply(
-                sparse_query,
-                sparse_kv,
-                kernel_indices,
-                scale=self.scaling,
-                value_dim=self.kv_lora_rank,
-            )
-        except torch.OutOfMemoryError:
-            # Capacity failures must still fail the trial, not select another backend.
-            raise
-        except Exception as error:
-            if isinstance(error, RuntimeError) and str(error).startswith("CUDA error"):
-                raise
-            self._ap_flashinfer_failed = True
-            get_logger().warning(
-                "GLM53_FLASHINFER_FALLBACK rank=%s error=%s; disabling FlashInfer for this module",
+    if self.kv_lora_rank == 512 and _use_flashinfer(sparse_query, sparse_kv):
+        absorbed_output = _flashinfer_sparse_mla_apply(
+            sparse_query,
+            sparse_kv,
+            kernel_indices,
+            scale=self.scaling,
+            value_dim=self.kv_lora_rank,
+        )
+        if not getattr(self, "_ap_flashinfer_dispatch_reported", False):
+            get_logger().info(
+                "GLM53_FLASHINFER_EXECUTED rank=%s query_width=512 backward=reference",
                 dist.get_rank() if dist.is_initialized() else 0,
-                error,
             )
-        else:
-            if not getattr(self, "_ap_flashinfer_dispatch_reported", False):
-                get_logger().info(
-                    "GLM53_FLASHINFER_EXECUTED rank=%s query_width=512 backward=reference",
-                    dist.get_rank() if dist.is_initialized() else 0,
-                )
-                self._ap_flashinfer_dispatch_reported = True
-    if absorbed_output is None and _use_flashmla(sparse_query, self.kv_lora_rank):
+            self._ap_flashinfer_dispatch_reported = True
+    elif _use_flashmla(sparse_query, self.kv_lora_rank):
         # The rope-free checkpoint keeps the same dot products with zero-padded kernel channels.
         padding = 576 - sparse_query.shape[-1]
         if padding:
@@ -568,7 +551,7 @@ def _sparse_attention_forward(
                 576 - padding,
             )
             self._ap_flashmla_dispatch_reported = True
-    elif absorbed_output is None:
+    else:
         absorbed_output = _reference_sparse_mla(
             sparse_query,
             sparse_kv,

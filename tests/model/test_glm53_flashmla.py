@@ -28,6 +28,45 @@ from arctic_platform.testing_utils import torch_assert_close
 from arctic_platform.testing_utils import torch_assert_equal
 
 
+@pytest.fixture(autouse=True)
+def clear_device_architecture_cache():
+    cached_lookup = context_parallel._cuda_device_major
+    cached_lookup.cache_clear()
+    yield
+    cached_lookup.cache_clear()
+
+
+def test_cuda_classification_and_architecture_are_cached_per_device(monkeypatch):
+    cpu = torch.device("cpu")
+    hopper = torch.device("cuda:0")
+    blackwell = torch.device("cuda:1")
+    lookup = Mock(side_effect=lambda device: {hopper: (9, 0), blackwell: (10, 0)}[device])
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lookup)
+    for device, expected in [(cpu, None), (hopper, 9), (blackwell, 10)]:
+        for _ in range(2):
+            assert context_parallel._cuda_device_major(device) == expected
+    assert [entry.args[0] for entry in lookup.call_args_list] == [hopper, blackwell]
+    assert context_parallel._cuda_device_major.cache_info().hits == 3
+    assert context_parallel._cuda_device_major.cache_info().misses == 3
+
+
+@pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:3")])
+def test_attention_guards_share_cached_device_classification(monkeypatch, device):
+    query = SimpleNamespace(device=device, dtype=torch.bfloat16, shape=(1, 4, 2, 512))
+    kv = SimpleNamespace(shape=(1, 5, 1, 512))
+    lookup = Mock(return_value=(9, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lookup)
+    monkeypatch.setattr(context_parallel, "_flashinfer_available", lambda: True)
+    for _ in range(3):
+        assert context_parallel._use_flashinfer(query, kv) == (device.type == "cuda")
+        assert context_parallel._use_flashmla(query, 512) == (device.type == "cuda")
+    if device.type == "cuda":
+        lookup.assert_called_once_with(device)
+    else:
+        lookup.assert_not_called()
+    assert context_parallel._cuda_device_major.cache_info().hits == 5
+
+
 def _assert_bf16_kernel_close(actual, expected, *, atol=1e-6):
     # Allow one BF16 epsilon per element, with a fixed floor for cancellation near zero.
     torch_assert_close(actual, expected, rtol=torch.finfo(torch.bfloat16).eps, atol=atol)
@@ -83,9 +122,8 @@ def test_zero_padded_channels_preserve_attention_and_gradients():
 
 @pytest.mark.parametrize("capability", [(8, 0), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0)])
 def test_flashinfer_fa3_requires_hopper_on_query_device(monkeypatch, capability):
-    monkeypatch.setenv("ARCTIC_GLM53_FLASHINFER", "1")
     device = torch.device("cuda:3")
-    query = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16, shape=(1, 4, 2, 512), device=device)
+    query = SimpleNamespace(dtype=torch.bfloat16, shape=(1, 4, 2, 512), device=device)
     kv = SimpleNamespace(shape=(1, 5, 1, 512))
     capability_lookup = Mock(return_value=capability)
     monkeypatch.setattr(torch.cuda, "get_device_capability", capability_lookup)
@@ -95,32 +133,65 @@ def test_flashinfer_fa3_requires_hopper_on_query_device(monkeypatch, capability)
 
 
 def test_flashinfer_guard_does_not_query_cuda_for_cpu(monkeypatch):
-    monkeypatch.setenv("ARCTIC_GLM53_FLASHINFER", "1")
-    query = SimpleNamespace(is_cuda=False)
+    query = SimpleNamespace(device=torch.device("cpu"))
     capability_lookup = Mock(side_effect=AssertionError("CPU input queried CUDA"))
     monkeypatch.setattr(torch.cuda, "get_device_capability", capability_lookup)
     assert not context_parallel._use_flashinfer(query, None)
     capability_lookup.assert_not_called()
 
 
-@pytest.mark.parametrize("flag", [None, "0", "true", "1"])
-def test_flashinfer_requires_explicit_opt_in(monkeypatch, flag):
-    if flag is None:
-        monkeypatch.delenv("ARCTIC_GLM53_FLASHINFER", raising=False)
-    else:
-        monkeypatch.setenv("ARCTIC_GLM53_FLASHINFER", flag)
-    query = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16, shape=(1, 4, 2, 512), device="cuda:3")
+@pytest.mark.parametrize("installed", [False, True])
+def test_flashinfer_is_hopper_default_when_installed(monkeypatch, installed):
+    query = SimpleNamespace(dtype=torch.bfloat16, shape=(1, 4, 2, 512), device=torch.device("cuda:3"))
     kv = SimpleNamespace(shape=(1, 5, 1, 512))
     capability = Mock(return_value=(9, 0))
     monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
-    monkeypatch.setattr(context_parallel, "_flashinfer_available", lambda: True)
-    assert context_parallel._use_flashinfer(query, kv) == (flag == "1")
-    assert capability.call_count == int(flag == "1")
+    monkeypatch.setattr(context_parallel, "_flashinfer_available", lambda: installed)
+    assert context_parallel._use_flashinfer(query, kv) == installed
+    capability.assert_called_once_with(query.device)
+
+
+@pytest.mark.parametrize(
+    "backend,capability",
+    [
+        ("flashinfer", (8, 0)),
+        ("flashinfer", (10, 0)),
+        ("flashinfer", (12, 0)),
+        ("flashmla", (8, 0)),
+        ("flashmla", (12, 0)),
+    ],
+)
+def test_architecture_guard_precedes_layout_and_package_checks(monkeypatch, backend, capability):
+    query = SimpleNamespace(device=torch.device("cuda:3"))
+    lookup = Mock(return_value=capability)
+    availability = Mock(side_effect=AssertionError("Unsupported architecture checked FlashInfer installation"))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lookup)
+    monkeypatch.setattr(context_parallel, "_flashinfer_available", availability)
+    second_arg = None if backend == "flashinfer" else 512
+    assert not getattr(context_parallel, f"_use_{backend}")(query, second_arg)
+    lookup.assert_called_once_with(query.device)
+    availability.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "dtype,query_width,kv_width",
+    [(torch.float32, 512, 512), (torch.bfloat16, 576, 512), (torch.float16, 512, 576)],
+)
+def test_flashinfer_rejects_unsupported_layouts_before_package_lookup(monkeypatch, dtype, query_width, kv_width):
+    query = SimpleNamespace(dtype=dtype, shape=(1, 4, 2, query_width), device=torch.device("cuda:3"))
+    kv = SimpleNamespace(shape=(1, 5, 1, kv_width))
+    lookup = Mock(return_value=(9, 0))
+    availability = Mock(side_effect=AssertionError("Unsupported layout checked FlashInfer installation"))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lookup)
+    monkeypatch.setattr(context_parallel, "_flashinfer_available", availability)
+    assert not context_parallel._use_flashinfer(query, kv)
+    lookup.assert_called_once_with(query.device)
+    availability.assert_not_called()
 
 
 @pytest.mark.parametrize("capability", [(8, 0), (9, 0), (10, 0), (10, 3), (12, 0)])
 def test_flashmla_requires_supported_device_major(monkeypatch, capability):
-    query = SimpleNamespace(is_cuda=True, shape=(1, 4, 2, 512), device="cuda:3")
+    query = SimpleNamespace(shape=(1, 4, 2, 512), device=torch.device("cuda:3"))
     lookup = Mock(return_value=capability)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lookup)
     assert context_parallel._use_flashmla(query, 512) == (capability[0] in (9, 10))
@@ -128,12 +199,15 @@ def test_flashmla_requires_supported_device_major(monkeypatch, capability):
 
 
 @pytest.mark.parametrize("is_cuda,width,value_dim", [(False, 512, 512), (True, 544, 512), (True, 512, 448)])
-def test_flashmla_rejects_unsupported_layout_before_cuda_lookup(monkeypatch, is_cuda, width, value_dim):
-    lookup = Mock(side_effect=AssertionError("Unsupported layout queried CUDA"))
+def test_flashmla_rejects_unsupported_layout(monkeypatch, is_cuda, width, value_dim):
+    lookup = Mock(return_value=(9, 0))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lookup)
-    query = SimpleNamespace(is_cuda=is_cuda, shape=(1, 4, 2, width))
+    query = SimpleNamespace(shape=(1, 4, 2, width), device=torch.device("cuda:3" if is_cuda else "cpu"))
     assert not context_parallel._use_flashmla(query, value_dim)
-    lookup.assert_not_called()
+    if is_cuda:
+        lookup.assert_called_once_with(query.device)
+    else:
+        lookup.assert_not_called()
 
 
 def _dispatch_attention(kv_lora_rank=512, rope_width=0):
@@ -158,19 +232,19 @@ def _dispatch_attention(kv_lora_rank=512, rope_width=0):
     return attention
 
 
-@pytest.mark.parametrize("failure", [RuntimeError("plan failed"), TypeError("run contract rejected")])
-@pytest.mark.parametrize("flashmla_supported", [False, True])
-def test_flashinfer_failure_logs_and_falls_back_once(monkeypatch, failure, flashmla_supported):
-    attention = _dispatch_attention()
-    hidden_states = torch.zeros(1, 4, 16)
+@pytest.mark.parametrize("installed", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_hopper_dispatch_prefers_flashinfer_and_uses_flashmla_when_absent(monkeypatch, installed, dtype):
+    attention = _dispatch_attention().to(dtype=dtype)
+    hidden_states = torch.zeros(1, 4, 16, dtype=dtype)
     indices = torch.arange(4).expand(1, 4, -1)
     logger = Mock()
-    flashinfer = Mock(side_effect=failure)
+    flashinfer = Mock(side_effect=lambda query, *_args, **_kwargs: torch.zeros_like(query))
     flashmla = Mock(side_effect=lambda query, *_: torch.zeros_like(query[..., :512]))
     reference = Mock(wraps=context_parallel._reference_sparse_mla)
     monkeypatch.setattr(context_parallel, "get_logger", lambda: logger)
-    monkeypatch.setattr(context_parallel, "_use_flashinfer", lambda *_: True)
-    monkeypatch.setattr(context_parallel, "_use_flashmla", lambda *_: flashmla_supported)
+    monkeypatch.setattr(context_parallel, "_cuda_device_major", lambda _device: 9)
+    monkeypatch.setattr(context_parallel, "_flashinfer_available", lambda: installed)
     monkeypatch.setattr(context_parallel, "_flashinfer_sparse_mla", flashinfer)
     monkeypatch.setattr(context_parallel, "sparse_mla_flashmla_apply", flashmla)
     monkeypatch.setattr(context_parallel, "_reference_sparse_mla", reference)
@@ -181,47 +255,34 @@ def test_flashinfer_failure_logs_and_falls_back_once(monkeypatch, failure, flash
             )
             assert output.shape == hidden_states.shape
             assert torch.isfinite(output).all()
-    flashinfer.assert_called_once()
-    assert flashmla.call_count == 2 * int(flashmla_supported)
-    assert reference.call_count == 2 * int(not flashmla_supported)
-    logger.warning.assert_called_once()
-    assert "GLM53_FLASHINFER_FALLBACK" in logger.warning.call_args.args[0]
-    assert logger.warning.call_args.args[-1] is failure
+    assert flashinfer.call_count == 2 * int(installed)
+    assert flashmla.call_count == 2 * int(not installed)
+    reference.assert_not_called()
+    logger.warning.assert_not_called()
     logger.info.assert_called_once()
-    backend_log = "GLM53_FLASHMLA_EXECUTED" if flashmla_supported else "GLM53_REFERENCE_EXECUTED"
+    backend_log = "GLM53_FLASHINFER_EXECUTED" if installed else "GLM53_FLASHMLA_EXECUTED"
     assert backend_log in logger.info.call_args.args[0]
-    if flashmla_supported:
+    if installed:
+        assert flashinfer.call_args.args[0].shape[-1] == 512
+    else:
         assert flashmla.call_args.args[0].shape[-1] == 576
 
 
-def test_flashinfer_oom_is_not_hidden_by_runtime_fallback(monkeypatch):
-    attention = _dispatch_attention()
-    logger = Mock()
-    fallback = Mock(side_effect=AssertionError("OOM must propagate"))
-    monkeypatch.setattr(context_parallel, "get_logger", lambda: logger)
-    monkeypatch.setattr(context_parallel, "_use_flashinfer", lambda *_: True)
-    monkeypatch.setattr(
-        context_parallel, "_flashinfer_sparse_mla", Mock(side_effect=torch.OutOfMemoryError("reserve"))
-    )
-    monkeypatch.setattr(context_parallel, "_use_flashmla", fallback)
-    with pytest.raises(torch.OutOfMemoryError, match="reserve"):
-        context_parallel._sparse_attention_forward(
-            attention, torch.zeros(1, 4, 16), None, prev_topk_indices=torch.arange(4).expand(1, 4, -1)
-        )
-    fallback.assert_not_called()
-    logger.warning.assert_not_called()
-    assert not getattr(attention, "_ap_flashinfer_failed", False)
-
-
 @pytest.mark.parametrize(
-    "message", ["CUDA error: an illegal memory access", "CUDA error: device-side assert triggered"]
+    "error",
+    [
+        RuntimeError("plan failed"),
+        TypeError("run contract rejected"),
+        torch.OutOfMemoryError("reserve"),
+        RuntimeError("CUDA error: an illegal memory access"),
+        RuntimeError("CUDA error: device-side assert triggered"),
+    ],
 )
-def test_flashinfer_sticky_cuda_error_is_not_hidden_by_runtime_fallback(monkeypatch, message):
+def test_installed_flashinfer_failure_propagates_without_fallback(monkeypatch, error):
     attention = _dispatch_attention()
-    error = RuntimeError(message)
     logger = Mock()
     flashinfer = Mock(side_effect=error)
-    flashmla_guard = Mock(side_effect=AssertionError("Sticky CUDA error must propagate"))
+    flashmla_guard = Mock(side_effect=AssertionError("Installed FlashInfer failure must propagate"))
     flashmla = Mock()
     reference = Mock()
     monkeypatch.setattr(context_parallel, "get_logger", lambda: logger)
@@ -230,7 +291,7 @@ def test_flashinfer_sticky_cuda_error_is_not_hidden_by_runtime_fallback(monkeypa
     monkeypatch.setattr(context_parallel, "_use_flashmla", flashmla_guard)
     monkeypatch.setattr(context_parallel, "sparse_mla_flashmla_apply", flashmla)
     monkeypatch.setattr(context_parallel, "_reference_sparse_mla", reference)
-    with pytest.raises(RuntimeError, match="CUDA error") as raised:
+    with pytest.raises(type(error)) as raised:
         context_parallel._sparse_attention_forward(
             attention, torch.zeros(1, 4, 16), None, prev_topk_indices=torch.arange(4).expand(1, 4, -1)
         )
@@ -485,9 +546,8 @@ def test_glm53_rope_free_model_executes_flashmla(tiny_glm_sparse_model):
 
 
 @require_torch_gpu
-def test_glm53_rope_free_model_prefers_flashinfer_when_opted_in(tiny_glm_sparse_model, monkeypatch):
+def test_glm53_rope_free_model_prefers_installed_flashinfer(tiny_glm_sparse_model):
     pytest.importorskip("flashinfer")
-    monkeypatch.setenv("ARCTIC_GLM53_FLASHINFER", "1")
     set_seed(42)
     model = tiny_glm_sparse_model(kv_lora_rank=512).to(device="cuda", dtype=torch.bfloat16).train()
     sparse_layers = sum(layer.block_type == "deepseek_sparse_attention" for layer in model.model.layers)
