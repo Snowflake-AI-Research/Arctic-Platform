@@ -158,8 +158,7 @@ def test_real_flashmla_padded_width_matches_original_reference():
     indices[:, 0] = -1
     indices = context_parallel._pad_sparse_indices(indices)
     scale = 0.03125
-    # FlashMLA accumulates softmax in FP32. The BF16 fallback rounds probabilities
-    # before multiplying values; use the independent FP32 reference for kernel parity.
+    # FP32 reference leaves defer gradient rounding until the original BF16 query/KV leaves.
     expected = context_parallel._reference_sparse_mla(
         query.float(),
         kv.float(),
