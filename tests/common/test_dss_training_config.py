@@ -18,6 +18,7 @@
 import json
 from collections import UserDict
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -521,8 +522,35 @@ def test_transport_controls_reach_real_loader_and_model_config(
     assert source == original
 
 
+@pytest.mark.parametrize("location", ["flat", "nested"])
+def test_pinned_dss_transport_contract(location):
+    """CPU CI pins exact DSS field names and MoE loader keys without importing DSS.
+
+    The fixture records the relevant transport contract at its named DSS revision,
+    not the whole schema or evidence that a later DSS revision is compatible.
+    """
+    fixture_path = Path(__file__).parent / "fixtures" / "dss_moe_transport_contract.json"
+    contract = json.loads(fixture_path.read_text())
+    controls = deepcopy(contract["controls"])
+    source = job(
+        **(controls if location == "flat" else {"prime_rl": controls}),
+        sp_size=4,
+        attn_implementation="flash_attention_3",
+        debug={"gpu_mem_preallocate_gib": 20},
+    )
+    original = deepcopy(source)
+    training = json.loads(json.dumps(dss_moe_initialize_payload(source)))["training_config"]
+    expected = contract[f"{location}_training_config"]
+    assert set(training) == set(expected)
+    assert set(training["prime_rl"]) == set(expected["prime_rl"])
+    assert training == expected
+    assert source == original
+
+
+@pytest.mark.dss_consumer
 @pytest.mark.parametrize("model_type", ["qwen3_moe", "glm5_next", "qwen4_exp"])
 def test_installed_dss_consumer_preserves_transport_controls(monkeypatch, model_type):
+    """Supplemental live-DSS check; standard CPU CI uses the pinned contract fixture."""
     pytest.importorskip("transformers.models.qwen3_5_moe")
     dss_models = pytest.importorskip("dss.ray_dss.models")
     dss_training = pytest.importorskip("dss.ray_dss.jobs.gpu.training")

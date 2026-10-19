@@ -57,6 +57,9 @@ jobs:
       - name: Environment print
         run: |
           uv pip list
+      - name: Pinned DSS transport contract (no DSS dependency)
+        run: |
+          python -m pytest -sv tests/common/test_dss_training_config.py -k pinned_dss_transport_contract
       - name: Unit Tests
         run: |
           cd tests
