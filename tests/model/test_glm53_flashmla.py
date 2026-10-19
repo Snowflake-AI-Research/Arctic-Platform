@@ -83,6 +83,7 @@ def test_zero_padded_channels_preserve_attention_and_gradients():
 
 @pytest.mark.parametrize("capability", [(8, 0), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0)])
 def test_flashinfer_fa3_requires_hopper_on_query_device(monkeypatch, capability):
+    monkeypatch.setenv("ARCTIC_GLM53_FLASHINFER", "1")
     device = torch.device("cuda:3")
     query = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16, shape=(1, 4, 2, 512), device=device)
     kv = SimpleNamespace(shape=(1, 5, 1, 512))
@@ -94,11 +95,122 @@ def test_flashinfer_fa3_requires_hopper_on_query_device(monkeypatch, capability)
 
 
 def test_flashinfer_guard_does_not_query_cuda_for_cpu(monkeypatch):
+    monkeypatch.setenv("ARCTIC_GLM53_FLASHINFER", "1")
     query = SimpleNamespace(is_cuda=False)
     capability_lookup = Mock(side_effect=AssertionError("CPU input queried CUDA"))
     monkeypatch.setattr(torch.cuda, "get_device_capability", capability_lookup)
     assert not context_parallel._use_flashinfer(query, None)
     capability_lookup.assert_not_called()
+
+
+@pytest.mark.parametrize("flag", [None, "0", "true", "1"])
+def test_flashinfer_requires_explicit_opt_in(monkeypatch, flag):
+    if flag is None:
+        monkeypatch.delenv("ARCTIC_GLM53_FLASHINFER", raising=False)
+    else:
+        monkeypatch.setenv("ARCTIC_GLM53_FLASHINFER", flag)
+    query = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16, shape=(1, 4, 2, 512), device="cuda:3")
+    kv = SimpleNamespace(shape=(1, 5, 1, 512))
+    capability = Mock(return_value=(9, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    monkeypatch.setattr(context_parallel, "_flashinfer_available", lambda: True)
+    assert context_parallel._use_flashinfer(query, kv) == (flag == "1")
+    assert capability.call_count == int(flag == "1")
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (10, 0), (10, 3), (12, 0)])
+def test_flashmla_requires_supported_device_major(monkeypatch, capability):
+    query = SimpleNamespace(is_cuda=True, shape=(1, 4, 2, 512), device="cuda:3")
+    lookup = Mock(return_value=capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lookup)
+    assert context_parallel._use_flashmla(query, 512) == (capability[0] in (9, 10))
+    lookup.assert_called_once_with(query.device)
+
+
+@pytest.mark.parametrize("is_cuda,width,value_dim", [(False, 512, 512), (True, 544, 512), (True, 512, 448)])
+def test_flashmla_rejects_unsupported_layout_before_cuda_lookup(monkeypatch, is_cuda, width, value_dim):
+    lookup = Mock(side_effect=AssertionError("Unsupported layout queried CUDA"))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lookup)
+    query = SimpleNamespace(is_cuda=is_cuda, shape=(1, 4, 2, width))
+    assert not context_parallel._use_flashmla(query, value_dim)
+    lookup.assert_not_called()
+
+
+def _dispatch_attention(kv_lora_rank=512, rope_width=0):
+    attention = torch.nn.Module()
+    attention.num_heads = 2
+    attention.kv_lora_rank = kv_lora_rank
+    attention.qk_nope_head_dim = 4
+    attention.qk_rope_head_dim = rope_width
+    attention.qk_head_dim = 4 + rope_width
+    attention.v_head_dim = 4
+    attention.q_a_proj = torch.nn.Linear(16, 8, bias=False)
+    attention.q_a_layernorm = torch.nn.LayerNorm(8)
+    attention.q_b_proj = torch.nn.Linear(8, 2 * attention.qk_head_dim, bias=False)
+    attention.kv_a_proj_with_mqa = torch.nn.Linear(16, kv_lora_rank + rope_width, bias=False)
+    attention.kv_a_layernorm = torch.nn.LayerNorm(kv_lora_rank)
+    attention.kv_b_proj = torch.nn.Linear(kv_lora_rank, 2 * 8, bias=False)
+    attention.o_proj = torch.nn.Linear(8, 16, bias=False)
+    attention.indexer = None
+    attention.next_skip_topk = False
+    attention.scaling = 0.03125
+    attention._cp_group = None
+    return attention
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("plan failed"), TypeError("run contract rejected")])
+@pytest.mark.parametrize("flashmla_supported", [False, True])
+def test_flashinfer_failure_logs_and_falls_back_once(monkeypatch, failure, flashmla_supported):
+    attention = _dispatch_attention()
+    hidden_states = torch.zeros(1, 4, 16)
+    indices = torch.arange(4).expand(1, 4, -1)
+    logger = Mock()
+    flashinfer = Mock(side_effect=failure)
+    flashmla = Mock(side_effect=lambda query, *_: torch.zeros_like(query[..., :512]))
+    reference = Mock(wraps=context_parallel._reference_sparse_mla)
+    monkeypatch.setattr(context_parallel, "get_logger", lambda: logger)
+    monkeypatch.setattr(context_parallel, "_use_flashinfer", lambda *_: True)
+    monkeypatch.setattr(context_parallel, "_use_flashmla", lambda *_: flashmla_supported)
+    monkeypatch.setattr(context_parallel, "_flashinfer_sparse_mla", flashinfer)
+    monkeypatch.setattr(context_parallel, "sparse_mla_flashmla_apply", flashmla)
+    monkeypatch.setattr(context_parallel, "_reference_sparse_mla", reference)
+    with torch.no_grad():
+        for _ in range(2):
+            output, _, _ = context_parallel._sparse_attention_forward(
+                attention, hidden_states, None, prev_topk_indices=indices
+            )
+            assert output.shape == hidden_states.shape
+            assert torch.isfinite(output).all()
+    flashinfer.assert_called_once()
+    assert flashmla.call_count == 2 * int(flashmla_supported)
+    assert reference.call_count == 2 * int(not flashmla_supported)
+    logger.warning.assert_called_once()
+    assert "GLM53_FLASHINFER_FALLBACK" in logger.warning.call_args.args[0]
+    assert logger.warning.call_args.args[-1] is failure
+    logger.info.assert_called_once()
+    backend_log = "GLM53_FLASHMLA_EXECUTED" if flashmla_supported else "GLM53_REFERENCE_EXECUTED"
+    assert backend_log in logger.info.call_args.args[0]
+    if flashmla_supported:
+        assert flashmla.call_args.args[0].shape[-1] == 576
+
+
+def test_flashinfer_oom_is_not_hidden_by_runtime_fallback(monkeypatch):
+    attention = _dispatch_attention()
+    logger = Mock()
+    fallback = Mock(side_effect=AssertionError("OOM must propagate"))
+    monkeypatch.setattr(context_parallel, "get_logger", lambda: logger)
+    monkeypatch.setattr(context_parallel, "_use_flashinfer", lambda *_: True)
+    monkeypatch.setattr(
+        context_parallel, "_flashinfer_sparse_mla", Mock(side_effect=torch.OutOfMemoryError("reserve"))
+    )
+    monkeypatch.setattr(context_parallel, "_use_flashmla", fallback)
+    with pytest.raises(torch.OutOfMemoryError, match="reserve"):
+        context_parallel._sparse_attention_forward(
+            attention, torch.zeros(1, 4, 16), None, prev_topk_indices=torch.arange(4).expand(1, 4, -1)
+        )
+    fallback.assert_not_called()
+    logger.warning.assert_not_called()
+    assert not getattr(attention, "_ap_flashinfer_failed", False)
 
 
 @pytest.mark.parametrize("all_empty", [False, True])
@@ -111,6 +223,7 @@ def test_flashinfer_request_contract_and_empty_rows(monkeypatch, all_empty):
     counts = torch.tensor([0, 0, 0] if all_empty else [0, 2, 3], dtype=torch.int32)
     packed = torch.tensor([0] if all_empty else [2, 0, 0, 0, 2], dtype=torch.int32)
     observed = []
+    kernel_outputs = []
 
     class Wrapper:
         def plan(
@@ -146,6 +259,7 @@ def test_flashinfer_request_contract_and_empty_rows(monkeypatch, all_empty):
             assert q_nope.is_contiguous() and ckv_cache.is_contiguous()
             output = torch.ones_like(q_nope)
             output[counts == 0] = float("nan")
+            kernel_outputs.append(output)
             return output
 
     monkeypatch.setattr(context_parallel, "_flashinfer_wrapper", lambda _device: Wrapper())
@@ -154,6 +268,7 @@ def test_flashinfer_request_contract_and_empty_rows(monkeypatch, all_empty):
     expected = torch.ones_like(query)
     expected[:, counts == 0] = 0
     torch_assert_equal(actual, expected)
+    assert actual.data_ptr() == kernel_outputs[0].data_ptr()
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -263,6 +378,7 @@ def test_real_flashmla_padded_width_matches_original_reference():
         pytest.param(512, 32, False, None, id="unsupported-query-544"),
         pytest.param(256, 0, False, None, id="unsupported-query-256"),
         pytest.param(512, 0, False, (8, 0), id="pre-hopper-reference-fallback"),
+        pytest.param(512, 0, False, (12, 0), id="unsupported-sm12-reference-fallback"),
     ],
 )
 def test_sparse_attention_dispatches_only_supported_flashmla_layouts(
@@ -274,24 +390,7 @@ def test_sparse_attention_dispatches_only_supported_flashmla_layouts(
     logger = Mock()
     monkeypatch.setattr(context_parallel, "get_logger", lambda: logger)
     # Exercise the adapter independently: current GLM configs reject nonzero RoPE widths.
-    attention = torch.nn.Module()
-    attention.num_heads = 2
-    attention.kv_lora_rank = kv_lora_rank
-    attention.qk_nope_head_dim = 4
-    attention.qk_rope_head_dim = rope_width
-    attention.qk_head_dim = 4 + rope_width
-    attention.v_head_dim = 4
-    attention.q_a_proj = torch.nn.Linear(16, 8, bias=False)
-    attention.q_a_layernorm = torch.nn.LayerNorm(8)
-    attention.q_b_proj = torch.nn.Linear(8, 2 * attention.qk_head_dim, bias=False)
-    attention.kv_a_proj_with_mqa = torch.nn.Linear(16, kv_lora_rank + rope_width, bias=False)
-    attention.kv_a_layernorm = torch.nn.LayerNorm(kv_lora_rank)
-    attention.kv_b_proj = torch.nn.Linear(kv_lora_rank, 2 * 8, bias=False)
-    attention.o_proj = torch.nn.Linear(8, 16, bias=False)
-    attention.indexer = None
-    attention.next_skip_topk = False
-    attention.scaling = 0.03125
-    attention._cp_group = None
+    attention = _dispatch_attention(kv_lora_rank, rope_width)
     attention = attention.to(device="cuda", dtype=torch.bfloat16)
     hidden_states = torch.randn(1, 4, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     indices = torch.arange(4, device="cuda").expand(1, 4, -1)
@@ -355,8 +454,9 @@ def test_glm53_rope_free_model_executes_flashmla(tiny_glm_sparse_model):
 
 
 @require_torch_gpu
-def test_glm53_rope_free_model_prefers_flashinfer(tiny_glm_sparse_model):
+def test_glm53_rope_free_model_prefers_flashinfer_when_opted_in(tiny_glm_sparse_model, monkeypatch):
     pytest.importorskip("flashinfer")
+    monkeypatch.setenv("ARCTIC_GLM53_FLASHINFER", "1")
     set_seed(42)
     model = tiny_glm_sparse_model(kv_lora_rank=512).to(device="cuda", dtype=torch.bfloat16).train()
     sparse_layers = sum(layer.block_type == "deepseek_sparse_attention" for layer in model.model.layers)

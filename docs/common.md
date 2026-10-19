@@ -163,6 +163,7 @@ With `colocate=True`:
 | `RAY_PORT` / `RAY_DASHBOARD_PORT` | Ray head |
 | `ARL_LOG_DP_SHARD_TOKENS` | Debug per-DP token stats |
 | `ARCTIC_INFERENCE_ENABLED` | Set when `arctic_inference_config` is present |
+| `ARCTIC_GLM53_FLASHINFER` | Set exactly `1` to opt into the experimental rope-free GLM-5.3 FlashInfer FA3 backend on Hopper; default is off. API failures log once per attention module and fall back to FlashMLA or reference; OOM still propagates. |
 | `NCCL_TOPO_FILE` | Stale inherited `/proc/self/fd/*` values are dropped in the worker (avoids OFI topology deadlock) |
 
 ## Gotchas
