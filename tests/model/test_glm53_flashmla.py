@@ -84,6 +84,14 @@ def test_bf16_tolerance_has_a_fixed_floor_for_zero():
         _assert_bf16_kernel_close(expected + 2e-6, expected)
 
 
+def test_bf16_forward_tolerance_does_not_scale_with_other_elements():
+    expected = torch.tensor([100.0, 1e-2])
+    actual = expected.clone()
+    actual[1] = 2e-2
+    with pytest.raises(AssertionError):
+        _assert_bf16_kernel_close(actual, expected, atol=1e-4)
+
+
 def test_zero_padded_channels_preserve_attention_and_gradients():
     set_seed(42)
     query = torch.randn(1, 6, 2, 512, requires_grad=True)
@@ -139,7 +147,9 @@ def test_real_flashmla_padded_width_matches_original_reference():
     retained_bytes = sum(size for ptr, size in saved if ptr in (padded_query.data_ptr(), padded_kv.data_ptr()))
     assert retained_bytes == input_bytes * 576 // 512
     assert {ptr for ptr, _ in saved}.issuperset({padded_query.data_ptr(), padded_kv.data_ptr()})
-    _assert_bf16_kernel_close(actual, expected, atol=2e-5)
+    # BF16 kernel accumulation leaves cancellation residuals near zero. Use a fixed
+    # forward floor, not a budget scaled by the largest output; gradients keep 1e-6.
+    _assert_bf16_kernel_close(actual, expected, atol=1e-4)
     torch_assert_equal(actual[:, 0], torch.zeros_like(actual[:, 0]))
     grad = torch.randn_like(expected)
     expected_grads = torch.autograd.grad(expected, (query, kv), grad, retain_graph=True)
