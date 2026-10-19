@@ -393,6 +393,9 @@ class TestClusterRequestBuilders:
             cluster_requests.export_checkpoint_request("job", "checkpoint"),
             cluster_requests.delete_checkpoint_request("job", "checkpoint"),
             cluster_requests.download_artifacts_request("job", "stdout", "/tmp/logs"),
+            cluster_requests.generate_stream_request(JobHandles(sampling="job"), ["hi"]),
+            cluster_requests.request_status_request("job", "req", 16),
+            cluster_requests.cancel_request_request("job", "req"),
         )
         assert {request.op for request in requests} == CLUSTER_OPS
         assert CLUSTER_OPS.isdisjoint(OPS)

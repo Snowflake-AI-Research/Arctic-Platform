@@ -67,6 +67,10 @@ CLUSTER_OPS = frozenset(
         "export-checkpoint",
         "delete-checkpoint",
         "download-artifacts",
+        # Cortex polls a submitted request for its events; on-prem answers inline.
+        "generate-stream",
+        "request-status",
+        "cancel-request",
     }
 )
 
