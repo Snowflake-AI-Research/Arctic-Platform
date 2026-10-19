@@ -13,36 +13,197 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import weakref
+
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from arctic_platform.model.implementations.gpu.sp import collectives
+from arctic_platform.testing_utils import get_unique_port_number
+from arctic_platform.testing_utils import reserve_free_port
 from arctic_platform.testing_utils import torch_assert_equal
 
 
 @pytest.fixture(autouse=True)
 def clean_groups(monkeypatch):
-    monkeypatch.setattr(collectives, "_barrier_groups", {})
+    monkeypatch.setattr(collectives, "_barrier_groups", weakref.WeakKeyDictionary())
     monkeypatch.delenv("ARCTIC_SP_ALLTOALL_BARRIER", raising=False)
 
 
-def test_default_does_not_create_barrier_group(monkeypatch):
+class Group:
+    pass
+
+
+@pytest.fixture
+def group_runtime(monkeypatch):
+    ranks = {}
+    created = []
+    destroyed = []
+    world = Group()
+    ranks[world] = [0, 1]
+    monkeypatch.setattr(collectives.dist.group, "WORLD", world)
+    monkeypatch.setattr(collectives.dist, "is_initialized", lambda: world in ranks)
+    monkeypatch.setattr(collectives.dist, "get_process_group_ranks", lambda group: ranks[group])
+
+    def new_group(**kwargs):
+        group = Group()
+        ranks[group] = kwargs["ranks"]
+        created.append(kwargs)
+        return group
+
+    def destroy(group):
+        destroyed.append(group)
+        del ranks[group]
+
+    monkeypatch.setattr(collectives.dist, "new_group", new_group)
+    monkeypatch.setattr(collectives.dist, "destroy_process_group", destroy)
+    return SimpleNamespace(ranks=ranks, created=created, destroyed=destroyed, world=world)
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "true", "on"])
+def test_disabled_values_do_not_create_barrier_group(monkeypatch, value):
+    if value is not None:
+        monkeypatch.setenv("ARCTIC_SP_ALLTOALL_BARRIER", value)
     monkeypatch.setattr(collectives.dist, "new_group", lambda **kw: pytest.fail("unexpected group"))
     assert collectives._exchange_barrier_group(object()) is None
 
 
-def test_group_is_cached_for_the_exact_sp_group(monkeypatch):
+def test_group_is_cached_for_the_exact_sp_group(monkeypatch, group_runtime):
     monkeypatch.setenv("ARCTIC_SP_ALLTOALL_BARRIER", "1")
-    calls = []
-    monkeypatch.setattr(collectives.dist, "get_process_group_ranks", lambda group: [8, 9])
-    monkeypatch.setattr(collectives.dist, "new_group", lambda **kw: calls.append(kw) or object())
-    source = object()
+    source = Group()
+    group_runtime.ranks[source] = [8, 9]
     assert collectives._exchange_barrier_group(source) is collectives._exchange_barrier_group(source)
-    assert calls == [{"ranks": [8, 9], "backend": "gloo", "use_local_synchronization": True}]
-    collectives._exchange_barrier_group(object())
-    assert len(calls) == 2
+    assert group_runtime.created == [{"ranks": [8, 9], "backend": "gloo", "use_local_synchronization": True}]
+    other = Group()
+    group_runtime.ranks[other] = [8, 9]
+    collectives._exchange_barrier_group(other)
+    assert len(group_runtime.created) == 2
+
+
+def test_destroy_releases_only_the_requested_group_and_all_is_idempotent(monkeypatch, group_runtime):
+    monkeypatch.setenv("ARCTIC_SP_ALLTOALL_BARRIER", "1")
+    source = Group()
+    group_runtime.ranks[source] = [8, 9]
+    first = collectives._exchange_barrier_group(source)
+    second = collectives._exchange_barrier_group(None)
+    collectives.destroy_exchange_barrier_groups(source)
+    assert group_runtime.destroyed == [first]
+    assert source not in collectives._barrier_groups
+    assert group_runtime.world in collectives._barrier_groups
+    collectives.destroy_exchange_barrier_groups()
+    collectives.destroy_exchange_barrier_groups()
+    assert group_runtime.destroyed == [first, second]
+    assert not collectives._barrier_groups
+
+
+@pytest.mark.parametrize("destroy_source", [False, True])
+def test_destroyed_groups_are_not_reused(monkeypatch, group_runtime, destroy_source):
+    monkeypatch.setenv("ARCTIC_SP_ALLTOALL_BARRIER", "1")
+    source = Group()
+    group_runtime.ranks[source] = [8, 9]
+    barrier = collectives._exchange_barrier_group(source)
+    if destroy_source:
+        del group_runtime.ranks[source]
+        new_source = Group()
+        group_runtime.ranks[new_source] = [8, 9]
+    else:
+        del group_runtime.ranks[barrier]
+        new_source = source
+    new_barrier = collectives._exchange_barrier_group(new_source)
+    assert new_barrier is not barrier
+    assert barrier not in group_runtime.ranks
+    assert len(collectives._barrier_groups) == 1
+
+
+def test_cache_does_not_retain_groups_after_global_teardown(monkeypatch, group_runtime):
+    monkeypatch.setenv("ARCTIC_SP_ALLTOALL_BARRIER", "1")
+    source = Group()
+    group_runtime.ranks[source] = [8, 9]
+    barrier = collectives._exchange_barrier_group(source)
+    source_ref = weakref.ref(source)
+    barrier_ref = weakref.ref(barrier)
+    group_runtime.ranks.clear()
+    del source, barrier
+    gc.collect()
+    assert source_ref() is None
+    assert barrier_ref() is None
+    assert not collectives._barrier_groups
+    collectives.destroy_exchange_barrier_groups()
+    assert group_runtime.destroyed == []
+
+
+def test_default_group_reinitialization_uses_the_new_world(monkeypatch, group_runtime):
+    monkeypatch.setenv("ARCTIC_SP_ALLTOALL_BARRIER", "1")
+    old = collectives._exchange_barrier_group(None)
+    group_runtime.ranks.clear()
+    world = Group()
+    group_runtime.ranks[world] = [0, 1]
+    monkeypatch.setattr(collectives.dist.group, "WORLD", world)
+    monkeypatch.setattr(collectives.dist, "is_initialized", lambda: True)
+    new = collectives._exchange_barrier_group(None)
+    assert new is not old
+    assert len(collectives._barrier_groups) == 1
+    assert group_runtime.destroyed == []
+
+
+def test_unregistered_source_is_rejected_without_creating_a_group(monkeypatch, group_runtime):
+    monkeypatch.setenv("ARCTIC_SP_ALLTOALL_BARRIER", "1")
+    with pytest.raises(ValueError, match="not registered"):
+        collectives._exchange_barrier_group(Group())
+    assert group_runtime.created == []
+
+
+def test_worker_destroy_releases_barriers_before_process_groups(monkeypatch):
+    pytest.importorskip("ray")
+    from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
+
+    events = []
+    monkeypatch.setattr(collectives, "destroy_exchange_barrier_groups", lambda: events.append("barriers"))
+    monkeypatch.setattr(collectives.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(collectives.dist, "destroy_process_group", lambda: events.append("process-groups"))
+    worker = SimpleNamespace(_weight_sender=None, engine=object())
+    assert DeepSpeedWorker.destroy(worker)
+    assert events == ["barriers", "process-groups"]
+    assert worker.engine is None
+
+
+def _gloo_lifecycle_worker(rank, port):
+    import os
+
+    os.environ["ARCTIC_SP_ALLTOALL_BARRIER"] = "1"
+    for _ in range(2):
+        collectives.dist.init_process_group(
+            "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+        )
+        try:
+            source = collectives.dist.new_group(ranks=[0, 1], backend="gloo")
+            barrier = collectives._exchange_barrier_group(source)
+            assert collectives._exchange_barrier_group(source) is barrier
+            collectives.dist.barrier(group=barrier)
+            collectives.destroy_exchange_barrier_groups(source)
+            assert not collectives._barrier_groups
+            replacement = collectives._exchange_barrier_group(source)
+            assert replacement is not barrier
+            collectives.dist.barrier(group=replacement)
+            default_barrier = collectives._exchange_barrier_group(None)
+            collectives.dist.barrier(group=default_barrier)
+        finally:
+            collectives.dist.destroy_process_group()
+        del source, barrier, replacement, default_barrier
+        gc.collect()
+        assert not collectives._barrier_groups
+
+
+@pytest.mark.timeout(90)
+def test_real_gloo_groups_survive_teardown_and_reinitialization():
+    if not collectives.dist.is_gloo_available():
+        pytest.skip("PyTorch was built without Gloo")
+    port = reserve_free_port(get_unique_port_number() + 1, span=7)
+    torch.multiprocessing.spawn(_gloo_lifecycle_worker, args=(port,), nprocs=2, join=True)
 
 
 @pytest.mark.parametrize("enabled", [False, True])

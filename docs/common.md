@@ -163,10 +163,12 @@ With `colocate=True`:
 | `RAY_PORT` / `RAY_DASHBOARD_PORT` | Ray head |
 | `ARL_LOG_DP_SHARD_TOKENS` | Debug per-DP token stats |
 | `ARCTIC_INFERENCE_ENABLED` | Set when `arctic_inference_config` is present |
+| `ARCTIC_SP_ALLTOALL_BARRIER` | Set to exactly `1` on every SP rank to synchronize CUDA and enter a Gloo barrier after each sequence/head all-to-all; absent, `0`, `true` and all other values disable it |
 | `NCCL_TOPO_FILE` | Stale inherited `/proc/self/fd/*` values are dropped in the worker (avoids OFI topology deadlock) |
 
 ## Gotchas
 
+- The opt-in SP exchange guard requires Gloo and adds synchronization overhead. AP workers release its auxiliary groups during teardown. Other callers destroying an SP subgroup must call `destroy_exchange_barrier_groups(group)` from `arctic_platform.model.implementations.gpu.sp.collectives` on every subgroup member before destroying that subgroup; omit the argument to release all owned barrier groups. PyTorch-wide teardown does not leave strong cache references behind.
 - Concurrent jobs on one host: use distinct `MASTER_PORT` /
   `ARL_WEIGHT_SYNC_PORT`.
 - Training-only servers must keep `sampling_gpus=0` unless inference deps

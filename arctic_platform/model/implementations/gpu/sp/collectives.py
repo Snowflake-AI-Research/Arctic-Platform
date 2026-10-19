@@ -17,23 +17,59 @@
 from __future__ import annotations
 
 import os
+import weakref
 
 import torch
 import torch.distributed as dist
 
-_barrier_groups: dict[object, object] = {}
+_barrier_groups: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _group_is_registered(group):
+    if group is None or not dist.is_initialized():
+        return False
+    try:
+        dist.get_process_group_ranks(group)
+    except (KeyError, ValueError):
+        return False
+    return True
+
+
+def destroy_exchange_barrier_groups(group=None):
+    """Release owned Gloo groups before SP-group teardown; all members must call."""
+    for source in list(_barrier_groups):
+        if group is not None and source is not group:
+            continue
+        barrier = _barrier_groups.pop(source)()
+        if barrier is not None and _group_is_registered(barrier):
+            dist.destroy_process_group(barrier)
+
+
+def _discard_stale_barrier_groups():
+    for source, barrier_ref in list(_barrier_groups.items()):
+        barrier = barrier_ref()
+        if not _group_is_registered(source) or barrier is None or not _group_is_registered(barrier):
+            destroy_exchange_barrier_groups(source)
 
 
 def _exchange_barrier_group(group):
+    # Exactly "1" enables the guard; set the same value on every SP rank.
     if os.environ.get("ARCTIC_SP_ALLTOALL_BARRIER") != "1":
         return None
+    _discard_stale_barrier_groups()
+    group = dist.group.WORLD if group is None else group
+    if not _group_is_registered(group):
+        raise ValueError("The SP all-to-all group is not registered")
     if group not in _barrier_groups:
-        _barrier_groups[group] = dist.new_group(
+        barrier = dist.new_group(
             ranks=dist.get_process_group_ranks(group),
             backend="gloo",
             use_local_synchronization=True,
         )
-    return _barrier_groups[group]
+        # PyTorch owns live groups; the cache must not retain destroyed groups.
+        _barrier_groups[group] = weakref.ref(barrier)
+        return barrier
+    return _barrier_groups[group]()
 
 
 def _finish_exchange(barrier_group):
