@@ -14,6 +14,7 @@
 # limitations under the License.
 import json
 import types
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -403,6 +404,77 @@ def test_glm53_defaults_to_sparse_mla_and_allows_context_parallelism(tmp_path):
     assert spec.attn_implementation == "sparse_mla"
 
 
+@pytest.mark.parametrize("backend", ["sparse_mla", "flashinfer", "flashmla"])
+def test_glm53_spec_accepts_sparse_backend_selection(tmp_path, backend):
+    spec = ModelSpec(
+        model_path_or_name=_checkpoint(tmp_path, "glm5_next"),
+        attn_implementation=backend,
+    )
+    assert spec.attn_implementation == backend
+
+
+@pytest.mark.parametrize("backend", ["sparse_mla", "flashinfer", "flashmla"])
+def test_glm53_loader_preserves_backend_and_constructs_hf_eager_attention(monkeypatch, backend):
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as integration
+    from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+
+    config = integration._build_model_config("unused", 1, 1, "bfloat16", backend, Qwen3_5MoeOptions())
+    assert config.attn == backend
+    get_model = Mock(return_value=torch.nn.Module())
+    monkeypatch.setattr(integration.qwen_ds, "_generic_adapter", lambda: types.SimpleNamespace(get_model=get_model))
+    model = integration._get_model(config, torch.device("meta"), torch.bfloat16)
+    assert model is get_model.return_value
+    assert get_model.call_args.args[0].attn == "eager"
+    assert config.attn == backend
+
+
+@pytest.mark.parametrize("backend", ["sparse_mla", "flashinfer", "flashmla"])
+def test_glm53_deepspeed_adapter_forwards_backend_at_sp1(monkeypatch, backend):
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as integration
+
+    apply_cp = Mock()
+    monkeypatch.setattr(integration, "apply_context_parallelism", apply_cp)
+    model = torch.nn.Module()
+    integration._adapter(backend).apply_sequence_parallelism(model, 1, None)
+    apply_cp.assert_called_once_with(model, 1, None, attn_implementation=backend)
+
+
+@pytest.mark.parametrize("backend", ["sparse_mla", "flashinfer", "flashmla"])
+def test_glm53_deepspeed_loader_uses_model_config_backend(monkeypatch, backend):
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as integration
+    from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+
+    config = integration._build_model_config("unused", 1, 1, "bfloat16", backend, Qwen3_5MoeOptions())
+    model = torch.nn.Module()
+    apply_cp = Mock()
+    monkeypatch.setattr(integration, "apply_context_parallelism", apply_cp)
+
+    def load(adapter, *_args, **kwargs):
+        adapter.apply_sequence_parallelism(model, kwargs["sp_size"], kwargs["sp_group"])
+        return model
+
+    monkeypatch.setattr(integration.qwen_ds, "_load_moe_model_for_deepspeed", load)
+    assert integration.load_glm5_next_model_for_deepspeed(config, None, None, "unused") is model
+    apply_cp.assert_called_once_with(model, 1, None, attn_implementation=backend)
+
+
+def _assert_sparse_mla_gradient_close(actual, expected, dtype, *, is_kv):
+    # FP16 KV scatter sums 4 queries x 64 heads; H200 cancellation residuals reached 2.4e-4.
+    # Keep query/BF16 checks strict and bound only FP16 KV's absolute floor to 3e-4.
+    atol = 3e-4 if dtype == torch.float16 and is_kv else 1e-6
+    torch_assert_close(actual, expected.to(dtype), atol=atol, rtol=torch.finfo(dtype).eps)
+
+
+@pytest.mark.parametrize("dtype,is_kv", [(torch.float16, True), (torch.float16, False), (torch.bfloat16, True)])
+def test_sparse_mla_gradient_tolerance_is_bounded(dtype, is_kv):
+    expected = torch.zeros(2, dtype=dtype)
+    allowed = 2.4e-4 if dtype == torch.float16 and is_kv else 5e-7
+    _assert_sparse_mla_gradient_close(expected + allowed, expected, dtype, is_kv=is_kv)
+    rejected = 5e-4 if dtype == torch.float16 and is_kv else 2e-6
+    with pytest.raises(AssertionError):
+        _assert_sparse_mla_gradient_close(expected + rejected, expected, dtype, is_kv=is_kv)
+
+
 def test_glm53_sparse_reference_supports_rectangular_context_parallelism():
     from arctic_platform.model.implementations.glm53.context_parallel import _reference_sparse_mla
 
@@ -497,9 +569,9 @@ def test_glm53_flashinfer_sparse_mla_matches_reference(monkeypatch, dtype):
     expected_grads = torch.autograd.grad(dense, (reference_query, reference_kv), gradient)
     for actual in (output, chunked):
         actual_grads = torch.autograd.grad(actual, (query, key_value), gradient)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        for index, (actual_grad, expected_grad) in enumerate(zip(actual_grads, expected_grads, strict=True)):
             assert torch.isfinite(actual_grad).all()
-            torch_assert_close(actual_grad, expected_grad.to(dtype), atol=1e-6, rtol=torch.finfo(dtype).eps)
+            _assert_sparse_mla_gradient_close(actual_grad, expected_grad, dtype, is_kv=index == 1)
 
 
 def test_glm53_sparse_indices_are_padded_for_flashmla():

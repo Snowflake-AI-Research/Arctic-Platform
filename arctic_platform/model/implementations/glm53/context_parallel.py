@@ -28,6 +28,7 @@ import torch.distributed.nn as dist_nn
 import torch.nn.functional as F
 from torch import nn
 
+from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import flash_mla_available
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import sparse_mla_flashmla_apply
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
@@ -43,6 +44,7 @@ _GLOBAL_CU_SEQLENS = "_ap_glm53_global_cu_seqlens"
 # Bound one fp32 gathered-key tile while recomputing reference sparse-MLA backward.
 _REFERENCE_SPARSE_MLA_TILE_BYTES = 1 << 30
 _INDEXER_SCORE_CHUNK_BYTES = 512 * 1024 * 1024
+SPARSE_MLA_BACKENDS = ("sparse_mla", "flashinfer", "flashmla")
 
 
 def _gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:
@@ -270,7 +272,29 @@ def _use_flashinfer(query: torch.Tensor, key_value: torch.Tensor) -> bool:
 
 def _use_flashmla(query: torch.Tensor, value_dim: int) -> bool:
     # Allow Hopper (compute-capability major 9) and datacenter Blackwell (major 10), not SM12x.
-    return _cuda_device_major(query.device) in (9, 10) and value_dim == 512 and query.shape[-1] in (512, 576)
+    return (
+        _cuda_device_major(query.device) in (9, 10)
+        and value_dim == 512
+        and query.shape[-1] in (512, 576)
+        and flash_mla_available()
+    )
+
+
+def _select_sparse_mla_backend(requested: str, query: torch.Tensor, key_value: torch.Tensor, value_dim: int) -> str:
+    if requested not in SPARSE_MLA_BACKENDS:
+        raise ValueError(f"Unknown GLM-5.3 sparse attention backend {requested!r}; expected {SPARSE_MLA_BACKENDS}")
+    if requested in ("sparse_mla", "flashinfer"):
+        if value_dim == 512 and _use_flashinfer(query, key_value):
+            return "flashinfer"
+        if requested == "flashinfer":
+            raise RuntimeError("Requested GLM-5.3 FlashInfer requires an installed kernel and supported Hopper layout")
+    if _use_flashmla(query, value_dim):
+        return "flashmla"
+    if requested == "flashmla":
+        raise RuntimeError(
+            "Requested GLM-5.3 FlashMLA requires an installed kernel and supported Hopper/Blackwell layout"
+        )
+    return "reference"
 
 
 def _flashinfer_wrapper(device: torch.device):
@@ -518,7 +542,10 @@ def _sparse_attention_forward(
     )
 
     kernel_indices = _pad_sparse_indices(topk_indices)
-    if self.kv_lora_rank == 512 and _use_flashinfer(sparse_query, sparse_kv):
+    backend = _select_sparse_mla_backend(
+        getattr(self, "_ap_sparse_mla_backend", "sparse_mla"), sparse_query, sparse_kv, self.kv_lora_rank
+    )
+    if backend == "flashinfer":
         absorbed_output = _flashinfer_sparse_mla_apply(
             sparse_query,
             sparse_kv,
@@ -532,7 +559,7 @@ def _sparse_attention_forward(
                 dist.get_rank() if dist.is_initialized() else 0,
             )
             self._ap_flashinfer_dispatch_reported = True
-    elif _use_flashmla(sparse_query, self.kv_lora_rank):
+    elif backend == "flashmla":
         # The rope-free checkpoint keeps the same dot products with zero-padded kernel channels.
         padding = 576 - sparse_query.shape[-1]
         if padding:
@@ -783,7 +810,13 @@ def _wrap_backbone_forward(backbone: nn.Module, parallel_modules: list[nn.Module
     backbone.forward = types.MethodType(forward, backbone)
 
 
-def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
+def apply_context_parallelism(
+    model: nn.Module, cp_size: int, cp_group, *, attn_implementation: str = "sparse_mla"
+) -> None:
+    if attn_implementation not in SPARSE_MLA_BACKENDS:
+        raise ValueError(
+            f"Unknown GLM-5.3 sparse attention backend {attn_implementation!r}; expected {SPARSE_MLA_BACKENDS}"
+        )
     backbone = get_language_model(model)
     if cp_size > 1:
         if cp_group is None:
@@ -808,6 +841,7 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
         attention._cp_rank = cp_rank
         attention._cp_world_size = cp_world_size
         if layer.block_type == "deepseek_sparse_attention":
+            attention._ap_sparse_mla_backend = attn_implementation
             attention.forward = types.MethodType(
                 _sparse_attention_forward,
                 attention,

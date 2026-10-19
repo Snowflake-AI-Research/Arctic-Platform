@@ -57,6 +57,7 @@ def test_attention_guards_share_cached_device_classification(monkeypatch, device
     lookup = Mock(return_value=(9, 0))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lookup)
     monkeypatch.setattr(context_parallel, "_flashinfer_available", lambda: True)
+    monkeypatch.setattr(context_parallel, "flash_mla_available", lambda: True)
     for _ in range(3):
         assert context_parallel._use_flashinfer(query, kv) == (device.type == "cuda")
         assert context_parallel._use_flashmla(query, 512) == (device.type == "cuda")
@@ -167,6 +168,7 @@ def test_architecture_guard_precedes_layout_and_package_checks(monkeypatch, back
     availability = Mock(side_effect=AssertionError("Unsupported architecture checked FlashInfer installation"))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lookup)
     monkeypatch.setattr(context_parallel, "_flashinfer_available", availability)
+    monkeypatch.setattr(context_parallel, "flash_mla_available", availability)
     second_arg = None if backend == "flashinfer" else 512
     assert not getattr(context_parallel, f"_use_{backend}")(query, second_arg)
     lookup.assert_called_once_with(query.device)
@@ -194,6 +196,7 @@ def test_flashmla_requires_supported_device_major(monkeypatch, capability):
     query = SimpleNamespace(shape=(1, 4, 2, 512), device=torch.device("cuda:3"))
     lookup = Mock(return_value=capability)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lookup)
+    monkeypatch.setattr(context_parallel, "flash_mla_available", lambda: True)
     assert context_parallel._use_flashmla(query, 512) == (capability[0] in (9, 10))
     lookup.assert_called_once_with(query.device)
 
@@ -232,10 +235,20 @@ def _dispatch_attention(kv_lora_rank=512, rope_width=0):
     return attention
 
 
-@pytest.mark.parametrize("installed", [False, True])
+@pytest.mark.parametrize(
+    "installed,requested,expect_infer",
+    [
+        (False, "sparse_mla", False),
+        (True, "sparse_mla", True),
+        (False, "flashmla", False),
+        (True, "flashmla", False),
+        (True, "flashinfer", True),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_hopper_dispatch_prefers_flashinfer_and_uses_flashmla_when_absent(monkeypatch, installed, dtype):
+def test_hopper_dispatch_respects_backend_preference(monkeypatch, installed, requested, expect_infer, dtype):
     attention = _dispatch_attention().to(dtype=dtype)
+    attention._ap_sparse_mla_backend = requested
     hidden_states = torch.zeros(1, 4, 16, dtype=dtype)
     indices = torch.arange(4).expand(1, 4, -1)
     logger = Mock()
@@ -245,6 +258,7 @@ def test_hopper_dispatch_prefers_flashinfer_and_uses_flashmla_when_absent(monkey
     monkeypatch.setattr(context_parallel, "get_logger", lambda: logger)
     monkeypatch.setattr(context_parallel, "_cuda_device_major", lambda _device: 9)
     monkeypatch.setattr(context_parallel, "_flashinfer_available", lambda: installed)
+    monkeypatch.setattr(context_parallel, "flash_mla_available", lambda: True)
     monkeypatch.setattr(context_parallel, "_flashinfer_sparse_mla", flashinfer)
     monkeypatch.setattr(context_parallel, "sparse_mla_flashmla_apply", flashmla)
     monkeypatch.setattr(context_parallel, "_reference_sparse_mla", reference)
@@ -255,14 +269,14 @@ def test_hopper_dispatch_prefers_flashinfer_and_uses_flashmla_when_absent(monkey
             )
             assert output.shape == hidden_states.shape
             assert torch.isfinite(output).all()
-    assert flashinfer.call_count == 2 * int(installed)
-    assert flashmla.call_count == 2 * int(not installed)
+    assert flashinfer.call_count == 2 * int(expect_infer)
+    assert flashmla.call_count == 2 * int(not expect_infer)
     reference.assert_not_called()
     logger.warning.assert_not_called()
     logger.info.assert_called_once()
-    backend_log = "GLM53_FLASHINFER_EXECUTED" if installed else "GLM53_FLASHMLA_EXECUTED"
+    backend_log = "GLM53_FLASHINFER_EXECUTED" if expect_infer else "GLM53_FLASHMLA_EXECUTED"
     assert backend_log in logger.info.call_args.args[0]
-    if installed:
+    if expect_infer:
         assert flashinfer.call_args.args[0].shape[-1] == 512
     else:
         assert flashmla.call_args.args[0].shape[-1] == 576
@@ -303,6 +317,86 @@ def test_installed_flashinfer_failure_propagates_without_fallback(monkeypatch, e
     logger.warning.assert_not_called()
     logger.info.assert_not_called()
     assert not hasattr(attention, "_ap_flashinfer_failed")
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_flashmla_guard_checks_installation(monkeypatch, installed):
+    query = SimpleNamespace(shape=(1, 4, 2, 512), device=torch.device("cuda:0"))
+    monkeypatch.setattr(context_parallel, "_cuda_device_major", lambda _device: 9)
+    monkeypatch.setattr(context_parallel, "flash_mla_available", lambda: installed)
+    assert context_parallel._use_flashmla(query, 512) == installed
+
+
+@pytest.mark.parametrize(
+    "requested,infer_available,mla_available,expected",
+    [
+        ("sparse_mla", True, True, "flashinfer"),
+        ("sparse_mla", False, True, "flashmla"),
+        ("sparse_mla", False, False, "reference"),
+        ("flashinfer", True, True, "flashinfer"),
+        ("flashinfer", False, True, None),
+        ("flashmla", True, True, "flashmla"),
+        ("flashmla", True, False, None),
+    ],
+)
+def test_sparse_backend_selection_respects_explicit_request(
+    monkeypatch, requested, infer_available, mla_available, expected
+):
+    monkeypatch.setattr(context_parallel, "_use_flashinfer", lambda *_args: infer_available)
+    monkeypatch.setattr(context_parallel, "_use_flashmla", lambda *_args: mla_available)
+    if expected is None:
+        with pytest.raises(RuntimeError, match="requires an installed kernel"):
+            context_parallel._select_sparse_mla_backend(requested, None, None, 512)
+    else:
+        assert context_parallel._select_sparse_mla_backend(requested, None, None, 512) == expected
+
+
+def test_missing_optional_kernels_use_reference(monkeypatch):
+    attention = _dispatch_attention().to(dtype=torch.bfloat16)
+    hidden_states = torch.zeros(1, 4, 16, dtype=torch.bfloat16)
+    indices = torch.arange(4).expand(1, 4, -1)
+    monkeypatch.setattr(context_parallel, "_cuda_device_major", lambda _device: 9)
+    monkeypatch.setattr(context_parallel, "_flashinfer_available", lambda: False)
+    monkeypatch.setattr(context_parallel, "flash_mla_available", lambda: False)
+    reference = Mock(wraps=context_parallel._reference_sparse_mla)
+    flashmla = Mock(side_effect=AssertionError("Missing FlashMLA was selected"))
+    monkeypatch.setattr(context_parallel, "_reference_sparse_mla", reference)
+    monkeypatch.setattr(context_parallel, "sparse_mla_flashmla_apply", flashmla)
+    output, _, _ = context_parallel._sparse_attention_forward(
+        attention, hidden_states, None, prev_topk_indices=indices
+    )
+    assert torch.isfinite(output).all()
+    reference.assert_called_once()
+    flashmla.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", context_parallel.SPARSE_MLA_BACKENDS)
+def test_sp1_patches_each_sparse_layer_with_requested_backend(tiny_glm_sparse_model, backend):
+    model = tiny_glm_sparse_model()
+    context_parallel.apply_context_parallelism(model, 1, None, attn_implementation=backend)
+    sparse = [layer.self_attn for layer in model.model.layers if layer.block_type == "deepseek_sparse_attention"]
+    assert sparse
+    assert all(attention._ap_sparse_mla_backend == backend for attention in sparse)
+
+
+@pytest.mark.parametrize("backend", ["eager", "sdpa", "typo"])
+def test_invalid_sparse_backend_is_rejected_before_model_patch(backend):
+    with pytest.raises(ValueError, match="Unknown GLM-5.3 sparse attention backend"):
+        context_parallel.apply_context_parallelism(None, 1, None, attn_implementation=backend)
+
+
+def _require_flashmla_kernel():
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
+        pytest.skip("FlashMLA sparse prefill requires Hopper or datacenter Blackwell")
+    if not context_parallel.flash_mla_available():
+        pytest.skip("FlashMLA sparse kernel is not installed")
+
+
+def test_real_flashmla_gate_skips_missing_kernel(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+    monkeypatch.setattr(context_parallel, "flash_mla_available", lambda: False)
+    with pytest.raises(pytest.skip.Exception, match="FlashMLA sparse kernel is not installed"):
+        _require_flashmla_kernel()
 
 
 @pytest.mark.parametrize("all_empty", [False, True])
@@ -417,6 +511,7 @@ def test_tiled_bf16_kv_gradients_accumulate_before_final_cast(monkeypatch):
 
 @require_torch_gpu
 def test_real_flashmla_padded_width_matches_original_reference():
+    _require_flashmla_kernel()
     set_seed(42)
     query = (torch.randn(1, 8, 2, 512, device="cuda", dtype=torch.bfloat16) * 0.05).requires_grad_()
     kv = (torch.randn(1, 17, 1, 512, device="cuda", dtype=torch.bfloat16) * 0.05).requires_grad_()
@@ -476,6 +571,8 @@ def test_real_flashmla_padded_width_matches_original_reference():
 def test_sparse_attention_dispatches_only_supported_flashmla_layouts(
     monkeypatch, kv_lora_rank, rope_width, use_flashmla, capability
 ):
+    if use_flashmla:
+        _require_flashmla_kernel()
     set_seed(42)
     if capability is not None:
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
@@ -524,6 +621,7 @@ def test_sparse_attention_dispatches_only_supported_flashmla_layouts(
 
 @require_torch_gpu
 def test_glm53_rope_free_model_executes_flashmla(tiny_glm_sparse_model):
+    _require_flashmla_kernel()
     set_seed(42)
     model = tiny_glm_sparse_model(kv_lora_rank=512).to(device="cuda", dtype=torch.bfloat16).train()
     sparse_layers = sum(layer.block_type == "deepseek_sparse_attention" for layer in model.model.layers)
@@ -548,6 +646,8 @@ def test_glm53_rope_free_model_executes_flashmla(tiny_glm_sparse_model):
 @require_torch_gpu
 def test_glm53_rope_free_model_prefers_installed_flashinfer(tiny_glm_sparse_model):
     pytest.importorskip("flashinfer")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("FlashInfer FA3 MLA requires Hopper")
     set_seed(42)
     model = tiny_glm_sparse_model(kv_lora_rank=512).to(device="cuda", dtype=torch.bfloat16).train()
     sparse_layers = sum(layer.block_type == "deepseek_sparse_attention" for layer in model.model.layers)
