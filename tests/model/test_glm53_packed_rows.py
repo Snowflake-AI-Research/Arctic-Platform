@@ -253,44 +253,126 @@ def test_glm53_sp1_packed_kda_outputs_and_gradients_match_isolated_row():
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="packed KDA kernels require CUDA")
-def test_glm53_head_parallel_kda_matches_local_path(tmp_path):
+def test_glm53_kda_convolution_shards_select_matching_qkv_channels(monkeypatch):
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _shard_convolution_parameter
+
+    num_heads, head_dim, world_size = 4, 3, 2
+    channels = num_heads * head_dim
+    weight = torch.arange(3 * channels, dtype=torch.float32)[:, None].repeat(1, 4)
+    bias = torch.arange(3 * channels, dtype=torch.float32)
+    weight_shards, bias_shards = [], []
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: world_size)
+    for rank in range(world_size):
+        monkeypatch.setattr(dist, "get_rank", lambda group=None, rank=rank: rank)
+        for value, shards in ((weight, weight_shards), (bias, bias_shards)):
+            shards.append(
+                _shard_convolution_parameter(
+                    value,
+                    name="conv1d",
+                    num_key_heads=num_heads,
+                    num_value_heads=num_heads,
+                    key_head_dim=head_dim,
+                    value_head_dim=head_dim,
+                    process_group=None,
+                )
+            )
+
+    for weight_shard, bias_shard in zip(weight_shards, bias_shards, strict=True):
+        assert torch.equal(weight_shard[:, 0], bias_shard)
+    local_channels = channels // world_size
+    reassembled = torch.cat(
+        [
+            torch.cat([shard[part * local_channels : (part + 1) * local_channels] for shard in bias_shards])
+            for part in range(3)
+        ]
+    )
+    assert torch.equal(reassembled, bias)
+
+
+def test_glm53_head_parallel_kda_requires_global_cu_seqlens():
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+
+    model = _tiny_glm_sparse_model(with_linear_attention=True)
+    attention = model.model.layers[1].self_attn
+    hidden_states = torch.zeros(1, 8, model.model.config.hidden_size, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="global cu_seqlens"):
+        cp._linear_attention_forward(attention, hidden_states)
+
+
+def _head_parallel_kda_worker(rank, world_size, rendezvous, fallback_convolution):
+    import sys
+    from datetime import timedelta
+
     import torch.distributed as dist
 
     from arctic_platform.model.implementations.glm53 import context_parallel as cp
 
-    created = not dist.is_initialized()
-    if created:
-        dist.init_process_group("nccl", init_method=f"file://{tmp_path / 'group'}", world_size=1, rank=0)
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
     try:
         torch.manual_seed(29)
         model = _tiny_glm_sparse_model(with_linear_attention=True).cuda()
         attention = model.model.layers[1].self_attn
-        setattr(attention, cp._GLOBAL_CU_SEQLENS, torch.tensor([0, 3, 8], dtype=torch.int32, device="cuda"))
-        attention._cp_group = dist.group.WORLD
-        attention._cp_world_size = 1
-        hidden_states = torch.randn(1, 8, model.model.config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        attention.conv1d.bias = nn.Parameter(0.1 * torch.randn_like(attention.conv1d.weight[:, 0, 0]))
+        global_length = 8
+        local_length = global_length // world_size
+        # The second packed sequence starts inside rank 0's shard and continues into rank 1's.
+        setattr(attention, cp._GLOBAL_CU_SEQLENS, torch.tensor([0, 3, global_length], dtype=torch.int32).cuda())
+        hidden_states = torch.randn(1, global_length, model.model.config.hidden_size, dtype=torch.bfloat16).cuda()
 
-        def run(forward):
+        def run(forward, inputs):
             attention.zero_grad(set_to_none=True)
-            inputs = hidden_states.detach().requires_grad_(True)
+            inputs = inputs.detach().requires_grad_(True)
             output = forward(attention, inputs)
             output.float().square().sum().backward()
             gradients = {
-                name: parameter.grad.detach().clone()
+                name: parameter.grad.detach().float()
                 for name, parameter in attention.named_parameters()
                 if parameter.grad is not None
             }
             return output.detach(), inputs.grad.detach(), gradients
 
-        local_output, local_input_gradient, local_gradients = run(cp._local_linear_attention_forward)
-        parallel_output, parallel_input_gradient, parallel_gradients = run(cp._linear_attention_forward)
-    finally:
-        if created:
-            dist.destroy_process_group()
+        local_output, local_input_gradient, local_gradients = run(cp._local_linear_attention_forward, hidden_states)
+        attention._cp_group = dist.group.WORLD
+        attention._cp_world_size = world_size
+        if fallback_convolution:
+            sys.modules["causal_conv1d"] = None
+        shard = slice(rank * local_length, (rank + 1) * local_length)
+        output, input_gradient, gradients = run(cp._linear_attention_forward, hidden_states[:, shard])
 
-    torch.testing.assert_close(parallel_output, local_output, rtol=1e-2, atol=2e-2)
-    torch.testing.assert_close(parallel_input_gradient, local_input_gradient, rtol=3e-2, atol=3e-2)
-    assert parallel_gradients.keys() == local_gradients.keys()
-    for name, gradient in parallel_gradients.items():
+        outputs = [torch.empty_like(output) for _ in range(world_size)]
+        dist.all_gather(outputs, output.contiguous())
+        for gradient in gradients.values():
+            dist.all_reduce(gradient)
+    finally:
+        dist.destroy_process_group()
+
+    torch.testing.assert_close(torch.cat(outputs, dim=1), local_output, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(input_gradient, local_input_gradient[:, shard], rtol=3e-2, atol=3e-2)
+    assert gradients.keys() == local_gradients.keys()
+    assert "conv1d.bias" in gradients
+    for name, gradient in gradients.items():
         torch.testing.assert_close(gradient, local_gradients[name], rtol=3e-2, atol=3e-2, msg=name)
+
+
+@pytest.mark.parametrize("fallback_convolution", [False, True], ids=["causal_conv1d", "fallback_convolution"])
+@pytest.mark.parametrize("world_size", [1, 2])
+def test_glm53_head_parallel_kda_matches_local_path(tmp_path, world_size, fallback_convolution):
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"head-parallel KDA parity needs {world_size} GPUs")
+    mp.spawn(
+        _head_parallel_kda_worker,
+        args=(world_size, f"file://{tmp_path / 'rendezvous'}", fallback_convolution),
+        nprocs=world_size,
+        join=True,
+    )

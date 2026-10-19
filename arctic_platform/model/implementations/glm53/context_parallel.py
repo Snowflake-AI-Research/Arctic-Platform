@@ -29,6 +29,7 @@ from torch import nn
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import sparse_mla_flashmla_apply
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _pack_and_exchange_head_tensors
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _packed_sequence_indices
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _shard_convolution_parameter
@@ -328,6 +329,9 @@ def _linear_attention_forward(
         raise NotImplementedError("GLM-5.3 head-parallel KDA is a training-only path")
     if hidden_states.shape[0] != 1:
         raise NotImplementedError("GLM-5.3 head-parallel KDA currently requires one packed row")
+    global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
+    if global_cu_seqlens is None:
+        raise RuntimeError("GLM-5.3 head-parallel KDA requires global cu_seqlens from the backbone wrapper")
     if attention_mask is not None:
         hidden_states = hidden_states * attention_mask[..., None].to(hidden_states.dtype)
 
@@ -361,13 +365,6 @@ def _linear_attention_forward(
         value_head_dim=self.head_dim,
         process_group=self._cp_group,
     )
-    global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
-    if global_cu_seqlens is None:
-        global_cu_seqlens = torch.tensor(
-            [0, global_length],
-            dtype=torch.int32,
-            device=hidden_states.device,
-        )
     mixed_qkv = torch.cat(
         [
             exchanged["query"].reshape(batch_size, global_length, -1),
@@ -376,8 +373,6 @@ def _linear_attention_forward(
         ],
         dim=-1,
     ).transpose(1, 2)
-    from causal_conv1d import causal_conv1d_fn
-
     conv_bias = _shard_convolution_parameter(
         self.conv1d.bias,
         name="conv1d.bias",
@@ -387,13 +382,25 @@ def _linear_attention_forward(
         value_head_dim=self.head_dim,
         process_group=self._cp_group,
     )
-    mixed_qkv = causal_conv1d_fn(
-        mixed_qkv,
-        weight=conv_weight,
-        bias=conv_bias,
-        activation=self.activation,
-        seq_idx=_packed_sequence_indices(global_cu_seqlens),
-    ).transpose(1, 2)
+    try:
+        from causal_conv1d import causal_conv1d_fn
+    except ImportError:
+        mixed_qkv = _fallback_depthwise_causal_convolution(
+            mixed_qkv,
+            weight=conv_weight,
+            bias=conv_bias,
+            activation=self.activation,
+            global_cu_seqlens=global_cu_seqlens,
+        )
+    else:
+        mixed_qkv = causal_conv1d_fn(
+            mixed_qkv,
+            weight=conv_weight,
+            bias=conv_bias,
+            activation=self.activation,
+            seq_idx=_packed_sequence_indices(global_cu_seqlens),
+        )
+    mixed_qkv = mixed_qkv.transpose(1, 2)
     local_width = local_heads * self.head_dim
     query, key, value = torch.split(
         mixed_qkv,
