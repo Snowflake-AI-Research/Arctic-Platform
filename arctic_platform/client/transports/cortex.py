@@ -67,7 +67,9 @@ _CHUNKED_RESULTS = {"response_options": {"format": "dssst1", "delivery": "chunke
 # marshals that RPC as JSON, so the frame inflates 4/3 on the way in and the
 # budget below is a JSON-body budget, not a frame budget. These mirror
 # dss_client's constants so both clients split at the same boundary.
-_OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
+_OPERATION_MAX_JSON_BYTES_ENV = "CORTEX_TRAINING_FORWARD_OPERATION_MAX_JSON_BYTES"
+_DEFAULT_OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
+_MIN_OPERATION_MAX_JSON_BYTES = 16 * 1024
 # Room for the envelope's keys, the operation type and the sub-job token.
 _OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
@@ -126,6 +128,32 @@ def _status_query(request: Request, body: dict) -> list[Send]:
     return [{"params": {"max_events": body["max_events"]}}]
 
 
+def _operation_max_json_bytes() -> int:
+    raw = os.environ.get(_OPERATION_MAX_JSON_BYTES_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_OPERATION_MAX_JSON_BYTES
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{_OPERATION_MAX_JSON_BYTES_ENV} must be an integer, got {raw!r}") from exc
+    if value < _MIN_OPERATION_MAX_JSON_BYTES:
+        raise ValueError(f"{_OPERATION_MAX_JSON_BYTES_ENV} must be at least {_MIN_OPERATION_MAX_JSON_BYTES} bytes")
+    return value
+
+
+def _operation_chunk_max_bytes(max_json_bytes: int) -> int:
+    return max(1, (max_json_bytes - _OPERATION_ENVELOPE_OVERHEAD_BYTES) * 3 // 4)
+
+
+def _operation_body_json_bytes(body: dict) -> int:
+    payload = body.get("payload")
+    raw = payload.get("payload_b64") if isinstance(payload, dict) else None
+    if not isinstance(raw, str):
+        return len(json.dumps(body).encode())
+    empty = {**body, "payload": {**payload, "payload_b64": ""}}
+    return len(json.dumps(empty).encode()) + len(raw)
+
+
 def _forward(request: Request, body: dict) -> list[Send]:
     """One /operation envelope per slice of the forward frame.
 
@@ -136,22 +164,29 @@ def _forward(request: Request, body: dict) -> list[Send]:
     was cached -- so they must be posted in order and the last reply kept.
     """
     frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
-    # The budget is on the JSON body, and base64 costs 4 bytes per 3, so the
-    # frame slice has to be the smaller 3/4 share of what is left.
-    max_payload = max(1, (_OPERATION_MAX_JSON_BYTES - _OPERATION_ENVELOPE_OVERHEAD_BYTES) * 3 // 4)
-    return [
+    max_json_bytes = _operation_max_json_bytes()
+    chunks = wire.encode_byte_chunks(
+        frame,
+        kind="request",
+        operation="forward",
+        max_bytes=_operation_chunk_max_bytes(max_json_bytes),
+    )
+    sends = [
         {
             "json": {
                 "operation_type": "forward",
                 "sub_job_id": str(request.job_id),
                 "payload": {
                     "content_type": "application/octet-stream",
-                    "payload_b64": base64.b64encode(frame[at : at + max_payload]).decode("ascii"),
+                    "payload_b64": base64.b64encode(chunk).decode("ascii"),
                 },
             }
         }
-        for at in range(0, len(frame), max_payload)
+        for chunk in chunks
     ]
+    if any(_operation_body_json_bytes(send["json"]) > max_json_bytes for send in sends):
+        raise ValueError(f"cortex forward operation body exceeds the {max_json_bytes}-byte JSON limit")
+    return sends
 
 
 # ── normalizers: a Cortex reply -> the canonical result ─────────────────────
@@ -569,8 +604,10 @@ class CortexTransport(Transport):
     async def _send_each(self, route: _Route, url: str, sends: list[Send]) -> dict:
         """Post every send in order; the last reply is the op's answer."""
         reply: dict = {}
-        for kwargs in sends:
+        for index, kwargs in enumerate(sends):
             reply = await self._send(route.method, url, policy=route.policy, **kwargs)
+            if index < len(sends) - 1 and reply.get("request_id") is not None:
+                raise RuntimeError(f"cortex chunk {index} unexpectedly returned request_id")
         return reply
 
     def _request_url(self, request_id: str, cursor: str | None) -> tuple[str, dict | None]:

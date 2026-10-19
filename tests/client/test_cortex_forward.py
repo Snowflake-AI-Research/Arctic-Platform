@@ -38,6 +38,7 @@ result it decodes without a live GS.
 from __future__ import annotations
 
 import base64
+import json
 from urllib.parse import unquote
 
 import pytest
@@ -69,6 +70,12 @@ class FakeSend:
         if method == "GET":
             return {"status": "REQUEST_STATE_DONE", "result": self.result}
         self.posts.append({"url": url, **kwargs})
+        frame = kwargs.get("data")
+        if frame is None and "json" in kwargs:
+            frame = base64.b64decode(kwargs["json"]["payload"]["payload_b64"])
+        chunk = wire.read_byte_chunk_metadata(frame) if frame is not None else None
+        if chunk is not None and chunk["chunk_idx"] < chunk["total_chunks"] - 1:
+            return {"chunk_cached": True}
         return {"request_id": "req-1"}
 
     @property
@@ -87,7 +94,10 @@ class FakeSend:
     @property
     def operation_frame(self) -> bytes:
         """The frame the zone will reassemble from every payload we posted."""
-        return b"".join(base64.b64decode(e["payload"]["payload_b64"]) for e in self.envelopes)
+        frames = [base64.b64decode(e["payload"]["payload_b64"]) for e in self.envelopes]
+        if len(frames) == 1:
+            return frames[0]
+        return wire.decode_byte_chunks(frames, kind="request")
 
 
 def _transport(result: dict | None = None) -> tuple[CortexTransport, FakeSend]:
@@ -147,12 +157,8 @@ class TestForwardWire:
         assert wire.read_byte_chunk_metadata(send.operation_frame) is None
 
     def test_oversized_frame_splits_across_envelopes(self, monkeypatch):
-        """Each POST is a whole envelope carrying one slice of the frame.
-
-        The zone stages the slices and concatenates them, so what must survive is
-        the byte-for-byte frame -- not any per-chunk structure.
-        """
-        monkeypatch.setattr(cortex_module, "_OPERATION_MAX_JSON_BYTES", 8 * 1024)
+        """Each POST carries a request-chunk frame the zone can reassemble."""
+        monkeypatch.setenv(cortex_module._OPERATION_MAX_JSON_BYTES_ENV, str(16 * 1024))
         transport, send = _transport()
         batch = {"batch": {"input_ids": torch.arange(20_000).reshape(1, -1)}, "meta": {}, "processing": {}}
         transport.call(fwd_no_grad_request(transport.jobs, batch))
@@ -167,13 +173,13 @@ class TestForwardWire:
         Sizing the slice against the raw budget would overshoot by a third and be
         rejected by GS, so this pins the encoded payload under the cap.
         """
-        budget = 8 * 1024
-        monkeypatch.setattr(cortex_module, "_OPERATION_MAX_JSON_BYTES", budget)
+        budget = 16 * 1024
+        monkeypatch.setenv(cortex_module._OPERATION_MAX_JSON_BYTES_ENV, str(budget))
         transport, send = _transport()
         batch = {"batch": {"input_ids": torch.arange(20_000).reshape(1, -1)}, "meta": {}, "processing": {}}
         transport.call(fwd_no_grad_request(transport.jobs, batch))
 
-        assert max(len(e["payload"]["payload_b64"]) for e in send.envelopes) <= budget
+        assert max(len(json.dumps(envelope).encode()) for envelope in send.envelopes) <= budget
 
     def test_missing_request_id_on_the_last_chunk_is_an_error(self):
         """Only the final chunk starts execution; without its id there is nothing to poll."""
