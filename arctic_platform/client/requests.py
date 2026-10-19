@@ -141,8 +141,17 @@ def save_checkpoint_request(
     return Request("save", jobs.require("training"), body)
 
 
-def load_checkpoint_request(jobs: JobHandles, path: str | None = None, step: int | None = None) -> Request:
-    return Request("load-checkpoint", jobs.require("training"), {"path": path, "step": step})
+def load_checkpoint_request(
+    jobs: JobHandles,
+    *,
+    path: str | None = None,
+    step: int | None = None,
+    checkpoint_id: str | None = None,
+    source_job_id: JobId | None = None,
+) -> Request:
+    # Cortex: checkpoint_id, optionally from source_job_id's store. On-prem SFT: path/step.
+    body = {"path": path, "step": step, "checkpoint_id": checkpoint_id, "source_job_id": source_job_id}
+    return Request("load-checkpoint", jobs.require("training"), body)
 
 
 def generate_request(
@@ -156,6 +165,26 @@ def generate_request(
     return Request("generate", jobs.require("sampling"), body)
 
 
+def generate_stream_request(
+    jobs: JobHandles,
+    prompts: list,
+    sampling_params: dict | None = None,
+    routing_key: Any = None,
+    strict: bool = False,
+) -> Request:
+    body = {"prompts": prompts, "sampling_params": sampling_params, "routing_key": routing_key, "strict": strict}
+    return Request("generate-stream", jobs.require("sampling"), body)
+
+
+def request_status_request(job_id: JobId, request_id: str, max_events: int) -> Request:
+    return Request("request-status", job_id, {"request_id": request_id, "max_events": max_events})
+
+
+def cancel_request_request(job_id: JobId, request_id: str) -> Request:
+    body = {"operation_type": "cancel-request", "sub_job_id": job_id, "payload": {"request_id": request_id}}
+    return Request("cancel-request", job_id, body)
+
+
 def log_probs_request(jobs: JobHandles, prompts: list, completions: list | None = None, top_k: int = 1) -> Request:
     body = {"prompts": prompts, "completions": completions, "top_k": top_k}
     return Request("log-probs", jobs.require("log_prob"), body)
@@ -167,6 +196,7 @@ def sync_weights_request(
     cuda_ipc: bool | None = None,
     low_memory: bool | None = None,
     weight_format: str | None = None,
+    bucket_size: int | None = None,
 ) -> Request:
     # The client assembles the full Cortex `/operation` envelope here so transports
     # just forward it: SnowAPI reads the `sub_job_*` routing hints, on-prem accepts
@@ -176,15 +206,18 @@ def sync_weights_request(
     # In non-colocated mode the server uses NCCL. In colocated mode, cuda_ipc=True is
     # zero-copy (training weights must be on GPU) and low_memory streams one param at
     # a time to bound peak GPU memory. weight_format="lora" broadcasts only the
-    # trained adapter tensors instead of the full model.
+    # trained adapter tensors instead of the full model. bucket_size (bytes) raises
+    # Cortex's transfer bucket when one tensor exceeds its default; on-prem sizes the
+    # bucket to the largest parameter itself.
     tid, sid = jobs.require("training"), jobs.require("sampling")
+    options = {
+        "cuda_ipc": cuda_ipc,
+        "low_memory": low_memory,
+        "weight_format": weight_format,
+        "bucket_size": bucket_size,
+    }
     payload = {"source_sub_job_id": tid, "target_sub_job_ids": [sid]}
-    if cuda_ipc is not None:
-        payload["cuda_ipc"] = cuda_ipc
-    if low_memory is not None:
-        payload["low_memory"] = low_memory
-    if weight_format is not None:
-        payload["weight_format"] = weight_format
+    payload.update({k: v for k, v in options.items() if v is not None})
     body = {
         "operation_type": "weight-sync",
         "sub_job_id": tid,
@@ -203,6 +236,29 @@ def reset_prefix_cache_request(
         "sub_job_type": "sampling",
         "payload": {"drain": drain, "timeout_s": timeout_s, "retry_interval_s": retry_interval_s},
     }
+    return Request("operation", sid, body)
+
+
+def tail_logs_request(job_id: JobId, cursor: str | None = None, max_lines: int | None = None) -> Request:
+    payload = {k: v for k, v in (("cursor", cursor), ("max_lines", max_lines)) if v is not None}
+    return Request("operation", job_id, {"operation_type": "tail-logs", "sub_job_id": job_id, "payload": payload})
+
+
+def bootstrap_router_replay_request(jobs: JobHandles, max_cache_bytes: int | None = None) -> Request:
+    # Runs on the training sub-job, which pulls routing decisions from sampling.
+    tid, sid = jobs.require("training"), jobs.require("sampling")
+    payload = {"source_sub_job_id": sid, "target_sub_job_id": tid, "max_cache_bytes": max_cache_bytes}
+    body = {
+        "operation_type": "bootstrap-router-replay",
+        "sub_job_id": tid,
+        "payload": {k: v for k, v in payload.items() if v is not None},
+    }
+    return Request("operation", tid, body)
+
+
+def router_replay_discard_request(jobs: JobHandles, sample_ids: list[str]) -> Request:
+    sid = jobs.require("sampling")
+    body = {"operation_type": "router-replay-discard", "sub_job_id": sid, "payload": {"sample_ids": sample_ids}}
     return Request("operation", sid, body)
 
 
