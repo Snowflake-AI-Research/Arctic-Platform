@@ -35,6 +35,25 @@ def _reference(hidden, scores):
     return (hidden.float() * scores.float().reshape(-1, 1)).to(hidden.dtype)
 
 
+def _require_cuda_memory(required_bytes):
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < required_bytes:
+        pytest.skip(
+            f"CUDA memory regression needs {required_bytes / 1024**3:g} GiB free; has {free_bytes / 1024**3:g}"
+        )
+
+
+@pytest.mark.parametrize("free_gib", [16, 20, 22 - 1 / 1024**3, 22, 24])
+def test_cuda_memory_capacity_guard(monkeypatch, free_gib):
+    required_bytes = 22 * 1024**3
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (int(free_gib * 1024**3), 24 * 1024**3))
+    if free_gib < 22:
+        with pytest.raises(pytest.skip.Exception, match="needs 22 GiB free"):
+            _require_cuda_memory(required_bytes)
+    else:
+        _require_cuda_memory(required_bytes)
+
+
 @pytest.mark.parametrize("hidden_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("score_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("requires_grad", [(True, True), (True, False), (False, True)])
@@ -206,7 +225,10 @@ def test_local_moe_weighting_sites_preserve_forward_and_gradients(monkeypatch, d
 
 @require_torch_gpu
 def test_routing_weights_cuda_retained_memory():
-    reserve = torch.empty(20 * 1024**3, dtype=torch.uint8, device="cuda")
+    reserve_bytes = 20 * 1024**3
+    # Keep the tuning reserve, but admit only devices with room for both measured workloads.
+    _require_cuda_memory(reserve_bytes + 2 * 1024**3)
+    reserve = torch.empty(reserve_bytes, dtype=torch.uint8, device="cuda")
     hidden = torch.randn(8192, 1024, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     scores = torch.randn(8192, device="cuda", requires_grad=True)
 
@@ -228,7 +250,7 @@ def test_routing_weights_cuda_retained_memory():
 
     reference_retained, reference_peak, reference_gradients = measure(_reference)
     retained, peak, gradients = measure(apply_routing_weights)
-    assert reserve.numel() == 20 * 1024**3
+    assert reserve.numel() == reserve_bytes
     assert reference_retained - retained >= 8 * hidden.numel() * 4
     assert peak < reference_peak
     for actual, expected in zip(gradients, reference_gradients, strict=True):
