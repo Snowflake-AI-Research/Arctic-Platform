@@ -36,6 +36,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any
 from typing import Iterator
+from urllib.parse import quote
 from urllib.parse import unquote
 
 from tenacity import AsyncRetrying
@@ -190,6 +191,16 @@ def _forward(request: Request, body: dict) -> list[Send]:
     if any(_operation_body_json_bytes(send["json"]) > max_json_bytes for send in sends):
         raise ValueError(f"cortex forward operation body exceeds the {max_json_bytes}-byte JSON limit")
     return sends
+
+
+def _save(request: Request, body: dict) -> list[Send]:
+    checkpoint_type = body["checkpoint_type"].lower()
+    if checkpoint_type not in ("resumable", "weights-only"):
+        raise ValueError("checkpoint_type must be 'resumable' or 'weights-only'")
+    payload = {"checkpoint_type": checkpoint_type}
+    if "checkpoint_id" in body:
+        payload["checkpoint_id"] = body["checkpoint_id"]
+    return [{"json": payload}]
 
 
 # ── normalizers: a Cortex reply -> the canonical result ─────────────────────
@@ -406,7 +417,7 @@ _ROUTES = {
         method="POST", path="/{job}/operation", encode=_forward, poll=True, normalize=_unwrap_forward_payload
     ),
     "step": _Route(method="POST", path="/{job}/step", poll=True),
-    "save": _Route(method="POST", path="/{job}/save", poll=True),
+    "save": _Route(method="POST", path="/{job}/save", encode=_save, poll=True),
     "load-checkpoint": _Route(method="POST", path="/{job}/load", poll=True),
     # /operation is polymorphic: weight-sync is polled, the rest answer inline.
     "operation": _Route(
@@ -715,7 +726,8 @@ class CortexTransport(Transport):
     def _prefix(self) -> str:
         cx = self.config
         base = (cx.base_url or f"https://{cx.host}").rstrip("/")
-        return f"{base}/api/v2/databases/{cx.database}/schemas/{cx.schema_}/{cx.endpoint}"
+        database, schema = quote(cx.database, safe="$"), quote(cx.schema_, safe="$")
+        return f"{base}/api/v2/databases/{database}/schemas/{schema}/{cx.endpoint}"
 
     def _auth_headers(self) -> dict[str, str]:
         cx = self.config
@@ -742,7 +754,8 @@ class CortexTransport(Transport):
         import aiohttp
 
         if self._session is None:
-            self._session = aiohttp.ClientSession(headers=self._auth_headers())
+            connector = aiohttp.TCPConnector(ssl=self.config.verify_ssl)
+            self._session = aiohttp.ClientSession(headers=self._auth_headers(), connector=connector)
         session = self._session
         retries = self.config.max_retries if policy.max_retries is None else policy.max_retries
         timeout = min(self.config.request_timeout, policy.timeout or self.config.request_timeout)
